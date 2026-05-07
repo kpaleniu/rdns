@@ -3,13 +3,22 @@ use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::{FromPrimitive, ToPrimitive};
 use rand::Rng;
 use std::{
+    io::{Cursor, Write},
     net::{Ipv4Addr, Ipv6Addr},
     str::from_utf8,
 };
 
-use dname::{dname_from_bytes, dname_to_bytes, DNameUnpacker, TryUnpackDeserialize};
+use dname::{dname_from_bytes, dname_to_bytes, DNameUnpacker, TryUnpackFromBytes};
 
 pub mod dname;
+pub mod zone;
+pub mod security;
+pub mod validation;
+pub mod logging;
+pub mod bench;
+pub mod cache;
+pub mod resolver;
+pub mod metrics;
 
 #[macro_use]
 mod macros {
@@ -24,7 +33,7 @@ mod macros {
     }
 }
 
-#[derive(Debug, FromPrimitive, ToPrimitive)]
+#[derive(Debug, FromPrimitive, ToPrimitive, Clone)]
 pub enum OpCode {
     Query = 0,
     IQuery = 1, // RFC3425: IQUERY obsolete
@@ -34,17 +43,28 @@ pub enum OpCode {
     Unknown = 15,
 }
 
-#[derive(Debug)]
+// practically always IN (1), classes are supposed to be sort of
+// dimension to the DNS database (see RFC6895 section 3.2). Only CH (3)
+// and HS (4) are mentioned but practially never used outside of local tests
+#[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, Clone)]
+pub enum QueryClass {
+    IN = 1,
+    CH = 3,
+    HS = 4,
+    None = 254,
+    Any = 255,
+}
+
+#[derive(Debug, Clone)]
 pub struct QuerySection {
     // Contains the domain name for the question
     pub qname: String,
     // Query type, matches ResourceRecordKind discriminant
     pub qtype: u16,
-    // Class,
-    pub qclass: u16,
+    pub qclass: QueryClass,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ResourceRecordKind {
     A(Ipv4Addr),
     NS(String),
@@ -82,7 +102,7 @@ impl ResourceRecordKind {
         }
     }
 
-    fn try_deserialize<'a>(
+    fn try_from_bytes<'a>(
         record_type: u16,
         rdata: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
@@ -141,7 +161,7 @@ impl ResourceRecordKind {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResourceRecord {
     pub name: String,
     pub class: u16,
@@ -149,15 +169,37 @@ pub struct ResourceRecord {
     pub rdata: ResourceRecordKind,
 }
 
-#[derive(Debug, FromPrimitive, ToPrimitive)]
+#[derive(Debug, FromPrimitive, ToPrimitive, Clone)]
 pub enum ResponseCode {
-    Ok,
-    FormatError,
-    ServerFailure,
-    NameError,
-    NotImplemented,
-    Refused,
-    Unknown,
+    // RFC 1035 - Basic codes
+    Ok = 0,
+    FormatError = 1,
+    ServerFailure = 2,
+    NoSuchDomain = 3,
+    NotImplemented = 4,
+    Refused = 5,
+    // RFC 2136 - Domain update related codes
+    DomainExistsForSomeReason = 6,
+    ResourceRecordSetExistsForSomeReason = 7,
+    NoSuchResourceRecordSet = 8,
+    NotAuthorized = 9, // Or ServerNotAuthorativeForZone (RFC8945)
+    NameNotInZone = 10,
+
+    // RFC 8490 - DNS Stateful Operations
+    DsoTypeNotImplemented = 11,
+
+    BadOptVersion = 16, // Or BadTsigSignature (RFC8945)
+    BadKey = 17,
+    BadTime = 18,
+
+    // RFC 2930 - TKEY RR
+    BadTkeyMode = 19,
+    BadName = 20,
+    BadAlgorithm = 21,
+    BadTruncation = 22,
+    BadCookie = 23,
+
+    Unknown = 65535,
 }
 
 #[derive(Debug)]
@@ -177,15 +219,15 @@ pub struct DnsMessage {
     pub additionals: Vec<ResourceRecord>,
 }
 
-impl<'a> TryUnpackDeserialize<'a> for QuerySection {
+impl<'a> TryUnpackFromBytes<'a> for QuerySection {
     type Output = (QuerySection, &'a [u8]);
     type Error = anyhow::Error;
-    fn try_deserialize(
+    fn try_from_bytes(
         data: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<
-        <QuerySection as TryUnpackDeserialize<'a>>::Output,
-        <QuerySection as TryUnpackDeserialize<'a>>::Error,
+        <QuerySection as TryUnpackFromBytes<'a>>::Output,
+        <QuerySection as TryUnpackFromBytes<'a>>::Error,
     > {
         let (qname, rest) = dname_from_bytes(data, unpacker)?;
         let (qtype, rest) = read_be!(u16, rest);
@@ -194,20 +236,20 @@ impl<'a> TryUnpackDeserialize<'a> for QuerySection {
             Self {
                 qname,
                 qtype,
-                qclass,
+                qclass: QueryClass::from_u16(qclass).unwrap_or(QueryClass::None),
             },
             rest,
         ))
     }
 }
 
-impl<'a> TryUnpackDeserialize<'a> for ResourceRecord {
+impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
     type Output = (ResourceRecord, &'a [u8]);
     type Error = anyhow::Error;
-    fn try_deserialize(
+    fn try_from_bytes(
         data: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
-    ) -> Result<Self::Output, Self::Error> {
+    ) -> Result<<Self as TryUnpackFromBytes<'a>>::Output, Self::Error> {
         let (name, rest) = dname_from_bytes(data, unpacker)?;
         let (record_type, rest) = read_be!(u16, rest);
         let (class, rest) = read_be!(u16, rest);
@@ -215,7 +257,7 @@ impl<'a> TryUnpackDeserialize<'a> for ResourceRecord {
         let (rdatalen, rest) = read_be!(u16, rest);
         let rdata = &rest[..rdatalen as usize];
 
-        let rdata = ResourceRecordKind::try_deserialize(record_type, rdata, unpacker)?;
+        let rdata = ResourceRecordKind::try_from_bytes(record_type, rdata, unpacker)?;
         Ok((
             Self {
                 name,
@@ -229,7 +271,7 @@ impl<'a> TryUnpackDeserialize<'a> for ResourceRecord {
 }
 
 impl DnsMessage {
-    pub fn deserialize(data: &[u8]) -> anyhow::Result<Self> {
+    pub fn try_from_bytes(data: &[u8]) -> Result<Self, anyhow::Error> {
         if data.len() < 12 {
             return Err(anyhow!("not enough data"));
         }
@@ -249,28 +291,28 @@ impl DnsMessage {
 
         let mut queries: Vec<QuerySection> = Vec::new();
         for _ in 0..query_len {
-            let (query, r) = QuerySection::try_deserialize(rest, &unpacker)?;
+            let (query, r) = QuerySection::try_from_bytes(rest, &unpacker)?;
             queries.push(query);
             rest = r;
         }
 
         let mut answers = Vec::new();
         for _ in 0..answer_len {
-            let (query, r) = ResourceRecord::try_deserialize(rest, &unpacker)?;
+            let (query, r) = ResourceRecord::try_from_bytes(rest, &unpacker)?;
             answers.push(query);
             rest = r;
         }
 
         let mut authorities = Vec::new();
         for _ in 0..auth_len {
-            let (query, r) = ResourceRecord::try_deserialize(rest, &unpacker)?;
+            let (query, r) = ResourceRecord::try_from_bytes(rest, &unpacker)?;
             authorities.push(query);
             rest = r;
         }
 
         let mut additionals = Vec::new();
         for _ in 0..add_len {
-            let (query, r) = ResourceRecord::try_deserialize(rest, &unpacker)?;
+            let (query, r) = ResourceRecord::try_from_bytes(rest, &unpacker)?;
             additionals.push(query);
             rest = r;
         }
@@ -291,9 +333,10 @@ impl DnsMessage {
         })
     }
 
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut buf: Vec<u8> = Vec::new();
-        buf.extend_from_slice(&self.id.to_be_bytes());
+    pub fn to_bytes(&self, output: &mut [u8]) -> Result<usize, anyhow::Error> {
+        let mut written = 0;
+        let mut buf = Cursor::new(output);
+        written += buf.write(&self.id.to_be_bytes())?;
 
         let opcode = self.opcode.to_u8().unwrap_or_default();
         let rcode = self.rcode.to_u8().unwrap_or_default();
@@ -304,19 +347,19 @@ impl DnsMessage {
             | self.recursion as u8;
         let lo: u8 = (self.recursion_ok as u8) << 7 | (rcode & 0x7);
 
-        buf.extend_from_slice(&[hi, lo]);
-        buf.extend_from_slice(&(self.queries.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&(self.answers.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&(self.authorities.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&(self.additionals.len() as u16).to_be_bytes());
+        written += buf.write(&[hi, lo])?;
+        written += buf.write(&(self.queries.len() as u16).to_be_bytes())?;
+        written += buf.write(&(self.answers.len() as u16).to_be_bytes())?;
+        written += buf.write(&(self.authorities.len() as u16).to_be_bytes())?;
+        written += buf.write(&(self.additionals.len() as u16).to_be_bytes())?;
 
         for q in &self.queries {
-            buf.extend_from_slice(&dname_to_bytes(q.qname.as_str()).unwrap());
-            buf.extend_from_slice(&q.qtype.to_be_bytes());
-            buf.extend_from_slice(&q.qclass.to_be_bytes());
+            written += buf.write(&dname_to_bytes(q.qname.as_str())?)?;
+            written += buf.write(&q.qtype.to_be_bytes())?;
+            let qclass = &q.qclass.to_u16().unwrap_or(254);
+            written += buf.write(&qclass.to_be_bytes())?;
         }
-
-        buf
+        Ok(written)
     }
 }
 
@@ -365,7 +408,7 @@ impl DnsMessageBuilder {
                 .map(|(url, qt)| QuerySection {
                     qname: url.to_owned(),
                     qtype: *qt,
-                    qclass: 1_u16,
+                    qclass: QueryClass::IN,
                 })
                 .collect(),
             answers: Vec::new(),
@@ -387,13 +430,13 @@ mod tests {
             0x01, 0x00, 0x01,
         ];
 
-        let msg = DnsMessage::deserialize(&query_header).unwrap();
+        let msg = DnsMessage::try_from_bytes(&query_header).unwrap();
         assert!(msg.recursion);
 
         let query = &msg.queries[0];
         assert_eq!(query.qname, "www.google.fi.");
         assert_eq!(query.qtype, 1);
-        assert_eq!(query.qclass, 1);
+        assert_eq!(query.qclass, QueryClass::IN);
     }
 
     #[test]
@@ -403,7 +446,8 @@ mod tests {
             .with_url("www.google.fi", "A")
             .build();
 
-        let buf = req.serialize();
+        let mut buf = [0u8; 512];
+        let n = req.to_bytes(&mut buf).expect("to_bytes");
 
         let expected: [u8; 31] = [
             0xf5, 0x6f, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x77,
@@ -411,7 +455,7 @@ mod tests {
             0x01, 0x00, 0x01,
         ];
 
-        assert_eq!(buf, expected);
+        assert_eq!(&buf[0..n], &expected);
     }
 
     #[test]
@@ -441,7 +485,7 @@ mod tests {
             0x0a,
         ];
 
-        let msg = DnsMessage::deserialize(&resp).expect("deserialize");
+        let msg = DnsMessage::try_from_bytes(&resp).expect("deserialize");
         assert!(msg.recursion_ok);
     }
 }

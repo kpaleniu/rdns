@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "rdns",
-    "rdnsc"
+    "rdnsc",
+    "rdnsd"
 ]
 resolver = "2"

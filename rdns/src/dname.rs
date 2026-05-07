@@ -1,15 +1,17 @@
 use std::str::from_utf8;
+use std::cell::RefCell;
+use std::collections::HashSet;
 
 use anyhow::anyhow;
 
-pub(crate) trait TryDeserialize<'a> {
+pub(crate) trait TryFromBytes<'a> {
     type Output;
     type Error;
 
-    fn try_deserialize(data: &'a [u8]) -> Result<Self::Output, Self::Error>;
+    fn try_from_bytes(data: &'a [u8]) -> Result<Self::Output, Self::Error>;
 }
 
-// TODO: TrySerialize and others
+// TODO: TryToBytes and others
 
 #[derive(Debug, PartialEq, Clone)]
 enum Label<'a> {
@@ -50,10 +52,10 @@ impl<'a> TryInto<&'a str> for Label<'a> {
  *   * Not supported until I read through RFC6891
  */
 
-impl<'a> TryDeserialize<'a> for Label<'a> {
+impl<'a> TryFromBytes<'a> for Label<'a> {
     type Output = Label<'a>;
     type Error = anyhow::Error;
-    fn try_deserialize(data: &'a [u8]) -> Result<Label<'a>, anyhow::Error> {
+    fn try_from_bytes(data: &'a [u8]) -> Result<Label<'a>, anyhow::Error> {
         let lt = data[0] >> 6;
         let len = data[0] & 0x3f; // guarantees len cannot be more than 63
 
@@ -107,14 +109,14 @@ Quoting from RFC 1035:
 TODO: Implement validation to enforce this pattern
 */
 
-impl<'a> TryDeserialize<'a> for DName<'a> {
+impl<'a> TryFromBytes<'a> for DName<'a> {
     type Output = (DName<'a>, &'a [u8]);
     type Error = anyhow::Error;
-    fn try_deserialize(data: &'a [u8]) -> Result<(DName<'a>, &'a [u8]), anyhow::Error> {
+    fn try_from_bytes(data: &'a [u8]) -> Result<(DName<'a>, &'a [u8]), anyhow::Error> {
         let mut labels = Vec::new();
         let mut off = data;
         loop {
-            let lbl = Label::try_deserialize(off)?;
+            let lbl = Label::try_from_bytes(off)?;
             off = &off[lbl.len()..];
 
             let end = !matches!(lbl, Label::String(_));
@@ -132,7 +134,7 @@ impl<'a> TryDeserialize<'a> for DName<'a> {
  * offsets to bytes in the complete DNS message. While rest of the deserialization
  * works with
  *
- *   let (val, rest) = sometype::try_deserialize(bytes)?;
+ *   let (val, rest) = sometype::try_from_bytes(bytes)?;
  *
  * to simplify how the code reads, this loses the original byte context. We still
  * need a lookup mechanism to hop anywhere in the original set of bytes. Unpacker
@@ -141,14 +143,28 @@ impl<'a> TryDeserialize<'a> for DName<'a> {
 
 pub struct DNameUnpacker<'a> {
     data: &'a [u8],
+    visited: RefCell<HashSet<usize>>,
 }
 
 impl<'a> DNameUnpacker<'a> {
     pub fn new(data: &'a [u8]) -> DNameUnpacker<'a> {
-        DNameUnpacker { data }
+        DNameUnpacker {
+            data,
+            visited: RefCell::new(HashSet::new()),
+        }
     }
 
-    fn unpack(&self, name: DName<'a>) -> Result<UnpackedDName<'a>, anyhow::Error> {
+    fn unpack_internal(
+        &self,
+        name: DName<'a>,
+        depth: usize,
+    ) -> Result<UnpackedDName<'a>, anyhow::Error> {
+        const MAX_DEPTH: usize = 50;
+        
+        if depth > MAX_DEPTH {
+            return Err(anyhow!("pointer recursion depth limit ({}) exceeded", MAX_DEPTH));
+        }
+
         let mut output = Vec::new();
         for label in &name.labels {
             match label {
@@ -156,27 +172,57 @@ impl<'a> DNameUnpacker<'a> {
                     output.push(label.clone());
                 }
                 Label::Pointer(offset) => {
-                    let (name, _) = DName::try_deserialize(&self.data[*offset..])?;
-                    let name = self.unpack(name)?;
-                    output.extend(name.labels);
+                    // Bounds check: pointer offset must be within message
+                    if *offset >= self.data.len() {
+                        return Err(anyhow!(
+                            "pointer offset {} exceeds message size {}",
+                            offset,
+                            self.data.len()
+                        ));
+                    }
+
+                    // Cycle detection: check if we've already visited this offset
+                    if self.visited.borrow().contains(offset) {
+                        return Err(anyhow!(
+                            "circular pointer detected at offset {}",
+                            offset
+                        ));
+                    }
+
+                    // Mark offset as visited
+                    self.visited.borrow_mut().insert(*offset);
+                    
+                    let (name, _) = DName::try_from_bytes(&self.data[*offset..])?;
+                    let unpacked = self.unpack_internal(name, depth + 1)?;
+                    
+                    // Unmark offset (allows same offset in other branches)
+                    self.visited.borrow_mut().remove(offset);
+                    
+                    output.extend(unpacked.labels);
                 }
                 Label::Root => break,
             }
         }
         Ok(UnpackedDName { labels: output })
     }
+
+    fn unpack(&self, name: DName<'a>) -> Result<UnpackedDName<'a>, anyhow::Error> {
+        self.visited.borrow_mut().clear();
+        self.unpack_internal(name, 0)
+    }
 }
 
-pub(crate) trait TryUnpackDeserialize<'a> {
+pub(crate) trait TryUnpackFromBytes<'a> {
     type Output;
     type Error;
 
-    fn try_deserialize(
+    fn try_from_bytes(
         data: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<Self::Output, Self::Error>;
 }
 
+#[derive(Debug)]
 pub(crate) struct UnpackedDName<'a> {
     labels: Vec<Label<'a>>,
 }
@@ -189,7 +235,7 @@ pub fn dname_from_bytes<'a>(
     bytes: &'a [u8],
     unpacker: &DNameUnpacker<'a>,
 ) -> Result<(String, &'a [u8]), anyhow::Error> {
-    let (name, rest) = DName::try_deserialize(bytes)?;
+    let (name, rest) = DName::try_from_bytes(bytes)?;
     let name = unpacker.unpack(name)?;
     let s = name.try_into()?;
     Ok((s, rest))
@@ -216,22 +262,32 @@ pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, anyhow::Error> {
  */
 impl<'a> TryInto<String> for UnpackedDName<'a> {
     fn try_into(self) -> Result<String, Self::Error> {
-        let mut res = Vec::new();
+        // Phase 1: Calculate exact size needed
+        let mut total_len = 1; // For trailing dot
+        for l in &self.labels {
+            if let Label::String(s) = l {
+                total_len += s.len() + 1; // label + dot
+            }
+        }
+
+        // Phase 2: Single allocation with exact capacity
+        let mut result = String::with_capacity(total_len);
+        
         for l in &self.labels {
             match l {
                 Label::String(s) => {
-                    let lbl = std::str::from_utf8(s)?;
-                    res.push(lbl.to_string());
+                    let label_str = std::str::from_utf8(s)?;
+                    result.push_str(label_str);
+                    result.push('.');
                 }
                 Label::Pointer(_) => {
                     return Err(anyhow!("unpacked names should not contain pointers"));
                 }
-                Label::Root => {
-                    break;
-                }
+                Label::Root => break,
             }
         }
-        Ok(res.join(".") + ".")
+        
+        Ok(result)
     }
 
     type Error = anyhow::Error;
@@ -248,19 +304,19 @@ mod tests {
             0x00,
         ];
 
-        let lbl = Label::try_deserialize(&data).expect("www");
+        let lbl = Label::try_from_bytes(&data).expect("www");
         let lbl: &str = lbl.try_into().unwrap();
         assert_eq!(lbl, "www");
 
-        let lbl = Label::try_deserialize(&data[4..]).expect("google");
+        let lbl = Label::try_from_bytes(&data[4..]).expect("google");
         let lbl: &str = lbl.try_into().unwrap();
         assert_eq!(lbl, "google");
 
-        let lbl = Label::try_deserialize(&data[11..]).expect("fi");
+        let lbl = Label::try_from_bytes(&data[11..]).expect("fi");
         let lbl: &str = lbl.try_into().unwrap();
         assert_eq!(lbl, "fi");
 
-        assert_eq!(Label::try_deserialize(&data[14..]).unwrap(), Label::Root);
+        assert_eq!(Label::try_from_bytes(&data[14..]).unwrap(), Label::Root);
     }
 
     #[test]
@@ -288,5 +344,51 @@ mod tests {
 
         let res = dname_to_bytes("www.google.fi.").expect("www.google.fi");
         assert!(res.iter().zip(&data).all(|(l, r)| l == r));
+    }
+
+    #[test]
+    fn test_pointer_bounds_protection() {
+        // Test bounds checking with an out-of-bounds pointer
+        let data = &[0xc0, 0x50]; // Pointer to offset 80 (message is only 2 bytes)
+        let unpacker = DNameUnpacker::new(data);
+
+        let (dname, _) = DName::try_from_bytes(data).expect("should parse pointer");
+        let result = unpacker.unpack(dname);
+        
+        assert!(result.is_err(), "should fail on bounds check");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("out of bounds") || err_msg.contains("exceeds"), 
+                "got error: {}", err_msg);
+    }
+
+    #[test]
+    fn test_cycle_detection_works() {
+        // Test that cycle detection catches self-referential pointers
+        let data = &[0xc0, 0x00]; // Pointer to offset 0
+        let unpacker = DNameUnpacker::new(data);
+
+        let (dname, _) = DName::try_from_bytes(data).expect("should parse pointer");
+        let result = unpacker.unpack(dname);
+        
+        assert!(result.is_err(), "cycle detection should prevent unpacking");
+        assert!(result.unwrap_err().to_string().contains("circular"));
+    }
+
+    #[test]
+    fn test_depth_limit_prevents_deep_recursion() {
+        // Verify depth limit is enforced
+        // Create a deep but valid pointer structure
+        let mut data = vec![0xc0u8; 102];
+        // Each pointer points forward: 0->2->4...
+        for i in 0..50 {
+            data[i * 2 + 1] = ((i + 1) * 2) as u8;
+        }
+
+        let unpacker = DNameUnpacker::new(&data);
+        let (dname, _) = DName::try_from_bytes(&data[0..2]).expect("should parse");
+        let result = unpacker.unpack(dname);
+        
+        // Should hit depth limit and fail safely
+        assert!(result.is_err(), "depth limit should be enforced");
     }
 }

@@ -19,13 +19,14 @@ fn main() {
         .with_url(&args.hostname, &args.record)
         .build();
 
-    let buf = req.serialize();
+    let mut buf = [0u8; 512];
+    let _ = req.to_bytes(&mut buf).expect("error serializing");
     sock.send_to(&buf, dns_addr).expect("error sending");
 
     let mut buf = [0; 512];
     let _ = sock.recv_from(&mut buf).expect("error receiving");
 
-    let msg = DnsMessage::deserialize(&buf).expect("error deserializing");
+    let msg = DnsMessage::try_from_bytes(&buf).expect("error deserializing");
     if !msg.response {
         println!("not a response, DNS server non-compliant!");
     }
