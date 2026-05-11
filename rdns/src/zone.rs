@@ -270,6 +270,10 @@ fn record_type(rdata: &ResourceRecordKind) -> u16 {
         ResourceRecordKind::MX { .. } => 15,
         ResourceRecordKind::TXT(_) => 16,
         ResourceRecordKind::AAAA(_) => 28,
+        ResourceRecordKind::DS { .. } => 43,
+        ResourceRecordKind::RRSIG { .. } => 46,
+        ResourceRecordKind::NSEC { .. } => 47,
+        ResourceRecordKind::DNSKEY { .. } => 48,
     }
 }
 

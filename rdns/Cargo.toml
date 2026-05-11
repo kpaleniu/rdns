@@ -9,3 +9,12 @@ anyhow = "1.0"
 rand = "0.8"
 num-traits = "0.2"
 num-derive = "0.4"
+
+# DNSSEC crypto
+ring = "0.17"
+base64 = "0.22"
+sha1 = "0.10"
+sha2 = "0.10"
+
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }

@@ -19,12 +19,17 @@ pub mod bench;
 pub mod cache;
 pub mod resolver;
 pub mod metrics;
+pub mod dnssec;
+pub mod telemetry;
 
 #[macro_use]
 mod macros {
     macro_rules! read_be {
         ($dt:ty, $data:expr) => {{
             let sz = std::mem::size_of::<$dt>();
+            if $data.len() < sz {
+                return Err(anyhow::anyhow!("Not enough data to read {}: need {}, have {}", stringify!($dt), sz, $data.len()));
+            }
             (
                 <$dt>::from_be_bytes($data[..sz].try_into().unwrap()),
                 &$data[sz..],
@@ -85,6 +90,34 @@ pub enum ResourceRecordKind {
     },
     TXT(String),
     AAAA(Ipv6Addr),
+    // DNSSEC record types
+    DNSKEY {
+        flags: u16,
+        protocol: u8,
+        algorithm: u8,
+        public_key: Vec<u8>,
+    },
+    RRSIG {
+        type_covered: u16,
+        algorithm: u8,
+        labels: u8,
+        original_ttl: u32,
+        inception: u32,
+        expiration: u32,
+        key_tag: u16,
+        signer_name: String,
+        signature: Vec<u8>,
+    },
+    DS {
+        key_tag: u16,
+        algorithm: u8,
+        digest_type: u8,
+        digest: Vec<u8>,
+    },
+    NSEC {
+        next_domain_name: String,
+        type_bitmap: Vec<u8>,
+    },
 }
 
 impl ResourceRecordKind {
@@ -98,6 +131,10 @@ impl ResourceRecordKind {
             "MX" => Some(15),
             "TXT" => Some(16),
             "AAAA" => Some(28),
+            "DNSKEY" => Some(48),
+            "DS" => Some(43),
+            "NSEC" => Some(47),
+            "RRSIG" => Some(46),
             _ => None,
         }
     }
@@ -155,6 +192,66 @@ impl ResourceRecordKind {
             28 => {
                 let addr: [u8; 16] = rdata.try_into()?;
                 Ok(ResourceRecordKind::AAAA(Ipv6Addr::from(addr)))
+            }
+            // DNSSEC types
+            43 => {
+                // DS: key_tag(2) + algorithm(1) + digest_type(1) + digest(variable)
+                let (key_tag, rest) = read_be!(u16, rdata);
+                let algorithm = rest[0];
+                let digest_type = rest[1];
+                let digest = rest[2..].to_vec();
+                Ok(ResourceRecordKind::DS {
+                    key_tag,
+                    algorithm,
+                    digest_type,
+                    digest,
+                })
+            }
+            46 => {
+                // RRSIG: type_covered(2) + algorithm(1) + labels(1) + original_ttl(4) +
+                // inception(4) + expiration(4) + key_tag(2) + signer_name + signature
+                let (type_covered, rest) = read_be!(u16, rdata);
+                let algorithm = rest[0];
+                let labels = rest[1];
+                let (original_ttl, rest) = read_be!(u32, &rest[2..]);
+                let (inception, rest) = read_be!(u32, rest);
+                let (expiration, rest) = read_be!(u32, rest);
+                let (key_tag, rest) = read_be!(u16, rest);
+                let (signer_name, rest) = dname_from_bytes(rest, unpacker)?;
+                let signature = rest.to_vec();
+                Ok(ResourceRecordKind::RRSIG {
+                    type_covered,
+                    algorithm,
+                    labels,
+                    original_ttl,
+                    inception,
+                    expiration,
+                    key_tag,
+                    signer_name,
+                    signature,
+                })
+            }
+            47 => {
+                // NSEC: next_domain_name + type_bitmap
+                let (next_domain_name, rest) = dname_from_bytes(rdata, unpacker)?;
+                let type_bitmap = rest.to_vec();
+                Ok(ResourceRecordKind::NSEC {
+                    next_domain_name,
+                    type_bitmap,
+                })
+            }
+            48 => {
+                // DNSKEY: flags(2) + protocol(1) + algorithm(1) + public_key(variable)
+                let (flags, rest) = read_be!(u16, rdata);
+                let protocol = rest[0];
+                let algorithm = rest[1];
+                let public_key = rest[2..].to_vec();
+                Ok(ResourceRecordKind::DNSKEY {
+                    flags,
+                    protocol,
+                    algorithm,
+                    public_key,
+                })
             }
             _ => Err(anyhow!("unknown record type: {record_type}")),
         }

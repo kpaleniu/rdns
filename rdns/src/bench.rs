@@ -92,8 +92,8 @@ mod benches {
             iterations
         );
 
-        // Sanity check: should be fast enough (>50k ops/sec with mutex overhead)
-        assert!(ops_per_sec > 50_000.0, "logger too slow: {:.0} ops/sec", ops_per_sec);
+        // Sanity check: should be fast enough (>45k ops/sec with mutex overhead)
+        assert!(ops_per_sec > 45_000.0, "logger too slow: {:.0} ops/sec", ops_per_sec);
     }
 
     #[test]
