@@ -118,6 +118,14 @@ pub enum ResourceRecordKind {
         next_domain_name: String,
         type_bitmap: Vec<u8>,
     },
+    NSEC3 {
+        hash_algorithm: u8,
+        flags: u8,
+        iterations: u16,
+        salt: Vec<u8>,
+        next_hashed_owner: Vec<u8>,
+        type_bitmap: Vec<u8>,
+    },
 }
 
 impl ResourceRecordKind {
@@ -134,6 +142,7 @@ impl ResourceRecordKind {
             "DNSKEY" => Some(48),
             "DS" => Some(43),
             "NSEC" => Some(47),
+            "NSEC3" => Some(50),
             "RRSIG" => Some(46),
             _ => None,
         }

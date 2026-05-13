@@ -273,6 +273,7 @@ fn record_type(rdata: &ResourceRecordKind) -> u16 {
         ResourceRecordKind::DS { .. } => 43,
         ResourceRecordKind::RRSIG { .. } => 46,
         ResourceRecordKind::NSEC { .. } => 47,
+        ResourceRecordKind::NSEC3 { .. } => 50,
         ResourceRecordKind::DNSKEY { .. } => 48,
     }
 }

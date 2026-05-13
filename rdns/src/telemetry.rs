@@ -226,6 +226,11 @@ pub mod instrumentation {
         }
     }
 
+    /// Trace informational event.
+    pub fn trace_info(context: &str, message: &str) {
+        tracing::info!(context, message, "info_event");
+    }
+
     /// Trace error condition.
     pub fn trace_error(context: &str, remote_addr: Option<&IpAddr>, message: &str) {
         if let Some(addr) = remote_addr {
