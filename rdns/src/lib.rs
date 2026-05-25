@@ -70,7 +70,7 @@ pub struct QuerySection {
 }
 
 #[derive(Debug, Clone)]
-pub enum ResourceRecordKind {
+pub enum StandardRecord {
     A(Ipv4Addr),
     NS(String),
     CNAME(String),
@@ -90,7 +90,10 @@ pub enum ResourceRecordKind {
     },
     TXT(String),
     AAAA(Ipv6Addr),
-    // DNSSEC record types
+}
+
+#[derive(Debug, Clone)]
+pub enum DnssecRecord {
     DNSKEY {
         flags: u16,
         protocol: u8,
@@ -128,7 +131,14 @@ pub enum ResourceRecordKind {
     },
 }
 
-impl ResourceRecordKind {
+#[derive(Debug, Clone)]
+pub enum RecordData {
+    Standard(StandardRecord),
+    Dnssec(DnssecRecord),
+    Unknown(u16),
+}
+
+impl RecordData {
     fn to_u16(kind: &str) -> Option<u16> {
         match kind {
             "A" => Some(1),
@@ -156,15 +166,15 @@ impl ResourceRecordKind {
         match record_type {
             1 => {
                 let addr: [u8; 4] = rdata.try_into()?;
-                Ok(ResourceRecordKind::A(Ipv4Addr::from(addr)))
+                Ok(RecordData::Standard(StandardRecord::A(Ipv4Addr::from(addr))))
             }
             2 => {
                 let (nsname, _) = dname_from_bytes(rdata, unpacker)?;
-                Ok(ResourceRecordKind::NS(nsname))
+                Ok(RecordData::Standard(StandardRecord::NS(nsname)))
             }
             5 => {
                 let (cname, _) = dname_from_bytes(rdata, unpacker)?;
-                Ok(ResourceRecordKind::CNAME(cname))
+                Ok(RecordData::Standard(StandardRecord::CNAME(cname)))
             }
             6 => {
                 let (mname, rest) = dname_from_bytes(rdata, unpacker)?;
@@ -175,7 +185,7 @@ impl ResourceRecordKind {
                 let (expire, rest) = read_be!(i32, rest);
                 let (minimum, _) = read_be!(u32, rest);
 
-                Ok(ResourceRecordKind::SOA {
+                Ok(RecordData::Standard(StandardRecord::SOA {
                     mname,
                     rname,
                     serial,
@@ -183,24 +193,24 @@ impl ResourceRecordKind {
                     retry,
                     expire,
                     minimum,
-                })
+                }))
             }
             12 => {
                 let (ptrdname, _) = dname_from_bytes(rdata, unpacker)?;
-                Ok(ResourceRecordKind::PTR(ptrdname))
+                Ok(RecordData::Standard(StandardRecord::PTR(ptrdname)))
             }
             15 => {
                 let (preference, rest) = read_be!(u16, rdata);
                 let (exchange, _) = dname_from_bytes(rest, unpacker)?;
-                Ok(ResourceRecordKind::MX {
+                Ok(RecordData::Standard(StandardRecord::MX {
                     preference,
                     exchange,
-                })
+                }))
             }
-            16 => Ok(ResourceRecordKind::TXT(from_utf8(rdata)?.to_string())),
+            16 => Ok(RecordData::Standard(StandardRecord::TXT(from_utf8(rdata)?.to_string()))),
             28 => {
                 let addr: [u8; 16] = rdata.try_into()?;
-                Ok(ResourceRecordKind::AAAA(Ipv6Addr::from(addr)))
+                Ok(RecordData::Standard(StandardRecord::AAAA(Ipv6Addr::from(addr))))
             }
             // DNSSEC types
             43 => {
@@ -209,12 +219,12 @@ impl ResourceRecordKind {
                 let algorithm = rest[0];
                 let digest_type = rest[1];
                 let digest = rest[2..].to_vec();
-                Ok(ResourceRecordKind::DS {
+                Ok(RecordData::Dnssec(DnssecRecord::DS {
                     key_tag,
                     algorithm,
                     digest_type,
                     digest,
-                })
+                }))
             }
             46 => {
                 // RRSIG: type_covered(2) + algorithm(1) + labels(1) + original_ttl(4) +
@@ -228,7 +238,7 @@ impl ResourceRecordKind {
                 let (key_tag, rest) = read_be!(u16, rest);
                 let (signer_name, rest) = dname_from_bytes(rest, unpacker)?;
                 let signature = rest.to_vec();
-                Ok(ResourceRecordKind::RRSIG {
+                Ok(RecordData::Dnssec(DnssecRecord::RRSIG {
                     type_covered,
                     algorithm,
                     labels,
@@ -238,16 +248,16 @@ impl ResourceRecordKind {
                     key_tag,
                     signer_name,
                     signature,
-                })
+                }))
             }
             47 => {
                 // NSEC: next_domain_name + type_bitmap
                 let (next_domain_name, rest) = dname_from_bytes(rdata, unpacker)?;
                 let type_bitmap = rest.to_vec();
-                Ok(ResourceRecordKind::NSEC {
+                Ok(RecordData::Dnssec(DnssecRecord::NSEC {
                     next_domain_name,
                     type_bitmap,
-                })
+                }))
             }
             48 => {
                 // DNSKEY: flags(2) + protocol(1) + algorithm(1) + public_key(variable)
@@ -255,14 +265,49 @@ impl ResourceRecordKind {
                 let protocol = rest[0];
                 let algorithm = rest[1];
                 let public_key = rest[2..].to_vec();
-                Ok(ResourceRecordKind::DNSKEY {
+                Ok(RecordData::Dnssec(DnssecRecord::DNSKEY {
                     flags,
                     protocol,
                     algorithm,
                     public_key,
-                })
+                }))
             }
-            _ => Err(anyhow!("unknown record type: {record_type}")),
+            50 => {
+                // NSEC3: hash_algorithm(1) + flags(1) + iterations(2) + salt_len(1) + salt(variable) + next_hashed_owner + type_bitmap
+                if rdata.len() < 5 {
+                    return Err(anyhow!("NSEC3 record too short: need at least 5 bytes, got {}", rdata.len()));
+                }
+                let hash_algorithm = rdata[0];
+                let flags = rdata[1];
+                let (iterations, rest) = read_be!(u16, &rdata[2..]);
+                let salt_len = rest[0] as usize;
+                if rest.len() < 1 + salt_len {
+                    return Err(anyhow!("NSEC3 salt extends beyond record boundary"));
+                }
+                let salt = rest[1..1+salt_len].to_vec();
+                let rest = &rest[1+salt_len..];
+                
+                // next_hashed_owner is a raw byte string (not a domain name)
+                if rest.is_empty() {
+                    return Err(anyhow!("NSEC3 record missing next_hashed_owner"));
+                }
+                let next_owner_len = rest[0] as usize;
+                if rest.len() < 1 + next_owner_len {
+                    return Err(anyhow!("NSEC3 next_hashed_owner extends beyond record boundary"));
+                }
+                let next_hashed_owner = rest[1..1+next_owner_len].to_vec();
+                let type_bitmap = rest[1+next_owner_len..].to_vec();
+                
+                Ok(RecordData::Dnssec(DnssecRecord::NSEC3 {
+                    hash_algorithm,
+                    flags,
+                    iterations,
+                    salt,
+                    next_hashed_owner,
+                    type_bitmap,
+                }))
+            }
+            _ => Ok(RecordData::Unknown(record_type)),
         }
     }
 }
@@ -272,7 +317,7 @@ pub struct ResourceRecord {
     pub name: String,
     pub class: u16,
     pub ttl: i32, // As per 2.3.3 in RFC 1035
-    pub rdata: ResourceRecordKind,
+    pub rdata: RecordData,
 }
 
 #[derive(Debug, FromPrimitive, ToPrimitive, Clone)]
@@ -363,7 +408,7 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
         let (rdatalen, rest) = read_be!(u16, rest);
         let rdata = &rest[..rdatalen as usize];
 
-        let rdata = ResourceRecordKind::try_from_bytes(record_type, rdata, unpacker)?;
+        let rdata = RecordData::try_from_bytes(record_type, rdata, unpacker)?;
         Ok((
             Self {
                 name,
@@ -481,7 +526,7 @@ impl DnsMessageBuilder {
     }
 
     pub fn with_url(mut self, url: &str, query_type: &str) -> Self {
-        if let Some(q) = ResourceRecordKind::to_u16(query_type) {
+        if let Some(q) = RecordData::to_u16(query_type) {
             self.queries.push((url.to_owned(), q));
         }
         self

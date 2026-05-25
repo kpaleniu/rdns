@@ -187,14 +187,14 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
-    use crate::ResourceRecordKind;
+    use crate::{ResourceRecord, RecordData, StandardRecord};
 
     fn create_test_record(name: &str, ttl: i32) -> ResourceRecord {
         ResourceRecord {
             name: name.to_string(),
             class: 1,
             ttl,
-            rdata: ResourceRecordKind::A(Ipv4Addr::new(192, 0, 2, 1)),
+            rdata: RecordData::Standard(StandardRecord::A(Ipv4Addr::new(192, 0, 2, 1))),
         }
     }
 

@@ -131,9 +131,7 @@ impl RequestValidator {
         // Parse query names (basic validation without full parsing)
         if offset < data.len() {
             // Attempt to validate first query domain name
-            if let Err(e) = self.validate_domain_name_at(&data, &mut offset, 0) {
-                return Err(e);
-            }
+            self.validate_domain_name_at(data, &mut offset, 0)?;
         }
 
         Ok(())

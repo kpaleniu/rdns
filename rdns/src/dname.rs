@@ -51,7 +51,6 @@ impl<'a> TryInto<&'a str> for Label<'a> {
  * * Extended label, if top 2 bits are 01
  *   * Not supported until I read through RFC6891
  */
-
 impl<'a> TryFromBytes<'a> for Label<'a> {
     type Output = Label<'a>;
     type Error = anyhow::Error;
@@ -108,7 +107,6 @@ Quoting from RFC 1035:
 
 TODO: Implement validation to enforce this pattern
 */
-
 impl<'a> TryFromBytes<'a> for DName<'a> {
     type Output = (DName<'a>, &'a [u8]);
     type Error = anyhow::Error;
@@ -140,7 +138,6 @@ impl<'a> TryFromBytes<'a> for DName<'a> {
  * need a lookup mechanism to hop anywhere in the original set of bytes. Unpacker
  * gets contructed with the original bytes and thus is able to perform the lookup.
  */
-
 pub struct DNameUnpacker<'a> {
     data: &'a [u8],
     visited: RefCell<HashSet<usize>>,

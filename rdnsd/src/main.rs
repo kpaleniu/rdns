@@ -497,8 +497,8 @@ fn extract_zone_origin_from_path(path: &str) -> String {
         .unwrap_or("zone");
     
     // Remove .zone extension if present
-    let origin = if file_name.ends_with(".zone") {
-        &file_name[..file_name.len() - 5]
+    let origin = if let Some(stripped) = file_name.strip_suffix(".zone") {
+        stripped
     } else {
         file_name
     };

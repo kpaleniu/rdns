@@ -1,4 +1,4 @@
-use crate::ResourceRecordKind;
+use crate::{RecordData, StandardRecord};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// A single DNS resource record stored in a zone
@@ -7,7 +7,7 @@ pub struct ZoneRecord {
     pub name: String,
     pub ttl: i32,
     pub class: u16, // typically 1 for IN
-    pub rdata: ResourceRecordKind,
+    pub rdata: RecordData,
 }
 
 /// In-memory DNS zone storage
@@ -180,28 +180,28 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
         let rdata = match record_type.as_str() {
             "A" => {
                 if let Ok(addr) = rdata.parse::<Ipv4Addr>() {
-                    Some(ResourceRecordKind::A(addr))
+                    Some(RecordData::Standard(StandardRecord::A(addr)))
                 } else {
                     None
                 }
             }
             "AAAA" => {
                 if let Ok(addr) = rdata.parse::<Ipv6Addr>() {
-                    Some(ResourceRecordKind::AAAA(addr))
+                    Some(RecordData::Standard(StandardRecord::AAAA(addr)))
                 } else {
                     None
                 }
             }
-            "NS" => Some(ResourceRecordKind::NS(rdata)),
-            "CNAME" => Some(ResourceRecordKind::CNAME(rdata)),
+            "NS" => Some(RecordData::Standard(StandardRecord::NS(rdata))),
+            "CNAME" => Some(RecordData::Standard(StandardRecord::CNAME(rdata))),
             "MX" => {
                 let mx_parts: Vec<&str> = rdata.split_whitespace().collect();
                 if mx_parts.len() >= 2 {
                     if let Ok(pref) = mx_parts[0].parse::<u16>() {
-                        Some(ResourceRecordKind::MX {
+                        Some(RecordData::Standard(StandardRecord::MX {
                             preference: pref,
                             exchange: mx_parts[1..].join(" "),
-                        })
+                        }))
                     } else {
                         None
                     }
@@ -214,9 +214,9 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
                 let txt_data = rdata
                     .trim_matches('"')
                     .to_string();
-                Some(ResourceRecordKind::TXT(txt_data))
+                Some(RecordData::Standard(StandardRecord::TXT(txt_data)))
             }
-            "PTR" => Some(ResourceRecordKind::PTR(rdata)),
+            "PTR" => Some(RecordData::Standard(StandardRecord::PTR(rdata))),
             "SOA" => {
                 let soa_parts: Vec<&str> = rdata.split_whitespace().collect();
                 if soa_parts.len() >= 7 {
@@ -227,7 +227,7 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
                         soa_parts[5].parse::<i32>(),
                         soa_parts[6].parse::<u32>(),
                     ) {
-                        Some(ResourceRecordKind::SOA {
+                        Some(RecordData::Standard(StandardRecord::SOA {
                             mname: soa_parts[0].to_string(),
                             rname: soa_parts[1].to_string(),
                             serial,
@@ -235,7 +235,7 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
                             retry,
                             expire,
                             minimum,
-                        })
+                        }))
                     } else {
                         None
                     }
@@ -259,22 +259,27 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
     Ok(zone)
 }
 
-/// Get the numeric type ID from ResourceRecordKind
-fn record_type(rdata: &ResourceRecordKind) -> u16 {
+/// Get the numeric type ID from RecordData
+fn record_type(rdata: &RecordData) -> u16 {
     match rdata {
-        ResourceRecordKind::A(_) => 1,
-        ResourceRecordKind::NS(_) => 2,
-        ResourceRecordKind::CNAME(_) => 5,
-        ResourceRecordKind::SOA { .. } => 6,
-        ResourceRecordKind::PTR(_) => 12,
-        ResourceRecordKind::MX { .. } => 15,
-        ResourceRecordKind::TXT(_) => 16,
-        ResourceRecordKind::AAAA(_) => 28,
-        ResourceRecordKind::DS { .. } => 43,
-        ResourceRecordKind::RRSIG { .. } => 46,
-        ResourceRecordKind::NSEC { .. } => 47,
-        ResourceRecordKind::NSEC3 { .. } => 50,
-        ResourceRecordKind::DNSKEY { .. } => 48,
+        RecordData::Standard(sr) => match sr {
+            StandardRecord::A(_) => 1,
+            StandardRecord::NS(_) => 2,
+            StandardRecord::CNAME(_) => 5,
+            StandardRecord::SOA { .. } => 6,
+            StandardRecord::PTR(_) => 12,
+            StandardRecord::MX { .. } => 15,
+            StandardRecord::TXT(_) => 16,
+            StandardRecord::AAAA(_) => 28,
+        },
+        RecordData::Dnssec(dr) => match dr {
+            crate::DnssecRecord::DS { .. } => 43,
+            crate::DnssecRecord::RRSIG { .. } => 46,
+            crate::DnssecRecord::NSEC { .. } => 47,
+            crate::DnssecRecord::DNSKEY { .. } => 48,
+            crate::DnssecRecord::NSEC3 { .. } => 50,
+        },
+        RecordData::Unknown(type_id) => *type_id,
     }
 }
 
