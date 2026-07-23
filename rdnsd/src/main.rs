@@ -76,6 +76,8 @@ fn make_response(
         truncation: false,
         recursion: msg.recursion,
         recursion_ok: false,
+        ad: false,
+        cd: msg.cd,
         rcode: ResponseCode::Ok,
         queries: msg.queries.clone(),
         answers: Vec::new(),

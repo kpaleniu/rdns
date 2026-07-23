@@ -2,6 +2,7 @@
 members = [
     "rdns",
     "rdnsc",
-    "rdnsd"
+    "rdnsd",
+    "rdnsr"
 ]
 resolver = "2"

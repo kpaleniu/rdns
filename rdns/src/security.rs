@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::utils::current_unix_timestamp;
 
 /// Configuration for rate limiting
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ impl RateLimiter {
         RateLimiter {
             config,
             buckets: Arc::new(Mutex::new(HashMap::new())),
-            last_cleanup: Arc::new(Mutex::new(Self::current_time())),
+            last_cleanup: Arc::new(Mutex::new(current_unix_timestamp())),
         }
     }
 
@@ -56,7 +56,7 @@ impl RateLimiter {
 
     /// Check if a request from the given IP should be allowed
     pub fn should_allow(&self, ip: IpAddr) -> bool {
-        let now = Self::current_time();
+        let now = current_unix_timestamp();
         
         // Cleanup old entries periodically
         self.cleanup_if_needed(now);
@@ -109,13 +109,6 @@ impl RateLimiter {
         buckets.retain(|_, bucket| {
             now - bucket.last_refill < self.config.cleanup_interval_secs
         });
-    }
-
-    fn current_time() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
     }
 
     /// Get statistics (for monitoring)

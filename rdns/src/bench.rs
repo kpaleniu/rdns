@@ -1,6 +1,6 @@
-/// Performance benchmarking for Phase 3 features
-/// This module provides utilities to measure the impact of rate limiting,
-/// validation, and logging on DNS query performance.
+//! Performance benchmarking for Phase 3 features
+//! This module provides utilities to measure the impact of rate limiting,
+//! validation, and logging on DNS query performance.
 
 #[cfg(test)]
 mod benches {
@@ -203,21 +203,22 @@ mod benches {
     fn bench_nested_record_type_matching() {
         // Performance review: nested enum pattern matching in zone queries
         // This tests the hot path: zone.query() -> record_type() matching
-        use crate::{ResourceRecord, RecordData, StandardRecord, DnssecRecord};
+        use crate::{ResourceRecord, RecordData, ParsedRecord};
         use std::net::{Ipv4Addr, Ipv6Addr};
 
+        let build = |parsed: ParsedRecord| RecordData::from_parsed(&parsed).unwrap();
         let records = vec![
             ResourceRecord {
                 name: "www.example.com.".to_string(),
                 class: 1,
                 ttl: 3600,
-                rdata: RecordData::Standard(StandardRecord::A(Ipv4Addr::new(1, 2, 3, 4))),
+                rdata: build(ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))),
             },
             ResourceRecord {
                 name: "mail.example.com.".to_string(),
                 class: 1,
                 ttl: 3600,
-                rdata: RecordData::Standard(StandardRecord::MX {
+                rdata: build(ParsedRecord::MX {
                     preference: 10,
                     exchange: "mx.example.com.".to_string(),
                 }),
@@ -226,19 +227,19 @@ mod benches {
                 name: "example.com.".to_string(),
                 class: 1,
                 ttl: 3600,
-                rdata: RecordData::Standard(StandardRecord::NS("ns1.example.com.".to_string())),
+                rdata: build(ParsedRecord::NS("ns1.example.com.".to_string())),
             },
             ResourceRecord {
                 name: "ipv6.example.com.".to_string(),
                 class: 1,
                 ttl: 3600,
-                rdata: RecordData::Standard(StandardRecord::AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+                rdata: build(ParsedRecord::AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
             },
             ResourceRecord {
                 name: "example.com.".to_string(),
                 class: 1,
                 ttl: 3600,
-                rdata: RecordData::Dnssec(DnssecRecord::DNSKEY {
+                rdata: build(ParsedRecord::DNSKEY {
                     flags: 256,
                     protocol: 3,
                     algorithm: 8,
@@ -249,7 +250,7 @@ mod benches {
                 name: "example.com.".to_string(),
                 class: 1,
                 ttl: 3600,
-                rdata: RecordData::Dnssec(DnssecRecord::DS {
+                rdata: build(ParsedRecord::DS {
                     key_tag: 12345,
                     algorithm: 8,
                     digest_type: 2,
@@ -263,60 +264,45 @@ mod benches {
 
         for _ in 0..iterations {
             for record in &records {
-                // Simulate zone query type matching (2-level nested match)
-                let _type_id = match &record.rdata {
-                    RecordData::Standard(sr) => match sr {
-                        StandardRecord::A(_) => 1u16,
-                        StandardRecord::NS(_) => 2u16,
-                        StandardRecord::CNAME(_) => 5u16,
-                        StandardRecord::SOA { .. } => 6u16,
-                        StandardRecord::PTR(_) => 12u16,
-                        StandardRecord::MX { .. } => 15u16,
-                        StandardRecord::TXT(_) => 16u16,
-                        StandardRecord::AAAA(_) => 28u16,
-                    },
-                    RecordData::Dnssec(dr) => match dr {
-                        DnssecRecord::DS { .. } => 43u16,
-                        DnssecRecord::RRSIG { .. } => 46u16,
-                        DnssecRecord::NSEC { .. } => 47u16,
-                        DnssecRecord::DNSKEY { .. } => 48u16,
-                        DnssecRecord::NSEC3 { .. } => 50u16,
-                    },
-                    RecordData::Unknown(id) => *id,
-                };
+                // With raw-byte storage the record type is a direct field read,
+                // not a two-level enum match.
+                let _type_id = record.rdata.rtype;
+                std::hint::black_box(_type_id);
             }
         }
 
         let elapsed = start.elapsed();
         let ops_per_sec = (iterations * records.len()) as f64 / elapsed.as_secs_f64();
         println!(
-            "Nested Pattern Matching: {:.0} ops/sec ({:.3}μs per match)",
+            "Record type lookup: {:.0} ops/sec ({:.3}μs per lookup)",
             ops_per_sec,
             elapsed.as_secs_f64() * 1_000_000.0 / (iterations * records.len()) as f64
         );
 
-        // Sanity check: should be very fast (compiler should inline the matches)
-        assert!(ops_per_sec > 100_000_000.0, "nested matching too slow: {:.0} ops/sec", ops_per_sec);
+        // Gross-regression floor, not a benchmark: a plain field read should never
+        // drop to parse-like cost. Kept well below the observed debug-build rate
+        // (~150M ops/sec) so parallel-test CPU contention doesn't make it flaky.
+        assert!(ops_per_sec > 10_000_000.0, "type lookup too slow: {:.0} ops/sec", ops_per_sec);
     }
 
     #[test]
     fn bench_recorddata_clone_performance() {
         // Test cloning performance of RecordData (refactoring impact on cache/storage)
-        use crate::{RecordData, StandardRecord, DnssecRecord};
+        use crate::{RecordData, ParsedRecord};
 
-        // Most common case: StandardRecord with String data (NS/CNAME/MX/TXT)
-        let mx_record = RecordData::Standard(StandardRecord::MX {
+        // Most common case: a name-bearing record (NS/CNAME/MX/TXT).
+        let mx_record = RecordData::from_parsed(&ParsedRecord::MX {
             preference: 10,
             exchange: "mail.example.com.".to_string(),
-        });
+        }).unwrap();
 
-        // Less common: DNSSEC with Vec<u8> (cryptographic data)
-        let dnskey_record = RecordData::Dnssec(DnssecRecord::DNSKEY {
+        // Less common: DNSSEC with a large key.
+        let dnskey_record = RecordData::from_parsed(&ParsedRecord::DNSKEY {
             flags: 256,
             protocol: 3,
             algorithm: 8,
             public_key: vec![0; 256], // 256-byte RSA public key
-        });
+        }).unwrap();
 
         let iterations = 100_000;
 

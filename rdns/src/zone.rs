@@ -1,4 +1,5 @@
-use crate::{RecordData, StandardRecord};
+use crate::{ParsedRecord, RecordData};
+use crate::utils::record_type_code;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// A single DNS resource record stored in a zone
@@ -39,12 +40,12 @@ impl Zone {
     pub fn query(&self, name: &str, qtype: u16) -> Vec<&ZoneRecord> {
         self.records
             .iter()
-            .filter(|r| self.matches_query(&r.name, name) && record_type(&r.rdata) == qtype)
+            .filter(|r| self.matches_query(&r.name, name) && record_type_code(&r.rdata) == qtype)
             .collect()
     }
 
     /// Helper to match domain names, handling wildcards and relative names
-    fn matches_query(&self, record_name: &str, query_name: &str) -> bool {
+    pub fn matches_query(&self, record_name: &str, query_name: &str) -> bool {
         let record_name = self.normalize_name(record_name);
         let query_name = self.normalize_name(query_name);
         
@@ -82,13 +83,126 @@ impl Zone {
     }
 }
 
+fn parse_hex(hex_str: &str) -> Result<Vec<u8>, String> {
+    let hex_str = hex_str.trim();
+    if !hex_str.len().is_multiple_of(2) {
+        return Err("Odd number of hexadecimal digits".to_string());
+    }
+    let mut res = Vec::with_capacity(hex_str.len() / 2);
+    let chars: Vec<char> = hex_str.chars().collect();
+    for i in (0..chars.len()).step_by(2) {
+        let high = chars[i].to_digit(16).ok_or("Invalid hex digit")? as u8;
+        let low = chars[i+1].to_digit(16).ok_or("Invalid hex digit")? as u8;
+        res.push((high << 4) | low);
+    }
+    Ok(res)
+}
+
+fn parse_base32_hex(input: &str) -> Result<Vec<u8>, String> {
+    let input = input.trim().to_uppercase();
+    let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    let char_to_val = |c: u8| -> Option<u8> {
+        alphabet.iter().position(|&x| x == c).map(|p| p as u8)
+    };
+    
+    let mut bits = 0u64;
+    let mut count = 0;
+    let mut res = Vec::new();
+    
+    for &c in input.as_bytes() {
+        if c == b'=' {
+            break; // Skip padding
+        }
+        let val = char_to_val(c).ok_or_else(|| format!("Invalid Base32 hex character: {}", c as char))?;
+        bits = (bits << 5) | (val as u64);
+        count += 5;
+        if count >= 8 {
+            res.push((bits >> (count - 8)) as u8);
+            count -= 8;
+        }
+    }
+    Ok(res)
+}
+
+fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
+    if let Ok(epoch) = time_str.parse::<u32>() {
+        return Ok(epoch);
+    }
+    if time_str.len() == 14 {
+        let year = time_str[0..4].parse::<i32>().map_err(|e| e.to_string())?;
+        let month = time_str[4..6].parse::<i32>().map_err(|e| e.to_string())?;
+        let day = time_str[6..8].parse::<i32>().map_err(|e| e.to_string())?;
+        let hour = time_str[8..10].parse::<i32>().map_err(|e| e.to_string())?;
+        let min = time_str[10..12].parse::<i32>().map_err(|e| e.to_string())?;
+        let sec = time_str[12..14].parse::<i32>().map_err(|e| e.to_string())?;
+        
+        let is_leap = |y| (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        let days_in_month = |m, y| match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => if is_leap(y) { 29 } else { 28 },
+            _ => 0,
+        };
+        
+        let mut total_days = 0;
+        for y in 1970..year {
+            total_days += if is_leap(y) { 366 } else { 365 };
+        }
+        for m in 1..month {
+            total_days += days_in_month(m, year);
+        }
+        total_days += day - 1;
+        
+        let epoch = total_days as i64 * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
+        return Ok(epoch as u32);
+    }
+    Err(format!("Invalid DNSSEC time format: {}", time_str))
+}
+
+fn construct_type_bitmap(types: &[String]) -> Vec<u8> {
+    let mut codes = Vec::new();
+    for t in types {
+        if let Some(code) = crate::utils::record_type_name_to_code(t) {
+            codes.push(code);
+        }
+    }
+    codes.sort();
+    codes.dedup();
+    
+    let mut blocks: std::collections::BTreeMap<u8, Vec<u8>> = std::collections::BTreeMap::new();
+    for code in codes {
+        let block_num = (code / 256) as u8;
+        let block_offset = (code % 256) as u8;
+        let byte_offset = (block_offset / 8) as usize;
+        let bit_offset = block_offset % 8;
+        
+        let bitmap = blocks.entry(block_num).or_insert_with(|| vec![0u8; 32]);
+        bitmap[byte_offset] |= 1 << (7 - bit_offset);
+    }
+    
+    let mut result = Vec::new();
+    for (block_num, bitmap) in blocks {
+        let mut len = 32;
+        while len > 0 && bitmap[len - 1] == 0 {
+            len -= 1;
+        }
+        if len > 0 {
+            result.push(block_num);
+            result.push(len as u8);
+            result.extend_from_slice(&bitmap[..len]);
+        }
+    }
+    result
+}
+
 /// Parse a BIND-format zone file
 pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
     let mut zone = Zone::new(origin.to_string());
     let mut current_name = String::new();
     let mut current_ttl = 3600i32;
 
-    for line in content.lines() {
+    for (line_idx, line) in content.lines().enumerate() {
+        let ln = line_idx + 1;
         // Remove comments
         let line = line.split(';').next().unwrap_or("").trim();
         
@@ -113,7 +227,9 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
         if line.starts_with("$TTL") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
-                current_ttl = parts[1].parse().unwrap_or(3600);
+                current_ttl = parts[1]
+                    .parse()
+                    .map_err(|e| format!("line {ln}: invalid $TTL {:?}: {e}", parts[1]))?;
             }
             continue;
         }
@@ -177,110 +293,258 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
         idx += 1;
         let rdata = parts[idx..].join(" ");
 
-        let rdata = match record_type.as_str() {
+        let rdata: RecordData = match record_type.as_str() {
             "A" => {
-                if let Ok(addr) = rdata.parse::<Ipv4Addr>() {
-                    Some(RecordData::Standard(StandardRecord::A(addr)))
-                } else {
-                    None
-                }
+                let addr = rdata
+                    .parse::<Ipv4Addr>()
+                    .map_err(|e| format!("line {ln}: invalid A address {rdata:?}: {e}"))?;
+                RecordData::from_parsed(&ParsedRecord::A(addr))
+                    .map_err(|e| format!("line {ln}: A record: {e}"))?
             }
             "AAAA" => {
-                if let Ok(addr) = rdata.parse::<Ipv6Addr>() {
-                    Some(RecordData::Standard(StandardRecord::AAAA(addr)))
-                } else {
-                    None
-                }
+                let addr = rdata
+                    .parse::<Ipv6Addr>()
+                    .map_err(|e| format!("line {ln}: invalid AAAA address {rdata:?}: {e}"))?;
+                RecordData::from_parsed(&ParsedRecord::AAAA(addr))
+                    .map_err(|e| format!("line {ln}: AAAA record: {e}"))?
             }
-            "NS" => Some(RecordData::Standard(StandardRecord::NS(rdata))),
-            "CNAME" => Some(RecordData::Standard(StandardRecord::CNAME(rdata))),
+            "NS" => RecordData::from_parsed(&ParsedRecord::NS(rdata))
+                .map_err(|e| format!("line {ln}: NS record: {e}"))?,
+            "CNAME" => RecordData::from_parsed(&ParsedRecord::CNAME(rdata))
+                .map_err(|e| format!("line {ln}: CNAME record: {e}"))?,
             "MX" => {
                 let mx_parts: Vec<&str> = rdata.split_whitespace().collect();
-                if mx_parts.len() >= 2 {
-                    if let Ok(pref) = mx_parts[0].parse::<u16>() {
-                        Some(RecordData::Standard(StandardRecord::MX {
-                            preference: pref,
-                            exchange: mx_parts[1..].join(" "),
-                        }))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                if mx_parts.len() < 2 {
+                    return Err(format!(
+                        "line {ln}: MX record needs preference and exchange, got {:?}",
+                        rdata
+                    ));
                 }
+                let preference = mx_parts[0]
+                    .parse::<u16>()
+                    .map_err(|e| format!("line {ln}: invalid MX preference {:?}: {e}", mx_parts[0]))?;
+                RecordData::from_parsed(&ParsedRecord::MX {
+                    preference,
+                    exchange: mx_parts[1..].join(" "),
+                })
+                .map_err(|e| format!("line {ln}: MX record: {e}"))?
             }
             "TXT" => {
                 // Remove quotes from TXT records
-                let txt_data = rdata
-                    .trim_matches('"')
-                    .to_string();
-                Some(RecordData::Standard(StandardRecord::TXT(txt_data)))
+                let txt_data = rdata.trim_matches('"').to_string();
+                RecordData::from_parsed(&ParsedRecord::TXT(txt_data))
+                    .map_err(|e| format!("line {ln}: TXT record: {e}"))?
             }
-            "PTR" => Some(RecordData::Standard(StandardRecord::PTR(rdata))),
+            "PTR" => RecordData::from_parsed(&ParsedRecord::PTR(rdata))
+                .map_err(|e| format!("line {ln}: PTR record: {e}"))?,
             "SOA" => {
                 let soa_parts: Vec<&str> = rdata.split_whitespace().collect();
-                if soa_parts.len() >= 7 {
-                    if let (Ok(serial), Ok(refresh), Ok(retry), Ok(expire), Ok(minimum)) = (
-                        soa_parts[2].parse::<u32>(),
-                        soa_parts[3].parse::<i32>(),
-                        soa_parts[4].parse::<i32>(),
-                        soa_parts[5].parse::<i32>(),
-                        soa_parts[6].parse::<u32>(),
-                    ) {
-                        Some(RecordData::Standard(StandardRecord::SOA {
-                            mname: soa_parts[0].to_string(),
-                            rname: soa_parts[1].to_string(),
-                            serial,
-                            refresh,
-                            retry,
-                            expire,
-                            minimum,
-                        }))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                if soa_parts.len() < 7 {
+                    return Err(format!(
+                        "line {ln}: SOA record needs 7 fields, got {}",
+                        soa_parts.len()
+                    ));
                 }
+                let serial = soa_parts[2]
+                    .parse::<u32>()
+                    .map_err(|e| format!("line {ln}: invalid SOA serial {:?}: {e}", soa_parts[2]))?;
+                let refresh = soa_parts[3]
+                    .parse::<i32>()
+                    .map_err(|e| format!("line {ln}: invalid SOA refresh {:?}: {e}", soa_parts[3]))?;
+                let retry = soa_parts[4]
+                    .parse::<i32>()
+                    .map_err(|e| format!("line {ln}: invalid SOA retry {:?}: {e}", soa_parts[4]))?;
+                let expire = soa_parts[5]
+                    .parse::<i32>()
+                    .map_err(|e| format!("line {ln}: invalid SOA expire {:?}: {e}", soa_parts[5]))?;
+                let minimum = soa_parts[6]
+                    .parse::<u32>()
+                    .map_err(|e| format!("line {ln}: invalid SOA minimum {:?}: {e}", soa_parts[6]))?;
+                RecordData::from_parsed(&ParsedRecord::SOA {
+                    mname: soa_parts[0].to_string(),
+                    rname: soa_parts[1].to_string(),
+                    serial,
+                    refresh,
+                    retry,
+                    expire,
+                    minimum,
+                })
+                .map_err(|e| format!("line {ln}: SOA record: {e}"))?
             }
-            _ => None,
+            "DNSKEY" => {
+                let key_parts = &parts[idx..];
+                if key_parts.len() < 4 {
+                    return Err(format!(
+                        "line {ln}: DNSKEY record needs 4 fields, got {}",
+                        key_parts.len()
+                    ));
+                }
+                let flags = key_parts[0]
+                    .parse::<u16>()
+                    .map_err(|e| format!("line {ln}: invalid DNSKEY flags {:?}: {e}", key_parts[0]))?;
+                let protocol = key_parts[1]
+                    .parse::<u8>()
+                    .map_err(|e| format!("line {ln}: invalid DNSKEY protocol {:?}: {e}", key_parts[1]))?;
+                let algorithm = key_parts[2]
+                    .parse::<u8>()
+                    .map_err(|e| format!("line {ln}: invalid DNSKEY algorithm {:?}: {e}", key_parts[2]))?;
+                let b64_key = key_parts[3..].join("");
+                let public_key =
+                    base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_key)
+                        .map_err(|e| format!("line {ln}: invalid DNSKEY base64 key: {e}"))?;
+                RecordData::from_parsed(&ParsedRecord::DNSKEY {
+                    flags,
+                    protocol,
+                    algorithm,
+                    public_key,
+                })
+                .map_err(|e| format!("line {ln}: DNSKEY record: {e}"))?
+            }
+            "DS" => {
+                let ds_parts = &parts[idx..];
+                if ds_parts.len() < 4 {
+                    return Err(format!(
+                        "line {ln}: DS record needs 4 fields, got {}",
+                        ds_parts.len()
+                    ));
+                }
+                let key_tag = ds_parts[0]
+                    .parse::<u16>()
+                    .map_err(|e| format!("line {ln}: invalid DS key tag {:?}: {e}", ds_parts[0]))?;
+                let algorithm = ds_parts[1]
+                    .parse::<u8>()
+                    .map_err(|e| format!("line {ln}: invalid DS algorithm {:?}: {e}", ds_parts[1]))?;
+                let digest_type = ds_parts[2]
+                    .parse::<u8>()
+                    .map_err(|e| format!("line {ln}: invalid DS digest type {:?}: {e}", ds_parts[2]))?;
+                let hex_digest = ds_parts[3..].join("");
+                let digest = parse_hex(&hex_digest)
+                    .map_err(|e| format!("line {ln}: invalid DS digest: {e}"))?;
+                RecordData::from_parsed(&ParsedRecord::DS {
+                    key_tag,
+                    algorithm,
+                    digest_type,
+                    digest,
+                })
+                .map_err(|e| format!("line {ln}: DS record: {e}"))?
+            }
+            "RRSIG" => {
+                let rrsig_parts = &parts[idx..];
+                if rrsig_parts.len() < 9 {
+                    return Err(format!(
+                        "line {ln}: RRSIG record needs 9 fields, got {}",
+                        rrsig_parts.len()
+                    ));
+                }
+                let type_covered = crate::utils::record_type_name_to_code(rrsig_parts[0])
+                    .ok_or_else(|| {
+                        format!("line {ln}: unknown RRSIG type covered {:?}", rrsig_parts[0])
+                    })?;
+                let algorithm = rrsig_parts[1]
+                    .parse::<u8>()
+                    .map_err(|e| format!("line {ln}: invalid RRSIG algorithm {:?}: {e}", rrsig_parts[1]))?;
+                let labels = rrsig_parts[2]
+                    .parse::<u8>()
+                    .map_err(|e| format!("line {ln}: invalid RRSIG labels {:?}: {e}", rrsig_parts[2]))?;
+                let original_ttl = rrsig_parts[3]
+                    .parse::<u32>()
+                    .map_err(|e| format!("line {ln}: invalid RRSIG original TTL {:?}: {e}", rrsig_parts[3]))?;
+                let expiration = parse_dnssec_time(rrsig_parts[4])
+                    .map_err(|e| format!("line {ln}: invalid RRSIG expiration {:?}: {e}", rrsig_parts[4]))?;
+                let inception = parse_dnssec_time(rrsig_parts[5])
+                    .map_err(|e| format!("line {ln}: invalid RRSIG inception {:?}: {e}", rrsig_parts[5]))?;
+                let key_tag = rrsig_parts[6]
+                    .parse::<u16>()
+                    .map_err(|e| format!("line {ln}: invalid RRSIG key tag {:?}: {e}", rrsig_parts[6]))?;
+                let signer_name = rrsig_parts[7].to_string();
+                let b64_sig = rrsig_parts[8..].join("");
+                let signature =
+                    base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_sig)
+                        .map_err(|e| format!("line {ln}: invalid RRSIG base64 signature: {e}"))?;
+                RecordData::from_parsed(&ParsedRecord::RRSIG {
+                    type_covered,
+                    algorithm,
+                    labels,
+                    original_ttl,
+                    expiration,
+                    inception,
+                    key_tag,
+                    signer_name,
+                    signature,
+                })
+                .map_err(|e| format!("line {ln}: RRSIG record: {e}"))?
+            }
+            "NSEC" => {
+                let nsec_parts = &parts[idx..];
+                if nsec_parts.len() < 2 {
+                    return Err(format!(
+                        "line {ln}: NSEC record needs next domain and at least one type, got {}",
+                        nsec_parts.len()
+                    ));
+                }
+                let next_domain_name = nsec_parts[0].to_string();
+                let type_names: Vec<String> =
+                    nsec_parts[1..].iter().map(|s| s.to_string()).collect();
+                let type_bitmap = construct_type_bitmap(&type_names);
+                RecordData::from_parsed(&ParsedRecord::NSEC {
+                    next_domain_name,
+                    type_bitmap,
+                })
+                .map_err(|e| format!("line {ln}: NSEC record: {e}"))?
+            }
+            "NSEC3" => {
+                let nsec3_parts = &parts[idx..];
+                if nsec3_parts.len() < 5 {
+                    return Err(format!(
+                        "line {ln}: NSEC3 record needs at least 5 fields, got {}",
+                        nsec3_parts.len()
+                    ));
+                }
+                let hash_algorithm = nsec3_parts[0]
+                    .parse::<u8>()
+                    .map_err(|e| format!("line {ln}: invalid NSEC3 hash algorithm {:?}: {e}", nsec3_parts[0]))?;
+                let flags = nsec3_parts[1]
+                    .parse::<u8>()
+                    .map_err(|e| format!("line {ln}: invalid NSEC3 flags {:?}: {e}", nsec3_parts[1]))?;
+                let iterations = nsec3_parts[2]
+                    .parse::<u16>()
+                    .map_err(|e| format!("line {ln}: invalid NSEC3 iterations {:?}: {e}", nsec3_parts[2]))?;
+                let salt_str = nsec3_parts[3];
+                let salt = if salt_str == "-" {
+                    Vec::new()
+                } else {
+                    parse_hex(salt_str)
+                        .map_err(|e| format!("line {ln}: invalid NSEC3 salt {:?}: {e}", salt_str))?
+                };
+                let next_hashed_owner = parse_base32_hex(nsec3_parts[4])
+                    .map_err(|e| format!("line {ln}: invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4]))?;
+                let type_names: Vec<String> =
+                    nsec3_parts[5..].iter().map(|s| s.to_string()).collect();
+                let type_bitmap = construct_type_bitmap(&type_names);
+                RecordData::from_parsed(&ParsedRecord::NSEC3 {
+                    hash_algorithm,
+                    flags,
+                    iterations,
+                    salt,
+                    next_hashed_owner,
+                    type_bitmap,
+                })
+                .map_err(|e| format!("line {ln}: NSEC3 record: {e}"))?
+            }
+            other => {
+                return Err(format!("line {ln}: unsupported record type {other:?}"));
+            }
         };
 
-        if let Some(rdata) = rdata {
-            zone.add_record(ZoneRecord {
-                name: record_name,
-                ttl,
-                class,
-                rdata,
-            });
-        }
+        zone.add_record(ZoneRecord {
+            name: record_name,
+            ttl,
+            class,
+            rdata,
+        });
     }
 
     Ok(zone)
-}
-
-/// Get the numeric type ID from RecordData
-fn record_type(rdata: &RecordData) -> u16 {
-    match rdata {
-        RecordData::Standard(sr) => match sr {
-            StandardRecord::A(_) => 1,
-            StandardRecord::NS(_) => 2,
-            StandardRecord::CNAME(_) => 5,
-            StandardRecord::SOA { .. } => 6,
-            StandardRecord::PTR(_) => 12,
-            StandardRecord::MX { .. } => 15,
-            StandardRecord::TXT(_) => 16,
-            StandardRecord::AAAA(_) => 28,
-        },
-        RecordData::Dnssec(dr) => match dr {
-            crate::DnssecRecord::DS { .. } => 43,
-            crate::DnssecRecord::RRSIG { .. } => 46,
-            crate::DnssecRecord::NSEC { .. } => 47,
-            crate::DnssecRecord::DNSKEY { .. } => 48,
-            crate::DnssecRecord::NSEC3 { .. } => 50,
-        },
-        RecordData::Unknown(type_id) => *type_id,
-    }
 }
 
 #[cfg(test)]
@@ -308,5 +572,28 @@ mail IN A   192.0.2.3
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         assert_eq!(zone.origin, "example.com.");
         assert!(zone.records.len() >= 4);
+    }
+
+    #[test]
+    fn test_malformed_rdata_surfaces_error() {
+        // A bad IPv4 address must fail the load, not be silently dropped.
+        let zone_content = "www IN A 999.0.2.1\n";
+        let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
+        assert!(err.contains("line 1"), "error should carry line number: {err}");
+        assert!(err.contains("A address"), "error should name the failure: {err}");
+    }
+
+    #[test]
+    fn test_unsupported_record_type_surfaces_error() {
+        let zone_content = "www IN WKS 192.0.2.1\n";
+        let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
+        assert!(err.contains("unsupported record type"), "got: {err}");
+    }
+
+    #[test]
+    fn test_malformed_ttl_directive_surfaces_error() {
+        let zone_content = "$TTL notanumber\nwww IN A 192.0.2.1\n";
+        let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
+        assert!(err.contains("$TTL"), "got: {err}");
     }
 }

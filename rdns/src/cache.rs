@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ResourceRecord;
+use crate::utils::current_unix_timestamp;
 
 /// DNS cache entry with TTL expiration
 #[derive(Debug, Clone)]
@@ -39,7 +39,7 @@ impl DnsCache {
 
     /// Get cached records for a query (domain_name, record_type)
     pub fn get(&self, name: &str, qtype: u16) -> Option<Vec<ResourceRecord>> {
-        let now = Self::current_time();
+        let now = current_unix_timestamp();
         let mut cache = self.cache.lock().unwrap();
         
         let key = (name.to_lowercase(), qtype);
@@ -59,11 +59,11 @@ impl DnsCache {
 
     /// Put records in cache with TTL
     pub fn put(&self, name: &str, qtype: u16, records: Vec<ResourceRecord>) {
-        if records.is_empty() {
+        if records.is_empty() || self.max_entries == 0 {
             return;
         }
 
-        let now = Self::current_time();
+        let now = current_unix_timestamp();
         
         // Find minimum TTL from records
         let min_ttl = records.iter()
@@ -89,7 +89,7 @@ impl DnsCache {
 
     /// Evict expired and oldest entries
     fn evict_oldest(&self, cache: &mut HashMap<(String, u16), CacheEntry>) {
-        let now = Self::current_time();
+        let now = current_unix_timestamp();
         
         // First remove all expired entries
         cache.retain(|_, entry| !entry.is_expired(now));
@@ -110,7 +110,11 @@ impl DnsCache {
 
     /// Clear negative cache entries (NXDOMAIN responses)
     pub fn put_negative(&self, name: &str, ttl: u64) {
-        let now = Self::current_time();
+        if self.max_entries == 0 {
+            return;
+        }
+
+        let now = current_unix_timestamp();
         let expires_at = now + ttl;
         
         let mut cache = self.cache.lock().unwrap();
@@ -129,7 +133,7 @@ impl DnsCache {
 
     /// Check if domain has negative cache entry
     pub fn is_negative_cached(&self, name: &str) -> bool {
-        let now = Self::current_time();
+        let now = current_unix_timestamp();
         let cache = self.cache.lock().unwrap();
         
         let key = (name.to_lowercase(), 0u16);
@@ -143,7 +147,7 @@ impl DnsCache {
     /// Get cache statistics
     pub fn get_stats(&self) -> CacheStats {
         let cache = self.cache.lock().unwrap();
-        let now = Self::current_time();
+        let now = current_unix_timestamp();
         
         let mut expired_count = 0;
         let mut valid_count = 0;
@@ -167,13 +171,6 @@ impl DnsCache {
     pub fn clear(&self) {
         self.cache.lock().unwrap().clear();
     }
-
-    fn current_time() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -187,14 +184,14 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
-    use crate::{ResourceRecord, RecordData, StandardRecord};
+    use crate::{ResourceRecord, RecordData, ParsedRecord};
 
     fn create_test_record(name: &str, ttl: i32) -> ResourceRecord {
         ResourceRecord {
             name: name.to_string(),
             class: 1,
             ttl,
-            rdata: RecordData::Standard(StandardRecord::A(Ipv4Addr::new(192, 0, 2, 1))),
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         }
     }
 

@@ -240,11 +240,27 @@ pub fn dname_from_bytes<'a>(
 
 pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, anyhow::Error> {
     let mut res = Vec::new();
-    for lbl in name.split('.') {
-        res.push(lbl.len().try_into()?);
-        res.extend_from_slice(lbl.as_bytes());
+    // A fully-qualified name carries a trailing '.' denoting the root; splitting
+    // on '.' would otherwise yield a spurious empty final label (and a second
+    // zero byte), which corrupts any record that stores data after the name.
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if !name.is_empty() {
+        for lbl in name.split('.') {
+            if lbl.is_empty() {
+                return Err(anyhow!("empty label in domain name '{}'", name));
+            }
+            let len: u8 = lbl
+                .len()
+                .try_into()
+                .map_err(|_| anyhow!("label longer than 255 bytes"))?;
+            if len > 63 {
+                return Err(anyhow!("label longer than 63 bytes: {}", lbl));
+            }
+            res.push(len);
+            res.extend_from_slice(lbl.as_bytes());
+        }
     }
-    res.push(0); // terminate with 'End' label
+    res.push(0); // terminate with root label
     Ok(res)
 }
 

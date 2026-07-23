@@ -1,35 +1,37 @@
-use crate::DnssecRecord;
+use crate::ParsedRecord;
 use crate::dname::dname_to_bytes;
+use crate::utils::{current_unix_timestamp, normalize_domain_name};
+use crate::serialization;
+use crate::RecordData;
 use anyhow::anyhow;
 use ring::signature;
 use sha1::{Digest, Sha1};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// DNSSEC signature validation and chain of trust validation.
 /// 
 /// This module provides DNSSEC validation functionality using RecordData
-/// enum variants, with DnssecRecord for DNSSEC-specific records.
+/// enum variants, with ParsedRecord for DNSSEC-specific records.
 #[derive(Debug)]
 pub struct DnssecValidator {
     /// Trusted DNSKEY records (root zone DNSKEY or DS parent chain)
-    trusted_keys: Vec<DnssecRecord>,
+    trusted_keys: Vec<ParsedRecord>,
 }
 
 impl DnssecValidator {
     /// Create a new DNSSEC validator with trusted keys.
-    pub fn new(trusted_keys: Vec<DnssecRecord>) -> Self {
+    pub fn new(trusted_keys: Vec<ParsedRecord>) -> Self {
         DnssecValidator { trusted_keys }
     }
 
     /// Add a trusted key to the validator.
-    pub fn add_trusted_key(&mut self, key: DnssecRecord) {
-        if let DnssecRecord::DNSKEY { .. } = key {
+    pub fn add_trusted_key(&mut self, key: ParsedRecord) {
+        if let ParsedRecord::DNSKEY { .. } = key {
             self.trusted_keys.push(key);
         }
     }
 
     /// Get all trusted keys.
-    pub fn get_trusted_keys(&self) -> &[DnssecRecord] {
+    pub fn get_trusted_keys(&self) -> &[ParsedRecord] {
         &self.trusted_keys
     }
 
@@ -39,11 +41,11 @@ impl DnssecValidator {
     pub fn validate_signature(
         &self,
         data: &[u8],
-        rrsig: &DnssecRecord,
+        rrsig: &ParsedRecord,
     ) -> Result<bool, anyhow::Error> {
         // Extract RRSIG fields
         let (_rrsig_type_covered, rrsig_algorithm, rrsig_key_tag, rrsig_inception, rrsig_expiration, rrsig_signature) = match rrsig {
-            DnssecRecord::RRSIG {
+            ParsedRecord::RRSIG {
                 type_covered,
                 algorithm,
                 key_tag,
@@ -60,7 +62,7 @@ impl DnssecValidator {
             .trusted_keys
             .iter()
             .find(|k| {
-                if let DnssecRecord::DNSKEY {
+                if let ParsedRecord::DNSKEY {
                     algorithm,
                     public_key,
                     flags,
@@ -76,7 +78,7 @@ impl DnssecValidator {
             .ok_or_else(|| anyhow!("No trusted key found for key_tag={}", rrsig_key_tag))?;
 
         // Check signature inception/expiration
-        let current_time = Self::current_time();
+        let current_time = current_unix_timestamp();
         if current_time < rrsig_inception as u64 || current_time > rrsig_expiration as u64 {
             return Ok(false); // Signature has expired or not yet valid
         }
@@ -94,11 +96,11 @@ impl DnssecValidator {
         &self,
         data: &[u8],
         signature: &[u8],
-        key: &DnssecRecord,
+        key: &ParsedRecord,
     ) -> Result<bool, anyhow::Error> {
         // Extract DNSKEY fields
         let (algorithm, public_key) = match key {
-            DnssecRecord::DNSKEY {
+            ParsedRecord::DNSKEY {
                 algorithm,
                 public_key,
                 ..
@@ -173,11 +175,11 @@ impl DnssecValidator {
         &self,
         data: &[u8],
         signature: &[u8],
-        key: &DnssecRecord,
+        key: &ParsedRecord,
     ) -> Result<bool, anyhow::Error> {
         // Extract DNSKEY fields
         let (algorithm, public_key) = match key {
-            DnssecRecord::DNSKEY {
+            ParsedRecord::DNSKEY {
                 algorithm,
                 public_key,
                 ..
@@ -223,26 +225,26 @@ impl DnssecValidator {
         &self,
         _data: &[u8],
         _signature: &[u8],
-        _key: &DnssecRecord,
+        _key: &ParsedRecord,
     ) -> Result<bool, anyhow::Error> {
         // DSA is deprecated in DNSSEC
         Err(anyhow!("DSA signatures not supported (deprecated)"))
     }
 
-    /// Extract DNSSEC records from a list of DnssecRecord values.
+    /// Extract DNSSEC records from a list of ParsedRecord values.
     /// Returns filtered lists of DNSKEY, RRSIG, and DS records.
     pub fn extract_dnssec_records(
-        records: &[DnssecRecord],
-    ) -> (Vec<DnssecRecord>, Vec<DnssecRecord>, Vec<DnssecRecord>) {
+        records: &[ParsedRecord],
+    ) -> (Vec<ParsedRecord>, Vec<ParsedRecord>, Vec<ParsedRecord>) {
         let mut dnskeys = Vec::new();
         let mut rrsigs = Vec::new();
         let mut dss = Vec::new();
 
         for record in records {
             match record {
-                DnssecRecord::DNSKEY { .. } => dnskeys.push(record.clone()),
-                DnssecRecord::RRSIG { .. } => rrsigs.push(record.clone()),
-                DnssecRecord::DS { .. } => dss.push(record.clone()),
+                ParsedRecord::DNSKEY { .. } => dnskeys.push(record.clone()),
+                ParsedRecord::RRSIG { .. } => rrsigs.push(record.clone()),
+                ParsedRecord::DS { .. } => dss.push(record.clone()),
                 _ => {}
             }
         }
@@ -287,25 +289,18 @@ impl DnssecValidator {
         tag
     }
 
-    fn current_time() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
-
     /// Validate a DNSKEY record against a DS record per RFC 4034 § 5.3
     /// 
     /// Checks that the DNSKEY's digest (using the algorithm specified in DS)
     /// matches the DS record's digest value.
     pub fn validate_ds_chain(
         &self,
-        dnskey: &DnssecRecord,
-        ds: &DnssecRecord,
+        dnskey: &ParsedRecord,
+        ds: &ParsedRecord,
     ) -> Result<bool, anyhow::Error> {
         // Extract fields from DNSKEY
         let (dnskey_flags, dnskey_protocol, dnskey_algorithm, dnskey_public_key) = match dnskey {
-            DnssecRecord::DNSKEY {
+            ParsedRecord::DNSKEY {
                 flags,
                 protocol,
                 algorithm,
@@ -316,7 +311,7 @@ impl DnssecValidator {
 
         // Extract fields from DS
         let (ds_key_tag, ds_algorithm, ds_digest_type, ds_digest) = match ds {
-            DnssecRecord::DS {
+            ParsedRecord::DS {
                 key_tag,
                 algorithm,
                 digest_type,
@@ -435,6 +430,24 @@ pub fn serialize_rrset(
     Ok(serialized)
 }
 
+/// Serialize an RRset using RecordData objects.
+///
+/// This is a higher-level variant of serialize_rrset() that works with RecordData
+/// objects instead of pre-serialized RDATA bytes. Uses the unified serialization
+/// module to ensure consistent encoding across the codebase.
+///
+/// Format: For each record: name | type | class | TTL | RDLEN | RDATA
+/// All records must be for the same name, type, and class (standard RRset rules).
+pub fn serialize_rrset_from_record_data(
+    name: &str,
+    rtype: u16,
+    class: u16,
+    ttl: u32,
+    records: &[RecordData],
+) -> Result<Vec<u8>, anyhow::Error> {
+    serialization::serialize_rrset_canonical(name, rtype, class, ttl, records)
+}
+
 /// Helper function to construct RSA public key DER encoding from components.
 /// 
 /// Converts raw RSA exponent and modulus (from DNSKEY wire format) to DER format
@@ -504,15 +517,15 @@ fn construct_rsa_public_key_der(exponent: &[u8], modulus: &[u8]) -> Result<Vec<u
 /// 
 /// Returns true if the chain is valid, false otherwise, or error on validation failure
 pub fn validate_dnskey_chain(
-    child_dnskey: &DnssecRecord,
-    child_rrsig: &DnssecRecord,
-    parent_dnskey: &DnssecRecord,
-    parent_ds: &DnssecRecord,
+    child_dnskey: &ParsedRecord,
+    child_rrsig: &ParsedRecord,
+    parent_dnskey: &ParsedRecord,
+    parent_ds: &ParsedRecord,
     child_dnskey_data: &[u8],
 ) -> Result<bool, anyhow::Error> {
     // Extract fields from child RRSIG
     let (rrsig_key_tag, rrsig_algorithm, rrsig_inception, rrsig_expiration) = match child_rrsig {
-        DnssecRecord::RRSIG {
+        ParsedRecord::RRSIG {
             key_tag,
             algorithm,
             inception,
@@ -524,7 +537,7 @@ pub fn validate_dnskey_chain(
 
     // Extract fields from parent DNSKEY
     let (parent_dnskey_flags, parent_dnskey_protocol, parent_dnskey_algorithm, parent_dnskey_public_key) = match parent_dnskey {
-        DnssecRecord::DNSKEY {
+        ParsedRecord::DNSKEY {
             flags,
             protocol,
             algorithm,
@@ -546,7 +559,7 @@ pub fn validate_dnskey_chain(
     }
     
     // Step 1: Verify RRSIG inception/expiration
-    let current_time = DnssecValidator::current_time();
+    let current_time = current_unix_timestamp();
     if current_time < rrsig_inception as u64 || current_time > rrsig_expiration as u64 {
         return Ok(false); // Signature has expired or not yet valid
     }
@@ -576,27 +589,61 @@ pub fn validate_dnskey_chain(
     Ok(true) // Chain structure is valid
 }
 
+/// Count labels in a domain name for wildcard validation
+pub fn count_labels(name: &str) -> u8 {
+    let name = name.trim().trim_end_matches('.');
+    if name.is_empty() {
+        0
+    } else {
+        name.split('.').filter(|s| !s.is_empty() && *s != "*").count() as u8
+    }
+}
+
+/// Validate wildcard expansion according to RFC 4035 § 3.1.3
+/// 
+/// Returns true if valid wildcard or not a wildcard, false if invalid label count.
+pub fn validate_wildcard(
+    qname: &str,
+    owner_name: &str,
+    rrsig: &ParsedRecord,
+) -> Result<bool, anyhow::Error> {
+    if let ParsedRecord::RRSIG { labels, .. } = rrsig {
+        let qname_lower = qname.trim_end_matches('.').to_lowercase();
+        let owner_lower = owner_name.trim_end_matches('.').to_lowercase();
+        if qname_lower != owner_lower {
+            // Wildcard expansion occurred
+            let owner_labels = count_labels(owner_name);
+            if *labels != owner_labels {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    } else {
+        Err(anyhow!("Not an RRSIG record"))
+    }
+}
+
 /// NSEC record validator for proof of non-existence
 /// 
 /// Validates that a query name falls within the NSEC record range
 /// for proving the name does not exist.
 pub fn validate_nsec(
     query_name: &str,
-    nsec: &DnssecRecord,
+    nsec: &ParsedRecord,
     nsec_owner_name: &str,
 ) -> Result<bool, anyhow::Error> {
     // Extract NSEC fields
     let next_domain_name = match nsec {
-        DnssecRecord::NSEC {
+        ParsedRecord::NSEC {
             next_domain_name,
             ..
         } => next_domain_name.clone(),
         _ => return Err(anyhow!("Not an NSEC record")),
     };
 
-    let query_lower = query_name.to_lowercase().trim_end_matches('.').to_string();
-    let nsec_name_lower = nsec_owner_name.to_lowercase().trim_end_matches('.').to_string();
-    let next_name_lower = next_domain_name.to_lowercase().trim_end_matches('.').to_string();
+    let query_lower = normalize_domain_name(query_name);
+    let nsec_name_lower = normalize_domain_name(nsec_owner_name);
+    let next_name_lower = normalize_domain_name(&next_domain_name);
     
     // NSEC covers names in the range: [owner, next_owner)
     // Special case: if next_owner < owner (wrapping), it covers to infinity
@@ -621,12 +668,12 @@ pub fn validate_nsec(
 /// Uses SHA-1 hashing (as per RFC 5155 standard).
 pub fn validate_nsec3(
     query_name: &str,
-    nsec3: &DnssecRecord,
+    nsec3: &ParsedRecord,
     owner_hash: &[u8],
 ) -> Result<bool, anyhow::Error> {
     // Extract NSEC3 fields
     let (hash_algorithm, next_hashed_owner) = match nsec3 {
-        DnssecRecord::NSEC3 {
+        ParsedRecord::NSEC3 {
             hash_algorithm,
             next_hashed_owner,
             ..
@@ -640,7 +687,7 @@ pub fn validate_nsec3(
     }
     
     // Hash the query name using SHA-1 (simplified - RFC 5155 specifies PBKDF2-SHA1)
-    let query_lower = query_name.to_lowercase().trim_end_matches('.').to_string();
+    let query_lower = normalize_domain_name(query_name);
     let mut hasher = Sha1::new();
     hasher.update(query_lower.as_bytes());
     let query_hash = hasher.finalize().to_vec();
@@ -679,7 +726,7 @@ mod tests {
     #[test]
     fn test_add_trusted_key() {
         let mut validator = DnssecValidator::new(Vec::new());
-        let key = DnssecRecord::DNSKEY {
+        let key = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
@@ -706,13 +753,13 @@ mod tests {
     #[test]
     fn test_extract_dnssec_records() {
         let records = vec![
-            DnssecRecord::DNSKEY {
+            ParsedRecord::DNSKEY {
                 flags: 0x0100,
                 protocol: 3,
                 algorithm: 8,
                 public_key: vec![1, 2, 3, 4],
             },
-            DnssecRecord::RRSIG {
+            ParsedRecord::RRSIG {
                 type_covered: 1,
                 algorithm: 8,
                 labels: 2,
@@ -733,12 +780,12 @@ mod tests {
 
     #[test]
     fn test_expired_signature_rejected() {
-        let past_time = (DnssecValidator::current_time() as i64 - 3600) as u32;
+        let past_time = (current_unix_timestamp() as i64 - 3600) as u32;
         
         let public_key = vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD];
         let key_tag = DnssecValidator::calculate_key_tag(0x0100, 3, 8, &public_key);
         
-        let rrsig = DnssecRecord::RRSIG {
+        let rrsig = ParsedRecord::RRSIG {
             type_covered: 1,
             algorithm: 8,
             labels: 1,
@@ -750,7 +797,7 @@ mod tests {
             signature: vec![0x01; 256],
         };
 
-        let key = DnssecRecord::DNSKEY {
+        let key = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
@@ -764,12 +811,12 @@ mod tests {
 
     #[test]
     fn test_not_yet_valid_signature_rejected() {
-        let future_time = (DnssecValidator::current_time() as i64 + 3600) as u32;
+        let future_time = (current_unix_timestamp() as i64 + 3600) as u32;
         
         let public_key = vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD];
         let key_tag = DnssecValidator::calculate_key_tag(0x0100, 3, 8, &public_key);
         
-        let rrsig = DnssecRecord::RRSIG {
+        let rrsig = ParsedRecord::RRSIG {
             type_covered: 1,
             algorithm: 8,
             labels: 1,
@@ -781,7 +828,7 @@ mod tests {
             signature: vec![0x01; 256],
         };
 
-        let key = DnssecRecord::DNSKEY {
+        let key = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
@@ -795,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_missing_trusted_key() {
-        let rrsig = DnssecRecord::RRSIG {
+        let rrsig = ParsedRecord::RRSIG {
             type_covered: 1,
             algorithm: 8,
             labels: 1,
@@ -814,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_unsupported_algorithm() {
-        let rrsig = DnssecRecord::RRSIG {
+        let rrsig = ParsedRecord::RRSIG {
             type_covered: 1,
             algorithm: 99, // Unsupported
             labels: 1,
@@ -826,7 +873,7 @@ mod tests {
             signature: vec![0x01; 256],
         };
 
-        let key = DnssecRecord::DNSKEY {
+        let key = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 99,
@@ -840,7 +887,7 @@ mod tests {
 
     #[test]
     fn test_dsa_deprecated() {
-        let rrsig = DnssecRecord::RRSIG {
+        let rrsig = ParsedRecord::RRSIG {
             type_covered: 1,
             algorithm: 6, // DSA
             labels: 1,
@@ -852,7 +899,7 @@ mod tests {
             signature: vec![0x01; 256],
         };
 
-        let key = DnssecRecord::DNSKEY {
+        let key = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 6,
@@ -906,11 +953,12 @@ mod tests {
     fn test_dname_wire_format_root() {
         // Test root zone encoding
         let buf = dname_to_bytes(".").expect("dname_to_bytes should succeed");
-        
-        // dname_to_bytes splits "." into ["", ""] creating empty labels + terminator
-        // So we get: 0 (empty), 0 (empty), 0 (terminator) = 3 bytes
-        assert_eq!(buf.len(), 3);
-        assert_eq!(&buf[..], &[0, 0, 0]);
+
+        // The root domain "." encodes as a single zero octet (RFC 1035 §3.1):
+        // the trailing dot is stripped, leaving no labels, then the root
+        // terminator is appended.
+        assert_eq!(buf.len(), 1);
+        assert_eq!(&buf[..], &[0]);
     }
 
     #[test]
@@ -918,14 +966,14 @@ mod tests {
         // Test DS validation rejects mismatched key tags
         let validator = DnssecValidator::new(Vec::new());
         
-        let dnskey = DnssecRecord::DNSKEY {
+        let dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
             public_key: vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD],
         };
         
-        let ds = DnssecRecord::DS {
+        let ds = ParsedRecord::DS {
             key_tag: 54321, // Different key tag
             algorithm: 8,
             digest_type: 2,
@@ -941,14 +989,14 @@ mod tests {
         // Test DS validation rejects mismatched algorithms
         let validator = DnssecValidator::new(Vec::new());
         
-        let dnskey = DnssecRecord::DNSKEY {
+        let dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,  // RSA
             public_key: vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD],
         };
         
-        let ds = DnssecRecord::DS {
+        let ds = ParsedRecord::DS {
             key_tag: 12345,
             algorithm: 13, // ECDSA (different)
             digest_type: 2,
@@ -967,14 +1015,14 @@ mod tests {
         let public_key = vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD];
         let key_tag = DnssecValidator::calculate_key_tag(0x0100, 3, 8, &public_key);
         
-        let dnskey = DnssecRecord::DNSKEY {
+        let dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
             public_key,
         };
         
-        let ds = DnssecRecord::DS {
+        let ds = ParsedRecord::DS {
             key_tag,
             algorithm: 8,
             digest_type: 99, // Unsupported
@@ -999,14 +1047,14 @@ mod tests {
         let key_tag = DnssecValidator::calculate_key_tag(flags, protocol, algorithm, &public_key);
         let digest = compute_sha256_digest(flags, protocol, algorithm, &public_key).expect("Digest computation failed");
         
-        let dnskey = DnssecRecord::DNSKEY {
+        let dnskey = ParsedRecord::DNSKEY {
             flags,
             protocol,
             algorithm,
             public_key,
         };
         
-        let ds = DnssecRecord::DS {
+        let ds = ParsedRecord::DS {
             key_tag,
             algorithm,
             digest_type: 2, // SHA-256
@@ -1029,41 +1077,41 @@ mod tests {
     #[test]
     fn test_dnskey_chain_valid() {
         // Test valid DNSKEY chain validation
-        let current = DnssecValidator::current_time() as u32;
+        let current = current_unix_timestamp() as u32;
         let inception = current - 3600;
         let expiration = current + 3600;
 
-        let parent_dnskey = DnssecRecord::DNSKEY {
+        let parent_dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
             public_key: vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD],
         };
 
-        let child_dnskey = DnssecRecord::DNSKEY {
+        let child_dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
             public_key: vec![0x03, 0x01, 0x00, 0x01, 0xCD, 0xEF],
         };
 
-        let child_rrsig = DnssecRecord::RRSIG {
+        let child_rrsig = ParsedRecord::RRSIG {
             type_covered: 48, // DNSKEY
             algorithm: 8,
             labels: 1,
             original_ttl: 3600,
             inception,
             expiration,
-            key_tag: DnssecValidator::calculate_key_tag(0x0100, 3, 8, &vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD]),
+            key_tag: DnssecValidator::calculate_key_tag(0x0100, 3, 8, &[0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD]),
             signer_name: "example.com.".to_string(),
             signature: vec![0x01; 256], // Dummy signature
         };
 
-        let parent_ds = DnssecRecord::DS {
-            key_tag: DnssecValidator::calculate_key_tag(0x0100, 3, 8, &vec![0x03, 0x01, 0x00, 0x01, 0xCD, 0xEF]),
+        let parent_ds = ParsedRecord::DS {
+            key_tag: DnssecValidator::calculate_key_tag(0x0100, 3, 8, &[0x03, 0x01, 0x00, 0x01, 0xCD, 0xEF]),
             algorithm: 8,
             digest_type: 2,
-            digest: compute_sha256_digest(0x0100, 3, 8, &vec![0x03, 0x01, 0x00, 0x01, 0xCD, 0xEF]).expect("Digest failed"),
+            digest: compute_sha256_digest(0x0100, 3, 8, &[0x03, 0x01, 0x00, 0x01, 0xCD, 0xEF]).expect("Digest failed"),
         };
 
         let result = validate_dnskey_chain(
@@ -1080,23 +1128,23 @@ mod tests {
     #[test]
     fn test_dnskey_chain_invalid_keytag() {
         // Test DNSKEY chain validation with mismatched key tag
-        let current = DnssecValidator::current_time() as u32;
+        let current = current_unix_timestamp() as u32;
         
-        let parent_dnskey = DnssecRecord::DNSKEY {
+        let parent_dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
             public_key: vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD],
         };
 
-        let child_dnskey = DnssecRecord::DNSKEY {
+        let child_dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
             public_key: vec![0x03, 0x01, 0x00, 0x01, 0xCD, 0xEF],
         };
 
-        let child_rrsig = DnssecRecord::RRSIG {
+        let child_rrsig = ParsedRecord::RRSIG {
             type_covered: 48,
             algorithm: 8,
             labels: 1,
@@ -1108,7 +1156,7 @@ mod tests {
             signature: vec![0x01; 256],
         };
 
-        let parent_ds = DnssecRecord::DS {
+        let parent_ds = ParsedRecord::DS {
             key_tag: 12345,
             algorithm: 8,
             digest_type: 2,
@@ -1129,23 +1177,23 @@ mod tests {
     #[test]
     fn test_dnskey_chain_algorithm_mismatch() {
         // Test DNSKEY chain validation with algorithm mismatch
-        let current = DnssecValidator::current_time() as u32;
+        let current = current_unix_timestamp() as u32;
         
-        let parent_dnskey = DnssecRecord::DNSKEY {
+        let parent_dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
             public_key: vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD],
         };
 
-        let child_dnskey = DnssecRecord::DNSKEY {
+        let child_dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
             public_key: vec![0x03, 0x01, 0x00, 0x01, 0xCD, 0xEF],
         };
 
-        let child_rrsig = DnssecRecord::RRSIG {
+        let child_rrsig = ParsedRecord::RRSIG {
             type_covered: 48,
             algorithm: 13, // Different algorithm
             labels: 1,
@@ -1157,7 +1205,7 @@ mod tests {
             signature: vec![0x01; 256],
         };
 
-        let parent_ds = DnssecRecord::DS {
+        let parent_ds = ParsedRecord::DS {
             key_tag: 12345,
             algorithm: 8,
             digest_type: 2,
@@ -1178,25 +1226,25 @@ mod tests {
     #[test]
     fn test_dnskey_chain_expired_signature() {
         // Test DNSKEY chain validation with expired signature
-        let current = DnssecValidator::current_time() as u32;
+        let current = current_unix_timestamp() as u32;
         
-        let parent_dnskey = DnssecRecord::DNSKEY {
+        let parent_dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
             public_key: vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD],
         };
 
-        let child_dnskey = DnssecRecord::DNSKEY {
+        let child_dnskey = ParsedRecord::DNSKEY {
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
             public_key: vec![0x03, 0x01, 0x00, 0x01, 0xCD, 0xEF],
         };
 
-        let parent_key_tag = DnssecValidator::calculate_key_tag(0x0100, 3, 8, &vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD]);
+        let parent_key_tag = DnssecValidator::calculate_key_tag(0x0100, 3, 8, &[0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD]);
 
-        let child_rrsig = DnssecRecord::RRSIG {
+        let child_rrsig = ParsedRecord::RRSIG {
             type_covered: 48,
             algorithm: 8,
             labels: 1,
@@ -1208,7 +1256,7 @@ mod tests {
             signature: vec![0x01; 256],
         };
 
-        let parent_ds = DnssecRecord::DS {
+        let parent_ds = ParsedRecord::DS {
             key_tag: 12345,
             algorithm: 8,
             digest_type: 2,
@@ -1245,7 +1293,7 @@ mod tests {
     #[test]
     fn test_nsec_valid_range() {
         // Test NSEC validation with query name in range
-        let nsec = DnssecRecord::NSEC {
+        let nsec = ParsedRecord::NSEC {
             next_domain_name: "www.example.com.".to_string(),
             type_bitmap: vec![0x00, 0x01], // A record type
         };
@@ -1258,7 +1306,7 @@ mod tests {
     #[test]
     fn test_nsec_query_before_range() {
         // Test NSEC validation with query name before range
-        let nsec = DnssecRecord::NSEC {
+        let nsec = ParsedRecord::NSEC {
             next_domain_name: "www.example.com.".to_string(),
             type_bitmap: vec![0x00, 0x01],
         };
@@ -1271,7 +1319,7 @@ mod tests {
     #[test]
     fn test_nsec_query_after_range() {
         // Test NSEC validation with query name after range
-        let nsec = DnssecRecord::NSEC {
+        let nsec = ParsedRecord::NSEC {
             next_domain_name: "mail.example.com.".to_string(),
             type_bitmap: vec![0x00, 0x01],
         };
@@ -1284,7 +1332,7 @@ mod tests {
     #[test]
     fn test_nsec_wrapping_range() {
         // Test NSEC validation with wrapping range (next < owner)
-        let nsec = DnssecRecord::NSEC {
+        let nsec = ParsedRecord::NSEC {
             next_domain_name: "abc.example.com.".to_string(),
             type_bitmap: vec![0x00, 0x01],
         };
@@ -1301,7 +1349,7 @@ mod tests {
     fn test_nsec3_hash_in_range() {
         // Test NSEC3 validation with hash in valid range
         let owner_hash = vec![0x01, 0x02];
-        let nsec3 = DnssecRecord::NSEC3 {
+        let nsec3 = ParsedRecord::NSEC3 {
             hash_algorithm: 1,
             flags: 0,
             iterations: 0,
@@ -1320,7 +1368,7 @@ mod tests {
     fn test_nsec3_unsupported_algorithm() {
         // Test NSEC3 validation with unsupported algorithm
         let owner_hash = vec![0x10, 0x11];
-        let nsec3 = DnssecRecord::NSEC3 {
+        let nsec3 = ParsedRecord::NSEC3 {
             hash_algorithm: 99, // Unsupported
             flags: 0,
             iterations: 0,
@@ -1337,7 +1385,7 @@ mod tests {
     fn test_nsec3_empty_hash() {
         // Test NSEC3 validation with empty hash values
         let owner_hash = vec![];
-        let nsec3 = DnssecRecord::NSEC3 {
+        let nsec3 = ParsedRecord::NSEC3 {
             hash_algorithm: 1,
             flags: 0,
             iterations: 0,
@@ -1354,7 +1402,7 @@ mod tests {
     #[test]
     fn test_wildcard_nsec_covers_subdomain() {
         // Test NSEC record with wildcard-like coverage
-        let nsec = DnssecRecord::NSEC {
+        let nsec = ParsedRecord::NSEC {
             next_domain_name: "zzz.example.com.".to_string(),
             type_bitmap: vec![0x00, 0x01],
         };
@@ -1368,7 +1416,7 @@ mod tests {
     fn test_wildcard_nsec3_range_check() {
         // Test NSEC3 range validation
         let owner_hash = vec![0x00];
-        let nsec3 = DnssecRecord::NSEC3 {
+        let nsec3 = ParsedRecord::NSEC3 {
             hash_algorithm: 1,
             flags: 0,
             iterations: 100,
@@ -1386,7 +1434,7 @@ mod tests {
     #[test]
     fn test_nsec_wildcard_denial_range() {
         // Test NSEC record covering a wider range useful for wildcard denial
-        let nsec = DnssecRecord::NSEC {
+        let nsec = ParsedRecord::NSEC {
             next_domain_name: "z.example.com.".to_string(),
             type_bitmap: vec![0x00, 0x01],
         };
@@ -1400,7 +1448,7 @@ mod tests {
     fn test_nsec3_wildcard_denial_wrapping() {
         // Test NSEC3 denial with wrapping range
         let owner_hash = vec![0xF0];
-        let nsec3 = DnssecRecord::NSEC3 {
+        let nsec3 = ParsedRecord::NSEC3 {
             hash_algorithm: 1,
             flags: 0,
             iterations: 10,
@@ -1469,6 +1517,65 @@ mod tests {
         
         assert!(!serialized.is_empty(), "AAAA record RRset should serialize");
         assert!(serialized.len() > 50, "Serialized AAAA RRset too short");
+    }
+
+    // Tests for unified serialization module usage
+    #[test]
+    fn test_serialize_rrset_from_a_records() {
+        // Test RRset serialization using RecordData objects
+        use std::net::Ipv4Addr;
+        
+        let records = vec![
+            RecordData::from_parsed(&crate::ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
+            RecordData::from_parsed(&crate::ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 2))).unwrap(),
+        ];
+
+        let serialized = serialize_rrset_from_record_data("test.example.com.", 1, 1, 300, &records)
+            .expect("serialize_rrset_from_record_data should succeed");
+        
+        assert!(!serialized.is_empty(), "A record RRset should serialize");
+        assert!(serialized.len() >= 32, "Serialized A RRset too short"); // name + 2*(type+class+ttl+rdlen+data)
+    }
+
+    #[test]
+    fn test_serialize_rrset_from_dnskey_records() {
+        // Test RRset serialization for DNSKEY records using RecordData
+        let records = vec![
+            RecordData::from_parsed(&ParsedRecord::DNSKEY {
+                flags: 0x0100,
+                protocol: 3,
+                algorithm: 8,
+                public_key: vec![0x01, 0x02, 0x03, 0x04],
+            }).unwrap(),
+            RecordData::from_parsed(&ParsedRecord::DNSKEY {
+                flags: 0x0101,
+                protocol: 3,
+                algorithm: 8,
+                public_key: vec![0x05, 0x06, 0x07, 0x08],
+            }).unwrap(),
+        ];
+
+        let serialized = serialize_rrset_from_record_data("example.com.", 48, 1, 3600, &records)
+            .expect("serialize_rrset_from_record_data should succeed");
+        
+        assert!(!serialized.is_empty(), "DNSKEY record RRset should serialize");
+        // Each DNSKEY: name + type(2) + class(2) + ttl(4) + rdlen(2) + (flags(2) + proto(1) + algo(1) + key(4))
+        assert!(serialized.len() > 30, "Serialized DNSKEY RRset too short");
+    }
+
+    #[test]
+    fn test_serialize_rrset_from_mixed_standard_records() {
+        // Test that unified serialization works correctly with various record types
+        let records = vec![
+            RecordData::from_parsed(&crate::ParsedRecord::NS("ns1.example.com.".to_string())).unwrap(),
+            RecordData::from_parsed(&crate::ParsedRecord::NS("ns2.example.com.".to_string())).unwrap(),
+        ];
+
+        let serialized = serialize_rrset_from_record_data("example.com.", 2, 1, 3600, &records)
+            .expect("serialize_rrset_from_record_data should succeed");
+        
+        assert!(!serialized.is_empty(), "NS record RRset should serialize");
+        assert!(serialized.len() > 20, "Serialized NS RRset too short");
     }
 }
 

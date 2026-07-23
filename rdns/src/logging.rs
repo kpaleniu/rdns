@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::utils::current_unix_timestamp;
 
 /// Query statistics for monitoring and anomaly detection
 #[derive(Debug, Clone)]
@@ -43,7 +43,7 @@ impl QueryLogger {
                 queries_by_type: HashMap::new(),
                 rate_limited_ips: HashMap::new(),
             })),
-            last_qps_update: Arc::new(Mutex::new(Self::current_time())),
+            last_qps_update: Arc::new(Mutex::new(current_unix_timestamp())),
             query_window: Arc::new(Mutex::new(QueryWindow {
                 queries: Vec::new(),
                 max_age_secs: 10,
@@ -53,7 +53,7 @@ impl QueryLogger {
 
     /// Log a successful query
     pub fn log_query(&self, ip: IpAddr, query_type: Option<u16>) {
-        let now = Self::current_time();
+        let now = current_unix_timestamp();
         
         let mut stats = self.stats.lock().unwrap();
         stats.total_queries += 1;
@@ -154,13 +154,6 @@ impl QueryLogger {
         stats.queries_by_ip.clear();
         stats.queries_by_type.clear();
         stats.rate_limited_ips.clear();
-    }
-
-    fn current_time() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
     }
 }
 

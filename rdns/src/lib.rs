@@ -20,7 +20,13 @@ pub mod cache;
 pub mod resolver;
 pub mod metrics;
 pub mod dnssec;
+pub mod dnssec_validation_mode;
 pub mod telemetry;
+pub mod utils;
+pub mod serialization;
+
+// Re-export cache module for public use
+pub use cache::{DnsCache, CacheStats};
 
 #[macro_use]
 mod macros {
@@ -69,8 +75,15 @@ pub struct QuerySection {
     pub qclass: QueryClass,
 }
 
-#[derive(Debug, Clone)]
-pub enum StandardRecord {
+/// Typed, fully-parsed view of a record's data.
+///
+/// This is produced on demand from [`RecordData`] via [`RecordData::parse`],
+/// and consumed when building records via [`RecordData::from_parsed`]. It is
+/// deliberately *not* what we store: keeping the parsed form (with its `String`s
+/// and `Vec`s) resident for every cached record is what the raw-bytes storage
+/// avoids. All domain names here are fully-qualified and uncompressed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedRecord {
     A(Ipv4Addr),
     NS(String),
     CNAME(String),
@@ -90,10 +103,6 @@ pub enum StandardRecord {
     },
     TXT(String),
     AAAA(Ipv6Addr),
-}
-
-#[derive(Debug, Clone)]
-pub enum DnssecRecord {
     DNSKEY {
         flags: u16,
         protocol: u8,
@@ -129,36 +138,89 @@ pub enum DnssecRecord {
         next_hashed_owner: Vec<u8>,
         type_bitmap: Vec<u8>,
     },
-}
-
-#[derive(Debug, Clone)]
-pub enum RecordData {
-    Standard(StandardRecord),
-    Dnssec(DnssecRecord),
+    /// A record type we don't parse. `rtype` is carried by the enclosing
+    /// [`RecordData`]; the raw bytes are preserved there too.
     Unknown(u16),
 }
 
+/// A record's data, stored as **uncompressed wire-format bytes**.
+///
+/// This is the compact, allocation-light form we keep resident (in caches,
+/// zones, and messages). It is 24 bytes regardless of record type, versus the
+/// ~96-byte typed enum it replaces, because the large/rare DNSSEC and SOA
+/// payloads no longer sit inline in every record.
+///
+/// Any domain names embedded in the data are expanded to their full,
+/// uncompressed form when the record is read off the wire (see
+/// [`RecordData::from_wire`]), so the bytes are self-contained: they can be
+/// re-parsed with [`RecordData::parse`] or re-serialized without needing the
+/// original message for compression-pointer resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordData {
+    /// The RR TYPE code (e.g. 1 = A, 28 = AAAA).
+    pub rtype: u16,
+    /// Uncompressed wire-format RDATA.
+    pub rdata: Box<[u8]>,
+}
+
 impl RecordData {
+    /// Map a record-type name (e.g. "A", "AAAA") to its numeric TYPE code.
     fn to_u16(kind: &str) -> Option<u16> {
-        match kind {
-            "A" => Some(1),
-            "NS" => Some(2),
-            "CNAME" => Some(5),
-            "SOA" => Some(6),
-            "PTR" => Some(12),
-            "MX" => Some(15),
-            "TXT" => Some(16),
-            "AAAA" => Some(28),
-            "DNSKEY" => Some(48),
-            "DS" => Some(43),
-            "NSEC" => Some(47),
-            "NSEC3" => Some(50),
-            "RRSIG" => Some(46),
-            _ => None,
-        }
+        utils::record_type_name_to_code(kind)
     }
 
-    fn try_from_bytes<'a>(
+    /// The RR TYPE code of this record.
+    pub fn rtype(&self) -> u16 {
+        self.rtype
+    }
+
+    /// Read a record's RDATA off the wire and store it compactly.
+    ///
+    /// `unpacker` is used to follow any compression pointers against the full
+    /// message; the result is re-encoded without compression so the stored
+    /// bytes are self-contained. Types we don't parse are stored verbatim
+    /// (RFC 3597), which — unlike the old typed enum — preserves their bytes.
+    pub fn from_wire<'a>(
+        record_type: u16,
+        rdata: &'a [u8],
+        unpacker: &DNameUnpacker<'a>,
+    ) -> Result<Self, anyhow::Error> {
+        let parsed = ParsedRecord::decode(record_type, rdata, unpacker)?;
+        if let ParsedRecord::Unknown(_) = parsed {
+            // Opaque type: keep the original bytes exactly as received.
+            return Ok(RecordData {
+                rtype: record_type,
+                rdata: rdata.to_vec().into_boxed_slice(),
+            });
+        }
+        Self::from_parsed(&parsed)
+    }
+
+    /// Parse the stored bytes into a typed [`ParsedRecord`] on demand.
+    ///
+    /// Records that are only cached and re-served never need this, which is the
+    /// whole point of storing raw bytes. Stored names are uncompressed, so no
+    /// message context is required — the decoder is handed an unpacker over the
+    /// rdata itself, which by construction contains no pointers.
+    pub fn parse(&self) -> Result<ParsedRecord, anyhow::Error> {
+        let unpacker = DNameUnpacker::new(&self.rdata);
+        ParsedRecord::decode(self.rtype, &self.rdata, &unpacker)
+    }
+
+    /// Encode a typed record into compact, uncompressed wire-format storage.
+    pub fn from_parsed(parsed: &ParsedRecord) -> Result<Self, anyhow::Error> {
+        let (rtype, rdata) = parsed.encode()?;
+        Ok(RecordData {
+            rtype,
+            rdata: rdata.into_boxed_slice(),
+        })
+    }
+}
+
+impl ParsedRecord {
+    /// Decode wire-format RDATA into a typed record. `unpacker` resolves any
+    /// compressed domain names against the message it was built over.
+    fn decode<'a>(
         record_type: u16,
         rdata: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
@@ -166,15 +228,15 @@ impl RecordData {
         match record_type {
             1 => {
                 let addr: [u8; 4] = rdata.try_into()?;
-                Ok(RecordData::Standard(StandardRecord::A(Ipv4Addr::from(addr))))
+                Ok(ParsedRecord::A(Ipv4Addr::from(addr)))
             }
             2 => {
                 let (nsname, _) = dname_from_bytes(rdata, unpacker)?;
-                Ok(RecordData::Standard(StandardRecord::NS(nsname)))
+                Ok(ParsedRecord::NS(nsname))
             }
             5 => {
                 let (cname, _) = dname_from_bytes(rdata, unpacker)?;
-                Ok(RecordData::Standard(StandardRecord::CNAME(cname)))
+                Ok(ParsedRecord::CNAME(cname))
             }
             6 => {
                 let (mname, rest) = dname_from_bytes(rdata, unpacker)?;
@@ -185,7 +247,7 @@ impl RecordData {
                 let (expire, rest) = read_be!(i32, rest);
                 let (minimum, _) = read_be!(u32, rest);
 
-                Ok(RecordData::Standard(StandardRecord::SOA {
+                Ok(ParsedRecord::SOA {
                     mname,
                     rname,
                     serial,
@@ -193,24 +255,24 @@ impl RecordData {
                     retry,
                     expire,
                     minimum,
-                }))
+                })
             }
             12 => {
                 let (ptrdname, _) = dname_from_bytes(rdata, unpacker)?;
-                Ok(RecordData::Standard(StandardRecord::PTR(ptrdname)))
+                Ok(ParsedRecord::PTR(ptrdname))
             }
             15 => {
                 let (preference, rest) = read_be!(u16, rdata);
                 let (exchange, _) = dname_from_bytes(rest, unpacker)?;
-                Ok(RecordData::Standard(StandardRecord::MX {
+                Ok(ParsedRecord::MX {
                     preference,
                     exchange,
-                }))
+                })
             }
-            16 => Ok(RecordData::Standard(StandardRecord::TXT(from_utf8(rdata)?.to_string()))),
+            16 => Ok(ParsedRecord::TXT(from_utf8(rdata)?.to_string())),
             28 => {
                 let addr: [u8; 16] = rdata.try_into()?;
-                Ok(RecordData::Standard(StandardRecord::AAAA(Ipv6Addr::from(addr))))
+                Ok(ParsedRecord::AAAA(Ipv6Addr::from(addr)))
             }
             // DNSSEC types
             43 => {
@@ -219,12 +281,12 @@ impl RecordData {
                 let algorithm = rest[0];
                 let digest_type = rest[1];
                 let digest = rest[2..].to_vec();
-                Ok(RecordData::Dnssec(DnssecRecord::DS {
+                Ok(ParsedRecord::DS {
                     key_tag,
                     algorithm,
                     digest_type,
                     digest,
-                }))
+                })
             }
             46 => {
                 // RRSIG: type_covered(2) + algorithm(1) + labels(1) + original_ttl(4) +
@@ -238,7 +300,7 @@ impl RecordData {
                 let (key_tag, rest) = read_be!(u16, rest);
                 let (signer_name, rest) = dname_from_bytes(rest, unpacker)?;
                 let signature = rest.to_vec();
-                Ok(RecordData::Dnssec(DnssecRecord::RRSIG {
+                Ok(ParsedRecord::RRSIG {
                     type_covered,
                     algorithm,
                     labels,
@@ -248,16 +310,16 @@ impl RecordData {
                     key_tag,
                     signer_name,
                     signature,
-                }))
+                })
             }
             47 => {
                 // NSEC: next_domain_name + type_bitmap
                 let (next_domain_name, rest) = dname_from_bytes(rdata, unpacker)?;
                 let type_bitmap = rest.to_vec();
-                Ok(RecordData::Dnssec(DnssecRecord::NSEC {
+                Ok(ParsedRecord::NSEC {
                     next_domain_name,
                     type_bitmap,
-                }))
+                })
             }
             48 => {
                 // DNSKEY: flags(2) + protocol(1) + algorithm(1) + public_key(variable)
@@ -265,12 +327,12 @@ impl RecordData {
                 let protocol = rest[0];
                 let algorithm = rest[1];
                 let public_key = rest[2..].to_vec();
-                Ok(RecordData::Dnssec(DnssecRecord::DNSKEY {
+                Ok(ParsedRecord::DNSKEY {
                     flags,
                     protocol,
                     algorithm,
                     public_key,
-                }))
+                })
             }
             50 => {
                 // NSEC3: hash_algorithm(1) + flags(1) + iterations(2) + salt_len(1) + salt(variable) + next_hashed_owner + type_bitmap
@@ -286,7 +348,7 @@ impl RecordData {
                 }
                 let salt = rest[1..1+salt_len].to_vec();
                 let rest = &rest[1+salt_len..];
-                
+
                 // next_hashed_owner is a raw byte string (not a domain name)
                 if rest.is_empty() {
                     return Err(anyhow!("NSEC3 record missing next_hashed_owner"));
@@ -297,18 +359,136 @@ impl RecordData {
                 }
                 let next_hashed_owner = rest[1..1+next_owner_len].to_vec();
                 let type_bitmap = rest[1+next_owner_len..].to_vec();
-                
-                Ok(RecordData::Dnssec(DnssecRecord::NSEC3 {
+
+                Ok(ParsedRecord::NSEC3 {
                     hash_algorithm,
                     flags,
                     iterations,
                     salt,
                     next_hashed_owner,
                     type_bitmap,
-                }))
+                })
             }
-            _ => Ok(RecordData::Unknown(record_type)),
+            _ => Ok(ParsedRecord::Unknown(record_type)),
         }
+    }
+
+    /// Encode this record into `(rtype, uncompressed wire-format RDATA)`.
+    ///
+    /// The inverse of [`ParsedRecord::decode`] for the types we parse. Names
+    /// are written uncompressed via [`dname_to_bytes`].
+    fn encode(&self) -> Result<(u16, Vec<u8>), anyhow::Error> {
+        let out = match self {
+            ParsedRecord::A(addr) => (1, addr.octets().to_vec()),
+            ParsedRecord::AAAA(addr) => (28, addr.octets().to_vec()),
+            ParsedRecord::NS(name) => (2, dname_to_bytes(name)?),
+            ParsedRecord::CNAME(name) => (5, dname_to_bytes(name)?),
+            ParsedRecord::PTR(name) => (12, dname_to_bytes(name)?),
+            ParsedRecord::MX {
+                preference,
+                exchange,
+            } => {
+                let mut v = preference.to_be_bytes().to_vec();
+                v.extend_from_slice(&dname_to_bytes(exchange)?);
+                (15, v)
+            }
+            ParsedRecord::TXT(text) => (16, text.as_bytes().to_vec()),
+            ParsedRecord::SOA {
+                mname,
+                rname,
+                serial,
+                refresh,
+                retry,
+                expire,
+                minimum,
+            } => {
+                let mut v = dname_to_bytes(mname)?;
+                v.extend_from_slice(&dname_to_bytes(rname)?);
+                v.extend_from_slice(&serial.to_be_bytes());
+                v.extend_from_slice(&refresh.to_be_bytes());
+                v.extend_from_slice(&retry.to_be_bytes());
+                v.extend_from_slice(&expire.to_be_bytes());
+                v.extend_from_slice(&minimum.to_be_bytes());
+                (6, v)
+            }
+            ParsedRecord::DNSKEY {
+                flags,
+                protocol,
+                algorithm,
+                public_key,
+            } => {
+                let mut v = flags.to_be_bytes().to_vec();
+                v.push(*protocol);
+                v.push(*algorithm);
+                v.extend_from_slice(public_key);
+                (48, v)
+            }
+            ParsedRecord::RRSIG {
+                type_covered,
+                algorithm,
+                labels,
+                original_ttl,
+                inception,
+                expiration,
+                key_tag,
+                signer_name,
+                signature,
+            } => {
+                let mut v = type_covered.to_be_bytes().to_vec();
+                v.push(*algorithm);
+                v.push(*labels);
+                v.extend_from_slice(&original_ttl.to_be_bytes());
+                v.extend_from_slice(&inception.to_be_bytes());
+                v.extend_from_slice(&expiration.to_be_bytes());
+                v.extend_from_slice(&key_tag.to_be_bytes());
+                v.extend_from_slice(&dname_to_bytes(signer_name)?);
+                v.extend_from_slice(signature);
+                (46, v)
+            }
+            ParsedRecord::DS {
+                key_tag,
+                algorithm,
+                digest_type,
+                digest,
+            } => {
+                let mut v = key_tag.to_be_bytes().to_vec();
+                v.push(*algorithm);
+                v.push(*digest_type);
+                v.extend_from_slice(digest);
+                (43, v)
+            }
+            ParsedRecord::NSEC {
+                next_domain_name,
+                type_bitmap,
+            } => {
+                let mut v = dname_to_bytes(next_domain_name)?;
+                v.extend_from_slice(type_bitmap);
+                (47, v)
+            }
+            ParsedRecord::NSEC3 {
+                hash_algorithm,
+                flags,
+                iterations,
+                salt,
+                next_hashed_owner,
+                type_bitmap,
+            } => {
+                let mut v = Vec::with_capacity(6 + salt.len() + next_hashed_owner.len() + type_bitmap.len());
+                v.push(*hash_algorithm);
+                v.push(*flags);
+                v.extend_from_slice(&iterations.to_be_bytes());
+                v.push(salt.len() as u8);
+                v.extend_from_slice(salt);
+                v.push(next_hashed_owner.len() as u8);
+                v.extend_from_slice(next_hashed_owner);
+                v.extend_from_slice(type_bitmap);
+                (50, v)
+            }
+            // Opaque types are stored verbatim by `RecordData::from_wire`; there
+            // is no typed payload to re-encode here.
+            ParsedRecord::Unknown(rtype) => (*rtype, Vec::new()),
+        };
+        Ok(out)
     }
 }
 
@@ -362,6 +542,8 @@ pub struct DnsMessage {
     pub truncation: bool, // whether or not the message had to be truncated due to transmission channel
     pub recursion: bool,  // query: whether or not client wants server to do recursion
     pub recursion_ok: bool, // response: whether or not server support is available
+    pub ad: bool,        // Authenticated Data bit (RFC 4035)
+    pub cd: bool,        // Checking Disabled bit (RFC 4035)
     pub rcode: ResponseCode, // response status: whether or not response was succesful
 
     pub queries: Vec<QuerySection>,
@@ -408,7 +590,7 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
         let (rdatalen, rest) = read_be!(u16, rest);
         let rdata = &rest[..rdatalen as usize];
 
-        let rdata = RecordData::try_from_bytes(record_type, rdata, unpacker)?;
+        let rdata = RecordData::from_wire(record_type, rdata, unpacker)?;
         Ok((
             Self {
                 name,
@@ -476,6 +658,8 @@ impl DnsMessage {
             truncation: hi & 0x02 == 0x02,
             recursion: hi & 0x01 == 0x01,
             recursion_ok: lo & 0x80 == 0x80,
+            ad: lo & 0x20 == 0x20,
+            cd: lo & 0x10 == 0x10,
             rcode,
             queries,
             answers,
@@ -496,7 +680,10 @@ impl DnsMessage {
             | (self.authoritive as u8) << 2
             | (self.truncation as u8) << 1
             | self.recursion as u8;
-        let lo: u8 = (self.recursion_ok as u8) << 7 | (rcode & 0x7);
+        let lo: u8 = (self.recursion_ok as u8) << 7 
+            | (self.ad as u8) << 5
+            | (self.cd as u8) << 4
+            | (rcode & 0xf);
 
         written += buf.write(&[hi, lo])?;
         written += buf.write(&(self.queries.len() as u16).to_be_bytes())?;
@@ -509,6 +696,26 @@ impl DnsMessage {
             written += buf.write(&q.qtype.to_be_bytes())?;
             let qclass = &q.qclass.to_u16().unwrap_or(254);
             written += buf.write(&qclass.to_be_bytes())?;
+        }
+
+        // Resource records. RDATA is stored uncompressed and wire-ready, so
+        // serializing a record is a straight copy of its bytes (no name
+        // compression on output yet — see TODO Part B #5).
+        for section in [&self.answers, &self.authorities, &self.additionals] {
+            for rr in section {
+                written += buf.write(&dname_to_bytes(rr.name.as_str())?)?;
+                written += buf.write(&rr.rdata.rtype.to_be_bytes())?;
+                written += buf.write(&rr.class.to_be_bytes())?;
+                written += buf.write(&rr.ttl.to_be_bytes())?;
+                let rdlen: u16 = rr
+                    .rdata
+                    .rdata
+                    .len()
+                    .try_into()
+                    .map_err(|_| anyhow!("RDATA exceeds 65535 bytes"))?;
+                written += buf.write(&rdlen.to_be_bytes())?;
+                written += buf.write(&rr.rdata.rdata)?;
+            }
         }
         Ok(written)
     }
@@ -552,6 +759,8 @@ impl DnsMessageBuilder {
             truncation: false,
             recursion: true,
             recursion_ok: false,
+            ad: false,
+            cd: false,
             rcode: ResponseCode::Ok,
             queries: self
                 .queries
@@ -610,6 +819,50 @@ mod tests {
     }
 
     #[test]
+    fn test_response_roundtrip_with_answer() {
+        use std::net::Ipv4Addr;
+
+        let answer = ResourceRecord {
+            name: "www.example.com.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
+        };
+        let msg = DnsMessage {
+            id: 0x1234,
+            response: true,
+            opcode: OpCode::Query,
+            authoritive: true,
+            truncation: false,
+            recursion: true,
+            recursion_ok: true,
+            ad: false,
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![QuerySection {
+                qname: "www.example.com.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            }],
+            answers: vec![answer],
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+        };
+
+        let mut buf = [0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("to_bytes");
+        let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
+
+        assert_eq!(parsed.answers.len(), 1, "answer record must survive round-trip");
+        let a = &parsed.answers[0];
+        assert_eq!(a.name, "www.example.com.");
+        assert_eq!(a.class, 1);
+        assert_eq!(a.ttl, 3600);
+        assert_eq!(a.rdata.rtype, 1);
+        assert_eq!(&*a.rdata.rdata, &[192, 0, 2, 1]); // A record: 4 address octets
+    }
+
+    #[test]
     fn test_response_parse() {
         let resp: [u8; 295] = [
             0xf5, 0x6f, 0x81, 0x80, 0x00, 0x01, 0x00, 0x07, 0x00, 0x04, 0x00, 0x04, 0x03, 0x77,
@@ -638,5 +891,197 @@ mod tests {
 
         let msg = DnsMessage::try_from_bytes(&resp).expect("deserialize");
         assert!(msg.recursion_ok);
+    }
+
+    #[test]
+    fn test_ad_bit_serialization() {
+        let msg = DnsMessage {
+            id: 0x1234,
+            response: true,
+            opcode: OpCode::Query,
+            authoritive: true,
+            truncation: false,
+            recursion: false,
+            recursion_ok: false,
+            ad: true,  // Set AD bit
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![],
+            answers: vec![],
+            authorities: vec![],
+            additionals: vec![],
+        };
+
+        let mut buf = [0u8; 512];
+        let len = msg.to_bytes(&mut buf).expect("serialize");
+        
+        // Parse it back
+        let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
+        assert!(parsed.ad, "AD bit should be set");
+    }
+
+    #[test]
+    fn test_cd_bit_serialization() {
+        let msg = DnsMessage {
+            id: 0x1234,
+            response: true,
+            opcode: OpCode::Query,
+            authoritive: true,
+            truncation: false,
+            recursion: false,
+            recursion_ok: false,
+            ad: false,
+            cd: true,  // Set CD bit
+            rcode: ResponseCode::Ok,
+            queries: vec![],
+            answers: vec![],
+            authorities: vec![],
+            additionals: vec![],
+        };
+
+        let mut buf = [0u8; 512];
+        let len = msg.to_bytes(&mut buf).expect("serialize");
+        
+        // Parse it back
+        let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
+        assert!(parsed.cd, "CD bit should be set");
+    }
+
+    #[test]
+    fn test_ad_and_cd_bits_serialization() {
+        let msg = DnsMessage {
+            id: 0x1234,
+            response: true,
+            opcode: OpCode::Query,
+            authoritive: true,
+            truncation: false,
+            recursion: false,
+            recursion_ok: false,
+            ad: true,   // Set AD bit
+            cd: true,   // Set CD bit
+            rcode: ResponseCode::Ok,
+            queries: vec![],
+            answers: vec![],
+            authorities: vec![],
+            additionals: vec![],
+        };
+
+        let mut buf = [0u8; 512];
+        let len = msg.to_bytes(&mut buf).expect("serialize");
+        
+        // Parse it back
+        let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
+        assert!(parsed.ad, "AD bit should be set");
+        assert!(parsed.cd, "CD bit should be set");
+    }
+
+    #[test]
+    fn test_ad_bit_not_set() {
+        let msg = DnsMessage {
+            id: 0x1234,
+            response: true,
+            opcode: OpCode::Query,
+            authoritive: true,
+            truncation: false,
+            recursion: false,
+            recursion_ok: false,
+            ad: false,  // AD bit not set
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![],
+            answers: vec![],
+            authorities: vec![],
+            additionals: vec![],
+        };
+
+        let mut buf = [0u8; 512];
+        let len = msg.to_bytes(&mut buf).expect("serialize");
+        
+        // Parse it back
+        let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
+        assert!(!parsed.ad, "AD bit should not be set");
+    }
+
+    #[test]
+    fn test_cd_bit_not_set() {
+        let msg = DnsMessage {
+            id: 0x1234,
+            response: true,
+            opcode: OpCode::Query,
+            authoritive: true,
+            truncation: false,
+            recursion: false,
+            recursion_ok: false,
+            ad: false,
+            cd: false,  // CD bit not set
+            rcode: ResponseCode::Ok,
+            queries: vec![],
+            answers: vec![],
+            authorities: vec![],
+            additionals: vec![],
+        };
+
+        let mut buf = [0u8; 512];
+        let len = msg.to_bytes(&mut buf).expect("serialize");
+        
+        // Parse it back
+        let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
+        assert!(!parsed.cd, "CD bit should not be set");
+    }
+
+    #[test]
+    fn test_ad_bit_with_ra_bit() {
+        let msg = DnsMessage {
+            id: 0x1234,
+            response: true,
+            opcode: OpCode::Query,
+            authoritive: true,
+            truncation: false,
+            recursion: false,
+            recursion_ok: true,  // RA bit set
+            ad: true,            // AD bit set
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![],
+            answers: vec![],
+            authorities: vec![],
+            additionals: vec![],
+        };
+
+        let mut buf = [0u8; 512];
+        let len = msg.to_bytes(&mut buf).expect("serialize");
+        
+        // Parse it back
+        let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
+        assert!(parsed.recursion_ok, "RA bit should be set");
+        assert!(parsed.ad, "AD bit should be set");
+    }
+
+    #[test]
+    fn test_dnssec_validator_integration() {
+        use crate::dnssec_validation_mode::DnssecValidator;
+        
+        let validator = DnssecValidator::new(true);
+        let zone = crate::zone::Zone::new("example.com.".to_string());
+        let records = vec![];
+        
+        let (is_valid, is_signed) = validator.validate_response(&zone, &records, "example.com.");
+        
+        // Unsigned zone should be valid but not signed
+        assert!(is_valid);
+        assert!(!is_signed);
+        
+        // AD bit should not be set
+        assert!(!validator.should_set_ad_bit(is_valid, is_signed));
+    }
+
+    #[test]
+    fn test_message_builder_initializes_ad_cd_false() {
+        let builder = DnsMessageBuilder::new()
+            .with_url("example.com", "A");
+        let msg = builder.build();
+        
+        assert!(!msg.ad, "AD bit should be false by default");
+        assert!(!msg.cd, "CD bit should be false by default");
     }
 }

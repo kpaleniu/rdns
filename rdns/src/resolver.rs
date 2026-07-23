@@ -68,6 +68,8 @@ impl RecursiveResolver {
             truncation: false,
             recursion: true,
             recursion_ok: false,
+            ad: false,
+            cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![query.clone()],
             answers: Vec::new(),
