@@ -8,7 +8,7 @@ use std::{
 };
 
 use compression::NameCompressor;
-use dname::{dname_from_bytes, dname_to_bytes, DNameUnpacker, TryUnpackFromBytes};
+use dname::{dname_from_bytes, dname_to_bytes, write_bytes, DNameUnpacker, TryUnpackFromBytes};
 
 pub mod compression;
 pub mod dname;
@@ -839,24 +839,7 @@ impl DnsMessage {
         let mut compressor = NameCompressor::new();
         let mut pos = 0;
 
-        // Copy `bytes` into the output at the running position.
-        macro_rules! put {
-            ($bytes:expr) => {{
-                let bytes = $bytes;
-                let end = pos + bytes.len();
-                if end > output.len() {
-                    return Err(anyhow!(
-                        "buffer too small: need {} bytes, have {}",
-                        end,
-                        output.len()
-                    ));
-                }
-                output[pos..end].copy_from_slice(&bytes);
-                pos = end;
-            }};
-        }
-
-        put!(self.id.to_be_bytes());
+        pos = write_bytes(output, pos, &self.id.to_be_bytes())?;
 
         let opcode = self.opcode.to_u8().unwrap_or_default();
 
@@ -887,16 +870,16 @@ impl DnsMessage {
             | (self.cd as u8) << 4
             | (rcode & 0xf) as u8;
 
-        put!([hi, lo]);
-        put!((self.queries.len() as u16).to_be_bytes());
-        put!((self.answers.len() as u16).to_be_bytes());
-        put!((self.authorities.len() as u16).to_be_bytes());
-        put!((self.additionals.len() as u16).to_be_bytes());
+        pos = write_bytes(output, pos, &[hi, lo])?;
+        pos = write_bytes(output, pos, &(self.queries.len() as u16).to_be_bytes())?;
+        pos = write_bytes(output, pos, &(self.answers.len() as u16).to_be_bytes())?;
+        pos = write_bytes(output, pos, &(self.authorities.len() as u16).to_be_bytes())?;
+        pos = write_bytes(output, pos, &(self.additionals.len() as u16).to_be_bytes())?;
 
         for q in &self.queries {
             pos = compressor.write_name(q.qname.as_str(), output, pos)?;
-            put!(q.qtype.to_be_bytes());
-            put!(q.qclass.to_u16().unwrap_or(254).to_be_bytes());
+            pos = write_bytes(output, pos, &q.qtype.to_be_bytes())?;
+            pos = write_bytes(output, pos, &q.qclass.to_u16().unwrap_or(254).to_be_bytes())?;
         }
 
         // Resource records. Owner names are compressed against everything
@@ -906,8 +889,8 @@ impl DnsMessage {
         for section in [&self.answers, &self.authorities, &self.additionals] {
             for rr in section {
                 pos = compressor.write_name(rr.name.as_str(), output, pos)?;
-                put!(rr.rdata.rtype.to_be_bytes());
-                put!(rr.class.to_be_bytes());
+                pos = write_bytes(output, pos, &rr.rdata.rtype.to_be_bytes())?;
+                pos = write_bytes(output, pos, &rr.class.to_be_bytes())?;
                 // The OPT TTL's top byte is the extended RCODE's high 8 bits.
                 // `self.rcode` owns the whole 12-bit value, so stamp it in here
                 // rather than trusting whatever the OPT record was built with.
@@ -916,18 +899,18 @@ impl DnsMessage {
                 } else {
                     rr.ttl as u32
                 };
-                put!(ttl.to_be_bytes());
+                pos = write_bytes(output, pos, &ttl.to_be_bytes())?;
 
                 // RDLEN can only be known once the RDATA is written, since
                 // compression changes its length. Leave a hole and fill it in.
                 let rdlen_at = pos;
-                put!([0u8, 0u8]);
+                pos = write_bytes(output, pos, &[0u8, 0u8])?;
                 let rdata_at = pos;
                 pos = compressor.write_rdata(rr.rdata.rtype, &rr.rdata.rdata, output, pos)?;
                 let rdlen: u16 = (pos - rdata_at)
                     .try_into()
                     .map_err(|_| anyhow!("RDATA exceeds 65535 bytes"))?;
-                output[rdlen_at..rdlen_at + 2].copy_from_slice(&rdlen.to_be_bytes());
+                write_bytes(output, rdlen_at, &rdlen.to_be_bytes())?;
             }
         }
         Ok(pos)
@@ -1275,6 +1258,33 @@ mod tests {
 
         let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
         assert_eq!(&*parsed.answers[0].rdata.rdata, srv_rdata.as_slice());
+    }
+
+    /// A packet that claims more questions than it carries must be an error,
+    /// not a panic: the name parser runs off the end of the buffer otherwise.
+    #[test]
+    fn test_truncated_message_is_an_error_not_a_panic() {
+        // Header says qdcount=2, but only one (short) question follows.
+        let packet: Vec<u8> = vec![
+            0x12, 0x34, 0x01, 0x00, // id, flags
+            0x00, 0x02, // qdcount = 2
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar = 0
+            0x03, b'w', b'w', b'w', 0x00, // "www."
+            0x00, 0x01, 0x00, 0x01, // qtype, qclass
+        ];
+        assert!(DnsMessage::try_from_bytes(&packet).is_err());
+
+        // A name whose length byte overruns the buffer.
+        let overrun: Vec<u8> = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, b'a',
+        ];
+        assert!(DnsMessage::try_from_bytes(&overrun).is_err());
+
+        // A compression pointer cut in half by the end of the buffer.
+        let half_pointer: Vec<u8> = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0,
+        ];
+        assert!(DnsMessage::try_from_bytes(&half_pointer).is_err());
     }
 
     /// Serializing into a buffer that cannot hold the message is an error, not

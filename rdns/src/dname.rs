@@ -4,6 +4,60 @@ use std::collections::HashSet;
 
 use anyhow::anyhow;
 
+/// The two high bits that mark a label as a compression pointer (RFC 1035
+/// §4.1.4).
+pub(crate) const POINTER_TAG: u16 = 0xc000;
+
+/// The offset a pointer carries, once the tag bits are masked off. Being a
+/// 14-bit field, this doubles as the highest offset a pointer can address —
+/// which is why a name written past it can never become a compression target.
+pub(crate) const POINTER_MASK: u16 = 0x3fff;
+
+/// The longest a single label may be (RFC 1035 §2.3.4).
+pub(crate) const MAX_LABEL_LEN: usize = 63;
+
+/// Copy `bytes` into `buf` at `pos`, returning the position just past them.
+///
+/// This is the one bounds-checked write every wire serializer goes through.
+/// Unlike an `io::Cursor` over a slice, it refuses to write past the end rather
+/// than silently dropping the tail of a message.
+pub(crate) fn write_bytes(
+    buf: &mut [u8],
+    pos: usize,
+    bytes: &[u8],
+) -> Result<usize, anyhow::Error> {
+    let end = pos + bytes.len();
+    if end > buf.len() {
+        return Err(anyhow!(
+            "buffer too small: need {} bytes, have {}",
+            end,
+            buf.len()
+        ));
+    }
+    buf[pos..end].copy_from_slice(bytes);
+    Ok(end)
+}
+
+/// Write one length-prefixed label, validating it first.
+///
+/// The single place a label becomes bytes — shared by [`dname_to_bytes`] (which
+/// writes whole names uncompressed) and the message compressor (which writes the
+/// labels ahead of a pointer).
+pub(crate) fn write_label(
+    buf: &mut [u8],
+    pos: usize,
+    label: &str,
+) -> Result<usize, anyhow::Error> {
+    if label.is_empty() {
+        return Err(anyhow!("empty label in domain name"));
+    }
+    if label.len() > MAX_LABEL_LEN {
+        return Err(anyhow!("label longer than {MAX_LABEL_LEN} bytes: {label}"));
+    }
+    let pos = write_bytes(buf, pos, &[label.len() as u8])?;
+    write_bytes(buf, pos, label.as_bytes())
+}
+
 pub(crate) trait TryFromBytes<'a> {
     type Output;
     type Error;
@@ -55,19 +109,38 @@ impl<'a> TryFromBytes<'a> for Label<'a> {
     type Output = Label<'a>;
     type Error = anyhow::Error;
     fn try_from_bytes(data: &'a [u8]) -> Result<Label<'a>, anyhow::Error> {
-        let lt = data[0] >> 6;
-        let len = data[0] & 0x3f; // guarantees len cannot be more than 63
+        // Every index below is on bytes a hostile peer chose the length of, so
+        // each one is checked: a truncated message must be an error, not a panic.
+        let Some(&first) = data.first() else {
+            return Err(anyhow!("truncated message: expected a label"));
+        };
+        let lt = first >> 6;
+        let len = (first & 0x3f) as usize; // guarantees len cannot be more than 63
 
         match lt {
             /* normal label */
             0x0 => match len {
                 0 => Ok(Label::Root),
-                _ => Ok(Label::String(&data[1..=len as usize])),
+                _ => {
+                    if data.len() <= len {
+                        return Err(anyhow!(
+                            "truncated label: claims {} bytes, {} remain",
+                            len,
+                            data.len() - 1
+                        ));
+                    }
+                    Ok(Label::String(&data[1..=len]))
+                }
             },
             /* compressed label */
-            0x3 => Ok(Label::Pointer(
-                ((data[0] & 0x3f) as usize) << 8 | (data[1] as usize),
-            )),
+            0x3 => {
+                if data.len() < 2 {
+                    return Err(anyhow!("truncated compression pointer"));
+                }
+                Ok(Label::Pointer(
+                    (u16::from_be_bytes([data[0], data[1]]) & POINTER_MASK) as usize,
+                ))
+            }
             /* extended label */
             0x1 => match data[0] {
                 0x41 => Err(anyhow!("binary label, not supported")),
@@ -238,30 +311,32 @@ pub fn dname_from_bytes<'a>(
     Ok((s, rest))
 }
 
+/// Encode a name in full, without compression.
+///
+/// This is the form stored in RDATA and the one DNSSEC canonical serialization
+/// requires; the message serializer uses the compressor instead.
 pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, anyhow::Error> {
-    let mut res = Vec::new();
     // A fully-qualified name carries a trailing '.' denoting the root; splitting
     // on '.' would otherwise yield a spurious empty final label (and a second
     // zero byte), which corrupts any record that stores data after the name.
     let name = name.strip_suffix('.').unwrap_or(name);
-    if !name.is_empty() {
-        for lbl in name.split('.') {
-            if lbl.is_empty() {
-                return Err(anyhow!("empty label in domain name '{}'", name));
-            }
-            let len: u8 = lbl
-                .len()
-                .try_into()
-                .map_err(|_| anyhow!("label longer than 255 bytes"))?;
-            if len > 63 {
-                return Err(anyhow!("label longer than 63 bytes: {}", lbl));
-            }
-            res.push(len);
-            res.extend_from_slice(lbl.as_bytes());
-        }
+    if name.is_empty() {
+        return Ok(vec![0]); // the root, on its own
     }
-    res.push(0); // terminate with root label
-    Ok(res)
+
+    // Size the buffer from the labels themselves, then let `write_label` do the
+    // validating as it writes. An over-long or empty label errors there rather
+    // than being checked twice.
+    let labels: Vec<&str> = name.split('.').collect();
+    let size: usize = labels.iter().map(|l| l.len() + 1).sum::<usize>() + 1;
+
+    let mut out = vec![0u8; size];
+    let mut pos = 0;
+    for label in &labels {
+        pos = write_label(&mut out, pos, label)?;
+    }
+    write_bytes(&mut out, pos, &[0])?; // terminate with the root label
+    Ok(out)
 }
 
 /**
@@ -357,6 +432,41 @@ mod tests {
 
         let res = dname_to_bytes("www.google.fi.").expect("www.google.fi");
         assert!(res.iter().zip(&data).all(|(l, r)| l == r));
+    }
+
+    /// A label header is attacker-controlled, so every read past it must be
+    /// bounds-checked rather than indexing into whatever is left.
+    #[test]
+    fn test_truncated_labels_are_errors_not_panics() {
+        assert!(Label::try_from_bytes(&[]).is_err(), "empty input");
+
+        // Claims a 32-byte label with only one byte behind it.
+        assert!(Label::try_from_bytes(&[0x20, b'a']).is_err(), "short label");
+
+        // A pointer needs two bytes; only the tag byte is present.
+        assert!(Label::try_from_bytes(&[0xc0]).is_err(), "half pointer");
+
+        // The boundary case either side: exactly enough, and one short.
+        assert!(Label::try_from_bytes(&[0x02, b'a', b'b']).is_ok());
+        assert!(Label::try_from_bytes(&[0x02, b'a']).is_err());
+    }
+
+    /// Encoding rejects what it cannot represent, rather than truncating.
+    #[test]
+    fn test_dname_to_bytes_rejects_bad_labels() {
+        assert!(dname_to_bytes("a..b.").is_err(), "empty label");
+        let too_long = "x".repeat(MAX_LABEL_LEN + 1);
+        assert!(dname_to_bytes(&format!("{too_long}.com.")).is_err());
+        // The longest legal label is still fine.
+        let max = "x".repeat(MAX_LABEL_LEN);
+        assert!(dname_to_bytes(&format!("{max}.com.")).is_ok());
+    }
+
+    /// The root encodes to a single zero octet, with or without the dot.
+    #[test]
+    fn test_dname_to_bytes_root() {
+        assert_eq!(dname_to_bytes(".").unwrap(), vec![0]);
+        assert_eq!(dname_to_bytes("").unwrap(), vec![0]);
     }
 
     #[test]

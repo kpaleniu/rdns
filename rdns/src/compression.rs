@@ -17,45 +17,11 @@
 //! out SRV (RFC 2782), DNAME, and the DNSSEC types, whose embedded names RFC
 //! 4034 requires to stay uncompressed.
 
-use crate::dname::{DNameUnpacker, dname_from_bytes};
+use crate::dname::{
+    dname_from_bytes, write_bytes, write_label, DNameUnpacker, POINTER_MASK, POINTER_TAG,
+};
 use anyhow::anyhow;
 use std::collections::HashMap;
-
-/// The two high bits that mark a label as a compression pointer.
-const POINTER_TAG: u16 = 0xc000;
-
-/// A pointer carries a 14-bit offset, so nothing past this can be referenced.
-/// Names beyond it are still *written*, just never pointed at.
-const MAX_POINTER_OFFSET: usize = 0x3fff;
-
-/// Copy `bytes` into `buf` at `pos`, returning the new position.
-///
-/// Unlike a `Cursor`, this refuses to write past the end rather than silently
-/// dropping the tail of the message.
-fn put(buf: &mut [u8], pos: usize, bytes: &[u8]) -> Result<usize, anyhow::Error> {
-    let end = pos + bytes.len();
-    if end > buf.len() {
-        return Err(anyhow!(
-            "buffer too small: need {} bytes, have {}",
-            end,
-            buf.len()
-        ));
-    }
-    buf[pos..end].copy_from_slice(bytes);
-    Ok(end)
-}
-
-/// Write one length-prefixed label.
-fn put_label(buf: &mut [u8], pos: usize, label: &str) -> Result<usize, anyhow::Error> {
-    if label.is_empty() {
-        return Err(anyhow!("empty label in domain name"));
-    }
-    if label.len() > 63 {
-        return Err(anyhow!("label longer than 63 bytes: {}", label));
-    }
-    let pos = put(buf, pos, &[label.len() as u8])?;
-    put(buf, pos, label.as_bytes())
-}
 
 /// Per-message table of name suffixes already written, and where.
 #[derive(Debug, Default)]
@@ -81,7 +47,7 @@ impl NameCompressor {
         let trimmed = name.strip_suffix('.').unwrap_or(name);
         if trimmed.is_empty() {
             // The root is one zero octet; a pointer to it would cost two.
-            return put(buf, pos, &[0]);
+            return write_bytes(buf, pos, &[0]);
         }
 
         let labels: Vec<&str> = trimmed.split('.').collect();
@@ -100,9 +66,9 @@ impl NameCompressor {
                 self.remember(fresh);
                 let mut out = pos;
                 for label in &labels[..i] {
-                    out = put_label(buf, out, label)?;
+                    out = write_label(buf, out, label)?;
                 }
-                return put(buf, out, &(POINTER_TAG | target).to_be_bytes());
+                return write_bytes(buf, out, &(POINTER_TAG | target).to_be_bytes());
             }
 
             fresh.push((key, suffix_pos));
@@ -113,16 +79,16 @@ impl NameCompressor {
         self.remember(fresh);
         let mut out = pos;
         for label in &labels {
-            out = put_label(buf, out, label)?;
+            out = write_label(buf, out, label)?;
         }
-        put(buf, out, &[0])
+        write_bytes(buf, out, &[0])
     }
 
     /// Record where each newly-written suffix starts, skipping any that a
     /// 14-bit pointer cannot reach.
     fn remember(&mut self, suffixes: Vec<(String, usize)>) {
         for (key, offset) in suffixes {
-            if offset <= MAX_POINTER_OFFSET {
+            if offset <= POINTER_MASK as usize {
                 self.seen.entry(key).or_insert(offset as u16);
             }
         }
@@ -145,7 +111,7 @@ impl NameCompressor {
             2 | 5 | 12 => {
                 let (name, rest) = read_name(rdata)?;
                 let pos = self.write_name(&name, buf, pos)?;
-                put(buf, pos, rest)
+                write_bytes(buf, pos, rest)
             }
             // SOA: MNAME, RNAME, then five 32-bit fields.
             6 => {
@@ -153,21 +119,21 @@ impl NameCompressor {
                 let (rname, rest) = read_name(rest)?;
                 let pos = self.write_name(&mname, buf, pos)?;
                 let pos = self.write_name(&rname, buf, pos)?;
-                put(buf, pos, rest)
+                write_bytes(buf, pos, rest)
             }
             // MX: 16-bit preference, then EXCHANGE.
             15 => {
                 if rdata.len() < 2 {
                     return Err(anyhow!("MX RDATA too short for its preference field"));
                 }
-                let pos = put(buf, pos, &rdata[..2])?;
+                let pos = write_bytes(buf, pos, &rdata[..2])?;
                 let (exchange, rest) = read_name(&rdata[2..])?;
                 let pos = self.write_name(&exchange, buf, pos)?;
-                put(buf, pos, rest)
+                write_bytes(buf, pos, rest)
             }
             // Everything else — including SRV, DNAME and the DNSSEC types —
             // goes out byte-for-byte (RFC 3597 §4, RFC 4034 §3.1.7/§4.1.1).
-            _ => put(buf, pos, rdata),
+            _ => write_bytes(buf, pos, rdata),
         }
     }
 }
