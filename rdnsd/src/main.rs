@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rdns::{
@@ -15,9 +17,26 @@ use rdns::{
 /// UDP payload size rdnsd advertises to clients via EDNS0.
 const RDNSD_PAYLOAD_SIZE: u16 = 4096;
 
+/// How long a TCP connection may sit idle between queries before we close it.
+/// RFC 7766 §6.2.3 wants connections reused rather than reopened; an idle one
+/// still costs a socket, so this is the compromise.
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long we wait for the rest of a message once its length prefix arrived.
+const TCP_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ceiling on concurrent TCP connections. Without one, an accept loop that
+/// spawns per connection is a free file-descriptor exhaustion vector.
+const MAX_TCP_CONNECTIONS: usize = 128;
+
+/// Queries a single connection may have in flight at once. Doubles as the reply
+/// channel's depth, so a client that pipelines faster than it reads eventually
+/// pushes back on our read loop instead of growing a queue in memory.
+const MAX_INFLIGHT_PER_CONNECTION: usize = 16;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::RwLock;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 
 #[cfg(unix)]
 use signal_hook::consts::signal::SIGHUP;
@@ -205,97 +224,198 @@ fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> 
     candidates.first().copied()
 }
 
+/// The shared state a TCP connection needs to answer queries. Bundled so a
+/// connection task clones one `Arc` instead of five.
+struct TcpServer {
+    zone_map: Arc<RwLock<HashMap<String, Zone>>>,
+    rate_limiter: Arc<RateLimiter>,
+    validator: Arc<RequestValidator>,
+    logger: Arc<QueryLogger>,
+    metrics: Arc<DnsMetrics>,
+}
+
 async fn tcp_main(
     addr: &str,
     zone_map: Arc<RwLock<HashMap<String, Zone>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
-    let rate_limiter = Arc::new(RateLimiter::with_defaults());
-    let validator = Arc::new(RequestValidator::with_defaults());
-    let logger = Arc::new(QueryLogger::new());
-    let metrics = Arc::new(DnsMetrics::new());
+    let server = Arc::new(TcpServer {
+        zone_map,
+        rate_limiter: Arc::new(RateLimiter::with_defaults()),
+        validator: Arc::new(RequestValidator::with_defaults()),
+        logger: Arc::new(QueryLogger::new()),
+        metrics: Arc::new(DnsMetrics::new()),
+    });
     println!("TCP DNS server listening on {}", addr);
 
+    let permits = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
     loop {
-        let (mut socket, peer_addr) = listener.accept().await?;
-        let zone_map = zone_map.clone();
-        let rate_limiter = rate_limiter.clone();
-        let validator = validator.clone();
-        let logger = logger.clone();
-        let metrics = metrics.clone();
-
+        let (stream, peer) = listener.accept().await?;
+        // Back-pressure on accept: at the ceiling we simply stop taking new
+        // connections until one finishes, rather than spawning unboundedly.
+        // The semaphore is never closed, so this only fails if we drop it.
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            continue;
+        };
+        let server = server.clone();
         tokio::spawn(async move {
-            let mut buf = [0; 16384]; // 16KB for TCP
+            server.serve_connection(stream, peer).await;
+            drop(permit);
+        });
+    }
+}
 
-            let n = match socket.read(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    logger.log_error(peer_addr.ip(), &format!("socket read error: {}", e));
-                    return;
+impl TcpServer {
+    /// Serve one connection until it goes idle, closes, or misbehaves.
+    ///
+    /// A connection carries any number of queries (RFC 7766 §6.2.1), and they
+    /// are answered **concurrently**: reading, answering and writing are three
+    /// separate jobs, so one slow query cannot stall the queries behind it
+    /// (§6.2.1.1).
+    async fn serve_connection(self: Arc<Self>, stream: TcpStream, peer: SocketAddr) {
+        let (mut reader, mut writer) = stream.into_split();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_INFLIGHT_PER_CONNECTION);
+
+        // One task owns the write half. Answers may complete out of order —
+        // RFC 7766 §6.2.1.1 allows that, and clients match on the transaction
+        // id — but two framed messages must never interleave on the wire, so
+        // every reply funnels through here.
+        let writer_logger = self.logger.clone();
+        let writer_task = tokio::spawn(async move {
+            while let Some(framed) = rx.recv().await {
+                if let Err(e) = writer.write_all(&framed).await {
+                    writer_logger.log_error(peer.ip(), &format!("socket write error: {}", e));
+                    break;
                 }
-            };
-
-            // Rate limiting check
-            if !rate_limiter.should_allow(peer_addr.ip()) {
-                logger.log_rate_limited(peer_addr.ip());
-                instrumentation::trace_rate_limit_check(&peer_addr.ip(), false);
-                return;
-            }
-            instrumentation::trace_rate_limit_check(&peer_addr.ip(), true);
-
-            // Validation check
-            let validation = validator.validate_packet(&buf[0..n], true);
-            if !validation.is_valid() {
-                logger.log_error(
-                    peer_addr.ip(),
-                    &format!(
-                        "invalid query: {}",
-                        validation.error_message().unwrap_or("unknown error")
-                    ),
-                );
-                instrumentation::trace_validation(
-                    &peer_addr.ip(),
-                    false,
-                    validation.error_message(),
-                );
-                return;
-            }
-            instrumentation::trace_validation(&peer_addr.ip(), true, None);
-
-            if let Ok(msg) = DnsMessage::try_from_bytes(&buf[0..n]) {
-                // Log successful query parsing
-                let qtype = msg.queries.first().map(|q| q.qtype);
-                logger.log_query(peer_addr.ip(), qtype);
-
-                let query_name = msg
-                    .queries
-                    .first()
-                    .map(|q| q.qname.as_str())
-                    .unwrap_or("unknown");
-                instrumentation::trace_query_received(
-                    &peer_addr.ip(),
-                    query_name,
-                    qtype.unwrap_or(0),
-                );
-
-                // Read zone map and generate response
-                let zone_map = zone_map.read().await;
-                let resp = make_response(&msg, &zone_map, &metrics);
-                let mut response_buf = [0; 16384];
-                match resp.to_bytes(&mut response_buf) {
-                    Ok(n) => {
-                        if let Err(e) = socket.write_all(&response_buf[0..n]).await {
-                            logger.log_error(peer_addr.ip(), &format!("socket write error: {}", e));
-                        }
-                    }
-                    Err(e) => {
-                        logger.log_error(peer_addr.ip(), &format!("serialization error: {}", e));
-                    }
-                }
-            } else {
-                logger.log_error(peer_addr.ip(), "failed to parse DNS message");
             }
         });
+
+        let in_flight = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_CONNECTION));
+
+        loop {
+            // DNS over TCP frames every message with a 2-byte big-endian length
+            // prefix (RFC 1035 §4.2.2). Read the prefix first, then exactly that
+            // many bytes — a single `read` can return a short or coalesced chunk.
+            //
+            // Between messages the peer may legitimately be idle, so a timeout
+            // here (like EOF) is an ordinary end to a connection, not an error.
+            let mut len_buf = [0u8; 2];
+            match tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut len_buf)).await {
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+
+            let len = u16::from_be_bytes(len_buf) as usize;
+            if len == 0 {
+                self.logger.log_error(peer.ip(), "zero-length TCP message");
+                break;
+            }
+
+            // Mid-message the peer has committed to sending `len` bytes, so a
+            // stall here gets a much shorter leash than an idle connection.
+            let mut packet = vec![0u8; len];
+            match tokio::time::timeout(TCP_READ_TIMEOUT, reader.read_exact(&mut packet)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    self.logger
+                        .log_error(peer.ip(), &format!("socket read error: {}", e));
+                    break;
+                }
+                Err(_) => {
+                    self.logger
+                        .log_error(peer.ip(), "timed out mid-message on TCP");
+                    break;
+                }
+            }
+
+            // Cap in-flight work per connection: this await is what stops a
+            // pipelining client from spawning tasks faster than we retire them.
+            let Ok(permit) = in_flight.clone().acquire_owned().await else {
+                break;
+            };
+            let server = self.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Some(framed) = server.answer(&packet, peer).await {
+                    // A send error means the writer is gone (the peer hung up);
+                    // there is nowhere left to put the reply.
+                    let _ = tx.send(framed).await;
+                }
+                drop(permit);
+            });
+        }
+
+        // Dropping our sender lets the writer drain the replies still in flight
+        // — the clones held by running tasks keep the channel open — and then
+        // exit on its own.
+        drop(tx);
+        let _ = writer_task.await;
+    }
+
+    /// Answer one query, returning the length-prefixed reply to write back, or
+    /// `None` if the query earned no response at all.
+    async fn answer(&self, packet: &[u8], peer: SocketAddr) -> Option<Vec<u8>> {
+        let ip = peer.ip();
+
+        if !self.rate_limiter.should_allow(ip) {
+            self.logger.log_rate_limited(ip);
+            instrumentation::trace_rate_limit_check(&ip, false);
+            return None;
+        }
+        instrumentation::trace_rate_limit_check(&ip, true);
+
+        let validation = self.validator.validate_packet(packet, true);
+        if !validation.is_valid() {
+            self.logger.log_error(
+                ip,
+                &format!(
+                    "invalid query: {}",
+                    validation.error_message().unwrap_or("unknown error")
+                ),
+            );
+            instrumentation::trace_validation(&ip, false, validation.error_message());
+            return None;
+        }
+        instrumentation::trace_validation(&ip, true, None);
+
+        let Ok(msg) = DnsMessage::try_from_bytes(packet) else {
+            self.logger.log_error(ip, "failed to parse DNS message");
+            return None;
+        };
+
+        let qtype = msg.queries.first().map(|q| q.qtype);
+        self.logger.log_query(ip, qtype);
+        let query_name = msg
+            .queries
+            .first()
+            .map(|q| q.qname.as_str())
+            .unwrap_or("unknown");
+        instrumentation::trace_query_received(&ip, query_name, qtype.unwrap_or(0));
+
+        // Hold the zone lock only as long as it takes to build and serialize the
+        // response — never across a socket write, or a SIGHUP zone reload would
+        // queue behind a slow client for the life of its connection.
+        let bytes = {
+            let zones = self.zone_map.read().await;
+            let resp = make_response(&msg, &zones, &self.metrics);
+            // Over TCP the 2-byte length prefix is the only size limit, so the
+            // EDNS UDP payload size does not apply (RFC 6891 §6.2.2).
+            match resp.to_bytes_within(u16::MAX as usize) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.logger
+                        .log_error(ip, &format!("serialization error: {}", e));
+                    return None;
+                }
+            }
+        };
+
+        // Length prefix + message in one buffer, so the writer emits them in a
+        // single call (RFC 1035 §4.2.2).
+        let mut framed = Vec::with_capacity(2 + bytes.len());
+        framed.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&bytes);
+        Some(framed)
     }
 }
 
@@ -358,12 +478,17 @@ async fn udp_main(
                     .unwrap_or("unknown");
                 instrumentation::trace_query_received(&peer.ip(), query_name, qtype.unwrap_or(0));
 
-                // Read zone map and generate response
-                let zone_map = zone_map.read().await;
-                let resp = make_response(&msg, &zone_map, &metrics);
-                // Honor the client's EDNS0 UDP payload size (512 if no EDNS);
-                // truncates with TC=1 if the response is larger.
-                match resp.to_bytes_within(msg.udp_payload_size() as usize) {
+                // Build the response under the zone lock, then drop it before
+                // touching the socket: a read guard held across `send_to` would
+                // stall a SIGHUP zone reload behind the network.
+                let serialized = {
+                    let zones = zone_map.read().await;
+                    let resp = make_response(&msg, &zones, &metrics);
+                    // Honor the client's EDNS0 UDP payload size (512 if no EDNS);
+                    // truncates with TC=1 if the response is larger.
+                    resp.to_bytes_within(msg.udp_payload_size() as usize)
+                };
+                match serialized {
                     Ok(bytes) => {
                         if let Err(e) = socket.send_to(&bytes, peer).await {
                             logger.log_error(peer.ip(), &format!("socket send error: {}", e));

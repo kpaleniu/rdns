@@ -3,13 +3,14 @@ use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::{FromPrimitive, ToPrimitive};
 use rand::Rng;
 use std::{
-    io::{Cursor, Write},
     net::{Ipv4Addr, Ipv6Addr},
     str::from_utf8,
 };
 
+use compression::NameCompressor;
 use dname::{dname_from_bytes, dname_to_bytes, DNameUnpacker, TryUnpackFromBytes};
 
+pub mod compression;
 pub mod dname;
 pub mod zone;
 pub mod security;
@@ -831,10 +832,31 @@ impl DnsMessage {
         })
     }
 
+    /// Serialize the message into `output`, with domain-name compression
+    /// (RFC 1035 §4.1.4). Returns the number of bytes written; errors if the
+    /// message does not fit rather than writing a silently truncated one.
     pub fn to_bytes(&self, output: &mut [u8]) -> Result<usize, anyhow::Error> {
-        let mut written = 0;
-        let mut buf = Cursor::new(output);
-        written += buf.write(&self.id.to_be_bytes())?;
+        let mut compressor = NameCompressor::new();
+        let mut pos = 0;
+
+        // Copy `bytes` into the output at the running position.
+        macro_rules! put {
+            ($bytes:expr) => {{
+                let bytes = $bytes;
+                let end = pos + bytes.len();
+                if end > output.len() {
+                    return Err(anyhow!(
+                        "buffer too small: need {} bytes, have {}",
+                        end,
+                        output.len()
+                    ));
+                }
+                output[pos..end].copy_from_slice(&bytes);
+                pos = end;
+            }};
+        }
+
+        put!(self.id.to_be_bytes());
 
         let opcode = self.opcode.to_u8().unwrap_or_default();
 
@@ -865,27 +887,27 @@ impl DnsMessage {
             | (self.cd as u8) << 4
             | (rcode & 0xf) as u8;
 
-        written += buf.write(&[hi, lo])?;
-        written += buf.write(&(self.queries.len() as u16).to_be_bytes())?;
-        written += buf.write(&(self.answers.len() as u16).to_be_bytes())?;
-        written += buf.write(&(self.authorities.len() as u16).to_be_bytes())?;
-        written += buf.write(&(self.additionals.len() as u16).to_be_bytes())?;
+        put!([hi, lo]);
+        put!((self.queries.len() as u16).to_be_bytes());
+        put!((self.answers.len() as u16).to_be_bytes());
+        put!((self.authorities.len() as u16).to_be_bytes());
+        put!((self.additionals.len() as u16).to_be_bytes());
 
         for q in &self.queries {
-            written += buf.write(&dname_to_bytes(q.qname.as_str())?)?;
-            written += buf.write(&q.qtype.to_be_bytes())?;
-            let qclass = &q.qclass.to_u16().unwrap_or(254);
-            written += buf.write(&qclass.to_be_bytes())?;
+            pos = compressor.write_name(q.qname.as_str(), output, pos)?;
+            put!(q.qtype.to_be_bytes());
+            put!(q.qclass.to_u16().unwrap_or(254).to_be_bytes());
         }
 
-        // Resource records. RDATA is stored uncompressed and wire-ready, so
-        // serializing a record is a straight copy of its bytes (no name
-        // compression on output yet — see TODO Part B #5).
+        // Resource records. Owner names are compressed against everything
+        // written so far; RDATA is stored uncompressed and wire-ready, so it is
+        // a straight copy except for the record types whose embedded names may
+        // legally be compressed (see [`NameCompressor::write_rdata`]).
         for section in [&self.answers, &self.authorities, &self.additionals] {
             for rr in section {
-                written += buf.write(&dname_to_bytes(rr.name.as_str())?)?;
-                written += buf.write(&rr.rdata.rtype.to_be_bytes())?;
-                written += buf.write(&rr.class.to_be_bytes())?;
+                pos = compressor.write_name(rr.name.as_str(), output, pos)?;
+                put!(rr.rdata.rtype.to_be_bytes());
+                put!(rr.class.to_be_bytes());
                 // The OPT TTL's top byte is the extended RCODE's high 8 bits.
                 // `self.rcode` owns the whole 12-bit value, so stamp it in here
                 // rather than trusting whatever the OPT record was built with.
@@ -894,18 +916,21 @@ impl DnsMessage {
                 } else {
                     rr.ttl as u32
                 };
-                written += buf.write(&ttl.to_be_bytes())?;
-                let rdlen: u16 = rr
-                    .rdata
-                    .rdata
-                    .len()
+                put!(ttl.to_be_bytes());
+
+                // RDLEN can only be known once the RDATA is written, since
+                // compression changes its length. Leave a hole and fill it in.
+                let rdlen_at = pos;
+                put!([0u8, 0u8]);
+                let rdata_at = pos;
+                pos = compressor.write_rdata(rr.rdata.rtype, &rr.rdata.rdata, output, pos)?;
+                let rdlen: u16 = (pos - rdata_at)
                     .try_into()
                     .map_err(|_| anyhow!("RDATA exceeds 65535 bytes"))?;
-                written += buf.write(&rdlen.to_be_bytes())?;
-                written += buf.write(&rr.rdata.rdata)?;
+                output[rdlen_at..rdlen_at + 2].copy_from_slice(&rdlen.to_be_bytes());
             }
         }
-        Ok(written)
+        Ok(pos)
     }
 
     /// The EDNS0 OPT record from the additional section, if the message carries
@@ -1119,6 +1144,148 @@ mod tests {
         assert_eq!(a.ttl, 3600);
         assert_eq!(a.rdata.rtype, 1);
         assert_eq!(&*a.rdata.rdata, &[192, 0, 2, 1]); // A record: 4 address octets
+    }
+
+    /// A response whose records all share the question's owner name should
+    /// carry that name once, with 2-byte pointers thereafter.
+    #[test]
+    fn test_output_compresses_repeated_owner_names() {
+        use std::net::Ipv4Addr;
+
+        let answers: Vec<ResourceRecord> = (1..=10)
+            .map(|i| ResourceRecord {
+                name: "www.example.com.".to_string(),
+                class: 1,
+                ttl: 3600,
+                rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, i)))
+                    .unwrap(),
+            })
+            .collect();
+
+        let mut msg = query_msg(0x4242);
+        msg.response = true;
+        msg.queries[0].qname = "www.example.com.".to_string();
+        msg.answers = answers;
+
+        let mut buf = [0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("to_bytes");
+
+        // 12 header + 21 question (17-byte name + type + class) + 10 * (2
+        // pointer + 2 type + 2 class + 4 TTL + 2 RDLEN + 4 address) = 193.
+        // Without compression each answer would carry the 17-byte name instead
+        // of a 2-byte pointer: 33 + 10 * 31 = 343.
+        assert_eq!(n, 193);
+
+        let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
+        assert_eq!(parsed.answers.len(), 10);
+        for (i, a) in parsed.answers.iter().enumerate() {
+            assert_eq!(a.name, "www.example.com.");
+            assert_eq!(&*a.rdata.rdata, &[192, 0, 2, (i + 1) as u8]);
+        }
+    }
+
+    /// Names inside NS/CNAME/SOA/MX RDATA are compressed too, and survive the
+    /// round-trip — the parser resolves the pointers against the full message.
+    #[test]
+    fn test_output_compresses_names_inside_rdata() {
+        let ns = ResourceRecord {
+            name: "example.com.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::NS("ns1.example.com.".to_string()))
+                .unwrap(),
+        };
+        let mx = ResourceRecord {
+            name: "example.com.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::MX {
+                preference: 10,
+                exchange: "mail.example.com.".to_string(),
+            })
+            .unwrap(),
+        };
+        let cname = ResourceRecord {
+            name: "alias.example.com.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::CNAME("www.example.com.".to_string()))
+                .unwrap(),
+        };
+
+        let mut msg = query_msg(0x5150);
+        msg.response = true;
+        msg.answers = vec![ns.clone(), mx.clone(), cname.clone()];
+
+        let mut buf = [0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("to_bytes");
+        let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
+
+        // RDATA is stored uncompressed, so the parsed records must equal the
+        // originals byte for byte even though the wire form used pointers.
+        assert_eq!(parsed.answers.len(), 3);
+        for (got, want) in parsed.answers.iter().zip([&ns, &mx, &cname]) {
+            assert_eq!(got.name, want.name);
+            assert_eq!(got.ttl, want.ttl);
+            assert_eq!(got.rdata, want.rdata);
+        }
+
+        // Every one of those names ends in a pointer rather than spelling the
+        // zone out again. (Labels are length-prefixed on the wire, so the
+        // literal to look for is the label "example", not "example.com".)
+        assert_eq!(
+            buf[..n].windows(7).filter(|w| *w == b"example").count(),
+            1,
+            "the zone name should appear exactly once in the message"
+        );
+    }
+
+    /// RFC 3597 §4 / RFC 4034: names in types the receiver may not know must
+    /// not be compressed. SRV is the canonical example.
+    #[test]
+    fn test_unknown_and_dnssec_rdata_is_not_compressed() {
+        // SRV: priority, weight, port, then a target name we must leave alone.
+        let mut srv_rdata = vec![0, 10, 0, 20, 0, 80];
+        srv_rdata.extend_from_slice(&dname_to_bytes("www.example.com.").unwrap());
+        let srv = ResourceRecord {
+            name: "_sip._tcp.example.com.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData {
+                rtype: 33,
+                rdata: srv_rdata.clone().into_boxed_slice(),
+            },
+        };
+
+        let mut msg = query_msg(0x1111);
+        msg.response = true;
+        msg.queries[0].qname = "_sip._tcp.example.com.".to_string();
+        msg.answers = vec![srv];
+
+        let mut buf = [0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("to_bytes");
+
+        // The RDATA appears verbatim, pointers and all.
+        assert!(
+            buf[..n]
+                .windows(srv_rdata.len())
+                .any(|w| w == srv_rdata.as_slice()),
+            "SRV RDATA must go out byte-for-byte"
+        );
+
+        let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
+        assert_eq!(&*parsed.answers[0].rdata.rdata, srv_rdata.as_slice());
+    }
+
+    /// Serializing into a buffer that cannot hold the message is an error, not
+    /// a silently short write.
+    #[test]
+    fn test_to_bytes_rejects_undersized_buffer() {
+        let mut msg = query_msg(7);
+        msg.queries[0].qname = "a-rather-long-name.example.com.".to_string();
+
+        let mut buf = [0u8; 20];
+        assert!(msg.to_bytes(&mut buf).is_err());
     }
 
     fn query_msg(id: u16) -> DnsMessage {
