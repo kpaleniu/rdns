@@ -1,4 +1,4 @@
-use crate::{DnsMessage, QuerySection, ResponseCode};
+use crate::{DnsMessage, Edns, QuerySection, ResponseCode};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 use anyhow::anyhow;
@@ -12,6 +12,8 @@ pub struct ResolverConfig {
     pub timeout_ms: u64,
     /// Maximum recursion depth
     pub max_depth: usize,
+    /// EDNS0 UDP payload size to advertise to upstream (RFC 6891).
+    pub udp_payload_size: u16,
 }
 
 impl Default for ResolverConfig {
@@ -24,6 +26,7 @@ impl Default for ResolverConfig {
             ],
             timeout_ms: 5000,
             max_depth: 3,
+            udp_payload_size: 4096,
         }
     }
 }
@@ -60,7 +63,7 @@ impl RecursiveResolver {
         }
 
         // Create query message
-        let msg = DnsMessage {
+        let mut msg = DnsMessage {
             id: rand::random::<u16>(),
             response: false,
             opcode: crate::OpCode::Query,
@@ -76,6 +79,8 @@ impl RecursiveResolver {
             authorities: Vec::new(),
             additionals: Vec::new(),
         };
+        // Advertise EDNS0 so upstream may return responses larger than 512 bytes.
+        msg.set_edns(Edns::with_payload_size(self.config.udp_payload_size))?;
 
         // Serialize query
         let mut query_buf = vec![0; 512];
@@ -108,8 +113,8 @@ impl RecursiveResolver {
         // Send query
         socket.send(query)?;
 
-        // Receive response
-        let mut response_buf = vec![0; 512];
+        // Receive response, sized to the payload we advertised via EDNS.
+        let mut response_buf = vec![0; self.config.udp_payload_size as usize];
         let n = socket.recv(&mut response_buf)?;
 
         response_buf.truncate(n);
@@ -141,6 +146,7 @@ mod tests {
             upstream_servers: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)],
             timeout_ms: 1000,
             max_depth: 0,
+            udp_payload_size: 4096,
         };
         let resolver = RecursiveResolver::new(config);
         assert_eq!(resolver.config.max_depth, 0);
@@ -152,6 +158,7 @@ mod tests {
             upstream_servers: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)],
             timeout_ms: 1000,
             max_depth: 0,
+            udp_payload_size: 4096,
         };
         let resolver = RecursiveResolver::new(config);
 

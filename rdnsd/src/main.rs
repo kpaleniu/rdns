@@ -9,8 +9,11 @@ use rdns::{
     telemetry::{instrumentation, DnsMetrics, LatencyTimer},
     validation::RequestValidator,
     zone::{parse_zone_file, Zone},
-    DnsMessage, ResourceRecord, ResponseCode,
+    DnsMessage, Edns, ResourceRecord, ResponseCode, EDNS_VERSION,
 };
+
+/// UDP payload size rdnsd advertises to clients via EDNS0.
+const RDNSD_PAYLOAD_SIZE: u16 = 4096;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -85,6 +88,22 @@ fn make_response(
         additionals: Vec::new(),
     };
 
+    // EDNS-level rejections take precedence over any zone lookup: a malformed
+    // option list is FORMERR, and an EDNS version we don't implement is BADVERS
+    // (RFC 6891 §6.1.3). Both replies carry a bare version-0 OPT — BADVERS is an
+    // extended RCODE, so the OPT record is what carries its high bits.
+    let edns_rejection = match msg.edns() {
+        Err(_) => Some(ResponseCode::FormatError),
+        Ok(Some(edns)) if edns.version > EDNS_VERSION => Some(ResponseCode::BadOptVersion),
+        _ => None,
+    };
+    if let Some(rcode) = edns_rejection {
+        response.rcode = rcode;
+        // `with_payload_size` carries no options, so encoding it cannot fail.
+        let _ = response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+        return response;
+    }
+
     // Process each query
     for query in &msg.queries {
         // Find the matching zone for this query
@@ -94,22 +113,29 @@ fn make_response(
             let matching_records = zone.query(&query.qname, query.qtype);
 
             if matching_records.is_empty() {
-                // No records found - return NXDOMAIN if no other records for this domain
-                let any_records = zone.records.iter().any(|r| {
-                    r.name.to_lowercase().trim_end_matches('.')
-                        == query.qname.to_lowercase().trim_end_matches('.')
-                });
+                // Nothing of this type here. NXDOMAIN only if the *name* doesn't
+                // exist either; otherwise it's NOERROR with an empty answer
+                // (NODATA). Names must go through `Zone::matches_query`, which
+                // is what expands `@` and relative owner names against the
+                // origin — comparing the stored names raw never matches.
+                let name_exists = zone
+                    .records
+                    .iter()
+                    .any(|r| zone.matches_query(&r.name, &query.qname));
 
-                if !any_records {
+                if !name_exists {
                     response.rcode = ResponseCode::NoSuchDomain;
                 }
 
                 metrics.increment_cache_misses();
             } else {
-                // Add matching records to answer section
+                // Add matching records to answer section. The answer echoes the
+                // queried name rather than the stored one, which may be `@` or
+                // relative — and for a wildcard match the queried name is what
+                // the client must see (RFC 1034 §4.3.3).
                 for record in matching_records {
                     response.answers.push(ResourceRecord {
-                        name: record.name.clone(),
+                        name: query.qname.clone(),
                         class: record.class,
                         ttl: record.ttl,
                         rdata: record.rdata.clone(),
@@ -136,6 +162,12 @@ fn make_response(
     let query_type = msg.queries.first().map(|q| q.qtype).unwrap_or(0);
     instrumentation::trace_query_response(query_name, query_type, timer.elapsed_ms(), None);
 
+    // Mirror EDNS0: only include an OPT record when the client used EDNS
+    // (RFC 6891 §6.1.1), advertising our own UDP payload size.
+    if msg.has_edns() {
+        let _ = response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+    }
+
     response
 }
 
@@ -143,14 +175,25 @@ fn make_response(
 /// 
 /// Matches the query name against zone origins, preferring the most specific (longest) match
 fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> Option<&'a Zone> {
+    // Wire-format query names are absolute ("www.example.com."), so the trailing
+    // dot has to come off both sides before comparing — otherwise nothing ever
+    // matches an origin and every query is an NXDOMAIN.
     let qname_lower = qname.to_lowercase();
-    
+    let qname_lower = qname_lower.trim_end_matches('.');
+
     // Find all zones that could handle this query
     let mut candidates: Vec<_> = zone_map
         .values()
         .filter(|zone| {
             let zone_origin = zone.origin.trim_end_matches('.').to_lowercase();
-            qname_lower.ends_with(&zone_origin) || qname_lower == zone_origin
+            // The root zone serves everything; otherwise the query must be the
+            // origin or sit under it *at a label boundary*, so that a zone for
+            // "example.com" doesn't capture "notexample.com".
+            zone_origin.is_empty()
+                || qname_lower == zone_origin
+                || qname_lower
+                    .strip_suffix(&zone_origin)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
         })
         .collect();
     
@@ -267,7 +310,7 @@ async fn udp_main(
     let metrics = Arc::new(DnsMetrics::new());
     println!("UDP DNS server listening on {}", addr);
 
-    let mut buf = vec![0; 512];
+    let mut buf = vec![0; 4096];
 
     loop {
         let (size, peer) = socket.recv_from(&mut buf).await?;
@@ -318,10 +361,11 @@ async fn udp_main(
                 // Read zone map and generate response
                 let zone_map = zone_map.read().await;
                 let resp = make_response(&msg, &zone_map, &metrics);
-                let mut response_buf = [0; 512];
-                match resp.to_bytes(&mut response_buf) {
-                    Ok(n) => {
-                        if let Err(e) = socket.send_to(&response_buf[0..n], peer).await {
+                // Honor the client's EDNS0 UDP payload size (512 if no EDNS);
+                // truncates with TC=1 if the response is larger.
+                match resp.to_bytes_within(msg.udp_payload_size() as usize) {
+                    Ok(bytes) => {
+                        if let Err(e) = socket.send_to(&bytes, peer).await {
                             logger.log_error(peer.ip(), &format!("socket send error: {}", e));
                             instrumentation::trace_error(
                                 "socket_send",

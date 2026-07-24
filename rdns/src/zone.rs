@@ -44,11 +44,15 @@ impl Zone {
             .collect()
     }
 
-    /// Helper to match domain names, handling wildcards and relative names
+    /// Helper to match domain names, handling wildcards and relative names.
+    ///
+    /// Both sides are normalized to absolute form first, so a record stored as
+    /// `@` or `www` matches a query for the origin or `www.<origin>.`.
     pub fn matches_query(&self, record_name: &str, query_name: &str) -> bool {
-        let record_name = self.normalize_name(record_name);
-        let query_name = self.normalize_name(query_name);
-        
+        // DNS names compare case-insensitively (RFC 4343).
+        let record_name = self.normalize_name(record_name).to_lowercase();
+        let query_name = self.normalize_name(query_name).to_lowercase();
+
         // Exact match
         if record_name == query_name {
             return true;
@@ -70,7 +74,7 @@ impl Zone {
     }
 
     /// Normalize domain names to absolute form with trailing dot
-    fn normalize_name(&self, name: &str) -> String {
+    pub fn normalize_name(&self, name: &str) -> String {
         let name = name.trim();
         if name.is_empty() || name == "@" {
             self.origin.clone()
@@ -201,11 +205,15 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
     let mut current_name = String::new();
     let mut current_ttl = 3600i32;
 
-    for (line_idx, line) in content.lines().enumerate() {
+    for (line_idx, raw_line) in content.lines().enumerate() {
         let ln = line_idx + 1;
-        // Remove comments
-        let line = line.split(';').next().unwrap_or("").trim();
-        
+        // Strip comments, but read the indentation off the raw line first: a
+        // record line that begins with whitespace omits its owner name and
+        // inherits the previous record's (RFC 1035 §5.1).
+        let uncommented = raw_line.split(';').next().unwrap_or("");
+        let omits_owner = uncommented.starts_with(|c: char| c.is_whitespace());
+        let line = uncommented.trim();
+
         if line.is_empty() {
             continue;
         }
@@ -240,24 +248,22 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
             continue;
         }
 
-        // Handle relative names (lines starting with whitespace implicitly use previous name)
-        if !line.starts_with(|c: char| c.is_whitespace()) && !parts[0].starts_with('$') {
-            current_name = parts[0].to_string();
-        }
-
         // Parse record: [name] [ttl] [class] type rdata...
+        //
+        // Position is what tells an owner name apart from a TTL/class/type, not
+        // the token's shape: a name may end in '.' (an FQDN) or contain digits
+        // (`www2`), and common host names collide with type mnemonics (`ns IN A
+        // …` — `ns` is the owner there, not an NS record).
         let mut idx = 0;
-        let record_name = if parts[idx].ends_with('.') || parts[idx].contains(char::is_numeric) {
-            // This is likely a TTL or class, use current name
-            current_name.clone()
-        } else {
-            let name = parts[idx].to_string();
+        if !omits_owner {
+            current_name = parts[0].to_string();
             idx += 1;
-            if name != "@" {
-                current_name = name.clone();
-            }
-            name
-        };
+        } else if current_name.is_empty() {
+            return Err(format!(
+                "line {ln}: record omits its owner name but no previous record supplies one"
+            ));
+        }
+        let record_name = current_name.clone();
 
         // Parse TTL and class
         let mut ttl = current_ttl;
@@ -588,6 +594,58 @@ mail IN A   192.0.2.3
         let zone_content = "www IN WKS 192.0.2.1\n";
         let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
         assert!(err.contains("unsupported record type"), "got: {err}");
+    }
+
+    #[test]
+    fn test_fully_qualified_owner_name_parses() {
+        // An FQDN owner ends in '.', which the old lookahead mistook for a
+        // TTL/class token and then tried to read as a record type.
+        let zone = parse_zone_file("www.example.com. IN A 192.0.2.5\n", "example.com.").unwrap();
+        assert_eq!(zone.records.len(), 1);
+        assert_eq!(zone.records[0].name, "www.example.com.");
+        assert_eq!(zone.query("www.example.com.", 1).len(), 1);
+    }
+
+    #[test]
+    fn test_owner_name_may_contain_digits() {
+        let zone = parse_zone_file("www2 IN A 192.0.2.6\n", "example.com.").unwrap();
+        assert_eq!(zone.records[0].name, "www2");
+        assert_eq!(zone.query("www2.example.com.", 1).len(), 1);
+    }
+
+    #[test]
+    fn test_owner_name_may_look_like_a_record_type() {
+        // "ns IN A ..." is a host called `ns`, not an NS record — position, not
+        // the token's spelling, decides what the first field is.
+        let zone = parse_zone_file("ns IN A 192.0.2.7\n", "example.com.").unwrap();
+        assert_eq!(zone.records[0].name, "ns");
+        assert_eq!(zone.query("ns.example.com.", 1).len(), 1, "should be an A record");
+    }
+
+    #[test]
+    fn test_indented_line_inherits_previous_owner() {
+        // RFC 1035 §5.1: a line beginning with whitespace reuses the last owner.
+        let zone_content = "www IN A 192.0.2.1\n    IN A 192.0.2.2\n";
+        let zone = parse_zone_file(zone_content, "example.com.").unwrap();
+        assert_eq!(zone.records.len(), 2);
+        assert_eq!(zone.records[1].name, "www");
+        assert_eq!(zone.query("www.example.com.", 1).len(), 2);
+    }
+
+    #[test]
+    fn test_indented_line_without_a_previous_owner_errors() {
+        let err = parse_zone_file("    IN A 192.0.2.1\n", "example.com.").unwrap_err();
+        assert!(err.contains("omits its owner name"), "got: {err}");
+    }
+
+    #[test]
+    fn test_apex_and_relative_names_match_absolute_queries() {
+        let zone_content = "@ IN A 192.0.2.1\nwww IN A 192.0.2.2\n";
+        let zone = parse_zone_file(zone_content, "example.com.").unwrap();
+        assert_eq!(zone.query("example.com.", 1).len(), 1, "@ should match the apex");
+        assert_eq!(zone.query("www.example.com.", 1).len(), 1);
+        // DNS names are case-insensitive (RFC 4343).
+        assert_eq!(zone.query("WWW.Example.COM.", 1).len(), 1);
     }
 
     #[test]

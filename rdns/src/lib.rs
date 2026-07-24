@@ -500,7 +500,7 @@ pub struct ResourceRecord {
     pub rdata: RecordData,
 }
 
-#[derive(Debug, FromPrimitive, ToPrimitive, Clone)]
+#[derive(Debug, FromPrimitive, ToPrimitive, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseCode {
     // RFC 1035 - Basic codes
     Ok = 0,
@@ -533,7 +533,7 @@ pub enum ResponseCode {
     Unknown = 65535,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DnsMessage {
     pub id: u16,
     pub response: bool,      // is the message response or query, QR
@@ -550,6 +550,158 @@ pub struct DnsMessage {
     pub answers: Vec<ResourceRecord>,
     pub authorities: Vec<ResourceRecord>,
     pub additionals: Vec<ResourceRecord>,
+}
+
+/// The RR TYPE code of the EDNS0 OPT pseudo-record (RFC 6891).
+pub const OPT_RECORD_TYPE: u16 = 41;
+
+/// The classic (pre-EDNS) UDP message size limit (RFC 1035 §4.2.1).
+pub const CLASSIC_UDP_SIZE: u16 = 512;
+
+/// The EDNS version we implement. A request at a higher version gets BADVERS
+/// (RFC 6891 §6.1.3).
+pub const EDNS_VERSION: u8 = 0;
+
+// EDNS option codes from the IANA "DNS EDNS0 Option Codes" registry. We don't
+// interpret any of these yet — options round-trip as opaque bytes — but naming
+// the common ones keeps call sites readable.
+/// Name Server Identifier (RFC 5001).
+pub const EDNS_OPTION_NSID: u16 = 3;
+/// Client Subnet (RFC 7871).
+pub const EDNS_OPTION_CLIENT_SUBNET: u16 = 8;
+/// DNS Cookie (RFC 7873).
+pub const EDNS_OPTION_COOKIE: u16 = 10;
+/// Padding (RFC 7830).
+pub const EDNS_OPTION_PADDING: u16 = 12;
+
+/// A single EDNS option carried in the OPT RDATA (RFC 6891 §6.1.2): a 16-bit
+/// option code, a 16-bit length, then that many bytes of option data.
+///
+/// Option data is stored verbatim; we don't interpret any option's contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdnsOption {
+    pub code: u16,
+    pub data: Vec<u8>,
+}
+
+/// EDNS0 OPT pseudo-record (RFC 6891).
+///
+/// OPT is carried as a record in the additional section, but repurposes the
+/// usual RR fields: NAME is root, CLASS is the requestor's UDP payload size, and
+/// TTL packs the extended-RCODE / version / flags (including the DNSSEC-OK bit).
+/// We interpret it on top of the generic [`ResourceRecord`] storage rather than
+/// giving [`DnsMessage`] dedicated fields.
+///
+/// The extended RCODE is deliberately *not* a field here: it is a property of
+/// the message, not of the OPT record, so it lives in [`DnsMessage::rcode`] as a
+/// single 12-bit value and is split across the header and the OPT TTL only at
+/// serialization time. See [`DnsMessage::to_bytes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edns {
+    /// Requestor's/responder's advertised UDP payload size (OPT CLASS field).
+    pub udp_payload_size: u16,
+    /// EDNS version (0 for EDNS0).
+    pub version: u8,
+    /// DNSSEC OK bit (DO) — the client is willing to receive DNSSEC records.
+    pub do_bit: bool,
+    /// Options carried in the OPT RDATA, in wire order.
+    pub options: Vec<EdnsOption>,
+}
+
+impl Edns {
+    /// A plain OPT advertising `size` bytes, EDNS version 0, DO clear, no options.
+    pub fn with_payload_size(size: u16) -> Self {
+        Edns {
+            udp_payload_size: size,
+            version: EDNS_VERSION,
+            do_bit: false,
+            options: Vec::new(),
+        }
+    }
+
+    /// The data of the first option with `code`, if present.
+    pub fn option(&self, code: u16) -> Option<&[u8]> {
+        self.options
+            .iter()
+            .find(|o| o.code == code)
+            .map(|o| o.data.as_slice())
+    }
+
+    /// Pack version and flags into the 32-bit OPT TTL field. The extended-RCODE
+    /// byte is left zero; [`DnsMessage::to_bytes`] fills it in from the
+    /// message's RCODE.
+    fn flags(&self) -> u32 {
+        let do_flag: u32 = if self.do_bit { 0x8000 } else { 0 };
+        ((self.version as u32) << 16) | do_flag
+    }
+
+    /// Decode EDNS parameters from a parsed OPT [`ResourceRecord`].
+    fn from_record(rr: &ResourceRecord) -> Result<Self, anyhow::Error> {
+        let flags = rr.ttl as u32;
+        Ok(Edns {
+            udp_payload_size: rr.class,
+            version: ((flags >> 16) & 0xff) as u8,
+            do_bit: (flags & 0x8000) != 0,
+            options: Self::parse_options(&rr.rdata.rdata)?,
+        })
+    }
+
+    /// Parse the OPT RDATA option list. A malformed list is an error rather
+    /// than a partial read: a client that sends one deserves FORMERR, not a
+    /// silently truncated view of what it asked for.
+    fn parse_options(mut rdata: &[u8]) -> Result<Vec<EdnsOption>, anyhow::Error> {
+        let mut options = Vec::new();
+        while !rdata.is_empty() {
+            if rdata.len() < 4 {
+                return Err(anyhow!(
+                    "truncated EDNS option header: {} byte(s) left, need 4",
+                    rdata.len()
+                ));
+            }
+            let code = u16::from_be_bytes([rdata[0], rdata[1]]);
+            let len = u16::from_be_bytes([rdata[2], rdata[3]]) as usize;
+            rdata = &rdata[4..];
+            if rdata.len() < len {
+                return Err(anyhow!(
+                    "EDNS option {code} declares {len} bytes but only {} remain",
+                    rdata.len()
+                ));
+            }
+            options.push(EdnsOption {
+                code,
+                data: rdata[..len].to_vec(),
+            });
+            rdata = &rdata[len..];
+        }
+        Ok(options)
+    }
+
+    /// Build the OPT [`ResourceRecord`] for the additional section, encoding the
+    /// option list into RDATA.
+    fn to_record(&self) -> Result<ResourceRecord, anyhow::Error> {
+        let mut rdata = Vec::new();
+        for opt in &self.options {
+            let len: u16 = opt.data.len().try_into().map_err(|_| {
+                anyhow!(
+                    "EDNS option {} data is {} bytes, exceeding the 65535-byte field",
+                    opt.code,
+                    opt.data.len()
+                )
+            })?;
+            rdata.extend_from_slice(&opt.code.to_be_bytes());
+            rdata.extend_from_slice(&len.to_be_bytes());
+            rdata.extend_from_slice(&opt.data);
+        }
+        Ok(ResourceRecord {
+            name: ".".to_string(),
+            class: self.udp_payload_size,
+            ttl: self.flags() as i32,
+            rdata: RecordData {
+                rtype: OPT_RECORD_TYPE,
+                rdata: rdata.into_boxed_slice(),
+            },
+        })
+    }
 }
 
 impl<'a> TryUnpackFromBytes<'a> for QuerySection {
@@ -620,7 +772,6 @@ impl DnsMessage {
         let (add_len, mut rest) = read_be!(u16, rest);
 
         let opcode = OpCode::from_u8(hi & 0x70).unwrap_or(OpCode::Unknown);
-        let rcode = ResponseCode::from_u8(lo & 0x0f).unwrap_or(ResponseCode::Unknown);
 
         let mut queries: Vec<QuerySection> = Vec::new();
         for _ in 0..query_len {
@@ -650,6 +801,18 @@ impl DnsMessage {
             rest = r;
         }
 
+        // RCODE is 12 bits (RFC 6891 §6.1.3): the low 4 in the header, the high
+        // 8 in the OPT record's TTL when the message carries one. Reassemble
+        // them so `rcode` is the whole value; without OPT the high bits are 0
+        // and this is the classic 4-bit code.
+        let ext_rcode = additionals
+            .iter()
+            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
+            .map(|rr| ((rr.ttl as u32) >> 24) as u16)
+            .unwrap_or(0);
+        let rcode = ResponseCode::from_u16((ext_rcode << 4) | (lo & 0x0f) as u16)
+            .unwrap_or(ResponseCode::Unknown);
+
         Ok(Self {
             id,
             response: hi & 0x80 == 0x80,
@@ -674,7 +837,24 @@ impl DnsMessage {
         written += buf.write(&self.id.to_be_bytes())?;
 
         let opcode = self.opcode.to_u8().unwrap_or_default();
-        let rcode = self.rcode.to_u8().unwrap_or_default();
+
+        // RCODE is a 12-bit value split across the header (low 4 bits) and the
+        // OPT record's TTL (high 8). `ResponseCode::Unknown` is a sentinel for
+        // an unrecognized wire value rather than a real code, so it goes out as 0.
+        let rcode = match self.rcode.to_u16() {
+            Some(v) if v <= 0xfff => v,
+            _ => 0,
+        };
+        let has_opt = self
+            .additionals
+            .iter()
+            .any(|rr| rr.rdata.rtype == OPT_RECORD_TYPE);
+        if rcode > 0xf && !has_opt {
+            return Err(anyhow!(
+                "extended RCODE {rcode} needs an EDNS0 OPT record to carry its high bits (RFC 6891 §6.1.3)"
+            ));
+        }
+
         let hi: u8 = (self.response as u8) << 7
             | (opcode & 0xf_u8) << 3
             | (self.authoritive as u8) << 2
@@ -683,7 +863,7 @@ impl DnsMessage {
         let lo: u8 = (self.recursion_ok as u8) << 7 
             | (self.ad as u8) << 5
             | (self.cd as u8) << 4
-            | (rcode & 0xf);
+            | (rcode & 0xf) as u8;
 
         written += buf.write(&[hi, lo])?;
         written += buf.write(&(self.queries.len() as u16).to_be_bytes())?;
@@ -706,7 +886,15 @@ impl DnsMessage {
                 written += buf.write(&dname_to_bytes(rr.name.as_str())?)?;
                 written += buf.write(&rr.rdata.rtype.to_be_bytes())?;
                 written += buf.write(&rr.class.to_be_bytes())?;
-                written += buf.write(&rr.ttl.to_be_bytes())?;
+                // The OPT TTL's top byte is the extended RCODE's high 8 bits.
+                // `self.rcode` owns the whole 12-bit value, so stamp it in here
+                // rather than trusting whatever the OPT record was built with.
+                let ttl = if rr.rdata.rtype == OPT_RECORD_TYPE {
+                    (rr.ttl as u32 & 0x00ff_ffff) | ((rcode as u32 >> 4) << 24)
+                } else {
+                    rr.ttl as u32
+                };
+                written += buf.write(&ttl.to_be_bytes())?;
                 let rdlen: u16 = rr
                     .rdata
                     .rdata
@@ -718,6 +906,77 @@ impl DnsMessage {
             }
         }
         Ok(written)
+    }
+
+    /// The EDNS0 OPT record from the additional section, if the message carries
+    /// one. Errors if the OPT record's option list is malformed — the caller
+    /// should answer FORMERR.
+    pub fn edns(&self) -> Result<Option<Edns>, anyhow::Error> {
+        self.additionals
+            .iter()
+            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
+            .map(Edns::from_record)
+            .transpose()
+    }
+
+    /// Whether the message carries an OPT record at all, regardless of whether
+    /// its options parse. Use this to decide OPT mirroring (RFC 6891 §6.1.1).
+    pub fn has_edns(&self) -> bool {
+        self.additionals
+            .iter()
+            .any(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
+    }
+
+    /// The requestor's advertised UDP payload size: the EDNS value (floored at
+    /// the classic 512 per RFC 6891 §6.2.3) if present, else the classic 512.
+    ///
+    /// The payload size lives in the OPT CLASS field, so it is readable even
+    /// when the option list is malformed; a bad option list just falls back to
+    /// the safe classic size.
+    pub fn udp_payload_size(&self) -> u16 {
+        self.additionals
+            .iter()
+            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
+            .map(|rr| rr.class.max(CLASSIC_UDP_SIZE))
+            .unwrap_or(CLASSIC_UDP_SIZE)
+    }
+
+    /// Add the OPT record to the additional section, replacing any existing one.
+    /// Errors only if an option's data exceeds the 16-bit length field.
+    pub fn set_edns(&mut self, edns: Edns) -> Result<(), anyhow::Error> {
+        let record = edns.to_record()?;
+        self.additionals
+            .retain(|rr| rr.rdata.rtype != OPT_RECORD_TYPE);
+        self.additionals.push(record);
+        Ok(())
+    }
+
+    /// Serialize, truncating to `max_len` bytes (RFC 1035 §4.2.1). If the full
+    /// message doesn't fit, the answer/authority records are dropped (the OPT
+    /// record and question are kept) and TC=1 is set so the client retries over
+    /// TCP. Returns the wire bytes.
+    pub fn to_bytes_within(&self, max_len: usize) -> Result<Vec<u8>, anyhow::Error> {
+        let mut scratch = vec![0u8; u16::MAX as usize];
+        let n = self.to_bytes(&mut scratch)?;
+        if n <= max_len {
+            scratch.truncate(n);
+            return Ok(scratch);
+        }
+
+        let mut truncated = self.clone();
+        truncated.truncation = true;
+        truncated.answers.clear();
+        truncated.authorities.clear();
+        // Keep only the OPT record — the DNS message size limit itself is
+        // signalled via EDNS, so it must survive truncation.
+        truncated
+            .additionals
+            .retain(|rr| rr.rdata.rtype == OPT_RECORD_TYPE);
+
+        let mut out = vec![0u8; max_len.max(CLASSIC_UDP_SIZE as usize)];
+        let n = truncated.to_bytes(&mut out)?;
+        out.truncate(n);
+        Ok(out)
     }
 }
 
@@ -860,6 +1119,228 @@ mod tests {
         assert_eq!(a.ttl, 3600);
         assert_eq!(a.rdata.rtype, 1);
         assert_eq!(&*a.rdata.rdata, &[192, 0, 2, 1]); // A record: 4 address octets
+    }
+
+    fn query_msg(id: u16) -> DnsMessage {
+        DnsMessage {
+            id,
+            response: false,
+            opcode: OpCode::Query,
+            authoritive: false,
+            truncation: false,
+            recursion: true,
+            recursion_ok: false,
+            ad: false,
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![QuerySection {
+                qname: "example.com.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            }],
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_edns_absent_defaults_to_512() {
+        let msg = query_msg(1);
+        assert!(msg.edns().expect("no OPT to misparse").is_none());
+        assert!(!msg.has_edns());
+        assert_eq!(msg.udp_payload_size(), 512);
+    }
+
+    #[test]
+    fn test_edns_set_and_read() {
+        let mut msg = query_msg(1);
+        let mut edns = Edns::with_payload_size(4096);
+        edns.do_bit = true;
+        msg.set_edns(edns).expect("set_edns");
+
+        let got = msg.edns().unwrap().expect("edns present");
+        assert_eq!(got.udp_payload_size, 4096);
+        assert!(got.do_bit);
+        assert_eq!(got.version, 0);
+        assert_eq!(msg.udp_payload_size(), 4096);
+
+        // set_edns replaces rather than accumulates.
+        msg.set_edns(Edns::with_payload_size(1232)).expect("set_edns");
+        assert_eq!(
+            msg.additionals
+                .iter()
+                .filter(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
+                .count(),
+            1
+        );
+        assert_eq!(msg.udp_payload_size(), 1232);
+    }
+
+    #[test]
+    fn test_edns_survives_wire_roundtrip() {
+        let mut msg = query_msg(0xABCD);
+        let mut edns = Edns::with_payload_size(4096);
+        edns.do_bit = true;
+        msg.set_edns(edns.clone()).expect("set_edns");
+
+        let mut buf = [0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("to_bytes");
+        let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
+
+        let got = parsed.edns().unwrap().expect("edns survives round-trip");
+        assert_eq!(got, edns);
+    }
+
+    #[test]
+    fn test_edns_payload_size_floored_at_512() {
+        // RFC 6891 §6.2.3: values below 512 are treated as 512.
+        let mut msg = query_msg(1);
+        msg.set_edns(Edns::with_payload_size(300)).expect("set_edns");
+        assert_eq!(msg.udp_payload_size(), 512);
+    }
+
+    #[test]
+    fn test_edns_options_survive_wire_roundtrip() {
+        let mut msg = query_msg(0x0F0F);
+        let mut edns = Edns::with_payload_size(1232);
+        edns.options = vec![
+            EdnsOption {
+                code: EDNS_OPTION_COOKIE,
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            },
+            // A zero-length option is legal and must not be dropped.
+            EdnsOption {
+                code: EDNS_OPTION_NSID,
+                data: Vec::new(),
+            },
+        ];
+        msg.set_edns(edns.clone()).expect("set_edns");
+
+        // 2 (code) + 2 (len) + 8 (data), then 2 + 2 + 0.
+        let opt = msg
+            .additionals
+            .iter()
+            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
+            .expect("OPT present");
+        assert_eq!(opt.rdata.rdata.len(), 16);
+
+        let mut buf = [0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("to_bytes");
+        let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
+
+        let got = parsed.edns().unwrap().expect("edns present");
+        assert_eq!(got, edns);
+        assert_eq!(got.option(EDNS_OPTION_COOKIE), Some(&[1u8, 2, 3, 4, 5, 6, 7, 8][..]));
+        assert_eq!(got.option(EDNS_OPTION_NSID), Some(&[][..]));
+        assert_eq!(got.option(EDNS_OPTION_PADDING), None);
+    }
+
+    #[test]
+    fn test_malformed_edns_options_surface_error() {
+        let mut msg = query_msg(1);
+        msg.set_edns(Edns::with_payload_size(1232)).expect("set_edns");
+        // Option claims 8 bytes of data but supplies 2.
+        let opt = msg
+            .additionals
+            .iter_mut()
+            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
+            .unwrap();
+        opt.rdata.rdata = Box::new([0x00, 0x0a, 0x00, 0x08, 0xde, 0xad]);
+
+        let err = msg.edns().expect_err("truncated option must be rejected");
+        assert!(err.to_string().contains("only 2 remain"), "got: {err}");
+        // The payload size is still readable — it lives in the OPT CLASS field.
+        assert_eq!(msg.udp_payload_size(), 1232);
+        assert!(msg.has_edns());
+    }
+
+    #[test]
+    fn test_extended_rcode_splits_across_header_and_opt() {
+        // BADVERS is 16: 0 in the header's low 4 bits, 1 in the OPT TTL's top byte.
+        let mut msg = query_msg(0x2222);
+        msg.response = true;
+        msg.rcode = ResponseCode::BadOptVersion;
+        msg.set_edns(Edns::with_payload_size(1232)).expect("set_edns");
+
+        let mut buf = [0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("to_bytes");
+        assert_eq!(buf[3] & 0x0f, 0, "low 4 bits of RCODE 16 are 0");
+
+        let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
+        assert_eq!(parsed.rcode, ResponseCode::BadOptVersion);
+    }
+
+    #[test]
+    fn test_extended_rcode_without_opt_is_an_error() {
+        let mut msg = query_msg(1);
+        msg.response = true;
+        msg.rcode = ResponseCode::BadOptVersion;
+
+        let mut buf = [0u8; 512];
+        let err = msg
+            .to_bytes(&mut buf)
+            .expect_err("extended RCODE needs an OPT record");
+        assert!(err.to_string().contains("OPT record"), "got: {err}");
+    }
+
+    #[test]
+    fn test_basic_rcode_unaffected_by_opt() {
+        // A plain 4-bit RCODE must not have its bits disturbed by OPT presence.
+        let mut msg = query_msg(1);
+        msg.response = true;
+        msg.rcode = ResponseCode::NoSuchDomain;
+        msg.set_edns(Edns::with_payload_size(4096)).expect("set_edns");
+
+        let mut buf = [0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("to_bytes");
+        let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
+        assert_eq!(parsed.rcode, ResponseCode::NoSuchDomain);
+        assert_eq!(parsed.udp_payload_size(), 4096);
+    }
+
+    #[test]
+    fn test_to_bytes_within_truncates_and_sets_tc() {
+        use std::net::Ipv4Addr;
+        let mut msg = query_msg(1);
+        msg.response = true;
+        // Pack in enough answers to blow past 512 bytes.
+        for i in 0..60u8 {
+            msg.answers.push(ResourceRecord {
+                name: format!("host{i}.example.com."),
+                class: 1,
+                ttl: 3600,
+                rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(10, 0, 0, i)))
+                    .unwrap(),
+            });
+        }
+        msg.set_edns(Edns::with_payload_size(4096)).expect("set_edns");
+
+        let bytes = msg.to_bytes_within(512).expect("to_bytes_within");
+        assert!(bytes.len() <= 512, "must fit within 512, got {}", bytes.len());
+
+        let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse truncated");
+        assert!(parsed.truncation, "TC bit must be set on truncation");
+        assert!(parsed.answers.is_empty(), "answers dropped on truncation");
+        assert!(parsed.has_edns(), "OPT record must survive truncation");
+    }
+
+    #[test]
+    fn test_to_bytes_within_keeps_full_when_it_fits() {
+        use std::net::Ipv4Addr;
+        let mut msg = query_msg(1);
+        msg.response = true;
+        msg.answers.push(ResourceRecord {
+            name: "example.com.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
+        });
+
+        let bytes = msg.to_bytes_within(4096).expect("to_bytes_within");
+        let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
+        assert!(!parsed.truncation);
+        assert_eq!(parsed.answers.len(), 1);
     }
 
     #[test]

@@ -3,8 +3,14 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rdns::resolver::{RecursiveResolver, ResolverConfig};
-use rdns::{DnsCache, DnsMessage, OpCode, QuerySection, ResourceRecord, ResponseCode};
+use rdns::{
+    DnsCache, DnsMessage, Edns, OpCode, QuerySection, ResourceRecord, ResponseCode, EDNS_VERSION,
+    OPT_RECORD_TYPE,
+};
 use tokio::net::UdpSocket;
+
+/// UDP payload size rdnsr advertises to clients via EDNS0.
+const RDNSR_PAYLOAD_SIZE: u16 = 4096;
 
 /// Forwarding DNS resolver with caching.
 ///
@@ -65,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if capacity == 0 { "disabled".to_string() } else { format!("{capacity} entries") },
     );
 
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 4096];
     loop {
         let (n, peer) = socket.recv_from(&mut buf).await?;
         let data = buf[..n].to_vec();
@@ -92,40 +98,81 @@ async fn handle_query(
     let query = msg.queries.first()?.clone();
     let id = msg.id;
     let recursion = msg.recursion;
+    // Classic 512 unless the client advertised a larger size via EDNS0.
+    let client_max = msg.udp_payload_size() as usize;
 
-    // Cache hit: reconstruct a response from the cached RRset.
-    if let Some(records) = cache.get(&query.qname, query.qtype) {
-        let resp = build_response(id, &query, records, ResponseCode::Ok, recursion);
-        return serialize(&resp);
-    }
-
-    // Cache miss: forward upstream. RecursiveResolver::resolve is blocking, so
-    // run it off the async runtime's worker threads.
-    let resolver = resolver.clone();
-    let q = query.clone();
-    let resolved = tokio::task::spawn_blocking(move || resolver.resolve(&q))
-        .await
-        .ok()?;
-
-    match resolved {
-        Ok(mut upstream) => {
-            // The resolver used its own random transaction id; the reply must
-            // echo the client's id and advertise recursion availability.
-            upstream.id = id;
-            upstream.response = true;
-            upstream.recursion = recursion;
-            upstream.recursion_ok = true;
-            if !upstream.answers.is_empty() {
-                cache.put(&query.qname, query.qtype, upstream.answers.clone());
-            }
-            serialize(&upstream)
-        }
-        // Upstream failed / timed out: return SERVFAIL rather than nothing.
+    // Reject bad EDNS before doing any work on the client's behalf: a malformed
+    // option list is a FORMERR, and an EDNS version we don't implement is
+    // BADVERS (RFC 6891 §6.1.3). Both replies carry a bare version-0 OPT.
+    match msg.edns() {
         Err(_) => {
-            let resp = build_response(id, &query, Vec::new(), ResponseCode::ServerFailure, recursion);
-            serialize(&resp)
+            return edns_error(id, &query, ResponseCode::FormatError, recursion, client_max)
         }
+        Ok(Some(edns)) if edns.version > EDNS_VERSION => {
+            return edns_error(id, &query, ResponseCode::BadOptVersion, recursion, client_max)
+        }
+        _ => {}
     }
+    let client_uses_edns = msg.has_edns();
+
+    // Build the response: from cache if we have it, else by forwarding upstream.
+    let mut resp = if let Some(records) = cache.get(&query.qname, query.qtype) {
+        build_response(id, &query, records, ResponseCode::Ok, recursion)
+    } else {
+        // RecursiveResolver::resolve is blocking, so run it off the async
+        // runtime's worker threads.
+        let resolver = resolver.clone();
+        let q = query.clone();
+        let resolved = tokio::task::spawn_blocking(move || resolver.resolve(&q))
+            .await
+            .ok()?;
+        match resolved {
+            Ok(mut upstream) => {
+                // The resolver used its own random transaction id; the reply
+                // must echo the client's id and advertise recursion.
+                upstream.id = id;
+                upstream.response = true;
+                upstream.recursion = recursion;
+                upstream.recursion_ok = true;
+                if !upstream.answers.is_empty() {
+                    cache.put(&query.qname, query.qtype, upstream.answers.clone());
+                }
+                upstream
+            }
+            // Upstream failed / timed out: return SERVFAIL rather than nothing.
+            Err(_) => {
+                build_response(id, &query, Vec::new(), ResponseCode::ServerFailure, recursion)
+            }
+        }
+    };
+
+    // Only include an OPT record when the client used EDNS (RFC 6891 §6.1.1);
+    // otherwise strip any OPT the upstream added so we don't reply with
+    // unsolicited EDNS.
+    if client_uses_edns {
+        resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE)).ok()?;
+    } else {
+        resp.additionals.retain(|rr| rr.rdata.rtype != OPT_RECORD_TYPE);
+    }
+
+    // Honor the client's advertised UDP size: truncates (TC=1) if it overflows.
+    resp.to_bytes_within(client_max).ok()
+}
+
+/// An empty error response carrying a version-0 OPT record, for the EDNS-level
+/// rejections (FORMERR / BADVERS) that must be signalled before resolving.
+fn edns_error(
+    id: u16,
+    query: &QuerySection,
+    rcode: ResponseCode,
+    recursion: bool,
+    client_max: usize,
+) -> Option<Vec<u8>> {
+    let mut resp = build_response(id, query, Vec::new(), rcode, recursion);
+    // BADVERS is an extended RCODE, so the OPT record isn't optional here — it
+    // carries the code's high bits.
+    resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE)).ok()?;
+    resp.to_bytes_within(client_max).ok()
 }
 
 /// Build a minimal response message echoing the question section.
@@ -152,13 +199,4 @@ fn build_response(
         authorities: Vec::new(),
         additionals: Vec::new(),
     }
-}
-
-/// Serialize a message to wire bytes. Uses a generous buffer since we don't do
-/// EDNS0 negotiation yet (TODO Part B #1); returns `None` on serialization error.
-fn serialize(msg: &DnsMessage) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; 4096];
-    let n = msg.to_bytes(&mut buf).ok()?;
-    buf.truncate(n);
-    Some(buf)
 }

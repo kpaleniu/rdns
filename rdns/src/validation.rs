@@ -1,5 +1,9 @@
 use anyhow::anyhow;
 
+/// Upper bound on additional records in a request. A legitimate request carries
+/// at most an OPT plus a TSIG/SIG(0); the slack is for forward compatibility.
+const MAX_REQUEST_ADDITIONALS: usize = 4;
+
 /// Configuration for request validation
 #[derive(Debug, Clone)]
 pub struct ValidationConfig {
@@ -113,12 +117,24 @@ impl RequestValidator {
             return Err(anyhow!("too many queries: {}", query_count));
         }
 
-        // Queries should only be in requests, not responses
+        // Answers and authority records belong in responses, not requests.
+        // The additional section is different: it is where a request carries its
+        // OPT (EDNS0, RFC 6891 §6.1.1) and TSIG/SIG(0) records, so rejecting a
+        // non-empty additional section would reject every EDNS query. Cap it
+        // instead — a request has no legitimate reason to carry many records.
         let qr_flag = data[2] & 0x80 != 0;
-        if !qr_flag && (answer_count > 0 || auth_count > 0 || add_count > 0) {
-            return Err(anyhow!(
-                "request query should not have answer/authority/additional sections"
-            ));
+        if !qr_flag {
+            if answer_count > 0 || auth_count > 0 {
+                return Err(anyhow!(
+                    "request query should not have answer/authority sections"
+                ));
+            }
+            if add_count > MAX_REQUEST_ADDITIONALS {
+                return Err(anyhow!(
+                    "too many additional records in request: {}",
+                    add_count
+                ));
+            }
         }
 
         Ok(())
@@ -298,6 +314,55 @@ mod tests {
             .error_message()
             .unwrap()
             .contains("should not have answer"));
+    }
+
+    #[test]
+    fn test_request_with_opt_record_is_allowed() {
+        let validator = RequestValidator::with_defaults();
+
+        // An EDNS0 query: one question plus an OPT record in the additional
+        // section. Rejecting this would reject every EDNS-capable client.
+        let packet = vec![
+            0x00, 0x01, // ID
+            0x01, 0x00, // flags (query, RD)
+            0x00, 0x01, // 1 query
+            0x00, 0x00, // 0 answers
+            0x00, 0x00, // 0 authorities
+            0x00, 0x01, // 1 additional (the OPT record)
+            0x03, 0x77, 0x77, 0x77, // "www"
+            0x03, 0x63, 0x6f, 0x6d, // "com"
+            0x00, // root
+            0x00, 0x01, // A
+            0x00, 0x01, // IN
+            0x00, // OPT name: root
+            0x00, 0x29, // type 41 (OPT)
+            0x10, 0x00, // class: 4096 payload size
+            0x00, 0x00, 0x00, 0x00, // TTL: version 0, no flags
+            0x00, 0x00, // RDLENGTH: no options
+        ];
+
+        assert!(validator.validate_packet(&packet, false).is_valid());
+    }
+
+    #[test]
+    fn test_request_with_too_many_additionals() {
+        let validator = RequestValidator::with_defaults();
+
+        let packet = vec![
+            0x00, 0x01, // ID
+            0x00, 0x00, // flags (query, QR=0)
+            0x00, 0x01, // 1 query
+            0x00, 0x00, // 0 answers
+            0x00, 0x00, // 0 authorities
+            0x00, 0x64, // 100 additionals (over the limit)
+        ];
+
+        let result = validator.validate_packet(&packet, false);
+        assert!(!result.is_valid());
+        assert!(result
+            .error_message()
+            .unwrap()
+            .contains("too many additional"));
     }
 
     #[test]
