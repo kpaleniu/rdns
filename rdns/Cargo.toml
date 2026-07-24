@@ -3,6 +3,7 @@ name = "rdns"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "DNS library: wire codec, zone files, caching, resolver and DNSSEC. Shared by rdnsc, rdnsd and rdnsr."
 
 [dependencies]
 anyhow = "1.0"

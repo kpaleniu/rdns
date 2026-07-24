@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use rdns::resolver::{RecursiveResolver, ResolverConfig};
+use rdns::resolver::{Resolver, ResolverConfig, ResolverMode};
 use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, QuerySection, ResourceRecord, ResponseCode, EDNS_VERSION,
     OPT_RECORD_TYPE,
@@ -44,12 +44,15 @@ enum Transport {
     Tcp,
 }
 
-/// Forwarding DNS resolver with caching.
+/// Recursive DNS resolver with caching.
 ///
-/// Unlike the authoritative server (`rdnsd`), `rdnsr` answers by forwarding
-/// queries to upstream resolvers and caching the results by (name, type) + TTL.
-/// It binds to localhost by default so it is not accidentally exposed as an open
-/// recursive resolver (an amplification vector).
+/// Unlike the authoritative server (`rdnsd`), `rdnsr` answers by resolving:
+/// walking the delegation chain from the root and caching what it learns.
+/// Passing `--upstream` switches it to forwarding instead, the way
+/// `forwarders`/`forward-zone` does in BIND and Unbound.
+///
+/// Binds to localhost by default so it is not accidentally exposed as an open
+/// resolver (an amplification vector).
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -58,8 +61,10 @@ struct Cli {
     host: String,
     #[arg(long, default_value = "53")]
     port: u16,
-    /// Upstream resolver to forward to, e.g. 8.8.8.8:53 (repeatable).
-    /// Defaults to 8.8.8.8:53 and 1.1.1.1:53.
+    /// Forward to this resolver instead of recursing, e.g. 8.8.8.8:53
+    /// (repeatable). Passing any `--upstream` switches the resolver from
+    /// recursion to forwarding, the way `forwarders`/`forward-zone` does in
+    /// BIND and Unbound.
     #[arg(long)]
     upstream: Vec<SocketAddr>,
     /// Maximum number of cached RRsets.
@@ -69,7 +74,7 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
     /// Validate DNSSEC on resolved answers. Accepted but not yet enforced
-    /// (validation is not wired into the resolve path — see TODO Part B #6).
+    /// (validation is not wired into the resolve path — see TODO open item #2).
     #[arg(long)]
     dnssec_validate: bool,
 }
@@ -78,12 +83,19 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    // Recursion is the default; naming an upstream is what selects forwarding.
     let mut config = ResolverConfig::default();
-    if !cli.upstream.is_empty() {
+    if cli.upstream.is_empty() {
+        config.mode = ResolverMode::Recurse;
+    } else {
+        config.mode = ResolverMode::Forward;
         config.upstream_servers = cli.upstream.clone();
     }
-    let upstreams = config.upstream_servers.clone();
-    let resolver = Arc::new(RecursiveResolver::new(config));
+    let source = match config.mode {
+        ResolverMode::Recurse => "recursing from the root hints".to_string(),
+        ResolverMode::Forward => format!("forwarding to {:?}", config.upstream_servers),
+    };
+    let resolver = Arc::new(Resolver::new(config));
 
     // A zero-capacity cache never stores (DnsCache::put is a no-op at 0), so
     // --no-cache is just a cache sized to hold nothing.
@@ -102,9 +114,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = Arc::new(UdpSocket::bind(&addr).await?);
     let listener = TcpListener::bind(&addr).await?;
     println!(
-        "rdnsr forwarding resolver listening on {} (UDP+TCP) (upstreams: {:?}, cache: {})",
+        "rdnsr listening on {} (UDP+TCP), {}, cache: {}",
         addr,
-        upstreams,
+        source,
         if capacity == 0 { "disabled".to_string() } else { format!("{capacity} entries") },
     );
 
@@ -123,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Accept datagrams and answer each in its own task.
 async fn udp_main(
     socket: Arc<UdpSocket>,
-    resolver: Arc<RecursiveResolver>,
+    resolver: Arc<Resolver>,
     cache: Arc<DnsCache>,
 ) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 4096];
@@ -144,7 +156,7 @@ async fn udp_main(
 /// Accept TCP connections, bounded by [`MAX_TCP_CONNECTIONS`].
 async fn tcp_main(
     listener: TcpListener,
-    resolver: Arc<RecursiveResolver>,
+    resolver: Arc<Resolver>,
     cache: Arc<DnsCache>,
 ) -> Result<(), std::io::Error> {
     let permits = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
@@ -172,7 +184,7 @@ async fn tcp_main(
 /// query on a connection wait out the slowest one ahead of it.
 async fn serve_connection(
     stream: TcpStream,
-    resolver: Arc<RecursiveResolver>,
+    resolver: Arc<Resolver>,
     cache: Arc<DnsCache>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
@@ -248,7 +260,7 @@ async fn serve_connection(
 /// (in which case we simply drop it, as a resolver should).
 async fn handle_query(
     data: Vec<u8>,
-    resolver: &Arc<RecursiveResolver>,
+    resolver: &Arc<Resolver>,
     cache: &Arc<DnsCache>,
     transport: Transport,
 ) -> Option<Vec<u8>> {
@@ -282,7 +294,7 @@ async fn handle_query(
     let mut resp = if let Some(records) = cache.get(&query.qname, query.qtype) {
         build_response(id, &query, records, ResponseCode::Ok, recursion)
     } else {
-        // RecursiveResolver::resolve is blocking, so run it off the async
+        // Resolver::resolve is blocking, so run it off the async
         // runtime's worker threads.
         let resolver = resolver.clone();
         let q = query.clone();
@@ -302,8 +314,15 @@ async fn handle_query(
                 }
                 upstream
             }
-            // Upstream failed / timed out: return SERVFAIL rather than nothing.
-            Err(_) => {
+            // Resolution failed: say why, then SERVFAIL. A resolver that turns
+            // every failure into a bare SERVFAIL is undiagnosable from the
+            // outside, and the reasons here are specific — lame delegation,
+            // budget exhausted, CNAME loop — precisely so they can be read.
+            Err(ref e) => {
+                eprintln!(
+                    "resolve {} type {} failed: {:#}",
+                    query.qname, query.qtype, e
+                );
                 build_response(id, &query, Vec::new(), ResponseCode::ServerFailure, recursion)
             }
         }

@@ -2,7 +2,7 @@
 name = "rdnsr"
 version = "0.1.0"
 edition = "2021"
-description = "Forwarding DNS resolver with caching. Separate from the authoritative server (rdnsd)."
+description = "Recursive DNS resolver with caching, and a forwarding mode. Separate from the authoritative server (rdnsd)."
 license = "MIT OR Apache-2.0"
 
 [dependencies]

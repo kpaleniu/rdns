@@ -2,7 +2,7 @@
 name = "rdnsd"
 version = "0.1.0"
 edition = "2021"
-description = "Basic DNS query command line tool. Supports bare essentials and not stuff like DNS over TLS."
+description = "Authoritative DNS server. Serves zone files over UDP and TCP; one process per transport."
 license = "MIT OR Apache-2.0"
 
 [dependencies]
