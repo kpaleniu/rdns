@@ -21,7 +21,13 @@ pub mod cache;
 pub mod resolver;
 pub mod metrics;
 pub mod dnssec;
+pub mod dnssec_chain;
+pub mod dnssec_denial;
 pub mod dnssec_validation_mode;
+/// Real DNSSEC signing for tests only — see the module docs for why an
+/// in-process signer is the only way to exercise this code here.
+#[cfg(test)]
+mod dnssec_test_util;
 pub mod telemetry;
 pub mod utils;
 pub mod serialization;
@@ -279,6 +285,9 @@ impl ParsedRecord {
             43 => {
                 // DS: key_tag(2) + algorithm(1) + digest_type(1) + digest(variable)
                 let (key_tag, rest) = read_be!(u16, rdata);
+                if rest.len() < 2 {
+                    return Err(anyhow!("DS record truncated before its digest type"));
+                }
                 let algorithm = rest[0];
                 let digest_type = rest[1];
                 let digest = rest[2..].to_vec();
@@ -290,14 +299,21 @@ impl ParsedRecord {
                 })
             }
             46 => {
-                // RRSIG: type_covered(2) + algorithm(1) + labels(1) + original_ttl(4) +
-                // inception(4) + expiration(4) + key_tag(2) + signer_name + signature
+                // RRSIG (RFC 4034 §3.1): type_covered(2) + algorithm(1) + labels(1)
+                // + original_ttl(4) + expiration(4) + inception(4) + key_tag(2) +
+                // signer_name + signature. Expiration precedes inception on the
+                // wire — reading them the other way round makes an expired
+                // signature look current, which is only invisible while both ends
+                // of the round trip are ours.
                 let (type_covered, rest) = read_be!(u16, rdata);
+                if rest.len() < 2 {
+                    return Err(anyhow!("RRSIG record truncated before its label count"));
+                }
                 let algorithm = rest[0];
                 let labels = rest[1];
                 let (original_ttl, rest) = read_be!(u32, &rest[2..]);
-                let (inception, rest) = read_be!(u32, rest);
                 let (expiration, rest) = read_be!(u32, rest);
+                let (inception, rest) = read_be!(u32, rest);
                 let (key_tag, rest) = read_be!(u16, rest);
                 let (signer_name, rest) = dname_from_bytes(rest, unpacker)?;
                 let signature = rest.to_vec();
@@ -325,6 +341,9 @@ impl ParsedRecord {
             48 => {
                 // DNSKEY: flags(2) + protocol(1) + algorithm(1) + public_key(variable)
                 let (flags, rest) = read_be!(u16, rdata);
+                if rest.len() < 2 {
+                    return Err(anyhow!("DNSKEY record truncated before its algorithm"));
+                }
                 let protocol = rest[0];
                 let algorithm = rest[1];
                 let public_key = rest[2..].to_vec();
@@ -439,8 +458,9 @@ impl ParsedRecord {
                 v.push(*algorithm);
                 v.push(*labels);
                 v.extend_from_slice(&original_ttl.to_be_bytes());
-                v.extend_from_slice(&inception.to_be_bytes());
+                // Expiration first, then inception (RFC 4034 §3.1).
                 v.extend_from_slice(&expiration.to_be_bytes());
+                v.extend_from_slice(&inception.to_be_bytes());
                 v.extend_from_slice(&key_tag.to_be_bytes());
                 v.extend_from_slice(&dname_to_bytes(signer_name)?);
                 v.extend_from_slice(signature);
@@ -1375,6 +1395,48 @@ mod tests {
         let mut msg = query_msg(1);
         msg.set_edns(Edns::with_payload_size(300)).expect("set_edns");
         assert_eq!(msg.udp_payload_size(), 512);
+    }
+
+    /// RFC 4034 §3.1 fixes the RRSIG field order, and expiration comes *before*
+    /// inception. Decoding them the other way round is invisible to a
+    /// round-trip test — both halves agree — so this checks the decode against
+    /// bytes laid out by hand, which is the only thing a real signer's output
+    /// can be compared to.
+    #[test]
+    fn test_rrsig_reads_expiration_before_inception() {
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&1u16.to_be_bytes()); // type covered = A
+        rdata.push(13); // algorithm = ECDSAP256SHA256
+        rdata.push(3); // labels
+        rdata.extend_from_slice(&3600u32.to_be_bytes()); // original TTL
+        rdata.extend_from_slice(&0x5000_0000u32.to_be_bytes()); // expiration
+        rdata.extend_from_slice(&0x4000_0000u32.to_be_bytes()); // inception
+        rdata.extend_from_slice(&12345u16.to_be_bytes()); // key tag
+        rdata.extend_from_slice(&dname_to_bytes("example.com.").unwrap());
+        rdata.extend_from_slice(&[0xAB; 64]); // signature
+
+        let record = RecordData::from_wire(46, &rdata, &DNameUnpacker::new(&rdata))
+            .expect("RRSIG should decode");
+        let ParsedRecord::RRSIG {
+            expiration,
+            inception,
+            key_tag,
+            signer_name,
+            ref signature,
+            ..
+        } = record.parse().expect("parse")
+        else {
+            panic!("not an RRSIG");
+        };
+        assert_eq!(expiration, 0x5000_0000, "the earlier field is expiration");
+        assert_eq!(inception, 0x4000_0000, "the later field is inception");
+        assert!(inception < expiration, "a signature is valid over a range");
+        assert_eq!(key_tag, 12345);
+        assert_eq!(signer_name, "example.com.");
+        assert_eq!(signature.len(), 64);
+
+        // And the encoder puts them back in the same order it found them.
+        assert_eq!(&*record.rdata, rdata.as_slice());
     }
 
     #[test]

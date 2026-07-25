@@ -374,7 +374,18 @@ impl<'a> TryInto<String> for UnpackedDName<'a> {
                 Label::Root => break,
             }
         }
-        
+
+        // Every other name ends up with a trailing dot because each label
+        // contributes one. The root has no labels, so it would come back as the
+        // empty string — which is not what the rest of the codebase calls the
+        // root, and not what we put on the wire when we ask for it. A query for
+        // `.` (which is exactly what fetching the root's DNSKEY RRset is) would
+        // then fail the reply check, its question having apparently changed
+        // from "." to "" in transit.
+        if result.is_empty() {
+            result.push('.');
+        }
+
         Ok(result)
     }
 

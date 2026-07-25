@@ -124,10 +124,46 @@ validation, RTT-based server selection, IPv6 hints/glue and the `--root-hints`
 flag — is done; see "Done so far".
 
 ### 2. Put DNSSEC validation on the resolve path
-**The pieces all exist; nothing calls them.** `grep` for `DnssecValidator` or
+Nothing calls the DNSSEC code: `grep` for `DnssecValidator` or
 `dnssec_validation_mode` across `rdnsd`/`rdnsr`/`rdnsc` returns nothing, and the
-DO bit round-trips through the EDNS codec without being acted on. This is a
-wiring job plus two policy decisions, not a from-scratch implementation.
+DO bit round-trips through the EDNS codec without being acted on.
+
+**⚠️ This is NOT "just wiring" — the primitives were never exercised against a
+real signature (investigated 2026-07-25, before starting).** Before any of the
+Outstanding items below can be trusted, these have to be fixed first:
+
+- **The signed-data assembly is incomplete.** RFC 4035 §5.3.2 says the bytes fed
+  to signature verification are `RRSIG_RDATA(with the signature field zeroed out)
+  || canonical RRset`. Nothing prepends the RRSIG RDATA:
+  `serialize_rrset_from_record_data` returns only the RRset, and
+  `DnssecValidator::validate_signature` takes the `data` pre-built by the caller.
+  Every test in `dnssec.rs` passes `b"test"` as that data, so `verify_rsa` /
+  `verify_ecdsa` have **never run against a genuine signature**. This must be
+  built (assemble RRSIG prefix + canonical RRset, with names lowercased and
+  RRs sorted by canonical RDATA — RFC 4034 §6) or nothing validates.
+- **`construct_rsa_public_key_der` is self-described "simplified … may need
+  adjustment"** and almost certainly wrong for real RSA keys. ECDSA (algs 13/14)
+  goes straight to `ring` and is the safer first target; prove RSA separately.
+- **NSEC3 hashing is wrong (item #3)** — negative proofs can't be trusted yet.
+
+**No live verification is possible on this machine** — port 53 is intercepted
+(see "Verifying"), so there is no real DNSSEC path to test against. The way to
+prove this end-to-end is a fake *signed* hierarchy in-process (extend the
+`resolver.rs` test harness) using **real ECDSA P-256 signatures generated in the
+test** (`ring` can sign): build a root KSK/ZSK, sign a DNSKEY RRset, emit a DS
+into the parent, sign the answer, and validate the whole chain. That exercises
+the real crypto without the internet.
+
+**Scope was left as an open question (a cold start is picking this up).** Three
+sensible sizes, smallest-risk first:
+1. *Fix primitives only* — signed-data assembly + RSA DER, with real-ECDSA tests
+   proving `validate_signature`. No resolver integration.
+2. *Scoped first step* — the above, plus a leaf validator (verify an RRset
+   against its RRSIGs+DNSKEYs) and the trust-anchor / strictness / unsigned-vs-
+   bogus *types*, all tested; still not wired into the resolve path.
+3. *Full thing* — 2, plus the chain-walk integrated into the resolver (collect
+   DS at each delegation in `walk`, fetch DNSKEY per zone, validate up to the
+   root anchor) and enforced behind `rdnsr --dnssec-validate`. Several commits.
 
 The chain this has to walk (RFC 4034 / 6605):
 
@@ -139,7 +175,9 @@ root DNSKEY (trust anchor)
   → answer is validated (set AD)
 ```
 
-Already in `dnssec.rs`, with tests:
+Already in `dnssec.rs` (the building blocks — but their tests check *structure*,
+key-tag arithmetic, DS-hash equality and expiry, not real signature crypto; see
+the warning above):
 
 - `validate_signature`, `calculate_key_tag`, `extract_dnssec_records`
 - `validate_ds_chain` (child DNSKEY hashes to the parent DS)

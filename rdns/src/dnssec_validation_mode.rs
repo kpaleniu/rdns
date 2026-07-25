@@ -8,12 +8,18 @@
 //! - Authoritative-only (not recursive validation)
 //! - When enabled, validates RRsets before responding
 //! - Sets AD bit in DNS message header if validation succeeds
-//! - Silently skips validation if it fails (doesn't reject) or zone is unsigned
 //! - Follows RFC 4035 § 3.2.3 guidance for recursive servers
+//!
+//! This is the *serving* side and is deliberately narrower than
+//! [`crate::dnssec_chain`], which is what a resolver uses: there is no chain to
+//! walk when the zone is loaded from disk, only the question of whether the
+//! records about to go out match the signatures sitting beside them in the same
+//! file.
 
+use crate::dnssec::{verify_rrset, Dnskey, Rrset, RrsetProof, Rrsig};
+use crate::utils::{current_unix_timestamp, record_types};
 use crate::zone::Zone;
-use crate::{ParsedRecord, RecordData};
-use crate::utils::record_types;
+use crate::{RecordData, ResourceRecord};
 
 /// DNSSEC validator for query-response mode
 ///
@@ -22,8 +28,16 @@ use crate::utils::record_types;
 pub struct DnssecValidator {
     /// Whether DNSSEC validation is enabled
     enabled: bool,
-    /// Whether to validate unsigned zones (if false, unsigned = valid)
-    validate_unsigned: bool,
+    /// Whether an *unsigned* zone counts as a failure.
+    ///
+    /// Off by default, which is the only sane default for a server that may
+    /// hold a mix of signed and unsigned zones: most zones are unsigned and
+    /// serving them is the normal case, so "not signed" must not read as "not
+    /// valid". Turning it on means "every zone I serve is meant to be signed" —
+    /// an operator assertion, and a useful one, because a zone that silently
+    /// loses its signatures (an expired resigning cron, a bad reload) otherwise
+    /// keeps answering as though nothing happened.
+    require_signed: bool,
 }
 
 impl DnssecValidator {
@@ -34,13 +48,13 @@ impl DnssecValidator {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            validate_unsigned: false,
+            require_signed: false,
         }
     }
 
-    /// Enable or disable validation of unsigned zones
-    pub fn set_validate_unsigned(&mut self, validate: bool) {
-        self.validate_unsigned = validate;
+    /// Treat an unsigned zone as a validation failure. See [`Self::require_signed`].
+    pub fn set_require_signed(&mut self, require: bool) {
+        self.require_signed = require;
     }
 
     /// Check if DNSSEC validation is enabled
@@ -61,97 +75,80 @@ impl DnssecValidator {
     /// # Returns
     /// A tuple (is_valid, is_signed):
     /// - If validation disabled: (true, false)
-    /// - If zone is unsigned: (true, false)
-    /// - If zone is signed: (validation_result, true)
+    /// - If the zone is unsigned: (!require_signed, false)
+    /// - If the zone is signed: (validation_result, true)
     pub fn validate_response(
         &self,
         zone: &Zone,
         records: &[&crate::zone::ZoneRecord],
-        query_name: &str,
+        _query_name: &str,
     ) -> (bool, bool) {
-        // If validation is disabled, return success but not signed
         if !self.enabled {
             return (true, false);
         }
 
-        // Check if zone is signed
-        let is_signed = Self::is_zone_signed(zone);
+        if !Self::is_zone_signed(zone) {
+            // Unsigned. Normal unless the operator has said every zone here is
+            // meant to be signed, in which case the absence of signatures is
+            // itself the finding.
+            return (!self.require_signed, false);
+        }
 
-        if !is_signed {
-            // Unsigned zone: return success, not signed
-            if self.validate_unsigned {
-                (true, false)
-            } else {
-                (true, false)
-            }
-        } else {
-            // If records is empty, we can't validate signatures on them
-            if records.is_empty() {
-                return (true, true);
-            }
+        // Nothing to check — an empty answer carries no RRset. The zone is
+        // still signed, so say so.
+        let Some(first) = records.first() else {
+            return (true, true);
+        };
 
-            // Get the type and class of the records (they should all be the same)
-            let rtype = crate::utils::record_type_code(&records[0].rdata);
-            let class = records[0].class;
-            let ttl = records[0].ttl as u32;
-
-            // Find DNSKEY records in the zone to use as trusted keys
-            let dnskeys: Vec<ParsedRecord> = zone.records.iter()
-                .filter(|r| r.rdata.rtype == record_types::DNSKEY)
-                .filter_map(|r| r.rdata.parse().ok())
-                .collect();
-
-            if dnskeys.is_empty() {
-                return (false, true); // Signed zone must have DNSKEYs
-            }
-
-            // Find RRSIG records in the zone that cover this rtype and query_name
-            let rrsigs: Vec<ParsedRecord> = zone.records.iter()
-                .filter(|r| {
-                    r.rdata.rtype == record_types::RRSIG
-                        && zone.matches_query(&r.name, query_name)
+        let keys: Vec<Dnskey> = zone
+            .records
+            .iter()
+            .filter(|r| r.rdata.rtype == record_types::DNSKEY)
+            .filter_map(|r| {
+                Dnskey::from_record(&ResourceRecord {
+                    name: r.name.clone(),
+                    class: r.class,
+                    ttl: r.ttl,
+                    rdata: r.rdata.clone(),
                 })
-                .filter_map(|r| r.rdata.parse().ok())
-                .filter(|sig| {
-                    matches!(sig, ParsedRecord::RRSIG { type_covered, .. } if *type_covered == rtype)
+            })
+            .collect();
+        if keys.is_empty() {
+            return (false, true); // A signed zone must have DNSKEYs.
+        }
+
+        // Every RRSIG in the zone; `verify_rrset` picks the ones that cover
+        // this RRset by owner and type, and rejects a signer outside the zone.
+        let rrsigs: Vec<Rrsig> = zone
+            .records
+            .iter()
+            .filter(|r| r.rdata.rtype == record_types::RRSIG)
+            .filter_map(|r| {
+                Rrsig::from_record(&ResourceRecord {
+                    name: r.name.clone(),
+                    class: r.class,
+                    ttl: r.ttl,
+                    rdata: r.rdata.clone(),
                 })
-                .collect();
+            })
+            .collect();
 
-            if rrsigs.is_empty() {
-                return (false, true); // Signed zone must have RRSIG for the RRset
+        let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
+        let proof = verify_rrset(
+            &Rrset::new(&first.name, first.rdata.rtype, first.class, &rdatas),
+            &rrsigs,
+            &keys,
+            &zone.origin,
+            current_unix_timestamp(),
+        );
+
+        match proof {
+            RrsetProof::Verified { .. } => (true, true),
+            // A signed zone with an unsigned RRset in it is a broken zone, and
+            // the AD bit would be a lie either way.
+            RrsetProof::Unsigned | RrsetProof::Bogus(_) | RrsetProof::Unsupported(_) => {
+                (false, true)
             }
-
-            // Construct DnssecValidator from dnssec.rs
-            let crypto_validator = crate::dnssec::DnssecValidator::new(dnskeys);
-
-            // Serialize the RRset in canonical form
-            let records_data: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
-            let serialized_rrset = match crate::dnssec::serialize_rrset_from_record_data(
-                &records[0].name,
-                rtype,
-                class,
-                ttl,
-                &records_data,
-            ) {
-                Ok(bytes) => bytes,
-                Err(_) => return (false, true),
-            };
-
-            // Validate each RRSIG signature
-            for rrsig in &rrsigs {
-                // Also validate wildcard expansion if applicable
-                if let Ok(false) = crate::dnssec::validate_wildcard(query_name, &records[0].name, rrsig) {
-                    continue;
-                }
-                
-                if let Ok(true) = crypto_validator.validate_signature(&serialized_rrset, rrsig) {
-                    // Valid signature found!
-                    return (true, true);
-                }
-            }
-
-            // No valid signature found
-            (false, true)
         }
     }
 
@@ -170,6 +167,7 @@ impl DnssecValidator {
 mod tests {
     use super::*;
     use crate::zone::ZoneRecord;
+    use crate::ParsedRecord;
     use std::net::Ipv4Addr;
 
     #[test]
