@@ -20,6 +20,7 @@ pub mod bench;
 pub mod cache;
 pub mod resolver;
 pub mod metrics;
+pub mod nsec_cache;
 pub mod dnssec;
 pub mod dnssec_chain;
 pub mod dnssec_denial;

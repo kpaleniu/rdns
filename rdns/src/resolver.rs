@@ -13,8 +13,13 @@
 //! trip rather than pinning a thread for the sum of them. `rdnsr` awaits
 //! `resolve` directly. See the note on [`Resolver::recurse`].
 
-use crate::utils::current_unix_timestamp;
-use crate::{DnsMessage, Edns, ParsedRecord, QuerySection, ResponseCode};
+use crate::dnssec::{Dnskey, Rrsig};
+use crate::dnssec_chain::{
+    ChainValidator, DelegationEvidence, DelegationVerdict, KeyStore, TrustAnchors, ValidationState,
+};
+use crate::dnssec_denial::{proves_nodata, proves_nxdomain, nsec3s_in, nsecs_in, Denial};
+use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::{DnsMessage, Edns, ParsedRecord, QuerySection, ResourceRecord, ResponseCode};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
@@ -166,6 +171,15 @@ pub struct ResolverConfig {
     /// port, so there is nothing else to go on. Configurable only so a test can
     /// stand up a fake root/TLD/authoritative hierarchy on an unprivileged one.
     pub server_port: u16,
+    /// Trust anchors to validate against, or `None` to do no DNSSEC validation
+    /// at all.
+    ///
+    /// Turning this on changes what goes out as well as what comes back: every
+    /// query carries DO so servers include their signatures, and CD so a
+    /// forwarded query reaches us unfiltered — an upstream that validates on our
+    /// behalf and hands back SERVFAIL leaves us nothing to check, which is the
+    /// same as trusting it.
+    pub dnssec: Option<TrustAnchors>,
 }
 
 impl Default for ResolverConfig {
@@ -198,6 +212,9 @@ impl Default for ResolverConfig {
             qname_minimization: true,
             zero_x20: true,
             server_port: 53,
+            // Off by default: validation costs extra round trips and turns a
+            // misconfigured zone into a failure, so it is the operator's call.
+            dnssec: None,
         }
     }
 }
@@ -237,15 +254,28 @@ impl DelegationCache {
     /// Deepest wins: knowing the servers for `example.com.` is worth more than
     /// knowing the ones for `com.`, because it skips a round trip.
     fn best_match(&self, qname: &str) -> Option<(String, Vec<SocketAddr>)> {
+        self.best_match_where(qname, |_| true)
+    }
+
+    /// As [`DelegationCache::best_match`], but only considering zones that
+    /// `accept` approves of. A validating resolver uses this to refuse a
+    /// shortcut that would skip past a zone cut it has not authenticated.
+    fn best_match_where(
+        &self,
+        qname: &str,
+        accept: impl Fn(&str) -> bool,
+    ) -> Option<(String, Vec<SocketAddr>)> {
         let name = normalize(qname);
         let now = current_unix_timestamp();
         let mut entries = self.entries.lock().ok()?;
 
         for candidate in ancestors(&name) {
             match entries.get(&candidate) {
-                Some(entry) if entry.expires_at > now => {
+                Some(entry) if entry.expires_at > now && accept(&candidate) => {
                     return Some((candidate, entry.servers.clone()));
                 }
+                // Live, but the caller does not want to start here.
+                Some(entry) if entry.expires_at > now => {}
                 Some(_) => {
                     entries.remove(&candidate);
                 }
@@ -438,6 +468,141 @@ impl Budget {
     }
 }
 
+/// The mutable state of one client query, threaded through the whole walk.
+///
+/// The budget was always here. `cuts` is the new part: every referral we follow
+/// is also the only moment we get to see the *parent's* side of that zone cut,
+/// which is where the DS records live. Asking the child for its own DS
+/// afterwards lets the child answer a question about itself, and asking the
+/// parent again costs a round trip we have already spent — so the referral is
+/// read for DS and NSEC evidence as it goes past, and validation consumes what
+/// the walk collected.
+struct Resolution {
+    budget: Budget,
+    cuts: Vec<DelegationEvidence>,
+}
+
+impl Resolution {
+    fn new(budget: usize) -> Self {
+        Resolution {
+            budget: Budget::new(budget),
+            cuts: Vec::new(),
+        }
+    }
+
+    /// Remember what a referral to `zone` said about that zone's security.
+    fn record_cut(&mut self, zone: &str, authorities: &[ResourceRecord]) {
+        let evidence = DelegationEvidence::from_authority(zone, authorities);
+        // A zone can be crossed more than once in one resolution (a CNAME
+        // chase, or fetching a nameserver's address). Keep the first sighting
+        // that actually carried evidence — a later referral pulled from a cache
+        // or answered by a different server may be thinner.
+        if let Some(existing) = self.cuts.iter_mut().find(|c| c.zone == evidence.zone) {
+            if existing.ds.is_empty() && existing.nsecs.is_empty() && existing.nsec3s.is_empty() {
+                *existing = evidence;
+            }
+            return;
+        }
+        self.cuts.push(evidence);
+    }
+
+    /// The next zone cut below `zone` on the way to `target`.
+    ///
+    /// Shallowest first: the chain has to be walked one cut at a time, because
+    /// each zone's keys are what authenticate the DS of the zone beneath it.
+    fn next_cut_below(&self, zone: &str, target: &str) -> Option<&DelegationEvidence> {
+        self.cuts
+            .iter()
+            .filter(|c| {
+                c.zone != normalize(zone)
+                    && is_subdomain(&c.zone, zone)
+                    && is_subdomain(target, &c.zone)
+            })
+            .min_by_key(|c| label_count(&c.zone))
+    }
+}
+
+/// DNSKEY sets that have already been validated up to a trust anchor.
+///
+/// Without this, every query into a signed zone re-walks the whole chain from
+/// the root and re-verifies every signature on the way down — several extra
+/// round trips and a few dozen public-key operations for an answer we could
+/// have had from cache. With it, that cost is paid once per zone per TTL.
+///
+/// What is stored is the *conclusion*, not the material: these keys have been
+/// checked against their DS, so nothing re-derives them. That makes the TTL
+/// load-bearing, hence the cap.
+#[derive(Debug)]
+struct KeyCache {
+    entries: Mutex<HashMap<String, CachedKeys>>,
+    capacity: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedKeys {
+    keys: Vec<Dnskey>,
+    expires_at: u64,
+}
+
+/// Never hold a validated key set longer than this, whatever the TTL says.
+/// A key that has been withdrawn should stop being trusted within the day.
+const MAX_KEY_TTL: u64 = 86_400;
+
+impl KeyCache {
+    fn new(capacity: usize) -> Self {
+        KeyCache {
+            entries: Mutex::new(HashMap::new()),
+            capacity,
+        }
+    }
+
+    fn get(&self, zone: &str) -> Option<Vec<Dnskey>> {
+        let now = current_unix_timestamp();
+        let mut entries = self.entries.lock().ok()?;
+        match entries.get(zone) {
+            Some(entry) if entry.expires_at > now => Some(entry.keys.clone()),
+            Some(_) => {
+                entries.remove(zone);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn insert(&self, zone: &str, keys: Vec<Dnskey>, ttl: u64) {
+        if self.capacity == 0 || keys.is_empty() || ttl == 0 {
+            return;
+        }
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        if entries.len() >= self.capacity {
+            let now = current_unix_timestamp();
+            entries.retain(|_, e| e.expires_at > now);
+            if entries.len() >= self.capacity {
+                if let Some(soonest) = entries
+                    .iter()
+                    .min_by_key(|(_, e)| e.expires_at)
+                    .map(|(k, _)| k.clone())
+                {
+                    entries.remove(&soonest);
+                }
+            }
+        }
+        entries.insert(
+            normalize(zone),
+            CachedKeys {
+                keys,
+                expires_at: current_unix_timestamp() + ttl.min(MAX_KEY_TTL),
+            },
+        );
+    }
+
+    fn holds(&self, zone: &str) -> bool {
+        self.get(zone).is_some()
+    }
+}
+
 /// A DNS resolver. See [`ResolverMode`] for what it actually does.
 pub struct Resolver {
     config: ResolverConfig,
@@ -448,16 +613,20 @@ pub struct Resolver {
     /// Shares its bound with the delegation cache (0 disables both the recording
     /// and, harmlessly, the reordering — `order` then keeps the input order).
     rtt: RttStore,
+    /// Zones whose DNSKEY set we have already validated.
+    keys: KeyCache,
 }
 
 impl Resolver {
     pub fn new(config: ResolverConfig) -> Self {
         let delegations = DelegationCache::new(config.delegation_cache_size);
         let rtt = RttStore::new(config.delegation_cache_size);
+        let keys = KeyCache::new(config.delegation_cache_size);
         Resolver {
             config,
             delegations,
             rtt,
+            keys,
         }
     }
 
@@ -480,24 +649,48 @@ impl Resolver {
     }
 
     /// Resolve a query.
+    ///
+    /// The answer only; use [`Resolver::resolve_validated`] to learn whether it
+    /// was authenticated.
     pub async fn resolve(&self, query: &QuerySection) -> Result<DnsMessage, anyhow::Error> {
-        let mut budget = Budget::new(self.config.query_budget);
-        match self.config.mode {
-            ResolverMode::Forward => self.forward(query, &mut budget).await,
-            ResolverMode::Recurse => self.recurse(query, &mut budget).await,
-        }
+        self.resolve_validated(query).await.map(|(msg, _)| msg)
+    }
+
+    /// Resolve a query and say how much the answer can be trusted.
+    ///
+    /// With no trust anchors configured the state is always
+    /// [`ValidationState::Indeterminate`] — not `Insecure`, because we did not
+    /// establish that anything is unsigned, we simply did not look.
+    pub async fn resolve_validated(
+        &self,
+        query: &QuerySection,
+    ) -> Result<(DnsMessage, ValidationState), anyhow::Error> {
+        let mut state = Resolution::new(self.config.query_budget);
+        let response = match self.config.mode {
+            ResolverMode::Forward => self.forward(query, &mut state).await?,
+            ResolverMode::Recurse => self.recurse(query, &mut state).await?,
+        };
+
+        let Some(anchors) = &self.config.dnssec else {
+            return Ok((
+                response,
+                ValidationState::Indeterminate("DNSSEC validation is not enabled".into()),
+            ));
+        };
+        let verdict = self.validate(query, &response, &mut state, anchors).await;
+        Ok((response, verdict))
     }
 
     /// Forward the query to each upstream in turn and return the first answer.
     async fn forward(
         &self,
         query: &QuerySection,
-        budget: &mut Budget,
+        state: &mut Resolution,
     ) -> Result<DnsMessage, anyhow::Error> {
         // RD=1: we are asking the upstream to do the recursion for us. `ask_any`
         // tries them fastest-first and records their RTTs, same as recursion.
         let out = self.build_query(query, true)?;
-        self.ask_any(&self.config.upstream_servers, &out, budget)
+        self.ask_any(&self.config.upstream_servers, &out, &mut state.budget)
             .await
             .ok_or_else(|| {
                 anyhow!("failed to resolve {} with all upstream servers", query.qname)
@@ -545,8 +738,15 @@ impl Resolver {
             authorities: Vec::new(),
             additionals: Vec::new(),
         };
-        // Advertise EDNS0 so the responder may exceed 512 bytes.
-        msg.set_edns(Edns::with_payload_size(self.config.udp_payload_size))?;
+        // Advertise EDNS0 so the responder may exceed 512 bytes, and — when we
+        // validate — ask for the signatures with DO. CD goes with it: we are
+        // doing the checking, so an upstream must hand back what it has rather
+        // than withholding data it judged bogus, which would leave us with
+        // nothing to judge and no choice but to take its word for it.
+        let mut edns = Edns::with_payload_size(self.config.udp_payload_size);
+        edns.do_bit = self.config.dnssec.is_some();
+        msg.cd = self.config.dnssec.is_some();
+        msg.set_edns(edns)?;
 
         let mut buf = vec![0; 512];
         let len = msg.to_bytes(&mut buf)?;
@@ -589,7 +789,7 @@ impl Resolver {
     async fn recurse(
         &self,
         query: &QuerySection,
-        budget: &mut Budget,
+        state: &mut Resolution,
     ) -> Result<DnsMessage, anyhow::Error> {
         let mut qname = normalize(&query.qname);
         let mut answers = Vec::new();
@@ -616,7 +816,7 @@ impl Resolver {
                 qtype: query.qtype,
                 qclass: query.qclass.clone(),
             };
-            let response = self.resolve_from_root(&step, budget, 0).await?;
+            let response = self.resolve_from_root(&step, state, 0).await?;
 
             // Keep only records that belong to the chain we actually asked
             // about — the name in hand, plus whatever a CNAME we have accepted
@@ -675,7 +875,7 @@ impl Resolver {
     async fn resolve_from_root(
         &self,
         query: &QuerySection,
-        budget: &mut Budget,
+        state: &mut Resolution,
         depth: usize,
     ) -> Result<DnsMessage, anyhow::Error> {
         const MAX_NESTED: usize = 4;
@@ -685,8 +885,14 @@ impl Resolver {
 
         // Start as far down the tree as we already know how to, rather than at
         // the root every time.
-        if let Some((zone, servers)) = self.delegations.best_match(&query.qname) {
-            match self.walk(query, budget, depth, zone.clone(), servers).await {
+        //
+        // Validating narrows that: a shortcut past a zone cut is also a
+        // shortcut past the DS records at it, and the chain cannot be walked
+        // through a gap. So when DNSSEC is on we only skip ahead to a zone
+        // whose keys are already validated — from there every cut below is
+        // still crossed, and still recorded.
+        if let Some((zone, servers)) = self.best_start(&query.qname) {
+            match self.walk(query, state, depth, zone.clone(), servers).await {
                 Ok(response) => return Ok(response),
                 Err(_) => {
                     // A cached delegation goes stale: servers get renumbered,
@@ -699,7 +905,7 @@ impl Resolver {
 
         self.walk(
             query,
-            budget,
+            state,
             depth,
             ".".to_string(),
             self.config.root_hints.clone(),
@@ -707,11 +913,21 @@ impl Resolver {
         .await
     }
 
+    /// The deepest cached delegation we are willing to start from.
+    fn best_start(&self, qname: &str) -> Option<(String, Vec<SocketAddr>)> {
+        if self.config.dnssec.is_some() {
+            self.delegations
+                .best_match_where(qname, |zone| self.keys.holds(zone))
+        } else {
+            self.delegations.best_match(qname)
+        }
+    }
+
     /// The delegation walk proper, from a known starting point.
     async fn walk(
         &self,
         query: &QuerySection,
-        budget: &mut Budget,
+        state: &mut Resolution,
         depth: usize,
         start_zone: String,
         start_servers: Vec<SocketAddr>,
@@ -757,7 +973,7 @@ impl Resolver {
             };
             let out = self.build_query(&step, false)?;
 
-            let Some(response) = self.ask_any(&servers, &out, budget).await else {
+            let Some(response) = self.ask_any(&servers, &out, &mut state.budget).await else {
                 return Err(anyhow!("no server for {zone} answered while resolving {qname}"));
             };
 
@@ -771,10 +987,17 @@ impl Resolver {
                 ttl,
             }) = self.extract_referral(&response, &zone, &qname)?
             {
+                // Read the parent's side of the cut before moving below it.
+                // This is the only pass where the DS records — and the NSEC
+                // that would prove there are none — are in front of us.
+                if self.config.dnssec.is_some() {
+                    state.record_cut(&child_zone, &response.authorities);
+                }
+
                 servers = if glue.is_empty() {
                     // Glueless delegation: the referral named servers but gave no
                     // usable addresses, so each one costs a resolution of its own.
-                    self.resolve_nameserver_addresses(&ns_names, budget, depth + 1)
+                    self.resolve_nameserver_addresses(&ns_names, state, depth + 1)
                         .await?
                 } else {
                     glue
@@ -950,7 +1173,7 @@ impl Resolver {
     async fn resolve_nameserver_addresses(
         &self,
         ns_names: &[String],
-        budget: &mut Budget,
+        state: &mut Resolution,
         depth: usize,
     ) -> Result<Vec<SocketAddr>, anyhow::Error> {
         for name in ns_names {
@@ -963,7 +1186,7 @@ impl Resolver {
             // (resolve_from_root → walk → here → resolve_from_root), and an
             // `async fn` future may not contain itself by value. Boxing stores a
             // pointer instead, so the future's size stays finite.
-            let Ok(response) = Box::pin(self.resolve_from_root(&lookup, budget, depth)).await
+            let Ok(response) = Box::pin(self.resolve_from_root(&lookup, state, depth)).await
             else {
                 continue;
             };
@@ -1083,6 +1306,241 @@ impl Resolver {
             return Err(anyhow!("TCP reply from {upstream} did not match the query"));
         }
         Ok(response)
+    }
+
+    // -----------------------------------------------------------------
+    // DNSSEC validation
+    // -----------------------------------------------------------------
+
+    /// Decide how much of `response` is authentic.
+    ///
+    /// The shape of this is: work out which zones claim to have signed the
+    /// records in hand, establish a chain of trust down to each of those zones,
+    /// and only then check the signatures. Doing it the other way round — check
+    /// signatures first, chase the chain if they pass — would let an attacker
+    /// choose the key that validates their own data.
+    async fn validate(
+        &self,
+        query: &QuerySection,
+        response: &DnsMessage,
+        state: &mut Resolution,
+        anchors: &TrustAnchors,
+    ) -> ValidationState {
+        let now = current_unix_timestamp();
+
+        // A negative answer carries its proof in the authority section, so that
+        // is what has to be validated when there is nothing in the answer.
+        let negative = response.answers.is_empty();
+        let records: Vec<ResourceRecord> = if negative {
+            response.authorities.clone()
+        } else {
+            response.answers.clone()
+        };
+
+        // Every zone that put its name to something here.
+        let mut signers: Vec<String> = Vec::new();
+        for sig in records.iter().filter_map(Rrsig::from_record) {
+            if !signers.contains(&sig.signer_name) {
+                signers.push(sig.signer_name);
+            }
+        }
+
+        // Nothing is signed. That is either a genuinely unsigned zone — fine,
+        // and the chain walk will prove it — or a signed zone whose signatures
+        // were stripped in flight, which is not fine at all. Walking towards
+        // the name is what tells the two apart.
+        if signers.is_empty() {
+            let mut keys = KeyStore::new();
+            return match self
+                .establish_chain(&query.qname, state, anchors, now, &mut keys)
+                .await
+            {
+                ValidationState::Secure => ValidationState::Bogus(format!(
+                    "{} lies in a signed zone but nothing in the answer is signed",
+                    query.qname
+                )),
+                other => other,
+            };
+        }
+
+        let mut keys = KeyStore::new();
+        for signer in &signers {
+            match self
+                .establish_chain(signer, state, anchors, now, &mut keys)
+                .await
+            {
+                ValidationState::Secure => {}
+                // The chain to a signer ends in an unsigned zone, so its
+                // signature means nothing and cannot be held against it.
+                other => return other,
+            }
+        }
+
+        let validator = ChainValidator::new(anchors, now);
+        let verdict = validator.validate_records(&records, &keys);
+        if !verdict.is_secure() {
+            return verdict;
+        }
+
+        // A signature over a denial only says the records are authentic; it
+        // does not say they deny what we asked about. That check is separate,
+        // and skipping it lets a valid NSEC from elsewhere in the zone stand in
+        // for a proof it does not make.
+        if negative {
+            return self.check_denial(query, response);
+        }
+        ValidationState::Secure
+    }
+
+    /// Walk from a trust anchor down to `target`, filling `keys` with the
+    /// validated DNSKEY set of every zone on the way.
+    ///
+    /// Returns [`ValidationState::Secure`] when `target`'s own zone was
+    /// reached and is signed, `Insecure` when the chain provably ends above it,
+    /// and `Bogus` when it breaks.
+    async fn establish_chain(
+        &self,
+        target: &str,
+        state: &mut Resolution,
+        anchors: &TrustAnchors,
+        now: u64,
+        keys: &mut KeyStore,
+    ) -> ValidationState {
+        let validator = ChainValidator::new(anchors, now);
+        let Some((anchor_zone, anchor_ds)) = validator.start(target) else {
+            return ValidationState::Indeterminate(format!(
+                "no trust anchor covers {target}"
+            ));
+        };
+
+        // Resume as deep as we already trust, rather than re-walking from the
+        // anchor every time. This has to use the same rule `best_start` used to
+        // pick where the *resolution* began, or the two disagree: the walk
+        // would skip a zone cut whose DS this loop then goes looking for, and
+        // an answer that validated a moment ago would come back bogus.
+        let (mut zone, mut ds_set) = (anchor_zone.clone(), anchor_ds);
+        for candidate in ancestors(&normalize(target)) {
+            if is_subdomain(&candidate, &anchor_zone) && self.keys.holds(&candidate) {
+                // Its keys are cached, so they were validated to the anchor
+                // once already and the DS that got us there is not needed again.
+                zone = candidate;
+                ds_set = Vec::new();
+                break;
+            }
+        }
+
+        // A chain is at most one zone cut per label, plus the anchor.
+        let max_steps = label_count(target) + 2;
+        for _ in 0..max_steps {
+            // Establish this zone's keys, from cache if we have already done so.
+            let zone_keys = match self.keys.get(&zone) {
+                Some(cached) => cached,
+                None => {
+                    let (records, ttl) = match self.fetch_dnskeys(&zone, state).await {
+                        Ok(found) => found,
+                        Err(e) => {
+                            return ValidationState::Bogus(format!(
+                                "could not fetch the DNSKEY RRset for {zone}: {e:#}"
+                            ))
+                        }
+                    };
+                    match validator.validate_dnskeys(&zone, &records, &ds_set) {
+                        Ok(validated) => {
+                            self.keys.insert(&zone, validated.clone(), ttl);
+                            validated
+                        }
+                        Err(other) => return other,
+                    }
+                }
+            };
+            keys.insert(zone.clone(), zone_keys.clone());
+
+            if names_equal(&zone, target) {
+                return ValidationState::Secure;
+            }
+
+            // Step down to the next zone cut on the way to the target.
+            let Some(evidence) = state.next_cut_below(&zone, target).cloned() else {
+                // No cut below this zone on the path: the target is served out
+                // of this very zone, so its keys are the ones that signed it.
+                return ValidationState::Secure;
+            };
+
+            match validator.validate_delegation(&evidence, &zone, &zone_keys) {
+                DelegationVerdict::Secure(ds) => {
+                    ds_set = ds;
+                    zone = evidence.zone.clone();
+                }
+                DelegationVerdict::Insecure(_) => return ValidationState::Insecure,
+                DelegationVerdict::Bogus(why) => return ValidationState::Bogus(why),
+            }
+        }
+
+        ValidationState::Bogus(format!("the chain of trust to {target} does not terminate"))
+    }
+
+    /// Fetch a zone's DNSKEY RRset, returning the records and the TTL to cache
+    /// the conclusion for.
+    async fn fetch_dnskeys(
+        &self,
+        zone: &str,
+        state: &mut Resolution,
+    ) -> Result<(Vec<ResourceRecord>, u64), anyhow::Error> {
+        let query = QuerySection {
+            qname: zone.to_string(),
+            qtype: rt::DNSKEY,
+            qclass: crate::QueryClass::IN,
+        };
+        let response = match self.config.mode {
+            ResolverMode::Forward => Box::pin(self.forward(&query, state)).await?,
+            ResolverMode::Recurse => Box::pin(self.resolve_from_root(&query, state, 0)).await?,
+        };
+        let ttl = response
+            .answers
+            .iter()
+            .filter(|rr| rr.rdata.rtype == rt::DNSKEY)
+            .map(|rr| rr.ttl.max(0) as u64)
+            .min()
+            .unwrap_or(0);
+        Ok((response.answers, ttl))
+    }
+
+    /// For a negative answer, check that the NSEC/NSEC3 records actually deny
+    /// what was asked — not merely that they are correctly signed.
+    fn check_denial(&self, query: &QuerySection, response: &DnsMessage) -> ValidationState {
+        let nsecs = nsecs_in(&response.authorities);
+        let nsec3s = nsec3s_in(&response.authorities);
+        if nsecs.is_empty() && nsec3s.is_empty() {
+            // A signed zone that answers "no" without proof. Common enough from
+            // a middlebox; not something to hand on as authenticated.
+            return ValidationState::Bogus(format!(
+                "{} was denied without an NSEC or NSEC3 proof",
+                query.qname
+            ));
+        }
+
+        // The zone the proof came from — the SOA in the authority section names
+        // it, and failing that the shallowest NSEC owner we were given.
+        let zone = response
+            .authorities
+            .iter()
+            .find(|rr| rr.rdata.rtype == rt::SOA)
+            .map(|rr| normalize(&rr.name))
+            .unwrap_or_else(|| normalize(&query.qname));
+
+        let denial = if response.rcode == ResponseCode::NoSuchDomain {
+            proves_nxdomain(&query.qname, &zone, &nsecs, &nsec3s)
+        } else {
+            proves_nodata(&query.qname, query.qtype, &nsecs, &nsec3s)
+        };
+
+        match denial {
+            Denial::Proved => ValidationState::Secure,
+            Denial::NotProved(why) => ValidationState::Bogus(format!(
+                "the denial of {} does not prove it: {why}",
+                query.qname
+            )),
+        }
     }
 }
 
@@ -2630,5 +3088,435 @@ this line has no record and is skipped
             answer.answers[0].rdata.parse().unwrap(),
             ParsedRecord::A(Ipv4Addr::new(203, 0, 113, 5))
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // DNSSEC: a signed hierarchy, with real signatures, in-process
+    // ---------------------------------------------------------------------
+    //
+    // Port 53 is intercepted on this machine, so there is no live signed zone
+    // to point at and never was — which is exactly how the validator came to
+    // be written without a genuine signature ever reaching it. These tests
+    // sign with `ring` at run time and put the whole resolve path through it:
+    // root KSK/ZSK, a DS in each parent, and a signature over the answer.
+
+    use crate::dnssec_denial::build_type_bitmap;
+    use crate::dnssec_test_util::{ds_record, TestZone};
+
+    /// Root → `test.` → `example.test.`, every zone signed and every
+    /// delegation carrying a DS.
+    struct SignedHierarchy {
+        root_addr: SocketAddr,
+        anchors: TrustAnchors,
+        // Held so the servers stay alive for the test's lifetime.
+        _servers: Vec<FakeServer>,
+    }
+
+    /// A referral that also carries the parent's DNSSEC statement about the
+    /// child — the DS RRset and its signature, or whatever `extra` supplies
+    /// instead (an NSEC denial, or nothing at all, for the attack cases).
+    fn signed_referral(
+        query: &DnsMessage,
+        zone: &str,
+        ns_name: &str,
+        glue: SocketAddr,
+        extra: &[ResourceRecord],
+    ) -> DnsMessage {
+        let mut resp = referral(query, zone, ns_name, Some((ns_name, glue)));
+        resp.authorities.extend_from_slice(extra);
+        resp
+    }
+
+    /// A DS RRset for `child`, signed by `parent`.
+    fn signed_ds(parent: &TestZone, child: &TestZone) -> Vec<ResourceRecord> {
+        let ds = ds_record(&child.ds(2), 3600);
+        let sig = parent.sign_records(std::slice::from_ref(&ds));
+        vec![ds, sig]
+    }
+
+    /// A signed NSEC at `name` proving there is no DS there, so the delegation
+    /// is genuinely to an unsigned zone.
+    fn signed_no_ds_proof(parent: &TestZone, name: &str) -> Vec<ResourceRecord> {
+        let nsec = ResourceRecord {
+            name: name.to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
+                next_domain_name: "zz.test.".to_string(),
+                type_bitmap: build_type_bitmap(&[rt::NS, rt::RRSIG, rt::NSEC]),
+            })
+            .unwrap(),
+        };
+        let sig = parent.sign_records(std::slice::from_ref(&nsec));
+        vec![nsec, sig]
+    }
+
+    /// Stand up the hierarchy. `delegation` decides what the TLD says about
+    /// `example.test.`, and `leaf` produces the authoritative server's answer
+    /// for `www.example.test.` — the two knobs every test here turns.
+    fn signed_hierarchy(
+        delegation: impl Fn(&TestZone, &TestZone) -> Vec<ResourceRecord>,
+        leaf: impl Fn(&TestZone) -> Vec<ResourceRecord> + Send + 'static,
+    ) -> SignedHierarchy {
+        let root = TestZone::new(".");
+        let tld = TestZone::new("test.");
+        let auth = TestZone::new("example.test.");
+
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, tld_sock, auth_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let tld_addr = tld_sock.local_addr().unwrap();
+        let auth_addr = auth_sock.local_addr().unwrap();
+
+        let anchors = TrustAnchors::new(vec![root.ds(2)]);
+
+        // Everything each server will ever say is computed and signed up front,
+        // so the closures below need only clone — the keys themselves never
+        // cross a thread boundary.
+        let root_keys = root.dnskey_records();
+        let tld_keys = tld.dnskey_records();
+        let auth_keys = auth.dnskey_records();
+        let tld_ds = signed_ds(&root, &tld);
+        let example_delegation = delegation(&tld, &auth);
+        let answers = leaf(&auth);
+        let denial = signed_nxdomain_authority(&auth);
+
+        let auth_server = spawn_server(auth_sock, move |q| {
+            let name = qname_of(q);
+            let qtype = q.queries.first().map(|x| x.qtype).unwrap_or(0);
+            if name == "example.test." && qtype == rt::DNSKEY {
+                authoritative(q, auth_keys.clone())
+            } else if name == "www.example.test." {
+                authoritative(q, answers.clone())
+            } else if name == "gone.example.test." {
+                // A signed "no": SOA and an NSEC whose gap runs from the apex to
+                // www, which covers both the name and the wildcard position.
+                let mut resp = response_to(q);
+                resp.authoritive = true;
+                resp.rcode = ResponseCode::NoSuchDomain;
+                resp.authorities = denial.clone();
+                resp
+            } else {
+                // Any other probe (the QNAME-minimized NS step) is answered
+                // NODATA from the apex, which deepens the walk by a label.
+                authoritative(q, Vec::new())
+            }
+        });
+
+        let tld_server = spawn_server(tld_sock, move |q| {
+            let name = qname_of(q);
+            let qtype = q.queries.first().map(|x| x.qtype).unwrap_or(0);
+            if name == "test." && qtype == rt::DNSKEY {
+                authoritative(q, tld_keys.clone())
+            } else {
+                signed_referral(
+                    q,
+                    "example.test.",
+                    "ns.example.test.",
+                    auth_addr,
+                    &example_delegation,
+                )
+            }
+        });
+
+        let root_server = spawn_server(root_sock, move |q| {
+            let name = qname_of(q);
+            let qtype = q.queries.first().map(|x| x.qtype).unwrap_or(0);
+            if name == "." && qtype == rt::DNSKEY {
+                authoritative(q, root_keys.clone())
+            } else {
+                signed_referral(q, "test.", "ns.test.", tld_addr, &tld_ds)
+            }
+        });
+
+        SignedHierarchy {
+            root_addr: root_server.addr,
+            anchors,
+            _servers: vec![root_server, tld_server, auth_server],
+        }
+    }
+
+    /// The authority section of a signed NXDOMAIN: the SOA, and one NSEC whose
+    /// gap runs from the apex to `www` — which covers `gone.example.test.` and
+    /// the `*.example.test.` wildcard position at once, so a single record
+    /// makes the whole proof.
+    fn signed_nxdomain_authority(auth: &TestZone) -> Vec<ResourceRecord> {
+        let soa = ResourceRecord {
+            name: "example.test.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::SOA {
+                mname: "ns.example.test.".to_string(),
+                rname: "admin.example.test.".to_string(),
+                serial: 1,
+                refresh: 10800,
+                retry: 3600,
+                expire: 604800,
+                minimum: 300,
+            })
+            .unwrap(),
+        };
+        let nsec = ResourceRecord {
+            name: "example.test.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
+                next_domain_name: "www.example.test.".to_string(),
+                type_bitmap: build_type_bitmap(&[rt::SOA, rt::NS, rt::RRSIG, rt::NSEC]),
+            })
+            .unwrap(),
+        };
+        let soa_sig = auth.sign_records(std::slice::from_ref(&soa));
+        let nsec_sig = auth.sign_records(std::slice::from_ref(&nsec));
+        vec![soa, soa_sig, nsec, nsec_sig]
+    }
+
+    /// A correctly signed A record, the ordinary case.
+    fn signed_answer(auth: &TestZone) -> Vec<ResourceRecord> {
+        let a = a_record("www.example.test.", [192, 0, 2, 1]);
+        let sig = auth.sign_records(std::slice::from_ref(&a));
+        vec![a, sig]
+    }
+
+    fn validating_config(h: &SignedHierarchy) -> ResolverConfig {
+        ResolverConfig {
+            dnssec: Some(h.anchors.clone()),
+            ..recursing_config(h.root_addr)
+        }
+    }
+
+    async fn resolve_www(config: ResolverConfig) -> (DnsMessage, ValidationState) {
+        Resolver::new(config)
+            .resolve_validated(&QuerySection {
+                qname: "www.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the resolution itself should succeed")
+    }
+
+    /// The whole chain, end to end: the trust anchor vouches for the root's
+    /// KSK, each zone's DS vouches for the next, and the answer's signature
+    /// verifies under the keys that walk establishes.
+    #[tokio::test]
+    async fn test_signed_hierarchy_validates_as_secure() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (answer, state) = resolve_www(validating_config(&h)).await;
+
+        assert_eq!(state, ValidationState::Secure, "{state}");
+        assert!(
+            answer.answers.iter().any(|rr| matches!(
+                rr.rdata.parse(),
+                Ok(ParsedRecord::A(a)) if a == Ipv4Addr::new(192, 0, 2, 1)
+            )),
+            "the validated answer must still carry the address"
+        );
+        assert!(
+            answer.answers.iter().any(|rr| rr.rdata.rtype == rt::RRSIG),
+            "DO was set, so the signatures come back with the answer"
+        );
+    }
+
+    /// The attack the whole apparatus exists to stop: the authoritative server
+    /// hands over a different address alongside a perfectly genuine signature
+    /// for the original one.
+    #[tokio::test]
+    async fn test_substituted_answer_is_bogus() {
+        let h = signed_hierarchy(signed_ds, |auth| {
+            let real = a_record("www.example.test.", [192, 0, 2, 1]);
+            let sig = auth.sign_records(std::slice::from_ref(&real));
+            // Same signature, different address.
+            vec![a_record("www.example.test.", [6, 6, 6, 6]), sig]
+        });
+
+        let (_, state) = resolve_www(validating_config(&h)).await;
+        assert!(state.is_bogus(), "expected bogus, got {state}");
+    }
+
+    /// A signature from a key the parent never vouched for. The zone's own
+    /// DNSKEY RRset is what the DS commits to, so a substituted ZSK breaks
+    /// that signature and the chain stops at the DNSKEY step.
+    #[tokio::test]
+    async fn test_answer_signed_by_an_unvouched_key_is_bogus() {
+        let impostor = TestZone::new("example.test.");
+        let h = signed_hierarchy(signed_ds, move |_auth| {
+            let a = a_record("www.example.test.", [192, 0, 2, 1]);
+            let sig = impostor.sign_records(std::slice::from_ref(&a));
+            vec![a, sig]
+        });
+
+        let (_, state) = resolve_www(validating_config(&h)).await;
+        assert!(state.is_bogus(), "expected bogus, got {state}");
+    }
+
+    /// The downgrade: strip the DS from the referral and serve the zone
+    /// unsigned. Without a proof that there is no DS, "unsigned" is just a
+    /// claim by whoever is answering.
+    #[tokio::test]
+    async fn test_stripped_ds_is_bogus_not_insecure() {
+        let h = signed_hierarchy(
+            |_parent, _child| Vec::new(),
+            |_auth| vec![a_record("www.example.test.", [6, 6, 6, 6])],
+        );
+
+        let (_, state) = resolve_www(validating_config(&h)).await;
+        assert!(
+            state.is_bogus(),
+            "a missing DS with nothing to back it must not read as unsigned: {state}"
+        );
+    }
+
+    /// And the legitimate version of the same shape: the parent signs an NSEC
+    /// saying there is no DS, so the child really is unsigned. The answer is
+    /// served, without the AD bit.
+    #[tokio::test]
+    async fn test_proven_unsigned_delegation_is_insecure_and_still_answers() {
+        let h = signed_hierarchy(
+            |parent, _child| signed_no_ds_proof(parent, "example.test."),
+            |_auth| vec![a_record("www.example.test.", [192, 0, 2, 4])],
+        );
+
+        let (answer, state) = resolve_www(validating_config(&h)).await;
+        assert_eq!(state, ValidationState::Insecure, "{state}");
+        assert!(
+            answer.answers.iter().any(|rr| matches!(
+                rr.rdata.parse(),
+                Ok(ParsedRecord::A(a)) if a == Ipv4Addr::new(192, 0, 2, 4)
+            )),
+            "an insecure answer is still an answer — most of the internet is unsigned"
+        );
+    }
+
+    /// An unsigned answer from a zone the chain says *is* signed is bogus: the
+    /// signatures did not go missing by accident.
+    #[tokio::test]
+    async fn test_missing_signature_in_a_signed_zone_is_bogus() {
+        let h = signed_hierarchy(signed_ds, |_auth| {
+            vec![a_record("www.example.test.", [192, 0, 2, 1])]
+        });
+
+        let (_, state) = resolve_www(validating_config(&h)).await;
+        assert!(state.is_bogus(), "expected bogus, got {state}");
+    }
+
+    /// With no anchors configured nothing is checked, and the state says so —
+    /// "indeterminate", not "insecure": we did not establish that anything is
+    /// unsigned, we simply never looked.
+    #[tokio::test]
+    async fn test_validation_disabled_is_indeterminate() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (_, state) = resolve_www(recursing_config(h.root_addr)).await;
+        assert!(
+            matches!(state, ValidationState::Indeterminate(_)),
+            "got {state}"
+        );
+    }
+
+    /// A name outside every island of trust cannot be judged either way.
+    #[tokio::test]
+    async fn test_name_outside_the_anchors_is_indeterminate() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let config = ResolverConfig {
+            // An anchor for an unrelated zone, and none for the root.
+            dnssec: Some(TrustAnchors::parse("other.invalid. IN DS 1 13 2 AABB").unwrap()),
+            ..recursing_config(h.root_addr)
+        };
+        let (_, state) = resolve_www(config).await;
+        assert!(
+            matches!(state, ValidationState::Indeterminate(_)),
+            "got {state}"
+        );
+    }
+
+    /// A signed "no" has to validate as thoroughly as a signed "yes" — and it
+    /// is a different code path: the proof lives in the authority section, and
+    /// being correctly signed is only half of it. The records must also *deny
+    /// the thing that was asked*, which is what `check_denial` adds on top.
+    #[tokio::test]
+    async fn test_signed_nxdomain_validates_as_secure() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (answer, state) = Resolver::new(validating_config(&h))
+            .resolve_validated(&QuerySection {
+                qname: "gone.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the resolution itself should succeed");
+
+        assert_eq!(state, ValidationState::Secure, "{state}");
+        assert_eq!(answer.rcode, ResponseCode::NoSuchDomain);
+        assert!(answer.authorities.iter().any(|rr| rr.rdata.rtype == rt::NSEC));
+    }
+
+    /// The point of RFC 8198, end to end: the NSEC that denied one name is a
+    /// signed statement about a whole *range* of them, so once it is validated
+    /// and cached, every other name in that gap is answered without asking
+    /// anyone. This is the test that ties the resolver's validation to the
+    /// denial cache — each is well covered alone, and the join is where a
+    /// mistake would let unvalidated material through.
+    #[tokio::test]
+    async fn test_a_validated_denial_answers_other_names_in_its_gap() {
+        use crate::nsec_cache::NsecCache;
+
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (denial, state) = Resolver::new(validating_config(&h))
+            .resolve_validated(&QuerySection {
+                qname: "gone.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("resolution should succeed");
+        assert_eq!(state, ValidationState::Secure, "{state}");
+
+        // Exactly what rdnsr does with a Secure negative answer.
+        let cache = NsecCache::new(16);
+        cache.insert_validated(&denial);
+
+        // A name nobody has ever asked about, answered from the cached gap.
+        let synthesized = cache
+            .synthesize("never-queried.example.test.", 1)
+            .expect("the cached gap covers this name too");
+        assert_eq!(synthesized.rcode, ResponseCode::NoSuchDomain);
+        assert!(
+            synthesized.authority.iter().any(|rr| rr.rdata.rtype == rt::SOA),
+            "RFC 2308 §2.1 wants the SOA on a negative answer"
+        );
+        assert!(synthesized.ttl <= 300, "bounded by the SOA MINIMUM");
+
+        // But a name outside the gap still has to be resolved.
+        assert!(
+            cache.synthesize("zzz.example.test.", 1).is_none(),
+            "the gap ends at www.example.test."
+        );
+    }
+
+    /// The validated-key cache: a second query into the same zone must not
+    /// re-walk the chain, or every answer costs a full revalidation.
+    #[tokio::test]
+    async fn test_validated_keys_are_cached_across_queries() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let resolver = Resolver::new(validating_config(&h));
+        let query = QuerySection {
+            qname: "www.example.test.".to_string(),
+            qtype: 1,
+            qclass: QueryClass::IN,
+        };
+
+        let (_, first) = resolver.resolve_validated(&query).await.unwrap();
+        assert_eq!(first, ValidationState::Secure, "{first}");
+        assert!(
+            resolver.keys.holds("example.test."),
+            "the leaf zone's keys should be cached after one validated query"
+        );
+        assert!(resolver.keys.holds("."), "and the root's");
+
+        let (_, second) = resolver.resolve_validated(&query).await.unwrap();
+        assert_eq!(second, ValidationState::Secure, "{second}");
     }
 }

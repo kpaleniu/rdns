@@ -61,6 +61,27 @@ pub fn canonical_name_cmp(a: &str, b: &str) -> Ordering {
     unreachable!("the loop returns on the first differing or missing label")
 }
 
+/// A byte string whose plain `Ord` is exactly [`canonical_name_cmp`].
+///
+/// Canonical order compares labels from the right, which a `BTreeMap` cannot do
+/// with a `String` key — and without an ordered key there is no way to ask "is
+/// there a cached NSEC whose range contains this name?" except to scan every
+/// one. Encoding the labels right-to-left, each terminated by a zero byte, moves
+/// that ordering into the bytes: a range query then finds the candidate.
+///
+/// The terminator is what makes an ancestor sort before its descendants
+/// (`com\0example\0` is a prefix of `com\0example\0a\0`) and what keeps a label
+/// from sorting after a longer label it is a prefix of (`ab\0` before `abc\0`,
+/// since `\0` < `c`). Zero cannot occur inside a label, so it is unambiguous.
+pub fn canonical_sort_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(name.len() + 1);
+    for label in reversed_labels(name) {
+        key.extend_from_slice(label.as_bytes());
+        key.push(0);
+    }
+    key
+}
+
 /// A name's labels, down-cased and right to left. The root has none.
 fn reversed_labels(name: &str) -> Vec<String> {
     let trimmed = name.trim_end_matches('.');
@@ -666,6 +687,40 @@ mod tests {
                 "*.z.example.",
             ]
         );
+    }
+
+    /// The sort key exists so a BTreeMap can do what `canonical_name_cmp` does.
+    /// If the two ever disagree, a range query returns the wrong NSEC and the
+    /// covering check silently examines a record that cannot prove anything.
+    #[test]
+    fn test_sort_key_ordering_matches_canonical_ordering() {
+        let names = [
+            ".",
+            "example.",
+            "a.example.",
+            "yljkjljk.a.example.",
+            "Z.a.example.",
+            "zABC.a.EXAMPLE.",
+            "z.example.",
+            "*.z.example.",
+            "\\200.z.example.",
+            "b.example.",
+            "a.z.example.",
+            "ab.example.",
+            "abc.example.",
+        ];
+        for a in names {
+            for b in names {
+                assert_eq!(
+                    canonical_sort_key(a).cmp(&canonical_sort_key(b)),
+                    canonical_name_cmp(a, b),
+                    "sort key disagrees with canonical order for {a:?} vs {b:?}"
+                );
+            }
+        }
+        // The two properties the zero terminator buys, spelled out.
+        assert!(canonical_sort_key("example.") < canonical_sort_key("a.example."));
+        assert!(canonical_sort_key("ab.example.") < canonical_sort_key("abc.example."));
     }
 
     #[test]

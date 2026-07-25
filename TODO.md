@@ -20,13 +20,17 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **225 lib + 15 integration** tests passing,
-`cargo clippy --workspace --all-targets` clean **except one deliberate warning**
-(`if_same_then_else` on `dnssec_validation_mode.rs::validate_response` — the
-`validate_unsigned` no-op; leave it until open item #2 defines the semantics).
+`cargo test --workspace` = **280 lib + 15 integration** tests passing,
+`cargo clippy --workspace --all-targets` **clean, no exceptions**.
 
-**Next task: #2 (DNSSEC validation on the resolve path).** #1 is done bar
-aggressive NSEC caching, which is blocked on #2 and #3.
+**Next task: #2's remaining DNSSEC follow-ups**, of which the wildcard NSEC
+requirement is the one with a security consequence; then #4 (zone indexing) if
+you would rather do something with an obvious payoff.
+
+**One flaky test, pre-existing:** `bench::bench_logger_throughput` asserts
+`>45k ops/sec` in wall-clock time and fails on a loaded machine (seen at 44,875
+while eight `cargo test` runs were competing). It is a benchmark wearing a test's
+clothes; drop the assertion or `#[ignore]` it.
 
 ### How to run
 
@@ -51,6 +55,14 @@ cargo run -p rdnsr -- --port 15354 --root-hints ./named.root
 
 # Same resolver, forwarding instead of recursing.
 cargo run -p rdnsr -- --port 15354 --upstream 127.0.0.1:15353
+
+# Validating DNSSEC against the built-in ICANN root anchor. Fails closed:
+# an answer that does not verify gets SERVFAIL, not the data.
+cargo run -p rdnsr -- --port 15354 --dnssec-validate
+
+# ...or against an anchor file, which is what to use when the root KSK rolls.
+# DS presentation format; the digest may be split across whitespace.
+cargo run -p rdnsr -- --port 15354 --dnssec-validate --trust-anchor ./root-anchors.txt
 ```
 
 ### Verifying, and one trap that invalidates it
@@ -110,120 +122,54 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-### 1. Recursor follow-ups
-The recursor works and is covered by 36 tests in `resolver.rs` (see
-"Architecture: the resolver"). One item is left, and it is blocked:
+### 1. Recursor follow-ups — done
+Aggressive NSEC caching (RFC 8198) landed; see "Architecture: aggressive use"
+and "Done so far". Everything else under #1 — async conversion, QNAME
+minimization, 0x20 + reply validation, RTT-based server selection, IPv6
+hints/glue and the `--root-hints` flag — was already done.
 
-- [ ] Aggressive NSEC caching (RFC 8198) — synthesize a negative answer from a
-      cached, *validated* NSEC/NSEC3 range instead of re-querying. Blocked on #2
-      (nothing validates NSEC yet) and #3 (NSEC3 hashing is wrong), so it cannot
-      be trusted until those land. Do it after #2.
+The recursor is covered by 47 tests in `resolver.rs` (see "Architecture: the
+resolver") and the denial cache by 16 in `nsec_cache.rs`.
 
-Everything else under #1 — async conversion, QNAME minimization, 0x20 + reply
-validation, RTT-based server selection, IPv6 hints/glue and the `--root-hints`
-flag — is done; see "Done so far".
+Two things aggressive use deliberately does **not** do, either of which is a
+reasonable next step:
 
-### 2. Put DNSSEC validation on the resolve path
-Nothing calls the DNSSEC code: `grep` for `DnssecValidator` or
-`dnssec_validation_mode` across `rdnsd`/`rdnsr`/`rdnsc` returns nothing, and the
-DO bit round-trips through the EDNS codec without being acted on.
+- [ ] **No wildcard synthesis.** RFC 8198 §5.3 also allows *positive* answers to
+      be synthesized from a validated wildcard record. Not done: it needs the
+      closest-encloser machinery on the positive path and interacts with the
+      unfinished wildcard-NSEC item under #2.
+- [ ] **NSEC3 covers NODATA but its NXDOMAIN path is untested against a real
+      zone.** The closest-encloser proof is implemented and unit-tested, but
+      every NSEC3 test here builds its own records; no NSEC3 zone has been
+      resolved end to end the way the NSEC one has.
 
-**⚠️ This is NOT "just wiring" — the primitives were never exercised against a
-real signature (investigated 2026-07-25, before starting).** Before any of the
-Outstanding items below can be trusted, these have to be fixed first:
+### 2. DNSSEC follow-ups
+Validation is on the resolve path and enforced (see "Architecture: DNSSEC" and
+"Done so far"). What is left is narrower than what landed:
 
-- **The signed-data assembly is incomplete.** RFC 4035 §5.3.2 says the bytes fed
-  to signature verification are `RRSIG_RDATA(with the signature field zeroed out)
-  || canonical RRset`. Nothing prepends the RRSIG RDATA:
-  `serialize_rrset_from_record_data` returns only the RRset, and
-  `DnssecValidator::validate_signature` takes the `data` pre-built by the caller.
-  Every test in `dnssec.rs` passes `b"test"` as that data, so `verify_rsa` /
-  `verify_ecdsa` have **never run against a genuine signature**. This must be
-  built (assemble RRSIG prefix + canonical RRset, with names lowercased and
-  RRs sorted by canonical RDATA — RFC 4034 §6) or nothing validates.
-- **`construct_rsa_public_key_der` is self-described "simplified … may need
-  adjustment"** and almost certainly wrong for real RSA keys. ECDSA (algs 13/14)
-  goes straight to `ring` and is the safer first target; prove RSA separately.
-- **NSEC3 hashing is wrong (item #3)** — negative proofs can't be trusted yet.
+- [ ] **No RFC 5011 automated key rollover.** A root KSK roll needs either a new
+      build or a new `--trust-anchor` file. RFC 5011 tracks the new key from the
+      zone itself during an overlap window; worth having, but it needs
+      persistent state across restarts, which nothing here has yet.
+- [ ] **CNAME chains are validated per-RRset, not as a chain.** Each RRset must
+      verify under the keys of the zone that signed it, which is checked — but
+      nothing verifies that the chain of CNAMEs itself is the one the client
+      asked for beyond the existing `chain` filter in `recurse`.
+- [ ] **Wildcard answers do not demand their NSEC.** `verify_rrset` reports the
+      wildcard an answer was expanded from (RFC 4035 §5.3.4), and nothing
+      consumes it yet: a complete proof also needs an NSEC showing the queried
+      name itself does not exist. Today such an answer validates as Secure on
+      the signature alone.
+- [ ] **`rdnsd` cannot sign a zone**, only serve one that arrives pre-signed,
+      and `dnssec_validation_mode` is still not called from anywhere.
 
-**No live verification is possible on this machine** — port 53 is intercepted
-(see "Verifying"), so there is no real DNSSEC path to test against. The way to
-prove this end-to-end is a fake *signed* hierarchy in-process (extend the
-`resolver.rs` test harness) using **real ECDSA P-256 signatures generated in the
-test** (`ring` can sign): build a root KSK/ZSK, sign a DNSKEY RRset, emit a DS
-into the parent, sign the answer, and validate the whole chain. That exercises
-the real crypto without the internet.
-
-**Scope was left as an open question (a cold start is picking this up).** Three
-sensible sizes, smallest-risk first:
-1. *Fix primitives only* — signed-data assembly + RSA DER, with real-ECDSA tests
-   proving `validate_signature`. No resolver integration.
-2. *Scoped first step* — the above, plus a leaf validator (verify an RRset
-   against its RRSIGs+DNSKEYs) and the trust-anchor / strictness / unsigned-vs-
-   bogus *types*, all tested; still not wired into the resolve path.
-3. *Full thing* — 2, plus the chain-walk integrated into the resolver (collect
-   DS at each delegation in `walk`, fetch DNSKEY per zone, validate up to the
-   root anchor) and enforced behind `rdnsr --dnssec-validate`. Several commits.
-
-The chain this has to walk (RFC 4034 / 6605):
-
-```
-root DNSKEY (trust anchor)
-  → verify RRSIG over the zone's DNSKEY RRset with it
-  → DS in the parent == hash of the child DNSKEY
-  → verify RRSIG over the answer RRset with the child DNSKEY
-  → answer is validated (set AD)
-```
-
-Already in `dnssec.rs` (the building blocks — but their tests check *structure*,
-key-tag arithmetic, DS-hash equality and expiry, not real signature crypto; see
-the warning above):
-
-- `validate_signature`, `calculate_key_tag`, `extract_dnssec_records`
-- `validate_ds_chain` (child DNSKEY hashes to the parent DS)
-- `validate_dnskey_chain` (the walk above; 4 tests incl. bad signature, DS
-  mismatch, expired)
-- `validate_wildcard` (RFC 4034 §3.1.3 — label count vs signer name)
-- `validate_nsec`, `validate_nsec3` (negative proof — but see #3: the NSEC3 hash
-  is not RFC 5155 §5, so negative proof cannot be trusted until that is fixed)
-- `serialization::serialize_rrset_canonical` is generic over every record type,
-  so the old "only A/AAAA can be verified" limitation is gone
-- `dnssec_validation_mode.rs` already composes several of these into a
-  `validate_response`
-
-Outstanding:
-
-- [ ] Call it. In `rdnsr`, between "answer obtained" and "cache-store": validate
-      when the client set DO, and set AD on the reply only when validation
-      succeeded. Never cache an answer as validated that was not.
-- [ ] **Trust anchor: where does the root key come from?** Hardcoding the ICANN
-      root KSK means a rebuild at every rollover; a file means a config path and
-      a parse step. A file with the current key compiled in as fallback is the
-      usual compromise.
-- [ ] **Strictness policy.** On validation failure: SERVFAIL (fail closed, the
-      correct default) versus serving the unsigned answer. Same decision as the
-      `validate_unsigned` flag in `dnssec_validation_mode.rs::validate_response`,
-      whose two branches both return `(true, false)` today — that is the one
-      deliberate clippy warning. The `false` path is correct; `true` ("require
-      signing") is unspecified and should be defined here.
-- [ ] Distinguish an unsigned *zone* from a *failed* signature. Unsigned is
-      normal — most zones are — while failed is an attack or a misconfiguration.
-      They must not share a code path.
-
-### 3. NSEC3 validation ignores salt and iterations
-`dnssec.rs::validate_nsec3` destructures only `hash_algorithm` and
-`next_hashed_owner`, then hashes the query name with a single bare SHA-1 pass.
-RFC 5155 §5 requires the *salted, iterated* construction, so any NSEC3 record
-with a non-empty salt or a non-zero iteration count validates against the wrong
-hash. The code comment admits this ("simplified"). `hash_algorithm` is checked
-(must be 1); iterations and salt are parsed and stored but never read.
-
-- [ ] Implement the RFC 5155 §5 iterated hash.
-- [ ] Cap `iterations` when doing so. It is a `u16` off the wire and each
-      iteration hashes the whole name, so 65535 is a CPU amplification vector.
-      RFC 9276 says treat anything above 0 as suspect; a few hundred is a
-      generous ceiling. No cap is needed *today* only because the loop does not
-      exist yet.
+### 3. NSEC3 salt and iterations — done
+Was: `validate_nsec3` hashed the query name with a single bare SHA-1 pass,
+ignoring the salt and iteration count it had already parsed. Now
+`dnssec_denial::nsec3_hash` implements RFC 5155 §5 properly and is checked
+against the RFC's own Appendix A vectors. Iterations are capped at 150
+(RFC 9276); above that the hash is refused, which reads as insecure rather than
+bogus — a zone that signs itself unreasonably is not evidence of an attack.
 
 ### 4. Zone lookup is a linear scan
 `Zone::query` filters the whole record vector per query, and `matches_query`
@@ -243,13 +189,16 @@ touches. Fine at current zone sizes; the wrong shape as zones grow.
       (Note: the resolver's outbound source port is already randomized via
       `UdpSocket::bind("0.0.0.0:0")`. Do **not** "fix" the servers to reply from
       a random port — a reply must come from the port the query was sent to.)
-- [ ] `rdnsr` caches answer sections only, not authority/additional. Now that it
-      recurses, caching negative answers (RFC 2308) matters more than it did.
+- [ ] `rdnsr` caches answer sections only, not authority/additional. Negative
+      answers are now cached when validating (`NsecCache`, and far more
+      aggressively than RFC 2308 asks), but an *unvalidated* NXDOMAIN — which is
+      most of them, since validation is opt-in — is still re-resolved every
+      time. Plain RFC 2308 negative caching would cover that.
 - [ ] Zone parser: no `$INCLUDE`, and no parenthesized multi-line records — a
       parenthesized SOA fails the load.
 - [ ] TXT is stored as one blob, not split into `<character-string>`s (RFC 1035).
-- [ ] Canonical DNSSEC serialization does not lowercase embedded names (not
-      strict RFC 4034 §6.2).
+      Note this now has a second consequence: a TXT RRset's canonical form is
+      wrong too, so a signed TXT RRset with multiple strings will not verify.
 
 ---
 
@@ -344,6 +293,139 @@ in-process. They share one port across distinct loopback addresses, because glue
 carries an address and no port — which is also why `server_port` exists in the
 config.
 
+## Architecture: DNSSEC
+
+Four modules, split by what they know rather than by record type:
+
+| module | what it answers |
+|--------|-----------------|
+| `dnssec` | do these bytes verify under this key; does this DNSKEY hash to this DS |
+| `dnssec_denial` | does this NSEC/NSEC3 actually deny the thing being claimed |
+| `dnssec_chain` | trust anchors, and the verdict for one step of the chain |
+| `resolver` | fetching, ordering, caching — the async half |
+
+`dnssec_chain` is deliberately synchronous and takes records as arguments;
+fetching them means asking servers, which is the resolver's job. The resolver
+drives the loop and calls in at each step. That split is what makes the chain
+logic testable without a socket.
+
+**The load-bearing function is `dnssec::signed_data`.** A signature is not over
+the RRset as it arrived; it is over `RRSIG_RDATA(signature field removed) ||
+canonical RRset` (RFC 4035 §5.3.2), where canonical means the RRSIG's *original*
+TTL rather than the received one, owner names down-cased, a wildcard-expanded
+owner replaced by the wildcard that was really signed, embedded names down-cased
+for the RFC 4034 §6.2 types, and the records sorted by canonical RDATA with
+duplicates dropped. Sorting is by RDATA **alone**, not by the encoded RR: RDLEN
+sits between the fixed prefix and the RDATA, so sorting whole records orders by
+length first and puts a short RDATA ahead of a longer one that precedes it.
+
+**Four states, and the two that matter are Insecure and Bogus.** Insecure means
+the chain legitimately ended — a zone *proved* it has no DS — and is the normal
+case for most of the internet; the answer is served without AD. Bogus means the
+chain was supposed to continue and did not, and the answer is withheld. Conflate
+them and you either break the unsigned internet or launder attacks. Indeterminate
+is a third thing again: no trust anchor covers the name, so there was never a
+chain to walk.
+
+**DS is collected during the walk, not asked for afterwards.** A referral is the
+only moment the *parent's* side of a zone cut is in front of us. Querying the
+child for its own DS lets the child answer a question about itself; querying the
+parent again costs a round trip already spent. So `walk` reads each referral's
+authority section into `Resolution::cuts` as it goes past, and validation
+consumes what the walk collected. This is also why the delegation-cache shortcut
+is narrowed when validating: skipping ahead to a cached zone also skips the cut
+above it, so `best_start` only jumps to a zone whose keys are already validated —
+and `establish_chain` resumes at exactly the same place, or the two disagree and
+an answer that validated a moment ago comes back bogus.
+
+**A stripped DS must be bogus, not insecure.** Delete the DS records from a
+referral and a naive validator concludes "unsigned zone, nothing to check",
+downgrading every signed zone beneath it. So the absence of a DS is only
+believed when the parent *proves* it with a signed NSEC/NSEC3 — and the proof is
+verified as an RRset like any other, because an attacker can write NSEC records
+too. Opt-out (RFC 5155 §6) is the one case where a merely *covering* NSEC3
+suffices, and only with the flag actually set.
+
+**The key cache stores conclusions, not material.** `KeyCache` holds DNSKEY sets
+that have already been validated to an anchor, so a second query into a zone
+costs no revalidation. That makes its TTL load-bearing, hence the one-day cap.
+
+Failure is closed: `rdnsr` answers SERVFAIL on bogus, and never caches an answer
+as validated that was not. A client setting CD gets the data unfiltered
+(RFC 4035 §3.2.2) — it has said it validates for itself. AD goes out only for a
+Secure answer and only to a client that set DO or AD (RFC 6840 §5.8), and a
+client that did not set DO gets no DNSSEC records at all (RFC 4035 §3.2.1).
+
+**Algorithms:** ECDSA P-256/P-384 (13/14), RSA/SHA-256 and SHA-512 (8/10),
+Ed25519 (15), and RSA/SHA-1 (5/7) because a long tail of zones still uses it.
+Anything else — RSAMD5, DSA, GOST, Ed448 — is *unsupported*, which per RFC 4035
+§5.2 makes the delegation insecure rather than bogus: we have no basis to call an
+answer forged when we simply cannot read the signature.
+
+**Testing.** Port 53 is intercepted here (see "Verifying"), so there is no live
+signed zone to point at — which is precisely how this code came to be written
+without a genuine signature ever reaching it. `dnssec_test_util` generates real
+keys with `ring` and signs at test time; `resolver.rs` stands up a signed
+root → `test.` → `example.test.` hierarchy in-process and drives the whole
+resolve path through it, including the substituted-answer, unvouched-key,
+stripped-DS and proven-unsigned cases.
+
+## Architecture: aggressive use of validated denials (RFC 8198)
+
+An NSEC record does not say "this name does not exist". It says "nothing exists
+between these two names", and it is signed. A validator holding one therefore
+already knows the answer for *every* name in that gap, and asking the
+authoritative server again learns nothing it was not already told. `NsecCache`
+caches the gap rather than the question, which turns a flood of random names
+under one zone — a water-torture attack, or an ordinary typo storm — from one
+upstream query per name into one query per zone.
+
+This could not be bolted onto `DnsCache`. That maps `(name, type)` to records
+and can only answer the question it was asked; a gap has to be searched by
+*range*. So the proofs live in a `BTreeMap` ordered by
+`dnssec_denial::canonical_sort_key` — a byte encoding of the labels right to
+left, each terminated by a zero byte, whose plain `Ord` is exactly RFC 4034
+§6.1 canonical order. A covering lookup is then `range(..=key).next_back()`,
+falling back to the last entry for the record that wraps to the apex.
+
+Everything here is a way of *not* asking, so every mistake is invisible until it
+denies a name that exists. Five rules keep that from happening:
+
+- **Only Secure material is stored.** `rdnsr` inserts a denial only when
+  validation returned Secure. An unvalidated NSEC is an attacker's assertion
+  about which names do not exist, which is a denial-of-service primitive.
+- **Never across an opt-out NSEC3 span** (RFC 8198 §5.2). Opt-out means the span
+  may contain delegations the zone never named. Refused at *insert* rather than
+  at lookup, so no code path can consult one.
+- **Never below a delegation.** This one is not in the RFC's list and is the
+  easiest to get wrong. A gap says nothing exists *in this zone* between its
+  endpoints; if its lower edge is a delegation (NS set, SOA clear), everything
+  under that name lives in the child zone — and those names sort *inside* the
+  gap, because `sub.example.com.` and `x.sub.example.com.` are canonically
+  adjacent. Synthesizing there denies an entire zone we were never authoritative
+  for. `ZoneProofs::covering_nsec` refuses it, and a test pins the ordering fact
+  that makes it possible.
+- **NXDOMAIN needs the wildcard denied too**, or a name the gap covers could
+  still have been answered by a wildcard higher up. Rather than re-derive that
+  argument, the cache gathers the candidate records and hands them to the same
+  `dnssec_denial::proves_nxdomain` that validated them — a second implementation
+  would drift from the first.
+- **TTL is bounded by the proof**, not by the question: the minimum of the
+  proof records' remaining life and the SOA's negative TTL (RFC 2308 §5),
+  applied in one place to every record going out, so a client cannot re-cache a
+  proof for longer than we may hold it.
+
+At a delegation point the parent holds only the DS, so a NODATA there is
+synthesized for QTYPE=DS and refused for anything else — the real answer to
+those is a referral. ANY and RRSIG are never synthesized: neither can be
+reasoned about from a type bitmap.
+
+`rdnsr` checks the denial cache *before* the answer cache, and skips it entirely
+for a client with CD set — that client asked us not to filter on its behalf, and
+an answer we invented from cached proofs is exactly that. The cache is sized to
+zero unless `--dnssec-validate` is on, the same zero-capacity idiom `--no-cache`
+uses, so there is no configuration in which unvalidated proofs can enter it.
+
 ## Architecture: DNS over TCP (both daemons)
 
 Both daemons frame TCP messages with the RFC 1035 §4.2.2 2-byte big-endian
@@ -407,7 +489,9 @@ job is picking the response size limit.
 Two things `rdnsr` does *not* share with `rdnsd`: it doesn't run the
 `RequestValidator`, and it has no zone storage. `--no-cache` is a zero-capacity
 `DnsCache` (`put` is a no-op at 0) rather than an `Option`. `--dnssec-validate`
-parses but only warns — it does nothing until open item #2.
+turns on the chain walk described under "Architecture: DNSSEC"; the cache
+remembers each entry's validation state alongside it, so an answer served from
+cache carries the same AD bit the first client saw and no other.
 
 ---
 
@@ -416,6 +500,43 @@ parses but only warns — it does nothing until open item #2.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **Aggressive use of validated denials (RFC 8198)** — a validated NSEC/NSEC3 is
+  a signed statement about a *range* of names, so `NsecCache` stores the range
+  and answers every name in it without asking again. New
+  `dnssec_denial::canonical_sort_key` puts canonical name order into bytes so a
+  `BTreeMap` can do the covering lookup that `DnsCache`'s `(name, type)` key
+  cannot express. Guards: Secure material only, never across an opt-out NSEC3
+  span, never below a delegation, wildcard denial required for NXDOMAIN, TTL
+  bounded by the proof. See "Architecture: aggressive use".
+- **DNSSEC validation on the resolve path** — the chain of trust is walked from
+  a trust anchor down to the answer and enforced behind `rdnsr
+  --dnssec-validate` (`--trust-anchor <file>` to override the built-in ICANN
+  root key). New modules `dnssec_chain` (anchors, states, per-step verdicts) and
+  `dnssec_denial` (NSEC/NSEC3, canonical name ordering, type bitmaps,
+  base32hex); `dnssec` rewritten around RFC 4035 §5.3.2 signed-data assembly.
+  See "Architecture: DNSSEC".
+- **The DNSSEC primitives had never run against a real signature, and did not
+  work.** Every test fed `b"test"` as the signed data, so nothing exercised the
+  crypto. Once real signatures were put through it: the signed-data assembly
+  did not exist (no RRSIG prefix, no canonical ordering, no original-TTL
+  substitution, no wildcard reconstruction); the DS digest omitted the owner
+  name, so no real DS could ever match; ECDSA keys were handed to `ring` without
+  the SEC1 `0x04` prefix, so algorithm 13/14 could never verify; the algorithm
+  dispatch mapped 8 to ECDSA and 5/7 to RSA/SHA-256 and SHA-512, all wrong
+  against IANA; and `construct_rsa_public_key_der` emitted DER with broken
+  length encoding and no sign padding (replaced by `ring`'s
+  `RsaPublicKeyComponents`, which needs no DER at all).
+- **RRSIG expiration and inception were swapped in the codec** — RFC 4034 §3.1
+  puts expiration first. Invisible to a round-trip test because both halves
+  agreed; against a genuine RRSIG it read an expired signature as current.
+- **The root name decoded as `""` rather than `"."`** — every other name gets
+  its trailing dot from its last label and the root has none. With 0x20 on, the
+  reply check compares the echoed question byte-for-byte, so *every query for
+  the root name was rejected as a mismatch*. Only surfaced when the validator
+  started asking for `./DNSKEY`, which it does before anything else.
+- **NSEC name ordering was string comparison**, not the RFC 4034 §6.1 ordering
+  by label from the right, so a range check would accept names outside the gap
+  it was given (`a.z.example.com.` vs `b.example.com.` sort opposite ways).
 - **IPv6 root hints + `--root-hints` flag** — the built-in hints now ship both
   families (the 13 AAAA addresses too), interleaved v4/v6 so either stack is
   reached in the first hop or two. `query_server` binds a send socket of the
@@ -537,3 +658,69 @@ msg.to_bytes_within(max)?         // truncates + sets TC=1, keeps question + OPT
 // low 4 bits and the OPT TTL's top byte; try_from_bytes reassembles it. An RCODE
 // above 15 without an OPT record in `additionals` is a to_bytes error.
 ```
+
+## Quick reference: the DNSSEC API
+
+```rust
+// Typed views. Each carries its owner name, because a key or a digest applied
+// at the wrong name is the bug these exist to prevent.
+Dnskey::from_record(&rr)   // -> Option<Dnskey>;  .key_tag(), .is_zone_key()
+Rrsig::from_record(&rr)    // -> Option<Rrsig>;   .is_current(now), .is_wildcard_expansion()
+Ds::from_record(&rr)       // -> Option<Ds>;      .matches_key(&dnskey)
+
+// The bytes a signature actually covers (RFC 4035 §5.3.2).
+dnssec::signed_data(&rrsig, owner, class, &rdatas)?
+
+// The leaf validator. `zone` is the only zone allowed to have signed this.
+let proof = dnssec::verify_rrset(
+    &Rrset::new(owner, rtype, class, &rdatas), &rrsigs, &keys, zone, now);
+// RrsetProof::{ Verified { wildcard, expires }, Unsigned, Bogus(why), Unsupported(why) }
+//   Unsigned  != Bogus: no signature at all is normal, a failed one is not.
+//   Unsupported: an algorithm we cannot read -> insecure, never bogus.
+
+// Denial of existence. Names compare by canonical_name_cmp, NOT as strings.
+dnssec_denial::nsec3_hash(name, salt, iterations)?   // capped at MAX_NSEC3_ITERATIONS
+dnssec_denial::proves_no_ds(zone, &nsecs, &nsec3s)   // -> Denial::{Proved, NotProved(why)}
+dnssec_denial::proves_nxdomain(qname, zone, &nsecs, &nsec3s)
+dnssec_denial::proves_nodata(qname, qtype, &nsecs, &nsec3s)
+
+// The chain, one step at a time. Fetching is the resolver's job, not this API's.
+let v = ChainValidator::new(&anchors, now);
+v.start(name)                                  // -> Option<(anchor zone, its DS)>
+v.validate_dnskeys(zone, &records, &ds_set)?   // -> Vec<Dnskey>, or a ValidationState
+v.validate_delegation(&evidence, parent, &parent_keys)  // -> DelegationVerdict
+v.validate_records(&records, &keystore)        // -> ValidationState
+
+// End to end, from the resolver:
+let (answer, state) = resolver.resolve_validated(&query).await?;
+// ValidationState::{ Secure, Insecure, Bogus(why), Indeterminate(why) }
+//   Secure       -> may set AD
+//   Insecure     -> serve it, no AD (provably unsigned: most of the internet)
+//   Bogus        -> SERVFAIL, and never cache
+//   Indeterminate-> no anchor covers the name; we never looked
+```
+
+## Quick reference: the denial cache
+
+```rust
+// Zero zones disables it entirely — the same idiom --no-cache uses.
+let denials = NsecCache::new(1000);
+
+// Store a denial. ONLY for an answer that validated as Secure: nothing here
+// re-checks a signature, so the caller's validation is the whole basis for
+// trusting these records later. Needs a SOA in the authority section (it names
+// the zone and bounds the negative TTL) or the response is ignored.
+denials.insert_validated(&response);
+
+// Answer from a cached gap, or None to go and ask. None is always safe and is
+// what comes back whenever anything is in doubt.
+if let Some(s) = denials.synthesize(&qname, qtype) {
+    // s.rcode     -> NoSuchDomain, or Ok for NODATA
+    // s.authority -> SOA + the proof records, TTLs already counted down
+    // s.ttl       -> min(proof remaining, SOA negative TTL)
+}
+```
+
+Deliberately refused, each for a reason worth keeping: QTYPE ANY and RRSIG;
+anything below a delegation; NODATA at a delegation for any type but DS;
+opt-out NSEC3 spans (rejected at insert); NXDOMAIN without a wildcard denial.

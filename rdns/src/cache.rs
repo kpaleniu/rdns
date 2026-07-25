@@ -8,6 +8,14 @@ use crate::utils::current_unix_timestamp;
 struct CacheEntry {
     records: Vec<ResourceRecord>,
     expires_at: u64, // Unix timestamp
+    /// Whether this answer was DNSSEC-validated when it was stored.
+    ///
+    /// Cached alongside the records because the AD bit has to survive the
+    /// cache: an answer served from here is the same answer, and dropping the
+    /// flag would make the first client see AD and every later one not. The
+    /// converse matters more — an unvalidated answer must never pick the bit up
+    /// on its way back out.
+    secure: bool,
 }
 
 impl CacheEntry {
@@ -39,26 +47,48 @@ impl DnsCache {
 
     /// Get cached records for a query (domain_name, record_type)
     pub fn get(&self, name: &str, qtype: u16) -> Option<Vec<ResourceRecord>> {
+        self.get_validated(name, qtype).map(|(records, _)| records)
+    }
+
+    /// As [`DnsCache::get`], but also reporting whether the answer was
+    /// DNSSEC-validated when it was stored.
+    pub fn get_validated(&self, name: &str, qtype: u16) -> Option<(Vec<ResourceRecord>, bool)> {
         let now = current_unix_timestamp();
         let mut cache = self.cache.lock().unwrap();
-        
+
         let key = (name.to_lowercase(), qtype);
-        
+
         // Check if entry exists and is not expired
         if let Some(entry) = cache.get(&key) {
             if !entry.is_expired(now) {
-                return Some(entry.records.clone());
+                return Some((entry.records.clone(), entry.secure));
             } else {
                 // Remove expired entry
                 cache.remove(&key);
             }
         }
-        
+
         None
     }
 
-    /// Put records in cache with TTL
+    /// Put records in cache with TTL, unvalidated.
     pub fn put(&self, name: &str, qtype: u16, records: Vec<ResourceRecord>) {
+        self.put_validated(name, qtype, records, false)
+    }
+
+    /// Put records in cache, remembering whether they were DNSSEC-validated.
+    ///
+    /// `secure` must be what validation actually concluded. Storing an answer
+    /// as validated that was not is the one mistake a cache can make that
+    /// outlives the query: every later client is told the data is authentic on
+    /// the strength of a check that never happened.
+    pub fn put_validated(
+        &self,
+        name: &str,
+        qtype: u16,
+        records: Vec<ResourceRecord>,
+        secure: bool,
+    ) {
         if records.is_empty() || self.max_entries == 0 {
             return;
         }
@@ -84,6 +114,7 @@ impl DnsCache {
         cache.insert(key, CacheEntry {
             records,
             expires_at,
+            secure,
         });
     }
 
@@ -128,6 +159,7 @@ impl DnsCache {
         cache.insert(key, CacheEntry {
             records: Vec::new(),
             expires_at,
+            secure: false,
         });
     }
 

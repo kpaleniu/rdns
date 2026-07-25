@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use rdns::dnssec_chain::{TrustAnchors, ValidationState};
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode};
+use rdns::nsec_cache::NsecCache;
+use rdns::utils::record_types;
 use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, QuerySection, ResourceRecord, ResponseCode, EDNS_VERSION,
     OPT_RECORD_TYPE,
@@ -31,6 +34,25 @@ const MAX_TCP_CONNECTIONS: usize = 128;
 /// channel's depth, so a client that pipelines faster than it reads eventually
 /// pushes back on our read loop instead of growing a queue in memory.
 const MAX_INFLIGHT_PER_CONNECTION: usize = 16;
+
+/// Zones whose validated denial proofs we keep for aggressive use (RFC 8198).
+///
+/// Counted in zones rather than records because that is the unit that pays off:
+/// one zone's NSEC chain answers for every non-existent name in it, so a
+/// thousand zones covers the whole tail of a random-name flood. `NsecCache`
+/// bounds the records within each zone separately.
+const NSEC_CACHE_ZONES: usize = 1000;
+
+/// What `rdnsr` remembers between queries.
+///
+/// Two caches with different shapes, which is why they are not one. `answers`
+/// maps a question to its answer. `denials` maps a *range* of names to the
+/// signed statement that none of them exist — a lookup the first cannot express,
+/// and the whole point of RFC 8198.
+struct Caches {
+    answers: DnsCache,
+    denials: NsecCache,
+}
 
 /// Which transport a query arrived on.
 ///
@@ -77,10 +99,18 @@ struct Cli {
     /// Disable caching entirely.
     #[arg(long)]
     no_cache: bool,
-    /// Validate DNSSEC on resolved answers. Accepted but not yet enforced
-    /// (validation is not wired into the resolve path — see TODO open item #2).
+    /// Validate DNSSEC on resolved answers: walk the chain of trust from a
+    /// trust anchor, set AD only on answers that verify, and refuse to serve
+    /// ones that fail (SERVFAIL, unless the client sets CD).
     #[arg(long)]
     dnssec_validate: bool,
+    /// Trust anchors in DS presentation format, replacing the built-in ICANN
+    /// root key. Only used with --dnssec-validate.
+    ///
+    /// A file rather than a rebuild, because the root KSK rolls over and a
+    /// binary compiled before the roll is wrong until it is rebuilt.
+    #[arg(long)]
+    trust_anchor: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -115,6 +145,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // DNSSEC. The built-in ICANN root key is the fallback so a plain
+    // --dnssec-validate works out of the box; --trust-anchor overrides it, and
+    // is what to reach for when the root KSK rolls.
+    let mut dnssec_source = String::new();
+    if cli.dnssec_validate {
+        let anchors = match &cli.trust_anchor {
+            Some(path) => {
+                dnssec_source = format!(", DNSSEC validating from {}", path.display());
+                TrustAnchors::from_file(path)?
+            }
+            None => {
+                dnssec_source = ", DNSSEC validating from the built-in root anchor".to_string();
+                TrustAnchors::icann_root()
+            }
+        };
+        config.dnssec = Some(anchors);
+    } else if cli.trust_anchor.is_some() {
+        eprintln!("warning: --trust-anchor does nothing without --dnssec-validate");
+    }
+
     let source = match config.mode {
         ResolverMode::Recurse if custom_hints => {
             format!("recursing from {} root hints in {}", config.root_hints.len(), cli.root_hints.as_ref().unwrap().display())
@@ -125,13 +175,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolver = Arc::new(Resolver::new(config));
 
     // A zero-capacity cache never stores (DnsCache::put is a no-op at 0), so
-    // --no-cache is just a cache sized to hold nothing.
+    // --no-cache is just a cache sized to hold nothing. The denial cache is
+    // sized the same way, and additionally to zero when we are not validating:
+    // aggressive use rests entirely on the proofs having been checked, so
+    // without validation there is nothing legitimate to put in it.
     let capacity = if cli.no_cache { 0 } else { cli.cache_size };
-    let cache = Arc::new(DnsCache::new(capacity));
-
-    if cli.dnssec_validate {
-        eprintln!("warning: --dnssec-validate is accepted but not yet enforced");
-    }
+    let denial_zones = if cli.no_cache || !cli.dnssec_validate {
+        0
+    } else {
+        NSEC_CACHE_ZONES
+    };
+    let caches = Arc::new(Caches {
+        answers: DnsCache::new(capacity),
+        denials: NsecCache::new(denial_zones),
+    });
 
     let addr = format!("{}:{}", cli.host, cli.port);
     // Both transports are mandatory for a resolver: when an answer overflows the
@@ -141,14 +198,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = Arc::new(UdpSocket::bind(&addr).await?);
     let listener = TcpListener::bind(&addr).await?;
     println!(
-        "rdnsr listening on {} (UDP+TCP), {}, cache: {}",
+        "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}",
         addr,
         source,
         if capacity == 0 { "disabled".to_string() } else { format!("{capacity} entries") },
+        dnssec_source,
     );
 
-    let udp = tokio::spawn(udp_main(socket, resolver.clone(), cache.clone()));
-    let tcp = tokio::spawn(tcp_main(listener, resolver, cache));
+    let udp = tokio::spawn(udp_main(socket, resolver.clone(), caches.clone()));
+    let tcp = tokio::spawn(tcp_main(listener, resolver, caches));
 
     // Neither loop returns in normal operation; whichever fails first takes the
     // process down rather than leaving us serving one transport.
@@ -163,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn udp_main(
     socket: Arc<UdpSocket>,
     resolver: Arc<Resolver>,
-    cache: Arc<DnsCache>,
+    caches: Arc<Caches>,
 ) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 4096];
     loop {
@@ -171,9 +229,9 @@ async fn udp_main(
         let data = buf[..n].to_vec();
         let socket = socket.clone();
         let resolver = resolver.clone();
-        let cache = cache.clone();
+        let caches = caches.clone();
         tokio::spawn(async move {
-            if let Some(reply) = handle_query(data, &resolver, &cache, Transport::Udp).await {
+            if let Some(reply) = handle_query(data, &resolver, &caches, Transport::Udp).await {
                 let _ = socket.send_to(&reply, peer).await;
             }
         });
@@ -184,7 +242,7 @@ async fn udp_main(
 async fn tcp_main(
     listener: TcpListener,
     resolver: Arc<Resolver>,
-    cache: Arc<DnsCache>,
+    caches: Arc<Caches>,
 ) -> Result<(), std::io::Error> {
     let permits = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
     loop {
@@ -194,9 +252,9 @@ async fn tcp_main(
             continue;
         };
         let resolver = resolver.clone();
-        let cache = cache.clone();
+        let caches = caches.clone();
         tokio::spawn(async move {
-            serve_connection(stream, resolver, cache).await;
+            serve_connection(stream, resolver, caches).await;
             drop(permit);
         });
     }
@@ -212,7 +270,7 @@ async fn tcp_main(
 async fn serve_connection(
     stream: TcpStream,
     resolver: Arc<Resolver>,
-    cache: Arc<DnsCache>,
+    caches: Arc<Caches>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_INFLIGHT_PER_CONNECTION);
@@ -259,10 +317,10 @@ async fn serve_connection(
             break;
         };
         let resolver = resolver.clone();
-        let cache = cache.clone();
+        let caches = caches.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            if let Some(reply) = handle_query(buf, &resolver, &cache, Transport::Tcp).await {
+            if let Some(reply) = handle_query(buf, &resolver, &caches, Transport::Tcp).await {
                 // Length prefix and message in one buffer, so the writer emits
                 // them in a single call.
                 let mut framed = Vec::with_capacity(2 + reply.len());
@@ -288,7 +346,7 @@ async fn serve_connection(
 async fn handle_query(
     data: Vec<u8>,
     resolver: &Arc<Resolver>,
-    cache: &Arc<DnsCache>,
+    caches: &Arc<Caches>,
     transport: Transport,
 ) -> Option<Vec<u8>> {
     let msg = DnsMessage::try_from_bytes(&data).ok()?;
@@ -316,25 +374,101 @@ async fn handle_query(
         _ => {}
     }
     let client_uses_edns = msg.has_edns();
+    // What the client asked for, DNSSEC-wise. DO means "send me the signatures";
+    // CD means "don't withhold anything on my behalf, I validate myself".
+    let client_wants_dnssec = msg.edns().ok().flatten().is_some_and(|e| e.do_bit);
+    let checking_disabled = msg.cd;
 
-    // Build the response: from cache if we have it, else by forwarding upstream.
-    let mut resp = if let Some(records) = cache.get(&query.qname, query.qtype) {
-        build_response(id, &query, records, ResponseCode::Ok, recursion)
+    // Aggressive use of the validated denial cache (RFC 8198). A cached NSEC
+    // does not answer one question, it answers every question in its gap, so
+    // this is checked before the answer cache: a flood of random names under one
+    // zone costs a single upstream query rather than one per name.
+    //
+    // A client with CD set has asked us not to filter on its behalf, and an
+    // answer we invented from cached proofs is exactly that, so it goes
+    // upstream instead.
+    if !checking_disabled {
+        if let Some(denial) = caches.denials.synthesize(&query.qname, query.qtype) {
+            let mut resp = build_response(id, &query, Vec::new(), denial.rcode, recursion);
+            resp.authorities = denial.authority;
+            // The proofs were validated before they were stored, so the answer
+            // derived from them is authentic on the same terms as the original.
+            resp.ad = client_wants_dnssec || msg.ad;
+            return finish(resp, client_uses_edns, client_wants_dnssec, &query, client_max);
+        }
+    }
+
+    // Build the response: from cache if we have it, else by resolving.
+    let (mut resp, secure) = if let Some((records, secure)) =
+        caches.answers.get_validated(&query.qname, query.qtype)
+    {
+        (
+            build_response(id, &query, records, ResponseCode::Ok, recursion),
+            secure,
+        )
     } else {
-        // Resolver::resolve is async — each upstream round trip is an await, so
-        // this yields the task rather than holding a thread for the resolution.
-        match resolver.resolve(&query).await {
-            Ok(mut upstream) => {
+        // Resolver::resolve_validated is async — each upstream round trip is an
+        // await, so this yields the task rather than holding a thread.
+        match resolver.resolve_validated(&query).await {
+            Ok((mut upstream, state)) => {
                 // The resolver used its own random transaction id; the reply
                 // must echo the client's id and advertise recursion.
                 upstream.id = id;
                 upstream.response = true;
                 upstream.recursion = recursion;
                 upstream.recursion_ok = true;
-                if !upstream.answers.is_empty() {
-                    cache.put(&query.qname, query.qtype, upstream.answers.clone());
+
+                if let ValidationState::Bogus(ref why) = state {
+                    eprintln!(
+                        "resolve {} type {}: DNSSEC validation failed: {why}",
+                        query.qname, query.qtype
+                    );
+                    // Fail closed. Data we know we cannot authenticate is worse
+                    // than no data: the client has no way to tell it apart from
+                    // an answer that was checked, so serving it launders an
+                    // attack into an ordinary-looking reply. A client that sets
+                    // CD has said it will do its own checking, and RFC 4035
+                    // §3.2.2 requires we hand the data over unfiltered.
+                    if !checking_disabled {
+                        let resp = build_response(
+                            id,
+                            &query,
+                            Vec::new(),
+                            ResponseCode::ServerFailure,
+                            recursion,
+                        );
+                        return finish(
+                            resp,
+                            client_uses_edns,
+                            client_wants_dnssec,
+                            &query,
+                            client_max,
+                        );
+                    }
                 }
-                upstream
+
+                let secure = state.is_secure();
+                // Never store an answer as validated that was not, and never
+                // store one at all if it failed: a bogus answer in the cache is
+                // an attack that outlives the query that carried it.
+                if !upstream.answers.is_empty() && !state.is_bogus() {
+                    caches.answers.put_validated(
+                        &query.qname,
+                        query.qtype,
+                        upstream.answers.clone(),
+                        secure,
+                    );
+                }
+                // A validated "no" is worth more than the question that
+                // produced it — the NSEC covers a whole range of names — so it
+                // goes into the denial cache. Only when Secure: aggressive use
+                // rests entirely on the proof having been checked, and an
+                // unvalidated NSEC is an attacker's claim about which names do
+                // not exist.
+                if upstream.answers.is_empty() && secure {
+                    caches.denials.insert_validated(&upstream);
+                }
+                (upstream, secure)
             }
             // Resolution failed: say why, then SERVFAIL. A resolver that turns
             // every failure into a bare SERVFAIL is undiagnosable from the
@@ -345,16 +479,58 @@ async fn handle_query(
                     "resolve {} type {} failed: {:#}",
                     query.qname, query.qtype, e
                 );
-                build_response(id, &query, Vec::new(), ResponseCode::ServerFailure, recursion)
+                (
+                    build_response(id, &query, Vec::new(), ResponseCode::ServerFailure, recursion),
+                    false,
+                )
             }
         }
     };
+
+    // The AD bit goes on only for an answer we actually authenticated, and only
+    // for a client that asked about it (RFC 6840 §5.8) — to anyone else it is
+    // noise, and to a client behind an untrusted link it is not evidence of
+    // anything anyway.
+    resp.ad = secure && (client_wants_dnssec || msg.ad);
+    resp.cd = checking_disabled;
+
+    finish(resp, client_uses_edns, client_wants_dnssec, &query, client_max)
+}
+
+/// Final shaping common to every reply: OPT mirroring, stripping DNSSEC records
+/// a client did not ask for, and the size limit.
+fn finish(
+    mut resp: DnsMessage,
+    client_uses_edns: bool,
+    client_wants_dnssec: bool,
+    query: &QuerySection,
+    client_max: usize,
+) -> Option<Vec<u8>> {
+    // A client that did not set DO gets no DNSSEC records (RFC 4035 §3.2.1) —
+    // it did not ask for them, they are large, and it has no use for them.
+    // Records it asked for by type are a different matter and stay.
+    if !client_wants_dnssec {
+        let asked_for = |rtype: u16| query.qtype == rtype;
+        let keep = |rr: &ResourceRecord| match rr.rdata.rtype {
+            record_types::RRSIG | record_types::NSEC | record_types::NSEC3 => false,
+            record_types::DNSKEY | record_types::DS => asked_for(rr.rdata.rtype),
+            _ => true,
+        };
+        resp.answers.retain(keep);
+        resp.authorities.retain(keep);
+        resp.additionals
+            .retain(|rr| rr.rdata.rtype == OPT_RECORD_TYPE || keep(rr));
+    }
 
     // Only include an OPT record when the client used EDNS (RFC 6891 §6.1.1);
     // otherwise strip any OPT the upstream added so we don't reply with
     // unsolicited EDNS.
     if client_uses_edns {
-        resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE)).ok()?;
+        let mut edns = Edns::with_payload_size(RDNSR_PAYLOAD_SIZE);
+        // Mirror DO back: it tells the client the signatures it sees were
+        // deliberate rather than leftovers.
+        edns.do_bit = client_wants_dnssec;
+        resp.set_edns(edns).ok()?;
     } else {
         resp.additionals.retain(|rr| rr.rdata.rtype != OPT_RECORD_TYPE);
     }
