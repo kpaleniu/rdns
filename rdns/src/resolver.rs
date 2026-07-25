@@ -8,31 +8,43 @@
 //! differs, and mixed deployments (forward one zone, recurse the rest) are
 //! ordinary. See [`ResolverMode`].
 //!
-//! Everything here is synchronous `std::net`. `rdnsr` drives it from
-//! `spawn_blocking`, so a resolution that takes several round trips occupies a
-//! blocking thread rather than an async task. That is a deliberate trade for
-//! now — see the note on [`Resolver::recurse`].
+//! Everything here is async `tokio::net`. Each hop is an `await` on a socket, so
+//! a resolution that takes several round trips yields its task at every round
+//! trip rather than pinning a thread for the sum of them. `rdnsr` awaits
+//! `resolve` directly. See the note on [`Resolver::recurse`].
 
 use crate::utils::current_unix_timestamp;
 use crate::{DnsMessage, Edns, ParsedRecord, QuerySection, ResponseCode};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Duration;
 use anyhow::anyhow;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 
 /// A DNS message sent over TCP is prefixed with a 2-byte big-endian length
 /// (RFC 1035 §4.2.2), so no message can exceed what that field can express.
 const TCP_MAX_MESSAGE: usize = u16::MAX as usize;
 
-/// The IPv4 addresses of the 13 root servers, used to prime recursion.
+/// The NS record type. Intermediate QNAME-minimized probes ask for this so a
+/// zone cut shows up as a referral while a plain name in the current zone comes
+/// back as NODATA, without revealing the leaf being resolved (RFC 9156).
+const TYPE_NS: u16 = 2;
+
+/// The IPv4 and IPv6 addresses of the 13 root servers, used to prime recursion.
 ///
 /// Hard-coded as a fallback the way every resolver ships one; these do change
 /// (b.root-servers.net moved to 170.247.170.2 in 2023), so a deployment that
-/// cares should load the published hints file instead — `root_hints` in
-/// [`ResolverConfig`] is what to override. A stale entry degrades rather than
-/// breaks: servers are tried in turn until one answers.
+/// cares should load the published hints file instead — [`parse_root_hints`]
+/// reads that format, and `root_hints` in [`ResolverConfig`] is what to
+/// override with the result. A stale entry degrades rather than breaks: servers
+/// are tried until one answers, and RTT selection demotes the ones that don't.
+///
+/// Both families are shipped so a v6 deployment is not stuck behind v4; the two
+/// are interleaved into `root_hints` (a, a-v6, b, b-v6, …) so whichever family
+/// works is reached within a hop or two on the very first query, before any RTT
+/// is known.
 const ROOT_HINTS: [Ipv4Addr; 13] = [
     Ipv4Addr::new(198, 41, 0, 4),      // a.root-servers.net
     Ipv4Addr::new(170, 247, 170, 2),   // b
@@ -48,6 +60,54 @@ const ROOT_HINTS: [Ipv4Addr; 13] = [
     Ipv4Addr::new(199, 7, 83, 42),     // l
     Ipv4Addr::new(202, 12, 27, 33),    // m
 ];
+
+/// The IPv6 (AAAA) addresses of the same 13 root servers, in the same order.
+const ROOT_HINTS_V6: [Ipv6Addr; 13] = [
+    Ipv6Addr::new(0x2001, 0x503, 0xba3e, 0, 0, 0, 0x2, 0x30), // a
+    Ipv6Addr::new(0x2801, 0x1b8, 0x10, 0, 0, 0, 0, 0xb),      // b
+    Ipv6Addr::new(0x2001, 0x500, 0x2, 0, 0, 0, 0, 0xc),       // c
+    Ipv6Addr::new(0x2001, 0x500, 0x2d, 0, 0, 0, 0, 0xd),      // d
+    Ipv6Addr::new(0x2001, 0x500, 0xa8, 0, 0, 0, 0, 0xe),      // e
+    Ipv6Addr::new(0x2001, 0x500, 0x2f, 0, 0, 0, 0, 0xf),      // f
+    Ipv6Addr::new(0x2001, 0x500, 0x12, 0, 0, 0, 0, 0xd0d),    // g
+    Ipv6Addr::new(0x2001, 0x500, 0x1, 0, 0, 0, 0, 0x53),      // h
+    Ipv6Addr::new(0x2001, 0x7fe, 0, 0, 0, 0, 0, 0x53),        // i
+    Ipv6Addr::new(0x2001, 0x503, 0xc27, 0, 0, 0, 0x2, 0x30),  // j
+    Ipv6Addr::new(0x2001, 0x7fd, 0, 0, 0, 0, 0, 0x1),         // k
+    Ipv6Addr::new(0x2001, 0x500, 0x9f, 0, 0, 0, 0, 0x42),     // l
+    Ipv6Addr::new(0x2001, 0xdc3, 0, 0, 0, 0, 0, 0x35),        // m
+];
+
+/// Parse root hints in the published `named.root` format, returning every A and
+/// AAAA address it lists (port 53, the only port a root speaks on).
+///
+/// The NS lines that name the servers are ignored — only the addresses prime
+/// recursion — as is anything after a `;` comment. A line whose address does not
+/// parse is skipped rather than failing the whole file, so one stray entry does
+/// not sink an otherwise good hints file; the caller decides what an empty
+/// result means.
+pub fn parse_root_hints(text: &str) -> Vec<SocketAddr> {
+    let mut hints = Vec::new();
+    for line in text.lines() {
+        // named.root comments start with ';'.
+        let line = line.split(';').next().unwrap_or("");
+        // Layout is NAME TTL [CLASS] TYPE RDATA. Scan for the A/AAAA type token
+        // and take the next token as the address; that tolerates the optional
+        // class and any spacing without hard-coding column positions. The owner
+        // name "A.ROOT-SERVERS.NET." is not equal to the bare type "A", so it
+        // does not trip the match.
+        let mut tokens = line.split_whitespace();
+        while let Some(tok) = tokens.next() {
+            if tok.eq_ignore_ascii_case("A") || tok.eq_ignore_ascii_case("AAAA") {
+                if let Some(Ok(ip)) = tokens.next().map(str::parse::<IpAddr>) {
+                    hints.push(SocketAddr::new(ip, 53));
+                }
+                break;
+            }
+        }
+    }
+    hints
+}
 
 /// How the resolver obtains an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +148,18 @@ pub struct ResolverConfig {
     /// How many zone delegations to remember. 0 disables the cache, which makes
     /// every query restart at the root — correct, but only acceptable in tests.
     pub delegation_cache_size: usize,
+    /// Whether to minimize the query name sent up the delegation chain
+    /// (RFC 9156). With it on, each server is asked only for the label being
+    /// delegated rather than the full name, so the root learns the TLD and no
+    /// more; the leaf is revealed only to the server authoritative for it. On by
+    /// default, as the RFC asks; turn it off to send the full name at every hop.
+    pub qname_minimization: bool,
+    /// Whether to randomize the case of letters in the outgoing query name
+    /// (draft-vixie-dnsext-dns0x20). A response must echo the question, so the
+    /// random casing is entropy an off-path spoofer has to guess on top of the
+    /// transaction id and source port. On by default; turn it off for the rare
+    /// authoritative server or middlebox that does not preserve case.
+    pub zero_x20: bool,
     /// Port to contact a nameserver on once we have learned its address.
     ///
     /// Always 53 in practice — glue and address records carry an address but no
@@ -105,9 +177,17 @@ impl Default for ResolverConfig {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
             ],
+            // Interleaved v4/v6 so whichever family the host has is reached in
+            // the first hop or two, before RTT selection has anything to go on.
             root_hints: ROOT_HINTS
                 .iter()
-                .map(|ip| SocketAddr::new(IpAddr::V4(*ip), 53))
+                .zip(ROOT_HINTS_V6.iter())
+                .flat_map(|(v4, v6)| {
+                    [
+                        SocketAddr::new(IpAddr::V4(*v4), 53),
+                        SocketAddr::new(IpAddr::V6(*v6), 53),
+                    ]
+                })
                 .collect(),
             timeout_ms: 5000,
             max_delegations: 16,
@@ -115,6 +195,8 @@ impl Default for ResolverConfig {
             query_budget: 64,
             udp_payload_size: 4096,
             delegation_cache_size: 10_000,
+            qname_minimization: true,
+            zero_x20: true,
             server_port: 53,
         }
     }
@@ -216,6 +298,89 @@ impl DelegationCache {
     }
 }
 
+/// A smoothed round-trip time per nameserver, so a zone's servers can be tried
+/// fastest-first instead of always in the order they were learned.
+///
+/// This is what stops every query for a zone from waiting on the same slow or
+/// dead server before falling through to a working one. Kept as an exponentially
+/// weighted moving average the way BIND and Unbound track SRTT: one bad sample
+/// nudges a server down the order rather than banishing it, and a run of good
+/// ones pulls it back.
+#[derive(Debug)]
+struct RttStore {
+    rtts: Mutex<HashMap<SocketAddr, f64>>,
+    capacity: usize,
+}
+
+/// Weight given to the newest sample in the moving average. 0.25 is the classic
+/// SRTT smoothing factor (RFC 6298 for TCP): responsive but not twitchy.
+const RTT_ALPHA: f64 = 0.25;
+
+/// What an unmeasured server is assumed to cost, in milliseconds. Sorts between
+/// a fast known server and a known-bad one, so a fresh set of servers is tried
+/// in the order given while a measured-fast server still wins over an untried
+/// one, and an untried one still wins over a server that has been timing out.
+const UNKNOWN_RTT_MS: f64 = 100.0;
+
+impl RttStore {
+    fn new(capacity: usize) -> Self {
+        RttStore {
+            rtts: Mutex::new(HashMap::new()),
+            capacity,
+        }
+    }
+
+    /// The stored SRTT for a server, or [`UNKNOWN_RTT_MS`] if we've never timed
+    /// it.
+    fn get(&self, server: &SocketAddr) -> f64 {
+        self.rtts
+            .lock()
+            .ok()
+            .and_then(|m| m.get(server).copied())
+            .unwrap_or(UNKNOWN_RTT_MS)
+    }
+
+    /// Fold a new round-trip sample (or a timeout, on failure) into a server's
+    /// average. The first sample is taken as-is; later ones are smoothed.
+    fn record(&self, server: &SocketAddr, sample_ms: f64) {
+        if self.capacity == 0 {
+            return;
+        }
+        let Ok(mut m) = self.rtts.lock() else {
+            return;
+        };
+        match m.get_mut(server) {
+            Some(srtt) => *srtt = (1.0 - RTT_ALPHA) * *srtt + RTT_ALPHA * sample_ms,
+            None => {
+                // At capacity, drop the slowest entry — the one we would
+                // deprioritize anyway, and lose least by re-learning as unknown.
+                if m.len() >= self.capacity {
+                    if let Some(worst) = m
+                        .iter()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(k, _)| *k)
+                    {
+                        m.remove(&worst);
+                    }
+                }
+                m.insert(*server, sample_ms);
+            }
+        }
+    }
+
+    /// `servers` reordered fastest-known-first, ties keeping their input order
+    /// (so a freshly learned, all-unmeasured set is tried as given).
+    fn order(&self, servers: &[SocketAddr]) -> Vec<SocketAddr> {
+        let mut ranked: Vec<(usize, SocketAddr, f64)> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, *s, self.get(s)))
+            .collect();
+        ranked.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.0.cmp(&b.0)));
+        ranked.into_iter().map(|(_, s, _)| s).collect()
+    }
+}
+
 /// A name and every zone above it, deepest first: `www.example.com.` yields
 /// `www.example.com.`, `example.com.`, `com.`, `.`.
 fn ancestors(name: &str) -> Vec<String> {
@@ -244,6 +409,15 @@ struct Referral {
     ttl: u64,
 }
 
+/// A serialized query, kept alongside the two things a reply must match to be
+/// accepted: the transaction id and the exact (possibly 0x20-cased) question
+/// name we put on the wire.
+struct OutgoingQuery {
+    buf: Vec<u8>,
+    id: u16,
+    qname: String,
+}
+
 /// Tracks how much work one client query has cost us.
 struct Budget {
     remaining: usize,
@@ -270,14 +444,20 @@ pub struct Resolver {
     /// Shared across concurrent resolutions — `rdnsr` holds one `Resolver` in an
     /// `Arc` and resolves from many threads at once.
     delegations: DelegationCache,
+    /// Per-server round-trip times, so a zone's servers are tried fastest-first.
+    /// Shares its bound with the delegation cache (0 disables both the recording
+    /// and, harmlessly, the reordering — `order` then keeps the input order).
+    rtt: RttStore,
 }
 
 impl Resolver {
     pub fn new(config: ResolverConfig) -> Self {
         let delegations = DelegationCache::new(config.delegation_cache_size);
+        let rtt = RttStore::new(config.delegation_cache_size);
         Resolver {
             config,
             delegations,
+            rtt,
         }
     }
 
@@ -299,51 +479,58 @@ impl Resolver {
         self.config.mode
     }
 
-    /// Resolve a query (blocking).
-    pub fn resolve(&self, query: &QuerySection) -> Result<DnsMessage, anyhow::Error> {
+    /// Resolve a query.
+    pub async fn resolve(&self, query: &QuerySection) -> Result<DnsMessage, anyhow::Error> {
         let mut budget = Budget::new(self.config.query_budget);
         match self.config.mode {
-            ResolverMode::Forward => self.forward(query, &mut budget),
-            ResolverMode::Recurse => self.recurse(query, &mut budget),
+            ResolverMode::Forward => self.forward(query, &mut budget).await,
+            ResolverMode::Recurse => self.recurse(query, &mut budget).await,
         }
     }
 
     /// Forward the query to each upstream in turn and return the first answer.
-    fn forward(
+    async fn forward(
         &self,
         query: &QuerySection,
         budget: &mut Budget,
     ) -> Result<DnsMessage, anyhow::Error> {
-        // RD=1: we are asking the upstream to do the recursion for us.
-        let query_buf = self.build_query(query, true)?;
-
-        for upstream in &self.config.upstream_servers {
-            if budget.spend().is_err() {
-                break;
-            }
-            match self.query_server(upstream, &query_buf) {
-                Ok(response) => return Ok(response),
-                Err(_) => continue, // Try next upstream
-            }
-        }
-
-        Err(anyhow!(
-            "failed to resolve {} with all upstream servers",
-            query.qname
-        ))
+        // RD=1: we are asking the upstream to do the recursion for us. `ask_any`
+        // tries them fastest-first and records their RTTs, same as recursion.
+        let out = self.build_query(query, true)?;
+        self.ask_any(&self.config.upstream_servers, &out, budget)
+            .await
+            .ok_or_else(|| {
+                anyhow!("failed to resolve {} with all upstream servers", query.qname)
+            })
     }
 
     /// Serialize a query message. `recursion_desired` is false when we are
     /// walking the delegation chain ourselves — an authoritative server has no
     /// business recursing on our behalf, and asking it to is how open resolvers
     /// get abused.
+    ///
+    /// The returned [`OutgoingQuery`] carries the id and the exact question name
+    /// placed on the wire (its case randomized when 0x20 is on) so the reply can
+    /// be checked against them.
     fn build_query(
         &self,
         query: &QuerySection,
         recursion_desired: bool,
-    ) -> Result<Vec<u8>, anyhow::Error> {
+    ) -> Result<OutgoingQuery, anyhow::Error> {
+        let id = rand::random::<u16>();
+        // The name as sent: same labels, but with the case of its letters
+        // scrambled when 0x20 is on. Resolution logic elsewhere still
+        // normalizes, so only the wire bytes and the reply check see this.
+        let sent_qname = if self.config.zero_x20 {
+            randomize_case(&query.qname)
+        } else {
+            query.qname.clone()
+        };
+        let mut wire_query = query.clone();
+        wire_query.qname = sent_qname.clone();
+
         let mut msg = DnsMessage {
-            id: rand::random::<u16>(),
+            id,
             response: false,
             opcode: crate::OpCode::Query,
             authoritive: false,
@@ -353,7 +540,7 @@ impl Resolver {
             ad: false,
             cd: false,
             rcode: ResponseCode::Ok,
-            queries: vec![query.clone()],
+            queries: vec![wire_query],
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
@@ -364,18 +551,42 @@ impl Resolver {
         let mut buf = vec![0; 512];
         let len = msg.to_bytes(&mut buf)?;
         buf.truncate(len);
-        Ok(buf)
+        Ok(OutgoingQuery {
+            buf,
+            id,
+            qname: sent_qname,
+        })
+    }
+
+    /// Whether a reply actually answers the query we sent: same transaction id,
+    /// and the echoed question matches the name we asked. With 0x20 on the name
+    /// check is case-sensitive — that is what turns the random casing into an
+    /// anti-spoofing signal; off, it is the ordinary case-insensitive compare.
+    ///
+    /// A mismatch is treated as no answer (a spoof, or a confused middlebox),
+    /// so the caller moves on to the next server rather than trusting it.
+    fn response_matches(&self, response: &DnsMessage, sent: &OutgoingQuery) -> bool {
+        if response.id != sent.id {
+            return false;
+        }
+        let Some(question) = response.queries.first() else {
+            return false;
+        };
+        if self.config.zero_x20 {
+            question.qname == sent.qname
+        } else {
+            names_equal(&question.qname, &sent.qname)
+        }
     }
 
     /// Resolve by walking the delegation chain, following any CNAME chain the
     /// answer leads through.
     ///
-    /// Note on threading: each hop is a blocking round trip, so a resolution
-    /// from cold occupies its thread for the sum of them (root + TLD +
-    /// authoritative, more with glueless delegations). `rdnsr` runs this under
-    /// `spawn_blocking`, which is correct but not free — converting the
-    /// resolver to async is the obvious follow-up once this is proven.
-    fn recurse(
+    /// Note on threading: each hop is an `await` on a socket, so a resolution
+    /// from cold yields its task at every round trip (root + TLD +
+    /// authoritative, more with glueless delegations) rather than holding a
+    /// thread for the sum of them. `rdnsr` awaits this directly.
+    async fn recurse(
         &self,
         query: &QuerySection,
         budget: &mut Budget,
@@ -405,7 +616,7 @@ impl Resolver {
                 qtype: query.qtype,
                 qclass: query.qclass.clone(),
             };
-            let response = self.resolve_from_root(&step, budget, 0)?;
+            let response = self.resolve_from_root(&step, budget, 0).await?;
 
             // Keep only records that belong to the chain we actually asked
             // about — the name in hand, plus whatever a CNAME we have accepted
@@ -461,7 +672,7 @@ impl Resolver {
     /// `depth` counts *nested* resolutions — looking up a nameserver's address
     /// re-enters here — and is capped separately from the query budget so a
     /// chain of glueless delegations cannot recurse without bound.
-    fn resolve_from_root(
+    async fn resolve_from_root(
         &self,
         query: &QuerySection,
         budget: &mut Budget,
@@ -475,7 +686,7 @@ impl Resolver {
         // Start as far down the tree as we already know how to, rather than at
         // the root every time.
         if let Some((zone, servers)) = self.delegations.best_match(&query.qname) {
-            match self.walk(query, budget, depth, zone.clone(), servers) {
+            match self.walk(query, budget, depth, zone.clone(), servers).await {
                 Ok(response) => return Ok(response),
                 Err(_) => {
                     // A cached delegation goes stale: servers get renumbered,
@@ -493,10 +704,11 @@ impl Resolver {
             ".".to_string(),
             self.config.root_hints.clone(),
         )
+        .await
     }
 
     /// The delegation walk proper, from a known starting point.
-    fn walk(
+    async fn walk(
         &self,
         query: &QuerySection,
         budget: &mut Budget,
@@ -505,7 +717,7 @@ impl Resolver {
         start_servers: Vec<SocketAddr>,
     ) -> Result<DnsMessage, anyhow::Error> {
         let qname = normalize(&query.qname);
-        let query_buf = self.build_query(query, false)?;
+        let qname_labels = label_count(&qname);
 
         // The zone whose servers we are currently talking to. Everything they
         // tell us is judged against this: a server for `com.` may delegate
@@ -513,51 +725,98 @@ impl Resolver {
         let mut zone = start_zone;
         let mut servers = start_servers;
 
-        for _ in 0..self.config.max_delegations {
-            let Some(response) = self.ask_any(&servers, &query_buf, budget) else {
+        // How many labels of `qname` the next minimized query reveals: begin one
+        // label below the zone we start from — asking `com.`'s servers for
+        // `example.com.`, not the whole name — and deepen a label at a time.
+        // Ignored when minimization is off (the loop uses the full name then).
+        let mut sent_labels = label_count(&zone) + 1;
+
+        // Each iteration is one upstream query, so the budget is the real limit;
+        // this cap only bounds a pathological spin. Minimization can add a probe
+        // per non-delegated (empty-non-terminal) label, hence the `+ qname_labels`.
+        let max_steps = self.config.max_delegations + qname_labels + 1;
+        for _ in 0..max_steps {
+            // With minimization off, always the full name; on, the tracked
+            // depth (capped at the full name).
+            let labels = if self.config.qname_minimization {
+                sent_labels.min(qname_labels)
+            } else {
+                qname_labels
+            };
+            let sname = suffix_with_labels(&qname, labels);
+            let is_final = names_equal(&sname, &qname);
+
+            // Intermediate probes ask for NS, which a zone cut answers with a
+            // referral and a plain in-zone name answers with NODATA — telling
+            // the two apart without disclosing the leaf. The final query uses
+            // the type actually wanted.
+            let step = QuerySection {
+                qname: sname.clone(),
+                qtype: if is_final { query.qtype } else { TYPE_NS },
+                qclass: query.qclass.clone(),
+            };
+            let out = self.build_query(&step, false)?;
+
+            let Some(response) = self.ask_any(&servers, &out, budget).await else {
                 return Err(anyhow!("no server for {zone} answered while resolving {qname}"));
             };
 
-            // An answer, or an authoritative "no" (NXDOMAIN / NODATA), ends the
-            // walk. Both are results; only a referral continues it.
-            if !response.answers.is_empty() || response.authoritive {
-                return Ok(response);
-            }
-
-            let referral = self.extract_referral(&response, &zone, &qname)?;
-            let Some(Referral {
+            // A referral advances us to the child zone, whether the probe was
+            // final or intermediate. Judged against the full `qname` for
+            // bailiwick even when we asked a shorter name.
+            if let Some(Referral {
                 zone: child_zone,
                 ns_names,
                 glue,
                 ttl,
-            }) = referral
-            else {
-                // No answer, not authoritative, and nothing we are willing to
-                // follow. That is a lame delegation (or a referral that doesn't
-                // advance, e.g. a server pointing at its own zone), and it must
-                // not be passed off to the client: an empty NOERROR reads as a
-                // definitive "no such record", which this is not. Failing here
-                // becomes SERVFAIL, which is the honest answer.
+            }) = self.extract_referral(&response, &zone, &qname)?
+            {
+                servers = if glue.is_empty() {
+                    // Glueless delegation: the referral named servers but gave no
+                    // usable addresses, so each one costs a resolution of its own.
+                    self.resolve_nameserver_addresses(&ns_names, budget, depth + 1)
+                        .await?
+                } else {
+                    glue
+                };
+
+                if servers.is_empty() {
+                    return Err(anyhow!("no reachable nameserver for {child_zone}"));
+                }
+                // Remember it so the next query for anything in this zone can
+                // start here instead of at the root.
+                self.delegations.insert(&child_zone, servers.clone(), ttl);
+                // A referral may jump more than one label at once; resume one
+                // below wherever it landed.
+                sent_labels = label_count(&child_zone) + 1;
+                zone = child_zone;
+                continue;
+            }
+
+            if is_final {
+                // An answer, or an authoritative "no" (NXDOMAIN / NODATA), ends
+                // the walk. Anything else — no answer, not authoritative, no
+                // referral — is a lame delegation and must not be passed off as
+                // a definitive "no such record", which an empty NOERROR reads
+                // as. Failing here becomes SERVFAIL, the honest answer.
+                if !response.answers.is_empty() || response.authoritive {
+                    return Ok(response);
+                }
                 return Err(anyhow!(
                     "lame delegation: {zone} gave no answer and no usable referral for {qname}"
                 ));
-            };
-
-            servers = if glue.is_empty() {
-                // Glueless delegation: the referral named servers but gave no
-                // usable addresses, so each one costs a resolution of its own.
-                self.resolve_nameserver_addresses(&ns_names, budget, depth + 1)?
-            } else {
-                glue
-            };
-
-            if servers.is_empty() {
-                return Err(anyhow!("no reachable nameserver for {child_zone}"));
             }
-            // Remember it so the next query for anything in this zone can start
-            // here instead of at the root.
-            self.delegations.insert(&child_zone, servers.clone(), ttl);
-            zone = child_zone;
+
+            // No referral on an *intermediate* probe.
+            if response.rcode == ResponseCode::NoSuchDomain {
+                // The ancestor does not exist, so neither does the full name
+                // (RFC 8020 — NXDOMAIN means the whole subtree is empty).
+                return Ok(response);
+            }
+            // Otherwise this label exists inside the current zone but is not a
+            // cut (a plain name, or an empty non-terminal answered NODATA), so
+            // ask the same servers one label deeper.
+            sent_labels = labels + 1;
         }
 
         Err(anyhow!(
@@ -566,20 +825,27 @@ impl Resolver {
         ))
     }
 
-    /// Try each server in turn, returning the first usable response.
-    fn ask_any(
+    /// Try the servers fastest-known-first, returning the first usable response
+    /// and folding each round trip (or failure) back into the RTT estimates.
+    async fn ask_any(
         &self,
         servers: &[SocketAddr],
-        query_buf: &[u8],
+        out: &OutgoingQuery,
         budget: &mut Budget,
     ) -> Option<DnsMessage> {
-        for server in servers {
+        for server in self.rtt.order(servers) {
             if budget.spend().is_err() {
                 return None;
             }
-            if let Ok(response) = self.query_server(server, query_buf) {
+            let started = std::time::Instant::now();
+            if let Ok(response) = self.query_server(&server, out).await {
+                self.rtt
+                    .record(&server, started.elapsed().as_secs_f64() * 1000.0);
                 return Some(response);
             }
+            // A server that failed or timed out is charged the full timeout, so
+            // the next query for this zone tries a different one ahead of it.
+            self.rtt.record(&server, self.config.timeout_ms as f64);
         }
         None
     }
@@ -681,7 +947,7 @@ impl Resolver {
     /// Resolve nameserver names to addresses, for delegations that came without
     /// usable glue. Stops at the first name that yields an address: one working
     /// nameserver is enough, and each extra lookup is charged to the budget.
-    fn resolve_nameserver_addresses(
+    async fn resolve_nameserver_addresses(
         &self,
         ns_names: &[String],
         budget: &mut Budget,
@@ -693,7 +959,12 @@ impl Resolver {
                 qtype: 1, // A
                 qclass: crate::QueryClass::IN,
             };
-            let Ok(response) = self.resolve_from_root(&lookup, budget, depth) else {
+            // Box the recursive call: this closes the resolution cycle
+            // (resolve_from_root → walk → here → resolve_from_root), and an
+            // `async fn` future may not contain itself by value. Boxing stores a
+            // pointer instead, so the future's size stays finite.
+            let Ok(response) = Box::pin(self.resolve_from_root(&lookup, budget, depth)).await
+            else {
                 continue;
             };
             let addrs: Vec<SocketAddr> = response
@@ -713,33 +984,52 @@ impl Resolver {
         Ok(Vec::new())
     }
 
-    fn query_server(
+    async fn query_server(
         &self,
         upstream: &SocketAddr,
-        query: &[u8],
+        out: &OutgoingQuery,
     ) -> Result<DnsMessage, anyhow::Error> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        socket.set_read_timeout(Some(Duration::from_millis(self.config.timeout_ms / 2)))?;
-        socket.connect(upstream)?;
+        // tokio's UdpSocket has no read timeout of its own, so the deadline is
+        // applied with `tokio::time::timeout` around the recv.
+        let read_timeout = Duration::from_millis(self.config.timeout_ms / 2);
+        // Bind a socket of the same family as the target: a v4-wildcard socket
+        // cannot connect to a v6 address, which is what made AAAA glue and the
+        // v6 root hints unreachable before. The source port stays random
+        // (0.0.0.0:0 / [::]:0) — that randomness is anti-spoofing, so keep it.
+        let bind_addr = if upstream.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = UdpSocket::bind(bind_addr).await?;
+        socket.connect(upstream).await?;
 
         // Send query
-        socket.send(query)?;
+        socket.send(&out.buf).await?;
 
         // Receive response, sized to the payload we advertised via EDNS.
         let mut response_buf = vec![0; self.config.udp_payload_size as usize];
-        let n = socket.recv(&mut response_buf)?;
+        let n = tokio::time::timeout(read_timeout, socket.recv(&mut response_buf)).await??;
 
         response_buf.truncate(n);
         let response = DnsMessage::try_from_bytes(&response_buf)?;
+
+        // Reject anything that isn't a reply to *this* query — wrong id, or a
+        // question that doesn't echo the name we sent (case included, when 0x20
+        // is on). The connected socket already filters by source address; this
+        // is the entropy an off-path spoofer additionally has to match.
+        if !self.response_matches(&response, out) {
+            return Err(anyhow!("reply from {upstream} did not match the query"));
+        }
 
         // RFC 1035 §4.2.1: a truncated answer must be retried over TCP. The
         // retry stays on the *same* upstream — TC says "this answer doesn't fit
         // in a datagram", not "this server is unhealthy", so moving on would
         // just collect the same TC=1 from the next one. If the TCP attempt
-        // fails, the error propagates and `resolve_internal` tries the next
-        // upstream with a fresh UDP query.
+        // fails, the error propagates and the caller tries the next upstream
+        // with a fresh UDP query.
         if response.truncation {
-            return self.query_upstream_tcp(upstream, query);
+            return self.query_upstream_tcp(upstream, out).await;
         }
 
         Ok(response)
@@ -752,40 +1042,47 @@ impl Resolver {
     /// treated as an error: TCP is the last resort, so a TC=1 here means the
     /// upstream genuinely cannot express the full RRset and the partial answer
     /// plus the flag is more useful to the caller than a hard failure.
-    fn query_upstream_tcp(
+    async fn query_upstream_tcp(
         &self,
         upstream: &SocketAddr,
-        query: &[u8],
+        out: &OutgoingQuery,
     ) -> Result<DnsMessage, anyhow::Error> {
-        if query.len() > TCP_MAX_MESSAGE {
+        if out.buf.len() > TCP_MAX_MESSAGE {
             return Err(anyhow!(
                 "query of {} bytes exceeds the 2-byte TCP length prefix",
-                query.len()
+                out.buf.len()
             ));
         }
 
-        // Same budget as the UDP half, applied to connect, write and read.
+        // Same budget as the UDP half, applied to each of connect, write and
+        // read via `tokio::time::timeout`.
         let timeout = Duration::from_millis(self.config.timeout_ms / 2);
-        let stream = TcpStream::connect_timeout(upstream, timeout)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
+        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(upstream)).await??;
 
         // Prefix and message go out in one write so they share a segment.
-        let mut framed = Vec::with_capacity(2 + query.len());
-        framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
-        framed.extend_from_slice(query);
-        (&stream).write_all(&framed)?;
+        let mut framed = Vec::with_capacity(2 + out.buf.len());
+        framed.extend_from_slice(&(out.buf.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&out.buf);
+        tokio::time::timeout(timeout, stream.write_all(&framed)).await??;
 
         let mut len_buf = [0u8; 2];
-        (&stream).read_exact(&mut len_buf)?;
+        tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await??;
         let len = u16::from_be_bytes(len_buf) as usize;
         if len == 0 {
             return Err(anyhow!("upstream {} sent a zero-length TCP message", upstream));
         }
 
         let mut response_buf = vec![0; len];
-        (&stream).read_exact(&mut response_buf)?;
-        DnsMessage::try_from_bytes(&response_buf)
+        tokio::time::timeout(timeout, stream.read_exact(&mut response_buf)).await??;
+        let response = DnsMessage::try_from_bytes(&response_buf)?;
+
+        // The same reply check as the UDP path. TCP is not off-path spoofable,
+        // but a mismatched id or question still means a confused peer, not an
+        // answer to trust.
+        if !self.response_matches(&response, out) {
+            return Err(anyhow!("TCP reply from {upstream} did not match the query"));
+        }
+        Ok(response)
     }
 }
 
@@ -800,8 +1097,53 @@ fn normalize(name: &str) -> String {
     }
 }
 
+/// Scramble the case of each ASCII letter in `name`, leaving the labels
+/// themselves (and any non-letter bytes) untouched. DNS treats names
+/// case-insensitively (RFC 4343), so this changes nothing about what is asked —
+/// only the bit pattern on the wire, which a reply must echo back (0x20).
+fn randomize_case(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphabetic() && rand::random::<bool>() {
+                c.to_ascii_uppercase()
+            } else if c.is_ascii_alphabetic() {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn names_equal(a: &str, b: &str) -> bool {
     normalize(a) == normalize(b)
+}
+
+/// How many labels a name has, the root (`.`) being zero. `example.com.` is 2.
+fn label_count(name: &str) -> usize {
+    let n = normalize(name);
+    let trimmed = n.trim_end_matches('.');
+    if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.split('.').count()
+    }
+}
+
+/// The `labels`-deep suffix of `qname`: the last `labels` labels of it, plus the
+/// root dot. Used to build a QNAME-minimized query — `example.com.` from
+/// `www.example.com.` at two labels. Zero labels is the root; asking for more
+/// than the name has yields the whole name.
+fn suffix_with_labels(qname: &str, labels: usize) -> String {
+    let n = normalize(qname);
+    if labels == 0 {
+        return ".".to_string();
+    }
+    let parts: Vec<&str> = n.trim_end_matches('.').split('.').collect();
+    if labels >= parts.len() {
+        return n;
+    }
+    format!("{}.", parts[parts.len() - labels..].join("."))
 }
 
 /// Whether `name` is at or below `ancestor` in the tree. Everything is below
@@ -819,7 +1161,12 @@ fn is_subdomain(name: &str, ancestor: &str) -> bool {
 mod tests {
     use super::*;
     use crate::{ParsedRecord, QueryClass, RecordData, ResourceRecord};
-    use std::net::TcpListener;
+    // The fake servers below are blocking `std::net`, run on their own OS
+    // threads; these explicit imports shadow the async tokio `UdpSocket` /
+    // `TcpStream` that `super::*` would otherwise bring in, and restore the
+    // blocking `Read`/`Write` traits the resolver no longer imports.
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, UdpSocket};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
@@ -910,11 +1257,79 @@ mod tests {
         let config = ResolverConfig::default();
         // Recursion is the default; forwarding is opt-in by naming an upstream.
         assert_eq!(config.mode, ResolverMode::Recurse);
-        assert_eq!(config.root_hints.len(), 13, "one per root server");
+        assert_eq!(
+            config.root_hints.len(),
+            26,
+            "v4 and v6 for each of the 13 root servers"
+        );
+        // Interleaved: the first two are a.root-servers.net v4 then v6.
+        assert!(config.root_hints[0].is_ipv4());
+        assert!(config.root_hints[1].is_ipv6());
         assert!(!config.upstream_servers.is_empty());
         assert!(config.timeout_ms > 0);
         assert!(config.max_delegations > 0);
         assert!(config.query_budget > 0);
+        // QNAME minimization is on by default (RFC 9156 §2.1).
+        assert!(config.qname_minimization);
+        // 0x20 case randomization is on by default too.
+        assert!(config.zero_x20);
+    }
+
+    #[test]
+    fn test_label_count_and_suffix() {
+        assert_eq!(label_count("."), 0);
+        assert_eq!(label_count("com."), 1);
+        assert_eq!(label_count("example.com"), 2);
+        assert_eq!(label_count("www.example.com."), 3);
+
+        assert_eq!(suffix_with_labels("www.example.com.", 0), ".");
+        assert_eq!(suffix_with_labels("www.example.com.", 1), "com.");
+        assert_eq!(suffix_with_labels("www.example.com.", 2), "example.com.");
+        assert_eq!(suffix_with_labels("www.example.com.", 3), "www.example.com.");
+        // Asking for more labels than the name has yields the whole name.
+        assert_eq!(suffix_with_labels("www.example.com.", 9), "www.example.com.");
+    }
+
+    #[test]
+    fn test_randomize_case_changes_only_case() {
+        let name = "www.Example.com.";
+        for _ in 0..64 {
+            let scrambled = randomize_case(name);
+            // Same name, just different casing: structure and letters preserved.
+            assert_eq!(scrambled.to_ascii_lowercase(), name.to_ascii_lowercase());
+            assert_eq!(scrambled.len(), name.len());
+            assert!(names_equal(&scrambled, name));
+        }
+        // Digits, hyphens and dots are untouched.
+        let mixed = "9-a.b.";
+        assert_eq!(randomize_case(mixed).to_ascii_lowercase(), mixed);
+        for c in randomize_case(mixed).chars().filter(|c| !c.is_ascii_alphabetic()) {
+            assert!("9-.".contains(c));
+        }
+    }
+
+    #[test]
+    fn test_parse_root_hints() {
+        let sample = "\
+; sample named.root hints
+.                        3600000      NS    A.ROOT-SERVERS.NET.
+A.ROOT-SERVERS.NET.      3600000      A     198.41.0.4
+A.ROOT-SERVERS.NET.      3600000      AAAA  2001:503:ba3e::2:30
+B.ROOT-SERVERS.NET.      3600000  IN  A     170.247.170.2
+this line has no record and is skipped
+";
+        assert_eq!(
+            parse_root_hints(sample),
+            vec![
+                "198.41.0.4:53".parse().unwrap(),
+                "[2001:503:ba3e::2:30]:53".parse().unwrap(),
+                "170.247.170.2:53".parse().unwrap(),
+            ]
+        );
+
+        // NS-only and empty input yield no addresses.
+        assert!(parse_root_hints("").is_empty());
+        assert!(parse_root_hints(".  3600000  NS  A.ROOT-SERVERS.NET.").is_empty());
     }
 
     #[test]
@@ -932,8 +1347,8 @@ mod tests {
 
     /// The budget is what stops one client query becoming unbounded upstream
     /// work; at zero, nothing is asked at all.
-    #[test]
-    fn test_query_budget_is_enforced() {
+    #[tokio::test]
+    async fn test_query_budget_is_enforced() {
         let config = ResolverConfig {
             mode: ResolverMode::Forward,
             upstream_servers: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)],
@@ -943,7 +1358,7 @@ mod tests {
         };
         let resolver = Resolver::new(config);
 
-        let result = resolver.resolve(&test_query());
+        let result = resolver.resolve(&test_query()).await;
         assert!(result.is_err());
     }
 
@@ -1103,8 +1518,8 @@ mod tests {
     }
 
     /// The whole point: root → TLD → authoritative, following glue at each step.
-    #[test]
-    fn test_recursion_follows_the_delegation_chain() {
+    #[tokio::test]
+    async fn test_recursion_follows_the_delegation_chain() {
         let mut socks = bind_hierarchy(3).into_iter();
         let (root_sock, tld_sock, auth_sock) = (
             socks.next().unwrap(),
@@ -1136,6 +1551,7 @@ mod tests {
                 qtype: 1,
                 qclass: QueryClass::IN,
             })
+            .await
             .expect("recursion should reach the authoritative server");
 
         assert_eq!(answer.answers.len(), 1);
@@ -1148,8 +1564,8 @@ mod tests {
     /// A referral to a zone that is not an ancestor of the name we are chasing
     /// is a hijack attempt and must not be followed. The root here tries to
     /// hand off `evil.test.` while we are asking for `www.example.test.`.
-    #[test]
-    fn test_out_of_bailiwick_referral_is_not_followed() {
+    #[tokio::test]
+    async fn test_out_of_bailiwick_referral_is_not_followed() {
         let mut socks = bind_hierarchy(2).into_iter();
         let (root_sock, evil_sock) = (socks.next().unwrap(), socks.next().unwrap());
         let evil_addr = evil_sock.local_addr().unwrap();
@@ -1162,11 +1578,13 @@ mod tests {
         });
 
         let resolver = Resolver::new(recursing_config(root.addr));
-        let result = resolver.resolve(&QuerySection {
-            qname: "www.example.test.".to_string(),
-            qtype: 1,
-            qclass: QueryClass::IN,
-        });
+        let result = resolver
+            .resolve(&QuerySection {
+                qname: "www.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await;
 
         // The referral is ignored, so the walk ends at the root's own (empty)
         // response rather than reaching the attacker's server.
@@ -1183,8 +1601,8 @@ mod tests {
     /// and so *everything* it offers is in bailiwick — that is exactly what lets
     /// the root hand out `a.gtld-servers.net.` addresses for the `com.`
     /// delegation. A TLD server has no such latitude.
-    #[test]
-    fn test_out_of_bailiwick_glue_is_ignored() {
+    #[tokio::test]
+    async fn test_out_of_bailiwick_glue_is_ignored() {
         let mut socks = bind_hierarchy(3).into_iter();
         let (root_sock, tld_sock, attacker_sock) = (
             socks.next().unwrap(),
@@ -1213,11 +1631,13 @@ mod tests {
         });
 
         let resolver = Resolver::new(recursing_config(root.addr));
-        let result = resolver.resolve(&QuerySection {
-            qname: "www.example.test.".to_string(),
-            qtype: 1,
-            qclass: QueryClass::IN,
-        });
+        let result = resolver
+            .resolve(&QuerySection {
+                qname: "www.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await;
 
         // With that glue rejected the delegation is glueless, and resolving
         // ns.example.test. goes nowhere in this fake hierarchy — so the resolve
@@ -1232,8 +1652,8 @@ mod tests {
     }
 
     /// A CNAME is followed, and every record along the chain is returned.
-    #[test]
-    fn test_cname_chain_is_followed() {
+    #[tokio::test]
+    async fn test_cname_chain_is_followed() {
         let mut socks = bind_hierarchy(2).into_iter();
         let (root_sock, auth_sock) = (socks.next().unwrap(), socks.next().unwrap());
         let auth_addr = auth_sock.local_addr().unwrap();
@@ -1262,6 +1682,7 @@ mod tests {
                 qtype: 1,
                 qclass: QueryClass::IN,
             })
+            .await
             .expect("CNAME should be chased to the address");
 
         assert_eq!(answer.answers.len(), 2, "CNAME and the A it leads to");
@@ -1273,8 +1694,8 @@ mod tests {
     }
 
     /// A CNAME pointing back at itself must terminate, not spin.
-    #[test]
-    fn test_cname_loop_is_detected() {
+    #[tokio::test]
+    async fn test_cname_loop_is_detected() {
         let mut socks = bind_hierarchy(2).into_iter();
         let (root_sock, auth_sock) = (socks.next().unwrap(), socks.next().unwrap());
         let auth_addr = auth_sock.local_addr().unwrap();
@@ -1298,11 +1719,13 @@ mod tests {
         });
 
         let resolver = Resolver::new(recursing_config(root.addr));
-        let result = resolver.resolve(&QuerySection {
-            qname: "a.example.test.".to_string(),
-            qtype: 1,
-            qclass: QueryClass::IN,
-        });
+        let result = resolver
+            .resolve(&QuerySection {
+                qname: "a.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await;
 
         let err = result.expect_err("a CNAME loop must be an error").to_string();
         assert!(
@@ -1313,16 +1736,21 @@ mod tests {
 
     /// A delegation with no glue costs a nested resolution of the nameserver's
     /// own name — which must work, and must be charged to the same budget.
-    #[test]
-    fn test_glueless_delegation_is_resolved() {
-        let mut socks = bind_hierarchy(2).into_iter();
-        let (root_sock, auth_sock) = (socks.next().unwrap(), socks.next().unwrap());
+    #[tokio::test]
+    async fn test_glueless_delegation_is_resolved() {
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, tld_sock, auth_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let tld_addr = tld_sock.local_addr().unwrap();
         let auth_addr = auth_sock.local_addr().unwrap();
 
-        // Authoritative for example.test., and also holds the address of the
-        // nameserver name (which lives in a different zone: ns.hoster.test.).
-        // The nameserver lookup has to answer with this server's *real* address
-        // — the resolver dials whatever the A record says.
+        // Authoritative for example.test. (the target), and also holds the
+        // address of the nameserver name (which lives in a different zone:
+        // ns.hoster.test.). The nameserver lookup has to answer with this
+        // server's *real* address — the resolver dials whatever the A says.
         let IpAddr::V4(auth_ip) = auth_addr.ip() else {
             unreachable!("bound on IPv4 loopback")
         };
@@ -1334,9 +1762,11 @@ mod tests {
                 authoritative(q, vec![a_record(&name, [192, 0, 2, 7])])
             }
         });
-        // The root delegates both `example.test.` (glueless) and `hoster.test.`
-        // (with glue), so looking up the nameserver's address can succeed.
-        let root = spawn_server(root_sock, move |q| {
+        // The TLD delegates both `example.test.` (glueless — its nameserver
+        // ns.hoster.test. is outside the example.test. zone, so no glue is
+        // offered) and `hoster.test.` (with glue), so looking up the
+        // nameserver's address can succeed.
+        let _tld = spawn_server(tld_sock, move |q| {
             let name = qname_of(q);
             if name.ends_with("hoster.test.") {
                 referral(
@@ -1349,6 +1779,9 @@ mod tests {
                 referral(q, "example.test.", "ns.hoster.test.", None)
             }
         });
+        let root = spawn_server(root_sock, move |q| {
+            referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
+        });
 
         let resolver = Resolver::new(recursing_config(root.addr));
         let answer = resolver
@@ -1357,6 +1790,7 @@ mod tests {
                 qtype: 1,
                 qclass: QueryClass::IN,
             })
+            .await
             .expect("glueless delegation should resolve via the nameserver's name");
 
         assert_eq!(
@@ -1367,8 +1801,8 @@ mod tests {
 
     /// A server that refers to itself forever must be stopped by the budget
     /// rather than looping until the client times out.
-    #[test]
-    fn test_referral_loop_is_bounded() {
+    #[tokio::test]
+    async fn test_referral_loop_is_bounded() {
         let root_sock = bind_hierarchy(1).into_iter().next().unwrap();
         let self_addr = root_sock.local_addr().unwrap();
 
@@ -1387,13 +1821,328 @@ mod tests {
             query_budget: 12,
             ..recursing_config(root.addr)
         });
-        let result = resolver.resolve(&QuerySection {
-            qname: "www.example.test.".to_string(),
-            qtype: 1,
-            qclass: QueryClass::IN,
-        });
+        let result = resolver
+            .resolve(&QuerySection {
+                qname: "www.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await;
 
         assert!(result.is_err(), "a referral loop must terminate in an error");
+    }
+
+    // ---------------------------------------------------------------------
+    // QNAME minimization (RFC 9156)
+    // ---------------------------------------------------------------------
+
+    /// A shared log of the QNAMEs a fake server was asked.
+    type SeenLog = Arc<Mutex<Vec<String>>>;
+
+    /// A root/TLD/auth hierarchy where each server records the QNAME it was
+    /// asked, so a test can assert what each learned. All three answer the same
+    /// way regardless of the QTYPE, which is what lets the intermediate NS
+    /// probes and the final query share one server.
+    fn recording_hierarchy() -> (FakeServer, FakeServer, FakeServer, SeenLog, SeenLog, SeenLog) {
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, tld_sock, auth_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let tld_addr = tld_sock.local_addr().unwrap();
+        let auth_addr = auth_sock.local_addr().unwrap();
+
+        let (root_seen, tld_seen, auth_seen) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+
+        let a = auth_seen.clone();
+        let auth = spawn_server(auth_sock, move |q| {
+            a.lock().unwrap().push(qname_of(q));
+            authoritative(q, vec![a_record("www.example.test.", [192, 0, 2, 1])])
+        });
+        let t = tld_seen.clone();
+        let tld = spawn_server(tld_sock, move |q| {
+            t.lock().unwrap().push(qname_of(q));
+            referral(
+                q,
+                "example.test.",
+                "ns.example.test.",
+                Some(("ns.example.test.", auth_addr)),
+            )
+        });
+        let r = root_seen.clone();
+        let root = spawn_server(root_sock, move |q| {
+            r.lock().unwrap().push(qname_of(q));
+            referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
+        });
+
+        (root, tld, auth, root_seen, tld_seen, auth_seen)
+    }
+
+    /// With minimization on (the default), the root is asked only for the TLD
+    /// and the TLD only for the delegated zone; the leaf name reaches only the
+    /// server authoritative for it.
+    #[tokio::test]
+    async fn test_qname_minimization_reveals_only_the_delegated_label() {
+        let (root, _tld, _auth, root_seen, tld_seen, auth_seen) = recording_hierarchy();
+
+        let resolver = Resolver::new(recursing_config(root.addr));
+        let answer = resolver
+            .resolve(&QuerySection {
+                qname: "www.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("minimized recursion should still reach the answer");
+
+        assert_eq!(
+            answer.answers[0].rdata.parse().unwrap(),
+            ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))
+        );
+        assert_eq!(root_seen.lock().unwrap().as_slice(), ["test.".to_string()]);
+        assert_eq!(
+            tld_seen.lock().unwrap().as_slice(),
+            ["example.test.".to_string()]
+        );
+        assert_eq!(
+            auth_seen.lock().unwrap().as_slice(),
+            ["www.example.test.".to_string()]
+        );
+    }
+
+    /// With minimization off, the full name goes to every server up the chain —
+    /// the behaviour the privacy fix replaces.
+    #[tokio::test]
+    async fn test_minimization_disabled_sends_the_full_name() {
+        let (root, _tld, _auth, root_seen, tld_seen, _auth_seen) = recording_hierarchy();
+
+        let resolver = Resolver::new(ResolverConfig {
+            qname_minimization: false,
+            ..recursing_config(root.addr)
+        });
+        resolver
+            .resolve(&QuerySection {
+                qname: "www.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("recursion should reach the answer without minimization");
+
+        assert_eq!(
+            root_seen.lock().unwrap().as_slice(),
+            ["www.example.test.".to_string()]
+        );
+        assert_eq!(
+            tld_seen.lock().unwrap().as_slice(),
+            ["www.example.test.".to_string()]
+        );
+    }
+
+    /// An empty non-terminal — a name with no records of its own but with
+    /// descendants — costs one extra probe: the intermediate NS query returns
+    /// NODATA (not a referral), so the resolver deepens by a label and asks the
+    /// same server again, rather than mistaking NODATA for a final answer.
+    #[tokio::test]
+    async fn test_qname_minimization_probes_an_empty_non_terminal() {
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, tld_sock, auth_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let tld_addr = tld_sock.local_addr().unwrap();
+        let auth_addr = auth_sock.local_addr().unwrap();
+
+        // Authoritative for example.test. The leaf www.sub.example.test. has an
+        // A; its parent sub.example.test. is an empty non-terminal, so an
+        // authoritative NODATA (no answers) comes back for anything else.
+        let auth_seen = Arc::new(Mutex::new(Vec::new()));
+        let a = auth_seen.clone();
+        let _auth = spawn_server(auth_sock, move |q| {
+            let name = qname_of(q);
+            a.lock().unwrap().push(name.clone());
+            if name == "www.sub.example.test." {
+                authoritative(q, vec![a_record(&name, [192, 0, 2, 8])])
+            } else {
+                authoritative(q, vec![])
+            }
+        });
+        let _tld = spawn_server(tld_sock, move |q| {
+            referral(
+                q,
+                "example.test.",
+                "ns.example.test.",
+                Some(("ns.example.test.", auth_addr)),
+            )
+        });
+        let root = spawn_server(root_sock, move |q| {
+            referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
+        });
+
+        let resolver = Resolver::new(recursing_config(root.addr));
+        let answer = resolver
+            .resolve(&QuerySection {
+                qname: "www.sub.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the empty non-terminal must be probed through, not stopped at");
+
+        assert_eq!(
+            answer.answers[0].rdata.parse().unwrap(),
+            ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 8))
+        );
+        // The empty non-terminal was probed first, then the leaf.
+        assert_eq!(
+            auth_seen.lock().unwrap().as_slice(),
+            [
+                "sub.example.test.".to_string(),
+                "www.sub.example.test.".to_string()
+            ]
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // RTT-based server selection
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_rtt_store_orders_fastest_first() {
+        let store = RttStore::new(16);
+        let a: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let b: SocketAddr = "192.0.2.2:53".parse().unwrap();
+        let c: SocketAddr = "192.0.2.3:53".parse().unwrap();
+
+        // All unmeasured: the input order is kept.
+        assert_eq!(store.order(&[a, b, c]), vec![a, b, c]);
+
+        store.record(&a, 200.0);
+        store.record(&b, 5.0);
+        // c is still unknown (100), so: b(5) < c(100) < a(200).
+        assert_eq!(store.order(&[a, b, c]), vec![b, c, a]);
+    }
+
+    #[test]
+    fn test_rtt_store_smooths_samples() {
+        let store = RttStore::new(16);
+        let s: SocketAddr = "192.0.2.1:53".parse().unwrap();
+
+        store.record(&s, 10.0); // first sample taken as-is
+        assert!((store.get(&s) - 10.0).abs() < 1e-9);
+        store.record(&s, 20.0); // EWMA: 0.75*10 + 0.25*20 = 12.5
+        assert!((store.get(&s) - 12.5).abs() < 1e-9);
+
+        // An unmeasured server reads back the default.
+        let u: SocketAddr = "192.0.2.9:53".parse().unwrap();
+        assert_eq!(store.get(&u), UNKNOWN_RTT_MS);
+    }
+
+    #[test]
+    fn test_rtt_store_evicts_the_slowest_at_capacity() {
+        let store = RttStore::new(2);
+        let a: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let b: SocketAddr = "192.0.2.2:53".parse().unwrap();
+        let c: SocketAddr = "192.0.2.3:53".parse().unwrap();
+
+        store.record(&a, 500.0); // slowest
+        store.record(&b, 5.0);
+        store.record(&c, 10.0); // over capacity: evicts the slowest (a)
+
+        let m = store.rtts.lock().unwrap();
+        assert_eq!(m.len(), 2);
+        assert!(!m.contains_key(&a), "the slowest entry is dropped");
+        assert!(m.contains_key(&b) && m.contains_key(&c));
+    }
+
+    #[test]
+    fn test_rtt_store_zero_capacity_is_off() {
+        let store = RttStore::new(0);
+        let a: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let b: SocketAddr = "192.0.2.2:53".parse().unwrap();
+
+        store.record(&a, 5.0);
+        assert_eq!(store.get(&a), UNKNOWN_RTT_MS, "nothing is stored");
+        // Ordering still works, and with no data it is just the input order.
+        assert_eq!(store.order(&[b, a]), vec![b, a]);
+    }
+
+    /// A zone with two nameservers, one of which is unusable: the failing one is
+    /// tried once, demoted, and then skipped — later queries go straight to the
+    /// server that answered.
+    #[tokio::test]
+    async fn test_rtt_selection_skips_a_failing_server_after_the_first_try() {
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, bad_sock, good_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let bad_addr = bad_sock.local_addr().unwrap();
+        let good_addr = good_sock.local_addr().unwrap();
+        let IpAddr::V4(bad_ip) = bad_addr.ip() else {
+            unreachable!("bound on IPv4 loopback")
+        };
+        let IpAddr::V4(good_ip) = good_addr.ip() else {
+            unreachable!("bound on IPv4 loopback")
+        };
+
+        // The "bad" server answers instantly but always with the wrong
+        // transaction id, so its replies are rejected — an immediate failure
+        // rather than one that costs a timeout. It counts how often it is asked.
+        let bad_hits = Arc::new(AtomicUsize::new(0));
+        let bh = bad_hits.clone();
+        let _bad = spawn_server(bad_sock, move |q| {
+            bh.fetch_add(1, Ordering::Relaxed);
+            let mut r = response_to(q);
+            r.id = q.id.wrapping_add(1);
+            r
+        });
+        let _good = spawn_server(good_sock, move |q| {
+            authoritative(q, vec![a_record(&qname_of(q), [192, 0, 2, 1])])
+        });
+        // The root delegates example.test. to both, the bad server listed first
+        // so it is the one tried before any RTT is known.
+        let root = spawn_server(root_sock, move |q| {
+            let mut resp = response_to(q);
+            resp.authorities = vec![
+                ns_record("example.test.", "ns1.example.test."),
+                ns_record("example.test.", "ns2.example.test."),
+            ];
+            resp.additionals = vec![
+                a_record("ns1.example.test.", bad_ip.octets()),
+                a_record("ns2.example.test.", good_ip.octets()),
+            ];
+            resp
+        });
+
+        let resolver = Resolver::new(recursing_config(root.addr));
+        for name in ["one.example.test.", "two.example.test.", "three.example.test."] {
+            let answer = resolver
+                .resolve(&QuerySection {
+                    qname: name.to_string(),
+                    qtype: 1,
+                    qclass: QueryClass::IN,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("resolving {name}: {e}"));
+            assert_eq!(
+                answer.answers[0].rdata.parse().unwrap(),
+                ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))
+            );
+        }
+
+        assert_eq!(
+            bad_hits.load(Ordering::Relaxed),
+            1,
+            "the failing server should be tried once, then skipped on later queries"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1484,8 +2233,8 @@ mod tests {
 
     /// The point of the whole exercise: a second query for the same zone must
     /// not go back to the root.
-    #[test]
-    fn test_second_query_does_not_revisit_the_root() {
+    #[tokio::test]
+    async fn test_second_query_does_not_revisit_the_root() {
         let mut socks = bind_hierarchy(2).into_iter();
         let (root_sock, auth_sock) = (socks.next().unwrap(), socks.next().unwrap());
         let auth_addr = auth_sock.local_addr().unwrap();
@@ -1514,6 +2263,7 @@ mod tests {
                     qtype: 1,
                     qclass: QueryClass::IN,
                 })
+                .await
                 .unwrap_or_else(|e| panic!("resolving {name}: {e}"));
             assert_eq!(
                 answer.answers[0].rdata.parse().unwrap(),
@@ -1530,8 +2280,8 @@ mod tests {
 
     /// A cached delegation that has gone stale must not fail the query: the
     /// resolver drops it and starts again from the root.
-    #[test]
-    fn test_stale_delegation_falls_back_to_the_root() {
+    #[tokio::test]
+    async fn test_stale_delegation_falls_back_to_the_root() {
         let mut socks = bind_hierarchy(2).into_iter();
         let (root_sock, auth_sock) = (socks.next().unwrap(), socks.next().unwrap());
         let auth_addr = auth_sock.local_addr().unwrap();
@@ -1568,6 +2318,7 @@ mod tests {
                 qtype: 1,
                 qclass: QueryClass::IN,
             })
+            .await
             .expect("a stale delegation must fall back to the root, not fail");
 
         assert_eq!(
@@ -1578,8 +2329,8 @@ mod tests {
 
     /// A TC=1 UDP answer must be retried over TCP, and the TCP answer is what
     /// the caller gets (RFC 1035 §4.2.1).
-    #[test]
-    fn test_tcp_fallback_on_truncated_udp_response() {
+    #[tokio::test]
+    async fn test_tcp_fallback_on_truncated_udp_response() {
         let (udp, tcp, addr) = bind_fake_upstream();
 
         // UDP half: always truncate, never answer.
@@ -1620,14 +2371,19 @@ mod tests {
         });
 
         let resolver = Resolver::new(test_config(addr));
-        let answer = resolver.resolve(&test_query()).unwrap();
+        let answer = resolver.resolve(&test_query()).await.unwrap();
 
         udp_thread.join().unwrap();
         let (claimed, tcp_qname) = tcp_thread.join().unwrap();
 
-        // The TCP retry carried the same question, correctly framed.
+        // The TCP retry carried the same question, correctly framed. Compared
+        // case-insensitively because 0x20 randomizes the casing on the wire
+        // (e.g. "ExAMPLe.coM."), which is the whole point of the feature.
         assert!(claimed >= 12, "TCP length prefix {} is below a DNS header", claimed);
-        assert_eq!(tcp_qname.as_deref(), Some("example.com."));
+        assert_eq!(
+            tcp_qname.as_deref().map(|n| n.to_ascii_lowercase()),
+            Some("example.com.".to_string())
+        );
 
         // And its answer, not the truncated one, is what came back.
         assert!(!answer.truncation);
@@ -1641,8 +2397,8 @@ mod tests {
     /// The inverse: a response that fits in a datagram must not touch TCP.
     /// Nothing is listening on the TCP side of this port, so an attempted
     /// fallback would fail the connect and turn into a resolve error.
-    #[test]
-    fn test_no_tcp_fallback_when_response_fits() {
+    #[tokio::test]
+    async fn test_no_tcp_fallback_when_response_fits() {
         // Take the pair and immediately release the TCP half, so we know for
         // certain nothing is listening there to accept a stray fallback.
         let (udp, tcp, addr) = bind_fake_upstream();
@@ -1661,7 +2417,7 @@ mod tests {
         });
 
         let resolver = Resolver::new(test_config(addr));
-        let answer = resolver.resolve(&test_query()).unwrap();
+        let answer = resolver.resolve(&test_query()).await.unwrap();
         udp_thread.join().unwrap();
 
         assert_eq!(answer.answers.len(), 1);
@@ -1672,8 +2428,8 @@ mod tests {
     }
 
     /// A TCP answer that is *itself* truncated is passed through, not rejected.
-    #[test]
-    fn test_still_truncated_tcp_response_is_returned() {
+    #[tokio::test]
+    async fn test_still_truncated_tcp_response_is_returned() {
         let (udp, tcp, addr) = bind_fake_upstream();
 
         let udp_thread = thread::spawn(move || {
@@ -1707,7 +2463,7 @@ mod tests {
         });
 
         let resolver = Resolver::new(test_config(addr));
-        let answer = resolver.resolve(&test_query()).unwrap();
+        let answer = resolver.resolve(&test_query()).await.unwrap();
 
         udp_thread.join().unwrap();
         tcp_thread.join().unwrap();
@@ -1717,8 +2473,8 @@ mod tests {
     }
 
     /// A zero-length TCP frame is a protocol error, not an empty message.
-    #[test]
-    fn test_zero_length_tcp_frame_is_an_error() {
+    #[tokio::test]
+    async fn test_zero_length_tcp_frame_is_an_error() {
         let (udp, tcp, addr) = bind_fake_upstream();
 
         let udp_thread = thread::spawn(move || {
@@ -1742,12 +2498,137 @@ mod tests {
         });
 
         let resolver = Resolver::new(test_config(addr));
-        let result = resolver.resolve(&test_query());
+        let result = resolver.resolve(&test_query()).await;
 
         udp_thread.join().unwrap();
         tcp_thread.join().unwrap();
 
         // The single upstream failed, so the resolve as a whole fails.
         assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Reply validation: 0x20 case randomization and transaction id
+    // ---------------------------------------------------------------------
+
+    /// Flip the case of every ASCII letter, so the result is guaranteed to
+    /// differ from any input that has at least one letter.
+    fn flip_case(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_uppercase() {
+                    c.to_ascii_lowercase()
+                } else if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    /// A fake upstream that answers `example.com.` but rewrites the echoed
+    /// question with `mangle`, and optionally perturbs the id. Returns the
+    /// resolve result so a test can assert accept/reject.
+    async fn resolve_against_mangling_upstream(
+        config: impl FnOnce(SocketAddr) -> ResolverConfig,
+        mangle: fn(&str) -> String,
+        break_id: bool,
+    ) -> Result<DnsMessage, anyhow::Error> {
+        let (udp, _tcp, addr) = bind_fake_upstream();
+        let udp_thread = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = udp.recv_from(&mut buf).unwrap();
+            let query = DnsMessage::try_from_bytes(&buf[..n]).unwrap();
+            let mut resp = response_to(&query);
+            if break_id {
+                resp.id = query.id.wrapping_add(1);
+            }
+            if let Some(q) = resp.queries.first_mut() {
+                q.qname = mangle(&q.qname);
+            }
+            resp.answers.push(a_record("example.com.", [10, 0, 0, 5]));
+            let mut out = vec![0u8; 512];
+            let len = resp.to_bytes(&mut out).unwrap();
+            udp.send_to(&out[..len], peer).unwrap();
+        });
+
+        let resolver = Resolver::new(config(addr));
+        let result = resolver.resolve(&test_query()).await;
+        udp_thread.join().unwrap();
+        result
+    }
+
+    /// With 0x20 on, a reply that does not echo the exact casing we sent — a
+    /// case-mangling middlebox, or an off-path spoofer that never saw it — is
+    /// rejected, so the resolve fails rather than trusting it.
+    #[tokio::test]
+    async fn test_zero_x20_rejects_a_reply_with_mangled_case() {
+        let result = resolve_against_mangling_upstream(test_config, flip_case, false).await;
+        assert!(
+            result.is_err(),
+            "a reply that doesn't echo the 0x20 casing must be rejected"
+        );
+    }
+
+    /// With 0x20 off, the same case difference is fine: the question is compared
+    /// case-insensitively (RFC 4343), as it always was.
+    #[tokio::test]
+    async fn test_zero_x20_disabled_accepts_a_case_insensitive_reply() {
+        let config = |addr| ResolverConfig {
+            zero_x20: false,
+            ..test_config(addr)
+        };
+        let answer = resolve_against_mangling_upstream(config, flip_case, false)
+            .await
+            .expect("case-insensitive match must be accepted when 0x20 is off");
+        assert_eq!(
+            answer.answers[0].rdata.parse().unwrap(),
+            ParsedRecord::A(Ipv4Addr::new(10, 0, 0, 5))
+        );
+    }
+
+    /// A reply that echoes the question perfectly but carries the wrong
+    /// transaction id is not an answer to our query, 0x20 or not.
+    #[tokio::test]
+    async fn test_reply_with_wrong_transaction_id_is_rejected() {
+        // `mangle` leaves the case alone, so only the id is wrong.
+        let result = resolve_against_mangling_upstream(test_config, |s| s.to_string(), true).await;
+        assert!(result.is_err(), "a mismatched transaction id must be rejected");
+    }
+
+    // ---------------------------------------------------------------------
+    // IPv6
+    // ---------------------------------------------------------------------
+
+    /// Reaching a server over IPv6: a v4-wildcard send socket cannot connect to
+    /// a v6 address, so this only works because `query_server` binds a socket of
+    /// the target's family — which is also what makes AAAA glue and the v6 root
+    /// hints usable.
+    #[tokio::test]
+    async fn test_forwarding_reaches_an_ipv6_upstream() {
+        let udp = UdpSocket::bind("[::1]:0").expect("IPv6 loopback should be available");
+        let addr = udp.local_addr().unwrap();
+
+        let udp_thread = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = udp.recv_from(&mut buf).unwrap();
+            let query = DnsMessage::try_from_bytes(&buf[..n]).unwrap();
+            let mut resp = response_to(&query);
+            resp.answers.push(a_record("example.com.", [203, 0, 113, 5]));
+            let mut out = vec![0u8; 512];
+            let len = resp.to_bytes(&mut out).unwrap();
+            udp.send_to(&out[..len], peer).unwrap();
+        });
+
+        let resolver = Resolver::new(test_config(addr));
+        let answer = resolver.resolve(&test_query()).await.unwrap();
+        udp_thread.join().unwrap();
+
+        assert!(addr.is_ipv6(), "the upstream must be a v6 address for this test");
+        assert_eq!(
+            answer.answers[0].rdata.parse().unwrap(),
+            ParsedRecord::A(Ipv4Addr::new(203, 0, 113, 5))
+        );
     }
 }

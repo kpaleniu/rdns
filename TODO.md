@@ -8,7 +8,7 @@ where to look rather than here.
 
 ---
 
-## Current state (last updated 2026-07-24)
+## Current state (last updated 2026-07-25)
 
 **Workspace** — four members, all on branch `master`:
 
@@ -20,12 +20,13 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **210 lib + 15 integration** tests passing,
+`cargo test --workspace` = **225 lib + 15 integration** tests passing,
 `cargo clippy --workspace --all-targets` clean **except one deliberate warning**
 (`if_same_then_else` on `dnssec_validation_mode.rs::validate_response` — the
 `validate_unsigned` no-op; leave it until open item #2 defines the semantics).
 
-**Next task: #1 (recursor follow-ups — async conversion first)**, then #2.
+**Next task: #2 (DNSSEC validation on the resolve path).** #1 is done bar
+aggressive NSEC caching, which is blocked on #2 and #3.
 
 ### How to run
 
@@ -43,6 +44,10 @@ cargo run -p rdnsd -- tcp --host 127.0.0.1 --port 15353 --zone-file example.com.
 # Resolver, recursing from the root hints. Serves UDP and TCP on one port, and
 # binds 127.0.0.1 by default on purpose — not an open resolver.
 cargo run -p rdnsr -- --port 15354
+
+# Recursing from a custom root hints file (named.root format) instead of the
+# built-in v4+v6 list.
+cargo run -p rdnsr -- --port 15354 --root-hints ./named.root
 
 # Same resolver, forwarding instead of recursing.
 cargo run -p rdnsr -- --port 15354 --upstream 127.0.0.1:15353
@@ -106,24 +111,17 @@ Four environment traps that have each cost an hour:
 ## Open work
 
 ### 1. Recursor follow-ups
-The recursor works and is covered by 21 tests in `resolver.rs` (see
-"Architecture: the resolver"). What is left, in priority order:
+The recursor works and is covered by 36 tests in `resolver.rs` (see
+"Architecture: the resolver"). One item is left, and it is blocked:
 
-- [ ] **Convert the resolver to async.** It is synchronous `std::net` and `rdnsr`
-      drives it through `spawn_blocking`, so a cold resolution holds a blocking
-      thread for the sum of its round trips. Less pressing since the delegation
-      cache landed — warm resolutions are now one round trip — but it is the
-      right shape for a resolver.
-- [ ] **QNAME minimization (RFC 9156)** — send only the label being delegated
-      rather than the full name to every server up the chain. A privacy fix: the
-      root currently learns every name we resolve.
-- [ ] Aggressive NSEC caching (RFC 8198), 0x20 randomization, and RTT-based
-      server selection instead of always trying servers in order.
-- [ ] IPv6 root hints and AAAA glue. AAAA glue is parsed and used already, but
-      the built-in hint list is v4-only.
-- [ ] A `--root-hints` flag. The list is overridable in `ResolverConfig` but not
-      from the CLI, and the built-in addresses do drift (b.root-servers.net moved
-      in 2023).
+- [ ] Aggressive NSEC caching (RFC 8198) — synthesize a negative answer from a
+      cached, *validated* NSEC/NSEC3 range instead of re-querying. Blocked on #2
+      (nothing validates NSEC yet) and #3 (NSEC3 hashing is wrong), so it cannot
+      be trusted until those land. Do it after #2.
+
+Everything else under #1 — async conversion, QNAME minimization, 0x20 + reply
+validation, RTT-based server selection, IPv6 hints/glue and the `--root-hints`
+flag — is done; see "Done so far".
 
 ### 2. Put DNSSEC validation on the resolve path
 **The pieces all exist; nothing calls them.** `grep` for `DnssecValidator` or
@@ -226,8 +224,12 @@ the means of obtaining an answer differs, and mixed deployments (forward one
 zone, recurse the rest) need both in one process. `rdnsr` recurses by default;
 any `--upstream` selects forwarding.
 
-**Recursion** walks root hints → TLD → authoritative, following referrals. Three
-controls are load-bearing:
+**Recursion** walks root hints → TLD → authoritative, following referrals. The
+built-in hints carry both an A and an AAAA for each of the 13 roots, interleaved
+so whichever family the host has is reached early; `query_server` binds its send
+socket to the target's family (a v4-wildcard socket cannot reach a v6 address),
+which is what makes AAAA glue usable at all. `parse_root_hints` loads the
+`named.root` format for `rdnsr --root-hints`. Three controls are load-bearing:
 
 - **Bailiwick on referrals.** A referral must be below the zone we asked and at
   or above the name being chased, or `com.` could hand us the servers for
@@ -251,6 +253,29 @@ with no answer, no AA and no usable referral is an error, not a pass-through —
 empty NOERROR reads as a definitive "no such record", which a lame delegation is
 not.
 
+**Reply validation** guards every response `query_server` accepts: the
+transaction id must match, and the echoed question must be the name we sent.
+With **0x20 case randomization** on (`zero_x20`, default on) the outgoing name's
+letter case is scrambled and the question check is case-sensitive, so an off-path
+spoofer has to reproduce the casing on top of the id and the random source port;
+off, the check is the ordinary case-insensitive one. A mismatch is treated as no
+answer, so `ask_any` moves to the next server. Turn 0x20 off for the rare
+authoritative server or middlebox that does not preserve case.
+
+**QNAME minimization (RFC 9156)** is on by default (`qname_minimization`, off to
+send the full name every hop). Each hop asks the current servers only for the
+next label down toward the target — `com.`, then `example.com.`, then the leaf —
+so the root learns the TLD and no more, and the full name reaches only the
+server authoritative for it. Intermediate probes use QTYPE=NS: a zone cut answers
+with a referral, a plain in-zone name with NODATA, telling the two apart without
+disclosing the leaf. An empty non-terminal (a name with descendants but no
+records of its own) returns NODATA to the NS probe, so the walk deepens by a
+label and re-asks the same servers rather than mistaking it for a final answer;
+that costs one extra probe per such label. NXDOMAIN on an ancestor ends the walk
+— the whole subtree is empty (RFC 8020). Bailiwick is still judged against the
+full target name, so minimizing the query does not widen what a referral may
+claim.
+
 **The delegation cache** (`DelegationCache`) keeps the servers learned per zone,
 keyed by zone name with the referral's shortest TTL, capped at a day. A
 resolution starts at the deepest cached ancestor of the name rather than at the
@@ -260,11 +285,23 @@ stale bookkeeping degrades to slow rather than broken. `delegation_cache_size`
 (10k default, 0 disables). Verified: three queries into one zone consult the root
 exactly once.
 
-**Forwarding** sends RD=1 to each configured upstream in turn and returns the
-first answer. Recursion sends RD=0 — an authoritative server has no business
-recursing for us, and asking it to is how open resolvers get abused.
+**Server selection** within a zone is fastest-first, not round-robin or
+learned-order. `RttStore` keeps a smoothed round-trip time per server address
+(EWMA, α=0.25, the RFC 6298 SRTT factor); `ask_any` orders the candidates by it,
+times each round trip, and charges a failure the full timeout so a dead server
+sinks to the back after one attempt. Unmeasured servers sort at a middling
+default (`UNKNOWN_RTT_MS`), so a fresh set is tried in the order given, a
+measured-fast server beats an untried one, and an untried one beats a known-bad
+one. The store shares the delegation cache's capacity, evicting the slowest
+entry when full; a resolution keeps preferring the fast server and only re-tries
+a demoted one once the fast one also fails (no active re-probing yet).
 
-Tests (21 in `resolver.rs`) stand up a fake root/TLD/authoritative hierarchy
+**Forwarding** sends RD=1 to each configured upstream and returns the first
+answer, going through the same `ask_any` (so upstreams are RTT-ordered too).
+Recursion sends RD=0 — an authoritative server has no business recursing for us,
+and asking it to is how open resolvers get abused.
+
+Tests (36 in `resolver.rs`) stand up a fake root/TLD/authoritative hierarchy
 in-process. They share one port across distinct loopback addresses, because glue
 carries an address and no port — which is also why `server_port` exists in the
 config.
@@ -316,7 +353,8 @@ resolver. Forwarding versus recursion divides none of those, which is why *that*
 is a mode rather than a fifth crate.
 
 `rdnsr` (`rdnsr/src/main.rs`): query → EDNS sanity check (FORMERR / BADVERS) →
-`DnsCache` lookup → miss resolves via `Resolver` on a blocking thread →
+`DnsCache` lookup → miss resolves by awaiting `Resolver::resolve` (async; each
+upstream round trip is an `await`, no blocking thread) →
 cache-store by (name,type)+TTL → reply, echoing the client's txn id with RA set
 and OPT mirrored only if the client used EDNS. Cache hits return in 0 ms against
 ~7 ms for a miss.
@@ -340,6 +378,37 @@ parses but only warns — it does nothing until open item #2.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **IPv6 root hints + `--root-hints` flag** — the built-in hints now ship both
+  families (the 13 AAAA addresses too), interleaved v4/v6 so either stack is
+  reached in the first hop or two. `query_server` binds a send socket of the
+  target's family, which is what actually makes AAAA glue and the v6 hints
+  reachable — a v4-wildcard socket cannot connect to a v6 address, so they were
+  dead before. `parse_root_hints` reads the published `named.root` format, and
+  `rdnsr --root-hints <file>` overrides the built-ins (fails loudly on a file
+  with no addresses; ignored when forwarding).
+- **RTT-based server selection** — `ask_any` now tries a zone's servers
+  fastest-known-first, folding each round trip into a smoothed per-server RTT
+  (EWMA, α=0.25) and charging a failure the full timeout, so a slow or dead
+  nameserver is demoted after one try instead of being waited on every query.
+  Unmeasured servers keep their input order; forwarding reuses the same path.
+  `RttStore` shares the delegation cache's capacity bound (0 disables it).
+- **0x20 case randomization + reply validation** — outgoing query names get
+  their letter case scrambled (draft-vixie-dnsext-dns0x20) and every reply is
+  now checked to actually answer the query: matching transaction id, and a
+  question that echoes the name sent — case-sensitively when 0x20 is on, which is
+  what makes the casing anti-spoof entropy. Neither check existed before; a reply
+  from the right address was taken on faith. `zero_x20` flag, default on.
+- **QNAME minimization (RFC 9156)** — the walk sends each server only the label
+  it is delegating (root learns the TLD, the leaf reaches only the authoritative
+  server), probing with QTYPE=NS so a zone cut shows as a referral and a plain
+  in-zone name as NODATA. Empty non-terminals cost one extra probe; NXDOMAIN on
+  an ancestor short-circuits (RFC 8020). `qname_minimization` config flag,
+  default on.
+- **Async resolver** — the whole resolve path (`resolve` → `recurse` →
+  `resolve_from_root` → `walk` → `ask_any` → `query_server`/TCP fallback) is
+  `tokio::net` now, so each round trip is an `await` and `rdnsr` awaits `resolve`
+  directly instead of pinning a `spawn_blocking` thread for the sum of the hops.
+  Glueless-delegation recursion is boxed (`Box::pin`) to keep the future finite.
 - **Delegation cache** — resolution starts at the deepest known zone instead of
   the root every time; stale entries fall back to the root rather than failing.
 - **Real recursion, with forwarding as a mode** — root hints, referral walking,

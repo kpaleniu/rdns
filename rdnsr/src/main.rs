@@ -67,6 +67,10 @@ struct Cli {
     /// BIND and Unbound.
     #[arg(long)]
     upstream: Vec<SocketAddr>,
+    /// Root hints file (named.root format) to prime recursion from, replacing
+    /// the built-in list. Only used when recursing; ignored with --upstream.
+    #[arg(long)]
+    root_hints: Option<std::path::PathBuf>,
     /// Maximum number of cached RRsets.
     #[arg(long, default_value = "10000")]
     cache_size: usize,
@@ -91,8 +95,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.mode = ResolverMode::Forward;
         config.upstream_servers = cli.upstream.clone();
     }
+
+    // Custom root hints only make sense when recursing. Fail loudly on a hints
+    // file that yields no addresses — silently falling back to the built-ins
+    // would hide a misconfiguration.
+    let mut custom_hints = false;
+    if let Some(path) = &cli.root_hints {
+        if config.mode == ResolverMode::Recurse {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("reading root hints {}: {e}", path.display()))?;
+            let hints = rdns::resolver::parse_root_hints(&text);
+            if hints.is_empty() {
+                return Err(format!("no A/AAAA records found in {}", path.display()).into());
+            }
+            config.root_hints = hints;
+            custom_hints = true;
+        } else {
+            eprintln!("warning: --root-hints is ignored when forwarding (--upstream)");
+        }
+    }
+
     let source = match config.mode {
-        ResolverMode::Recurse => "recursing from the root hints".to_string(),
+        ResolverMode::Recurse if custom_hints => {
+            format!("recursing from {} root hints in {}", config.root_hints.len(), cli.root_hints.as_ref().unwrap().display())
+        }
+        ResolverMode::Recurse => "recursing from the built-in root hints".to_string(),
         ResolverMode::Forward => format!("forwarding to {:?}", config.upstream_servers),
     };
     let resolver = Arc::new(Resolver::new(config));
@@ -294,14 +321,9 @@ async fn handle_query(
     let mut resp = if let Some(records) = cache.get(&query.qname, query.qtype) {
         build_response(id, &query, records, ResponseCode::Ok, recursion)
     } else {
-        // Resolver::resolve is blocking, so run it off the async
-        // runtime's worker threads.
-        let resolver = resolver.clone();
-        let q = query.clone();
-        let resolved = tokio::task::spawn_blocking(move || resolver.resolve(&q))
-            .await
-            .ok()?;
-        match resolved {
+        // Resolver::resolve is async — each upstream round trip is an await, so
+        // this yields the task rather than holding a thread for the resolution.
+        match resolver.resolve(&query).await {
             Ok(mut upstream) => {
                 // The resolver used its own random transaction id; the reply
                 // must echo the client's id and advertise recursion.
