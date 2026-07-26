@@ -20,14 +20,18 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **338 lib + 15 integration** tests passing,
+`cargo test --workspace` = **381 lib + 15 integration** tests passing,
 `cargo clippy --workspace --all-targets` **clean, no exceptions**.
 
-**Next task: still #5**, and what is left there is the two bigger pieces: **AXFR**
-(no handler at all, and the one with a security requirement attached — ACL,
-default deny, log every attempt) and the **response-size-blind rate limiter**.
-What is left under #2 is RFC 5011 key rollover (needs persistent state),
-CNAME-chain validation and `rdnsd` signing.
+**#5 is closed, and TSIG and NOTIFY with it.** The work now has a spine: **#7,
+the secondary role** — `rdnsd` can hand a zone out (AXFR) and announce a change
+(NOTIFY) but cannot *be* a replica of anything, which is what IXFR would exist to
+serve. #7 lists it in six steps with the persistence design settled first (see
+"Architecture: persistence"). Start at step 1.
+
+Still open outside that: #2's RFC 5011 key rollover (cheaper than it looks — see
+the item), CNAME-chain validation and `rdnsd` zone signing; #1's two
+aggressive-use extensions; and #6, a candidate rather than a plan.
 
 **The flaky test is fixed.** `bench::bench_logger_throughput` asserted
 `>45k ops/sec` against a measurement of 47–50k, so any competing load failed the
@@ -48,6 +52,13 @@ cargo clippy --workspace --all-targets
 # everything. Serves UDP and TCP; run one process per transport.
 cargo run -p rdnsd -- udp --host 127.0.0.1 --port 15353 --zone-file example.com.zone
 cargo run -p rdnsd -- tcp --host 127.0.0.1 --port 15353 --zone-file example.com.zone
+
+# Zone transfers are refused unless a peer is named. AXFR is TCP-only.
+cargo run -p rdnsd -- tcp --port 15353 --zone-file example.com.zone \
+  --allow-transfer 127.0.0.1 --allow-transfer 10.0.0.0/8
+
+# Response bytes per second per client (UDP). 8192 by default; 0 turns it off.
+cargo run -p rdnsd -- udp --port 15353 --zone-file example.com.zone --response-rate 4096
 
 # Resolver, recursing from the root hints. Serves UDP and TCP on one port, and
 # binds 127.0.0.1 by default on purpose — not an open resolver.
@@ -104,6 +115,28 @@ r.setServers(['127.0.0.1:15353']);
 r.resolve4('www.example.com', console.log);
 ```
 
+**dnspython is installed on this machine** (2.8.0, `pip install dnspython`) and is
+the better tool for anything cryptographic, because its TSIG is interop-tested
+against BIND — it signs, verifies, and does AXFR with a keyring, so it can be put
+on either side of an exchange. It is *not* a project dependency; it exists so a
+third party can disagree with us:
+
+```python
+import dns.message, dns.query, dns.tsig, dns.tsigkeyring, dns.name, dns.zone
+ring = dns.tsigkeyring.from_text({'transfer.key.': 'BASE64SECRET'})
+q = dns.message.make_query('example.com', 'SOA')
+q.use_tsig(ring, keyname=dns.name.from_text('transfer.key.'),
+           algorithm=dns.tsig.HMAC_SHA256)
+print(dns.query.udp(q, '127.0.0.1', port=15353))          # verifies the reply's TSIG
+dns.zone.from_xfr(dns.query.xfr('127.0.0.1', 'example.com', port=15353,
+                                keyring=ring,
+                                keyname=dns.name.from_text('transfer.key.')))
+```
+
+This is the check the DNSSEC work did not have and should have: a MAC or a
+signature over a canonical serialization is the one thing that cannot be verified
+by both halves of your own code agreeing.
+
 Four environment traps that have each cost an hour:
 
 - **PowerShell 5.1 `-shl` keeps the left operand's `[byte]` type and truncates**,
@@ -153,8 +186,13 @@ Validation is on the resolve path and enforced (see "Architecture: DNSSEC" and
 
 - [ ] **No RFC 5011 automated key rollover.** A root KSK roll needs either a new
       build or a new `--trust-anchor` file. RFC 5011 tracks the new key from the
-      zone itself during an overlap window; worth having, but it needs
-      persistent state across restarts, which nothing here has yet.
+      zone itself during an overlap window.
+      *Cheaper than this item used to claim.* The "persistent state" it needs is
+      what Unbound keeps in `auto-trust-anchor-file:` — one small writable text
+      file of key states and timestamps, rewritten as keys roll. Not a database,
+      and no interaction with zone storage at all: `TrustAnchors::parse` and
+      `from_file` already exist, so it is a writer plus the state machine. It is
+      the most self-contained item left on this list.
 - [ ] **CNAME chains are validated per-RRset, not as a chain.** Each RRset must
       verify under the keys of the zone that signed it, which is checked — but
       nothing verifies that the chain of CNAMEs itself is the one the client
@@ -178,12 +216,26 @@ touched — 20k allocations for one lookup on a 10k-record zone, measured at
 `bench_zone_lookup` guards the regression. See "Architecture: zone storage".
 
 ### 5. Smaller open items
-- [ ] **AXFR is not implemented at all** (no handler, no type 252). When adding
-      it, gate it on an ACL that defaults to deny and log every attempt — an open
-      AXFR is a whole-zone disclosure.
-- [ ] **Amplification:** `rdnsd` binds `0.0.0.0` by default and the rate limiter
-      is a flat 100 queries / 10 s / IP with no regard for *response size*. A
-      large-RRset query is cheap to send and expensive to answer.
+- [x] **AXFR** — done, see "Done so far" and "Architecture: zone transfer".
+- [x] **TSIG** (RFC 8945) — done, see "Architecture: TSIG". A key authorizes a
+      transfer from any address, and every signed query gets a signed answer.
+      Neither `rdnsr` nor `rdnsc` signs anything yet: TSIG is server-side only, so
+      there is no way to *send* a signed query from this workspace except from a
+      test.
+- [x] **NOTIFY** (RFC 1996) — done, see "Architecture: NOTIFY". `--also-notify`
+      tells a secondary at once instead of leaving it to the refresh timer, and an
+      incoming NOTIFY is answered as a NOTIFY.
+- [ ] **IXFR** (RFC 1995) — moved to #7, where it belongs: it is an optimisation
+      inside the secondary story rather than a feature of its own. Two things about
+      it are worth knowing before starting there. A request currently **cannot even
+      be received** — `validation.rs:128` rejects any request with a non-empty
+      authority section, and an IXFR request carries the client's SOA there. And a
+      server may *always* answer AXFR-style instead (RFC 1995 §4), which NSD did as
+      a primary for years, so the conformant first version needs no journal at all.
+- [x] **Amplification** — the response byte budget is in (`--response-rate`, UDP);
+      see "Done so far" and "Architecture: amplification". `rdnsd` still binds
+      `0.0.0.0` by default, which is the right default for an authoritative server
+      and the reason the budget matters.
       (Note: the resolver's outbound source port is already randomized via
       `UdpSocket::bind("0.0.0.0:0")`. Do **not** "fix" the servers to reply from
       a random port — a reply must come from the port the query was sent to.)
@@ -195,6 +247,91 @@ touched — 20k allocations for one lookup on a 10k-record zone, measured at
       "Done so far". Still missing from the parser: TTL unit suffixes (`1h`,
       `2d`), `\`-escaped dots inside a label, and `@` as an rdata name.
 - [x] TXT `<character-string>` framing — done, see "Done so far".
+
+### 7. The secondary role — replication, in six steps
+
+`rdnsd` is a standalone primary: it reads zone files, serves them, hands out copies
+(AXFR) and announces changes (NOTIFY). It cannot be the *other* end of any of that.
+Adding the client half makes it a replica in a single-writer, asynchronous,
+pull-based replication topology — one primary holds the editable copy, secondaries
+are read-only, NOTIFY is a wake-up hint rather than a data channel, and there is no
+election or conflict resolution because a replica never accepts writes. It also
+composes: a secondary can serve AXFR of a zone it fetched and NOTIFY further
+downstream, so one binary can be any node in a replication tree.
+
+What the client actually does, per (zone, master): load the local copy and its last
+refresh time → ask the master for the zone's SOA → compare serials (RFC 1982) →
+transfer if behind (AXFR, or IXFR with our SOA in the authority section) → verify,
+assemble, **swap in atomically** → persist → sleep on the SOA's REFRESH, RETRY and
+EXPIRE, with a NOTIFY short-circuiting the wait. EXPIRE is the one with teeth: out
+of contact past it, a secondary must **stop answering** rather than serve stale
+authoritative data.
+
+The steps, in decreasing value per line:
+
+- [ ] **1. Serve both transports in one process.** The prerequisite, and good on its
+      own: `rdnsd udp` and `rdnsd tcp` are separate processes today, and writable
+      state needs a single owner — two of them transferring the same zone and racing
+      to write it is not a design to grow into. `rdnsr` already does this. Merging
+      also lets the rate limiter, validator, logger and metrics be *shared* rather
+      than one set per transport, which is what they should have been.
+- [ ] **2. A zone-file writer**, plus the write-temp-then-rename helper. Independently
+      useful for dumping and debugging, and required by everything below. Text
+      presentation format, so the load path is the one already parsed and tested.
+- [ ] **3. Secondary role, AXFR-only.** Master configuration, refresh/retry/expire
+      timers, an AXFR client (the TSIG client primitives `sign_request` and
+      `check_response` already exist and are used only by tests), the state sidecar,
+      per-zone atomic swap, and acting on a NOTIFY instead of answering NOTAUTH.
+- [ ] **4. IXFR-out** from in-memory diffs computed at load time — BIND's
+      `ixfr-from-differences` semantics without an on-disk journal.
+- [ ] **5. IXFR-in**, which needs step 3's timers and step 4's delta handling.
+- [ ] **6. Persisted deltas**, only if dynamic UPDATE (RFC 2136) ever arrives — that
+      is what really needs a journal, because then the journal *is* the source of
+      truth between file syncs.
+
+**One simplification worth not re-deriving.** Applying a transfer does not need a
+record-removal API on `Zone`, and it is worth never adding one: the index holds
+*positions* into the record vector, so removal shifts every later position. A full
+AXFR is "build a new `Zone`, swap it in". An IXFR delta is "build a new `Zone` from
+the old records minus the deletes plus the adds, swap it in" — O(zone size) per
+transfer rather than per record, which at any zone size this serves is nothing.
+
+### 6. Candidate: special-use names in `rdnsr` (RFC 6761)
+
+Not required by anything here, and the smallest step towards `rdnsr` being usable
+as a real system resolver. Right now every one of these leaves the machine and
+goes to the root servers:
+
+- [ ] **`localhost` must resolve locally** — 127.0.0.1 / ::1, and must *never* be
+      sent upstream (RFC 6761 §6.3).
+- [ ] **`*.local` is mDNS, not DNS** (RFC 6762 §3) — the honest answer is REFUSED
+      or NXDOMAIN, immediately. Today it costs a full walk to the root, fails
+      slowly, and tells the root what LAN names are being looked up.
+- [ ] **Private-address reverse lookups** — `10.in-addr.arpa`,
+      `16-31.172.in-addr.arpa`, `168.192.in-addr.arpa`, `254.169.in-addr.arpa`,
+      and the v6 equivalents — should be answered NXDOMAIN locally (RFC 6303).
+      Leaking them exposes internal addressing and hammers AS112.
+- [ ] Also in RFC 6761: `invalid.` (always NXDOMAIN), `example.`/`example.com`/
+      `.net`/`.org` (ordinary, no special handling), and `10.in-addr.arpa` friends
+      above.
+
+Perhaps a hundred lines and a table, entirely inside this codebase's existing
+shape — unlike the rest of what a system resolver needs.
+
+**The rest of that ambition is deliberately not on this list**, because it is not
+DNS: dynamic upstreams and per-link split DNS from DHCP/NetworkManager/
+systemd-networkd (reconfiguring live when a VPN or a new Wi-Fi network appears),
+mDNS/LLMNR responding, DNS-over-TLS, a `resolvectl`-style control surface
+(flush-caches, statistics), privilege dropping and a systemd unit, and listening
+on 127.0.0.1 *and* ::1 at once — `rdnsr` binds one host:port
+(`rdnsr/src/main.rs:204`). That is a network-configuration daemon that happens to
+speak DNS, and it is a bigger project than this one. Smaller gaps in the same
+direction, if it is ever picked up: no opcode check (an UPDATE or NOTIFY is
+treated as a query rather than answered NOTIMP), no admission control on the UDP
+path (a task per datagram, unbounded — TCP has both caps), no rate limiting or
+query logging in `rdnsr` at all (both exist in the library, wired into `rdnsd`
+only), no signal handling, no EDNS cookies (RFC 7873), and static root hints with
+no periodic re-priming of the root NS set.
 
 ---
 
@@ -506,6 +643,53 @@ zone's SOA in the authority section (RFC 2308 §2.1, §2.2). Without it a
 downstream resolver — ours included — has no negative TTL and cannot cache the
 answer at all.
 
+## Architecture: persistence
+
+Settled before writing any of #7, because every step below depends on it: **plain
+files, no database**, with the format chosen per kind of state.
+
+| state | store | why |
+|-------|-------|-----|
+| fetched zone data | a text **zone file**, written by us | the format already parsed and tested here; inspectable; what NSD and BIND do |
+| per-zone transfer state | a small **line-based text file** (`zone serial last-refresh master`) | keeps operational state out of the interchange format — BIND leans on the file's mtime instead and pays in imprecision |
+| IXFR deltas | **in memory**, derived by diffing at load time | zones come from files and reload in discrete events; NSD answered AXFR instead of deltas as a primary for years |
+| RFC 5011 anchors | a **writable trust-anchor file** | Unbound's `auto-trust-anchor-file:` model; `TrustAnchors::parse`/`from_file` already exist |
+
+Four rules, and the first is why step 1 of #7 exists at all:
+
+- **One writer per file.** Which means one process: two `rdnsd`s over the same zone
+  cannot both own writable state.
+- **Write a temporary file, then rename.** `std::fs::rename` replaces an existing
+  file on both Unix and Windows, so this is portable; the fsync-the-directory
+  refinement is POSIX-only.
+- **Nothing on the query path touches disk.** Memory stays authoritative for
+  answering — the zone index is 0.685 µs a lookup and must stay that way. Disk
+  exists to survive a restart, nothing else.
+- **Missing or corrupt state degrades, never crashes.** No state file means "never
+  refreshed", which means fetch. The same posture the caches already take: when in
+  doubt, go and ask.
+
+**Why not SQL or LMDB.** PowerDNS is database-backed because in its deployments the
+*source of truth* is a provisioning system's database; here it is a zone file. SQL
+would add a C dependency and a schema-migration story to persist a few kilobytes,
+buy nothing on the hot path (the in-memory index stays either way, so the database
+is an expensive file), and cost the dependency-light character of the rest of this
+codebase. LMDB is Knot's choice and right *at Knot's scale* — journals, catalog
+zones, key state, hundreds of thousands of zones; this serves single digits. Three
+triggers would change the answer: thousands of zones, dynamic UPDATE at a real
+write rate, or an external system owning the data.
+
+**What the others actually persist**, since it is the evidence for the table above:
+NSD keeps `xfrd.state` for serials and transfer times and rewrites secondary zones
+into their zone files hourly; BIND keeps a per-zone `.jnl` journal (dynamic UPDATE,
+IXFR both ways, inline signing) plus managed-key files for RFC 5011; Knot puts
+journal, timers and key state in LMDB. And the surprise: **neither BIND nor Unbound
+persists its resolver cache** — `dumpdb`/`dump_cache` are inspection tools, and
+Unbound's only real answer is the optional Redis-backed `cachedb` module. Knot
+Resolver is the outlier that does (LMDB on disk). So `rdnsr` losing its cache on
+restart is mainstream rather than a gap, and is the one store on this page not to
+build.
+
 ## Architecture: zone storage
 
 Records live in one vector; an index built as they are added maps the absolute,
@@ -549,6 +733,159 @@ entirely, including for types it does not carry (RFC 1034 §4.3.3, RFC 4592
 §2.2.1). The old scan returned the exact and the wildcard records together,
 merging two owners' data into one RRset; that is fixed as a side effect of having
 to decide the question.
+
+## Architecture: amplification
+
+Two limiters, because there are two different quantities to bound and the second
+one is what a reflection attack is measured in.
+
+`RateLimiter` counts **queries** per client: 100 per 10 s, burst 20. That is a
+fairness limit, and it is blind to amplification — a query is a query whether the
+answer is 60 bytes or 4000, so a client staying inside it can still have the
+server emit 25 KB/s at whatever address it claims to be.
+
+`ResponseLimiter` counts **bytes going out** per client: `--response-rate`, 8 KiB/s
+by default with a four-second burst. The burst is what keeps ordinary use out of
+it — a page load is a dozen names at once — while the sustained rate is what an
+attacker would need and cannot get.
+
+Over budget, the response is **truncated rather than dropped**, one in every two
+(the *slip* of BIND's Response Rate Limiting; RFC 5358 is the reflector problem
+itself). A truncated reply carries no records and measured 42 bytes against the
+44-byte query that asked for it, so it cannot amplify — and RFC 1035 §4.2.1 has a
+real client retry over TCP, where the handshake proves the source address and the
+budget stops applying. Dropping every over-budget response instead would leave a
+legitimate client with nothing but a timeout and no hint that TCP would work;
+answering every one of them would make the refusal itself the reflector.
+
+The per-client table is **bounded** (10k addresses). A spoofed flood arrives from
+every address there is, so unbounded tracking would be the next thing to exhaust;
+past the bound the limiter stops growing and truncates instead, which is small,
+still answerable over TCP, and no longer proportional to the number of forged
+sources.
+
+Measured on a zone with a 2.5 KB TXT RRset, one address, 5.5 s at 200 queries/s:
+**32.7 KB/s** of responses with the budget off against **13.2 KB/s** with the
+default — the 8 KB/s rate plus the 32 KB burst spread over the window, which is
+the arithmetic working rather than a leak.
+
+## Architecture: NOTIFY
+
+A NOTIFY is not a query, and that is the whole of the difference. The opcode is 4
+rather than 0, so a server dispatching on nothing but the question section answers
+it as a lookup for the zone's SOA — a plausible reply to a message that asked
+nothing. `rdnsd` dispatches on the opcode now: QUERY goes to the zone lookup,
+NOTIFY is answered as a NOTIFY, and everything else (UPDATE, STATUS, the obsolete
+IQUERY) gets NOTIMP instead of being treated as a lookup.
+
+**Sending** is on zone load — startup, and SIGHUP where signals exist — for every
+zone whose serial moved *forward*, compared against what was last announced.
+Unchanged is not news; backwards is not either, since a secondary compares serials
+and would ignore it. The comparison is RFC 1982 serial arithmetic, so a serial
+wrapping past 2^32 still reads as an increment rather than as a rollback that would
+silence the zone forever. The message carries the zone's SOA (RFC 1996 §3.7 makes
+that optional) because it saves the secondary a question. Retries are bounded and
+any rcode ends them: a secondary answering NOTAUTH has still received it. The
+targets are exactly what `--also-notify` lists — not the zone's NS set, which BIND
+derives and which would mean sending to whatever a zone happens to name.
+
+Messages are built under the zone lock and sent outside it: an unanswered NOTIFY
+takes seconds to retry, and holding the map that long would block a reload behind
+the network.
+
+**Receiving** is answered NOTAUTH, because it is the truth — this server is a
+primary, with no secondary role, no master to be told by and nothing to fetch. The
+attempt is logged either way, distinguishing a zone we serve from one we do not: a
+NOTIFY from an unexpected source is worth seeing (RFC 1996 §3.10 has a secondary
+log exactly that).
+
+## Architecture: TSIG
+
+A TSIG is not a record, it is a *pseudo*-record: appended as the last entry of the
+additional section, covering the message it is attached to. Verifying one means
+removing it again and hashing what is left — which is why `tsig.rs` works on bytes
+rather than on a parsed `DnsMessage`. A re-serialized message is not necessarily
+the same bytes (name compression is a choice), and the MAC is over the bytes that
+were actually sent. `find_tsig` walks the wire format to locate the record,
+`strip_tsig` reproduces the message as it was before signing (ARCOUNT one lower,
+the signer's own id restored — a forwarder may have rewritten the one on the
+wire), and `append_tsig` puts one on.
+
+What the digest covers (RFC 8945 §4.3.3, §5.4.2):
+
+```text
+request:   message-without-TSIG || TSIG variables
+response:  2-byte length || request MAC || message-without-TSIG || TSIG variables
+envelope:  2-byte length || previous MAC || message-without-TSIG || timers only
+```
+
+The **request MAC in the response's digest** is the part that matters: it binds
+the answer to the question, so a reply cannot be replayed as the reply to
+something else. For a zone transfer the MACs **chain** — each envelope over the
+previous one, and the messages after the first hash only the timers (§5.3.1) — so
+a dropped or reordered envelope fails at the client instead of passing for a
+complete zone.
+
+**Three failures, and they say different things.** BADKEY: I do not know that key
+name, or not with that algorithm — which is also the answer for an algorithm we do
+not implement, since either way we cannot check what arrived, and it is what stops
+a peer downgrading SHA-256 to SHA-1 by asking. BADSIG: I know the key and the MAC
+does not match. BADTIME: the MAC *did* match but the clocks disagree by more than
+the fudge. The first two go back unsigned (there is nothing to sign with, or no
+reason to believe the sender holds the key); BADTIME is signed and carries this
+server's time, so the peer can see which of the two clocks is wrong (§5.2.3).
+
+**Checked before anything answers.** A server that answered the question first and
+verified the signature afterwards would be answering questions for whoever asked.
+
+**A truncated MAC is refused** (BADTRUNC) rather than accepted at half length:
+that is a policy this server does not have, and the honest failure is better than
+a shorter MAC than the operator thinks they configured.
+
+Two deliberate limits. A TSIG that is not the *last* record is treated as no
+signature at all, because it does not cover what follows it — accepting one would
+be a way to append anything to a signed message. And nothing here signs *outgoing*
+queries: `rdnsr` and `rdnsc` have no TSIG support, so the only client in the
+workspace is the test suite.
+
+## Architecture: zone transfer
+
+`transfer::axfr_messages` turns a zone into the sequence of messages a transfer
+is; who may ask is `security::TransferAcl`'s business, and the two are separate
+on purpose — the shape of the answer has nothing to do with the policy, and the
+policy is the part that must be impossible to get wrong by accident.
+
+**The framing is the protocol.** A transfer opens with the zone's SOA and closes
+with the same SOA (RFC 5936 §2.2). That is not decoration: without the closing
+SOA a client cannot tell a complete transfer from a stream that was cut, so the
+apex SOA is emitted exactly twice and skipped in the middle. Messages are packed
+to a 16 KiB target using an estimate that ignores name compression — an estimate
+that can only be too large is the safe direction, since the real limit is the
+64 KiB length prefix. Every message repeats the question and stands on its own as
+a well-formed authoritative answer (§2.2.1 permits omitting it after the first;
+including it is simpler and equally legal). A serialization failure part-way
+through abandons the whole transfer rather than sending a prefix of it.
+
+**The ACL defaults to refusing everyone**, which is the opposite of how the rest
+of a nameserver works and is the point: an ordinary query leaks one record, an
+AXFR leaks the zone. Rules are addresses or CIDR prefixes; families do not mix, so
+a v4-mapped v6 peer cannot reach a v4 rule; a malformed rule stops the server
+rather than silently shortening the list. Every attempt is logged either way — a
+refused transfer is a probe worth seeing, and an allowed one is a copy of the zone
+leaving the building.
+
+**Three refusals, three different rcodes.** Not on the list is REFUSED (a policy
+decision). A name that is not a zone apex we serve is NOTAUTH — deliberately not
+the enclosing-zone lookup an ordinary query does, or asking for
+`www.example.com.` would transfer `example.com.`. A zone with no SOA is SERVFAIL,
+because there is nothing to bracket the transfer with. Over UDP it is FORMERR: a
+whole zone does not fit a datagram and the protocol has no way to say "there is
+more", so the request is malformed rather than merely unwelcome.
+
+The TCP server's `answer` returns a *list* of framed messages for this reason.
+One task pushes them into the reply channel in order, so a transfer's messages
+never reorder among themselves; another query's reply may land between them,
+which is legal — a client demultiplexes on the transaction id.
 
 ## Architecture: DNS over TCP (both daemons)
 
@@ -624,6 +961,48 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **NOTIFY (RFC 1996), and the opcode field was being read wrong** — a secondary
+  had no way to hear that a zone changed except its own refresh timer. New `notify`
+  module and `--also-notify`: sent on zone load for every zone whose serial moved
+  forward (RFC 1982 arithmetic, so a wrap is not read as a rollback), carrying the
+  SOA, retried until acknowledged. An incoming NOTIFY is answered *as* a NOTIFY
+  with NOTAUTH — this server is a primary, not a secondary — and other opcodes get
+  NOTIMP rather than being treated as lookups. See "Architecture: NOTIFY".
+- **The opcode decode masked instead of shifting** — `hi & 0x70` where the field
+  needs `(hi >> 3) & 0x0f`. It dropped the low bit and never shifted, so IQUERY
+  arrived as QUERY, and NOTIFY, UPDATE and STATUS all arrived as `Unknown`; the
+  *write* side shifted correctly, so the two disagreed. Invisible because every
+  test used QUERY, whose value survives any mask — the same shape as the RRSIG
+  expiration/inception swap. NOTIFY could not have worked at all before it.
+- **TSIG (RFC 8945)** — `--allow-transfer` authenticates by address, and an address
+  is a claim the network makes on a peer's behalf. New `tsig` module: HMAC-SHA1 /
+  256 / 384 / 512 over the RFC 8945 digest, `--tsig-key [alg:]name:base64` on both
+  subcommands, verification before anything is answered, signed replies to signed
+  queries, chained MACs across the envelopes of a zone transfer, and BADKEY /
+  BADSIG / BADTIME / BADTRUNC as distinct answers. A key authorizes a transfer from
+  any address; the log line says whether a key or an address allowed it.
+  Cross-checked against dnspython in both directions, which is the check the DNSSEC
+  work never had. See "Architecture: TSIG".
+- **A response *byte* budget, not just a query count** — the rate limiter counted
+  requests, which is blind to the thing an amplification attack is made of: one
+  small query can pull a 2.5 KB answer, and a forged source address turns that
+  into someone else's traffic. `security::ResponseLimiter` meters bytes leaving
+  per client (`--response-rate`, UDP only — a TCP query has completed a handshake,
+  so there is nobody to reflect at), with a four-second burst so ordinary use
+  never sees it, and RRL-style *slip*: every second response over budget goes out
+  truncated rather than dropped, which cannot amplify and tells a real client to
+  retry over TCP. The tracking table is bounded, because a spoofed flood comes
+  from every address there is. Measured: 32.7 KB/s out with the budget off,
+  13.2 KB/s with it on. See "Architecture: amplification".
+- **AXFR (RFC 5936), refused by default** — zone transfer, which the server had no
+  handler for at all. The response is the sequence RFC 5936 §2.2 asks for: the SOA
+  first, the zone, the same SOA last, split into messages that fit a TCP frame, so
+  a client can tell a finished transfer from a cut one. Gated on
+  `security::TransferAcl` — addresses or CIDR prefixes, **empty by default, which
+  refuses everyone** — and every attempt is logged whether or not it was allowed.
+  TCP only: over UDP it is FORMERR, since a zone does not fit a datagram and the
+  protocol cannot say "there is more". An AXFR for a name that is not a zone apex
+  we serve gets NOTAUTH, not the enclosing zone. See "Architecture: zone transfer".
 - **Negative caching, the plain kind (RFC 2308)** — a "no" costs as much to obtain
   as a "yes" and was cached only when it validated, which for most deployments
   meant never: every repeat of a failing lookup was a fresh walk. New

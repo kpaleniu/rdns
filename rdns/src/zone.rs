@@ -100,6 +100,20 @@ impl Zone {
         }
     }
 
+    /// The serial from the apex SOA, if the zone has one.
+    ///
+    /// The serial is how every other server decides whether what it holds is
+    /// stale, so it is the one field a zone is compared by — NOTIFY sends it,
+    /// and a secondary's refresh check is a comparison of it.
+    pub fn serial(&self) -> Option<u32> {
+        self.query(&self.origin, crate::utils::record_types::SOA)
+            .first()
+            .and_then(|soa| match soa.rdata.parse() {
+                Ok(crate::ParsedRecord::SOA { serial, .. }) => Some(serial),
+                _ => None,
+            })
+    }
+
     /// Whether the zone holds anything at `name` — by that name or through a
     /// wildcard. This is the NXDOMAIN question: a name that exists with no
     /// record of the queried type is NODATA, which is a different answer.

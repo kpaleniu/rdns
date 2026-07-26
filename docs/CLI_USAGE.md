@@ -119,6 +119,151 @@ rdnsd udp --zone-dir ./zones
 rdnsd udp --zone-dir .
 ```
 
+### `--response-rate <BYTES_PER_SEC>` (udp only)
+
+Response **bytes** per second, per client address. Default `8192`; `0` turns the
+budget off.
+
+The query limiter counts requests, which says nothing about amplification — a
+query is a query whether the answer is 60 bytes or 4000. An attacker forging a
+victim's source address picks the question with the largest answer, so the bytes
+going *out* are what has to be metered.
+
+- The burst allowance is four seconds' worth, so an ordinary page load (a dozen
+  names at once) is never touched.
+- Over budget, every second response is sent truncated (TC=1) instead of dropped.
+  That reply carries no records — smaller than the query that asked for it — and a
+  real client retries over TCP, where the handshake proves the source address and
+  the budget does not apply.
+- UDP only: a TCP query has completed a handshake, so there is nobody to reflect
+  at.
+
+```bash
+# The default: 8 KiB/s per client.
+rdnsd udp --zone-file example.com.zone
+
+# Tighter, for a server facing the open internet.
+rdnsd udp --zone-file example.com.zone --response-rate 4096
+
+# Off — only sensible on a closed network.
+rdnsd udp --zone-file example.com.zone --response-rate 0
+```
+
+Measured on a zone with a 2.5 KB TXT RRset, flooding for 5.5 s from one address:
+**32.7 KB/s** of responses with the budget off, **13.2 KB/s** with the default
+(the 8 KB/s rate plus the burst allowance spread across the window), and the
+truncated replies keep a legitimate client working.
+
+### `--allow-transfer <ADDR|CIDR>` (tcp only)
+
+Who may request a zone transfer (AXFR). **Repeatable, and empty by default —
+which refuses everyone.**
+
+An AXFR answers with the entire zone: every host, every internal name, the shape
+of the network. It is the one query where the answer is the whole database, so it
+is allowed by list rather than refused by exception. Every attempt is logged,
+permitted or not.
+
+- A rule is a bare address (`192.0.2.10`) or a CIDR prefix (`10.0.0.0/8`,
+  `2001:db8::/32`).
+- Address families do not mix: a v4 rule never matches a v6 peer, including a
+  v4-mapped one.
+- A malformed rule stops the server rather than quietly shortening the list.
+- Only on the `tcp` subcommand: AXFR is defined over TCP alone (RFC 5936 §4.2).
+  A UDP request for it gets FORMERR.
+
+```bash
+# One secondary.
+rdnsd tcp --zone-file example.com.zone --allow-transfer 192.0.2.10
+
+# Two of them, and a management subnet.
+rdnsd tcp --zone-file example.com.zone \
+  --allow-transfer 192.0.2.10 --allow-transfer 192.0.2.11 \
+  --allow-transfer 10.9.0.0/24
+
+# No flag: transfers refused, which is what you want unless a secondary needs one.
+rdnsd tcp --zone-file example.com.zone
+```
+
+### `--also-notify <ADDR[:PORT]>`
+
+A secondary to notify when a zone changes (RFC 1996). **Repeatable**, port
+defaults to 53, and available on both subcommands.
+
+Without it a secondary learns of a change when its refresh timer next goes off —
+for a typical SOA, hours later. A NOTIFY says so at once, and the secondary
+decides what to do about it.
+
+- Sent **on zone load**: at startup, and again on SIGHUP where signals are
+  supported, for every zone whose serial moved *forward*. An unchanged serial is
+  not news, and one that went backwards would be ignored by the secondary anyway.
+- The message carries the zone's SOA, so the secondary sees the new serial without
+  asking a second question.
+- Retried up to three times with a doubling wait. Any rcode counts as an
+  acknowledgement — a secondary answering NOTAUTH has still received it, and
+  repeating would not change its mind.
+- A bare IPv6 address needs brackets to carry a port: `[::1]:5353`.
+
+```bash
+# Two secondaries.
+rdnsd udp --zone-file example.com.zone \
+  --also-notify 192.0.2.10 --also-notify 192.0.2.11
+
+# One on a non-standard port, for testing.
+rdnsd tcp --zone-file example.com.zone --also-notify 127.0.0.1:15353
+```
+
+Not done: notifying the zone's own NS set. BIND derives the list from the NS
+records; here it is only what `--also-notify` says, which is explicit and never
+surprises a host that happens to be named in a zone.
+
+**Receiving** a NOTIFY is answered NOTAUTH: this server is a primary, with no
+secondary role, no master to be told by, and nothing to fetch. The attempt is
+logged either way — a NOTIFY from an unexpected source is worth seeing.
+
+### `--tsig-key <[ALG:]NAME:SECRET>`
+
+A TSIG key (RFC 8945). **Repeatable**, and available on both subcommands.
+
+Holding a key is an identity; arriving from an address is not. `--allow-transfer`
+trusts the network to tell the truth about who is calling; TSIG replaces that with
+a keyed MAC over the message.
+
+- The secret is base64, as in a BIND `key {}` statement. The algorithm defaults to
+  `hmac-sha256` (what RFC 8945 requires) and may be `hmac-sha1`, `hmac-sha384` or
+  `hmac-sha512`. `hmac-md5` is deprecated by RFC 8945 and is not implemented.
+- **A signed request may transfer a zone whatever its source address** — a key is
+  a stronger statement than an address, so it does not also need to be on
+  `--allow-transfer`. Both remain grants; the log line says which one applied.
+- Any signed query gets a signed answer, on either transport, so a client can tell
+  the reply came from something holding the key rather than from whatever answered
+  first.
+- A signature that does not check out gets NOTAUTH and a TSIG saying which of
+  **BADKEY** (no such key here), **BADSIG** (wrong secret, or the message changed)
+  or **BADTIME** (clocks more than 300 s apart — the reply carries this server's
+  time so the peer can see which side is wrong) it was.
+- A malformed key spec stops the server rather than leaving a key the operator
+  believes is configured silently absent.
+
+```bash
+# Transfers to whoever holds the key, from anywhere.
+rdnsd tcp --zone-file example.com.zone \
+  --tsig-key hmac-sha256:transfer.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=
+
+# Belt and braces: the key, and only from the secondary's address.
+rdnsd tcp --zone-file example.com.zone \
+  --tsig-key transfer.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI= \
+  --allow-transfer 192.0.2.10
+
+# Signed ordinary queries over UDP, answered signed.
+rdnsd udp --zone-file example.com.zone \
+  --tsig-key transfer.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=
+```
+
+Interoperability was checked against dnspython, whose TSIG is interop-tested
+against BIND: it signs a query that `rdnsd` verifies, verifies the answer `rdnsd`
+signs, and validates every envelope of a multi-message zone transfer.
+
 ## Zone Source
 
 Exactly one of `--zone-file` or `--zone-dir` must be specified.

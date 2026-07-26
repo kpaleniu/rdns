@@ -38,6 +38,11 @@ pub mod record_types {
     pub const DNSKEY: u16 = 48;
     /// NSEC3 record (next secure v3)
     pub const NSEC3: u16 = 50;
+    /// AXFR — a whole-zone transfer. A QTYPE only: no record ever has this type,
+    /// and it is defined over TCP alone (RFC 5936).
+    pub const AXFR: u16 = 252;
+    /// ANY (`*`) — also a QTYPE only.
+    pub const ANY: u16 = 255;
 }
 
 /// Normalize a domain name to lowercase and remove trailing dot

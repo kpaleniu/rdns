@@ -18,7 +18,10 @@ pub mod logging;
 pub mod bench;
 pub mod cache;
 pub mod resolver;
+pub mod transfer;
+pub mod tsig;
 pub mod metrics;
+pub mod notify;
 pub mod nsec_cache;
 pub mod negative_cache;
 pub mod dnssec;
@@ -52,7 +55,7 @@ mod macros {
     }
 }
 
-#[derive(Debug, FromPrimitive, ToPrimitive, Clone)]
+#[derive(Debug, FromPrimitive, ToPrimitive, Clone, Copy, PartialEq, Eq)]
 pub enum OpCode {
     Query = 0,
     IQuery = 1, // RFC3425: IQUERY obsolete
@@ -844,7 +847,13 @@ impl DnsMessage {
         let (auth_len, rest) = read_be!(u16, rest);
         let (add_len, mut rest) = read_be!(u16, rest);
 
-        let opcode = OpCode::from_u8(hi & 0x70).unwrap_or(OpCode::Unknown);
+        // The opcode is bits 3..6 of the flags' high byte, so it has to be
+        // shifted down. Masking in place (`hi & 0x70`) read every opcode wrong:
+        // it dropped the low bit, so IQUERY (1) came out as QUERY and NOTIFY (4),
+        // UPDATE (5) and STATUS (2) all came out as `Unknown` — while the *write*
+        // side shifted correctly, so the two disagreed. Nothing noticed because
+        // every test used QUERY, whose value survives any mask.
+        let opcode = OpCode::from_u8((hi >> 3) & 0x0f).unwrap_or(OpCode::Unknown);
 
         let mut queries: Vec<QuerySection> = Vec::new();
         for _ in 0..query_len {
@@ -1155,6 +1164,50 @@ mod tests {
         ];
 
         assert_eq!(&buf[0..n], &expected);
+    }
+
+    /// Every opcode has to survive the wire, and until this test none but QUERY
+    /// did: the decoder masked the field in place instead of shifting it down, so
+    /// IQUERY arrived as QUERY and NOTIFY, UPDATE and STATUS all arrived as
+    /// `Unknown`. The writer shifted correctly, which is why no round trip
+    /// noticed — every test used QUERY, and 0 survives any mask.
+    #[test]
+    fn test_every_opcode_survives_the_wire() {
+        for opcode in [
+            OpCode::Query,
+            OpCode::IQuery,
+            OpCode::Status,
+            OpCode::Notify,
+            OpCode::Update,
+        ] {
+            let msg = DnsMessage {
+                id: 0x1234,
+                response: false,
+                opcode,
+                authoritive: true,
+                truncation: false,
+                recursion: false,
+                recursion_ok: false,
+                ad: false,
+                cd: false,
+                rcode: ResponseCode::Ok,
+                queries: vec![QuerySection {
+                    qname: "example.com.".to_string(),
+                    qtype: 6,
+                    qclass: QueryClass::IN,
+                }],
+                answers: Vec::new(),
+                authorities: Vec::new(),
+                additionals: Vec::new(),
+            };
+            let mut buf = vec![0u8; 512];
+            let n = msg.to_bytes(&mut buf).expect("serialize");
+            let parsed = DnsMessage::try_from_bytes(&buf[..n]).expect("parse");
+            assert_eq!(parsed.opcode, opcode, "opcode {opcode:?} did not round-trip");
+            // And the flags either side of it are unharmed.
+            assert!(parsed.authoritive, "AA survived alongside {opcode:?}");
+            assert!(!parsed.response);
+        }
     }
 
     // -----------------------------------------------------------------
