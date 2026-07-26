@@ -514,41 +514,228 @@ pub fn proves_nxdomain(qname: &str, zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]
 
 /// Whether these records prove `qname` exists but has no record of `qtype`
 /// (NODATA).
-pub fn proves_nodata(qname: &str, qtype: u16, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
+///
+/// Two shapes, and the second is easy to forget. Usually the zone has a record
+/// *at* the name and its NSEC lists the types present, so the absence of `qtype`
+/// from the bitmap is the whole proof. But the name may not exist at all and a
+/// **wildcard** may be what answered — and then have had no record of this type
+/// either. The zone's proof for that is a different pair of records: one showing
+/// the name itself is absent, and the NSEC/NSEC3 *at the wildcard* showing what
+/// a wildcard would have answered with (RFC 4035 §5.4, RFC 5155 §8.7).
+///
+/// Demanding only the first shape refuses a perfectly good answer, which is what
+/// this used to do: any zone with a wildcard got SERVFAIL for every type the
+/// wildcard does not carry.
+pub fn proves_nodata(
+    qname: &str,
+    zone: &str,
+    qtype: u16,
+    nsecs: &[Nsec],
+    nsec3s: &[Nsec3],
+) -> Denial {
     for nsec in nsecs {
         if !nsec.matches(qname) {
             continue;
         }
-        if nsec.has_type(qtype) {
-            return Denial::NotProved(format!("the NSEC at {qname} says type {qtype} exists"));
-        }
-        // A CNAME at the name would have been followed instead of answered
-        // NODATA, so its presence contradicts the proof.
-        if nsec.has_type(rt::CNAME) {
-            return Denial::NotProved(format!("{qname} has a CNAME, which is not NODATA"));
-        }
-        return Denial::Proved;
+        return nodata_bitmap(qtype, qname, |t| nsec.has_type(t));
     }
 
     for nsec3 in nsec3s {
         match nsec3.matches(qname) {
-            Ok(true) => {
-                if nsec3.has_type(qtype) {
-                    return Denial::NotProved(format!(
-                        "the NSEC3 for {qname} says type {qtype} exists"
-                    ));
-                }
-                if nsec3.has_type(rt::CNAME) {
-                    return Denial::NotProved(format!("{qname} has a CNAME, which is not NODATA"));
-                }
-                return Denial::Proved;
-            }
+            Ok(true) => return nodata_bitmap(qtype, qname, |t| nsec3.has_type(t)),
             Ok(false) => {}
             Err(e) => return Denial::NotProved(format!("NSEC3 for {qname} unusable: {e}")),
         }
     }
 
+    // Nothing is at the name, so the name does not exist and a wildcard is what
+    // answered. Both halves of that have to be shown.
+    if !nsecs.is_empty() {
+        return nsec_wildcard_nodata(qname, qtype, nsecs);
+    }
+    if !nsec3s.is_empty() {
+        return nsec3_wildcard_nodata(qname, zone, qtype, nsec3s);
+    }
+
     Denial::NotProved(format!("no NSEC or NSEC3 record denies type {qtype} at {qname}"))
+}
+
+/// The bitmap half of a NODATA proof, shared by NSEC and NSEC3 and by both the
+/// plain and the wildcard case: the type asked for must be absent, and so must
+/// CNAME — a CNAME at the name would have been followed rather than answered
+/// NODATA, so its presence contradicts the proof.
+fn nodata_bitmap(qtype: u16, at: &str, has_type: impl Fn(u16) -> bool) -> Denial {
+    if has_type(qtype) {
+        return Denial::NotProved(format!("the denial at {at} says type {qtype} exists"));
+    }
+    if has_type(rt::CNAME) {
+        return Denial::NotProved(format!("{at} has a CNAME, which is not NODATA"));
+    }
+    Denial::Proved
+}
+
+/// Wildcard NODATA with NSEC: the name is covered (so it does not exist), and
+/// the wildcard at its closest encloser has an NSEC whose bitmap lacks the type.
+///
+/// The closest encloser is derived from the covering record rather than taken on
+/// the responder's word, which is what stops the answer from being a wildcard
+/// higher up the tree than the one that really governs the name — the same
+/// reasoning as [`proves_wildcard_expansion`], and the same machinery. Often one
+/// record does both jobs: `*.example.com.`'s own NSEC covers the ordinary names
+/// it answers for, because `*` sorts before every ordinary label.
+fn nsec_wildcard_nodata(qname: &str, qtype: u16, nsecs: &[Nsec]) -> Denial {
+    let Some(covering) = nsecs.iter().find(|n| n.covers(qname)) else {
+        return Denial::NotProved(format!("no NSEC matches or covers {qname}"));
+    };
+    let wildcard = format!("*.{}", closest_encloser_nsec(qname, covering));
+    let Some(matching) = nsecs.iter().find(|n| n.matches(&wildcard)) else {
+        return Denial::NotProved(format!(
+            "{qname} does not exist and no NSEC at {wildcard} says what a wildcard would \
+             have answered"
+        ));
+    };
+    nodata_bitmap(qtype, &wildcard, |t| matching.has_type(t))
+}
+
+/// Wildcard NODATA with NSEC3 (RFC 5155 §8.7): the closest-encloser proof for
+/// `qname`, and an NSEC3 matching the wildcard at that encloser whose bitmap
+/// lacks the type.
+fn nsec3_wildcard_nodata(qname: &str, zone: &str, qtype: u16, nsec3s: &[Nsec3]) -> Denial {
+    let encloser = match nsec3_closest_encloser(qname, zone, nsec3s) {
+        Ok(encloser) => encloser,
+        Err(why) => return Denial::NotProved(why),
+    };
+    let wildcard = format!("*.{encloser}");
+    let Some(matching) = nsec3s
+        .iter()
+        .find(|n| n.matches(&wildcard).unwrap_or(false))
+    else {
+        return Denial::NotProved(format!(
+            "{qname} does not exist and no NSEC3 matches the wildcard {wildcard}"
+        ));
+    };
+    nodata_bitmap(qtype, &wildcard, |t| matching.has_type(t))
+}
+
+/// The outcome of checking a wildcard-expanded answer.
+///
+/// Three states rather than [`Denial`]'s two, because an Opt-Out NSEC3 span is
+/// neither a proof nor an attack: it declines to say whether a delegation sits
+/// in the gap, so the answer cannot be called authentic and cannot be called
+/// forged either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WildcardVerdict {
+    /// The name really had nothing of its own: expanding the wildcard was right.
+    Proved,
+    /// The records offered cannot settle it, through no fault of the answer.
+    /// Insecure, not bogus.
+    Unjudgeable(String),
+    /// No proof, or a proof of something else.
+    NotProved(String),
+}
+
+/// Whether these records prove that `owner` — a name answered out of the
+/// wildcard `wildcard` — had nothing of its own to answer with, so expanding
+/// that wildcard was the correct thing to do (RFC 4035 §5.3.4, RFC 5155 §8.8).
+///
+/// This is not a formality. A wildcard signature is made over the wildcard
+/// name, so it verifies at *every* name the wildcard could expand to: hold one
+/// genuine `*.example.com. A` RRset and its RRSIG, re-own them onto any name
+/// under `example.com.`, and the signature still checks out. Two things have to
+/// be shown before that is an answer rather than a substitution.
+///
+/// - **The name asked about has no records of its own.** Otherwise a wildcard is
+///   not what should have answered for it, and the real records are being
+///   suppressed in favour of ones the attacker chose.
+/// - **The wildcard is the one that name's closest encloser publishes**, not one
+///   further up the tree. If some ancestor of `owner` below `wildcard`'s parent
+///   exists, RFC 4592 §3.3.1 says the wildcard at *that* name (or nothing at
+///   all) governs, and a `*.example.com.` answer for `a.b.example.com.` when
+///   `b.example.com.` exists is exactly the substitution above wearing a
+///   correct-looking signature. For NSEC that check is the closest encloser the
+///   covering record implies; NSEC3 gets it for free, because the name it has to
+///   cover — the "next closer" — is derived from where the wildcard sits.
+pub fn proves_wildcard_expansion(
+    owner: &str,
+    wildcard: &str,
+    nsecs: &[Nsec],
+    nsec3s: &[Nsec3],
+) -> WildcardVerdict {
+    let owner = crate::dnssec::canonical_name(owner);
+    let Some(encloser) = wildcard_encloser(wildcard) else {
+        return WildcardVerdict::NotProved(format!("{wildcard} is not a wildcard name"));
+    };
+    if crate::dnssec::label_count(&owner) <= crate::dnssec::label_count(&encloser) {
+        return WildcardVerdict::NotProved(format!(
+            "{owner} is not below {encloser}, so {wildcard} cannot have expanded to it"
+        ));
+    }
+
+    if !nsecs.is_empty() {
+        let Some(covering) = nsecs.iter().find(|n| n.covers(&owner)) else {
+            return WildcardVerdict::NotProved(format!(
+                "no NSEC covers {owner}, so nothing rules out records of its own"
+            ));
+        };
+        // Both ends of a covering NSEC exist, so the longest suffix `owner`
+        // shares with either is the deepest ancestor of `owner` known to exist.
+        // It has to be the name the wildcard hangs off; deeper means a closer
+        // encloser exists and this wildcard never applied.
+        let found = closest_encloser_nsec(&owner, covering);
+        if canonical_name_cmp(&found, &encloser) != Ordering::Equal {
+            return WildcardVerdict::NotProved(format!(
+                "the NSEC covering {owner} puts its closest encloser at {found}, \
+                 not at {encloser} where {wildcard} lives"
+            ));
+        }
+        return WildcardVerdict::Proved;
+    }
+
+    if !nsec3s.is_empty() {
+        // RFC 5155 §8.8: show the "next closer" name — one label below the
+        // encloser, on the way to `owner` — absent. Naming it from the
+        // wildcard's own position is what pins the expansion to the right depth.
+        let next_closer =
+            crate::dnssec::suffix_labels(&owner, crate::dnssec::label_count(&encloser) + 1);
+        if nsec3s
+            .iter()
+            .any(|n| !n.opt_out() && n.covers(&next_closer).unwrap_or(false))
+        {
+            return WildcardVerdict::Proved;
+        }
+        // Opt-out means the span may hold delegations the zone never named
+        // (RFC 5155 §6). If the next closer name were one of them, `owner` lives
+        // in a child zone and a referral was the honest answer — so this proves
+        // nothing, without being evidence of anything either.
+        if nsec3s
+            .iter()
+            .any(|n| n.covers(&next_closer).unwrap_or(false))
+        {
+            return WildcardVerdict::Unjudgeable(format!(
+                "the NSEC3 covering the next closer name {next_closer} has Opt-Out set"
+            ));
+        }
+        return WildcardVerdict::NotProved(format!(
+            "no NSEC3 covers the next closer name {next_closer}"
+        ));
+    }
+
+    WildcardVerdict::NotProved(format!(
+        "{owner} was answered from {wildcard} with no denial of {owner} at all"
+    ))
+}
+
+/// The name a wildcard hangs off: `*.example.com.` expands names below
+/// `example.com.`, which is therefore their closest encloser. `None` for a name
+/// that is not a wildcard.
+fn wildcard_encloser(wildcard: &str) -> Option<String> {
+    let name = crate::dnssec::canonical_name(wildcard);
+    let rest = name.strip_prefix("*.")?;
+    Some(if rest.is_empty() {
+        ".".to_string()
+    } else {
+        rest.to_string()
+    })
 }
 
 /// The longest suffix `qname` shares with either end of the NSEC that covers
@@ -583,11 +770,34 @@ fn common_suffix(a: &str, b: &str) -> String {
     }
 }
 
-/// The RFC 5155 §8.4 closest-encloser proof: find the deepest ancestor of
-/// `qname` that an NSEC3 matches, show the name one label below it is covered
-/// (so `qname` itself cannot exist), and show the wildcard at the encloser is
-/// covered too.
+/// The RFC 5155 §8.4 closest-encloser proof: `qname` cannot exist because its
+/// closest encloser is proven and the name one label below that is absent — plus
+/// the wildcard at the encloser accounted for, or one could still have answered.
 fn nsec3_closest_encloser_proof(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Denial {
+    let encloser = match nsec3_closest_encloser(qname, zone, nsec3s) {
+        Ok(encloser) => encloser,
+        Err(why) => return Denial::NotProved(why),
+    };
+    let wildcard = format!("*.{encloser}");
+    let wildcard_denied = nsec3s
+        .iter()
+        .any(|n| n.covers(&wildcard).unwrap_or(false) || n.matches(&wildcard).unwrap_or(false));
+    if !wildcard_denied {
+        return Denial::NotProved(format!("no NSEC3 accounts for the wildcard {wildcard}"));
+    }
+    Denial::Proved
+}
+
+/// The closest encloser of `qname` that these NSEC3 records prove
+/// (RFC 5155 §8.3): the deepest ancestor one of them matches, provided the name
+/// one label below it — the "next closer" — is covered. That pair is what makes
+/// `qname` itself impossible while naming the only wildcard that could have
+/// applied to it, so both the NXDOMAIN proof and the wildcard proofs start here.
+///
+/// `Err` carries why the proof does not stand. A record matching `qname` itself
+/// is one of those reasons: the name exists, so nothing below this is the
+/// question being asked.
+fn nsec3_closest_encloser(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Result<String, String> {
     let qname = crate::dnssec::canonical_name(qname);
     let zone = crate::dnssec::canonical_name(zone);
     let qlabels = crate::dnssec::label_count(&qname);
@@ -604,7 +814,7 @@ fn nsec3_closest_encloser_proof(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> De
             continue;
         }
         if depth == qlabels {
-            return Denial::NotProved(format!("an NSEC3 matches {qname}, so it exists"));
+            return Err(format!("an NSEC3 matches {qname}, so it exists"));
         }
         // The "next closer" name: one label longer than the encloser.
         let next_closer = crate::dnssec::suffix_labels(&qname, depth + 1);
@@ -612,19 +822,12 @@ fn nsec3_closest_encloser_proof(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> De
             .iter()
             .any(|n| n.covers(&next_closer).unwrap_or(false))
         {
-            return Denial::NotProved(format!("no NSEC3 covers the next closer name {next_closer}"));
+            return Err(format!("no NSEC3 covers the next closer name {next_closer}"));
         }
-        let wildcard = format!("*.{candidate}");
-        let wildcard_denied = nsec3s.iter().any(|n| {
-            n.covers(&wildcard).unwrap_or(false) || n.matches(&wildcard).unwrap_or(false)
-        });
-        if !wildcard_denied {
-            return Denial::NotProved(format!("no NSEC3 accounts for the wildcard {wildcard}"));
-        }
-        return Denial::Proved;
+        return Ok(candidate);
     }
 
-    Denial::NotProved(format!("no NSEC3 matches any ancestor of {qname}"))
+    Err(format!("no NSEC3 matches any ancestor of {qname}"))
 }
 
 #[cfg(test)]
@@ -894,9 +1097,135 @@ mod tests {
     fn test_nsec_nodata_proof() {
         let n = nsec("www.example.com.", "z.example.com.", &[rt::A, rt::RRSIG, rt::NSEC]);
         // No AAAA in the bitmap, so NODATA for AAAA is proven.
-        assert!(proves_nodata("www.example.com.", rt::AAAA, std::slice::from_ref(&n), &[]).is_proved());
+        assert!(proves_nodata(
+            "www.example.com.",
+            "example.com.",
+            rt::AAAA,
+            std::slice::from_ref(&n),
+            &[]
+        )
+        .is_proved());
         // But A is listed, so it cannot deny that.
-        assert!(!proves_nodata("www.example.com.", rt::A, &[n], &[]).is_proved());
+        assert!(!proves_nodata("www.example.com.", "example.com.", rt::A, &[n], &[]).is_proved());
+    }
+
+    /// A CNAME at the name would have been followed rather than answered NODATA,
+    /// so a bitmap listing one contradicts the proof.
+    #[test]
+    fn test_nsec_nodata_refuses_a_name_with_a_cname() {
+        let n = nsec("www.example.com.", "z.example.com.", &[rt::CNAME, rt::RRSIG]);
+        let denial = proves_nodata("www.example.com.", "example.com.", rt::A, &[n], &[]);
+        assert!(!denial.is_proved(), "{denial:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // Wildcard NODATA — the name does not exist and a wildcard answered,
+    // but the wildcard has no record of this type either
+    // -----------------------------------------------------------------
+
+    /// The ordinary shape, and the one that used to be refused: the zone holds
+    /// `*.example.com. A`, nothing at `a.example.com.`, and the query is for
+    /// AAAA. One NSEC does both jobs here — it sits at the wildcard (so its
+    /// bitmap says what a wildcard would answer) and covers `a.example.com.`
+    /// (so the name itself does not exist).
+    #[test]
+    fn test_wildcard_nodata_is_proved() {
+        let at_wildcard = nsec("*.example.com.", "www.example.com.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let denial = proves_nodata(
+            "a.example.com.",
+            "example.com.",
+            rt::AAAA,
+            std::slice::from_ref(&at_wildcard),
+            &[],
+        );
+        assert!(denial.is_proved(), "{denial:?}");
+
+        // A is in the wildcard's bitmap, so the wildcard *would* have answered
+        // that — this is not NODATA for A.
+        let denial = proves_nodata(
+            "a.example.com.",
+            "example.com.",
+            rt::A,
+            std::slice::from_ref(&at_wildcard),
+            &[],
+        );
+        assert!(!denial.is_proved(), "{denial:?}");
+    }
+
+    /// Covering the name is not enough on its own: without the record at the
+    /// wildcard there is nothing saying which types a wildcard carries, and the
+    /// honest answer to the query may have been an address.
+    #[test]
+    fn test_wildcard_nodata_needs_the_record_at_the_wildcard() {
+        let covering = nsec("m.example.com.", "z.example.com.", &[rt::A, rt::RRSIG]);
+        let denial = proves_nodata("nope.example.com.", "example.com.", rt::AAAA, &[covering], &[]);
+        assert!(!denial.is_proved(), "{denial:?}");
+    }
+
+    /// And the depth has to be right, for the same reason a wildcard *answer*
+    /// must come from the closest encloser: `b.example.com.` exists, so
+    /// `*.example.com.` never governed `a.b.example.com.`, and its bitmap says
+    /// nothing about that name.
+    #[test]
+    fn test_wildcard_nodata_at_the_wrong_depth_is_refused() {
+        let at_wildcard = nsec("*.example.com.", "b.example.com.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let covering = nsec("b.example.com.", "c.example.com.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        assert!(covering.covers("a.b.example.com."), "the name is covered");
+
+        let denial = proves_nodata(
+            "a.b.example.com.",
+            "example.com.",
+            rt::AAAA,
+            &[at_wildcard, covering],
+            &[],
+        );
+        assert!(
+            !denial.is_proved(),
+            "the closest encloser is b.example.com., whose wildcard was never shown: {denial:?}"
+        );
+    }
+
+    /// RFC 5155 §8.7: the closest-encloser proof, plus an NSEC3 matching the
+    /// wildcard whose bitmap lacks the type.
+    #[test]
+    fn test_nsec3_wildcard_nodata_is_proved() {
+        // `a.example.com.` does not exist: the encloser is the apex (matched),
+        // the next closer name is `a.example.com.` itself (covered), and the
+        // wildcard is matched with only A in its bitmap.
+        let apex = nsec3_matching("example.com.", &[rt::SOA, rt::NS, rt::RRSIG]);
+        let next_closer = nsec3_span_around("a.example.com.", 0);
+        let wildcard = nsec3_matching("*.example.com.", &[rt::A, rt::RRSIG]);
+        let proofs = vec![apex, next_closer, wildcard];
+
+        let denial = proves_nodata("a.example.com.", "example.com.", rt::AAAA, &[], &proofs);
+        assert!(denial.is_proved(), "{denial:?}");
+
+        // A is in the wildcard's bitmap.
+        let denial = proves_nodata("a.example.com.", "example.com.", rt::A, &[], &proofs);
+        assert!(!denial.is_proved(), "{denial:?}");
+
+        // And without the record at the wildcard there is no proof at all.
+        let denial = proves_nodata(
+            "a.example.com.",
+            "example.com.",
+            rt::AAAA,
+            &[],
+            &proofs[..2],
+        );
+        assert!(!denial.is_proved(), "{denial:?}");
+
+        // Nothing covering the next closer name, either: then `a.example.com.`
+        // may exist in its own right and the wildcard is not what answered. The
+        // closest-encloser proof is what rules that out, and it is also what
+        // pins the wildcard to the right depth.
+        let denial = proves_nodata(
+            "a.example.com.",
+            "example.com.",
+            rt::AAAA,
+            &[],
+            &[proofs[0].clone(), proofs[2].clone()],
+        );
+        assert!(!denial.is_proved(), "{denial:?}");
     }
 
     #[test]
@@ -910,6 +1239,200 @@ mod tests {
         let narrow = nsec("m.example.com.", "z.example.com.", &[rt::A]);
         let denial = proves_nxdomain("nope.example.com.", "example.com.", &[narrow], &[]);
         assert!(!denial.is_proved(), "{denial:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // Wildcard expansions
+    // -----------------------------------------------------------------
+
+    /// The ordinary case: `a.example.com.` answered from `*.example.com.`, with
+    /// the NSEC that shows `a.example.com.` has nothing of its own. In a real
+    /// zone the covering record is often the wildcard's own NSEC, since `*`
+    /// sorts before every ordinary label.
+    #[test]
+    fn test_wildcard_expansion_proved_by_a_covering_nsec() {
+        let covering = nsec("*.example.com.", "www.example.com.", &[rt::A, rt::RRSIG]);
+        let verdict = proves_wildcard_expansion(
+            "a.example.com.",
+            "*.example.com.",
+            std::slice::from_ref(&covering),
+            &[],
+        );
+        assert_eq!(verdict, WildcardVerdict::Proved, "{verdict:?}");
+    }
+
+    /// No denial at all: the signature verified, and that is all it did.
+    #[test]
+    fn test_wildcard_expansion_without_any_nsec_is_not_proved() {
+        let verdict = proves_wildcard_expansion("a.example.com.", "*.example.com.", &[], &[]);
+        assert!(matches!(verdict, WildcardVerdict::NotProved(_)), "{verdict:?}");
+    }
+
+    /// An NSEC that puts the name *inside* the zone's namespace — one whose
+    /// range does not contain it — is not the proof being asked for.
+    #[test]
+    fn test_wildcard_expansion_needs_the_name_covered() {
+        let elsewhere = nsec("m.example.com.", "n.example.com.", &[rt::A]);
+        let verdict =
+            proves_wildcard_expansion("a.example.com.", "*.example.com.", &[elsewhere], &[]);
+        assert!(matches!(verdict, WildcardVerdict::NotProved(_)), "{verdict:?}");
+    }
+
+    /// The attack the closest-encloser check exists to stop. `b.example.com.`
+    /// exists, so `a.b.example.com.` is governed by `*.b.example.com.` (or by
+    /// nothing at all) — never by `*.example.com.`. But the NSEC at
+    /// `b.example.com.` does cover `a.b.example.com.`, because a name sorts
+    /// before everything beneath it, so "some NSEC covers the name" would accept
+    /// a re-owned `*.example.com.` RRset here.
+    #[test]
+    fn test_wildcard_expansion_at_the_wrong_depth_is_refused() {
+        let covering = nsec("b.example.com.", "c.example.com.", &[rt::A, rt::RRSIG]);
+        assert!(
+            covering.covers("a.b.example.com."),
+            "the fact that makes the attack possible"
+        );
+
+        let verdict = proves_wildcard_expansion(
+            "a.b.example.com.",
+            "*.example.com.",
+            std::slice::from_ref(&covering),
+            &[],
+        );
+        assert!(
+            matches!(verdict, WildcardVerdict::NotProved(_)),
+            "the wildcard sits above the closest encloser: {verdict:?}"
+        );
+
+        // The wildcard at the closest encloser itself is fine.
+        let verdict = proves_wildcard_expansion(
+            "a.b.example.com.",
+            "*.b.example.com.",
+            &[covering],
+            &[],
+        );
+        assert_eq!(verdict, WildcardVerdict::Proved, "{verdict:?}");
+    }
+
+    /// A name that is not below the wildcard cannot have come from it, whatever
+    /// else is offered.
+    #[test]
+    fn test_wildcard_expansion_outside_the_wildcard_is_refused() {
+        let wide = nsec("example.com.", "z.example.com.", &[rt::SOA]);
+        let verdict = proves_wildcard_expansion("other.test.", "*.example.com.", &[wide], &[]);
+        assert!(matches!(verdict, WildcardVerdict::NotProved(_)), "{verdict:?}");
+    }
+
+    /// NSEC3 (RFC 5155 §8.8): what has to be covered is the "next closer" name,
+    /// one label below the wildcard's own position — which is what pins the
+    /// expansion to the right depth without a separate encloser check.
+    #[test]
+    fn test_nsec3_wildcard_expansion_covers_the_next_closer_name() {
+        let span = nsec3_span_around;
+
+        // `a.example.com.` from `*.example.com.`: the next closer name is
+        // `a.example.com.` itself.
+        let verdict = proves_wildcard_expansion(
+            "a.example.com.",
+            "*.example.com.",
+            &[],
+            &[span("a.example.com.", 0)],
+        );
+        assert_eq!(verdict, WildcardVerdict::Proved, "{verdict:?}");
+
+        // Two labels down, the next closer is the intermediate name — covering
+        // the leaf instead proves nothing about `b.example.com.`.
+        let verdict = proves_wildcard_expansion(
+            "a.b.example.com.",
+            "*.example.com.",
+            &[],
+            &[span("a.b.example.com.", 0)],
+        );
+        assert!(
+            matches!(verdict, WildcardVerdict::NotProved(_)),
+            "covering the leaf says nothing about its parent: {verdict:?}"
+        );
+        let verdict = proves_wildcard_expansion(
+            "a.b.example.com.",
+            "*.example.com.",
+            &[],
+            &[span("b.example.com.", 0)],
+        );
+        assert_eq!(verdict, WildcardVerdict::Proved, "{verdict:?}");
+    }
+
+    /// Opt-out declines to say whether a delegation sits in the span, so the
+    /// name may live in a child zone and a referral may have been the honest
+    /// answer. Neither a proof nor an accusation: insecure.
+    #[test]
+    fn test_nsec3_wildcard_expansion_over_an_opt_out_span_is_unjudgeable() {
+        let opt_out = nsec3_span_around("a.example.com.", 0x01);
+        let verdict =
+            proves_wildcard_expansion("a.example.com.", "*.example.com.", &[], &[opt_out]);
+        assert!(
+            matches!(verdict, WildcardVerdict::Unjudgeable(_)),
+            "{verdict:?}"
+        );
+    }
+
+    /// An NSEC3 in `example.com.` that *matches* `name` and covers nothing: its
+    /// span is the empty interval just above its own hash, so it can only ever
+    /// prove what its bitmap says about that one name and cannot stand in for a
+    /// covering record by accident.
+    fn nsec3_matching(name: &str, types: &[u16]) -> Nsec3 {
+        let salt = vec![0x01, 0x02];
+        let hash = nsec3_hash(name, &salt, 5).expect("hash");
+        Nsec3 {
+            owner: format!("{}.example.com.", base32hex_encode(&hash).to_lowercase()),
+            next_hashed_owner: hash_step(&hash, true),
+            owner_hash: hash,
+            zone: "example.com.".into(),
+            hash_algorithm: 1,
+            flags: 0,
+            iterations: 5,
+            salt,
+            type_bitmap: build_type_bitmap(types),
+        }
+    }
+
+    /// An NSEC3 in `example.com.` whose span contains exactly `name`'s hash and
+    /// nothing else: one step below it to one step above. Building the span from
+    /// the hash keeps the test deterministic — a span pinned to fixed bytes
+    /// covers or misses a freshly computed hash by luck.
+    fn nsec3_span_around(name: &str, flags: u8) -> Nsec3 {
+        let salt = vec![0x01, 0x02];
+        let hash = nsec3_hash(name, &salt, 5).expect("hash");
+        let low = hash_step(&hash, false);
+        Nsec3 {
+            owner: format!("{}.example.com.", base32hex_encode(&low).to_lowercase()),
+            owner_hash: low,
+            zone: "example.com.".into(),
+            hash_algorithm: 1,
+            flags,
+            iterations: 5,
+            salt,
+            next_hashed_owner: hash_step(&hash, true),
+            type_bitmap: build_type_bitmap(&[rt::A]),
+        }
+    }
+
+    /// A hash one step up or down, treated as the big-endian number it is
+    /// compared as, with the carry or borrow propagated.
+    fn hash_step(hash: &[u8], up: bool) -> Vec<u8> {
+        let mut out = hash.to_vec();
+        for byte in out.iter_mut().rev() {
+            if up {
+                *byte = byte.wrapping_add(1);
+                if *byte != 0x00 {
+                    break;
+                }
+            } else {
+                *byte = byte.wrapping_sub(1);
+                if *byte != 0xff {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     // -----------------------------------------------------------------

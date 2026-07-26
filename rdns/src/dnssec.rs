@@ -201,8 +201,17 @@ impl Rrsig {
     /// Whether this signature was made over a wildcard that was then expanded
     /// to reach `owner` (RFC 4035 §5.3.4): the label count in the RRSIG is
     /// fewer than the owner name actually has.
+    ///
+    /// The label arithmetic alone is not enough. The labels field never counts a
+    /// leading `*` (RFC 4034 §3.1.3), so the RRset sitting *at* the wildcard —
+    /// which every signed zone with a wildcard publishes, and which appears in
+    /// the authority section of every wildcard-aware denial — has one label more
+    /// than the RRSIG over it claims, and would read as an expansion. Comparing
+    /// against the name that was actually signed tells the two apart: an
+    /// expansion is precisely the case where the signed name is not the owner.
     pub fn is_wildcard_expansion(&self) -> bool {
         (self.labels as usize) < label_count(&self.owner)
+            && signed_owner(&self.owner, self.labels) != canonical_name(&self.owner)
     }
 }
 

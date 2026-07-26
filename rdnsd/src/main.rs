@@ -10,7 +10,7 @@ use rdns::{
     security::RateLimiter,
     telemetry::{instrumentation, DnsMetrics, LatencyTimer},
     validation::RequestValidator,
-    zone::{parse_zone_file, Zone},
+    zone::{parse_zone_file_at, Zone},
     DnsMessage, Edns, ResourceRecord, ResponseCode, EDNS_VERSION,
 };
 
@@ -134,15 +134,10 @@ fn make_response(
             if matching_records.is_empty() {
                 // Nothing of this type here. NXDOMAIN only if the *name* doesn't
                 // exist either; otherwise it's NOERROR with an empty answer
-                // (NODATA). Names must go through `Zone::matches_query`, which
-                // is what expands `@` and relative owner names against the
-                // origin — comparing the stored names raw never matches.
-                let name_exists = zone
-                    .records
-                    .iter()
-                    .any(|r| zone.matches_query(&r.name, &query.qname));
-
-                if !name_exists {
+                // (NODATA). `Zone::name_exists` is what expands `@` and relative
+                // owner names against the origin and accounts for a wildcard —
+                // comparing the stored names raw never matches.
+                if !zone.name_exists(&query.qname) {
                     response.rcode = ResponseCode::NoSuchDomain;
                 }
 
@@ -204,7 +199,7 @@ fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> 
     let mut candidates: Vec<_> = zone_map
         .values()
         .filter(|zone| {
-            let zone_origin = zone.origin.trim_end_matches('.').to_lowercase();
+            let zone_origin = zone.origin().trim_end_matches('.').to_lowercase();
             // The root zone serves everything; otherwise the query must be the
             // origin or sit under it *at a label boundary*, so that a zone for
             // "example.com" doesn't capture "notexample.com".
@@ -218,7 +213,7 @@ fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> 
     
     // Sort by zone origin length (longest first, most specific)
     candidates.sort_by(|a, b| {
-        b.origin.len().cmp(&a.origin.len())
+        b.origin().len().cmp(&a.origin().len())
     });
     
     candidates.first().copied()
@@ -645,11 +640,12 @@ async fn load_zones_from_source(
 ) -> Result<HashMap<String, Zone>, Box<dyn std::error::Error>> {
     match source {
         ZoneSource::SingleFile(path) => {
-            let content = std::fs::read_to_string(path)?;
+            // Path-aware, so a `$INCLUDE` in the file resolves next to it rather
+            // than against whatever directory the daemon happens to run in.
             let zone_origin = extract_zone_origin_from_path(path);
-            let zone = parse_zone_file(&content, &zone_origin)?;
+            let zone = parse_zone_file_at(Path::new(path), &zone_origin)?;
             let mut map = HashMap::new();
-            map.insert(zone.origin.clone(), zone);
+            map.insert(zone.origin().to_string(), zone);
             println!("Loaded zone from {}", path);
             Ok(map)
         }
@@ -693,22 +689,14 @@ fn enumerate_zone_files(dir: &str) -> Result<HashMap<String, Zone>, Box<dyn std:
         
         if path.extension().and_then(|s| s.to_str()) == Some("zone") {
             let path_str = path.to_string_lossy();
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    let zone_origin = extract_zone_origin_from_path(&path_str);
-                    match parse_zone_file(&content, &zone_origin) {
-                        Ok(zone) => {
-                            println!("Loaded zone from {}", path_str);
-                            zones.insert(zone.origin.clone(), zone);
-                        }
-                        Err(e) => {
-                            eprintln!("Error parsing zone file {}: {}", path_str, e);
-                            // Continue with next file
-                        }
-                    }
+            let zone_origin = extract_zone_origin_from_path(&path_str);
+            match parse_zone_file_at(&path, &zone_origin) {
+                Ok(zone) => {
+                    println!("Loaded zone from {}", path_str);
+                    zones.insert(zone.origin().to_string(), zone);
                 }
                 Err(e) => {
-                    eprintln!("Error reading zone file {}: {}", path_str, e);
+                    eprintln!("Error loading zone file {}: {}", path_str, e);
                     // Continue with next file
                 }
             }

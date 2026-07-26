@@ -25,7 +25,9 @@ use crate::dnssec::{
     algorithm_supported, canonical_name, digest_type_supported, label_count, verify_rrset, Dnskey,
     Ds, Rrset, RrsetProof, Rrsig,
 };
-use crate::dnssec_denial::{proves_no_ds, Denial, Nsec, Nsec3};
+use crate::dnssec_denial::{
+    proves_no_ds, proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
+};
 use crate::utils::record_types as rt;
 use crate::{RecordData, ResourceRecord};
 use anyhow::anyhow;
@@ -299,6 +301,44 @@ pub enum DelegationVerdict {
 /// The keys established for each zone so far, keyed by canonical zone name.
 pub type KeyStore = HashMap<String, Vec<Dnskey>>;
 
+/// An RRset that turned out to have been synthesized from a wildcard.
+///
+/// Kept rather than discarded because verifying its signature is only half of
+/// what RFC 4035 §5.3.4 asks: the other half is a denial, and the records that
+/// carry it are in a different section of the response from the ones that were
+/// just checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WildcardExpansion {
+    /// The name the records were served at.
+    pub owner: String,
+    /// The wildcard they were really signed at — `*.example.com.`.
+    pub wildcard: String,
+    /// The zone that signed them, and therefore the only zone whose denial of
+    /// `owner` counts.
+    pub signer: String,
+}
+
+/// What validating a set of records established.
+///
+/// `state` is not the whole verdict on its own: a `Secure` state alongside a
+/// non-empty `wildcards` means every signature checked out *and* one or more
+/// answers still owe a proof that the name they were served at does not exist
+/// (RFC 4035 §5.3.4). [`ChainValidator::validate_wildcard_proofs`] settles that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordsVerdict {
+    pub state: ValidationState,
+    pub wildcards: Vec<WildcardExpansion>,
+}
+
+impl RecordsVerdict {
+    fn state(state: ValidationState) -> Self {
+        RecordsVerdict {
+            state,
+            wildcards: Vec::new(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The validator
 // ---------------------------------------------------------------------------
@@ -521,9 +561,15 @@ impl<'a> ChainValidator<'a> {
     ///
     /// An RRset whose RRSIG names a zone we have no keys for is bogus, not
     /// unsigned: we walked to that zone precisely because it was signed.
-    pub fn validate_records(&self, records: &[ResourceRecord], keys: &KeyStore) -> ValidationState {
+    ///
+    /// A `Secure` state here is a statement about signatures only. Any RRset
+    /// that came from a wildcard is reported in
+    /// [`RecordsVerdict::wildcards`] and is not fully validated until its
+    /// denial has been checked too.
+    pub fn validate_records(&self, records: &[ResourceRecord], keys: &KeyStore) -> RecordsVerdict {
         let rrsigs: Vec<Rrsig> = records.iter().filter_map(Rrsig::from_record).collect();
         let mut validated_any = false;
+        let mut wildcards: Vec<WildcardExpansion> = Vec::new();
 
         for (owner, rtype, class, rdatas) in group_rrsets(records) {
             // Which zone claims to have signed this RRset.
@@ -533,20 +579,20 @@ impl<'a> ChainValidator<'a> {
                 .map(|s| s.signer_name.clone());
 
             let Some(signer) = signer else {
-                return ValidationState::Bogus(format!(
+                return RecordsVerdict::state(ValidationState::Bogus(format!(
                     "{owner} type {rtype} came back unsigned from a signed zone"
-                ));
+                )));
             };
             // A zone may only sign at or below itself.
             if !is_at_or_below(&owner, &signer) {
-                return ValidationState::Bogus(format!(
+                return RecordsVerdict::state(ValidationState::Bogus(format!(
                     "{owner} is signed by {signer}, which is not above it"
-                ));
+                )));
             }
             let Some(zone_keys) = keys.get(&signer) else {
-                return ValidationState::Bogus(format!(
+                return RecordsVerdict::state(ValidationState::Bogus(format!(
                     "{owner} is signed by {signer}, whose keys were never established"
-                ));
+                )));
             };
 
             match verify_rrset(
@@ -556,22 +602,123 @@ impl<'a> ChainValidator<'a> {
                 &signer,
                 self.now,
             ) {
-                RrsetProof::Verified { .. } => validated_any = true,
-                RrsetProof::Unsigned => {
-                    return ValidationState::Bogus(format!("{owner} type {rtype} is unsigned"))
+                RrsetProof::Verified { wildcard, .. } => {
+                    validated_any = true;
+                    if let Some(wildcard) = wildcard {
+                        wildcards.push(WildcardExpansion {
+                            owner: owner.clone(),
+                            wildcard,
+                            signer: signer.clone(),
+                        });
+                    }
                 }
-                RrsetProof::Unsupported(_) => return ValidationState::Insecure,
-                RrsetProof::Bogus(why) => return ValidationState::Bogus(why),
+                RrsetProof::Unsigned => {
+                    return RecordsVerdict::state(ValidationState::Bogus(format!(
+                        "{owner} type {rtype} is unsigned"
+                    )))
+                }
+                RrsetProof::Unsupported(_) => {
+                    return RecordsVerdict::state(ValidationState::Insecure)
+                }
+                RrsetProof::Bogus(why) => {
+                    return RecordsVerdict::state(ValidationState::Bogus(why))
+                }
             }
         }
 
-        if validated_any {
+        let state = if validated_any {
             ValidationState::Secure
         } else {
             // Nothing to check — an empty answer. The caller decides whether a
             // denial-of-existence proof is owed.
             ValidationState::Insecure
+        };
+        RecordsVerdict { state, wildcards }
+    }
+
+    /// Check that each wildcard-expanded RRset comes with a signed denial of the
+    /// name it was served at (RFC 4035 §5.3.4).
+    ///
+    /// `proofs` is where the NSEC/NSEC3 records may be found — the authority
+    /// section of the response, plus whatever earlier hops of a CNAME chase
+    /// carried. They are re-verified here rather than taken on trust: an NSEC an
+    /// attacker appended is exactly as easy to append as the answer it excuses,
+    /// and only the zone that signed the answer can deny a name in it.
+    pub fn validate_wildcard_proofs(
+        &self,
+        expansions: &[WildcardExpansion],
+        proofs: &[ResourceRecord],
+        keys: &KeyStore,
+    ) -> ValidationState {
+        for expansion in expansions {
+            let Some(zone_keys) = keys.get(&expansion.signer) else {
+                return ValidationState::Bogus(format!(
+                    "{} was expanded from {} by {}, whose keys were never established",
+                    expansion.owner, expansion.wildcard, expansion.signer
+                ));
+            };
+            let (nsecs, nsec3s) = self.verified_denials(proofs, &expansion.signer, zone_keys);
+            match proves_wildcard_expansion(&expansion.owner, &expansion.wildcard, &nsecs, &nsec3s)
+            {
+                WildcardVerdict::Proved => {}
+                // Not a proof, but not an accusation either: serve it without AD.
+                WildcardVerdict::Unjudgeable(_) => return ValidationState::Insecure,
+                WildcardVerdict::NotProved(why) => {
+                    return ValidationState::Bogus(format!(
+                        "{} was answered from the wildcard {} without proof that it has no \
+                         records of its own: {why}",
+                        expansion.owner, expansion.wildcard
+                    ))
+                }
+            }
         }
+        ValidationState::Secure
+    }
+
+    /// The NSEC and NSEC3 records in `records` that `zone` really signed.
+    ///
+    /// One that does not verify is dropped rather than reported: it is not
+    /// evidence of anything, and dropping it leaves whatever obligation needed
+    /// it unmet — a refusal by the same route, with one error path instead of
+    /// two. Each record is verified as an RRset of its own, which NSEC and NSEC3
+    /// always are (RFC 4034 §4.1.3 allows exactly one per owner name), so a
+    /// forged record spliced in beside a genuine one is discarded on its own
+    /// rather than invalidating the record it was meant to hide.
+    fn verified_denials(
+        &self,
+        records: &[ResourceRecord],
+        zone: &str,
+        keys: &[Dnskey],
+    ) -> (Vec<Nsec>, Vec<Nsec3>) {
+        let rrsigs: Vec<Rrsig> = records.iter().filter_map(Rrsig::from_record).collect();
+        let mut nsecs = Vec::new();
+        let mut nsec3s = Vec::new();
+        for rr in records {
+            let rtype = rr.rdata.rtype;
+            if rtype != rt::NSEC && rtype != rt::NSEC3 {
+                continue;
+            }
+            let rdatas = [rr.rdata.clone()];
+            if !matches!(
+                verify_rrset(
+                    &Rrset::new(&rr.name, rtype, rr.class, &rdatas),
+                    &rrsigs,
+                    keys,
+                    zone,
+                    self.now,
+                ),
+                RrsetProof::Verified { .. }
+            ) {
+                continue;
+            }
+            if let Some(nsec) = Nsec::from_record(rr) {
+                nsecs.push(nsec);
+            }
+            if let Some(nsec3) = Nsec3::from_record(rr) {
+                nsec3s.push(nsec3);
+            }
+        }
+        (nsecs, nsec3s)
     }
 }
 
@@ -939,10 +1086,9 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let mut keys = KeyStore::new();
         keys.insert("example.test.".into(), zone.dnskeys());
 
-        assert_eq!(
-            v.validate_records(&[answer, sig], &keys),
-            ValidationState::Secure
-        );
+        let verdict = v.validate_records(&[answer, sig], &keys);
+        assert_eq!(verdict.state, ValidationState::Secure);
+        assert!(verdict.wildcards.is_empty(), "not a wildcard answer");
     }
 
     #[test]
@@ -954,7 +1100,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let answer = a_record("www.example.test.", 1);
         let sig = zone.sign_records(std::slice::from_ref(&answer));
 
-        let state = v.validate_records(&[answer, sig], &KeyStore::new());
+        let state = v.validate_records(&[answer, sig], &KeyStore::new()).state;
         assert!(state.is_bogus(), "{state:?}");
     }
 
@@ -971,7 +1117,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let mut keys = KeyStore::new();
         keys.insert("evil.test.".into(), evil.dnskeys());
 
-        let state = v.validate_records(&[answer, sig], &keys);
+        let state = v.validate_records(&[answer, sig], &keys).state;
         assert!(state.is_bogus(), "{state:?}");
     }
 
@@ -985,7 +1131,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         keys.insert("example.test.".into(), zone.dnskeys());
 
         // A record with no RRSIG beside it, in a zone we know is signed.
-        let state = v.validate_records(&[a_record("www.example.test.", 1)], &keys);
+        let state = v.validate_records(&[a_record("www.example.test.", 1)], &keys).state;
         assert!(state.is_bogus(), "{state:?}");
     }
 
@@ -1009,8 +1155,167 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let mut keys = KeyStore::new();
         keys.insert("example.test.".into(), zone.dnskeys());
 
-        let state = v.validate_records(&[signed, sig, smuggled], &keys);
+        let state = v.validate_records(&[signed, sig, smuggled], &keys).state;
         assert!(state.is_bogus(), "{state:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // Wildcard answers
+    // -----------------------------------------------------------------
+
+    /// An NSEC resource record, ready to be signed.
+    fn nsec_record(owner: &str, next: &str, types: &[u16]) -> ResourceRecord {
+        ResourceRecord {
+            name: owner.to_string(),
+            class: 1,
+            ttl: 300,
+            rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
+                next_domain_name: next.to_string(),
+                type_bitmap: build_type_bitmap(types),
+            })
+            .unwrap(),
+        }
+    }
+
+    /// A wildcard-expanded answer verifies, and is reported as owing a proof
+    /// rather than being taken as complete.
+    #[test]
+    fn test_wildcard_answer_is_reported_as_owing_a_proof() {
+        let zone = TestZone::new("example.test.");
+        let anchors = TrustAnchors::default();
+        let v = ChainValidator::new(&anchors, current_unix_timestamp());
+
+        let answer = a_record("a.example.test.", 1);
+        let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
+
+        let mut keys = KeyStore::new();
+        keys.insert("example.test.".into(), zone.dnskeys());
+
+        let verdict = v.validate_records(&[answer, sig], &keys);
+        assert_eq!(verdict.state, ValidationState::Secure, "the signature is genuine");
+        assert_eq!(
+            verdict.wildcards.len(),
+            1,
+            "a verified signature is only half of a wildcard answer"
+        );
+        assert_eq!(verdict.wildcards[0].owner, "a.example.test.");
+        assert_eq!(verdict.wildcards[0].wildcard, "*.example.test.");
+        assert_eq!(verdict.wildcards[0].signer, "example.test.");
+    }
+
+    /// The whole point: with the signed NSEC the answer is secure; without it,
+    /// the same signature is not enough.
+    #[test]
+    fn test_wildcard_answer_needs_its_nsec() {
+        let zone = TestZone::new("example.test.");
+        let anchors = TrustAnchors::default();
+        let v = ChainValidator::new(&anchors, current_unix_timestamp());
+
+        let answer = a_record("a.example.test.", 1);
+        let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
+        let mut keys = KeyStore::new();
+        keys.insert("example.test.".into(), zone.dnskeys());
+        let expansions = v.validate_records(&[answer, sig], &keys).wildcards;
+
+        // The zone's own NSEC at the wildcard, which covers everything from
+        // `*.example.test.` up to `www.example.test.` — `a.example.test.`
+        // included, because `*` sorts before every ordinary label.
+        let nsec = nsec_record("*.example.test.", "www.example.test.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let nsec_sig = zone.sign_records(std::slice::from_ref(&nsec));
+
+        assert_eq!(
+            v.validate_wildcard_proofs(&expansions, &[nsec.clone(), nsec_sig.clone()], &keys),
+            ValidationState::Secure
+        );
+
+        let state = v.validate_wildcard_proofs(&expansions, &[], &keys);
+        assert!(state.is_bogus(), "no proof at all: {state:?}");
+
+        // And an unsigned NSEC is no proof: anyone can write one.
+        let state = v.validate_wildcard_proofs(&expansions, &[nsec], &keys);
+        assert!(state.is_bogus(), "unsigned proof: {state:?}");
+    }
+
+    /// A proof signed by somebody else does not count, even when we hold their
+    /// keys — only the zone that expanded the wildcard can say what is in it.
+    #[test]
+    fn test_wildcard_proof_from_another_zone_is_refused() {
+        let zone = TestZone::new("example.test.");
+        let stranger = TestZone::new("evil.test.");
+        let anchors = TrustAnchors::default();
+        let v = ChainValidator::new(&anchors, current_unix_timestamp());
+
+        let answer = a_record("a.example.test.", 1);
+        let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
+        let mut keys = KeyStore::new();
+        keys.insert("example.test.".into(), zone.dnskeys());
+        keys.insert("evil.test.".into(), stranger.dnskeys());
+        let expansions = v.validate_records(&[answer, sig], &keys).wildcards;
+
+        let nsec = nsec_record("*.example.test.", "www.example.test.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let forged = stranger.sign_records(std::slice::from_ref(&nsec));
+
+        let state = v.validate_wildcard_proofs(&expansions, &[nsec, forged], &keys);
+        assert!(state.is_bogus(), "{state:?}");
+    }
+
+    /// The substitution a wildcard signature makes possible: the RRset and its
+    /// RRSIG are genuine and verify at the re-owned name, because that is what
+    /// signing a wildcard means. `b.example.test.` exists, so this name's
+    /// closest encloser is `b.example.test.` and `*.example.test.` never applied
+    /// to it — and the NSEC the attacker has to offer says exactly that.
+    #[test]
+    fn test_wildcard_answer_re_owned_below_an_existing_name_is_bogus() {
+        let zone = TestZone::new("example.test.");
+        let anchors = TrustAnchors::default();
+        let v = ChainValidator::new(&anchors, current_unix_timestamp());
+
+        let answer = a_record("stolen.b.example.test.", 6);
+        let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
+        let mut keys = KeyStore::new();
+        keys.insert("example.test.".into(), zone.dnskeys());
+
+        let verdict = v.validate_records(&[answer, sig], &keys);
+        assert_eq!(
+            verdict.state,
+            ValidationState::Secure,
+            "the signature really does verify at the re-owned name — that is the problem"
+        );
+
+        // The genuine NSEC at `b.example.test.`, which does cover the re-owned
+        // name: a name sorts before everything beneath it.
+        let nsec = nsec_record("b.example.test.", "c.example.test.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let nsec_sig = zone.sign_records(std::slice::from_ref(&nsec));
+
+        let state = v.validate_wildcard_proofs(&verdict.wildcards, &[nsec, nsec_sig], &keys);
+        assert!(
+            state.is_bogus(),
+            "an expansion below an existing name must not validate: {state:?}"
+        );
+    }
+
+    /// A record sitting *at* a wildcard is not an expansion of it, even though
+    /// the RRSIG's label count is one short of the owner's — the labels field
+    /// never counts the `*`. Getting this wrong demands a proof that
+    /// `*.example.test.` does not exist, which would break every wildcard-aware
+    /// denial, since those carry precisely that record.
+    #[test]
+    fn test_the_wildcards_own_rrset_is_not_an_expansion() {
+        let zone = TestZone::new("example.test.");
+        let anchors = TrustAnchors::default();
+        let v = ChainValidator::new(&anchors, current_unix_timestamp());
+
+        let at_wildcard = a_record("*.example.test.", 1);
+        let sig = zone.sign_records(std::slice::from_ref(&at_wildcard));
+        let mut keys = KeyStore::new();
+        keys.insert("example.test.".into(), zone.dnskeys());
+
+        let verdict = v.validate_records(&[at_wildcard, sig], &keys);
+        assert_eq!(verdict.state, ValidationState::Secure);
+        assert!(
+            verdict.wildcards.is_empty(),
+            "the name asked about is the wildcard itself, which exists"
+        );
     }
 
     /// A DS is computed over the down-cased owner name, so the case a zone

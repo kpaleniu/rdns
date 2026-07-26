@@ -1,6 +1,8 @@
 use crate::{ParsedRecord, RecordData};
 use crate::utils::record_type_code;
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 
 /// A single DNS resource record stored in a zone
 #[derive(Debug, Clone)]
@@ -11,79 +13,185 @@ pub struct ZoneRecord {
     pub rdata: RecordData,
 }
 
-/// In-memory DNS zone storage
+/// In-memory DNS zone storage.
+///
+/// Records are held in one vector and reached through an index built as they are
+/// added: the absolute, down-cased owner name to the positions of the records at
+/// it. Without it, answering a query means filtering the whole vector and
+/// normalizing *both* names into fresh `String`s for every record touched — two
+/// allocations per record per query, which on a 10k-record zone measured 4.4 ms
+/// and 20k allocations for a single lookup.
+///
+/// Keying on the name rather than on (name, type) is deliberate. A server needs
+/// two questions answered, and the second one is what tells NXDOMAIN from
+/// NODATA: "which records of this type are at this name", and "does this name
+/// exist at all". A (name, type) map answers the first and cannot answer the
+/// second without probing 65535 types, whereas the records at one name are a
+/// handful, so selecting a type from them costs nothing measurable. It is also
+/// how NSD and Knot store a zone — a node per name, holding its RRsets.
+///
+/// `origin` and `records` are private because the index is derived from both: a
+/// record appended behind its back, or an origin changed without a rebuild,
+/// leaves the zone answering NXDOMAIN for data it holds. That bug has already
+/// happened here once, before there was an index to get wrong.
 #[derive(Debug, Clone)]
 pub struct Zone {
-    pub origin: String,
-    pub records: Vec<ZoneRecord>,
+    origin: String,
+    records: Vec<ZoneRecord>,
+    /// Positions in `records`, by [`Zone::lookup_key`] of the owner name.
+    index: HashMap<String, Vec<usize>>,
 }
 
 impl Zone {
     /// Create a new zone with the given origin (e.g., "example.com.")
     pub fn new(origin: String) -> Self {
         Zone {
-            origin: if origin.ends_with('.') {
-                origin
-            } else {
-                format!("{}.", origin)
-            },
+            origin: absolute(&origin),
             records: Vec::new(),
+            index: HashMap::new(),
         }
+    }
+
+    /// The zone's apex name, absolute.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Every record in the zone, in load order.
+    pub fn records(&self) -> &[ZoneRecord] {
+        &self.records
+    }
+
+    /// Move the zone's apex, as a top-level `$ORIGIN` does.
+    ///
+    /// The index keys are absolute names, so any record still held under a
+    /// *relative* name has to be re-keyed — that is what the rebuild is for.
+    /// Records the zone parser added are already absolute (it resolves each owner
+    /// name against the origin in force at its line, which is what makes
+    /// `$ORIGIN` apply to the lines below it), so this only moves records added
+    /// through [`Zone::add_record`] with a relative name.
+    pub fn set_origin(&mut self, origin: &str) {
+        self.origin = absolute(origin);
+        self.reindex();
     }
 
     /// Add a record to the zone
     pub fn add_record(&mut self, record: ZoneRecord) {
+        let key = self.lookup_key(&record.name);
+        self.index.entry(key).or_default().push(self.records.len());
         self.records.push(record);
     }
 
-    /// Query records by name and type
+    /// Query records by name and type.
+    ///
+    /// A wildcard is consulted only when the queried name has no records of its
+    /// own: an existing name shadows the wildcard entirely, types it does not
+    /// carry included (RFC 1034 §4.3.3, RFC 4592 §2.2.1). The linear scan this
+    /// replaced returned the exact *and* the wildcard records together, merging
+    /// two owners' data into one RRset.
     pub fn query(&self, name: &str, qtype: u16) -> Vec<&ZoneRecord> {
-        self.records
+        let key = self.lookup_key(name);
+        if let Some(at_name) = self.index.get(&key) {
+            return self.of_type(at_name, qtype);
+        }
+        match wildcard_for(&key).and_then(|w| self.index.get(&w)) {
+            Some(at_wildcard) => self.of_type(at_wildcard, qtype),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether the zone holds anything at `name` — by that name or through a
+    /// wildcard. This is the NXDOMAIN question: a name that exists with no
+    /// record of the queried type is NODATA, which is a different answer.
+    pub fn name_exists(&self, name: &str) -> bool {
+        let key = self.lookup_key(name);
+        self.index.contains_key(&key)
+            || wildcard_for(&key).is_some_and(|w| self.index.contains_key(&w))
+    }
+
+    /// The records at these positions that are of `qtype`.
+    fn of_type(&self, positions: &[usize], qtype: u16) -> Vec<&ZoneRecord> {
+        positions
             .iter()
-            .filter(|r| self.matches_query(&r.name, name) && record_type_code(&r.rdata) == qtype)
+            .map(|&i| &self.records[i])
+            .filter(|r| record_type_code(&r.rdata) == qtype)
             .collect()
+    }
+
+    /// Rebuild the index from `records`.
+    fn reindex(&mut self) {
+        let keys: Vec<String> = self
+            .records
+            .iter()
+            .map(|r| self.lookup_key(&r.name))
+            .collect();
+        self.index.clear();
+        for (position, key) in keys.into_iter().enumerate() {
+            self.index.entry(key).or_default().push(position);
+        }
+    }
+
+    /// The form a name is indexed and looked up under: absolute, and down-cased
+    /// because DNS names compare case-insensitively (RFC 4343 — ASCII only,
+    /// which is why this is `make_ascii_lowercase` and not `to_lowercase`).
+    fn lookup_key(&self, name: &str) -> String {
+        let mut key = self.normalize_name(name);
+        key.make_ascii_lowercase();
+        key
     }
 
     /// Helper to match domain names, handling wildcards and relative names.
     ///
     /// Both sides are normalized to absolute form first, so a record stored as
-    /// `@` or `www` matches a query for the origin or `www.<origin>.`.
+    /// `@` or `www` matches a query for the origin or `www.<origin>.`. This is
+    /// the definition of matching that the index encodes; a test holds the two
+    /// to the same answers.
     pub fn matches_query(&self, record_name: &str, query_name: &str) -> bool {
-        // DNS names compare case-insensitively (RFC 4343).
-        let record_name = self.normalize_name(record_name).to_lowercase();
-        let query_name = self.normalize_name(query_name).to_lowercase();
+        let record_name = self.lookup_key(record_name);
+        let query_name = self.lookup_key(query_name);
 
-        // Exact match
         if record_name == query_name {
             return true;
         }
-        
-        // Wildcard match (* matches one label)
-        if record_name.starts_with("*.") {
-            let wildcard_suffix = &record_name[1..]; // Skip the "*"
-            if query_name.ends_with(wildcard_suffix) {
-                // Check that wildcard doesn't match multiple labels
-                let prefix = &query_name[..query_name.len() - wildcard_suffix.len()];
-                if !prefix.contains('.') || prefix.is_empty() {
-                    return true;
-                }
-            }
-        }
-        
-        false
+        wildcard_for(&query_name).is_some_and(|w| w == record_name)
     }
 
     /// Normalize domain names to absolute form with trailing dot
     pub fn normalize_name(&self, name: &str) -> String {
-        let name = name.trim();
-        if name.is_empty() || name == "@" {
-            self.origin.clone()
-        } else if name.ends_with('.') {
-            name.to_string()
-        } else {
-            // Relative to zone origin
-            format!("{}.{}", name, self.origin)
-        }
+        absolutize(name, &self.origin)
+    }
+}
+
+/// A zone-file owner name in absolute form, resolved against `origin`: `@` and
+/// the empty name are the origin itself, a name ending in `.` is already
+/// absolute, and anything else is relative to it.
+fn absolutize(name: &str, origin: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() || name == "@" {
+        origin.to_string()
+    } else if name.ends_with('.') {
+        name.to_string()
+    } else {
+        format!("{name}.{origin}")
+    }
+}
+
+/// The wildcard name that could answer for `name`: its first label replaced by
+/// `*`. A wildcard covers one label and only one (RFC 4592 §2.1.1) — nothing
+/// deeper — so this single lookup is the whole of wildcard matching.
+///
+/// `None` only for a name with no labels at all.
+fn wildcard_for(name: &str) -> Option<String> {
+    let (_first_label, rest) = name.split_once('.')?;
+    Some(format!("*.{rest}"))
+}
+
+/// A name with its trailing dot.
+fn absolute(name: &str) -> String {
+    if name.ends_with('.') {
+        name.to_string()
+    } else {
+        format!("{name}.")
     }
 }
 
@@ -199,52 +307,234 @@ fn construct_type_bitmap(types: &[String]) -> Vec<u8> {
     result
 }
 
-/// Parse a BIND-format zone file
-pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
-    let mut zone = Zone::new(origin.to_string());
-    let mut current_name = String::new();
-    let mut current_ttl = 3600i32;
+/// One record or directive, assembled from as many physical lines as it spans.
+struct LogicalLine {
+    /// The physical line it started on, so an error still points at the file.
+    line_no: usize,
+    /// Comments stripped, parentheses removed, continuation lines joined.
+    text: String,
+    /// The first physical line began with whitespace, so the record inherits the
+    /// previous owner name (RFC 1035 §5.1).
+    omits_owner: bool,
+}
 
-    for (line_idx, raw_line) in content.lines().enumerate() {
-        let ln = line_idx + 1;
-        // Strip comments, but read the indentation off the raw line first: a
-        // record line that begins with whitespace omits its owner name and
-        // inherits the previous record's (RFC 1035 §5.1).
-        let uncommented = raw_line.split(';').next().unwrap_or("");
-        let omits_owner = uncommented.starts_with(|c: char| c.is_whitespace());
-        let line = uncommented.trim();
+/// Split a zone file into logical lines (RFC 1035 §5.1).
+///
+/// Three things make this more than `content.lines()`:
+///
+/// - **Parentheses group data across a line boundary**, which is how every real
+///   SOA is written. A parenthesized SOA used to fail the load outright, so the
+///   zone files this server could read were the ones nothing else writes.
+/// - **A `;` begins a comment — except inside a quoted string**, where it is
+///   data. TXT records are full of semicolons (SPF, DKIM), and cutting the line
+///   at the first one turned them silently into something shorter.
+/// - **A quoted string may hold parentheses too**, which must not open or close
+///   a group, and `\` escapes whatever follows it.
+fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, String> {
+    let mut out: Vec<LogicalLine> = Vec::new();
+    let mut pending: Option<LogicalLine> = None;
+    let mut depth = 0usize;
 
-        if line.is_empty() {
-            continue;
+    for (idx, raw) in content.lines().enumerate() {
+        let ln = idx + 1;
+        let mut text = String::with_capacity(raw.len());
+        let mut quoted = false;
+        let mut escaped = false;
+
+        for c in raw.chars() {
+            if escaped {
+                text.push(c);
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => {
+                    text.push(c);
+                    escaped = true;
+                }
+                '"' => {
+                    quoted = !quoted;
+                    text.push(c);
+                }
+                ';' if !quoted => break, // comment, to the end of the line
+                // The parentheses themselves are not data. Replacing them with a
+                // space keeps `(1` and `1)` from becoming tokens.
+                '(' if !quoted => {
+                    depth += 1;
+                    text.push(' ');
+                }
+                ')' if !quoted => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| format!("line {ln}: unmatched ')'"))?;
+                    text.push(' ');
+                }
+                _ => text.push(c),
+            }
+        }
+        if quoted {
+            return Err(format!("line {ln}: unterminated quoted string"));
         }
 
+        match &mut pending {
+            // Inside a group: this line continues the one that opened it.
+            Some(open) => {
+                let more = text.trim();
+                if !more.is_empty() {
+                    open.text.push(' ');
+                    open.text.push_str(more);
+                }
+            }
+            None => {
+                // A blank line outside a group is nothing at all. Inside one —
+                // a lone `(` on its own line — it still starts the record, so
+                // the line number and indentation come from there.
+                if text.trim().is_empty() && depth == 0 {
+                    continue;
+                }
+                pending = Some(LogicalLine {
+                    line_no: ln,
+                    omits_owner: text.starts_with(|c: char| c.is_whitespace()),
+                    text: text.trim().to_string(),
+                });
+            }
+        }
+
+        if depth == 0 {
+            if let Some(done) = pending.take() {
+                out.push(done);
+            }
+        }
+    }
+
+    if let Some(open) = pending {
+        return Err(format!(
+            "line {}: '(' is never closed before the end of the file",
+            open.line_no
+        ));
+    }
+    Ok(out)
+}
+
+/// How deep `$INCLUDE` may nest. A file that includes itself is a loop, and the
+/// only way to notice is to stop counting somewhere.
+const MAX_INCLUDE_DEPTH: usize = 8;
+
+/// What the parser carries from one line to the next.
+struct ParseState {
+    /// The origin relative owner names are resolved against — `$ORIGIN`, or the
+    /// origin an `$INCLUDE` named for the file being read.
+    origin: String,
+    /// The default TTL for records that do not state one (`$TTL`).
+    ttl: i32,
+    /// The last owner name seen, absolute, for lines that omit theirs.
+    owner: Option<String>,
+}
+
+/// Parse a BIND-format zone file.
+///
+/// `$INCLUDE` resolves relative paths against the process's working directory
+/// here, because a string of content has no directory of its own. Use
+/// [`parse_zone_file_at`] when the file is on disk — that resolves them the way
+/// an operator expects, next to the file doing the including.
+pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
+    parse_zone_file_with_base(content, origin, None)
+}
+
+/// Parse the zone file at `path`, resolving `$INCLUDE` relative to its directory.
+pub fn parse_zone_file_at(path: &Path, origin: &str) -> Result<Zone, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    parse_zone_file_with_base(&content, origin, path.parent())
+}
+
+fn parse_zone_file_with_base(
+    content: &str,
+    origin: &str,
+    base_dir: Option<&Path>,
+) -> Result<Zone, String> {
+    let mut zone = Zone::new(origin.to_string());
+    let mut state = ParseState {
+        origin: absolute(origin),
+        ttl: 3600,
+        owner: None,
+    };
+    parse_into(&mut zone, content, &mut state, base_dir, 0)?;
+    Ok(zone)
+}
+
+/// Read `content` into `zone`. Recurses for `$INCLUDE`, hence `depth`.
+fn parse_into(
+    zone: &mut Zone,
+    content: &str,
+    state: &mut ParseState,
+    base_dir: Option<&Path>,
+    depth: usize,
+) -> Result<(), String> {
+    for logical in logical_lines(content)? {
+        let ln = logical.line_no;
+        let parts: Vec<&str> = logical.text.split_whitespace().collect();
+        let Some(&first) = parts.first() else {
+            continue;
+        };
+
         // Handle $ORIGIN directive
-        if line.starts_with("$ORIGIN") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                zone.origin = if parts[1].ends_with('.') {
-                    parts[1].to_string()
-                } else {
-                    format!("{}.", parts[1])
-                };
+        if first.eq_ignore_ascii_case("$ORIGIN") {
+            if let Some(new_origin) = parts.get(1) {
+                state.origin = absolutize(new_origin, &state.origin);
+                // The apex is the zone's identity, so only the file that *is*
+                // the zone may move it — an included fragment redefining the
+                // zone it was pulled into would be a surprise, and RFC 1035
+                // §5.1 keeps an include's origin to the included file anyway.
+                if depth == 0 {
+                    zone.set_origin(&state.origin.clone());
+                }
             }
             continue;
         }
 
         // Handle $TTL directive
-        if line.starts_with("$TTL") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                current_ttl = parts[1]
+        if first.eq_ignore_ascii_case("$TTL") {
+            if let Some(value) = parts.get(1) {
+                state.ttl = value
                     .parse()
-                    .map_err(|e| format!("line {ln}: invalid $TTL {:?}: {e}", parts[1]))?;
+                    .map_err(|e| format!("line {ln}: invalid $TTL {value:?}: {e}"))?;
             }
             continue;
         }
 
-        // Parse zone record line
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
+        // Handle $INCLUDE directive: `$INCLUDE <file> [origin]`
+        if first.eq_ignore_ascii_case("$INCLUDE") {
+            let Some(&file) = parts.get(1) else {
+                return Err(format!("line {ln}: $INCLUDE needs a file name"));
+            };
+            if depth + 1 >= MAX_INCLUDE_DEPTH {
+                return Err(format!(
+                    "line {ln}: $INCLUDE nested more than {MAX_INCLUDE_DEPTH} deep — a cycle?"
+                ));
+            }
+            let path = match base_dir {
+                Some(dir) => dir.join(file),
+                None => PathBuf::from(file),
+            };
+            let included = std::fs::read_to_string(&path)
+                .map_err(|e| format!("line {ln}: $INCLUDE {}: {e}", path.display()))?;
+
+            // RFC 1035 §5.1: the origin an $INCLUDE names is for the included
+            // file, and nothing the included file does changes the origin of the
+            // file that included it. So the state goes in as a copy and none of
+            // it comes back — the owner name does not carry across either, since
+            // a fragment inheriting an owner from wherever it happened to be
+            // included is not something anyone can read.
+            let mut inner = ParseState {
+                origin: parts
+                    .get(2)
+                    .map(|o| absolutize(o, &state.origin))
+                    .unwrap_or_else(|| state.origin.clone()),
+                ttl: state.ttl,
+                owner: None,
+            };
+            parse_into(zone, &included, &mut inner, path.parent(), depth + 1)?;
             continue;
         }
 
@@ -254,25 +544,31 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
         // the token's shape: a name may end in '.' (an FQDN) or contain digits
         // (`www2`), and common host names collide with type mnemonics (`ns IN A
         // …` — `ns` is the owner there, not an NS record).
+        //
+        // The name is resolved against the origin *in force here* rather than
+        // stored relative, which is what makes `$ORIGIN` apply to the lines
+        // below it only and what lets an `$INCLUDE` bring records in under a
+        // different origin.
         let mut idx = 0;
-        if !omits_owner {
-            current_name = parts[0].to_string();
+        let record_name = if logical.omits_owner {
+            state.owner.clone().ok_or_else(|| {
+                format!("line {ln}: record omits its owner name but no previous record supplies one")
+            })?
+        } else {
+            let name = absolutize(first, &state.origin);
+            state.owner = Some(name.clone());
             idx += 1;
-        } else if current_name.is_empty() {
-            return Err(format!(
-                "line {ln}: record omits its owner name but no previous record supplies one"
-            ));
-        }
-        let record_name = current_name.clone();
+            name
+        };
 
         // Parse TTL and class
-        let mut ttl = current_ttl;
+        let mut ttl = state.ttl;
         let mut class = 1u16; // IN
 
         while idx < parts.len() {
             if let Ok(parsed_ttl) = parts[idx].parse::<i32>() {
                 ttl = parsed_ttl;
-                current_ttl = ttl;
+                state.ttl = ttl;
                 idx += 1;
             } else if parts[idx].eq_ignore_ascii_case("IN")
                 || parts[idx].eq_ignore_ascii_case("CH")
@@ -550,7 +846,7 @@ pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
         });
     }
 
-    Ok(zone)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -609,7 +905,7 @@ mail IN A   192.0.2.3
     #[test]
     fn test_owner_name_may_contain_digits() {
         let zone = parse_zone_file("www2 IN A 192.0.2.6\n", "example.com.").unwrap();
-        assert_eq!(zone.records[0].name, "www2");
+        assert_eq!(zone.records[0].name, "www2.example.com.", "stored absolute");
         assert_eq!(zone.query("www2.example.com.", 1).len(), 1);
     }
 
@@ -618,7 +914,7 @@ mail IN A   192.0.2.3
         // "ns IN A ..." is a host called `ns`, not an NS record — position, not
         // the token's spelling, decides what the first field is.
         let zone = parse_zone_file("ns IN A 192.0.2.7\n", "example.com.").unwrap();
-        assert_eq!(zone.records[0].name, "ns");
+        assert_eq!(zone.records[0].name, "ns.example.com.");
         assert_eq!(zone.query("ns.example.com.", 1).len(), 1, "should be an A record");
     }
 
@@ -628,7 +924,7 @@ mail IN A   192.0.2.3
         let zone_content = "www IN A 192.0.2.1\n    IN A 192.0.2.2\n";
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         assert_eq!(zone.records.len(), 2);
-        assert_eq!(zone.records[1].name, "www");
+        assert_eq!(zone.records[1].name, "www.example.com.");
         assert_eq!(zone.query("www.example.com.", 1).len(), 2);
     }
 
@@ -646,6 +942,321 @@ mail IN A   192.0.2.3
         assert_eq!(zone.query("www.example.com.", 1).len(), 1);
         // DNS names are case-insensitive (RFC 4343).
         assert_eq!(zone.query("WWW.Example.COM.", 1).len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // The index: wildcards, existence, and staying in step with the origin
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_wildcard_answers_a_name_that_does_not_exist() {
+        let zone = parse_zone_file("* IN A 192.0.2.9\n", "example.com.").unwrap();
+        assert_eq!(zone.query("anything.example.com.", 1).len(), 1);
+        // A wildcard covers one label and only one (RFC 4592 §2.1.1).
+        assert!(zone.query("a.b.example.com.", 1).is_empty());
+        // And it does not answer for the name it hangs off.
+        assert!(zone.query("example.com.", 1).is_empty());
+    }
+
+    /// An existing name shadows the wildcard completely — including for types it
+    /// does not carry (RFC 1034 §4.3.3, RFC 4592 §2.2.1). The linear scan this
+    /// replaced returned both the exact and the wildcard record for one query,
+    /// merging two owners' data into a single RRset.
+    #[test]
+    fn test_an_existing_name_shadows_the_wildcard() {
+        let zone =
+            parse_zone_file("* IN A 192.0.2.9\nwww IN AAAA 2001:db8::1\n", "example.com.").unwrap();
+
+        let a = zone.query("www.example.com.", 1);
+        assert!(
+            a.is_empty(),
+            "www exists, so the wildcard must not answer for it: {a:?}"
+        );
+        assert_eq!(zone.query("www.example.com.", 28).len(), 1, "its own AAAA");
+        // Any other name still gets the wildcard.
+        assert_eq!(zone.query("other.example.com.", 1).len(), 1);
+    }
+
+    #[test]
+    fn test_name_exists_distinguishes_nodata_from_nxdomain() {
+        let zone =
+            parse_zone_file("* IN A 192.0.2.9\nwww IN AAAA 2001:db8::1\n", "example.com.").unwrap();
+
+        assert!(zone.name_exists("www.example.com."), "by its own records");
+        assert!(
+            zone.name_exists("other.example.com."),
+            "through the wildcard — NODATA, not NXDOMAIN"
+        );
+        assert!(
+            !zone.name_exists("a.b.example.com."),
+            "two labels down, past what the wildcard reaches"
+        );
+        assert!(!zone.name_exists("elsewhere.test."));
+    }
+
+    /// The index encodes what `matches_query` defines, so the two must agree.
+    /// They are separate code, and a divergence would show up as a zone serving
+    /// NXDOMAIN for records it holds.
+    #[test]
+    fn test_the_index_and_matches_query_agree() {
+        let zone = parse_zone_file(
+            "@ IN A 192.0.2.1\nwww IN A 192.0.2.2\n* IN A 192.0.2.9\n",
+            "example.com.",
+        )
+        .unwrap();
+
+        for name in [
+            "example.com.",
+            "www.example.com.",
+            "WWW.EXAMPLE.COM.",
+            "other.example.com.",
+            "a.b.example.com.",
+            "*.example.com.",
+            "elsewhere.test.",
+            "com.",
+        ] {
+            let by_scan = zone
+                .records()
+                .iter()
+                .any(|r| zone.matches_query(&r.name, name));
+            assert_eq!(
+                zone.name_exists(name),
+                by_scan,
+                "the index and matches_query disagree about {name}"
+            );
+        }
+    }
+
+    /// `$ORIGIN` applies to the lines *below* it (RFC 1035 §5.1): a name already
+    /// read keeps the origin it was read under. Owner names are resolved as they
+    /// are parsed, which is what makes that true — and what `$INCLUDE`'s optional
+    /// origin needs in order to mean anything.
+    #[test]
+    fn test_origin_applies_only_to_the_lines_below_it() {
+        let zone_content = "www IN A 192.0.2.1\n$ORIGIN other.test.\nmail IN A 192.0.2.2\n";
+        let zone = parse_zone_file(zone_content, "example.com.").unwrap();
+
+        assert_eq!(
+            zone.query("www.example.com.", 1).len(),
+            1,
+            "www was read before the $ORIGIN and stays where it was"
+        );
+        assert_eq!(zone.query("mail.other.test.", 1).len(), 1);
+        assert!(zone.query("www.other.test.", 1).is_empty());
+    }
+
+    /// The `set_origin` re-key, which is what the index needs when a *relative*
+    /// name is added through the API and the origin moves afterwards. The parser
+    /// resolves names as it goes, so this is the path that still depends on it.
+    #[test]
+    fn test_set_origin_rekeys_relative_records() {
+        let mut zone = Zone::new("example.com.".to_string());
+        zone.add_record(ZoneRecord {
+            name: "www".to_string(),
+            ttl: 3600,
+            class: 1,
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
+        });
+        assert_eq!(zone.query("www.example.com.", 1).len(), 1);
+
+        zone.set_origin("other.test.");
+        assert_eq!(
+            zone.query("www.other.test.", 1).len(),
+            1,
+            "a relative name follows the origin it is relative to"
+        );
+        assert!(zone.query("www.example.com.", 1).is_empty());
+    }
+
+    /// A record added after the zone is built has to be reachable, or the index
+    /// is a cache that silently hides data.
+    #[test]
+    fn test_records_added_later_are_indexed() {
+        let mut zone = Zone::new("example.com.".to_string());
+        assert!(zone.query("www.example.com.", 1).is_empty());
+
+        zone.add_record(ZoneRecord {
+            name: "www".to_string(),
+            ttl: 3600,
+            class: 1,
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
+        });
+        assert_eq!(zone.query("www.example.com.", 1).len(), 1);
+        assert!(zone.name_exists("www.example.com."));
+    }
+
+    // -----------------------------------------------------------------
+    // Logical lines: parentheses, comments and quoted strings
+    // -----------------------------------------------------------------
+
+    /// The SOA as every zone file in the world actually writes it. This failed
+    /// the load outright before: the first line ended after `(`, so the record
+    /// had no type and the numbers on the lines below were parsed as owner names.
+    #[test]
+    fn test_parenthesized_soa_loads() {
+        let zone_content = r#"
+$TTL 3600
+@   IN  SOA ns1.example.com. admin.example.com. (
+                2021010101  ; serial
+                3600        ; refresh
+                1800        ; retry
+                604800      ; expire
+                86400 )     ; minimum
+@   IN  A   192.0.2.1
+"#;
+        let zone = parse_zone_file(zone_content, "example.com.").unwrap();
+        let soa = zone.query("example.com.", crate::utils::record_types::SOA);
+        assert_eq!(soa.len(), 1, "the SOA should have loaded");
+        match soa[0].rdata.parse().unwrap() {
+            ParsedRecord::SOA {
+                mname,
+                serial,
+                minimum,
+                ..
+            } => {
+                assert_eq!(mname, "ns1.example.com.");
+                assert_eq!(serial, 2021010101, "comments inside the group are not data");
+                assert_eq!(minimum, 86400);
+            }
+            other => panic!("expected an SOA, got {other:?}"),
+        }
+        // The record after the group is still read as its own line.
+        assert_eq!(zone.query("example.com.", 1).len(), 1);
+    }
+
+    /// A `;` inside a quoted string is data, not a comment. SPF and DKIM records
+    /// are mostly semicolons, and cutting the line at the first one silently
+    /// shortened them.
+    #[test]
+    fn test_semicolon_inside_a_quoted_string_survives() {
+        let zone_content = "txt IN TXT \"v=spf1 include:example.net; -all\"\n";
+        let zone = parse_zone_file(zone_content, "example.com.").unwrap();
+        let txt = zone.query("txt.example.com.", crate::utils::record_types::TXT);
+        assert_eq!(txt.len(), 1);
+        match txt[0].rdata.parse().unwrap() {
+            ParsedRecord::TXT(text) => {
+                assert!(text.contains("; -all"), "semicolon was eaten: {text:?}")
+            }
+            other => panic!("expected TXT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unbalanced_parentheses_are_an_error() {
+        let err = parse_zone_file("@ IN SOA ns1. admin. ( 1 2 3 4\n", "example.com.").unwrap_err();
+        assert!(err.contains("never closed"), "got: {err}");
+        assert!(err.contains("line 1"), "should point at the opening line: {err}");
+
+        let err = parse_zone_file("@ IN A 192.0.2.1 )\n", "example.com.").unwrap_err();
+        assert!(err.contains("unmatched"), "got: {err}");
+    }
+
+    #[test]
+    fn test_unterminated_quote_is_an_error() {
+        let err = parse_zone_file("txt IN TXT \"no closing quote\n", "example.com.").unwrap_err();
+        assert!(err.contains("unterminated"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // $INCLUDE
+    // -----------------------------------------------------------------
+
+    /// A scratch directory that removes itself, for the include tests — they
+    /// need real files, because resolving `$INCLUDE` is the thing being tested.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("rdns-zone-{tag}-{unique}"));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            ScratchDir(dir)
+        }
+
+        fn write(&self, name: &str, content: &str) -> std::path::PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, content).expect("write scratch file");
+            path
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_include_pulls_in_records_relative_to_the_including_file() {
+        let dir = ScratchDir::new("include");
+        dir.write("hosts.inc", "mail IN A 192.0.2.20\nwww IN A 192.0.2.21\n");
+        let main = dir.write(
+            "example.com.zone",
+            "@ IN A 192.0.2.1\n$INCLUDE hosts.inc\nftp IN A 192.0.2.22\n",
+        );
+
+        let zone = parse_zone_file_at(&main, "example.com.").unwrap();
+        assert_eq!(zone.query("mail.example.com.", 1).len(), 1, "from the include");
+        assert_eq!(zone.query("www.example.com.", 1).len(), 1);
+        assert_eq!(
+            zone.query("ftp.example.com.", 1).len(),
+            1,
+            "parsing continues after the include"
+        );
+        assert_eq!(zone.query("example.com.", 1).len(), 1);
+    }
+
+    /// `$INCLUDE file origin` reads the file under that origin — and RFC 1035
+    /// §5.1 is explicit that it does not change the origin of the file doing the
+    /// including, however the included file plays with it.
+    #[test]
+    fn test_include_origin_applies_to_the_included_file_only() {
+        let dir = ScratchDir::new("include-origin");
+        dir.write("sub.inc", "$ORIGIN deeper.example.com.\nns IN A 192.0.2.30\n");
+        let main = dir.write(
+            "example.com.zone",
+            "$INCLUDE sub.inc sub.example.com.\nafter IN A 192.0.2.31\n",
+        );
+
+        let zone = parse_zone_file_at(&main, "example.com.").unwrap();
+        assert_eq!(
+            zone.query("ns.deeper.example.com.", 1).len(),
+            1,
+            "the included file's own $ORIGIN applies inside it"
+        );
+        assert_eq!(
+            zone.query("after.example.com.", 1).len(),
+            1,
+            "and neither origin leaks back out to the including file"
+        );
+        assert_eq!(zone.origin(), "example.com.", "the apex is untouched");
+    }
+
+    #[test]
+    fn test_include_of_a_missing_file_is_an_error() {
+        let dir = ScratchDir::new("include-missing");
+        let main = dir.write("example.com.zone", "$INCLUDE nope.inc\n");
+        let err = parse_zone_file_at(&main, "example.com.").unwrap_err();
+        assert!(err.contains("nope.inc"), "the error should name the file: {err}");
+        assert!(err.contains("line 1"), "and the line: {err}");
+    }
+
+    /// A file that includes itself would recurse until the stack ran out.
+    #[test]
+    fn test_include_cycle_is_refused() {
+        let dir = ScratchDir::new("include-cycle");
+        let main = dir.write("example.com.zone", "$INCLUDE example.com.zone\n");
+        let err = parse_zone_file_at(&main, "example.com.").unwrap_err();
+        assert!(err.contains("cycle"), "got: {err}");
+    }
+
+    #[test]
+    fn test_include_without_a_file_name_is_an_error() {
+        let err = parse_zone_file("$INCLUDE\n", "example.com.").unwrap_err();
+        assert!(err.contains("needs a file name"), "got: {err}");
     }
 
     #[test]

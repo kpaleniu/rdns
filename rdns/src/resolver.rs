@@ -480,6 +480,7 @@ impl Budget {
 struct Resolution {
     budget: Budget,
     cuts: Vec<DelegationEvidence>,
+    denials: Vec<ResourceRecord>,
 }
 
 impl Resolution {
@@ -487,7 +488,25 @@ impl Resolution {
         Resolution {
             budget: Budget::new(budget),
             cuts: Vec::new(),
+            denials: Vec::new(),
         }
+    }
+
+    /// Keep the NSEC/NSEC3 records — and the signatures over them — from an
+    /// answer's authority section.
+    ///
+    /// A CNAME chase spans several responses and only the last one's authority
+    /// section survives into the message we return, so a wildcard expansion at
+    /// an earlier hop would arrive with its denial already discarded and be
+    /// refused on our own bookkeeping. RRSIGs come along because a proof nobody
+    /// signed is not one.
+    fn record_denials(&mut self, authorities: &[ResourceRecord]) {
+        self.denials.extend(
+            authorities
+                .iter()
+                .filter(|rr| matches!(rr.rdata.rtype, rt::NSEC | rt::NSEC3 | rt::RRSIG))
+                .cloned(),
+        );
     }
 
     /// Remember what a referral to `zone` said about that zone's security.
@@ -817,6 +836,13 @@ impl Resolver {
                 qclass: query.qclass.clone(),
             };
             let response = self.resolve_from_root(&step, state, 0).await?;
+
+            // A hop's denial records outlive its response: only the last hop's
+            // authority section is returned, and a wildcard-expanded CNAME
+            // earlier in the chain still owes the NSEC that came with it.
+            if self.config.dnssec.is_some() {
+                state.record_denials(&response.authorities);
+            }
 
             // Keep only records that belong to the chain we actually asked
             // about — the name in hand, plus whatever a CNAME we have accepted
@@ -1378,8 +1404,8 @@ impl Resolver {
 
         let validator = ChainValidator::new(anchors, now);
         let verdict = validator.validate_records(&records, &keys);
-        if !verdict.is_secure() {
-            return verdict;
+        if !verdict.state.is_secure() {
+            return verdict.state;
         }
 
         // A signature over a denial only says the records are authentic; it
@@ -1388,6 +1414,18 @@ impl Resolver {
         // for a proof it does not make.
         if negative {
             return self.check_denial(query, response);
+        }
+
+        // The same gap on the positive side: a wildcard's signature verifies at
+        // every name that wildcard could expand to, so a verified answer at one
+        // of them is not yet an answer *about* that name. The denial that makes
+        // it one may have arrived with an earlier hop of a CNAME chase, which is
+        // why `state.denials` is offered alongside this response's own authority
+        // section.
+        if !verdict.wildcards.is_empty() {
+            let mut proofs = response.authorities.clone();
+            proofs.extend(state.denials.iter().cloned());
+            return validator.validate_wildcard_proofs(&verdict.wildcards, &proofs, &keys);
         }
         ValidationState::Secure
     }
@@ -1531,7 +1569,7 @@ impl Resolver {
         let denial = if response.rcode == ResponseCode::NoSuchDomain {
             proves_nxdomain(&query.qname, &zone, &nsecs, &nsec3s)
         } else {
-            proves_nodata(&query.qname, query.qtype, &nsecs, &nsec3s)
+            proves_nodata(&query.qname, &zone, query.qtype, &nsecs, &nsec3s)
         };
 
         match denial {
@@ -3158,6 +3196,16 @@ this line has no record and is skipped
         delegation: impl Fn(&TestZone, &TestZone) -> Vec<ResourceRecord>,
         leaf: impl Fn(&TestZone) -> Vec<ResourceRecord> + Send + 'static,
     ) -> SignedHierarchy {
+        signed_hierarchy_with(delegation, move |auth| (leaf(auth), Vec::new()))
+    }
+
+    /// As [`signed_hierarchy`], but the leaf's answer arrives with an authority
+    /// section of its own — which is where a wildcard answer carries the NSEC
+    /// that says the name it was expanded to has nothing of its own.
+    fn signed_hierarchy_with(
+        delegation: impl Fn(&TestZone, &TestZone) -> Vec<ResourceRecord>,
+        leaf: impl Fn(&TestZone) -> (Vec<ResourceRecord>, Vec<ResourceRecord>) + Send + 'static,
+    ) -> SignedHierarchy {
         let root = TestZone::new(".");
         let tld = TestZone::new("test.");
         let auth = TestZone::new("example.test.");
@@ -3181,8 +3229,10 @@ this line has no record and is skipped
         let auth_keys = auth.dnskey_records();
         let tld_ds = signed_ds(&root, &tld);
         let example_delegation = delegation(&tld, &auth);
-        let answers = leaf(&auth);
+        let (answers, leaf_authority) = leaf(&auth);
         let denial = signed_nxdomain_authority(&auth);
+        let wildcard_nodata = signed_wildcard_nodata_authority(&auth, true);
+        let stripped_wildcard = signed_wildcard_nodata_authority(&auth, false);
 
         let auth_server = spawn_server(auth_sock, move |q| {
             let name = qname_of(q);
@@ -3190,7 +3240,9 @@ this line has no record and is skipped
             if name == "example.test." && qtype == rt::DNSKEY {
                 authoritative(q, auth_keys.clone())
             } else if name == "www.example.test." {
-                authoritative(q, answers.clone())
+                let mut resp = authoritative(q, answers.clone());
+                resp.authorities = leaf_authority.clone();
+                resp
             } else if name == "gone.example.test." {
                 // A signed "no": SOA and an NSEC whose gap runs from the apex to
                 // www, which covers both the name and the wildcard position.
@@ -3198,6 +3250,22 @@ this line has no record and is skipped
                 resp.authoritive = true;
                 resp.rcode = ResponseCode::NoSuchDomain;
                 resp.authorities = denial.clone();
+                resp
+            } else if name == "wild-nodata.example.test." && qtype == rt::AAAA {
+                // A wildcard NODATA: the name does not exist, `*.example.test.`
+                // answered, and it has an A but no AAAA. NOERROR with an empty
+                // answer section.
+                let mut resp = response_to(q);
+                resp.authoritive = true;
+                resp.authorities = wildcard_nodata.clone();
+                resp
+            } else if name == "stripped-wildcard.example.test." && qtype == rt::AAAA {
+                // The same, with the record at the wildcard removed: what is
+                // left covers the name but says nothing about what a wildcard
+                // would have answered with.
+                let mut resp = response_to(q);
+                resp.authoritive = true;
+                resp.authorities = stripped_wildcard.clone();
                 resp
             } else {
                 // Any other probe (the QNAME-minimized NS step) is answered
@@ -3266,6 +3334,53 @@ this line has no record and is skipped
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: "www.example.test.".to_string(),
                 type_bitmap: build_type_bitmap(&[rt::SOA, rt::NS, rt::RRSIG, rt::NSEC]),
+            })
+            .unwrap(),
+        };
+        let soa_sig = auth.sign_records(std::slice::from_ref(&soa));
+        let nsec_sig = auth.sign_records(std::slice::from_ref(&nsec));
+        vec![soa, soa_sig, nsec, nsec_sig]
+    }
+
+    /// The authority section of a signed wildcard NODATA: the SOA, and the NSEC
+    /// at `*.example.test.` whose bitmap carries A but not AAAA — and which also
+    /// covers the queried name, since `*` sorts before every ordinary label, so
+    /// one record shows both that the name does not exist and what the wildcard
+    /// that answered for it holds.
+    ///
+    /// With `at_wildcard` false the record is moved off the wildcard to
+    /// `m.example.test.`: it still covers the queried names, and proves nothing
+    /// about what a wildcard would have answered.
+    fn signed_wildcard_nodata_authority(
+        auth: &TestZone,
+        at_wildcard: bool,
+    ) -> Vec<ResourceRecord> {
+        let soa = ResourceRecord {
+            name: "example.test.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::SOA {
+                mname: "ns.example.test.".to_string(),
+                rname: "admin.example.test.".to_string(),
+                serial: 1,
+                refresh: 10800,
+                retry: 3600,
+                expire: 604800,
+                minimum: 300,
+            })
+            .unwrap(),
+        };
+        let nsec = ResourceRecord {
+            name: if at_wildcard {
+                "*.example.test.".to_string()
+            } else {
+                "m.example.test.".to_string()
+            },
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
+                next_domain_name: "zzz.example.test.".to_string(),
+                type_bitmap: build_type_bitmap(&[rt::A, rt::RRSIG, rt::NSEC]),
             })
             .unwrap(),
         };
@@ -3494,6 +3609,115 @@ this line has no record and is skipped
             cache.synthesize("zzz.example.test.", 1).is_none(),
             "the gap ends at www.example.test."
         );
+    }
+
+    /// A wildcard NODATA, end to end: the name does not exist, `*.example.test.`
+    /// is what answered, and it has no AAAA. The proof is a different pair of
+    /// records from an ordinary NODATA — nothing sits at the name to carry a type
+    /// bitmap — and insisting on the ordinary shape refused this outright.
+    #[tokio::test]
+    async fn test_wildcard_nodata_validates_as_secure() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (answer, state) = Resolver::new(validating_config(&h))
+            .resolve_validated(&QuerySection {
+                qname: "wild-nodata.example.test.".to_string(),
+                qtype: rt::AAAA,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the resolution itself should succeed");
+
+        assert_eq!(state, ValidationState::Secure, "{state}");
+        assert_eq!(answer.rcode, ResponseCode::Ok, "NODATA is NOERROR with no answer");
+        assert!(answer.answers.is_empty());
+    }
+
+    /// The same query with the record at the wildcard removed. What is left still
+    /// covers the name, so a check that only asked "does the name exist" would
+    /// pass it — but nothing says what a wildcard would have answered with, and
+    /// the honest answer may have been an address.
+    #[tokio::test]
+    async fn test_wildcard_nodata_without_the_wildcards_own_nsec_is_bogus() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (_, state) = Resolver::new(validating_config(&h))
+            .resolve_validated(&QuerySection {
+                qname: "stripped-wildcard.example.test.".to_string(),
+                qtype: rt::AAAA,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the resolution itself should succeed");
+
+        assert!(state.is_bogus(), "expected bogus, got {state}");
+        assert!(
+            state.reason().contains("*.example.test."),
+            "it must fail for the missing wildcard record rather than by accident: {state}"
+        );
+    }
+
+    /// A wildcard answer, end to end. The zone holds `*.example.test.` and no
+    /// `www`, so the answer's signature is made at the wildcard — and the same
+    /// signature would verify at any other name under `example.test.`, which is
+    /// why the NSEC in the authority section is part of the answer rather than
+    /// decoration.
+    #[tokio::test]
+    async fn test_wildcard_answer_with_its_nsec_is_secure() {
+        let h = signed_hierarchy_with(signed_ds, |auth| wildcard_answer(auth, true));
+        let (answer, state) = resolve_www(validating_config(&h)).await;
+
+        assert_eq!(state, ValidationState::Secure, "{state}");
+        assert!(
+            answer.answers.iter().any(|rr| matches!(
+                rr.rdata.parse(),
+                Ok(ParsedRecord::A(a)) if a == Ipv4Addr::new(192, 0, 2, 9)
+            )),
+            "a validated wildcard answer is still an answer"
+        );
+    }
+
+    /// The same answer with the proof left out. Nothing about the cryptography
+    /// changed — this is the case that validated as Secure on the signature
+    /// alone before the proof was demanded.
+    #[tokio::test]
+    async fn test_wildcard_answer_without_its_nsec_is_bogus() {
+        let h = signed_hierarchy_with(signed_ds, |auth| wildcard_answer(auth, false));
+        let (_, state) = resolve_www(validating_config(&h)).await;
+        assert!(
+            state.is_bogus(),
+            "a wildcard answer with no denial of the queried name must not be served \
+             as authentic: {state}"
+        );
+    }
+
+    /// `www.example.test.` answered from `*.example.test.`, with or without the
+    /// NSEC that completes the proof.
+    ///
+    /// The NSEC gap runs from the wildcard to `zzz.example.test.`, which covers
+    /// `www` — `*` sorts before every ordinary label, so the wildcard's own NSEC
+    /// is usually the record that covers the names it answers for.
+    fn wildcard_answer(
+        auth: &TestZone,
+        with_proof: bool,
+    ) -> (Vec<ResourceRecord>, Vec<ResourceRecord>) {
+        let a = a_record("www.example.test.", [192, 0, 2, 9]);
+        let sig = auth.sign_as_wildcard(std::slice::from_ref(&a), "*.example.test.");
+
+        let mut authority = Vec::new();
+        if with_proof {
+            let nsec = ResourceRecord {
+                name: "*.example.test.".to_string(),
+                class: 1,
+                ttl: 3600,
+                rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
+                    next_domain_name: "zzz.example.test.".to_string(),
+                    type_bitmap: build_type_bitmap(&[rt::A, rt::RRSIG, rt::NSEC]),
+                })
+                .unwrap(),
+            };
+            let nsec_sig = auth.sign_records(std::slice::from_ref(&nsec));
+            authority = vec![nsec, nsec_sig];
+        }
+        (vec![a, sig], authority)
     }
 
     /// The validated-key cache: a second query into the same zone must not

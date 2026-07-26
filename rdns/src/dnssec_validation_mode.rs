@@ -64,7 +64,7 @@ impl DnssecValidator {
 
     /// Check if a zone is signed (has DNSKEY records)
     pub fn is_zone_signed(zone: &Zone) -> bool {
-        zone.records.iter().any(|r| r.rdata.rtype == record_types::DNSKEY)
+        zone.records().iter().any(|r| r.rdata.rtype == record_types::DNSKEY)
     }
 
     /// Validate records in a response before sending
@@ -101,7 +101,7 @@ impl DnssecValidator {
         };
 
         let keys: Vec<Dnskey> = zone
-            .records
+            .records()
             .iter()
             .filter(|r| r.rdata.rtype == record_types::DNSKEY)
             .filter_map(|r| {
@@ -120,7 +120,7 @@ impl DnssecValidator {
         // Every RRSIG in the zone; `verify_rrset` picks the ones that cover
         // this RRset by owner and type, and rejects a signer outside the zone.
         let rrsigs: Vec<Rrsig> = zone
-            .records
+            .records()
             .iter()
             .filter(|r| r.rdata.rtype == record_types::RRSIG)
             .filter_map(|r| {
@@ -138,7 +138,7 @@ impl DnssecValidator {
             &Rrset::new(&first.name, first.rdata.rtype, first.class, &rdatas),
             &rrsigs,
             &keys,
-            &zone.origin,
+            zone.origin(),
             current_unix_timestamp(),
         );
 

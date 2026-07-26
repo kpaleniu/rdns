@@ -246,7 +246,7 @@ impl NsecCache {
         let soa = zone.soa.as_ref().filter(|s| s.expires_at > now)?;
 
         let (rcode, proof_records, proof_ttl) = zone
-            .synthesize_nodata(&qname, qtype, now)
+            .synthesize_nodata(&qname, zone_name, qtype, now)
             .or_else(|| zone.synthesize_nxdomain(&qname, zone_name, now))?;
 
         // The answer lives as long as the shortest-lived thing it rests on: the
@@ -326,9 +326,15 @@ impl ZoneProofs {
     }
 
     /// NODATA: the name exists, but not with this type.
+    ///
+    /// Only the record *at* the name is consulted, so `proves_nodata`'s wildcard
+    /// case never comes into play here. That is deliberate: answering NODATA for
+    /// a name that does not exist means synthesizing from a wildcard, which is
+    /// the RFC 8198 §5.3 step this cache does not take.
     fn synthesize_nodata(
         &self,
         qname: &str,
+        zone: &str,
         qtype: u16,
         now: u64,
     ) -> Option<(ResponseCode, Vec<ResourceRecord>, u32)> {
@@ -339,7 +345,9 @@ impl ZoneProofs {
             if is_delegation(&cached.proof) && qtype != rt::DS {
                 return None;
             }
-            if proves_nodata(qname, qtype, std::slice::from_ref(&cached.proof), &[]).is_proved() {
+            if proves_nodata(qname, zone, qtype, std::slice::from_ref(&cached.proof), &[])
+                .is_proved()
+            {
                 return Some((
                     ResponseCode::Ok,
                     with_ttl(&cached.records, cached.remaining(now)),
@@ -357,7 +365,9 @@ impl ZoneProofs {
             if cached.proof.has_type(rt::NS) && !cached.proof.has_type(rt::SOA) && qtype != rt::DS {
                 return None;
             }
-            if proves_nodata(qname, qtype, &[], std::slice::from_ref(&cached.proof)).is_proved() {
+            if proves_nodata(qname, zone, qtype, &[], std::slice::from_ref(&cached.proof))
+                .is_proved()
+            {
                 return Some((
                     ResponseCode::Ok,
                     with_ttl(&cached.records, cached.remaining(now)),

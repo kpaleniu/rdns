@@ -8,7 +8,7 @@ where to look rather than here.
 
 ---
 
-## Current state (last updated 2026-07-25)
+## Current state (last updated 2026-07-26)
 
 **Workspace** — four members, all on branch `master`:
 
@@ -20,12 +20,15 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **280 lib + 15 integration** tests passing,
+`cargo test --workspace` = **318 lib + 15 integration** tests passing,
 `cargo clippy --workspace --all-targets` **clean, no exceptions**.
 
-**Next task: #2's remaining DNSSEC follow-ups**, of which the wildcard NSEC
-requirement is the one with a security consequence; then #4 (zone indexing) if
-you would rather do something with an obvious payoff.
+**Next task: still #5.** Of what is left there, **TXT `<character-string>`
+framing** is a live wire-format bug (see the item — a correct client loses the
+first character of every TXT record), and plain **RFC 2308 negative caching** in
+`rdnsr` is the one users would feel. AXFR and the response-size rate limiter are
+the bigger pieces. What is left under #2 is RFC 5011 key rollover (needs
+persistent state), CNAME-chain validation and `rdnsd` signing.
 
 **One flaky test, pre-existing:** `bench::bench_logger_throughput` asserts
 `>45k ops/sec` in wall-clock time and fails on a loaded machine (seen at 44,875
@@ -128,7 +131,7 @@ and "Done so far". Everything else under #1 — async conversion, QNAME
 minimization, 0x20 + reply validation, RTT-based server selection, IPv6
 hints/glue and the `--root-hints` flag — was already done.
 
-The recursor is covered by 47 tests in `resolver.rs` (see "Architecture: the
+The recursor is covered by 51 tests in `resolver.rs` (see "Architecture: the
 resolver") and the denial cache by 16 in `nsec_cache.rs`.
 
 Two things aggressive use deliberately does **not** do, either of which is a
@@ -155,11 +158,6 @@ Validation is on the resolve path and enforced (see "Architecture: DNSSEC" and
       verify under the keys of the zone that signed it, which is checked — but
       nothing verifies that the chain of CNAMEs itself is the one the client
       asked for beyond the existing `chain` filter in `recurse`.
-- [ ] **Wildcard answers do not demand their NSEC.** `verify_rrset` reports the
-      wildcard an answer was expanded from (RFC 4035 §5.3.4), and nothing
-      consumes it yet: a complete proof also needs an NSEC showing the queried
-      name itself does not exist. Today such an answer validates as Secure on
-      the signature alone.
 - [ ] **`rdnsd` cannot sign a zone**, only serve one that arrives pre-signed,
       and `dnssec_validation_mode` is still not called from anywhere.
 
@@ -171,13 +169,12 @@ against the RFC's own Appendix A vectors. Iterations are capped at 150
 (RFC 9276); above that the hash is refused, which reads as insecure rather than
 bogus — a zone that signs itself unreasonably is not evidence of an attack.
 
-### 4. Zone lookup is a linear scan
-`Zone::query` filters the whole record vector per query, and `matches_query`
-normalizes and lowercases both names into fresh `String`s for every record it
-touches. Fine at current zone sizes; the wrong shape as zones grow.
-
-- [ ] Index by (name, type) — a `HashMap`/`BTreeMap` built at load time — and
-      drop the per-comparison allocation.
+### 4. Zone lookup — done
+Was: `Zone::query` filtered the whole record vector per query, and `matches_query`
+normalized and lower-cased both names into fresh `String`s for every record it
+touched — 20k allocations for one lookup on a 10k-record zone, measured at
+**4.4 ms**. Now indexed by owner name at load time: **0.685 µs**, and
+`bench_zone_lookup` guards the regression. See "Architecture: zone storage".
 
 ### 5. Smaller open items
 - [ ] **AXFR is not implemented at all** (no handler, no type 252). When adding
@@ -194,11 +191,16 @@ touches. Fine at current zone sizes; the wrong shape as zones grow.
       aggressively than RFC 2308 asks), but an *unvalidated* NXDOMAIN — which is
       most of them, since validation is opt-in — is still re-resolved every
       time. Plain RFC 2308 negative caching would cover that.
-- [ ] Zone parser: no `$INCLUDE`, and no parenthesized multi-line records — a
-      parenthesized SOA fails the load.
+- [x] Zone parser: `$INCLUDE` and parenthesized multi-line records — done, see
+      "Done so far". Still missing from the parser: TTL unit suffixes (`1h`,
+      `2d`), `\`-escaped dots inside a label, and `@` as an rdata name.
 - [ ] TXT is stored as one blob, not split into `<character-string>`s (RFC 1035).
-      Note this now has a second consequence: a TXT RRset's canonical form is
-      wrong too, so a signed TXT RRset with multiple strings will not verify.
+      Two consequences, both confirmed: a TXT RRset's canonical form is wrong, so
+      a signed TXT RRset will not verify — and on the wire the RDATA has no
+      length prefix at all, so a client decoding it per RFC 1035 reads the first
+      character as a length byte and loses it. Seen live: a TXT of
+      `v=spf1 include:example.net; -all` arrives as
+      `=spf1 include:example.net; -all` at any correct client.
 
 ---
 
@@ -346,6 +348,45 @@ verified as an RRset like any other, because an attacker can write NSEC records
 too. Opt-out (RFC 5155 §6) is the one case where a merely *covering* NSEC3
 suffices, and only with the flag actually set.
 
+**A wildcard answer is not finished when its signature verifies.** A wildcard is
+signed at `*.example.com.`, and the labels field in the RRSIG says so — which
+means the same RRset and signature verify at *every* name that wildcard could
+expand to. Re-own a genuine `*.example.com. A` RRset onto any name under
+`example.com.` and the cryptography still checks out. So a verified expansion
+carries an obligation out of `validate_records` (as `RecordsVerdict::wildcards`)
+and `validate_wildcard_proofs` discharges it against a signed NSEC/NSEC3, which
+must show two things: the name asked about has no records of its own, and the
+wildcard used is the one its *closest encloser* publishes. The second half is
+the one that is easy to miss — `b.example.com.`'s own NSEC covers
+`a.b.example.com.`, because a name sorts before everything beneath it, so
+"some NSEC covers the name" would accept a `*.example.com.` answer for a name
+that `b.example.com.` governs. For NSEC that is checked by deriving the closest
+encloser from the covering record; NSEC3 gets it for free, since the name it has
+to cover — the next closer — is named from where the wildcard sits (RFC 5155
+§8.8). An Opt-Out NSEC3 there yields Insecure rather than Bogus: it declines to
+say whether a delegation is in the span, which is not a proof and not an attack.
+
+**And the same thing on the negative side.** A NODATA answer usually rests on the
+NSEC *at* the name, whose bitmap lists the types it has. But the name may not
+exist at all, a wildcard may be what answered, and it may have had no record of
+this type either — so the proof is a different pair: the name shown absent, and
+the record at the wildcard showing what a wildcard would have carried (RFC 4035
+§5.4, RFC 5155 §8.7). Demanding only the first shape refuses a legitimate answer,
+which is what `proves_nodata` did: any zone with a wildcard got SERVFAIL for
+every type the wildcard does not hold. The depth check matters here for the same
+reason as on the positive side — `*.example.com.`'s bitmap says nothing about a
+name that `b.example.com.` governs.
+
+Two things that fall out of this and are worth not re-deriving. A record sitting
+*at* a wildcard is not an expansion of it — the labels field never counts the
+leading `*` (RFC 4034 §3.1.3), so the arithmetic alone flags the wildcard's own
+RRset, and demanding a proof that `*.example.com.` does not exist would break
+every wildcard-aware denial, since those carry exactly that record.
+`is_wildcard_expansion` therefore compares against the name that was signed.
+And the proof may arrive with an *earlier* hop of a CNAME chase, whose authority
+section does not survive into the message we return, so `Resolution` accumulates
+NSEC/NSEC3 records across hops the same way it accumulates zone cuts.
+
 **The key cache stores conclusions, not material.** `KeyCache` holds DNSKEY sets
 that have already been validated to an anchor, so a second query into a zone
 costs no revalidation. That makes its TTL load-bearing, hence the one-day cap.
@@ -426,6 +467,50 @@ an answer we invented from cached proofs is exactly that. The cache is sized to
 zero unless `--dnssec-validate` is on, the same zero-capacity idiom `--no-cache`
 uses, so there is no configuration in which unvalidated proofs can enter it.
 
+## Architecture: zone storage
+
+Records live in one vector; an index built as they are added maps the absolute,
+down-cased owner name to the positions of the records at it. `origin` and
+`records` are private because the index is derived from both — a record appended
+behind its back, or an origin changed without a rebuild, leaves the zone
+answering NXDOMAIN for data it holds, which is a bug this repo has already had
+once. `$ORIGIN` mid-file therefore goes through `set_origin`, which re-keys what
+is already loaded, keeping the result identical to resolving every relative name
+against the final origin (what the query-time normalization used to do).
+
+**Keyed by name, not by (name, type)**, though the TODO item said the latter. A
+server needs two questions answered and the second is what tells NXDOMAIN from
+NODATA: "which records of this type sit at this name", and "does this name exist
+at all". A (name, type) map answers the first and cannot answer the second
+without probing 65535 types; the records at a single name are a handful, so
+picking a type out of them costs nothing measurable. It is also how NSD and Knot
+hold a zone — a node per name, carrying its RRsets.
+
+**Owner names are resolved as they are parsed**, not stored relative, so
+`ZoneRecord.name` is always absolute for a parsed zone. That is what makes
+`$ORIGIN` apply to the lines below it (RFC 1035 §5.1) and what gives `$INCLUDE`'s
+optional origin argument something to mean. `Zone::set_origin` still re-keys,
+because a record added through the API may carry a relative name.
+
+**Reading the file is two passes.** `logical_lines` turns physical lines into
+logical ones first: comments stripped, quoted strings respected, and lines joined
+while parentheses are open. Parentheses are not cosmetic — every real SOA is
+written across five lines — and `;` inside a quoted string is data, which matters
+because TXT records are mostly semicolons. `$INCLUDE` then recurses, with the
+origin and default TTL copied in and nothing copied back (RFC 1035 §5.1 requires
+exactly that for the origin), a depth cap to catch a file that includes itself,
+and relative paths resolved next to the including file — which is why
+`parse_zone_file_at` exists alongside `parse_zone_file`.
+
+**Wildcards are one extra lookup**, not a scan: the queried name's first label
+replaced by `*`. A wildcard covers exactly one label (RFC 4592 §2.1.1), so that
+single probe is the whole of wildcard matching — and it is consulted *only* when
+the name itself has no records, because an existing name shadows the wildcard
+entirely, including for types it does not carry (RFC 1034 §4.3.3, RFC 4592
+§2.2.1). The old scan returned the exact and the wildcard records together,
+merging two owners' data into one RRset; that is fixed as a side effect of having
+to decide the question.
+
 ## Architecture: DNS over TCP (both daemons)
 
 Both daemons frame TCP messages with the RFC 1035 §4.2.2 2-byte big-endian
@@ -500,6 +585,43 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **The zone parser reads the files people actually write** — parentheses group a
+  record across lines (RFC 1035 §5.1), which every real SOA uses and which used to
+  fail the load outright; `;` inside a quoted string is data, not a comment, which
+  is what TXT records are full of; and `$INCLUDE <file> [origin]` works, resolved
+  next to the including file via the new `parse_zone_file_at`. Owner names are now
+  resolved against the origin in force at their line, so `$ORIGIN` applies to what
+  follows it rather than retroactively. See "Architecture: zone storage".
+- **Zone lookup is indexed** — one `HashMap` from owner name to record positions,
+  built at load time, replacing a filter over the whole record vector that
+  allocated two `String`s per record compared. 10k-record zone, one lookup:
+  **4.4 ms → 0.685 µs** (`bench_zone_lookup` holds the floor). `Zone`'s `origin`
+  and `records` are private now, since the index is derived from both. Fixed on
+  the way past: an existing name no longer gets the wildcard's records mixed into
+  its answer. See "Architecture: zone storage".
+- **Wildcard NODATA is no longer refused (RFC 4035 §5.4, RFC 5155 §8.7)** —
+  `proves_nodata` insisted on an NSEC whose owner *is* the queried name, so a
+  zone with a wildcard got SERVFAIL for every type the wildcard does not carry:
+  when a wildcard answers, nothing sits at the name to hold a type bitmap. It now
+  falls back to the other shape — the name shown absent, plus the record at the
+  wildcard its closest encloser publishes. The NSEC3 half is RFC 5155 §8.7's
+  closest-encloser proof, now shared with the NXDOMAIN path as
+  `nsec3_closest_encloser` (§8.3) rather than written twice. `proves_nodata`
+  takes the zone name, as `proves_nxdomain` already did. The denial cache is
+  untouched by design: it consults only the record *at* a name, so answering from
+  a wildcard would be the RFC 8198 §5.3 synthesis it deliberately does not do.
+- **Wildcard answers now demand their NSEC (RFC 4035 §5.3.4, RFC 5155 §8.8)** — a
+  wildcard's signature verifies at every name the wildcard could expand to, so a
+  verified expansion was being served as Secure on the strength of a signature
+  that says nothing about the name asked for. `validate_records` now reports each
+  expansion and `validate_wildcard_proofs` requires a signed denial of that name,
+  including that the wildcard belongs to its closest encloser — without which a
+  genuine `*.example.com.` RRset re-owned onto a name under an existing
+  `b.example.com.` validates, since `b`'s own NSEC covers it. New
+  `dnssec_denial::proves_wildcard_expansion`. Also fixed: the wildcard's *own*
+  RRset read as an expansion of itself (the labels field never counts the `*`),
+  which would have demanded a proof that the wildcard does not exist. See
+  "Architecture: DNSSEC".
 - **Aggressive use of validated denials (RFC 8198)** — a validated NSEC/NSEC3 is
   a signed statement about a *range* of names, so `NsecCache` stores the range
   and answers every name in it without asking again. New
@@ -682,14 +804,25 @@ let proof = dnssec::verify_rrset(
 dnssec_denial::nsec3_hash(name, salt, iterations)?   // capped at MAX_NSEC3_ITERATIONS
 dnssec_denial::proves_no_ds(zone, &nsecs, &nsec3s)   // -> Denial::{Proved, NotProved(why)}
 dnssec_denial::proves_nxdomain(qname, zone, &nsecs, &nsec3s)
-dnssec_denial::proves_nodata(qname, qtype, &nsecs, &nsec3s)
+// Handles both NODATA shapes: the NSEC at the name, and the wildcard case where
+// the name does not exist and the record at `*.encloser` is what applies.
+dnssec_denial::proves_nodata(qname, zone, qtype, &nsecs, &nsec3s)
+// A wildcard answer's other half: does this name have nothing of its own, and is
+// `wildcard` the one its closest encloser publishes? Three states — Opt-Out is
+// neither a proof nor an attack.
+dnssec_denial::proves_wildcard_expansion(owner, wildcard, &nsecs, &nsec3s)
+// -> WildcardVerdict::{ Proved, Unjudgeable(why) /* insecure */, NotProved(why) }
 
 // The chain, one step at a time. Fetching is the resolver's job, not this API's.
 let v = ChainValidator::new(&anchors, now);
 v.start(name)                                  // -> Option<(anchor zone, its DS)>
 v.validate_dnskeys(zone, &records, &ds_set)?   // -> Vec<Dnskey>, or a ValidationState
 v.validate_delegation(&evidence, parent, &parent_keys)  // -> DelegationVerdict
-v.validate_records(&records, &keystore)        // -> ValidationState
+v.validate_records(&records, &keystore)        // -> RecordsVerdict
+//   .state     -> ValidationState, about the signatures alone
+//   .wildcards -> expansions still owing a denial of the name they were served
+//                 at. A Secure state with a non-empty list is not yet an answer.
+v.validate_wildcard_proofs(&verdict.wildcards, &authority_records, &keystore)
 
 // End to end, from the resolver:
 let (answer, state) = resolver.resolve_validated(&query).await?;

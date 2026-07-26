@@ -252,6 +252,34 @@ impl TestZone {
         out
     }
 
+    /// Sign `records` the way a server answering from a wildcard does: the
+    /// signature is made over `wildcard`, which is the name really in the zone,
+    /// but the RRSIG is published at the expanded owner name with the wildcard's
+    /// (shorter) label count.
+    ///
+    /// That shape is what a validator has to notice — and it is also the shape
+    /// of the attack, because the same signature verifies at every name the
+    /// wildcard could reach. A test can therefore re-own the result onto any
+    /// name under the wildcard and it will still verify.
+    pub fn sign_as_wildcard(
+        &self,
+        records: &[ResourceRecord],
+        wildcard: &str,
+    ) -> ResourceRecord {
+        let first = records.first().expect("an RRset has at least one record");
+        let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
+        let mut sig = self.zsk.sign_rrset(
+            wildcard,
+            first.rdata.rtype,
+            first.class,
+            first.ttl.max(0) as u32,
+            &self.name,
+            &rdatas,
+        );
+        sig.owner = first.name.clone();
+        rrsig_record(&sig, first.ttl)
+    }
+
     /// Sign `records` (all one RRset) with the ZSK, returning the RRSIG record
     /// to put beside them.
     pub fn sign_records(&self, records: &[ResourceRecord]) -> ResourceRecord {

@@ -336,4 +336,62 @@ mod benches {
         // Should be reasonably fast (String clone is cheap unless strings are huge)
         assert!(standard_ops_per_sec > 1_000_000.0, "StandardRecord clone too slow");
     }
+
+    /// Zone lookup on a zone big enough for the difference to matter.
+    ///
+    /// `Zone::query` used to filter the whole record vector per query, and the
+    /// name comparison normalized and lower-cased *both* names into fresh
+    /// `String`s for every record it touched — so one lookup on a 10k-record
+    /// zone did 20k allocations. Measured here before and after the index went
+    /// in: **227 lookups/sec (4.4 ms each) → 1.32M lookups/sec (0.755 µs)**, in
+    /// a debug build.
+    ///
+    /// The floor asserted below is an order of magnitude under the second figure
+    /// and three under the first: it is a guard against going back to a linear
+    /// scan, not a claim about how fast this machine is on any given day.
+    #[test]
+    fn bench_zone_lookup() {
+        use crate::zone::{Zone, ZoneRecord};
+        use crate::{ParsedRecord, RecordData};
+        use std::net::Ipv4Addr;
+
+        let mut zone = Zone::new("example.com.".to_string());
+        for i in 0..10_000u32 {
+            zone.add_record(ZoneRecord {
+                name: format!("host{i}"),
+                ttl: 3600,
+                class: 1,
+                rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
+                    192,
+                    0,
+                    2,
+                    (i % 254) as u8 + 1,
+                )))
+                .unwrap(),
+            });
+        }
+
+        let iterations = 20_000;
+        let start = Instant::now();
+        for i in 0..iterations {
+            // A hit deep in the zone, and a miss — the miss is what a linear
+            // scan pays the most for, and what a random-name flood produces.
+            let hit = format!("host{}.example.com.", 9_000 + (i % 1_000));
+            assert_eq!(zone.query(&hit, 1).len(), 1);
+            assert!(zone.query("nothing-here.example.com.", 1).is_empty());
+        }
+        let elapsed = start.elapsed();
+
+        let lookups_per_sec = (iterations * 2) as f64 / elapsed.as_secs_f64();
+        println!(
+            "Zone lookup (10k records): {:.0} lookups/sec ({:.3}us per lookup)",
+            lookups_per_sec,
+            elapsed.as_secs_f64() * 1_000_000.0 / (iterations * 2) as f64
+        );
+
+        assert!(
+            lookups_per_sec > 100_000.0,
+            "zone lookup has gone back to scanning: {lookups_per_sec:.0} lookups/sec"
+        );
+    }
 }
