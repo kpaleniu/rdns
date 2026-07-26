@@ -20,20 +20,21 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **318 lib + 15 integration** tests passing,
+`cargo test --workspace` = **338 lib + 15 integration** tests passing,
 `cargo clippy --workspace --all-targets` **clean, no exceptions**.
 
-**Next task: still #5.** Of what is left there, **TXT `<character-string>`
-framing** is a live wire-format bug (see the item — a correct client loses the
-first character of every TXT record), and plain **RFC 2308 negative caching** in
-`rdnsr` is the one users would feel. AXFR and the response-size rate limiter are
-the bigger pieces. What is left under #2 is RFC 5011 key rollover (needs
-persistent state), CNAME-chain validation and `rdnsd` signing.
+**Next task: still #5**, and what is left there is the two bigger pieces: **AXFR**
+(no handler at all, and the one with a security requirement attached — ACL,
+default deny, log every attempt) and the **response-size-blind rate limiter**.
+What is left under #2 is RFC 5011 key rollover (needs persistent state),
+CNAME-chain validation and `rdnsd` signing.
 
-**One flaky test, pre-existing:** `bench::bench_logger_throughput` asserts
-`>45k ops/sec` in wall-clock time and fails on a loaded machine (seen at 44,875
-while eight `cargo test` runs were competing). It is a benchmark wearing a test's
-clothes; drop the assertion or `#[ignore]` it.
+**The flaky test is fixed.** `bench::bench_logger_throughput` asserted
+`>45k ops/sec` against a measurement of 47–50k, so any competing load failed the
+suite; the floor is 10k now, which still catches an order-of-magnitude
+regression. The other benches keep their floors — `bench_zone_lookup`'s is a
+factor of ten under what it measures, which is the rule to follow when adding
+one. A wall-clock assertion with no headroom is a coin toss, not a test.
 
 ### How to run
 
@@ -186,21 +187,14 @@ touched — 20k allocations for one lookup on a 10k-record zone, measured at
       (Note: the resolver's outbound source port is already randomized via
       `UdpSocket::bind("0.0.0.0:0")`. Do **not** "fix" the servers to reply from
       a random port — a reply must come from the port the query was sent to.)
-- [ ] `rdnsr` caches answer sections only, not authority/additional. Negative
-      answers are now cached when validating (`NsecCache`, and far more
-      aggressively than RFC 2308 asks), but an *unvalidated* NXDOMAIN — which is
-      most of them, since validation is opt-in — is still re-resolved every
-      time. Plain RFC 2308 negative caching would cover that.
+- [x] Plain RFC 2308 negative caching — done, see "Done so far". `rdnsr` still
+      caches only the answer section of a *positive* answer: authority and
+      additional records (delegation NS sets, glue) are dropped, so a referral
+      learned mid-resolution is not reusable except through the delegation cache.
 - [x] Zone parser: `$INCLUDE` and parenthesized multi-line records — done, see
       "Done so far". Still missing from the parser: TTL unit suffixes (`1h`,
       `2d`), `\`-escaped dots inside a label, and `@` as an rdata name.
-- [ ] TXT is stored as one blob, not split into `<character-string>`s (RFC 1035).
-      Two consequences, both confirmed: a TXT RRset's canonical form is wrong, so
-      a signed TXT RRset will not verify — and on the wire the RDATA has no
-      length prefix at all, so a client decoding it per RFC 1035 reads the first
-      character as a length byte and loses it. Seen live: a TXT of
-      `v=spf1 include:example.net; -all` arrives as
-      `=spf1 include:example.net; -all` at any correct client.
+- [x] TXT `<character-string>` framing — done, see "Done so far".
 
 ---
 
@@ -467,6 +461,51 @@ an answer we invented from cached proofs is exactly that. The cache is sized to
 zero unless `--dnssec-validate` is on, the same zero-capacity idiom `--no-cache`
 uses, so there is no configuration in which unvalidated proofs can enter it.
 
+## Architecture: what `rdnsr` remembers
+
+Three caches, because there are three shapes of thing to remember and one map
+cannot hold them:
+
+| cache | key | holds |
+|-------|-----|-------|
+| `DnsCache` | (name, type) | the records that answered |
+| `NegativeCache` | name, or (name, type) | that there were none (RFC 2308) |
+| `NsecCache` | a *range* of names | a signed statement that none of them exist (RFC 8198) |
+
+`NegativeCache` is not redundant with `NsecCache`. The denial cache holds
+validated material only — everything it does rests on the proof having been
+checked — so it is sized to zero unless `--dnssec-validate` is on, which for most
+deployments means negative answers were not cached at all and every repeat of a
+failing lookup was a fresh walk to the authoritative server.
+
+The two kinds of "no" are keyed differently because they say different things.
+**NXDOMAIN** is about the name: no type at it exists, and nothing below it does
+either, since a name with descendants would be an empty non-terminal answering
+NODATA (RFC 8020 — the resolver's walk already stops on an ancestor's NXDOMAIN,
+and a cache that disagreed with the walk would be the odd one out). The lookup is
+therefore a walk up the ancestors, bounded by the label count. **NODATA** is about
+one type at a name that does exist, so it is keyed by both and says nothing about
+any other type.
+
+Three rules keep it honest. **An SOA is required** — RFC 2308 §5 takes the
+negative TTL from it, so a "no" that arrives without one never said how long it
+was good for; this is also what keeps a referral out of the cache. **The TTL is
+`min(SOA MINIMUM, the SOA record's TTL)`, capped at an hour**, and the records
+handed back count down, so a client cannot re-cache a "no" for longer than we may
+hold it. **Nothing bogus is stored**, and whether an answer validated is stored
+with it, so the AD bit the second client sees is the one the first client saw.
+
+Lookup order in `handle_query` is denials → negatives → answers → resolve. The
+denial cache goes first because it answers questions never asked, and is skipped
+for a client with CD set for the same reason. The negative cache is not skipped:
+it returns the answer *this* question actually got, which is caching rather than
+filtering.
+
+`rdnsd` had to change for any of this to work: a negative answer now carries the
+zone's SOA in the authority section (RFC 2308 §2.1, §2.2). Without it a
+downstream resolver — ours included — has no negative TTL and cannot cache the
+answer at all.
+
 ## Architecture: zone storage
 
 Records live in one vector; an index built as they are added maps the absolute,
@@ -585,6 +624,28 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **Negative caching, the plain kind (RFC 2308)** — a "no" costs as much to obtain
+  as a "yes" and was cached only when it validated, which for most deployments
+  meant never: every repeat of a failing lookup was a fresh walk. New
+  `NegativeCache` keyed the way each kind of "no" applies — NXDOMAIN by name (all
+  types, and everything below it per RFC 8020), NODATA by (name, type) — with the
+  TTL from the SOA as RFC 2308 §5 defines it, bounded at an hour, and nothing
+  stored without an SOA or from a bogus answer. `rdnsd` now puts its zone's SOA in
+  negative answers (RFC 2308 §2.1/§2.2), without which nothing downstream could
+  cache them at all. Replaces a `DnsCache::put_negative` stub that stored an empty
+  entry under type 0, recorded neither rcode nor SOA, and had no callers. See
+  "Architecture: what rdnsr remembers".
+- **TXT is framed as `<character-string>`s (RFC 1035 §3.3.14)** — it was stored as
+  one unframed blob, so the RDATA on the wire had no length prefix and every
+  correct client read the first character of the text as a length byte and lost
+  it. `ParsedRecord::TXT` is a `Vec<Vec<u8>>` now: a *sequence*, because two
+  strings are not one string joined; and *bytes*, because a character-string is
+  arbitrary octets — as `String` a binary TXT failed to decode, and decoding
+  happens while reading the message, so one such record made the whole response
+  unparseable. The zone parser splits on quotes rather than whitespace (`"a b"` is
+  one string, `a b` is two), and a string over 255 bytes fails the load instead of
+  being silently split. This also fixes the canonical form, so a signed TXT RRset
+  verifies. Confirmed against c-ares.
 - **The zone parser reads the files people actually write** — parentheses group a
   record across lines (RFC 1035 §5.1), which every real SOA uses and which used to
   fail the load outright; `;` inside a quoted string is data, not a comment, which
@@ -737,6 +798,11 @@ pub struct RecordData { pub rtype: u16, pub rdata: Box<[u8]> }
 RecordData::from_wire(rtype, rdata, &unpacker)? // ingest from the wire
 record.parse()?                                 // -> ParsedRecord, on demand
 RecordData::from_parsed(&ParsedRecord::A(addr))? // build a record
+
+// TXT is a sequence of byte strings, not a string (RFC 1035 §3.3.14): each is
+// length-prefixed on the wire, at most 255 bytes, and the encoder refuses both
+// an empty sequence and an over-long string.
+ParsedRecord::TXT(vec![b"v=spf1 -all".to_vec()])
 record.rtype                                    // type code, direct field read
 ```
 

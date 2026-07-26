@@ -5,6 +5,7 @@ use std::time::Duration;
 use clap::Parser;
 use rdns::dnssec_chain::{TrustAnchors, ValidationState};
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode};
+use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
 use rdns::utils::record_types;
 use rdns::{
@@ -45,12 +46,19 @@ const NSEC_CACHE_ZONES: usize = 1000;
 
 /// What `rdnsr` remembers between queries.
 ///
-/// Two caches with different shapes, which is why they are not one. `answers`
-/// maps a question to its answer. `denials` maps a *range* of names to the
-/// signed statement that none of them exist — a lookup the first cannot express,
-/// and the whole point of RFC 8198.
+/// Three caches with three shapes, which is why they are not one.
+///
+/// - `answers` maps a question to the records that answered it.
+/// - `negatives` maps a question to the *absence* of records (RFC 2308): a
+///   different thing, because there are no records to key on and the TTL comes
+///   from the SOA rather than from an answer.
+/// - `denials` maps a *range* of names to the signed statement that none of them
+///   exist — a lookup neither of the others can express, and the whole point of
+///   RFC 8198. It holds validated material only, so it is empty unless
+///   `--dnssec-validate` is on, which is why `negatives` is not redundant with it.
 struct Caches {
     answers: DnsCache,
+    negatives: NegativeCache,
     denials: NsecCache,
 }
 
@@ -187,6 +195,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let caches = Arc::new(Caches {
         answers: DnsCache::new(capacity),
+        // Negative answers share the answer cache's bound: they are answers, and
+        // `--no-cache` means no cache.
+        negatives: NegativeCache::new(capacity),
         denials: NsecCache::new(denial_zones),
     });
 
@@ -398,6 +409,19 @@ async fn handle_query(
         }
     }
 
+    // A cached "no" (RFC 2308). Checked alongside the answer cache because it
+    // answers the same question the same way — the only reason it is a separate
+    // cache is that there are no records to key on. Unlike the denial cache
+    // above, nothing here is synthesized: this is the answer this question got,
+    // so a CD client may have it too.
+    if let Some(negative) = caches.negatives.get(&query.qname, query.qtype) {
+        let mut resp = build_response(id, &query, Vec::new(), negative.rcode, recursion);
+        resp.authorities = negative.authority;
+        resp.ad = negative.secure && (client_wants_dnssec || msg.ad);
+        resp.cd = checking_disabled;
+        return finish(resp, client_uses_edns, client_wants_dnssec, &query, client_max);
+    }
+
     // Build the response: from cache if we have it, else by resolving.
     let (mut resp, secure) = if let Some((records, secure)) =
         caches.answers.get_validated(&query.qname, query.qtype)
@@ -459,10 +483,18 @@ async fn handle_query(
                         secure,
                     );
                 }
-                // A validated "no" is worth more than the question that
+                // A "no" is an answer, and re-resolving it every time is what
+                // made a typo storm cost one upstream walk per repeat. RFC 2308:
+                // the SOA in the authority section says how long it is good for.
+                if !state.is_bogus() {
+                    caches
+                        .negatives
+                        .insert(&query.qname, query.qtype, &upstream, secure);
+                }
+                // A *validated* "no" is worth more than the question that
                 // produced it — the NSEC covers a whole range of names — so it
-                // goes into the denial cache. Only when Secure: aggressive use
-                // rests entirely on the proof having been checked, and an
+                // also goes into the denial cache. Only when Secure: aggressive
+                // use rests entirely on the proof having been checked, and an
                 // unvalidated NSEC is an attacker's claim about which names do
                 // not exist.
                 if upstream.answers.is_empty() && secure {

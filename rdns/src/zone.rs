@@ -416,6 +416,53 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, String> {
     Ok(out)
 }
 
+/// Split an assembled line into fields, keeping a quoted string whole.
+///
+/// Whitespace splitting alone cannot express a TXT record: `"two words"` is one
+/// `<character-string>` and `two words` is two, and the quotes are the only
+/// thing that says which. A quoted field also survives being empty (`""`), which
+/// is a legal TXT string and disappears under `split_whitespace`.
+///
+/// Escapes are resolved inside quotes and nowhere else — a bare token like
+/// `a\.b` is a name whose meaning changes if the backslash is dropped, and names
+/// are not this function's business.
+fn tokenize(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for c in text.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quotes => escaped = true,
+            '"' => {
+                in_quotes = !in_quotes;
+                started = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if started {
+                    out.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(current);
+    }
+    out
+}
+
 /// How deep `$INCLUDE` may nest. A file that includes itself is a loop, and the
 /// only way to notice is to stop counting somewhere.
 const MAX_INCLUDE_DEPTH: usize = 8;
@@ -473,7 +520,10 @@ fn parse_into(
 ) -> Result<(), String> {
     for logical in logical_lines(content)? {
         let ln = logical.line_no;
-        let parts: Vec<&str> = logical.text.split_whitespace().collect();
+        // Quoted strings stay whole; `parts` is the plain view of the same
+        // fields, which is all any record but TXT needs.
+        let tokens = tokenize(&logical.text);
+        let parts: Vec<&str> = tokens.iter().map(String::as_str).collect();
         let Some(&first) = parts.first() else {
             continue;
         };
@@ -632,9 +682,19 @@ fn parse_into(
                 .map_err(|e| format!("line {ln}: MX record: {e}"))?
             }
             "TXT" => {
-                // Remove quotes from TXT records
-                let txt_data = rdata.trim_matches('"').to_string();
-                RecordData::from_parsed(&ParsedRecord::TXT(txt_data))
+                // Every field after the type is one `<character-string>`
+                // (RFC 1035 §3.3.14): `"a b" c` is two strings, `a b c` is
+                // three, and the quotes are what says which. The 255-byte
+                // ceiling is enforced by the encoder, for every caller.
+                // The zone file speaks text; a character-string is octets.
+                let strings: Vec<Vec<u8>> = tokens[idx..]
+                    .iter()
+                    .map(|t| t.as_bytes().to_vec())
+                    .collect();
+                if strings.is_empty() {
+                    return Err(format!("line {ln}: TXT record has no text"));
+                }
+                RecordData::from_parsed(&ParsedRecord::TXT(strings))
                     .map_err(|e| format!("line {ln}: TXT record: {e}"))?
             }
             "PTR" => RecordData::from_parsed(&ParsedRecord::PTR(rdata))
@@ -1134,11 +1194,67 @@ $TTL 3600
         let txt = zone.query("txt.example.com.", crate::utils::record_types::TXT);
         assert_eq!(txt.len(), 1);
         match txt[0].rdata.parse().unwrap() {
-            ParsedRecord::TXT(text) => {
-                assert!(text.contains("; -all"), "semicolon was eaten: {text:?}")
+            ParsedRecord::TXT(strings) => {
+                assert_eq!(strings.len(), 1, "one quoted string is one character-string");
+                assert_eq!(strings[0], b"v=spf1 include:example.net; -all");
             }
             other => panic!("expected TXT, got {other:?}"),
         }
+    }
+
+    /// Quotes are what says where one `<character-string>` ends and the next
+    /// begins (RFC 1035 §3.3.14), which whitespace splitting alone cannot
+    /// express: `"a b"` is one string and `a b` is two.
+    #[test]
+    fn test_txt_character_strings_are_split_on_quotes_not_whitespace() {
+        let strings_of = |line: &str| -> Vec<Vec<u8>> {
+            let zone = parse_zone_file(line, "example.com.").unwrap();
+            match zone
+                .query("txt.example.com.", crate::utils::record_types::TXT)[0]
+                .rdata
+                .parse()
+                .unwrap()
+            {
+                ParsedRecord::TXT(strings) => strings,
+                other => panic!("expected TXT, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            strings_of("txt IN TXT \"two words\"\n"),
+            vec![b"two words".to_vec()],
+            "a quoted string is one character-string, spaces and all"
+        );
+        assert_eq!(
+            strings_of("txt IN TXT \"first\" \"second\"\n"),
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "two quoted strings are two character-strings"
+        );
+        assert_eq!(
+            strings_of("txt IN TXT bare words\n"),
+            vec![b"bare".to_vec(), b"words".to_vec()],
+            "unquoted fields are one character-string each"
+        );
+        assert_eq!(
+            strings_of("txt IN TXT \"\"\n"),
+            vec![Vec::<u8>::new()],
+            "an empty string is legal, and survives being empty"
+        );
+        assert_eq!(
+            strings_of("txt IN TXT \"say \\\"hi\\\"\"\n"),
+            vec![b"say \"hi\"".to_vec()],
+            "an escaped quote is data, not the end of the string"
+        );
+    }
+
+    /// A string too long for its one-byte length is the zone's mistake, and has
+    /// to fail the load — splitting it silently would change what it says.
+    #[test]
+    fn test_txt_string_over_255_bytes_fails_the_load() {
+        let long = "z".repeat(256);
+        let err = parse_zone_file(&format!("txt IN TXT \"{long}\"\n"), "example.com.").unwrap_err();
+        assert!(err.contains("255"), "got: {err}");
+        assert!(err.contains("line 1"), "got: {err}");
     }
 
     #[test]

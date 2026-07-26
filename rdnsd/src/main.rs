@@ -9,6 +9,7 @@ use rdns::{
     logging::QueryLogger,
     security::RateLimiter,
     telemetry::{instrumentation, DnsMetrics, LatencyTimer},
+    utils::record_types,
     validation::RequestValidator,
     zone::{parse_zone_file_at, Zone},
     DnsMessage, Edns, ResourceRecord, ResponseCode, EDNS_VERSION,
@@ -139,6 +140,21 @@ fn make_response(
                 // comparing the stored names raw never matches.
                 if !zone.name_exists(&query.qname) {
                     response.rcode = ResponseCode::NoSuchDomain;
+                }
+
+                // Both kinds of "no" carry the zone's SOA in the authority
+                // section (RFC 2308 §2.1 and §2.2). It is not decoration: the
+                // SOA's MINIMUM and its own TTL are what tell the client, and
+                // every resolver in between, how long the answer may be cached.
+                // Without it a negative answer is uncacheable, so each repeat of
+                // a failing lookup comes back to us.
+                for soa in zone.query(zone.origin(), record_types::SOA) {
+                    response.authorities.push(ResourceRecord {
+                        name: zone.origin().to_string(),
+                        class: soa.class,
+                        ttl: soa.ttl,
+                        rdata: soa.rdata.clone(),
+                    });
                 }
 
                 metrics.increment_cache_misses();

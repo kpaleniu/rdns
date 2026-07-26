@@ -859,9 +859,43 @@ mod tests {
         let want = RecordData::from_parsed(&ParsedRecord::NS("ns1.example.com.".into())).unwrap();
         assert_eq!(lowered, want.rdata.to_vec(), "NS is on the RFC 4034 §6.2 list");
 
-        // TXT is not on the list, so its bytes pass through untouched.
-        let txt = RecordData::from_parsed(&ParsedRecord::TXT("MiXeD".into())).unwrap();
-        assert_eq!(canonical_rdata(&txt).unwrap(), b"MiXeD".to_vec());
+        // TXT is not on the list, so its bytes pass through untouched — length
+        // prefix (RFC 1035 §3.3.14) and case both.
+        let txt = RecordData::from_parsed(&ParsedRecord::TXT(vec!["MiXeD".into()])).unwrap();
+        assert_eq!(canonical_rdata(&txt).unwrap(), b"\x05MiXeD".to_vec());
+    }
+
+    /// A signed TXT RRset, including one with several `<character-string>`s.
+    ///
+    /// The canonical form of a TXT record is its RDATA unchanged, so it is only
+    /// right if the RDATA is right: while TXT was stored as one unframed blob,
+    /// what got signed here was not what a real signer would have signed, and a
+    /// genuine zone's TXT signature could not have verified against it.
+    #[test]
+    fn test_signed_txt_rrset_with_several_strings_verifies() {
+        let zone = TestZone::new("example.test.");
+        let txt = ResourceRecord {
+            name: "txt.example.test.".into(),
+            class: 1,
+            ttl: 300,
+            rdata: RecordData::from_parsed(&ParsedRecord::TXT(vec![
+                b"v=spf1 include:example.net".to_vec(),
+                b"-all".to_vec(),
+            ]))
+            .unwrap(),
+        };
+        let sig = zone.sign_records(std::slice::from_ref(&txt));
+
+        let proof = verify_records(
+            &[txt],
+            &[Rrsig::from_record(&sig).unwrap()],
+            &zone.dnskeys(),
+            "example.test.",
+        );
+        assert!(
+            matches!(proof, RrsetProof::Verified { .. }),
+            "a multi-string TXT RRset must verify: {proof:?}"
+        );
     }
 
     /// RFC 4034 §6.3 sorts by RDATA, not by the encoded RR — and the two differ

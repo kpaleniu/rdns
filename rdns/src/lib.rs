@@ -4,7 +4,6 @@ use num_traits::{FromPrimitive, ToPrimitive};
 use rand::Rng;
 use std::{
     net::{Ipv4Addr, Ipv6Addr},
-    str::from_utf8,
 };
 
 use compression::NameCompressor;
@@ -21,6 +20,7 @@ pub mod cache;
 pub mod resolver;
 pub mod metrics;
 pub mod nsec_cache;
+pub mod negative_cache;
 pub mod dnssec;
 pub mod dnssec_chain;
 pub mod dnssec_denial;
@@ -109,7 +109,22 @@ pub enum ParsedRecord {
         preference: u16,
         exchange: String,
     },
-    TXT(String),
+    /// One TXT record's `<character-string>`s (RFC 1035 §3.3.14).
+    ///
+    /// A sequence of byte strings, and both halves of that matter.
+    ///
+    /// **A sequence**, because the RDATA is a run of length-prefixed strings of
+    /// at most 255 bytes each, and a record holding two of them is a different
+    /// record from one holding the two joined together. Stored as a single
+    /// unframed blob — which is what this was — the RDATA is something no
+    /// correct client can read: the first byte of the text is taken for a length
+    /// that nothing wrote.
+    ///
+    /// **Bytes**, because a character-string is arbitrary octets. As `String` it
+    /// was worse than lossy: a TXT carrying non-UTF-8 data failed to decode, and
+    /// since decoding happens while reading the message, one such record made
+    /// the entire response unparseable.
+    TXT(Vec<Vec<u8>>),
     AAAA(Ipv6Addr),
     DNSKEY {
         flags: u16,
@@ -277,7 +292,24 @@ impl ParsedRecord {
                     exchange,
                 })
             }
-            16 => Ok(ParsedRecord::TXT(from_utf8(rdata)?.to_string())),
+            16 => {
+                // A run of `<character-string>`s: one length byte, then that
+                // many bytes, until the RDATA runs out.
+                let mut strings = Vec::new();
+                let mut rest = rdata;
+                while let Some((&len, after_len)) = rest.split_first() {
+                    let len = len as usize;
+                    if after_len.len() < len {
+                        return Err(anyhow!(
+                            "TXT character-string claims {len} bytes but only {} remain",
+                            after_len.len()
+                        ));
+                    }
+                    strings.push(after_len[..len].to_vec());
+                    rest = &after_len[len..];
+                }
+                Ok(ParsedRecord::TXT(strings))
+            }
             28 => {
                 let addr: [u8; 16] = rdata.try_into()?;
                 Ok(ParsedRecord::AAAA(Ipv6Addr::from(addr)))
@@ -413,7 +445,26 @@ impl ParsedRecord {
                 v.extend_from_slice(&dname_to_bytes(exchange)?);
                 (15, v)
             }
-            ParsedRecord::TXT(text) => (16, text.as_bytes().to_vec()),
+            ParsedRecord::TXT(strings) => {
+                if strings.is_empty() {
+                    return Err(anyhow!("a TXT record must carry at least one string"));
+                }
+                let mut v = Vec::new();
+                for s in strings {
+                    // The length is one byte, so 255 is the ceiling. Splitting a
+                    // longer string across two character-strings would change
+                    // what the record says, so this is the zone's mistake to fix.
+                    let len = u8::try_from(s.len()).map_err(|_| {
+                        anyhow!(
+                            "TXT string is {} bytes; a character-string holds at most 255",
+                            s.len()
+                        )
+                    })?;
+                    v.push(len);
+                    v.extend_from_slice(s);
+                }
+                (16, v)
+            }
             ParsedRecord::SOA {
                 mname,
                 rname,
@@ -1104,6 +1155,72 @@ mod tests {
         ];
 
         assert_eq!(&buf[0..n], &expected);
+    }
+
+    // -----------------------------------------------------------------
+    // TXT <character-string>s (RFC 1035 §3.3.14)
+    // -----------------------------------------------------------------
+
+    /// The framing itself: each string is preceded by its length. Stored as one
+    /// unframed blob — which is what this was — the first byte of the text is
+    /// read as a length by every correct client, and the record arrives short.
+    #[test]
+    fn test_txt_is_framed_as_character_strings() {
+        let one = RecordData::from_parsed(&ParsedRecord::TXT(vec![b"hello".to_vec()])).unwrap();
+        assert_eq!(&*one.rdata, b"\x05hello");
+
+        let two = RecordData::from_parsed(&ParsedRecord::TXT(vec![
+            b"v=spf1".to_vec(),
+            b"-all".to_vec(),
+        ]))
+        .unwrap();
+        assert_eq!(&*two.rdata, b"\x06v=spf1\x04-all");
+    }
+
+    #[test]
+    fn test_txt_survives_a_wire_roundtrip() {
+        let strings = vec![
+            b"first string".to_vec(),
+            Vec::new(),
+            // Arbitrary octets: a character-string is not text. As a `String`
+            // this failed to decode at all — and decoding happens while reading
+            // the message, so one such record took the whole response with it.
+            vec![0xff, 0x00, 0x80],
+        ];
+        let encoded = RecordData::from_parsed(&ParsedRecord::TXT(strings.clone())).unwrap();
+        assert_eq!(
+            encoded.parse().unwrap(),
+            ParsedRecord::TXT(strings),
+            "an empty character-string is legal too, and must survive"
+        );
+    }
+
+    /// A character-string's length is one byte, so 255 is the ceiling. Splitting
+    /// a longer string in two would change what the record says, so this is the
+    /// zone's error to fix rather than ours to paper over.
+    #[test]
+    fn test_txt_string_longer_than_255_is_refused() {
+        let err =
+            RecordData::from_parsed(&ParsedRecord::TXT(vec![vec![b'x'; 256]])).unwrap_err();
+        assert!(err.to_string().contains("255"), "got: {err}");
+
+        // 255 exactly is fine.
+        assert!(RecordData::from_parsed(&ParsedRecord::TXT(vec![vec![b'y'; 255]])).is_ok());
+    }
+
+    #[test]
+    fn test_txt_with_no_strings_is_refused() {
+        let err = RecordData::from_parsed(&ParsedRecord::TXT(Vec::new())).unwrap_err();
+        assert!(err.to_string().contains("at least one"), "got: {err}");
+    }
+
+    /// A length byte that runs past the end of the RDATA is malformed, and is
+    /// refused as the record is read rather than indexed off the end of.
+    #[test]
+    fn test_txt_with_a_length_past_the_end_is_an_error() {
+        let unpacker = crate::dname::DNameUnpacker::new(&[]);
+        let err = RecordData::from_wire(16, b"\x09short", &unpacker).unwrap_err();
+        assert!(err.to_string().contains("character-string"), "got: {err}");
     }
 
     #[test]

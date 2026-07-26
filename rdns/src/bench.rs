@@ -92,8 +92,12 @@ mod benches {
             iterations
         );
 
-        // Sanity check: should be fast enough (>45k ops/sec with mutex overhead)
-        assert!(ops_per_sec > 45_000.0, "logger too slow: {:.0} ops/sec", ops_per_sec);
+        // The floor was 45k, which is what this measures on an idle machine
+        // (47-50k here) — so any competing load failed the suite and the number
+        // said nothing about the code. A regression that matters, like a write
+        // or an allocation per call, costs an order of magnitude; 10k catches
+        // that and survives a busy machine.
+        assert!(ops_per_sec > 10_000.0, "logger too slow: {:.0} ops/sec", ops_per_sec);
     }
 
     #[test]

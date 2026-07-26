@@ -24,8 +24,14 @@ impl CacheEntry {
     }
 }
 
-/// DNS response cache with TTL support
-/// Caches responses keyed by (domain_name, record_type)
+/// DNS response cache with TTL support.
+///
+/// Caches responses keyed by (domain_name, record_type) — *answers* only. A
+/// negative answer has no records to key on and takes its TTL from the SOA
+/// instead, so it lives in [`crate::negative_cache::NegativeCache`]. There used
+/// to be a `put_negative` here that stored an empty entry under type 0; it
+/// recorded neither the rcode nor the SOA, could not tell NXDOMAIN from NODATA,
+/// and nothing ever called it.
 pub struct DnsCache {
     cache: Arc<Mutex<HashMap<(String, u16), CacheEntry>>>,
     max_entries: usize,
@@ -139,43 +145,6 @@ impl DnsCache {
         }
     }
 
-    /// Clear negative cache entries (NXDOMAIN responses)
-    pub fn put_negative(&self, name: &str, ttl: u64) {
-        if self.max_entries == 0 {
-            return;
-        }
-
-        let now = current_unix_timestamp();
-        let expires_at = now + ttl;
-        
-        let mut cache = self.cache.lock().unwrap();
-        
-        if cache.len() >= self.max_entries {
-            self.evict_oldest(&mut cache);
-        }
-
-        // Use type 0 to indicate negative cache entry
-        let key = (name.to_lowercase(), 0u16);
-        cache.insert(key, CacheEntry {
-            records: Vec::new(),
-            expires_at,
-            secure: false,
-        });
-    }
-
-    /// Check if domain has negative cache entry
-    pub fn is_negative_cached(&self, name: &str) -> bool {
-        let now = current_unix_timestamp();
-        let cache = self.cache.lock().unwrap();
-        
-        let key = (name.to_lowercase(), 0u16);
-        if let Some(entry) = cache.get(&key) {
-            !entry.is_expired(now)
-        } else {
-            false
-        }
-    }
-
     /// Get cache statistics
     pub fn get_stats(&self) -> CacheStats {
         let cache = self.cache.lock().unwrap();
@@ -270,17 +239,6 @@ mod tests {
         assert!(cache.get("example.com.", 1).is_some());
         assert!(cache.get("example.com.", 28).is_some());
         assert!(cache.get("example.com.", 5).is_none()); // CNAME not cached
-    }
-
-    #[test]
-    fn test_negative_cache() {
-        let cache = DnsCache::with_defaults();
-        
-        cache.put_negative("notexist.com.", 300);
-        assert!(cache.is_negative_cached("notexist.com."));
-        
-        // Case insensitive
-        assert!(cache.is_negative_cached("NOTEXIST.COM."));
     }
 
     #[test]
