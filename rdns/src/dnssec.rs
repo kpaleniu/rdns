@@ -334,6 +334,26 @@ pub fn signed_owner(owner: &str, rrsig_labels: u8) -> String {
     }
 }
 
+/// The label count an RRSIG over `owner` must carry (RFC 4034 §3.1.3).
+///
+/// The root and a leading `*` are not counted. Not counting the `*` is the
+/// whole of wildcard signing: it is what makes one signature verify at every
+/// name the wildcard expands to, because a validator reconstructs the signed
+/// owner name from this number ([`signed_owner`] is the same rule read
+/// backwards).
+pub fn rrsig_labels(owner: &str) -> u8 {
+    let labels = label_count(owner);
+    let counted = if owner.starts_with("*.") {
+        labels.saturating_sub(1)
+    } else {
+        labels
+    };
+    // A name cannot have more than 127 labels and still fit the 255-octet
+    // limit, so the cast is total; saturating rather than wrapping keeps a
+    // hypothetical monster name from claiming *fewer* labels than it has.
+    counted.min(u8::MAX as usize) as u8
+}
+
 /// A record's RDATA in canonical form: identical to the stored bytes except for
 /// the RFC 4034 §6.2 types, whose embedded domain names are down-cased.
 ///

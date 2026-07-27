@@ -8,7 +8,7 @@ where to look rather than here.
 
 ---
 
-## Current state (last updated 2026-07-26)
+## Current state (last updated 2026-07-27)
 
 **Workspace** — four members, all on branch `master`:
 
@@ -20,10 +20,11 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **515 lib + 29 integration** tests passing (`rdnsd`'s
-own 29 cover argument validation, zone sources, the secondary role, both
-directions of IXFR and onward announcement), `cargo clippy --workspace
---all-targets` **clean, no exceptions**.
+`cargo test --workspace` = **553 lib + 37 integration** tests passing (`rdnsd`'s
+own 37 cover argument validation, zone sources, the secondary role, both
+directions of IXFR and onward announcement, and answering a DO-bit query from a
+zone it signed itself), `cargo clippy --workspace --all-targets` **clean, no
+exceptions**.
 
 **Steps 1–5 of #7 are done: `rdnsd` replicates in both directions, incrementally
 at both ends, and cascades.** It transfers a zone from a master, serves it, writes
@@ -37,22 +38,27 @@ incremental transfer".
 deltas matter when dynamic UPDATE (RFC 2136) arrives and not before, because that
 is what makes a journal the source of truth rather than a cache of one.
 
-**One item is left on this whole list: `rdnsd` cannot sign a zone** (#2). It is
-also the only remaining item that is a feature rather than a gap — key management,
-signing an RRset per name, and generating an NSEC or NSEC3 chain, with
-`dnssec_validation_mode` still called from nowhere. Everything needed to *check* a
-signed zone is here and tested against real signatures, which is the half that was
-hard; producing one is mostly bookkeeping and a lot of it.
+**`rdnsd` signs zones now, and #2 is closed with it.** It generates its own keys,
+signs every zone it holds keys for as that zone loads, and answers a DO-bit query
+with the signatures and the denials that go with it — including the two an
+answer *owes* rather than merely carries: a wildcard answer with a denial of the
+name asked for, and an NXDOMAIN with a denial of the wildcard that could have
+answered it. Verified against **dnspython**, which validated every RRset it was
+served under both NSEC and NSEC3. See "Architecture: signing a zone".
+`dnssec_validation_mode` is called at last: every signature in a zone is checked
+against the zone's own keys before anything is served from it, and `--require-signed`
+turns "this zone is not signed" into a refusal to start.
 
-**#5 is closed, and TSIG and NOTIFY with it.** The work now has a spine: **#7,
-the secondary role** — `rdnsd` can hand a zone out (AXFR) and announce a change
-(NOTIFY) but cannot *be* a replica of anything, which is what IXFR would exist to
-serve. #7 lists it in six steps with the persistence design settled first (see
-"Architecture: persistence"). Start at step 1.
+**Only step 6 of #7 is left, and it is explicitly conditional** — persisted
+deltas matter when dynamic UPDATE (RFC 2136) arrives and not before, because that
+is what makes a journal the source of truth rather than a cache of one.
 
-Still open outside that: #2's RFC 5011 key rollover (cheaper than it looks — see
-the item), CNAME-chain validation and `rdnsd` zone signing; #1's two
-aggressive-use extensions; and #6, a candidate rather than a plan.
+**What is open now is what signing turned up**, listed under #8: no resigning
+timer (signatures are made at load, so a server up longer than
+`--signature-validity` serves expired ones), no serial bump when a zone is
+re-signed, and `rdnsd` answering NXDOMAIN where a referral belongs — the last of
+which predates all of this and is not a DNSSEC bug. Plus #1's two aggressive-use
+extensions, and #6, a candidate rather than a plan.
 
 **The flaky test is fixed.** `bench::bench_logger_throughput` asserted
 `>45k ops/sec` against a measurement of 47–50k, so any competing load failed the
@@ -91,6 +97,18 @@ cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
 # Tell a secondary at once when a zone changes, and cap UDP response bytes/s.
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --also-notify 127.0.0.1:15354 --response-rate 4096
+
+# Sign a zone. Once, to make the keys and learn the DS to give the parent:
+cargo run -p rdnsd -- --signing-key-dir ./keys --generate-keys example.com
+
+# ...then serve, signing every zone there is a key for as it loads. The zone
+# file on disk stays unsigned; the signatures live in memory only.
+cargo run -p rdnsd -- --port 15353 --zone-dir ./zones --signing-key-dir ./keys
+
+# NSEC3 instead of NSEC, and refuse to start if anything here is unsigned or
+# does not verify.
+cargo run -p rdnsd -- --port 15353 --zone-dir ./zones --signing-key-dir ./keys \
+  --nsec3 --require-signed
 
 # Resolver, recursing from the root hints. Serves UDP and TCP on one port, and
 # binds 127.0.0.1 by default on purpose — not an open resolver.
@@ -170,9 +188,35 @@ dns.zone.from_xfr(dns.query.xfr('127.0.0.1', 'example.com', port=15353,
                                 keyname=dns.name.from_text('transfer.key.')))
 ```
 
-This is the check the DNSSEC work did not have and should have: a MAC or a
-signature over a canonical serialization is the one thing that cannot be verified
-by both halves of your own code agreeing.
+A MAC or a signature over a canonical serialization is the one thing that cannot
+be verified by both halves of your own code agreeing, so **the signer is checked
+the same way**. `dns.dnssec.validate` needs `pip install cryptography` as well;
+without it every call fails with "DNSSEC validation requires python
+cryptography", which reads exactly like a bad signature and is not one:
+
+```python
+import dns.message, dns.query, dns.dnssec, dns.name, dns.rdatatype
+zone = dns.name.from_text('example.com.')
+ask = lambda n, t: dns.query.udp(
+    dns.message.make_query(n, t, want_dnssec=True), '127.0.0.1', port=15353)
+
+r = ask('example.com.', 'DNSKEY')                      # the keys, self-signed
+keys = [s for s in r.answer if s.rdtype == dns.rdatatype.DNSKEY][0]
+sig  = [s for s in r.answer if s.rdtype == dns.rdatatype.RRSIG][0]
+dns.dnssec.validate(keys, sig, {zone: keys})           # raises if it does not hold
+
+r = ask('www.example.com.', 'A')                       # then anything else
+data = [s for s in r.answer if s.rdtype == dns.rdatatype.A][0]
+sig  = [s for s in r.answer if s.rdtype == dns.rdatatype.RRSIG][0]
+dns.dnssec.validate(data, sig, {zone: keys})
+```
+
+Three things are worth checking beyond "it verifies", because each is a bug that
+still verifies: a wildcard answer's RRSIG must have a *lower* label count than the
+name it was served at and must arrive with an NSEC/NSEC3 in the authority section;
+an NXDOMAIN must carry two denials, not one; and a delegation's NS RRset must have
+**no** RRSIG at all, with the NSEC at that name listing `NS RRSIG NSEC` and not
+`DS`.
 
 Four environment traps that have each cost an hour:
 
@@ -231,8 +275,11 @@ Validation is on the resolve path and enforced (see "Architecture: DNSSEC" and
       "Architecture: DNSSEC". `dnssec_chain::cname_chain_shape` walks the answer
       from the question and requires every record to be on that path; a Secure
       verdict now depends on it.
-- [ ] **`rdnsd` cannot sign a zone**, only serve one that arrives pre-signed,
-      and `dnssec_validation_mode` is still not called from anywhere.
+- [x] **`rdnsd` signs a zone** — done, see "Done so far" and "Architecture:
+      signing a zone". `--generate-keys` makes a KSK and a ZSK and prints the DS
+      for the parent; `--signing-key-dir` signs every zone there is a key for as
+      it loads; `--nsec3` picks the other chain. `dnssec_validation_mode` is
+      what checks the result before it is served.
 
 ### 3. NSEC3 salt and iterations — done
 Was: `validate_nsec3` hashed the query name with a single bare SHA-1 pass,
@@ -366,6 +413,43 @@ path (a task per datagram, unbounded — TCP has both caps), no rate limiting or
 query logging in `rdnsr` at all (both exist in the library, wired into `rdnsd`
 only), no signal handling, no EDNS cookies (RFC 7873), and static root hints with
 no periodic re-priming of the root NS set.
+
+### 8. What signing turned up
+
+Three gaps, in the order they will bite. The first two are signing's own; the
+third is older than signing and was only made visible by it.
+
+- [ ] **Nothing re-signs a running server.** Signatures are made when a zone
+      loads — startup, and SIGHUP where signals exist — and expire
+      `--signature-validity` days later, 30 by default. A server up longer than
+      that serves expired signatures, which is bogus rather than merely stale:
+      every validating client stops resolving the zone. The workaround is a
+      `kill -HUP` from cron and it is not good enough. The work is a timer that
+      re-signs at roughly a third of the validity, which `sign_zone` already
+      supports — it drops the previous run's output and starts over, so
+      re-signing an already-signed zone is the ordinary case, not a special one.
+- [ ] **Re-signing does not bump the SOA serial**, which is what the timer above
+      has to decide before it can be written. New signatures are a new version of
+      the zone as far as a secondary is concerned, and a secondary compares
+      serials — so without a bump the replica keeps the signatures it transferred
+      and they expire underneath it. With a bump, every re-signing is a zone
+      change that NOTIFYs the world, which is what BIND does and what the
+      replication path here is already built for (`install_all_zones` computes
+      the delta, `announce_zones` sends it). The reason it is not done in the
+      same breath as the timer is that a serial that moves on its own interacts
+      with an operator editing the same number in the file, and that deserves
+      deciding rather than defaulting.
+- [ ] **`rdnsd` answers NXDOMAIN where a referral belongs.** A query for a name
+      under a delegation finds no records at that name and falls through to
+      `Zone::name_exists`, which says no — so a child zone's names are denied by
+      the parent rather than pointed at. This is wrong without DNSSEC and *loudly*
+      wrong with it: the denial is now signed, so the parent authenticates a
+      statement that the child does not exist. The zone signer already computes
+      the delegation set it would need (`zone_signer::Layout`), and the denial
+      records for the secure and insecure cases already exist in the chain; what
+      is missing is `make_response` noticing that the query name is below a
+      delegation and answering with the NS RRset, its glue, and either the DS or
+      a proof there is none.
 
 ---
 
@@ -1128,6 +1212,104 @@ so the first refresh after a first fetch waited the default hour instead of the
 zone's own REFRESH. Both look perfectly correct in a test that only asserts the
 transfer happened.
 
+## Architecture: signing a zone
+
+Three modules, split by what they know. `dnssec_key` holds private keys and can
+make a signature; `zone_signer` turns a zone into a signed zone; `dnssec_answer`
+decides which of those records a particular reply needs. None of them validates
+anything — `dnssec` and `dnssec_denial` were written first and are what the tests
+here judge the output with, which is the point: a signer checked against a
+validator written alongside it proves the two agree, not that either is right.
+The independent check is **dnspython**, which validated every RRset `rdnsd`
+served under both chains.
+
+**Keys are PKCS#8 in a file of our own, and the extension says so.** BIND's
+`.private` format differs per algorithm and keeps the public half in a second
+file; `ring` will take none of it, wanting PKCS#8 with the public key alongside
+the private one. Converting between the two is a format conversion whose failure
+mode is a key that signs with the wrong identity, so it is not attempted: the
+file is `Owner`, `Flags`, `Algorithm` and base64 PKCS#8, named
+`K<zone>+<alg>+<tag>.rdnskey`, and `openssl genpkey` output imports as-is. The
+owner name and flags live *in* the file rather than at the call site, because the
+key tag is computed over the flags — a key whose flags were decided by the loader
+would have a different tag depending on who loaded it, and every RRSIG naming
+that tag would point at a key nobody can find.
+
+Signing algorithms are deliberately a subset of what verification accepts. A
+validator has to read whatever the internet was signed with; a signer chooses,
+and RFC 8624 §3.1 is the list of what may be chosen. RSA/SHA-1 is therefore
+verifiable here and not signable. RSA at all is import-only, because `ring`
+implements RSA signing and not RSA key generation.
+
+**What is not signed is the part worth getting right.** A zone's authority stops
+at a delegation: the NS RRset pointing down carries no signature, the glue below
+it is not in the zone at all, and the only signed thing at a delegation point is
+the DS — plus the denial record, which exists precisely so the *absence* of a DS
+can be proved. Signing a delegation's NS is the classic signer bug; every
+validator ignores the signature, and the stray RRSIG then shows up in that name's
+NSEC bitmap as a type that is not there.
+
+**Empty non-terminals are in the chain, and this is the subtle one.** A name with
+no records of its own but with descendants still *exists*, so a query for it is
+NODATA — and the proof of a NODATA has to be a record *at* the name. Left out of
+the chain, the only record available would be one saying the name does not exist,
+which is a different answer with a signature on it. RFC 5155 §7.1 says so
+outright for NSEC3; for NSEC it follows from what NODATA means, and it is why an
+NSEC zone walk enumerates names that hold nothing.
+
+**Signing is in memory, at load, and the zone file is never rewritten.** The file
+on disk stays the unsigned thing an operator edits. A signer that rewrote its
+input would have to solve the same "who owns this file" problem the transfer
+sidecar stepped around (see "Architecture: persistence"), an editor and a
+resigning timer racing for one file is a way to lose a zone, and nothing needs
+the file anyway — what a client validates is what leaves the socket. Only zones
+read from disk are signed: a zone that arrived by transfer is the master's,
+signatures included, and the parent's DS points at their key.
+
+**A signed zone is not a signed answer**, which is what `dnssec_answer` is for.
+Three of the four shapes owe a *proof* rather than a signature, and each missing
+one is a specific attack:
+
+| the answer | what it owes | why |
+|------------|--------------|-----|
+| ordinary positive | the covering RRSIGs | — |
+| from a wildcard | the RRSIGs, re-owned onto the queried name, **and** a denial that the queried name exists | one wildcard answer verifies at every name that wildcard reaches (RFC 4035 §3.1.3); without the denial, capturing one is capturing all of them |
+| NODATA | a record at the name whose bitmap lacks the type | — |
+| NXDOMAIN | a denial of the name **and** of the wildcard that could have answered it | otherwise a wildcard-covered name can be denied |
+
+Re-owning a wildcard's RRSIG onto the queried name is not forgery and not a
+special case: the label count in the RRSIG still says where the signature was
+made, and that count is how a validator reconstructs the name that was really
+signed. Changing the owner and leaving the count alone is the shape of a genuine
+wildcard answer.
+
+**Finding the covering record is a range query, so the zone holds two ordered
+indexes.** `Zone` already indexed names in a `HashMap` for lookups; a denial asks
+a different question — "which record's span contains this name" — which a hash
+map cannot answer without looking at everything. So NSEC records are also filed in
+a `BTreeMap` by canonical sort key and NSEC3 records by their hash, and the
+covering record is the greatest entry strictly below the target, wrapping to the
+last when nothing sorts below it, because the chain is a loop. Both are empty for
+the unsigned zones that are most of them. Scanning instead would have put an
+O(records) walk on the negative-answer path, which is the mistake the name index
+exists to have already fixed.
+
+The NSEC3 salt and iteration count are read off a record *in the chain* rather
+than off NSEC3PARAM. NSEC3PARAM exists to tell a server which of several chains
+to use mid-rollover, a notion this server does not have; parameters taken from
+the chain cannot disagree with the chain, whereas an NSEC3PARAM left over from a
+previous signing can, and the failure would be every denial hashing to something
+no record matches.
+
+**What we produce is checked before it is served.** `dnssec_validation_mode` —
+which had no caller until now — is run over every zone at load: each signature in
+the zone must cover an RRset that verifies against the zone's own keys. The
+question is "does every signature hold", not "is everything signed", because a
+delegation's NS and its glue carry none by design. `--require-signed` adds the
+stronger assertion that every zone here is meant to be signed at all, and a
+failure of either refuses to start rather than serving something a validator will
+call bogus.
+
 ## Architecture: writing a zone back out
 
 Two modules, and the split is the same one the persistence table makes: `persist`
@@ -1493,6 +1675,23 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **`rdnsd` signs zones, and answers a DO-bit query from one** — closes #2, the
+  last feature on this list. `dnssec_key` generates and stores private keys and
+  makes signatures; `zone_signer` publishes the DNSKEY RRset, signs every
+  authoritative RRset, and builds an NSEC or NSEC3 chain over every name in the
+  zone — delegation points and empty non-terminals included, which is what makes
+  a missing DS and a NODATA at a name holding nothing provable rather than merely
+  asserted. `dnssec_answer` then decides what a *reply* needs, which is more than
+  the signatures: a wildcard answer goes out with a denial of the name actually
+  asked for, and an NXDOMAIN with a denial of the wildcard that could have
+  answered it. `--generate-keys` makes the pair and prints the DS for the parent;
+  `--nsec3` and `--nsec3-opt-out` pick the other chain, with RFC 9276's empty
+  salt and zero iterations. `dnssec_validation_mode` gets its first caller:
+  every signature in a zone is verified against the zone's own keys before
+  anything is served from it, and `--require-signed` makes an unsigned zone a
+  refusal to start. Verified with **dnspython**, which validated every RRset
+  served under both chains, and confirmed the delegation's NS RRset unsigned and
+  its NSEC listing NS without DS. See "Architecture: signing a zone".
 - **CNAME chains are validated as chains, not just as RRsets** — closes an item
   under #2. Every RRset in an answer verifying under its own zone's keys says each
   record is authentic and nothing about whether together they answer the question:
@@ -1971,6 +2170,39 @@ let (answer, state) = resolver.resolve_validated(&query).await?;
 //   Insecure     -> serve it, no AD (provably unsigned: most of the internet)
 //   Bogus        -> SERVFAIL, and never cache
 //   Indeterminate-> no anchor covers the name; we never looked
+```
+
+## Quick reference: signing a zone
+
+```rust
+// Keys. The owner name and flags are part of the key, not of the call.
+let ksk = SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256,
+                               "example.com.", DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP)?;
+ksk.write_to_dir(Path::new("/etc/rdns/keys"))?;   // K<zone>+<alg>+<tag>.rdnskey
+let keys = SigningKey::load_dir(Path::new("/etc/rdns/keys"))?;  // a bad file is an error
+ksk.ds(2)?          // what the parent has to publish; 2 is SHA-256
+ksk.dnskey()        // what the zone publishes
+SigningKey::from_pkcs8(alg, owner, flags, &pkcs8)?  // an openssl key, imported
+
+// Signing. The input zone is untouched; the result is a new one.
+let policy = SigningPolicy::valid_for(now, 30 * 86_400)   // inception backdated an hour
+    .with_chain(DenialChain::nsec3());                    // or DenialChain::Nsec
+let signed = zone_signer::sign_zone(&zone, &keys, &policy)?;
+// Idempotent where it matters: the previous run's RRSIG/NSEC/NSEC3/NSEC3PARAM are
+// dropped first. DNSKEYs are NOT — a pre-published key is how a rollover starts.
+
+// Serving. `zone` is signed; these say what a reply owes beyond the records.
+let sigs = dnssec_answer::answer_signatures(&zone, qname, qtype);
+sigs.records                 // RRSIGs, owned by the queried name
+sigs.wildcard                // Some(..) -> the answer still owes a denial:
+dnssec_answer::proof_of_absence(&zone, qname)
+dnssec_answer::negative_proof(&zone, qname, name_exists)  // NODATA vs NXDOMAIN
+dnssec_answer::is_signed(&zone)                           // nothing to add if not
+
+// The zone's own ordered chains, for finding a covering record without scanning.
+zone.nsec_covering(name)      // greatest entry strictly below, wrapping
+zone.nsec3_covering(&hash)
+zone.holds_name(name)         // exact — NOT name_exists, which honours wildcards
 ```
 
 ## Quick reference: answer shape

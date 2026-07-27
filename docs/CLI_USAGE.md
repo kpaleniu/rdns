@@ -260,6 +260,76 @@ Interoperability was checked against dnspython, whose TSIG is interop-tested
 against BIND: it signs a query that `rdnsd` verifies, verifies the answer `rdnsd`
 signs, and validates every envelope of a multi-message zone transfer.
 
+### `--signing-key-dir <DIR>`
+
+Where the private signing keys live. Every zone loaded from disk whose apex
+matches a key in here is **signed in memory as it loads**: the DNSKEY RRset
+published, an RRSIG over every authoritative RRset, and an NSEC chain over every
+name — including delegation points and empty non-terminals, which is what makes
+"this child has no DS" and "this name holds nothing" provable rather than merely
+asserted. Zones with no key here are served exactly as before.
+
+The zone file is never rewritten. What a client validates is what leaves the
+socket, and a resigning timer racing an editor for one file is a way to lose a
+zone. A zone that arrived by transfer is not signed either: it is the master's,
+signatures included, and the parent's DS points at their key rather than yours.
+
+- Key files are `K<zone>+<algorithm>+<tag>.rdnskey` and hold PKCS#8. They are not
+  BIND's `.private` format and do not pretend to be; a key from `openssl genpkey`
+  imports as-is.
+- Signatures last `--signature-validity` days, 30 by default, and are made when
+  the zone loads. **A server running longer than that without a reload serves
+  expired signatures**, which validating clients treat as bogus — send it a
+  SIGHUP, or restart it, well inside the window.
+- `--nsec3` uses NSEC3 instead, with no salt and no extra iterations (RFC 9276
+  §3.1: both only ever cost the server and the validator). `--nsec3-opt-out`
+  additionally leaves insecure delegations out of the chain, which is worth it
+  for a zone with many unsigned children and costs the strength of every denial
+  covering an opted-out span.
+- `--require-signed` refuses to start unless every zone is signed and every
+  signature verifies. Off by default, because most zones are unsigned and serving
+  them is the normal case.
+
+### `--generate-keys <ZONE>`
+
+Makes a key-signing key and a zone-signing key for ZONE in `--signing-key-dir`,
+prints the DS record to give the parent, and exits. Nothing is served in this
+mode. `--key-algorithm` picks the algorithm by number or mnemonic and defaults to
+`ECDSAP256SHA256`; RSA keys cannot be generated here (`ring` implements RSA
+signing and not RSA key generation) but can be imported.
+
+Two keys rather than one because only the key-signing key is digested into the
+DS: the zone-signing key can then be replaced whenever, while replacing the other
+means a conversation with the registrar.
+
+```bash
+# Once, before anything else.
+mkdir -p /etc/rdns/keys
+rdnsd --signing-key-dir /etc/rdns/keys --generate-keys example.com
+# -> Wrote /etc/rdns/keys/Kexample.com.+013+19047.rdnskey
+# -> Wrote /etc/rdns/keys/Kexample.com.+013+04339.rdnskey
+# -> Give the parent zone this DS record:
+# -> example.com. IN DS 19047 13 2 F073CC97...
+
+# Then serve, signing on the way in.
+rdnsd --zone-dir /etc/rdns/zones --signing-key-dir /etc/rdns/keys
+
+# NSEC3 instead, and a shorter validity.
+rdnsd --zone-dir /etc/rdns/zones --signing-key-dir /etc/rdns/keys \
+  --nsec3 --signature-validity 14
+
+# Every zone here is meant to be signed; say so, and fail loudly if one is not.
+rdnsd --zone-dir /etc/rdns/zones --signing-key-dir /etc/rdns/keys --require-signed
+```
+
+A client asking with the DO bit set gets the signatures and the proofs that go
+with them; a client that did not ask gets exactly what it always got. Checked
+against dnspython, which validated every RRset served under both chains.
+
+Until the parent publishes the DS, the zone is signed but *insecure*: a validator
+has no path to the keys and will treat the zone as unsigned rather than as
+protected.
+
 ## Zone Source
 
 Exactly one of `--zone-file` or `--zone-dir` must be specified.

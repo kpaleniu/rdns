@@ -13,6 +13,7 @@ pub mod compression;
 pub mod dname;
 pub mod zone;
 pub mod zone_writer;
+pub mod zone_signer;
 pub mod xfr;
 pub mod secondary;
 pub mod ixfr;
@@ -32,7 +33,9 @@ pub mod notify;
 pub mod nsec_cache;
 pub mod negative_cache;
 pub mod dnssec;
+pub mod dnssec_answer;
 pub mod dnssec_chain;
+pub mod dnssec_key;
 pub mod dnssec_denial;
 pub mod dnssec_validation_mode;
 /// Real DNSSEC signing for tests only — see the module docs for why an

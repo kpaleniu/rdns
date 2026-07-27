@@ -1,6 +1,7 @@
 use crate::{ParsedRecord, RecordData};
 use crate::utils::record_type_code;
-use std::collections::HashMap;
+use crate::dnssec_denial::{base32hex_decode, canonical_sort_key};
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,22 @@ pub struct Zone {
     records: Vec<ZoneRecord>,
     /// Positions in `records`, by [`Zone::lookup_key`] of the owner name.
     index: HashMap<String, Vec<usize>>,
+    /// The NSEC chain, keyed by canonical sort order, and the NSEC3 chain,
+    /// keyed by hash — both empty for the unsigned zones that are most of them.
+    ///
+    /// Ordered, where the name index is not, because the question a denial asks
+    /// is a range one: "which record's span contains this name". A hash map
+    /// cannot answer that without looking at every entry, and answering it by
+    /// scanning the zone would put an O(records) walk on the negative-answer
+    /// path — the same mistake the name index exists to have fixed.
+    nsec_chain: BTreeMap<Vec<u8>, usize>,
+    nsec3_chain: BTreeMap<Vec<u8>, usize>,
+}
+
+/// Which of the two chains a denial record belongs to.
+enum Chain {
+    Nsec,
+    Nsec3,
 }
 
 impl Zone {
@@ -49,6 +66,8 @@ impl Zone {
             origin: absolute(&origin),
             records: Vec::new(),
             index: HashMap::new(),
+            nsec_chain: BTreeMap::new(),
+            nsec3_chain: BTreeMap::new(),
         }
     }
 
@@ -78,8 +97,96 @@ impl Zone {
     /// Add a record to the zone
     pub fn add_record(&mut self, record: ZoneRecord) {
         let key = self.lookup_key(&record.name);
-        self.index.entry(key).or_default().push(self.records.len());
+        let position = self.records.len();
+        self.index.entry(key).or_default().push(position);
+        match self.chain_key(&record) {
+            Some((Chain::Nsec, k)) => {
+                self.nsec_chain.insert(k, position);
+            }
+            Some((Chain::Nsec3, k)) => {
+                self.nsec3_chain.insert(k, position);
+            }
+            None => {}
+        }
         self.records.push(record);
+    }
+
+    /// Whether the zone holds records at exactly this name — no wildcard.
+    ///
+    /// [`Zone::name_exists`] answers a different question, the one a query
+    /// needs: it says yes for a name a wildcard reaches. Denial of existence
+    /// needs the literal one, because a name that only exists through a
+    /// wildcard is precisely the name a wildcard answer has to prove does
+    /// *not* exist (RFC 4035 §3.1.3).
+    pub fn holds_name(&self, name: &str) -> bool {
+        self.index.contains_key(&self.lookup_key(name))
+    }
+
+    pub fn has_nsec_chain(&self) -> bool {
+        !self.nsec_chain.is_empty()
+    }
+
+    pub fn has_nsec3_chain(&self) -> bool {
+        !self.nsec3_chain.is_empty()
+    }
+
+    /// Any one record from the NSEC3 chain, for reading the salt and iteration
+    /// count the chain was built with.
+    pub fn any_nsec3(&self) -> Option<&ZoneRecord> {
+        self.nsec3_chain
+            .values()
+            .next()
+            .map(|position| &self.records[*position])
+    }
+
+    /// The NSEC whose span contains `name` — the record that denies it exists.
+    ///
+    /// Strictly *between* two names: an NSEC sitting at `name` itself proves
+    /// the opposite, that the name is there, so the search is exclusive at the
+    /// low end. When nothing sorts before `name` the answer is the last record
+    /// in the chain, because the chain is a loop — its final NSEC points back
+    /// at the apex and so covers everything after the last name in the zone
+    /// *and* everything before the first (RFC 4034 §4.1.1).
+    pub fn nsec_covering(&self, name: &str) -> Option<&ZoneRecord> {
+        let key = canonical_sort_key(name);
+        let position = self
+            .nsec_chain
+            .range(..key)
+            .next_back()
+            .or_else(|| self.nsec_chain.iter().next_back())?;
+        Some(&self.records[*position.1])
+    }
+
+    /// The NSEC3 whose span contains `hash`. Same rule, in hash order.
+    pub fn nsec3_covering(&self, hash: &[u8]) -> Option<&ZoneRecord> {
+        let position = self
+            .nsec3_chain
+            .range(..hash.to_vec())
+            .next_back()
+            .or_else(|| self.nsec3_chain.iter().next_back())?;
+        Some(&self.records[*position.1])
+    }
+
+    /// Where a denial record belongs in the ordered chains, if it is one.
+    ///
+    /// An NSEC is filed under its owner name; an NSEC3 under the hash in its
+    /// owner's first label, which is the value the chain is actually ordered
+    /// by. A record whose label will not decode is left out rather than filed
+    /// under something wrong — it cannot be part of a chain a validator can
+    /// walk either.
+    fn chain_key(&self, record: &ZoneRecord) -> Option<(Chain, Vec<u8>)> {
+        match record.rdata.rtype {
+            crate::utils::record_types::NSEC => Some((
+                Chain::Nsec,
+                canonical_sort_key(&self.normalize_name(&record.name)),
+            )),
+            crate::utils::record_types::NSEC3 => {
+                let owner = self.normalize_name(&record.name);
+                let label = owner.split('.').next()?;
+                Some((Chain::Nsec3, base32hex_decode(label).ok()?))
+            }
+            _ => None,
+        }
     }
 
     /// Query records by name and type.
@@ -142,6 +249,25 @@ impl Zone {
         self.index.clear();
         for (position, key) in keys.into_iter().enumerate() {
             self.index.entry(key).or_default().push(position);
+        }
+
+        // The chains are keyed by the *absolute* name too, so moving the origin
+        // moves them — an NSEC filed under a relative name would be findable
+        // only by a query that happened to ask the same way.
+        let chain_keys: Vec<Option<(Chain, Vec<u8>)>> =
+            self.records.iter().map(|r| self.chain_key(r)).collect();
+        self.nsec_chain.clear();
+        self.nsec3_chain.clear();
+        for (position, key) in chain_keys.into_iter().enumerate() {
+            match key {
+                Some((Chain::Nsec, k)) => {
+                    self.nsec_chain.insert(k, position);
+                }
+                Some((Chain::Nsec3, k)) => {
+                    self.nsec3_chain.insert(k, position);
+                }
+                None => {}
+            }
         }
     }
 

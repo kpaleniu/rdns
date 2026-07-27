@@ -38,6 +38,12 @@ pub mod record_types {
     pub const DNSKEY: u16 = 48;
     /// NSEC3 record (next secure v3)
     pub const NSEC3: u16 = 50;
+    /// NSEC3PARAM — the salt and iteration count a zone's NSEC3 chain was built
+    /// with, published at the apex so an authoritative server can find the chain
+    /// it is meant to answer from (RFC 5155 §4). It carries no names and is
+    /// stored as opaque RDATA rather than parsed, which is why there is no
+    /// `ParsedRecord` arm for it.
+    pub const NSEC3PARAM: u16 = 51;
     /// AXFR — a whole-zone transfer. A QTYPE only: no record ever has this type,
     /// and it is defined over TCP alone (RFC 5936).
     pub const AXFR: u16 = 252;

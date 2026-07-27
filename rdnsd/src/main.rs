@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use clap::Parser;
 use rdns::{
+    dnssec::{DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE},
+    dnssec_answer,
+    dnssec_key::{SigningAlgorithm, SigningKey},
+    dnssec_validation_mode::DnssecValidator,
     ixfr::{ixfr_response, DeltaLog, IxfrResponse},
     logging::QueryLogger,
     notify,
@@ -22,6 +26,7 @@ use rdns::{
     validation::RequestValidator,
     xfr,
     zone::{parse_zone_file_at, Zone},
+    zone_signer::{sign_zone, DenialChain, SigningPolicy},
     zone_writer::write_zone_file,
     DnsMessage, Edns, ResourceRecord, ResponseCode, EDNS_VERSION,
 };
@@ -112,6 +117,60 @@ struct Cli {
     /// path on the next start.
     #[arg(long, value_name = "ZONE@MASTER[:PORT][#KEY]")]
     secondary: Vec<String>,
+    /// A directory of `.rdnskey` signing keys.
+    ///
+    /// Every zone this server loads from disk whose apex matches a key here is
+    /// signed in memory as it loads: the DNSKEY RRset published, every
+    /// authoritative RRset signed, and an NSEC chain generated. The zone file
+    /// itself is never rewritten — what a client validates is what leaves the
+    /// socket, and a resigning timer racing an editor for one file is a way to
+    /// lose a zone. Zones with no key here are served exactly as before.
+    #[arg(long, value_name = "DIR")]
+    signing_key_dir: Option<PathBuf>,
+    /// How long a generated signature is good for, in days.
+    ///
+    /// Signatures are made at load — startup, and SIGHUP where signals exist —
+    /// so this also says how often the zone has to be reloaded. It is long by
+    /// default for that reason.
+    #[arg(long, value_name = "DAYS", default_value = "30")]
+    signature_validity: u32,
+    /// Deny names with NSEC3 (RFC 5155) rather than NSEC.
+    ///
+    /// With no salt and no extra iterations, which is what RFC 9276 §3.1 asks
+    /// for: both were meant to cost an attacker something and only ever cost
+    /// the server and the validator. The reason left to choose NSEC3 is that
+    /// NSEC lets anyone walk the zone one query at a time.
+    #[arg(long)]
+    nsec3: bool,
+    /// Leave insecure delegations out of the NSEC3 chain (RFC 5155 §6).
+    ///
+    /// For a zone with many unsigned children, which would otherwise pay a
+    /// record and a signature each. The cost is that a denial covering an
+    /// opted-out span proves less: "not here, or an insecure delegation I did
+    /// not list".
+    #[arg(long, requires = "nsec3")]
+    nsec3_opt_out: bool,
+    /// Generate a key-signing and a zone-signing key for ZONE, print the DS
+    /// record to give the parent, and exit.
+    ///
+    /// Writes both into `--signing-key-dir`, which must exist. Nothing is
+    /// served in this mode: it is the one thing that has to happen before a
+    /// zone can be signed, and it happens once.
+    #[arg(long, value_name = "ZONE", requires = "signing_key_dir")]
+    generate_keys: Option<String>,
+    /// The algorithm `--generate-keys` uses: a number or a mnemonic.
+    #[arg(long, value_name = "ALG", default_value = "ECDSAP256SHA256")]
+    key_algorithm: String,
+    /// Refuse to serve a zone that is not signed, or whose signatures do not
+    /// verify.
+    ///
+    /// Off by default, which is the only sane default for a server that may
+    /// hold a mix: most zones are unsigned and serving them is the normal case.
+    /// Turning it on is an operator assertion that every zone here is meant to
+    /// be signed — worth making, because a zone that silently loses its
+    /// signatures otherwise keeps answering as though nothing happened.
+    #[arg(long)]
+    require_signed: bool,
     /// Response bytes per second, per client address. 0 turns the budget off.
     ///
     /// Meters what leaves rather than what arrives, because that is what an
@@ -169,6 +228,12 @@ fn make_response(
         let _ = response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
         return response;
     }
+
+    // DO says the client can make sense of DNSSEC records, so send them
+    // (RFC 4035 §3.1.1). It is not a request for validation and not a demand
+    // that the zone be signed — an unsigned zone answers a DO query exactly as
+    // it answers any other, and [`dnssec_answer`] returns nothing for it.
+    let dnssec_ok = matches!(msg.edns(), Ok(Some(edns)) if edns.do_bit);
 
     // Only QUERY reaches the zone lookup. NOTIFY is answered by the caller,
     // which knows the peer's address; anything else — UPDATE, STATUS, the
@@ -230,7 +295,8 @@ fn make_response(
                 // (NODATA). `Zone::name_exists` is what expands `@` and relative
                 // owner names against the origin and accounts for a wildcard —
                 // comparing the stored names raw never matches.
-                if !zone.name_exists(&query.qname) {
+                let name_exists = zone.name_exists(&query.qname);
+                if !name_exists {
                     response.rcode = ResponseCode::NoSuchDomain;
                 }
 
@@ -249,6 +315,18 @@ fn make_response(
                     });
                 }
 
+                // An unsigned "no" is a "no" a resolver has to take on trust,
+                // which for a signed zone is the one thing DNSSEC exists to
+                // avoid: the proof is what stops a forged NXDOMAIN taking a
+                // name off the internet for as long as it stays cached.
+                if dnssec_ok {
+                    response.authorities.extend(dnssec_answer::negative_proof(
+                        zone,
+                        &query.qname,
+                        name_exists,
+                    ));
+                }
+
                 metrics.increment_cache_misses();
             } else {
                 // Add matching records to answer section. The answer echoes the
@@ -262,6 +340,23 @@ fn make_response(
                         ttl: record.ttl,
                         rdata: record.rdata.clone(),
                     });
+                }
+
+                if dnssec_ok {
+                    let signatures =
+                        dnssec_answer::answer_signatures(zone, &query.qname, query.qtype);
+                    // A wildcard answer is not finished when its signature is
+                    // attached. The same signature verifies at every name that
+                    // wildcard reaches, so the answer also has to say that the
+                    // name actually asked for is not in the zone
+                    // (RFC 4035 §3.1.3) — otherwise one captured answer is a
+                    // valid answer for all of them.
+                    if signatures.wildcard.is_some() {
+                        response
+                            .authorities
+                            .extend(dnssec_answer::proof_of_absence(zone, &query.qname));
+                    }
+                    response.answers.extend(signatures.records);
                 }
 
                 metrics.increment_cache_hits();
@@ -298,9 +393,13 @@ fn make_response(
     instrumentation::trace_query_response(query_name, query_type, timer.elapsed_ms(), None);
 
     // Mirror EDNS0: only include an OPT record when the client used EDNS
-    // (RFC 6891 §6.1.1), advertising our own UDP payload size.
+    // (RFC 6891 §6.1.1), advertising our own UDP payload size. DO is echoed
+    // when it was asked for, which is how the client knows the DNSSEC records
+    // it did or did not get were a deliberate answer (RFC 3225 §3).
     if msg.has_edns() {
-        let _ = response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+        let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
+        edns.do_bit = dnssec_ok;
+        let _ = response.set_edns(edns);
     }
 
     response
@@ -1150,6 +1249,40 @@ async fn udp_loop(socket: Arc<UdpSocket>, server: Arc<Server>) -> Result<(), std
     }
 }
 
+/// What a reload has to redo: everything between reading the files and being
+/// ready to answer from them.
+///
+/// Only SIGHUP reloads, so on a platform without signals this is carried and
+/// never used — the same shape the signal handler itself has.
+#[derive(Clone)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Reloading {
+    replicating: bool,
+    signing: Option<Arc<ZoneSigning>>,
+    validator: Arc<DnssecValidator>,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl Reloading {
+    /// Read the zones again and put them through signing and checking, or say
+    /// why not.
+    ///
+    /// Nothing is installed unless the whole set comes through. A reload that
+    /// replaced half the zones and gave up would leave the server serving a
+    /// mixture of two versions, and the half that failed is the half that
+    /// needed attention.
+    async fn load(&self, source: &ZoneSource) -> Result<HashMap<String, Zone>, String> {
+        let mut zones = load_zones_from_source(source, self.replicating)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(signing) = &self.signing {
+            signing.apply(&mut zones)?;
+        }
+        verify_zones(&zones, &self.validator)?;
+        Ok(zones)
+    }
+}
+
 /// Spawn a signal handler task to reload zones on SIGHUP (Unix only)
 #[cfg(unix)]
 fn spawn_signal_handler(
@@ -1158,6 +1291,7 @@ fn spawn_signal_handler(
     source: ZoneSource,
     notify_targets: Vec<SocketAddr>,
     announced: Vec<(String, u32)>,
+    reloading: Reloading,
 ) {
     let zone_map_clone = Arc::clone(&zone_map);
     let source_clone = source.clone();
@@ -1165,7 +1299,7 @@ fn spawn_signal_handler(
         let mut announced = announced;
         if let Ok(mut signals) = Signals::new(&[SIGHUP]) {
             while signals.next().await.is_some() {
-                match load_zones_from_source(&source_clone).await {
+                match reloading.load(&source_clone).await {
                     Ok(new_zones) => {
                         // A reload is a version step like any other: the
                         // difference from what we were serving is what an IXFR
@@ -1180,8 +1314,11 @@ fn spawn_signal_handler(
                             announce_zones(&zone_map_clone, &announced, &notify_targets).await;
                     }
                     Err(e) => {
-                        eprintln!("Failed to reload zones: {}", e);
-                        instrumentation::trace_error("zone_reload_failed", None, &e.to_string());
+                        // The zones already loaded keep answering. A reload
+                        // that failed is a file that changed for the worse, and
+                        // the version in memory is the last one known good.
+                        eprintln!("Failed to reload zones: {e}");
+                        instrumentation::trace_error("zone_reload_failed", None, &e);
                     }
                 }
             }
@@ -1197,6 +1334,7 @@ fn spawn_signal_handler(
     _source: ZoneSource,
     _notify_targets: Vec<SocketAddr>,
     _announced: Vec<(String, u32)>,
+    _reloading: Reloading,
 ) {
     // Signal handling not supported on this platform, so a zone change is only
     // announced at startup here.
@@ -1822,6 +1960,17 @@ fn rand_id() -> u16 {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Key generation is a mode, not a server option: nothing is served, and it
+    // happens once per zone before anything else can.
+    if let Some(zone) = &cli.generate_keys {
+        let dir = cli
+            .signing_key_dir
+            .as_deref()
+            .ok_or("--generate-keys needs --signing-key-dir")?;
+        return generate_keys(zone, dir, &cli.key_algorithm);
+    }
+
     validate_cli_args(&cli.host, cli.port)?;
     // A typo in either list stops the server rather than quietly narrowing it —
     // or, worse, being read as something wider.
@@ -1832,8 +1981,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let secondary_specs = parse_secondary_specs(&cli.secondary)?;
 
-    let source = validate_zone_source(cli.zone_file, cli.zone_dir, !secondary_specs.is_empty())?;
-    let zones = load_zones_from_source(&source, !secondary_specs.is_empty()).await?;
+    let replicating = !secondary_specs.is_empty();
+    // Read before the source is taken apart, which consumes the two path
+    // fields.
+    let signing = ZoneSigning::load(&cli)?.map(Arc::new);
+    let source = validate_zone_source(cli.zone_file, cli.zone_dir, replicating)?;
+    let mut zones = load_zones_from_source(&source, replicating).await?;
+
+    // Signing happens between loading and serving, and so does checking the
+    // result: verifying what we just produced is what catches a canonicalization
+    // bug here rather than at every validator on the internet.
+    if let Some(signing) = &signing {
+        signing.apply(&mut zones)?;
+    }
+    let mut validator = DnssecValidator::new(cli.require_signed || signing.is_some());
+    validator.set_require_signed(cli.require_signed);
+    let validator = Arc::new(validator);
+    verify_zones(&zones, &validator)?;
+
     let zone_map = Arc::new(RwLock::new(zones));
     // Empty at startup by design: the deltas are between versions *this process*
     // has held, and a zone read from disk has no previous version here. Every
@@ -1877,6 +2042,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         source,
         notify_targets,
         announced,
+        Reloading {
+            replicating,
+            signing,
+            validator,
+        },
     );
 
     serve(
@@ -1967,6 +2137,201 @@ fn validate_zone_source(
             Err(Box::from("Must specify either --zone-file or --zone-dir"))
         }
     }
+}
+
+/// Zone signing as configured: which keys, for how long, and which chain.
+///
+/// Only zones loaded from disk are signed. A zone that arrived by transfer is
+/// the master's, signatures included — re-signing it here would replace a
+/// statement its owner made with one we made about data we do not own, and the
+/// parent's DS points at their key, not ours.
+struct ZoneSigning {
+    /// Keys by the zone they are published at, down-cased.
+    keys: HashMap<String, Vec<SigningKey>>,
+    validity: u64,
+    chain: DenialChain,
+}
+
+impl ZoneSigning {
+    fn load(cli: &Cli) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let Some(dir) = &cli.signing_key_dir else {
+            return Ok(None);
+        };
+        let loaded = SigningKey::load_dir(dir).map_err(|e| format!("{e:#}"))?;
+        if loaded.is_empty() {
+            // Not an error — a key directory prepared before any key is in it
+            // is a reasonable state — but silence here would look exactly like
+            // signing that quietly did nothing.
+            eprintln!(
+                "No .{} files in {}: no zone will be signed",
+                rdns::dnssec_key::KEY_FILE_EXTENSION,
+                dir.display()
+            );
+        }
+        let mut keys: HashMap<String, Vec<SigningKey>> = HashMap::new();
+        for key in loaded {
+            keys.entry(key.owner().to_ascii_lowercase())
+                .or_default()
+                .push(key);
+        }
+        Ok(Some(ZoneSigning {
+            keys,
+            validity: u64::from(cli.signature_validity) * 86_400,
+            chain: if cli.nsec3 {
+                DenialChain::Nsec3 {
+                    salt: Vec::new(),
+                    iterations: 0,
+                    opt_out: cli.nsec3_opt_out,
+                }
+            } else {
+                DenialChain::Nsec
+            },
+        }))
+    }
+
+    /// Sign every zone there are keys for, in place.
+    ///
+    /// A zone we hold keys for and cannot sign is an error rather than a zone
+    /// served unsigned: its parent has a DS pointing at one of these keys, so
+    /// the unsigned answer would be bogus at every validating client rather
+    /// than merely unvalidated.
+    fn apply(&self, zones: &mut HashMap<String, Zone>) -> Result<(), String> {
+        let policy = SigningPolicy::valid_for(current_unix_timestamp(), self.validity)
+            .with_chain(self.chain.clone());
+        for (origin, zone) in zones.iter_mut() {
+            let Some(keys) = self.keys.get(&origin.to_ascii_lowercase()) else {
+                continue;
+            };
+            *zone = sign_zone(zone, keys, &policy)
+                .map_err(|e| format!("signing {origin}: {e:#}"))?;
+            println!(
+                "Signed {origin} with {} key{}",
+                keys.len(),
+                if keys.len() == 1 { "" } else { "s" }
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Check every signature in every zone before anything is served from it.
+///
+/// The question asked is "does each signature in this zone cover an RRset that
+/// verifies", not "is every RRset signed" — a delegation's NS RRset and the
+/// glue below it carry no signature by design, and demanding one would fail
+/// every zone with a child. What this catches is the case worth catching: a
+/// zone whose signatures have expired, or were made over data that has since
+/// been edited, which otherwise keeps answering as though nothing happened.
+fn verify_zones(
+    zones: &HashMap<String, Zone>,
+    validator: &DnssecValidator,
+) -> Result<(), String> {
+    if !validator.is_enabled() {
+        return Ok(());
+    }
+    for (origin, zone) in zones {
+        let signed = DnssecValidator::is_zone_signed(zone);
+        if !signed {
+            // `validate_response` gives the same verdict; asking it with no
+            // records keeps the "is unsigned acceptable" decision in one place.
+            let (ok, _) = validator.validate_response(zone, &[], origin);
+            if !ok {
+                return Err(format!("{origin} is not signed"));
+            }
+            continue;
+        }
+
+        let mut checked = 0usize;
+        for (name, rtype) in signed_rrsets(zone) {
+            let records = zone.query(&name, rtype);
+            if records.is_empty() {
+                return Err(format!(
+                    "{origin}: a signature covers the {rtype} RRset at {name}, which is not there"
+                ));
+            }
+            let (ok, _) = validator.validate_response(zone, &records, &name);
+            if !ok {
+                return Err(format!(
+                    "{origin}: the {rtype} RRset at {name} does not verify against the zone's \
+                     own keys"
+                ));
+            }
+            checked += 1;
+        }
+        println!("Verified {checked} signed RRsets in {origin}");
+    }
+    Ok(())
+}
+
+/// Every `(owner, type)` in the zone that some RRSIG claims to cover.
+fn signed_rrsets(zone: &Zone) -> Vec<(String, u16)> {
+    let mut seen: Vec<(String, u16)> = zone
+        .records()
+        .iter()
+        .filter(|r| r.rdata.rtype == record_types::RRSIG)
+        .filter_map(|r| {
+            rdns::dnssec::Rrsig::from_record(&ResourceRecord {
+                name: r.name.clone(),
+                class: r.class,
+                ttl: r.ttl,
+                rdata: r.rdata.clone(),
+            })
+        })
+        .map(|sig| (sig.owner, sig.type_covered))
+        .collect();
+    seen.sort();
+    seen.dedup();
+    seen
+}
+
+/// Make a key-signing and a zone-signing key for `zone`, and say what to give
+/// the parent.
+///
+/// Two keys rather than one because that is what lets the data key roll without
+/// the parent being involved: only the key-signing key is digested into the DS,
+/// so the zone-signing key can be replaced whenever, while replacing the other
+/// means a conversation with the registrar.
+fn generate_keys(
+    zone: &str,
+    dir: &Path,
+    algorithm: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let algorithm = SigningAlgorithm::parse(algorithm).map_err(|e| format!("{e:#}"))?;
+    let zone = if zone.ends_with('.') {
+        zone.to_string()
+    } else {
+        format!("{zone}.")
+    };
+
+    let ksk = SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP)
+        .map_err(|e| format!("{e:#}"))?;
+    let zsk =
+        SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE).map_err(|e| format!("{e:#}"))?;
+    for key in [&ksk, &zsk] {
+        let path = key.write_to_dir(dir).map_err(|e| format!("{e:#}"))?;
+        println!("Wrote {}", path.display());
+    }
+
+    // SHA-256, which RFC 8624 §3.3 is the only digest that is both mandatory to
+    // implement and not deprecated.
+    let ds = ksk.ds(2).map_err(|e| format!("{e:#}"))?;
+    println!("\nGive the parent zone this DS record:\n");
+    println!(
+        "{} IN DS {} {} {} {}",
+        ds.owner,
+        ds.key_tag,
+        ds.algorithm,
+        ds.digest_type,
+        ds.digest
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<String>()
+    );
+    println!(
+        "\nUntil it is published, {zone} is signed but insecure: a validator has no way to \
+         reach these keys."
+    );
+    Ok(())
 }
 
 /// Load zones from source (single file or directory)
@@ -2824,5 +3189,291 @@ mod tests {
             from("never-heard-of.test.", "192.0.2.1"),
             ResponseCode::NotAuthorized
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Signing, and answering a client that can read the result
+    // -----------------------------------------------------------------------
+
+    mod dnssec {
+        use super::*;
+        use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Dnskey, Rrset, RrsetProof};
+        use rdns::dnssec_denial::{nsec3s_in, nsecs_in, proves_nxdomain, Denial};
+        use rdns::zone::parse_zone_file;
+        use rdns::{QueryClass, QuerySection, RecordData};
+
+        const SIGNED_ZONE: &str = r#"$ORIGIN example.com.
+$TTL 3600
+@   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )
+@   IN NS  ns1.example.com.
+ns1 IN A   192.0.2.1
+www IN A   192.0.2.10
+deep.a.b IN TXT "down here"
+"#;
+
+        /// A server holding one signed zone, and the keys it was signed with.
+        fn signed_server(nsec3: bool) -> (HashMap<String, Zone>, Vec<SigningKey>) {
+            let keys = vec![
+                SigningKey::generate(
+                    SigningAlgorithm::EcdsaP256Sha256,
+                    "example.com.",
+                    DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+                )
+                .unwrap(),
+                SigningKey::generate(
+                    SigningAlgorithm::EcdsaP256Sha256,
+                    "example.com.",
+                    DNSKEY_FLAG_ZONE,
+                )
+                .unwrap(),
+            ];
+            let policy = SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400)
+                .with_chain(if nsec3 {
+                    DenialChain::nsec3()
+                } else {
+                    DenialChain::Nsec
+                });
+            let zone = sign_zone(
+                &parse_zone_file(SIGNED_ZONE, "example.com.").unwrap(),
+                &keys,
+                &policy,
+            )
+            .unwrap();
+            let mut zones = HashMap::new();
+            zones.insert(zone.origin().to_string(), zone);
+            (zones, keys)
+        }
+
+        fn query(qname: &str, qtype: u16, dnssec_ok: bool) -> DnsMessage {
+            let mut msg = DnsMessage {
+                id: 1,
+                response: false,
+                opcode: OpCode::Query,
+                authoritive: false,
+                truncation: false,
+                recursion: false,
+                recursion_ok: false,
+                ad: false,
+                cd: false,
+                rcode: ResponseCode::Ok,
+                queries: vec![QuerySection {
+                    qname: qname.to_string(),
+                    qtype,
+                    qclass: QueryClass::IN,
+                }],
+                answers: Vec::new(),
+                authorities: Vec::new(),
+                additionals: Vec::new(),
+            };
+            let mut edns = Edns::with_payload_size(4096);
+            edns.do_bit = dnssec_ok;
+            msg.set_edns(edns).expect("set edns");
+            msg
+        }
+
+        fn keys_of(zones: &HashMap<String, Zone>) -> Vec<Dnskey> {
+            let zone = &zones["example.com."];
+            dnskeys_in(
+                &zone
+                    .query("example.com.", record_types::DNSKEY)
+                    .into_iter()
+                    .map(|r| ResourceRecord {
+                        name: r.name.clone(),
+                        class: r.class,
+                        ttl: r.ttl,
+                        rdata: r.rdata.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        #[test]
+        fn a_do_query_gets_an_answer_a_validator_accepts() {
+            let (zones, _keys) = signed_server(false);
+            let metrics = DnsMetrics::new();
+            let response = make_response(
+                &query("www.example.com.", record_types::A, true),
+                &zones,
+                &metrics,
+            );
+
+            // Judge it the way a client would: only what came back.
+            let rdatas: Vec<RecordData> = response
+                .answers
+                .iter()
+                .filter(|r| r.rdata.rtype == record_types::A)
+                .map(|r| r.rdata.clone())
+                .collect();
+            let proof = verify_rrset(
+                &Rrset::new("www.example.com.", record_types::A, 1, &rdatas),
+                &rrsigs_in(&response.answers),
+                &keys_of(&zones),
+                "example.com.",
+                current_unix_timestamp(),
+            );
+            assert!(matches!(proof, RrsetProof::Verified { .. }), "{proof:?}");
+        }
+
+        #[test]
+        fn a_do_query_for_a_name_that_is_not_there_gets_the_proof() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_server(nsec3);
+                let metrics = DnsMetrics::new();
+                let response = make_response(
+                    &query("gone.a.b.example.com.", record_types::A, true),
+                    &zones,
+                    &metrics,
+                );
+                assert_eq!(response.rcode, ResponseCode::NoSuchDomain);
+
+                let denial = proves_nxdomain(
+                    "gone.a.b.example.com.",
+                    "example.com.",
+                    &nsecs_in(&response.authorities),
+                    &nsec3s_in(&response.authorities),
+                );
+                assert!(matches!(denial, Denial::Proved), "nsec3={nsec3}: {denial:?}");
+            }
+        }
+
+        #[test]
+        fn a_client_that_did_not_ask_gets_no_dnssec_records() {
+            // The DO bit is what says the client can read them. Sending them
+            // anyway is bytes on an amplification path for a client that will
+            // ignore them, and a response that may no longer fit a datagram.
+            let (zones, _keys) = signed_server(false);
+            let metrics = DnsMetrics::new();
+
+            let answer = make_response(
+                &query("www.example.com.", record_types::A, false),
+                &zones,
+                &metrics,
+            );
+            assert!(rrsigs_in(&answer.answers).is_empty());
+            assert!(!answer.edns().unwrap().unwrap().do_bit);
+
+            let denial = make_response(
+                &query("nope.example.com.", record_types::A, false),
+                &zones,
+                &metrics,
+            );
+            assert!(nsecs_in(&denial.authorities).is_empty());
+            // The SOA is still there: a negative answer has always carried one
+            // (RFC 2308), signed zone or not.
+            assert!(denial
+                .authorities
+                .iter()
+                .any(|r| r.rdata.rtype == record_types::SOA));
+        }
+
+        #[test]
+        fn the_do_bit_comes_back_set() {
+            // RFC 3225 §3. Without it the client cannot tell an answer with no
+            // DNSSEC records from a server that dropped them.
+            let (zones, _keys) = signed_server(false);
+            let metrics = DnsMetrics::new();
+            let response = make_response(
+                &query("www.example.com.", record_types::A, true),
+                &zones,
+                &metrics,
+            );
+            assert!(response.edns().unwrap().unwrap().do_bit);
+        }
+
+        #[test]
+        fn an_unsigned_zone_answers_a_do_query_the_way_it_answers_any_other() {
+            let mut zones = HashMap::new();
+            let zone = parse_zone_file(SIGNED_ZONE, "example.com.").unwrap();
+            zones.insert(zone.origin().to_string(), zone);
+            let metrics = DnsMetrics::new();
+
+            let response = make_response(
+                &query("www.example.com.", record_types::A, true),
+                &zones,
+                &metrics,
+            );
+            assert_eq!(response.answers.len(), 1);
+            assert!(rrsigs_in(&response.answers).is_empty());
+        }
+
+        #[test]
+        fn keys_are_generated_loaded_and_used_without_anything_in_between() {
+            // The whole operator path in one test: make the keys, point the
+            // server at the directory, and have what it serves verify. Each
+            // step is checked elsewhere; what this catches is the two ends not
+            // meeting — a key written under a name the loader does not look
+            // for, or loaded for a zone whose origin is spelled differently.
+            let dir = ScratchDir::new("signing");
+            generate_keys("example.com", &dir.0, "ECDSAP256SHA256").expect("generate");
+
+            let zone_path = dir.0.join("example.com.zone");
+            std::fs::write(&zone_path, SIGNED_ZONE).unwrap();
+
+            let cli = Cli::parse_from([
+                "rdnsd",
+                "--zone-dir",
+                dir.0.to_str().unwrap(),
+                "--signing-key-dir",
+                dir.0.to_str().unwrap(),
+            ]);
+            let signing = ZoneSigning::load(&cli).expect("load keys").expect("configured");
+
+            let mut zones = enumerate_zone_files(dir.0.to_str().unwrap()).expect("zones");
+            signing.apply(&mut zones).expect("sign");
+
+            // Checked with the same validator the server runs before serving.
+            let mut validator = DnssecValidator::new(true);
+            validator.set_require_signed(true);
+            verify_zones(&zones, &validator).expect("the zone we just signed verifies");
+
+            let metrics = DnsMetrics::new();
+            let response = make_response(
+                &query("www.example.com.", record_types::A, true),
+                &zones,
+                &metrics,
+            );
+            assert_eq!(rrsigs_in(&response.answers).len(), 1);
+        }
+
+        #[test]
+        fn require_signed_refuses_an_unsigned_zone_rather_than_serving_it() {
+            let zone = parse_zone_file(SIGNED_ZONE, "example.com.").unwrap();
+            let mut zones = HashMap::new();
+            zones.insert(zone.origin().to_string(), zone);
+
+            let mut validator = DnssecValidator::new(true);
+            validator.set_require_signed(true);
+            let err = verify_zones(&zones, &validator).unwrap_err();
+            assert!(err.contains("not signed"), "{err}");
+
+            // And without the assertion, the same zone is fine: most zones are
+            // unsigned and serving them is the normal case.
+            let permissive = DnssecValidator::new(true);
+            assert!(verify_zones(&zones, &permissive).is_ok());
+        }
+
+        #[test]
+        fn a_signature_that_stopped_matching_its_records_stops_the_server() {
+            // The failure this check exists for: the zone file was edited and
+            // the signatures were not renewed, so what goes out is signed data
+            // that no longer says what the signature says it says.
+            let (mut zones, _keys) = signed_server(false);
+            let zone = zones.get_mut("example.com.").unwrap();
+            let mut edited = Zone::new(zone.origin().to_string());
+            for record in zone.records() {
+                let mut record = record.clone();
+                if record.name == "www.example.com." && record.rdata.rtype == record_types::A {
+                    record.rdata =
+                        RecordData::from_parsed(&rdns::ParsedRecord::A("198.51.100.9".parse().unwrap()))
+                            .unwrap();
+                }
+                edited.add_record(record);
+            }
+            *zone = edited;
+
+            let validator = DnssecValidator::new(true);
+            let err = verify_zones(&zones, &validator).unwrap_err();
+            assert!(err.contains("does not verify"), "{err}");
+        }
     }
 }

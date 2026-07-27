@@ -10,6 +10,8 @@ all the RFC nomenclature uses.
 
 - Full DNSSEC validation (RSA/ECDSA, SHA-256/SHA-512 signatures)
 - NSEC/NSEC3 proof-of-non-existence validation
+- DNSSEC signing: key generation, an RRSIG per RRset, and an NSEC or NSEC3 chain,
+  signed in memory as the zone loads
 - Multi-zone support via zone enumeration
 - Signal handling (SIGHUP) for zone reload without restart
 - OpenTelemetry integration for tracing and metrics

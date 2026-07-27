@@ -10,14 +10,10 @@
 //!
 //! Nothing here is compiled into a release build.
 
-use crate::dnssec::{key_tag, label_count, signed_data, Dnskey, Ds, Rrset, Rrsig};
+use crate::dnssec::{key_tag, rrsig_labels, signed_data, Dnskey, Ds, Rrset, Rrsig};
+use crate::dnssec_key::{SigningAlgorithm, SigningKey};
 use crate::utils::{current_unix_timestamp, record_types as rt};
 use crate::{ParsedRecord, RecordData, ResourceRecord};
-use ring::rand::SystemRandom;
-use ring::signature::{
-    EcdsaKeyPair, Ed25519KeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING,
-    ECDSA_P384_SHA384_FIXED_SIGNING,
-};
 
 /// DNSKEY flags for a zone-signing key, and for a key-signing key (which adds
 /// the Secure Entry Point bit).
@@ -25,76 +21,50 @@ pub const ZSK_FLAGS: u16 = 0x0100;
 pub const KSK_FLAGS: u16 = 0x0101;
 
 /// A keypair that can actually sign.
-pub enum TestKey {
-    Ecdsa {
-        algorithm: u8,
-        pair: EcdsaKeyPair,
-        /// The DNSKEY form: x || y, without SEC1's 0x04 prefix (RFC 6605 §4).
-        public: Vec<u8>,
-    },
-    Ed25519 {
-        pair: Ed25519KeyPair,
-        public: Vec<u8>,
-    },
+///
+/// The signing itself is [`SigningKey`]'s, which is the same code `rdnsd` signs
+/// a zone with — so what these tests verify against is what the server
+/// produces, rather than a second implementation that could agree with the
+/// validator while the real one does not. What stays here is the freedom to
+/// publish one key at several owner names and flag combinations, which a signer
+/// has no business offering and a test of the chain walk needs constantly.
+pub struct TestKey {
+    key: SigningKey,
 }
 
 impl TestKey {
     pub fn generate_p256() -> Self {
-        Self::generate_ecdsa(13, &ECDSA_P256_SHA256_FIXED_SIGNING)
+        Self::generate(SigningAlgorithm::EcdsaP256Sha256)
     }
 
     pub fn generate_p384() -> Self {
-        Self::generate_ecdsa(14, &ECDSA_P384_SHA384_FIXED_SIGNING)
-    }
-
-    fn generate_ecdsa(
-        algorithm: u8,
-        signing: &'static ring::signature::EcdsaSigningAlgorithm,
-    ) -> Self {
-        let rng = SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(signing, &rng).expect("generate ECDSA key");
-        let pair =
-            EcdsaKeyPair::from_pkcs8(signing, pkcs8.as_ref(), &rng).expect("parse ECDSA key");
-        // ring hands back an uncompressed SEC1 point; DNSSEC publishes it
-        // without the leading 0x04.
-        let public = pair.public_key().as_ref()[1..].to_vec();
-        TestKey::Ecdsa {
-            algorithm,
-            pair,
-            public,
-        }
+        Self::generate(SigningAlgorithm::EcdsaP384Sha384)
     }
 
     pub fn generate_ed25519() -> Self {
-        let rng = SystemRandom::new();
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate Ed25519 key");
-        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse Ed25519 key");
-        let public = pair.public_key().as_ref().to_vec();
-        TestKey::Ed25519 { pair, public }
+        Self::generate(SigningAlgorithm::Ed25519)
+    }
+
+    /// The owner and flags given here are placeholders: every method that
+    /// publishes this key takes the name and flags it is published under, so
+    /// the ones baked into the key are never the ones used.
+    fn generate(algorithm: SigningAlgorithm) -> Self {
+        TestKey {
+            key: SigningKey::generate(algorithm, ".", ZSK_FLAGS).expect("generate key"),
+        }
     }
 
     pub fn algorithm(&self) -> u8 {
-        match self {
-            TestKey::Ecdsa { algorithm, .. } => *algorithm,
-            TestKey::Ed25519 { .. } => 15,
-        }
+        self.key.algorithm().code()
     }
 
     pub fn public_key(&self) -> &[u8] {
-        match self {
-            TestKey::Ecdsa { public, .. } | TestKey::Ed25519 { public, .. } => public,
-        }
+        self.key.dnskey_public_key()
     }
 
     /// Sign arbitrary bytes, exactly as a signer would sign the canonical form.
     pub fn sign(&self, data: &[u8]) -> Vec<u8> {
-        match self {
-            TestKey::Ecdsa { pair, .. } => {
-                let rng = SystemRandom::new();
-                pair.sign(&rng, data).expect("sign").as_ref().to_vec()
-            }
-            TestKey::Ed25519 { pair, .. } => pair.sign(data).as_ref().to_vec(),
-        }
+        self.key.sign(data).expect("sign")
     }
 
     /// This key published at `owner` as a zone-signing key.
@@ -132,7 +102,7 @@ impl TestKey {
             owner: owner.to_string(),
             type_covered,
             algorithm: self.algorithm(),
-            labels: wildcard_aware_label_count(owner) as u8,
+            labels: rrsig_labels(owner),
             original_ttl,
             inception: (now - 3600) as u32,
             expiration: (now + 86_400) as u32,
@@ -169,18 +139,6 @@ impl TestKey {
             .expect("build signed data");
         rrsig.signature = self.sign(&data);
         rrsig
-    }
-}
-
-/// Labels as RFC 4034 §3.1.3 counts them: the root and a leading `*` do not
-/// count, which is what makes a wildcard signature validate at every name it
-/// expands to.
-fn wildcard_aware_label_count(owner: &str) -> usize {
-    let n = label_count(owner);
-    if owner.starts_with("*.") {
-        n.saturating_sub(1)
-    } else {
-        n
     }
 }
 
