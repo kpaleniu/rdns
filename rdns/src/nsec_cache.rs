@@ -32,7 +32,7 @@
 use crate::dnssec_denial::{
     canonical_sort_key, proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3,
 };
-use crate::dnssec::{canonical_name, label_count, suffix_labels};
+use crate::dnssec::{canonical_name, label_count, suffix_labels, Rrsig};
 use crate::utils::{current_unix_timestamp, record_types as rt};
 use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};
 use std::collections::{BTreeMap, HashMap};
@@ -59,6 +59,14 @@ struct ZoneProofs {
     /// The zone's SOA and its signatures. A negative answer must carry it
     /// (RFC 2308 §2.1), and its MINIMUM bounds how long the answer may live.
     soa: Option<CachedSoa>,
+    /// Validated RRsets that came from a wildcard, by (wildcard owner, type).
+    ///
+    /// The other half of RFC 8198: a validated wildcard answer is a signed
+    /// statement about every name the wildcard reaches, exactly as a validated
+    /// NSEC is one about every name in its gap. Keyed by the wildcard rather than
+    /// by the name that was asked for, because the name asked for is the one
+    /// thing about it that is not reusable.
+    wildcards: HashMap<(String, u16), CachedWildcard>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +74,17 @@ struct CachedProof<T> {
     proof: T,
     /// The record and its RRSIGs, kept whole so a DO client gets the proof it
     /// would have got from the zone.
+    records: Vec<ResourceRecord>,
+    expires_at: u64,
+}
+
+/// An RRset that a wildcard answered with, ready to answer with again.
+#[derive(Debug, Clone)]
+struct CachedWildcard {
+    /// The RRset and its RRSIGs, owned at the name they arrived under. The owner
+    /// is rewritten on the way out — and the signature still verifies at the new
+    /// name, which is the property that makes this legal at all and also the
+    /// reason a wildcard answer needs its own denial proof (RFC 4035 §5.3.4).
     records: Vec<ResourceRecord>,
     expires_at: u64,
 }
@@ -98,6 +117,45 @@ pub struct Synthesis {
     pub ttl: u32,
 }
 
+/// A positive answer built from a cached wildcard.
+pub struct WildcardSynthesis {
+    /// The wildcard's records, re-owned onto the name that was asked for.
+    pub answers: Vec<ResourceRecord>,
+    /// The NSEC proving that name does not exist, which is what makes the
+    /// wildcard apply — and what a DO client needs to check the answer itself.
+    pub authority: Vec<ResourceRecord>,
+    pub ttl: u32,
+}
+
+/// The wildcard a signature was made at, given the expanded owner and the label
+/// count the RRSIG carried.
+///
+/// `labels` counts the labels of the name that was really signed, excluding the
+/// leading `*` and the root (RFC 4034 §3.1.3). So the wildcard is `*.` plus that
+/// many trailing labels of the owner.
+fn wildcard_for_expansion(owner: &str, labels: u8) -> Option<String> {
+    let owner = canonical_name(owner);
+    let parts: Vec<&str> = owner.trim_end_matches('.').split('.').collect();
+    let labels = labels as usize;
+    if labels >= parts.len() {
+        // Not an expansion after all: nothing was stripped.
+        return None;
+    }
+    let suffix = parts[parts.len() - labels..].join(".");
+    Some(format!("*.{suffix}."))
+}
+
+/// `*.` plus the immediate parent of `name` — the only wildcard that may answer
+/// for it (RFC 4592 §2.1.1).
+fn wildcard_for_parent_of(name: &str) -> Option<String> {
+    let name = canonical_name(name);
+    let (_first, rest) = name.trim_end_matches('.').split_once('.')?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(format!("*.{rest}."))
+}
+
 /// Validated NSEC/NSEC3 proofs, searchable by range.
 #[derive(Debug)]
 pub struct NsecCache {
@@ -116,6 +174,9 @@ const MAX_PROOFS_PER_ZONE: usize = 256;
 
 /// Never hold a proof longer than this, whatever its TTL claims.
 const MAX_PROOF_TTL: u64 = 3600;
+
+/// Wildcard RRsets kept per zone.
+const MAX_WILDCARDS_PER_ZONE: usize = 64;
 
 impl NsecCache {
     pub fn new(max_zones: usize) -> Self {
@@ -223,6 +284,213 @@ impl NsecCache {
                 _ => {}
             }
         }
+    }
+
+    /// Store the wildcard RRset that answered `response`, and the denial that
+    /// came with it.
+    ///
+    /// **Only call this for an answer that validated as Secure**, on the same
+    /// terms as [`NsecCache::insert_validated`] — nothing here re-checks a
+    /// signature.
+    ///
+    /// RFC 8198 §5.3's other half. A validated wildcard answer is a signed
+    /// statement about every name the wildcard reaches, in the same way a
+    /// validated NSEC is one about every name in its gap, so it can answer for
+    /// names nobody has asked about yet.
+    ///
+    /// The zone comes from the RRSIG's signer name rather than from an SOA,
+    /// because a positive answer has no SOA to read — the authority section of a
+    /// wildcard answer carries the NSEC proving the queried name absent, and that
+    /// is all. Those NSECs are stored too: they are validated denial material
+    /// that arrived on a positive answer, which is the one path
+    /// `insert_validated` cannot see.
+    pub fn insert_validated_wildcard(&self, response: &DnsMessage) {
+        if self.max_zones == 0 {
+            return;
+        }
+        let now = current_unix_timestamp();
+
+        // Which RRsets in the answer came from a wildcard, and which wildcard.
+        // The RRSIG's label count is what says so (RFC 4035 §5.3.4): fewer labels
+        // than the owner name has means the signature was made at a wildcard.
+        let mut pending: Vec<(String, String, u16)> = Vec::new();
+        for rr in &response.answers {
+            let Some(rrsig) = Rrsig::from_record(rr) else {
+                continue;
+            };
+            if !rrsig.is_wildcard_expansion() {
+                continue;
+            }
+            let Some(wildcard) = wildcard_for_expansion(&rrsig.owner, rrsig.labels) else {
+                continue;
+            };
+            let zone = canonical_name(&rrsig.signer_name);
+            // A signature made outside the zone it claims to sign is not this
+            // zone's to keep. The chain validator has already established the
+            // signer, so this is a consistency check rather than the security
+            // boundary.
+            if !is_at_or_below(&wildcard, &zone) {
+                continue;
+            }
+            pending.push((zone, wildcard, rrsig.type_covered));
+        }
+        if pending.is_empty() {
+            return;
+        }
+
+        let Ok(mut zones) = self.zones.lock() else {
+            return;
+        };
+        for (zone, wildcard, rtype) in pending {
+            if !synthesizable_qtype(rtype) {
+                continue;
+            }
+            if !zones.contains_key(&zone) && zones.len() >= self.max_zones {
+                evict_zone(&mut zones, now);
+            }
+            let entry = zones.entry(zone.clone()).or_default();
+
+            // The RRset as it arrived, plus its signatures. `records_at` keeps
+            // the owner name it came under; synthesis rewrites it.
+            let owner = canonical_name(
+                &response
+                    .answers
+                    .iter()
+                    .find(|rr| rr.rdata.rtype == rtype)
+                    .map(|rr| rr.name.clone())
+                    .unwrap_or_default(),
+            );
+            let mut records = records_at(&response.answers, &owner, rtype);
+            records.extend(
+                response
+                    .answers
+                    .iter()
+                    .filter(|rr| rr.rdata.rtype == rt::RRSIG)
+                    .filter(|rr| {
+                        Rrsig::from_record(rr).is_some_and(|s| {
+                            s.type_covered == rtype && canonical_name(&s.owner) == owner
+                        })
+                    })
+                    .cloned(),
+            );
+            if records.is_empty() {
+                continue;
+            }
+            let ttl = records
+                .iter()
+                .map(|rr| (rr.ttl.max(0) as u64).min(MAX_PROOF_TTL))
+                .min()
+                .unwrap_or(0);
+            if ttl == 0 {
+                continue;
+            }
+
+            insert_bounded_map(
+                &mut entry.wildcards,
+                (wildcard, rtype),
+                CachedWildcard {
+                    records,
+                    expires_at: now + ttl,
+                },
+                now,
+            );
+
+            // The NSEC that proved the queried name absent rides along on a
+            // wildcard answer, and it is what a later synthesis needs to show the
+            // *next* name absent too.
+            for rr in &response.authorities {
+                if rr.rdata.rtype != rt::NSEC {
+                    continue;
+                }
+                let Some(nsec) = Nsec::from_record(rr) else {
+                    continue;
+                };
+                if !is_at_or_below(&nsec.owner, &zone) {
+                    continue;
+                }
+                let ttl = (rr.ttl.max(0) as u64).min(MAX_PROOF_TTL);
+                let key = canonical_sort_key(&nsec.owner);
+                let records = records_covering(&response.authorities, &nsec.owner, rt::NSEC);
+                insert_bounded(
+                    &mut entry.nsecs,
+                    key,
+                    CachedProof {
+                        proof: nsec,
+                        records,
+                        expires_at: now + ttl,
+                    },
+                    now,
+                );
+            }
+        }
+    }
+
+    /// Answer `qname`/`qtype` positively from a cached wildcard (RFC 8198 §5.3).
+    ///
+    /// Two things must hold, and the second is the one that is easy to get wrong.
+    ///
+    /// **The name must be proved not to exist**, by a cached NSEC covering it —
+    /// otherwise a wildcard would be answering for a name that has records of its
+    /// own, which an existing name shadows entirely (RFC 1034 §4.3.3).
+    ///
+    /// **The wildcard must be the one that governs the name**, which means
+    /// `*.<the name's immediate parent>` and nothing shallower. A wildcard covers
+    /// exactly one label (RFC 4592 §2.1.1), so `*.example.com.` answers for
+    /// `a.example.com.` and must never answer for `a.b.example.com.` — and
+    /// "some cached NSEC covers the name" does not distinguish those, because a
+    /// name sorts before everything beneath it, so `b.example.com.`'s own NSEC
+    /// covers `a.b.example.com.`. Deriving the wildcard from the queried name
+    /// rather than searching for one that fits is what makes that impossible to
+    /// get wrong here.
+    pub fn synthesize_wildcard(&self, qname: &str, qtype: u16) -> Option<WildcardSynthesis> {
+        if !synthesizable_qtype(qtype) {
+            return None;
+        }
+        let qname = canonical_name(qname);
+        let wildcard = wildcard_for_parent_of(&qname)?;
+        let now = current_unix_timestamp();
+        let zones = self.zones.lock().ok()?;
+
+        let (_, zone) = zones
+            .iter()
+            .filter(|(z, _)| is_at_or_below(&qname, z))
+            .max_by_key(|(z, _)| label_count(z))?;
+
+        let cached = zone
+            .wildcards
+            .get(&(wildcard.clone(), qtype))
+            .filter(|w| w.expires_at > now)?;
+        // The queried name must not exist. `covering_nsec` also refuses a gap
+        // below a delegation, which matters here for the same reason it does for
+        // a denial: the names under a delegation sort inside the gap after it.
+        let denial = zone.covering_nsec(&qname, now)?;
+
+        let ttl = cached
+            .expires_at
+            .saturating_sub(now)
+            .min(denial.expires_at.saturating_sub(now))
+            .min(u32::MAX as u64) as u32;
+        if ttl == 0 {
+            return None;
+        }
+
+        // Re-owned onto the name that was asked for, which is what the zone
+        // itself would have sent. The signature verifies there unchanged — that
+        // is what a wildcard signature means — so a DO client can check this
+        // answer for itself rather than taking our word for it.
+        let answers: Vec<ResourceRecord> = with_ttl(&cached.records, ttl)
+            .into_iter()
+            .map(|mut rr| {
+                rr.name = qname.clone();
+                rr
+            })
+            .collect();
+
+        Some(WildcardSynthesis {
+            answers,
+            authority: with_ttl(&denial.records, ttl),
+            ttl,
+        })
     }
 
     /// Answer `qname`/`qtype` from cached proofs, or `None` to go and ask.
@@ -560,6 +828,31 @@ fn with_ttl(records: &[ResourceRecord], ttl: u32) -> Vec<ResourceRecord> {
 
 /// Insert into a bounded map, making room by dropping expired entries first and
 /// then the one that expires soonest.
+/// The same bound for the wildcard store: drop what has expired first, and
+/// otherwise the entry closest to expiring. A zone can hold a wildcard per type
+/// at every level, and this is bounded for the same reason everything else here
+/// is — the alternative is unbounded.
+fn insert_bounded_map(
+    map: &mut HashMap<(String, u16), CachedWildcard>,
+    key: (String, u16),
+    value: CachedWildcard,
+    now: u64,
+) {
+    if !map.contains_key(&key) && map.len() >= MAX_WILDCARDS_PER_ZONE {
+        map.retain(|_, v| v.expires_at > now);
+        if map.len() >= MAX_WILDCARDS_PER_ZONE {
+            if let Some(soonest) = map
+                .iter()
+                .min_by_key(|(_, v)| v.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&soonest);
+            }
+        }
+    }
+    map.insert(key, value);
+}
+
 fn insert_bounded<T>(
     map: &mut BTreeMap<Vec<u8>, CachedProof<T>>,
     key: Vec<u8>,
@@ -1072,5 +1365,240 @@ mod tests {
             .synthesize("nope.example.com.", rt::AAAA)
             .expect("the child zone's proof applies");
         assert_eq!(s.rcode, ResponseCode::Ok, "NODATA, not the parent's NXDOMAIN");
+    }
+    // -----------------------------------------------------------------
+    // Wildcard synthesis (RFC 8198 section 5.3)
+    // -----------------------------------------------------------------
+
+    /// A positive answer as a zone sends one from a wildcard: the records owned at
+    /// the *queried* name, an RRSIG whose label count says a wildcard signed it,
+    /// and in the authority section the NSEC proving the queried name absent.
+    fn wildcard_answer(qname: &str, wildcard_labels: u8, nsec: ResourceRecord) -> DnsMessage {
+        let a = ResourceRecord {
+            name: qname.to_string(),
+            class: 1,
+            ttl: 300,
+            rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.7".parse().unwrap())).unwrap(),
+        };
+        let sig = ResourceRecord {
+            name: qname.to_string(),
+            class: 1,
+            ttl: 300,
+            rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
+                type_covered: rt::A,
+                algorithm: 13,
+                labels: wildcard_labels,
+                original_ttl: 300,
+                inception: 1,
+                expiration: u32::MAX,
+                key_tag: 1234,
+                signer_name: "example.com.".to_string(),
+                signature: vec![9; 64],
+            })
+            .unwrap(),
+        };
+        let nsec_sig = ResourceRecord {
+            name: nsec.name.clone(),
+            class: 1,
+            ttl: 300,
+            rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
+                type_covered: rt::NSEC,
+                algorithm: 13,
+                labels: 2,
+                original_ttl: 300,
+                inception: 1,
+                expiration: u32::MAX,
+                key_tag: 1234,
+                signer_name: "example.com.".to_string(),
+                signature: vec![8; 64],
+            })
+            .unwrap(),
+        };
+        DnsMessage {
+            id: 1,
+            response: true,
+            opcode: OpCode::Query,
+            authoritive: true,
+            truncation: false,
+            recursion: true,
+            recursion_ok: true,
+            ad: true,
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![QuerySection {
+                qname: qname.to_string(),
+                qtype: rt::A,
+                qclass: QueryClass::IN,
+            }],
+            answers: vec![a, sig],
+            authorities: vec![nsec, nsec_sig],
+            additionals: Vec::new(),
+        }
+    }
+
+    fn apex_gap() -> ResourceRecord {
+        nsec_record("example.com.", "zzz.example.com.", &[rt::SOA, rt::NS], 300)
+    }
+
+    /// The point of section 5.3: one validated wildcard answer answers for every
+    /// name that wildcard reaches, without asking again.
+    #[test]
+    fn test_a_validated_wildcard_answers_another_name_it_reaches() {
+        let cache = NsecCache::new(4);
+        // `a.example.com.` was answered by `*.example.com.` — labels=2 for a
+        // three-label owner — and the NSEC gap runs from the apex to `zzz`.
+        cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
+
+        let s = cache
+            .synthesize_wildcard("b.example.com.", rt::A)
+            .expect("the same wildcard reaches this name too");
+        assert_eq!(
+            s.answers.iter().filter(|rr| rr.rdata.rtype == rt::A).count(),
+            1
+        );
+        for rr in &s.answers {
+            assert_eq!(rr.name, "b.example.com.", "re-owned onto the name asked for");
+            assert!(rr.ttl as u32 <= 300);
+        }
+        assert!(
+            s.answers.iter().any(|rr| rr.rdata.rtype == rt::RRSIG),
+            "the signature goes with it: it verifies at the new name unchanged"
+        );
+        assert!(
+            s.authority.iter().any(|rr| rr.rdata.rtype == rt::NSEC),
+            "with the proof the name does not exist, so a client can check it"
+        );
+        assert!(
+            matches!(
+                s.answers[0].rdata.parse(),
+                Ok(ParsedRecord::A(a)) if a == "192.0.2.7".parse::<std::net::Ipv4Addr>().unwrap()
+            ),
+            "and the address the wildcard holds"
+        );
+    }
+
+    /// The rule that makes this safe. A wildcard covers exactly one label
+    /// (RFC 4592 section 2.1.1), so `*.example.com.` must never answer for a name
+    /// that `b.example.com.` governs — and "some cached NSEC covers the name" does
+    /// not distinguish the two, because a name sorts before everything beneath it.
+    #[test]
+    fn test_a_wildcard_never_answers_for_a_deeper_name() {
+        let cache = NsecCache::new(4);
+        cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
+
+        assert!(
+            cache.synthesize_wildcard("x.b.example.com.", rt::A).is_none(),
+            "*.example.com. does not reach a name two labels down"
+        );
+        assert!(
+            cache
+                .synthesize_wildcard("x.y.z.example.com.", rt::A)
+                .is_none(),
+            "nor any deeper"
+        );
+    }
+
+    /// Only for a name that does not exist. An existing name shadows the wildcard
+    /// entirely (RFC 1034 section 4.3.3), so without a covering NSEC there is no
+    /// basis to answer at all.
+    #[test]
+    fn test_nothing_is_synthesized_without_a_proof_the_name_is_absent() {
+        let cache = NsecCache::new(4);
+        // A gap that stops short of `b`, so nothing proves `b` absent.
+        cache.insert_validated_wildcard(&wildcard_answer(
+            "a.example.com.",
+            2,
+            nsec_record("example.com.", "aa.example.com.", &[rt::SOA, rt::NS], 300),
+        ));
+
+        assert!(cache.synthesize_wildcard("b.example.com.", rt::A).is_none());
+    }
+
+    /// The type has to match: a wildcard holding an A says nothing about AAAA.
+    #[test]
+    fn test_a_cached_wildcard_answers_only_its_own_type() {
+        let cache = NsecCache::new(4);
+        cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
+
+        assert!(cache.synthesize_wildcard("b.example.com.", rt::A).is_some());
+        assert!(cache
+            .synthesize_wildcard("b.example.com.", rt::AAAA)
+            .is_none());
+        assert!(cache.synthesize_wildcard("b.example.com.", rt::MX).is_none());
+    }
+
+    /// An answer that was *not* a wildcard expansion must not be stored as one, or
+    /// an ordinary answer for one name would start answering for its siblings.
+    #[test]
+    fn test_an_ordinary_answer_is_not_a_wildcard() {
+        let cache = NsecCache::new(4);
+        // labels=3 for a three-label owner: signed at its own name.
+        cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 3, apex_gap()));
+
+        assert!(cache.synthesize_wildcard("b.example.com.", rt::A).is_none());
+        assert!(cache.is_empty(), "nothing was stored at all");
+    }
+
+    /// The same delegation rule as the denial side, and for the same reason: the
+    /// names under a delegation sort inside the gap that follows it, so a wildcard
+    /// above must not answer for them.
+    #[test]
+    fn test_no_synthesis_below_a_delegation() {
+        let cache = NsecCache::new(4);
+        cache.insert_validated_wildcard(&wildcard_answer(
+            "a.example.com.",
+            2,
+            // The gap's lower edge is a delegation: NS set, no SOA.
+            nsec_record("sub.example.com.", "zzz.example.com.", &[rt::NS], 300),
+        ));
+
+        assert!(
+            cache
+                .synthesize_wildcard("x.sub.example.com.", rt::A)
+                .is_none(),
+            "the child zone's names are not ours to answer for"
+        );
+    }
+
+    #[test]
+    fn test_the_wildcard_derivations() {
+        assert_eq!(
+            wildcard_for_expansion("a.example.com.", 2).as_deref(),
+            Some("*.example.com.")
+        );
+        assert_eq!(
+            wildcard_for_expansion("x.y.example.com.", 2).as_deref(),
+            Some("*.example.com."),
+            "two labels stripped is still the same wildcard name"
+        );
+        assert_eq!(
+            wildcard_for_expansion("a.example.com.", 3),
+            None,
+            "nothing stripped is not an expansion"
+        );
+
+        assert_eq!(
+            wildcard_for_parent_of("b.example.com.").as_deref(),
+            Some("*.example.com.")
+        );
+        assert_eq!(
+            wildcard_for_parent_of("x.b.example.com.").as_deref(),
+            Some("*.b.example.com."),
+            "the immediate parent, which is what makes the depth check work"
+        );
+        // A top-level name's parent is the root, so the wildcard that would
+        // govern it is `*.` — refused rather than derived. The root publishes no
+        // wildcard, and a rule about synthesizing TLDs is not one to have.
+        assert_eq!(wildcard_for_parent_of("com."), None);
+        assert_eq!(wildcard_for_parent_of("."), None);
+    }
+
+    /// A disabled cache stores nothing, the same as for denials.
+    #[test]
+    fn test_a_zero_capacity_cache_holds_no_wildcards() {
+        let cache = NsecCache::new(0);
+        cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
+        assert!(cache.synthesize_wildcard("b.example.com.", rt::A).is_none());
+        assert!(cache.is_empty());
     }
 }

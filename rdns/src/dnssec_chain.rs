@@ -29,7 +29,7 @@ use crate::dnssec_denial::{
     proves_no_ds, proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
 };
 use crate::utils::record_types as rt;
-use crate::{RecordData, ResourceRecord};
+use crate::{ParsedRecord, RecordData, ResourceRecord};
 use anyhow::anyhow;
 use std::collections::HashMap;
 
@@ -783,6 +783,116 @@ fn push_rrset(
     }
 }
 
+// ---------------------------------------------------------------------------
+// CNAME chains
+// ---------------------------------------------------------------------------
+
+/// How many CNAMEs an answer may chain through before we stop believing it is a
+/// chain. RFC 1034 sets no limit; every implementation picks one, because the
+/// alternative is following a loop somebody built on purpose.
+pub const MAX_CNAME_CHAIN: usize = 16;
+
+/// What the shape of an answer's CNAME chain turned out to be.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChainShape {
+    /// The records form the chain the question asked for, ending at `final_name`.
+    Intact { final_name: String },
+    /// They do not, and this says how.
+    Broken(String),
+}
+
+/// Whether an answer section really is the CNAME chain the query asked for.
+///
+/// **Verifying each RRset is not the same as verifying the chain.** Every record
+/// here may carry a perfectly good signature from the zone that owns it, and the
+/// collection can still be an answer to a different question: a genuine
+/// `a.example.com. CNAME b.example.net.` beside a genuine
+/// `something-else.example.net. A 6.6.6.6` is two authentic RRsets and no chain
+/// at all. A consumer that takes "the A record in the answer" as the answer has
+/// then been handed an address for a name nobody asked about.
+///
+/// So the shape is checked independently of the signatures: walk from the queried
+/// name, follow each CNAME to its target, and require that *every* record in the
+/// answer is either a link in that walk or an RRset of the queried type at the
+/// name the walk ends on. Anything left over means the answer contains records
+/// that are not on the path from the question to its answer.
+///
+/// This is deliberately not the same check as the resolver's `chain` filter while
+/// it fetches. That decides what to *accept* hop by hop and is the reason a
+/// stray record rarely reaches here; this decides whether what arrived is
+/// coherent, and it holds for an answer that came from anywhere — a forwarder, a
+/// cache, a single upstream response.
+pub fn cname_chain_shape(qname: &str, qtype: u16, answers: &[ResourceRecord]) -> ChainShape {
+    let queried = canonical_name(qname);
+
+    // Index the CNAMEs by owner. More than one CNAME at a name is itself
+    // malformed: a CNAME is by definition the only record at its owner
+    // (RFC 1034 section 3.6.2), so two of them cannot both be followed.
+    let mut cnames: Vec<(String, String)> = Vec::new();
+    for rr in answers.iter().filter(|rr| rr.rdata.rtype == rt::CNAME) {
+        let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() else {
+            return ChainShape::Broken(format!("a CNAME at {} does not parse", rr.name));
+        };
+        let owner = canonical_name(&rr.name);
+        if cnames.iter().any(|(o, _)| *o == owner) {
+            return ChainShape::Broken(format!(
+                "{owner} has more than one CNAME, which cannot be a chain"
+            ));
+        }
+        cnames.push((owner, canonical_name(&target)));
+    }
+
+    // A query *for* a CNAME is answered by the CNAME itself rather than by
+    // following it (RFC 1034 section 3.6.2), so that question follows nothing and
+    // its answer sits at the name asked about.
+    let follow = qtype != rt::CNAME;
+
+    // Walk from the question.
+    let mut current = queried.clone();
+    let mut followed: Vec<String> = Vec::new();
+    if follow {
+        while let Some((_, target)) = cnames.iter().find(|(owner, _)| *owner == current) {
+            if followed.len() >= MAX_CNAME_CHAIN {
+                return ChainShape::Broken(format!(
+                    "the chain from {queried} is longer than {MAX_CNAME_CHAIN} links"
+                ));
+            }
+            if followed.iter().any(|seen| seen == &current) {
+                return ChainShape::Broken(format!("the chain from {queried} loops at {current}"));
+            }
+            followed.push(current.clone());
+            current = target.clone();
+        }
+    }
+
+    // Everything in the answer must be on that path. A record that is not is
+    // either an answer to something else or an attempt to have one taken for
+    // this answer.
+    for rr in answers {
+        if rr.rdata.rtype == rt::RRSIG {
+            // A signature is attached to an RRset rather than being one, and the
+            // RRset it covers is checked on its own account.
+            continue;
+        }
+        let owner = canonical_name(&rr.name);
+        let on_the_path = if rr.rdata.rtype == rt::CNAME {
+            // Either a link the walk followed, or — for a query that asked for a
+            // CNAME — the answer itself.
+            followed.contains(&owner) || (!follow && owner == current)
+        } else {
+            owner == current
+        };
+        if !on_the_path {
+            return ChainShape::Broken(format!(
+                "{owner} type {} is in the answer but not on the path from {queried}",
+                rr.rdata.rtype
+            ));
+        }
+    }
+
+    ChainShape::Intact { final_name: current }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1342,5 +1452,194 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert_eq!(sets.len(), 2, "two owner names, and the RRSIG is not an RRset");
         assert_eq!(sets[0].3.len(), 2, "two addresses at the first name");
         assert_eq!(sets[1].3.len(), 1);
+    }
+    // -----------------------------------------------------------------
+    // CNAME chains
+    // -----------------------------------------------------------------
+
+    fn cname(owner: &str, target: &str) -> ResourceRecord {
+        ResourceRecord {
+            name: owner.to_string(),
+            class: 1,
+            ttl: 300,
+            rdata: RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).unwrap(),
+        }
+    }
+
+    fn a(owner: &str, addr: &str) -> ResourceRecord {
+        ResourceRecord {
+            name: owner.to_string(),
+            class: 1,
+            ttl: 300,
+            rdata: RecordData::from_parsed(&ParsedRecord::A(addr.parse().unwrap())).unwrap(),
+        }
+    }
+
+    fn rrsig_over(owner: &str, covered: u16) -> ResourceRecord {
+        ResourceRecord {
+            name: owner.to_string(),
+            class: 1,
+            ttl: 300,
+            rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
+                type_covered: covered,
+                algorithm: 13,
+                labels: 3,
+                original_ttl: 300,
+                inception: 1,
+                expiration: u32::MAX,
+                key_tag: 1,
+                signer_name: "example.com.".to_string(),
+                signature: vec![7; 64],
+            })
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_an_ordinary_chain_is_intact() {
+        let answers = vec![
+            cname("a.example.com.", "b.example.net."),
+            rrsig_over("a.example.com.", rt::CNAME),
+            cname("b.example.net.", "c.example.org."),
+            rrsig_over("b.example.net.", rt::CNAME),
+            a("c.example.org.", "192.0.2.1"),
+            rrsig_over("c.example.org.", rt::A),
+        ];
+        assert_eq!(
+            cname_chain_shape("a.example.com.", rt::A, &answers),
+            ChainShape::Intact {
+                final_name: "c.example.org.".to_string()
+            }
+        );
+
+        // An answer with no CNAME at all is a chain of length zero.
+        assert_eq!(
+            cname_chain_shape("www.example.com.", rt::A, &[a("www.example.com.", "192.0.2.2")]),
+            ChainShape::Intact {
+                final_name: "www.example.com.".to_string()
+            }
+        );
+    }
+
+    /// The case the check exists for: two RRsets that are each perfectly
+    /// authentic, and together are not an answer to this question. A consumer
+    /// reading "the A record in the answer" would take an address for a name
+    /// nobody asked about.
+    #[test]
+    fn test_a_record_off_the_path_breaks_the_chain() {
+        let answers = vec![
+            cname("a.example.com.", "b.example.net."),
+            // The A is for something else entirely.
+            a("attacker.example.net.", "6.6.6.6"),
+        ];
+        let shape = cname_chain_shape("a.example.com.", rt::A, &answers);
+        assert!(
+            matches!(&shape, ChainShape::Broken(why) if why.contains("not on the path")),
+            "got {shape:?}"
+        );
+    }
+
+    /// The first link has to start at the name that was asked about, or the chain
+    /// is somebody else's.
+    #[test]
+    fn test_a_chain_that_does_not_start_at_the_question_is_broken() {
+        let answers = vec![
+            cname("other.example.com.", "b.example.net."),
+            a("b.example.net.", "192.0.2.1"),
+        ];
+        let shape = cname_chain_shape("a.example.com.", rt::A, &answers);
+        assert!(matches!(shape, ChainShape::Broken(_)), "got {shape:?}");
+    }
+
+    /// A missing link is not a shorter chain: the records after the gap are not
+    /// reachable from the question.
+    #[test]
+    fn test_a_missing_link_breaks_the_chain() {
+        let answers = vec![
+            cname("a.example.com.", "b.example.net."),
+            // The CNAME from b to c is absent, so c is unreachable.
+            a("c.example.org.", "192.0.2.1"),
+        ];
+        let shape = cname_chain_shape("a.example.com.", rt::A, &answers);
+        assert!(matches!(shape, ChainShape::Broken(_)), "got {shape:?}");
+    }
+
+    #[test]
+    fn test_a_loop_is_refused() {
+        let answers = vec![
+            cname("a.example.com.", "b.example.com."),
+            cname("b.example.com.", "a.example.com."),
+        ];
+        let shape = cname_chain_shape("a.example.com.", rt::A, &answers);
+        assert!(
+            matches!(&shape, ChainShape::Broken(why) if why.contains("loops")),
+            "got {shape:?}"
+        );
+    }
+
+    /// A CNAME is by definition the only record at its owner (RFC 1034 section
+    /// 3.6.2), so two of them cannot both be followed — and picking one would be
+    /// letting whoever sent them choose.
+    #[test]
+    fn test_two_cnames_at_one_name_are_refused() {
+        let answers = vec![
+            cname("a.example.com.", "b.example.net."),
+            cname("a.example.com.", "evil.example.net."),
+        ];
+        let shape = cname_chain_shape("a.example.com.", rt::A, &answers);
+        assert!(
+            matches!(&shape, ChainShape::Broken(why) if why.contains("more than one CNAME")),
+            "got {shape:?}"
+        );
+    }
+
+    /// A query *for* a CNAME is answered by the CNAME itself rather than by
+    /// following it (RFC 1034 section 3.6.2), so the walk must stop at the first
+    /// hop — otherwise the answer to the question looks like a record off the path.
+    #[test]
+    fn test_a_query_for_a_cname_is_answered_by_it() {
+        let answers = vec![
+            cname("a.example.com.", "b.example.net."),
+            rrsig_over("a.example.com.", rt::CNAME),
+        ];
+        assert_eq!(
+            cname_chain_shape("a.example.com.", rt::CNAME, &answers),
+            ChainShape::Intact {
+                final_name: "a.example.com.".to_string()
+            }
+        );
+    }
+
+    /// Names compare case-insensitively (RFC 4343), and a chain that broke on
+    /// capitalisation would break on every answer from a 0x20-randomizing
+    /// resolver — which this one is.
+    #[test]
+    fn test_the_chain_is_case_insensitive() {
+        let answers = vec![
+            cname("A.ExAmPlE.CoM.", "B.example.NET."),
+            a("b.EXAMPLE.net.", "192.0.2.1"),
+        ];
+        assert!(matches!(
+            cname_chain_shape("a.example.com.", rt::A, &answers),
+            ChainShape::Intact { .. }
+        ));
+    }
+
+    /// Bounded, because the alternative is following a chain somebody built to be
+    /// followed for ever.
+    #[test]
+    fn test_a_chain_longer_than_the_limit_is_refused() {
+        let mut answers = Vec::new();
+        for i in 0..(MAX_CNAME_CHAIN + 2) {
+            answers.push(cname(
+                &format!("n{i}.example.com."),
+                &format!("n{}.example.com.", i + 1),
+            ));
+        }
+        let shape = cname_chain_shape("n0.example.com.", rt::A, &answers);
+        assert!(
+            matches!(&shape, ChainShape::Broken(why) if why.contains("longer than")),
+            "got {shape:?}"
+        );
     }
 }

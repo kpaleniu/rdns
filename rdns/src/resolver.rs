@@ -13,9 +13,11 @@
 //! trip rather than pinning a thread for the sum of them. `rdnsr` awaits
 //! `resolve` directly. See the note on [`Resolver::recurse`].
 
+use std::sync::Arc;
 use crate::dnssec::{Dnskey, Rrsig};
 use crate::dnssec_chain::{
-    ChainValidator, DelegationEvidence, DelegationVerdict, KeyStore, TrustAnchors, ValidationState,
+    cname_chain_shape, ChainShape, ChainValidator, DelegationEvidence, DelegationVerdict, KeyStore,
+    TrustAnchors, ValidationState,
 };
 use crate::dnssec_denial::{proves_nodata, proves_nxdomain, nsec3s_in, nsecs_in, Denial};
 use crate::utils::{current_unix_timestamp, record_types as rt};
@@ -179,7 +181,52 @@ pub struct ResolverConfig {
     /// forwarded query reaches us unfiltered — an upstream that validates on our
     /// behalf and hands back SERVFAIL leaves us nothing to check, which is the
     /// same as trusting it.
-    pub dnssec: Option<TrustAnchors>,
+    /// Held behind a lock because RFC 5011 replaces them while the resolver
+    /// runs — that is the whole point of following a key roll rather than
+    /// requiring a restart for it. Read once per validated resolve and cloned;
+    /// an anchor set is a handful of DS records, and cloning is what keeps the
+    /// lock from being held across an await.
+    pub dnssec: Option<SharedAnchors>,
+}
+
+/// Trust anchors the resolver validates against, which something else may
+/// replace while it runs.
+///
+/// A `std::sync::RwLock` rather than tokio's: every use is a clone-and-release
+/// with no await inside, so an async lock would buy nothing and cost the chance
+/// of holding a guard across a suspension point.
+#[derive(Clone, Debug)]
+pub struct SharedAnchors(Arc<std::sync::RwLock<TrustAnchors>>);
+
+impl SharedAnchors {
+    pub fn new(anchors: TrustAnchors) -> Self {
+        SharedAnchors(Arc::new(std::sync::RwLock::new(anchors)))
+    }
+
+    /// The anchors as they stand. A poisoned lock means a panic while anchors
+    /// were being swapped, and validating against a set nobody finished writing
+    /// is worse than not validating: the recovered value is used, and the caller
+    /// sees whichever of the two versions was in place.
+    pub fn get(&self) -> TrustAnchors {
+        match self.0.read() {
+            Ok(anchors) => anchors.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Put a new set in place. Every resolve after this uses it.
+    pub fn replace(&self, anchors: TrustAnchors) {
+        match self.0.write() {
+            Ok(mut held) => *held = anchors,
+            Err(poisoned) => *poisoned.into_inner() = anchors,
+        }
+    }
+}
+
+impl From<TrustAnchors> for SharedAnchors {
+    fn from(anchors: TrustAnchors) -> Self {
+        SharedAnchors::new(anchors)
+    }
 }
 
 impl Default for ResolverConfig {
@@ -696,7 +743,11 @@ impl Resolver {
                 ValidationState::Indeterminate("DNSSEC validation is not enabled".into()),
             ));
         };
-        let verdict = self.validate(query, &response, &mut state, anchors).await;
+        // Taken once, for the whole of this resolve. Anchors that changed
+        // half-way through a chain walk would let a key be trusted for one step
+        // and not the next, which is a verdict about nothing.
+        let anchors = anchors.get();
+        let verdict = self.validate(query, &response, &mut state, &anchors).await;
         Ok((response, verdict))
     }
 
@@ -1422,6 +1473,21 @@ impl Resolver {
         // it one may have arrived with an earlier hop of a CNAME chase, which is
         // why `state.denials` is offered alongside this response's own authority
         // section.
+        // And the shape of the answer, independently of its signatures. Every
+        // RRset here verifies under the keys of the zone that owns it, which says
+        // each record is authentic and nothing about whether together they are the
+        // chain from this question to its answer: a genuine CNAME beside a genuine
+        // A record for an unrelated name is two valid RRsets and no chain, and a
+        // client that reads "the A record in the answer" has been handed an
+        // address for a name nobody asked about.
+        //
+        // The resolver's own `chain` filter makes that unlikely while it is
+        // fetching, hop by hop. This check does not depend on having done the
+        // fetching: it holds for an answer that arrived whole from a forwarder too.
+        if let ChainShape::Broken(why) = cname_chain_shape(&query.qname, query.qtype, &records) {
+            return ValidationState::Bogus(why);
+        }
+
         if !verdict.wildcards.is_empty() {
             let mut proofs = response.authorities.clone();
             proofs.extend(state.denials.iter().cloned());
@@ -3231,6 +3297,18 @@ this line has no record and is skipped
         let example_delegation = delegation(&tld, &auth);
         let (answers, leaf_authority) = leaf(&auth);
         let denial = signed_nxdomain_authority(&auth);
+        let nsec3_denial = signed_nsec3_nxdomain_authority(&auth);
+        // The same proof with the closest-encloser record removed. It still
+        // *covers* the queried name, so a validator that only checked coverage
+        // would call it proved.
+        let nsec3_incomplete: Vec<ResourceRecord> = {
+            let full = signed_nsec3_nxdomain_authority(&auth);
+            // Keep the SOA (and its signature) and the covering record (and
+            // its signature); drop the matching one.
+            let mut kept = full[0..2].to_vec();
+            kept.extend_from_slice(&full[4..6]);
+            kept
+        };
         let wildcard_nodata = signed_wildcard_nodata_authority(&auth, true);
         let stripped_wildcard = signed_wildcard_nodata_authority(&auth, false);
 
@@ -3250,6 +3328,21 @@ this line has no record and is skipped
                 resp.authoritive = true;
                 resp.rcode = ResponseCode::NoSuchDomain;
                 resp.authorities = denial.clone();
+                resp
+            } else if name == "nsec3-gone.example.test." {
+                // The same "no", proved with NSEC3 instead: a record matching the
+                // closest encloser and one covering both the next closer name and
+                // the wildcard position.
+                let mut resp = response_to(q);
+                resp.authoritive = true;
+                resp.rcode = ResponseCode::NoSuchDomain;
+                resp.authorities = nsec3_denial.clone();
+                resp
+            } else if name == "nsec3-incomplete.example.test." {
+                let mut resp = response_to(q);
+                resp.authoritive = true;
+                resp.rcode = ResponseCode::NoSuchDomain;
+                resp.authorities = nsec3_incomplete.clone();
                 resp
             } else if name == "wild-nodata.example.test." && qtype == rt::AAAA {
                 // A wildcard NODATA: the name does not exist, `*.example.test.`
@@ -3342,6 +3435,84 @@ this line has no record and is skipped
         vec![soa, soa_sig, nsec, nsec_sig]
     }
 
+    /// The authority section of a signed NXDOMAIN proved with **NSEC3**.
+    ///
+    /// Worth having end to end, because every NSEC3 test in this repo until now
+    /// built its own records and handed them straight to the denial functions.
+    /// That checks the proof logic and nothing about the path to it — whether the
+    /// resolver collects NSEC3 records across hops, whether they survive being
+    /// parsed off the wire, whether their signatures verify as an RRset at their
+    /// hashed owner names. The NSEC side has been resolved end to end since it was
+    /// written; this closes the gap for NSEC3 (an open item under #1).
+    ///
+    /// RFC 5155 §7.2.2 wants three things proved, and two records do it here:
+    ///
+    /// - an NSEC3 **matching** the closest encloser, `example.test.`;
+    /// - an NSEC3 **covering** the next closer name, the queried name itself;
+    /// - an NSEC3 **covering** `*.example.test.`, since a wildcard could
+    ///   otherwise have answered.
+    ///
+    /// The covering record spans everything between an all-zero and an all-ones
+    /// hash, so it covers the last two at once. Opt-out is deliberately clear: set,
+    /// it would make this Insecure rather than Secure, which is a different test.
+    fn signed_nsec3_nxdomain_authority(auth: &TestZone) -> Vec<ResourceRecord> {
+        use crate::dnssec_denial::{base32hex_encode, nsec3_hash};
+
+        let salt = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        let iterations = 10u16;
+        let zone = "example.test.";
+
+        let soa = ResourceRecord {
+            name: zone.to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::SOA {
+                mname: "ns.example.test.".to_string(),
+                rname: "admin.example.test.".to_string(),
+                serial: 1,
+                refresh: 10800,
+                retry: 3600,
+                expire: 604800,
+                minimum: 300,
+            })
+            .unwrap(),
+        };
+
+        let nsec3 = |owner_hash: &[u8], next: &[u8], types: &[u16]| ResourceRecord {
+            // An NSEC3's owner name is the base32hex of the hash, under the zone
+            // — which is why nothing about this shape can be checked without
+            // hashing for real.
+            name: format!("{}.{zone}", base32hex_encode(owner_hash)),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
+                hash_algorithm: 1,
+                flags: 0,
+                iterations,
+                salt: salt.clone(),
+                next_hashed_owner: next.to_vec(),
+                type_bitmap: build_type_bitmap(types),
+            })
+            .unwrap(),
+        };
+
+        let encloser = nsec3_hash(zone, &salt, iterations).expect("hash the encloser");
+        let matching = nsec3(&encloser, &[0xff; 20], &[rt::SOA, rt::NS, rt::RRSIG]);
+        let covering = nsec3(&[0x00; 20], &[0xff; 20], &[rt::RRSIG]);
+
+        let soa_sig = auth.sign_records(std::slice::from_ref(&soa));
+        let matching_sig = auth.sign_records(std::slice::from_ref(&matching));
+        let covering_sig = auth.sign_records(std::slice::from_ref(&covering));
+        vec![
+            soa,
+            soa_sig,
+            matching,
+            matching_sig,
+            covering,
+            covering_sig,
+        ]
+    }
+
     /// The authority section of a signed wildcard NODATA: the SOA, and the NSEC
     /// at `*.example.test.` whose bitmap carries A but not AAAA — and which also
     /// covers the queried name, since `*` sorts before every ordinary label, so
@@ -3398,7 +3569,7 @@ this line has no record and is skipped
 
     fn validating_config(h: &SignedHierarchy) -> ResolverConfig {
         ResolverConfig {
-            dnssec: Some(h.anchors.clone()),
+            dnssec: Some(h.anchors.clone().into()),
             ..recursing_config(h.root_addr)
         }
     }
@@ -3537,7 +3708,11 @@ this line has no record and is skipped
         let h = signed_hierarchy(signed_ds, signed_answer);
         let config = ResolverConfig {
             // An anchor for an unrelated zone, and none for the root.
-            dnssec: Some(TrustAnchors::parse("other.invalid. IN DS 1 13 2 AABB").unwrap()),
+            dnssec: Some(
+                TrustAnchors::parse("other.invalid. IN DS 1 13 2 AABB")
+                    .unwrap()
+                    .into(),
+            ),
             ..recursing_config(h.root_addr)
         };
         let (_, state) = resolve_www(config).await;
@@ -3566,6 +3741,62 @@ this line has no record and is skipped
         assert_eq!(state, ValidationState::Secure, "{state}");
         assert_eq!(answer.rcode, ResponseCode::NoSuchDomain);
         assert!(answer.authorities.iter().any(|rr| rr.rdata.rtype == rt::NSEC));
+    }
+
+    /// The NSEC3 denial path, end to end — the gap this closes is that every
+    /// other NSEC3 test here builds its records and calls the proof functions
+    /// directly, so nothing established that a hashed denial survives the trip
+    /// through a real resolve: collected across hops, parsed off the wire, and
+    /// verified as an RRset at owner names that are base32hex of a hash.
+    #[tokio::test]
+    async fn test_signed_nsec3_nxdomain_validates_as_secure() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (answer, state) = Resolver::new(validating_config(&h))
+            .resolve_validated(&QuerySection {
+                qname: "nsec3-gone.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the resolution itself should succeed");
+
+        assert_eq!(state, ValidationState::Secure, "{state}");
+        assert_eq!(answer.rcode, ResponseCode::NoSuchDomain);
+        assert!(
+            answer.authorities.iter().any(|rr| rr.rdata.rtype == rt::NSEC3),
+            "the proof that came back is the hashed kind"
+        );
+        assert!(
+            !answer.authorities.iter().any(|rr| rr.rdata.rtype == rt::NSEC),
+            "and only the hashed kind — this zone has no plain NSEC to fall back on"
+        );
+    }
+
+    /// And the test that the test means something: the same denial with the
+    /// closest-encloser record taken out must not validate.
+    ///
+    /// It still *covers* the queried name and the wildcard, so a validator that
+    /// checked coverage and stopped would call this proved — and would then accept
+    /// a denial for any name in a zone from an attacker holding one covering
+    /// record. RFC 5155 §7.2.2 wants the encloser shown to exist as well, which is
+    /// what makes the span meaningful.
+    #[tokio::test]
+    async fn test_an_nsec3_denial_missing_its_closest_encloser_is_not_secure() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (_, state) = Resolver::new(validating_config(&h))
+            .resolve_validated(&QuerySection {
+                qname: "nsec3-incomplete.example.test.".to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the resolution itself should succeed");
+
+        assert_ne!(
+            state,
+            ValidationState::Secure,
+            "an incomplete NSEC3 proof must not read as proved"
+        );
     }
 
     /// The point of RFC 8198, end to end: the NSEC that denied one name is a
@@ -3718,6 +3949,104 @@ this line has no record and is skipped
             authority = vec![nsec, nsec_sig];
         }
         (vec![a, sig], authority)
+    }
+
+    /// A signed CNAME chain, end to end. There was no CNAME anywhere in these
+    /// tests before, which mattered once the answer's *shape* became part of the
+    /// verdict: a check that rejects incoherent answers is only useful if it
+    /// accepts coherent ones, and the way to find out is to resolve one.
+    ///
+    /// Both RRsets come in a single response, which is what an authoritative
+    /// server sends for a CNAME whose target it also holds.
+    #[tokio::test]
+    async fn test_a_signed_cname_chain_validates_as_secure() {
+        let h = signed_hierarchy_with(signed_ds, |auth| {
+            let cname = ResourceRecord {
+                name: "www.example.test.".to_string(),
+                class: 1,
+                ttl: 3600,
+                rdata: RecordData::from_parsed(&ParsedRecord::CNAME(
+                    "alias.example.test.".to_string(),
+                ))
+                .unwrap(),
+            };
+            let cname_sig = auth.sign_records(std::slice::from_ref(&cname));
+            let target = a_record("alias.example.test.", [192, 0, 2, 44]);
+            let target_sig = auth.sign_records(std::slice::from_ref(&target));
+            (vec![cname, cname_sig, target, target_sig], Vec::new())
+        });
+
+        let (answer, state) = resolve_www(validating_config(&h)).await;
+        assert_eq!(state, ValidationState::Secure, "{state}");
+        assert!(
+            answer.answers.iter().any(|rr| rr.rdata.rtype == rt::CNAME),
+            "the chain itself comes back"
+        );
+        assert!(
+            answer.answers.iter().any(|rr| matches!(
+                rr.rdata.parse(),
+                Ok(ParsedRecord::A(a)) if a == Ipv4Addr::new(192, 0, 2, 44)
+            )),
+            "and the address at the end of it"
+        );
+    }
+
+    /// The positive half of RFC 8198 (section 5.3), end to end: a validated
+    /// wildcard answer is a signed statement about every name the wildcard
+    /// reaches, so once it is cached, another such name is answered without
+    /// asking anyone.
+    ///
+    /// The counterpart to `test_a_validated_denial_answers_other_names_in_its_gap`
+    /// and, like it, the test of the *join* — validation and the cache are each
+    /// well covered alone, and a mistake between them is what would let a
+    /// wildcard answer for a name it does not govern.
+    #[tokio::test]
+    async fn test_a_validated_wildcard_answers_other_names_it_reaches() {
+        use crate::nsec_cache::NsecCache;
+
+        let h = signed_hierarchy_with(signed_ds, |auth| wildcard_answer(auth, true));
+        let (answer, state) = resolve_www(validating_config(&h)).await;
+        assert_eq!(state, ValidationState::Secure, "{state}");
+
+        // Exactly what rdnsr does with a Secure positive answer.
+        let cache = NsecCache::new(16);
+        cache.insert_validated_wildcard(&answer);
+
+        // A name nobody has asked about, answered from the cached wildcard. The
+        // gap in the proof runs from `*.example.test.` to `zzz.example.test.`, so
+        // this name is inside it and provably absent.
+        let synthesized = cache
+            .synthesize_wildcard("never-asked.example.test.", 1)
+            .expect("the cached wildcard reaches this name too");
+        assert!(
+            synthesized.answers.iter().any(|rr| matches!(
+                rr.rdata.parse(),
+                Ok(ParsedRecord::A(a)) if a == Ipv4Addr::new(192, 0, 2, 9)
+            )),
+            "the address the wildcard holds"
+        );
+        for rr in &synthesized.answers {
+            assert_eq!(
+                rr.name, "never-asked.example.test.",
+                "owned at the name asked for, as the zone would have sent it"
+            );
+        }
+        assert!(
+            synthesized
+                .authority
+                .iter()
+                .any(|rr| rr.rdata.rtype == rt::NSEC),
+            "with the denial that makes the wildcard apply"
+        );
+
+        // And a name the wildcard does not govern is refused, however tempting
+        // the covering NSEC looks: a wildcard reaches exactly one label.
+        assert!(
+            cache
+                .synthesize_wildcard("deeper.never-asked.example.test.", 1)
+                .is_none(),
+            "*.example.test. does not reach two labels down"
+        );
     }
 
     /// The validated-key cache: a second query into the same zone must not

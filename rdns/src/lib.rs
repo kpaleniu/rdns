@@ -16,6 +16,8 @@ pub mod zone_writer;
 pub mod xfr;
 pub mod secondary;
 pub mod ixfr;
+pub mod rfc5011;
+pub mod special_names;
 pub mod persist;
 pub mod security;
 pub mod validation;

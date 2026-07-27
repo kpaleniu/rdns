@@ -20,7 +20,7 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **461 lib + 29 integration** tests passing (`rdnsd`'s
+`cargo test --workspace` = **515 lib + 29 integration** tests passing (`rdnsd`'s
 own 29 cover argument validation, zone sources, the secondary role, both
 directions of IXFR and onward announcement), `cargo clippy --workspace
 --all-targets` **clean, no exceptions**.
@@ -35,10 +35,14 @@ incremental transfer".
 
 **Only step 6 is left under #7, and it is explicitly conditional** — persisted
 deltas matter when dynamic UPDATE (RFC 2136) arrives and not before, because that
-is what makes a journal the source of truth rather than a cache of one. So the
-next thing to pick up is a choice rather than a queue: **#2's RFC 5011 key
-rollover** (the most self-contained item left on this list), **#6's special-use
-names** (~100 lines and a table), or **#1's two aggressive-use extensions**.
+is what makes a journal the source of truth rather than a cache of one.
+
+**One item is left on this whole list: `rdnsd` cannot sign a zone** (#2). It is
+also the only remaining item that is a feature rather than a gap — key management,
+signing an RRset per name, and generating an NSEC or NSEC3 chain, with
+`dnssec_validation_mode` still called from nowhere. Everything needed to *check* a
+signed zone is here and tested against real signatures, which is the half that was
+hard; producing one is mostly bookkeeping and a lot of it.
 
 **#5 is closed, and TSIG and NOTIFY with it.** The work now has a spine: **#7,
 the secondary role** — `rdnsd` can hand a zone out (AXFR) and announce a change
@@ -106,6 +110,11 @@ cargo run -p rdnsr -- --port 15354 --dnssec-validate
 # ...or against an anchor file, which is what to use when the root KSK rolls.
 # DS presentation format; the digest may be split across whitespace.
 cargo run -p rdnsr -- --port 15354 --dnssec-validate --trust-anchor ./root-anchors.txt
+
+# Or let the resolver follow the roll itself (RFC 5011). The file is written as
+# well as read: a successor key is adopted after 30 days of publication, and one
+# that revokes itself is dropped. Created from the anchors in force if absent.
+cargo run -p rdnsr -- --port 15354 --dnssec-validate --auto-trust-anchor ./root.key
 ```
 
 ### Verifying, and one trap that invalidates it
@@ -199,32 +208,29 @@ resolver") and the denial cache by 16 in `nsec_cache.rs`.
 Two things aggressive use deliberately does **not** do, either of which is a
 reasonable next step:
 
-- [ ] **No wildcard synthesis.** RFC 8198 §5.3 also allows *positive* answers to
-      be synthesized from a validated wildcard record. Not done: it needs the
-      closest-encloser machinery on the positive path and interacts with the
-      unfinished wildcard-NSEC item under #2.
-- [ ] **NSEC3 covers NODATA but its NXDOMAIN path is untested against a real
-      zone.** The closest-encloser proof is implemented and unit-tested, but
-      every NSEC3 test here builds its own records; no NSEC3 zone has been
-      resolved end to end the way the NSEC one has.
+- [x] **Wildcard synthesis** (RFC 8198 §5.3) — done, see "Done so far" and
+      "Architecture: aggressive use". A validated wildcard answer is kept under the
+      wildcard and answers for other names it reaches.
+- [x] **NSEC3's NXDOMAIN path is now resolved end to end** — the signed test
+      hierarchy serves an NSEC3-proved NXDOMAIN, and the resolver validates it
+      Secure through the whole path: collected across hops, parsed off the wire,
+      and verified as an RRset at owner names that are base32hex of a hash. The
+      companion test removes the closest-encloser record and requires the verdict
+      to stop being Secure, since a proof that only *covers* the name would
+      otherwise let one covering record deny anything in the zone.
 
 ### 2. DNSSEC follow-ups
 Validation is on the resolve path and enforced (see "Architecture: DNSSEC" and
 "Done so far"). What is left is narrower than what landed:
 
-- [ ] **No RFC 5011 automated key rollover.** A root KSK roll needs either a new
-      build or a new `--trust-anchor` file. RFC 5011 tracks the new key from the
-      zone itself during an overlap window.
-      *Cheaper than this item used to claim.* The "persistent state" it needs is
-      what Unbound keeps in `auto-trust-anchor-file:` — one small writable text
-      file of key states and timestamps, rewritten as keys roll. Not a database,
-      and no interaction with zone storage at all: `TrustAnchors::parse` and
-      `from_file` already exist, so it is a writer plus the state machine. It is
-      the most self-contained item left on this list.
-- [ ] **CNAME chains are validated per-RRset, not as a chain.** Each RRset must
-      verify under the keys of the zone that signed it, which is checked — but
-      nothing verifies that the chain of CNAMEs itself is the one the client
-      asked for beyond the existing `chain` filter in `recurse`.
+- [x] **RFC 5011 automated key rollover** — done, see "Done so far" and
+      "Architecture: following a trust anchor". `rdnsr --auto-trust-anchor <file>`
+      follows the zone's own signed DNSKEY RRset, adopts a successor after a
+      30-day hold-down, and drops a key that revokes itself.
+- [x] **CNAME chains are validated as chains** — done, see "Done so far" and
+      "Architecture: DNSSEC". `dnssec_chain::cname_chain_shape` walks the answer
+      from the question and requires every record to be on that path; a Secure
+      verdict now depends on it.
 - [ ] **`rdnsd` cannot sign a zone**, only serve one that arrives pre-signed,
       and `dnssec_validation_mode` is still not called from anywhere.
 
@@ -334,27 +340,17 @@ AXFR is "build a new `Zone`, swap it in". An IXFR delta is "build a new `Zone` f
 the old records minus the deletes plus the adds, swap it in" — O(zone size) per
 transfer rather than per record, which at any zone size this serves is nothing.
 
-### 6. Candidate: special-use names in `rdnsr` (RFC 6761)
+### 6. Special-use names in `rdnsr` — done
 
-Not required by anything here, and the smallest step towards `rdnsr` being usable
-as a real system resolver. Right now every one of these leaves the machine and
-goes to the root servers:
+- [x] **`localhost`** resolves to 127.0.0.1 / ::1 and never goes upstream
+      (RFC 6761 §6.3), the whole subtree included.
+- [x] **`*.local`** is answered NXDOMAIN at once (RFC 6762 §3).
+- [x] **Private-address reverse lookups** are answered locally (RFC 6303 §4),
+      including the sixteen zones 172.16/12 really is and the v6 equivalents.
+- [x] **`invalid.`** is NXDOMAIN (RFC 6761 §6.4); the `example.` names are left
+      ordinary, which is the only thing they exist for.
 
-- [ ] **`localhost` must resolve locally** — 127.0.0.1 / ::1, and must *never* be
-      sent upstream (RFC 6761 §6.3).
-- [ ] **`*.local` is mDNS, not DNS** (RFC 6762 §3) — the honest answer is REFUSED
-      or NXDOMAIN, immediately. Today it costs a full walk to the root, fails
-      slowly, and tells the root what LAN names are being looked up.
-- [ ] **Private-address reverse lookups** — `10.in-addr.arpa`,
-      `16-31.172.in-addr.arpa`, `168.192.in-addr.arpa`, `254.169.in-addr.arpa`,
-      and the v6 equivalents — should be answered NXDOMAIN locally (RFC 6303).
-      Leaking them exposes internal addressing and hammers AS112.
-- [ ] Also in RFC 6761: `invalid.` (always NXDOMAIN), `example.`/`example.com`/
-      `.net`/`.org` (ordinary, no special handling), and `10.in-addr.arpa` friends
-      above.
-
-Perhaps a hundred lines and a table, entirely inside this codebase's existing
-shape — unlike the rest of what a system resolver needs.
+See "Done so far" and "Architecture: names that never leave".
 
 **The rest of that ambition is deliberately not on this list**, because it is not
 DNS: dynamic upstreams and per-link split DNS from DHCP/NetworkManager/
@@ -556,6 +552,24 @@ And the proof may arrive with an *earlier* hop of a CNAME chase, whose authority
 section does not survive into the message we return, so `Resolution` accumulates
 NSEC/NSEC3 records across hops the same way it accumulates zone cuts.
 
+**A verified answer is not yet a coherent one.** Every RRset in an answer may
+carry a good signature from the zone that owns it and the collection still not be
+an answer to the question asked: a genuine `a.example.com. CNAME b.example.net.`
+beside a genuine `something-else.example.net. A 6.6.6.6` is two authentic RRsets
+and no chain, and a client reading "the A record in the answer" has been handed an
+address for a name nobody asked about. `dnssec_chain::cname_chain_shape` walks the
+answer from the question, follows each CNAME to its target, and requires every
+record present to be either a link on that walk or an RRset of the queried type at
+the name it ends on. Bounded, loop-detecting, case-insensitive, and it stops before
+the first hop when the question *was* for a CNAME (RFC 1034 §3.6.2).
+
+The resolver's own `chain` filter already drops off-path records hop by hop while
+it fetches, which is why this rarely has anything to reject during recursion — and
+is also why it is hard to exercise end to end there. It earns its keep on an answer
+that arrived whole: from a forwarder, which does no such filtering. It is checked
+by unit tests over the shapes, plus a signed CNAME chain resolved end to end to be
+sure a coherent answer is still accepted.
+
 **The key cache stores conclusions, not material.** `KeyCache` holds DNSKEY sets
 that have already been validated to an anchor, so a second query into a zone
 costs no revalidation. That makes its TTL load-bearing, hence the one-day cap.
@@ -629,6 +643,30 @@ At a delegation point the parent holds only the DS, so a NODATA there is
 synthesized for QTYPE=DS and refused for anything else — the real answer to
 those is a referral. ANY and RRSIG are never synthesized: neither can be
 reasoned about from a type bitmap.
+
+**The positive half, §5.3.** A validated *wildcard* answer is the same kind of
+statement as a validated NSEC — one signature covering a whole set of names — so
+it is kept too, under the wildcard rather than under the name that happened to be
+asked for. Another name the wildcard reaches is then answered without asking,
+with the records re-owned onto it and the wildcard's own signature attached: that
+signature verifies at the new name unchanged, which is exactly what makes this
+legal and also why a wildcard answer needs its own denial in the first place.
+
+Two rules, and the second is where this would go wrong:
+
+- **The name must be proved absent**, by a cached covering NSEC. An existing name
+  shadows the wildcard entirely (RFC 1034 §4.3.3), so without that proof there is
+  no basis to answer at all — and the same delegation rule applies as on the
+  negative side, for the same reason.
+- **The wildcard must be the one that governs the name**: `*.` plus its *immediate
+  parent*, and nothing shallower. A wildcard reaches exactly one label (RFC 4592
+  §2.1.1), and "some cached NSEC covers the name" cannot tell `a.example.com.`
+  from `a.b.example.com.`, because a name sorts before everything beneath it. The
+  wildcard is therefore *derived* from the queried name rather than searched for
+  among the ones we hold, which makes the mistake unavailable.
+
+The two halves cannot both fire: a cached NXDOMAIN requires the wildcard to have
+been *denied*, so it never applies to a name a wildcard governs.
 
 `rdnsr` checks the denial cache *before* the answer cache, and skips it entirely
 for a client with CD set — that client asked us not to filter on its behalf, and
@@ -727,6 +765,140 @@ Unbound's only real answer is the optional Redis-backed `cachedb` module. Knot
 Resolver is the outlier that does (LMDB on disk). So `rdnsr` losing its cache on
 restart is mainstream rather than a gap, and is the one store on this page not to
 build.
+
+## Architecture: names that never leave (RFC 6761, 6762, 6303)
+
+Some names are reserved for uses that are not the global DNS, and treating them as
+ordinary questions does three things wrong at once: it answers slowly (a full walk
+to the root, then a failure), it answers wrongly (whatever a wildcard-happy TLD or
+a captive portal decides to say), and it *tells the root servers* what those names
+are. The reverse lookups leak most: every query for `10.in-addr.arpa` describes a
+piece of somebody's internal addressing to a public server, and AS112 exists purely
+to absorb the flood of them.
+
+`special_names::lookup` is a table consulted **first** — before every cache, before
+any resolution. For these names the table *is* the answer, so consulting anything
+else would already mean a query going out.
+
+- **`localhost` and everything under it** is the loopback address (RFC 6761 §6.3).
+  The subtree matters: `api.dev.localhost` is as much this machine as `localhost`
+  is, and software relies on it. Types other than A and AAAA get NODATA, not
+  NXDOMAIN — the name exists, and saying otherwise would be a lie about the one
+  name every machine has.
+- **`.local` is mDNS** (RFC 6762 §3), so NXDOMAIN is the literal truth rather than
+  a policy: the name really does not exist in the DNS.
+- **`invalid.`** is reserved to be unresolvable (§6.4).
+- **The private reverse zones** (RFC 6303 §4), including `127.in-addr.arpa` with
+  `1.0.0.127` answering `localhost.`, and the sixteen separate zones that 172.16/12
+  actually is — `in-addr.arpa` splits on octet boundaries and that block does not.
+
+**Not in the table, deliberately:** RFC 6761 also reserves `example.`,
+`example.com.`, `.net` and `.org` — as *ordinary* names, delegated and resolvable.
+Special-casing them would break the only thing they exist for, which is being
+copied out of documentation and working.
+
+Two properties worth stating. **Never AD**, because nothing here was validated — it
+was decided by specification, and claiming otherwise is the one lie a validating
+client cannot check for itself. And **not skipped for a client with CD**: CD says
+"do not withhold an answer because it failed validation", which is about DNSSEC, not
+a request to hear what a public server thinks `localhost` is.
+
+Each negative answer carries a **synthetic SOA** so a downstream resolver can cache
+it (RFC 2308 §5 takes the negative TTL from it). It has to be invented — these
+zones exist by specification rather than by delegation — and follows what Unbound
+synthesizes for a `local-zone`, with `nobody.invalid.` as the responsible mailbox:
+unmistakably synthetic, and guaranteed by §6.4 not to resolve.
+
+**Verified live** by forwarding to `192.0.2.1` (TEST-NET-1, which cannot answer):
+every special name was answered anyway, none with AD, while `example.com` and
+`1.1.1.1.in-addr.arpa` went to the network — visible in their 0x20 case-randomized
+echo, which only comes back from a real server.
+
+## Architecture: following a trust anchor (RFC 5011)
+
+A trust anchor is a key you decided to believe out of band, so every change to one
+is an out-of-band event: a rebuild, or an operator editing a file. That holds until
+the key rolls — and the root KSK does roll, at which point every validator that
+has not been updated fails closed on the entire internet. RFC 5011 makes the roll
+followable, using the zone's own signed DNSKEY RRset as the announcement channel.
+
+`--auto-trust-anchor <file>` turns it on. The difference from `--trust-anchor` is
+who owns the file: that one is read and never written, this one is read *and*
+rewritten as keys move.
+
+**Two rules carry the whole security argument.**
+
+- **A new key is trusted because it stayed, not because it appeared.** Thirty days
+  of continuous publication (`ADD_HOLD_DOWN`) before adoption. The point is the
+  time: an attacker who has the zone's keys must keep the compromise up, and
+  visible, for a month before any validator adopts a key of theirs.
+- **A key is revoked only by itself.** REVOKE counts only when the RRset carrying
+  it is signed *by that key* (§2.1). Without that, whoever holds any one of a
+  zone's keys could retire the others. `self_signers` verifies each candidate
+  *alone* against the RRSIGs, so "someone signed this" can never be mistaken for
+  "this key signed this".
+
+**Everything rests on the input having been validated**, and `observe` cannot check
+that for itself — it is handed a DNSKEY RRset and reasons about it over time.
+`probe_zone` therefore insists on `Secure` and nothing else: an Insecure or
+Indeterminate answer for a zone we anchor is not an unsigned zone, it is an answer
+that could not be tied to the anchor. Same posture as `NsecCache::insert_validated`,
+and the same warning in the docs.
+
+Four things that are easy to get wrong, three of which were:
+
+- **Identity is (algorithm, protocol, public key), not the record.** Revoking sets
+  a flag and therefore changes the key tag (§2.1 says so explicitly). Identifying
+  keys by tag or RDATA makes a revocation look like an unrelated new key — and
+  starts a hold-down on the key being retired.
+- **The hold-down must not restart when the key is observed again**, or it never
+  elapses and the key is never adopted. A failure that would surface 30 days after
+  a roll, in production. There is a test that probes daily for a month.
+- **A revocation outranks a configured DS.** The operator wrote "trust this
+  digest"; the key has since said, with its own signature, to stop. Leaving the DS
+  in place would mean a static anchor can never be retired by the mechanism built
+  to retire it — and the built-in ICANN anchor is exactly such a DS. So a tracked
+  key is kept in its *unrevoked* form (a DS digest covers the flags, so only that
+  form matches) and the revocation lives in the state.
+- **Only secure entry points are tracked.** The literal reading of §4 tracks every
+  key in the RRset; against the real root that means tracking the ZSK, which nobody
+  will ever publish a DS for. The root replaces its ZSK quarterly by dropping it,
+  never by revoking it, and a key that merely disappears stays trusted by design —
+  so the literal reading gains a permanently trusted stale key every three months.
+  SEP is formally a hint, so this narrowing would miss a zone that rolled to a KSK
+  without it; that is an unusual mistake with `--trust-anchor` as the way out,
+  whereas unbounded growth of the trusted set is invisible.
+
+**A key that merely vanishes stays trusted** (`Missing`). Deliberate: a key
+disappearing is far likelier to be a zone publishing badly than an operator
+retiring one, and retiring has a mechanism. **And with no anchor for a zone,
+nothing is learned about it** (§5) — a resolver that bootstrapped itself there
+would be trusting whatever answered.
+
+**Persistence** is the writable trust-anchor file the persistence table called for,
+in Unbound's spirit: DS and DNSKEY lines in presentation format, with `;;state=`
+and `;;since=` annotations carrying the bookkeeping. A DNSKEY line *without*
+annotations is read as a key the operator has decided to trust outright, because
+making them write bookkeeping fields by hand to be believed would be a trap. The
+file is written at startup if absent, so pointing at a new path shows immediately
+what is trusted rather than after the first change. Unlike the transfer sidecar, a
+corrupt file here is **fatal**: forgetting a serial costs a refresh, forgetting
+anchor state costs either the internet or a hold-down that had nearly elapsed.
+
+The live anchor set is behind `SharedAnchors` (a `std::sync::RwLock`, cloned per
+validated resolve so no guard is ever held across an await), because the point is
+to follow a roll without a restart. The set is replaced only *after* the file is
+written: validating against keys we could not record would forget them on restart,
+which is what the file exists to prevent.
+
+**Verified against the real root zone**, which was not expected to be possible
+here — port 53 is intercepted (see "Verifying") and recursion generally fails, but
+a one-hop `./DNSKEY` query does get answered. So the probe ran for real: key 20326
+was adopted immediately as the built-in DS's match, and the two other published
+keys entered hold-down. That run is what found the ZSK-tracking flaw above — no
+unit test would have, because the flaw is in what the real root publishes. The
+state machine's timing, and the revocation rule against genuine signatures
+(`dnssec_test_util` keys that really sign), are covered by tests.
 
 ## Architecture: incremental transfer (RFC 1995)
 
@@ -1321,6 +1493,67 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **CNAME chains are validated as chains, not just as RRsets** — closes an item
+  under #2. Every RRset in an answer verifying under its own zone's keys says each
+  record is authentic and nothing about whether together they answer the question:
+  a genuine CNAME beside a genuine A record for an unrelated name is two valid
+  RRsets and no chain. `dnssec_chain::cname_chain_shape` walks from the question,
+  follows each CNAME, and requires every record to be on that path — bounded,
+  loop-detecting, case-insensitive (0x20 makes that not optional), and stopping
+  before the first hop when the question was itself for a CNAME. A Secure verdict
+  now depends on it. The resolver's `chain` filter is the first line during
+  recursion; this is the one that holds for an answer arriving whole from a
+  forwarder. See "Architecture: DNSSEC".
+- **Wildcard synthesis: the positive half of RFC 8198** — closes an item under #1.
+  A validated wildcard answer is one signature covering a whole set of names, the
+  same as a validated NSEC, so it is kept under the wildcard and answers for other
+  names it reaches, re-owned and with its signature attached — which verifies at
+  the new name unchanged. Two rules keep it honest: the name must be proved absent
+  by a cached covering NSEC, and the wildcard must be `*.` plus the name's
+  *immediate parent*, derived from the queried name rather than searched for, so
+  `*.example.com.` cannot answer for `a.b.example.com.`. See "Architecture:
+  aggressive use".
+- **NSEC3's NXDOMAIN path is resolved end to end** — closes an open item under #1.
+  Every NSEC3 test here built its own records and called the proof functions
+  directly, which checks the proof logic and nothing about the path to it. The
+  signed test hierarchy now serves an NSEC3-proved NXDOMAIN and the resolver
+  validates it Secure: collected across hops, parsed off the wire, verified as an
+  RRset at owner names that are base32hex of a real hash. Plus the test that the
+  test means something — with the closest-encloser record removed the verdict must
+  stop being Secure, because a proof that merely *covers* the name would let an
+  attacker holding one covering record deny anything in the zone (RFC 5155 §7.2.2).
+- **Special-use names are answered locally, not asked about** (RFC 6761, 6762,
+  6303) — closes #6. `localhost` and its subtree resolve to loopback, `.local` and
+  `invalid.` are NXDOMAIN at once, and the reverse zones for address space that is
+  not globally unique are answered here rather than described to a public server.
+  New `special_names` table, consulted before every cache in `rdnsr` because for
+  these names a cache lookup would already be one query too late. Never AD, and not
+  skipped for CD clients — CD is about DNSSEC, not about wanting a stranger's
+  opinion of `localhost`. Negative answers carry a synthetic SOA so downstream can
+  cache them. The `example.` names are deliberately left ordinary. Verified by
+  forwarding to TEST-NET-1, where anything answered was answered locally by
+  definition. See "Architecture: names that never leave".
+- **RFC 5011: the resolver follows a trust anchor as it rolls** — closes #2's
+  rollover item. A trust anchor is believed out of band, so changing one was an
+  out-of-band event; the root KSK rolls, and a validator that has not been updated
+  fails closed on the whole internet. New `rfc5011` module and
+  `rdnsr --auto-trust-anchor <file>`: the zone's own signed DNSKEY RRset is the
+  announcement channel, a successor is adopted after 30 days of continuous
+  publication, and a key that revokes itself — verified as having signed the very
+  RRset that revokes it — stops being an anchor, configured DS or not. State lives
+  in a writable presentation-format file, so a restart does not restart a hold-down.
+  `SharedAnchors` makes the live set replaceable, since following a roll without a
+  restart is the entire point.
+  **Verified against the real root**, which was not expected to work here: port 53
+  is intercepted and recursion generally fails, but a one-hop `./DNSKEY` query is
+  answered, so the probe ran for real. Key 20326 was adopted at once as the
+  built-in DS's match and 38696 — a successor KSK the root is currently
+  pre-publishing — entered its hold-down; a restart left the clock where it was.
+  That run also found a flaw no unit test would: the literal reading of §4 tracks
+  every key in the RRset, which meant tracking the root's ZSK, a key nobody will
+  ever anchor and one the root replaces quarterly *without* revoking — so the set
+  of permanently trusted keys would have grown every three months. Only secure
+  entry points are tracked now. See "Architecture: following a trust anchor".
 - **A secondary announces what it transferred, so a tree cascades** — `announce_zones`
   ran at startup and on SIGHUP, which are the moments a *primary* learns of a
   change; a secondary learns of one by transferring it and said nothing. So the
@@ -1740,6 +1973,17 @@ let (answer, state) = resolver.resolve_validated(&query).await?;
 //   Indeterminate-> no anchor covers the name; we never looked
 ```
 
+## Quick reference: answer shape
+
+```rust
+// Is this answer the CNAME chain the question asked for? Independent of the
+// signatures — each RRset verifying says nothing about the collection.
+match dnssec_chain::cname_chain_shape(&qname, qtype, &answers) {
+    ChainShape::Intact { final_name } => {}
+    ChainShape::Broken(why) => {}   // -> Bogus
+}
+```
+
 ## Quick reference: the denial cache
 
 ```rust
@@ -1761,9 +2005,45 @@ if let Some(s) = denials.synthesize(&qname, qtype) {
 }
 ```
 
+```rust
+// The positive half (RFC 8198 §5.3). Same precondition: Secure answers only.
+denials.insert_validated_wildcard(&response);
+
+if let Some(w) = denials.synthesize_wildcard(&qname, qtype) {
+    // w.answers   -> the wildcard's records, re-owned onto qname, TTL counted down
+    // w.authority -> the NSEC proving qname absent, so a client can check it
+}
+```
+
 Deliberately refused, each for a reason worth keeping: QTYPE ANY and RRSIG;
 anything below a delegation; NODATA at a delegation for any type but DS;
-opt-out NSEC3 spans (rejected at insert); NXDOMAIN without a wildcard denial.
+opt-out NSEC3 spans (rejected at insert); NXDOMAIN without a wildcard denial; and
+a wildcard answering for a name deeper than the one label it reaches.
+
+## Quick reference: managed trust anchors
+
+```rust
+// Load, or seed from whatever anchors are configured. Fatal on a corrupt file:
+// forgetting anchor state is not like forgetting a zone serial.
+let mut managed = ManagedAnchors::load_or_seed(path, &configured, now)?;
+
+// Feed it a DNSKEY RRset that VALIDATED — this checks no signatures itself, and
+// unvalidated input here hands over the trust anchor set. `self_signers` is the
+// subset that signed the RRset, which is the only basis for a revocation.
+let signers = rfc5011::self_signers(zone, &response.answers, now);
+for change in managed.observe(zone, &keys, &signers, now) { /* log it */ }
+
+managed.save(path)?;                     // write before trusting, always
+anchors.replace(managed.trust_anchors()); // SharedAnchors: live, no restart
+
+// When to ask again (RFC 5011 §2.3), bounded at both ends.
+rfc5011::query_interval(original_ttl, signature_remaining);
+rfc5011::retry_interval(original_ttl, signature_remaining);
+```
+
+The order matters: the file is written *before* the live set is replaced, because
+validating against keys we could not record would forget them on restart — which
+is the failure the file exists to prevent.
 
 ## Quick reference: replication
 

@@ -4,9 +4,12 @@ use std::time::Duration;
 
 use clap::Parser;
 use rdns::dnssec_chain::{TrustAnchors, ValidationState};
-use rdns::resolver::{Resolver, ResolverConfig, ResolverMode};
+use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
+use rdns::rfc5011::{self, AnchorChange, ManagedAnchors};
+use rdns::utils::current_unix_timestamp;
 use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
+use rdns::special_names;
 use rdns::utils::record_types;
 use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, QuerySection, ResourceRecord, ResponseCode, EDNS_VERSION,
@@ -119,6 +122,21 @@ struct Cli {
     /// binary compiled before the roll is wrong until it is rebuilt.
     #[arg(long)]
     trust_anchor: Option<std::path::PathBuf>,
+    /// A *managed* trust anchor file, followed and rewritten as keys roll
+    /// (RFC 5011). Only used with --dnssec-validate.
+    ///
+    /// The difference from `--trust-anchor` is who owns the file. That one is
+    /// read and never touched: the operator's decision, and a key roll means
+    /// editing it. This one is read *and written*: the resolver watches the
+    /// zone's own signed DNSKEY RRset, adopts a new key once it has been
+    /// published continuously for 30 days, and drops one the zone revokes with a
+    /// signature from that same key. It is the difference between a root KSK roll
+    /// being an outage and being something that already happened.
+    ///
+    /// Created from the anchors in force when it does not exist yet, so pointing
+    /// at a new path is enough to start.
+    #[arg(long)]
+    auto_trust_anchor: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -157,6 +175,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --dnssec-validate works out of the box; --trust-anchor overrides it, and
     // is what to reach for when the root KSK rolls.
     let mut dnssec_source = String::new();
+    let mut managed: Option<(std::path::PathBuf, ManagedAnchors)> = None;
+    let mut shared_anchors: Option<SharedAnchors> = None;
     if cli.dnssec_validate {
         let anchors = match &cli.trust_anchor {
             Some(path) => {
@@ -168,9 +188,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TrustAnchors::icann_root()
             }
         };
-        config.dnssec = Some(anchors);
-    } else if cli.trust_anchor.is_some() {
-        eprintln!("warning: --trust-anchor does nothing without --dnssec-validate");
+        // A managed file, if there is one, supersedes what we just loaded: it is
+        // the record of what has been *learned* since, and starting from the
+        // configured anchors again would throw away a hold-down that may be 29
+        // days old.
+        managed = match &cli.auto_trust_anchor {
+            Some(path) => {
+                let anchors = ManagedAnchors::load_or_seed(path, &anchors, current_unix_timestamp())?;
+                // Write it out now if it is not there yet, rather than at the
+                // first change. An operator who points at a new path should be
+                // able to look at the file and see what is trusted, and a
+                // resolver that only writes when something happens leaves them
+                // wondering for a month whether any of this is on.
+                if !path.exists() {
+                    anchors.save(path)?;
+                    println!("trust anchors: wrote {} from the anchors in force", path.display());
+                }
+                dnssec_source = format!(", DNSSEC validating from {} (RFC 5011)", path.display());
+                Some((path.clone(), anchors))
+            }
+            None => None,
+        };
+        let in_force = match &managed {
+            Some((_, managed)) => managed.trust_anchors(),
+            None => anchors,
+        };
+        shared_anchors = Some(SharedAnchors::new(in_force));
+        config.dnssec = shared_anchors.clone();
+    } else if cli.trust_anchor.is_some() || cli.auto_trust_anchor.is_some() {
+        eprintln!(
+            "warning: --trust-anchor and --auto-trust-anchor do nothing without --dnssec-validate"
+        );
     }
 
     let source = match config.mode {
@@ -181,6 +229,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ResolverMode::Forward => format!("forwarding to {:?}", config.upstream_servers),
     };
     let resolver = Arc::new(Resolver::new(config));
+
+    // Following the anchors is a task of its own: it resolves, which means it
+    // needs the resolver, which means it cannot be part of building one.
+    if let (Some((path, anchors)), Some(shared)) = (managed, shared_anchors) {
+        spawn_anchor_manager(resolver.clone(), shared, anchors, path);
+    }
 
     // A zero-capacity cache never stores (DnsCache::put is a no-op at 0), so
     // --no-cache is just a cache sized to hold nothing. The denial cache is
@@ -229,6 +283,166 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Accept datagrams and answer each in its own task.
+/// Follow the managed zones' DNSKEY RRsets and keep the anchors in step
+/// (RFC 5011).
+///
+/// One task, not one per zone: the zones share a file, and one writer per file
+/// is the rule everything else here obeys too.
+fn spawn_anchor_manager(
+    resolver: Arc<Resolver>,
+    anchors: SharedAnchors,
+    mut managed: ManagedAnchors,
+    path: std::path::PathBuf,
+) {
+    tokio::spawn(async move {
+        // A first probe soon after start rather than immediately: a resolver
+        // that cannot answer its own first query yet would just spend a retry.
+        let mut wait = Duration::from_secs(60);
+        loop {
+            tokio::time::sleep(wait).await;
+            wait = Duration::from_secs(rfc5011::retry_interval(0, 0));
+
+            let mut changed = false;
+            let mut soonest = u64::MAX;
+            for zone in managed.zones() {
+                match probe_zone(&resolver, &zone).await {
+                    Ok(probe) => {
+                        let changes = managed.observe(
+                            &zone,
+                            &probe.keys,
+                            &probe.self_signers,
+                            current_unix_timestamp(),
+                        );
+                        for change in &changes {
+                            report(change);
+                        }
+                        changed |= !changes.is_empty();
+                        soonest = soonest.min(rfc5011::query_interval(
+                            probe.original_ttl,
+                            probe.signature_remaining,
+                        ));
+                    }
+                    Err(e) => eprintln!("trust anchors for {zone}: {e}"),
+                }
+            }
+
+            if changed {
+                // The live anchor set moves with the file, in that order: a
+                // resolver validating against keys it has not recorded would
+                // forget them on restart, which is the failure this file exists
+                // to prevent.
+                match managed.save(&path) {
+                    Ok(()) => anchors.replace(managed.trust_anchors()),
+                    Err(e) => eprintln!(
+                        "trust anchors: {e} — keeping the previous set rather than \
+                         validating against keys we could not write down"
+                    ),
+                }
+            }
+            if soonest != u64::MAX {
+                wait = Duration::from_secs(soonest);
+            }
+        }
+    });
+}
+
+/// What one DNSKEY probe learned.
+struct AnchorProbe {
+    keys: Vec<rdns::dnssec::Dnskey>,
+    /// Those of them that signed the RRset — what a revocation rests on.
+    self_signers: Vec<rdns::dnssec::Dnskey>,
+    original_ttl: u32,
+    signature_remaining: u64,
+}
+
+/// Resolve a zone's DNSKEY RRset, insisting it validated.
+///
+/// **Secure or nothing.** An Insecure or Indeterminate answer for a zone we hold
+/// an anchor for is not a zone that went unsigned, it is an answer we could not
+/// tie to the anchor — and adopting keys from one would be adopting whatever
+/// answered. This is the precondition `ManagedAnchors::observe` documents and
+/// cannot check for itself.
+async fn probe_zone(resolver: &Resolver, zone: &str) -> Result<AnchorProbe, String> {
+    let query = QuerySection {
+        qname: zone.to_string(),
+        qtype: record_types::DNSKEY,
+        qclass: rdns::QueryClass::IN,
+    };
+    let (response, state) = resolver
+        .resolve_validated(&query)
+        .await
+        .map_err(|e| format!("resolving DNSKEY: {e}"))?;
+
+    if state != ValidationState::Secure {
+        return Err(format!(
+            "the DNSKEY RRset did not validate ({state:?}) — not adopting anything from it"
+        ));
+    }
+
+    let now = current_unix_timestamp();
+    let keys: Vec<rdns::dnssec::Dnskey> = response
+        .answers
+        .iter()
+        .filter_map(rdns::dnssec::Dnskey::from_record)
+        .collect();
+    if keys.is_empty() {
+        return Err("a validated answer with no DNSKEY in it".to_string());
+    }
+
+    // The timers come from the RRSIG that covers the set: how long the zone said
+    // to cache it, and how long its signature has left.
+    let (original_ttl, signature_remaining) = response
+        .answers
+        .iter()
+        .filter_map(rdns::dnssec::Rrsig::from_record)
+        .filter(|sig| sig.type_covered == record_types::DNSKEY)
+        .map(|sig| {
+            (
+                sig.original_ttl,
+                (sig.expiration as u64).saturating_sub(now),
+            )
+        })
+        .max_by_key(|(_, remaining)| *remaining)
+        .unwrap_or((0, 0));
+
+    Ok(AnchorProbe {
+        self_signers: rfc5011::self_signers(zone, &response.answers, now),
+        keys,
+        original_ttl,
+        signature_remaining,
+    })
+}
+
+/// Say what happened. A trust anchor moving is the rarest event this resolver
+/// has and the one an operator most wants to find in a log afterwards.
+fn report(change: &AnchorChange) {
+    match change {
+        AnchorChange::Pending { zone, key_tag } => println!(
+            "trust anchors: {zone} key {key_tag} is new — trusted in {} days if it stays",
+            rfc5011::ADD_HOLD_DOWN / 86_400
+        ),
+        AnchorChange::Trusted { zone, key_tag } => {
+            println!("trust anchors: {zone} key {key_tag} is now a trust anchor")
+        }
+        AnchorChange::Withdrawn { zone, key_tag } => println!(
+            "trust anchors: {zone} key {key_tag} went away before its hold-down elapsed"
+        ),
+        AnchorChange::Absent { zone, key_tag } => println!(
+            "trust anchors: {zone} key {key_tag} is no longer published, but is still trusted \
+             (revocation is how a key is retired)"
+        ),
+        AnchorChange::Returned { zone, key_tag } => {
+            println!("trust anchors: {zone} key {key_tag} is published again")
+        }
+        AnchorChange::Revoked { zone, key_tag } => println!(
+            "trust anchors: {zone} key {key_tag} REVOKED itself — no longer a trust anchor"
+        ),
+        AnchorChange::Forgotten { zone, key_tag } => {
+            println!("trust anchors: {zone} key {key_tag} is forgotten")
+        }
+    }
+}
+
 async fn udp_main(
     socket: Arc<UdpSocket>,
     resolver: Arc<Resolver>,
@@ -409,6 +623,26 @@ async fn handle_query(
     let client_wants_dnssec = msg.edns().ok().flatten().is_some_and(|e| e.do_bit);
     let checking_disabled = msg.cd;
 
+    // Names that must not leave this machine (RFC 6761, 6762, 6303). First,
+    // before every cache and before any resolution: for these the table *is* the
+    // answer, and consulting anything else would mean a query going out.
+    //
+    // Not skipped for a client with CD set, unlike the denial cache. CD says "do
+    // not withhold an answer on my behalf because it failed validation", which is
+    // a statement about DNSSEC; it is not a request to be told what a public
+    // server thinks `localhost` is.
+    if let Some(local) = special_names::lookup(&query.qname, query.qtype) {
+        let mut resp = build_response(id, &query, local.answers, local.rcode, recursion);
+        resp.authorities = local.authority;
+        // Never AD: nothing here was validated, it was decided by specification.
+        // Claiming otherwise would be the one lie a validating client cannot
+        // check for itself.
+        resp.ad = false;
+        resp.cd = checking_disabled;
+        println!("{}: answered locally — {}", query.qname, local.why);
+        return finish(resp, client_uses_edns, client_wants_dnssec, &query, client_max);
+    }
+
     // Aggressive use of the validated denial cache (RFC 8198). A cached NSEC
     // does not answer one question, it answers every question in its gap, so
     // this is checked before the answer cache: a flood of random names under one
@@ -417,6 +651,26 @@ async fn handle_query(
     // A client with CD set has asked us not to filter on its behalf, and an
     // answer we invented from cached proofs is exactly that, so it goes
     // upstream instead.
+    // The positive half of RFC 8198 (§5.3): a validated wildcard answer is a
+    // signed statement about every name that wildcard reaches, so a name nobody
+    // has asked about yet can be answered from it. Checked before the negative
+    // synthesis because the two are mutually exclusive by construction — a
+    // cached NXDOMAIN needs the wildcard *denied*, so it cannot fire for a name a
+    // wildcard governs — and this way the cheaper, more specific answer is tried
+    // first.
+    if !checking_disabled {
+        if let Some(wildcard) = caches.denials.synthesize_wildcard(&query.qname, query.qtype) {
+            let mut resp =
+                build_response(id, &query, wildcard.answers, ResponseCode::Ok, recursion);
+            resp.authorities = wildcard.authority;
+            // The wildcard's own signature verifies at this name unchanged —
+            // that is what a wildcard signature means — so this is as validated
+            // as the answer it came from, and the client can check it itself.
+            resp.ad = client_wants_dnssec || msg.ad;
+            return finish(resp, client_uses_edns, client_wants_dnssec, &query, client_max);
+        }
+    }
+
     if !checking_disabled {
         if let Some(denial) = caches.denials.synthesize(&query.qname, query.qtype) {
             let mut resp = build_response(id, &query, Vec::new(), denial.rcode, recursion);
@@ -518,6 +772,14 @@ async fn handle_query(
                 // not exist.
                 if upstream.answers.is_empty() && secure {
                     caches.denials.insert_validated(&upstream);
+                }
+                // And a validated *positive* answer that came from a wildcard is
+                // the same kind of statement about a range of names (RFC 8198
+                // §5.3), so it is kept too — under the wildcard rather than under
+                // the name that happened to be asked for. Only when Secure, for
+                // exactly the same reason.
+                if !upstream.answers.is_empty() && secure {
+                    caches.denials.insert_validated_wildcard(&upstream);
                 }
                 (upstream, secure)
             }
