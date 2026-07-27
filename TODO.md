@@ -16,12 +16,29 @@ where to look rather than here.
 |---------|-------------------------------------------------------------------|
 | `rdns`  | the library: wire codec, zones, cache, resolver, DNSSEC           |
 | `rdnsc` | command-line query client                                         |
-| `rdnsd` | authoritative server — serves zone files, one process per transport |
+| `rdnsd` | authoritative server — serves zone files over UDP and TCP in one process |
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **381 lib + 15 integration** tests passing,
-`cargo clippy --workspace --all-targets` **clean, no exceptions**.
+`cargo test --workspace` = **461 lib + 29 integration** tests passing (`rdnsd`'s
+own 29 cover argument validation, zone sources, the secondary role, both
+directions of IXFR and onward announcement), `cargo clippy --workspace
+--all-targets` **clean, no exceptions**.
+
+**Steps 1–5 of #7 are done: `rdnsd` replicates in both directions, incrementally
+at both ends, and cascades.** It transfers a zone from a master, serves it, writes
+it down, refreshes it on the zone's own timers, acts on a NOTIFY *and sends one
+onward*, withdraws a zone past EXPIRE, answers an IXFR with just the difference,
+and takes one. Verified as a three-node tree where a change at the primary reaches
+the bottom in seconds rather than at the next refresh. See "Architecture: the secondary role" and "Architecture:
+incremental transfer".
+
+**Only step 6 is left under #7, and it is explicitly conditional** — persisted
+deltas matter when dynamic UPDATE (RFC 2136) arrives and not before, because that
+is what makes a journal the source of truth rather than a cache of one. So the
+next thing to pick up is a choice rather than a queue: **#2's RFC 5011 key
+rollover** (the most self-contained item left on this list), **#6's special-use
+names** (~100 lines and a table), or **#1's two aggressive-use extensions**.
 
 **#5 is closed, and TSIG and NOTIFY with it.** The work now has a spine: **#7,
 the secondary role** — `rdnsd` can hand a zone out (AXFR) and announce a change
@@ -47,18 +64,29 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets
 
-# Authoritative server. The zone origin comes from the FILENAME:
-# example.com.zone serves example.com — a mismatch silently yields NXDOMAIN for
-# everything. Serves UDP and TCP; run one process per transport.
-cargo run -p rdnsd -- udp --host 127.0.0.1 --port 15353 --zone-file example.com.zone
-cargo run -p rdnsd -- tcp --host 127.0.0.1 --port 15353 --zone-file example.com.zone
+# Authoritative server, UDP and TCP from one process. The zone origin comes from
+# the FILENAME: example.com.zone serves example.com — a mismatch silently yields
+# NXDOMAIN for everything.
+cargo run -p rdnsd -- --host 127.0.0.1 --port 15353 --zone-file example.com.zone
 
-# Zone transfers are refused unless a peer is named. AXFR is TCP-only.
-cargo run -p rdnsd -- tcp --port 15353 --zone-file example.com.zone \
+# Zone transfers are refused unless an address or a key says otherwise.
+cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --allow-transfer 127.0.0.1 --allow-transfer 10.0.0.0/8
 
-# Response bytes per second per client (UDP). 8192 by default; 0 turns it off.
-cargo run -p rdnsd -- udp --port 15353 --zone-file example.com.zone --response-rate 4096
+# Secondary: replicate a zone from a master. Needs --zone-dir, because the zone
+# is written there under its own name. `#keyname` signs the transfer with a key
+# --tsig-key defines. Repeat for more zones, or for more masters of one zone.
+cargo run -p rdnsd -- --port 15354 --zone-dir ./zones \
+  --secondary example.com@127.0.0.1:15353 \
+  --secondary other.test@192.0.2.1#transfer.key.
+
+# A TSIG key authorizes a transfer from any address, and signs the answers.
+cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
+  --tsig-key hmac-sha256:transfer.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=
+
+# Tell a secondary at once when a zone changes, and cap UDP response bytes/s.
+cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
+  --also-notify 127.0.0.1:15354 --response-rate 4096
 
 # Resolver, recursing from the root hints. Serves UDP and TCP on one port, and
 # binds 127.0.0.1 by default on purpose — not an open resolver.
@@ -226,12 +254,13 @@ touched — 20k allocations for one lookup on a 10k-record zone, measured at
       tells a secondary at once instead of leaving it to the refresh timer, and an
       incoming NOTIFY is answered as a NOTIFY.
 - [ ] **IXFR** (RFC 1995) — moved to #7, where it belongs: it is an optimisation
-      inside the secondary story rather than a feature of its own. Two things about
-      it are worth knowing before starting there. A request currently **cannot even
-      be received** — `validation.rs:128` rejects any request with a non-empty
-      authority section, and an IXFR request carries the client's SOA there. And a
-      server may *always* answer AXFR-style instead (RFC 1995 §4), which NSD did as
-      a primary for years, so the conformant first version needs no journal at all.
+      inside the secondary story rather than a feature of its own. The thing worth
+      knowing before starting there is that a server may *always* answer AXFR-style
+      instead (RFC 1995 §4), which NSD did as a primary for years, so the conformant
+      first version needs no journal at all. (The request used to be unreceivable —
+      the validator rejected any request with a non-empty authority section, which
+      is where an IXFR carries the client's SOA. Fixed while making NOTIFY work; see
+      "Done so far".)
 - [x] **Amplification** — the response byte budget is in (`--response-rate`, UDP);
       see "Done so far" and "Architecture: amplification". `rdnsd` still binds
       `0.0.0.0` by default, which is the right default for an authoritative server
@@ -244,8 +273,12 @@ touched — 20k allocations for one lookup on a 10k-record zone, measured at
       additional records (delegation NS sets, glue) are dropped, so a referral
       learned mid-resolution is not reusable except through the delegation cache.
 - [x] Zone parser: `$INCLUDE` and parenthesized multi-line records — done, see
-      "Done so far". Still missing from the parser: TTL unit suffixes (`1h`,
-      `2d`), `\`-escaped dots inside a label, and `@` as an rdata name.
+      "Done so far". RFC 3597's `TYPEnnn` and generic `\# <len> <hex>` rdata are in
+      too, since the writer needs them. Still missing from the parser: TTL unit
+      suffixes (`1h`, `2d`), `\`-escaped dots inside a label, and `@` as an rdata
+      name. The escaped-dot gap now has a consequence beyond reading: it is the one
+      thing that can make a zone *unwritable*, since an owner name is the first
+      field of the line and has no generic form to fall back to.
 - [x] TXT `<character-string>` framing — done, see "Done so far".
 
 ### 7. The secondary role — replication, in six steps
@@ -269,25 +302,30 @@ authoritative data.
 
 The steps, in decreasing value per line:
 
-- [ ] **1. Serve both transports in one process.** The prerequisite, and good on its
-      own: `rdnsd udp` and `rdnsd tcp` are separate processes today, and writable
-      state needs a single owner — two of them transferring the same zone and racing
-      to write it is not a design to grow into. `rdnsr` already does this. Merging
-      also lets the rate limiter, validator, logger and metrics be *shared* rather
-      than one set per transport, which is what they should have been.
-- [ ] **2. A zone-file writer**, plus the write-temp-then-rename helper. Independently
-      useful for dumping and debugging, and required by everything below. Text
-      presentation format, so the load path is the one already parsed and tested.
-- [ ] **3. Secondary role, AXFR-only.** Master configuration, refresh/retry/expire
-      timers, an AXFR client (the TSIG client primitives `sign_request` and
-      `check_response` already exist and are used only by tests), the state sidecar,
-      per-zone atomic swap, and acting on a NOTIFY instead of answering NOTAUTH.
-- [ ] **4. IXFR-out** from in-memory diffs computed at load time — BIND's
+- [x] **1. Serve both transports in one process** — done, see "Done so far". The
+      rate limiter, validator, logger and metrics are shared now, so a client cannot
+      get two budgets by switching transport.
+- [x] **2. A zone-file writer**, plus the write-temp-then-rename helper — done, see
+      "Done so far" and "Architecture: writing a zone back out". `zone_writer` and
+      `persist` are the two new modules; there is no CLI surface for dumping yet,
+      because step 3 is the first caller and the flag belongs with it.
+- [x] **3. Secondary role, AXFR-only** — done, see "Done so far" and "Architecture:
+      the secondary role". `--secondary zone@master[:port][#key]`, new `xfr` and
+      `secondary` library modules, the state sidecar, per-zone atomic swap, EXPIRE
+      withdrawal, and a NOTIFY from a master now refreshes instead of being answered
+      NOTAUTH.
+- [x] **4. IXFR-out** from in-memory diffs computed at load time — done, see "Done
+      so far" and "Architecture: incremental transfer". BIND's
       `ixfr-from-differences` semantics without an on-disk journal.
-- [ ] **5. IXFR-in**, which needs step 3's timers and step 4's delta handling.
+- [x] **5. IXFR-in** — done, see "Done so far" and "Architecture: incremental
+      transfer". A refresh asks for the difference whenever it has a version to
+      differ from, and copes with all three answers.
 - [ ] **6. Persisted deltas**, only if dynamic UPDATE (RFC 2136) ever arrives — that
       is what really needs a journal, because then the journal *is* the source of
       truth between file syncs.
+- [x] **A secondary announces what it transferred** — done, see "Done so far".
+      `announce_zones` covered only the moments a *primary* learns of a change
+      (startup, SIGHUP), so a tree below the first level moved on refresh timers.
 
 **One simplification worth not re-deriving.** Applying a transfer does not need a
 record-removal API on `Zone`, and it is worth never adding one: the index holds
@@ -690,6 +728,299 @@ Resolver is the outlier that does (LMDB on disk). So `rdnsr` losing its cache on
 restart is mainstream rather than a gap, and is the one store on this page not to
 build.
 
+## Architecture: incremental transfer (RFC 1995)
+
+An AXFR moves the whole zone whenever any part of it moves: a serial bump and one
+changed address cost a fresh copy. That is what makes a secondary with a short
+REFRESH expensive to be, and what IXFR exists to fix.
+
+**Where the deltas come from was the decision.** BIND keeps an on-disk journal,
+which is what you need when the zone is edited in place by dynamic UPDATE —
+there, the journal *is* the record of what happened. Here a zone comes from a file
+and changes in discrete events (a reload, or a transfer from a master), so the
+difference between two versions can be computed when the new one arrives and kept
+in memory. That is `ixfr-from-differences` without the journal, and the same call
+NSD made. A journal earns its keep at #7 step 6 and not before.
+
+**The consequence, stated so nobody is surprised:** a restart forgets the deltas.
+Every secondary asking for an increment across one gets a full transfer instead,
+which RFC 1995 §4 permits unconditionally and which corrects itself at the next
+change. `DeltaLog` also keeps only `MAX_DELTAS_PER_ZONE` (32) steps per zone; a
+client further behind than that gets the zone.
+
+**The response is positional, and that is the part to get right.** Not "the
+changed records": the current SOA, then one *difference sequence* per version step
+— old SOA, deletions, new SOA, additions — then the current SOA again. A client
+reads the second record of the stream to decide what it is holding; another SOA
+means an increment, anything else means the server fell back to the whole zone.
+Four things make it fall back, each logged: no SOA in the request, no unbroken
+chain back to the client's serial, a chain that does not reach the serial we are
+serving, or an increment no smaller than the zone (§4 says to send the zone then,
+since the point is that less crosses the wire).
+
+**A gap in the chain is not something to paper over.** If the steps from the
+client's serial do not link end to end up to the current one, applying the rest
+would leave the client holding a zone that never existed — with a serial saying it
+is current, which no comparison afterwards could catch. `chain_from` returns
+nothing rather than a partial chain, and the answer is a full transfer.
+
+Three details worth not re-deriving:
+
+- **The apex SOA is excluded from the deltas.** It is carried by the framing, as
+  the header of each half; a copy among the records would read as the start of
+  another difference sequence.
+- **A TTL change is a deletion and an addition.** A secondary caches and re-serves
+  that number, so two records differing only in TTL are not the same record to it.
+  This is what BIND produces too.
+- **The diff counts rather than sets.** A zone holding the same record twice does
+  not read as a change when one copy is removed.
+
+**The delta log is derived state, so it moves with the zone map or not at all.**
+Every replacement goes through `install_zone`/`install_all_zones`, which take both
+locks and record the step in the same call — the same hazard the zone index has,
+and the reason `note_change` wants both versions rather than being something a
+caller can forget. A zone that is withdrawn (expired, or gone from the
+configuration) has its history dropped: offering increments of a zone we no longer
+serve would be answering for something we stopped serving. Under `answer_transfer`
+the log is read *under the zone lock*, so the increments and the zone they are
+increments of are the same version.
+
+**Gated by the same ACL as an AXFR**, because an IXFR may answer with the whole
+zone — a policy that let it through would be no policy at all.
+
+**Over UDP, the answer is always a single SOA of the current version**, which is
+RFC 1995 §2's own "come back over TCP" signal. Deliberate rather than a
+limitation: the ACL, the TSIG session and the multi-message packing all live on
+the TCP path, and duplicating them to serve the increments that happen to fit a
+datagram would be a second implementation of the interesting parts.
+
+### The client half
+
+A refresh asks for the difference whenever it has a version to differ from, and
+for the whole zone when it does not. That is a *preference*, not a demand — which
+is why there is one code path and not two.
+
+**The answer's shape is positional, and a client cannot assume it got what it
+asked for.** The signal is the second record of the stream: another SOA means
+difference sequences follow, anything else means the server chose to send the
+whole zone. A client that assumed sequences would read a zone's first ordinary
+record as the header of a delete section and start deleting things. `IxfrAssembler`
+therefore switches to `AxfrAssembler` at that point rather than growing a second
+copy of the rules about what a transfer may contain — bailiwick, the closing SOA,
+the bound — which apply identically either way.
+
+Two boundaries in that state machine are worth not re-deriving. An SOA arriving
+during a sequence's *additions* is either the next sequence's header or the
+closing record, and the serial is what tells them apart: the next sequence starts
+where this one ended, which equals the current serial only when there is nothing
+left to send. And an "already current" answer is a single SOA with no terminator
+of its own, so it is recognised by being the whole of the first message — a server
+with sequences to send packs them into that same message rather than sending one
+record and pausing.
+
+**Applying is rebuild, not edit** (`ixfr::apply_changes`), which is the
+simplification noted under #7 and the reason `Zone` has no record-removal API and
+should never get one: the index holds *positions* into the record vector, so
+removing in place invalidates every later one. Rebuilding is O(zone size) per
+sequence rather than per record, and the result is a zone built by the ordinary
+constructor whose index cannot disagree with its contents.
+
+**A deletion for a record we do not hold is counted, not fatal.** It means our
+copy and the master's had already diverged — worth logging, never worth refusing
+the transfer over, since the record is meant to be gone either way and failing
+would strand the secondary on a version it can never leave.
+
+One consequence worth knowing: an increment and a full transfer produce the same
+zone but not the same *file*, because a changed record is deleted and re-added and
+so moves to the end of the load order. Confirmed identical as record sets, which
+is what a zone is; a textual diff between two secondaries that took different
+routes to the same serial is expected.
+
+**Verified live, both directions.** Outbound, against dnspython — our client and
+our server agreeing about a format proves nothing. A secondary holding one
+recorded change was asked for an increment by `dns.query.inbound_xfr` from serial
+200; dnspython applied it and arrived at serial 201 with exactly the right nine
+records. The other two paths too: asking from the current serial changed nothing
+(one SOA), and asking from a serial we never held replaced the client's zone
+wholesale and dropped a record that only existed there.
+
+Inbound, as a three-node tree — primary → S1 → S2, which is also the check that
+this composes. The primary was restarted with a changed zone, so it had no deltas
+and sent S1 the whole zone (`sent in full`, exactly as documented). S1 recorded the
+step, and S2's next refresh took it as `1 incremental step(s)`: 8 records on the
+wire against the 12 a full transfer moved, with the changed address updated, the
+new record present, the deleted one answering NXDOMAIN, and the untouched records
+untouched. S1's and S2's zones compared identical as record sets.
+
+## Architecture: the secondary role
+
+Two modules, split by whether they touch the network. `xfr` is the client half of
+a transfer — asking for a zone and deciding what of the answer to believe.
+`secondary` is the policy: when a refresh is due, when a zone has gone stale, and
+what survives a restart. The timing rules have no I/O in them and all the
+interesting edge cases, so they are tested by moving a clock rather than by
+waiting.
+
+**What `xfr` refuses is the interesting part**, because a stream that was merely
+*received* is not a zone:
+
+- **It must open and close with the apex SOA** (RFC 5936 §2.2). The closing SOA is
+  the only thing distinguishing a complete transfer from a cut connection, and a
+  secondary that swapped in a truncated zone would answer NXDOMAIN for everything
+  the stream did not reach — worse than not updating at all.
+- **Every record must be in bailiwick.** A master for `example.com.` sending a
+  record for anything outside it is writing into a name it is not authoritative
+  for. Same rule as the resolver's, same reason.
+- **The stream is bounded** (`MAX_TRANSFER_RECORDS`), because a master that never
+  sends the closing SOA is otherwise a slow way to exhaust memory.
+- **AA must be set**, and the rcode must be NOERROR. AA is how the master says the
+  zone is its to hand out.
+
+TSIG is chained across envelopes: the first is verified against the request's MAC
+and each one after against its predecessor (RFC 8945 §5.3.1), so a dropped or
+reordered envelope fails at the client rather than passing for a complete zone.
+An envelope with *no* TSIG when a key is configured is refused rather than
+accepted — §5.3.1 permits omitting intermediate signatures, and handling that
+properly means feeding the unsigned bytes into the next signed envelope's digest,
+which `check_response` has no way to express. Refusing is the honest position
+until it does; the note is here so the next person does not conclude the chaining
+is simply wrong.
+
+**The cycle** is RFC 1035 §4.3.5's, per (zone, master): ask for the SOA, compare
+serials with RFC 1982 arithmetic, transfer if behind, sleep on REFRESH — or on
+RETRY if anything failed, with a NOTIFY cutting the wait short. Reaching the
+master resets the staleness clock whether or not anything was transferred: a zone
+confirmed unchanged is exactly as current as one just fetched.
+
+**EXPIRE is the timer with teeth, and the only place a secondary is required to
+make things worse for its clients.** Out of contact past it, the zone stops being
+served. The alternative is worse: a zone served with AA set is a claim to be
+current, and a server that keeps making that claim turns a primary's outage into
+permanently wrong answers that nobody can see are wrong. Withdrawn, the query gets
+REFUSED, which sends a resolver to the other nameservers in the delegation.
+
+Three details that are easy to get wrong and were:
+
+- **Expiry is measured from the last time the master answered**, not from the last
+  time the zone changed. A zone that has not changed in a year is not stale.
+- **Expiry has to survive a restart**, or it lasts only as long as the process:
+  the stale file is loaded from disk and served again, authoritative once more.
+  So the state line is *kept* when a zone expires — it is the record of when
+  contact was last made — and `expire_stale_zones_at_startup` consults it before
+  anything is served. Deleting the line would read as "never fetched", which means
+  "fetch", which means serving the stale copy.
+- **A zone we have never reached counts its EXPIRE from process start.** Not
+  "forever ago", which would withdraw a zone before ever trying, and not "never",
+  which would serve a copy of unknown age indefinitely because we happened to
+  restart.
+
+REFRESH and RETRY are clamped to a 60-second floor. The RFCs set none because they
+did not imagine one being needed; a zone whose SOA says `refresh 0` is otherwise a
+loop that asks its master as fast as the network allows. EXPIRE is *not* clamped —
+it is a limit on staleness, and raising a small one would serve a zone longer than
+its operator said to.
+
+**A NOTIFY now has three answers**, where it used to have one. From a master of a
+zone we replicate: NOERROR, and the refresh happens now. From anywhere else for
+such a zone: REFUSED — a policy decision, the same shape as the transfer ACL's,
+because a NOTIFY is a spoofable datagram that costs its recipient a transfer. For
+anything else: NOTAUTH, which is the truth for a zone we hold as a primary and one
+we have never heard of alike. The serial inside the message is deliberately not
+acted on: it is unauthenticated, and the refresh does its own comparison against
+what the master answers.
+
+**Persistence** is what "Architecture: persistence" settled: the zone as a text
+zone file written by `zone_writer`, under its origin's name, so the ordinary load
+path reads it back with nothing to distinguish it from one an operator wrote; and
+a line-based sidecar (`rdnsd.state`) holding `zone serial refreshed-at master`.
+Both are replaced atomically. The sidecar never fails a load — a missing or
+corrupt one means "nothing fetched", which means fetch, and refusing to start over
+a scratch file would make it a single point of failure.
+
+**Verified live, two `rdnsd` processes**, with dnspython as the client throughout:
+
+- a fresh secondary transferred the zone, served it, and wrote it down;
+- changing the primary's zone and restarting it produced `NOTIFY … acknowledged
+  (Ok)` on one side and `refreshing now` → `transferred serial 101 -> 102` on the
+  other, with a record deleted on the primary gone from the secondary;
+- the secondary restarted with the primary *down* and served the zone from its own
+  written file — the step-2 writer and the zone parser closing the loop;
+- a zone with `EXPIRE 60` whose master was killed logged
+  `EXPIRE (60s) passed with no contact — no longer serving this zone` and answered
+  REFUSED thereafter.
+
+That run is also what caught the two bugs under "Done so far" that no unit test
+would have: the validator dropping NOTIFY before anything read its opcode, and the
+refresh loop reading the zone's timers *before* the transfer that installs them,
+so the first refresh after a first fetch waited the default hour instead of the
+zone's own REFRESH. Both look perfectly correct in a test that only asserts the
+transfer happened.
+
+## Architecture: writing a zone back out
+
+Two modules, and the split is the same one the persistence table makes: `persist`
+knows how to replace a file safely and nothing about DNS; `zone_writer` knows how
+to spell a zone and nothing about disks.
+
+**`persist::write_atomically`** writes a temporary sibling, `sync_all`s it, and
+renames it over the target. The sibling matters — a rename across filesystems is
+a copy, which is the non-atomic thing being avoided — and so does the fsync
+*order*: without it a crash can leave the directory entry pointing at a file
+whose blocks were never written, so "the rename happened" would not imply "the
+contents are there". The temporary carries the pid, because "one writer per file"
+is a rule about the target and a leftover from a crashed process must not be
+something a later run renames into place. Syncing the directory afterwards is
+POSIX-only and best-effort: it is a durability refinement, not a correctness one,
+since no reader can observe a partial file either way.
+
+**`zone_writer` has one rule: what is written must read back as the same bytes.**
+Not the same *meaning* — the same bytes. A fetched zone may be signed, and a
+signature covers RDATA octet for octet, so a record re-spelled in a way that
+re-encodes even slightly differently becomes bogus at a validating client rather
+than failing here. Every line is therefore rendered type-specifically only when
+that provably round-trips, and otherwise in RFC 3597 §5's generic
+`\# <len> <hex>` form, which is exact by construction.
+
+The check for "provably" is one comparison, not a list of cases: parse the stored
+RDATA, re-encode it, and see whether the bytes come back identical. That catches
+RDATA carrying trailing bytes its type does not define, a name whose labels do
+not survive a round trip, and anything else of that shape without this module
+having to anticipate it. **One gap is not visible to it and is worth not
+re-deriving:** a type bitmap is stored and re-encoded verbatim, so a bitmap
+padded with trailing zero bytes passes that check intact — and then the *text*
+form silently drops the padding, because a list of type names says which types
+are set and nothing about how they were laid out. So NSEC and NSEC3 additionally
+compare the bitmap against the one the parser would rebuild, and go out generic
+if it differs.
+
+Everything else about the format follows from making a line independent of its
+neighbours: owner names absolute, a TTL and class on every record, so nothing
+depends on directive order or on which record happens to precede which.
+`$ORIGIN` and `$TTL` are still emitted for other tools, and because an origin is
+worth recording in the file rather than left implied by the file's *name*.
+Records keep their load order under the apex SOA, which leads the file — so
+rewriting an unchanged zone produces an unchanged file, and a diff between two
+versions shows what actually moved.
+
+**The one thing that cannot fall back is an owner name**: it is the first field
+of the line, not RDATA, and this parser has no escape syntax for a label holding
+a dot or a space (the gap listed under #5). Such a name is refused, and the write
+fails, rather than producing a file that reads back as a different zone.
+
+Two things landed on the *load* path to make this work, both RFC 3597 §5.
+`TYPEnnn` is accepted and emitted wherever a type is named, so a type this
+library has no parser for is expressible — in a record and in an NSEC bitmap
+alike. And a type bitmap listing a name with no type code is now an error rather
+than a silent omission: dropping one turns an NSEC that denies six types into one
+that denies five, which is a signed record quietly changed into a different
+signed record.
+
+**Verified against dnspython**, which is the check that matters here — our parser
+agreeing with our writer proves nothing. A zone with SOA/NS/DS/DNSKEY/RRSIG/NSEC/
+NSEC3 and a generic `TYPE1234` was written by `zone_writer` and read by
+dnspython, and every record's `to_digestable()` matched our stored RDATA byte for
+byte. Also confirmed idempotent: writing the output again reproduces it exactly.
+
 ## Architecture: zone storage
 
 Records live in one vector; an index built as they are added maps the absolute,
@@ -793,9 +1124,16 @@ Messages are built under the zone lock and sent outside it: an unanswered NOTIFY
 takes seconds to retry, and holding the map that long would block a reload behind
 the network.
 
-**Receiving** is answered NOTAUTH, because it is the truth — this server is a
-primary, with no secondary role, no master to be told by and nothing to fetch. The
-attempt is logged either way, distinguishing a zone we serve from one we do not: a
+**Sending also happens when a zone we replicate moves**, which is what makes a
+replication *tree* work rather than just a star. §3.2's "master" is whoever serves
+the zone to someone, and a secondary in the middle of a tree is one; without this,
+only the moments a primary learns of a change (startup, SIGHUP) produce a NOTIFY,
+so everything below the first level waits out a refresh timer. See "Architecture:
+the secondary role".
+
+**Receiving** has three answers now that this server can be a secondary — refresh,
+REFUSED, or NOTAUTH depending on what the zone is to us. See `notify_reply` and
+"Architecture: the secondary role"; the attempt is logged in every case, since a
 NOTIFY from an unexpected source is worth seeing (RFC 1996 §3.10 has a secondary
 log exactly that).
 
@@ -887,6 +1225,28 @@ One task pushes them into the reply channel in order, so a transfer's messages
 never reorder among themselves; another query's reply may land between them,
 which is legal — a client demultiplexes on the transaction id.
 
+## Architecture: one process per server
+
+Both daemons serve UDP *and* TCP from a single process, and both bind before they
+announce anything so a port conflict fails at startup instead of after one
+transport is already up. Two loops are spawned and whichever fails first takes the
+process down — a server quietly answering on one transport and not the other is
+worse than one that stopped, because a client's TC=1 retry (RFC 1035 §4.2.1) or a
+zone transfer would simply hang.
+
+`rdnsd` reached this late. It ran one process per transport, which was harmless
+only while zones were read-only: the moment anything writes state — a fetched zone,
+a refresh timestamp — that state needs a single owner, and two servers over the same
+zone file racing to write it is not a design to grow into (see "Architecture:
+persistence"). The `udp` and `tcp` subcommands are gone rather than kept as no-ops:
+a flag that is accepted and means nothing is worse documentation than an error.
+
+Merging also fixed something that was wrong on its own terms: the rate limiter,
+request validator, logger and metrics used to be **one set per transport**, so a
+client had two query budgets and the metrics each saw half the traffic. They are one
+`Server` now, shared by both loops. The response *byte* budget stays UDP-only, since
+a TCP query has completed a handshake and there is nobody to reflect at.
+
 ## Architecture: DNS over TCP (both daemons)
 
 Both daemons frame TCP messages with the RFC 1035 §4.2.2 2-byte big-endian
@@ -961,6 +1321,108 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **A secondary announces what it transferred, so a tree cascades** — `announce_zones`
+  ran at startup and on SIGHUP, which are the moments a *primary* learns of a
+  change; a secondary learns of one by transferring it and said nothing. So the
+  first level of a replication tree updated at once and every level below it waited
+  out a refresh timer — which for a typical SOA is hours. RFC 1996 §3.2's "master"
+  is whoever serves the zone to someone, which a secondary in the middle is, so
+  `refresh_once` now announces the zone whose serial just moved, to the same
+  `--also-notify` targets. Spawned rather than awaited, for the same reason the
+  primary's announcements are. Found by running a three-node tree for the IXFR
+  work and noticing the bottom node waiting; fixed and re-verified there, with
+  REFRESH at an hour so nothing but the NOTIFY could have moved it — the change
+  reached the bottom in about seven seconds, incrementally.
+  `Replication` now bundles what a refresh task shares (zone map, delta log, state
+  file, zone directory, notify targets) rather than passing six parameters that
+  are not independently choosable.
+- **IXFR-in: taking an increment rather than the zone** — step 5 of #7. A refresh
+  now asks for the difference whenever it holds a version to differ from. The
+  answer's shape is positional and a client may not assume it got what it asked
+  for: the second record of the stream decides, and `IxfrAssembler` hands over to
+  `AxfrAssembler` when it is not an SOA rather than duplicating the rules about
+  what a transfer may contain. Applying is `ixfr::apply_changes` — rebuild the
+  zone, never edit it, which is why `Zone` has no record-removal API. A deletion
+  for a record we do not hold is counted and logged, not fatal: the record is meant
+  to be gone either way, and failing would strand the secondary on a version it can
+  never leave. Verified as a three-node tree, where S2 took an increment from S1
+  covering the change S1 had itself received in full — 8 records on the wire against
+  12 — and ended up with S1's zone exactly. See "Architecture: incremental
+  transfer".
+- **IXFR-out: an increment instead of the whole zone** — step 4 of #7. An AXFR
+  moves everything whenever anything moves, which is what makes a short REFRESH
+  expensive. New `ixfr` module: `DeltaLog` remembers the difference between the
+  versions of each zone this process has held (bounded, 32 steps), computed at the
+  moment a zone is replaced — BIND's `ixfr-from-differences` without the on-disk
+  journal, which is a thing to build when dynamic UPDATE arrives and not before.
+  The response is RFC 1995 §4's positional shape, with four logged reasons to fall
+  back to a full transfer, and a chain with a gap in it is never partially applied:
+  a client that took one would hold a zone that never existed, with a serial saying
+  it was current. Gated by the same ACL as an AXFR, since it may answer with the
+  whole zone. Over UDP the answer is §2's single-SOA "come back over TCP". The log
+  is derived state, so it moves with the zone map in one call and a withdrawn zone
+  takes its history with it. Verified against dnspython's own `inbound_xfr`, which
+  applied our increment and landed on the right zone. See "Architecture:
+  incremental transfer".
+- **`rdnsd` can be a secondary** — step 3 of #7, and the one that makes the rest a
+  replication story rather than a pile of parts: it could hand a zone out (AXFR)
+  and announce a change (NOTIFY), but could not *be* a replica of anything.
+  `--secondary zone@master[:port][#key]`, new `xfr` (the client half of a transfer)
+  and `secondary` (timers, master specs, the state sidecar) modules. What arrives
+  is checked before it is believed — opens and closes with the apex SOA, every
+  record in bailiwick, AA set, bounded length, TSIG chained across envelopes — and
+  a zone is swapped in whole under the write lock, written to disk by `zone_writer`
+  and recorded in a line-based sidecar. EXPIRE is enforced, including across a
+  restart, which is what the sidecar is really for. A NOTIFY from a master now
+  refreshes at once; from anywhere else it is REFUSED. Verified live between two
+  `rdnsd` processes with dnspython as the client. See "Architecture: the secondary
+  role".
+- **A request's sections were being judged by one blanket rule, and it had now
+  killed three features** — `validate_header` rejected *any* request carrying an
+  answer or authority section, before anything read the opcode. That is right for
+  QUERY and wrong for everything else: a NOTIFY carries the zone's SOA in its
+  answer section (RFC 1996 §3.7) and an IXFR request carries the client's SOA in
+  its authority section (RFC 1995 §3). The symptom is always silence — the message
+  is dropped and nothing says why — which is exactly how the additional-section
+  version of this rule left EDNS dead on arrival. Found by watching a live NOTIFY
+  fail to reach a secondary that was configured to act on it. Now: answers are
+  forbidden for QUERY only, and every section is capped rather than prohibited.
+- **A UDP receive error took the whole server down** — on Windows, replying to a
+  client that has already closed its socket earns an ICMP port-unreachable, which
+  is reported as `WSAECONNRESET` on the socket's *next* `recv_from`. Both daemons
+  treated any receive error as fatal, so the loop returned and the process with it.
+  A stray ICMP report says nothing about the socket's health; it is now skipped and
+  receiving continues, while errors that are not that are still fatal, because a
+  server that cannot receive is not serving. Unix only reports this on connected
+  sockets, which is why the shape of the bug is invisible there.
+- **A zone this server does not hold is REFUSED, not NXDOMAIN** — NXDOMAIN is an
+  assertion about the DNS as a whole, which we have no standing to make about a
+  zone we hold nothing for, and a resolver caches it (RFC 2308) so the lie
+  propagates. REFUSED says the truth and sends the resolver to the rest of the
+  delegation. It is what BIND, NSD and Knot answer here, and it matters more now
+  that a zone can be *withdrawn*: an expired secondary answering NXDOMAIN would
+  take its zone off the internet for as long as anything cached the answer.
+- **A zone-file writer, and a file replaced atomically** — step 2 of #7, and what
+  everything below it needs: a secondary that fetches a zone has nowhere to put it.
+  New `zone_writer` (text presentation format, so the load path is the one already
+  parsed and tested) and `persist` (temporary sibling → fsync → rename, which
+  replaces an existing file on both Unix and Windows). The rule the writer is built
+  around is byte-exactness rather than equivalence — a signature covers RDATA octet
+  for octet — so a record is spelled type-specifically only when re-encoding it
+  provably reproduces the stored bytes, and goes out in RFC 3597 §5's generic
+  `\# <len> <hex>` form when it does not. That fallback is also what lets a type
+  this library has no parser for be persisted at all. On the load path: `TYPEnnn`
+  is now read and written wherever a type is named, and a type bitmap listing an
+  unrecognized name is an error instead of dropping it silently. Cross-checked
+  against dnspython, record by record, on the wire bytes. See "Architecture:
+  writing a zone back out".
+- **`rdnsd` serves both transports from one process** — it ran one per transport,
+  which cannot hold writable state: two servers over the same zone file would race
+  to write it, and step 1 of #7 exists for that reason. Also fixed on its own terms:
+  the rate limiter, validator, logger and metrics were one set *per transport*, so a
+  client had two query budgets and the metrics each saw half the traffic — now one
+  shared `Server`. The `udp`/`tcp` subcommands are gone. See "Architecture: one
+  process per server".
 - **NOTIFY (RFC 1996), and the opcode field was being read wrong** — a secondary
   had no way to hear that a zone changed except its own refresh timer. New `notify`
   module and `--also-notify`: sent on zone load for every zone whose serial moved
@@ -1302,3 +1764,81 @@ if let Some(s) = denials.synthesize(&qname, qtype) {
 Deliberately refused, each for a reason worth keeping: QTYPE ANY and RRSIG;
 anything below a delegation; NODATA at a delegation for any type but DS;
 opt-out NSEC3 spans (rejected at insert); NXDOMAIN without a wildcard denial.
+
+## Quick reference: replication
+
+```rust
+// The client half of a transfer. All three open a TCP connection and time out.
+xfr::fetch_soa(master, "example.com.", key.as_ref()).await?;   // -> u32 serial
+xfr::fetch_zone(master, "example.com.", key.as_ref()).await?;  // -> Zone
+
+// Incremental. The master may answer with the whole zone whatever you ask, so
+// all three outcomes have to be handled — this is a preference, not a demand.
+match xfr::fetch_changes(master, &held, key.as_ref()).await? {
+    xfr::IxfrOutcome::UpToDate(serial) => {}
+    xfr::IxfrOutcome::Updated { zone, steps, missing_deletions } => {}
+    xfr::IxfrOutcome::FullTransfer(zone) => {}
+}
+
+// Or drive the assembling yourself, message by message, with no socket.
+let mut assembler = xfr::AxfrAssembler::new("example.com.");
+if assembler.accept(&msg)? == xfr::Progress::Complete {
+    let zone = assembler.into_zone()?;   // errors if the closing SOA never came
+}
+// The incremental one is the same shape, and `into_outcome` takes the version
+// the request was made from — applying to anything else builds a zone that
+// never existed.
+let mut assembler = xfr::IxfrAssembler::new("example.com.");
+if assembler.accept(&msg)? == xfr::Progress::Complete {
+    let outcome = assembler.into_outcome(&held)?;
+}
+
+// Policy: when to ask, when to give up, what to remember.
+secondary::MasterSpec::parse("example.com@192.0.2.1:53#transfer.key.")?;
+let timers = secondary::RefreshTimers::from_zone(&zone).unwrap_or_default();
+timers.after_success();  timers.after_failure();
+timers.has_expired(last_contact, now);          // -> stop serving the zone
+secondary::is_newer(remote_serial, ours);       // RFC 1982, never `>`
+
+let mut state = secondary::StateFile::load(&secondary::state_file_path(dir));
+state.get("example.com.", master);              // Option<&TransferState>
+state.record(TransferState { .. })?;            // upsert + atomic rewrite
+
+// Outbound increments. The log is derived from the zone map: record the step in
+// the same breath as the swap, or an IXFR describes a zone we do not serve.
+let mut deltas = ixfr::DeltaLog::new();
+deltas.note_change(previous_version, &new_version);
+deltas.forget("example.com.");                  // a zone we stopped serving
+ixfr::apply_changes(&base, &deleted, &added, &new_soa);  // -> (Zone, removed)
+match ixfr::ixfr_response(&request, &zone, &deltas)? {
+    ixfr::IxfrResponse::UpToDate(messages) => {}          // one SOA
+    ixfr::IxfrResponse::Incremental { messages, .. } => {}
+    ixfr::IxfrResponse::FullTransfer { messages, why } => {}  // always allowed
+}
+```
+
+Nothing here trusts what arrives: a transfer must open and close with the apex
+SOA, every record must be in bailiwick, and a delta chain with a gap is refused
+rather than partially applied. When adding to this, keep that posture — the
+failures it prevents are all invisible after the fact.
+
+## Quick reference: writing a zone, and writing a file
+
+```rust
+// Serialize a zone. Fails only on something this format cannot express — in
+// practice an owner name needing escapes the parser does not read back.
+let text: String = zone_writer::zone_to_string(&zone)?;
+zone_writer::write_zone_file(&zone, Path::new("/var/db/example.com.zone"))?;
+zone_writer::record_to_string(&record)?;   // one line, for logs and diffs
+
+// Replace a file atomically: temporary sibling -> fsync -> rename. Use this for
+// every piece of persisted state, not just zones (the step-3 sidecar included).
+persist::write_atomically(path, bytes)?;
+persist::write_atomically_str(path, &text)?;
+```
+
+What comes back out is byte-identical to what went in, including for records this
+library cannot parse — that is the property to preserve when touching either
+module, because a signed RRset re-spelled differently is a bogus one. Do not add
+a "prettier" rendering without re-checking it against the re-encode guard in
+`rdata_to_string`.

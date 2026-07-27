@@ -250,7 +250,20 @@ fn parse_base32_hex(input: &str) -> Result<Vec<u8>, String> {
     Ok(res)
 }
 
-fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
+fn is_leap(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+fn days_in_month(month: i32, year: i32) -> i32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if is_leap(year) { 29 } else { 28 },
+        _ => 0,
+    }
+}
+
+pub(crate) fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
     if let Ok(epoch) = time_str.parse::<u32>() {
         return Ok(epoch);
     }
@@ -261,15 +274,7 @@ fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
         let hour = time_str[8..10].parse::<i32>().map_err(|e| e.to_string())?;
         let min = time_str[10..12].parse::<i32>().map_err(|e| e.to_string())?;
         let sec = time_str[12..14].parse::<i32>().map_err(|e| e.to_string())?;
-        
-        let is_leap = |y| (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
-        let days_in_month = |m, y| match m {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 => if is_leap(y) { 29 } else { 28 },
-            _ => 0,
-        };
-        
+
         let mut total_days = 0;
         for y in 1970..year {
             total_days += if is_leap(y) { 366 } else { 365 };
@@ -278,47 +283,115 @@ fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
             total_days += days_in_month(m, year);
         }
         total_days += day - 1;
-        
+
         let epoch = total_days as i64 * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
         return Ok(epoch as u32);
     }
     Err(format!("Invalid DNSSEC time format: {}", time_str))
 }
 
-fn construct_type_bitmap(types: &[String]) -> Vec<u8> {
-    let mut codes = Vec::new();
-    for t in types {
-        if let Some(code) = crate::utils::record_type_name_to_code(t) {
-            codes.push(code);
+/// The `YYYYMMDDHHmmSS` form an RRSIG's times are written in (RFC 4034 §3.2).
+///
+/// The inverse of [`parse_dnssec_time`], and deliberately next to it: the two
+/// share the calendar arithmetic, and a formatter that disagreed with the parser
+/// would write signature validity times that read back as different instants.
+/// Kept in UTC, which is the only zone a DNSSEC timestamp has.
+///
+/// The parser also accepts a bare epoch, and writing that would be shorter — but
+/// nothing else in the ecosystem does, and a dumped zone whose signatures cannot
+/// be read at a glance is a zone nobody can debug.
+pub(crate) fn format_dnssec_time(epoch: u32) -> String {
+    let mut days = (epoch / 86400) as i32;
+    let seconds = epoch % 86400;
+
+    let mut year = 1970;
+    loop {
+        let in_year = if is_leap(year) { 366 } else { 365 };
+        if days < in_year {
+            break;
         }
+        days -= in_year;
+        year += 1;
     }
-    codes.sort();
+
+    let mut month = 1;
+    while days >= days_in_month(month, year) {
+        days -= days_in_month(month, year);
+        month += 1;
+    }
+
+    format!(
+        "{year:04}{month:02}{:02}{:02}{:02}{:02}",
+        days + 1,
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
+}
+
+/// The type bitmap for a list of type names, as an NSEC or NSEC3 line writes
+/// them.
+///
+/// A name with no type code is an error rather than a silent omission: this used
+/// to drop what it did not recognize, which turns an NSEC that denies six types
+/// into one that denies five — a signed record quietly changed into a different
+/// signed record. `TYPEnnn` (RFC 3597 §5) means every type has a spelling, so
+/// there is no longer a case where dropping one would be the lesser evil.
+///
+/// The bits are laid out by [`crate::dnssec_denial::build_type_bitmap`], the
+/// same function the validator's own denials are built with, so a bitmap read
+/// here and one synthesized there cannot drift apart.
+fn construct_type_bitmap(types: &[String]) -> Result<Vec<u8>, String> {
+    let mut codes = Vec::with_capacity(types.len());
+    for name in types {
+        let code = crate::utils::record_type_name_to_code(&name.to_uppercase())
+            .ok_or_else(|| format!("unknown record type {name:?} in type bitmap"))?;
+        codes.push(code);
+    }
+    codes.sort_unstable();
     codes.dedup();
-    
-    let mut blocks: std::collections::BTreeMap<u8, Vec<u8>> = std::collections::BTreeMap::new();
-    for code in codes {
-        let block_num = (code / 256) as u8;
-        let block_offset = (code % 256) as u8;
-        let byte_offset = (block_offset / 8) as usize;
-        let bit_offset = block_offset % 8;
-        
-        let bitmap = blocks.entry(block_num).or_insert_with(|| vec![0u8; 32]);
-        bitmap[byte_offset] |= 1 << (7 - bit_offset);
+    Ok(crate::dnssec_denial::build_type_bitmap(&codes))
+}
+
+/// Read `\# <length> <hex>` (RFC 3597 §5) into stored form.
+///
+/// The stated length is checked against the digits rather than trusted: the two
+/// disagreeing means the record was mangled somewhere, and a length field is
+/// exactly the sort of thing a hand-edit gets wrong.
+///
+/// A known type is parsed once after decoding, purely to reject it — the bytes
+/// are kept either way, but RDATA that cannot be read as the type it claims is a
+/// malformed record, and this parser's rule is that a malformed record fails the
+/// load rather than waiting to fail a query.
+fn parse_generic_rdata(record_type: &str, fields: &[&str]) -> Result<RecordData, String> {
+    let rtype = crate::utils::record_type_name_to_code(record_type)
+        .ok_or_else(|| format!("unknown record type {record_type:?}"))?;
+
+    let Some((length, hex)) = fields.split_first() else {
+        return Err("generic rdata needs a length after '\\#'".to_string());
+    };
+    let length: usize = length
+        .parse()
+        .map_err(|e| format!("invalid generic rdata length {length:?}: {e}"))?;
+
+    let bytes = parse_hex(&hex.concat()).map_err(|e| format!("invalid generic rdata: {e}"))?;
+    if bytes.len() != length {
+        return Err(format!(
+            "generic rdata says {length} bytes but carries {}",
+            bytes.len()
+        ));
     }
-    
-    let mut result = Vec::new();
-    for (block_num, bitmap) in blocks {
-        let mut len = 32;
-        while len > 0 && bitmap[len - 1] == 0 {
-            len -= 1;
-        }
-        if len > 0 {
-            result.push(block_num);
-            result.push(len as u8);
-            result.extend_from_slice(&bitmap[..len]);
-        }
-    }
-    result
+
+    let stored = RecordData {
+        rtype,
+        rdata: bytes.into_boxed_slice(),
+    };
+    // A type with no parser reads back as `Unknown` rather than failing, so this
+    // only ever rejects a known type whose bytes are not that type.
+    stored
+        .parse()
+        .map_err(|e| format!("generic rdata is not valid {record_type}: {e}"))?;
+    Ok(stored)
 }
 
 /// One record or directive, assembled from as many physical lines as it spans.
@@ -659,6 +732,25 @@ fn parse_into(
         idx += 1;
         let rdata = parts[idx..].join(" ");
 
+        // RFC 3597 §5's generic form: `\# <length> <hex>`, which says nothing
+        // about what the RDATA means and so can carry any type at all. It is the
+        // only way to write a type this library has no parser for — and the way
+        // the zone writer emits anything whose type-specific spelling would not
+        // read back as the same bytes. Accepted for known types too (§5 permits
+        // it), because refusing it would make a written zone unreadable by the
+        // program that wrote it.
+        if parts.get(idx).is_some_and(|token| *token == "\\#") {
+            let rdata = parse_generic_rdata(&record_type, &parts[idx + 1..])
+                .map_err(|e| format!("line {ln}: {record_type} record: {e}"))?;
+            zone.add_record(ZoneRecord {
+                name: record_name,
+                ttl,
+                class,
+                rdata,
+            });
+            continue;
+        }
+
         let rdata: RecordData = match record_type.as_str() {
             "A" => {
                 let addr = rdata
@@ -861,7 +953,8 @@ fn parse_into(
                 let next_domain_name = nsec_parts[0].to_string();
                 let type_names: Vec<String> =
                     nsec_parts[1..].iter().map(|s| s.to_string()).collect();
-                let type_bitmap = construct_type_bitmap(&type_names);
+                let type_bitmap = construct_type_bitmap(&type_names)
+                    .map_err(|e| format!("line {ln}: NSEC record: {e}"))?;
                 RecordData::from_parsed(&ParsedRecord::NSEC {
                     next_domain_name,
                     type_bitmap,
@@ -896,7 +989,8 @@ fn parse_into(
                     .map_err(|e| format!("line {ln}: invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4]))?;
                 let type_names: Vec<String> =
                     nsec3_parts[5..].iter().map(|s| s.to_string()).collect();
-                let type_bitmap = construct_type_bitmap(&type_names);
+                let type_bitmap = construct_type_bitmap(&type_names)
+                    .map_err(|e| format!("line {ln}: NSEC3 record: {e}"))?;
                 RecordData::from_parsed(&ParsedRecord::NSEC3 {
                     hash_algorithm,
                     flags,
@@ -926,6 +1020,7 @@ fn parse_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::record_types;
 
     #[test]
     fn test_zone_creation() {
@@ -1387,6 +1482,103 @@ $TTL 3600
     fn test_include_without_a_file_name_is_an_error() {
         let err = parse_zone_file("$INCLUDE\n", "example.com.").unwrap_err();
         assert!(err.contains("needs a file name"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 3597: types with no mnemonic, and rdata written as raw bytes
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_generic_rdata_carries_a_type_we_do_not_parse() {
+        let zone = parse_zone_file("odd IN TYPE1234 \\# 4 DEADBEEF\n", "example.com.").unwrap();
+        let record = zone.query("odd.example.com.", 1234);
+        assert_eq!(record.len(), 1);
+        assert_eq!(&*record[0].rdata.rdata, &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    /// RFC 3597 §5 permits the generic form for a known type too, and the writer
+    /// uses it whenever the type-specific spelling would not read back exactly.
+    #[test]
+    fn test_generic_rdata_is_accepted_for_a_known_type() {
+        let zone = parse_zone_file("www IN A \\# 4 C0000201\n", "example.com.").unwrap();
+        assert!(matches!(
+            zone.query("www.example.com.", record_types::A)[0].rdata.parse(),
+            Ok(ParsedRecord::A(addr)) if addr == Ipv4Addr::new(192, 0, 2, 1)
+        ));
+    }
+
+    #[test]
+    fn test_generic_rdata_of_zero_length() {
+        let zone = parse_zone_file("empty IN TYPE4321 \\# 0\n", "example.com.").unwrap();
+        assert!(zone.query("empty.example.com.", 4321)[0].rdata.rdata.is_empty());
+    }
+
+    /// The length is checked rather than trusted — it is exactly the field a
+    /// hand-edit gets wrong, and believing it would store the wrong bytes.
+    #[test]
+    fn test_generic_rdata_length_must_match_the_digits() {
+        let err = parse_zone_file("odd IN TYPE1234 \\# 8 DEADBEEF\n", "example.com.").unwrap_err();
+        assert!(err.contains("says 8 bytes but carries 4"), "got: {err}");
+    }
+
+    #[test]
+    fn test_generic_rdata_that_is_not_the_type_it_claims_fails_the_load() {
+        // Three bytes cannot be an A record.
+        let err = parse_zone_file("www IN A \\# 3 C00002\n", "example.com.").unwrap_err();
+        assert!(err.contains("not valid A"), "got: {err}");
+    }
+
+    #[test]
+    fn test_generic_rdata_needs_a_length() {
+        let err = parse_zone_file("odd IN TYPE1234 \\#\n", "example.com.").unwrap_err();
+        assert!(err.contains("needs a length"), "got: {err}");
+    }
+
+    /// A type bitmap may list a type this library has no name for; `TYPEnnn` is
+    /// how RFC 3597 §5 says to write it, and dropping it would turn a signed
+    /// NSEC into a different signed NSEC.
+    #[test]
+    fn test_nsec_bitmap_accepts_a_generic_type_name() {
+        let zone = parse_zone_file(
+            "@ IN NSEC www.example.com. A TYPE1234\n",
+            "example.com.",
+        )
+        .unwrap();
+        let record = zone.query("example.com.", record_types::NSEC)[0];
+        let ParsedRecord::NSEC { type_bitmap, .. } = record.rdata.parse().unwrap() else {
+            panic!("not an NSEC");
+        };
+        assert!(crate::dnssec_denial::bitmap_has_type(&type_bitmap, record_types::A));
+        assert!(crate::dnssec_denial::bitmap_has_type(&type_bitmap, 1234));
+    }
+
+    #[test]
+    fn test_nsec_bitmap_rejects_a_name_that_is_no_type_at_all() {
+        let err = parse_zone_file("@ IN NSEC www.example.com. A NOTATYPE\n", "example.com.")
+            .unwrap_err();
+        assert!(err.contains("unknown record type"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // DNSSEC timestamps
+    // -----------------------------------------------------------------
+
+    /// The formatter and the parser are inverses, or a rewritten RRSIG would
+    /// claim a different validity period from the one it was signed with.
+    #[test]
+    fn test_dnssec_time_round_trips() {
+        for (epoch, text) in [
+            (0u32, "19700101000000"),
+            (1, "19700101000001"),
+            (951_868_800, "20000301000000"),   // the day after a leap day
+            (1_078_012_800, "20040229000000"), // a leap day itself
+            (1_609_459_199, "20201231235959"),
+            (2_147_483_647, "20380119031407"),
+            (u32::MAX, "21060207062815"),
+        ] {
+            assert_eq!(format_dnssec_time(epoch), text, "formatting {epoch}");
+            assert_eq!(parse_dnssec_time(text), Ok(epoch), "parsing {text}");
+        }
     }
 
     #[test]

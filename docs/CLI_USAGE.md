@@ -12,30 +12,26 @@ Complete reference for command-line options and examples for rdnsd (DNS server).
 
 ## Basic Commands
 
-### UDP Server
-
 ```bash
-rdnsd udp [OPTIONS]
+rdnsd [OPTIONS]
 ```
 
-Starts a UDP DNS server on the specified host and port.
+Serves **UDP and TCP from one process**, on the same host and port. Both are
+mandatory for an authoritative server: a reply that overflows the client's UDP
+payload size goes out with TC=1 and the client retries over TCP (RFC 1035 §4.2.1),
+and zone transfers are TCP-only (RFC 5936 §4.2). Whichever loop fails first takes
+the process down, so it never quietly serves one and not the other.
 
-### TCP Server
-
-```bash
-rdnsd tcp [OPTIONS]
-```
-
-Starts a TCP DNS server on the specified host and port. Useful for:
-- Zone transfers (AXFR)
-- Large DNS queries
-- Testing and debugging
+`rdnsd` used to be one process per transport, invoked as `rdnsd udp` or
+`rdnsd tcp`. Those subcommands are gone: writable state (a fetched zone, a refresh
+timestamp) needs a single owner, and two servers over one zone file would race to
+write it. Pass the options directly.
 
 ## Flags and Options
 
 ### `--host <HOST>`
 
-Listen address for the DNS server.
+Listen address, for both transports.
 
 **Default:** `0.0.0.0`
 
@@ -47,21 +43,21 @@ Listen address for the DNS server.
 **Examples:**
 ```bash
 # All interfaces (production)
-rdnsd udp --host 0.0.0.0
+rdnsd --host 0.0.0.0
 
 # Localhost only (development)
-rdnsd udp --host 127.0.0.1
+rdnsd --host 127.0.0.1
 
 # IPv6 localhost
-rdnsd udp --host ::1
+rdnsd --host ::1
 
 # Specific interface
-rdnsd udp --host 192.168.1.100
+rdnsd --host 192.168.1.100
 ```
 
 ### `--port <PORT>`
 
-Listen port for the DNS server.
+Listen port, for both transports.
 
 **Default:** `53` (standard DNS port)
 
@@ -70,13 +66,13 @@ Listen port for the DNS server.
 **Examples:**
 ```bash
 # Standard DNS port (requires root or CAP_NET_BIND_SERVICE)
-rdnsd udp --port 53
+rdnsd --port 53
 
 # Development/testing port (no root required)
-rdnsd udp --port 5353
+rdnsd --port 5353
 
 # High port number
-rdnsd udp --port 8053
+rdnsd --port 8053
 ```
 
 ### `--zone-file <PATH>`
@@ -91,9 +87,9 @@ Load zones from a single zone file.
 
 **Examples:**
 ```bash
-rdnsd udp --zone-file example.com.zone
-rdnsd udp --zone-file /etc/rdns/zones/example.com.zone
-rdnsd tcp --zone-file ./zones/test.zone
+rdnsd --zone-file example.com.zone
+rdnsd --zone-file /etc/rdns/zones/example.com.zone
+rdnsd --zone-file ./zones/test.zone
 ```
 
 ### `--zone-dir <DIR>`
@@ -110,16 +106,16 @@ Load all `.zone` files from a directory.
 **Examples:**
 ```bash
 # All zones in directory
-rdnsd udp --zone-dir /etc/rdns/zones
+rdnsd --zone-dir /etc/rdns/zones
 
 # Development zones
-rdnsd udp --zone-dir ./zones
+rdnsd --zone-dir ./zones
 
 # Current directory
-rdnsd udp --zone-dir .
+rdnsd --zone-dir .
 ```
 
-### `--response-rate <BYTES_PER_SEC>` (udp only)
+### `--response-rate <BYTES_PER_SEC>` (applies to UDP)
 
 Response **bytes** per second, per client address. Default `8192`; `0` turns the
 budget off.
@@ -135,18 +131,18 @@ going *out* are what has to be metered.
   That reply carries no records — smaller than the query that asked for it — and a
   real client retries over TCP, where the handshake proves the source address and
   the budget does not apply.
-- UDP only: a TCP query has completed a handshake, so there is nobody to reflect
-  at.
+- Applies to UDP replies only: a TCP query has completed a handshake, so there is
+  nobody to reflect at.
 
 ```bash
 # The default: 8 KiB/s per client.
-rdnsd udp --zone-file example.com.zone
+rdnsd --zone-file example.com.zone
 
 # Tighter, for a server facing the open internet.
-rdnsd udp --zone-file example.com.zone --response-rate 4096
+rdnsd --zone-file example.com.zone --response-rate 4096
 
 # Off — only sensible on a closed network.
-rdnsd udp --zone-file example.com.zone --response-rate 0
+rdnsd --zone-file example.com.zone --response-rate 0
 ```
 
 Measured on a zone with a 2.5 KB TXT RRset, flooding for 5.5 s from one address:
@@ -154,7 +150,7 @@ Measured on a zone with a 2.5 KB TXT RRset, flooding for 5.5 s from one address:
 (the 8 KB/s rate plus the burst allowance spread across the window), and the
 truncated replies keep a legitimate client working.
 
-### `--allow-transfer <ADDR|CIDR>` (tcp only)
+### `--allow-transfer <ADDR|CIDR>` (applies to TCP)
 
 Who may request a zone transfer (AXFR). **Repeatable, and empty by default —
 which refuses everyone.**
@@ -169,20 +165,20 @@ permitted or not.
 - Address families do not mix: a v4 rule never matches a v6 peer, including a
   v4-mapped one.
 - A malformed rule stops the server rather than quietly shortening the list.
-- Only on the `tcp` subcommand: AXFR is defined over TCP alone (RFC 5936 §4.2).
-  A UDP request for it gets FORMERR.
+- Applies to TCP, because AXFR is defined over TCP alone (RFC 5936 §4.2). A UDP
+  request for it gets FORMERR.
 
 ```bash
 # One secondary.
-rdnsd tcp --zone-file example.com.zone --allow-transfer 192.0.2.10
+rdnsd --zone-file example.com.zone --allow-transfer 192.0.2.10
 
 # Two of them, and a management subnet.
-rdnsd tcp --zone-file example.com.zone \
+rdnsd --zone-file example.com.zone \
   --allow-transfer 192.0.2.10 --allow-transfer 192.0.2.11 \
   --allow-transfer 10.9.0.0/24
 
 # No flag: transfers refused, which is what you want unless a secondary needs one.
-rdnsd tcp --zone-file example.com.zone
+rdnsd --zone-file example.com.zone
 ```
 
 ### `--also-notify <ADDR[:PORT]>`
@@ -206,11 +202,11 @@ decides what to do about it.
 
 ```bash
 # Two secondaries.
-rdnsd udp --zone-file example.com.zone \
+rdnsd --zone-file example.com.zone \
   --also-notify 192.0.2.10 --also-notify 192.0.2.11
 
 # One on a non-standard port, for testing.
-rdnsd tcp --zone-file example.com.zone --also-notify 127.0.0.1:15353
+rdnsd --zone-file example.com.zone --also-notify 127.0.0.1:15353
 ```
 
 Not done: notifying the zone's own NS set. BIND derives the list from the NS
@@ -247,16 +243,16 @@ a keyed MAC over the message.
 
 ```bash
 # Transfers to whoever holds the key, from anywhere.
-rdnsd tcp --zone-file example.com.zone \
+rdnsd --zone-file example.com.zone \
   --tsig-key hmac-sha256:transfer.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=
 
 # Belt and braces: the key, and only from the secondary's address.
-rdnsd tcp --zone-file example.com.zone \
+rdnsd --zone-file example.com.zone \
   --tsig-key transfer.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI= \
   --allow-transfer 192.0.2.10
 
 # Signed ordinary queries over UDP, answered signed.
-rdnsd udp --zone-file example.com.zone \
+rdnsd --zone-file example.com.zone \
   --tsig-key transfer.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=
 ```
 
@@ -272,17 +268,17 @@ Exactly one of `--zone-file` or `--zone-dir` must be specified.
 
 ✅ **Valid:**
 ```bash
-rdnsd udp --zone-file example.com.zone
-rdnsd udp --zone-dir /etc/rdns/zones
-rdnsd tcp --host 127.0.0.1 --port 5353 --zone-file test.zone
+rdnsd --zone-file example.com.zone
+rdnsd --zone-dir /etc/rdns/zones
+rdnsd --host 127.0.0.1 --port 5353 --zone-file test.zone
 ```
 
 ❌ **Invalid:**
 ```bash
-rdnsd udp --zone-file example.com.zone --zone-dir /etc/rdns/zones
+rdnsd --zone-file example.com.zone --zone-dir /etc/rdns/zones
 # Error: Cannot specify both --zone-file and --zone-dir
 
-rdnsd udp --host 127.0.0.1 --port 5353
+rdnsd --host 127.0.0.1 --port 5353
 # Error: Must specify either --zone-file or --zone-dir
 ```
 
@@ -313,13 +309,13 @@ dig @127.0.0.1 -p 5353 example.com
 ```bash
 # Run UDP server on standard DNS port
 # Requires root or CAP_NET_BIND_SERVICE capability
-rdnsd udp \
+rdnsd \
   --host 0.0.0.0 \
   --port 53 \
   --zone-dir /etc/rdns/zones
 
 # Run TCP server for zone transfers
-rdnsd tcp \
+rdnsd \
   --host 0.0.0.0 \
   --port 53 \
   --zone-dir /etc/rdns/zones
@@ -330,13 +326,9 @@ rdnsd tcp \
 **DNS primary and secondary on same host:**
 
 ```bash
-# Primary server (UDP + TCP on standard port)
-rdnsd udp --zone-dir /etc/rdns/zones/primary &
-rdnsd tcp --zone-dir /etc/rdns/zones/primary &
-
-# Secondary server (UDP + TCP on alternate port for testing)
-rdnsd udp --port 5353 --zone-dir /etc/rdns/zones/secondary &
-rdnsd tcp --port 5354 --zone-dir /etc/rdns/zones/secondary &
+# One server per zone set, each serving both transports.
+rdnsd --zone-dir /etc/rdns/zones/primary &
+rdnsd --port 5353 --zone-dir /etc/rdns/zones/other &
 ```
 
 ### Testing with Different Protocols
@@ -344,15 +336,12 @@ rdnsd tcp --port 5354 --zone-dir /etc/rdns/zones/secondary &
 **Test UDP vs TCP:**
 
 ```bash
-# Terminal 1: UDP server
-rdnsd udp --host 127.0.0.1 --port 5353 --zone-dir ./zones
+# One server, both transports on the same port.
+rdnsd --host 127.0.0.1 --port 5353 --zone-dir ./zones
 
-# Terminal 2: TCP server (different port)
-rdnsd tcp --host 127.0.0.1 --port 5354 --zone-dir ./zones
-
-# Terminal 3: Query both
+# Query it either way.
 dig @127.0.0.1 -p 5353 example.com          # UDP
-dig @127.0.0.1 -p 5354 +tcp example.com    # TCP
+dig @127.0.0.1 -p 5353 +tcp example.com     # TCP
 ```
 
 ### Single Zone File
@@ -360,7 +349,7 @@ dig @127.0.0.1 -p 5354 +tcp example.com    # TCP
 **For testing or dedicated zone serving:**
 
 ```bash
-rdnsd udp \
+rdnsd \
   --host 127.0.0.1 \
   --port 5353 \
   --zone-file example.com.zone
@@ -391,12 +380,12 @@ Error: Permission denied
 **Solutions:**
 1. Run with `sudo`:
    ```bash
-   sudo rdnsd udp --zone-dir /etc/rdns/zones
+   sudo rdnsd --zone-dir /etc/rdns/zones
    ```
 
 2. Or use a high port for testing:
    ```bash
-   rdnsd udp --port 5353 --zone-dir ./zones
+   rdnsd --port 5353 --zone-dir ./zones
    ```
 
 3. Or set capability on binary (production):
@@ -418,7 +407,7 @@ Error: No such file or directory
 
 - Use absolute path:
   ```bash
-  rdnsd udp --zone-file /full/path/to/example.com.zone
+  rdnsd --zone-file /full/path/to/example.com.zone
   ```
 
 ### No .zone Files Found
@@ -468,7 +457,7 @@ kill -HUP <PID>  # No effect
 - Add new zone files to the zone directory, then signal:
   ```bash
   # Start server
-  rdnsd udp --zone-dir ./zones &
+  rdnsd --zone-dir ./zones &
   SERVER_PID=$!
   
   # Add new zone file

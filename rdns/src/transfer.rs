@@ -64,9 +64,23 @@ pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> Result<Vec<DnsMessage
     }
     records.push(soa);
 
-    // Pack into messages by estimated wire size: the encoded name is at most its
-    // text length plus two, and the fixed part of a record is ten bytes. An
-    // estimate that can only be too large is the safe direction here.
+    Ok(pack_transfer_messages(request, records))
+}
+
+/// Split a transfer's records into messages that each fit a TCP frame.
+///
+/// Shared with the incremental transfer in [`crate::ixfr`], because the framing
+/// is a property of a transfer rather than of which kind it is: same target size,
+/// same estimate, same one-well-formed-answer-per-message rule.
+///
+/// The estimate is by wire size and ignores name compression: the encoded name is
+/// at most its text length plus two, and the fixed part of a record is ten bytes.
+/// An estimate that can only be too large is the safe direction, since the real
+/// limit is the 64 KiB length prefix.
+pub(crate) fn pack_transfer_messages(
+    request: &DnsMessage,
+    records: Vec<ResourceRecord>,
+) -> Vec<DnsMessage> {
     let mut messages = Vec::new();
     let mut current: Vec<ResourceRecord> = Vec::new();
     let mut estimated = 0usize;
@@ -82,7 +96,7 @@ pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> Result<Vec<DnsMessage
     if !current.is_empty() {
         messages.push(transfer_message(request, current));
     }
-    Ok(messages)
+    messages
 }
 
 /// One message of a transfer: the request's id and question, authoritative, with
@@ -91,7 +105,7 @@ pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> Result<Vec<DnsMessage
 /// Every message repeats the question. RFC 5936 §2.2.1 allows omitting it after
 /// the first and requires accepting either, so the simpler of the two is fine —
 /// and it means each message is a well-formed response on its own.
-fn transfer_message(request: &DnsMessage, answers: Vec<ResourceRecord>) -> DnsMessage {
+pub(crate) fn transfer_message(request: &DnsMessage, answers: Vec<ResourceRecord>) -> DnsMessage {
     DnsMessage {
         id: request.id,
         response: true,

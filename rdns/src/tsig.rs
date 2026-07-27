@@ -557,6 +557,18 @@ pub fn sign_request(message: Vec<u8>, key: &TsigKey, now: u64) -> Result<Vec<u8>
     append_tsig(message, &tsig)
 }
 
+/// The MAC carried by a signed message.
+///
+/// A client needs its own request's MAC to check the reply against: a response's
+/// digest opens with it (RFC 8945 §4.3.3), which is the binding that stops a
+/// reply to one question being replayed as the reply to another. Reading it back
+/// off the signed bytes keeps [`sign_request`]'s signature as it is and means
+/// there is one definition of where a MAC lives.
+pub fn request_mac(packet: &[u8]) -> Option<Vec<u8>> {
+    let (_, rdata, owner) = find_tsig(packet)?;
+    Tsig::parse_rdata(&owner, rdata).ok().map(|tsig| tsig.mac)
+}
+
 /// Verify a response against the request's MAC — the client half of a reply, and
 /// of each envelope of a transfer.
 ///

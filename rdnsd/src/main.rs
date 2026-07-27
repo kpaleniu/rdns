@@ -1,21 +1,28 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use rdns::{
+    ixfr::{ixfr_response, DeltaLog, IxfrResponse},
     logging::QueryLogger,
     notify,
+    secondary::{
+        is_newer, state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile,
+        TransferState,
+    },
     security::{RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
     transfer::axfr_messages,
-    tsig::{self, TsigCheck, TsigKeyring, TsigSession},
+    tsig::{self, TsigAlgorithm, TsigCheck, TsigKey, TsigKeyring, TsigSession},
     OpCode,
     telemetry::{instrumentation, DnsMetrics, LatencyTimer},
-    utils::record_types,
+    utils::{current_unix_timestamp, record_types},
     validation::RequestValidator,
+    xfr,
     zone::{parse_zone_file_at, Zone},
+    zone_writer::write_zone_file,
     DnsMessage, Edns, ResourceRecord, ResponseCode, EDNS_VERSION,
 };
 
@@ -41,88 +48,77 @@ const MAX_INFLIGHT_PER_CONNECTION: usize = 16;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 
 #[cfg(unix)]
 use signal_hook::consts::signal::SIGHUP;
 #[cfg(unix)]
 use signal_hook_tokio::Signals;
 
+/// Authoritative DNS server.
+///
+/// Serves UDP *and* TCP from one process. It used to be one process per transport
+/// — `rdnsd udp` beside `rdnsd tcp` over the same zone files — which was harmless
+/// only while zones were read-only. Anything that writes state (a fetched zone, a
+/// refresh timestamp) needs a single owner, and two servers racing to write the
+/// same zone file is not a design to grow into.
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    #[command(subcommand)]
-    commands: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    Tcp {
-        #[arg(long, default_value = "0.0.0.0")]
-        host: String,
-        #[arg(long, default_value = "53")]
-        port: u16,
-        #[arg(long)]
-        zone_file: Option<String>,
-        #[arg(long)]
-        zone_dir: Option<String>,
-        /// Who may request a zone transfer: an address or CIDR prefix, repeatable.
-        ///
-        /// Nobody, unless this says otherwise. An AXFR is the whole zone in one
-        /// answer, so it is the one query that has to be allowed by list. Only
-        /// on the TCP subcommand, because AXFR is defined over TCP alone
-        /// (RFC 5936 §4.2).
-        #[arg(long, value_name = "ADDR|CIDR")]
-        allow_transfer: Vec<String>,
-        /// A TSIG key, `[algorithm:]name:base64secret`, repeatable.
-        ///
-        /// Holding the key is an identity; coming from an address is not. A
-        /// request signed with a key named here may transfer a zone whatever its
-        /// source address, and any signed request gets a signed answer
-        /// (RFC 8945). Algorithm defaults to hmac-sha256.
-        #[arg(long, value_name = "[ALG:]NAME:SECRET")]
-        tsig_key: Vec<String>,
-        /// A secondary to notify when a zone changes: `addr[:port]`, repeatable.
-        ///
-        /// Without this a secondary hears about a change when its refresh timer
-        /// next goes off, which for a typical SOA is hours later. A NOTIFY says so
-        /// at once (RFC 1996). Sent on zone load — at startup and on SIGHUP — for
-        /// every zone whose serial moved forward.
-        #[arg(long, value_name = "ADDR[:PORT]")]
-        also_notify: Vec<String>,
-    },
-    Udp {
-        #[arg(long, default_value = "0.0.0.0")]
-        host: String,
-        #[arg(long, default_value = "53")]
-        port: u16,
-        #[arg(long)]
-        zone_file: Option<String>,
-        #[arg(long)]
-        zone_dir: Option<String>,
-        /// Response bytes per second, per client address. 0 turns the budget off.
-        ///
-        /// Meters what leaves rather than what arrives, because that is what an
-        /// amplification attack is made of. Only on the UDP subcommand: a TCP
-        /// query has completed a handshake, so there is nobody to reflect at.
-        #[arg(long, value_name = "BYTES_PER_SEC", default_value = "8192")]
-        response_rate: u32,
-        /// A TSIG key, `[algorithm:]name:base64secret`, repeatable.
-        ///
-        /// A signed query gets a signed answer (RFC 8945), which is what lets a
-        /// client know the reply came from someone holding the key rather than
-        /// from whatever answered first.
-        #[arg(long, value_name = "[ALG:]NAME:SECRET")]
-        tsig_key: Vec<String>,
-        /// A secondary to notify when a zone changes: `addr[:port]`, repeatable.
-        ///
-        /// Without this a secondary hears about a change when its refresh timer
-        /// next goes off, which for a typical SOA is hours later. A NOTIFY says so
-        /// at once (RFC 1996). Sent on zone load — at startup and on SIGHUP — for
-        /// every zone whose serial moved forward.
-        #[arg(long, value_name = "ADDR[:PORT]")]
-        also_notify: Vec<String>,
-    },
+    /// Address to listen on, for both transports.
+    #[arg(long, default_value = "0.0.0.0")]
+    host: String,
+    /// Port to listen on, for both transports.
+    #[arg(long, default_value = "53")]
+    port: u16,
+    /// A single zone file. The origin comes from the file name.
+    #[arg(long)]
+    zone_file: Option<String>,
+    /// A directory of `.zone` files.
+    #[arg(long)]
+    zone_dir: Option<String>,
+    /// Who may request a zone transfer: an address or CIDR prefix, repeatable.
+    ///
+    /// Nobody, unless this says otherwise. An AXFR is the whole zone in one
+    /// answer, so it is the one query that has to be allowed by list. Applies to
+    /// TCP, because AXFR is defined over TCP alone (RFC 5936 §4.2).
+    #[arg(long, value_name = "ADDR|CIDR")]
+    allow_transfer: Vec<String>,
+    /// A TSIG key, `[algorithm:]name:base64secret`, repeatable.
+    ///
+    /// Holding the key is an identity; coming from an address is not. A request
+    /// signed with a key named here may transfer a zone whatever its source
+    /// address, and any signed request gets a signed answer (RFC 8945). The
+    /// algorithm defaults to hmac-sha256.
+    #[arg(long, value_name = "[ALG:]NAME:SECRET")]
+    tsig_key: Vec<String>,
+    /// A secondary to notify when a zone changes: `addr[:port]`, repeatable.
+    ///
+    /// Without this a secondary hears about a change when its refresh timer next
+    /// goes off, which for a typical SOA is hours later. A NOTIFY says so at once
+    /// (RFC 1996). Sent on zone load — at startup and on SIGHUP — for every zone
+    /// whose serial moved forward.
+    #[arg(long, value_name = "ADDR[:PORT]")]
+    also_notify: Vec<String>,
+    /// A zone to replicate: `zone@master[:port][#tsig-key-name]`, repeatable.
+    ///
+    /// Makes this server a *secondary* for that zone: it asks the master for the
+    /// SOA on the zone's own REFRESH timer, transfers when the serial has moved,
+    /// and stops serving the zone entirely once EXPIRE has passed without
+    /// contact. Repeat with the same zone to give it more than one master.
+    ///
+    /// Requires `--zone-dir`, because a fetched zone has to be written somewhere:
+    /// the file lands there under the zone's name and is loaded by the ordinary
+    /// path on the next start.
+    #[arg(long, value_name = "ZONE@MASTER[:PORT][#KEY]")]
+    secondary: Vec<String>,
+    /// Response bytes per second, per client address. 0 turns the budget off.
+    ///
+    /// Meters what leaves rather than what arrives, because that is what an
+    /// amplification attack is made of. Applies to UDP: a TCP query has completed
+    /// a handshake, so there is nobody to reflect at.
+    #[arg(long, value_name = "BYTES_PER_SEC", default_value = "8192")]
+    response_rate: u32,
 }
 
 /// Zone source: either a single file or a directory of zone files
@@ -196,6 +192,32 @@ fn make_response(
             continue;
         }
 
+        // An IXFR over UDP is different: it is *expected*, and RFC 1995 §2 gives
+        // the answer for one that will not fit in a datagram — a single SOA of
+        // the server's current version, which tells the client to come back over
+        // TCP. Answering that way always is a deliberate choice rather than a
+        // limitation: the ACL, the TSIG session and the multi-message packing all
+        // live on the TCP path, and duplicating them here to serve the small
+        // subset of increments that fit a datagram would be a second
+        // implementation of the interesting parts. The SOA discloses nothing an
+        // ordinary SOA query does not, so it needs no ACL of its own.
+        if query.qtype == record_types::IXFR {
+            if let Some(zone) = find_zone_for_query(&query.qname, zone_map) {
+                for soa in zone.query(zone.origin(), record_types::SOA) {
+                    response.answers.push(ResourceRecord {
+                        name: zone.origin().to_string(),
+                        class: soa.class,
+                        ttl: soa.ttl,
+                        rdata: soa.rdata.clone(),
+                    });
+                }
+            } else {
+                response.rcode = ResponseCode::Refused;
+                response.authoritive = false;
+            }
+            continue;
+        }
+
         // Find the matching zone for this query
         let zone = find_zone_for_query(&query.qname, zone_map);
         
@@ -247,8 +269,21 @@ fn make_response(
 
             metrics.increment_query_counter();
         } else {
-            // No zone found for this query - NXDOMAIN
-            response.rcode = ResponseCode::NoSuchDomain;
+            // A zone we do not serve is REFUSED, not NXDOMAIN, and the two are
+            // not interchangeable. NXDOMAIN is an assertion *about the DNS* —
+            // this name does not exist anywhere — which we have no standing to
+            // make about a zone we hold nothing for; a resolver believes it and
+            // caches it (RFC 2308), so the lie propagates. REFUSED says the
+            // truth, that this server will not answer, and sends the resolver to
+            // the other nameservers in the delegation. It is what BIND, NSD and
+            // Knot all answer here.
+            //
+            // This matters more now that a zone can be *withdrawn*: an expired
+            // secondary that answered NXDOMAIN would take its zone off the
+            // internet for as long as anything cached the answer, which is the
+            // opposite of what stopping serving it is for.
+            response.rcode = ResponseCode::Refused;
+            response.authoritive = false;
             metrics.increment_cache_misses();
         }
     }
@@ -305,9 +340,13 @@ fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> 
     candidates.first().copied()
 }
 
-/// The shared state a TCP connection needs to answer queries. Bundled so a
-/// connection task clones one `Arc` instead of five.
-struct TcpServer {
+/// Everything both transports answer from. One of these per process, so a
+/// connection task or a datagram task clones a single `Arc`.
+///
+/// Shared deliberately. A client's rate limit should not reset because it switched
+/// transport, and the metrics are one server's, not one socket's — with a process
+/// per transport they were two sets that each saw half the traffic.
+struct Server {
     zone_map: Arc<RwLock<HashMap<String, Zone>>>,
     rate_limiter: Arc<RateLimiter>,
     validator: Arc<RequestValidator>,
@@ -317,15 +356,27 @@ struct TcpServer {
     transfer_acl: Arc<TransferAcl>,
     /// The TSIG keys we know. Holding one is an identity; an address is not.
     tsig_keys: Arc<TsigKeyring>,
+    /// Bytes-per-second budget for UDP replies. Not applied to TCP: a query that
+    /// completed a handshake has an address nobody can be reflecting at.
+    response_limiter: Arc<ResponseLimiter>,
+    /// The zones we replicate, so a NOTIFY can be told from a plausible one.
+    secondaries: Secondaries,
+    /// What changed between the versions of each zone we have held, so an IXFR
+    /// can answer with the difference rather than the whole zone. Derived from
+    /// the zone map, so the two are only ever updated together.
+    deltas: Arc<RwLock<DeltaLog>>,
 }
 
-async fn tcp_main(
+/// Bind both transports and serve them from one process.
+async fn serve(
     addr: &str,
     zone_map: Arc<RwLock<HashMap<String, Zone>>>,
     transfer_acl: TransferAcl,
     tsig_keys: TsigKeyring,
+    response_rate: u32,
+    secondaries: Secondaries,
+    deltas: Arc<RwLock<DeltaLog>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(addr).await?;
     let transfers = if transfer_acl.is_empty() && tsig_keys.is_empty() {
         "refused (no --allow-transfer, no --tsig-key)".to_string()
     } else {
@@ -335,7 +386,18 @@ async fn tcp_main(
             tsig_keys.len()
         )
     };
-    let server = Arc::new(TcpServer {
+    let budget = if response_rate == 0 {
+        "off".to_string()
+    } else {
+        format!("{response_rate} bytes/s per client")
+    };
+
+    // Bind both before announcing anything, so a port conflict fails here rather
+    // than after one transport is already up.
+    let socket = Arc::new(UdpSocket::bind(addr).await?);
+    let listener = TcpListener::bind(addr).await?;
+
+    let server = Arc::new(Server {
         zone_map,
         rate_limiter: Arc::new(RateLimiter::with_defaults()),
         validator: Arc::new(RequestValidator::with_defaults()),
@@ -343,9 +405,34 @@ async fn tcp_main(
         metrics: Arc::new(DnsMetrics::new()),
         transfer_acl: Arc::new(transfer_acl),
         tsig_keys: Arc::new(tsig_keys),
+        response_limiter: Arc::new(if response_rate == 0 {
+            ResponseLimiter::disabled()
+        } else {
+            ResponseLimiter::new(response_rate, response_rate.saturating_mul(4), 2)
+        }),
+        secondaries,
+        deltas,
     });
-    println!("TCP DNS server listening on {addr}, zone transfer: {transfers}");
+    println!(
+        "rdnsd listening on {addr} (UDP+TCP), zone transfer: {transfers}, \
+         response budget: {budget}, TSIG keys: {}",
+        server.tsig_keys.len()
+    );
 
+    let udp = tokio::spawn(udp_loop(socket, server.clone()));
+    let tcp = tokio::spawn(tcp_loop(listener, server));
+
+    // Neither loop returns in normal operation. Whichever fails first takes the
+    // process down rather than leaving us serving one transport and not the other.
+    tokio::select! {
+        r = udp => r??,
+        r = tcp => r??,
+    }
+    Ok(())
+}
+
+/// Accept connections and serve each in its own task.
+async fn tcp_loop(listener: TcpListener, server: Arc<Server>) -> Result<(), std::io::Error> {
     let permits = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -363,7 +450,7 @@ async fn tcp_main(
     }
 }
 
-impl TcpServer {
+impl Server {
     /// Serve one connection until it goes idle, closes, or misbehaves.
     ///
     /// A connection carries any number of queries (RFC 7766 §6.2.1), and they
@@ -531,10 +618,13 @@ impl TcpServer {
         };
 
         // A transfer is answered here rather than in `make_response`: it is a
-        // sequence of messages, it is gated on an ACL, and it is the only query
-        // whose answer is the entire zone.
-        if msg.queries.first().map(|q| q.qtype) == Some(record_types::AXFR) {
-            return self.answer_axfr(&msg, peer, session.as_mut(), now).await;
+        // sequence of messages, it is gated on an ACL, and it is the only kind of
+        // query whose answer can be the entire zone.
+        if matches!(
+            msg.queries.first().map(|q| q.qtype),
+            Some(record_types::AXFR) | Some(record_types::IXFR)
+        ) {
+            return self.answer_transfer(&msg, peer, session.as_mut(), now).await;
         }
 
         // Hold the zone lock only as long as it takes to build and serialize the
@@ -543,7 +633,7 @@ impl TcpServer {
         let bytes = {
             let zones = self.zone_map.read().await;
             let resp = if msg.opcode == OpCode::Notify {
-                notify_reply(&msg, &zones, peer)
+                notify_reply(&msg, &zones, &self.secondaries, peer)
             } else {
                 make_response(&msg, &zones, &self.metrics)
             };
@@ -580,7 +670,7 @@ impl TcpServer {
     /// knowing it happened matters as much as whether it was permitted — a
     /// refused one is a probe, and an allowed one is a copy of the zone leaving
     /// the building.
-    async fn answer_axfr(
+    async fn answer_transfer(
         &self,
         msg: &DnsMessage,
         peer: SocketAddr,
@@ -593,22 +683,28 @@ impl TcpServer {
             .first()
             .map(|q| q.qname.clone())
             .unwrap_or_default();
+        let incremental = msg.queries.first().map(|q| q.qtype) == Some(record_types::IXFR);
+        let kind = if incremental { "IXFR" } else { "AXFR" };
 
         // Two ways to be allowed, and they are not equivalent. A verified TSIG is
         // proof that the peer holds a secret we gave it; an address is a claim the
         // network makes on its behalf. Either grants the transfer, and which one
         // did is worth writing down.
+        //
+        // An IXFR is gated identically, and for the identical reason: it may
+        // *answer* with the whole zone (RFC 1995 §4), so a policy that let it
+        // through would be no policy at all.
         let authenticated_by = session.as_ref().map(|s| s.key_name().to_string());
         if authenticated_by.is_none() && !self.transfer_acl.allows(ip) {
             self.logger.log_error(
                 ip,
-                &format!("AXFR of {qname} refused: {ip} has no key and is not in --allow-transfer"),
+                &format!("{kind} of {qname} refused: {ip} has no key and is not in --allow-transfer"),
             );
-            println!("AXFR of {qname} from {ip}: REFUSED (no TSIG key, not in --allow-transfer)");
+            println!("{kind} of {qname} from {ip}: REFUSED (no TSIG key, not in --allow-transfer)");
             return self.transfer_error(msg, ResponseCode::Refused, ip);
         }
 
-        // An AXFR names a zone apex, not any name within it: transferring
+        // A transfer names a zone apex, not any name within it: transferring
         // example.com. because www.example.com. was asked for would hand over a
         // zone nobody named. So this is an exact match on the origin, not the
         // enclosing-zone lookup an ordinary query does.
@@ -616,13 +712,36 @@ impl TcpServer {
             let zones = self.zone_map.read().await;
             let apex = absolute_name(&qname);
             let Some(zone) = zones.values().find(|z| z.origin().eq_ignore_ascii_case(&apex)) else {
-                println!("AXFR of {qname} from {ip}: NOTAUTH (not a zone served here)");
+                println!("{kind} of {qname} from {ip}: NOTAUTH (not a zone served here)");
                 return self.transfer_error(msg, ResponseCode::NotAuthorized, ip);
             };
-            match axfr_messages(msg, zone) {
+            let built = if incremental {
+                // The delta log is read under the zone lock, so the increments
+                // and the zone they are increments *of* are the same version.
+                // Taken separately, a reload between the two reads would produce
+                // a chain that does not match the SOA framing it is wrapped in.
+                let deltas = self.deltas.read().await;
+                ixfr_response(msg, zone, &deltas).map(|response| {
+                    match &response {
+                        IxfrResponse::UpToDate(_) => {
+                            println!("IXFR of {qname} from {ip}: already current, sending one SOA")
+                        }
+                        IxfrResponse::Incremental { steps, records, .. } => println!(
+                            "IXFR of {qname} to {ip}: {records} record(s) across {steps} version(s)"
+                        ),
+                        IxfrResponse::FullTransfer { why, .. } => println!(
+                            "IXFR of {qname} to {ip}: sending the whole zone instead ({why})"
+                        ),
+                    }
+                    response.messages()
+                })
+            } else {
+                axfr_messages(msg, zone)
+            };
+            match built {
                 Ok(messages) => messages,
                 Err(e) => {
-                    self.logger.log_error(ip, &format!("AXFR of {qname}: {e}"));
+                    self.logger.log_error(ip, &format!("{kind} of {qname}: {e}"));
                     return self.transfer_error(msg, ResponseCode::ServerFailure, ip);
                 }
             }
@@ -639,7 +758,7 @@ impl TcpServer {
                     // a stream that stopped early from one that finished, so give
                     // up on the whole thing rather than send a prefix of it.
                     self.logger
-                        .log_error(ip, &format!("AXFR of {qname}: serialization error: {e}"));
+                        .log_error(ip, &format!("{kind} of {qname}: serialization error: {e}"));
                     return self.transfer_error(msg, ResponseCode::ServerFailure, ip);
                 }
             };
@@ -651,7 +770,7 @@ impl TcpServer {
                     Ok(signed) => signed,
                     Err(e) => {
                         self.logger
-                            .log_error(ip, &format!("AXFR of {qname}: TSIG signing failed: {e}"));
+                            .log_error(ip, &format!("{kind} of {qname}: TSIG signing failed: {e}"));
                         return self.transfer_error(msg, ResponseCode::ServerFailure, ip);
                     }
                 },
@@ -665,7 +784,7 @@ impl TcpServer {
             None => format!("address {ip}"),
         };
         println!(
-            "AXFR of {qname} to {ip}: {records} records in {} message(s), authenticated by {how}",
+            "{kind} of {qname} to {ip}: {records} records in {} message(s), authenticated by {how}",
             frames.len()
         );
         frames
@@ -749,13 +868,21 @@ fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
 
 /// Answer a NOTIFY (RFC 1996).
 ///
-/// This server is a primary: it serves zone files, has no secondary role, no
-/// master to be told by, and nothing to fetch if it were. So the honest answer is
-/// NOTAUTH — *I am not a secondary for that zone* — whether or not the zone is one
-/// we serve, and the attempt is logged either way. A NOTIFY arriving from an
-/// unexpected source is worth seeing; RFC 1996 §3.10 has a secondary log exactly
-/// that, and the same reasoning applies to a primary being told news about its own
-/// zone.
+/// Three outcomes, and which one applies is a question about *this* zone:
+///
+/// - **A zone we replicate, from one of its masters** — the message is what it
+///   claims to be. NOERROR, and the refresh task is woken so the check happens
+///   now instead of when the REFRESH timer next goes off. The serial in the
+///   message is not acted on: it is unauthenticated, and the refresh does its own
+///   comparison against what the master answers.
+/// - **A zone we replicate, from anywhere else** — REFUSED, a policy decision
+///   (§3.10 has a secondary log exactly this). A NOTIFY is a spoofable datagram
+///   that costs its recipient a transfer, so who may send one is a list, the same
+///   way an AXFR's is.
+/// - **Anything else** — NOTAUTH, meaning *I am not a secondary for that zone*,
+///   which is the truth for a zone we hold as a primary and for one we have never
+///   heard of alike. The two are distinguished in the log rather than in the
+///   rcode, because they are the same answer to the sender.
 ///
 /// What matters as much is that it is answered *as a NOTIFY*: same opcode, the
 /// question echoed, no data (§4.7). Before the opcode decode was fixed this
@@ -764,9 +891,30 @@ fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
 fn notify_reply(
     msg: &DnsMessage,
     zone_map: &HashMap<String, Zone>,
+    secondaries: &Secondaries,
     peer: SocketAddr,
 ) -> DnsMessage {
     let zone = notify::notified_zone(msg).unwrap_or_default();
+    let key = absolute_name(&zone).to_lowercase();
+
+    if let Some(replicated) = secondaries.get(&key) {
+        if replicated.masters.contains(&peer.ip()) {
+            // `notify_one` rather than waking every waiter: it leaves a permit
+            // for a task that is mid-transfer right now, so a NOTIFY that
+            // arrives at a busy moment is not simply lost.
+            for wake in &replicated.wake {
+                wake.notify_one();
+            }
+            println!("NOTIFY for {zone} from {peer}: refreshing now");
+            return notify::notify_response(msg, ResponseCode::Ok);
+        }
+        println!(
+            "NOTIFY for {zone} from {peer}: REFUSED (not one of its masters — \
+             a NOTIFY costs its recipient a transfer)"
+        );
+        return notify::notify_response(msg, ResponseCode::Refused);
+    }
+
     let ours = zone_map
         .values()
         .any(|z| z.origin().eq_ignore_ascii_case(&absolute_name(&zone)));
@@ -788,50 +936,59 @@ fn absolute_name(name: &str) -> String {
     }
 }
 
-async fn udp_main(
-    addr: &str,
-    zone_map: Arc<RwLock<HashMap<String, Zone>>>,
-    response_rate: u32,
-    tsig_keys: TsigKeyring,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let socket = Arc::new(UdpSocket::bind(&addr).await?);
-    let rate_limiter = Arc::new(RateLimiter::with_defaults());
-    // The query limiter counts requests; this one counts the bytes going back,
-    // which is what an amplification attack is measured in.
-    let response_limiter = Arc::new(if response_rate == 0 {
-        ResponseLimiter::disabled()
-    } else {
-        ResponseLimiter::new(response_rate, response_rate.saturating_mul(4), 2)
-    });
-    let validator = Arc::new(RequestValidator::with_defaults());
-    let logger = Arc::new(QueryLogger::new());
-    let metrics = Arc::new(DnsMetrics::new());
-    let tsig_keys = Arc::new(tsig_keys);
-    let budget = if response_rate == 0 {
-        "off".to_string()
-    } else {
-        format!("{response_rate} bytes/s per client")
-    };
-    println!(
-        "UDP DNS server listening on {addr}, response budget: {budget}, TSIG keys: {}",
-        tsig_keys.len()
-    );
+/// Whether a receive error is an ICMP report about a *previous* datagram rather
+/// than anything wrong with this socket.
+///
+/// A UDP server that replies to a client which has already gone away gets an
+/// ICMP port-unreachable back, and Windows reports it as an error on the socket's
+/// **next** `recv_from` (WSAECONNRESET; `WSAENETRESET` for a TTL expiry). Unix
+/// only does this on a connected socket, which is why this shape of bug is
+/// invisible there and fatal here.
+///
+/// It was fatal here in the most literal sense: `recv_from` returning an error
+/// ended the UDP loop, which took the whole process down — so any client that
+/// closed its socket before our reply landed could stop the server. A stray ICMP
+/// report says nothing about the socket's health and the only correct response is
+/// to carry on receiving. Errors that are not this are still fatal, because a
+/// server that cannot receive is not serving.
+fn is_stray_icmp(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+    )
+}
 
+/// Receive datagrams and answer each in its own task.
+async fn udp_loop(socket: Arc<UdpSocket>, server: Arc<Server>) -> Result<(), std::io::Error> {
     let mut buf = vec![0; 4096];
 
     loop {
-        let (size, peer) = socket.recv_from(&mut buf).await?;
-        let zone_map = zone_map.clone();
+        let (size, peer) = match socket.recv_from(&mut buf).await {
+            Ok(received) => received,
+            Err(e) if is_stray_icmp(&e) => continue,
+            Err(e) => return Err(e),
+        };
         let socket = socket.clone();
-        let rate_limiter = rate_limiter.clone();
-        let response_limiter = response_limiter.clone();
-        let tsig_keys = tsig_keys.clone();
-        let validator = validator.clone();
-        let logger = logger.clone();
-        let metrics = metrics.clone();
+        let server = server.clone();
         let packet = buf[0..size].to_vec();
 
         tokio::spawn(async move {
+            // Named for the body below, which was written against separate Arcs
+            // when this loop owned its own copy of everything.
+            let Server {
+                zone_map,
+                rate_limiter,
+                validator,
+                logger,
+                metrics,
+                tsig_keys,
+                response_limiter,
+                secondaries,
+                ..
+            } = &*server;
             // Rate limiting check
             if !rate_limiter.should_allow(peer.ip()) {
                 logger.log_rate_limited(peer.ip());
@@ -864,7 +1021,7 @@ async fn udp_main(
                 // is signed back (RFC 8945). A rejected one gets NOTAUTH and a
                 // TSIG saying which of BADKEY/BADSIG/BADTIME it was.
                 let now = tsig::now();
-                let mut session = match tsig::check_request(&packet, &tsig_keys, now) {
+                let mut session = match tsig::check_request(&packet, tsig_keys, now) {
                     TsigCheck::Unsigned => None,
                     TsigCheck::Verified(session) => Some(session),
                     TsigCheck::Rejected(rejection) => {
@@ -917,9 +1074,9 @@ async fn udp_main(
                 let serialized = {
                     let zones = zone_map.read().await;
                     let resp = if msg.opcode == OpCode::Notify {
-                        notify_reply(&msg, &zones, peer)
+                        notify_reply(&msg, &zones, secondaries, peer)
                     } else {
-                        make_response(&msg, &zones, &metrics)
+                        make_response(&msg, &zones, metrics)
                     };
                     // Honor the client's EDNS0 UDP payload size (512 if no EDNS);
                     // truncates with TC=1 if the response is larger.
@@ -997,6 +1154,7 @@ async fn udp_main(
 #[cfg(unix)]
 fn spawn_signal_handler(
     zone_map: Arc<RwLock<HashMap<String, Zone>>>,
+    deltas: Arc<RwLock<DeltaLog>>,
     source: ZoneSource,
     notify_targets: Vec<SocketAddr>,
     announced: Vec<(String, u32)>,
@@ -1009,7 +1167,11 @@ fn spawn_signal_handler(
             while signals.next().await.is_some() {
                 match load_zones_from_source(&source_clone).await {
                     Ok(new_zones) => {
-                        *zone_map_clone.write().await = new_zones;
+                        // A reload is a version step like any other: the
+                        // difference from what we were serving is what an IXFR
+                        // will answer with, and this is the only moment both
+                        // versions exist.
+                        install_all_zones(&zone_map_clone, &deltas, new_zones).await;
                         println!("Zones reloaded via SIGHUP");
                         instrumentation::trace_info("zones_reloaded", "SIGHUP signal");
                         // The point of reloading is that something changed, so
@@ -1031,6 +1193,7 @@ fn spawn_signal_handler(
 #[cfg(not(unix))]
 fn spawn_signal_handler(
     _zone_map: Arc<RwLock<HashMap<String, Zone>>>,
+    _deltas: Arc<RwLock<DeltaLog>>,
     _source: ZoneSource,
     _notify_targets: Vec<SocketAddr>,
     _announced: Vec<(String, u32)>,
@@ -1113,6 +1276,32 @@ async fn announce_zones(
     current
 }
 
+/// Tell the configured secondaries that a zone *we* replicate has moved.
+///
+/// RFC 1996 §3.2's "master" is whoever serves the zone to someone, which a
+/// secondary in the middle of a tree is. Without this, `announce_zones` covers
+/// only the moments a *primary* learns of a change — startup and SIGHUP — while a
+/// secondary learns of one by transferring it and says nothing, so the first
+/// level of a tree updates at once and every level below it waits out a refresh
+/// timer.
+///
+/// Spawned rather than awaited for the same reason the primary's announcements
+/// are: an unanswered NOTIFY takes seconds to give up on, and a refresh should
+/// not be held behind the network to tell somebody about work it has finished.
+fn announce_transfer(
+    zone: &str,
+    serial: u32,
+    soa: Option<ResourceRecord>,
+    targets: &[SocketAddr],
+) {
+    for target in targets {
+        let (zone, soa, target) = (zone.to_string(), soa.clone(), *target);
+        tokio::spawn(async move {
+            send_notify(&zone, serial, soa, target).await;
+        });
+    }
+}
+
 /// Send one NOTIFY, retrying until it is acknowledged (RFC 1996 §3.6).
 ///
 /// Any rcode is an acknowledgement: a secondary answering NOTAUTH has still
@@ -1174,6 +1363,450 @@ async fn send_notify(
     );
 }
 
+// ---------------------------------------------------------------------------
+// The secondary role
+// ---------------------------------------------------------------------------
+
+/// Replace one zone, recording what changed.
+///
+/// The only way a zone should ever enter the map once the server is running.
+/// Both halves happen under the same pair of locks and in the same call, because
+/// the delta log is *derived* from the zone map: a swap that skipped it would
+/// leave us offering an IXFR chain that does not describe the zone we serve — and
+/// a secondary applying that chain would end up with a zone that never existed,
+/// holding a serial saying it is current.
+async fn install_zone(
+    zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
+    deltas: &Arc<RwLock<DeltaLog>>,
+    zone: Zone,
+) {
+    let mut zones = zone_map.write().await;
+    let mut log = deltas.write().await;
+
+    let key = zones
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(zone.origin()))
+        .cloned();
+    let previous = key.as_ref().and_then(|k| zones.get(k));
+    log.note_change(previous, &zone);
+
+    if let Some(key) = key {
+        zones.remove(&key);
+    }
+    zones.insert(zone.origin().to_string(), zone);
+}
+
+/// Replace every zone, as a reload does, recording what changed in each.
+///
+/// A zone that has gone from the configuration takes its history with it: we no
+/// longer serve it, so we have no increments of it to offer.
+// Reached only from the SIGHUP handler, which exists on Unix — the reload it
+// serves has no trigger on Windows, so there it is genuinely unreachable rather
+// than merely unused.
+#[cfg_attr(not(unix), allow(dead_code))]
+async fn install_all_zones(
+    zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
+    deltas: &Arc<RwLock<DeltaLog>>,
+    new_zones: HashMap<String, Zone>,
+) {
+    let mut zones = zone_map.write().await;
+    let mut log = deltas.write().await;
+
+    for old_name in zones.keys() {
+        if !new_zones
+            .values()
+            .any(|z| z.origin().eq_ignore_ascii_case(old_name))
+        {
+            log.forget(old_name);
+        }
+    }
+    for zone in new_zones.values() {
+        let previous = zones
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(zone.origin()))
+            .and_then(|k| zones.get(k));
+        log.note_change(previous, zone);
+    }
+
+    *zones = new_zones;
+}
+
+/// One replicated zone, as a NOTIFY needs to see it.
+struct ReplicatedZone {
+    /// The addresses a NOTIFY for this zone is believed from — the masters it is
+    /// configured to come from, and nobody else.
+    masters: Vec<IpAddr>,
+    /// One per refresh task, since a zone may have several masters and each is
+    /// checked on its own timer.
+    wake: Vec<Arc<Notify>>,
+}
+
+/// Replicated zones by lowercased origin.
+type Secondaries = Arc<HashMap<String, ReplicatedZone>>;
+
+/// What every refresh task shares with the server and with each other.
+///
+/// Bundled rather than passed as six parameters because they are one thing —
+/// the state a replicated zone is maintained *in* — and because the pieces are
+/// not independently choosable: the delta log is derived from the zone map, and
+/// the sidecar lives in the zone directory. A signature that let a caller supply
+/// four of them and forget the fifth would be inviting exactly the drift the
+/// swap helpers exist to prevent.
+#[derive(Clone)]
+struct Replication {
+    zone_map: Arc<RwLock<HashMap<String, Zone>>>,
+    deltas: Arc<RwLock<DeltaLog>>,
+    /// One file, so one mutex: the rule that made step 1 of #7 necessary applies
+    /// inside a process too.
+    state: Arc<Mutex<StateFile>>,
+    zone_dir: PathBuf,
+    /// Who to tell when a zone we replicate moves — we are its master to them.
+    notify_targets: Vec<SocketAddr>,
+}
+
+/// Start a refresh task per (zone, master), and return what a NOTIFY needs to
+/// find them.
+///
+/// The state file is shared behind one mutex because it is one file, and the
+/// rule that made step 1 of this work necessary applies just as much inside a
+/// process: one writer.
+fn spawn_secondaries(
+    specs: Vec<MasterSpec>,
+    keys: &TsigKeyring,
+    replication: Replication,
+) -> Result<Secondaries, Box<dyn std::error::Error>> {
+    let mut registry: HashMap<String, ReplicatedZone> = HashMap::new();
+
+    for spec in specs {
+        // A key named but not defined is a configuration error, not a reason to
+        // transfer unsigned: the operator asked for authentication and would
+        // have no way to see that they did not get it.
+        let key = match &spec.key_name {
+            Some(name) => Some(
+                keys.get(&absolute_name(name), TsigAlgorithm::HmacSha256)
+                    .or_else(|| {
+                        [
+                            TsigAlgorithm::HmacSha1,
+                            TsigAlgorithm::HmacSha384,
+                            TsigAlgorithm::HmacSha512,
+                        ]
+                        .into_iter()
+                        .find_map(|alg| keys.get(&absolute_name(name), alg))
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "--secondary names TSIG key {name:?}, which no --tsig-key defines"
+                        )
+                    })?
+                    .clone(),
+            ),
+            None => None,
+        };
+
+        let wake = Arc::new(Notify::new());
+        let entry = registry
+            .entry(spec.zone.to_lowercase())
+            .or_insert_with(|| ReplicatedZone {
+                masters: Vec::new(),
+                wake: Vec::new(),
+            });
+        entry.masters.push(spec.master.ip());
+        entry.wake.push(wake.clone());
+
+        println!(
+            "secondary for {} from {}{}",
+            spec.zone,
+            spec.master,
+            match &spec.key_name {
+                Some(name) => format!(" signed with {name}"),
+                None => String::new(),
+            }
+        );
+
+        tokio::spawn(secondary_loop(spec, key, replication.clone(), wake));
+    }
+
+    Ok(Arc::new(registry))
+}
+
+/// Keep one zone in step with one master, forever.
+///
+/// The cycle is RFC 1035 §4.3.5's: ask for the SOA, compare serials, transfer if
+/// behind, then sleep on REFRESH — or on RETRY if anything failed, with a NOTIFY
+/// cutting the wait short. What makes it a *replica* rather than a cache is the
+/// third timer: out of contact past EXPIRE, the zone stops being served at all.
+async fn secondary_loop(
+    spec: MasterSpec,
+    key: Option<TsigKey>,
+    replication: Replication,
+    wake: Arc<Notify>,
+) {
+    // What the EXPIRE clock counts from when we have never reached the master:
+    // process start. Not "forever ago", which would withdraw a zone we hold
+    // before ever trying, and not "never expires", which would serve a copy of
+    // unknown age indefinitely because we happened to restart.
+    let started_at = current_unix_timestamp();
+
+    loop {
+        let result = refresh_once(&spec, key.as_ref(), &replication).await;
+
+        // The timers are read *after* the refresh, not before, because the
+        // refresh may have just installed the zone that defines them. Read first,
+        // the very first transfer of a zone is followed by the default hour's
+        // wait instead of the REFRESH the zone actually asks for — which is
+        // invisible in a test that only checks the transfer happened, and was
+        // caught by watching a zone with a one-minute REFRESH sit there for an
+        // hour.
+        let timers = zone_timers(&replication.zone_map, &spec.zone).await;
+
+        let wait = match result {
+            Ok(outcome) => {
+                println!("secondary {}: {outcome} (from {})", spec.zone, spec.master);
+                timers.after_success()
+            }
+            Err(e) => {
+                eprintln!("secondary {} from {}: {e}", spec.zone, spec.master);
+                expire_if_out_of_contact(&spec, &replication, started_at, timers).await;
+                timers.after_failure()
+            }
+        };
+
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = wake.notified() => {}
+        }
+    }
+}
+
+/// The timers the zone we currently hold asks for, or the defaults if we hold
+/// none — a zone we have never fetched has no SOA to obey.
+async fn zone_timers(zone_map: &Arc<RwLock<HashMap<String, Zone>>>, zone: &str) -> RefreshTimers {
+    zone_map
+        .read()
+        .await
+        .values()
+        .find(|z| z.origin().eq_ignore_ascii_case(zone))
+        .and_then(RefreshTimers::from_zone)
+        .unwrap_or_default()
+}
+
+/// One refresh: probe, compare, and transfer if there is anything to transfer.
+async fn refresh_once(
+    spec: &MasterSpec,
+    key: Option<&TsigKey>,
+    replication: &Replication,
+) -> Result<String, String> {
+    let Replication {
+        zone_map,
+        deltas,
+        state,
+        zone_dir,
+        notify_targets,
+    } = replication;
+    // A clone rather than a borrow: an incremental transfer applies its changes
+    // to this version, and holding the read lock across a network round trip
+    // would block every reload and every swap for the length of the transfer.
+    let base = zone_map
+        .read()
+        .await
+        .values()
+        .find(|z| z.origin().eq_ignore_ascii_case(&spec.zone))
+        .cloned();
+    let held = base.as_ref().and_then(Zone::serial);
+
+    let remote = xfr::fetch_soa(spec.master, &spec.zone, key).await?;
+    let now = current_unix_timestamp();
+
+    // Reaching the master is what the EXPIRE clock resets on, whether or not
+    // there was anything new to fetch — the zone is confirmed current, which is
+    // exactly what "not stale" means.
+    if let Some(held) = held {
+        if !is_newer(remote, held) {
+            record_state(state, spec, held, now)?;
+            return Ok(format!("serial {held} is current"));
+        }
+    }
+
+    // Ask for the difference when we have a version to differ from, and for the
+    // whole zone when we do not. The master may answer either request with the
+    // whole zone (RFC 1995 §4), so this is a preference rather than a demand —
+    // which is why there is one code path below and not two.
+    let mut note = String::new();
+    let fetched = match &base {
+        Some(base) => match xfr::fetch_changes(spec.master, base, key).await? {
+            xfr::IxfrOutcome::UpToDate(serial) => {
+                // The SOA probe said otherwise a moment ago, so the master
+                // changed its mind between the two questions. Nothing to do, and
+                // the next refresh will see the newer serial.
+                record_state(state, spec, serial, now)?;
+                return Ok(format!("serial {serial} is current (the master says so)"));
+            }
+            xfr::IxfrOutcome::Updated {
+                zone,
+                steps,
+                missing_deletions,
+            } => {
+                note = format!(", {steps} incremental step(s)");
+                if missing_deletions > 0 {
+                    // Worth saying out loud: it means our copy and the master's
+                    // had already diverged. Not worth failing over — the records
+                    // are meant to be gone either way.
+                    note.push_str(&format!(
+                        ", {missing_deletions} deletion(s) we did not hold"
+                    ));
+                }
+                zone
+            }
+            xfr::IxfrOutcome::FullTransfer(zone) => {
+                note = ", sent in full".to_string();
+                zone
+            }
+        },
+        None => xfr::fetch_zone(spec.master, &spec.zone, key).await?,
+    };
+
+    let serial = fetched
+        .serial()
+        .ok_or_else(|| "the transferred zone has no SOA".to_string())?;
+
+    // Persist before serving. Both orders are safe — a crash between them costs
+    // at most a refetch — but this way the state line, written last, is only ever
+    // true after both the file and memory agree with it.
+    let path = zone_file_path(zone_dir, &spec.zone);
+    write_zone_file(&fetched, &path)?;
+
+    let count = fetched.records().len();
+    // The swap is a whole-zone replacement under the write lock: readers see the
+    // old zone or the new one and never a half-applied transfer. Nothing removes
+    // records one at a time, which is also why `Zone` has no API to.
+    //
+    // The delta is computed here, while both versions are in hand — this is the
+    // only moment they both exist, and the difference is what lets us answer an
+    // IXFR for this step to our own downstream secondaries. That composition is
+    // the point: a secondary that can serve increments of a zone it received is
+    // an interior node of a replication tree rather than a leaf.
+    let soa = notify::soa_record(&fetched);
+    install_zone(zone_map, deltas, fetched).await;
+    record_state(state, spec, serial, now)?;
+
+    // We are this zone's master to whoever replicates it from us, and the serial
+    // just moved forward — which is the whole of what a NOTIFY says.
+    announce_transfer(&spec.zone, serial, soa, notify_targets);
+
+    Ok(match held {
+        Some(held) => format!("transferred serial {held} -> {serial}, {count} records{note}"),
+        None => format!("transferred serial {serial}, {count} records{note}"),
+    })
+}
+
+fn record_state(
+    state: &Arc<Mutex<StateFile>>,
+    spec: &MasterSpec,
+    serial: u32,
+    now: u64,
+) -> Result<(), String> {
+    state.lock().expect("state mutex").record(TransferState {
+        zone: spec.zone.clone(),
+        serial,
+        refreshed_at: now,
+        master: spec.master,
+    })
+}
+
+/// Stop serving a zone we have not been able to reach for longer than its
+/// EXPIRE.
+///
+/// This is the one place a secondary is *required* to make things worse for its
+/// clients, and the reason is that the alternative is worse still: a zone served
+/// with AA set is a claim to be current, and a server that keeps making that
+/// claim indefinitely turns a primary's outage into permanently wrong answers
+/// nobody can see is wrong. Withdrawn, the same query gets REFUSED, which sends
+/// a resolver to the other nameservers in the delegation.
+///
+/// The state line is deliberately left behind: it records when contact was last
+/// made, which is what lets a restart notice the zone is still expired instead of
+/// reading "nothing known" as "fetch and serve".
+async fn expire_if_out_of_contact(
+    spec: &MasterSpec,
+    replication: &Replication,
+    started_at: u64,
+    timers: RefreshTimers,
+) {
+    let Replication {
+        zone_map,
+        deltas,
+        state,
+        ..
+    } = replication;
+    let last_contact = state
+        .lock()
+        .expect("state mutex")
+        .get(&spec.zone, spec.master)
+        .map(|s| s.refreshed_at)
+        .unwrap_or(started_at);
+
+    if !timers.has_expired(last_contact, current_unix_timestamp()) {
+        return;
+    }
+
+    let mut zones = zone_map.write().await;
+    let held = zones
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(&spec.zone))
+        .cloned();
+    if let Some(key) = held {
+        zones.remove(&key);
+        // The increments go with it: offering a chain for a zone we have
+        // withdrawn would be answering for something we just stopped serving.
+        deltas.write().await.forget(&spec.zone);
+        eprintln!(
+            "secondary {}: EXPIRE ({}s) passed with no contact — no longer serving this zone",
+            spec.zone, timers.expire
+        );
+    }
+}
+
+/// Withdraw any replicated zone that was already expired when we started.
+///
+/// Without this, expiry would last only as long as the process: a restart loads
+/// the stale file from disk and serves it again, and the zone is authoritative
+/// once more until the next refresh fails. The state file is what remembers, so
+/// this is the one moment it has to be consulted before anything is served.
+async fn expire_stale_zones_at_startup(
+    specs: &[MasterSpec],
+    zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
+    zone_dir: &Path,
+) {
+    let state = StateFile::load(&state_file_path(zone_dir));
+    let now = current_unix_timestamp();
+
+    for spec in specs {
+        let Some(entry) = state.get(&spec.zone, spec.master) else {
+            continue; // never fetched, so nothing on disk is ours to judge
+        };
+        let timers = zone_timers(zone_map, &spec.zone).await;
+        if !timers.has_expired(entry.refreshed_at, now) {
+            continue;
+        }
+
+        let mut zones = zone_map.write().await;
+        let held = zones
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(&spec.zone))
+            .cloned();
+        if let Some(key) = held {
+            zones.remove(&key);
+            eprintln!(
+                "secondary {}: the copy on disk expired {}s ago — not serving it until \
+                 {} answers",
+                spec.zone,
+                now.saturating_sub(entry.refreshed_at + timers.expire),
+                spec.master
+            );
+        }
+    }
+}
+
 /// A transaction id for a NOTIFY. Random, for the same reason a query's is.
 fn rand_id() -> u16 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1188,74 +1821,93 @@ fn rand_id() -> u16 {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Cli::parse();
+    let cli = Cli::parse();
+    validate_cli_args(&cli.host, cli.port)?;
+    // A typo in either list stops the server rather than quietly narrowing it —
+    // or, worse, being read as something wider.
+    let transfer_acl =
+        TransferAcl::parse(&cli.allow_transfer).map_err(Box::<dyn std::error::Error>::from)?;
+    let tsig_keys = TsigKeyring::parse(&cli.tsig_key).map_err(Box::<dyn std::error::Error>::from)?;
+    let notify_targets = parse_notify_targets(&cli.also_notify)?;
 
-    match args.commands {
-        Some(Commands::Tcp {
-            host,
-            port,
-            zone_file,
+    let secondary_specs = parse_secondary_specs(&cli.secondary)?;
+
+    let source = validate_zone_source(cli.zone_file, cli.zone_dir, !secondary_specs.is_empty())?;
+    let zones = load_zones_from_source(&source, !secondary_specs.is_empty()).await?;
+    let zone_map = Arc::new(RwLock::new(zones));
+    // Empty at startup by design: the deltas are between versions *this process*
+    // has held, and a zone read from disk has no previous version here. Every
+    // secondary asking for an increment across a restart gets a full transfer
+    // instead, which RFC 1995 §4 permits unconditionally and which corrects
+    // itself at the next change. See "Architecture: incremental transfer".
+    let deltas = Arc::new(RwLock::new(DeltaLog::new()));
+    let addr = format!("{}:{}", cli.host, cli.port);
+
+    // Before anything is served: a replicated zone whose copy on disk went out
+    // of contact past its EXPIRE is not ours to answer for, however recently the
+    // process started.
+    let secondaries = if secondary_specs.is_empty() {
+        Arc::new(HashMap::new())
+    } else {
+        let ZoneSource::Directory(dir) = &source else {
+            // `validate_zone_source` has already refused this combination; this
+            // is the compiler being told so.
+            return Err(Box::from("--secondary requires --zone-dir"));
+        };
+        let zone_dir = PathBuf::from(dir);
+        expire_stale_zones_at_startup(&secondary_specs, &zone_map, &zone_dir).await;
+        let replication = Replication {
+            zone_map: zone_map.clone(),
+            deltas: deltas.clone(),
+            state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&zone_dir)))),
             zone_dir,
-            allow_transfer,
-            tsig_key,
-            also_notify,
-        }) => {
-            validate_cli_args(&host, port)?;
-            // A typo in the transfer list stops the server rather than quietly
-            // narrowing it — or, worse, being read as something wider.
-            let transfer_acl = TransferAcl::parse(&allow_transfer).map_err(Box::<dyn std::error::Error>::from)?;
-            let tsig_keys =
-                TsigKeyring::parse(&tsig_key).map_err(Box::<dyn std::error::Error>::from)?;
-            let notify_targets = parse_notify_targets(&also_notify)?;
-            let source = validate_zone_source(zone_file, zone_dir)?;
-            let zones = load_zones_from_source(&source).await?;
-            let zone_map = Arc::new(RwLock::new(zones));
-            let addr = format!("{}:{}", host, port);
-            
-            // Spawn signal handler task for zone reload (SIGHUP on Unix)
-            // A zone that has just been loaded is news to every secondary, which
-            // is why this runs at startup and not only on reload.
-            let announced = announce_zones(&zone_map, &[], &notify_targets).await;
-            spawn_signal_handler(zone_map.clone(), source, notify_targets, announced);
-            
-            tcp_main(&addr, zone_map, transfer_acl, tsig_keys).await?;
-        }
-        Some(Commands::Udp {
-            host,
-            port,
-            zone_file,
-            zone_dir,
-            response_rate,
-            tsig_key,
-            also_notify,
-        }) => {
-            validate_cli_args(&host, port)?;
-            let tsig_keys =
-                TsigKeyring::parse(&tsig_key).map_err(Box::<dyn std::error::Error>::from)?;
-            let notify_targets = parse_notify_targets(&also_notify)?;
-            let source = validate_zone_source(zone_file, zone_dir)?;
-            let zones = load_zones_from_source(&source).await?;
-            let zone_map = Arc::new(RwLock::new(zones));
-            let addr = format!("{}:{}", host, port);
-            
-            // Spawn signal handler task for zone reload (SIGHUP on Unix)
-            // A zone that has just been loaded is news to every secondary, which
-            // is why this runs at startup and not only on reload.
-            let announced = announce_zones(&zone_map, &[], &notify_targets).await;
-            spawn_signal_handler(zone_map.clone(), source, notify_targets, announced);
-            
-            udp_main(&addr, zone_map, response_rate, tsig_keys).await?;
-        }
-        None => {
-            return Err(Box::from(
-                "usage: rdnsd <tcp|udp> [--host HOST] [--port PORT] [--zone-file FILE|--zone-dir DIR]",
-            ));
-        }
-    }
-    Ok(())
+            notify_targets: notify_targets.clone(),
+        };
+        spawn_secondaries(secondary_specs, &tsig_keys, replication)?
+    };
+
+    // A zone that has just been loaded is news to every secondary, which is why
+    // this runs at startup and not only on reload.
+    let announced = announce_zones(&zone_map, &[], &notify_targets).await;
+
+    // Zone reload on SIGHUP, where signals exist.
+    spawn_signal_handler(
+        zone_map.clone(),
+        deltas.clone(),
+        source,
+        notify_targets,
+        announced,
+    );
+
+    serve(
+        &addr,
+        zone_map,
+        transfer_acl,
+        tsig_keys,
+        cli.response_rate,
+        secondaries,
+        deltas,
+    )
+    .await
 }
 
-/// Validate CLI arguments: host and port
+/// Parse every `--secondary`, or stop.
+///
+/// A spec that does not parse is an error rather than a skip, for the same
+/// reason a malformed ACL rule is: a secondary that silently is not replicating
+/// a zone it was told to replicate is a failure nobody notices until the day the
+/// primary is gone.
+fn parse_secondary_specs(specs: &[String]) -> Result<Vec<MasterSpec>, Box<dyn std::error::Error>> {
+    specs
+        .iter()
+        .filter(|spec| !spec.trim().is_empty())
+        .map(|spec| {
+            MasterSpec::parse(spec)
+                .map_err(|e| Box::<dyn std::error::Error>::from(format!("--secondary {e}")))
+        })
+        .collect()
+}
+
 fn validate_cli_args(host: &str, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     // Port must be 1-65535 (0 is reserved)
     if port == 0 {
@@ -1278,10 +1930,21 @@ fn validate_cli_args(host: &str, port: u16) -> Result<(), Box<dyn std::error::Er
 }
 
 /// Validate that exactly one of zone_file or zone_dir is specified
+///
+/// `replicating` is whether any `--secondary` was given, which narrows this: a
+/// fetched zone has to be written somewhere, and a single `--zone-file` is not a
+/// place to put a zone whose name we may not have seen yet.
 fn validate_zone_source(
     zone_file: Option<String>,
     zone_dir: Option<String>,
+    replicating: bool,
 ) -> Result<ZoneSource, Box<dyn std::error::Error>> {
+    if replicating && zone_dir.is_none() {
+        return Err(Box::from(
+            "--secondary needs --zone-dir: a transferred zone is written to disk, \
+             and --zone-file names one file rather than somewhere to put them",
+        ));
+    }
     match (zone_file, zone_dir) {
         (Some(file), None) => {
             // Check if file exists
@@ -1307,9 +1970,19 @@ fn validate_zone_source(
 }
 
 /// Load zones from source (single file or directory)
+///
+/// `replicating` allows an empty directory: a secondary's first start has
+/// nothing on disk yet, and refusing to run until a zone arrives would mean it
+/// never could.
 async fn load_zones_from_source(
     source: &ZoneSource,
+    replicating: bool,
 ) -> Result<HashMap<String, Zone>, Box<dyn std::error::Error>> {
+    if let ZoneSource::Directory(dir) = source {
+        if replicating {
+            return Ok(enumerate_zone_files(dir).unwrap_or_default());
+        }
+    }
     match source {
         ZoneSource::SingleFile(path) => {
             // Path-aware, so a `$INCLUDE` in the file resolves next to it rather
@@ -1470,7 +2143,7 @@ mod tests {
     fn test_validate_zone_source_file_present() {
         // Test zone source validation error when file doesn't exist
         // This documents that validate_zone_source checks file existence
-        let result = validate_zone_source(Some("nonexistent.zone".to_string()), None);
+        let result = validate_zone_source(Some("nonexistent.zone".to_string()), None, false);
         assert!(result.is_err(), "Non-existent file should fail validation");
     }
 
@@ -1478,21 +2151,678 @@ mod tests {
     fn test_validate_zone_source_dir_present() {
         // Test zone source validation error when directory doesn't exist
         // This documents that validate_zone_source checks directory existence
-        let result = validate_zone_source(None, Some("/nonexistent/path".to_string()));
+        let result = validate_zone_source(None, Some("/nonexistent/path".to_string()), false);
         assert!(result.is_err(), "Non-existent directory should fail validation");
     }
 
     #[test]
     fn test_validate_zone_source_both_present_error() {
         // Test zone source validation rejects when both file and dir provided
-        let result = validate_zone_source(Some("test.zone".to_string()), Some("/etc/dns".to_string()));
+        let result = validate_zone_source(Some("test.zone".to_string()), Some("/etc/dns".to_string()), false);
         assert!(result.is_err(), "Should reject when both file and dir specified");
     }
 
     #[test]
     fn test_validate_zone_source_neither_present_error() {
         // Test zone source validation rejects when neither file nor dir provided
-        let result = validate_zone_source(None, None);
+        let result = validate_zone_source(None, None, false);
         assert!(result.is_err(), "Should reject when neither file nor dir specified");
+    }
+
+    // -----------------------------------------------------------------
+    // The secondary role
+    // -----------------------------------------------------------------
+
+    /// A transferred zone has to be written somewhere, and one file is not a
+    /// place to put zones whose names we may not have seen yet.
+    #[test]
+    fn test_secondary_requires_a_zone_directory() {
+        let Err(err) = validate_zone_source(Some("test.zone".to_string()), None, true) else {
+            panic!("--secondary with only --zone-file should be refused");
+        };
+        assert!(err.to_string().contains("--zone-dir"), "got: {err}");
+    }
+
+    #[test]
+    fn test_secondary_specs_are_parsed_or_refused() {
+        let specs = parse_secondary_specs(&[
+            "example.com@127.0.0.1:5353".to_string(),
+            "  ".to_string(), // an empty repetition is not a zone
+        ])
+        .expect("parse");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].zone, "example.com.");
+
+        let err = parse_secondary_specs(&["nonsense".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--secondary"), "the error names the flag: {err}");
+    }
+
+    /// A primary on a loopback port, answering with `rdnsd`'s own AXFR path.
+    ///
+    /// Deliberately the real thing rather than a stub: `Server::serve_connection`
+    /// is what a live `rdnsd` answers a transfer with, ACL and all, so what this
+    /// exercises is the two halves of this codebase against each other rather
+    /// than the secondary against a convenient fiction.
+    async fn spawn_primary(zone_text: &str) -> SocketAddr {
+        spawn_primary_with_acl(zone_text, &["127.0.0.1".to_string()]).await
+    }
+
+    /// A primary serving `new_text` that remembers the step from `old_text` —
+    /// what a real one holds after a reload, and what lets it answer an IXFR.
+    async fn spawn_primary_with_history(old_text: &str, new_text: &str) -> SocketAddr {
+        let old = rdns::zone::parse_zone_file(old_text, "example.com.").expect("parse the old zone");
+        let new = rdns::zone::parse_zone_file(new_text, "example.com.").expect("parse the new zone");
+        let mut log = DeltaLog::new();
+        log.note_change(Some(&old), &new);
+        spawn_primary_inner(new, &["127.0.0.1".to_string()], log).await
+    }
+
+    async fn spawn_primary_with_acl(zone_text: &str, acl: &[String]) -> SocketAddr {
+        let zone = rdns::zone::parse_zone_file(zone_text, "example.com.").expect("parse the zone");
+        spawn_primary_inner(zone, acl, DeltaLog::new()).await
+    }
+
+    async fn spawn_primary_inner(zone: Zone, acl: &[String], log: DeltaLog) -> SocketAddr {
+        let mut zones = HashMap::new();
+        zones.insert(zone.origin().to_string(), zone);
+
+        let server = Arc::new(Server {
+            zone_map: Arc::new(RwLock::new(zones)),
+            rate_limiter: Arc::new(RateLimiter::with_defaults()),
+            validator: Arc::new(RequestValidator::with_defaults()),
+            logger: Arc::new(QueryLogger::new()),
+            metrics: Arc::new(DnsMetrics::new()),
+            transfer_acl: Arc::new(TransferAcl::parse(acl).expect("acl")),
+            tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
+            response_limiter: Arc::new(ResponseLimiter::disabled()),
+            secondaries: Arc::new(HashMap::new()),
+            deltas: Arc::new(RwLock::new(log)),
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                tokio::spawn(server.clone().serve_connection(stream, peer));
+            }
+        });
+        addr
+    }
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("rdnsd-secondary-{tag}-{unique}"));
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            ScratchDir(dir)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The replication context a refresh runs in, over a scratch directory.
+    fn replication(dir: &ScratchDir, notify_targets: Vec<SocketAddr>) -> Replication {
+        Replication {
+            zone_map: Arc::new(RwLock::new(HashMap::new())),
+            deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&dir.0)))),
+            zone_dir: dir.0.clone(),
+            notify_targets,
+        }
+    }
+
+    fn zone_text(serial: u32) -> String {
+        format!(
+            "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. {serial} 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n\
+             ns1  IN A   192.0.2.1\n\
+             www  IN A   192.0.2.2\n"
+        )
+    }
+
+    /// The whole of step 3 in one test: a zone this server has never seen is
+    /// fetched, served, written down, and remembered.
+    #[tokio::test]
+    async fn test_a_secondary_fetches_serves_and_persists_a_zone() {
+        let dir = ScratchDir::new("fetch");
+        let master = spawn_primary(&zone_text(7)).await;
+        let spec = MasterSpec {
+            zone: "example.com.".to_string(),
+            master,
+            key_name: None,
+        };
+        let r = replication(&dir, Vec::new());
+
+        let outcome = refresh_once(&spec, None, &r)
+            .await
+            .expect("refresh");
+        assert!(outcome.contains("transferred serial 7"), "got: {outcome}");
+
+        // Served from memory...
+        let zones = r.zone_map.read().await;
+        let held = zones.get("example.com.").expect("the zone is now served");
+        assert_eq!(held.serial(), Some(7));
+        assert_eq!(held.query("www.example.com.", record_types::A).len(), 1);
+        drop(zones);
+
+        // ...written to disk, in the form the ordinary load path reads...
+        let path = zone_file_path(&dir.0, "example.com.");
+        let reloaded = parse_zone_file_at(&path, "example.com.").expect("reload from disk");
+        assert_eq!(reloaded.serial(), Some(7));
+        assert_eq!(reloaded.records().len(), 4);
+
+        // ...and remembered, so a restart knows when contact was last made.
+        let entry = r
+            .state
+            .lock()
+            .unwrap()
+            .get("example.com.", master)
+            .cloned()
+            .expect("state recorded");
+        assert_eq!(entry.serial, 7);
+        assert!(entry.refreshed_at > 0);
+    }
+
+    /// The serial comparison is the point of the SOA probe: an unchanged zone
+    /// must not be transferred again, or every refresh interval would move the
+    /// whole zone for nothing.
+    #[tokio::test]
+    async fn test_an_unchanged_serial_is_not_transferred_again() {
+        let dir = ScratchDir::new("unchanged");
+        let master = spawn_primary(&zone_text(7)).await;
+        let spec = MasterSpec {
+            zone: "example.com.".to_string(),
+            master,
+            key_name: None,
+        };
+        let r = replication(&dir, Vec::new());
+
+        refresh_once(&spec, None, &r)
+            .await
+            .expect("first refresh");
+        let second = refresh_once(&spec, None, &r)
+            .await
+            .expect("second refresh");
+
+        assert!(second.contains("current"), "got: {second}");
+        assert_eq!(
+            r.zone_map.read().await.get("example.com.").unwrap().serial(),
+            Some(7)
+        );
+    }
+
+    /// And a serial that moved forward *is* transferred, replacing the zone
+    /// wholesale rather than merging into it.
+    #[tokio::test]
+    async fn test_a_bumped_serial_replaces_the_zone() {
+        let dir = ScratchDir::new("bumped");
+        let spec_zone = "example.com.".to_string();
+        let r = replication(&dir, Vec::new());
+
+        let old = spawn_primary(&zone_text(7)).await;
+        refresh_once(
+            &MasterSpec { zone: spec_zone.clone(), master: old, key_name: None },
+            None,
+            &r,
+        )
+        .await
+        .expect("first");
+
+        // A primary whose zone has moved on — and lost a record, which is what
+        // proves the zone is replaced rather than added to.
+        let new = spawn_primary(
+            "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. 8 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n\
+             ns1  IN A   192.0.2.1\n",
+        )
+        .await;
+        let outcome = refresh_once(
+            &MasterSpec { zone: spec_zone, master: new, key_name: None },
+            None,
+            &r,
+        )
+        .await
+        .expect("second");
+
+        assert!(outcome.contains("serial 7 -> 8"), "got: {outcome}");
+        let zones = r.zone_map.read().await;
+        let held = zones.get("example.com.").unwrap();
+        assert_eq!(held.serial(), Some(8));
+        assert!(
+            held.query("www.example.com.", record_types::A).is_empty(),
+            "a record the new zone does not have must be gone, not merged"
+        );
+    }
+
+    /// EXPIRE is the timer with teeth: out of contact past it, the zone stops
+    /// being served rather than being answered for with stale data and AA set.
+    #[tokio::test]
+    async fn test_a_zone_out_of_contact_past_expire_is_withdrawn() {
+        let dir = ScratchDir::new("expire");
+        let master = "127.0.0.1:1".parse().expect("an address nothing answers on");
+        let spec = MasterSpec {
+            zone: "example.com.".to_string(),
+            master,
+            key_name: None,
+        };
+
+        let zone = rdns::zone::parse_zone_file(&zone_text(7), "example.com.").expect("zone");
+        let timers = RefreshTimers::from_zone(&zone).expect("timers");
+        let mut zones = HashMap::new();
+        zones.insert(zone.origin().to_string(), zone);
+        let zone_map = Arc::new(RwLock::new(zones));
+
+        let mut state_file = StateFile::load(&state_file_path(&dir.0));
+        // Contact was made, a very long time ago.
+        state_file
+            .record(TransferState {
+                zone: "example.com.".to_string(),
+                serial: 7,
+                refreshed_at: current_unix_timestamp() - timers.expire - 1,
+                master,
+            })
+            .expect("record");
+        let state = Arc::new(Mutex::new(state_file));
+
+        let r = Replication {
+            zone_map: zone_map.clone(),
+            deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            state: state.clone(),
+            zone_dir: dir.0.clone(),
+            notify_targets: Vec::new(),
+        };
+        expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
+        assert!(
+            zone_map.read().await.is_empty(),
+            "an expired zone is no longer served"
+        );
+
+        // And the state line survives, so a restart still knows it is expired
+        // rather than reading "nothing known" as "fetch and serve".
+        assert!(state.lock().unwrap().get("example.com.", master).is_some());
+    }
+
+    /// Within EXPIRE, a failure to reach the master changes nothing: that is the
+    /// whole point of having three timers rather than one.
+    #[tokio::test]
+    async fn test_a_recent_failure_does_not_withdraw_the_zone() {
+        let dir = ScratchDir::new("still-good");
+        let master = "127.0.0.1:1".parse().unwrap();
+        let spec = MasterSpec {
+            zone: "example.com.".to_string(),
+            master,
+            key_name: None,
+        };
+
+        let zone = rdns::zone::parse_zone_file(&zone_text(7), "example.com.").expect("zone");
+        let timers = RefreshTimers::from_zone(&zone).expect("timers");
+        let mut zones = HashMap::new();
+        zones.insert(zone.origin().to_string(), zone);
+        let zone_map = Arc::new(RwLock::new(zones));
+
+        let mut state_file = StateFile::load(&state_file_path(&dir.0));
+        state_file
+            .record(TransferState {
+                zone: "example.com.".to_string(),
+                serial: 7,
+                refreshed_at: current_unix_timestamp() - 60,
+                master,
+            })
+            .expect("record");
+        let state = Arc::new(Mutex::new(state_file));
+
+        let r = Replication {
+            zone_map: zone_map.clone(),
+            deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            state: state.clone(),
+            zone_dir: dir.0.clone(),
+            notify_targets: Vec::new(),
+        };
+        expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
+        assert_eq!(zone_map.read().await.len(), 1, "still served");
+    }
+
+    /// A refresh against a master that remembers the change moves only the
+    /// difference — and lands on the same zone a full transfer would have.
+    ///
+    /// The equality is the assertion that matters: an incremental transfer that
+    /// produces a *nearly* right zone is the failure mode this whole path has,
+    /// and no serial comparison afterwards would ever notice it.
+    #[tokio::test]
+    async fn test_a_refresh_takes_the_increment_when_the_master_has_one() {
+        let dir = ScratchDir::new("ixfr-in");
+        let old_text = zone_text(7);
+        let new_text = "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. 8 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n\
+             ns1  IN A   192.0.2.1\n\
+             www  IN A   192.0.2.250\n\
+             extra IN TXT \"added in version 8\"\n";
+
+        let r = replication(&dir, Vec::new());
+
+        // Start from version 7, fetched in full because we hold nothing yet.
+        let first = spawn_primary(&old_text).await;
+        let spec = |master| MasterSpec {
+            zone: "example.com.".to_string(),
+            master,
+            key_name: None,
+        };
+        refresh_once(&spec(first), None, &r)
+            .await
+            .expect("initial transfer");
+
+        // Now a master that knows how to get from 7 to 8.
+        let master = spawn_primary_with_history(&old_text, new_text).await;
+        let outcome = refresh_once(&spec(master), None, &r)
+            .await
+            .expect("incremental refresh");
+        assert!(
+            outcome.contains("1 incremental step(s)"),
+            "expected an increment, got: {outcome}"
+        );
+
+        let zones = r.zone_map.read().await;
+        let held = zones.get("example.com.").expect("still served");
+        assert_eq!(held.serial(), Some(8));
+        assert_eq!(held.query("extra.example.com.", record_types::TXT).len(), 1);
+        assert!(
+            held.query("www.example.com.", record_types::A)
+                .iter()
+                .all(|r| r.rdata.parse().map(|p| matches!(p, rdns::ParsedRecord::A(a) if a.octets() == [192, 0, 2, 250])).unwrap_or(false)),
+            "the old address must be gone, not merged"
+        );
+
+        // Record for record, the zone the master serves.
+        let expected = rdns::zone::parse_zone_file(new_text, "example.com.").unwrap();
+        let key = |z: &Zone| {
+            let mut rows: Vec<_> = z
+                .records()
+                .iter()
+                .map(|r| (z.normalize_name(&r.name).to_lowercase(), r.ttl, r.rdata.clone()))
+                .collect();
+            rows.sort_by_key(|r| (r.0.clone(), r.2.rtype));
+            rows
+        };
+        assert_eq!(key(held), key(&expected), "the increment reproduced the zone");
+    }
+
+    /// A secondary that takes a transfer tells its own secondaries at once.
+    ///
+    /// Without this, only a *primary* ever announces — at startup and on SIGHUP —
+    /// so the first level of a replication tree updates immediately and every
+    /// level below it waits out a refresh timer. RFC 1996 §3.2's "master" is
+    /// whoever serves the zone to someone, which a secondary in the middle is.
+    #[tokio::test]
+    async fn test_a_secondary_announces_what_it_transferred() {
+        let dir = ScratchDir::new("announce");
+        let master = spawn_primary(&zone_text(11)).await;
+
+        // A socket standing in for a downstream secondary, so the NOTIFY is
+        // caught on the wire rather than inferred from a log line.
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let target = downstream.local_addr().expect("addr");
+
+        let r = replication(&dir, vec![target]);
+        let spec = MasterSpec {
+            zone: "example.com.".to_string(),
+            master,
+            key_name: None,
+        };
+
+        refresh_once(&spec, None, &r)
+            .await
+            .expect("transfer");
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
+            .await
+            .expect("a NOTIFY should arrive")
+            .expect("recv");
+
+        let msg = DnsMessage::try_from_bytes(&buf[..n]).expect("parse the NOTIFY");
+        assert_eq!(msg.opcode, OpCode::Notify, "a NOTIFY, not a query");
+        assert!(!msg.response);
+        assert_eq!(
+            notify::notified_zone(&msg).as_deref(),
+            Some("example.com."),
+            "for the zone that moved"
+        );
+        assert_eq!(
+            notify::notified_serial(&msg),
+            Some(11),
+            "carrying the serial we just transferred, so the downstream \
+             secondary need not ask"
+        );
+    }
+
+    /// Nothing is announced when nothing moved: a refresh that confirms the
+    /// serial is unchanged is not news, and telling anyone would cost them a
+    /// pointless SOA probe every refresh interval.
+    #[tokio::test]
+    async fn test_an_unchanged_refresh_announces_nothing() {
+        let dir = ScratchDir::new("announce-quiet");
+        let master = spawn_primary(&zone_text(11)).await;
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let target = downstream.local_addr().expect("addr");
+
+        let r = replication(&dir, vec![target]);
+        let spec = MasterSpec {
+            zone: "example.com.".to_string(),
+            master,
+            key_name: None,
+        };
+
+        // The first transfer announces; drain it.
+        refresh_once(&spec, None, &r)
+            .await
+            .expect("transfer");
+        let mut buf = vec![0u8; 4096];
+        let _ = tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
+            .await
+            .expect("the first NOTIFY");
+
+        // The second finds the same serial and must say nothing.
+        let outcome = refresh_once(&spec, None, &r)
+            .await
+            .expect("second refresh");
+        assert!(outcome.contains("current"), "got: {outcome}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), downstream.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "an unchanged zone is not news"
+        );
+    }
+
+    /// A secondary that receives a change can answer an IXFR for it — which is
+    /// what makes one of these an interior node of a replication tree rather than
+    /// a leaf. The delta only exists if the swap recorded it, so this is really a
+    /// test that the zone map and the delta log move together.
+    #[tokio::test]
+    async fn test_a_transferred_change_becomes_an_increment_we_can_serve() {
+        let dir = ScratchDir::new("ixfr-out");
+        let r = replication(&dir, Vec::new());
+        let spec = |master| MasterSpec {
+            zone: "example.com.".to_string(),
+            master,
+            key_name: None,
+        };
+
+        let first = spawn_primary(&zone_text(7)).await;
+        refresh_once(&spec(first), None, &r)
+            .await
+            .expect("first transfer");
+        assert_eq!(
+            r.deltas.read().await.len("example.com."),
+            0,
+            "a first fetch has no previous version to differ from"
+        );
+
+        let second = spawn_primary(
+            "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. 8 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n\
+             ns1  IN A   192.0.2.1\n\
+             www  IN A   192.0.2.250\n",
+        )
+        .await;
+        refresh_once(&spec(second), None, &r)
+            .await
+            .expect("second transfer");
+
+        let log = r.deltas.read().await;
+        assert_eq!(log.len("example.com."), 1, "the change was recorded");
+        let chain = log.chain_from("example.com.", 7).expect("a chain from 7");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].to_serial, 8);
+        // www's address changed: one deletion, one addition.
+        assert_eq!(chain[0].deleted.len(), 1);
+        assert_eq!(chain[0].added.len(), 1);
+    }
+
+    /// A reload is a version step too, and a zone that leaves the configuration
+    /// takes its history with it — we cannot offer increments of a zone we no
+    /// longer serve.
+    #[tokio::test]
+    async fn test_a_reload_records_its_changes_and_forgets_removed_zones() {
+        let zone_map = Arc::new(RwLock::new(HashMap::new()));
+        let deltas = Arc::new(RwLock::new(DeltaLog::new()));
+        let parse = |text: &str, origin: &str| {
+            rdns::zone::parse_zone_file(text, origin).expect("zone should parse")
+        };
+
+        let v7 = parse(&zone_text(7), "example.com.");
+        let other = parse(
+            "@ IN SOA ns1.other.test. admin.other.test. 1 3600 1800 604800 86400\n\
+             @ IN NS ns1.other.test.\n",
+            "other.test.",
+        );
+        let mut initial = HashMap::new();
+        initial.insert(v7.origin().to_string(), v7);
+        initial.insert(other.origin().to_string(), other);
+        install_all_zones(&zone_map, &deltas, initial).await;
+        assert!(deltas.read().await.is_empty(), "nothing to differ from yet");
+
+        // example.com. moves on; other.test. is dropped from the configuration.
+        let v8 = parse(
+            "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. 8 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n\
+             ns1  IN A   192.0.2.1\n\
+             www  IN A   192.0.2.222\n",
+            "example.com.",
+        );
+        let mut reloaded = HashMap::new();
+        reloaded.insert(v8.origin().to_string(), v8);
+        install_all_zones(&zone_map, &deltas, reloaded).await;
+
+        let log = deltas.read().await;
+        assert_eq!(log.len("example.com."), 1, "the reload is a version step");
+        assert_eq!(log.len("other.test."), 0, "a zone we no longer serve");
+        assert_eq!(zone_map.read().await.len(), 1);
+    }
+
+    /// An IXFR is gated by the same ACL as an AXFR, and it has to be: it may
+    /// *answer* with the whole zone (RFC 1995 §4), so a policy that let it
+    /// through would be no policy at all. The default is to refuse everyone, and
+    /// this is the test that a new transfer type did not quietly escape it.
+    #[tokio::test]
+    async fn test_an_ixfr_is_refused_by_the_same_default_that_refuses_an_axfr() {
+        let master = spawn_primary_with_acl(&zone_text(7), &[]).await;
+        let spec = MasterSpec {
+            zone: "example.com.".to_string(),
+            master,
+            key_name: None,
+        };
+        let dir = ScratchDir::new("refused");
+        let r = replication(&dir, Vec::new());
+
+        // The AXFR our own client makes is refused, which is the baseline.
+        let err = refresh_once(&spec, None, &r).await.unwrap_err();
+        assert!(err.contains("Refused"), "got: {err}");
+
+        // And so is an IXFR, over the same connection path.
+        let request = {
+            let mut msg = rdns::xfr::axfr_request("example.com.", 0x33);
+            msg.queries[0].qtype = record_types::IXFR;
+            msg
+        };
+        let mut buf = vec![0u8; 512];
+        let n = request.to_bytes(&mut buf).expect("serialize");
+        let mut framed = (n as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&buf[..n]);
+
+        let mut stream = TcpStream::connect(master).await.expect("connect");
+        stream.write_all(&framed).await.expect("send");
+        let mut length = [0u8; 2];
+        stream.read_exact(&mut length).await.expect("length");
+        let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+        stream.read_exact(&mut packet).await.expect("reply");
+
+        let reply = DnsMessage::try_from_bytes(&packet).expect("parse");
+        assert_eq!(reply.rcode, ResponseCode::Refused);
+        assert!(reply.answers.is_empty(), "a refusal carries no zone");
+    }
+
+    /// A NOTIFY is acted on when it comes from a master of a zone we replicate,
+    /// refused when it does not, and NOTAUTH for anything we are not a secondary
+    /// for — three different answers to three different situations.
+    #[test]
+    fn test_notify_is_answered_by_what_the_zone_is_to_us() {
+        let wake = Arc::new(Notify::new());
+        let mut registry = HashMap::new();
+        registry.insert(
+            "replicated.test.".to_string(),
+            ReplicatedZone {
+                masters: vec!["192.0.2.1".parse().unwrap()],
+                wake: vec![wake.clone()],
+            },
+        );
+        let secondaries: Secondaries = Arc::new(registry);
+
+        let primary_zone =
+            rdns::zone::parse_zone_file(&zone_text(1), "example.com.").expect("zone");
+        let mut zones = HashMap::new();
+        zones.insert(primary_zone.origin().to_string(), primary_zone);
+
+        let from = |zone: &str, ip: &str| {
+            let msg = notify::notify_request(zone, None, 1);
+            let peer: SocketAddr = format!("{ip}:5353").parse().unwrap();
+            notify_reply(&msg, &zones, &secondaries, peer).rcode
+        };
+
+        assert_eq!(
+            from("replicated.test.", "192.0.2.1"),
+            ResponseCode::Ok,
+            "from its master: acted on"
+        );
+        assert_eq!(
+            from("replicated.test.", "203.0.113.9"),
+            ResponseCode::Refused,
+            "from anywhere else: refused, because acting would cost us a transfer"
+        );
+        assert_eq!(
+            from("example.com.", "192.0.2.1"),
+            ResponseCode::NotAuthorized,
+            "a zone we are the primary for: we are nobody's secondary for it"
+        );
+        assert_eq!(
+            from("never-heard-of.test.", "192.0.2.1"),
+            ResponseCode::NotAuthorized
+        );
     }
 }

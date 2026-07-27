@@ -4,6 +4,10 @@ use anyhow::anyhow;
 /// at most an OPT plus a TSIG/SIG(0); the slack is for forward compatibility.
 const MAX_REQUEST_ADDITIONALS: usize = 4;
 
+/// The QUERY opcode, which is the only one whose requests carry no records of
+/// their own — see the section checks in [`RequestValidator::validate_header`].
+const OPCODE_QUERY: u8 = 0;
+
 /// Configuration for request validation
 #[derive(Debug, Clone)]
 pub struct ValidationConfig {
@@ -117,16 +121,39 @@ impl RequestValidator {
             return Err(anyhow!("too many queries: {}", query_count));
         }
 
-        // Answers and authority records belong in responses, not requests.
-        // The additional section is different: it is where a request carries its
-        // OPT (EDNS0, RFC 6891 §6.1.1) and TSIG/SIG(0) records, so rejecting a
-        // non-empty additional section would reject every EDNS query. Cap it
-        // instead — a request has no legitimate reason to carry many records.
+        // Which sections a *request* may carry is a question per section, not one
+        // blanket rule — and the blanket version of it has now silently killed a
+        // feature three times, because the symptom is always the same: the
+        // message is dropped before anything reads the opcode, so the feature
+        // simply never happens and nothing says why.
+        //
+        // - **The answer section** is empty in a QUERY: no query type carries
+        //   answers to a question it is still asking. A **NOTIFY** does carry
+        //   one — the zone's SOA (RFC 1996 §3.7), which is how a secondary learns
+        //   the new serial without asking a second question. Forbidden for QUERY,
+        //   capped otherwise.
+        // - **The authority section** cannot be forbidden at all: an **IXFR**
+        //   request is a QUERY that carries the client's current SOA there
+        //   (RFC 1995 §3), and that record is the whole of what makes it
+        //   incremental rather than an AXFR. Capped.
+        // - **The additional section** is where a request carries its OPT (EDNS0,
+        //   RFC 6891 §6.1.1) and its TSIG/SIG(0), so rejecting a non-empty one
+        //   rejects every signed or EDNS query — which is precisely what it used
+        //   to do, leaving EDNS dead on arrival. Capped.
+        //
+        // A cap rather than a prohibition is the shape this check wants: a
+        // request has no legitimate reason to carry many records, and that is a
+        // statement about resources rather than a guess about which protocol
+        // extensions exist.
         let qr_flag = data[2] & 0x80 != 0;
+        let opcode = (data[2] >> 3) & 0x0f;
         if !qr_flag {
-            if answer_count > 0 || auth_count > 0 {
+            if opcode == OPCODE_QUERY && answer_count > 0 {
+                return Err(anyhow!("request query should not have answer sections"));
+            }
+            if answer_count > MAX_REQUEST_ADDITIONALS || auth_count > MAX_REQUEST_ADDITIONALS {
                 return Err(anyhow!(
-                    "request query should not have answer/authority sections"
+                    "too many records in a request: {answer_count} answer, {auth_count} authority"
                 ));
             }
             if add_count > MAX_REQUEST_ADDITIONALS {
@@ -314,6 +341,45 @@ mod tests {
             .error_message()
             .unwrap()
             .contains("should not have answer"));
+    }
+
+    /// A NOTIFY carries the zone's SOA in its answer section (RFC 1996 §3.7),
+    /// and an IXFR request carries the client's SOA in its authority section
+    /// (RFC 1995 §3). Rejecting either here is invisible — the message is
+    /// dropped before anything reads the opcode — and it made NOTIFY silently
+    /// undeliverable to this server's own secondary role until a live test
+    /// caught it.
+    #[test]
+    fn test_a_notify_may_carry_its_soa_and_an_ixfr_may_carry_its_own() {
+        let validator = RequestValidator::with_defaults();
+        let header = |opcode: u8, answers: u8, authorities: u8| {
+            vec![
+                0x00, 0x01, // ID
+                opcode << 3, // flags: QR=0, this opcode
+                0x00, //
+                0x00, 0x01, // 1 query
+                0x00, answers, //
+                0x00, authorities, //
+                0x00, 0x00, // 0 additionals
+                0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, // "example"
+                0x03, 0x63, 0x6f, 0x6d, 0x00, // "com."
+                0x00, 0x06, // SOA
+                0x00, 0x01, // IN
+            ]
+        };
+
+        assert!(
+            validator.validate_packet(&header(4, 1, 0), false).is_valid(),
+            "a NOTIFY carrying the new SOA must reach the server"
+        );
+        assert!(
+            validator.validate_packet(&header(0, 0, 1), false).is_valid(),
+            "an IXFR request is a QUERY carrying its SOA in the authority section"
+        );
+        assert!(
+            !validator.validate_packet(&header(4, 40, 0), false).is_valid(),
+            "the sections are capped rather than unbounded"
+        );
     }
 
     #[test]

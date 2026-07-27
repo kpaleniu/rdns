@@ -12,6 +12,11 @@ use dname::{dname_from_bytes, dname_to_bytes, write_bytes, DNameUnpacker, TryUnp
 pub mod compression;
 pub mod dname;
 pub mod zone;
+pub mod zone_writer;
+pub mod xfr;
+pub mod secondary;
+pub mod ixfr;
+pub mod persist;
 pub mod security;
 pub mod validation;
 pub mod logging;

@@ -156,6 +156,46 @@ pub fn build_type_bitmap(types: &[u16]) -> Vec<u8> {
     out
 }
 
+/// Every type set in a bitmap, ascending.
+///
+/// The inverse of [`build_type_bitmap`], and the reason the zone writer can put
+/// an NSEC back into presentation format. A malformed bitmap stops the walk
+/// rather than guessing, for the same reason [`bitmap_has_type`] reads it as
+/// "absent" — but here the caller is writing a record out rather than judging a
+/// proof, so a short read would silently drop types. [`bitmap_types_exact`] is
+/// the checked form.
+pub fn bitmap_types(bitmap: &[u8]) -> Vec<u16> {
+    bitmap_types_exact(bitmap).unwrap_or_else(|partial| partial)
+}
+
+/// [`bitmap_types`], but `Err(what was read before the damage)` when the bitmap
+/// does not parse to its end. Anything rewriting a record needs to know the
+/// difference: re-encoding a bitmap we only partly understood would produce a
+/// record that is not the one we were given.
+pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<u16>, Vec<u16>> {
+    let mut types = Vec::new();
+    let mut rest = bitmap;
+    while !rest.is_empty() {
+        if rest.len() < 2 {
+            return Err(types);
+        }
+        let window = rest[0] as u16;
+        let len = rest[1] as usize;
+        if len == 0 || len > 32 || rest.len() < 2 + len {
+            return Err(types);
+        }
+        for (byte, bits) in rest[2..2 + len].iter().enumerate() {
+            for bit in 0..8 {
+                if bits & (0x80 >> bit) != 0 {
+                    types.push((window << 8) | (byte as u16 * 8 + bit));
+                }
+            }
+        }
+        rest = &rest[2 + len..];
+    }
+    Ok(types)
+}
+
 // ---------------------------------------------------------------------------
 // base32hex (RFC 4648 §7) — how NSEC3 owner names carry a hash
 // ---------------------------------------------------------------------------
@@ -973,6 +1013,34 @@ mod tests {
         assert!(!bitmap_has_type(&[0x00], rt::A), "truncated window header");
         assert!(!bitmap_has_type(&[0x00, 0x09, 0x40], rt::A), "length overruns");
         assert!(!bitmap_has_type(&[], rt::A));
+    }
+
+    /// Listing the types back out is what turns an NSEC into a zone-file line.
+    #[test]
+    fn test_bitmap_types_lists_what_was_built() {
+        let types = [rt::A, rt::NS, rt::SOA, rt::RRSIG, rt::NSEC, rt::DNSKEY, 1234];
+        let bitmap = build_type_bitmap(&types);
+
+        let mut expected = types.to_vec();
+        expected.sort_unstable();
+        assert_eq!(bitmap_types(&bitmap), expected, "ascending, across windows");
+        assert_eq!(bitmap_types_exact(&bitmap), Ok(expected));
+        assert_eq!(bitmap_types(&[]), Vec::<u16>::new());
+    }
+
+    /// A bitmap that does not parse to its end must be reported as such: a
+    /// rewrite that silently kept the types it managed to read would emit a
+    /// record other than the one it was handed.
+    #[test]
+    fn test_bitmap_types_reports_a_short_read() {
+        let mut damaged = build_type_bitmap(&[rt::A]);
+        damaged.push(0x01); // a window header with nothing behind it
+        assert_eq!(
+            bitmap_types_exact(&damaged),
+            Err(vec![rt::A]),
+            "what was read, and that there was more"
+        );
+        assert_eq!(bitmap_types_exact(&[0x00, 0x09, 0x40]), Err(vec![]));
     }
 
     // -----------------------------------------------------------------

@@ -101,7 +101,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/rdnsd udp --host 0.0.0.0 --port 53 --zone-dir /etc/rdns/zones
+ExecStart=/usr/local/bin/rdnsd --host 0.0.0.0 --port 53 --zone-dir /etc/rdns/zones
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10
@@ -164,7 +164,7 @@ To run on standard DNS port (53) without root:
 2. Or use `sudo` to run with elevated privileges:
 
 ```bash
-sudo rdnsd udp --host 0.0.0.0 --port 53 --zone-dir /etc/rdns/zones
+sudo rdnsd --host 0.0.0.0 --port 53 --zone-dir /etc/rdns/zones
 ```
 
 ## Testing
@@ -190,40 +190,47 @@ cargo test -- --nocapture
 
 ## CLI Reference
 
-### UDP Server
+### Authoritative server
 
 ```bash
-rdnsd udp [OPTIONS]
+rdnsd [OPTIONS]
 ```
+
+Serves **UDP and TCP from one process**, on the same host and port. Both are
+required of an authoritative server: an oversized reply goes out with TC=1 and the
+client retries over TCP (RFC 1035 §4.2.1), and zone transfers are TCP-only
+(RFC 5936 §4.2).
 
 **Options:**
 - `--host <HOST>` - Listen address (default: 0.0.0.0)
 - `--port <PORT>` - Listen port (default: 53)
-- `--zone-file <PATH>` - Load single zone file
-- `--zone-dir <DIR>` - Load all .zone files from directory
+- `--zone-file <PATH>` - Load a single zone file; the origin comes from its name
+- `--zone-dir <DIR>` - Load all `.zone` files from a directory
+- `--allow-transfer <ADDR|CIDR>` - Who may request an AXFR. Repeatable, and empty
+  by default, which refuses everyone
+- `--tsig-key <[ALG:]NAME:SECRET>` - A TSIG key (RFC 8945). Repeatable. A signed
+  request may transfer a zone from any address, and gets a signed answer
+- `--also-notify <ADDR[:PORT]>` - Tell a secondary at once when a zone's serial
+  moves (RFC 1996). Repeatable
+- `--response-rate <BYTES_PER_SEC>` - Cap on UDP response bytes per client
+  (default 8192; 0 disables). Meters what an amplification attack is made of
 
-### TCP Server
-
-```bash
-rdnsd tcp [OPTIONS]
-```
-
-**Options:** Same as UDP server
+See `docs/CLI_USAGE.md` for the reasoning behind each.
 
 ### Examples
 
 ```bash
-# Production setup (UDP, all interfaces, port 53, load zones from directory)
-rdnsd udp --zone-dir /etc/rdns/zones
+# Production: all interfaces, port 53, zones from a directory, one secondary.
+rdnsd --zone-dir /etc/rdns/zones   --allow-transfer 192.0.2.10 --also-notify 192.0.2.10
 
-# Development setup (UDP, localhost, custom port)
-rdnsd udp --host 127.0.0.1 --port 5353 --zone-dir ./zones
+# Development: localhost, custom port.
+rdnsd --host 127.0.0.1 --port 5353 --zone-dir ./zones
 
-# Single zone file
-rdnsd udp --zone-file example.com.zone
+# Single zone file.
+rdnsd --zone-file example.com.zone
 
-# TCP server for zone transfer testing
-rdnsd tcp --host 127.0.0.1 --port 5354 --zone-dir ./zones
+# Transfers authenticated by key rather than by address.
+rdnsd --host 127.0.0.1 --port 5353 --zone-file example.com.zone   --tsig-key hmac-sha256:transfer.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=
 ```
 
 ## Project Status

@@ -236,7 +236,26 @@ async fn udp_main(
 ) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 4096];
     loop {
-        let (n, peer) = socket.recv_from(&mut buf).await?;
+        let (n, peer) = match socket.recv_from(&mut buf).await {
+            Ok(received) => received,
+            // An ICMP report about a datagram we already sent — a client that
+            // closed its socket before our reply landed. Windows surfaces it as
+            // an error on the *next* receive (WSAECONNRESET), and treating it as
+            // fatal meant any such client could stop the resolver. It says
+            // nothing about this socket, so carry on receiving.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NetworkUnreachable
+                        | std::io::ErrorKind::HostUnreachable
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
         let data = buf[..n].to_vec();
         let socket = socket.clone();
         let resolver = resolver.clone();

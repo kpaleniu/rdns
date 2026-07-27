@@ -2,7 +2,7 @@
 name = "rdnsd"
 version = "0.1.0"
 edition = "2021"
-description = "Authoritative DNS server. Serves zone files over UDP and TCP; one process per transport."
+description = "Authoritative DNS server. Serves zone files over UDP and TCP from one process, with AXFR, TSIG and NOTIFY."
 license = "MIT OR Apache-2.0"
 
 [dependencies]

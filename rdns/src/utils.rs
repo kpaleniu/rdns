@@ -41,6 +41,10 @@ pub mod record_types {
     /// AXFR — a whole-zone transfer. A QTYPE only: no record ever has this type,
     /// and it is defined over TCP alone (RFC 5936).
     pub const AXFR: u16 = 252;
+    /// IXFR — an incremental transfer (RFC 1995). A QTYPE only, and the one
+    /// request that carries a record of its own: the client's SOA, in the
+    /// authority section, saying which version it already holds.
+    pub const IXFR: u16 = 251;
     /// ANY (`*`) — also a QTYPE only.
     pub const ANY: u16 = 255;
 }
@@ -142,10 +146,15 @@ pub fn record_type_code(rdata: &RecordData) -> u16 {
 
 /// Convert record type name to its numeric code
 ///
+/// `TYPEnnn` is accepted for any type at all (RFC 3597 §5), which is what makes
+/// a type this library has no mnemonic for still expressible in a zone file — an
+/// NSEC bitmap listing one, or a record carried in the generic `\#` form.
+///
 /// # Examples
 /// ```ignore
 /// assert_eq!(record_type_name_to_code("A"), Some(1));
 /// assert_eq!(record_type_name_to_code("MX"), Some(15));
+/// assert_eq!(record_type_name_to_code("TYPE1234"), Some(1234));
 /// assert_eq!(record_type_name_to_code("UNKNOWN"), None);
 /// ```
 pub fn record_type_name_to_code(kind: &str) -> Option<u16> {
@@ -163,7 +172,32 @@ pub fn record_type_name_to_code(kind: &str) -> Option<u16> {
         "RRSIG" => Some(record_types::RRSIG),
         "NSEC" => Some(record_types::NSEC),
         "NSEC3" => Some(record_types::NSEC3),
-        _ => None,
+        other => other
+            .strip_prefix("TYPE")
+            .or_else(|| other.strip_prefix("type"))
+            .and_then(|n| n.parse::<u16>().ok()),
+    }
+}
+
+/// The mnemonic for a type code, or its `TYPEnnn` form (RFC 3597 §5) when this
+/// library has none. Always a name the parser reads back, which is what the zone
+/// writer relies on.
+pub fn record_type_name(code: u16) -> String {
+    match code {
+        record_types::A => "A".to_string(),
+        record_types::NS => "NS".to_string(),
+        record_types::CNAME => "CNAME".to_string(),
+        record_types::SOA => "SOA".to_string(),
+        record_types::PTR => "PTR".to_string(),
+        record_types::MX => "MX".to_string(),
+        record_types::TXT => "TXT".to_string(),
+        record_types::AAAA => "AAAA".to_string(),
+        record_types::DS => "DS".to_string(),
+        record_types::DNSKEY => "DNSKEY".to_string(),
+        record_types::RRSIG => "RRSIG".to_string(),
+        record_types::NSEC => "NSEC".to_string(),
+        record_types::NSEC3 => "NSEC3".to_string(),
+        other => format!("TYPE{other}"),
     }
 }
 
@@ -323,6 +357,33 @@ mod tests {
         assert_eq!(record_type_name_to_code("MX"), Some(record_types::MX));
         assert_eq!(record_type_name_to_code("DNSKEY"), Some(record_types::DNSKEY));
         assert_eq!(record_type_name_to_code("UNKNOWN"), None);
+    }
+
+    /// RFC 3597 §5: any type at all can be named, which is what keeps a type we
+    /// have no mnemonic for from being unwritable.
+    #[test]
+    fn test_generic_type_names_round_trip() {
+        assert_eq!(record_type_name_to_code("TYPE1234"), Some(1234));
+        assert_eq!(record_type_name_to_code("TYPE1"), Some(record_types::A));
+        assert_eq!(record_type_name(1234), "TYPE1234");
+        assert_eq!(record_type_name(record_types::A), "A");
+
+        for code in [1u16, 15, 50, 99, 257, 65535] {
+            let name = record_type_name(code);
+            assert_eq!(
+                record_type_name_to_code(&name),
+                Some(code),
+                "{name} should read back as {code}"
+            );
+        }
+    }
+
+    /// A number that does not fit a TYPE code is not a type name.
+    #[test]
+    fn test_out_of_range_generic_type_name_is_rejected() {
+        assert_eq!(record_type_name_to_code("TYPE65536"), None);
+        assert_eq!(record_type_name_to_code("TYPE"), None);
+        assert_eq!(record_type_name_to_code("TYPEA"), None);
     }
 
     #[test]
