@@ -30,7 +30,8 @@ use crate::dnssec::{
     ds_digest, key_tag, rrsig_labels, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP,
     DNSKEY_FLAG_ZONE,
 };
-use anyhow::{anyhow, Context, Result};
+use crate::error::DnssecError;
+use crate::error::DnssecResult as Result;
 use ring::rand::SystemRandom;
 use ring::signature::{
     EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING,
@@ -94,11 +95,16 @@ impl SigningAlgorithm {
             13 => SigningAlgorithm::EcdsaP256Sha256,
             14 => SigningAlgorithm::EcdsaP384Sha384,
             15 => SigningAlgorithm::Ed25519,
-            5 | 7 => return Err(anyhow!(
+            5 | 7 => return Err(DnssecError::key(format!(
                 "algorithm {code} (RSA/SHA-1) can be verified but not signed with: \
-                 RFC 8624 §3.1 lists it MUST NOT for signing"
-            )),
-            other => return Err(anyhow!("algorithm {other} cannot sign")),
+                 RFC 8624 §3.1 lists it MUST NOT for signing",
+            ))),
+            other => {
+                return Err(DnssecError::UnsupportedAlgorithm {
+                    what: "signing",
+                    algorithm: other,
+                })
+            }
         })
     }
 
@@ -118,7 +124,9 @@ impl SigningAlgorithm {
         ]
         .into_iter()
         .find(|a| a.name().eq_ignore_ascii_case(wanted))
-        .ok_or_else(|| anyhow!("{text:?} is not a signing algorithm this build knows"))
+        .ok_or_else(|| {
+            DnssecError::key(format!("{text:?} is not a signing algorithm this build knows"))
+        })
     }
 
     /// Whether a key of this algorithm can be created here, as opposed to only
@@ -174,28 +182,28 @@ impl SigningKey {
         let pkcs8 = match algorithm {
             SigningAlgorithm::EcdsaP256Sha256 => {
                 EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
-                    .map_err(|e| anyhow!("generating a P-256 key: {e}"))?
+                    .map_err(|e| DnssecError::key(format!("generating a P-256 key: {e}")))?
                     .as_ref()
                     .to_vec()
             }
             SigningAlgorithm::EcdsaP384Sha384 => {
                 EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &rng)
-                    .map_err(|e| anyhow!("generating a P-384 key: {e}"))?
+                    .map_err(|e| DnssecError::key(format!("generating a P-384 key: {e}")))?
                     .as_ref()
                     .to_vec()
             }
             SigningAlgorithm::Ed25519 => Ed25519KeyPair::generate_pkcs8(&rng)
-                .map_err(|e| anyhow!("generating an Ed25519 key: {e}"))?
+                .map_err(|e| DnssecError::key(format!("generating an Ed25519 key: {e}")))?
                 .as_ref()
                 .to_vec(),
             rsa => {
-                return Err(anyhow!(
+                return Err(DnssecError::key(format!(
                     "{} keys cannot be generated here — ring implements RSA signing but not \
                      RSA key generation. Make one elsewhere and import the PKCS#8: \
                      openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
                      -outform DER -out key.der",
-                    rsa.name()
-                ))
+                    rsa.name(),
+                )))
             }
         };
         Self::from_pkcs8(algorithm, owner, flags, &pkcs8)
@@ -217,7 +225,10 @@ impl SigningKey {
                     &ECDSA_P384_SHA384_FIXED_SIGNING
                 };
                 let pair = EcdsaKeyPair::from_pkcs8(signing, pkcs8, &rng)
-                    .map_err(|e| anyhow!("reading a {} key: {e}", algorithm.name()))?;
+                    .map_err(|e| DnssecError::key(format!(
+                        "reading a {} key: {e}",
+                        algorithm.name(),
+                    )))?;
                 // ring hands back an uncompressed SEC1 point; RFC 6605 §4
                 // publishes it without the leading 0x04.
                 let public = pair.public_key().as_ref()[1..].to_vec();
@@ -229,23 +240,23 @@ impl SigningKey {
                 // the seed, and refusing those would refuse every imported key.
                 let pair = Ed25519KeyPair::from_pkcs8(pkcs8)
                     .or_else(|_| Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8))
-                    .map_err(|e| anyhow!("reading an Ed25519 key: {e}"))?;
+                    .map_err(|e| DnssecError::key(format!("reading an Ed25519 key: {e}")))?;
                 let public = pair.public_key().as_ref().to_vec();
                 (Pair::Ed25519(Box::new(pair)), public)
             }
             SigningAlgorithm::RsaSha256 | SigningAlgorithm::RsaSha512 => {
                 let pair = RsaKeyPair::from_pkcs8(pkcs8)
-                    .map_err(|e| anyhow!("reading an RSA key: {e}"))?;
+                    .map_err(|e| DnssecError::key(format!("reading an RSA key: {e}")))?;
                 let public = rsa_dnskey_public_key(pair.public().as_ref())?;
                 (Pair::Rsa(Box::new(pair)), public)
             }
         };
 
         if flags & DNSKEY_FLAG_ZONE == 0 {
-            return Err(anyhow!(
+            return Err(DnssecError::key(format!(
                 "flags {flags} do not have the Zone Key bit set, so this key may not sign zone \
-                 data (RFC 4034 §2.1.1)"
-            ));
+                 data (RFC 4034 §2.1.1)",
+            )));
         }
 
         Ok(SigningKey {
@@ -319,7 +330,7 @@ impl SigningKey {
                 let rng = SystemRandom::new();
                 Ok(pair
                     .sign(&rng, data)
-                    .map_err(|e| anyhow!("ECDSA signing failed: {e}"))?
+                    .map_err(|e| DnssecError::key(format!("ECDSA signing failed: {e}")))?
                     .as_ref()
                     .to_vec())
             }
@@ -333,7 +344,7 @@ impl SigningKey {
                 };
                 let mut signature = vec![0u8; pair.public().modulus_len()];
                 pair.sign(padding, &rng, data, &mut signature)
-                    .map_err(|e| anyhow!("RSA signing failed: {e}"))?;
+                    .map_err(|e| DnssecError::key(format!("RSA signing failed: {e}")))?;
                 Ok(signature)
             }
         }
@@ -370,7 +381,7 @@ impl SigningKey {
             signature: Vec::new(),
         };
         let data = signed_data(&rrsig, rrset.owner, rrset.class, rrset.rdatas)
-            .context("building the bytes to sign")?;
+            .map_err(|e| DnssecError::key(format!("building the bytes to sign: {e}")))?;
         rrsig.signature = self.sign(&data)?;
         Ok(rrsig)
     }
@@ -425,26 +436,28 @@ impl SigningKey {
             }
             let (name, value) = line
                 .split_once(':')
-                .ok_or_else(|| anyhow!("{line:?} is not a `Name: value` line"))?;
+                .ok_or_else(|| DnssecError::key(format!("{line:?} is not a `Name: value` line")))?;
             let value = value.trim();
             match name.trim().to_ascii_lowercase().as_str() {
                 "owner" => owner = Some(value.to_string()),
                 "flags" => {
-                    flags = Some(value.parse::<u16>().context("the Flags field")?);
+                    flags = Some(value.parse::<u16>().map_err(|e| DnssecError::key(format!("the Flags field: {e}")))?);
                 }
                 "algorithm" => algorithm = Some(SigningAlgorithm::parse(value)?),
-                "privatekey" => private = Some(base64_decode(value).context("the PrivateKey")?),
+                "privatekey" => private = Some(base64_decode(value).map_err(|e| DnssecError::key(format!("the PrivateKey: {e}")))?),
                 // Unknown fields are ignored so a file written by a later
                 // version still loads, the same rule the anchor file follows.
                 _ => {}
             }
         }
 
-        let owner = owner.ok_or_else(|| anyhow!("no Owner field: a key with no name at which \
-                                                 it is published cannot sign anything"))?;
-        let flags = flags.ok_or_else(|| anyhow!("no Flags field"))?;
-        let algorithm = algorithm.ok_or_else(|| anyhow!("no Algorithm field"))?;
-        let private = private.ok_or_else(|| anyhow!("no PrivateKey field"))?;
+        let owner = owner.ok_or_else(|| DnssecError::key(
+    "no Owner field: a key with no name at which \
+             it is published cannot sign anything",
+))?;
+        let flags = flags.ok_or_else(|| DnssecError::key("no Flags field"))?;
+        let algorithm = algorithm.ok_or_else(|| DnssecError::key("no Algorithm field"))?;
+        let private = private.ok_or_else(|| DnssecError::key("no PrivateKey field"))?;
         Self::from_pkcs8(algorithm, &owner, flags, &private)
     }
 
@@ -458,7 +471,10 @@ impl SigningKey {
     pub fn write_to_dir(&self, dir: &Path) -> Result<PathBuf> {
         let path = dir.join(self.file_name());
         crate::persist::write_atomically_str(&path, &self.to_key_file())
-            .with_context(|| format!("writing {}", path.display()))?;
+            .map_err(|e| DnssecError::key(format!(
+                "writing {}: {e}",
+                path.display(),
+            )))?;
         restrict_to_owner(&path);
         Ok(path)
     }
@@ -472,18 +488,30 @@ impl SigningKey {
     pub fn load_dir(dir: &Path) -> Result<Vec<SigningKey>> {
         let mut keys = Vec::new();
         let entries = std::fs::read_dir(dir)
-            .with_context(|| format!("reading the key directory {}", dir.display()))?;
+            .map_err(|e| DnssecError::key(format!(
+                "reading the key directory {}: {e}",
+                dir.display(),
+            )))?;
         for entry in entries {
             let path = entry
-                .with_context(|| format!("reading the key directory {}", dir.display()))?
+                .map_err(|e| DnssecError::key(format!(
+                    "reading the key directory {}: {e}",
+                    dir.display(),
+                )))?
                 .path();
             if path.extension().and_then(|e| e.to_str()) != Some(KEY_FILE_EXTENSION) {
                 continue;
             }
             let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
+                .map_err(|e| DnssecError::key(format!(
+                    "reading {}: {e}",
+                    path.display(),
+                )))?;
             let key = SigningKey::from_key_file(&text)
-                .with_context(|| format!("in {}", path.display()))?;
+                .map_err(|e| DnssecError::key(format!(
+                    "in {}: {e}",
+                    path.display(),
+                )))?;
             keys.push(key);
         }
         // A directory listing has no order worth relying on, and the DNSKEY
@@ -506,19 +534,19 @@ impl SigningKey {
 /// padding rather than part of the number; leaving it in changes the key, and
 /// with it the key tag, so every RRSIG would name a key that is not there.
 fn rsa_dnskey_public_key(der: &[u8]) -> Result<Vec<u8>> {
-    let body = der_expect(der, 0x30).context("the RSA public key's outer SEQUENCE")?;
-    let (modulus, rest) = der_take(body, 0x02).context("the RSA modulus")?;
-    let (exponent, rest) = der_take(rest, 0x02).context("the RSA exponent")?;
+    let body = der_expect(der, 0x30).map_err(|e| DnssecError::key(format!("the RSA public key's outer SEQUENCE: {e}")))?;
+    let (modulus, rest) = der_take(body, 0x02).map_err(|e| DnssecError::key(format!("the RSA modulus: {e}")))?;
+    let (exponent, rest) = der_take(rest, 0x02).map_err(|e| DnssecError::key(format!("the RSA exponent: {e}")))?;
     if !rest.is_empty() {
-        return Err(anyhow!(
+        return Err(DnssecError::key(format!(
             "{} trailing bytes after the RSA public key",
-            rest.len()
-        ));
+            rest.len(),
+        )));
     }
     let modulus = strip_leading_zeros(modulus);
     let exponent = strip_leading_zeros(exponent);
     if exponent.is_empty() || modulus.is_empty() {
-        return Err(anyhow!("an RSA key part is zero"));
+        return Err(DnssecError::key("an RSA key part is zero"));
     }
 
     let mut out = Vec::with_capacity(3 + exponent.len() + modulus.len());
@@ -529,7 +557,7 @@ fn rsa_dnskey_public_key(der: &[u8]) -> Result<Vec<u8>> {
         let len: u16 = exponent
             .len()
             .try_into()
-            .map_err(|_| anyhow!("RSA exponent is longer than 65535 bytes"))?;
+            .map_err(|_| DnssecError::key("RSA exponent is longer than 65535 bytes"))?;
         out.push(0);
         out.extend_from_slice(&len.to_be_bytes());
     }
@@ -543,7 +571,10 @@ fn rsa_dnskey_public_key(der: &[u8]) -> Result<Vec<u8>> {
 fn der_expect(der: &[u8], tag: u8) -> Result<&[u8]> {
     let (body, rest) = der_take(der, tag)?;
     if !rest.is_empty() {
-        return Err(anyhow!("{} trailing bytes", rest.len()));
+        return Err(DnssecError::key(format!(
+            "{} trailing bytes",
+            rest.len(),
+        )));
     }
     Ok(body)
 }
@@ -553,12 +584,12 @@ fn der_expect(der: &[u8], tag: u8) -> Result<&[u8]> {
 ///
 /// Only definite-length forms are accepted, which is all DER has.
 fn der_take(der: &[u8], tag: u8) -> Result<(&[u8], &[u8])> {
-    let short = || anyhow!("DER element is truncated");
+    let short = || DnssecError::key("DER element is truncated");
     if der.first() != Some(&tag) {
-        return Err(anyhow!(
+        return Err(DnssecError::key(format!(
             "expected DER tag {tag:#04x}, found {:?}",
-            der.first()
-        ));
+            der.first(),
+        )));
     }
     let first = *der.get(1).ok_or_else(short)?;
     let (len, offset) = if first < 0x80 {
@@ -566,7 +597,7 @@ fn der_take(der: &[u8], tag: u8) -> Result<(&[u8], &[u8])> {
     } else {
         let count = (first & 0x7f) as usize;
         if count == 0 || count > 4 {
-            return Err(anyhow!("DER length of {count} bytes is not one we read"));
+            return Err(DnssecError::key(format!("DER length of {count} bytes is not one we read")));
         }
         let bytes = der.get(2..2 + count).ok_or_else(short)?;
         let mut len = 0usize;
@@ -598,10 +629,8 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 fn base64_decode(text: &str) -> Result<Vec<u8>> {
-    Ok(base64::Engine::decode(
-        &base64::prelude::BASE64_STANDARD,
-        text.trim(),
-    )?)
+    base64::Engine::decode(&base64::prelude::BASE64_STANDARD, text.trim())
+        .map_err(|e| DnssecError::parse(format!("not valid base64: {e}")))
 }
 
 #[cfg(test)]

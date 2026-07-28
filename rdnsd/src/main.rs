@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use rdns::{
     dnssec::{DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE},
@@ -712,7 +713,7 @@ async fn serve(
     response_rate: u32,
     secondaries: Secondaries,
     deltas: Arc<RwLock<DeltaLog>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     let transfers = if transfer_acl.is_empty() && tsig_keys.is_empty() {
         "refused (no --allow-transfer, no --tsig-key)".to_string()
     } else {
@@ -900,10 +901,12 @@ impl Server {
                 ip,
                 &format!(
                     "invalid query: {}",
-                    validation.error_message().unwrap_or("unknown error")
+                    validation
+                        .error()
+                        .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
                 ),
             );
-            instrumentation::trace_validation(&ip, false, validation.error_message());
+            instrumentation::trace_validation(&ip, false, validation.error().map(|e| e.to_string()).as_deref());
             return Vec::new();
         }
         instrumentation::trace_validation(&ip, true, None);
@@ -1327,10 +1330,12 @@ async fn udp_loop(socket: Arc<UdpSocket>, server: Arc<Server>) -> Result<(), std
                     peer.ip(),
                     &format!(
                         "invalid query: {}",
-                        validation.error_message().unwrap_or("unknown error")
+                        validation
+                        .error()
+                        .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
                     ),
                 );
-                instrumentation::trace_validation(&peer.ip(), false, validation.error_message());
+                instrumentation::trace_validation(&peer.ip(), false, validation.error().map(|e| e.to_string()).as_deref());
                 return;
             }
             instrumentation::trace_validation(&peer.ip(), true, None);
@@ -1502,10 +1507,9 @@ impl Reloading {
     /// replaced half the zones and gave up would leave the server serving a
     /// mixture of two versions, and the half that failed is the half that
     /// needed attention.
-    async fn load(&self, source: &ZoneSource) -> Result<HashMap<String, Zone>, String> {
-        let mut zones = load_zones_from_source(source, self.replicating, self.allow_partial)
-            .await
-            .map_err(|e| e.to_string())?;
+    async fn load(&self, source: &ZoneSource) -> Result<HashMap<String, Zone>> {
+        let mut zones =
+            load_zones_from_source(source, self.replicating, self.allow_partial).await?;
         if let Some(signing) = &self.signing {
             signing.apply(&mut zones)?;
         }
@@ -1599,7 +1603,7 @@ fn spawn_signal_handler(
 /// A bare IPv6 address has colons of its own, so `[::1]:5353` is the only
 /// unambiguous way to give one a port — which is what `SocketAddr` already
 /// parses, so the shape is the familiar one rather than a new convention.
-fn parse_notify_targets(specs: &[String]) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
+fn parse_notify_targets(specs: &[String]) -> Result<Vec<SocketAddr>> {
     let mut targets = Vec::new();
     for spec in specs {
         let spec = spec.trim();
@@ -1613,9 +1617,9 @@ fn parse_notify_targets(specs: &[String]) -> Result<Vec<SocketAddr>, Box<dyn std
         match spec.parse::<IpAddr>() {
             Ok(ip) => targets.push(SocketAddr::new(ip, 53)),
             Err(e) => {
-                return Err(Box::from(format!(
+                return Err(anyhow!(
                     "--also-notify {spec:?} is not an address or address:port: {e}"
-                )))
+                ))
             }
         }
     }
@@ -1866,7 +1870,7 @@ fn spawn_secondaries(
     specs: Vec<MasterSpec>,
     keys: &TsigKeyring,
     replication: Replication,
-) -> Result<Secondaries, Box<dyn std::error::Error>> {
+) -> Result<Secondaries> {
     let mut registry: HashMap<String, ReplicatedZone> = HashMap::new();
 
     for spec in specs {
@@ -1886,9 +1890,7 @@ fn spawn_secondaries(
                         .find_map(|alg| keys.get(&absolute_name(name), alg))
                     })
                     .ok_or_else(|| {
-                        format!(
-                            "--secondary names TSIG key {name:?}, which no --tsig-key defines"
-                        )
+                        anyhow!("--secondary names TSIG key {name:?}, which no --tsig-key defines")
                     })?
                     .clone(),
             ),
@@ -1987,7 +1989,7 @@ async fn refresh_once(
     spec: &MasterSpec,
     key: Option<&TsigKey>,
     replication: &Replication,
-) -> Result<String, String> {
+) -> Result<String> {
     let Replication {
         zone_map,
         deltas,
@@ -2059,7 +2061,7 @@ async fn refresh_once(
 
     let serial = fetched
         .serial()
-        .ok_or_else(|| "the transferred zone has no SOA".to_string())?;
+        .ok_or_else(|| anyhow!("the transferred zone has no SOA"))?;
 
     // Persist before serving. Both orders are safe — a crash between them costs
     // at most a refetch — but this way the state line, written last, is only ever
@@ -2096,13 +2098,17 @@ fn record_state(
     spec: &MasterSpec,
     serial: u32,
     now: u64,
-) -> Result<(), String> {
-    state.lock().expect("state mutex").record(TransferState {
-        zone: spec.zone.clone(),
-        serial,
-        refreshed_at: now,
-        master: spec.master,
-    })
+) -> Result<()> {
+    state
+        .lock()
+        .expect("state mutex")
+        .record(TransferState {
+            zone: spec.zone.clone(),
+            serial,
+            refreshed_at: now,
+            master: spec.master,
+        })
+        .map_err(|e| anyhow!("recording the transfer state: {e}"))
 }
 
 /// Stop serving a zone we have not been able to reach for longer than its
@@ -2238,7 +2244,7 @@ fn rand_id() -> u16 {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Key generation is a mode, not a server option: nothing is served, and it
@@ -2247,7 +2253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dir = cli
             .signing_key_dir
             .as_deref()
-            .ok_or("--generate-keys needs --signing-key-dir")?;
+            .ok_or_else(|| anyhow!("--generate-keys needs --signing-key-dir"))?;
         return generate_keys(zone, dir, &cli.key_algorithm);
     }
 
@@ -2255,8 +2261,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A typo in either list stops the server rather than quietly narrowing it —
     // or, worse, being read as something wider.
     let transfer_acl =
-        TransferAcl::parse(&cli.allow_transfer).map_err(Box::<dyn std::error::Error>::from)?;
-    let tsig_keys = TsigKeyring::parse(&cli.tsig_key).map_err(Box::<dyn std::error::Error>::from)?;
+        TransferAcl::parse(&cli.allow_transfer)?;
+    let tsig_keys = TsigKeyring::parse(&cli.tsig_key)?;
     let notify_targets = parse_notify_targets(&cli.also_notify)?;
 
     let secondary_specs = parse_secondary_specs(&cli.secondary)?;
@@ -2299,7 +2305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ZoneSource::Directory(dir) = &source else {
             // `validate_zone_source` has already refused this combination; this
             // is the compiler being told so.
-            return Err(Box::from("--secondary requires --zone-dir"));
+            return Err(anyhow!("--secondary requires --zone-dir"));
         };
         let zone_dir = PathBuf::from(dir);
         withdraw_unvouched_zones(&secondary_specs, &zone_map, &deltas, &zone_dir).await;
@@ -2354,33 +2360,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// reason a malformed ACL rule is: a secondary that silently is not replicating
 /// a zone it was told to replicate is a failure nobody notices until the day the
 /// primary is gone.
-fn parse_secondary_specs(specs: &[String]) -> Result<Vec<MasterSpec>, Box<dyn std::error::Error>> {
+fn parse_secondary_specs(specs: &[String]) -> Result<Vec<MasterSpec>> {
     specs
         .iter()
         .filter(|spec| !spec.trim().is_empty())
         .map(|spec| {
             MasterSpec::parse(spec)
-                .map_err(|e| Box::<dyn std::error::Error>::from(format!("--secondary {e}")))
+                .map_err(|e| anyhow!("--secondary {e}"))
         })
         .collect()
 }
 
-fn validate_cli_args(host: &str, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_cli_args(host: &str, port: u16) -> Result<()> {
     // Port must be 1-65535 (0 is reserved)
     if port == 0 {
-        return Err(Box::from("Port must be in range 1-65535"));
+        return Err(anyhow!("Port must be in range 1-65535"));
     }
     
     // Host must be valid IP or hostname (basic validation)
     // This is a simple check; more complex validation could parse as IP
     if host.is_empty() {
-        return Err(Box::from("Host cannot be empty"));
+        return Err(anyhow!("Host cannot be empty"));
     }
     
     // Very basic hostname/IP validation - just check for invalid characters
     // Valid hostnames: alphanumeric, dots, hyphens, colons (for IPv6)
     if !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':' || c == '%') {
-        return Err(Box::from(format!("Invalid host format: {}", host)));
+        return Err(anyhow!("Invalid host format: {host}"));
     }
     
     Ok(())
@@ -2395,9 +2401,9 @@ fn validate_zone_source(
     zone_file: Option<String>,
     zone_dir: Option<String>,
     replicating: bool,
-) -> Result<ZoneSource, Box<dyn std::error::Error>> {
+) -> Result<ZoneSource> {
     if replicating && zone_dir.is_none() {
-        return Err(Box::from(
+        return Err(anyhow!(
             "--secondary needs --zone-dir: a transferred zone is written to disk, \
              and --zone-file names one file rather than somewhere to put them",
         ));
@@ -2406,22 +2412,22 @@ fn validate_zone_source(
         (Some(file), None) => {
             // Check if file exists
             if !Path::new(&file).exists() {
-                return Err(Box::from(format!("Zone file not found: {}", file)));
+                return Err(anyhow!("Zone file not found: {file}"));
             }
             Ok(ZoneSource::SingleFile(file))
         }
         (None, Some(dir)) => {
             // Check if directory exists
             if !Path::new(&dir).is_dir() {
-                return Err(Box::from(format!("Zone directory not found or not a directory: {}", dir)));
+                return Err(anyhow!("Zone directory not found or not a directory: {dir}"));
             }
             Ok(ZoneSource::Directory(dir))
         }
         (Some(_), Some(_)) => {
-            Err(Box::from("Cannot specify both --zone-file and --zone-dir"))
+            Err(anyhow!("Cannot specify both --zone-file and --zone-dir"))
         }
         (None, None) => {
-            Err(Box::from("Must specify either --zone-file or --zone-dir"))
+            Err(anyhow!("Must specify either --zone-file or --zone-dir"))
         }
     }
 }
@@ -2440,11 +2446,11 @@ struct ZoneSigning {
 }
 
 impl ZoneSigning {
-    fn load(cli: &Cli) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+    fn load(cli: &Cli) -> Result<Option<Self>> {
         let Some(dir) = &cli.signing_key_dir else {
             return Ok(None);
         };
-        let loaded = SigningKey::load_dir(dir).map_err(|e| format!("{e:#}"))?;
+        let loaded = SigningKey::load_dir(dir).context("loading the signing keys")?;
         if loaded.is_empty() {
             // Not an error — a key directory prepared before any key is in it
             // is a reasonable state — but silence here would look exactly like
@@ -2482,7 +2488,7 @@ impl ZoneSigning {
     /// served unsigned: its parent has a DS pointing at one of these keys, so
     /// the unsigned answer would be bogus at every validating client rather
     /// than merely unvalidated.
-    fn apply(&self, zones: &mut HashMap<String, Zone>) -> Result<(), String> {
+    fn apply(&self, zones: &mut HashMap<String, Zone>) -> Result<()> {
         let policy = SigningPolicy::valid_for(current_unix_timestamp(), self.validity)
             .with_chain(self.chain.clone());
         for (origin, zone) in zones.iter_mut() {
@@ -2490,7 +2496,7 @@ impl ZoneSigning {
                 continue;
             };
             *zone = sign_zone(zone, keys, &policy)
-                .map_err(|e| format!("signing {origin}: {e:#}"))?;
+                .with_context(|| format!("signing {origin}"))?;
             println!(
                 "Signed {origin} with {} key{}",
                 keys.len(),
@@ -2512,7 +2518,7 @@ impl ZoneSigning {
 fn verify_zones(
     zones: &HashMap<String, Zone>,
     validator: &DnssecValidator,
-) -> Result<(), String> {
+) -> Result<()> {
     if !validator.is_enabled() {
         return Ok(());
     }
@@ -2523,7 +2529,7 @@ fn verify_zones(
             // records keeps the "is unsigned acceptable" decision in one place.
             let (ok, _) = validator.validate_response(zone, &[], origin);
             if !ok {
-                return Err(format!("{origin} is not signed"));
+                return Err(anyhow!("{origin} is not signed"));
             }
             continue;
         }
@@ -2532,13 +2538,13 @@ fn verify_zones(
         for (name, rtype) in signed_rrsets(zone) {
             let records = zone.query(&name, rtype);
             if records.is_empty() {
-                return Err(format!(
+                return Err(anyhow!(
                     "{origin}: a signature covers the {rtype} RRset at {name}, which is not there"
                 ));
             }
             let (ok, _) = validator.validate_response(zone, &records, &name);
             if !ok {
-                return Err(format!(
+                return Err(anyhow!(
                     "{origin}: the {rtype} RRset at {name} does not verify against the zone's \
                      own keys"
                 ));
@@ -2582,8 +2588,8 @@ fn generate_keys(
     zone: &str,
     dir: &Path,
     algorithm: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let algorithm = SigningAlgorithm::parse(algorithm).map_err(|e| format!("{e:#}"))?;
+) -> Result<()> {
+    let algorithm = SigningAlgorithm::parse(algorithm)?;
     let zone = if zone.ends_with('.') {
         zone.to_string()
     } else {
@@ -2591,17 +2597,17 @@ fn generate_keys(
     };
 
     let ksk = SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP)
-        .map_err(|e| format!("{e:#}"))?;
+        ?;
     let zsk =
-        SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE).map_err(|e| format!("{e:#}"))?;
+        SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE)?;
     for key in [&ksk, &zsk] {
-        let path = key.write_to_dir(dir).map_err(|e| format!("{e:#}"))?;
+        let path = key.write_to_dir(dir)?;
         println!("Wrote {}", path.display());
     }
 
     // SHA-256, which RFC 8624 §3.3 is the only digest that is both mandatory to
     // implement and not deprecated.
-    let ds = ksk.ds(2).map_err(|e| format!("{e:#}"))?;
+    let ds = ksk.ds(2)?;
     println!("\nGive the parent zone this DS record:\n");
     println!(
         "{} IN DS {} {} {} {}",
@@ -2644,7 +2650,7 @@ async fn load_zones_from_source(
     source: &ZoneSource,
     replicating: bool,
     allow_partial: bool,
-) -> Result<HashMap<String, Zone>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, Zone>> {
     match source {
         ZoneSource::SingleFile(path) => {
             // Path-aware, so a `$INCLUDE` in the file resolves next to it rather
@@ -2659,9 +2665,7 @@ async fn load_zones_from_source(
         ZoneSource::Directory(dir) => {
             let zones = enumerate_zone_files(dir, allow_partial)?;
             if zones.is_empty() && !replicating {
-                return Err(Box::from(format!(
-                    "No .zone files found in directory: {dir}"
-                )));
+                return Err(anyhow!("No .zone files found in directory: {dir}"));
             }
             Ok(zones)
         }
@@ -2695,7 +2699,7 @@ fn extract_zone_origin_from_path(path: &str) -> String {
 fn enumerate_zone_files(
     dir: &str,
     allow_partial: bool,
-) -> Result<HashMap<String, Zone>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, Zone>> {
     let mut zones = HashMap::new();
     let mut failures: Vec<String> = Vec::new();
     let entries = std::fs::read_dir(dir)?;
@@ -2721,20 +2725,25 @@ fn enumerate_zone_files(
     // because an operator fixing a deploy wants the whole list and not one typo
     // per restart.
     if !failures.is_empty() {
-        for failure in &failures {
-            eprintln!("Error loading zone file {failure}");
-        }
         if !allow_partial {
-            // One line, because `main` returning an `Err` prints it with `{:?}`
-            // and a multi-line message comes out with the newlines escaped. The
-            // detail is on stderr just above, where it is readable.
-            return Err(Box::from(format!(
-                "{} of {} zone files in {dir} failed to load (listed above). Refusing to \
-                 serve a partial set; pass --allow-partial-load to serve the {} that did.",
+            // The whole list goes *in* the error rather than only on stderr
+            // ahead of it. `main` prints its `Err` with `Debug`, and
+            // `anyhow::Error`'s `Debug` is built for exactly this — a
+            // `Box<dyn Error>` printed the message as a quoted Rust string with
+            // the newlines escaped, which is why this was one line with the
+            // detail somewhere else until the binaries moved to anyhow.
+            return Err(anyhow!(
+                "{} of {} zone files in {dir} failed to load:\n  {}\n\
+                 Refusing to serve a partial set; pass --allow-partial-load to serve \
+                 the {} that did.",
                 failures.len(),
                 failures.len() + zones.len(),
+                failures.join("\n  "),
                 zones.len(),
-            )));
+            ));
+        }
+        for failure in &failures {
+            eprintln!("Error loading zone file {failure}");
         }
         eprintln!(
             "--allow-partial-load: serving {} zones, {} failed and will answer REFUSED",
@@ -2916,7 +2925,7 @@ mod tests {
         let err = parse_secondary_specs(&["nonsense".to_string()])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--secondary"), "the error names the flag: {err}");
+        assert!(err.to_string().contains("--secondary"), "the error names the flag: {err}");
     }
 
     /// A primary on a loopback port, answering with `rdnsd`'s own AXFR path.
@@ -3473,7 +3482,7 @@ mod tests {
 
         // The AXFR our own client makes is refused, which is the baseline.
         let err = refresh_once(&spec, None, &r).await.unwrap_err();
-        assert!(err.contains("Refused"), "got: {err}");
+        assert!(err.to_string().contains("Refused"), "got: {err}");
 
         // And so is an IXFR, over the same connection path.
         let request = {
@@ -3541,11 +3550,11 @@ mod tests {
                 .expect_err("a broken zone file must not pass for a configuration choice")
                 .to_string();
             assert!(
-                err.contains("1 of 3"),
+                err.to_string().contains("1 of 3"),
                 "say how many of how many, so the scale is visible: {err}"
             );
             assert!(
-                err.contains("--allow-partial-load"),
+                err.to_string().contains("--allow-partial-load"),
                 "and say what to do about it: {err}"
             );
         }
@@ -4471,7 +4480,7 @@ ns.plain  IN A   192.0.2.30
             let mut validator = DnssecValidator::new(true);
             validator.set_require_signed(true);
             let err = verify_zones(&zones, &validator).unwrap_err();
-            assert!(err.contains("not signed"), "{err}");
+            assert!(err.to_string().contains("not signed"), "{err}");
 
             // And without the assertion, the same zone is fine: most zones are
             // unsigned and serving them is the normal case.
@@ -4500,7 +4509,7 @@ ns.plain  IN A   192.0.2.30
 
             let validator = DnssecValidator::new(true);
             let err = verify_zones(&zones, &validator).unwrap_err();
-            assert!(err.contains("does not verify"), "{err}");
+            assert!(err.to_string().contains("does not verify"), "{err}");
         }
     }
 }

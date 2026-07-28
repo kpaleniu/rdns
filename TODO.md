@@ -26,12 +26,24 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **578 lib + 60 `rdnsd` + 2 `rdnsr`** tests passing
+`cargo test --workspace` = **567 lib + 60 `rdnsd` + 2 `rdnsr`** tests passing
 (`rdnsd`'s own 60 cover argument validation, zone sources and the load policy,
 the secondary role and EXPIRE across reloads, both directions of IXFR and onward
 announcement, answering a DO-bit query from a zone it signed itself, and all four
 cases of RFC 1034 §4.3.2; `rdnsr` had **no test module at all** until #9c gave it
-one), `cargo clippy --workspace --all-targets` **clean, no exceptions**.
+one), `cargo clippy --workspace --all-targets` **clean, no exceptions**. The lib
+count fell from 578 when dead `serialization.rs` was deleted with its 11 tests.
+
+**Errors are typed in the library and `anyhow` in the binaries (2026-07-28).**
+The convention used to run the other way round — `rdns` returned `anyhow::Error`,
+which erases the failure kind from its own API, while `rdnsd` and `rdnsr` used
+`Box<dyn Error>` and `Result<_, String>` and never called the `anyhow` they both
+declared as a dependency. `rdns::error` now holds six types (`WireError`,
+`ZoneError`, `DnssecError`, `TransferError`, `ResolveError`, `ConfigError`) whose
+variants are the decisions a caller actually makes: truncated is FORMERR and
+unsupported is NOTIMP, a bogus signature is SERVFAIL and an unknown algorithm is
+insecure, a transfer timeout is retried and a malformed one is not. See
+`CLAUDE.md` §3; the reasoning is in the five commits.
 
 **Green did not mean conformant, and the fix for that is `CLAUDE.md`.** The suite
 passed at 590 tests while `rdnsd` could not serve a CNAME, a delegation or a
@@ -60,7 +72,7 @@ first start, because the commit asserted a property of `enumerate_zone_files` �
 that it returns `Ok(empty)` for an empty directory — that was simply not true of
 the code. The claim went into a commit message, a doc comment and this file
 unchecked, and no test covered the case. It is written up under #9c rather than
-edited away; see also `CLAUDE.md` §3.
+edited away; see also `CLAUDE.md` §4.
 
 **Steps 1–5 of #7 are done: `rdnsd` replicates in both directions, incrementally
 at both ends, and cascades.** It transfers a zone from a master, serves it, writes
@@ -324,7 +336,7 @@ under "Closed work" further down.
 
 | # | what | open |
 |---|------|------|
-| **9** | what the five-way code review turned up | **33** — 9a, 9b and 9c are closed; what is left is operability, performance and small conformance gaps |
+| **9** | what the five-way code review turned up | **32** — 9a, 9b and 9c are closed; what is left is operability, performance and small conformance gaps |
 | **8** | what signing turned up | **2** — both about re-signing a running server |
 | **7** | the secondary role | **1**, and conditional |
 | **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
@@ -610,7 +622,7 @@ two-label wildcard. See `CLAUDE.md` §1.
       not bound by the payload size we advertise for *responses*, which is where
       the 4096 came from. The predicate moved into `utils::recv_error_is_transient`
       and `rdnsr` uses it too, because it existed twice and this case had been
-      found in neither copy; that duplication is now a rule in `CLAUDE.md` §6. The
+      found in neither copy; that duplication is now a rule in `CLAUDE.md` §7. The
       test drives it through `Error::from_raw_os_error`, since the kind carries no
       information — which is exactly why a `matches!` on kinds missed it. Original
       finding follows.
@@ -670,7 +682,7 @@ two-label wildcard. See `CLAUDE.md` §1.
       timestamp subtractions under the stats mutex — and is fixed with it; that one
       was not in the original finding, which is why "every subtraction of two
       timestamps is `saturating_sub`, no exceptions" is now a rule
-      (`CLAUDE.md` §5). Moving both limiters to `Instant` is still the right
+      (`CLAUDE.md` §6). Moving both limiters to `Instant` is still the right
       answer and is not done. Original finding follows.
 
       (`rdns/src/security.rs:71`, and `:101`), inside the lock. `current_unix_timestamp()`
@@ -738,7 +750,7 @@ here degrades quietly with the process healthy and nothing alerting.
       place that knows whether the caller is replicating, and
       `a_secondary_may_start_with_an_empty_zone_directory` pins it. Left written
       down rather than edited out, because "I asserted what the callee does
-      instead of reading it" is the interesting part and is now `CLAUDE.md` §3.
+      instead of reading it" is the interesting part and is now `CLAUDE.md` §4.
       Original finding follows.
 
       (`rdnsd/src/main.rs:2348`): `return Ok(enumerate_zone_files(dir).unwrap_or_default());`
@@ -1207,8 +1219,12 @@ into a measurement you can re-run, and it is what tells you when to stop.
       once and rebuild only the RRSIG prefix per candidate. (The verify primitives
       themselves are fine — RSA borrows slices with no allocation, and ECDSA's
       65-byte point prefix is forced by ring's API.)
-- [ ] **`serialization.rs` is dead code that documents a guarantee it does not
-      implement — delete it.** No caller anywhere outside its own `#[cfg(test)]`
+- [x] **`serialization.rs` is dead code that documents a guarantee it does not
+      implement — delete it** — **done 2026-07-28**, on the way past while typing
+      the wire layer's errors: converting dead code to a better error type would
+      have been work spent making a loaded gun more comfortable to hold. Its 11
+      tests went with it, which is why the lib count drops from 578 to 567.
+      Original finding follows. No caller anywhere outside its own `#[cfg(test)]`
       module. Its doc comment at `:112` promises RFC 4034 canonical ordering; the
       loop at `:116` emits in argument order and never sorts, and
       `serialize_resource_record_canonical` (`:53`) writes the owner via
@@ -3266,8 +3282,11 @@ pos = c.write_name("www.example.com.", buf, pos)?;   // literal, or a pointer
 pos = c.write_rdata(rtype, &rdata, buf, pos)?;       // NS/CNAME/PTR/SOA/MX only
 ```
 
-Canonical DNSSEC output must stay uncompressed — use
-`serialization::serialize_resource_record_canonical`, not the compressor.
+Canonical DNSSEC output must stay uncompressed — use `dnssec::signed_data`, which
+is the live canonicalization and the one the validator agrees with. (This used to
+point at `serialization::serialize_resource_record_canonical`, which was deleted
+in #9e: it never sorted and never down-cased, so it produced neither RFC 4034
+§6.2 canonical form nor the ordering its own doc comment promised.)
 
 ## Quick reference: the EDNS0 API
 

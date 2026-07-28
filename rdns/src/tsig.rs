@@ -35,6 +35,7 @@
 //! reason to believe the sender holds it); BADTIME is signed, because the MAC did
 //! verify.
 
+use crate::error::{ConfigError, ConfigResult};
 use crate::dname::dname_to_bytes;
 use crate::utils::current_unix_timestamp;
 use base64::Engine;
@@ -134,30 +135,28 @@ impl TsigKey {
     /// The algorithm defaults to HMAC-SHA256 when omitted. An unparsable spec is
     /// an error rather than a skip: a key the operator believes is configured but
     /// is not would fail every transfer, and the reason would not be visible.
-    pub fn parse(spec: &str) -> Result<Self, String> {
+    pub fn parse(spec: &str) -> ConfigResult<Self> {
         let parts: Vec<&str> = spec.split(':').collect();
         let (algorithm, name, secret) = match parts.as_slice() {
             [name, secret] => (TsigAlgorithm::HmacSha256, *name, *secret),
             [alg, name, secret] => (
                 TsigAlgorithm::from_name(alg)
-                    .ok_or_else(|| format!("unknown TSIG algorithm {alg:?}"))?,
+                    .ok_or_else(|| ConfigError::new(format!("unknown TSIG algorithm {alg:?}")))?,
                 *name,
                 *secret,
             ),
             _ => {
-                return Err(format!(
-                    "TSIG key {spec:?} is not [algorithm:]name:base64secret"
-                ))
+                return Err(ConfigError::new(format!("TSIG key {spec:?} is not [algorithm:]name:base64secret")))
             }
         };
         if name.is_empty() {
-            return Err("TSIG key name is empty".to_string());
+            return Err(ConfigError::new("TSIG key name is empty"));
         }
         let secret = base64::prelude::BASE64_STANDARD
             .decode(secret)
-            .map_err(|e| format!("TSIG secret for {name:?} is not base64: {e}"))?;
+            .map_err(|e| ConfigError::new(format!("TSIG secret for {name:?} is not base64: {e}")))?;
         if secret.is_empty() {
-            return Err(format!("TSIG secret for {name:?} is empty"));
+            return Err(ConfigError::new(format!("TSIG secret for {name:?} is empty")));
         }
         Ok(TsigKey::new(name, algorithm, secret))
     }
@@ -174,7 +173,7 @@ impl TsigKeyring {
         TsigKeyring { keys }
     }
 
-    pub fn parse(specs: &[String]) -> Result<Self, String> {
+    pub fn parse(specs: &[String]) -> ConfigResult<Self> {
         let mut keys = Vec::new();
         for spec in specs {
             let spec = spec.trim();
@@ -226,17 +225,17 @@ pub struct Tsig {
 
 impl Tsig {
     /// Parse the RDATA of a TSIG record.
-    fn parse_rdata(key_name: &str, rdata: &[u8]) -> Result<Self, String> {
-        let (algorithm_name, rest) = read_name(rdata).ok_or("TSIG algorithm name is malformed")?;
+    fn parse_rdata(key_name: &str, rdata: &[u8]) -> ConfigResult<Self> {
+        let (algorithm_name, rest) = read_name(rdata).ok_or_else(|| ConfigError::new("TSIG algorithm name is malformed"))?;
         if rest.len() < 10 {
-            return Err("TSIG RDATA is truncated before its time".to_string());
+            return Err(ConfigError::new("TSIG RDATA is truncated before its time"));
         }
         let time_signed = rest[..6].iter().fold(0u64, |acc, b| (acc << 8) | *b as u64);
         let fudge = u16::from_be_bytes([rest[6], rest[7]]);
         let mac_size = u16::from_be_bytes([rest[8], rest[9]]) as usize;
         let rest = &rest[10..];
         if rest.len() < mac_size + 6 {
-            return Err("TSIG RDATA is truncated inside its MAC".to_string());
+            return Err(ConfigError::new("TSIG RDATA is truncated inside its MAC"));
         }
         let mac = rest[..mac_size].to_vec();
         let rest = &rest[mac_size..];
@@ -245,7 +244,7 @@ impl Tsig {
         let other_len = u16::from_be_bytes([rest[4], rest[5]]) as usize;
         let rest = &rest[6..];
         if rest.len() < other_len {
-            return Err("TSIG RDATA is truncated inside its other data".to_string());
+            return Err(ConfigError::new("TSIG RDATA is truncated inside its other data"));
         }
         Ok(Tsig {
             key_name: canonical_key_name(key_name),
@@ -260,9 +259,9 @@ impl Tsig {
     }
 
     /// The RDATA bytes of this record.
-    fn rdata_bytes(&self) -> Result<Vec<u8>, String> {
+    fn rdata_bytes(&self) -> ConfigResult<Vec<u8>> {
         let mut out = dname_to_bytes(&self.algorithm_name)
-            .map_err(|e| format!("TSIG algorithm name {}: {e}", self.algorithm_name))?;
+            .map_err(|e| ConfigError::new(format!("TSIG algorithm name {}: {e}", self.algorithm_name)))?;
         out.extend_from_slice(&self.time_signed.to_be_bytes()[2..]); // 48 bits
         out.extend_from_slice(&self.fudge.to_be_bytes());
         out.extend_from_slice(&(self.mac.len() as u16).to_be_bytes());
@@ -276,14 +275,14 @@ impl Tsig {
 
     /// The "TSIG variables" half of the digest (RFC 8945 §4.3.3): everything
     /// about the record except the MAC itself.
-    fn variables(&self) -> Result<Vec<u8>, String> {
+    fn variables(&self) -> ConfigResult<Vec<u8>> {
         let mut out = dname_to_bytes(&self.key_name)
-            .map_err(|e| format!("TSIG key name {}: {e}", self.key_name))?;
+            .map_err(|e| ConfigError::new(format!("TSIG key name {}: {e}", self.key_name)))?;
         out.extend_from_slice(&TSIG_CLASS.to_be_bytes());
         out.extend_from_slice(&0u32.to_be_bytes()); // TTL, always 0
         out.extend_from_slice(
             &dname_to_bytes(&self.algorithm_name)
-                .map_err(|e| format!("TSIG algorithm name: {e}"))?,
+                .map_err(|e| ConfigError::new(format!("TSIG algorithm name: {e}")))?,
         );
         out.extend_from_slice(&self.time_signed.to_be_bytes()[2..]);
         out.extend_from_slice(&self.fudge.to_be_bytes());
@@ -380,9 +379,9 @@ impl TsigSession {
     /// Call it once per message of a zone transfer, in order: the MACs chain, so
     /// a reordered or dropped envelope fails at the client rather than passing
     /// unnoticed.
-    pub fn sign(&mut self, message: Vec<u8>, now: u64) -> Result<Vec<u8>, String> {
+    pub fn sign(&mut self, message: Vec<u8>, now: u64) -> ConfigResult<Vec<u8>> {
         if message.len() < 12 {
-            return Err("cannot sign a message shorter than a header".to_string());
+            return Err(ConfigError::new("cannot sign a message shorter than a header"));
         }
         let mut tsig = Tsig {
             key_name: self.key.name.clone(),
@@ -439,7 +438,7 @@ impl TsigRejection {
     /// asks for exactly that. BADTIME is signed, because the MAC did verify, and
     /// carries this server's time in the other-data field so the peer can see
     /// which of the two clocks is wrong (§5.2.3).
-    pub fn attach(&self, response: Vec<u8>, now: u64) -> Result<Vec<u8>, String> {
+    pub fn attach(&self, response: Vec<u8>, now: u64) -> ConfigResult<Vec<u8>> {
         let mut tsig = Tsig {
             key_name: self.key_name.clone(),
             algorithm_name: self.algorithm_name.clone(),
@@ -537,9 +536,9 @@ pub fn check_request(packet: &[u8], keyring: &TsigKeyring, now: u64) -> TsigChec
 
 /// Sign a request with `key` — the client half, and what the tests drive both
 /// sides through.
-pub fn sign_request(message: Vec<u8>, key: &TsigKey, now: u64) -> Result<Vec<u8>, String> {
+pub fn sign_request(message: Vec<u8>, key: &TsigKey, now: u64) -> ConfigResult<Vec<u8>> {
     if message.len() < 12 {
-        return Err("cannot sign a message shorter than a header".to_string());
+        return Err(ConfigError::new("cannot sign a message shorter than a header"));
     }
     let mut tsig = Tsig {
         key_name: key.name.clone(),
@@ -705,10 +704,10 @@ fn strip_tsig(packet: &[u8], tsig_offset: usize, original_id: u16) -> Vec<u8> {
 
 /// `message` with `tsig` appended as the last additional record and ARCOUNT
 /// raised to match.
-fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> Result<Vec<u8>, String> {
+fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> ConfigResult<Vec<u8>> {
     let rdata = tsig.rdata_bytes()?;
     let owner = dname_to_bytes(&tsig.key_name)
-        .map_err(|e| format!("TSIG key name {}: {e}", tsig.key_name))?;
+        .map_err(|e| ConfigError::new(format!("TSIG key name {}: {e}", tsig.key_name)))?;
 
     // The owner name goes in uncompressed. A pointer would still be legal, but
     // the record has to be removable by truncating the message, and a pointer
@@ -722,7 +721,7 @@ fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> Result<Vec<u8>, String> {
 
     let ar = u16::from_be_bytes([message[10], message[11]])
         .checked_add(1)
-        .ok_or("additional count would overflow")?;
+        .ok_or_else(|| ConfigError::new("additional count would overflow"))?;
     message[10..12].copy_from_slice(&ar.to_be_bytes());
     Ok(message)
 }

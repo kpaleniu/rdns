@@ -15,7 +15,7 @@
 use crate::dname::dname_to_bytes;
 use crate::utils::record_types as rt;
 use crate::{ParsedRecord, ResourceRecord};
-use anyhow::anyhow;
+use crate::error::{DnssecError, DnssecResult};
 use sha1::{Digest, Sha1};
 use std::cmp::Ordering;
 
@@ -221,7 +221,7 @@ pub fn base32hex_encode(data: &[u8]) -> String {
 }
 
 /// Decode unpadded base32hex. Case-insensitive, as DNS labels are.
-pub fn base32hex_decode(text: &str) -> Result<Vec<u8>, anyhow::Error> {
+pub fn base32hex_decode(text: &str) -> DnssecResult<Vec<u8>> {
     let mut acc: u64 = 0;
     let mut bits = 0u32;
     let mut out = Vec::new();
@@ -230,7 +230,10 @@ pub fn base32hex_decode(text: &str) -> Result<Vec<u8>, anyhow::Error> {
             b'0'..=b'9' => c - b'0',
             b'a'..=b'v' => c - b'a' + 10,
             b'A'..=b'V' => c - b'A' + 10,
-            _ => return Err(anyhow!("invalid base32hex character {:?}", c as char)),
+            _ => return Err(DnssecError::parse(format!(
+                "invalid base32hex character {:?}",
+                c as char,
+            ))),
         };
         acc = (acc << 5) | value as u64;
         bits += 5;
@@ -258,11 +261,11 @@ pub fn base32hex_decode(text: &str) -> Result<Vec<u8>, anyhow::Error> {
 /// round zero is the down-cased wire-format name — not its text. Hashing the
 /// text with a single unsalted pass, as this used to, produces a value that
 /// matches no real zone, so every negative answer fails to prove anything.
-pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> Result<Vec<u8>, anyhow::Error> {
+pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Vec<u8>> {
     if iterations > MAX_NSEC3_ITERATIONS {
-        return Err(anyhow!(
-            "NSEC3 iteration count {iterations} exceeds the {MAX_NSEC3_ITERATIONS} we will compute (RFC 9276)"
-        ));
+        return Err(DnssecError::parse(format!(
+            "NSEC3 iteration count {iterations} exceeds the {MAX_NSEC3_ITERATIONS} we will compute (RFC 9276)",
+        )));
     }
     let wire = dname_to_bytes(&name.to_ascii_lowercase())?;
 
@@ -392,23 +395,23 @@ impl Nsec3 {
     }
 
     /// The hash of `name` under this record's parameters.
-    pub fn hash(&self, name: &str) -> Result<Vec<u8>, anyhow::Error> {
+    pub fn hash(&self, name: &str) -> DnssecResult<Vec<u8>> {
         if self.hash_algorithm != 1 {
-            return Err(anyhow!(
+            return Err(DnssecError::parse(format!(
                 "unsupported NSEC3 hash algorithm {}",
-                self.hash_algorithm
-            ));
+                self.hash_algorithm,
+            )));
         }
         nsec3_hash(name, &self.salt, self.iterations)
     }
 
     /// Whether this NSEC3 is the record *for* `name`.
-    pub fn matches(&self, name: &str) -> Result<bool, anyhow::Error> {
+    pub fn matches(&self, name: &str) -> DnssecResult<bool> {
         Ok(self.hash(name)? == self.owner_hash)
     }
 
     /// Whether `name`'s hash falls strictly inside this record's span.
-    pub fn covers(&self, name: &str) -> Result<bool, anyhow::Error> {
+    pub fn covers(&self, name: &str) -> DnssecResult<bool> {
         let hash = self.hash(name)?;
         if hash.is_empty() || self.owner_hash.is_empty() || self.next_hashed_owner.is_empty() {
             return Ok(false);

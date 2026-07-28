@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use crate::error::WireError;
 
 /// Upper bound on additional records in a request. A legitimate request carries
 /// at most an OPT plus a TSIG/SIG(0); the slack is for forward compatibility.
@@ -39,7 +39,7 @@ impl Default for ValidationConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationResult {
     Valid,
-    Invalid(String),
+    Invalid(WireError),
 }
 
 impl ValidationResult {
@@ -47,10 +47,16 @@ impl ValidationResult {
         matches!(self, ValidationResult::Valid)
     }
 
-    pub fn error_message(&self) -> Option<&str> {
+    /// Why the packet was rejected, as something a caller can branch on.
+    ///
+    /// Typed rather than a message, because the decision this feeds is a
+    /// *response code*: [`WireError::Unsupported`] is NOTIMP and the rest are
+    /// FORMERR. Stringifying it here threw that away and forced every caller to
+    /// grep the wording.
+    pub fn error(&self) -> Option<&WireError> {
         match self {
             ValidationResult::Valid => None,
-            ValidationResult::Invalid(msg) => Some(msg),
+            ValidationResult::Invalid(why) => Some(why),
         }
     }
 }
@@ -79,35 +85,43 @@ impl RequestValidator {
         };
 
         if data.len() > max_size {
-            return ValidationResult::Invalid(format!(
-                "packet size {} exceeds maximum {}",
-                data.len(),
-                max_size
-            ));
+            return ValidationResult::Invalid(WireError::TooLong {
+                what: "the packet",
+                limit: max_size,
+                actual: data.len(),
+            });
         }
 
         // Minimum DNS header size
         if data.len() < 12 {
-            return ValidationResult::Invalid("packet too small for DNS header".to_string());
+            return ValidationResult::Invalid(WireError::Truncated {
+                what: "the DNS header",
+                need: 12,
+                have: data.len(),
+            });
         }
 
         // Validate header structure
         if let Err(e) = self.validate_header(data) {
-            return ValidationResult::Invalid(e.to_string());
+            return ValidationResult::Invalid(e);
         }
 
         // Parse and validate domain names in queries
         if let Err(e) = self.validate_domain_names(data) {
-            return ValidationResult::Invalid(e.to_string());
+            return ValidationResult::Invalid(e);
         }
 
         ValidationResult::Valid
     }
 
     /// Validate DNS header format
-    fn validate_header(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+    fn validate_header(&self, data: &[u8]) -> Result<(), WireError> {
         if data.len() < 12 {
-            return Err(anyhow!("header too short"));
+            return Err(WireError::Truncated {
+                what: "the DNS header",
+                need: 12,
+                have: data.len(),
+            });
         }
 
         // Parse counts from header
@@ -118,7 +132,11 @@ impl RequestValidator {
 
         // Sanity checks
         if query_count > 10 {
-            return Err(anyhow!("too many queries: {}", query_count));
+            return Err(WireError::TooLong {
+                what: "the question count",
+                limit: 10,
+                actual: query_count,
+            });
         }
 
         // Which sections a *request* may carry is a question per section, not one
@@ -149,18 +167,24 @@ impl RequestValidator {
         let opcode = (data[2] >> 3) & 0x0f;
         if !qr_flag {
             if opcode == OPCODE_QUERY && answer_count > 0 {
-                return Err(anyhow!("request query should not have answer sections"));
+                return Err(WireError::malformed(
+                    "a request",
+                    "a QUERY carries no answer records",
+                ));
             }
             if answer_count > MAX_REQUEST_ADDITIONALS || auth_count > MAX_REQUEST_ADDITIONALS {
-                return Err(anyhow!(
-                    "too many records in a request: {answer_count} answer, {auth_count} authority"
-                ));
+                return Err(WireError::TooLong {
+                    what: "the answer and authority counts of a request",
+                    limit: MAX_REQUEST_ADDITIONALS,
+                    actual: answer_count.max(auth_count),
+                });
             }
             if add_count > MAX_REQUEST_ADDITIONALS {
-                return Err(anyhow!(
-                    "too many additional records in request: {}",
-                    add_count
-                ));
+                return Err(WireError::TooLong {
+                    what: "the additional count of a request",
+                    limit: MAX_REQUEST_ADDITIONALS,
+                    actual: add_count,
+                });
             }
         }
 
@@ -168,7 +192,7 @@ impl RequestValidator {
     }
 
     /// Validate domain names in the packet
-    fn validate_domain_names(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+    fn validate_domain_names(&self, data: &[u8]) -> Result<(), WireError> {
         let mut offset = 12; // Start after header
 
         // Parse query names (basic validation without full parsing)
@@ -186,11 +210,15 @@ impl RequestValidator {
         data: &[u8],
         offset: &mut usize,
         depth: usize,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), WireError> {
         const MAX_DEPTH: usize = 10;
         
         if depth > MAX_DEPTH {
-            return Err(anyhow!("domain name pointer depth exceeded"));
+            return Err(WireError::TooLong {
+                what: "compression pointer nesting",
+                limit: MAX_DEPTH,
+                actual: depth,
+            });
         }
 
         let mut label_count = 0;
@@ -198,7 +226,11 @@ impl RequestValidator {
 
         loop {
             if *offset >= data.len() {
-                return Err(anyhow!("domain name goes beyond packet boundary"));
+                return Err(WireError::Truncated {
+                    what: "a domain name",
+                    need: *offset + 1,
+                    have: data.len(),
+                });
             }
 
             let len_byte = data[*offset];
@@ -207,7 +239,11 @@ impl RequestValidator {
             // Check for pointer (top 2 bits = 11)
             if len_byte & 0xc0 == 0xc0 {
                 if *offset >= data.len() {
-                    return Err(anyhow!("pointer incomplete"));
+                    return Err(WireError::Truncated {
+                        what: "a compression pointer",
+                        need: 2,
+                        have: data.len() - *offset,
+                    });
                 }
                 // Skip pointer offset byte (pointer is 2 bytes total, we already consumed first)
                 *offset += 1;
@@ -224,16 +260,20 @@ impl RequestValidator {
 
             // Validate label length
             if label_len > self.config.max_label_size {
-                return Err(anyhow!(
-                    "label length {} exceeds maximum {}",
-                    label_len,
-                    self.config.max_label_size
-                ));
+                return Err(WireError::TooLong {
+                    what: "a label",
+                    limit: self.config.max_label_size,
+                    actual: label_len,
+                });
             }
 
             // Check bounds
             if *offset + label_len > data.len() {
-                return Err(anyhow!("label goes beyond packet boundary"));
+                return Err(WireError::Truncated {
+                    what: "a label",
+                    need: *offset + label_len,
+                    have: data.len(),
+                });
             }
 
             *offset += label_len;
@@ -242,19 +282,19 @@ impl RequestValidator {
 
             // Validate counts
             if label_count > self.config.max_labels {
-                return Err(anyhow!(
-                    "label count {} exceeds maximum {}",
-                    label_count,
-                    self.config.max_labels
-                ));
+                return Err(WireError::TooLong {
+                    what: "the label count of a domain name",
+                    limit: self.config.max_labels,
+                    actual: label_count,
+                });
             }
 
             if total_size > self.config.max_name_size {
-                return Err(anyhow!(
-                    "domain name size {} exceeds maximum {}",
-                    total_size,
-                    self.config.max_name_size
-                ));
+                return Err(WireError::TooLong {
+                    what: "a domain name",
+                    limit: self.config.max_name_size,
+                    actual: total_size,
+                });
             }
         }
     }
@@ -294,10 +334,10 @@ mod tests {
         
         let result = validator.validate_packet(&packet, false);
         assert!(!result.is_valid());
-        assert!(result
-            .error_message()
-            .unwrap()
-            .contains("exceeds maximum"));
+        assert!(
+            matches!(result.error(), Some(WireError::TooLong { what: "the packet", .. })),
+            "got {result:?}"
+        );
     }
 
     #[test]
@@ -308,8 +348,10 @@ mod tests {
         // But invalid because it's malformed DNS
         let result = validator.validate_packet(&packet, true);
         // May fail due to format, but not size
-        assert!(result.error_message().is_none() || 
-                !result.error_message().unwrap().contains("exceeds maximum"));
+        assert!(
+            !matches!(result.error(), Some(WireError::TooLong { what: "the packet", .. })),
+            "600 bytes is under the TCP limit, so any failure here is not about size"
+        );
     }
 
     #[test]
@@ -337,10 +379,10 @@ mod tests {
         
         let result = validator.validate_packet(&packet, false);
         assert!(!result.is_valid());
-        assert!(result
-            .error_message()
-            .unwrap()
-            .contains("should not have answer"));
+        assert!(
+            matches!(result.error(), Some(WireError::Malformed { what: "a request", .. })),
+            "got {result:?}"
+        );
     }
 
     /// A NOTIFY carries the zone's SOA in its answer section (RFC 1996 §3.7),
@@ -425,10 +467,16 @@ mod tests {
 
         let result = validator.validate_packet(&packet, false);
         assert!(!result.is_valid());
-        assert!(result
-            .error_message()
-            .unwrap()
-            .contains("too many additional"));
+        assert!(
+            matches!(
+                result.error(),
+                Some(WireError::TooLong {
+                    what: "the additional count of a request",
+                    ..
+                })
+            ),
+            "got {result:?}"
+        );
     }
 
     #[test]
@@ -464,8 +512,10 @@ mod tests {
         
         let result = validator.validate_packet(&packet, false);
         // Should not fail due to answer count (responses can have answers)
-        assert!(result.error_message().is_none() || 
-                !result.error_message().unwrap().contains("should not have answer"));
+        assert!(
+            !matches!(result.error(), Some(WireError::Malformed { what: "a request", .. })),
+            "a response may carry answers, got {result:?}"
+        );
     }
 
     #[test]
@@ -488,13 +538,14 @@ mod tests {
         
         let result = validator.validate_packet(&packet, false);
         assert!(!result.is_valid());
-        assert!(result
-            .error_message()
-            .unwrap()
-            .contains("label length") || result
-            .error_message()
-            .unwrap()
-            .contains("boundary"));
+        assert!(
+            matches!(
+                result.error(),
+                Some(WireError::TooLong { what: "a label", .. })
+                    | Some(WireError::Truncated { what: "a label", .. })
+            ),
+            "got {result:?}"
+        );
     }
 
     #[test]
@@ -505,8 +556,10 @@ mod tests {
         let packet = vec![0u8; 16 * 1024];
         let result = validator.validate_packet(&packet, true);
         // May fail due to format, but not size
-        assert!(result.error_message().is_none() || 
-                !result.error_message().unwrap().contains("exceeds maximum"));
+        assert!(
+            !matches!(result.error(), Some(WireError::TooLong { what: "the packet", .. })),
+            "600 bytes is under the TCP limit, so any failure here is not about size"
+        );
     }
 
     #[test]

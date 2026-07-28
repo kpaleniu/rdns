@@ -22,6 +22,7 @@
 //! Nothing here opens a socket except [`fetch_zone`] and [`fetch_soa`]; the
 //! assembling is a state machine so it can be tested without one.
 
+use crate::error::{TransferError, TransferResult};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -134,17 +135,17 @@ impl AxfrAssembler {
     }
 
     /// Take one message of the transfer.
-    pub fn accept(&mut self, msg: &DnsMessage) -> Result<Progress, String> {
+    pub fn accept(&mut self, msg: &DnsMessage) -> TransferResult<Progress> {
         if self.complete {
-            return Err("a record arrived after the transfer closed".to_string());
+            return Err(TransferError::malformed("a record arrived after the transfer closed"));
         }
         if msg.rcode != ResponseCode::Ok {
-            return Err(format!("master answered {:?}", msg.rcode));
+            return Err(TransferError::malformed(format!("master answered {:?}", msg.rcode)));
         }
         if !msg.authoritive {
             // AA is how the master says the zone is its to hand out. Without it
             // this is some other server's idea of the zone.
-            return Err("transfer message is not authoritative".to_string());
+            return Err(TransferError::malformed("transfer message is not authoritative"));
         }
 
         for rr in &msg.answers {
@@ -156,14 +157,12 @@ impl AxfrAssembler {
         Ok(Progress::More)
     }
 
-    fn accept_record(&mut self, rr: &ResourceRecord) -> Result<Progress, String> {
+    fn accept_record(&mut self, rr: &ResourceRecord) -> TransferResult<Progress> {
         let name = absolute(&rr.name);
         if !in_bailiwick(&name, &self.zone) {
-            return Err(format!(
-                "master sent {name}, which is not in {}: a transfer may only carry \
+            return Err(TransferError::malformed(format!("master sent {name}, which is not in {}: a transfer may only carry \
                  the zone it is a transfer of",
-                self.zone
-            ));
+                self.zone)));
         }
 
         let is_apex_soa = rr.rdata.rtype == rt::SOA && name.eq_ignore_ascii_case(&self.zone);
@@ -173,13 +172,11 @@ impl AxfrAssembler {
             // and this is not a transfer we can bracket.
             None => {
                 if !is_apex_soa {
-                    return Err(format!(
-                        "transfer does not open with the SOA of {}, but with {name} type {}",
-                        self.zone, rr.rdata.rtype
-                    ));
+                    return Err(TransferError::malformed(format!("transfer does not open with the SOA of {}, but with {name} type {}",
+                        self.zone, rr.rdata.rtype)));
                 }
                 let Ok(ParsedRecord::SOA { serial, .. }) = rr.rdata.parse() else {
-                    return Err("the opening SOA does not parse".to_string());
+                    return Err(TransferError::malformed("the opening SOA does not parse"));
                 };
                 self.opening_soa = Some((rr.clone(), serial));
                 self.records.push(rr.clone());
@@ -192,9 +189,7 @@ impl AxfrAssembler {
             }
             Some(_) => {
                 if self.records.len() >= MAX_TRANSFER_RECORDS {
-                    return Err(format!(
-                        "transfer exceeded {MAX_TRANSFER_RECORDS} records without closing"
-                    ));
+                    return Err(TransferError::malformed(format!("transfer exceeded {MAX_TRANSFER_RECORDS} records without closing")));
                 }
                 self.records.push(rr.clone());
                 Ok(Progress::More)
@@ -206,12 +201,10 @@ impl AxfrAssembler {
     ///
     /// A stream that stopped early is an error rather than a short zone: the
     /// whole purpose of the closing SOA is that the difference is visible.
-    pub fn into_zone(self) -> Result<Zone, String> {
+    pub fn into_zone(self) -> TransferResult<Zone> {
         if !self.complete {
-            return Err(format!(
-                "transfer of {} ended without its closing SOA — the stream was cut",
-                self.zone
-            ));
+            return Err(TransferError::malformed(format!("transfer of {} ended without its closing SOA — the stream was cut",
+                self.zone)));
         }
         let mut zone = Zone::new(self.zone.clone());
         for rr in self.records {
@@ -315,15 +308,15 @@ impl IxfrAssembler {
     }
 
     /// Take one message of the answer.
-    pub fn accept(&mut self, msg: &DnsMessage) -> Result<Progress, String> {
+    pub fn accept(&mut self, msg: &DnsMessage) -> TransferResult<Progress> {
         if self.state == IxfrState::Complete {
-            return Err("a record arrived after the transfer closed".to_string());
+            return Err(TransferError::malformed("a record arrived after the transfer closed"));
         }
         if msg.rcode != ResponseCode::Ok {
-            return Err(format!("master answered {:?}", msg.rcode));
+            return Err(TransferError::malformed(format!("master answered {:?}", msg.rcode)));
         }
         if !msg.authoritive {
-            return Err("transfer message is not authoritative".to_string());
+            return Err(TransferError::malformed("transfer message is not authoritative"));
         }
 
         for rr in &msg.answers {
@@ -351,21 +344,19 @@ impl IxfrAssembler {
         Ok(Progress::More)
     }
 
-    fn accept_record(&mut self, rr: &ResourceRecord) -> Result<Progress, String> {
+    fn accept_record(&mut self, rr: &ResourceRecord) -> TransferResult<Progress> {
         let name = absolute(&rr.name);
         if !in_bailiwick(&name, &self.zone) {
-            return Err(format!(
-                "master sent {name}, which is not in {}: a transfer may only carry \
+            return Err(TransferError::malformed(format!("master sent {name}, which is not in {}: a transfer may only carry \
                  the zone it is a transfer of",
-                self.zone
-            ));
+                self.zone)));
         }
         self.records_seen += 1;
 
         let soa_serial = if rr.rdata.rtype == rt::SOA && name.eq_ignore_ascii_case(&self.zone) {
             match rr.rdata.parse() {
                 Ok(ParsedRecord::SOA { serial, .. }) => Some(serial),
-                _ => return Err("an SOA in the transfer does not parse".to_string()),
+                _ => return Err(TransferError::malformed("an SOA in the transfer does not parse")),
             }
         } else {
             None
@@ -381,10 +372,8 @@ impl IxfrAssembler {
                 self.state = IxfrState::BetweenSequences;
             }
             (IxfrState::AwaitingFirstSoa, None) => {
-                return Err(format!(
-                    "the answer does not open with the SOA of {}",
-                    self.zone
-                ))
+                return Err(TransferError::malformed(format!("the answer does not open with the SOA of {}",
+                    self.zone)))
             }
 
             // The second record decides which shape this is.
@@ -439,12 +428,10 @@ impl IxfrAssembler {
     /// `base` must be the version whose serial was sent in the request — the
     /// sequences describe changes *from* it, and applying them to anything else
     /// produces a zone that never existed.
-    pub fn into_outcome(self, base: &Zone) -> Result<IxfrOutcome, String> {
+    pub fn into_outcome(self, base: &Zone) -> TransferResult<IxfrOutcome> {
         if self.state != IxfrState::Complete {
-            return Err(format!(
-                "the answer for {} ended without its closing SOA — the stream was cut",
-                self.zone
-            ));
+            return Err(TransferError::malformed(format!("the answer for {} ended without its closing SOA — the stream was cut",
+                self.zone)));
         }
         if !self.sequences.is_empty() {
             let steps = self.sequences.len();
@@ -453,7 +440,7 @@ impl IxfrAssembler {
             for sequence in self.sequences {
                 let to_soa = sequence
                     .to_soa
-                    .ok_or("a difference sequence has no SOA for the version it produces")?;
+                    .ok_or_else(|| TransferError::malformed("a difference sequence has no SOA for the version it produces"))?;
                 let (next, removed) =
                     crate::ixfr::apply_changes(&zone, &sequence.deleted, &sequence.added, &to_soa);
                 missing_deletions += sequence.deleted.len() - removed;
@@ -507,7 +494,7 @@ pub async fn fetch_soa(
     master: std::net::SocketAddr,
     zone: &str,
     key: Option<&TsigKey>,
-) -> Result<u32, String> {
+) -> TransferResult<u32> {
     let deadline = tokio::time::timeout(SOA_TIMEOUT, async {
         let mut stream = connect(master).await?;
         let id = rand_id();
@@ -516,14 +503,15 @@ pub async fn fetch_soa(
 
         let (reply, _mac) = read_reply(&mut stream, id, key, &signed, true).await?;
         if reply.rcode != ResponseCode::Ok {
-            return Err(format!("master answered {:?} to the SOA probe", reply.rcode));
+            return Err(TransferError::malformed(format!("master answered {:?} to the SOA probe", reply.rcode)));
         }
-        soa_serial(&reply).ok_or_else(|| "master's answer carried no SOA".to_string())
+        soa_serial(&reply)
+            .ok_or_else(|| TransferError::malformed("master's answer carried no SOA"))
     });
 
     deadline
         .await
-        .map_err(|_| format!("SOA probe to {master} timed out"))?
+        .map_err(|_| TransferError::timeout(format!("SOA probe to {master} timed out")))?
 }
 
 /// Transfer the zone from `master`, verifying it as it arrives.
@@ -531,7 +519,7 @@ pub async fn fetch_zone(
     master: std::net::SocketAddr,
     zone: &str,
     key: Option<&TsigKey>,
-) -> Result<Zone, String> {
+) -> TransferResult<Zone> {
     let transfer = tokio::time::timeout(TRANSFER_TIMEOUT, async {
         let mut stream = connect(master).await?;
         let id = rand_id();
@@ -558,7 +546,7 @@ pub async fn fetch_zone(
 
     transfer
         .await
-        .map_err(|_| format!("transfer of {zone} from {master} timed out"))?
+        .map_err(|_| TransferError::timeout(format!("transfer of {zone} from {master} timed out")))?
 }
 
 /// Ask `master` only for what changed since `base`, over TCP.
@@ -572,9 +560,9 @@ pub async fn fetch_changes(
     master: std::net::SocketAddr,
     base: &Zone,
     key: Option<&TsigKey>,
-) -> Result<IxfrOutcome, String> {
+) -> TransferResult<IxfrOutcome> {
     let zone = base.origin().to_string();
-    let soa = apex_soa(base).ok_or_else(|| format!("zone {zone} has no SOA to ask from"))?;
+    let soa = apex_soa(base).ok_or_else(|| TransferError::malformed(format!("zone {zone} has no SOA to ask from")))?;
 
     let transfer = tokio::time::timeout(TRANSFER_TIMEOUT, async {
         let mut stream = connect(master).await?;
@@ -599,7 +587,9 @@ pub async fn fetch_changes(
 
     transfer
         .await
-        .map_err(|_| format!("incremental transfer of {zone} from {master} timed out"))?
+        .map_err(|_| TransferError::timeout(format!(
+            "incremental transfer of {zone} from {master} timed out"
+        )))?
 }
 
 /// The apex SOA of a zone as a resource record.
@@ -614,10 +604,10 @@ fn apex_soa(zone: &Zone) -> Option<ResourceRecord> {
         })
 }
 
-async fn connect(master: std::net::SocketAddr) -> Result<TcpStream, String> {
+async fn connect(master: std::net::SocketAddr) -> TransferResult<TcpStream> {
     TcpStream::connect(master)
         .await
-        .map_err(|e| format!("connecting to {master}: {e}"))
+        .map_err(|e| TransferError::malformed(format!("connecting to {master}: {e}")))
 }
 
 /// Serialize, sign if there is a key, and send. Returns the request's MAC, which
@@ -627,17 +617,18 @@ async fn send_request(
     request: &DnsMessage,
     key: Option<&TsigKey>,
     _id: u16,
-) -> Result<Vec<u8>, String> {
+) -> TransferResult<Vec<u8>> {
     let mut buf = vec![0u8; 512];
     let n = request
         .to_bytes(&mut buf)
-        .map_err(|e| format!("serializing the request: {e}"))?;
+        .map_err(|e| TransferError::malformed(format!("serializing the request: {e}")))?;
     let mut packet = buf[..n].to_vec();
 
     let mut mac = Vec::new();
     if let Some(key) = key {
         packet = tsig::sign_request(packet, key, tsig::now())?;
-        mac = tsig::request_mac(&packet).ok_or("just-signed request has no TSIG")?;
+        mac = tsig::request_mac(&packet)
+            .ok_or_else(|| TransferError::tsig("just-signed request has no TSIG"))?;
     }
 
     let mut framed = (packet.len() as u16).to_be_bytes().to_vec();
@@ -645,7 +636,7 @@ async fn send_request(
     stream
         .write_all(&framed)
         .await
-        .map_err(|e| format!("sending the request: {e}"))?;
+        .map_err(|e| TransferError::malformed(format!("sending the request: {e}")))?;
     Ok(mac)
 }
 
@@ -658,21 +649,21 @@ async fn read_reply(
     key: Option<&TsigKey>,
     previous_mac: &[u8],
     first: bool,
-) -> Result<(DnsMessage, Option<Vec<u8>>), String> {
+) -> TransferResult<(DnsMessage, Option<Vec<u8>>)> {
     let mut length = [0u8; 2];
     stream
         .read_exact(&mut length)
         .await
-        .map_err(|e| format!("reading the reply's length: {e}"))?;
+        .map_err(|e| TransferError::malformed(format!("reading the reply's length: {e}")))?;
     let length = u16::from_be_bytes(length) as usize;
     if length == 0 {
-        return Err("master closed the transfer with an empty frame".to_string());
+        return Err(TransferError::malformed("master closed the transfer with an empty frame"));
     }
     let mut packet = vec![0u8; length];
     stream
         .read_exact(&mut packet)
         .await
-        .map_err(|e| format!("reading the reply: {e}"))?;
+        .map_err(|e| TransferError::malformed(format!("reading the reply: {e}")))?;
 
     let mut mac = None;
     if let Some(key) = key {
@@ -686,24 +677,26 @@ async fn read_reply(
                 // an unsigned intermediate would have to be handled. Refusing is
                 // the honest position: a message we did not authenticate is not
                 // one to build a zone from.
-                return Err(
-                    "an envelope of the transfer carried no TSIG, and a key was configured"
-                        .to_string(),
-                );
+                return Err(TransferError::tsig(
+                    "an envelope of the transfer carried no TSIG, and a key was configured",
+                ));
             }
-            Err(e) => return Err(format!("the transfer's signature failed: {}", e.reason())),
+            Err(e) => {
+                return Err(TransferError::tsig(format!(
+                    "the transfer's signature failed: {}",
+                    e.reason()
+                )))
+            }
         }
     }
 
-    let msg = DnsMessage::try_from_bytes(&packet).map_err(|e| format!("parsing the reply: {e}"))?;
+    let msg = DnsMessage::try_from_bytes(&packet).map_err(|e| TransferError::malformed(format!("parsing the reply: {e}")))?;
     if msg.id != id {
-        return Err(format!(
-            "reply has transaction id {:#06x}, not the {id:#06x} we sent",
-            msg.id
-        ));
+        return Err(TransferError::malformed(format!("reply has transaction id {:#06x}, not the {id:#06x} we sent",
+            msg.id)));
     }
     if !msg.response {
-        return Err("master sent a query where a response belongs".to_string());
+        return Err(TransferError::malformed("master sent a query where a response belongs"));
     }
     Ok((msg, mac))
 }
@@ -785,7 +778,7 @@ mod tests {
         assert_eq!(assembler.accept(&truncated).unwrap(), Progress::More);
 
         let err = assembler.into_zone().unwrap_err();
-        assert!(err.contains("without its closing SOA"), "got: {err}");
+        assert!(err.to_string().contains("without its closing SOA"), "got: {err}");
     }
 
     #[test]
@@ -795,7 +788,7 @@ mod tests {
         msg.answers.remove(0); // drop the opening SOA
 
         let err = assembler.accept(&msg).unwrap_err();
-        assert!(err.contains("does not open with the SOA"), "got: {err}");
+        assert!(err.to_string().contains("does not open with the SOA"), "got: {err}");
     }
 
     /// A master for one zone must not be able to write into another. The records
@@ -817,7 +810,7 @@ mod tests {
         );
 
         let err = assembler.accept(&msg).unwrap_err();
-        assert!(err.contains("not in example.com."), "got: {err}");
+        assert!(err.to_string().contains("not in example.com."), "got: {err}");
     }
 
     #[test]
@@ -828,7 +821,7 @@ mod tests {
             let _ = assembler.accept(&msg);
         }
         let err = assembler.accept(&transfer_of(&source)[0]).unwrap_err();
-        assert!(err.contains("after the transfer closed"), "got: {err}");
+        assert!(err.to_string().contains("after the transfer closed"), "got: {err}");
     }
 
     #[test]
@@ -836,7 +829,7 @@ mod tests {
         let mut assembler = AxfrAssembler::new("example.com.");
         let mut msg = transfer_of(&source_zone())[0].clone();
         msg.rcode = ResponseCode::Refused;
-        assert!(assembler.accept(&msg).unwrap_err().contains("Refused"));
+        assert!(assembler.accept(&msg).unwrap_err().to_string().contains("Refused"));
 
         // Nor is a non-authoritative one: AA is how the master says the zone is
         // its to hand out.
@@ -846,6 +839,7 @@ mod tests {
         assert!(assembler
             .accept(&not_auth)
             .unwrap_err()
+            .to_string()
             .contains("not authoritative"));
     }
 
@@ -1086,7 +1080,7 @@ mod tests {
         let Err(err) = assembler.into_outcome(&v1) else {
             panic!("a stream cut before its closing SOA is not a transfer");
         };
-        assert!(err.contains("without its closing SOA"), "got: {err}");
+        assert!(err.to_string().contains("without its closing SOA"), "got: {err}");
 
         // A record from another zone.
         let mut out_of_bailiwick = crate::ixfr::ixfr_response(&ixfr_from(&v1), &v2, &log)
@@ -1107,7 +1101,7 @@ mod tests {
             .iter()
             .find_map(|msg| assembler.accept(msg).err())
             .expect("the foreign record should be refused");
-        assert!(err.contains("not in example.com."), "got: {err}");
+        assert!(err.to_string().contains("not in example.com."), "got: {err}");
 
         // And an answer that does not open with the zone's SOA at all. Note that
         // simply dropping the first record would *not* be caught: the second
@@ -1128,7 +1122,7 @@ mod tests {
         let Err(err) = assembler.accept(&headless[0]) else {
             panic!("an answer that does not open with an SOA is not a transfer");
         };
-        assert!(err.contains("does not open with the SOA"), "got: {err}");
+        assert!(err.to_string().contains("does not open with the SOA"), "got: {err}");
     }
 
     // -----------------------------------------------------------------
@@ -1237,7 +1231,11 @@ mod tests {
     #[tokio::test]
     async fn test_fetches_the_soa_serial_over_tcp() {
         let master = spawn_master(source_zone(), None).await;
-        assert_eq!(fetch_soa(master, "example.com.", None).await, Ok(42));
+        assert_eq!(
+            fetch_soa(master, "example.com.", None).await.unwrap(),
+            42,
+            "the master's apex SOA carries serial 42"
+        );
     }
 
     /// A signed transfer, MACs chained across every envelope — the case a
@@ -1277,7 +1275,7 @@ mod tests {
         let err = fetch_zone(master, "example.com.", Some(&ours))
             .await
             .unwrap_err();
-        assert!(err.contains("signature failed"), "got: {err}");
+        assert!(err.to_string().contains("signature failed"), "got: {err}");
     }
 
     #[tokio::test]

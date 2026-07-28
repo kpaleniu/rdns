@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use rdns::dnssec_chain::{TrustAnchors, ValidationState};
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
@@ -141,7 +142,7 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Recursion is the default; naming an upstream is what selects forwarding.
@@ -160,10 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = &cli.root_hints {
         if config.mode == ResolverMode::Recurse {
             let text = std::fs::read_to_string(path)
-                .map_err(|e| format!("reading root hints {}: {e}", path.display()))?;
+                .with_context(|| format!("reading root hints {}", path.display()))?;
             let hints = rdns::resolver::parse_root_hints(&text);
             if hints.is_empty() {
-                return Err(format!("no A/AAAA records found in {}", path.display()).into());
+                return Err(anyhow!("no A/AAAA records found in {}", path.display()));
             }
             config.root_hints = hints;
             custom_hints = true;
@@ -363,7 +364,7 @@ struct AnchorProbe {
 /// tie to the anchor — and adopting keys from one would be adopting whatever
 /// answered. This is the precondition `ManagedAnchors::observe` documents and
 /// cannot check for itself.
-async fn probe_zone(resolver: &Resolver, zone: &str) -> Result<AnchorProbe, String> {
+async fn probe_zone(resolver: &Resolver, zone: &str) -> anyhow::Result<AnchorProbe> {
     let query = QuerySection {
         qname: zone.to_string(),
         qtype: record_types::DNSKEY,
@@ -372,10 +373,10 @@ async fn probe_zone(resolver: &Resolver, zone: &str) -> Result<AnchorProbe, Stri
     let (response, state) = resolver
         .resolve_validated(&query)
         .await
-        .map_err(|e| format!("resolving DNSKEY: {e}"))?;
+        .context("resolving DNSKEY")?;
 
     if state != ValidationState::Secure {
-        return Err(format!(
+        return Err(anyhow!(
             "the DNSKEY RRset did not validate ({state:?}) — not adopting anything from it"
         ));
     }
@@ -387,7 +388,7 @@ async fn probe_zone(resolver: &Resolver, zone: &str) -> Result<AnchorProbe, Stri
         .filter_map(rdns::dnssec::Dnskey::from_record)
         .collect();
     if keys.is_empty() {
-        return Err("a validated answer with no DNSKEY in it".to_string());
+        return Err(anyhow!("a validated answer with no DNSKEY in it"));
     }
 
     // The timers come from the RRSIG that covers the set: how long the zone said

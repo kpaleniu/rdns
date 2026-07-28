@@ -30,7 +30,7 @@ use crate::dnssec_denial::{
 };
 use crate::utils::record_types as rt;
 use crate::{ParsedRecord, RecordData, ResourceRecord};
-use anyhow::anyhow;
+use crate::error::DnssecError;
 use std::collections::HashMap;
 
 /// How much authentication an answer carries (RFC 4035 §4.3).
@@ -136,7 +136,7 @@ impl TrustAnchors {
     /// parse is an error rather than a skip: a trust anchor file with a typo in
     /// it should stop the process, not quietly leave us trusting less than the
     /// operator intended.
-    pub fn parse(text: &str) -> Result<Self, anyhow::Error> {
+    pub fn parse(text: &str) -> Result<Self, DnssecError> {
         let mut anchors = Vec::new();
         for (lineno, raw) in text.lines().enumerate() {
             let line = raw.split(';').next().unwrap_or("");
@@ -146,19 +146,29 @@ impl TrustAnchors {
                 continue;
             }
             anchors.push(parse_ds_line(line).map_err(|e| {
-                anyhow!("trust anchor line {}: {e} in {:?}", lineno + 1, raw.trim())
+                DnssecError::parse(format!(
+                    "trust anchor line {}: {e} in {:?}",
+                    lineno + 1,
+                    raw.trim(),
+                ))
             })?);
         }
         if anchors.is_empty() {
-            return Err(anyhow!("no DS records found"));
+            return Err(DnssecError::parse("no DS records found"));
         }
         Ok(TrustAnchors { anchors })
     }
 
-    pub fn from_file(path: &std::path::Path) -> Result<Self, anyhow::Error> {
+    pub fn from_file(path: &std::path::Path) -> Result<Self, DnssecError> {
         let text = std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("reading trust anchors {}: {e}", path.display()))?;
-        Self::parse(&text).map_err(|e| anyhow!("{}: {e}", path.display()))
+            .map_err(|e| DnssecError::parse(format!(
+                "reading trust anchors {}: {e}",
+                path.display(),
+            )))?;
+        Self::parse(&text).map_err(|e| DnssecError::parse(format!(
+            "{}: {e}",
+            path.display(),
+        )))
     }
 
     /// The anchors published exactly at `zone`.
@@ -185,10 +195,13 @@ impl TrustAnchors {
 }
 
 /// One `owner [class] DS key_tag algorithm digest_type digest` line.
-fn parse_ds_line(line: &str) -> Result<Ds, anyhow::Error> {
+fn parse_ds_line(line: &str) -> Result<Ds, DnssecError> {
     let mut tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.len() < 6 {
-        return Err(anyhow!("expected at least 6 fields, got {}", tokens.len()));
+        return Err(DnssecError::parse(format!(
+            "expected at least 6 fields, got {}",
+            tokens.len(),
+        )));
     }
     let owner = canonical_name(tokens.remove(0));
     // A TTL and a class may sit between the owner and the type keyword, in
@@ -199,30 +212,42 @@ fn parse_ds_line(line: &str) -> Result<Ds, anyhow::Error> {
         skipped += 1;
     }
     if tokens.is_empty() || !tokens[0].eq_ignore_ascii_case("DS") {
-        return Err(anyhow!("expected the DS type keyword, found {:?}", tokens.first()));
+        return Err(DnssecError::parse(format!(
+            "expected the DS type keyword, found {:?}",
+            tokens.first(),
+        )));
     }
     tokens.remove(0);
     if tokens.len() < 4 {
-        return Err(anyhow!("DS needs key tag, algorithm, digest type and digest"));
+        return Err(DnssecError::parse("DS needs key tag, algorithm, digest type and digest"));
     }
 
-    let key_tag: u16 = tokens[0].parse().map_err(|_| anyhow!("bad key tag {:?}", tokens[0]))?;
+    let key_tag: u16 = tokens[0].parse().map_err(|_| DnssecError::parse(format!(
+        "bad key tag {:?}",
+        tokens[0],
+    )))?;
     let algorithm: u8 = tokens[1]
         .parse()
-        .map_err(|_| anyhow!("bad algorithm {:?}", tokens[1]))?;
+        .map_err(|_| DnssecError::parse(format!(
+            "bad algorithm {:?}",
+            tokens[1],
+        )))?;
     let digest_type: u8 = tokens[2]
         .parse()
-        .map_err(|_| anyhow!("bad digest type {:?}", tokens[2]))?;
+        .map_err(|_| DnssecError::parse(format!(
+            "bad digest type {:?}",
+            tokens[2],
+        )))?;
     // The digest may be split across whitespace, as it is in IANA's own file.
     let hex: String = tokens[3..].concat();
     if !hex.len().is_multiple_of(2) {
-        return Err(anyhow!("digest has an odd number of hex characters"));
+        return Err(DnssecError::parse("digest has an odd number of hex characters"));
     }
     let digest = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
         .collect::<Result<Vec<u8>, _>>()
-        .map_err(|_| anyhow!("digest is not hexadecimal"))?;
+        .map_err(|_| DnssecError::parse("digest is not hexadecimal"))?;
 
     Ok(Ds {
         owner,
@@ -931,7 +956,7 @@ mod tests {
     #[test]
     fn test_anchor_file_formats() {
         let text = "\
-; a comment
+                    ; a comment
 . IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D
 # another comment
 example.test. DS 12345 13 2 ABCDEF0123456789

@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::error::ConfigResult;
 use std::sync::Arc;
 use std::time::Instant;
 

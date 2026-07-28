@@ -17,7 +17,8 @@
 use crate::dname::dname_to_bytes;
 use crate::utils::{current_unix_timestamp, record_types as rt};
 use crate::{ParsedRecord, RecordData, ResourceRecord};
-use anyhow::anyhow;
+use crate::error::{DnssecError, DnssecResult};
+use crate::error::WireError;
 use ring::signature;
 
 /// DNSKEY flags bit 7 (0x0100): the key is a zone key, i.e. it may sign RRsets
@@ -253,7 +254,7 @@ impl Ds {
     ///
     /// The tag and algorithm are checked first only as a filter — the digest is
     /// what actually decides, because a key tag is not unique.
-    pub fn matches_key(&self, key: &Dnskey) -> Result<bool, anyhow::Error> {
+    pub fn matches_key(&self, key: &Dnskey) -> DnssecResult<bool> {
         if self.key_tag != key.key_tag() || self.algorithm != key.algorithm {
             return Ok(false);
         }
@@ -363,7 +364,7 @@ pub fn rrsig_labels(owner: &str) -> u8 {
 /// NXT, NAPTR, KX, SRV, DNAME, A6) are obsolete or unparsed here and pass
 /// through unchanged, which is a signature failure rather than a false accept
 /// if one ever shows up mixed-case.
-pub fn canonical_rdata(record: &RecordData) -> Result<Vec<u8>, anyhow::Error> {
+pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
     let lowered = match record.rtype {
         rt::NS | rt::CNAME | rt::PTR | rt::SOA | rt::MX | rt::RRSIG | rt::NSEC => {
             match record.parse()? {
@@ -452,9 +453,9 @@ pub fn signed_data(
     owner: &str,
     class: u16,
     rdatas: &[RecordData],
-) -> Result<Vec<u8>, anyhow::Error> {
+) -> DnssecResult<Vec<u8>> {
     if rdatas.is_empty() {
-        return Err(anyhow!("cannot build signed data for an empty RRset"));
+        return Err(DnssecError::signing("cannot build signed data for an empty RRset"));
     }
 
     // RRSIG_RDATA with the signature field left off.
@@ -485,7 +486,11 @@ pub fn signed_data(
         let rdlen: u16 = rdata
             .len()
             .try_into()
-            .map_err(|_| anyhow!("RDATA exceeds 65535 bytes"))?;
+            .map_err(|_| WireError::TooLong {
+                what: "RDATA",
+                limit: u16::MAX as usize,
+                actual: rdata.len(),
+            })?;
         data.extend_from_slice(&name_wire);
         data.extend_from_slice(&rrsig.type_covered.to_be_bytes());
         data.extend_from_slice(&class.to_be_bytes());
@@ -530,7 +535,7 @@ pub fn key_tag(flags: u16, protocol: u8, algorithm: u8, public_key: &[u8]) -> u1
 /// value that matches nothing a real parent publishes, and — since a mismatch
 /// reads as "this key is not the one the parent vouched for" — turns every
 /// secure delegation into a failure.
-pub fn ds_digest(key: &Dnskey, digest_type: u8) -> Result<Vec<u8>, anyhow::Error> {
+pub fn ds_digest(key: &Dnskey, digest_type: u8) -> DnssecResult<Vec<u8>> {
     let mut input = dname_to_bytes(&canonical_name(&key.owner))?;
     input.extend_from_slice(&key.rdata());
 
@@ -547,7 +552,12 @@ pub fn ds_digest(key: &Dnskey, digest_type: u8) -> Result<Vec<u8>, anyhow::Error
             use sha2::{Digest, Sha384};
             Sha384::digest(&input).to_vec()
         }
-        other => return Err(anyhow!("unsupported DS digest type {other}")),
+        other => {
+            return Err(DnssecError::UnsupportedAlgorithm {
+                what: "DS digest",
+                algorithm: other,
+            })
+        }
     })
 }
 

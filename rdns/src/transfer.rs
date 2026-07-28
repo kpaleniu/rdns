@@ -14,6 +14,7 @@
 //! finished — a truncated stream is otherwise indistinguishable from a small
 //! zone.
 
+use crate::error::{TransferError, TransferResult};
 use crate::utils::record_types as rt;
 use crate::zone::Zone;
 use crate::{DnsMessage, ResourceRecord, ResponseCode};
@@ -32,7 +33,7 @@ pub const AXFR_TARGET_MESSAGE_SIZE: usize = 16 * 1024;
 /// open and close the transfer with, and a client cannot tell that what it
 /// received is complete. That is a broken zone rather than a bad request, so the
 /// caller should answer SERVFAIL.
-pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> Result<Vec<DnsMessage>, String> {
+pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<DnsMessage>> {
     let apex = zone.origin().to_string();
     let soa = zone
         .query(&apex, rt::SOA)
@@ -43,7 +44,7 @@ pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> Result<Vec<DnsMessage
             ttl: zr.ttl,
             rdata: zr.rdata.clone(),
         })
-        .ok_or_else(|| format!("zone {apex} has no SOA at its apex"))?;
+        .ok_or_else(|| TransferError::malformed(format!("zone {apex} has no SOA at its apex")))?;
 
     // SOA first, everything else in load order, SOA again (RFC 5936 §2.2). The
     // apex SOA is skipped in the middle so it appears exactly twice — a client
@@ -272,6 +273,6 @@ mod tests {
     fn test_a_zone_without_an_soa_cannot_be_transferred() {
         let zone = parse_zone_file("www IN A 192.0.2.1\n", "example.com.").unwrap();
         let err = axfr_messages(&request_for("example.com."), &zone).unwrap_err();
-        assert!(err.contains("no SOA"), "got: {err}");
+        assert!(err.to_string().contains("no SOA"), "got: {err}");
     }
 }

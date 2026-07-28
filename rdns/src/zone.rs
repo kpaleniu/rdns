@@ -1,3 +1,4 @@
+use crate::error::ZoneError;
 use crate::{ParsedRecord, RecordData};
 use crate::utils::record_type_code;
 use crate::utils::record_types as rt;
@@ -524,6 +525,12 @@ fn absolute(name: &str) -> String {
     }
 }
 
+/// The small parse helpers below return `Result<_, String>` on purpose, and it
+/// is the one place in this library that shape is right: they produce a *detail*
+/// — "odd number of hexadecimal digits" — and the caller is the zone parser,
+/// which is the only thing that knows the line number to attach it to. Giving
+/// them a `ZoneError` would mean inventing a line number they do not have. See
+/// `CLAUDE.md` §3.
 fn parse_hex(hex_str: &str) -> Result<Vec<u8>, String> {
     let hex_str = hex_str.trim();
     if !hex_str.len().is_multiple_of(2) {
@@ -732,7 +739,7 @@ struct LogicalLine {
 ///   at the first one turned them silently into something shorter.
 /// - **A quoted string may hold parentheses too**, which must not open or close
 ///   a group, and `\` escapes whatever follows it.
-fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, String> {
+fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, ZoneError> {
     let mut out: Vec<LogicalLine> = Vec::new();
     let mut pending: Option<LogicalLine> = None;
     let mut depth = 0usize;
@@ -768,14 +775,14 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, String> {
                 ')' if !quoted => {
                     depth = depth
                         .checked_sub(1)
-                        .ok_or_else(|| format!("line {ln}: unmatched ')'"))?;
+                        .ok_or_else(|| ZoneError::syntax(ln, "unmatched ')'"))?;
                     text.push(' ');
                 }
                 _ => text.push(c),
             }
         }
         if quoted {
-            return Err(format!("line {ln}: unterminated quoted string"));
+            return Err(ZoneError::syntax(ln, "unterminated quoted string"));
         }
 
         match &mut pending {
@@ -810,9 +817,9 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, String> {
     }
 
     if let Some(open) = pending {
-        return Err(format!(
-            "line {}: '(' is never closed before the end of the file",
-            open.line_no
+        return Err(ZoneError::syntax(
+            open.line_no,
+            "'(' is never closed before the end of the file",
         ));
     }
     Ok(out)
@@ -886,14 +893,16 @@ struct ParseState {
 /// here, because a string of content has no directory of its own. Use
 /// [`parse_zone_file_at`] when the file is on disk — that resolves them the way
 /// an operator expects, next to the file doing the including.
-pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, String> {
+pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, ZoneError> {
     parse_zone_file_with_base(content, origin, None)
 }
 
 /// Parse the zone file at `path`, resolving `$INCLUDE` relative to its directory.
-pub fn parse_zone_file_at(path: &Path, origin: &str) -> Result<Zone, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+pub fn parse_zone_file_at(path: &Path, origin: &str) -> Result<Zone, ZoneError> {
+    let content = std::fs::read_to_string(path).map_err(|source| ZoneError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
     parse_zone_file_with_base(&content, origin, path.parent())
 }
 
@@ -901,7 +910,7 @@ fn parse_zone_file_with_base(
     content: &str,
     origin: &str,
     base_dir: Option<&Path>,
-) -> Result<Zone, String> {
+) -> Result<Zone, ZoneError> {
     let mut zone = Zone::new(origin.to_string());
     let mut state = ParseState {
         origin: absolute(origin),
@@ -921,7 +930,7 @@ fn parse_zone_file_with_base(
 /// two servers loading the same file answer differently. The exceptions are the
 /// three types that describe the name rather than name it: RRSIG signs the
 /// CNAME, and NSEC/NSEC3 deny the types around it (RFC 4035 §2.5).
-fn check_cname_exclusivity(zone: &Zone) -> Result<(), String> {
+fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
     let mut by_name: HashMap<String, (bool, Vec<u16>)> = HashMap::new();
     for record in zone.records() {
         let rtype = record_type_code(&record.rdata);
@@ -946,12 +955,12 @@ fn check_cname_exclusivity(zone: &Zone) -> Result<(), String> {
                 .filter(|&&t| t != rt::CNAME)
                 .map(|t| t.to_string())
                 .collect();
-            return Err(format!(
+            return Err(ZoneError::invalid(format!(
                 "{name} has a CNAME and also type(s) {} — RFC 1034 §3.6.2 allows a CNAME to be \
                  the only type at a name, and a resolver given both has no way to know which \
                  answer it was meant to get",
                 others.join(", ")
-            ));
+            )));
         }
     }
     Ok(())
@@ -964,7 +973,7 @@ fn parse_into(
     state: &mut ParseState,
     base_dir: Option<&Path>,
     depth: usize,
-) -> Result<(), String> {
+) -> Result<(), ZoneError> {
     for logical in logical_lines(content)? {
         let ln = logical.line_no;
         // Quoted strings stay whole; `parts` is the plain view of the same
@@ -995,7 +1004,7 @@ fn parse_into(
             if let Some(value) = parts.get(1) {
                 state.ttl = value
                     .parse()
-                    .map_err(|e| format!("line {ln}: invalid $TTL {value:?}: {e}"))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid $TTL {value:?}: {e}")))?;
             }
             continue;
         }
@@ -1003,19 +1012,19 @@ fn parse_into(
         // Handle $INCLUDE directive: `$INCLUDE <file> [origin]`
         if first.eq_ignore_ascii_case("$INCLUDE") {
             let Some(&file) = parts.get(1) else {
-                return Err(format!("line {ln}: $INCLUDE needs a file name"));
+                return Err(ZoneError::syntax(ln, "$INCLUDE needs a file name"));
             };
             if depth + 1 >= MAX_INCLUDE_DEPTH {
-                return Err(format!(
-                    "line {ln}: $INCLUDE nested more than {MAX_INCLUDE_DEPTH} deep — a cycle?"
-                ));
+                return Err(ZoneError::syntax(ln, format!(
+                    "$INCLUDE nested more than {MAX_INCLUDE_DEPTH} deep — a cycle?"
+                )));
             }
             let path = match base_dir {
                 Some(dir) => dir.join(file),
                 None => PathBuf::from(file),
             };
             let included = std::fs::read_to_string(&path)
-                .map_err(|e| format!("line {ln}: $INCLUDE {}: {e}", path.display()))?;
+                .map_err(|e| ZoneError::syntax(ln, format!("$INCLUDE {}: {e}", path.display())))?;
 
             // RFC 1035 §5.1: the origin an $INCLUDE names is for the included
             // file, and nothing the included file does changes the origin of the
@@ -1049,7 +1058,7 @@ fn parse_into(
         let mut idx = 0;
         let record_name = if logical.omits_owner {
             state.owner.clone().ok_or_else(|| {
-                format!("line {ln}: record omits its owner name but no previous record supplies one")
+                ZoneError::syntax(ln, "record omits its owner name but no previous record supplies one")
             })?
         } else {
             let name = absolutize(first, &state.origin);
@@ -1101,7 +1110,7 @@ fn parse_into(
         // program that wrote it.
         if parts.get(idx).is_some_and(|token| *token == "\\#") {
             let rdata = parse_generic_rdata(&record_type, &parts[idx + 1..])
-                .map_err(|e| format!("line {ln}: {record_type} record: {e}"))?;
+                .map_err(|e| ZoneError::syntax(ln, format!("{record_type} record: {e}")))?;
             zone.add_record(ZoneRecord {
                 name: record_name,
                 ttl,
@@ -1115,37 +1124,37 @@ fn parse_into(
             "A" => {
                 let addr = rdata
                     .parse::<Ipv4Addr>()
-                    .map_err(|e| format!("line {ln}: invalid A address {rdata:?}: {e}"))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid A address {rdata:?}: {e}")))?;
                 RecordData::from_parsed(&ParsedRecord::A(addr))
-                    .map_err(|e| format!("line {ln}: A record: {e}"))?
+                    .map_err(|e| ZoneError::syntax(ln, format!("A record: {e}")))?
             }
             "AAAA" => {
                 let addr = rdata
                     .parse::<Ipv6Addr>()
-                    .map_err(|e| format!("line {ln}: invalid AAAA address {rdata:?}: {e}"))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid AAAA address {rdata:?}: {e}")))?;
                 RecordData::from_parsed(&ParsedRecord::AAAA(addr))
-                    .map_err(|e| format!("line {ln}: AAAA record: {e}"))?
+                    .map_err(|e| ZoneError::syntax(ln, format!("AAAA record: {e}")))?
             }
             "NS" => RecordData::from_parsed(&ParsedRecord::NS(rdata))
-                .map_err(|e| format!("line {ln}: NS record: {e}"))?,
+                .map_err(|e| ZoneError::syntax(ln, format!("NS record: {e}")))?,
             "CNAME" => RecordData::from_parsed(&ParsedRecord::CNAME(rdata))
-                .map_err(|e| format!("line {ln}: CNAME record: {e}"))?,
+                .map_err(|e| ZoneError::syntax(ln, format!("CNAME record: {e}")))?,
             "MX" => {
                 let mx_parts: Vec<&str> = rdata.split_whitespace().collect();
                 if mx_parts.len() < 2 {
-                    return Err(format!(
-                        "line {ln}: MX record needs preference and exchange, got {:?}",
+                    return Err(ZoneError::syntax(ln, format!(
+                        "MX record needs preference and exchange, got {:?}",
                         rdata
-                    ));
+                    )));
                 }
                 let preference = mx_parts[0]
                     .parse::<u16>()
-                    .map_err(|e| format!("line {ln}: invalid MX preference {:?}: {e}", mx_parts[0]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid MX preference {:?}: {e}", mx_parts[0])))?;
                 RecordData::from_parsed(&ParsedRecord::MX {
                     preference,
                     exchange: mx_parts[1..].join(" "),
                 })
-                .map_err(|e| format!("line {ln}: MX record: {e}"))?
+                .map_err(|e| ZoneError::syntax(ln, format!("MX record: {e}")))?
             }
             "TXT" => {
                 // Every field after the type is one `<character-string>`
@@ -1158,36 +1167,36 @@ fn parse_into(
                     .map(|t| t.as_bytes().to_vec())
                     .collect();
                 if strings.is_empty() {
-                    return Err(format!("line {ln}: TXT record has no text"));
+                    return Err(ZoneError::syntax(ln, "TXT record has no text"));
                 }
                 RecordData::from_parsed(&ParsedRecord::TXT(strings))
-                    .map_err(|e| format!("line {ln}: TXT record: {e}"))?
+                    .map_err(|e| ZoneError::syntax(ln, format!("TXT record: {e}")))?
             }
             "PTR" => RecordData::from_parsed(&ParsedRecord::PTR(rdata))
-                .map_err(|e| format!("line {ln}: PTR record: {e}"))?,
+                .map_err(|e| ZoneError::syntax(ln, format!("PTR record: {e}")))?,
             "SOA" => {
                 let soa_parts: Vec<&str> = rdata.split_whitespace().collect();
                 if soa_parts.len() < 7 {
-                    return Err(format!(
-                        "line {ln}: SOA record needs 7 fields, got {}",
+                    return Err(ZoneError::syntax(ln, format!(
+                        "SOA record needs 7 fields, got {}",
                         soa_parts.len()
-                    ));
+                    )));
                 }
                 let serial = soa_parts[2]
                     .parse::<u32>()
-                    .map_err(|e| format!("line {ln}: invalid SOA serial {:?}: {e}", soa_parts[2]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA serial {:?}: {e}", soa_parts[2])))?;
                 let refresh = soa_parts[3]
                     .parse::<i32>()
-                    .map_err(|e| format!("line {ln}: invalid SOA refresh {:?}: {e}", soa_parts[3]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA refresh {:?}: {e}", soa_parts[3])))?;
                 let retry = soa_parts[4]
                     .parse::<i32>()
-                    .map_err(|e| format!("line {ln}: invalid SOA retry {:?}: {e}", soa_parts[4]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA retry {:?}: {e}", soa_parts[4])))?;
                 let expire = soa_parts[5]
                     .parse::<i32>()
-                    .map_err(|e| format!("line {ln}: invalid SOA expire {:?}: {e}", soa_parts[5]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA expire {:?}: {e}", soa_parts[5])))?;
                 let minimum = soa_parts[6]
                     .parse::<u32>()
-                    .map_err(|e| format!("line {ln}: invalid SOA minimum {:?}: {e}", soa_parts[6]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA minimum {:?}: {e}", soa_parts[6])))?;
                 RecordData::from_parsed(&ParsedRecord::SOA {
                     mname: soa_parts[0].to_string(),
                     rname: soa_parts[1].to_string(),
@@ -1197,98 +1206,98 @@ fn parse_into(
                     expire,
                     minimum,
                 })
-                .map_err(|e| format!("line {ln}: SOA record: {e}"))?
+                .map_err(|e| ZoneError::syntax(ln, format!("SOA record: {e}")))?
             }
             "DNSKEY" => {
                 let key_parts = &parts[idx..];
                 if key_parts.len() < 4 {
-                    return Err(format!(
-                        "line {ln}: DNSKEY record needs 4 fields, got {}",
+                    return Err(ZoneError::syntax(ln, format!(
+                        "DNSKEY record needs 4 fields, got {}",
                         key_parts.len()
-                    ));
+                    )));
                 }
                 let flags = key_parts[0]
                     .parse::<u16>()
-                    .map_err(|e| format!("line {ln}: invalid DNSKEY flags {:?}: {e}", key_parts[0]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY flags {:?}: {e}", key_parts[0])))?;
                 let protocol = key_parts[1]
                     .parse::<u8>()
-                    .map_err(|e| format!("line {ln}: invalid DNSKEY protocol {:?}: {e}", key_parts[1]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY protocol {:?}: {e}", key_parts[1])))?;
                 let algorithm = key_parts[2]
                     .parse::<u8>()
-                    .map_err(|e| format!("line {ln}: invalid DNSKEY algorithm {:?}: {e}", key_parts[2]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY algorithm {:?}: {e}", key_parts[2])))?;
                 let b64_key = key_parts[3..].join("");
                 let public_key =
                     base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_key)
-                        .map_err(|e| format!("line {ln}: invalid DNSKEY base64 key: {e}"))?;
+                        .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY base64 key: {e}")))?;
                 RecordData::from_parsed(&ParsedRecord::DNSKEY {
                     flags,
                     protocol,
                     algorithm,
                     public_key,
                 })
-                .map_err(|e| format!("line {ln}: DNSKEY record: {e}"))?
+                .map_err(|e| ZoneError::syntax(ln, format!("DNSKEY record: {e}")))?
             }
             "DS" => {
                 let ds_parts = &parts[idx..];
                 if ds_parts.len() < 4 {
-                    return Err(format!(
-                        "line {ln}: DS record needs 4 fields, got {}",
+                    return Err(ZoneError::syntax(ln, format!(
+                        "DS record needs 4 fields, got {}",
                         ds_parts.len()
-                    ));
+                    )));
                 }
                 let key_tag = ds_parts[0]
                     .parse::<u16>()
-                    .map_err(|e| format!("line {ln}: invalid DS key tag {:?}: {e}", ds_parts[0]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DS key tag {:?}: {e}", ds_parts[0])))?;
                 let algorithm = ds_parts[1]
                     .parse::<u8>()
-                    .map_err(|e| format!("line {ln}: invalid DS algorithm {:?}: {e}", ds_parts[1]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DS algorithm {:?}: {e}", ds_parts[1])))?;
                 let digest_type = ds_parts[2]
                     .parse::<u8>()
-                    .map_err(|e| format!("line {ln}: invalid DS digest type {:?}: {e}", ds_parts[2]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DS digest type {:?}: {e}", ds_parts[2])))?;
                 let hex_digest = ds_parts[3..].join("");
                 let digest = parse_hex(&hex_digest)
-                    .map_err(|e| format!("line {ln}: invalid DS digest: {e}"))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DS digest: {e}")))?;
                 RecordData::from_parsed(&ParsedRecord::DS {
                     key_tag,
                     algorithm,
                     digest_type,
                     digest,
                 })
-                .map_err(|e| format!("line {ln}: DS record: {e}"))?
+                .map_err(|e| ZoneError::syntax(ln, format!("DS record: {e}")))?
             }
             "RRSIG" => {
                 let rrsig_parts = &parts[idx..];
                 if rrsig_parts.len() < 9 {
-                    return Err(format!(
-                        "line {ln}: RRSIG record needs 9 fields, got {}",
+                    return Err(ZoneError::syntax(ln, format!(
+                        "RRSIG record needs 9 fields, got {}",
                         rrsig_parts.len()
-                    ));
+                    )));
                 }
                 let type_covered = crate::utils::record_type_name_to_code(rrsig_parts[0])
                     .ok_or_else(|| {
-                        format!("line {ln}: unknown RRSIG type covered {:?}", rrsig_parts[0])
+                        ZoneError::syntax(ln, format!("unknown RRSIG type covered {:?}", rrsig_parts[0]))
                     })?;
                 let algorithm = rrsig_parts[1]
                     .parse::<u8>()
-                    .map_err(|e| format!("line {ln}: invalid RRSIG algorithm {:?}: {e}", rrsig_parts[1]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG algorithm {:?}: {e}", rrsig_parts[1])))?;
                 let labels = rrsig_parts[2]
                     .parse::<u8>()
-                    .map_err(|e| format!("line {ln}: invalid RRSIG labels {:?}: {e}", rrsig_parts[2]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG labels {:?}: {e}", rrsig_parts[2])))?;
                 let original_ttl = rrsig_parts[3]
                     .parse::<u32>()
-                    .map_err(|e| format!("line {ln}: invalid RRSIG original TTL {:?}: {e}", rrsig_parts[3]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG original TTL {:?}: {e}", rrsig_parts[3])))?;
                 let expiration = parse_dnssec_time(rrsig_parts[4])
-                    .map_err(|e| format!("line {ln}: invalid RRSIG expiration {:?}: {e}", rrsig_parts[4]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG expiration {:?}: {e}", rrsig_parts[4])))?;
                 let inception = parse_dnssec_time(rrsig_parts[5])
-                    .map_err(|e| format!("line {ln}: invalid RRSIG inception {:?}: {e}", rrsig_parts[5]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG inception {:?}: {e}", rrsig_parts[5])))?;
                 let key_tag = rrsig_parts[6]
                     .parse::<u16>()
-                    .map_err(|e| format!("line {ln}: invalid RRSIG key tag {:?}: {e}", rrsig_parts[6]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG key tag {:?}: {e}", rrsig_parts[6])))?;
                 let signer_name = rrsig_parts[7].to_string();
                 let b64_sig = rrsig_parts[8..].join("");
                 let signature =
                     base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_sig)
-                        .map_err(|e| format!("line {ln}: invalid RRSIG base64 signature: {e}"))?;
+                        .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG base64 signature: {e}")))?;
                 RecordData::from_parsed(&ParsedRecord::RRSIG {
                     type_covered,
                     algorithm,
@@ -1300,57 +1309,57 @@ fn parse_into(
                     signer_name,
                     signature,
                 })
-                .map_err(|e| format!("line {ln}: RRSIG record: {e}"))?
+                .map_err(|e| ZoneError::syntax(ln, format!("RRSIG record: {e}")))?
             }
             "NSEC" => {
                 let nsec_parts = &parts[idx..];
                 if nsec_parts.len() < 2 {
-                    return Err(format!(
-                        "line {ln}: NSEC record needs next domain and at least one type, got {}",
+                    return Err(ZoneError::syntax(ln, format!(
+                        "NSEC record needs next domain and at least one type, got {}",
                         nsec_parts.len()
-                    ));
+                    )));
                 }
                 let next_domain_name = nsec_parts[0].to_string();
                 let type_names: Vec<String> =
                     nsec_parts[1..].iter().map(|s| s.to_string()).collect();
                 let type_bitmap = construct_type_bitmap(&type_names)
-                    .map_err(|e| format!("line {ln}: NSEC record: {e}"))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("NSEC record: {e}")))?;
                 RecordData::from_parsed(&ParsedRecord::NSEC {
                     next_domain_name,
                     type_bitmap,
                 })
-                .map_err(|e| format!("line {ln}: NSEC record: {e}"))?
+                .map_err(|e| ZoneError::syntax(ln, format!("NSEC record: {e}")))?
             }
             "NSEC3" => {
                 let nsec3_parts = &parts[idx..];
                 if nsec3_parts.len() < 5 {
-                    return Err(format!(
-                        "line {ln}: NSEC3 record needs at least 5 fields, got {}",
+                    return Err(ZoneError::syntax(ln, format!(
+                        "NSEC3 record needs at least 5 fields, got {}",
                         nsec3_parts.len()
-                    ));
+                    )));
                 }
                 let hash_algorithm = nsec3_parts[0]
                     .parse::<u8>()
-                    .map_err(|e| format!("line {ln}: invalid NSEC3 hash algorithm {:?}: {e}", nsec3_parts[0]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid NSEC3 hash algorithm {:?}: {e}", nsec3_parts[0])))?;
                 let flags = nsec3_parts[1]
                     .parse::<u8>()
-                    .map_err(|e| format!("line {ln}: invalid NSEC3 flags {:?}: {e}", nsec3_parts[1]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid NSEC3 flags {:?}: {e}", nsec3_parts[1])))?;
                 let iterations = nsec3_parts[2]
                     .parse::<u16>()
-                    .map_err(|e| format!("line {ln}: invalid NSEC3 iterations {:?}: {e}", nsec3_parts[2]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid NSEC3 iterations {:?}: {e}", nsec3_parts[2])))?;
                 let salt_str = nsec3_parts[3];
                 let salt = if salt_str == "-" {
                     Vec::new()
                 } else {
                     parse_hex(salt_str)
-                        .map_err(|e| format!("line {ln}: invalid NSEC3 salt {:?}: {e}", salt_str))?
+                        .map_err(|e| ZoneError::syntax(ln, format!("invalid NSEC3 salt {:?}: {e}", salt_str)))?
                 };
                 let next_hashed_owner = parse_base32_hex(nsec3_parts[4])
-                    .map_err(|e| format!("line {ln}: invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4]))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4])))?;
                 let type_names: Vec<String> =
                     nsec3_parts[5..].iter().map(|s| s.to_string()).collect();
                 let type_bitmap = construct_type_bitmap(&type_names)
-                    .map_err(|e| format!("line {ln}: NSEC3 record: {e}"))?;
+                    .map_err(|e| ZoneError::syntax(ln, format!("NSEC3 record: {e}")))?;
                 RecordData::from_parsed(&ParsedRecord::NSEC3 {
                     hash_algorithm,
                     flags,
@@ -1359,10 +1368,10 @@ fn parse_into(
                     next_hashed_owner,
                     type_bitmap,
                 })
-                .map_err(|e| format!("line {ln}: NSEC3 record: {e}"))?
+                .map_err(|e| ZoneError::syntax(ln, format!("NSEC3 record: {e}")))?
             }
             other => {
-                return Err(format!("line {ln}: unsupported record type {other:?}"));
+                return Err(ZoneError::syntax(ln, format!("unsupported record type {other:?}")));
             }
         };
 
@@ -1410,15 +1419,18 @@ mail IN A   192.0.2.3
         // A bad IPv4 address must fail the load, not be silently dropped.
         let zone_content = "www IN A 999.0.2.1\n";
         let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
-        assert!(err.contains("line 1"), "error should carry line number: {err}");
-        assert!(err.contains("A address"), "error should name the failure: {err}");
+        assert!(
+            matches!(err, ZoneError::Syntax { line: 1, .. }),
+            "the line number is a field, not a prefix: {err:?}"
+        );
+        assert!(err.to_string().contains("A address"), "error should name the failure: {err}");
     }
 
     #[test]
     fn test_unsupported_record_type_surfaces_error() {
         let zone_content = "www IN WKS 192.0.2.1\n";
         let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
-        assert!(err.contains("unsupported record type"), "got: {err}");
+        assert!(err.to_string().contains("unsupported record type"), "got: {err}");
     }
 
     #[test]
@@ -1460,7 +1472,7 @@ mail IN A   192.0.2.3
     #[test]
     fn test_indented_line_without_a_previous_owner_errors() {
         let err = parse_zone_file("    IN A 192.0.2.1\n", "example.com.").unwrap_err();
-        assert!(err.contains("omits its owner name"), "got: {err}");
+        assert!(err.to_string().contains("omits its owner name"), "got: {err}");
     }
 
     #[test]
@@ -1607,7 +1619,7 @@ mail IN A   192.0.2.3
             "example.com.",
         )
         .unwrap_err();
-        assert!(err.contains("CNAME"), "the error should say why: {err}");
+        assert!(err.to_string().contains("CNAME"), "the error should say why: {err}");
 
         // RRSIG, NSEC and NSEC3 are the exceptions — they describe the name
         // rather than name it (RFC 4035 §2.5), and a signed zone with a CNAME in
@@ -1855,24 +1867,30 @@ $TTL 3600
     fn test_txt_string_over_255_bytes_fails_the_load() {
         let long = "z".repeat(256);
         let err = parse_zone_file(&format!("txt IN TXT \"{long}\"\n"), "example.com.").unwrap_err();
-        assert!(err.contains("255"), "got: {err}");
-        assert!(err.contains("line 1"), "got: {err}");
+        assert!(err.to_string().contains("255"), "got: {err}");
+        assert!(
+            matches!(err, ZoneError::Syntax { line: 1, .. }),
+            "the line number is a field, not a prefix: {err:?}"
+        );
     }
 
     #[test]
     fn test_unbalanced_parentheses_are_an_error() {
         let err = parse_zone_file("@ IN SOA ns1. admin. ( 1 2 3 4\n", "example.com.").unwrap_err();
-        assert!(err.contains("never closed"), "got: {err}");
-        assert!(err.contains("line 1"), "should point at the opening line: {err}");
+        assert!(err.to_string().contains("never closed"), "got: {err}");
+        assert!(
+            matches!(err, ZoneError::Syntax { line: 1, .. }),
+            "the line number is a field, not a prefix: {err:?}"
+        );
 
         let err = parse_zone_file("@ IN A 192.0.2.1 )\n", "example.com.").unwrap_err();
-        assert!(err.contains("unmatched"), "got: {err}");
+        assert!(err.to_string().contains("unmatched"), "got: {err}");
     }
 
     #[test]
     fn test_unterminated_quote_is_an_error() {
         let err = parse_zone_file("txt IN TXT \"no closing quote\n", "example.com.").unwrap_err();
-        assert!(err.contains("unterminated"), "got: {err}");
+        assert!(err.to_string().contains("unterminated"), "got: {err}");
     }
 
     // -----------------------------------------------------------------
@@ -1958,8 +1976,11 @@ $TTL 3600
         let dir = ScratchDir::new("include-missing");
         let main = dir.write("example.com.zone", "$INCLUDE nope.inc\n");
         let err = parse_zone_file_at(&main, "example.com.").unwrap_err();
-        assert!(err.contains("nope.inc"), "the error should name the file: {err}");
-        assert!(err.contains("line 1"), "and the line: {err}");
+        assert!(err.to_string().contains("nope.inc"), "the error should name the file: {err}");
+        assert!(
+            matches!(err, ZoneError::Syntax { line: 1, .. }),
+            "the line number is a field, not a prefix: {err:?}"
+        );
     }
 
     /// A file that includes itself would recurse until the stack ran out.
@@ -1968,13 +1989,13 @@ $TTL 3600
         let dir = ScratchDir::new("include-cycle");
         let main = dir.write("example.com.zone", "$INCLUDE example.com.zone\n");
         let err = parse_zone_file_at(&main, "example.com.").unwrap_err();
-        assert!(err.contains("cycle"), "got: {err}");
+        assert!(err.to_string().contains("cycle"), "got: {err}");
     }
 
     #[test]
     fn test_include_without_a_file_name_is_an_error() {
         let err = parse_zone_file("$INCLUDE\n", "example.com.").unwrap_err();
-        assert!(err.contains("needs a file name"), "got: {err}");
+        assert!(err.to_string().contains("needs a file name"), "got: {err}");
     }
 
     // -----------------------------------------------------------------
@@ -2011,20 +2032,20 @@ $TTL 3600
     #[test]
     fn test_generic_rdata_length_must_match_the_digits() {
         let err = parse_zone_file("odd IN TYPE1234 \\# 8 DEADBEEF\n", "example.com.").unwrap_err();
-        assert!(err.contains("says 8 bytes but carries 4"), "got: {err}");
+        assert!(err.to_string().contains("says 8 bytes but carries 4"), "got: {err}");
     }
 
     #[test]
     fn test_generic_rdata_that_is_not_the_type_it_claims_fails_the_load() {
         // Three bytes cannot be an A record.
         let err = parse_zone_file("www IN A \\# 3 C00002\n", "example.com.").unwrap_err();
-        assert!(err.contains("not valid A"), "got: {err}");
+        assert!(err.to_string().contains("not valid A"), "got: {err}");
     }
 
     #[test]
     fn test_generic_rdata_needs_a_length() {
         let err = parse_zone_file("odd IN TYPE1234 \\#\n", "example.com.").unwrap_err();
-        assert!(err.contains("needs a length"), "got: {err}");
+        assert!(err.to_string().contains("needs a length"), "got: {err}");
     }
 
     /// A type bitmap may list a type this library has no name for; `TYPEnnn` is
@@ -2049,7 +2070,7 @@ $TTL 3600
     fn test_nsec_bitmap_rejects_a_name_that_is_no_type_at_all() {
         let err = parse_zone_file("@ IN NSEC www.example.com. A NOTATYPE\n", "example.com.")
             .unwrap_err();
-        assert!(err.contains("unknown record type"), "got: {err}");
+        assert!(err.to_string().contains("unknown record type"), "got: {err}");
     }
 
     // -----------------------------------------------------------------
@@ -2078,6 +2099,6 @@ $TTL 3600
     fn test_malformed_ttl_directive_surfaces_error() {
         let zone_content = "$TTL notanumber\nwww IN A 192.0.2.1\n";
         let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
-        assert!(err.contains("$TTL"), "got: {err}");
+        assert!(err.to_string().contains("$TTL"), "got: {err}");
     }
 }

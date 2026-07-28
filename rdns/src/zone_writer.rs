@@ -29,6 +29,7 @@
 //! name is refused rather than written as something that would read back as a
 //! different name.
 
+use crate::error::ZoneError;
 use std::path::Path;
 
 use crate::dnssec_denial::{base32hex_encode, bitmap_types_exact};
@@ -40,7 +41,7 @@ use crate::{ParsedRecord, RecordData};
 ///
 /// Fails only on a record this format cannot express — see the module docs; in
 /// practice that is an owner name needing escapes.
-pub fn zone_to_string(zone: &Zone) -> Result<String, String> {
+pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
     let mut out = String::new();
 
     out.push_str("; ");
@@ -75,23 +76,28 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, String> {
 /// see [`crate::persist::write_atomically`]. Nothing here writes into the file
 /// the server is serving from until the whole zone has been rendered, so a
 /// record that cannot be expressed leaves the previous file untouched.
-pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), String> {
+pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), ZoneError> {
     let text = zone_to_string(zone)?;
     crate::persist::write_atomically_str(path, &text)
-        .map_err(|e| format!("writing {}: {e}", path.display()))
+        .map_err(|source| ZoneError::Io {
+            path: path.display().to_string(),
+            source,
+        })
 }
 
 /// One record as a zone-file line.
-pub fn record_to_string(record: &ZoneRecord) -> Result<String, String> {
+pub fn record_to_string(record: &ZoneRecord) -> Result<String, ZoneError> {
     let owner = writable_name(&record.name).ok_or_else(|| {
-        format!(
+        ZoneError::invalid(format!(
             "owner name {:?} cannot be written in a zone file: it needs escapes this parser \
              does not read back",
             record.name
-        )
+        ))
     })?;
     let class = class_name(record.class)
-        .ok_or_else(|| format!("record {owner}: unknown class {}", record.class))?;
+        .ok_or_else(|| {
+            ZoneError::invalid(format!("record {owner}: unknown class {}", record.class))
+        })?;
 
     let (rtype, rdata) = rdata_to_string(&record.rdata);
     Ok(format!(
@@ -587,8 +593,8 @@ mod tests {
         });
 
         let err = zone_to_string(&zone).unwrap_err();
-        assert!(err.contains("cannot be written"), "got: {err}");
-        assert!(err.contains("has space"), "the error should name it: {err}");
+        assert!(err.to_string().contains("cannot be written"), "got: {err}");
+        assert!(err.to_string().contains("has space"), "the error should name it: {err}");
     }
 
     /// The same name inside RDATA is not fatal — the generic form spells it.
@@ -631,7 +637,7 @@ mod tests {
                 .expect("encode"),
         });
         let err = zone_to_string(&unknown).unwrap_err();
-        assert!(err.contains("unknown class 42"), "got: {err}");
+        assert!(err.to_string().contains("unknown class 42"), "got: {err}");
     }
 
     #[test]

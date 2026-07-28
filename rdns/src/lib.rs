@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use crate::error::WireError;
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::{FromPrimitive, ToPrimitive};
 use rand::Rng;
@@ -9,6 +9,7 @@ use std::{
 use compression::NameCompressor;
 use dname::{dname_from_bytes, dname_to_bytes, write_bytes, DNameUnpacker, TryUnpackFromBytes};
 
+pub mod error;
 pub mod compression;
 pub mod dname;
 pub mod zone;
@@ -44,7 +45,6 @@ pub mod dnssec_validation_mode;
 mod dnssec_test_util;
 pub mod telemetry;
 pub mod utils;
-pub mod serialization;
 
 // Re-export cache module for public use
 pub use cache::{DnsCache, CacheStats};
@@ -55,7 +55,11 @@ mod macros {
         ($dt:ty, $data:expr) => {{
             let sz = std::mem::size_of::<$dt>();
             if $data.len() < sz {
-                return Err(anyhow::anyhow!("Not enough data to read {}: need {}, have {}", stringify!($dt), sz, $data.len()));
+                return Err($crate::error::WireError::Truncated {
+                    what: stringify!($dt),
+                    need: sz,
+                    have: $data.len(),
+                });
             }
             (
                 <$dt>::from_be_bytes($data[..sz].try_into().unwrap()),
@@ -220,7 +224,7 @@ impl RecordData {
         record_type: u16,
         rdata: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Result<Self, WireError> {
         let parsed = ParsedRecord::decode(record_type, rdata, unpacker)?;
         if let ParsedRecord::Unknown(_) = parsed {
             // Opaque type: keep the original bytes exactly as received.
@@ -238,13 +242,13 @@ impl RecordData {
     /// whole point of storing raw bytes. Stored names are uncompressed, so no
     /// message context is required — the decoder is handed an unpacker over the
     /// rdata itself, which by construction contains no pointers.
-    pub fn parse(&self) -> Result<ParsedRecord, anyhow::Error> {
+    pub fn parse(&self) -> Result<ParsedRecord, WireError> {
         let unpacker = DNameUnpacker::new(&self.rdata);
         ParsedRecord::decode(self.rtype, &self.rdata, &unpacker)
     }
 
     /// Encode a typed record into compact, uncompressed wire-format storage.
-    pub fn from_parsed(parsed: &ParsedRecord) -> Result<Self, anyhow::Error> {
+    pub fn from_parsed(parsed: &ParsedRecord) -> Result<Self, WireError> {
         let (rtype, rdata) = parsed.encode()?;
         Ok(RecordData {
             rtype,
@@ -260,7 +264,7 @@ impl ParsedRecord {
         record_type: u16,
         rdata: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Result<Self, WireError> {
         match record_type {
             1 => {
                 let addr: [u8; 4] = rdata.try_into()?;
@@ -313,10 +317,11 @@ impl ParsedRecord {
                 while let Some((&len, after_len)) = rest.split_first() {
                     let len = len as usize;
                     if after_len.len() < len {
-                        return Err(anyhow!(
-                            "TXT character-string claims {len} bytes but only {} remain",
-                            after_len.len()
-                        ));
+                        return Err(WireError::Truncated {
+                            what: "a TXT character-string",
+                            need: len,
+                            have: after_len.len(),
+                        });
                     }
                     strings.push(after_len[..len].to_vec());
                     rest = &after_len[len..];
@@ -332,7 +337,11 @@ impl ParsedRecord {
                 // DS: key_tag(2) + algorithm(1) + digest_type(1) + digest(variable)
                 let (key_tag, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
-                    return Err(anyhow!("DS record truncated before its digest type"));
+                    return Err(WireError::Truncated {
+                        what: "DS RDATA",
+                        need: 4,
+                        have: rdata.len(),
+                    });
                 }
                 let algorithm = rest[0];
                 let digest_type = rest[1];
@@ -353,7 +362,11 @@ impl ParsedRecord {
                 // of the round trip are ours.
                 let (type_covered, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
-                    return Err(anyhow!("RRSIG record truncated before its label count"));
+                    return Err(WireError::Truncated {
+                        what: "RRSIG RDATA",
+                        need: 3,
+                        have: rdata.len(),
+                    });
                 }
                 let algorithm = rest[0];
                 let labels = rest[1];
@@ -388,7 +401,11 @@ impl ParsedRecord {
                 // DNSKEY: flags(2) + protocol(1) + algorithm(1) + public_key(variable)
                 let (flags, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
-                    return Err(anyhow!("DNSKEY record truncated before its algorithm"));
+                    return Err(WireError::Truncated {
+                        what: "DNSKEY RDATA",
+                        need: 4,
+                        have: rdata.len(),
+                    });
                 }
                 let protocol = rest[0];
                 let algorithm = rest[1];
@@ -403,25 +420,38 @@ impl ParsedRecord {
             50 => {
                 // NSEC3: hash_algorithm(1) + flags(1) + iterations(2) + salt_len(1) + salt(variable) + next_hashed_owner + type_bitmap
                 if rdata.len() < 5 {
-                    return Err(anyhow!("NSEC3 record too short: need at least 5 bytes, got {}", rdata.len()));
+                    return Err(WireError::Truncated {
+                        what: "NSEC3 RDATA",
+                        need: 5,
+                        have: rdata.len(),
+                    });
                 }
                 let hash_algorithm = rdata[0];
                 let flags = rdata[1];
                 let (iterations, rest) = read_be!(u16, &rdata[2..]);
                 let salt_len = rest[0] as usize;
                 if rest.len() < 1 + salt_len {
-                    return Err(anyhow!("NSEC3 salt extends beyond record boundary"));
+                    return Err(WireError::malformed(
+                        "NSEC3 RDATA",
+                        "the salt extends past the end of the record",
+                    ));
                 }
                 let salt = rest[1..1+salt_len].to_vec();
                 let rest = &rest[1+salt_len..];
 
                 // next_hashed_owner is a raw byte string (not a domain name)
                 if rest.is_empty() {
-                    return Err(anyhow!("NSEC3 record missing next_hashed_owner"));
+                    return Err(WireError::malformed(
+                        "NSEC3 RDATA",
+                        "there is no next-hashed-owner field",
+                    ));
                 }
                 let next_owner_len = rest[0] as usize;
                 if rest.len() < 1 + next_owner_len {
-                    return Err(anyhow!("NSEC3 next_hashed_owner extends beyond record boundary"));
+                    return Err(WireError::malformed(
+                        "NSEC3 RDATA",
+                        "the next-hashed-owner field extends past the end of the record",
+                    ));
                 }
                 let next_hashed_owner = rest[1..1+next_owner_len].to_vec();
                 let type_bitmap = rest[1+next_owner_len..].to_vec();
@@ -443,7 +473,7 @@ impl ParsedRecord {
     ///
     /// The inverse of [`ParsedRecord::decode`] for the types we parse. Names
     /// are written uncompressed via [`dname_to_bytes`].
-    fn encode(&self) -> Result<(u16, Vec<u8>), anyhow::Error> {
+    fn encode(&self) -> Result<(u16, Vec<u8>), WireError> {
         let out = match self {
             ParsedRecord::A(addr) => (1, addr.octets().to_vec()),
             ParsedRecord::AAAA(addr) => (28, addr.octets().to_vec()),
@@ -460,7 +490,10 @@ impl ParsedRecord {
             }
             ParsedRecord::TXT(strings) => {
                 if strings.is_empty() {
-                    return Err(anyhow!("a TXT record must carry at least one string"));
+                    return Err(WireError::malformed(
+                        "a TXT record",
+                        "it must carry at least one character-string",
+                    ));
                 }
                 let mut v = Vec::new();
                 for s in strings {
@@ -468,10 +501,11 @@ impl ParsedRecord {
                     // longer string across two character-strings would change
                     // what the record says, so this is the zone's mistake to fix.
                     let len = u8::try_from(s.len()).map_err(|_| {
-                        anyhow!(
-                            "TXT string is {} bytes; a character-string holds at most 255",
-                            s.len()
-                        )
+                        WireError::TooLong {
+                            what: "a TXT character-string",
+                            limit: 255,
+                            actual: s.len(),
+                        }
                     })?;
                     v.push(len);
                     v.extend_from_slice(s);
@@ -722,7 +756,7 @@ impl Edns {
     }
 
     /// Decode EDNS parameters from a parsed OPT [`ResourceRecord`].
-    fn from_record(rr: &ResourceRecord) -> Result<Self, anyhow::Error> {
+    fn from_record(rr: &ResourceRecord) -> Result<Self, WireError> {
         let flags = rr.ttl as u32;
         Ok(Edns {
             udp_payload_size: rr.class,
@@ -735,23 +769,25 @@ impl Edns {
     /// Parse the OPT RDATA option list. A malformed list is an error rather
     /// than a partial read: a client that sends one deserves FORMERR, not a
     /// silently truncated view of what it asked for.
-    fn parse_options(mut rdata: &[u8]) -> Result<Vec<EdnsOption>, anyhow::Error> {
+    fn parse_options(mut rdata: &[u8]) -> Result<Vec<EdnsOption>, WireError> {
         let mut options = Vec::new();
         while !rdata.is_empty() {
             if rdata.len() < 4 {
-                return Err(anyhow!(
-                    "truncated EDNS option header: {} byte(s) left, need 4",
-                    rdata.len()
-                ));
+                return Err(WireError::Truncated {
+                    what: "an EDNS option header",
+                    need: 4,
+                    have: rdata.len(),
+                });
             }
             let code = u16::from_be_bytes([rdata[0], rdata[1]]);
             let len = u16::from_be_bytes([rdata[2], rdata[3]]) as usize;
             rdata = &rdata[4..];
             if rdata.len() < len {
-                return Err(anyhow!(
-                    "EDNS option {code} declares {len} bytes but only {} remain",
-                    rdata.len()
-                ));
+                return Err(WireError::Truncated {
+                    what: "EDNS option data",
+                    need: len,
+                    have: rdata.len(),
+                });
             }
             options.push(EdnsOption {
                 code,
@@ -764,15 +800,15 @@ impl Edns {
 
     /// Build the OPT [`ResourceRecord`] for the additional section, encoding the
     /// option list into RDATA.
-    fn to_record(&self) -> Result<ResourceRecord, anyhow::Error> {
+    fn to_record(&self) -> Result<ResourceRecord, WireError> {
         let mut rdata = Vec::new();
         for opt in &self.options {
             let len: u16 = opt.data.len().try_into().map_err(|_| {
-                anyhow!(
-                    "EDNS option {} data is {} bytes, exceeding the 65535-byte field",
-                    opt.code,
-                    opt.data.len()
-                )
+                WireError::TooLong {
+                    what: "EDNS option data",
+                    limit: u16::MAX as usize,
+                    actual: opt.data.len(),
+                }
             })?;
             rdata.extend_from_slice(&opt.code.to_be_bytes());
             rdata.extend_from_slice(&len.to_be_bytes());
@@ -792,7 +828,7 @@ impl Edns {
 
 impl<'a> TryUnpackFromBytes<'a> for QuerySection {
     type Output = (QuerySection, &'a [u8]);
-    type Error = anyhow::Error;
+    type Error = WireError;
     fn try_from_bytes(
         data: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
@@ -816,7 +852,7 @@ impl<'a> TryUnpackFromBytes<'a> for QuerySection {
 
 impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
     type Output = (ResourceRecord, &'a [u8]);
-    type Error = anyhow::Error;
+    type Error = WireError;
     fn try_from_bytes(
         data: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
@@ -838,10 +874,11 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
         // until the length is known good, which is the whole point.
         let rdatalen = rdatalen as usize;
         if rest.len() < rdatalen {
-            return Err(anyhow!(
-                "RDATA declares {rdatalen} bytes but only {} remain",
-                rest.len()
-            ));
+            return Err(WireError::Truncated {
+                what: "RDATA",
+                need: rdatalen,
+                have: rest.len(),
+            });
         }
         let (rdata, rest) = rest.split_at(rdatalen);
 
@@ -859,9 +896,13 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
 }
 
 impl DnsMessage {
-    pub fn try_from_bytes(data: &[u8]) -> Result<Self, anyhow::Error> {
+    pub fn try_from_bytes(data: &[u8]) -> Result<Self, WireError> {
         if data.len() < 12 {
-            return Err(anyhow!("not enough data"));
+            return Err(WireError::Truncated {
+                what: "the DNS header",
+                need: 12,
+                have: data.len(),
+            });
         }
 
         let unpacker = DNameUnpacker::new(data);
@@ -943,7 +984,7 @@ impl DnsMessage {
     /// Serialize the message into `output`, with domain-name compression
     /// (RFC 1035 §4.1.4). Returns the number of bytes written; errors if the
     /// message does not fit rather than writing a silently truncated one.
-    pub fn to_bytes(&self, output: &mut [u8]) -> Result<usize, anyhow::Error> {
+    pub fn to_bytes(&self, output: &mut [u8]) -> Result<usize, WireError> {
         let mut compressor = NameCompressor::new();
         let mut pos = 0;
 
@@ -963,8 +1004,11 @@ impl DnsMessage {
             .iter()
             .any(|rr| rr.rdata.rtype == OPT_RECORD_TYPE);
         if rcode > 0xf && !has_opt {
-            return Err(anyhow!(
-                "extended RCODE {rcode} needs an EDNS0 OPT record to carry its high bits (RFC 6891 §6.1.3)"
+            return Err(WireError::malformed(
+                "the header",
+                format!(
+                    "extended RCODE {rcode} needs an EDNS0 OPT record to carry its high                      bits (RFC 6891 §6.1.3)"
+                ),
             ));
         }
 
@@ -1017,7 +1061,11 @@ impl DnsMessage {
                 pos = compressor.write_rdata(rr.rdata.rtype, &rr.rdata.rdata, output, pos)?;
                 let rdlen: u16 = (pos - rdata_at)
                     .try_into()
-                    .map_err(|_| anyhow!("RDATA exceeds 65535 bytes"))?;
+                    .map_err(|_| WireError::TooLong {
+                        what: "RDATA",
+                        limit: u16::MAX as usize,
+                        actual: pos - rdata_at,
+                    })?;
                 write_bytes(output, rdlen_at, &rdlen.to_be_bytes())?;
             }
         }
@@ -1027,7 +1075,7 @@ impl DnsMessage {
     /// The EDNS0 OPT record from the additional section, if the message carries
     /// one. Errors if the OPT record's option list is malformed — the caller
     /// should answer FORMERR.
-    pub fn edns(&self) -> Result<Option<Edns>, anyhow::Error> {
+    pub fn edns(&self) -> Result<Option<Edns>, WireError> {
         self.additionals
             .iter()
             .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
@@ -1059,7 +1107,7 @@ impl DnsMessage {
 
     /// Add the OPT record to the additional section, replacing any existing one.
     /// Errors only if an option's data exceeds the 16-bit length field.
-    pub fn set_edns(&mut self, edns: Edns) -> Result<(), anyhow::Error> {
+    pub fn set_edns(&mut self, edns: Edns) -> Result<(), WireError> {
         let record = edns.to_record()?;
         self.additionals
             .retain(|rr| rr.rdata.rtype != OPT_RECORD_TYPE);
@@ -1071,7 +1119,7 @@ impl DnsMessage {
     /// message doesn't fit, the answer/authority records are dropped (the OPT
     /// record and question are kept) and TC=1 is set so the client retries over
     /// TCP. Returns the wire bytes.
-    pub fn to_bytes_within(&self, max_len: usize) -> Result<Vec<u8>, anyhow::Error> {
+    pub fn to_bytes_within(&self, max_len: usize) -> Result<Vec<u8>, WireError> {
         let mut scratch = vec![0u8; u16::MAX as usize];
         let n = self.to_bytes(&mut scratch)?;
         if n <= max_len {
@@ -1749,7 +1797,15 @@ mod tests {
         opt.rdata.rdata = Box::new([0x00, 0x0a, 0x00, 0x08, 0xde, 0xad]);
 
         let err = msg.edns().expect_err("truncated option must be rejected");
-        assert!(err.to_string().contains("only 2 remain"), "got: {err}");
+        assert_eq!(
+            err,
+            WireError::Truncated {
+                what: "EDNS option data",
+                need: 8,
+                have: 2,
+            },
+            "the option declared 8 bytes and supplied 2"
+        );
         // The payload size is still readable — it lives in the OPT CLASS field.
         assert_eq!(msg.udp_payload_size(), 1232);
         assert!(msg.has_edns());

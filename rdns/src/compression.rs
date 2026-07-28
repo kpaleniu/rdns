@@ -20,7 +20,7 @@
 use crate::dname::{
     dname_from_bytes, write_bytes, write_label, DNameUnpacker, POINTER_MASK, POINTER_TAG,
 };
-use anyhow::anyhow;
+use crate::error::WireError;
 use std::collections::HashMap;
 
 /// Per-message table of name suffixes already written, and where.
@@ -43,7 +43,7 @@ impl NameCompressor {
         name: &str,
         buf: &mut [u8],
         pos: usize,
-    ) -> Result<usize, anyhow::Error> {
+    ) -> Result<usize, WireError> {
         let trimmed = name.strip_suffix('.').unwrap_or(name);
         if trimmed.is_empty() {
             // The root is one zero octet; a pointer to it would cost two.
@@ -105,7 +105,7 @@ impl NameCompressor {
         rdata: &[u8],
         buf: &mut [u8],
         pos: usize,
-    ) -> Result<usize, anyhow::Error> {
+    ) -> Result<usize, WireError> {
         match rtype {
             // NS, CNAME, PTR: the RDATA is exactly one domain name.
             2 | 5 | 12 => {
@@ -124,7 +124,11 @@ impl NameCompressor {
             // MX: 16-bit preference, then EXCHANGE.
             15 => {
                 if rdata.len() < 2 {
-                    return Err(anyhow!("MX RDATA too short for its preference field"));
+                    return Err(WireError::Truncated {
+                        what: "MX RDATA",
+                        need: 2,
+                        have: rdata.len(),
+                    });
                 }
                 let pos = write_bytes(buf, pos, &rdata[..2])?;
                 let (exchange, rest) = read_name(&rdata[2..])?;
@@ -140,7 +144,7 @@ impl NameCompressor {
 
 /// Read one uncompressed name from the head of `data`, returning it with the
 /// bytes that follow.
-fn read_name(data: &[u8]) -> Result<(String, &[u8]), anyhow::Error> {
+fn read_name(data: &[u8]) -> Result<(String, &[u8]), WireError> {
     // Stored RDATA contains no pointers by construction, so the unpacker only
     // ever walks the bytes it is given.
     let unpacker = DNameUnpacker::new(data);

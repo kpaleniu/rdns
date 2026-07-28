@@ -7,6 +7,7 @@
 //! - Expiration checking
 //! - Record type constants and conversion
 
+use crate::error::{DnssecError, DnssecResult};
 use crate::{ParsedRecord, RecordData};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -210,7 +211,7 @@ pub fn is_cache_expired(expires_at: u64) -> bool {
 /// Returns an error if the record is not a DNSKEY record
 pub fn extract_dnskey_fields(
     key: &ParsedRecord,
-) -> Result<(u8, Vec<u8>, u16, u8), anyhow::Error> {
+) -> DnssecResult<(u8, Vec<u8>, u16, u8)> {
     match key {
         ParsedRecord::DNSKEY {
             algorithm,
@@ -218,7 +219,7 @@ pub fn extract_dnskey_fields(
             flags,
             protocol,
         } => Ok((*algorithm, public_key.clone(), *flags, *protocol)),
-        _ => Err(anyhow::anyhow!("Not a DNSKEY record")),
+        _ => Err(DnssecError::parse("not a DNSKEY record")),
     }
 }
 

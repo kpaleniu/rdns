@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use crate::error::{ConfigError, ConfigResult};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use crate::utils::current_unix_timestamp;
@@ -343,7 +344,7 @@ impl TransferAcl {
     /// A rule that does not parse is an error rather than a skip: a typo in an
     /// ACL must stop the server, not silently leave the list shorter than the
     /// operator believes it to be.
-    pub fn parse(specs: &[String]) -> Result<Self, String> {
+    pub fn parse(specs: &[String]) -> ConfigResult<Self> {
         let mut rules = Vec::new();
         for spec in specs {
             let spec = spec.trim();
@@ -356,19 +357,17 @@ impl TransferAcl {
             };
             let addr: IpAddr = addr_part
                 .parse()
-                .map_err(|e| format!("bad address {addr_part:?} in transfer ACL: {e}"))?;
+                .map_err(|e| ConfigError::new(format!("bad address {addr_part:?} in transfer ACL: {e}")))?;
             let max = if addr.is_ipv4() { 32 } else { 128 };
             let prefix = match prefix_part {
                 Some(p) => p
                     .parse::<u8>()
-                    .map_err(|e| format!("bad prefix length {p:?} in transfer ACL: {e}"))?,
+                    .map_err(|e| ConfigError::new(format!("bad prefix length {p:?} in transfer ACL: {e}")))?,
                 None => max,
             };
             if prefix > max {
-                return Err(format!(
-                    "prefix /{prefix} is longer than an {} address allows",
-                    if addr.is_ipv4() { "IPv4" } else { "IPv6" }
-                ));
+                return Err(ConfigError::new(format!("prefix /{prefix} is longer than an {} address allows",
+                    if addr.is_ipv4() { "IPv4" } else { "IPv6" })));
             }
             rules.push(AclRule { addr, prefix });
         }

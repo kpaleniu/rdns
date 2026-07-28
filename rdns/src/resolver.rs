@@ -13,6 +13,7 @@
 //! trip rather than pinning a thread for the sum of them. `rdnsr` awaits
 //! `resolve` directly. See the note on [`Resolver::recurse`].
 
+use crate::error::{ResolveError, ResolveResult};
 use std::sync::Arc;
 use crate::dnssec::{Dnskey, Rrsig};
 use crate::dnssec_chain::{
@@ -26,7 +27,6 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Duration;
-use anyhow::anyhow;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -506,11 +506,11 @@ impl Budget {
     }
 
     /// Charge one upstream query, or fail if the query has spent its budget.
-    fn spend(&mut self) -> Result<(), anyhow::Error> {
+    fn spend(&mut self) -> ResolveResult<()> {
         self.remaining = self
             .remaining
             .checked_sub(1)
-            .ok_or_else(|| anyhow!("query budget exhausted"))?;
+            .ok_or(ResolveError::BudgetExhausted)?;
         Ok(())
     }
 }
@@ -718,7 +718,7 @@ impl Resolver {
     ///
     /// The answer only; use [`Resolver::resolve_validated`] to learn whether it
     /// was authenticated.
-    pub async fn resolve(&self, query: &QuerySection) -> Result<DnsMessage, anyhow::Error> {
+    pub async fn resolve(&self, query: &QuerySection) -> ResolveResult<DnsMessage> {
         self.resolve_validated(query).await.map(|(msg, _)| msg)
     }
 
@@ -730,7 +730,7 @@ impl Resolver {
     pub async fn resolve_validated(
         &self,
         query: &QuerySection,
-    ) -> Result<(DnsMessage, ValidationState), anyhow::Error> {
+    ) -> Result<(DnsMessage, ValidationState), ResolveError> {
         let mut state = Resolution::new(self.config.query_budget);
         let response = match self.config.mode {
             ResolverMode::Forward => self.forward(query, &mut state).await?,
@@ -756,14 +756,14 @@ impl Resolver {
         &self,
         query: &QuerySection,
         state: &mut Resolution,
-    ) -> Result<DnsMessage, anyhow::Error> {
+    ) -> ResolveResult<DnsMessage> {
         // RD=1: we are asking the upstream to do the recursion for us. `ask_any`
         // tries them fastest-first and records their RTTs, same as recursion.
         let out = self.build_query(query, true)?;
         self.ask_any(&self.config.upstream_servers, &out, &mut state.budget)
             .await
             .ok_or_else(|| {
-                anyhow!("failed to resolve {} with all upstream servers", query.qname)
+                ResolveError::no_response(format!("failed to resolve {} with all upstream servers", query.qname))
             })
     }
 
@@ -779,7 +779,7 @@ impl Resolver {
         &self,
         query: &QuerySection,
         recursion_desired: bool,
-    ) -> Result<OutgoingQuery, anyhow::Error> {
+    ) -> ResolveResult<OutgoingQuery> {
         let id = rand::random::<u16>();
         // The name as sent: same labels, but with the case of its letters
         // scrambled when 0x20 is on. Resolution logic elsewhere still
@@ -860,7 +860,7 @@ impl Resolver {
         &self,
         query: &QuerySection,
         state: &mut Resolution,
-    ) -> Result<DnsMessage, anyhow::Error> {
+    ) -> ResolveResult<DnsMessage> {
         let mut qname = normalize(&query.qname);
         let mut answers = Vec::new();
         // Names we have already asked about — asking twice means a CNAME loop.
@@ -872,13 +872,11 @@ impl Resolver {
 
         for hop in 0..=self.config.max_cname_hops {
             if !queried.insert(qname.clone()) {
-                return Err(anyhow!("CNAME loop at {qname}"));
+                return Err(ResolveError::no_response(format!("CNAME loop at {qname}")));
             }
             if hop == self.config.max_cname_hops {
-                return Err(anyhow!(
-                    "CNAME chain longer than {} hops",
-                    self.config.max_cname_hops
-                ));
+                return Err(ResolveError::no_response(format!("CNAME chain longer than {} hops",
+                    self.config.max_cname_hops)));
             }
 
             let step = QuerySection {
@@ -935,7 +933,7 @@ impl Resolver {
             qname = cname.expect("checked is_none above");
         }
 
-        let mut response = last.ok_or_else(|| anyhow!("no response for {}", query.qname))?;
+        let mut response = last.ok_or_else(|| ResolveError::no_response(format!("no response for {}", query.qname)))?;
         // Present the whole chain under the question the client actually asked.
         response.queries = vec![query.clone()];
         response.answers = answers;
@@ -954,10 +952,10 @@ impl Resolver {
         query: &QuerySection,
         state: &mut Resolution,
         depth: usize,
-    ) -> Result<DnsMessage, anyhow::Error> {
+    ) -> ResolveResult<DnsMessage> {
         const MAX_NESTED: usize = 4;
         if depth > MAX_NESTED {
-            return Err(anyhow!("nameserver lookup nested deeper than {MAX_NESTED}"));
+            return Err(ResolveError::no_response(format!("nameserver lookup nested deeper than {MAX_NESTED}")));
         }
 
         // Start as far down the tree as we already know how to, rather than at
@@ -1008,7 +1006,7 @@ impl Resolver {
         depth: usize,
         start_zone: String,
         start_servers: Vec<SocketAddr>,
-    ) -> Result<DnsMessage, anyhow::Error> {
+    ) -> ResolveResult<DnsMessage> {
         let qname = normalize(&query.qname);
         let qname_labels = label_count(&qname);
 
@@ -1051,7 +1049,7 @@ impl Resolver {
             let out = self.build_query(&step, false)?;
 
             let Some(response) = self.ask_any(&servers, &out, &mut state.budget).await else {
-                return Err(anyhow!("no server for {zone} answered while resolving {qname}"));
+                return Err(ResolveError::no_response(format!("no server for {zone} answered while resolving {qname}")));
             };
 
             // A referral advances us to the child zone, whether the probe was
@@ -1081,7 +1079,7 @@ impl Resolver {
                 };
 
                 if servers.is_empty() {
-                    return Err(anyhow!("no reachable nameserver for {child_zone}"));
+                    return Err(ResolveError::no_response(format!("no reachable nameserver for {child_zone}")));
                 }
                 // Remember it so the next query for anything in this zone can
                 // start here instead of at the root.
@@ -1102,9 +1100,7 @@ impl Resolver {
                 if !response.answers.is_empty() || response.authoritive {
                     return Ok(response);
                 }
-                return Err(anyhow!(
-                    "lame delegation: {zone} gave no answer and no usable referral for {qname}"
-                ));
+                return Err(ResolveError::no_response(format!("lame delegation: {zone} gave no answer and no usable referral for {qname}")));
             }
 
             // No referral on an *intermediate* probe.
@@ -1119,10 +1115,8 @@ impl Resolver {
             sent_labels = labels + 1;
         }
 
-        Err(anyhow!(
-            "more than {} referrals while resolving {qname}",
-            self.config.max_delegations
-        ))
+        Err(ResolveError::no_response(format!("more than {} referrals while resolving {qname}",
+            self.config.max_delegations)))
     }
 
     /// Try the servers fastest-known-first, returning the first usable response
@@ -1160,7 +1154,7 @@ impl Resolver {
         response: &DnsMessage,
         zone: &str,
         qname: &str,
-    ) -> Result<Option<Referral>, anyhow::Error> {
+    ) -> ResolveResult<Option<Referral>> {
         // The NS records in the authority section name the child zone.
         let mut child_zone: Option<String> = None;
         let mut ns_names = Vec::new();
@@ -1252,7 +1246,7 @@ impl Resolver {
         ns_names: &[String],
         state: &mut Resolution,
         depth: usize,
-    ) -> Result<Vec<SocketAddr>, anyhow::Error> {
+    ) -> ResolveResult<Vec<SocketAddr>> {
         for name in ns_names {
             let lookup = QuerySection {
                 qname: name.clone(),
@@ -1288,7 +1282,7 @@ impl Resolver {
         &self,
         upstream: &SocketAddr,
         out: &OutgoingQuery,
-    ) -> Result<DnsMessage, anyhow::Error> {
+    ) -> ResolveResult<DnsMessage> {
         // tokio's UdpSocket has no read timeout of its own, so the deadline is
         // applied with `tokio::time::timeout` around the recv.
         let read_timeout = Duration::from_millis(self.config.timeout_ms / 2);
@@ -1319,7 +1313,7 @@ impl Resolver {
         // is on). The connected socket already filters by source address; this
         // is the entropy an off-path spoofer additionally has to match.
         if !self.response_matches(&response, out) {
-            return Err(anyhow!("reply from {upstream} did not match the query"));
+            return Err(ResolveError::no_response(format!("reply from {upstream} did not match the query")));
         }
 
         // RFC 1035 §4.2.1: a truncated answer must be retried over TCP. The
@@ -1346,12 +1340,10 @@ impl Resolver {
         &self,
         upstream: &SocketAddr,
         out: &OutgoingQuery,
-    ) -> Result<DnsMessage, anyhow::Error> {
+    ) -> ResolveResult<DnsMessage> {
         if out.buf.len() > TCP_MAX_MESSAGE {
-            return Err(anyhow!(
-                "query of {} bytes exceeds the 2-byte TCP length prefix",
-                out.buf.len()
-            ));
+            return Err(ResolveError::no_response(format!("query of {} bytes exceeds the 2-byte TCP length prefix",
+                out.buf.len())));
         }
 
         // Same budget as the UDP half, applied to each of connect, write and
@@ -1369,7 +1361,7 @@ impl Resolver {
         tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await??;
         let len = u16::from_be_bytes(len_buf) as usize;
         if len == 0 {
-            return Err(anyhow!("upstream {} sent a zero-length TCP message", upstream));
+            return Err(ResolveError::no_response(format!("upstream {} sent a zero-length TCP message", upstream)));
         }
 
         let mut response_buf = vec![0; len];
@@ -1380,7 +1372,7 @@ impl Resolver {
         // but a mismatched id or question still means a confused peer, not an
         // answer to trust.
         if !self.response_matches(&response, out) {
-            return Err(anyhow!("TCP reply from {upstream} did not match the query"));
+            return Err(ResolveError::no_response(format!("TCP reply from {upstream} did not match the query")));
         }
         Ok(response)
     }
@@ -1626,7 +1618,7 @@ impl Resolver {
         &self,
         zone: &str,
         state: &mut Resolution,
-    ) -> Result<(Vec<ResourceRecord>, u64), anyhow::Error> {
+    ) -> Result<(Vec<ResourceRecord>, u64), ResolveError> {
         let query = QuerySection {
             qname: zone.to_string(),
             qtype: rt::DNSKEY,
@@ -2334,7 +2326,7 @@ this line has no record and is skipped
 
         let err = result.expect_err("a CNAME loop must be an error").to_string();
         assert!(
-            err.contains("loop") || err.contains("budget") || err.contains("hops"),
+            err.to_string().contains("loop") || err.to_string().contains("budget") || err.to_string().contains("hops"),
             "unexpected error: {err}"
         );
     }
@@ -3139,7 +3131,7 @@ this line has no record and is skipped
         config: impl FnOnce(SocketAddr) -> ResolverConfig,
         mangle: fn(&str) -> String,
         break_id: bool,
-    ) -> Result<DnsMessage, anyhow::Error> {
+    ) -> ResolveResult<DnsMessage> {
         let (udp, _tcp, addr) = bind_fake_upstream();
         let udp_thread = thread::spawn(move || {
             let mut buf = [0u8; 4096];

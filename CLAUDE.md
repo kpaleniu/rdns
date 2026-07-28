@@ -74,7 +74,45 @@ Both halves of this were violated in code where every *other* length was checked
   mattered. If a value has an invariant, make it unrepresentable without it
   rather than re-asserting it per site.
 
-## 3. Errors: degrading quietly is worse than failing
+## 3. Error types: typed in the library, `anyhow` in the binaries
+
+One rule, and it runs the opposite way in the two places:
+
+- **`rdns` returns typed errors** (`WireError`, `ZoneError`, `DnssecError`,
+  `TransferError`, `ResolveError`, `ConfigError` — all in `rdns::error`). A
+  library that returns `anyhow::Error` erases the failure kind from its own API,
+  and here that kind *is* the answer: a truncated packet is FORMERR, an
+  unsupported label is NOTIMP, a signature that does not verify is SERVFAIL and
+  an algorithm we cannot read is insecure. With a string in hand the caller
+  cannot tell them apart.
+- **`rdnsd` and `rdnsr` use `anyhow::Result`** with `.context()`. Their only
+  consumer is a human reading a log line or an exit message, which is exactly
+  what `anyhow` is for.
+- **Never `Box<dyn Error>`, never `Result<_, String>`.** Both were in use here
+  and both are strictly worse than the option beside them. `Box<dyn Error>` is
+  `anyhow` without context chaining, without `Send + Sync`, and with a `Debug`
+  impl that renders a multi-line message as a quoted Rust literal with the
+  newlines escaped — `main` prints its `Err` with `Debug`, so an error an
+  operator has to read comes out unreadable. `Result<_, String>` does not even
+  implement `Error`, so `?` will not lift it into either of the above.
+
+Two habits that keep the types honest:
+
+- **Add a variant when a caller would branch on it, not when a message differs.**
+  `TransferError::Timeout` exists because a secondary retries a timeout and gives
+  up on a malformed transfer; `ResolveError::BudgetExhausted` exists because the
+  NXNSAttack defence firing is an operational signal, not a lookup failure. A
+  variant nobody matches on is a `String` with extra syntax.
+- **A `String` inside a variant is fine when the *category* is the typed part.**
+  The structural ways a DNS message can be malformed are open-ended; enumerating
+  them would produce a hundred variants nobody reads, and dropping the text would
+  make a bad packet undiagnosable.
+
+**Assert on the variant, not the message.** `matches!(err, WireError::TooLong { what: "a label", .. })`
+says what the test means and survives a reworded message; `err.to_string().contains("label length")`
+does neither. Roughly a dozen tests here were the second kind.
+
+## 4. Errors: degrading quietly is worse than failing
 
 Serving a wrong DNS answer is worse than serving none, and every finding in this
 class left the process healthy with nothing alerting.
@@ -117,7 +155,7 @@ class left the process healthy with nothing alerting.
   arrives as `Uncategorized` and matches no kind at all. See
   `utils::recv_error_is_transient`.
 
-## 4. State keyed on something an attacker chooses must be bounded
+## 5. State keyed on something an attacker chooses must be bounded
 
 Four of five reviewers found the same shape. `QueryStats::queries_by_ip`,
 `rate_limited_ips` and `RateLimiter::buckets` grew one entry per source address,
@@ -135,7 +173,7 @@ no trimming at all in two of them.
   place. A bound plus a visible shortfall counter (`untracked_sources`) beats a
   map that is quietly a lie.
 
-## 5. Wall-clock time is not monotonic
+## 6. Wall-clock time is not monotonic
 
 `utils::current_unix_timestamp` is `SystemTime`. An NTP step backwards made
 `now - last_refill` underflow: a debug panic **with a mutex held**, which poisons
@@ -149,7 +187,7 @@ wrapped to ~1.8e19 and silently refilled every bucket.
   path a query can reach.
 - Anything measuring an interval rather than naming an instant wants `Instant`.
 
-## 6. Duplicated logic drifts; the second copy is where the bug lives
+## 7. Duplicated logic drifts; the second copy is where the bug lives
 
 The ICMP predicate existed twice, once per binary. The oversized-datagram case
 was found in one copy. The ASCII-lowercasing helper existed correctly in `zone`
@@ -159,7 +197,7 @@ When you find the same reasoning in two places, move it into `rdns` and make bot
 call it — and put the *reason* in the doc comment, because the reason is what
 stops the next copy being written.
 
-## 7. DNS rules this codebase has already got wrong
+## 8. DNS rules this codebase has already got wrong
 
 Cheap to re-check, expensive to rediscover.
 
@@ -207,7 +245,7 @@ Cheap to re-check, expensive to rediscover.
   NSEC3 denied a type that was there — and an aggressive-NSEC resolver would then
   synthesize that false NODATA for other clients out of its cache.
 
-## 8. Async, locks, and the work done under them
+## 9. Async, locks, and the work done under them
 
 - **An `async fn` with no `.await` in it is blocking, and its signature says
   otherwise.** `load_zones_from_source` did `read_dir`, `read_to_string` per zone,
@@ -222,7 +260,7 @@ Cheap to re-check, expensive to rediscover.
   `to_vec()`, two `Arc` clones and a task before deciding to drop the packet is
   backwards.
 
-## 9. Benchmarks and measurement
+## 10. Benchmarks and measurement
 
 - **A wall-clock assertion with no headroom is a coin toss, not a test.** Give a
   floor a factor of ten of headroom, as `bench_zone_lookup` does.
@@ -233,7 +271,7 @@ Cheap to re-check, expensive to rediscover.
 - **Prefer a deterministic assertion where one exists.** An allocation count
   (`dhat::assert_eq!` on `total_blocks`) does not care what else is running.
 
-## 10. Comments, commits, and `TODO.md`
+## 11. Comments, commits, and `TODO.md`
 
 This repo keeps its reasoning in prose, and that is deliberate — match it.
 

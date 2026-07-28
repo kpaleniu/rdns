@@ -1,8 +1,8 @@
+use crate::error::WireError;
 use std::str::from_utf8;
 use std::cell::RefCell;
 use std::collections::HashSet;
 
-use anyhow::anyhow;
 
 /// The two high bits that mark a label as a compression pointer (RFC 1035
 /// §4.1.4).
@@ -25,14 +25,14 @@ pub(crate) fn write_bytes(
     buf: &mut [u8],
     pos: usize,
     bytes: &[u8],
-) -> Result<usize, anyhow::Error> {
+) -> Result<usize, WireError> {
     let end = pos + bytes.len();
     if end > buf.len() {
-        return Err(anyhow!(
-            "buffer too small: need {} bytes, have {}",
-            end,
-            buf.len()
-        ));
+        return Err(WireError::Truncated {
+            what: "the output buffer",
+            need: end,
+            have: buf.len(),
+        });
     }
     buf[pos..end].copy_from_slice(bytes);
     Ok(end)
@@ -47,12 +47,16 @@ pub(crate) fn write_label(
     buf: &mut [u8],
     pos: usize,
     label: &str,
-) -> Result<usize, anyhow::Error> {
+) -> Result<usize, WireError> {
     if label.is_empty() {
-        return Err(anyhow!("empty label in domain name"));
+        return Err(WireError::malformed("domain name", "a label may not be empty"));
     }
     if label.len() > MAX_LABEL_LEN {
-        return Err(anyhow!("label longer than {MAX_LABEL_LEN} bytes: {label}"));
+        return Err(WireError::TooLong {
+            what: "a label",
+            limit: MAX_LABEL_LEN,
+            actual: label.len(),
+        });
     }
     let pos = write_bytes(buf, pos, &[label.len() as u8])?;
     write_bytes(buf, pos, label.as_bytes())
@@ -85,12 +89,13 @@ impl<'a> Label<'a> {
 }
 
 impl<'a> TryInto<&'a str> for Label<'a> {
-    type Error = anyhow::Error;
+    type Error = WireError;
 
-    fn try_into(self) -> Result<&'a str, anyhow::Error> {
+    fn try_into(self) -> Result<&'a str, WireError> {
         match self {
-            Label::String(s) => from_utf8(s).or(Err(anyhow!("not a string"))),
-            _ => Err(anyhow!("not a string")),
+            Label::String(s) => from_utf8(s)
+                .map_err(|_| WireError::malformed("a label", "not valid UTF-8")),
+            _ => Err(WireError::malformed("a label", "not a text label")),
         }
     }
 }
@@ -107,12 +112,16 @@ impl<'a> TryInto<&'a str> for Label<'a> {
  */
 impl<'a> TryFromBytes<'a> for Label<'a> {
     type Output = Label<'a>;
-    type Error = anyhow::Error;
-    fn try_from_bytes(data: &'a [u8]) -> Result<Label<'a>, anyhow::Error> {
+    type Error = WireError;
+    fn try_from_bytes(data: &'a [u8]) -> Result<Label<'a>, WireError> {
         // Every index below is on bytes a hostile peer chose the length of, so
         // each one is checked: a truncated message must be an error, not a panic.
         let Some(&first) = data.first() else {
-            return Err(anyhow!("truncated message: expected a label"));
+            return Err(WireError::Truncated {
+                what: "a label",
+                need: 1,
+                have: 0,
+            });
         };
         let lt = first >> 6;
         let len = (first & 0x3f) as usize; // guarantees len cannot be more than 63
@@ -123,11 +132,11 @@ impl<'a> TryFromBytes<'a> for Label<'a> {
                 0 => Ok(Label::Root),
                 _ => {
                     if data.len() <= len {
-                        return Err(anyhow!(
-                            "truncated label: claims {} bytes, {} remain",
-                            len,
-                            data.len() - 1
-                        ));
+                        return Err(WireError::Truncated {
+                            what: "a label",
+                            need: len,
+                            have: data.len() - 1,
+                        });
                     }
                     Ok(Label::String(&data[1..=len]))
                 }
@@ -135,7 +144,11 @@ impl<'a> TryFromBytes<'a> for Label<'a> {
             /* compressed label */
             0x3 => {
                 if data.len() < 2 {
-                    return Err(anyhow!("truncated compression pointer"));
+                    return Err(WireError::Truncated {
+                        what: "a compression pointer",
+                        need: 2,
+                        have: data.len(),
+                    });
                 }
                 Ok(Label::Pointer(
                     (u16::from_be_bytes([data[0], data[1]]) & POINTER_MASK) as usize,
@@ -143,11 +156,15 @@ impl<'a> TryFromBytes<'a> for Label<'a> {
             }
             /* extended label */
             0x1 => match data[0] {
-                0x41 => Err(anyhow!("binary label, not supported")),
-                0x7f => Err(anyhow!("reseved for future expansion, not supported")),
-                _ => Err(anyhow!("unknown label")),
+                // Legal encodings we do not implement (RFC 2673, RFC 6891
+                // §6.2.4), so the sender is not at fault: NOTIMP, not FORMERR.
+                0x41 => Err(WireError::Unsupported { what: "a binary label" }),
+                0x7f => Err(WireError::Unsupported {
+                    what: "the reserved extended label type",
+                }),
+                _ => Err(WireError::malformed("a label", "unknown extended label type")),
             },
-            _ => Err(anyhow!("unknown label")),
+            _ => Err(WireError::malformed("a label", "unknown label type")),
         }
     }
 }
@@ -182,8 +199,8 @@ TODO: Implement validation to enforce this pattern
 */
 impl<'a> TryFromBytes<'a> for DName<'a> {
     type Output = (DName<'a>, &'a [u8]);
-    type Error = anyhow::Error;
-    fn try_from_bytes(data: &'a [u8]) -> Result<(DName<'a>, &'a [u8]), anyhow::Error> {
+    type Error = WireError;
+    fn try_from_bytes(data: &'a [u8]) -> Result<(DName<'a>, &'a [u8]), WireError> {
         let mut labels = Vec::new();
         let mut off = data;
         loop {
@@ -228,11 +245,15 @@ impl<'a> DNameUnpacker<'a> {
         &self,
         name: DName<'a>,
         depth: usize,
-    ) -> Result<UnpackedDName<'a>, anyhow::Error> {
+    ) -> Result<UnpackedDName<'a>, WireError> {
         const MAX_DEPTH: usize = 50;
         
         if depth > MAX_DEPTH {
-            return Err(anyhow!("pointer recursion depth limit ({}) exceeded", MAX_DEPTH));
+            return Err(WireError::TooLong {
+                what: "compression pointer nesting",
+                limit: MAX_DEPTH,
+                actual: MAX_DEPTH + 1,
+            });
         }
 
         let mut output = Vec::new();
@@ -244,18 +265,20 @@ impl<'a> DNameUnpacker<'a> {
                 Label::Pointer(offset) => {
                     // Bounds check: pointer offset must be within message
                     if *offset >= self.data.len() {
-                        return Err(anyhow!(
-                            "pointer offset {} exceeds message size {}",
-                            offset,
-                            self.data.len()
+                        return Err(WireError::malformed(
+                            "a compression pointer",
+                            format!(
+                                "offset {offset} is past the {}-byte message",
+                                self.data.len()
+                            ),
                         ));
                     }
 
                     // Cycle detection: check if we've already visited this offset
                     if self.visited.borrow().contains(offset) {
-                        return Err(anyhow!(
-                            "circular pointer detected at offset {}",
-                            offset
+                        return Err(WireError::malformed(
+                            "a compression pointer",
+                            format!("offset {offset} points into a cycle"),
                         ));
                     }
 
@@ -276,7 +299,7 @@ impl<'a> DNameUnpacker<'a> {
         Ok(UnpackedDName { labels: output })
     }
 
-    fn unpack(&self, name: DName<'a>) -> Result<UnpackedDName<'a>, anyhow::Error> {
+    fn unpack(&self, name: DName<'a>) -> Result<UnpackedDName<'a>, WireError> {
         self.visited.borrow_mut().clear();
         self.unpack_internal(name, 0)
     }
@@ -304,7 +327,7 @@ pub(crate) struct UnpackedDName<'a> {
 pub fn dname_from_bytes<'a>(
     bytes: &'a [u8],
     unpacker: &DNameUnpacker<'a>,
-) -> Result<(String, &'a [u8]), anyhow::Error> {
+) -> Result<(String, &'a [u8]), WireError> {
     let (name, rest) = DName::try_from_bytes(bytes)?;
     let name = unpacker.unpack(name)?;
     let s = name.try_into()?;
@@ -315,7 +338,7 @@ pub fn dname_from_bytes<'a>(
 ///
 /// This is the form stored in RDATA and the one DNSSEC canonical serialization
 /// requires; the message serializer uses the compressor instead.
-pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, anyhow::Error> {
+pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, WireError> {
     // A fully-qualified name carries a trailing '.' denoting the root; splitting
     // on '.' would otherwise yield a spurious empty final label (and a second
     // zero byte), which corrupts any record that stores data after the name.
@@ -369,7 +392,10 @@ impl<'a> TryInto<String> for UnpackedDName<'a> {
                     result.push('.');
                 }
                 Label::Pointer(_) => {
-                    return Err(anyhow!("unpacked names should not contain pointers"));
+                    return Err(WireError::malformed(
+                        "a domain name",
+                        "an unpacked name may not contain a compression pointer",
+                    ));
                 }
                 Label::Root => break,
             }
@@ -389,7 +415,7 @@ impl<'a> TryInto<String> for UnpackedDName<'a> {
         Ok(result)
     }
 
-    type Error = anyhow::Error;
+    type Error = WireError;
 }
 
 #[cfg(test)]
@@ -489,10 +515,13 @@ mod tests {
         let (dname, _) = DName::try_from_bytes(data).expect("should parse pointer");
         let result = unpacker.unpack(dname);
         
-        assert!(result.is_err(), "should fail on bounds check");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("out of bounds") || err_msg.contains("exceeds"), 
-                "got error: {}", err_msg);
+        // Matched on the variant rather than on the message: what a caller acts
+        // on is the category, and an assertion on wording breaks every time the
+        // wording improves.
+        assert!(
+            matches!(result, Err(WireError::Malformed { what: "a compression pointer", .. })),
+            "got {result:?}"
+        );
     }
 
     #[test]
@@ -504,8 +533,10 @@ mod tests {
         let (dname, _) = DName::try_from_bytes(data).expect("should parse pointer");
         let result = unpacker.unpack(dname);
         
-        assert!(result.is_err(), "cycle detection should prevent unpacking");
-        assert!(result.unwrap_err().to_string().contains("circular"));
+        assert!(
+            matches!(result, Err(WireError::Malformed { what: "a compression pointer", .. })),
+            "cycle detection should prevent unpacking, got {result:?}"
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@
 //! SOA means an increment, anything else means the server has fallen back to
 //! sending the whole zone.
 
+use crate::error::{TransferError, TransferResult};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
@@ -416,12 +417,12 @@ pub fn ixfr_response(
     request: &DnsMessage,
     zone: &Zone,
     deltas: &DeltaLog,
-) -> Result<IxfrResponse, String> {
+) -> TransferResult<IxfrResponse> {
     let apex = zone.origin();
-    let soa = apex_soa(zone).ok_or_else(|| format!("zone {apex} has no SOA at its apex"))?;
+    let soa = apex_soa(zone).ok_or_else(|| TransferError::malformed(format!("zone {apex} has no SOA at its apex")))?;
     let current = zone
         .serial()
-        .ok_or_else(|| format!("zone {apex} has no serial"))?;
+        .ok_or_else(|| TransferError::malformed(format!("zone {apex} has no serial")))?;
 
     // No SOA in the request is an IXFR that did not say what it holds. RFC 1995
     // §3 requires one; without it the only answerable question is "give me
@@ -798,7 +799,7 @@ mod tests {
         let Err(err) = ixfr_response(&request(Some(1)), &zone, &DeltaLog::new()) else {
             panic!("a zone with no SOA cannot be transferred at all");
         };
-        assert!(err.contains("no SOA"), "got: {err}");
+        assert!(err.to_string().contains("no SOA"), "got: {err}");
     }
 
     #[test]

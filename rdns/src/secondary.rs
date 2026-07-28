@@ -18,6 +18,7 @@
 //! serving the zone rather than to keep handing out data that may be arbitrarily
 //! stale, with the AA bit claiming otherwise (RFC 1035 §3.3.13, RFC 1912 §2.2).
 
+use crate::error::{ConfigError, ConfigResult};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -137,21 +138,19 @@ pub struct MasterSpec {
 }
 
 impl MasterSpec {
-    pub fn parse(spec: &str) -> Result<Self, String> {
+    pub fn parse(spec: &str) -> ConfigResult<Self> {
         let spec = spec.trim();
         let (rest, key_name) = match spec.split_once('#') {
             Some((rest, key)) if !key.is_empty() => (rest, Some(key.to_string())),
-            Some(_) => return Err(format!("{spec:?}: '#' with no key name after it")),
+            Some(_) => return Err(ConfigError::new(format!("{spec:?}: '#' with no key name after it"))),
             None => (spec, None),
         };
         let Some((zone, master)) = rest.split_once('@') else {
-            return Err(format!(
-                "{spec:?} is not zone@master[:port][#key]: no '@' separating the \
-                 zone from the address it comes from"
-            ));
+            return Err(ConfigError::new(format!("{spec:?} is not zone@master[:port][#key]: no '@' separating the \
+                 zone from the address it comes from")));
         };
         if zone.is_empty() {
-            return Err(format!("{spec:?}: no zone before the '@'"));
+            return Err(ConfigError::new(format!("{spec:?}: no zone before the '@'")));
         }
 
         Ok(MasterSpec {
@@ -167,15 +166,13 @@ impl MasterSpec {
 /// A bare IPv6 address has colons of its own, so `[::1]:5353` is the only
 /// unambiguous way to give one a port — the shape `SocketAddr` already parses,
 /// rather than a convention of ours.
-fn parse_address(text: &str, spec: &str) -> Result<SocketAddr, String> {
+fn parse_address(text: &str, spec: &str) -> ConfigResult<SocketAddr> {
     if let Ok(addr) = text.parse::<SocketAddr>() {
         return Ok(addr);
     }
     match text.parse::<IpAddr>() {
         Ok(ip) => Ok(SocketAddr::new(ip, 53)),
-        Err(e) => Err(format!(
-            "{spec:?}: {text:?} is not an address or address:port: {e}"
-        )),
+        Err(e) => Err(ConfigError::new(format!("{spec:?}: {text:?} is not an address or address:port: {e}"))),
     }
 }
 
@@ -268,7 +265,7 @@ impl StateFile {
     ///
     /// Written whole and atomically every time rather than appended to: the file
     /// is small, and a reader must never see a line half-updated.
-    pub fn record(&mut self, state: TransferState) -> Result<(), String> {
+    pub fn record(&mut self, state: TransferState) -> ConfigResult<()> {
         match self
             .entries
             .iter_mut()
@@ -280,7 +277,7 @@ impl StateFile {
         self.save()
     }
 
-    fn save(&self) -> Result<(), String> {
+    fn save(&self) -> ConfigResult<()> {
         let mut text = String::from(
             "# rdnsd transfer state: zone serial refreshed-at master\n\
              # Written by the server. Deleting this only costs a refresh.\n",
@@ -292,22 +289,22 @@ impl StateFile {
             ));
         }
         crate::persist::write_atomically_str(&self.path, &text)
-            .map_err(|e| format!("writing {}: {e}", self.path.display()))
+            .map_err(|e| ConfigError::new(format!("writing {}: {e}", self.path.display())))
     }
 }
 
-fn parse_state_line(line: &str) -> Result<TransferState, String> {
+fn parse_state_line(line: &str) -> ConfigResult<TransferState> {
     let fields: Vec<&str> = line.split_whitespace().collect();
     let [zone, serial, refreshed_at, master] = fields[..] else {
-        return Err(format!("expected 4 fields, got {}", fields.len()));
+        return Err(ConfigError::new(format!("expected 4 fields, got {}", fields.len())));
     };
     Ok(TransferState {
         zone: absolute(zone),
-        serial: serial.parse().map_err(|e| format!("serial: {e}"))?,
+        serial: serial.parse().map_err(|e| ConfigError::new(format!("serial: {e}")))?,
         refreshed_at: refreshed_at
             .parse()
-            .map_err(|e| format!("refresh time: {e}"))?,
-        master: master.parse().map_err(|e| format!("master address: {e}"))?,
+            .map_err(|e| ConfigError::new(format!("refresh time: {e}")))?,
+        master: master.parse().map_err(|e| ConfigError::new(format!("master address: {e}")))?,
     })
 }
 

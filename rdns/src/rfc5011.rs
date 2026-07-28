@@ -35,6 +35,7 @@
 //! unrelated new key and start a hold-down on it, which is the opposite of what
 //! happened.
 
+use crate::error::{DnssecError, DnssecResult};
 use std::path::Path;
 
 use crate::dnssec::{ds_digest, Dnskey, Ds, Rrset};
@@ -442,7 +443,7 @@ impl ManagedAnchors {
     /// A line that does not parse is an error rather than a skip, as it is for
     /// the static anchor file: a typo must stop the resolver rather than quietly
     /// leave it trusting less, or differently, than intended.
-    pub fn parse(text: &str, now: u64) -> Result<Self, String> {
+    pub fn parse(text: &str, now: u64) -> DnssecResult<Self> {
         let mut ds = Vec::new();
         let mut keys = Vec::new();
 
@@ -467,7 +468,9 @@ impl ManagedAnchors {
             }
 
             let fields: Vec<&str> = record.split_whitespace().collect();
-            let error = |e: String| format!("line {}: {e} in {:?}", number + 1, raw.trim());
+            let error = |e: DnssecError| {
+                DnssecError::parse(format!("line {}: {e} in {:?}", number + 1, raw.trim()))
+            };
             match parse_anchor_line(&fields).map_err(error)? {
                 AnchorLine::Ds(record) => ds.push(record),
                 AnchorLine::Key(key) => {
@@ -482,7 +485,7 @@ impl ManagedAnchors {
         }
 
         if ds.is_empty() && keys.is_empty() {
-            return Err("no DS or DNSKEY records found".to_string());
+            return Err(DnssecError::parse("no DS or DNSKEY records found"));
         }
         Ok(ManagedAnchors { ds, keys })
     }
@@ -535,17 +538,17 @@ impl ManagedAnchors {
         path: &Path,
         seed: &crate::dnssec_chain::TrustAnchors,
         now: u64,
-    ) -> Result<Self, String> {
+    ) -> DnssecResult<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text, now).map_err(|e| format!("{}: {e}", path.display())),
+            Ok(text) => Self::parse(&text, now).map_err(|e| DnssecError::parse(format!("{}: {e}", path.display()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::from_ds(seed)),
-            Err(e) => Err(format!("reading {}: {e}", path.display())),
+            Err(e) => Err(DnssecError::parse(format!("reading {}: {e}", path.display()))),
         }
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), String> {
+    pub fn save(&self, path: &Path) -> DnssecResult<()> {
         crate::persist::write_atomically_str(path, &self.format())
-            .map_err(|e| format!("writing {}: {e}", path.display()))
+            .map_err(|e| DnssecError::parse(format!("writing {}: {e}", path.display())))
     }
 }
 
@@ -657,11 +660,11 @@ enum AnchorLine {
     Key(Dnskey),
 }
 
-fn parse_anchor_line(fields: &[&str]) -> Result<AnchorLine, String> {
+fn parse_anchor_line(fields: &[&str]) -> DnssecResult<AnchorLine> {
     let mut index = 0;
     let owner = fields
         .first()
-        .ok_or_else(|| "empty record".to_string())?
+        .ok_or_else(|| DnssecError::parse("empty record"))?
         .to_string();
     index += 1;
 
@@ -681,7 +684,7 @@ fn parse_anchor_line(fields: &[&str]) -> Result<AnchorLine, String> {
 
     let rtype = fields
         .get(index)
-        .ok_or_else(|| "no record type".to_string())?
+        .ok_or_else(|| DnssecError::parse("no record type"))?
         .to_ascii_uppercase();
     index += 1;
     let rest = &fields[index..];
@@ -690,34 +693,34 @@ fn parse_anchor_line(fields: &[&str]) -> Result<AnchorLine, String> {
     match rtype.as_str() {
         "DS" => {
             if rest.len() < 4 {
-                return Err(format!("a DS needs 4 fields, got {}", rest.len()));
+                return Err(DnssecError::parse(format!("a DS needs 4 fields, got {}", rest.len())));
             }
             Ok(AnchorLine::Ds(Ds {
                 owner,
-                key_tag: rest[0].parse().map_err(|e| format!("key tag: {e}"))?,
-                algorithm: rest[1].parse().map_err(|e| format!("algorithm: {e}"))?,
-                digest_type: rest[2].parse().map_err(|e| format!("digest type: {e}"))?,
+                key_tag: rest[0].parse().map_err(|e| DnssecError::parse(format!("key tag: {e}")))?,
+                algorithm: rest[1].parse().map_err(|e| DnssecError::parse(format!("algorithm: {e}")))?,
+                digest_type: rest[2].parse().map_err(|e| DnssecError::parse(format!("digest type: {e}")))?,
                 digest: parse_hex(&rest[3..].concat())?,
             }))
         }
         "DNSKEY" => {
             if rest.len() < 4 {
-                return Err(format!("a DNSKEY needs 4 fields, got {}", rest.len()));
+                return Err(DnssecError::parse(format!("a DNSKEY needs 4 fields, got {}", rest.len())));
             }
             let public_key = base64::Engine::decode(
                 &base64::prelude::BASE64_STANDARD,
                 rest[3..].concat(),
             )
-            .map_err(|e| format!("public key: {e}"))?;
+            .map_err(|e| DnssecError::parse(format!("public key: {e}")))?;
             Ok(AnchorLine::Key(Dnskey {
                 owner,
-                flags: rest[0].parse().map_err(|e| format!("flags: {e}"))?,
-                protocol: rest[1].parse().map_err(|e| format!("protocol: {e}"))?,
-                algorithm: rest[2].parse().map_err(|e| format!("algorithm: {e}"))?,
+                flags: rest[0].parse().map_err(|e| DnssecError::parse(format!("flags: {e}")))?,
+                protocol: rest[1].parse().map_err(|e| DnssecError::parse(format!("protocol: {e}")))?,
+                algorithm: rest[2].parse().map_err(|e| DnssecError::parse(format!("algorithm: {e}")))?,
                 public_key,
             }))
         }
-        other => Err(format!("{other} is not a trust anchor record type")),
+        other => Err(DnssecError::parse(format!("{other} is not a trust anchor record type"))),
     }
 }
 
@@ -740,14 +743,14 @@ fn parse_annotations(text: &str) -> (Option<KeyState>, Option<u64>) {
     (state, since)
 }
 
-fn parse_hex(text: &str) -> Result<Vec<u8>, String> {
+fn parse_hex(text: &str) -> DnssecResult<Vec<u8>> {
     let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     if !text.len().is_multiple_of(2) {
-        return Err("digest has an odd number of hex digits".to_string());
+        return Err(DnssecError::parse("digest has an odd number of hex digits"));
     }
     (0..text.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|e| format!("digest: {e}")))
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|e| DnssecError::parse(format!("digest: {e}"))))
         .collect()
 }
 

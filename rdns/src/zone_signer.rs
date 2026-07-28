@@ -36,7 +36,8 @@ use crate::dnssec_key::SigningKey;
 use crate::utils::record_types as rt;
 use crate::zone::{Zone, ZoneRecord};
 use crate::{ParsedRecord, RecordData};
-use anyhow::{anyhow, Context, Result};
+use crate::error::DnssecError;
+use crate::error::DnssecResult as Result;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// How a zone proves that a name is not in it.
@@ -83,21 +84,21 @@ impl DenialChain {
         } = self
         {
             if salt.len() > 255 {
-                return Err(anyhow!(
+                return Err(DnssecError::signing(format!(
                     "an NSEC3 salt is a length-prefixed byte string and cannot exceed 255 bytes, \
                      this one is {}",
-                    salt.len()
-                ));
+                    salt.len(),
+                )));
             }
             if *iterations > MAX_NSEC3_ITERATIONS {
                 // Refusing to *sign* what we would refuse to *validate* is the
                 // point: this library caps verification at the RFC 9276 limit,
                 // so a zone signed above it here would be a zone we could not
                 // read ourselves.
-                return Err(anyhow!(
+                return Err(DnssecError::signing(format!(
                     "{iterations} NSEC3 iterations exceeds the {MAX_NSEC3_ITERATIONS} \
-                     RFC 9276 permits"
-                ));
+                     RFC 9276 permits",
+                )));
             }
         }
         Ok(())
@@ -153,11 +154,11 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
     let origin = canonical_name(zone.origin());
     check_keys(keys, &origin)?;
     if policy.expiration <= policy.inception {
-        return Err(anyhow!(
+        return Err(DnssecError::signing(format!(
             "a signature that expires at {} cannot have been made at {}",
             policy.expiration,
-            policy.inception
-        ));
+            policy.inception,
+        )));
     }
 
     let mut signed = Zone::new(origin.clone());
@@ -209,16 +210,16 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
 /// signatures nobody can use.
 fn check_keys(keys: &[SigningKey], origin: &str) -> Result<()> {
     if keys.is_empty() {
-        return Err(anyhow!("no keys to sign {origin} with"));
+        return Err(DnssecError::signing(format!("no keys to sign {origin} with")));
     }
     for key in keys {
         if key.owner() != origin {
-            return Err(anyhow!(
+            return Err(DnssecError::signing(format!(
                 "the key with tag {} is published at {}, not at {origin} — a signature from it \
                  names the wrong signer and verifies against nothing",
                 key.key_tag(),
-                key.owner()
-            ));
+                key.owner(),
+            )));
         }
     }
     Ok(())
@@ -243,22 +244,22 @@ fn carry_over_records(zone: &Zone, origin: &str, signed: &mut Zone) -> Result<(i
             continue;
         }
         if record.class != 1 {
-            return Err(anyhow!(
+            return Err(DnssecError::signing(format!(
                 "{} carries class {}, and DNSSEC is defined per class — a zone mixing them has \
                  no single chain to sign",
                 record.name,
-                record.class
-            ));
+                record.class,
+            )));
         }
         let name = canonical_name(&zone.normalize_name(&record.name));
         if !is_at_or_under(&name, origin) {
-            return Err(anyhow!(
-                "{name} is not in {origin}, so this zone has no authority to sign it"
-            ));
+            return Err(DnssecError::signing(format!(
+                "{name} is not in {origin}, so this zone has no authority to sign it",
+            )));
         }
         if record.rdata.rtype == rt::SOA && name == origin {
             let ParsedRecord::SOA { minimum, .. } = record.rdata.parse()? else {
-                return Err(anyhow!("the apex SOA does not parse as an SOA"));
+                return Err(DnssecError::signing("the apex SOA does not parse as an SOA"));
             };
             soa = Some((record.ttl, minimum));
         }
@@ -275,7 +276,9 @@ fn carry_over_records(zone: &Zone, origin: &str, signed: &mut Zone) -> Result<(i
     }
 
     soa.ok_or_else(|| {
-        anyhow!("{origin} has no SOA at its apex, so there is no zone here to sign")
+        DnssecError::signing(format!(
+            "{origin} has no SOA at its apex, so there is no zone here to sign",
+        ))
     })
 }
 
@@ -498,7 +501,7 @@ fn build_nsec_chain(layout: &Layout, ttl: i32, signed: &mut Zone) -> Result<()> 
             next_domain_name: next.clone(),
             type_bitmap: build_type_bitmap(&types.into_iter().collect::<Vec<_>>()),
         })
-        .context("encoding an NSEC")?;
+        .map_err(|e| DnssecError::key(format!("encoding an NSEC: {e}")))?;
         signed.add_record(ZoneRecord {
             name: name.clone(),
             ttl,
@@ -520,7 +523,7 @@ fn build_nsec3_chain(
     let mut hashed: Vec<(Vec<u8>, String)> = Vec::new();
     for name in layout.chain_names(opt_out) {
         let hash = nsec3_hash(&name, salt, iterations)
-            .with_context(|| format!("hashing {name} for the NSEC3 chain"))?;
+            .map_err(|e| DnssecError::key(format!("hashing {name} for the NSEC3 chain: {e}")))?;
         hashed.push((hash, name));
     }
     hashed.sort();
@@ -529,11 +532,11 @@ fn build_nsec3_chain(
     // unprovable, and the chain would silently be a lie about one of them. It
     // takes a SHA-1 collision to happen, but the check is one comparison.
     if let Some(window) = hashed.windows(2).find(|w| w[0].0 == w[1].0) {
-        return Err(anyhow!(
+        return Err(DnssecError::signing(format!(
             "{} and {} have the same NSEC3 hash — pick a different salt",
             window[0].1,
-            window[1].1
-        ));
+            window[1].1,
+        )));
     }
 
     for (index, (hash, name)) in hashed.iter().enumerate() {
@@ -556,7 +559,7 @@ fn build_nsec3_chain(
             next_hashed_owner: next.clone(),
             type_bitmap: build_type_bitmap(&types.into_iter().collect::<Vec<_>>()),
         })
-        .context("encoding an NSEC3")?;
+        .map_err(|e| DnssecError::key(format!("encoding an NSEC3: {e}")))?;
         signed.add_record(ZoneRecord {
             name: format!("{}.{}", base32hex_encode(hash).to_lowercase(), layout.origin),
             ttl,
@@ -635,7 +638,7 @@ fn sign_everything(
         for key in signers.iter() {
             let sig = key
                 .sign_rrset(&rrset, original_ttl, policy.inception, policy.expiration)
-                .with_context(|| format!("signing the {rtype} RRset at {name}"))?;
+                .map_err(|e| DnssecError::key(format!("signing the {rtype} RRset at {name}: {e}")))?;
             signatures.push(ZoneRecord {
                 name: name.clone(),
                 ttl,
@@ -651,7 +654,7 @@ fn sign_everything(
                     signer_name: sig.signer_name,
                     signature: sig.signature,
                 })
-                .context("encoding an RRSIG")?,
+                .map_err(|e| DnssecError::key(format!("encoding an RRSIG: {e}")))?,
             });
         }
     }
