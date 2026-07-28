@@ -171,6 +171,20 @@ struct Cli {
     /// signatures otherwise keeps answering as though nothing happened.
     #[arg(long)]
     require_signed: bool,
+    /// Serve the zones that loaded even if others in --zone-dir failed to parse.
+    ///
+    /// Off by default, and the default is the safe one. A zone file that fails to
+    /// parse used to be skipped with one line on stderr: the process stayed up,
+    /// exit code 0, and that zone answered REFUSED — indistinguishable from a
+    /// zone nobody configured. One typo in 1 of 40 zones plus a deploy SIGHUP is
+    /// a lame delegation for that zone, 39 green dashboards, and a log line that
+    /// scrolled past hours ago.
+    ///
+    /// The flag exists because the behaviour is defensible when the alternative
+    /// is worse — a secondary holding 40 zones would rather serve 39 than none —
+    /// but it should be a decision, not what happens when nobody looked.
+    #[arg(long)]
+    allow_partial_load: bool,
     /// Response bytes per second, per client address. 0 turns the budget off.
     ///
     /// Meters what leaves rather than what arrives, because that is what an
@@ -899,6 +913,18 @@ impl Server {
             return Vec::new();
         };
 
+        // A response is not a question. `RequestValidator` deliberately accepts
+        // QR=1 — it is used on both directions of the wire and a response
+        // legitimately carries answers — so the check belongs here, where we know
+        // this packet arrived at a listening socket. Answering one turns a pair
+        // of servers, or one spoofed datagram, into a packet loop; and there is
+        // no reply to send, because the sender did not ask anything.
+        if msg.response {
+            self.logger
+                .log_error(ip, "a response was sent to a server port; dropped");
+            return Vec::new();
+        }
+
         let qtype = msg.queries.first().map(|q| q.qtype);
         self.logger.log_query(ip, qtype);
         let query_name = msg
@@ -1456,6 +1482,13 @@ async fn udp_loop(socket: Arc<UdpSocket>, server: Arc<Server>) -> Result<(), std
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Reloading {
     replicating: bool,
+    allow_partial: bool,
+    /// The zones we replicate, and the directory their state sidecar lives in.
+    /// A reload re-reads every `.zone` file from disk, so it can resurrect a zone
+    /// that was withdrawn for EXPIRE — these are what let it be withdrawn again.
+    /// Empty for a server that is nobody's secondary.
+    secondaries: Vec<MasterSpec>,
+    zone_dir: Option<PathBuf>,
     signing: Option<Arc<ZoneSigning>>,
     validator: Arc<DnssecValidator>,
 }
@@ -1470,7 +1503,7 @@ impl Reloading {
     /// mixture of two versions, and the half that failed is the half that
     /// needed attention.
     async fn load(&self, source: &ZoneSource) -> Result<HashMap<String, Zone>, String> {
-        let mut zones = load_zones_from_source(source, self.replicating)
+        let mut zones = load_zones_from_source(source, self.replicating, self.allow_partial)
             .await
             .map_err(|e| e.to_string())?;
         if let Some(signing) = &self.signing {
@@ -1478,6 +1511,25 @@ impl Reloading {
         }
         verify_zones(&zones, &self.validator)?;
         Ok(zones)
+    }
+
+    /// Re-apply EXPIRE to what was just installed.
+    ///
+    /// Separate from [`Reloading::load`] because it has to run *after*
+    /// `install_all_zones`: the question is about the zones now being served, and
+    /// until they are installed there is nothing to withdraw.
+    async fn withdraw_unvouched(
+        &self,
+        zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
+        deltas: &Arc<RwLock<DeltaLog>>,
+    ) {
+        let Some(zone_dir) = &self.zone_dir else {
+            return;
+        };
+        if self.secondaries.is_empty() {
+            return;
+        }
+        withdraw_unvouched_zones(&self.secondaries, zone_map, deltas, zone_dir).await;
     }
 }
 
@@ -1504,6 +1556,10 @@ fn spawn_signal_handler(
                         // will answer with, and this is the only moment both
                         // versions exist.
                         install_all_zones(&zone_map_clone, &deltas, new_zones).await;
+                        // A reload re-reads the files, so a zone withdrawn for
+                        // EXPIRE is back in the map at this point. Judge it
+                        // again before anything is announced or answered.
+                        reloading.withdraw_unvouched(&zone_map_clone, &deltas).await;
                         println!("Zones reloaded via SIGHUP");
                         instrumentation::trace_info("zones_reloaded", "SIGHUP signal");
                         // The point of reloading is that something changed, so
@@ -2102,28 +2158,53 @@ async fn expire_if_out_of_contact(
     }
 }
 
-/// Withdraw any replicated zone that was already expired when we started.
+/// Withdraw every replicated zone whose age we cannot vouch for.
 ///
-/// Without this, expiry would last only as long as the process: a restart loads
-/// the stale file from disk and serves it again, and the zone is authoritative
-/// once more until the next refresh fails. The state file is what remembers, so
-/// this is the one moment it has to be consulted before anything is served.
-async fn expire_stale_zones_at_startup(
+/// **Called after each time the zone map is filled from disk** — at startup and
+/// after every reload — because that is exactly when a file whose contents
+/// expired can come back. It used to run from `main` only, so a `SIGHUP` re-read
+/// every `.zone` file and served it again without consulting the sidecar: a zone
+/// correctly withdrawn because its primary had been unreachable for a week came
+/// straight back, **with AA set**, which is the "permanently wrong answers nobody
+/// can see are wrong" the withdrawal exists to prevent. Expiry that lasts only
+/// until the next deploy is not expiry.
+///
+/// Two ways a zone fails to earn an answer, and the second one was the hole:
+///
+/// - Its last successful contact is older than the SOA's EXPIRE. The plain case.
+/// - **There is no record of contact at all**, while the zone is loaded — so it
+///   came off disk. A missing sidecar, an unreadable one, or an entry for another
+///   master all land here. `StateFile::load` returns empty by design and never
+///   fails, which is right for a cache and wrong for expiry: forgetting the
+///   last-contact time *is* the difference between withdrawn and served, so
+///   unknown age has to mean "do not serve" rather than "serve and hope". The
+///   zone comes back at the first successful transfer, which is seconds away and
+///   is the thing that makes it ours to answer for.
+///
+/// A zone we hold but do not replicate is never touched: the loop is over the
+/// `--secondary` specs, so a primary zone sharing the directory is not this
+/// function's business.
+async fn withdraw_unvouched_zones(
     specs: &[MasterSpec],
     zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
+    deltas: &Arc<RwLock<DeltaLog>>,
     zone_dir: &Path,
 ) {
     let state = StateFile::load(&state_file_path(zone_dir));
     let now = current_unix_timestamp();
 
     for spec in specs {
-        let Some(entry) = state.get(&spec.zone, spec.master) else {
-            continue; // never fetched, so nothing on disk is ours to judge
-        };
         let timers = zone_timers(zone_map, &spec.zone).await;
-        if !timers.has_expired(entry.refreshed_at, now) {
-            continue;
-        }
+        let why = match state.get(&spec.zone, spec.master) {
+            Some(entry) if timers.has_expired(entry.refreshed_at, now) => format!(
+                "the copy on disk expired {}s ago",
+                now.saturating_sub(entry.refreshed_at + timers.expire)
+            ),
+            Some(_) => continue,
+            None => "there is no record of ever having transferred it, so its age is \
+                     unknown"
+                .to_string(),
+        };
 
         let mut zones = zone_map.write().await;
         let held = zones
@@ -2132,12 +2213,13 @@ async fn expire_stale_zones_at_startup(
             .cloned();
         if let Some(key) = held {
             zones.remove(&key);
+            // The increments go with it, for the same reason as in `expire_zone`:
+            // offering a chain for a zone we have withdrawn would be answering
+            // for something we just stopped serving.
+            deltas.write().await.forget(&spec.zone);
             eprintln!(
-                "secondary {}: the copy on disk expired {}s ago — not serving it until \
-                 {} answers",
-                spec.zone,
-                now.saturating_sub(entry.refreshed_at + timers.expire),
-                spec.master
+                "secondary {}: {why} — not serving it until {} answers",
+                spec.zone, spec.master
             );
         }
     }
@@ -2184,7 +2266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fields.
     let signing = ZoneSigning::load(&cli)?.map(Arc::new);
     let source = validate_zone_source(cli.zone_file, cli.zone_dir, replicating)?;
-    let mut zones = load_zones_from_source(&source, replicating).await?;
+    let mut zones = load_zones_from_source(&source, replicating, cli.allow_partial_load).await?;
 
     // Signing happens between loading and serving, and so does checking the
     // result: verifying what we just produced is what catches a canonicalization
@@ -2209,6 +2291,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before anything is served: a replicated zone whose copy on disk went out
     // of contact past its EXPIRE is not ours to answer for, however recently the
     // process started.
+    let mut reload_secondaries: Vec<MasterSpec> = Vec::new();
+    let mut reload_zone_dir: Option<PathBuf> = None;
     let secondaries = if secondary_specs.is_empty() {
         Arc::new(HashMap::new())
     } else {
@@ -2218,7 +2302,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(Box::from("--secondary requires --zone-dir"));
         };
         let zone_dir = PathBuf::from(dir);
-        expire_stale_zones_at_startup(&secondary_specs, &zone_map, &zone_dir).await;
+        withdraw_unvouched_zones(&secondary_specs, &zone_map, &deltas, &zone_dir).await;
+        reload_secondaries = secondary_specs.clone();
+        reload_zone_dir = Some(zone_dir.clone());
         let replication = Replication {
             zone_map: zone_map.clone(),
             deltas: deltas.clone(),
@@ -2242,6 +2328,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         announced,
         Reloading {
             replicating,
+            allow_partial: cli.allow_partial_load,
+            secondaries: reload_secondaries,
+            zone_dir: reload_zone_dir,
             signing,
             validator,
         },
@@ -2534,24 +2623,28 @@ fn generate_keys(
 
 /// Load zones from source (single file or directory)
 ///
-/// `replicating` allows an empty directory: a secondary's first start has
-/// nothing on disk yet, and refusing to run until a zone arrives would mean it
-/// never could. That is all it allows — `enumerate_zone_files` already returns
-/// an empty map for an empty directory, so the case costs nothing here, and an
-/// *error* from it must still propagate. Swallowing one used to turn an
-/// unreadable directory into `Ok(empty)`, which `install_all_zones` then
-/// installed wholesale: the server stayed up, listening, holding zero zones, and
-/// answered REFUSED for every name it is authoritative for. Nothing crashed, so
-/// nothing alerted.
+/// Three questions that used to be one, and conflating them is what let a broken
+/// zone file pass for a configuration choice:
+///
+/// - **Could the directory be read?** Always fatal. An `Err` here used to become
+///   `Ok(empty)` on the `--secondary` path, so a permission change left the
+///   server up, listening, and answering REFUSED for every name it is
+///   authoritative for.
+/// - **Did every zone file parse?** Fatal unless `--allow-partial-load`. See
+///   [`enumerate_zone_files`].
+/// - **Is the directory empty?** Fatal *except* when replicating. A secondary's
+///   first start has nothing on disk yet, and refusing to run until a zone
+///   arrives would mean it never could — while for a primary an empty
+///   `--zone-dir` is a typo in the path, and serving nothing is not what was
+///   asked for.
+///
+/// The emptiness check lives here rather than in `enumerate_zone_files` because
+/// only this function knows which of its callers is a secondary.
 async fn load_zones_from_source(
     source: &ZoneSource,
     replicating: bool,
+    allow_partial: bool,
 ) -> Result<HashMap<String, Zone>, Box<dyn std::error::Error>> {
-    if let ZoneSource::Directory(dir) = source {
-        if replicating {
-            return enumerate_zone_files(dir);
-        }
-    }
     match source {
         ZoneSource::SingleFile(path) => {
             // Path-aware, so a `$INCLUDE` in the file resolves next to it rather
@@ -2564,7 +2657,13 @@ async fn load_zones_from_source(
             Ok(map)
         }
         ZoneSource::Directory(dir) => {
-            enumerate_zone_files(dir)
+            let zones = enumerate_zone_files(dir, allow_partial)?;
+            if zones.is_empty() && !replicating {
+                return Err(Box::from(format!(
+                    "No .zone files found in directory: {dir}"
+                )));
+            }
+            Ok(zones)
         }
     }
 }
@@ -2593,14 +2692,18 @@ fn extract_zone_origin_from_path(path: &str) -> String {
 }
 
 /// Enumerate all .zone files in a directory and load them
-fn enumerate_zone_files(dir: &str) -> Result<HashMap<String, Zone>, Box<dyn std::error::Error>> {
+fn enumerate_zone_files(
+    dir: &str,
+    allow_partial: bool,
+) -> Result<HashMap<String, Zone>, Box<dyn std::error::Error>> {
     let mut zones = HashMap::new();
+    let mut failures: Vec<String> = Vec::new();
     let entries = std::fs::read_dir(dir)?;
-    
+
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        
+
         if path.extension().and_then(|s| s.to_str()) == Some("zone") {
             let path_str = path.to_string_lossy();
             let zone_origin = extract_zone_origin_from_path(&path_str);
@@ -2609,18 +2712,37 @@ fn enumerate_zone_files(dir: &str) -> Result<HashMap<String, Zone>, Box<dyn std:
                     println!("Loaded zone from {}", path_str);
                     zones.insert(zone.origin().to_string(), zone);
                 }
-                Err(e) => {
-                    eprintln!("Error loading zone file {}: {}", path_str, e);
-                    // Continue with next file
-                }
+                Err(e) => failures.push(format!("{path_str}: {e}")),
             }
         }
     }
-    
-    if zones.is_empty() {
-        return Err(Box::from(format!("No .zone files found in directory: {}", dir)));
+
+    // Every file, then the verdict — rather than stopping at the first failure,
+    // because an operator fixing a deploy wants the whole list and not one typo
+    // per restart.
+    if !failures.is_empty() {
+        for failure in &failures {
+            eprintln!("Error loading zone file {failure}");
+        }
+        if !allow_partial {
+            // One line, because `main` returning an `Err` prints it with `{:?}`
+            // and a multi-line message comes out with the newlines escaped. The
+            // detail is on stderr just above, where it is readable.
+            return Err(Box::from(format!(
+                "{} of {} zone files in {dir} failed to load (listed above). Refusing to \
+                 serve a partial set; pass --allow-partial-load to serve the {} that did.",
+                failures.len(),
+                failures.len() + zones.len(),
+                zones.len(),
+            )));
+        }
+        eprintln!(
+            "--allow-partial-load: serving {} zones, {} failed and will answer REFUSED",
+            zones.len(),
+            failures.len()
+        );
     }
-    
+
     println!("Loaded {} zones from directory {}", zones.len(), dir);
     Ok(zones)
 }
@@ -3376,6 +3498,295 @@ mod tests {
         assert!(reply.answers.is_empty(), "a refusal carries no zone");
     }
 
+    // -----------------------------------------------------------------------
+    // Loading a directory of zones: three questions, three answers
+    // -----------------------------------------------------------------------
+
+    mod loading {
+        use super::*;
+
+        const GOOD: &str = "@ IN SOA ns1.example.com. admin.example.com. \
+                            1 3600 600 604800 300\n@ IN NS ns1.example.com.\n";
+        const BROKEN: &str = "@ IN SOA ns1.broken.test. admin.broken.test. \
+                              1 3600 600 604800 300\nwww IN A not-an-address\n";
+
+        fn dir_with(tag: &str, files: &[(&str, &str)]) -> ScratchDir {
+            let dir = ScratchDir::new(tag);
+            for (name, text) in files {
+                std::fs::write(dir.0.join(name), text).expect("write zone");
+            }
+            dir
+        }
+
+        /// One bad file out of three used to be a line on stderr, exit code 0, and
+        /// that zone answering **REFUSED** — indistinguishable from a zone nobody
+        /// configured. It also defeated the all-or-nothing invariant
+        /// `Reloading::load`'s own doc comment claims, because `install_all_zones`
+        /// then installed the survivors wholesale: a broken file plus a deploy
+        /// SIGHUP took a *previously working* zone off the air.
+        #[tokio::test]
+        async fn a_zone_file_that_fails_to_parse_fails_the_load() {
+            let dir = dir_with(
+                "partial",
+                &[
+                    ("example.com.zone", GOOD),
+                    ("other.test.zone", GOOD),
+                    ("broken.test.zone", BROKEN),
+                ],
+            );
+            let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
+
+            let err = load_zones_from_source(&source, false, false)
+                .await
+                .expect_err("a broken zone file must not pass for a configuration choice")
+                .to_string();
+            assert!(
+                err.contains("1 of 3"),
+                "say how many of how many, so the scale is visible: {err}"
+            );
+            assert!(
+                err.contains("--allow-partial-load"),
+                "and say what to do about it: {err}"
+            );
+        }
+
+        /// The escape hatch, because the behaviour is defensible when the
+        /// alternative is worse — 39 of 40 zones beats none. It just has to be a
+        /// decision rather than what happens when nobody looked.
+        #[tokio::test]
+        async fn allow_partial_load_serves_what_parsed() {
+            let dir = dir_with(
+                "partial-ok",
+                &[("example.com.zone", GOOD), ("broken.test.zone", BROKEN)],
+            );
+            let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
+
+            let zones = load_zones_from_source(&source, false, true)
+                .await
+                .expect("the flag is an explicit choice to serve a partial set");
+            assert_eq!(zones.len(), 1);
+            assert!(zones.contains_key("example.com."));
+        }
+
+        /// A secondary's first start has nothing on disk yet, and refusing to run
+        /// until a zone arrives would mean it never could.
+        ///
+        /// **This is a regression test for a fix, not for the original bug.**
+        /// Removing the `unwrap_or_default()` that turned an unreadable directory
+        /// into `Ok(empty)` also removed the only thing making an *empty*
+        /// directory work, because `enumerate_zone_files` returned
+        /// `Err("No .zone files found")` for one — and the commit that removed it
+        /// claimed the opposite. Nothing caught it, because nothing tested a
+        /// secondary starting from an empty directory. The emptiness check now
+        /// lives in `load_zones_from_source`, which is the only place that knows
+        /// whether the caller is a secondary.
+        #[tokio::test]
+        async fn a_secondary_may_start_with_an_empty_zone_directory() {
+            let dir = dir_with("empty-secondary", &[]);
+            let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
+
+            let zones = load_zones_from_source(&source, true, false)
+                .await
+                .expect("a secondary starts before its first transfer");
+            assert!(zones.is_empty());
+
+            // A primary with an empty --zone-dir is a typo in the path, and
+            // serving nothing is not what was asked for.
+            assert!(load_zones_from_source(&source, false, false).await.is_err());
+        }
+
+        /// The zone a secondary replicates, with an EXPIRE of one hour so the
+        /// arithmetic in the tests below is legible.
+        const REPLICATED: &str = "@ IN SOA ns1.example.com. admin.example.com. \
+                                  7 3600 600 3600 300\n@ IN NS ns1.example.com.\n";
+
+        /// A secondary mid-life: a zone dir, the spec it replicates under, and
+        /// the two maps a withdrawal touches.
+        struct Replica {
+            dir: ScratchDir,
+            specs: Vec<MasterSpec>,
+            zone_map: Arc<RwLock<HashMap<String, Zone>>>,
+            deltas: Arc<RwLock<DeltaLog>>,
+        }
+
+        fn replicated_setup(tag: &str) -> Replica {
+            let dir = ScratchDir::new(tag);
+            let zone = rdns::zone::parse_zone_file(REPLICATED, "example.com.").expect("zone");
+            let mut zones = HashMap::new();
+            zones.insert(zone.origin().to_string(), zone);
+            let specs = vec![MasterSpec {
+                zone: "example.com.".to_string(),
+                master: "192.0.2.1:53".parse().unwrap(),
+                key_name: None,
+            }];
+            Replica {
+                dir,
+                specs,
+                zone_map: Arc::new(RwLock::new(zones)),
+                deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            }
+        }
+
+        fn record_contact(dir: &ScratchDir, master: &str, refreshed_at: u64) {
+            let mut state = StateFile::load(&state_file_path(&dir.0));
+            state
+                .record(TransferState {
+                    zone: "example.com.".to_string(),
+                    serial: 7,
+                    refreshed_at,
+                    master: master.parse().unwrap(),
+                })
+                .expect("write the sidecar");
+        }
+
+        /// Expiry that lasts only until the next deploy is not expiry.
+        ///
+        /// `expire_stale_zones_at_startup` ran from `main` and nowhere else, while
+        /// `Reloading::load` re-reads every `.zone` file from disk without
+        /// consulting the sidecar. A zone correctly withdrawn because its primary
+        /// had been unreachable for a week came straight back on SIGHUP and was
+        /// served **with AA set** — which is precisely the "permanently wrong
+        /// answers nobody can see are wrong" the withdrawal code's own comment
+        /// says it exists to prevent.
+        #[tokio::test]
+        async fn a_reload_does_not_resurrect_a_zone_that_expired() {
+            let Replica { dir, specs, zone_map, deltas } = replicated_setup("expire-reload");
+            // Last contact two hours ago, against an EXPIRE of one.
+            record_contact(&dir, "192.0.2.1:53", current_unix_timestamp() - 7200);
+
+            withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
+            assert!(
+                zone_map.read().await.is_empty(),
+                "out of contact past EXPIRE is not ours to answer for"
+            );
+
+            // Now the reload: the file is still on disk, so it comes back.
+            let zone = rdns::zone::parse_zone_file(REPLICATED, "example.com.").unwrap();
+            let mut reloaded = HashMap::new();
+            reloaded.insert(zone.origin().to_string(), zone);
+            install_all_zones(&zone_map, &deltas, reloaded).await;
+            assert_eq!(zone_map.read().await.len(), 1, "a reload re-reads the file");
+
+            // ...and must be withdrawn again, which is the whole finding.
+            withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
+            assert!(
+                zone_map.read().await.is_empty(),
+                "a SIGHUP is not new contact with the master"
+            );
+        }
+
+        /// The other half: no record of contact at all.
+        ///
+        /// `StateFile::load` returns empty rather than failing — right for a
+        /// cache, wrong for expiry, because forgetting the last-contact time *is*
+        /// the difference between withdrawn and served. A missing or unreadable
+        /// sidecar used to mean the stale copy on disk was served authoritatively
+        /// from a cold start. Unknown age has to read as "do not serve": the zone
+        /// comes back at the first successful transfer, which is what makes it
+        /// ours to answer for in the first place.
+        #[tokio::test]
+        async fn a_zone_with_no_record_of_transfer_is_not_served() {
+            let Replica { dir, specs, zone_map, deltas } = replicated_setup("expire-nostate");
+            assert!(!state_file_path(&dir.0).exists(), "no sidecar at all");
+
+            withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
+            assert!(zone_map.read().await.is_empty());
+        }
+
+        /// A sidecar entry for a *different* master is not evidence about this
+        /// one, and lands in the same place.
+        #[tokio::test]
+        async fn a_record_for_another_master_does_not_vouch_for_this_one() {
+            let Replica { dir, specs, zone_map, deltas } = replicated_setup("expire-othermaster");
+            record_contact(&dir, "192.0.2.99:53", current_unix_timestamp());
+
+            withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
+            assert!(zone_map.read().await.is_empty());
+        }
+
+        /// And the control, because the check has to be narrow: a zone in contact
+        /// keeps being served, reload or no reload.
+        #[tokio::test]
+        async fn a_zone_in_contact_with_its_master_keeps_being_served() {
+            let Replica { dir, specs, zone_map, deltas } = replicated_setup("expire-fresh");
+            record_contact(&dir, "192.0.2.1:53", current_unix_timestamp());
+
+            withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
+            assert_eq!(zone_map.read().await.len(), 1);
+        }
+
+        /// A directory that cannot be read is fatal either way — this is the
+        /// original #9c finding, and `--allow-partial-load` must not weaken it.
+        /// "Some files failed to parse" and "the directory is not there" are
+        /// different questions, and only the first one has a flag.
+        #[tokio::test]
+        async fn an_unreadable_directory_is_fatal_even_with_partial_load() {
+            let missing = ZoneSource::Directory("no-such-directory-anywhere".to_string());
+            for allow_partial in [false, true] {
+                assert!(
+                    load_zones_from_source(&missing, true, allow_partial)
+                        .await
+                        .is_err(),
+                    "allow_partial={allow_partial}: an I/O error is not a parse failure"
+                );
+            }
+        }
+    }
+
+    /// A *response* arriving at the server port is dropped, not answered.
+    ///
+    /// `RequestValidator` deliberately accepts QR=1 — it is used on both
+    /// directions of the wire — so nothing between the socket and the zone lookup
+    /// tested it, and `make_response` would happily build a reply to a reply. Two
+    /// servers pointed at each other, or one spoofed datagram with a forged
+    /// source, is then a packet loop that neither end can see is one.
+    #[tokio::test]
+    async fn a_response_sent_to_the_server_port_is_dropped() {
+        let zone = rdns::zone::parse_zone_file(
+            "@ IN SOA ns1.example.com. admin.example.com. 1 3600 600 604800 300\n\
+             @ IN NS ns1.example.com.\n\
+             ns1 IN A 192.0.2.1\n",
+            "example.com.",
+        )
+        .expect("parse the zone");
+        let mut zones = HashMap::new();
+        zones.insert(zone.origin().to_string(), zone);
+        let server = Server {
+            zone_map: Arc::new(RwLock::new(zones)),
+            rate_limiter: Arc::new(RateLimiter::with_defaults()),
+            validator: Arc::new(RequestValidator::with_defaults()),
+            logger: Arc::new(QueryLogger::new()),
+            metrics: Arc::new(DnsMetrics::new()),
+            transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
+            tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
+            response_limiter: Arc::new(ResponseLimiter::disabled()),
+            secondaries: Arc::new(HashMap::new()),
+            deltas: Arc::new(RwLock::new(DeltaLog::new())),
+        };
+        let peer: SocketAddr = "192.0.2.9:5353".parse().unwrap();
+
+        let wire = |msg: &DnsMessage| {
+            let mut buf = vec![0u8; 512];
+            let n = msg.to_bytes(&mut buf).expect("serialize");
+            buf.truncate(n);
+            buf
+        };
+
+        // The control: the same question, asked as a question, is answered.
+        let mut question = query("ns1.example.com.", record_types::A, false);
+        assert!(
+            !server.answer(&wire(&question), peer).await.is_empty(),
+            "a real query must still be answered — the check has to be narrow"
+        );
+
+        // The same bytes with QR set are a response, and get nothing back.
+        question.response = true;
+        assert!(
+            server.answer(&wire(&question), peer).await.is_empty(),
+            "a response is not a question, and replying to one is a packet loop"
+        );
+    }
+
     /// A NOTIFY is acted on when it comes from a master of a zone we replicate,
     /// refused when it does not, and NOTAUTH for anything we are not a secondary
     /// for — three different answers to three different situations.
@@ -4033,7 +4444,8 @@ ns.plain  IN A   192.0.2.30
             ]);
             let signing = ZoneSigning::load(&cli).expect("load keys").expect("configured");
 
-            let mut zones = enumerate_zone_files(dir.0.to_str().unwrap()).expect("zones");
+            let mut zones =
+                enumerate_zone_files(dir.0.to_str().unwrap(), false).expect("zones");
             signing.apply(&mut zones).expect("sign");
 
             // Checked with the same validator the server runs before serving.

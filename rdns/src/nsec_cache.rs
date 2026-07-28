@@ -145,8 +145,14 @@ fn wildcard_for_expansion(owner: &str, labels: u8) -> Option<String> {
     Some(format!("*.{suffix}."))
 }
 
-/// `*.` plus the immediate parent of `name` — the only wildcard that may answer
-/// for it (RFC 4592 §2.1.1).
+/// `*.` plus the immediate parent of `name`.
+///
+/// Deliberately the *immediate* parent and nothing shallower, which is narrower
+/// than the protocol allows and is the point — see `synthesize_wildcard` for why.
+/// Note that a wildcard is not limited to one label: the source of synthesis is
+/// the wildcard immediately below the closest encloser, which can be several
+/// labels above the queried name (RFC 4592 §3.3.1, and §3.3.2's worked example).
+/// This function is a deliberate under-approximation, not a reading of the rule.
 fn wildcard_for_parent_of(name: &str) -> Option<String> {
     let name = canonical_name(name);
     let (_first, rest) = name.trim_end_matches('.').split_once('.')?;
@@ -433,15 +439,26 @@ impl NsecCache {
     /// otherwise a wildcard would be answering for a name that has records of its
     /// own, which an existing name shadows entirely (RFC 1034 §4.3.3).
     ///
-    /// **The wildcard must be the one that governs the name**, which means
-    /// `*.<the name's immediate parent>` and nothing shallower. A wildcard covers
-    /// exactly one label (RFC 4592 §2.1.1), so `*.example.com.` answers for
-    /// `a.example.com.` and must never answer for `a.b.example.com.` — and
-    /// "some cached NSEC covers the name" does not distinguish those, because a
-    /// name sorts before everything beneath it, so `b.example.com.`'s own NSEC
-    /// covers `a.b.example.com.`. Deriving the wildcard from the queried name
-    /// rather than searching for one that fits is what makes that impossible to
-    /// get wrong here.
+    /// **The wildcard must be the one that governs the name**, which here means
+    /// `*.<the name's immediate parent>` and nothing shallower.
+    ///
+    /// A wildcard is *not* limited to one label — the source of synthesis is the
+    /// wildcard immediately below the closest encloser, which may be several
+    /// labels up (RFC 4592 §3.3.1, §3.3.2). This cache restricts itself to the
+    /// immediate parent anyway, and the restriction is the safety property:
+    /// deciding the closest encloser needs to know which intermediate names
+    /// *exist*, and a resolver's cache does not know that. `*.example.com.` may
+    /// legitimately answer for `a.b.example.com.` — but only if `b.example.com.`
+    /// does not exist, and "some cached NSEC covers the name" cannot establish
+    /// that: a name sorts before everything beneath it, so `b.example.com.`'s own
+    /// NSEC covers `a.b.example.com.` whether or not `b` is there. Deriving the
+    /// wildcard from the queried name rather than searching for one that fits is
+    /// what makes the mistake unavailable.
+    ///
+    /// The cost is a missed synthesis, which is a cache miss and a real query —
+    /// the safe direction. Widening this needs a cached proof about the
+    /// *intermediate* names, which is a separate piece of work (see `TODO.md`
+    /// #9a's note on aggressive use).
     pub fn synthesize_wildcard(&self, qname: &str, qtype: u16) -> Option<WildcardSynthesis> {
         if !synthesizable_qtype(qtype) {
             return None;

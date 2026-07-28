@@ -588,6 +588,24 @@ async fn handle_query(
     transport: Transport,
 ) -> Option<Vec<u8>> {
     let msg = DnsMessage::try_from_bytes(&data).ok()?;
+
+    // A *response* is not a query, and answering one is how a resolver becomes a
+    // packet engine. `handle_query` used to go straight to `queries.first()`,
+    // which a response also has — so two instances pointed at each other, or one
+    // spoofed datagram with a forged source, is a self-sustaining loop between
+    // them: each reply is parsed as a question and answered with another reply.
+    // There is nothing to send back here, because the peer did not ask anything.
+    if msg.response {
+        return None;
+    }
+
+    // Every opcode but QUERY is something this resolver does not implement, and
+    // saying so is more useful than answering a NOTIFY or an UPDATE with a
+    // plausible QUERY-shaped reply the sender will misread (RFC 1035 §4.1.1).
+    if msg.opcode != OpCode::Query {
+        return unsupported_opcode(&msg);
+    }
+
     let query = msg.queries.first()?.clone();
     let id = msg.id;
     let recursion = msg.recursion;
@@ -626,7 +644,7 @@ async fn handle_query(
     // a statement about DNSSEC; it is not a request to be told what a public
     // server thinks `localhost` is.
     if let Some(local) = special_names::lookup(&query.qname, query.qtype) {
-        let mut resp = build_response(id, &query, local.answers, local.rcode, recursion);
+        let mut resp = build_response(id, OpCode::Query, &query, local.answers, local.rcode, recursion);
         resp.authorities = local.authority;
         // Never AD: nothing here was validated, it was decided by specification.
         // Claiming otherwise would be the one lie a validating client cannot
@@ -655,7 +673,7 @@ async fn handle_query(
     if !checking_disabled {
         if let Some(wildcard) = caches.denials.synthesize_wildcard(&query.qname, query.qtype) {
             let mut resp =
-                build_response(id, &query, wildcard.answers, ResponseCode::Ok, recursion);
+                build_response(id, OpCode::Query, &query, wildcard.answers, ResponseCode::Ok, recursion);
             resp.authorities = wildcard.authority;
             // The wildcard's own signature verifies at this name unchanged —
             // that is what a wildcard signature means — so this is as validated
@@ -667,7 +685,7 @@ async fn handle_query(
 
     if !checking_disabled {
         if let Some(denial) = caches.denials.synthesize(&query.qname, query.qtype) {
-            let mut resp = build_response(id, &query, Vec::new(), denial.rcode, recursion);
+            let mut resp = build_response(id, OpCode::Query, &query, Vec::new(), denial.rcode, recursion);
             resp.authorities = denial.authority;
             // The proofs were validated before they were stored, so the answer
             // derived from them is authentic on the same terms as the original.
@@ -682,7 +700,7 @@ async fn handle_query(
     // above, nothing here is synthesized: this is the answer this question got,
     // so a CD client may have it too.
     if let Some(negative) = caches.negatives.get(&query.qname, query.qtype) {
-        let mut resp = build_response(id, &query, Vec::new(), negative.rcode, recursion);
+        let mut resp = build_response(id, OpCode::Query, &query, Vec::new(), negative.rcode, recursion);
         resp.authorities = negative.authority;
         resp.ad = negative.secure && (client_wants_dnssec || msg.ad);
         resp.cd = checking_disabled;
@@ -694,7 +712,7 @@ async fn handle_query(
         caches.answers.get_validated(&query.qname, query.qtype)
     {
         (
-            build_response(id, &query, records, ResponseCode::Ok, recursion),
+            build_response(id, OpCode::Query, &query, records, ResponseCode::Ok, recursion),
             secure,
         )
     } else {
@@ -723,6 +741,7 @@ async fn handle_query(
                     if !checking_disabled {
                         let resp = build_response(
                             id,
+                            OpCode::Query,
                             &query,
                             Vec::new(),
                             ResponseCode::ServerFailure,
@@ -787,7 +806,7 @@ async fn handle_query(
                     query.qname, query.qtype, e
                 );
                 (
-                    build_response(id, &query, Vec::new(), ResponseCode::ServerFailure, recursion),
+                    build_response(id, OpCode::Query, &query, Vec::new(), ResponseCode::ServerFailure, recursion),
                     false,
                 )
             }
@@ -855,16 +874,57 @@ fn edns_error(
     recursion: bool,
     client_max: usize,
 ) -> Option<Vec<u8>> {
-    let mut resp = build_response(id, query, Vec::new(), rcode, recursion);
+    let mut resp = build_response(id, OpCode::Query, query, Vec::new(), rcode, recursion);
     // BADVERS is an extended RCODE, so the OPT record isn't optional here — it
     // carries the code's high bits.
     resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE)).ok()?;
     resp.to_bytes_within(client_max).ok()
 }
 
+/// NOTIMP for an opcode this resolver does not implement.
+///
+/// The opcode is **echoed**, not replaced with QUERY: RFC 1035 §4.1.1 says it is
+/// "set by the originator of a query and copied into the response", and a NOTIFY
+/// answered with `opcode = QUERY` is a reply its sender cannot match to what it
+/// asked. That is the same reason [`build_response`] takes one rather than
+/// assuming.
+///
+/// The question section is echoed if there was one, and the OPT record mirrored
+/// if the client used EDNS (RFC 6891 §6.1.1) — an EDNS client that gets a reply
+/// with no OPT may cache us as a server that does not do EDNS, which is a
+/// downgrade earned by an unrelated mistake.
+fn unsupported_opcode(msg: &DnsMessage) -> Option<Vec<u8>> {
+    let mut resp = DnsMessage {
+        id: msg.id,
+        response: true,
+        opcode: msg.opcode,
+        authoritive: false,
+        truncation: false,
+        recursion: msg.recursion,
+        recursion_ok: true,
+        ad: false,
+        cd: msg.cd,
+        rcode: ResponseCode::NotImplemented,
+        queries: msg.queries.clone(),
+        answers: Vec::new(),
+        authorities: Vec::new(),
+        additionals: Vec::new(),
+    };
+    if msg.has_edns() {
+        resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE)).ok()?;
+    }
+    resp.to_bytes_within(RDNSR_PAYLOAD_SIZE as usize).ok()
+}
+
 /// Build a minimal response message echoing the question section.
+///
+/// `opcode` is a parameter because it is the client's, not ours (RFC 1035
+/// §4.1.1). Every caller here passes QUERY and is right to — `handle_query`
+/// refuses anything else before reaching them — but hardcoding it is what made
+/// the missing opcode check invisible.
 fn build_response(
     id: u16,
+    opcode: OpCode,
     query: &QuerySection,
     answers: Vec<ResourceRecord>,
     rcode: ResponseCode,
@@ -873,7 +933,7 @@ fn build_response(
     DnsMessage {
         id,
         response: true,
-        opcode: OpCode::Query,
+        opcode,
         authoritive: false,
         truncation: false,
         recursion,
@@ -885,5 +945,99 @@ fn build_response(
         answers,
         authorities: Vec::new(),
         additionals: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A resolver that will never be reached: every test below is about a packet
+    /// rejected before any resolution is attempted.
+    fn context() -> (Arc<Resolver>, Arc<Caches>) {
+        let config = ResolverConfig {
+            mode: ResolverMode::Forward,
+            // Nothing here ever reaches an upstream: every test below is about a
+            // packet rejected before resolution is attempted.
+            upstream_servers: vec!["127.0.0.1:1".parse().unwrap()],
+            ..Default::default()
+        };
+        (
+            Arc::new(Resolver::new(config)),
+            Arc::new(Caches {
+                answers: DnsCache::new(16),
+                negatives: NegativeCache::new(16),
+                denials: NsecCache::new(4),
+            }),
+        )
+    }
+
+    fn message(opcode: OpCode, response: bool) -> Vec<u8> {
+        let msg = DnsMessage {
+            id: 0x1234,
+            response,
+            opcode,
+            authoritive: false,
+            truncation: false,
+            recursion: true,
+            recursion_ok: false,
+            ad: false,
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![QuerySection {
+                qname: "example.com.".to_string(),
+                qtype: record_types::A,
+                qclass: rdns::QueryClass::IN,
+            }],
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+        };
+        let mut buf = vec![0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("serialize");
+        buf.truncate(n);
+        buf
+    }
+
+    /// The packet loop. `handle_query` went straight to `queries.first()`, which
+    /// a *response* also has — so two instances pointed at each other, or one
+    /// spoofed datagram with a forged source, kept answering each other's
+    /// answers for as long as both were up.
+    ///
+    /// There is nothing to reply with here, so the test is that nothing comes
+    /// back at all.
+    #[tokio::test]
+    async fn a_response_is_dropped_rather_than_resolved() {
+        let (resolver, caches) = context();
+        let reply = handle_query(message(OpCode::Query, true), &resolver, &caches, Transport::Udp)
+            .await;
+        assert!(
+            reply.is_none(),
+            "answering a response is how a resolver becomes a packet engine"
+        );
+    }
+
+    /// An opcode this resolver does not implement is NOTIMP, and the opcode
+    /// comes back unchanged — RFC 1035 §4.1.1 says it is "copied into the
+    /// response". A NOTIFY answered with `opcode = QUERY` is a reply its sender
+    /// cannot match to what it asked.
+    #[tokio::test]
+    async fn an_unimplemented_opcode_is_notimp_with_the_opcode_echoed() {
+        let (resolver, caches) = context();
+        for opcode in [OpCode::Notify, OpCode::Update, OpCode::Status] {
+            let bytes = handle_query(message(opcode, false), &resolver, &caches, Transport::Udp)
+                .await
+                .unwrap_or_else(|| panic!("{opcode:?} should be answered, not dropped"));
+            let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+
+            assert!(reply.response, "{opcode:?}");
+            assert_eq!(reply.rcode, ResponseCode::NotImplemented, "{opcode:?}");
+            assert_eq!(reply.opcode, opcode, "the opcode is the client's, not ours");
+            assert_eq!(reply.id, 0x1234, "{opcode:?}");
+            assert!(
+                reply.answers.is_empty(),
+                "{opcode:?}: a plausible QUERY-shaped answer is worse than a refusal"
+            );
+        }
     }
 }

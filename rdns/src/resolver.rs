@@ -1405,14 +1405,45 @@ impl Resolver {
     ) -> ValidationState {
         let now = current_unix_timestamp();
 
-        // A negative answer carries its proof in the authority section, so that
-        // is what has to be validated when there is nothing in the answer.
-        let negative = response.answers.is_empty();
-        let records: Vec<ResourceRecord> = if negative {
-            response.authorities.clone()
-        } else {
-            response.answers.clone()
+        // Where the answer really ends, and whether the data asked for is there.
+        //
+        // `answers.is_empty()` was the old test and it is wrong for every answer
+        // reached through an alias: `recurse` returns the accumulated CNAME chain
+        // in `answers`, so for `www.example.com CNAME cdn.example.net` where the
+        // target has no AAAA, the answer section holds the alias and nothing else.
+        // Not empty, so the response was treated as positive: the authority
+        // section was never signature-verified, `check_denial` never ran, and
+        // validation fell through to Secure. Strip or forge the terminal
+        // NODATA/NXDOMAIN after any legitimate CNAME and `rdnsr` set AD on it and
+        // cached it as validated — a downgrade relative to the non-CNAME path,
+        // which handled this correctly.
+        //
+        // RFC 4035 §5: a validator MUST authenticate negative responses; §5.4
+        // keys the proof to the name actually denied, which after a chain is the
+        // end of the chain and not the name asked about.
+        let shape = cname_chain_shape(&query.qname, query.qtype, &response.answers);
+        let denied_name = match &shape {
+            ChainShape::Intact { final_name } => final_name.clone(),
+            // A broken chain is judged further down, after the signatures, so
+            // that an unsigned zone still reads Insecure rather than Bogus. Until
+            // then the question's own name is the only one worth speaking about.
+            ChainShape::Broken(_) => normalize(&query.qname),
         };
+        let holds_the_answer = response
+            .answers
+            .iter()
+            .any(|rr| rr.rdata.rtype == query.qtype && normalize(&rr.name) == denied_name);
+        let negative = !holds_the_answer;
+
+        // A negative answer carries its proof in the authority section, so that
+        // has to be validated too — and the answer section still has to be
+        // validated with it, because a CNAME-terminated "no" hands the client a
+        // chain of real records alongside the denial. Validating only one of the
+        // two sections is how half an answer goes out authenticated.
+        let mut records: Vec<ResourceRecord> = response.answers.clone();
+        if negative {
+            records.extend(response.authorities.iter().cloned());
+        }
 
         // Every zone that put its name to something here.
         let mut signers: Vec<String> = Vec::new();
@@ -1464,7 +1495,13 @@ impl Resolver {
         // and skipping it lets a valid NSEC from elsewhere in the zone stand in
         // for a proof it does not make.
         if negative {
-            return self.check_denial(query, response);
+            // A chain that is not a chain must not be laundered into a denial:
+            // if the answer holds records that are not on the path from the
+            // question, the "final name" they lead to is not one we asked about.
+            if let ChainShape::Broken(why) = shape {
+                return ValidationState::Bogus(why);
+            }
+            return self.check_denial(query, &denied_name, response);
         }
 
         // The same gap on the positive side: a wildcard's signature verifies at
@@ -1484,7 +1521,7 @@ impl Resolver {
         // The resolver's own `chain` filter makes that unlikely while it is
         // fetching, hop by hop. This check does not depend on having done the
         // fetching: it holds for an answer that arrived whole from a forwarder too.
-        if let ChainShape::Broken(why) = cname_chain_shape(&query.qname, query.qtype, &records) {
+        if let ChainShape::Broken(why) = shape {
             return ValidationState::Bogus(why);
         }
 
@@ -1611,15 +1648,22 @@ impl Resolver {
 
     /// For a negative answer, check that the NSEC/NSEC3 records actually deny
     /// what was asked — not merely that they are correctly signed.
-    fn check_denial(&self, query: &QuerySection, response: &DnsMessage) -> ValidationState {
+    /// `denied_name` is the name the proof has to be about, which after a CNAME
+    /// chain is the end of the chain rather than the name asked about
+    /// (RFC 4035 §5.4). For an answer with no aliases in it the two are the same.
+    fn check_denial(
+        &self,
+        query: &QuerySection,
+        denied_name: &str,
+        response: &DnsMessage,
+    ) -> ValidationState {
         let nsecs = nsecs_in(&response.authorities);
         let nsec3s = nsec3s_in(&response.authorities);
         if nsecs.is_empty() && nsec3s.is_empty() {
             // A signed zone that answers "no" without proof. Common enough from
             // a middlebox; not something to hand on as authenticated.
             return ValidationState::Bogus(format!(
-                "{} was denied without an NSEC or NSEC3 proof",
-                query.qname
+                "{denied_name} was denied without an NSEC or NSEC3 proof"
             ));
         }
 
@@ -1630,19 +1674,18 @@ impl Resolver {
             .iter()
             .find(|rr| rr.rdata.rtype == rt::SOA)
             .map(|rr| normalize(&rr.name))
-            .unwrap_or_else(|| normalize(&query.qname));
+            .unwrap_or_else(|| denied_name.to_string());
 
         let denial = if response.rcode == ResponseCode::NoSuchDomain {
-            proves_nxdomain(&query.qname, &zone, &nsecs, &nsec3s)
+            proves_nxdomain(denied_name, &zone, &nsecs, &nsec3s)
         } else {
-            proves_nodata(&query.qname, &zone, query.qtype, &nsecs, &nsec3s)
+            proves_nodata(denied_name, &zone, query.qtype, &nsecs, &nsec3s)
         };
 
         match denial {
             Denial::Proved => ValidationState::Secure,
             Denial::NotProved(why) => ValidationState::Bogus(format!(
-                "the denial of {} does not prove it: {why}",
-                query.qname
+                "the denial of {denied_name} does not prove it: {why}"
             )),
         }
     }
@@ -3311,6 +3354,15 @@ this line has no record and is skipped
         };
         let wildcard_nodata = signed_wildcard_nodata_authority(&auth, true);
         let stripped_wildcard = signed_wildcard_nodata_authority(&auth, false);
+        let aliased_nodata = signed_nodata_authority(&auth, "chased.example.test.");
+        // Signed up front like everything else here, so the closure below only
+        // has to pick which of the two aliases was asked for.
+        let alias_cname = cname_records(&auth, "chase.example.test.", "chased.example.test.");
+        let stripped_alias_cname = cname_records(
+            &auth,
+            "stripped-chase.example.test.",
+            "unproved.example.test.",
+        );
 
         let auth_server = spawn_server(auth_sock, move |q| {
             let name = qname_of(q);
@@ -3360,6 +3412,28 @@ this line has no record and is skipped
                 resp.authoritive = true;
                 resp.authorities = stripped_wildcard.clone();
                 resp
+            } else if name == "chase.example.test." || name == "stripped-chase.example.test." {
+                // An alias, answered with the CNAME alone — which is what makes
+                // the response's answer section non-empty while holding none of
+                // the data that was asked for.
+                let records = if name == "chase.example.test." {
+                    alias_cname.clone()
+                } else {
+                    stripped_alias_cname.clone()
+                };
+                authoritative(q, records)
+            } else if name == "chased.example.test." && qtype == rt::AAAA {
+                // The end of the chain: an A record but no AAAA, denied properly.
+                let mut resp = response_to(q);
+                resp.authoritive = true;
+                resp.authorities = aliased_nodata.clone();
+                resp
+            } else if name == "unproved.example.test." && qtype == rt::AAAA {
+                // The same NODATA with the proof stripped out, which is what an
+                // attacker who cannot forge a signature does instead.
+                let mut resp = response_to(q);
+                resp.authoritive = true;
+                resp
             } else {
                 // Any other probe (the QNAME-minimized NS step) is answered
                 // NODATA from the apex, which deepens the walk by a label.
@@ -3398,6 +3472,52 @@ this line has no record and is skipped
             anchors,
             _servers: vec![root_server, tld_server, auth_server],
         }
+    }
+
+    /// A signed CNAME RRset at `owner` pointing at `target`.
+    fn cname_records(auth: &TestZone, owner: &str, target: &str) -> Vec<ResourceRecord> {
+        let cname = ResourceRecord {
+            name: owner.to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).unwrap(),
+        };
+        let sig = auth.sign_records(std::slice::from_ref(&cname));
+        vec![cname, sig]
+    }
+
+    /// The authority section of a signed NODATA at `name`: the SOA, and an NSEC
+    /// *at* the name whose bitmap lists A but not AAAA — so it proves the name
+    /// exists and has no AAAA, which is what a NODATA owes (RFC 4035 §5.4).
+    fn signed_nodata_authority(auth: &TestZone, name: &str) -> Vec<ResourceRecord> {
+        let soa = ResourceRecord {
+            name: "example.test.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::SOA {
+                mname: "ns.example.test.".to_string(),
+                rname: "admin.example.test.".to_string(),
+                serial: 1,
+                refresh: 10800,
+                retry: 3600,
+                expire: 604800,
+                minimum: 300,
+            })
+            .unwrap(),
+        };
+        let nsec = ResourceRecord {
+            name: name.to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
+                next_domain_name: "zz.example.test.".to_string(),
+                type_bitmap: build_type_bitmap(&[rt::A, rt::RRSIG, rt::NSEC]),
+            })
+            .unwrap(),
+        };
+        let soa_sig = auth.sign_records(std::slice::from_ref(&soa));
+        let nsec_sig = auth.sign_records(std::slice::from_ref(&nsec));
+        vec![soa, soa_sig, nsec, nsec_sig]
     }
 
     /// The authority section of a signed NXDOMAIN: the SOA, and one NSEC whose
@@ -3949,6 +4069,65 @@ this line has no record and is skipped
             authority = vec![nsec, nsec_sig];
         }
         (vec![a, sig], authority)
+    }
+
+    /// A NODATA reached through a CNAME is validated like any other NODATA.
+    ///
+    /// The control for the test below: the terminal denial is there and correct,
+    /// so the verdict is Secure — which has to be established separately, because
+    /// the bug was that *everything* here came back Secure.
+    #[tokio::test]
+    async fn a_negative_answer_after_a_cname_is_validated() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (answer, state) = Resolver::new(validating_config(&h))
+            .resolve_validated(&QuerySection {
+                qname: "chase.example.test.".to_string(),
+                qtype: rt::AAAA,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the resolution itself should succeed");
+
+        assert_eq!(state, ValidationState::Secure, "{state}");
+        assert!(
+            answer.answers.iter().any(|rr| rr.rdata.rtype == rt::CNAME),
+            "the chain is still handed to the client"
+        );
+        assert!(
+            !answer.answers.iter().any(|rr| rr.rdata.rtype == rt::AAAA),
+            "and it holds no AAAA, which is what makes this a negative answer"
+        );
+    }
+
+    /// **Strip the terminal denial after a legitimate CNAME and the answer used
+    /// to be handed to clients as authenticated.**
+    ///
+    /// `let negative = response.answers.is_empty()` was the test, and a CNAME
+    /// chain is not empty: `negative` was false, so the authority section was
+    /// never signature-verified, `check_denial` never ran, and `validate` fell
+    /// through to Secure. `rdnsr` then set AD and cached it as validated. It was
+    /// a downgrade relative to the non-CNAME path, which handled the same attack
+    /// correctly — and it needed no forged signature, only deletion.
+    ///
+    /// RFC 4035 §5 requires a validator to authenticate negative responses;
+    /// §5.4 keys the proof to the name actually denied, which after a chain is
+    /// the end of the chain.
+    #[tokio::test]
+    async fn a_stripped_denial_after_a_cname_is_bogus() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (_, state) = Resolver::new(validating_config(&h))
+            .resolve_validated(&QuerySection {
+                qname: "stripped-chase.example.test.".to_string(),
+                qtype: rt::AAAA,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the resolution itself should succeed");
+
+        assert!(
+            state.is_bogus(),
+            "a NODATA with its proof removed is not authentic, whatever led to it: {state}"
+        );
     }
 
     /// A signed CNAME chain, end to end. There was no CNAME anywhere in these
