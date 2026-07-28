@@ -647,7 +647,7 @@ fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> 
     let qname_lower = qname_lower.trim_end_matches('.');
 
     // Find all zones that could handle this query
-    let mut candidates: Vec<_> = zone_map
+    let candidates: Vec<_> = zone_map
         .values()
         .filter(|zone| {
             let zone_origin = zone.origin().trim_end_matches('.').to_lowercase();
@@ -662,10 +662,11 @@ fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> 
         })
         .collect();
 
-    // Sort by zone origin length (longest first, most specific)
-    candidates.sort_by(|a, b| b.origin().len().cmp(&a.origin().len()));
-
-    candidates.first().copied()
+    // Longest origin first, which is the most specific zone: a server holding
+    // both `example.com` and `sub.example.com` must answer for the child from
+    // the child's zone. `max_by_key` rather than a sort, because only the first
+    // element is ever read — and `Reverse` is unnecessary once the sort is gone.
+    candidates.into_iter().max_by_key(|z| z.origin().len())
 }
 
 /// Everything both transports answer from. One of these per process, so a
