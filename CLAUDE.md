@@ -18,6 +18,7 @@ highest.
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets   # must be clean, no exceptions
+cargo fmt --all                          # before every commit — see §12
 ```
 
 ---
@@ -288,3 +289,38 @@ This repo keeps its reasoning in prose, and that is deliberate — match it.
   page.
 - The numbered sections in `TODO.md` are stable identifiers referenced from the
   code and from each other. Move them, never renumber them.
+
+## 12. Formatting: `cargo fmt --all`, every time
+
+**Run it before every commit.** Stock rustfmt, no `rustfmt.toml` — the defaults
+are the convention, and a config file is a thing to argue about rather than a
+thing that helps. `cargo fmt --all --check` is the way to ask whether the tree is
+clean without touching it.
+
+This was not done for the first year of the repo, and the cost was not
+ugliness — it was that **hand-formatting became load-bearing**. A mechanical
+rewrite of a hundred error call sites had to be followed by a hand-written
+re-wrapping pass, because `cargo fmt` was unavailable: the tree was 558 diffs
+away from it, so running it would have buried the change under a reformat of
+every file in the workspace. A formatter you cannot run is a formatter that makes
+every large edit more expensive than it should be.
+
+Two things it does *not* do, so do not expect them:
+
+- **It does not touch comments.** `wrap_comments` is off (and nightly-only), so
+  the prose in this codebase — which is most of its value, per §11 — is wrapped
+  by hand and stays that way. rustfmt will re-indent a comment to follow the code
+  it is attached to, and nothing else. Keep prose at 80-ish columns; rustfmt's
+  100 applies to code.
+- **It does not touch string literals.** `format_strings` is off, so a `\`
+  continuation inside a message stays where you put it, including the indentation
+  of the continuation line — which rustfmt will not fix and a careless
+  search-and-replace will wreck.
+
+**A reformat is its own commit, and goes in `.git-blame-ignore-revs`.** Mixing
+one into a behaviour change makes the diff unreviewable and the blame useless.
+Configure git to honour the file once per clone:
+
+```sh
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
