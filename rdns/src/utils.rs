@@ -77,6 +77,86 @@ pub fn normalize_domain_name_for_comparison(a: &str, b: &str) -> bool {
     normalize_domain_name(a) == normalize_domain_name(b)
 }
 
+/// WSAEMSGSIZE: the datagram was larger than the buffer offered for it.
+///
+/// Windows fails the receive rather than truncating, and Rust has no
+/// [`std::io::ErrorKind`] for it — it arrives as `Uncategorized`, which no
+/// `matches!` on kinds can catch, so the raw code is the only way to recognize
+/// it.
+const WSAEMSGSIZE: i32 = 10040;
+
+/// Whether a UDP receive error is about a *previous* datagram, or about the one
+/// just dropped, rather than about the health of the socket.
+///
+/// Both servers end their receive loop — and with it the process — when
+/// `recv_from` returns `Err`. So anything a remote party can provoke has to be
+/// recognized here, or it is a remote kill switch. This lives in the library
+/// because it was written twice, in `rdnsd` and in `rdnsr`, and the second
+/// oversight below was found in one copy only.
+///
+/// **A stray ICMP report.** A server that replies to a client which has already
+/// gone away gets an ICMP port-unreachable back, and Windows reports it on the
+/// socket's **next** `recv_from` (WSAECONNRESET; `WSAENETRESET` for a TTL
+/// expiry). Unix only does this on a connected socket, which is why the shape is
+/// invisible there and fatal here — any client that closed its socket before our
+/// reply landed could stop the server.
+///
+/// **An oversized datagram.** On Windows a datagram larger than the buffer makes
+/// `recv_from` fail with WSAEMSGSIZE instead of truncating, so one large packet
+/// from anywhere — before authentication, before the rate limiter, before any
+/// zone is consulted — exited the process. Same class as the ICMP bug, and missed
+/// because the original fix was a list of `ErrorKind`s and this error has no kind
+/// of its own. On Unix the packet is truncated instead and then fails to parse,
+/// so a receive buffer large enough for any datagram is the other half of the
+/// fix.
+///
+/// Errors that are neither are still fatal, because a server that cannot receive
+/// is not serving.
+pub fn recv_error_is_transient(e: &std::io::Error) -> bool {
+    if e.raw_os_error() == Some(WSAEMSGSIZE) {
+        return true;
+    }
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            // The portable spelling of "that datagram did not fit", which is
+            // what some platforms report and what a future Rust may map
+            // WSAEMSGSIZE onto.
+            | std::io::ErrorKind::InvalidInput
+    )
+}
+
+/// The receive buffer one datagram needs.
+///
+/// Not the EDNS payload size either server advertises: that is a statement about
+/// *responses*, and a request is not bound by it. A client may send anything a
+/// UDP length field can express.
+pub const UDP_RECEIVE_BUFFER: usize = 65_535;
+
+/// A name in the form DNS compares names by: ASCII case folded, and nothing
+/// else.
+///
+/// The "and nothing else" is the point. DNS case-insensitivity is defined over
+/// ASCII only (RFC 4343): the octets 0x41–0x5A match 0x61–0x7A and every other
+/// octet matches only itself, because a label is a byte string and the protocol
+/// has no idea what encoding is in it. `str::to_lowercase` applies the full
+/// Unicode mapping instead, which folds codepoints *into* ASCII — U+212A KELVIN
+/// SIGN becomes `k` — so two names that differ on the wire come out equal. Any
+/// table keyed on the result then merges them, which for a cache means one
+/// entry answering for two owners.
+///
+/// This lives here because it was independently written, correctly, in `zone`
+/// and incorrectly in `cache`, with the comment explaining why only in the
+/// former. Every keyed-by-name structure should reach for this one.
+pub fn ascii_lowered(name: &str) -> String {
+    let mut owned = name.to_string();
+    owned.make_ascii_lowercase();
+    owned
+}
+
 /// Get the current Unix timestamp in seconds
 ///
 /// Returns 0 if the system time is before UNIX_EPOCH (unlikely in practice)
@@ -390,6 +470,61 @@ mod tests {
         assert_eq!(record_type_name_to_code("TYPE65536"), None);
         assert_eq!(record_type_name_to_code("TYPE"), None);
         assert_eq!(record_type_name_to_code("TYPEA"), None);
+    }
+
+    /// The oversized-datagram case, which the `ErrorKind` list could not express.
+    ///
+    /// Windows reports WSAEMSGSIZE for a datagram bigger than the buffer, Rust
+    /// maps it to `kind = Uncategorized`, and an `Uncategorized` error matched
+    /// none of the arms — so the receive loop treated it as fatal and one
+    /// oversized packet from any source exited the process, before
+    /// authentication and before the rate limiter. The predicate has to be
+    /// tested through the raw code because the kind carries no information.
+    #[test]
+    fn an_oversized_datagram_is_not_a_reason_to_stop_serving() {
+        let too_big = std::io::Error::from_raw_os_error(WSAEMSGSIZE);
+        assert!(
+            recv_error_is_transient(&too_big),
+            "WSAEMSGSIZE arrives as {:?}, which is why matching on the kind alone missed it",
+            too_big.kind()
+        );
+    }
+
+    #[test]
+    fn a_stray_icmp_report_is_not_a_reason_to_stop_serving() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::HostUnreachable,
+        ] {
+            assert!(recv_error_is_transient(&std::io::Error::from(kind)), "{kind:?}");
+        }
+    }
+
+    /// And a socket that has genuinely failed still stops the loop — the point of
+    /// the predicate is to be narrow. A server that cannot receive is not
+    /// serving, and pretending otherwise is a process that looks healthy and
+    /// answers nothing.
+    #[test]
+    fn a_broken_socket_is_still_fatal() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::AddrNotAvailable,
+            std::io::ErrorKind::OutOfMemory,
+        ] {
+            assert!(!recv_error_is_transient(&std::io::Error::from(kind)), "{kind:?}");
+        }
+    }
+
+    /// ASCII case folding, and nothing else (RFC 4343).
+    #[test]
+    fn ascii_lowering_does_not_fold_unicode_into_ascii() {
+        assert_eq!(ascii_lowered("WWW.Example.COM."), "www.example.com.");
+        // U+212A KELVIN SIGN lowercases to `k` under Unicode rules. Two names
+        // that are different bytes on the wire must not come out equal.
+        assert_ne!(ascii_lowered("\u{212A}.example.com."), "k.example.com.");
+        assert_eq!("\u{212A}".to_lowercase(), "k", "which is what to_lowercase does");
     }
 
     #[test]

@@ -22,10 +22,10 @@ use rdns::{
     tsig::{self, TsigAlgorithm, TsigCheck, TsigKey, TsigKeyring, TsigSession},
     OpCode,
     telemetry::{instrumentation, DnsMetrics, LatencyTimer},
-    utils::{current_unix_timestamp, record_types},
+    utils::{current_unix_timestamp, record_types, recv_error_is_transient, UDP_RECEIVE_BUFFER},
     validation::RequestValidator,
     xfr,
-    zone::{parse_zone_file_at, Zone},
+    zone::{parse_zone_file_at, NameKind, Zone},
     zone_signer::{sign_zone, DenialChain, SigningPolicy},
     zone_writer::write_zone_file,
     DnsMessage, Edns, ResourceRecord, ResponseCode, EDNS_VERSION,
@@ -285,81 +285,27 @@ fn make_response(
 
         // Find the matching zone for this query
         let zone = find_zone_for_query(&query.qname, zone_map);
-        
+
         if let Some(zone) = zone {
-            let matching_records = zone.query(&query.qname, query.qtype);
-
-            if matching_records.is_empty() {
-                // Nothing of this type here. NXDOMAIN only if the *name* doesn't
-                // exist either; otherwise it's NOERROR with an empty answer
-                // (NODATA). `Zone::name_exists` is what expands `@` and relative
-                // owner names against the origin and accounts for a wildcard —
-                // comparing the stored names raw never matches.
-                let name_exists = zone.name_exists(&query.qname);
-                if !name_exists {
-                    response.rcode = ResponseCode::NoSuchDomain;
+            match resolve_in_zone(zone, &query.qname, query.qtype) {
+                Outcome::Referral { cut } => {
+                    refer_to_child(zone, &cut, dnssec_ok, &mut response);
+                    metrics.increment_cache_misses();
                 }
-
-                // Both kinds of "no" carry the zone's SOA in the authority
-                // section (RFC 2308 §2.1 and §2.2). It is not decoration: the
-                // SOA's MINIMUM and its own TTL are what tell the client, and
-                // every resolver in between, how long the answer may be cached.
-                // Without it a negative answer is uncacheable, so each repeat of
-                // a failing lookup comes back to us.
-                for soa in zone.query(zone.origin(), record_types::SOA) {
-                    response.authorities.push(ResourceRecord {
-                        name: zone.origin().to_string(),
-                        class: soa.class,
-                        ttl: soa.ttl,
-                        rdata: soa.rdata.clone(),
-                    });
+                Outcome::Answer { chain, name } => {
+                    add_chain(zone, &chain, dnssec_ok, &mut response);
+                    add_answer(zone, &name, query.qtype, dnssec_ok, &mut response);
+                    metrics.increment_cache_hits();
                 }
-
-                // An unsigned "no" is a "no" a resolver has to take on trust,
-                // which for a signed zone is the one thing DNSSEC exists to
-                // avoid: the proof is what stops a forged NXDOMAIN taking a
-                // name off the internet for as long as it stays cached.
-                if dnssec_ok {
-                    response.authorities.extend(dnssec_answer::negative_proof(
-                        zone,
-                        &query.qname,
-                        name_exists,
-                    ));
+                Outcome::Negative { chain, name, kind } => {
+                    add_chain(zone, &chain, dnssec_ok, &mut response);
+                    add_negative(zone, &name, &kind, dnssec_ok, &mut response);
+                    metrics.increment_cache_misses();
                 }
-
-                metrics.increment_cache_misses();
-            } else {
-                // Add matching records to answer section. The answer echoes the
-                // queried name rather than the stored one, which may be `@` or
-                // relative — and for a wildcard match the queried name is what
-                // the client must see (RFC 1034 §4.3.3).
-                for record in matching_records {
-                    response.answers.push(ResourceRecord {
-                        name: query.qname.clone(),
-                        class: record.class,
-                        ttl: record.ttl,
-                        rdata: record.rdata.clone(),
-                    });
+                Outcome::ChainLeftZone { chain } => {
+                    add_chain(zone, &chain, dnssec_ok, &mut response);
+                    metrics.increment_cache_hits();
                 }
-
-                if dnssec_ok {
-                    let signatures =
-                        dnssec_answer::answer_signatures(zone, &query.qname, query.qtype);
-                    // A wildcard answer is not finished when its signature is
-                    // attached. The same signature verifies at every name that
-                    // wildcard reaches, so the answer also has to say that the
-                    // name actually asked for is not in the zone
-                    // (RFC 4035 §3.1.3) — otherwise one captured answer is a
-                    // valid answer for all of them.
-                    if signatures.wildcard.is_some() {
-                        response
-                            .authorities
-                            .extend(dnssec_answer::proof_of_absence(zone, &query.qname));
-                    }
-                    response.answers.extend(signatures.records);
-                }
-
-                metrics.increment_cache_hits();
             }
 
             metrics.increment_query_counter();
@@ -405,8 +351,285 @@ fn make_response(
     response
 }
 
+/// What RFC 1034 §4.3.2 decided about one question against one zone.
+///
+/// The algorithm there is a loop with four exits, and only two of them were ever
+/// implemented here: records, or a negative answer. The two that were missing are
+/// the ones an ordinary zone cannot be served without — a referral at a
+/// delegation, and following an alias.
+enum Outcome {
+    /// The zone's authority stops at `cut`: the answer is a referral to the
+    /// child, with AA **clear** (RFC 1035 §4.1.1).
+    Referral { cut: String },
+    /// There are records for the question at `name`, reached through the
+    /// aliases at `chain` (empty in the ordinary case).
+    Answer { chain: Vec<String>, name: String },
+    /// No records. `name` is the name the "no" is about — the end of the chain
+    /// when one was followed — and `kind` decides NXDOMAIN against NODATA.
+    Negative {
+        chain: Vec<String>,
+        name: String,
+        kind: NameKind,
+    },
+    /// The chain walked out of this zone: NOERROR with the aliases we do hold
+    /// and nothing else. **Not** NXDOMAIN — we know nothing about the target,
+    /// and saying it does not exist would take it off the internet for as long
+    /// as anything cached the answer (RFC 1034 §4.3.2 step 3a).
+    ChainLeftZone { chain: Vec<String> },
+}
+
+/// How many aliases we will follow inside one zone before giving up.
+///
+/// A zone with `a CNAME b` and `b CNAME a` is a broken zone, not an attack, but
+/// the loop is real and the visited set below is what actually stops it. This is
+/// the second bound, for the chain that grows without repeating.
+const MAX_CNAME_HOPS: usize = 16;
+
+/// Walk RFC 1034 §4.3.2 for one question.
+///
+/// The four cases are tried in this order at every name, which is the order the
+/// RFC gives and the order that matters: the zone's authority ends here, the
+/// name has the data, the name is an alias, the name has no such data. Getting
+/// the first one last is how a parent ends up answering NXDOMAIN for a child's
+/// names.
+fn resolve_in_zone(zone: &Zone, qname: &str, qtype: u16) -> Outcome {
+    let mut chain: Vec<String> = Vec::new();
+    let mut visited: Vec<String> = Vec::new();
+    let mut name = qname.to_string();
+
+    for _ in 0..MAX_CNAME_HOPS {
+        // A delegation is a referral whatever the type asked for, with one
+        // exception: the DS *at* the cut is the parent's own statement about the
+        // child, so it is answered here rather than sent downwards — the child
+        // does not hold its own DS and could not be asked (RFC 4035 §3.1.4.1).
+        if let Some(cut) = zone.delegation_for(&name) {
+            let at_the_cut = cut.eq_ignore_ascii_case(&zone.normalize_name(&name));
+            if !(qtype == record_types::DS && at_the_cut) {
+                return if chain.is_empty() {
+                    Outcome::Referral { cut }
+                } else {
+                    // Mid-chain, the target is the child's name to answer for.
+                    // Stopping with what we hold costs the resolver one round
+                    // trip and cannot be wrong; answering from the glue below
+                    // the cut would serve occluded data as authoritative.
+                    Outcome::ChainLeftZone { chain }
+                };
+            }
+        }
+
+        let kind = zone.name_kind(&name);
+        if !zone.query(&name, qtype).is_empty() {
+            return Outcome::Answer { chain, name };
+        }
+        // A CNAME query is answered by the CNAME, not followed by it — the
+        // alias is the data when the alias is what was asked for.
+        if qtype == record_types::CNAME {
+            return Outcome::Negative { chain, name, kind };
+        }
+
+        let Some(target) = cname_target(zone, &name) else {
+            return Outcome::Negative { chain, name, kind };
+        };
+        chain.push(name.clone());
+        visited.push(zone.normalize_name(&name).to_ascii_lowercase());
+
+        let target_key = zone.normalize_name(&target).to_ascii_lowercase();
+        if !in_zone(zone, &target_key) || visited.contains(&target_key) {
+            return Outcome::ChainLeftZone { chain };
+        }
+        name = target;
+    }
+    Outcome::ChainLeftZone { chain }
+}
+
+/// The target of the CNAME at `name`, if there is one.
+///
+/// Only the first is read. RFC 1034 §3.6.2 allows exactly one CNAME at an owner
+/// name — a second is a broken zone, and picking one arbitrarily is better than
+/// answering with a two-record RRset no client can use. The parser refuses to
+/// load the shape at all (see `zone::parse_zone_file`), so this is the belt to
+/// that braces.
+fn cname_target(zone: &Zone, name: &str) -> Option<String> {
+    zone.query(name, record_types::CNAME)
+        .first()
+        .and_then(|record| match record.rdata.parse() {
+            Ok(rdns::ParsedRecord::CNAME(target)) => Some(target),
+            _ => None,
+        })
+}
+
+/// Whether an absolute, down-cased name is at or below this zone's apex.
+fn in_zone(zone: &Zone, name: &str) -> bool {
+    let origin = zone.origin().to_ascii_lowercase();
+    name == origin
+        || (name.len() > origin.len()
+            && name.ends_with(&origin)
+            && name.as_bytes()[name.len() - origin.len() - 1] == b'.')
+}
+
+/// Put the records of `qtype` at `name` into the answer section, with their
+/// signatures.
+///
+/// The answer echoes the name asked about rather than the stored owner, which
+/// may be `@`, relative, or a wildcard — and for a wildcard match the queried
+/// name is what the client must see (RFC 1034 §4.3.3).
+fn add_answer(
+    zone: &Zone,
+    name: &str,
+    qtype: u16,
+    dnssec_ok: bool,
+    response: &mut DnsMessage,
+) {
+    for record in zone.query(name, qtype) {
+        response.answers.push(ResourceRecord {
+            name: name.to_string(),
+            class: record.class,
+            ttl: record.ttl,
+            rdata: record.rdata.clone(),
+        });
+    }
+
+    if dnssec_ok {
+        let signatures = dnssec_answer::answer_signatures(zone, name, qtype);
+        // A wildcard answer is not finished when its signature is attached. The
+        // same signature verifies at every name that wildcard reaches, so the
+        // answer also has to say that the name actually asked for is not in the
+        // zone (RFC 4035 §3.1.3) — otherwise one captured answer is a valid
+        // answer for all of them.
+        if signatures.wildcard.is_some() {
+            response
+                .authorities
+                .extend(dnssec_answer::proof_of_absence(zone, name));
+        }
+        response.answers.extend(signatures.records);
+    }
+}
+
+/// The aliases walked to reach the answer, in the order they were followed.
+///
+/// Each is a CNAME RRset at its own owner name, so it carries its own signature
+/// — and its own wildcard denial when the alias was synthesized.
+fn add_chain(zone: &Zone, chain: &[String], dnssec_ok: bool, response: &mut DnsMessage) {
+    for at in chain {
+        add_answer(zone, at, record_types::CNAME, dnssec_ok, response);
+    }
+}
+
+/// A negative answer: the rcode, the SOA that says how long it may be cached,
+/// and the proof of it when the client can check one.
+fn add_negative(
+    zone: &Zone,
+    name: &str,
+    kind: &NameKind,
+    dnssec_ok: bool,
+    response: &mut DnsMessage,
+) {
+    if matches!(kind, NameKind::NotFound) {
+        response.rcode = ResponseCode::NoSuchDomain;
+    }
+
+    // Both kinds of "no" carry the zone's SOA in the authority section
+    // (RFC 2308 §2.1 and §2.2). It is not decoration: it is what tells the
+    // client, and every resolver in between, how long the answer may be cached.
+    // Without it a negative answer is uncacheable, so each repeat of a failing
+    // lookup comes back to us.
+    for soa in zone.query(zone.origin(), record_types::SOA) {
+        response.authorities.push(ResourceRecord {
+            name: zone.origin().to_string(),
+            class: soa.class,
+            ttl: negative_ttl(soa),
+            rdata: soa.rdata.clone(),
+        });
+    }
+
+    // An unsigned "no" is a "no" a resolver has to take on trust, which for a
+    // signed zone is the one thing DNSSEC exists to avoid: the proof is what
+    // stops a forged NXDOMAIN taking a name off the internet for as long as it
+    // stays cached.
+    if dnssec_ok {
+        response
+            .authorities
+            .extend(dnssec_answer::negative_proof(zone, name, kind));
+    }
+}
+
+/// How long a negative answer may be cached: `min(SOA MINIMUM, the SOA record's
+/// own TTL)` (RFC 2308 §3).
+///
+/// The record's own TTL alone is wrong, and wrong in the expensive direction.
+/// For the zone shape this repo's own tests use — `$TTL 3600`, `minimum 300` —
+/// sending it verbatim advertises every NXDOMAIN and NODATA at 3600 where the
+/// RFC says 300, so a record added to fix a typo takes an hour to appear instead
+/// of five minutes. It was also internally inconsistent: the signer already caps
+/// the NSEC/NSEC3 TTL at MINIMUM (`zone_signer::sign_zone`), so the SOA and the
+/// proof beside it in the same section disagreed about how long the "no" was
+/// good for.
+fn negative_ttl(soa: &rdns::zone::ZoneRecord) -> i32 {
+    match soa.rdata.parse() {
+        Ok(rdns::ParsedRecord::SOA { minimum, .. }) => {
+            soa.ttl.min(minimum.min(i32::MAX as u32) as i32)
+        }
+        // An apex SOA that will not parse is a zone that should not have loaded.
+        // Capping at nothing is the conservative direction: the client asks
+        // again rather than caching a "no" we cannot bound.
+        _ => 0,
+    }
+}
+
+/// A referral to the child zone: the delegation's NS RRset, its glue, and — for
+/// a client that can check it — the DS or the proof there is none.
+///
+/// AA is **clear**, which is the whole point. This server hardcoded it true and
+/// answered NXDOMAIN for names below a delegation, so per RFC 8020 every
+/// resolver cached "the entire subtree does not exist" and the child zone went
+/// off the internet for the negative TTL.
+fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMessage) {
+    response.authoritive = false;
+
+    let mut targets: Vec<String> = Vec::new();
+    for ns in zone.query(cut, record_types::NS) {
+        if let Ok(rdns::ParsedRecord::NS(target)) = ns.rdata.parse() {
+            targets.push(target);
+        }
+        response.authorities.push(ResourceRecord {
+            name: cut.to_string(),
+            class: ns.class,
+            ttl: ns.ttl,
+            rdata: ns.rdata.clone(),
+        });
+    }
+
+    // Glue, and only in-bailiwick glue: an address we hold for a nameserver
+    // under this zone is a hint we are entitled to give, while one for a name in
+    // somebody else's zone is an assertion about their data. A resolver worth
+    // anything discards the latter, and sending it is how cache-poisoning
+    // attempts look (RFC 1034 §4.2.1).
+    for target in targets {
+        let key = zone.normalize_name(&target).to_ascii_lowercase();
+        if !in_zone(zone, &key) {
+            continue;
+        }
+        for rtype in [record_types::A, record_types::AAAA] {
+            for glue in zone.query(&target, rtype) {
+                response.additionals.push(ResourceRecord {
+                    name: target.clone(),
+                    class: glue.class,
+                    ttl: glue.ttl,
+                    rdata: glue.rdata.clone(),
+                });
+            }
+        }
+    }
+
+    if dnssec_ok {
+        response
+            .authorities
+            .extend(dnssec_answer::delegation_proof(zone, cut));
+    }
+}
+
 /// Find the zone that should handle this query
-/// 
+///
 /// Matches the query name against zone origins, preferring the most specific (longest) match
 fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> Option<&'a Zone> {
     // Wire-format query names are absolute ("www.example.com."), so the trailing
@@ -1035,39 +1258,14 @@ fn absolute_name(name: &str) -> String {
     }
 }
 
-/// Whether a receive error is an ICMP report about a *previous* datagram rather
-/// than anything wrong with this socket.
-///
-/// A UDP server that replies to a client which has already gone away gets an
-/// ICMP port-unreachable back, and Windows reports it as an error on the socket's
-/// **next** `recv_from` (WSAECONNRESET; `WSAENETRESET` for a TTL expiry). Unix
-/// only does this on a connected socket, which is why this shape of bug is
-/// invisible there and fatal here.
-///
-/// It was fatal here in the most literal sense: `recv_from` returning an error
-/// ended the UDP loop, which took the whole process down — so any client that
-/// closed its socket before our reply landed could stop the server. A stray ICMP
-/// report says nothing about the socket's health and the only correct response is
-/// to carry on receiving. Errors that are not this are still fatal, because a
-/// server that cannot receive is not serving.
-fn is_stray_icmp(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::NetworkUnreachable
-            | std::io::ErrorKind::HostUnreachable
-    )
-}
-
 /// Receive datagrams and answer each in its own task.
 async fn udp_loop(socket: Arc<UdpSocket>, server: Arc<Server>) -> Result<(), std::io::Error> {
-    let mut buf = vec![0; 4096];
+    let mut buf = vec![0; UDP_RECEIVE_BUFFER];
 
     loop {
         let (size, peer) = match socket.recv_from(&mut buf).await {
             Ok(received) => received,
-            Err(e) if is_stray_icmp(&e) => continue,
+            Err(e) if recv_error_is_transient(&e) => continue,
             Err(e) => return Err(e),
         };
         let socket = socket.clone();
@@ -2338,14 +2536,20 @@ fn generate_keys(
 ///
 /// `replicating` allows an empty directory: a secondary's first start has
 /// nothing on disk yet, and refusing to run until a zone arrives would mean it
-/// never could.
+/// never could. That is all it allows — `enumerate_zone_files` already returns
+/// an empty map for an empty directory, so the case costs nothing here, and an
+/// *error* from it must still propagate. Swallowing one used to turn an
+/// unreadable directory into `Ok(empty)`, which `install_all_zones` then
+/// installed wholesale: the server stayed up, listening, holding zero zones, and
+/// answered REFUSED for every name it is authoritative for. Nothing crashed, so
+/// nothing alerted.
 async fn load_zones_from_source(
     source: &ZoneSource,
     replicating: bool,
 ) -> Result<HashMap<String, Zone>, Box<dyn std::error::Error>> {
     if let ZoneSource::Directory(dir) = source {
         if replicating {
-            return Ok(enumerate_zone_files(dir).unwrap_or_default());
+            return enumerate_zone_files(dir);
         }
     }
     match source {
@@ -2424,6 +2628,35 @@ fn enumerate_zone_files(dir: &str) -> Result<HashMap<String, Zone>, Box<dyn std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdns::{QueryClass, QuerySection};
+
+    /// A query as it arrives on the wire, EDNS and all.
+    fn query(qname: &str, qtype: u16, dnssec_ok: bool) -> DnsMessage {
+        let mut msg = DnsMessage {
+            id: 1,
+            response: false,
+            opcode: OpCode::Query,
+            authoritive: false,
+            truncation: false,
+            recursion: false,
+            recursion_ok: false,
+            ad: false,
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![QuerySection {
+                qname: qname.to_string(),
+                qtype,
+                qclass: QueryClass::IN,
+            }],
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+        };
+        let mut edns = Edns::with_payload_size(4096);
+        edns.do_bit = dnssec_ok;
+        msg.set_edns(edns).expect("set edns");
+        msg
+    }
 
     #[test]
     fn test_validate_cli_args_valid() {
@@ -3192,15 +3425,243 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // RFC 1034 §4.3.2: the four cases an authoritative answer can be
+    // -----------------------------------------------------------------------
+
+    /// Three of the four cases were missing here, and the suite was green the
+    /// whole time because it asserted what the code did. Each test below names
+    /// the wire shape that used to go out.
+    mod answer_path {
+        use super::*;
+        use rdns::zone::parse_zone_file;
+
+        /// A zone with everything the algorithm has to branch on: an alias, an
+        /// alias out of the zone, a two-deep wildcard, a delegation with glue,
+        /// and an empty non-terminal.
+        const ZONE: &str = r#"$ORIGIN example.com.
+$TTL 3600
+@        IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )
+@        IN NS  ns1.example.com.
+ns1      IN A   192.0.2.1
+www      IN CNAME host.example.com.
+host     IN A   192.0.2.10
+away     IN CNAME elsewhere.test.
+loop1    IN CNAME loop2.example.com.
+loop2    IN CNAME loop1.example.com.
+*        IN A   192.0.2.99
+deep.a.b IN TXT "down here"
+sub      IN NS  ns.sub.example.com.
+sub      IN NS  ns.other.test.
+ns.sub   IN A   192.0.2.20
+"#;
+
+        fn server() -> HashMap<String, Zone> {
+            let zone = parse_zone_file(ZONE, "example.com.").expect("the test zone parses");
+            let mut zones = HashMap::new();
+            zones.insert(zone.origin().to_string(), zone);
+            zones
+        }
+
+        fn ask(qname: &str, qtype: u16) -> DnsMessage {
+            make_response(&query(qname, qtype, false), &server(), &DnsMetrics::new())
+        }
+
+        fn rdatas(records: &[ResourceRecord], rtype: u16) -> Vec<&ResourceRecord> {
+            records.iter().filter(|r| r.rdata.rtype == rtype).collect()
+        }
+
+        /// The wire shape that used to go out for every CNAME in every zone this
+        /// server loaded: an empty NOERROR with the SOA — "this name has no A
+        /// record". `getaddrinfo` fails on it, and BIND and Unbound cache the
+        /// NODATA and never follow the alias.
+        #[test]
+        fn a_cname_is_followed_to_its_target_in_the_same_zone() {
+            let response = ask("www.example.com.", record_types::A);
+
+            assert_eq!(response.rcode, ResponseCode::Ok);
+            assert!(response.authoritive);
+            let cnames = rdatas(&response.answers, record_types::CNAME);
+            assert_eq!(cnames.len(), 1, "the alias itself comes first");
+            assert_eq!(cnames[0].name, "www.example.com.");
+
+            let addresses = rdatas(&response.answers, record_types::A);
+            assert_eq!(addresses.len(), 1, "and the data it points at");
+            assert_eq!(addresses[0].name, "host.example.com.");
+            assert!(
+                response.authorities.is_empty(),
+                "an answer is not a negative answer and owes no SOA"
+            );
+        }
+
+        /// A chain leaving the zone stops with what we hold. NXDOMAIN here would
+        /// be an assertion about a name in somebody else's zone.
+        #[test]
+        fn a_cname_out_of_the_zone_stops_with_the_partial_chain() {
+            let response = ask("away.example.com.", record_types::A);
+
+            assert_eq!(response.rcode, ResponseCode::Ok, "not NXDOMAIN");
+            assert_eq!(rdatas(&response.answers, record_types::CNAME).len(), 1);
+            assert!(rdatas(&response.answers, record_types::A).is_empty());
+        }
+
+        /// A CNAME query is answered by the CNAME, not followed by it.
+        #[test]
+        fn a_cname_query_is_not_chased() {
+            let response = ask("www.example.com.", record_types::CNAME);
+            assert_eq!(response.answers.len(), 1);
+            assert_eq!(response.answers[0].rdata.rtype, record_types::CNAME);
+        }
+
+        /// A broken zone must not hang the server. Two aliases pointing at each
+        /// other terminate on the visited set, not on the hop limit.
+        #[test]
+        fn a_cname_loop_terminates() {
+            let response = ask("loop1.example.com.", record_types::A);
+            assert_eq!(response.rcode, ResponseCode::Ok);
+            assert!(
+                rdatas(&response.answers, record_types::CNAME).len() <= MAX_CNAME_HOPS,
+                "the chain is bounded"
+            );
+        }
+
+        /// The referral, and the header bit that makes it one. This used to be an
+        /// NXDOMAIN with **AA=1**, so per RFC 8020 every resolver cached "the
+        /// whole subtree does not exist" and the child zone was off the internet
+        /// for the negative TTL.
+        #[test]
+        fn a_name_below_a_delegation_gets_a_referral_not_an_nxdomain() {
+            let response = ask("anything.sub.example.com.", record_types::A);
+
+            assert_eq!(response.rcode, ResponseCode::Ok, "a referral is not an error");
+            assert!(
+                !response.authoritive,
+                "RFC 1035 §4.1.1: AA is clear on a referral — this is the bit that \
+                 stopped the child zone resolving"
+            );
+            assert!(response.answers.is_empty());
+
+            let ns = rdatas(&response.authorities, record_types::NS);
+            assert_eq!(ns.len(), 2, "the child's NS RRset, in the authority section");
+            assert!(ns.iter().all(|r| r.name == "sub.example.com."));
+            assert!(
+                rdatas(&response.authorities, record_types::SOA).is_empty(),
+                "a referral carries no SOA — it is not a negative answer"
+            );
+
+            // In-bailiwick glue only: an address for `ns.other.test.` would be an
+            // assertion about a zone we do not serve.
+            let glue = rdatas(&response.additionals, record_types::A);
+            assert_eq!(glue.len(), 1, "{:?}", response.additionals);
+            assert_eq!(glue[0].name, "ns.sub.example.com.");
+        }
+
+        /// The wildcard at the apex must not answer for a name below the cut
+        /// (RFC 4592 §2.2.1) — that name belongs to the child.
+        #[test]
+        fn the_delegation_wins_over_the_wildcard() {
+            let response = ask("anything.sub.example.com.", record_types::A);
+            assert!(
+                response.answers.is_empty(),
+                "the apex wildcard is not this name's source of synthesis"
+            );
+        }
+
+        /// A query *at* the cut is still a referral, whatever the type — except
+        /// the DS, which is the parent's own statement about the child and which
+        /// the child could not answer (RFC 4035 §3.1.4.1).
+        #[test]
+        fn a_ds_at_the_cut_is_answered_by_the_parent() {
+            let mut text = ZONE.to_string();
+            text.push_str(
+                "sub IN DS 12345 13 2 \
+                 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\n",
+            );
+            let zone = parse_zone_file(&text, "example.com.").unwrap();
+            let mut zones = HashMap::new();
+            zones.insert(zone.origin().to_string(), zone);
+
+            let response = make_response(
+                &query("sub.example.com.", record_types::DS, false),
+                &zones,
+                &DnsMetrics::new(),
+            );
+            assert_eq!(rdatas(&response.answers, record_types::DS).len(), 1);
+            assert!(response.authoritive, "the DS is the parent's own data");
+
+            // Anything else at the same name is a referral.
+            let ns = make_response(
+                &query("sub.example.com.", record_types::NS, false),
+                &zones,
+                &DnsMetrics::new(),
+            );
+            assert!(!ns.authoritive);
+            assert!(ns.answers.is_empty());
+        }
+
+        /// RFC 4592 §3.3.2: synthesis reaches any depth, not one label.
+        #[test]
+        fn a_wildcard_answers_a_name_more_than_one_label_deep() {
+            let response = ask("a.b.c.example.com.", record_types::A);
+            assert_eq!(response.rcode, ResponseCode::Ok);
+            let addresses = rdatas(&response.answers, record_types::A);
+            assert_eq!(addresses.len(), 1);
+            assert_eq!(addresses[0].name, "a.b.c.example.com.", "echoed as asked");
+        }
+
+        /// RFC 4592 §2.2.2: a name with descendants exists. NXDOMAIN here is the
+        /// zone taking *its own* data offline, because an RFC 8020 resolver
+        /// extends the denial down to `deep.a.b`.
+        #[test]
+        fn an_empty_non_terminal_is_nodata_not_nxdomain() {
+            let response = ask("a.b.example.com.", record_types::TXT);
+            assert_eq!(response.rcode, ResponseCode::Ok);
+            assert!(response.answers.is_empty());
+            assert_eq!(rdatas(&response.authorities, record_types::SOA).len(), 1);
+        }
+
+        /// RFC 2308 §3: `min(SOA MINIMUM, the SOA record's own TTL)`. The zone
+        /// above is the shape this repo's own tests use — `$TTL 3600`,
+        /// `minimum 300` — so sending the record's own TTL advertised every "no"
+        /// at 3600 where the RFC says 300, cached 12× longer than the operator
+        /// asked for.
+        #[test]
+        fn a_negative_answer_caps_the_soa_ttl_at_minimum() {
+            for (qname, qtype, what) in [
+                ("a.b.example.com.", record_types::TXT, "NODATA"),
+                ("x.a.b.example.com.", record_types::A, "NXDOMAIN"),
+            ] {
+                let response = ask(qname, qtype);
+                let soa = rdatas(&response.authorities, record_types::SOA);
+                assert_eq!(soa.len(), 1, "{what}");
+                assert_eq!(soa[0].ttl, 300, "{what}: capped at MINIMUM, not the $TTL");
+            }
+        }
+
+        /// And the NXDOMAIN that is still an NXDOMAIN, so the fixes above did not
+        /// turn every name into a hit: `x.a.b` is below an existing name, so the
+        /// apex wildcard is not its source of synthesis and nothing answers.
+        #[test]
+        fn a_name_nothing_reaches_is_still_nxdomain() {
+            let response = ask("x.a.b.example.com.", record_types::A);
+            assert_eq!(response.rcode, ResponseCode::NoSuchDomain);
+            assert!(response.authoritive, "we are authoritative for saying no");
+            assert_eq!(rdatas(&response.authorities, record_types::SOA).len(), 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Signing, and answering a client that can read the result
     // -----------------------------------------------------------------------
 
     mod dnssec {
         use super::*;
         use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Dnskey, Rrset, RrsetProof};
-        use rdns::dnssec_denial::{nsec3s_in, nsecs_in, proves_nxdomain, Denial};
+        use rdns::dnssec_denial::{
+            nsec3s_in, nsecs_in, proves_no_ds, proves_nxdomain, proves_wildcard_expansion, Denial,
+            WildcardVerdict,
+        };
         use rdns::zone::parse_zone_file;
-        use rdns::{QueryClass, QuerySection, RecordData};
+        use rdns::RecordData;
 
         const SIGNED_ZONE: &str = r#"$ORIGIN example.com.
 $TTL 3600
@@ -3244,33 +3705,6 @@ deep.a.b IN TXT "down here"
             (zones, keys)
         }
 
-        fn query(qname: &str, qtype: u16, dnssec_ok: bool) -> DnsMessage {
-            let mut msg = DnsMessage {
-                id: 1,
-                response: false,
-                opcode: OpCode::Query,
-                authoritive: false,
-                truncation: false,
-                recursion: false,
-                recursion_ok: false,
-                ad: false,
-                cd: false,
-                rcode: ResponseCode::Ok,
-                queries: vec![QuerySection {
-                    qname: qname.to_string(),
-                    qtype,
-                    qclass: QueryClass::IN,
-                }],
-                answers: Vec::new(),
-                authorities: Vec::new(),
-                additionals: Vec::new(),
-            };
-            let mut edns = Edns::with_payload_size(4096);
-            edns.do_bit = dnssec_ok;
-            msg.set_edns(edns).expect("set edns");
-            msg
-        }
-
         fn keys_of(zones: &HashMap<String, Zone>) -> Vec<Dnskey> {
             let zone = &zones["example.com."];
             dnskeys_in(
@@ -3285,6 +3719,187 @@ deep.a.b IN TXT "down here"
                     })
                     .collect::<Vec<_>>(),
             )
+        }
+
+        /// A zone with a wildcard and both kinds of delegation, which is what the
+        /// referral and deep-synthesis proofs need and what `SIGNED_ZONE` above
+        /// deliberately does not have — a wildcard at the apex would turn its
+        /// NXDOMAIN tests into wildcard answers.
+        const DELEGATING_ZONE: &str = r#"$ORIGIN example.com.
+$TTL 3600
+@         IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )
+@         IN NS  ns1.example.com.
+ns1       IN A   192.0.2.1
+*         IN A   192.0.2.99
+secure    IN NS  ns.secure.example.com.
+secure    IN DS  12345 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+ns.secure IN A   192.0.2.20
+plain     IN NS  ns.plain.example.com.
+ns.plain  IN A   192.0.2.30
+"#;
+
+        fn signed_zones(text: &str, nsec3: bool) -> (HashMap<String, Zone>, Vec<SigningKey>) {
+            let keys = vec![
+                SigningKey::generate(
+                    SigningAlgorithm::EcdsaP256Sha256,
+                    "example.com.",
+                    DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+                )
+                .unwrap(),
+                SigningKey::generate(
+                    SigningAlgorithm::EcdsaP256Sha256,
+                    "example.com.",
+                    DNSKEY_FLAG_ZONE,
+                )
+                .unwrap(),
+            ];
+            let policy = SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400)
+                .with_chain(if nsec3 {
+                    DenialChain::nsec3()
+                } else {
+                    DenialChain::Nsec
+                });
+            let zone = sign_zone(
+                &parse_zone_file(text, "example.com.").unwrap(),
+                &keys,
+                &policy,
+            )
+            .unwrap();
+            let mut zones = HashMap::new();
+            zones.insert(zone.origin().to_string(), zone);
+            (zones, keys)
+        }
+
+        /// The failure this is the regression test for: **a signed zone with a
+        /// wildcard SERVFAILed at every validator for every non-existent name two
+        /// or more labels deep.** The synthesis reached one label, so a deeper
+        /// name became an NXDOMAIN — and then the wildcard denial asked the chain
+        /// to cover `*.example.com.`, a name that is *in* the chain, so nothing
+        /// covered it and the proof came back unproved. Failing closed is worse
+        /// than failing open here: the zone was unusable rather than merely
+        /// wrong.
+        #[test]
+        fn a_deep_wildcard_answer_verifies_and_proves_its_own_expansion() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_zones(DELEGATING_ZONE, nsec3);
+                let qname = "x.y.z.example.com.";
+                let response = make_response(
+                    &query(qname, record_types::A, true),
+                    &zones,
+                    &DnsMetrics::new(),
+                );
+
+                assert_eq!(response.rcode, ResponseCode::Ok, "nsec3={nsec3}");
+                let rdatas: Vec<RecordData> = response
+                    .answers
+                    .iter()
+                    .filter(|r| r.rdata.rtype == record_types::A)
+                    .map(|r| r.rdata.clone())
+                    .collect();
+                assert_eq!(rdatas.len(), 1, "nsec3={nsec3}: no wildcard answer");
+
+                let proof = verify_rrset(
+                    &Rrset::new(qname, record_types::A, 1, &rdatas),
+                    &rrsigs_in(&response.answers),
+                    &keys_of(&zones),
+                    "example.com.",
+                    current_unix_timestamp(),
+                );
+                let RrsetProof::Verified {
+                    wildcard: Some(wildcard),
+                    ..
+                } = proof
+                else {
+                    panic!("nsec3={nsec3}: expected a wildcard expansion, got {proof:?}");
+                };
+                assert_eq!(wildcard, "*.example.com.");
+
+                // And the denial it owes: without it one captured answer is a
+                // valid answer for every name the wildcard reaches
+                // (RFC 4035 §3.1.3).
+                let verdict = proves_wildcard_expansion(
+                    qname,
+                    &wildcard,
+                    &nsecs_in(&response.authorities),
+                    &nsec3s_in(&response.authorities),
+                );
+                assert!(
+                    matches!(verdict, WildcardVerdict::Proved),
+                    "nsec3={nsec3}: {verdict:?}"
+                );
+            }
+        }
+
+        /// A secure delegation hands down the DS and its signature, and the NS
+        /// RRset goes out **unsigned** — it is the child's data (RFC 4035 §2.2).
+        #[test]
+        fn a_secure_referral_carries_the_ds_and_leaves_the_ns_rrset_unsigned() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_zones(DELEGATING_ZONE, nsec3);
+                let response = make_response(
+                    &query("host.secure.example.com.", record_types::A, true),
+                    &zones,
+                    &DnsMetrics::new(),
+                );
+
+                assert!(!response.authoritive, "nsec3={nsec3}");
+                let ds: Vec<RecordData> = response
+                    .authorities
+                    .iter()
+                    .filter(|r| r.rdata.rtype == record_types::DS)
+                    .map(|r| r.rdata.clone())
+                    .collect();
+                assert_eq!(ds.len(), 1, "nsec3={nsec3}: the DS is what continues the chain");
+
+                let sigs = rrsigs_in(&response.authorities);
+                let proof = verify_rrset(
+                    &Rrset::new("secure.example.com.", record_types::DS, 1, &ds),
+                    &sigs,
+                    &keys_of(&zones),
+                    "example.com.",
+                    current_unix_timestamp(),
+                );
+                assert!(
+                    matches!(proof, RrsetProof::Verified { .. }),
+                    "nsec3={nsec3}: an unsigned DS proves nothing: {proof:?}"
+                );
+                assert!(
+                    !sigs.iter().any(|s| s.type_covered == record_types::NS),
+                    "nsec3={nsec3}: the delegation's NS RRset must not be signed — every \
+                     validator ignores the signature and the type shows up in the parent's \
+                     bitmap as one that is not there"
+                );
+            }
+        }
+
+        /// An insecure delegation is the other half, and the more dangerous one:
+        /// "there is no DS here" has to be *proved*, or stripping the DS is a
+        /// downgrade to insecure and anything in the child may then be forged.
+        #[test]
+        fn an_insecure_referral_carries_a_signed_denial_of_the_ds() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_zones(DELEGATING_ZONE, nsec3);
+                let response = make_response(
+                    &query("host.plain.example.com.", record_types::A, true),
+                    &zones,
+                    &DnsMetrics::new(),
+                );
+
+                assert!(!response.authoritive, "nsec3={nsec3}");
+                assert!(
+                    !response
+                        .authorities
+                        .iter()
+                        .any(|r| r.rdata.rtype == record_types::DS),
+                    "nsec3={nsec3}: this child is not signed"
+                );
+                let denial = proves_no_ds(
+                    "plain.example.com.",
+                    &nsecs_in(&response.authorities),
+                    &nsec3s_in(&response.authorities),
+                );
+                assert!(matches!(denial, Denial::Proved), "nsec3={nsec3}: {denial:?}");
+            }
         }
 
         #[test]

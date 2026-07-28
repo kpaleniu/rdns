@@ -14,6 +14,8 @@ pub struct RateLimitConfig {
     pub burst_size: u32,
     /// Cleanup interval for inactive IPs (in seconds)
     pub cleanup_interval_secs: u64,
+    /// The most source addresses tracked at once. See [`RateLimiter`].
+    pub max_tracked: usize,
 }
 
 impl Default for RateLimitConfig {
@@ -23,6 +25,7 @@ impl Default for RateLimitConfig {
             window_size_secs: 10,        // 10 second window
             burst_size: 20,              // Allow burst of 20
             cleanup_interval_secs: 600,  // 10 minute cleanup
+            max_tracked: 10_000,         // See RateLimiter: the table is attacker-keyed
         }
     }
 }
@@ -34,7 +37,24 @@ struct TokenBucket {
     last_refill: u64,
 }
 
-/// Rate limiter using token bucket algorithm
+/// Rate limiter using token bucket algorithm.
+///
+/// Two properties here are not about rate limiting at all, and both were missing:
+///
+/// - **The table is bounded.** A bucket is created *before* anything validates
+///   the packet, so it costs an attacker one spoofed 12-byte datagram per entry,
+///   and cleanup ran only every `cleanup_interval_secs` — ten minutes of
+///   unbounded growth with IPv6 source addresses, followed by a full-map walk
+///   under the lock. Above `max_tracked` no new bucket is created and the packet
+///   is allowed on the same terms an untracked source would get, because failing
+///   *closed* here would mean one flood denies service to everybody. See
+///   [`ResponseLimiter`], which had this from the start.
+/// - **Time arithmetic saturates.** `current_unix_timestamp` is `SystemTime`, not
+///   monotonic. An NTP step backwards made `now - last_refill` underflow: in
+///   debug a panic *with the mutex held*, which poisons it and makes every later
+///   `should_allow` panic in turn — a clock correction taking the server off the
+///   air permanently — and in release a wrap to ~1.8e19, which refills every
+///   bucket to full and silently disables the limiter.
 pub struct RateLimiter {
     config: RateLimitConfig,
     buckets: Arc<Mutex<HashMap<IpAddr, TokenBucket>>>,
@@ -61,14 +81,24 @@ impl RateLimiter {
         // Cleanup old entries periodically
         self.cleanup_if_needed(now);
 
-        let mut buckets = self.buckets.lock().unwrap();
+        let Ok(mut buckets) = self.buckets.lock() else {
+            // A poisoned lock means some other thread panicked holding it. The
+            // limiter's state is unknown; allowing the query is the honest
+            // failure mode, since the alternative is a server that answers
+            // nothing at all until it is restarted.
+            return true;
+        };
+        if !buckets.contains_key(&ip) && buckets.len() >= self.config.max_tracked {
+            return true;
+        }
         let bucket = buckets.entry(ip).or_insert_with(|| TokenBucket {
             tokens: self.config.burst_size as f64,
             last_refill: now,
         });
 
-        // Refill tokens based on time elapsed
-        let time_elapsed = now - bucket.last_refill;
+        // Refill tokens based on time elapsed. Saturating because the clock is
+        // wall-clock and can step backwards.
+        let time_elapsed = now.saturating_sub(bucket.last_refill);
         let tokens_to_add = (time_elapsed as f64 / self.config.window_size_secs as f64)
             * self.config.tokens_per_window as f64;
 
@@ -96,18 +126,24 @@ impl RateLimiter {
 
     /// Clean up inactive IPs from the bucket map
     fn cleanup_if_needed(&self, now: u64) {
-        let mut last_cleanup = self.last_cleanup.lock().unwrap();
-        
-        if now - *last_cleanup < self.config.cleanup_interval_secs {
+        let Ok(mut last_cleanup) = self.last_cleanup.lock() else {
+            return;
+        };
+
+        if now.saturating_sub(*last_cleanup) < self.config.cleanup_interval_secs {
             return;
         }
 
         *last_cleanup = now;
-        let mut buckets = self.buckets.lock().unwrap();
-        
-        // Remove entries that haven't been used in the last cleanup interval
+        let Ok(mut buckets) = self.buckets.lock() else {
+            return;
+        };
+
+        // Remove entries that haven't been used in the last cleanup interval.
+        // Saturating again: a clock step backwards would otherwise underflow and
+        // keep every entry — or, in debug, panic while holding both locks.
         buckets.retain(|_, bucket| {
-            now - bucket.last_refill < self.config.cleanup_interval_secs
+            now.saturating_sub(bucket.last_refill) < self.config.cleanup_interval_secs
         });
     }
 
@@ -429,6 +465,100 @@ mod tests {
         assert!(limiter.should_allow(ip2), "different IPs should have separate buckets");
     }
 
+    /// The table an attacker keys. A bucket is created before anything validates
+    /// the packet, so one spoofed 12-byte datagram per source address is the
+    /// whole cost of making the server allocate — and with IPv6 there are as
+    /// many source addresses as the attacker cares to type.
+    ///
+    /// Bounded, the flood stops costing memory. Unbounded, the *rate limiter* was
+    /// the memory-exhaustion vector.
+    #[test]
+    fn a_flood_of_source_addresses_does_not_grow_the_table_without_bound() {
+        let config = RateLimitConfig {
+            max_tracked: 64,
+            ..RateLimitConfig::default()
+        };
+        let limiter = RateLimiter::new(config);
+
+        for i in 0..5_000u32 {
+            // Spread across the whole v4 space, as a spoofing source would.
+            limiter.should_allow(IpAddr::V4(Ipv4Addr::from(i.wrapping_mul(2_654_435_761))));
+        }
+
+        assert!(
+            limiter.get_stats().tracked_ips <= 64,
+            "tracked {} addresses with a bound of 64",
+            limiter.get_stats().tracked_ips
+        );
+    }
+
+    /// And at the bound the answer is "allow", not "deny": failing closed would
+    /// let one flood take the server off the air for every legitimate client,
+    /// which is the outcome the limiter exists to prevent.
+    #[test]
+    fn a_source_the_table_has_no_room_for_is_still_served() {
+        let config = RateLimitConfig {
+            max_tracked: 1,
+            ..RateLimitConfig::default()
+        };
+        let limiter = RateLimiter::new(config);
+        let tracked = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let untracked = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+
+        assert!(limiter.should_allow(tracked));
+        for _ in 0..100 {
+            assert!(
+                limiter.should_allow(untracked),
+                "an untracked source is not a refused source"
+            );
+        }
+        // The one address that did get a bucket is still limited normally.
+        for _ in 0..19 {
+            limiter.should_allow(tracked);
+        }
+        assert!(!limiter.should_allow(tracked), "the tracked bucket still empties");
+    }
+
+    /// A clock step backwards must not panic, and must not silently refill every
+    /// bucket either.
+    ///
+    /// `current_unix_timestamp` is wall-clock, so an NTP correction can move it
+    /// backwards. `now - bucket.last_refill` then underflowed: in debug a panic
+    /// **with the mutex held**, poisoning it so that every later `should_allow`
+    /// panicked too — a clock correction taking the server off the air until it
+    /// was restarted — and in release a wrap to ~1.8e19 tokens, which refilled
+    /// every bucket to full and turned the limiter off without saying so.
+    ///
+    /// The bucket is reached through the public API with a `last_refill` in the
+    /// future, which is what the clock stepping back looks like from here.
+    #[test]
+    fn a_clock_step_backwards_neither_panics_nor_refills_the_bucket() {
+        let limiter = RateLimiter::with_defaults();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+
+        assert!(limiter.should_allow(ip));
+        // Move the bucket's stamp an hour into the future: the same arithmetic a
+        // backwards step produces.
+        limiter
+            .buckets
+            .lock()
+            .unwrap()
+            .get_mut(&ip)
+            .expect("a bucket")
+            .last_refill = current_unix_timestamp() + 3600;
+
+        // Drain it. Without saturation the first call here refills to burst on
+        // an underflowed elapsed time, so the bucket never empties.
+        for _ in 0..19 {
+            limiter.should_allow(ip);
+        }
+        assert!(
+            !limiter.should_allow(ip),
+            "a bucket stamped in the future must not refill — that is the limiter \
+             silently switching itself off"
+        );
+    }
+
     #[test]
     fn test_rate_limiter_get_stats() {
         let limiter = RateLimiter::with_defaults();
@@ -464,6 +594,7 @@ mod tests {
             window_size_secs: 5,
             burst_size: 5,
             cleanup_interval_secs: 60,
+            ..RateLimitConfig::default()
         };
         let limiter = RateLimiter::new(config);
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -484,6 +615,7 @@ mod tests {
             window_size_secs: 10,
             burst_size: 0, // No burst allowed
             cleanup_interval_secs: 60,
+            ..RateLimitConfig::default()
         };
         let limiter = RateLimiter::new(config);
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));

@@ -163,6 +163,30 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
     let mut signed = Zone::new(origin.clone());
     let (soa_ttl, minimum) = carry_over_records(zone, &origin, &mut signed)?;
     let dnskey_ttl = publish_dnskeys(keys, &origin, soa_ttl, &mut signed);
+
+    // NSEC3PARAM goes in *before* the layout is taken, and the order is the
+    // whole of the bug this line fixes. `Layout::of` is a snapshot of which
+    // types are at which name, and every NSEC3's bitmap "MUST indicate the
+    // presence of all types present at the original owner name" (RFC 5155 §7.1)
+    // — so adding the record after the snapshot left the apex NSEC3 denying a
+    // type that is there, signed. `dnssec-verify`, `ldns-verify-zone` and
+    // `validns` all reject that zone, and worse: a validator asking for
+    // `<apex> NSEC3PARAM` with DO gets a signed NODATA proof for a record it is
+    // also being served, and an RFC 8198 aggressive-NSEC resolver — this
+    // repo's own `rdnsr` among them — then synthesizes that false NODATA for
+    // other clients out of its cache.
+    if let DenialChain::Nsec3 {
+        salt, iterations, ..
+    } = &policy.chain
+    {
+        signed.add_record(ZoneRecord {
+            name: origin.clone(),
+            ttl: dnskey_ttl,
+            class: 1,
+            rdata: nsec3param_rdata(salt, *iterations),
+        });
+    }
+
     let layout = Layout::of(&signed, &origin);
 
     let denial_ttl = minimum.min(i32::MAX as u32) as i32;
@@ -172,15 +196,7 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
             salt,
             iterations,
             opt_out,
-        } => {
-            build_nsec3_chain(&layout, salt, *iterations, *opt_out, denial_ttl, &mut signed)?;
-            signed.add_record(ZoneRecord {
-                name: origin.clone(),
-                ttl: dnskey_ttl,
-                class: 1,
-                rdata: nsec3param_rdata(salt, *iterations),
-            });
-        }
+        } => build_nsec3_chain(&layout, salt, *iterations, *opt_out, denial_ttl, &mut signed)?,
     }
 
     sign_everything(&layout, keys, policy, &mut signed)?;
@@ -896,6 +912,100 @@ ns.plain IN A  192.0.2.40
         assert!(!seen.contains(&"ns.secure.example.com.".to_string()));
     }
 
+    /// Every denial record's bitmap must list every type actually at the name it
+    /// describes (RFC 5155 §7.1, RFC 4034 §4.1.2) — checked over the whole zone,
+    /// because the class of bug is "a record was added after the layout was
+    /// taken" and it can happen at any name.
+    ///
+    /// It happened at the apex, with NSEC3PARAM. The type was inserted after
+    /// `Layout::of` snapshotted the zone, so the apex NSEC3 said NSEC3PARAM was
+    /// absent while an NSEC3PARAM record sat at the apex, signed. That is a zone
+    /// `dnssec-verify`, `ldns-verify-zone` and `validns` all reject — and worse
+    /// than a lint failure: a validator asking for the type gets a *signed*
+    /// NODATA proof for a record it is also being served, and an RFC 8198
+    /// aggressive-NSEC resolver then synthesizes that false NODATA for other
+    /// clients out of its cache.
+    #[test]
+    fn every_bitmap_lists_every_type_at_the_name_it_describes() {
+        for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
+            let zone = sign_test_zone(chain.clone());
+            let layout = Layout::of(&zone, ORIGIN);
+            let (nsecs, nsec3s) = chain_records(&zone);
+
+            for (name, entry) in &layout.names {
+                if entry.occluded {
+                    continue;
+                }
+                if entry.types.contains(&rt::NSEC3) {
+                    // An NSEC3's own owner name is invented by the hash. It is
+                    // not a name of the zone and nothing describes it.
+                    continue;
+                }
+                let mut expected = entry.published_types();
+                // The record that describes a name is not itself at it under
+                // NSEC3 — the chain lives at hashed names — so NSEC3 is never
+                // in the bitmap, while NSEC always is.
+                expected.remove(&rt::NSEC3);
+
+                let lists: Box<dyn Fn(u16) -> bool> = match &chain {
+                    DenialChain::Nsec => {
+                        let Some(nsec) = nsecs.iter().find(|n| &n.owner == name) else {
+                            panic!("{chain:?}: no NSEC at {name}");
+                        };
+                        Box::new(move |rtype| nsec.has_type(rtype))
+                    }
+                    DenialChain::Nsec3 { salt, iterations, .. } => {
+                        let hash = nsec3_hash(name, salt, *iterations).unwrap();
+                        let owner =
+                            format!("{}.{ORIGIN}", base32hex_encode(&hash).to_lowercase());
+                        let Some(nsec3) = nsec3s.iter().find(|n| n.owner == owner) else {
+                            panic!("{chain:?}: no NSEC3 for {name}");
+                        };
+                        Box::new(move |rtype| nsec3.has_type(rtype))
+                    }
+                };
+
+                for rtype in expected {
+                    assert!(
+                        lists(rtype),
+                        "{chain:?}: {name} has type {rtype}, and the denial record \
+                         describing it does not list it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The apex specifically, spelled out, because the NSEC3PARAM case is the one
+    /// that was wrong and a reader should be able to see it named.
+    #[test]
+    fn the_apex_nsec3_lists_nsec3param() {
+        let zone = sign_test_zone(DenialChain::nsec3());
+        assert_eq!(
+            zone.query(ORIGIN, rt::NSEC3PARAM).len(),
+            1,
+            "an NSEC3-signed zone publishes NSEC3PARAM at its apex (RFC 5155 §4)"
+        );
+
+        let (_, nsec3s) = chain_records(&zone);
+        let DenialChain::Nsec3 { salt, iterations, .. } = policy(DenialChain::nsec3()).chain else {
+            unreachable!()
+        };
+        let hash = nsec3_hash(ORIGIN, &salt, iterations).unwrap();
+        let owner = format!("{}.{ORIGIN}", base32hex_encode(&hash).to_lowercase());
+        let apex = nsec3s
+            .iter()
+            .find(|n| n.owner == owner)
+            .expect("an NSEC3 for the apex");
+
+        for rtype in [rt::SOA, rt::NS, rt::DNSKEY, rt::RRSIG, rt::NSEC3PARAM] {
+            assert!(
+                apex.has_type(rtype),
+                "the apex NSEC3 omits type {rtype}, which is present at the apex"
+            );
+        }
+    }
+
     #[test]
     fn an_empty_non_terminal_reads_as_nodata_rather_than_nxdomain() {
         // The reason empty non-terminals are in the chain at all.
@@ -931,10 +1041,15 @@ ns.plain IN A  192.0.2.40
             let (nsecs, nsec3s) = chain_records(&zone);
             // Both are below a name that exists, so the closest encloser is
             // not the apex — the case a chain built only from the names
-            // written in the file gets wrong. Neither is reachable by the
-            // apex wildcard either, which covers one label and no more
-            // (RFC 4592 §2.1.1); a name it *does* cover is not deniable at
-            // all, which is what the wildcard test checks from the other side.
+            // written in the file gets wrong. That is also what puts them out
+            // of the apex wildcard's reach, and the distinction matters:
+            // synthesis is not limited to one label (RFC 4592 §3.3.2), it is
+            // limited to the closest encloser (§3.3.1). `a.b.example.com.`
+            // exists as an empty non-terminal, so the source of synthesis for
+            // `x.a.b.example.com.` would have to be `*.a.b.example.com.`, and
+            // there is none. A name the wildcard *does* reach is not deniable
+            // at all, which is what the wildcard test checks from the other
+            // side.
             for absent in ["x.a.b.example.com.", "y.deep.a.b.example.com."] {
                 let denial = proves_nxdomain(absent, ORIGIN, &nsecs, &nsec3s);
                 assert!(

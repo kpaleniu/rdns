@@ -826,7 +826,24 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
         let (class, rest) = read_be!(u16, rest);
         let (ttl, rest) = read_be!(i32, rest);
         let (rdatalen, rest) = read_be!(u16, rest);
-        let rdata = &rest[..rdatalen as usize];
+        // RDLENGTH is attacker-chosen and every other length in this file is
+        // checked before it is used — `read_be!` checks its own bytes,
+        // `Label::try_from_bytes` checks before slicing, `parse_options` checks
+        // each option. This one was not, and a record declaring more RDATA than
+        // the message carries panicked the parser on a bare slice. That is
+        // reachable before any authentication on both transports, in `rdnsr`
+        // where no validator runs at all, and from a primary during a transfer —
+        // where it kills a replication task that is never restarted, so the zone
+        // silently stops refreshing until EXPIRE. `split_at` cannot be used
+        // until the length is known good, which is the whole point.
+        let rdatalen = rdatalen as usize;
+        if rest.len() < rdatalen {
+            return Err(anyhow!(
+                "RDATA declares {rdatalen} bytes but only {} remain",
+                rest.len()
+            ));
+        }
+        let (rdata, rest) = rest.split_at(rdatalen);
 
         let rdata = RecordData::from_wire(record_type, rdata, unpacker)?;
         Ok((
@@ -836,7 +853,7 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
                 ttl,
                 rdata,
             },
-            &rest[rdatalen as usize..],
+            rest,
         ))
     }
 }
@@ -1139,6 +1156,69 @@ impl DnsMessageBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record may not declare more RDATA than the message actually carries.
+    ///
+    /// This is an error, not a panic. `ResourceRecord::try_from_bytes` used to
+    /// slice `&rest[..rdatalen]` on an attacker-chosen `u16`, which is reachable
+    /// before authentication on both of `rdnsd`'s transports, in `rdnsr` with no
+    /// validator in front of it, and from a primary mid-transfer.
+    #[test]
+    fn rdlength_past_end_of_message_is_an_error() {
+        // Header: id, QR=1, qd=0, an=1, ns=0, ar=0.
+        let mut packet: Vec<u8> = vec![0x12, 0x34, 0x84, 0x00, 0, 0, 0, 1, 0, 0, 0, 0];
+        packet.push(0x00); // owner name = root
+        packet.extend_from_slice(&1u16.to_be_bytes()); // type A
+        packet.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        packet.extend_from_slice(&3600u32.to_be_bytes()); // ttl
+        packet.extend_from_slice(&0xFFFFu16.to_be_bytes()); // RDLENGTH, with nothing following
+
+        let parsed = DnsMessage::try_from_bytes(&packet);
+        assert!(
+            parsed.is_err(),
+            "a record claiming 65535 bytes of RDATA in a message that carries none \
+             must be rejected, not sliced"
+        );
+    }
+
+    /// The same shape in the additional section, which is the one that gets past
+    /// `RequestValidator::validate_packet` — OPT and TSIG legitimately live
+    /// there, so it is only count-capped, and this arrives as a well-formed
+    /// QUERY rather than as an obviously bogus response.
+    #[test]
+    fn rdlength_past_end_in_additional_section_is_an_error() {
+        // Header: id, QR=0 opcode=QUERY, qd=0, an=0, ns=0, ar=1.
+        let mut packet: Vec<u8> = vec![0x12, 0x34, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 1];
+        packet.push(0x00); // OPT owner name is always root
+        packet.extend_from_slice(&41u16.to_be_bytes()); // type OPT
+        packet.extend_from_slice(&4096u16.to_be_bytes()); // class = UDP payload size
+        packet.extend_from_slice(&0u32.to_be_bytes()); // extended rcode and flags
+        packet.extend_from_slice(&0xFFFFu16.to_be_bytes()); // RDLENGTH, with nothing following
+
+        let parsed = DnsMessage::try_from_bytes(&packet);
+        assert!(
+            parsed.is_err(),
+            "an OPT record claiming 65535 bytes of options must be rejected, not sliced"
+        );
+    }
+
+    /// A record whose RDLENGTH exactly consumes the rest of the message is
+    /// legal, and the boundary is where an off-by-one in the new check would
+    /// live — so pin it rather than only testing the failing side.
+    #[test]
+    fn rdlength_reaching_exactly_the_end_of_the_message_parses() {
+        let mut packet: Vec<u8> = vec![0x12, 0x34, 0x84, 0x00, 0, 0, 0, 1, 0, 0, 0, 0];
+        packet.push(0x00);
+        packet.extend_from_slice(&1u16.to_be_bytes()); // type A
+        packet.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        packet.extend_from_slice(&3600u32.to_be_bytes());
+        packet.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH = 4
+        packet.extend_from_slice(&[192, 0, 2, 1]); // ...and exactly 4 bytes of A rdata
+
+        let parsed = DnsMessage::try_from_bytes(&packet)
+            .expect("a record whose RDATA ends exactly at the message end is well-formed");
+        assert_eq!(parsed.answers.len(), 1);
+    }
 
     #[test]
     fn test_query_parse() {

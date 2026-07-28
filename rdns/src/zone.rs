@@ -1,7 +1,8 @@
 use crate::{ParsedRecord, RecordData};
 use crate::utils::record_type_code;
+use crate::utils::record_types as rt;
 use crate::dnssec_denial::{base32hex_decode, canonical_sort_key};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
@@ -51,6 +52,38 @@ pub struct Zone {
     /// path — the same mistake the name index exists to have fixed.
     nsec_chain: BTreeMap<Vec<u8>, usize>,
     nsec3_chain: BTreeMap<Vec<u8>, usize>,
+    /// Every ancestor, up to the apex, of a name that is in `index` — the names
+    /// that exist because something below them does.
+    ///
+    /// `index` cannot answer this: a zone holding only `deep.a.b.example.com.`
+    /// has records at one name and *four* names that exist. RFC 4592 §2.2.2
+    /// says so, and the difference is NODATA against NXDOMAIN for `a.b` and
+    /// `b` — which an RFC 8020 resolver then extends downwards, taking the
+    /// zone's own data off the internet. Kept as its own set rather than folded
+    /// into `index` because the denial path needs the literal question too, and
+    /// [`Zone::holds_name`] is where that lives.
+    non_terminals: HashSet<String>,
+}
+
+/// Why a name has an answer in this zone, or has none — the distinction
+/// RFC 1034 §4.3.2 and RFC 2308 both turn on.
+///
+/// Three of these are "the name exists" and only one is NXDOMAIN, which is the
+/// whole reason it is an enum rather than a bool: an empty non-terminal and a
+/// wildcard match are NODATA, and each owes a *different* DNSSEC proof (see
+/// [`crate::dnssec_answer::negative_proof`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameKind {
+    /// The zone holds records at this exact name.
+    Exact,
+    /// The name has descendants and no records of its own (RFC 4592 §2.2.2).
+    /// It exists, and every type at it is NODATA.
+    EmptyNonTerminal,
+    /// The name is not in the zone, and this wildcard is its source of
+    /// synthesis (RFC 4592 §3.3.1). Absolute and down-cased.
+    Wildcard(String),
+    /// Not in the zone at all: NXDOMAIN.
+    NotFound,
 }
 
 /// Which of the two chains a denial record belongs to.
@@ -68,6 +101,7 @@ impl Zone {
             index: HashMap::new(),
             nsec_chain: BTreeMap::new(),
             nsec3_chain: BTreeMap::new(),
+            non_terminals: HashSet::new(),
         }
     }
 
@@ -98,6 +132,7 @@ impl Zone {
     pub fn add_record(&mut self, record: ZoneRecord) {
         let key = self.lookup_key(&record.name);
         let position = self.records.len();
+        self.note_non_terminals(&key);
         self.index.entry(key).or_default().push(position);
         match self.chain_key(&record) {
             Some((Chain::Nsec, k)) => {
@@ -191,18 +226,21 @@ impl Zone {
 
     /// Query records by name and type.
     ///
-    /// A wildcard is consulted only when the queried name has no records of its
-    /// own: an existing name shadows the wildcard entirely, types it does not
-    /// carry included (RFC 1034 §4.3.3, RFC 4592 §2.2.1). The linear scan this
-    /// replaced returned the exact *and* the wildcard records together, merging
-    /// two owners' data into one RRset.
+    /// A wildcard is consulted only when the queried name does not exist at
+    /// all: an existing name shadows the wildcard entirely, types it does not
+    /// carry included, and so does an empty non-terminal (RFC 1034 §4.3.3,
+    /// RFC 4592 §2.2.1 and §4.4). The linear scan this replaced returned the
+    /// exact *and* the wildcard records together, merging two owners' data into
+    /// one RRset.
     pub fn query(&self, name: &str, qtype: u16) -> Vec<&ZoneRecord> {
         let key = self.lookup_key(name);
-        if let Some(at_name) = self.index.get(&key) {
-            return self.of_type(at_name, qtype);
-        }
-        match wildcard_for(&key).and_then(|w| self.index.get(&w)) {
-            Some(at_wildcard) => self.of_type(at_wildcard, qtype),
+        let positions = match self.name_kind_of_key(&key) {
+            NameKind::Exact => self.index.get(&key),
+            NameKind::Wildcard(ref wildcard) => self.index.get(wildcard),
+            NameKind::EmptyNonTerminal | NameKind::NotFound => None,
+        };
+        match positions {
+            Some(positions) => self.of_type(positions, qtype),
             None => Vec::new(),
         }
     }
@@ -221,13 +259,142 @@ impl Zone {
             })
     }
 
-    /// Whether the zone holds anything at `name` — by that name or through a
-    /// wildcard. This is the NXDOMAIN question: a name that exists with no
-    /// record of the queried type is NODATA, which is a different answer.
+    /// Whether the zone holds anything at `name` — by that name, because
+    /// something below it exists, or through a wildcard. This is the NXDOMAIN
+    /// question: a name that exists with no record of the queried type is
+    /// NODATA, which is a different answer.
     pub fn name_exists(&self, name: &str) -> bool {
-        let key = self.lookup_key(name);
-        self.index.contains_key(&key)
-            || wildcard_for(&key).is_some_and(|w| self.index.contains_key(&w))
+        !matches!(self.name_kind(name), NameKind::NotFound)
+    }
+
+    /// Why `name` has an answer here, or has none. See [`NameKind`].
+    pub fn name_kind(&self, name: &str) -> NameKind {
+        self.name_kind_of_key(&self.lookup_key(name))
+    }
+
+    /// [`Zone::name_kind`] for a name already in [`Zone::lookup_key`] form.
+    ///
+    /// The wildcard search is a closest-encloser walk, not a single lookup, and
+    /// that is the whole of the correction here. A wildcard synthesizes to any
+    /// depth: RFC 4592 §3.3.2's worked example answers `_telnet._tcp.host1.example.`
+    /// from `*.example.`, two labels down. The single `split_once` this replaced
+    /// reached exactly one label, citing §2.1.1 — which is about `*` being
+    /// special only as the leftmost label of a zone-file owner name, and says
+    /// nothing about how deep synthesis reaches.
+    ///
+    /// The walk stops at the first ancestor that exists, and the *only* wildcard
+    /// that may answer is the one directly below it (§3.3.1). Going on to try
+    /// `*.<grandparent>` would answer for a name whose parent exists, which
+    /// §4.4 forbids: an existing name — an empty non-terminal included — ends
+    /// the search whether or not it has the type asked for.
+    fn name_kind_of_key(&self, key: &str) -> NameKind {
+        if self.index.contains_key(key) {
+            return NameKind::Exact;
+        }
+        if self.non_terminals.contains(key) {
+            return NameKind::EmptyNonTerminal;
+        }
+
+        let origin = self.origin_key();
+        let mut name = key;
+        while let Some(encloser) = parent_name(name) {
+            if !is_at_or_under(encloser, &origin) {
+                // Walked out of the zone without finding anything, which means
+                // the query was never in it to begin with.
+                return NameKind::NotFound;
+            }
+            if !self.node_exists(encloser) {
+                name = encloser;
+                continue;
+            }
+            // The closest encloser. A wildcard below a zone cut is occluded —
+            // it is the child's data, not ours (RFC 4592 §2.2.1) — so a
+            // delegation between here and the apex means no synthesis at all,
+            // and the caller owes a referral instead.
+            if self.delegation_for_key(encloser).is_some() {
+                return NameKind::NotFound;
+            }
+            let wildcard = format!("*.{encloser}");
+            return if self.index.contains_key(&wildcard) {
+                NameKind::Wildcard(wildcard)
+            } else {
+                NameKind::NotFound
+            };
+        }
+        NameKind::NotFound
+    }
+
+    /// Whether this name is a node of the zone: it has records, or it has
+    /// descendants (RFC 4592 §2.2.2). Takes a lookup key.
+    fn node_exists(&self, key: &str) -> bool {
+        self.index.contains_key(key) || self.non_terminals.contains(key)
+    }
+
+    /// The delegation point at or above `name`, if the zone's authority stops
+    /// before reaching it.
+    ///
+    /// The deepest ancestor-or-self other than the apex with an NS RRset
+    /// (RFC 1034 §4.2.1). `Some` means the answer owes a referral — the NS
+    /// RRset, its glue, and AA **clear** — rather than data or a denial. The
+    /// apex is excluded because its NS RRset is this zone's own, not a cut.
+    pub fn delegation_for(&self, name: &str) -> Option<String> {
+        self.delegation_for_key(&self.lookup_key(name))
+    }
+
+    fn delegation_for_key(&self, key: &str) -> Option<String> {
+        let origin = self.origin_key();
+        let mut candidate = key;
+        loop {
+            if candidate != origin && self.has_type(candidate, rt::NS) {
+                return Some(candidate.to_string());
+            }
+            if candidate == origin {
+                return None;
+            }
+            candidate = parent_name(candidate)?;
+            if !is_at_or_under(candidate, &origin) {
+                return None;
+            }
+        }
+    }
+
+    /// Whether there is an RRset of `rtype` at exactly this key.
+    fn has_type(&self, key: &str, rtype: u16) -> bool {
+        self.index.get(key).is_some_and(|positions| {
+            positions
+                .iter()
+                .any(|&i| record_type_code(&self.records[i].rdata) == rtype)
+        })
+    }
+
+    /// Record every ancestor of `key`, up to the apex, as a name that exists.
+    ///
+    /// Stops as soon as an ancestor is already known, because ancestors are
+    /// always noted all the way to the apex — so one being present means the
+    /// rest are too. That makes the whole of index construction linear in the
+    /// zone rather than in names × labels.
+    fn note_non_terminals(&mut self, key: &str) {
+        let origin = self.origin_key();
+        let mut name = key.to_string();
+        while let Some(parent) = parent_name(&name) {
+            if !is_at_or_under(parent, &origin) {
+                // A record whose owner is outside the zone — glue written with
+                // a foreign absolute name, say. Its ancestors are somebody
+                // else's names and must not be claimed to exist here.
+                return;
+            }
+            let parent = parent.to_string();
+            let reached_apex = parent == origin;
+            if !self.non_terminals.insert(parent.clone()) || reached_apex {
+                return;
+            }
+            name = parent;
+        }
+    }
+
+    /// The apex in [`Zone::lookup_key`] form.
+    fn origin_key(&self) -> String {
+        self.origin.to_ascii_lowercase()
     }
 
     /// The records at these positions that are of `qtype`.
@@ -247,7 +414,9 @@ impl Zone {
             .map(|r| self.lookup_key(&r.name))
             .collect();
         self.index.clear();
+        self.non_terminals.clear();
         for (position, key) in keys.into_iter().enumerate() {
+            self.note_non_terminals(&key);
             self.index.entry(key).or_default().push(position);
         }
 
@@ -293,7 +462,11 @@ impl Zone {
         if record_name == query_name {
             return true;
         }
-        wildcard_for(&query_name).is_some_and(|w| w == record_name)
+        // Which wildcard reaches a name is a question about the whole zone, not
+        // about the two names — the closest encloser decides it. Asking
+        // `name_kind` rather than re-deriving it here is what keeps this in step
+        // with the index instead of drifting from it.
+        matches!(self.name_kind_of_key(&query_name), NameKind::Wildcard(w) if w == record_name)
     }
 
     /// Normalize domain names to absolute form with trailing dot
@@ -316,14 +489,30 @@ fn absolutize(name: &str, origin: &str) -> String {
     }
 }
 
-/// The wildcard name that could answer for `name`: its first label replaced by
-/// `*`. A wildcard covers one label and only one (RFC 4592 §2.1.1) — nothing
-/// deeper — so this single lookup is the whole of wildcard matching.
-///
-/// `None` only for a name with no labels at all.
-fn wildcard_for(name: &str) -> Option<String> {
+/// The parent of an absolute name: its first label removed. `None` at the root,
+/// which is what terminates every walk up the tree.
+fn parent_name(name: &str) -> Option<&str> {
+    if name == "." {
+        return None;
+    }
     let (_first_label, rest) = name.split_once('.')?;
-    Some(format!("*.{rest}"))
+    Some(if rest.is_empty() { "." } else { rest })
+}
+
+/// Whether `name` is `origin` or sits below it. Both absolute and down-cased.
+fn is_at_or_under(name: &str, origin: &str) -> bool {
+    if origin == "." {
+        return true;
+    }
+    if name == origin {
+        return true;
+    }
+    // Suffix alone is not enough: `notexample.com.` ends with `example.com.`
+    // and is a different zone's name entirely, so the boundary has to land on
+    // a label separator.
+    name.len() > origin.len()
+        && name.ends_with(origin)
+        && name.as_bytes()[name.len() - origin.len() - 1] == b'.'
 }
 
 /// A name with its trailing dot.
@@ -720,7 +909,52 @@ fn parse_zone_file_with_base(
         owner: None,
     };
     parse_into(&mut zone, content, &mut state, base_dir, 0)?;
+    check_cname_exclusivity(&zone)?;
     Ok(zone)
+}
+
+/// RFC 1034 §3.6.2: a CNAME must be the only type at its owner name.
+///
+/// Refused at load rather than coped with at query time, because there is no
+/// correct answer for the shape. An alias says "this name is really that name",
+/// so data beside it contradicts it, and a server has to pick one — which means
+/// two servers loading the same file answer differently. The exceptions are the
+/// three types that describe the name rather than name it: RRSIG signs the
+/// CNAME, and NSEC/NSEC3 deny the types around it (RFC 4035 §2.5).
+fn check_cname_exclusivity(zone: &Zone) -> Result<(), String> {
+    let mut by_name: HashMap<String, (bool, Vec<u16>)> = HashMap::new();
+    for record in zone.records() {
+        let rtype = record_type_code(&record.rdata);
+        if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3) {
+            continue;
+        }
+        let entry = by_name
+            .entry(zone.lookup_key(&record.name))
+            .or_insert((false, Vec::new()));
+        if rtype == rt::CNAME {
+            entry.0 = true;
+        }
+        if !entry.1.contains(&rtype) {
+            entry.1.push(rtype);
+        }
+    }
+
+    for (name, (has_cname, types)) in by_name {
+        if has_cname && types.len() > 1 {
+            let others: Vec<String> = types
+                .iter()
+                .filter(|&&t| t != rt::CNAME)
+                .map(|t| t.to_string())
+                .collect();
+            return Err(format!(
+                "{name} has a CNAME and also type(s) {} — RFC 1034 §3.6.2 allows a CNAME to be \
+                 the only type at a name, and a resolver given both has no way to know which \
+                 answer it was meant to get",
+                others.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Read `content` into `zone`. Recurses for `$INCLUDE`, hence `depth`.
@@ -1247,10 +1481,143 @@ mail IN A   192.0.2.3
     fn test_wildcard_answers_a_name_that_does_not_exist() {
         let zone = parse_zone_file("* IN A 192.0.2.9\n", "example.com.").unwrap();
         assert_eq!(zone.query("anything.example.com.", 1).len(), 1);
-        // A wildcard covers one label and only one (RFC 4592 §2.1.1).
-        assert!(zone.query("a.b.example.com.", 1).is_empty());
         // And it does not answer for the name it hangs off.
         assert!(zone.query("example.com.", 1).is_empty());
+    }
+
+    /// RFC 4592 §3.3.2's own worked example, which is the authority on how deep
+    /// synthesis reaches: `*.example.` answers `_telnet._tcp.host1.example.` —
+    /// three labels below the wildcard's parent.
+    ///
+    /// This asserted the opposite for a long time, citing §2.1.1. That section
+    /// is about `*` being special only as the **leftmost label of a zone-file
+    /// owner name**; it says nothing about matching depth. The test agreed with
+    /// the code because both were written from the same misreading, which is why
+    /// a green suite was no evidence here.
+    #[test]
+    fn test_a_wildcard_synthesizes_at_any_depth() {
+        let zone = parse_zone_file("* IN A 192.0.2.9\n", "example.").unwrap();
+        assert_eq!(
+            zone.query("_telnet._tcp.host1.example.", 1).len(),
+            1,
+            "RFC 4592 §3.3.2 synthesizes this from *.example."
+        );
+        assert_eq!(zone.query("a.b.example.", 1).len(), 1);
+        assert!(zone.name_exists("a.b.c.d.e.f.example."));
+        assert_eq!(
+            zone.name_kind("a.b.example."),
+            NameKind::Wildcard("*.example.".to_string())
+        );
+    }
+
+    /// An existing name ends the search, whether or not it has the type asked
+    /// for and whether or not it has records at all (RFC 4592 §4.4).
+    ///
+    /// The wildcard at the apex must not reach past `b.example.com.` — which
+    /// exists as an empty non-terminal — to answer for names under it. Only
+    /// `*.b.example.com.` could do that, and there isn't one.
+    #[test]
+    fn test_an_existing_name_stops_the_wildcard_search() {
+        let zone =
+            parse_zone_file("* IN A 192.0.2.9\ndeep.a.b IN TXT \"x\"\n", "example.com.").unwrap();
+
+        assert_eq!(zone.query("other.example.com.", 1).len(), 1, "nothing above it");
+        assert!(
+            zone.query("x.a.b.example.com.", 1).is_empty(),
+            "a.b exists, so *.example.com. is not this name's source of synthesis"
+        );
+        assert_eq!(
+            zone.name_kind("x.a.b.example.com."),
+            NameKind::NotFound,
+            "NXDOMAIN: the closest encloser is a.b, and *.a.b does not exist"
+        );
+    }
+
+    /// A wildcard below a zone cut is the child's data, not ours (RFC 4592
+    /// §2.2.1), so it synthesizes nothing here — the answer owes a referral.
+    #[test]
+    fn test_no_synthesis_at_or_below_a_delegation() {
+        let zone = parse_zone_file(
+            "@ IN SOA ns1 admin 1 3600 600 604800 300\n\
+             @ IN NS ns1\n\
+             ns1 IN A 192.0.2.1\n\
+             sub IN NS ns.sub\n\
+             ns.sub IN A 192.0.2.2\n\
+             *.sub IN A 192.0.2.3\n",
+            "example.com.",
+        )
+        .unwrap();
+
+        assert_eq!(
+            zone.delegation_for("anything.sub.example.com.").as_deref(),
+            Some("sub.example.com."),
+        );
+        assert_eq!(
+            zone.name_kind("anything.sub.example.com."),
+            NameKind::NotFound,
+            "occluded: the wildcard is below the cut, so it is not ours to expand"
+        );
+        // The apex NS RRset is not a cut — the zone starts there, it does not
+        // stop there.
+        assert_eq!(zone.delegation_for("www.example.com."), None);
+        // A query at the cut itself is still a referral.
+        assert_eq!(
+            zone.delegation_for("sub.example.com.").as_deref(),
+            Some("sub.example.com.")
+        );
+    }
+
+    /// An empty non-terminal exists (RFC 4592 §2.2.2): a name with descendants
+    /// and no records of its own is NODATA, not NXDOMAIN.
+    ///
+    /// The consequence of getting this wrong is that the zone takes *its own
+    /// data* offline — an RFC 8020 resolver caches the NXDOMAIN for `a.b` and
+    /// extends it to everything below, `deep.a.b` included.
+    #[test]
+    fn test_empty_non_terminals_exist() {
+        let zone = parse_zone_file("deep.a.b IN TXT \"down here\"\n", "example.com.").unwrap();
+
+        for ent in ["a.b.example.com.", "b.example.com.", "example.com."] {
+            assert_eq!(
+                zone.name_kind(ent),
+                NameKind::EmptyNonTerminal,
+                "{ent} has descendants, so it exists"
+            );
+            assert!(zone.name_exists(ent), "{ent}");
+            assert!(
+                !zone.holds_name(ent),
+                "{ent} still holds no records of its own — the denial path needs that answer"
+            );
+            assert!(zone.query(ent, 16).is_empty(), "{ent}: NODATA, no records");
+        }
+
+        assert_eq!(zone.name_kind("deep.a.b.example.com."), NameKind::Exact);
+        assert_eq!(zone.name_kind("gone.a.b.example.com."), NameKind::NotFound);
+        // Names outside the zone are not conjured into existence by the walk.
+        assert_eq!(zone.name_kind("com."), NameKind::NotFound);
+        assert_eq!(zone.name_kind("elsewhere.test."), NameKind::NotFound);
+    }
+
+    /// RFC 1034 §3.6.2: a CNAME is the only type at its owner, and the load
+    /// fails rather than the server picking one at query time.
+    #[test]
+    fn test_a_cname_may_not_share_its_owner_name() {
+        let err = parse_zone_file(
+            "www IN CNAME host.example.com.\nwww IN A 192.0.2.1\n",
+            "example.com.",
+        )
+        .unwrap_err();
+        assert!(err.contains("CNAME"), "the error should say why: {err}");
+
+        // RRSIG, NSEC and NSEC3 are the exceptions — they describe the name
+        // rather than name it (RFC 4035 §2.5), and a signed zone with a CNAME in
+        // it has all three.
+        parse_zone_file(
+            "www IN CNAME host.example.com.\n\
+             www IN NSEC x.example.com. CNAME RRSIG NSEC\n",
+            "example.com.",
+        )
+        .expect("a signed CNAME is not a conflict");
     }
 
     /// An existing name shadows the wildcard completely — including for types it
@@ -1283,8 +1650,8 @@ mail IN A   192.0.2.3
             "through the wildcard — NODATA, not NXDOMAIN"
         );
         assert!(
-            !zone.name_exists("a.b.example.com."),
-            "two labels down, past what the wildcard reaches"
+            zone.name_exists("a.b.example.com."),
+            "the wildcard reaches any depth (RFC 4592 §3.3.2) — NODATA, not NXDOMAIN"
         );
         assert!(!zone.name_exists("elsewhere.test."));
     }

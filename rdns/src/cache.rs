@@ -1,7 +1,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use crate::ResourceRecord;
-use crate::utils::current_unix_timestamp;
+use crate::utils::{ascii_lowered, current_unix_timestamp};
+
+/// The longest anything is cached, whatever the record says.
+///
+/// RFC 8767 §4 suggests a day as the ceiling, and the reason to have one at all
+/// is that a TTL is a promise about how long an answer stays *correct*, made by
+/// whoever wrote the zone — and a wrong one is how a stale answer outlives the
+/// fix. It is also the second line of defence behind the clamp below: a bug that
+/// lets a nonsense TTL through can then cost a day rather than the life of the
+/// process.
+const MAX_CACHE_TTL: u64 = 86_400;
 
 /// DNS cache entry with TTL expiration
 #[derive(Debug, Clone)]
@@ -62,7 +72,14 @@ impl DnsCache {
         let now = current_unix_timestamp();
         let mut cache = self.cache.lock().unwrap();
 
-        let key = (name.to_lowercase(), qtype);
+        // ASCII case folding, not Unicode. DNS is case-insensitive over ASCII
+        // and nothing else (RFC 4343), and `str::to_lowercase` applies the full
+        // Unicode mapping — which folds codepoints *into* ASCII. U+212A KELVIN
+        // SIGN lowercases to `k`, so it and `k.example.com.` shared one entry:
+        // two different owner names, different bytes on the wire, one cache
+        // slot. `zone.rs` had the comment explaining this and the cache drifted
+        // from it, so the helper now lives in `utils` where both reach it.
+        let key = (ascii_lowered(name), qtype);
 
         // Check if entry exists and is not expired
         if let Some(entry) = cache.get(&key) {
@@ -100,15 +117,34 @@ impl DnsCache {
         }
 
         let now = current_unix_timestamp();
-        
-        // Find minimum TTL from records
-        let min_ttl = records.iter()
-            .map(|r| r.ttl as u64)
+
+        // An RRset is cached for the shortest TTL in it, and every step of
+        // getting there is a place this went wrong.
+        //
+        // `ResourceRecord::ttl` is an `i32` straight off the wire, so a TTL with
+        // the high bit set parses *negative*. `-1 as u64` is `u64::MAX`, `min`
+        // then picked it as the smallest, and `is_expired` was false for the
+        // life of the process: an entry pinned forever, immune to the re-query
+        // that would otherwise correct it. Poison one answer and it stays
+        // poisoned until the daemon restarts. RFC 2181 §8 says to treat a
+        // received TTL with the high bit set as zero, which `.max(0)` does
+        // *before* the widening rather than after.
+        //
+        // `negative_cache` and `nsec_cache` already clamped; this cache and the
+        // two `rr.ttl.max(0)` sites in `resolver` that write into it did not
+        // agree about whose job it was, which is how a check that exists three
+        // times over is still missing in one place.
+        let min_ttl = records
+            .iter()
+            .map(|r| (r.ttl.max(0) as u64).min(MAX_CACHE_TTL))
             .min()
             .unwrap_or(300); // Default 5 minutes if no TTL
 
-        let expires_at = now + min_ttl;
-        
+        // Saturating because `now + ttl` on a clock far in the future is a debug
+        // panic and a release wrap, and a wrapped expiry is an entry that has
+        // already expired — or never does.
+        let expires_at = now.saturating_add(min_ttl);
+
         let mut cache = self.cache.lock().unwrap();
         
         // Evict oldest entries if cache is full
@@ -116,7 +152,7 @@ impl DnsCache {
             self.evict_oldest(&mut cache);
         }
 
-        let key = (name.to_lowercase(), qtype);
+        let key = (ascii_lowered(name), qtype);
         cache.insert(key, CacheEntry {
             records,
             expires_at,
@@ -277,6 +313,59 @@ mod tests {
         
         let retrieved = cache.get("example.com.", 1);
         assert!(retrieved.is_some()); // Still valid within 100 seconds
+    }
+
+    /// A TTL with the high bit set parses negative off the wire, and the widening
+    /// to `u64` used to sign-extend it into `u64::MAX` — an entry that never
+    /// expires, in a cache that exists so answers *do*. RFC 2181 §8: treat it as
+    /// zero.
+    ///
+    /// Written as an expiry check rather than by reading the private field,
+    /// because "never expires" is the bug and the field is only how it happened.
+    #[test]
+    fn a_negative_ttl_does_not_pin_an_entry_forever() {
+        for ttl in [-1, i32::MIN, -3600] {
+            let cache = DnsCache::with_defaults();
+            cache.put("example.com.", 1, vec![create_test_record("example.com.", ttl)]);
+            assert!(
+                cache.get("example.com.", 1).is_none(),
+                "a TTL of {ttl} means zero seconds, not forever"
+            );
+        }
+    }
+
+    /// And a TTL nobody should be believed about is capped rather than honoured.
+    /// `i32::MAX` seconds is 68 years.
+    #[test]
+    fn an_absurd_ttl_is_capped() {
+        let cache = DnsCache::with_defaults();
+        cache.put(
+            "example.com.",
+            1,
+            vec![create_test_record("example.com.", i32::MAX)],
+        );
+        let expires_at = cache.cache.lock().unwrap()[&("example.com.".to_string(), 1)].expires_at;
+        assert!(
+            expires_at <= current_unix_timestamp() + MAX_CACHE_TTL,
+            "an entry may not outlive the ceiling"
+        );
+    }
+
+    /// DNS folds case over ASCII and nothing else (RFC 4343). U+212A KELVIN SIGN
+    /// lowercases to `k` under Unicode rules, so a Unicode-folded key merged two
+    /// names that are different bytes on the wire into one cache entry — and the
+    /// second name's owner then answered for the first.
+    #[test]
+    fn distinct_names_that_unicode_would_fold_together_stay_distinct() {
+        let cache = DnsCache::with_defaults();
+        let kelvin = "\u{212A}.example.com.";
+        cache.put(kelvin, 1, vec![create_test_record(kelvin, 300)]);
+
+        assert!(cache.get(kelvin, 1).is_some(), "its own name still finds it");
+        assert!(
+            cache.get("k.example.com.", 1).is_none(),
+            "a different owner name must not share the entry"
+        );
     }
 
     #[test]

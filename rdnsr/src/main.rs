@@ -11,6 +11,7 @@ use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
 use rdns::special_names;
 use rdns::utils::record_types;
+use rdns::utils::{recv_error_is_transient, UDP_RECEIVE_BUFFER};
 use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, QuerySection, ResourceRecord, ResponseCode, EDNS_VERSION,
     OPT_RECORD_TYPE,
@@ -448,26 +449,19 @@ async fn udp_main(
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
 ) -> Result<(), std::io::Error> {
-    let mut buf = [0u8; 4096];
+    // Sized for any datagram a client may send, not for the payload size we
+    // advertise: on Windows an oversized datagram fails the receive rather than
+    // truncating, and a failed receive ends this loop and the process with it.
+    let mut buf = vec![0u8; UDP_RECEIVE_BUFFER];
     loop {
         let (n, peer) = match socket.recv_from(&mut buf).await {
             Ok(received) => received,
-            // An ICMP report about a datagram we already sent — a client that
-            // closed its socket before our reply landed. Windows surfaces it as
-            // an error on the *next* receive (WSAECONNRESET), and treating it as
-            // fatal meant any such client could stop the resolver. It says
-            // nothing about this socket, so carry on receiving.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::NetworkUnreachable
-                        | std::io::ErrorKind::HostUnreachable
-                ) =>
-            {
-                continue
-            }
+            // An ICMP report about a datagram we already sent, or a datagram
+            // that did not fit — neither says anything about this socket, and
+            // both used to end the loop. See `recv_error_is_transient`, which
+            // this shares with `rdnsd` precisely because the two copies had
+            // already drifted.
+            Err(e) if recv_error_is_transient(&e) => continue,
             Err(e) => return Err(e),
         };
         let data = buf[..n].to_vec();
