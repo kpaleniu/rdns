@@ -1,0 +1,12 @@
+# Commits that changed formatting only, and should not show up in `git blame`.
+#
+# Enable it once per clone:
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Only add a revision here if it is *purely* mechanical — see CLAUDE.md §12. A
+# commit listed here is one whose authorship git will hide, so anything with a
+# real change in it must not be on this list.
+
+# cargo fmt --all: the first run, 36 files. The repo predates the formatter.
+15e9aa6bea1fd0581839421f0349d6d04e9cae72
