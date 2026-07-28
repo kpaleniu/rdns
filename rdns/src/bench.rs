@@ -4,11 +4,11 @@
 
 #[cfg(test)]
 mod benches {
+    use crate::cache::DnsCache;
+    use crate::logging::QueryLogger;
+    use crate::metrics::DnsMetrics;
     use crate::security::RateLimiter;
     use crate::validation::RequestValidator;
-    use crate::logging::QueryLogger;
-    use crate::cache::DnsCache;
-    use crate::metrics::DnsMetrics;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Instant;
 
@@ -33,7 +33,11 @@ mod benches {
         );
 
         // Sanity check: should be very fast (>100k ops/sec)
-        assert!(ops_per_sec > 100_000.0, "rate limiter too slow: {:.0} ops/sec", ops_per_sec);
+        assert!(
+            ops_per_sec > 100_000.0,
+            "rate limiter too slow: {:.0} ops/sec",
+            ops_per_sec
+        );
     }
 
     #[test]
@@ -69,7 +73,11 @@ mod benches {
         );
 
         // Sanity check: should be very fast (>50k ops/sec)
-        assert!(ops_per_sec > 50_000.0, "validator too slow: {:.0} ops/sec", ops_per_sec);
+        assert!(
+            ops_per_sec > 50_000.0,
+            "validator too slow: {:.0} ops/sec",
+            ops_per_sec
+        );
     }
 
     #[test]
@@ -97,7 +105,11 @@ mod benches {
         // said nothing about the code. A regression that matters, like a write
         // or an allocation per call, costs an order of magnitude; 10k catches
         // that and survives a busy machine.
-        assert!(ops_per_sec > 10_000.0, "logger too slow: {:.0} ops/sec", ops_per_sec);
+        assert!(
+            ops_per_sec > 10_000.0,
+            "logger too slow: {:.0} ops/sec",
+            ops_per_sec
+        );
     }
 
     #[test]
@@ -121,7 +133,11 @@ mod benches {
         );
 
         // Sanity check: should be fast (>50k ops/sec with mutex)
-        assert!(ops_per_sec > 50_000.0, "cache get too slow: {:.0} ops/sec", ops_per_sec);
+        assert!(
+            ops_per_sec > 50_000.0,
+            "cache get too slow: {:.0} ops/sec",
+            ops_per_sec
+        );
     }
 
     #[test]
@@ -131,7 +147,9 @@ mod benches {
 
         let start = Instant::now();
         for _ in 0..iterations {
-            metrics.queries_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .queries_received
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             metrics.track_query_type(1);
         }
         let elapsed = start.elapsed();
@@ -145,7 +163,11 @@ mod benches {
         );
 
         // Sanity check: should be extremely fast (atomic operations)
-        assert!(ops_per_sec > 1_000_000.0, "metrics too slow: {:.0} ops/sec", ops_per_sec);
+        assert!(
+            ops_per_sec > 1_000_000.0,
+            "metrics too slow: {:.0} ops/sec",
+            ops_per_sec
+        );
     }
 
     #[test]
@@ -175,14 +197,16 @@ mod benches {
         let iterations = 5_000;
         let start = Instant::now();
         for i in 0..iterations {
-            metrics.queries_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            
+            metrics
+                .queries_received
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             if limiter.should_allow(ip) {
                 let validation = validator.validate_packet(&packet, false);
                 if validation.is_valid() {
                     logger.log_query(ip, Some(1));
                     metrics.track_query_type(1);
-                    
+
                     // Cache get
                     let name = format!("google{}.com.", i % 10);
                     let _ = cache.get(&name, 1);
@@ -200,14 +224,18 @@ mod benches {
         );
 
         // Sanity check: should handle at least 10k ops/sec combined
-        assert!(ops_per_sec > 10_000.0, "pipeline too slow: {:.0} ops/sec", ops_per_sec);
+        assert!(
+            ops_per_sec > 10_000.0,
+            "pipeline too slow: {:.0} ops/sec",
+            ops_per_sec
+        );
     }
 
     #[test]
     fn bench_nested_record_type_matching() {
         // Performance review: nested enum pattern matching in zone queries
         // This tests the hot path: zone.query() -> record_type() matching
-        use crate::{ResourceRecord, RecordData, ParsedRecord};
+        use crate::{ParsedRecord, RecordData, ResourceRecord};
         use std::net::{Ipv4Addr, Ipv6Addr};
 
         let build = |parsed: ParsedRecord| RecordData::from_parsed(&parsed).unwrap();
@@ -237,7 +265,9 @@ mod benches {
                 name: "ipv6.example.com.".to_string(),
                 class: 1,
                 ttl: 3600,
-                rdata: build(ParsedRecord::AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+                rdata: build(ParsedRecord::AAAA(Ipv6Addr::new(
+                    0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                ))),
             },
             ResourceRecord {
                 name: "example.com.".to_string(),
@@ -286,19 +316,24 @@ mod benches {
         // Gross-regression floor, not a benchmark: a plain field read should never
         // drop to parse-like cost. Kept well below the observed debug-build rate
         // (~150M ops/sec) so parallel-test CPU contention doesn't make it flaky.
-        assert!(ops_per_sec > 10_000_000.0, "type lookup too slow: {:.0} ops/sec", ops_per_sec);
+        assert!(
+            ops_per_sec > 10_000_000.0,
+            "type lookup too slow: {:.0} ops/sec",
+            ops_per_sec
+        );
     }
 
     #[test]
     fn bench_recorddata_clone_performance() {
         // Test cloning performance of RecordData (refactoring impact on cache/storage)
-        use crate::{RecordData, ParsedRecord};
+        use crate::{ParsedRecord, RecordData};
 
         // Most common case: a name-bearing record (NS/CNAME/MX/TXT).
         let mx_record = RecordData::from_parsed(&ParsedRecord::MX {
             preference: 10,
             exchange: "mail.example.com.".to_string(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // Less common: DNSSEC with a large key.
         let dnskey_record = RecordData::from_parsed(&ParsedRecord::DNSKEY {
@@ -306,7 +341,8 @@ mod benches {
             protocol: 3,
             algorithm: 8,
             public_key: vec![0; 256], // 256-byte RSA public key
-        }).unwrap();
+        })
+        .unwrap();
 
         let iterations = 100_000;
 
@@ -338,7 +374,10 @@ mod benches {
         );
 
         // Should be reasonably fast (String clone is cheap unless strings are huge)
-        assert!(standard_ops_per_sec > 1_000_000.0, "StandardRecord clone too slow");
+        assert!(
+            standard_ops_per_sec > 1_000_000.0,
+            "StandardRecord clone too slow"
+        );
     }
 
     /// Zone lookup on a zone big enough for the difference to matter.

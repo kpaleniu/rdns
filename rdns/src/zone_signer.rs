@@ -33,11 +33,11 @@ use crate::dnssec_denial::{
     base32hex_encode, build_type_bitmap, canonical_sort_key, nsec3_hash, MAX_NSEC3_ITERATIONS,
 };
 use crate::dnssec_key::SigningKey;
+use crate::error::DnssecError;
+use crate::error::DnssecResult as Result;
 use crate::utils::record_types as rt;
 use crate::zone::{Zone, ZoneRecord};
 use crate::{ParsedRecord, RecordData};
-use crate::error::DnssecError;
-use crate::error::DnssecResult as Result;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// How a zone proves that a name is not in it.
@@ -156,8 +156,7 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
     if policy.expiration <= policy.inception {
         return Err(DnssecError::signing(format!(
             "a signature that expires at {} cannot have been made at {}",
-            policy.expiration,
-            policy.inception,
+            policy.expiration, policy.inception,
         )));
     }
 
@@ -197,7 +196,14 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
             salt,
             iterations,
             opt_out,
-        } => build_nsec3_chain(&layout, salt, *iterations, *opt_out, denial_ttl, &mut signed)?,
+        } => build_nsec3_chain(
+            &layout,
+            salt,
+            *iterations,
+            *opt_out,
+            denial_ttl,
+            &mut signed,
+        )?,
     }
 
     sign_everything(&layout, keys, policy, &mut signed)?;
@@ -210,7 +216,9 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
 /// signatures nobody can use.
 fn check_keys(keys: &[SigningKey], origin: &str) -> Result<()> {
     if keys.is_empty() {
-        return Err(DnssecError::signing(format!("no keys to sign {origin} with")));
+        return Err(DnssecError::signing(format!(
+            "no keys to sign {origin} with"
+        )));
     }
     for key in keys {
         if key.owner() != origin {
@@ -247,8 +255,7 @@ fn carry_over_records(zone: &Zone, origin: &str, signed: &mut Zone) -> Result<(i
             return Err(DnssecError::signing(format!(
                 "{} carries class {}, and DNSSEC is defined per class — a zone mixing them has \
                  no single chain to sign",
-                record.name,
-                record.class,
+                record.name, record.class,
             )));
         }
         let name = canonical_name(&zone.normalize_name(&record.name));
@@ -259,7 +266,9 @@ fn carry_over_records(zone: &Zone, origin: &str, signed: &mut Zone) -> Result<(i
         }
         if record.rdata.rtype == rt::SOA && name == origin {
             let ParsedRecord::SOA { minimum, .. } = record.rdata.parse()? else {
-                return Err(DnssecError::signing("the apex SOA does not parse as an SOA"));
+                return Err(DnssecError::signing(
+                    "the apex SOA does not parse as an SOA",
+                ));
             };
             soa = Some((record.ttl, minimum));
         }
@@ -267,7 +276,10 @@ fn carry_over_records(zone: &Zone, origin: &str, signed: &mut Zone) -> Result<(i
         ttls.entry(key)
             .and_modify(|t| *t = (*t).min(record.ttl))
             .or_insert(record.ttl);
-        carried.push(ZoneRecord { name, ..record.clone() });
+        carried.push(ZoneRecord {
+            name,
+            ..record.clone()
+        });
     }
 
     for mut record in carried {
@@ -534,8 +546,7 @@ fn build_nsec3_chain(
     if let Some(window) = hashed.windows(2).find(|w| w[0].0 == w[1].0) {
         return Err(DnssecError::signing(format!(
             "{} and {} have the same NSEC3 hash — pick a different salt",
-            window[0].1,
-            window[1].1,
+            window[0].1, window[1].1,
         )));
     }
 
@@ -561,7 +572,11 @@ fn build_nsec3_chain(
         })
         .map_err(|e| DnssecError::key(format!("encoding an NSEC3: {e}")))?;
         signed.add_record(ZoneRecord {
-            name: format!("{}.{}", base32hex_encode(hash).to_lowercase(), layout.origin),
+            name: format!(
+                "{}.{}",
+                base32hex_encode(hash).to_lowercase(),
+                layout.origin
+            ),
             ttl,
             class: 1,
             rdata,
@@ -638,7 +653,9 @@ fn sign_everything(
         for key in signers.iter() {
             let sig = key
                 .sign_rrset(&rrset, original_ttl, policy.inception, policy.expiration)
-                .map_err(|e| DnssecError::key(format!("signing the {rtype} RRset at {name}: {e}")))?;
+                .map_err(|e| {
+                    DnssecError::key(format!("signing the {rtype} RRset at {name}: {e}"))
+                })?;
             signatures.push(ZoneRecord {
                 name: name.clone(),
                 ttl,
@@ -957,10 +974,11 @@ ns.plain IN A  192.0.2.40
                         };
                         Box::new(move |rtype| nsec.has_type(rtype))
                     }
-                    DenialChain::Nsec3 { salt, iterations, .. } => {
+                    DenialChain::Nsec3 {
+                        salt, iterations, ..
+                    } => {
                         let hash = nsec3_hash(name, salt, *iterations).unwrap();
-                        let owner =
-                            format!("{}.{ORIGIN}", base32hex_encode(&hash).to_lowercase());
+                        let owner = format!("{}.{ORIGIN}", base32hex_encode(&hash).to_lowercase());
                         let Some(nsec3) = nsec3s.iter().find(|n| n.owner == owner) else {
                             panic!("{chain:?}: no NSEC3 for {name}");
                         };
@@ -991,7 +1009,10 @@ ns.plain IN A  192.0.2.40
         );
 
         let (_, nsec3s) = chain_records(&zone);
-        let DenialChain::Nsec3 { salt, iterations, .. } = policy(DenialChain::nsec3()).chain else {
+        let DenialChain::Nsec3 {
+            salt, iterations, ..
+        } = policy(DenialChain::nsec3()).chain
+        else {
             unreachable!()
         };
         let hash = nsec3_hash(ORIGIN, &salt, iterations).unwrap();
@@ -1164,11 +1185,7 @@ ns.plain IN A  192.0.2.40
         let (_, nsec3s) = chain_records(&zone);
         assert!(nsec3s.iter().all(|n| n.opt_out()));
 
-        let matched = |name: &str| {
-            nsec3s
-                .iter()
-                .any(|n| n.matches(name).unwrap_or(false))
-        };
+        let matched = |name: &str| nsec3s.iter().any(|n| n.matches(name).unwrap_or(false));
         // No DS, so opt-out leaves it out: nothing matches its hash.
         assert!(
             !matched("plain.example.com."),
@@ -1257,7 +1274,12 @@ ns.plain IN A  192.0.2.40
         let once = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).unwrap();
         let twice = sign_zone(&once, &keys, &policy(DenialChain::Nsec)).unwrap();
 
-        let count = |z: &Zone, rtype: u16| z.records().iter().filter(|r| r.rdata.rtype == rtype).count();
+        let count = |z: &Zone, rtype: u16| {
+            z.records()
+                .iter()
+                .filter(|r| r.rdata.rtype == rtype)
+                .count()
+        };
         assert_eq!(count(&once, rt::NSEC), count(&twice, rt::NSEC));
         assert_eq!(count(&once, rt::RRSIG), count(&twice, rt::RRSIG));
         assert_eq!(count(&once, rt::DNSKEY), count(&twice, rt::DNSKEY));
@@ -1271,12 +1293,11 @@ ns.plain IN A  192.0.2.40
 
     #[test]
     fn a_key_published_at_another_name_is_refused() {
-        let wrong = vec![SigningKey::generate(
-            SigningAlgorithm::Ed25519,
-            "example.net.",
-            DNSKEY_FLAG_ZONE,
-        )
-        .unwrap()];
+        let wrong =
+            vec![
+                SigningKey::generate(SigningAlgorithm::Ed25519, "example.net.", DNSKEY_FLAG_ZONE)
+                    .unwrap(),
+            ];
         let err = sign_zone(
             &parse_zone_file(ZONE, ORIGIN).unwrap(),
             &wrong,

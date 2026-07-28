@@ -1,7 +1,7 @@
+use crate::utils::current_unix_timestamp;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use crate::utils::current_unix_timestamp;
 
 /// How many source addresses are counted individually at once.
 ///
@@ -107,10 +107,10 @@ impl QueryLogger {
     /// Log a successful query
     pub fn log_query(&self, ip: IpAddr, query_type: Option<u16>) {
         let now = current_unix_timestamp();
-        
+
         let mut stats = self.stats.lock().unwrap();
         stats.total_queries += 1;
-        
+
         // Track per-IP queries, bounded — see `note_source`.
         let QueryStats {
             queries_by_ip,
@@ -118,7 +118,7 @@ impl QueryLogger {
             ..
         } = &mut *stats;
         note_source(queries_by_ip, ip, untracked_sources, MAX_TRACKED_SOURCES);
-        
+
         // Track per-type queries
         if let Some(qtype) = query_type {
             *stats.queries_by_type.entry(qtype).or_insert(0) += 1;
@@ -129,10 +129,10 @@ impl QueryLogger {
             let window = self.query_window.lock().unwrap();
             window.max_age_secs
         };
-        
+
         let mut window = self.query_window.lock().unwrap();
         window.queries.push(now);
-        
+
         // Remove old entries (older than max_age). Saturating, like every other
         // subtraction of two wall-clock stamps in this workspace: the clock can
         // step backwards, and an underflow here is a debug panic *while holding
@@ -153,7 +153,7 @@ impl QueryLogger {
     pub fn log_error(&self, _ip: IpAddr, reason: &str) {
         let mut stats = self.stats.lock().unwrap();
         stats.total_errors += 1;
-        
+
         // Log detailed error message
         eprintln!("[QueryLogger] Error: {}", reason);
     }
@@ -175,30 +175,39 @@ impl QueryLogger {
     /// Check for anomalies and print warnings
     pub fn check_anomalies(&self) {
         let stats = self.stats.lock().unwrap();
-        
+
         // Check for high QPS
         if stats.qps > 50.0 {
-            eprintln!("[QueryLogger] WARNING: High QPS detected: {:.2} q/s", stats.qps);
+            eprintln!(
+                "[QueryLogger] WARNING: High QPS detected: {:.2} q/s",
+                stats.qps
+            );
         }
-        
+
         // Check for high error rate
         let error_rate = if stats.total_queries > 0 {
             (stats.total_errors as f64) / (stats.total_queries as f64)
         } else {
             0.0
         };
-        
+
         if error_rate > 0.1 {
-            eprintln!("[QueryLogger] WARNING: High error rate: {:.2}%", error_rate * 100.0);
+            eprintln!(
+                "[QueryLogger] WARNING: High error rate: {:.2}%",
+                error_rate * 100.0
+            );
         }
-        
+
         // Check for IPs with many queries
         for (ip, count) in &stats.queries_by_ip {
             if *count > 100 {
-                eprintln!("[QueryLogger] WARNING: High query count from {}: {}", ip, count);
+                eprintln!(
+                    "[QueryLogger] WARNING: High query count from {}: {}",
+                    ip, count
+                );
             }
         }
-        
+
         if stats.untracked_sources > 0 {
             eprintln!(
                 "[QueryLogger] WARNING: {} queries from sources there was no room to count                  individually — the per-IP figures below are a sample, not a census",
@@ -209,10 +218,7 @@ impl QueryLogger {
         // Check for IPs that have been rate limited multiple times
         for (ip, count) in &stats.rate_limited_ips {
             if *count > 5 {
-                eprintln!(
-                    "[QueryLogger] WARNING: {} rate limited {} times",
-                    ip, count
-                );
+                eprintln!("[QueryLogger] WARNING: {} rate limited {} times", ip, count);
             }
         }
     }

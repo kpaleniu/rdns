@@ -69,7 +69,9 @@ pub fn answer_signatures(zone: &Zone, qname: &str, qtype: u16) -> AnswerSignatur
     let qname = canonical_name(qname);
     let mut out = AnswerSignatures::default();
     for record in zone.query(&qname, rt::RRSIG) {
-        let Some(sig) = rrsig_of(record) else { continue };
+        let Some(sig) = rrsig_of(record) else {
+            continue;
+        };
         if sig.type_covered != qtype {
             continue;
         }
@@ -468,7 +470,6 @@ mod tests {
     use crate::dnssec::{
         dnskeys_in, verify_rrset, Dnskey, Rrset, RrsetProof, DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE,
     };
-    use crate::RecordData;
     use crate::dnssec_denial::{
         nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, proves_wildcard_expansion, Denial,
         WildcardVerdict,
@@ -476,6 +477,7 @@ mod tests {
     use crate::dnssec_key::{SigningAlgorithm, SigningKey};
     use crate::zone::parse_zone_file;
     use crate::zone_signer::{sign_zone, DenialChain, SigningPolicy};
+    use crate::RecordData;
 
     const NOW: u64 = 1_700_000_000;
     const ORIGIN: &str = "example.com.";
@@ -551,7 +553,10 @@ deep.a.b IN TXT "down here"
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = signed(chain.clone());
             assert!(
-                matches!(judge(&zone, "www.example.com.", rt::A), RrsetProof::Verified { .. }),
+                matches!(
+                    judge(&zone, "www.example.com.", rt::A),
+                    RrsetProof::Verified { .. }
+                ),
                 "{chain:?}"
             );
             // And only the signature that covers it: an RRSIG over the AAAA at
@@ -594,7 +599,10 @@ deep.a.b IN TXT "down here"
                 &nsecs_in(&proof_records),
                 &nsec3s_in(&proof_records),
             );
-            assert!(matches!(verdict, WildcardVerdict::Proved), "{chain:?}: {verdict:?}");
+            assert!(
+                matches!(verdict, WildcardVerdict::Proved),
+                "{chain:?}: {verdict:?}"
+            );
         }
     }
 
@@ -602,7 +610,11 @@ deep.a.b IN TXT "down here"
     fn nodata_carries_a_record_at_the_name_denying_the_type() {
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = signed(chain.clone());
-            let records = negative_proof(&zone, "www.example.com.", &zone.name_kind("www.example.com."));
+            let records = negative_proof(
+                &zone,
+                "www.example.com.",
+                &zone.name_kind("www.example.com."),
+            );
             let denial = proves_nodata(
                 "www.example.com.",
                 ORIGIN,
@@ -622,7 +634,11 @@ deep.a.b IN TXT "down here"
         // of the queried name is what ties the two together.
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = signed(chain.clone());
-            let records = negative_proof(&zone, "anything.example.com.", &zone.name_kind("anything.example.com."));
+            let records = negative_proof(
+                &zone,
+                "anything.example.com.",
+                &zone.name_kind("anything.example.com."),
+            );
             let denial = proves_nodata(
                 "anything.example.com.",
                 ORIGIN,
@@ -653,7 +669,11 @@ deep.a.b IN TXT "down here"
         // authority section is a record an attacker could have written.
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = signed(chain.clone());
-            let records = negative_proof(&zone, "gone.a.b.example.com.", &zone.name_kind("gone.a.b.example.com."));
+            let records = negative_proof(
+                &zone,
+                "gone.a.b.example.com.",
+                &zone.name_kind("gone.a.b.example.com."),
+            );
             let keys = keys_of(&zone);
             let sigs = crate::dnssec::rrsigs_in(&records);
 
@@ -703,7 +723,12 @@ deep.a.b IN TXT "down here"
         assert!(answer_signatures(&zone, "www.example.com.", rt::A)
             .records
             .is_empty());
-        assert!(negative_proof(&zone, "nope.example.com.", &zone.name_kind("nope.example.com.")).is_empty());
+        assert!(negative_proof(
+            &zone,
+            "nope.example.com.",
+            &zone.name_kind("nope.example.com.")
+        )
+        .is_empty());
         assert!(proof_of_absence(&zone, "nope.example.com.").is_empty());
     }
 

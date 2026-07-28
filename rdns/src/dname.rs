@@ -1,8 +1,7 @@
 use crate::error::WireError;
-use std::str::from_utf8;
 use std::cell::RefCell;
 use std::collections::HashSet;
-
+use std::str::from_utf8;
 
 /// The two high bits that mark a label as a compression pointer (RFC 1035
 /// §4.1.4).
@@ -21,11 +20,7 @@ pub(crate) const MAX_LABEL_LEN: usize = 63;
 /// This is the one bounds-checked write every wire serializer goes through.
 /// Unlike an `io::Cursor` over a slice, it refuses to write past the end rather
 /// than silently dropping the tail of a message.
-pub(crate) fn write_bytes(
-    buf: &mut [u8],
-    pos: usize,
-    bytes: &[u8],
-) -> Result<usize, WireError> {
+pub(crate) fn write_bytes(buf: &mut [u8], pos: usize, bytes: &[u8]) -> Result<usize, WireError> {
     let end = pos + bytes.len();
     if end > buf.len() {
         return Err(WireError::Truncated {
@@ -43,13 +38,12 @@ pub(crate) fn write_bytes(
 /// The single place a label becomes bytes — shared by [`dname_to_bytes`] (which
 /// writes whole names uncompressed) and the message compressor (which writes the
 /// labels ahead of a pointer).
-pub(crate) fn write_label(
-    buf: &mut [u8],
-    pos: usize,
-    label: &str,
-) -> Result<usize, WireError> {
+pub(crate) fn write_label(buf: &mut [u8], pos: usize, label: &str) -> Result<usize, WireError> {
     if label.is_empty() {
-        return Err(WireError::malformed("domain name", "a label may not be empty"));
+        return Err(WireError::malformed(
+            "domain name",
+            "a label may not be empty",
+        ));
     }
     if label.len() > MAX_LABEL_LEN {
         return Err(WireError::TooLong {
@@ -93,8 +87,9 @@ impl<'a> TryInto<&'a str> for Label<'a> {
 
     fn try_into(self) -> Result<&'a str, WireError> {
         match self {
-            Label::String(s) => from_utf8(s)
-                .map_err(|_| WireError::malformed("a label", "not valid UTF-8")),
+            Label::String(s) => {
+                from_utf8(s).map_err(|_| WireError::malformed("a label", "not valid UTF-8"))
+            }
             _ => Err(WireError::malformed("a label", "not a text label")),
         }
     }
@@ -158,11 +153,16 @@ impl<'a> TryFromBytes<'a> for Label<'a> {
             0x1 => match data[0] {
                 // Legal encodings we do not implement (RFC 2673, RFC 6891
                 // §6.2.4), so the sender is not at fault: NOTIMP, not FORMERR.
-                0x41 => Err(WireError::Unsupported { what: "a binary label" }),
+                0x41 => Err(WireError::Unsupported {
+                    what: "a binary label",
+                }),
                 0x7f => Err(WireError::Unsupported {
                     what: "the reserved extended label type",
                 }),
-                _ => Err(WireError::malformed("a label", "unknown extended label type")),
+                _ => Err(WireError::malformed(
+                    "a label",
+                    "unknown extended label type",
+                )),
             },
             _ => Err(WireError::malformed("a label", "unknown label type")),
         }
@@ -247,7 +247,7 @@ impl<'a> DNameUnpacker<'a> {
         depth: usize,
     ) -> Result<UnpackedDName<'a>, WireError> {
         const MAX_DEPTH: usize = 50;
-        
+
         if depth > MAX_DEPTH {
             return Err(WireError::TooLong {
                 what: "compression pointer nesting",
@@ -284,13 +284,13 @@ impl<'a> DNameUnpacker<'a> {
 
                     // Mark offset as visited
                     self.visited.borrow_mut().insert(*offset);
-                    
+
                     let (name, _) = DName::try_from_bytes(&self.data[*offset..])?;
                     let unpacked = self.unpack_internal(name, depth + 1)?;
-                    
+
                     // Unmark offset (allows same offset in other branches)
                     self.visited.borrow_mut().remove(offset);
-                    
+
                     output.extend(unpacked.labels);
                 }
                 Label::Root => break,
@@ -383,7 +383,7 @@ impl<'a> TryInto<String> for UnpackedDName<'a> {
 
         // Phase 2: Single allocation with exact capacity
         let mut result = String::with_capacity(total_len);
-        
+
         for l in &self.labels {
             match l {
                 Label::String(s) => {
@@ -514,12 +514,18 @@ mod tests {
 
         let (dname, _) = DName::try_from_bytes(data).expect("should parse pointer");
         let result = unpacker.unpack(dname);
-        
+
         // Matched on the variant rather than on the message: what a caller acts
         // on is the category, and an assertion on wording breaks every time the
         // wording improves.
         assert!(
-            matches!(result, Err(WireError::Malformed { what: "a compression pointer", .. })),
+            matches!(
+                result,
+                Err(WireError::Malformed {
+                    what: "a compression pointer",
+                    ..
+                })
+            ),
             "got {result:?}"
         );
     }
@@ -532,9 +538,15 @@ mod tests {
 
         let (dname, _) = DName::try_from_bytes(data).expect("should parse pointer");
         let result = unpacker.unpack(dname);
-        
+
         assert!(
-            matches!(result, Err(WireError::Malformed { what: "a compression pointer", .. })),
+            matches!(
+                result,
+                Err(WireError::Malformed {
+                    what: "a compression pointer",
+                    ..
+                })
+            ),
             "cycle detection should prevent unpacking, got {result:?}"
         );
     }
@@ -552,7 +564,7 @@ mod tests {
         let unpacker = DNameUnpacker::new(&data);
         let (dname, _) = DName::try_from_bytes(&data[0..2]).expect("should parse");
         let result = unpacker.unpack(dname);
-        
+
         // Should hit depth limit and fail safely
         assert!(result.is_err(), "depth limit should be enforced");
     }

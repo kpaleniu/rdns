@@ -342,7 +342,12 @@ mod tests {
     #[test]
     fn test_nxdomain_is_cached_for_every_type_at_the_name() {
         let cache = NegativeCache::new(16);
-        cache.insert("nope.example.com.", rt::A, &nxdomain_for("nope.example.com."), false);
+        cache.insert(
+            "nope.example.com.",
+            rt::A,
+            &nxdomain_for("nope.example.com."),
+            false,
+        );
 
         for qtype in [rt::A, rt::AAAA, rt::MX, rt::TXT] {
             let answer = cache
@@ -358,7 +363,12 @@ mod tests {
     #[test]
     fn test_nxdomain_denies_names_below_it() {
         let cache = NegativeCache::new(16);
-        cache.insert("gone.example.com.", rt::A, &nxdomain_for("gone.example.com."), false);
+        cache.insert(
+            "gone.example.com.",
+            rt::A,
+            &nxdomain_for("gone.example.com."),
+            false,
+        );
 
         assert!(cache.get("a.gone.example.com.", rt::A).is_some());
         assert!(cache.get("deep.b.gone.example.com.", rt::AAAA).is_some());
@@ -472,7 +482,10 @@ mod tests {
             ),
             false,
         );
-        assert!(cache.get("a.example.com.", rt::A).is_none(), "0 means do not reuse");
+        assert!(
+            cache.get("a.example.com.", rt::A).is_none(),
+            "0 means do not reuse"
+        );
     }
 
     /// A failure is not an answer. Caching SERVFAIL would turn a transient
@@ -517,8 +530,18 @@ mod tests {
     #[test]
     fn test_validation_state_is_remembered() {
         let cache = NegativeCache::new(16);
-        cache.insert("a.example.com.", rt::A, &nxdomain_for("a.example.com."), true);
-        cache.insert("b.example.com.", rt::A, &nxdomain_for("b.example.com."), false);
+        cache.insert(
+            "a.example.com.",
+            rt::A,
+            &nxdomain_for("a.example.com."),
+            true,
+        );
+        cache.insert(
+            "b.example.com.",
+            rt::A,
+            &nxdomain_for("b.example.com."),
+            false,
+        );
 
         assert!(cache.get("a.example.com.", rt::A).unwrap().secure);
         assert!(!cache.get("b.example.com.", rt::A).unwrap().secure);
@@ -527,14 +550,24 @@ mod tests {
     #[test]
     fn test_names_are_matched_case_insensitively() {
         let cache = NegativeCache::new(16);
-        cache.insert("NoPe.Example.COM.", rt::A, &nxdomain_for("NoPe.Example.COM."), false);
+        cache.insert(
+            "NoPe.Example.COM.",
+            rt::A,
+            &nxdomain_for("NoPe.Example.COM."),
+            false,
+        );
         assert!(cache.get("nope.example.com.", rt::A).is_some());
     }
 
     #[test]
     fn test_zero_capacity_stores_nothing() {
         let cache = NegativeCache::new(0);
-        cache.insert("a.example.com.", rt::A, &nxdomain_for("a.example.com."), false);
+        cache.insert(
+            "a.example.com.",
+            rt::A,
+            &nxdomain_for("a.example.com."),
+            false,
+        );
         assert!(cache.is_empty());
         assert!(cache.get("a.example.com.", rt::A).is_none());
     }

@@ -330,7 +330,10 @@ mod tests {
 
     #[test]
     fn test_invalid_is_reserved_to_not_exist() {
-        assert_eq!(answer("nope.invalid.", rt::A).rcode, ResponseCode::NoSuchDomain);
+        assert_eq!(
+            answer("nope.invalid.", rt::A).rcode,
+            ResponseCode::NoSuchDomain
+        );
         assert_eq!(answer("invalid.", rt::A).rcode, ResponseCode::NoSuchDomain);
     }
 
@@ -417,7 +420,10 @@ mod tests {
     fn test_the_synthetic_soa_is_well_formed() {
         let a = answer("printer.local.", rt::A);
         let soa = &a.authority[0];
-        assert_eq!(soa.name, "local.", "owned by the zone, not the queried name");
+        assert_eq!(
+            soa.name, "local.",
+            "owned by the zone, not the queried name"
+        );
         assert_eq!(soa.rdata.rtype, rt::SOA);
         let ParsedRecord::SOA { rname, minimum, .. } = parsed(soa) else {
             panic!("not an SOA");

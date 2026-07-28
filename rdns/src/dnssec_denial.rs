@@ -13,9 +13,9 @@
 //! SHA-1 pass with the salt and iteration count parsed and then ignored.
 
 use crate::dname::dname_to_bytes;
+use crate::error::{DnssecError, DnssecResult};
 use crate::utils::record_types as rt;
 use crate::{ParsedRecord, ResourceRecord};
-use crate::error::{DnssecError, DnssecResult};
 use sha1::{Digest, Sha1};
 use std::cmp::Ordering;
 
@@ -230,10 +230,12 @@ pub fn base32hex_decode(text: &str) -> DnssecResult<Vec<u8>> {
             b'0'..=b'9' => c - b'0',
             b'a'..=b'v' => c - b'a' + 10,
             b'A'..=b'V' => c - b'A' + 10,
-            _ => return Err(DnssecError::parse(format!(
-                "invalid base32hex character {:?}",
-                c as char,
-            ))),
+            _ => {
+                return Err(DnssecError::parse(format!(
+                    "invalid base32hex character {:?}",
+                    c as char,
+                )))
+            }
         };
         acc = (acc << 5) | value as u64;
         bits += 5;
@@ -499,7 +501,9 @@ pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
                     return Denial::NotProved(format!("the NSEC3 for {zone} says a DS does exist"));
                 }
                 if !nsec3.has_type(rt::NS) {
-                    return Denial::NotProved(format!("the NSEC3 for {zone} is not at a delegation"));
+                    return Denial::NotProved(format!(
+                        "the NSEC3 for {zone} is not at a delegation"
+                    ));
                 }
                 return Denial::Proved;
             }
@@ -600,7 +604,9 @@ pub fn proves_nodata(
         return nsec3_wildcard_nodata(qname, zone, qtype, nsec3s);
     }
 
-    Denial::NotProved(format!("no NSEC or NSEC3 record denies type {qtype} at {qname}"))
+    Denial::NotProved(format!(
+        "no NSEC or NSEC3 record denies type {qtype} at {qname}"
+    ))
 }
 
 /// The bitmap half of a NODATA proof, shared by NSEC and NSEC3 and by both the
@@ -865,7 +871,9 @@ fn nsec3_closest_encloser(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Result<S
             .iter()
             .any(|n| n.covers(&next_closer).unwrap_or(false))
         {
-            return Err(format!("no NSEC3 covers the next closer name {next_closer}"));
+            return Err(format!(
+                "no NSEC3 covers the next closer name {next_closer}"
+            ));
         }
         return Ok(candidate);
     }
@@ -994,10 +1002,16 @@ mod tests {
     fn test_type_bitmap_roundtrip() {
         let bitmap = build_type_bitmap(&[rt::A, rt::NS, rt::SOA, rt::RRSIG, rt::NSEC, rt::DNSKEY]);
         for present in [rt::A, rt::NS, rt::SOA, rt::RRSIG, rt::NSEC, rt::DNSKEY] {
-            assert!(bitmap_has_type(&bitmap, present), "type {present} should be set");
+            assert!(
+                bitmap_has_type(&bitmap, present),
+                "type {present} should be set"
+            );
         }
         for absent in [rt::AAAA, rt::MX, rt::DS, rt::CNAME] {
-            assert!(!bitmap_has_type(&bitmap, absent), "type {absent} should not be set");
+            assert!(
+                !bitmap_has_type(&bitmap, absent),
+                "type {absent} should not be set"
+            );
         }
     }
 
@@ -1014,14 +1028,25 @@ mod tests {
     #[test]
     fn test_malformed_bitmap_denies_nothing() {
         assert!(!bitmap_has_type(&[0x00], rt::A), "truncated window header");
-        assert!(!bitmap_has_type(&[0x00, 0x09, 0x40], rt::A), "length overruns");
+        assert!(
+            !bitmap_has_type(&[0x00, 0x09, 0x40], rt::A),
+            "length overruns"
+        );
         assert!(!bitmap_has_type(&[], rt::A));
     }
 
     /// Listing the types back out is what turns an NSEC into a zone-file line.
     #[test]
     fn test_bitmap_types_lists_what_was_built() {
-        let types = [rt::A, rt::NS, rt::SOA, rt::RRSIG, rt::NSEC, rt::DNSKEY, 1234];
+        let types = [
+            rt::A,
+            rt::NS,
+            rt::SOA,
+            rt::RRSIG,
+            rt::NSEC,
+            rt::DNSKEY,
+            1234,
+        ];
         let bitmap = build_type_bitmap(&types);
 
         let mut expected = types.to_vec();
@@ -1117,7 +1142,8 @@ mod tests {
     #[test]
     fn test_iteration_count_is_capped() {
         assert!(nsec3_hash("a.example.", &[], MAX_NSEC3_ITERATIONS).is_ok());
-        let err = nsec3_hash("a.example.", &[], u16::MAX).expect_err("65535 rounds must be refused");
+        let err =
+            nsec3_hash("a.example.", &[], u16::MAX).expect_err("65535 rounds must be refused");
         assert!(err.to_string().contains("exceeds"), "got: {err}");
     }
 
@@ -1128,7 +1154,11 @@ mod tests {
     #[test]
     fn test_nsec_proves_an_unsigned_delegation() {
         // The parent's NSEC at the delegation: NS present, DS absent.
-        let n = nsec("insecure.example.com.", "z.example.com.", &[rt::NS, rt::RRSIG, rt::NSEC]);
+        let n = nsec(
+            "insecure.example.com.",
+            "z.example.com.",
+            &[rt::NS, rt::RRSIG, rt::NSEC],
+        );
         assert!(proves_no_ds("insecure.example.com.", &[n], &[]).is_proved());
     }
 
@@ -1166,7 +1196,11 @@ mod tests {
 
     #[test]
     fn test_nsec_nodata_proof() {
-        let n = nsec("www.example.com.", "z.example.com.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let n = nsec(
+            "www.example.com.",
+            "z.example.com.",
+            &[rt::A, rt::RRSIG, rt::NSEC],
+        );
         // No AAAA in the bitmap, so NODATA for AAAA is proven.
         assert!(proves_nodata(
             "www.example.com.",
@@ -1184,7 +1218,11 @@ mod tests {
     /// so a bitmap listing one contradicts the proof.
     #[test]
     fn test_nsec_nodata_refuses_a_name_with_a_cname() {
-        let n = nsec("www.example.com.", "z.example.com.", &[rt::CNAME, rt::RRSIG]);
+        let n = nsec(
+            "www.example.com.",
+            "z.example.com.",
+            &[rt::CNAME, rt::RRSIG],
+        );
         let denial = proves_nodata("www.example.com.", "example.com.", rt::A, &[n], &[]);
         assert!(!denial.is_proved(), "{denial:?}");
     }
@@ -1201,7 +1239,11 @@ mod tests {
     /// (so the name itself does not exist).
     #[test]
     fn test_wildcard_nodata_is_proved() {
-        let at_wildcard = nsec("*.example.com.", "www.example.com.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let at_wildcard = nsec(
+            "*.example.com.",
+            "www.example.com.",
+            &[rt::A, rt::RRSIG, rt::NSEC],
+        );
         let denial = proves_nodata(
             "a.example.com.",
             "example.com.",
@@ -1229,7 +1271,13 @@ mod tests {
     #[test]
     fn test_wildcard_nodata_needs_the_record_at_the_wildcard() {
         let covering = nsec("m.example.com.", "z.example.com.", &[rt::A, rt::RRSIG]);
-        let denial = proves_nodata("nope.example.com.", "example.com.", rt::AAAA, &[covering], &[]);
+        let denial = proves_nodata(
+            "nope.example.com.",
+            "example.com.",
+            rt::AAAA,
+            &[covering],
+            &[],
+        );
         assert!(!denial.is_proved(), "{denial:?}");
     }
 
@@ -1239,8 +1287,16 @@ mod tests {
     /// nothing about that name.
     #[test]
     fn test_wildcard_nodata_at_the_wrong_depth_is_refused() {
-        let at_wildcard = nsec("*.example.com.", "b.example.com.", &[rt::A, rt::RRSIG, rt::NSEC]);
-        let covering = nsec("b.example.com.", "c.example.com.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let at_wildcard = nsec(
+            "*.example.com.",
+            "b.example.com.",
+            &[rt::A, rt::RRSIG, rt::NSEC],
+        );
+        let covering = nsec(
+            "b.example.com.",
+            "c.example.com.",
+            &[rt::A, rt::RRSIG, rt::NSEC],
+        );
         assert!(covering.covers("a.b.example.com."), "the name is covered");
 
         let denial = proves_nodata(
@@ -1336,7 +1392,10 @@ mod tests {
     #[test]
     fn test_wildcard_expansion_without_any_nsec_is_not_proved() {
         let verdict = proves_wildcard_expansion("a.example.com.", "*.example.com.", &[], &[]);
-        assert!(matches!(verdict, WildcardVerdict::NotProved(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, WildcardVerdict::NotProved(_)),
+            "{verdict:?}"
+        );
     }
 
     /// An NSEC that puts the name *inside* the zone's namespace — one whose
@@ -1346,7 +1405,10 @@ mod tests {
         let elsewhere = nsec("m.example.com.", "n.example.com.", &[rt::A]);
         let verdict =
             proves_wildcard_expansion("a.example.com.", "*.example.com.", &[elsewhere], &[]);
-        assert!(matches!(verdict, WildcardVerdict::NotProved(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, WildcardVerdict::NotProved(_)),
+            "{verdict:?}"
+        );
     }
 
     /// The attack the closest-encloser check exists to stop. `b.example.com.`
@@ -1375,12 +1437,8 @@ mod tests {
         );
 
         // The wildcard at the closest encloser itself is fine.
-        let verdict = proves_wildcard_expansion(
-            "a.b.example.com.",
-            "*.b.example.com.",
-            &[covering],
-            &[],
-        );
+        let verdict =
+            proves_wildcard_expansion("a.b.example.com.", "*.b.example.com.", &[covering], &[]);
         assert_eq!(verdict, WildcardVerdict::Proved, "{verdict:?}");
     }
 
@@ -1390,7 +1448,10 @@ mod tests {
     fn test_wildcard_expansion_outside_the_wildcard_is_refused() {
         let wide = nsec("example.com.", "z.example.com.", &[rt::SOA]);
         let verdict = proves_wildcard_expansion("other.test.", "*.example.com.", &[wide], &[]);
-        assert!(matches!(verdict, WildcardVerdict::NotProved(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, WildcardVerdict::NotProved(_)),
+            "{verdict:?}"
+        );
     }
 
     /// NSEC3 (RFC 5155 §8.8): what has to be covered is the "next closer" name,
@@ -1528,7 +1589,13 @@ mod tests {
 
     #[test]
     fn test_nsec3_matching_record_proves_no_ds() {
-        let n = nsec3_record("example.com.", "child.example.com.", &[0xff; 20], 0, &[rt::NS]);
+        let n = nsec3_record(
+            "example.com.",
+            "child.example.com.",
+            &[0xff; 20],
+            0,
+            &[rt::NS],
+        );
         assert!(n.matches("child.example.com.").unwrap());
         assert!(proves_no_ds("child.example.com.", &[], &[n]).is_proved());
     }

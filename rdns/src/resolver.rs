@@ -13,18 +13,18 @@
 //! trip rather than pinning a thread for the sum of them. `rdnsr` awaits
 //! `resolve` directly. See the note on [`Resolver::recurse`].
 
-use crate::error::{ResolveError, ResolveResult};
-use std::sync::Arc;
 use crate::dnssec::{Dnskey, Rrsig};
 use crate::dnssec_chain::{
     cname_chain_shape, ChainShape, ChainValidator, DelegationEvidence, DelegationVerdict, KeyStore,
     TrustAnchors, ValidationState,
 };
-use crate::dnssec_denial::{proves_nodata, proves_nxdomain, nsec3s_in, nsecs_in, Denial};
+use crate::dnssec_denial::{nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, Denial};
+use crate::error::{ResolveError, ResolveResult};
 use crate::utils::{current_unix_timestamp, record_types as rt};
 use crate::{DnsMessage, Edns, ParsedRecord, QuerySection, ResourceRecord, ResponseCode};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,19 +53,19 @@ const TYPE_NS: u16 = 2;
 /// works is reached within a hop or two on the very first query, before any RTT
 /// is known.
 const ROOT_HINTS: [Ipv4Addr; 13] = [
-    Ipv4Addr::new(198, 41, 0, 4),      // a.root-servers.net
-    Ipv4Addr::new(170, 247, 170, 2),   // b
-    Ipv4Addr::new(192, 33, 4, 12),     // c
-    Ipv4Addr::new(199, 7, 91, 13),     // d
-    Ipv4Addr::new(192, 203, 230, 10),  // e
-    Ipv4Addr::new(192, 5, 5, 241),     // f
-    Ipv4Addr::new(192, 112, 36, 4),    // g
-    Ipv4Addr::new(198, 97, 190, 53),   // h
-    Ipv4Addr::new(192, 36, 148, 17),   // i
-    Ipv4Addr::new(192, 58, 128, 30),   // j
-    Ipv4Addr::new(193, 0, 14, 129),    // k
-    Ipv4Addr::new(199, 7, 83, 42),     // l
-    Ipv4Addr::new(202, 12, 27, 33),    // m
+    Ipv4Addr::new(198, 41, 0, 4),     // a.root-servers.net
+    Ipv4Addr::new(170, 247, 170, 2),  // b
+    Ipv4Addr::new(192, 33, 4, 12),    // c
+    Ipv4Addr::new(199, 7, 91, 13),    // d
+    Ipv4Addr::new(192, 203, 230, 10), // e
+    Ipv4Addr::new(192, 5, 5, 241),    // f
+    Ipv4Addr::new(192, 112, 36, 4),   // g
+    Ipv4Addr::new(198, 97, 190, 53),  // h
+    Ipv4Addr::new(192, 36, 148, 17),  // i
+    Ipv4Addr::new(192, 58, 128, 30),  // j
+    Ipv4Addr::new(193, 0, 14, 129),   // k
+    Ipv4Addr::new(199, 7, 83, 42),    // l
+    Ipv4Addr::new(202, 12, 27, 33),   // m
 ];
 
 /// The IPv6 (AAAA) addresses of the same 13 root servers, in the same order.
@@ -432,10 +432,7 @@ impl RttStore {
                 // At capacity, drop the slowest entry — the one we would
                 // deprioritize anyway, and lose least by re-learning as unknown.
                 if m.len() >= self.capacity {
-                    if let Some(worst) = m
-                        .iter()
-                        .max_by(|a, b| a.1.total_cmp(b.1))
-                        .map(|(k, _)| *k)
+                    if let Some(worst) = m.iter().max_by(|a, b| a.1.total_cmp(b.1)).map(|(k, _)| *k)
                     {
                         m.remove(&worst);
                     }
@@ -763,7 +760,10 @@ impl Resolver {
         self.ask_any(&self.config.upstream_servers, &out, &mut state.budget)
             .await
             .ok_or_else(|| {
-                ResolveError::no_response(format!("failed to resolve {} with all upstream servers", query.qname))
+                ResolveError::no_response(format!(
+                    "failed to resolve {} with all upstream servers",
+                    query.qname
+                ))
             })
     }
 
@@ -875,8 +875,10 @@ impl Resolver {
                 return Err(ResolveError::no_response(format!("CNAME loop at {qname}")));
             }
             if hop == self.config.max_cname_hops {
-                return Err(ResolveError::no_response(format!("CNAME chain longer than {} hops",
-                    self.config.max_cname_hops)));
+                return Err(ResolveError::no_response(format!(
+                    "CNAME chain longer than {} hops",
+                    self.config.max_cname_hops
+                )));
             }
 
             let step = QuerySection {
@@ -933,7 +935,8 @@ impl Resolver {
             qname = cname.expect("checked is_none above");
         }
 
-        let mut response = last.ok_or_else(|| ResolveError::no_response(format!("no response for {}", query.qname)))?;
+        let mut response = last
+            .ok_or_else(|| ResolveError::no_response(format!("no response for {}", query.qname)))?;
         // Present the whole chain under the question the client actually asked.
         response.queries = vec![query.clone()];
         response.answers = answers;
@@ -955,7 +958,9 @@ impl Resolver {
     ) -> ResolveResult<DnsMessage> {
         const MAX_NESTED: usize = 4;
         if depth > MAX_NESTED {
-            return Err(ResolveError::no_response(format!("nameserver lookup nested deeper than {MAX_NESTED}")));
+            return Err(ResolveError::no_response(format!(
+                "nameserver lookup nested deeper than {MAX_NESTED}"
+            )));
         }
 
         // Start as far down the tree as we already know how to, rather than at
@@ -1049,7 +1054,9 @@ impl Resolver {
             let out = self.build_query(&step, false)?;
 
             let Some(response) = self.ask_any(&servers, &out, &mut state.budget).await else {
-                return Err(ResolveError::no_response(format!("no server for {zone} answered while resolving {qname}")));
+                return Err(ResolveError::no_response(format!(
+                    "no server for {zone} answered while resolving {qname}"
+                )));
             };
 
             // A referral advances us to the child zone, whether the probe was
@@ -1079,7 +1086,9 @@ impl Resolver {
                 };
 
                 if servers.is_empty() {
-                    return Err(ResolveError::no_response(format!("no reachable nameserver for {child_zone}")));
+                    return Err(ResolveError::no_response(format!(
+                        "no reachable nameserver for {child_zone}"
+                    )));
                 }
                 // Remember it so the next query for anything in this zone can
                 // start here instead of at the root.
@@ -1100,7 +1109,9 @@ impl Resolver {
                 if !response.answers.is_empty() || response.authoritive {
                     return Ok(response);
                 }
-                return Err(ResolveError::no_response(format!("lame delegation: {zone} gave no answer and no usable referral for {qname}")));
+                return Err(ResolveError::no_response(format!(
+                    "lame delegation: {zone} gave no answer and no usable referral for {qname}"
+                )));
             }
 
             // No referral on an *intermediate* probe.
@@ -1115,8 +1126,10 @@ impl Resolver {
             sent_labels = labels + 1;
         }
 
-        Err(ResolveError::no_response(format!("more than {} referrals while resolving {qname}",
-            self.config.max_delegations)))
+        Err(ResolveError::no_response(format!(
+            "more than {} referrals while resolving {qname}",
+            self.config.max_delegations
+        )))
     }
 
     /// Try the servers fastest-known-first, returning the first usable response
@@ -1257,8 +1270,7 @@ impl Resolver {
             // (resolve_from_root → walk → here → resolve_from_root), and an
             // `async fn` future may not contain itself by value. Boxing stores a
             // pointer instead, so the future's size stays finite.
-            let Ok(response) = Box::pin(self.resolve_from_root(&lookup, state, depth)).await
-            else {
+            let Ok(response) = Box::pin(self.resolve_from_root(&lookup, state, depth)).await else {
                 continue;
             };
             let addrs: Vec<SocketAddr> = response
@@ -1313,7 +1325,9 @@ impl Resolver {
         // is on). The connected socket already filters by source address; this
         // is the entropy an off-path spoofer additionally has to match.
         if !self.response_matches(&response, out) {
-            return Err(ResolveError::no_response(format!("reply from {upstream} did not match the query")));
+            return Err(ResolveError::no_response(format!(
+                "reply from {upstream} did not match the query"
+            )));
         }
 
         // RFC 1035 §4.2.1: a truncated answer must be retried over TCP. The
@@ -1342,8 +1356,10 @@ impl Resolver {
         out: &OutgoingQuery,
     ) -> ResolveResult<DnsMessage> {
         if out.buf.len() > TCP_MAX_MESSAGE {
-            return Err(ResolveError::no_response(format!("query of {} bytes exceeds the 2-byte TCP length prefix",
-                out.buf.len())));
+            return Err(ResolveError::no_response(format!(
+                "query of {} bytes exceeds the 2-byte TCP length prefix",
+                out.buf.len()
+            )));
         }
 
         // Same budget as the UDP half, applied to each of connect, write and
@@ -1361,7 +1377,10 @@ impl Resolver {
         tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await??;
         let len = u16::from_be_bytes(len_buf) as usize;
         if len == 0 {
-            return Err(ResolveError::no_response(format!("upstream {} sent a zero-length TCP message", upstream)));
+            return Err(ResolveError::no_response(format!(
+                "upstream {} sent a zero-length TCP message",
+                upstream
+            )));
         }
 
         let mut response_buf = vec![0; len];
@@ -1372,7 +1391,9 @@ impl Resolver {
         // but a mismatched id or question still means a confused peer, not an
         // answer to trust.
         if !self.response_matches(&response, out) {
-            return Err(ResolveError::no_response(format!("TCP reply from {upstream} did not match the query")));
+            return Err(ResolveError::no_response(format!(
+                "TCP reply from {upstream} did not match the query"
+            )));
         }
         Ok(response)
     }
@@ -1541,9 +1562,7 @@ impl Resolver {
     ) -> ValidationState {
         let validator = ChainValidator::new(anchors, now);
         let Some((anchor_zone, anchor_ds)) = validator.start(target) else {
-            return ValidationState::Indeterminate(format!(
-                "no trust anchor covers {target}"
-            ));
+            return ValidationState::Indeterminate(format!("no trust anchor covers {target}"));
         };
 
         // Resume as deep as we already trust, rather than re-walking from the
@@ -1882,9 +1901,15 @@ mod tests {
         assert_eq!(suffix_with_labels("www.example.com.", 0), ".");
         assert_eq!(suffix_with_labels("www.example.com.", 1), "com.");
         assert_eq!(suffix_with_labels("www.example.com.", 2), "example.com.");
-        assert_eq!(suffix_with_labels("www.example.com.", 3), "www.example.com.");
+        assert_eq!(
+            suffix_with_labels("www.example.com.", 3),
+            "www.example.com."
+        );
         // Asking for more labels than the name has yields the whole name.
-        assert_eq!(suffix_with_labels("www.example.com.", 9), "www.example.com.");
+        assert_eq!(
+            suffix_with_labels("www.example.com.", 9),
+            "www.example.com."
+        );
     }
 
     #[test]
@@ -1900,7 +1925,10 @@ mod tests {
         // Digits, hyphens and dots are untouched.
         let mixed = "9-a.b.";
         assert_eq!(randomize_case(mixed).to_ascii_lowercase(), mixed);
-        for c in randomize_case(mixed).chars().filter(|c| !c.is_ascii_alphabetic()) {
+        for c in randomize_case(mixed)
+            .chars()
+            .filter(|c| !c.is_ascii_alphabetic())
+        {
             assert!("9-.".contains(c));
         }
     }
@@ -1963,7 +1991,10 @@ this line has no record and is skipped
     fn test_bailiwick_helpers() {
         assert!(is_subdomain("www.example.com.", "example.com."));
         assert!(is_subdomain("example.com.", "com."));
-        assert!(is_subdomain("anything.", "."), "everything is under the root");
+        assert!(
+            is_subdomain("anything.", "."),
+            "everything is under the root"
+        );
         assert!(is_subdomain("example.com.", "example.com."), "reflexive");
 
         // The attack these guard against: a name that merely *ends with* the
@@ -2011,15 +2042,16 @@ this line has no record and is skipped
         for offset in 0..500u16 {
             let port = 20_000 + (start - 20_000 + offset) % 20_000;
             let mut socks = Vec::with_capacity(count);
-            let bound = (0..count).all(|i| {
-                match UdpSocket::bind(format!("127.0.0.{}:{}", i + 1, port)) {
-                    Ok(s) => {
-                        socks.push(s);
-                        true
-                    }
-                    Err(_) => false,
-                }
-            });
+            let bound =
+                (0..count).all(
+                    |i| match UdpSocket::bind(format!("127.0.0.{}:{}", i + 1, port)) {
+                        Ok(s) => {
+                            socks.push(s);
+                            true
+                        }
+                        Err(_) => false,
+                    },
+                );
             if bound {
                 return socks;
             }
@@ -2171,7 +2203,12 @@ this line has no record and is skipped
             authoritative(q, vec![a_record(&qname_of(q), [6, 6, 6, 6])])
         });
         let root = spawn_server(root_sock, move |q| {
-            referral(q, "evil.test.", "ns.evil.test.", Some(("ns.evil.test.", evil_addr)))
+            referral(
+                q,
+                "evil.test.",
+                "ns.evil.test.",
+                Some(("ns.evil.test.", evil_addr)),
+            )
         });
 
         let resolver = Resolver::new(recursing_config(root.addr));
@@ -2258,7 +2295,10 @@ this line has no record and is skipped
         let _auth = spawn_server(auth_sock, |q| {
             let name = qname_of(q);
             if name == "www.example.test." {
-                authoritative(q, vec![cname_record("www.example.test.", "real.example.test.")])
+                authoritative(
+                    q,
+                    vec![cname_record("www.example.test.", "real.example.test.")],
+                )
             } else {
                 authoritative(q, vec![a_record("real.example.test.", [192, 0, 2, 9])])
             }
@@ -2324,9 +2364,13 @@ this line has no record and is skipped
             })
             .await;
 
-        let err = result.expect_err("a CNAME loop must be an error").to_string();
+        let err = result
+            .expect_err("a CNAME loop must be an error")
+            .to_string();
         assert!(
-            err.to_string().contains("loop") || err.to_string().contains("budget") || err.to_string().contains("hops"),
+            err.to_string().contains("loop")
+                || err.to_string().contains("budget")
+                || err.to_string().contains("hops"),
             "unexpected error: {err}"
         );
     }
@@ -2426,7 +2470,10 @@ this line has no record and is skipped
             })
             .await;
 
-        assert!(result.is_err(), "a referral loop must terminate in an error");
+        assert!(
+            result.is_err(),
+            "a referral loop must terminate in an error"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -2440,7 +2487,14 @@ this line has no record and is skipped
     /// asked, so a test can assert what each learned. All three answer the same
     /// way regardless of the QTYPE, which is what lets the intermediate NS
     /// probes and the final query share one server.
-    fn recording_hierarchy() -> (FakeServer, FakeServer, FakeServer, SeenLog, SeenLog, SeenLog) {
+    fn recording_hierarchy() -> (
+        FakeServer,
+        FakeServer,
+        FakeServer,
+        SeenLog,
+        SeenLog,
+        SeenLog,
+    ) {
         let mut socks = bind_hierarchy(3).into_iter();
         let (root_sock, tld_sock, auth_sock) = (
             socks.next().unwrap(),
@@ -2720,7 +2774,11 @@ this line has no record and is skipped
         });
 
         let resolver = Resolver::new(recursing_config(root.addr));
-        for name in ["one.example.test.", "two.example.test.", "three.example.test."] {
+        for name in [
+            "one.example.test.",
+            "two.example.test.",
+            "three.example.test.",
+        ] {
             let answer = resolver
                 .resolve(&QuerySection {
                     qname: name.to_string(),
@@ -2853,7 +2911,11 @@ this line has no record and is skipped
         });
 
         let resolver = Resolver::new(recursing_config(root.addr));
-        for name in ["one.example.test.", "two.example.test.", "three.example.test."] {
+        for name in [
+            "one.example.test.",
+            "two.example.test.",
+            "three.example.test.",
+        ] {
             let answer = resolver
                 .resolve(&QuerySection {
                     qname: name.to_string(),
@@ -2955,7 +3017,8 @@ this line has no record and is skipped
             let query = DnsMessage::try_from_bytes(&buf).unwrap();
 
             let mut resp = response_to(&query);
-            resp.answers.push(a_record("example.com.", [93, 184, 216, 34]));
+            resp.answers
+                .push(a_record("example.com.", [93, 184, 216, 34]));
             let mut out = vec![0u8; 4096];
             let n = resp.to_bytes(&mut out).unwrap();
 
@@ -2976,7 +3039,11 @@ this line has no record and is skipped
         // The TCP retry carried the same question, correctly framed. Compared
         // case-insensitively because 0x20 randomizes the casing on the wire
         // (e.g. "ExAMPLe.coM."), which is the whole point of the feature.
-        assert!(claimed >= 12, "TCP length prefix {} is below a DNS header", claimed);
+        assert!(
+            claimed >= 12,
+            "TCP length prefix {} is below a DNS header",
+            claimed
+        );
         assert_eq!(
             tcp_qname.as_deref().map(|n| n.to_ascii_lowercase()),
             Some("example.com.".to_string())
@@ -3191,7 +3258,10 @@ this line has no record and is skipped
     async fn test_reply_with_wrong_transaction_id_is_rejected() {
         // `mangle` leaves the case alone, so only the id is wrong.
         let result = resolve_against_mangling_upstream(test_config, |s| s.to_string(), true).await;
-        assert!(result.is_err(), "a mismatched transaction id must be rejected");
+        assert!(
+            result.is_err(),
+            "a mismatched transaction id must be rejected"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -3212,7 +3282,8 @@ this line has no record and is skipped
             let (n, peer) = udp.recv_from(&mut buf).unwrap();
             let query = DnsMessage::try_from_bytes(&buf[..n]).unwrap();
             let mut resp = response_to(&query);
-            resp.answers.push(a_record("example.com.", [203, 0, 113, 5]));
+            resp.answers
+                .push(a_record("example.com.", [203, 0, 113, 5]));
             let mut out = vec![0u8; 512];
             let len = resp.to_bytes(&mut out).unwrap();
             udp.send_to(&out[..len], peer).unwrap();
@@ -3222,7 +3293,10 @@ this line has no record and is skipped
         let answer = resolver.resolve(&test_query()).await.unwrap();
         udp_thread.join().unwrap();
 
-        assert!(addr.is_ipv6(), "the upstream must be a v6 address for this test");
+        assert!(
+            addr.is_ipv6(),
+            "the upstream must be a v6 address for this test"
+        );
         assert_eq!(
             answer.answers[0].rdata.parse().unwrap(),
             ParsedRecord::A(Ipv4Addr::new(203, 0, 113, 5))
@@ -3615,14 +3689,7 @@ this line has no record and is skipped
         let soa_sig = auth.sign_records(std::slice::from_ref(&soa));
         let matching_sig = auth.sign_records(std::slice::from_ref(&matching));
         let covering_sig = auth.sign_records(std::slice::from_ref(&covering));
-        vec![
-            soa,
-            soa_sig,
-            matching,
-            matching_sig,
-            covering,
-            covering_sig,
-        ]
+        vec![soa, soa_sig, matching, matching_sig, covering, covering_sig]
     }
 
     /// The authority section of a signed wildcard NODATA: the SOA, and the NSEC
@@ -3634,10 +3701,7 @@ this line has no record and is skipped
     /// With `at_wildcard` false the record is moved off the wildcard to
     /// `m.example.test.`: it still covers the queried names, and proves nothing
     /// about what a wildcard would have answered.
-    fn signed_wildcard_nodata_authority(
-        auth: &TestZone,
-        at_wildcard: bool,
-    ) -> Vec<ResourceRecord> {
+    fn signed_wildcard_nodata_authority(auth: &TestZone, at_wildcard: bool) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
             name: "example.test.".to_string(),
             class: 1,
@@ -3852,7 +3916,10 @@ this line has no record and is skipped
 
         assert_eq!(state, ValidationState::Secure, "{state}");
         assert_eq!(answer.rcode, ResponseCode::NoSuchDomain);
-        assert!(answer.authorities.iter().any(|rr| rr.rdata.rtype == rt::NSEC));
+        assert!(answer
+            .authorities
+            .iter()
+            .any(|rr| rr.rdata.rtype == rt::NSEC));
     }
 
     /// The NSEC3 denial path, end to end — the gap this closes is that every
@@ -3875,11 +3942,17 @@ this line has no record and is skipped
         assert_eq!(state, ValidationState::Secure, "{state}");
         assert_eq!(answer.rcode, ResponseCode::NoSuchDomain);
         assert!(
-            answer.authorities.iter().any(|rr| rr.rdata.rtype == rt::NSEC3),
+            answer
+                .authorities
+                .iter()
+                .any(|rr| rr.rdata.rtype == rt::NSEC3),
             "the proof that came back is the hashed kind"
         );
         assert!(
-            !answer.authorities.iter().any(|rr| rr.rdata.rtype == rt::NSEC),
+            !answer
+                .authorities
+                .iter()
+                .any(|rr| rr.rdata.rtype == rt::NSEC),
             "and only the hashed kind — this zone has no plain NSEC to fall back on"
         );
     }
@@ -3942,7 +4015,10 @@ this line has no record and is skipped
             .expect("the cached gap covers this name too");
         assert_eq!(synthesized.rcode, ResponseCode::NoSuchDomain);
         assert!(
-            synthesized.authority.iter().any(|rr| rr.rdata.rtype == rt::SOA),
+            synthesized
+                .authority
+                .iter()
+                .any(|rr| rr.rdata.rtype == rt::SOA),
             "RFC 2308 §2.1 wants the SOA on a negative answer"
         );
         assert!(synthesized.ttl <= 300, "bounded by the SOA MINIMUM");
@@ -3971,7 +4047,11 @@ this line has no record and is skipped
             .expect("the resolution itself should succeed");
 
         assert_eq!(state, ValidationState::Secure, "{state}");
-        assert_eq!(answer.rcode, ResponseCode::Ok, "NODATA is NOERROR with no answer");
+        assert_eq!(
+            answer.rcode,
+            ResponseCode::Ok,
+            "NODATA is NOERROR with no answer"
+        );
         assert!(answer.answers.is_empty());
     }
 

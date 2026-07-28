@@ -1,7 +1,7 @@
+use crate::utils::{ascii_lowered, current_unix_timestamp};
+use crate::ResourceRecord;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use crate::ResourceRecord;
-use crate::utils::{ascii_lowered, current_unix_timestamp};
 
 /// The longest anything is cached, whatever the record says.
 ///
@@ -146,27 +146,30 @@ impl DnsCache {
         let expires_at = now.saturating_add(min_ttl);
 
         let mut cache = self.cache.lock().unwrap();
-        
+
         // Evict oldest entries if cache is full
         if cache.len() >= self.max_entries {
             self.evict_oldest(&mut cache);
         }
 
         let key = (ascii_lowered(name), qtype);
-        cache.insert(key, CacheEntry {
-            records,
-            expires_at,
-            secure,
-        });
+        cache.insert(
+            key,
+            CacheEntry {
+                records,
+                expires_at,
+                secure,
+            },
+        );
     }
 
     /// Evict expired and oldest entries
     fn evict_oldest(&self, cache: &mut HashMap<(String, u16), CacheEntry>) {
         let now = current_unix_timestamp();
-        
+
         // First remove all expired entries
         cache.retain(|_, entry| !entry.is_expired(now));
-        
+
         // If still over limit, remove oldest entries
         while cache.len() > self.max_entries / 2 {
             if let Some(key) = cache
@@ -185,10 +188,10 @@ impl DnsCache {
     pub fn get_stats(&self) -> CacheStats {
         let cache = self.cache.lock().unwrap();
         let now = current_unix_timestamp();
-        
+
         let mut expired_count = 0;
         let mut valid_count = 0;
-        
+
         for entry in cache.values() {
             if entry.is_expired(now) {
                 expired_count += 1;
@@ -196,7 +199,7 @@ impl DnsCache {
                 valid_count += 1;
             }
         }
-        
+
         CacheStats {
             total_entries: cache.len(),
             valid_entries: valid_count,
@@ -220,8 +223,8 @@ pub struct CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ParsedRecord, RecordData, ResourceRecord};
     use std::net::Ipv4Addr;
-    use crate::{ResourceRecord, RecordData, ParsedRecord};
 
     fn create_test_record(name: &str, ttl: i32) -> ResourceRecord {
         ResourceRecord {
@@ -238,7 +241,7 @@ mod tests {
         let records = vec![create_test_record("example.com.", 300)];
 
         cache.put("example.com.", 1, records.clone());
-        
+
         let retrieved = cache.get("example.com.", 1);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().len(), 1);
@@ -247,7 +250,7 @@ mod tests {
     #[test]
     fn test_cache_miss() {
         let cache = DnsCache::with_defaults();
-        
+
         let result = cache.get("notcached.com.", 1);
         assert!(result.is_none());
     }
@@ -258,7 +261,7 @@ mod tests {
         let records = vec![create_test_record("example.com.", 300)];
 
         cache.put("EXAMPLE.COM.", 1, records.clone());
-        
+
         let retrieved = cache.get("example.com.", 1);
         assert!(retrieved.is_some());
     }
@@ -271,7 +274,7 @@ mod tests {
 
         cache.put("example.com.", 1, a_records);
         cache.put("example.com.", 28, aaaa_records);
-        
+
         assert!(cache.get("example.com.", 1).is_some());
         assert!(cache.get("example.com.", 28).is_some());
         assert!(cache.get("example.com.", 5).is_none()); // CNAME not cached
@@ -283,10 +286,13 @@ mod tests {
         let records = vec![create_test_record("example.com.", 300)];
 
         cache.put("example.com.", 1, records);
-        
+
         let stats = cache.get_stats();
         assert!(stats.total_entries > 0);
-        assert_eq!(stats.valid_entries, stats.total_entries - stats.expired_entries);
+        assert_eq!(
+            stats.valid_entries,
+            stats.total_entries - stats.expired_entries
+        );
     }
 
     #[test]
@@ -296,7 +302,7 @@ mod tests {
 
         cache.put("example.com.", 1, records);
         assert!(cache.get("example.com.", 1).is_some());
-        
+
         cache.clear();
         assert!(cache.get("example.com.", 1).is_none());
     }
@@ -310,7 +316,7 @@ mod tests {
         ];
 
         cache.put("example.com.", 1, records);
-        
+
         let retrieved = cache.get("example.com.", 1);
         assert!(retrieved.is_some()); // Still valid within 100 seconds
     }
@@ -326,7 +332,11 @@ mod tests {
     fn a_negative_ttl_does_not_pin_an_entry_forever() {
         for ttl in [-1, i32::MIN, -3600] {
             let cache = DnsCache::with_defaults();
-            cache.put("example.com.", 1, vec![create_test_record("example.com.", ttl)]);
+            cache.put(
+                "example.com.",
+                1,
+                vec![create_test_record("example.com.", ttl)],
+            );
             assert!(
                 cache.get("example.com.", 1).is_none(),
                 "a TTL of {ttl} means zero seconds, not forever"
@@ -361,7 +371,10 @@ mod tests {
         let kelvin = "\u{212A}.example.com.";
         cache.put(kelvin, 1, vec![create_test_record(kelvin, 300)]);
 
-        assert!(cache.get(kelvin, 1).is_some(), "its own name still finds it");
+        assert!(
+            cache.get(kelvin, 1).is_some(),
+            "its own name still finds it"
+        );
         assert!(
             cache.get("k.example.com.", 1).is_none(),
             "a different owner name must not share the entry"
@@ -371,14 +384,14 @@ mod tests {
     #[test]
     fn test_cache_capacity() {
         let cache = DnsCache::new(10);
-        
+
         // Fill cache beyond capacity
         for i in 0..20 {
             let name = format!("example{}.com.", i);
             let records = vec![create_test_record(&name, 300)];
             cache.put(&name, 1, records);
         }
-        
+
         let stats = cache.get_stats();
         assert!(stats.total_entries <= 10, "cache exceeded max capacity");
     }

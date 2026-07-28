@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::ConfigResult;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -219,11 +219,27 @@ pub mod instrumentation {
     }
 
     /// Trace query response generation with latency.
-    pub fn trace_query_response(query_name: &str, query_type: u16, latency_ms: f64, error: Option<&str>) {
+    pub fn trace_query_response(
+        query_name: &str,
+        query_type: u16,
+        latency_ms: f64,
+        error: Option<&str>,
+    ) {
         if let Some(e) = error {
-            tracing::error!(query_name, query_type, latency_ms, error = e, "query_response_error");
+            tracing::error!(
+                query_name,
+                query_type,
+                latency_ms,
+                error = e,
+                "query_response_error"
+            );
         } else {
-            tracing::info!(query_name, query_type, latency_ms, "query_response_generated");
+            tracing::info!(
+                query_name,
+                query_type,
+                latency_ms,
+                "query_response_generated"
+            );
         }
     }
 
@@ -306,6 +322,10 @@ mod tests {
         let timer = LatencyTimer::new();
         std::thread::sleep(std::time::Duration::from_millis(10));
         let elapsed_ms = timer.elapsed_ms();
-        assert!(elapsed_ms >= 10.0, "elapsed_ms should be >= 10ms, got {}", elapsed_ms);
+        assert!(
+            elapsed_ms >= 10.0,
+            "elapsed_ms should be >= 10ms, got {}",
+            elapsed_ms
+        );
     }
 }

@@ -15,10 +15,10 @@
 //! like success.
 
 use crate::dname::dname_to_bytes;
+use crate::error::WireError;
+use crate::error::{DnssecError, DnssecResult};
 use crate::utils::{current_unix_timestamp, record_types as rt};
 use crate::{ParsedRecord, RecordData, ResourceRecord};
-use crate::error::{DnssecError, DnssecResult};
-use crate::error::WireError;
 use ring::signature;
 
 /// DNSKEY flags bit 7 (0x0100): the key is a zone key, i.e. it may sign RRsets
@@ -455,7 +455,9 @@ pub fn signed_data(
     rdatas: &[RecordData],
 ) -> DnssecResult<Vec<u8>> {
     if rdatas.is_empty() {
-        return Err(DnssecError::signing("cannot build signed data for an empty RRset"));
+        return Err(DnssecError::signing(
+            "cannot build signed data for an empty RRset",
+        ));
     }
 
     // RRSIG_RDATA with the signature field left off.
@@ -483,14 +485,11 @@ pub fn signed_data(
     canonical.dedup();
 
     for rdata in &canonical {
-        let rdlen: u16 = rdata
-            .len()
-            .try_into()
-            .map_err(|_| WireError::TooLong {
-                what: "RDATA",
-                limit: u16::MAX as usize,
-                actual: rdata.len(),
-            })?;
+        let rdlen: u16 = rdata.len().try_into().map_err(|_| WireError::TooLong {
+            what: "RDATA",
+            limit: u16::MAX as usize,
+            actual: rdata.len(),
+        })?;
         data.extend_from_slice(&name_wire);
         data.extend_from_slice(&rrsig.type_covered.to_be_bytes());
         data.extend_from_slice(&class.to_be_bytes());
@@ -810,8 +809,10 @@ pub fn verify_rrset(
                     }
                 }
                 Ok(false) => {
-                    last_failure =
-                        format!("signature on {owner} did not verify under key {}", key.key_tag())
+                    last_failure = format!(
+                        "signature on {owner} did not verify under key {}",
+                        key.key_tag()
+                    )
                 }
                 Err(e) => unsupported = Some(format!("{owner}: {e}")),
             }
@@ -887,7 +888,11 @@ mod tests {
         let ns = RecordData::from_parsed(&ParsedRecord::NS("NS1.Example.COM.".into())).unwrap();
         let lowered = canonical_rdata(&ns).unwrap();
         let want = RecordData::from_parsed(&ParsedRecord::NS("ns1.example.com.".into())).unwrap();
-        assert_eq!(lowered, want.rdata.to_vec(), "NS is on the RFC 4034 §6.2 list");
+        assert_eq!(
+            lowered,
+            want.rdata.to_vec(),
+            "NS is on the RFC 4034 §6.2 list"
+        );
 
         // TXT is not on the list, so its bytes pass through untouched — length
         // prefix (RFC 1035 §3.3.14) and case both.
@@ -1094,8 +1099,7 @@ mod tests {
     fn test_expired_signature_is_bogus() {
         let key = TestKey::generate_p256();
         let rdatas = vec![a_rdata(1)];
-        let mut rrsig =
-            key.sign_rrset("example.com.", rt::A, 1, 3600, "example.com.", &rdatas);
+        let mut rrsig = key.sign_rrset("example.com.", rt::A, 1, 3600, "example.com.", &rdatas);
         let now = current_unix_timestamp();
         rrsig.inception = (now - 7200) as u32;
         rrsig.expiration = (now - 3600) as u32;
@@ -1157,8 +1161,7 @@ mod tests {
         let key = TestKey::generate_p256();
         let rdatas = vec![a_rdata(5)];
         // Signed at *.example.com. (2 labels) but served for anything.example.com.
-        let mut rrsig =
-            key.sign_rrset("*.example.com.", rt::A, 1, 3600, "example.com.", &rdatas);
+        let mut rrsig = key.sign_rrset("*.example.com.", rt::A, 1, 3600, "example.com.", &rdatas);
         rrsig.owner = "anything.example.com.".to_string();
         rrsig.labels = 2;
 
@@ -1272,8 +1275,14 @@ mod tests {
     #[test]
     fn test_malformed_keys_error_rather_than_panic() {
         assert!(rsa_key_parts(&[]).is_err());
-        assert!(rsa_key_parts(&[0]).is_err(), "3-byte form with nothing after");
-        assert!(rsa_key_parts(&[9, 1, 2]).is_err(), "exponent runs off the end");
+        assert!(
+            rsa_key_parts(&[0]).is_err(),
+            "3-byte form with nothing after"
+        );
+        assert!(
+            rsa_key_parts(&[9, 1, 2]).is_err(),
+            "exponent runs off the end"
+        );
         assert!(rsa_key_parts(&[3, 1, 2, 3]).is_err(), "no modulus left");
     }
 
@@ -1310,7 +1319,8 @@ mod tests {
             "the DS must point at the KSK"
         );
         assert!(
-            !ds.matches_key(&zone.zsk.dnskey("example.com.")).unwrap_or(false),
+            !ds.matches_key(&zone.zsk.dnskey("example.com."))
+                .unwrap_or(false),
             "and not at the ZSK, which the parent never saw"
         );
 

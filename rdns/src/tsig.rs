@@ -35,8 +35,8 @@
 //! reason to believe the sender holds it); BADTIME is signed, because the MAC did
 //! verify.
 
-use crate::error::{ConfigError, ConfigResult};
 use crate::dname::dname_to_bytes;
+use crate::error::{ConfigError, ConfigResult};
 use crate::utils::current_unix_timestamp;
 use base64::Engine;
 use ring::hmac;
@@ -146,7 +146,9 @@ impl TsigKey {
                 *secret,
             ),
             _ => {
-                return Err(ConfigError::new(format!("TSIG key {spec:?} is not [algorithm:]name:base64secret")))
+                return Err(ConfigError::new(format!(
+                    "TSIG key {spec:?} is not [algorithm:]name:base64secret"
+                )))
             }
         };
         if name.is_empty() {
@@ -154,9 +156,13 @@ impl TsigKey {
         }
         let secret = base64::prelude::BASE64_STANDARD
             .decode(secret)
-            .map_err(|e| ConfigError::new(format!("TSIG secret for {name:?} is not base64: {e}")))?;
+            .map_err(|e| {
+                ConfigError::new(format!("TSIG secret for {name:?} is not base64: {e}"))
+            })?;
         if secret.is_empty() {
-            return Err(ConfigError::new(format!("TSIG secret for {name:?} is empty")));
+            return Err(ConfigError::new(format!(
+                "TSIG secret for {name:?} is empty"
+            )));
         }
         Ok(TsigKey::new(name, algorithm, secret))
     }
@@ -226,7 +232,8 @@ pub struct Tsig {
 impl Tsig {
     /// Parse the RDATA of a TSIG record.
     fn parse_rdata(key_name: &str, rdata: &[u8]) -> ConfigResult<Self> {
-        let (algorithm_name, rest) = read_name(rdata).ok_or_else(|| ConfigError::new("TSIG algorithm name is malformed"))?;
+        let (algorithm_name, rest) =
+            read_name(rdata).ok_or_else(|| ConfigError::new("TSIG algorithm name is malformed"))?;
         if rest.len() < 10 {
             return Err(ConfigError::new("TSIG RDATA is truncated before its time"));
         }
@@ -244,7 +251,9 @@ impl Tsig {
         let other_len = u16::from_be_bytes([rest[4], rest[5]]) as usize;
         let rest = &rest[6..];
         if rest.len() < other_len {
-            return Err(ConfigError::new("TSIG RDATA is truncated inside its other data"));
+            return Err(ConfigError::new(
+                "TSIG RDATA is truncated inside its other data",
+            ));
         }
         Ok(Tsig {
             key_name: canonical_key_name(key_name),
@@ -260,8 +269,9 @@ impl Tsig {
 
     /// The RDATA bytes of this record.
     fn rdata_bytes(&self) -> ConfigResult<Vec<u8>> {
-        let mut out = dname_to_bytes(&self.algorithm_name)
-            .map_err(|e| ConfigError::new(format!("TSIG algorithm name {}: {e}", self.algorithm_name)))?;
+        let mut out = dname_to_bytes(&self.algorithm_name).map_err(|e| {
+            ConfigError::new(format!("TSIG algorithm name {}: {e}", self.algorithm_name))
+        })?;
         out.extend_from_slice(&self.time_signed.to_be_bytes()[2..]); // 48 bits
         out.extend_from_slice(&self.fudge.to_be_bytes());
         out.extend_from_slice(&(self.mac.len() as u16).to_be_bytes());
@@ -381,7 +391,9 @@ impl TsigSession {
     /// unnoticed.
     pub fn sign(&mut self, message: Vec<u8>, now: u64) -> ConfigResult<Vec<u8>> {
         if message.len() < 12 {
-            return Err(ConfigError::new("cannot sign a message shorter than a header"));
+            return Err(ConfigError::new(
+                "cannot sign a message shorter than a header",
+            ));
         }
         let mut tsig = Tsig {
             key_name: self.key.name.clone(),
@@ -538,7 +550,9 @@ pub fn check_request(packet: &[u8], keyring: &TsigKeyring, now: u64) -> TsigChec
 /// sides through.
 pub fn sign_request(message: Vec<u8>, key: &TsigKey, now: u64) -> ConfigResult<Vec<u8>> {
     if message.len() < 12 {
-        return Err(ConfigError::new("cannot sign a message shorter than a header"));
+        return Err(ConfigError::new(
+            "cannot sign a message shorter than a header",
+        ));
     }
     let mut tsig = Tsig {
         key_name: key.name.clone(),
@@ -887,9 +901,15 @@ mod tests {
     #[test]
     fn test_bad_key_specs_are_errors() {
         assert!(TsigKey::parse("no-secret").is_err());
-        assert!(TsigKey::parse("hmac-md5:k:AAEC").is_err(), "MD5 is deprecated");
+        assert!(
+            TsigKey::parse("hmac-md5:k:AAEC").is_err(),
+            "MD5 is deprecated"
+        );
         assert!(TsigKey::parse("hmac-sha256:k:not base64!").is_err());
-        assert!(TsigKey::parse("hmac-sha256::AAECAwQFBgcICQoLDA0ODw==").is_err(), "no name");
+        assert!(
+            TsigKey::parse("hmac-sha256::AAECAwQFBgcICQoLDA0ODw==").is_err(),
+            "no name"
+        );
     }
 
     /// A key name is not a licence to pick the algorithm: answering BADKEY for a
@@ -897,8 +917,12 @@ mod tests {
     #[test]
     fn test_the_keyring_matches_name_and_algorithm() {
         let ring = TsigKeyring::new(vec![test_key()]);
-        assert!(ring.get("TRANSFER.KEY.", TsigAlgorithm::HmacSha256).is_some());
-        assert!(ring.get("transfer.key", TsigAlgorithm::HmacSha256).is_some());
+        assert!(ring
+            .get("TRANSFER.KEY.", TsigAlgorithm::HmacSha256)
+            .is_some());
+        assert!(ring
+            .get("transfer.key", TsigAlgorithm::HmacSha256)
+            .is_some());
         assert!(ring.get("transfer.key.", TsigAlgorithm::HmacSha1).is_none());
         assert!(ring.get("other.key.", TsigAlgorithm::HmacSha256).is_none());
     }
@@ -977,7 +1001,11 @@ mod tests {
         match check_request(&signed, &TsigKeyring::default(), now) {
             TsigCheck::Rejected(r) => {
                 assert_eq!(r.error, TsigError::BadKey);
-                assert_eq!(r.key_name(), "transfer.key.", "the error names the key asked for");
+                assert_eq!(
+                    r.key_name(),
+                    "transfer.key.",
+                    "the error names the key asked for"
+                );
             }
             _ => panic!("an empty keyring knows no keys"),
         }
@@ -1104,7 +1132,11 @@ mod tests {
         };
 
         let envelopes: Vec<Vec<u8>> = (0..3)
-            .map(|i| session.sign(query_bytes(&format!("e{i}.example.com."), 252), now).unwrap())
+            .map(|i| {
+                session
+                    .sign(query_bytes(&format!("e{i}.example.com."), 252), now)
+                    .unwrap()
+            })
             .collect();
 
         // In order: each verifies against the previous MAC.
@@ -1132,11 +1164,14 @@ mod tests {
         let request = sign_request(query_bytes("example.com.", 252), &key, signed_at).unwrap();
 
         // BADKEY: unsigned, empty MAC.
-        let TsigCheck::Rejected(badkey) = check_request(&request, &TsigKeyring::default(), signed_at)
+        let TsigCheck::Rejected(badkey) =
+            check_request(&request, &TsigKeyring::default(), signed_at)
         else {
             panic!("expected a rejection");
         };
-        let reply = badkey.attach(query_bytes("example.com.", 252), signed_at).unwrap();
+        let reply = badkey
+            .attach(query_bytes("example.com.", 252), signed_at)
+            .unwrap();
         let (_, rdata, owner) = find_tsig(&reply).unwrap();
         let tsig = Tsig::parse_rdata(&owner, rdata).unwrap();
         assert_eq!(tsig.error, 17);
@@ -1149,13 +1184,21 @@ mod tests {
             panic!("expected a rejection");
         };
         assert_eq!(badtime.error, TsigError::BadTime);
-        let reply = badtime.attach(query_bytes("example.com.", 252), later).unwrap();
+        let reply = badtime
+            .attach(query_bytes("example.com.", 252), later)
+            .unwrap();
         let (_, rdata, owner) = find_tsig(&reply).unwrap();
         let tsig = Tsig::parse_rdata(&owner, rdata).unwrap();
         assert_eq!(tsig.error, 18);
-        assert_eq!(tsig.mac.len(), 32, "the MAC verified, so the reply is signed");
         assert_eq!(
-            tsig.other.iter().fold(0u64, |acc, b| (acc << 8) | *b as u64),
+            tsig.mac.len(),
+            32,
+            "the MAC verified, so the reply is signed"
+        );
+        assert_eq!(
+            tsig.other
+                .iter()
+                .fold(0u64, |acc, b| (acc << 8) | *b as u64),
             later,
             "so the peer can see whose clock is wrong"
         );
@@ -1185,7 +1228,10 @@ mod tests {
     #[test]
     fn test_malformed_rdata_is_an_error_not_a_panic() {
         assert!(Tsig::parse_rdata("k.", &[]).is_err());
-        assert!(Tsig::parse_rdata("k.", b"\x0chmac-sha256\x00").is_err(), "no timers");
+        assert!(
+            Tsig::parse_rdata("k.", b"\x0chmac-sha256\x00").is_err(),
+            "no timers"
+        );
         // A MAC size that runs past the end.
         let mut rdata = b"\x0bhmac-sha256\x00".to_vec();
         rdata.extend_from_slice(&[0, 0, 0, 0, 0, 1]); // time

@@ -53,10 +53,7 @@ pub enum WireError {
     Unsupported { what: &'static str },
     /// A structural rule of the encoding is broken.
     #[error("malformed {what}: {detail}")]
-    Malformed {
-        what: &'static str,
-        detail: String,
-    },
+    Malformed { what: &'static str, detail: String },
 }
 
 impl WireError {

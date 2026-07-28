@@ -198,7 +198,10 @@ mod tests {
     #[test]
     fn test_temp_path_is_a_sibling_of_the_target() {
         let temp = temp_path_for(Path::new("/var/db/example.com.zone")).expect("temp path");
-        assert_eq!(temp.parent(), Path::new("/var/db/example.com.zone").parent());
+        assert_eq!(
+            temp.parent(),
+            Path::new("/var/db/example.com.zone").parent()
+        );
         assert!(
             temp.file_name()
                 .expect("a name")
@@ -209,6 +212,9 @@ mod tests {
 
         // A bare file name has no parent directory to join against.
         let bare = temp_path_for(Path::new("zone")).expect("temp path");
-        assert_eq!(bare, PathBuf::from(format!(".zone.tmp{}", std::process::id())));
+        assert_eq!(
+            bare,
+            PathBuf::from(format!(".zone.tmp{}", std::process::id()))
+        );
     }
 }

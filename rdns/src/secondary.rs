@@ -142,15 +142,23 @@ impl MasterSpec {
         let spec = spec.trim();
         let (rest, key_name) = match spec.split_once('#') {
             Some((rest, key)) if !key.is_empty() => (rest, Some(key.to_string())),
-            Some(_) => return Err(ConfigError::new(format!("{spec:?}: '#' with no key name after it"))),
+            Some(_) => {
+                return Err(ConfigError::new(format!(
+                    "{spec:?}: '#' with no key name after it"
+                )))
+            }
             None => (spec, None),
         };
         let Some((zone, master)) = rest.split_once('@') else {
-            return Err(ConfigError::new(format!("{spec:?} is not zone@master[:port][#key]: no '@' separating the \
-                 zone from the address it comes from")));
+            return Err(ConfigError::new(format!(
+                "{spec:?} is not zone@master[:port][#key]: no '@' separating the \
+                 zone from the address it comes from"
+            )));
         };
         if zone.is_empty() {
-            return Err(ConfigError::new(format!("{spec:?}: no zone before the '@'")));
+            return Err(ConfigError::new(format!(
+                "{spec:?}: no zone before the '@'"
+            )));
         }
 
         Ok(MasterSpec {
@@ -172,7 +180,9 @@ fn parse_address(text: &str, spec: &str) -> ConfigResult<SocketAddr> {
     }
     match text.parse::<IpAddr>() {
         Ok(ip) => Ok(SocketAddr::new(ip, 53)),
-        Err(e) => Err(ConfigError::new(format!("{spec:?}: {text:?} is not an address or address:port: {e}"))),
+        Err(e) => Err(ConfigError::new(format!(
+            "{spec:?}: {text:?} is not an address or address:port: {e}"
+        ))),
     }
 }
 
@@ -296,15 +306,22 @@ impl StateFile {
 fn parse_state_line(line: &str) -> ConfigResult<TransferState> {
     let fields: Vec<&str> = line.split_whitespace().collect();
     let [zone, serial, refreshed_at, master] = fields[..] else {
-        return Err(ConfigError::new(format!("expected 4 fields, got {}", fields.len())));
+        return Err(ConfigError::new(format!(
+            "expected 4 fields, got {}",
+            fields.len()
+        )));
     };
     Ok(TransferState {
         zone: absolute(zone),
-        serial: serial.parse().map_err(|e| ConfigError::new(format!("serial: {e}")))?,
+        serial: serial
+            .parse()
+            .map_err(|e| ConfigError::new(format!("serial: {e}")))?,
         refreshed_at: refreshed_at
             .parse()
             .map_err(|e| ConfigError::new(format!("refresh time: {e}")))?,
-        master: master.parse().map_err(|e| ConfigError::new(format!("master address: {e}")))?,
+        master: master
+            .parse()
+            .map_err(|e| ConfigError::new(format!("master address: {e}")))?,
     })
 }
 
@@ -378,10 +395,10 @@ mod tests {
     #[test]
     fn test_a_malformed_master_spec_is_an_error() {
         for spec in [
-            "example.com",              // no master
-            "@192.0.2.1",               // no zone
+            "example.com", // no master
+            "@192.0.2.1",  // no zone
             "example.com@not-an-address",
-            "example.com@192.0.2.1#",   // '#' promising a key that is not there
+            "example.com@192.0.2.1#", // '#' promising a key that is not there
         ] {
             assert!(
                 MasterSpec::parse(spec).is_err(),
@@ -409,8 +426,14 @@ mod tests {
                 expire: 1_209_600,
             })
         );
-        assert_eq!(RefreshTimers::from_zone(&zone).unwrap().after_success(), Duration::from_secs(7200));
-        assert_eq!(RefreshTimers::from_zone(&zone).unwrap().after_failure(), Duration::from_secs(3600));
+        assert_eq!(
+            RefreshTimers::from_zone(&zone).unwrap().after_success(),
+            Duration::from_secs(7200)
+        );
+        assert_eq!(
+            RefreshTimers::from_zone(&zone).unwrap().after_failure(),
+            Duration::from_secs(3600)
+        );
 
         // No SOA, no timers to obey.
         let bare = parse_zone_file("www IN A 192.0.2.1\n", "example.com.").unwrap();
@@ -436,8 +459,14 @@ mod tests {
         let timers = RefreshTimers::from_soa(3600, 600, 86400);
         let fetched_at = 1_000_000;
 
-        assert!(!timers.has_expired(fetched_at, fetched_at + 86_400), "exactly at the limit");
-        assert!(timers.has_expired(fetched_at, fetched_at + 86_401), "past it");
+        assert!(
+            !timers.has_expired(fetched_at, fetched_at + 86_400),
+            "exactly at the limit"
+        );
+        assert!(
+            timers.has_expired(fetched_at, fetched_at + 86_401),
+            "past it"
+        );
         assert!(
             !timers.has_expired(fetched_at, fetched_at - 5),
             "a clock that went backwards does not expire a zone"
@@ -450,7 +479,10 @@ mod tests {
     fn test_default_timers_cannot_expire() {
         let timers = RefreshTimers::default();
         assert!(!timers.has_expired(0, u64::MAX));
-        assert_eq!(timers.after_success(), Duration::from_secs(DEFAULT_REFRESH_SECS));
+        assert_eq!(
+            timers.after_success(),
+            Duration::from_secs(DEFAULT_REFRESH_SECS)
+        );
     }
 
     #[test]
@@ -458,7 +490,10 @@ mod tests {
         assert!(is_newer(2, 1));
         assert!(!is_newer(1, 2));
         assert!(!is_newer(5, 5), "the same serial is not newer");
-        assert!(is_newer(3, u32::MAX - 1), "RFC 1982: wrapping is an increment");
+        assert!(
+            is_newer(3, u32::MAX - 1),
+            "RFC 1982: wrapping is an increment"
+        );
         assert!(!is_newer(u32::MAX - 1, 3));
     }
 
@@ -587,11 +622,25 @@ mod tests {
 
         let state = StateFile::load(&path);
         assert_eq!(state.entries().len(), 2, "the readable lines survive");
-        assert_eq!(state.get("example.com.", addr("192.0.2.1:53")).unwrap().serial, 42);
-        assert_eq!(state.get("good.test.", addr("192.0.2.2:53")).unwrap().serial, 7);
+        assert_eq!(
+            state
+                .get("example.com.", addr("192.0.2.1:53"))
+                .unwrap()
+                .serial,
+            42
+        );
+        assert_eq!(
+            state
+                .get("good.test.", addr("192.0.2.2:53"))
+                .unwrap()
+                .serial,
+            7
+        );
 
         // And a file that is not there at all is the same thing: fetch.
-        assert!(StateFile::load(&dir.0.join("no-such-file")).entries().is_empty());
+        assert!(StateFile::load(&dir.0.join("no-such-file"))
+            .entries()
+            .is_empty());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Shared utility functions for RDNSC
-//! 
+//!
 //! This module contains common functions that are used across multiple modules
 //! to eliminate code duplication and provide a consistent interface for:
 //! - Domain name normalization
@@ -209,9 +209,7 @@ pub fn is_cache_expired(expires_at: u64) -> bool {
 ///
 /// # Errors
 /// Returns an error if the record is not a DNSKEY record
-pub fn extract_dnskey_fields(
-    key: &ParsedRecord,
-) -> DnssecResult<(u8, Vec<u8>, u16, u8)> {
+pub fn extract_dnskey_fields(key: &ParsedRecord) -> DnssecResult<(u8, Vec<u8>, u16, u8)> {
     match key {
         ParsedRecord::DNSKEY {
             algorithm,
@@ -324,7 +322,7 @@ mod tests {
     fn test_current_unix_timestamp() {
         let ts = current_unix_timestamp();
         assert!(ts > 0);
-        
+
         let ts2 = current_unix_timestamp();
         assert!(ts2 >= ts);
     }
@@ -334,7 +332,7 @@ mod tests {
         let now = current_unix_timestamp() as u32;
         let inception = now + 3600; // 1 hour in future
         let expiration = now + 7200; // 2 hours in future
-        
+
         assert!(is_time_expired(inception, expiration));
     }
 
@@ -343,7 +341,7 @@ mod tests {
         let now = current_unix_timestamp() as u32;
         let inception = now - 7200; // 2 hours ago
         let expiration = now - 3600; // 1 hour ago
-        
+
         assert!(is_time_expired(inception, expiration));
     }
 
@@ -352,7 +350,7 @@ mod tests {
         let now = current_unix_timestamp() as u32;
         let inception = now - 3600; // 1 hour ago
         let expiration = now + 3600; // 1 hour in future
-        
+
         assert!(!is_time_expired(inception, expiration));
     }
 
@@ -360,7 +358,7 @@ mod tests {
     fn test_is_cache_expired_valid() {
         let now = current_unix_timestamp();
         let expires_at = now + 3600; // 1 hour from now
-        
+
         assert!(!is_cache_expired(expires_at));
     }
 
@@ -368,7 +366,7 @@ mod tests {
     fn test_is_cache_expired_expired() {
         let now = current_unix_timestamp();
         let expires_at = now - 1; // Already expired
-        
+
         assert!(is_cache_expired(expires_at));
     }
 
@@ -404,11 +402,13 @@ mod tests {
     #[test]
     fn test_record_type_code_standard() {
         use std::net::Ipv4Addr;
-        
-        let a_record = RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap();
+
+        let a_record =
+            RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap();
         assert_eq!(record_type_code(&a_record), record_types::A);
 
-        let aaaa_record = RecordData::from_parsed(&ParsedRecord::AAAA("::1".parse().unwrap())).unwrap();
+        let aaaa_record =
+            RecordData::from_parsed(&ParsedRecord::AAAA("::1".parse().unwrap())).unwrap();
         assert_eq!(record_type_code(&aaaa_record), record_types::AAAA);
     }
 
@@ -419,7 +419,8 @@ mod tests {
             protocol: 3,
             algorithm: 8,
             public_key: vec![1, 2, 3],
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(record_type_code(&dnskey), record_types::DNSKEY);
 
         let ds = RecordData::from_parsed(&ParsedRecord::DS {
@@ -427,7 +428,8 @@ mod tests {
             algorithm: 8,
             digest_type: 2,
             digest: vec![1, 2, 3],
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(record_type_code(&ds), record_types::DS);
     }
 
@@ -442,7 +444,10 @@ mod tests {
         assert_eq!(record_type_name_to_code("A"), Some(record_types::A));
         assert_eq!(record_type_name_to_code("AAAA"), Some(record_types::AAAA));
         assert_eq!(record_type_name_to_code("MX"), Some(record_types::MX));
-        assert_eq!(record_type_name_to_code("DNSKEY"), Some(record_types::DNSKEY));
+        assert_eq!(
+            record_type_name_to_code("DNSKEY"),
+            Some(record_types::DNSKEY)
+        );
         assert_eq!(record_type_name_to_code("UNKNOWN"), None);
     }
 
@@ -499,7 +504,10 @@ mod tests {
             std::io::ErrorKind::NetworkUnreachable,
             std::io::ErrorKind::HostUnreachable,
         ] {
-            assert!(recv_error_is_transient(&std::io::Error::from(kind)), "{kind:?}");
+            assert!(
+                recv_error_is_transient(&std::io::Error::from(kind)),
+                "{kind:?}"
+            );
         }
     }
 
@@ -514,7 +522,10 @@ mod tests {
             std::io::ErrorKind::AddrNotAvailable,
             std::io::ErrorKind::OutOfMemory,
         ] {
-            assert!(!recv_error_is_transient(&std::io::Error::from(kind)), "{kind:?}");
+            assert!(
+                !recv_error_is_transient(&std::io::Error::from(kind)),
+                "{kind:?}"
+            );
         }
     }
 
@@ -525,7 +536,11 @@ mod tests {
         // U+212A KELVIN SIGN lowercases to `k` under Unicode rules. Two names
         // that are different bytes on the wire must not come out equal.
         assert_ne!(ascii_lowered("\u{212A}.example.com."), "k.example.com.");
-        assert_eq!("\u{212A}".to_lowercase(), "k", "which is what to_lowercase does");
+        assert_eq!(
+            "\u{212A}".to_lowercase(),
+            "k",
+            "which is what to_lowercase does"
+        );
     }
 
     #[test]

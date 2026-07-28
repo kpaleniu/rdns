@@ -64,7 +64,9 @@ impl DnssecValidator {
 
     /// Check if a zone is signed (has DNSKEY records)
     pub fn is_zone_signed(zone: &Zone) -> bool {
-        zone.records().iter().any(|r| r.rdata.rtype == record_types::DNSKEY)
+        zone.records()
+            .iter()
+            .any(|r| r.rdata.rtype == record_types::DNSKEY)
     }
 
     /// Validate records in a response before sending
@@ -228,7 +230,8 @@ mod tests {
                 protocol: 3,
                 algorithm: 8,
                 public_key: vec![1, 2, 3, 4],
-            }).unwrap(),
+            })
+            .unwrap(),
         });
 
         assert!(DnssecValidator::is_zone_signed(&zone));

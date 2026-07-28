@@ -26,11 +26,11 @@ pub struct ValidationConfig {
 impl Default for ValidationConfig {
     fn default() -> Self {
         ValidationConfig {
-            max_udp_size: 512,         // RFC 1035 standard
-            max_tcp_size: 16 * 1024,   // 16KB for TCP
-            max_labels: 127,           // RFC 1035 limit
-            max_label_size: 63,        // RFC 1035 limit
-            max_name_size: 255,        // RFC 1035 limit
+            max_udp_size: 512,       // RFC 1035 standard
+            max_tcp_size: 16 * 1024, // 16KB for TCP
+            max_labels: 127,         // RFC 1035 limit
+            max_label_size: 63,      // RFC 1035 limit
+            max_name_size: 255,      // RFC 1035 limit
         }
     }
 }
@@ -212,7 +212,7 @@ impl RequestValidator {
         depth: usize,
     ) -> Result<(), WireError> {
         const MAX_DEPTH: usize = 10;
-        
+
         if depth > MAX_DEPTH {
             return Err(WireError::TooLong {
                 what: "compression pointer nesting",
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn test_valid_small_packet() {
         let validator = RequestValidator::with_defaults();
-        
+
         // Minimal valid DNS query header (12 bytes) + minimal query (www.com.)
         let packet = vec![
             0x00, 0x01, // ID
@@ -318,11 +318,11 @@ mod tests {
             0x00, 0x00, // 0 additionals
             0x03, 0x77, 0x77, 0x77, // "www"
             0x03, 0x63, 0x6f, 0x6d, // "com"
-            0x00,       // root
+            0x00, // root
             0x00, 0x01, // A record
             0x00, 0x01, // IN class
         ];
-        
+
         let result = validator.validate_packet(&packet, false);
         assert_eq!(result, ValidationResult::Valid);
     }
@@ -331,11 +331,17 @@ mod tests {
     fn test_packet_too_large_udp() {
         let validator = RequestValidator::with_defaults();
         let packet = vec![0u8; 513]; // Over 512 byte limit for UDP
-        
+
         let result = validator.validate_packet(&packet, false);
         assert!(!result.is_valid());
         assert!(
-            matches!(result.error(), Some(WireError::TooLong { what: "the packet", .. })),
+            matches!(
+                result.error(),
+                Some(WireError::TooLong {
+                    what: "the packet",
+                    ..
+                })
+            ),
             "got {result:?}"
         );
     }
@@ -344,12 +350,18 @@ mod tests {
     fn test_packet_size_ok_tcp() {
         let validator = RequestValidator::with_defaults();
         let packet = vec![0u8; 600]; // Valid for TCP
-        
+
         // But invalid because it's malformed DNS
         let result = validator.validate_packet(&packet, true);
         // May fail due to format, but not size
         assert!(
-            !matches!(result.error(), Some(WireError::TooLong { what: "the packet", .. })),
+            !matches!(
+                result.error(),
+                Some(WireError::TooLong {
+                    what: "the packet",
+                    ..
+                })
+            ),
             "600 bytes is under the TCP limit, so any failure here is not about size"
         );
     }
@@ -358,7 +370,7 @@ mod tests {
     fn test_packet_too_small() {
         let validator = RequestValidator::with_defaults();
         let packet = vec![0u8; 11]; // Less than 12-byte header
-        
+
         let result = validator.validate_packet(&packet, false);
         assert!(!result.is_valid());
     }
@@ -366,7 +378,7 @@ mod tests {
     #[test]
     fn test_request_with_answer_section() {
         let validator = RequestValidator::with_defaults();
-        
+
         // Query with QR=0 (request) but answer_count > 0 (invalid)
         let packet = vec![
             0x00, 0x01, // ID
@@ -376,11 +388,17 @@ mod tests {
             0x00, 0x00, // 0 authorities
             0x00, 0x00, // 0 additionals
         ];
-        
+
         let result = validator.validate_packet(&packet, false);
         assert!(!result.is_valid());
         assert!(
-            matches!(result.error(), Some(WireError::Malformed { what: "a request", .. })),
+            matches!(
+                result.error(),
+                Some(WireError::Malformed {
+                    what: "a request",
+                    ..
+                })
+            ),
             "got {result:?}"
         );
     }
@@ -396,30 +414,54 @@ mod tests {
         let validator = RequestValidator::with_defaults();
         let header = |opcode: u8, answers: u8, authorities: u8| {
             vec![
-                0x00, 0x01, // ID
+                0x00,
+                0x01,        // ID
                 opcode << 3, // flags: QR=0, this opcode
-                0x00, //
-                0x00, 0x01, // 1 query
-                0x00, answers, //
-                0x00, authorities, //
-                0x00, 0x00, // 0 additionals
-                0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, // "example"
-                0x03, 0x63, 0x6f, 0x6d, 0x00, // "com."
-                0x00, 0x06, // SOA
-                0x00, 0x01, // IN
+                0x00,        //
+                0x00,
+                0x01, // 1 query
+                0x00,
+                answers, //
+                0x00,
+                authorities, //
+                0x00,
+                0x00, // 0 additionals
+                0x07,
+                0x65,
+                0x78,
+                0x61,
+                0x6d,
+                0x70,
+                0x6c,
+                0x65, // "example"
+                0x03,
+                0x63,
+                0x6f,
+                0x6d,
+                0x00, // "com."
+                0x00,
+                0x06, // SOA
+                0x00,
+                0x01, // IN
             ]
         };
 
         assert!(
-            validator.validate_packet(&header(4, 1, 0), false).is_valid(),
+            validator
+                .validate_packet(&header(4, 1, 0), false)
+                .is_valid(),
             "a NOTIFY carrying the new SOA must reach the server"
         );
         assert!(
-            validator.validate_packet(&header(0, 0, 1), false).is_valid(),
+            validator
+                .validate_packet(&header(0, 0, 1), false)
+                .is_valid(),
             "an IXFR request is a QUERY carrying its SOA in the authority section"
         );
         assert!(
-            !validator.validate_packet(&header(4, 40, 0), false).is_valid(),
+            !validator
+                .validate_packet(&header(4, 40, 0), false)
+                .is_valid(),
             "the sections are capped rather than unbounded"
         );
     }
@@ -482,7 +524,7 @@ mod tests {
     #[test]
     fn test_too_many_queries() {
         let validator = RequestValidator::with_defaults();
-        
+
         let packet = vec![
             0x00, 0x01, // ID
             0x00, 0x00, // flags (query)
@@ -491,7 +533,7 @@ mod tests {
             0x00, 0x00, // 0 authorities
             0x00, 0x00, // 0 additionals
         ];
-        
+
         let result = validator.validate_packet(&packet, false);
         assert!(!result.is_valid());
     }
@@ -499,7 +541,7 @@ mod tests {
     #[test]
     fn test_response_packet_allowed() {
         let validator = RequestValidator::with_defaults();
-        
+
         // Response (QR=1) with answers is valid
         let packet = vec![
             0x00, 0x01, // ID
@@ -509,11 +551,17 @@ mod tests {
             0x00, 0x00, // 0 authorities
             0x00, 0x00, // 0 additionals
         ];
-        
+
         let result = validator.validate_packet(&packet, false);
         // Should not fail due to answer count (responses can have answers)
         assert!(
-            !matches!(result.error(), Some(WireError::Malformed { what: "a request", .. })),
+            !matches!(
+                result.error(),
+                Some(WireError::Malformed {
+                    what: "a request",
+                    ..
+                })
+            ),
             "a response may carry answers, got {result:?}"
         );
     }
@@ -521,7 +569,7 @@ mod tests {
     #[test]
     fn test_oversized_label() {
         let validator = RequestValidator::with_defaults();
-        
+
         // Create packet with a label longer than 63 bytes
         let mut packet = vec![
             0x00, 0x01, // ID
@@ -530,19 +578,24 @@ mod tests {
             0x00, 0x00, // 0 answers
             0x00, 0x00, // 0 authorities
             0x00, 0x00, // 0 additionals
-            0x41,       // Label length: 65 (exceeds 63 max)
+            0x41, // Label length: 65 (exceeds 63 max)
         ];
-        
+
         // Add 65 bytes of data
         packet.extend_from_slice(&[0x61; 65]);
-        
+
         let result = validator.validate_packet(&packet, false);
         assert!(!result.is_valid());
         assert!(
             matches!(
                 result.error(),
-                Some(WireError::TooLong { what: "a label", .. })
-                    | Some(WireError::Truncated { what: "a label", .. })
+                Some(WireError::TooLong {
+                    what: "a label",
+                    ..
+                }) | Some(WireError::Truncated {
+                    what: "a label",
+                    ..
+                })
             ),
             "got {result:?}"
         );
@@ -551,13 +604,19 @@ mod tests {
     #[test]
     fn test_max_tcp_size_accepted() {
         let validator = RequestValidator::with_defaults();
-        
+
         // 16KB should be accepted for TCP
         let packet = vec![0u8; 16 * 1024];
         let result = validator.validate_packet(&packet, true);
         // May fail due to format, but not size
         assert!(
-            !matches!(result.error(), Some(WireError::TooLong { what: "the packet", .. })),
+            !matches!(
+                result.error(),
+                Some(WireError::TooLong {
+                    what: "the packet",
+                    ..
+                })
+            ),
             "600 bytes is under the TCP limit, so any failure here is not about size"
         );
     }
@@ -565,7 +624,7 @@ mod tests {
     #[test]
     fn test_exceeds_tcp_size() {
         let validator = RequestValidator::with_defaults();
-        
+
         // Exceed 16KB for TCP
         let packet = vec![0u8; 16 * 1024 + 1];
         let result = validator.validate_packet(&packet, true);
@@ -575,7 +634,7 @@ mod tests {
     #[test]
     fn test_pointer_with_incomplete_offset() {
         let validator = RequestValidator::with_defaults();
-        
+
         let packet = vec![
             0x00, 0x01, // ID
             0x00, 0x00, // flags
@@ -583,11 +642,10 @@ mod tests {
             0x00, 0x00, // 0 answers
             0x00, 0x00, // 0 authorities
             0x00, 0x00, // 0 additionals
-            0xc0,       // Pointer marker (incomplete)
+            0xc0, // Pointer marker (incomplete)
         ];
-        
+
         let result = validator.validate_packet(&packet, false);
         assert!(!result.is_valid());
     }
 }
-

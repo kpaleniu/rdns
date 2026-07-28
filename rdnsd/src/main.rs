@@ -19,17 +19,16 @@ use rdns::{
         TransferState,
     },
     security::{RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
+    telemetry::{instrumentation, DnsMetrics, LatencyTimer},
     transfer::axfr_messages,
     tsig::{self, TsigAlgorithm, TsigCheck, TsigKey, TsigKeyring, TsigSession},
-    OpCode,
-    telemetry::{instrumentation, DnsMetrics, LatencyTimer},
     utils::{current_unix_timestamp, record_types, recv_error_is_transient, UDP_RECEIVE_BUFFER},
     validation::RequestValidator,
     xfr,
     zone::{parse_zone_file_at, NameKind, Zone},
     zone_signer::{sign_zone, DenialChain, SigningPolicy},
     zone_writer::write_zone_file,
-    DnsMessage, Edns, ResourceRecord, ResponseCode, EDNS_VERSION,
+    DnsMessage, Edns, OpCode, ResourceRecord, ResponseCode, EDNS_VERSION,
 };
 
 /// UDP payload size rdnsd advertises to clients via EDNS0.
@@ -203,7 +202,7 @@ enum ZoneSource {
 }
 
 /// Build a DNS response for the given query message
-/// 
+///
 /// Looks up the zone based on the query name and returns appropriate response
 fn make_response(
     msg: &DnsMessage,
@@ -488,13 +487,7 @@ fn in_zone(zone: &Zone, name: &str) -> bool {
 /// The answer echoes the name asked about rather than the stored owner, which
 /// may be `@`, relative, or a wildcard — and for a wildcard match the queried
 /// name is what the client must see (RFC 1034 §4.3.3).
-fn add_answer(
-    zone: &Zone,
-    name: &str,
-    qtype: u16,
-    dnssec_ok: bool,
-    response: &mut DnsMessage,
-) {
+fn add_answer(zone: &Zone, name: &str, qtype: u16, dnssec_ok: bool, response: &mut DnsMessage) {
     for record in zone.query(name, qtype) {
         response.answers.push(ResourceRecord {
             name: name.to_string(),
@@ -668,12 +661,10 @@ fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> 
                     .is_some_and(|prefix| prefix.ends_with('.'))
         })
         .collect();
-    
+
     // Sort by zone origin length (longest first, most specific)
-    candidates.sort_by(|a, b| {
-        b.origin().len().cmp(&a.origin().len())
-    });
-    
+    candidates.sort_by(|a, b| b.origin().len().cmp(&a.origin().len()));
+
     candidates.first().copied()
 }
 
@@ -906,7 +897,11 @@ impl Server {
                         .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
                 ),
             );
-            instrumentation::trace_validation(&ip, false, validation.error().map(|e| e.to_string()).as_deref());
+            instrumentation::trace_validation(
+                &ip,
+                false,
+                validation.error().map(|e| e.to_string()).as_deref(),
+            );
             return Vec::new();
         }
         instrumentation::trace_validation(&ip, true, None);
@@ -975,7 +970,9 @@ impl Server {
             msg.queries.first().map(|q| q.qtype),
             Some(record_types::AXFR) | Some(record_types::IXFR)
         ) {
-            return self.answer_transfer(&msg, peer, session.as_mut(), now).await;
+            return self
+                .answer_transfer(&msg, peer, session.as_mut(), now)
+                .await;
         }
 
         // Hold the zone lock only as long as it takes to build and serialize the
@@ -1007,7 +1004,8 @@ impl Server {
             Some(session) => match session.sign(bytes, now) {
                 Ok(signed) => vec![frame(&signed)],
                 Err(e) => {
-                    self.logger.log_error(ip, &format!("TSIG signing failed: {e}"));
+                    self.logger
+                        .log_error(ip, &format!("TSIG signing failed: {e}"));
                     Vec::new()
                 }
             },
@@ -1049,7 +1047,9 @@ impl Server {
         if authenticated_by.is_none() && !self.transfer_acl.allows(ip) {
             self.logger.log_error(
                 ip,
-                &format!("{kind} of {qname} refused: {ip} has no key and is not in --allow-transfer"),
+                &format!(
+                    "{kind} of {qname} refused: {ip} has no key and is not in --allow-transfer"
+                ),
             );
             println!("{kind} of {qname} from {ip}: REFUSED (no TSIG key, not in --allow-transfer)");
             return self.transfer_error(msg, ResponseCode::Refused, ip);
@@ -1062,7 +1062,10 @@ impl Server {
         let messages = {
             let zones = self.zone_map.read().await;
             let apex = absolute_name(&qname);
-            let Some(zone) = zones.values().find(|z| z.origin().eq_ignore_ascii_case(&apex)) else {
+            let Some(zone) = zones
+                .values()
+                .find(|z| z.origin().eq_ignore_ascii_case(&apex))
+            else {
                 println!("{kind} of {qname} from {ip}: NOTAUTH (not a zone served here)");
                 return self.transfer_error(msg, ResponseCode::NotAuthorized, ip);
             };
@@ -1092,7 +1095,8 @@ impl Server {
             match built {
                 Ok(messages) => messages,
                 Err(e) => {
-                    self.logger.log_error(ip, &format!("{kind} of {qname}: {e}"));
+                    self.logger
+                        .log_error(ip, &format!("{kind} of {qname}: {e}"));
                     return self.transfer_error(msg, ResponseCode::ServerFailure, ip);
                 }
             }
@@ -1146,7 +1150,8 @@ impl Server {
         match self.error_bytes(msg, rcode) {
             Some(bytes) => vec![frame(&bytes)],
             None => {
-                self.logger.log_error(ip, "could not serialize an error response");
+                self.logger
+                    .log_error(ip, "could not serialize an error response");
                 Vec::new()
             }
         }
@@ -1331,11 +1336,15 @@ async fn udp_loop(socket: Arc<UdpSocket>, server: Arc<Server>) -> Result<(), std
                     &format!(
                         "invalid query: {}",
                         validation
-                        .error()
-                        .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
+                            .error()
+                            .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
                     ),
                 );
-                instrumentation::trace_validation(&peer.ip(), false, validation.error().map(|e| e.to_string()).as_deref());
+                instrumentation::trace_validation(
+                    &peer.ip(),
+                    false,
+                    validation.error().map(|e| e.to_string()).as_deref(),
+                );
                 return;
             }
             instrumentation::trace_validation(&peer.ip(), true, None);
@@ -1437,10 +1446,8 @@ async fn udp_loop(socket: Arc<UdpSocket>, server: Arc<Server>) -> Result<(), std
                             (Some(reply), Some(session)) => match session.sign(reply, now) {
                                 Ok(signed) => Some(signed),
                                 Err(e) => {
-                                    logger.log_error(
-                                        peer.ip(),
-                                        &format!("TSIG signing failed: {e}"),
-                                    );
+                                    logger
+                                        .log_error(peer.ip(), &format!("TSIG signing failed: {e}"));
                                     None
                                 }
                             },
@@ -1684,12 +1691,7 @@ async fn announce_zones(
 /// Spawned rather than awaited for the same reason the primary's announcements
 /// are: an unanswered NOTIFY takes seconds to give up on, and a refresh should
 /// not be held behind the network to tell somebody about work it has finished.
-fn announce_transfer(
-    zone: &str,
-    serial: u32,
-    soa: Option<ResourceRecord>,
-    targets: &[SocketAddr],
-) {
+fn announce_transfer(zone: &str, serial: u32, soa: Option<ResourceRecord>, targets: &[SocketAddr]) {
     for target in targets {
         let (zone, soa, target) = (zone.to_string(), soa.clone(), *target);
         tokio::spawn(async move {
@@ -2260,8 +2262,7 @@ async fn main() -> Result<()> {
     validate_cli_args(&cli.host, cli.port)?;
     // A typo in either list stops the server rather than quietly narrowing it —
     // or, worse, being read as something wider.
-    let transfer_acl =
-        TransferAcl::parse(&cli.allow_transfer)?;
+    let transfer_acl = TransferAcl::parse(&cli.allow_transfer)?;
     let tsig_keys = TsigKeyring::parse(&cli.tsig_key)?;
     let notify_targets = parse_notify_targets(&cli.also_notify)?;
 
@@ -2364,10 +2365,7 @@ fn parse_secondary_specs(specs: &[String]) -> Result<Vec<MasterSpec>> {
     specs
         .iter()
         .filter(|spec| !spec.trim().is_empty())
-        .map(|spec| {
-            MasterSpec::parse(spec)
-                .map_err(|e| anyhow!("--secondary {e}"))
-        })
+        .map(|spec| MasterSpec::parse(spec).map_err(|e| anyhow!("--secondary {e}")))
         .collect()
 }
 
@@ -2376,19 +2374,22 @@ fn validate_cli_args(host: &str, port: u16) -> Result<()> {
     if port == 0 {
         return Err(anyhow!("Port must be in range 1-65535"));
     }
-    
+
     // Host must be valid IP or hostname (basic validation)
     // This is a simple check; more complex validation could parse as IP
     if host.is_empty() {
         return Err(anyhow!("Host cannot be empty"));
     }
-    
+
     // Very basic hostname/IP validation - just check for invalid characters
     // Valid hostnames: alphanumeric, dots, hyphens, colons (for IPv6)
-    if !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':' || c == '%') {
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':' || c == '%')
+    {
         return Err(anyhow!("Invalid host format: {host}"));
     }
-    
+
     Ok(())
 }
 
@@ -2419,16 +2420,14 @@ fn validate_zone_source(
         (None, Some(dir)) => {
             // Check if directory exists
             if !Path::new(&dir).is_dir() {
-                return Err(anyhow!("Zone directory not found or not a directory: {dir}"));
+                return Err(anyhow!(
+                    "Zone directory not found or not a directory: {dir}"
+                ));
             }
             Ok(ZoneSource::Directory(dir))
         }
-        (Some(_), Some(_)) => {
-            Err(anyhow!("Cannot specify both --zone-file and --zone-dir"))
-        }
-        (None, None) => {
-            Err(anyhow!("Must specify either --zone-file or --zone-dir"))
-        }
+        (Some(_), Some(_)) => Err(anyhow!("Cannot specify both --zone-file and --zone-dir")),
+        (None, None) => Err(anyhow!("Must specify either --zone-file or --zone-dir")),
     }
 }
 
@@ -2495,8 +2494,7 @@ impl ZoneSigning {
             let Some(keys) = self.keys.get(&origin.to_ascii_lowercase()) else {
                 continue;
             };
-            *zone = sign_zone(zone, keys, &policy)
-                .with_context(|| format!("signing {origin}"))?;
+            *zone = sign_zone(zone, keys, &policy).with_context(|| format!("signing {origin}"))?;
             println!(
                 "Signed {origin} with {} key{}",
                 keys.len(),
@@ -2515,10 +2513,7 @@ impl ZoneSigning {
 /// every zone with a child. What this catches is the case worth catching: a
 /// zone whose signatures have expired, or were made over data that has since
 /// been edited, which otherwise keeps answering as though nothing happened.
-fn verify_zones(
-    zones: &HashMap<String, Zone>,
-    validator: &DnssecValidator,
-) -> Result<()> {
+fn verify_zones(zones: &HashMap<String, Zone>, validator: &DnssecValidator) -> Result<()> {
     if !validator.is_enabled() {
         return Ok(());
     }
@@ -2584,11 +2579,7 @@ fn signed_rrsets(zone: &Zone) -> Vec<(String, u16)> {
 /// the parent being involved: only the key-signing key is digested into the DS,
 /// so the zone-signing key can be replaced whenever, while replacing the other
 /// means a conversation with the registrar.
-fn generate_keys(
-    zone: &str,
-    dir: &Path,
-    algorithm: &str,
-) -> Result<()> {
+fn generate_keys(zone: &str, dir: &Path, algorithm: &str) -> Result<()> {
     let algorithm = SigningAlgorithm::parse(algorithm)?;
     let zone = if zone.ends_with('.') {
         zone.to_string()
@@ -2596,10 +2587,8 @@ fn generate_keys(
         format!("{zone}.")
     };
 
-    let ksk = SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP)
-        ?;
-    let zsk =
-        SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE)?;
+    let ksk = SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP)?;
+    let zsk = SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE)?;
     for key in [&ksk, &zsk] {
         let path = key.write_to_dir(dir)?;
         println!("Wrote {}", path.display());
@@ -2679,14 +2668,14 @@ fn extract_zone_origin_from_path(path: &str) -> String {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("zone");
-    
+
     // Remove .zone extension if present
     let origin = if let Some(stripped) = file_name.strip_suffix(".zone") {
         stripped
     } else {
         file_name
     };
-    
+
     // Ensure it ends with a dot
     if origin.ends_with('.') {
         origin.to_string()
@@ -2696,10 +2685,7 @@ fn extract_zone_origin_from_path(path: &str) -> String {
 }
 
 /// Enumerate all .zone files in a directory and load them
-fn enumerate_zone_files(
-    dir: &str,
-    allow_partial: bool,
-) -> Result<HashMap<String, Zone>> {
+fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<HashMap<String, Zone>> {
     let mut zones = HashMap::new();
     let mut failures: Vec<String> = Vec::new();
     let entries = std::fs::read_dir(dir)?;
@@ -2816,14 +2802,20 @@ mod tests {
     fn test_validate_cli_args_localhost() {
         // Test CLI argument validation with localhost (valid for local dev)
         let result = validate_cli_args("127.0.0.1", 5353);
-        assert!(result.is_ok(), "Localhost with custom port should pass validation");
+        assert!(
+            result.is_ok(),
+            "Localhost with custom port should pass validation"
+        );
     }
 
     #[test]
     fn test_validate_cli_args_custom_host() {
         // Test CLI argument validation with custom host
         let result = validate_cli_args("192.168.1.1", 8053);
-        assert!(result.is_ok(), "Custom host and port should pass validation");
+        assert!(
+            result.is_ok(),
+            "Custom host and port should pass validation"
+        );
     }
 
     #[test]
@@ -2881,21 +2873,34 @@ mod tests {
         // Test zone source validation error when directory doesn't exist
         // This documents that validate_zone_source checks directory existence
         let result = validate_zone_source(None, Some("/nonexistent/path".to_string()), false);
-        assert!(result.is_err(), "Non-existent directory should fail validation");
+        assert!(
+            result.is_err(),
+            "Non-existent directory should fail validation"
+        );
     }
 
     #[test]
     fn test_validate_zone_source_both_present_error() {
         // Test zone source validation rejects when both file and dir provided
-        let result = validate_zone_source(Some("test.zone".to_string()), Some("/etc/dns".to_string()), false);
-        assert!(result.is_err(), "Should reject when both file and dir specified");
+        let result = validate_zone_source(
+            Some("test.zone".to_string()),
+            Some("/etc/dns".to_string()),
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "Should reject when both file and dir specified"
+        );
     }
 
     #[test]
     fn test_validate_zone_source_neither_present_error() {
         // Test zone source validation rejects when neither file nor dir provided
         let result = validate_zone_source(None, None, false);
-        assert!(result.is_err(), "Should reject when neither file nor dir specified");
+        assert!(
+            result.is_err(),
+            "Should reject when neither file nor dir specified"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2925,7 +2930,10 @@ mod tests {
         let err = parse_secondary_specs(&["nonsense".to_string()])
             .unwrap_err()
             .to_string();
-        assert!(err.to_string().contains("--secondary"), "the error names the flag: {err}");
+        assert!(
+            err.to_string().contains("--secondary"),
+            "the error names the flag: {err}"
+        );
     }
 
     /// A primary on a loopback port, answering with `rdnsd`'s own AXFR path.
@@ -2941,8 +2949,10 @@ mod tests {
     /// A primary serving `new_text` that remembers the step from `old_text` —
     /// what a real one holds after a reload, and what lets it answer an IXFR.
     async fn spawn_primary_with_history(old_text: &str, new_text: &str) -> SocketAddr {
-        let old = rdns::zone::parse_zone_file(old_text, "example.com.").expect("parse the old zone");
-        let new = rdns::zone::parse_zone_file(new_text, "example.com.").expect("parse the new zone");
+        let old =
+            rdns::zone::parse_zone_file(old_text, "example.com.").expect("parse the old zone");
+        let new =
+            rdns::zone::parse_zone_file(new_text, "example.com.").expect("parse the new zone");
         let mut log = DeltaLog::new();
         log.note_change(Some(&old), &new);
         spawn_primary_inner(new, &["127.0.0.1".to_string()], log).await
@@ -3034,9 +3044,7 @@ mod tests {
         };
         let r = replication(&dir, Vec::new());
 
-        let outcome = refresh_once(&spec, None, &r)
-            .await
-            .expect("refresh");
+        let outcome = refresh_once(&spec, None, &r).await.expect("refresh");
         assert!(outcome.contains("transferred serial 7"), "got: {outcome}");
 
         // Served from memory...
@@ -3078,16 +3086,17 @@ mod tests {
         };
         let r = replication(&dir, Vec::new());
 
-        refresh_once(&spec, None, &r)
-            .await
-            .expect("first refresh");
-        let second = refresh_once(&spec, None, &r)
-            .await
-            .expect("second refresh");
+        refresh_once(&spec, None, &r).await.expect("first refresh");
+        let second = refresh_once(&spec, None, &r).await.expect("second refresh");
 
         assert!(second.contains("current"), "got: {second}");
         assert_eq!(
-            r.zone_map.read().await.get("example.com.").unwrap().serial(),
+            r.zone_map
+                .read()
+                .await
+                .get("example.com.")
+                .unwrap()
+                .serial(),
             Some(7)
         );
     }
@@ -3102,7 +3111,11 @@ mod tests {
 
         let old = spawn_primary(&zone_text(7)).await;
         refresh_once(
-            &MasterSpec { zone: spec_zone.clone(), master: old, key_name: None },
+            &MasterSpec {
+                zone: spec_zone.clone(),
+                master: old,
+                key_name: None,
+            },
             None,
             &r,
         )
@@ -3119,7 +3132,11 @@ mod tests {
         )
         .await;
         let outcome = refresh_once(
-            &MasterSpec { zone: spec_zone, master: new, key_name: None },
+            &MasterSpec {
+                zone: spec_zone,
+                master: new,
+                key_name: None,
+            },
             None,
             &r,
         )
@@ -3141,7 +3158,9 @@ mod tests {
     #[tokio::test]
     async fn test_a_zone_out_of_contact_past_expire_is_withdrawn() {
         let dir = ScratchDir::new("expire");
-        let master = "127.0.0.1:1".parse().expect("an address nothing answers on");
+        let master = "127.0.0.1:1"
+            .parse()
+            .expect("an address nothing answers on");
         let spec = MasterSpec {
             zone: "example.com.".to_string(),
             master,
@@ -3271,7 +3290,13 @@ mod tests {
         assert!(
             held.query("www.example.com.", record_types::A)
                 .iter()
-                .all(|r| r.rdata.parse().map(|p| matches!(p, rdns::ParsedRecord::A(a) if a.octets() == [192, 0, 2, 250])).unwrap_or(false)),
+                .all(|r| r
+                    .rdata
+                    .parse()
+                    .map(
+                        |p| matches!(p, rdns::ParsedRecord::A(a) if a.octets() == [192, 0, 2, 250])
+                    )
+                    .unwrap_or(false)),
             "the old address must be gone, not merged"
         );
 
@@ -3281,12 +3306,22 @@ mod tests {
             let mut rows: Vec<_> = z
                 .records()
                 .iter()
-                .map(|r| (z.normalize_name(&r.name).to_lowercase(), r.ttl, r.rdata.clone()))
+                .map(|r| {
+                    (
+                        z.normalize_name(&r.name).to_lowercase(),
+                        r.ttl,
+                        r.rdata.clone(),
+                    )
+                })
                 .collect();
             rows.sort_by_key(|r| (r.0.clone(), r.2.rtype));
             rows
         };
-        assert_eq!(key(held), key(&expected), "the increment reproduced the zone");
+        assert_eq!(
+            key(held),
+            key(&expected),
+            "the increment reproduced the zone"
+        );
     }
 
     /// A secondary that takes a transfer tells its own secondaries at once.
@@ -3312,15 +3347,14 @@ mod tests {
             key_name: None,
         };
 
-        refresh_once(&spec, None, &r)
-            .await
-            .expect("transfer");
+        refresh_once(&spec, None, &r).await.expect("transfer");
 
         let mut buf = vec![0u8; 4096];
-        let (n, _from) = tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
-            .await
-            .expect("a NOTIFY should arrive")
-            .expect("recv");
+        let (n, _from) =
+            tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
+                .await
+                .expect("a NOTIFY should arrive")
+                .expect("recv");
 
         let msg = DnsMessage::try_from_bytes(&buf[..n]).expect("parse the NOTIFY");
         assert_eq!(msg.opcode, OpCode::Notify, "a NOTIFY, not a query");
@@ -3356,18 +3390,14 @@ mod tests {
         };
 
         // The first transfer announces; drain it.
-        refresh_once(&spec, None, &r)
-            .await
-            .expect("transfer");
+        refresh_once(&spec, None, &r).await.expect("transfer");
         let mut buf = vec![0u8; 4096];
         let _ = tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
             .await
             .expect("the first NOTIFY");
 
         // The second finds the same serial and must say nothing.
-        let outcome = refresh_once(&spec, None, &r)
-            .await
-            .expect("second refresh");
+        let outcome = refresh_once(&spec, None, &r).await.expect("second refresh");
         assert!(outcome.contains("current"), "got: {outcome}");
         assert!(
             tokio::time::timeout(Duration::from_millis(500), downstream.recv_from(&mut buf))
@@ -3659,7 +3689,12 @@ mod tests {
         /// says it exists to prevent.
         #[tokio::test]
         async fn a_reload_does_not_resurrect_a_zone_that_expired() {
-            let Replica { dir, specs, zone_map, deltas } = replicated_setup("expire-reload");
+            let Replica {
+                dir,
+                specs,
+                zone_map,
+                deltas,
+            } = replicated_setup("expire-reload");
             // Last contact two hours ago, against an EXPIRE of one.
             record_contact(&dir, "192.0.2.1:53", current_unix_timestamp() - 7200);
 
@@ -3695,7 +3730,12 @@ mod tests {
         /// ours to answer for in the first place.
         #[tokio::test]
         async fn a_zone_with_no_record_of_transfer_is_not_served() {
-            let Replica { dir, specs, zone_map, deltas } = replicated_setup("expire-nostate");
+            let Replica {
+                dir,
+                specs,
+                zone_map,
+                deltas,
+            } = replicated_setup("expire-nostate");
             assert!(!state_file_path(&dir.0).exists(), "no sidecar at all");
 
             withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
@@ -3706,7 +3746,12 @@ mod tests {
         /// one, and lands in the same place.
         #[tokio::test]
         async fn a_record_for_another_master_does_not_vouch_for_this_one() {
-            let Replica { dir, specs, zone_map, deltas } = replicated_setup("expire-othermaster");
+            let Replica {
+                dir,
+                specs,
+                zone_map,
+                deltas,
+            } = replicated_setup("expire-othermaster");
             record_contact(&dir, "192.0.2.99:53", current_unix_timestamp());
 
             withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
@@ -3717,7 +3762,12 @@ mod tests {
         /// keeps being served, reload or no reload.
         #[tokio::test]
         async fn a_zone_in_contact_with_its_master_keeps_being_served() {
-            let Replica { dir, specs, zone_map, deltas } = replicated_setup("expire-fresh");
+            let Replica {
+                dir,
+                specs,
+                zone_map,
+                deltas,
+            } = replicated_setup("expire-fresh");
             record_contact(&dir, "192.0.2.1:53", current_unix_timestamp());
 
             withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
@@ -3952,7 +4002,11 @@ ns.sub   IN A   192.0.2.20
         fn a_name_below_a_delegation_gets_a_referral_not_an_nxdomain() {
             let response = ask("anything.sub.example.com.", record_types::A);
 
-            assert_eq!(response.rcode, ResponseCode::Ok, "a referral is not an error");
+            assert_eq!(
+                response.rcode,
+                ResponseCode::Ok,
+                "a referral is not an error"
+            );
             assert!(
                 !response.authoritive,
                 "RFC 1035 §4.1.1: AA is clear on a referral — this is the bit that \
@@ -3961,7 +4015,11 @@ ns.sub   IN A   192.0.2.20
             assert!(response.answers.is_empty());
 
             let ns = rdatas(&response.authorities, record_types::NS);
-            assert_eq!(ns.len(), 2, "the child's NS RRset, in the authority section");
+            assert_eq!(
+                ns.len(),
+                2,
+                "the child's NS RRset, in the authority section"
+            );
             assert!(ns.iter().all(|r| r.name == "sub.example.com."));
             assert!(
                 rdatas(&response.authorities, record_types::SOA).is_empty(),
@@ -4269,7 +4327,11 @@ ns.plain  IN A   192.0.2.30
                     .filter(|r| r.rdata.rtype == record_types::DS)
                     .map(|r| r.rdata.clone())
                     .collect();
-                assert_eq!(ds.len(), 1, "nsec3={nsec3}: the DS is what continues the chain");
+                assert_eq!(
+                    ds.len(),
+                    1,
+                    "nsec3={nsec3}: the DS is what continues the chain"
+                );
 
                 let sigs = rrsigs_in(&response.authorities);
                 let proof = verify_rrset(
@@ -4318,7 +4380,10 @@ ns.plain  IN A   192.0.2.30
                     &nsecs_in(&response.authorities),
                     &nsec3s_in(&response.authorities),
                 );
-                assert!(matches!(denial, Denial::Proved), "nsec3={nsec3}: {denial:?}");
+                assert!(
+                    matches!(denial, Denial::Proved),
+                    "nsec3={nsec3}: {denial:?}"
+                );
             }
         }
 
@@ -4367,7 +4432,10 @@ ns.plain  IN A   192.0.2.30
                     &nsecs_in(&response.authorities),
                     &nsec3s_in(&response.authorities),
                 );
-                assert!(matches!(denial, Denial::Proved), "nsec3={nsec3}: {denial:?}");
+                assert!(
+                    matches!(denial, Denial::Proved),
+                    "nsec3={nsec3}: {denial:?}"
+                );
             }
         }
 
@@ -4451,10 +4519,11 @@ ns.plain  IN A   192.0.2.30
                 "--signing-key-dir",
                 dir.0.to_str().unwrap(),
             ]);
-            let signing = ZoneSigning::load(&cli).expect("load keys").expect("configured");
+            let signing = ZoneSigning::load(&cli)
+                .expect("load keys")
+                .expect("configured");
 
-            let mut zones =
-                enumerate_zone_files(dir.0.to_str().unwrap(), false).expect("zones");
+            let mut zones = enumerate_zone_files(dir.0.to_str().unwrap(), false).expect("zones");
             signing.apply(&mut zones).expect("sign");
 
             // Checked with the same validator the server runs before serving.
@@ -4499,9 +4568,10 @@ ns.plain  IN A   192.0.2.30
             for record in zone.records() {
                 let mut record = record.clone();
                 if record.name == "www.example.com." && record.rdata.rtype == record_types::A {
-                    record.rdata =
-                        RecordData::from_parsed(&rdns::ParsedRecord::A("198.51.100.9".parse().unwrap()))
-                            .unwrap();
+                    record.rdata = RecordData::from_parsed(&rdns::ParsedRecord::A(
+                        "198.51.100.9".parse().unwrap(),
+                    ))
+                    .unwrap();
                 }
                 edited.add_record(record);
             }

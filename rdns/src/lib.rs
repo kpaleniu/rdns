@@ -2,52 +2,50 @@ use crate::error::WireError;
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::{FromPrimitive, ToPrimitive};
 use rand::Rng;
-use std::{
-    net::{Ipv4Addr, Ipv6Addr},
-};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use compression::NameCompressor;
 use dname::{dname_from_bytes, dname_to_bytes, write_bytes, DNameUnpacker, TryUnpackFromBytes};
 
-pub mod error;
-pub mod compression;
-pub mod dname;
-pub mod zone;
-pub mod zone_writer;
-pub mod zone_signer;
-pub mod xfr;
-pub mod secondary;
-pub mod ixfr;
-pub mod rfc5011;
-pub mod special_names;
-pub mod persist;
-pub mod security;
-pub mod validation;
-pub mod logging;
 pub mod bench;
 pub mod cache;
-pub mod resolver;
-pub mod transfer;
-pub mod tsig;
-pub mod metrics;
-pub mod notify;
-pub mod nsec_cache;
-pub mod negative_cache;
+pub mod compression;
+pub mod dname;
 pub mod dnssec;
 pub mod dnssec_answer;
 pub mod dnssec_chain;
-pub mod dnssec_key;
 pub mod dnssec_denial;
-pub mod dnssec_validation_mode;
+pub mod dnssec_key;
 /// Real DNSSEC signing for tests only — see the module docs for why an
 /// in-process signer is the only way to exercise this code here.
 #[cfg(test)]
 mod dnssec_test_util;
+pub mod dnssec_validation_mode;
+pub mod error;
+pub mod ixfr;
+pub mod logging;
+pub mod metrics;
+pub mod negative_cache;
+pub mod notify;
+pub mod nsec_cache;
+pub mod persist;
+pub mod resolver;
+pub mod rfc5011;
+pub mod secondary;
+pub mod security;
+pub mod special_names;
 pub mod telemetry;
+pub mod transfer;
+pub mod tsig;
 pub mod utils;
+pub mod validation;
+pub mod xfr;
+pub mod zone;
+pub mod zone_signer;
+pub mod zone_writer;
 
 // Re-export cache module for public use
-pub use cache::{DnsCache, CacheStats};
+pub use cache::{CacheStats, DnsCache};
 
 #[macro_use]
 mod macros {
@@ -436,8 +434,8 @@ impl ParsedRecord {
                         "the salt extends past the end of the record",
                     ));
                 }
-                let salt = rest[1..1+salt_len].to_vec();
-                let rest = &rest[1+salt_len..];
+                let salt = rest[1..1 + salt_len].to_vec();
+                let rest = &rest[1 + salt_len..];
 
                 // next_hashed_owner is a raw byte string (not a domain name)
                 if rest.is_empty() {
@@ -453,8 +451,8 @@ impl ParsedRecord {
                         "the next-hashed-owner field extends past the end of the record",
                     ));
                 }
-                let next_hashed_owner = rest[1..1+next_owner_len].to_vec();
-                let type_bitmap = rest[1+next_owner_len..].to_vec();
+                let next_hashed_owner = rest[1..1 + next_owner_len].to_vec();
+                let type_bitmap = rest[1 + next_owner_len..].to_vec();
 
                 Ok(ParsedRecord::NSEC3 {
                     hash_algorithm,
@@ -500,12 +498,10 @@ impl ParsedRecord {
                     // The length is one byte, so 255 is the ceiling. Splitting a
                     // longer string across two character-strings would change
                     // what the record says, so this is the zone's mistake to fix.
-                    let len = u8::try_from(s.len()).map_err(|_| {
-                        WireError::TooLong {
-                            what: "a TXT character-string",
-                            limit: 255,
-                            actual: s.len(),
-                        }
+                    let len = u8::try_from(s.len()).map_err(|_| WireError::TooLong {
+                        what: "a TXT character-string",
+                        limit: 255,
+                        actual: s.len(),
                     })?;
                     v.push(len);
                     v.extend_from_slice(s);
@@ -593,7 +589,9 @@ impl ParsedRecord {
                 next_hashed_owner,
                 type_bitmap,
             } => {
-                let mut v = Vec::with_capacity(6 + salt.len() + next_hashed_owner.len() + type_bitmap.len());
+                let mut v = Vec::with_capacity(
+                    6 + salt.len() + next_hashed_owner.len() + type_bitmap.len(),
+                );
                 v.push(*hash_algorithm);
                 v.push(*flags);
                 v.extend_from_slice(&iterations.to_be_bytes());
@@ -662,8 +660,8 @@ pub struct DnsMessage {
     pub truncation: bool, // whether or not the message had to be truncated due to transmission channel
     pub recursion: bool,  // query: whether or not client wants server to do recursion
     pub recursion_ok: bool, // response: whether or not server support is available
-    pub ad: bool,        // Authenticated Data bit (RFC 4035)
-    pub cd: bool,        // Checking Disabled bit (RFC 4035)
+    pub ad: bool,         // Authenticated Data bit (RFC 4035)
+    pub cd: bool,         // Checking Disabled bit (RFC 4035)
     pub rcode: ResponseCode, // response status: whether or not response was succesful
 
     pub queries: Vec<QuerySection>,
@@ -803,12 +801,10 @@ impl Edns {
     fn to_record(&self) -> Result<ResourceRecord, WireError> {
         let mut rdata = Vec::new();
         for opt in &self.options {
-            let len: u16 = opt.data.len().try_into().map_err(|_| {
-                WireError::TooLong {
-                    what: "EDNS option data",
-                    limit: u16::MAX as usize,
-                    actual: opt.data.len(),
-                }
+            let len: u16 = opt.data.len().try_into().map_err(|_| WireError::TooLong {
+                what: "EDNS option data",
+                limit: u16::MAX as usize,
+                actual: opt.data.len(),
             })?;
             rdata.extend_from_slice(&opt.code.to_be_bytes());
             rdata.extend_from_slice(&len.to_be_bytes());
@@ -1017,7 +1013,7 @@ impl DnsMessage {
             | (self.authoritive as u8) << 2
             | (self.truncation as u8) << 1
             | self.recursion as u8;
-        let lo: u8 = (self.recursion_ok as u8) << 7 
+        let lo: u8 = (self.recursion_ok as u8) << 7
             | (self.ad as u8) << 5
             | (self.cd as u8) << 4
             | (rcode & 0xf) as u8;
@@ -1341,7 +1337,10 @@ mod tests {
             let mut buf = vec![0u8; 512];
             let n = msg.to_bytes(&mut buf).expect("serialize");
             let parsed = DnsMessage::try_from_bytes(&buf[..n]).expect("parse");
-            assert_eq!(parsed.opcode, opcode, "opcode {opcode:?} did not round-trip");
+            assert_eq!(
+                parsed.opcode, opcode,
+                "opcode {opcode:?} did not round-trip"
+            );
             // And the flags either side of it are unharmed.
             assert!(parsed.authoritive, "AA survived alongside {opcode:?}");
             assert!(!parsed.response);
@@ -1391,8 +1390,7 @@ mod tests {
     /// zone's error to fix rather than ours to paper over.
     #[test]
     fn test_txt_string_longer_than_255_is_refused() {
-        let err =
-            RecordData::from_parsed(&ParsedRecord::TXT(vec![vec![b'x'; 256]])).unwrap_err();
+        let err = RecordData::from_parsed(&ParsedRecord::TXT(vec![vec![b'x'; 256]])).unwrap_err();
         assert!(err.to_string().contains("255"), "got: {err}");
 
         // 255 exactly is fine.
@@ -1449,7 +1447,11 @@ mod tests {
         let n = msg.to_bytes(&mut buf).expect("to_bytes");
         let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
 
-        assert_eq!(parsed.answers.len(), 1, "answer record must survive round-trip");
+        assert_eq!(
+            parsed.answers.len(),
+            1,
+            "answer record must survive round-trip"
+        );
         let a = &parsed.answers[0];
         assert_eq!(a.name, "www.example.com.");
         assert_eq!(a.class, 1);
@@ -1672,7 +1674,8 @@ mod tests {
         assert_eq!(msg.udp_payload_size(), 4096);
 
         // set_edns replaces rather than accumulates.
-        msg.set_edns(Edns::with_payload_size(1232)).expect("set_edns");
+        msg.set_edns(Edns::with_payload_size(1232))
+            .expect("set_edns");
         assert_eq!(
             msg.additionals
                 .iter()
@@ -1702,7 +1705,8 @@ mod tests {
     fn test_edns_payload_size_floored_at_512() {
         // RFC 6891 §6.2.3: values below 512 are treated as 512.
         let mut msg = query_msg(1);
-        msg.set_edns(Edns::with_payload_size(300)).expect("set_edns");
+        msg.set_edns(Edns::with_payload_size(300))
+            .expect("set_edns");
         assert_eq!(msg.udp_payload_size(), 512);
     }
 
@@ -1779,7 +1783,10 @@ mod tests {
 
         let got = parsed.edns().unwrap().expect("edns present");
         assert_eq!(got, edns);
-        assert_eq!(got.option(EDNS_OPTION_COOKIE), Some(&[1u8, 2, 3, 4, 5, 6, 7, 8][..]));
+        assert_eq!(
+            got.option(EDNS_OPTION_COOKIE),
+            Some(&[1u8, 2, 3, 4, 5, 6, 7, 8][..])
+        );
         assert_eq!(got.option(EDNS_OPTION_NSID), Some(&[][..]));
         assert_eq!(got.option(EDNS_OPTION_PADDING), None);
     }
@@ -1787,7 +1794,8 @@ mod tests {
     #[test]
     fn test_malformed_edns_options_surface_error() {
         let mut msg = query_msg(1);
-        msg.set_edns(Edns::with_payload_size(1232)).expect("set_edns");
+        msg.set_edns(Edns::with_payload_size(1232))
+            .expect("set_edns");
         // Option claims 8 bytes of data but supplies 2.
         let opt = msg
             .additionals
@@ -1817,7 +1825,8 @@ mod tests {
         let mut msg = query_msg(0x2222);
         msg.response = true;
         msg.rcode = ResponseCode::BadOptVersion;
-        msg.set_edns(Edns::with_payload_size(1232)).expect("set_edns");
+        msg.set_edns(Edns::with_payload_size(1232))
+            .expect("set_edns");
 
         let mut buf = [0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("to_bytes");
@@ -1846,7 +1855,8 @@ mod tests {
         let mut msg = query_msg(1);
         msg.response = true;
         msg.rcode = ResponseCode::NoSuchDomain;
-        msg.set_edns(Edns::with_payload_size(4096)).expect("set_edns");
+        msg.set_edns(Edns::with_payload_size(4096))
+            .expect("set_edns");
 
         let mut buf = [0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("to_bytes");
@@ -1870,10 +1880,15 @@ mod tests {
                     .unwrap(),
             });
         }
-        msg.set_edns(Edns::with_payload_size(4096)).expect("set_edns");
+        msg.set_edns(Edns::with_payload_size(4096))
+            .expect("set_edns");
 
         let bytes = msg.to_bytes_within(512).expect("to_bytes_within");
-        assert!(bytes.len() <= 512, "must fit within 512, got {}", bytes.len());
+        assert!(
+            bytes.len() <= 512,
+            "must fit within 512, got {}",
+            bytes.len()
+        );
 
         let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse truncated");
         assert!(parsed.truncation, "TC bit must be set on truncation");
@@ -1940,7 +1955,7 @@ mod tests {
             truncation: false,
             recursion: false,
             recursion_ok: false,
-            ad: true,  // Set AD bit
+            ad: true, // Set AD bit
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![],
@@ -1951,7 +1966,7 @@ mod tests {
 
         let mut buf = [0u8; 512];
         let len = msg.to_bytes(&mut buf).expect("serialize");
-        
+
         // Parse it back
         let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
         assert!(parsed.ad, "AD bit should be set");
@@ -1968,7 +1983,7 @@ mod tests {
             recursion: false,
             recursion_ok: false,
             ad: false,
-            cd: true,  // Set CD bit
+            cd: true, // Set CD bit
             rcode: ResponseCode::Ok,
             queries: vec![],
             answers: vec![],
@@ -1978,7 +1993,7 @@ mod tests {
 
         let mut buf = [0u8; 512];
         let len = msg.to_bytes(&mut buf).expect("serialize");
-        
+
         // Parse it back
         let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
         assert!(parsed.cd, "CD bit should be set");
@@ -1994,8 +2009,8 @@ mod tests {
             truncation: false,
             recursion: false,
             recursion_ok: false,
-            ad: true,   // Set AD bit
-            cd: true,   // Set CD bit
+            ad: true, // Set AD bit
+            cd: true, // Set CD bit
             rcode: ResponseCode::Ok,
             queries: vec![],
             answers: vec![],
@@ -2005,7 +2020,7 @@ mod tests {
 
         let mut buf = [0u8; 512];
         let len = msg.to_bytes(&mut buf).expect("serialize");
-        
+
         // Parse it back
         let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
         assert!(parsed.ad, "AD bit should be set");
@@ -2022,7 +2037,7 @@ mod tests {
             truncation: false,
             recursion: false,
             recursion_ok: false,
-            ad: false,  // AD bit not set
+            ad: false, // AD bit not set
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![],
@@ -2033,7 +2048,7 @@ mod tests {
 
         let mut buf = [0u8; 512];
         let len = msg.to_bytes(&mut buf).expect("serialize");
-        
+
         // Parse it back
         let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
         assert!(!parsed.ad, "AD bit should not be set");
@@ -2050,7 +2065,7 @@ mod tests {
             recursion: false,
             recursion_ok: false,
             ad: false,
-            cd: false,  // CD bit not set
+            cd: false, // CD bit not set
             rcode: ResponseCode::Ok,
             queries: vec![],
             answers: vec![],
@@ -2060,7 +2075,7 @@ mod tests {
 
         let mut buf = [0u8; 512];
         let len = msg.to_bytes(&mut buf).expect("serialize");
-        
+
         // Parse it back
         let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
         assert!(!parsed.cd, "CD bit should not be set");
@@ -2075,8 +2090,8 @@ mod tests {
             authoritive: true,
             truncation: false,
             recursion: false,
-            recursion_ok: true,  // RA bit set
-            ad: true,            // AD bit set
+            recursion_ok: true, // RA bit set
+            ad: true,           // AD bit set
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![],
@@ -2087,7 +2102,7 @@ mod tests {
 
         let mut buf = [0u8; 512];
         let len = msg.to_bytes(&mut buf).expect("serialize");
-        
+
         // Parse it back
         let parsed = DnsMessage::try_from_bytes(&buf[..len]).expect("deserialize");
         assert!(parsed.recursion_ok, "RA bit should be set");
@@ -2097,27 +2112,26 @@ mod tests {
     #[test]
     fn test_dnssec_validator_integration() {
         use crate::dnssec_validation_mode::DnssecValidator;
-        
+
         let validator = DnssecValidator::new(true);
         let zone = crate::zone::Zone::new("example.com.".to_string());
         let records = vec![];
-        
+
         let (is_valid, is_signed) = validator.validate_response(&zone, &records, "example.com.");
-        
+
         // Unsigned zone should be valid but not signed
         assert!(is_valid);
         assert!(!is_signed);
-        
+
         // AD bit should not be set
         assert!(!validator.should_set_ad_bit(is_valid, is_signed));
     }
 
     #[test]
     fn test_message_builder_initializes_ad_cd_false() {
-        let builder = DnsMessageBuilder::new()
-            .with_url("example.com", "A");
+        let builder = DnsMessageBuilder::new().with_url("example.com", "A");
         let msg = builder.build();
-        
+
         assert!(!msg.ad, "AD bit should be false by default");
         assert!(!msg.cd, "CD bit should be false by default");
     }

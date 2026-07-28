@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use crate::error::{ConfigError, ConfigResult};
+use crate::utils::current_unix_timestamp;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use crate::utils::current_unix_timestamp;
 
 /// Configuration for rate limiting
 #[derive(Debug, Clone)]
@@ -22,11 +22,11 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         RateLimitConfig {
-            tokens_per_window: 100,      // 100 queries per window
-            window_size_secs: 10,        // 10 second window
-            burst_size: 20,              // Allow burst of 20
-            cleanup_interval_secs: 600,  // 10 minute cleanup
-            max_tracked: 10_000,         // See RateLimiter: the table is attacker-keyed
+            tokens_per_window: 100,     // 100 queries per window
+            window_size_secs: 10,       // 10 second window
+            burst_size: 20,             // Allow burst of 20
+            cleanup_interval_secs: 600, // 10 minute cleanup
+            max_tracked: 10_000,        // See RateLimiter: the table is attacker-keyed
         }
     }
 }
@@ -78,7 +78,7 @@ impl RateLimiter {
     /// Check if a request from the given IP should be allowed
     pub fn should_allow(&self, ip: IpAddr) -> bool {
         let now = current_unix_timestamp();
-        
+
         // Cleanup old entries periodically
         self.cleanup_if_needed(now);
 
@@ -103,8 +103,7 @@ impl RateLimiter {
         let tokens_to_add = (time_elapsed as f64 / self.config.window_size_secs as f64)
             * self.config.tokens_per_window as f64;
 
-        bucket.tokens = (bucket.tokens + tokens_to_add)
-            .min(self.config.burst_size as f64);
+        bucket.tokens = (bucket.tokens + tokens_to_add).min(self.config.burst_size as f64);
         bucket.last_refill = now;
 
         // Check if we have tokens
@@ -355,19 +354,21 @@ impl TransferAcl {
                 Some((a, p)) => (a, Some(p)),
                 None => (spec, None),
             };
-            let addr: IpAddr = addr_part
-                .parse()
-                .map_err(|e| ConfigError::new(format!("bad address {addr_part:?} in transfer ACL: {e}")))?;
+            let addr: IpAddr = addr_part.parse().map_err(|e| {
+                ConfigError::new(format!("bad address {addr_part:?} in transfer ACL: {e}"))
+            })?;
             let max = if addr.is_ipv4() { 32 } else { 128 };
             let prefix = match prefix_part {
-                Some(p) => p
-                    .parse::<u8>()
-                    .map_err(|e| ConfigError::new(format!("bad prefix length {p:?} in transfer ACL: {e}")))?,
+                Some(p) => p.parse::<u8>().map_err(|e| {
+                    ConfigError::new(format!("bad prefix length {p:?} in transfer ACL: {e}"))
+                })?,
                 None => max,
             };
             if prefix > max {
-                return Err(ConfigError::new(format!("prefix /{prefix} is longer than an {} address allows",
-                    if addr.is_ipv4() { "IPv4" } else { "IPv6" })));
+                return Err(ConfigError::new(format!(
+                    "prefix /{prefix} is longer than an {} address allows",
+                    if addr.is_ipv4() { "IPv4" } else { "IPv6" }
+                )));
             }
             rules.push(AclRule { addr, prefix });
         }
@@ -461,7 +462,10 @@ mod tests {
         }
 
         // ip2 should still have tokens
-        assert!(limiter.should_allow(ip2), "different IPs should have separate buckets");
+        assert!(
+            limiter.should_allow(ip2),
+            "different IPs should have separate buckets"
+        );
     }
 
     /// The table an attacker keys. A bucket is created before anything validates
@@ -515,7 +519,10 @@ mod tests {
         for _ in 0..19 {
             limiter.should_allow(tracked);
         }
-        assert!(!limiter.should_allow(tracked), "the tracked bucket still empties");
+        assert!(
+            !limiter.should_allow(tracked),
+            "the tracked bucket still empties"
+        );
     }
 
     /// A clock step backwards must not panic, and must not silently refill every
@@ -644,9 +651,7 @@ mod tests {
             handles.push(handle);
         }
 
-        let total_allowed: u32 = handles.into_iter()
-            .map(|h| h.join().unwrap())
-            .sum();
+        let total_allowed: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
 
         // Each IP should allow its burst size (20)
         // So 10 IPs * 20 = 200
@@ -706,7 +711,10 @@ mod tests {
         assert!(!acl.allows("::1".parse().unwrap()));
 
         let v6 = parse_acl(&["::/0"]);
-        assert!(v6.allows("2001:db8::1".parse().unwrap()), "/0 matches its own family");
+        assert!(
+            v6.allows("2001:db8::1".parse().unwrap()),
+            "/0 matches its own family"
+        );
         assert!(!v6.allows("10.0.0.1".parse().unwrap()));
     }
 
@@ -715,7 +723,10 @@ mod tests {
     #[test]
     fn test_a_bad_rule_is_an_error() {
         assert!(TransferAcl::parse(&["not-an-address".to_string()]).is_err());
-        assert!(TransferAcl::parse(&["10.0.0.0/33".to_string()]).is_err(), "v4 prefix too long");
+        assert!(
+            TransferAcl::parse(&["10.0.0.0/33".to_string()]).is_err(),
+            "v4 prefix too long"
+        );
         assert!(TransferAcl::parse(&["2001:db8::/129".to_string()]).is_err());
         assert!(TransferAcl::parse(&["10.0.0.0/eight".to_string()]).is_err());
     }
@@ -741,12 +752,20 @@ mod tests {
                 "response {i} should fit"
             );
         }
-        assert_ne!(limiter.admit(ip, 512), ResponseVerdict::Send, "budget spent");
+        assert_ne!(
+            limiter.admit(ip, 512),
+            ResponseVerdict::Send,
+            "budget spent"
+        );
 
         // The same budget is one large answer, not eight.
         let big = ResponseLimiter::new(1, 4096, 2);
         assert_eq!(big.admit(ip, 4000), ResponseVerdict::Send);
-        assert_ne!(big.admit(ip, 512), ResponseVerdict::Send, "4000 bytes ate it");
+        assert_ne!(
+            big.admit(ip, 512),
+            ResponseVerdict::Send,
+            "4000 bytes ate it"
+        );
     }
 
     /// Slip: every second response over budget is truncated rather than dropped,
@@ -812,13 +831,20 @@ mod tests {
         let mut truncated = 0;
         for i in 0..200u32 {
             let ip: IpAddr = format!("198.51.100.{}", i % 256).parse().unwrap();
-            let ip = if i < 256 { ip } else { format!("203.0.113.{}", i % 256).parse().unwrap() };
+            let ip = if i < 256 {
+                ip
+            } else {
+                format!("203.0.113.{}", i % 256).parse().unwrap()
+            };
             if limiter.admit(ip, 100) == ResponseVerdict::Truncate {
                 truncated += 1;
             }
         }
         assert!(limiter.tracked() <= 16, "tracked {}", limiter.tracked());
-        assert!(truncated > 0, "past the bound, responses are truncated rather than tracked");
+        assert!(
+            truncated > 0,
+            "past the bound, responses are truncated rather than tracked"
+        );
     }
 
     #[test]

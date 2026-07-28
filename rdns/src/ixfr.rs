@@ -419,7 +419,8 @@ pub fn ixfr_response(
     deltas: &DeltaLog,
 ) -> TransferResult<IxfrResponse> {
     let apex = zone.origin();
-    let soa = apex_soa(zone).ok_or_else(|| TransferError::malformed(format!("zone {apex} has no SOA at its apex")))?;
+    let soa = apex_soa(zone)
+        .ok_or_else(|| TransferError::malformed(format!("zone {apex} has no SOA at its apex")))?;
     let current = zone
         .serial()
         .ok_or_else(|| TransferError::malformed(format!("zone {apex} has no serial")))?;
@@ -567,7 +568,10 @@ mod tests {
     #[test]
     fn test_unchanged_records_are_not_in_the_delta() {
         let old = zone_at(1, "www IN A 192.0.2.1\nns1 IN A 192.0.2.53\n");
-        let new = zone_at(2, "www IN A 192.0.2.1\nns1 IN A 192.0.2.53\nnew IN A 192.0.2.7\n");
+        let new = zone_at(
+            2,
+            "www IN A 192.0.2.1\nns1 IN A 192.0.2.53\nnew IN A 192.0.2.7\n",
+        );
 
         let delta = diff(&old, &new).unwrap();
         assert!(delta.deleted.is_empty(), "{:?}", delta.deleted);
@@ -694,12 +698,23 @@ mod tests {
     #[test]
     fn test_an_incremental_response_has_the_shape_the_rfc_describes() {
         let mut log = DeltaLog::new();
-        let v1 = zone_at(1, "www IN A 192.0.2.1\nkeep IN A 192.0.2.50\nb IN A 192.0.2.60\n");
-        let v2 = zone_at(2, "www IN A 192.0.2.2\nkeep IN A 192.0.2.50\nb IN A 192.0.2.60\n");
+        let v1 = zone_at(
+            1,
+            "www IN A 192.0.2.1\nkeep IN A 192.0.2.50\nb IN A 192.0.2.60\n",
+        );
+        let v2 = zone_at(
+            2,
+            "www IN A 192.0.2.2\nkeep IN A 192.0.2.50\nb IN A 192.0.2.60\n",
+        );
         log.note_change(Some(&v1), &v2);
 
         let response = ixfr_response(&request(Some(1)), &v2, &log).expect("response");
-        let IxfrResponse::Incremental { messages, steps, records } = response else {
+        let IxfrResponse::Incremental {
+            messages,
+            steps,
+            records,
+        } = response
+        else {
             panic!("expected an incremental response");
         };
         assert_eq!(steps, 1);
@@ -707,9 +722,17 @@ mod tests {
 
         let all = answers(&messages);
         assert_eq!(all[0].rdata.rtype, rt::SOA, "opens with the current SOA");
-        assert_eq!(all[1].rdata.rtype, rt::SOA, "then the old SOA: deletions follow");
+        assert_eq!(
+            all[1].rdata.rtype,
+            rt::SOA,
+            "then the old SOA: deletions follow"
+        );
         assert_eq!(all[2].name, "www.example.com.");
-        assert_eq!(all[3].rdata.rtype, rt::SOA, "then the new SOA: additions follow");
+        assert_eq!(
+            all[3].rdata.rtype,
+            rt::SOA,
+            "then the new SOA: additions follow"
+        );
         assert_eq!(all[4].name, "www.example.com.");
         assert_eq!(all[5].rdata.rtype, rt::SOA, "closes with the current SOA");
         assert_eq!(all.len(), 6);
@@ -755,7 +778,9 @@ mod tests {
 
         // No SOA in the request: nothing to compare against.
         let response = ixfr_response(&request(None), &v2, &DeltaLog::new()).unwrap();
-        assert!(matches!(response, IxfrResponse::FullTransfer { why, .. } if why.contains("no SOA")));
+        assert!(
+            matches!(response, IxfrResponse::FullTransfer { why, .. } if why.contains("no SOA"))
+        );
     }
 
     /// If the increment is not smaller than the zone, the zone is the cheaper
@@ -764,7 +789,10 @@ mod tests {
     fn test_a_change_bigger_than_the_zone_is_sent_as_a_full_transfer() {
         let mut log = DeltaLog::new();
         let v1 = zone_at(1, "a IN A 192.0.2.1\nb IN A 192.0.2.2\nc IN A 192.0.2.3\n");
-        let v2 = zone_at(2, "x IN A 192.0.2.11\ny IN A 192.0.2.12\nz IN A 192.0.2.13\n");
+        let v2 = zone_at(
+            2,
+            "x IN A 192.0.2.11\ny IN A 192.0.2.12\nz IN A 192.0.2.13\n",
+        );
         log.note_change(Some(&v1), &v2);
 
         // Three deleted plus three added is six, against a zone of five records.

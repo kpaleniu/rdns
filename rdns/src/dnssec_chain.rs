@@ -28,9 +28,9 @@ use crate::dnssec::{
 use crate::dnssec_denial::{
     proves_no_ds, proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
 };
+use crate::error::DnssecError;
 use crate::utils::record_types as rt;
 use crate::{ParsedRecord, RecordData, ResourceRecord};
-use crate::error::DnssecError;
 use std::collections::HashMap;
 
 /// How much authentication an answer carries (RFC 4035 §4.3).
@@ -160,15 +160,10 @@ impl TrustAnchors {
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<Self, DnssecError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| DnssecError::parse(format!(
-                "reading trust anchors {}: {e}",
-                path.display(),
-            )))?;
-        Self::parse(&text).map_err(|e| DnssecError::parse(format!(
-            "{}: {e}",
-            path.display(),
-        )))
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            DnssecError::parse(format!("reading trust anchors {}: {e}", path.display(),))
+        })?;
+        Self::parse(&text).map_err(|e| DnssecError::parse(format!("{}: {e}", path.display(),)))
     }
 
     /// The anchors published exactly at `zone`.
@@ -219,29 +214,26 @@ fn parse_ds_line(line: &str) -> Result<Ds, DnssecError> {
     }
     tokens.remove(0);
     if tokens.len() < 4 {
-        return Err(DnssecError::parse("DS needs key tag, algorithm, digest type and digest"));
+        return Err(DnssecError::parse(
+            "DS needs key tag, algorithm, digest type and digest",
+        ));
     }
 
-    let key_tag: u16 = tokens[0].parse().map_err(|_| DnssecError::parse(format!(
-        "bad key tag {:?}",
-        tokens[0],
-    )))?;
+    let key_tag: u16 = tokens[0]
+        .parse()
+        .map_err(|_| DnssecError::parse(format!("bad key tag {:?}", tokens[0],)))?;
     let algorithm: u8 = tokens[1]
         .parse()
-        .map_err(|_| DnssecError::parse(format!(
-            "bad algorithm {:?}",
-            tokens[1],
-        )))?;
+        .map_err(|_| DnssecError::parse(format!("bad algorithm {:?}", tokens[1],)))?;
     let digest_type: u8 = tokens[2]
         .parse()
-        .map_err(|_| DnssecError::parse(format!(
-            "bad digest type {:?}",
-            tokens[2],
-        )))?;
+        .map_err(|_| DnssecError::parse(format!("bad digest type {:?}", tokens[2],)))?;
     // The digest may be split across whitespace, as it is in IANA's own file.
     let hex: String = tokens[3..].concat();
     if !hex.len().is_multiple_of(2) {
-        return Err(DnssecError::parse("digest has an odd number of hex characters"));
+        return Err(DnssecError::parse(
+            "digest has an odd number of hex characters",
+        ));
     }
     let digest = (0..hex.len())
         .step_by(2)
@@ -301,7 +293,10 @@ impl DelegationEvidence {
             .collect();
         DelegationEvidence {
             class: relevant.first().map(|rr| rr.class).unwrap_or(1),
-            ds: relevant.iter().filter_map(|rr| Ds::from_record(rr)).collect(),
+            ds: relevant
+                .iter()
+                .filter_map(|rr| Ds::from_record(rr))
+                .collect(),
             rrsigs: authorities.iter().filter_map(Rrsig::from_record).collect(),
             nsecs: authorities.iter().filter_map(Nsec::from_record).collect(),
             nsec3s: authorities.iter().filter_map(Nsec3::from_record).collect(),
@@ -915,7 +910,9 @@ pub fn cname_chain_shape(qname: &str, qtype: u16, answers: &[ResourceRecord]) ->
         }
     }
 
-    ChainShape::Intact { final_name: current }
+    ChainShape::Intact {
+        final_name: current,
+    }
 }
 
 #[cfg(test)]
@@ -975,7 +972,10 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors =
             TrustAnchors::parse(". IN DS 20326 8 2 E06D44B8 0B8F1D39 A95C0B0D 7C65D084 58E88040 9BBC6834 57104237 C7F8EC8D")
                 .expect("should parse");
-        assert_eq!(anchors.for_zone(".")[0].digest, TrustAnchors::icann_root().for_zone(".")[0].digest);
+        assert_eq!(
+            anchors.for_zone(".")[0].digest,
+            TrustAnchors::icann_root().for_zone(".")[0].digest
+        );
     }
 
     /// A typo must stop us rather than silently trust less than intended.
@@ -983,7 +983,10 @@ example.test. DS 12345 13 2 ABCDEF0123456789
     fn test_bad_anchor_file_is_an_error() {
         assert!(TrustAnchors::parse("").is_err(), "empty file");
         assert!(TrustAnchors::parse("; only comments").is_err());
-        assert!(TrustAnchors::parse(". IN DS 20326 8 2").is_err(), "no digest");
+        assert!(
+            TrustAnchors::parse(". IN DS 20326 8 2").is_err(),
+            "no digest"
+        );
         assert!(TrustAnchors::parse(". IN A 192.0.2.1").is_err(), "not a DS");
         assert!(
             TrustAnchors::parse(". IN DS 20326 8 2 NOTHEX!!").is_err(),
@@ -1135,7 +1138,10 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let evidence =
             DelegationEvidence::from_authority("example.test.", &[ds_record(&child.ds(2), 3600)]);
         let verdict = v.validate_delegation(&evidence, "test.", &parent.dnskeys());
-        assert!(matches!(verdict, DelegationVerdict::Bogus(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, DelegationVerdict::Bogus(_)),
+            "{verdict:?}"
+        );
     }
 
     /// A signed NSEC proving there is no DS: the child really is unsigned, and
@@ -1202,7 +1208,10 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         };
         let evidence = DelegationEvidence::from_authority("example.test.", &[nsec]);
         let verdict = v.validate_delegation(&evidence, "test.", &parent.dnskeys());
-        assert!(matches!(verdict, DelegationVerdict::Bogus(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, DelegationVerdict::Bogus(_)),
+            "{verdict:?}"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1266,7 +1275,9 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         keys.insert("example.test.".into(), zone.dnskeys());
 
         // A record with no RRSIG beside it, in a zone we know is signed.
-        let state = v.validate_records(&[a_record("www.example.test.", 1)], &keys).state;
+        let state = v
+            .validate_records(&[a_record("www.example.test.", 1)], &keys)
+            .state;
         assert!(state.is_bogus(), "{state:?}");
     }
 
@@ -1327,7 +1338,11 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         keys.insert("example.test.".into(), zone.dnskeys());
 
         let verdict = v.validate_records(&[answer, sig], &keys);
-        assert_eq!(verdict.state, ValidationState::Secure, "the signature is genuine");
+        assert_eq!(
+            verdict.state,
+            ValidationState::Secure,
+            "the signature is genuine"
+        );
         assert_eq!(
             verdict.wildcards.len(),
             1,
@@ -1355,7 +1370,11 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         // The zone's own NSEC at the wildcard, which covers everything from
         // `*.example.test.` up to `www.example.test.` — `a.example.test.`
         // included, because `*` sorts before every ordinary label.
-        let nsec = nsec_record("*.example.test.", "www.example.test.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let nsec = nsec_record(
+            "*.example.test.",
+            "www.example.test.",
+            &[rt::A, rt::RRSIG, rt::NSEC],
+        );
         let nsec_sig = zone.sign_records(std::slice::from_ref(&nsec));
 
         assert_eq!(
@@ -1387,7 +1406,11 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         keys.insert("evil.test.".into(), stranger.dnskeys());
         let expansions = v.validate_records(&[answer, sig], &keys).wildcards;
 
-        let nsec = nsec_record("*.example.test.", "www.example.test.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let nsec = nsec_record(
+            "*.example.test.",
+            "www.example.test.",
+            &[rt::A, rt::RRSIG, rt::NSEC],
+        );
         let forged = stranger.sign_records(std::slice::from_ref(&nsec));
 
         let state = v.validate_wildcard_proofs(&expansions, &[nsec, forged], &keys);
@@ -1419,7 +1442,11 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 
         // The genuine NSEC at `b.example.test.`, which does cover the re-owned
         // name: a name sorts before everything beneath it.
-        let nsec = nsec_record("b.example.test.", "c.example.test.", &[rt::A, rt::RRSIG, rt::NSEC]);
+        let nsec = nsec_record(
+            "b.example.test.",
+            "c.example.test.",
+            &[rt::A, rt::RRSIG, rt::NSEC],
+        );
         let nsec_sig = zone.sign_records(std::slice::from_ref(&nsec));
 
         let state = v.validate_wildcard_proofs(&verdict.wildcards, &[nsec, nsec_sig], &keys);
@@ -1466,7 +1493,10 @@ example.test. DS 12345 13 2 ABCDEF0123456789
     #[test]
     fn test_group_rrsets_splits_by_name_and_type_and_skips_signatures() {
         let zone = TestZone::new("example.test.");
-        let addresses = vec![a_record("a.example.test.", 1), a_record("a.example.test.", 2)];
+        let addresses = vec![
+            a_record("a.example.test.", 1),
+            a_record("a.example.test.", 2),
+        ];
         let sig = zone.sign_records(&addresses);
 
         let mut records = addresses;
@@ -1474,7 +1504,11 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         records.push(sig);
 
         let sets = group_rrsets(&records);
-        assert_eq!(sets.len(), 2, "two owner names, and the RRSIG is not an RRset");
+        assert_eq!(
+            sets.len(),
+            2,
+            "two owner names, and the RRSIG is not an RRset"
+        );
         assert_eq!(sets[0].3.len(), 2, "two addresses at the first name");
         assert_eq!(sets[1].3.len(), 1);
     }
@@ -1539,7 +1573,11 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 
         // An answer with no CNAME at all is a chain of length zero.
         assert_eq!(
-            cname_chain_shape("www.example.com.", rt::A, &[a("www.example.com.", "192.0.2.2")]),
+            cname_chain_shape(
+                "www.example.com.",
+                rt::A,
+                &[a("www.example.com.", "192.0.2.2")]
+            ),
             ChainShape::Intact {
                 final_name: "www.example.com.".to_string()
             }

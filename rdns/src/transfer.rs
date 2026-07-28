@@ -176,7 +176,11 @@ mod tests {
 
         let all: Vec<&ResourceRecord> = messages.iter().flat_map(|m| m.answers.iter()).collect();
         assert!(all.len() >= 2);
-        assert_eq!(all.first().unwrap().rdata.rtype, rt::SOA, "opens with the SOA");
+        assert_eq!(
+            all.first().unwrap().rdata.rtype,
+            rt::SOA,
+            "opens with the SOA"
+        );
         assert_eq!(all.last().unwrap().rdata.rtype, rt::SOA, "closes with it");
         assert_eq!(
             all.iter().filter(|rr| rr.rdata.rtype == rt::SOA).count(),
@@ -203,7 +207,10 @@ mod tests {
             "www.example.com.",
             "*.example.com.",
         ] {
-            assert!(names.iter().any(|n| n == expected), "missing {expected}: {names:?}");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing {expected}: {names:?}"
+            );
         }
         // The SOA twice plus the four other records.
         assert_eq!(
@@ -218,7 +225,10 @@ mod tests {
         let zone = small_zone();
         let request = request_for("example.com.");
         for message in axfr_messages(&request, &zone).unwrap() {
-            assert_eq!(message.id, request.id, "the transfer keeps the request's id");
+            assert_eq!(
+                message.id, request.id,
+                "the transfer keeps the request's id"
+            );
             assert!(message.response && message.authoritive);
             assert_eq!(message.rcode, ResponseCode::Ok);
             assert_eq!(message.queries.len(), 1, "the question is echoed");
@@ -244,9 +254,20 @@ mod tests {
         let zone = parse_zone_file(&text, "example.com.").unwrap();
 
         let messages = axfr_messages(&request_for("example.com."), &zone).unwrap();
-        assert!(messages.len() > 1, "expected a split, got {} message(s)", messages.len());
+        assert!(
+            messages.len() > 1,
+            "expected a split, got {} message(s)",
+            messages.len()
+        );
         assert_eq!(
-            messages.first().unwrap().answers.first().unwrap().rdata.rtype,
+            messages
+                .first()
+                .unwrap()
+                .answers
+                .first()
+                .unwrap()
+                .rdata
+                .rtype,
             rt::SOA
         );
         assert_eq!(
@@ -261,9 +282,7 @@ mod tests {
 
         // And each message fits a TCP frame, which is the point of splitting.
         for message in &messages {
-            assert!(
-                message.to_bytes_within(u16::MAX as usize).unwrap().len() <= u16::MAX as usize
-            );
+            assert!(message.to_bytes_within(u16::MAX as usize).unwrap().len() <= u16::MAX as usize);
         }
     }
 

@@ -5,12 +5,12 @@ use std::time::Duration;
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use rdns::dnssec_chain::{TrustAnchors, ValidationState};
-use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
-use rdns::rfc5011::{self, AnchorChange, ManagedAnchors};
-use rdns::utils::current_unix_timestamp;
 use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
+use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
+use rdns::rfc5011::{self, AnchorChange, ManagedAnchors};
 use rdns::special_names;
+use rdns::utils::current_unix_timestamp;
 use rdns::utils::record_types;
 use rdns::utils::{recv_error_is_transient, UDP_RECEIVE_BUFFER};
 use rdns::{
@@ -196,7 +196,8 @@ async fn main() -> anyhow::Result<()> {
         // days old.
         managed = match &cli.auto_trust_anchor {
             Some(path) => {
-                let anchors = ManagedAnchors::load_or_seed(path, &anchors, current_unix_timestamp())?;
+                let anchors =
+                    ManagedAnchors::load_or_seed(path, &anchors, current_unix_timestamp())?;
                 // Write it out now if it is not there yet, rather than at the
                 // first change. An operator who points at a new path should be
                 // able to look at the file and see what is trusted, and a
@@ -204,7 +205,10 @@ async fn main() -> anyhow::Result<()> {
                 // wondering for a month whether any of this is on.
                 if !path.exists() {
                     anchors.save(path)?;
-                    println!("trust anchors: wrote {} from the anchors in force", path.display());
+                    println!(
+                        "trust anchors: wrote {} from the anchors in force",
+                        path.display()
+                    );
                 }
                 dnssec_source = format!(", DNSSEC validating from {} (RFC 5011)", path.display());
                 Some((path.clone(), anchors))
@@ -225,7 +229,11 @@ async fn main() -> anyhow::Result<()> {
 
     let source = match config.mode {
         ResolverMode::Recurse if custom_hints => {
-            format!("recursing from {} root hints in {}", config.root_hints.len(), cli.root_hints.as_ref().unwrap().display())
+            format!(
+                "recursing from {} root hints in {}",
+                config.root_hints.len(),
+                cli.root_hints.as_ref().unwrap().display()
+            )
         }
         ResolverMode::Recurse => "recursing from the built-in root hints".to_string(),
         ResolverMode::Forward => format!("forwarding to {:?}", config.upstream_servers),
@@ -268,7 +276,11 @@ async fn main() -> anyhow::Result<()> {
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}",
         addr,
         source,
-        if capacity == 0 { "disabled".to_string() } else { format!("{capacity} entries") },
+        if capacity == 0 {
+            "disabled".to_string()
+        } else {
+            format!("{capacity} entries")
+        },
         dnssec_source,
     );
 
@@ -426,9 +438,9 @@ fn report(change: &AnchorChange) {
         AnchorChange::Trusted { zone, key_tag } => {
             println!("trust anchors: {zone} key {key_tag} is now a trust anchor")
         }
-        AnchorChange::Withdrawn { zone, key_tag } => println!(
-            "trust anchors: {zone} key {key_tag} went away before its hold-down elapsed"
-        ),
+        AnchorChange::Withdrawn { zone, key_tag } => {
+            println!("trust anchors: {zone} key {key_tag} went away before its hold-down elapsed")
+        }
         AnchorChange::Absent { zone, key_tag } => println!(
             "trust anchors: {zone} key {key_tag} is no longer published, but is still trusted \
              (revocation is how a key is retired)"
@@ -506,11 +518,7 @@ async fn tcp_main(
 /// **concurrently** (§6.2.1.1). Concurrency earns its keep here: a cache miss
 /// costs an upstream round trip, so answering in lock-step would make every
 /// query on a connection wait out the slowest one ahead of it.
-async fn serve_connection(
-    stream: TcpStream,
-    resolver: Arc<Resolver>,
-    caches: Arc<Caches>,
-) {
+async fn serve_connection(stream: TcpStream, resolver: Arc<Resolver>, caches: Arc<Caches>) {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_INFLIGHT_PER_CONNECTION);
 
@@ -622,11 +630,15 @@ async fn handle_query(
     // option list is a FORMERR, and an EDNS version we don't implement is
     // BADVERS (RFC 6891 §6.1.3). Both replies carry a bare version-0 OPT.
     match msg.edns() {
-        Err(_) => {
-            return edns_error(id, &query, ResponseCode::FormatError, recursion, client_max)
-        }
+        Err(_) => return edns_error(id, &query, ResponseCode::FormatError, recursion, client_max),
         Ok(Some(edns)) if edns.version > EDNS_VERSION => {
-            return edns_error(id, &query, ResponseCode::BadOptVersion, recursion, client_max)
+            return edns_error(
+                id,
+                &query,
+                ResponseCode::BadOptVersion,
+                recursion,
+                client_max,
+            )
         }
         _ => {}
     }
@@ -645,7 +657,14 @@ async fn handle_query(
     // a statement about DNSSEC; it is not a request to be told what a public
     // server thinks `localhost` is.
     if let Some(local) = special_names::lookup(&query.qname, query.qtype) {
-        let mut resp = build_response(id, OpCode::Query, &query, local.answers, local.rcode, recursion);
+        let mut resp = build_response(
+            id,
+            OpCode::Query,
+            &query,
+            local.answers,
+            local.rcode,
+            recursion,
+        );
         resp.authorities = local.authority;
         // Never AD: nothing here was validated, it was decided by specification.
         // Claiming otherwise would be the one lie a validating client cannot
@@ -653,7 +672,13 @@ async fn handle_query(
         resp.ad = false;
         resp.cd = checking_disabled;
         println!("{}: answered locally — {}", query.qname, local.why);
-        return finish(resp, client_uses_edns, client_wants_dnssec, &query, client_max);
+        return finish(
+            resp,
+            client_uses_edns,
+            client_wants_dnssec,
+            &query,
+            client_max,
+        );
     }
 
     // Aggressive use of the validated denial cache (RFC 8198). A cached NSEC
@@ -672,26 +697,54 @@ async fn handle_query(
     // wildcard governs — and this way the cheaper, more specific answer is tried
     // first.
     if !checking_disabled {
-        if let Some(wildcard) = caches.denials.synthesize_wildcard(&query.qname, query.qtype) {
-            let mut resp =
-                build_response(id, OpCode::Query, &query, wildcard.answers, ResponseCode::Ok, recursion);
+        if let Some(wildcard) = caches
+            .denials
+            .synthesize_wildcard(&query.qname, query.qtype)
+        {
+            let mut resp = build_response(
+                id,
+                OpCode::Query,
+                &query,
+                wildcard.answers,
+                ResponseCode::Ok,
+                recursion,
+            );
             resp.authorities = wildcard.authority;
             // The wildcard's own signature verifies at this name unchanged —
             // that is what a wildcard signature means — so this is as validated
             // as the answer it came from, and the client can check it itself.
             resp.ad = client_wants_dnssec || msg.ad;
-            return finish(resp, client_uses_edns, client_wants_dnssec, &query, client_max);
+            return finish(
+                resp,
+                client_uses_edns,
+                client_wants_dnssec,
+                &query,
+                client_max,
+            );
         }
     }
 
     if !checking_disabled {
         if let Some(denial) = caches.denials.synthesize(&query.qname, query.qtype) {
-            let mut resp = build_response(id, OpCode::Query, &query, Vec::new(), denial.rcode, recursion);
+            let mut resp = build_response(
+                id,
+                OpCode::Query,
+                &query,
+                Vec::new(),
+                denial.rcode,
+                recursion,
+            );
             resp.authorities = denial.authority;
             // The proofs were validated before they were stored, so the answer
             // derived from them is authentic on the same terms as the original.
             resp.ad = client_wants_dnssec || msg.ad;
-            return finish(resp, client_uses_edns, client_wants_dnssec, &query, client_max);
+            return finish(
+                resp,
+                client_uses_edns,
+                client_wants_dnssec,
+                &query,
+                client_max,
+            );
         }
     }
 
@@ -701,118 +754,144 @@ async fn handle_query(
     // above, nothing here is synthesized: this is the answer this question got,
     // so a CD client may have it too.
     if let Some(negative) = caches.negatives.get(&query.qname, query.qtype) {
-        let mut resp = build_response(id, OpCode::Query, &query, Vec::new(), negative.rcode, recursion);
+        let mut resp = build_response(
+            id,
+            OpCode::Query,
+            &query,
+            Vec::new(),
+            negative.rcode,
+            recursion,
+        );
         resp.authorities = negative.authority;
         resp.ad = negative.secure && (client_wants_dnssec || msg.ad);
         resp.cd = checking_disabled;
-        return finish(resp, client_uses_edns, client_wants_dnssec, &query, client_max);
+        return finish(
+            resp,
+            client_uses_edns,
+            client_wants_dnssec,
+            &query,
+            client_max,
+        );
     }
 
     // Build the response: from cache if we have it, else by resolving.
-    let (mut resp, secure) = if let Some((records, secure)) =
-        caches.answers.get_validated(&query.qname, query.qtype)
-    {
-        (
-            build_response(id, OpCode::Query, &query, records, ResponseCode::Ok, recursion),
-            secure,
-        )
-    } else {
-        // Resolver::resolve_validated is async — each upstream round trip is an
-        // await, so this yields the task rather than holding a thread.
-        match resolver.resolve_validated(&query).await {
-            Ok((mut upstream, state)) => {
-                // The resolver used its own random transaction id; the reply
-                // must echo the client's id and advertise recursion.
-                upstream.id = id;
-                upstream.response = true;
-                upstream.recursion = recursion;
-                upstream.recursion_ok = true;
+    let (mut resp, secure) =
+        if let Some((records, secure)) = caches.answers.get_validated(&query.qname, query.qtype) {
+            (
+                build_response(
+                    id,
+                    OpCode::Query,
+                    &query,
+                    records,
+                    ResponseCode::Ok,
+                    recursion,
+                ),
+                secure,
+            )
+        } else {
+            // Resolver::resolve_validated is async — each upstream round trip is an
+            // await, so this yields the task rather than holding a thread.
+            match resolver.resolve_validated(&query).await {
+                Ok((mut upstream, state)) => {
+                    // The resolver used its own random transaction id; the reply
+                    // must echo the client's id and advertise recursion.
+                    upstream.id = id;
+                    upstream.response = true;
+                    upstream.recursion = recursion;
+                    upstream.recursion_ok = true;
 
-                if let ValidationState::Bogus(ref why) = state {
+                    if let ValidationState::Bogus(ref why) = state {
+                        eprintln!(
+                            "resolve {} type {}: DNSSEC validation failed: {why}",
+                            query.qname, query.qtype
+                        );
+                        // Fail closed. Data we know we cannot authenticate is worse
+                        // than no data: the client has no way to tell it apart from
+                        // an answer that was checked, so serving it launders an
+                        // attack into an ordinary-looking reply. A client that sets
+                        // CD has said it will do its own checking, and RFC 4035
+                        // §3.2.2 requires we hand the data over unfiltered.
+                        if !checking_disabled {
+                            let resp = build_response(
+                                id,
+                                OpCode::Query,
+                                &query,
+                                Vec::new(),
+                                ResponseCode::ServerFailure,
+                                recursion,
+                            );
+                            return finish(
+                                resp,
+                                client_uses_edns,
+                                client_wants_dnssec,
+                                &query,
+                                client_max,
+                            );
+                        }
+                    }
+
+                    let secure = state.is_secure();
+                    // Never store an answer as validated that was not, and never
+                    // store one at all if it failed: a bogus answer in the cache is
+                    // an attack that outlives the query that carried it.
+                    if !upstream.answers.is_empty() && !state.is_bogus() {
+                        caches.answers.put_validated(
+                            &query.qname,
+                            query.qtype,
+                            upstream.answers.clone(),
+                            secure,
+                        );
+                    }
+                    // A "no" is an answer, and re-resolving it every time is what
+                    // made a typo storm cost one upstream walk per repeat. RFC 2308:
+                    // the SOA in the authority section says how long it is good for.
+                    if !state.is_bogus() {
+                        caches
+                            .negatives
+                            .insert(&query.qname, query.qtype, &upstream, secure);
+                    }
+                    // A *validated* "no" is worth more than the question that
+                    // produced it — the NSEC covers a whole range of names — so it
+                    // also goes into the denial cache. Only when Secure: aggressive
+                    // use rests entirely on the proof having been checked, and an
+                    // unvalidated NSEC is an attacker's claim about which names do
+                    // not exist.
+                    if upstream.answers.is_empty() && secure {
+                        caches.denials.insert_validated(&upstream);
+                    }
+                    // And a validated *positive* answer that came from a wildcard is
+                    // the same kind of statement about a range of names (RFC 8198
+                    // §5.3), so it is kept too — under the wildcard rather than under
+                    // the name that happened to be asked for. Only when Secure, for
+                    // exactly the same reason.
+                    if !upstream.answers.is_empty() && secure {
+                        caches.denials.insert_validated_wildcard(&upstream);
+                    }
+                    (upstream, secure)
+                }
+                // Resolution failed: say why, then SERVFAIL. A resolver that turns
+                // every failure into a bare SERVFAIL is undiagnosable from the
+                // outside, and the reasons here are specific — lame delegation,
+                // budget exhausted, CNAME loop — precisely so they can be read.
+                Err(ref e) => {
                     eprintln!(
-                        "resolve {} type {}: DNSSEC validation failed: {why}",
-                        query.qname, query.qtype
+                        "resolve {} type {} failed: {:#}",
+                        query.qname, query.qtype, e
                     );
-                    // Fail closed. Data we know we cannot authenticate is worse
-                    // than no data: the client has no way to tell it apart from
-                    // an answer that was checked, so serving it launders an
-                    // attack into an ordinary-looking reply. A client that sets
-                    // CD has said it will do its own checking, and RFC 4035
-                    // §3.2.2 requires we hand the data over unfiltered.
-                    if !checking_disabled {
-                        let resp = build_response(
+                    (
+                        build_response(
                             id,
                             OpCode::Query,
                             &query,
                             Vec::new(),
                             ResponseCode::ServerFailure,
                             recursion,
-                        );
-                        return finish(
-                            resp,
-                            client_uses_edns,
-                            client_wants_dnssec,
-                            &query,
-                            client_max,
-                        );
-                    }
+                        ),
+                        false,
+                    )
                 }
-
-                let secure = state.is_secure();
-                // Never store an answer as validated that was not, and never
-                // store one at all if it failed: a bogus answer in the cache is
-                // an attack that outlives the query that carried it.
-                if !upstream.answers.is_empty() && !state.is_bogus() {
-                    caches.answers.put_validated(
-                        &query.qname,
-                        query.qtype,
-                        upstream.answers.clone(),
-                        secure,
-                    );
-                }
-                // A "no" is an answer, and re-resolving it every time is what
-                // made a typo storm cost one upstream walk per repeat. RFC 2308:
-                // the SOA in the authority section says how long it is good for.
-                if !state.is_bogus() {
-                    caches
-                        .negatives
-                        .insert(&query.qname, query.qtype, &upstream, secure);
-                }
-                // A *validated* "no" is worth more than the question that
-                // produced it — the NSEC covers a whole range of names — so it
-                // also goes into the denial cache. Only when Secure: aggressive
-                // use rests entirely on the proof having been checked, and an
-                // unvalidated NSEC is an attacker's claim about which names do
-                // not exist.
-                if upstream.answers.is_empty() && secure {
-                    caches.denials.insert_validated(&upstream);
-                }
-                // And a validated *positive* answer that came from a wildcard is
-                // the same kind of statement about a range of names (RFC 8198
-                // §5.3), so it is kept too — under the wildcard rather than under
-                // the name that happened to be asked for. Only when Secure, for
-                // exactly the same reason.
-                if !upstream.answers.is_empty() && secure {
-                    caches.denials.insert_validated_wildcard(&upstream);
-                }
-                (upstream, secure)
             }
-            // Resolution failed: say why, then SERVFAIL. A resolver that turns
-            // every failure into a bare SERVFAIL is undiagnosable from the
-            // outside, and the reasons here are specific — lame delegation,
-            // budget exhausted, CNAME loop — precisely so they can be read.
-            Err(ref e) => {
-                eprintln!(
-                    "resolve {} type {} failed: {:#}",
-                    query.qname, query.qtype, e
-                );
-                (
-                    build_response(id, OpCode::Query, &query, Vec::new(), ResponseCode::ServerFailure, recursion),
-                    false,
-                )
-            }
-        }
-    };
+        };
 
     // The AD bit goes on only for an answer we actually authenticated, and only
     // for a client that asked about it (RFC 6840 §5.8) — to anyone else it is
@@ -821,7 +900,13 @@ async fn handle_query(
     resp.ad = secure && (client_wants_dnssec || msg.ad);
     resp.cd = checking_disabled;
 
-    finish(resp, client_uses_edns, client_wants_dnssec, &query, client_max)
+    finish(
+        resp,
+        client_uses_edns,
+        client_wants_dnssec,
+        &query,
+        client_max,
+    )
 }
 
 /// Final shaping common to every reply: OPT mirroring, stripping DNSSEC records
@@ -859,7 +944,8 @@ fn finish(
         edns.do_bit = client_wants_dnssec;
         resp.set_edns(edns).ok()?;
     } else {
-        resp.additionals.retain(|rr| rr.rdata.rtype != OPT_RECORD_TYPE);
+        resp.additionals
+            .retain(|rr| rr.rdata.rtype != OPT_RECORD_TYPE);
     }
 
     // Honor the client's advertised UDP size: truncates (TC=1) if it overflows.
@@ -878,7 +964,8 @@ fn edns_error(
     let mut resp = build_response(id, OpCode::Query, query, Vec::new(), rcode, recursion);
     // BADVERS is an extended RCODE, so the OPT record isn't optional here — it
     // carries the code's high bits.
-    resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE)).ok()?;
+    resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE))
+        .ok()?;
     resp.to_bytes_within(client_max).ok()
 }
 
@@ -912,7 +999,8 @@ fn unsupported_opcode(msg: &DnsMessage) -> Option<Vec<u8>> {
         additionals: Vec::new(),
     };
     if msg.has_edns() {
-        resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE)).ok()?;
+        resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE))
+            .ok()?;
     }
     resp.to_bytes_within(RDNSR_PAYLOAD_SIZE as usize).ok()
 }
@@ -1010,8 +1098,13 @@ mod tests {
     #[tokio::test]
     async fn a_response_is_dropped_rather_than_resolved() {
         let (resolver, caches) = context();
-        let reply = handle_query(message(OpCode::Query, true), &resolver, &caches, Transport::Udp)
-            .await;
+        let reply = handle_query(
+            message(OpCode::Query, true),
+            &resolver,
+            &caches,
+            Transport::Udp,
+        )
+        .await;
         assert!(
             reply.is_none(),
             "answering a response is how a resolver becomes a packet engine"

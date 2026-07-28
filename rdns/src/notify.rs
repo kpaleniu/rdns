@@ -113,15 +113,19 @@ pub fn acknowledges(reply: &DnsMessage, id: u16) -> bool {
 pub fn changed_zones(before: &[(String, u32)], after: &[(String, u32)]) -> Vec<(String, u32)> {
     after
         .iter()
-        .filter(|(zone, serial)| match before.iter().find(|(z, _)| z == zone) {
-            // RFC 1982 §3.2: `new` is later than `old` when the difference,
-            // taken in 32-bit wrapping arithmetic, is in the first half of the
-            // space. That is what makes a serial that wraps past 2^32 still read
-            // as an increment.
-            Some((_, previous)) => serial.wrapping_sub(*previous) != 0
-                && serial.wrapping_sub(*previous) < 0x8000_0000,
-            None => true,
-        })
+        .filter(
+            |(zone, serial)| match before.iter().find(|(z, _)| z == zone) {
+                // RFC 1982 §3.2: `new` is later than `old` when the difference,
+                // taken in 32-bit wrapping arithmetic, is in the first half of the
+                // space. That is what makes a serial that wraps past 2^32 still read
+                // as an increment.
+                Some((_, previous)) => {
+                    serial.wrapping_sub(*previous) != 0
+                        && serial.wrapping_sub(*previous) < 0x8000_0000
+                }
+                None => true,
+            },
+        )
         .cloned()
         .collect()
 }
@@ -130,7 +134,10 @@ pub fn changed_zones(before: &[(String, u32)], after: &[(String, u32)]) -> Vec<(
 pub fn zone_serials(zones: &[&Zone]) -> Vec<(String, u32)> {
     zones
         .iter()
-        .filter_map(|zone| zone.serial().map(|serial| (zone.origin().to_string(), serial)))
+        .filter_map(|zone| {
+            zone.serial()
+                .map(|serial| (zone.origin().to_string(), serial))
+        })
         .collect()
 }
 
@@ -188,7 +195,10 @@ mod tests {
 
         assert_eq!(parsed.opcode, OpCode::Notify, "opcode 4, not 0");
         assert!(!parsed.response, "a NOTIFY request is not a response");
-        assert!(parsed.authoritive, "the sender is authoritative for the zone");
+        assert!(
+            parsed.authoritive,
+            "the sender is authoritative for the zone"
+        );
         assert!(!parsed.recursion, "and is not asking anyone to recurse");
         assert_eq!(parsed.queries[0].qname, "example.com.");
         assert_eq!(parsed.queries[0].qtype, rt::SOA);
@@ -211,7 +221,10 @@ mod tests {
 
         assert!(acknowledges(&parsed, 0x4321));
         assert_eq!(parsed.opcode, OpCode::Notify, "the reply keeps the opcode");
-        assert!(parsed.answers.is_empty(), "an acknowledgement carries no data");
+        assert!(
+            parsed.answers.is_empty(),
+            "an acknowledgement carries no data"
+        );
         assert_eq!(parsed.queries[0].qname, "example.com.");
 
         // A different transaction, or an answer to something else, is not it.

@@ -248,7 +248,9 @@ impl ManagedAnchors {
     /// deliberately painful outcome.
     pub fn has_anchor_for(&self, zone: &str) -> bool {
         let zone = zone.to_ascii_lowercase();
-        self.ds.iter().any(|ds| ds.owner.eq_ignore_ascii_case(&zone))
+        self.ds
+            .iter()
+            .any(|ds| ds.owner.eq_ignore_ascii_case(&zone))
             || self
                 .keys
                 .iter()
@@ -327,12 +329,15 @@ impl ManagedAnchors {
                     // A key matching a configured DS anchor is already trusted by
                     // the operator's decision; there is nothing for a hold-down
                     // to establish.
-                    let anchored = self
-                        .ds
-                        .iter()
-                        .any(|ds| ds.owner.eq_ignore_ascii_case(&key.owner)
-                            && ds.matches_key(key).unwrap_or(false));
-                    let state = if anchored { KeyState::Valid } else { KeyState::AddPend };
+                    let anchored = self.ds.iter().any(|ds| {
+                        ds.owner.eq_ignore_ascii_case(&key.owner)
+                            && ds.matches_key(key).unwrap_or(false)
+                    });
+                    let state = if anchored {
+                        KeyState::Valid
+                    } else {
+                        KeyState::AddPend
+                    };
                     self.keys.push(TrackedKey {
                         key: key.clone(),
                         state,
@@ -540,9 +545,13 @@ impl ManagedAnchors {
         now: u64,
     ) -> DnssecResult<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text, now).map_err(|e| DnssecError::parse(format!("{}: {e}", path.display()))),
+            Ok(text) => Self::parse(&text, now)
+                .map_err(|e| DnssecError::parse(format!("{}: {e}", path.display()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::from_ds(seed)),
-            Err(e) => Err(DnssecError::parse(format!("reading {}: {e}", path.display()))),
+            Err(e) => Err(DnssecError::parse(format!(
+                "reading {}: {e}",
+                path.display()
+            ))),
         }
     }
 
@@ -693,34 +702,52 @@ fn parse_anchor_line(fields: &[&str]) -> DnssecResult<AnchorLine> {
     match rtype.as_str() {
         "DS" => {
             if rest.len() < 4 {
-                return Err(DnssecError::parse(format!("a DS needs 4 fields, got {}", rest.len())));
+                return Err(DnssecError::parse(format!(
+                    "a DS needs 4 fields, got {}",
+                    rest.len()
+                )));
             }
             Ok(AnchorLine::Ds(Ds {
                 owner,
-                key_tag: rest[0].parse().map_err(|e| DnssecError::parse(format!("key tag: {e}")))?,
-                algorithm: rest[1].parse().map_err(|e| DnssecError::parse(format!("algorithm: {e}")))?,
-                digest_type: rest[2].parse().map_err(|e| DnssecError::parse(format!("digest type: {e}")))?,
+                key_tag: rest[0]
+                    .parse()
+                    .map_err(|e| DnssecError::parse(format!("key tag: {e}")))?,
+                algorithm: rest[1]
+                    .parse()
+                    .map_err(|e| DnssecError::parse(format!("algorithm: {e}")))?,
+                digest_type: rest[2]
+                    .parse()
+                    .map_err(|e| DnssecError::parse(format!("digest type: {e}")))?,
                 digest: parse_hex(&rest[3..].concat())?,
             }))
         }
         "DNSKEY" => {
             if rest.len() < 4 {
-                return Err(DnssecError::parse(format!("a DNSKEY needs 4 fields, got {}", rest.len())));
+                return Err(DnssecError::parse(format!(
+                    "a DNSKEY needs 4 fields, got {}",
+                    rest.len()
+                )));
             }
-            let public_key = base64::Engine::decode(
-                &base64::prelude::BASE64_STANDARD,
-                rest[3..].concat(),
-            )
-            .map_err(|e| DnssecError::parse(format!("public key: {e}")))?;
+            let public_key =
+                base64::Engine::decode(&base64::prelude::BASE64_STANDARD, rest[3..].concat())
+                    .map_err(|e| DnssecError::parse(format!("public key: {e}")))?;
             Ok(AnchorLine::Key(Dnskey {
                 owner,
-                flags: rest[0].parse().map_err(|e| DnssecError::parse(format!("flags: {e}")))?,
-                protocol: rest[1].parse().map_err(|e| DnssecError::parse(format!("protocol: {e}")))?,
-                algorithm: rest[2].parse().map_err(|e| DnssecError::parse(format!("algorithm: {e}")))?,
+                flags: rest[0]
+                    .parse()
+                    .map_err(|e| DnssecError::parse(format!("flags: {e}")))?,
+                protocol: rest[1]
+                    .parse()
+                    .map_err(|e| DnssecError::parse(format!("protocol: {e}")))?,
+                algorithm: rest[2]
+                    .parse()
+                    .map_err(|e| DnssecError::parse(format!("algorithm: {e}")))?,
                 public_key,
             }))
         }
-        other => Err(DnssecError::parse(format!("{other} is not a trust anchor record type"))),
+        other => Err(DnssecError::parse(format!(
+            "{other} is not a trust anchor record type"
+        ))),
     }
 }
 
@@ -750,7 +777,10 @@ fn parse_hex(text: &str) -> DnssecResult<Vec<u8>> {
     }
     (0..text.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|e| DnssecError::parse(format!("digest: {e}"))))
+        .map(|i| {
+            u8::from_str_radix(&text[i..i + 2], 16)
+                .map_err(|e| DnssecError::parse(format!("digest: {e}")))
+        })
         .collect()
 }
 
@@ -808,7 +838,10 @@ mod tests {
     }
 
     fn zone_key(tagseed: u8) -> Dnskey {
-        key(tagseed, crate::dnssec::DNSKEY_FLAG_ZONE | crate::dnssec::DNSKEY_FLAG_SEP)
+        key(
+            tagseed,
+            crate::dnssec::DNSKEY_FLAG_ZONE | crate::dnssec::DNSKEY_FLAG_SEP,
+        )
     }
 
     fn anchored_on(k: &Dnskey) -> ManagedAnchors {
@@ -1006,9 +1039,16 @@ mod tests {
         let mut revoked = old.clone();
         revoked.flags |= DNSKEY_FLAG_REVOKE;
         // Signed by a different key, not by the one being revoked.
-        let changes = anchors.observe(".", std::slice::from_ref(&revoked), std::slice::from_ref(&other), t0 + DAY);
+        let changes = anchors.observe(
+            ".",
+            std::slice::from_ref(&revoked),
+            std::slice::from_ref(&other),
+            t0 + DAY,
+        );
 
-        assert!(!changes.iter().any(|c| matches!(c, AnchorChange::Revoked { .. })));
+        assert!(!changes
+            .iter()
+            .any(|c| matches!(c, AnchorChange::Revoked { .. })));
         assert_eq!(state_of(&anchors, &old), Some(KeyState::Valid));
 
         // Nobody signing it at all is the same answer.
@@ -1056,7 +1096,12 @@ mod tests {
         );
 
         // Dropped from the zone; forgotten once the remove hold-down elapses.
-        anchors.observe(".", std::slice::from_ref(&successor), &[], revoked_at + DAY + 1);
+        anchors.observe(
+            ".",
+            std::slice::from_ref(&successor),
+            &[],
+            revoked_at + DAY + 1,
+        );
         assert_eq!(state_of(&anchors, &old), Some(KeyState::Revoked));
         let changes = anchors.observe(
             ".",
@@ -1099,7 +1144,12 @@ mod tests {
         anchors.observe(".", &[old.clone(), new.clone()], &[], t0);
         anchors.observe(".", &[old.clone(), new.clone()], &[], t0 + ADD_HOLD_DOWN);
 
-        let changes = anchors.observe(".", std::slice::from_ref(&old), &[], t0 + ADD_HOLD_DOWN + DAY);
+        let changes = anchors.observe(
+            ".",
+            std::slice::from_ref(&old),
+            &[],
+            t0 + ADD_HOLD_DOWN + DAY,
+        );
         assert!(changes.contains(&AnchorChange::Absent {
             zone: ".".to_string(),
             key_tag: new.key_tag()
@@ -1160,7 +1210,11 @@ mod tests {
             &[],
             1,
         );
-        assert_eq!(state_of(&anchors, &zsk), None, "a ZSK is not an anchor in waiting");
+        assert_eq!(
+            state_of(&anchors, &zsk),
+            None,
+            "a ZSK is not an anchor in waiting"
+        );
         assert_eq!(state_of(&anchors, &not_a_zone_key), None);
         assert_eq!(
             state_of(&anchors, &anchor),
@@ -1241,7 +1295,12 @@ mod tests {
 
         let mut revoked = anchor.clone();
         revoked.flags |= DNSKEY_FLAG_REVOKE;
-        anchors.observe(".", std::slice::from_ref(&revoked), std::slice::from_ref(&revoked), 2);
+        anchors.observe(
+            ".",
+            std::slice::from_ref(&revoked),
+            std::slice::from_ref(&revoked),
+            2,
+        );
 
         assert_eq!(anchors.ds().len(), 1, "the DS anchor is untouched");
         assert!(anchors.has_anchor_for("."));
@@ -1322,7 +1381,9 @@ mod tests {
     fn test_retry_interval_is_shorter_but_still_bounded() {
         assert_eq!(retry_interval(0, 0), 3_600);
         assert_eq!(retry_interval(u32::MAX, u64::MAX), 86_400);
-        assert!(retry_interval(30 * 86_400, 30 * 86_400) <= query_interval(30 * 86_400, 30 * 86_400));
+        assert!(
+            retry_interval(30 * 86_400, 30 * 86_400) <= query_interval(30 * 86_400, 30 * 86_400)
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1437,7 +1498,10 @@ mod tests {
         // a key its owner has publicly withdrawn.
         let in_force = anchors.trust_anchors();
         assert!(
-            in_force.all().iter().any(|ds| ds.key_tag == new_key.key_tag()),
+            in_force
+                .all()
+                .iter()
+                .any(|ds| ds.key_tag == new_key.key_tag()),
             "the successor is an anchor"
         );
         assert!(

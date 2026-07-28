@@ -272,7 +272,10 @@ mod tests {
         mx.extend_from_slice(&crate::dname::dname_to_bytes("mail.example.com.").unwrap());
         let end = c.write_rdata(15, &mx, &mut buf, pos).unwrap();
 
-        assert_eq!(&buf[pos..end], &[0, 10, 4, b'm', b'a', b'i', b'l', 0xc0, 12]);
+        assert_eq!(
+            &buf[pos..end],
+            &[0, 10, 4, b'm', b'a', b'i', b'l', 0xc0, 12]
+        );
     }
 
     /// SOA compresses both of its names and leaves the 20 bytes of counters.
@@ -288,10 +291,12 @@ mod tests {
         soa.extend_from_slice(&[9u8; 20]);
         let end = c.write_rdata(6, &soa, &mut buf, pos).unwrap();
 
-        let expected: Vec<u8> = [2, b'n', b's', 0xc0, 12, 5, b'a', b'd', b'm', b'i', b'n', 0xc0, 12]
-            .into_iter()
-            .chain([9u8; 20])
-            .collect();
+        let expected: Vec<u8> = [
+            2, b'n', b's', 0xc0, 12, 5, b'a', b'd', b'm', b'i', b'n', 0xc0, 12,
+        ]
+        .into_iter()
+        .chain([9u8; 20])
+        .collect();
         assert_eq!(&buf[pos..end], &expected[..]);
     }
 

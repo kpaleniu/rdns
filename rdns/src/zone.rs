@@ -1,8 +1,8 @@
+use crate::dnssec_denial::{base32hex_decode, canonical_sort_key};
 use crate::error::ZoneError;
-use crate::{ParsedRecord, RecordData};
 use crate::utils::record_type_code;
 use crate::utils::record_types as rt;
-use crate::dnssec_denial::{base32hex_decode, canonical_sort_key};
+use crate::{ParsedRecord, RecordData};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -540,7 +540,7 @@ fn parse_hex(hex_str: &str) -> Result<Vec<u8>, String> {
     let chars: Vec<char> = hex_str.chars().collect();
     for i in (0..chars.len()).step_by(2) {
         let high = chars[i].to_digit(16).ok_or("Invalid hex digit")? as u8;
-        let low = chars[i+1].to_digit(16).ok_or("Invalid hex digit")? as u8;
+        let low = chars[i + 1].to_digit(16).ok_or("Invalid hex digit")? as u8;
         res.push((high << 4) | low);
     }
     Ok(res)
@@ -549,19 +549,19 @@ fn parse_hex(hex_str: &str) -> Result<Vec<u8>, String> {
 fn parse_base32_hex(input: &str) -> Result<Vec<u8>, String> {
     let input = input.trim().to_uppercase();
     let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
-    let char_to_val = |c: u8| -> Option<u8> {
-        alphabet.iter().position(|&x| x == c).map(|p| p as u8)
-    };
-    
+    let char_to_val =
+        |c: u8| -> Option<u8> { alphabet.iter().position(|&x| x == c).map(|p| p as u8) };
+
     let mut bits = 0u64;
     let mut count = 0;
     let mut res = Vec::new();
-    
+
     for &c in input.as_bytes() {
         if c == b'=' {
             break; // Skip padding
         }
-        let val = char_to_val(c).ok_or_else(|| format!("Invalid Base32 hex character: {}", c as char))?;
+        let val =
+            char_to_val(c).ok_or_else(|| format!("Invalid Base32 hex character: {}", c as char))?;
         bits = (bits << 5) | (val as u64);
         count += 5;
         if count >= 8 {
@@ -580,7 +580,13 @@ fn days_in_month(month: i32, year: i32) -> i32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 => if is_leap(year) { 29 } else { 28 },
+        2 => {
+            if is_leap(year) {
+                29
+            } else {
+                28
+            }
+        }
         _ => 0,
     }
 }
@@ -1015,9 +1021,10 @@ fn parse_into(
                 return Err(ZoneError::syntax(ln, "$INCLUDE needs a file name"));
             };
             if depth + 1 >= MAX_INCLUDE_DEPTH {
-                return Err(ZoneError::syntax(ln, format!(
-                    "$INCLUDE nested more than {MAX_INCLUDE_DEPTH} deep — a cycle?"
-                )));
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!("$INCLUDE nested more than {MAX_INCLUDE_DEPTH} deep — a cycle?"),
+                ));
             }
             let path = match base_dir {
                 Some(dir) => dir.join(file),
@@ -1058,7 +1065,10 @@ fn parse_into(
         let mut idx = 0;
         let record_name = if logical.omits_owner {
             state.owner.clone().ok_or_else(|| {
-                ZoneError::syntax(ln, "record omits its owner name but no previous record supplies one")
+                ZoneError::syntax(
+                    ln,
+                    "record omits its owner name but no previous record supplies one",
+                )
             })?
         } else {
             let name = absolutize(first, &state.origin);
@@ -1122,16 +1132,16 @@ fn parse_into(
 
         let rdata: RecordData = match record_type.as_str() {
             "A" => {
-                let addr = rdata
-                    .parse::<Ipv4Addr>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid A address {rdata:?}: {e}")))?;
+                let addr = rdata.parse::<Ipv4Addr>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid A address {rdata:?}: {e}"))
+                })?;
                 RecordData::from_parsed(&ParsedRecord::A(addr))
                     .map_err(|e| ZoneError::syntax(ln, format!("A record: {e}")))?
             }
             "AAAA" => {
-                let addr = rdata
-                    .parse::<Ipv6Addr>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid AAAA address {rdata:?}: {e}")))?;
+                let addr = rdata.parse::<Ipv6Addr>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid AAAA address {rdata:?}: {e}"))
+                })?;
                 RecordData::from_parsed(&ParsedRecord::AAAA(addr))
                     .map_err(|e| ZoneError::syntax(ln, format!("AAAA record: {e}")))?
             }
@@ -1142,14 +1152,14 @@ fn parse_into(
             "MX" => {
                 let mx_parts: Vec<&str> = rdata.split_whitespace().collect();
                 if mx_parts.len() < 2 {
-                    return Err(ZoneError::syntax(ln, format!(
-                        "MX record needs preference and exchange, got {:?}",
-                        rdata
-                    )));
+                    return Err(ZoneError::syntax(
+                        ln,
+                        format!("MX record needs preference and exchange, got {:?}", rdata),
+                    ));
                 }
-                let preference = mx_parts[0]
-                    .parse::<u16>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid MX preference {:?}: {e}", mx_parts[0])))?;
+                let preference = mx_parts[0].parse::<u16>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid MX preference {:?}: {e}", mx_parts[0]))
+                })?;
                 RecordData::from_parsed(&ParsedRecord::MX {
                     preference,
                     exchange: mx_parts[1..].join(" "),
@@ -1177,26 +1187,26 @@ fn parse_into(
             "SOA" => {
                 let soa_parts: Vec<&str> = rdata.split_whitespace().collect();
                 if soa_parts.len() < 7 {
-                    return Err(ZoneError::syntax(ln, format!(
-                        "SOA record needs 7 fields, got {}",
-                        soa_parts.len()
-                    )));
+                    return Err(ZoneError::syntax(
+                        ln,
+                        format!("SOA record needs 7 fields, got {}", soa_parts.len()),
+                    ));
                 }
-                let serial = soa_parts[2]
-                    .parse::<u32>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA serial {:?}: {e}", soa_parts[2])))?;
-                let refresh = soa_parts[3]
-                    .parse::<i32>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA refresh {:?}: {e}", soa_parts[3])))?;
-                let retry = soa_parts[4]
-                    .parse::<i32>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA retry {:?}: {e}", soa_parts[4])))?;
-                let expire = soa_parts[5]
-                    .parse::<i32>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA expire {:?}: {e}", soa_parts[5])))?;
-                let minimum = soa_parts[6]
-                    .parse::<u32>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA minimum {:?}: {e}", soa_parts[6])))?;
+                let serial = soa_parts[2].parse::<u32>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid SOA serial {:?}: {e}", soa_parts[2]))
+                })?;
+                let refresh = soa_parts[3].parse::<i32>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid SOA refresh {:?}: {e}", soa_parts[3]))
+                })?;
+                let retry = soa_parts[4].parse::<i32>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid SOA retry {:?}: {e}", soa_parts[4]))
+                })?;
+                let expire = soa_parts[5].parse::<i32>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid SOA expire {:?}: {e}", soa_parts[5]))
+                })?;
+                let minimum = soa_parts[6].parse::<u32>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid SOA minimum {:?}: {e}", soa_parts[6]))
+                })?;
                 RecordData::from_parsed(&ParsedRecord::SOA {
                     mname: soa_parts[0].to_string(),
                     rname: soa_parts[1].to_string(),
@@ -1211,24 +1221,31 @@ fn parse_into(
             "DNSKEY" => {
                 let key_parts = &parts[idx..];
                 if key_parts.len() < 4 {
-                    return Err(ZoneError::syntax(ln, format!(
-                        "DNSKEY record needs 4 fields, got {}",
-                        key_parts.len()
-                    )));
+                    return Err(ZoneError::syntax(
+                        ln,
+                        format!("DNSKEY record needs 4 fields, got {}", key_parts.len()),
+                    ));
                 }
-                let flags = key_parts[0]
-                    .parse::<u16>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY flags {:?}: {e}", key_parts[0])))?;
-                let protocol = key_parts[1]
-                    .parse::<u8>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY protocol {:?}: {e}", key_parts[1])))?;
-                let algorithm = key_parts[2]
-                    .parse::<u8>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY algorithm {:?}: {e}", key_parts[2])))?;
+                let flags = key_parts[0].parse::<u16>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid DNSKEY flags {:?}: {e}", key_parts[0]))
+                })?;
+                let protocol = key_parts[1].parse::<u8>().map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid DNSKEY protocol {:?}: {e}", key_parts[1]),
+                    )
+                })?;
+                let algorithm = key_parts[2].parse::<u8>().map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid DNSKEY algorithm {:?}: {e}", key_parts[2]),
+                    )
+                })?;
                 let b64_key = key_parts[3..].join("");
                 let public_key =
-                    base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_key)
-                        .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY base64 key: {e}")))?;
+                    base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_key).map_err(
+                        |e| ZoneError::syntax(ln, format!("invalid DNSKEY base64 key: {e}")),
+                    )?;
                 RecordData::from_parsed(&ParsedRecord::DNSKEY {
                     flags,
                     protocol,
@@ -1240,20 +1257,20 @@ fn parse_into(
             "DS" => {
                 let ds_parts = &parts[idx..];
                 if ds_parts.len() < 4 {
-                    return Err(ZoneError::syntax(ln, format!(
-                        "DS record needs 4 fields, got {}",
-                        ds_parts.len()
-                    )));
+                    return Err(ZoneError::syntax(
+                        ln,
+                        format!("DS record needs 4 fields, got {}", ds_parts.len()),
+                    ));
                 }
-                let key_tag = ds_parts[0]
-                    .parse::<u16>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DS key tag {:?}: {e}", ds_parts[0])))?;
-                let algorithm = ds_parts[1]
-                    .parse::<u8>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DS algorithm {:?}: {e}", ds_parts[1])))?;
-                let digest_type = ds_parts[2]
-                    .parse::<u8>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DS digest type {:?}: {e}", ds_parts[2])))?;
+                let key_tag = ds_parts[0].parse::<u16>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid DS key tag {:?}: {e}", ds_parts[0]))
+                })?;
+                let algorithm = ds_parts[1].parse::<u8>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid DS algorithm {:?}: {e}", ds_parts[1]))
+                })?;
+                let digest_type = ds_parts[2].parse::<u8>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid DS digest type {:?}: {e}", ds_parts[2]))
+                })?;
                 let hex_digest = ds_parts[3..].join("");
                 let digest = parse_hex(&hex_digest)
                     .map_err(|e| ZoneError::syntax(ln, format!("invalid DS digest: {e}")))?;
@@ -1268,36 +1285,60 @@ fn parse_into(
             "RRSIG" => {
                 let rrsig_parts = &parts[idx..];
                 if rrsig_parts.len() < 9 {
-                    return Err(ZoneError::syntax(ln, format!(
-                        "RRSIG record needs 9 fields, got {}",
-                        rrsig_parts.len()
-                    )));
+                    return Err(ZoneError::syntax(
+                        ln,
+                        format!("RRSIG record needs 9 fields, got {}", rrsig_parts.len()),
+                    ));
                 }
                 let type_covered = crate::utils::record_type_name_to_code(rrsig_parts[0])
                     .ok_or_else(|| {
-                        ZoneError::syntax(ln, format!("unknown RRSIG type covered {:?}", rrsig_parts[0]))
+                        ZoneError::syntax(
+                            ln,
+                            format!("unknown RRSIG type covered {:?}", rrsig_parts[0]),
+                        )
                     })?;
-                let algorithm = rrsig_parts[1]
-                    .parse::<u8>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG algorithm {:?}: {e}", rrsig_parts[1])))?;
-                let labels = rrsig_parts[2]
-                    .parse::<u8>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG labels {:?}: {e}", rrsig_parts[2])))?;
-                let original_ttl = rrsig_parts[3]
-                    .parse::<u32>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG original TTL {:?}: {e}", rrsig_parts[3])))?;
-                let expiration = parse_dnssec_time(rrsig_parts[4])
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG expiration {:?}: {e}", rrsig_parts[4])))?;
-                let inception = parse_dnssec_time(rrsig_parts[5])
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG inception {:?}: {e}", rrsig_parts[5])))?;
-                let key_tag = rrsig_parts[6]
-                    .parse::<u16>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG key tag {:?}: {e}", rrsig_parts[6])))?;
+                let algorithm = rrsig_parts[1].parse::<u8>().map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid RRSIG algorithm {:?}: {e}", rrsig_parts[1]),
+                    )
+                })?;
+                let labels = rrsig_parts[2].parse::<u8>().map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid RRSIG labels {:?}: {e}", rrsig_parts[2]),
+                    )
+                })?;
+                let original_ttl = rrsig_parts[3].parse::<u32>().map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid RRSIG original TTL {:?}: {e}", rrsig_parts[3]),
+                    )
+                })?;
+                let expiration = parse_dnssec_time(rrsig_parts[4]).map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid RRSIG expiration {:?}: {e}", rrsig_parts[4]),
+                    )
+                })?;
+                let inception = parse_dnssec_time(rrsig_parts[5]).map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid RRSIG inception {:?}: {e}", rrsig_parts[5]),
+                    )
+                })?;
+                let key_tag = rrsig_parts[6].parse::<u16>().map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid RRSIG key tag {:?}: {e}", rrsig_parts[6]),
+                    )
+                })?;
                 let signer_name = rrsig_parts[7].to_string();
                 let b64_sig = rrsig_parts[8..].join("");
-                let signature =
-                    base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_sig)
-                        .map_err(|e| ZoneError::syntax(ln, format!("invalid RRSIG base64 signature: {e}")))?;
+                let signature = base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_sig)
+                    .map_err(|e| {
+                        ZoneError::syntax(ln, format!("invalid RRSIG base64 signature: {e}"))
+                    })?;
                 RecordData::from_parsed(&ParsedRecord::RRSIG {
                     type_covered,
                     algorithm,
@@ -1314,10 +1355,13 @@ fn parse_into(
             "NSEC" => {
                 let nsec_parts = &parts[idx..];
                 if nsec_parts.len() < 2 {
-                    return Err(ZoneError::syntax(ln, format!(
-                        "NSEC record needs next domain and at least one type, got {}",
-                        nsec_parts.len()
-                    )));
+                    return Err(ZoneError::syntax(
+                        ln,
+                        format!(
+                            "NSEC record needs next domain and at least one type, got {}",
+                            nsec_parts.len()
+                        ),
+                    ));
                 }
                 let next_domain_name = nsec_parts[0].to_string();
                 let type_names: Vec<String> =
@@ -1333,29 +1377,43 @@ fn parse_into(
             "NSEC3" => {
                 let nsec3_parts = &parts[idx..];
                 if nsec3_parts.len() < 5 {
-                    return Err(ZoneError::syntax(ln, format!(
-                        "NSEC3 record needs at least 5 fields, got {}",
-                        nsec3_parts.len()
-                    )));
+                    return Err(ZoneError::syntax(
+                        ln,
+                        format!(
+                            "NSEC3 record needs at least 5 fields, got {}",
+                            nsec3_parts.len()
+                        ),
+                    ));
                 }
-                let hash_algorithm = nsec3_parts[0]
-                    .parse::<u8>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid NSEC3 hash algorithm {:?}: {e}", nsec3_parts[0])))?;
-                let flags = nsec3_parts[1]
-                    .parse::<u8>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid NSEC3 flags {:?}: {e}", nsec3_parts[1])))?;
-                let iterations = nsec3_parts[2]
-                    .parse::<u16>()
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid NSEC3 iterations {:?}: {e}", nsec3_parts[2])))?;
+                let hash_algorithm = nsec3_parts[0].parse::<u8>().map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid NSEC3 hash algorithm {:?}: {e}", nsec3_parts[0]),
+                    )
+                })?;
+                let flags = nsec3_parts[1].parse::<u8>().map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid NSEC3 flags {:?}: {e}", nsec3_parts[1]))
+                })?;
+                let iterations = nsec3_parts[2].parse::<u16>().map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid NSEC3 iterations {:?}: {e}", nsec3_parts[2]),
+                    )
+                })?;
                 let salt_str = nsec3_parts[3];
                 let salt = if salt_str == "-" {
                     Vec::new()
                 } else {
-                    parse_hex(salt_str)
-                        .map_err(|e| ZoneError::syntax(ln, format!("invalid NSEC3 salt {:?}: {e}", salt_str)))?
+                    parse_hex(salt_str).map_err(|e| {
+                        ZoneError::syntax(ln, format!("invalid NSEC3 salt {:?}: {e}", salt_str))
+                    })?
                 };
-                let next_hashed_owner = parse_base32_hex(nsec3_parts[4])
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4])))?;
+                let next_hashed_owner = parse_base32_hex(nsec3_parts[4]).map_err(|e| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4]),
+                    )
+                })?;
                 let type_names: Vec<String> =
                     nsec3_parts[5..].iter().map(|s| s.to_string()).collect();
                 let type_bitmap = construct_type_bitmap(&type_names)
@@ -1371,7 +1429,10 @@ fn parse_into(
                 .map_err(|e| ZoneError::syntax(ln, format!("NSEC3 record: {e}")))?
             }
             other => {
-                return Err(ZoneError::syntax(ln, format!("unsupported record type {other:?}")));
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!("unsupported record type {other:?}"),
+                ));
             }
         };
 
@@ -1408,7 +1469,7 @@ $TTL 3600
 www IN  A   192.0.2.2
 mail IN A   192.0.2.3
         "#;
-        
+
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         assert_eq!(zone.origin, "example.com.");
         assert!(zone.records.len() >= 4);
@@ -1423,14 +1484,20 @@ mail IN A   192.0.2.3
             matches!(err, ZoneError::Syntax { line: 1, .. }),
             "the line number is a field, not a prefix: {err:?}"
         );
-        assert!(err.to_string().contains("A address"), "error should name the failure: {err}");
+        assert!(
+            err.to_string().contains("A address"),
+            "error should name the failure: {err}"
+        );
     }
 
     #[test]
     fn test_unsupported_record_type_surfaces_error() {
         let zone_content = "www IN WKS 192.0.2.1\n";
         let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
-        assert!(err.to_string().contains("unsupported record type"), "got: {err}");
+        assert!(
+            err.to_string().contains("unsupported record type"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1456,7 +1523,11 @@ mail IN A   192.0.2.3
         // the token's spelling, decides what the first field is.
         let zone = parse_zone_file("ns IN A 192.0.2.7\n", "example.com.").unwrap();
         assert_eq!(zone.records[0].name, "ns.example.com.");
-        assert_eq!(zone.query("ns.example.com.", 1).len(), 1, "should be an A record");
+        assert_eq!(
+            zone.query("ns.example.com.", 1).len(),
+            1,
+            "should be an A record"
+        );
     }
 
     #[test]
@@ -1472,14 +1543,21 @@ mail IN A   192.0.2.3
     #[test]
     fn test_indented_line_without_a_previous_owner_errors() {
         let err = parse_zone_file("    IN A 192.0.2.1\n", "example.com.").unwrap_err();
-        assert!(err.to_string().contains("omits its owner name"), "got: {err}");
+        assert!(
+            err.to_string().contains("omits its owner name"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn test_apex_and_relative_names_match_absolute_queries() {
         let zone_content = "@ IN A 192.0.2.1\nwww IN A 192.0.2.2\n";
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
-        assert_eq!(zone.query("example.com.", 1).len(), 1, "@ should match the apex");
+        assert_eq!(
+            zone.query("example.com.", 1).len(),
+            1,
+            "@ should match the apex"
+        );
         assert_eq!(zone.query("www.example.com.", 1).len(), 1);
         // DNS names are case-insensitive (RFC 4343).
         assert_eq!(zone.query("WWW.Example.COM.", 1).len(), 1);
@@ -1533,7 +1611,11 @@ mail IN A   192.0.2.3
         let zone =
             parse_zone_file("* IN A 192.0.2.9\ndeep.a.b IN TXT \"x\"\n", "example.com.").unwrap();
 
-        assert_eq!(zone.query("other.example.com.", 1).len(), 1, "nothing above it");
+        assert_eq!(
+            zone.query("other.example.com.", 1).len(),
+            1,
+            "nothing above it"
+        );
         assert!(
             zone.query("x.a.b.example.com.", 1).is_empty(),
             "a.b exists, so *.example.com. is not this name's source of synthesis"
@@ -1619,7 +1701,10 @@ mail IN A   192.0.2.3
             "example.com.",
         )
         .unwrap_err();
-        assert!(err.to_string().contains("CNAME"), "the error should say why: {err}");
+        assert!(
+            err.to_string().contains("CNAME"),
+            "the error should say why: {err}"
+        );
 
         // RRSIG, NSEC and NSEC3 are the exceptions — they describe the name
         // rather than name it (RFC 4035 §2.5), and a signed zone with a CNAME in
@@ -1638,8 +1723,11 @@ mail IN A   192.0.2.3
     /// merging two owners' data into a single RRset.
     #[test]
     fn test_an_existing_name_shadows_the_wildcard() {
-        let zone =
-            parse_zone_file("* IN A 192.0.2.9\nwww IN AAAA 2001:db8::1\n", "example.com.").unwrap();
+        let zone = parse_zone_file(
+            "* IN A 192.0.2.9\nwww IN AAAA 2001:db8::1\n",
+            "example.com.",
+        )
+        .unwrap();
 
         let a = zone.query("www.example.com.", 1);
         assert!(
@@ -1653,8 +1741,11 @@ mail IN A   192.0.2.3
 
     #[test]
     fn test_name_exists_distinguishes_nodata_from_nxdomain() {
-        let zone =
-            parse_zone_file("* IN A 192.0.2.9\nwww IN AAAA 2001:db8::1\n", "example.com.").unwrap();
+        let zone = parse_zone_file(
+            "* IN A 192.0.2.9\nwww IN AAAA 2001:db8::1\n",
+            "example.com.",
+        )
+        .unwrap();
 
         assert!(zone.name_exists("www.example.com."), "by its own records");
         assert!(
@@ -1809,7 +1900,11 @@ $TTL 3600
         assert_eq!(txt.len(), 1);
         match txt[0].rdata.parse().unwrap() {
             ParsedRecord::TXT(strings) => {
-                assert_eq!(strings.len(), 1, "one quoted string is one character-string");
+                assert_eq!(
+                    strings.len(),
+                    1,
+                    "one quoted string is one character-string"
+                );
                 assert_eq!(strings[0], b"v=spf1 include:example.net; -all");
             }
             other => panic!("expected TXT, got {other:?}"),
@@ -1823,8 +1918,7 @@ $TTL 3600
     fn test_txt_character_strings_are_split_on_quotes_not_whitespace() {
         let strings_of = |line: &str| -> Vec<Vec<u8>> {
             let zone = parse_zone_file(line, "example.com.").unwrap();
-            match zone
-                .query("txt.example.com.", crate::utils::record_types::TXT)[0]
+            match zone.query("txt.example.com.", crate::utils::record_types::TXT)[0]
                 .rdata
                 .parse()
                 .unwrap()
@@ -1935,7 +2029,11 @@ $TTL 3600
         );
 
         let zone = parse_zone_file_at(&main, "example.com.").unwrap();
-        assert_eq!(zone.query("mail.example.com.", 1).len(), 1, "from the include");
+        assert_eq!(
+            zone.query("mail.example.com.", 1).len(),
+            1,
+            "from the include"
+        );
         assert_eq!(zone.query("www.example.com.", 1).len(), 1);
         assert_eq!(
             zone.query("ftp.example.com.", 1).len(),
@@ -1951,7 +2049,10 @@ $TTL 3600
     #[test]
     fn test_include_origin_applies_to_the_included_file_only() {
         let dir = ScratchDir::new("include-origin");
-        dir.write("sub.inc", "$ORIGIN deeper.example.com.\nns IN A 192.0.2.30\n");
+        dir.write(
+            "sub.inc",
+            "$ORIGIN deeper.example.com.\nns IN A 192.0.2.30\n",
+        );
         let main = dir.write(
             "example.com.zone",
             "$INCLUDE sub.inc sub.example.com.\nafter IN A 192.0.2.31\n",
@@ -1976,7 +2077,10 @@ $TTL 3600
         let dir = ScratchDir::new("include-missing");
         let main = dir.write("example.com.zone", "$INCLUDE nope.inc\n");
         let err = parse_zone_file_at(&main, "example.com.").unwrap_err();
-        assert!(err.to_string().contains("nope.inc"), "the error should name the file: {err}");
+        assert!(
+            err.to_string().contains("nope.inc"),
+            "the error should name the file: {err}"
+        );
         assert!(
             matches!(err, ZoneError::Syntax { line: 1, .. }),
             "the line number is a field, not a prefix: {err:?}"
@@ -2024,7 +2128,10 @@ $TTL 3600
     #[test]
     fn test_generic_rdata_of_zero_length() {
         let zone = parse_zone_file("empty IN TYPE4321 \\# 0\n", "example.com.").unwrap();
-        assert!(zone.query("empty.example.com.", 4321)[0].rdata.rdata.is_empty());
+        assert!(zone.query("empty.example.com.", 4321)[0]
+            .rdata
+            .rdata
+            .is_empty());
     }
 
     /// The length is checked rather than trusted — it is exactly the field a
@@ -2032,7 +2139,10 @@ $TTL 3600
     #[test]
     fn test_generic_rdata_length_must_match_the_digits() {
         let err = parse_zone_file("odd IN TYPE1234 \\# 8 DEADBEEF\n", "example.com.").unwrap_err();
-        assert!(err.to_string().contains("says 8 bytes but carries 4"), "got: {err}");
+        assert!(
+            err.to_string().contains("says 8 bytes but carries 4"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2053,24 +2163,27 @@ $TTL 3600
     /// NSEC into a different signed NSEC.
     #[test]
     fn test_nsec_bitmap_accepts_a_generic_type_name() {
-        let zone = parse_zone_file(
-            "@ IN NSEC www.example.com. A TYPE1234\n",
-            "example.com.",
-        )
-        .unwrap();
+        let zone =
+            parse_zone_file("@ IN NSEC www.example.com. A TYPE1234\n", "example.com.").unwrap();
         let record = zone.query("example.com.", record_types::NSEC)[0];
         let ParsedRecord::NSEC { type_bitmap, .. } = record.rdata.parse().unwrap() else {
             panic!("not an NSEC");
         };
-        assert!(crate::dnssec_denial::bitmap_has_type(&type_bitmap, record_types::A));
+        assert!(crate::dnssec_denial::bitmap_has_type(
+            &type_bitmap,
+            record_types::A
+        ));
         assert!(crate::dnssec_denial::bitmap_has_type(&type_bitmap, 1234));
     }
 
     #[test]
     fn test_nsec_bitmap_rejects_a_name_that_is_no_type_at_all() {
-        let err = parse_zone_file("@ IN NSEC www.example.com. A NOTATYPE\n", "example.com.")
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown record type"), "got: {err}");
+        let err =
+            parse_zone_file("@ IN NSEC www.example.com. A NOTATYPE\n", "example.com.").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown record type"),
+            "got: {err}"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2084,7 +2197,7 @@ $TTL 3600
         for (epoch, text) in [
             (0u32, "19700101000000"),
             (1, "19700101000001"),
-            (951_868_800, "20000301000000"),   // the day after a leap day
+            (951_868_800, "20000301000000"), // the day after a leap day
             (1_078_012_800, "20040229000000"), // a leap day itself
             (1_609_459_199, "20201231235959"),
             (2_147_483_647, "20380119031407"),

@@ -78,11 +78,10 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
 /// record that cannot be expressed leaves the previous file untouched.
 pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), ZoneError> {
     let text = zone_to_string(zone)?;
-    crate::persist::write_atomically_str(path, &text)
-        .map_err(|source| ZoneError::Io {
-            path: path.display().to_string(),
-            source,
-        })
+    crate::persist::write_atomically_str(path, &text).map_err(|source| ZoneError::Io {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 /// One record as a zone-file line.
@@ -94,10 +93,9 @@ pub fn record_to_string(record: &ZoneRecord) -> Result<String, ZoneError> {
             record.name
         ))
     })?;
-    let class = class_name(record.class)
-        .ok_or_else(|| {
-            ZoneError::invalid(format!("record {owner}: unknown class {}", record.class))
-        })?;
+    let class = class_name(record.class).ok_or_else(|| {
+        ZoneError::invalid(format!("record {owner}: unknown class {}", record.class))
+    })?;
 
     let (rtype, rdata) = rdata_to_string(&record.rdata);
     Ok(format!(
@@ -295,9 +293,9 @@ fn bitmap_to_string(bitmap: &[u8]) -> Option<String> {
 /// parser. A name containing any of them would read back as something else —
 /// which for a name is not a formatting problem but a different name.
 fn writable_name(name: &str) -> Option<String> {
-    let plain = name.chars().all(|c| {
-        c.is_ascii_graphic() && !matches!(c, ';' | '"' | '(' | ')' | '\\' | '@' | '$')
-    });
+    let plain = name
+        .chars()
+        .all(|c| c.is_ascii_graphic() && !matches!(c, ';' | '"' | '(' | ')' | '\\' | '@' | '$'));
     (plain && !name.is_empty()).then(|| name.to_string())
 }
 
@@ -382,7 +380,10 @@ mod tests {
             .collect();
         before.sort_by_key(|r| (r.0.clone(), r.3.rtype));
         after.sort_by_key(|r| (r.0.clone(), r.3.rtype));
-        assert_eq!(before, after, "round trip changed the zone\n---\n{written}\n---");
+        assert_eq!(
+            before, after,
+            "round trip changed the zone\n---\n{written}\n---"
+        );
 
         (first, second, written)
     }
@@ -406,7 +407,11 @@ mod tests {
         assert!(written.contains("$ORIGIN example.com."));
         assert!(written.contains("; serial"), "the SOA is written readably");
         assert_eq!(second.query("www.example.com.", rt::A).len(), 1);
-        assert_eq!(second.query("anything.example.com.", rt::A).len(), 1, "wildcard");
+        assert_eq!(
+            second.query("anything.example.com.", rt::A).len(),
+            1,
+            "wildcard"
+        );
         assert_eq!(second.serial(), Some(2021010101));
     }
 
@@ -450,7 +455,10 @@ mod tests {
             matches!(two.rdata.parse(), Ok(ParsedRecord::TXT(s)) if s.len() == 2),
             "unquoted words stay two strings"
         );
-        assert!(written.contains(r#""say \"hi\"; and a backslash \\""#), "{written}");
+        assert!(
+            written.contains(r#""say \"hi\"; and a backslash \\""#),
+            "{written}"
+        );
     }
 
     /// A TXT record is arbitrary octets, and this format has no decimal escape
@@ -515,7 +523,10 @@ mod tests {
         let written = zone_to_string(&zone).expect("write");
         assert!(written.contains("TYPE4321 \\# 0"), "{written}");
         let reread = parse_zone_file(&written, "example.com.").expect("re-parse");
-        assert!(reread.query("empty.example.com.", 4321)[0].rdata.rdata.is_empty());
+        assert!(reread.query("empty.example.com.", 4321)[0]
+            .rdata
+            .rdata
+            .is_empty());
     }
 
     /// The DNSSEC records are the ones a rewrite must be byte-exact for: a
@@ -537,11 +548,23 @@ mod tests {
         // The round-trip assertion above is the real check; these pin the
         // spellings a reader would expect to see, and that none of them took the
         // generic escape hatch.
-        assert!(written.contains("NSEC    www.example.com. A NS SOA MX RRSIG NSEC DNSKEY"), "{written}");
+        assert!(
+            written.contains("NSEC    www.example.com. A NS SOA MX RRSIG NSEC DNSKEY"),
+            "{written}"
+        );
         assert!(written.contains("NSEC3   1 1 12 AABBCCDD "), "{written}");
-        assert!(written.contains("NSEC3   1 0 0 - "), "empty salt is `-`: {written}");
-        assert!(written.contains("RRSIG   A 8 2 3600 20300101000000 20200101000000 12345"), "{written}");
-        assert!(!written.contains("\\#"), "nothing needed the generic form: {written}");
+        assert!(
+            written.contains("NSEC3   1 0 0 - "),
+            "empty salt is `-`: {written}"
+        );
+        assert!(
+            written.contains("RRSIG   A 8 2 3600 20300101000000 20200101000000 12345"),
+            "{written}"
+        );
+        assert!(
+            !written.contains("\\#"),
+            "nothing needed the generic form: {written}"
+        );
 
         assert_eq!(
             first.query("example.com.", rt::NSEC3)[0].rdata,
@@ -594,7 +617,10 @@ mod tests {
 
         let err = zone_to_string(&zone).unwrap_err();
         assert!(err.to_string().contains("cannot be written"), "got: {err}");
-        assert!(err.to_string().contains("has space"), "the error should name it: {err}");
+        assert!(
+            err.to_string().contains("has space"),
+            "the error should name it: {err}"
+        );
     }
 
     /// The same name inside RDATA is not fatal — the generic form spells it.

@@ -7,23 +7,23 @@ pub struct DnsMetrics {
     pub queries_received: Arc<AtomicU64>,
     pub queries_authoritative: Arc<AtomicU64>,
     pub queries_recursive: Arc<AtomicU64>,
-    
+
     // Response counters
     pub responses_sent: Arc<AtomicU64>,
     pub responses_nxdomain: Arc<AtomicU64>,
     pub responses_servfail: Arc<AtomicU64>,
     pub responses_refused: Arc<AtomicU64>,
     pub responses_noerror: Arc<AtomicU64>,
-    
+
     // Cache metrics
     pub cache_hits: Arc<AtomicU64>,
     pub cache_misses: Arc<AtomicU64>,
-    
+
     // Security metrics
     pub rate_limited: Arc<AtomicU64>,
     pub validation_errors: Arc<AtomicU64>,
     pub queries_dropped: Arc<AtomicU64>,
-    
+
     // Record type counters
     pub queries_type_a: Arc<AtomicU64>,
     pub queries_type_aaaa: Arc<AtomicU64>,
@@ -283,9 +283,9 @@ mod tests {
     #[test]
     fn test_track_query_type() {
         let metrics = DnsMetrics::new();
-        
-        metrics.track_query_type(1);  // A
-        metrics.track_query_type(1);  // A
+
+        metrics.track_query_type(1); // A
+        metrics.track_query_type(1); // A
         metrics.track_query_type(28); // AAAA
         metrics.track_query_type(99); // Unknown
 

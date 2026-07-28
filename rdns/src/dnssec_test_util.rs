@@ -122,21 +122,20 @@ impl TestKey {
         signer: &str,
         rdatas: &[RecordData],
     ) -> Rrsig {
-        self.sign_rrset_as(&Rrset::new(owner, rtype, class, rdatas), ttl, signer, ZSK_FLAGS)
+        self.sign_rrset_as(
+            &Rrset::new(owner, rtype, class, rdatas),
+            ttl,
+            signer,
+            ZSK_FLAGS,
+        )
     }
 
     /// As [`TestKey::sign_rrset`], but for a key published with `flags` — the
     /// key tag depends on the flags, so a KSK signature has to name the KSK.
-    pub fn sign_rrset_as(
-        &self,
-        rrset: &Rrset<'_>,
-        ttl: u32,
-        signer: &str,
-        flags: u16,
-    ) -> Rrsig {
+    pub fn sign_rrset_as(&self, rrset: &Rrset<'_>, ttl: u32, signer: &str, flags: u16) -> Rrsig {
         let mut rrsig = self.rrsig_template(rrset.owner, rrset.rtype, ttl, signer, flags);
-        let data = signed_data(&rrsig, rrset.owner, rrset.class, rrset.rdatas)
-            .expect("build signed data");
+        let data =
+            signed_data(&rrsig, rrset.owner, rrset.class, rrset.rdatas).expect("build signed data");
         rrsig.signature = self.sign(&data);
         rrsig
     }
@@ -167,11 +166,7 @@ impl TestZone {
 
     /// The apex DNSKEY RRset and the KSK's signature over it.
     pub fn signed_dnskey_rrset(&self) -> (Vec<RecordData>, Rrsig) {
-        let rdatas: Vec<RecordData> = self
-            .dnskeys()
-            .iter()
-            .map(dnskey_rdata)
-            .collect();
+        let rdatas: Vec<RecordData> = self.dnskeys().iter().map(dnskey_rdata).collect();
         let sig = self.ksk.sign_rrset_as(
             &Rrset::new(&self.name, rt::DNSKEY, 1, &rdatas),
             3600,
@@ -219,11 +214,7 @@ impl TestZone {
     /// of the attack, because the same signature verifies at every name the
     /// wildcard could reach. A test can therefore re-own the result onto any
     /// name under the wildcard and it will still verify.
-    pub fn sign_as_wildcard(
-        &self,
-        records: &[ResourceRecord],
-        wildcard: &str,
-    ) -> ResourceRecord {
+    pub fn sign_as_wildcard(&self, records: &[ResourceRecord], wildcard: &str) -> ResourceRecord {
         let first = records.first().expect("an RRset has at least one record");
         let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
         let mut sig = self.zsk.sign_rrset(

@@ -29,10 +29,10 @@
 //!   still have been answered by a wildcard.
 //! - **TTL is bounded by the proof**, not by the question.
 
+use crate::dnssec::{canonical_name, label_count, suffix_labels, Rrsig};
 use crate::dnssec_denial::{
     canonical_sort_key, proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3,
 };
-use crate::dnssec::{canonical_name, label_count, suffix_labels, Rrsig};
 use crate::utils::{current_unix_timestamp, record_types as rt};
 use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};
 use std::collections::{BTreeMap, HashMap};
@@ -723,8 +723,7 @@ impl ZoneProofs {
         zone: &str,
         now: u64,
     ) -> Option<(ResponseCode, Vec<ResourceRecord>, u32)> {
-        let live: Vec<&CachedProof<Nsec3>> =
-            self.nsec3s.values().filter(|c| c.live(now)).collect();
+        let live: Vec<&CachedProof<Nsec3>> = self.nsec3s.values().filter(|c| c.live(now)).collect();
         if live.is_empty() {
             return None;
         }
@@ -759,8 +758,7 @@ impl ZoneProofs {
         // Same delegation trap as NSEC: if the closest encloser we can prove is
         // a delegation, the name below it belongs to the child zone.
         for cached in &candidates {
-            let is_delegation =
-                cached.proof.has_type(rt::NS) && !cached.proof.has_type(rt::SOA);
+            let is_delegation = cached.proof.has_type(rt::NS) && !cached.proof.has_type(rt::SOA);
             if !is_delegation {
                 continue;
             }
@@ -773,10 +771,7 @@ impl ZoneProofs {
         }
 
         let proofs: Vec<Nsec3> = candidates.iter().map(|c| c.proof.clone()).collect();
-        if !matches!(
-            proves_nxdomain(qname, zone, &[], &proofs),
-            Denial::Proved
-        ) {
+        if !matches!(proves_nxdomain(qname, zone, &[], &proofs), Denial::Proved) {
             return None;
         }
 
@@ -905,7 +900,7 @@ fn evict_zone(zones: &mut HashMap<String, ZoneProofs>, now: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dnssec_denial::{build_type_bitmap, nsec3_hash, base32hex_encode};
+    use crate::dnssec_denial::{base32hex_encode, build_type_bitmap, nsec3_hash};
     use crate::{OpCode, QueryClass, QuerySection, RecordData};
 
     fn soa_record(zone: &str, minimum: u32, ttl: i32) -> ResourceRecord {
@@ -1015,7 +1010,11 @@ mod tests {
     #[test]
     fn test_one_gap_denies_every_name_inside_it() {
         let cache = cache_with_a_gap();
-        for name in ["nope.example.com.", "also-nope.example.com.", "b.example.com."] {
+        for name in [
+            "nope.example.com.",
+            "also-nope.example.com.",
+            "b.example.com.",
+        ] {
             let s = cache
                 .synthesize(name, rt::A)
                 .unwrap_or_else(|| panic!("{name} is inside the cached gap"));
@@ -1131,7 +1130,9 @@ mod tests {
             ],
         ));
 
-        let s = cache.synthesize("www.example.com.", rt::AAAA).expect("NODATA");
+        let s = cache
+            .synthesize("www.example.com.", rt::AAAA)
+            .expect("NODATA");
         assert_eq!(s.rcode, ResponseCode::Ok);
         assert!(s.authority.iter().all(|rr| rr.rdata.rtype != rt::A));
         // A is in the bitmap, so that one has to go upstream.
@@ -1215,8 +1216,14 @@ mod tests {
             ],
         ));
 
-        let s = cache.synthesize("nope.example.com.", rt::A).expect("denied");
-        assert!(s.ttl <= 60, "SOA MINIMUM bounds the negative TTL, got {}", s.ttl);
+        let s = cache
+            .synthesize("nope.example.com.", rt::A)
+            .expect("denied");
+        assert!(
+            s.ttl <= 60,
+            "SOA MINIMUM bounds the negative TTL, got {}",
+            s.ttl
+        );
         assert!(
             s.authority.iter().all(|rr| rr.ttl <= 60),
             "the records handed back must count down too"
@@ -1381,7 +1388,11 @@ mod tests {
         let s = cache
             .synthesize("nope.example.com.", rt::AAAA)
             .expect("the child zone's proof applies");
-        assert_eq!(s.rcode, ResponseCode::Ok, "NODATA, not the parent's NXDOMAIN");
+        assert_eq!(
+            s.rcode,
+            ResponseCode::Ok,
+            "NODATA, not the parent's NXDOMAIN"
+        );
     }
     // -----------------------------------------------------------------
     // Wildcard synthesis (RFC 8198 section 5.3)
@@ -1470,11 +1481,17 @@ mod tests {
             .synthesize_wildcard("b.example.com.", rt::A)
             .expect("the same wildcard reaches this name too");
         assert_eq!(
-            s.answers.iter().filter(|rr| rr.rdata.rtype == rt::A).count(),
+            s.answers
+                .iter()
+                .filter(|rr| rr.rdata.rtype == rt::A)
+                .count(),
             1
         );
         for rr in &s.answers {
-            assert_eq!(rr.name, "b.example.com.", "re-owned onto the name asked for");
+            assert_eq!(
+                rr.name, "b.example.com.",
+                "re-owned onto the name asked for"
+            );
             assert!(rr.ttl as u32 <= 300);
         }
         assert!(
@@ -1504,7 +1521,9 @@ mod tests {
         cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
 
         assert!(
-            cache.synthesize_wildcard("x.b.example.com.", rt::A).is_none(),
+            cache
+                .synthesize_wildcard("x.b.example.com.", rt::A)
+                .is_none(),
             "*.example.com. does not reach a name two labels down"
         );
         assert!(
@@ -1541,7 +1560,9 @@ mod tests {
         assert!(cache
             .synthesize_wildcard("b.example.com.", rt::AAAA)
             .is_none());
-        assert!(cache.synthesize_wildcard("b.example.com.", rt::MX).is_none());
+        assert!(cache
+            .synthesize_wildcard("b.example.com.", rt::MX)
+            .is_none());
     }
 
     /// An answer that was *not* a wildcard expansion must not be stored as one, or
