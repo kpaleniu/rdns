@@ -163,25 +163,57 @@ impl DnsCache {
         );
     }
 
-    /// Evict expired and oldest entries
+    /// Evict expired entries, and then the soonest-to-expire until the cache is
+    /// down to half its limit.
+    ///
+    /// Three passes over the map and one `Vec<u64>`, all linear. It used to be a
+    /// `while` loop calling `min_by_key` over the *whole* map to find one victim
+    /// and `clone()` its `String` key to remove it — O(n²) with an allocation
+    /// per removal, under the global cache lock, with every reader blocked for
+    /// the duration. At the default `max_entries = 10_000` that is ~37 million
+    /// `HashMap` iterations and 5,000 `String` allocations in one uninterruptible
+    /// stall, repeated every time the cache refilled.
+    ///
+    /// The policy is unchanged — keep the entries with the most life left — so
+    /// this is a rewrite of how, not of what.
     fn evict_oldest(&self, cache: &mut HashMap<(String, u16), CacheEntry>) {
         let now = current_unix_timestamp();
 
         // First remove all expired entries
         cache.retain(|_, entry| !entry.is_expired(now));
 
-        // If still over limit, remove oldest entries
-        while cache.len() > self.max_entries / 2 {
-            if let Some(key) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(k, _)| k.clone())
-            {
-                cache.remove(&key);
-            } else {
-                break;
-            }
+        let target = self.max_entries / 2;
+        if cache.len() <= target {
+            return;
         }
+
+        // `select_nth_unstable` partitions in O(n) average without sorting: the
+        // element at `remove` lands where it would be in sorted order, and
+        // everything before it is no greater. That value is the eviction
+        // boundary, and it is a *value*, so no key is cloned to find it.
+        let mut expiries: Vec<u64> = cache.values().map(|entry| entry.expires_at).collect();
+        let remove = expiries.len() - target;
+        let (_, &mut cutoff, _) = expiries.select_nth_unstable(remove);
+
+        // Ties are the case that matters and the reason this is not a plain
+        // `retain(|e| e.expires_at > cutoff)`. Expiries are whole seconds, so a
+        // cache filled in one burst at one TTL has *every* entry on the same
+        // value — and a strict comparison would then evict the entire cache
+        // rather than half of it, turning a bounded cache into no cache. Keep
+        // entries strictly past the boundary, then admit ties until the target
+        // is met, which lands on exactly `target` entries however they tie.
+        let strictly_newer = expiries.iter().filter(|&&e| e > cutoff).count();
+        let mut ties_to_keep = target.saturating_sub(strictly_newer);
+        cache.retain(|_, entry| {
+            if entry.expires_at > cutoff {
+                true
+            } else if entry.expires_at == cutoff && ties_to_keep > 0 {
+                ties_to_keep -= 1;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Get cache statistics
@@ -394,5 +426,67 @@ mod tests {
 
         let stats = cache.get_stats();
         assert!(stats.total_entries <= 10, "cache exceeded max capacity");
+    }
+
+    /// The case the one-line version of this eviction gets wrong. Expiries are
+    /// whole seconds, so a cache filled in a burst at a single TTL — which is
+    /// what a resolver warming up actually looks like — has **every** entry on
+    /// the same `expires_at`. Evicting "everything not strictly newer than the
+    /// boundary" then empties the entire cache instead of halving it, and the
+    /// server does it again on the next fill: a bounded cache that is really no
+    /// cache, with nothing to see but a miss rate.
+    ///
+    /// Note what this test is and is not: it fails against the *naive* rewrite
+    /// (1 of 100 entries survives), not against the old quadratic, which got
+    /// ties right by removing one entry at a time. It guards the fix, not the
+    /// bug — the regression test for the bug is the one below.
+    #[test]
+    fn evicting_a_cache_whose_entries_all_expire_together_halves_it() {
+        let cache = DnsCache::new(100);
+        for i in 0..101 {
+            let name = format!("example{i}.com.");
+            cache.put(&name, 1, vec![create_test_record(&name, 300)]);
+        }
+
+        let total = cache.get_stats().total_entries;
+        assert!(total <= 100, "still bounded, got {total}");
+        assert!(
+            total >= 50,
+            "half the cache is the eviction policy; {total} entries survived, \
+             so the tie on expires_at swept entries it was not asked to"
+        );
+    }
+
+    /// Eviction used to re-scan the whole map with `min_by_key` to find **one**
+    /// victim and clone its `String` key to remove it, looping until half the
+    /// entries were gone: O(n²) plus an allocation per removal, under the global
+    /// cache lock with every reader blocked, repeated each time the cache
+    /// refilled. At the default of 10,000 entries that is ~37 million `HashMap`
+    /// iterations per stall.
+    ///
+    /// A ceiling rather than a floor, and a very loose one: this measures ~0.2 s
+    /// in a debug build, so five seconds is more than the factor of ten of
+    /// headroom `CLAUDE.md` §10 asks for and still nowhere near the tens of
+    /// seconds the quadratic needs at this size. `bench_cache_throughput` cannot
+    /// see any of this — it only ever calls `get` on an empty cache.
+    #[test]
+    fn evicting_a_large_cache_is_linear_not_quadratic() {
+        use std::time::Instant;
+
+        let cache = DnsCache::new(20_000);
+        let start = Instant::now();
+        // Past the bound and then some, so eviction runs more than once.
+        for i in 0..40_000 {
+            let name = format!("example{i}.com.");
+            cache.put(&name, 1, vec![create_test_record(&name, 300)]);
+        }
+        let elapsed = start.elapsed();
+
+        assert!(cache.get_stats().total_entries <= 20_000);
+        assert!(
+            elapsed.as_secs_f64() < 5.0,
+            "filling a 20k cache twice over took {elapsed:?}; eviction is \
+             scaling with the cache size again"
+        );
     }
 }

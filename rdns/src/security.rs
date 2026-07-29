@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 /// Configuration for rate limiting
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
-    /// Number of tokens available per window
+    /// Number of tokens available per window. **Zero turns the limiter off.**
     pub tokens_per_window: u32,
     /// Window size in seconds
     pub window_size_secs: u64,
@@ -17,6 +17,9 @@ pub struct RateLimitConfig {
     pub cleanup_interval_secs: u64,
     /// The most source addresses tracked at once. See [`RateLimiter`].
     pub max_tracked: usize,
+    /// Addresses the limit does not apply to. Empty by default: nobody is
+    /// exempt unless an operator says so.
+    pub exempt: TransferAcl,
 }
 
 impl Default for RateLimitConfig {
@@ -27,7 +30,39 @@ impl Default for RateLimitConfig {
             burst_size: 20,             // Allow burst of 20
             cleanup_interval_secs: 600, // 10 minute cleanup
             max_tracked: 10_000,        // See RateLimiter: the table is attacker-keyed
+            exempt: TransferAcl::default(),
         }
+    }
+}
+
+impl RateLimitConfig {
+    /// A limit stated the way an operator states it: queries per second, and how
+    /// many may arrive at once before the rate applies.
+    ///
+    /// `per_sec` of **0 disables the limiter entirely**, which is a position an
+    /// authoritative server can reasonably take — it fronts resolvers, not end
+    /// users, and the response-byte budget ([`ResponseLimiter`]) is the control
+    /// that actually stops amplification.
+    ///
+    /// The defaults these replace were a trap: 100 tokens per 10-second window
+    /// with a burst of 20 reads as "100 queries" and is **10 queries a second**,
+    /// which is below what one busy resolver sends. Stating the rate in the unit
+    /// the operator thinks in is most of the fix.
+    pub fn per_second(per_sec: u32, burst: u32) -> Self {
+        RateLimitConfig {
+            tokens_per_window: per_sec,
+            window_size_secs: 1,
+            // A burst of zero would refuse every query outright, since a bucket
+            // starts full and a full bucket of nothing has no token to spend.
+            burst_size: burst.max(1),
+            ..Default::default()
+        }
+    }
+
+    /// Exempt these addresses (bare or CIDR) from the limit.
+    pub fn exempting(mut self, exempt: TransferAcl) -> Self {
+        self.exempt = exempt;
+        self
     }
 }
 
@@ -77,6 +112,13 @@ impl RateLimiter {
 
     /// Check if a request from the given IP should be allowed
     pub fn should_allow(&self, ip: IpAddr) -> bool {
+        // Both of these short-circuit before the lock and before a bucket is
+        // created, so an exempt source costs nothing and a disabled limiter is
+        // not a mutex on every query.
+        if self.config.tokens_per_window == 0 || self.config.exempt.allows(ip) {
+            return true;
+        }
+
         let now = current_unix_timestamp();
 
         // Cleanup old entries periodically
@@ -344,6 +386,19 @@ impl TransferAcl {
     /// ACL must stop the server, not silently leave the list shorter than the
     /// operator believes it to be.
     pub fn parse(specs: &[String]) -> ConfigResult<Self> {
+        Self::parse_named(specs, "transfer ACL")
+    }
+
+    /// [`Self::parse`] for an address list that is not the transfer ACL — the
+    /// query-rate exemption list, today.
+    ///
+    /// Same syntax and the same refusal to skip a rule it cannot read; only the
+    /// error text differs, so an operator running two lists is told which one has
+    /// the typo. Sharing the parser rather than writing a second one is
+    /// `CLAUDE.md` §7: a CIDR matcher that exists twice is a CIDR matcher where
+    /// one copy has the v4-mapped-v6 hole that the doc comment above this type
+    /// exists to warn about.
+    pub fn parse_named(specs: &[String], what: &str) -> ConfigResult<Self> {
         let mut rules = Vec::new();
         for spec in specs {
             let spec = spec.trim();
@@ -355,12 +410,12 @@ impl TransferAcl {
                 None => (spec, None),
             };
             let addr: IpAddr = addr_part.parse().map_err(|e| {
-                ConfigError::new(format!("bad address {addr_part:?} in transfer ACL: {e}"))
+                ConfigError::new(format!("bad address {addr_part:?} in {what}: {e}"))
             })?;
             let max = if addr.is_ipv4() { 32 } else { 128 };
             let prefix = match prefix_part {
                 Some(p) => p.parse::<u8>().map_err(|e| {
-                    ConfigError::new(format!("bad prefix length {p:?} in transfer ACL: {e}"))
+                    ConfigError::new(format!("bad prefix length {p:?} in {what}: {e}"))
                 })?,
                 None => max,
             };
@@ -628,6 +683,79 @@ mod tests {
 
         // Should deny immediately
         assert!(!limiter.should_allow(ip));
+    }
+
+    /// The limit is a *rate*, and the units it was configured in were not the
+    /// units it read as: 100 tokens per 10-second window with a burst of 20 is
+    /// **10 queries a second**, which is below what one busy resolver sends, and
+    /// it was hardcoded with no flag. Measured live before the change: a
+    /// 60-query burst from one address got 20 answers and 40 silent drops.
+    #[test]
+    fn a_per_second_limit_means_what_it_says() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+
+        // The burst is what may arrive at once, before the rate applies.
+        let limiter = RateLimiter::new(RateLimitConfig::per_second(1000, 200));
+        for i in 0..200 {
+            assert!(limiter.should_allow(ip), "query {i} of the burst");
+        }
+        assert!(
+            !limiter.should_allow(ip),
+            "and the burst is a bound, not a suggestion"
+        );
+
+        // The old default, stated in its own units, is the 10 q/s that caused
+        // the problem — kept here so the number is written down somewhere.
+        let old = RateLimitConfig::default();
+        assert_eq!(
+            old.tokens_per_window as f64 / old.window_size_secs as f64,
+            10.0
+        );
+    }
+
+    /// 0 turns the limiter off outright, which is a defensible position for an
+    /// authoritative server: it fronts resolvers rather than end users, and
+    /// [`ResponseLimiter`] is the control that actually stops amplification.
+    #[test]
+    fn a_rate_of_zero_disables_the_limiter_rather_than_refusing_everything() {
+        let limiter = RateLimiter::new(RateLimitConfig::per_second(0, 1));
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        for i in 0..10_000 {
+            assert!(limiter.should_allow(ip), "query {i}");
+        }
+        // And nothing was tracked, so "off" is not "a bucket per source".
+        assert_eq!(limiter.get_stats().tracked_ips, 0);
+    }
+
+    /// An exempt source is never limited, and — the half worth testing — being
+    /// exempt does not exempt anybody else.
+    #[test]
+    fn an_exempt_source_is_not_rate_limited_and_its_neighbours_still_are() {
+        let limiter = RateLimiter::new(RateLimitConfig::per_second(10, 2).exempting(
+            TransferAcl::parse_named(&["192.0.2.0/24".to_string()], "test list").unwrap(),
+        ));
+        let exempt = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
+        let ordinary = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+
+        for i in 0..1_000 {
+            assert!(limiter.should_allow(exempt), "exempt query {i}");
+        }
+        assert!(limiter.should_allow(ordinary));
+        assert!(limiter.should_allow(ordinary));
+        assert!(
+            !limiter.should_allow(ordinary),
+            "an address outside the exemption keeps its own bucket"
+        );
+    }
+
+    /// A burst of zero would refuse every query outright — a bucket starts full,
+    /// and a full bucket of nothing has no token to spend. `per_second` floors
+    /// it at one so a mistyped flag cannot turn the server off.
+    #[test]
+    fn a_burst_of_zero_does_not_become_a_total_outage() {
+        let limiter = RateLimiter::new(RateLimitConfig::per_second(10, 0));
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        assert!(limiter.should_allow(ip), "one query must still get through");
     }
 
     #[test]

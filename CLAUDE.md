@@ -74,6 +74,22 @@ Both halves of this were violated in code where every *other* length was checked
   way in — so a check that existed four times over was still missing where it
   mattered. If a value has an invariant, make it unrepresentable without it
   rather than re-asserting it per site.
+- **A catch-all variant must carry the value it caught.** `QueryClass` had no
+  variant for an unrecognized class, so the parse was
+  `from_u16(qclass).unwrap_or(QueryClass::None)` — and `None` is not a sentinel,
+  it is **254**, RFC 2136's real NONE class. QCLASS 99 arrived as `None` and went
+  back out as 254, so the question echoed in the response was not the question
+  asked. `ResponseCode` had the mirror image: an `Unknown = 65535` sentinel that
+  could not hold the code it stood for, which `to_bytes` therefore wrote as
+  **0** — an unrecognized *failure* relayed to the client as NOERROR. Write
+  `Other(u16)`, hand-roll `from_u16`/`to_u16` so both are total and each other's
+  inverse, and the round trip cannot lose anything. `unwrap_or` on the parse of a
+  wire field is the smell; look at what the fallback actually means on the wire.
+- **A signed catch-all is worse than a `String`.** Both of the above were
+  `num_derive`'s `FromPrimitive`, which hands you an `Option` and invites exactly
+  that `unwrap_or`. A data-carrying variant costs the derive and twenty lines of
+  match; it buys a conversion with no failure case for the compiler to let you
+  paper over.
 
 ## 3. Error types: typed in the library, `anyhow` in the binaries
 
@@ -198,6 +214,29 @@ When you find the same reasoning in two places, move it into `rdns` and make bot
 call it — and put the *reason* in the doc comment, because the reason is what
 stops the next copy being written.
 
+Two shapes that are the same drift wearing different clothes:
+
+- **An early `return` that jumps over a shared epilogue.** `make_response` ends
+  by mirroring the client's OPT record (RFC 6891 §6.1.1), and the NOTIMP branch
+  fifty lines above it returned before reaching that — so the one reply that
+  dropped the client's EDNS was the one for an opcode we do not implement. There
+  is no second copy to grep for here; the copy is the *absence* of one. When you
+  add a `return` to a function with a tail that matters, ask what the tail was
+  doing.
+- **A sibling that was written separately and got it right.** `truncated_reply`
+  set AA on a reply carrying no data and hardcoded 512 instead of reading
+  `udp_payload_size()`; `error_bytes`, twenty lines up and doing the same job,
+  had both correct. Two functions that build the same kind of message are one
+  function with a parameter, and until they are, fixing one means reading the
+  other.
+
+**Reuse the parser you already have for the same syntax.** The query-rate
+exemption list is addresses and CIDR prefixes, which `security::TransferAcl`
+already parses — including the rule that a v4 prefix never matches a v4-mapped v6
+peer, which a second implementation would not have. It grew a `parse_named` so
+the error text can say which list has the typo, and that is the whole of what
+"another list of the same thing" should cost.
+
 ## 8. DNS rules this codebase has already got wrong
 
 Cheap to re-check, expensive to rediscover.
@@ -245,6 +284,34 @@ Cheap to re-check, expensive to rediscover.
   a bug pattern**: `Layout::of` was taken before NSEC3PARAM was added, so the apex
   NSEC3 denied a type that was there — and an aggressive-NSEC resolver would then
   synthesize that false NODATA for other clients out of its cache.
+- **A QTYPE is not an RTYPE and a QCLASS is not a CLASS.** The question carries
+  values no stored record can ever hold — ANY is QTYPE 255 and QCLASS 255,
+  neither of which any RR *is* — so `record_type_code(&r.rdata) == qtype` matched
+  nothing and QTYPE=ANY came back as an empty NOERROR plus the SOA. That is a
+  NODATA for a name with data, and none of the shapes RFC 8482 §4 permits. Every
+  comparison of a question field against stored data has to ask first whether the
+  question field is a *query* value with its own meaning (RFC 1035 §3.2.3,
+  §3.2.5).
+- **A class we do not serve is REFUSED, not answered from the class we do.** The
+  class was parsed, stored on every record, and then never compared, so a CH
+  question was answered out of the IN zone — `CLASS=CH` in the echoed question
+  next to `CLASS=IN` records in the answer, which is malformed. RFC 1034 §4.3.2
+  step 1 searches the zones *of the question's class*. The zone parser now refuses
+  a non-IN record outright, which is what makes the class-blind index correct
+  rather than merely untested (§2's "make it unrepresentable").
+- **DNSSEC records are not answer-section data unless DO asked for them**
+  (RFC 4035 §3.1.1). This is the trap hiding inside "ANY means every type": RRSIG,
+  NSEC and NSEC3 are types at the name, so a literal reading hands them to a
+  client that cannot read them, duplicates the ones `answer_signatures` attaches,
+  and — the one that is a correctness bug rather than noise — makes an empty
+  non-terminal in an NSEC-signed zone look like a name *with* data, because the
+  chain puts an NSEC at it.
+- **QNAME minimisation needs a ceiling** (RFC 9156 §2.3, MAX_MINIMISE_COUNT,
+  recommended 10), and the probes ask for **A**, not NS — §2.3 replaced RFC 7816's
+  NS advice with "the QTYPE least likely to raise issues in DNS software and
+  middleboxes". Without the ceiling a 34-label reverse-IPv6 PTR spent ~30 round
+  trips and exhausted the query budget, so a deep name failed outright where it
+  should have degraded to a full-QNAME query that still resolves.
 
 ## 9. Async, locks, and the work done under them
 
@@ -268,9 +335,29 @@ Cheap to re-check, expensive to rediscover.
 - **Never lower a floor to make a bench pass without first proving why it moved.**
   `bench_logger_throughput`'s floor went from 45k to 10k, attributed to competing
   load. It was a quadratic in `log_query`, and lowering the floor ratified the
-  regression the benchmark had caught.
+  regression the benchmark had caught. **And put it back when you fix the cause**,
+  with what it measures now written next to it — a floor left at the regressed
+  value is a benchmark that has agreed to stop noticing.
 - **Prefer a deterministic assertion where one exists.** An allocation count
   (`dhat::assert_eq!` on `total_blocks`) does not care what else is running.
+  Neither does a `Vec::capacity` (the 64 KB response scratch), a pointer identity
+  (did the reused buffer reallocate?), a table length (six suffixes, one copy of
+  the name between them), or a count of the queries a mock server was asked.
+  Reach for one of those before reaching for a stopwatch.
+- **"Cost must not grow with N" is a ratio, not a floor.** Time a batch cold,
+  do N units of work, time the same batch again, assert the ratio. It does not
+  care how fast the machine is or what else is running — which is exactly the
+  weakness that let the `log_query` quadratic be argued away. Measured against
+  the old code: 22.5×. Against the fix: ~1×. See
+  `logging::tests::logging_a_query_costs_the_same_however_many_came_before`.
+- **A ceiling with a factor of a hundred of headroom is a fine test.** Filling a
+  20k-entry cache twice over takes 0.05 s now and took 6.8 s with the O(n²)
+  eviction; asserting "under five seconds" is not a performance target, it is a
+  tripwire for a complexity class, and it never fires on a busy machine.
+- **Say what a test is a regression for, and what it is not.** The tie-handling
+  test for cache eviction fails against the *naive rewrite*, not against the old
+  quadratic — which got ties right, slowly. Both are worth having; conflating
+  them is how a suite gets credit it has not earned (§1).
 
 ## 11. Comments, commits, and `TODO.md`
 
@@ -324,3 +411,73 @@ Configure git to honour the file once per clone:
 ```sh
 git config blame.ignoreRevsFile .git-blame-ignore-revs
 ```
+
+---
+
+## 13. Size a buffer for what you will send, not for what the protocol allows
+
+Every one of these was a scratch buffer sized by the format's maximum rather than
+by the caller's actual limit, and each cost more than it looks.
+
+- **`Vec::truncate` does not release capacity.** `to_bytes_within` built every
+  response in `vec![0u8; u16::MAX as usize]` — 64 KB, zeroed — and truncated it,
+  so the `Vec` handed to `send_to` and held for the duration of the send was 64 KB
+  whatever the answer was. A 60-byte response retained capacity 65535. Only the
+  TCP and transfer paths ever want `u16::MAX`; a UDP caller knows its EDNS payload
+  size and should be charged that. Verified by asserting on `capacity()`, which is
+  exact.
+- **Give the hot path a way to bring its own buffer.** `to_bytes_within_buf` is
+  the primitive and `to_bytes_within` is the allocating wrapper, so a send loop
+  that keeps one scratch buffer allocates nothing per response — a third of
+  serialization was allocator traffic, and it is not optimizer-erasable because
+  the allocation escapes into the socket call.
+- **When the maximum *is* the limit, the "too long" check moves.** Sizing the
+  scratch to `max_len` turns "the message does not fit" from a comparison into a
+  `WireError::Truncated` from the writer, which then has to be caught rather than
+  propagated — and every *other* `WireError` is still a real failure. Test the
+  message that is exactly `max_len` bytes: that is where an off-by-one puts a
+  message that fits onto the truncation path.
+- **Do not store one owned copy per derived key.** The name compressor kept a
+  `HashMap<String, u16>` filled by `labels[i..].join(".").to_ascii_lowercase()` —
+  two allocations per suffix (join, then lowercase, since `to_ascii_lowercase` on
+  a `str` returns a new `String`) and a total byte count quadratic in the label
+  count, because every suffix carried its own copy of the tail it shares with the
+  others. One lowercased copy in an arena plus ranges into it is smaller, faster,
+  and a linear scan beats the hash outright when a message holds a handful of
+  distinct names.
+- **Halving a map with `select_nth_unstable` beats `min_by_key` in a loop.** Cache
+  eviction re-scanned the whole map to find *one* victim and cloned its `String`
+  key to remove it: O(n²) plus an allocation per removal, under the global lock,
+  ~37 million iterations per stall at the default size. And **check the ties**:
+  expiries are whole seconds, so a cache filled in one burst has every entry on
+  one value, and `retain(|e| e.expires_at > cutoff)` empties the whole cache
+  instead of halving it.
+
+## 14. A limit with no flag is a limit nobody has reviewed
+
+- **State a rate in the unit the operator thinks in.** The query limiter was
+  configured as "100 tokens per 10-second window, burst 20", which reads as a
+  hundred queries and *is* **ten a second** — below what one busy resolver sends.
+  It was hardcoded, had no flag, and dropped over it **silently**: no REFUSED, no
+  SERVFAIL, nothing on the wire, so the operator concludes it is the network.
+  Measured before the fix: a 60-query burst got 20 answers and 40 drops.
+  `RateLimitConfig::per_second(rate, burst)` exists so the number in the config
+  is the number in the head.
+- **Silence can be the right answer and still needs to be visible somewhere.**
+  Replying to a rate-limited source is what an amplifier does, so dropping is
+  correct — which is exactly why the effective policy is printed at startup and
+  why the metrics item (`TODO.md` #9d) is what finishes this. A control nobody can
+  observe is a control nobody can debug.
+- **Every knob wants an escape hatch and an off switch.** `--query-rate 0`
+  disables the limiter outright, and `--query-rate-exempt` takes the resolvers you
+  run yourself and the monitoring probe whose job is to query more often than a
+  client would. Without the exemption the only way to spare a known-good source is
+  to raise the limit for everyone.
+- **Floor a knob that can turn the server off.** A burst of zero refuses every
+  query, because a bucket starts full and a full bucket of nothing has no token to
+  spend. `per_second` floors it at one: a mistyped flag should be wrong, not
+  fatal.
+- **Group policy parameters into a struct once there are more than a few.**
+  `serve` reached eight arguments — two `u32`s and two address-shaped things among
+  them — which is one edit away from swapping the response budget for the query
+  rate with nothing to catch it. Clippy says so at 7; it is right for a reason.

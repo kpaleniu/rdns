@@ -21,14 +21,43 @@ use crate::dname::{
     dname_from_bytes, write_bytes, write_label, DNameUnpacker, POINTER_MASK, POINTER_TAG,
 };
 use crate::error::WireError;
-use std::collections::HashMap;
 
 /// Per-message table of name suffixes already written, and where.
+///
+/// **Suffixes are ranges into one arena, not owned `String`s.** This used to be
+/// a `HashMap<String, u16>` filled by `labels[i..].join(".").to_ascii_lowercase()`
+/// — which allocates once to join and *again* to lowercase, since
+/// `to_ascii_lowercase` on a `str` returns a new `String` rather than mutating.
+/// Writing `www.example.com.` cold cost about eight allocations and a total byte
+/// count quadratic in the label count, because every suffix carried its own copy
+/// of the tail it shares with the others. Measured at 339 ns per name, which made
+/// compression the *majority* of response serialization: the whole rest of
+/// `to_bytes` for a three-record answer was under 400 ns.
+///
+/// A linear scan beats a hash here rather than merely tying it. One message holds
+/// a handful of distinct names, so the table is a handful of entries long; hashing
+/// a string costs a pass over it either way, and the `HashMap` had to be built and
+/// dropped per message on top of that.
 #[derive(Debug, Default)]
 pub struct NameCompressor {
-    /// Lowercased suffix (no trailing dot) -> offset of its first occurrence.
-    /// Lowercased because name comparison is case-insensitive (RFC 4343).
-    seen: HashMap<String, u16>,
+    /// Every name written so far, lowercased and concatenated. Lowercased
+    /// because name comparison is case-insensitive (RFC 4343) — and ASCII-only,
+    /// per `utils::ascii_lowered`'s reasoning: `str::to_lowercase` folds U+212A
+    /// KELVIN SIGN to `k`, which would make two names that differ on the wire
+    /// compress against each other.
+    arena: String,
+    /// Suffixes of those names, as ranges into `arena` with the offset each was
+    /// first written at. Never holds two entries for the same suffix.
+    seen: Vec<Suffix>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Suffix {
+    /// Byte range into [`NameCompressor::arena`].
+    start: u32,
+    end: u32,
+    /// Where this suffix begins in the message being written.
+    offset: u16,
 }
 
 impl NameCompressor {
@@ -50,48 +79,86 @@ impl NameCompressor {
             return write_bytes(buf, pos, &[0]);
         }
 
-        let labels: Vec<&str> = trimmed.split('.').collect();
+        // Lowercase the whole name once, into the arena. Every suffix of it is
+        // then a slice of that one copy, which is what removes both the join and
+        // the second allocation per suffix.
+        let base = self.arena.len();
+        self.arena.push_str(trimmed);
+        self.arena[base..].make_ascii_lowercase();
+        let end = self.arena.len();
 
-        // Walk suffixes longest-first. Everything we pass is a suffix that will
-        // be written literally here, so note where it lands: a later name can
-        // point at it, and its tail continues correctly into whatever we emit
-        // after it (labels or a pointer).
-        let mut suffix_pos = pos;
-        let mut fresh: Vec<(String, usize)> = Vec::with_capacity(labels.len());
-
-        for i in 0..labels.len() {
-            let key = labels[i..].join(".").to_ascii_lowercase();
-
-            if let Some(&target) = self.seen.get(&key) {
-                self.remember(fresh);
-                let mut out = pos;
-                for label in &labels[..i] {
-                    out = write_label(buf, out, label)?;
-                }
-                return write_bytes(buf, out, &(POINTER_TAG | target).to_be_bytes());
+        // Byte offsets of each label's start, within the arena. Split on every
+        // `.` exactly as `str::split` did, so an empty label still reaches
+        // `write_label` and is still rejected there.
+        let mut starts: Vec<usize> = Vec::with_capacity(8);
+        starts.push(base);
+        for (i, byte) in self.arena.as_bytes()[base..end].iter().enumerate() {
+            if *byte == b'.' {
+                starts.push(base + i + 1);
             }
-
-            fresh.push((key, suffix_pos));
-            suffix_pos += labels[i].len() + 1;
         }
 
-        // Nothing matched: write the name out in full.
-        self.remember(fresh);
+        // Walk suffixes longest-first, looking for one already in the message.
+        let mut matched = None;
+        for (i, &start) in starts.iter().enumerate() {
+            if let Some(target) = self.lookup(start, end) {
+                matched = Some((i, target));
+                break;
+            }
+        }
+
+        // Everything before the match is a suffix that will be written literally
+        // here, so note where it lands: a later name can point at it, and its
+        // tail continues correctly into whatever we emit after it (labels or a
+        // pointer). Everything from the match on is already recorded.
+        let fresh = matched.map_or(starts.len(), |(i, _)| i);
+        if fresh == 0 {
+            // The whole name was already known, so the copy just appended is
+            // redundant. Drop it rather than letting the arena grow per name.
+            self.arena.truncate(base);
+        } else {
+            let mut suffix_pos = pos;
+            for (i, &start) in starts.iter().enumerate().take(fresh) {
+                // Bytes this label occupies on the wire: its own length plus the
+                // one-byte length prefix, which is exactly the distance to the
+                // next label's start — or, for the last label, the remaining
+                // bytes plus the root's zero octet.
+                let next = starts.get(i + 1).copied().unwrap_or(end + 1);
+                // A pointer field is 14 bits, so a suffix past that is a target
+                // nothing can reach. Recording it would only slow the scan.
+                if suffix_pos <= POINTER_MASK as usize {
+                    self.seen.push(Suffix {
+                        start: start as u32,
+                        end: end as u32,
+                        offset: suffix_pos as u16,
+                    });
+                }
+                suffix_pos += next - start;
+            }
+        }
+
+        // The labels ahead of the match go out literally; `fresh` is exactly how
+        // many those are, whether or not anything matched. Split `trimmed`
+        // rather than the arena so the name keeps the case it was given — RFC
+        // 4343 folds case for *comparison*, and the arena copy exists for that
+        // and nothing else.
         let mut out = pos;
-        for label in &labels {
+        for label in trimmed.split('.').take(fresh) {
             out = write_label(buf, out, label)?;
         }
-        write_bytes(buf, out, &[0])
+        match matched {
+            Some((_, target)) => write_bytes(buf, out, &(POINTER_TAG | target).to_be_bytes()),
+            None => write_bytes(buf, out, &[0]),
+        }
     }
 
-    /// Record where each newly-written suffix starts, skipping any that a
-    /// 14-bit pointer cannot reach.
-    fn remember(&mut self, suffixes: Vec<(String, usize)>) {
-        for (key, offset) in suffixes {
-            if offset <= POINTER_MASK as usize {
-                self.seen.entry(key).or_insert(offset as u16);
-            }
-        }
+    /// The offset a suffix was first written at, if it has been.
+    fn lookup(&self, start: usize, end: usize) -> Option<u16> {
+        let needle = &self.arena[start..end];
+        self.seen
+            .iter()
+            .find(|s| &self.arena[s.start as usize..s.end as usize] == needle)
+            .map(|s| s.offset)
     }
 
     /// Write a record's RDATA at `pos`, compressing embedded names for the
@@ -220,6 +287,59 @@ mod tests {
 
         let end = c.write_name(".", &mut buf, pos).unwrap();
         assert_eq!(&buf[pos..end], &[0]);
+    }
+
+    /// The suffix table used to hold an owned, separately-allocated `String` per
+    /// suffix, so `a.b.c.d.example.com.` stored six keys totalling 84 bytes for
+    /// a 20-byte name — a copy of the shared tail per label, quadratic in label
+    /// count, on top of one discarded intermediate `String` per suffix from the
+    /// `join` that built it. Suffixes are ranges into one copy now.
+    ///
+    /// Asserted on bytes held rather than on a timing, because it is exact and
+    /// does not care what else is running (`CLAUDE.md` §10).
+    #[test]
+    fn a_names_suffixes_are_stored_once_between_them_not_once_each() {
+        let mut c = NameCompressor::new();
+        let mut buf = [0u8; 256];
+
+        let name = "a.b.c.d.example.com.";
+        c.write_name(name, &mut buf, 12).unwrap();
+
+        assert_eq!(c.seen.len(), 6, "six suffixes, one per label");
+        assert_eq!(
+            c.arena.len(),
+            name.len() - 1,
+            "and one copy of the name between them, not one per suffix"
+        );
+
+        // A second name sharing five of those labels adds only its own label.
+        c.write_name("z.b.c.d.example.com.", &mut buf, 40).unwrap();
+        assert_eq!(c.seen.len(), 7);
+        assert_eq!(
+            c.arena.len(),
+            (name.len() - 1) * 2,
+            "the shared tail is not copied per suffix, only per name"
+        );
+    }
+
+    /// A name already known in full adds nothing at all: the lowercased copy
+    /// made to look it up is dropped again, so a response repeating one owner
+    /// name across twenty records does not carry twenty copies of it.
+    #[test]
+    fn a_fully_matched_name_leaves_the_table_and_the_arena_untouched() {
+        let mut c = NameCompressor::new();
+        let mut buf = [0u8; 256];
+
+        let pos = c.write_name("www.example.com.", &mut buf, 12).unwrap();
+        let (suffixes, bytes) = (c.seen.len(), c.arena.len());
+
+        let mut at = pos;
+        for _ in 0..20 {
+            at = c.write_name("WWW.Example.Com.", &mut buf, at).unwrap();
+        }
+        assert_eq!(c.seen.len(), suffixes, "no new suffixes");
+        assert_eq!(c.arena.len(), bytes, "and no new bytes");
+        assert_eq!(at - pos, 40, "twenty two-byte pointers");
     }
 
     /// A name past the 14-bit pointer range is written, but never becomes a

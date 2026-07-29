@@ -34,10 +34,27 @@ use tokio::net::{TcpStream, UdpSocket};
 /// (RFC 1035 §4.2.2), so no message can exceed what that field can express.
 const TCP_MAX_MESSAGE: usize = u16::MAX as usize;
 
-/// The NS record type. Intermediate QNAME-minimized probes ask for this so a
-/// zone cut shows up as a referral while a plain name in the current zone comes
-/// back as NODATA, without revealing the leaf being resolved (RFC 9156).
-const TYPE_NS: u16 = 2;
+/// The record type an intermediate QNAME-minimized probe asks for.
+///
+/// **A, not NS.** RFC 9156 §2.3 says to use "a QTYPE that is least likely to
+/// raise issues in DNS software and middleboxes", and names A as the one it
+/// recommends; NS is RFC 7816's superseded guidance, which 9156 replaced
+/// precisely because some authoritative servers and middleboxes answer an NS
+/// probe for a non-apex name badly. Either type distinguishes a zone cut from a
+/// plain name — a cut answers with a referral, an in-zone name with NODATA —
+/// and neither reveals the leaf being resolved, so there is nothing to trade
+/// off against interoperability here.
+const MINIMIZED_PROBE_TYPE: u16 = 1;
+
+/// How many minimized probes are sent before the full QNAME goes out instead.
+///
+/// RFC 9156 §2.3 requires a MAX_MINIMISE_COUNT and recommends 10. There was no
+/// ceiling: the loop deepened one label at a time for as many labels as the name
+/// had, so a reverse-IPv6 PTR — 34 labels — cost about thirty round trips and
+/// usually exhausted `query_budget` first. That is the wrong failure: the point
+/// of a ceiling is to *degrade* to a full-name query, which still resolves,
+/// rather than to fail a name outright for being deep.
+const MAX_MINIMISE_COUNT: usize = 10;
 
 /// The IPv4 and IPv6 addresses of the 13 root servers, used to prime recursion.
 ///
@@ -884,7 +901,7 @@ impl Resolver {
             let step = QuerySection {
                 qname: qname.clone(),
                 qtype: query.qtype,
-                qclass: query.qclass.clone(),
+                qclass: query.qclass,
             };
             let response = self.resolve_from_root(&step, state, 0).await?;
 
@@ -1031,25 +1048,40 @@ impl Resolver {
         // this cap only bounds a pathological spin. Minimization can add a probe
         // per non-delegated (empty-non-terminal) label, hence the `+ qname_labels`.
         let max_steps = self.config.max_delegations + qname_labels + 1;
+        // Minimized probes sent so far, against RFC 9156 §2.3's
+        // MAX_MINIMISE_COUNT. Counted rather than derived from `sent_labels`,
+        // because a referral can move `zone` several labels at once and it is
+        // the number of *round trips spent minimizing* that the ceiling bounds.
+        let mut minimized_probes = 0usize;
         for _ in 0..max_steps {
-            // With minimization off, always the full name; on, the tracked
-            // depth (capped at the full name).
-            let labels = if self.config.qname_minimization {
+            // With minimization off — or once the ceiling is reached — always
+            // the full name; otherwise the tracked depth, capped at the full
+            // name.
+            let minimizing =
+                self.config.qname_minimization && minimized_probes < MAX_MINIMISE_COUNT;
+            let labels = if minimizing {
                 sent_labels.min(qname_labels)
             } else {
                 qname_labels
             };
             let sname = suffix_with_labels(&qname, labels);
             let is_final = names_equal(&sname, &qname);
+            if !is_final {
+                minimized_probes += 1;
+            }
 
-            // Intermediate probes ask for NS, which a zone cut answers with a
+            // Intermediate probes ask for A, which a zone cut answers with a
             // referral and a plain in-zone name answers with NODATA — telling
             // the two apart without disclosing the leaf. The final query uses
             // the type actually wanted.
             let step = QuerySection {
                 qname: sname.clone(),
-                qtype: if is_final { query.qtype } else { TYPE_NS },
-                qclass: query.qclass.clone(),
+                qtype: if is_final {
+                    query.qtype
+                } else {
+                    MINIMIZED_PROBE_TYPE
+                },
+                qclass: query.qclass,
             };
             let out = self.build_query(&step, false)?;
 
@@ -1254,35 +1286,57 @@ impl Resolver {
     /// Resolve nameserver names to addresses, for delegations that came without
     /// usable glue. Stops at the first name that yields an address: one working
     /// nameserver is enough, and each extra lookup is charged to the budget.
+    ///
+    /// **Both address families.** This asked for A alone, so a delegation whose
+    /// nameservers are IPv6-only and carry no glue was simply unresolvable —
+    /// while `query_server` binds a v6 socket correctly and `extract_referral`
+    /// takes AAAA glue happily, so every other part of the resolver was ready
+    /// for a name the lookup could never produce. AAAA is asked second: on a
+    /// dual-stacked nameserver the A answer ends the search and costs one query,
+    /// which is the common case, and the second lookup is charged to the budget
+    /// only when the first found nothing.
     async fn resolve_nameserver_addresses(
         &self,
         ns_names: &[String],
         state: &mut Resolution,
         depth: usize,
     ) -> ResolveResult<Vec<SocketAddr>> {
+        const A: u16 = 1;
+        const AAAA: u16 = 28;
         for name in ns_names {
-            let lookup = QuerySection {
-                qname: name.clone(),
-                qtype: 1, // A
-                qclass: crate::QueryClass::IN,
-            };
-            // Box the recursive call: this closes the resolution cycle
-            // (resolve_from_root → walk → here → resolve_from_root), and an
-            // `async fn` future may not contain itself by value. Boxing stores a
-            // pointer instead, so the future's size stays finite.
-            let Ok(response) = Box::pin(self.resolve_from_root(&lookup, state, depth)).await else {
-                continue;
-            };
-            let addrs: Vec<SocketAddr> = response
-                .answers
-                .iter()
-                .filter_map(|rr| match rr.rdata.parse() {
-                    Ok(ParsedRecord::A(addr)) => {
-                        Some(SocketAddr::new(IpAddr::V4(addr), self.config.server_port))
-                    }
-                    _ => None,
-                })
-                .collect();
+            let mut addrs: Vec<SocketAddr> = Vec::new();
+            for qtype in [A, AAAA] {
+                let lookup = QuerySection {
+                    qname: name.clone(),
+                    qtype,
+                    qclass: crate::QueryClass::IN,
+                };
+                // Box the recursive call: this closes the resolution cycle
+                // (resolve_from_root → walk → here → resolve_from_root), and an
+                // `async fn` future may not contain itself by value. Boxing
+                // stores a pointer instead, so the future's size stays finite.
+                let Ok(response) = Box::pin(self.resolve_from_root(&lookup, state, depth)).await
+                else {
+                    continue;
+                };
+                addrs.extend(
+                    response
+                        .answers
+                        .iter()
+                        .filter_map(|rr| match rr.rdata.parse() {
+                            Ok(ParsedRecord::A(addr)) => {
+                                Some(SocketAddr::new(IpAddr::V4(addr), self.config.server_port))
+                            }
+                            Ok(ParsedRecord::AAAA(addr)) => {
+                                Some(SocketAddr::new(IpAddr::V6(addr), self.config.server_port))
+                            }
+                            _ => None,
+                        }),
+                );
+                if !addrs.is_empty() {
+                    break;
+                }
+            }
             if !addrs.is_empty() {
                 return Ok(addrs);
             }
@@ -2658,6 +2712,102 @@ this line has no record and is skipped
                 "www.sub.example.test.".to_string()
             ]
         );
+    }
+
+    /// RFC 9156 §2.3 requires a MAX_MINIMISE_COUNT and recommends 10, and there
+    /// was none: the loop deepened a label at a time for as many labels as the
+    /// name had. A reverse-IPv6 PTR is 34 labels, so it cost about thirty round
+    /// trips and usually blew `query_budget` before reaching the leaf — failing
+    /// a name outright for being deep, when the whole point of the ceiling is to
+    /// fall back to the full QNAME, which still resolves.
+    ///
+    /// Also pins the probe QTYPE at **A**. RFC 9156 §2.3 recommends the type
+    /// "least likely to raise issues in DNS software and middleboxes" and names
+    /// A; NS is RFC 7816's superseded advice, which 9156 replaced for that
+    /// reason.
+    #[tokio::test]
+    async fn deep_names_stop_minimizing_at_the_rfc_9156_ceiling() {
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, tld_sock, auth_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let tld_addr = tld_sock.local_addr().unwrap();
+        let auth_addr = auth_sock.local_addr().unwrap();
+
+        // Twelve empty non-terminals below the apex, then the leaf: deeper than
+        // the ceiling, so the fallback has to happen for this to resolve.
+        let leaf = "a.b.c.d.e.f.g.h.i.j.k.l.example.test.";
+
+        // Recorded at *every* server, because the ceiling bounds the minimized
+        // probes in the whole resolution and not per zone: the root is asked
+        // `test.` and the TLD `example.test.`, and those are two of the ten.
+        let seen: Arc<Mutex<Vec<(String, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let a = seen.clone();
+        let _auth = spawn_server(auth_sock, move |q| {
+            let name = qname_of(q);
+            let qtype = q.queries.first().map(|q| q.qtype).unwrap_or(0);
+            a.lock().unwrap().push((name.clone(), qtype));
+            if name == "a.b.c.d.e.f.g.h.i.j.k.l.example.test." && qtype == 1 {
+                authoritative(q, vec![a_record(&name, [192, 0, 2, 9])])
+            } else {
+                authoritative(q, vec![])
+            }
+        });
+        let t = seen.clone();
+        let _tld = spawn_server(tld_sock, move |q| {
+            t.lock()
+                .unwrap()
+                .push((qname_of(q), q.queries.first().map(|q| q.qtype).unwrap_or(0)));
+            referral(
+                q,
+                "example.test.",
+                "ns.example.test.",
+                Some(("ns.example.test.", auth_addr)),
+            )
+        });
+        let r = seen.clone();
+        let root = spawn_server(root_sock, move |q| {
+            r.lock()
+                .unwrap()
+                .push((qname_of(q), q.queries.first().map(|q| q.qtype).unwrap_or(0)));
+            referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
+        });
+
+        let resolver = Resolver::new(recursing_config(root.addr));
+        let answer = resolver
+            .resolve(&QuerySection {
+                qname: leaf.to_string(),
+                qtype: 1,
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("a deep name must fall back to the full QNAME, not fail");
+
+        assert_eq!(
+            answer.answers[0].rdata.parse().unwrap(),
+            ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 9))
+        );
+
+        let seen = seen.lock().unwrap();
+        let minimized: Vec<&(String, u16)> = seen.iter().filter(|(name, _)| name != leaf).collect();
+        assert_eq!(
+            minimized.len(),
+            MAX_MINIMISE_COUNT,
+            "the ceiling bounds the minimized probes, and every one of them \
+             counts: {seen:?}"
+        );
+        assert!(
+            minimized.iter().all(|(_, qtype)| *qtype == 1),
+            "an intermediate probe asks for A, not NS: {minimized:?}"
+        );
+        // The name is fourteen labels deep, so without the ceiling this would
+        // have been thirteen probes and then the leaf.
+        assert!(minimized.len() < 13, "no fallback happened: {minimized:?}");
+        // And then the full name, once, with the type actually wanted.
+        assert_eq!(seen.iter().filter(|(name, _)| name == leaf).count(), 1);
     }
 
     // ---------------------------------------------------------------------

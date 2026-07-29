@@ -26,13 +26,15 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **567 lib + 60 `rdnsd` + 2 `rdnsr`** tests passing
-(`rdnsd`'s own 60 cover argument validation, zone sources and the load policy,
+`cargo test --workspace` = **588 lib + 68 `rdnsd` + 2 `rdnsr`** tests passing
+(`rdnsd`'s own 68 cover argument validation, zone sources and the load policy,
 the secondary role and EXPIRE across reloads, both directions of IXFR and onward
-announcement, answering a DO-bit query from a zone it signed itself, and all four
-cases of RFC 1034 §4.3.2; `rdnsr` had **no test module at all** until #9c gave it
-one), `cargo clippy --workspace --all-targets` **clean, no exceptions**. The lib
-count fell from 578 when dead `serialization.rs` was deleted with its 11 tests.
+announcement, answering a DO-bit query from a zone it signed itself, all four
+cases of RFC 1034 §4.3.2, and the class and ANY handling from #9f; `rdnsr` had
+**no test module at all** until #9c gave it one), `cargo clippy --workspace
+--all-targets` **clean, no exceptions**, `cargo fmt --all --check` clean. The lib
+count fell from 578 to 567 when dead `serialization.rs` was deleted with its 11
+tests, and is back up at 588 with #9e's and #9f's regression tests.
 
 **Errors are typed in the library and `anyhow` in the binaries (2026-07-28).**
 The convention used to run the other way round — `rdns` returned `anyhow::Error`,
@@ -62,9 +64,31 @@ oversized-datagram process kill, the unbounded per-IP tables and the wall-clock
 underflows — plus, from #9c, a broken zone file failing the load instead of being
 skipped, EXPIRE surviving a SIGHUP, neither daemon answering a *response* or a
 non-QUERY opcode, and a CNAME-terminated negative answer having its denial
-checked rather than being handed out with AD set. What is left under #9 is
-operability (9d), performance (9e) and smaller conformance gaps (9f): real work,
-none of it blocking correct service.
+checked rather than being handed out with AD set.
+
+**#9f is closed too, and #9e is down to four (2026-07-28).** The conformance gaps
+went as a set: the class is checked at last (and a non-IN record no longer loads
+at all, which is what makes the class-blind index correct rather than untested),
+QTYPE=ANY answers with every RRset at the name and the signatures over them, an
+unknown QCLASS or RCODE round-trips instead of being folded onto a meaningful
+value, QNAME minimisation has RFC 9156's ceiling and asks for A rather than NS,
+a glueless IPv6-only delegation resolves, NOTIMP keeps the client's OPT, a
+truncated reply stops claiming AA, a transfer carries an OPT — and `rdnsc` can
+finally query the non-53 port this repo's own documentation tells you to develop
+against. On the performance side the `log_query` quadratic is gone (3.09M ops/sec
+where it managed 47k, and `bench_logger_throughput`'s floor is back up at 100k),
+responses no longer carry a 64 KB buffer into `send_to`, cache eviction is linear
+rather than O(n²), and name compression stores one copy of a name instead of one
+per suffix. What is left under #9 is **mostly operability (9d)**: metrics, graceful
+shutdown, a config file, a control channel, CI. Four items remain under 9e, led by
+the DHAT profiling pass that turns the rest from a list of claims into a
+measurement.
+
+**One 9d item is closed with them**, because it was the most operationally severe
+thing on the list: the query rate limiter was hardcoded at ~10 q/s per source and
+dropped over it in silence. It has flags now, a default a hundred times higher,
+and an exemption list — measured live at 60 answers to a 60-query burst where the
+finding recorded 20.
 
 **One fix in #9c was a fix to a previous fix.** Closing "an unreadable zone
 directory silently unloads every zone" (2026-07-27) also broke a secondary's
@@ -145,7 +169,13 @@ that produced them is the interesting part:
 suite; the floor is 10k now, which still catches an order-of-magnitude
 regression. (**Superseded — see #9e**: the measurement was falling because of a
 quadratic in `log_query`, not because of competing load. Fix the quadratic and
-the floor should go back up.) The other benches keep their floors —
+the floor should go back up.) **The quadratic is fixed and the floor is back up,
+2026-07-28** — to 100k, not the original 45k, because a floor set at what an idle
+machine measures is what made it flaky to begin with; the debug measurement is now
+3.09M. The floor is the weaker guard of the two either way: the assertion that
+actually catches this class coming back is a *ratio* — cost independent of how
+much has already been logged — for the reason in `CLAUDE.md` §10. The other
+benches keep their floors —
 `bench_zone_lookup`'s is a factor of ten under what it measures, which is the
 rule to follow when adding one. A wall-clock assertion with no headroom is a coin
 toss, not a test.
@@ -180,6 +210,13 @@ cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
 # Tell a secondary at once when a zone changes, and cap UDP response bytes/s.
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --also-notify 127.0.0.1:15354 --response-rate 4096
+
+# Queries per second per source address, its burst, and who is exempt. The
+# default is 1000/200; 0 turns the limit off. Rate-limited queries are dropped
+# in silence on purpose (a reply to a spoofed source is what an amplifier
+# sends), so the effective policy is in the startup banner.
+cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
+  --query-rate 5000 --query-burst 500 --query-rate-exempt 10.0.0.0/8
 
 # Sign a zone. Once, to make the keys and learn the DS to give the parent:
 cargo run -p rdnsd -- --signing-key-dir ./keys --generate-keys example.com
@@ -248,6 +285,15 @@ For local verification, `nslookup` is unreliable against a non-53 port on
 Windows — it reports "No response from server" even when the server replied.
 Probe with a raw `System.Net.Sockets.UdpClient` in PowerShell and read the
 bytes; that is how the "verified live" claims here were checked.
+
+**`rdnsc` works against a non-53 port now** (#9f), which it could not before —
+that is the reason the recipes here reach for something else. It checks the id
+and the echoed question before printing, and falls back to TCP on TC, so it is a
+usable first probe even though it is not an independent one:
+
+```sh
+cargo run -p rdnsc -- 127.0.0.1:15353 A www.example.com.
+```
 
 For an *independent* decode check — our parser agreeing with our serializer
 proves little — Node's resolver is c-ares and takes a port in the server string:
@@ -336,7 +382,7 @@ under "Closed work" further down.
 
 | # | what | open |
 |---|------|------|
-| **9** | what the five-way code review turned up | **32** — 9a, 9b and 9c are closed; what is left is operability, performance and small conformance gaps |
+| **9** | what the five-way code review turned up | **18** — 9a, 9b, 9c and **9f** are closed, and 9e is down to four; what is left is mostly operability |
 | **8** | what signing turned up | **2** — both about re-signing a running server |
 | **7** | the secondary role | **1**, and conditional |
 | **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
@@ -854,8 +900,37 @@ here degrades quietly with the process healthy and nothing alerting.
 
 #### 9d. Operability — none of this is visible from outside the process
 
-- [ ] **The query rate limiter is hardcoded at ~10 q/s per source IP, drops
-      silently, and has no flag** (`rdns/src/security.rs:22-27`, wired
+- [x] **The query rate limiter is hardcoded at ~10 q/s per source IP, drops
+      silently, and has no flag** — **done 2026-07-28**, with all three flags the
+      finding asks for and the higher default. `--query-rate` (1000, per second,
+      **0 turns it off**), `--query-burst` (200), `--query-rate-exempt` taking
+      addresses and CIDR prefixes.
+
+      **The units were most of the bug.** The old configuration read as "100
+      tokens per 10-second window, burst 20", which looks like a hundred queries
+      and is ten a second. `RateLimitConfig::per_second(rate, burst)` states it
+      the way an operator does. A burst of 0 is floored at 1, because a bucket
+      starts full and a full bucket of nothing refuses every query — a mistyped
+      flag should be wrong, not fatal.
+
+      The exemption list reuses `security::TransferAcl` rather than growing a
+      second CIDR parser (`CLAUDE.md` §7); it gained a `parse_named` so an
+      operator with two lists is told which one has the typo.
+
+      **Verified live, the same way the finding was measured.** With the default:
+      a 60-query burst from one address gets **60 answers, 0 drops** — against the
+      20/40 recorded below. With `--query-rate 5 --query-burst 10` it still drops
+      50 of 60, so the limiter works when it is asked to. With
+      `--query-rate-exempt 127.0.0.0/8` on top of that, all 60 come back.
+
+      **The silence is deliberate and still only half-addressed.** Replying to a
+      rate-limited source is what an amplifier does, so dropping is right; the
+      effective policy is printed in the startup banner so the number is at least
+      discoverable, but `log_rate_limited` still increments a map nothing reads.
+      The rest is the metrics item three bullets down, and that is where this
+      finally becomes observable. Original finding follows.
+
+      (`rdns/src/security.rs:22-27`, wired
       unconditionally at `rdnsd/src/main.rs:501`). Measured live: a 60-query burst
       from one address got **20 answers and 40 silent drops** — no REFUSED, no
       SERVFAIL, nothing on the wire. Put this behind any ISP resolver or public
@@ -913,6 +988,15 @@ here degrades quietly with the process healthy and nothing alerting.
       SIGTERM, stop accepting, bounded drain (~5 s), exit 0. `announce_zones`'
       fire-and-forget NOTIFY tasks want a `JoinSet` so shutdown can drain them.
 - [ ] **A malformed-packet flood becomes a disk fill and a global lock convoy**
+      — **the lock convoy half is fixed (2026-07-28), the disk fill is not.**
+      `log_error` counts under the guard and does its `eprintln!` outside it, so
+      one `write(2)` per bad packet no longer serializes every *other* query path
+      behind the stats mutex as well as behind Rust's stderr lock. What is left is
+      the part that needs `tracing` with real levels: there is still no
+      `--log-level` or `--quiet`, the caller still allocates its message with
+      `format!` whether or not anything wants it, and 50k pps of garbage is still
+      50k journald lines a second. Original finding follows.
+
       (`rdns/src/logging.rs:96`). `log_error` does an unconditional, unbuffered
       `eprintln!` while holding the stats mutex — one `write(2)` per bad packet,
       serialized on both Rust's stderr lock and the mutex, from `answer`
@@ -1125,8 +1209,34 @@ into a measurement you can re-run, and it is what tells you when to stop.
       `scratchpad/dhat_probe` (session-local — recreate from the snippet above if
       it is gone).
 
-- [ ] **`QueryLogger::log_query` is O(window) per query under one global mutex —
-      a hard ~23k qps ceiling** (`rdns/src/logging.rs:80`, lock at `:58`).
+- [x] **`QueryLogger::log_query` is O(window) per query under one global mutex —
+      a hard ~23k qps ceiling** — **done 2026-07-28.** The window is a `count` and
+      a `window_start` rolled every five seconds, which answers the same question
+      — queries per second — in two words of state instead of one timestamp per
+      query rescanned on every call. The three mutexes became one: `log_query` used
+      to take four guards per call, including `query_window` **twice in six lines**,
+      the first time only to read the constant 10.
+
+      Measured: 3.09M ops/sec in a debug build, up from the ~47k the old code
+      managed on an idle machine, so `bench_logger_throughput`'s floor goes back
+      up — to 100k rather than the original 45k, since a floor set at what an idle
+      machine measures is what made it flaky in the first place.
+
+      **The floor is not the real guard, and that is the lesson.** A wall-clock
+      floor is what got lowered to ratify this regression. The regression test is
+      `logging_a_query_costs_the_same_however_many_came_before`, which asserts a
+      *ratio*: time a batch cold, log 50,000, time the same batch again. 22.5×
+      against the old code, ~1× against this one, and it does not care what else
+      is running on the machine. Now a rule in `CLAUDE.md` §10.
+
+      While here, `.lock().unwrap()` on a path every query reaches became
+      `let Ok(..) = .. else` with a commented decision (`CLAUDE.md` §6): monitoring
+      that cannot lock stops counting rather than taking the server down. And
+      `log_error`'s unbuffered `eprintln!` moved **outside** the guard — half of
+      the flood item below, which is still open for the rest. Original finding
+      follows.
+
+      (`rdns/src/logging.rs:80`, lock at `:58`).
       `window.queries.retain(|&t| t > age_limit)` rescans every timestamp from the
       last 10 s on **every** query, so the vector is `10 × qps` long and the cost
       is linear in it. Measured: 469 ns at 1k depth, 2,364 at 10k, 9,886 at 50k,
@@ -1144,7 +1254,29 @@ into a measurement you can re-run, and it is what tells you when to stop.
       `pop_front` while the head is stale (amortized O(1)). Split the `stats`
       mutex from the window and drop the double acquisition at `:70-75`, which
       takes a lock twice to read the constant `10`.
-- [ ] **Every response allocates and hands a 64 KB buffer to `send_to`**
+- [x] **Every response allocates and hands a 64 KB buffer to `send_to`** —
+      **done 2026-07-28**, both halves the finding asks for. The scratch is sized
+      to `max_len` (UDP callers pass their EDNS payload size; only TCP and the
+      transfer paths pass `u16::MAX`, where 64 KB is honest), and
+      `to_bytes_within_buf(max_len, &mut Vec<u8>)` is the primitive so a send path
+      that keeps one buffer allocates nothing per response —
+      `to_bytes_within` is now the allocating wrapper around it.
+
+      **Neither daemon reuses a buffer yet**, because the UDP loops spawn a task
+      per datagram and there is no per-task scratch to hang one on; that is
+      #9d's "unbounded `tokio::spawn` per UDP datagram", and the API is there for
+      when it lands. The sizing fix alone removes the overshoot: a 60-byte
+      response used to retain capacity 65535 and now retains at most what the
+      client advertised.
+
+      Asserted on `Vec::capacity` and on pointer identity rather than on a
+      timing — both exact, neither caring what else is running (`CLAUDE.md` §10).
+      Plus the boundary the new sizing introduces: with the scratch sized to
+      `max_len`, "too long" arrives as a `WireError` from the writer rather than
+      as a comparison, so a message of *exactly* `max_len` bytes is where an
+      off-by-one would put a fitting answer onto the truncation path. Original
+      finding follows.
+
       (`rdns/src/lib.rs:1058`, `:1075`). `to_bytes_within` does
       `vec![0u8; u16::MAX as usize]` — 64 KB, zeroed, per response — and
       `Vec::truncate` **does not release capacity**, so the Vec passed to
@@ -1158,8 +1290,30 @@ into a measurement you can re-run, and it is what tells you when to stop.
       the AXFR/TCP paths pass `u16::MAX`), and add
       `to_bytes_within_buf(&self, max_len, &mut Vec<u8>)` so the datagram path
       reuses a per-task scratch buffer and allocates nothing.
-- [ ] **`DnsCache` eviction is O(n²) with a `String` clone per removal, under the
-      global cache lock** (`rdns/src/cache.rs:135`). The loop re-scans the entire
+- [x] **`DnsCache` eviction is O(n²) with a `String` clone per removal, under the
+      global cache lock** — **done 2026-07-28.** Three linear passes and one
+      `Vec<u64>`: collect the expiries, `select_nth_unstable` to find the eviction
+      boundary in O(n) average without sorting, then one `retain`. No key is
+      cloned at all, because the boundary is a *value*. Policy unchanged — keep
+      the entries with the most life left — so this is a rewrite of how, not of
+      what. Measured: filling a 20k cache twice over takes 0.05 s, against 6.8 s
+      for the old loop.
+
+      **Ties are the case the one-line version gets wrong**, and they are the
+      common case rather than a corner: expiries are whole seconds, so a cache
+      filled in a burst at one TTL has *every* entry on one value, and
+      `retain(|e| e.expires_at > cutoff)` then empties the whole cache instead of
+      halving it — a bounded cache that is really no cache, visible only as a miss
+      rate. Entries past the boundary are kept, then ties are admitted until the
+      target is met. The test for that fails against the **naive rewrite**, not
+      against the old quadratic, which got ties right slowly; saying which is
+      which is `CLAUDE.md` §10.
+
+      The same `retain`-then-`min_by_key` shape at `nsec_cache.rs:841`/`:862` and
+      `negative_cache.rs:253` is **not** changed — bounded much smaller there, as
+      the finding says. Original finding follows.
+
+      (`rdns/src/cache.rs:135`). The loop re-scans the entire
       map with `min_by_key` to find *one* victim, and runs until half the entries
       are gone: at the default `max_entries = 10_000` that is ~37 million HashMap
       iterations plus 5,000 `String` allocations in one uninterruptible stall with
@@ -1188,7 +1342,19 @@ into a measurement you can re-run, and it is what tells you when to stop.
       a shared `ascii_lowered` helper so cache, zone, negative cache and compressor
       cannot drift apart again. It is also the faster choice — a vectorizable byte
       loop instead of char-by-char Unicode table lookups.
-- [ ] **Name compression allocates two `String`s per suffix per name**
+- [x] **Name compression allocates two `String`s per suffix per name** — **done
+      2026-07-28**, taking the finding's "real fix" rather than its cheap one.
+      `NameCompressor` keeps an arena of every name written, lowercased once, and
+      the suffix table is `Vec<{start, end, offset}>` of ranges into it with a
+      linear scan — so the per-message `HashMap` construction goes too. A name
+      already known in full has its arena copy truncated away, so a response
+      repeating one owner across twenty records carries one copy of it.
+
+      Asserted structurally: writing `a.b.c.d.example.com.` records six suffixes
+      and **one** copy of the name between them, where the old table held six
+      owned `String`s totalling 84 bytes for a 20-byte name — the byte cost that
+      was quadratic in label count. Original finding follows.
+
       (`rdns/src/compression.rs:63`). `labels[i..].join(".").to_ascii_lowercase()`
       allocates once to join and **again** to lowercase (`to_ascii_lowercase` does
       not mutate in place). Writing `www.example.com.` cold costs ~8 allocations,
@@ -1245,19 +1411,77 @@ into a measurement you can re-run, and it is what tells you when to stop.
 
 #### 9f. Smaller conformance gaps found in the same pass
 
-- [ ] **QCLASS is never checked or matched** (`rdnsd/src/main.rs:249`,
+**All nine are closed, 2026-07-28.** Verified live against dnspython on a running
+`rdnsd` as well as by unit test, because our parser agreeing with our serializer
+proves nothing (`CLAUDE.md` §1): ANY at the apex returns SOA + NS + DNSKEY with
+AA set and every RRset validating under the zone's own keys, a CH question is
+REFUSED with the CH question echoed, QCLASS=ANY is answered from the IN zone, and
+a STATUS opcode gets NOTIMP with the opcode echoed and the OPT record still there.
+
+- [x] **QCLASS is never checked or matched** — **done.** `make_response` refuses
+      a class it does not serve before the zone lookup — REFUSED, not NXDOMAIN,
+      for the reason the rest of that loop gives — and QCLASS=ANY is *not*
+      refused, because RFC 1035 §3.2.5 makes `*` match any class and IN is the
+      only class here.
+
+      The other half is the one worth recording: rather than threading a class
+      through `Zone::query`, `name_kind`, the denial machinery and the signer,
+      **`zone::parse` now refuses a non-IN record outright**. A CH record in an IN
+      zone had no correct behaviour available to it — it sat in the class-blind
+      index and answered IN questions — and a real CH zone needs its own apex and
+      its own place in the zone map, which is a feature rather than a field. That
+      makes the class-blind index correct by construction instead of three
+      lookups away from a check nobody wrote (`CLAUDE.md` §2).
+
+      **That opened a second way in, and closing only one would have been a
+      regression.** A zone also arrives by *transfer*, which took whatever class
+      the primary sent — and `zone_writer` spells CH and HS quite happily — so a
+      primary with one CH record would have had a secondary assemble the zone,
+      serve it, write it to disk, and then fail to read its own file back on the
+      next start, with the whole server refusing to come up (a zone file that will
+      not parse fails the load by design, #9c). Both assemblers refuse a non-IN
+      record now, as a **malformed** transfer, in the same `xfr::belongs_here`
+      that does the bailiwick check — malformed and not a timeout, because a
+      secondary retries a timeout and a primary serving a class we cannot hold
+      will still be serving it in ten minutes. Original finding:
+      (`rdnsd/src/main.rs:249`,
       `zone.rs:199`, `:238`). `ZoneRecord.class` is stored and parsed (IN/CH/HS)
       but never compared at lookup, so a CH-class query is answered from the IN
       zone — the question echoes `CLASS=CH` while the answer records carry
       `CLASS=IN`, a malformed pairing. Filter by class in `Zone::query`/`name_exists`
       and REFUSE a class the zone does not serve.
-- [ ] **QTYPE=ANY (255) is answered as NODATA** — no stored record has rtype 255,
+- [x] **QTYPE=ANY (255) is answered as NODATA** — **done**, taking RFC 1035
+      §3.2.3's reading: every RRset at the name, plus the RRSIGs when DO is set.
+      `Zone::of_type` treats ANY as matching every type, and
+      `dnssec_answer::answer_signatures` stops filtering on
+      `type_covered == qtype` for it — that filter matched *nothing* for QTYPE
+      255, since no RRSIG covers a QTYPE, so making ANY return every type without
+      touching it would have handed a validator the whole of a signed name's data
+      unsigned. Bogus, not merely unsigned.
+
+      **The trap inside the fix**, which is the part worth carrying forward:
+      RRSIG, NSEC and NSEC3 are types at the name too, so a literal "every type"
+      puts denial records and signatures in the answer section — where RFC 4035
+      §3.1.1 says they only belong when DO asked, where they duplicate what
+      `answer_signatures` attaches, and where an NSEC at an empty non-terminal
+      makes the ENT look like a name *with* data. They are excluded, and the
+      exclusion is what the ENT case depends on. Judged with `verify_rrset`
+      rather than by counting RRSIG records. Original finding: no stored record
+      has rtype 255,
       so an existing name gets empty NOERROR + SOA, which is none of the three
       shapes RFC 8482 §4.1 permits. Either return every RRset at the name (plus
       RRSIGs when DO is set) or take §4.2's synthesized-HINFO route deliberately.
       The constant is already defined and unused at `rdns/src/utils.rs:55`.
-- [ ] **Unknown QCLASS is aliased onto a meaningful class, and unknown RCODE is
-      rewritten to 0** (`rdns/src/lib.rs:810`, `:940`).
+- [x] **Unknown QCLASS is aliased onto a meaningful class, and unknown RCODE is
+      rewritten to 0** — **done**, exactly as the finding prescribes:
+      `QueryClass::Other(u16)` and `ResponseCode::Other(u16)`, with hand-written
+      `from_u16`/`to_u16` that are total and each other's inverse over the whole
+      16-bit range. Both enums lost their `num_derive` `FromPrimitive`, which is
+      the thing that handed out the `Option` that invited the `unwrap_or` in the
+      first place — and `ResponseCode` lost its explicit discriminants with it,
+      since a variant with a payload forbids them. A code above 0xfff is now a
+      `WireError` rather than a silent NOERROR. Original finding:
+      (`rdns/src/lib.rs:810`, `:940`).
       `QueryClass::from_u16(qclass).unwrap_or(QueryClass::None)` maps QCLASS 99 to
       NONE — which is 254, RFC 2136's *real* NONE class, not a sentinel — and it is
       re-serialized as 254 at `:973`, so the echoed question differs from the
@@ -1266,7 +1490,15 @@ into a measurement you can re-run, and it is what tells you when to stop.
       and the resolver does relay upstream messages. Fix both with a value-carrying
       catch-all (`Other(u16)`) so `to_u16` is infallible and round-tripping is
       total.
-- [ ] **QNAME minimisation has no iteration ceiling** (`rdns/src/resolver.rs:1030`,
+- [x] **QNAME minimisation has no iteration ceiling** — **done**, both halves.
+      `MAX_MINIMISE_COUNT = 10`, counted across the whole resolution rather than
+      per zone (the root probe and the TLD probe are two of the ten), after which
+      the full QNAME goes out and the name still resolves. The probe QTYPE moved
+      from NS to **A**, which is §2.3's own recommendation and the reason it
+      superseded RFC 7816's. Regression test drives a fourteen-label name through
+      a mock hierarchy and counts what each server was asked: 13 NS probes before,
+      10 A probes and then the full name after. Original finding:
+      (`rdns/src/resolver.rs:1030`,
       `:1119`). RFC 9156 §2.3 requires a MAX_MINIMISE_COUNT, recommended 10, after
       which the full QNAME is sent. The loop deepens one label at a time for as
       many labels as the name has, so a reverse-IPv6 PTR (34 labels) costs ~30
@@ -1274,12 +1506,30 @@ into a measurement you can re-run, and it is what tells you when to stop.
       rather than degrading. Also worth taking §2.3's advice on QTYPE: the probes
       use NS (`resolver.rs:37`, `:1048`), which is RFC 7816's superseded guidance;
       A/AAAA are "least likely to raise issues in DNS software and middleboxes".
-- [ ] **Glueless delegations are resolved with A queries only**
+- [x] **Glueless delegations are resolved with A queries only** — **done.**
+      `resolve_nameserver_addresses` asks A and then AAAA, and collects both
+      families. AAAA is second so the common dual-stacked case still costs one
+      query and the second lookup is charged to the budget only when the first
+      found nothing. Original finding:
       (`rdns/src/resolver.rs:1259`, `qtype: 1`), so a delegation whose nameservers
       are IPv6-only and carry no glue is unresolvable — even though `query_server`
       correctly binds a v6 socket and `extract_referral` accepts AAAA glue.
-- [ ] **`rdnsc` sends 512 bytes regardless of message length, and does not verify
-      the reply** (`rdnsc/src/main.rs:22-31`). `to_bytes` returns `n` and it is
+- [x] **`rdnsc` sends 512 bytes regardless of message length, and does not verify
+      the reply** — **done**, all of it, and the client is now `anyhow::Result`
+      with `.context()` like the other two binaries (`CLAUDE.md` §3) instead of a
+      column of `.expect()`. Sends `&buf[..n]`; parses `&buf[..n]`; checks QR, the
+      id and the echoed question before printing anything (RFC 5452 §9.1) and
+      keeps waiting rather than printing a reply that is not ours; five-second
+      read timeout, one retry, and a TC→TCP fallback with the RFC 1035 §4.2.2
+      length prefix. The server argument takes `host[:port]` — bare IPv6 literals
+      included, which is why it tries the whole spec as a socket address before
+      appending the default port rather than looking for a colon.
+
+      **Verified by using it**: `rdnsc 127.0.0.1:15353 A www.example.com.` now
+      answers, against an `rdnsd` started the way the "How to run" section above
+      says to start one. That is the thing this tool could not do, and the reason
+      every verification recipe here reaches for dnspython or Node. Original
+      finding: (`rdnsc/src/main.rs:22-31`). `to_bytes` returns `n` and it is
       discarded, so a 31-byte query goes out as 512 bytes with 481 trailing zeros —
       and this project's own `RequestValidator` caps UDP at exactly 512, so it is
       one option byte from rejecting its own client. `:29` mirrors the bug:
@@ -1291,17 +1541,34 @@ into a measurement you can re-run, and it is what tells you when to stop.
       fails with "invalid IPv4 address syntax", so our own client cannot query the
       non-53 port our own docs tell you to develop against. That is why every
       verification recipe above reaches for dnspython or Node.
-- [ ] **A NOTIMP reply drops the client's OPT record** (`rdnsd/src/main.rs:242`
+- [x] **A NOTIMP reply drops the client's OPT record** — **done.** The NOTIMP
+      branch mirrors the OPT before returning. Worth naming the shape rather than
+      the instance: this is not a second copy that drifted, it is an **early
+      `return` jumping over a shared epilogue**, so there is nothing to grep for —
+      the copy is the absence of one. Now a rule in `CLAUDE.md` §7. Original
+      finding: (`rdnsd/src/main.rs:242`
       returns before the EDNS mirroring at `:399`). RFC 6891 §6.1.1: if the query
       had an OPT, the response includes one. An EDNS client asking with an
       unsupported opcode gets a reply indistinguishable from a server that does not
       do EDNS, which some clients cache as a downgrade. `error_bytes` (`:921`)
       already does this correctly.
-- [ ] **Truncated rate-limit replies set AA and hardcode 512**
+- [x] **Truncated rate-limit replies set AA and hardcode 512** — **done**, both.
+      AA is clear on a reply carrying no data, and the size comes from
+      `request.udp_payload_size()`. The size half changes no bytes today — the
+      message is empty either way — which is exactly why it was worth fixing: it
+      is the wrong rule sitting in a place it happens not to bite, and that is
+      where the next reader copies it from. `error_bytes`, twenty lines up and
+      doing the same job, had both right; two functions building the same kind of
+      message and disagreeing is `CLAUDE.md` §7's second shape. Original finding:
       (`rdnsd/src/main.rs:948`, `:965`). `truncated_reply` ignores
       `msg.udp_payload_size()` (RFC 6891 §6.2.4) and sets `authoritive: true` on a
       reply carrying no authoritative data. `error_bytes` at `:918` gets AA right.
-- [ ] **Zone transfer responses never carry an OPT record**
+- [x] **Zone transfer responses never carry an OPT record** — **done**, on the
+      **first** message of a transfer and no other: a multi-message transfer is
+      one response, which is where BIND puts it, and repeating it would put a
+      second OPT into what RFC 6891 §6.1.1 treats as a single exchange. Before the
+      TSIG, since RFC 8945 §5.1 wants that last in the additional section and the
+      signer appends after `pack_transfer_messages`. Original finding:
       (`rdns/src/transfer.rs:108`, `additionals: Vec::new()`). No known client
       fails on it, but RFC 6891 §6.1.1 applies to transfers too.
 

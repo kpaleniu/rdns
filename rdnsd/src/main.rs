@@ -18,7 +18,7 @@ use rdns::{
         is_newer, state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile,
         TransferState,
     },
-    security::{RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
+    security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
     telemetry::{instrumentation, DnsMetrics, LatencyTimer},
     transfer::axfr_messages,
     tsig::{self, TsigAlgorithm, TsigCheck, TsigKey, TsigKeyring, TsigSession},
@@ -28,7 +28,7 @@ use rdns::{
     zone::{parse_zone_file_at, NameKind, Zone},
     zone_signer::{sign_zone, DenialChain, SigningPolicy},
     zone_writer::write_zone_file,
-    DnsMessage, Edns, OpCode, ResourceRecord, ResponseCode, EDNS_VERSION,
+    DnsMessage, Edns, OpCode, QueryClass, ResourceRecord, ResponseCode, EDNS_VERSION,
 };
 
 /// UDP payload size rdnsd advertises to clients via EDNS0.
@@ -192,6 +192,39 @@ struct Cli {
     /// a handshake, so there is nobody to reflect at.
     #[arg(long, value_name = "BYTES_PER_SEC", default_value = "8192")]
     response_rate: u32,
+    /// Queries per second, per client address. 0 turns the limit off.
+    ///
+    /// This was hardcoded, unreachable from the command line, and set at
+    /// **~10 q/s** — the library default of 100 tokens per 10-second window
+    /// with a burst of 20. Measured live: a 60-query burst from one address got
+    /// 20 answers and 40 **silent** drops. Not REFUSED, not SERVFAIL: nothing on
+    /// the wire at all, so a client sees a timeout and blames the network. Put
+    /// that in front of an ISP or public resolver, which sends far more than
+    /// 10 q/s from one address, and you blackhole the bulk of its traffic while
+    /// `dig` from a laptop works perfectly.
+    ///
+    /// The default is 1000 because `rdnsd` is authoritative: its clients are
+    /// resolvers, not end users, and one resolver behind one address legitimately
+    /// asks orders of magnitude more than one person does. The limiter is a
+    /// backstop against a flood, not a quota.
+    #[arg(long, value_name = "QUERIES_PER_SEC", default_value = "1000")]
+    query_rate: u32,
+    /// How many queries may arrive at once before `--query-rate` applies.
+    ///
+    /// A DNS client sends its queries in bursts by nature — one page load is
+    /// dozens of names at once — so a limiter with no burst allowance drops
+    /// traffic that is not a flood at all.
+    #[arg(long, value_name = "QUERIES", default_value = "200")]
+    query_burst: u32,
+    /// An address or CIDR prefix the query rate limit does not apply to,
+    /// repeatable.
+    ///
+    /// For the resolvers you run yourself, and for a monitoring probe whose
+    /// whole job is to query more often than a client would. Without it the
+    /// only way to exempt a known-good source is to raise the limit for
+    /// everybody.
+    #[arg(long, value_name = "ADDR|CIDR")]
+    query_rate_exempt: Vec<String>,
 }
 
 /// Zone source: either a single file or a directory of zone files
@@ -256,11 +289,46 @@ fn make_response(
     if msg.opcode != OpCode::Query {
         response.rcode = ResponseCode::NotImplemented;
         response.authoritive = false;
+        // Mirror the OPT record on the way out. This `return` jumps over the
+        // EDNS mirroring at the end of the function, so a NOTIMP used to be the
+        // one reply that dropped the client's OPT — and RFC 6891 §6.1.1 says a
+        // response to a request that had one includes one. An EDNS client
+        // asking with an unsupported opcode got an answer indistinguishable from
+        // a server that does not do EDNS at all, which some clients remember as
+        // a downgrade and then never offer EDNS to again. `error_bytes` already
+        // does this correctly; this path was written separately and drifted
+        // (`CLAUDE.md` §7).
+        if msg.has_edns() {
+            let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
+            edns.do_bit = dnssec_ok;
+            let _ = response.set_edns(edns);
+        }
         return response;
     }
 
     // Process each query
     for query in &msg.queries {
+        // The class is part of the question and was never looked at. Every zone
+        // this server holds is IN — `zone::parse` refuses any other class in a
+        // zone file — so a CH or HS question was answered from the IN zone, and
+        // the reply carried `CLASS=CH` in the echoed question beside `CLASS=IN`
+        // records in the answer. That pairing is malformed; RFC 1034 §4.3.2's
+        // step 1 searches the zones *of the question's class*, and finding none
+        // is the same situation as a zone we do not serve.
+        //
+        // REFUSED rather than NXDOMAIN, for the reason spelled out at the bottom
+        // of this loop: NXDOMAIN is an assertion about the DNS that a server
+        // holding nothing in that class has no standing to make, and resolvers
+        // cache it. QCLASS=ANY (255) is *not* refused — RFC 1035 §3.2.5 makes it
+        // match any class, and matching it against the IN zone is exactly right
+        // when IN is the only class there is here.
+        if !matches!(query.qclass, QueryClass::IN | QueryClass::Any) {
+            response.rcode = ResponseCode::Refused;
+            response.authoritive = false;
+            metrics.increment_cache_misses();
+            continue;
+        }
+
         // A transfer over UDP is not a transfer. AXFR is defined over TCP alone
         // (RFC 5936 §4.2) — a whole zone does not fit a datagram and the protocol
         // has no way to say "there is more" — so a UDP request for it is
@@ -696,16 +764,35 @@ struct Server {
     deltas: Arc<RwLock<DeltaLog>>,
 }
 
+/// The policy knobs `serve` applies, grouped because they all come from the
+/// command line and mean nothing to each other.
+///
+/// A struct rather than four more parameters: they are two `u32`s and two
+/// address-shaped things, so a positional call is one edit away from swapping
+/// the response budget for the query rate and nothing catching it.
+struct ServePolicy {
+    transfer_acl: TransferAcl,
+    tsig_keys: TsigKeyring,
+    /// Bytes per second per client, for UDP replies. 0 is off.
+    response_rate: u32,
+    /// Queries per second per client, with its burst and exemptions.
+    query_limit: RateLimitConfig,
+}
+
 /// Bind both transports and serve them from one process.
 async fn serve(
     addr: &str,
     zone_map: Arc<RwLock<HashMap<String, Zone>>>,
-    transfer_acl: TransferAcl,
-    tsig_keys: TsigKeyring,
-    response_rate: u32,
+    policy: ServePolicy,
     secondaries: Secondaries,
     deltas: Arc<RwLock<DeltaLog>>,
 ) -> Result<()> {
+    let ServePolicy {
+        transfer_acl,
+        tsig_keys,
+        response_rate,
+        query_limit,
+    } = policy;
     let transfers = if transfer_acl.is_empty() && tsig_keys.is_empty() {
         "refused (no --allow-transfer, no --tsig-key)".to_string()
     } else {
@@ -720,6 +807,26 @@ async fn serve(
     } else {
         format!("{response_rate} bytes/s per client")
     };
+    // Printed at startup on purpose. The old limit was hardcoded at ~10 q/s and
+    // dropped over it *silently* — no REFUSED, no SERVFAIL, nothing on the wire —
+    // so an operator debugging the resulting blackhole had no way to learn the
+    // limit existed, let alone what it was. Silence remains the right answer to a
+    // flood (a reply to a spoofed source is what an amplifier sends), which is
+    // exactly why the number has to be visible somewhere else.
+    let query_limit_note = if query_limit.tokens_per_window == 0 {
+        "off".to_string()
+    } else {
+        format!(
+            "{} q/s per client, burst {}{}",
+            query_limit.tokens_per_window,
+            query_limit.burst_size,
+            if query_limit.exempt.is_empty() {
+                String::new()
+            } else {
+                format!(", {} exempt rule(s)", query_limit.exempt.len())
+            }
+        )
+    };
 
     // Bind both before announcing anything, so a port conflict fails here rather
     // than after one transport is already up.
@@ -728,7 +835,7 @@ async fn serve(
 
     let server = Arc::new(Server {
         zone_map,
-        rate_limiter: Arc::new(RateLimiter::with_defaults()),
+        rate_limiter: Arc::new(RateLimiter::new(query_limit)),
         validator: Arc::new(RequestValidator::with_defaults()),
         logger: Arc::new(QueryLogger::new()),
         metrics: Arc::new(DnsMetrics::new()),
@@ -744,7 +851,7 @@ async fn serve(
     });
     println!(
         "rdnsd listening on {addr} (UDP+TCP), zone transfer: {transfers}, \
-         response budget: {budget}, TSIG keys: {}",
+         response budget: {budget}, query rate: {query_limit_note}, TSIG keys: {}",
         server.tsig_keys.len()
     );
 
@@ -1200,12 +1307,27 @@ fn frame(bytes: &[u8]) -> Vec<u8> {
 /// handshake proves the source address and the budget no longer applies. Going
 /// silent instead would leave a legitimate client with a timeout and no idea that
 /// TCP would work.
+///
+/// Two things this got wrong, both of which `error_bytes` twenty lines up gets
+/// right — which is the tell that they were written apart and drifted (see
+/// `CLAUDE.md` §7):
+///
+/// - **AA was set** on a reply carrying no authoritative data. It carries no
+///   data at all; the bit is a claim about an answer that is not here, and a
+///   client is entitled to read it as one.
+/// - **The size was hardcoded at 512**, ignoring `udp_payload_size()`. RFC 6891
+///   §6.2.4 says a response to an EDNS query is bounded by what the *requestor*
+///   advertised, and truncating below that is how a client that could have taken
+///   the answer is sent to TCP for nothing. It makes no difference to the bytes
+///   here, since the message is empty either way — it is the wrong rule applied
+///   in a place where it happens not to bite, which is where the next reader
+///   copies it from.
 fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
     let mut resp = DnsMessage {
         id: request.id,
         response: true,
         opcode: request.opcode,
-        authoritive: true,
+        authoritive: false,
         truncation: true,
         recursion: request.recursion,
         recursion_ok: false,
@@ -1220,7 +1342,8 @@ fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
     if request.has_edns() {
         let _ = resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
     }
-    resp.to_bytes_within(512).ok()
+    resp.to_bytes_within(request.udp_payload_size() as usize)
+        .ok()
 }
 
 /// Answer a NOTIFY (RFC 1996).
@@ -2266,6 +2389,9 @@ async fn main() -> Result<()> {
     let transfer_acl = TransferAcl::parse(&cli.allow_transfer)?;
     let tsig_keys = TsigKeyring::parse(&cli.tsig_key)?;
     let notify_targets = parse_notify_targets(&cli.also_notify)?;
+    let query_limit = RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(
+        TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
+    );
 
     let secondary_specs = parse_secondary_specs(&cli.secondary)?;
 
@@ -2347,9 +2473,12 @@ async fn main() -> Result<()> {
     serve(
         &addr,
         zone_map,
-        transfer_acl,
-        tsig_keys,
-        cli.response_rate,
+        ServePolicy {
+            transfer_acl,
+            tsig_keys,
+            response_rate: cli.response_rate,
+            query_limit,
+        },
         secondaries,
         deltas,
     )
@@ -4126,6 +4255,110 @@ ns.sub   IN A   192.0.2.20
             assert!(response.authoritive, "we are authoritative for saying no");
             assert_eq!(rdatas(&response.authorities, record_types::SOA).len(), 1);
         }
+
+        /// The class was stored, parsed and then never compared, so a CH
+        /// question was answered out of the IN zone — putting `CLASS=CH` in the
+        /// echoed question next to `CLASS=IN` records in the answer, a pairing
+        /// no resolver can make sense of. RFC 1034 §4.3.2 step 1 searches the
+        /// zones *of the question's class*, and there are none.
+        ///
+        /// REFUSED rather than NXDOMAIN for the reason the rest of this file
+        /// gives: NXDOMAIN is an assertion about the DNS that a server holding
+        /// nothing in that class has no standing to make, and resolvers cache it.
+        #[test]
+        fn a_class_this_server_does_not_serve_is_refused() {
+            for class in [QueryClass::CH, QueryClass::HS, QueryClass::Other(99)] {
+                let mut msg = query("example.com.", record_types::SOA, false);
+                msg.queries[0].qclass = class;
+                let response = make_response(&msg, &server(), &DnsMetrics::new());
+
+                assert_eq!(response.rcode, ResponseCode::Refused, "{class:?}");
+                assert!(!response.authoritive, "{class:?}");
+                assert!(
+                    response.answers.is_empty(),
+                    "{class:?}: an IN record must not answer a {class:?} question"
+                );
+                assert_eq!(
+                    response.queries[0].qclass, class,
+                    "{class:?}: the question is echoed as it was asked"
+                );
+            }
+        }
+
+        /// QTYPE=ANY is 255, which is a QTYPE and never an RTYPE, so the strict
+        /// `record_type_code(&r.rdata) == qtype` matched nothing and an existing
+        /// name came back as an empty NOERROR plus the SOA. That is a NODATA for
+        /// a name that plainly has data, and it is none of the shapes RFC 8482
+        /// §4 permits — not the conventional full answer, not §4.2's synthesized
+        /// HINFO, not a single-RRset subset. RFC 1035 §3.2.3 defines it as "all
+        /// records", which is the shape taken here.
+        #[test]
+        fn qtype_any_returns_every_rrset_at_the_name() {
+            let response = ask("example.com.", record_types::ANY);
+
+            assert_eq!(response.rcode, ResponseCode::Ok);
+            assert!(response.authoritive);
+            assert_eq!(
+                rdatas(&response.answers, record_types::SOA).len(),
+                1,
+                "the apex SOA"
+            );
+            assert_eq!(
+                rdatas(&response.answers, record_types::NS).len(),
+                1,
+                "and the apex NS beside it, in one answer"
+            );
+            assert!(
+                response.authorities.is_empty(),
+                "an answer is not a negative answer and owes no SOA in authority"
+            );
+        }
+
+        /// A name holding one type still answers with just that type, so the
+        /// change did not turn ANY into "everything in the zone".
+        #[test]
+        fn qtype_any_at_a_single_type_name_returns_only_that_type() {
+            let response = ask("host.example.com.", record_types::ANY);
+            assert_eq!(response.rcode, ResponseCode::Ok);
+            assert_eq!(response.answers.len(), 1);
+            assert_eq!(response.answers[0].rdata.rtype, record_types::A);
+        }
+
+        /// A CNAME is the only type at its owner (RFC 1034 §3.6.2), so ANY
+        /// answers with the alias itself rather than chasing it — the chase is
+        /// for a QTYPE the alias does not hold, and ANY holds everything.
+        #[test]
+        fn qtype_any_at_an_alias_answers_with_the_alias() {
+            let response = ask("www.example.com.", record_types::ANY);
+            assert_eq!(response.rcode, ResponseCode::Ok);
+            assert_eq!(response.answers.len(), 1);
+            assert_eq!(response.answers[0].rdata.rtype, record_types::CNAME);
+            assert_eq!(response.answers[0].name, "www.example.com.");
+        }
+
+        /// And a name that does not exist is still NXDOMAIN under ANY: matching
+        /// every type must not become matching every name.
+        #[test]
+        fn qtype_any_at_a_missing_name_is_still_a_negative_answer() {
+            let response = ask("x.a.b.example.com.", record_types::ANY);
+            assert_eq!(response.rcode, ResponseCode::NoSuchDomain);
+            assert!(response.answers.is_empty());
+            assert_eq!(rdatas(&response.authorities, record_types::SOA).len(), 1);
+        }
+
+        /// QCLASS=ANY is not an unserved class: RFC 1035 §3.2.5 makes `*` match
+        /// any class, and IN is the only class there is here. Refusing it would
+        /// be the fix overshooting the bug.
+        #[test]
+        fn qclass_any_is_answered_from_the_in_zone() {
+            let mut msg = query("example.com.", record_types::SOA, false);
+            msg.queries[0].qclass = QueryClass::Any;
+            let response = make_response(&msg, &server(), &DnsMetrics::new());
+
+            assert_eq!(response.rcode, ResponseCode::Ok);
+            assert!(response.authoritive);
+            assert_eq!(rdatas(&response.answers, record_types::SOA).len(), 1);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4305,6 +4538,105 @@ ns.plain  IN A   192.0.2.30
                 assert!(
                     matches!(verdict, WildcardVerdict::Proved),
                     "nsec3={nsec3}: {verdict:?}"
+                );
+            }
+        }
+
+        /// An ANY answer from a signed zone owes a signature over **every**
+        /// RRset it returns, and the filter that finds them was
+        /// `sig.type_covered != qtype` — which matches nothing for QTYPE 255,
+        /// because no RRSIG covers a QTYPE. Left alone, making ANY return every
+        /// type would have handed a validator the whole of a signed name's data
+        /// with no signatures on it at all: bogus, not merely unsigned, and a
+        /// SERVFAIL for the name.
+        ///
+        /// Judged with `verify_rrset` — the same code that judges a real zone
+        /// off the internet — rather than by counting RRSIG records, because a
+        /// signature that is present and does not verify passes a count
+        /// (`CLAUDE.md` §1).
+        #[test]
+        fn an_any_answer_from_a_signed_zone_is_signed_rrset_by_rrset() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_zones(SIGNED_ZONE, nsec3);
+                let response = make_response(
+                    &query("example.com.", record_types::ANY, true),
+                    &zones,
+                    &DnsMetrics::new(),
+                );
+
+                assert_eq!(response.rcode, ResponseCode::Ok, "nsec3={nsec3}");
+
+                // Every type the apex actually holds must be in the answer, and
+                // the DNSSEC meta types must not: RFC 4035 §3.1.1 keeps NSEC and
+                // the signatures out of the answer section, and an NSEC there
+                // would also make an empty non-terminal look like data.
+                for rtype in [record_types::SOA, record_types::NS, record_types::DNSKEY] {
+                    assert!(
+                        response.answers.iter().any(|r| r.rdata.rtype == rtype),
+                        "nsec3={nsec3}: type {rtype} missing from the ANY answer"
+                    );
+                }
+                assert!(
+                    !response
+                        .answers
+                        .iter()
+                        .any(|r| matches!(r.rdata.rtype, record_types::NSEC | record_types::NSEC3)),
+                    "nsec3={nsec3}: a denial record is not answer-section data"
+                );
+
+                // Then the part that matters: each RRset, against the zone's own
+                // keys.
+                let signatures = rrsigs_in(&response.answers);
+                let keys = keys_of(&zones);
+                for rtype in [record_types::SOA, record_types::NS, record_types::DNSKEY] {
+                    let rdatas: Vec<RecordData> = response
+                        .answers
+                        .iter()
+                        .filter(|r| r.rdata.rtype == rtype)
+                        .map(|r| r.rdata.clone())
+                        .collect();
+                    let proof = verify_rrset(
+                        &Rrset::new("example.com.", rtype, 1, &rdatas),
+                        &signatures,
+                        &keys,
+                        "example.com.",
+                        current_unix_timestamp(),
+                    );
+                    assert!(
+                        matches!(proof, RrsetProof::Verified { .. }),
+                        "nsec3={nsec3}: type {rtype} in an ANY answer: {proof:?}"
+                    );
+                }
+            }
+        }
+
+        /// And without DO, an ANY answer carries the data and nothing else — the
+        /// signatures are not volunteered to a client that did not ask for them
+        /// (RFC 4035 §3.1.1), which is the other half of the same rule.
+        #[test]
+        fn an_any_answer_without_do_carries_no_dnssec_records() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_zones(SIGNED_ZONE, nsec3);
+                let response = make_response(
+                    &query("example.com.", record_types::ANY, false),
+                    &zones,
+                    &DnsMetrics::new(),
+                );
+
+                assert_eq!(response.rcode, ResponseCode::Ok, "nsec3={nsec3}");
+                assert!(
+                    !response.answers.iter().any(|r| matches!(
+                        r.rdata.rtype,
+                        record_types::RRSIG | record_types::NSEC | record_types::NSEC3
+                    )),
+                    "nsec3={nsec3}: DNSSEC records went out to a client that did not set DO"
+                );
+                assert!(
+                    response
+                        .answers
+                        .iter()
+                        .any(|r| r.rdata.rtype == record_types::SOA),
+                    "nsec3={nsec3}: but the zone's own data is still there"
                 );
             }
         }

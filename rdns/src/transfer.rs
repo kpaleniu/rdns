@@ -17,7 +17,7 @@
 use crate::error::{TransferError, TransferResult};
 use crate::utils::record_types as rt;
 use crate::zone::Zone;
-use crate::{DnsMessage, ResourceRecord, ResponseCode};
+use crate::{DnsMessage, Edns, ResourceRecord, ResponseCode};
 
 /// How much of a message to fill before starting the next one.
 ///
@@ -96,6 +96,24 @@ pub(crate) fn pack_transfer_messages(
     }
     if !current.is_empty() {
         messages.push(transfer_message(request, current));
+    }
+
+    // RFC 6891 §6.1.1 — a response to a request that carried an OPT record
+    // carries one — applies to a transfer as much as to a lookup, and the
+    // transfer path was the one that never did it. On the *first* message only:
+    // a multi-message transfer is one response, BIND puts the OPT there and
+    // nowhere else, and repeating it would put a second OPT in what §6.1.1
+    // treats as a single exchange.
+    //
+    // Before the TSIG, if one follows: RFC 8945 §5.1 requires the TSIG to be the
+    // last record in the additional section, and the signer appends after this.
+    if let Some(first) = messages.first_mut() {
+        if request.has_edns() {
+            // `with_payload_size` carries no options, so this cannot fail. The
+            // size is the client's own, echoed: a transfer is framed by the TCP
+            // length prefix, so our UDP payload size says nothing useful here.
+            let _ = first.set_edns(Edns::with_payload_size(request.udp_payload_size()));
+        }
     }
     messages
 }

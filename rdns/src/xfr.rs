@@ -165,14 +165,7 @@ impl AxfrAssembler {
     }
 
     fn accept_record(&mut self, rr: &ResourceRecord) -> TransferResult<Progress> {
-        let name = absolute(&rr.name);
-        if !in_bailiwick(&name, &self.zone) {
-            return Err(TransferError::malformed(format!(
-                "master sent {name}, which is not in {}: a transfer may only carry \
-                 the zone it is a transfer of",
-                self.zone
-            )));
-        }
+        let name = belongs_here(rr, &self.zone)?;
 
         let is_apex_soa = rr.rdata.rtype == rt::SOA && name.eq_ignore_ascii_case(&self.zone);
 
@@ -367,14 +360,7 @@ impl IxfrAssembler {
     }
 
     fn accept_record(&mut self, rr: &ResourceRecord) -> TransferResult<Progress> {
-        let name = absolute(&rr.name);
-        if !in_bailiwick(&name, &self.zone) {
-            return Err(TransferError::malformed(format!(
-                "master sent {name}, which is not in {}: a transfer may only carry \
-                 the zone it is a transfer of",
-                self.zone
-            )));
-        }
+        let name = belongs_here(rr, &self.zone)?;
         self.records_seen += 1;
 
         let soa_serial = if rr.rdata.rtype == rt::SOA && name.eq_ignore_ascii_case(&self.zone) {
@@ -493,6 +479,42 @@ impl IxfrAssembler {
             self.current_serial.unwrap_or_default(),
         ))
     }
+}
+
+/// The two things a record has to be before a transfer keeps it: in this zone,
+/// and in a class this server can hold. Returns the absolute owner name.
+///
+/// Both assemblers had the bailiwick half, separately and identically; the class
+/// half is new and belongs beside it rather than at either assembler's exit,
+/// which is where writing it twice would have started (`CLAUDE.md` §7).
+///
+/// **Why the class matters here at all.** The request went out in class IN (see
+/// [`question`]), and `zone::parse` refuses a non-IN record in a zone *file* —
+/// but `zone_writer` spells CH and HS quite happily, so without this check a
+/// primary sending one CH record would have a secondary assemble the zone, serve
+/// it, write it to disk, and then fail to read its own file back on the next
+/// start, with the whole server refusing to come up (a zone file that will not
+/// parse fails the load by design, #9c). A boundary that holds on one of the two
+/// ways in is not a boundary.
+///
+/// Malformed rather than a timeout, deliberately: a secondary retries a timeout
+/// and gives up on a malformed transfer, and a primary serving a class we cannot
+/// hold will still be serving it in ten minutes.
+fn belongs_here(rr: &ResourceRecord, zone: &str) -> TransferResult<String> {
+    let name = absolute(&rr.name);
+    if !in_bailiwick(&name, zone) {
+        return Err(TransferError::malformed(format!(
+            "master sent {name}, which is not in {zone}: a transfer may only carry \
+             the zone it is a transfer of"
+        )));
+    }
+    if rr.class != 1 {
+        return Err(TransferError::malformed(format!(
+            "master sent {name} in class {}, and this server holds only IN zones",
+            rr.class
+        )));
+    }
+    Ok(name)
 }
 
 /// Whether `name` is the zone apex or below it.
@@ -804,6 +826,45 @@ mod tests {
             received.query("anything.example.com.", rt::A).len(),
             1,
             "the wildcard transferred too"
+        );
+    }
+
+    /// The transfer asked in class IN, so a record in another class is a
+    /// malformed answer rather than data to keep — and refusing it is what keeps
+    /// the *other* boundary honest. `zone::parse` refuses a non-IN record in a
+    /// zone file; `zone_writer` spells CH and HS quite happily. Without this
+    /// check a primary sending one record of class CH would have a secondary
+    /// assemble the zone, serve it, write it to disk, and then fail to read its
+    /// own file back on the next start — with the whole server refusing to come
+    /// up, since a zone file that will not parse fails the load by design (#9c).
+    ///
+    /// Asserted on the variant rather than the message (`CLAUDE.md` §3): the
+    /// category matters because a secondary retries a timeout and gives up on a
+    /// malformed transfer, and a primary serving a class we cannot hold will
+    /// still be serving it in ten minutes.
+    #[test]
+    fn a_transfer_carrying_a_class_we_do_not_serve_is_malformed() {
+        let source = source_zone();
+        let mut messages = transfer_of(&source);
+        messages[0].answers.insert(
+            1,
+            ResourceRecord {
+                name: "ch.example.com.".to_string(),
+                class: 3,
+                ttl: 300,
+                rdata: crate::RecordData::from_parsed(&ParsedRecord::TXT(vec![b"chaos".to_vec()]))
+                    .unwrap(),
+            },
+        );
+
+        let mut assembler = AxfrAssembler::new("example.com.");
+        let err = messages
+            .iter()
+            .find_map(|msg| assembler.accept(msg).err())
+            .expect("a class this server cannot hold must not be assembled");
+        assert!(
+            matches!(err, TransferError::Malformed(_)),
+            "want a malformed transfer, not a retryable one: {err:?}"
         );
     }
 

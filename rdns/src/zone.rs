@@ -399,11 +399,34 @@ impl Zone {
     }
 
     /// The records at these positions that are of `qtype`.
+    ///
+    /// `ANY` (255) is a QTYPE and never an RTYPE, so no stored record could
+    /// equal it and a strict comparison returned nothing. That is what made an
+    /// ANY query at an existing name come back as NODATA — an empty NOERROR
+    /// plus the SOA, which is none of the shapes RFC 8482 §4 permits for it. It
+    /// means "every type at this name" (RFC 1035 §3.2.3), and that is what it
+    /// gets.
+    ///
+    /// **Except the three DNSSEC meta types.** RRSIG, NSEC and NSEC3 are not
+    /// answer-section data: RFC 4035 §3.1.1 says a server includes them only
+    /// when the DO bit asked for them, and the signatures for an answer are
+    /// attached by `dnssec_answer::answer_signatures`, which knows which ones
+    /// the answer actually owes. Returning them from here would put signatures
+    /// in front of a client that cannot read them, duplicate them for one that
+    /// can — and, worse, make an empty non-terminal in an NSEC-signed zone look
+    /// like a name *with* data, because the chain puts an NSEC at it.
     fn of_type(&self, positions: &[usize], qtype: u16) -> Vec<&ZoneRecord> {
         positions
             .iter()
             .map(|&i| &self.records[i])
-            .filter(|r| record_type_code(&r.rdata) == qtype)
+            .filter(|r| {
+                let rtype = record_type_code(&r.rdata);
+                if qtype == rt::ANY {
+                    !matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3)
+                } else {
+                    rtype == qtype
+                }
+            })
             .collect()
     }
 
@@ -1077,7 +1100,23 @@ fn parse_into(
             name
         };
 
-        // Parse TTL and class
+        // Parse TTL and class.
+        //
+        // The class is read and then **required to be IN**, which is narrower
+        // than it looks. CH and HS used to be accepted here and stored on the
+        // record, and nothing downstream ever looked at the field again: neither
+        // `Zone::query` nor `name_exists` compares it, so a CH record sat in the
+        // IN zone's index and answered IN queries — and a CH *question* was
+        // answered from the IN zone, which puts `CLASS=CH` in the echoed question
+        // beside `CLASS=IN` answer records. That pairing is malformed, and no
+        // resolver can do anything sensible with it.
+        //
+        // Refusing at the boundary rather than filtering at every lookup is
+        // `CLAUDE.md` §2's rule: a zone loaded from a file is single-class by
+        // construction now, so the class-blind index is *correct* instead of
+        // being three lookups away from a class check nobody wrote. A CH zone
+        // needs its own zone, its own apex and its own place in the zone map —
+        // that is a feature, and this is the parser refusing to half-have it.
         let mut ttl = state.ttl;
         let mut class = 1u16; // IN
 
@@ -1090,12 +1129,17 @@ fn parse_into(
                 || parts[idx].eq_ignore_ascii_case("CH")
                 || parts[idx].eq_ignore_ascii_case("HS")
             {
-                class = match parts[idx].to_uppercase().as_str() {
-                    "IN" => 1,
-                    "CH" => 3,
-                    "HS" => 4,
-                    _ => 1,
-                };
+                if !parts[idx].eq_ignore_ascii_case("IN") {
+                    return Err(ZoneError::syntax(
+                        ln,
+                        format!(
+                            "class {} is not served: a zone here is IN, and a record of another \
+                             class in it would answer IN queries with a class it never matched",
+                            parts[idx].to_uppercase()
+                        ),
+                    ));
+                }
+                class = 1;
                 idx += 1;
             } else {
                 break;
@@ -1473,6 +1517,58 @@ mail IN A   192.0.2.3
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         assert_eq!(zone.origin, "example.com.");
         assert!(zone.records.len() >= 4);
+    }
+
+    /// A CH or HS record used to load into an IN zone and then be indistinguishable
+    /// from an IN one: the class was stored on the record and no lookup ever
+    /// compared it, so `Zone::query` handed it out for IN questions. Refusing it
+    /// at the parse boundary is what makes the class-blind index correct rather
+    /// than merely untested (`CLAUDE.md` §2).
+    ///
+    /// Asserted on the variant, not the message (`CLAUDE.md` §3).
+    #[test]
+    fn a_record_in_a_class_this_zone_does_not_serve_is_refused_at_load() {
+        for class in ["CH", "HS"] {
+            let zone_content = format!(
+                "$ORIGIN example.com.\n\
+                 $TTL 3600\n\
+                 @   IN  SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 300\n\
+                 @   IN  NS  ns1.example.com.\n\
+                 ver {class} TXT \"1.0\"\n"
+            );
+            let err = parse_zone_file(&zone_content, "example.com.")
+                .expect_err("a class this server cannot serve must not load silently");
+            assert!(
+                matches!(err, ZoneError::Syntax { line: 5, .. }),
+                "{class}: want a syntax error naming line 5, got {err:?}"
+            );
+        }
+    }
+
+    /// And IN still loads, with or without the token — the fix must not make the
+    /// class field mandatory, since `$TTL`-only lines are ordinary zone syntax.
+    #[test]
+    fn an_in_record_loads_whether_or_not_it_names_its_class() {
+        let zone_content = r#"$ORIGIN example.com.
+$TTL 3600
+@    IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 300
+@    IN NS  ns1.example.com.
+named IN A  192.0.2.1
+bare     A  192.0.2.2
+timed 60 IN A 192.0.2.3
+"#;
+        let zone = parse_zone_file(zone_content, "example.com.").expect("parses");
+        for name in [
+            "named.example.com.",
+            "bare.example.com.",
+            "timed.example.com.",
+        ] {
+            assert_eq!(
+                zone.query(name, record_types::A).len(),
+                1,
+                "{name} should have loaded"
+            );
+        }
     }
 
     #[test]

@@ -72,34 +72,62 @@ fn note_source(map: &mut HashMap<IpAddr, u64>, ip: IpAddr, untracked: &mut u64, 
     map.insert(ip, 1);
 }
 
+/// How long a QPS measurement runs before it is rolled over and published.
+///
+/// The rate is a tumbling counter, not a sliding one: `count` queries arrived in
+/// the `elapsed` seconds since `start`, and at the end of the window that pair
+/// becomes `qps` and both are reset. It used to be a `Vec<u64>` of one timestamp
+/// per query, rescanned with `retain` on *every* query to drop the ones older
+/// than ten seconds — so the vector was `10 × qps` long and the cost of logging
+/// one query was linear in it. Measured before the change: 469 ns at 1k depth,
+/// 2,364 at 10k, 9,886 at 50k, 19,419 at 100k, dead linear at ~0.19 ns/element,
+/// which put a hard ceiling of ~23k qps on the whole server and did not improve
+/// with core count because the stats mutex was held across all of it. A count
+/// and a start answer the same question — "how many queries per second" — in two
+/// words of state.
+const QPS_WINDOW_SECS: u64 = 5;
+
 /// Query logger with anomaly detection
 pub struct QueryLogger {
-    stats: Arc<Mutex<QueryStats>>,
-    last_qps_update: Arc<Mutex<u64>>,
-    query_window: Arc<Mutex<QueryWindow>>,
+    /// Stats and the QPS window under **one** lock, deliberately.
+    ///
+    /// There used to be three (`stats`, `query_window`, `last_qps_update`), and
+    /// `log_query` took four guards per call — including taking `query_window`
+    /// twice in six lines, the first time only to read a constant. Every one of
+    /// them was held on the same path with no ordering discipline, which is a
+    /// deadlock waiting for a second writer. One lock, one acquisition, O(1)
+    /// work under it.
+    inner: Arc<Mutex<Inner>>,
 }
 
-struct QueryWindow {
-    queries: Vec<u64>, // timestamps
-    max_age_secs: u64,
+struct Inner {
+    stats: QueryStats,
+    window: QpsWindow,
+}
+
+/// Queries counted since the current window opened.
+struct QpsWindow {
+    start: u64,
+    count: u64,
 }
 
 impl QueryLogger {
     pub fn new() -> Self {
         QueryLogger {
-            stats: Arc::new(Mutex::new(QueryStats {
-                total_queries: 0,
-                total_errors: 0,
-                qps: 0.0,
-                queries_by_ip: HashMap::new(),
-                queries_by_type: HashMap::new(),
-                rate_limited_ips: HashMap::new(),
-                untracked_sources: 0,
-            })),
-            last_qps_update: Arc::new(Mutex::new(current_unix_timestamp())),
-            query_window: Arc::new(Mutex::new(QueryWindow {
-                queries: Vec::new(),
-                max_age_secs: 10,
+            inner: Arc::new(Mutex::new(Inner {
+                stats: QueryStats {
+                    total_queries: 0,
+                    total_errors: 0,
+                    qps: 0.0,
+                    queries_by_ip: HashMap::new(),
+                    queries_by_type: HashMap::new(),
+                    rate_limited_ips: HashMap::new(),
+                    untracked_sources: 0,
+                },
+                window: QpsWindow {
+                    start: current_unix_timestamp(),
+                    count: 0,
+                },
             })),
         }
     }
@@ -108,7 +136,10 @@ impl QueryLogger {
     pub fn log_query(&self, ip: IpAddr, query_type: Option<u16>) {
         let now = current_unix_timestamp();
 
-        let mut stats = self.stats.lock().unwrap();
+        let Some(mut inner) = self.locked() else {
+            return;
+        };
+        let Inner { stats, window } = &mut *inner;
         stats.total_queries += 1;
 
         // Track per-IP queries, bounded — see `note_source`.
@@ -116,7 +147,7 @@ impl QueryLogger {
             queries_by_ip,
             untracked_sources,
             ..
-        } = &mut *stats;
+        } = stats;
         note_source(queries_by_ip, ip, untracked_sources, MAX_TRACKED_SOURCES);
 
         // Track per-type queries
@@ -124,57 +155,73 @@ impl QueryLogger {
             *stats.queries_by_type.entry(qtype).or_insert(0) += 1;
         }
 
-        // Update query window for QPS calculation
-        let max_age_secs = {
-            let window = self.query_window.lock().unwrap();
-            window.max_age_secs
-        };
-
-        let mut window = self.query_window.lock().unwrap();
-        window.queries.push(now);
-
-        // Remove old entries (older than max_age). Saturating, like every other
-        // subtraction of two wall-clock stamps in this workspace: the clock can
-        // step backwards, and an underflow here is a debug panic *while holding
-        // the stats mutex*, which poisons it and takes every later query down
-        // with it. Same defect as the one `security::RateLimiter` had.
-        let age_limit = now.saturating_sub(max_age_secs);
-        window.queries.retain(|&t| t > age_limit);
-
-        // Update QPS periodically
-        let mut last_update = self.last_qps_update.lock().unwrap();
-        if now.saturating_sub(*last_update) >= 5 {
-            *last_update = now;
-            stats.qps = (window.queries.len() as f64) / max_age_secs as f64;
+        // Roll the QPS window if it has run its course. Saturating, like every
+        // other subtraction of two wall-clock stamps in this workspace
+        // (`CLAUDE.md` §6): the clock can step backwards, and an underflow here
+        // is a debug panic *while holding this mutex*, which poisons it and
+        // takes every later query down with it. Same defect `RateLimiter` had.
+        window.count += 1;
+        let elapsed = now.saturating_sub(window.start);
+        if elapsed >= QPS_WINDOW_SECS {
+            stats.qps = (window.count as f64) / (elapsed as f64);
+            window.start = now;
+            window.count = 0;
+        } else if now < window.start {
+            // The clock stepped backwards past the window's start. The elapsed
+            // time is unknowable, so publishing a rate from it would be a
+            // fabricated number; reopen the window instead and lose one sample.
+            window.start = now;
+            window.count = 0;
         }
     }
 
     /// Log a query error
     pub fn log_error(&self, _ip: IpAddr, reason: &str) {
-        let mut stats = self.stats.lock().unwrap();
-        stats.total_errors += 1;
+        if let Some(mut inner) = self.locked() {
+            inner.stats.total_errors += 1;
+        }
 
-        // Log detailed error message
+        // Outside the guard on purpose. `eprintln!` is an unbuffered `write(2)`
+        // serialized on Rust's stderr lock, and doing it while holding this
+        // mutex made a malformed-packet flood into a lock convoy across every
+        // query path as well as a disk fill. Holding one global lock across a
+        // syscall is the shape to avoid; the count is what the lock is for.
         eprintln!("[QueryLogger] Error: {}", reason);
     }
 
     /// Log rate limit event
     pub fn log_rate_limited(&self, ip: IpAddr) {
-        let mut stats = self.stats.lock().unwrap();
+        let Some(mut inner) = self.locked() else {
+            return;
+        };
         let QueryStats {
             rate_limited_ips,
             untracked_sources,
             ..
-        } = &mut *stats;
+        } = &mut inner.stats;
         // The map that most needs a bound: an entry here is created for a source
         // that was *refused*, which is exactly the traffic an attacker sends in
         // volume from addresses they do not own.
         note_source(rate_limited_ips, ip, untracked_sources, MAX_TRACKED_SOURCES);
     }
 
+    /// The one place this lock is taken, and the one place the failure decision
+    /// is made: a poisoned lock means some other thread panicked mid-update, and
+    /// the right answer for *monitoring* is to stop counting, not to stop
+    /// answering DNS. `.lock().unwrap()` here would turn one panic anywhere into
+    /// a permanently dead server, since every query path calls `log_query`.
+    /// Contrast `security::RateLimiter`, where the same decision is made for a
+    /// different reason — see `CLAUDE.md` §6.
+    fn locked(&self) -> Option<std::sync::MutexGuard<'_, Inner>> {
+        self.inner.lock().ok()
+    }
+
     /// Check for anomalies and print warnings
     pub fn check_anomalies(&self) {
-        let stats = self.stats.lock().unwrap();
+        let Some(inner) = self.locked() else {
+            return;
+        };
+        let stats = &inner.stats;
 
         // Check for high QPS
         if stats.qps > 50.0 {
@@ -224,13 +271,31 @@ impl QueryLogger {
     }
 
     /// Get current statistics
+    ///
+    /// Returns the zero value if the lock is poisoned, for the reason in
+    /// [`Self::locked`]: a caller reading counters must not be able to take the
+    /// process down.
     pub fn get_stats(&self) -> QueryStats {
-        self.stats.lock().unwrap().clone()
+        match self.locked() {
+            Some(inner) => inner.stats.clone(),
+            None => QueryStats {
+                total_queries: 0,
+                total_errors: 0,
+                qps: 0.0,
+                queries_by_ip: HashMap::new(),
+                queries_by_type: HashMap::new(),
+                rate_limited_ips: HashMap::new(),
+                untracked_sources: 0,
+            },
+        }
     }
 
     /// Reset statistics
     pub fn reset_stats(&self) {
-        let mut stats = self.stats.lock().unwrap();
+        let Some(mut inner) = self.locked() else {
+            return;
+        };
+        let stats = &mut inner.stats;
         stats.total_queries = 0;
         stats.total_errors = 0;
         stats.qps = 0.0;
@@ -238,6 +303,10 @@ impl QueryLogger {
         stats.queries_by_type.clear();
         stats.rate_limited_ips.clear();
         stats.untracked_sources = 0;
+        inner.window = QpsWindow {
+            start: current_unix_timestamp(),
+            count: 0,
+        };
     }
 }
 
@@ -392,6 +461,74 @@ mod tests {
         // price of keeping the table bounded and is why these are anomaly
         // signals rather than accounting.
         assert!(map.values().all(|&count| count >= 1));
+    }
+
+    /// The regression test for the quadratic. `log_query` used to push one
+    /// timestamp per query into a `Vec` and `retain` the whole thing on **every**
+    /// call, so the cost of logging a query grew with the traffic already logged
+    /// — 469 ns at 1k deep, 19,419 ns at 100k. That is a server-wide ~23k qps
+    /// ceiling that no profile of the answer path would ever point at.
+    ///
+    /// Asserted as a *ratio* rather than a floor, deliberately: a wall-clock
+    /// floor is what `bench_logger_throughput` had, and lowering it is how this
+    /// very regression got ratified (`CLAUDE.md` §10). A ratio does not care how
+    /// fast the machine is or what else is running on it — only whether the
+    /// second batch costs more than the first because of what came before.
+    /// Measured against the old code: ~20×. Against this one: ~1×.
+    #[test]
+    fn logging_a_query_costs_the_same_however_many_came_before() {
+        use std::time::Instant;
+
+        let logger = QueryLogger::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let batch = 5_000;
+        let depth = 50_000;
+
+        let start = Instant::now();
+        for _ in 0..batch {
+            logger.log_query(ip, Some(1));
+        }
+        let shallow = start.elapsed();
+
+        for _ in 0..depth {
+            logger.log_query(ip, Some(1));
+        }
+
+        let start = Instant::now();
+        for _ in 0..batch {
+            logger.log_query(ip, Some(1));
+        }
+        let deep = start.elapsed();
+
+        let ratio = deep.as_secs_f64() / shallow.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 5.0,
+            "logging got {ratio:.1}x slower after {depth} queries \
+             ({shallow:?} -> {deep:?}); the per-query cost is growing with the \
+             window again"
+        );
+    }
+
+    /// The window is a count and a start, so a clock that steps backwards past
+    /// the window's opening must not publish a rate computed from a negative
+    /// interval — `saturating_sub` would report the whole count as one second's
+    /// worth. There is no way to inject a clock here, so this pins the arithmetic
+    /// the guard exists for.
+    #[test]
+    fn a_rolled_window_divides_by_the_interval_it_actually_measured() {
+        let window = QpsWindow {
+            start: 1_000,
+            count: 250,
+        };
+        let now = 1_010u64;
+        let elapsed = now.saturating_sub(window.start);
+        assert_eq!(elapsed, 10);
+        assert_eq!((window.count as f64) / (elapsed as f64), 25.0);
+
+        // Backwards: elapsed saturates to zero, which is why `log_query` tests
+        // `now < window.start` separately instead of dividing by it.
+        let backwards = 900u64.saturating_sub(window.start);
+        assert_eq!(backwards, 0);
     }
 
     #[test]

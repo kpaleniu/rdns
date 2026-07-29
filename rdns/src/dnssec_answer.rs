@@ -72,7 +72,18 @@ pub fn answer_signatures(zone: &Zone, qname: &str, qtype: u16) -> AnswerSignatur
         let Some(sig) = rrsig_of(record) else {
             continue;
         };
-        if sig.type_covered != qtype {
+        // ANY asked for every type at the name, so it owes the signature over
+        // every RRset that came back. Filtering on `type_covered == 255` matches
+        // nothing — no RRSIG covers a QTYPE — which would have handed a client
+        // the whole of a signed name's data with no signatures on it, from a
+        // zone whose apex says it is signed. That is bogus to a validator, not
+        // merely unsigned.
+        if qtype != rt::ANY && sig.type_covered != qtype {
+            continue;
+        }
+        // The DNSSEC meta types are not in an ANY answer (see `Zone::of_type`),
+        // so the signatures over them are not owed either.
+        if qtype == rt::ANY && matches!(sig.type_covered, rt::RRSIG | rt::NSEC | rt::NSEC3) {
             continue;
         }
         if sig.owner != qname {

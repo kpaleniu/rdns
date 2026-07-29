@@ -80,13 +80,50 @@ pub enum OpCode {
 // practically always IN (1), classes are supposed to be sort of
 // dimension to the DNS database (see RFC6895 section 3.2). Only CH (3)
 // and HS (4) are mentioned but practially never used outside of local tests
-#[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, Clone)]
+///
+/// `Other` carries the value, which is the whole point of it. The parse used to
+/// be `QueryClass::from_u16(qclass).unwrap_or(QueryClass::None)`, and `None` is
+/// not a sentinel — it is 254, RFC 2136's real "no such class" used in UPDATE
+/// prerequisites. So QCLASS 99 arrived as `None`, was re-serialized as **254**,
+/// and the question echoed back in the response was not the question that was
+/// asked. A client matching the response to its query on the question section,
+/// as RFC 5452 §9.1 says to, sees a mismatch and discards a reply it waited for.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum QueryClass {
-    IN = 1,
-    CH = 3,
-    HS = 4,
-    None = 254,
-    Any = 255,
+    IN,
+    CH,
+    HS,
+    None,
+    Any,
+    /// A class this implementation has no name for, kept as it arrived.
+    Other(u16),
+}
+
+impl QueryClass {
+    /// Total, by construction: every 16-bit value is some class.
+    pub fn from_u16(value: u16) -> Self {
+        match value {
+            1 => QueryClass::IN,
+            3 => QueryClass::CH,
+            4 => QueryClass::HS,
+            254 => QueryClass::None,
+            255 => QueryClass::Any,
+            other => QueryClass::Other(other),
+        }
+    }
+
+    /// Infallible, so round-tripping a question is total: what came off the wire
+    /// goes back onto it unchanged.
+    pub fn to_u16(self) -> u16 {
+        match self {
+            QueryClass::IN => 1,
+            QueryClass::CH => 3,
+            QueryClass::HS => 4,
+            QueryClass::None => 254,
+            QueryClass::Any => 255,
+            QueryClass::Other(value) => value,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -618,37 +655,109 @@ pub struct ResourceRecord {
     pub rdata: RecordData,
 }
 
-#[derive(Debug, FromPrimitive, ToPrimitive, Clone, Copy, PartialEq, Eq)]
+/// A DNS response code: the 12-bit value of RFC 6891 §6.1.3, not the 4-bit
+/// header field.
+///
+/// `Other` replaces what was an `Unknown = 65535` sentinel. The sentinel could
+/// not carry the code it stood for, so [`DnsMessage::to_bytes`] mapped it to
+/// **0** — and the resolver *does* relay upstream messages, so a response
+/// carrying an rcode we have no name for was handed to the client as NOERROR.
+/// An unrecognized failure became a successful empty answer, which is the one
+/// direction this must never fail in. RFC 6895 §2.3 keeps the space open for
+/// exactly this: codes get assigned after the code that relays them is written.
+///
+/// No explicit discriminants, because a variant with a payload forbids them.
+/// The numbering lives in [`ResponseCode::from_u16`] and
+/// [`ResponseCode::to_u16`] instead, which are each other's inverse over the
+/// whole 16-bit range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseCode {
     // RFC 1035 - Basic codes
-    Ok = 0,
-    FormatError = 1,
-    ServerFailure = 2,
-    NoSuchDomain = 3,
-    NotImplemented = 4,
-    Refused = 5,
+    Ok,
+    FormatError,
+    ServerFailure,
+    NoSuchDomain,
+    NotImplemented,
+    Refused,
     // RFC 2136 - Domain update related codes
-    DomainExistsForSomeReason = 6,
-    ResourceRecordSetExistsForSomeReason = 7,
-    NoSuchResourceRecordSet = 8,
-    NotAuthorized = 9, // Or ServerNotAuthorativeForZone (RFC8945)
-    NameNotInZone = 10,
+    DomainExistsForSomeReason,
+    ResourceRecordSetExistsForSomeReason,
+    NoSuchResourceRecordSet,
+    NotAuthorized, // Or ServerNotAuthorativeForZone (RFC8945)
+    NameNotInZone,
 
     // RFC 8490 - DNS Stateful Operations
-    DsoTypeNotImplemented = 11,
+    DsoTypeNotImplemented,
 
-    BadOptVersion = 16, // Or BadTsigSignature (RFC8945)
-    BadKey = 17,
-    BadTime = 18,
+    BadOptVersion, // Or BadTsigSignature (RFC8945)
+    BadKey,
+    BadTime,
 
     // RFC 2930 - TKEY RR
-    BadTkeyMode = 19,
-    BadName = 20,
-    BadAlgorithm = 21,
-    BadTruncation = 22,
-    BadCookie = 23,
+    BadTkeyMode,
+    BadName,
+    BadAlgorithm,
+    BadTruncation,
+    BadCookie,
 
-    Unknown = 65535,
+    /// A code with no name here, carried through as it arrived.
+    Other(u16),
+}
+
+impl ResponseCode {
+    /// Total: every 16-bit value is some response code.
+    pub fn from_u16(value: u16) -> Self {
+        match value {
+            0 => ResponseCode::Ok,
+            1 => ResponseCode::FormatError,
+            2 => ResponseCode::ServerFailure,
+            3 => ResponseCode::NoSuchDomain,
+            4 => ResponseCode::NotImplemented,
+            5 => ResponseCode::Refused,
+            6 => ResponseCode::DomainExistsForSomeReason,
+            7 => ResponseCode::ResourceRecordSetExistsForSomeReason,
+            8 => ResponseCode::NoSuchResourceRecordSet,
+            9 => ResponseCode::NotAuthorized,
+            10 => ResponseCode::NameNotInZone,
+            11 => ResponseCode::DsoTypeNotImplemented,
+            16 => ResponseCode::BadOptVersion,
+            17 => ResponseCode::BadKey,
+            18 => ResponseCode::BadTime,
+            19 => ResponseCode::BadTkeyMode,
+            20 => ResponseCode::BadName,
+            21 => ResponseCode::BadAlgorithm,
+            22 => ResponseCode::BadTruncation,
+            23 => ResponseCode::BadCookie,
+            other => ResponseCode::Other(other),
+        }
+    }
+
+    /// Infallible, so relaying a response cannot silently change its meaning.
+    pub fn to_u16(self) -> u16 {
+        match self {
+            ResponseCode::Ok => 0,
+            ResponseCode::FormatError => 1,
+            ResponseCode::ServerFailure => 2,
+            ResponseCode::NoSuchDomain => 3,
+            ResponseCode::NotImplemented => 4,
+            ResponseCode::Refused => 5,
+            ResponseCode::DomainExistsForSomeReason => 6,
+            ResponseCode::ResourceRecordSetExistsForSomeReason => 7,
+            ResponseCode::NoSuchResourceRecordSet => 8,
+            ResponseCode::NotAuthorized => 9,
+            ResponseCode::NameNotInZone => 10,
+            ResponseCode::DsoTypeNotImplemented => 11,
+            ResponseCode::BadOptVersion => 16,
+            ResponseCode::BadKey => 17,
+            ResponseCode::BadTime => 18,
+            ResponseCode::BadTkeyMode => 19,
+            ResponseCode::BadName => 20,
+            ResponseCode::BadAlgorithm => 21,
+            ResponseCode::BadTruncation => 22,
+            ResponseCode::BadCookie => 23,
+            ResponseCode::Other(value) => value,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -839,7 +948,9 @@ impl<'a> TryUnpackFromBytes<'a> for QuerySection {
             Self {
                 qname,
                 qtype,
-                qclass: QueryClass::from_u16(qclass).unwrap_or(QueryClass::None),
+                // Total, and it has to be: a class we have no name for is
+                // echoed back unchanged, not folded onto one we do.
+                qclass: QueryClass::from_u16(qclass),
             },
             rest,
         ))
@@ -956,8 +1067,7 @@ impl DnsMessage {
             .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
             .map(|rr| ((rr.ttl as u32) >> 24) as u16)
             .unwrap_or(0);
-        let rcode = ResponseCode::from_u16((ext_rcode << 4) | (lo & 0x0f) as u16)
-            .unwrap_or(ResponseCode::Unknown);
+        let rcode = ResponseCode::from_u16((ext_rcode << 4) | (lo & 0x0f) as u16);
 
         Ok(Self {
             id,
@@ -989,12 +1099,19 @@ impl DnsMessage {
         let opcode = self.opcode.to_u8().unwrap_or_default();
 
         // RCODE is a 12-bit value split across the header (low 4 bits) and the
-        // OPT record's TTL (high 8). `ResponseCode::Unknown` is a sentinel for
-        // an unrecognized wire value rather than a real code, so it goes out as 0.
-        let rcode = match self.rcode.to_u16() {
-            Some(v) if v <= 0xfff => v,
-            _ => 0,
-        };
+        // OPT record's TTL (high 8). This used to read
+        // `match self.rcode.to_u16() { Some(v) if v <= 0xfff => v, _ => 0 }`,
+        // which turned the old `Unknown` sentinel — and any code above 0xfff —
+        // into **NOERROR**. `to_u16` is infallible now, so the only thing left
+        // to check is the 12-bit ceiling, and a value past it is a bug in the
+        // caller rather than something to paper over with a success code.
+        let rcode = self.rcode.to_u16();
+        if rcode > 0xfff {
+            return Err(WireError::malformed(
+                "the header",
+                format!("RCODE {rcode} does not fit the 12 bits RFC 6891 §6.1.3 gives it"),
+            ));
+        }
         let has_opt = self
             .additionals
             .iter()
@@ -1027,7 +1144,7 @@ impl DnsMessage {
         for q in &self.queries {
             pos = compressor.write_name(q.qname.as_str(), output, pos)?;
             pos = write_bytes(output, pos, &q.qtype.to_be_bytes())?;
-            pos = write_bytes(output, pos, &q.qclass.to_u16().unwrap_or(254).to_be_bytes())?;
+            pos = write_bytes(output, pos, &q.qclass.to_u16().to_be_bytes())?;
         }
 
         // Resource records. Owner names are compressed against everything
@@ -1116,11 +1233,49 @@ impl DnsMessage {
     /// record and question are kept) and TC=1 is set so the client retries over
     /// TCP. Returns the wire bytes.
     pub fn to_bytes_within(&self, max_len: usize) -> Result<Vec<u8>, WireError> {
-        let mut scratch = vec![0u8; u16::MAX as usize];
-        let n = self.to_bytes(&mut scratch)?;
-        if n <= max_len {
-            scratch.truncate(n);
-            return Ok(scratch);
+        let mut out = Vec::new();
+        self.to_bytes_within_buf(max_len, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Self::to_bytes_within`] into a caller-owned buffer, which is left
+    /// holding exactly the wire bytes.
+    ///
+    /// This exists so a hot send path can keep one scratch buffer and allocate
+    /// nothing per response. `to_bytes_within` used to serialize into
+    /// `vec![0u8; u16::MAX as usize]` — 64 KB, zeroed, per response — and
+    /// `Vec::truncate` **does not release capacity**, so the `Vec` handed to
+    /// `send_to` and held until the send completed was 64 KB whatever the answer
+    /// was. Confirmed: a 60-byte response retained capacity 65535, and a DHAT
+    /// probe of the same shape reported 65,560,600 bytes live in 1,002 blocks
+    /// for a thousand of them. Measured cost on a 3-record response: 1043 ns vs
+    /// 718 ns with a reused buffer — a third of serialization was allocator
+    /// traffic, and not optimizer-erasable because the allocation escapes into
+    /// the socket call.
+    ///
+    /// The buffer is sized to what the caller will actually send rather than to
+    /// the protocol maximum. Only the TCP and transfer paths pass `u16::MAX`;
+    /// a UDP caller passes its EDNS payload size, and now pays for that.
+    pub fn to_bytes_within_buf(&self, max_len: usize, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.clear();
+        out.resize(max_len, 0);
+        match self.to_bytes(out) {
+            Ok(n) if n <= max_len => {
+                out.truncate(n);
+                return Ok(());
+            }
+            // Fits the buffer but not the limit — only reachable when a caller
+            // passes a `max_len` above what it means to send, which none do.
+            Ok(_) => {}
+            // The message did not fit, which is the ordinary reason to truncate.
+            // Sizing the scratch to `max_len` is what turns "too long" from a
+            // comparison into an error, so it has to be caught rather than
+            // propagated; every other `WireError` is a real failure to encode.
+            Err(WireError::Truncated {
+                what: "the output buffer",
+                ..
+            }) => {}
+            Err(e) => return Err(e),
         }
 
         let mut truncated = self.clone();
@@ -1133,10 +1288,14 @@ impl DnsMessage {
             .additionals
             .retain(|rr| rr.rdata.rtype == OPT_RECORD_TYPE);
 
-        let mut out = vec![0u8; max_len.max(CLASSIC_UDP_SIZE as usize)];
-        let n = truncated.to_bytes(&mut out)?;
+        // The floor is the classic 512: a header, a question and an OPT record
+        // fit there, and a caller that asked for less than a minimal response
+        // can hold still gets a well-formed TC=1 answer to retry on.
+        out.clear();
+        out.resize(max_len.max(CLASSIC_UDP_SIZE as usize), 0);
+        let n = truncated.to_bytes(out)?;
         out.truncate(n);
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -1652,6 +1811,95 @@ mod tests {
         }
     }
 
+    /// An unknown QCLASS used to be aliased onto `QueryClass::None`, which is
+    /// **254** — RFC 2136's real NONE class, not a sentinel — and re-serialized
+    /// as 254. The question echoed in the response was therefore not the
+    /// question asked, and a client matching them as RFC 5452 §9.1 requires
+    /// discards a reply it was waiting for.
+    #[test]
+    fn an_unknown_qclass_is_echoed_back_as_the_class_that_was_asked() {
+        for qclass in [99u16, 2, 0, 253, 256, 0xffff] {
+            let mut msg = query_msg(1);
+            msg.queries[0].qclass = QueryClass::from_u16(qclass);
+
+            let bytes = msg.to_bytes_within(512).expect("serialize");
+            let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
+            assert_eq!(
+                parsed.queries[0].qclass.to_u16(),
+                qclass,
+                "QCLASS {qclass} came back as {}",
+                parsed.queries[0].qclass.to_u16()
+            );
+        }
+    }
+
+    /// And the classes we do name still travel as themselves, so widening the
+    /// type did not turn IN into `Other(1)` on the way through.
+    #[test]
+    fn the_named_qclasses_round_trip_as_themselves() {
+        for (class, value) in [
+            (QueryClass::IN, 1u16),
+            (QueryClass::CH, 3),
+            (QueryClass::HS, 4),
+            (QueryClass::None, 254),
+            (QueryClass::Any, 255),
+        ] {
+            assert_eq!(class.to_u16(), value);
+            assert_eq!(QueryClass::from_u16(value), class);
+        }
+    }
+
+    /// An rcode with no name here used to serialize as **0**. `rdnsr` relays
+    /// upstream messages, so an unrecognized *failure* reached the client as a
+    /// successful empty answer — the one direction a response code must never
+    /// fail in. RFC 6895 §2.3 keeps the space open on purpose; a relay that does
+    /// not know a code still has to pass it on.
+    #[test]
+    fn an_unknown_rcode_is_relayed_rather_than_rewritten_to_noerror() {
+        // 12 is unassigned; 4095 is the top of the extended range. Both need an
+        // OPT record to carry the high bits (RFC 6891 §6.1.3).
+        for value in [12u16, 24, 100, 0xfff] {
+            let mut msg = query_msg(1);
+            msg.response = true;
+            msg.rcode = ResponseCode::from_u16(value);
+            msg.set_edns(Edns::with_payload_size(4096))
+                .expect("set_edns");
+
+            let bytes = msg.to_bytes_within(512).expect("serialize");
+            let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
+            assert_eq!(
+                parsed.rcode.to_u16(),
+                value,
+                "rcode {value} came back as {}",
+                parsed.rcode.to_u16()
+            );
+            assert_ne!(parsed.rcode, ResponseCode::Ok);
+        }
+    }
+
+    /// The low four bits still work without EDNS, which is the case every
+    /// non-EDNS client sees.
+    #[test]
+    fn the_named_rcodes_round_trip_as_themselves() {
+        for code in [
+            ResponseCode::Ok,
+            ResponseCode::FormatError,
+            ResponseCode::ServerFailure,
+            ResponseCode::NoSuchDomain,
+            ResponseCode::NotImplemented,
+            ResponseCode::Refused,
+        ] {
+            let mut msg = query_msg(1);
+            msg.response = true;
+            msg.rcode = code;
+            let bytes = msg.to_bytes_within(512).expect("serialize");
+            let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
+            assert_eq!(parsed.rcode, code);
+        }
+        assert_eq!(ResponseCode::from_u16(23), ResponseCode::BadCookie);
+        assert_eq!(ResponseCode::BadCookie.to_u16(), 23);
+    }
+
     #[test]
     fn test_edns_absent_defaults_to_512() {
         let msg = query_msg(1);
@@ -1894,6 +2142,96 @@ mod tests {
         assert!(parsed.truncation, "TC bit must be set on truncation");
         assert!(parsed.answers.is_empty(), "answers dropped on truncation");
         assert!(parsed.has_edns(), "OPT record must survive truncation");
+    }
+
+    /// A response used to be built in a zeroed 64 KB scratch that `truncate`
+    /// then shrank the *length* of and not the capacity, so the `Vec` handed to
+    /// `send_to` and held for the duration of the send was 64 KB whatever the
+    /// answer was — a 1000x overshoot at a thousand in flight.
+    ///
+    /// Asserted on capacity rather than on a timing, deliberately: capacity is
+    /// exact and does not care what else is running on the machine
+    /// (`CLAUDE.md` §10). Against the old code this reads 65535.
+    #[test]
+    fn a_small_response_does_not_carry_a_64k_buffer_into_the_send() {
+        use std::net::Ipv4Addr;
+        let mut msg = query_msg(1);
+        msg.response = true;
+        msg.answers.push(ResourceRecord {
+            name: "example.com.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
+        });
+
+        let bytes = msg.to_bytes_within(4096).expect("to_bytes_within");
+        assert!(bytes.len() < 100, "a one-record answer is small");
+        assert!(
+            bytes.capacity() <= 4096,
+            "a UDP response asked to fit in 4096 bytes must not hold {} of \
+             capacity — that is the buffer travelling into send_to",
+            bytes.capacity()
+        );
+    }
+
+    /// The reason [`DnsMessage::to_bytes_within_buf`] exists: a send path that
+    /// keeps one buffer allocates nothing per response. Checked by pointer
+    /// identity, which is the only way to say "did not reallocate" without
+    /// measuring time.
+    #[test]
+    fn serializing_into_a_reused_buffer_does_not_reallocate() {
+        use std::net::Ipv4Addr;
+        let mut msg = query_msg(1);
+        msg.response = true;
+        msg.answers.push(ResourceRecord {
+            name: "example.com.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
+        });
+
+        let mut buf = Vec::new();
+        msg.to_bytes_within_buf(4096, &mut buf).expect("first");
+        let first_len = buf.len();
+        let (ptr, cap) = (buf.as_ptr(), buf.capacity());
+
+        for _ in 0..16 {
+            msg.to_bytes_within_buf(4096, &mut buf).expect("again");
+            assert_eq!(buf.len(), first_len, "same message, same bytes");
+        }
+        assert_eq!(buf.as_ptr(), ptr, "the buffer moved, so it reallocated");
+        assert_eq!(buf.capacity(), cap);
+    }
+
+    /// The boundary the new sizing introduces: with the scratch sized to
+    /// `max_len`, "the message is too long" arrives as a `WireError` from the
+    /// writer rather than as a comparison, so an off-by-one puts a message that
+    /// fits exactly onto the truncation path. The RFC 1035 §4.2.1 answer for a
+    /// message of exactly `max_len` bytes is to send it, TC clear.
+    #[test]
+    fn a_response_of_exactly_the_limit_is_sent_whole() {
+        use std::net::Ipv4Addr;
+        let mut msg = query_msg(1);
+        msg.response = true;
+        msg.answers.push(ResourceRecord {
+            name: "example.com.".to_string(),
+            class: 1,
+            ttl: 3600,
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
+        });
+        let exact = msg.to_bytes_within(4096).expect("measure").len();
+
+        let bytes = msg.to_bytes_within(exact).expect("at the limit");
+        assert_eq!(bytes.len(), exact);
+        let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
+        assert!(!parsed.truncation, "it fit, so TC must be clear");
+        assert_eq!(parsed.answers.len(), 1);
+
+        // One byte less and it must truncate rather than error.
+        let bytes = msg.to_bytes_within(exact - 1).expect("under the limit");
+        let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
+        assert!(parsed.truncation, "TC set when it does not fit");
+        assert!(parsed.answers.is_empty());
     }
 
     #[test]

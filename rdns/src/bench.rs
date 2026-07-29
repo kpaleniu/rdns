@@ -100,13 +100,22 @@ mod benches {
             iterations
         );
 
-        // The floor was 45k, which is what this measures on an idle machine
-        // (47-50k here) — so any competing load failed the suite and the number
-        // said nothing about the code. A regression that matters, like a write
-        // or an allocation per call, costs an order of magnitude; 10k catches
-        // that and survives a busy machine.
+        // The floor has moved twice and the history is the point. It was 45k —
+        // exactly what an idle machine measured — so any competing load failed
+        // the suite; it was lowered to 10k and blamed on that competing load,
+        // which ratified the O(window) regression in `log_query` the benchmark
+        // had correctly caught (`CLAUDE.md` §10). With the window replaced by a
+        // count this measures ~3.1M ops/sec in debug, so 100k is well past the
+        // factor of ten of headroom `bench_zone_lookup` sets as the rule, and
+        // still an order of magnitude above what the quadratic could reach.
+        //
+        // The floor is not the real guard, though: it is a wall-clock number and
+        // a busy machine can still move it. `logging::tests::
+        // logging_a_query_costs_the_same_however_many_came_before` asserts the
+        // shape — cost independent of depth — as a ratio, which is what actually
+        // catches this class coming back.
         assert!(
-            ops_per_sec > 10_000.0,
+            ops_per_sec > 100_000.0,
             "logger too slow: {:.0} ops/sec",
             ops_per_sec
         );
