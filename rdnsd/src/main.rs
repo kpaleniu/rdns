@@ -13,14 +13,14 @@ use rdns::{
     dnssec_validation_mode::DnssecValidator,
     ixfr::{ixfr_response, DeltaLog, IxfrResponse},
     logging::QueryLogger,
-    notify,
+    metrics::{DnsMetrics, LatencyTimer},
+    metrics_server, notify,
     secondary::{
         is_newer, state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile,
         TransferState,
     },
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
     shutdown::{stop_signal, Busy, Lifecycle, Shutdown, Stop},
-    telemetry::{instrumentation, DnsMetrics, LatencyTimer},
     transfer::axfr_messages,
     tsig::{self, TsigAlgorithm, TsigCheck, TsigKey, TsigKeyring, TsigSession},
     utils::{current_unix_timestamp, record_types, recv_error_is_transient, UDP_RECEIVE_BUFFER},
@@ -227,6 +227,24 @@ struct Cli {
     /// everybody.
     #[arg(long, value_name = "ADDR|CIDR")]
     query_rate_exempt: Vec<String>,
+    /// Serve Prometheus metrics and a liveness probe on this address.
+    ///
+    /// Off by default, because it is a second listening socket and an operator
+    /// should choose where it lives. `GET /metrics` is the scrape, `GET /healthz`
+    /// says the process is running.
+    ///
+    /// **Scraped, not pushed.** What was here before was an OpenTelemetry OTLP
+    /// exporter that `init_telemetry` never called — it dragged `tonic`, `prost`,
+    /// `hyper` and `h2`, a gRPC server, into a DNS daemon for an exporter that
+    /// built two objects into `let _` and dropped them. Meanwhile the module
+    /// with the counters worth paging on was referenced only by a benchmark.
+    /// DNS shops scrape; that is the whole argument.
+    ///
+    /// No TLS and no auth: bind it on loopback or a management address. The
+    /// counters are not secret, but they say how much traffic this server takes
+    /// and which zones are failing.
+    #[arg(long, value_name = "ADDR:PORT")]
+    metrics_listen: Option<String>,
 }
 
 /// Zone source: either a single file or a directory of zone files
@@ -327,7 +345,6 @@ fn make_response(
         if !matches!(query.qclass, QueryClass::IN | QueryClass::Any) {
             response.rcode = ResponseCode::Refused;
             response.authoritive = false;
-            metrics.increment_cache_misses();
             continue;
         }
 
@@ -374,25 +391,19 @@ fn make_response(
             match resolve_in_zone(zone, &query.qname, query.qtype) {
                 Outcome::Referral { cut } => {
                     refer_to_child(zone, &cut, dnssec_ok, &mut response);
-                    metrics.increment_cache_misses();
                 }
                 Outcome::Answer { chain, name } => {
                     add_chain(zone, &chain, dnssec_ok, &mut response);
                     add_answer(zone, &name, query.qtype, dnssec_ok, &mut response);
-                    metrics.increment_cache_hits();
                 }
                 Outcome::Negative { chain, name, kind } => {
                     add_chain(zone, &chain, dnssec_ok, &mut response);
                     add_negative(zone, &name, &kind, dnssec_ok, &mut response);
-                    metrics.increment_cache_misses();
                 }
                 Outcome::ChainLeftZone { chain } => {
                     add_chain(zone, &chain, dnssec_ok, &mut response);
-                    metrics.increment_cache_hits();
                 }
             }
-
-            metrics.increment_query_counter();
         } else {
             // A zone we do not serve is REFUSED, not NXDOMAIN, and the two are
             // not interchangeable. NXDOMAIN is an assertion *about the DNS* —
@@ -409,18 +420,23 @@ fn make_response(
             // opposite of what stopping serving it is for.
             response.rcode = ResponseCode::Refused;
             response.authoritive = false;
-            metrics.increment_cache_misses();
         }
     }
 
-    // Log query response with latency
-    let query_name = msg
-        .queries
-        .first()
-        .map(|q| q.qname.as_str())
-        .unwrap_or("unknown");
-    let query_type = msg.queries.first().map(|q| q.qtype).unwrap_or(0);
-    instrumentation::trace_query_response(query_name, query_type, timer.elapsed_ms(), None);
+    // Count the *answer*, once, by what it actually says.
+    //
+    // These used to be `increment_cache_hits`/`increment_cache_misses`, on an
+    // authoritative server that has no cache — the names were standing in for
+    // "found something" and "did not", which is not a question anyone asks of a
+    // primary. A rate of SERVFAIL, NXDOMAIN and REFUSED is what an operator
+    // pages on, and it is what tells a zone that went missing (REFUSED climbs)
+    // from a zone that went wrong (SERVFAIL climbs) from ordinary traffic for
+    // names that are not there (NXDOMAIN, which is normal and noisy).
+    metrics.count_response(response.rcode);
+    if response.authoritive {
+        metrics.count(&metrics.queries_authoritative);
+    }
+    metrics.observe_latency_ms(timer.elapsed_ms());
 
     // Mirror EDNS0: only include an OPT record when the client used EDNS
     // (RFC 6891 §6.1.1), advertising our own UDP payload size. DO is echoed
@@ -779,6 +795,8 @@ struct ServePolicy {
     response_rate: u32,
     /// Queries per second per client, with its burst and exemptions.
     query_limit: RateLimitConfig,
+    /// Where to serve Prometheus metrics, if anywhere.
+    metrics_listen: Option<String>,
 }
 
 /// Bind both transports and serve them from one process.
@@ -789,12 +807,14 @@ async fn serve(
     secondaries: Secondaries,
     deltas: Arc<RwLock<DeltaLog>>,
     shutdown: Shutdown,
+    metrics: Arc<DnsMetrics>,
 ) -> Result<()> {
     let ServePolicy {
         transfer_acl,
         tsig_keys,
         response_rate,
         query_limit,
+        metrics_listen,
     } = policy;
     let transfers = if transfer_acl.is_empty() && tsig_keys.is_empty() {
         "refused (no --allow-transfer, no --tsig-key)".to_string()
@@ -831,17 +851,28 @@ async fn serve(
         )
     };
 
-    // Bind both before announcing anything, so a port conflict fails here rather
-    // than after one transport is already up.
+    // Bind everything before announcing anything, so a port conflict fails here
+    // rather than after one transport is already up — the metrics listener
+    // included, since a typo in `--metrics-listen` should stop the server the
+    // same way a typo in `--port` does rather than leave it running without the
+    // observability the operator asked for.
     let socket = Arc::new(UdpSocket::bind(addr).await?);
     let listener = TcpListener::bind(addr).await?;
+    let metrics_listener = match &metrics_listen {
+        Some(spec) => Some(
+            TcpListener::bind(spec)
+                .await
+                .with_context(|| format!("--metrics-listen {spec}"))?,
+        ),
+        None => None,
+    };
 
     let server = Arc::new(Server {
         zone_map,
         rate_limiter: Arc::new(RateLimiter::new(query_limit)),
         validator: Arc::new(RequestValidator::with_defaults()),
         logger: Arc::new(QueryLogger::new()),
-        metrics: Arc::new(DnsMetrics::new()),
+        metrics,
         transfer_acl: Arc::new(transfer_acl),
         tsig_keys: Arc::new(tsig_keys),
         response_limiter: Arc::new(if response_rate == 0 {
@@ -854,8 +885,13 @@ async fn serve(
     });
     println!(
         "rdnsd listening on {addr} (UDP+TCP), zone transfer: {transfers}, \
-         response budget: {budget}, query rate: {query_limit_note}, TSIG keys: {}",
-        server.tsig_keys.len()
+         response budget: {budget}, query rate: {query_limit_note}, \
+         TSIG keys: {}, metrics: {}",
+        server.tsig_keys.len(),
+        match &metrics_listen {
+            Some(spec) => format!("{spec}/metrics"),
+            None => "off (--metrics-listen)".to_string(),
+        }
     );
 
     // A `JoinSet` rather than two `JoinHandle`s in a `select!`. The old shape
@@ -874,10 +910,21 @@ async fn serve(
     ));
     loops.spawn(tcp_loop(
         listener,
-        server,
+        server.clone(),
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
+    // The scrape endpoint is a listener like the others: if it dies, the process
+    // does. A server whose metrics silently stopped is a server nobody is
+    // watching, which is worse than one that is plainly down.
+    if let Some(metrics_listener) = metrics_listener {
+        loops.spawn(metrics_server::serve(
+            metrics_listener,
+            server.metrics.clone(),
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+    }
 
     // Neither loop returns in normal operation. Whichever ends first ends the
     // process — a server answering on one transport and not the other is worse
@@ -1085,10 +1132,9 @@ impl Server {
 
         if !self.rate_limiter.should_allow(ip) {
             self.logger.log_rate_limited(ip);
-            instrumentation::trace_rate_limit_check(&ip, false);
+            self.metrics.count(&self.metrics.rate_limited);
             return Vec::new();
         }
-        instrumentation::trace_rate_limit_check(&ip, true);
 
         let validation = self.validator.validate_packet(packet, true);
         if !validation.is_valid() {
@@ -1101,14 +1147,9 @@ impl Server {
                         .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
                 ),
             );
-            instrumentation::trace_validation(
-                &ip,
-                false,
-                validation.error().map(|e| e.to_string()).as_deref(),
-            );
+            self.metrics.count(&self.metrics.validation_errors);
             return Vec::new();
         }
-        instrumentation::trace_validation(&ip, true, None);
 
         let Ok(msg) = DnsMessage::try_from_bytes(packet) else {
             self.logger.log_error(ip, "failed to parse DNS message");
@@ -1129,12 +1170,10 @@ impl Server {
 
         let qtype = msg.queries.first().map(|q| q.qtype);
         self.logger.log_query(ip, qtype);
-        let query_name = msg
-            .queries
-            .first()
-            .map(|q| q.qname.as_str())
-            .unwrap_or("unknown");
-        instrumentation::trace_query_received(&ip, query_name, qtype.unwrap_or(0));
+        self.metrics.count(&self.metrics.queries_received);
+        if let Some(qtype) = qtype {
+            self.metrics.track_query_type(qtype);
+        }
 
         // TSIG before anything else that could answer: a signed message is
         // either authentic or it is not, and a server that answered the question
@@ -1337,7 +1376,9 @@ impl Server {
             };
             frames.push(frame(&bytes));
         }
-        self.metrics.increment_query_counter();
+        // A transfer is an answer too, and this is the only path that does not
+        // go through `make_response`.
+        self.metrics.count(&self.metrics.responses_sent);
         let how = match &authenticated_by {
             Some(key) => format!("key {key}"),
             None => format!("address {ip}"),
@@ -1559,10 +1600,9 @@ async fn udp_loop(
             // Rate limiting check
             if !rate_limiter.should_allow(peer.ip()) {
                 logger.log_rate_limited(peer.ip());
-                instrumentation::trace_rate_limit_check(&peer.ip(), false);
+                metrics.count(&metrics.rate_limited);
                 return;
             }
-            instrumentation::trace_rate_limit_check(&peer.ip(), true);
 
             // Validation check
             let validation = validator.validate_packet(&packet, false);
@@ -1576,14 +1616,9 @@ async fn udp_loop(
                             .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
                     ),
                 );
-                instrumentation::trace_validation(
-                    &peer.ip(),
-                    false,
-                    validation.error().map(|e| e.to_string()).as_deref(),
-                );
+                metrics.count(&metrics.validation_errors);
                 return;
             }
-            instrumentation::trace_validation(&peer.ip(), true, None);
 
             if let Ok(msg) = DnsMessage::try_from_bytes(&packet) {
                 // Log successful query parsing
@@ -1634,12 +1669,10 @@ async fn udp_loop(
                     }
                 };
 
-                let query_name = msg
-                    .queries
-                    .first()
-                    .map(|q| q.qname.as_str())
-                    .unwrap_or("unknown");
-                instrumentation::trace_query_received(&peer.ip(), query_name, qtype.unwrap_or(0));
+                metrics.count(&metrics.queries_received);
+                if let Some(qtype) = qtype {
+                    metrics.track_query_type(qtype);
+                }
 
                 // Build the response under the zone lock, then drop it before
                 // touching the socket: a read guard held across `send_to` would
@@ -1666,12 +1699,12 @@ async fn udp_loop(
                             ResponseVerdict::Send => Some(bytes),
                             ResponseVerdict::Truncate => {
                                 logger.log_rate_limited(peer.ip());
-                                metrics.increment_cache_misses();
+                                metrics.count(&metrics.rate_limited);
                                 truncated_reply(&msg)
                             }
                             ResponseVerdict::Drop => {
                                 logger.log_rate_limited(peer.ip());
-                                instrumentation::trace_rate_limit_check(&peer.ip(), false);
+                                metrics.count(&metrics.queries_dropped);
                                 None
                             }
                         };
@@ -1692,30 +1725,15 @@ async fn udp_loop(
                         if let Some(reply) = reply {
                             if let Err(e) = socket.send_to(&reply, peer).await {
                                 logger.log_error(peer.ip(), &format!("socket send error: {}", e));
-                                instrumentation::trace_error(
-                                    "socket_send",
-                                    Some(&peer.ip()),
-                                    &e.to_string(),
-                                );
                             }
                         }
                     }
                     Err(e) => {
                         logger.log_error(peer.ip(), &format!("serialization error: {}", e));
-                        instrumentation::trace_error(
-                            "serialization",
-                            Some(&peer.ip()),
-                            &e.to_string(),
-                        );
                     }
                 }
             } else {
                 logger.log_error(peer.ip(), "failed to parse DNS message");
-                instrumentation::trace_error(
-                    "parse_dns_message",
-                    Some(&peer.ip()),
-                    "failed to parse DNS message",
-                );
             }
         });
     }
@@ -1765,18 +1783,14 @@ impl Reloading {
     /// Separate from [`Reloading::load`] because it has to run *after*
     /// `install_all_zones`: the question is about the zones now being served, and
     /// until they are installed there is nothing to withdraw.
-    async fn withdraw_unvouched(
-        &self,
-        zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
-        deltas: &Arc<RwLock<DeltaLog>>,
-    ) {
+    async fn withdraw_unvouched(&self, served: &Served) {
         let Some(zone_dir) = &self.zone_dir else {
             return;
         };
         if self.secondaries.is_empty() {
             return;
         }
-        withdraw_unvouched_zones(&self.secondaries, zone_map, deltas, zone_dir).await;
+        withdraw_unvouched_zones(&self.secondaries, served, zone_dir).await;
     }
 }
 
@@ -1788,8 +1802,7 @@ impl Reloading {
 /// drain budget every single shutdown.
 #[cfg(unix)]
 fn spawn_signal_handler(
-    zone_map: Arc<RwLock<HashMap<String, Zone>>>,
-    deltas: Arc<RwLock<DeltaLog>>,
+    served: Served,
     source: ZoneSource,
     notify_targets: Vec<SocketAddr>,
     announced: Vec<(String, u32)>,
@@ -1797,7 +1810,7 @@ fn spawn_signal_handler(
     lifecycle: Lifecycle,
 ) {
     let Lifecycle { stop, busy } = lifecycle;
-    let zone_map_clone = Arc::clone(&zone_map);
+    let zone_map_clone = Arc::clone(&served.zone_map);
     let source_clone = source.clone();
     tokio::spawn(async move {
         let _busy = busy;
@@ -1820,13 +1833,12 @@ fn spawn_signal_handler(
                         // difference from what we were serving is what an IXFR
                         // will answer with, and this is the only moment both
                         // versions exist.
-                        install_all_zones(&zone_map_clone, &deltas, new_zones).await;
+                        install_all_zones(&served, new_zones).await;
                         // A reload re-reads the files, so a zone withdrawn for
                         // EXPIRE is back in the map at this point. Judge it
                         // again before anything is announced or answered.
-                        reloading.withdraw_unvouched(&zone_map_clone, &deltas).await;
+                        reloading.withdraw_unvouched(&served).await;
                         println!("Zones reloaded via SIGHUP");
-                        instrumentation::trace_info("zones_reloaded", "SIGHUP signal");
                         // The point of reloading is that something changed, so
                         // this is exactly when a secondary wants to hear about it.
                         announced =
@@ -1838,7 +1850,6 @@ fn spawn_signal_handler(
                         // that failed is a file that changed for the worse, and
                         // the version in memory is the last one known good.
                         eprintln!("Failed to reload zones: {e}");
-                        instrumentation::trace_error("zone_reload_failed", None, &e);
                     }
                 }
             }
@@ -1849,8 +1860,7 @@ fn spawn_signal_handler(
 /// No-op signal handler for non-Unix platforms
 #[cfg(not(unix))]
 fn spawn_signal_handler(
-    _zone_map: Arc<RwLock<HashMap<String, Zone>>>,
-    _deltas: Arc<RwLock<DeltaLog>>,
+    _served: Served,
     _source: ZoneSource,
     _notify_targets: Vec<SocketAddr>,
     _announced: Vec<(String, u32)>,
@@ -2046,11 +2056,15 @@ async fn send_notify(
 /// leave us offering an IXFR chain that does not describe the zone we serve — and
 /// a secondary applying that chain would end up with a zone that never existed,
 /// holding a serial saying it is current.
-async fn install_zone(
-    zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
-    deltas: &Arc<RwLock<DeltaLog>>,
-    zone: Zone,
-) {
+async fn install_zone(served: &Served, zone: Zone) {
+    let Served {
+        zone_map,
+        deltas,
+        metrics,
+    } = served;
+    if let Some(serial) = zone.serial() {
+        metrics.set_zone_serial(zone.origin(), serial);
+    }
     let mut zones = zone_map.write().await;
     let mut log = deltas.write().await;
 
@@ -2075,11 +2089,22 @@ async fn install_zone(
 // serves has no trigger on Windows, so there it is genuinely unreachable rather
 // than merely unused.
 #[cfg_attr(not(unix), allow(dead_code))]
-async fn install_all_zones(
-    zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
-    deltas: &Arc<RwLock<DeltaLog>>,
-    new_zones: HashMap<String, Zone>,
-) {
+async fn install_all_zones(served: &Served, new_zones: HashMap<String, Zone>) {
+    let Served {
+        zone_map,
+        deltas,
+        metrics,
+    } = served;
+    // A reload replaces the set, so a zone that has gone takes its gauges with
+    // it. Leaving them behind would show a zone nobody serves any more as
+    // perfectly healthy at whatever serial it last had.
+    metrics.retain_zones(
+        &new_zones
+            .values()
+            .map(|z| z.origin().to_string())
+            .collect::<Vec<_>>(),
+    );
+    note_serials(metrics, &new_zones);
     let mut zones = zone_map.write().await;
     let mut log = deltas.write().await;
 
@@ -2100,6 +2125,29 @@ async fn install_all_zones(
     }
 
     *zones = new_zones;
+}
+
+/// Record the serial of every zone in `zones`.
+fn note_serials(metrics: &DnsMetrics, zones: &HashMap<String, Zone>) {
+    for zone in zones.values() {
+        if let Some(serial) = zone.serial() {
+            metrics.set_zone_serial(zone.origin(), serial);
+        }
+    }
+}
+
+/// The three things that describe what this server is currently serving.
+///
+/// They are grouped because they are only ever updated *together*: a zone
+/// installed is a new version in the delta log and a new serial on the gauge,
+/// and a zone withdrawn has to leave all three. Passing them as three
+/// parameters is how one of them gets forgotten at a fourth call site —
+/// `CLAUDE.md` §14, and clippy objects at seven arguments for the same reason.
+#[derive(Clone)]
+struct Served {
+    zone_map: Arc<RwLock<HashMap<String, Zone>>>,
+    deltas: Arc<RwLock<DeltaLog>>,
+    metrics: Arc<DnsMetrics>,
 }
 
 /// One replicated zone, as a NOTIFY needs to see it.
@@ -2125,8 +2173,7 @@ type Secondaries = Arc<HashMap<String, ReplicatedZone>>;
 /// swap helpers exist to prevent.
 #[derive(Clone)]
 struct Replication {
-    zone_map: Arc<RwLock<HashMap<String, Zone>>>,
-    deltas: Arc<RwLock<DeltaLog>>,
+    served: Served,
     /// One file, so one mutex: the rule that made step 1 of #7 necessary applies
     /// inside a process too.
     state: Arc<Mutex<StateFile>>,
@@ -2253,7 +2300,7 @@ async fn secondary_loop(
         // invisible in a test that only checks the transfer happened, and was
         // caught by watching a zone with a one-minute REFRESH sit there for an
         // hour.
-        let timers = zone_timers(&replication.zone_map, &spec.zone).await;
+        let timers = zone_timers(&replication.served.zone_map, &spec.zone).await;
 
         let wait = match result {
             Ok(outcome) => {
@@ -2297,12 +2344,14 @@ async fn refresh_once(
     busy: &Busy,
 ) -> Result<String> {
     let Replication {
-        zone_map,
-        deltas,
+        served,
         state,
         zone_dir,
         notify_targets,
     } = replication;
+    let Served {
+        zone_map, metrics, ..
+    } = served;
     // A clone rather than a borrow: an incremental transfer applies its changes
     // to this version, and holding the read lock across a network round trip
     // would block every reload and every swap for the length of the transfer.
@@ -2322,7 +2371,7 @@ async fn refresh_once(
     // exactly what "not stale" means.
     if let Some(held) = held {
         if !is_newer(remote, held) {
-            record_state(state, spec, held, now)?;
+            record_state(state, spec, held, now, metrics)?;
             return Ok(format!("serial {held} is current"));
         }
     }
@@ -2338,7 +2387,7 @@ async fn refresh_once(
                 // The SOA probe said otherwise a moment ago, so the master
                 // changed its mind between the two questions. Nothing to do, and
                 // the next refresh will see the newer serial.
-                record_state(state, spec, serial, now)?;
+                record_state(state, spec, serial, now, metrics)?;
                 return Ok(format!("serial {serial} is current (the master says so)"));
             }
             xfr::IxfrOutcome::Updated {
@@ -2386,8 +2435,8 @@ async fn refresh_once(
     // the point: a secondary that can serve increments of a zone it received is
     // an interior node of a replication tree rather than a leaf.
     let soa = notify::soa_record(&fetched);
-    install_zone(zone_map, deltas, fetched).await;
-    record_state(state, spec, serial, now)?;
+    install_zone(served, fetched).await;
+    record_state(state, spec, serial, now, metrics)?;
 
     // We are this zone's master to whoever replicates it from us, and the serial
     // just moved forward — which is the whole of what a NOTIFY says.
@@ -2404,7 +2453,20 @@ fn record_state(
     spec: &MasterSpec,
     serial: u32,
     now: u64,
+    metrics: &DnsMetrics,
 ) -> Result<()> {
+    // The same fact the state file records, exposed where an operator can see it
+    // without reading a sidecar off the box.
+    //
+    // **Contact, not transfer.** All three of this function's callers are
+    // "reached the master" — including the one where the serial was already
+    // current and nothing moved — and contact is the operationally meaningful
+    // one: it is what EXPIRE counts from, and it is what decides whether a zone
+    // is withdrawn. A replica in contact with nothing new to fetch is healthy,
+    // and a gauge that only moved on an actual transfer would call it stale.
+    // #9d asked for "last successful transfer"; this is the same question asked
+    // more precisely.
+    metrics.note_zone_transfer(&spec.zone, now);
     state
         .lock()
         .expect("state mutex")
@@ -2436,12 +2498,12 @@ async fn expire_if_out_of_contact(
     started_at: u64,
     timers: RefreshTimers,
 ) {
-    let Replication {
+    let Replication { served, state, .. } = replication;
+    let Served {
         zone_map,
         deltas,
-        state,
-        ..
-    } = replication;
+        metrics,
+    } = served;
     let last_contact = state
         .lock()
         .expect("state mutex")
@@ -2463,6 +2525,10 @@ async fn expire_if_out_of_contact(
         // The increments go with it: offering a chain for a zone we have
         // withdrawn would be answering for something we just stopped serving.
         deltas.write().await.forget(&spec.zone);
+        // And the gauges, for the same reason as at startup: a serial left
+        // frozen at whatever it last was shows a zone this server has stopped
+        // answering for as perfectly healthy.
+        metrics.forget_zone(&spec.zone);
         eprintln!(
             "secondary {}: EXPIRE ({}s) passed with no contact — no longer serving this zone",
             spec.zone, timers.expire
@@ -2496,12 +2562,12 @@ async fn expire_if_out_of_contact(
 /// A zone we hold but do not replicate is never touched: the loop is over the
 /// `--secondary` specs, so a primary zone sharing the directory is not this
 /// function's business.
-async fn withdraw_unvouched_zones(
-    specs: &[MasterSpec],
-    zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
-    deltas: &Arc<RwLock<DeltaLog>>,
-    zone_dir: &Path,
-) {
+async fn withdraw_unvouched_zones(specs: &[MasterSpec], served: &Served, zone_dir: &Path) {
+    let Served {
+        zone_map,
+        deltas,
+        metrics,
+    } = served;
     let state = StateFile::load(&state_file_path(zone_dir));
     let now = current_unix_timestamp();
 
@@ -2529,6 +2595,10 @@ async fn withdraw_unvouched_zones(
             // offering a chain for a zone we have withdrawn would be answering
             // for something we just stopped serving.
             deltas.write().await.forget(&spec.zone);
+            // And its gauges. A withdrawn zone whose serial sat frozen at
+            // whatever it last was would read as a perfectly healthy replica;
+            // an absent series is a question a dashboard can ask about.
+            metrics.forget_zone(&spec.zone);
             eprintln!(
                 "secondary {}: {why} — not serving it until {} answers",
                 spec.zone, spec.master
@@ -2587,6 +2657,10 @@ async fn main() -> Result<()> {
     // bind would leave both of those outside the only mechanism that waits for
     // them.
     let shutdown = Shutdown::new();
+    // Created here for the same reason as `shutdown`: the facts it records —
+    // which serial is served, when a zone last transferred — start being true
+    // before the listeners exist, at the initial zone load.
+    let metrics = Arc::new(DnsMetrics::new());
     // A typo in either list stops the server rather than quietly narrowing it —
     // or, worse, being read as something wider.
     let transfer_acl = TransferAcl::parse(&cli.allow_transfer)?;
@@ -2616,6 +2690,7 @@ async fn main() -> Result<()> {
     let validator = Arc::new(validator);
     verify_zones(&zones, &validator)?;
 
+    note_serials(&metrics, &zones);
     let zone_map = Arc::new(RwLock::new(zones));
     // Empty at startup by design: the deltas are between versions *this process*
     // has held, and a zone read from disk has no previous version here. Every
@@ -2623,6 +2698,12 @@ async fn main() -> Result<()> {
     // instead, which RFC 1995 §4 permits unconditionally and which corrects
     // itself at the next change. See "Architecture: incremental transfer".
     let deltas = Arc::new(RwLock::new(DeltaLog::new()));
+    // The three that are only ever updated together. See [`Served`].
+    let served = Served {
+        zone_map: zone_map.clone(),
+        deltas: deltas.clone(),
+        metrics: metrics.clone(),
+    };
     let addr = format!("{}:{}", cli.host, cli.port);
 
     // Before anything is served: a replicated zone whose copy on disk went out
@@ -2639,12 +2720,11 @@ async fn main() -> Result<()> {
             return Err(anyhow!("--secondary requires --zone-dir"));
         };
         let zone_dir = PathBuf::from(dir);
-        withdraw_unvouched_zones(&secondary_specs, &zone_map, &deltas, &zone_dir).await;
+        withdraw_unvouched_zones(&secondary_specs, &served, &zone_dir).await;
         reload_secondaries = secondary_specs.clone();
         reload_zone_dir = Some(zone_dir.clone());
         let replication = Replication {
-            zone_map: zone_map.clone(),
-            deltas: deltas.clone(),
+            served: served.clone(),
             state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&zone_dir)))),
             zone_dir,
             notify_targets: notify_targets.clone(),
@@ -2663,8 +2743,7 @@ async fn main() -> Result<()> {
 
     // Zone reload on SIGHUP, where signals exist.
     spawn_signal_handler(
-        zone_map.clone(),
-        deltas.clone(),
+        served.clone(),
         source,
         notify_targets,
         announced,
@@ -2687,10 +2766,12 @@ async fn main() -> Result<()> {
             tsig_keys,
             response_rate: cli.response_rate,
             query_limit,
+            metrics_listen: cli.metrics_listen,
         },
         secondaries,
         deltas,
         shutdown,
+        metrics,
     )
     .await
 }
@@ -3276,6 +3357,19 @@ mod tests {
         );
     }
 
+    /// A [`Served`] over the given map and log, with throwaway gauges — for
+    /// tests about installing and withdrawing zones rather than about metrics.
+    fn served(
+        zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
+        deltas: &Arc<RwLock<DeltaLog>>,
+    ) -> Served {
+        Served {
+            zone_map: zone_map.clone(),
+            deltas: deltas.clone(),
+            metrics: Arc::new(DnsMetrics::new()),
+        }
+    }
+
     /// A `Shutdown` that is never triggered and never dropped, for tests that
     /// need the handles but not the behaviour.
     ///
@@ -3582,8 +3676,11 @@ mod tests {
     /// The replication context a refresh runs in, over a scratch directory.
     fn replication(dir: &ScratchDir, notify_targets: Vec<SocketAddr>) -> Replication {
         Replication {
-            zone_map: Arc::new(RwLock::new(HashMap::new())),
-            deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            served: Served {
+                zone_map: Arc::new(RwLock::new(HashMap::new())),
+                deltas: Arc::new(RwLock::new(DeltaLog::new())),
+                metrics: Arc::new(DnsMetrics::new()),
+            },
             state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&dir.0)))),
             zone_dir: dir.0.clone(),
             notify_targets,
@@ -3619,7 +3716,7 @@ mod tests {
         assert!(outcome.contains("transferred serial 7"), "got: {outcome}");
 
         // Served from memory...
-        let zones = r.zone_map.read().await;
+        let zones = r.served.zone_map.read().await;
         let held = zones.get("example.com.").expect("the zone is now served");
         assert_eq!(held.serial(), Some(7));
         assert_eq!(held.query("www.example.com.", record_types::A).len(), 1);
@@ -3666,7 +3763,8 @@ mod tests {
 
         assert!(second.contains("current"), "got: {second}");
         assert_eq!(
-            r.zone_map
+            r.served
+                .zone_map
                 .read()
                 .await
                 .get("example.com.")
@@ -3721,7 +3819,7 @@ mod tests {
         .expect("second");
 
         assert!(outcome.contains("serial 7 -> 8"), "got: {outcome}");
-        let zones = r.zone_map.read().await;
+        let zones = r.served.zone_map.read().await;
         let held = zones.get("example.com.").unwrap();
         assert_eq!(held.serial(), Some(8));
         assert!(
@@ -3763,8 +3861,11 @@ mod tests {
         let state = Arc::new(Mutex::new(state_file));
 
         let r = Replication {
-            zone_map: zone_map.clone(),
-            deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            served: Served {
+                zone_map: zone_map.clone(),
+                deltas: Arc::new(RwLock::new(DeltaLog::new())),
+                metrics: Arc::new(DnsMetrics::new()),
+            },
             state: state.clone(),
             zone_dir: dir.0.clone(),
             notify_targets: Vec::new(),
@@ -3810,8 +3911,11 @@ mod tests {
         let state = Arc::new(Mutex::new(state_file));
 
         let r = Replication {
-            zone_map: zone_map.clone(),
-            deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            served: Served {
+                zone_map: zone_map.clone(),
+                deltas: Arc::new(RwLock::new(DeltaLog::new())),
+                metrics: Arc::new(DnsMetrics::new()),
+            },
             state: state.clone(),
             zone_dir: dir.0.clone(),
             notify_targets: Vec::new(),
@@ -3860,7 +3964,7 @@ mod tests {
             "expected an increment, got: {outcome}"
         );
 
-        let zones = r.zone_map.read().await;
+        let zones = r.served.zone_map.read().await;
         let held = zones.get("example.com.").expect("still served");
         assert_eq!(held.serial(), Some(8));
         assert_eq!(held.query("extra.example.com.", record_types::TXT).len(), 1);
@@ -4009,7 +4113,7 @@ mod tests {
             .await
             .expect("first transfer");
         assert_eq!(
-            r.deltas.read().await.len("example.com."),
+            r.served.deltas.read().await.len("example.com."),
             0,
             "a first fetch has no previous version to differ from"
         );
@@ -4026,7 +4130,7 @@ mod tests {
             .await
             .expect("second transfer");
 
-        let log = r.deltas.read().await;
+        let log = r.served.deltas.read().await;
         assert_eq!(log.len("example.com."), 1, "the change was recorded");
         let chain = log.chain_from("example.com.", 7).expect("a chain from 7");
         assert_eq!(chain.len(), 1);
@@ -4056,7 +4160,7 @@ mod tests {
         let mut initial = HashMap::new();
         initial.insert(v7.origin().to_string(), v7);
         initial.insert(other.origin().to_string(), other);
-        install_all_zones(&zone_map, &deltas, initial).await;
+        install_all_zones(&served(&zone_map, &deltas), initial).await;
         assert!(deltas.read().await.is_empty(), "nothing to differ from yet");
 
         // example.com. moves on; other.test. is dropped from the configuration.
@@ -4070,7 +4174,7 @@ mod tests {
         );
         let mut reloaded = HashMap::new();
         reloaded.insert(v8.origin().to_string(), v8);
-        install_all_zones(&zone_map, &deltas, reloaded).await;
+        install_all_zones(&served(&zone_map, &deltas), reloaded).await;
 
         let log = deltas.read().await;
         assert_eq!(log.len("example.com."), 1, "the reload is a version step");
@@ -4283,7 +4387,7 @@ mod tests {
             // Last contact two hours ago, against an EXPIRE of one.
             record_contact(&dir, "192.0.2.1:53", current_unix_timestamp() - 7200);
 
-            withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
+            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), &dir.0).await;
             assert!(
                 zone_map.read().await.is_empty(),
                 "out of contact past EXPIRE is not ours to answer for"
@@ -4293,11 +4397,11 @@ mod tests {
             let zone = rdns::zone::parse_zone_file(REPLICATED, "example.com.").unwrap();
             let mut reloaded = HashMap::new();
             reloaded.insert(zone.origin().to_string(), zone);
-            install_all_zones(&zone_map, &deltas, reloaded).await;
+            install_all_zones(&served(&zone_map, &deltas), reloaded).await;
             assert_eq!(zone_map.read().await.len(), 1, "a reload re-reads the file");
 
             // ...and must be withdrawn again, which is the whole finding.
-            withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
+            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), &dir.0).await;
             assert!(
                 zone_map.read().await.is_empty(),
                 "a SIGHUP is not new contact with the master"
@@ -4323,7 +4427,7 @@ mod tests {
             } = replicated_setup("expire-nostate");
             assert!(!state_file_path(&dir.0).exists(), "no sidecar at all");
 
-            withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
+            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), &dir.0).await;
             assert!(zone_map.read().await.is_empty());
         }
 
@@ -4339,7 +4443,7 @@ mod tests {
             } = replicated_setup("expire-othermaster");
             record_contact(&dir, "192.0.2.99:53", current_unix_timestamp());
 
-            withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
+            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), &dir.0).await;
             assert!(zone_map.read().await.is_empty());
         }
 
@@ -4355,7 +4459,7 @@ mod tests {
             } = replicated_setup("expire-fresh");
             record_contact(&dir, "192.0.2.1:53", current_unix_timestamp());
 
-            withdraw_unvouched_zones(&specs, &zone_map, &deltas, &dir.0).await;
+            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), &dir.0).await;
             assert_eq!(zone_map.read().await.len(), 1);
         }
 

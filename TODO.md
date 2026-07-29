@@ -26,7 +26,7 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **593 lib + 6 allocation + 71 `rdnsd` + 2 `rdnsr`**
+`cargo test --workspace` = **594 lib + 6 allocation + 71 `rdnsd` + 2 `rdnsr`**
 tests passing
 (`rdnsd`'s own 71 cover argument validation, zone sources and the load policy,
 the secondary role and EXPIRE across reloads, both directions of IXFR and onward
@@ -36,8 +36,8 @@ signal arriving mid-AXFR; `rdnsr` had
 **no test module at all** until #9c gave it one), `cargo clippy --workspace
 --all-targets` **clean, no exceptions**, `cargo fmt --all --check` clean. The lib
 count fell from 578 to 567 when dead `serialization.rs` was deleted with its 11
-tests, and is back up at 593 with #9e's, #9f's and graceful shutdown's
-regression tests.
+tests, and is at 594 now: #9e's, #9f's, graceful shutdown's and the metrics
+endpoint's tests, minus the seven that went with `telemetry.rs`.
 
 **Errors are typed in the library and `anyhow` in the binaries (2026-07-28).**
 The convention used to run the other way round — `rdns` returned `anyhow::Error`,
@@ -82,14 +82,14 @@ against. On the performance side the `log_query` quadratic is gone (3.09M ops/se
 where it managed 47k, and `bench_logger_throughput`'s floor is back up at 100k),
 responses no longer carry a 64 KB buffer into `send_to`, cache eviction is linear
 rather than O(n²), and name compression stores one copy of a name instead of one
-per suffix. What is left under #9 is **mostly operability (9d)**: metrics, a config
-file, a control channel, CI. Three items remain under 9e — the DHAT pass that was
+per suffix. What is left under #9 is **mostly operability (9d)**: a config file,
+a control channel, CI, log levels. Three items remain under 9e — the DHAT pass that was
 leading them is done, and its numbers are what the rest get judged against now,
 including one finding it turned up that nobody had guessed: the `tokio::spawn`
 per UDP datagram costs **1,536 bytes**, which is 46% of everything a query
 allocates.
 
-**Two 9d items are closed with them.** The query rate limiter was hardcoded at
+**Three 9d items are closed with them.** The query rate limiter was hardcoded at
 ~10 q/s per source and dropped over it in silence — it has flags now, a default a
 hundred times higher, and an exemption list, measured live at 60 answers to a
 60-query burst where the finding recorded 20. And **both daemons stop
@@ -99,6 +99,16 @@ truncated transfer from a complete one. `rdns::shutdown` is shared by both,
 because both had the same hole and the same detached-`JoinHandle` bug underneath
 it. That also unblocks 9e's DHAT item, which needs a process that returns from
 `main` in order to write its report at all.
+
+**And the observability story changed shape (2026-07-29).** `telemetry.rs` and
+its OpenTelemetry stack are deleted — `Cargo.lock` drops from **187 packages to
+104**, since an OTLP exporter that was never initialised was carrying `tonic`,
+`prost`, `hyper` and `h2` into a DNS daemon. What replaces it is what DNS shops
+actually run: `metrics.rs`'s counters, which had been referenced only by a
+benchmark, wired into `rdnsd` and served as Prometheus text on
+`--metrics-listen` — with a latency histogram, a `/healthz`, and the two per-zone
+gauges an operator asks for by name: which serial is being served, and when this
+replica was last in contact with a master.
 
 **One fix in #9c was a fix to a previous fix.** Closing "an unreadable zone
 directory silently unloads every zone" (2026-07-27) also broke a secondary's
@@ -220,6 +230,14 @@ cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
 # Tell a secondary at once when a zone changes, and cap UDP response bytes/s.
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --also-notify 127.0.0.1:15354 --response-rate 4096
+
+# Prometheus metrics and a liveness probe. GET /metrics and GET /healthz; off
+# by default, and with no TLS or auth, so bind it somewhere an operator reaches
+# and a client does not.
+cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone   --metrics-listen 127.0.0.1:9153
+# The two alerts worth having, in PromQL:
+#   rate(dns_responses_servfail_total[5m]) > 0
+#   time() - dns_zone_last_refresh_timestamp_seconds > 604800   # the zone's EXPIRE
 
 # Heap-profile the daemon. Writes dhat-heap.json on exit, which is why it needs
 # the graceful stop above — the report is written on Drop. Counts and sizes
@@ -408,7 +426,7 @@ under "Closed work" further down.
 
 | # | what | open |
 |---|------|------|
-| **9** | what the five-way code review turned up | **16** — 9a, 9b, 9c and **9f** are closed, 9e is down to three; what is left is mostly operability |
+| **9** | what the five-way code review turned up | **15** — 9a, 9b, 9c and **9f** are closed, 9e is down to three; what is left is mostly operability |
 | **8** | what signing turned up | **2** — both about re-signing a running server |
 | **7** | the secondary role | **1**, and conditional |
 | **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
@@ -971,8 +989,88 @@ here degrades quietly with the process healthy and nothing alerting.
       while the server is healthy and `dig +norec` looks perfect. Until the timer
       exists, a cron `kill -HUP` is **mandatory documented deployment config**, and
       an alert on `now - zone_signed_at > validity/2` is what makes it survivable.
-- [ ] **There are no metrics: `init_telemetry` is never called, and the module
-      with the useful counters is wired to nothing.** Verified by grep — the only
+- [x] **There are no metrics: `init_telemetry` is never called, and the module
+      with the useful counters is wired to nothing** — **done 2026-07-29**, and
+      the OTel question is answered by deletion.
+
+      **`rdns/src/telemetry.rs` is gone**, and with it six dependencies:
+      `opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`,
+      `tracing-opentelemetry`, `tracing` and `tracing-subscriber`. `Cargo.lock`
+      goes from **187 packages to 104** — 83 crates, including `tonic`, `prost`,
+      `hyper` and `h2`, a gRPC *server*, carried by a DNS daemon for an exporter
+      that built two objects into `let _` and dropped them. `tracing` went too
+      because after deleting the inert instrumentation layer nothing used it; the
+      log-flood item below wants it back, and it can come back deliberately when
+      something actually initialises a subscriber.
+
+      **`metrics.rs::DnsMetrics` is the one now**, wired into `rdnsd` and no
+      longer referenced only by a benchmark. `LatencyTimer` moved there with it.
+      The counter calls changed meaning as well as module: `make_response` used
+      to call `increment_cache_hits`/`increment_cache_misses` on an authoritative
+      server that **has no cache** — the names were standing in for "found
+      something" and "did not", which is not a question anyone asks of a primary.
+      It counts the answer by its rcode instead, which is what an operator pages
+      on: REFUSED climbing means a zone went *missing*, SERVFAIL climbing means
+      one went *wrong*, NXDOMAIN is ordinary and noisy.
+
+      **`--metrics-listen <ADDR:PORT>`** serves `GET /metrics` (Prometheus text)
+      and `GET /healthz`, in `rdns::metrics_server` — ninety lines of hand-rolled
+      HTTP over `tokio`'s `TcpListener` rather than a second HTTP stack, since
+      pulling `hyper` back in to answer one method on one path would be the same
+      mistake with better manners. It is a listener like the others: it stops
+      with the rest and holds the drain only while a scrape is in flight. Off by
+      default; no TLS and no auth, so bind it on loopback or a management
+      address.
+
+      **The latency histogram is in**, as cumulative `le` buckets plus `_sum` and
+      `_count` — the exact shape `histogram_quantile()` needs — in *seconds*,
+      because Prometheus convention is base units. The bounds start at 50 µs:
+      an in-memory zone lookup is tens of microseconds, and a histogram whose
+      first bucket is 5 ms reports every healthy server as identical.
+
+      **The two gauges are in too (2026-07-29).** `dns_zone_serial{zone=...}`
+      and `dns_zone_last_refresh_timestamp_seconds{zone=...}`, and three
+      decisions in them are worth keeping:
+
+      - **Written when the fact changes, not sampled at scrape time.** Reading
+        the zone map on the scrape path would put a scrape behind a reload and a
+        reload behind a scrape, and the number would still be only as fresh as
+        the last scrape. `Served` — zone map, delta log, gauges — exists because
+        those three are only ever updated together, and passing them separately
+        is how one gets forgotten at a fourth call site.
+      - **A timestamp, not a "seconds since".** Prometheus convention is to
+        expose the instant and let the query do `time() - x`; a duration computed
+        here is stale the moment it is scraped and goes on ageing in the
+        dashboard. The alert is
+        `time() - dns_zone_last_refresh_timestamp_seconds > <expire>`.
+      - **Contact, not transfer**, which is the finding's wording asked more
+        precisely. All three success paths in `refresh_once` go through
+        `record_state`, including the one where the serial was already current —
+        and contact is what EXPIRE counts from and what decides whether a zone is
+        withdrawn. A replica in contact with nothing new to fetch is healthy; a
+        gauge that only moved on an actual transfer would call it stale.
+
+      A zone with no transfer is **omitted rather than zeroed** — a primary is
+      never transferred, and `0` reads as 1970 and fires every staleness alert —
+      and a withdrawn zone is **forgotten rather than frozen**, at both the
+      startup check and the runtime EXPIRE, because a gauge stuck at its last
+      value shows a zone nobody serves as perfectly healthy. The compiler found
+      the second of those: the runtime expiry path had been missed, and an unused
+      `metrics` binding is what said so.
+
+      Verified live on a real primary and secondary: the primary reports a serial
+      and **no** refresh timestamp, the secondary reports both, four seconds
+      behind the clock.
+
+      Verified live: nine queries (five A, two for a name that is not there, one
+      for a zone we do not serve, one MX) produce
+      `dns_queries_received_total 9`, `dns_responses_noerror_total 6`,
+      `dns_responses_nxdomain_total 2`, `dns_responses_refused_total 1`,
+      `dns_queries_authoritative_total 8` — the REFUSED one is not authoritative
+      — `dns_queries_type{type="A"} 8`, `type="MX" 1`, and a latency histogram
+      summing to 31 µs across the nine. Original finding follows.
+
+      Verified by grep — the only
       match for `init_telemetry` in the workspace is its own definition at
       `rdns/src/telemetry.rs:13`, and it is a stub that builds two exporters into
       `let _trace_exporter`/`let _metrics_exporter` and drops them. No tracer
@@ -1069,10 +1167,14 @@ here degrades quietly with the process healthy and nothing alerting.
       `log_error` counts under the guard and does its `eprintln!` outside it, so
       one `write(2)` per bad packet no longer serializes every *other* query path
       behind the stats mutex as well as behind Rust's stderr lock. What is left is
-      the part that needs `tracing` with real levels: there is still no
-      `--log-level` or `--quiet`, the caller still allocates its message with
-      `format!` whether or not anything wants it, and 50k pps of garbage is still
-      50k journald lines a second. Original finding follows.
+      the part that needs real log levels: there is still no `--log-level` or
+      `--quiet`, the caller still allocates its message with `format!` whether or
+      not anything wants it, and 50k pps of garbage is still 50k journald lines a
+      second. **Note the fix below names `tracing`, which is no longer a
+      dependency** — it went with the OpenTelemetry deletion because nothing used
+      it once the inert instrumentation layer was gone. Bringing it back for this
+      is still the right answer; it just has to be a deliberate choice now rather
+      than a crate that happened to be in the tree. Original finding follows.
 
       (`rdns/src/logging.rs:96`). `log_error` does an unconditional, unbuffered
       `eprintln!` while holding the stats mutex — one `write(2)` per bad packet,
@@ -1088,12 +1190,14 @@ here degrades quietly with the process healthy and nothing alerting.
       evaluated when disabled), count under the lock and log outside it, sample or
       rate-limit the error path.
 
-      **Note the level inversion on the other side**: `trace_query_response`
-      (`telemetry.rs:263`) logs the **query name at INFO on every successful
-      query**. It is inert only because `tracing_subscriber` is never initialised —
-      fixing the metrics item above switches on full per-query logging by default,
-      with the client IP, with no runtime toggle. Query logging must be explicit
-      opt-in, with the client IP behind a second switch, before that lands.
+      **The level inversion this used to warn about is gone with the code.**
+      `trace_query_response` logged the query name at INFO on every successful
+      query, inert only because no subscriber was ever initialised — so fixing
+      metrics would have switched on full per-query logging with the client IP
+      and no runtime toggle. `telemetry.rs` was deleted rather than wired up, so
+      the trap never sprang. The rule it implies still stands for whatever
+      replaces it: **query logging is explicit opt-in, and the client IP is
+      behind a second switch.**
 - [ ] **Unbounded `tokio::spawn` per UDP datagram on both daemons**
       (`rdnsd/src/main.rs:1077`, `rdnsr/src/main.rs:477`) — TCP has both
       `MAX_TCP_CONNECTIONS` and `MAX_INFLIGHT_PER_CONNECTION`, UDP has neither.

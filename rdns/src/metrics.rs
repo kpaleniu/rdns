@@ -1,7 +1,76 @@
+//! Counters an operator can page on, and the Prometheus text to scrape them.
+//!
+//! **This module used to be dead** — referenced only by `bench.rs` — while both
+//! servers used a second `DnsMetrics` in a `telemetry` module built around an
+//! OpenTelemetry OTLP exporter that was never initialised. That module is gone;
+//! see `TODO.md` #9d for what it cost and why scraping is the right shape here.
+//!
+//! The counters are plain relaxed atomics. Relaxed is right: each is
+//! independent, nothing branches on one, and a scrape is a snapshot of a moving
+//! system either way — ordering between two counters would buy nothing and cost
+//! a fence on every query.
+
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
+use crate::ResponseCode;
+
+/// Upper bounds, in milliseconds, of the latency histogram's buckets.
+///
+/// Chosen for what a DNS answer actually costs: an in-memory zone lookup is
+/// tens of microseconds, so the interesting resolution is *below* a
+/// millisecond, and anything past ten means a lock was contended, a signature
+/// was computed, or a disk was touched. A histogram whose first bucket is 5 ms
+/// would report every healthy server as identical.
+const LATENCY_BUCKETS_MS: [f64; 8] = [0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 25.0, 100.0];
+
+/// Escape a label value for the Prometheus text format: backslash, double quote
+/// and newline (the exposition format's §"label value" rules).
+///
+/// A zone name should contain none of these — but it comes from a file an
+/// operator wrote, and RFC 1035 §5.1 allows `\` escapes in one, so "should" is
+/// not "cannot". An unescaped quote here would not corrupt one metric, it would
+/// make the *rest of the scrape* unparseable.
+fn escape_label(value: &str) -> String {
+    if !value.contains(['\\', '"', '\n']) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// What is currently true of one zone.
+#[derive(Debug, Clone, Copy, Default)]
+struct ZoneGauge {
+    /// The SOA serial being served, which is the one number that says *which
+    /// version* of a zone a server has — the thing you compare across a primary
+    /// and its secondaries to find the one that is behind.
+    serial: u32,
+    /// Unix seconds of the last successful *contact with a master*, for a zone
+    /// we replicate — which is what EXPIRE counts from, and so what decides
+    /// whether the zone is still ours to answer for. A refresh that found
+    /// nothing new still counts: the zone is confirmed current, which is exactly
+    /// what "not stale" means.
+    ///
+    /// `None` covers two cases that must not render the same as each other or as
+    /// zero: a zone we are primary for, which is never transferred, and a
+    /// secondary zone we have not managed to fetch yet. Emitting `0` for either
+    /// would read as 1970 and fire every staleness alert there is.
+    last_transfer: Option<u64>,
+}
 
 /// Prometheus-compatible metrics for DNS server
+#[derive(Clone)]
 pub struct DnsMetrics {
     // Query counters
     pub queries_received: Arc<AtomicU64>,
@@ -23,6 +92,27 @@ pub struct DnsMetrics {
     pub rate_limited: Arc<AtomicU64>,
     pub validation_errors: Arc<AtomicU64>,
     pub queries_dropped: Arc<AtomicU64>,
+
+    // Answer latency, as cumulative histogram buckets plus a count and a sum —
+    // the three things Prometheus needs to compute a quantile.
+    latency_buckets: Arc<[AtomicU64; 8]>,
+    latency_count: Arc<AtomicU64>,
+    /// Microseconds, integer, so the sum needs no float atomic.
+    latency_sum_us: Arc<AtomicU64>,
+
+    /// Per-zone facts, updated when they change rather than sampled.
+    ///
+    /// A gauge over live state, unlike everything else here, and it is written
+    /// at the moment the fact changes — a zone installed, a transfer that
+    /// succeeded — rather than read out of the zone map at scrape time. That is
+    /// deliberate: sampling would need the zone-map lock on the scrape path, so
+    /// a scrape could be blocked behind a reload and a reload behind a scrape,
+    /// and the number would still only be as fresh as the last scrape.
+    ///
+    /// Not bounded, and it does not need to be (`CLAUDE.md` §5): the key space
+    /// is zone names from the configuration, not anything a client can put on
+    /// the wire.
+    zones: Arc<RwLock<BTreeMap<String, ZoneGauge>>>,
 
     // Record type counters
     pub queries_type_a: Arc<AtomicU64>,
@@ -52,6 +142,10 @@ impl DnsMetrics {
             rate_limited: Arc::new(AtomicU64::new(0)),
             validation_errors: Arc::new(AtomicU64::new(0)),
             queries_dropped: Arc::new(AtomicU64::new(0)),
+            zones: Arc::new(RwLock::new(BTreeMap::new())),
+            latency_buckets: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            latency_count: Arc::new(AtomicU64::new(0)),
+            latency_sum_us: Arc::new(AtomicU64::new(0)),
             queries_type_a: Arc::new(AtomicU64::new(0)),
             queries_type_aaaa: Arc::new(AtomicU64::new(0)),
             queries_type_mx: Arc::new(AtomicU64::new(0)),
@@ -62,6 +156,93 @@ impl DnsMetrics {
             queries_type_ptr: Arc::new(AtomicU64::new(0)),
             queries_type_other: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Add one to a counter, named so a call site reads as what it counts:
+    /// `metrics.count(&metrics.rate_limited)`.
+    pub fn count(&self, counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one answer by the code it carries.
+    ///
+    /// The rates of these are what an operator pages on, and they say different
+    /// things: REFUSED climbing means a zone went *missing*, SERVFAIL climbing
+    /// means one went *wrong*, and NXDOMAIN is ordinary and noisy. Anything else
+    /// — NOTIMP, FORMERR, BADVERS — is counted as sent and not broken out,
+    /// because a per-rcode counter for all twenty-four would be a lot of
+    /// cardinality for codes nobody alerts on.
+    pub fn count_response(&self, rcode: ResponseCode) {
+        self.count(&self.responses_sent);
+        match rcode {
+            ResponseCode::Ok => self.count(&self.responses_noerror),
+            ResponseCode::NoSuchDomain => self.count(&self.responses_nxdomain),
+            ResponseCode::ServerFailure => self.count(&self.responses_servfail),
+            ResponseCode::Refused => self.count(&self.responses_refused),
+            _ => {}
+        }
+    }
+
+    /// Record one answer's latency into the histogram.
+    ///
+    /// Cumulative buckets, which is the shape Prometheus wants: each `le` bucket
+    /// counts everything at or below it, so a quantile is computed at query time
+    /// rather than being fixed here. Bounds are the ones a DNS answer actually
+    /// falls between — an in-memory zone lookup is microseconds, and anything
+    /// past ten milliseconds means a lock was contended or a disk was touched.
+    pub fn observe_latency_ms(&self, ms: f64) {
+        for (bound, bucket) in LATENCY_BUCKETS_MS.iter().zip(self.latency_buckets.iter()) {
+            if ms <= *bound {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.latency_count.fetch_add(1, Ordering::Relaxed);
+        // Microseconds, as an integer, so the sum is exact and needs no float
+        // atomic. Converted back on the way out.
+        self.latency_sum_us
+            .fetch_add((ms * 1000.0) as u64, Ordering::Relaxed);
+    }
+
+    /// Record the serial currently served for `zone`.
+    ///
+    /// Call it wherever a zone is installed — that is the only moment the
+    /// answer changes, and it is the moment we already hold the version.
+    pub fn set_zone_serial(&self, zone: &str, serial: u32) {
+        let Ok(mut zones) = self.zones.write() else {
+            // A poisoned lock costs a stale gauge. Refusing to serve DNS over it
+            // would be absurd (`CLAUDE.md` §6).
+            return;
+        };
+        zones.entry(zone.to_string()).or_default().serial = serial;
+    }
+
+    /// Record that `zone` was in contact with its master at `at` (Unix seconds).
+    pub fn note_zone_transfer(&self, zone: &str, at: u64) {
+        let Ok(mut zones) = self.zones.write() else {
+            return;
+        };
+        zones.entry(zone.to_string()).or_default().last_transfer = Some(at);
+    }
+
+    /// Stop reporting `zone` — it was removed from the configuration, or
+    /// withdrawn for EXPIRE.
+    ///
+    /// Forgetting rather than zeroing, because a gauge that stays at its last
+    /// value is how a dashboard shows a zone that is no longer served as
+    /// perfectly healthy. An absent series is visible; a frozen one is not.
+    pub fn forget_zone(&self, zone: &str) {
+        let Ok(mut zones) = self.zones.write() else {
+            return;
+        };
+        zones.remove(zone);
+    }
+
+    /// Replace the whole set, for a reload that installs every zone at once.
+    pub fn retain_zones(&self, keep: &[String]) {
+        let Ok(mut zones) = self.zones.write() else {
+            return;
+        };
+        zones.retain(|name, _| keep.iter().any(|k| k.eq_ignore_ascii_case(name)));
     }
 
     /// Track query type
@@ -214,6 +395,71 @@ impl DnsMetrics {
             self.queries_type_other.load(Ordering::Relaxed)
         ));
 
+        // The latency histogram, in the exact shape `histogram_quantile()`
+        // wants: cumulative `le` buckets, a `+Inf` bucket equal to the count,
+        // then `_sum` and `_count`. Seconds, because Prometheus convention is
+        // base units and a dashboard that has to know we chose milliseconds is
+        // a dashboard that will get it wrong.
+        output.push_str("# HELP dns_answer_latency_seconds Time to build one answer\n");
+        output.push_str("# TYPE dns_answer_latency_seconds histogram\n");
+        for (bound, bucket) in LATENCY_BUCKETS_MS.iter().zip(self.latency_buckets.iter()) {
+            output.push_str(&format!(
+                "dns_answer_latency_seconds_bucket{{le=\"{}\"}} {}\n",
+                bound / 1000.0,
+                bucket.load(Ordering::Relaxed)
+            ));
+        }
+        let count = self.latency_count.load(Ordering::Relaxed);
+        output.push_str(&format!(
+            "dns_answer_latency_seconds_bucket{{le=\"+Inf\"}} {count}\n"
+        ));
+        output.push_str(&format!(
+            "dns_answer_latency_seconds_sum {}\n",
+            self.latency_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        ));
+        output.push_str(&format!("dns_answer_latency_seconds_count {count}\n"));
+
+        // The two per-zone gauges, which are the ones an operator asks for by
+        // name: "which version am I serving" and "when did this replica last
+        // hear from its master".
+        if let Ok(zones) = self.zones.read() {
+            output.push_str("# HELP dns_zone_serial SOA serial currently served\n");
+            output.push_str("# TYPE dns_zone_serial gauge\n");
+            for (zone, gauge) in zones.iter() {
+                output.push_str(&format!(
+                    "dns_zone_serial{{zone=\"{}\"}} {}\n",
+                    escape_label(zone),
+                    gauge.serial
+                ));
+            }
+
+            // A **timestamp**, not a "seconds since". Prometheus convention is to
+            // expose the instant and let the query do `time() - x`, because a
+            // duration computed here is already stale by the time it is scraped
+            // and goes on ageing in the dashboard's cache. The alert is
+            // `time() - dns_zone_last_refresh_timestamp_seconds > <expire>`.
+            //
+            // Zones with no transfer are **omitted rather than zeroed**: a
+            // primary is never transferred and a secondary that has not managed
+            // its first fetch has no answer, and `0` for either reads as 1970 and
+            // fires every staleness alert there is. An absent series is a
+            // question the query language can ask about (`absent()`); a wrong
+            // one is not.
+            output.push_str(
+                "# HELP dns_zone_last_refresh_timestamp_seconds \
+                 Unix time of the last successful transfer of a replicated zone\n",
+            );
+            output.push_str("# TYPE dns_zone_last_refresh_timestamp_seconds gauge\n");
+            for (zone, gauge) in zones.iter() {
+                if let Some(at) = gauge.last_transfer {
+                    output.push_str(&format!(
+                        "dns_zone_last_refresh_timestamp_seconds{{zone=\"{}\"}} {at}\n",
+                        escape_label(zone)
+                    ));
+                }
+            }
+        }
+
         output
     }
 
@@ -243,6 +489,36 @@ impl Default for DnsMetrics {
     }
 }
 
+/// Wall-clock timer for one query, in the units a latency histogram wants.
+///
+/// `Instant`, not the wall clock: this measures an interval rather than naming
+/// a moment, and the wall clock can step backwards (`CLAUDE.md` §6).
+pub struct LatencyTimer {
+    start: Instant,
+}
+
+impl LatencyTimer {
+    pub fn new() -> Self {
+        LatencyTimer {
+            start: Instant::now(),
+        }
+    }
+
+    pub fn elapsed_ms(&self) -> f64 {
+        self.start.elapsed().as_secs_f64() * 1000.0
+    }
+
+    pub fn elapsed_us(&self) -> f64 {
+        self.start.elapsed().as_secs_f64() * 1_000_000.0
+    }
+}
+
+impl Default for LatencyTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
     pub queries_received: u64,
@@ -258,6 +534,96 @@ pub struct MetricsSnapshot {
     pub rate_limited: u64,
     pub validation_errors: u64,
     pub queries_dropped: u64,
+}
+
+#[cfg(test)]
+mod zone_gauge_tests {
+    use super::*;
+
+    fn lines(metrics: &DnsMetrics, prefix: &str) -> Vec<String> {
+        metrics
+            .to_prometheus_format()
+            .lines()
+            .filter(|l| l.starts_with(prefix))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The two questions an operator asks of a server holding zones: which
+    /// version am I serving, and when did this replica last hear from its
+    /// master.
+    #[test]
+    fn a_zone_reports_its_serial_and_a_replica_its_last_contact() {
+        let metrics = DnsMetrics::new();
+        metrics.set_zone_serial("example.com.", 42);
+        metrics.set_zone_serial("replica.test.", 7);
+        metrics.note_zone_transfer("replica.test.", 1_700_000_000);
+
+        assert_eq!(
+            lines(&metrics, "dns_zone_serial{"),
+            [
+                "dns_zone_serial{zone=\"example.com.\"} 42",
+                "dns_zone_serial{zone=\"replica.test.\"} 7",
+            ]
+        );
+        // Only the replica has a refresh time. The primary is **omitted**, not
+        // zeroed: a zero would read as 1970 and fire every staleness alert.
+        assert_eq!(
+            lines(&metrics, "dns_zone_last_refresh_timestamp_seconds{"),
+            ["dns_zone_last_refresh_timestamp_seconds{zone=\"replica.test.\"} 1700000000"]
+        );
+    }
+
+    /// A withdrawn or removed zone stops being reported. A gauge frozen at its
+    /// last value shows a zone nobody serves as perfectly healthy, which is the
+    /// failure mode a staleness alert exists to catch and would miss.
+    #[test]
+    fn a_withdrawn_zone_disappears_rather_than_freezing() {
+        let metrics = DnsMetrics::new();
+        metrics.set_zone_serial("gone.test.", 1);
+        metrics.note_zone_transfer("gone.test.", 1_700_000_000);
+        assert_eq!(lines(&metrics, "dns_zone_serial{").len(), 1);
+
+        metrics.forget_zone("gone.test.");
+        assert!(lines(&metrics, "dns_zone_serial{").is_empty());
+        assert!(lines(&metrics, "dns_zone_last_refresh_timestamp_seconds{").is_empty());
+    }
+
+    /// A reload replaces the set, so zones dropped from the configuration go
+    /// with it — and the ones that stay keep what they had.
+    #[test]
+    fn a_reload_keeps_only_the_zones_it_installed() {
+        let metrics = DnsMetrics::new();
+        metrics.set_zone_serial("kept.test.", 5);
+        metrics.note_zone_transfer("kept.test.", 1_700_000_000);
+        metrics.set_zone_serial("dropped.test.", 9);
+
+        metrics.retain_zones(&["KEPT.test.".to_string()]);
+
+        assert_eq!(
+            lines(&metrics, "dns_zone_serial{"),
+            ["dns_zone_serial{zone=\"kept.test.\"} 5"],
+            "the comparison is case-insensitive, as every name comparison here is"
+        );
+        assert_eq!(
+            lines(&metrics, "dns_zone_last_refresh_timestamp_seconds{").len(),
+            1,
+            "and a kept zone keeps its refresh time"
+        );
+    }
+
+    /// A quote in a label value would end the label early and make **the rest of
+    /// the scrape** unparseable, not just this line. Zone names should not
+    /// contain one, but they come from a file an operator wrote.
+    #[test]
+    fn a_label_value_that_could_break_the_format_is_escaped() {
+        let metrics = DnsMetrics::new();
+        metrics.set_zone_serial("od\"d\\.test.", 1);
+        let rendered = lines(&metrics, "dns_zone_serial{");
+        assert_eq!(rendered, ["dns_zone_serial{zone=\"od\\\"d\\\\.test.\"} 1"]);
+        assert_eq!(escape_label("plain.test."), "plain.test.");
+        assert_eq!(escape_label("a\nb"), "a\\nb");
+    }
 }
 
 #[cfg(test)]

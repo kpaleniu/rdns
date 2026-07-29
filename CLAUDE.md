@@ -539,3 +539,51 @@ by the caller's actual limit, and each cost more than it looks.
   `serve` reached eight arguments — two `u32`s and two address-shaped things among
   them — which is one edit away from swapping the response budget for the query
   rate with nothing to catch it. Clippy says so at 7; it is right for a reason.
+- **A dependency that is only ever *configured* is not a feature, it is a
+  liability.** `init_telemetry` built two OTLP exporters into
+  `let _trace_exporter` / `let _metrics_exporter` and dropped them. Nothing
+  called it. For that, the workspace carried `opentelemetry`, `-otlp`, `_sdk`,
+  `tracing-opentelemetry`, `tracing` and `tracing-subscriber` — and through them
+  `tonic`, `prost`, `hyper` and `h2`, a gRPC *server*. Deleting the module took
+  `Cargo.lock` from **187 packages to 104**. Meanwhile the module that had the
+  counters worth paging on was referenced only by a benchmark. Count what a
+  dependency does *at run time*, not what it is for.
+- **Prefer the shape the operator already runs.** DNS shops scrape; an OTLP push
+  exporter was the wrong default before it was a broken one. The replacement is
+  ninety lines of HTTP over `tokio`'s `TcpListener`, because pulling a second
+  HTTP stack back in to answer one method on one path would be the same mistake
+  with better manners.
+- **A counter's name is a claim about what it counts.** `make_response` called
+  `increment_cache_hits` and `increment_cache_misses` on an *authoritative*
+  server, which has no cache — they were standing in for "found something" and
+  "did not". A dashboard built on that reports a cache hit rate for a thing with
+  no cache. Count what an operator pages on: REFUSED climbing means a zone went
+  missing, SERVFAIL climbing means one went wrong, NXDOMAIN is ordinary.
+- **Histograms in base units, with the buckets the system actually falls in.**
+  Prometheus convention is seconds, and a dashboard that has to know you chose
+  milliseconds is a dashboard that will get it wrong. An in-memory zone lookup is
+  tens of microseconds, so a histogram whose first bucket is 5 ms reports every
+  healthy server as identical.
+- **Expose an instant, not an elapsed time.** `time() - x` is the query
+  language's job. A "seconds since" computed at scrape time is already stale when
+  it arrives and goes on ageing in the dashboard's cache.
+- **A gauge must be able to say "no answer".** Zero is a value, and for a
+  timestamp it is 1970 — which fires every staleness alert there is. A zone we
+  are primary for has no last-transfer time and a secondary that has never
+  fetched has none either, so those series are *omitted*. `absent()` is a
+  question the query language can ask; a wrong number is not.
+- **A withdrawn thing must stop being reported, not freeze.** A serial gauge left
+  at its last value shows a zone nobody serves any more as perfectly healthy —
+  the exact condition a staleness alert exists to catch, hidden by the metric
+  meant to reveal it. Every path that stops serving something has to forget it;
+  in `rdnsd` there are two (the startup check and the runtime EXPIRE) and the
+  second was missed until an unused binding warned about it.
+- **Update a gauge where the fact changes, not where it is read.** Sampling live
+  state at scrape time puts the scrape behind whatever lock the state is under —
+  here a scrape behind a reload and a reload behind a scrape — and the value is
+  still only as fresh as the last scrape. Write it at the moment you already hold
+  the answer.
+- **Escape label values.** A stray `"` does not corrupt one line, it makes the
+  *rest of the scrape* unparseable. Zone names come from a file an operator
+  wrote, and RFC 1035 §5.1 allows escapes in one, so "should not contain a quote"
+  is not "cannot".

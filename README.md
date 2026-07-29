@@ -13,10 +13,11 @@ all the RFC nomenclature uses.
 - DNSSEC signing: key generation, an RRSIG per RRset, and an NSEC or NSEC3 chain,
   signed in memory as the zone loads
 - Multi-zone support via zone enumeration
-- Signal handling (SIGHUP) for zone reload without restart
-- OpenTelemetry integration for tracing and metrics
-- Rate limiting and request validation
-- Structured logging
+- Signal handling: SIGHUP reloads zones, SIGTERM/SIGINT stop gracefully —
+  in-flight zone transfers finish rather than being cut mid-stream
+- Prometheus metrics on `--metrics-listen`: RED counters, an answer-latency
+  histogram, per-zone serial and last-refresh gauges, and a liveness probe
+- Rate limiting (`--query-rate`) and request validation
 
 ## Local Development
 
@@ -243,9 +244,9 @@ rdnsd --host 127.0.0.1 --port 5353 --zone-file example.com.zone   --tsig-key hma
 - ✅ DNSKEY chain validation with DS chain verification
 - ✅ NSEC/NSEC3 proof-of-non-existence validation
 - ✅ Multi-zone support with automatic enumeration
-- ✅ Signal handling (SIGHUP) for zone reload
+- ✅ Signal handling: SIGHUP reload, SIGTERM/SIGINT graceful shutdown
 - ✅ CLI with configurable host/port defaults
-- ✅ OpenTelemetry integration for observability
+- ✅ Prometheus metrics endpoint (`--metrics-listen`)
 - ✅ 110+ unit tests with 100% pass rate
 
 Test Results: 110 tests passing
