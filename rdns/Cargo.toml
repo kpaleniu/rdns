@@ -19,3 +19,8 @@ sha2 = "0.10"
 
 tracing = "0.1"
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+# Allocation counting for `tests/allocations.rs`. A dev-dependency, so a normal
+# build of the library never sees it.
+dhat = "0.3"

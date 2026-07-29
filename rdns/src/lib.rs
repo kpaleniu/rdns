@@ -33,6 +33,7 @@ pub mod resolver;
 pub mod rfc5011;
 pub mod secondary;
 pub mod security;
+pub mod shutdown;
 pub mod special_names;
 pub mod telemetry;
 pub mod transfer;

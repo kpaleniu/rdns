@@ -19,6 +19,7 @@ use rdns::{
         TransferState,
     },
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
+    shutdown::{stop_signal, Busy, Lifecycle, Shutdown, Stop},
     telemetry::{instrumentation, DnsMetrics, LatencyTimer},
     transfer::axfr_messages,
     tsig::{self, TsigAlgorithm, TsigCheck, TsigKey, TsigKeyring, TsigSession},
@@ -54,6 +55,7 @@ const MAX_INFLIGHT_PER_CONNECTION: usize = 16;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
+use tokio::task::JoinSet;
 
 #[cfg(unix)]
 use signal_hook::consts::signal::SIGHUP;
@@ -786,6 +788,7 @@ async fn serve(
     policy: ServePolicy,
     secondaries: Secondaries,
     deltas: Arc<RwLock<DeltaLog>>,
+    shutdown: Shutdown,
 ) -> Result<()> {
     let ServePolicy {
         transfer_acl,
@@ -855,23 +858,94 @@ async fn serve(
         server.tsig_keys.len()
     );
 
-    let udp = tokio::spawn(udp_loop(socket, server.clone()));
-    let tcp = tokio::spawn(tcp_loop(listener, server));
+    // A `JoinSet` rather than two `JoinHandle`s in a `select!`. The old shape
+    // selected over the handles and **dropped the loser**, and dropping a
+    // `JoinHandle` detaches the task rather than cancelling it — so `main`
+    // returned while the other transport was still reading, and every reply
+    // still queued in a per-connection `mpsc` went nowhere. `join_next` is
+    // cancel-safe, so the same first-one-wins shape now leaves both tasks
+    // owned and joinable.
+    let mut loops = JoinSet::new();
+    loops.spawn(udp_loop(
+        socket,
+        server.clone(),
+        shutdown.stop_handle(),
+        shutdown.busy(),
+    ));
+    loops.spawn(tcp_loop(
+        listener,
+        server,
+        shutdown.stop_handle(),
+        shutdown.busy(),
+    ));
 
-    // Neither loop returns in normal operation. Whichever fails first takes the
-    // process down rather than leaving us serving one transport and not the other.
+    // Neither loop returns in normal operation. Whichever ends first ends the
+    // process — a server answering on one transport and not the other is worse
+    // than one that is plainly down — but it ends it *cooperatively* now.
+    let mut failure: Option<anyhow::Error> = None;
     tokio::select! {
-        r = udp => r??,
-        r = tcp => r??,
+        joined = loops.join_next() => {
+            failure = joined.and_then(listener_failure);
+        }
+        signal = stop_signal() => {
+            println!("{signal} received, shutting down");
+        }
     }
-    Ok(())
+
+    shutdown.begin();
+    // Both loops observe the stop and return promptly. Awaiting them is what
+    // makes "stopped accepting" true before the drain starts counting.
+    while let Some(joined) = loops.join_next().await {
+        if failure.is_none() {
+            failure = listener_failure(joined);
+        }
+    }
+
+    // Everything accepted before the stop is still running: a TCP connection
+    // mid-AXFR, a UDP answer being built, a NOTIFY waiting on a peer, a
+    // secondary part-way through writing a zone file. This is the wait for
+    // them, and a zone transfer cut mid-stream is exactly what it is for —
+    // a client cannot tell a truncated AXFR from a complete one.
+    shutdown.drain_reporting().await;
+
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// How a finished listener task is reported, in one place because `serve` reads
+/// it twice — once from the `select!` and once while joining the rest.
+///
+/// A cancelled task is not a failure: it is a task that was told to stop.
+fn listener_failure(
+    joined: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
+) -> Option<anyhow::Error> {
+    match joined {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(anyhow::Error::from(e).context("a listener stopped")),
+        Err(e) if e.is_cancelled() => None,
+        Err(e) => Some(anyhow!("a listener task panicked: {e}")),
+    }
 }
 
 /// Accept connections and serve each in its own task.
-async fn tcp_loop(listener: TcpListener, server: Arc<Server>) -> Result<(), std::io::Error> {
+async fn tcp_loop(
+    listener: TcpListener,
+    server: Arc<Server>,
+    stop: Stop,
+    busy: Busy,
+) -> Result<(), std::io::Error> {
     let permits = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
     loop {
-        let (stream, peer) = listener.accept().await?;
+        // Stop *accepting* on shutdown; the connections already open are drained
+        // by their own tasks below. `accept` is cancel-safe, so losing this race
+        // drops nothing — the connection simply stays in the kernel's backlog and
+        // the peer retries against whatever replaces us.
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = stop.wait() => return Ok(()),
+        };
         // Back-pressure on accept: at the ceiling we simply stop taking new
         // connections until one finishes, rather than spawning unboundedly.
         // The semaphore is never closed, so this only fails if we drop it.
@@ -879,9 +953,15 @@ async fn tcp_loop(listener: TcpListener, server: Arc<Server>) -> Result<(), std:
             continue;
         };
         let server = server.clone();
+        let stop = stop.clone();
+        // The connection claims the drain for as long as it runs, which is what
+        // keeps an in-flight AXFR from being cut mid-stream: a client cannot
+        // tell a truncated transfer from a complete one.
+        let busy = busy.clone();
         tokio::spawn(async move {
-            server.serve_connection(stream, peer).await;
+            server.serve_connection(stream, peer, stop).await;
             drop(permit);
+            drop(busy);
         });
     }
 }
@@ -893,7 +973,12 @@ impl Server {
     /// are answered **concurrently**: reading, answering and writing are three
     /// separate jobs, so one slow query cannot stall the queries behind it
     /// (§6.2.1.1).
-    async fn serve_connection(self: Arc<Self>, stream: TcpStream, peer: SocketAddr) {
+    ///
+    /// On shutdown it stops reading *new* queries and lets the ones already
+    /// accepted finish and reach the wire. That asymmetry is the whole point:
+    /// cutting a connection between queries costs the client a retry, and
+    /// cutting it mid-answer costs an AXFR client a zone it believes is complete.
+    async fn serve_connection(self: Arc<Self>, stream: TcpStream, peer: SocketAddr, stop: Stop) {
         let (mut reader, mut writer) = stream.into_split();
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_INFLIGHT_PER_CONNECTION);
 
@@ -920,8 +1005,19 @@ impl Server {
             //
             // Between messages the peer may legitimately be idle, so a timeout
             // here (like EOF) is an ordinary end to a connection, not an error.
+            //
+            // A shutdown between messages ends the connection here, which is the
+            // cheapest moment for it: the peer has committed to nothing, so it
+            // costs one reconnect and no answer. `read_exact` is not cancel-safe
+            // in general — it can consume bytes before being dropped — but the
+            // only thing we lose here is a length prefix on a connection we are
+            // closing anyway.
             let mut len_buf = [0u8; 2];
-            match tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut len_buf)).await {
+            let read = tokio::select! {
+                r = tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut len_buf)) => r,
+                _ = stop.wait() => break,
+            };
+            match read {
                 Ok(Ok(_)) => {}
                 _ => break,
             }
@@ -1417,11 +1513,22 @@ fn absolute_name(name: &str) -> String {
 }
 
 /// Receive datagrams and answer each in its own task.
-async fn udp_loop(socket: Arc<UdpSocket>, server: Arc<Server>) -> Result<(), std::io::Error> {
+async fn udp_loop(
+    socket: Arc<UdpSocket>,
+    server: Arc<Server>,
+    stop: Stop,
+    busy: Busy,
+) -> Result<(), std::io::Error> {
     let mut buf = vec![0; UDP_RECEIVE_BUFFER];
 
     loop {
-        let (size, peer) = match socket.recv_from(&mut buf).await {
+        // `recv_from` is cancel-safe, so a datagram is either fully received or
+        // not received at all — losing this race drops nothing that was ours.
+        let received = tokio::select! {
+            r = socket.recv_from(&mut buf) => r,
+            _ = stop.wait() => return Ok(()),
+        };
+        let (size, peer) = match received {
             Ok(received) => received,
             Err(e) if recv_error_is_transient(&e) => continue,
             Err(e) => return Err(e),
@@ -1429,8 +1536,13 @@ async fn udp_loop(socket: Arc<UdpSocket>, server: Arc<Server>) -> Result<(), std
         let socket = socket.clone();
         let server = server.clone();
         let packet = buf[0..size].to_vec();
+        // Claims the drain until this answer is on the wire. A datagram is small
+        // and this is quick, which is exactly why it is worth waiting for rather
+        // than dropping an answer the client is already waiting on.
+        let busy = busy.clone();
 
         tokio::spawn(async move {
+            let _busy = busy;
             // Named for the body below, which was written against separate Arcs
             // when this loop owned its own copy of everything.
             let Server {
@@ -1669,6 +1781,11 @@ impl Reloading {
 }
 
 /// Spawn a signal handler task to reload zones on SIGHUP (Unix only)
+///
+/// It holds a [`Busy`] and exits on [`Stop`], in that order of importance: a
+/// reload part-way through installing zones is work the drain should wait for,
+/// and a task that never exits while holding a `Busy` would spend the whole
+/// drain budget every single shutdown.
 #[cfg(unix)]
 fn spawn_signal_handler(
     zone_map: Arc<RwLock<HashMap<String, Zone>>>,
@@ -1677,13 +1794,26 @@ fn spawn_signal_handler(
     notify_targets: Vec<SocketAddr>,
     announced: Vec<(String, u32)>,
     reloading: Reloading,
+    lifecycle: Lifecycle,
 ) {
+    let Lifecycle { stop, busy } = lifecycle;
     let zone_map_clone = Arc::clone(&zone_map);
     let source_clone = source.clone();
     tokio::spawn(async move {
+        let _busy = busy;
         let mut announced = announced;
         if let Ok(mut signals) = Signals::new(&[SIGHUP]) {
-            while signals.next().await.is_some() {
+            loop {
+                // A SIGHUP that arrives during shutdown is ignored: reloading
+                // zones we are about to stop serving is work for nobody.
+                tokio::select! {
+                    next = signals.next() => {
+                        if next.is_none() {
+                            break;
+                        }
+                    }
+                    _ = stop.wait() => break,
+                }
                 match reloading.load(&source_clone).await {
                     Ok(new_zones) => {
                         // A reload is a version step like any other: the
@@ -1700,7 +1830,8 @@ fn spawn_signal_handler(
                         // The point of reloading is that something changed, so
                         // this is exactly when a secondary wants to hear about it.
                         announced =
-                            announce_zones(&zone_map_clone, &announced, &notify_targets).await;
+                            announce_zones(&zone_map_clone, &announced, &notify_targets, &_busy)
+                                .await;
                     }
                     Err(e) => {
                         // The zones already loaded keep answering. A reload
@@ -1724,6 +1855,7 @@ fn spawn_signal_handler(
     _notify_targets: Vec<SocketAddr>,
     _announced: Vec<(String, u32)>,
     _reloading: Reloading,
+    _lifecycle: Lifecycle,
 ) {
     // Signal handling not supported on this platform, so a zone change is only
     // announced at startup here.
@@ -1767,6 +1899,7 @@ async fn announce_zones(
     zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
     announced: &[(String, u32)],
     targets: &[SocketAddr],
+    busy: &Busy,
 ) -> Vec<(String, u32)> {
     let (current, pending) = {
         let zones = zone_map.read().await;
@@ -1795,7 +1928,12 @@ async fn announce_zones(
             let target = *target;
             let zone = zone.clone();
             let soa = soa.clone();
+            // Fire-and-forget, but not unaccounted-for: a NOTIFY dropped at
+            // shutdown is a secondary that waits out a whole REFRESH before it
+            // learns of a change we already knew about, so the drain covers it.
+            let busy = busy.clone();
             tokio::spawn(async move {
+                let _busy = busy;
                 send_notify(&zone, serial, soa, target).await;
             });
         }
@@ -1815,10 +1953,21 @@ async fn announce_zones(
 /// Spawned rather than awaited for the same reason the primary's announcements
 /// are: an unanswered NOTIFY takes seconds to give up on, and a refresh should
 /// not be held behind the network to tell somebody about work it has finished.
-fn announce_transfer(zone: &str, serial: u32, soa: Option<ResourceRecord>, targets: &[SocketAddr]) {
+fn announce_transfer(
+    zone: &str,
+    serial: u32,
+    soa: Option<ResourceRecord>,
+    targets: &[SocketAddr],
+    busy: &Busy,
+) {
     for target in targets {
         let (zone, soa, target) = (zone.to_string(), soa.clone(), *target);
+        // Accounted for by the drain, like the primary's announcements: a NOTIFY
+        // dropped at shutdown costs the level below us a whole REFRESH before it
+        // learns of a change that has already reached us.
+        let busy = busy.clone();
         tokio::spawn(async move {
+            let _busy = busy;
             send_notify(&zone, serial, soa, target).await;
         });
     }
@@ -1996,7 +2145,9 @@ fn spawn_secondaries(
     specs: Vec<MasterSpec>,
     keys: &TsigKeyring,
     replication: Replication,
+    lifecycle: Lifecycle,
 ) -> Result<Secondaries> {
+    let Lifecycle { stop, busy } = lifecycle;
     let mut registry: HashMap<String, ReplicatedZone> = HashMap::new();
 
     for spec in specs {
@@ -2043,7 +2194,16 @@ fn spawn_secondaries(
             }
         );
 
-        tokio::spawn(secondary_loop(spec, key, replication.clone(), wake));
+        tokio::spawn(secondary_loop(
+            spec,
+            key,
+            replication.clone(),
+            wake,
+            Lifecycle {
+                stop: stop.clone(),
+                busy: busy.clone(),
+            },
+        ));
     }
 
     Ok(Arc::new(registry))
@@ -2055,12 +2215,22 @@ fn spawn_secondaries(
 /// behind, then sleep on REFRESH — or on RETRY if anything failed, with a NOTIFY
 /// cutting the wait short. What makes it a *replica* rather than a cache is the
 /// third timer: out of contact past EXPIRE, the zone stops being served at all.
+/// On shutdown it stops between refreshes, and holds a [`Busy`] only across a
+/// refresh — never across the sleep, which is where it spends almost all of its
+/// life and would otherwise burn the whole drain budget doing nothing.
+///
+/// Holding it across the refresh is the point: `refresh_once` writes the zone
+/// file, and `persist` cleans up its `.zone.tmpNNN` sibling on *error* and not
+/// on being killed. Finishing the write is what stops a stopped server from
+/// leaving temporary files behind.
 async fn secondary_loop(
     spec: MasterSpec,
     key: Option<TsigKey>,
     replication: Replication,
     wake: Arc<Notify>,
+    lifecycle: Lifecycle,
 ) {
+    let Lifecycle { stop, busy } = lifecycle;
     // What the EXPIRE clock counts from when we have never reached the master:
     // process start. Not "forever ago", which would withdraw a zone we hold
     // before ever trying, and not "never expires", which would serve a copy of
@@ -2068,7 +2238,13 @@ async fn secondary_loop(
     let started_at = current_unix_timestamp();
 
     loop {
-        let result = refresh_once(&spec, key.as_ref(), &replication).await;
+        if stop.is_set() {
+            return;
+        }
+        let result = {
+            let _busy = busy.clone();
+            refresh_once(&spec, key.as_ref(), &replication, &busy).await
+        };
 
         // The timers are read *after* the refresh, not before, because the
         // refresh may have just installed the zone that defines them. Read first,
@@ -2091,9 +2267,12 @@ async fn secondary_loop(
             }
         };
 
+        // No `Busy` is held across this, deliberately: a refresh timer is hours
+        // long and the drain must not wait on one.
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             _ = wake.notified() => {}
+            _ = stop.wait() => return,
         }
     }
 }
@@ -2115,6 +2294,7 @@ async fn refresh_once(
     spec: &MasterSpec,
     key: Option<&TsigKey>,
     replication: &Replication,
+    busy: &Busy,
 ) -> Result<String> {
     let Replication {
         zone_map,
@@ -2211,7 +2391,7 @@ async fn refresh_once(
 
     // We are this zone's master to whoever replicates it from us, and the serial
     // just moved forward — which is the whole of what a NOTIFY says.
-    announce_transfer(&spec.zone, serial, soa, notify_targets);
+    announce_transfer(&spec.zone, serial, soa, notify_targets, busy);
 
     Ok(match held {
         Some(held) => format!("transferred serial {held} -> {serial}, {count} records{note}"),
@@ -2369,8 +2549,24 @@ fn rand_id() -> u16 {
     (nanos ^ (nanos >> 16)) as u16
 }
 
+/// DHAT's allocator shim, only under `--features dhat-heap`.
+///
+/// It records a backtrace per allocation, which dominates everything — so a
+/// build with this on answers *how many* and *how big* and says nothing useful
+/// about *how fast*. Never read a timing number from one.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Held to the end of `main`, because the profiler writes `dhat-heap.json`
+    // on `Drop` — a daemon that never returns from `main` never writes one at
+    // all, which is why this item waited on graceful shutdown. Binding it in
+    // `serve` instead would drop it before the drain and report short.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     let cli = Cli::parse();
 
     // Key generation is a mode, not a server option: nothing is served, and it
@@ -2384,6 +2580,13 @@ async fn main() -> Result<()> {
     }
 
     validate_cli_args(&cli.host, cli.port)?;
+
+    // Created here rather than in `serve`, because the things that need to be
+    // drained start before the listeners do: the startup NOTIFY burst, and every
+    // secondary's refresh task. A `Shutdown` created at the point the sockets
+    // bind would leave both of those outside the only mechanism that waits for
+    // them.
+    let shutdown = Shutdown::new();
     // A typo in either list stops the server rather than quietly narrowing it —
     // or, worse, being read as something wider.
     let transfer_acl = TransferAcl::parse(&cli.allow_transfer)?;
@@ -2446,12 +2649,17 @@ async fn main() -> Result<()> {
             zone_dir,
             notify_targets: notify_targets.clone(),
         };
-        spawn_secondaries(secondary_specs, &tsig_keys, replication)?
+        spawn_secondaries(
+            secondary_specs,
+            &tsig_keys,
+            replication,
+            shutdown.lifecycle(),
+        )?
     };
 
     // A zone that has just been loaded is news to every secondary, which is why
     // this runs at startup and not only on reload.
-    let announced = announce_zones(&zone_map, &[], &notify_targets).await;
+    let announced = announce_zones(&zone_map, &[], &notify_targets, &shutdown.busy()).await;
 
     // Zone reload on SIGHUP, where signals exist.
     spawn_signal_handler(
@@ -2468,6 +2676,7 @@ async fn main() -> Result<()> {
             signing,
             validator,
         },
+        shutdown.lifecycle(),
     );
 
     serve(
@@ -2481,6 +2690,7 @@ async fn main() -> Result<()> {
         },
         secondaries,
         deltas,
+        shutdown,
     )
     .await
 }
@@ -3066,6 +3276,231 @@ mod tests {
         );
     }
 
+    /// A `Shutdown` that is never triggered and never dropped, for tests that
+    /// need the handles but not the behaviour.
+    ///
+    /// Leaked on purpose. Dropping the `Shutdown` closes the `watch` channel,
+    /// which makes every `Stop::wait` resolve *immediately* — so a test holding
+    /// only a `Stop` would find its connections closing the moment they opened,
+    /// and would be testing shutdown rather than whatever it meant to test.
+    fn test_shutdown() -> &'static Shutdown {
+        use std::sync::OnceLock;
+        static SHUTDOWN: OnceLock<Shutdown> = OnceLock::new();
+        SHUTDOWN.get_or_init(Shutdown::new)
+    }
+
+    // -----------------------------------------------------------------------
+    // Graceful shutdown
+    // -----------------------------------------------------------------------
+
+    mod shutdown {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        /// A zone big enough that its AXFR spans many messages, so a transfer is
+        /// reliably still in flight when the stop arrives. One message would make
+        /// this test pass for the wrong reason.
+        fn big_zone() -> Zone {
+            let mut text = String::from(
+                "$ORIGIN example.com.\n\
+                 $TTL 3600\n\
+                 @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @   IN NS  ns1.example.com.\n\
+                 ns1 IN A   192.0.2.1\n",
+            );
+            for i in 0..4000 {
+                text.push_str(&format!(
+                    "host{i} IN A 10.{}.{}.{}\n",
+                    (i >> 16) & 255,
+                    (i >> 8) & 255,
+                    i & 255
+                ));
+            }
+            rdns::zone::parse_zone_file(&text, "example.com.").expect("the big zone parses")
+        }
+
+        fn server_with(zone: Zone) -> Arc<Server> {
+            let mut zones = HashMap::new();
+            zones.insert(zone.origin().to_string(), zone);
+            Arc::new(Server {
+                zone_map: Arc::new(RwLock::new(zones)),
+                rate_limiter: Arc::new(RateLimiter::with_defaults()),
+                validator: Arc::new(RequestValidator::with_defaults()),
+                logger: Arc::new(QueryLogger::new()),
+                metrics: Arc::new(DnsMetrics::new()),
+                transfer_acl: Arc::new(
+                    TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl"),
+                ),
+                tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
+                response_limiter: Arc::new(ResponseLimiter::disabled()),
+                secondaries: Arc::new(HashMap::new()),
+                deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            })
+        }
+
+        /// Read one length-prefixed message.
+        async fn read_message(stream: &mut TcpStream) -> Option<DnsMessage> {
+            let mut len = [0u8; 2];
+            stream.read_exact(&mut len).await.ok()?;
+            let mut body = vec![0u8; u16::from_be_bytes(len) as usize];
+            stream.read_exact(&mut body).await.ok()?;
+            DnsMessage::try_from_bytes(&body).ok()
+        }
+
+        async fn send_axfr_request(stream: &mut TcpStream) {
+            let msg = query("example.com.", record_types::AXFR, false);
+            let bytes = msg.to_bytes_within(u16::MAX as usize).expect("serialize");
+            let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+            framed.extend_from_slice(&bytes);
+            stream.write_all(&framed).await.expect("send the request");
+        }
+
+        /// The harm the whole item is about: `systemctl stop` used to cut an
+        /// in-flight AXFR mid-stream, and **the client cannot tell a truncated
+        /// transfer from a complete one** — it sees records, then silence, and a
+        /// secondary that believes it holds a zone it holds half of.
+        ///
+        /// Drives the real `tcp_loop` and the real `serve_connection`, and stops
+        /// the server after the first message of a multi-message transfer has
+        /// arrived — so the stop is unambiguously mid-transfer.
+        #[tokio::test]
+        async fn a_transfer_in_flight_survives_the_stop() {
+            let shutdown = Shutdown::new();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let loop_handle = tokio::spawn(tcp_loop(
+                listener,
+                server_with(big_zone()),
+                shutdown.stop_handle(),
+                shutdown.busy(),
+            ));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            send_axfr_request(&mut stream).await;
+
+            // One message in: the transfer has begun and is not finished.
+            let first = read_message(&mut stream).await.expect("the first message");
+            assert!(!first.answers.is_empty());
+
+            shutdown.begin();
+
+            // Everything else must still arrive, ending with the closing SOA
+            // that RFC 5936 §2.2 uses to bracket a transfer — which is exactly
+            // the thing a cut connection withholds.
+            let mut records = first.answers.len();
+            let mut messages = 1;
+            while let Some(msg) = read_message(&mut stream).await {
+                records += msg.answers.len();
+                messages += 1;
+                let closed = msg
+                    .answers
+                    .last()
+                    .is_some_and(|rr| rr.rdata.rtype == record_types::SOA);
+                if closed {
+                    break;
+                }
+            }
+            assert!(
+                messages > 1,
+                "the zone must not fit in one message or this proves nothing"
+            );
+            // 4000 hosts + SOA + NS + ns1 + the closing SOA.
+            assert_eq!(
+                records, 4004,
+                "the transfer arrived short after {messages} messages"
+            );
+
+            // And the loop stopped accepting, so the drain can complete.
+            let _ = tokio::time::timeout(Duration::from_secs(5), loop_handle)
+                .await
+                .expect("the accept loop must return on stop");
+            assert!(
+                shutdown.drain(Duration::from_secs(5)).await,
+                "the drain must complete once the transfer is done"
+            );
+        }
+
+        /// The other half: once stopped, nothing new is taken on. A connection
+        /// opened after the signal gets no answer — the loop has returned, so the
+        /// kernel's backlog holds the socket and the peer's retry goes to whatever
+        /// replaces us.
+        #[tokio::test]
+        async fn nothing_new_is_accepted_after_the_stop() {
+            let shutdown = Shutdown::new();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let loop_handle = tokio::spawn(tcp_loop(
+                listener,
+                server_with(big_zone()),
+                shutdown.stop_handle(),
+                shutdown.busy(),
+            ));
+
+            shutdown.begin();
+            let _ = tokio::time::timeout(Duration::from_secs(5), loop_handle)
+                .await
+                .expect("the accept loop must return on stop");
+
+            // The listener is dropped with the loop, so this either fails to
+            // connect or connects and is never answered. Both are "not served";
+            // what must not happen is a reply.
+            if let Ok(Ok(mut stream)) =
+                tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr)).await
+            {
+                send_axfr_request(&mut stream).await;
+                let answered =
+                    tokio::time::timeout(Duration::from_secs(1), read_message(&mut stream)).await;
+                assert!(
+                    !matches!(answered, Ok(Some(_))),
+                    "a stopped server answered a query it accepted after stopping"
+                );
+            }
+
+            assert!(shutdown.drain(Duration::from_secs(5)).await);
+        }
+
+        /// A connection sitting idle between queries closes on the stop rather
+        /// than holding the drain for its full idle timeout. This is the case
+        /// that decides whether a shutdown takes milliseconds or the whole
+        /// budget, since a resolver keeps connections open by design (RFC 7766
+        /// §6.2.3) and most of them are idle at any moment.
+        #[tokio::test]
+        async fn an_idle_connection_does_not_hold_the_drain() {
+            let shutdown = Shutdown::new();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(tcp_loop(
+                listener,
+                server_with(big_zone()),
+                shutdown.stop_handle(),
+                shutdown.busy(),
+            ));
+
+            // Connect, ask one question, read the answer, then go quiet — which
+            // is what a pooled connection does for most of its life.
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            let msg = query("example.com.", record_types::SOA, false);
+            let bytes = msg.to_bytes_within(u16::MAX as usize).expect("serialize");
+            let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+            framed.extend_from_slice(&bytes);
+            stream.write_all(&framed).await.expect("send");
+            read_message(&mut stream).await.expect("answer");
+
+            shutdown.begin();
+
+            // TCP_IDLE_TIMEOUT is ten seconds; this budget is well under it, so
+            // passing means the connection observed the stop rather than timing
+            // out. Keep the client end alive so nothing else can close it.
+            let drained = shutdown.drain(Duration::from_secs(3)).await;
+            drop(stream);
+            assert!(
+                drained,
+                "an idle connection held the drain for its idle timeout"
+            );
+        }
+    }
+
     /// A primary on a loopback port, answering with `rdnsd`'s own AXFR path.
     ///
     /// Deliberately the real thing rather than a stub: `Server::serve_connection`
@@ -3114,7 +3549,11 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             while let Ok((stream, peer)) = listener.accept().await {
-                tokio::spawn(server.clone().serve_connection(stream, peer));
+                tokio::spawn(server.clone().serve_connection(
+                    stream,
+                    peer,
+                    test_shutdown().stop_handle(),
+                ));
             }
         });
         addr
@@ -3174,7 +3613,9 @@ mod tests {
         };
         let r = replication(&dir, Vec::new());
 
-        let outcome = refresh_once(&spec, None, &r).await.expect("refresh");
+        let outcome = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("refresh");
         assert!(outcome.contains("transferred serial 7"), "got: {outcome}");
 
         // Served from memory...
@@ -3216,8 +3657,12 @@ mod tests {
         };
         let r = replication(&dir, Vec::new());
 
-        refresh_once(&spec, None, &r).await.expect("first refresh");
-        let second = refresh_once(&spec, None, &r).await.expect("second refresh");
+        refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("first refresh");
+        let second = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("second refresh");
 
         assert!(second.contains("current"), "got: {second}");
         assert_eq!(
@@ -3248,6 +3693,7 @@ mod tests {
             },
             None,
             &r,
+            &test_shutdown().busy(),
         )
         .await
         .expect("first");
@@ -3269,6 +3715,7 @@ mod tests {
             },
             None,
             &r,
+            &test_shutdown().busy(),
         )
         .await
         .expect("second");
@@ -3399,13 +3846,13 @@ mod tests {
             master,
             key_name: None,
         };
-        refresh_once(&spec(first), None, &r)
+        refresh_once(&spec(first), None, &r, &test_shutdown().busy())
             .await
             .expect("initial transfer");
 
         // Now a master that knows how to get from 7 to 8.
         let master = spawn_primary_with_history(&old_text, new_text).await;
-        let outcome = refresh_once(&spec(master), None, &r)
+        let outcome = refresh_once(&spec(master), None, &r, &test_shutdown().busy())
             .await
             .expect("incremental refresh");
         assert!(
@@ -3477,7 +3924,9 @@ mod tests {
             key_name: None,
         };
 
-        refresh_once(&spec, None, &r).await.expect("transfer");
+        refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("transfer");
 
         let mut buf = vec![0u8; 4096];
         let (n, _from) =
@@ -3520,14 +3969,18 @@ mod tests {
         };
 
         // The first transfer announces; drain it.
-        refresh_once(&spec, None, &r).await.expect("transfer");
+        refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("transfer");
         let mut buf = vec![0u8; 4096];
         let _ = tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
             .await
             .expect("the first NOTIFY");
 
         // The second finds the same serial and must say nothing.
-        let outcome = refresh_once(&spec, None, &r).await.expect("second refresh");
+        let outcome = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("second refresh");
         assert!(outcome.contains("current"), "got: {outcome}");
         assert!(
             tokio::time::timeout(Duration::from_millis(500), downstream.recv_from(&mut buf))
@@ -3552,7 +4005,7 @@ mod tests {
         };
 
         let first = spawn_primary(&zone_text(7)).await;
-        refresh_once(&spec(first), None, &r)
+        refresh_once(&spec(first), None, &r, &test_shutdown().busy())
             .await
             .expect("first transfer");
         assert_eq!(
@@ -3569,7 +4022,7 @@ mod tests {
              www  IN A   192.0.2.250\n",
         )
         .await;
-        refresh_once(&spec(second), None, &r)
+        refresh_once(&spec(second), None, &r, &test_shutdown().busy())
             .await
             .expect("second transfer");
 
@@ -3641,7 +4094,9 @@ mod tests {
         let r = replication(&dir, Vec::new());
 
         // The AXFR our own client makes is refused, which is the baseline.
-        let err = refresh_once(&spec, None, &r).await.unwrap_err();
+        let err = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("Refused"), "got: {err}");
 
         // And so is an IXFR, over the same connection path.

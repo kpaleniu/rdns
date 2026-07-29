@@ -669,9 +669,16 @@ fn find_tsig(packet: &[u8]) -> Option<(usize, &[u8], String)> {
     if packet.len() < 12 {
         return None;
     }
-    let counts: Vec<usize> = (0..4)
-        .map(|i| u16::from_be_bytes([packet[4 + i * 2], packet[5 + i * 2]]) as usize)
-        .collect();
+    // An array, not a `Vec`. This was `(0..4).map(..).collect::<Vec<usize>>()`,
+    // which heap-allocates on **every packet the server receives** — before the
+    // `ar == 0` check below, so it happened even for the overwhelming majority
+    // of queries that carry no additional section and for every server with no
+    // TSIG keys configured at all. Found by the DHAT profile (#9e): one block
+    // per query, 32 bytes, for four `usize`s whose count is known at compile
+    // time.
+    let counts: [usize; 4] = std::array::from_fn(|i| {
+        u16::from_be_bytes([packet[4 + i * 2], packet[5 + i * 2]]) as usize
+    });
     let (qd, an, ns, ar) = (counts[0], counts[1], counts[2], counts[3]);
     if ar == 0 {
         return None;

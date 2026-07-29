@@ -14,7 +14,7 @@ where to look rather than here.
 
 ---
 
-## Current state (last updated 2026-07-28)
+## Current state (last updated 2026-07-29)
 
 **Workspace** — four members, all on branch `master`:
 
@@ -26,15 +26,18 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **588 lib + 68 `rdnsd` + 2 `rdnsr`** tests passing
-(`rdnsd`'s own 68 cover argument validation, zone sources and the load policy,
+`cargo test --workspace` = **593 lib + 6 allocation + 71 `rdnsd` + 2 `rdnsr`**
+tests passing
+(`rdnsd`'s own 71 cover argument validation, zone sources and the load policy,
 the secondary role and EXPIRE across reloads, both directions of IXFR and onward
 announcement, answering a DO-bit query from a zone it signed itself, all four
-cases of RFC 1034 §4.3.2, and the class and ANY handling from #9f; `rdnsr` had
+cases of RFC 1034 §4.3.2, the class and ANY handling from #9f, and a stop
+signal arriving mid-AXFR; `rdnsr` had
 **no test module at all** until #9c gave it one), `cargo clippy --workspace
 --all-targets` **clean, no exceptions**, `cargo fmt --all --check` clean. The lib
 count fell from 578 to 567 when dead `serialization.rs` was deleted with its 11
-tests, and is back up at 588 with #9e's and #9f's regression tests.
+tests, and is back up at 593 with #9e's, #9f's and graceful shutdown's
+regression tests.
 
 **Errors are typed in the library and `anyhow` in the binaries (2026-07-28).**
 The convention used to run the other way round — `rdns` returned `anyhow::Error`,
@@ -79,16 +82,23 @@ against. On the performance side the `log_query` quadratic is gone (3.09M ops/se
 where it managed 47k, and `bench_logger_throughput`'s floor is back up at 100k),
 responses no longer carry a 64 KB buffer into `send_to`, cache eviction is linear
 rather than O(n²), and name compression stores one copy of a name instead of one
-per suffix. What is left under #9 is **mostly operability (9d)**: metrics, graceful
-shutdown, a config file, a control channel, CI. Four items remain under 9e, led by
-the DHAT profiling pass that turns the rest from a list of claims into a
-measurement.
+per suffix. What is left under #9 is **mostly operability (9d)**: metrics, a config
+file, a control channel, CI. Three items remain under 9e — the DHAT pass that was
+leading them is done, and its numbers are what the rest get judged against now,
+including one finding it turned up that nobody had guessed: the `tokio::spawn`
+per UDP datagram costs **1,536 bytes**, which is 46% of everything a query
+allocates.
 
-**One 9d item is closed with them**, because it was the most operationally severe
-thing on the list: the query rate limiter was hardcoded at ~10 q/s per source and
-dropped over it in silence. It has flags now, a default a hundred times higher,
-and an exemption list — measured live at 60 answers to a 60-query burst where the
-finding recorded 20.
+**Two 9d items are closed with them.** The query rate limiter was hardcoded at
+~10 q/s per source and dropped over it in silence — it has flags now, a default a
+hundred times higher, and an exemption list, measured live at 60 answers to a
+60-query burst where the finding recorded 20. And **both daemons stop
+gracefully (2026-07-29)**: there was no SIGTERM handler of any kind, so
+`systemctl stop` cut an in-flight AXFR mid-stream and the client could not tell a
+truncated transfer from a complete one. `rdns::shutdown` is shared by both,
+because both had the same hole and the same detached-`JoinHandle` bug underneath
+it. That also unblocks 9e's DHAT item, which needs a process that returns from
+`main` in order to write its report at all.
 
 **One fix in #9c was a fix to a previous fix.** Closing "an unreadable zone
 directory silently unloads every zone" (2026-07-27) also broke a secondary's
@@ -210,6 +220,22 @@ cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
 # Tell a secondary at once when a zone changes, and cap UDP response bytes/s.
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --also-notify 127.0.0.1:15354 --response-rate 4096
+
+# Heap-profile the daemon. Writes dhat-heap.json on exit, which is why it needs
+# the graceful stop above — the report is written on Drop. Counts and sizes
+# only: it records a backtrace per allocation, so never read a timing from it.
+cargo run --release -p rdnsd --features dhat-heap -- --port 15353 --zone-file example.com.zone
+
+# The same numbers as assertions, in their own test binary so the global
+# allocator does not slow the other 593 unit tests.
+cargo test -p rdns --test allocations -- --nocapture
+
+# Both daemons stop gracefully: SIGTERM or SIGINT on Unix, Ctrl-C/Ctrl-Break/
+# console-close/shutdown on Windows. They stop accepting, let the work already
+# accepted finish (5s budget), print "drained cleanly", and exit 0 — so an
+# in-flight AXFR is not cut, and a client cannot be handed half a zone it
+# believes is whole. An idle server stops in about 2ms.
+kill -TERM $(pgrep rdnsd)
 
 # Queries per second per source address, its burst, and who is exempt. The
 # default is 1000/200; 0 turns the limit off. Rate-limited queries are dropped
@@ -382,7 +408,7 @@ under "Closed work" further down.
 
 | # | what | open |
 |---|------|------|
-| **9** | what the five-way code review turned up | **18** — 9a, 9b, 9c and **9f** are closed, and 9e is down to four; what is left is mostly operability |
+| **9** | what the five-way code review turned up | **16** — 9a, 9b, 9c and **9f** are closed, 9e is down to three; what is left is mostly operability |
 | **8** | what signing turned up | **2** — both about re-signing a running server |
 | **7** | the secondary role | **1**, and conditional |
 | **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
@@ -974,7 +1000,58 @@ here degrades quietly with the process healthy and nothing alerting.
       daemon for an exporter that never initialises. Either finish the export
       (a coordinated bump of all four OTel crates plus `tracing-opentelemetry`,
       no incremental path) or delete five dependencies.
-- [ ] **No SIGTERM handling anywhere** (grep for `SIGTERM`/`SIGINT`/`ctrl_c`
+- [x] **No SIGTERM handling anywhere** — **done 2026-07-29**, in both daemons.
+      `rdns::shutdown` is the new module: `Stop` is the signal, `Busy` is a claim
+      on the drain, and they are deliberately **two types**. A single one would
+      mean the accept loops — which hold the signal for the life of the process —
+      also held the drain open, so every shutdown would wait out its full budget
+      and the feature would look like it worked while doing nothing.
+
+      The drain is an `mpsc` nobody sends on: `recv()` returns `None` exactly
+      when the last `Busy` is dropped. No counter to get wrong and no polling.
+      Both accept loops stop accepting and return; a TCP connection stops reading
+      *new* queries but finishes the ones in flight; the NOTIFY tasks, the SIGHUP
+      handler, each secondary's refresh and `rdnsr`'s RFC 5011 anchor manager all
+      hold a `Busy` across their work and none across their sleep — a refresh
+      timer is hours long, and holding the claim there would spend the whole
+      budget every time.
+
+      **`serve`'s `select!` over two `JoinHandle`s is a `JoinSet` now.** Dropping
+      a `JoinHandle` detaches rather than cancels, so the old shape returned from
+      `main` with the other transport still reading. Both binaries had that bug,
+      written twice, which is why the module is in `rdns` and not copied
+      (`CLAUDE.md` §7).
+
+      **Testing it is what found the second bug, and it is the interesting one.**
+      The first version used `tokio::signal::ctrl_c()` on Windows and a comment
+      claiming that covers a console close too. It does not: `ctrl_c` registers
+      for `CTRL_C_EVENT` and nothing else, so a real `CTRL_BREAK_EVENT` sent
+      mid-AXFR went to the default handler and killed the process with exit code
+      `0xC000013A`, cutting the transfer exactly as before. That is `CLAUDE.md`
+      §4's "never state what a function you are calling does without opening it",
+      broken in the same commit that added the feature. `ctrl_break`,
+      `ctrl_close` and `ctrl_shutdown` are separate listeners and are all
+      selected on now. Note `CTRL_CLOSE_EVENT` gives about five seconds before
+      Windows terminates regardless, which is the same order as the drain budget.
+
+      **Verified live on both**, by sending a real console control event to a
+      server mid-transfer of a 20,000-record zone: before, `ConnectionResetError`
+      and exit `0xC000013A`; after, all 20,002 names delivered, `drained
+      cleanly`, exit 0, in 0.29 s. An idle stop takes 2 ms rather than the
+      5 s budget, on both daemons. Three regression tests drive the real
+      `tcp_loop` and `serve_connection`, and each half of the fix was reverted
+      separately to watch them fail: without the accept-side stop all three fail,
+      without the per-connection stop the transfer still completes but the drain
+      never does.
+
+      **One part of the finding is not addressed**: `write_zone_file`'s
+      `.zone.tmpNNN` sibling is now *unlikely* rather than impossible. The
+      secondary holds a `Busy` across `refresh_once`, so an ordinary stop lets
+      the write finish — but a write still in progress when the budget runs out,
+      or a SIGKILL, still leaves one. Cleaning up strays belongs with `persist`,
+      not here. Original finding follows.
+
+      (grep for `SIGTERM`/`SIGINT`/`ctrl_c`
       across all four crates returns nothing; only SIGHUP exists).
       `systemctl stop`, `docker stop` and a Kubernetes eviction all kill the
       process instantly: in-flight TCP zone transfers are cut mid-stream, and the
@@ -1123,8 +1200,83 @@ Every item below except the first was found by reading code and confirmed by
 timing it. **Do the first one first**: it turns the rest from a list of claims
 into a measurement you can re-run, and it is what tells you when to stop.
 
-- [ ] **Profile the allocation pattern with DHAT, then drive it down.** The
-      findings below are individually true but were each found by hand, which
+- [x] **Profile the allocation pattern with DHAT, then drive it down** —
+      **the profiling half is done 2026-07-29**; driving it down is the items
+      below plus three the profile turned up that were not on anyone's list.
+
+      **Wiring**: `--features dhat-heap` on `rdnsd` swaps in the allocator shim
+      and writes `dhat-heap.json` on exit; `[profile.release] debug = 1` in the
+      workspace manifest is what gives the frame table `file:line`. The profiler
+      is bound in `main` and not in `serve`, so it outlives the drain. **This is
+      where graceful shutdown pays off**: the report is written on `Drop`, and
+      before that fix Ctrl-C killed the process before it happened.
+
+      **Baseline, measured on 1,000 UDP queries against a 5-record zone**
+      (996 answered; the four lost are ordinary UDP loss): **29,365 blocks,
+      3.32 MB — about 29 allocations and 3.3 KB per query.** By site, per query:
+
+      | per query | bytes each | site |
+      |---|---|---|
+      | 4.0 | 16 | `zone::absolutize` |
+      | 2.0 | 32 | `Zone::of_type` |
+      | 2.0 | 64 | `compression::write_name` (the `starts` vec) |
+      | 2.0 | 22 | `compression::write_name` (the arena growing) |
+      | 2.0 | 24 | `make_response` (`msg.queries.clone()`) |
+      | 3.0 | 96 | `dname` parsing |
+      | 1.0 | **1,536** | `tokio::spawn` per datagram, in `udp_loop` |
+      | 1.0 | 33 | `udp_loop`'s `to_vec()` of the packet |
+      | 1.0 | 224 | `add_answer` pushing into the answer vec |
+      | 1.0 | 32 | `tsig::find_tsig` |
+
+      **Three findings that were not on the list below**, which is the whole
+      reason this item said to profile before optimising:
+
+      1. **The spawned task is 1,536 bytes — 46% of every byte allocated per
+         query.** `tokio::spawn` per datagram costs more than the entire rest of
+         the query path put together. That is a number for #9d's "unbounded
+         `tokio::spawn` per UDP datagram", which is now a memory item as well as
+         an admission-control one.
+      2. **`zone::absolutize` is the biggest count at 4 per query.** It returns
+         `String` unconditionally, so a qname that arrived absolute and lowercase
+         — the common case off the wire — is copied four times over on the way
+         through `lookup_key`, `name_kind` and `delegation_for`. A `Cow` and a
+         borrowed `HashMap` lookup would take it to nearly zero. Not done: it
+         touches the public `normalize_name` and deserves its own change.
+      3. **`tsig::find_tsig` allocated a 4-element `Vec<usize>` per packet** —
+         **fixed here**, since it is one line. It built the section counts on the
+         heap *before* the "is there an additional section at all" check, so
+         every query on every server paid for it, TSIG configured or not.
+         Re-measured: 29,365 → 28,374 blocks, and the site is gone from the
+         profile.
+
+      **And one negative result worth recording**, because it redirects effort:
+      `verify_rrset` against **two** candidate RRSIGs costs 22 allocations. The
+      "DNSSEC canonicalization is rebuilt per candidate" item below is real, but
+      it is a *time and bytes* problem rather than an allocation-count one — do
+      not go at it expecting the count to move.
+
+      **The results are pinned as tests**, which was the part worth the effort:
+      `rdns/tests/allocations.rs`, its own test binary so the `#[global_allocator]`
+      does not slow the other 593 unit tests. Six measurements with ranges wide
+      enough to survive a `HashMap` growing differently and narrow enough to
+      catch a per-record allocation appearing in a loop.
+
+      **Two harness traps, both of which produced wrong numbers first:**
+
+      - **The profiler is global, so guarding only the measurement is not
+        enough.** While one test measures, allocations made by every *other* test
+        thread land in its total. The first version locked around the
+        `allocations()` call only and gave 4 where the truth was 12, 208 where it
+        was 1015 — numbers that changed with `--test-threads`. Every test now
+        holds the mutex for its whole body.
+      - **The first profiled block in the process picks up a one-off.** For a
+        measurement whose target is exactly zero that is the difference between
+        passing and failing depending on which test the scheduler started first.
+        Call the function once before measuring it.
+
+      Original finding follows.
+
+      The findings below are individually true but were each found by hand, which
       means the list is certainly incomplete and none of it is guarded against
       coming back. `dhat` (the crate — Nicholas Nethercote's Rust port) answers
       "how many allocations, how big, from which line" for a real workload, and
@@ -1164,10 +1316,14 @@ into a measurement you can re-run, and it is what tells you when to stop.
       Three things that will otherwise waste an afternoon:
 
       - **The profiler writes on `Drop`, so a daemon that never returns from
-        `main` never writes the file** — and there is no SIGTERM handler yet
-        (#9d), so Ctrl-C kills it before the drop runs. Either give the profiling
-        build a bounded-query exit, or do the graceful-shutdown item first. They
-        compose in that order.
+        `main` never writes the file.** This used to say "there is no SIGTERM
+        handler yet (#9d), so Ctrl-C kills it before the drop runs — do the
+        graceful-shutdown item first". **That was done on 2026-07-29 and this
+        item with it**: both daemons return from `main` on a signal with exit
+        code 0, so the profiler writes `dhat-heap.json` on the way out —
+        confirmed by doing it. `dhat::Profiler` is bound in `main` and not in
+        `serve`, or the drop would happen before the drain and the report would
+        be short.
       - **Never read timing numbers from a DHAT build.** Collecting a backtrace
         per allocation dominates everything; it answers how many and how big, not
         how fast. The nanosecond figures in the items below were measured

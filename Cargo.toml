@@ -6,3 +6,8 @@ members = [
     "rdnsr"
 ]
 resolver = "2"
+
+# DHAT's frame table has no file:line without this, which makes a heap profile a
+# list of addresses. Costs build time and binary size, not run-time speed.
+[profile.release]
+debug = 1

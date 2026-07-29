@@ -11,8 +11,16 @@ rdns = { path = "../rdns" }
 tokio = { version = "1.41.1", features = ["full"] }
 anyhow = "1.0"
 signal-hook = { version = "0.3", optional = true }
+# Heap profiling, off unless asked for: `cargo run --release --features dhat-heap`.
+dhat = { version = "0.3", optional = true }
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+
+[features]
+# Swap in DHAT's allocator shim and write `dhat-heap.json` on exit. Never on by
+# default: it records a backtrace per allocation, so a build with it is useless
+# for timing and only meaningful for counts and sizes.
+dhat-heap = ["dep:dhat"]

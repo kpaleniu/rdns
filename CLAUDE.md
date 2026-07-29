@@ -156,6 +156,23 @@ class left the process healthy with nothing alerting.
   settled it, and a secondary pointed at an empty directory then refused to
   start. Nothing caught it, because the case had no test — a green suite standing
   in for evidence it never had, which is §1 again from the other direction.
+
+  **It happened again**, in the commit that added graceful shutdown, and the
+  second time is the more instructive one because the claim was about a *third
+  party's* function. `tokio::signal::ctrl_c()` was used as the whole Windows stop
+  handler, with a doc comment asserting it also covers a console close. It does
+  not: it registers for `CTRL_C_EVENT` alone, and `ctrl_break`, `ctrl_close` and
+  `ctrl_shutdown` are separate listeners. A real `CTRL_BREAK_EVENT` sent
+  mid-AXFR went to the *default* handler and killed the process with exit code
+  `0xC000013A` — the exact failure the change existed to fix, shipped alongside
+  a comment saying it could not happen. Reading the docs is not the same as
+  reading the code, and neither is the same as sending the signal.
+- **Prove an operational fix by provoking the failure, not by reading the diff.**
+  The three unit tests for shutdown passed against the broken signal handler,
+  because they call `Shutdown::begin()` directly and never involve the operating
+  system. Only sending a real console control event to a real process mid-transfer
+  showed it. When a change is about what happens to a *process*, the test that
+  settles it has to involve a process.
 - **When one function answers several questions, separate them before fixing
   one.** That same loader conflated "could the directory be read", "did every
   file parse", and "is it empty" — three questions with three different right
@@ -327,6 +344,28 @@ Cheap to re-check, expensive to rediscover.
 - **Check admission before spawning, not inside the spawned future.** Paying a
   `to_vec()`, two `Arc` clones and a task before deciding to drop the packet is
   backwards.
+- **Dropping a `JoinHandle` detaches the task; it does not cancel it.** Both
+  daemons had a `tokio::select!` over two handles that dropped the loser, so
+  `main` returned while the other transport was still reading and replies were
+  still queued in per-connection channels. A `JoinSet` gives the same
+  first-one-wins shape with both tasks still owned and joinable, and
+  `join_next` is cancel-safe so it can sit in the `select!` directly.
+- **Separate "watch for the stop" from "hold the thing open".** In
+  `rdns::shutdown` those are `Stop` and `Busy`, and the split is the whole
+  design: the accept loops hold the signal for the life of the process, so one
+  type carrying both would keep the drain open forever and the shutdown would
+  wait out its budget every time — looking like it worked while doing nothing.
+  Hold the claim across *work*, never across a sleep: a refresh timer is hours
+  long.
+- **The drain is an `mpsc` nobody sends on.** `recv()` returns `None` exactly
+  when the last sender clone is dropped, which is a counter that cannot be got
+  wrong and needs no polling. Whatever owns the receiver must drop its own
+  sender first, or it waits forever.
+- **Cancel-safety decides where a `select!` arm may go.** `recv_from` and
+  `accept` are cancel-safe, so losing a race against the stop drops nothing that
+  was ours. `read_exact` is not, which is why the shutdown check on a TCP
+  connection sits between messages — where the peer has committed to nothing —
+  and not mid-message.
 
 ## 10. Benchmarks and measurement
 
@@ -358,6 +397,25 @@ Cheap to re-check, expensive to rediscover.
   test for cache eviction fails against the *naive rewrite*, not against the old
   quadratic — which got ties right, slowly. Both are worth having; conflating
   them is how a suite gets credit it has not earned (§1).
+- **Profile before optimising, and record the negative results.** The DHAT pass
+  turned up the biggest cost on the query path — `tokio::spawn` at 1,536 bytes
+  per datagram, 46% of everything a query allocates — which was on nobody's
+  hand-written list, and cleared one that was: `verify_rrset` against two
+  candidate signatures costs 22 allocations, so that item is a time problem and
+  not a count problem. A measurement that redirects effort away from something
+  is worth as much as one that finds a bug.
+- **An exact count that is not actually exact is worse than a timing**, because
+  it looks trustworthy. `rdns/tests/allocations.rs` got two numbers wrong before
+  it got any right: the DHAT profiler is *global*, so guarding only the
+  measurement let other test threads' allocations land in the total (4 read as
+  12, 208 as 1015, changing with `--test-threads`) — every test holds the mutex
+  for its whole body now. And the first profiled block in a process picks up a
+  one-off, which for a target of exactly zero flips on which test the scheduler
+  started first; call the function once before measuring it. Check a count is
+  stable across several runs before trusting it.
+- **A `#[global_allocator]` applies to the whole binary**, so allocation-count
+  tests belong in their own `tests/` file rather than beside the unit tests they
+  would otherwise slow down.
 
 ## 11. Comments, commits, and `TODO.md`
 

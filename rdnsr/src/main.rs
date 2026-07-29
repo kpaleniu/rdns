@@ -9,6 +9,7 @@ use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::rfc5011::{self, AnchorChange, ManagedAnchors};
+use rdns::shutdown::{stop_signal, Busy, Shutdown, Stop};
 use rdns::special_names;
 use rdns::utils::current_unix_timestamp;
 use rdns::utils::record_types;
@@ -20,6 +21,7 @@ use rdns::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
 
 /// UDP payload size rdnsr advertises to clients via EDNS0.
 const RDNSR_PAYLOAD_SIZE: u16 = 4096;
@@ -145,6 +147,11 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Created before anything is spawned: the RFC 5011 anchor manager starts
+    // before the listeners do, and it owns the only durable state this process
+    // writes.
+    let shutdown = Shutdown::new();
+
     // Recursion is the default; naming an upstream is what selects forwarding.
     let mut config = ResolverConfig::default();
     if cli.upstream.is_empty() {
@@ -243,7 +250,14 @@ async fn main() -> anyhow::Result<()> {
     // Following the anchors is a task of its own: it resolves, which means it
     // needs the resolver, which means it cannot be part of building one.
     if let (Some((path, anchors)), Some(shared)) = (managed, shared_anchors) {
-        spawn_anchor_manager(resolver.clone(), shared, anchors, path);
+        spawn_anchor_manager(
+            resolver.clone(),
+            shared,
+            anchors,
+            path,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        );
     }
 
     // A zero-capacity cache never stores (DnsCache::put is a no-op at 0), so
@@ -284,16 +298,68 @@ async fn main() -> anyhow::Result<()> {
         dnssec_source,
     );
 
-    let udp = tokio::spawn(udp_main(socket, resolver.clone(), caches.clone()));
-    let tcp = tokio::spawn(tcp_main(listener, resolver, caches));
+    // A `JoinSet` rather than two `JoinHandle`s in a `select!`, which dropped
+    // the loser — and dropping a `JoinHandle` detaches the task rather than
+    // cancelling it, so `main` returned with the other transport still reading
+    // and replies still queued in a per-connection `mpsc`. `join_next` is
+    // cancel-safe, so first-one-wins keeps both tasks owned and joinable.
+    let mut loops = JoinSet::new();
+    loops.spawn(udp_main(
+        socket,
+        resolver.clone(),
+        caches.clone(),
+        shutdown.stop_handle(),
+        shutdown.busy(),
+    ));
+    loops.spawn(tcp_main(
+        listener,
+        resolver,
+        caches,
+        shutdown.stop_handle(),
+        shutdown.busy(),
+    ));
 
-    // Neither loop returns in normal operation; whichever fails first takes the
-    // process down rather than leaving us serving one transport.
+    // Neither loop returns in normal operation; whichever ends first ends the
+    // process rather than leaving us serving one transport — cooperatively now.
+    let mut failure: Option<anyhow::Error> = None;
     tokio::select! {
-        r = udp => r??,
-        r = tcp => r??,
+        joined = loops.join_next() => {
+            failure = joined.and_then(listener_failure);
+        }
+        signal = stop_signal() => {
+            println!("{signal} received, shutting down");
+        }
     }
-    Ok(())
+
+    shutdown.begin();
+    while let Some(joined) = loops.join_next().await {
+        if failure.is_none() {
+            failure = listener_failure(joined);
+        }
+    }
+
+    // What is left running is a resolution the client is still waiting on, or
+    // the RFC 5011 manager part-way through rewriting the anchor file — which
+    // is the one piece of durable state this process owns.
+    shutdown.drain_reporting().await;
+
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// How a finished listener task is reported. A cancelled task is not a failure:
+/// it is a task that was told to stop.
+fn listener_failure(
+    joined: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
+) -> Option<anyhow::Error> {
+    match joined {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(anyhow::Error::from(e).context("a listener stopped")),
+        Err(e) if e.is_cancelled() => None,
+        Err(e) => Some(anyhow::anyhow!("a listener task panicked: {e}")),
+    }
 }
 
 /// Accept datagrams and answer each in its own task.
@@ -307,13 +373,21 @@ fn spawn_anchor_manager(
     anchors: SharedAnchors,
     mut managed: ManagedAnchors,
     path: std::path::PathBuf,
+    stop: Stop,
+    busy: Busy,
 ) {
     tokio::spawn(async move {
         // A first probe soon after start rather than immediately: a resolver
         // that cannot answer its own first query yet would just spend a retry.
         let mut wait = Duration::from_secs(60);
         loop {
-            tokio::time::sleep(wait).await;
+            // No `Busy` across the sleep, which is hours long — only across the
+            // probe-and-save below, where the file is actually rewritten.
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = stop.wait() => return,
+            }
+            let _busy = busy.clone();
             wait = Duration::from_secs(rfc5011::retry_interval(0, 0));
 
             let mut changed = false;
@@ -461,13 +535,21 @@ async fn udp_main(
     socket: Arc<UdpSocket>,
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
+    stop: Stop,
+    busy: Busy,
 ) -> Result<(), std::io::Error> {
     // Sized for any datagram a client may send, not for the payload size we
     // advertise: on Windows an oversized datagram fails the receive rather than
     // truncating, and a failed receive ends this loop and the process with it.
     let mut buf = vec![0u8; UDP_RECEIVE_BUFFER];
     loop {
-        let (n, peer) = match socket.recv_from(&mut buf).await {
+        // Stop receiving on shutdown. `recv_from` is cancel-safe, so a datagram
+        // is either fully received or not received at all.
+        let received = tokio::select! {
+            r = socket.recv_from(&mut buf) => r,
+            _ = stop.wait() => return Ok(()),
+        };
+        let (n, peer) = match received {
             Ok(received) => received,
             // An ICMP report about a datagram we already sent, or a datagram
             // that did not fit — neither says anything about this socket, and
@@ -481,7 +563,11 @@ async fn udp_main(
         let socket = socket.clone();
         let resolver = resolver.clone();
         let caches = caches.clone();
+        // A recursive answer can take seconds and the client is already waiting
+        // on it, so it is worth the drain rather than being dropped.
+        let busy = busy.clone();
         tokio::spawn(async move {
+            let _busy = busy;
             if let Some(reply) = handle_query(data, &resolver, &caches, Transport::Udp).await {
                 let _ = socket.send_to(&reply, peer).await;
             }
@@ -494,19 +580,30 @@ async fn tcp_main(
     listener: TcpListener,
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
+    stop: Stop,
+    busy: Busy,
 ) -> Result<(), std::io::Error> {
     let permits = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        // Stop accepting on shutdown; connections already open drain in their
+        // own tasks below. `accept` is cancel-safe, so a connection lost to this
+        // race stays in the kernel backlog rather than being half-taken.
+        let (stream, _peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = stop.wait() => return Ok(()),
+        };
         // The semaphore is never closed, so acquiring only fails if we drop it.
         let Ok(permit) = permits.clone().acquire_owned().await else {
             continue;
         };
         let resolver = resolver.clone();
         let caches = caches.clone();
+        let stop = stop.clone();
+        let busy = busy.clone();
         tokio::spawn(async move {
-            serve_connection(stream, resolver, caches).await;
+            serve_connection(stream, resolver, caches, stop).await;
             drop(permit);
+            drop(busy);
         });
     }
 }
@@ -518,7 +615,12 @@ async fn tcp_main(
 /// **concurrently** (§6.2.1.1). Concurrency earns its keep here: a cache miss
 /// costs an upstream round trip, so answering in lock-step would make every
 /// query on a connection wait out the slowest one ahead of it.
-async fn serve_connection(stream: TcpStream, resolver: Arc<Resolver>, caches: Arc<Caches>) {
+async fn serve_connection(
+    stream: TcpStream,
+    resolver: Arc<Resolver>,
+    caches: Arc<Caches>,
+    stop: Stop,
+) {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_INFLIGHT_PER_CONNECTION);
 
@@ -538,9 +640,15 @@ async fn serve_connection(stream: TcpStream, resolver: Arc<Resolver>, caches: Ar
 
     loop {
         // Between messages the peer may legitimately be idle, so a timeout here
-        // is a normal close rather than an error.
+        // is a normal close rather than an error — and so is a shutdown, which
+        // ends the connection at the cheapest possible moment: the peer has
+        // committed to nothing, so it costs one reconnect and no answer.
         let mut len_buf = [0u8; 2];
-        match tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut len_buf)).await {
+        let read = tokio::select! {
+            r = tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut len_buf)) => r,
+            _ = stop.wait() => break,
+        };
+        match read {
             Ok(Ok(_)) => {}
             _ => break,
         }
