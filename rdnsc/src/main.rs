@@ -27,7 +27,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTEMPTS: usize = 2;
 
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(version = rdns::VERSION, about, long_about = None)]
 struct Cli {
     /// The server to ask: an address, optionally with `:port` (default 53).
     ///

@@ -25,8 +25,14 @@ where to look rather than here.
 | `rdnsd` | authoritative server — serves zone files over UDP and TCP in one process |
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
+**CI runs all of this now (2026-07-30).** `.github/workflows/ci.yml`: build and
+test on Linux *and* Windows, clippy `-D warnings`, `cargo fmt --check`, a build on
+1.95 exactly so the MSRV is verified rather than asserted, `cargo deny check`, and
+a build of `--features dhat-heap`. The four commands below were a convention until
+now, and a convention is what a green dashboard quietly stops honouring.
+
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **603 lib + 6 allocation + 75 `rdnsd` + 2 `rdnsr`**
+`cargo test --workspace` = **603 lib + 6 allocation + 85 `rdnsd` + 2 `rdnsr`**
 tests passing
 (`rdnsd`'s own 71 cover argument validation, zone sources and the load policy,
 the secondary role and EXPIRE across reloads, both directions of IXFR and onward
@@ -209,9 +215,38 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets
 
+# Everything below can go in a TOML file instead, which is the only way to keep a
+# TSIG secret out of `argv` and the only way to set anything per zone. The file
+# and the flags are mutually exclusive: --config with --port is an error, not a
+# precedence rule.
+cargo run -p rdnsd -- --config ./rdnsd.toml
+cargo run -p rdnsd -- --config ./rdnsd.toml --check-config   # dry run, exits 0
+#
+#   [server]
+#   host = "127.0.0.1"
+#   port = 53
+#   zone-dir = "./zones"
+#   allow-transfer = ["192.0.2.1"]
+#   metrics-listen = "127.0.0.1:9153"
+#
+#   [signing]
+#   key-dir = "./keys"
+#   validity-days = 30
+#
+#   [keys."partner.key."]
+#   algorithm = "hmac-sha256"
+#   secret-file = "/etc/rdns/secrets/partner.key"   # mode 0600, checked
+#   zones = ["example.com."]                        # or every zone if omitted
+#
+#   [zones."example.com."]
+#   nsec3 = true              # overrides [signing] for this zone only
+#   validity-days = 7
+#   masters = ["192.0.2.9#partner.key."]
+
 # Authoritative server, UDP and TCP from one process. The zone origin comes from
 # the FILENAME: example.com.zone serves example.com — a mismatch silently yields
-# NXDOMAIN for everything.
+# NXDOMAIN for everything. (A config file's [zones."name"] says the origin
+# explicitly and does not have this trap.)
 cargo run -p rdnsd -- --host 127.0.0.1 --port 15353 --zone-file example.com.zone
 
 # Zone transfers are refused unless an address or a key says otherwise.
@@ -435,7 +470,7 @@ under "Closed work" further down.
 
 | # | what | open |
 |---|------|------|
-| **9** | what the five-way code review turned up | **16** — 9a, 9b, 9c and **9f** are closed; what is left is mostly operability, plus the allocation findings the DHAT pass turned up |
+| **9** | what the five-way code review turned up | **13** — 9a, 9b, 9c and **9f** are closed; what is left is mostly operability, plus the allocation findings the DHAT pass turned up |
 | **8** | what signing turned up | **0** — the re-signing timer and its serial are done |
 | **7** | the secondary role | **1**, and conditional |
 | **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
@@ -1243,7 +1278,69 @@ here degrades quietly with the process healthy and nothing alerting.
       stall the comments at `main.rs:729` and `:1170` took trouble to avoid on the
       read side. Fix: compute under the read lock, apply under the write lock.
       Cheap once zones are `Arc<Zone>` (see 9e).
-- [ ] **No config file; TSIG secrets go on the command line**
+- [x] **No config file; TSIG secrets go on the command line** — **done
+      2026-07-30.** `--config <FILE>` (TOML) in `rdnsd/src/config.rs`, with
+      `[server]`, `[signing]`, `[keys.<name>]` and `[zones.<name>]`, plus
+      `--check-config`.
+
+      **`secret-file` is the point of it.** A key's secret can live in a file of
+      its own, so it appears in neither `argv` nor the main config — and the file
+      is **mode-checked on Unix**, refusing anything group- or world-readable. A
+      secret in a file is only better than a secret in `argv` if the file is
+      actually private, and a key directory restored from backup as 0644 or
+      `chmod -R`'d by a deploy script is the ordinary way that stops being true.
+      Verified: with the secret in a file, `wmic process get CommandLine` shows no
+      trace of it. The `--tsig-key-file` the finding asks for is spelled
+      `secret-file` inside the config instead, because a flag would have put the
+      *path* on the command line to reach a secret the config already knows where
+      to find.
+
+      **The file and the flags are mutually exclusive**, and that is a decision
+      rather than an omission: `--config` with `--port` is a clap error, not a
+      precedence rule. Every precedence rule is one somebody has to remember at
+      3am to work out why the server is not listening where the file says — and
+      the failure is silent, because both values are valid. `--check-config`,
+      `--generate-keys` and `--config` are the exceptions, none being a setting.
+
+      **`deny_unknown_fields` on every table.** `require-signd = true` fails at
+      startup with the line number rather than serving unsigned zones quietly,
+      which is the whole difference between a config file and a config file worth
+      having.
+
+      **Per-zone settings, which is the gap the finding names.** `[zones.<name>]`
+      carries `file`, `masters`, `also-notify`, and signing overrides — `nsec3`,
+      `nsec3-opt-out`, `validity-days` — as `Option`s, so absent means *inherit
+      `[signing]`* rather than "the default". `ZoneSigning::policy_for` composes
+      the two, and `resign_interval` follows the **shortest** validity of any
+      zone rather than the global one: a seven-day zone among thirty-day ones
+      needs the timer on its schedule or it is the one zone that expires.
+      Verified live — a global NSEC/30-day policy with one zone overridden to
+      NSEC3/7 days produced `Signed example.com. with 2 keys, NSEC3 for 7 days`,
+      `re-signing every 56h`, and an `NSEC3PARAM` at that apex and nowhere else.
+
+      **A zone may name its own file, and that quietly fixes an older trap.**
+      `ZoneSource::Files` takes the origin from the *table key*, where
+      `--zone-file` derives it from the filename — the trap this document warns
+      about in "How to run", where a mismatch yields NXDOMAIN for everything with
+      nothing to say why. Only a config file can fix it, because only a config
+      file has somewhere to write the origin down. All-or-nothing on load like the
+      directory path, for the §4 reason.
+
+      **`--check-config` is a real dry run**, and where it exits is the design: it
+      returns *after* the config parsed, the secrets were read and mode-checked,
+      the ACLs and master specs parsed, every zone file loaded, every zone was
+      signed and every signature verified — and before any socket is bound. A
+      shallower check would pass for the failures that actually break a deploy: a
+      typo in a zone, a key file that got chmodded, signatures that do not verify.
+
+      **It cost nine crates** (`toml`, `serde` and seven transitive), taking the
+      lock from 104 to 113. Worth saying next to the OpenTelemetry deletion three
+      commits earlier, which removed eighty-three: the argument there was never
+      "no dependencies", it was "no dependencies that do not do anything". A
+      hand-rolled TOML subset that misreads a config file is exactly the class of
+      bug this file is full of — reading configuration wrong is worse than not
+      having any. Original finding follows.
+
       (`rdnsd/src/main.rs:70-181`). `--tsig-key <[ALG:]NAME:SECRET>` puts the
       base64 HMAC secret in `argv`, world-readable in `ps aux` and
       `/proc/<pid>/cmdline`, in shell history, and copied verbatim into the
@@ -1321,7 +1418,30 @@ here degrades quietly with the process healthy and nothing alerting.
       `--control-socket <PATH>` with `status` (zones, serials, load time, per-zone
       last transfer), `reload [zone]`, and `dump <zone>` — `zone_writer` already
       exists for the last one and has no CLI surface yet (noted at #7 step 2).
-- [ ] **Docs an operator will copy from are wrong.** `docs/CLI_USAGE.md:366` and
+- [x] **Docs an operator will copy from are wrong** — **done 2026-07-30.** The
+      `rdnsd -- udp` invocations are gone from both files (two in `CLI_USAGE.md`,
+      one in `README.md`), along with a "Run TCP server for zone transfers" second
+      invocation that never made sense — one process binds both listeners, which
+      is what makes a rate limit, a TSIG session and an ACL mean the same thing on
+      either transport. The corrected command was run to confirm it starts.
+
+      `--zone-dir` no longer claims to recurse; it says flat, and points at the
+      config file's `[zones."name"] file = "..."` for anyone with a tree.
+
+      The systemd unit gained `User=`/`Group=`, an `ExecStartPre` running
+      `--check-config`, `KillSignal=SIGTERM` with a note that the drain is bounded
+      at 5s so the default 90s `TimeoutStopSec` is ample, `ReadWritePaths` for the
+      secondary case, and `--config` instead of a flag soup. The `sudo rdnsd`
+      suggestion is replaced by `setcap CAP_NET_BIND_SERVICE`, with the reason
+      stated: **rdnsd still has no `--user`/`--group`**, so it never drops
+      privilege after binding — whatever it starts as, it stays as, reading
+      private signing keys as that user for the life of the process. Documented
+      rather than fixed; the privilege-drop flag is left below as its own item.
+
+      **Two parts of this finding were already fixed before I got to it**, and are
+      recorded rather than claimed: `CLI_USAGE.md:25` already explained that the
+      subcommands were removed, and the line numbers in the original text had
+      drifted. Original finding follows. `docs/CLI_USAGE.md:366` and
       `:382-391` still document the `rdnsd udp` / `rdnsd tcp` subcommands, and
       README.md:31-34 has them too — both **removed**, as line 25 of CLI_USAGE.md
       itself explains; copy either and the daemon refuses to start.
@@ -1332,7 +1452,61 @@ here degrades quietly with the process healthy and nothing alerting.
       omits every flag a real deployment needs. Also: no privilege drop exists
       anywhere — no `--user`/`--group` to drop after binding 53 — and the README's
       `sudo rdnsd` suggestion should go.
-- [ ] **No CI, and `deny.toml` has never been green.** No `.github`, no CI config
+- [x] **No CI, and `deny.toml` has never been green** — **done 2026-07-30**, and
+      it found a live vulnerability on its first real run.
+
+      `.github/workflows/ci.yml` has five jobs: **test** (build + test on
+      *both* Linux and Windows — not decoration, since the ICMP predicate, the
+      oversized-datagram receive error and the whole signal story behave
+      differently between them and every one of those has been a bug here),
+      **lint** (clippy `-D warnings` and `fmt --check`), **msrv** (builds on
+      1.95 exactly, which is what turns `rust-version` from a claim into a fact),
+      **deny**, and **features** (builds `--features dhat-heap`, because
+      feature-gated code is code nobody compiles until the day they need it in a
+      hurry). `RUSTFLAGS: -D warnings` throughout. Every job was run locally
+      before landing.
+
+      **`deny.toml` is rewritten and now passes all four checks** — the first time
+      this repository has had that. The old file was the unmodified upstream
+      template and could not have passed: it allowed only MIT and
+      Unicode-DFS-2016 with Apache-2.0 commented out, so `ring` (Apache-2.0 AND
+      ISC) and `unicode-ident` (Unicode-3.0) would both have failed. The new
+      allow-list was derived by reading `cargo metadata`, not guessed, and passed
+      first time. The finding's other claim held exactly: cargo-deny 0.16.1 fails
+      here with "unknown variant `2024`" because eleven crates in the graph are
+      edition 2024, so 0.20.2 was installed to verify against and CI pins a new
+      enough one.
+
+      **It immediately caught something real**: `anyhow` 1.0.102 carries an
+      advisory (RUSTSEC, fixed in 1.0.103); updated to 1.0.104. That is the whole
+      argument for the item in one line — the check had never run, and there was
+      a known-vulnerable dependency sitting in the lock file.
+
+      Two `bans` findings were real and are fixed rather than silenced. Duplicate
+      `syn` (2 via `clap_derive`/`num-derive`, 3 via `serde_derive`/
+      `thiserror-impl`) is skipped **by name with a reason**, keeping
+      `multiple-versions = "deny"` for everything else — the case that mattered
+      was a *runtime* duplicate, the two `opentelemetry` copies, and a warning
+      nobody reads would have missed it as thoroughly as no check. And the
+      wildcard `rdns = { path = "../rdns" }` was a correct complaint: with no
+      version alongside the path, none of these crates could ever be published.
+      Fixed with **workspace inheritance** — `[workspace.package]` and
+      `[workspace.dependencies]` now hold the version, edition, licence, MSRV and
+      the internal dependency once instead of four times.
+
+      **`--version` identifies a build now.** `rdns/build.rs` stamps
+      `<package> (<git describe --always --dirty --tags>)` and all three binaries
+      report it: `rdnsd 0.1.0 (ca422ac-dirty)`. In the library rather than once
+      per binary, so there is one copy to drift (`CLAUDE.md` §7), and it degrades
+      to the bare version when there is no git — a released tarball or a shallow
+      checkout, neither of which should fail a build.
+
+      **One part is deliberately not done, because it is not mine to decide.** The
+      manifests say `license = "MIT OR Apache-2.0"` and the repository ships only
+      an MIT `LICENSE`. Resolving it means either adding `LICENSE-APACHE` or
+      narrowing the manifests to `MIT`, and which of those is right is a decision
+      for the copyright holder rather than a bug to fix. `cargo deny` does not
+      object either way. Original finding follows. No `.github`, no CI config
       of any kind: nothing runs the 553+37 tests or clippy on push. No MSRV is
       pinned anywhere (no `rust-version`, no `rust-toolchain.toml`) while the
       README asserts "Rust 1.95.0+". All three crates are `version = "0.1.0"`, so

@@ -91,7 +91,7 @@ enum Transport {
 /// Binds to localhost by default so it is not accidentally exposed as an open
 /// resolver (an amplification vector).
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(version = rdns::VERSION, about, long_about = None)]
 struct Cli {
     /// Address to listen on. Defaults to localhost to avoid an open resolver.
     #[arg(long, default_value = "127.0.0.1")]

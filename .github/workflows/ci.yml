@@ -1,0 +1,103 @@
+# The checks CLAUDE.md already says must pass, run where nobody can forget them.
+#
+# Nothing ran the test suite or clippy on push before this: the four commands at
+# the top of CLAUDE.md were a convention, and a convention is what a green
+# dashboard quietly stops honouring. `TODO.md` #9d.
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+# A second push to the same branch makes the first run's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are failures here for the same reason clippy is: `CLAUDE.md` says
+  # clean, no exceptions, and a warning nobody is forced to read is a warning
+  # that accumulates.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The one job that has to pass. Split from the rest so a lint failure and a
+  # test failure are distinguishable at a glance rather than both being "CI red".
+  test:
+    name: build and test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both platforms this is developed and deployed on. Not decoration: the
+        # ICMP predicate, the oversized-datagram receive error and the whole
+        # graceful-shutdown signal story all behave differently between them, and
+        # every one of those has been a bug here.
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `build.rs` stamps the version from `git describe`, which needs tags
+          # and history. A shallow clone would silently produce a bare version.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+      # The allocation-count tests are a separate binary with its own global
+      # allocator, and `cargo test --workspace` does run them — named here so a
+      # failure says which suite it was.
+      - run: cargo test -p rdns --test allocations -- --nocapture
+
+  lint:
+    name: clippy and fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # `--all-targets` so tests and benches are linted too — most of this
+      # repository's code by line count is tests.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo fmt --all --check
+
+  msrv:
+    name: minimum supported rust (1.95)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+      # `rust-version` in the manifests is a *claim*; this is what makes it true.
+      # The README promises 1.95.0+, and until now nothing checked that a feature
+      # from a later toolchain had not crept in.
+      - run: cargo build --workspace --all-targets
+
+  deny:
+    name: licences and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to something new enough to parse the manifests: cargo-deny 0.16.1
+      # fails on this workspace with "unknown variant `2024`", because eleven
+      # crates in the graph are edition 2024. `deny.toml` says so too.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.95"
+          command: check
+
+  # Feature-gated code is code nobody compiles until the day they need it, and
+  # the heap profiler is the one thing here whose whole purpose is to be reached
+  # in a hurry.
+  features:
+    name: optional features build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p rdnsd --features dhat-heap

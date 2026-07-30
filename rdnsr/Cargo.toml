@@ -1,12 +1,13 @@
 [package]
 name = "rdnsr"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Recursive DNS resolver with caching, and a forwarding mode. Separate from the authoritative server (rdnsd)."
-license = "MIT OR Apache-2.0"
+license.workspace = true
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-rdns = { path = "../rdns" }
-tokio = { version = "1.41.1", features = ["full"] }
-anyhow = "1.0"
+clap.workspace = true
+rdns.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

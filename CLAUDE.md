@@ -616,7 +616,47 @@ by the caller's actual limit, and each cost more than it looks.
   wrote, and RFC 1035 §5.1 allows escapes in one, so "should not contain a quote"
   is not "cannot".
 
-## 15. Authentication is not authorization
+## 15. Configuration
+
+- **`deny_unknown_fields`, always.** A mistyped key that is silently ignored is a
+  setting the operator believes is in force and is not. `require-signd = true`
+  has to fail at startup with a line number, not serve unsigned zones quietly.
+  This one attribute is most of the difference between a config file and a config
+  file worth having.
+- **Two sources for one setting means an error, not a precedence rule.**
+  `--config` and `--port` together is refused. Every precedence rule is one
+  somebody has to remember at 3am to work out why the server is not where the
+  file says — and the failure is silent, because both values are valid. Refusing
+  costs one restart.
+- **`Option` per field for an override, not a whole struct.** In `[zones.*]`,
+  absent means *inherit* and not "the default": an operator who sets `nsec3` for
+  one zone must not silently reset that zone's validity to thirty days.
+- **A derived global has to follow the extreme, not the default.** The re-signing
+  interval follows the *shortest* validity of any zone, because a seven-day zone
+  among thirty-day ones is the one that expires if the timer runs on the global
+  number.
+- **A secret in a file is only better than a secret in `argv` if the file is
+  private** — so check the mode and refuse a readable one. A key directory
+  restored from backup as 0644, or `chmod -R`'d by a deploy script, is the
+  ordinary way a private key stops being private. And say out loud where the
+  check does not apply: on Windows there is no equivalent, and "the permissions
+  were checked" must not be a claim that is only true on one platform.
+- **Reuse the parser the flags use.** The config builds `[alg:]name:secret[:zones]`
+  strings and hands them to `TsigKey::parse`, rather than constructing keys
+  directly, so the two paths cannot disagree about what a key means and every rule
+  the parser enforces applies to both (§7).
+- **A dry run has to run everything that does not bind a socket.** `--check-config`
+  returns after the config parsed, the secrets were read and mode-checked, every
+  zone loaded, every zone was signed and every signature verified. A shallower
+  check — parse the file and stop — passes for the failures that actually break a
+  deploy: a typo in a zone, a chmodded key, signatures that do not verify.
+- **Pay for a parser; do not pay for a stub.** Nine crates for `toml` + `serde`
+  is proportionate three commits after deleting eighty-three for an exporter that
+  never ran. The rule is not "no dependencies", it is "no dependencies that do
+  not do anything" — and a hand-rolled TOML subset that misreads a config is the
+  worst outcome available.
+
+## 16. Authentication is not authorization
 
 `answer_transfer` asked whether a TSIG *session existed* and called that
 permission, so holding any key in the keyring transferred any zone and bypassed

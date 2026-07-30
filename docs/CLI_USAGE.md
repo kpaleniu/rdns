@@ -98,7 +98,9 @@ Load all `.zone` files from a directory.
 
 **Notes:**
 - Mutually exclusive with `--zone-file`
-- Recursively searches directory for `*.zone` files
+- Reads `*.zone` files from that one directory. **Not recursive** — a flat
+  `read_dir`, so organising zones into subdirectories hides them. (A config file's
+  `[zones."name"] file = "..."` names paths individually if you need a tree.)
 - Zone origin extracted from filename
 - Directory must exist and be readable
 - One of `--zone-file` or `--zone-dir` is required
@@ -362,8 +364,8 @@ rdnsd --host 127.0.0.1 --port 5353
 # Create test zones directory
 mkdir -p zones
 
-# Run UDP server on localhost
-cargo run --bin rdnsd -- udp \
+# One process, both transports. (There is no `udp` subcommand — see above.)
+cargo run --bin rdnsd -- \
   --host 127.0.0.1 \
   --port 5353 \
   --zone-dir ./zones

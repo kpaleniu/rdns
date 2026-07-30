@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+mod config;
+
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -70,26 +72,26 @@ use signal_hook_tokio::Signals;
 /// refresh timestamp) needs a single owner, and two servers racing to write the
 /// same zone file is not a design to grow into.
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(version = rdns::VERSION, about, long_about = None)]
 struct Cli {
     /// Address to listen on, for both transports.
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "0.0.0.0", conflicts_with = "config")]
     host: String,
     /// Port to listen on, for both transports.
-    #[arg(long, default_value = "53")]
+    #[arg(long, default_value = "53", conflicts_with = "config")]
     port: u16,
     /// A single zone file. The origin comes from the file name.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     zone_file: Option<String>,
     /// A directory of `.zone` files.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     zone_dir: Option<String>,
     /// Who may request a zone transfer: an address or CIDR prefix, repeatable.
     ///
     /// Nobody, unless this says otherwise. An AXFR is the whole zone in one
     /// answer, so it is the one query that has to be allowed by list. Applies to
     /// TCP, because AXFR is defined over TCP alone (RFC 5936 §4.2).
-    #[arg(long, value_name = "ADDR|CIDR")]
+    #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     allow_transfer: Vec<String>,
     /// A TSIG key, `[algorithm:]name:base64secret`, repeatable.
     ///
@@ -97,7 +99,7 @@ struct Cli {
     /// signed with a key named here may transfer a zone whatever its source
     /// address, and any signed request gets a signed answer (RFC 8945). The
     /// algorithm defaults to hmac-sha256.
-    #[arg(long, value_name = "[ALG:]NAME:SECRET")]
+    #[arg(long, value_name = "[ALG:]NAME:SECRET", conflicts_with = "config")]
     tsig_key: Vec<String>,
     /// A secondary to notify when a zone changes: `addr[:port]`, repeatable.
     ///
@@ -105,7 +107,7 @@ struct Cli {
     /// goes off, which for a typical SOA is hours later. A NOTIFY says so at once
     /// (RFC 1996). Sent on zone load — at startup and on SIGHUP — for every zone
     /// whose serial moved forward.
-    #[arg(long, value_name = "ADDR[:PORT]")]
+    #[arg(long, value_name = "ADDR[:PORT]", conflicts_with = "config")]
     also_notify: Vec<String>,
     /// A zone to replicate: `zone@master[:port][#tsig-key-name]`, repeatable.
     ///
@@ -117,7 +119,11 @@ struct Cli {
     /// Requires `--zone-dir`, because a fetched zone has to be written somewhere:
     /// the file lands there under the zone's name and is loaded by the ordinary
     /// path on the next start.
-    #[arg(long, value_name = "ZONE@MASTER[:PORT][#KEY]")]
+    #[arg(
+        long,
+        value_name = "ZONE@MASTER[:PORT][#KEY]",
+        conflicts_with = "config"
+    )]
     secondary: Vec<String>,
     /// A directory of `.rdnskey` signing keys.
     ///
@@ -127,14 +133,19 @@ struct Cli {
     /// itself is never rewritten — what a client validates is what leaves the
     /// socket, and a resigning timer racing an editor for one file is a way to
     /// lose a zone. Zones with no key here are served exactly as before.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", conflicts_with = "config")]
     signing_key_dir: Option<PathBuf>,
     /// How long a generated signature is good for, in days.
     ///
     /// Signatures are made at load — startup, and SIGHUP where signals exist —
     /// so this also says how often the zone has to be reloaded. It is long by
     /// default for that reason.
-    #[arg(long, value_name = "DAYS", default_value = "30")]
+    #[arg(
+        long,
+        value_name = "DAYS",
+        default_value = "30",
+        conflicts_with = "config"
+    )]
     signature_validity: u32,
     /// Deny names with NSEC3 (RFC 5155) rather than NSEC.
     ///
@@ -142,7 +153,7 @@ struct Cli {
     /// for: both were meant to cost an attacker something and only ever cost
     /// the server and the validator. The reason left to choose NSEC3 is that
     /// NSEC lets anyone walk the zone one query at a time.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     nsec3: bool,
     /// Leave insecure delegations out of the NSEC3 chain (RFC 5155 §6).
     ///
@@ -150,7 +161,7 @@ struct Cli {
     /// record and a signature each. The cost is that a denial covering an
     /// opted-out span proves less: "not here, or an insecure delegation I did
     /// not list".
-    #[arg(long, requires = "nsec3")]
+    #[arg(long, requires = "nsec3", conflicts_with = "config")]
     nsec3_opt_out: bool,
     /// Generate a key-signing and a zone-signing key for ZONE, print the DS
     /// record to give the parent, and exit.
@@ -171,7 +182,7 @@ struct Cli {
     /// Turning it on is an operator assertion that every zone here is meant to
     /// be signed — worth making, because a zone that silently loses its
     /// signatures otherwise keeps answering as though nothing happened.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     require_signed: bool,
     /// Serve the zones that loaded even if others in --zone-dir failed to parse.
     ///
@@ -185,14 +196,19 @@ struct Cli {
     /// The flag exists because the behaviour is defensible when the alternative
     /// is worse — a secondary holding 40 zones would rather serve 39 than none —
     /// but it should be a decision, not what happens when nobody looked.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     allow_partial_load: bool,
     /// Response bytes per second, per client address. 0 turns the budget off.
     ///
     /// Meters what leaves rather than what arrives, because that is what an
     /// amplification attack is made of. Applies to UDP: a TCP query has completed
     /// a handshake, so there is nobody to reflect at.
-    #[arg(long, value_name = "BYTES_PER_SEC", default_value = "8192")]
+    #[arg(
+        long,
+        value_name = "BYTES_PER_SEC",
+        default_value = "8192",
+        conflicts_with = "config"
+    )]
     response_rate: u32,
     /// Queries per second, per client address. 0 turns the limit off.
     ///
@@ -209,14 +225,24 @@ struct Cli {
     /// resolvers, not end users, and one resolver behind one address legitimately
     /// asks orders of magnitude more than one person does. The limiter is a
     /// backstop against a flood, not a quota.
-    #[arg(long, value_name = "QUERIES_PER_SEC", default_value = "1000")]
+    #[arg(
+        long,
+        value_name = "QUERIES_PER_SEC",
+        default_value = "1000",
+        conflicts_with = "config"
+    )]
     query_rate: u32,
     /// How many queries may arrive at once before `--query-rate` applies.
     ///
     /// A DNS client sends its queries in bursts by nature — one page load is
     /// dozens of names at once — so a limiter with no burst allowance drops
     /// traffic that is not a flood at all.
-    #[arg(long, value_name = "QUERIES", default_value = "200")]
+    #[arg(
+        long,
+        value_name = "QUERIES",
+        default_value = "200",
+        conflicts_with = "config"
+    )]
     query_burst: u32,
     /// An address or CIDR prefix the query rate limit does not apply to,
     /// repeatable.
@@ -225,7 +251,7 @@ struct Cli {
     /// whole job is to query more often than a client would. Without it the
     /// only way to exempt a known-good source is to raise the limit for
     /// everybody.
-    #[arg(long, value_name = "ADDR|CIDR")]
+    #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     query_rate_exempt: Vec<String>,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///
@@ -243,8 +269,28 @@ struct Cli {
     /// No TLS and no auth: bind it on loopback or a management address. The
     /// counters are not secret, but they say how much traffic this server takes
     /// and which zones are failing.
-    #[arg(long, value_name = "ADDR:PORT")]
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     metrics_listen: Option<String>,
+    /// Read the settings from a TOML file instead of from flags.
+    ///
+    /// **Exclusive of the flags it would set**, deliberately: `--config` together
+    /// with `--port` is an error rather than a precedence rule. Every precedence
+    /// rule is one somebody has to remember at 3am to work out why the server is
+    /// not listening where the file says — and the failure is silent, because both
+    /// values are valid. Refusing costs one restart and no confusion.
+    ///
+    /// The file can express two things a flag cannot: a TSIG secret in a file of
+    /// its own (so it is in neither `argv` nor the config), and per-zone signing
+    /// settings.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Validate the configuration and exit without binding a socket.
+    ///
+    /// A dry run for a deploy: it reads the config, the TSIG secrets and the
+    /// signing keys, and checks everything that can be known without touching the
+    /// network. Exit 0 means the server would start.
+    #[arg(long, requires = "config")]
+    check_config: bool,
 }
 
 /// Zone source: either a single file or a directory of zone files
@@ -252,6 +298,15 @@ struct Cli {
 enum ZoneSource {
     SingleFile(String),
     Directory(String),
+    /// Zones that named their own files, from a config file's `[zones.*]`.
+    ///
+    /// The origin comes from the *table key* rather than the file name, which
+    /// quietly removes the trap `SingleFile` still has: `--zone-file` derives the
+    /// origin from the path, so `example.com.zone` holding `other.test.` yields
+    /// NXDOMAIN for everything with nothing to indicate why. Only a config file
+    /// can express this, because only a config file has somewhere to say the
+    /// origin out loud.
+    Files(Vec<(String, String)>),
 }
 
 /// Build a DNS response for the given query message
@@ -2790,7 +2845,22 @@ async fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // A config file supplies the same settings the flags do, plus the two things
+    // a flag cannot express — a secret in its own file, and per-zone settings.
+    // It *replaces* the flags rather than layering over them; see `config` for
+    // why that is an error rather than a precedence rule.
+    let per_zone = match cli.config.clone() {
+        Some(path) => {
+            let config = config::Config::load(&path)?;
+            let per_zone = config.apply(&mut cli)?;
+            println!("Configured from {}", path.display());
+            per_zone
+        }
+        None => config::PerZone::default(),
+    };
+    let cli = cli;
 
     // Key generation is a mode, not a server option: nothing is served, and it
     // happens once per zone before anything else can.
@@ -2828,8 +2898,26 @@ async fn main() -> Result<()> {
     let replicating = !secondary_specs.is_empty();
     // Read before the source is taken apart, which consumes the two path
     // fields.
-    let signing = ZoneSigning::load(&cli)?.map(Arc::new);
-    let source = validate_zone_source(cli.zone_file, cli.zone_dir, replicating)?;
+    let signing = ZoneSigning::load(&cli, &per_zone.signing)?.map(Arc::new);
+    let source = if per_zone.files.is_empty() {
+        validate_zone_source(cli.zone_file, cli.zone_dir, replicating)?
+    } else {
+        // Zones that named their own files. `Config::apply` has already refused
+        // this combined with `zone-dir`, and `Config::check` has refused a
+        // secondary zone with no directory to write to.
+        for path in per_zone.files.values() {
+            if !Path::new(path).exists() {
+                return Err(anyhow!("Zone file not found: {path}"));
+            }
+        }
+        ZoneSource::Files(
+            per_zone
+                .files
+                .iter()
+                .map(|(origin, path)| (origin.clone(), path.clone()))
+                .collect(),
+        )
+    };
     let mut zones = load_zones_from_source(&source, replicating, cli.allow_partial_load).await?;
 
     // Signing happens between loading and serving, and so does checking the
@@ -2842,6 +2930,28 @@ async fn main() -> Result<()> {
     validator.set_require_signed(cli.require_signed);
     let validator = Arc::new(validator);
     verify_zones(&zones, &validator)?;
+
+    // The dry run exits here, and *here* specifically: everything above is
+    // everything that can be known without touching the network. The config
+    // parsed, the TSIG secrets were read and their permissions checked, the ACLs
+    // and master specs parsed, every zone file loaded and was signed, and every
+    // signature verified. What is left is binding sockets and starting timers.
+    //
+    // A shallower check — parse the TOML and stop — would pass for the failures
+    // that actually break a deploy: a zone with a typo in it, a key file that got
+    // chmodded, a zone whose signatures do not verify.
+    if cli.check_config {
+        println!(
+            "configuration is valid: {} zone(s), {} TSIG key(s), signing {}",
+            zones.len(),
+            cli.tsig_key.len(),
+            match &signing {
+                Some(s) => format!("{} zone(s)", s.signed_zone_count(&zones)),
+                None => "disabled".to_string(),
+            }
+        );
+        return Ok(());
+    }
 
     note_serials(&metrics, &zones);
     let zone_map = Arc::new(RwLock::new(zones));
@@ -3016,10 +3126,19 @@ struct ZoneSigning {
     keys: HashMap<String, Vec<SigningKey>>,
     validity: u64,
     chain: DenialChain,
+    /// Zones whose signing settings differ from the two above, by apex.
+    ///
+    /// Only a config file can populate this — there is no flag shape for "NSEC3
+    /// for this zone and NSEC for the rest", which is the gap `TODO.md` #9d names
+    /// when it says every zone got the same signing policy.
+    per_zone: BTreeMap<String, config::ZoneSigningOverride>,
 }
 
 impl ZoneSigning {
-    fn load(cli: &Cli) -> Result<Option<Self>> {
+    fn load(
+        cli: &Cli,
+        per_zone: &BTreeMap<String, config::ZoneSigningOverride>,
+    ) -> Result<Option<Self>> {
         let Some(dir) = &cli.signing_key_dir else {
             return Ok(None);
         };
@@ -3042,6 +3161,7 @@ impl ZoneSigning {
         }
         Ok(Some(ZoneSigning {
             keys,
+            per_zone: per_zone.clone(),
             validity: u64::from(cli.signature_validity) * 86_400,
             chain: if cli.nsec3 {
                 DenialChain::Nsec3 {
@@ -3053,6 +3173,58 @@ impl ZoneSigning {
                 DenialChain::Nsec
             },
         }))
+    }
+
+    /// The policy for one zone: the global one, with that zone's overrides
+    /// applied.
+    ///
+    /// `signed_at` is passed in rather than read here so that every zone in one
+    /// signing run shares a moment — otherwise two zones signed a second apart
+    /// would derive serials from different hours at an hour boundary, which is a
+    /// difference nobody could explain from the outside.
+    fn policy_for(&self, origin: &str, signed_at: u64) -> SigningPolicy {
+        let over = self
+            .per_zone
+            .get(&absolute_name(origin))
+            .copied()
+            .unwrap_or_default();
+        let validity = over
+            .validity_days
+            .map(|days| u64::from(days) * 86_400)
+            .unwrap_or(self.validity);
+        let nsec3 = over
+            .nsec3
+            .unwrap_or(!matches!(self.chain, DenialChain::Nsec));
+        let opt_out = over.nsec3_opt_out.unwrap_or(matches!(
+            self.chain,
+            DenialChain::Nsec3 { opt_out: true, .. }
+        ));
+        let chain = if nsec3 {
+            DenialChain::Nsec3 {
+                salt: Vec::new(),
+                iterations: 0,
+                opt_out,
+            }
+        } else {
+            DenialChain::Nsec
+        };
+        SigningPolicy::valid_for(signed_at, validity).with_chain(chain)
+    }
+
+    /// The shortest validity any zone is signed with, which is what the
+    /// re-signing interval has to follow.
+    ///
+    /// The *minimum*, not the global setting: a zone configured with a seven-day
+    /// validity among thirty-day ones needs the timer to run on its schedule, or
+    /// it is the one zone that expires.
+    fn shortest_validity(&self) -> u64 {
+        self.per_zone
+            .values()
+            .filter_map(|o| o.validity_days)
+            .map(|days| u64::from(days) * 86_400)
+            .chain(std::iter::once(self.validity))
+            .min()
+            .unwrap_or(self.validity)
     }
 
     /// How often the zones should be re-signed.
@@ -3074,12 +3246,24 @@ impl ZoneSigning {
     /// Floored at a minute so that a tiny `--signature-validity`, which is only
     /// ever a test setting, cannot turn this into a spin loop.
     fn resign_interval(&self) -> Duration {
-        Duration::from_secs((self.validity / 3).max(60))
+        Duration::from_secs((self.shortest_validity() / 3).max(60))
     }
 
-    /// The configured validity in days, for the startup line.
+    /// How many of `zones` this would actually sign, for `--check-config`.
+    ///
+    /// Counted rather than assumed: "signing is configured" and "this zone gets
+    /// signed" are different claims, and a key directory that does not hold a key
+    /// for the zone an operator thought it did is exactly what a dry run is for.
+    fn signed_zone_count(&self, zones: &HashMap<String, Zone>) -> usize {
+        zones
+            .keys()
+            .filter(|origin| self.keys.contains_key(&origin.to_ascii_lowercase()))
+            .count()
+    }
+
+    /// The shortest configured validity in days, for the startup line.
     fn validity_days(&self) -> u64 {
-        self.validity / 86_400
+        self.shortest_validity() / 86_400
     }
 
     /// Sign every zone there are keys for, in place.
@@ -3089,17 +3273,25 @@ impl ZoneSigning {
     /// the unsigned answer would be bogus at every validating client rather
     /// than merely unvalidated.
     fn apply(&self, zones: &mut HashMap<String, Zone>) -> Result<()> {
-        let policy = SigningPolicy::valid_for(current_unix_timestamp(), self.validity)
-            .with_chain(self.chain.clone());
+        // One moment for the whole run — see `policy_for`.
+        let signed_at = current_unix_timestamp();
         for (origin, zone) in zones.iter_mut() {
             let Some(keys) = self.keys.get(&origin.to_ascii_lowercase()) else {
                 continue;
             };
+            let policy = self.policy_for(origin, signed_at);
             *zone = sign_zone(zone, keys, &policy).with_context(|| format!("signing {origin}"))?;
             println!(
-                "Signed {origin} with {} key{}",
+                "Signed {origin} with {} key{}, {} for {} day{}",
                 keys.len(),
-                if keys.len() == 1 { "" } else { "s" }
+                if keys.len() == 1 { "" } else { "s" },
+                if matches!(policy.chain, DenialChain::Nsec) {
+                    "NSEC"
+                } else {
+                    "NSEC3"
+                },
+                (u64::from(policy.expiration) - u64::from(policy.inception)) / 86_400,
+                if self.validity == 86_400 { "" } else { "s" }
             );
         }
         Ok(())
@@ -3258,6 +3450,45 @@ async fn load_zones_from_source(
                 return Err(anyhow!("No .zone files found in directory: {dir}"));
             }
             Ok(zones)
+        }
+        ZoneSource::Files(files) => {
+            // All-or-nothing, like the directory path and for the same reason
+            // (`CLAUDE.md` §4): one broken file out of forty must not leave the
+            // server up and answering REFUSED for that one zone, which is
+            // indistinguishable from a zone nobody configured. Every failure is
+            // collected so a deploy is fixed in one pass.
+            let mut map = HashMap::new();
+            let mut failures = Vec::new();
+            for (origin, path) in files {
+                match parse_zone_file_at(Path::new(path), origin) {
+                    Ok(zone) => {
+                        map.insert(zone.origin().to_string(), zone);
+                    }
+                    Err(e) => failures.push(format!("  {origin} from {path}: {e}")),
+                }
+            }
+            if !failures.is_empty() {
+                let listed = failures.join(
+                    "
+",
+                );
+                if !allow_partial {
+                    return Err(anyhow!(
+                        "{} of {} configured zone(s) failed to load:
+{listed}",
+                        failures.len(),
+                        files.len()
+                    ));
+                }
+                eprintln!(
+                    "{} of {} configured zone(s) failed to load and are NOT being served                      (--allow-partial-load):
+{listed}",
+                    failures.len(),
+                    files.len()
+                );
+            }
+            println!("Loaded {} zone(s) named in the config", map.len());
+            Ok(map)
         }
     }
 }
@@ -5699,7 +5930,7 @@ ns.plain  IN A   192.0.2.30
                 "--signing-key-dir",
                 dir.0.to_str().unwrap(),
             ]);
-            let signing = ZoneSigning::load(&cli)
+            let signing = ZoneSigning::load(&cli, &BTreeMap::new())
                 .expect("load keys")
                 .expect("configured");
 

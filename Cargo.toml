@@ -7,6 +7,25 @@ members = [
 ]
 resolver = "2"
 
+# One place for the version and for the internal dependency. Three binaries each
+# spelling `rdns = { path = "../rdns" }` is three manifests to edit for one
+# number — and with no `version` alongside the path, none of them could ever be
+# published, which is what `cargo deny check bans` says when it rejects a
+# wildcard dependency on a publishable crate.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+# Pinned so a build that would fail on the toolchain the README promises fails in
+# CI rather than at a user. Verified by the `msrv` job, not asserted.
+rust-version = "1.95"
+
+[workspace.dependencies]
+rdns = { path = "rdns", version = "0.1.0" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.41.1", features = ["full"] }
+
 # DHAT's frame table has no file:line without this, which makes a heap profile a
 # list of addresses. Costs build time and binary size, not run-time speed.
 [profile.release]

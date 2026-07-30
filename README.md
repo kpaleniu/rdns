@@ -14,7 +14,8 @@ all the RFC nomenclature uses.
   signed in memory as the zone loads, re-signed on a timer before the signatures
   lapse, with expiry spread across the zone so it degrades on a slope rather than
   expiring all at once
-- Multi-zone support via zone enumeration
+- Multi-zone support via zone enumeration, or a TOML config file with per-zone
+  settings (`--config`, `--check-config`) that keeps TSIG secrets out of `argv`
 - Signal handling: SIGHUP reloads zones, SIGTERM/SIGINT stop gracefully —
   in-flight zone transfers finish rather than being cut mid-stream
 - Prometheus metrics on `--metrics-listen`: RED counters, an answer-latency
@@ -27,17 +28,20 @@ all the RFC nomenclature uses.
 
 ### Quick Start
 
-1. Ensure you have Rust 1.95.0+ installed
+1. Ensure you have Rust 1.95.0+ installed (pinned as `rust-version` in the
+   manifests and verified by CI, not just asserted here)
 2. Create test zone files (`.zone` extension) in a zones directory
 3. Run rdnsd on localhost without requiring root:
 
 ```bash
-# UDP server on localhost:5353
-cargo run --bin rdnsd -- udp --host 127.0.0.1 --port 5353 --zone-dir ./zones
-
-# TCP server on localhost:5353
-cargo run --bin rdnsd -- tcp --host 127.0.0.1 --port 5353 --zone-dir ./zones
+# One process, both transports, on localhost:5353.
+cargo run --bin rdnsd -- --host 127.0.0.1 --port 5353 --zone-dir ./zones
 ```
+
+There are no `udp` / `tcp` subcommands. There used to be, and both listeners now
+live in one process: writable state — a fetched zone, a refresh timer, a TSIG
+session, a rate-limit bucket — cannot be split across two processes without one
+of them being wrong.
 
 ### Zone File Format
 
@@ -108,8 +112,28 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/rdnsd --host 0.0.0.0 --port 53 --zone-dir /etc/rdns/zones
+
+# Not root. rdnsd has no --user/--group of its own, so it never drops privilege
+# after binding — which means whatever it starts as, it stays as, and it reads
+# private signing keys and TSIG secrets as that user for the life of the process.
+# systemd is what makes it unprivileged, and CAP_NET_BIND_SERVICE is what lets an
+# unprivileged user have port 53 anyway.
+User=rdns
+Group=rdns
+
+# --config keeps TSIG secrets out of argv, where `ps aux` and this unit file
+# would otherwise both expose them. --check-config is the dry run.
+ExecStartPre=/usr/local/bin/rdnsd --config /etc/rdns/rdnsd.toml --check-config
+ExecStart=/usr/local/bin/rdnsd --config /etc/rdns/rdnsd.toml
+
+# SIGHUP reloads the zones. Signatures are re-made on their own timer, so the
+# cron kill -HUP that DNSSEC deployments used to need is gone.
 ExecReload=/bin/kill -HUP $MAINPID
+
+# SIGTERM stops accepting and finishes what is in flight — an AXFR mid-stream
+# included, since a client cannot tell a truncated transfer from a complete one.
+# The drain is bounded at 5s, so the default 90s TimeoutStopSec is ample.
+KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=10
 
@@ -123,6 +147,9 @@ NoNewPrivileges=true
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
+# The zone directory needs to be writable only if this server is a secondary:
+# a transferred zone is written there, along with its state sidecar.
+ReadWritePaths=/etc/rdns/zones
 
 # Logging
 StandardOutput=journal
@@ -167,12 +194,21 @@ chmod 755 /etc/rdns/zones
 
 To run on standard DNS port (53) without root:
 
-1. Use the `systemd` service file above with `AmbientCapabilities=CAP_NET_BIND_SERVICE`
-2. Or use `sudo` to run with elevated privileges:
+Use the `systemd` unit above, which gives an unprivileged user
+`CAP_NET_BIND_SERVICE` and nothing else. Outside systemd, grant the capability to
+the binary directly:
 
 ```bash
-sudo rdnsd --host 0.0.0.0 --port 53 --zone-dir /etc/rdns/zones
+sudo setcap CAP_NET_BIND_SERVICE=+eip /usr/local/bin/rdnsd
+rdnsd --config /etc/rdns/rdnsd.toml          # as an ordinary user
 ```
+
+**Running the whole server as root is worth avoiding rather than documenting.**
+rdnsd has no `--user`/`--group`, so it does not drop privilege after binding —
+whatever it starts as, it stays as, and it reads private signing keys and TSIG
+secrets as that user for the life of the process. `sudo rdnsd` used to be
+suggested here; a capability on the binary or a `User=` in the unit does the same
+job without it.
 
 ## Testing
 

@@ -1,19 +1,22 @@
 [package]
 name = "rdnsd"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Authoritative DNS server. Serves zone files over UDP and TCP from one process, with AXFR, TSIG and NOTIFY."
-license = "MIT OR Apache-2.0"
+license.workspace = true
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-rdns = { path = "../rdns" }
-tokio = { version = "1.41.1", features = ["full"] }
-anyhow = "1.0"
+clap.workspace = true
+rdns.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
 signal-hook = { version = "0.3", optional = true }
 # Heap profiling, off unless asked for: `cargo run --release --features dhat-heap`.
 dhat = { version = "0.3", optional = true }
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"], optional = true }
+toml = "1.1.4"
+serde = { version = "1.0.229", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

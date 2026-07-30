@@ -7,6 +7,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use compression::NameCompressor;
 use dname::{dname_from_bytes, dname_to_bytes, write_bytes, DNameUnpacker, TryUnpackFromBytes};
 
+/// This build, as `<package version> (<git describe>)`.
+///
+/// Stamped by `build.rs`. Every binary passes it to clap's `version`, so
+/// `--version` names a commit rather than three crates all saying `0.1.0` —
+/// which is what an operator needs when asked which build is running.
+pub const VERSION: &str = env!("RDNS_VERSION");
+
 pub mod bench;
 pub mod cache;
 pub mod compression;
