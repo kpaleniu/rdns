@@ -11,13 +11,17 @@ all the RFC nomenclature uses.
 - Full DNSSEC validation (RSA/ECDSA, SHA-256/SHA-512 signatures)
 - NSEC/NSEC3 proof-of-non-existence validation
 - DNSSEC signing: key generation, an RRSIG per RRset, and an NSEC or NSEC3 chain,
-  signed in memory as the zone loads
+  signed in memory as the zone loads, re-signed on a timer before the signatures
+  lapse, with expiry spread across the zone so it degrades on a slope rather than
+  expiring all at once
 - Multi-zone support via zone enumeration
 - Signal handling: SIGHUP reloads zones, SIGTERM/SIGINT stop gracefully —
   in-flight zone transfers finish rather than being cut mid-stream
 - Prometheus metrics on `--metrics-listen`: RED counters, an answer-latency
   histogram, per-zone serial and last-refresh gauges, and a liveness probe
 - Rate limiting (`--query-rate`) and request validation
+- TSIG (RFC 8945), with per-key zone scoping so one partner's key is not a key
+  to every zone
 
 ## Local Development
 

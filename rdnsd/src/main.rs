@@ -819,10 +819,19 @@ async fn serve(
     let transfers = if transfer_acl.is_empty() && tsig_keys.is_empty() {
         "refused (no --allow-transfer, no --tsig-key)".to_string()
     } else {
+        // The per-key scope is spelled out rather than counted. A key that may
+        // transfer every zone is a policy decision, and it used to be the *only*
+        // thing a key could mean — an operator upgrading needs to be able to see
+        // which of their keys are still that wide without reading a changelog.
         format!(
-            "allowed for {} address rule(s) and {} key(s)",
+            "allowed for {} address rule(s) and {} key(s){}",
             transfer_acl.len(),
-            tsig_keys.len()
+            tsig_keys.len(),
+            if tsig_keys.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", tsig_keys.describe())
+            }
         )
     };
     let budget = if response_rate == 0 {
@@ -1286,6 +1295,37 @@ impl Server {
         // An IXFR is gated identically, and for the identical reason: it may
         // *answer* with the whole zone (RFC 1995 §4), so a policy that let it
         // through would be no policy at all.
+        // A key is not a licence to transfer *everything*. This used to ask only
+        // whether a session existed, so holding any key in the keyring
+        // transferred any zone and bypassed `--allow-transfer` entirely: hand a
+        // per-customer key to one partner and you handed them every zone on the
+        // server, including ones whose ACL named nobody.
+        //
+        // Checked here, before the zone is looked up and before any message is
+        // built — the point of an authorization check is that the work does not
+        // happen. A key with no zone list still authorizes everything; see
+        // `TsigKey::zones` for why the default did not change, and the startup
+        // banner for how an operator finds out.
+        //
+        // A refused *authenticated* request is still REFUSED rather than NOTAUTH:
+        // the peer proved who it is and the answer is no, which is a policy
+        // decision about this server, not a statement about the zone's authority.
+        let apex = absolute_name(&qname);
+        let unauthorized = session
+            .as_ref()
+            .filter(|s| !s.may_transfer(&apex))
+            .map(|s| s.key_name().to_string());
+        if let Some(key_name) = unauthorized {
+            self.logger.log_error(
+                ip,
+                &format!("{kind} of {qname} refused: key {key_name} is not allowed to transfer it"),
+            );
+            println!(
+                "{kind} of {qname} from {ip}: REFUSED (key {key_name} is scoped to other zones)"
+            );
+            return self.transfer_error(msg, ResponseCode::Refused, ip, session);
+        }
+
         let authenticated_by = session.as_ref().map(|s| s.key_name().to_string());
         if authenticated_by.is_none() && !self.transfer_acl.allows(ip) {
             self.logger.log_error(
@@ -1295,7 +1335,8 @@ impl Server {
                 ),
             );
             println!("{kind} of {qname} from {ip}: REFUSED (no TSIG key, not in --allow-transfer)");
-            return self.transfer_error(msg, ResponseCode::Refused, ip);
+            // No session on this path by construction — it is the "no key" case.
+            return self.transfer_error(msg, ResponseCode::Refused, ip, None);
         }
 
         // A transfer names a zone apex, not any name within it: transferring
@@ -1310,7 +1351,7 @@ impl Server {
                 .find(|z| z.origin().eq_ignore_ascii_case(&apex))
             else {
                 println!("{kind} of {qname} from {ip}: NOTAUTH (not a zone served here)");
-                return self.transfer_error(msg, ResponseCode::NotAuthorized, ip);
+                return self.transfer_error(msg, ResponseCode::NotAuthorized, ip, session);
             };
             let built = if incremental {
                 // The delta log is read under the zone lock, so the increments
@@ -1340,7 +1381,7 @@ impl Server {
                 Err(e) => {
                     self.logger
                         .log_error(ip, &format!("{kind} of {qname}: {e}"));
-                    return self.transfer_error(msg, ResponseCode::ServerFailure, ip);
+                    return self.transfer_error(msg, ResponseCode::ServerFailure, ip, session);
                 }
             }
         };
@@ -1357,7 +1398,7 @@ impl Server {
                     // up on the whole thing rather than send a prefix of it.
                     self.logger
                         .log_error(ip, &format!("{kind} of {qname}: serialization error: {e}"));
-                    return self.transfer_error(msg, ResponseCode::ServerFailure, ip);
+                    return self.transfer_error(msg, ResponseCode::ServerFailure, ip, session);
                 }
             };
             // Every envelope is signed, and the MACs chain (RFC 8945 §5.3.1): a
@@ -1369,7 +1410,8 @@ impl Server {
                     Err(e) => {
                         self.logger
                             .log_error(ip, &format!("{kind} of {qname}: TSIG signing failed: {e}"));
-                        return self.transfer_error(msg, ResponseCode::ServerFailure, ip);
+                        // Deliberately unsigned: signing is what just failed.
+                        return self.transfer_error(msg, ResponseCode::ServerFailure, ip, None);
                     }
                 },
                 None => bytes,
@@ -1390,16 +1432,49 @@ impl Server {
         frames
     }
 
-    /// One framed error response to a transfer request.
-    fn transfer_error(&self, msg: &DnsMessage, rcode: ResponseCode, ip: IpAddr) -> Vec<Vec<u8>> {
-        match self.error_bytes(msg, rcode) {
-            Some(bytes) => vec![frame(&bytes)],
-            None => {
-                self.logger
-                    .log_error(ip, "could not serialize an error response");
-                Vec::new()
-            }
-        }
+    /// One framed error response to a transfer request, **signed if the request
+    /// was**.
+    ///
+    /// RFC 8945 §5.3: a response to a request whose TSIG verified is itself
+    /// signed, and that includes an error response. This did not sign, and the
+    /// consequence is the one this codebase keeps running into — the client
+    /// cannot tell the difference between two things: a server that refused it,
+    /// and a reply that was tampered with in flight. `dns.query.xfr` reports the
+    /// unsigned REFUSED as "the TSIG record is malformed", which sends whoever
+    /// is debugging it after a key mismatch that does not exist.
+    ///
+    /// Found by writing a test for the *authorization* fix below and being told
+    /// the wrong thing by the client — the refusal was working, the reply was
+    /// simply unreadable. It applies to every error on this path, not just that
+    /// one: NOTAUTH for a zone we do not serve, SERVFAIL for a transfer that
+    /// would not build, and a signing failure.
+    fn transfer_error(
+        &self,
+        msg: &DnsMessage,
+        rcode: ResponseCode,
+        ip: IpAddr,
+        session: Option<&mut TsigSession>,
+    ) -> Vec<Vec<u8>> {
+        let Some(bytes) = self.error_bytes(msg, rcode) else {
+            self.logger
+                .log_error(ip, "could not serialize an error response");
+            return Vec::new();
+        };
+        let bytes = match session {
+            Some(session) => match session.sign(bytes, current_unix_timestamp()) {
+                Ok(signed) => signed,
+                Err(e) => {
+                    // Nothing useful left to send: an unsigned error is what we
+                    // were trying not to produce, so say so here rather than
+                    // emitting one anyway.
+                    self.logger
+                        .log_error(ip, &format!("signing an error response failed: {e}"));
+                    return Vec::new();
+                }
+            },
+            None => bytes,
+        };
+        vec![frame(&bytes)]
     }
 
     /// An empty response to `msg` carrying `rcode`, serialized.
@@ -1794,14 +1869,59 @@ impl Reloading {
     }
 }
 
-/// Spawn a signal handler task to reload zones on SIGHUP (Unix only)
+/// One reload, installed and announced. What SIGHUP and the re-signing timer
+/// both do, so that they cannot drift apart (`CLAUDE.md` §7).
+///
+/// Returns the announced-serial state to carry into the next round.
+async fn reload_once(
+    reloading: &Reloading,
+    source: &ZoneSource,
+    served: &Served,
+    notify_targets: &[SocketAddr],
+    announced: Vec<(String, u32)>,
+    busy: &Busy,
+    why: &str,
+) -> Vec<(String, u32)> {
+    match reloading.load(source).await {
+        Ok(new_zones) => {
+            // A reload is a version step like any other: the difference from
+            // what we were serving is what an IXFR will answer with, and this is
+            // the only moment both versions exist.
+            install_all_zones(served, new_zones).await;
+            // A reload re-reads the files, so a zone withdrawn for EXPIRE is
+            // back in the map at this point. Judge it again before anything is
+            // announced or answered.
+            reloading.withdraw_unvouched(served).await;
+            println!("Zones reloaded ({why})");
+            // The point of reloading is that something changed — new data, or at
+            // minimum new signatures and a new serial — so this is exactly when a
+            // secondary wants to hear about it.
+            announce_zones(&served.zone_map, &announced, notify_targets, busy).await
+        }
+        Err(e) => {
+            // The zones already loaded keep answering. A reload that failed is a
+            // file that changed for the worse, and the version in memory is the
+            // last one known good.
+            eprintln!("Failed to reload zones ({why}): {e}");
+            announced
+        }
+    }
+}
+
+/// Keep the zones current: reload on SIGHUP, and re-sign on a timer.
+///
+/// **One task, deliberately.** The re-signing timer does its work by *reloading*
+/// — see [`ZoneSigning::resign_interval`] for why that is the right shape — so it
+/// and SIGHUP are the same operation on two triggers. Two tasks would mean two
+/// reloads able to run at once, each installing a different snapshot of the
+/// files, and two independent ideas of which serials have been announced. One
+/// loop selecting over both triggers has neither problem.
 ///
 /// It holds a [`Busy`] and exits on [`Stop`], in that order of importance: a
 /// reload part-way through installing zones is work the drain should wait for,
 /// and a task that never exits while holding a `Busy` would spend the whole
 /// drain budget every single shutdown.
-#[cfg(unix)]
-fn spawn_signal_handler(
+fn spawn_zone_maintenance(
     served: Served,
     source: ZoneSource,
     notify_targets: Vec<SocketAddr>,
@@ -1810,65 +1930,98 @@ fn spawn_signal_handler(
     lifecycle: Lifecycle,
 ) {
     let Lifecycle { stop, busy } = lifecycle;
-    let zone_map_clone = Arc::clone(&served.zone_map);
-    let source_clone = source.clone();
+    // `None` when nothing is signed: a server with no keys has nothing to
+    // re-sign, and a timer that fired anyway would reload the zones on a
+    // schedule nobody asked for.
+    let resign_every = reloading.signing.as_ref().map(|s| s.resign_interval());
+    if let Some(every) = resign_every {
+        println!(
+            "re-signing every {}h, a third of the {}-day signature validity",
+            every.as_secs() / 3600,
+            reloading
+                .signing
+                .as_ref()
+                .map(|s| s.validity_days())
+                .unwrap_or(0),
+        );
+    }
+
     tokio::spawn(async move {
         let _busy = busy;
         let mut announced = announced;
-        if let Ok(mut signals) = Signals::new(&[SIGHUP]) {
-            loop {
-                // A SIGHUP that arrives during shutdown is ignored: reloading
-                // zones we are about to stop serving is work for nobody.
-                tokio::select! {
-                    next = signals.next() => {
-                        if next.is_none() {
-                            break;
-                        }
+        let mut signals = signal_stream();
+        loop {
+            // Whichever comes first. A trigger that arrives during shutdown is
+            // ignored: reloading zones we are about to stop serving is work for
+            // nobody.
+            let why = tokio::select! {
+                reloaded = next_reload_signal(&mut signals) => {
+                    if !reloaded {
+                        break;
                     }
-                    _ = stop.wait() => break,
+                    "SIGHUP"
                 }
-                match reloading.load(&source_clone).await {
-                    Ok(new_zones) => {
-                        // A reload is a version step like any other: the
-                        // difference from what we were serving is what an IXFR
-                        // will answer with, and this is the only moment both
-                        // versions exist.
-                        install_all_zones(&served, new_zones).await;
-                        // A reload re-reads the files, so a zone withdrawn for
-                        // EXPIRE is back in the map at this point. Judge it
-                        // again before anything is announced or answered.
-                        reloading.withdraw_unvouched(&served).await;
-                        println!("Zones reloaded via SIGHUP");
-                        // The point of reloading is that something changed, so
-                        // this is exactly when a secondary wants to hear about it.
-                        announced =
-                            announce_zones(&zone_map_clone, &announced, &notify_targets, &_busy)
-                                .await;
-                    }
-                    Err(e) => {
-                        // The zones already loaded keep answering. A reload
-                        // that failed is a file that changed for the worse, and
-                        // the version in memory is the last one known good.
-                        eprintln!("Failed to reload zones: {e}");
-                    }
-                }
-            }
+                _ = sleep_for(resign_every) => "signature refresh",
+                _ = stop.wait() => break,
+            };
+            announced = reload_once(
+                &reloading,
+                &source,
+                &served,
+                &notify_targets,
+                announced,
+                &_busy,
+                why,
+            )
+            .await;
         }
     });
 }
 
-/// No-op signal handler for non-Unix platforms
+/// Sleep for `every`, or forever when there is nothing to wait for.
+///
+/// `pending()` rather than a long sleep, so an unsigned server's maintenance task
+/// costs one parked future rather than waking up to do nothing.
+async fn sleep_for(every: Option<Duration>) {
+    match every {
+        Some(every) => tokio::time::sleep(every).await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(unix)]
+fn signal_stream() -> Option<Signals> {
+    match Signals::new([SIGHUP]) {
+        Ok(signals) => Some(signals),
+        Err(e) => {
+            // The re-signing timer still works, which is the half with teeth.
+            eprintln!("could not listen for SIGHUP ({e}); zones will not reload on signal");
+            None
+        }
+    }
+}
+
+/// Whether a reload was asked for. `false` means the signal source ended and the
+/// loop should stop watching it.
+#[cfg(unix)]
+async fn next_reload_signal(signals: &mut Option<Signals>) -> bool {
+    match signals {
+        Some(signals) => signals.next().await.is_some(),
+        // No signal source, but the timer may still fire — so park here rather
+        // than ending the loop.
+        None => std::future::pending().await,
+    }
+}
+
+/// Windows has no SIGHUP, so only the timer triggers a reload here.
 #[cfg(not(unix))]
-fn spawn_signal_handler(
-    _served: Served,
-    _source: ZoneSource,
-    _notify_targets: Vec<SocketAddr>,
-    _announced: Vec<(String, u32)>,
-    _reloading: Reloading,
-    _lifecycle: Lifecycle,
-) {
-    // Signal handling not supported on this platform, so a zone change is only
-    // announced at startup here.
+fn signal_stream() -> Option<()> {
+    None
+}
+
+#[cfg(not(unix))]
+async fn next_reload_signal(_signals: &mut Option<()>) -> bool {
+    std::future::pending().await
 }
 
 /// `addr` or `addr:port` for a secondary, defaulting to port 53.
@@ -2741,8 +2894,8 @@ async fn main() -> Result<()> {
     // this runs at startup and not only on reload.
     let announced = announce_zones(&zone_map, &[], &notify_targets, &shutdown.busy()).await;
 
-    // Zone reload on SIGHUP, where signals exist.
-    spawn_signal_handler(
+    // Reload on SIGHUP, and re-sign on the signature timer.
+    spawn_zone_maintenance(
         served.clone(),
         source,
         notify_targets,
@@ -2900,6 +3053,33 @@ impl ZoneSigning {
                 DenialChain::Nsec
             },
         }))
+    }
+
+    /// How often the zones should be re-signed.
+    ///
+    /// A third of the validity, so a failed run has two more chances before
+    /// anything expires — see `zone_signer::RESIGN_FRACTION` for the reasoning,
+    /// which is BIND's.
+    ///
+    /// **The timer re-signs by reloading**, which is not an implementation
+    /// shortcut but the only correct shape here. The served SOA serial is derived
+    /// from the *file's* serial plus a time term (`zone_signer::signed_serial`),
+    /// and the zone in memory already carries the derived value — so re-signing
+    /// the in-memory copy would apply the derivation to its own output and
+    /// compound the bump on every cycle. Re-reading the file makes it idempotent:
+    /// the file's serial is the input every time. It also means an edit to a zone
+    /// file is picked up within one interval without a SIGHUP, which is a
+    /// behaviour change worth knowing about.
+    ///
+    /// Floored at a minute so that a tiny `--signature-validity`, which is only
+    /// ever a test setting, cannot turn this into a spin loop.
+    fn resign_interval(&self) -> Duration {
+        Duration::from_secs((self.validity / 3).max(60))
+    }
+
+    /// The configured validity in days, for the startup line.
+    fn validity_days(&self) -> u64 {
+        self.validity / 86_400
     }
 
     /// Sign every zone there are keys for, in place.
@@ -3595,6 +3775,102 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Who a TSIG key authorizes
+    // -----------------------------------------------------------------------
+
+    mod transfer_authorization {
+        use super::*;
+        use rdns::tsig::{TsigAlgorithm, TsigKey, TsigKeyring};
+
+        fn key(zones: &[&str]) -> TsigKey {
+            TsigKey::new(
+                "partner.key.",
+                TsigAlgorithm::HmacSha256,
+                b"0123456789012345678901234567890123456789".to_vec(),
+            )
+            .for_zones(zones.iter().copied())
+        }
+
+        /// A primary holding both zones, with an **empty** ACL — so the key is the
+        /// only thing that can authorize a transfer, which is the situation the
+        /// bug was about.
+        async fn primary_with(key: TsigKey) -> SocketAddr {
+            let zone = rdns::zone::parse_zone_file(
+                "$ORIGIN example.com.\n\
+                 $TTL 3600\n\
+                 @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @   IN NS  ns1.example.com.\n\
+                 ns1 IN A   192.0.2.1\n",
+                "example.com.",
+            )
+            .expect("parse");
+            spawn_primary_with_keys(zone, &[], DeltaLog::new(), TsigKeyring::new(vec![key])).await
+        }
+
+        /// The bug: `answer_transfer` asked only whether a session *existed*, so
+        /// any key in the keyring transferred any zone and bypassed
+        /// `--allow-transfer` entirely. Hand a per-customer key to one partner and
+        /// you handed them every zone on the server.
+        #[tokio::test]
+        async fn a_key_scoped_to_another_zone_cannot_transfer_this_one() {
+            let scoped = key(&["other.test."]);
+            let master = primary_with(scoped.clone()).await;
+
+            let err = rdns::xfr::fetch_zone(master, "example.com.", Some(&scoped))
+                .await
+                .expect_err("a key scoped to other.test. must not transfer example.com.");
+            // REFUSED, and reported as a refusal rather than as a bad signature:
+            // the peer proved who it is and the answer is still no.
+            assert!(
+                err.to_string().contains("Refused"),
+                "want a refusal, got: {err}"
+            );
+        }
+
+        /// The control. Narrowing must not break the case it exists to serve.
+        #[tokio::test]
+        async fn a_key_scoped_to_this_zone_transfers_it() {
+            let scoped = key(&["example.com."]);
+            let master = primary_with(scoped.clone()).await;
+
+            let zone = rdns::xfr::fetch_zone(master, "example.com.", Some(&scoped))
+                .await
+                .expect("a key naming this zone must transfer it");
+            assert_eq!(zone.serial(), Some(1));
+        }
+
+        /// Case-insensitively, and with or without the trailing dot — a zone name
+        /// is a domain name, and every other comparison in this codebase folds
+        /// ASCII case (RFC 4343). An operator who wrote `EXAMPLE.COM` in a flag
+        /// must not get a silent refusal at 3am.
+        #[tokio::test]
+        async fn the_zone_list_is_matched_as_a_domain_name() {
+            let scoped = key(&["EXAMPLE.com"]);
+            let master = primary_with(scoped.clone()).await;
+
+            let zone = rdns::xfr::fetch_zone(master, "example.com.", Some(&scoped))
+                .await
+                .expect("case and the trailing dot must not decide authorization");
+            assert_eq!(zone.serial(), Some(1));
+        }
+
+        /// The preserved default, stated as a test so that changing it is a
+        /// deliberate act rather than a side effect. A key with no zone list still
+        /// transfers everything: making it deny instead would mean upgrading the
+        /// binary silently stops every transfer on a working deployment.
+        #[tokio::test]
+        async fn a_key_with_no_zone_list_still_transfers_everything() {
+            let unscoped = key(&[]);
+            let master = primary_with(unscoped.clone()).await;
+
+            let zone = rdns::xfr::fetch_zone(master, "example.com.", Some(&unscoped))
+                .await
+                .expect("an unscoped key is unrestricted, as it always was");
+            assert_eq!(zone.serial(), Some(1));
+        }
+    }
+
     /// A primary on a loopback port, answering with `rdnsd`'s own AXFR path.
     ///
     /// Deliberately the real thing rather than a stub: `Server::serve_connection`
@@ -3623,6 +3899,18 @@ mod tests {
     }
 
     async fn spawn_primary_inner(zone: Zone, acl: &[String], log: DeltaLog) -> SocketAddr {
+        spawn_primary_with_keys(zone, acl, log, TsigKeyring::new(Vec::new())).await
+    }
+
+    /// A primary that knows some TSIG keys, for the authorization tests. The ACL
+    /// is deliberately empty in those, so the key is the *only* thing that can
+    /// grant a transfer.
+    async fn spawn_primary_with_keys(
+        zone: Zone,
+        acl: &[String],
+        log: DeltaLog,
+        keys: TsigKeyring,
+    ) -> SocketAddr {
         let mut zones = HashMap::new();
         zones.insert(zone.origin().to_string(), zone);
 
@@ -3633,7 +3921,7 @@ mod tests {
             logger: Arc::new(QueryLogger::new()),
             metrics: Arc::new(DnsMetrics::new()),
             transfer_acl: Arc::new(TransferAcl::parse(acl).expect("acl")),
-            tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
+            tsig_keys: Arc::new(keys),
             response_limiter: Arc::new(ResponseLimiter::disabled()),
             secondaries: Arc::new(HashMap::new()),
             deltas: Arc::new(RwLock::new(log)),

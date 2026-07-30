@@ -26,7 +26,7 @@ where to look rather than here.
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **594 lib + 6 allocation + 71 `rdnsd` + 2 `rdnsr`**
+`cargo test --workspace` = **603 lib + 6 allocation + 75 `rdnsd` + 2 `rdnsr`**
 tests passing
 (`rdnsd`'s own 71 cover argument validation, zone sources and the load policy,
 the secondary role and EXPIRE across reloads, both directions of IXFR and onward
@@ -36,7 +36,7 @@ signal arriving mid-AXFR; `rdnsr` had
 **no test module at all** until #9c gave it one), `cargo clippy --workspace
 --all-targets` **clean, no exceptions**, `cargo fmt --all --check` clean. The lib
 count fell from 578 to 567 when dead `serialization.rs` was deleted with its 11
-tests, and is at 594 now: #9e's, #9f's, graceful shutdown's and the metrics
+tests, and is at 603 now: #9e's, #9f's, graceful shutdown's and the metrics
 endpoint's tests, minus the seven that went with `telemetry.rs`.
 
 **Errors are typed in the library and `anyhow` in the binaries (2026-07-28).**
@@ -144,11 +144,13 @@ served under both NSEC and NSEC3. See "Architecture: signing a zone".
 against the zone's own keys before anything is served from it, and `--require-signed`
 turns "this zone is not signed" into a refusal to start.
 
-**What is open now is what signing turned up**, listed under #8: no resigning
-timer (signatures are made at load, so a server up longer than
-`--signature-validity` serves expired ones), no serial bump when a zone is
-re-signed, and `rdnsd` answering NXDOMAIN where a referral belongs — the last of
-which predates all of this and is not a DNSSEC bug. Plus #1's two aggressive-use
+**#8 is closed as of 2026-07-30.** Signatures are re-made on a timer at a third
+of the validity, expiry is spread over a fifth of the window so a zone degrades
+on a slope instead of expiring as one cliff, and the served SOA serial is
+`file_serial + hours_since_epoch` — BIND's "the number served is not the number in
+the file" shape, with the clock standing in for the journal we do not have. The
+comparison with BIND, Knot, PowerDNS and NSD that settled the serial question is
+written out under #8. Plus #1's two aggressive-use
 extensions, and #6, a candidate rather than a plan.
 
 **A five-way code review (2026-07-27) found rather more, and #9a/#9b are the part
@@ -261,6 +263,13 @@ kill -TERM $(pgrep rdnsd)
 # sends), so the effective policy is in the startup banner.
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --query-rate 5000 --query-burst 500 --query-rate-exempt 10.0.0.0/8
+
+# Signing re-signs on a timer now: a third of --signature-validity, and expiry is
+# spread over a fifth of the window so the zone degrades on a slope rather than
+# expiring all at once. The SERVED SOA serial is not the file's — it is
+# file_serial + hours-since-epoch, so a secondary sees each re-signing as a new
+# version (see #8). A zone-file edit is also picked up within one interval
+# without a SIGHUP.
 
 # Sign a zone. Once, to make the keys and learn the DS to give the parent:
 cargo run -p rdnsd -- --signing-key-dir ./keys --generate-keys example.com
@@ -426,10 +435,11 @@ under "Closed work" further down.
 
 | # | what | open |
 |---|------|------|
-| **9** | what the five-way code review turned up | **15** — 9a, 9b, 9c and **9f** are closed, 9e is down to three; what is left is mostly operability |
-| **8** | what signing turned up | **2** — both about re-signing a running server |
+| **9** | what the five-way code review turned up | **16** — 9a, 9b, 9c and **9f** are closed; what is left is mostly operability, plus the allocation findings the DHAT pass turned up |
+| **8** | what signing turned up | **0** — the re-signing timer and its serial are done |
 | **7** | the secondary role | **1**, and conditional |
 | **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
+| **11** | data layout and CPU cache friendliness | **0** — a stretch goal; blocked on a measurement this machine cannot make |
 | **5** | smaller open items | **0** |
 
 ### 9. What a five-way code review turned up (2026-07-27)
@@ -983,7 +993,10 @@ here degrades quietly with the process healthy and nothing alerting.
       increments a map nothing ever reads. Fix: `--query-rate`, `--query-burst`,
       `--query-rate-exempt <CIDR>`, and a default at least 10× higher — or off for
       `rdnsd`, which fronts resolvers rather than end users.
-- [ ] **Nothing re-signs a running server** — already #8's first bullet, and the
+- [x] **Nothing re-signs a running server** — **done 2026-07-30**, with #8's two
+      bullets; see #8 for the design and the reasoning. Original finding follows.
+
+      Already #8's first bullet, and the
       review confirms the 3am shape: exactly `--signature-validity` days after the
       last deploy, every validating resolver SERVFAILs the entire zone at once,
       while the server is healthy and `dig +norec` looks perfect. Until the timer
@@ -1242,7 +1255,54 @@ here degrades quietly with the process healthy and nothing alerting.
       with a `[zones.<name>]` table, `--tsig-key-file` reading mode-0600 secrets,
       and `--check-config` that validates and exits without binding. Largest item
       here, and the one that makes the rest configuration-manageable.
-- [ ] **Any configured TSIG key authorizes a transfer of every zone**
+- [x] **Any configured TSIG key authorizes a transfer of every zone** — **done
+      2026-07-30.** `TsigKey` carries a zone list, `--tsig-key` takes it as a
+      fourth field, and `answer_transfer` checks it against the requested apex
+      **before** the zone is looked up or any message is built — the point of an
+      authorization check being that the work does not happen. The check hangs off
+      the `TsigSession` rather than a fresh keyring lookup, because the session
+      *is* the answer to "which key was this" and a key name is attacker-supplied
+      until the MAC verifies.
+
+      Matched as a domain name: ASCII case and the trailing dot do not decide
+      authorization (RFC 4343), and a *child* of a listed zone is refused —
+      a transfer hands over a whole zone, so anything less specific than the apex
+      authorizes more than it names.
+
+      **A zone list requires the algorithm to be spelled out**, because
+      `name:secret:zones` and `alg:name:secret` are both three colon-separated
+      fields and telling them apart would mean guessing whether the first field
+      looks like an algorithm. Failing at startup with a message beats reading a
+      zone list as a base64 secret. An empty list — a bare trailing colon, or a
+      trailing comma — is an error rather than a silent widening to everything.
+
+      **The default did not change, deliberately, and that is the remaining sharp
+      edge.** A key with no zone list still transfers every zone: making it deny
+      would mean upgrading the binary silently stops every transfer on a working
+      deployment. What changed is that scoping is *expressible* and an unscoped
+      key is *visible* — the startup banner now names every key and what it may
+      transfer (`[partner.key. -> example.com.]`, or `-> every zone`). Narrowing
+      the default belongs with the config file below, where an operator is editing
+      the whole policy at once rather than reading a changelog.
+
+      **A second bug fell out of testing this, and it was older and wider.** The
+      REFUSED went back **unsigned** even though the request's TSIG had verified,
+      which RFC 8945 §5.3 forbids — and the consequence is this codebase's
+      recurring shape: the client cannot tell a refusal from a tampered reply.
+      dnspython reported the unsigned REFUSED as *"the TSIG record is
+      malformed"*, which sends whoever is debugging it after a key mismatch that
+      does not exist. It applied to **every** error on the transfer path, not just
+      the new one: NOTAUTH for a zone we do not serve, and SERVFAIL for a transfer
+      that would not build. `transfer_error` signs now when there is a verified
+      session, and deliberately does not when signing is what failed.
+
+      Verified against dnspython, whose TSIG is interop-tested against BIND: with
+      `--tsig-key hmac-sha256:partner.key.:<secret>:example.com.` on a server
+      holding two zones, `example.com.` transfers and `other.test.` comes back
+      `TransferError: Zone transfer error: REFUSED` — readable, which it was not
+      before the signing fix. With the same key unscoped, both transfer, which is
+      what every key used to do. Original finding follows.
+
       (`rdnsd/src/main.rs:796`). `answer_transfer` asks only whether a session
       exists — `authenticated_by.is_none()` — so holding *any* key in the keyring
       transfers *any* zone, and bypasses `--allow-transfer` entirely. `TsigKeyring`
@@ -1626,6 +1686,37 @@ into a measurement you can re-run, and it is what tells you when to stop.
       `(hash, offset, len)` in a `Vec` with linear scan — a message holds a handful
       of distinct names, so that beats `HashMap<String, u16>` outright and removes
       the per-message HashMap construction too.
+- [ ] **`zone::absolutize` allocates four `String`s per query — the largest
+      allocation count on the answer path** (`rdns/src/zone.rs:505`). Found by the
+      DHAT pass, not by reading, and it was on nobody's list. It returns `String`
+      unconditionally, so a qname that arrived **already absolute and already
+      lowercase** — the ordinary case off the wire — is copied once for each of
+      `lookup_key`, `name_kind` and `delegation_for`, plus once more in
+      `resolve_in_zone`. 4 of the ~29 allocations per query, ~14%.
+
+      Fix: return `Cow<str>` from `absolutize`, and give `Zone` a lookup that
+      borrows — `HashMap<String, _>::get` takes `&str`, so a name that needs
+      neither absolutizing nor down-casing can be looked up with no allocation at
+      all. It touches the public `normalize_name`, which is why it is its own item
+      rather than part of the profiling commit. The assertion to prove it is
+      already in `rdns/tests/allocations.rs` ("look up one A record in the zone",
+      currently 5).
+- [ ] **`tokio::spawn` per UDP datagram costs 1,536 bytes — 46% of every byte a
+      query allocates.** Measured, and by far the largest single cost on the
+      path: the task allocation is bigger than the entire rest of the query put
+      together. This is the same defect as #9d's "unbounded `tokio::spawn` per UDP
+      datagram" seen from the other side, so **fix it there** — check the limiter
+      and the validator inline in the recv loop, then `try_acquire_owned` on a
+      semaphore — and this number is how to tell whether it worked. Listed here so
+      the memory cost is visible from the performance section too, rather than
+      only as an admission-control concern.
+- [ ] **Three more per-query allocations the profile named**, none of them
+      individually large, all of them on every single query:
+      `compression::write_name`'s `starts` vec (2 per query — the label offsets,
+      which could be a small stack array since a name has at most 127 labels and
+      in practice four), `make_response`'s `msg.queries.clone()` (2), and `dname`
+      parsing (3). Worth doing together, and worth doing *after* `absolutize`,
+      since that one is bigger than all three.
 - [ ] **EDNS is re-parsed two to four times per query**
       (`rdnsd/src/main.rs:220`, `:236`, `:399`, `:1151`, `:1182`;
       `rdnsr/src/main.rs:611`, `:622`, `:624`). `msg.edns()` runs
@@ -1858,7 +1949,42 @@ is not served correctly.
 Three gaps, in the order they will bite. The first two are signing's own; the
 third is older than signing and was only made visible by it.
 
-- [ ] **Nothing re-signs a running server.** Signatures are made when a zone
+- [x] **Nothing re-signs a running server** — **done 2026-07-30**, and it closes
+      the next bullet with it because the two could not be built separately.
+
+      **The timer re-signs by *reloading*, and that is the load-bearing choice.**
+      `spawn_zone_maintenance` is one task selecting over SIGHUP, the signature
+      timer and the stop signal, and both triggers run the same `reload_once`.
+      One task rather than two, because two could have reloads in flight at once
+      — each installing a different snapshot of the files — and two independent
+      ideas of which serials had been announced.
+
+      Reloading rather than re-signing the zone in memory is not a shortcut. The
+      served serial is derived from the **file's** serial plus a time term, and
+      the in-memory zone already carries the derived value, so re-signing it
+      would apply the derivation to its own output and compound the bump every
+      cycle. Re-reading the file makes it idempotent: the file's serial is the
+      input every time. Side effect worth knowing: a zone-file edit is now picked
+      up within one interval without a SIGHUP.
+
+      **A third of the validity**, so a failed run has two whole windows of slack
+      before anything expires — BIND's default is a quarter and the reasoning is
+      the same: a *missed* re-sign has to be survivable, because the one thing
+      that must never happen is serving expired signatures. Floored at a minute
+      so a tiny `--signature-validity` cannot make it a spin loop. Printed at
+      startup: `re-signing every 24h, a third of the 3-day signature validity`.
+
+      **And the cliff is now a slope.** Every RRSIG in a zone used to get an
+      identical expiration, so the whole zone expired in the same second — which
+      is *why* the failure was "every validating resolver SERVFAILs the entire
+      zone at once". Expiry is spread back over a fifth of the validity,
+      deterministically per (owner, type) via FNV-1a: random jitter would put
+      every name at a different point on the slope on every reload, so the slope
+      would never be the same slope twice. Verified live on a 3-day zone: five
+      distinct expiries spanning 6.6 hours, every RRset still validating under
+      dnspython.
+
+      Original finding follows. Signatures are made when a zone
       loads — startup, and SIGHUP where signals exist — and expire
       `--signature-validity` days later, 30 by default. A server up longer than
       that serves expired signatures, which is bogus rather than merely stale:
@@ -1867,8 +1993,74 @@ third is older than signing and was only made visible by it.
       re-signs at roughly a third of the validity, which `sign_zone` already
       supports — it drops the previous run's output and starts over, so
       re-signing an already-signed zone is the ordinary case, not a special one.
-- [ ] **Re-signing does not bump the SOA serial**, which is what the timer above
-      has to decide before it can be written. New signatures are a new version of
+- [x] **Re-signing does not bump the SOA serial** — **done 2026-07-30.** It does
+      now, and the decision the finding says "deserves deciding rather than
+      defaulting" was settled by looking at what everyone else does. Written up
+      here because the reasoning is the whole of the work.
+
+      **What the other implementations do**, checked rather than recalled:
+
+      - **BIND 9 inline-signing** keeps two zones — the raw unsigned one from the
+        file and a separate signed one with **its own serial** — and increments the
+        signed serial on every re-signing run, even with no zone change. One
+        report has a file sitting at `2016090105` while the world was served
+        `2016090133`, 28 bumps of drift from signing cycles alone.
+        `serial-update-method` picks `increment` (default) or `unixtime`, and the
+        DNSSEC changes go to the **journal**, never the source file.
+      - **Knot DNS** goes further: `zonefile-load: difference-no-serial` takes the
+        field away from the operator entirely — "the SOA serial is handled by the
+        server automatically. So the user no longer needs to care about it in the
+        zone file" — and `serial-policy` covers "after a dynamic update **or
+        automatic DNSSEC signing**". It **requires `journal-content: all`**,
+        because "the information about the last real SOA serial is preserved in
+        case of server re-start".
+      - **PowerDNS** sidesteps re-signing altogether with live signing: RRSIGs are
+        computed at answer time from week boundaries (inception = the most recent
+        Thursday 00:00 UTC, expiry = the Thursday two weeks on), so nothing
+        expires in place. That *creates* the serial problem instead — the serial
+        does not move when signatures roll, so non-PowerDNS secondaries would
+        serve stale signatures — hence `SOA-EDIT`, whose `INCEPTION-EPOCH` sets
+        the serial to "the maximum of the existing serial and the age in seconds
+        of the last RRSIG update".
+      - **NSD** does not sign at all; it serves pre-signed zones and the external
+        signer owns the serial. **Unbound** is a validating resolver and never
+        signs. Both sidestep the question rather than answering it.
+
+      **The convergent answer** is that everyone who signs *and stores*
+      signatures bumps the serial, and they all dissolve the collision the finding
+      worries about the same way: the operator's number and the served number are
+      **different numbers**, so they cannot race.
+
+      **What we could not copy** is the persistence. BIND and Knot both keep the
+      divergence in a journal and we have none (#7 step 6). Without it a restart
+      would go *backwards*, and RFC 1982 makes that worse than it sounds — a
+      secondary that saw `N` and then sees `N-k` reads it as older and will not
+      transfer, so it keeps the signatures that are about to expire. The outage
+      simply moves to restart time.
+
+      **So the clock is the counter**: `served = file_serial + hours_since_epoch`
+      (`zone_signer::signed_serial`). Monotone in wall time by construction, needs
+      nothing persisted, and an operator's `+1` in the file still shows up as `+1`
+      served.
+
+      **Added, not `max`ed, and that correction is the interesting part.** The
+      obvious design — `max(file_serial, now)`, PowerDNS's `INCEPTION-EPOCH`
+      shape — silently does nothing for a date-style serial: `2026073001` is
+      numerically far *larger* than any current Unix timestamp, so the `max`
+      keeps the file's number and never bumps. PowerDNS documents its own version
+      as "requiring epoch-based backend serials" for exactly this reason, which is
+      easy to read past. Hours rather than seconds so the term stays small (about
+      495,000) and does not crowd a date-style serial toward the 32-bit ceiling;
+      hours since the *epoch* rather than a fraction of the validity, so changing
+      `--signature-validity` cannot move the serial backwards.
+
+      Verified live: a zone whose file says serial 1 is served as 495,949, and
+      re-signing the same file at a later hour produces a serial RFC 1982 calls
+      newer while re-signing it in the same hour produces the same one — the
+      first is what makes a secondary transfer, the second is what stops a restart
+      looking like a change.
+
+      Original finding follows. New signatures are a new version of
       the zone as far as a secondary is concerned, and a secondary compares
       serials — so without a bump the replica keeps the signatures it transferred
       and they expire underneath it. With a bump, every re-signing is a zone
@@ -1954,6 +2146,59 @@ record-removal API on `Zone`, and it is worth never adding one: the index holds
 AXFR is "build a new `Zone`, swap it in". An IXFR delta is "build a new `Zone` from
 the old records minus the deletes plus the adds, swap it in" — O(zone size) per
 transfer rather than per record, which at any zone size this serves is nothing.
+
+### 11. Data layout and CPU cache friendliness — a stretch goal, on purpose
+
+**Not scheduled, and the reason it is written down is that it is a different kind
+of item from everything above.** Every other performance entry here fixes
+something that is *wrong* — a quadratic, a 64 KB buffer, an allocation that
+should not exist. This one is about how far a correct implementation can be
+pushed, which is a question worth answering even when the answer does not change
+a production number.
+
+**Be honest about the ceiling first.** A DNS server is dominated by syscalls and
+the network: the DHAT pass measured a whole answer at about 3.3 KB and 29
+allocations, of which **1,536 bytes is the `tokio::spawn`** and a good deal of the
+rest is the kernel round trip that no data layout touches. Against a UDP
+`recvfrom`/`sendto` pair, a cache miss in a zone index is noise. So the framing
+is "how far can this reasonably be taken", not "this will make the server
+faster" — and anything found here should be reported with the honesty §10 asks
+for, including the negative results.
+
+That said, there is real structure to attack, and the profiling harness to judge
+it with already exists:
+
+- **`Zone`'s index is `HashMap<String, Vec<usize>>` into a `Vec<ZoneRecord>`.**
+  Every lookup hashes an owned `String` and then chases a pointer per position.
+  The positions-into-a-vector design is deliberate and load-bearing (see #7's
+  "one simplification worth not re-deriving" — it is why `Zone` has no
+  record-removal API), so what is on the table is the *key* side: interning names,
+  a sorted `Vec` with binary search instead of a hash, or storing a hash and
+  comparing bytes rather than `String`s.
+- **`ZoneRecord` holds a `String` name and a `RecordData` with a `Vec<u8>`.** Two
+  indirections per record, and a scan over an RRset touches both. An arena of
+  name bytes plus `(offset, len)` — the shape the name compressor moved to
+  already, and where it went from ~8 allocations per name to one copy — applies
+  to the zone too.
+- **`of_type` filters a `Vec<usize>` by calling `record_type_code` per record**,
+  which parses the record's discriminant. Storing the rtype beside the position
+  would make the filter a scan over `u16`s: one cache line per eight candidates
+  instead of one indirection each.
+- **The per-message name compressor is a `Vec<Suffix>` with a linear scan**, which
+  is already the cache-friendly choice and is worth *measuring* rather than
+  changing — a handful of entries scanned linearly beats a hash, and confirming
+  that is as useful as improving it.
+
+**What to measure with, since guessing here is worse than useless.** Wall-clock
+alone will not resolve it: the differences are small enough to be lost in the
+syscall noise, which is exactly the trap `bench.rs` fell into. The tools that
+would answer it are hardware counters — cache misses and branch mispredicts per
+query — which means `perf stat` on Linux, since the Windows box this was
+developed on has no equivalent worth trusting. **That is the honest blocker**: the
+one measurement that could tell whether a layout change helped is not available
+here, so this item needs either a Linux target or a criterion conversion careful
+enough to see single-digit-percent effects. The criterion conversion is already an
+open item at the end of #9e; do it first.
 
 ### 10. Dynamic UPDATE (RFC 2136) — the dependency nothing schedules
 

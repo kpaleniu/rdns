@@ -167,6 +167,15 @@ class left the process healthy with nothing alerting.
   `0xC000013A` — the exact failure the change existed to fix, shipped alongside
   a comment saying it could not happen. Reading the docs is not the same as
   reading the code, and neither is the same as sending the signal.
+- **Check what the other implementations do, and quote them.** The SOA-serial
+  question under `TODO.md` #8 sat undecided for weeks and was settled in twenty
+  minutes by reading BIND's, Knot's, PowerDNS's and NSD's answers — which
+  *converge*, and converge on something better than either option that had been
+  written down. It also caught a design error before it shipped: `max(file, now)`
+  looks obviously right and silently does nothing for a date-style serial, and
+  PowerDNS's docs say so in five words ("requiring epoch-based backend serials")
+  that are easy to read past. A protocol this old has had every decision made
+  several times already.
 - **Prove an operational fix by provoking the failure, not by reading the diff.**
   The three unit tests for shutdown passed against the broken signal handler,
   because they call `Shutdown::begin()` directly and never involve the operating
@@ -301,6 +310,25 @@ Cheap to re-check, expensive to rediscover.
   a bug pattern**: `Layout::of` was taken before NSEC3PARAM was added, so the apex
   NSEC3 denied a type that was there — and an aggressive-NSEC resolver would then
   synthesize that false NODATA for other clients out of its cache.
+- **Re-signing is a new version of the zone, so the serial has to move.** A
+  secondary decides whether to transfer by comparing serials; without a bump the
+  replica keeps the signatures it already has and they expire underneath it —
+  the same outage as never re-signing, one hop downstream. Everyone who signs and
+  *stores* signatures does this, and they all dissolve the "but the operator owns
+  that number" objection the same way: the served serial and the file's serial are
+  **different numbers**, so they cannot collide. BIND's inline-signing serves a
+  number that visibly drifts from the file's; Knot takes the field away from the
+  operator entirely.
+- **Do not give every RRSIG in a zone the same expiration.** They then all expire
+  in the same second, which turns "signatures lapsed" into "the entire zone
+  SERVFAILs at every validator at once". Spread expiry across a fraction of the
+  window — and make the spread **deterministic** per (owner, type), because random
+  jitter reshuffles the slope on every reload and no two servers holding the zone
+  agree about it. Never spread *past* the requested validity: 30 days means at
+  most 30 days.
+- **Re-sign with slack, not just before expiry.** A third of the validity (BIND
+  uses a quarter) leaves room for a run to fail, or for the server to be down
+  over one, without anything expiring. A missed re-sign has to be survivable.
 - **A QTYPE is not an RTYPE and a QCLASS is not a CLASS.** The question carries
   values no stored record can ever hold — ANY is QTYPE 255 and QCLASS 255,
   neither of which any RR *is* — so `record_type_code(&r.rdata) == qtype` matched
@@ -587,3 +615,41 @@ by the caller's actual limit, and each cost more than it looks.
   *rest of the scrape* unparseable. Zone names come from a file an operator
   wrote, and RFC 1035 §5.1 allows escapes in one, so "should not contain a quote"
   is not "cannot".
+
+## 15. Authentication is not authorization
+
+`answer_transfer` asked whether a TSIG *session existed* and called that
+permission, so holding any key in the keyring transferred any zone and bypassed
+`--allow-transfer` entirely. Hand a per-customer key to one partner and you have
+handed them every zone on the server.
+
+- **"Who are you" and "what may you do" are two questions.** A verified MAC
+  answers the first. It says nothing about the second, and code that treats it as
+  though it did grants everything to anyone who holds anything.
+- **Authorize against the most specific thing the request names.** A transfer
+  hands over a whole zone, so the check is against the *apex* — a rule matching
+  anything less specific authorizes more than it names, which is why a child of a
+  listed zone is refused.
+- **Check before doing the work, not before sending it.** The point of an
+  authorization check is that the zone is never looked up and the messages are
+  never built.
+- **Ask the object that already knows.** The check hangs off the `TsigSession`
+  rather than looking the key up again by name: the session *is* the answer to
+  "which key was this", and a key name is attacker-supplied until the MAC
+  verifies. A second lookup is a second chance to get it wrong.
+- **An authenticated refusal is still signed** (RFC 8945 §5.3). Not doing so was
+  a second, older bug on every error path of the transfer — and the symptom was
+  this codebase's usual one: the client cannot tell a refusal from a tampered
+  reply. dnspython reported the unsigned REFUSED as "the TSIG record is
+  malformed", which sends the reader after a key mismatch that does not exist.
+- **Do not silently narrow a default that would break a working deployment**, but
+  do make the wide case *visible*. An unscoped key still transfers everything,
+  because changing that would mean a version bump stops every transfer with no
+  warning; the startup banner now prints what each key may transfer, so the
+  decision is reviewable instead of invisible. Narrowing belongs with the config
+  file, where the operator is editing the whole policy at once.
+- **Where a new field is ambiguous, require the disambiguating one.** A zone list
+  as a fourth colon-separated field collides with `[alg:]name:secret` at three
+  fields, so a zone list requires the algorithm to be spelled out. Failing at
+  startup with a message beats guessing whether the first field looks like an
+  algorithm name — and beats reading a zone list as a base64 secret.

@@ -119,6 +119,23 @@ pub struct TsigKey {
     pub name: String,
     pub algorithm: TsigAlgorithm,
     secret: Vec<u8>,
+    /// The zone apexes this key may transfer, absolute and down-cased.
+    ///
+    /// **Empty means every zone**, which is what every key used to mean whether
+    /// its holder was meant to have that or not: `answer_transfer` asked only
+    /// whether a session existed, so holding *any* key transferred *any* zone
+    /// and bypassed `--allow-transfer` entirely. Hand a per-customer key to one
+    /// partner and you handed them every zone on the server, including ones
+    /// whose ACL named nobody.
+    ///
+    /// Empty still means everything, deliberately: changing the default would
+    /// mean upgrading the binary silently stops every transfer on a working
+    /// deployment. What changes is that scoping is now *expressible* and an
+    /// unscoped key is *visible* — the startup banner names each key and what it
+    /// may transfer. Narrowing the default belongs with the config file, where an
+    /// operator is editing the whole policy at once rather than reading a
+    /// changelog. See `TODO.md` #9d.
+    zones: Vec<String>,
 }
 
 impl TsigKey {
@@ -127,27 +144,81 @@ impl TsigKey {
             name: canonical_key_name(name),
             algorithm,
             secret,
+            zones: Vec::new(),
         }
     }
 
-    /// Parse `[algorithm:]name:base64secret`, the shape `dig -y` uses.
+    /// Restrict this key to the given zone apexes. No zones means no restriction.
+    pub fn for_zones<I, S>(mut self, zones: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.zones = zones
+            .into_iter()
+            .map(|z| canonical_key_name(z.as_ref()))
+            .collect();
+        self
+    }
+
+    /// Whether this key authorizes a transfer of the zone at `apex`.
     ///
-    /// The algorithm defaults to HMAC-SHA256 when omitted. An unparsable spec is
-    /// an error rather than a skip: a key the operator believes is configured but
-    /// is not would fail every transfer, and the reason would not be visible.
+    /// Checked against the *apex being transferred*, which is the only name that
+    /// matters: a transfer hands over a whole zone, so authorizing by anything
+    /// less specific than the zone itself authorizes more than it names.
+    pub fn may_transfer(&self, apex: &str) -> bool {
+        if self.zones.is_empty() {
+            return true;
+        }
+        let apex = canonical_key_name(apex);
+        self.zones.contains(&apex)
+    }
+
+    /// The zones this key is restricted to, or `None` if it is unrestricted.
+    ///
+    /// For the startup banner: an unscoped key is a policy decision and has to be
+    /// visible, because it is indistinguishable at run time from a scoped one
+    /// until the moment someone transfers a zone you did not mean to give them.
+    pub fn zone_scope(&self) -> Option<&[String]> {
+        if self.zones.is_empty() {
+            None
+        } else {
+            Some(&self.zones)
+        }
+    }
+
+    /// Parse `[algorithm:]name:base64secret[:zone,zone,...]`, the first three
+    /// fields being the shape `dig -y` uses.
+    ///
+    /// The algorithm defaults to HMAC-SHA256 when omitted — but **a zone list
+    /// requires it to be spelled out**, because `name:secret:zones` and
+    /// `alg:name:secret` are both three colon-separated fields and there is no
+    /// way to tell them apart that does not turn on whether the first field
+    /// happens to look like an algorithm name. Requiring the algorithm is the
+    /// less surprising of the two: it fails at startup with a message, rather
+    /// than reading a zone list as a secret.
+    ///
+    /// An unparsable spec is an error rather than a skip: a key the operator
+    /// believes is configured but is not would fail every transfer, and the
+    /// reason would not be visible.
     pub fn parse(spec: &str) -> ConfigResult<Self> {
         let parts: Vec<&str> = spec.split(':').collect();
-        let (algorithm, name, secret) = match parts.as_slice() {
-            [name, secret] => (TsigAlgorithm::HmacSha256, *name, *secret),
-            [alg, name, secret] => (
-                TsigAlgorithm::from_name(alg)
-                    .ok_or_else(|| ConfigError::new(format!("unknown TSIG algorithm {alg:?}")))?,
-                *name,
-                *secret,
-            ),
+        let named_algorithm = |alg: &str| {
+            TsigAlgorithm::from_name(alg)
+                .ok_or_else(|| ConfigError::new(format!("unknown TSIG algorithm {alg:?}")))
+        };
+        // `None` for "no zone field at all" rather than `""`, because an *empty*
+        // fourth field has to be an error: it reads as a narrowing the operator
+        // typed, and an empty list means the opposite — every zone.
+        let (algorithm, name, secret, zones) = match parts.as_slice() {
+            [name, secret] => (TsigAlgorithm::HmacSha256, *name, *secret, None),
+            [alg, name, secret] => (named_algorithm(alg)?, *name, *secret, None),
+            [alg, name, secret, zones] => (named_algorithm(alg)?, *name, *secret, Some(*zones)),
             _ => {
                 return Err(ConfigError::new(format!(
-                    "TSIG key {spec:?} is not [algorithm:]name:base64secret"
+                    "TSIG key {spec:?} is not [algorithm:]name:base64secret[:zone,zone,...] \
+                     (a zone list needs the algorithm spelled out, since otherwise it cannot \
+                     be told apart from one)"
                 )))
             }
         };
@@ -164,7 +235,22 @@ impl TsigKey {
                 "TSIG secret for {name:?} is empty"
             )));
         }
-        Ok(TsigKey::new(name, algorithm, secret))
+
+        // An empty entry — a trailing comma, or a bare trailing colon — means the
+        // operator wrote something they did not mean. Refusing beats silently
+        // narrowing the list, and beats silently *widening* it to every zone,
+        // which is what an empty list means.
+        let mut allowed = Vec::new();
+        for zone in zones.into_iter().flat_map(|z| z.split(',')) {
+            if zone.trim().is_empty() {
+                return Err(ConfigError::new(format!(
+                    "TSIG key {name:?} has an empty zone in its list {:?}",
+                    zones.unwrap_or_default()
+                )));
+            }
+            allowed.push(zone.trim().to_string());
+        }
+        Ok(TsigKey::new(name, algorithm, secret).for_zones(allowed))
     }
 }
 
@@ -208,6 +294,26 @@ impl TsigKeyring {
 
     pub fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    /// Every key, for reporting what the transfer policy actually is.
+    pub fn keys(&self) -> impl Iterator<Item = &TsigKey> {
+        self.keys.iter()
+    }
+
+    /// One line per key: its name and what it may transfer.
+    ///
+    /// Printed at startup because "this key can transfer everything" is a
+    /// decision, and an undisplayed decision is one nobody reviews.
+    pub fn describe(&self) -> String {
+        self.keys
+            .iter()
+            .map(|key| match key.zone_scope() {
+                Some(zones) => format!("{} -> {}", key.name, zones.join(",")),
+                None => format!("{} -> every zone", key.name),
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 }
 
@@ -382,6 +488,16 @@ impl TsigSession {
     /// The name of the key that authenticated the request, for logging.
     pub fn key_name(&self) -> &str {
         &self.key.name
+    }
+
+    /// Whether the key that authenticated this request may transfer `apex`.
+    ///
+    /// On the session rather than reached through the keyring by name, because
+    /// the session *is* the answer to "which key was this" — looking the name up
+    /// again would be a second chance to get it wrong, and a key name is
+    /// attacker-supplied until the MAC verifies.
+    pub fn may_transfer(&self, apex: &str) -> bool {
+        self.key.may_transfer(apex)
     }
 
     /// Sign one response message, returning the bytes with a TSIG appended.
@@ -916,6 +1032,81 @@ mod tests {
         assert!(
             TsigKey::parse("hmac-sha256::AAECAwQFBgcICQoLDA0ODw==").is_err(),
             "no name"
+        );
+    }
+
+    /// A key used to be a licence to transfer **every** zone: `answer_transfer`
+    /// asked only whether a session existed, so holding any key transferred any
+    /// zone and bypassed `--allow-transfer` entirely.
+    #[test]
+    fn a_key_may_be_scoped_to_zones() {
+        let scoped = TsigKey::parse(
+            "hmac-sha256:partner.key:AAECAwQFBgcICQoLDA0ODw==:example.com.,other.test",
+        )
+        .expect("a zone list parses");
+        assert_eq!(
+            scoped.zone_scope().map(<[String]>::len),
+            Some(2),
+            "and is reported, because an unscoped key is a decision to display"
+        );
+        assert!(scoped.may_transfer("example.com."));
+        assert!(
+            scoped.may_transfer("OTHER.TEST"),
+            "a zone name is a domain name: ASCII case and the trailing dot do not \
+             decide authorization (RFC 4343)"
+        );
+        assert!(
+            !scoped.may_transfer("third.test."),
+            "a zone it does not name is refused"
+        );
+        assert!(
+            !scoped.may_transfer("sub.example.com."),
+            "and so is a child — a transfer hands over a whole zone, so anything \
+             less specific than the apex authorizes more than it names"
+        );
+
+        // The preserved default, so that changing it has to be deliberate.
+        let unscoped = TsigKey::parse("hmac-sha256:any.key:AAECAwQFBgcICQoLDA0ODw==").unwrap();
+        assert_eq!(unscoped.zone_scope(), None);
+        assert!(unscoped.may_transfer("anything.test."));
+    }
+
+    /// A zone list needs the algorithm spelled out, because `name:secret:zones`
+    /// and `alg:name:secret` are both three colon-separated fields. Failing at
+    /// startup with a message beats reading a zone list as a base64 secret.
+    #[test]
+    fn a_zone_list_without_an_algorithm_is_an_error_rather_than_a_guess() {
+        // Three fields where the first is not an algorithm: refused, and *not*
+        // read as name:secret:zones.
+        assert!(TsigKey::parse("my.key:AAECAwQFBgcICQoLDA0ODw==:example.com.").is_err());
+        // An empty entry means the operator wrote something they did not mean.
+        // Refusing beats silently narrowing the list — or widening it to
+        // everything, which is what an empty list means.
+        assert!(
+            TsigKey::parse("hmac-sha256:k:AAECAwQFBgcICQoLDA0ODw==:example.com.,").is_err(),
+            "a trailing comma"
+        );
+        assert!(
+            TsigKey::parse("hmac-sha256:k:AAECAwQFBgcICQoLDA0ODw==:").is_err(),
+            "no zones"
+        );
+    }
+
+    /// The startup banner has to name each key's scope: "this key can transfer
+    /// everything" is indistinguishable at run time from a scoped key until the
+    /// moment someone transfers a zone you did not mean to give them.
+    #[test]
+    fn the_keyring_describes_what_each_key_may_transfer() {
+        let ring = TsigKeyring::new(vec![
+            TsigKey::new("wide.key.", TsigAlgorithm::HmacSha256, vec![1; 32]),
+            TsigKey::new("narrow.key.", TsigAlgorithm::HmacSha256, vec![2; 32])
+                .for_zones(["example.com."]),
+        ]);
+        let described = ring.describe();
+        assert!(described.contains("wide.key. -> every zone"), "{described}");
+        assert!(
+            described.contains("narrow.key. -> example.com."),
+            "{described}"
         );
     }
 

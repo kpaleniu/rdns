@@ -105,14 +105,47 @@ impl DenialChain {
     }
 }
 
+/// How much of the validity window signature expiry is spread across.
+///
+/// **Why spread it at all.** Every RRSIG in a zone used to be given the same
+/// expiration, so the whole zone expired in the same second — which is precisely
+/// why the failure this guards against is "*every* validating resolver SERVFAILs
+/// the *entire* zone at once". Jitter turns that cliff into a slope: the zone
+/// degrades over a fifth of its validity instead of vanishing, which is the
+/// difference between a page that says "one zone is losing signatures" and an
+/// outage. BIND jitters expiry for the same reason.
+///
+/// A fifth is a compromise. Wider spreads the risk further but shortens the
+/// effective life of the earliest signatures; narrower makes the slope steeper.
+const EXPIRY_JITTER_FRACTION: u64 = 5;
+
+/// The fraction of the validity window after which a zone wants re-signing.
+///
+/// A third, so there are two whole windows of slack: if a re-signing run fails,
+/// or a server is down over one, the signatures are still valid for the next two
+/// attempts. BIND's default is a quarter of the validity, and the reasoning is
+/// the same — the point is that a *missed* re-sign is survivable, because the one
+/// thing that must never happen is serving expired signatures.
+const RESIGN_FRACTION: u64 = 3;
+
 /// The choices a signing run makes that are not in the zone or in the keys.
 #[derive(Debug, Clone)]
 pub struct SigningPolicy {
     /// When the signatures start being valid.
     pub inception: u32,
-    /// When they stop.
+    /// When they stop — the *latest* expiry in the zone. Individual RRsets
+    /// expire earlier, spread back over [`EXPIRY_JITTER_FRACTION`] of the
+    /// window; see [`SigningPolicy::expiry_for`].
     pub expiration: u32,
     pub chain: DenialChain,
+    /// The validity window in seconds, kept so the policy can say when the zone
+    /// should be signed again and how far to spread expiry.
+    validity: u64,
+    /// The wall-clock second this signing run belongs to, which is what the
+    /// served SOA serial is derived from. Not the same as `inception`, which is
+    /// backdated for clock skew — a serial derived from a backdated time would
+    /// step backwards the moment the allowance changed.
+    signed_at: u64,
 }
 
 impl SigningPolicy {
@@ -128,6 +161,8 @@ impl SigningPolicy {
             inception: now.saturating_sub(CLOCK_SKEW_ALLOWANCE) as u32,
             expiration: now.saturating_add(validity) as u32,
             chain: DenialChain::Nsec,
+            validity,
+            signed_at: now,
         }
     }
 
@@ -135,6 +170,98 @@ impl SigningPolicy {
         self.chain = chain;
         self
     }
+
+    /// When the zone signed under this policy should be signed again.
+    ///
+    /// A third of the validity after inception, so a failed run has two more
+    /// chances before anything expires. Nothing calls this inside the signer —
+    /// it is for the daemon's re-signing timer, and it lives here because the
+    /// number has to agree with the validity it is a fraction *of*.
+    pub fn resign_at(&self) -> u64 {
+        let after = (self.validity / RESIGN_FRACTION).max(1);
+        u64::from(self.inception).saturating_add(after)
+    }
+
+    /// The expiry for one RRset's signature: the window's end, pulled back by a
+    /// deterministic amount derived from the owner name and type.
+    ///
+    /// **Deterministic, not random**, and that matters twice. A reload re-signs,
+    /// and random jitter would reshuffle which names expire when on every reload
+    /// — so the slope would be a different slope each time and no two servers
+    /// holding the same zone would agree about it. Deterministic jitter means the
+    /// same RRset always sits at the same point on the slope.
+    ///
+    /// Never later than [`Self::expiration`]: an operator who asked for 30 days
+    /// gets at most 30 days, never 35.
+    pub fn expiry_for(&self, name: &str, rtype: u16) -> u32 {
+        let spread = self.validity / EXPIRY_JITTER_FRACTION;
+        if spread == 0 {
+            return self.expiration;
+        }
+        // FNV-1a over the owner name and type. Not a security choice — nothing
+        // adversarial depends on it — just a cheap, stable spread that does not
+        // pull in a hasher whose output is randomized per process, which is
+        // exactly what `DefaultHasher` would do and would destroy the
+        // determinism above.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in name
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(rtype.to_be_bytes().iter().copied())
+        {
+            hash ^= u64::from(byte.to_ascii_lowercase());
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        self.expiration
+            .saturating_sub((hash % spread) as u32)
+            .max(self.inception.saturating_add(1))
+    }
+
+    /// The SOA serial to serve for the zone this policy signs.
+    /// See [`signed_serial`] for why it is what it is.
+    pub fn serial_for(&self, file_serial: u32) -> u32 {
+        signed_serial(file_serial, self.signed_at)
+    }
+}
+
+/// The serial to serve for a zone we signed ourselves.
+///
+/// **The problem.** Re-signing produces a new version of the zone as far as a
+/// secondary is concerned — new RRSIGs are new data — and a secondary decides
+/// whether to transfer by comparing serials. Without a bump the replica keeps
+/// the signatures it already has and they expire underneath it, which is the same
+/// outage as never re-signing at all, one hop downstream.
+///
+/// **How everyone else does it.** BIND's inline-signing keeps a signed copy with
+/// its *own* serial and increments it on every re-signing run, so the number it
+/// serves diverges from the number in the file — one report has a file at
+/// `2016090105` being served as `2016090133`. Knot takes the field away from the
+/// operator entirely (`zonefile-load: difference-no-serial`). Both persist the
+/// divergence in a **journal**, and we have none (`TODO.md` #7 step 6), so
+/// neither is available: without persistence a restart would go *backwards*, and
+/// RFC 1982 makes that worse than it sounds — a secondary that saw `N` and then
+/// sees `N-k` reads it as older and will not transfer, so it keeps the signatures
+/// that are about to expire. The outage moves to restart time.
+///
+/// **So the time is the counter.** Hours since the Unix epoch, *added* to the
+/// file's serial. That is monotone in wall time by construction, needs nothing
+/// persisted, and an operator's `+1` in the file still shows up as `+1` served.
+///
+/// Added rather than `max`ed, which is the correction to the obvious design:
+/// PowerDNS's `INCEPTION-EPOCH` documents itself as "requiring epoch-based
+/// backend serials" for exactly this reason — a date-style serial like
+/// `2026073001` is numerically *larger* than any current Unix timestamp, so a
+/// `max` would keep the file's number and never bump at all.
+///
+/// Hours, not seconds: the term stays small (about 495,000 today) so it does not
+/// crowd a date-style serial towards the 32-bit ceiling, and a re-sign every ten
+/// days is far coarser than an hour anyway. And hours since the *epoch* rather
+/// than a fraction of the validity, so that changing `--signature-validity` does
+/// not move the serial backwards.
+pub fn signed_serial(file_serial: u32, signed_at: u64) -> u32 {
+    const HOUR: u64 = 3600;
+    file_serial.wrapping_add((signed_at / HOUR) as u32)
 }
 
 /// Sign `zone` with `keys`, returning the signed zone.
@@ -161,7 +288,7 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
     }
 
     let mut signed = Zone::new(origin.clone());
-    let (soa_ttl, minimum) = carry_over_records(zone, &origin, &mut signed)?;
+    let (soa_ttl, minimum) = carry_over_records(zone, &origin, policy, &mut signed)?;
     let dnskey_ttl = publish_dnskeys(keys, &origin, soa_ttl, &mut signed);
 
     // NSEC3PARAM goes in *before* the layout is taken, and the order is the
@@ -236,7 +363,12 @@ fn check_keys(keys: &[SigningKey], origin: &str) -> Result<()> {
 /// Copy everything that is not this signer's own previous output into `signed`,
 /// normalizing owner names and per-RRset TTLs. Returns the apex SOA's TTL and
 /// its MINIMUM field.
-fn carry_over_records(zone: &Zone, origin: &str, signed: &mut Zone) -> Result<(i32, u32)> {
+fn carry_over_records(
+    zone: &Zone,
+    origin: &str,
+    policy: &SigningPolicy,
+    signed: &mut Zone,
+) -> Result<(i32, u32)> {
     let mut soa: Option<(i32, u32)> = None;
     // The TTL an RRset is signed with has to be one number (RFC 4034 §3.1.3
     // stores it in the RRSIG so a validator can restore it), and RFC 2181 §5.2
@@ -264,22 +396,47 @@ fn carry_over_records(zone: &Zone, origin: &str, signed: &mut Zone) -> Result<(i
                 "{name} is not in {origin}, so this zone has no authority to sign it",
             )));
         }
+        let mut record = record.clone();
         if record.rdata.rtype == rt::SOA && name == origin {
-            let ParsedRecord::SOA { minimum, .. } = record.rdata.parse()? else {
+            let ParsedRecord::SOA {
+                mname,
+                rname,
+                serial,
+                refresh,
+                retry,
+                expire,
+                minimum,
+            } = record.rdata.parse()?
+            else {
                 return Err(DnssecError::signing(
                     "the apex SOA does not parse as an SOA",
                 ));
             };
             soa = Some((record.ttl, minimum));
+            // The served serial is not the file's. New RRSIGs are a new version
+            // of the zone as far as a secondary is concerned, and a secondary
+            // decides whether to transfer by comparing serials — so without a
+            // bump the replica keeps signatures that then expire underneath it.
+            // See `signed_serial`: this is BIND's inline-signing shape, where the
+            // number served diverges from the number in the file, with a
+            // time-derived counter instead of BIND's journal because we have no
+            // journal to persist one in.
+            record.rdata = RecordData::from_parsed(&ParsedRecord::SOA {
+                mname,
+                rname,
+                serial: policy.serial_for(serial),
+                refresh,
+                retry,
+                expire,
+                minimum,
+            })
+            .map_err(|e| DnssecError::signing(format!("re-encoding the apex SOA: {e}")))?;
         }
         let key = (name.clone(), record.rdata.rtype);
         ttls.entry(key)
             .and_modify(|t| *t = (*t).min(record.ttl))
             .or_insert(record.ttl);
-        carried.push(ZoneRecord {
-            name,
-            ..record.clone()
-        });
+        carried.push(ZoneRecord { name, ..record });
     }
 
     for mut record in carried {
@@ -650,9 +807,13 @@ fn sign_everything(
         };
         let original_ttl = ttl.max(0) as u32;
         let rrset = Rrset::new(&name, rtype, 1, &rdatas);
+        // Spread this RRset's expiry back from the window's end, so the zone
+        // degrades over a slope rather than expiring as one cliff. Deterministic
+        // per (owner, type) — see `SigningPolicy::expiry_for`.
+        let expiration = policy.expiry_for(&name, rtype);
         for key in signers.iter() {
             let sig = key
-                .sign_rrset(&rrset, original_ttl, policy.inception, policy.expiration)
+                .sign_rrset(&rrset, original_ttl, policy.inception, expiration)
                 .map_err(|e| {
                     DnssecError::key(format!("signing the {rtype} RRset at {name}: {e}"))
                 })?;
@@ -774,6 +935,162 @@ ns.plain IN A  192.0.2.40
     fn sign_test_zone(chain: DenialChain) -> Zone {
         let zone = parse_zone_file(ZONE, ORIGIN).expect("the test zone parses");
         sign_zone(&zone, &keys(), &policy(chain)).expect("signing succeeds")
+    }
+
+    // -----------------------------------------------------------------
+    // Re-signing: the serial, the jitter, and when to do it again
+    // -----------------------------------------------------------------
+
+    /// Every RRSIG in a zone used to be given the same expiration, so the whole
+    /// zone expired in the same second — which is *why* the failure this guards
+    /// against is "every validating resolver SERVFAILs the entire zone at once".
+    /// Spread turns the cliff into a slope.
+    #[test]
+    fn signature_expiry_is_spread_across_the_zone() {
+        let signed = sign_test_zone(DenialChain::Nsec);
+        let expiries: BTreeSet<u32> = rrsigs_in(&resources(&signed))
+            .iter()
+            .map(|sig| sig.expiration)
+            .collect();
+        assert!(
+            expiries.len() > 5,
+            "expiry should be spread over the zone, got {} distinct value(s)",
+            expiries.len()
+        );
+
+        let policy = policy(DenialChain::Nsec);
+        let spread = 30 * 86_400 / EXPIRY_JITTER_FRACTION;
+        for expiry in &expiries {
+            assert!(
+                *expiry <= policy.expiration,
+                "an operator who asked for 30 days must never get more"
+            );
+            assert!(
+                *expiry > policy.expiration - spread as u32,
+                "and never much less: {expiry} is outside the spread"
+            );
+            assert!(*expiry > policy.inception, "and always after inception");
+        }
+    }
+
+    /// Deterministic, not random. A reload re-signs, and random jitter would put
+    /// every name at a different point on the slope each time — so the slope
+    /// would be a different slope on every reload, and two servers holding the
+    /// same zone would never agree about it.
+    #[test]
+    fn the_spread_is_deterministic_for_a_given_name_and_type() {
+        let policy = policy(DenialChain::Nsec);
+        let first = policy.expiry_for("www.example.com.", rt::A);
+        assert_eq!(first, policy.expiry_for("www.example.com.", rt::A));
+        assert_ne!(
+            first,
+            policy.expiry_for("www.example.com.", rt::AAAA),
+            "a different type at the same name sits elsewhere on the slope"
+        );
+        assert_ne!(first, policy.expiry_for("mail.example.com.", rt::A));
+        assert_eq!(
+            first,
+            policy.expiry_for("WWW.EXAMPLE.COM.", rt::A),
+            "case folds, like every other name comparison here (RFC 4343)"
+        );
+    }
+
+    /// A zone with a validity too short to spread across still signs, rather
+    /// than dividing by zero or producing an expiry before inception.
+    #[test]
+    fn a_validity_too_short_to_spread_still_signs() {
+        let policy = SigningPolicy::valid_for(NOW, 2);
+        assert_eq!(
+            policy.expiry_for("www.example.com.", rt::A),
+            policy.expiration
+        );
+        let zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        let signed = sign_zone(&zone, &keys(), &policy).expect("signs");
+        for sig in rrsigs_in(&resources(&signed)) {
+            assert!(sig.expiration > sig.inception);
+        }
+    }
+
+    /// New signatures are a new version of the zone as far as a secondary is
+    /// concerned, and a secondary decides whether to transfer by comparing
+    /// serials — so without a bump the replica keeps signatures that then expire
+    /// underneath it. The bump has to survive a restart without being persisted,
+    /// which is why it is derived from the clock.
+    #[test]
+    fn signing_moves_the_soa_serial_and_keeps_moving_it() {
+        let unsigned = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        let file_serial = unsigned.serial().expect("the file has a serial");
+        assert_eq!(file_serial, 2024051300);
+
+        let first = sign_zone(&unsigned, &keys(), &policy(DenialChain::Nsec)).expect("signs");
+        let first_serial = first.serial().expect("still has one");
+        assert_ne!(
+            first_serial, file_serial,
+            "the served serial is not the file's — new signatures are a new version"
+        );
+
+        // Signing the same file later gives a *higher* serial, and signing it
+        // again at the same moment gives the same one. Both matter: the first is
+        // what makes a secondary transfer, the second is what stops a restart
+        // from looking like a change.
+        let later = SigningPolicy::valid_for(NOW + 7 * 86_400, 30 * 86_400);
+        let later_serial = sign_zone(&unsigned, &keys(), &later)
+            .expect("signs")
+            .serial()
+            .expect("has a serial");
+        assert!(
+            crate::secondary::is_newer(later_serial, first_serial),
+            "{later_serial} must be newer than {first_serial} by RFC 1982"
+        );
+        let again = sign_zone(&unsigned, &keys(), &policy(DenialChain::Nsec))
+            .expect("signs")
+            .serial()
+            .expect("has a serial");
+        assert_eq!(again, first_serial, "same file, same moment, same serial");
+    }
+
+    /// The correction that made this design work: `max(file, time)` would keep a
+    /// date-style serial forever, because `2024051300` is numerically far larger
+    /// than any current Unix timestamp. PowerDNS documents its `INCEPTION-EPOCH`
+    /// as "requiring epoch-based backend serials" for exactly this reason.
+    #[test]
+    fn a_date_style_serial_still_moves() {
+        let date_style = 2_026_073_001u32;
+        let signed = signed_serial(date_style, NOW);
+        assert!(
+            crate::secondary::is_newer(signed, date_style),
+            "{signed} must be newer than {date_style}"
+        );
+        assert!(
+            signed > date_style,
+            "and it is addition, not max — max would have returned the file's number"
+        );
+        // An operator's own bump still registers as one.
+        assert_eq!(
+            signed_serial(date_style + 1, NOW),
+            signed + 1,
+            "editing the file by one moves the served serial by one"
+        );
+    }
+
+    /// Re-signing at a third of the validity leaves two whole windows of slack:
+    /// a run that fails, or a server down over one, still has two more chances
+    /// before anything expires.
+    #[test]
+    fn re_signing_is_due_well_before_anything_expires() {
+        let validity = 30 * 86_400;
+        let policy = SigningPolicy::valid_for(NOW, validity);
+        let due = policy.resign_at();
+        assert!(
+            due < u64::from(policy.expiration),
+            "due at {due}, expires at {}",
+            policy.expiration
+        );
+        let slack = u64::from(policy.expiration) - due;
+        assert!(
+            slack >= validity / 2,
+            "at least half the window should remain when re-signing is due, got {slack}s"
+        );
     }
 
     fn resources(zone: &Zone) -> Vec<ResourceRecord> {
