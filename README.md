@@ -19,7 +19,10 @@ all the RFC nomenclature uses.
 - Signal handling: SIGHUP reloads zones, SIGTERM/SIGINT stop gracefully —
   in-flight zone transfers finish rather than being cut mid-stream
 - Prometheus metrics on `--metrics-listen`: RED counters, an answer-latency
-  histogram, per-zone serial and last-refresh gauges, and a liveness probe
+  histogram, per-zone serial and last-refresh gauges, and separate liveness
+  (`/healthz`) and readiness (`/readyz`) probes
+- A container image (`Dockerfile`), running unprivileged, built and exercised in
+  CI rather than only written
 - A control socket (`--control-socket`) and `rdnsctl`: `status`, `reload` that
   reports whether it worked, and `dump` of a zone as it is being served
 - Rate limiting (`--query-rate`) and request validation
@@ -195,6 +198,83 @@ Enable and start:
 sudo systemctl enable rdns
 sudo systemctl start rdns
 ```
+
+### Container image
+
+```bash
+# The build arg is what `--version` reports. `.git` is deliberately not in the
+# build context — an image layer is a bad place for every version of every file
+# ever committed — so the description is computed here and passed in. Without it
+# the image reports a bare "0.1.0", which identifies nothing.
+docker build -t rdns \
+  --build-arg RDNS_GIT_DESCRIBE="$(git describe --always --dirty --tags)" .
+docker run -d --name rdns \
+  -p 53:5353/udp -p 53:5353/tcp -p 9153:9153 \
+  -v /etc/rdns/zones:/etc/rdns/zones:ro \
+  rdns
+```
+
+The image runs as uid 65532 and listens on **5353**, not 53 — an unprivileged
+process cannot bind 53, and both ways around that are worse than publishing a
+port: running the server as root gives it root for the lifetime of the process
+for the sake of one syscall, and a file capability baked into the image is
+invisible to `docker inspect` and inherited by every image built `FROM` it.
+Where the container genuinely needs 53 inside its own namespace — host
+networking, or a Kubernetes pod with `hostNetwork` — start it with
+`--sysctl net.ipv4.ip_unprivileged_port_start=53` and pass `--port 53`.
+
+A secondary needs its zone directory **writable**: it writes each transferred
+zone there along with the state sidecar that records when contact was last made,
+and that sidecar is what makes a restart able to tell a current replica from an
+expired one. Mount it `rw` and `chown 65532`.
+
+`docker stop` sends SIGTERM, which stops accepting, finishes what is in flight —
+an AXFR mid-stream included — and exits 0. The drain is bounded at 5s.
+
+### Liveness and readiness
+
+Two questions, two endpoints, on the `--metrics-listen` port:
+
+| probe | asks | says no when |
+|---|---|---|
+| `GET /healthz` | is the process alive | never, while it can answer at all |
+| `GET /readyz` | has it finished starting | a zone it is configured to serve is not in the zone map |
+
+The distinction matters for exactly one deployment: a **secondary**. A primary
+loads, signs and verifies every zone before it binds a socket, so it is ready as
+soon as it is alive. A secondary that starts cold — or whose copy on disk is
+older than the zone's EXPIRE, or that has no record of ever having transferred
+it — withdraws that zone and answers REFUSED for it until the first transfer
+lands. With `Restart=on-failure` and a liveness-only gate, a rolling restart
+moves traffic onto exactly that server.
+
+```console
+$ curl -i localhost:9153/readyz
+HTTP/1.1 503 Service Unavailable
+not ready: waiting for 1 zone(s) to transfer: example.com.
+
+$ curl -i localhost:9153/readyz          # after the transfer
+HTTP/1.1 200 OK
+ready
+```
+
+In Kubernetes:
+
+```yaml
+livenessProbe:
+  httpGet: { path: /healthz, port: 9153 }
+readinessProbe:
+  httpGet: { path: /readyz, port: 9153 }
+  periodSeconds: 5
+```
+
+`/readyz` is a **one-way latch**: once every zone has arrived it stays ready, and
+a zone withdrawn later by EXPIRE does not take it back to not-ready. Every
+replica of a zone expires at the same moment — they share the master's EXPIRE and
+they all lost contact when the master did — so a readiness signal that followed
+expiry would pull every server out of rotation at once, turning stale data into
+no server at all. Staleness is what the `dns_zone_last_refresh_timestamp_seconds`
+alert below is for.
 
 ### Monitoring
 

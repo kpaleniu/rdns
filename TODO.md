@@ -7,15 +7,23 @@ planning; the first rule in `CLAUDE.md` is why a green suite here has twice not
 meant what it looked like.
 
 **Starting cold, read in this order:** "Current state" for what works today —
-including the fact that **CI has never run**, which is why the test numbers there
-are given per platform — "How to run" for the commands, the four environment
-traps under "Verifying" (each has cost an hour) plus the Linux recipe beside them
-for anything `#[cfg(unix)]`, and then **"Where to pick up next"**, which lists
-every open item in one place in the order worth doing it and names the next one. "Open work" holds the full
-finding behind each of those lines; the "Architecture" sections describe what
-exists and why it is shaped that way. Completed work is one line each under "Done
-so far" — the reasoning, RFC citations and verification for each piece are in its
-commit message, which is where to look rather than here.
+including where the work stopped, and the fact that **CI has never run**, which is
+why the test numbers there are given per platform — "How to run" for the commands,
+the four environment traps under "Verifying" (each has cost an hour) plus the Linux
+recipe beside them for anything `#[cfg(unix)]` or containerized, and then
+**"Where to pick up next"**, which lists every open item in one place in the order
+worth doing it and names the next one along with the file it is in. "Open work"
+holds the full finding behind each of those lines; the "Architecture" sections
+describe what exists and why it is shaped that way. Completed work is one line
+each under "Done so far" — the reasoning, RFC citations and verification for each
+piece are in its commit message, which is where to look rather than here.
+
+**The short version, if you read nothing else:** the operational shell is
+finished and #9d is closed; what is open is performance (#9e — start with
+`zone::absolutize`, `rdns/src/zone.rs:505`, whose assertion is already written)
+and one audit (#12, pre-authentication panics). Build and test with the four
+commands at the top of `CLAUDE.md`; nothing is half-applied and the tree is
+clean.
 
 ---
 
@@ -50,21 +58,29 @@ thing on this page: the file asserting a property is not the thing that upholds
 it (`CLAUDE.md` §4).
 
 **Until there is a remote, the Linux half is checked by hand** — see "Verifying"
-below, which now has the Linux recipe.
+below, which now has the Linux recipe. That Linux image **has docker now**, which is
+where the container image is built and run.
+
+**Where the work stopped (2026-08-01).** Branch `main`, working tree clean, the
+last four commits being the readiness gate and the container image. #9d is closed
+in full, so the operational shell — flags, logging, config file, metrics, control
+socket, graceful shutdown, readiness, image — is finished. **What is left is
+performance (#9e) and one audit (#12)**, and "Where to pick up next" names the
+first move and the file it is in.
 
 **Green as of the last commit**, on both platforms and checked on both:
 
 | | Windows | Linux |
 |---|---|---|
-| `rdns` lib | 610 | 613 |
+| `rdns` lib | 619 | 622 |
 | allocations | 6 | 6 |
 | `rdnsd` | 92 | **105** |
 | `rdnsr` | 3 | 3 |
-| **total** | **711** | **727** |
+| **total** | **720** | **736** |
 
-The Windows column and `rdnsd`'s and `rdnsr`'s Linux numbers are measured; the
-Linux lib number is the Windows one plus the three `#[cfg(unix)]` tests, in a
-run that was green as a whole.
+Both columns are measured (the Linux ones through the Linux recipe below); the
+difference is the sixteen `#[cfg(unix)]` tests described next. The last nine on
+each side are `readiness` and the two `/readyz` tests in `metrics_server`.
 
 **Sixteen tests exist on Linux only**, and they are the ones a green Windows run
 says nothing about. Three are the old ones: two on the secret-file mode check and
@@ -87,8 +103,9 @@ and a suppressed log line that must not build its message; `rdnsr` had
 **no test module at all** until #9c gave it one, and has three now — the third
 is its UDP in-flight ceiling.) The lib
 count fell from 578 to 567 when dead `serialization.rs` was deleted with its 11
-tests, and is at 603 now: #9e's, #9f's, graceful shutdown's and the metrics
-endpoint's tests, minus the seven that went with `telemetry.rs`.
+tests, and is at 619 now: #9e's, #9f's, graceful shutdown's, the metrics
+endpoint's and the readiness gate's tests, minus the seven that went with
+`telemetry.rs`.
 
 **Errors are typed in the library and `anyhow` in the binaries (2026-07-28).**
 The convention used to run the other way round — `rdns` returned `anyhow::Error`,
@@ -187,6 +204,20 @@ benchmark, wired into `rdnsd` and served as Prometheus text on
 `--metrics-listen` — with a latency histogram, a `/healthz`, and the two per-zone
 gauges an operator asks for by name: which serial is being served, and when this
 replica was last in contact with a master.
+
+**Ready is a different question from alive, and there is an image (2026-08-01).**
+`GET /readyz` on the same listener as `/metrics` is 503, naming the zones, until
+every `--secondary` zone has transferred at least once; `/healthz` stays
+liveness-only. A **primary** is ready as soon as it is alive — its zones are
+loaded, signed and verified before `serve` binds anything — so the state this
+exists for is a cold **secondary**, which listens and answers REFUSED until a
+master answers. The latch is one-way: every replica of a zone expires in the same
+second, so readiness that followed EXPIRE would empty the rotation rather than
+shrink it (`rdns/src/readiness.rs` argues it). The `Dockerfile` runs unprivileged
+on 5353, is 31 MB, and its build context is an allowlist with **no `.git` in it** —
+the version stamp comes in through `RDNS_GIT_DESCRIBE` instead. Both were run for
+real, two containers on a docker network with the secondary started first; see
+#9d's last item for the table.
 
 **There is a config file now (2026-07-30), and it is the only way to set anything
 per zone.** `--config <file>` reads TOML with `deny_unknown_fields` on every
@@ -355,13 +386,23 @@ cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --also-notify 127.0.0.1:15354 --response-rate 4096
 
-# Prometheus metrics and a liveness probe. GET /metrics and GET /healthz; off
-# by default, and with no TLS or auth, so bind it somewhere an operator reaches
-# and a client does not.
+# Prometheus metrics and the two probes. GET /metrics, GET /healthz (alive) and
+# GET /readyz (holds every zone it is configured for); off by default, and with
+# no TLS or auth, so bind it somewhere an operator reaches and a client does not.
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone   --metrics-listen 127.0.0.1:9153
 # The two alerts worth having, in PromQL:
 #   rate(dns_responses_servfail_total[5m]) > 0
 #   time() - dns_zone_last_refresh_timestamp_seconds > 604800   # the zone's EXPIRE
+#
+# /readyz is 503 until every --secondary zone has transferred at least once, and
+# 200 immediately on a primary — whose zones were all loaded, signed and verified
+# before anything bound a socket. A one-way latch: see rdns/src/readiness.rs.
+
+# The container image. Never built on this machine (no runtime here); the `image`
+# job in CI builds it, runs it, probes both endpoints and stops it.
+docker build -t rdns .
+docker run -d -p 53:5353/udp -p 53:5353/tcp -p 9153:9153 \
+  -v /etc/rdns/zones:/etc/rdns/zones:ro rdns
 
 # Heap-profile the daemon. Writes dhat-heap.json on exit, which is why it needs
 # the graceful stop above — the report is written on Drop. Counts and sizes
@@ -510,6 +551,18 @@ rm -rf "$SCRATCH" && mkdir -p "$SCRATCH" \
 cargo build --workspace --all-targets && cargo test --workspace
 ```
 
+**That image also has docker** (29.6.2), which is where the container image is
+built and exercised — see #9d's last item for what was run. The user is in
+`wheel` and not `docker`, so every command needs `sudo -n`:
+
+```sh
+sudo -n docker build -t rdns:local \
+  --build-arg RDNS_GIT_DESCRIBE=$(git describe --always --dirty --tags) .
+```
+
+The build arg matters: the build context has no `.git` in it on purpose, so
+without it the image reports a bare `0.1.0`.
+
 Three things to know before trusting a run there:
 
 - **Build on a native filesystem, not the mount.** It reports everything as 0777 and
@@ -638,7 +691,7 @@ under "Closed work" further down.
 
 | # | what | open |
 |---|------|------|
-| **9** | what the five-way code review turned up | **6** — 9a, 9b, 9c and **9f** are closed; what is left is 1 of operability (9d) and 5 of performance (9e) |
+| **9** | what the five-way code review turned up | **5** — 9a, 9b, 9c, **9d** and **9f** are closed; what is left is 5 of performance (9e) |
 | **8** | what signing turned up | **0** — the re-signing timer and its serial are done |
 | **7** | the secondary role | **1**, and conditional |
 | **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
@@ -653,20 +706,29 @@ full finding below, which has the file, the line number and the reasoning; **rea
 that before starting**, because several have already been half-fixed by something
 else and the finding says which half.
 
-> **Next is item 8** — the container image and the readiness signal, which is
-> the last of the operational shell. Items 1-7 and 10 closed on 2026-08-01 and
-> are struck through below rather than deleted, because each says what was
-> actually done and four of them reversed or narrowed the fix the original
-> finding proposed. The numbers are positions other lines refer to, so they are
-> never reused.
+> **Next is item 9** — `zone::absolutize` (`rdns/src/zone.rs:505`) returns
+> `String` unconditionally, so a qname that arrived already absolute and already
+> lowercase is copied four times per query: once each for `lookup_key`,
+> `name_kind` and `delegation_for`, plus once in `rdnsd`'s `resolve_in_zone`.
+> That is ~14% of the allocations on the answer path and the largest single item
+> left. The fix is a `Cow<str>` plus a borrowing lookup, and **the assertion that
+> judges it already exists** — the labelled middle segment of
+> `one_query_end_to_end` in `rdns/tests/allocations.rs`, currently
+> `within("look up one A record in the zone", .., 1..=10)` and measuring 5.
+> Tightening that range is part of the fix. It touches the public
+> `normalize_name`, which is why it is its own change.
 >
-> **Item 9 is the one to take first if the appetite is for performance rather
-> than operability** — `zone::absolutize`, four `String`s per query, with the
-> assertion that judges it already in place.
+> **The operational shell is finished.** Items 1-8 and 10 all closed on
+> 2026-08-01 and are struck through below rather than deleted, because each says
+> what was actually done and five of them reversed or narrowed the fix the
+> original finding proposed. The numbers are positions other lines refer to, so
+> they are never reused.
 >
-> **And read #12 before either.** It is the audit of what a stranger can panic
-> before authenticating, and it is not on this list only because it has no known
-> defect behind it.
+> **And read #12 first.** It is the audit of what a stranger can panic before
+> authenticating. It is not on the numbered list only because it has no known
+> defect behind it — but its *cost* changed on 2026-08-01, when `rdnsd` stopped
+> spawning a task per datagram: a panic on the answer path used to be swallowed
+> by the task and now ends the process.
 
 **Correctness and safety first** — these can lose data or serve a wrong answer:
 
@@ -706,11 +768,17 @@ else and the finding says which half.
    Unix socket at mode 0600 because that is what Knot, PowerDNS and Unbound do
    and because the TCP ones all authenticate; no per-zone reload, because a
    reload is the whole set or nothing.
-8. **No container image / no readiness signal** (9d) — `/healthz` exists now, so
-   what is left is the Dockerfile and the ready-vs-alive distinction. The
-   readiness half is the interesting one: `/healthz` answers as soon as the
-   listener is up, which is exactly the "bound but still parsing 40 zones" state
-   it would need to report as *not* ready.
+8. ~~**No container image / no readiness signal**~~ (9d) — **done 2026-08-01**,
+   and the finding's own description of the not-ready state was wrong in a way
+   worth keeping: "bound but still parsing 40 zones" does not happen here.
+   `rdnsd` loads, signs and verifies every zone *before* `serve` binds anything,
+   so a **primary** is ready the moment it is alive. The state that does exist is
+   a **secondary**'s: `withdraw_unvouched_zones` removes every replicated zone
+   whose age cannot be vouched for, and the server then listens and answers
+   REFUSED for those names until the first transfer lands. `rdns::readiness` is
+   the gate, `GET /readyz` on the metrics listener reports it (503, naming the
+   zones), and it is a one-way latch — see the module docs for why following
+   EXPIRE would take every replica out of rotation at the same second.
 
 **Then performance (9e).** The DHAT pass is done and its numbers decide the order:
 
@@ -731,10 +799,10 @@ else and the finding says which half.
 
 **Waiting for someone to schedule it:** #12, an audit of what a stranger can
 panic before authenticating. It is not on the numbered list above because it has
-no known defect behind it — but it is the one item there whose *cost* changed
-under this session's work, since a panic on the UDP answer path used to be
-swallowed by the spawned task and now ends the process. Read it before deciding
-that item 7 is really next.
+no known defect behind it — but it is the one item there whose *cost* changed on
+2026-08-01, since a panic on the UDP answer path used to be swallowed by the
+spawned task and now ends the process. Read it before deciding that item 9 is
+really next.
 
 **Not scheduled, and deliberately:** #7 step 6 (persisted deltas) waits on #10
 (dynamic UPDATE), which nothing schedules; #11 (cache locality) is a stretch goal
@@ -1257,6 +1325,13 @@ here degrades quietly with the process healthy and nothing alerting.
       the end of #6 — the QR half is new, and is the one that loops.
 
 #### 9d. Operability — none of this is visible from outside the process
+
+**Closed 2026-08-01.** Every item below is done or is a recorded won't-fix
+(`--user`/`--group`, whose argument is under it). Two of them ended somewhere
+other than where the finding pointed, and both say so in place rather than being
+edited: the loader fix that broke a secondary's first start, and the readiness
+gate, whose "bound but still parsing 40 zones" premise turned out not to describe
+this server at all.
 
 - [x] **The query rate limiter is hardcoded at ~10 q/s per source IP, drops
       silently, and has no flag** — **done 2026-07-28**, with all three flags the
@@ -2060,6 +2135,14 @@ here degrades quietly with the process healthy and nothing alerting.
       to the bare version when there is no git — a released tarball or a shallow
       checkout, neither of which should fail a build.
 
+      **`RDNS_GIT_DESCRIBE` overrides the `git describe` call (2026-08-01)**, for
+      a build with no repository to ask. That is the container image: putting
+      `.git` in a build context so a build script can run git inside it is how
+      every version of every file ever committed ends up one careless
+      `COPY --from` away from an image layer. What the variable carries is the
+      *description*, not the whole version string, so the format still comes from
+      the one `match` in `build.rs` and the two paths cannot drift.
+
       **One part is deliberately not done, because it is not mine to decide.** The
       manifests say `license = "MIT OR Apache-2.0"` and the repository ships only
       an MIT `LICENSE`. Resolving it means either adding `LICENSE-APACHE` or
@@ -2244,16 +2327,115 @@ here degrades quietly with the process healthy and nothing alerting.
       CAP_NET_BIND_SERVICE` plus systemd's `User=` instead of `sudo rdnsd`, which
       sidesteps the problem for the deployment that reads the README and not for
       anyone else. Unix-only by nature; say so where it lands.
-- [ ] **No container image, no readiness signal** — no Dockerfile, no
-      `Type=notify`/sd_notify. With `Restart=on-failure` and no
-      readiness gate, a rolling restart moves traffic to an instance that has bound
-      the socket but is still parsing 40 zones.
+- [x] **No container image, no readiness signal** — **done 2026-08-01.** Both
+      halves, and the readiness half found the finding's own reasoning to be
+      wrong. Original text follows the correction, per `CLAUDE.md` §11.
 
-      **Half of this is done**: `--metrics-listen` serves `GET /healthz`, so the
-      health endpoint the original finding asked for exists. What is left is the
-      Dockerfile and an actual *readiness* distinction — `/healthz` answers as soon
-      as the listener is up, which is exactly the "bound but still loading" state
-      it would need to report as not-ready.
+      **The state the finding described does not exist here.** "Bound but still
+      parsing 40 zones" cannot happen: `main` loads, signs and verifies every
+      zone and *then* calls `serve`, which is what binds. A failure anywhere in
+      there stops the start. So a **primary** is ready the instant it is alive,
+      and `Readiness::ready()` says exactly that rather than special-casing it.
+
+      **The state that does exist is a secondary's**, and it is worse than the
+      one that was imagined, because it is not a few seconds of parsing — it
+      lasts until a master answers. `withdraw_unvouched_zones` removes every
+      replicated zone whose age cannot be vouched for (a cold start with no state
+      sidecar is all of them), the server binds, and it answers REFUSED for those
+      names until the first transfer lands. Nothing reported it: the per-zone
+      gauges are deliberately *absent* for a zone we do not hold, and absence is
+      not something a probe can be pointed at.
+
+      **What landed**: `rdns::readiness::Readiness` — a fixed set of zone names,
+      one `AtomicBool` each plus a counter, no lock — built in `main` from the
+      `--secondary` specs the zone map does not satisfy, ticked off in
+      `refresh_once` next to `install_zone`, and read by `GET /readyz` on
+      `--metrics-listen`. 503 with the zone names in the body until every one has
+      arrived, 200 after. `/healthz` is unchanged and stays liveness-only. The
+      startup banner says what is being waited for, and says so even when
+      `--metrics-listen` is off and therefore nothing can ask (§14: a control
+      nobody can observe is a control nobody can debug).
+
+      **It is a one-way latch**, and that is the decision worth recording: a zone
+      withdrawn later by EXPIRE does not take the server back to not-ready.
+      Every replica of a zone expires in the *same second* — they share the
+      master's EXPIRE and lost contact when the master did — so readiness
+      following expiry would pull the entire nameserver set out of rotation at
+      once, turning "the data is stale" into "there is no server". That is what
+      the `dns_zone_last_refresh_timestamp_seconds` alert is for.
+
+      **Verified by provoking it** (§4), not by reading the diff: a real
+      secondary started with its master down answered `/healthz` 200 and
+      `/readyz` 503 `waiting for 1 zone(s) to transfer: example.com.`; the master
+      was then started with `--also-notify`, and the same two probes read 200 and
+      200, with `rdnsc` getting the transferred record from the secondary. Both
+      `/readyz` tests were also run against the code with the endpoint removed,
+      and both fail there (§1).
+
+      **The image**: `Dockerfile` plus `.dockerignore`, multi-stage, running as
+      uid 65532 and listening on 5353 — an unprivileged process cannot bind 53,
+      and both ways around that are worse than publishing a port (root for the
+      life of the process for one syscall; or a file capability that
+      `docker inspect` cannot see and every derived image inherits). No
+      `HEALTHCHECK`: it runs a command *inside* the container, which would mean
+      shipping an HTTP client next to a DNS server to issue one GET, and every
+      orchestrator that would schedule this probes over the network itself.
+
+      **The build context is an allowlist, and `.git` is not on it.** `*` then
+      `!` per workspace member, and the `COPY`s name each directory rather than
+      being `COPY . .`, so two independent things would have to go wrong for
+      anything else to reach a layer. The first version of this kept `.git` on
+      purpose — `build.rs` runs `git describe`, and a bare "0.1.0" identifies
+      nothing — which had it exactly backwards: a repository in a build context
+      is every version of every file anyone ever committed, sitting one careless
+      `COPY --from` or one `--target build` away from being published, and a
+      discarded build stage is a convention rather than a guarantee. The stamp
+      comes in through `RDNS_GIT_DESCRIBE` instead (see #9d's CI item), computed
+      by whoever *has* the repository. In CI that is not a `git` call either:
+      GitHub already states `github.ref_type`, `ref_name` and `sha`, so the job
+      composes the description from those and does not need `fetch-depth: 0` —
+      the tag on a tag push, `g<short sha>` otherwise. What that cannot express
+      is `git describe`'s "nearest tag plus commits since", which no environment
+      variable carries.
+
+      **Built and run — the Linux image has docker now** (29.6.2, `sudo -n` for
+      the socket; the user is in `wheel` and not `docker`). This paragraph
+      previously said the image was a written artifact and not a verified one,
+      which was true for about an hour. Build: 50s cold, 31 MB, and the whole of
+      it end to end:
+
+      | checked | result |
+      |---|---|
+      | `--version` | `rdnsd 0.1.0 (0904562)` — the build arg reached the binary |
+      | `id` | `uid=65532(rdns) gid=65532(rdns)` |
+      | `find / -name .git` | 0 hits — the point of the allowlist |
+      | primary: `/healthz`, `/readyz` | 200, 200 |
+      | primary: `/metrics` | `dns_zone_serial{zone="example.com."} 7` |
+      | primary: DNS | the A record, asked with the `rdnsc` inside the image |
+      | **secondary, master not started** | `/healthz` **200**, `/readyz` **503** `waiting for 1 zone(s) to transfer: example.com.` |
+      | **master appears** | `/readyz` **200 within 2s**, and the secondary serves the record |
+      | `docker stop` | "SIGTERM received" → "drained cleanly", exit **0** |
+
+      The two-container half is the one worth having: two `rdnsd`s on a docker
+      network with static addresses, the secondary started *first*, so the
+      not-ready window is the real one rather than a simulated one. It is also
+      the only place `rdnsd` has been observed handling SIGTERM as **PID 1**.
+
+      **51 MB → 31 MB** by stripping debuginfo in the image build. The workspace
+      sets `[profile.release] debug = 1` so a DHAT profile has `file:line` in its
+      frame table; nothing in the image can use that, since the profiler is behind
+      a feature that is not built here and there are no sources to resolve frames
+      against.
+
+      CI runs the same checks on every push (the `image` job), which is what keeps
+      this true rather than true once.
+
+      Original finding: *no Dockerfile, no `Type=notify`/sd_notify. With
+      `Restart=on-failure` and no readiness gate, a rolling restart moves traffic
+      to an instance that has bound the socket but is still parsing 40 zones.*
+      sd_notify was not adopted: it is a systemd-only protocol for the same fact
+      `/readyz` reports over HTTP, and one answer readable by every orchestrator
+      beats two that have to agree.
 
 #### 9e. Performance — all measured under `--release`
 
@@ -4641,6 +4823,24 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **A readiness probe and a container image** — closes 9d's last operability
+  item, and with it 9d. `GET /readyz` on `--metrics-listen` is 503 (naming the
+  zones) until every `--secondary` zone has transferred at least once, and 200
+  after; `/healthz` stays liveness-only. A primary is ready as soon as it is
+  alive, because its zones are loaded, signed and verified before `serve` binds
+  anything — the finding's "bound but still parsing 40 zones" state does not
+  exist here, and a cold **secondary** serving REFUSED until its master answers
+  is the one that does. The latch is one-way on purpose: every replica of a zone
+  expires in the same second, so readiness that followed EXPIRE would empty the
+  rotation rather than shrink it. Proved by running a secondary against a master
+  that was down and then bringing the master up. The `Dockerfile` runs
+  unprivileged on 5353 with no `HEALTHCHECK` (an orchestrator probes over the
+  network; the image should not carry an HTTP client to talk to itself), and CI's
+  new `image` job builds it, runs it, probes both endpoints, asks it a DNS
+  question with the `rdnsc` inside it, and requires a clean SIGTERM stop. The
+  same was run by hand on the Linux side: 31 MB, no `.git` anywhere in it, and a
+  secondary container started before its master answered `/healthz` 200 and
+  `/readyz` 503 until the master appeared.
 - **`rdnsd` has a control socket, and `rdnsctl` talks to it** — closes 9d's
   control-channel item. `status`, `reload` and `dump <zone>` over a Unix socket
   at mode 0600, because the servers that put a control channel on TCP all

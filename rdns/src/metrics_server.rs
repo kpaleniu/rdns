@@ -1,5 +1,7 @@
 //! A scrape endpoint for [`crate::metrics::DnsMetrics`], hand-rolled over
-//! `tokio`'s `TcpListener`.
+//! `tokio`'s `TcpListener`, plus the two probes an orchestrator asks for:
+//! `/healthz` (is the process alive) and `/readyz` (has it finished starting).
+//! The distinction between those two is [`crate::readiness`]'s doc comment.
 //!
 //! **Why not a web framework.** This replaced an OpenTelemetry OTLP exporter
 //! that dragged `tonic`, `prost`, `hyper` and `h2` — a gRPC *server* — into a
@@ -22,6 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::metrics::DnsMetrics;
+use crate::readiness::Readiness;
 use crate::shutdown::{Busy, Stop};
 
 /// How long a scraper gets to send its request line before we give up on it.
@@ -34,13 +37,14 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// and a `GET /metrics HTTP/1.1` with headers is well under this.
 const MAX_REQUEST: usize = 8 * 1024;
 
-/// Serve `GET /metrics` until told to stop.
+/// Serve `GET /metrics`, `GET /healthz` and `GET /readyz` until told to stop.
 ///
 /// Returns when [`Stop`] fires, holding a [`Busy`] for each connection so a
 /// scrape in flight is finished rather than cut.
 pub async fn serve(
     listener: TcpListener,
     metrics: Arc<DnsMetrics>,
+    readiness: Readiness,
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
@@ -50,18 +54,23 @@ pub async fn serve(
             _ = stop.wait() => return Ok(()),
         };
         let metrics = metrics.clone();
+        let readiness = readiness.clone();
         let busy = busy.clone();
         tokio::spawn(async move {
             let _busy = busy;
             // A scraper that misbehaves is not worth a log line on a DNS
             // server's stderr — it cannot affect an answer, and the flood item
             // in TODO.md #9d is about exactly this shape of noise.
-            let _ = respond(stream, &metrics).await;
+            let _ = respond(stream, &metrics, &readiness).await;
         });
     }
 }
 
-async fn respond(mut stream: TcpStream, metrics: &DnsMetrics) -> std::io::Result<()> {
+async fn respond(
+    mut stream: TcpStream,
+    metrics: &DnsMetrics,
+    readiness: &Readiness,
+) -> std::io::Result<()> {
     let mut buf = vec![0u8; MAX_REQUEST];
     let mut filled = 0;
 
@@ -102,13 +111,36 @@ async fn respond(mut stream: TcpStream, metrics: &DnsMetrics) -> std::io::Result
         ),
         // A liveness probe that costs nothing to answer. It says the process is
         // running and its runtime is scheduling tasks, which is all a `/healthz`
-        // can honestly claim — readiness (are the zones loaded?) is a different
-        // question and does not have an answer here yet.
+        // can honestly claim — and all a supervisor deciding whether to *restart*
+        // should be asked to act on. Whether there is anything to serve yet is
+        // `/readyz`, below.
         ("GET", "/healthz") => response(200, "text/plain", "ok\n"),
+        // Readiness: is every zone this server is configured to answer for
+        // actually in the zone map? See [`Readiness`] for why this is a one-way
+        // latch and why a primary is ready the moment it is alive.
+        //
+        // 503 rather than 200-with-a-body, because the only consumer that
+        // matters reads the status code: every orchestrator's HTTP probe treats
+        // 2xx as pass and everything else as fail, and a probe that always
+        // passes is a probe that is not a gate. The names go in the body so an
+        // operator who curls it learns *what* is missing.
+        ("GET", "/readyz") => match readiness.pending() {
+            pending if pending.is_empty() => response(200, "text/plain", "ready\n"),
+            pending => response(
+                503,
+                "text/plain",
+                &format!(
+                    "not ready: waiting for {} zone(s) to transfer: {}\n",
+                    pending.len(),
+                    pending.join(" ")
+                ),
+            ),
+        },
         ("GET", "/") => response(
             200,
             "text/plain",
-            "rdns metrics\n\n  /metrics   Prometheus text\n  /healthz   liveness\n",
+            "rdns metrics\n\n  /metrics   Prometheus text\n  /healthz   liveness\n  \
+             /readyz    readiness\n",
         ),
         ("GET", _) => response(404, "text/plain", "not found\n"),
         _ => response(405, "text/plain", "method not allowed\n"),
@@ -127,6 +159,7 @@ fn response(status: u16, content_type: &str, body: &str) -> Vec<u8> {
         404 => "Not Found",
         405 => "Method Not Allowed",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     // `Connection: close` because there is no keep-alive here: one request, one
@@ -163,6 +196,13 @@ mod tests {
     }
 
     async fn start() -> (SocketAddr, Shutdown, Arc<DnsMetrics>) {
+        let (addr, shutdown, metrics, _) = start_with(Readiness::ready()).await;
+        (addr, shutdown, metrics)
+    }
+
+    async fn start_with(
+        readiness: Readiness,
+    ) -> (SocketAddr, Shutdown, Arc<DnsMetrics>, Readiness) {
         let shutdown = Shutdown::new();
         let metrics = Arc::new(DnsMetrics::new());
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -170,10 +210,11 @@ mod tests {
         tokio::spawn(serve(
             listener,
             metrics.clone(),
+            readiness.clone(),
             shutdown.stop_handle(),
             shutdown.busy(),
         ));
-        (addr, shutdown, metrics)
+        (addr, shutdown, metrics, readiness)
     }
 
     #[tokio::test]
@@ -224,6 +265,51 @@ mod tests {
         assert!(scrape(addr, "POST /metrics HTTP/1.1\r\n\r\n")
             .await
             .starts_with("HTTP/1.1 405"));
+    }
+
+    /// The whole point of the split: a secondary that has bound its sockets but
+    /// has not transferred anything is **alive and not ready**, and one endpoint
+    /// answering both questions cannot say so. `/healthz` passes throughout;
+    /// `/readyz` is 503 until the zone arrives, and names what it is waiting for.
+    #[tokio::test]
+    async fn a_server_can_be_alive_and_not_ready() {
+        let (addr, _shutdown, _metrics, readiness) =
+            start_with(Readiness::waiting_for(["example.com.", "example.net."])).await;
+
+        assert!(
+            scrape(addr, "GET /healthz HTTP/1.1\r\n\r\n")
+                .await
+                .starts_with("HTTP/1.1 200 OK"),
+            "liveness does not wait on the zones"
+        );
+        let body = scrape(addr, "GET /readyz HTTP/1.1\r\n\r\n").await;
+        assert!(
+            body.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{body}"
+        );
+        // "not ready" with no reason attached is a probe nobody can act on.
+        assert!(body.contains("example.com."), "{body}");
+        assert!(body.contains("example.net."), "{body}");
+
+        readiness.arrived("example.com.");
+        let body = scrape(addr, "GET /readyz HTTP/1.1\r\n\r\n").await;
+        assert!(body.starts_with("HTTP/1.1 503"), "one of two: {body}");
+        assert!(!body.contains("example.com."), "it arrived: {body}");
+
+        readiness.arrived("example.net.");
+        let body = scrape(addr, "GET /readyz HTTP/1.1\r\n\r\n").await;
+        assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
+        assert!(body.ends_with("ready\n"), "{body}");
+    }
+
+    /// A primary loads, signs and verifies every zone before anything binds, so
+    /// there is no window to report: it is ready as soon as it answers at all.
+    #[tokio::test]
+    async fn a_server_with_nothing_to_wait_for_is_ready_at_once() {
+        let (addr, _shutdown, _metrics) = start().await;
+        assert!(scrape(addr, "GET /readyz HTTP/1.1\r\n\r\n")
+            .await
+            .starts_with("HTTP/1.1 200 OK"));
     }
 
     /// The endpoint stops with everything else, and does not hold the drain open

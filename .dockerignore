@@ -1,0 +1,30 @@
+# Deny everything, then name what the build needs. An allowlist rather than a
+# list of exclusions because the failure modes are not symmetric: something that
+# should have been excluded and was not ends up in an image layer, and `.git` is
+# the one that matters — it carries every version of every file anyone ever
+# committed by mistake, and a multi-stage build discarding the stage it landed in
+# is a convention, not a guarantee (`--target build`, a cache export, or one
+# careless `COPY --from` all keep it). The build stamps its version from
+# `RDNS_GIT_DESCRIBE` instead; see the Dockerfile.
+#
+# `*` matches top-level entries only — it does not cross `/` — which is what
+# makes the `!` lines below able to bring whole directories back.
+*
+
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+
+# All five workspace members. `rdnsr` is not built into the image, but cargo
+# parses every member's manifest to resolve the workspace and refuses one whose
+# `src/main.rs` is missing, so it has to be here.
+!rdns
+!rdnsc
+!rdnsctl
+!rdnsd
+!rdnsr
+
+# Nothing above should contain these, but say so rather than rely on it. After
+# the `!` lines, because the last matching pattern wins.
+**/target
+**/*.log

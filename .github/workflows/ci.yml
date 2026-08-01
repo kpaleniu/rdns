@@ -90,6 +90,85 @@ jobs:
           rust-version: "1.95"
           command: check
 
+  # The image is built and *run*, not merely built. A Dockerfile that is only
+  # parsed is a deployment artifact nobody has checked — `CLAUDE.md` §4: prove an
+  # operational fix by provoking it, not by reading the diff. The same sequence
+  # is runnable by hand on the Linux side (see TODO.md "Running the Linux half"); this is
+  # what makes it happen on every push instead of once.
+  image:
+    name: container image
+    runs-on: ubuntu-latest
+    steps:
+      # No `fetch-depth: 0` here, unlike every other job: nothing in this one runs
+      # `git describe`. The build context has no `.git` in it by design, and what
+      # the version stamp needs is passed in from the variables GitHub already
+      # sets — so the default shallow checkout is enough.
+      - uses: actions/checkout@v4
+      - name: build the image
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          # A tag push names itself; anything else is identified by its commit,
+          # with `git describe`'s `g` prefix for "this is an object name". What is
+          # lost against a real `git describe` is the "nearest tag plus commits
+          # since" form, which no environment variable carries — and `--dirty`,
+          # which cannot happen in a fresh checkout. On a pull request `SHA` is
+          # the merge commit, which is what was built and so what should be
+          # reported.
+          if [ "$REF_TYPE" = tag ]; then describe="$REF_NAME"; else describe="g${SHA:0:12}"; fi
+          docker build -t rdns:ci --build-arg RDNS_GIT_DESCRIBE="$describe" .
+      # Naming a commit is the one question asked of a running container, and it
+      # is also the cheapest proof that the binary in the image runs at all.
+      - run: docker run --rm rdns:ci --version
+
+      - name: it serves, probes, and stops cleanly
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/zones
+          cat > /tmp/zones/example.com.zone <<'EOF'
+          $ORIGIN example.com.
+          $TTL 3600
+          @   IN  SOA ns1.example.com. admin.example.com. (
+                      7 3600 1800 604800 300 )
+          @   IN  NS  ns1.example.com.
+          ns1 IN  A   127.0.0.1
+          www IN  A   192.0.2.10
+          EOF
+          docker run -d --name rdns-ci \
+            -p 15353:5353/udp -p 19153:9153 \
+            -v /tmp/zones:/etc/rdns/zones:ro rdns:ci
+
+          # Liveness first: it answers as soon as the listener is up.
+          # `if`, not `curl ... && break`: under `set -e` a failing AND-list is
+          # fatal, so the poll would exit the script on its first attempt —
+          # before the container had finished starting, which is the only reason
+          # the poll exists.
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:19153/healthz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:19153/healthz
+
+          # Readiness. `curl -f` fails on the 503, which is the point of using a
+          # status code rather than a body: a probe that always passes is not a
+          # gate. This server is a primary, so it is ready as soon as it is alive.
+          curl -sf http://127.0.0.1:19153/readyz
+
+          # The scrape works and knows about the zone it loaded.
+          curl -sf http://127.0.0.1:19153/metrics | grep 'dns_zone_serial{zone="example.com."} 7'
+
+          # And it answers DNS — asked with the client shipped in the image, so
+          # the check needs nothing installed on the runner.
+          docker exec rdns-ci rdnsc 127.0.0.1:5353 A www.example.com. | grep '192, 0, 2, 10'
+
+          # STOPSIGNAL and the drain, as PID 1 in a container: `docker stop` sends
+          # SIGTERM, and a clean stop is exit 0 with the drain having reported.
+          docker stop -t 30 rdns-ci
+          docker logs rdns-ci 2>&1 | grep 'drained cleanly'
+          test "$(docker inspect -f '{{.State.ExitCode}}' rdns-ci)" = 0
+
   # Feature-gated code is code nobody compiles until the day they need it, and
   # the heap profiler is the one thing here whose whole purpose is to be reached
   # in a hurry.

@@ -23,6 +23,7 @@ use rdns::{
     logging::{LogLevel, QueryLogger},
     metrics::{DnsMetrics, LatencyTimer},
     metrics_server, notify,
+    readiness::Readiness,
     secondary::{
         is_newer, state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile,
         TransferState,
@@ -980,6 +981,9 @@ struct ServePolicy {
     udp_workers: usize,
     /// Where to serve Prometheus metrics, if anywhere.
     metrics_listen: Option<String>,
+    /// Whether every zone this server answers for is in the map yet, for
+    /// `/readyz` on that same listener.
+    readiness: Readiness,
     /// The control socket, and what a `reload` on it pokes.
     control: ControlPolicy,
 }
@@ -1023,6 +1027,7 @@ async fn serve(
         query_limit,
         udp_workers,
         metrics_listen,
+        readiness,
         control,
     } = policy;
     // Floored, not refused: `--udp-workers 0` is a server that binds the UDP
@@ -1131,6 +1136,24 @@ async fn serve(
             None => "off (--control-socket)".to_string(),
         }
     );
+    // Listening is not the same as serving, and this is the one moment where the
+    // difference is invisible from outside: the sockets are up and some zones are
+    // not. Said out loud for `CLAUDE.md` §14's reason — a gate nobody can observe
+    // is a gate nobody can debug — including the case where the answer is
+    // nowhere, because `--metrics-listen` is off and `/readyz` is the only way to
+    // ask.
+    let still_waiting = readiness.pending();
+    if !still_waiting.is_empty() {
+        tracing::info!(
+            "not ready: {} zone(s) awaiting a first transfer [{}]{}",
+            still_waiting.len(),
+            still_waiting.join(" "),
+            match &metrics_listen {
+                Some(spec) => format!(" — {spec}/readyz answers 503 until they arrive"),
+                None => " — with no --metrics-listen, nothing can probe for it".to_string(),
+            }
+        );
+    }
 
     // A `JoinSet` rather than two `JoinHandle`s in a `select!`. The old shape
     // selected over the handles and **dropped the loser**, and dropping a
@@ -1165,6 +1188,7 @@ async fn serve(
         loops.spawn(metrics_server::serve(
             metrics_listener,
             server.metrics.clone(),
+            readiness,
             shutdown.stop_handle(),
             shutdown.busy(),
         ));
@@ -2941,6 +2965,9 @@ struct Replication {
     zone_dir: PathBuf,
     /// Who to tell when a zone we replicate moves — we are its master to them.
     notify_targets: Vec<SocketAddr>,
+    /// Ticked off when a zone this server had nothing for arrives, which is what
+    /// takes a cold-started secondary from "listening" to "ready".
+    readiness: Readiness,
 }
 
 /// Start a refresh task per (zone, master), and return what a NOTIFY needs to
@@ -3109,6 +3136,7 @@ async fn refresh_once(
         state,
         zone_dir,
         notify_targets,
+        readiness,
     } = replication;
     let Served {
         zone_map, metrics, ..
@@ -3198,6 +3226,23 @@ async fn refresh_once(
     let soa = notify::soa_record(&fetched);
     install_zone(served, fetched).await;
     record_state(state, spec, serial, now, metrics).await?;
+
+    // The zone is in the map, so if this server was started without it — a cold
+    // secondary, or one whose copy on disk could not be vouched for — that is one
+    // fewer thing standing between it and `/readyz`. Idempotent, and a no-op for
+    // every zone that was already there at startup, so the ordinary hourly
+    // refresh reports nothing.
+    if readiness.arrived(&spec.zone) {
+        tracing::info!(
+            "{}: first transfer since startup{}",
+            spec.zone,
+            if readiness.is_ready() {
+                " — every zone is now being served, /readyz passes"
+            } else {
+                ""
+            }
+        );
+    }
 
     // We are this zone's master to whoever replicates it from us, and the serial
     // just moved forward — which is the whole of what a NOTIFY says.
@@ -3570,6 +3615,11 @@ async fn main() -> Result<()> {
     // process started.
     let mut reload_secondaries: Vec<MasterSpec> = Vec::new();
     let mut reload_zone_dir: Option<PathBuf> = None;
+    // Filled in below for a secondary. A primary's is empty and it is ready as
+    // soon as it is alive: every zone it serves was loaded, signed and verified
+    // above, and a failure in any of that stopped the start rather than reaching
+    // here.
+    let mut readiness = Readiness::ready();
     let secondaries = if secondary_specs.is_empty() {
         Arc::new(HashMap::new())
     } else {
@@ -3582,11 +3632,28 @@ async fn main() -> Result<()> {
         withdraw_unvouched_zones(&secondary_specs, &served, &zone_dir).await;
         reload_secondaries = secondary_specs.clone();
         reload_zone_dir = Some(zone_dir.clone());
+
+        // What we are configured to answer for but do not hold — asked *after*
+        // the withdrawal above, because a zone read off disk whose age cannot be
+        // vouched for has just stopped being served and is exactly what this has
+        // to wait for. Built before the refresh tasks start, so an arrival can
+        // never be reported to a `Readiness` that does not exist yet.
+        readiness = {
+            let zones = zone_map.read().await;
+            Readiness::waiting_for(
+                secondary_specs
+                    .iter()
+                    .filter(|spec| zones.matching(&spec.zone).is_none())
+                    .map(|spec| spec.zone.as_str()),
+            )
+        };
+
         let replication = Replication {
             served: served.clone(),
             state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&zone_dir)))),
             zone_dir,
             notify_targets: notify_targets.clone(),
+            readiness: readiness.clone(),
         };
         spawn_secondaries(
             secondary_specs,
@@ -3637,6 +3704,7 @@ async fn main() -> Result<()> {
             query_limit,
             udp_workers: cli.udp_workers,
             metrics_listen: cli.metrics_listen,
+            readiness,
             control: ControlPolicy {
                 socket: cli.control_socket,
                 reloads,
@@ -5027,6 +5095,9 @@ mod tests {
             state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&dir.0)))),
             zone_dir: dir.0.clone(),
             notify_targets,
+            // Nothing here probes `/readyz`; `readiness::tests` is where the
+            // latch itself is checked.
+            readiness: Readiness::ready(),
         }
     }
 
@@ -5225,6 +5296,7 @@ mod tests {
             state: state.clone(),
             zone_dir: dir.0.clone(),
             notify_targets: Vec::new(),
+            readiness: Readiness::ready(),
         };
         expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
         assert!(
@@ -5275,6 +5347,7 @@ mod tests {
             state: state.clone(),
             zone_dir: dir.0.clone(),
             notify_targets: Vec::new(),
+            readiness: Readiness::ready(),
         };
         expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
         assert_eq!(zone_map.read().await.len(), 1, "still served");
