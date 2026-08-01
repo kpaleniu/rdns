@@ -117,6 +117,44 @@ rdnsd --zone-dir ./zones
 rdnsd --zone-dir .
 ```
 
+### `--log-level <LEVEL>` and `--quiet`
+
+`error`, `warn`, `info`, `debug` or `trace`. Default `info`. `--quiet` is the
+same as `--log-level error`, and giving both is an error rather than a
+precedence rule. The same flags, levels and default on `rdnsd` and `rdnsr`.
+
+**Nothing per-packet is above `debug`**, and that is the point rather than an
+accident. A malformed query, a parse failure, a response arriving at a listening
+socket, a client that vanished mid-write — none of those is worth an operator's
+attention one at a time, and at 50k pps of garbage they were 50k journald lines a
+second with no way to turn them off. Measured after the change: 50 malformed
+datagrams produce no log lines at the default level.
+
+What each level is for:
+
+| Level | What it adds |
+|-------|--------------|
+| `error` | The server cannot do something it must — a trust-anchor file it cannot write, a SIGHUP handler it could not install. |
+| `warn` | Somebody should look, without turning anything up: a TSIG rejection, a refused transfer, a zone withdrawn on EXPIRE, an unacknowledged NOTIFY, an answer that failed DNSSEC validation. |
+| `info` | The operational record: startup banner and effective policy, zone loads, transfers, reloads, NOTIFYs. **The default.** |
+| `debug` | Per-packet and per-query detail. This is the flood; ask for it deliberately. |
+| `trace` | Everything. |
+
+`RUST_LOG` overrides the flag when it is set, which is what to reach for on a
+server that is already misbehaving under a level chosen weeks ago in a unit file:
+
+```bash
+RUST_LOG=rdnsd=debug,rdns::xfr=trace rdnsd --config /etc/rdns/rdnsd.toml
+```
+
+Log **volume** is the platform's job. `rdnsd` has no rate limiter of its own on
+purpose — journald's is per-unit (`LogRateLimitIntervalSec`, `LogRateLimitBurst`,
+both in the README's unit), it reports what it dropped, and two limiters would be
+two things to reason about at 3am.
+
+Two commands still write to **stdout** regardless of level, because their output
+is the point of running them: `--check-config` and `--generate-keys`.
+
 ### `--response-rate <BYTES_PER_SEC>` (applies to UDP)
 
 Response **bytes** per second, per client address. Default `8192`; `0` turns the

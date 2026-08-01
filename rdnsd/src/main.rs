@@ -13,8 +13,8 @@ use rdns::{
     dnssec_answer,
     dnssec_key::{SigningAlgorithm, SigningKey},
     dnssec_validation_mode::DnssecValidator,
-    ixfr::{ixfr_response, DeltaLog, IxfrResponse},
-    logging::QueryLogger,
+    ixfr::{ixfr_response, plan_change, DeltaLog, IxfrResponse, PlannedDelta},
+    logging::{LogLevel, QueryLogger},
     metrics::{DnsMetrics, LatencyTimer},
     metrics_server, notify,
     secondary::{
@@ -60,9 +60,44 @@ use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 use tokio::task::JoinSet;
 
 #[cfg(unix)]
-use signal_hook::consts::signal::SIGHUP;
-#[cfg(unix)]
-use signal_hook_tokio::Signals;
+use tokio::signal::unix::{signal, Signal, SignalKind};
+
+/// A peer sent something we could not use: a malformed packet, a truncated TCP
+/// message, a response arriving at a listening socket.
+///
+/// **DEBUG is the whole point of this macro.** These are the paths a flood goes
+/// through, and every one of them used to be an unconditional unbuffered
+/// `write(2)` with the message built by `format!` first — 50k lines a second at
+/// 50k pps of garbage, with no way to turn it off. At DEBUG the message is not
+/// formatted at all unless somebody asked for it, and what an operator sees by
+/// default is the *counter*, which is what a graph should be built on anyway.
+///
+/// A malformed packet is not an operator-actionable event. Ten million of them
+/// are, and that is what `dns_errors_total` is for.
+macro_rules! bad_request {
+    ($logger:expr, $ip:expr, $($arg:tt)*) => {{
+        $logger.count_error($ip);
+        tracing::debug!(peer = %$ip, $($arg)*);
+    }};
+}
+
+/// Something went wrong while serving a request that an operator may want to
+/// know about: a refusal we decided on, or a failure that is ours.
+///
+/// WARN, because none of these is attacker-triggerable in volume the way
+/// [`bad_request`] is — a signing failure or a serialization error means
+/// something is actually wrong here, and a refused transfer is a policy decision
+/// somebody may be debugging at the other end.
+///
+/// Both macros count, so `total_errors` still means "requests that did not get a
+/// normal answer" whichever level is in force. Counting and logging in one place
+/// is what stops a call site doing one and forgetting the other.
+macro_rules! serving_error {
+    ($logger:expr, $ip:expr, $($arg:tt)*) => {{
+        $logger.count_error($ip);
+        tracing::warn!(peer = %$ip, $($arg)*);
+    }};
+}
 
 /// Authoritative DNS server.
 ///
@@ -291,6 +326,23 @@ struct Cli {
     /// network. Exit 0 means the server would start.
     #[arg(long, requires = "config")]
     check_config: bool,
+    /// How much to say: error, warn, info, debug or trace.
+    ///
+    /// `info` by default — the startup banner and the effective policy, every
+    /// zone load, transfer and NOTIFY, every refusal, every failure that is
+    /// ours. All of those are per-event and rare.
+    ///
+    /// **Nothing per-packet is above `debug`**, which is the point: a malformed
+    /// packet is not an operator-actionable event, and at 50k pps of garbage it
+    /// used to be 50k journald lines a second with no way to turn it off.
+    ///
+    /// `RUST_LOG` overrides this when set, so a running server can be turned up
+    /// without editing its unit file and restarting into new flags.
+    #[arg(long, value_name = "LEVEL", default_value = "info")]
+    log_level: LogLevel,
+    /// Errors only. The same as `--log-level error`, and refused with it.
+    #[arg(long, conflicts_with = "log_level")]
+    quiet: bool,
 }
 
 /// Zone source: either a single file or a directory of zone files
@@ -817,7 +869,7 @@ fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> 
 /// transport, and the metrics are one server's, not one socket's — with a process
 /// per transport they were two sets that each saw half the traffic.
 struct Server {
-    zone_map: Arc<RwLock<HashMap<String, Zone>>>,
+    zone_map: Arc<RwLock<Zones>>,
     rate_limiter: Arc<RateLimiter>,
     validator: Arc<RequestValidator>,
     logger: Arc<QueryLogger>,
@@ -857,7 +909,7 @@ struct ServePolicy {
 /// Bind both transports and serve them from one process.
 async fn serve(
     addr: &str,
-    zone_map: Arc<RwLock<HashMap<String, Zone>>>,
+    zone_map: Arc<RwLock<Zones>>,
     policy: ServePolicy,
     secondaries: Secondaries,
     deltas: Arc<RwLock<DeltaLog>>,
@@ -947,7 +999,11 @@ async fn serve(
         secondaries,
         deltas,
     });
-    println!(
+    // INFO, and the default level is INFO so it is seen: `CLAUDE.md` §14 —
+    // the effective policy is printed at startup because a control nobody can
+    // observe is a control nobody can debug. `--quiet` silences it, which is an
+    // operator saying they do not want it rather than a default hiding it.
+    tracing::info!(
         "rdnsd listening on {addr} (UDP+TCP), zone transfer: {transfers}, \
          response budget: {budget}, query rate: {query_limit_note}, \
          TSIG keys: {}, metrics: {}",
@@ -999,7 +1055,7 @@ async fn serve(
             failure = joined.and_then(listener_failure);
         }
         signal = stop_signal() => {
-            println!("{signal} received, shutting down");
+            tracing::info!("{signal} received, shutting down");
         }
     }
 
@@ -1101,7 +1157,7 @@ impl Server {
         let writer_task = tokio::spawn(async move {
             while let Some(framed) = rx.recv().await {
                 if let Err(e) = writer.write_all(&framed).await {
-                    writer_logger.log_error(peer.ip(), &format!("socket write error: {}", e));
+                    bad_request!(writer_logger, peer.ip(), "socket write error: {e}");
                     break;
                 }
             }
@@ -1135,7 +1191,7 @@ impl Server {
 
             let len = u16::from_be_bytes(len_buf) as usize;
             if len == 0 {
-                self.logger.log_error(peer.ip(), "zero-length TCP message");
+                bad_request!(self.logger, peer.ip(), "zero-length TCP message");
                 break;
             }
 
@@ -1145,13 +1201,13 @@ impl Server {
             match tokio::time::timeout(TCP_READ_TIMEOUT, reader.read_exact(&mut packet)).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    self.logger
-                        .log_error(peer.ip(), &format!("socket read error: {}", e));
+                    self.logger.count_error(peer.ip());
+                    tracing::debug!(peer = %peer.ip(), "socket read error: {e}");
                     break;
                 }
                 Err(_) => {
-                    self.logger
-                        .log_error(peer.ip(), "timed out mid-message on TCP");
+                    self.logger.count_error(peer.ip());
+                    tracing::debug!(peer = %peer.ip(), "timed out mid-message on TCP");
                     break;
                 }
             }
@@ -1202,21 +1258,23 @@ impl Server {
 
         let validation = self.validator.validate_packet(packet, true);
         if !validation.is_valid() {
-            self.logger.log_error(
+            // `map_or_else` builds a `String` for the "unknown error" case and
+            // `to_string()`s the error for the other, per packet — inside a
+            // macro that does not evaluate its arguments unless DEBUG is on.
+            bad_request!(
+                self.logger,
                 ip,
-                &format!(
-                    "invalid query: {}",
-                    validation
-                        .error()
-                        .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
-                ),
+                "invalid query: {}",
+                validation
+                    .error()
+                    .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
             );
             self.metrics.count(&self.metrics.validation_errors);
             return Vec::new();
         }
 
         let Ok(msg) = DnsMessage::try_from_bytes(packet) else {
-            self.logger.log_error(ip, "failed to parse DNS message");
+            bad_request!(self.logger, ip, "failed to parse DNS message");
             return Vec::new();
         };
 
@@ -1227,8 +1285,11 @@ impl Server {
         // of servers, or one spoofed datagram, into a packet loop; and there is
         // no reply to send, because the sender did not ask anything.
         if msg.response {
-            self.logger
-                .log_error(ip, "a response was sent to a server port; dropped");
+            bad_request!(
+                self.logger,
+                ip,
+                "a response was sent to a server port; dropped"
+            );
             return Vec::new();
         }
 
@@ -1248,13 +1309,15 @@ impl Server {
             TsigCheck::Unsigned => None,
             TsigCheck::Verified(session) => Some(session),
             TsigCheck::Rejected(rejection) => {
-                self.logger.log_error(
+                // WARN, not DEBUG: a key that does not verify is either a
+                // misconfiguration somebody is debugging from the other end or
+                // somebody trying keys, and both are worth seeing.
+                serving_error!(
+                    self.logger,
                     ip,
-                    &format!(
-                        "TSIG rejected (key {}): {}",
-                        rejection.key_name(),
-                        rejection.error.reason()
-                    ),
+                    "TSIG rejected (key {}): {}",
+                    rejection.key_name(),
+                    rejection.error.reason()
                 );
                 let response = match self.error_bytes(&msg, ResponseCode::NotAuthorized) {
                     Some(bytes) => bytes,
@@ -1263,7 +1326,7 @@ impl Server {
                 return match rejection.attach(response, now) {
                     Ok(bytes) => vec![frame(&bytes)],
                     Err(e) => {
-                        self.logger.log_error(ip, &format!("TSIG error reply: {e}"));
+                        serving_error!(self.logger, ip, "TSIG error reply: {e}");
                         Vec::new()
                     }
                 };
@@ -1297,8 +1360,7 @@ impl Server {
             match resp.to_bytes_within(u16::MAX as usize) {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    self.logger
-                        .log_error(ip, &format!("serialization error: {}", e));
+                    serving_error!(self.logger, ip, "serialization error: {e}");
                     return Vec::new();
                 }
             }
@@ -1311,8 +1373,7 @@ impl Server {
             Some(session) => match session.sign(bytes, now) {
                 Ok(signed) => vec![frame(&signed)],
                 Err(e) => {
-                    self.logger
-                        .log_error(ip, &format!("TSIG signing failed: {e}"));
+                    serving_error!(self.logger, ip, "TSIG signing failed: {e}");
                     Vec::new()
                 }
             },
@@ -1371,25 +1432,24 @@ impl Server {
             .filter(|s| !s.may_transfer(&apex))
             .map(|s| s.key_name().to_string());
         if let Some(key_name) = unauthorized {
-            self.logger.log_error(
+            // One line, not two. This said the same thing through `log_error`
+            // and again through `println!`, so an operator grepping for a
+            // refused transfer found it twice on two different streams.
+            serving_error!(
+                self.logger,
                 ip,
-                &format!("{kind} of {qname} refused: key {key_name} is not allowed to transfer it"),
-            );
-            println!(
-                "{kind} of {qname} from {ip}: REFUSED (key {key_name} is scoped to other zones)"
+                "{kind} of {qname} REFUSED: key {key_name} is scoped to other zones"
             );
             return self.transfer_error(msg, ResponseCode::Refused, ip, session);
         }
 
         let authenticated_by = session.as_ref().map(|s| s.key_name().to_string());
         if authenticated_by.is_none() && !self.transfer_acl.allows(ip) {
-            self.logger.log_error(
+            serving_error!(
+                self.logger,
                 ip,
-                &format!(
-                    "{kind} of {qname} refused: {ip} has no key and is not in --allow-transfer"
-                ),
+                "{kind} of {qname} REFUSED: no TSIG key, and not in --allow-transfer"
             );
-            println!("{kind} of {qname} from {ip}: REFUSED (no TSIG key, not in --allow-transfer)");
             // No session on this path by construction — it is the "no key" case.
             return self.transfer_error(msg, ResponseCode::Refused, ip, None);
         }
@@ -1405,7 +1465,7 @@ impl Server {
                 .values()
                 .find(|z| z.origin().eq_ignore_ascii_case(&apex))
             else {
-                println!("{kind} of {qname} from {ip}: NOTAUTH (not a zone served here)");
+                tracing::info!(peer = %ip, "{kind} of {qname}: NOTAUTH (not a zone served here)");
                 return self.transfer_error(msg, ResponseCode::NotAuthorized, ip, session);
             };
             let built = if incremental {
@@ -1417,13 +1477,15 @@ impl Server {
                 ixfr_response(msg, zone, &deltas).map(|response| {
                     match &response {
                         IxfrResponse::UpToDate(_) => {
-                            println!("IXFR of {qname} from {ip}: already current, sending one SOA")
+                            tracing::info!(peer = %ip, "IXFR of {qname}: already current, sending one SOA")
                         }
-                        IxfrResponse::Incremental { steps, records, .. } => println!(
-                            "IXFR of {qname} to {ip}: {records} record(s) across {steps} version(s)"
+                        IxfrResponse::Incremental { steps, records, .. } => tracing::info!(
+                            peer = %ip,
+                            "IXFR of {qname}: {records} record(s) across {steps} version(s)"
                         ),
-                        IxfrResponse::FullTransfer { why, .. } => println!(
-                            "IXFR of {qname} to {ip}: sending the whole zone instead ({why})"
+                        IxfrResponse::FullTransfer { why, .. } => tracing::info!(
+                            peer = %ip,
+                            "IXFR of {qname}: sending the whole zone instead ({why})"
                         ),
                     }
                     response.messages()
@@ -1434,8 +1496,7 @@ impl Server {
             match built {
                 Ok(messages) => messages,
                 Err(e) => {
-                    self.logger
-                        .log_error(ip, &format!("{kind} of {qname}: {e}"));
+                    serving_error!(self.logger, ip, "{kind} of {qname}: {e}");
                     return self.transfer_error(msg, ResponseCode::ServerFailure, ip, session);
                 }
             }
@@ -1451,8 +1512,11 @@ impl Server {
                     // Half a transfer is worse than none: the client cannot tell
                     // a stream that stopped early from one that finished, so give
                     // up on the whole thing rather than send a prefix of it.
-                    self.logger
-                        .log_error(ip, &format!("{kind} of {qname}: serialization error: {e}"));
+                    serving_error!(
+                        self.logger,
+                        ip,
+                        "{kind} of {qname}: serialization error: {e}"
+                    );
                     return self.transfer_error(msg, ResponseCode::ServerFailure, ip, session);
                 }
             };
@@ -1463,8 +1527,11 @@ impl Server {
                 Some(session) => match session.sign(bytes, now) {
                     Ok(signed) => signed,
                     Err(e) => {
-                        self.logger
-                            .log_error(ip, &format!("{kind} of {qname}: TSIG signing failed: {e}"));
+                        serving_error!(
+                            self.logger,
+                            ip,
+                            "{kind} of {qname}: TSIG signing failed: {e}"
+                        );
                         // Deliberately unsigned: signing is what just failed.
                         return self.transfer_error(msg, ResponseCode::ServerFailure, ip, None);
                     }
@@ -1480,8 +1547,9 @@ impl Server {
             Some(key) => format!("key {key}"),
             None => format!("address {ip}"),
         };
-        println!(
-            "{kind} of {qname} to {ip}: {records} records in {} message(s), authenticated by {how}",
+        tracing::info!(
+            peer = %ip,
+            "{kind} of {qname}: {records} records in {} message(s), authenticated by {how}",
             frames.len()
         );
         frames
@@ -1511,8 +1579,7 @@ impl Server {
         session: Option<&mut TsigSession>,
     ) -> Vec<Vec<u8>> {
         let Some(bytes) = self.error_bytes(msg, rcode) else {
-            self.logger
-                .log_error(ip, "could not serialize an error response");
+            serving_error!(self.logger, ip, "could not serialize an error response");
             return Vec::new();
         };
         let bytes = match session {
@@ -1522,8 +1589,7 @@ impl Server {
                     // Nothing useful left to send: an unsigned error is what we
                     // were trying not to produce, so say so here rather than
                     // emitting one anyway.
-                    self.logger
-                        .log_error(ip, &format!("signing an error response failed: {e}"));
+                    serving_error!(self.logger, ip, "signing an error response failed: {e}");
                     return Vec::new();
                 }
             },
@@ -1652,11 +1718,12 @@ fn notify_reply(
             for wake in &replicated.wake {
                 wake.notify_one();
             }
-            println!("NOTIFY for {zone} from {peer}: refreshing now");
+            tracing::info!(%peer, "NOTIFY for {zone}: refreshing now");
             return notify::notify_response(msg, ResponseCode::Ok);
         }
-        println!(
-            "NOTIFY for {zone} from {peer}: REFUSED (not one of its masters — \
+        tracing::warn!(
+            %peer,
+            "NOTIFY for {zone}: REFUSED (not one of its masters — \
              a NOTIFY costs its recipient a transfer)"
         );
         return notify::notify_response(msg, ResponseCode::Refused);
@@ -1670,7 +1737,7 @@ fn notify_reply(
     } else {
         "not a zone served here"
     };
-    println!("NOTIFY for {zone} from {peer}: NOTAUTH ({why})");
+    tracing::info!(%peer, "NOTIFY for {zone}: NOTAUTH ({why})");
     notify::notify_response(msg, ResponseCode::NotAuthorized)
 }
 
@@ -1737,14 +1804,13 @@ async fn udp_loop(
             // Validation check
             let validation = validator.validate_packet(&packet, false);
             if !validation.is_valid() {
-                logger.log_error(
+                bad_request!(
+                    logger,
                     peer.ip(),
-                    &format!(
-                        "invalid query: {}",
-                        validation
-                            .error()
-                            .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
-                    ),
+                    "invalid query: {}",
+                    validation
+                        .error()
+                        .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
                 );
                 metrics.count(&metrics.validation_errors);
                 return;
@@ -1763,13 +1829,12 @@ async fn udp_loop(
                     TsigCheck::Unsigned => None,
                     TsigCheck::Verified(session) => Some(session),
                     TsigCheck::Rejected(rejection) => {
-                        logger.log_error(
+                        serving_error!(
+                            logger,
                             peer.ip(),
-                            &format!(
-                                "TSIG rejected (key {}): {}",
-                                rejection.key_name(),
-                                rejection.error.reason()
-                            ),
+                            "TSIG rejected (key {}): {}",
+                            rejection.key_name(),
+                            rejection.error.reason()
                         );
                         let mut resp = DnsMessage {
                             id: msg.id,
@@ -1845,8 +1910,7 @@ async fn udp_loop(
                             (Some(reply), Some(session)) => match session.sign(reply, now) {
                                 Ok(signed) => Some(signed),
                                 Err(e) => {
-                                    logger
-                                        .log_error(peer.ip(), &format!("TSIG signing failed: {e}"));
+                                    serving_error!(logger, peer.ip(), "TSIG signing failed: {e}");
                                     None
                                 }
                             },
@@ -1854,16 +1918,16 @@ async fn udp_loop(
                         };
                         if let Some(reply) = reply {
                             if let Err(e) = socket.send_to(&reply, peer).await {
-                                logger.log_error(peer.ip(), &format!("socket send error: {}", e));
+                                bad_request!(logger, peer.ip(), "socket send error: {e}");
                             }
                         }
                     }
                     Err(e) => {
-                        logger.log_error(peer.ip(), &format!("serialization error: {}", e));
+                        serving_error!(logger, peer.ip(), "serialization error: {e}");
                     }
                 }
             } else {
-                logger.log_error(peer.ip(), "failed to parse DNS message");
+                bad_request!(logger, peer.ip(), "failed to parse DNS message");
             }
         });
     }
@@ -1898,9 +1962,28 @@ impl Reloading {
     /// replaced half the zones and gave up would leave the server serving a
     /// mixture of two versions, and the half that failed is the half that
     /// needed attention.
+    /// **On a blocking thread, all of it.** Every step here blocks: `read_dir`,
+    /// a `read_to_string` and a full parse per zone, then `signing.apply`, which
+    /// is a ring ECDSA signing run over every RRset of every signed zone, then a
+    /// verification pass over what that produced. This is reached from the
+    /// SIGHUP task and from the re-signing timer, both of which run while the
+    /// listeners are live — so on the runtime it is a worker taken out of
+    /// service for the length of a full load, with queries queued behind it.
+    ///
+    /// The old signature was the trap rather than the cost: an `async fn`
+    /// containing *zero* await points reads as though it yields somewhere, and
+    /// nothing about calling it said otherwise (`CLAUDE.md` §9).
     async fn load(&self, source: &ZoneSource) -> Result<HashMap<String, Zone>> {
-        let mut zones =
-            load_zones_from_source(source, self.replicating, self.allow_partial).await?;
+        let reloading = self.clone();
+        let source = source.clone();
+        tokio::task::spawn_blocking(move || reloading.load_blocking(&source))
+            .await
+            .context("the zone-loading task")?
+    }
+
+    /// The blocking half of [`Reloading::load`], and named so at the call site.
+    fn load_blocking(&self, source: &ZoneSource) -> Result<HashMap<String, Zone>> {
+        let mut zones = load_zones_from_source(source, self.replicating, self.allow_partial)?;
         if let Some(signing) = &self.signing {
             signing.apply(&mut zones)?;
         }
@@ -1947,7 +2030,7 @@ async fn reload_once(
             // back in the map at this point. Judge it again before anything is
             // announced or answered.
             reloading.withdraw_unvouched(served).await;
-            println!("Zones reloaded ({why})");
+            tracing::info!("zones reloaded ({why})");
             // The point of reloading is that something changed — new data, or at
             // minimum new signatures and a new serial — so this is exactly when a
             // secondary wants to hear about it.
@@ -1957,7 +2040,7 @@ async fn reload_once(
             // The zones already loaded keep answering. A reload that failed is a
             // file that changed for the worse, and the version in memory is the
             // last one known good.
-            eprintln!("Failed to reload zones ({why}): {e}");
+            tracing::error!("failed to reload zones ({why}): {e}");
             announced
         }
     }
@@ -1990,7 +2073,7 @@ fn spawn_zone_maintenance(
     // schedule nobody asked for.
     let resign_every = reloading.signing.as_ref().map(|s| s.resign_interval());
     if let Some(every) = resign_every {
-        println!(
+        tracing::info!(
             "re-signing every {}h, a third of the {}-day signature validity",
             every.as_secs() / 3600,
             reloading
@@ -2044,13 +2127,22 @@ async fn sleep_for(every: Option<Duration>) {
     }
 }
 
+/// `tokio`'s own signal support rather than `signal-hook-tokio`, for the same
+/// reason `rdns::shutdown` uses it: it is already here, it needs no dependency,
+/// and one mechanism for every signal this process handles beats two.
+///
+/// **The two-crate version did not compile on Unix at all.** `signals.next()`
+/// needs a `StreamExt` in scope to resolve to `Stream::next`, nothing imported
+/// one, and so it resolved to `Iterator::next` and failed the trait bound —
+/// which no amount of building on Windows could show, because the whole module
+/// is `#[cfg(unix)]`. See `TODO.md` #9d.
 #[cfg(unix)]
-fn signal_stream() -> Option<Signals> {
-    match Signals::new([SIGHUP]) {
+fn signal_stream() -> Option<Signal> {
+    match signal(SignalKind::hangup()) {
         Ok(signals) => Some(signals),
         Err(e) => {
             // The re-signing timer still works, which is the half with teeth.
-            eprintln!("could not listen for SIGHUP ({e}); zones will not reload on signal");
+            tracing::error!("could not listen for SIGHUP ({e}); zones will not reload on signal");
             None
         }
     }
@@ -2059,9 +2151,9 @@ fn signal_stream() -> Option<Signals> {
 /// Whether a reload was asked for. `false` means the signal source ended and the
 /// loop should stop watching it.
 #[cfg(unix)]
-async fn next_reload_signal(signals: &mut Option<Signals>) -> bool {
+async fn next_reload_signal(signals: &mut Option<Signal>) -> bool {
     match signals {
-        Some(signals) => signals.next().await.is_some(),
+        Some(signals) => signals.recv().await.is_some(),
         // No signal source, but the timer may still fire — so park here rather
         // than ending the loop.
         None => std::future::pending().await,
@@ -2114,7 +2206,7 @@ fn parse_notify_targets(specs: &[String]) -> Result<Vec<SocketAddr>> {
 /// that went backwards is not either — a secondary compares serials and would
 /// ignore it, so sending would be noise.
 async fn announce_zones(
-    zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
+    zone_map: &Arc<RwLock<Zones>>,
     announced: &[(String, u32)],
     targets: &[SocketAddr],
     busy: &Busy,
@@ -2209,7 +2301,7 @@ async fn send_notify(
         "[::]:0".parse().expect("valid bind address")
     };
     let Ok(socket) = UdpSocket::bind(bind).await else {
-        eprintln!("NOTIFY {zone} to {target}: could not open a socket");
+        tracing::warn!("NOTIFY {zone} to {target}: could not open a socket");
         return;
     };
 
@@ -2219,11 +2311,11 @@ async fn send_notify(
         let msg = notify::notify_request(zone, soa.clone(), id);
         let mut buf = vec![0u8; 512];
         let Ok(len) = msg.to_bytes(&mut buf) else {
-            eprintln!("NOTIFY {zone}: could not serialize");
+            tracing::warn!("NOTIFY {zone}: could not serialize");
             return;
         };
         if socket.send_to(&buf[..len], target).await.is_err() {
-            eprintln!("NOTIFY {zone} to {target}: send failed");
+            tracing::warn!("NOTIFY {zone} to {target}: send failed");
             return;
         }
 
@@ -2234,7 +2326,7 @@ async fn send_notify(
         if let Ok(Ok((n, _))) = tokio::time::timeout(wait, socket.recv_from(&mut reply)).await {
             if let Ok(parsed) = DnsMessage::try_from_bytes(&reply[..n]) {
                 if notify::acknowledges(&parsed, id) {
-                    println!(
+                    tracing::info!(
                         "NOTIFY {zone} serial {serial} to {target}: acknowledged ({:?})",
                         parsed.rcode
                     );
@@ -2246,7 +2338,7 @@ async fn send_notify(
             wait *= 2;
         }
     }
-    eprintln!(
+    tracing::warn!(
         "NOTIFY {zone} serial {serial} to {target}: no acknowledgement after {} attempts",
         notify::NOTIFY_ATTEMPTS
     );
@@ -2273,20 +2365,35 @@ async fn install_zone(served: &Served, zone: Zone) {
     if let Some(serial) = zone.serial() {
         metrics.set_zone_serial(zone.origin(), serial);
     }
+
+    // The diff walks every record of both versions, and queries take this same
+    // lock — so it is planned under the read guard, where they run alongside it,
+    // rather than under the write guard, where they would all wait for it.
+    let (planned, generation) = {
+        let zones = zone_map.read().await;
+        (
+            plan_change(zones.matching(zone.origin()), &zone),
+            zones.generation(),
+        )
+    };
+
     let mut zones = zone_map.write().await;
     let mut log = deltas.write().await;
-
-    let key = zones
-        .keys()
-        .find(|k| k.eq_ignore_ascii_case(zone.origin()))
-        .cloned();
-    let previous = key.as_ref().and_then(|k| zones.get(k));
-    log.note_change(previous, &zone);
-
-    if let Some(key) = key {
-        zones.remove(&key);
+    // If the map moved while we held neither guard, the plan describes a
+    // version we are no longer replacing. See `Zones`.
+    let planned = if zones.generation() == generation {
+        planned
+    } else {
+        plan_change(zones.matching(zone.origin()), &zone)
+    };
+    if let Some(planned) = planned {
+        log.record(planned);
     }
-    zones.insert(zone.origin().to_string(), zone);
+    let displaced = zones.insert(zone);
+    drop(log);
+    drop(zones);
+    // Outside the guards on purpose. See `Zones::insert`.
+    drop(displaced);
 }
 
 /// Replace every zone, as a reload does, recording what changed in each.
@@ -2313,26 +2420,60 @@ async fn install_all_zones(served: &Served, new_zones: HashMap<String, Zone>) {
             .collect::<Vec<_>>(),
     );
     note_serials(metrics, &new_zones);
+
+    // A reload diffs *every* zone, so this is the call site the read/write split
+    // exists for: under one write guard it blocked every query for the sum of
+    // all of them. See `Zones`.
+    let (mut plan, generation) = {
+        let zones = zone_map.read().await;
+        (plan_reload(&zones, &new_zones), zones.generation())
+    };
+
     let mut zones = zone_map.write().await;
     let mut log = deltas.write().await;
-
-    for old_name in zones.keys() {
-        if !new_zones
-            .values()
-            .any(|z| z.origin().eq_ignore_ascii_case(old_name))
-        {
-            log.forget(old_name);
-        }
+    if zones.generation() != generation {
+        plan = plan_reload(&zones, &new_zones);
     }
-    for zone in new_zones.values() {
-        let previous = zones
-            .keys()
-            .find(|k| k.eq_ignore_ascii_case(zone.origin()))
-            .and_then(|k| zones.get(k));
-        log.note_change(previous, zone);
+    for gone in plan.forgotten {
+        log.forget(&gone);
+    }
+    for planned in plan.recorded {
+        log.record(planned);
     }
 
-    *zones = new_zones;
+    let displaced = zones.replace_all(new_zones);
+    drop(log);
+    drop(zones);
+    // Outside the guards on purpose: freeing the set we just replaced is one
+    // deallocation per record of every zone, and no query needs to wait for it.
+    drop(displaced);
+}
+
+/// What a reload does to the delta log: which zones leave it, and which gain a
+/// version step. Computed away from the write lock — see `Zones`.
+struct ReloadPlan {
+    forgotten: Vec<String>,
+    recorded: Vec<PlannedDelta>,
+}
+
+fn plan_reload(zones: &Zones, new_zones: &HashMap<String, Zone>) -> ReloadPlan {
+    let forgotten = zones
+        .keys()
+        .filter(|old_name| {
+            !new_zones
+                .values()
+                .any(|z| z.origin().eq_ignore_ascii_case(old_name))
+        })
+        .cloned()
+        .collect();
+    let recorded = new_zones
+        .values()
+        .filter_map(|zone| plan_change(zones.matching(zone.origin()), zone))
+        .collect();
+    ReloadPlan {
+        forgotten,
+        recorded,
+    }
 }
 
 /// Record the serial of every zone in `zones`.
@@ -2341,6 +2482,126 @@ fn note_serials(metrics: &DnsMetrics, zones: &HashMap<String, Zone>) {
         if let Some(serial) = zone.serial() {
             metrics.set_zone_serial(zone.origin(), serial);
         }
+    }
+}
+
+/// The zones this server answers from, and a counter that moves whenever the
+/// set does.
+///
+/// **The counter is the whole reason this is not a bare `HashMap`.** Installing
+/// a zone has to diff it against the version it replaces, and `ixfr::diff` walks
+/// every record of both into a `BTreeMap`. Doing that while holding the *write*
+/// lock blocks every query for the length of the walk — and on a `SIGHUP`
+/// reload, which installs every zone under one guard, for the sum of all of
+/// them. So the diff is planned under the read lock, where queries run
+/// alongside it, and only recorded under the write lock.
+///
+/// That split leaves a window: between dropping the read guard and taking the
+/// write guard, another task can install, expire or withdraw a zone. A plan made
+/// before that window may no longer describe the version it would be recorded
+/// against, and a delta computed from the wrong old version is precisely the
+/// "IXFR chain that does not describe the zone we serve" that `install_zone`'s
+/// comment is about — a secondary applying it ends up holding a zone that never
+/// existed. `generation` closes the window: equal means nothing moved and the
+/// plan still stands, different means throw it away and re-plan under the write
+/// lock, which is correct and rare.
+///
+/// **A serial comparison would not have done**, which is why this is a counter
+/// and not `Option<u32>`: two different versions of a zone can carry the same
+/// serial — an edited file reloaded without a bump is the ordinary way — so
+/// "same serial" does not mean "same records", and the check has to be about
+/// identity rather than about version.
+///
+/// Mutation goes through the methods below and there is no `DerefMut`, so the
+/// counter cannot be forgotten at a call site. That is the same reasoning as
+/// `DeltaLog::note_change` taking both versions rather than trusting the caller
+/// to remember the old one (`CLAUDE.md` §2, make it unrepresentable).
+#[derive(Debug, Default)]
+struct Zones {
+    by_name: HashMap<String, Zone>,
+    generation: u64,
+}
+
+impl Zones {
+    fn new(by_name: HashMap<String, Zone>) -> Self {
+        Zones {
+            by_name,
+            generation: 0,
+        }
+    }
+
+    /// Which version of the map this is. Only ever compared for equality.
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Install one zone, replacing any version of it already held.
+    ///
+    /// The removal is by the key already in the map rather than by the new
+    /// zone's origin, because the two can differ in case and inserting without
+    /// removing would leave both (`CLAUDE.md` §8, case folding is ASCII-only).
+    ///
+    /// **The displaced version is handed back rather than dropped here**, so the
+    /// caller can let it go after releasing the lock. Freeing a zone is one
+    /// deallocation per record, and a query waiting on the lock is waiting on
+    /// every one of them for no reason — the same argument as planning the diff
+    /// outside the guard, applied to the other end of the swap.
+    #[must_use = "drop the displaced zone after releasing the lock, not under it"]
+    fn insert(&mut self, zone: Zone) -> Option<Zone> {
+        let displaced = match self.matching_key(zone.origin()) {
+            Some(key) => self.by_name.remove(&key),
+            None => None,
+        };
+        self.by_name.insert(zone.origin().to_string(), zone);
+        self.generation += 1;
+        displaced
+    }
+
+    /// Withdraw a zone. `true` if one was actually held.
+    fn remove(&mut self, name: &str) -> bool {
+        let Some(key) = self.matching_key(name) else {
+            return false;
+        };
+        self.by_name.remove(&key);
+        self.generation += 1;
+        true
+    }
+
+    /// Swap the whole set, as a reload does, handing back the set replaced.
+    ///
+    /// Dropped by the caller once the lock is released, for the reason given on
+    /// [`Zones::insert`] — and it matters more here, because a reload displaces
+    /// every zone at once.
+    #[must_use = "drop the displaced zones after releasing the lock, not under it"]
+    fn replace_all(&mut self, by_name: HashMap<String, Zone>) -> HashMap<String, Zone> {
+        self.generation += 1;
+        std::mem::replace(&mut self.by_name, by_name)
+    }
+
+    /// The key under which `name` is held, whatever case either is in.
+    fn matching_key(&self, name: &str) -> Option<String> {
+        self.by_name
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    /// The version held for `name`, whatever case either is in.
+    fn matching(&self, name: &str) -> Option<&Zone> {
+        self.by_name
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, zone)| zone)
+    }
+}
+
+// Read-only, deliberately: every mutation has to go through a method that
+// moves `generation`, and a `DerefMut` would be a way around that.
+impl std::ops::Deref for Zones {
+    type Target = HashMap<String, Zone>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_name
     }
 }
 
@@ -2353,7 +2614,7 @@ fn note_serials(metrics: &DnsMetrics, zones: &HashMap<String, Zone>) {
 /// `CLAUDE.md` §14, and clippy objects at seven arguments for the same reason.
 #[derive(Clone)]
 struct Served {
-    zone_map: Arc<RwLock<HashMap<String, Zone>>>,
+    zone_map: Arc<RwLock<Zones>>,
     deltas: Arc<RwLock<DeltaLog>>,
     metrics: Arc<DnsMetrics>,
 }
@@ -2439,7 +2700,7 @@ fn spawn_secondaries(
         entry.masters.push(spec.master.ip());
         entry.wake.push(wake.clone());
 
-        println!(
+        tracing::info!(
             "secondary for {} from {}{}",
             spec.zone,
             spec.master,
@@ -2512,11 +2773,11 @@ async fn secondary_loop(
 
         let wait = match result {
             Ok(outcome) => {
-                println!("secondary {}: {outcome} (from {})", spec.zone, spec.master);
+                tracing::info!("secondary {}: {outcome} (from {})", spec.zone, spec.master);
                 timers.after_success()
             }
             Err(e) => {
-                eprintln!("secondary {} from {}: {e}", spec.zone, spec.master);
+                tracing::warn!("secondary {} from {}: {e}", spec.zone, spec.master);
                 expire_if_out_of_contact(&spec, &replication, started_at, timers).await;
                 timers.after_failure()
             }
@@ -2534,7 +2795,7 @@ async fn secondary_loop(
 
 /// The timers the zone we currently hold asks for, or the defaults if we hold
 /// none — a zone we have never fetched has no SOA to obey.
-async fn zone_timers(zone_map: &Arc<RwLock<HashMap<String, Zone>>>, zone: &str) -> RefreshTimers {
+async fn zone_timers(zone_map: &Arc<RwLock<Zones>>, zone: &str) -> RefreshTimers {
     zone_map
         .read()
         .await
@@ -2579,7 +2840,7 @@ async fn refresh_once(
     // exactly what "not stale" means.
     if let Some(held) = held {
         if !is_newer(remote, held) {
-            record_state(state, spec, held, now, metrics)?;
+            record_state(state, spec, held, now, metrics).await?;
             return Ok(format!("serial {held} is current"));
         }
     }
@@ -2595,7 +2856,7 @@ async fn refresh_once(
                 // The SOA probe said otherwise a moment ago, so the master
                 // changed its mind between the two questions. Nothing to do, and
                 // the next refresh will see the newer serial.
-                record_state(state, spec, serial, now, metrics)?;
+                record_state(state, spec, serial, now, metrics).await?;
                 return Ok(format!("serial {serial} is current (the master says so)"));
             }
             xfr::IxfrOutcome::Updated {
@@ -2644,7 +2905,7 @@ async fn refresh_once(
     // an interior node of a replication tree rather than a leaf.
     let soa = notify::soa_record(&fetched);
     install_zone(served, fetched).await;
-    record_state(state, spec, serial, now, metrics)?;
+    record_state(state, spec, serial, now, metrics).await?;
 
     // We are this zone's master to whoever replicates it from us, and the serial
     // just moved forward — which is the whole of what a NOTIFY says.
@@ -2656,7 +2917,7 @@ async fn refresh_once(
     })
 }
 
-fn record_state(
+async fn record_state(
     state: &Arc<Mutex<StateFile>>,
     spec: &MasterSpec,
     serial: u32,
@@ -2675,15 +2936,30 @@ fn record_state(
     // #9d asked for "last successful transfer"; this is the same question asked
     // more precisely.
     metrics.note_zone_transfer(&spec.zone, now);
-    state
-        .lock()
-        .expect("state mutex")
-        .record(TransferState {
+
+    // Update in memory under the guard, write outside it. `StateFile::record`
+    // would do both, and the write ends in an fsync of the file and then of its
+    // directory — so it would hold this `std::sync::Mutex` across the fsync,
+    // which every other zone's refresh loop then *spins* on rather than
+    // yielding, and it would do it on a runtime worker that is also answering
+    // queries (`CLAUDE.md` §9). The guard is dropped by the end of this block.
+    let (path, text) = {
+        let mut file = state.lock().expect("state mutex");
+        file.set(TransferState {
             zone: spec.zone.clone(),
             serial,
             refreshed_at: now,
             master: spec.master,
-        })
+        });
+        file.snapshot()
+    };
+
+    // `spawn_blocking` because the fsync is the point of the write: it is what
+    // makes "we transferred this" survive the power going out, and it is not
+    // something to do on a worker with queries queued behind it.
+    tokio::task::spawn_blocking(move || rdns::secondary::write_snapshot(&path, &text))
+        .await
+        .context("the task writing the transfer state")?
         .map_err(|e| anyhow!("recording the transfer state: {e}"))
 }
 
@@ -2724,12 +3000,7 @@ async fn expire_if_out_of_contact(
     }
 
     let mut zones = zone_map.write().await;
-    let held = zones
-        .keys()
-        .find(|k| k.eq_ignore_ascii_case(&spec.zone))
-        .cloned();
-    if let Some(key) = held {
-        zones.remove(&key);
+    if zones.remove(&spec.zone) {
         // The increments go with it: offering a chain for a zone we have
         // withdrawn would be answering for something we just stopped serving.
         deltas.write().await.forget(&spec.zone);
@@ -2737,9 +3008,12 @@ async fn expire_if_out_of_contact(
         // frozen at whatever it last was shows a zone this server has stopped
         // answering for as perfectly healthy.
         metrics.forget_zone(&spec.zone);
-        eprintln!(
+        // WARN: a zone has just gone out of service. This is the one an alert
+        // is built on, and it must not need a level turned up to be seen.
+        tracing::warn!(
             "secondary {}: EXPIRE ({}s) passed with no contact — no longer serving this zone",
-            spec.zone, timers.expire
+            spec.zone,
+            timers.expire
         );
     }
 }
@@ -2793,12 +3067,7 @@ async fn withdraw_unvouched_zones(specs: &[MasterSpec], served: &Served, zone_di
         };
 
         let mut zones = zone_map.write().await;
-        let held = zones
-            .keys()
-            .find(|k| k.eq_ignore_ascii_case(&spec.zone))
-            .cloned();
-        if let Some(key) = held {
-            zones.remove(&key);
+        if zones.remove(&spec.zone) {
             // The increments go with it, for the same reason as in `expire_zone`:
             // offering a chain for a zone we have withdrawn would be answering
             // for something we just stopped serving.
@@ -2807,9 +3076,10 @@ async fn withdraw_unvouched_zones(specs: &[MasterSpec], served: &Served, zone_di
             // whatever it last was would read as a perfectly healthy replica;
             // an absent series is a question a dashboard can ask about.
             metrics.forget_zone(&spec.zone);
-            eprintln!(
+            tracing::warn!(
                 "secondary {}: {why} — not serving it until {} answers",
-                spec.zone, spec.master
+                spec.zone,
+                spec.master
             );
         }
     }
@@ -2847,6 +3117,15 @@ async fn main() -> Result<()> {
 
     let mut cli = Cli::parse();
 
+    // Before anything that might have something to say. `--quiet` is the same
+    // as `--log-level error`; clap refuses the two together, so this is a
+    // rename and not a precedence rule (`CLAUDE.md` §15).
+    rdns::logging::init(if cli.quiet {
+        rdns::logging::LogLevel::Error
+    } else {
+        cli.log_level
+    });
+
     // A config file supplies the same settings the flags do, plus the two things
     // a flag cannot express — a secret in its own file, and per-zone settings.
     // It *replaces* the flags rather than layering over them; see `config` for
@@ -2855,7 +3134,7 @@ async fn main() -> Result<()> {
         Some(path) => {
             let config = config::Config::load(&path)?;
             let per_zone = config.apply(&mut cli)?;
-            println!("Configured from {}", path.display());
+            tracing::info!("configured from {}", path.display());
             per_zone
         }
         None => config::PerZone::default(),
@@ -2918,7 +3197,10 @@ async fn main() -> Result<()> {
                 .collect(),
         )
     };
-    let mut zones = load_zones_from_source(&source, replicating, cli.allow_partial_load).await?;
+    // Blocking, and deliberately left on this thread: startup has no listeners
+    // bound yet and nothing to answer, so there is no worker to take out of
+    // service. The reload path is the one that needs `spawn_blocking`.
+    let mut zones = load_zones_from_source(&source, replicating, cli.allow_partial_load)?;
 
     // Signing happens between loading and serving, and so does checking the
     // result: verifying what we just produced is what catches a canonicalization
@@ -2941,6 +3223,10 @@ async fn main() -> Result<()> {
     // that actually break a deploy: a zone with a typo in it, a key file that got
     // chmodded, a zone whose signatures do not verify.
     if cli.check_config {
+        // `println!`, not `tracing`: this is `--check-config`'s answer on
+        // stdout, not a log line. A deploy script reads it, and `--quiet` must
+        // not be able to take away the output of a command whose entire job is
+        // to produce it.
         println!(
             "configuration is valid: {} zone(s), {} TSIG key(s), signing {}",
             zones.len(),
@@ -2954,7 +3240,7 @@ async fn main() -> Result<()> {
     }
 
     note_serials(&metrics, &zones);
-    let zone_map = Arc::new(RwLock::new(zones));
+    let zone_map = Arc::new(RwLock::new(Zones::new(zones)));
     // Empty at startup by design: the deltas are between versions *this process*
     // has held, and a zone read from disk has no previous version here. Every
     // secondary asking for an increment across a restart gets a full transfer
@@ -3147,8 +3433,8 @@ impl ZoneSigning {
             // Not an error — a key directory prepared before any key is in it
             // is a reasonable state — but silence here would look exactly like
             // signing that quietly did nothing.
-            eprintln!(
-                "No .{} files in {}: no zone will be signed",
+            tracing::warn!(
+                "no .{} files in {}: no zone will be signed",
                 rdns::dnssec_key::KEY_FILE_EXTENSION,
                 dir.display()
             );
@@ -3281,8 +3567,8 @@ impl ZoneSigning {
             };
             let policy = self.policy_for(origin, signed_at);
             *zone = sign_zone(zone, keys, &policy).with_context(|| format!("signing {origin}"))?;
-            println!(
-                "Signed {origin} with {} key{}, {} for {} day{}",
+            tracing::info!(
+                "signed {origin} with {} key{}, {} for {} day{}",
                 keys.len(),
                 if keys.len() == 1 { "" } else { "s" },
                 if matches!(policy.chain, DenialChain::Nsec) {
@@ -3339,7 +3625,7 @@ fn verify_zones(zones: &HashMap<String, Zone>, validator: &DnssecValidator) -> R
             }
             checked += 1;
         }
-        println!("Verified {checked} signed RRsets in {origin}");
+        tracing::info!("verified {checked} signed RRsets in {origin}");
     }
     Ok(())
 }
@@ -3384,6 +3670,9 @@ fn generate_keys(zone: &str, dir: &Path, algorithm: &str) -> Result<()> {
     let zsk = SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE)?;
     for key in [&ksk, &zsk] {
         let path = key.write_to_dir(dir)?;
+        // Also stdout on purpose, for the same reason as `--check-config`:
+        // `--generate-keys` exists to print a DS record somebody pastes into a
+        // registrar form, and that is output, not logging.
         println!("Wrote {}", path.display());
     }
 
@@ -3428,7 +3717,12 @@ fn generate_keys(zone: &str, dir: &Path, algorithm: &str) -> Result<()> {
 ///
 /// The emptiness check lives here rather than in `enumerate_zone_files` because
 /// only this function knows which of its callers is a secondary.
-async fn load_zones_from_source(
+///
+/// **Blocking, and says so.** It was an `async fn` with no await point in it,
+/// which reads as if it yields and does not: `read_dir`, then a
+/// `read_to_string` and a full parse per zone. The callers that run while the
+/// listeners are live put it on a blocking thread; see [`Reloading::load`].
+fn load_zones_from_source(
     source: &ZoneSource,
     replicating: bool,
     allow_partial: bool,
@@ -3441,7 +3735,7 @@ async fn load_zones_from_source(
             let zone = parse_zone_file_at(Path::new(path), &zone_origin)?;
             let mut map = HashMap::new();
             map.insert(zone.origin().to_string(), zone);
-            println!("Loaded zone from {}", path);
+            tracing::info!("loaded zone from {}", path);
             Ok(map)
         }
         ZoneSource::Directory(dir) => {
@@ -3480,14 +3774,14 @@ async fn load_zones_from_source(
                         files.len()
                     ));
                 }
-                eprintln!(
+                tracing::warn!(
                     "{} of {} configured zone(s) failed to load and are NOT being served                      (--allow-partial-load):
 {listed}",
                     failures.len(),
                     files.len()
                 );
             }
-            println!("Loaded {} zone(s) named in the config", map.len());
+            tracing::info!("loaded {} zone(s) named in the config", map.len());
             Ok(map)
         }
     }
@@ -3531,7 +3825,7 @@ fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<HashMap<String
             let zone_origin = extract_zone_origin_from_path(&path_str);
             match parse_zone_file_at(&path, &zone_origin) {
                 Ok(zone) => {
-                    println!("Loaded zone from {}", path_str);
+                    tracing::info!("loaded zone from {}", path_str);
                     zones.insert(zone.origin().to_string(), zone);
                 }
                 Err(e) => failures.push(format!("{path_str}: {e}")),
@@ -3561,16 +3855,16 @@ fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<HashMap<String
             ));
         }
         for failure in &failures {
-            eprintln!("Error loading zone file {failure}");
+            tracing::warn!("error loading zone file {failure}");
         }
-        eprintln!(
+        tracing::warn!(
             "--allow-partial-load: serving {} zones, {} failed and will answer REFUSED",
             zones.len(),
             failures.len()
         );
     }
 
-    println!("Loaded {} zones from directory {}", zones.len(), dir);
+    tracing::info!("loaded {} zones from directory {}", zones.len(), dir);
     Ok(zones)
 }
 
@@ -3605,6 +3899,80 @@ mod tests {
         edns.do_bit = dnssec_ok;
         msg.set_edns(edns).expect("set edns");
         msg
+    }
+
+    /// A suppressed log line must not build its message.
+    ///
+    /// This is the half of the malformed-packet finding that a level alone does
+    /// not fix. The old call site was
+    /// `log_error(ip, &format!("invalid query: {}", ...))` — the `format!` runs,
+    /// and the `String` is allocated, before `log_error` is even entered, so
+    /// turning the logging off would still have paid for every message at 50k
+    /// pps. `tracing`'s macros do not evaluate their arguments unless a
+    /// subscriber is interested, and `bad_request!` is a thin wrapper over one.
+    ///
+    /// The counter is asserted in the same test on purpose: an error that stops
+    /// being *counted* when the level is turned down would make `total_errors`
+    /// mean "errors we happened to log", and every graph built on it wrong.
+    #[test]
+    fn a_suppressed_bad_request_costs_nothing_to_format_and_is_still_counted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Counts how many times something asked it to render.
+        struct CountsFormats(Arc<AtomicUsize>);
+        impl std::fmt::Display for CountsFormats {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                f.write_str("the reason a packet was rejected")
+            }
+        }
+
+        let logger = QueryLogger::new();
+        let ip: IpAddr = "198.51.100.7".parse().expect("a documentation address");
+        let formats = Arc::new(AtomicUsize::new(0));
+
+        // At WARN, the DEBUG line is not emitted — and not built.
+        let quiet = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(quiet, || {
+            bad_request!(
+                logger,
+                ip,
+                "invalid query: {}",
+                CountsFormats(formats.clone())
+            );
+        });
+        assert_eq!(
+            formats.load(Ordering::SeqCst),
+            0,
+            "the message was built for a line nobody wanted"
+        );
+        assert_eq!(
+            logger.get_stats().total_errors,
+            1,
+            "but the error still counted: the metric is not a function of the log level"
+        );
+
+        // At DEBUG it is emitted, which is what makes the assertion above mean
+        // something rather than testing a macro that does nothing.
+        let verbose = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(verbose, || {
+            bad_request!(
+                logger,
+                ip,
+                "invalid query: {}",
+                CountsFormats(formats.clone())
+            );
+        });
+        assert_eq!(
+            formats.load(Ordering::SeqCst),
+            1,
+            "the message was not built for a line that was asked for"
+        );
+        assert_eq!(logger.get_stats().total_errors, 2);
     }
 
     #[test]
@@ -3770,10 +4138,7 @@ mod tests {
 
     /// A [`Served`] over the given map and log, with throwaway gauges — for
     /// tests about installing and withdrawing zones rather than about metrics.
-    fn served(
-        zone_map: &Arc<RwLock<HashMap<String, Zone>>>,
-        deltas: &Arc<RwLock<DeltaLog>>,
-    ) -> Served {
+    fn served(zone_map: &Arc<RwLock<Zones>>, deltas: &Arc<RwLock<DeltaLog>>) -> Served {
         Served {
             zone_map: zone_map.clone(),
             deltas: deltas.clone(),
@@ -3829,7 +4194,7 @@ mod tests {
             let mut zones = HashMap::new();
             zones.insert(zone.origin().to_string(), zone);
             Arc::new(Server {
-                zone_map: Arc::new(RwLock::new(zones)),
+                zone_map: Arc::new(RwLock::new(Zones::new(zones))),
                 rate_limiter: Arc::new(RateLimiter::with_defaults()),
                 validator: Arc::new(RequestValidator::with_defaults()),
                 logger: Arc::new(QueryLogger::new()),
@@ -4146,7 +4511,7 @@ mod tests {
         zones.insert(zone.origin().to_string(), zone);
 
         let server = Arc::new(Server {
-            zone_map: Arc::new(RwLock::new(zones)),
+            zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             rate_limiter: Arc::new(RateLimiter::with_defaults()),
             validator: Arc::new(RequestValidator::with_defaults()),
             logger: Arc::new(QueryLogger::new()),
@@ -4196,7 +4561,7 @@ mod tests {
     fn replication(dir: &ScratchDir, notify_targets: Vec<SocketAddr>) -> Replication {
         Replication {
             served: Served {
-                zone_map: Arc::new(RwLock::new(HashMap::new())),
+                zone_map: Arc::new(RwLock::new(Zones::default())),
                 deltas: Arc::new(RwLock::new(DeltaLog::new())),
                 metrics: Arc::new(DnsMetrics::new()),
             },
@@ -4257,6 +4622,19 @@ mod tests {
             .expect("state recorded");
         assert_eq!(entry.serial, 7);
         assert!(entry.refreshed_at > 0);
+
+        // ...*on disk*, and not only in the copy held in memory. The assertion
+        // above passes whether or not the sidecar was ever written, which is
+        // exactly what a restart depends on — and the half a refactor of the
+        // write path can break in silence. `record_state` updates under the
+        // mutex and writes after dropping it, so "the entry is there" and "the
+        // file has it" became two separate claims.
+        let on_disk = StateFile::load(&state_file_path(&dir.0))
+            .get("example.com.", master)
+            .cloned()
+            .expect("the sidecar on disk has the entry, not just the copy in memory");
+        assert_eq!(on_disk.serial, 7);
+        assert_eq!(on_disk.refreshed_at, entry.refreshed_at);
     }
 
     /// The serial comparison is the point of the SOA probe: an unchanged zone
@@ -4365,7 +4743,7 @@ mod tests {
         let timers = RefreshTimers::from_zone(&zone).expect("timers");
         let mut zones = HashMap::new();
         zones.insert(zone.origin().to_string(), zone);
-        let zone_map = Arc::new(RwLock::new(zones));
+        let zone_map = Arc::new(RwLock::new(Zones::new(zones)));
 
         let mut state_file = StateFile::load(&state_file_path(&dir.0));
         // Contact was made, a very long time ago.
@@ -4416,7 +4794,7 @@ mod tests {
         let timers = RefreshTimers::from_zone(&zone).expect("timers");
         let mut zones = HashMap::new();
         zones.insert(zone.origin().to_string(), zone);
-        let zone_map = Arc::new(RwLock::new(zones));
+        let zone_map = Arc::new(RwLock::new(Zones::new(zones)));
 
         let mut state_file = StateFile::load(&state_file_path(&dir.0));
         state_file
@@ -4664,7 +5042,7 @@ mod tests {
     /// longer serve.
     #[tokio::test]
     async fn test_a_reload_records_its_changes_and_forgets_removed_zones() {
-        let zone_map = Arc::new(RwLock::new(HashMap::new()));
+        let zone_map = Arc::new(RwLock::new(Zones::default()));
         let deltas = Arc::new(RwLock::new(DeltaLog::new()));
         let parse = |text: &str, origin: &str| {
             rdns::zone::parse_zone_file(text, origin).expect("zone should parse")
@@ -4699,6 +5077,100 @@ mod tests {
         assert_eq!(log.len("example.com."), 1, "the reload is a version step");
         assert_eq!(log.len("other.test."), 0, "a zone we no longer serve");
         assert_eq!(zone_map.read().await.len(), 1);
+    }
+
+    /// A reload must not block every query for the length of its diffs.
+    ///
+    /// `install_all_zones` used to take the zone map's *write* lock and then run
+    /// `ixfr::diff` inside it — a walk of every record of both versions of every
+    /// zone — so a query arriving during a reload waited for the sum of all of
+    /// them. The planning happens under the *read* lock now, where queries run
+    /// alongside it; only the swap is under the write lock.
+    ///
+    /// **This is a ratio, not a stopwatch** (`CLAUDE.md` §10): what the reader
+    /// waits for is compared against how long the whole reload took on the same
+    /// machine at the same moment, so the assertion does not care how fast the
+    /// machine is or what else is running on it. Against the old code the reader
+    /// waited for essentially all of the reload that was left; against this one
+    /// it is admitted straight away.
+    ///
+    /// **Multi-threaded on purpose.** The diff is synchronous CPU work with no
+    /// `.await` in it, so on the single-threaded runtime the reload would run to
+    /// completion before the reader was ever polled, and the test would pass
+    /// against both versions — a test agreeing with the code rather than
+    /// checking it (§1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_does_not_hold_the_write_lock_across_its_diffs() {
+        // Every record differs between the two versions, so nothing cancels out
+        // and the diff does the most work it can — which is the work that used
+        // to happen with every query waiting on it.
+        const RECORDS: u32 = 6000;
+        let version = |serial: u32, tail: u8| {
+            let mut text = format!(
+                "$TTL 3600\n\
+                 @    IN SOA ns1.example.com. admin.example.com. {serial} 3600 1800 604800 86400\n\
+                 @    IN NS  ns1.example.com.\n"
+            );
+            for i in 0..RECORDS {
+                text.push_str(&format!("h{i} IN A 10.{}.{}.{tail}\n", i / 256, i % 256));
+            }
+            rdns::zone::parse_zone_file(&text, "example.com.").expect("zone should parse")
+        };
+
+        let zone_map = Arc::new(RwLock::new(Zones::default()));
+        let deltas = Arc::new(RwLock::new(DeltaLog::new()));
+        let v1 = version(1, 1);
+        let mut initial = HashMap::new();
+        initial.insert(v1.origin().to_string(), v1);
+        install_all_zones(&served(&zone_map, &deltas), initial).await;
+
+        let v2 = version(2, 2);
+        let mut reloaded = HashMap::new();
+        reloaded.insert(v2.origin().to_string(), v2);
+        let reloading = served(&zone_map, &deltas);
+        let reload = tokio::spawn(async move {
+            install_all_zones(&reloading, reloaded).await;
+        });
+
+        // Sample continuously for as long as the reload runs, rather than
+        // asking once after a fixed delay: a single probe times out against how
+        // long the diff happens to take on this machine, and a probe that
+        // arrives after the reload has finished measures nothing and passes
+        // against either version. Every sample is one query's worth of "could I
+        // have been answered right now?".
+        let mut attempts = 0u32;
+        let mut refused = 0u32;
+        while !reload.is_finished() {
+            attempts += 1;
+            if zone_map.try_read().is_err() {
+                refused += 1;
+            }
+            tokio::task::yield_now().await;
+        }
+        reload.await.expect("the reload finished");
+
+        // Measured here: ~0.3% of samples refused with the split in place
+        // (90-484 of ~85,000 over five runs), against **99.5%** with the diff
+        // back under the write lock. The threshold sits an order of magnitude
+        // clear of both, so it is a tripwire and not a performance target.
+        //
+        // A vacuous run — one that never sampled — must fail loudly rather than
+        // pass by finding nothing to complain about.
+        assert!(
+            attempts > 100,
+            "only {attempts} samples: the reload finished before this measured \
+             anything, so it proves nothing either way"
+        );
+        assert!(
+            refused * 10 < attempts,
+            "{refused} of {attempts} queries were locked out — the write lock is \
+             being held across the diff again"
+        );
+        assert_eq!(
+            deltas.read().await.len("example.com."),
+            1,
+            "and the version step is still recorded"
+        );
     }
 
     /// An IXFR is gated by the same ACL as an AXFR, and it has to be: it may
@@ -4784,7 +5256,6 @@ mod tests {
             let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
 
             let err = load_zones_from_source(&source, false, false)
-                .await
                 .expect_err("a broken zone file must not pass for a configuration choice")
                 .to_string();
             assert!(
@@ -4809,7 +5280,6 @@ mod tests {
             let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
 
             let zones = load_zones_from_source(&source, false, true)
-                .await
                 .expect("the flag is an explicit choice to serve a partial set");
             assert_eq!(zones.len(), 1);
             assert!(zones.contains_key("example.com."));
@@ -4833,13 +5303,12 @@ mod tests {
             let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
 
             let zones = load_zones_from_source(&source, true, false)
-                .await
                 .expect("a secondary starts before its first transfer");
             assert!(zones.is_empty());
 
             // A primary with an empty --zone-dir is a typo in the path, and
             // serving nothing is not what was asked for.
-            assert!(load_zones_from_source(&source, false, false).await.is_err());
+            assert!(load_zones_from_source(&source, false, false).is_err());
         }
 
         /// The zone a secondary replicates, with an EXPIRE of one hour so the
@@ -4852,7 +5321,7 @@ mod tests {
         struct Replica {
             dir: ScratchDir,
             specs: Vec<MasterSpec>,
-            zone_map: Arc<RwLock<HashMap<String, Zone>>>,
+            zone_map: Arc<RwLock<Zones>>,
             deltas: Arc<RwLock<DeltaLog>>,
         }
 
@@ -4869,7 +5338,7 @@ mod tests {
             Replica {
                 dir,
                 specs,
-                zone_map: Arc::new(RwLock::new(zones)),
+                zone_map: Arc::new(RwLock::new(Zones::new(zones))),
                 deltas: Arc::new(RwLock::new(DeltaLog::new())),
             }
         }
@@ -4991,12 +5460,91 @@ mod tests {
             let missing = ZoneSource::Directory("no-such-directory-anywhere".to_string());
             for allow_partial in [false, true] {
                 assert!(
-                    load_zones_from_source(&missing, true, allow_partial)
-                        .await
-                        .is_err(),
+                    load_zones_from_source(&missing, true, allow_partial).is_err(),
                     "allow_partial={allow_partial}: an I/O error is not a parse failure"
                 );
             }
+        }
+
+        /// A reload must not take the runtime worker with it.
+        ///
+        /// `Reloading::load` was an `async fn` containing no await point at all:
+        /// `read_dir`, a `read_to_string` and a full parse per zone, then an
+        /// ECDSA signing run, then verification — all of it inline on whichever
+        /// worker polled it, while both listeners were live. The signature was
+        /// the trap rather than the cost, because it read as though it yielded.
+        ///
+        /// **One worker thread on purpose.** With a single worker the question
+        /// has a yes-or-no answer instead of a ratio: if the load blocks the
+        /// runtime, nothing else on it is polled even once while the load runs,
+        /// and the ticker below stays where it was.
+        ///
+        /// **And the load has to be inside a spawned task.** The first version
+        /// of this test called `load` from the test body and passed against the
+        /// old code, proving nothing: `#[tokio::test(flavor = "multi_thread")]`
+        /// runs the body on the calling thread via `block_on`, so a blocking
+        /// call there never occupies the worker it was supposed to be starving.
+        /// The body is the *observer* here, which is why it can measure at all.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+        async fn a_reload_does_not_block_the_runtime_it_was_called_from() {
+            // Enough parsing to take real time — the point is that whatever it
+            // costs, it is not charged to the runtime.
+            let mut records = String::new();
+            for i in 0..4000 {
+                records.push_str(&format!("h{i} IN A 10.{}.{}.1\n", i / 256, i % 256));
+            }
+            let dir = ScratchDir::new("reload-blocking");
+            for zone in ["a", "b", "c", "d"] {
+                let text = format!(
+                    "@ IN SOA ns1.{zone}.test. admin.{zone}.test. 1 3600 600 604800 300\n\
+                     @ IN NS ns1.{zone}.test.\n{records}"
+                );
+                std::fs::write(dir.0.join(format!("{zone}.test.zone")), text).expect("write");
+            }
+
+            let reloading = Reloading {
+                replicating: false,
+                allow_partial: false,
+                secondaries: Vec::new(),
+                zone_dir: Some(dir.0.clone()),
+                signing: None,
+                validator: Arc::new(DnssecValidator::new(false)),
+            };
+            let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
+
+            // Anything at all that wants the runtime while the reload runs — one
+            // query's worth of "was I polled?".
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let ticks = Arc::new(AtomicU64::new(0));
+            let counting = ticks.clone();
+            let ticker = tokio::spawn(async move {
+                loop {
+                    counting.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            // The loader announces itself and then does the work, so the count
+            // is taken across the load and not across the scheduling that
+            // preceded it.
+            let (started, has_started) = tokio::sync::oneshot::channel();
+            let loader = tokio::spawn(async move {
+                let _ = started.send(());
+                reloading.load(&source).await
+            });
+            has_started.await.expect("the loader started");
+            let before = ticks.load(Ordering::Relaxed);
+
+            let zones = loader.await.expect("the loading task").expect("zones load");
+            let during = ticks.load(Ordering::Relaxed) - before;
+            ticker.abort();
+
+            assert_eq!(zones.len(), 4, "and it actually loaded them");
+            assert!(
+                during > 0,
+                "nothing else on the runtime was polled during the reload — the \
+                 parse and sign are back on the worker"
+            );
         }
     }
 
@@ -5019,7 +5567,7 @@ mod tests {
         let mut zones = HashMap::new();
         zones.insert(zone.origin().to_string(), zone);
         let server = Server {
-            zone_map: Arc::new(RwLock::new(zones)),
+            zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             rate_limiter: Arc::new(RateLimiter::with_defaults()),
             validator: Arc::new(RequestValidator::with_defaults()),
             logger: Arc::new(QueryLogger::new()),

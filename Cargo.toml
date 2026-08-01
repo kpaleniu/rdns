@@ -25,6 +25,18 @@ rdns = { path = "rdns", version = "0.1.0" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.41.1", features = ["full"] }
+# Levels, so a malformed-packet flood is not 50k journald lines a second and so
+# the message is not built at all when nothing wants it. The library only emits;
+# the binaries choose where it goes.
+tracing = "0.1"
+# `default-features = false` drops `ansi` (output goes to a journal, not a
+# terminal) and `tracing-log` (nothing here logs through the `log` facade).
+# `env-filter` is kept for `RUST_LOG`, which is how a level gets changed on a
+# server that is already misbehaving.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "env-filter",
+] }
 
 # DHAT's frame table has no file:line without this, which makes a heap profile a
 # list of addresses. Costs build time and binary size, not run-time speed.

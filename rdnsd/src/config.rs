@@ -423,15 +423,13 @@ impl Config {
 
 /// Read a secret from its own file, refusing one anybody else can read.
 ///
-/// The mode check is the point of the feature. A secret in a file is only better
-/// than a secret in `argv` if the file is actually private, and a key directory
-/// restored from backup as 0644 or `chmod -R`'d by a deploy script is the
-/// ordinary way that stops being true. Failing to start is the right answer:
-/// an operator who believes a key is private and is wrong has no way to find out
-/// otherwise, and the same reasoning is already written down for signing keys in
-/// `TODO.md` #9d.
+/// The mode check is the point of the feature, and it lives in
+/// `rdns::persist::ensure_private` — the same call the DNSSEC key loader makes,
+/// because "is this file private enough to hold a secret" is one question with
+/// one answer and a second copy of it would be a second thing to get wrong
+/// (`CLAUDE.md` §7). The reasoning is there.
 fn read_secret_file(path: &Path) -> Result<String> {
-    check_secret_permissions(path)?;
+    rdns::persist::ensure_private(path, "a TSIG secret")?;
     let secret = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?
         .trim()
@@ -440,37 +438,6 @@ fn read_secret_file(path: &Path) -> Result<String> {
         bail!("{} is empty", path.display());
     }
     Ok(secret)
-}
-
-#[cfg(unix)]
-fn check_secret_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(path)
-        .with_context(|| format!("reading the permissions of {}", path.display()))?
-        .permissions()
-        .mode();
-    if mode & 0o077 != 0 {
-        return Err(anyhow!(
-            "{} is mode {:o}: a TSIG secret readable by its group or by everybody \
-             is not a secret, and a file in a config directory is exactly what a \
-             deploy script chmods by accident",
-            path.display(),
-            mode & 0o777
-        ));
-    }
-    Ok(())
-}
-
-/// Windows has no mode bits worth checking this way — an ACL check would need
-/// the security API and would not mean the same thing. Said out loud rather than
-/// silently skipped, because "the permissions were checked" is exactly the kind
-/// of claim that is only true on one platform.
-#[cfg(not(unix))]
-fn check_secret_permissions(path: &Path) -> Result<()> {
-    if !path.is_file() {
-        bail!("{} is not a file", path.display());
-    }
-    Ok(())
 }
 
 #[cfg(test)]

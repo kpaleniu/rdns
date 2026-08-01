@@ -47,6 +47,98 @@ pub fn write_atomically_str(path: &Path, contents: &str) -> io::Result<()> {
     write_atomically(path, contents.as_bytes())
 }
 
+/// Same, for a file nobody but the owner may read: a private key, a shared
+/// secret.
+///
+/// **The restriction goes on the temporary file, before the rename.** Setting
+/// the mode on the target afterwards leaves a window — however short — in which
+/// a freshly written private key is sitting there at whatever the umask allowed,
+/// usually 0644. Restricting the temporary first means the key is never
+/// reachable by anyone else at any point, because the name it is finally known
+/// by only ever refers to a file that was already 0600.
+///
+/// A failure to restrict is a failure to write. The alternative — carrying on
+/// and reporting success — hands back a path the caller believes is private and
+/// is not, which is the one outcome worth refusing (`CLAUDE.md` §4).
+pub fn write_atomically_private(path: &Path, contents: &str) -> io::Result<()> {
+    let temp = temp_path_for(path)?;
+
+    let result = write_and_sync(&temp, contents.as_bytes())
+        .and_then(|()| restrict_to_owner(&temp))
+        .and_then(|()| fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+        return result;
+    }
+
+    sync_dir(path.parent());
+    Ok(())
+}
+
+/// Refuse a file holding a secret that anyone but its owner can read.
+///
+/// `what` names the secret for the error message — "a TSIG secret", "a DNSSEC
+/// private key" — because the check is the same and only the noun differs.
+///
+/// **This is the check the feature exists for.** A secret in a file is only
+/// better than a secret in `argv` if the file is actually private, and a key
+/// directory restored from backup as 0644, or `chmod -R`'d by a deploy script,
+/// is the ordinary way that stops being true. Refusing to start is the right
+/// answer: an operator who believes a key is private and is wrong has no other
+/// way to find out.
+///
+/// One implementation, called from both the TSIG and the DNSSEC paths, because
+/// two copies of a security check are one copy and one bug waiting (§7).
+pub fn ensure_private(path: &Path, what: &str) -> io::Result<()> {
+    check_mode(path, what)
+}
+
+#[cfg(unix)]
+fn check_mode(path: &Path, what: &str) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path)?.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is mode {:o}: {what} readable by its group or by everybody is \
+                 not a secret, and a file in a config directory is exactly what a \
+                 deploy script chmods by accident",
+                path.display(),
+                mode & 0o777
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Windows has no mode bits worth checking this way — an ACL check would need
+/// the security API and would not mean the same thing. Said out loud rather
+/// than silently skipped, because "the permissions were checked" is exactly the
+/// kind of claim that is only true on one platform.
+#[cfg(not(unix))]
+fn check_mode(path: &Path, _what: &str) -> io::Result<()> {
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a file", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+/// Nothing to do, and nothing to claim. See [`ensure_private`].
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 fn write_and_sync(temp: &Path, contents: &[u8]) -> io::Result<()> {
     let mut file = File::create(temp)?;
     file.write_all(contents)?;
@@ -186,6 +278,79 @@ mod tests {
             vec!["in-the-way".to_string()],
             "and the temporary is cleaned up"
         );
+    }
+
+    /// The mode check, which is the whole of what makes a secret in a file
+    /// better than a secret in `argv`.
+    ///
+    /// Unix only, and that is not a gap being papered over: there are no mode
+    /// bits to check on Windows, which is why [`ensure_private`] says so in a
+    /// comment rather than quietly returning `Ok`.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_secret_readable_by_anyone_else_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ScratchDir::new("private");
+        let path = dir.path("tsig.secret");
+
+        for (mode, private) in [
+            (0o600, true),
+            (0o400, true),
+            (0o640, false), // the group can read it
+            (0o604, false), // everybody can read it
+            (0o660, false),
+            (0o644, false), // what a restore from backup leaves behind
+        ] {
+            // Removed first: a previous iteration may have left it 0400, and
+            // `fs::write` opens for writing before anything else happens.
+            let _ = fs::remove_file(&path);
+            fs::write(&path, "c3VwZXItc2VjcmV0\n").expect("write the secret");
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
+
+            let verdict = ensure_private(&path, "a TSIG secret");
+            assert_eq!(
+                verdict.is_ok(),
+                private,
+                "mode {mode:o} should {} have been accepted",
+                if private { "" } else { "not" }
+            );
+            if let Err(e) = verdict {
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+                // The mode is in the message: an operator has to be able to see
+                // what it is without going to look.
+                assert!(
+                    e.to_string().contains(&format!("{mode:o}")),
+                    "the error should name the mode it refused: {e}"
+                );
+            }
+        }
+    }
+
+    /// A private write is never briefly readable under its final name.
+    ///
+    /// The restriction goes on the temporary file, before the rename — setting
+    /// it afterwards would leave a window at whatever the umask allowed, which
+    /// for a private key is the whole thing.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_private_write_lands_already_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ScratchDir::new("private-write");
+        let path = dir.path("key.rdnskey");
+
+        write_atomically_private(&path, "PrivateKey: not-really\n").expect("write");
+
+        let mode = fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "got mode {:o}", mode & 0o777);
+        // And the file it wrote is the file it says it wrote.
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            "PrivateKey: not-really\n"
+        );
+        assert_eq!(dir.entries(), vec!["key.rdnskey".to_string()]);
+        // The check and the write agree, which is the point of them being in
+        // one module.
+        ensure_private(&path, "a DNSSEC private key").expect("what we just wrote passes");
     }
 
     #[test]

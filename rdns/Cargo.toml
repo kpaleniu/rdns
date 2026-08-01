@@ -19,6 +19,11 @@ sha1 = "0.10"
 sha2 = "0.10"
 
 tokio.workspace = true
+tracing.workspace = true
+# The subscriber is here, but nothing in this crate installs one: `logging::init`
+# exists so that `rdnsd` and `rdnsr` configure logging identically rather than
+# each growing their own copy to drift (`CLAUDE.md` §7). A binary calls it, once.
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # Allocation counting for `tests/allocations.rs`. A dev-dependency, so a normal

@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use rdns::dnssec_chain::{TrustAnchors, ValidationState};
+use rdns::logging::LogLevel;
 use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
@@ -141,11 +142,31 @@ struct Cli {
     /// at a new path is enough to start.
     #[arg(long)]
     auto_trust_anchor: Option<std::path::PathBuf>,
+    /// How much to say: error, warn, info, debug or trace.
+    ///
+    /// `info` by default, and nothing per-query is above `debug` — the same
+    /// flag, levels and default as `rdnsd`. `RUST_LOG` overrides it when set, so
+    /// a resolver that is already misbehaving can be turned up without a restart
+    /// into new flags.
+    #[arg(long, value_name = "LEVEL", default_value = "info")]
+    log_level: LogLevel,
+    /// Errors only. The same as `--log-level error`, and refused with it.
+    #[arg(long, conflicts_with = "log_level")]
+    quiet: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Before anything that might have something to say — and through the same
+    // initialiser `rdnsd` uses, so the two daemons cannot end up formatting or
+    // filtering differently (`CLAUDE.md` §7).
+    rdns::logging::init(if cli.quiet {
+        LogLevel::Error
+    } else {
+        cli.log_level
+    });
 
     // Created before anything is spawned: the RFC 5011 anchor manager starts
     // before the listeners do, and it owns the only durable state this process
@@ -176,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
             config.root_hints = hints;
             custom_hints = true;
         } else {
-            eprintln!("warning: --root-hints is ignored when forwarding (--upstream)");
+            tracing::warn!("--root-hints is ignored when forwarding (--upstream)");
         }
     }
 
@@ -212,9 +233,9 @@ async fn main() -> anyhow::Result<()> {
                 // wondering for a month whether any of this is on.
                 if !path.exists() {
                     anchors.save(path)?;
-                    println!(
-                        "trust anchors: wrote {} from the anchors in force",
-                        path.display()
+                    tracing::info!(
+                        file = %path.display(),
+                        "trust anchors: wrote the anchors in force"
                     );
                 }
                 dnssec_source = format!(", DNSSEC validating from {} (RFC 5011)", path.display());
@@ -229,8 +250,8 @@ async fn main() -> anyhow::Result<()> {
         shared_anchors = Some(SharedAnchors::new(in_force));
         config.dnssec = shared_anchors.clone();
     } else if cli.trust_anchor.is_some() || cli.auto_trust_anchor.is_some() {
-        eprintln!(
-            "warning: --trust-anchor and --auto-trust-anchor do nothing without --dnssec-validate"
+        tracing::warn!(
+            "--trust-anchor and --auto-trust-anchor do nothing without --dnssec-validate"
         );
     }
 
@@ -286,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
     // refused and the query simply fails.
     let socket = Arc::new(UdpSocket::bind(&addr).await?);
     let listener = TcpListener::bind(&addr).await?;
-    println!(
+    tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}",
         addr,
         source,
@@ -327,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
             failure = joined.and_then(listener_failure);
         }
         signal = stop_signal() => {
-            println!("{signal} received, shutting down");
+            tracing::info!("{signal} received, shutting down");
         }
     }
 
@@ -410,7 +431,7 @@ fn spawn_anchor_manager(
                             probe.signature_remaining,
                         ));
                     }
-                    Err(e) => eprintln!("trust anchors for {zone}: {e}"),
+                    Err(e) => tracing::warn!(%zone, "trust anchors: {e}"),
                 }
             }
 
@@ -421,7 +442,7 @@ fn spawn_anchor_manager(
                 // to prevent.
                 match managed.save(&path) {
                     Ok(()) => anchors.replace(managed.trust_anchors()),
-                    Err(e) => eprintln!(
+                    Err(e) => tracing::error!(
                         "trust anchors: {e} — keeping the previous set rather than \
                          validating against keys we could not write down"
                     ),
@@ -503,30 +524,42 @@ async fn probe_zone(resolver: &Resolver, zone: &str) -> anyhow::Result<AnchorPro
 
 /// Say what happened. A trust anchor moving is the rarest event this resolver
 /// has and the one an operator most wants to find in a log afterwards.
+/// INFO throughout, and INFO deliberately: a trust anchor changing is rare, it
+/// is the thing an operator reconstructs a DNSSEC incident from afterwards, and
+/// there is no volume in it — a key rolls over months. `--quiet` still silences
+/// it, which is the operator saying they do not want it.
 fn report(change: &AnchorChange) {
     match change {
-        AnchorChange::Pending { zone, key_tag } => println!(
-            "trust anchors: {zone} key {key_tag} is new — trusted in {} days if it stays",
+        AnchorChange::Pending { zone, key_tag } => tracing::info!(
+            %zone,
+            key_tag,
+            "trust anchors: new key — trusted in {} days if it stays",
             rfc5011::ADD_HOLD_DOWN / 86_400
         ),
         AnchorChange::Trusted { zone, key_tag } => {
-            println!("trust anchors: {zone} key {key_tag} is now a trust anchor")
+            tracing::info!(%zone, key_tag, "trust anchors: key is now a trust anchor")
         }
-        AnchorChange::Withdrawn { zone, key_tag } => {
-            println!("trust anchors: {zone} key {key_tag} went away before its hold-down elapsed")
-        }
-        AnchorChange::Absent { zone, key_tag } => println!(
-            "trust anchors: {zone} key {key_tag} is no longer published, but is still trusted \
+        AnchorChange::Withdrawn { zone, key_tag } => tracing::info!(
+            %zone,
+            key_tag,
+            "trust anchors: key went away before its hold-down elapsed"
+        ),
+        AnchorChange::Absent { zone, key_tag } => tracing::info!(
+            %zone,
+            key_tag,
+            "trust anchors: key is no longer published, but is still trusted \
              (revocation is how a key is retired)"
         ),
         AnchorChange::Returned { zone, key_tag } => {
-            println!("trust anchors: {zone} key {key_tag} is published again")
+            tracing::info!(%zone, key_tag, "trust anchors: key is published again")
         }
-        AnchorChange::Revoked { zone, key_tag } => println!(
-            "trust anchors: {zone} key {key_tag} REVOKED itself — no longer a trust anchor"
+        AnchorChange::Revoked { zone, key_tag } => tracing::info!(
+            %zone,
+            key_tag,
+            "trust anchors: key REVOKED itself — no longer a trust anchor"
         ),
         AnchorChange::Forgotten { zone, key_tag } => {
-            println!("trust anchors: {zone} key {key_tag} is forgotten")
+            tracing::info!(%zone, key_tag, "trust anchors: key is forgotten")
         }
     }
 }
@@ -779,7 +812,11 @@ async fn handle_query(
         // check for itself.
         resp.ad = false;
         resp.cd = checking_disabled;
-        println!("{}: answered locally — {}", query.qname, local.why);
+        // DEBUG: this is one line per query, with the name asked for on it.
+        // Unconditional query logging is a decision an operator makes, not one a
+        // default makes for them — see `TODO.md` #9d on what the deleted
+        // telemetry module used to do here.
+        tracing::debug!(qname = %query.qname, why = %local.why, "answered locally");
         return finish(
             resp,
             client_uses_edns,
@@ -909,9 +946,13 @@ async fn handle_query(
                     upstream.recursion_ok = true;
 
                     if let ValidationState::Bogus(ref why) = state {
-                        eprintln!(
-                            "resolve {} type {}: DNSSEC validation failed: {why}",
-                            query.qname, query.qtype
+                        // WARN, not DEBUG: an answer that does not validate is
+                        // either an attack or a broken zone, and both are worth
+                        // seeing without turning anything up.
+                        tracing::warn!(
+                            qname = %query.qname,
+                            qtype = query.qtype,
+                            "DNSSEC validation failed: {why}"
                         );
                         // Fail closed. Data we know we cannot authenticate is worse
                         // than no data: the client has no way to tell it apart from
@@ -982,9 +1023,16 @@ async fn handle_query(
                 // outside, and the reasons here are specific — lame delegation,
                 // budget exhausted, CNAME loop — precisely so they can be read.
                 Err(ref e) => {
-                    eprintln!(
-                        "resolve {} type {} failed: {:#}",
-                        query.qname, query.qtype, e
+                    // DEBUG: a lookup that fails is ordinary — a typo, a dead
+                    // nameserver, a client asking for something that is not
+                    // there — and one line per failed query is the flood the
+                    // level exists to stop. The SERVFAIL counter is what an
+                    // operator alerts on.
+                    tracing::debug!(
+                        qname = %query.qname,
+                        qtype = query.qtype,
+                        "resolve failed: {:#}",
+                        e
                     );
                     (
                         build_response(

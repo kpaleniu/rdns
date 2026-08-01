@@ -140,11 +140,11 @@ impl Shutdown {
     /// restart should not have to know which process wrote it.
     pub async fn drain_reporting(self) {
         if self.drain(DEFAULT_DRAIN).await {
-            println!("drained cleanly");
+            tracing::info!("drained cleanly");
         } else {
-            eprintln!(
-                "shutdown drain hit its {}s budget with work still running; exiting anyway",
-                DEFAULT_DRAIN.as_secs()
+            tracing::warn!(
+                budget_secs = DEFAULT_DRAIN.as_secs(),
+                "shutdown drain hit its budget with work still running; exiting anyway"
             );
         }
     }
@@ -183,7 +183,7 @@ pub async fn stop_signal() -> &'static str {
             // Ctrl-C below still works, and a supervisor's SIGTERM will kill the
             // process the old way rather than draining. Say so once, because the
             // difference is invisible until the day it matters.
-            eprintln!("could not listen for SIGTERM ({e}); shutdown will not be graceful");
+            tracing::error!("could not listen for SIGTERM ({e}); shutdown will not be graceful");
             std::future::pending().await
         }
     };

@@ -480,15 +480,20 @@ impl SigningKey {
     /// Write the key into `dir` under [`SigningKey::file_name`], returning the
     /// path.
     ///
-    /// Readable by its owner alone where the platform has a way to say so. This
-    /// is best-effort by necessity — Windows has no mode bits — so it is a
-    /// second line of defence behind the directory's own permissions, not the
-    /// first.
+    /// Readable by its owner alone where the platform has a way to say so —
+    /// Windows has no mode bits, so there it is the directory's permissions or
+    /// nothing, and this says so rather than implying a guarantee it cannot
+    /// make.
+    ///
+    /// The restriction is applied before the file reaches its final name and a
+    /// failure to apply it fails the write; both belong to
+    /// [`crate::persist::write_atomically_private`], where the reasoning is.
+    /// It used to be a `let _ =` on a `set_permissions` *after* the rename,
+    /// which both ignored the failure and left a window at 0644.
     pub fn write_to_dir(&self, dir: &Path) -> Result<PathBuf> {
         let path = dir.join(self.file_name());
-        crate::persist::write_atomically_str(&path, &self.to_key_file())
+        crate::persist::write_atomically_private(&path, &self.to_key_file())
             .map_err(|e| DnssecError::key(format!("writing {}: {e}", path.display(),)))?;
-        restrict_to_owner(&path);
         Ok(path)
     }
 
@@ -512,6 +517,14 @@ impl SigningKey {
             if path.extension().and_then(|e| e.to_str()) != Some(KEY_FILE_EXTENSION) {
                 continue;
             }
+            // Checked on the way in, not just set on the way out. A key this
+            // server wrote is 0600, but a key directory restored from backup or
+            // walked by a `chmod -R` is the ordinary way a private key stops
+            // being private, and reading one without complaint is how nobody
+            // ever finds out. This is a zone-signing key: whoever has it can
+            // sign anything in the zone.
+            crate::persist::ensure_private(&path, "a DNSSEC private key")
+                .map_err(|e| DnssecError::key(e.to_string()))?;
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| DnssecError::key(format!("reading {}: {e}", path.display(),)))?;
             let key = SigningKey::from_key_file(&text)
@@ -620,15 +633,6 @@ fn strip_leading_zeros(bytes: &[u8]) -> &[u8] {
     let first = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len());
     &bytes[first..]
 }
-
-#[cfg(unix)]
-fn restrict_to_owner(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn restrict_to_owner(_path: &Path) {}
 
 fn base64(bytes: &[u8]) -> String {
     base64::Engine::encode(&base64::prelude::BASE64_STANDARD, bytes)
@@ -862,9 +866,86 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(tags, expected);
 
-        std::fs::write(dir.join("broken.rdnskey"), "Owner: example.com.\n").unwrap();
+        // 0600 on purpose: `fs::write` leaves 0644 under the usual umask, and
+        // `load_dir` refuses a world-readable key *before* it parses it — so
+        // without this the assertion below would pass on the permission error
+        // and this test would quietly stop being about a broken key at all.
+        let broken = dir.join("broken.rdnskey");
+        std::fs::write(&broken, "Owner: example.com.\n").unwrap();
+        restrict(&broken);
         let err = SigningKey::load_dir(&dir).unwrap_err();
         assert!(format!("{err:#}").contains("broken.rdnskey"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("Flags"),
+            "the parse failure, not the permission check: {err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn restrict(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn restrict(_path: &Path) {}
+
+    /// A private key anybody can read is refused, not loaded with a shrug.
+    ///
+    /// `--generate-keys` writes 0600, so the way this happens is never the
+    /// server's own doing: a key directory restored from backup as 0644, or a
+    /// `chmod -R` in a deploy script. Whoever can read this file can sign
+    /// anything in the zone, so reading it without complaint is how an operator
+    /// never finds out.
+    ///
+    /// **Unix only, and the check genuinely does not exist on Windows** — there
+    /// are no mode bits to read. Stated here rather than left for someone to
+    /// infer from a green suite on the wrong platform.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_private_key_is_refused_by_the_loader() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rdns-keyperms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let key = SigningKey::generate(
+            SigningAlgorithm::EcdsaP256Sha256,
+            "example.com.",
+            DNSKEY_FLAG_ZONE,
+        )
+        .unwrap();
+        let path = key.write_to_dir(&dir).unwrap();
+
+        // What the server writes is already private, and loads.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(SigningKey::load_dir(&dir).unwrap().len(), 1);
+
+        // What a deploy script leaves behind does not.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = SigningKey::load_dir(&dir).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("644"), "name the mode: {text}");
+        assert!(
+            text.contains(&path.display().to_string()),
+            "name the file: {text}"
+        );
+
+        // And group-readable is no better — the group is other people.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(SigningKey::load_dir(&dir).is_err());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            SigningKey::load_dir(&dir).unwrap().len(),
+            1,
+            "and putting it back is all it takes to recover"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -11,16 +11,16 @@ clap.workspace = true
 rdns.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-signal-hook = { version = "0.3", optional = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 # Heap profiling, off unless asked for: `cargo run --release --features dhat-heap`.
 dhat = { version = "0.3", optional = true }
-signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"], optional = true }
 toml = "1.1.4"
 serde = { version = "1.0.229", features = ["derive"] }
-
-[target.'cfg(unix)'.dependencies]
-signal-hook = "0.3"
-signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+# SIGHUP uses `tokio::signal::unix`, which `tokio`'s "full" already provides —
+# `signal-hook` and `signal-hook-tokio` were here for that and are gone. They
+# also never worked: the call needed a `StreamExt` nothing imported, so `rdnsd`
+# did not compile on Unix.
 
 [features]
 # Swap in DHAT's allocator shim and write `dhat-heap.json` on exit. Never on by

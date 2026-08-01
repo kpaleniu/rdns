@@ -6,15 +6,20 @@ codebase has already made and the rules that follow from them. Read both before
 planning; the first rule in `CLAUDE.md` is why a green suite here has twice not
 meant what it looked like.
 
-"Open work" is what is left; the
-"Architecture" sections describe what exists and why it is shaped that way.
-Completed work is one line each under "Done so far" — the reasoning, RFC
-citations and verification for each piece are in its commit message, which is
-where to look rather than here.
+**Starting cold, read in this order:** "Current state" for what works today —
+including the fact that **CI has never run**, which is why the test numbers there
+are given per platform — "How to run" for the commands, the four environment
+traps under "Verifying" (each has cost an hour) plus the Linux recipe beside them
+for anything `#[cfg(unix)]`, and then **"Where to pick up next"**, which lists
+every open item in one place in the order worth doing it and names the next one. "Open work" holds the full
+finding behind each of those lines; the "Architecture" sections describe what
+exists and why it is shaped that way. Completed work is one line each under "Done
+so far" — the reasoning, RFC citations and verification for each piece are in its
+commit message, which is where to look rather than here.
 
 ---
 
-## Current state (last updated 2026-07-29)
+## Current state (last updated 2026-08-01)
 
 **Workspace** — four members, all on branch `master`:
 
@@ -25,22 +30,51 @@ where to look rather than here.
 | `rdnsd` | authoritative server — serves zone files over UDP and TCP in one process |
 | `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
 
-**CI runs all of this now (2026-07-30).** `.github/workflows/ci.yml`: build and
-test on Linux *and* Windows, clippy `-D warnings`, `cargo fmt --check`, a build on
-1.95 exactly so the MSRV is verified rather than asserted, `cargo deny check`, and
-a build of `--features dhat-heap`. The four commands below were a convention until
-now, and a convention is what a green dashboard quietly stops honouring.
+**CI is written and has never run (corrected 2026-08-01).**
+`.github/workflows/ci.yml` describes build and test on Linux *and* Windows,
+clippy `-D warnings`, `cargo fmt --check`, a build on 1.95 exactly, `cargo deny
+check`, and a build of `--features dhat-heap`. All of that is accurate about the
+file. What the 2026-07-30 entry here claimed — *"CI runs all of this now"* — was
+not: **`git remote -v` is empty**, so there is nowhere for the workflow to run
+and no commit has ever been checked by it.
 
-**Green as of the last commit:** `cargo build --workspace` clean,
-`cargo test --workspace` = **603 lib + 6 allocation + 85 `rdnsd` + 2 `rdnsr`**
-tests passing
-(`rdnsd`'s own 71 cover argument validation, zone sources and the load policy,
+The cost was not hypothetical. `rdnsd` **did not compile on Unix at all** from
+the day SIGHUP reloading was written until 2026-08-01, because the call needed a
+`StreamExt` nothing imported and the module is `#[cfg(unix)]` in a workspace
+developed on Windows. See the closed item under 9d. The reasoning that produced
+the wrong claim is left above rather than deleted, because it is the most useful
+thing on this page: the file asserting a property is not the thing that upholds
+it (`CLAUDE.md` §4).
+
+**Until there is a remote, the Linux half is checked by hand** — see "Verifying"
+below, which now has the Linux recipe.
+
+**Green as of the last commit**, on both platforms and checked on both:
+
+| | Windows | Linux |
+|---|---|---|
+| `rdns` lib | 603 | **606** |
+| allocations | 6 | 6 |
+| `rdnsd` | 88 | 88 |
+| `rdnsr` | 2 | 2 |
+| **total** | **699** | **702** |
+
+The three extra on Linux are `#[cfg(unix)]`: two on the secret-file mode check
+and one on the private-key loader. They are the *only* tests that exercise that
+check at all — there are no mode bits on Windows — so a green Windows run says
+nothing about it.
+
+`cargo clippy --workspace --all-targets` is clean with no exceptions and
+`cargo fmt --all --check` is clean, **on Windows**; the Linux image used for the
+Linux runs has no clippy package, so that half is unverified there.
+
+(`rdnsd`'s own tests cover argument validation, the config file, zone sources and the load policy,
 the secondary role and EXPIRE across reloads, both directions of IXFR and onward
 announcement, answering a DO-bit query from a zone it signed itself, all four
 cases of RFC 1034 §4.3.2, the class and ANY handling from #9f, and a stop
-signal arriving mid-AXFR; `rdnsr` had
-**no test module at all** until #9c gave it one), `cargo clippy --workspace
---all-targets` **clean, no exceptions**, `cargo fmt --all --check` clean. The lib
+signal arriving mid-AXFR, a reload that must not block queries or the runtime,
+and a suppressed log line that must not build its message; `rdnsr` had
+**no test module at all** until #9c gave it one.) The lib
 count fell from 578 to 567 when dead `serialization.rs` was deleted with its 11
 tests, and is at 603 now: #9e's, #9f's, graceful shutdown's and the metrics
 endpoint's tests, minus the seven that went with `telemetry.rs`.
@@ -75,7 +109,7 @@ skipped, EXPIRE surviving a SIGHUP, neither daemon answering a *response* or a
 non-QUERY opcode, and a CNAME-terminated negative answer having its denial
 checked rather than being handed out with AD set.
 
-**#9f is closed too, and #9e is down to four (2026-07-28).** The conformance gaps
+**#9f is closed too (2026-07-28).** The conformance gaps
 went as a set: the class is checked at last (and a non-IN record no longer loads
 at all, which is what makes the class-blind index correct rather than untested),
 QTYPE=ANY answers with every RRset at the name and the signatures over them, an
@@ -88,14 +122,15 @@ against. On the performance side the `log_query` quadratic is gone (3.09M ops/se
 where it managed 47k, and `bench_logger_throughput`'s floor is back up at 100k),
 responses no longer carry a 64 KB buffer into `send_to`, cache eviction is linear
 rather than O(n²), and name compression stores one copy of a name instead of one
-per suffix. What is left under #9 is **mostly operability (9d)**: a config file,
-a control channel, CI, log levels. Three items remain under 9e — the DHAT pass that was
-leading them is done, and its numbers are what the rest get judged against now,
+per suffix. What is left under #9 is **9 items: 3 of operability (9d) and 6 of
+performance (9e)**, listed in the order worth doing under "Where to pick up next"
+below. The DHAT pass that was
+leading 9e is done, and its numbers are what the rest get judged against now,
 including one finding it turned up that nobody had guessed: the `tokio::spawn`
 per UDP datagram costs **1,536 bytes**, which is 46% of everything a query
 allocates.
 
-**Three 9d items are closed with them.** The query rate limiter was hardcoded at
+**Six 9d items are closed with them.** The query rate limiter was hardcoded at
 ~10 q/s per source and dropped over it in silence — it has flags now, a default a
 hundred times higher, and an exemption list, measured live at 60 answers to a
 60-query burst where the finding recorded 20. And **both daemons stop
@@ -115,6 +150,21 @@ benchmark, wired into `rdnsd` and served as Prometheus text on
 `--metrics-listen` — with a latency histogram, a `/healthz`, and the two per-zone
 gauges an operator asks for by name: which serial is being served, and when this
 replica was last in contact with a master.
+
+**There is a config file now (2026-07-30), and it is the only way to set anything
+per zone.** `--config <file>` reads TOML with `deny_unknown_fields` on every
+table, so a mistyped `require-signd = true` fails at startup with a line number
+instead of serving unsigned zones quietly. The file and the individual flags are
+**mutually exclusive on purpose** — `--config` with `--port` is a clap error, not
+a precedence rule, because every precedence rule is one somebody has to remember
+at 3am. A TSIG key's secret goes in a file of its own (`secret-file`), which is
+mode-checked on Unix and refused if it is group- or world-readable; that takes the
+base64 out of `argv`, where `ps aux` and the systemd unit could both read it.
+`[zones."name"]` carries per-zone signing overrides as `Option`s, so absent means
+*inherit* rather than "the default", and the re-signing timer follows the
+**shortest** validity of any zone. `--check-config` is a real dry run: it returns
+after every zone has loaded, been signed and been verified, and before any socket
+is bound. Cost: nine crates, lock 104 → 113.
 
 **One fix in #9c was a fix to a previous fix.** Closing "an unreadable zone
 directory silently unloads every zone" (2026-07-27) also broke a secondary's
@@ -299,6 +349,14 @@ kill -TERM $(pgrep rdnsd)
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --query-rate 5000 --query-burst 500 --query-rate-exempt 10.0.0.0/8
 
+# How much either daemon says. info by default; nothing per-packet is above
+# debug, so a malformed-packet flood costs no log lines at all (measured: 50
+# malformed datagrams, 0 lines at the default level, 50 at --log-level debug).
+# --quiet is --log-level error. RUST_LOG wins over the flag.
+cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone --log-level debug
+RUST_LOG=rdnsd=debug,rdns::xfr=trace cargo run -p rdnsd -- --port 15353 \
+  --zone-file example.com.zone
+
 # Signing re-signs on a timer now: a third of --signature-validity, and expiry is
 # spread over a fifth of the window so the zone degrades on a slope rather than
 # expiring all at once. The SERVED SOA serial is not the file's — it is
@@ -374,6 +432,37 @@ Windows — it reports "No response from server" even when the server replied.
 Probe with a raw `System.Net.Sockets.UdpClient` in PowerShell and read the
 bytes; that is how the "verified live" claims here were checked.
 
+### Running the Linux half, by hand until there is a remote
+
+There is no CI (see "Current state"), and this is a Windows machine, so anything
+`#[cfg(unix)]` is invisible here — that is how `rdnsd` went months without
+compiling on Unix. **The Linux image has a full toolchain** (cargo,
+rustc, gcc) and is where the Linux numbers in this file come from:
+
+```sh
+# Copy the tree in. Excluding target/ matters: it is large, and a Windows
+# target/ is useless to a Linux build anyway.
+rm -rf "$SCRATCH" && mkdir -p "$SCRATCH" \
+  && cd "$REPO" && tar cf - --exclude=target --exclude=.git . \
+  | (cd ~/rdns && tar xf -)"
+cargo build --workspace --all-targets && cargo test --workspace
+```
+
+Three things to know before trusting a run there:
+
+- **Build on a native filesystem, not the mount.** It reports everything as 0777 and
+  `chmod` is a no-op without the `metadata` mount option, so every
+  permission-related test would either pass or fail for reasons that have
+  nothing to do with the code. `~` is ext4 and behaves.
+- **That image has no `clippy`.** `cargo clippy` fails with "no such command", so
+  the lint half of the four commands is Windows-only for now.
+- **The copy is a copy.** Re-sync before each run or you are testing whatever was
+  there last time; the tar line above is cheap enough to repeat.
+
+One older image has cargo but **no C compiler**,
+so every build there dies at `linker \`cc\` not found` — ring needs one. Use
+the Linux image.
+
 **`rdnsc` works against a non-53 port now** (#9f), which it could not before —
 that is the reason the recipes here reach for something else. It checks the id
 and the echoed question before printing, and falls back to TCP on TC, so it is a
@@ -440,6 +529,23 @@ an NXDOMAIN must carry two denials, not one; and a delegation's NS RRset must ha
 **no** RRSIG at all, with the NSEC at that name listing `NS RRSIG NSEC` and not
 `DS`.
 
+**The checks CI runs, to run before pushing.** All five pass as of the last
+commit; the first four are `CLAUDE.md`'s and the fifth is new with CI:
+
+```sh
+cargo build --workspace --all-targets
+cargo test --workspace                          # 603 + 6 + 85 + 2
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+cargo deny check                                # needs cargo-deny 0.17+
+```
+
+`cargo deny` on an older version dies with "unknown variant `2024`" — eleven
+crates in the graph are edition 2024 and 0.16's manifest parser predates it.
+0.20.2 is what these numbers were taken with. CI also builds on **1.95 exactly**
+(the pinned MSRV) and with `--features dhat-heap`, neither of which the commands
+above cover.
+
 Four environment traps that have each cost an hour:
 
 - **PowerShell 5.1 `-shl` keeps the left operand's `[byte]` type and truncates**,
@@ -470,12 +576,87 @@ under "Closed work" further down.
 
 | # | what | open |
 |---|------|------|
-| **9** | what the five-way code review turned up | **13** — 9a, 9b, 9c and **9f** are closed; what is left is mostly operability, plus the allocation findings the DHAT pass turned up |
+| **9** | what the five-way code review turned up | **9** — 9a, 9b, 9c and **9f** are closed; what is left is 3 of operability (9d) and 6 of performance (9e) |
 | **8** | what signing turned up | **0** — the re-signing timer and its serial are done |
 | **7** | the secondary role | **1**, and conditional |
 | **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
 | **11** | data layout and CPU cache friendliness | **0** — a stretch goal; blocked on a measurement this machine cannot make |
 | **5** | smaller open items | **0** |
+
+### Where to pick up next
+
+Every open item in one place, in the order worth doing it. Each line points at the
+full finding below, which has the file, the line number and the reasoning; **read
+that before starting**, because several have already been half-fixed by something
+else and the finding says which half.
+
+> **Next is item 5** — the unbounded `tokio::spawn` per UDP datagram. Items 1-4
+> and 6 closed on 2026-08-01 and are struck through below rather than deleted,
+> because each says what was actually done and two of them reversed the fix the
+> original finding proposed. The numbers are positions other lines refer to, so
+> they are never reused.
+>
+> **Do item 5 with item 10**, which is the same call site measured from the
+> allocation side: admission control and 1,536 bytes per datagram are one change.
+
+**Correctness and safety first** — these can lose data or serve a wrong answer:
+
+1. ~~**A zone diff runs while the zone-map write lock is held**~~ (9d) — **done
+   2026-08-01.** Planned under the read lock, recorded under the write lock, with
+   a generation counter deciding whether a plan survived the gap; 99.5% of
+   sampled queries were locked out during a reload before, ~0.3% after.
+2. ~~**Blocking I/O and a full zone parse-and-sign run on the tokio runtime**~~
+   (9d) — **done 2026-08-01.** The reload is on `spawn_blocking`,
+   `load_zones_from_source` is honestly sync, and the state write happens after
+   the mutex guard is dropped rather than across the fsync.
+3. ~~**Private key permissions unchecked on read**~~ (9d) — **done 2026-08-01.**
+   One `persist::ensure_private` for both the TSIG and DNSSEC paths, and the
+   write now restricts the temporary file before the rename rather than the
+   target after it. Verified on Linux.
+4. ~~**A malformed-packet flood becomes a disk fill and a global lock convoy**~~
+   (9d) — **done 2026-08-01.** `tracing` with real levels and `--log-level` /
+   `--quiet` on both daemons; nothing per-packet above `debug`. Measured: 50
+   malformed datagrams, 0 log lines at the default level. No in-process rate
+   limiter — journald's per-unit one is in the README's unit instead.
+5. **Unbounded `tokio::spawn` per UDP datagram** (9d) — pairs with 9e's
+   1,536-bytes-per-datagram finding below; they are the same call site seen from
+   two angles, and worth doing together.
+
+**Then the operational shell** — visible gaps a deployment will hit:
+
+6. ~~**No `--user`/`--group`**~~ (9d) — **closed 2026-08-01 as won't-fix.** The
+   service manager sets the identity, and `User=` plus an ambient capability is
+   stronger than a setuid drop rather than equivalent to it. The number is kept
+   rather than reused because these positions are referenced from each other.
+7. **No control channel** (9d) — the runbook answer is still "read the logs".
+8. **No container image / no readiness signal** (9d) — `/healthz` exists now, so
+   what is left is the Dockerfile and the ready-vs-alive distinction.
+
+**Then performance (9e).** The DHAT pass is done and its numbers decide the order:
+
+9. **`zone::absolutize` allocates four `String`s per query** — the largest single
+   item, and the assertion that will judge it is already in place (a labelled
+   segment of `one_query_end_to_end`, currently a *range* that still admits the
+   old number, so tightening it is part of the fix). Best value here.
+10. **`tokio::spawn` costs 1,536 bytes per datagram** — 46% of everything a query
+    allocates, and nobody had guessed it. See item 5.
+11. **Three more per-query allocation sites**, each small.
+12. **EDNS is re-parsed two to four times per query.**
+13. **DNSSEC canonicalization is rebuilt per candidate RRSIG** — measured at 22
+    allocations, so this is a *time* problem, not a count problem; DHAT will not
+    show progress on it.
+14. **`bench.rs` measures debug builds** — convert to criterion. Do this *before*
+    #11, which needs a measurement harness that can see what it changes.
+
+**Not scheduled, and deliberately:** #7 step 6 (persisted deltas) waits on #10
+(dynamic UPDATE), which nothing schedules; #11 (cache locality) is a stretch goal
+and is wanted — it is on the list because it was asked for, not because a
+measurement demanded it — but it is blocked on hardware counters this machine
+cannot read, and item 14 above is its prerequisite either way.
+
+**One decision is the copyright holder's, not a bug:** the manifests say
+`MIT OR Apache-2.0` and the repository ships only an MIT `LICENSE`. Either add
+`LICENSE-APACHE` or narrow the manifests. `cargo deny` passes either way.
 
 ### 9. What a five-way code review turned up (2026-07-27)
 
@@ -1210,8 +1391,66 @@ here degrades quietly with the process healthy and nothing alerting.
       `CancellationToken` both loops select on, `tokio::signal::ctrl_c()` plus
       SIGTERM, stop accepting, bounded drain (~5 s), exit 0. `announce_zones`'
       fire-and-forget NOTIFY tasks want a `JoinSet` so shutdown can drain them.
-- [ ] **A malformed-packet flood becomes a disk fill and a global lock convoy**
-      — **the lock convoy half is fixed (2026-07-28), the disk fill is not.**
+- [x] **A malformed-packet flood becomes a disk fill and a global lock convoy**
+      — **done 2026-08-01.** The lock convoy went 2026-07-28; the log volume
+      goes now, with `tracing` and real levels on both daemons.
+
+      **Measured live, which is the whole claim:** 50 malformed datagrams at the
+      default level produce **0** log lines (the only stderr is the startup
+      banner), and 50 at `--log-level debug`. Before, all 50 were written
+      unconditionally.
+
+      `--log-level error|warn|info|debug|trace` and `--quiet` on `rdnsd` and
+      `rdnsr`, both going through one `rdns::logging::init` so the two cannot end
+      up configured differently (§7). `RUST_LOG` overrides the flag, because the
+      moment you want it is a server already misbehaving under a level chosen
+      weeks ago in a unit file.
+
+      **The level assignment is the design, not the plumbing.** Nothing
+      per-packet is above `debug` — a malformed query, a parse failure, a
+      response arriving at a listening socket, a client vanishing mid-write, a
+      failed recursive lookup. Those are the flood, and none of them is
+      operator-actionable one at a time. `warn` is for what somebody should see
+      without turning anything up: a TSIG rejection, a refused transfer, a zone
+      going out of service on EXPIRE, a NOTIFY nobody acknowledged, a DNSSEC
+      answer that did not validate. `info` is the per-event operational record —
+      the startup banner and effective policy, zone loads, transfers, reloads —
+      and is the default, so the server still says what it is doing.
+
+      **`format!` no longer runs for a line nobody wants.** That is the half a
+      level alone does not fix: the old call site built its `String` *before*
+      calling `log_error`. `bad_request!` and `serving_error!` wrap the `tracing`
+      macros, which do not evaluate their arguments unless a subscriber is
+      interested, and they also count — so `total_errors` does not become "errors
+      we happened to log" when the level goes down. Verified by
+      `a_suppressed_bad_request_costs_nothing_to_format_and_is_still_counted`,
+      which logs a `Display` that counts its own renderings: 0 at WARN, 1 at
+      DEBUG, counted both times. **Shown to fail** against an eagerly-formatting
+      version of the macro.
+
+      **No in-process rate limiter, deliberately** — this reverses the fix the
+      finding proposed. journald already rate-limits *per unit*
+      (`LogRateLimitIntervalSec`, `LogRateLimitBurst`, both now in the README's
+      unit) and reports what it dropped, so a flood cannot starve other services
+      the way the original text claims. A second limiter would be a second thing
+      to reason about at 3am and would hide what the first one did. Levels stop
+      the volume at the source; the platform handles what is left (§14, prefer
+      the shape the operator already runs).
+
+      **Cost: 11 crates** (110 → 121), measured rather than guessed —
+      `tracing` is 4 of them because `syn`/`quote`/`proc-macro2` are already here
+      for serde and `pin-project-lite` for tokio; `fmt` is 3 more; `env-filter`'s
+      `matchers` + `regex-automata` are the last 4. `ansi` and `tracing-log` are
+      off. For scale, the OpenTelemetry stack this replaces the memory of was 83.
+
+      Two `println!`s survive on purpose and say so in comments: `--check-config`
+      and `--generate-keys` write to **stdout** because a deploy script and a
+      registrar form read them, and `--quiet` must not be able to remove the
+      output of a command whose whole job is to produce it.
+
+      Original finding follows, including the `tracing` recommendation this
+      followed and the rate-limiting one it did not.
+      (The 2026-07-28 half, kept for its reasoning.)
       `log_error` counts under the guard and does its `eprintln!` outside it, so
       one `write(2)` per bad packet no longer serializes every *other* query path
       behind the stats mutex as well as behind Rust's stderr lock. What is left is
@@ -1257,7 +1496,51 @@ here degrades quietly with the process healthy and nothing alerting.
       `try_acquire_owned` on a `Semaphore` sized by `--max-concurrent-udp` —
       `try_`, not `acquire`, because for UDP shedding is correct back-pressure and
       awaiting would just move the queue into the kernel buffer.
-- [ ] **Blocking I/O and full zone parse-and-sign run on the tokio runtime**
+- [x] **Blocking I/O and full zone parse-and-sign run on the tokio runtime** —
+      **done 2026-08-01.** Both halves, and the mutex.
+
+      **The load.** `Reloading::load` runs on `spawn_blocking` now, and
+      `load_zones_from_source` is no longer declared `async` — it never was. The
+      signature was the trap rather than the cost: an `async fn` with zero await
+      points in it reads as though it yields somewhere, and nothing at the call
+      site said otherwise. The startup call stays on the calling thread on
+      purpose, and says so in a comment: no listener is bound yet, so there is no
+      worker to take out of service. It is the SIGHUP and re-signing paths that
+      needed moving, because those run with both transports live.
+
+      **The state write.** `record_state` updates the `StateFile` under the mutex,
+      takes a `snapshot`, drops the guard, and writes on `spawn_blocking`. The
+      finding offered "a `tokio::sync::Mutex` or move the write outside the
+      guard" — the second is better, because with the write gone the critical
+      section holds no `.await` at all and an async mutex would buy nothing. So
+      `StateFile::record` split into `set` (memory) + `snapshot` (path and bytes,
+      owned so they outlive the guard) + `write_snapshot` (free-standing,
+      because by then the caller has deliberately let go of the file *and* its
+      lock). `record` remains as the two glued together for sync callers.
+
+      Verified by `a_reload_does_not_block_the_runtime_it_was_called_from`, on a
+      **one-worker** runtime so the question has a yes-or-no answer: it counts
+      whether anything else on the runtime is polled while a reload of four
+      4,000-record zones runs. Zero against the old code, tens of thousands with
+      the load on a blocking thread.
+
+      **The first version of that test passed against both**, which is §1's
+      warning arriving on schedule. It called `load` from the test body, and
+      `#[tokio::test(flavor = "multi_thread")]` runs the body on the calling
+      thread via `block_on` — so the blocking call never occupied the worker it
+      was meant to be starving. The load has to be inside a spawned task, with
+      the body left as the observer.
+
+      **A second gap this turned up**, and the more useful one: the existing
+      "fetches, serves and persists" test asserted the transfer state through
+      `state.lock().unwrap().get(..)` — the copy *in memory*. It passes whether
+      or not the sidecar was ever written, so splitting the write out could have
+      dropped it silently and the suite would have stayed green. It now reloads
+      `StateFile` from disk and compares. Confirmed by deleting the write: that
+      one test fails, and it is the only one that does.
+
+      Original finding follows.
+
       (`rdnsd/src/main.rs:1846`, `:1814`, `:2342`). `record_state` → `StateFile::record`
       → `persist::write_atomically_str` does `File::create` + `write_all` +
       **`sync_all`** + `rename` + a directory fsync, synchronously, on a worker
@@ -1269,7 +1552,51 @@ here degrades quietly with the process healthy and nothing alerting.
       both listeners are live. The declared-`async`-but-fully-blocking signature is
       the trap — it reads as if it yields. Fix: `spawn_blocking` for each, and make
       the state mutex a `tokio::sync::Mutex` (or move the write outside the guard).
-- [ ] **A full zone diff runs while the zone-map write lock is held**
+- [x] **A full zone diff runs while the zone-map write lock is held** — **done
+      2026-08-01.** The diff is planned under the *read* lock, where queries run
+      alongside it; only the recording and the swap happen under the write lock.
+
+      **The counter is the part worth reading.** Splitting the work in two opens
+      a window between dropping the read guard and taking the write guard, in
+      which another task can install, expire or withdraw a zone — and a delta
+      computed against a version we are no longer replacing is exactly the "IXFR
+      chain that does not describe the zone we serve" that `install_zone`'s own
+      comment warns about. So the zone map is a `Zones` struct now, carrying a
+      `generation` that moves on every mutation: equal at apply time means the
+      plan still stands, different means re-plan under the write lock. **A serial
+      comparison would not have been sound** — two versions of a zone can carry
+      the same serial, an edited file reloaded without a bump being the ordinary
+      way — so the check has to be about identity and not about version.
+      Mutation goes through methods and there is no `DerefMut`, so the counter
+      cannot be forgotten at a call site (§2, make it unrepresentable).
+
+      `ixfr` grew `plan_change` and `DeltaLog::record` to make the split possible
+      without giving up the property that a caller cannot record a step without
+      having had the old version in hand: `record` consumes a token only
+      `plan_change` can mint. `note_change` stays as the one-shot wrapper.
+
+      **Freeing the old zones was half of what was left.** With the read/write
+      split alone, 12.7% of sampled queries were still locked out — the displaced
+      `HashMap` was being dropped *under* the write guard, one deallocation per
+      record of every zone. `insert` and `replace_all` hand the displaced data
+      back (`#[must_use]`) for the caller to drop after releasing the lock, which
+      took it to ~0.3%.
+
+      Verified by `a_reload_does_not_hold_the_write_lock_across_its_diffs`, which
+      samples "could a query have been answered right now?" continuously for as
+      long as a reload runs. **Shown to fail against the old code first**, as §1
+      demands: 127,697 of 128,319 samples locked out (99.5%) before, 90-484 of
+      ~85,000 (~0.3%) after. The first draft of that test used a single probe
+      after a fixed 20 ms sleep and **passed against both versions** — the diff
+      finished before the probe arrived, so it measured nothing. The sampling
+      loop is what makes it a test rather than a coin toss (§10); it asserts a
+      minimum sample count so a run that measures nothing fails loudly instead of
+      passing vacuously, and it is `multi_thread` on purpose, because the diff
+      has no `.await` in it and on the single-threaded runtime the reload would
+      finish before the reader was ever polled.
+
+      Original finding follows.
+
       (`rdnsd/src/main.rs:1521`, `:1550`). `install_zone` takes `zone_map.write()`,
       then `deltas.write()`, then calls `note_change` → `ixfr::diff`
       (`ixfr.rs:175`), which walks every record of both versions into a
@@ -1436,7 +1763,16 @@ here degrades quietly with the process healthy and nothing alerting.
       stated: **rdnsd still has no `--user`/`--group`**, so it never drops
       privilege after binding — whatever it starts as, it stays as, reading
       private signing keys as that user for the life of the process. Documented
-      rather than fixed; the privilege-drop flag is left below as its own item.
+      rather than fixed; the privilege-drop flag is now its own open item below.
+      (That sentence said "is left below as its own item" when the item did not
+      exist — the §4 mistake again, a claim about neighbouring text nobody
+      opened. Corrected by adding it rather than by deleting the sentence.)
+
+      **2026-08-01: that item is now closed as won't-fix** — see it below for
+      why. "Documented rather than fixed" turned out to be the right answer and
+      not a shortfall: `User=` plus an ambient capability is what a privilege
+      drop is trying to approximate, and it gets there without the process ever
+      being root.
 
       **Two parts of this finding were already fixed before I got to it**, and are
       recorded rather than claimed: `CLI_USAGE.md:25` already explained that the
@@ -1520,17 +1856,181 @@ here degrades quietly with the process healthy and nothing alerting.
       Fix: GitHub Actions running build + test + clippy + a cargo-deny new enough
       to parse edition 2024; pin the MSRV; stamp the version from git; add the
       Apache license file or drop the claim.
-- [ ] **Private key permissions are best-effort on write and unchecked on read**
+- [x] **`rdnsd` did not compile on Unix at all** — **found and fixed
+      2026-08-01**, while trying to run the permission tests below on Linux.
+      New finding, not from the review.
+
+      `next_reload_signal` called `signals.next()` on a
+      `signal_hook_tokio::Signals`. That resolves to `Stream::next` only with a
+      `StreamExt` in scope; nothing imported one, and neither `futures` nor
+      `tokio-stream` was a dependency — so it resolved to `Iterator::next`,
+      which `SignalsInfo` does not implement, and the build failed:
+
+      ```
+      error[E0599]: the method `next` exists for mutable reference
+      `&mut signal_hook_tokio::SignalsInfo`, but its trait bounds were not satisfied
+      ```
+
+      The whole module is `#[cfg(unix)]`, so **no amount of building on Windows
+      could show it**, and this is a workspace developed on Windows. The daemon
+      has therefore never built on its own deployment platform since SIGHUP
+      reloading was written.
+
+      **Why CI did not catch it: CI has never run.** `.github/workflows/ci.yml`
+      does build and test on `ubuntu-latest`, exactly as its own commit says —
+      but `git remote -v` is empty. There is nowhere for it to run. The workflow
+      was landed with "every job was run locally before landing", and on Windows
+      that claim was true and useless. This is `CLAUDE.md` §4's rule again at one
+      remove: the file asserting the property was never the thing that upholds
+      it.
+
+      The fix removes dependencies rather than adding one. `tokio::signal::unix`
+      is already in the workspace — `rdns::shutdown` uses it for SIGTERM — so
+      SIGHUP uses `signal(SignalKind::hangup())` and `recv()`, one mechanism for
+      every signal this process handles, and **`signal-hook` and
+      `signal-hook-tokio` are gone** (`Cargo.lock` loses 30 lines with their
+      transitives). A dependency that never worked is the purest case of §14's
+      "count what a dependency does at run time".
+
+      Verified by building and running the whole suite on the Linux side:
+      `cargo build --workspace --all-targets` succeeds, `cargo test --workspace`
+      is 701 passing. **Not verified there:** `cargo clippy`, which that image
+      has no package for — Windows clippy is clean and the Unix-only code is one
+      function, but the gap is real and belongs in the record rather than in an
+      assumption. What would close all of this properly is a remote for the CI
+      to run on.
+
+- [x] **Private key permissions are best-effort on write and unchecked on read**
+      — **done 2026-08-01**, both halves, with the check in one place.
+
+      `rdns::persist::ensure_private(path, what)` is the whole of it, called by
+      `SigningKey::load_dir` and by `rdnsd`'s `read_secret_file`. The TSIG copy
+      in `rdnsd/src/config.rs` is deleted rather than duplicated: "is this file
+      private enough to hold a secret" is one question, and a second
+      implementation of a security check is one more thing to get wrong (§7).
+      `what` names the secret so the message can still say "a TSIG secret" or
+      "a DNSSEC private key".
+
+      **The write side moved too, and closed a window nobody had mentioned.**
+      `write_to_dir` did `write_atomically_str` — temp file, rename — and *then*
+      `let _ = set_permissions(0o600)` on the final path. Two faults in one line:
+      the failure was discarded (§4), and between the rename and the chmod the
+      private key sat at whatever the umask allowed, 0644 on a stock Linux.
+      `persist::write_atomically_private` restricts the **temporary** file before
+      the rename, so the name the key is finally known by only ever refers to a
+      file that was already 0600, and a failure to restrict fails the write.
+
+      Verified **on Linux**, which is the only place any of this exists — see the
+      next item for why that was not previously possible. `ensure_private` is
+      checked against six modes; `a_world_readable_private_key_is_refused_by_the_loader`
+      writes a real key, confirms `write_to_dir` left it 0600, chmods it 0644,
+      and requires the loader to refuse. **Shown to fail against the old
+      behaviour**: with the check removed the world-readable key loads and the
+      test reports `unwrap_err() on an Ok value: [SigningKey { .. }]`.
+
+      Two things running it on Linux caught that Windows could not:
+
+      - The mode-table test was **wrong on its first run** — after the 0400 case
+        it left the file read-only, so the next `fs::write` failed with EACCES.
+        It removes the file each iteration now.
+      - `a_key_directory_loads_every_key_and_refuses_a_broken_one` writes its
+        broken key with `fs::write`, which is 0644 under the usual umask — so
+        the new check would have fired *before* the parse and that test would
+        have quietly stopped being about a broken key. It chmods to 0600 first
+        and now asserts the error names `Flags`, so it fails if it ever drifts
+        back onto the permission path (§1).
+
+      Original finding follows.
+
       (`rdns/src/dnssec_key.rs:590`, `:472`). `--generate-keys` does
       `let _ = set_permissions(..., 0o600)` on Unix and nothing at all on Windows;
       `load_dir` reads whatever is there with no check and no warning. A key
       directory restored from backup as 0644, or `chmod -R`'d by a deploy script,
       is silently accepted with a world-readable zone-signing key.
+
+      **The check already exists and is in the wrong crate.** `rdnsd`'s config
+      module grew `check_secret_permissions` for TSIG `secret-file` (mode
+      `& 0o077 != 0` is refused, with the platform caveat stated out loud). This
+      item is the same check on the DNSSEC key directory, so the fix is to move
+      that helper into `rdns` and call it from both — `CLAUDE.md` §7, before there
+      is a second copy to drift.
+- [x] **No `--user`/`--group`** — **closed 2026-08-01 as won't-fix: this is the
+      service manager's job, and it does it better.** The item is kept rather
+      than deleted because the reasoning that made it look open is the useful
+      part.
+
+      The original finding below is not wrong about the facts — `rdnsd` does not
+      drop privilege, and whatever it starts as it stays as. What it got wrong is
+      the assumption that the *daemon* is what should fix that. The unit in
+      `README.md` runs `User=rdns` with `AmbientCapabilities=CAP_NET_BIND_SERVICE`
+      and `NoNewPrivileges=true`, and that is **strictly stronger than a setuid
+      drop, not merely equivalent to it**:
+
+      - **The process is never root, not for one instruction.** A drop after
+        binding leaves a window in which the process holds root's fd table,
+        environment and full capability set, so anything before the drop — a
+        config parse, a key load, a panic writing a core — is a bug in root
+        context. An ambient capability is handed to a process that started
+        unprivileged: there is no window to get wrong.
+      - **The drop does not fix the harm the finding names.** "Reads private
+        signing keys as uid 0" is solved by dropping *before* the key load — at
+        which point the keys must already be owned by the target user, which is
+        exactly what `User=` gets you with no code at all. Drop *after* the key
+        load and they were read as root anyway. The flag is either redundant with
+        the file ownership you need regardless, or it does not address the
+        complaint it was written for.
+      - **It would break the dry run.** `ExecStartPre` runs `--check-config` as
+        `rdns` today, which is what makes §15's "a chmodded key fails the dry
+        run" actually true. An in-process drop makes the check run under one
+        identity and the server under another — a dry run that passes for
+        precisely the failure it exists to catch.
+      - **And it is a Unix-only, thread-hostile code path.** `setuid(2)` is
+        per-thread in the kernel; POSIX semantics are a glibc/musl signal
+        broadcast to every thread, and doing that after tokio has spawned its
+        worker pool is delicate with a silent partial failure. `setgroups` must
+        precede `setuid` or the supplementary groups survive the drop — the
+        classic version of this bug, still shipping in real daemons. That is a
+        platform-conditional path in a workspace whose CI builds both platforms
+        *because* per-platform paths keep being where the bugs are.
+
+      One correction to the finding while it is open: the unit does not use
+      `setcap`, it uses `AmbientCapabilities`, and the difference matters. A file
+      capability is granted to **everyone who executes that binary**, so anyone
+      with a shell can bind low ports with it; the ambient capability is granted
+      to the one invocation systemd starts. `setcap` survives in the README only
+      as the fallback for running outside a service manager, which is the case
+      where there is nothing else to grant it.
+
+      **What would reopen this: `chroot`.** NSD and Unbound keep their own drop
+      because they chroot first, and entering a chroot needs privilege that
+      binding a socket does not. If `--chroot` is ever wanted, the two arrive
+      together. Until then `ProtectSystem=strict` plus `ReadWritePaths` covers
+      the filesystem-confinement half, and both are already in the unit.
+
+      Every supervisor anyone would realistically deploy this under can set an
+      identity: systemd `User=`, OpenRC's `start-stop-daemon --user`, FreeBSD's
+      `daemon -u`, launchd's `UserName`, a container's `USER`, a Windows service
+      account. Re-implementing that badly inside the daemon is not worth the
+      code. **If someone deploying this hits a supervisor that cannot, that is a
+      PR** — and this item is the argument it has to answer. Original finding
+      follows.
+
+      Whatever it starts as, it stays as, reading private signing keys with those
+      credentials for the life of the process. Binding 53 needs privilege for one
+      syscall and nothing after it. The README now recommends `setcap
+      CAP_NET_BIND_SERVICE` plus systemd's `User=` instead of `sudo rdnsd`, which
+      sidesteps the problem for the deployment that reads the README and not for
+      anyone else. Unix-only by nature; say so where it lands.
 - [ ] **No container image, no readiness signal** — no Dockerfile, no
-      `Type=notify`/sd_notify, no health endpoint. With `Restart=on-failure` and no
+      `Type=notify`/sd_notify. With `Restart=on-failure` and no
       readiness gate, a rolling restart moves traffic to an instance that has bound
-      the socket but is still parsing 40 zones. Cheap once the metrics listener
-      above exists (`/healthz` on it).
+      the socket but is still parsing 40 zones.
+
+      **Half of this is done**: `--metrics-listen` serves `GET /healthz`, so the
+      health endpoint the original finding asked for exists. What is left is the
+      Dockerfile and an actual *readiness* distinction — `/healthz` answers as soon
+      as the listener is up, which is exactly the "bound but still loading" state
+      it would need to report as not-ready.
 
 #### 9e. Performance — all measured under `--release`
 
@@ -1873,8 +2373,12 @@ into a measurement you can re-run, and it is what tells you when to stop.
       neither absolutizing nor down-casing can be looked up with no allocation at
       all. It touches the public `normalize_name`, which is why it is its own item
       rather than part of the profiling commit. The assertion to prove it is
-      already in `rdns/tests/allocations.rs` ("look up one A record in the zone",
-      currently 5).
+      already in `rdns/tests/allocations.rs` — not a test of its own, but the
+      labelled middle segment of `one_query_end_to_end`
+      (`within("look up one A record in the zone", .., 1..=10)`, measuring 5).
+      Tightening that range is part of the fix, not a follow-up: a range that
+      still admits the old number is a test that has agreed not to notice
+      (`CLAUDE.md` §10).
 - [ ] **`tokio::spawn` per UDP datagram costs 1,536 bytes — 46% of every byte a
       query allocates.** Measured, and by far the largest single cost on the
       path: the task allocation is bigger than the entire rest of the query put
@@ -3806,6 +4310,34 @@ cache carries the same AD bit the first client saw and no other.
 
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
+
+- **Both daemons have log levels** — closes 9d's log-volume half. `--log-level`
+  and `--quiet` on `rdnsd` and `rdnsr` through one `rdns::logging::init`, with
+  `RUST_LOG` on top. Nothing per-packet is above `debug`, so 50 malformed
+  datagrams cost **0 log lines** at the default level where they used to cost 50,
+  and `format!` no longer runs for a line nobody wants. No in-process rate
+  limiter: journald's per-unit one is in the README's unit instead. 11 crates,
+  measured. (`79614a8`)
+- **`rdnsd` compiles on Unix** — it had not since SIGHUP reloading was written,
+  because `signals.next()` needed a `StreamExt` nothing imported and the module
+  is `#[cfg(unix)]`. Found by running the suite on Linux for the first time.
+  Fixed by using `tokio::signal::unix`, which `rdns::shutdown` already used, and
+  deleting `signal-hook` and `signal-hook-tokio`. (`220e4ba`)
+- **A secret file's mode is checked when it is read** — one
+  `persist::ensure_private` for the TSIG and DNSSEC paths both, and
+  `write_atomically_private` restricts the temporary file *before* the rename so
+  a new private key is never briefly world-readable. (`742bba6`)
+- **The zone load and the state fsync are off the runtime** — `spawn_blocking`
+  for the reload, and the state write happens after the mutex guard is dropped
+  rather than across the fsync. `load_zones_from_source` is honestly sync now; it
+  was an `async fn` with no await in it. (`c99fb6d`)
+- **A reload no longer blocks every query for the length of its diffs** — planned
+  under the read lock and recorded under the write lock, with a generation
+  counter deciding whether the plan survived the gap. 99.5% of sampled queries
+  were locked out during a reload before; ~0.3% after. (`9df8d90`)
+- **`--user`/`--group` closed as won't-fix** — privilege separation belongs to
+  the service manager, and `User=` with an ambient capability is stronger than a
+  setuid drop rather than equivalent to it. (`3dab5f2`)
 
 - **`rdnsd` signs zones, and answers a DO-bit query from one** — closes #2, the
   last feature on this list. `dnssec_key` generates and stores private keys and

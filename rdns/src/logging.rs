@@ -1,7 +1,106 @@
 use crate::utils::current_unix_timestamp;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+
+/// How much a daemon says.
+///
+/// A level exists because a malformed-packet flood used to be one unbuffered
+/// `write(2)` per bad packet with no way to turn it off — 50k lines a second at
+/// 50k pps, and the caller built the message with `format!` whether or not
+/// anything wanted it. `tracing`'s macros only evaluate their arguments when a
+/// subscriber is interested, so the level is what stops the work, not just the
+/// output.
+///
+/// **Volume beyond that is the platform's job, not this process's.** journald
+/// rate-limits per service (`LogRateLimitIntervalSec`, `LogRateLimitBurst`) and
+/// says how many it dropped; a second limiter in here would be a second thing to
+/// reason about at 3am and would hide what the first one did. See the README's
+/// unit, where the knobs are set (`CLAUDE.md` §14 — prefer the shape the
+/// operator already runs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    /// The `tracing` filter this level means.
+    pub fn as_filter(self) -> tracing::level_filters::LevelFilter {
+        use tracing::level_filters::LevelFilter;
+        match self {
+            LogLevel::Error => LevelFilter::ERROR,
+            LogLevel::Warn => LevelFilter::WARN,
+            LogLevel::Info => LevelFilter::INFO,
+            LogLevel::Debug => LevelFilter::DEBUG,
+            LogLevel::Trace => LevelFilter::TRACE,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
+impl FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "error" => Ok(LogLevel::Error),
+            "warn" | "warning" => Ok(LogLevel::Warn),
+            "info" => Ok(LogLevel::Info),
+            "debug" => Ok(LogLevel::Debug),
+            "trace" => Ok(LogLevel::Trace),
+            other => Err(format!(
+                "unknown log level {other:?}: expected error, warn, info, debug or trace"
+            )),
+        }
+    }
+}
+
+/// Send this process's log lines to stderr at `level`, honouring `RUST_LOG`.
+///
+/// Called **once, by a binary** — never from library code, which only emits.
+/// It lives here rather than in each daemon so that `rdnsd` and `rdnsr` cannot
+/// end up configured differently, which is the same reason the ICMP predicate
+/// was moved into this crate (`CLAUDE.md` §7).
+///
+/// `RUST_LOG` wins where it is set, because the reason to reach for it is a
+/// server already misbehaving under a level chosen weeks ago in a unit file, and
+/// editing the unit to look at one module is a restart nobody wants. `--quiet`
+/// and `--log-level` set the default it falls back to.
+///
+/// No timestamps and no ANSI: journald stamps every line it receives, and a
+/// second timestamp beside its own is one an operator has to reconcile when the
+/// two disagree. Running in a terminal loses the timestamp entirely, which is
+/// the deliberate trade — the deployed shape wins over the development one.
+pub fn init(level: LogLevel) {
+    use tracing_subscriber::EnvFilter;
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.as_str()));
+
+    // `try_init` rather than `init`: a second call is a bug in the caller, but
+    // it must not be a panic in a server that is otherwise fine, and the tests
+    // in this workspace share a process.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .without_time()
+        .with_target(true)
+        .try_init();
+}
 
 /// How many source addresses are counted individually at once.
 ///
@@ -175,18 +274,17 @@ impl QueryLogger {
         }
     }
 
-    /// Log a query error
-    pub fn log_error(&self, _ip: IpAddr, reason: &str) {
+    /// Count a query error. **The caller does the logging** — see below.
+    ///
+    /// This used to `eprintln!` the reason itself, which made it impossible for
+    /// the caller to say anything about *where* the error came from without
+    /// building a string first. `count_error` counts; the call site emits at
+    /// whatever level fits, with the peer as a field, and pays for the message
+    /// only if something is listening.
+    pub fn count_error(&self, _ip: IpAddr) {
         if let Some(mut inner) = self.locked() {
             inner.stats.total_errors += 1;
         }
-
-        // Outside the guard on purpose. `eprintln!` is an unbuffered `write(2)`
-        // serialized on Rust's stderr lock, and doing it while holding this
-        // mutex made a malformed-packet flood into a lock convoy across every
-        // query path as well as a disk fill. Holding one global lock across a
-        // syscall is the shape to avoid; the count is what the lock is for.
-        eprintln!("[QueryLogger] Error: {}", reason);
     }
 
     /// Log rate limit event
@@ -225,10 +323,7 @@ impl QueryLogger {
 
         // Check for high QPS
         if stats.qps > 50.0 {
-            eprintln!(
-                "[QueryLogger] WARNING: High QPS detected: {:.2} q/s",
-                stats.qps
-            );
+            tracing::warn!(qps = stats.qps, "high query rate");
         }
 
         // Check for high error rate
@@ -239,33 +334,28 @@ impl QueryLogger {
         };
 
         if error_rate > 0.1 {
-            eprintln!(
-                "[QueryLogger] WARNING: High error rate: {:.2}%",
-                error_rate * 100.0
-            );
+            tracing::warn!(percent = error_rate * 100.0, "high error rate");
         }
 
         // Check for IPs with many queries
         for (ip, count) in &stats.queries_by_ip {
             if *count > 100 {
-                eprintln!(
-                    "[QueryLogger] WARNING: High query count from {}: {}",
-                    ip, count
-                );
+                tracing::warn!(peer = %ip, count, "high query count from one source");
             }
         }
 
         if stats.untracked_sources > 0 {
-            eprintln!(
-                "[QueryLogger] WARNING: {} queries from sources there was no room to count                  individually — the per-IP figures below are a sample, not a census",
-                stats.untracked_sources
+            tracing::warn!(
+                untracked = stats.untracked_sources,
+                "queries from sources there was no room to count individually — the \
+                 per-IP figures are a sample, not a census"
             );
         }
 
         // Check for IPs that have been rate limited multiple times
         for (ip, count) in &stats.rate_limited_ips {
             if *count > 5 {
-                eprintln!("[QueryLogger] WARNING: {} rate limited {} times", ip, count);
+                tracing::warn!(peer = %ip, count, "repeatedly rate limited");
             }
         }
     }
@@ -342,8 +432,8 @@ mod tests {
         let logger = QueryLogger::new();
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
-        logger.log_error(ip, "invalid packet");
-        logger.log_error(ip, "parse error");
+        logger.count_error(ip);
+        logger.count_error(ip);
 
         let stats = logger.get_stats();
         assert_eq!(stats.total_errors, 2);
@@ -368,7 +458,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
         logger.log_query(ip, Some(1));
-        logger.log_error(ip, "error");
+        logger.count_error(ip);
 
         logger.reset_stats();
 

@@ -77,9 +77,53 @@ impl ZoneDelta {
 /// derived state, so the two have to move together — the same hazard the zone
 /// index has, and the reason [`DeltaLog::note_change`] takes both versions
 /// rather than being something a caller can forget to call with the old one.
+/// [`plan_change`] and [`DeltaLog::record`] split that in two without giving the
+/// property up: the token only planning can mint is what the recording step
+/// consumes.
 #[derive(Debug, Default)]
 pub struct DeltaLog {
     by_zone: HashMap<String, Vec<ZoneDelta>>,
+}
+
+/// A version step that has been computed but not yet recorded.
+///
+/// This exists because computing one is the expensive part — [`diff`] walks
+/// every record of both versions into a `BTreeMap` — and `rdnsd` needs that
+/// work to happen off the zone map's *write* lock, where it blocks every query
+/// for as long as it takes. So the daemon plans under the read lock and records
+/// under the write lock; see `Zones` in `rdnsd`, which carries the counter that
+/// says whether a plan made under one lock is still true under the other.
+///
+/// The zone key is baked in at planning time, so a plan cannot be recorded
+/// against the wrong zone.
+#[derive(Debug, Clone)]
+pub struct PlannedDelta {
+    zone: String,
+    delta: ZoneDelta,
+}
+
+/// Work out the step from `old` to `new`, without recording it anywhere.
+///
+/// `None` when there is no step worth keeping, which is the same three cases
+/// [`DeltaLog::note_change`] declines: no previous version (a zone loaded at
+/// startup has no history and never did), a serial that did not move forward,
+/// or two versions that are identical — a serial bump with no change is a
+/// legitimate thing to publish, but there is no increment in it to remember.
+pub fn plan_change(old: Option<&Zone>, new: &Zone) -> Option<PlannedDelta> {
+    let (Some(old), Some(from), Some(to)) = (old, old.and_then(Zone::serial), new.serial()) else {
+        return None;
+    };
+    if !crate::secondary::is_newer(to, from) {
+        return None;
+    }
+    let delta = diff(old, new)?;
+    if delta.is_empty() {
+        return None;
+    }
+    Some(PlannedDelta {
+        zone: key(new.origin()),
+        delta,
+    })
 }
 
 impl DeltaLog {
@@ -95,22 +139,19 @@ impl DeltaLog {
     /// change is a legitimate thing to publish, but there is no increment in it
     /// worth keeping.
     pub fn note_change(&mut self, old: Option<&Zone>, new: &Zone) {
-        let (Some(old), Some(from), Some(to)) = (old, old.and_then(Zone::serial), new.serial())
-        else {
-            return;
-        };
-        if !crate::secondary::is_newer(to, from) {
-            return;
+        if let Some(planned) = plan_change(old, new) {
+            self.record(planned);
         }
-        let Some(delta) = diff(old, new) else {
-            return;
-        };
-        if delta.is_empty() {
-            return;
-        }
+    }
 
-        let history = self.by_zone.entry(key(new.origin())).or_default();
-        history.push(delta);
+    /// Record a step [`plan_change`] already worked out.
+    ///
+    /// The two-phase caller is `rdnsd`, which plans under the zone map's read
+    /// lock and records under its write lock so that a diff of every record in
+    /// the zone is not something every query waits behind.
+    pub fn record(&mut self, planned: PlannedDelta) {
+        let history = self.by_zone.entry(planned.zone).or_default();
+        history.push(planned.delta);
         // Oldest first, so the oldest steps are the ones dropped.
         if history.len() > MAX_DELTAS_PER_ZONE {
             history.remove(0);

@@ -113,11 +113,13 @@ After=network.target
 [Service]
 Type=simple
 
-# Not root. rdnsd has no --user/--group of its own, so it never drops privilege
-# after binding — which means whatever it starts as, it stays as, and it reads
-# private signing keys and TSIG secrets as that user for the life of the process.
-# systemd is what makes it unprivileged, and CAP_NET_BIND_SERVICE is what lets an
-# unprivileged user have port 53 anyway.
+# Not root, and never root. rdnsd has no --user/--group of its own by design:
+# these two lines are stronger than a setuid drop, because the process starts
+# unprivileged rather than dropping privilege after the bind, so there is no
+# window in which a config parse or a key load runs as uid 0. It follows that
+# whatever it starts as it stays as — so this is the user that reads the private
+# signing keys and TSIG secrets, and those files should be owned by it.
+# CAP_NET_BIND_SERVICE below is what lets an unprivileged user have port 53.
 User=rdns
 Group=rdns
 
@@ -151,10 +153,24 @@ ProtectHome=yes
 # a transferred zone is written there, along with its state sidecar.
 ReadWritePaths=/etc/rdns/zones
 
-# Logging
+# Logging. The default level is info: the startup banner and effective policy,
+# zone loads, transfers, NOTIFYs, refusals and failures. Nothing per-packet is
+# above debug, so a malformed-packet flood costs no log lines at all — that used
+# to be one unbuffered write(2) per bad packet with no way to turn it off.
+# RUST_LOG overrides the level without editing this file; Environment= sets it
+# permanently.
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=rdns
+#Environment=RUST_LOG=rdnsd=debug,rdns::xfr=trace
+
+# Log volume is journald's job, not the daemon's. These are per-unit, so a flood
+# here suppresses rdns's own lines and says how many it dropped, without
+# starving any other service on the box. rdnsd deliberately has no rate limiter
+# of its own: two limiters means two things to reason about at 3am, and the
+# second one hides what the first did.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
 
 [Install]
 WantedBy=multi-user.target
@@ -196,7 +212,9 @@ To run on standard DNS port (53) without root:
 
 Use the `systemd` unit above, which gives an unprivileged user
 `CAP_NET_BIND_SERVICE` and nothing else. Outside systemd, grant the capability to
-the binary directly:
+the binary directly — but note that a file capability applies to **everyone who
+executes that binary**, not just the service, which is why the unit's
+`AmbientCapabilities` is the better of the two wherever it is available:
 
 ```bash
 sudo setcap CAP_NET_BIND_SERVICE=+eip /usr/local/bin/rdnsd
@@ -204,11 +222,11 @@ rdnsd --config /etc/rdns/rdnsd.toml          # as an ordinary user
 ```
 
 **Running the whole server as root is worth avoiding rather than documenting.**
-rdnsd has no `--user`/`--group`, so it does not drop privilege after binding —
-whatever it starts as, it stays as, and it reads private signing keys and TSIG
-secrets as that user for the life of the process. `sudo rdnsd` used to be
-suggested here; a capability on the binary or a `User=` in the unit does the same
-job without it.
+rdnsd has no `--user`/`--group` on purpose: privilege separation belongs to
+whatever starts the process, and `User=` plus an ambient capability beats a
+setuid drop, because the process is never root at all rather than dropping root
+after the bind. `sudo rdnsd` used to be suggested here; a capability plus a
+service-manager identity does the same job without it.
 
 ## Testing
 

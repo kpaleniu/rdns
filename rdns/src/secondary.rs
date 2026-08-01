@@ -246,10 +246,10 @@ impl StateFile {
                 }
                 match parse_state_line(line) {
                     Ok(state) => entries.push(state),
-                    Err(e) => eprintln!(
-                        "{}:{}: ignoring unreadable state line ({e})",
-                        path.display(),
-                        number + 1
+                    Err(e) => tracing::warn!(
+                        file = %path.display(),
+                        line = number + 1,
+                        "ignoring unreadable state line ({e})"
                     ),
                 }
             }
@@ -275,7 +275,26 @@ impl StateFile {
     ///
     /// Written whole and atomically every time rather than appended to: the file
     /// is small, and a reader must never see a line half-updated.
+    ///
+    /// **The write is the expensive half**, and a caller that holds a lock or
+    /// runs on an async runtime should not do it here — see [`StateFile::set`].
     pub fn record(&mut self, state: TransferState) -> ConfigResult<()> {
+        self.set(state);
+        let (path, text) = self.snapshot();
+        write_snapshot(&path, &text)
+    }
+
+    /// Update what is known, writing nothing.
+    ///
+    /// Split out of [`StateFile::record`] because the write ends in an `fsync`
+    /// of the file *and* of its directory, and `rdnsd` reaches this through an
+    /// `Arc<Mutex<StateFile>>` from an async task. Doing the write here would
+    /// hold a `std::sync::Mutex` across that fsync — which every other
+    /// secondary's refresh loop then spins on rather than yielding — and would
+    /// block a runtime worker that is also answering queries (`CLAUDE.md` §9).
+    /// The caller updates under the guard, takes a [`StateFile::snapshot`],
+    /// drops the guard, and writes.
+    pub fn set(&mut self, state: TransferState) {
         match self
             .entries
             .iter_mut()
@@ -284,10 +303,13 @@ impl StateFile {
             Some(existing) => *existing = state,
             None => self.entries.push(state),
         }
-        self.save()
     }
 
-    fn save(&self) -> ConfigResult<()> {
+    /// The path and the exact contents [`StateFile::record`] would write.
+    ///
+    /// Owned rather than borrowed, so it can outlive the guard it was taken
+    /// under — which is the entire point of it existing.
+    pub fn snapshot(&self) -> (PathBuf, String) {
         let mut text = String::from(
             "# rdnsd transfer state: zone serial refreshed-at master\n\
              # Written by the server. Deleting this only costs a refresh.\n",
@@ -298,9 +320,17 @@ impl StateFile {
                 entry.zone, entry.serial, entry.refreshed_at, entry.master
             ));
         }
-        crate::persist::write_atomically_str(&self.path, &text)
-            .map_err(|e| ConfigError::new(format!("writing {}: {e}", self.path.display())))
+        (self.path.clone(), text)
     }
+}
+
+/// Write a snapshot taken by [`StateFile::snapshot`].
+///
+/// Free-standing because by the time this runs the caller has deliberately let
+/// go of the `StateFile` — and of whatever lock it sits behind.
+pub fn write_snapshot(path: &Path, text: &str) -> ConfigResult<()> {
+    crate::persist::write_atomically_str(path, text)
+        .map_err(|e| ConfigError::new(format!("writing {}: {e}", path.display())))
 }
 
 fn parse_state_line(line: &str) -> ConfigResult<TransferState> {
