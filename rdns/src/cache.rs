@@ -70,7 +70,17 @@ impl DnsCache {
     /// DNSSEC-validated when it was stored.
     pub fn get_validated(&self, name: &str, qtype: u16) -> Option<(Vec<ResourceRecord>, bool)> {
         let now = current_unix_timestamp();
-        let mut cache = self.cache.lock().unwrap();
+        // A poisoned lock reads as a cache miss (`CLAUDE.md` §6, §4). This is on
+        // `rdnsr`'s query path, and `.lock().unwrap()` here meant that one panic
+        // anywhere under this mutex — ever — would make every later query panic
+        // too, because poisoning is permanent: a resolver taken off the air by a
+        // fault it had already survived. Degrading is the right failure for a
+        // cache and only a cache; the missing state costs a round trip and
+        // nothing else, which is exactly what §4 says a cache may do and a
+        // last-contact time may not.
+        let Ok(mut cache) = self.cache.lock() else {
+            return None;
+        };
 
         // ASCII case folding, not Unicode. DNS is case-insensitive over ASCII
         // and nothing else (RFC 4343), and `str::to_lowercase` applies the full
@@ -145,7 +155,11 @@ impl DnsCache {
         // already expired — or never does.
         let expires_at = now.saturating_add(min_ttl);
 
-        let mut cache = self.cache.lock().unwrap();
+        // And the write side degrades the same way: nothing is stored, the next
+        // client asks upstream again. See [`DnsCache::get_validated`].
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
 
         // Evict oldest entries if cache is full
         if cache.len() >= self.max_entries {
@@ -217,8 +231,21 @@ impl DnsCache {
     }
 
     /// Get cache statistics
+    ///
+    /// Zeros for a poisoned lock, and this is the one place in the file where
+    /// that could mislead — a cache reporting no entries looks like a cache that
+    /// is not being used. It is still better than the alternative: this is read
+    /// by the metrics endpoint, and panicking there turns a cache that failed
+    /// once into a server with no observability at all, at the exact moment an
+    /// operator needs some.
     pub fn get_stats(&self) -> CacheStats {
-        let cache = self.cache.lock().unwrap();
+        let Ok(cache) = self.cache.lock() else {
+            return CacheStats {
+                total_entries: 0,
+                valid_entries: 0,
+                expired_entries: 0,
+            };
+        };
         let now = current_unix_timestamp();
 
         let mut expired_count = 0;
@@ -240,8 +267,13 @@ impl DnsCache {
     }
 
     /// Clear all cache entries
+    ///
+    /// A poisoned lock is left alone: there is nothing to clear that a caller
+    /// could then rely on being clear, and the entries expire on their own.
     pub fn clear(&self) {
-        self.cache.lock().unwrap().clear();
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
+        }
     }
 }
 
@@ -469,6 +501,58 @@ mod tests {
     /// headroom `CLAUDE.md` §10 asks for and still nowhere near the tens of
     /// seconds the quadratic needs at this size. `bench_cache_throughput` cannot
     /// see any of this — it only ever calls `get` on an empty cache.
+    /// A panic under the cache mutex must cost the cache, not the process.
+    ///
+    /// `.lock().unwrap()` was on all four of this type's lock sites, two of them
+    /// on `rdnsr`'s query path — and mutex poisoning is *permanent*, so one
+    /// panic under that lock, ever, would have made every later query panic as
+    /// well. A resolver taken off the air by a fault it had already survived,
+    /// which is `CLAUDE.md` §6's "one reachable panic under a shared lock takes
+    /// the whole process off the air permanently".
+    ///
+    /// Degrading is what a cache may do (§4): the answers are gone, the next
+    /// client pays a round trip, and the process keeps serving. Against the old
+    /// code every assertion below panics instead of failing.
+    #[test]
+    fn a_poisoned_lock_costs_the_cache_and_not_the_process() {
+        let cache = DnsCache::with_defaults();
+        cache.put(
+            "example.com.",
+            1,
+            vec![create_test_record("example.com.", 300)],
+        );
+        assert!(
+            cache.get("example.com.", 1).is_some(),
+            "cached to begin with"
+        );
+
+        // Poison it the only way a mutex is poisoned: panic while holding it.
+        let guarded = Arc::clone(&cache.cache);
+        let panicked = std::thread::spawn(move || {
+            let _held = guarded.lock().expect("not poisoned yet");
+            panic!("a panic under the cache lock");
+        })
+        .join();
+        assert!(panicked.is_err(), "the thread did panic");
+        assert!(cache.cache.lock().is_err(), "so the mutex is poisoned");
+
+        assert!(
+            cache.get("example.com.", 1).is_none(),
+            "a poisoned cache reads as a miss"
+        );
+        cache.put(
+            "other.example.com.",
+            1,
+            vec![create_test_record("other.example.com.", 300)],
+        );
+        assert_eq!(
+            cache.get_stats().total_entries,
+            0,
+            "and reports nothing rather than panicking in the metrics endpoint"
+        );
+        cache.clear();
+    }
+
     #[test]
     fn evicting_a_large_cache_is_linear_not_quadratic() {
         use std::time::Instant;

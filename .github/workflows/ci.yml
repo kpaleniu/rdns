@@ -37,7 +37,7 @@ jobs:
         # every one of those has been a bug here.
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # `build.rs` stamps the version from `git describe`, which needs tags
           # and history. A shallow clone would silently produce a bare version.
@@ -60,7 +60,7 @@ jobs:
     name: clippy and fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -74,7 +74,7 @@ jobs:
     name: minimum supported rust (1.95)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
       # `rust-version` in the manifests is a *claim*; this is what makes it true.
@@ -86,7 +86,7 @@ jobs:
     name: licences and advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Pinned to something new enough to parse the manifests: cargo-deny 0.16.1
       # fails on this workspace with "unknown variant `2024`", because eleven
       # crates in the graph are edition 2024. `deny.toml` says so too.
@@ -108,7 +108,7 @@ jobs:
       # `git describe`. The build context has no `.git` in it by design, and what
       # the version stamp needs is passed in from the variables GitHub already
       # sets — so the default shallow checkout is enough.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: build the image
         env:
           REF_TYPE: ${{ github.ref_type }}
@@ -181,7 +181,7 @@ jobs:
     name: optional features build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p rdnsd --features dhat-heap

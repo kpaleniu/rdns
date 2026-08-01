@@ -130,6 +130,13 @@ impl<'a> TryFromBytes<'a> for Label<'a> {
                         return Err(WireError::Truncated {
                             what: "a label",
                             need: len,
+                            // Cannot underflow: `data.first()` at the top of the
+                            // function returned early on an empty slice, so
+                            // there is at least the length byte being subtracted
+                            // here. The same note as `validation.rs`'s: a
+                            // subtraction of wire-derived lengths on the
+                            // pre-authentication path is worth a proof in place
+                            // (`TODO.md` #12).
                             have: data.len() - 1,
                         });
                     }

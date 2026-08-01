@@ -158,8 +158,18 @@ impl RateLimiter {
     }
 
     /// Get current remaining tokens for an IP (for monitoring/logging)
+    ///
+    /// A poisoned lock reads as a full bucket, which is what an untracked source
+    /// reads as anyway and matches the direction [`RateLimiter::should_allow`]
+    /// fails in — open, because failing closed lets one flood deny service to
+    /// everybody (`CLAUDE.md` §5). The three other lock sites in this file
+    /// already did this; these two monitoring ones were left on `.unwrap()`,
+    /// where a single poisoning would panic whoever asked for the number
+    /// (`CLAUDE.md` §6).
     pub fn get_tokens(&self, ip: IpAddr) -> f64 {
-        let buckets = self.buckets.lock().unwrap();
+        let Ok(buckets) = self.buckets.lock() else {
+            return self.config.burst_size as f64;
+        };
         buckets
             .get(&ip)
             .map(|b| b.tokens)
@@ -190,8 +200,17 @@ impl RateLimiter {
     }
 
     /// Get statistics (for monitoring)
+    ///
+    /// Zeros for a poisoned lock, for the reason [`RateLimiter::get_tokens`]
+    /// gives: a number nobody can read is worse than a number that is wrong in
+    /// a direction the comment names.
     pub fn get_stats(&self) -> RateLimiterStats {
-        let buckets = self.buckets.lock().unwrap();
+        let Ok(buckets) = self.buckets.lock() else {
+            return RateLimiterStats {
+                tracked_ips: 0,
+                total_tokens: 0,
+            };
+        };
         RateLimiterStats {
             tracked_ips: buckets.len(),
             total_tokens: buckets.values().map(|b| b.tokens as u64).sum(),

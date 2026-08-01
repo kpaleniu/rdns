@@ -5630,12 +5630,37 @@ mod tests {
     /// them. The planning happens under the *read* lock now, where queries run
     /// alongside it; only the swap is under the write lock.
     ///
-    /// **This is a ratio, not a stopwatch** (`CLAUDE.md` §10): what the reader
-    /// waits for is compared against how long the whole reload took on the same
-    /// machine at the same moment, so the assertion does not care how fast the
-    /// machine is or what else is running on it. Against the old code the reader
-    /// waited for essentially all of the reload that was left; against this one
-    /// it is admitted straight away.
+    /// **The assertion calibrates against this machine, at this moment**
+    /// (`CLAUDE.md` §10). The test times one unlocked diff itself, then requires
+    /// that somewhere inside the reload there was a *contiguous window* at least
+    /// half that long in which a reader could have been admitted. A window that
+    /// long can only exist if the diff ran under a shared lock. It does not care
+    /// how fast the machine is, because a slower box stretches the baseline and
+    /// the window together.
+    ///
+    /// **It used to be a ratio of samples, and that was wrong.** It counted the
+    /// fraction of `try_read` probes that failed; CI failed it on Windows at 71%
+    /// where this machine measures 0.3%, and nothing had regressed. Two reasons,
+    /// either of which is fatal to that metric:
+    ///
+    /// - **`tokio::sync::RwLock` is fair, so `try_read` fails while a writer is
+    ///   merely *queued*** — not only while one holds the lock. Verified with a
+    ///   probe rather than assumed. Every sample taken between the reload asking
+    ///   for the write lock and the scheduler waking it counted as a query
+    ///   "locked out", so the number was really measuring *wake latency*: single
+    ///   digit microseconds here, unbounded on a contended 2-vCPU runner with
+    ///   ninety other tests on it.
+    /// - **The denominator was the sampler's own spin rate, which is not a
+    ///   clock.** The sampler is a `yield_now` loop, so it competes for the CPU
+    ///   it is measuring, and takes more samples per unit of the reload's
+    ///   progress the busier the machine gets.
+    ///
+    /// Measured with the whole test binary pinned to two cores: the longest
+    /// admitted window is **90% of the reload** with the split, and **9%** with
+    /// the diff put back under the write lock, against a baseline diff of ~4 ms.
+    /// The old sample ratio read 0.2% and 93% for those same two runs — it
+    /// separated them perfectly *here*, which is exactly how it survived to fail
+    /// on a machine that was not here.
     ///
     /// **Multi-threaded on purpose.** The diff is synchronous CPU work with no
     /// `.await` in it, so on the single-threaded runtime the reload would run to
@@ -5660,59 +5685,119 @@ mod tests {
             rdns::zone::parse_zone_file(&text, "example.com.").expect("zone should parse")
         };
 
-        let zone_map = Arc::new(RwLock::new(Zones::default()));
-        let deltas = Arc::new(RwLock::new(DeltaLog::new()));
         let v1 = version(1, 1);
-        let mut initial = HashMap::new();
-        initial.insert(v1.origin().to_string(), v1);
-        install_all_zones(&served(&zone_map, &deltas), initial).await;
-
         let v2 = version(2, 2);
-        let mut reloaded = HashMap::new();
-        reloaded.insert(v2.origin().to_string(), v2);
-        let reloading = served(&zone_map, &deltas);
-        let reload = tokio::spawn(async move {
-            install_all_zones(&reloading, reloaded).await;
-        });
 
-        // Sample continuously for as long as the reload runs, rather than
-        // asking once after a fixed delay: a single probe times out against how
-        // long the diff happens to take on this machine, and a probe that
-        // arrives after the reload has finished measures nothing and passes
-        // against either version. Every sample is one query's worth of "could I
-        // have been answered right now?".
-        let mut attempts = 0u32;
-        let mut refused = 0u32;
-        while !reload.is_finished() {
-            attempts += 1;
-            if zone_map.try_read().is_err() {
-                refused += 1;
+        // **Observing this is a race, and losing it is not a failure.** If this
+        // task is descheduled between spawning the reload and starting to
+        // sample, the whole reload can be over before the first probe — there is
+        // then nothing to measure and no verdict to give either way. On a
+        // machine pinned to two cores with the rest of the suite running, about
+        // one attempt in four saw nothing at all. So the *observation* is
+        // retried, and only never managing to observe anything is a failure.
+        // Each attempt gets its own map and log, so a retry cannot inherit
+        // anything from the one before it.
+        let mut observed = None;
+        for _ in 0..16 {
+            let zone_map = Arc::new(RwLock::new(Zones::default()));
+            let deltas = Arc::new(RwLock::new(DeltaLog::new()));
+            let mut initial = HashMap::new();
+            initial.insert(v1.origin().to_string(), v1.clone());
+            install_all_zones(&served(&zone_map, &deltas), initial).await;
+
+            // What one diff costs on this machine right now, with no locks and
+            // nothing else running: the yardstick the window below is measured
+            // against. Timed here rather than assumed, because it is what makes
+            // the assertion portable — CI's runner is several times slower than
+            // this one and the comparison has to survive that.
+            let mut baseline_zones = HashMap::new();
+            baseline_zones.insert(v2.origin().to_string(), v2.clone());
+            let baseline = {
+                let zones = zone_map.read().await;
+                let started = std::time::Instant::now();
+                let plan = plan_reload(&zones, &baseline_zones);
+                let elapsed = started.elapsed();
+                std::hint::black_box(&plan);
+                elapsed
+            };
+
+            let mut reloaded = HashMap::new();
+            reloaded.insert(v2.origin().to_string(), v2.clone());
+            let reloading = served(&zone_map, &deltas);
+            let reload = tokio::spawn(async move {
+                install_all_zones(&reloading, reloaded).await;
+            });
+
+            // Sample continuously for as long as the reload runs, rather than
+            // asking once after a fixed delay: a single probe times out against
+            // how long the diff happens to take on this machine, and a probe
+            // that arrives after the reload has finished measures nothing.
+            // Every sample is one query's worth of "could I have been answered
+            // right now?".
+            //
+            // What is kept is the longest *contiguous stretch of time* over
+            // which every sample was admitted. A stretch, rather than a count or
+            // a fraction: the count depends on how often this loop gets
+            // scheduled, and the fraction has the writer's wake latency in its
+            // denominator. A stretch of wall-clock time has neither in it. Gaps
+            // in sampling cannot shorten one either — only a refusal ends a
+            // stretch — so a starved sampler measures the same window as an idle
+            // one.
+            let mut attempts = 0u32;
+            let started = std::time::Instant::now();
+            let mut stretch_began = started;
+            let mut longest = std::time::Duration::ZERO;
+            let mut admitted = true;
+            while !reload.is_finished() {
+                attempts += 1;
+                let now = std::time::Instant::now();
+                if zone_map.try_read().is_err() {
+                    if admitted {
+                        longest = longest.max(now - stretch_began);
+                        admitted = false;
+                    }
+                } else if !admitted {
+                    stretch_began = now;
+                    admitted = true;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        reload.await.expect("the reload finished");
+            if admitted {
+                longest = longest.max(std::time::Instant::now() - stretch_began);
+            }
+            reload.await.expect("the reload finished");
 
-        // Measured here: ~0.3% of samples refused with the split in place
-        // (90-484 of ~85,000 over five runs), against **99.5%** with the diff
-        // back under the write lock. The threshold sits an order of magnitude
-        // clear of both, so it is a tripwire and not a performance target.
-        //
-        // A vacuous run — one that never sampled — must fail loudly rather than
-        // pass by finding nothing to complain about.
+            assert_eq!(
+                deltas.read().await.len("example.com."),
+                1,
+                "the version step is recorded whether or not this attempt saw \
+                 anything"
+            );
+            if attempts > 100 {
+                observed = Some((longest, baseline, attempts));
+                break;
+            }
+        }
+
+        let Some((longest, baseline, attempts)) = observed else {
+            panic!(
+                "sixteen attempts and not one of them sampled the reload while it \
+                 was running — this proves nothing either way, so it is a broken \
+                 measurement rather than a broken lock discipline"
+            );
+        };
+
+        // Half the baseline, which is a factor of five clear of both measured
+        // shapes: the window is ~90% of a reload with the split and ~9% without
+        // it, and the reload is a little longer than one diff. Halving leaves
+        // room for the diff inside the reload to run slower than the unlocked
+        // baseline — it is competing with this sampler, after all — without
+        // leaving room for the old behaviour to pass.
         assert!(
-            attempts > 100,
-            "only {attempts} samples: the reload finished before this measured \
-             anything, so it proves nothing either way"
-        );
-        assert!(
-            refused * 10 < attempts,
-            "{refused} of {attempts} queries were locked out — the write lock is \
-             being held across the diff again"
-        );
-        assert_eq!(
-            deltas.read().await.len("example.com."),
-            1,
-            "and the version step is still recorded"
+            longest * 2 > baseline,
+            "over {attempts} samples the longest window in which a reader could be \
+             admitted was {longest:?}, against a {baseline:?} diff on this machine: \
+             the diff is being held under the write lock again"
         );
     }
 

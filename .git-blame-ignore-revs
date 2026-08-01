@@ -9,4 +9,8 @@
 # real change in it must not be on this list.
 
 # cargo fmt --all: the first run, 36 files. The repo predates the formatter.
-15e9aa6bea1fd0581839421f0349d6d04e9cae72
+#
+# This hash changed on 2026-08-01, when the session-URL trailers were stripped
+# from every commit message and the history was rewritten. A stale entry here is
+# not cosmetic: `git blame` fails outright on a revision it cannot resolve.
+32fb31d76f416d72db73bf4a4a8a4e9792c1f74b

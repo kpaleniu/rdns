@@ -1,38 +1,46 @@
 # rdns — TODO / Next Steps
 
 Working notes for picking this up cold. **`CLAUDE.md` is the companion to this
-file**: this one says what is left to do, that one says which mistakes this
-codebase has already made and the rules that follow from them. Read both before
-planning; the first rule in `CLAUDE.md` is why a green suite here has twice not
-meant what it looked like.
+file**: this one says where the work is and how to run it, that one says which
+mistakes this codebase has already made and the rules that follow from them.
+Read both before planning; the first rule in `CLAUDE.md` is why a green suite
+here has twice not meant what it looked like.
 
-**Starting cold, read in this order:** "Current state" for what works today —
-including where the work stopped, and the fact that **CI has never run**, which is
-why the test numbers there are given per platform — "How to run" for the commands,
-the four environment traps under "Verifying" (each has cost an hour) plus the Linux
-recipe beside them for anything `#[cfg(unix)]` or containerized, and then
-**"Where to pick up next"**, which lists every open item in one place in the order
-worth doing it and names the next one along with the file it is in. "Open work"
-holds the full finding behind each of those lines; the "Architecture" sections
-describe what exists and why it is shaped that way. Completed work is one line
-each under "Done so far" — the reasoning, RFC citations and verification for each
-piece are in its commit message, which is where to look rather than here.
+**Starting cold, read in this order:** "Current state" for what works today and
+what is unproven, "How to run" for the commands, the four environment traps under
+"Verifying" (each has cost an hour) plus the Linux recipe beside them for anything
+`#[cfg(unix)]` or containerized, and then "Where to pick up next". The
+"Architecture" sections describe what exists and why it is shaped that way — they
+are the part of this file that is not written down anywhere else. Finished work
+is one line each under "Done so far", pointing at the commit that carries its
+reasoning, RFC citations and verification.
 
-**The short version, if you read nothing else:** the operational shell is
-finished, and **#9 is closed in full** — the last performance item was measured
-rather than fixed, because the measurement said it was worth a tenth of a
-percent. What is open is one audit (**#12**, pre-authentication panics), which is
-where to start, and one stretch goal (#11, cache locality). Build and test with
-the four commands at the top of `CLAUDE.md`; `cargo bench -p rdns` is the fifth
-now. Nothing is half-applied and the tree is clean.
+**The short version, if you read nothing else:** **every numbered item on this
+page is closed.** The operational shell is finished; #9's five-way review went in
+full, its last performance item closed by measuring rather than fixing it; and
+#12's audit found no reachable panic and left a fuzzer behind to keep it that
+way. What is left is a stretch goal (#11), a feature nobody has scheduled (#10),
+and the first thing worth doing: **CI runs now, and its first run failed.** Build
+and test with the four commands at the top of `CLAUDE.md`; `cargo bench -p rdns`
+is the fifth. **Do not push** — commit locally and leave it; every push spends
+the owner's GitHub Actions minutes on a private repository. Nothing is
+half-applied and the tree is clean.
+
+**This file was cut from 6,067 lines to about a third of that on 2026-08-02**,
+when the last numbered item closed. What went was the full text of findings that
+are now fixed — 55 "original finding follows" blocks and a 2,435-line review
+section — because that reasoning is in three better places: the commit that fixed
+each one, the rules distilled in `CLAUDE.md`, and `git log -p TODO.md`, which
+still has every word of it. What was kept is what a cold reader cannot get
+elsewhere: how to run the thing, why it is shaped as it is, and which claims on
+this page turned out to be wrong.
 
 ---
 
-## Current state (last updated 2026-08-01)
+## Current state (last updated 2026-08-02)
 
 **Workspace** — five members, all on branch `main` (it was `master` until
-2026-08-01; the rename is why older commit messages and notes here say the other
-one):
+2026-08-01; the rename is why older commit messages say the other one):
 
 | crate     | what it is                                                        |
 |-----------|-------------------------------------------------------------------|
@@ -42,313 +50,111 @@ one):
 | `rdnsd`   | authoritative server — serves zone files over UDP and TCP in one process |
 | `rdnsr`   | recursive resolver with a caching layer; forwards on `--upstream` |
 
-**CI is written and has never run (corrected 2026-08-01).**
-`.github/workflows/ci.yml` describes build and test on Linux *and* Windows,
-clippy `-D warnings`, `cargo fmt --check`, a build on 1.95 exactly, `cargo deny
-check`, and a build of `--features dhat-heap`. All of that is accurate about the
-file. What the 2026-07-30 entry here claimed — *"CI runs all of this now"* — was
-not: **`git remote -v` is empty**, so there is nowhere for the workflow to run
-and no commit has ever been checked by it.
+**There is a remote, and CI has run at last (2026-08-01).** `origin` is
+The remote is **private**, and
+`.github/workflows/ci.yml` finally has somewhere to execute. Seven job-runs per
+push — `test` on Linux *and* Windows, plus lint, msrv, deny, image and features —
+of which the Windows leg bills at twice the rate against the free-tier allowance.
+`concurrency` with `cancel-in-progress` is set, so a second push abandons the
+first run rather than paying for both.
 
-The cost was not hypothetical. `rdnsd` **did not compile on Unix at all** from
-the day SIGHUP reloading was written until 2026-08-01, because the call needed a
-`StreamExt` nothing imported and the module is `#[cfg(unix)]` in a workspace
-developed on Windows. See the closed item under 9d. The reasoning that produced
-the wrong claim is left above rather than deleted, because it is the most useful
-thing on this page: the file asserting a property is not the thing that upholds
-it (`CLAUDE.md` §4).
+**Do not push from a session.** Commit locally and stop; the owner pushes when
+they choose to. This is why: the account has a cap, and a session that pushes on
+every commit spends it on runs nobody asked for.
 
-**Until there is a remote, the Linux half is checked by hand** — see "Verifying"
-below, which now has the Linux recipe. That Linux image **has docker now**, which is
-where the container image is built and run.
+**The first CI run failed, and the failure was the test's fault rather than the
+code's.** One job failed and one warning appeared across several; both are fixed
+locally and unpushed, and nothing was wrong with the code CI was checking. The
+Windows `build and test` job failed
+`a_reload_does_not_hold_the_write_lock_across_its_diffs` at 71% of samples locked
+out, where this machine measures 0.3% for the same code. `tokio::sync::RwLock` is
+fair, so `try_read` fails while a writer is merely *queued*: the metric was
+measuring scheduler wake latency, and its denominator was the sampler's own spin
+rate, which is not a clock. The test measures a window of *time* against a
+baseline diff it times on the machine it is running on now. Fixed and verified
+both ways under starvation (`59cc900`).
 
-**Where the work stopped (2026-08-01).** Branch `main`, working tree clean, the
-last four commits being #9e: three allocation items — the borrowing lookup key,
-the four sites after it, and reading a request's EDNS parameters without building
-the option list — and then the criterion harness, which closed the fifth by
-measuring it. #9d was closed the same day, so the operational shell — flags,
-logging, config file, metrics, control socket, graceful shutdown, readiness,
-image — is finished too. **What is left is one audit (#12) and one stretch goal
-(#11)**, and "Where to pick up next" names the first move and the file it is in.
+The warning was `actions/checkout@v4` targeting Node 20, bumped to `@v5` in the
+same commit. It showed up in several jobs' logs, one of which is named `licences
+and advisories` — **`cargo deny` itself passed.** Reading a job name as a
+description of its complaint is a mistake worth not repeating: the names here say
+what a job checks.
+
+**The reason CI mattered is on this page in the form of a mistake.** A
+2026-07-30 entry here claimed *"CI runs all of this now"* when `git remote -v`
+was empty; the claim was wrong for a month and the cost was not hypothetical —
+`rdnsd` **did not compile on Unix at all** from the day SIGHUP reloading was
+written until 2026-08-01, because the call needed a `StreamExt` nothing imported
+and the module is `#[cfg(unix)]` in a workspace developed on Windows. The
+reasoning that produced the wrong claim is kept rather than deleted, because it
+is the most useful thing on this page: the file asserting a property is not the
+thing that upholds it (`CLAUDE.md` §4).
+
+**The history was rewritten on 2026-08-01, so every commit hash changed.** Each
+message carried a `Claude-Session:` trailer holding a session URL — 118 of the
+150 commits — and they were stripped with `git filter-branch --msg-filter`. Only
+the messages changed: the tree at the old head and the tree at the new one are
+byte-identical. Any hash written down *outside* this repository is now dangling;
+inside it, the commit references in "Done so far" and the entry in
+`.git-blame-ignore-revs` were remapped by matching subjects, and every one
+resolves. The blame file is the one that would have failed loudly rather than
+quietly — `git blame` refuses a revision it cannot resolve.
 
 **Green as of the last commit**, on both platforms and checked on both:
 
 | | Windows | Linux |
 |---|---|---|
-| `rdns` lib | 617 | 620 |
+| `rdns` lib | 618 | 621 |
 | allocations | 1 | 1 |
+| no_input_panics | 1 | 1 |
 | `rdnsd` | 93 | **106** |
 | `rdnsr` | 3 | 3 |
-| **total** | **714** | **730** |
+| **total** | **716** | **732** |
 
-**The lib count fell by seven** when `bench.rs` lost the debug-build ops/sec
-floors that guarded nothing (#9e's last item). The measurement they were
-pretending to be is `cargo bench` now; the two floors that guard a *complexity
-class* stayed. Seven deleted tests is the second count drop in three commits and
-both were removals of things that looked like evidence and were not — which is
-the same rule as `CLAUDE.md` §1, applied to the suite rather than to a fix.
-
-**The allocations binary is one test now, and that is why the total went down**
-rather than up. It holds fourteen measurements; they were eight `#[test]`s
-holding a mutex across every body, which serialized the bodies but not
-*libtest's own* per-test work on its other threads. That work lands in whichever
-measurement is running, because the dhat profiler is global: one measurement read
-15 where it reads 7, on three runs in five on Linux and never observed on
-Windows. With one test there is one thread doing anything at all. See the note at
-the top of `rdns/tests/allocations.rs`; do not add a second `#[test]` there.
-
-Both columns are measured (the Linux ones through the Linux recipe below); the
-difference is the sixteen `#[cfg(unix)]` tests described next. The last nine on
-each side are `readiness` and the two `/readyz` tests in `metrics_server`.
+**Two of those single tests are worth more than their count suggests.**
+`allocations` holds fourteen exact measurements and `no_input_panics` runs 1,506
+mutated messages through the pre-authentication path — 1.4 million of them when
+soaked. A test count is a poor summary of a suite and this is where it shows.
 
 **Sixteen tests exist on Linux only**, and they are the ones a green Windows run
-says nothing about. Three are the old ones: two on the secret-file mode check and
-one on the private-key loader, and there are no mode bits on Windows to exercise
-them. The other thirteen are the control socket, which needs a Unix domain socket
-and so is `#[cfg(unix)]` in its entirety — `rdnsd`'s 93 on Windows compile none
-of that module.
+says nothing about: two on the secret-file mode check and one on the private-key
+loader (there are no mode bits on Windows), and thirteen for the control socket,
+which needs a Unix domain socket and so is `#[cfg(unix)]` in its entirety.
 
-`cargo clippy --workspace --all-targets` is clean with no exceptions and
-`cargo fmt --all --check` is clean, **on Windows**; the Linux image used for the
-Linux runs has no clippy package, so that half is unverified there.
-
-(`rdnsd`'s own tests cover argument validation, the config file, zone sources and the load policy,
-the UDP worker pool,
-the secondary role and EXPIRE across reloads, both directions of IXFR and onward
-announcement, answering a DO-bit query from a zone it signed itself, all four
-cases of RFC 1034 §4.3.2, the class and ANY handling from #9f, and a stop
-signal arriving mid-AXFR, a reload that must not block queries or the runtime,
-and a suppressed log line that must not build its message; `rdnsr` had
-**no test module at all** until #9c gave it one, and has three now — the third
-is its UDP in-flight ceiling.) The lib
-count fell from 578 to 567 when dead `serialization.rs` was deleted with its 11
-tests, and is at 617 now: #9e's, #9f's, graceful shutdown's, the metrics
-endpoint's and the readiness gate's tests, minus the seven that went with
-`telemetry.rs`.
-
-**The allocation counts are the same on both platforms**, which is worth one
-line because it is not obvious: `dhat` counts calls into the global allocator, so
-what it measures does not depend on whether glibc's malloc or Windows' heap is
+**The allocation counts are the same on both platforms**, which is worth a line
+because it is not obvious: `dhat` counts calls into the global allocator, so what
+it measures does not depend on whether glibc's malloc or Windows' heap is
 underneath. Every exact assertion in `rdns/tests/allocations.rs` (0, 1, 2, 2, 3,
 3 and 4) reads the same on the Linux side.
 
-**Errors are typed in the library and `anyhow` in the binaries (2026-07-28).**
-The convention used to run the other way round — `rdns` returned `anyhow::Error`,
-which erases the failure kind from its own API, while `rdnsd` and `rdnsr` used
-`Box<dyn Error>` and `Result<_, String>` and never called the `anyhow` they both
-declared as a dependency. `rdns::error` now holds six types (`WireError`,
+`cargo clippy --workspace --all-targets` and `cargo fmt --all --check` are clean
+**on Windows**; the Linux image used for the Linux runs has no clippy package,
+so that half is checked by CI now and was checked nowhere before.
+
+**Errors are typed in the library and `anyhow` in the binaries.** The convention
+used to run the other way round. `rdns::error` holds six types (`WireError`,
 `ZoneError`, `DnssecError`, `TransferError`, `ResolveError`, `ConfigError`) whose
 variants are the decisions a caller actually makes: truncated is FORMERR and
 unsupported is NOTIMP, a bogus signature is SERVFAIL and an unknown algorithm is
 insecure, a transfer timeout is retried and a malformed one is not. See
-`CLAUDE.md` §3; the reasoning is in the five commits.
+`CLAUDE.md` §3.
 
 **Green did not mean conformant, and the fix for that is `CLAUDE.md`.** The suite
 passed at 590 tests while `rdnsd` could not serve a CNAME, a delegation or a
 two-label wildcard, because the tests were written from the same understanding as
 the code — two of them asserted the wrong behaviour and cited an RFC section that
-says nothing about the subject. That is now the first rule in `CLAUDE.md`: assert
-what the RFC says and cite the section that says it, use the RFC's own worked
-example, and show a new regression test failing against the old behaviour before
-landing it. Every fix below was checked that way.
+says nothing about the subject. That is now the first rule in `CLAUDE.md`.
 
-**`rdnsd` serves an ordinary zone correctly now: #9a, #9b and #9c are closed.**
-CNAME chasing, referrals at a delegation with AA clear, wildcard synthesis to any
-depth, empty non-terminals as NODATA, the apex NSEC3 bitmap, and RFC 2308's
-negative TTL cap — plus the remote panic, the negative-TTL cache pin, the
-oversized-datagram process kill, the unbounded per-IP tables and the wall-clock
-underflows — plus, from #9c, a broken zone file failing the load instead of being
-skipped, EXPIRE surviving a SIGHUP, neither daemon answering a *response* or a
-non-QUERY opcode, and a CNAME-terminated negative answer having its denial
-checked rather than being handed out with AD set.
+**What the answer path costs now**, because it took three changes to find out and
+the numbers are the input to any future attempt: **13.7 allocations per query**
+for a plain query (down from 25.7), **20.7** for the query a real resolver sends
+(EDNS0, DO, a cookie). One whole answer — parse, look up, build, serialize — is
+**522 ns**, and the `sendto`+`recvfrom` pair around it is **3.6-4.1 µs**. So
+everything the benchmark suite measures is about 6% of what a query costs a
+server, and a 20% win anywhere in it is worth about 1% end to end. Read
+`rdns/benches/answer_path.rs`'s header before quoting any of it.
 
-**#9f is closed too (2026-07-28).** The conformance gaps
-went as a set: the class is checked at last (and a non-IN record no longer loads
-at all, which is what makes the class-blind index correct rather than untested),
-QTYPE=ANY answers with every RRset at the name and the signatures over them, an
-unknown QCLASS or RCODE round-trips instead of being folded onto a meaningful
-value, QNAME minimisation has RFC 9156's ceiling and asks for A rather than NS,
-a glueless IPv6-only delegation resolves, NOTIMP keeps the client's OPT, a
-truncated reply stops claiming AA, a transfer carries an OPT — and `rdnsc` can
-finally query the non-53 port this repo's own documentation tells you to develop
-against. On the performance side the `log_query` quadratic is gone (3.09M ops/sec
-where it managed 47k, and `bench_logger_throughput`'s floor is back up at 100k),
-responses no longer carry a 64 KB buffer into `send_to`, cache eviction is linear
-rather than O(n²), and name compression stores one copy of a name instead of one
-per suffix. What is left under #9 is **4 items, all of performance (9e)**, listed
-in the order worth doing under "Where to pick up next" below. The DHAT pass that was
-leading 9e is done, and its numbers are what the rest get judged against now,
-including one finding it turned up that nobody had guessed: the `tokio::spawn`
-per UDP datagram cost **1,536 bytes**, 46% of everything a query allocated.
-**That one is closed as of 2026-08-01** — see the next paragraph.
-
-**`rdnsd` no longer spawns a task per UDP datagram (2026-08-01), and `rdnsr`'s
-spawn is bounded at last.** This was the last correctness-and-safety item on the
-list and it was two items: an admission-control hole (TCP had two ceilings, UDP
-had none, and the rate limiter ran *inside* the spawned task, after the packet
-had been copied and the task paid for) and the largest allocation on the query
-path. The two daemons got opposite fixes because the work is opposite:
-`rdnsd` answers from memory in microseconds, so `--udp-workers` identical tasks
-share the socket and answer inline with no spawn at all; `rdnsr` waits seconds on
-the internet, so it keeps the task and takes a `--max-inflight-udp` permit before
-copying anything. Measured with DHAT over 1,000 queries against the same box,
-against a `HEAD` build rebuilt beside it: **7.45 MB in 34,487 blocks → 2.88 MB in
-31,574 blocks**, the 1,536-byte task site gone, and 996 responses built in 16
-scratch buffers instead of 996. The cost is stated with it: peak live memory goes
-118 KB → 1.19 MB, which is sixteen workers holding sixteen 64 KB receive buffers.
-
-**There is a control channel (2026-08-01), which closes the last of the
-operational shell but one.** `--control-socket` and a fifth binary, `rdnsctl`:
-`status` answers three of the four 3am questions the finding listed that had no
-answer from outside the box at all, and `reload` answers the fourth by *reporting
-its result* — a typo in a zone file gets `exit 1` and `the reload failed and the
-zones already loaded are still being served: line 8: SOA record needs 7 fields,
-got 0`, where `kill -HUP` said nothing. A Unix socket at mode 0600 and no TCP
-option, which was settled by reading Knot, PowerDNS, Unbound, BIND and NSD: the
-ones on TCP all authenticate, and nobody ships an open control port. Unix only,
-and refused rather than ignored on Windows.
-
-**Six 9d items are closed with them.** The query rate limiter was hardcoded at
-~10 q/s per source and dropped over it in silence — it has flags now, a default a
-hundred times higher, and an exemption list, measured live at 60 answers to a
-60-query burst where the finding recorded 20. And **both daemons stop
-gracefully (2026-07-29)**: there was no SIGTERM handler of any kind, so
-`systemctl stop` cut an in-flight AXFR mid-stream and the client could not tell a
-truncated transfer from a complete one. `rdns::shutdown` is shared by both,
-because both had the same hole and the same detached-`JoinHandle` bug underneath
-it. That also unblocks 9e's DHAT item, which needs a process that returns from
-`main` in order to write its report at all.
-
-**And the observability story changed shape (2026-07-29).** `telemetry.rs` and
-its OpenTelemetry stack are deleted — `Cargo.lock` drops from **187 packages to
-104**, since an OTLP exporter that was never initialised was carrying `tonic`,
-`prost`, `hyper` and `h2` into a DNS daemon. What replaces it is what DNS shops
-actually run: `metrics.rs`'s counters, which had been referenced only by a
-benchmark, wired into `rdnsd` and served as Prometheus text on
-`--metrics-listen` — with a latency histogram, a `/healthz`, and the two per-zone
-gauges an operator asks for by name: which serial is being served, and when this
-replica was last in contact with a master.
-
-**Ready is a different question from alive, and there is an image (2026-08-01).**
-`GET /readyz` on the same listener as `/metrics` is 503, naming the zones, until
-every `--secondary` zone has transferred at least once; `/healthz` stays
-liveness-only. A **primary** is ready as soon as it is alive — its zones are
-loaded, signed and verified before `serve` binds anything — so the state this
-exists for is a cold **secondary**, which listens and answers REFUSED until a
-master answers. The latch is one-way: every replica of a zone expires in the same
-second, so readiness that followed EXPIRE would empty the rotation rather than
-shrink it (`rdns/src/readiness.rs` argues it). The `Dockerfile` runs unprivileged
-on 5353, is 31 MB, and its build context is an allowlist with **no `.git` in it** —
-the version stamp comes in through `RDNS_GIT_DESCRIBE` instead. Both were run for
-real, two containers on a docker network with the secondary started first; see
-#9d's last item for the table.
-
-**There is a config file now (2026-07-30), and it is the only way to set anything
-per zone.** `--config <file>` reads TOML with `deny_unknown_fields` on every
-table, so a mistyped `require-signd = true` fails at startup with a line number
-instead of serving unsigned zones quietly. The file and the individual flags are
-**mutually exclusive on purpose** — `--config` with `--port` is a clap error, not
-a precedence rule, because every precedence rule is one somebody has to remember
-at 3am. A TSIG key's secret goes in a file of its own (`secret-file`), which is
-mode-checked on Unix and refused if it is group- or world-readable; that takes the
-base64 out of `argv`, where `ps aux` and the systemd unit could both read it.
-`[zones."name"]` carries per-zone signing overrides as `Option`s, so absent means
-*inherit* rather than "the default", and the re-signing timer follows the
-**shortest** validity of any zone. `--check-config` is a real dry run: it returns
-after every zone has loaded, been signed and been verified, and before any socket
-is bound. Cost: nine crates, lock 104 → 113.
-
-**One fix in #9c was a fix to a previous fix.** Closing "an unreadable zone
-directory silently unloads every zone" (2026-07-27) also broke a secondary's
-first start, because the commit asserted a property of `enumerate_zone_files` —
-that it returns `Ok(empty)` for an empty directory — that was simply not true of
-the code. The claim went into a commit message, a doc comment and this file
-unchecked, and no test covered the case. It is written up under #9c rather than
-edited away; see also `CLAUDE.md` §4.
-
-**Steps 1–5 of #7 are done: `rdnsd` replicates in both directions, incrementally
-at both ends, and cascades.** It transfers a zone from a master, serves it, writes
-it down, refreshes it on the zone's own timers, acts on a NOTIFY *and sends one
-onward*, withdraws a zone past EXPIRE, answers an IXFR with just the difference,
-and takes one. Verified as a three-node tree where a change at the primary reaches
-the bottom in seconds rather than at the next refresh. See "Architecture: the secondary role" and "Architecture:
-incremental transfer".
-
-**Only step 6 is left under #7, and it is explicitly conditional** — persisted
-deltas matter when dynamic UPDATE (RFC 2136) arrives and not before, because that
-is what makes a journal the source of truth rather than a cache of one. **RFC 2136
-itself has no entry anywhere and never did** — it appears in this file and in
-`ixfr.rs` only as the reason for deferring the journal. That circularity is
-written down now as #10; it is not scheduled, but it is at least visible.
-
-**`rdnsd` signs zones now, and #2 is closed with it.** It generates its own keys,
-signs every zone it holds keys for as that zone loads, and answers a DO-bit query
-with the signatures and the denials that go with it — including the two an
-answer *owes* rather than merely carries: a wildcard answer with a denial of the
-name asked for, and an NXDOMAIN with a denial of the wildcard that could have
-answered it. Verified against **dnspython**, which validated every RRset it was
-served under both NSEC and NSEC3. See "Architecture: signing a zone".
-`dnssec_validation_mode` is called at last: every signature in a zone is checked
-against the zone's own keys before anything is served from it, and `--require-signed`
-turns "this zone is not signed" into a refusal to start.
-
-**#8 is closed as of 2026-07-30.** Signatures are re-made on a timer at a third
-of the validity, expiry is spread over a fifth of the window so a zone degrades
-on a slope instead of expiring as one cliff, and the served SOA serial is
-`file_serial + hours_since_epoch` — BIND's "the number served is not the number in
-the file" shape, with the clock standing in for the journal we do not have. The
-comparison with BIND, Knot, PowerDNS and NSD that settled the serial question is
-written out under #8. Plus #1's two aggressive-use
-extensions, and #6, a candidate rather than a plan.
-
-**A five-way code review (2026-07-27) found rather more, and #9a/#9b are the part
-that is now fixed (2026-07-28).** The headline was that the *answer path* was
-missing three of the four cases in RFC 1034 §4.3.2: no CNAME chasing, no referral
-at a delegation (#8's third bullet, confirmed and worse than recorded — the
-NXDOMAIN went out with AA=1), and wildcard synthesis reaching exactly one label
-instead of walking to the closest encloser. On a signed zone the wildcard bug
-failed *closed*, so a signed zone with a wildcard SERVFAILed at every validator
-for every non-existent name two or more labels deep. There was also an
-unauthenticated remote panic in the wire parser (RDLENGTH sliced without a bounds
-check). All of that is closed with regression tests that fail against the old
-behaviour. The cryptographic and protocol-state work — DNSSEC verification, TSIG,
-NSEC3 iteration caps, RFC 5011, serial arithmetic — came through clean; see #9's
-preamble for the full list of what was cleared.
-
-**Two claims made further down this file were wrong, and #9 corrects them.** They
-are left in place with pointers rather than quietly edited, because the reasoning
-that produced them is the interesting part:
-
-- The wildcard rule that used to be cited at `zone.rs:319`, `dnssec_answer.rs:369`
-  and in "Architecture: aggressive use" below — *"a wildcard covers one label and
-  only one (RFC 4592 §2.1.1)"* — is a **misreading**. §2.1.1 is about `*` being
-  special only as the leftmost label in zone-file *syntax*; §3.3.2's worked
-  example synthesizes two labels down. Two tests (`zone.rs:1251`, `:1287`)
-  asserted the wrong behaviour and cited the same misreading, so **fixing the code
-  meant fixing those tests** — a green suite was not evidence here. The code
-  comments and both tests are corrected as of 2026-07-28; the "Architecture:
-  aggressive use" paragraph below still says it, and is marked there.
-- The flaky-benchmark note below blames competing load. It was not: `log_query`
-  is O(queries-in-window) per query (`logging.rs:80`), measured at 469 ns → 19.4 µs
-  as the window fills, which caps the whole server at ~23k qps. Lowering the
-  floor from 45k to 10k ratified a real regression the benchmark had caught. See
-  #9e.
-
-**The flaky test is fixed.** `bench::bench_logger_throughput` asserted
-`>45k ops/sec` against a measurement of 47–50k, so any competing load failed the
-suite; the floor is 10k now, which still catches an order-of-magnitude
-regression. (**Superseded — see #9e**: the measurement was falling because of a
-quadratic in `log_query`, not because of competing load. Fix the quadratic and
-the floor should go back up.) **The quadratic is fixed and the floor is back up,
-2026-07-28** — to 100k, not the original 45k, because a floor set at what an idle
-machine measures is what made it flaky to begin with; the debug measurement is now
-3.09M. The floor is the weaker guard of the two either way: the assertion that
-actually catches this class coming back is a *ratio* — cost independent of how
-much has already been logged — for the reason in `CLAUDE.md` §10. The other
-benches keep their floors —
-`bench_zone_lookup`'s is a factor of ten under what it measures, which is the
-rule to follow when adding one. A wall-clock assertion with no headroom is a coin
-toss, not a test.
+---
 
 ### How to run
 
@@ -437,6 +243,13 @@ cargo run --release -p rdnsd --features dhat-heap -- --port 15353 --zone-file ex
 # allocator does not slow the other unit tests. One `#[test]` holding fourteen
 # measurements, on purpose — `--nocapture` is how you read them.
 cargo test -p rdns --test allocations -- --nocapture
+
+# Mutated wire data through everything a stranger's bytes reach before anything
+# has authenticated them. 1,506 cases in the suite; these are the soak. Debug on
+# purpose — overflow panics in debug and wraps in release, so a release run
+# would pass the arithmetic class this is looking for.
+RDNS_FUZZ_ITERATIONS=120000 cargo test -p rdns --test no_input_panics -- --nocapture
+RDNS_FUZZ_SEED=7 cargo test -p rdns --test no_input_panics
 
 # What a query costs in *time*, on optimized code. Read the header of
 # `rdns/benches/answer_path.rs` first: one whole answer is ~0.5 µs and the
@@ -568,12 +381,14 @@ Windows — it reports "No response from server" even when the server replied.
 Probe with a raw `System.Net.Sockets.UdpClient` in PowerShell and read the
 bytes; that is how the "verified live" claims here were checked.
 
-### Running the Linux half, by hand until there is a remote
+### Running the Linux half by hand
 
-There is no CI (see "Current state"), and this is a Windows machine, so anything
-`#[cfg(unix)]` is invisible here — that is how `rdnsd` went months without
-compiling on Unix. **The Linux image has a full toolchain** (cargo,
-rustc, gcc) and is where the Linux numbers in this file come from:
+CI covers this now, but a session still cannot push (see "Current state"), so
+this is how the Linux half gets checked before a commit rather than after one.
+This is a Windows machine, so anything `#[cfg(unix)]` is invisible here — that is
+how `rdnsd` went months without compiling on Unix. **The Linux image
+has a full toolchain** (cargo, rustc, gcc) and is where every Linux number in
+this file comes from:
 
 ```sh
 # Copy the tree in. Excluding target/ matters: it is large, and a Windows
@@ -584,9 +399,9 @@ rm -rf "$SCRATCH" && mkdir -p "$SCRATCH" \
 cargo build --workspace --all-targets && cargo test --workspace
 ```
 
-**That image also has docker** (29.6.2), which is where the container image is
-built and exercised — see #9d's last item for what was run. The user is in
-`wheel` and not `docker`, so every command needs `sudo -n`:
+**That image also has docker** (29.6.2), which is where the container image was
+built and exercised before CI's `image` job existed to do it on every push. The
+user is in `wheel` and not `docker`, so every command needs `sudo -n`:
 
 ```sh
 sudo -n docker build -t rdns:local \
@@ -718,3024 +533,175 @@ Four environment traps that have each cost an hour:
 
 The numbers are **stable identifiers, not reading order.** They are referenced
 from the code (`ixfr.rs:16` points at "#7 step 6") and from each other, so they
-are never renumbered — sections get moved instead. Everything still open is
-below, roughly in the order worth doing it; closed sections keep their reasoning
-under "Closed work" further down.
+are never renumbered.
 
-| # | what | open |
-|---|------|------|
-| **9** | what the five-way code review turned up | **0** — 9a, 9b, 9c, 9d, **9e** and 9f are all closed. The last item was closed by measuring it rather than fixing it |
-| **8** | what signing turned up | **0** — the re-signing timer and its serial are done |
-| **7** | the secondary role | **1**, and conditional |
-| **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
-| **11** | data layout and CPU cache friendliness | **0** — a stretch goal; blocked on a measurement this machine cannot make |
-| **12** | pre-authentication panics | **1** — an audit with no known defect behind it, opened because #9d changed what a panic costs |
-| **5** | smaller open items | **0** |
+**Everything numbered is closed.** What each was, and where its reasoning now
+lives — the commit that closed it, and the rule it became in `CLAUDE.md`:
 
-### Where to pick up next
+| # | what it was | closed |
+|---|---|---|
+| **1-4, 6** | recursor, DNSSEC and NSEC3 follow-ups, zone lookup, special-use names | see "Closed work" below |
+| **5** | smaller items: AXFR, TSIG, NOTIFY, IXFR, amplification, negative caching, `$INCLUDE`, TXT framing | all done; see "Done so far" |
+| **7** | the secondary role, in six steps | 5 of 6 done; step 6 (persisted deltas) waits on #10 and is the one unchecked box in this file |
+| **8** | what signing turned up — the re-signing timer and its serial | done |
+| **9** | what a five-way review found: 48 defects in six groups (9a-9f) | **all done, 2026-07-27 → 2026-08-01.** The patterns became `CLAUDE.md`, which is the useful artefact; the 2,435 lines of finding text are in `git log -p TODO.md` |
+| **10** | dynamic UPDATE (RFC 2136) | **not scheduled.** The largest feature not on this list, estimated 1.5-2 weeks; #7 step 6 waits on it |
+| **11** | data layout and CPU cache friendliness | **a stretch goal, not scheduled.** Its measurement harness exists now (criterion, `--baseline`); what it still lacks is the *diagnostic* half — `perf stat`'s cache-miss and branch-miss counters, which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns) is the number it would have to move |
+| **12** | pre-authentication panics | **audited 2026-08-01.** No reachable panic in 1.4M mutated inputs; two mutex-poisoning fixes; `rdns/tests/no_input_panics.rs` left behind as the guard |
 
-Every open item in one place, in the order worth doing it. Each line points at the
-full finding below, which has the file, the line number and the reasoning; **read
-that before starting**, because several have already been half-fixed by something
-else and the finding says which half.
+**What the letters mean**, because comments in the code and lines further down
+this page still name them and the sections they named are gone:
 
-> **Next is #12**, the audit of what a stranger can panic before authenticating.
-> It is the only open item with a defect possibly behind it, and its cost went up
-> on 2026-08-01 when `rdnsd` stopped spawning a task per datagram: a panic on the
-> answer path used to be swallowed by the task and now ends the process. Read
-> §12; the fastest first move it names is a `proptest` over
-> `DnsMessage::try_from_bytes` asserting only "no input panics", which needs no
-> oracle and would have caught the RDLENGTH slice on the first hundred inputs.
->
-> **All of #9 is closed** (2026-08-01). The answer path went from **25.7
-> allocations per query to 13.7** across three changes; a query as a real
-> resolver sends it — EDNS0, DO, a cookie — went from 24.7 to 20.7. Then the
-> criterion harness landed and closed the last item by **measuring** it: the
-> DNSSEC canonicalization rebuild is 102 ns per record against 31 µs of ECDSA,
-> and does not usually happen at all, so it is not worth fixing. The numbers are
-> in the closed checkboxes under 9e.
->
-> **Read `benches/answer_path.rs`'s header before quoting anything from it.** One
-> whole answer is 522 ns and one `sendto`+`recvfrom` pair is 4 µs, so the entire
-> benchmark suite covers about 6% of what a query costs — which is the context
-> that stops a 20% win in it being reported as a 20% win.
->
-> **What item 11 declined, and why it is not an oversight.**
-> `make_response`'s `msg.queries.clone()` — 2 of the remaining 13.7 — was on its
-> list and stayed. Moving the question out of the request instead of copying it
-> means `make_response` taking the request by value, and the UDP path still needs
-> it afterwards: `truncated_reply` builds the TC=1 reply from the *client's* EDNS
-> payload size, which the response does not carry. That is the same "who owns the
-> request" question as `resolve_in_zone`'s `qname.to_string()` (1 more), and both
-> want answering together or not at all.
->
-> **The operational shell is finished.** Items 1-8 and 10 all closed on
-> 2026-08-01 and are struck through below rather than deleted, because each says
-> what was actually done and five of them reversed or narrowed the fix the
-> original finding proposed. The numbers are positions other lines refer to, so
-> they are never reused.
->
-> **And read #12 first.** It is the audit of what a stranger can panic before
-> authenticating. It is not on the numbered list only because it has no known
-> defect behind it — but its *cost* changed on 2026-08-01, when `rdnsd` stopped
-> spawning a task per datagram: a panic on the answer path used to be swallowed
-> by the task and now ends the process.
+| | |
+|---|---|
+| **9a** | the answer path missing three of RFC 1034 §4.3.2's four cases — no CNAME chasing, no delegations, one-label wildcards |
+| **9b** | wire-input safety: the RDLENGTH slice, the `i32` TTL widened to `u64`, the oversized-datagram kill switch |
+| **9c** | error handling that degraded quietly: a broken zone file skipped rather than failing the load, EXPIRE lost across a SIGHUP, a response answered as a question |
+| **9d** | the operational shell: flags, log levels, config file, metrics, control socket, graceful shutdown, readiness, container image, the rate limiter's units |
+| **9e** | performance: the DHAT pass and everything it found — allocations per query, the criterion harness, and the two items closed by measuring rather than fixing |
+| **9f** | smaller conformance gaps: the class check, QTYPE=ANY, unknown QCLASS/RCODE round-tripping, QNAME minimisation's ceiling, `rdnsc` on a non-53 port |
 
-**Correctness and safety first** — these can lose data or serve a wrong answer:
+**The three findings on this page that were wrong, kept because the reasoning is
+the useful part** (`CLAUDE.md` §11 — correct in place, never quietly):
 
-1. ~~**A zone diff runs while the zone-map write lock is held**~~ (9d) — **done
-   2026-08-01.** Planned under the read lock, recorded under the write lock, with
-   a generation counter deciding whether a plan survived the gap; 99.5% of
-   sampled queries were locked out during a reload before, ~0.3% after.
-2. ~~**Blocking I/O and a full zone parse-and-sign run on the tokio runtime**~~
-   (9d) — **done 2026-08-01.** The reload is on `spawn_blocking`,
-   `load_zones_from_source` is honestly sync, and the state write happens after
-   the mutex guard is dropped rather than across the fsync.
-3. ~~**Private key permissions unchecked on read**~~ (9d) — **done 2026-08-01.**
-   One `persist::ensure_private` for both the TSIG and DNSSEC paths, and the
-   write now restricts the temporary file before the rename rather than the
-   target after it. Verified on Linux.
-4. ~~**A malformed-packet flood becomes a disk fill and a global lock convoy**~~
-   (9d) — **done 2026-08-01.** `tracing` with real levels and `--log-level` /
-   `--quiet` on both daemons; nothing per-packet above `debug`. Measured: 50
-   malformed datagrams, 0 log lines at the default level. No in-process rate
-   limiter — journald's per-unit one is in the README's unit instead.
-5. ~~**Unbounded `tokio::spawn` per UDP datagram**~~ (9d) — **done 2026-08-01,
-   with item 10**, which was the same call site seen from the allocation side.
-   `rdnsd` stopped spawning per datagram altogether — a fixed pool of workers
-   answers inline, which is both the bound and the cheaper shape — and `rdnsr`
-   kept its spawn and bounded it, because a recursion is seconds of waiting where
-   an authoritative answer is microseconds. Measured over 1,000 queries:
-   7.45 MB → 2.88 MB, and the 1,536-byte task site is gone.
-
-**Then the operational shell** — visible gaps a deployment will hit:
-
-6. ~~**No `--user`/`--group`**~~ (9d) — **closed 2026-08-01 as won't-fix.** The
-   service manager sets the identity, and `User=` plus an ambient capability is
-   stronger than a setuid drop rather than equivalent to it. The number is kept
-   rather than reused because these positions are referenced from each other.
-7. ~~**No control channel**~~ (9d) — **done 2026-08-01.** `--control-socket` and
-   `rdnsctl`: `status`, `reload` that says whether it worked, `dump <zone>`. A
-   Unix socket at mode 0600 because that is what Knot, PowerDNS and Unbound do
-   and because the TCP ones all authenticate; no per-zone reload, because a
-   reload is the whole set or nothing.
-8. ~~**No container image / no readiness signal**~~ (9d) — **done 2026-08-01**,
-   and the finding's own description of the not-ready state was wrong in a way
-   worth keeping: "bound but still parsing 40 zones" does not happen here.
-   `rdnsd` loads, signs and verifies every zone *before* `serve` binds anything,
-   so a **primary** is ready the moment it is alive. The state that does exist is
-   a **secondary**'s: `withdraw_unvouched_zones` removes every replicated zone
-   whose age cannot be vouched for, and the server then listens and answers
-   REFUSED for those names until the first transfer lands. `rdns::readiness` is
-   the gate, `GET /readyz` on the metrics listener reports it (503, naming the
-   zones), and it is a one-way latch — see the module docs for why following
-   EXPIRE would take every replica out of rotation at the same second.
-
-**Then performance (9e).** The DHAT pass is done and its numbers decide the order:
-
-9. ~~**`zone::absolutize` allocates four `String`s per query**~~ — **done
-   2026-08-01.** `Cow<str>` out of `absolutize`, `normalize_name`, `lookup_key`
-   and `origin_key`, and `HashMap<String, _>::get` taking a `&str` on the other
-   side, so an ordinary query reaches the index without allocating at all.
-   Measured over 1,000 UDP queries against a rebuilt `HEAD` beside it:
-   **25,715 blocks → 20,712**, five per query, and the site is gone from the
-   profile.
-10. ~~**`tokio::spawn` costs 1,536 bytes per datagram**~~ — **done 2026-08-01**
-    with item 5, and it took the per-response buffer with it: 996 responses now
-    build in 16 buffers rather than 996.
-11. ~~**Three more per-query allocation sites**~~ — **done 2026-08-01**, two of
-    the three plus the fourth that turned up while closing item 9, and one
-    declined with its reason (`msg.queries.clone()`; see the blockquote above).
-    **20,712 blocks → 13,707** over the same 1,000 queries. The zone-selection
-    one was a correctness fix as well: it folded case with Unicode
-    `to_lowercase`, so a query differing from a zone's name only by U+212A got
-    that zone's NXDOMAIN with AA set (`CLAUDE.md` §8).
-12. ~~**EDNS is re-parsed two to four times per query**~~ — **done 2026-08-01.**
-    `DnsMessage::edns_header` checks the option list without building it and
-    hands back the three fields the answer path actually reads, so both daemons
-    read the client's OPT once. Measured with the probe a real resolver sends
-    (EDNS0, DO, a cookie): **24,707 blocks → 20,707** over 1,000 queries, four
-    per query, and both `parse_options` sites are gone from the profile.
-13. ~~**DNSSEC canonicalization is rebuilt per candidate RRSIG**~~ — **closed
-    2026-08-01 as not worth doing**, by the harness in item 14 on its first run.
-    `verify_rrset` returns on the first signature that verifies, so the rebuild
-    does not usually happen at all; and the same RRset verified at 1 and at 20
-    records costs 31.03 µs and 32.78 µs, which puts canonicalization at 102 ns
-    per record against 31 µs of ECDSA. A tenth of a percent, on a path only the
-    resolver takes.
-14. ~~**`bench.rs` measures debug builds**~~ — **done 2026-08-01.**
-    `rdns/benches/answer_path.rs`, criterion, fourteen benchmarks against the
-    release profile with baseline comparison. It closed #13 immediately and gave
-    #11 the harness it was waiting for. Seven `bench.rs` floors that guarded no
-    complexity class went with it; the two that do stayed.
-
-**Now the only scheduled item:** #12, an audit of what a stranger can panic
-before authenticating. It has no known defect behind it — but its *cost* changed
-on 2026-08-01, since a panic on the UDP answer path used to be swallowed by the
-spawned task and now ends the process.
-
-**Not scheduled, and deliberately:** #7 step 6 (persisted deltas) waits on #10
-(dynamic UPDATE), which nothing schedules; #11 (cache locality) is a stretch goal
-and is wanted — it is on the list because it was asked for, not because a
-measurement demanded it. Its prerequisite is met now (item 14), so what remains
-is the *diagnostic* half: `perf stat`'s cache-miss and branch-miss counters,
-which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns)
-is the number it would have to move, and criterion's `--baseline` can now judge
-whether it did.
+- *"CI runs all of this now"* (2026-07-30), while `git remote -v` was empty. See
+  "Current state"; the cost was `rdnsd` not compiling on Unix for a month.
+- *"`enumerate_zone_files` already returns `Ok(empty)` for an empty directory"*,
+  which went into a commit message, a doc comment and this file without anyone
+  reading the twenty lines that would have settled it. It returned `Err`, and a
+  secondary pointed at an empty directory then refused to start.
+- *"the profiler is global, so every test now holds the mutex for its whole
+  body"* — true and insufficient. A mutex in a test file cannot serialize
+  libtest's own bookkeeping on its other threads, which is why
+  `rdns/tests/allocations.rs` is one `#[test]` today.
 
 **One decision is the copyright holder's, not a bug:** the manifests say
 `MIT OR Apache-2.0` and the repository ships only an MIT `LICENSE`. Either add
 `LICENSE-APACHE` or narrow the manifests. `cargo deny` passes either way.
 
-### 9. What a five-way code review turned up (2026-07-27)
-
-A review of the whole workspace from five angles at once — security, Rust,
-low-level/wire, DNS protocol conformance, and operating it. Everything below was
-confirmed by reading the code or by running it; where a claim was checked by
-execution it says so. Ordered by what to fix first, which is **not** the order of
-severity: #9a is what stops this being a correct authoritative server at all.
-
-**What the review cleared**, because it says where effort does *not* need to go:
-DNSSEC signature verification has no bypass path, DS→DNSKEY binding is by digest,
-TSIG MACs are constant-time (`ring::hmac::verify`), checked before any state
-change, reject truncation, and cannot be algorithm-downgraded; NSEC3 iterations
-are capped per RFC 9276 (the CVE-2023-50868 class is closed); the resolver's
-spoofing entropy is sound (per-query random id, fresh ephemeral socket,
-`connect()` filtering, 0x20 on by default); compression pointers are
-cycle-detected and depth-capped; RRSIG label counting, the extended-RCODE split,
-NSEC3 opt-out semantics, RFC 1982 serial arithmetic, AXFR SOA bracketing and
-IXFR's fallback detection are all correct. Clippy is clean workspace-wide.
-
-The pattern worth carrying into the fixes: **the hard cryptographic and
-protocol-state work is right; the plain-DNS answer path and the operational shell
-are where it breaks.** The bugs cluster where the problem looked too simple to get
-wrong.
-
-#### 9a. The answer path is missing three of RFC 1034 §4.3.2's four cases
-
-**All six are done, 2026-07-28.** `rdnsd` walks the four cases of RFC 1034 §4.3.2
-in the order the RFC gives them — `resolve_in_zone` returns one of referral,
-answer, negative, or chain-left-zone, and `make_response` renders each. `Zone`
-gained the two lookups the walk needs and did not have: a closest-encloser walk
-shared by `query` and `name_exists`, and a `delegation_for` that says where the
-zone's authority stops. Verified with 14 new tests in `rdnsd` (`mod answer_path`,
-plus three signed ones) and 5 in `zone.rs`; the signed side is judged with
-`verify_rrset`, `proves_wildcard_expansion`, `proves_no_ds` and `proves_nodata`
-rather than by inspection. Each original finding follows, since the analysis is
-what makes the fix reviewable.
-
-**Verified live against dnspython, under NSEC and NSEC3, 2026-07-28** — the whole
-point being that our parser agreeing with our serializer proves nothing. dnspython
-validated the CNAME chain RRset by RRset, the secure referral's DS, the insecure
-referral's signed denial of DS, the three-label wildcard answer (RRSIG label count
-lower than the name's, with the denial of the queried name beside it), the NODATA
-proof at an empty non-terminal, and the two-denial NXDOMAIN; it also confirmed
-AA=0 on both referrals, no RRSIG on either delegation's NS RRset, in-bailiwick
-glue only, SOA TTL 300 rather than 3600, and — on the NSEC3 zone — that
-`example.com. NSEC3PARAM` now returns the signed record instead of a signed NODATA
-proof for a type that is present. The probe scripts were session-local; the recipe
-is in "Verifying, and one trap that invalidates it" above.
-
-**Two tests had to be deleted or inverted to land this, which is the finding
-inside the finding.** `zone.rs:1251` and `:1287` asserted the one-label rule and
-cited the misreading; they are now `test_a_wildcard_synthesizes_at_any_depth` and
-an inverted assertion, both citing RFC 4592 §3.3.2's worked example. The whole
-suite was green while the server could not serve a CNAME, a delegation or a
-two-label wildcard. See `CLAUDE.md` §1.
-
-- [x] **No CNAME chasing** — **done.** `resolve_in_zone` follows the alias while
-      it stays in the zone and stops with the partial chain and NOERROR when it
-      leaves, bounded by a visited set and `MAX_CNAME_HOPS`. A CNAME *query* is
-      answered by the CNAME rather than followed. RFC 1034 §3.6.2 is enforced at
-      load: `zone::check_cname_exclusivity` refuses a CNAME sharing its owner
-      with anything but RRSIG/NSEC/NSEC3 (RFC 4035 §2.5), because there is no
-      correct answer for that shape and two servers reading the same file would
-      pick differently. Original finding: (`zone.rs:238`, `rdnsd/src/main.rs:290`). `of_type`
-      filters strictly on `record_type_code(&r.rdata) == qtype`, and
-      `make_response` branches only records-or-negative. A zone holding
-      `www IN CNAME host.example.com.` answers `www.example.com. A` with an empty
-      NOERROR + SOA — the wire encoding of "this name has no A record". Every
-      CNAME in every zone this server loads is dead: `getaddrinfo` fails, and
-      BIND/Unbound cache the NODATA and never follow the alias. RFC 1034 §4.3.2
-      step 3a: copy the CNAME into the answer, change QNAME to the target, and go
-      back to step 1. Loop while the chain stays in this zone; if it leaves,
-      stop with NOERROR and the partial chain — **not** NXDOMAIN. While here,
-      enforce RFC 1034 §3.6.2 at load: a CNAME must be the only type at its owner
-      (except RRSIG/NSEC/NSEC3, RFC 4035 §2.5).
-- [x] **No delegation handling** — **done**, and with it #8's third bullet.
-      `Zone::delegation_for` finds the deepest non-apex NS RRset at or above the
-      qname; `refer_to_child` emits `authoritive = false`, the NS RRset in
-      authority, in-bailiwick glue only in additional, and — with DO —
-      `dnssec_answer::delegation_proof`, which is the DS with its RRSIG or the
-      signed denial that there is one (including the opt-out closest-encloser
-      pair). A DS query *at* the cut is answered authoritatively from the parent.
-      No SOA: a referral is not a negative answer. Original finding:
-      `response.authoritive` is hardcoded `true`
-      at `rdnsd/src/main.rs:203` and cleared only for REFUSED/NOTIMP, so the
-      NXDOMAIN goes out with **AA=1**. Per RFC 8020 every resolver then caches
-      "the whole subtree does not exist" and the child zone is off the internet
-      for the negative TTL. RFC 1035 §4.1.1 requires AA **clear** on a referral.
-      Fix with #8's bullet: walk from the qname up to (not including) the apex for
-      an NS RRset; if found, emit `authoritive=false`, the NS RRset in authority,
-      in-bailiwick glue in additional, and — with DO — the DS + RRSIG or the
-      NSEC/NSEC3 denying DS (RFC 4035 §3.1.4). A DS query *at* the cut is the
-      exception: answer it authoritatively from the parent.
-- [x] **Wildcard synthesis reaches exactly one label** — **done.**
-      `Zone::name_kind` walks up to the closest encloser and synthesizes from
-      `*.<encloser>` and only from there (RFC 4592 §3.3.1); an existing name,
-      empty non-terminal included, ends the search (§4.4); a delegation between
-      the encloser and the apex means no synthesis at all (§2.2.1). The result is
-      a three-way `NameKind` rather than a bool, because `negative_proof` needs to
-      know *which* wildcard matched in order to prove anything about it —
-      recomputing it as "first label replaced by `*`" was the second half of this
-      bug. The signed case is the regression test that matters:
-      `a_deep_wildcard_answer_verifies_and_proves_its_own_expansion` fails closed
-      against the old code under both chains. Original finding: (`zone.rs:324`).
-      `wildcard_for` is a single `split_once('.')` with `*` prepended. RFC 4592
-      §3.3.2's worked example synthesizes `_telnet._tcp.host1.example.` from
-      `*.example.` — two labels down. Confirmed by running it: with `* IN A` at
-      the apex, `query("a.b.example.com.", A)` returns 0 records where the RFC
-      says 1, and `name_exists` says false where it must say true.
-
-      **On a signed zone this fails closed, which is worse.**
-      `dnssec_answer::wildcard_denial` computes the closest encloser correctly,
-      then asks `nsec_covering("*.example.com.")` — but that name is itself in the
-      chain, so the strictly-less-than range lookup returns the record *before* it
-      and nothing covers it. Confirmed: the prover returns `NotProved` for both
-      NSEC and NSEC3. So **a signed zone with a wildcard SERVFAILs at every
-      validator for every non-existent name two or more labels deep.**
-
-      The fix is a closest-encloser walk shared by `query` and `name_exists`:
-      find the deepest existing ancestor, and if `*.<that>` exists and the qname
-      does not, synthesize from it. Add RFC 4592 §2.2.1 (no synthesis at or below
-      a delegation — `zone_signer::Layout` already computes `is_delegation` and
-      `occluded`) and §4.4 (an existing name, including an empty non-terminal,
-      stops the search).
-
-      **Three comments and two tests encode the wrong rule and must change with
-      the code**, or the next reader re-derives the bug from them: `zone.rs:319`,
-      `dnssec_answer.rs:369` and the "Architecture: aggressive use" section below
-      all cite *"a wildcard covers one label and only one (RFC 4592 §2.1.1)"*.
-      §2.1.1 is about `*` being special only as the **leftmost label in zone-file
-      syntax**; it says nothing about how deep synthesis reaches. The tests at
-      `zone.rs:1251` and `zone.rs:1287` assert the current wrong behaviour and
-      cite the same misreading. `zone_signer.rs:934`'s assertion is correct but
-      its *reason* is wrong — `x.a.b.example.com.` is NXDOMAIN because
-      `a.b.example.com.` is an empty non-terminal, so the closest encloser is
-      deeper than the apex; that test will still pass, and its comment will still
-      mislead.
-- [x] **Empty non-terminals answer NXDOMAIN instead of NODATA** — **done.**
-      `Zone` keeps a `non_terminals` set: every ancestor, up to the apex, of a
-      name that is in the index, maintained as records are added and rebuilt by
-      `reindex`. Insertion stops at the first ancestor already present, because
-      ancestors are always noted all the way to the apex — so index construction
-      stays linear in the zone rather than names × labels. `holds_name` is
-      untouched: the denial path needs the literal question, and `NameKind`
-      distinguishes `EmptyNonTerminal` from `Exact` so `negative_proof` can point
-      at the record the signer already puts in the chain for it. Original finding:
-      (`zone.rs:227`).
-      `name_exists` is bare index membership, so with `deep.a.b IN TXT "x"` in the
-      zone both `b.example.com.` and `a.b.example.com.` report false. RFC 4592
-      §2.2.2: a name with descendants but no records of its own *exists*. An
-      RFC 8020 resolver caches the NXDOMAIN and extends it to `deep.a.b`, so the
-      zone takes **its own data** offline. Signed, it is self-contradicting: the
-      signer does put ENTs in the chain (`zone_signer.rs:413`), so the authority
-      section carries an NSEC that *matches* the name while the header says
-      NXDOMAIN — and `zone_signer.rs:900` already has a test asserting the proof
-      is wrong. Fix: make `name_exists` (or a new `node_exists`) return true when
-      any indexed name is a strict descendant; a sorted name index makes it
-      O(log n). Keep `holds_name` as-is — the denial path correctly needs the
-      literal test.
-- [x] **The apex NSEC3 type bitmap omits NSEC3PARAM** — **done.** The record is
-      added before `Layout::of` takes its snapshot rather than after the chain is
-      built, which is a one-line move and the whole fix. Two tests: one naming the
-      apex and NSEC3PARAM specifically, and one asserting over *every* name in the
-      zone under both chains that the denial record describing it lists every type
-      present at it — because "a record was added after the layout was taken" is a
-      class, not an instance, and it can happen at any name. Both fail against the
-      old ordering (checked by reverting it). Original finding:
-      (`zone_signer.rs:166`).
-      `sign_zone` snapshots `Layout::of` at `:166`, builds the NSEC3 chain from
-      that snapshot at `:176`, and only *then* adds the NSEC3PARAM record at
-      `:177` — so the apex NSEC3 never lists the type. Confirmed by running it:
-      `apex NSEC3: SOA=true NS=true DNSKEY=true RRSIG=true NSEC3PARAM=false`,
-      with one NSEC3PARAM record actually present at the apex. RFC 5155 §7.1: the
-      bitmap of every NSEC3 "MUST indicate the presence of all types present at
-      the original owner name", and §4 puts NSEC3PARAM at the apex.
-      `dnssec-verify`, `ldns-verify-zone` and `validns` all reject the zone.
-
-      Worse than a lint failure: a validator asking `example.com. NSEC3PARAM`
-      with DO gets a signed NODATA proof for a type that **is** present and
-      signed — and an RFC 8198 aggressive-NSEC resolver will then synthesize that
-      false NODATA for other clients out of its cache. This repo's own `rdnsr`
-      does exactly that (`rdnsr/src/main.rs:773`), so we would poison ourselves.
-      Fix: add NSEC3PARAM to `signed` before `Layout::of`, or move `Layout::of`
-      after the chain-type branch. A regression test asserting the apex bitmap
-      lists every type actually at the apex catches the whole class.
-- [x] **The SOA in a negative answer is sent with its own TTL, uncapped by
-      MINIMUM** — **done.** `rdnsd::negative_ttl` caps it, and
-      `dnssec_answer::soa_signatures` caps the RRSIG beside it the same way, so
-      the two records in one section no longer disagree about how long the "no" is
-      good for. An apex SOA that will not parse yields 0 — the client asks again
-      rather than caching a "no" we cannot bound. Original finding:
-      (`rdnsd/src/main.rs:313`). RFC 2308 §3: the TTL is
-      `min(SOA MINIMUM, the SOA record's own TTL)`. The code pushes `soa.ttl`
-      verbatim, so for the zone shape used throughout this repo's own tests
-      (`$TTL 3600`, `minimum 300`) every NXDOMAIN and NODATA is advertised at
-      **3600 where the RFC says 300** — cached 12× longer than the operator asked,
-      so a record added to fix a typo takes an hour to appear. It is also
-      internally inconsistent: the signer already uses `minimum` for the
-      NSEC/NSEC3 TTL (`zone_signer.rs:168`), so the SOA and the proof beside it in
-      the same section disagree about how long the "no" is good for. Same cap
-      belongs on the RRSIG TTL in `dnssec_answer::soa_signatures`.
-      `NegativeCache` already gets this right — see "Architecture: what `rdnsr`
-      remembers"; this is `rdnsd` disagreeing with our own resolver.
-
-#### 9b. Remote crash and unbounded memory
-
-- [x] **RDLENGTH is sliced without a bounds check — remote panic, pre-auth**
-      — **done 2026-07-27.** `rdns/src/lib.rs` now checks the declared length
-      against the remaining buffer and errors, then `split_at`s; the companion
-      re-slice is gone with it. Three regression tests in `lib.rs`'s test module
-      pin it: the answer-section shape, the additional-section OPT shape (the one
-      that gets past `RequestValidator`), and the boundary case where RDATA ends
-      exactly at the message end, which is where an off-by-one in the new check
-      would live. Original finding follows, since the reachability analysis is
-      worth keeping.
-
-      (`rdns/src/lib.rs:829`, and the companion re-slice at `:839`). Three of the
-      five reviewers found this independently.
-
-      ```rust
-      let (rdatalen, rest) = read_be!(u16, rest);
-      let rdata = &rest[..rdatalen as usize];   // nothing checks this
-      ```
-
-      Every other length in the parser is checked — `read_be!`,
-      `Label::try_from_bytes`, `parse_options`. This one is not. Confirmed by
-      execution, and the nastiest shape passes our own validator: a **well-formed
-      QUERY** whose additional-section OPT declares `RDLEN=0xFFFF` with no data
-      gets through `RequestValidator::validate_packet` (the additional section is
-      where OPT and TSIG legitimately live, so it is only count-capped) and then
-      panics with `range end index 65535 out of range for slice of length 0`.
-
-      Reachable pre-authentication on UDP (`rdnsd/src/main.rs:1114`), TCP
-      (`:674`), in `rdnsr` with no validator in front of it at all
-      (`rdnsr/src/main.rs:596`), and in `xfr.rs:709` — where a hostile primary
-      kills a secondary's replication task, which is **not restarted**, so that
-      zone silently stops refreshing until EXPIRE. Contained today only because
-      the parse sits inside a `tokio::spawn`; that is incidental, and
-      `panic = "abort"` would make it a process kill.
-
-      ```rust
-      let rdatalen = rdatalen as usize;
-      if rest.len() < rdatalen {
-          return Err(anyhow!("RDATA declares {rdatalen} bytes, {} remain", rest.len()));
-      }
-      let (rdata, rest) = rest.split_at(rdatalen);
-      ```
-
-      A probe test for exactly this was written and thrown away twice during the
-      review. Land it as a regression test this time.
-- [x] **`DnsCache` sign-extends a negative TTL, pinning an entry forever** —
-      **done 2026-07-28.** `.max(0)` *before* the widening, a `MAX_CACHE_TTL`
-      ceiling of a day (RFC 8767 §4), and `saturating_add` for the expiry. Tested
-      through the public API — put a record with a negative TTL, assert the get
-      misses — rather than by reading the private field, because "never expires"
-      is the bug and the field is only how it happened. The `Ttl(u32)` newtype the
-      finding recommends is the better fix and is **not** done: it would make the
-      sign unrepresentable and retire ~30 individually load-bearing `as u64` /
-      `.max(0)` sites, which is worth doing and is a separate change. Original
-      finding follows.
-
-      (`rdns/src/cache.rs:106`). `ResourceRecord::ttl` is `i32` straight off the
-      wire (`lib.rs:827`); a TTL with the high bit set parses negative, `-1 as u64`
-      is `u64::MAX`, `min` picks it, and `is_expired` is false for the life of the
-      process — a poisoned answer immune to the re-query that would otherwise
-      correct it. `now + min_ttl` can also overflow-panic in debug. RFC 2181 §8
-      says treat a negative received TTL as 0. `negative_cache.rs:149` and
-      `nsec_cache.rs:214` already clamp; the positive cache is the one that does
-      not, and `resolver.rs:1195`/`:1229` write `rr.ttl.max(0)` while the cache
-      behind them does not. Fix now with `r.ttl.max(0) as u64`, a ceiling
-      (`MAX_CACHE_TTL`, a day) and `saturating_add`. Fix properly by making the
-      sign unrepresentable: a `Ttl(u32)` newtype clamping once at the parse
-      boundary, so the ~30 downstream `as u64`/`.max(0)` sites stop being
-      individually load-bearing.
-- [x] **One oversized UDP datagram terminates `rdnsd` on Windows** — **done
-      2026-07-28.** Both halves: the predicate now matches raw 10040 and
-      `ErrorKind::InvalidInput`, and the receive buffer is 65535 — a request is
-      not bound by the payload size we advertise for *responses*, which is where
-      the 4096 came from. The predicate moved into `utils::recv_error_is_transient`
-      and `rdnsr` uses it too, because it existed twice and this case had been
-      found in neither copy; that duplication is now a rule in `CLAUDE.md` §7. The
-      test drives it through `Error::from_raw_os_error`, since the kind carries no
-      information — which is exactly why a `matches!` on kinds missed it. Original
-      finding follows.
-
-      (`rdnsd/src/main.rs:1065`, `is_stray_icmp` at `:1053`). The receive buffer is
-      `vec![0; 4096]`; on Windows a larger datagram makes `recvfrom` fail with
-      **WSAEMSGSIZE** rather than truncate. Confirmed: Rust maps it to
-      `kind=Uncategorized raw=Some(10040)`, which `is_stray_icmp` does not match
-      (it covers only `ConnectionReset | ConnectionRefused | NetworkUnreachable |
-      HostUnreachable`), so it falls to the fatal arm at `:1071` → `udp_loop`
-      returns → `serve`'s `select!` propagates → the process exits. **This is the
-      development machine's platform**, so it is a dev-loop hazard as much as a
-      production one, and it is the same class as the ICMP bug the comment block
-      at `:1040-1052` was written to fix. Two parts: add the size case to the
-      non-fatal set (raw 10040, and `ErrorKind::InvalidInput`), and size the buffer
-      honestly — 4096 matches `RDNSD_PAYLOAD_SIZE` for *responses*, but a request
-      is not bound by it. On Linux the same packet is silently truncated and then
-      fails to parse, so the client gets nothing rather than FORMERR; the buffer
-      fix addresses both.
-- [x] **Two per-IP maps are unbounded; a spoofed-source flood is a memory DoS** —
-      **done 2026-07-28**, all three maps. `logging::note_source` bounds both
-      counters at 10,000 sources: an existing source always counts, a new one is
-      admitted while there is room, and at the bound every count is **halved** and
-      the entries reaching zero are forgotten. That keeps the heavy hitters the
-      counters exist to find and drops the single-datagram sources a spoofed flood
-      is made of, at amortized O(1) — a scan for the smallest count on every
-      insertion would have been O(n) per packet, which is worse than the problem.
-      A new `untracked_sources` field says when the per-IP figures became a sample
-      rather than a census, because a "top talkers" list that is quietly a lie is
-      worse than none. `RateLimiter` gets a `max_tracked` and *allows* a source it
-      has no room for: failing closed there would let one flood deny service to
-      everybody. The bound is a parameter of `note_source` so a test can check the
-      boundary at a size a reader can follow. Original finding follows.
-
-      (`rdns/src/logging.rs:16` and `:20`, `rdns/src/security.rs:40`). Four of the
-      five reviewers hit this. `QueryStats::queries_by_ip` and `rate_limited_ips`
-      are **never** trimmed — `reset_stats()` exists and is called from nothing but
-      tests. `RateLimiter::buckets` is trimmed only every
-      `cleanup_interval_secs = 600`, and an entry is created *before* any
-      validation, so it costs an attacker one spoofed 12-byte datagram per entry.
-      With IPv6 source addresses this is unbounded in practice, and the 600 s
-      cleanup then walks the whole map under the lock.
-
-      `ResponseLimiter` two hundred lines away already solves this
-      (`max_tracked: 10_000` plus `forget_idle`, `security.rs:160-164`) with a
-      comment explaining that the table would otherwise be the next amplification
-      vector. That reasoning applies verbatim to the two limiters that run
-      *first*; they just never got it. For the logger, per-IP counters are the
-      wrong shape for an unbounded key space at all — a top-K or a sketch gives
-      the same anomaly signal in constant memory.
-- [x] **`RateLimiter` subtracts wall-clock timestamps without saturation** —
-      **done 2026-07-28.** `saturating_sub` at all three sites, and
-      `.lock().unwrap()` replaced with `let Ok(..) = .. else` on both paths a query
-      reaches, each with a commented failure decision: `should_allow` allows,
-      because a limiter whose state is unknown must not become a total outage.
-      **The same defect was in `logging::log_query`** — two more unsaturated
-      timestamp subtractions under the stats mutex — and is fixed with it; that one
-      was not in the original finding, which is why "every subtraction of two
-      timestamps is `saturating_sub`, no exceptions" is now a rule
-      (`CLAUDE.md` §6). Moving both limiters to `Instant` is still the right
-      answer and is not done. Original finding follows.
-
-      (`rdns/src/security.rs:71`, and `:101`), inside the lock. `current_unix_timestamp()`
-      is `SystemTime`, not monotonic. An NTP step backwards panics with the guard
-      held (poisoning the mutex, after which every `should_allow` panics at
-      `:64` and the server stops answering entirely) or, in release with overflow
-      checks off, wraps to ~1.8e19 so `tokens_to_add` refills every bucket to full
-      and the limiter silently resets. `ResponseLimiter::admit` at `:244` uses
-      `saturating_sub` correctly. Use `saturating_sub` in both places, replace
-      `.lock().unwrap()` with a fail-closed `let Ok(..) = .. else`, and ideally
-      move both limiters to `Instant`.
-
-#### 9c. Silent wrong answers in operation
-
-The theme: serving a wrong DNS answer is worse than serving none, and every item
-here degrades quietly with the process healthy and nothing alerting.
-
-- [x] **A zone file that fails to parse is dropped and the server stays up** —
-      **done 2026-07-28.** `enumerate_zone_files` collects every failure, reports
-      them all, and refuses the set; `--allow-partial-load` is the flag for the
-      operator who genuinely wants the old behaviour, because 39 of 40 zones does
-      beat none when that is really the choice. All failures are listed rather
-      than the first, so a deploy is fixed in one pass instead of one typo per
-      restart.
-
-      **The change is really that three questions stopped being one.** "Could the
-      directory be read?" is always fatal; "did every file parse?" is fatal unless
-      the flag says otherwise; "is it empty?" is fatal except for a secondary that
-      has not had its first transfer yet. `load_zones_from_source` now answers the
-      third, because it is the only one of the three that knows whether its caller
-      is a secondary — see the correction under the next bullet. Original finding
-      follows.
-
-      (`rdnsd/src/main.rs:2408`, the `Err(e) => { eprintln!(...); }` arm).
-      Verified live: three zone files, one with a bad record, exit code 0, process
-      serving, the broken zone answering **REFUSED** — indistinguishable from a
-      zone that was never configured. `enumerate_zone_files` aborts only if
-      *every* file fails.
-
-      This defeats the invariant `Reloading::load`'s own doc comment
-      (`rdnsd/src/main.rs:1270`) claims to uphold: *"Nothing is installed unless
-      the whole set comes through… A reload that replaced half the zones and gave
-      up would leave the server serving a mixture."* It does not hold — a SIGHUP
-      taken while config management is mid-write drops every not-yet-written zone
-      from a set that `install_all_zones` then installs wholesale (`:1569`), so
-      **a broken zone file on reload takes down a previously-working zone.** One
-      typo in 1 of 40 zones plus a deploy SIGHUP is a lame delegation for that
-      zone, 39 green dashboards, and one stderr line that scrolled past hours ago.
-      Fix: collect errors and fail the whole load; add `--allow-partial-load` for
-      the operator who genuinely wants today's behaviour.
-- [x] **An unreadable zone directory silently unloads every zone** — **done
-      2026-07-27**, and the fix was half wrong until 2026-07-28. Deleting the
-      `.unwrap_or_default()` was right. The claim that came with it —
-      *"`enumerate_zone_files` already returns `Ok(empty)` for an empty directory,
-      so the `replicating` intent is unaffected"* — **was false**, and it was
-      written into the commit message, the doc comment and this file without
-      anyone checking it: that function returned `Err("No .zone files found in
-      directory")` for an empty one. So the swallowed error *was* the only thing
-      making a secondary's first start work, and removing it meant a secondary
-      pointed at an empty `--zone-dir` refused to start at all.
-
-      Nothing caught it, because nothing tested a secondary starting from an empty
-      directory — a green suite again standing in for evidence it never had. The
-      emptiness check now lives in `load_zones_from_source`, which is the only
-      place that knows whether the caller is replicating, and
-      `a_secondary_may_start_with_an_empty_zone_directory` pins it. Left written
-      down rather than edited out, because "I asserted what the callee does
-      instead of reading it" is the interesting part and is now `CLAUDE.md` §4.
-      Original finding follows.
-
-      (`rdnsd/src/main.rs:2348`): `return Ok(enumerate_zone_files(dir).unwrap_or_default());`
-      on the `--secondary` path. An `Err` — permission change, NFS blip, all files
-      failing to parse — becomes `Ok(empty map)`, `Reloading::load` sees success,
-      and `install_all_zones` installs it. The server is up, listening, and holding
-      zero zones; every query REFUSED. **Delete the `.unwrap_or_default()` and
-      propagate.** One line, and the best effort-to-risk trade on this list.
-- [x] **SIGHUP resurrects a secondary zone that was withdrawn for EXPIRE** —
-      **done 2026-07-28.** `expire_stale_zones_at_startup` is now
-      `withdraw_unvouched_zones` and runs after *every* fill of the zone map,
-      startup and reload alike — `Reloading` carries the specs and the zone
-      directory for that purpose. Expiry that lasts only until the next deploy is
-      not expiry.
-
-      Both halves are closed. A missing state entry for a zone that is loaded now
-      means "unknown age → do not serve" rather than `continue`: `StateFile::load`
-      returning empty is right for a cache and wrong here, because forgetting the
-      last-contact time *is* the difference between withdrawn and served. The zone
-      returns at the first successful transfer, which is what makes it ours to
-      answer for. An entry naming a different master is treated the same way,
-      since it is not evidence about this one. Four tests, including the control
-      that a zone in contact keeps being served — the check has to be narrow.
-      Original finding follows.
-
-      (`rdnsd/src/main.rs:2023`). `expire_stale_zones_at_startup` is called from
-      `main` only, never from the reload path, and `Reloading::load` re-reads every
-      `.zone` file from disk without consulting the state sidecar. A zone correctly
-      withdrawn because its primary has been unreachable for a week comes straight
-      back and is served **with AA set** — precisely the "permanently wrong answers
-      nobody can see are wrong" that the withdrawal code's own comment says it
-      exists to prevent. Same hole from the other side: if the sidecar is missing
-      or unreadable, `StateFile::load` returns empty by design
-      (`secondary.rs:232`, "Never fails"), `expire_stale_zones_at_startup` hits
-      `continue`, and the stale copy is served authoritatively from a cold start.
-      "Missing state degrades, never crashes" (see "Architecture: persistence") is
-      right for a cache and **wrong for expiry** — forgetting the last-contact time
-      *is* the difference between withdrawn and served. Fix: factor the check out
-      and call it after every `install_all_zones`; treat a missing state entry for
-      a zone whose file exists on disk as "unknown age → do not serve".
-- [x] **A negative answer reached through a CNAME gets AD=1 without its denial
-      being checked** — **done 2026-07-28**, along the lines the finding
-      prescribes. `validate` asks `cname_chain_shape` where the answer actually
-      ends and whether an RRset of the queried type is there; a chain that ends
-      without one is negative, and `check_denial` runs against the **end of the
-      chain** rather than the name asked about (RFC 4035 §5.4).
-
-      One thing the finding did not mention and the fix needs: on that path the
-      *answer* section has to be verified too. A CNAME-terminated "no" hands the
-      client a chain of real records alongside the denial, and validating only the
-      authority section would authenticate half the answer. So `records` is the
-      answer section, plus the authority section when the response is negative —
-      which for a chainless negative answer is exactly what it was before.
-
-      Confirmed by reverting: with `answers.is_empty()` restored, a NODATA whose
-      proof has simply been **deleted** after a legitimate CNAME comes back
-      `secure`. No forged signature required. Two tests, the control and the
-      attack. Original finding follows.
-
-      (`rdns/src/resolver.rs:1410`, `:1487`, `:1614`).
-      `let negative = response.answers.is_empty()` — but `recurse` returns the
-      accumulated CNAME chain in `answers`, so for
-      `www.example.com CNAME cdn.example.net` where the target has no AAAA,
-      `negative` is false and `check_denial` never runs. `cname_chain_shape`
-      returns `Intact { final_name }` and `validate()` pattern-matches only
-      `Broken`, discarding it, so validation falls through to `Secure` at `:1496`.
-      The last hop's authority section is neither signature-verified nor tested for
-      whether it denies anything, and `rdnsr` then sets AD (`rdnsr/src/main.rs:807`)
-      and caches it as validated (`:765`). Strip or forge the terminal
-      NODATA/NXDOMAIN after any legitimate CNAME and it is handed to clients as
-      authenticated — a downgrade relative to the non-CNAME path, which is handled
-      correctly. RFC 4035 §5: a validator MUST authenticate negative responses, and
-      §5.4 keys the proof to the name actually denied. Fix: use
-      `Intact { final_name }` — when the answer holds no RRset of `qtype` at
-      `final_name`, treat the response as negative and run `check_denial` against
-      `final_name`, after verifying the authority section with `validate_records`.
-- [x] **`rdnsr` answers messages with QR=1, and answers any opcode as a query** —
-      **done 2026-07-28.** `handle_query` drops a message with QR set before
-      anything else, and answers NOTIMP to every opcode but QUERY with the
-      client's own opcode echoed (RFC 1035 §4.1.1) and its OPT mirrored
-      (RFC 6891 §6.1.1). `build_response` takes the opcode as a parameter rather
-      than hardcoding QUERY — every caller passes QUERY and is right to, but
-      hardcoding it is what made the missing check invisible.
-
-      **`rdnsd` had the QR half too**, as the finding says, and it is fixed with
-      it: `RequestValidator` deliberately accepts QR=1 because it is used on both
-      directions of the wire, so the check belongs at the point where we know the
-      packet arrived at a listening socket. `rdnsr` had no test module at all
-      before this; it has one now. Original finding follows.
-
-      (`rdnsr/src/main.rs:596`, `:882`). `handle_query` parses and goes straight to
-      `msg.queries.first()`, never testing `msg.response` or `msg.opcode`, and
-      `build_response` hardcodes `opcode: OpCode::Query`. Two consequences: a
-      *response* sent to `rdnsr` is resolved and replied to, so two instances
-      pointed at each other — or one spoofed packet with a forged source — is a
-      self-sustaining packet loop; and a NOTIFY or UPDATE gets a plausible
-      QUERY-shaped answer instead of NOTIMP. `rdnsd` checks the opcode
-      (`main.rs:242`) but also skips the QR test. RFC 1035 §4.1.1: opcode is
-      "copied into the response". This is the "no opcode check" already noted at
-      the end of #6 — the QR half is new, and is the one that loops.
-
-#### 9d. Operability — none of this is visible from outside the process
-
-**Closed 2026-08-01.** Every item below is done or is a recorded won't-fix
-(`--user`/`--group`, whose argument is under it). Two of them ended somewhere
-other than where the finding pointed, and both say so in place rather than being
-edited: the loader fix that broke a secondary's first start, and the readiness
-gate, whose "bound but still parsing 40 zones" premise turned out not to describe
-this server at all.
-
-- [x] **The query rate limiter is hardcoded at ~10 q/s per source IP, drops
-      silently, and has no flag** — **done 2026-07-28**, with all three flags the
-      finding asks for and the higher default. `--query-rate` (1000, per second,
-      **0 turns it off**), `--query-burst` (200), `--query-rate-exempt` taking
-      addresses and CIDR prefixes.
-
-      **The units were most of the bug.** The old configuration read as "100
-      tokens per 10-second window, burst 20", which looks like a hundred queries
-      and is ten a second. `RateLimitConfig::per_second(rate, burst)` states it
-      the way an operator does. A burst of 0 is floored at 1, because a bucket
-      starts full and a full bucket of nothing refuses every query — a mistyped
-      flag should be wrong, not fatal.
-
-      The exemption list reuses `security::TransferAcl` rather than growing a
-      second CIDR parser (`CLAUDE.md` §7); it gained a `parse_named` so an
-      operator with two lists is told which one has the typo.
-
-      **Verified live, the same way the finding was measured.** With the default:
-      a 60-query burst from one address gets **60 answers, 0 drops** — against the
-      20/40 recorded below. With `--query-rate 5 --query-burst 10` it still drops
-      50 of 60, so the limiter works when it is asked to. With
-      `--query-rate-exempt 127.0.0.0/8` on top of that, all 60 come back.
-
-      **The silence is deliberate and still only half-addressed.** Replying to a
-      rate-limited source is what an amplifier does, so dropping is right; the
-      effective policy is printed in the startup banner so the number is at least
-      discoverable, but `log_rate_limited` still increments a map nothing reads.
-      The rest is the metrics item three bullets down, and that is where this
-      finally becomes observable. Original finding follows.
-
-      (`rdns/src/security.rs:22-27`, wired
-      unconditionally at `rdnsd/src/main.rs:501`). Measured live: a 60-query burst
-      from one address got **20 answers and 40 silent drops** — no REFUSED, no
-      SERVFAIL, nothing on the wire. Put this behind any ISP resolver or public
-      resolver and you blackhole the bulk of its traffic while `dig` from a laptop
-      works perfectly, so the operator concludes it is the network. `log_rate_limited`
-      increments a map nothing ever reads. Fix: `--query-rate`, `--query-burst`,
-      `--query-rate-exempt <CIDR>`, and a default at least 10× higher — or off for
-      `rdnsd`, which fronts resolvers rather than end users.
-- [x] **Nothing re-signs a running server** — **done 2026-07-30**, with #8's two
-      bullets; see #8 for the design and the reasoning. Original finding follows.
-
-      Already #8's first bullet, and the
-      review confirms the 3am shape: exactly `--signature-validity` days after the
-      last deploy, every validating resolver SERVFAILs the entire zone at once,
-      while the server is healthy and `dig +norec` looks perfect. Until the timer
-      exists, a cron `kill -HUP` is **mandatory documented deployment config**, and
-      an alert on `now - zone_signed_at > validity/2` is what makes it survivable.
-- [x] **There are no metrics: `init_telemetry` is never called, and the module
-      with the useful counters is wired to nothing** — **done 2026-07-29**, and
-      the OTel question is answered by deletion.
-
-      **`rdns/src/telemetry.rs` is gone**, and with it six dependencies:
-      `opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`,
-      `tracing-opentelemetry`, `tracing` and `tracing-subscriber`. `Cargo.lock`
-      goes from **187 packages to 104** — 83 crates, including `tonic`, `prost`,
-      `hyper` and `h2`, a gRPC *server*, carried by a DNS daemon for an exporter
-      that built two objects into `let _` and dropped them. `tracing` went too
-      because after deleting the inert instrumentation layer nothing used it; the
-      log-flood item below wants it back, and it can come back deliberately when
-      something actually initialises a subscriber.
-
-      **`metrics.rs::DnsMetrics` is the one now**, wired into `rdnsd` and no
-      longer referenced only by a benchmark. `LatencyTimer` moved there with it.
-      The counter calls changed meaning as well as module: `make_response` used
-      to call `increment_cache_hits`/`increment_cache_misses` on an authoritative
-      server that **has no cache** — the names were standing in for "found
-      something" and "did not", which is not a question anyone asks of a primary.
-      It counts the answer by its rcode instead, which is what an operator pages
-      on: REFUSED climbing means a zone went *missing*, SERVFAIL climbing means
-      one went *wrong*, NXDOMAIN is ordinary and noisy.
-
-      **`--metrics-listen <ADDR:PORT>`** serves `GET /metrics` (Prometheus text)
-      and `GET /healthz`, in `rdns::metrics_server` — ninety lines of hand-rolled
-      HTTP over `tokio`'s `TcpListener` rather than a second HTTP stack, since
-      pulling `hyper` back in to answer one method on one path would be the same
-      mistake with better manners. It is a listener like the others: it stops
-      with the rest and holds the drain only while a scrape is in flight. Off by
-      default; no TLS and no auth, so bind it on loopback or a management
-      address.
-
-      **The latency histogram is in**, as cumulative `le` buckets plus `_sum` and
-      `_count` — the exact shape `histogram_quantile()` needs — in *seconds*,
-      because Prometheus convention is base units. The bounds start at 50 µs:
-      an in-memory zone lookup is tens of microseconds, and a histogram whose
-      first bucket is 5 ms reports every healthy server as identical.
-
-      **The two gauges are in too (2026-07-29).** `dns_zone_serial{zone=...}`
-      and `dns_zone_last_refresh_timestamp_seconds{zone=...}`, and three
-      decisions in them are worth keeping:
-
-      - **Written when the fact changes, not sampled at scrape time.** Reading
-        the zone map on the scrape path would put a scrape behind a reload and a
-        reload behind a scrape, and the number would still be only as fresh as
-        the last scrape. `Served` — zone map, delta log, gauges — exists because
-        those three are only ever updated together, and passing them separately
-        is how one gets forgotten at a fourth call site.
-      - **A timestamp, not a "seconds since".** Prometheus convention is to
-        expose the instant and let the query do `time() - x`; a duration computed
-        here is stale the moment it is scraped and goes on ageing in the
-        dashboard. The alert is
-        `time() - dns_zone_last_refresh_timestamp_seconds > <expire>`.
-      - **Contact, not transfer**, which is the finding's wording asked more
-        precisely. All three success paths in `refresh_once` go through
-        `record_state`, including the one where the serial was already current —
-        and contact is what EXPIRE counts from and what decides whether a zone is
-        withdrawn. A replica in contact with nothing new to fetch is healthy; a
-        gauge that only moved on an actual transfer would call it stale.
-
-      A zone with no transfer is **omitted rather than zeroed** — a primary is
-      never transferred, and `0` reads as 1970 and fires every staleness alert —
-      and a withdrawn zone is **forgotten rather than frozen**, at both the
-      startup check and the runtime EXPIRE, because a gauge stuck at its last
-      value shows a zone nobody serves as perfectly healthy. The compiler found
-      the second of those: the runtime expiry path had been missed, and an unused
-      `metrics` binding is what said so.
-
-      Verified live on a real primary and secondary: the primary reports a serial
-      and **no** refresh timestamp, the secondary reports both, four seconds
-      behind the clock.
-
-      Verified live: nine queries (five A, two for a name that is not there, one
-      for a zone we do not serve, one MX) produce
-      `dns_queries_received_total 9`, `dns_responses_noerror_total 6`,
-      `dns_responses_nxdomain_total 2`, `dns_responses_refused_total 1`,
-      `dns_queries_authoritative_total 8` — the REFUSED one is not authoritative
-      — `dns_queries_type{type="A"} 8`, `type="MX" 1`, and a latency histogram
-      summing to 31 µs across the nine. Original finding follows.
-
-      Verified by grep — the only
-      match for `init_telemetry` in the workspace is its own definition at
-      `rdns/src/telemetry.rs:13`, and it is a stub that builds two exporters into
-      `let _trace_exporter`/`let _metrics_exporter` and drops them. No tracer
-      provider, no meter provider, no OTLP endpoint flag. **The README's
-      "OpenTelemetry integration for tracing and metrics" is not true.**
-
-      Because nothing initialises `tracing_subscriber`, every `tracing::` call in
-      `telemetry.rs::instrumentation` — the whole instrumentation layer, on every
-      query path — compiles in and discards. And `rdns/src/metrics.rs`, which
-      *does* have the RED metrics worth paging on (`responses_servfail`,
-      `responses_nxdomain`, `responses_refused`, per-qtype, `rate_limited`) plus a
-      working `to_prometheus_format()`, is referenced **only by `bench.rs`**. Both
-      servers use the other `DnsMetrics` in `telemetry.rs`, whose
-      `dnssec_validations`/`dnssec_failures` `rdnsd` never increments.
-
-      Fix: delete `telemetry.rs::DnsMetrics`, wire `metrics.rs::DnsMetrics` into
-      both servers, add `--metrics-listen <ADDR>` serving `to_prometheus_format()`
-      (most DNS shops scrape; OTLP push is the wrong default here). Then add a
-      latency histogram, a per-zone serial-currently-served gauge, and a
-      seconds-since-last-successful-transfer gauge — the three an operator
-      actually asks for. **Decide the OTel question in the same breath**: the
-      `opentelemetry 0.24` family is many releases behind, the lock carries two
-      copies (0.23 *and* 0.24, via `tracing-opentelemetry 0.24`), and it drags
-      `tonic`/`prost`/`hyper`/`h2` — ~40 crates and a gRPC server — into a DNS
-      daemon for an exporter that never initialises. Either finish the export
-      (a coordinated bump of all four OTel crates plus `tracing-opentelemetry`,
-      no incremental path) or delete five dependencies.
-- [x] **No SIGTERM handling anywhere** — **done 2026-07-29**, in both daemons.
-      `rdns::shutdown` is the new module: `Stop` is the signal, `Busy` is a claim
-      on the drain, and they are deliberately **two types**. A single one would
-      mean the accept loops — which hold the signal for the life of the process —
-      also held the drain open, so every shutdown would wait out its full budget
-      and the feature would look like it worked while doing nothing.
-
-      The drain is an `mpsc` nobody sends on: `recv()` returns `None` exactly
-      when the last `Busy` is dropped. No counter to get wrong and no polling.
-      Both accept loops stop accepting and return; a TCP connection stops reading
-      *new* queries but finishes the ones in flight; the NOTIFY tasks, the SIGHUP
-      handler, each secondary's refresh and `rdnsr`'s RFC 5011 anchor manager all
-      hold a `Busy` across their work and none across their sleep — a refresh
-      timer is hours long, and holding the claim there would spend the whole
-      budget every time.
-
-      **`serve`'s `select!` over two `JoinHandle`s is a `JoinSet` now.** Dropping
-      a `JoinHandle` detaches rather than cancels, so the old shape returned from
-      `main` with the other transport still reading. Both binaries had that bug,
-      written twice, which is why the module is in `rdns` and not copied
-      (`CLAUDE.md` §7).
-
-      **Testing it is what found the second bug, and it is the interesting one.**
-      The first version used `tokio::signal::ctrl_c()` on Windows and a comment
-      claiming that covers a console close too. It does not: `ctrl_c` registers
-      for `CTRL_C_EVENT` and nothing else, so a real `CTRL_BREAK_EVENT` sent
-      mid-AXFR went to the default handler and killed the process with exit code
-      `0xC000013A`, cutting the transfer exactly as before. That is `CLAUDE.md`
-      §4's "never state what a function you are calling does without opening it",
-      broken in the same commit that added the feature. `ctrl_break`,
-      `ctrl_close` and `ctrl_shutdown` are separate listeners and are all
-      selected on now. Note `CTRL_CLOSE_EVENT` gives about five seconds before
-      Windows terminates regardless, which is the same order as the drain budget.
-
-      **Verified live on both**, by sending a real console control event to a
-      server mid-transfer of a 20,000-record zone: before, `ConnectionResetError`
-      and exit `0xC000013A`; after, all 20,002 names delivered, `drained
-      cleanly`, exit 0, in 0.29 s. An idle stop takes 2 ms rather than the
-      5 s budget, on both daemons. Three regression tests drive the real
-      `tcp_loop` and `serve_connection`, and each half of the fix was reverted
-      separately to watch them fail: without the accept-side stop all three fail,
-      without the per-connection stop the transfer still completes but the drain
-      never does.
-
-      **One part of the finding is not addressed**: `write_zone_file`'s
-      `.zone.tmpNNN` sibling is now *unlikely* rather than impossible. The
-      secondary holds a `Busy` across `refresh_once`, so an ordinary stop lets
-      the write finish — but a write still in progress when the budget runs out,
-      or a SIGKILL, still leaves one. Cleaning up strays belongs with `persist`,
-      not here. Original finding follows.
-
-      (grep for `SIGTERM`/`SIGINT`/`ctrl_c`
-      across all four crates returns nothing; only SIGHUP exists).
-      `systemctl stop`, `docker stop` and a Kubernetes eviction all kill the
-      process instantly: in-flight TCP zone transfers are cut mid-stream, and the
-      client cannot distinguish a truncated AXFR from a complete one — the code
-      says so at `rdnsd/src/main.rs:856`. A `write_zone_file` in progress leaves a
-      `.zone.tmpNNN` sibling; `persist` cleans up on *error*, not on signal.
-      Compounding it, `serve`'s `tokio::select!` over the two `JoinHandle`s
-      *drops* the loser, which detaches rather than cancels, so `main` returns with
-      replies still queued in the per-connection `mpsc`. Fix: a
-      `CancellationToken` both loops select on, `tokio::signal::ctrl_c()` plus
-      SIGTERM, stop accepting, bounded drain (~5 s), exit 0. `announce_zones`'
-      fire-and-forget NOTIFY tasks want a `JoinSet` so shutdown can drain them.
-- [x] **A malformed-packet flood becomes a disk fill and a global lock convoy**
-      — **done 2026-08-01.** The lock convoy went 2026-07-28; the log volume
-      goes now, with `tracing` and real levels on both daemons.
-
-      **Measured live, which is the whole claim:** 50 malformed datagrams at the
-      default level produce **0** log lines (the only stderr is the startup
-      banner), and 50 at `--log-level debug`. Before, all 50 were written
-      unconditionally.
-
-      `--log-level error|warn|info|debug|trace` and `--quiet` on `rdnsd` and
-      `rdnsr`, both going through one `rdns::logging::init` so the two cannot end
-      up configured differently (§7). `RUST_LOG` overrides the flag, because the
-      moment you want it is a server already misbehaving under a level chosen
-      weeks ago in a unit file.
-
-      **The level assignment is the design, not the plumbing.** Nothing
-      per-packet is above `debug` — a malformed query, a parse failure, a
-      response arriving at a listening socket, a client vanishing mid-write, a
-      failed recursive lookup. Those are the flood, and none of them is
-      operator-actionable one at a time. `warn` is for what somebody should see
-      without turning anything up: a TSIG rejection, a refused transfer, a zone
-      going out of service on EXPIRE, a NOTIFY nobody acknowledged, a DNSSEC
-      answer that did not validate. `info` is the per-event operational record —
-      the startup banner and effective policy, zone loads, transfers, reloads —
-      and is the default, so the server still says what it is doing.
-
-      **`format!` no longer runs for a line nobody wants.** That is the half a
-      level alone does not fix: the old call site built its `String` *before*
-      calling `log_error`. `bad_request!` and `serving_error!` wrap the `tracing`
-      macros, which do not evaluate their arguments unless a subscriber is
-      interested, and they also count — so `total_errors` does not become "errors
-      we happened to log" when the level goes down. Verified by
-      `a_suppressed_bad_request_costs_nothing_to_format_and_is_still_counted`,
-      which logs a `Display` that counts its own renderings: 0 at WARN, 1 at
-      DEBUG, counted both times. **Shown to fail** against an eagerly-formatting
-      version of the macro.
-
-      **No in-process rate limiter, deliberately** — this reverses the fix the
-      finding proposed. journald already rate-limits *per unit*
-      (`LogRateLimitIntervalSec`, `LogRateLimitBurst`, both now in the README's
-      unit) and reports what it dropped, so a flood cannot starve other services
-      the way the original text claims. A second limiter would be a second thing
-      to reason about at 3am and would hide what the first one did. Levels stop
-      the volume at the source; the platform handles what is left (§14, prefer
-      the shape the operator already runs).
-
-      **Cost: 11 crates** (110 → 121), measured rather than guessed —
-      `tracing` is 4 of them because `syn`/`quote`/`proc-macro2` are already here
-      for serde and `pin-project-lite` for tokio; `fmt` is 3 more; `env-filter`'s
-      `matchers` + `regex-automata` are the last 4. `ansi` and `tracing-log` are
-      off. For scale, the OpenTelemetry stack this replaces the memory of was 83.
-
-      Two `println!`s survive on purpose and say so in comments: `--check-config`
-      and `--generate-keys` write to **stdout** because a deploy script and a
-      registrar form read them, and `--quiet` must not be able to remove the
-      output of a command whose whole job is to produce it.
-
-      Original finding follows, including the `tracing` recommendation this
-      followed and the rate-limiting one it did not.
-      (The 2026-07-28 half, kept for its reasoning.)
-      `log_error` counts under the guard and does its `eprintln!` outside it, so
-      one `write(2)` per bad packet no longer serializes every *other* query path
-      behind the stats mutex as well as behind Rust's stderr lock. What is left is
-      the part that needs real log levels: there is still no `--log-level` or
-      `--quiet`, the caller still allocates its message with `format!` whether or
-      not anything wants it, and 50k pps of garbage is still 50k journald lines a
-      second. **Note the fix below names `tracing`, which is no longer a
-      dependency** — it went with the OpenTelemetry deletion because nothing used
-      it once the inert instrumentation layer was gone. Bringing it back for this
-      is still the right answer; it just has to be a deliberate choice now rather
-      than a crate that happened to be in the tree. Original finding follows.
-
-      (`rdns/src/logging.rs:96`). `log_error` does an unconditional, unbuffered
-      `eprintln!` while holding the stats mutex — one `write(2)` per bad packet,
-      serialized on both Rust's stderr lock and the mutex, from `answer`
-      (`main.rs:662`, `:675`), the UDP task (`:1102`, `:1241`) and every TSIG
-      rejection. There is no `--log-level` or `--quiet` on either binary, so it
-      cannot be turned off. The caller compounds it:
-      `log_error(peer.ip(), &format!("invalid query: {}", ...))` allocates the
-      message whether or not anything wants it. At 50k pps of garbage that is 50k
-      journald lines a second, `/var/log` fills, journald drops logs for *every
-      other service on the box*, and the logging is itself the amplifier.
-      Fix: route through `tracing` with real levels (so the `format!` is not
-      evaluated when disabled), count under the lock and log outside it, sample or
-      rate-limit the error path.
-
-      **The level inversion this used to warn about is gone with the code.**
-      `trace_query_response` logged the query name at INFO on every successful
-      query, inert only because no subscriber was ever initialised — so fixing
-      metrics would have switched on full per-query logging with the client IP
-      and no runtime toggle. `telemetry.rs` was deleted rather than wired up, so
-      the trap never sprang. The rule it implies still stands for whatever
-      replaces it: **query logging is explicit opt-in, and the client IP is
-      behind a second switch.**
-- [x] **Unbounded `tokio::spawn` per UDP datagram on both daemons** — **done
-      2026-08-01**, and with it 9e's 1,536-bytes-per-datagram item, which was
-      always the same defect seen from the allocation side.
-
-      **The two daemons got different fixes, and the difference is the finding.**
-      The finding proposed one shape for both — keep the spawn, put a
-      `try_acquire_owned` semaphore in front of it — and that is right for
-      exactly one of them.
-
-      - **`rdnsr` keeps the spawn and got the semaphore** (`--max-inflight-udp`,
-        default 1024). A recursion is *seconds* of waiting on the internet, so a
-        fixed pool of tasks would leave the resolver idle and slow at the same
-        time. The permit is taken before the `to_vec()` and the clones, so a
-        datagram over the ceiling costs one comparison.
-      - **`rdnsd` lost the spawn entirely.** Answering from an in-memory zone has
-        two await points in it — the zone-map read guard and `send_to` — and
-        takes microseconds, so the task was pure overhead. `--udp-workers`
-        identical tasks now share the socket and answer inline, defaulting to
-        the machine's parallelism clamped to 2–32. The bound is the worker count,
-        it applies *before* the packet is copied rather than after, and what
-        queues past it is the socket receive buffer, where a UDP queue belongs:
-        the kernel drops the overflow for free and `netstat -su` counts it.
-        Shedding is still the policy — it happens one layer down.
-
-      The rate limiter and the validator run inline on `&buf[..size]` in the recv
-      loop on `rdnsd`, which is the half of the finding that was about *ordering*
-      rather than about bounds: nothing is allocated before something has decided
-      to keep the datagram.
-
-      **Measured on a real process, which is what this class of fix requires**
-      (`CLAUDE.md` §4). DHAT, 1,000 UDP queries against one zone, `--release`,
-      the same Linux box for both builds — the previous numbers in this file
-      were taken on Windows and are *not* comparable, so the baseline was rebuilt
-      from `HEAD` and re-run beside it:
-
-      | | blocks | bytes | peak live |
-      |---|---|---|---|
-      | before | 34,487 | 7,454,369 | 118,372 |
-      | after (16 workers) | 31,574 | 2,875,994 | 1,188,083 |
-
-      By site: `Box<Cell<udp_loop::{closure}>>` at **1,000 × 1,536 bytes is gone
-      from the profile**, and `to_bytes_within_buf` went from **996 blocks to
-      16** — one scratch buffer per worker instead of one per response, which is
-      the reuse `to_bytes_within_buf` was written for and which nothing could use
-      while a task per datagram had nowhere to keep a buffer between datagrams.
-      996 of 1,000 answered either way.
-
-      **The cost is in that table too and is not hidden:** peak live memory goes
-      from 118 KB to 1.19 MB, because sixteen workers hold sixteen 64 KB receive
-      buffers for the life of the process. That is the honest trade — a bounded
-      cost paid up front, in place of an unbounded one paid under load — and it
-      is why the default is the machine's parallelism rather than a round 64, and
-      why the clamp stops at 32.
-
-      Tests: `rdnsd`'s `mod udp` (the pool answers what it receives; the response
-      buffer is the worker's, asserted on pointer identity, which fails if
-      `to_bytes_within` is put back — confirmed by doing it) and `rdnsr`'s
-      `a_datagram_over_the_in_flight_ceiling_is_dropped`, which holds the only
-      permit with a forward query to a black-hole upstream and shows the next
-      datagram getting no answer where it used to get an immediate NOTIMP.
-
-      Original finding follows.
-
-      (`rdnsd/src/main.rs:1077`, `rdnsr/src/main.rs:477`) — TCP has both
-      `MAX_TCP_CONNECTIONS` and `MAX_INFLIGHT_PER_CONNECTION`, UDP has neither.
-      Already noted for `rdnsr` at the end of #6; it is equally true of `rdnsd`.
-      Worse, `rdnsd` runs `should_allow` as the first thing *inside* the spawned
-      future (`:1092`), so the `to_vec()`, two `Arc` clones and the task are all
-      paid before anything decides to drop the packet. Fix: check the limiter and
-      the validator inline on `&buf[..size]` in the recv loop, then
-      `try_acquire_owned` on a `Semaphore` sized by `--max-concurrent-udp` —
-      `try_`, not `acquire`, because for UDP shedding is correct back-pressure and
-      awaiting would just move the queue into the kernel buffer.
-- [x] **Blocking I/O and full zone parse-and-sign run on the tokio runtime** —
-      **done 2026-08-01.** Both halves, and the mutex.
-
-      **The load.** `Reloading::load` runs on `spawn_blocking` now, and
-      `load_zones_from_source` is no longer declared `async` — it never was. The
-      signature was the trap rather than the cost: an `async fn` with zero await
-      points in it reads as though it yields somewhere, and nothing at the call
-      site said otherwise. The startup call stays on the calling thread on
-      purpose, and says so in a comment: no listener is bound yet, so there is no
-      worker to take out of service. It is the SIGHUP and re-signing paths that
-      needed moving, because those run with both transports live.
-
-      **The state write.** `record_state` updates the `StateFile` under the mutex,
-      takes a `snapshot`, drops the guard, and writes on `spawn_blocking`. The
-      finding offered "a `tokio::sync::Mutex` or move the write outside the
-      guard" — the second is better, because with the write gone the critical
-      section holds no `.await` at all and an async mutex would buy nothing. So
-      `StateFile::record` split into `set` (memory) + `snapshot` (path and bytes,
-      owned so they outlive the guard) + `write_snapshot` (free-standing,
-      because by then the caller has deliberately let go of the file *and* its
-      lock). `record` remains as the two glued together for sync callers.
-
-      Verified by `a_reload_does_not_block_the_runtime_it_was_called_from`, on a
-      **one-worker** runtime so the question has a yes-or-no answer: it counts
-      whether anything else on the runtime is polled while a reload of four
-      4,000-record zones runs. Zero against the old code, tens of thousands with
-      the load on a blocking thread.
-
-      **The first version of that test passed against both**, which is §1's
-      warning arriving on schedule. It called `load` from the test body, and
-      `#[tokio::test(flavor = "multi_thread")]` runs the body on the calling
-      thread via `block_on` — so the blocking call never occupied the worker it
-      was meant to be starving. The load has to be inside a spawned task, with
-      the body left as the observer.
-
-      **A second gap this turned up**, and the more useful one: the existing
-      "fetches, serves and persists" test asserted the transfer state through
-      `state.lock().unwrap().get(..)` — the copy *in memory*. It passes whether
-      or not the sidecar was ever written, so splitting the write out could have
-      dropped it silently and the suite would have stayed green. It now reloads
-      `StateFile` from disk and compares. Confirmed by deleting the write: that
-      one test fails, and it is the only one that does.
-
-      Original finding follows.
-
-      (`rdnsd/src/main.rs:1846`, `:1814`, `:2342`). `record_state` → `StateFile::record`
-      → `persist::write_atomically_str` does `File::create` + `write_all` +
-      **`sync_all`** + `rename` + a directory fsync, synchronously, on a worker
-      that is also serving queries — and holds a `std::sync::Mutex` across the
-      fsync, so a second secondary loop spins a worker rather than yielding.
-      `load_zones_from_source` is an `async fn` **containing zero await points**:
-      `read_dir`, `read_to_string` per zone, full parsing, then `signing.apply`
-      (ring ECDSA over every RRset), invoked from the SIGHUP task at `:1302` while
-      both listeners are live. The declared-`async`-but-fully-blocking signature is
-      the trap — it reads as if it yields. Fix: `spawn_blocking` for each, and make
-      the state mutex a `tokio::sync::Mutex` (or move the write outside the guard).
-- [x] **A full zone diff runs while the zone-map write lock is held** — **done
-      2026-08-01.** The diff is planned under the *read* lock, where queries run
-      alongside it; only the recording and the swap happen under the write lock.
-
-      **The counter is the part worth reading.** Splitting the work in two opens
-      a window between dropping the read guard and taking the write guard, in
-      which another task can install, expire or withdraw a zone — and a delta
-      computed against a version we are no longer replacing is exactly the "IXFR
-      chain that does not describe the zone we serve" that `install_zone`'s own
-      comment warns about. So the zone map is a `Zones` struct now, carrying a
-      `generation` that moves on every mutation: equal at apply time means the
-      plan still stands, different means re-plan under the write lock. **A serial
-      comparison would not have been sound** — two versions of a zone can carry
-      the same serial, an edited file reloaded without a bump being the ordinary
-      way — so the check has to be about identity and not about version.
-      Mutation goes through methods and there is no `DerefMut`, so the counter
-      cannot be forgotten at a call site (§2, make it unrepresentable).
-
-      `ixfr` grew `plan_change` and `DeltaLog::record` to make the split possible
-      without giving up the property that a caller cannot record a step without
-      having had the old version in hand: `record` consumes a token only
-      `plan_change` can mint. `note_change` stays as the one-shot wrapper.
-
-      **Freeing the old zones was half of what was left.** With the read/write
-      split alone, 12.7% of sampled queries were still locked out — the displaced
-      `HashMap` was being dropped *under* the write guard, one deallocation per
-      record of every zone. `insert` and `replace_all` hand the displaced data
-      back (`#[must_use]`) for the caller to drop after releasing the lock, which
-      took it to ~0.3%.
-
-      Verified by `a_reload_does_not_hold_the_write_lock_across_its_diffs`, which
-      samples "could a query have been answered right now?" continuously for as
-      long as a reload runs. **Shown to fail against the old code first**, as §1
-      demands: 127,697 of 128,319 samples locked out (99.5%) before, 90-484 of
-      ~85,000 (~0.3%) after. The first draft of that test used a single probe
-      after a fixed 20 ms sleep and **passed against both versions** — the diff
-      finished before the probe arrived, so it measured nothing. The sampling
-      loop is what makes it a test rather than a coin toss (§10); it asserts a
-      minimum sample count so a run that measures nothing fails loudly instead of
-      passing vacuously, and it is `multi_thread` on purpose, because the diff
-      has no `.await` in it and on the single-threaded runtime the reload would
-      finish before the reader was ever polled.
-
-      Original finding follows.
-
-      (`rdnsd/src/main.rs:1521`, `:1550`). `install_zone` takes `zone_map.write()`,
-      then `deltas.write()`, then calls `note_change` → `ixfr::diff`
-      (`ixfr.rs:175`), which walks every record of both versions into a
-      `BTreeMap`. On SIGHUP `install_all_zones` does that for *every* zone inside
-      one write guard, so every query blocks for the sum of the diffs — the exact
-      stall the comments at `main.rs:729` and `:1170` took trouble to avoid on the
-      read side. Fix: compute under the read lock, apply under the write lock.
-      Cheap once zones are `Arc<Zone>` (see 9e).
-- [x] **No config file; TSIG secrets go on the command line** — **done
-      2026-07-30.** `--config <FILE>` (TOML) in `rdnsd/src/config.rs`, with
-      `[server]`, `[signing]`, `[keys.<name>]` and `[zones.<name>]`, plus
-      `--check-config`.
-
-      **`secret-file` is the point of it.** A key's secret can live in a file of
-      its own, so it appears in neither `argv` nor the main config — and the file
-      is **mode-checked on Unix**, refusing anything group- or world-readable. A
-      secret in a file is only better than a secret in `argv` if the file is
-      actually private, and a key directory restored from backup as 0644 or
-      `chmod -R`'d by a deploy script is the ordinary way that stops being true.
-      Verified: with the secret in a file, `wmic process get CommandLine` shows no
-      trace of it. The `--tsig-key-file` the finding asks for is spelled
-      `secret-file` inside the config instead, because a flag would have put the
-      *path* on the command line to reach a secret the config already knows where
-      to find.
-
-      **The file and the flags are mutually exclusive**, and that is a decision
-      rather than an omission: `--config` with `--port` is a clap error, not a
-      precedence rule. Every precedence rule is one somebody has to remember at
-      3am to work out why the server is not listening where the file says — and
-      the failure is silent, because both values are valid. `--check-config`,
-      `--generate-keys` and `--config` are the exceptions, none being a setting.
-
-      **`deny_unknown_fields` on every table.** `require-signd = true` fails at
-      startup with the line number rather than serving unsigned zones quietly,
-      which is the whole difference between a config file and a config file worth
-      having.
-
-      **Per-zone settings, which is the gap the finding names.** `[zones.<name>]`
-      carries `file`, `masters`, `also-notify`, and signing overrides — `nsec3`,
-      `nsec3-opt-out`, `validity-days` — as `Option`s, so absent means *inherit
-      `[signing]`* rather than "the default". `ZoneSigning::policy_for` composes
-      the two, and `resign_interval` follows the **shortest** validity of any
-      zone rather than the global one: a seven-day zone among thirty-day ones
-      needs the timer on its schedule or it is the one zone that expires.
-      Verified live — a global NSEC/30-day policy with one zone overridden to
-      NSEC3/7 days produced `Signed example.com. with 2 keys, NSEC3 for 7 days`,
-      `re-signing every 56h`, and an `NSEC3PARAM` at that apex and nowhere else.
-
-      **A zone may name its own file, and that quietly fixes an older trap.**
-      `ZoneSource::Files` takes the origin from the *table key*, where
-      `--zone-file` derives it from the filename — the trap this document warns
-      about in "How to run", where a mismatch yields NXDOMAIN for everything with
-      nothing to say why. Only a config file can fix it, because only a config
-      file has somewhere to write the origin down. All-or-nothing on load like the
-      directory path, for the §4 reason.
-
-      **`--check-config` is a real dry run**, and where it exits is the design: it
-      returns *after* the config parsed, the secrets were read and mode-checked,
-      the ACLs and master specs parsed, every zone file loaded, every zone was
-      signed and every signature verified — and before any socket is bound. A
-      shallower check would pass for the failures that actually break a deploy: a
-      typo in a zone, a key file that got chmodded, signatures that do not verify.
-
-      **It cost nine crates** (`toml`, `serde` and seven transitive), taking the
-      lock from 104 to 113. Worth saying next to the OpenTelemetry deletion three
-      commits earlier, which removed eighty-three: the argument there was never
-      "no dependencies", it was "no dependencies that do not do anything". A
-      hand-rolled TOML subset that misreads a config file is exactly the class of
-      bug this file is full of — reading configuration wrong is worse than not
-      having any. Original finding follows.
-
-      (`rdnsd/src/main.rs:70-181`). `--tsig-key <[ALG:]NAME:SECRET>` puts the
-      base64 HMAC secret in `argv`, world-readable in `ps aux` and
-      `/proc/<pid>/cmdline`, in shell history, and copied verbatim into the
-      systemd unit the README tells you to write. At 40 zones and 6 keys that is a
-      multi-kilobyte, undiffable exec line maintained by hand: one `--secondary`
-      per zone, one `--tsig-key` per key, plus `--also-notify` per target. There is
-      no per-zone configuration at all (every zone gets the same signing policy,
-      NSEC/NSEC3 choice and validity) and no dry run. Fix: `--config <FILE>` (TOML)
-      with a `[zones.<name>]` table, `--tsig-key-file` reading mode-0600 secrets,
-      and `--check-config` that validates and exits without binding. Largest item
-      here, and the one that makes the rest configuration-manageable.
-- [x] **Any configured TSIG key authorizes a transfer of every zone** — **done
-      2026-07-30.** `TsigKey` carries a zone list, `--tsig-key` takes it as a
-      fourth field, and `answer_transfer` checks it against the requested apex
-      **before** the zone is looked up or any message is built — the point of an
-      authorization check being that the work does not happen. The check hangs off
-      the `TsigSession` rather than a fresh keyring lookup, because the session
-      *is* the answer to "which key was this" and a key name is attacker-supplied
-      until the MAC verifies.
-
-      Matched as a domain name: ASCII case and the trailing dot do not decide
-      authorization (RFC 4343), and a *child* of a listed zone is refused —
-      a transfer hands over a whole zone, so anything less specific than the apex
-      authorizes more than it names.
-
-      **A zone list requires the algorithm to be spelled out**, because
-      `name:secret:zones` and `alg:name:secret` are both three colon-separated
-      fields and telling them apart would mean guessing whether the first field
-      looks like an algorithm. Failing at startup with a message beats reading a
-      zone list as a base64 secret. An empty list — a bare trailing colon, or a
-      trailing comma — is an error rather than a silent widening to everything.
-
-      **The default did not change, deliberately, and that is the remaining sharp
-      edge.** A key with no zone list still transfers every zone: making it deny
-      would mean upgrading the binary silently stops every transfer on a working
-      deployment. What changed is that scoping is *expressible* and an unscoped
-      key is *visible* — the startup banner now names every key and what it may
-      transfer (`[partner.key. -> example.com.]`, or `-> every zone`). Narrowing
-      the default belongs with the config file below, where an operator is editing
-      the whole policy at once rather than reading a changelog.
-
-      **A second bug fell out of testing this, and it was older and wider.** The
-      REFUSED went back **unsigned** even though the request's TSIG had verified,
-      which RFC 8945 §5.3 forbids — and the consequence is this codebase's
-      recurring shape: the client cannot tell a refusal from a tampered reply.
-      dnspython reported the unsigned REFUSED as *"the TSIG record is
-      malformed"*, which sends whoever is debugging it after a key mismatch that
-      does not exist. It applied to **every** error on the transfer path, not just
-      the new one: NOTAUTH for a zone we do not serve, and SERVFAIL for a transfer
-      that would not build. `transfer_error` signs now when there is a verified
-      session, and deliberately does not when signing is what failed.
-
-      Verified against dnspython, whose TSIG is interop-tested against BIND: with
-      `--tsig-key hmac-sha256:partner.key.:<secret>:example.com.` on a server
-      holding two zones, `example.com.` transfers and `other.test.` comes back
-      `TransferError: Zone transfer error: REFUSED` — readable, which it was not
-      before the signing fix. With the same key unscoped, both transfer, which is
-      what every key used to do. Original finding follows.
-
-      (`rdnsd/src/main.rs:796`). `answer_transfer` asks only whether a session
-      exists — `authenticated_by.is_none()` — so holding *any* key in the keyring
-      transfers *any* zone, and bypasses `--allow-transfer` entirely. `TsigKeyring`
-      (`tsig.rs:168`) is a flat list with no key→zone binding, and the
-      `[alg:]name:secret` spec format has no field to express one. Hand a
-      per-customer key to one partner and you have handed them every zone on the
-      server, including zones whose ACL names nobody. Fix: an allowed-zone list per
-      key, checked against the requested apex before the messages are built.
-- [x] **No control channel — the runbook answer is "read the logs"** — **done
-      2026-08-01.** `--control-socket <PATH>` on `rdnsd`, `rdnsctl` as the
-      client, and `rdns::control` as the protocol both ends share so they cannot
-      drift about what a reply means.
-
-      **A Unix socket, mode 0600, and no TCP option**, which was settled by
-      reading what the others do rather than by picking (`CLAUDE.md` §4). Knot's
-      `knotc`, PowerDNS's `pdns_control` and Unbound with `control-interface:
-      /path` all use a socket and let the filesystem authenticate. The two that
-      use TCP put something in front of it — BIND's `rndc` an HMAC per
-      connection, NSD's `nsd-control` a client certificate. **Nobody ships an
-      unauthenticated control port**, which is also the argument that killed the
-      cheaper design of bolting `reload` onto `--metrics-listen` as a `POST`:
-      that endpoint is documented as having no auth, and read-only counters and
-      a reload are not the same risk.
-
-      **What the commands answer** is the finding's own list of four questions,
-      three of which had no answer from outside the box: `status` (zones,
-      serials, record counts, NSEC/NSEC3, primary-or-secondary, last contact with
-      a master), `reload`, `dump <zone>`, plus `version` and `help`.
-
-      **`reload` reports the result, which a signal cannot**, and that is the
-      part worth having. Measured live: with a typo in a zone file,
-      `rdnsctl reload` exits 1 and says `the reload failed and the zones already
-      loaded are still being served: line 8: SOA record needs 7 fields, got 0`;
-      `kill -HUP` says nothing and leaves the operator to grep for it. The
-      README's unit now uses `ExecReload=rdnsctl reload` so `systemctl reload`
-      fails when the reload did. Three exit codes, because a deploy script needs
-      to tell a bad zone file (1) from a daemon that is not running (2).
-
-      **No per-zone reload, which the finding asked for.** `Reloading::load` is
-      all-or-nothing on purpose — nothing is installed unless the whole set comes
-      through — so reloading one zone out of a set that was never validated as a
-      set would be that bug with a smaller blast radius. `rdnsctl reload
-      example.com.` is refused with that sentence rather than quietly reloading
-      everything.
-
-      **It is a third trigger on the existing maintenance loop, not a fourth
-      caller of `Reloading::load`** (§7). SIGHUP, the re-signing timer and the
-      socket all send a `ReloadTrigger` to one task, which is what stops two
-      reloads installing two different snapshots of the same files. The trigger
-      carries the reply channel, so `reload_once` still takes seven arguments
-      rather than eight.
-
-      Three things the bind does that a plain `bind()` would not, each verified
-      by doing it: a **live** socket is not stolen (a second server on the same
-      path is refused, rather than leaving two daemons and one working control
-      channel), a **stale** socket file does not block a start (the ordinary
-      state after a crash), and the mode is in place **before the path is** — the
-      socket is bound under a temporary name, restricted, then renamed over the
-      target, which is `persist`'s atomic-rename idiom applied to a socket and
-      closes the window in which it would be reachable with whatever the umask
-      gave it. The socket is removed on a clean stop, so `rdnsctl` says "no such
-      file" rather than "connection refused" about a server that is not running.
-
-      **Unix only**, like SIGHUP reloading, and `--control-socket` on Windows is
-      refused at startup with that sentence rather than accepted and ignored
-      (§15). The flag and the config key parse on both platforms on purpose, so
-      one config file read on either fails with a sentence rather than an
-      unknown-key error.
-
-      13 tests in `rdnsd::control` and 7 in `rdns::control`, including the socket
-      end to end — bind, mode 0600 asserted on the file, a command answered over
-      it, and the file gone after the stop — because a control channel that
-      answers in a unit test and not over its socket is not a control channel.
-      Verified live besides: `status`, `dump`, a failed reload, a recovered
-      reload, the double-start refusal, and the exit codes.
-
-      Original finding follows.
-
-      Of the four questions an
-      operator asks at 3am, exactly one is answerable: *"is example.com loaded, at
-      what serial?"* (query the SOA). *"Is broken.test loaded?"* — REFUSED, which
-      is identical to a zone that was never configured. *"Is the secondary in
-      sync?"* — read the state sidecar off the box by hand. *"Why did this query
-      SERVFAIL?"* — `rdnsd` barely emits SERVFAIL at all. Fix:
-      `--control-socket <PATH>` with `status` (zones, serials, load time, per-zone
-      last transfer), `reload [zone]`, and `dump <zone>` — `zone_writer` already
-      exists for the last one and has no CLI surface yet (noted at #7 step 2).
-
-      (The logs are `tracing` with levels and timestamps now, not `println!`;
-      that half went with 9d's log-volume item and the sentence above predates
-      it.)
-- [x] **Docs an operator will copy from are wrong** — **done 2026-07-30.** The
-      `rdnsd -- udp` invocations are gone from both files (two in `CLI_USAGE.md`,
-      one in `README.md`), along with a "Run TCP server for zone transfers" second
-      invocation that never made sense — one process binds both listeners, which
-      is what makes a rate limit, a TSIG session and an ACL mean the same thing on
-      either transport. The corrected command was run to confirm it starts.
-
-      `--zone-dir` no longer claims to recurse; it says flat, and points at the
-      config file's `[zones."name"] file = "..."` for anyone with a tree.
-
-      The systemd unit gained `User=`/`Group=`, an `ExecStartPre` running
-      `--check-config`, `KillSignal=SIGTERM` with a note that the drain is bounded
-      at 5s so the default 90s `TimeoutStopSec` is ample, `ReadWritePaths` for the
-      secondary case, and `--config` instead of a flag soup. The `sudo rdnsd`
-      suggestion is replaced by `setcap CAP_NET_BIND_SERVICE`, with the reason
-      stated: **rdnsd still has no `--user`/`--group`**, so it never drops
-      privilege after binding — whatever it starts as, it stays as, reading
-      private signing keys as that user for the life of the process. Documented
-      rather than fixed; the privilege-drop flag is now its own open item below.
-      (That sentence said "is left below as its own item" when the item did not
-      exist — the §4 mistake again, a claim about neighbouring text nobody
-      opened. Corrected by adding it rather than by deleting the sentence.)
-
-      **2026-08-01: that item is now closed as won't-fix** — see it below for
-      why. "Documented rather than fixed" turned out to be the right answer and
-      not a shortfall: `User=` plus an ambient capability is what a privilege
-      drop is trying to approximate, and it gets there without the process ever
-      being root.
-
-      **Two parts of this finding were already fixed before I got to it**, and are
-      recorded rather than claimed: `CLI_USAGE.md:25` already explained that the
-      subcommands were removed, and the line numbers in the original text had
-      drifted. Original finding follows. `docs/CLI_USAGE.md:366` and
-      `:382-391` still document the `rdnsd udp` / `rdnsd tcp` subcommands, and
-      README.md:31-34 has them too — both **removed**, as line 25 of CLI_USAGE.md
-      itself explains; copy either and the daemon refuses to start.
-      `CLI_USAGE.md:100` claims `--zone-dir` "recursively searches" for `*.zone`
-      files — `enumerate_zone_files` is a flat `read_dir`, so organising 40 zones
-      into subdirectories serves nothing. The README's systemd unit (`:106`) omits
-      `User=`/`Group=` (it runs as root, reading private signing keys as uid 0) and
-      omits every flag a real deployment needs. Also: no privilege drop exists
-      anywhere — no `--user`/`--group` to drop after binding 53 — and the README's
-      `sudo rdnsd` suggestion should go.
-- [x] **No CI, and `deny.toml` has never been green** — **done 2026-07-30**, and
-      it found a live vulnerability on its first real run.
-
-      `.github/workflows/ci.yml` has five jobs: **test** (build + test on
-      *both* Linux and Windows — not decoration, since the ICMP predicate, the
-      oversized-datagram receive error and the whole signal story behave
-      differently between them and every one of those has been a bug here),
-      **lint** (clippy `-D warnings` and `fmt --check`), **msrv** (builds on
-      1.95 exactly, which is what turns `rust-version` from a claim into a fact),
-      **deny**, and **features** (builds `--features dhat-heap`, because
-      feature-gated code is code nobody compiles until the day they need it in a
-      hurry). `RUSTFLAGS: -D warnings` throughout. Every job was run locally
-      before landing.
-
-      **`deny.toml` is rewritten and now passes all four checks** — the first time
-      this repository has had that. The old file was the unmodified upstream
-      template and could not have passed: it allowed only MIT and
-      Unicode-DFS-2016 with Apache-2.0 commented out, so `ring` (Apache-2.0 AND
-      ISC) and `unicode-ident` (Unicode-3.0) would both have failed. The new
-      allow-list was derived by reading `cargo metadata`, not guessed, and passed
-      first time. The finding's other claim held exactly: cargo-deny 0.16.1 fails
-      here with "unknown variant `2024`" because eleven crates in the graph are
-      edition 2024, so 0.20.2 was installed to verify against and CI pins a new
-      enough one.
-
-      **It immediately caught something real**: `anyhow` 1.0.102 carries an
-      advisory (RUSTSEC, fixed in 1.0.103); updated to 1.0.104. That is the whole
-      argument for the item in one line — the check had never run, and there was
-      a known-vulnerable dependency sitting in the lock file.
-
-      Two `bans` findings were real and are fixed rather than silenced. Duplicate
-      `syn` (2 via `clap_derive`/`num-derive`, 3 via `serde_derive`/
-      `thiserror-impl`) is skipped **by name with a reason**, keeping
-      `multiple-versions = "deny"` for everything else — the case that mattered
-      was a *runtime* duplicate, the two `opentelemetry` copies, and a warning
-      nobody reads would have missed it as thoroughly as no check. And the
-      wildcard `rdns = { path = "../rdns" }` was a correct complaint: with no
-      version alongside the path, none of these crates could ever be published.
-      Fixed with **workspace inheritance** — `[workspace.package]` and
-      `[workspace.dependencies]` now hold the version, edition, licence, MSRV and
-      the internal dependency once instead of four times.
-
-      **`--version` identifies a build now.** `rdns/build.rs` stamps
-      `<package> (<git describe --always --dirty --tags>)` and all three binaries
-      report it: `rdnsd 0.1.0 (ca422ac-dirty)`. In the library rather than once
-      per binary, so there is one copy to drift (`CLAUDE.md` §7), and it degrades
-      to the bare version when there is no git — a released tarball or a shallow
-      checkout, neither of which should fail a build.
-
-      **`RDNS_GIT_DESCRIBE` overrides the `git describe` call (2026-08-01)**, for
-      a build with no repository to ask. That is the container image: putting
-      `.git` in a build context so a build script can run git inside it is how
-      every version of every file ever committed ends up one careless
-      `COPY --from` away from an image layer. What the variable carries is the
-      *description*, not the whole version string, so the format still comes from
-      the one `match` in `build.rs` and the two paths cannot drift.
-
-      **One part is deliberately not done, because it is not mine to decide.** The
-      manifests say `license = "MIT OR Apache-2.0"` and the repository ships only
-      an MIT `LICENSE`. Resolving it means either adding `LICENSE-APACHE` or
-      narrowing the manifests to `MIT`, and which of those is right is a decision
-      for the copyright holder rather than a bug to fix. `cargo deny` does not
-      object either way. Original finding follows. No `.github`, no CI config
-      of any kind: nothing runs the 553+37 tests or clippy on push. No MSRV is
-      pinned anywhere (no `rust-version`, no `rust-toolchain.toml`) while the
-      README asserts "Rust 1.95.0+". All three crates are `version = "0.1.0"`, so
-      `--version` cannot identify a build. `deny.toml` is the **unmodified upstream
-      template** — `allow = ["MIT", "Unicode-DFS-2016"]` with Apache-2.0 left
-      commented out, so it would fail on `ring` (Apache-2.0 AND ISC) and
-      `unicode-ident` (Unicode-3.0) the first time it ran; and it *cannot* run here
-      anyway, because cargo-deny 0.16.1 errors with "unknown variant `2024`" on an
-      edition-2024 crate in the graph. Both workspace crates declare
-      `license = "MIT OR Apache-2.0"` while the repo ships only an MIT `LICENSE`.
-      Fix: GitHub Actions running build + test + clippy + a cargo-deny new enough
-      to parse edition 2024; pin the MSRV; stamp the version from git; add the
-      Apache license file or drop the claim.
-- [x] **`rdnsd` did not compile on Unix at all** — **found and fixed
-      2026-08-01**, while trying to run the permission tests below on Linux.
-      New finding, not from the review.
-
-      `next_reload_signal` called `signals.next()` on a
-      `signal_hook_tokio::Signals`. That resolves to `Stream::next` only with a
-      `StreamExt` in scope; nothing imported one, and neither `futures` nor
-      `tokio-stream` was a dependency — so it resolved to `Iterator::next`,
-      which `SignalsInfo` does not implement, and the build failed:
-
-      ```
-      error[E0599]: the method `next` exists for mutable reference
-      `&mut signal_hook_tokio::SignalsInfo`, but its trait bounds were not satisfied
-      ```
-
-      The whole module is `#[cfg(unix)]`, so **no amount of building on Windows
-      could show it**, and this is a workspace developed on Windows. The daemon
-      has therefore never built on its own deployment platform since SIGHUP
-      reloading was written.
-
-      **Why CI did not catch it: CI has never run.** `.github/workflows/ci.yml`
-      does build and test on `ubuntu-latest`, exactly as its own commit says —
-      but `git remote -v` is empty. There is nowhere for it to run. The workflow
-      was landed with "every job was run locally before landing", and on Windows
-      that claim was true and useless. This is `CLAUDE.md` §4's rule again at one
-      remove: the file asserting the property was never the thing that upholds
-      it.
-
-      The fix removes dependencies rather than adding one. `tokio::signal::unix`
-      is already in the workspace — `rdns::shutdown` uses it for SIGTERM — so
-      SIGHUP uses `signal(SignalKind::hangup())` and `recv()`, one mechanism for
-      every signal this process handles, and **`signal-hook` and
-      `signal-hook-tokio` are gone** (`Cargo.lock` loses 30 lines with their
-      transitives). A dependency that never worked is the purest case of §14's
-      "count what a dependency does at run time".
-
-      Verified by building and running the whole suite on the Linux side:
-      `cargo build --workspace --all-targets` succeeds, `cargo test --workspace`
-      is 701 passing. **Not verified there:** `cargo clippy`, which that image
-      has no package for — Windows clippy is clean and the Unix-only code is one
-      function, but the gap is real and belongs in the record rather than in an
-      assumption. What would close all of this properly is a remote for the CI
-      to run on.
-
-- [x] **Private key permissions are best-effort on write and unchecked on read**
-      — **done 2026-08-01**, both halves, with the check in one place.
-
-      `rdns::persist::ensure_private(path, what)` is the whole of it, called by
-      `SigningKey::load_dir` and by `rdnsd`'s `read_secret_file`. The TSIG copy
-      in `rdnsd/src/config.rs` is deleted rather than duplicated: "is this file
-      private enough to hold a secret" is one question, and a second
-      implementation of a security check is one more thing to get wrong (§7).
-      `what` names the secret so the message can still say "a TSIG secret" or
-      "a DNSSEC private key".
-
-      **The write side moved too, and closed a window nobody had mentioned.**
-      `write_to_dir` did `write_atomically_str` — temp file, rename — and *then*
-      `let _ = set_permissions(0o600)` on the final path. Two faults in one line:
-      the failure was discarded (§4), and between the rename and the chmod the
-      private key sat at whatever the umask allowed, 0644 on a stock Linux.
-      `persist::write_atomically_private` restricts the **temporary** file before
-      the rename, so the name the key is finally known by only ever refers to a
-      file that was already 0600, and a failure to restrict fails the write.
-
-      Verified **on Linux**, which is the only place any of this exists — see the
-      next item for why that was not previously possible. `ensure_private` is
-      checked against six modes; `a_world_readable_private_key_is_refused_by_the_loader`
-      writes a real key, confirms `write_to_dir` left it 0600, chmods it 0644,
-      and requires the loader to refuse. **Shown to fail against the old
-      behaviour**: with the check removed the world-readable key loads and the
-      test reports `unwrap_err() on an Ok value: [SigningKey { .. }]`.
-
-      Two things running it on Linux caught that Windows could not:
-
-      - The mode-table test was **wrong on its first run** — after the 0400 case
-        it left the file read-only, so the next `fs::write` failed with EACCES.
-        It removes the file each iteration now.
-      - `a_key_directory_loads_every_key_and_refuses_a_broken_one` writes its
-        broken key with `fs::write`, which is 0644 under the usual umask — so
-        the new check would have fired *before* the parse and that test would
-        have quietly stopped being about a broken key. It chmods to 0600 first
-        and now asserts the error names `Flags`, so it fails if it ever drifts
-        back onto the permission path (§1).
-
-      Original finding follows.
-
-      (`rdns/src/dnssec_key.rs:590`, `:472`). `--generate-keys` does
-      `let _ = set_permissions(..., 0o600)` on Unix and nothing at all on Windows;
-      `load_dir` reads whatever is there with no check and no warning. A key
-      directory restored from backup as 0644, or `chmod -R`'d by a deploy script,
-      is silently accepted with a world-readable zone-signing key.
-
-      **The check already exists and is in the wrong crate.** `rdnsd`'s config
-      module grew `check_secret_permissions` for TSIG `secret-file` (mode
-      `& 0o077 != 0` is refused, with the platform caveat stated out loud). This
-      item is the same check on the DNSSEC key directory, so the fix is to move
-      that helper into `rdns` and call it from both — `CLAUDE.md` §7, before there
-      is a second copy to drift.
-- [x] **No `--user`/`--group`** — **closed 2026-08-01 as won't-fix: this is the
-      service manager's job, and it does it better.** The item is kept rather
-      than deleted because the reasoning that made it look open is the useful
-      part.
-
-      The original finding below is not wrong about the facts — `rdnsd` does not
-      drop privilege, and whatever it starts as it stays as. What it got wrong is
-      the assumption that the *daemon* is what should fix that. The unit in
-      `README.md` runs `User=rdns` with `AmbientCapabilities=CAP_NET_BIND_SERVICE`
-      and `NoNewPrivileges=true`, and that is **strictly stronger than a setuid
-      drop, not merely equivalent to it**:
-
-      - **The process is never root, not for one instruction.** A drop after
-        binding leaves a window in which the process holds root's fd table,
-        environment and full capability set, so anything before the drop — a
-        config parse, a key load, a panic writing a core — is a bug in root
-        context. An ambient capability is handed to a process that started
-        unprivileged: there is no window to get wrong.
-      - **The drop does not fix the harm the finding names.** "Reads private
-        signing keys as uid 0" is solved by dropping *before* the key load — at
-        which point the keys must already be owned by the target user, which is
-        exactly what `User=` gets you with no code at all. Drop *after* the key
-        load and they were read as root anyway. The flag is either redundant with
-        the file ownership you need regardless, or it does not address the
-        complaint it was written for.
-      - **It would break the dry run.** `ExecStartPre` runs `--check-config` as
-        `rdns` today, which is what makes §15's "a chmodded key fails the dry
-        run" actually true. An in-process drop makes the check run under one
-        identity and the server under another — a dry run that passes for
-        precisely the failure it exists to catch.
-      - **And it is a Unix-only, thread-hostile code path.** `setuid(2)` is
-        per-thread in the kernel; POSIX semantics are a glibc/musl signal
-        broadcast to every thread, and doing that after tokio has spawned its
-        worker pool is delicate with a silent partial failure. `setgroups` must
-        precede `setuid` or the supplementary groups survive the drop — the
-        classic version of this bug, still shipping in real daemons. That is a
-        platform-conditional path in a workspace whose CI builds both platforms
-        *because* per-platform paths keep being where the bugs are.
-
-      One correction to the finding while it is open: the unit does not use
-      `setcap`, it uses `AmbientCapabilities`, and the difference matters. A file
-      capability is granted to **everyone who executes that binary**, so anyone
-      with a shell can bind low ports with it; the ambient capability is granted
-      to the one invocation systemd starts. `setcap` survives in the README only
-      as the fallback for running outside a service manager, which is the case
-      where there is nothing else to grant it.
-
-      **What would reopen this: `chroot`.** NSD and Unbound keep their own drop
-      because they chroot first, and entering a chroot needs privilege that
-      binding a socket does not. If `--chroot` is ever wanted, the two arrive
-      together. Until then `ProtectSystem=strict` plus `ReadWritePaths` covers
-      the filesystem-confinement half, and both are already in the unit.
-
-      Every supervisor anyone would realistically deploy this under can set an
-      identity: systemd `User=`, OpenRC's `start-stop-daemon --user`, FreeBSD's
-      `daemon -u`, launchd's `UserName`, a container's `USER`, a Windows service
-      account. Re-implementing that badly inside the daemon is not worth the
-      code. **If someone deploying this hits a supervisor that cannot, that is a
-      PR** — and this item is the argument it has to answer. Original finding
-      follows.
-
-      Whatever it starts as, it stays as, reading private signing keys with those
-      credentials for the life of the process. Binding 53 needs privilege for one
-      syscall and nothing after it. The README now recommends `setcap
-      CAP_NET_BIND_SERVICE` plus systemd's `User=` instead of `sudo rdnsd`, which
-      sidesteps the problem for the deployment that reads the README and not for
-      anyone else. Unix-only by nature; say so where it lands.
-- [x] **No container image, no readiness signal** — **done 2026-08-01.** Both
-      halves, and the readiness half found the finding's own reasoning to be
-      wrong. Original text follows the correction, per `CLAUDE.md` §11.
-
-      **The state the finding described does not exist here.** "Bound but still
-      parsing 40 zones" cannot happen: `main` loads, signs and verifies every
-      zone and *then* calls `serve`, which is what binds. A failure anywhere in
-      there stops the start. So a **primary** is ready the instant it is alive,
-      and `Readiness::ready()` says exactly that rather than special-casing it.
-
-      **The state that does exist is a secondary's**, and it is worse than the
-      one that was imagined, because it is not a few seconds of parsing — it
-      lasts until a master answers. `withdraw_unvouched_zones` removes every
-      replicated zone whose age cannot be vouched for (a cold start with no state
-      sidecar is all of them), the server binds, and it answers REFUSED for those
-      names until the first transfer lands. Nothing reported it: the per-zone
-      gauges are deliberately *absent* for a zone we do not hold, and absence is
-      not something a probe can be pointed at.
-
-      **What landed**: `rdns::readiness::Readiness` — a fixed set of zone names,
-      one `AtomicBool` each plus a counter, no lock — built in `main` from the
-      `--secondary` specs the zone map does not satisfy, ticked off in
-      `refresh_once` next to `install_zone`, and read by `GET /readyz` on
-      `--metrics-listen`. 503 with the zone names in the body until every one has
-      arrived, 200 after. `/healthz` is unchanged and stays liveness-only. The
-      startup banner says what is being waited for, and says so even when
-      `--metrics-listen` is off and therefore nothing can ask (§14: a control
-      nobody can observe is a control nobody can debug).
-
-      **It is a one-way latch**, and that is the decision worth recording: a zone
-      withdrawn later by EXPIRE does not take the server back to not-ready.
-      Every replica of a zone expires in the *same second* — they share the
-      master's EXPIRE and lost contact when the master did — so readiness
-      following expiry would pull the entire nameserver set out of rotation at
-      once, turning "the data is stale" into "there is no server". That is what
-      the `dns_zone_last_refresh_timestamp_seconds` alert is for.
-
-      **Verified by provoking it** (§4), not by reading the diff: a real
-      secondary started with its master down answered `/healthz` 200 and
-      `/readyz` 503 `waiting for 1 zone(s) to transfer: example.com.`; the master
-      was then started with `--also-notify`, and the same two probes read 200 and
-      200, with `rdnsc` getting the transferred record from the secondary. Both
-      `/readyz` tests were also run against the code with the endpoint removed,
-      and both fail there (§1).
-
-      **The image**: `Dockerfile` plus `.dockerignore`, multi-stage, running as
-      uid 65532 and listening on 5353 — an unprivileged process cannot bind 53,
-      and both ways around that are worse than publishing a port (root for the
-      life of the process for one syscall; or a file capability that
-      `docker inspect` cannot see and every derived image inherits). No
-      `HEALTHCHECK`: it runs a command *inside* the container, which would mean
-      shipping an HTTP client next to a DNS server to issue one GET, and every
-      orchestrator that would schedule this probes over the network itself.
-
-      **The build context is an allowlist, and `.git` is not on it.** `*` then
-      `!` per workspace member, and the `COPY`s name each directory rather than
-      being `COPY . .`, so two independent things would have to go wrong for
-      anything else to reach a layer. The first version of this kept `.git` on
-      purpose — `build.rs` runs `git describe`, and a bare "0.1.0" identifies
-      nothing — which had it exactly backwards: a repository in a build context
-      is every version of every file anyone ever committed, sitting one careless
-      `COPY --from` or one `--target build` away from being published, and a
-      discarded build stage is a convention rather than a guarantee. The stamp
-      comes in through `RDNS_GIT_DESCRIBE` instead (see #9d's CI item), computed
-      by whoever *has* the repository. In CI that is not a `git` call either:
-      GitHub already states `github.ref_type`, `ref_name` and `sha`, so the job
-      composes the description from those and does not need `fetch-depth: 0` —
-      the tag on a tag push, `g<short sha>` otherwise. What that cannot express
-      is `git describe`'s "nearest tag plus commits since", which no environment
-      variable carries.
-
-      **Built and run — the Linux image has docker now** (29.6.2, `sudo -n` for
-      the socket; the user is in `wheel` and not `docker`). This paragraph
-      previously said the image was a written artifact and not a verified one,
-      which was true for about an hour. Build: 50s cold, 31 MB, and the whole of
-      it end to end:
-
-      | checked | result |
-      |---|---|
-      | `--version` | `rdnsd 0.1.0 (0904562)` — the build arg reached the binary |
-      | `id` | `uid=65532(rdns) gid=65532(rdns)` |
-      | `find / -name .git` | 0 hits — the point of the allowlist |
-      | primary: `/healthz`, `/readyz` | 200, 200 |
-      | primary: `/metrics` | `dns_zone_serial{zone="example.com."} 7` |
-      | primary: DNS | the A record, asked with the `rdnsc` inside the image |
-      | **secondary, master not started** | `/healthz` **200**, `/readyz` **503** `waiting for 1 zone(s) to transfer: example.com.` |
-      | **master appears** | `/readyz` **200 within 2s**, and the secondary serves the record |
-      | `docker stop` | "SIGTERM received" → "drained cleanly", exit **0** |
-
-      The two-container half is the one worth having: two `rdnsd`s on a docker
-      network with static addresses, the secondary started *first*, so the
-      not-ready window is the real one rather than a simulated one. It is also
-      the only place `rdnsd` has been observed handling SIGTERM as **PID 1**.
-
-      **51 MB → 31 MB** by stripping debuginfo in the image build. The workspace
-      sets `[profile.release] debug = 1` so a DHAT profile has `file:line` in its
-      frame table; nothing in the image can use that, since the profiler is behind
-      a feature that is not built here and there are no sources to resolve frames
-      against.
-
-      CI runs the same checks on every push (the `image` job), which is what keeps
-      this true rather than true once.
-
-      Original finding: *no Dockerfile, no `Type=notify`/sd_notify. With
-      `Restart=on-failure` and no readiness gate, a rolling restart moves traffic
-      to an instance that has bound the socket but is still parsing 40 zones.*
-      sd_notify was not adopted: it is a systemd-only protocol for the same fact
-      `/readyz` reports over HTTP, and one answer readable by every orchestrator
-      beats two that have to agree.
-
-#### 9e. Performance — all measured under `--release`
-
-Every item below except the first was found by reading code and confirmed by
-timing it. **Do the first one first**: it turns the rest from a list of claims
-into a measurement you can re-run, and it is what tells you when to stop.
-
-- [x] **Profile the allocation pattern with DHAT, then drive it down** —
-      **the profiling half is done 2026-07-29**; driving it down is the items
-      below plus three the profile turned up that were not on anyone's list.
-
-      **Wiring**: `--features dhat-heap` on `rdnsd` swaps in the allocator shim
-      and writes `dhat-heap.json` on exit; `[profile.release] debug = 1` in the
-      workspace manifest is what gives the frame table `file:line`. The profiler
-      is bound in `main` and not in `serve`, so it outlives the drain. **This is
-      where graceful shutdown pays off**: the report is written on `Drop`, and
-      before that fix Ctrl-C killed the process before it happened.
-
-      **Baseline, measured on 1,000 UDP queries against a 5-record zone**
-      (996 answered; the four lost are ordinary UDP loss): **29,365 blocks,
-      3.32 MB — about 29 allocations and 3.3 KB per query.** By site, per query:
-
-      | per query | bytes each | site |
-      |---|---|---|
-      | 4.0 | 16 | `zone::absolutize` |
-      | 2.0 | 32 | `Zone::of_type` |
-      | 2.0 | 64 | `compression::write_name` (the `starts` vec) |
-      | 2.0 | 22 | `compression::write_name` (the arena growing) |
-      | 2.0 | 24 | `make_response` (`msg.queries.clone()`) |
-      | 3.0 | 96 | `dname` parsing |
-      | 1.0 | **1,536** | `tokio::spawn` per datagram, in `udp_loop` |
-      | 1.0 | 33 | `udp_loop`'s `to_vec()` of the packet |
-      | 1.0 | 224 | `add_answer` pushing into the answer vec |
-      | 1.0 | 32 | `tsig::find_tsig` |
-
-      **Three findings that were not on the list below**, which is the whole
-      reason this item said to profile before optimising:
-
-      1. **The spawned task is 1,536 bytes — 46% of every byte allocated per
-         query.** `tokio::spawn` per datagram costs more than the entire rest of
-         the query path put together. That is a number for #9d's "unbounded
-         `tokio::spawn` per UDP datagram", which is now a memory item as well as
-         an admission-control one.
-      2. **`zone::absolutize` is the biggest count at 4 per query.** It returns
-         `String` unconditionally, so a qname that arrived absolute and lowercase
-         — the common case off the wire — is copied four times over on the way
-         through `lookup_key`, `name_kind` and `delegation_for`. A `Cow` and a
-         borrowed `HashMap` lookup would take it to nearly zero. Not done: it
-         touches the public `normalize_name` and deserves its own change. (It got
-         one on 2026-08-01, and "nearly zero" was right — it is zero. The
-         prediction is left as written because it is the reason the item was
-         split out; see the closed checkbox below.)
-      3. **`tsig::find_tsig` allocated a 4-element `Vec<usize>` per packet** —
-         **fixed here**, since it is one line. It built the section counts on the
-         heap *before* the "is there an additional section at all" check, so
-         every query on every server paid for it, TSIG configured or not.
-         Re-measured: 29,365 → 28,374 blocks, and the site is gone from the
-         profile.
-
-      **And one negative result worth recording**, because it redirects effort:
-      `verify_rrset` against **two** candidate RRSIGs costs 22 allocations. The
-      "DNSSEC canonicalization is rebuilt per candidate" item below is real, but
-      it is a *time and bytes* problem rather than an allocation-count one — do
-      not go at it expecting the count to move.
-
-      **The results are pinned as tests**, which was the part worth the effort:
-      `rdns/tests/allocations.rs`, its own test binary so the `#[global_allocator]`
-      does not slow the other 593 unit tests. Six measurements with ranges wide
-      enough to survive a `HashMap` growing differently and narrow enough to
-      catch a per-record allocation appearing in a loop. (Fourteen now, most of
-      them exact rather than ranges, in one `#[test]` — see the correction under
-      the first harness trap below.)
-
-      **Two harness traps, both of which produced wrong numbers first:**
-
-      - **The profiler is global, so guarding only the measurement is not
-        enough.** While one test measures, allocations made by every *other* test
-        thread land in its total. The first version locked around the
-        `allocations()` call only and gave 4 where the truth was 12, 208 where it
-        was 1015 — numbers that changed with `--test-threads`. Every test now
-        holds the mutex for its whole body.
-
-        **That was not enough, and the reasoning above is why** (corrected
-        2026-08-01). "Every *other* test thread" was the wrong boundary: a mutex
-        in this file cannot cover libtest's own per-test bookkeeping, which runs
-        on its threads around the bodies rather than inside them, and lands in
-        whichever measurement is open. It read 15 where the answer is 7, on
-        three runs in five on Linux and never on Windows. The file is one
-        `#[test]` now; the mutex stays as the thing a second one would collide
-        with.
-      - **The first profiled block in the process picks up a one-off.** For a
-        measurement whose target is exactly zero that is the difference between
-        passing and failing depending on which test the scheduler started first.
-        Call the function once before measuring it.
-
-      Original finding follows.
-
-      The findings below are individually true but were each found by hand, which
-      means the list is certainly incomplete and none of it is guarded against
-      coming back. `dhat` (the crate — Nicholas Nethercote's Rust port) answers
-      "how many allocations, how big, from which line" for a real workload, and
-      the answers are the input to every other item in this section.
-
-      **It runs natively on Windows — verified on this machine, 2026-07-27.** No
-      Valgrind, no Linux VM. The Valgrind tool and the crate share only an
-      output format and a viewer; the crate is a global-allocator shim that
-      records a backtrace per allocation and writes `dhat-heap.json` on `Drop`.
-      Symbolization works: the frame table resolves to `file.rs:line`. A probe
-      reproducing `to_bytes_within`'s shape (below) reported **65,560,600 bytes
-      live in 1,002 blocks** for 1000 sixty-byte responses, which is the
-      independent confirmation of the 64 KiB item three bullets down.
-
-      Wiring, feature-gated so a normal build never sees it:
-
-      ```toml
-      # rdnsd/Cargo.toml
-      [dependencies]
-      dhat = { version = "0.3", optional = true }
-      [features]
-      dhat-heap = ["dep:dhat"]
-
-      # workspace Cargo.toml — without this the frame table has no file:line
-      [profile.release]
-      debug = 1
-      ```
-      ```rust
-      #[cfg(feature = "dhat-heap")]
-      #[global_allocator]
-      static ALLOC: dhat::Alloc = dhat::Alloc;
-      // first line of main(), held for the life of the process:
-      #[cfg(feature = "dhat-heap")]
-      let _profiler = dhat::Profiler::new_heap();
-      ```
-
-      Three things that will otherwise waste an afternoon:
-
-      - **The profiler writes on `Drop`, so a daemon that never returns from
-        `main` never writes the file.** This used to say "there is no SIGTERM
-        handler yet (#9d), so Ctrl-C kills it before the drop runs — do the
-        graceful-shutdown item first". **That was done on 2026-07-29 and this
-        item with it**: both daemons return from `main` on a signal with exit
-        code 0, so the profiler writes `dhat-heap.json` on the way out —
-        confirmed by doing it. `dhat::Profiler` is bound in `main` and not in
-        `serve`, or the drop would happen before the drain and the report would
-        be short.
-      - **Never read timing numbers from a DHAT build.** Collecting a backtrace
-        per allocation dominates everything; it answers how many and how big, not
-        how fast. The nanosecond figures in the items below were measured
-        *without* it and re-measuring them under it will contradict them for the
-        wrong reason.
-      - **The viewer is the loose end.** `dh_view.html` ships with Valgrind, which
-        is not installed here; there is a hosted copy on the author's GitHub
-        Pages but that URL was **not** verified from this machine. The JSON is
-        self-contained and readable directly for simple questions — the 65 MB
-        figure above was read straight out of it.
-
-      What to actually measure, in order: one UDP query end to end (the target is
-      the per-query allocation *count*, and the interesting number is how much of
-      it is response serialization); one full zone load and sign; one AXFR out;
-      one recursive resolution with validation. Each has a different shape and the
-      last two are where a surprise is most likely, since nobody has looked.
-
-      **Then pin the results as tests, which is the part worth the effort.**
-      `dhat::Profiler::builder().testing()` plus `dhat::assert_eq!` on
-      `HeapStats::get().total_blocks` turns "N allocations per query" into an
-      exact assertion:
-
-      ```rust
-      let _p = dhat::Profiler::builder().testing().build();
-      // ... serialize one response ...
-      dhat::assert_eq!(dhat::HeapStats::get().total_blocks, 1);
-      ```
-
-      Several findings below *are* allocation-count claims — ~8 per compressed
-      name, 2–4 per query for re-parsed EDNS, one 64 KiB block per response — and
-      an exact count does not have `bench.rs`'s failure mode. A wall-clock floor
-      gets moved when the machine is busy, which is how the `log_query` quadratic
-      survived (see the next item and "Current state"); an allocation count is
-      deterministic and does not care what else is running. Put these under
-      `benches/` or a `#[test]` alongside the criterion conversion at the end of
-      this section, not in `bench.rs`.
-
-      A scratch project that already does the wiring is at
-      `scratchpad/dhat_probe` (session-local — recreate from the snippet above if
-      it is gone).
-
-- [x] **`QueryLogger::log_query` is O(window) per query under one global mutex —
-      a hard ~23k qps ceiling** — **done 2026-07-28.** The window is a `count` and
-      a `window_start` rolled every five seconds, which answers the same question
-      — queries per second — in two words of state instead of one timestamp per
-      query rescanned on every call. The three mutexes became one: `log_query` used
-      to take four guards per call, including `query_window` **twice in six lines**,
-      the first time only to read the constant 10.
-
-      Measured: 3.09M ops/sec in a debug build, up from the ~47k the old code
-      managed on an idle machine, so `bench_logger_throughput`'s floor goes back
-      up — to 100k rather than the original 45k, since a floor set at what an idle
-      machine measures is what made it flaky in the first place.
-
-      **The floor is not the real guard, and that is the lesson.** A wall-clock
-      floor is what got lowered to ratify this regression. The regression test is
-      `logging_a_query_costs_the_same_however_many_came_before`, which asserts a
-      *ratio*: time a batch cold, log 50,000, time the same batch again. 22.5×
-      against the old code, ~1× against this one, and it does not care what else
-      is running on the machine. Now a rule in `CLAUDE.md` §10.
-
-      While here, `.lock().unwrap()` on a path every query reaches became
-      `let Ok(..) = .. else` with a commented decision (`CLAUDE.md` §6): monitoring
-      that cannot lock stops counting rather than taking the server down. And
-      `log_error`'s unbuffered `eprintln!` moved **outside** the guard — half of
-      the flood item below, which is still open for the rest. Original finding
-      follows.
-
-      (`rdns/src/logging.rs:80`, lock at `:58`).
-      `window.queries.retain(|&t| t > age_limit)` rescans every timestamp from the
-      last 10 s on **every** query, so the vector is `10 × qps` long and the cost
-      is linear in it. Measured: 469 ns at 1k depth, 2,364 at 10k, 9,886 at 50k,
-      19,419 at 100k — dead linear at ~0.19 ns/element. Setting that against the
-      per-query budget gives a steady-state ceiling of **≈22,700 qps for the whole
-      server**, and because `stats` is held across the entire function including
-      both `query_window` acquisitions, it does not improve with core count.
-
-      **This is what `bench_logger_throughput`'s floor was lowered for.** The
-      "Current state" note above attributes the flakiness to competing load; it is
-      this quadratic, and moving the threshold from 45k to 10k ratified the
-      regression the benchmark had caught. Fix: the window exists only to compute
-      QPS every 5 s — replace it with `count` + `window_start` + `last_qps` as
-      relaxed atomics (one `fetch_add` per query), or a `VecDeque` with
-      `pop_front` while the head is stale (amortized O(1)). Split the `stats`
-      mutex from the window and drop the double acquisition at `:70-75`, which
-      takes a lock twice to read the constant `10`.
-- [x] **Every response allocates and hands a 64 KB buffer to `send_to`** —
-      **done 2026-07-28**, both halves the finding asks for. The scratch is sized
-      to `max_len` (UDP callers pass their EDNS payload size; only TCP and the
-      transfer paths pass `u16::MAX`, where 64 KB is honest), and
-      `to_bytes_within_buf(max_len, &mut Vec<u8>)` is the primitive so a send path
-      that keeps one buffer allocates nothing per response —
-      `to_bytes_within` is now the allocating wrapper around it.
-
-      **Neither daemon reuses a buffer yet**, because the UDP loops spawn a task
-      per datagram and there is no per-task scratch to hang one on; that is
-      #9d's "unbounded `tokio::spawn` per UDP datagram", and the API is there for
-      when it lands. (**It landed 2026-08-01.** `rdnsd`'s UDP workers each own
-      one, and DHAT reads 16 blocks from `to_bytes_within_buf` for 996 responses
-      where it read 996 before. `rdnsr` still allocates per response: it builds
-      its reply inside `handle_query`, several awaits deep in a spawned task, so
-      there is no single scratch to hand it — a separate change if it is ever
-      worth one.) The sizing fix alone removes the overshoot: a 60-byte
-      response used to retain capacity 65535 and now retains at most what the
-      client advertised.
-
-      Asserted on `Vec::capacity` and on pointer identity rather than on a
-      timing — both exact, neither caring what else is running (`CLAUDE.md` §10).
-      Plus the boundary the new sizing introduces: with the scratch sized to
-      `max_len`, "too long" arrives as a `WireError` from the writer rather than
-      as a comparison, so a message of *exactly* `max_len` bytes is where an
-      off-by-one would put a fitting answer onto the truncation path. Original
-      finding follows.
-
-      (`rdns/src/lib.rs:1058`, `:1075`). `to_bytes_within` does
-      `vec![0u8; u16::MAX as usize]` — 64 KB, zeroed, per response — and
-      `Vec::truncate` **does not release capacity**, so the Vec passed to
-      `send_to` and held until the send completes is 64 KB regardless of the
-      answer. Confirmed: a 60-byte response retains capacity 65535. At 1,000 in
-      flight that is 64 MB resident for a few hundred KB of payload, a 1000×
-      overshoot. Throughput cost measured on a 3-record response: 1043 ns/resp vs
-      718 ns with a reused buffer — 31% of serialization is pure allocator
-      traffic, and it is not optimizer-erasable because the allocation escapes into
-      `send_to`. Fix: size the scratch to `max_len` (UDP callers pass 4096; only
-      the AXFR/TCP paths pass `u16::MAX`), and add
-      `to_bytes_within_buf(&self, max_len, &mut Vec<u8>)` so the datagram path
-      reuses a per-task scratch buffer and allocates nothing.
-- [x] **`DnsCache` eviction is O(n²) with a `String` clone per removal, under the
-      global cache lock** — **done 2026-07-28.** Three linear passes and one
-      `Vec<u64>`: collect the expiries, `select_nth_unstable` to find the eviction
-      boundary in O(n) average without sorting, then one `retain`. No key is
-      cloned at all, because the boundary is a *value*. Policy unchanged — keep
-      the entries with the most life left — so this is a rewrite of how, not of
-      what. Measured: filling a 20k cache twice over takes 0.05 s, against 6.8 s
-      for the old loop.
-
-      **Ties are the case the one-line version gets wrong**, and they are the
-      common case rather than a corner: expiries are whole seconds, so a cache
-      filled in a burst at one TTL has *every* entry on one value, and
-      `retain(|e| e.expires_at > cutoff)` then empties the whole cache instead of
-      halving it — a bounded cache that is really no cache, visible only as a miss
-      rate. Entries past the boundary are kept, then ties are admitted until the
-      target is met. The test for that fails against the **naive rewrite**, not
-      against the old quadratic, which got ties right slowly; saying which is
-      which is `CLAUDE.md` §10.
-
-      The same `retain`-then-`min_by_key` shape at `nsec_cache.rs:841`/`:862` and
-      `negative_cache.rs:253` is **not** changed — bounded much smaller there, as
-      the finding says. Original finding follows.
-
-      (`rdns/src/cache.rs:135`). The loop re-scans the entire
-      map with `min_by_key` to find *one* victim, and runs until half the entries
-      are gone: at the default `max_entries = 10_000` that is ~37 million HashMap
-      iterations plus 5,000 `String` allocations in one uninterruptible stall with
-      every reader blocked — and it repeats as soon as the cache refills. Fix: one
-      pass with `select_nth_unstable_by_key` to partition, or a Redis-style random
-      sample (5 candidates, drop the soonest) for amortized O(1). The same
-      `retain`-then-`min_by_key` shape is at `nsec_cache.rs:841`/`:862` and
-      `negative_cache.rs:253` — bounded much smaller there, so lower priority, but
-      it should not spread further.
-- [x] **`DnsCache` keys on Unicode `to_lowercase()`, collapsing distinct names
-      into one slot** — **done 2026-07-28.** Both sites use the new
-      `utils::ascii_lowered`, whose doc comment carries the reason so the next copy
-      is not written wrong: it was correct in `zone.rs` *with* the explanation and
-      wrong in `cache.rs` without it. Tested with U+212A KELVIN SIGN, which
-      `to_lowercase` folds to `k`. The negative cache and the compressor were left
-      alone here — they are the other half of this bullet's "cannot drift apart
-      again" and are listed under name compression below. Original finding follows.
-
-      (`rdns/src/cache.rs:65`, `:119`). DNS case-insensitivity is
-      ASCII-only (RFC 4343), but `str::to_lowercase` applies the full Unicode
-      mapping, which folds codepoints *into* ASCII. Confirmed: U+212A KELVIN SIGN
-      (wire bytes `E2 84 AA`) lowercases to `k`, so `\u{212A}.example.com.` and
-      `k.example.com.` share one cache entry — two different owners, different
-      bytes on the wire. `zone.rs:279` uses `make_ascii_lowercase` *with a comment
-      explaining exactly why*; the cache drifted from it. Fix both sites, and hoist
-      a shared `ascii_lowered` helper so cache, zone, negative cache and compressor
-      cannot drift apart again. It is also the faster choice — a vectorizable byte
-      loop instead of char-by-char Unicode table lookups.
-- [x] **Name compression allocates two `String`s per suffix per name** — **done
-      2026-07-28**, taking the finding's "real fix" rather than its cheap one.
-      `NameCompressor` keeps an arena of every name written, lowercased once, and
-      the suffix table is `Vec<{start, end, offset}>` of ranges into it with a
-      linear scan — so the per-message `HashMap` construction goes too. A name
-      already known in full has its arena copy truncated away, so a response
-      repeating one owner across twenty records carries one copy of it.
-
-      Asserted structurally: writing `a.b.c.d.example.com.` records six suffixes
-      and **one** copy of the name between them, where the old table held six
-      owned `String`s totalling 84 bytes for a 20-byte name — the byte cost that
-      was quadratic in label count. Original finding follows.
-
-      (`rdns/src/compression.rs:63`). `labels[i..].join(".").to_ascii_lowercase()`
-      allocates once to join and **again** to lowercase (`to_ascii_lowercase` does
-      not mutate in place). Writing `www.example.com.` cold costs ~8 allocations,
-      total bytes quadratic in label count. Measured at 339 ns/name, which makes
-      compression the majority of response serialization — the whole rest of
-      `to_bytes` for a 3-record answer is under 400 ns. Cheapest fix: build the
-      joined key and `make_ascii_lowercase()` in place, halving it immediately.
-      Real fix: lowercase the name once into a scratch buffer and key on
-      `(hash, offset, len)` in a `Vec` with linear scan — a message holds a handful
-      of distinct names, so that beats `HashMap<String, u16>` outright and removes
-      the per-message HashMap construction too.
-- [x] **`zone::absolutize` allocates four `String`s per query — the largest
-      allocation count on the answer path** (`rdns/src/zone.rs:505`) — **done
-      2026-08-01.** `absolutize`, `normalize_name`, `lookup_key` and `origin_key`
-      all return `Cow<str>`, and the index is reached through
-      `HashMap<String, _>::get`, which takes a `&str` — so a name that needs
-      neither absolutizing nor down-casing is looked up with no allocation at all.
-      The lowering half is `utils::ascii_lowered_cow`, beside the `ascii_lowered`
-      it defers to, because a second copy of "fold ASCII and nothing else" is
-      exactly what `CLAUDE.md` §7 is about.
-
-      **Two of the three cases had nothing to do all along**, which is what made
-      this worth ~14%: an owner name that ends in `.` was copied to produce
-      itself, and `@` was copied to produce the origin the zone already holds.
-      Only a relative name — the zone parser's case, not the query path's —
-      produces something new, and that one still allocates, correctly.
-
-      **Measured live, 1,000 UDP queries against a 5-record zone, against a
-      `HEAD` build rebuilt beside it**: **25,715 blocks → 20,712**, five fewer
-      per query, and `zone::absolutize` (4,014 blocks) and `Zone::origin_key`
-      (1,000) are both gone from the profile entirely. Total bytes 2,280,913 →
-      2,204,653; the byte figure moves much less than the block figure because
-      these were 16-byte allocations, which is the point — it was a *count*
-      problem, and the count is what the tests assert.
-
-      **Four assertions, and the range that admitted the old number is gone.**
-      The labelled segment of `one_query_end_to_end` was
-      `within("look up one A record in the zone", .., 1..=10)` measuring 5; it is
-      `4..=4` now, and the four are the caller's own `ResourceRecord` — a range
-      that still admits the old number is a test that has agreed not to notice
-      (`CLAUDE.md` §10). Beside it,
-      `the_lookups_behind_one_answer_allocate_only_the_answer` measures the claim
-      itself — the `delegation_for` / `name_kind` / `query` walk `rdnsd` makes per
-      question — at **5 → 1**, the one being the `Vec` the answer is returned in.
-      And two tests assert the `Cow` *arm* rather than the value — the value is
-      the same either way, and which arm it is is the whole change:
-      `zone::tests::normalizing_a_name_copies_only_when_it_changes` for
-      `absolutize`'s three cases, and
-      `utils::tests::borrowing_ascii_lowering_copies_only_when_it_folds_something`
-      for the down-casing, where U+212A KELVIN SIGN takes the *borrowing* arm
-      because it is upper case to `char::is_uppercase` and not to
-      `u8::is_ascii_uppercase` — the RFC 4343 rule the copying form already
-      obeyed. Both allocation numbers were watched failing against the reverted
-      code and are identical on the Linux side, where the allocator underneath is
-      glibc's.
-
-      **What this did not touch, deliberately.** `find_zone_for_query` in `rdnsd`
-      allocates three more times per query — `qname.to_lowercase()`, one
-      `to_lowercase()` per zone in the filter, and the `candidates` vec — which
-      the profile confirms at 3,000 blocks over 1,000 queries. It is a larger
-      item than anything left on the 9e list and it is *not* on the list; it also
-      folds case with Unicode `to_lowercase` where every other name comparison in
-      this codebase uses `ascii_lowered` (`CLAUDE.md` §8: U+212A folds into `k`,
-      so two names that differ on the wire can select the same zone). Nothing has
-      tripped over either, and neither belongs in a change about `absolutize`.
-      Noted under item 11 above — and **both went with it the same day**; see the
-      next checkbox but one.
-- [x] **`tokio::spawn` per UDP datagram costs 1,536 bytes — 46% of every byte a
-      query allocates** — **done 2026-08-01 under #9d**, where the full write-up
-      and the before/after profile are. The site is gone from the profile
-      entirely: `rdnsd` no longer spawns per datagram, because for an
-      authoritative server the work is microseconds between two await points and
-      a fixed pool of workers answering inline is both the bound and the cheaper
-      shape. The response buffer went with it — 996 responses now build in 16
-      buffers rather than 996, which is what `to_bytes_within_buf` was written
-      for. Total allocation over 1,000 queries: 7.45 MB → 2.88 MB. `rdnsr` kept
-      its spawn on purpose and bounded it instead; a recursion is seconds of
-      waiting, and the 1,536 bytes are proportionate to that. Original finding
-      follows.
-
-      Measured, and by far the largest single cost on the
-      path: the task allocation is bigger than the entire rest of the query put
-      together. This is the same defect as #9d's "unbounded `tokio::spawn` per UDP
-      datagram" seen from the other side, so **fix it there** — check the limiter
-      and the validator inline in the recv loop, then `try_acquire_owned` on a
-      semaphore — and this number is how to tell whether it worked. Listed here so
-      the memory cost is visible from the performance section too, rather than
-      only as an admission-control concern.
-- [x] **Three more per-query allocations the profile named** — **done
-      2026-08-01**, together with the fourth site that turned up while closing
-      `absolutize`, which was larger than any of them. Measured over the same
-      1,000 UDP queries against a rebuilt `HEAD`: **20,712 blocks → 13,707**,
-      seven fewer per query, 2.20 MB → 1.89 MB. Cumulatively with the previous
-      item, the answer path went from 25.7 allocations per query to 13.7.
-
-      **`compression::write_name` was five per query, not two, and is two now.**
-      The `starts` vec was the one on the list; the profile also had the arena
-      growing twice per query and the suffix table once. `label_starts` is an
-      iterator now — a name has at most 127 labels and in practice four, so
-      collecting their offsets into a 64-byte heap vector to walk them twice was
-      the whole cost — and the arena copy is made only when the name has a label
-      the table does not already hold. That second half is what a response full
-      of one owner name actually does: it looks each repeat up against the
-      caller's own bytes, `eq_ignore_ascii_case`, and copies nothing.
-
-      **`dname` parsing was three per name and is two.** `DNameUnpacker` copied
-      every label into a second `Vec` in order to resolve compression pointers
-      in a name that has none — and a QNAME cannot have one, there being nothing
-      before it to point at. A name with no pointer is already unpacked, so its
-      labels are handed through. The remaining two are the label vector itself
-      and the `String` the name becomes, both of which the caller keeps.
-
-      **The fourth, and the one that was also a bug: `find_zone_for_query`.**
-      Three allocations per query — `qname.to_lowercase()`, one `to_lowercase()`
-      per zone in the filter, and a `Vec` of candidates that `max_by_key` never
-      needed — and it folded case with **Unicode** `to_lowercase` where every
-      other name comparison in this codebase folds ASCII (RFC 4343). U+212A
-      KELVIN SIGN folds to `k`, so a query for `\u{212A}.example.com.` *selected*
-      the zone `k.example.com.`; the index inside then folded ASCII, found
-      nothing, and the answer went out as **NXDOMAIN with AA set** — the
-      assertion `CLAUDE.md` §8 says only REFUSED may make, cached by every
-      resolver that hears it. The containment test is now
-      `utils::is_at_or_under`, which `zone` was already walking with (§7): one
-      function, byte comparisons, no allocation, and no slice of it can land
-      inside a multi-byte character and panic on a name off the wire.
-      `rdnsd::tests::answer_path::choosing_a_zone_folds_ascii_case_and_nothing_else`
-      is the regression test, and against the old code it reports NXDOMAIN where
-      it expects REFUSED.
-
-      **Declined, with the reason, because it is the third of the three:**
-      `make_response`'s `msg.queries.clone()`, 2 per query. Not copying the
-      question means moving it out of the request, which means `make_response`
-      taking the request by value — and the UDP path still needs the request
-      afterwards, because `truncated_reply` builds its TC=1 answer from the
-      *client's* EDNS payload size and the response carries ours instead. Same
-      question as `resolve_in_zone`'s `qname.to_string()` (1 more per query),
-      which would want `Outcome` to borrow. Both are the same "who owns the
-      request" decision and want taking together.
-
-      **Five exact assertions in `rdns/tests/allocations.rs` now**, three of them
-      moved by this change and each watched failing against the old code first:
-      parsing a one-question query 4 → 3, serializing a one-record response
-      6 → 3, serializing into a reused buffer 5 → 2. Two ranges narrowed rather
-      than made exact, because the compressor's two vectors grow with the number
-      of distinct names in the message and where they reallocate is theirs: four
-      names sharing a suffix 11 → 7 (`5..=10`), and one AXFR message 41 → 19
-      (`14..=26`) — the largest proportional move of the lot, because a transfer
-      is nothing but names.
-- [x] **EDNS is re-parsed two to four times per query** — **done 2026-08-01**,
-      and the finding's own parenthesis had the answer: a small `Copy` struct of
-      payload size, version and DO, "since the option list is never read on this
-      path". That is `EdnsHeader`, and `DnsMessage::edns_header` returns one.
-      Both daemons read the client's OPT exactly once now and thread the result
-      through; the two `has_edns()` scans in `make_response` went with it, since
-      `Some` from `edns_header` and `has_edns` differ only for an option list
-      that does not parse, and that answered FORMERR several lines earlier.
-
-      **The check is the same walk as the parse**, which is the part that had to
-      be got right rather than merely made faster: `Edns::walk_options` visits
-      the TLVs and hands each to a closure, `parse_options` collects them and
-      `edns_header` discards them, so a packet is FORMERR for one if and only if
-      it is FORMERR for the other. A second copy of that arithmetic for the
-      checking case is exactly the drift `CLAUDE.md` §7 describes, and this one
-      decides an rcode. `the_edns_header_agrees_with_the_full_parse` and
-      `the_edns_header_rejects_what_the_full_parse_rejects` hold them together.
-
-      **Measured with a different probe, deliberately.** Every earlier #9e
-      measurement used a plain query, and a plain query has no OPT record at all
-      — so it reads *nothing* here and would have shown this item as free. Worse,
-      an OPT record with no options parses into an empty `Vec`, which does not
-      allocate either. The cost only appears for a query carrying an option, and
-      that is what a resolver sends: BIND and Unbound both put a DNS cookie
-      (RFC 7873) in every query by default. Against a probe with EDNS0, DO and a
-      cookie, both sides rebuilt: **24,707 blocks → 20,707** over 1,000 queries,
-      2.73 MB → 2.46 MB, and the two `parse_options` sites (4,000 blocks between
-      them) are gone. The unit assertion is `read a request's EDNS parameters: 0`
-      beside `and the same three fields through the full option parse: 2`, the
-      old cost taken live rather than quoted so the comparison cannot go stale.
-
-      Note that the totals here are **not** comparable with the 13,707 recorded
-      two items above: that was a plain query, this is a two-record message, and
-      an EDNS query costs more to parse and answer whatever we do. Both sides of
-      each comparison were measured with the same probe on the same day.
-- [x] **DNSSEC canonicalization is rebuilt per candidate RRSIG** — **closed
-      2026-08-01 as not worth doing, on the measurement the criterion harness was
-      built to make.** The finding is accurate about the code and wrong about
-      what it costs, in two ways.
-
-      **It does not usually happen at all.** `verify_rrset` returns on the first
-      signature that verifies (`dnssec.rs:802`), so the KSK-and-ZSK case the
-      finding names — "does all of it twice for an identical result" — does it
-      *once*. A second canonicalization needs a candidate that is rejected first:
-      a key rollover, a wrong key tag, an expired signature, or an attacker
-      sending one. Not the ordinary path.
-
-      **And when it does happen it is ~0.3%.** `benches/answer_path.rs` verifies
-      the same RRset at 1 record and at 20; canonicalization scales with the
-      record count and the ECDSA verification does not, so the difference is the
-      canonicalization: **31.03 µs → 32.78 µs, a slope of 102 ns per record.**
-      A one-record RRset therefore spends about a tenth of a microsecond
-      canonicalizing and thirty-one on ring's P-256 verify. Doing the fix
-      perfectly, in the case where it applies at all, would save a tenth of a
-      percent of a verification — and a verification only happens in `rdnsr`,
-      not on `rdnsd`'s answer path.
-
-      A measurement that redirects effort is worth as much as one that finds a
-      bug (`CLAUDE.md` §10), and this one says: the cost of DNSSEC here is the
-      cryptography, exactly where it should be. Original finding follows.
-
-      (`rdns/src/dnssec.rs:779`, inside the loop at `:749`). `signed_data` re-runs
-      `canonical_rdata` over the whole RRset for each candidate — a full
-      `record.parse()` with `String` allocations, `canonical_name` per embedded
-      name, re-encode via `dname_to_bytes`, then re-sort and re-dedup. An RRset
-      signed by both a KSK and a ZSK does all of it twice for an identical result.
-      Only `type_covered`, `original_ttl` and the owner via `labels` differ between
-      candidates, and they almost always agree: compute the sorted/deduped RRset
-      once and rebuild only the RRSIG prefix per candidate. (The verify primitives
-      themselves are fine — RSA borrows slices with no allocation, and ECDSA's
-      65-byte point prefix is forced by ring's API.)
-- [x] **`serialization.rs` is dead code that documents a guarantee it does not
-      implement — delete it** — **done 2026-07-28**, on the way past while typing
-      the wire layer's errors: converting dead code to a better error type would
-      have been work spent making a loaded gun more comfortable to hold. Its 11
-      tests went with it, which is why the lib count drops from 578 to 567.
-      Original finding follows. No caller anywhere outside its own `#[cfg(test)]`
-      module. Its doc comment at `:112` promises RFC 4034 canonical ordering; the
-      loop at `:116` emits in argument order and never sorts, and
-      `serialize_resource_record_canonical` (`:53`) writes the owner via
-      `dname_to_bytes` with **no down-casing**, so it does not produce §6.2
-      canonical form either. It also allocates `vec![0u8; 65535]` *per record*
-      plus a second ~64 KB temp inside — 128 KB per RR. The live canonicalization
-      (`dnssec.rs::signed_data`) is correct and well-commented; this module is a
-      loaded gun aimed at whoever wires it up, because a caller would get silently
-      unverifiable signatures.
-- [x] **`bench.rs` measures debug builds and cannot see the defects above** —
-      **done 2026-08-01.** `rdns/benches/answer_path.rs` under criterion, which
-      runs against the release profile and can compare a run to a saved baseline
-      (`--save-baseline` / `--baseline`) — the thing an optimization actually
-      needs and the reason this item blocked #13 and #11. Fourteen benchmarks in
-      five groups, including the three cases the finding asked for: `log_query`
-      at a realistic depth (1,000 sources tracked), `put` into a *full* cache,
-      and a full-size response through `to_bytes_within_buf`.
-
-      **Measured on the development machine, 2026-08-01** (Windows; the Linux
-      figures for the answer path are roughly half these, see the file's header):
-
-      | | |
-      |---|---|
-      | parse a query | 151 ns |
-      | look up one A record | 60 ns |
-      | serialize a one-record response | 123 ns |
-      | serialize a full-size response (60 records) | 5.07 µs |
-      | **one whole answer** (parse, look up, build, serialize) | **522 ns** |
-      | zone hit / miss in a 10k-record zone | 64 ns / 159 ns |
-      | rate limiter / request validator | 62 ns / 6.7 ns |
-      | 100 puts into a full 20k cache | 26.3 µs (263 ns each) |
-      | log a query with 1k sources tracked | 49 ns |
-      | verify an RRset, two candidate signatures | 31.4 µs |
-
-      **The number that matters most is not in the table**, and the file's header
-      carries it: one `sendto` + one `recvfrom` on loopback is **3.6 µs on Linux
-      and 4.1 µs on Windows**, measured the same day. So everything above is
-      about 6% of what a query costs a server, and a 20% win anywhere in it is
-      worth about 1% end to end. That is the context a criterion result needs to
-      be read in — without it, this harness will make small things look large,
-      which is the failure mode opposite to `bench.rs`'s and just as misleading.
-
-      **Seven of the nine `bench.rs` tests are deleted**, which is why the lib
-      count falls from 624 to 617. Each is listed in that file's header with what
-      replaced it; the short version is that a debug-build ops/sec floor guards
-      nothing unless a *complexity class* is behind it. The two that have one
-      stay — `bench_logger_throughput`, whose floor has the history `CLAUDE.md`
-      §10 argues from, and `bench_zone_lookup`, which §10 names as the example of
-      a floor with a factor of ten of headroom — because those run under `cargo
-      test` in CI on every commit, where a benchmark does not.
-
-      **Cost: 22 packages, all dev-only.** `cargo tree -e normal` is unchanged,
-      so nothing here reaches a shipped binary. Default features off: `plotters`
-      and `rayon` draw HTML reports nobody in this project reads. By the standard
-      #14's own section sets — pay for a parser, not for a stub — a harness that
-      produced the table above and closed #13 on its first run is proportionate.
-      Original finding follows.
-
-      It is
-      `#[cfg(test)]`-gated, so it does not exist in release builds and every number
-      it prints is a debug number (`:351` says so). `bench_cache_throughput`
-      (`:104`) only ever calls `get` on an empty cache, so it never reaches
-      `evict_oldest` and cannot observe the O(n²) eviction at all. Worth converting
-      to criterion benches under `benches/` so they measure optimized code, with
-      cases that exercise what actually hurts: `log_query` at a realistic window
-      depth, `put` into a full cache, and `to_bytes_within` on a full-size response.
-
-#### 9f. Smaller conformance gaps found in the same pass
-
-**All nine are closed, 2026-07-28.** Verified live against dnspython on a running
-`rdnsd` as well as by unit test, because our parser agreeing with our serializer
-proves nothing (`CLAUDE.md` §1): ANY at the apex returns SOA + NS + DNSKEY with
-AA set and every RRset validating under the zone's own keys, a CH question is
-REFUSED with the CH question echoed, QCLASS=ANY is answered from the IN zone, and
-a STATUS opcode gets NOTIMP with the opcode echoed and the OPT record still there.
-
-- [x] **QCLASS is never checked or matched** — **done.** `make_response` refuses
-      a class it does not serve before the zone lookup — REFUSED, not NXDOMAIN,
-      for the reason the rest of that loop gives — and QCLASS=ANY is *not*
-      refused, because RFC 1035 §3.2.5 makes `*` match any class and IN is the
-      only class here.
-
-      The other half is the one worth recording: rather than threading a class
-      through `Zone::query`, `name_kind`, the denial machinery and the signer,
-      **`zone::parse` now refuses a non-IN record outright**. A CH record in an IN
-      zone had no correct behaviour available to it — it sat in the class-blind
-      index and answered IN questions — and a real CH zone needs its own apex and
-      its own place in the zone map, which is a feature rather than a field. That
-      makes the class-blind index correct by construction instead of three
-      lookups away from a check nobody wrote (`CLAUDE.md` §2).
-
-      **That opened a second way in, and closing only one would have been a
-      regression.** A zone also arrives by *transfer*, which took whatever class
-      the primary sent — and `zone_writer` spells CH and HS quite happily — so a
-      primary with one CH record would have had a secondary assemble the zone,
-      serve it, write it to disk, and then fail to read its own file back on the
-      next start, with the whole server refusing to come up (a zone file that will
-      not parse fails the load by design, #9c). Both assemblers refuse a non-IN
-      record now, as a **malformed** transfer, in the same `xfr::belongs_here`
-      that does the bailiwick check — malformed and not a timeout, because a
-      secondary retries a timeout and a primary serving a class we cannot hold
-      will still be serving it in ten minutes. Original finding:
-      (`rdnsd/src/main.rs:249`,
-      `zone.rs:199`, `:238`). `ZoneRecord.class` is stored and parsed (IN/CH/HS)
-      but never compared at lookup, so a CH-class query is answered from the IN
-      zone — the question echoes `CLASS=CH` while the answer records carry
-      `CLASS=IN`, a malformed pairing. Filter by class in `Zone::query`/`name_exists`
-      and REFUSE a class the zone does not serve.
-- [x] **QTYPE=ANY (255) is answered as NODATA** — **done**, taking RFC 1035
-      §3.2.3's reading: every RRset at the name, plus the RRSIGs when DO is set.
-      `Zone::of_type` treats ANY as matching every type, and
-      `dnssec_answer::answer_signatures` stops filtering on
-      `type_covered == qtype` for it — that filter matched *nothing* for QTYPE
-      255, since no RRSIG covers a QTYPE, so making ANY return every type without
-      touching it would have handed a validator the whole of a signed name's data
-      unsigned. Bogus, not merely unsigned.
-
-      **The trap inside the fix**, which is the part worth carrying forward:
-      RRSIG, NSEC and NSEC3 are types at the name too, so a literal "every type"
-      puts denial records and signatures in the answer section — where RFC 4035
-      §3.1.1 says they only belong when DO asked, where they duplicate what
-      `answer_signatures` attaches, and where an NSEC at an empty non-terminal
-      makes the ENT look like a name *with* data. They are excluded, and the
-      exclusion is what the ENT case depends on. Judged with `verify_rrset`
-      rather than by counting RRSIG records. Original finding: no stored record
-      has rtype 255,
-      so an existing name gets empty NOERROR + SOA, which is none of the three
-      shapes RFC 8482 §4.1 permits. Either return every RRset at the name (plus
-      RRSIGs when DO is set) or take §4.2's synthesized-HINFO route deliberately.
-      The constant is already defined and unused at `rdns/src/utils.rs:55`.
-- [x] **Unknown QCLASS is aliased onto a meaningful class, and unknown RCODE is
-      rewritten to 0** — **done**, exactly as the finding prescribes:
-      `QueryClass::Other(u16)` and `ResponseCode::Other(u16)`, with hand-written
-      `from_u16`/`to_u16` that are total and each other's inverse over the whole
-      16-bit range. Both enums lost their `num_derive` `FromPrimitive`, which is
-      the thing that handed out the `Option` that invited the `unwrap_or` in the
-      first place — and `ResponseCode` lost its explicit discriminants with it,
-      since a variant with a payload forbids them. A code above 0xfff is now a
-      `WireError` rather than a silent NOERROR. Original finding:
-      (`rdns/src/lib.rs:810`, `:940`).
-      `QueryClass::from_u16(qclass).unwrap_or(QueryClass::None)` maps QCLASS 99 to
-      NONE — which is 254, RFC 2136's *real* NONE class, not a sentinel — and it is
-      re-serialized as 254 at `:973`, so the echoed question differs from the
-      question asked. `ResponseCode` has an `Unknown` variant but `to_bytes` maps
-      it to 0, so a relayed response with an unrecognized rcode becomes NOERROR,
-      and the resolver does relay upstream messages. Fix both with a value-carrying
-      catch-all (`Other(u16)`) so `to_u16` is infallible and round-tripping is
-      total.
-- [x] **QNAME minimisation has no iteration ceiling** — **done**, both halves.
-      `MAX_MINIMISE_COUNT = 10`, counted across the whole resolution rather than
-      per zone (the root probe and the TLD probe are two of the ten), after which
-      the full QNAME goes out and the name still resolves. The probe QTYPE moved
-      from NS to **A**, which is §2.3's own recommendation and the reason it
-      superseded RFC 7816's. Regression test drives a fourteen-label name through
-      a mock hierarchy and counts what each server was asked: 13 NS probes before,
-      10 A probes and then the full name after. Original finding:
-      (`rdns/src/resolver.rs:1030`,
-      `:1119`). RFC 9156 §2.3 requires a MAX_MINIMISE_COUNT, recommended 10, after
-      which the full QNAME is sent. The loop deepens one label at a time for as
-      many labels as the name has, so a reverse-IPv6 PTR (34 labels) costs ~30
-      round trips and usually exhausts `query_budget` first — failing outright
-      rather than degrading. Also worth taking §2.3's advice on QTYPE: the probes
-      use NS (`resolver.rs:37`, `:1048`), which is RFC 7816's superseded guidance;
-      A/AAAA are "least likely to raise issues in DNS software and middleboxes".
-- [x] **Glueless delegations are resolved with A queries only** — **done.**
-      `resolve_nameserver_addresses` asks A and then AAAA, and collects both
-      families. AAAA is second so the common dual-stacked case still costs one
-      query and the second lookup is charged to the budget only when the first
-      found nothing. Original finding:
-      (`rdns/src/resolver.rs:1259`, `qtype: 1`), so a delegation whose nameservers
-      are IPv6-only and carry no glue is unresolvable — even though `query_server`
-      correctly binds a v6 socket and `extract_referral` accepts AAAA glue.
-- [x] **`rdnsc` sends 512 bytes regardless of message length, and does not verify
-      the reply** — **done**, all of it, and the client is now `anyhow::Result`
-      with `.context()` like the other two binaries (`CLAUDE.md` §3) instead of a
-      column of `.expect()`. Sends `&buf[..n]`; parses `&buf[..n]`; checks QR, the
-      id and the echoed question before printing anything (RFC 5452 §9.1) and
-      keeps waiting rather than printing a reply that is not ours; five-second
-      read timeout, one retry, and a TC→TCP fallback with the RFC 1035 §4.2.2
-      length prefix. The server argument takes `host[:port]` — bare IPv6 literals
-      included, which is why it tries the whole spec as a socket address before
-      appending the default port rather than looking for a colon.
-
-      **Verified by using it**: `rdnsc 127.0.0.1:15353 A www.example.com.` now
-      answers, against an `rdnsd` started the way the "How to run" section above
-      says to start one. That is the thing this tool could not do, and the reason
-      every verification recipe here reaches for dnspython or Node. Original
-      finding: (`rdnsc/src/main.rs:22-31`). `to_bytes` returns `n` and it is
-      discarded, so a 31-byte query goes out as 512 bytes with 481 trailing zeros —
-      and this project's own `RequestValidator` caps UDP at exactly 512, so it is
-      one option byte from rejecting its own client. `:29` mirrors the bug:
-      `try_from_bytes(&buf)` on the whole receive buffer rather than `&buf[..n]`.
-      It also never checks `msg.id`, the echoed question, or `msg.truncation`
-      (so a truncated answer prints as complete, silently dropping records), has no
-      TC→TCP fallback, no read timeout, and no retry. Separately, the server
-      argument parses as a bare IPv4 — `rdnsc 127.0.0.1:15353 SOA example.com`
-      fails with "invalid IPv4 address syntax", so our own client cannot query the
-      non-53 port our own docs tell you to develop against. That is why every
-      verification recipe above reaches for dnspython or Node.
-- [x] **A NOTIMP reply drops the client's OPT record** — **done.** The NOTIMP
-      branch mirrors the OPT before returning. Worth naming the shape rather than
-      the instance: this is not a second copy that drifted, it is an **early
-      `return` jumping over a shared epilogue**, so there is nothing to grep for —
-      the copy is the absence of one. Now a rule in `CLAUDE.md` §7. Original
-      finding: (`rdnsd/src/main.rs:242`
-      returns before the EDNS mirroring at `:399`). RFC 6891 §6.1.1: if the query
-      had an OPT, the response includes one. An EDNS client asking with an
-      unsupported opcode gets a reply indistinguishable from a server that does not
-      do EDNS, which some clients cache as a downgrade. `error_bytes` (`:921`)
-      already does this correctly.
-- [x] **Truncated rate-limit replies set AA and hardcode 512** — **done**, both.
-      AA is clear on a reply carrying no data, and the size comes from
-      `request.udp_payload_size()`. The size half changes no bytes today — the
-      message is empty either way — which is exactly why it was worth fixing: it
-      is the wrong rule sitting in a place it happens not to bite, and that is
-      where the next reader copies it from. `error_bytes`, twenty lines up and
-      doing the same job, had both right; two functions building the same kind of
-      message and disagreeing is `CLAUDE.md` §7's second shape. Original finding:
-      (`rdnsd/src/main.rs:948`, `:965`). `truncated_reply` ignores
-      `msg.udp_payload_size()` (RFC 6891 §6.2.4) and sets `authoritive: true` on a
-      reply carrying no authoritative data. `error_bytes` at `:918` gets AA right.
-- [x] **Zone transfer responses never carry an OPT record** — **done**, on the
-      **first** message of a transfer and no other: a multi-message transfer is
-      one response, which is where BIND puts it, and repeating it would put a
-      second OPT into what RFC 6891 §6.1.1 treats as a single exchange. Before the
-      TSIG, since RFC 8945 §5.1 wants that last in the additional section and the
-      signer appends after `pack_transfer_messages`. Original finding:
-      (`rdns/src/transfer.rs:108`, `additionals: Vec::new()`). No known client
-      fails on it, but RFC 6891 §6.1.1 applies to transfers too.
-
-**Gaps found but deliberately not scheduled here** (unimplemented, not wrong):
-DNAME (RFC 6672) is absent and unclaimed — `zone.rs:1130` rejects the type at
-load; SRV, CAA, TLSA, SSHFP, NAPTR and SVCB/HTTPS have no named parser and can
-only be loaded via RFC 3597 generic form (a *parser* gap — the unknown-type
-pass-through itself is correct, `lib.rs:225` preserves opaque bytes and
-`compression.rs:104` correctly refuses to compress names inside them);
-`make_response` never populates `additionals`, so an MX answer carries no address
-for the exchange (RFC 1034 §4.3.2 step 6) and every client pays a round trip;
-no CDS/CDNSKEY (RFC 7344/8078), so parent-side automation is impossible;
-EDNS options are dropped rather than echoed (`Edns::with_payload_size` builds an
-empty list), so DNS Cookies are never returned and a cookie-enforcing client
-re-queries over TCP forever; no edns-tcp-keepalive (RFC 7828) despite pipelining
-being implemented with a hardcoded 10 s idle timeout; no root priming query
-(RFC 8109), so `rdnsr` never learns the live root NS set; QDCOUNT > 1 is accepted
-and half-handled by both servers where BIND and NSD answer FORMERR; and
-`dnssec_answer.rs:248` documents the choice to read NSEC3 parameters off the
-chain rather than NSEC3PARAM, so a pre-signed zone mid-salt-roll with two chains
-is not served correctly.
-
----
-
-### 8. What signing turned up
-
-Three gaps, in the order they will bite. The first two are signing's own; the
-third is older than signing and was only made visible by it.
-
-- [x] **Nothing re-signs a running server** — **done 2026-07-30**, and it closes
-      the next bullet with it because the two could not be built separately.
-
-      **The timer re-signs by *reloading*, and that is the load-bearing choice.**
-      `spawn_zone_maintenance` is one task selecting over SIGHUP, the signature
-      timer and the stop signal, and both triggers run the same `reload_once`.
-      One task rather than two, because two could have reloads in flight at once
-      — each installing a different snapshot of the files — and two independent
-      ideas of which serials had been announced.
-
-      Reloading rather than re-signing the zone in memory is not a shortcut. The
-      served serial is derived from the **file's** serial plus a time term, and
-      the in-memory zone already carries the derived value, so re-signing it
-      would apply the derivation to its own output and compound the bump every
-      cycle. Re-reading the file makes it idempotent: the file's serial is the
-      input every time. Side effect worth knowing: a zone-file edit is now picked
-      up within one interval without a SIGHUP.
-
-      **A third of the validity**, so a failed run has two whole windows of slack
-      before anything expires — BIND's default is a quarter and the reasoning is
-      the same: a *missed* re-sign has to be survivable, because the one thing
-      that must never happen is serving expired signatures. Floored at a minute
-      so a tiny `--signature-validity` cannot make it a spin loop. Printed at
-      startup: `re-signing every 24h, a third of the 3-day signature validity`.
-
-      **And the cliff is now a slope.** Every RRSIG in a zone used to get an
-      identical expiration, so the whole zone expired in the same second — which
-      is *why* the failure was "every validating resolver SERVFAILs the entire
-      zone at once". Expiry is spread back over a fifth of the validity,
-      deterministically per (owner, type) via FNV-1a: random jitter would put
-      every name at a different point on the slope on every reload, so the slope
-      would never be the same slope twice. Verified live on a 3-day zone: five
-      distinct expiries spanning 6.6 hours, every RRset still validating under
-      dnspython.
-
-      Original finding follows. Signatures are made when a zone
-      loads — startup, and SIGHUP where signals exist — and expire
-      `--signature-validity` days later, 30 by default. A server up longer than
-      that serves expired signatures, which is bogus rather than merely stale:
-      every validating client stops resolving the zone. The workaround is a
-      `kill -HUP` from cron and it is not good enough. The work is a timer that
-      re-signs at roughly a third of the validity, which `sign_zone` already
-      supports — it drops the previous run's output and starts over, so
-      re-signing an already-signed zone is the ordinary case, not a special one.
-- [x] **Re-signing does not bump the SOA serial** — **done 2026-07-30.** It does
-      now, and the decision the finding says "deserves deciding rather than
-      defaulting" was settled by looking at what everyone else does. Written up
-      here because the reasoning is the whole of the work.
-
-      **What the other implementations do**, checked rather than recalled:
-
-      - **BIND 9 inline-signing** keeps two zones — the raw unsigned one from the
-        file and a separate signed one with **its own serial** — and increments the
-        signed serial on every re-signing run, even with no zone change. One
-        report has a file sitting at `2016090105` while the world was served
-        `2016090133`, 28 bumps of drift from signing cycles alone.
-        `serial-update-method` picks `increment` (default) or `unixtime`, and the
-        DNSSEC changes go to the **journal**, never the source file.
-      - **Knot DNS** goes further: `zonefile-load: difference-no-serial` takes the
-        field away from the operator entirely — "the SOA serial is handled by the
-        server automatically. So the user no longer needs to care about it in the
-        zone file" — and `serial-policy` covers "after a dynamic update **or
-        automatic DNSSEC signing**". It **requires `journal-content: all`**,
-        because "the information about the last real SOA serial is preserved in
-        case of server re-start".
-      - **PowerDNS** sidesteps re-signing altogether with live signing: RRSIGs are
-        computed at answer time from week boundaries (inception = the most recent
-        Thursday 00:00 UTC, expiry = the Thursday two weeks on), so nothing
-        expires in place. That *creates* the serial problem instead — the serial
-        does not move when signatures roll, so non-PowerDNS secondaries would
-        serve stale signatures — hence `SOA-EDIT`, whose `INCEPTION-EPOCH` sets
-        the serial to "the maximum of the existing serial and the age in seconds
-        of the last RRSIG update".
-      - **NSD** does not sign at all; it serves pre-signed zones and the external
-        signer owns the serial. **Unbound** is a validating resolver and never
-        signs. Both sidestep the question rather than answering it.
-
-      **The convergent answer** is that everyone who signs *and stores*
-      signatures bumps the serial, and they all dissolve the collision the finding
-      worries about the same way: the operator's number and the served number are
-      **different numbers**, so they cannot race.
-
-      **What we could not copy** is the persistence. BIND and Knot both keep the
-      divergence in a journal and we have none (#7 step 6). Without it a restart
-      would go *backwards*, and RFC 1982 makes that worse than it sounds — a
-      secondary that saw `N` and then sees `N-k` reads it as older and will not
-      transfer, so it keeps the signatures that are about to expire. The outage
-      simply moves to restart time.
-
-      **So the clock is the counter**: `served = file_serial + hours_since_epoch`
-      (`zone_signer::signed_serial`). Monotone in wall time by construction, needs
-      nothing persisted, and an operator's `+1` in the file still shows up as `+1`
-      served.
-
-      **Added, not `max`ed, and that correction is the interesting part.** The
-      obvious design — `max(file_serial, now)`, PowerDNS's `INCEPTION-EPOCH`
-      shape — silently does nothing for a date-style serial: `2026073001` is
-      numerically far *larger* than any current Unix timestamp, so the `max`
-      keeps the file's number and never bumps. PowerDNS documents its own version
-      as "requiring epoch-based backend serials" for exactly this reason, which is
-      easy to read past. Hours rather than seconds so the term stays small (about
-      495,000) and does not crowd a date-style serial toward the 32-bit ceiling;
-      hours since the *epoch* rather than a fraction of the validity, so changing
-      `--signature-validity` cannot move the serial backwards.
-
-      Verified live: a zone whose file says serial 1 is served as 495,949, and
-      re-signing the same file at a later hour produces a serial RFC 1982 calls
-      newer while re-signing it in the same hour produces the same one — the
-      first is what makes a secondary transfer, the second is what stops a restart
-      looking like a change.
-
-      Original finding follows. New signatures are a new version of
-      the zone as far as a secondary is concerned, and a secondary compares
-      serials — so without a bump the replica keeps the signatures it transferred
-      and they expire underneath it. With a bump, every re-signing is a zone
-      change that NOTIFYs the world, which is what BIND does and what the
-      replication path here is already built for (`install_all_zones` computes
-      the delta, `announce_zones` sends it). The reason it is not done in the
-      same breath as the timer is that a serial that moves on its own interacts
-      with an operator editing the same number in the file, and that deserves
-      deciding rather than defaulting.
-- [x] **`rdnsd` answers NXDOMAIN where a referral belongs** — **done 2026-07-28
-      as #9a's second bullet**, which is where the implementation notes are. The
-      three items turned out to be one missing walk through RFC 1034 §4.3.2, as
-      the note below predicted, and were done together. Original finding follows.
-
-      A query for a name
-      under a delegation finds no records at that name and falls through to
-      `Zone::name_exists`, which says no — so a child zone's names are denied by
-      the parent rather than pointed at. This is wrong without DNSSEC and *loudly*
-      wrong with it: the denial is now signed, so the parent authenticates a
-      statement that the child does not exist. The zone signer already computes
-      the delegation set it would need (`zone_signer::Layout`), and the denial
-      records for the secure and insecure cases already exist in the chain; what
-      is missing is `make_response` noticing that the query name is below a
-      delegation and answering with the NS RRset, its glue, and either the DS or
-      a proof there is none.
-
-      **Confirmed and extended by the review — see #9a.** The denial also goes out
-      with **AA=1** (`rdnsd/src/main.rs:203` hardcodes it), which RFC 1035 §4.1.1
-      forbids on a referral and which is what makes an RFC 8020 resolver cache the
-      whole subtree as non-existent. Do this one together with #9a's CNAME and
-      wildcard items: all three are the same missing walk through RFC 1034 §4.3.2,
-      and they share the closest-encloser/delegation lookup.
-
-### 7. The secondary role — replication, in six steps
-
-`rdnsd` is a standalone primary: it reads zone files, serves them, hands out copies
-(AXFR) and announces changes (NOTIFY). It cannot be the *other* end of any of that.
-Adding the client half makes it a replica in a single-writer, asynchronous,
-pull-based replication topology — one primary holds the editable copy, secondaries
-are read-only, NOTIFY is a wake-up hint rather than a data channel, and there is no
-election or conflict resolution because a replica never accepts writes. It also
-composes: a secondary can serve AXFR of a zone it fetched and NOTIFY further
-downstream, so one binary can be any node in a replication tree.
-
-What the client actually does, per (zone, master): load the local copy and its last
-refresh time → ask the master for the zone's SOA → compare serials (RFC 1982) →
-transfer if behind (AXFR, or IXFR with our SOA in the authority section) → verify,
-assemble, **swap in atomically** → persist → sleep on the SOA's REFRESH, RETRY and
-EXPIRE, with a NOTIFY short-circuiting the wait. EXPIRE is the one with teeth: out
-of contact past it, a secondary must **stop answering** rather than serve stale
-authoritative data.
-
-The steps, in decreasing value per line:
-
-- [x] **1. Serve both transports in one process** — done, see "Done so far". The
-      rate limiter, validator, logger and metrics are shared now, so a client cannot
-      get two budgets by switching transport.
-- [x] **2. A zone-file writer**, plus the write-temp-then-rename helper — done, see
-      "Done so far" and "Architecture: writing a zone back out". `zone_writer` and
-      `persist` are the two new modules; there is no CLI surface for dumping yet,
-      because step 3 is the first caller and the flag belongs with it.
-- [x] **3. Secondary role, AXFR-only** — done, see "Done so far" and "Architecture:
-      the secondary role". `--secondary zone@master[:port][#key]`, new `xfr` and
-      `secondary` library modules, the state sidecar, per-zone atomic swap, EXPIRE
-      withdrawal, and a NOTIFY from a master now refreshes instead of being answered
-      NOTAUTH.
-- [x] **4. IXFR-out** from in-memory diffs computed at load time — done, see "Done
-      so far" and "Architecture: incremental transfer". BIND's
-      `ixfr-from-differences` semantics without an on-disk journal.
-- [x] **5. IXFR-in** — done, see "Done so far" and "Architecture: incremental
-      transfer". A refresh asks for the difference whenever it has a version to
-      differ from, and copes with all three answers.
-- [ ] **6. Persisted deltas**, only if dynamic UPDATE (RFC 2136) ever arrives — that
-      is what really needs a journal, because then the journal *is* the source of
-      truth between file syncs.
-- [x] **A secondary announces what it transferred** — done, see "Done so far".
-      `announce_zones` covered only the moments a *primary* learns of a change
-      (startup, SIGHUP), so a tree below the first level moved on refresh timers.
-
-**One simplification worth not re-deriving.** Applying a transfer does not need a
-record-removal API on `Zone`, and it is worth never adding one: the index holds
-*positions* into the record vector, so removal shifts every later position. A full
-AXFR is "build a new `Zone`, swap it in". An IXFR delta is "build a new `Zone` from
-the old records minus the deletes plus the adds, swap it in" — O(zone size) per
-transfer rather than per record, which at any zone size this serves is nothing.
-
-### 11. Data layout and CPU cache friendliness — a stretch goal, on purpose
-
-**Not scheduled, and the reason it is written down is that it is a different kind
-of item from everything above.** Every other performance entry here fixes
-something that is *wrong* — a quadratic, a 64 KB buffer, an allocation that
-should not exist. This one is about how far a correct implementation can be
-pushed, which is a question worth answering even when the answer does not change
-a production number.
-
-**Be honest about the ceiling first.** A DNS server is dominated by syscalls and
-the network: the DHAT pass measured a whole answer at about 3.3 KB and 29
-allocations, of which **1,536 bytes is the `tokio::spawn`** and a good deal of the
-rest is the kernel round trip that no data layout touches. Against a UDP
-`recvfrom`/`sendto` pair, a cache miss in a zone index is noise. So the framing
-is "how far can this reasonably be taken", not "this will make the server
-faster" — and anything found here should be reported with the honesty §10 asks
-for, including the negative results.
-
-That said, there is real structure to attack, and the profiling harness to judge
-it with already exists:
-
-- **`Zone`'s index is `HashMap<String, Vec<usize>>` into a `Vec<ZoneRecord>`.**
-  Every lookup hashes an owned `String` and then chases a pointer per position.
-  The positions-into-a-vector design is deliberate and load-bearing (see #7's
-  "one simplification worth not re-deriving" — it is why `Zone` has no
-  record-removal API), so what is on the table is the *key* side: interning names,
-  a sorted `Vec` with binary search instead of a hash, or storing a hash and
-  comparing bytes rather than `String`s.
-- **`ZoneRecord` holds a `String` name and a `RecordData` with a `Vec<u8>`.** Two
-  indirections per record, and a scan over an RRset touches both. An arena of
-  name bytes plus `(offset, len)` — the shape the name compressor moved to
-  already, and where it went from ~8 allocations per name to one copy — applies
-  to the zone too.
-- **`of_type` filters a `Vec<usize>` by calling `record_type_code` per record**,
-  which parses the record's discriminant. Storing the rtype beside the position
-  would make the filter a scan over `u16`s: one cache line per eight candidates
-  instead of one indirection each.
-- **The per-message name compressor is a `Vec<Suffix>` with a linear scan**, which
-  is already the cache-friendly choice and is worth *measuring* rather than
-  changing — a handful of entries scanned linearly beats a hash, and confirming
-  that is as useful as improving it.
-
-**What to measure with, since guessing here is worse than useless.** Wall-clock
-alone will not resolve it: the differences are small enough to be lost in the
-syscall noise, which is exactly the trap `bench.rs` fell into. The tools that
-would answer it are hardware counters — cache misses and branch mispredicts per
-query — which means `perf stat` on Linux, since the Windows box this was
-developed on has no equivalent worth trusting. **That is the honest blocker**: the
-one measurement that could tell whether a layout change helped is not available
-here, so this item needs either a Linux target or a criterion conversion careful
-enough to see single-digit-percent effects. The criterion conversion is already an
-open item at the end of #9e; do it first.
+### Where to pick up next
+
+Nothing numbered is open, so this is a choice rather than a queue.
+
+> **1. Push, and read the second CI run.** Everything the first one reported is
+> fixed locally and unpushed. There were two findings, not three:
+>
+> - **The Windows `build and test` job failed**
+>   `a_reload_does_not_hold_the_write_lock_across_its_diffs`, and the test was
+>   wrong rather than the code. Fixed in `59cc900`; the reasoning is in "Current
+>   state" and in the test's own doc comment.
+> - **`actions/checkout@v4` targets Node 20**, which the runner now forces onto
+>   Node 24. Bumped to `@v5` across all six jobs in the same commit. This warning
+>   appeared in more than one job's log — including `licences and advisories`,
+>   which is what that job is *called*; `cargo deny` itself passed. Worth knowing
+>   before reading a log: a job name here describes what it checks, not what it
+>   complained about.
+>
+> Five jobs have still never actually been read: msrv (1.95), deny, the container
+> image, the `dhat-heap` feature build, and clippy on *Linux* — the Linux
+> image has no clippy package, so that half had only ever run on Windows. They
+> may have passed silently; nobody has looked.
+>
+> **2. #10, dynamic UPDATE (RFC 2136)** — the largest feature not on the list,
+> and what #7 step 6 is waiting for. Read §10 below for the six things it drags
+> in with it, of which serial handling collides with #8 and should not be
+> designed separately.
+>
+> **3. #11, cache locality** — wanted, but blocked on hardware counters this
+> machine cannot read. Its harness is ready.
+
+**Read `benches/answer_path.rs`'s header before quoting anything from it.** One
+whole answer is 522 ns and one `sendto`+`recvfrom` pair is 4 µs, so the entire
+benchmark suite covers about 6% of what a query costs — the context that stops a
+20% win in it being reported as a 20% win.
+
+### 7. The secondary role — five steps done, one waiting
+
+Steps 1-5 are done: both transports in one process, a zone-file writer with
+write-temp-then-rename, the secondary role with `--secondary
+zone@master[:port][#key]`, IXFR-out from in-memory diffs, and IXFR-in. See
+"Architecture: the secondary role" and "Architecture: incremental transfer" for
+the shapes, and "Done so far" for the commits.
+
+- [ ] **6. Persisted deltas**, only if dynamic UPDATE (RFC 2136) ever arrives —
+      that is what really needs a journal, because then the journal *is* the
+      record of what happened rather than something recomputed from two versions
+      that are both still in memory. `ixfr.rs:16` points here. Until then a
+      restart forgetting its deltas is correct, permitted unconditionally by
+      RFC 1995 §4, and self-correcting: the next change after a restart has a
+      delta again.
 
 ### 10. Dynamic UPDATE (RFC 2136) — the dependency nothing schedules
 
-**Not planned, and deliberately listed anyway**, because three other places treat
-it as a thing that will happen and defer real work to it. Before this entry
-existed, every mention of RFC 2136 in the repo was a *reason for not doing
-something else*:
+Not scheduled, listed so the dependency is visible. It is the largest single
+feature not on this list — **estimate 1.5-2 weeks**, of which #7 step 6 is about
+a day — and it drags in six things that must not be designed separately:
 
-- `ixfr.rs:16` — "A journal earns its keep when dynamic UPDATE arrives (#7 step
-  6) and not before", which is the design rationale for computing deltas in
-  memory instead of persisting them.
-- #7 step 6 — "Persisted deltas, **only if** dynamic UPDATE ever arrives".
-- "Current state" above, twice (now once).
-
-`ixfr.rs` defers to #7.6, #7.6 defers to UPDATE, and nothing points at UPDATE. The
-loop closes with no work item in it, which is how a load-bearing dependency stays
-invisible. The only trace in the code is `lib.rs:598`, a comment labelling the
-UPDATE-related RCODE constants — the wire format needs them, so they exist; the
-opcode is answered NOTIMP by `rdnsd` (`main.rs:242`) and, per #9c, mishandled as
-a query by `rdnsr`.
-
-**Nothing here needs doing.** The in-memory-delta decision is correct on its own
-terms — NSD answered AXFR as a primary for years — and stays correct as long as a
-zone changes only in discrete events (a reload, or a transfer). The entry exists
-so that a cold start reads "we chose not to, and here is what would change the
-answer" rather than "someone forgot".
-
-**What would change the answer:** a zone edited between file syncs. That is the
-moment the journal becomes the source of truth rather than a cache of one, and
-the moment "one writer per file" in "Architecture: persistence" starts doing real
-work instead of describing a property that is currently free.
-
-**If it is ever picked up**, roughly in order, and note that only the last step is
-#7.6 — the journal is the small part:
-
-- The UPDATE opcode itself: prerequisite-section evaluation (RFC 2136 §3.2 — the
-  five prerequisite forms, each with its own RCODE), then update-section
-  application (§3.4), then §3.7's rule that the whole update is atomic — all
-  prerequisites are tested against the zone *before* any change is applied.
-- Authorization per zone, on top of TSIG. §3.3 leaves policy to the
-  implementation, and "any key may update any zone" is the same mistake #9d
-  records for transfers — fix that one first and this inherits the shape.
-- Serial handling, which collides with #8.2: an UPDATE bumps the serial, and so
+- The prerequisite section (§2.4), which is a small query language of its own and
+  is checked against the zone *before* any change is applied.
+- Authorization per zone on top of TSIG. §3.3 leaves policy to the
+  implementation, and "any key may update any zone" is the mistake #9d records
+  for transfers; that one is fixed, and this inherits its shape (`CLAUDE.md` §16).
+- Serial handling, which **collides with #8**: an UPDATE bumps the serial and so
   does re-signing, and both then have to survive a reload that re-reads a file
-  saying something older. Do not design these separately.
+  saying something older.
 - Re-signing the changed names only, rather than the whole zone — `sign_zone`
-  currently rebuilds everything, which is fine at load and wrong per update.
-- Writing the zone back out, which `zone_writer` already does, and then #7.6:
-  the journal, so a restart does not lose changes that exist nowhere else.
+  rebuilds everything, which is right at load and wrong per update.
+- Writing the zone back out, which `zone_writer` already does.
+- Then #7.6, the journal, so a restart does not lose changes that exist nowhere
+  else.
 
-Estimate, for planning against rather than committing to: **1.5–2 weeks** for the
-whole of that, of which #7.6 is about a day. It is the largest single feature not
-on this list.
+### 11. Data layout and CPU cache friendliness — a stretch goal, on purpose
 
-### 12. Pre-authentication panics — an audit, not a bug report (opened 2026-08-01)
+Wanted because it was asked for, not because a measurement demanded it. The
+zone index is a `HashMap<String, Vec<usize>>` into one record vector; the
+question is whether a layout with fewer pointer chases per lookup is worth
+having.
 
-**No known defect. That is the point of the entry**: this is a question about a
-whole class of code, and the answer is currently "nobody has looked at it as a
-class". It is an investigation to schedule, not a fix to apply.
+**The prerequisite is met and the blocker is not.** `cargo bench -p rdns` with
+`--save-baseline`/`--baseline` can now judge a single-digit-percent change, which
+is what this needs and what `bench.rs` could never give. What is still missing is
+the *diagnostic* half: cache misses and branch mispredicts per query, which means
+`perf stat` on Linux, since the Windows box this was developed on has no
+equivalent worth trusting. Without it, any change here is a guess with a
+stopwatch attached.
 
-**Why it moved up.** Removing the task per UDP datagram (#9d) changed what a
-panic on the answer path *costs*. It used to be swallowed: `tokio::spawn` catches
-a task's panic, the datagram went unanswered, the loop carried on. Now the panic
-ends the worker, `serve` treats a stopped listener as fatal, and the process
-exits. That trade was taken deliberately — a server that keeps accepting queries
-while every answer panics is the quiet degradation this codebase keeps being
-bitten by — but it converts any reachable panic from "one lost answer" into "a
-remote kill switch", which is the exact shape `CLAUDE.md` §4 names for
-`recv_from`. The mitigation is to make the panic unreachable rather than to make
-it survivable.
+`zone/miss in a 10k-record zone` (159 ns) is the number it would have to move,
+and "Current state" has the context that decides whether moving it matters: the
+whole answer is 522 ns against a 4 µs syscall pair.
 
-**What "pre-authentication" means here.** Everything a datagram touches before
-`tsig::check_request` has verified a MAC — which for an unsigned query is
-*everything*, up to and including the answer being serialized. Concretely:
-`RequestValidator::validate_packet`, `DnsMessage::try_from_bytes` and everything
-under it (labels, compression pointers, RDATA, EDNS option parsing),
-`tsig::find_tsig`, the rate limiter and its per-IP tables, `make_response` and
-the zone lookup, and the serializer. `rdnsr`'s equivalent path, plus the
-*response* parsing it does on data from an upstream nobody authenticated either.
+### 12. Pre-authentication panics — audited 2026-08-01
 
-**What the audit is.** Not "grep for `unwrap`" — that finds the honest ones in
-`main` and misses the interesting kinds:
+**No reachable panic.** `rdns/tests/no_input_panics.rs` puts mutated wire data
+through everything a stranger's bytes reach before a MAC has been verified —
+`validate_packet` on both transports, `try_from_bytes`, the TSIG scan, both EDNS
+readers, the zone lookups, `dnssec_answer`'s four proof builders against an
+NSEC3-signed zone, and serialization back out. 1,506 cases in the suite,
+1.4 million across four seeds for the closing commit.
 
-- **Slicing and indexing.** `&buf[a..b]` with either end derived from the wire.
-  This is the one that has already happened: RDLENGTH was sliced without a bounds
-  check (#9b), a pre-authentication remote panic on both transports.
-- **Arithmetic.** Overflow panics in debug builds and wraps in release, so the
-  same input is two different bugs depending on the profile. §6's rule
-  (`saturating_sub` on every timestamp pair) came from one of these.
-- **`.lock().unwrap()`.** §6 again, and it is worse than it looks: the first
-  panic *poisons* the mutex, so every later call panics too. One reachable panic
-  under a shared lock takes the whole process off the air permanently even
-  without the worker-pool change.
-- **`.expect()` on anything with a wire-derived argument**, including in library
-  code called from the path rather than only in the daemons.
-- **Recursion depth.** Compression pointers are cycle-detected and depth-capped
-  (the review cleared that), but a stack overflow is not a catchable panic, so
-  anything else recursive on this path deserves the same treatment.
+Three things about it are deliberate and will be undone by accident otherwise:
+it runs in a **debug** build, because overflow panics in debug and wraps in
+release; it **mutates valid messages** rather than generating random bytes, since
+random bytes never get past the header check; and it is hand-rolled rather than
+`proptest`, because the corpus had to be built out of this library either way and
+the seed is what makes a failure reproducible.
 
-**How to settle it, in the order that gives an answer fastest:**
+**What it found was the amplifier, not a panic.** `DnsCache` used
+`.lock().unwrap()` on all four lock sites, two on `rdnsr`'s query path, and mutex
+poisoning is permanent — one panic under that lock, ever, would make every later
+query panic too. All four degrade now. `RateLimiter`'s two monitoring functions
+had the same shape. See `CLAUDE.md` §6.
 
-1. Enumerate the path mechanically rather than by reading — a call graph from
-   `udp_loop` and `serve_connection` down, and then the audit above over exactly
-   that set. A list nobody can reproduce is a list that rots.
-2. **Fuzz the parser.** `cargo-fuzz` is nightly-only; `arbitrary` + `proptest`
-   over `DnsMessage::try_from_bytes` runs on stable and would have caught the
-   RDLENGTH slice on the first hundred inputs. The property is "no input panics",
-   which needs no oracle — the cheapest useful test there is.
-3. **Then re-ask whether the trade in #9d is still the right one.** If the path
-   can be shown panic-free, the current behaviour is free. If it cannot, the
-   answer might be a supervisor that respawns a panicked worker and counts it,
-   rather than a process that exits — which is a design decision this entry
-   exists to inform, and which should not be taken on a hunch either way.
+**Not covered:** the fuzzer drives the library primitives `rdnsd::make_response`
+composes, but not the composition, because the mutator lives in an integration
+test and `rdnsd` is a binary. Sharing it would ship a fuzzing mutator in every
+release build.
 
-Related and not the same: §5's bounded per-peer tables are about *memory* a
-remote party can make us spend, and this is about *control flow* a remote party
-can force. Both are "what can a stranger provoke", and both are cheap to ask and
-expensive to rediscover.
-
-### 5. Smaller open items
-- [x] **AXFR** — done, see "Done so far" and "Architecture: zone transfer".
-- [x] **TSIG** (RFC 8945) — done, see "Architecture: TSIG". A key authorizes a
-      transfer from any address, and every signed query gets a signed answer.
-      Neither `rdnsr` nor `rdnsc` signs anything yet: TSIG is server-side only, so
-      there is no way to *send* a signed query from this workspace except from a
-      test.
-- [x] **NOTIFY** (RFC 1996) — done, see "Architecture: NOTIFY". `--also-notify`
-      tells a secondary at once instead of leaving it to the refresh timer, and an
-      incoming NOTIFY is answered as a NOTIFY.
-- [x] **IXFR** (RFC 1995) — **done as #7 steps 4 and 5**, both directions. Left
-      here with its original reasoning because the framing is what made it cheap:
-      it is an optimisation
-      inside the secondary story rather than a feature of its own. The thing worth
-      knowing before starting there is that a server may *always* answer AXFR-style
-      instead (RFC 1995 §4), which NSD did as a primary for years, so the conformant
-      first version needs no journal at all. (The request used to be unreceivable —
-      the validator rejected any request with a non-empty authority section, which
-      is where an IXFR carries the client's SOA. Fixed while making NOTIFY work; see
-      "Done so far".)
-- [x] **Amplification** — the response byte budget is in (`--response-rate`, UDP);
-      see "Done so far" and "Architecture: amplification". `rdnsd` still binds
-      `0.0.0.0` by default, which is the right default for an authoritative server
-      and the reason the budget matters.
-      (Note: the resolver's outbound source port is already randomized via
-      `UdpSocket::bind("0.0.0.0:0")`. Do **not** "fix" the servers to reply from
-      a random port — a reply must come from the port the query was sent to.)
-- [x] Plain RFC 2308 negative caching — done, see "Done so far". `rdnsr` still
-      caches only the answer section of a *positive* answer: authority and
-      additional records (delegation NS sets, glue) are dropped, so a referral
-      learned mid-resolution is not reusable except through the delegation cache.
-- [x] Zone parser: `$INCLUDE` and parenthesized multi-line records — done, see
-      "Done so far". RFC 3597's `TYPEnnn` and generic `\# <len> <hex>` rdata are in
-      too, since the writer needs them. Still missing from the parser: TTL unit
-      suffixes (`1h`, `2d`), `\`-escaped dots inside a label, and `@` as an rdata
-      name. The escaped-dot gap now has a consequence beyond reading: it is the one
-      thing that can make a zone *unwritable*, since an owner name is the first
-      field of the line and has no generic form to fall back to.
-- [x] TXT `<character-string>` framing — done, see "Done so far".
-
+**And the trade it was opened to re-ask stands.** A panic on the answer path ends
+the process rather than being swallowed by a per-datagram task. The path is
+fuzz-clean with a permanent regression test, so the trade costs nothing today,
+and the alternative — respawning a panicked worker and counting it — would turn a
+defect into a metric nobody reads.
 
 ## Closed work
 
@@ -5101,6 +2067,19 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **The pre-authentication panic audit, and a fuzzer to keep it true** — closes
+  #12, the last numbered item. No reachable panic: 1.4 million mutated messages
+  through `validate_packet`, `try_from_bytes`, the TSIG scan, both EDNS readers,
+  the zone lookups, `dnssec_answer`'s four proof builders and the writer, in a
+  debug build so overflow panics rather than wrapping. What it did find was the
+  amplifier: `DnsCache` used `.lock().unwrap()` on all four lock sites, two of
+  them on `rdnsr`'s query path, and poisoning is permanent — one panic under that
+  lock, ever, would have made every later query panic too (`CLAUDE.md` §6). All
+  four degrade now with the direction commented at each, and the regression test
+  *panics* rather than failing against the old code. `RateLimiter`'s two
+  monitoring functions had the same shape and now fail in the same direction as
+  the rest of that file. `rdns/tests/no_input_panics.rs` runs 1,506 cases in the
+  suite and takes `RDNS_FUZZ_ITERATIONS`/`RDNS_FUZZ_SEED` for a soak.
 - **A benchmark harness that measures optimized code, and the item it closed** —
   closes 9e's last two, and with them #9 entirely. `rdns/benches/answer_path.rs`
   under criterion: fourteen benchmarks, release profile, baseline comparison.
@@ -5175,41 +2154,41 @@ commit message.
   happened — exit 1 and the parse error, with the previous zones still being
   served — where `kill -HUP` reported nothing. No per-zone reload: a reload is
   the whole set or nothing. Unix only, refused rather than ignored elsewhere.
-  (`52b0a6c`)
+  (`a5ce3ce`)
 - **No task per UDP datagram on `rdnsd`, and a bound on `rdnsr`'s** — closes
   9d's admission-control item and 9e's 1,536-bytes-per-datagram one, which were
   the same call site. `rdnsd` answers inline from `--udp-workers` tasks sharing
   the socket; `rdnsr` keeps its spawn, because a recursion is seconds of waiting,
   and bounds it with `--max-inflight-udp`. Measured over 1,000 queries against a
   rebuilt `HEAD` on the same box: 7.45 MB in 34,487 blocks → 2.88 MB in 31,574,
-  the task site gone and 996 responses built in 16 buffers. (`23e7739`)
+  the task site gone and 996 responses built in 16 buffers. (`68e819d`)
 - **Both daemons have log levels** — closes 9d's log-volume half. `--log-level`
   and `--quiet` on `rdnsd` and `rdnsr` through one `rdns::logging::init`, with
   `RUST_LOG` on top. Nothing per-packet is above `debug`, so 50 malformed
   datagrams cost **0 log lines** at the default level where they used to cost 50,
   and `format!` no longer runs for a line nobody wants. No in-process rate
   limiter: journald's per-unit one is in the README's unit instead. 11 crates,
-  measured. (`79614a8`)
+  measured. (`4fb5cee`)
 - **`rdnsd` compiles on Unix** — it had not since SIGHUP reloading was written,
   because `signals.next()` needed a `StreamExt` nothing imported and the module
   is `#[cfg(unix)]`. Found by running the suite on Linux for the first time.
   Fixed by using `tokio::signal::unix`, which `rdns::shutdown` already used, and
-  deleting `signal-hook` and `signal-hook-tokio`. (`220e4ba`)
+  deleting `signal-hook` and `signal-hook-tokio`. (`01f2b70`)
 - **A secret file's mode is checked when it is read** — one
   `persist::ensure_private` for the TSIG and DNSSEC paths both, and
   `write_atomically_private` restricts the temporary file *before* the rename so
-  a new private key is never briefly world-readable. (`742bba6`)
+  a new private key is never briefly world-readable. (`c1c73d8`)
 - **The zone load and the state fsync are off the runtime** — `spawn_blocking`
   for the reload, and the state write happens after the mutex guard is dropped
   rather than across the fsync. `load_zones_from_source` is honestly sync now; it
-  was an `async fn` with no await in it. (`c99fb6d`)
+  was an `async fn` with no await in it. (`5ed8351`)
 - **A reload no longer blocks every query for the length of its diffs** — planned
   under the read lock and recorded under the write lock, with a generation
   counter deciding whether the plan survived the gap. 99.5% of sampled queries
-  were locked out during a reload before; ~0.3% after. (`9df8d90`)
+  were locked out during a reload before; ~0.3% after. (`0daf0c4`)
 - **`--user`/`--group` closed as won't-fix** — privilege separation belongs to
   the service manager, and `User=` with an ambient capability is stronger than a
-  setuid drop rather than equivalent to it. (`3dab5f2`)
+  setuid drop rather than equivalent to it. (`4f97660`)
 
 - **`rdnsd` signs zones, and answers a DO-bit query from one** — closes #2, the
   last feature on this list. `dnssec_key` generates and stores private keys and

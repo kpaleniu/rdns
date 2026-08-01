@@ -242,6 +242,14 @@ impl RequestValidator {
                     return Err(WireError::Truncated {
                         what: "a compression pointer",
                         need: 2,
+                        // Cannot underflow, and the proof is four lines up: the
+                        // loop head returns unless `*offset < data.len()`, and
+                        // only one byte has been consumed since, so reaching
+                        // here means `*offset == data.len()` exactly. Written
+                        // down because this is a subtraction of two
+                        // wire-derived lengths on the pre-authentication path
+                        // (`TODO.md` #12) — the class of thing that is safe
+                        // until somebody adds a second `+= 1` above it.
                         have: data.len() - *offset,
                     });
                 }
