@@ -32,7 +32,10 @@ use rdns::{
     shutdown::{stop_signal, Busy, Lifecycle, Shutdown, Stop},
     transfer::axfr_messages,
     tsig::{self, TsigAlgorithm, TsigCheck, TsigKey, TsigKeyring, TsigSession},
-    utils::{current_unix_timestamp, record_types, recv_error_is_transient, UDP_RECEIVE_BUFFER},
+    utils::{
+        current_unix_timestamp, is_at_or_under, record_types, recv_error_is_transient,
+        UDP_RECEIVE_BUFFER,
+    },
     validation::RequestValidator,
     xfr,
     zone::{parse_zone_file_at, NameKind, Zone},
@@ -462,18 +465,28 @@ fn make_response(
         additionals: Vec::new(),
     };
 
+    // The client's EDNS parameters, read once for the whole function. This used
+    // to be two `msg.edns()` calls sixteen lines apart plus two `has_edns()`
+    // scans, and `edns()` builds the option list — a `Vec` and a `Vec<u8>` per
+    // option — only for three fields that are not in it (`TODO.md` #9e). A
+    // client sending a DNS cookie, which is what BIND and Unbound do by default,
+    // paid four allocations per query for a bit.
+    //
     // EDNS-level rejections take precedence over any zone lookup: a malformed
     // option list is FORMERR, and an EDNS version we don't implement is BADVERS
     // (RFC 6891 §6.1.3). Both replies carry a bare version-0 OPT — BADVERS is an
     // extended RCODE, so the OPT record is what carries its high bits.
-    let edns_rejection = match msg.edns() {
-        Err(_) => Some(ResponseCode::FormatError),
-        Ok(Some(edns)) if edns.version > EDNS_VERSION => Some(ResponseCode::BadOptVersion),
-        _ => None,
+    let client_edns = match msg.edns_header() {
+        Ok(edns) => edns,
+        Err(_) => {
+            response.rcode = ResponseCode::FormatError;
+            // `with_payload_size` carries no options, so encoding it cannot fail.
+            let _ = response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+            return response;
+        }
     };
-    if let Some(rcode) = edns_rejection {
-        response.rcode = rcode;
-        // `with_payload_size` carries no options, so encoding it cannot fail.
+    if client_edns.is_some_and(|edns| edns.version > EDNS_VERSION) {
+        response.rcode = ResponseCode::BadOptVersion;
         let _ = response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
         return response;
     }
@@ -482,7 +495,7 @@ fn make_response(
     // (RFC 4035 §3.1.1). It is not a request for validation and not a demand
     // that the zone be signed — an unsigned zone answers a DO query exactly as
     // it answers any other, and [`dnssec_answer`] returns nothing for it.
-    let dnssec_ok = matches!(msg.edns(), Ok(Some(edns)) if edns.do_bit);
+    let dnssec_ok = client_edns.is_some_and(|edns| edns.do_bit);
 
     // Only QUERY reaches the zone lookup. NOTIFY is answered by the caller,
     // which knows the peer's address; anything else — UPDATE, STATUS, the
@@ -500,7 +513,11 @@ fn make_response(
         // a downgrade and then never offer EDNS to again. `error_bytes` already
         // does this correctly; this path was written separately and drifted
         // (`CLAUDE.md` §7).
-        if msg.has_edns() {
+        //
+        // `client_edns.is_some()` rather than `msg.has_edns()`, and they agree
+        // here: the two differ only for an OPT record whose option list is
+        // malformed, and that answered FORMERR above without reaching this.
+        if client_edns.is_some() {
             let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
             edns.do_bit = dnssec_ok;
             let _ = response.set_edns(edns);
@@ -624,7 +641,7 @@ fn make_response(
     // (RFC 6891 §6.1.1), advertising our own UDP payload size. DO is echoed
     // when it was asked for, which is how the client knows the DNSSEC records
     // it did or did not get were a deliberate answer (RFC 3225 §3).
-    if msg.has_edns() {
+    if client_edns.is_some() {
         let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
         edns.do_bit = dnssec_ok;
         let _ = response.set_edns(edns);
@@ -908,33 +925,27 @@ fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMes
 ///
 /// Matches the query name against zone origins, preferring the most specific (longest) match
 fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> Option<&'a Zone> {
-    // Wire-format query names are absolute ("www.example.com."), so the trailing
-    // dot has to come off both sides before comparing — otherwise nothing ever
-    // matches an origin and every query is an NXDOMAIN.
-    let qname_lower = qname.to_lowercase();
-    let qname_lower = qname_lower.trim_end_matches('.');
-
-    // Find all zones that could handle this query
-    let candidates: Vec<_> = zone_map
+    // The containment test is `utils::is_at_or_under`, which the zone index also
+    // walks with: the trailing dot on either side is its business rather than
+    // ours, the root zone serves everything, and a zone for `example.com` does
+    // not capture `notexample.com`.
+    //
+    // This used to lower-case the qname and every zone origin into fresh
+    // `String`s — three allocations per query, more on a server holding more
+    // than one zone, and the largest single site left on the answer path once
+    // `zone::absolutize` stopped copying (`TODO.md` #9e). It folded with
+    // `str::to_lowercase`, too, which is Unicode where the rest of this codebase
+    // is ASCII-only: U+212A KELVIN SIGN folds to `k`, so a query for a name that
+    // differs from a zone's on the wire could select that zone (`CLAUDE.md` §8).
+    //
+    // No `Vec` of candidates either: `max_by_key` reads one element and never
+    // needed the rest collected. Longest origin wins, which is the most specific
+    // zone — a server holding both `example.com` and `sub.example.com` must
+    // answer for the child from the child's zone.
+    zone_map
         .values()
-        .filter(|zone| {
-            let zone_origin = zone.origin().trim_end_matches('.').to_lowercase();
-            // The root zone serves everything; otherwise the query must be the
-            // origin or sit under it *at a label boundary*, so that a zone for
-            // "example.com" doesn't capture "notexample.com".
-            zone_origin.is_empty()
-                || qname_lower == zone_origin
-                || qname_lower
-                    .strip_suffix(&zone_origin)
-                    .is_some_and(|prefix| prefix.ends_with('.'))
-        })
-        .collect();
-
-    // Longest origin first, which is the most specific zone: a server holding
-    // both `example.com` and `sub.example.com` must answer for the child from
-    // the child's zone. `max_by_key` rather than a sort, because only the first
-    // element is ever read — and `Reverse` is unnecessary once the sort is gone.
-    candidates.into_iter().max_by_key(|z| z.origin().len())
+        .filter(|zone| is_at_or_under(qname, zone.origin()))
+        .max_by_key(|z| z.origin().len())
 }
 
 /// Everything both transports answer from. One of these per process, so a
@@ -6441,6 +6452,51 @@ ns.sub   IN A   192.0.2.20
                     "{class:?}: the question is echoed as it was asked"
                 );
             }
+        }
+
+        /// Choosing a zone folds ASCII case and nothing else (RFC 4343), which
+        /// is what the zone index inside it has always done.
+        ///
+        /// `find_zone_for_query` lower-cased both sides with `str::to_lowercase`
+        /// — the full Unicode mapping, which folds U+212A KELVIN SIGN to `k`. A
+        /// query for `\u{212A}.example.com.` therefore *selected* the zone
+        /// `k.example.com.`, two names that are different bytes on the wire. The
+        /// lookup inside then folded ASCII, found nothing, and the answer went
+        /// out as NXDOMAIN **with AA set** — an assertion that a name does not
+        /// exist anywhere, made by a server with no standing to make it, and
+        /// cached by every resolver that hears it (`CLAUDE.md` §8). REFUSED is
+        /// the answer for a name we hold no zone for.
+        #[test]
+        fn choosing_a_zone_folds_ascii_case_and_nothing_else() {
+            let zone = parse_zone_file(
+                "$ORIGIN k.example.com.\n\
+                 $TTL 3600\n\
+                 @ IN SOA ns1.k.example.com. admin.k.example.com. ( 1 3600 600 604800 300 )\n\
+                 @ IN NS  ns1.k.example.com.\n",
+                "k.example.com.",
+            )
+            .expect("the test zone parses");
+            let mut zones = HashMap::new();
+            zones.insert(zone.origin().to_string(), zone);
+
+            let refused = make_response(
+                &query("\u{212A}.example.com.", record_types::SOA, false),
+                &zones,
+                &DnsMetrics::new(),
+            );
+            assert_eq!(refused.rcode, ResponseCode::Refused);
+            assert!(!refused.authoritive);
+
+            // ASCII case still folds, which is the half that has to keep
+            // working: this is the same zone asked for in the other case.
+            let answered = make_response(
+                &query("K.Example.COM.", record_types::SOA, false),
+                &zones,
+                &DnsMetrics::new(),
+            );
+            assert_eq!(answered.rcode, ResponseCode::Ok);
+            assert!(answered.authoritive);
+            assert_eq!(rdatas(&answered.answers, record_types::SOA).len(), 1);
         }
 
         /// QTYPE=ANY is 255, which is a QTYPE and never an RTYPE, so the strict

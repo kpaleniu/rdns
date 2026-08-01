@@ -845,7 +845,60 @@ pub struct Edns {
     pub options: Vec<EdnsOption>,
 }
 
+/// The three EDNS parameters a server acts on, without the option list.
+///
+/// Everything on the answer path asks the same three questions of a request's
+/// OPT record — how big a reply may be, is this a version we implement, does the
+/// client want DNSSEC records — and none of them asks what the options were.
+/// [`Edns`] carries those too, which means a `Vec` and a `Vec<u8>` per option
+/// allocated and dropped again at every call site that only wanted a flag; the
+/// two in `rdnsd`'s `make_response` are sixteen lines apart (`TODO.md` #9e).
+///
+/// `Copy`, so threading it through a function costs nothing and nobody is
+/// tempted to re-derive it. The option list is still there for a caller that
+/// wants it: [`DnsMessage::edns`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdnsHeader {
+    /// Requestor's advertised UDP payload size (OPT CLASS field), as sent —
+    /// **not** floored at 512. [`DnsMessage::udp_payload_size`] is the one that
+    /// applies RFC 6891 §6.2.3's floor, because that is a question about what we
+    /// may send rather than about what the client wrote.
+    pub udp_payload_size: u16,
+    /// EDNS version. Anything but 0 is BADVERS (RFC 6891 §6.1.3).
+    pub version: u8,
+    /// DNSSEC OK: the client can make sense of DNSSEC records (RFC 3225).
+    pub do_bit: bool,
+}
+
+impl EdnsHeader {
+    /// Decode the fixed fields of an OPT record: CLASS is the payload size and
+    /// TTL packs the version and the flags (RFC 6891 §6.1.3).
+    ///
+    /// Infallible, and that is the difference between this and the option list:
+    /// these are a `u16` and a `u32` that a parsed record always has, so nothing
+    /// here can be malformed. The extended RCODE in the top byte of the TTL is
+    /// deliberately not read — it is a property of the *message*, and
+    /// [`DnsMessage::to_bytes`] is where the two halves are put back together.
+    fn from_record(rr: &ResourceRecord) -> Self {
+        let flags = rr.ttl as u32;
+        EdnsHeader {
+            udp_payload_size: rr.class,
+            version: ((flags >> 16) & 0xff) as u8,
+            do_bit: (flags & 0x8000) != 0,
+        }
+    }
+}
+
 impl Edns {
+    /// The parameters without the options — see [`EdnsHeader`].
+    pub fn header(&self) -> EdnsHeader {
+        EdnsHeader {
+            udp_payload_size: self.udp_payload_size,
+            version: self.version,
+            do_bit: self.do_bit,
+        }
+    }
+
     /// A plain OPT advertising `size` bytes, EDNS version 0, DO clear, no options.
     pub fn with_payload_size(size: u16) -> Self {
         Edns {
@@ -874,11 +927,11 @@ impl Edns {
 
     /// Decode EDNS parameters from a parsed OPT [`ResourceRecord`].
     fn from_record(rr: &ResourceRecord) -> Result<Self, WireError> {
-        let flags = rr.ttl as u32;
+        let header = EdnsHeader::from_record(rr);
         Ok(Edns {
-            udp_payload_size: rr.class,
-            version: ((flags >> 16) & 0xff) as u8,
-            do_bit: (flags & 0x8000) != 0,
+            udp_payload_size: header.udp_payload_size,
+            version: header.version,
+            do_bit: header.do_bit,
             options: Self::parse_options(&rr.rdata.rdata)?,
         })
     }
@@ -886,8 +939,28 @@ impl Edns {
     /// Parse the OPT RDATA option list. A malformed list is an error rather
     /// than a partial read: a client that sends one deserves FORMERR, not a
     /// silently truncated view of what it asked for.
-    fn parse_options(mut rdata: &[u8]) -> Result<Vec<EdnsOption>, WireError> {
+    fn parse_options(rdata: &[u8]) -> Result<Vec<EdnsOption>, WireError> {
         let mut options = Vec::new();
+        Self::walk_options(rdata, |code, data| {
+            options.push(EdnsOption {
+                code,
+                data: data.to_vec(),
+            })
+        })?;
+        Ok(options)
+    }
+
+    /// Walk the option list, handing each option's code and data to `each`
+    /// without copying either.
+    ///
+    /// The walk is here once and has two callers because it answers two
+    /// different questions: [`Edns::parse_options`] wants the options, and
+    /// [`DnsMessage::edns_header`] only wants to know that they are well formed
+    /// — the answer path reads the payload size, the version and the DO bit and
+    /// never looks at an option. A second copy of the TLV arithmetic for the
+    /// checking case is exactly the drift `CLAUDE.md` §7 is about, and this one
+    /// decides whether a packet is FORMERR.
+    fn walk_options(mut rdata: &[u8], mut each: impl FnMut(u16, &[u8])) -> Result<(), WireError> {
         while !rdata.is_empty() {
             if rdata.len() < 4 {
                 return Err(WireError::Truncated {
@@ -906,13 +979,10 @@ impl Edns {
                     have: rdata.len(),
                 });
             }
-            options.push(EdnsOption {
-                code,
-                data: rdata[..len].to_vec(),
-            });
+            each(code, &rdata[..len]);
             rdata = &rdata[len..];
         }
-        Ok(options)
+        Ok(())
     }
 
     /// Build the OPT [`ResourceRecord`] for the additional section, encoding the
@@ -1204,6 +1274,22 @@ impl DnsMessage {
             .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
             .map(Edns::from_record)
             .transpose()
+    }
+
+    /// The EDNS parameters a server acts on, with the option list checked but
+    /// not built — see [`EdnsHeader`]. `Err` on a malformed option list, exactly
+    /// as [`DnsMessage::edns`]: the check is the same walk, so a packet is
+    /// FORMERR here if and only if it is FORMERR there.
+    pub fn edns_header(&self) -> Result<Option<EdnsHeader>, WireError> {
+        let Some(opt) = self
+            .additionals
+            .iter()
+            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
+        else {
+            return Ok(None);
+        };
+        Edns::walk_options(&opt.rdata.rdata, |_, _| {})?;
+        Ok(Some(EdnsHeader::from_record(opt)))
     }
 
     /// Whether the message carries an OPT record at all, regardless of whether
@@ -2075,6 +2161,87 @@ mod tests {
         // The payload size is still readable — it lives in the OPT CLASS field.
         assert_eq!(msg.udp_payload_size(), 1232);
         assert!(msg.has_edns());
+    }
+
+    /// `edns_header` sees exactly what `edns` sees, minus the options.
+    ///
+    /// This is the property the answer path now depends on. Both daemons decide
+    /// FORMERR from the cheap one, so if it accepted a list the full parse
+    /// rejects — or the reverse — a packet would be answered differently
+    /// depending on which of the two a call site happened to use, which is
+    /// precisely the drift that comes of writing the walk twice
+    /// (`CLAUDE.md` §7). They share it; this holds them to it.
+    #[test]
+    fn the_edns_header_agrees_with_the_full_parse() {
+        // No OPT at all.
+        let plain = query_msg(1);
+        assert_eq!(plain.edns_header().unwrap(), None);
+
+        // An OPT with options, an OPT without, and a non-zero version — the
+        // three shapes the answer path branches on.
+        for (payload, version, do_bit, options) in [
+            (4096u16, 0u8, true, vec![]),
+            (
+                1232,
+                0,
+                false,
+                vec![EdnsOption {
+                    code: EDNS_OPTION_COOKIE,
+                    data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                }],
+            ),
+            (512, 1, true, vec![]),
+        ] {
+            let mut msg = query_msg(1);
+            msg.set_edns(Edns {
+                udp_payload_size: payload,
+                version,
+                do_bit,
+                options,
+            })
+            .expect("set_edns");
+            // Through the wire, because that is where a request comes from and
+            // the version lives in a field `set_edns` writes and the parser
+            // re-reads.
+            let bytes = msg.to_bytes_within(512).expect("serialize");
+            let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
+
+            let full = parsed.edns().unwrap().expect("OPT present");
+            let header = parsed.edns_header().unwrap().expect("OPT present");
+            assert_eq!(header, full.header(), "payload {payload} version {version}");
+            assert_eq!(header.do_bit, do_bit);
+            assert_eq!(header.version, version);
+        }
+    }
+
+    /// And a malformed option list is malformed to both of them.
+    #[test]
+    fn the_edns_header_rejects_what_the_full_parse_rejects() {
+        for rdata in [
+            // An option header cut short: three bytes where four are needed.
+            vec![0x00u8, 0x0a, 0x00],
+            // Data shorter than the length field claims.
+            vec![0x00, 0x0a, 0x00, 0x08, 0xde, 0xad],
+            // A well-formed option followed by a truncated one, which only a
+            // walk that gets that far can see.
+            vec![0x00, 0x0a, 0x00, 0x01, 0xff, 0x00, 0x03, 0x00, 0x04],
+        ] {
+            let mut msg = query_msg(1);
+            msg.set_edns(Edns::with_payload_size(1232))
+                .expect("set_edns");
+            let opt = msg
+                .additionals
+                .iter_mut()
+                .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
+                .unwrap();
+            opt.rdata.rdata = rdata.clone().into_boxed_slice();
+
+            assert_eq!(
+                msg.edns_header().unwrap_err(),
+                msg.edns().unwrap_err(),
+                "{rdata:02x?}: the same walk, so the same error"
+            );
+        }
     }
 
     #[test]

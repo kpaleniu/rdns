@@ -300,7 +300,7 @@ fn record_key(zone: &Zone, record: &ZoneRecord) -> RecordKey {
         class: record.class,
         ttl: record.ttl,
         rdata: record.rdata.rdata.clone(),
-        name,
+        name: name.into_owned(),
     }
 }
 
@@ -365,7 +365,7 @@ pub fn apply_changes(
             }
         }
         zone.add_record(ZoneRecord {
-            name: base.normalize_name(&record.name),
+            name: base.normalize_name(&record.name).into_owned(),
             ttl: record.ttl,
             class: record.class,
             rdata: record.rdata.clone(),
@@ -398,7 +398,7 @@ fn resource_key(zone: &Zone, record: &ResourceRecord) -> RecordKey {
         class: record.class,
         ttl: record.ttl,
         rdata: record.rdata.rdata.clone(),
-        name,
+        name: name.into_owned(),
     }
 }
 

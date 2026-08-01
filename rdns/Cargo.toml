@@ -26,6 +26,17 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Benchmarks that measure optimized code, in `benches/`. A dev-dependency, so
+# nothing it brings in is in a shipped binary — `cargo tree -e normal` is
+# unchanged by it — and 22 packages is what a statistics-driven harness with
+# baseline comparison costs (`TODO.md` #9e). Default features off: `plotters`
+# and `rayon` are for HTML reports nobody here reads, and `cargo_bench_support`
+# is the one that makes `cargo bench` work.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 # Allocation counting for `tests/allocations.rs`. A dev-dependency, so a normal
 # build of the library never sees it.
 dhat = "0.3"
+
+[[bench]]
+name = "answer_path"
+harness = false

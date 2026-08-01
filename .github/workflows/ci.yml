@@ -50,6 +50,11 @@ jobs:
       # allocator, and `cargo test --workspace` does run them — named here so a
       # failure says which suite it was.
       - run: cargo test -p rdns --test allocations -- --nocapture
+      # `cargo test --workspace` does *not* select bench targets, and
+      # `--all-targets` above only compiles them. This runs each benchmark once,
+      # which is what `--benches` does in test mode: a bench whose setup panics
+      # is a bench nobody discovers until they need a measurement.
+      - run: cargo test -p rdns --benches
 
   lint:
     name: clippy and fmt

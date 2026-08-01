@@ -2,7 +2,9 @@ use crate::dnssec_denial::{base32hex_decode, canonical_sort_key};
 use crate::error::ZoneError;
 use crate::utils::record_type_code;
 use crate::utils::record_types as rt;
+use crate::utils::{ascii_lowered_cow, is_at_or_under};
 use crate::{ParsedRecord, RecordData};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -131,7 +133,9 @@ impl Zone {
 
     /// Add a record to the zone
     pub fn add_record(&mut self, record: ZoneRecord) {
-        let key = self.lookup_key(&record.name);
+        // Owned here and not borrowed: the key is about to become an index entry
+        // and the two statements after this one need `&mut self`.
+        let key = self.lookup_key(&record.name).into_owned();
         let position = self.records.len();
         self.note_non_terminals(&key);
         self.index.entry(key).or_default().push(position);
@@ -155,7 +159,7 @@ impl Zone {
     /// wildcard is precisely the name a wildcard answer has to prove does
     /// *not* exist (RFC 4035 §3.1.3).
     pub fn holds_name(&self, name: &str) -> bool {
-        self.index.contains_key(&self.lookup_key(name))
+        self.index.contains_key(self.lookup_key(name).as_ref())
     }
 
     pub fn has_nsec_chain(&self) -> bool {
@@ -236,7 +240,7 @@ impl Zone {
     pub fn query(&self, name: &str, qtype: u16) -> Vec<&ZoneRecord> {
         let key = self.lookup_key(name);
         let positions = match self.name_kind_of_key(&key) {
-            NameKind::Exact => self.index.get(&key),
+            NameKind::Exact => self.index.get(key.as_ref()),
             NameKind::Wildcard(ref wildcard) => self.index.get(wildcard),
             NameKind::EmptyNonTerminal | NameKind::NotFound => None,
         };
@@ -375,7 +379,10 @@ impl Zone {
     /// rest are too. That makes the whole of index construction linear in the
     /// zone rather than in names × labels.
     fn note_non_terminals(&mut self, key: &str) {
-        let origin = self.origin_key();
+        // Owned, because the loop below takes `&mut self` and a borrowed origin
+        // would still be alive across it. This is the load path, once per
+        // record; the query path is where the borrow matters.
+        let origin = self.origin_key().into_owned();
         let mut name = key.to_string();
         while let Some(parent) = parent_name(&name) {
             if !is_at_or_under(parent, &origin) {
@@ -394,8 +401,14 @@ impl Zone {
     }
 
     /// The apex in [`Zone::lookup_key`] form.
-    fn origin_key(&self) -> String {
-        self.origin.to_ascii_lowercase()
+    ///
+    /// Borrowed for an origin that is already lower case, which is every zone
+    /// file anyone writes — the walk in [`Zone::name_kind_of_key`] and the one in
+    /// [`Zone::delegation_for_key`] each ask for this once per query, so an
+    /// unconditional copy here would have been two of the allocations the
+    /// borrowing lookup key exists to remove.
+    fn origin_key(&self) -> Cow<'_, str> {
+        ascii_lowered_cow(&self.origin)
     }
 
     /// The records at these positions that are of `qtype`.
@@ -435,7 +448,7 @@ impl Zone {
         let keys: Vec<String> = self
             .records
             .iter()
-            .map(|r| self.lookup_key(&r.name))
+            .map(|r| self.lookup_key(&r.name).into_owned())
             .collect();
         self.index.clear();
         self.non_terminals.clear();
@@ -467,10 +480,21 @@ impl Zone {
     /// The form a name is indexed and looked up under: absolute, and down-cased
     /// because DNS names compare case-insensitively (RFC 4343 — ASCII only,
     /// which is why this is `make_ascii_lowercase` and not `to_lowercase`).
-    fn lookup_key(&self, name: &str) -> String {
-        let mut key = self.normalize_name(name);
-        key.make_ascii_lowercase();
-        key
+    ///
+    /// A key that needs neither step is handed straight back, and
+    /// `HashMap<String, _>::get` takes a `&str` — so the ordinary query, whose
+    /// name is absolute and lower case already, reaches the index without
+    /// allocating at all. The owned arm is not wasted work either way: a name
+    /// that had to be absolutized is a fresh `String` nobody else holds, so it
+    /// can be down-cased in place.
+    fn lookup_key<'a>(&'a self, name: &'a str) -> Cow<'a, str> {
+        match self.normalize_name(name) {
+            Cow::Borrowed(key) => ascii_lowered_cow(key),
+            Cow::Owned(mut key) => {
+                key.make_ascii_lowercase();
+                Cow::Owned(key)
+            }
+        }
     }
 
     /// Helper to match domain names, handling wildcards and relative names.
@@ -493,8 +517,12 @@ impl Zone {
         matches!(self.name_kind_of_key(&query_name), NameKind::Wildcard(w) if w == record_name)
     }
 
-    /// Normalize domain names to absolute form with trailing dot
-    pub fn normalize_name(&self, name: &str) -> String {
+    /// Normalize domain names to absolute form with trailing dot.
+    ///
+    /// Borrows the argument back when it is already absolute, which is every
+    /// name that arrived on the wire; a caller that needs to keep the result
+    /// says `.into_owned()` and pays for it there. See [`absolutize`].
+    pub fn normalize_name<'a>(&'a self, name: &'a str) -> Cow<'a, str> {
         absolutize(name, &self.origin)
     }
 }
@@ -502,14 +530,22 @@ impl Zone {
 /// A zone-file owner name in absolute form, resolved against `origin`: `@` and
 /// the empty name are the origin itself, a name ending in `.` is already
 /// absolute, and anything else is relative to it.
-fn absolutize(name: &str, origin: &str) -> String {
+///
+/// Two of the three cases have nothing to do, and the one a query takes is one
+/// of them: a name off the wire is always absolute, so the `String` this used to
+/// return unconditionally was a copy of its own argument. Four per query, ~14%
+/// of the allocations on the answer path (`TODO.md` #9e) — one each for
+/// `delegation_for`, `name_kind` and the two `query` calls a single answer
+/// makes. Relative names are the zone parser's case and still allocate, which is
+/// right: there the result is a name that does not exist anywhere yet.
+fn absolutize<'a>(name: &'a str, origin: &'a str) -> Cow<'a, str> {
     let name = name.trim();
     if name.is_empty() || name == "@" {
-        origin.to_string()
+        Cow::Borrowed(origin)
     } else if name.ends_with('.') {
-        name.to_string()
+        Cow::Borrowed(name)
     } else {
-        format!("{name}.{origin}")
+        Cow::Owned(format!("{name}.{origin}"))
     }
 }
 
@@ -521,22 +557,6 @@ fn parent_name(name: &str) -> Option<&str> {
     }
     let (_first_label, rest) = name.split_once('.')?;
     Some(if rest.is_empty() { "." } else { rest })
-}
-
-/// Whether `name` is `origin` or sits below it. Both absolute and down-cased.
-fn is_at_or_under(name: &str, origin: &str) -> bool {
-    if origin == "." {
-        return true;
-    }
-    if name == origin {
-        return true;
-    }
-    // Suffix alone is not enough: `notexample.com.` ends with `example.com.`
-    // and is a different zone's name entirely, so the boundary has to land on
-    // a label separator.
-    name.len() > origin.len()
-        && name.ends_with(origin)
-        && name.as_bytes()[name.len() - origin.len() - 1] == b'.'
 }
 
 /// A name with its trailing dot.
@@ -967,7 +987,7 @@ fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
             continue;
         }
         let entry = by_name
-            .entry(zone.lookup_key(&record.name))
+            .entry(zone.lookup_key(&record.name).into_owned())
             .or_insert((false, Vec::new()));
         if rtype == rt::CNAME {
             entry.0 = true;
@@ -1016,7 +1036,7 @@ fn parse_into(
         // Handle $ORIGIN directive
         if first.eq_ignore_ascii_case("$ORIGIN") {
             if let Some(new_origin) = parts.get(1) {
-                state.origin = absolutize(new_origin, &state.origin);
+                state.origin = absolutize(new_origin, &state.origin).into_owned();
                 // The apex is the zone's identity, so only the file that *is*
                 // the zone may move it — an included fragment redefining the
                 // zone it was pulled into would be a surprise, and RFC 1035
@@ -1065,7 +1085,7 @@ fn parse_into(
             let mut inner = ParseState {
                 origin: parts
                     .get(2)
-                    .map(|o| absolutize(o, &state.origin))
+                    .map(|o| absolutize(o, &state.origin).into_owned())
                     .unwrap_or_else(|| state.origin.clone()),
                 ttl: state.ttl,
                 owner: None,
@@ -1094,7 +1114,7 @@ fn parse_into(
                 )
             })?
         } else {
-            let name = absolutize(first, &state.origin);
+            let name = absolutize(first, &state.origin).into_owned();
             state.owner = Some(name.clone());
             idx += 1;
             name
@@ -1657,6 +1677,34 @@ timed 60 IN A 192.0.2.3
         assert_eq!(zone.query("www.example.com.", 1).len(), 1);
         // DNS names are case-insensitive (RFC 4343).
         assert_eq!(zone.query("WWW.Example.COM.", 1).len(), 1);
+    }
+
+    /// Which of `normalize_name`'s three cases copies, and which hand the
+    /// argument back — the contract behind #9e's largest item.
+    ///
+    /// Asserted on the `Cow` arm and not only on the value, because the value is
+    /// the same either way and the whole point of the change is *which* one it
+    /// is: a name off the wire is absolute, and absolutizing it used to mean
+    /// copying it four times per query. `rdns/tests/allocations.rs` measures the
+    /// consequence; this says what the rule is.
+    #[test]
+    fn normalizing_a_name_copies_only_when_it_changes() {
+        let zone = parse_zone_file("@ IN A 192.0.2.1\n", "example.com.").unwrap();
+
+        assert!(matches!(
+            zone.normalize_name("www.example.com."),
+            Cow::Borrowed("www.example.com.")
+        ));
+        // `@` and the empty name are the origin, which the zone already holds.
+        assert!(matches!(
+            zone.normalize_name("@"),
+            Cow::Borrowed("example.com.")
+        ));
+        // A relative name is the one case where the result exists nowhere yet.
+        assert!(matches!(
+            zone.normalize_name("www"),
+            Cow::Owned(ref name) if name == "www.example.com."
+        ));
     }
 
     // -----------------------------------------------------------------

@@ -40,11 +40,15 @@ use crate::error::WireError;
 /// dropped per message on top of that.
 #[derive(Debug, Default)]
 pub struct NameCompressor {
-    /// Every name written so far, lowercased and concatenated. Lowercased
-    /// because name comparison is case-insensitive (RFC 4343) — and ASCII-only,
-    /// per `utils::ascii_lowered`'s reasoning: `str::to_lowercase` folds U+212A
-    /// KELVIN SIGN to `k`, which would make two names that differ on the wire
-    /// compress against each other.
+    /// Every name that contributed a suffix to the table, concatenated, in the
+    /// case it was written in.
+    ///
+    /// Not lowercased: [`NameCompressor::lookup`] compares case-insensitively,
+    /// so folding a stored copy would buy nothing and the fold would have to be
+    /// paid on the needle as well — which is an allocation per name looked up,
+    /// and looking a name up is what this type does. A name written *without*
+    /// contributing anything — one already in the table in full — is never
+    /// copied here at all.
     arena: String,
     /// Suffixes of those names, as ranges into `arena` with the offset each was
     /// first written at. Never holds two entries for the same suffix.
@@ -79,29 +83,14 @@ impl NameCompressor {
             return write_bytes(buf, pos, &[0]);
         }
 
-        // Lowercase the whole name once, into the arena. Every suffix of it is
-        // then a slice of that one copy, which is what removes both the join and
-        // the second allocation per suffix.
-        let base = self.arena.len();
-        self.arena.push_str(trimmed);
-        self.arena[base..].make_ascii_lowercase();
-        let end = self.arena.len();
-
-        // Byte offsets of each label's start, within the arena. Split on every
-        // `.` exactly as `str::split` did, so an empty label still reaches
-        // `write_label` and is still rejected there.
-        let mut starts: Vec<usize> = Vec::with_capacity(8);
-        starts.push(base);
-        for (i, byte) in self.arena.as_bytes()[base..end].iter().enumerate() {
-            if *byte == b'.' {
-                starts.push(base + i + 1);
-            }
-        }
-
-        // Walk suffixes longest-first, looking for one already in the message.
+        // Walk this name's suffixes longest-first, looking for one already in
+        // the message. Each needle is a slice of the caller's own name, so
+        // finding out whether a name is already here costs nothing at all —
+        // which matters because a response repeats one owner name across every
+        // record in it.
         let mut matched = None;
-        for (i, &start) in starts.iter().enumerate() {
-            if let Some(target) = self.lookup(start, end) {
+        for (i, start) in label_starts(trimmed).enumerate() {
+            if let Some(target) = self.lookup(&trimmed[start..]) {
                 matched = Some((i, target));
                 break;
             }
@@ -110,30 +99,30 @@ impl NameCompressor {
         // Everything before the match is a suffix that will be written literally
         // here, so note where it lands: a later name can point at it, and its
         // tail continues correctly into whatever we emit after it (labels or a
-        // pointer). Everything from the match on is already recorded.
-        let fresh = matched.map_or(starts.len(), |(i, _)| i);
-        if fresh == 0 {
-            // The whole name was already known, so the copy just appended is
-            // redundant. Drop it rather than letting the arena grow per name.
-            self.arena.truncate(base);
-        } else {
-            let mut suffix_pos = pos;
-            for (i, &start) in starts.iter().enumerate().take(fresh) {
-                // Bytes this label occupies on the wire: its own length plus the
-                // one-byte length prefix, which is exactly the distance to the
-                // next label's start — or, for the last label, the remaining
-                // bytes plus the root's zero octet.
-                let next = starts.get(i + 1).copied().unwrap_or(end + 1);
+        // pointer). Everything from the match on is already recorded, and a name
+        // matched at its first label — `fresh == 0` — is recorded in full
+        // already and contributes nothing, not even a copy.
+        let fresh = matched.map_or_else(|| label_starts(trimmed).count(), |(i, _)| i);
+        if fresh > 0 {
+            let base = self.arena.len();
+            self.arena.push_str(trimmed);
+            let end = self.arena.len();
+            for start in label_starts(trimmed).take(fresh) {
+                // Where this suffix lands in the message. A label costs its own
+                // bytes plus a one-byte length prefix on the wire, and its own
+                // bytes plus a separating `.` in the text — the same number
+                // either way, so the distance from the start of the name is the
+                // same on both sides and needs no running total.
+                let suffix_pos = pos + start;
                 // A pointer field is 14 bits, so a suffix past that is a target
                 // nothing can reach. Recording it would only slow the scan.
                 if suffix_pos <= POINTER_MASK as usize {
                     self.seen.push(Suffix {
-                        start: start as u32,
+                        start: (base + start) as u32,
                         end: end as u32,
                         offset: suffix_pos as u16,
                     });
                 }
-                suffix_pos += next - start;
             }
         }
 
@@ -153,11 +142,16 @@ impl NameCompressor {
     }
 
     /// The offset a suffix was first written at, if it has been.
-    fn lookup(&self, start: usize, end: usize) -> Option<u16> {
-        let needle = &self.arena[start..end];
+    ///
+    /// Case-insensitively, and **ASCII-only** (RFC 4343), which is the same rule
+    /// `utils::ascii_lowered` exists for: `str::to_lowercase` folds U+212A KELVIN
+    /// SIGN to `k`, and two names that differ on the wire must not compress
+    /// against each other. `eq_ignore_ascii_case` folds exactly the 26 letters
+    /// and nothing else.
+    fn lookup(&self, needle: &str) -> Option<u16> {
         self.seen
             .iter()
-            .find(|s| &self.arena[s.start as usize..s.end as usize] == needle)
+            .find(|s| self.arena[s.start as usize..s.end as usize].eq_ignore_ascii_case(needle))
             .map(|s| s.offset)
     }
 
@@ -207,6 +201,25 @@ impl NameCompressor {
             _ => write_bytes(buf, pos, rdata),
         }
     }
+}
+
+/// Where each label of `name` begins: byte 0, then one past every `.`.
+///
+/// An iterator rather than the `Vec<usize>` this used to collect. A name has at
+/// most 127 labels and in practice four, so the vector was 64 bytes of heap per
+/// name written — two allocations on every query, which the DHAT profile
+/// (`TODO.md` #9e) ranked beside the whole rest of serialization. The two passes
+/// it is walked in are over at most 255 bytes and cost nothing measurable.
+///
+/// Splits on every `.`, exactly as `str::split` does, so an empty label is still
+/// produced here and still rejected by `write_label`.
+fn label_starts(name: &str) -> impl Iterator<Item = usize> + '_ {
+    std::iter::once(0).chain(
+        name.bytes()
+            .enumerate()
+            .filter(|(_, byte)| *byte == b'.')
+            .map(|(i, _)| i + 1),
+    )
 }
 
 /// Read one uncompressed name from the head of `data`, returning it with the
@@ -322,9 +335,10 @@ mod tests {
         );
     }
 
-    /// A name already known in full adds nothing at all: the lowercased copy
-    /// made to look it up is dropped again, so a response repeating one owner
-    /// name across twenty records does not carry twenty copies of it.
+    /// A name already known in full adds nothing at all — and, since the lookup
+    /// compares against the caller's own bytes, nothing is copied in order to
+    /// find that out either. A response repeating one owner name across twenty
+    /// records touches the arena once, for the first.
     #[test]
     fn a_fully_matched_name_leaves_the_table_and_the_arena_untouched() {
         let mut c = NameCompressor::new();

@@ -158,6 +158,59 @@ pub fn ascii_lowered(name: &str) -> String {
     owned
 }
 
+/// [`ascii_lowered`] without the copy when there is nothing to fold.
+///
+/// Most names are already lower case: a zone file is written the way its author
+/// types names, and a query carries what the client was asked for.
+/// `ascii_lowered` allocates for those anyway, and a lookup key is where that
+/// gets paid several times per query — the DHAT profile had `zone::absolutize`
+/// and the down-casing after it at four allocations per query, ~14% of the whole
+/// answer path (`TODO.md` #9e).
+///
+/// A resolver using 0x20 encoding sends mixed case on purpose, so the copying
+/// arm is a real path and not a corner: what happens then is exactly what
+/// happened before, one allocation, after a scan that is cheaper than the copy
+/// it was deciding about.
+pub fn ascii_lowered_cow(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(ascii_lowered(name))
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
+/// Whether `name` is `origin` or sits below it — "is this name in that zone",
+/// which every part of this codebase has to ask and two of them used to answer
+/// separately.
+///
+/// **A suffix match is not enough**, and getting that wrong is how a server
+/// answers for somebody else's zone: `notexample.com.` ends with `example.com.`
+/// and is a different name entirely, so the boundary has to land on a label
+/// separator.
+///
+/// The trailing dot is optional on either side, because the two callers hold
+/// their names in different forms — `zone` walks absolute names, `rdnsd`
+/// compares a QNAME against a zone origin — and which form they are in is not
+/// the question being asked. An empty origin is the root, which contains
+/// everything including itself.
+///
+/// Comparison is ASCII case-insensitive (RFC 4343), so neither side has to be
+/// folded first: folding costs an allocation, and this sits on the query path.
+/// It compares bytes rather than `str`s, which also means no slice of it can
+/// land inside a multi-byte character and panic on a name that came off the
+/// wire.
+pub fn is_at_or_under(name: &str, origin: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name).as_bytes();
+    let origin = origin.strip_suffix('.').unwrap_or(origin).as_bytes();
+    if origin.is_empty() {
+        return true;
+    }
+    let Some(prefix) = name.len().checked_sub(origin.len()) else {
+        return false;
+    };
+    name[prefix..].eq_ignore_ascii_case(origin) && (prefix == 0 || name[prefix - 1] == b'.')
+}
+
 /// Get the current Unix timestamp in seconds
 ///
 /// Returns 0 if the system time is before UNIX_EPOCH (unlikely in practice)
@@ -541,6 +594,62 @@ mod tests {
             "k",
             "which is what to_lowercase does"
         );
+    }
+
+    /// The containment test both callers used to write for themselves, at the
+    /// boundary conditions each of them got right separately.
+    ///
+    /// `notexample.com.` is the one worth naming: it ends with `example.com.`
+    /// and belongs to somebody else, so a server matching on the suffix alone
+    /// answers authoritatively for a zone it does not hold.
+    #[test]
+    fn a_name_is_under_a_zone_only_at_a_label_boundary() {
+        assert!(is_at_or_under("www.example.com.", "example.com."));
+        assert!(is_at_or_under("example.com.", "example.com."), "the apex");
+        assert!(!is_at_or_under("notexample.com.", "example.com."));
+        assert!(!is_at_or_under("example.com.", "www.example.com."), "above");
+        assert!(!is_at_or_under("example.org.", "example.com."));
+
+        // The trailing dot is optional on either side, because the callers hold
+        // their names in different forms and that is not the question asked.
+        assert!(is_at_or_under("www.example.com", "example.com."));
+        assert!(is_at_or_under("www.example.com.", "example.com"));
+
+        // The root contains everything, itself included.
+        assert!(is_at_or_under("www.example.com.", "."));
+        assert!(is_at_or_under(".", "."));
+
+        // ASCII case folds; U+212A KELVIN SIGN does not become `k`, which is
+        // what `str::to_lowercase` on both sides used to do here.
+        assert!(is_at_or_under("WWW.Example.COM.", "example.com."));
+        assert!(!is_at_or_under("\u{212A}.example.com.", "k.example.com."));
+    }
+
+    /// The borrowing form folds the same octets and no others, and copies only
+    /// when it has something to fold.
+    ///
+    /// The Unicode case is the one worth having twice: U+212A is upper case to
+    /// `char::is_uppercase` and *not* to `u8::is_ascii_uppercase`, so it takes
+    /// the borrowing arm — which is right, and is the same rule the copying form
+    /// obeys. A version of this that scanned with `char::is_uppercase` would
+    /// return `Owned` and still not fold it, which would be merely wasteful; one
+    /// that then folded it with `to_lowercase` would be the cache bug in
+    /// [`ascii_lowered`]'s comment.
+    #[test]
+    fn borrowing_ascii_lowering_copies_only_when_it_folds_something() {
+        use std::borrow::Cow;
+        assert!(matches!(
+            ascii_lowered_cow("www.example.com."),
+            Cow::Borrowed("www.example.com.")
+        ));
+        assert!(matches!(
+            ascii_lowered_cow("WWW.Example.COM."),
+            Cow::Owned(ref name) if name == "www.example.com."
+        ));
+        assert!(matches!(
+            ascii_lowered_cow("\u{212A}.example.com."),
+            Cow::Borrowed("\u{212A}.example.com.")
+        ));
     }
 
     #[test]

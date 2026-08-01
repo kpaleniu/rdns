@@ -829,23 +829,30 @@ async fn handle_query(
     // Reject bad EDNS before doing any work on the client's behalf: a malformed
     // option list is a FORMERR, and an EDNS version we don't implement is
     // BADVERS (RFC 6891 §6.1.3). Both replies carry a bare version-0 OPT.
-    match msg.edns() {
+    //
+    // Read once. `edns()` builds the option list, which is a `Vec` and a
+    // `Vec<u8>` per option, and none of the three things asked of it below is in
+    // that list (`TODO.md` #9e); `edns_header` checks the list is well formed
+    // without building it, so a FORMERR is still a FORMERR.
+    let client_edns = match msg.edns_header() {
+        Ok(edns) => edns,
         Err(_) => return edns_error(id, &query, ResponseCode::FormatError, recursion, client_max),
-        Ok(Some(edns)) if edns.version > EDNS_VERSION => {
-            return edns_error(
-                id,
-                &query,
-                ResponseCode::BadOptVersion,
-                recursion,
-                client_max,
-            )
-        }
-        _ => {}
+    };
+    if client_edns.is_some_and(|edns| edns.version > EDNS_VERSION) {
+        return edns_error(
+            id,
+            &query,
+            ResponseCode::BadOptVersion,
+            recursion,
+            client_max,
+        );
     }
-    let client_uses_edns = msg.has_edns();
+    // `is_some()` rather than `has_edns()`: they differ only for an option list
+    // that does not parse, which returned FORMERR above.
+    let client_uses_edns = client_edns.is_some();
     // What the client asked for, DNSSEC-wise. DO means "send me the signatures";
     // CD means "don't withhold anything on my behalf, I validate myself".
-    let client_wants_dnssec = msg.edns().ok().flatten().is_some_and(|e| e.do_bit);
+    let client_wants_dnssec = client_edns.is_some_and(|e| e.do_bit);
     let checking_disabled = msg.cd;
 
     // Names that must not leave this machine (RFC 6761, 6762, 6303). First,

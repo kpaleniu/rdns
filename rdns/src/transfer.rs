@@ -57,7 +57,7 @@ pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<Dn
             continue;
         }
         records.push(ResourceRecord {
-            name,
+            name: name.into_owned(),
             class: zr.class,
             ttl: zr.ttl,
             rdata: zr.rdata.clone(),

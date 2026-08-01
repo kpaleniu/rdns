@@ -19,11 +19,12 @@ each under "Done so far" — the reasoning, RFC citations and verification for e
 piece are in its commit message, which is where to look rather than here.
 
 **The short version, if you read nothing else:** the operational shell is
-finished and #9d is closed; what is open is performance (#9e — start with
-`zone::absolutize`, `rdns/src/zone.rs:505`, whose assertion is already written)
-and one audit (#12, pre-authentication panics). Build and test with the four
-commands at the top of `CLAUDE.md`; nothing is half-applied and the tree is
-clean.
+finished, and **#9 is closed in full** — the last performance item was measured
+rather than fixed, because the measurement said it was worth a tenth of a
+percent. What is open is one audit (**#12**, pre-authentication panics), which is
+where to start, and one stretch goal (#11, cache locality). Build and test with
+the four commands at the top of `CLAUDE.md`; `cargo bench -p rdns` is the fifth
+now. Nothing is half-applied and the tree is clean.
 
 ---
 
@@ -62,21 +63,39 @@ below, which now has the Linux recipe. That Linux image **has docker now**, whic
 where the container image is built and run.
 
 **Where the work stopped (2026-08-01).** Branch `main`, working tree clean, the
-last four commits being the readiness gate and the container image. #9d is closed
-in full, so the operational shell — flags, logging, config file, metrics, control
-socket, graceful shutdown, readiness, image — is finished. **What is left is
-performance (#9e) and one audit (#12)**, and "Where to pick up next" names the
-first move and the file it is in.
+last four commits being #9e: three allocation items — the borrowing lookup key,
+the four sites after it, and reading a request's EDNS parameters without building
+the option list — and then the criterion harness, which closed the fifth by
+measuring it. #9d was closed the same day, so the operational shell — flags,
+logging, config file, metrics, control socket, graceful shutdown, readiness,
+image — is finished too. **What is left is one audit (#12) and one stretch goal
+(#11)**, and "Where to pick up next" names the first move and the file it is in.
 
 **Green as of the last commit**, on both platforms and checked on both:
 
 | | Windows | Linux |
 |---|---|---|
-| `rdns` lib | 619 | 622 |
-| allocations | 6 | 6 |
-| `rdnsd` | 92 | **105** |
+| `rdns` lib | 617 | 620 |
+| allocations | 1 | 1 |
+| `rdnsd` | 93 | **106** |
 | `rdnsr` | 3 | 3 |
-| **total** | **720** | **736** |
+| **total** | **714** | **730** |
+
+**The lib count fell by seven** when `bench.rs` lost the debug-build ops/sec
+floors that guarded nothing (#9e's last item). The measurement they were
+pretending to be is `cargo bench` now; the two floors that guard a *complexity
+class* stayed. Seven deleted tests is the second count drop in three commits and
+both were removals of things that looked like evidence and were not — which is
+the same rule as `CLAUDE.md` §1, applied to the suite rather than to a fix.
+
+**The allocations binary is one test now, and that is why the total went down**
+rather than up. It holds fourteen measurements; they were eight `#[test]`s
+holding a mutex across every body, which serialized the bodies but not
+*libtest's own* per-test work on its other threads. That work lands in whichever
+measurement is running, because the dhat profiler is global: one measurement read
+15 where it reads 7, on three runs in five on Linux and never observed on
+Windows. With one test there is one thread doing anything at all. See the note at
+the top of `rdns/tests/allocations.rs`; do not add a second `#[test]` there.
 
 Both columns are measured (the Linux ones through the Linux recipe below); the
 difference is the sixteen `#[cfg(unix)]` tests described next. The last nine on
@@ -86,7 +105,7 @@ each side are `readiness` and the two `/readyz` tests in `metrics_server`.
 says nothing about. Three are the old ones: two on the secret-file mode check and
 one on the private-key loader, and there are no mode bits on Windows to exercise
 them. The other thirteen are the control socket, which needs a Unix domain socket
-and so is `#[cfg(unix)]` in its entirety — `rdnsd`'s 92 on Windows compile none
+and so is `#[cfg(unix)]` in its entirety — `rdnsd`'s 93 on Windows compile none
 of that module.
 
 `cargo clippy --workspace --all-targets` is clean with no exceptions and
@@ -103,9 +122,15 @@ and a suppressed log line that must not build its message; `rdnsr` had
 **no test module at all** until #9c gave it one, and has three now — the third
 is its UDP in-flight ceiling.) The lib
 count fell from 578 to 567 when dead `serialization.rs` was deleted with its 11
-tests, and is at 619 now: #9e's, #9f's, graceful shutdown's, the metrics
+tests, and is at 617 now: #9e's, #9f's, graceful shutdown's, the metrics
 endpoint's and the readiness gate's tests, minus the seven that went with
 `telemetry.rs`.
+
+**The allocation counts are the same on both platforms**, which is worth one
+line because it is not obvious: `dhat` counts calls into the global allocator, so
+what it measures does not depend on whether glibc's malloc or Windows' heap is
+underneath. Every exact assertion in `rdns/tests/allocations.rs` (0, 1, 2, 2, 3,
+3 and 4) reads the same on the Linux side.
 
 **Errors are typed in the library and `anyhow` in the binaries (2026-07-28).**
 The convention used to run the other way round — `rdns` returned `anyhow::Error`,
@@ -150,9 +175,8 @@ against. On the performance side the `log_query` quadratic is gone (3.09M ops/se
 where it managed 47k, and `bench_logger_throughput`'s floor is back up at 100k),
 responses no longer carry a 64 KB buffer into `send_to`, cache eviction is linear
 rather than O(n²), and name compression stores one copy of a name instead of one
-per suffix. What is left under #9 is **7 items: 2 of operability (9d) and 5 of
-performance (9e)**, listed in the order worth doing under "Where to pick up next"
-below. The DHAT pass that was
+per suffix. What is left under #9 is **4 items, all of performance (9e)**, listed
+in the order worth doing under "Where to pick up next" below. The DHAT pass that was
 leading 9e is done, and its numbers are what the rest get judged against now,
 including one finding it turned up that nobody had guessed: the `tokio::spawn`
 per UDP datagram cost **1,536 bytes**, 46% of everything a query allocated.
@@ -410,8 +434,17 @@ docker run -d -p 53:5353/udp -p 53:5353/tcp -p 9153:9153 \
 cargo run --release -p rdnsd --features dhat-heap -- --port 15353 --zone-file example.com.zone
 
 # The same numbers as assertions, in their own test binary so the global
-# allocator does not slow the other 593 unit tests.
+# allocator does not slow the other unit tests. One `#[test]` holding fourteen
+# measurements, on purpose — `--nocapture` is how you read them.
 cargo test -p rdns --test allocations -- --nocapture
+
+# What a query costs in *time*, on optimized code. Read the header of
+# `rdns/benches/answer_path.rs` first: one whole answer is ~0.5 µs and the
+# sendto+recvfrom pair around it is ~4 µs, so everything this measures is about
+# 6% of a query and a 20% win in it is worth 1% end to end.
+cargo bench -p rdns
+cargo bench -p rdns -- --save-baseline before   # then change something
+cargo bench -p rdns -- --baseline before        # and compare against it
 
 # Both daemons stop gracefully: SIGTERM or SIGINT on Unix, Ctrl-C/Ctrl-Break/
 # console-close/shutdown on Windows. They stop accepting, let the work already
@@ -691,7 +724,7 @@ under "Closed work" further down.
 
 | # | what | open |
 |---|------|------|
-| **9** | what the five-way code review turned up | **5** — 9a, 9b, 9c, **9d** and **9f** are closed; what is left is 5 of performance (9e) |
+| **9** | what the five-way code review turned up | **0** — 9a, 9b, 9c, 9d, **9e** and 9f are all closed. The last item was closed by measuring it rather than fixing it |
 | **8** | what signing turned up | **0** — the re-signing timer and its serial are done |
 | **7** | the secondary role | **1**, and conditional |
 | **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
@@ -706,17 +739,35 @@ full finding below, which has the file, the line number and the reasoning; **rea
 that before starting**, because several have already been half-fixed by something
 else and the finding says which half.
 
-> **Next is item 9** — `zone::absolutize` (`rdns/src/zone.rs:505`) returns
-> `String` unconditionally, so a qname that arrived already absolute and already
-> lowercase is copied four times per query: once each for `lookup_key`,
-> `name_kind` and `delegation_for`, plus once in `rdnsd`'s `resolve_in_zone`.
-> That is ~14% of the allocations on the answer path and the largest single item
-> left. The fix is a `Cow<str>` plus a borrowing lookup, and **the assertion that
-> judges it already exists** — the labelled middle segment of
-> `one_query_end_to_end` in `rdns/tests/allocations.rs`, currently
-> `within("look up one A record in the zone", .., 1..=10)` and measuring 5.
-> Tightening that range is part of the fix. It touches the public
-> `normalize_name`, which is why it is its own change.
+> **Next is #12**, the audit of what a stranger can panic before authenticating.
+> It is the only open item with a defect possibly behind it, and its cost went up
+> on 2026-08-01 when `rdnsd` stopped spawning a task per datagram: a panic on the
+> answer path used to be swallowed by the task and now ends the process. Read
+> §12; the fastest first move it names is a `proptest` over
+> `DnsMessage::try_from_bytes` asserting only "no input panics", which needs no
+> oracle and would have caught the RDLENGTH slice on the first hundred inputs.
+>
+> **All of #9 is closed** (2026-08-01). The answer path went from **25.7
+> allocations per query to 13.7** across three changes; a query as a real
+> resolver sends it — EDNS0, DO, a cookie — went from 24.7 to 20.7. Then the
+> criterion harness landed and closed the last item by **measuring** it: the
+> DNSSEC canonicalization rebuild is 102 ns per record against 31 µs of ECDSA,
+> and does not usually happen at all, so it is not worth fixing. The numbers are
+> in the closed checkboxes under 9e.
+>
+> **Read `benches/answer_path.rs`'s header before quoting anything from it.** One
+> whole answer is 522 ns and one `sendto`+`recvfrom` pair is 4 µs, so the entire
+> benchmark suite covers about 6% of what a query costs — which is the context
+> that stops a 20% win in it being reported as a 20% win.
+>
+> **What item 11 declined, and why it is not an oversight.**
+> `make_response`'s `msg.queries.clone()` — 2 of the remaining 13.7 — was on its
+> list and stayed. Moving the question out of the request instead of copying it
+> means `make_response` taking the request by value, and the UDP path still needs
+> it afterwards: `truncated_reply` builds the TC=1 reply from the *client's* EDNS
+> payload size, which the response does not carry. That is the same "who owns the
+> request" question as `resolve_in_zone`'s `qname.to_string()` (1 more), and both
+> want answering together or not at all.
 >
 > **The operational shell is finished.** Items 1-8 and 10 all closed on
 > 2026-08-01 and are struck through below rather than deleted, because each says
@@ -782,33 +833,55 @@ else and the finding says which half.
 
 **Then performance (9e).** The DHAT pass is done and its numbers decide the order:
 
-9. **`zone::absolutize` allocates four `String`s per query** — the largest single
-   item, and the assertion that will judge it is already in place (a labelled
-   segment of `one_query_end_to_end`, currently a *range* that still admits the
-   old number, so tightening it is part of the fix). Best value here.
+9. ~~**`zone::absolutize` allocates four `String`s per query**~~ — **done
+   2026-08-01.** `Cow<str>` out of `absolutize`, `normalize_name`, `lookup_key`
+   and `origin_key`, and `HashMap<String, _>::get` taking a `&str` on the other
+   side, so an ordinary query reaches the index without allocating at all.
+   Measured over 1,000 UDP queries against a rebuilt `HEAD` beside it:
+   **25,715 blocks → 20,712**, five per query, and the site is gone from the
+   profile.
 10. ~~**`tokio::spawn` costs 1,536 bytes per datagram**~~ — **done 2026-08-01**
     with item 5, and it took the per-response buffer with it: 996 responses now
     build in 16 buffers rather than 996.
-11. **Three more per-query allocation sites**, each small.
-12. **EDNS is re-parsed two to four times per query.**
-13. **DNSSEC canonicalization is rebuilt per candidate RRSIG** — measured at 22
-    allocations, so this is a *time* problem, not a count problem; DHAT will not
-    show progress on it.
-14. **`bench.rs` measures debug builds** — convert to criterion. Do this *before*
-    #11, which needs a measurement harness that can see what it changes.
+11. ~~**Three more per-query allocation sites**~~ — **done 2026-08-01**, two of
+    the three plus the fourth that turned up while closing item 9, and one
+    declined with its reason (`msg.queries.clone()`; see the blockquote above).
+    **20,712 blocks → 13,707** over the same 1,000 queries. The zone-selection
+    one was a correctness fix as well: it folded case with Unicode
+    `to_lowercase`, so a query differing from a zone's name only by U+212A got
+    that zone's NXDOMAIN with AA set (`CLAUDE.md` §8).
+12. ~~**EDNS is re-parsed two to four times per query**~~ — **done 2026-08-01.**
+    `DnsMessage::edns_header` checks the option list without building it and
+    hands back the three fields the answer path actually reads, so both daemons
+    read the client's OPT once. Measured with the probe a real resolver sends
+    (EDNS0, DO, a cookie): **24,707 blocks → 20,707** over 1,000 queries, four
+    per query, and both `parse_options` sites are gone from the profile.
+13. ~~**DNSSEC canonicalization is rebuilt per candidate RRSIG**~~ — **closed
+    2026-08-01 as not worth doing**, by the harness in item 14 on its first run.
+    `verify_rrset` returns on the first signature that verifies, so the rebuild
+    does not usually happen at all; and the same RRset verified at 1 and at 20
+    records costs 31.03 µs and 32.78 µs, which puts canonicalization at 102 ns
+    per record against 31 µs of ECDSA. A tenth of a percent, on a path only the
+    resolver takes.
+14. ~~**`bench.rs` measures debug builds**~~ — **done 2026-08-01.**
+    `rdns/benches/answer_path.rs`, criterion, fourteen benchmarks against the
+    release profile with baseline comparison. It closed #13 immediately and gave
+    #11 the harness it was waiting for. Seven `bench.rs` floors that guarded no
+    complexity class went with it; the two that do stayed.
 
-**Waiting for someone to schedule it:** #12, an audit of what a stranger can
-panic before authenticating. It is not on the numbered list above because it has
-no known defect behind it — but it is the one item there whose *cost* changed on
-2026-08-01, since a panic on the UDP answer path used to be swallowed by the
-spawned task and now ends the process. Read it before deciding that item 9 is
-really next.
+**Now the only scheduled item:** #12, an audit of what a stranger can panic
+before authenticating. It has no known defect behind it — but its *cost* changed
+on 2026-08-01, since a panic on the UDP answer path used to be swallowed by the
+spawned task and now ends the process.
 
 **Not scheduled, and deliberately:** #7 step 6 (persisted deltas) waits on #10
 (dynamic UPDATE), which nothing schedules; #11 (cache locality) is a stretch goal
 and is wanted — it is on the list because it was asked for, not because a
-measurement demanded it — but it is blocked on hardware counters this machine
-cannot read, and item 14 above is its prerequisite either way.
+measurement demanded it. Its prerequisite is met now (item 14), so what remains
+is the *diagnostic* half: `perf stat`'s cache-miss and branch-miss counters,
+which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns)
+is the number it would have to move, and criterion's `--baseline` can now judge
+whether it did.
 
 **One decision is the copyright holder's, not a bug:** the manifests say
 `MIT OR Apache-2.0` and the repository ships only an MIT `LICENSE`. Either add
@@ -2484,7 +2557,10 @@ into a measurement you can re-run, and it is what tells you when to stop.
          — the common case off the wire — is copied four times over on the way
          through `lookup_key`, `name_kind` and `delegation_for`. A `Cow` and a
          borrowed `HashMap` lookup would take it to nearly zero. Not done: it
-         touches the public `normalize_name` and deserves its own change.
+         touches the public `normalize_name` and deserves its own change. (It got
+         one on 2026-08-01, and "nearly zero" was right — it is zero. The
+         prediction is left as written because it is the reason the item was
+         split out; see the closed checkbox below.)
       3. **`tsig::find_tsig` allocated a 4-element `Vec<usize>` per packet** —
          **fixed here**, since it is one line. It built the section counts on the
          heap *before* the "is there an additional section at all" check, so
@@ -2502,7 +2578,9 @@ into a measurement you can re-run, and it is what tells you when to stop.
       `rdns/tests/allocations.rs`, its own test binary so the `#[global_allocator]`
       does not slow the other 593 unit tests. Six measurements with ranges wide
       enough to survive a `HashMap` growing differently and narrow enough to
-      catch a per-record allocation appearing in a loop.
+      catch a per-record allocation appearing in a loop. (Fourteen now, most of
+      them exact rather than ranges, in one `#[test]` — see the correction under
+      the first harness trap below.)
 
       **Two harness traps, both of which produced wrong numbers first:**
 
@@ -2512,6 +2590,15 @@ into a measurement you can re-run, and it is what tells you when to stop.
         `allocations()` call only and gave 4 where the truth was 12, 208 where it
         was 1015 — numbers that changed with `--test-threads`. Every test now
         holds the mutex for its whole body.
+
+        **That was not enough, and the reasoning above is why** (corrected
+        2026-08-01). "Every *other* test thread" was the wrong boundary: a mutex
+        in this file cannot cover libtest's own per-test bookkeeping, which runs
+        on its threads around the bodies rather than inside them, and lands in
+        whichever measurement is open. It read 15 where the answer is 7, on
+        three runs in five on Linux and never on Windows. The file is one
+        `#[test]` now; the mutex stays as the thing a second one would collide
+        with.
       - **The first profiled block in the process picks up a one-off.** For a
         measurement whose target is exactly zero that is the difference between
         passing and failing depending on which test the scheduler started first.
@@ -2770,25 +2857,62 @@ into a measurement you can re-run, and it is what tells you when to stop.
       `(hash, offset, len)` in a `Vec` with linear scan — a message holds a handful
       of distinct names, so that beats `HashMap<String, u16>` outright and removes
       the per-message HashMap construction too.
-- [ ] **`zone::absolutize` allocates four `String`s per query — the largest
-      allocation count on the answer path** (`rdns/src/zone.rs:505`). Found by the
-      DHAT pass, not by reading, and it was on nobody's list. It returns `String`
-      unconditionally, so a qname that arrived **already absolute and already
-      lowercase** — the ordinary case off the wire — is copied once for each of
-      `lookup_key`, `name_kind` and `delegation_for`, plus once more in
-      `resolve_in_zone`. 4 of the ~29 allocations per query, ~14%.
+- [x] **`zone::absolutize` allocates four `String`s per query — the largest
+      allocation count on the answer path** (`rdns/src/zone.rs:505`) — **done
+      2026-08-01.** `absolutize`, `normalize_name`, `lookup_key` and `origin_key`
+      all return `Cow<str>`, and the index is reached through
+      `HashMap<String, _>::get`, which takes a `&str` — so a name that needs
+      neither absolutizing nor down-casing is looked up with no allocation at all.
+      The lowering half is `utils::ascii_lowered_cow`, beside the `ascii_lowered`
+      it defers to, because a second copy of "fold ASCII and nothing else" is
+      exactly what `CLAUDE.md` §7 is about.
 
-      Fix: return `Cow<str>` from `absolutize`, and give `Zone` a lookup that
-      borrows — `HashMap<String, _>::get` takes `&str`, so a name that needs
-      neither absolutizing nor down-casing can be looked up with no allocation at
-      all. It touches the public `normalize_name`, which is why it is its own item
-      rather than part of the profiling commit. The assertion to prove it is
-      already in `rdns/tests/allocations.rs` — not a test of its own, but the
-      labelled middle segment of `one_query_end_to_end`
-      (`within("look up one A record in the zone", .., 1..=10)`, measuring 5).
-      Tightening that range is part of the fix, not a follow-up: a range that
-      still admits the old number is a test that has agreed not to notice
-      (`CLAUDE.md` §10).
+      **Two of the three cases had nothing to do all along**, which is what made
+      this worth ~14%: an owner name that ends in `.` was copied to produce
+      itself, and `@` was copied to produce the origin the zone already holds.
+      Only a relative name — the zone parser's case, not the query path's —
+      produces something new, and that one still allocates, correctly.
+
+      **Measured live, 1,000 UDP queries against a 5-record zone, against a
+      `HEAD` build rebuilt beside it**: **25,715 blocks → 20,712**, five fewer
+      per query, and `zone::absolutize` (4,014 blocks) and `Zone::origin_key`
+      (1,000) are both gone from the profile entirely. Total bytes 2,280,913 →
+      2,204,653; the byte figure moves much less than the block figure because
+      these were 16-byte allocations, which is the point — it was a *count*
+      problem, and the count is what the tests assert.
+
+      **Four assertions, and the range that admitted the old number is gone.**
+      The labelled segment of `one_query_end_to_end` was
+      `within("look up one A record in the zone", .., 1..=10)` measuring 5; it is
+      `4..=4` now, and the four are the caller's own `ResourceRecord` — a range
+      that still admits the old number is a test that has agreed not to notice
+      (`CLAUDE.md` §10). Beside it,
+      `the_lookups_behind_one_answer_allocate_only_the_answer` measures the claim
+      itself — the `delegation_for` / `name_kind` / `query` walk `rdnsd` makes per
+      question — at **5 → 1**, the one being the `Vec` the answer is returned in.
+      And two tests assert the `Cow` *arm* rather than the value — the value is
+      the same either way, and which arm it is is the whole change:
+      `zone::tests::normalizing_a_name_copies_only_when_it_changes` for
+      `absolutize`'s three cases, and
+      `utils::tests::borrowing_ascii_lowering_copies_only_when_it_folds_something`
+      for the down-casing, where U+212A KELVIN SIGN takes the *borrowing* arm
+      because it is upper case to `char::is_uppercase` and not to
+      `u8::is_ascii_uppercase` — the RFC 4343 rule the copying form already
+      obeyed. Both allocation numbers were watched failing against the reverted
+      code and are identical on the Linux side, where the allocator underneath is
+      glibc's.
+
+      **What this did not touch, deliberately.** `find_zone_for_query` in `rdnsd`
+      allocates three more times per query — `qname.to_lowercase()`, one
+      `to_lowercase()` per zone in the filter, and the `candidates` vec — which
+      the profile confirms at 3,000 blocks over 1,000 queries. It is a larger
+      item than anything left on the 9e list and it is *not* on the list; it also
+      folds case with Unicode `to_lowercase` where every other name comparison in
+      this codebase uses `ascii_lowered` (`CLAUDE.md` §8: U+212A folds into `k`,
+      so two names that differ on the wire can select the same zone). Nothing has
+      tripped over either, and neither belongs in a change about `absolutize`.
+      Noted under item 11 above — and **both went with it the same day**; see the
+      next checkbox but one.
 - [x] **`tokio::spawn` per UDP datagram costs 1,536 bytes — 46% of every byte a
       query allocates** — **done 2026-08-01 under #9d**, where the full write-up
       and the before/after profile are. The site is gone from the profile
@@ -2810,22 +2934,127 @@ into a measurement you can re-run, and it is what tells you when to stop.
       semaphore — and this number is how to tell whether it worked. Listed here so
       the memory cost is visible from the performance section too, rather than
       only as an admission-control concern.
-- [ ] **Three more per-query allocations the profile named**, none of them
-      individually large, all of them on every single query:
-      `compression::write_name`'s `starts` vec (2 per query — the label offsets,
-      which could be a small stack array since a name has at most 127 labels and
-      in practice four), `make_response`'s `msg.queries.clone()` (2), and `dname`
-      parsing (3). Worth doing together, and worth doing *after* `absolutize`,
-      since that one is bigger than all three.
-- [ ] **EDNS is re-parsed two to four times per query**
-      (`rdnsd/src/main.rs:220`, `:236`, `:399`, `:1151`, `:1182`;
-      `rdnsr/src/main.rs:611`, `:622`, `:624`). `msg.edns()` runs
-      `Edns::from_record` → `parse_options`, allocating a `Vec<EdnsOption>` plus a
-      `Vec<u8>` per option, then throwing it away — and `make_response` calls it
-      twice in sixteen lines. Parse once into a local (or a small `Copy` struct of
-      payload size, version and DO, since the option list is never read on this
-      path) and thread it through.
-- [ ] **DNSSEC canonicalization is rebuilt per candidate RRSIG**
+- [x] **Three more per-query allocations the profile named** — **done
+      2026-08-01**, together with the fourth site that turned up while closing
+      `absolutize`, which was larger than any of them. Measured over the same
+      1,000 UDP queries against a rebuilt `HEAD`: **20,712 blocks → 13,707**,
+      seven fewer per query, 2.20 MB → 1.89 MB. Cumulatively with the previous
+      item, the answer path went from 25.7 allocations per query to 13.7.
+
+      **`compression::write_name` was five per query, not two, and is two now.**
+      The `starts` vec was the one on the list; the profile also had the arena
+      growing twice per query and the suffix table once. `label_starts` is an
+      iterator now — a name has at most 127 labels and in practice four, so
+      collecting their offsets into a 64-byte heap vector to walk them twice was
+      the whole cost — and the arena copy is made only when the name has a label
+      the table does not already hold. That second half is what a response full
+      of one owner name actually does: it looks each repeat up against the
+      caller's own bytes, `eq_ignore_ascii_case`, and copies nothing.
+
+      **`dname` parsing was three per name and is two.** `DNameUnpacker` copied
+      every label into a second `Vec` in order to resolve compression pointers
+      in a name that has none — and a QNAME cannot have one, there being nothing
+      before it to point at. A name with no pointer is already unpacked, so its
+      labels are handed through. The remaining two are the label vector itself
+      and the `String` the name becomes, both of which the caller keeps.
+
+      **The fourth, and the one that was also a bug: `find_zone_for_query`.**
+      Three allocations per query — `qname.to_lowercase()`, one `to_lowercase()`
+      per zone in the filter, and a `Vec` of candidates that `max_by_key` never
+      needed — and it folded case with **Unicode** `to_lowercase` where every
+      other name comparison in this codebase folds ASCII (RFC 4343). U+212A
+      KELVIN SIGN folds to `k`, so a query for `\u{212A}.example.com.` *selected*
+      the zone `k.example.com.`; the index inside then folded ASCII, found
+      nothing, and the answer went out as **NXDOMAIN with AA set** — the
+      assertion `CLAUDE.md` §8 says only REFUSED may make, cached by every
+      resolver that hears it. The containment test is now
+      `utils::is_at_or_under`, which `zone` was already walking with (§7): one
+      function, byte comparisons, no allocation, and no slice of it can land
+      inside a multi-byte character and panic on a name off the wire.
+      `rdnsd::tests::answer_path::choosing_a_zone_folds_ascii_case_and_nothing_else`
+      is the regression test, and against the old code it reports NXDOMAIN where
+      it expects REFUSED.
+
+      **Declined, with the reason, because it is the third of the three:**
+      `make_response`'s `msg.queries.clone()`, 2 per query. Not copying the
+      question means moving it out of the request, which means `make_response`
+      taking the request by value — and the UDP path still needs the request
+      afterwards, because `truncated_reply` builds its TC=1 answer from the
+      *client's* EDNS payload size and the response carries ours instead. Same
+      question as `resolve_in_zone`'s `qname.to_string()` (1 more per query),
+      which would want `Outcome` to borrow. Both are the same "who owns the
+      request" decision and want taking together.
+
+      **Five exact assertions in `rdns/tests/allocations.rs` now**, three of them
+      moved by this change and each watched failing against the old code first:
+      parsing a one-question query 4 → 3, serializing a one-record response
+      6 → 3, serializing into a reused buffer 5 → 2. Two ranges narrowed rather
+      than made exact, because the compressor's two vectors grow with the number
+      of distinct names in the message and where they reallocate is theirs: four
+      names sharing a suffix 11 → 7 (`5..=10`), and one AXFR message 41 → 19
+      (`14..=26`) — the largest proportional move of the lot, because a transfer
+      is nothing but names.
+- [x] **EDNS is re-parsed two to four times per query** — **done 2026-08-01**,
+      and the finding's own parenthesis had the answer: a small `Copy` struct of
+      payload size, version and DO, "since the option list is never read on this
+      path". That is `EdnsHeader`, and `DnsMessage::edns_header` returns one.
+      Both daemons read the client's OPT exactly once now and thread the result
+      through; the two `has_edns()` scans in `make_response` went with it, since
+      `Some` from `edns_header` and `has_edns` differ only for an option list
+      that does not parse, and that answered FORMERR several lines earlier.
+
+      **The check is the same walk as the parse**, which is the part that had to
+      be got right rather than merely made faster: `Edns::walk_options` visits
+      the TLVs and hands each to a closure, `parse_options` collects them and
+      `edns_header` discards them, so a packet is FORMERR for one if and only if
+      it is FORMERR for the other. A second copy of that arithmetic for the
+      checking case is exactly the drift `CLAUDE.md` §7 describes, and this one
+      decides an rcode. `the_edns_header_agrees_with_the_full_parse` and
+      `the_edns_header_rejects_what_the_full_parse_rejects` hold them together.
+
+      **Measured with a different probe, deliberately.** Every earlier #9e
+      measurement used a plain query, and a plain query has no OPT record at all
+      — so it reads *nothing* here and would have shown this item as free. Worse,
+      an OPT record with no options parses into an empty `Vec`, which does not
+      allocate either. The cost only appears for a query carrying an option, and
+      that is what a resolver sends: BIND and Unbound both put a DNS cookie
+      (RFC 7873) in every query by default. Against a probe with EDNS0, DO and a
+      cookie, both sides rebuilt: **24,707 blocks → 20,707** over 1,000 queries,
+      2.73 MB → 2.46 MB, and the two `parse_options` sites (4,000 blocks between
+      them) are gone. The unit assertion is `read a request's EDNS parameters: 0`
+      beside `and the same three fields through the full option parse: 2`, the
+      old cost taken live rather than quoted so the comparison cannot go stale.
+
+      Note that the totals here are **not** comparable with the 13,707 recorded
+      two items above: that was a plain query, this is a two-record message, and
+      an EDNS query costs more to parse and answer whatever we do. Both sides of
+      each comparison were measured with the same probe on the same day.
+- [x] **DNSSEC canonicalization is rebuilt per candidate RRSIG** — **closed
+      2026-08-01 as not worth doing, on the measurement the criterion harness was
+      built to make.** The finding is accurate about the code and wrong about
+      what it costs, in two ways.
+
+      **It does not usually happen at all.** `verify_rrset` returns on the first
+      signature that verifies (`dnssec.rs:802`), so the KSK-and-ZSK case the
+      finding names — "does all of it twice for an identical result" — does it
+      *once*. A second canonicalization needs a candidate that is rejected first:
+      a key rollover, a wrong key tag, an expired signature, or an attacker
+      sending one. Not the ordinary path.
+
+      **And when it does happen it is ~0.3%.** `benches/answer_path.rs` verifies
+      the same RRset at 1 record and at 20; canonicalization scales with the
+      record count and the ECDSA verification does not, so the difference is the
+      canonicalization: **31.03 µs → 32.78 µs, a slope of 102 ns per record.**
+      A one-record RRset therefore spends about a tenth of a microsecond
+      canonicalizing and thirty-one on ring's P-256 verify. Doing the fix
+      perfectly, in the case where it applies at all, would save a tenth of a
+      percent of a verification — and a verification only happens in `rdnsr`,
+      not on `rdnsd`'s answer path.
+
+      A measurement that redirects effort is worth as much as one that finds a
+      bug (`CLAUDE.md` §10), and this one says: the cost of DNSSEC here is the
+      cryptography, exactly where it should be. Original finding follows.
+
       (`rdns/src/dnssec.rs:779`, inside the loop at `:749`). `signed_data` re-runs
       `canonical_rdata` over the whole RRset for each candidate — a full
       `record.parse()` with `String` allocations, `canonical_name` per embedded
@@ -2851,7 +3080,56 @@ into a measurement you can re-run, and it is what tells you when to stop.
       (`dnssec.rs::signed_data`) is correct and well-commented; this module is a
       loaded gun aimed at whoever wires it up, because a caller would get silently
       unverifiable signatures.
-- [ ] **`bench.rs` measures debug builds and cannot see the defects above.** It is
+- [x] **`bench.rs` measures debug builds and cannot see the defects above** —
+      **done 2026-08-01.** `rdns/benches/answer_path.rs` under criterion, which
+      runs against the release profile and can compare a run to a saved baseline
+      (`--save-baseline` / `--baseline`) — the thing an optimization actually
+      needs and the reason this item blocked #13 and #11. Fourteen benchmarks in
+      five groups, including the three cases the finding asked for: `log_query`
+      at a realistic depth (1,000 sources tracked), `put` into a *full* cache,
+      and a full-size response through `to_bytes_within_buf`.
+
+      **Measured on the development machine, 2026-08-01** (Windows; the Linux
+      figures for the answer path are roughly half these, see the file's header):
+
+      | | |
+      |---|---|
+      | parse a query | 151 ns |
+      | look up one A record | 60 ns |
+      | serialize a one-record response | 123 ns |
+      | serialize a full-size response (60 records) | 5.07 µs |
+      | **one whole answer** (parse, look up, build, serialize) | **522 ns** |
+      | zone hit / miss in a 10k-record zone | 64 ns / 159 ns |
+      | rate limiter / request validator | 62 ns / 6.7 ns |
+      | 100 puts into a full 20k cache | 26.3 µs (263 ns each) |
+      | log a query with 1k sources tracked | 49 ns |
+      | verify an RRset, two candidate signatures | 31.4 µs |
+
+      **The number that matters most is not in the table**, and the file's header
+      carries it: one `sendto` + one `recvfrom` on loopback is **3.6 µs on Linux
+      and 4.1 µs on Windows**, measured the same day. So everything above is
+      about 6% of what a query costs a server, and a 20% win anywhere in it is
+      worth about 1% end to end. That is the context a criterion result needs to
+      be read in — without it, this harness will make small things look large,
+      which is the failure mode opposite to `bench.rs`'s and just as misleading.
+
+      **Seven of the nine `bench.rs` tests are deleted**, which is why the lib
+      count falls from 624 to 617. Each is listed in that file's header with what
+      replaced it; the short version is that a debug-build ops/sec floor guards
+      nothing unless a *complexity class* is behind it. The two that have one
+      stay — `bench_logger_throughput`, whose floor has the history `CLAUDE.md`
+      §10 argues from, and `bench_zone_lookup`, which §10 names as the example of
+      a floor with a factor of ten of headroom — because those run under `cargo
+      test` in CI on every commit, where a benchmark does not.
+
+      **Cost: 22 packages, all dev-only.** `cargo tree -e normal` is unchanged,
+      so nothing here reaches a shipped binary. Default features off: `plotters`
+      and `rayon` draw HTML reports nobody in this project reads. By the standard
+      #14's own section sets — pay for a parser, not for a stub — a harness that
+      produced the table above and closed #13 on its first run is proportionate.
+      Original finding follows.
+
+      It is
       `#[cfg(test)]`-gated, so it does not exist in release builds and every number
       it prints is a debug number (`:351` says so). `bench_cache_throughput`
       (`:104`) only ever calls `get` on an empty cache, so it never reaches
@@ -4823,6 +5101,55 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **A benchmark harness that measures optimized code, and the item it closed** —
+  closes 9e's last two, and with them #9 entirely. `rdns/benches/answer_path.rs`
+  under criterion: fourteen benchmarks, release profile, baseline comparison.
+  One whole answer is 522 ns (parse 151, look up 60, serialize 123); a full-size
+  60-record response 5.07 µs; a zone miss in 10k records 159 ns. It closed #13 on
+  its first run — verifying the same RRset at 1 and 20 records costs 31.03 and
+  32.78 µs, so the canonicalization the item wanted removed is 102 ns per record
+  against 31 µs of ECDSA, and `verify_rrset` returns on the first signature that
+  verifies so it usually happens once anyway. The header carries the number that
+  keeps all of this honest: a `sendto`+`recvfrom` pair is 3.6-4.1 µs, so the
+  whole suite is ~6% of a query. Seven `bench.rs` debug-build floors deleted
+  (lib count 624 → 617); the two guarding a complexity class stayed. Cost: 22
+  dev-only packages.
+- **A request's EDNS parameters, read once and without the option list** —
+  closes 9e item 12 and with it every allocation item on the list.
+  `DnsMessage::edns_header` walks the OPT RDATA to check it and returns the three
+  fields the answer path reads (payload size, version, DO) as a `Copy` struct;
+  `edns()` still exists for a caller that wants the options. Both daemons called
+  it twice per query and built the option list both times. Measured with the
+  query a real resolver sends — EDNS0, DO, a DNS cookie, which is what BIND and
+  Unbound send by default and what every earlier probe here lacked: 24,707 blocks
+  → 20,707 over 1,000 queries, four per query. The check and the parse are one
+  walk with two closures, so FORMERR means the same thing to both, with two tests
+  holding them to it. `rdns/tests/allocations.rs` is one `#[test]` now, because
+  the eight it had were being mis-counted by libtest's own bookkeeping on another
+  thread — 15 where the answer is 7, three runs in five on Linux.
+- **Four more per-query allocation sites, one of them a wrong answer** — closes
+  9e item 11. `compression::write_name` 5 → 2 (the vector of label offsets is an
+  iterator; a name already in the table is not copied to look it up), `dname`
+  parsing 3 → 2 (a name with no compression pointer in it is already unpacked),
+  and `find_zone_for_query` 3 → 0 — which also stopped folding case with Unicode
+  `to_lowercase`, where U+212A KELVIN SIGN made a query select a zone it differs
+  from on the wire and get that zone's NXDOMAIN with AA set (`CLAUDE.md` §8). Its
+  containment test is `utils::is_at_or_under` now, shared with the zone index
+  (§7). Measured over 1,000 UDP queries against a rebuilt `HEAD`: 20,712 blocks →
+  13,707 — 25.7 allocations per query down to 13.7 across the two changes.
+  `msg.queries.clone()` was the third item on the list and stayed, with its
+  reason. Five exact assertions in `allocations.rs`, three of them moved here and
+  each watched failing first.
+- **A zone lookup key that borrows** — closes 9e's largest item. `absolutize`,
+  `normalize_name`, `lookup_key` and `origin_key` return `Cow<str>`, and
+  `HashMap<String, _>::get` takes a `&str`, so a query for a name that arrived
+  absolute and lower case — every query off the wire — reaches the index without
+  allocating. Two of `absolutize`'s three cases were copying a string to produce
+  itself. Measured over 1,000 UDP queries against a rebuilt `HEAD` beside it:
+  25,715 blocks → 20,712, five per query, both sites gone from the profile. Four
+  assertions, two of them exact allocation counts (5 → 1 for the three lookups
+  behind one answer), each watched failing against the reverted code and
+  identical on the Linux side.
 - **A readiness probe and a container image** — closes 9d's last operability
   item, and with it 9d. `GET /readyz` on `--metrics-listen` is 503 (naming the
   zones) until every `--secondary` zone has transferred at least once, and 200

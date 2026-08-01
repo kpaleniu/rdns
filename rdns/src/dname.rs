@@ -256,6 +256,24 @@ impl<'a> DNameUnpacker<'a> {
             });
         }
 
+        // A name with no pointer in it is already unpacked, and copying its
+        // labels into a second `Vec` is the whole of what the loop below would
+        // do — one allocation per name parsed, on the path every query takes
+        // (`TODO.md` #9e). The common case is not a corner: a QNAME cannot
+        // contain a pointer, since there is nothing before it to point at.
+        //
+        // The trailing `Root` comes off, because an `UnpackedDName`'s labels are
+        // the name's *content* everywhere they are read: `try_into` stops at a
+        // `Root`, and the `extend` below would otherwise splice one into the
+        // middle of the name that pointed here.
+        if !name.labels.iter().any(|l| matches!(l, Label::Pointer(_))) {
+            let mut labels = name.labels;
+            if matches!(labels.last(), Some(Label::Root)) {
+                labels.pop();
+            }
+            return Ok(UnpackedDName { labels });
+        }
+
         let mut output = Vec::new();
         for label in &name.labels {
             match label {
