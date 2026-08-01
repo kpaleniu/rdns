@@ -537,6 +537,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdnsctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rdns",
+]
+
+[[package]]
 name = "rdnsd"
 version = "0.1.0"
 dependencies = [

@@ -20,6 +20,8 @@ all the RFC nomenclature uses.
   in-flight zone transfers finish rather than being cut mid-stream
 - Prometheus metrics on `--metrics-listen`: RED counters, an answer-latency
   histogram, per-zone serial and last-refresh gauges, and a liveness probe
+- A control socket (`--control-socket`) and `rdnsctl`: `status`, `reload` that
+  reports whether it worked, and `dump` of a zone as it is being served
 - Rate limiting (`--query-rate`) and request validation
 - TSIG (RFC 8945), with per-key zone scoping so one partner's key is not a key
   to every zone
@@ -130,7 +132,18 @@ ExecStart=/usr/local/bin/rdnsd --config /etc/rdns/rdnsd.toml
 
 # SIGHUP reloads the zones. Signatures are re-made on their own timer, so the
 # cron kill -HUP that DNSSEC deployments used to need is gone.
-ExecReload=/bin/kill -HUP $MAINPID
+#
+# `rdnsctl reload` does the same thing and *reports the result*, which a signal
+# cannot: a zone file with a typo in it fails the reload, the previous zones
+# keep answering, and only the log would have said so. Use it here and
+# `systemctl reload rdns` fails when the reload did.
+ExecReload=/usr/local/bin/rdnsctl reload
+
+# The control socket lives here, created by systemd with this service's own
+# ownership and cleared on stop. `rdnsctl` looks for /run/rdns/rdnsd.sock by
+# default, so this name and `control-socket` in the config file have to agree.
+RuntimeDirectory=rdns
+RuntimeDirectoryMode=0750
 
 # SIGTERM stops accepting and finishes what is in flight — an AXFR mid-stream
 # included, since a client cannot tell a truncated transfer from a complete one.
@@ -184,6 +197,31 @@ sudo systemctl start rdns
 ```
 
 ### Monitoring
+
+Ask the running server, which is the only thing that knows:
+
+```bash
+rdnsctl status               # zones, serials, records, denial, role, last contact
+rdnsctl reload               # re-read every zone; exits non-zero if it failed
+rdnsctl dump example.com.    # the zone *as served*, signatures and all
+```
+
+`rdnsctl` talks to `--control-socket` — a Unix socket, mode 0600, so the
+filesystem is the authentication. There is no control port, for the reason every
+other DNS server has one only behind an HMAC or a client certificate. Exit codes
+are 0 for a command that worked, 1 for one the server refused, and 2 for a
+server that could not be reached, so a deploy script can tell a bad zone file
+from a daemon that is not running.
+
+The distinction that makes `reload` worth having over `kill -HUP`:
+
+```console
+$ rdnsctl reload
+rdnsctl: the reload failed and the zones already loaded are still being served: \
+line 8: SOA record needs 7 fields, got 0
+$ echo $?
+1
+```
 
 View service logs:
 

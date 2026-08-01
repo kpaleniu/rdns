@@ -1,0 +1,12 @@
+[package]
+name = "rdnsctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Ask a running rdnsd what it is serving, reload it, or dump a zone as served."
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rdns.workspace = true

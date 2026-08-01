@@ -84,7 +84,18 @@ pub struct Server {
     pub query_burst: u32,
     #[serde(default)]
     pub query_rate_exempt: Vec<String>,
+    /// Concurrent UDP answers, which is also the number of tasks sharing the
+    /// socket. Defaults to the machine's parallelism — see
+    /// `crate::default_udp_workers`, which is the same function the flag's
+    /// default comes from so the two cannot drift.
+    #[serde(default = "crate::default_udp_workers")]
+    pub udp_workers: usize,
     pub metrics_listen: Option<String>,
+    /// Where `rdnsctl` reaches this server. Unix only, and refused at startup
+    /// on Windows rather than ignored — the field parses everywhere so that one
+    /// config file can be read on either platform and fail with a sentence
+    /// instead of an unknown-key error.
+    pub control_socket: Option<PathBuf>,
     #[serde(default)]
     pub allow_partial_load: bool,
 }
@@ -101,7 +112,9 @@ impl Default for Server {
             query_rate: default_query_rate(),
             query_burst: default_query_burst(),
             query_rate_exempt: Vec::new(),
+            udp_workers: crate::default_udp_workers(),
             metrics_listen: None,
+            control_socket: None,
             allow_partial_load: false,
         }
     }
@@ -252,6 +265,17 @@ impl Config {
                  a bucket starts full, and a full bucket of nothing has no token to spend"
             );
         }
+        // The flag floors this at 1 instead, which is not an inconsistency: a
+        // mistyped flag should be wrong rather than fatal, and a config file is
+        // the one place a wrong value can be reported with a line number to the
+        // operator who is editing the whole policy at once. `query-burst` above
+        // splits the same way for the same reason.
+        if self.server.udp_workers == 0 {
+            bail!(
+                "server.udp-workers 0 binds the UDP socket and answers nothing on it; \
+                 1 is the smallest server"
+            );
+        }
         for (name, key) in &self.keys {
             match (&key.secret, &key.secret_file) {
                 (Some(_), Some(_)) => bail!(
@@ -355,7 +379,9 @@ impl Config {
         cli.query_rate = self.server.query_rate;
         cli.query_burst = self.server.query_burst;
         cli.query_rate_exempt = self.server.query_rate_exempt.clone();
+        cli.udp_workers = self.server.udp_workers;
         cli.metrics_listen = self.server.metrics_listen.clone();
+        cli.control_socket = self.server.control_socket.clone();
         cli.allow_partial_load = self.server.allow_partial_load;
         cli.tsig_key = self.tsig_specs()?;
         cli.secondary = self.secondary_specs();
@@ -627,6 +653,29 @@ query-burst = 0
 "#
         )
         .is_ok());
+    }
+
+    /// Zero workers binds the UDP socket and answers nothing on it. The flag
+    /// floors that at 1 instead of refusing it, which is not a contradiction:
+    /// the file is where a wrong value can be reported with a line number to
+    /// somebody who is editing the whole policy, and `query-burst` above splits
+    /// the same way.
+    #[test]
+    fn no_udp_workers_at_all_is_refused() {
+        let config = parse(MINIMAL).expect("parses");
+        assert!(
+            (2..=32).contains(&config.server.udp_workers),
+            "the file's default is the flag's default"
+        );
+        let err = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+udp-workers = 0
+"#,
+        )
+        .expect_err("this would answer no UDP query at all");
+        assert!(err.to_string().contains("udp-workers"), "got: {err}");
     }
 
     #[test]

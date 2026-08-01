@@ -49,6 +49,22 @@ fn escape_label(value: &str) -> String {
     out
 }
 
+/// One zone's gauges, named and owned, as [`DnsMetrics::zone_facts`] hands them
+/// out.
+///
+/// A separate type from the internal [`ZoneGauge`] because it carries the zone
+/// name: inside the map the name is the key, and a caller reading a snapshot
+/// needs the pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneFacts {
+    pub zone: String,
+    pub serial: u32,
+    /// `None` for a zone we are primary for, and for a secondary that has never
+    /// reached its master. Those are different from each other and from zero,
+    /// which is 1970 and would fire every staleness alert there is.
+    pub last_transfer: Option<u64>,
+}
+
 /// What is currently true of one zone.
 #[derive(Debug, Clone, Copy, Default)]
 struct ZoneGauge {
@@ -235,6 +251,31 @@ impl DnsMetrics {
             return;
         };
         zones.remove(zone);
+    }
+
+    /// What is currently true of each zone, by name: the serial being served
+    /// and the last contact with a master, if it has one.
+    ///
+    /// Exists so the control channel's `status` reads the *same* facts the
+    /// scrape does rather than growing a second view of them (`CLAUDE.md` §7).
+    /// It is a snapshot: the lock is taken and released here, so a caller
+    /// cannot hold the gauges open across an await or a reload.
+    ///
+    /// A poisoned lock yields an empty list, for the reason the setters return
+    /// early on one — `status` reporting nothing is a great deal better than
+    /// `status` panicking, and either way something else has already gone wrong.
+    pub fn zone_facts(&self) -> Vec<ZoneFacts> {
+        let Ok(zones) = self.zones.read() else {
+            return Vec::new();
+        };
+        zones
+            .iter()
+            .map(|(zone, gauge)| ZoneFacts {
+                zone: zone.clone(),
+                serial: gauge.serial,
+                last_transfer: gauge.last_transfer,
+            })
+            .collect()
     }
 
     /// Replace the whole set, for a reload that installs every zone at once.

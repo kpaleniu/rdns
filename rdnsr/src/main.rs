@@ -44,6 +44,23 @@ const MAX_TCP_CONNECTIONS: usize = 128;
 /// pushes back on our read loop instead of growing a queue in memory.
 const MAX_INFLIGHT_PER_CONNECTION: usize = 16;
 
+/// UDP queries this resolver will have in flight at once, when nothing says
+/// otherwise.
+///
+/// **Large on purpose, and it is not the same number as `rdnsd`'s workers.**
+/// There, answering is microseconds out of memory and a small fixed pool of
+/// tasks answers inline. Here one query is a *recursion*: several round trips to
+/// servers on the internet, seconds of it, almost all of it spent waiting. A
+/// resolver that could only have a few of those outstanding would be idle and
+/// slow at the same time, so this stays a task per datagram — and the bound is
+/// on how many of those may exist, which is what was missing.
+///
+/// 1024 because a task waiting on the network is ~1.5 KB of state, so the
+/// ceiling costs about 1.5 MB fully occupied, and because a resolver with a
+/// thousand queries genuinely outstanding is either very busy or under attack —
+/// and shedding is the right answer to both.
+const MAX_INFLIGHT_UDP: usize = 1024;
+
 /// Zones whose validated denial proofs we keep for aggressive use (RFC 8198).
 ///
 /// Counted in zones rather than records because that is the unit that pays off:
@@ -153,6 +170,24 @@ struct Cli {
     /// Errors only. The same as `--log-level error`, and refused with it.
     #[arg(long, conflicts_with = "log_level")]
     quiet: bool,
+    /// How many UDP queries may be in flight at once. Over the ceiling, further
+    /// datagrams are dropped.
+    ///
+    /// There was no ceiling at all: TCP had `MAX_TCP_CONNECTIONS` and
+    /// `MAX_INFLIGHT_PER_CONNECTION`, UDP had neither, and a recursion holds its
+    /// task for seconds — so a flood of one-datagram queries spawned tasks
+    /// faster than they could possibly retire.
+    ///
+    /// **There is no off switch**, unlike `--query-rate 0` on `rdnsd`: "off"
+    /// here is the defect this closes rather than a policy an operator might
+    /// want, and 0 is floored to 1 rather than refused so a mistyped flag is
+    /// wrong and not fatal.
+    ///
+    /// Dropping is silent, and deliberately — a reply to a spoofed source is
+    /// what an amplifier sends. The drop is a `debug!` for the same reason
+    /// nothing else per-packet is above `debug`.
+    #[arg(long, value_name = "QUERIES", default_value_t = MAX_INFLIGHT_UDP)]
+    max_inflight_udp: usize,
 }
 
 #[tokio::main]
@@ -308,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
     let socket = Arc::new(UdpSocket::bind(&addr).await?);
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!(
-        "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}",
+        "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, UDP in flight: {}",
         addr,
         source,
         if capacity == 0 {
@@ -317,6 +352,9 @@ async fn main() -> anyhow::Result<()> {
             format!("{capacity} entries")
         },
         dnssec_source,
+        // Printed because the drops it causes are silent: `CLAUDE.md` §14, a
+        // control nobody can observe is a control nobody can debug.
+        cli.max_inflight_udp.max(1),
     );
 
     // A `JoinSet` rather than two `JoinHandle`s in a `select!`, which dropped
@@ -329,6 +367,7 @@ async fn main() -> anyhow::Result<()> {
         socket,
         resolver.clone(),
         caches.clone(),
+        cli.max_inflight_udp,
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
@@ -564,13 +603,25 @@ fn report(change: &AnchorChange) {
     }
 }
 
+/// Receive datagrams and resolve each in its own task, up to `max_inflight`.
+///
+/// The spawn stays — see [`MAX_INFLIGHT_UDP`] for why a resolver is the case
+/// where it is right — but it is bounded now, and the permit is taken **before**
+/// the packet is copied and the task is created rather than after. `try_acquire`
+/// and not `acquire`: waiting for a permit would only move the queue from the
+/// kernel's receive buffer into a pile of tasks holding copies of datagrams,
+/// which is the shape being fixed. For UDP, shedding *is* the back-pressure.
 async fn udp_main(
     socket: Arc<UdpSocket>,
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
+    max_inflight: usize,
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
+    // Floored, not refused: a resolver that answers nothing is not a setting
+    // anybody means (`CLAUDE.md` §14).
+    let in_flight = Arc::new(Semaphore::new(max_inflight.max(1)));
     // Sized for any datagram a client may send, not for the payload size we
     // advertise: on Windows an oversized datagram fails the receive rather than
     // truncating, and a failed receive ends this loop and the process with it.
@@ -592,6 +643,13 @@ async fn udp_main(
             Err(e) if recv_error_is_transient(&e) => continue,
             Err(e) => return Err(e),
         };
+        // Before the copy, before the clones, before the task: at the ceiling
+        // this datagram costs one comparison and nothing else. The semaphore is
+        // never closed, so the only failure is "full".
+        let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+            tracing::debug!(%peer, "dropped: {max_inflight} UDP queries already in flight");
+            continue;
+        };
         let data = buf[..n].to_vec();
         let socket = socket.clone();
         let resolver = resolver.clone();
@@ -601,6 +659,7 @@ async fn udp_main(
         let busy = busy.clone();
         tokio::spawn(async move {
             let _busy = busy;
+            let _permit = permit;
             if let Some(reply) = handle_query(data, &resolver, &caches, Transport::Udp).await {
                 let _ = socket.send_to(&reply, peer).await;
             }
@@ -1289,5 +1348,80 @@ mod tests {
                 "{opcode:?}: a plausible QUERY-shaped answer is worse than a refusal"
             );
         }
+    }
+
+    /// A datagram arriving with the in-flight ceiling already reached is
+    /// dropped, and dropped *before* it is copied and given a task.
+    ///
+    /// The setup is built so that neither half of it is a race. A resolver
+    /// forwarding to an upstream that never answers, with a thirty-second
+    /// timeout, holds its permit for the whole test; the black hole *receiving*
+    /// the forwarded query is the proof that it does, so the second datagram is
+    /// unambiguously sent while the only permit is taken. And the second
+    /// datagram is an UPDATE, which `handle_query` answers with NOTIMP out of
+    /// the message alone — no cache, no network, nothing that could be slow. So
+    /// "no reply arrived" means the packet was dropped at the door and not that
+    /// the answer was still being worked out.
+    ///
+    /// **Fails against the old code**, which spawned unconditionally: the
+    /// NOTIMP came straight back. Confirmed by deleting the `try_acquire_owned`
+    /// and watching it pass in the wrong direction.
+    #[tokio::test]
+    async fn a_datagram_over_the_in_flight_ceiling_is_dropped() {
+        let black_hole = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let upstream = black_hole.local_addr().expect("addr");
+        let resolver = Arc::new(Resolver::new(ResolverConfig {
+            mode: ResolverMode::Forward,
+            upstream_servers: vec![upstream],
+            // Long enough that the first query is still outstanding at the end
+            // of the test whatever the machine is doing.
+            timeout_ms: 30_000,
+            ..Default::default()
+        }));
+        let (_, caches) = context();
+
+        let shutdown = Shutdown::new();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let addr = socket.local_addr().expect("addr");
+        let server = tokio::spawn(udp_main(
+            socket,
+            resolver,
+            caches,
+            1,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+        client
+            .send_to(&message(OpCode::Query, false), addr)
+            .await
+            .expect("send the query that takes the permit");
+        // The forwarded query landing here is what makes the permit definitely
+        // held rather than probably held.
+        let mut buf = vec![0u8; 512];
+        black_hole
+            .recv_from(&mut buf)
+            .await
+            .expect("the query was forwarded, so the permit is taken");
+
+        client
+            .send_to(&message(OpCode::Update, false), addr)
+            .await
+            .expect("send the query that must be dropped");
+        let waited = tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+            .await
+            .is_ok();
+        assert!(
+            !waited,
+            "a NOTIMP came back, so the datagram was answered rather than shed — \
+             it costs microseconds to build, and half a second is a thousand times that"
+        );
+
+        shutdown.begin();
+        // The worker is parked in `recv_from`, which the stop cancels; the
+        // resolving task is what the drain is for and this test does not wait
+        // for its thirty seconds.
+        let _ = server.await;
     }
 }

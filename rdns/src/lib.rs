@@ -17,6 +17,7 @@ pub const VERSION: &str = env!("RDNS_VERSION");
 pub mod bench;
 pub mod cache;
 pub mod compression;
+pub mod control;
 pub mod dname;
 pub mod dnssec;
 pub mod dnssec_answer;

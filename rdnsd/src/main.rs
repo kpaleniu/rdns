@@ -1,10 +1,16 @@
 mod config;
+/// The control socket, which needs a Unix domain socket and so exists on Unix
+/// only — the same shape SIGHUP reloading has. See the module for why the
+/// alternative (control endpoints on the metrics listener) is not one.
+#[cfg(unix)]
+mod control;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -53,6 +59,33 @@ const MAX_TCP_CONNECTIONS: usize = 128;
 /// channel's depth, so a client that pipelines faster than it reads eventually
 /// pushes back on our read loop instead of growing a queue in memory.
 const MAX_INFLIGHT_PER_CONNECTION: usize = 16;
+
+/// How many UDP workers `--udp-workers` defaults to, and the reason it is not a
+/// round constant.
+///
+/// The work one worker does per datagram is microseconds of CPU between two
+/// await points, so the only parallelism that helps is the machine's — a fixed
+/// 64 would be 64 threads' worth of ambition on a two-core box and would cost
+/// 4 MB of receive buffers to say so, since each worker holds one
+/// [`UDP_RECEIVE_BUFFER`]. Hence the machine's own number.
+///
+/// Both ends are clamped rather than trusted. The floor is 2 so the default is
+/// never the degenerate single-worker case on a container reporting one CPU
+/// (**the flag itself is floored at 1** in `serve`, which is a different rule:
+/// §14's "a mistyped knob should be wrong, not fatal"). The ceiling is 32
+/// because past it this is buying receive buffers rather than throughput; an
+/// operator with a 128-core authoritative server and a reason can say so on the
+/// command line.
+///
+/// `available_parallelism` and not `num_cpus`: it is std, it respects cgroup
+/// quotas and affinity masks, and this crate does not need a dependency to ask
+/// one question.
+pub(crate) fn default_udp_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(2)
+        .clamp(2, 32)
+}
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -288,6 +321,29 @@ struct Cli {
     /// everybody.
     #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     query_rate_exempt: Vec<String>,
+    /// How many UDP datagrams may be answered at once.
+    ///
+    /// This is the ceiling on concurrent UDP work *and* the shape of it: that
+    /// many identical tasks share the socket and answer inline, rather than one
+    /// task being spawned per datagram. There was no ceiling at all before —
+    /// TCP had two (`MAX_TCP_CONNECTIONS`, `MAX_INFLIGHT_PER_CONNECTION`) and
+    /// UDP had none — so a flood spawned tasks until something gave out, at
+    /// 1,536 bytes of task per datagram before anything had decided to keep it.
+    ///
+    /// Raising it does not make a busy server faster. Answering from an
+    /// in-memory zone is microseconds of CPU with two await points in it, so the
+    /// useful parallelism is the machine's and no more; what this number really
+    /// guards is the memory (one 64 KB receive buffer per worker) and the number
+    /// of answers a stall can hold up. Beyond the workers, datagrams queue in
+    /// the socket receive buffer and the kernel drops the overflow — for UDP
+    /// that is the correct back-pressure, and `netstat -su` counts it.
+    #[arg(
+        long,
+        value_name = "TASKS",
+        default_value_t = default_udp_workers(),
+        conflicts_with = "config"
+    )]
+    udp_workers: usize,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///
     /// Off by default, because it is a second listening socket and an operator
@@ -306,6 +362,24 @@ struct Cli {
     /// and which zones are failing.
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     metrics_listen: Option<String>,
+    /// Answer `rdnsctl` on this Unix socket: `status`, `reload`, `dump <zone>`.
+    ///
+    /// Off by default, because it is a second thing to bind and an operator
+    /// should choose where it lives — `/run/rdns/rdnsd.sock` under a directory
+    /// the service unit makes is the shape to copy.
+    ///
+    /// **Filesystem permissions are the authentication.** The socket is created
+    /// mode 0600, so it is the server's user and root. That is what Knot,
+    /// PowerDNS and Unbound do; the two servers that put a control channel on
+    /// TCP (BIND's rndc, NSD's nsd-control) put an HMAC or a client certificate
+    /// in front of it, and nobody ships an unauthenticated control port. It is
+    /// also why these commands are not on `--metrics-listen`, where `reload`
+    /// would be a POST with no credential.
+    ///
+    /// **Unix only.** `tokio` has no `UnixListener` on Windows, so this is
+    /// refused there at startup rather than accepted and ignored.
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
+    control_socket: Option<PathBuf>,
     /// Read the settings from a TOML file instead of from flags.
     ///
     /// **Exclusive of the flags it would set**, deliberately: `--config` together
@@ -902,8 +976,34 @@ struct ServePolicy {
     response_rate: u32,
     /// Queries per second per client, with its burst and exemptions.
     query_limit: RateLimitConfig,
+    /// How many UDP datagrams may be answered at once. Floored at 1 in `serve`.
+    udp_workers: usize,
     /// Where to serve Prometheus metrics, if anywhere.
     metrics_listen: Option<String>,
+    /// The control socket, and what a `reload` on it pokes.
+    control: ControlPolicy,
+}
+
+/// Where the control socket lives and how it asks for a reload.
+///
+/// The sender is here rather than beside `zone_map` because it exists only for
+/// this: it is the control channel's end of the maintenance task's queue, and a
+/// server with no control socket never uses it.
+#[cfg_attr(not(unix), allow(dead_code))]
+struct ControlPolicy {
+    socket: Option<PathBuf>,
+    reloads: mpsc::Sender<ReloadTrigger>,
+    /// Zones this server replicates, so `status` can say `secondary` from
+    /// configuration rather than guessing it from an absent timestamp — which
+    /// is also what a primary has.
+    replicated: Vec<String>,
+    /// When the process started, for `status`'s uptime line.
+    ///
+    /// Taken in `main` rather than here: `serve` runs after every zone has been
+    /// loaded, signed and verified, which on a big set is the bulk of a start.
+    /// An uptime that began when the sockets bound would quietly under-report
+    /// exactly the servers whose starts are worth asking about.
+    started: Instant,
 }
 
 /// Bind both transports and serve them from one process.
@@ -921,8 +1021,14 @@ async fn serve(
         tsig_keys,
         response_rate,
         query_limit,
+        udp_workers,
         metrics_listen,
+        control,
     } = policy;
+    // Floored, not refused: `--udp-workers 0` is a server that binds the UDP
+    // socket and answers nothing on it, which is the same class of mistake as
+    // the zero burst that refused every query (`CLAUDE.md` §14).
+    let udp_workers = udp_workers.max(1);
     let transfers = if transfer_acl.is_empty() && tsig_keys.is_empty() {
         "refused (no --allow-transfer, no --tsig-key)".to_string()
     } else {
@@ -982,6 +1088,14 @@ async fn serve(
         ),
         None => None,
     };
+    // Same rule for the control socket: a path that cannot be bound — a
+    // directory that does not exist, or another server already there — stops the
+    // start rather than leaving a server nobody can ask anything.
+    #[cfg(unix)]
+    let control_listener = match &control.socket {
+        Some(path) => Some(control::bind(path)?),
+        None => None,
+    };
 
     let server = Arc::new(Server {
         zone_map,
@@ -1006,11 +1120,15 @@ async fn serve(
     tracing::info!(
         "rdnsd listening on {addr} (UDP+TCP), zone transfer: {transfers}, \
          response budget: {budget}, query rate: {query_limit_note}, \
-         TSIG keys: {}, metrics: {}",
+         UDP workers: {udp_workers}, TSIG keys: {}, metrics: {}, control: {}",
         server.tsig_keys.len(),
         match &metrics_listen {
             Some(spec) => format!("{spec}/metrics"),
             None => "off (--metrics-listen)".to_string(),
+        },
+        match &control.socket {
+            Some(path) => format!("{} (mode 0600)", path.display()),
+            None => "off (--control-socket)".to_string(),
         }
     );
 
@@ -1022,12 +1140,18 @@ async fn serve(
     // cancel-safe, so the same first-one-wins shape now leaves both tasks
     // owned and joinable.
     let mut loops = JoinSet::new();
-    loops.spawn(udp_loop(
-        socket,
-        server.clone(),
-        shutdown.stop_handle(),
-        shutdown.busy(),
-    ));
+    // The UDP workers are peers, not a supervisor and its children: each one
+    // receives from the shared socket and answers inline, so they belong in the
+    // same `JoinSet` as the accept loops and get the same treatment — the first
+    // one to stop for a reason other than the signal ends the process.
+    for _ in 0..udp_workers {
+        loops.spawn(udp_loop(
+            socket.clone(),
+            server.clone(),
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+    }
     loops.spawn(tcp_loop(
         listener,
         server.clone(),
@@ -1041,6 +1165,36 @@ async fn serve(
         loops.spawn(metrics_server::serve(
             metrics_listener,
             server.metrics.clone(),
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+    }
+    // And so is the control socket, for the stronger version of the same
+    // reason: an operator who reaches for it is already having a bad day, and a
+    // control channel that died quietly is one they will reach for and find
+    // silent.
+    #[cfg(unix)]
+    if let Some(control_listener) = control_listener {
+        let ControlPolicy {
+            socket,
+            reloads,
+            replicated,
+            started,
+        } = control;
+        loops.spawn(control::serve(
+            control_listener,
+            socket.expect("a listener implies a path"),
+            Arc::new(control::Control {
+                served: Served {
+                    zone_map: server.zone_map.clone(),
+                    deltas: server.deltas.clone(),
+                    metrics: server.metrics.clone(),
+                },
+                replicated,
+                reloads,
+                started,
+                listen: addr.to_string(),
+            }),
             shutdown.stop_handle(),
             shutdown.busy(),
         ));
@@ -1750,7 +1904,50 @@ fn absolute_name(name: &str) -> String {
     }
 }
 
-/// Receive datagrams and answer each in its own task.
+/// Receive datagrams and answer them, as one of `--udp-workers` identical tasks
+/// sharing the socket.
+///
+/// **No task per datagram, and the reason is not only the bound.** This loop
+/// used to `to_vec()` the packet, clone two `Arc`s and `tokio::spawn`, and only
+/// then — inside the spawned future — ask the rate limiter whether to drop it.
+/// Everything was paid before anything decided. DHAT put a number on the task
+/// itself: **1,536 bytes per datagram, 46% of every byte a query allocated**,
+/// larger than the whole rest of the answer path put together.
+///
+/// The finding proposed keeping the spawn and putting a `Semaphore` in front of
+/// it. This does the other thing, because for `rdnsd` the work is wrong for a
+/// task: answering from an in-memory zone has exactly two await points — the
+/// zone-map read guard and `send_to` — and takes microseconds. A fixed pool of
+/// workers gives the same bound (concurrency is the worker count) and gives it
+/// *before* the packet is copied rather than after, and the queue it pushes back
+/// into is the socket receive buffer, which is where a UDP queue belongs: the
+/// kernel drops the overflow for free and counts it (`netstat -su`) instead of
+/// us allocating a task in order to throw it away. Shedding is still the policy;
+/// it just happens one layer down.
+///
+/// What that buys, all of it measured rather than argued: the 1,536-byte task
+/// and the 33-byte packet copy are gone, and the response scratch buffer becomes
+/// per-worker rather than per-datagram, so a plain answer allocates nothing to
+/// send at all.
+///
+/// It costs one 64 KB receive buffer per worker, which is why the default is a
+/// handful and not a hundred (see [`default_udp_workers`]).
+///
+/// The one thing this shape must not do is block: a worker stuck in here is a
+/// worker not receiving. That is why the *slow* transport, TCP, still gets a
+/// task per connection, and why `rdnsr` — where one query is seconds of
+/// recursion — keeps its spawn and bounds it with a semaphore instead.
+///
+/// **One consequence is a deliberate change and worth stating.** A panic while
+/// answering used to be swallowed: the spawned task died, the datagram went
+/// unanswered, and the loop carried on. Here it ends the worker, and `serve`
+/// ends the process on a listener that stopped. That is the trade being taken
+/// on purpose — a panic on this path means a broken invariant (a poisoned
+/// mutex, a parse we thought was total), and a server that keeps accepting
+/// queries while every answer panics is the quiet degradation this codebase
+/// keeps being bitten by, not a server that survived. It is also why the parse
+/// in front of it is the code that gets hardened: see #9b's RDLENGTH panic,
+/// which was pre-authentication and remote.
 async fn udp_loop(
     socket: Arc<UdpSocket>,
     server: Arc<Server>,
@@ -1758,6 +1955,12 @@ async fn udp_loop(
     busy: Busy,
 ) -> Result<(), std::io::Error> {
     let mut buf = vec![0; UDP_RECEIVE_BUFFER];
+    // The response, built here once per worker and reused for its lifetime.
+    // `to_bytes_within_buf` exists for exactly this, and until now nothing could
+    // use it: a task per datagram has nowhere to keep a buffer between
+    // datagrams. It settles at the largest EDNS payload size this worker has
+    // been asked for.
+    let mut scratch = Vec::new();
 
     loop {
         // `recv_from` is cancel-safe, so a datagram is either fully received or
@@ -1771,165 +1974,182 @@ async fn udp_loop(
             Err(e) if recv_error_is_transient(&e) => continue,
             Err(e) => return Err(e),
         };
-        let socket = socket.clone();
-        let server = server.clone();
-        let packet = buf[0..size].to_vec();
-        // Claims the drain until this answer is on the wire. A datagram is small
-        // and this is quick, which is exactly why it is worth waiting for rather
-        // than dropping an answer the client is already waiting on.
-        let busy = busy.clone();
+        let packet = &buf[..size];
 
-        tokio::spawn(async move {
-            let _busy = busy;
-            // Named for the body below, which was written against separate Arcs
-            // when this loop owned its own copy of everything.
-            let Server {
-                zone_map,
-                rate_limiter,
-                validator,
-                logger,
-                metrics,
-                tsig_keys,
-                response_limiter,
-                secondaries,
-                ..
-            } = &*server;
-            // Rate limiting check
-            if !rate_limiter.should_allow(peer.ip()) {
-                logger.log_rate_limited(peer.ip());
-                metrics.count(&metrics.rate_limited);
-                return;
-            }
+        // Both of these are decisions to do nothing, so they come before any
+        // work is done: on `&buf[..size]` with nothing copied and nothing
+        // spawned.
+        if !server.rate_limiter.should_allow(peer.ip()) {
+            server.logger.log_rate_limited(peer.ip());
+            server.metrics.count(&server.metrics.rate_limited);
+            continue;
+        }
+        let validation = server.validator.validate_packet(packet, false);
+        if !validation.is_valid() {
+            bad_request!(
+                server.logger,
+                peer.ip(),
+                "invalid query: {}",
+                validation
+                    .error()
+                    .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
+            );
+            server.metrics.count(&server.metrics.validation_errors);
+            continue;
+        }
 
-            // Validation check
-            let validation = validator.validate_packet(&packet, false);
-            if !validation.is_valid() {
-                bad_request!(
+        // Claims the drain until this answer is on the wire, and only until
+        // then: held across the loop instead, it would be the accept-loop
+        // mistake `rdns::shutdown` splits `Stop` from `Busy` to prevent — a
+        // claim that never ends keeps the drain open for the whole budget.
+        let _busy = busy.clone();
+        server
+            .answer_datagram(packet, peer, &socket, &mut scratch)
+            .await;
+    }
+}
+
+/// A second `impl` block, next to [`udp_loop`] rather than beside
+/// `serve_connection` six hundred lines down, because it is the body of that
+/// loop and was only lifted out of it to keep the loop readable.
+impl Server {
+    /// Answer one datagram that has already been admitted, into `scratch`.
+    ///
+    /// The rate limiter and the validator have run in the loop above; what is
+    /// left is everything that has to look at the message.
+    async fn answer_datagram(
+        &self,
+        packet: &[u8],
+        peer: SocketAddr,
+        socket: &UdpSocket,
+        scratch: &mut Vec<u8>,
+    ) {
+        let Server {
+            zone_map,
+            logger,
+            metrics,
+            tsig_keys,
+            response_limiter,
+            secondaries,
+            ..
+        } = self;
+
+        let Ok(msg) = DnsMessage::try_from_bytes(packet) else {
+            bad_request!(logger, peer.ip(), "failed to parse DNS message");
+            return;
+        };
+
+        // Log successful query parsing
+        let qtype = msg.queries.first().map(|q| q.qtype);
+        logger.log_query(peer.ip(), qtype);
+
+        // A signed query is checked before it is answered, and its answer
+        // is signed back (RFC 8945). A rejected one gets NOTAUTH and a
+        // TSIG saying which of BADKEY/BADSIG/BADTIME it was.
+        let now = tsig::now();
+        let mut session = match tsig::check_request(packet, tsig_keys, now) {
+            TsigCheck::Unsigned => None,
+            TsigCheck::Verified(session) => Some(session),
+            TsigCheck::Rejected(rejection) => {
+                serving_error!(
                     logger,
                     peer.ip(),
-                    "invalid query: {}",
-                    validation
-                        .error()
-                        .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
+                    "TSIG rejected (key {}): {}",
+                    rejection.key_name(),
+                    rejection.error.reason()
                 );
-                metrics.count(&metrics.validation_errors);
+                let mut resp = DnsMessage {
+                    id: msg.id,
+                    response: true,
+                    opcode: msg.opcode,
+                    authoritive: false,
+                    truncation: false,
+                    recursion: msg.recursion,
+                    recursion_ok: false,
+                    ad: false,
+                    cd: msg.cd,
+                    rcode: ResponseCode::NotAuthorized,
+                    queries: msg.queries.clone(),
+                    answers: Vec::new(),
+                    authorities: Vec::new(),
+                    additionals: Vec::new(),
+                };
+                if msg.has_edns() {
+                    let _ = resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+                }
+                if let Ok(bytes) = resp.to_bytes_within(msg.udp_payload_size() as usize) {
+                    if let Ok(bytes) = rejection.attach(bytes, now) {
+                        let _ = socket.send_to(&bytes, peer).await;
+                    }
+                }
                 return;
             }
+        };
 
-            if let Ok(msg) = DnsMessage::try_from_bytes(&packet) {
-                // Log successful query parsing
-                let qtype = msg.queries.first().map(|q| q.qtype);
-                logger.log_query(peer.ip(), qtype);
+        metrics.count(&metrics.queries_received);
+        if let Some(qtype) = qtype {
+            metrics.track_query_type(qtype);
+        }
 
-                // A signed query is checked before it is answered, and its answer
-                // is signed back (RFC 8945). A rejected one gets NOTAUTH and a
-                // TSIG saying which of BADKEY/BADSIG/BADTIME it was.
-                let now = tsig::now();
-                let mut session = match tsig::check_request(&packet, tsig_keys, now) {
-                    TsigCheck::Unsigned => None,
-                    TsigCheck::Verified(session) => Some(session),
-                    TsigCheck::Rejected(rejection) => {
-                        serving_error!(
-                            logger,
-                            peer.ip(),
-                            "TSIG rejected (key {}): {}",
-                            rejection.key_name(),
-                            rejection.error.reason()
-                        );
-                        let mut resp = DnsMessage {
-                            id: msg.id,
-                            response: true,
-                            opcode: msg.opcode,
-                            authoritive: false,
-                            truncation: false,
-                            recursion: msg.recursion,
-                            recursion_ok: false,
-                            ad: false,
-                            cd: msg.cd,
-                            rcode: ResponseCode::NotAuthorized,
-                            queries: msg.queries.clone(),
-                            answers: Vec::new(),
-                            authorities: Vec::new(),
-                            additionals: Vec::new(),
-                        };
-                        if msg.has_edns() {
-                            let _ = resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
-                        }
-                        if let Ok(bytes) = resp.to_bytes_within(msg.udp_payload_size() as usize) {
-                            if let Ok(bytes) = rejection.attach(bytes, now) {
-                                let _ = socket.send_to(&bytes, peer).await;
-                            }
-                        }
-                        return;
-                    }
-                };
-
-                metrics.count(&metrics.queries_received);
-                if let Some(qtype) = qtype {
-                    metrics.track_query_type(qtype);
-                }
-
-                // Build the response under the zone lock, then drop it before
-                // touching the socket: a read guard held across `send_to` would
-                // stall a SIGHUP zone reload behind the network.
-                let serialized = {
-                    let zones = zone_map.read().await;
-                    let resp = if msg.opcode == OpCode::Notify {
-                        notify_reply(&msg, &zones, secondaries, peer)
-                    } else {
-                        make_response(&msg, &zones, metrics)
-                    };
-                    // Honor the client's EDNS0 UDP payload size (512 if no EDNS);
-                    // truncates with TC=1 if the response is larger.
-                    resp.to_bytes_within(msg.udp_payload_size() as usize)
-                };
-                match serialized {
-                    Ok(bytes) => {
-                        // Charge the response, not the query. Over budget, a
-                        // truncated reply is the useful refusal: it carries no
-                        // records, so it cannot amplify, and a real client reads
-                        // TC=1 and asks again over TCP where the handshake proves
-                        // who it is. Dropping is for the rest.
-                        let reply = match response_limiter.admit(peer.ip(), bytes.len()) {
-                            ResponseVerdict::Send => Some(bytes),
-                            ResponseVerdict::Truncate => {
-                                logger.log_rate_limited(peer.ip());
-                                metrics.count(&metrics.rate_limited);
-                                truncated_reply(&msg)
-                            }
-                            ResponseVerdict::Drop => {
-                                logger.log_rate_limited(peer.ip());
-                                metrics.count(&metrics.queries_dropped);
-                                None
-                            }
-                        };
-                        // Sign whatever we ended up sending — including a
-                        // truncated one, since that is still our answer to a
-                        // question someone authenticated.
-                        let reply = match (reply, session.as_mut()) {
-                            (Some(reply), Some(session)) => match session.sign(reply, now) {
-                                Ok(signed) => Some(signed),
-                                Err(e) => {
-                                    serving_error!(logger, peer.ip(), "TSIG signing failed: {e}");
-                                    None
-                                }
-                            },
-                            (reply, _) => reply,
-                        };
-                        if let Some(reply) = reply {
-                            if let Err(e) = socket.send_to(&reply, peer).await {
-                                bad_request!(logger, peer.ip(), "socket send error: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        serving_error!(logger, peer.ip(), "serialization error: {e}");
-                    }
-                }
+        // Build the response under the zone lock, then drop it before
+        // touching the socket: a read guard held across `send_to` would
+        // stall a SIGHUP zone reload behind the network.
+        let serialized = {
+            let zones = zone_map.read().await;
+            let resp = if msg.opcode == OpCode::Notify {
+                notify_reply(&msg, &zones, secondaries, peer)
             } else {
-                bad_request!(logger, peer.ip(), "failed to parse DNS message");
+                make_response(&msg, &zones, metrics)
+            };
+            // Honor the client's EDNS0 UDP payload size (512 if no EDNS);
+            // truncates with TC=1 if the response is larger.
+            resp.to_bytes_within_buf(msg.udp_payload_size() as usize, scratch)
+        };
+        if let Err(e) = serialized {
+            serving_error!(logger, peer.ip(), "serialization error: {e}");
+            return;
+        }
+
+        // Charge the response, not the query. Over budget, a truncated reply is
+        // the useful refusal: it carries no records, so it cannot amplify, and a
+        // real client reads TC=1 and asks again over TCP where the handshake
+        // proves who it is. Dropping is for the rest.
+        //
+        // `Cow` so the ordinary answer — no budget trouble, no TSIG — is sent
+        // straight out of the worker's scratch buffer with nothing allocated.
+        // The two exceptions build a message of their own and own it.
+        let reply: Option<Cow<'_, [u8]>> = match response_limiter.admit(peer.ip(), scratch.len()) {
+            ResponseVerdict::Send => Some(Cow::Borrowed(scratch.as_slice())),
+            ResponseVerdict::Truncate => {
+                logger.log_rate_limited(peer.ip());
+                metrics.count(&metrics.rate_limited);
+                truncated_reply(&msg).map(Cow::Owned)
             }
-        });
+            ResponseVerdict::Drop => {
+                logger.log_rate_limited(peer.ip());
+                metrics.count(&metrics.queries_dropped);
+                None
+            }
+        };
+        // Sign whatever we ended up sending — including a truncated one, since
+        // that is still our answer to a question someone authenticated. This is
+        // where the borrow above becomes a copy, and it is the right place for
+        // it: a signed query over UDP is a NOTIFY or an SOA probe, not traffic.
+        let reply = match (reply, session.as_mut()) {
+            (Some(reply), Some(session)) => match session.sign(reply.into_owned(), now) {
+                Ok(signed) => Some(Cow::Owned(signed)),
+                Err(e) => {
+                    serving_error!(logger, peer.ip(), "TSIG signing failed: {e}");
+                    None
+                }
+            },
+            (reply, _) => reply,
+        };
+        if let Some(reply) = reply {
+            if let Err(e) = socket.send_to(&reply, peer).await {
+                bad_request!(logger, peer.ip(), "socket send error: {e}");
+            }
+        }
     }
 }
 
@@ -2007,8 +2227,38 @@ impl Reloading {
     }
 }
 
-/// One reload, installed and announced. What SIGHUP and the re-signing timer
-/// both do, so that they cannot drift apart (`CLAUDE.md` §7).
+/// Why a reload is happening, and who — if anyone — is waiting to be told how
+/// it went.
+///
+/// A carrier for the reply channel as much as a label. `reload_once` already
+/// takes seven arguments, which is where clippy stops counting for the reason
+/// `CLAUDE.md` §14 gives, so the channel rides with the reason it exists for
+/// rather than becoming an eighth.
+enum ReloadTrigger {
+    /// SIGHUP. Nobody is waiting; the log is the report.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Signal,
+    /// The signature-validity timer came round.
+    Timer,
+    /// `rdnsctl reload`, with the channel the outcome goes back down. `Ok` is
+    /// the number of zones installed.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Control(tokio::sync::oneshot::Sender<Result<usize, String>>),
+}
+
+impl ReloadTrigger {
+    /// What the log line says this reload was for.
+    fn why(&self) -> &'static str {
+        match self {
+            ReloadTrigger::Signal => "SIGHUP",
+            ReloadTrigger::Timer => "signature refresh",
+            ReloadTrigger::Control(_) => "control socket",
+        }
+    }
+}
+
+/// One reload, installed and announced. What SIGHUP, the re-signing timer and
+/// the control socket all do, so that they cannot drift apart (`CLAUDE.md` §7).
 ///
 /// Returns the announced-serial state to carry into the next round.
 async fn reload_once(
@@ -2018,10 +2268,12 @@ async fn reload_once(
     notify_targets: &[SocketAddr],
     announced: Vec<(String, u32)>,
     busy: &Busy,
-    why: &str,
+    trigger: ReloadTrigger,
 ) -> Vec<(String, u32)> {
-    match reloading.load(source).await {
+    let why = trigger.why();
+    let (announced, outcome) = match reloading.load(source).await {
         Ok(new_zones) => {
+            let loaded = new_zones.len();
             // A reload is a version step like any other: the difference from
             // what we were serving is what an IXFR will answer with, and this is
             // the only moment both versions exist.
@@ -2034,26 +2286,44 @@ async fn reload_once(
             // The point of reloading is that something changed — new data, or at
             // minimum new signatures and a new serial — so this is exactly when a
             // secondary wants to hear about it.
-            announce_zones(&served.zone_map, &announced, notify_targets, busy).await
+            (
+                announce_zones(&served.zone_map, &announced, notify_targets, busy).await,
+                Ok(loaded),
+            )
         }
         Err(e) => {
             // The zones already loaded keep answering. A reload that failed is a
             // file that changed for the worse, and the version in memory is the
             // last one known good.
             tracing::error!("failed to reload zones ({why}): {e}");
-            announced
+            // `{e:#}` rather than `{e}`: `anyhow`'s `Display` prints only the
+            // outermost context, and the operator holding the terminal wants
+            // the whole chain — "the zone-loading task: example.com.zone:12:
+            // ..." — not just its first clause. The log line above keeps the
+            // short form because a log line is scanned rather than read.
+            (announced, Err(format!("{e:#}")))
         }
+    };
+    // Whoever asked hears how it went. A dropped receiver is an `rdnsctl` that
+    // gave up waiting, which is not this task's problem — the reload happened
+    // either way and the log has it.
+    if let ReloadTrigger::Control(reply) = trigger {
+        let _ = reply.send(outcome);
     }
+    announced
 }
 
-/// Keep the zones current: reload on SIGHUP, and re-sign on a timer.
+/// Keep the zones current: reload on SIGHUP or on the control socket, and
+/// re-sign on a timer.
 ///
 /// **One task, deliberately.** The re-signing timer does its work by *reloading*
 /// — see [`ZoneSigning::resign_interval`] for why that is the right shape — so it
 /// and SIGHUP are the same operation on two triggers. Two tasks would mean two
 /// reloads able to run at once, each installing a different snapshot of the
 /// files, and two independent ideas of which serials have been announced. One
-/// loop selecting over both triggers has neither problem.
+/// loop selecting over both triggers has neither problem — which is exactly why
+/// `rdnsctl reload` became a *third* trigger on this loop rather than a fourth
+/// place that calls `Reloading::load`.
 ///
 /// It holds a [`Busy`] and exits on [`Stop`], in that order of importance: a
 /// reload part-way through installing zones is work the drain should wait for,
@@ -2066,7 +2336,7 @@ fn spawn_zone_maintenance(
     announced: Vec<(String, u32)>,
     reloading: Reloading,
     lifecycle: Lifecycle,
-) {
+) -> mpsc::Sender<ReloadTrigger> {
     let Lifecycle { stop, busy } = lifecycle;
     // `None` when nothing is signed: a server with no keys has nothing to
     // re-sign, and a timer that fired anyway would reload the zones on a
@@ -2084,22 +2354,42 @@ fn spawn_zone_maintenance(
         );
     }
 
+    // Depth 1: a reload is the whole zone set, so a queue of them is a queue of
+    // identical work. The second `rdnsctl reload` to arrive while one is running
+    // waits for a slot rather than being dropped, and there is nothing to gain
+    // from letting a third pile up behind it.
+    let (requests, mut receiver) = mpsc::channel(1);
+    // The task keeps a sender of its own, so `recv` parks forever when nothing
+    // is asking rather than returning `None` the moment the control socket is
+    // not configured. A `None` branch here would be a busy loop or a dead arm,
+    // and neither is worth having when one clone removes the question.
+    let keepalive = requests.clone();
+
     tokio::spawn(async move {
         let _busy = busy;
+        let _keepalive = keepalive;
         let mut announced = announced;
         let mut signals = signal_stream();
         loop {
             // Whichever comes first. A trigger that arrives during shutdown is
             // ignored: reloading zones we are about to stop serving is work for
             // nobody.
-            let why = tokio::select! {
+            //
+            // `recv` on the request channel is cancel-safe, so losing this race
+            // leaves the request queued rather than dropping it — and a request
+            // that loses to the stop is one whose sender is about to be told the
+            // server stopped, which is true.
+            let trigger = tokio::select! {
                 reloaded = next_reload_signal(&mut signals) => {
                     if !reloaded {
                         break;
                     }
-                    "SIGHUP"
+                    ReloadTrigger::Signal
                 }
-                _ = sleep_for(resign_every) => "signature refresh",
+                // `None` is unreachable while `_keepalive` is alive, and it is
+                // alive for exactly as long as this loop.
+                Some(trigger) = receiver.recv() => trigger,
+                _ = sleep_for(resign_every) => ReloadTrigger::Timer,
                 _ = stop.wait() => break,
             };
             announced = reload_once(
@@ -2109,11 +2399,13 @@ fn spawn_zone_maintenance(
                 &notify_targets,
                 announced,
                 &_busy,
-                why,
+                trigger,
             )
             .await;
         }
     });
+
+    requests
 }
 
 /// Sleep for `every`, or forever when there is nothing to wait for.
@@ -3115,6 +3407,11 @@ async fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
 
+    // The first thing, so `status`'s uptime covers the zone load rather than
+    // starting once the sockets are bound. On a server with forty signed zones
+    // the load *is* the start.
+    let started = Instant::now();
+
     let mut cli = Cli::parse();
 
     // Before anything that might have something to say. `--quiet` is the same
@@ -3152,6 +3449,19 @@ async fn main() -> Result<()> {
     }
 
     validate_cli_args(&cli.host, cli.port)?;
+    // Refused rather than ignored, and refused *here* so `--check-config` says
+    // so too. A setting the operator believes is in force and is not is the
+    // whole failure `deny_unknown_fields` exists to prevent, and silently
+    // dropping a flag we parsed would be that failure with our name on it.
+    #[cfg(not(unix))]
+    if cli.control_socket.is_some() {
+        return Err(anyhow!(
+            "--control-socket needs a Unix domain socket, and neither std nor \
+             tokio exposes one on Windows — the flag is parsed everywhere so a \
+             config file written on Linux is not a syntax error here, but it \
+             cannot be honoured"
+        ));
+    }
 
     // Created here rather than in `serve`, because the things that need to be
     // drained start before the listeners do: the startup NOTIFY burst, and every
@@ -3290,8 +3600,18 @@ async fn main() -> Result<()> {
     // this runs at startup and not only on reload.
     let announced = announce_zones(&zone_map, &[], &notify_targets, &shutdown.busy()).await;
 
-    // Reload on SIGHUP, and re-sign on the signature timer.
-    spawn_zone_maintenance(
+    // Which zones are replicated, before `reload_secondaries` is moved into
+    // `Reloading`. `status` reports the role from the configuration rather than
+    // inferring it from an absent last-contact time, which a primary also has.
+    let replicated: Vec<String> = reload_secondaries
+        .iter()
+        .map(|spec| spec.zone.clone())
+        .collect();
+
+    // Reload on SIGHUP or on the control socket, and re-sign on the signature
+    // timer. The sender it hands back is how `rdnsctl reload` reaches the same
+    // loop rather than becoming a second implementation of a reload.
+    let reloads = spawn_zone_maintenance(
         served.clone(),
         source,
         notify_targets,
@@ -3315,7 +3635,14 @@ async fn main() -> Result<()> {
             tsig_keys,
             response_rate: cli.response_rate,
             query_limit,
+            udp_workers: cli.udp_workers,
             metrics_listen: cli.metrics_listen,
+            control: ControlPolicy {
+                socket: cli.control_socket,
+                reloads,
+                replicated,
+                started,
+            },
         },
         secondaries,
         deltas,
@@ -4159,6 +4486,157 @@ mod tests {
         SHUTDOWN.get_or_init(Shutdown::new)
     }
 
+    /// A `Server` holding one zone and nothing else surprising: no rate limit
+    /// worth hitting, no response budget, no keys.
+    ///
+    /// Up here rather than in `mod shutdown`, where it started, because the UDP
+    /// tests want the same thing and a second copy is how two of them come to
+    /// disagree about what a default server is (`CLAUDE.md` §7).
+    fn server_with(zone: Zone) -> Arc<Server> {
+        let mut zones = HashMap::new();
+        zones.insert(zone.origin().to_string(), zone);
+        Arc::new(Server {
+            zone_map: Arc::new(RwLock::new(Zones::new(zones))),
+            rate_limiter: Arc::new(RateLimiter::with_defaults()),
+            validator: Arc::new(RequestValidator::with_defaults()),
+            logger: Arc::new(QueryLogger::new()),
+            metrics: Arc::new(DnsMetrics::new()),
+            transfer_acl: Arc::new(TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl")),
+            tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
+            response_limiter: Arc::new(ResponseLimiter::disabled()),
+            secondaries: Arc::new(HashMap::new()),
+            deltas: Arc::new(RwLock::new(DeltaLog::new())),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // The UDP worker pool
+    // -----------------------------------------------------------------------
+
+    mod udp {
+        use super::*;
+
+        fn one_record_zone() -> Zone {
+            rdns::zone::parse_zone_file(
+                "$ORIGIN example.com.\n\
+                 $TTL 3600\n\
+                 @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @   IN NS  ns1.example.com.\n\
+                 ns1 IN A   192.0.2.1\n\
+                 www IN A   192.0.2.9\n",
+                "example.com.",
+            )
+            .expect("the zone parses")
+        }
+
+        fn a_query() -> Vec<u8> {
+            query("www.example.com.", record_types::A, false)
+                .to_bytes_within(4096)
+                .expect("serialize the query")
+        }
+
+        /// The pool answers, which is the part a refactor of the answer path has
+        /// to establish before anything else about it is interesting.
+        ///
+        /// Drives the real `udp_loop` over a real socket rather than calling the
+        /// answering code directly: the whole change is *where* the work happens
+        /// relative to the receive, so a test that skipped the loop would skip
+        /// the change.
+        #[tokio::test]
+        async fn a_worker_answers_a_datagram_it_received() {
+            let shutdown = Shutdown::new();
+            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+            let server_addr = socket.local_addr().expect("addr");
+            let worker = tokio::spawn(udp_loop(
+                socket,
+                server_with(one_record_zone()),
+                shutdown.stop_handle(),
+                shutdown.busy(),
+            ));
+
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+            client.send_to(&a_query(), server_addr).await.expect("send");
+            let mut buf = vec![0u8; 4096];
+            let (n, _) = client.recv_from(&mut buf).await.expect("an answer");
+            let reply = DnsMessage::try_from_bytes(&buf[..n]).expect("a parseable answer");
+
+            assert!(reply.response && reply.authoritive);
+            assert_eq!(reply.rcode, ResponseCode::Ok);
+            assert_eq!(reply.answers.len(), 1, "the A record for www");
+
+            shutdown.begin();
+            worker
+                .await
+                .expect("the worker joins")
+                .expect("no io error");
+        }
+
+        /// The response buffer is the worker's, not the datagram's.
+        ///
+        /// **What this is a regression for**, since it cannot fail against the
+        /// old code — the old code had no buffer to reuse, because a task per
+        /// datagram has nowhere to keep one between datagrams. It fails against
+        /// anyone putting `to_bytes_within` back in `answer_datagram`: swapping
+        /// the two lines makes the second answer allocate afresh and the pointer
+        /// move. Confirmed by doing exactly that.
+        ///
+        /// Asserted on the pointer and the capacity rather than on a timing,
+        /// which is the same reason `a_small_response_does_not_carry_a_64k_buffer`
+        /// asserts on capacity: both are exact and neither cares what else is
+        /// running (`CLAUDE.md` §10).
+        #[tokio::test]
+        async fn answering_a_second_datagram_reuses_the_first_one_s_buffer() {
+            let server = server_with(one_record_zone());
+            let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+            let peer = client.local_addr().expect("addr");
+            let packet = a_query();
+            let mut scratch = Vec::new();
+
+            server
+                .answer_datagram(&packet, peer, &socket, &mut scratch)
+                .await;
+            let (address, capacity) = (scratch.as_ptr(), scratch.capacity());
+            assert!(!scratch.is_empty(), "the first answer was serialized");
+
+            server
+                .answer_datagram(&packet, peer, &socket, &mut scratch)
+                .await;
+            assert_eq!(
+                scratch.as_ptr(),
+                address,
+                "the second answer reallocated: it is not reusing the buffer"
+            );
+            assert_eq!(scratch.capacity(), capacity);
+
+            // Both were sent, so the reuse is of a buffer that really carried an
+            // answer to the wire and not of one left over from a failure.
+            let mut buf = vec![0u8; 4096];
+            for _ in 0..2 {
+                let (n, _) = client.recv_from(&mut buf).await.expect("an answer");
+                assert_eq!(
+                    DnsMessage::try_from_bytes(&buf[..n])
+                        .expect("parseable")
+                        .answers
+                        .len(),
+                    1
+                );
+            }
+        }
+
+        /// The default is the machine's parallelism, clamped at both ends — see
+        /// [`default_udp_workers`] for why each end is where it is. A default of
+        /// zero would bind the UDP socket and answer nothing on it.
+        #[test]
+        fn the_default_worker_count_is_within_its_clamp() {
+            let workers = default_udp_workers();
+            assert!(
+                (2..=32).contains(&workers),
+                "{workers} is outside the clamp the default promises"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Graceful shutdown
     // -----------------------------------------------------------------------
@@ -4188,25 +4666,6 @@ mod tests {
                 ));
             }
             rdns::zone::parse_zone_file(&text, "example.com.").expect("the big zone parses")
-        }
-
-        fn server_with(zone: Zone) -> Arc<Server> {
-            let mut zones = HashMap::new();
-            zones.insert(zone.origin().to_string(), zone);
-            Arc::new(Server {
-                zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-                rate_limiter: Arc::new(RateLimiter::with_defaults()),
-                validator: Arc::new(RequestValidator::with_defaults()),
-                logger: Arc::new(QueryLogger::new()),
-                metrics: Arc::new(DnsMetrics::new()),
-                transfer_acl: Arc::new(
-                    TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl"),
-                ),
-                tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
-                response_limiter: Arc::new(ResponseLimiter::disabled()),
-                secondaries: Arc::new(HashMap::new()),
-                deltas: Arc::new(RwLock::new(DeltaLog::new())),
-            })
         }
 
         /// Read one length-prefixed message.

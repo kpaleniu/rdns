@@ -190,6 +190,119 @@ Measured on a zone with a 2.5 KB TXT RRset, flooding for 5.5 s from one address:
 (the 8 KB/s rate plus the burst allowance spread across the window), and the
 truncated replies keep a legitimate client working.
 
+### `--udp-workers <TASKS>` (applies to UDP)
+
+How many UDP datagrams may be answered at once. Defaults to the machine's
+parallelism, clamped to 2–32; the effective number is in the startup banner, so
+a floored or clamped value is visible rather than assumed.
+
+This is the shape of the UDP path as well as its ceiling. That many identical
+tasks share the socket and answer **inline**; there is no task spawned per
+datagram. TCP had two bounds (128 connections, 16 queries in flight per
+connection) and UDP had none at all, so a flood spawned tasks until something
+gave out — and it paid for the task, a copy of the packet and two `Arc` clones
+*before* the rate limiter had decided whether to keep the datagram.
+
+- **Raising it does not make a busy server faster.** Answering from an in-memory
+  zone is microseconds with two await points in it, so the useful parallelism is
+  the machine's. What the number really buys is memory: one 64 KB receive buffer
+  per worker, because a client may send any datagram a UDP length field can
+  express.
+- **Past the workers, datagrams queue in the socket receive buffer** and the
+  kernel drops the overflow. For UDP that is the right back-pressure — a reply to
+  a spoofed source is what an amplifier sends — and `netstat -su` counts it,
+  which a userspace drop would not.
+- `0` is floored to 1 on the command line (a mistyped flag should be wrong, not
+  fatal). In a config file `udp-workers = 0` is refused outright, with the line
+  number, because that is where the whole policy is being edited at once.
+
+```bash
+# The default: one worker per CPU, 2 to 32.
+rdnsd --zone-file example.com.zone
+
+# A small VM, or a deliberate cap on the receive buffers.
+rdnsd --zone-file example.com.zone --udp-workers 2
+```
+
+Measured with DHAT over 1,000 UDP queries against one zone, on 16 workers:
+allocation fell from **7.45 MB in 34,487 blocks** to **2.88 MB in 31,574
+blocks** — the 1,536-byte task per datagram is gone, and 996 responses are built
+in 16 buffers rather than 996. The trade is 1 MB of receive buffers held for the
+life of the process instead of 64 KB, which is what "one per worker" costs.
+
+### `--control-socket <PATH>` (Unix only)
+
+Answer `rdnsctl` on this Unix domain socket. Off by default.
+
+Of the four questions an operator asks at 3am, exactly one could be answered
+before this existed:
+
+| Question | Before | Now |
+|---|---|---|
+| Is `example.com` loaded, at what serial? | query the SOA | `rdnsctl status` |
+| Is `broken.test` loaded? | REFUSED — which is also what a zone that was never configured answers | `rdnsctl status` |
+| Is the secondary in sync? | read the state sidecar off the box by hand | `rdnsctl status`, last-contact column |
+| Did that reload take effect? | grep the log and hope the level was left on | `rdnsctl reload` exits non-zero and says why |
+
+```console
+$ rdnsctl status
+rdnsd 0.1.0 on 127.0.0.1:15356, up 4h 12m
+zones: 2 loaded, 1 replicated
+
+zone                            serial  records  denial  role       last contact
+example.com.                        42       57  NSEC3   primary    -
+replica.test.                        7       12  -       secondary  1754060591 (4m 11s ago)
+```
+
+**Filesystem permissions are the authentication.** The socket is created mode
+0600 — the server's user and root — and there is no TCP option. That is what
+Knot (`knotc`), PowerDNS (`pdns_control`) and Unbound with `control-interface:
+/path` do; the two that put a control channel on TCP put something in front of
+it, BIND's `rndc` an HMAC and NSD's `nsd-control` a client certificate. Nobody
+ships an unauthenticated control port, which is also why these commands are not
+endpoints on `--metrics-listen`.
+
+Three things the bind does that a plain `bind()` would not:
+
+- **A live socket is not stolen.** Starting a second server on the same path is
+  refused rather than leaving two daemons and one working control channel.
+- **A stale socket file does not block a start** — that is the ordinary state
+  after a crash.
+- **The mode is in place before the path is.** The socket is bound under a
+  temporary name, restricted, then renamed over the target, so there is no
+  window in which it is reachable at its published path with whatever the umask
+  gave it.
+
+The socket is removed on a clean stop, so `rdnsctl` says "no such file" rather
+than "connection refused" about a server that is not running.
+
+**`reload` is the whole zone set and takes no zone argument.** That is a
+decision rather than a gap: nothing is installed unless every zone parses, signs
+and verifies, because a partial reload leaves the server serving a mixture of
+two versions and the half that failed is the half that needed attention.
+`rdnsctl reload example.com.` is refused and says so.
+
+**Unix only.** `tokio` exposes no `UnixListener` on Windows, so `rdnsd` refuses
+`--control-socket` there at startup rather than accepting it and doing nothing.
+
+```bash
+# Under systemd, with RuntimeDirectory=rdns creating /run/rdns.
+rdnsd --config /etc/rdns/rdnsd.toml     # control-socket = "/run/rdns/rdnsd.sock"
+rdnsctl status                          # that path is rdnsctl's default
+
+# Development.
+rdnsd --port 15353 --zone-file example.com.zone --control-socket /tmp/rdnsd.sock
+rdnsctl -s /tmp/rdnsd.sock dump example.com. > served.zone
+```
+
+The protocol is one line in and one status line plus a body out, so anything
+that can write to a Unix socket is a client — which matters on the day the box
+has nothing else installed:
+
+```bash
+printf 'status\n' | socat - UNIX-CONNECT:/run/rdns/rdnsd.sock
+```
+
 ### `--allow-transfer <ADDR|CIDR>` (applies to TCP)
 
 Who may request a zone transfer (AXFR). **Repeatable, and empty by default —

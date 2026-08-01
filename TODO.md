@@ -21,14 +21,17 @@ commit message, which is where to look rather than here.
 
 ## Current state (last updated 2026-08-01)
 
-**Workspace** — four members, all on branch `master`:
+**Workspace** — five members, all on branch `main` (it was `master` until
+2026-08-01; the rename is why older commit messages and notes here say the other
+one):
 
-| crate   | what it is                                                        |
-|---------|-------------------------------------------------------------------|
-| `rdns`  | the library: wire codec, zones, cache, resolver, DNSSEC           |
-| `rdnsc` | command-line query client                                         |
-| `rdnsd` | authoritative server — serves zone files over UDP and TCP in one process |
-| `rdnsr` | recursive resolver with a caching layer; forwards on `--upstream` |
+| crate     | what it is                                                        |
+|-----------|-------------------------------------------------------------------|
+| `rdns`    | the library: wire codec, zones, cache, resolver, DNSSEC           |
+| `rdnsc`   | command-line query client                                         |
+| `rdnsctl` | control client for a running `rdnsd`: `status`, `reload`, `dump` (Unix only) |
+| `rdnsd`   | authoritative server — serves zone files over UDP and TCP in one process |
+| `rdnsr`   | recursive resolver with a caching layer; forwards on `--upstream` |
 
 **CI is written and has never run (corrected 2026-08-01).**
 `.github/workflows/ci.yml` describes build and test on Linux *and* Windows,
@@ -53,28 +56,36 @@ below, which now has the Linux recipe.
 
 | | Windows | Linux |
 |---|---|---|
-| `rdns` lib | 603 | **606** |
+| `rdns` lib | 610 | 613 |
 | allocations | 6 | 6 |
-| `rdnsd` | 88 | 88 |
-| `rdnsr` | 2 | 2 |
-| **total** | **699** | **702** |
+| `rdnsd` | 92 | **105** |
+| `rdnsr` | 3 | 3 |
+| **total** | **711** | **727** |
 
-The three extra on Linux are `#[cfg(unix)]`: two on the secret-file mode check
-and one on the private-key loader. They are the *only* tests that exercise that
-check at all — there are no mode bits on Windows — so a green Windows run says
-nothing about it.
+The Windows column and `rdnsd`'s and `rdnsr`'s Linux numbers are measured; the
+Linux lib number is the Windows one plus the three `#[cfg(unix)]` tests, in a
+run that was green as a whole.
+
+**Sixteen tests exist on Linux only**, and they are the ones a green Windows run
+says nothing about. Three are the old ones: two on the secret-file mode check and
+one on the private-key loader, and there are no mode bits on Windows to exercise
+them. The other thirteen are the control socket, which needs a Unix domain socket
+and so is `#[cfg(unix)]` in its entirety — `rdnsd`'s 92 on Windows compile none
+of that module.
 
 `cargo clippy --workspace --all-targets` is clean with no exceptions and
 `cargo fmt --all --check` is clean, **on Windows**; the Linux image used for the
 Linux runs has no clippy package, so that half is unverified there.
 
 (`rdnsd`'s own tests cover argument validation, the config file, zone sources and the load policy,
+the UDP worker pool,
 the secondary role and EXPIRE across reloads, both directions of IXFR and onward
 announcement, answering a DO-bit query from a zone it signed itself, all four
 cases of RFC 1034 §4.3.2, the class and ANY handling from #9f, and a stop
 signal arriving mid-AXFR, a reload that must not block queries or the runtime,
 and a suppressed log line that must not build its message; `rdnsr` had
-**no test module at all** until #9c gave it one.) The lib
+**no test module at all** until #9c gave it one, and has three now — the third
+is its UDP in-flight ceiling.) The lib
 count fell from 578 to 567 when dead `serialization.rs` was deleted with its 11
 tests, and is at 603 now: #9e's, #9f's, graceful shutdown's and the metrics
 endpoint's tests, minus the seven that went with `telemetry.rs`.
@@ -122,13 +133,39 @@ against. On the performance side the `log_query` quadratic is gone (3.09M ops/se
 where it managed 47k, and `bench_logger_throughput`'s floor is back up at 100k),
 responses no longer carry a 64 KB buffer into `send_to`, cache eviction is linear
 rather than O(n²), and name compression stores one copy of a name instead of one
-per suffix. What is left under #9 is **9 items: 3 of operability (9d) and 6 of
+per suffix. What is left under #9 is **7 items: 2 of operability (9d) and 5 of
 performance (9e)**, listed in the order worth doing under "Where to pick up next"
 below. The DHAT pass that was
 leading 9e is done, and its numbers are what the rest get judged against now,
 including one finding it turned up that nobody had guessed: the `tokio::spawn`
-per UDP datagram costs **1,536 bytes**, which is 46% of everything a query
-allocates.
+per UDP datagram cost **1,536 bytes**, 46% of everything a query allocated.
+**That one is closed as of 2026-08-01** — see the next paragraph.
+
+**`rdnsd` no longer spawns a task per UDP datagram (2026-08-01), and `rdnsr`'s
+spawn is bounded at last.** This was the last correctness-and-safety item on the
+list and it was two items: an admission-control hole (TCP had two ceilings, UDP
+had none, and the rate limiter ran *inside* the spawned task, after the packet
+had been copied and the task paid for) and the largest allocation on the query
+path. The two daemons got opposite fixes because the work is opposite:
+`rdnsd` answers from memory in microseconds, so `--udp-workers` identical tasks
+share the socket and answer inline with no spawn at all; `rdnsr` waits seconds on
+the internet, so it keeps the task and takes a `--max-inflight-udp` permit before
+copying anything. Measured with DHAT over 1,000 queries against the same box,
+against a `HEAD` build rebuilt beside it: **7.45 MB in 34,487 blocks → 2.88 MB in
+31,574 blocks**, the 1,536-byte task site gone, and 996 responses built in 16
+scratch buffers instead of 996. The cost is stated with it: peak live memory goes
+118 KB → 1.19 MB, which is sixteen workers holding sixteen 64 KB receive buffers.
+
+**There is a control channel (2026-08-01), which closes the last of the
+operational shell but one.** `--control-socket` and a fifth binary, `rdnsctl`:
+`status` answers three of the four 3am questions the finding listed that had no
+answer from outside the box at all, and `reload` answers the fourth by *reporting
+its result* — a typo in a zone file gets `exit 1` and `the reload failed and the
+zones already loaded are still being served: line 8: SOA record needs 7 fields,
+got 0`, where `kill -HUP` said nothing. A Unix socket at mode 0600 and no TCP
+option, which was settled by reading Knot, PowerDNS, Unbound, BIND and NSD: the
+ones on TCP all authenticate, and nobody ships an open control port. Unix only,
+and refused rather than ignored on Windows.
 
 **Six 9d items are closed with them.** The query rate limiter was hardcoded at
 ~10 q/s per source and dropped over it in silence — it has flags now, a default a
@@ -348,6 +385,31 @@ kill -TERM $(pgrep rdnsd)
 # sends), so the effective policy is in the startup banner.
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --query-rate 5000 --query-burst 500 --query-rate-exempt 10.0.0.0/8
+
+# How many UDP datagrams may be answered at once, which on rdnsd is also how
+# many tasks share the socket — there is no task per datagram. Defaults to the
+# machine's parallelism clamped to 2-32, costs one 64 KB receive buffer per
+# worker, and the effective number is in the startup banner. Past it, datagrams
+# queue in the socket receive buffer and the kernel drops the overflow.
+cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone --udp-workers 4
+
+# The resolver's equivalent, and deliberately a different shape: a recursion is
+# seconds of waiting, so rdnsr still spawns per datagram and this is the ceiling
+# on how many of those may exist. Over it, the datagram is dropped before it is
+# copied. Default 1024.
+cargo run -p rdnsr -- --port 15353 --max-inflight-udp 4096
+
+# Ask a running server what it is doing. A Unix socket at mode 0600 — the
+# filesystem is the authentication, which is what knotc, pdns_control and
+# unbound-control do; there is no control port. Unix only.
+cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
+  --control-socket /tmp/rdnsd.sock
+cargo run -p rdnsctl -- -s /tmp/rdnsd.sock status
+cargo run -p rdnsctl -- -s /tmp/rdnsd.sock dump example.com. > served.zone
+# Unlike kill -HUP, this says whether it worked: exit 1 and the parse error if a
+# zone file has a typo in it, with the previous zones still being served. Exit 2
+# means there was no server to ask, which a deploy script needs to tell apart.
+cargo run -p rdnsctl -- -s /tmp/rdnsd.sock reload
 
 # How much either daemon says. info by default; nothing per-packet is above
 # debug, so a malformed-packet flood costs no log lines at all (measured: 50
@@ -576,11 +638,12 @@ under "Closed work" further down.
 
 | # | what | open |
 |---|------|------|
-| **9** | what the five-way code review turned up | **9** — 9a, 9b, 9c and **9f** are closed; what is left is 3 of operability (9d) and 6 of performance (9e) |
+| **9** | what the five-way code review turned up | **6** — 9a, 9b, 9c and **9f** are closed; what is left is 1 of operability (9d) and 5 of performance (9e) |
 | **8** | what signing turned up | **0** — the re-signing timer and its serial are done |
 | **7** | the secondary role | **1**, and conditional |
 | **10** | dynamic UPDATE (RFC 2136) | **0** — not scheduled, listed so the dependency is visible |
 | **11** | data layout and CPU cache friendliness | **0** — a stretch goal; blocked on a measurement this machine cannot make |
+| **12** | pre-authentication panics | **1** — an audit with no known defect behind it, opened because #9d changed what a panic costs |
 | **5** | smaller open items | **0** |
 
 ### Where to pick up next
@@ -590,14 +653,20 @@ full finding below, which has the file, the line number and the reasoning; **rea
 that before starting**, because several have already been half-fixed by something
 else and the finding says which half.
 
-> **Next is item 5** — the unbounded `tokio::spawn` per UDP datagram. Items 1-4
-> and 6 closed on 2026-08-01 and are struck through below rather than deleted,
-> because each says what was actually done and two of them reversed the fix the
-> original finding proposed. The numbers are positions other lines refer to, so
-> they are never reused.
+> **Next is item 8** — the container image and the readiness signal, which is
+> the last of the operational shell. Items 1-7 and 10 closed on 2026-08-01 and
+> are struck through below rather than deleted, because each says what was
+> actually done and four of them reversed or narrowed the fix the original
+> finding proposed. The numbers are positions other lines refer to, so they are
+> never reused.
 >
-> **Do item 5 with item 10**, which is the same call site measured from the
-> allocation side: admission control and 1,536 bytes per datagram are one change.
+> **Item 9 is the one to take first if the appetite is for performance rather
+> than operability** — `zone::absolutize`, four `String`s per query, with the
+> assertion that judges it already in place.
+>
+> **And read #12 before either.** It is the audit of what a stranger can panic
+> before authenticating, and it is not on this list only because it has no known
+> defect behind it.
 
 **Correctness and safety first** — these can lose data or serve a wrong answer:
 
@@ -618,9 +687,13 @@ else and the finding says which half.
    `--quiet` on both daemons; nothing per-packet above `debug`. Measured: 50
    malformed datagrams, 0 log lines at the default level. No in-process rate
    limiter — journald's per-unit one is in the README's unit instead.
-5. **Unbounded `tokio::spawn` per UDP datagram** (9d) — pairs with 9e's
-   1,536-bytes-per-datagram finding below; they are the same call site seen from
-   two angles, and worth doing together.
+5. ~~**Unbounded `tokio::spawn` per UDP datagram**~~ (9d) — **done 2026-08-01,
+   with item 10**, which was the same call site seen from the allocation side.
+   `rdnsd` stopped spawning per datagram altogether — a fixed pool of workers
+   answers inline, which is both the bound and the cheaper shape — and `rdnsr`
+   kept its spawn and bounded it, because a recursion is seconds of waiting where
+   an authoritative answer is microseconds. Measured over 1,000 queries:
+   7.45 MB → 2.88 MB, and the 1,536-byte task site is gone.
 
 **Then the operational shell** — visible gaps a deployment will hit:
 
@@ -628,9 +701,16 @@ else and the finding says which half.
    service manager sets the identity, and `User=` plus an ambient capability is
    stronger than a setuid drop rather than equivalent to it. The number is kept
    rather than reused because these positions are referenced from each other.
-7. **No control channel** (9d) — the runbook answer is still "read the logs".
+7. ~~**No control channel**~~ (9d) — **done 2026-08-01.** `--control-socket` and
+   `rdnsctl`: `status`, `reload` that says whether it worked, `dump <zone>`. A
+   Unix socket at mode 0600 because that is what Knot, PowerDNS and Unbound do
+   and because the TCP ones all authenticate; no per-zone reload, because a
+   reload is the whole set or nothing.
 8. **No container image / no readiness signal** (9d) — `/healthz` exists now, so
-   what is left is the Dockerfile and the ready-vs-alive distinction.
+   what is left is the Dockerfile and the ready-vs-alive distinction. The
+   readiness half is the interesting one: `/healthz` answers as soon as the
+   listener is up, which is exactly the "bound but still parsing 40 zones" state
+   it would need to report as *not* ready.
 
 **Then performance (9e).** The DHAT pass is done and its numbers decide the order:
 
@@ -638,8 +718,9 @@ else and the finding says which half.
    item, and the assertion that will judge it is already in place (a labelled
    segment of `one_query_end_to_end`, currently a *range* that still admits the
    old number, so tightening it is part of the fix). Best value here.
-10. **`tokio::spawn` costs 1,536 bytes per datagram** — 46% of everything a query
-    allocates, and nobody had guessed it. See item 5.
+10. ~~**`tokio::spawn` costs 1,536 bytes per datagram**~~ — **done 2026-08-01**
+    with item 5, and it took the per-response buffer with it: 996 responses now
+    build in 16 buffers rather than 996.
 11. **Three more per-query allocation sites**, each small.
 12. **EDNS is re-parsed two to four times per query.**
 13. **DNSSEC canonicalization is rebuilt per candidate RRSIG** — measured at 22
@@ -647,6 +728,13 @@ else and the finding says which half.
     show progress on it.
 14. **`bench.rs` measures debug builds** — convert to criterion. Do this *before*
     #11, which needs a measurement harness that can see what it changes.
+
+**Waiting for someone to schedule it:** #12, an audit of what a stranger can
+panic before authenticating. It is not on the numbered list above because it has
+no known defect behind it — but it is the one item there whose *cost* changed
+under this session's work, since a panic on the UDP answer path used to be
+swallowed by the spawned task and now ends the process. Read it before deciding
+that item 7 is really next.
 
 **Not scheduled, and deliberately:** #7 step 6 (persisted deltas) waits on #10
 (dynamic UPDATE), which nothing schedules; #11 (cache locality) is a stretch goal
@@ -1485,7 +1573,69 @@ here degrades quietly with the process healthy and nothing alerting.
       the trap never sprang. The rule it implies still stands for whatever
       replaces it: **query logging is explicit opt-in, and the client IP is
       behind a second switch.**
-- [ ] **Unbounded `tokio::spawn` per UDP datagram on both daemons**
+- [x] **Unbounded `tokio::spawn` per UDP datagram on both daemons** — **done
+      2026-08-01**, and with it 9e's 1,536-bytes-per-datagram item, which was
+      always the same defect seen from the allocation side.
+
+      **The two daemons got different fixes, and the difference is the finding.**
+      The finding proposed one shape for both — keep the spawn, put a
+      `try_acquire_owned` semaphore in front of it — and that is right for
+      exactly one of them.
+
+      - **`rdnsr` keeps the spawn and got the semaphore** (`--max-inflight-udp`,
+        default 1024). A recursion is *seconds* of waiting on the internet, so a
+        fixed pool of tasks would leave the resolver idle and slow at the same
+        time. The permit is taken before the `to_vec()` and the clones, so a
+        datagram over the ceiling costs one comparison.
+      - **`rdnsd` lost the spawn entirely.** Answering from an in-memory zone has
+        two await points in it — the zone-map read guard and `send_to` — and
+        takes microseconds, so the task was pure overhead. `--udp-workers`
+        identical tasks now share the socket and answer inline, defaulting to
+        the machine's parallelism clamped to 2–32. The bound is the worker count,
+        it applies *before* the packet is copied rather than after, and what
+        queues past it is the socket receive buffer, where a UDP queue belongs:
+        the kernel drops the overflow for free and `netstat -su` counts it.
+        Shedding is still the policy — it happens one layer down.
+
+      The rate limiter and the validator run inline on `&buf[..size]` in the recv
+      loop on `rdnsd`, which is the half of the finding that was about *ordering*
+      rather than about bounds: nothing is allocated before something has decided
+      to keep the datagram.
+
+      **Measured on a real process, which is what this class of fix requires**
+      (`CLAUDE.md` §4). DHAT, 1,000 UDP queries against one zone, `--release`,
+      the same Linux box for both builds — the previous numbers in this file
+      were taken on Windows and are *not* comparable, so the baseline was rebuilt
+      from `HEAD` and re-run beside it:
+
+      | | blocks | bytes | peak live |
+      |---|---|---|---|
+      | before | 34,487 | 7,454,369 | 118,372 |
+      | after (16 workers) | 31,574 | 2,875,994 | 1,188,083 |
+
+      By site: `Box<Cell<udp_loop::{closure}>>` at **1,000 × 1,536 bytes is gone
+      from the profile**, and `to_bytes_within_buf` went from **996 blocks to
+      16** — one scratch buffer per worker instead of one per response, which is
+      the reuse `to_bytes_within_buf` was written for and which nothing could use
+      while a task per datagram had nowhere to keep a buffer between datagrams.
+      996 of 1,000 answered either way.
+
+      **The cost is in that table too and is not hidden:** peak live memory goes
+      from 118 KB to 1.19 MB, because sixteen workers hold sixteen 64 KB receive
+      buffers for the life of the process. That is the honest trade — a bounded
+      cost paid up front, in place of an unbounded one paid under load — and it
+      is why the default is the machine's parallelism rather than a round 64, and
+      why the clamp stops at 32.
+
+      Tests: `rdnsd`'s `mod udp` (the pool answers what it receives; the response
+      buffer is the worker's, asserted on pointer identity, which fails if
+      `to_bytes_within` is put back — confirmed by doing it) and `rdnsr`'s
+      `a_datagram_over_the_in_flight_ceiling_is_dropped`, which holds the only
+      permit with a forward query to a black-hole upstream and shows the next
+      datagram getting no answer where it used to get an immediate NOTIMP.
+
+      Original finding follows.
+
       (`rdnsd/src/main.rs:1077`, `rdnsr/src/main.rs:477`) — TCP has both
       `MAX_TCP_CONNECTIONS` and `MAX_INFLIGHT_PER_CONNECTION`, UDP has neither.
       Already noted for `rdnsr` at the end of #6; it is equally true of `rdnsd`.
@@ -1735,8 +1885,77 @@ here degrades quietly with the process healthy and nothing alerting.
       per-customer key to one partner and you have handed them every zone on the
       server, including zones whose ACL names nobody. Fix: an allowed-zone list per
       key, checked against the requested apex before the messages are built.
-- [ ] **No control channel — the runbook answer is "read the logs", and the logs
-      are unstructured `println!` with no timestamps.** Of the four questions an
+- [x] **No control channel — the runbook answer is "read the logs"** — **done
+      2026-08-01.** `--control-socket <PATH>` on `rdnsd`, `rdnsctl` as the
+      client, and `rdns::control` as the protocol both ends share so they cannot
+      drift about what a reply means.
+
+      **A Unix socket, mode 0600, and no TCP option**, which was settled by
+      reading what the others do rather than by picking (`CLAUDE.md` §4). Knot's
+      `knotc`, PowerDNS's `pdns_control` and Unbound with `control-interface:
+      /path` all use a socket and let the filesystem authenticate. The two that
+      use TCP put something in front of it — BIND's `rndc` an HMAC per
+      connection, NSD's `nsd-control` a client certificate. **Nobody ships an
+      unauthenticated control port**, which is also the argument that killed the
+      cheaper design of bolting `reload` onto `--metrics-listen` as a `POST`:
+      that endpoint is documented as having no auth, and read-only counters and
+      a reload are not the same risk.
+
+      **What the commands answer** is the finding's own list of four questions,
+      three of which had no answer from outside the box: `status` (zones,
+      serials, record counts, NSEC/NSEC3, primary-or-secondary, last contact with
+      a master), `reload`, `dump <zone>`, plus `version` and `help`.
+
+      **`reload` reports the result, which a signal cannot**, and that is the
+      part worth having. Measured live: with a typo in a zone file,
+      `rdnsctl reload` exits 1 and says `the reload failed and the zones already
+      loaded are still being served: line 8: SOA record needs 7 fields, got 0`;
+      `kill -HUP` says nothing and leaves the operator to grep for it. The
+      README's unit now uses `ExecReload=rdnsctl reload` so `systemctl reload`
+      fails when the reload did. Three exit codes, because a deploy script needs
+      to tell a bad zone file (1) from a daemon that is not running (2).
+
+      **No per-zone reload, which the finding asked for.** `Reloading::load` is
+      all-or-nothing on purpose — nothing is installed unless the whole set comes
+      through — so reloading one zone out of a set that was never validated as a
+      set would be that bug with a smaller blast radius. `rdnsctl reload
+      example.com.` is refused with that sentence rather than quietly reloading
+      everything.
+
+      **It is a third trigger on the existing maintenance loop, not a fourth
+      caller of `Reloading::load`** (§7). SIGHUP, the re-signing timer and the
+      socket all send a `ReloadTrigger` to one task, which is what stops two
+      reloads installing two different snapshots of the same files. The trigger
+      carries the reply channel, so `reload_once` still takes seven arguments
+      rather than eight.
+
+      Three things the bind does that a plain `bind()` would not, each verified
+      by doing it: a **live** socket is not stolen (a second server on the same
+      path is refused, rather than leaving two daemons and one working control
+      channel), a **stale** socket file does not block a start (the ordinary
+      state after a crash), and the mode is in place **before the path is** — the
+      socket is bound under a temporary name, restricted, then renamed over the
+      target, which is `persist`'s atomic-rename idiom applied to a socket and
+      closes the window in which it would be reachable with whatever the umask
+      gave it. The socket is removed on a clean stop, so `rdnsctl` says "no such
+      file" rather than "connection refused" about a server that is not running.
+
+      **Unix only**, like SIGHUP reloading, and `--control-socket` on Windows is
+      refused at startup with that sentence rather than accepted and ignored
+      (§15). The flag and the config key parse on both platforms on purpose, so
+      one config file read on either fails with a sentence rather than an
+      unknown-key error.
+
+      13 tests in `rdnsd::control` and 7 in `rdns::control`, including the socket
+      end to end — bind, mode 0600 asserted on the file, a command answered over
+      it, and the file gone after the stop — because a control channel that
+      answers in a unit test and not over its socket is not a control channel.
+      Verified live besides: `status`, `dump`, a failed reload, a recovered
+      reload, the double-start refusal, and the exit codes.
+
+      Original finding follows.
+
+      Of the four questions an
       operator asks at 3am, exactly one is answerable: *"is example.com loaded, at
       what serial?"* (query the SOA). *"Is broken.test loaded?"* — REFUSED, which
       is identical to a zone that was never configured. *"Is the secondary in
@@ -1745,6 +1964,10 @@ here degrades quietly with the process healthy and nothing alerting.
       `--control-socket <PATH>` with `status` (zones, serials, load time, per-zone
       last transfer), `reload [zone]`, and `dump <zone>` — `zone_writer` already
       exists for the last one and has no CLI surface yet (noted at #7 step 2).
+
+      (The logs are `tracing` with levels and timestamps now, not `println!`;
+      that half went with 9d's log-volume item and the sentence above predates
+      it.)
 - [x] **Docs an operator will copy from are wrong** — **done 2026-07-30.** The
       `rdnsd -- udp` invocations are gone from both files (two in `CLI_USAGE.md`,
       one in `README.md`), along with a "Run TCP server for zone transfers" second
@@ -2259,7 +2482,12 @@ into a measurement you can re-run, and it is what tells you when to stop.
       **Neither daemon reuses a buffer yet**, because the UDP loops spawn a task
       per datagram and there is no per-task scratch to hang one on; that is
       #9d's "unbounded `tokio::spawn` per UDP datagram", and the API is there for
-      when it lands. The sizing fix alone removes the overshoot: a 60-byte
+      when it lands. (**It landed 2026-08-01.** `rdnsd`'s UDP workers each own
+      one, and DHAT reads 16 blocks from `to_bytes_within_buf` for 996 responses
+      where it read 996 before. `rdnsr` still allocates per response: it builds
+      its reply inside `handle_query`, several awaits deep in a spawned task, so
+      there is no single scratch to hand it — a separate change if it is ever
+      worth one.) The sizing fix alone removes the overshoot: a 60-byte
       response used to retain capacity 65535 and now retains at most what the
       client advertised.
 
@@ -2379,8 +2607,20 @@ into a measurement you can re-run, and it is what tells you when to stop.
       Tightening that range is part of the fix, not a follow-up: a range that
       still admits the old number is a test that has agreed not to notice
       (`CLAUDE.md` §10).
-- [ ] **`tokio::spawn` per UDP datagram costs 1,536 bytes — 46% of every byte a
-      query allocates.** Measured, and by far the largest single cost on the
+- [x] **`tokio::spawn` per UDP datagram costs 1,536 bytes — 46% of every byte a
+      query allocates** — **done 2026-08-01 under #9d**, where the full write-up
+      and the before/after profile are. The site is gone from the profile
+      entirely: `rdnsd` no longer spawns per datagram, because for an
+      authoritative server the work is microseconds between two await points and
+      a fixed pool of workers answering inline is both the bound and the cheaper
+      shape. The response buffer went with it — 996 responses now build in 16
+      buffers rather than 996, which is what `to_bytes_within_buf` was written
+      for. Total allocation over 1,000 queries: 7.45 MB → 2.88 MB. `rdnsr` kept
+      its spawn on purpose and bounded it instead; a recursion is seconds of
+      waiting, and the 1,536 bytes are proportionate to that. Original finding
+      follows.
+
+      Measured, and by far the largest single cost on the
       path: the task allocation is bigger than the entire rest of the query put
       together. This is the same defect as #9d's "unbounded `tokio::spawn` per UDP
       datagram" seen from the other side, so **fix it there** — check the limiter
@@ -2931,6 +3171,71 @@ Estimate, for planning against rather than committing to: **1.5–2 weeks** for 
 whole of that, of which #7.6 is about a day. It is the largest single feature not
 on this list.
 
+### 12. Pre-authentication panics — an audit, not a bug report (opened 2026-08-01)
+
+**No known defect. That is the point of the entry**: this is a question about a
+whole class of code, and the answer is currently "nobody has looked at it as a
+class". It is an investigation to schedule, not a fix to apply.
+
+**Why it moved up.** Removing the task per UDP datagram (#9d) changed what a
+panic on the answer path *costs*. It used to be swallowed: `tokio::spawn` catches
+a task's panic, the datagram went unanswered, the loop carried on. Now the panic
+ends the worker, `serve` treats a stopped listener as fatal, and the process
+exits. That trade was taken deliberately — a server that keeps accepting queries
+while every answer panics is the quiet degradation this codebase keeps being
+bitten by — but it converts any reachable panic from "one lost answer" into "a
+remote kill switch", which is the exact shape `CLAUDE.md` §4 names for
+`recv_from`. The mitigation is to make the panic unreachable rather than to make
+it survivable.
+
+**What "pre-authentication" means here.** Everything a datagram touches before
+`tsig::check_request` has verified a MAC — which for an unsigned query is
+*everything*, up to and including the answer being serialized. Concretely:
+`RequestValidator::validate_packet`, `DnsMessage::try_from_bytes` and everything
+under it (labels, compression pointers, RDATA, EDNS option parsing),
+`tsig::find_tsig`, the rate limiter and its per-IP tables, `make_response` and
+the zone lookup, and the serializer. `rdnsr`'s equivalent path, plus the
+*response* parsing it does on data from an upstream nobody authenticated either.
+
+**What the audit is.** Not "grep for `unwrap`" — that finds the honest ones in
+`main` and misses the interesting kinds:
+
+- **Slicing and indexing.** `&buf[a..b]` with either end derived from the wire.
+  This is the one that has already happened: RDLENGTH was sliced without a bounds
+  check (#9b), a pre-authentication remote panic on both transports.
+- **Arithmetic.** Overflow panics in debug builds and wraps in release, so the
+  same input is two different bugs depending on the profile. §6's rule
+  (`saturating_sub` on every timestamp pair) came from one of these.
+- **`.lock().unwrap()`.** §6 again, and it is worse than it looks: the first
+  panic *poisons* the mutex, so every later call panics too. One reachable panic
+  under a shared lock takes the whole process off the air permanently even
+  without the worker-pool change.
+- **`.expect()` on anything with a wire-derived argument**, including in library
+  code called from the path rather than only in the daemons.
+- **Recursion depth.** Compression pointers are cycle-detected and depth-capped
+  (the review cleared that), but a stack overflow is not a catchable panic, so
+  anything else recursive on this path deserves the same treatment.
+
+**How to settle it, in the order that gives an answer fastest:**
+
+1. Enumerate the path mechanically rather than by reading — a call graph from
+   `udp_loop` and `serve_connection` down, and then the audit above over exactly
+   that set. A list nobody can reproduce is a list that rots.
+2. **Fuzz the parser.** `cargo-fuzz` is nightly-only; `arbitrary` + `proptest`
+   over `DnsMessage::try_from_bytes` runs on stable and would have caught the
+   RDLENGTH slice on the first hundred inputs. The property is "no input panics",
+   which needs no oracle — the cheapest useful test there is.
+3. **Then re-ask whether the trade in #9d is still the right one.** If the path
+   can be shown panic-free, the current behaviour is free. If it cannot, the
+   answer might be a supervisor that respawns a panicked worker and counts it,
+   rather than a process that exits — which is a design decision this entry
+   exists to inform, and which should not be taken on a hunch either way.
+
+Related and not the same: §5's bounded per-peer tables are about *memory* a
+remote party can make us spend, and this is about *control flow* a remote party
+can force. Both are "what can a stranger provoke", and both are cheap to ask and
+expensive to rediscover.
+
 ### 5. Smaller open items
 - [x] **AXFR** — done, see "Done so far" and "Architecture: zone transfer".
 - [x] **TSIG** (RFC 8945) — done, see "Architecture: TSIG". A key authorizes a
@@ -3055,8 +3360,9 @@ on 127.0.0.1 *and* ::1 at once — `rdnsr` binds one host:port
 (`rdnsr/src/main.rs:204`). That is a network-configuration daemon that happens to
 speak DNS, and it is a bigger project than this one. Smaller gaps in the same
 direction, if it is ever picked up: no opcode check (an UPDATE or NOTIFY is
-treated as a query rather than answered NOTIMP), no admission control on the UDP
-path (a task per datagram, unbounded — TCP has both caps), no rate limiting or
+treated as a query rather than answered NOTIMP — **fixed under #9c**), no
+admission control on the UDP path (a task per datagram, unbounded — TCP has both
+caps; **fixed 2026-08-01**, `--max-inflight-udp`), no rate limiting or
 query logging in `rdnsr` at all (both exist in the library, wired into `rdnsd`
 only), no signal handling, no EDNS cookies (RFC 7873), and static root hints with
 no periodic re-priming of the root NS set.
@@ -4237,6 +4543,26 @@ client had two query budgets and the metrics each saw half the traffic. They are
 `Server` now, shared by both loops. The response *byte* budget stays UDP-only, since
 a TCP query has completed a handshake and there is nobody to reflect at.
 
+**The two transports do not have the same concurrency shape, and the difference
+is the work rather than the protocol.** TCP is a task per connection, because a
+connection is long-lived, carries many queries and can hold a transfer open for
+minutes. UDP on `rdnsd` is a fixed pool of `--udp-workers` tasks that share the
+socket and answer **inline**: answering from an in-memory zone has two await
+points in it — the zone-map read guard and `send_to` — and takes microseconds, so
+a task per datagram was 1,536 bytes of overhead on a job smaller than the
+overhead. What limits the pool also bounds it, which is the point: past the
+workers, datagrams wait in the socket receive buffer and the kernel drops the
+overflow, which for UDP is the correct back-pressure and is counted by the
+operating system rather than by us.
+
+`rdnsr`'s UDP loop looks like the old `rdnsd` one on purpose. A recursion is
+several round trips to servers on the internet — seconds, nearly all of it
+waiting — so a small pool would leave the resolver idle and slow at once. It
+keeps the task per datagram and bounds *that* instead, with a
+`--max-inflight-udp` permit taken before the packet is copied. The rule the two
+share is only where the decision goes: nothing is allocated on behalf of a
+datagram before something has decided to keep it.
+
 ## Architecture: DNS over TCP (both daemons)
 
 Both daemons frame TCP messages with the RFC 1035 §4.2.2 2-byte big-endian
@@ -4292,6 +4618,10 @@ and OPT mirrored only if the client used EDNS. Cache hits return in 0 ms against
 
 It serves UDP *and* TCP on one host:port — both loops are spawned and whichever
 fails first takes the process down, so it never silently serves one transport.
+Its UDP loop still spawns a task per datagram, unlike `rdnsd`'s, and is bounded
+by `--max-inflight-udp` (default 1024) rather than replaced by a worker pool:
+see "Architecture: one process per server" for why seconds of recursion want the
+opposite shape from microseconds of zone lookup.
 TCP is not optional for a resolver: when an answer overflows the client's
 advertised UDP payload we reply TC=1, and RFC 1035 §4.2.1 has the client retry
 over TCP. The transport reaches `handle_query` as a `Transport` enum whose only
@@ -4311,6 +4641,21 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **`rdnsd` has a control socket, and `rdnsctl` talks to it** — closes 9d's
+  control-channel item. `status`, `reload` and `dump <zone>` over a Unix socket
+  at mode 0600, because the servers that put a control channel on TCP all
+  authenticate it and the ones that do not use a socket. `reload` reports what
+  happened — exit 1 and the parse error, with the previous zones still being
+  served — where `kill -HUP` reported nothing. No per-zone reload: a reload is
+  the whole set or nothing. Unix only, refused rather than ignored elsewhere.
+  (`52b0a6c`)
+- **No task per UDP datagram on `rdnsd`, and a bound on `rdnsr`'s** — closes
+  9d's admission-control item and 9e's 1,536-bytes-per-datagram one, which were
+  the same call site. `rdnsd` answers inline from `--udp-workers` tasks sharing
+  the socket; `rdnsr` keeps its spawn, because a recursion is seconds of waiting,
+  and bounds it with `--max-inflight-udp`. Measured over 1,000 queries against a
+  rebuilt `HEAD` on the same box: 7.45 MB in 34,487 blocks → 2.88 MB in 31,574,
+  the task site gone and 996 responses built in 16 buffers. (`23e7739`)
 - **Both daemons have log levels** — closes 9d's log-volume half. `--log-level`
   and `--quiet` on `rdnsd` and `rdnsr` through one `rdns::logging::init`, with
   `RUST_LOG` on top. Nothing per-packet is above `debug`, so 50 malformed
