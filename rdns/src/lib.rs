@@ -47,6 +47,7 @@ pub mod shutdown;
 pub mod special_names;
 pub mod transfer;
 pub mod tsig;
+pub mod update;
 pub mod utils;
 pub mod validation;
 pub mod xfr;
@@ -657,7 +658,13 @@ impl ParsedRecord {
     }
 }
 
-#[derive(Debug, Clone)]
+/// `PartialEq` is structural and includes the TTL, which is the right default
+/// and not what every DNS comparison wants: RFC 2181 §5.2 says the TTLs within
+/// one RRset must agree, so two records differing only in TTL are a malformed
+/// RRset rather than two different records. Anywhere that distinction matters —
+/// `ixfr`'s delta keys, `update`'s §2.5.4 deletion — compares the fields it
+/// means rather than reaching for this.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRecord {
     pub name: String,
     pub class: u16,

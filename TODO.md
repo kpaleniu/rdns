@@ -104,12 +104,12 @@ quietly — `git blame` refuses a revision it cannot resolve.
 
 | | Windows | Linux |
 |---|---|---|
-| `rdns` lib | 618 | 621 |
+| `rdns` lib | 630 | 633 |
 | allocations | 1 | 1 |
 | no_input_panics | 1 | 1 |
 | `rdnsd` | 93 | **106** |
 | `rdnsr` | 3 | 3 |
-| **total** | **716** | **732** |
+| **total** | **728** | **744** |
 
 **Two of those single tests are worth more than their count suggests.**
 `allocations` holds fourteen exact measurements and `no_input_panics` runs 1,506
@@ -545,7 +545,7 @@ lives — the commit that closed it, and the rule it became in `CLAUDE.md`:
 | **7** | the secondary role, in six steps | 5 of 6 done; step 6 (persisted deltas) waits on #10 and is the one unchecked box in this file |
 | **8** | what signing turned up — the re-signing timer and its serial | done |
 | **9** | what a five-way review found: 48 defects in six groups (9a-9f) | **all done, 2026-07-27 → 2026-08-01.** The patterns became `CLAUDE.md`, which is the useful artefact; the 2,435 lines of finding text are in `git log -p TODO.md` |
-| **10** | dynamic UPDATE (RFC 2136) | **not scheduled.** The largest feature not on this list, estimated 1.5-2 weeks; #7 step 6 waits on it |
+| **10** | dynamic UPDATE (RFC 2136) | **started 2026-08-02.** The reading half is in (`rdns/src/update.rs`: §2.4/§2.5 forms, §3.1, §3.2, §3.4.1's prescan); the writing half — apply, serial, re-signing, journal — is not. #7 step 6 still waits on it |
 | **11** | data layout and CPU cache friendliness | **a stretch goal, not scheduled.** Its measurement harness exists now (criterion, `--baseline`); what it still lacks is the *diagnostic* half — `perf stat`'s cache-miss and branch-miss counters, which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns) is the number it would have to move |
 | **12** | pre-authentication panics | **audited 2026-08-01.** No reachable panic in 1.4M mutated inputs; two mutex-poisoning fixes; `rdns/tests/no_input_panics.rs` left behind as the guard |
 
@@ -602,10 +602,13 @@ Nothing numbered is open, so this is a choice rather than a queue.
 > image has no clippy package, so that half had only ever run on Windows. They
 > may have passed silently; nobody has looked.
 >
-> **2. #10, dynamic UPDATE (RFC 2136)** — the largest feature not on the list,
-> and what #7 step 6 is waiting for. Read §10 below for the six things it drags
-> in with it, of which serial handling collides with #8 and should not be
-> designed separately.
+> **2. #10, dynamic UPDATE (RFC 2136)** — **started, one piece in.**
+> `rdns/src/update.rs` reads an UPDATE and checks its prerequisites; nothing
+> applies one yet. The next piece is applying the changes, and it must be
+> designed together with the serial: an UPDATE bumps it and so does re-signing
+> (#8), and both then have to survive a reload that re-reads a file saying
+> something older. Read §10 below before starting — it says which four of the
+> six original items are still on the far side of the seam.
 >
 > **3. #11, cache locality** — wanted, but blocked on hardware counters this
 > machine cannot read. Its harness is ready.
@@ -631,11 +634,47 @@ the shapes, and "Done so far" for the commits.
       RFC 1995 §4, and self-correcting: the next change after a restart has a
       delta again.
 
-### 10. Dynamic UPDATE (RFC 2136) — the dependency nothing schedules
+### 10. Dynamic UPDATE (RFC 2136) — started 2026-08-02, one piece in
 
-Not scheduled, listed so the dependency is visible. It is the largest single
-feature not on this list — **estimate 1.5-2 weeks**, of which #7 step 6 is about
-a day — and it drags in six things that must not be designed separately:
+**The reading half is done and the writing half is not.** `rdns/src/update.rs`
+turns an UPDATE message into a checked list of prerequisites and changes and
+evaluates the prerequisites against a zone. It never mutates a zone, touches a
+file, bumps a serial or looks at a key.
+
+That seam was chosen rather than found: of the six things listed below, four are
+policy or persistence, and all four sit on the far side of "here is what this
+message would change" — which is also the shape a journal entry (#7 step 6) and
+an IXFR delta both want. What is in:
+
+- **§2.2's renamed sections**, which needed no wire work at all: question is
+  Zone, answer is Prerequisite, authority is Update, additional stays itself.
+- **§2.4's five prerequisite forms and §2.5's four update forms**, each keyed on
+  CLASS — the field that says what kind of data a record is, used to say what to
+  *do* with it. `QueryClass::None` being a real value with a real meaning here is
+  why `CLAUDE.md` §2 insisted the parse keep it rather than fold it onto a
+  sentinel.
+- **§3.1's zone-section checks** (one zone, and it is an SOA), **§3.4.1's
+  prescan** (no meta-type may be added; nothing outside the named zone, which is
+  NOTZONE and not REFUSED), and **§3.2's four rcodes**, one per prerequisite
+  form. They are not interchangeable: a client uses them to tell "the name is not
+  there" from "the name is there and this type is not".
+
+Two rules in it are the kind that pass a careless test, so each was watched
+failing against the careless implementation before it landed. §3.2.3 compares a
+value-dependent prerequisite against the **whole RRset as a set** — "does the
+RRset contain this record" is the obvious reading and is wrong, and `www` with
+two A records is the case that shows it. And §2.4.4's "name is in use" is
+`holds_name`, the literal "are there records here", not `name_exists` — which is
+true for a name a wildcard reaches and for an empty non-terminal, so an update
+would otherwise believe a name exists because something could synthesize it.
+
+**What is left is the writing half**, and the four items below that this
+deliberately stopped short of. Applying the changes is `ixfr::apply_changes`'
+shape; what it drags with it is the serial, and that is the one that must not be
+designed alone. The six original items follow.
+
+Estimate for what remains: the bulk of the original **1.5-2 weeks**, since the
+part now done is the part with no policy in it.
 
 - The prerequisite section (§2.4), which is a small query language of its own and
   is checked against the zone *before* any change is applied.
@@ -2067,6 +2106,17 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **Dynamic UPDATE, the half with no policy in it** — opens #10.
+  `rdns/src/update.rs` reads an UPDATE message into a checked list of
+  prerequisites and changes and evaluates the prerequisites against a zone:
+  RFC 2136 §2.4's five prerequisite forms, §2.5's four update forms, §3.1's zone
+  checks, §3.4.1's prescan and §3.2's four distinct rcodes. It stops before
+  mutating anything, because the four policy items #10 lists all sit past that
+  point. Two rules that pass a careless test were each watched failing against
+  the careless version first: §3.2.3 compares a value-dependent prerequisite
+  against the whole RRset as a *set*, and §2.4.4's "in use" is `holds_name`
+  rather than `name_exists`, so a wildcard or an empty non-terminal does not make
+  a name exist. Twelve tests.
 - **The pre-authentication panic audit, and a fuzzer to keep it true** — closes
   #12, the last numbered item. No reachable panic: 1.4 million mutated messages
   through `validate_packet`, `try_from_bytes`, the TSIG scan, both EDNS readers,
