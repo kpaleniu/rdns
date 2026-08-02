@@ -15,6 +15,7 @@
 use crate::dname::dname_to_bytes;
 use crate::error::{DnssecError, DnssecResult};
 use crate::utils::record_types as rt;
+use crate::Rtype;
 use crate::{ParsedRecord, ResourceRecord};
 use sha1::{Digest, Sha1};
 use std::cmp::Ordering;
@@ -105,9 +106,9 @@ fn reversed_labels(name: &str) -> Vec<String> {
 /// many bytes of bits for types `window * 256 ..`. A malformed bitmap reads as
 /// "type not present", which is the safe direction — a bitmap we cannot parse
 /// must never be taken as proof that something *is* there.
-pub fn bitmap_has_type(bitmap: &[u8], rtype: u16) -> bool {
-    let want_window = (rtype >> 8) as u8;
-    let want_bit = (rtype & 0xff) as usize;
+pub fn bitmap_has_type(bitmap: &[u8], rtype: Rtype) -> bool {
+    let want_window = (rtype.to_u16() >> 8) as u8;
+    let want_bit = (rtype.to_u16() & 0xff) as usize;
 
     let mut rest = bitmap;
     while rest.len() >= 2 {
@@ -128,10 +129,11 @@ pub fn bitmap_has_type(bitmap: &[u8], rtype: u16) -> bool {
 
 /// Build a type bitmap covering `types`. Used by tests and by anything that
 /// needs to synthesize a denial.
-pub fn build_type_bitmap(types: &[u16]) -> Vec<u8> {
+pub fn build_type_bitmap(types: &[Rtype]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut windows: Vec<(u8, Vec<u8>)> = Vec::new();
     for &t in types {
+        let t = t.to_u16();
         let window = (t >> 8) as u8;
         let bit = (t & 0xff) as usize;
         let entry = match windows.iter_mut().find(|(w, _)| *w == window) {
@@ -164,7 +166,7 @@ pub fn build_type_bitmap(types: &[u16]) -> Vec<u8> {
 /// "absent" — but here the caller is writing a record out rather than judging a
 /// proof, so a short read would silently drop types. [`bitmap_types_exact`] is
 /// the checked form.
-pub fn bitmap_types(bitmap: &[u8]) -> Vec<u16> {
+pub fn bitmap_types(bitmap: &[u8]) -> Vec<Rtype> {
     bitmap_types_exact(bitmap).unwrap_or_else(|partial| partial)
 }
 
@@ -172,7 +174,7 @@ pub fn bitmap_types(bitmap: &[u8]) -> Vec<u16> {
 /// does not parse to its end. Anything rewriting a record needs to know the
 /// difference: re-encoding a bitmap we only partly understood would produce a
 /// record that is not the one we were given.
-pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<u16>, Vec<u16>> {
+pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>> {
     let mut types = Vec::new();
     let mut rest = bitmap;
     while !rest.is_empty() {
@@ -187,7 +189,7 @@ pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<u16>, Vec<u16>> {
         for (byte, bits) in rest[2..2 + len].iter().enumerate() {
             for bit in 0..8 {
                 if bits & (0x80 >> bit) != 0 {
-                    types.push((window << 8) | (byte as u16 * 8 + bit));
+                    types.push(Rtype::new((window << 8) | (byte as u16 * 8 + bit)));
                 }
             }
         }
@@ -337,7 +339,7 @@ impl Nsec {
         }
     }
 
-    pub fn has_type(&self, rtype: u16) -> bool {
+    pub fn has_type(&self, rtype: Rtype) -> bool {
         bitmap_has_type(&self.type_bitmap, rtype)
     }
 }
@@ -430,7 +432,7 @@ impl Nsec3 {
         )
     }
 
-    pub fn has_type(&self, rtype: u16) -> bool {
+    pub fn has_type(&self, rtype: Rtype) -> bool {
         bitmap_has_type(&self.type_bitmap, rtype)
     }
 }
@@ -576,7 +578,7 @@ pub fn proves_nxdomain(qname: &str, zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]
 pub fn proves_nodata(
     qname: &str,
     zone: &str,
-    qtype: u16,
+    qtype: Rtype,
     nsecs: &[Nsec],
     nsec3s: &[Nsec3],
 ) -> Denial {
@@ -613,7 +615,7 @@ pub fn proves_nodata(
 /// plain and the wildcard case: the type asked for must be absent, and so must
 /// CNAME — a CNAME at the name would have been followed rather than answered
 /// NODATA, so its presence contradicts the proof.
-fn nodata_bitmap(qtype: u16, at: &str, has_type: impl Fn(u16) -> bool) -> Denial {
+fn nodata_bitmap(qtype: Rtype, at: &str, has_type: impl Fn(Rtype) -> bool) -> Denial {
     if has_type(qtype) {
         return Denial::NotProved(format!("the denial at {at} says type {qtype} exists"));
     }
@@ -632,7 +634,7 @@ fn nodata_bitmap(qtype: u16, at: &str, has_type: impl Fn(u16) -> bool) -> Denial
 /// reasoning as [`proves_wildcard_expansion`], and the same machinery. Often one
 /// record does both jobs: `*.example.com.`'s own NSEC covers the ordinary names
 /// it answers for, because `*` sorts before every ordinary label.
-fn nsec_wildcard_nodata(qname: &str, qtype: u16, nsecs: &[Nsec]) -> Denial {
+fn nsec_wildcard_nodata(qname: &str, qtype: Rtype, nsecs: &[Nsec]) -> Denial {
     let Some(covering) = nsecs.iter().find(|n| n.covers(qname)) else {
         return Denial::NotProved(format!("no NSEC matches or covers {qname}"));
     };
@@ -649,7 +651,7 @@ fn nsec_wildcard_nodata(qname: &str, qtype: u16, nsecs: &[Nsec]) -> Denial {
 /// Wildcard NODATA with NSEC3 (RFC 5155 §8.7): the closest-encloser proof for
 /// `qname`, and an NSEC3 matching the wildcard at that encloser whose bitmap
 /// lacks the type.
-fn nsec3_wildcard_nodata(qname: &str, zone: &str, qtype: u16, nsec3s: &[Nsec3]) -> Denial {
+fn nsec3_wildcard_nodata(qname: &str, zone: &str, qtype: Rtype, nsec3s: &[Nsec3]) -> Denial {
     let encloser = match nsec3_closest_encloser(qname, zone, nsec3s) {
         Ok(encloser) => encloser,
         Err(why) => return Denial::NotProved(why),
@@ -884,9 +886,11 @@ fn nsec3_closest_encloser(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Class;
     use crate::RecordData;
+    use crate::Ttl;
 
-    fn nsec(owner: &str, next: &str, types: &[u16]) -> Nsec {
+    fn nsec(owner: &str, next: &str, types: &[Rtype]) -> Nsec {
         Nsec {
             owner: owner.to_string(),
             next: next.to_string(),
@@ -1018,10 +1022,10 @@ mod tests {
     #[test]
     fn test_type_bitmap_spans_windows() {
         // TYPE1234 lives in window 4; A lives in window 0.
-        let bitmap = build_type_bitmap(&[rt::A, 1234]);
+        let bitmap = build_type_bitmap(&[rt::A, Rtype::new(1234)]);
         assert!(bitmap_has_type(&bitmap, rt::A));
-        assert!(bitmap_has_type(&bitmap, 1234));
-        assert!(!bitmap_has_type(&bitmap, 1235));
+        assert!(bitmap_has_type(&bitmap, Rtype::new(1234)));
+        assert!(!bitmap_has_type(&bitmap, Rtype::new(1235)));
     }
 
     /// A bitmap we cannot parse must read as "absent", never as "present".
@@ -1045,7 +1049,7 @@ mod tests {
             rt::RRSIG,
             rt::NSEC,
             rt::DNSKEY,
-            1234,
+            Rtype::new(1234),
         ];
         let bitmap = build_type_bitmap(&types);
 
@@ -1053,7 +1057,7 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(bitmap_types(&bitmap), expected, "ascending, across windows");
         assert_eq!(bitmap_types_exact(&bitmap), Ok(expected));
-        assert_eq!(bitmap_types(&[]), Vec::<u16>::new());
+        assert_eq!(bitmap_types(&[]), Vec::<Rtype>::new());
     }
 
     /// A bitmap that does not parse to its end must be reported as such: a
@@ -1510,7 +1514,7 @@ mod tests {
     /// span is the empty interval just above its own hash, so it can only ever
     /// prove what its bitmap says about that one name and cannot stand in for a
     /// covering record by accident.
-    fn nsec3_matching(name: &str, types: &[u16]) -> Nsec3 {
+    fn nsec3_matching(name: &str, types: &[Rtype]) -> Nsec3 {
         let salt = vec![0x01, 0x02];
         let hash = nsec3_hash(name, &salt, 5).expect("hash");
         Nsec3 {
@@ -1571,7 +1575,7 @@ mod tests {
     // NSEC3 records off the wire
     // -----------------------------------------------------------------
 
-    fn nsec3_record(zone: &str, name: &str, next: &[u8], flags: u8, types: &[u16]) -> Nsec3 {
+    fn nsec3_record(zone: &str, name: &str, next: &[u8], flags: u8, types: &[Rtype]) -> Nsec3 {
         let salt = vec![0x01, 0x02];
         let hash = nsec3_hash(name, &salt, 5).unwrap();
         Nsec3 {
@@ -1648,8 +1652,8 @@ mod tests {
         let hash = nsec3_hash("child.example.com.", &salt, 3).unwrap();
         let rr = crate::ResourceRecord {
             name: format!("{}.example.com.", base32hex_encode(&hash)),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
                 hash_algorithm: 1,
                 flags: 1,

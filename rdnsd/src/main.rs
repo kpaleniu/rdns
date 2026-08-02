@@ -5,6 +5,8 @@ mod config;
 #[cfg(unix)]
 mod control;
 
+use rdns::Rtype;
+use rdns::Ttl;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
@@ -41,7 +43,7 @@ use rdns::{
     zone::{parse_zone_file_at, NameKind, Zone},
     zone_signer::{sign_zone, DenialChain, SigningPolicy},
     zone_writer::write_zone_file,
-    DnsMessage, Edns, OpCode, QueryClass, ResourceRecord, ResponseCode, EDNS_VERSION,
+    DnsMessage, Edns, OpCode, Qtype, QueryClass, ResourceRecord, ResponseCode, EDNS_VERSION,
 };
 
 /// UDP payload size rdnsd advertises to clients via EDNS0.
@@ -463,6 +465,7 @@ fn make_response(
         answers: Vec::new(),
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     };
 
     // The client's EDNS parameters, read once for the whole function. This used
@@ -481,13 +484,13 @@ fn make_response(
         Err(_) => {
             response.rcode = ResponseCode::FormatError;
             // `with_payload_size` carries no options, so encoding it cannot fail.
-            let _ = response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+            response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
             return response;
         }
     };
     if client_edns.is_some_and(|edns| edns.version > EDNS_VERSION) {
         response.rcode = ResponseCode::BadOptVersion;
-        let _ = response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+        response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
         return response;
     }
 
@@ -520,7 +523,7 @@ fn make_response(
         if client_edns.is_some() {
             let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
             edns.do_bit = dnssec_ok;
-            let _ = response.set_edns(edns);
+            response.set_edns(edns);
         }
         return response;
     }
@@ -552,7 +555,7 @@ fn make_response(
         // has no way to say "there is more" — so a UDP request for it is
         // malformed rather than merely refused. The TCP server answers AXFR
         // itself, before ever reaching here, so this is the UDP path speaking.
-        if query.qtype == record_types::AXFR {
+        if query.qtype == Qtype::AXFR {
             response.rcode = ResponseCode::FormatError;
             continue;
         }
@@ -566,9 +569,9 @@ fn make_response(
         // subset of increments that fit a datagram would be a second
         // implementation of the interesting parts. The SOA discloses nothing an
         // ordinary SOA query does not, so it needs no ACL of its own.
-        if query.qtype == record_types::IXFR {
+        if query.qtype == Qtype::IXFR {
             if let Some(zone) = find_zone_for_query(&query.qname, zone_map) {
-                for soa in zone.query(zone.origin(), record_types::SOA) {
+                for soa in zone.query(zone.origin(), Qtype::of(record_types::SOA)) {
                     response.answers.push(ResourceRecord {
                         name: zone.origin().to_string(),
                         class: soa.class,
@@ -644,7 +647,7 @@ fn make_response(
     if client_edns.is_some() {
         let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
         edns.do_bit = dnssec_ok;
-        let _ = response.set_edns(edns);
+        response.set_edns(edns);
     }
 
     response
@@ -691,7 +694,7 @@ const MAX_CNAME_HOPS: usize = 16;
 /// name has the data, the name is an alias, the name has no such data. Getting
 /// the first one last is how a parent ends up answering NXDOMAIN for a child's
 /// names.
-fn resolve_in_zone(zone: &Zone, qname: &str, qtype: u16) -> Outcome {
+fn resolve_in_zone(zone: &Zone, qname: &str, qtype: Qtype) -> Outcome {
     let mut chain: Vec<String> = Vec::new();
     let mut visited: Vec<String> = Vec::new();
     let mut name = qname.to_string();
@@ -703,7 +706,7 @@ fn resolve_in_zone(zone: &Zone, qname: &str, qtype: u16) -> Outcome {
         // does not hold its own DS and could not be asked (RFC 4035 §3.1.4.1).
         if let Some(cut) = zone.delegation_for(&name) {
             let at_the_cut = cut.eq_ignore_ascii_case(&zone.normalize_name(&name));
-            if !(qtype == record_types::DS && at_the_cut) {
+            if !(qtype.is(record_types::DS) && at_the_cut) {
                 return if chain.is_empty() {
                     Outcome::Referral { cut }
                 } else {
@@ -722,7 +725,7 @@ fn resolve_in_zone(zone: &Zone, qname: &str, qtype: u16) -> Outcome {
         }
         // A CNAME query is answered by the CNAME, not followed by it — the
         // alias is the data when the alias is what was asked for.
-        if qtype == record_types::CNAME {
+        if qtype.is(record_types::CNAME) {
             return Outcome::Negative { chain, name, kind };
         }
 
@@ -749,7 +752,7 @@ fn resolve_in_zone(zone: &Zone, qname: &str, qtype: u16) -> Outcome {
 /// load the shape at all (see `zone::parse_zone_file`), so this is the belt to
 /// that braces.
 fn cname_target(zone: &Zone, name: &str) -> Option<String> {
-    zone.query(name, record_types::CNAME)
+    zone.query(name, Qtype::of(record_types::CNAME))
         .first()
         .and_then(|record| match record.rdata.parse() {
             Ok(rdns::ParsedRecord::CNAME(target)) => Some(target),
@@ -772,7 +775,7 @@ fn in_zone(zone: &Zone, name: &str) -> bool {
 /// The answer echoes the name asked about rather than the stored owner, which
 /// may be `@`, relative, or a wildcard — and for a wildcard match the queried
 /// name is what the client must see (RFC 1034 §4.3.3).
-fn add_answer(zone: &Zone, name: &str, qtype: u16, dnssec_ok: bool, response: &mut DnsMessage) {
+fn add_answer(zone: &Zone, name: &str, qtype: Qtype, dnssec_ok: bool, response: &mut DnsMessage) {
     for record in zone.query(name, qtype) {
         response.answers.push(ResourceRecord {
             name: name.to_string(),
@@ -804,7 +807,13 @@ fn add_answer(zone: &Zone, name: &str, qtype: u16, dnssec_ok: bool, response: &m
 /// — and its own wildcard denial when the alias was synthesized.
 fn add_chain(zone: &Zone, chain: &[String], dnssec_ok: bool, response: &mut DnsMessage) {
     for at in chain {
-        add_answer(zone, at, record_types::CNAME, dnssec_ok, response);
+        add_answer(
+            zone,
+            at,
+            Qtype::of(record_types::CNAME),
+            dnssec_ok,
+            response,
+        );
     }
 }
 
@@ -826,7 +835,7 @@ fn add_negative(
     // client, and every resolver in between, how long the answer may be cached.
     // Without it a negative answer is uncacheable, so each repeat of a failing
     // lookup comes back to us.
-    for soa in zone.query(zone.origin(), record_types::SOA) {
+    for soa in zone.query(zone.origin(), Qtype::of(record_types::SOA)) {
         response.authorities.push(ResourceRecord {
             name: zone.origin().to_string(),
             class: soa.class,
@@ -857,15 +866,13 @@ fn add_negative(
 /// the NSEC/NSEC3 TTL at MINIMUM (`zone_signer::sign_zone`), so the SOA and the
 /// proof beside it in the same section disagreed about how long the "no" was
 /// good for.
-fn negative_ttl(soa: &rdns::zone::ZoneRecord) -> i32 {
+fn negative_ttl(soa: &rdns::zone::ZoneRecord) -> Ttl {
     match soa.rdata.parse() {
-        Ok(rdns::ParsedRecord::SOA { minimum, .. }) => {
-            soa.ttl.min(minimum.min(i32::MAX as u32) as i32)
-        }
+        Ok(rdns::ParsedRecord::SOA { minimum, .. }) => soa.ttl.min(Ttl::from_secs(minimum)),
         // An apex SOA that will not parse is a zone that should not have loaded.
         // Capping at nothing is the conservative direction: the client asks
         // again rather than caching a "no" we cannot bound.
-        _ => 0,
+        _ => Ttl::ZERO,
     }
 }
 
@@ -880,7 +887,7 @@ fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMes
     response.authoritive = false;
 
     let mut targets: Vec<String> = Vec::new();
-    for ns in zone.query(cut, record_types::NS) {
+    for ns in zone.query(cut, Qtype::of(record_types::NS)) {
         if let Ok(rdns::ParsedRecord::NS(target)) = ns.rdata.parse() {
             targets.push(target);
         }
@@ -903,7 +910,7 @@ fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMes
             continue;
         }
         for rtype in [record_types::A, record_types::AAAA] {
-            for glue in zone.query(&target, rtype) {
+            for glue in zone.query(&target, Qtype::of(rtype)) {
                 response.additionals.push(ResourceRecord {
                     name: target.clone(),
                     class: glue.class,
@@ -1527,7 +1534,7 @@ impl Server {
         // query whose answer can be the entire zone.
         if matches!(
             msg.queries.first().map(|q| q.qtype),
-            Some(record_types::AXFR) | Some(record_types::IXFR)
+            Some(Qtype::AXFR) | Some(Qtype::IXFR)
         ) {
             return self
                 .answer_transfer(&msg, peer, session.as_mut(), now)
@@ -1589,7 +1596,7 @@ impl Server {
             .first()
             .map(|q| q.qname.clone())
             .unwrap_or_default();
-        let incremental = msg.queries.first().map(|q| q.qtype) == Some(record_types::IXFR);
+        let incremental = msg.queries.first().map(|q| q.qtype) == Some(Qtype::IXFR);
         let kind = if incremental { "IXFR" } else { "AXFR" };
 
         // Two ways to be allowed, and they are not equivalent. A verified TSIG is
@@ -1804,9 +1811,10 @@ impl Server {
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         };
         if msg.has_edns() {
-            let _ = resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+            resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
         }
         resp.to_bytes_within(u16::MAX as usize).ok()
     }
@@ -1860,9 +1868,10 @@ fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
         answers: Vec::new(),
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     };
     if request.has_edns() {
-        let _ = resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+        resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
     }
     resp.to_bytes_within(request.udp_payload_size() as usize)
         .ok()
@@ -2108,9 +2117,10 @@ impl Server {
                     answers: Vec::new(),
                     authorities: Vec::new(),
                     additionals: Vec::new(),
+                    edns: None,
                 };
                 if msg.has_edns() {
-                    let _ = resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+                    resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
                 }
                 if let Ok(bytes) = resp.to_bytes_within(msg.udp_payload_size() as usize) {
                     if let Ok(bytes) = rejection.attach(bytes, now) {
@@ -4016,7 +4026,7 @@ fn verify_zones(zones: &HashMap<String, Zone>, validator: &DnssecValidator) -> R
 
         let mut checked = 0usize;
         for (name, rtype) in signed_rrsets(zone) {
-            let records = zone.query(&name, rtype);
+            let records = zone.query(&name, Qtype::of(rtype));
             if records.is_empty() {
                 return Err(anyhow!(
                     "{origin}: a signature covers the {rtype} RRset at {name}, which is not there"
@@ -4037,8 +4047,8 @@ fn verify_zones(zones: &HashMap<String, Zone>, validator: &DnssecValidator) -> R
 }
 
 /// Every `(owner, type)` in the zone that some RRSIG claims to cover.
-fn signed_rrsets(zone: &Zone) -> Vec<(String, u16)> {
-    let mut seen: Vec<(String, u16)> = zone
+fn signed_rrsets(zone: &Zone) -> Vec<(String, Rtype)> {
+    let mut seen: Vec<(String, Rtype)> = zone
         .records()
         .iter()
         .filter(|r| r.rdata.rtype == record_types::RRSIG)
@@ -4277,10 +4287,11 @@ fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<HashMap<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdns::Class;
     use rdns::{QueryClass, QuerySection};
 
     /// A query as it arrives on the wire, EDNS and all.
-    fn query(qname: &str, qtype: u16, dnssec_ok: bool) -> DnsMessage {
+    fn query(qname: &str, qtype: Qtype, dnssec_ok: bool) -> DnsMessage {
         let mut msg = DnsMessage {
             id: 1,
             response: false,
@@ -4300,10 +4311,11 @@ mod tests {
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         };
         let mut edns = Edns::with_payload_size(4096);
         edns.do_bit = dnssec_ok;
-        msg.set_edns(edns).expect("set edns");
+        msg.set_edns(edns);
         msg
     }
 
@@ -4609,7 +4621,7 @@ mod tests {
         }
 
         fn a_query() -> Vec<u8> {
-            query("www.example.com.", record_types::A, false)
+            query("www.example.com.", Qtype::of(record_types::A), false)
                 .to_bytes_within(4096)
                 .expect("serialize the query")
         }
@@ -4757,7 +4769,7 @@ mod tests {
         }
 
         async fn send_axfr_request(stream: &mut TcpStream) {
-            let msg = query("example.com.", record_types::AXFR, false);
+            let msg = query("example.com.", Qtype::of(record_types::AXFR), false);
             let bytes = msg.to_bytes_within(u16::MAX as usize).expect("serialize");
             let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
             framed.extend_from_slice(&bytes);
@@ -4888,7 +4900,7 @@ mod tests {
             // Connect, ask one question, read the answer, then go quiet — which
             // is what a pooled connection does for most of its life.
             let mut stream = TcpStream::connect(addr).await.expect("connect");
-            let msg = query("example.com.", record_types::SOA, false);
+            let msg = query("example.com.", Qtype::of(record_types::SOA), false);
             let bytes = msg.to_bytes_within(u16::MAX as usize).expect("serialize");
             let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
             framed.extend_from_slice(&bytes);
@@ -5144,7 +5156,11 @@ mod tests {
         let zones = r.served.zone_map.read().await;
         let held = zones.get("example.com.").expect("the zone is now served");
         assert_eq!(held.serial(), Some(7));
-        assert_eq!(held.query("www.example.com.", record_types::A).len(), 1);
+        assert_eq!(
+            held.query("www.example.com.", Qtype::of(record_types::A))
+                .len(),
+            1
+        );
         drop(zones);
 
         // ...written to disk, in the form the ordinary load path reads...
@@ -5261,7 +5277,8 @@ mod tests {
         let held = zones.get("example.com.").unwrap();
         assert_eq!(held.serial(), Some(8));
         assert!(
-            held.query("www.example.com.", record_types::A).is_empty(),
+            held.query("www.example.com.", Qtype::of(record_types::A))
+                .is_empty(),
             "a record the new zone does not have must be gone, not merged"
         );
     }
@@ -5407,9 +5424,13 @@ mod tests {
         let zones = r.served.zone_map.read().await;
         let held = zones.get("example.com.").expect("still served");
         assert_eq!(held.serial(), Some(8));
-        assert_eq!(held.query("extra.example.com.", record_types::TXT).len(), 1);
+        assert_eq!(
+            held.query("extra.example.com.", Qtype::of(record_types::TXT))
+                .len(),
+            1
+        );
         assert!(
-            held.query("www.example.com.", record_types::A)
+            held.query("www.example.com.", Qtype::of(record_types::A))
                 .iter()
                 .all(|r| r
                     .rdata
@@ -5825,7 +5846,7 @@ mod tests {
         // And so is an IXFR, over the same connection path.
         let request = {
             let mut msg = rdns::xfr::axfr_request("example.com.", 0x33);
-            msg.queries[0].qtype = record_types::IXFR;
+            msg.queries[0].qtype = Qtype::of(record_types::IXFR);
             msg
         };
         let mut buf = vec![0u8; 512];
@@ -6216,7 +6237,7 @@ mod tests {
         };
 
         // The control: the same question, asked as a question, is answered.
-        let mut question = query("ns1.example.com.", record_types::A, false);
+        let mut question = query("ns1.example.com.", Qtype::of(record_types::A), false);
         assert!(
             !server.answer(&wire(&question), peer).await.is_empty(),
             "a real query must still be answered — the check has to be narrow"
@@ -6316,11 +6337,11 @@ ns.sub   IN A   192.0.2.20
             zones
         }
 
-        fn ask(qname: &str, qtype: u16) -> DnsMessage {
+        fn ask(qname: &str, qtype: Qtype) -> DnsMessage {
             make_response(&query(qname, qtype, false), &server(), &DnsMetrics::new())
         }
 
-        fn rdatas(records: &[ResourceRecord], rtype: u16) -> Vec<&ResourceRecord> {
+        fn rdatas(records: &[ResourceRecord], rtype: Rtype) -> Vec<&ResourceRecord> {
             records.iter().filter(|r| r.rdata.rtype == rtype).collect()
         }
 
@@ -6330,7 +6351,7 @@ ns.sub   IN A   192.0.2.20
         /// NODATA and never follow the alias.
         #[test]
         fn a_cname_is_followed_to_its_target_in_the_same_zone() {
-            let response = ask("www.example.com.", record_types::A);
+            let response = ask("www.example.com.", Qtype::of(record_types::A));
 
             assert_eq!(response.rcode, ResponseCode::Ok);
             assert!(response.authoritive);
@@ -6351,7 +6372,7 @@ ns.sub   IN A   192.0.2.20
         /// be an assertion about a name in somebody else's zone.
         #[test]
         fn a_cname_out_of_the_zone_stops_with_the_partial_chain() {
-            let response = ask("away.example.com.", record_types::A);
+            let response = ask("away.example.com.", Qtype::of(record_types::A));
 
             assert_eq!(response.rcode, ResponseCode::Ok, "not NXDOMAIN");
             assert_eq!(rdatas(&response.answers, record_types::CNAME).len(), 1);
@@ -6361,7 +6382,7 @@ ns.sub   IN A   192.0.2.20
         /// A CNAME query is answered by the CNAME, not followed by it.
         #[test]
         fn a_cname_query_is_not_chased() {
-            let response = ask("www.example.com.", record_types::CNAME);
+            let response = ask("www.example.com.", Qtype::of(record_types::CNAME));
             assert_eq!(response.answers.len(), 1);
             assert_eq!(response.answers[0].rdata.rtype, record_types::CNAME);
         }
@@ -6370,7 +6391,7 @@ ns.sub   IN A   192.0.2.20
         /// other terminate on the visited set, not on the hop limit.
         #[test]
         fn a_cname_loop_terminates() {
-            let response = ask("loop1.example.com.", record_types::A);
+            let response = ask("loop1.example.com.", Qtype::of(record_types::A));
             assert_eq!(response.rcode, ResponseCode::Ok);
             assert!(
                 rdatas(&response.answers, record_types::CNAME).len() <= MAX_CNAME_HOPS,
@@ -6384,7 +6405,7 @@ ns.sub   IN A   192.0.2.20
         /// for the negative TTL.
         #[test]
         fn a_name_below_a_delegation_gets_a_referral_not_an_nxdomain() {
-            let response = ask("anything.sub.example.com.", record_types::A);
+            let response = ask("anything.sub.example.com.", Qtype::of(record_types::A));
 
             assert_eq!(
                 response.rcode,
@@ -6421,7 +6442,7 @@ ns.sub   IN A   192.0.2.20
         /// (RFC 4592 §2.2.1) — that name belongs to the child.
         #[test]
         fn the_delegation_wins_over_the_wildcard() {
-            let response = ask("anything.sub.example.com.", record_types::A);
+            let response = ask("anything.sub.example.com.", Qtype::of(record_types::A));
             assert!(
                 response.answers.is_empty(),
                 "the apex wildcard is not this name's source of synthesis"
@@ -6443,7 +6464,7 @@ ns.sub   IN A   192.0.2.20
             zones.insert(zone.origin().to_string(), zone);
 
             let response = make_response(
-                &query("sub.example.com.", record_types::DS, false),
+                &query("sub.example.com.", Qtype::of(record_types::DS), false),
                 &zones,
                 &DnsMetrics::new(),
             );
@@ -6452,7 +6473,7 @@ ns.sub   IN A   192.0.2.20
 
             // Anything else at the same name is a referral.
             let ns = make_response(
-                &query("sub.example.com.", record_types::NS, false),
+                &query("sub.example.com.", Qtype::of(record_types::NS), false),
                 &zones,
                 &DnsMetrics::new(),
             );
@@ -6463,7 +6484,7 @@ ns.sub   IN A   192.0.2.20
         /// RFC 4592 §3.3.2: synthesis reaches any depth, not one label.
         #[test]
         fn a_wildcard_answers_a_name_more_than_one_label_deep() {
-            let response = ask("a.b.c.example.com.", record_types::A);
+            let response = ask("a.b.c.example.com.", Qtype::of(record_types::A));
             assert_eq!(response.rcode, ResponseCode::Ok);
             let addresses = rdatas(&response.answers, record_types::A);
             assert_eq!(addresses.len(), 1);
@@ -6475,7 +6496,7 @@ ns.sub   IN A   192.0.2.20
         /// extends the denial down to `deep.a.b`.
         #[test]
         fn an_empty_non_terminal_is_nodata_not_nxdomain() {
-            let response = ask("a.b.example.com.", record_types::TXT);
+            let response = ask("a.b.example.com.", Qtype::of(record_types::TXT));
             assert_eq!(response.rcode, ResponseCode::Ok);
             assert!(response.answers.is_empty());
             assert_eq!(rdatas(&response.authorities, record_types::SOA).len(), 1);
@@ -6492,10 +6513,14 @@ ns.sub   IN A   192.0.2.20
                 ("a.b.example.com.", record_types::TXT, "NODATA"),
                 ("x.a.b.example.com.", record_types::A, "NXDOMAIN"),
             ] {
-                let response = ask(qname, qtype);
+                let response = ask(qname, Qtype::of(qtype));
                 let soa = rdatas(&response.authorities, record_types::SOA);
                 assert_eq!(soa.len(), 1, "{what}");
-                assert_eq!(soa[0].ttl, 300, "{what}: capped at MINIMUM, not the $TTL");
+                assert_eq!(
+                    soa[0].ttl,
+                    Ttl::from_secs(300),
+                    "{what}: capped at MINIMUM, not the $TTL"
+                );
             }
         }
 
@@ -6504,7 +6529,7 @@ ns.sub   IN A   192.0.2.20
         /// apex wildcard is not its source of synthesis and nothing answers.
         #[test]
         fn a_name_nothing_reaches_is_still_nxdomain() {
-            let response = ask("x.a.b.example.com.", record_types::A);
+            let response = ask("x.a.b.example.com.", Qtype::of(record_types::A));
             assert_eq!(response.rcode, ResponseCode::NoSuchDomain);
             assert!(response.authoritive, "we are authoritative for saying no");
             assert_eq!(rdatas(&response.authorities, record_types::SOA).len(), 1);
@@ -6522,7 +6547,7 @@ ns.sub   IN A   192.0.2.20
         #[test]
         fn a_class_this_server_does_not_serve_is_refused() {
             for class in [QueryClass::CH, QueryClass::HS, QueryClass::Other(99)] {
-                let mut msg = query("example.com.", record_types::SOA, false);
+                let mut msg = query("example.com.", Qtype::of(record_types::SOA), false);
                 msg.queries[0].qclass = class;
                 let response = make_response(&msg, &server(), &DnsMetrics::new());
 
@@ -6565,7 +6590,7 @@ ns.sub   IN A   192.0.2.20
             zones.insert(zone.origin().to_string(), zone);
 
             let refused = make_response(
-                &query("\u{212A}.example.com.", record_types::SOA, false),
+                &query("\u{212A}.example.com.", Qtype::of(record_types::SOA), false),
                 &zones,
                 &DnsMetrics::new(),
             );
@@ -6575,7 +6600,7 @@ ns.sub   IN A   192.0.2.20
             // ASCII case still folds, which is the half that has to keep
             // working: this is the same zone asked for in the other case.
             let answered = make_response(
-                &query("K.Example.COM.", record_types::SOA, false),
+                &query("K.Example.COM.", Qtype::of(record_types::SOA), false),
                 &zones,
                 &DnsMetrics::new(),
             );
@@ -6593,7 +6618,7 @@ ns.sub   IN A   192.0.2.20
         /// records", which is the shape taken here.
         #[test]
         fn qtype_any_returns_every_rrset_at_the_name() {
-            let response = ask("example.com.", record_types::ANY);
+            let response = ask("example.com.", Qtype::of(record_types::ANY));
 
             assert_eq!(response.rcode, ResponseCode::Ok);
             assert!(response.authoritive);
@@ -6617,7 +6642,7 @@ ns.sub   IN A   192.0.2.20
         /// change did not turn ANY into "everything in the zone".
         #[test]
         fn qtype_any_at_a_single_type_name_returns_only_that_type() {
-            let response = ask("host.example.com.", record_types::ANY);
+            let response = ask("host.example.com.", Qtype::of(record_types::ANY));
             assert_eq!(response.rcode, ResponseCode::Ok);
             assert_eq!(response.answers.len(), 1);
             assert_eq!(response.answers[0].rdata.rtype, record_types::A);
@@ -6628,7 +6653,7 @@ ns.sub   IN A   192.0.2.20
         /// for a QTYPE the alias does not hold, and ANY holds everything.
         #[test]
         fn qtype_any_at_an_alias_answers_with_the_alias() {
-            let response = ask("www.example.com.", record_types::ANY);
+            let response = ask("www.example.com.", Qtype::of(record_types::ANY));
             assert_eq!(response.rcode, ResponseCode::Ok);
             assert_eq!(response.answers.len(), 1);
             assert_eq!(response.answers[0].rdata.rtype, record_types::CNAME);
@@ -6639,7 +6664,7 @@ ns.sub   IN A   192.0.2.20
         /// every type must not become matching every name.
         #[test]
         fn qtype_any_at_a_missing_name_is_still_a_negative_answer() {
-            let response = ask("x.a.b.example.com.", record_types::ANY);
+            let response = ask("x.a.b.example.com.", Qtype::of(record_types::ANY));
             assert_eq!(response.rcode, ResponseCode::NoSuchDomain);
             assert!(response.answers.is_empty());
             assert_eq!(rdatas(&response.authorities, record_types::SOA).len(), 1);
@@ -6650,7 +6675,7 @@ ns.sub   IN A   192.0.2.20
         /// be the fix overshooting the bug.
         #[test]
         fn qclass_any_is_answered_from_the_in_zone() {
-            let mut msg = query("example.com.", record_types::SOA, false);
+            let mut msg = query("example.com.", Qtype::of(record_types::SOA), false);
             msg.queries[0].qclass = QueryClass::Any;
             let response = make_response(&msg, &server(), &DnsMetrics::new());
 
@@ -6720,7 +6745,7 @@ deep.a.b IN TXT "down here"
             let zone = &zones["example.com."];
             dnskeys_in(
                 &zone
-                    .query("example.com.", record_types::DNSKEY)
+                    .query("example.com.", Qtype::of(record_types::DNSKEY))
                     .into_iter()
                     .map(|r| ResourceRecord {
                         name: r.name.clone(),
@@ -6795,7 +6820,7 @@ ns.plain  IN A   192.0.2.30
                 let (zones, _keys) = signed_zones(DELEGATING_ZONE, nsec3);
                 let qname = "x.y.z.example.com.";
                 let response = make_response(
-                    &query(qname, record_types::A, true),
+                    &query(qname, Qtype::of(record_types::A), true),
                     &zones,
                     &DnsMetrics::new(),
                 );
@@ -6810,7 +6835,7 @@ ns.plain  IN A   192.0.2.30
                 assert_eq!(rdatas.len(), 1, "nsec3={nsec3}: no wildcard answer");
 
                 let proof = verify_rrset(
-                    &Rrset::new(qname, record_types::A, 1, &rdatas),
+                    &Rrset::new(qname, record_types::A, Class::new(1), &rdatas),
                     &rrsigs_in(&response.answers),
                     &keys_of(&zones),
                     "example.com.",
@@ -6858,7 +6883,7 @@ ns.plain  IN A   192.0.2.30
             for nsec3 in [false, true] {
                 let (zones, _keys) = signed_zones(SIGNED_ZONE, nsec3);
                 let response = make_response(
-                    &query("example.com.", record_types::ANY, true),
+                    &query("example.com.", Qtype::of(record_types::ANY), true),
                     &zones,
                     &DnsMetrics::new(),
                 );
@@ -6895,7 +6920,7 @@ ns.plain  IN A   192.0.2.30
                         .map(|r| r.rdata.clone())
                         .collect();
                     let proof = verify_rrset(
-                        &Rrset::new("example.com.", rtype, 1, &rdatas),
+                        &Rrset::new("example.com.", rtype, Class::new(1), &rdatas),
                         &signatures,
                         &keys,
                         "example.com.",
@@ -6917,7 +6942,7 @@ ns.plain  IN A   192.0.2.30
             for nsec3 in [false, true] {
                 let (zones, _keys) = signed_zones(SIGNED_ZONE, nsec3);
                 let response = make_response(
-                    &query("example.com.", record_types::ANY, false),
+                    &query("example.com.", Qtype::of(record_types::ANY), false),
                     &zones,
                     &DnsMetrics::new(),
                 );
@@ -6947,7 +6972,7 @@ ns.plain  IN A   192.0.2.30
             for nsec3 in [false, true] {
                 let (zones, _keys) = signed_zones(DELEGATING_ZONE, nsec3);
                 let response = make_response(
-                    &query("host.secure.example.com.", record_types::A, true),
+                    &query("host.secure.example.com.", Qtype::of(record_types::A), true),
                     &zones,
                     &DnsMetrics::new(),
                 );
@@ -6967,7 +6992,7 @@ ns.plain  IN A   192.0.2.30
 
                 let sigs = rrsigs_in(&response.authorities);
                 let proof = verify_rrset(
-                    &Rrset::new("secure.example.com.", record_types::DS, 1, &ds),
+                    &Rrset::new("secure.example.com.", record_types::DS, Class::new(1), &ds),
                     &sigs,
                     &keys_of(&zones),
                     "example.com.",
@@ -6994,7 +7019,7 @@ ns.plain  IN A   192.0.2.30
             for nsec3 in [false, true] {
                 let (zones, _keys) = signed_zones(DELEGATING_ZONE, nsec3);
                 let response = make_response(
-                    &query("host.plain.example.com.", record_types::A, true),
+                    &query("host.plain.example.com.", Qtype::of(record_types::A), true),
                     &zones,
                     &DnsMetrics::new(),
                 );
@@ -7024,7 +7049,7 @@ ns.plain  IN A   192.0.2.30
             let (zones, _keys) = signed_server(false);
             let metrics = DnsMetrics::new();
             let response = make_response(
-                &query("www.example.com.", record_types::A, true),
+                &query("www.example.com.", Qtype::of(record_types::A), true),
                 &zones,
                 &metrics,
             );
@@ -7037,7 +7062,7 @@ ns.plain  IN A   192.0.2.30
                 .map(|r| r.rdata.clone())
                 .collect();
             let proof = verify_rrset(
-                &Rrset::new("www.example.com.", record_types::A, 1, &rdatas),
+                &Rrset::new("www.example.com.", record_types::A, Class::new(1), &rdatas),
                 &rrsigs_in(&response.answers),
                 &keys_of(&zones),
                 "example.com.",
@@ -7052,7 +7077,7 @@ ns.plain  IN A   192.0.2.30
                 let (zones, _keys) = signed_server(nsec3);
                 let metrics = DnsMetrics::new();
                 let response = make_response(
-                    &query("gone.a.b.example.com.", record_types::A, true),
+                    &query("gone.a.b.example.com.", Qtype::of(record_types::A), true),
                     &zones,
                     &metrics,
                 );
@@ -7080,15 +7105,15 @@ ns.plain  IN A   192.0.2.30
             let metrics = DnsMetrics::new();
 
             let answer = make_response(
-                &query("www.example.com.", record_types::A, false),
+                &query("www.example.com.", Qtype::of(record_types::A), false),
                 &zones,
                 &metrics,
             );
             assert!(rrsigs_in(&answer.answers).is_empty());
-            assert!(!answer.edns().unwrap().unwrap().do_bit);
+            assert!(!answer.edns().unwrap().do_bit);
 
             let denial = make_response(
-                &query("nope.example.com.", record_types::A, false),
+                &query("nope.example.com.", Qtype::of(record_types::A), false),
                 &zones,
                 &metrics,
             );
@@ -7108,11 +7133,11 @@ ns.plain  IN A   192.0.2.30
             let (zones, _keys) = signed_server(false);
             let metrics = DnsMetrics::new();
             let response = make_response(
-                &query("www.example.com.", record_types::A, true),
+                &query("www.example.com.", Qtype::of(record_types::A), true),
                 &zones,
                 &metrics,
             );
-            assert!(response.edns().unwrap().unwrap().do_bit);
+            assert!(response.edns().unwrap().do_bit);
         }
 
         #[test]
@@ -7123,7 +7148,7 @@ ns.plain  IN A   192.0.2.30
             let metrics = DnsMetrics::new();
 
             let response = make_response(
-                &query("www.example.com.", record_types::A, true),
+                &query("www.example.com.", Qtype::of(record_types::A), true),
                 &zones,
                 &metrics,
             );
@@ -7165,7 +7190,7 @@ ns.plain  IN A   192.0.2.30
 
             let metrics = DnsMetrics::new();
             let response = make_response(
-                &query("www.example.com.", record_types::A, true),
+                &query("www.example.com.", Qtype::of(record_types::A), true),
                 &zones,
                 &metrics,
             );

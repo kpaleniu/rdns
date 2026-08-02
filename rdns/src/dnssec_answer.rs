@@ -30,7 +30,10 @@ use crate::dnssec::{canonical_name, rrsigs_in, Rrsig};
 use crate::dnssec_denial::{base32hex_encode, nsec3_hash, Nsec3};
 use crate::utils::record_types as rt;
 use crate::zone::{NameKind, Zone, ZoneRecord};
+use crate::Qtype;
 use crate::ResourceRecord;
+use crate::Rtype;
+use crate::Ttl;
 
 /// The signatures for an answer, and whether that answer came from a wildcard.
 #[derive(Debug, Default)]
@@ -51,7 +54,7 @@ pub struct AnswerSignatures {
 /// signatures but no published key cannot be validated by anyone, so serving
 /// its signatures only turns an insecure answer into a bogus one.
 pub fn is_signed(zone: &Zone) -> bool {
-    !zone.query(zone.origin(), rt::DNSKEY).is_empty()
+    !zone.query(zone.origin(), Qtype::of(rt::DNSKEY)).is_empty()
 }
 
 /// The RRSIGs covering the answer to `qname`/`qtype`.
@@ -62,28 +65,32 @@ pub fn is_signed(zone: &Zone) -> bool {
 /// name that was really signed (RFC 4035 §5.3.2). Changing the owner and
 /// leaving the label count alone is exactly the shape of a genuine wildcard
 /// answer.
-pub fn answer_signatures(zone: &Zone, qname: &str, qtype: u16) -> AnswerSignatures {
+pub fn answer_signatures(zone: &Zone, qname: &str, qtype: Qtype) -> AnswerSignatures {
     if !is_signed(zone) {
         return AnswerSignatures::default();
     }
     let qname = canonical_name(qname);
     let mut out = AnswerSignatures::default();
-    for record in zone.query(&qname, rt::RRSIG) {
+    for record in zone.query(&qname, Qtype::of(rt::RRSIG)) {
         let Some(sig) = rrsig_of(record) else {
             continue;
         };
-        // ANY asked for every type at the name, so it owes the signature over
-        // every RRset that came back. Filtering on `type_covered == 255` matches
-        // nothing — no RRSIG covers a QTYPE — which would have handed a client
-        // the whole of a signed name's data with no signatures on it, from a
-        // zone whose apex says it is signed. That is bogus to a validator, not
-        // merely unsigned.
-        if qtype != rt::ANY && sig.type_covered != qtype {
-            continue;
-        }
-        // The DNSSEC meta types are not in an ANY answer (see `Zone::of_type`),
-        // so the signatures over them are not owed either.
-        if qtype == rt::ANY && matches!(sig.type_covered, rt::RRSIG | rt::NSEC | rt::NSEC3) {
+        // Which signatures the answer owes is the same question `Zone::of_type`
+        // asks of the records themselves — "does this question select this
+        // type" — so it is the same function. This used to be two hand-written
+        // branches: ANY asked for every type at the name and so owes the
+        // signature over every RRset that came back, and filtering on
+        // `type_covered == 255` matches nothing, since no RRSIG covers a QTYPE.
+        // That handed a client the whole of a signed name's data with no
+        // signatures on it, from a zone whose apex says it is signed — bogus to
+        // a validator rather than merely unsigned. The DNSSEC meta types are
+        // excluded by the same rule, for the same reason they are excluded from
+        // an ANY answer (RFC 4035 §3.1.1).
+        //
+        // It survived `TODO.md` #13c's first half because this function still
+        // took a `u16` and its callers passed `qtype.to_u16()`: a newtype stops
+        // paying the moment a signature is widened back to let it through.
+        if !qtype.matches(sig.type_covered) {
             continue;
         }
         if sig.owner != qname {
@@ -191,7 +198,7 @@ pub fn delegation_proof(zone: &Zone, cut: &str) -> Vec<ResourceRecord> {
     }
     let cut = canonical_name(cut);
 
-    let ds = zone.query(&cut, rt::DS);
+    let ds = zone.query(&cut, Qtype::of(rt::DS));
     if !ds.is_empty() {
         let mut out: Vec<ResourceRecord> = ds.into_iter().map(to_resource).collect();
         out.extend(signatures_at(zone, &cut, rt::DS));
@@ -256,7 +263,7 @@ fn match_at_name(zone: &Zone, name: &str, out: &mut Vec<ResourceRecord>) {
     if !zone.holds_name(name) {
         return;
     }
-    for record in zone.query(name, rt::NSEC) {
+    for record in zone.query(name, Qtype::of(rt::NSEC)) {
         push_with_signatures(zone, record, out);
     }
 }
@@ -281,24 +288,22 @@ fn soa_signatures(zone: &Zone) -> Vec<ResourceRecord> {
         .collect()
 }
 
-/// The zone's MINIMUM, as an i32 TTL ceiling.
-fn negative_ttl_cap(zone: &Zone) -> i32 {
-    zone.query(zone.origin(), rt::SOA)
+/// The zone's MINIMUM, the ceiling a negative answer's TTLs take (RFC 2308 §3).
+fn negative_ttl_cap(zone: &Zone) -> Ttl {
+    zone.query(zone.origin(), Qtype::of(rt::SOA))
         .first()
         .and_then(|soa| match soa.rdata.parse() {
-            Ok(crate::ParsedRecord::SOA { minimum, .. }) => {
-                Some(minimum.min(i32::MAX as u32) as i32)
-            }
+            Ok(crate::ParsedRecord::SOA { minimum, .. }) => Some(Ttl::from_secs(minimum)),
             _ => None,
         })
-        .unwrap_or(0)
+        .unwrap_or(Ttl::ZERO)
 }
 
-fn signatures_at(zone: &Zone, name: &str, rtype: u16) -> Vec<ResourceRecord> {
+fn signatures_at(zone: &Zone, name: &str, rtype: Rtype) -> Vec<ResourceRecord> {
     if !zone.holds_name(name) {
         return Vec::new();
     }
-    zone.query(name, rt::RRSIG)
+    zone.query(name, Qtype::of(rt::RRSIG))
         .into_iter()
         .filter(|r| rrsig_of(r).is_some_and(|s| s.type_covered == rtype))
         .map(to_resource)
@@ -397,7 +402,7 @@ fn push_matching_nsec3(
     let Some(owner) = params.owner(zone, name) else {
         return;
     };
-    for record in zone.query(&owner, rt::NSEC3) {
+    for record in zone.query(&owner, Qtype::of(rt::NSEC3)) {
         push_with_signatures(zone, record, out);
     }
 }
@@ -488,6 +493,7 @@ mod tests {
     use crate::dnssec_key::{SigningAlgorithm, SigningKey};
     use crate::zone::parse_zone_file;
     use crate::zone_signer::{sign_zone, DenialChain, SigningPolicy};
+    use crate::Class;
     use crate::RecordData;
 
     const NOW: u64 = 1_700_000_000;
@@ -528,7 +534,7 @@ deep.a.b IN TXT "down here"
     fn keys_of(zone: &Zone) -> Vec<Dnskey> {
         dnskeys_in(
             &zone
-                .query(zone.origin(), rt::DNSKEY)
+                .query(zone.origin(), Qtype::of(rt::DNSKEY))
                 .into_iter()
                 .map(to_resource)
                 .collect::<Vec<_>>(),
@@ -536,7 +542,7 @@ deep.a.b IN TXT "down here"
     }
 
     /// The answer section rdnsd would build, plus what this module adds.
-    fn answer(zone: &Zone, qname: &str, qtype: u16) -> (Vec<RecordData>, AnswerSignatures) {
+    fn answer(zone: &Zone, qname: &str, qtype: Qtype) -> (Vec<RecordData>, AnswerSignatures) {
         let rdatas = zone
             .query(qname, qtype)
             .into_iter()
@@ -547,11 +553,11 @@ deep.a.b IN TXT "down here"
 
     /// Judge the answer with the validator, exactly as a client would: the
     /// records as they left, the signatures as they left, nothing from the zone.
-    fn judge(zone: &Zone, qname: &str, qtype: u16) -> RrsetProof {
+    fn judge(zone: &Zone, qname: &str, qtype: Qtype) -> RrsetProof {
         let (rdatas, sigs) = answer(zone, qname, qtype);
         let rrsigs = crate::dnssec::rrsigs_in(&sigs.records);
         verify_rrset(
-            &Rrset::new(qname, qtype, 1, &rdatas),
+            &Rrset::new(qname, Rtype::new(qtype.to_u16()), Class::new(1), &rdatas),
             &rrsigs,
             &keys_of(zone),
             ORIGIN,
@@ -565,7 +571,7 @@ deep.a.b IN TXT "down here"
             let zone = signed(chain.clone());
             assert!(
                 matches!(
-                    judge(&zone, "www.example.com.", rt::A),
+                    judge(&zone, "www.example.com.", Qtype::of(rt::A)),
                     RrsetProof::Verified { .. }
                 ),
                 "{chain:?}"
@@ -573,7 +579,7 @@ deep.a.b IN TXT "down here"
             // And only the signature that covers it: an RRSIG over the AAAA at
             // the same name is not evidence about the A, and sending it invites
             // a validator to try the wrong one.
-            let (_, sigs) = answer(&zone, "www.example.com.", rt::A);
+            let (_, sigs) = answer(&zone, "www.example.com.", Qtype::of(rt::A));
             assert_eq!(sigs.records.len(), 1, "{chain:?}");
             assert!(sigs.wildcard.is_none());
         }
@@ -587,7 +593,7 @@ deep.a.b IN TXT "down here"
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = signed(chain.clone());
             let qname = "anything.example.com.";
-            let proof = judge(&zone, qname, rt::A);
+            let proof = judge(&zone, qname, Qtype::of(rt::A));
             let RrsetProof::Verified {
                 wildcard: Some(wildcard),
                 ..
@@ -597,7 +603,7 @@ deep.a.b IN TXT "down here"
             };
             assert_eq!(wildcard, "*.example.com.");
 
-            let (_, sigs) = answer(&zone, qname, rt::A);
+            let (_, sigs) = answer(&zone, qname, Qtype::of(rt::A));
             assert_eq!(sigs.wildcard.as_deref(), Some("*.example.com."));
             // The RRSIG goes out owned by the name the client asked about.
             assert!(sigs.records.iter().all(|r| r.name == qname));
@@ -700,7 +706,7 @@ deep.a.b IN TXT "down here"
                     .map(|r| r.rdata.clone())
                     .collect();
                 let proof = verify_rrset(
-                    &Rrset::new(&record.name, record.rdata.rtype, 1, &rdatas),
+                    &Rrset::new(&record.name, record.rdata.rtype, Class::new(1), &rdatas),
                     &sigs,
                     &keys,
                     ORIGIN,
@@ -731,9 +737,11 @@ deep.a.b IN TXT "down here"
         // case, not a failure.
         let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
         assert!(!is_signed(&zone));
-        assert!(answer_signatures(&zone, "www.example.com.", rt::A)
-            .records
-            .is_empty());
+        assert!(
+            answer_signatures(&zone, "www.example.com.", Qtype::of(rt::A))
+                .records
+                .is_empty()
+        );
         assert!(negative_proof(
             &zone,
             "nope.example.com.",

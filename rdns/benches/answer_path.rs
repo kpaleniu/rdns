@@ -32,6 +32,8 @@
 //! The baseline pair is the point for `TODO.md` #11 and #13, both of which are
 //! single-digit-percent questions that no allocation count can answer.
 
+use rdns::Class;
+use rdns::Ttl;
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -48,7 +50,7 @@ use rdns::validation::RequestValidator;
 use rdns::zone::{parse_zone_file, Zone, ZoneRecord};
 use rdns::zone_signer::{sign_zone, SigningPolicy};
 use rdns::{
-    DnsMessage, OpCode, ParsedRecord, QueryClass, QuerySection, RecordData, ResourceRecord,
+    DnsMessage, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, RecordData, ResourceRecord,
     ResponseCode,
 };
 
@@ -63,7 +65,7 @@ mail IN MX  10 mx.example.com.
 mx   IN A   192.0.2.20
 ";
 
-fn query_message(qname: &str, qtype: u16) -> DnsMessage {
+fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
     DnsMessage {
         id: 0x1234,
         response: false,
@@ -83,10 +85,11 @@ fn query_message(qname: &str, qtype: u16) -> DnsMessage {
         answers: Vec::new(),
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     }
 }
 
-fn owned(zone: &Zone, name: &str, qtype: u16) -> Vec<ResourceRecord> {
+fn owned(zone: &Zone, name: &str, qtype: Qtype) -> Vec<ResourceRecord> {
     zone.query(name, qtype)
         .into_iter()
         .map(|r| ResourceRecord {
@@ -107,7 +110,7 @@ fn owned(zone: &Zone, name: &str, qtype: u16) -> Vec<ResourceRecord> {
 /// obviously dominating.
 fn answer(c: &mut Criterion) {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse the zone");
-    let wire = query_message("www.example.com.", record_types::A)
+    let wire = query_message("www.example.com.", Qtype::of(record_types::A))
         .to_bytes_within(512)
         .expect("serialize the query");
 
@@ -118,7 +121,7 @@ fn answer(c: &mut Criterion) {
     });
 
     group.bench_function("look up one A record", |b| {
-        b.iter(|| zone.query(black_box("www.example.com."), record_types::A))
+        b.iter(|| zone.query(black_box("www.example.com."), Qtype::of(record_types::A)))
     });
 
     // Into a warm buffer, because that is what the UDP workers do — one scratch
@@ -126,7 +129,7 @@ fn answer(c: &mut Criterion) {
     let mut response = DnsMessage::try_from_bytes(&wire).expect("parse");
     response.response = true;
     response.authoritive = true;
-    response.answers = owned(&zone, "www.example.com.", record_types::A);
+    response.answers = owned(&zone, "www.example.com.", Qtype::of(record_types::A));
     let mut scratch = Vec::with_capacity(4096);
     response
         .to_bytes_within_buf(4096, &mut scratch)
@@ -142,14 +145,14 @@ fn answer(c: &mut Criterion) {
     // A full-size answer is a different shape: 4 KB of records sharing a suffix,
     // where name compression and the answer vector are doing real work rather
     // than being one record's worth of overhead.
-    let mut big = query_message("example.com.", record_types::A);
+    let mut big = query_message("example.com.", Qtype::of(record_types::A));
     big.response = true;
     big.authoritive = true;
     for i in 0..60 {
         big.answers.push(ResourceRecord {
             name: format!("host{i}.example.com."),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
                 192,
                 0,
@@ -174,7 +177,7 @@ fn answer(c: &mut Criterion) {
     group.bench_function("one whole answer", |b| {
         b.iter(|| {
             let parsed = DnsMessage::try_from_bytes(black_box(&wire)).expect("parse");
-            let answers = owned(&zone, &parsed.queries[0].qname, record_types::A);
+            let answers = owned(&zone, &parsed.queries[0].qname, Qtype::of(record_types::A));
             let mut out = parsed.clone();
             out.response = true;
             out.authoritive = true;
@@ -197,8 +200,8 @@ fn zone_index(c: &mut Criterion) {
     for i in 0..10_000u32 {
         zone.add_record(ZoneRecord {
             name: format!("host{i}"),
-            ttl: 3600,
-            class: 1,
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
                 192,
                 0,
@@ -211,10 +214,20 @@ fn zone_index(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("zone");
     group.bench_function("hit in a 10k-record zone", |b| {
-        b.iter(|| zone.query(black_box("host9000.example.com."), record_types::A))
+        b.iter(|| {
+            zone.query(
+                black_box("host9000.example.com."),
+                Qtype::of(record_types::A),
+            )
+        })
     });
     group.bench_function("miss in a 10k-record zone", |b| {
-        b.iter(|| zone.query(black_box("nothing-here.example.com."), record_types::A))
+        b.iter(|| {
+            zone.query(
+                black_box("nothing-here.example.com."),
+                Qtype::of(record_types::A),
+            )
+        })
     });
     group.finish();
 }
@@ -228,7 +241,7 @@ fn admission(c: &mut Criterion) {
     let limiter = RateLimiter::with_defaults();
     let validator = RequestValidator::with_defaults();
     let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-    let packet = query_message("www.example.com.", record_types::A)
+    let packet = query_message("www.example.com.", Qtype::of(record_types::A))
         .to_bytes_within(512)
         .expect("serialize");
 
@@ -258,14 +271,14 @@ fn shared_state(c: &mut Criterion) {
     let cache = DnsCache::new(20_000);
     let record = |name: &str| ResourceRecord {
         name: name.to_string(),
-        class: 1,
-        ttl: 300,
+        class: Class::new(1),
+        ttl: Ttl::from_secs(300),
         rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1)))
             .expect("build the rdata"),
     };
     for i in 0..20_000 {
         let name = format!("fill{i}.example.com.");
-        cache.put(&name, 1, vec![record(&name)]);
+        cache.put(&name, Qtype::of(record_types::A), vec![record(&name)]);
     }
     let mut n = 0u64;
     group.bench_function("100 puts into a full cache", |b| {
@@ -273,7 +286,11 @@ fn shared_state(c: &mut Criterion) {
             for _ in 0..100 {
                 n += 1;
                 let name = format!("new{n}.example.com.");
-                cache.put(black_box(&name), 1, vec![record(&name)]);
+                cache.put(
+                    black_box(&name),
+                    Qtype::of(record_types::A),
+                    vec![record(&name)],
+                );
             }
         })
     });
@@ -282,10 +299,13 @@ fn shared_state(c: &mut Criterion) {
     // scan used to be quadratic in (`CLAUDE.md` §10).
     let logger = QueryLogger::new();
     for i in 0..1_000u32 {
-        logger.log_query(IpAddr::V4(Ipv4Addr::from(i.to_be_bytes())), Some(1));
+        logger.log_query(
+            IpAddr::V4(Ipv4Addr::from(i.to_be_bytes())),
+            Some(Qtype::of(record_types::A)),
+        );
     }
     group.bench_function("log a query with 1k sources tracked", |b| {
-        b.iter(|| logger.log_query(black_box(ip_of(12_345)), Some(1)))
+        b.iter(|| logger.log_query(black_box(ip_of(12_345)), Some(Qtype::of(record_types::A))))
     });
 
     group.finish();
@@ -337,13 +357,21 @@ fn dnssec(c: &mut Criterion) {
     )
     .expect("sign the zone");
 
-    let dnskeys = dnskeys_in(&owned(&signed, "example.com.", record_types::DNSKEY));
-    let rrsigs = rrsigs_in(&owned(&signed, "example.com.", record_types::RRSIG));
-    let rdatas: Vec<_> = owned(&signed, "example.com.", record_types::DNSKEY)
+    let dnskeys = dnskeys_in(&owned(
+        &signed,
+        "example.com.",
+        Qtype::of(record_types::DNSKEY),
+    ));
+    let rrsigs = rrsigs_in(&owned(
+        &signed,
+        "example.com.",
+        Qtype::of(record_types::RRSIG),
+    ));
+    let rdatas: Vec<_> = owned(&signed, "example.com.", Qtype::of(record_types::DNSKEY))
         .into_iter()
         .map(|r| r.rdata)
         .collect();
-    let rrset = Rrset::new("example.com.", record_types::DNSKEY, 1, &rdatas);
+    let rrset = Rrset::new("example.com.", record_types::DNSKEY, Class::new(1), &rdatas);
     let now = current_unix_timestamp();
 
     let mut group = c.benchmark_group("dnssec");
@@ -370,11 +398,15 @@ fn dnssec(c: &mut Criterion) {
         let signed = sign_zone(&zone, &keys, &SigningPolicy::valid_for(now, 30 * 86_400))
             .expect("sign the zone");
 
-        let records = owned(&signed, "many.example.com.", record_types::A);
+        let records = owned(&signed, "many.example.com.", Qtype::of(record_types::A));
         assert_eq!(records.len(), count, "the RRset is the size claimed");
-        let rrsigs = rrsigs_in(&owned(&signed, "many.example.com.", record_types::RRSIG));
+        let rrsigs = rrsigs_in(&owned(
+            &signed,
+            "many.example.com.",
+            Qtype::of(record_types::RRSIG),
+        ));
         let rdatas: Vec<_> = records.into_iter().map(|r| r.rdata).collect();
-        let rrset = Rrset::new("many.example.com.", record_types::A, 1, &rdatas);
+        let rrset = Rrset::new("many.example.com.", record_types::A, Class::new(1), &rdatas);
 
         let plural = if count == 1 { "record" } else { "records" };
         group.bench_function(format!("verify an RRset of {count} {plural}"), |b| {

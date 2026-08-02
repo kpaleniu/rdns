@@ -31,11 +31,15 @@
 //! sending the whole zone.
 
 use crate::error::{TransferError, TransferResult};
+use crate::Class;
+use crate::Qtype;
+use crate::Rtype;
+use crate::Ttl;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use crate::transfer::{axfr_messages, pack_transfer_messages};
-use crate::utils::record_types as rt;
+use crate::utils::{absolute_lowered, record_types as rt};
 use crate::zone::{Zone, ZoneRecord};
 use crate::{DnsMessage, ResourceRecord};
 
@@ -197,13 +201,14 @@ impl DeltaLog {
     }
 }
 
+/// The form a zone name is filed under here: absolute and ASCII-folded.
+///
+/// One line, because the rule lives in [`crate::utils::absolute_lowered`] — this
+/// was a seventh hand-written copy of it (`TODO.md` #13b), and the copies were
+/// worth removing not because any of them was wrong but because the next one
+/// would have been.
 fn key(zone: &str) -> String {
-    let mut key = zone.to_string();
-    if !key.ends_with('.') {
-        key.push('.');
-    }
-    key.make_ascii_lowercase();
-    key
+    absolute_lowered(zone).into_owned()
 }
 
 /// What changed between two versions of a zone.
@@ -268,9 +273,9 @@ pub fn diff(old: &Zone, new: &Zone) -> Option<ZoneDelta> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RecordKey {
     lowercase_name: String,
-    rtype: u16,
-    class: u16,
-    ttl: i32,
+    rtype: Rtype,
+    class: Class,
+    ttl: Ttl,
     rdata: Box<[u8]>,
     /// Not part of the ordering in practice — it is a function of
     /// `lowercase_name` — but carried so the record can be rebuilt with the case
@@ -312,7 +317,7 @@ fn is_apex_soa(zone: &Zone, record: &ZoneRecord) -> bool {
 }
 
 fn apex_soa(zone: &Zone) -> Option<ResourceRecord> {
-    zone.query(zone.origin(), rt::SOA)
+    zone.query(zone.origin(), Qtype::of(rt::SOA))
         .first()
         .map(|soa| ResourceRecord {
             name: zone.origin().to_string(),
@@ -564,12 +569,13 @@ mod tests {
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
                 qname: "example.com.".to_string(),
-                qtype: rt::IXFR,
+                qtype: Qtype::of(rt::IXFR),
                 qclass: QueryClass::IN,
             }],
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         };
         if let Some(serial) = client_serial {
             msg.authorities = vec![apex_soa(&zone_at(serial, "")).unwrap()];
@@ -642,8 +648,8 @@ mod tests {
         let delta = diff(&old, &new).unwrap();
         assert_eq!(delta.deleted.len(), 1);
         assert_eq!(delta.added.len(), 1);
-        assert_eq!(delta.deleted[0].ttl, 3600);
-        assert_eq!(delta.added[0].ttl, 60);
+        assert_eq!(delta.deleted[0].ttl, Ttl::from_secs(3600));
+        assert_eq!(delta.added[0].ttl, Ttl::from_secs(60));
     }
 
     // -----------------------------------------------------------------

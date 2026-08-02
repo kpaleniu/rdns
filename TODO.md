@@ -15,11 +15,13 @@ are the part of this file that is not written down anywhere else. Finished work
 is one line each under "Done so far", pointing at the commit that carries its
 reasoning, RFC citations and verification.
 
-**The short version, if you read nothing else:** **every numbered item on this
-page is closed.** The operational shell is finished; #9's five-way review went in
-full, its last performance item closed by measuring rather than fixing it; and
-#12's audit found no reachable panic and left a fuzzer behind to keep it that
-way. What is left is a stretch goal (#11), a feature nobody has scheduled (#10),
+**The short version, if you read nothing else:** **every numbered item through
+#12 is closed, and #13 is planned with nothing landed.** The operational shell is
+finished; #9's five-way review went in full, its last performance item closed by
+measuring rather than fixing it; and #12's audit found no reachable panic and
+left a fuzzer behind to keep it that way. What is left is a stretch goal (#11), a
+feature nobody has scheduled (#10), **#13 — five staged commits that move
+invariants this codebase currently re-asserts per call site into the types**,
 and the first thing worth doing: **CI runs now, and its first run failed.** Build
 and test with the four commands at the top of `CLAUDE.md`; `cargo bench -p rdns`
 is the fifth. **Do not push** — commit locally and leave it; every push spends
@@ -535,8 +537,9 @@ The numbers are **stable identifiers, not reading order.** They are referenced
 from the code (`ixfr.rs:16` points at "#7 step 6") and from each other, so they
 are never renumbered.
 
-**Everything numbered is closed.** What each was, and where its reasoning now
-lives — the commit that closed it, and the rule it became in `CLAUDE.md`:
+**Everything numbered through #12 is closed; #13 is planned and unstarted.** What
+each was, and where its reasoning now lives — the commit that closed it, and the
+rule it became in `CLAUDE.md`:
 
 | # | what it was | closed |
 |---|---|---|
@@ -548,6 +551,7 @@ lives — the commit that closed it, and the rule it became in `CLAUDE.md`:
 | **10** | dynamic UPDATE (RFC 2136) | **started 2026-08-02.** The reading half is in (`rdns/src/update.rs`: §2.4/§2.5 forms, §3.1, §3.2, §3.4.1's prescan); the writing half — apply, serial, re-signing, journal — is not. #7 step 6 still waits on it |
 | **11** | data layout and CPU cache friendliness | **a stretch goal, not scheduled.** Its measurement harness exists now (criterion, `--baseline`); what it still lacks is the *diagnostic* half — `perf stat`'s cache-miss and branch-miss counters, which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns) is the number it would have to move |
 | **12** | pre-authentication panics | **audited 2026-08-01.** No reachable panic in 1.4M mutated inputs; two mutex-poisoning fixes; `rdns/tests/no_input_panics.rs` left behind as the guard |
+| **13** | making illegal states unrepresentable: `OpCode`'s sentinel, the eleven name normalizations, QTYPE-vs-RTYPE, `Ttl` + `Class` + OPT out of the additional section, `Name`/`NameKey` | **started 2026-08-02. 13a-13d done**; only 13e remains, and it is the one stage the section says is legitimate to abandon. Every stage gated on `rdns/tests/allocations.rs` and every one has held its counts; 13b added a fifteenth measurement that went 2 to 0 |
 
 **What the letters mean**, because comments in the code and lines further down
 this page still name them and the sections they named are gone:
@@ -581,7 +585,7 @@ the useful part** (`CLAUDE.md` §11 — correct in place, never quietly):
 
 ### Where to pick up next
 
-Nothing numbered is open, so this is a choice rather than a queue.
+#13 is open and staged; everything else here is a choice rather than a queue.
 
 > **1. Push, and read the second CI run.** Everything the first one reported is
 > fixed locally and unpushed. There were two findings, not three:
@@ -602,7 +606,16 @@ Nothing numbered is open, so this is a choice rather than a queue.
 > image has no clippy package, so that half had only ever run on Windows. They
 > may have passed silently; nobody has looked.
 >
-> **2. #10, dynamic UPDATE (RFC 2136)** — **started, one piece in.**
+> **2. #13e, `Name`/`NameKey` — or the decision not to.** 13a through 13d are
+> done (see §13). 13e is the last stage and the one the section says is
+> legitimate to abandon: it has an unsettled prerequisite that 13b surfaced and
+> did not answer — whether a name in this codebase is in *presentation* form
+> (escapes intact, so `str::len()` is not the wire length) or something else,
+> which `zone.rs:885` and `dname_to_bytes` currently disagree about. **Settle
+> that first.** If the answer needs its own design, stop after 13d and file the
+> rest; four fifths of §13's value is already in.
+>
+> **3. #10, dynamic UPDATE (RFC 2136)** — **started, one piece in.**
 > `rdns/src/update.rs` reads an UPDATE and checks its prerequisites; nothing
 > applies one yet. The next piece is applying the changes, and it must be
 > designed together with the serial: an UPDATE bumps it and so does re-signing
@@ -610,8 +623,17 @@ Nothing numbered is open, so this is a choice rather than a queue.
 > something older. Read §10 below before starting — it says which four of the
 > six original items are still on the far side of the seam.
 >
-> **3. #11, cache locality** — wanted, but blocked on hardware counters this
-> machine cannot read. Its harness is ready.
+> **4. The rest of #13 (13b-13e)** — subtraction first (13b deletes six
+> duplicate normalizations, including a `to_lowercase` in the public API that
+> §8 forbids), then the two zero-cost newtypes, then the deep one. 13d is where
+> the work is: OPT comes out of the additional section, which is what lets the
+> TTL clamp move to the parse boundary, and the two halves land in that order
+> because the second is only correct after the first.
+>
+> **5. #11, cache locality** — wanted, but blocked on hardware counters this
+> machine cannot read. Its harness is ready. Note that **#13e deliberately stops
+> short of this**: a `Name` with inline or wire-format storage is #11's question,
+> and doing both at once means neither measurement can be read.
 
 **Read `benches/answer_path.rs`'s header before quoting anything from it.** One
 whole answer is 522 ns and one `sendto`+`recvfrom` pair is 4 µs, so the entire
@@ -741,6 +763,781 @@ the process rather than being swallowed by a per-datagram task. The path is
 fuzz-clean with a permanent regression test, so the trade costs nothing today,
 and the alternative — respawning a panicked worker and counting it — would turn a
 defect into a metric nobody reads.
+
+### 13. Making illegal states unrepresentable — planned 2026-08-02, nothing landed
+
+**The argument is an asymmetry in this repo's own history, not a preference.**
+Of the defects `CLAUDE.md` records, two were fixed by *changing a type* —
+`QueryClass::Other(u16)` and `ResponseCode::Other(u16)`, both replacing a
+sentinel that could not carry what it stood for — and neither has come back.
+Every other fix in the same class was a correction applied *at a call site*: the
+TTL clamp, the ANY comparison, the case folding, the class check. Those keep
+reappearing, one module at a time, because the next call site is written by
+someone who has not read the last one. §2 already says this out loud — "if a
+value has an invariant, make it unrepresentable without it rather than
+re-asserting it per site" — and then the codebase re-asserts it per site
+fourteen times for TTLs alone.
+
+So this is not new work so much as finishing the shape of work already done. It
+is also, deliberately, **not a rewrite**: the four conflations below are each a
+newtype or an enum variant over a primitive that is already there, and three of
+the four are provably zero-cost. The one that is not — 13d — buys a malformed
+state that is currently representable and ten linear scans that currently run
+per message.
+
+**What this deliberately does not do**, so the scope does not creep:
+
+- **No `Name` with inline or wire-format storage.** A 255-byte inline buffer or
+  a length-prefixed wire form would beat `String` on cache locality, and that is
+  #11's question, not this one. Doing both at once means neither's measurement
+  can be read.
+- **No typestate on the answer path.** "A response that has had its OPT mirrored"
+  as a distinct type from one that has not would catch §7's early-`return` bug,
+  and it would also make every function in `rdnsd` generic over a marker. Not
+  worth it for one bug that now has a test.
+- **No `Zone` generic over class.** The zone parser refuses non-IN records, which
+  is what makes the class-blind index correct. Encoding that in a type parameter
+  would be honest and would buy nothing, because there is exactly one instantiation.
+
+#### How every stage is proved not to have cost anything
+
+This is the gate, and it comes first because it is the thing that decides whether
+a stage lands. Each stage is measured **before and after, on the same machine,
+in the same session**:
+
+```sh
+cargo test -p rdns --test allocations -- --nocapture   # 14 exact counts
+cargo bench -p rdns -- --save-baseline before          # then do the stage
+cargo bench -p rdns -- --baseline before
+```
+
+**The allocation counts are the real gate.** They are exact, they do not care
+what else is running, and `TODO.md`'s "Current state" records that they read the
+same on Windows and on the Linux side — `dhat` counts calls into the global allocator, so
+the number does not depend on which malloc is underneath. The bar is **identical
+counts, or lower**. A count that moves up may not be waved through as noise,
+because it cannot be noise; it may only be accepted with the reason written next
+to the assertion, which is `CLAUDE.md` §10's rule about never lowering a floor
+without proving why it moved, pointed the other way.
+
+Criterion is the backstop for anything that trades an allocation for time. Read
+`benches/answer_path.rs`'s header before quoting any of it: one whole answer is
+522 ns against a 3.6-4.1 µs `sendto`+`recvfrom` pair, so the entire bench suite
+is about 6% of what a query costs a server. Nothing in this section should be
+reported as an end-to-end win.
+
+#### 13a. `OpCode` is the third sentinel, and it is live — **done**
+
+**Verified by provoking it**, not by reading the derive. A probe over all
+sixteen opcodes, parsed with `DnsMessage::try_from_bytes` and serialized back
+with `to_bytes`:
+
+```
+opcode  3 -> Unknown -> 15  CHANGED
+opcode  6 -> Unknown -> 15  CHANGED     (and 7, 8, 9, 10, 11, 12, 13, 14)
+```
+
+**Eleven of sixteen opcodes are rewritten on the way out.** `OpCode` still has
+an `Unknown = 15` sentinel and is still parsed at `lib.rs:1118` as
+`OpCode::from_u8((hi >> 3) & 0x0f).unwrap_or(OpCode::Unknown)` — the exact line
+§2 describes twice and calls the smell.
+
+**Opcode 6 is DSO, and that is what makes this concrete rather than
+prophylactic.** Checked against the IANA DNS OpCodes registry rather than from
+memory: 0 Query, 1 IQuery (obsolete), 2 Status, 4 Notify, 5 Update and **6 DNS
+Stateful Operations (RFC 8490)** are assigned; 3 and 7-15 are Unassigned. So a
+DSO-capable client — and this codebase already knows DSO exists, it carries
+`ResponseCode::DsoTypeNotImplemented` for RFC 8490's rcode 11 — sends opcode 6
+and gets a reply saying opcode 15.
+
+It reaches the wire. `rdnsd`'s `make_response` sets `opcode: msg.opcode`
+(`main.rs:428`) and the NOTIMP branch fifty lines down echoes it. RFC 1035
+§4.1.1 says that field "is set by the originator of a query and copied into the
+response", and `CLAUDE.md` §8 already carries the rule — "The opcode is the
+client's. Echo it" — which the code obeys for the five opcodes it has names for
+and breaks for the sixth that exists plus the nine that do not yet.
+
+- Replace with `Other(u8)` and hand-rolled `from_u8`/`to_u8` that are each
+  other's inverse over all sixteen values, exactly as `QueryClass` and
+  `ResponseCode` are over their range. `Query`, `IQuery`, `Status`, `Notify` and
+  `Update` keep their names; nothing that matches on them changes.
+- **This removes the last `num_derive` user in the workspace.** `lib.rs:2-3` are
+  the only imports of it, so `num-derive` and `num-traits` come out of
+  `rdns/Cargo.toml` with it. §14's rule about a dependency that does not do
+  anything at run time applies: the derive's whole contribution here was the
+  `Option` that invited the `unwrap_or`.
+- **Regression test:** the probe above, asserting every one of the sixteen values
+  round-trips. It fails against today's code for eleven inputs, which is the
+  §1 requirement — watch it fail, then fix it.
+- Cost: none. Churn: one enum, one parse site, one serialize site.
+
+**Done.** Landed as planned, with three corrections worth keeping:
+
+- **`Other(u8)`, not `Other(u16)`** as the plan first wrote it. OPCODE is a
+  four-bit field; a `u16` payload would have made a value the wire cannot carry
+  representable, which is this section's own mistake in miniature.
+  `from_u8` masks to four bits, so the invariant is established at the boundary
+  once (§2) rather than re-checked when the byte is packed.
+- **"`num-derive` and `num-traits` come out" was half right.** Both lines left
+  `rdns/Cargo.toml`, and `num-derive` left the dependency graph entirely — but
+  **`num-traits` is still in `Cargo.lock`**, pulled in by `criterion`. It is a
+  *dev*-dependency: `cargo tree -p rdns -e normal` has no `num-*` in it at all,
+  so nothing ships in a binary. The lock went **144 → 143**, and the one entry
+  that left was `num-derive` — measured with
+  `git show HEAD:Cargo.lock | grep -c '^\[\[package\]\]'`, because the first
+  number written here was a guess and was wrong. The saving is one crate
+  compiled at build time, not a smaller shipped graph. Claiming a dependency
+  "comes out" without reading the inverted tree is §4's rule about not stating
+  what something does without opening it.
+- **`deny.toml` named `num-derive` as one of the two syn-2 users**, so it needed
+  correcting with this change. It was never only two: the syn 2/3 duplicate is
+  still there, held by `clap_derive`, `tokio-macros` and `tracing-attributes`,
+  and the skip entry stays.
+
+Verified: the new test fails at opcode 3 against the old enum and passes against
+the new one; `cargo test --workspace` is 631/1/1/93/3 (the lib count is +1 for
+the new test); clippy and fmt clean; `cargo deny check` reports advisories,
+bans, licenses and sources ok. **All fourteen allocation counts unchanged** —
+3, 4, 3, 2, 1, 0, 2, 7, 208, 922, 24, 19, 0, 22 before and after.
+
+#### 13b. Delete the name-normalization trap, then converge the copies — **done**
+
+**Do this before 13e, not as part of it.** There are **nine** places that fold a
+domain name into a comparable form in this codebase — counted, not estimated,
+and the list below is all of them. Typing nine copies produces nine typed copies.
+Delete the duplicates first.
+
+- **`utils::normalize_domain_name` is a loaded gun in the public API.** It is
+  `name.to_lowercase().trim_end_matches('.')` — the Unicode fold that
+  `utils::ascii_lowered`'s own doc comment spends a paragraph forbidding, and
+  that §8 names: `str::to_lowercase` folds U+212A KELVIN SIGN into `k`, so two
+  names that differ on the wire come out equal and any table keyed on the result
+  merges them. It has **no callers** outside its own tests, and it is the
+  obviously-named function a new module would reach for.
+  Delete it and `normalize_domain_name_for_comparison` with it.
+- **`resolver::normalize` (1761) and `special_names::normalize` (178) are the
+  same function**, written twice, in the shape §7 is entirely about. Both
+  lowercase and append a trailing dot; both allocate unconditionally.
+- **`special_names::in_zone` (174) is a fourth copy of `utils::is_at_or_under`**,
+  and it allocates a `format!("{}.{zone}")` per call where the shared one
+  compares bytes and allocates nothing. It gets the label-boundary rule right,
+  which is the only reason this is a cleanup and not a finding.
+- **`resolver::names_equal` allocates two `String`s per comparison**, via two
+  `normalize` calls, and it is called inside `.any()` loops over the answer
+  section (`resolver.rs:938`, and again through `label_count`). This is the one
+  place in the section where the type work is expected to *reduce* the
+  allocation count rather than hold it — record the before and after.
+- The inline foldings in `cache.rs:{92,169}`, `ixfr.rs:{298,396}`, `xfr.rs:522`,
+  `rfc5011.rs:{250,280}` and `dnssec_denial.rs:{310,311,366}` each answer a
+  slightly different question (some absolutize, some do not). Converge them onto
+  `utils` **only where they are asking the same question** — a difference that
+  turns out to be real is a second function with a name that says so, not a
+  parameter.
+
+Verification: `zone::lookup_key`'s borrowing behaviour must not regress, since
+the allocation test measures it directly (the three-lookups-per-query
+measurement, `allocations.rs:269`).
+
+**Done**, and the count above was low. What landed, and what the plan had not
+seen:
+
+- **`utils` gained three functions and lost two.** `names_equal` (allocation-free
+  comparison), `absolute_lowered` (the `Cow` form of the shared `normalize`) and
+  `label_count` (which never needed to normalize at all) replace
+  `normalize_domain_name` and `normalize_domain_name_for_comparison`, the
+  `to_lowercase` pair §8 forbids.
+- **Nine was not the number.** The list counted the *folds* and missed two more
+  implementations entirely: **`xfr::in_bailiwick`**, a sixth copy of "is this
+  name at or under that one" — down-casing both sides into fresh `String`s — and
+  **`ixfr::key`**, a seventh hand-written `absolute_lowered`. Both were found by
+  reading the remaining sites rather than trusting the list, which is the only
+  reason they are in this commit.
+- **Folding `xfr::in_bailiwick` in was a small behaviour fix, not only a
+  cleanup.** It required the two names to agree about the trailing dot —
+  `strip_suffix` on an absolute name with a relative zone simply failed —
+  where `is_at_or_under` treats the dot as optional on either side.
+- **Four sites were deliberately left alone**, because they are not copies of
+  this rule: `cache` already calls `ascii_lowered`; `rfc5011` and
+  `ixfr::record_key` call `str::to_ascii_lowercase`, which *is* the RFC 4343
+  fold and is not the trap (the trap is `to_lowercase`); and `dnssec_denial`'s
+  is DNSSEC **canonical form** (RFC 4034 §6.1), a different rule that happens to
+  coincide. A difference that turns out to be real is a second function, not a
+  parameter — the plan said so and it applied to more sites than expected.
+- **Two tests were deleted, not added.** Once `is_subdomain` and `in_bailiwick`
+  became `utils::is_at_or_under`, `resolver::test_bailiwick_helpers` and
+  `xfr::test_bailiwick` were asserting things about another module's function
+  that `utils` already asserts, down to the same `notexample.com.` case. Both
+  modules keep the tests of what they *decide* with the answer
+  (`test_out_of_bailiwick_referral_is_not_followed`,
+  `test_out_of_bailiwick_records_are_refused`), which is the half that is theirs.
+  The lib count is **629**: +3 new `utils` tests, -3 deleted trap tests, -2
+  duplicates.
+
+Two more numbers written here from memory and corrected by counting, which is
+now a pattern worth naming rather than a coincidence: a comment claimed
+`special_names` consults "nineteen" private reverse zones (it is **27**), and
+another named a test `test_referral_must_be_in_bailiwick` that does not exist.
+Both were caught before the commit, both by grepping the thing being described.
+
+Measured: the fourteen existing allocation counts are **unchanged**, and
+`allocations.rs` gained a fifteenth measurement that records the one thing this
+stage was expected to improve — **comparing two names went 2 allocations to 0**.
+The old shape is measured beside the new one rather than described, because an
+assertion that zero is zero is not evidence that anything moved (§10).
+
+#### 13c. `Qtype` and `Rtype` are different things and are both `u16` — **done**
+
+§8 already says "A QTYPE is not an RTYPE and a QCLASS is not a CLASS", and
+records what it cost: `record_type_code(&r.rdata) == qtype` matched nothing for
+ANY, so a QTYPE=ANY question at a name with data came back as an empty NOERROR
+plus the SOA — a NODATA for a name that has data, and none of the shapes
+RFC 8482 §4 permits. That was fixed **in `zone::of_type`**. The comparison is
+still writable everywhere else, and `rdnsr` writes it twice:
+
+- **`resolver.rs:938`** — `rr.rdata.rtype == query.qtype` decides `got_type`,
+  which decides whether to stop chasing a CNAME.
+- **`resolver.rs:1502`** — the same comparison decides `holds_the_answer`, and
+  the next line is `let negative = !holds_the_answer`, which sends the DNSSEC
+  validator looking for a denial proof.
+
+For QTYPE=ANY both are unconditionally false. **The reachability half is
+settled: it is fully reachable.** `rdnsr/src/main.rs`, `rdns/src/resolver.rs`
+and `rdns/src/validation.rs` contain **no mention of ANY or 255 at all** — the
+QTYPE is never checked, never rejected and never special-cased anywhere on the
+resolver's path, so `dig ANY example.com @rdnsr` reaches those two comparisons
+directly. That upgrades 13c from prophylactic to a fix for something a client
+can do today.
+
+**The consequence half is a hypothesis and must be tested, not assumed.** The
+chain to check is `holds_the_answer == false` → `negative = true` → the
+validator looks for a denial proof in the authority section of an answer that is
+not negative → no proof → the verdict is not Secure → under `--dnssec-validate`,
+which fails closed, SERVFAIL for a query that had a perfectly good answer. Write
+that test first and watch it fail, per §1; if the chain breaks somewhere in the
+middle, the finding is smaller than it looks and the section says so.
+
+Meanwhile the ANY rule itself exists in four places and disagrees in spelling:
+`zone::of_type` (which also carries the RFC 4035 §3.1.1 exclusion of RRSIG,
+NSEC and NSEC3), `dnssec_answer.rs:81` and `:86`, and `nsec_cache.rs:48`, which
+writes it as `qtype != 255`.
+
+```rust
+#[repr(transparent)] pub struct Rtype(u16);   // a type a record has
+#[repr(transparent)] pub struct Qtype(u16);   // a type a question asks for
+
+impl Qtype {
+    /// The only comparison of a question's type against stored data.
+    /// ANY is QTYPE 255 and no RR *is* that type (RFC 1035 §3.2.3); the three
+    /// DNSSEC meta types stay out of an ANY answer (RFC 4035 §3.1.1).
+    pub fn matches(self, rtype: Rtype) -> bool { … }
+}
+```
+
+`Rtype` converts into `Qtype` — every RTYPE is a legal QTYPE. The reverse
+conversion does not exist, which is what makes `rr.rdata.rtype == query.qtype`
+stop compiling in all four places at once. AXFR (252), IXFR (251) and ANY (255)
+become `Qtype` constants with no `Rtype` counterpart, which is the same statement
+`utils::record_types`' comments already make in prose.
+
+Cost: none — `repr(transparent)` `Copy` newtypes over `u16`, identical codegen.
+Churn is the wide part: `qtype` appears ~180 times (52 in `resolver.rs`, 35 in
+`rdnsd`) and `rtype` ~280 (45 each in `zone_signer.rs` and `update.rs`). Almost
+all of it is mechanical, and the compiler drives it.
+
+**Split into two commits, and `Qtype` is the first.** ~520 sites across both
+newtypes is not one reviewable diff, and `Qtype` alone is what makes the bad
+comparison stop compiling — `rr.rdata.rtype == query.qtype` is `u16 == Qtype`
+whichever side is newtyped first. `Rtype` follows and tightens
+`Qtype::matches(u16)` to `Qtype::matches(Rtype)`. Same forced-order reasoning as
+13d's three.
+
+**The finding was confirmed before anything was newtyped, and it held.** The
+test 13c asked for — the same signed A RRset that
+`test_signed_hierarchy_validates_as_secure` calls Secure, asked for with
+QTYPE=ANY instead of A — failed against the old code with:
+
+```
+Bogus("www.example.test. was denied without an NSEC or NSEC3 proof")
+```
+
+A signed answer that verifies, reported as an unproven denial, which under
+`--dnssec-validate` is a SERVFAIL for a good answer. The hypothesized chain was
+right end to end: `holds_the_answer` false → `negative` true → the authority
+section is searched for a proof a positive answer has no reason to carry. It now
+passes.
+
+**Three methods, because there are three different questions**, and collapsing
+them is how the bug happened:
+
+- `Qtype::matches(rtype)` — does this question select this stored record. The
+  only cross-space comparison, and the only place ANY's meaning lives.
+- `Qtype::is(rtype)` — is the question for exactly this type. Said out loud at
+  the sites that mean it (`qtype.is(rt::DS)`, `qtype.is(rt::CNAME)`), so they do
+  not read like a `matches` that forgot about ANY.
+- `Qtype::of(rtype)` — `const`, so `utils::record_types` stays the one registry
+  of numbers rather than growing a `Qtype` twin that can drift.
+
+**`zone::of_type` lost its copy of the rule** — it was the place the ANY case
+was got *right*, and its twenty-line doc comment explaining ANY and the three
+DNSSEC meta types now lives on `Qtype::matches` with a pointer left behind. Two
+tellings of one rule is where 13c started.
+
+**The mechanical half was driven by rustc's own JSON spans, after regexes
+over-matched six times.** Wrapping "the last argument that looks like a type
+constant" turned `Some(7)` (a *serial*), `Some(2)` (a zone-list *length*),
+`Some(1)` (a delta-chain length), `Some(11)` (another serial) and two NSEC3
+fixture `u8`s into `Qtype`s. The compiler would have rejected all six — they are
+`Option<u32>` and `u8` — but that is luck rather than method: a regex that
+rewrites by shape can just as easily produce an edit that type-checks and is
+wrong. The rewrite was redone from `cargo build --message-format json`, taking
+the exact span rustc labels `expected \`Qtype\``, which cannot touch anything
+the compiler did not point at. 87 of the ~200 sites went that way; the six
+over-matches were reverted after auditing every `Some(Qtype::of(` in the tree.
+
+Measured: **all fifteen allocation counts unchanged.** `cargo test --workspace`
+630/1/1/93/3 (+1 for the ANY test), clippy and fmt clean, `cargo deny check` ok.
+
+**`Rtype` landed too, and the first thing it found was a hole in `Qtype`.**
+`dnssec_answer::answer_signatures` held a **fifth** copy of the ANY rule —
+`if qtype != rt::ANY && sig.type_covered != qtype` plus a meta-type exclusion —
+and it survived 13c-i intact, because that function still took a `u16` and its
+callers were changed to pass `qtype.to_u16()`. **A newtype stops paying the
+moment a signature is widened back to let it through**, and passing `.to_u16()`
+is exactly how that happens without anyone deciding to. It is now
+`qtype.matches(sig.type_covered)`, and `Qtype::matches` takes an `Rtype`, so the
+widening is no longer available.
+
+What else `Rtype` bought, beyond the comparison:
+
+- **`Rtype::is_meta`** replaces `rtype == rt::ANY || rtype == rt::AXFR ||
+  rtype == rt::IXFR` in RFC 2136 §3.4.1's prescan. The question there is not "is
+  this ANY" but "could this value ever be a stored record", and now it says so.
+  The meta-types stay representable as `Rtype`, because they genuinely arrive in
+  a TYPE field — RFC 2136 §2.4 and §2.5 put TYPE=ANY in an UPDATE's prerequisite
+  and update sections — with `_CODE` twins so `Qtype`'s constants stay `const`
+  without a second registry of numbers.
+- **The magic numbers had to be named.** `ParsedRecord::decode` matched on `1`,
+  `2`, `5`, `6`, …, `encode` returned them, and `NameCompressor::write_rdata`
+  matched `2 | 5 | 12`. None of those compile against a newtype, so they are
+  `rt::A`, `rt::NS`, `rt::CNAME` now. That is the readability win a type forces
+  and a lint would only have suggested.
+
+**Two more failure modes of the span-driven rewrite**, both caught by the
+compiler and both worth knowing before 13d does the same thing:
+
+- **Struct-literal field shorthand.** rustc's primary span for `Foo { rtype, .. }`
+  is the *field name*, so wrapping it produces `Foo { Rtype::new(rtype), .. }` —
+  a syntax error, three times. The script now skips a span whose text is a bare
+  identifier alone on its line.
+- **Match patterns.** `fn` calls are not allowed there, so wrapping a match arm
+  is a hard error rather than a wrong-but-compiling edit. That one turned into
+  the constant-naming improvement above.
+
+And a third over-match by the blunt sweep that preceded it: `Vec<u16>` →
+`Vec<Rtype>` caught a vector of **key tags**, which are `u16` and not types at
+all. Same lesson as 13c-i's `Some(7)`: a rewrite by shape needs a diff audit,
+and the compiler catching it is luck rather than method.
+
+Measured again: **all fifteen counts unchanged**, `cargo test --workspace`
+630/1/1/93/3, clippy and fmt clean, `cargo deny check` ok.
+
+**The other half of §8's sentence is missing from this section, and it belongs
+here: "a QCLASS is not a CLASS."** The question carries `QueryClass`, a real
+enum with `Any` and `None` variants that no stored record can hold; a record
+carries `class: u16`. §8 records what that asymmetry already cost — a CH
+question answered out of the IN zone, `CLASS=CH` echoed beside `CLASS=IN`
+records. That was fixed in `rdnsd`'s query loop and in the zone parser, not in
+the types, so it is the same shape as the ANY bug above and it is still
+writable.
+
+**A `Class` newtype cannot be done before 13d, which is why it is filed here
+rather than done here.** `Edns::to_record` stores the requestor's UDP payload
+size in `ResourceRecord::class` — the OPT pseudo-record repurposes CLASS exactly
+as it repurposes TTL. So `class` has the same two-meanings-in-one-field problem
+as `ttl`, it has the same cause, and it is fixed by the same change. **Do the
+class newtype as the third commit of 13d**, alongside `Ttl`, once OPT no longer
+lives in `additionals`. Doing it earlier means special-casing rtype 41, which is
+the conditional invariant this whole section exists to stop writing.
+
+#### 13d. `Ttl`, and lifting OPT out of the additional section — the deep one, **done**
+
+**Two changes, and they are one change**, because the reason the TTL cannot
+simply be clamped at the parse boundary is that the OPT pseudo-record's "TTL" is
+not a TTL.
+
+**The TTL half.** §2 records the `-1 as u64 == u64::MAX` bug — a negative TTL
+picked by `min` as the smallest and pinning a cache entry for the life of the
+process — and draws the rule: "Bounds and clamps belong at the boundary, once."
+The clamp is currently at every use instead: **fourteen `ttl.max(0) as …` sites**
+(`cache.rs:149`, `negative_cache.rs:149`, `nsec_cache.rs:{220,248,276,387,417}`,
+`resolver.rs:{1234,1268,1272,1708}`, `zone_signer.rs:808`, and two in
+`dnssec_test_util.rs`), plus **five `.min(i32::MAX as u32) as i32`** going back
+the other way (`dnssec_answer.rs:290`, `negative_cache.rs:242`,
+`nsec_cache.rs:835`, `zone_signer.rs:319`, `rdnsd/main.rs:863`). Every one is
+correct. The invariant is that the fifteenth will be — and §2's own account of
+this bug is that "a check that existed four times over was still missing where
+it mattered".
+
+`Ttl(u32)`, constructed only by `Ttl::from_wire(i32)` doing `.max(0)` — which is
+RFC 2181 §8's instruction in as many words: a TTL with the top bit set should be
+treated "as if the entire value received was zero". `ResourceRecord::ttl` becomes
+private behind `rr.ttl()`, so the widening cannot be written by hand.
+
+**The OPT half, and why it is the same change.** `Edns::to_record` writes
+`ttl: self.flags() as i32` and `EdnsHeader::from_record` reads `rr.ttl as u32`:
+in an OPT record that field is the extended RCODE, the EDNS version and the DO
+bit. A blanket clamp at the parse boundary would corrupt it. One field carrying
+two meanings depending on a sibling field *is* the conflation, and the fix is to
+stop storing a pseudo-record in a resource-record list.
+
+```rust
+pub struct DnsMessage {
+    …
+    /// The OPT record, if the message carries one. Not in `additionals`,
+    /// because OPT is not a resource record: RFC 6891 §6.1.1.
+    pub edns: Option<Edns>,
+}
+```
+
+What that buys, in order of how much it is worth:
+
+- **A malformed state stops being representable, and it is one nothing rejects
+  today.** RFC 6891 §6.1.1: "If a query message with more than one OPT RR is
+  received, a FORMERR (RCODE=1) MUST be returned." Nothing in `validation.rs` or
+  `lib.rs` checks this. Today the first OPT is read and *both* are re-serialized.
+  `Option<Edns>` makes two impossible, and the parse gets the FORMERR the RFC
+  asks for.
+- **Eight linear scans of `additionals` per message become field accesses.**
+  `lib.rs` searches the section for `rtype == OPT_RECORD_TYPE` at 1154, 1205,
+  1281, 1294, 1307, 1319, 1329 and 1392 — `try_from_bytes` for the extended
+  RCODE, `to_bytes`, `edns`, `edns_header`, `has_edns`, `udp_payload_size`,
+  `set_edns`'s `retain`, and the truncation path's `retain`. (Line 1249 is a
+  ninth comparison but not a scan: it is the per-record branch inside the write
+  loop that stamps the extended RCODE into the OPT TTL, and it becomes
+  unnecessary rather than cheaper. Counting it as a scan would overstate the
+  win, and the two `OPT_RECORD_TYPE` hits above line 1462 in that file are in
+  `mod tests`.)
+- **The OPT exemption disappears from filters that must remember it.**
+  `rdnsr/main.rs:1156` is `additionals.retain(|rr| rr.rdata.rtype ==
+  OPT_RECORD_TYPE || keep(rr))` — a filter over the additional section that has
+  to spare OPT by hand. That clause is the bug waiting to be omitted from the
+  next such filter; with a field there is nothing to spare.
+- **`to_bytes_within_buf`'s truncation path cannot drop the OPT record.** It
+  currently keeps it with a `retain`, and the size limit is signalled *via* EDNS,
+  so losing it there would be losing the thing that says why.
+
+**The one decision this must get right: a malformed option list must stay
+FORMERR-with-a-reply, not silence.** `rdnsd` answers a bad option list with
+FORMERR today (`main.rs:478-486`), and it can only do that because the message
+parsed — `DnsMessage::try_from_bytes` failing means `main.rs:1465` and `:2072`
+`return` **with no reply at all**, and `error_bytes` takes a parsed
+`&DnsMessage`, so there is nothing to build a FORMERR from. Making the option
+list a hard parse error would turn a diagnosable FORMERR into a client timeout.
+So `Edns` keeps the option list unparsed and the fallibility at the accessor:
+
+```rust
+pub struct Edns {
+    /// CLASS and TTL: payload size, version, DO. Infallible — a parsed record
+    /// always has both fields, so nothing here can be malformed.
+    pub header: EdnsHeader,
+    /// The option list as it arrived. Parsed on demand, because the answer path
+    /// reads three flags and never looks at an option.
+    rdata: Box<[u8]>,
+}
+impl Edns {
+    pub fn options(&self) -> Result<Vec<EdnsOption>, WireError>;
+    pub fn check_options(&self) -> Result<(), WireError>;  // the walk, no build
+    pub fn option(&self, code: u16) -> Result<Option<&[u8]>, WireError>;
+}
+```
+
+That is the distinction `EdnsHeader` already found and wrote down — "Infallible,
+and that is the difference between this and the option list" — made structural.
+It also preserves the allocation profile by construction: the option `Vec` is
+built only when something asks for the options, which is what `edns_header()`
+exists to avoid and what the `query_bytes_with_edns` measurement in
+`allocations.rs:146` is watching.
+
+**What has to be got right in the serializer**, each of which wants its own test:
+
+- **ARCOUNT is `additionals.len() + edns.is_some() as usize`.** It is currently
+  `additionals.len()`, and this is the arithmetic most likely to be wrong.
+- **OPT is written after the other additionals**, so that `tsig::append_tsig` —
+  which appends to the serialized bytes and bumps ARCOUNT itself (`tsig.rs:859`)
+  — still leaves the TSIG last, as RFC 8945 §5.1 requires.
+
+  **That is true, but not for the reason it first appears, and the real reason is
+  fragile enough to write down.** Writing OPT last within the struct's own
+  section would put it *after* a TSIG if a TSIG were ever in `additionals` when
+  the message was serialized. It never is: `TSIG_TYPE` appears nowhere outside
+  `tsig.rs`, that module works entirely on raw packet bytes (`strip_tsig`,
+  `append_tsig`), and the only place a TSIG record sits in a parsed
+  `additionals` is a test at `tsig.rs:1143` asserting the appended bytes parse
+  back. `make_response` and `error_bytes` both build `additionals: Vec::new()`,
+  so no reply ever inherits a request's TSIG. The ordering invariant therefore
+  holds by *where TSIG lives*, not by anything the serializer enforces — and
+  `no_input_panics.rs` mutates and re-serializes messages, so a fuzz case can
+  construct the OPT-after-TSIG ordering that production cannot. Add an assertion
+  that a message carrying both serializes with TSIG last, so the next person to
+  put a TSIG in a struct finds out from a test rather than from dnspython
+  reporting a malformed record.
+- **The extended RCODE still splits across the header and the OPT TTL** at
+  serialization time and is reassembled at parse time. The current design note
+  is right and stays: the 12-bit RCODE is a property of the *message*, so it
+  lives in `DnsMessage::rcode` and nowhere else.
+- **An OPT record in the answer or authority section stays an ordinary record.**
+  Only the additional section's OPT is lifted, because only there does it mean
+  anything.
+- `dnssec_chain::group_rrsets` (`:751`) skips OPT; after this it is skipping
+  something that can no longer be in the sections it is given. Delete the clause
+  rather than leaving a guard against an impossible state.
+
+Churn is the largest in the section: **65 `DnsMessage { … }` literals** across
+five crates (most in tests) each gain a field, and **109 call sites** touch
+`set_edns` / `edns()` / `edns_header` / `has_edns` / `udp_payload_size`. Most of
+the 109 get simpler. The 65 are mechanical and the compiler names every one.
+
+**The OPT commit is done.** `DnsMessage.edns: Option<Edns>`, and everything the
+plan asked for held:
+
+- **The malformed state is refused.** `more_than_one_opt_record_is_formerr`
+  drives two OPT records off the wire and requires FORMERR (RFC 6891 §6.1.1).
+  It fails against the old code by construction, because the old code had no
+  check at all — the first was read and both were re-serialized.
+- **ARCOUNT is one expression**, `additionals.len() + usize::from(edns.is_some())`,
+  and `arcount_counts_the_opt_record_that_is_not_in_the_section` is the guard.
+- **TSIG stays last**, and the test says why that is worth asserting rather than
+  assuming: the invariant holds because `TSIG_TYPE` appears nowhere outside
+  `tsig.rs` and no reply carries a TSIG *through* `to_bytes`, not because the
+  serializer enforces it. `a_signed_message_with_edns_still_ends_in_its_tsig`
+  checks it functionally — `strip_tsig` needs the TSIG last, so if OPT landed
+  after it the signature would not verify.
+- **The option list stayed lazy**, which is what preserves the FORMERR reply.
+  `Edns` holds `rdata: Box<[u8]>`; `check_options` is the FORMERR question and
+  `options()` is the parse.
+
+**Two tests changed, and both changes are the point rather than collateral.**
+`test_edns_set_and_read` asserted that the additional section held *exactly one*
+OPT record after `set_edns` — a real hazard when `set_edns` pushed onto a `Vec`
+and had to `retain` the old one away, and a meaningless thing to count once the
+field is an `Option`. `test_malformed_edns_options_surface_error` called
+`msg.edns()` and expected `Err`; reaching the OPT record is infallible now and
+`check_options` is where it fails. Each kept its subject and moved to the
+question that still exists (`CLAUDE.md` §1: a test that has to change is a test
+that encoded the old shape — say so).
+
+**One allocation measurement moved, and the number did not.** "the same three
+fields through the full option parse" used to call `edns()`, which parsed the
+option list on the way to the record and so read 2. `edns()` allocates nothing
+now, so the measurement calls `options()` — the same two allocations, charged to
+the call that actually wants them. A sixteenth measurement, "reach the OPT
+record", records the 0 that replaced it. Every other count is unchanged.
+
+`cargo test --workspace` 633/1/1/93/3 (+3 for the new tests), clippy and fmt
+clean, `cargo deny check` ok.
+
+**`Ttl` landed, and the forced order earned its keep.** `Ttl(u32)` with
+`Ttl::from_wire` clamping per RFC 2181 §8, applied once where the bytes are
+read. The fourteen `ttl.max(0) as …` sites and the five
+`.min(i32::MAX as u32) as i32` conversions are gone; `ResourceRecord::ttl` and
+`ZoneRecord::ttl` are `Ttl`, and a negative one can no longer be built.
+
+**The OPT hazard the plan predicted was real, and bit at exactly the predicted
+place.** With `ResourceRecord::ttl` clamped at parse, an OPT record's TTL —
+which is not a TTL but the extended RCODE, the EDNS version and the DO bit
+(RFC 6891 §6.1.3) — would have been erased whenever the extended RCODE's high
+byte had its top bit set. Moving OPT into a field in the previous commit was
+*necessary but not sufficient*: the OPT record was still being parsed **as a
+`ResourceRecord`** and taken apart afterwards, so it still went through `Ttl`.
+
+The fix is the honest one rather than a special case: the additional section is
+read through an `Additional::{Record, Opt}` enum, and an OPT is decoded straight
+from its wire fields — never becoming a `ResourceRecord` at all. `Edns::from_record`
+and `EdnsHeader::from_record` are deleted; there is no record to read from. This
+is the shape the section keeps arriving at: the conditional invariant ("clamp
+unless it is rtype 41") is the thing to avoid, and the way to avoid it is to stop
+pretending the pseudo-record is a record.
+
+Nothing sends an extended RCODE ≥ 2048 today, and that is not a reason to build a
+parser that cannot represent one.
+
+**A boundary test, and one regression test kept its meaning.**
+`a_ttl_with_the_high_bit_set_parses_as_zero` drives `-1`, `i32::MIN` and `-3600`
+*off the wire* rather than through `Ttl::from_wire`, because the claim being
+tested is that parsing a record applies the rule — which is what lets fourteen
+call sites stop applying it. `cache`'s `a_negative_ttl_does_not_pin_an_entry_forever`
+still drives the same three values and still passes; its subject moved from "the
+cache clamps" to "the cache no longer has to", and the comment above the cache's
+`min_ttl` says so.
+
+`cargo test --workspace` 634/1/1/93/3, clippy and fmt clean, `cargo deny check`
+ok, **all sixteen allocation counts unchanged**.
+
+**`Class` landed, and 13d is done.** `Class(u16)` with `IN`/`CH`/`HS`, on
+`ResourceRecord::class` and `ZoneRecord::class`. The same one-way conversion the
+other two pairs have — `From<Class> for QueryClass`, no way back — and
+`QueryClass::matches`/`is` to go with `Qtype`'s.
+
+Two things it turned up that the plan had not written down:
+
+- **RFC 2136 repurposes a record's CLASS field**, so `update.rs` reads one as a
+  QCLASS on purpose: §2.4 and §2.5 put ANY (255) and NONE (254) there to say what
+  to *do* with the record. That is what `From<Class> for QueryClass` is for, and
+  `Class::is_meta` names the two values no stored record can be in. The plan had
+  described the conversion as a formality; it is load-bearing on the UPDATE path.
+- **`Class` needs a `Default`, and it is not `derive`d.** `DelegationEvidence`
+  derives `Default`, and a derived `Class` would be `CLASS0` — not a class at
+  all. It is `IN`, with a comment saying why that is the honest default here: the
+  zone parser refuses every other class, so a record built without saying its
+  class is in the only one there is.
+
+One test message changed and no test did: `zone_writer`'s "unknown class 42" now
+reads the numeric value rather than `Display`, which renders the RFC 3597 §5
+generic form `CLASS42` and would have made the message say "unknown class
+CLASS42".
+
+`cargo test --workspace` 634/1/1/93/3, clippy and fmt clean, `cargo deny check`
+ok, **all sixteen allocation counts unchanged**. That is three commits in the
+forced order the section predicted, and each of the two newtypes was only
+correct because the one before it had landed.
+
+#### 13e. `Name` and `NameKey` — the pipeline that ends in `String`
+
+`dname.rs` states the intent already: "The design is you can only go
+`bytes -> DName -> unpacker -> UnpackedDName -> String`. This way the type system
+makes sure you don't end up with dname fragments." It is right, and then the
+pipeline terminates in `String`, which carries no evidence of any of it.
+
+Four invariants are live in this codebase and none is in a type: **absolute or
+relative** (`zone::absolutize` resolves it, `utils::normalize_domain_name` used
+to strip it), **ASCII case-folded or not** (required of anything used as a map
+key, and `cache` got it wrong once), **≤255 octets** (checked by
+`RequestValidator` on the way in — and `rdnsr` runs no validator at all, per §2 —
+and *not* checked by `dname_to_bytes`, which validates label length and total
+length never), and **non-empty labels of ≤63 octets** (checked at
+`write_label`, i.e. at serialization, which is the last possible moment).
+
+**Settle the escape question before writing any type. This is a real
+prerequisite and the section was drafted without it.** A name in this codebase
+may be in *presentation* form, and presentation form has escapes: `zone.rs:885`
+says so in as many words — "a bare token like `a\.b` is a name whose meaning
+changes if the backslash is dropped, and names are not this function's business"
+— and `zone_writer::record_to_string` refuses an owner name "it needs escapes
+this parser does not read back". Meanwhile `dname_to_bytes` splits on `'.'` with
+no escape handling at all, so `a\.b.example.com.` becomes the labels `a\`, `b`,
+`example`, `com`. Two functions in the same crate disagree about what a `String`
+holding a name means.
+
+That has three consequences for this stage, and the first one is fatal to the
+draft as written:
+
+- **`≤255 octets` cannot be checked with `s.len()`.** The limit is on wire
+  octets; presentation length is not wire length as soon as one escape is
+  present. Either `Name` holds a form where the two coincide, or the invariant
+  has to be stated over a conversion rather than over the string.
+- **A newtype that does not settle this just renames the ambiguity**, which is
+  the shallow pass this section exists to avoid.
+- Whether an owner name needing escapes is even *reachable* — can the zone
+  parser produce one, can one arrive off the wire — is an open question worth
+  answering first, because "unreachable" makes this a five-line assertion and
+  "reachable" makes it a design decision.
+
+**And the sketch's key type was wrong.** `NameKey<'a>(Cow<'a, str>)` cannot be
+what `Zone::index` is keyed by: a map key must be owned, and a lifetime
+parameter would infect `Zone`, `DnsCache` and everything holding one. The shape
+that works is the one `std` already uses for exactly this problem — a borrowed
+unsized type plus an owned counterpart, `str`/`String` and `Path`/`PathBuf`:
+
+```rust
+/// The only form a name may be a map key or a comparison operand in:
+/// absolute, ASCII case-folded (RFC 4343). Borrowed, unsized, like `str`.
+#[repr(transparent)] pub struct NameKey(str);
+/// Its owned counterpart. `Borrow<NameKey>` is what lets
+/// `HashMap<NameKeyBuf, _>::get(&NameKey)` look up without allocating.
+pub struct NameKeyBuf(String);
+
+/// A name as written or as it arrived. Case preserved — 0x20 encoding and
+/// zone-file presentation both depend on it.
+pub struct Name(String);
+```
+
+`HashMap<NameKeyBuf, _>` instead of `HashMap<String, _>` makes `cache.rs`'s
+original bug — keying on a name nobody folded — not compile, and the
+`Borrow<NameKey>` impl is what keeps the lookup allocation-free. There is one
+constructor, so there is one place the RFC 4343 reasoning lives, which is the
+whole of what 13b is clearing the ground for.
+
+**On cost:** `Name(String)` and `NameKeyBuf(String)` have `String`'s layout and
+allocation count. The borrowing lookup that `zone::lookup_key` performs today —
+which returns `Cow::Borrowed` for every name that arrives absolute and lower
+case, i.e. almost all of them — survives as a function returning
+`Cow<'a, NameKey>`, so the DHAT win it was introduced for (four allocations per
+query, ~14% of the answer path) is preserved by construction. The expected net
+movement is downward, from 13b's `names_equal`.
+
+**This is the stage most likely to be abandoned**, and that is an acceptable
+outcome rather than a failure: if the escape question turns out to need its own
+decision, stop after 13d and file the rest. Four fifths of this section's value
+is in 13a-13d, none of which depends on 13e.
+
+#### Order, and why it is this order
+
+1. **13a** — smallest, verified, fixes a live conformance bug, removes two
+   dependencies. Good first commit because it settles whether the section is
+   worth continuing.
+2. **13b** — deletes six things and types none of them. Pure subtraction, and
+   the prerequisite for 13e being one type rather than seven.
+3. **13c** — mechanical, zero-cost, and the compiler finds the two `resolver.rs`
+   sites rather than a reviewer having to.
+4. **13d** — the deep one, in **three commits and the order is forced**: OPT out
+   of `additionals` first, then `Ttl`, then `Class`. Both newtypes are only
+   correct once OPT stops repurposing the fields they cover, and doing either
+   first means special-casing rtype 41 — the conditional invariant this whole
+   section exists to stop writing.
+5. **13e** — largest churn, done when everything it would collide with is
+   settled, and the one stage it is legitimate to abandon (see its last
+   paragraph).
+
+Each stage is its own commit with its own before/after allocation counts in the
+message. A stage that cannot hold the counts stops the section rather than
+lowering the bar — that is §10's rule, and the `bench_logger_throughput` floor is
+what happens when it is not followed.
+
+Estimate: **13a and 13b are an afternoon each.** 13c is a day of mechanical
+edits. 13d is the bulk — call it four to five days across its three commits,
+most of it in the 65 struct literals and the serializer tests. 13e is a further
+two to three, *if* the escape question does not reopen it. Nothing in 13a-13d is
+research; all of it is churn with a compiler holding the other end.
+
+#### What an adversarial pass changed, and why the record is kept
+
+This section was reviewed against the code and the registries the day it was
+written, before anything landed. Five claims did not survive, and they are kept
+here rather than silently patched because the pattern in *how* they failed is
+the useful part (`CLAUDE.md` §11):
+
+- **"15 is reserved rather than unassigned"** — asserted from memory. IANA says
+  15 is *Unassigned*, and the fact worth having was one the draft missed
+  entirely: **opcode 6 is DSO (RFC 8490), assigned**, and this codebase already
+  carries `ResponseCode::DsoTypeNotImplemented` for it. The argument got
+  stronger by being checked. Two of the three §1 sins in one sentence — citing
+  from memory, and citing the thing that sounds right.
+- **"seven normalizations"** — the prose said seven and the list under it had
+  nine. A count nobody counted.
+- **"reachability is not proven"** for the QTYPE=ANY comparisons — it was
+  provable in one grep, and the answer was that ANY is *never mentioned* on
+  `rdnsr`'s path. Hedging is not the same as checking, and it reads the same on
+  the page.
+- **`NameKey<'a>(Cow<'a, str>)`** — cannot be a map key; a lifetime would infect
+  every struct holding one. The draft carried the *lookup* side of the problem
+  and forgot the *storage* side, which is the half that made the type necessary.
+- **The escape prerequisite in 13e** — missed entirely, and it is the one thing
+  in the section that could invalidate a whole stage.
+
+The through-line: every one of the five was a place the draft reasoned about
+what the code *should* look like instead of opening it. Which is §4's rule
+about never stating what a function does without reading it, applied to one's
+own plan — a plan is a claim about the code too.
 
 ## Closed work
 
@@ -2105,6 +2902,85 @@ cache carries the same AD bit the first client saw and no other.
 
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
+
+- **A CLASS is not a QCLASS, and now not a `u16`** — #13d, third of three, and
+  the last of it. `Class(u16)` on `ResourceRecord` and `ZoneRecord`, with the
+  same one-way conversion into `QueryClass` that `Rtype` has into `Qtype`. It
+  could not be done before OPT stopped parsing as a resource record: an OPT's
+  CLASS field is the requestor's UDP payload size, the same two-meanings problem
+  `Ttl` had in the field next door. RFC 2136's repurposing of a record's CLASS —
+  ANY and NONE in an UPDATE's prerequisite and update sections — is what
+  `From<Class> for QueryClass` and `Class::is_meta` are for. Sixteen allocation
+  counts unchanged.
+
+- **A TTL is unsigned, and clamped once where the bytes are read** — #13d,
+  second of three. `Ttl(u32)` with `Ttl::from_wire` applying RFC 2181 §8 at the
+  parse boundary, replacing fourteen hand-written `ttl.max(0) as …` sites and
+  five conversions back. The hazard #13d predicted was real: an OPT record's TTL
+  is a flags word, and it was still being parsed *as a `ResourceRecord`* even
+  after OPT moved into its own field — so clamping would have erased the
+  extended RCODE, the EDNS version and the DO bit. The additional section is now
+  read through an `Additional::{Record, Opt}` enum and an OPT never becomes a
+  record at all, which is the alternative to the conditional invariant "clamp
+  unless it is rtype 41". Sixteen allocation counts unchanged.
+
+- **OPT is not a resource record, and no longer stored as one** — #13d, first of
+  three. `DnsMessage.edns: Option<Edns>` replaces an OPT record hidden in
+  `additionals`, which cost eight linear scans of that `Vec` per message in
+  `lib.rs` alone and made every filter over the section responsible for
+  remembering to spare it. It also closes a malformed state nothing rejected:
+  **two OPT records in one message**, which RFC 6891 §6.1.1 says MUST be FORMERR
+  and which used to be read as one and written back as two. The option list is
+  kept unparsed on purpose — if reading it were part of parsing the message, a
+  bad list would fail `try_from_bytes`, and `rdnsd` answers a parse failure with
+  no bytes at all, so today's diagnosable FORMERR would become a client timeout.
+  Two tests changed to match the new shape and three were added. Fifteen
+  allocation counts unchanged, one measurement moved with its number intact.
+
+- **A TYPE is not a `u16` either, and `answer_signatures` proves why it matters**
+  — #13c, second half. `Rtype` newtypes `RecordData.rtype`, `Rrsig.type_covered`,
+  the NSEC type bitmaps and `utils::record_types`. It immediately found a fifth
+  hand-written copy of the ANY rule in `dnssec_answer::answer_signatures`, which
+  had survived the first half **because that function still took a `u16` and its
+  callers were changed to pass `.to_u16()`** — a newtype stops paying the moment
+  a signature is widened back to let it through. `Rtype::is_meta` replaces the
+  three-way comparison in RFC 2136 §3.4.1's prescan, and the magic type codes in
+  `ParsedRecord::decode`/`encode` and `NameCompressor::write_rdata` had to become
+  named constants to compile. All fifteen allocation counts unchanged.
+
+- **A QTYPE is not a TYPE, and now it is not a `u16` either** — #13c, first half.
+  `Qtype` is a `repr(transparent)` newtype on `QuerySection.qtype`, so
+  `rr.rdata.rtype == query.qtype` stops compiling. It was written twice in
+  `resolver.rs` and both were wrong for QTYPE=ANY: one decided whether a CNAME
+  chase was finished, the other whether an answer was *negative*, which sent the
+  DNSSEC validator hunting a denial proof and turned a verifying ANY answer into
+  `Bogus("... was denied without an NSEC or NSEC3 proof")` — SERVFAIL under
+  `--dnssec-validate`, for a question nothing on that path rejects. Watched
+  failing first. `Qtype::matches` is now the one home of what ANY means;
+  `zone::of_type`, where it was got right, keeps a pointer instead of a second
+  telling. All fifteen allocation counts unchanged.
+
+- **One name fold, one containment test, one label count** — #13b.
+  `utils::names_equal`, `absolute_lowered` and `label_count` replace seven
+  hand-written copies of the same three rules, and `utils::normalize_domain_name`
+  — a `to_lowercase` in the public API that folds U+212A KELVIN SIGN into `k`,
+  which `CLAUDE.md` §8 forbids and which had no callers but the obvious name — is
+  deleted. Two of the copies the plan had not found: `xfr::in_bailiwick`, whose
+  removal also fixes a trailing-dot mismatch, and `ixfr::key`. Two duplicated
+  tests deleted with them. Comparing two names went from 2 allocations to 0,
+  measured against the old shape rather than described; the other fourteen counts
+  are unchanged.
+
+- **`OpCode` carries the value it could not name** — #13a, opens #13.
+  `OpCode::Other(u8)` replaces an `Unknown = 15` sentinel that was parsed with
+  `from_u8(...).unwrap_or(OpCode::Unknown)`. 15 is a real value in a four-bit
+  field, so eleven of the sixteen opcodes went back onto the wire as 15 —
+  including **6, which is DSO (RFC 8490) and assigned**, checked against IANA
+  rather than assumed. `rdnsd` echoes this field into the NOTIMP reply RFC 1035
+  §4.1.1 says must carry the client's, so a DSO client got a reply to a question
+  it had not asked. The third instance of the sentinel pattern after
+  `QueryClass::None` and `ResponseCode::Unknown`, and the last `num_derive` user
+  in the workspace. Fourteen allocation counts unchanged.
 
 - **Dynamic UPDATE, the half with no policy in it** — opens #10.
   `rdns/src/update.rs` reads an UPDATE message into a checked list of

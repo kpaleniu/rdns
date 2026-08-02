@@ -18,6 +18,8 @@ use crate::dname::dname_to_bytes;
 use crate::error::WireError;
 use crate::error::{DnssecError, DnssecResult};
 use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::Class;
+use crate::Rtype;
 use crate::{ParsedRecord, RecordData, ResourceRecord};
 use ring::signature;
 
@@ -147,7 +149,7 @@ impl Dnskey {
 pub struct Rrsig {
     /// Owner of the RRSIG record, i.e. the name of the RRset it covers.
     pub owner: String,
-    pub type_covered: u16,
+    pub type_covered: Rtype,
     pub algorithm: u8,
     pub labels: u8,
     pub original_ttl: u32,
@@ -451,7 +453,7 @@ pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
 pub fn signed_data(
     rrsig: &Rrsig,
     owner: &str,
-    class: u16,
+    class: Class,
     rdatas: &[RecordData],
 ) -> DnssecResult<Vec<u8>> {
     if rdatas.is_empty() {
@@ -462,7 +464,7 @@ pub fn signed_data(
 
     // RRSIG_RDATA with the signature field left off.
     let mut data = Vec::new();
-    data.extend_from_slice(&rrsig.type_covered.to_be_bytes());
+    data.extend_from_slice(&rrsig.type_covered.to_u16().to_be_bytes());
     data.push(rrsig.algorithm);
     data.push(rrsig.labels);
     data.extend_from_slice(&rrsig.original_ttl.to_be_bytes());
@@ -491,8 +493,8 @@ pub fn signed_data(
             actual: rdata.len(),
         })?;
         data.extend_from_slice(&name_wire);
-        data.extend_from_slice(&rrsig.type_covered.to_be_bytes());
-        data.extend_from_slice(&class.to_be_bytes());
+        data.extend_from_slice(&rrsig.type_covered.to_u16().to_be_bytes());
+        data.extend_from_slice(&class.to_u16().to_be_bytes());
         data.extend_from_slice(&rrsig.original_ttl.to_be_bytes());
         data.extend_from_slice(&rdlen.to_be_bytes());
         data.extend_from_slice(rdata);
@@ -702,13 +704,13 @@ pub enum RrsetProof {
 #[derive(Debug, Clone, Copy)]
 pub struct Rrset<'a> {
     pub owner: &'a str,
-    pub rtype: u16,
-    pub class: u16,
+    pub rtype: Rtype,
+    pub class: Class,
     pub rdatas: &'a [RecordData],
 }
 
 impl<'a> Rrset<'a> {
-    pub fn new(owner: &'a str, rtype: u16, class: u16, rdatas: &'a [RecordData]) -> Self {
+    pub fn new(owner: &'a str, rtype: Rtype, class: Class, rdatas: &'a [RecordData]) -> Self {
         Rrset {
             owner,
             rtype,
@@ -858,6 +860,7 @@ pub fn verify_records(
 mod tests {
     use super::*;
     use crate::dnssec_test_util::{TestKey, TestZone};
+    use crate::Ttl;
     use crate::{ParsedRecord, RecordData};
     use std::net::Ipv4Addr;
 
@@ -911,8 +914,8 @@ mod tests {
         let zone = TestZone::new("example.test.");
         let txt = ResourceRecord {
             name: "txt.example.test.".into(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::TXT(vec![
                 b"v=spf1 include:example.net".to_vec(),
                 b"-all".to_vec(),
@@ -944,14 +947,14 @@ mod tests {
         let ordered = signed_data(
             &rrsig,
             "example.com.",
-            1,
+            Class::new(1),
             &[a_rdata(1), a_rdata(2), a_rdata(3)],
         )
         .unwrap();
         let shuffled = signed_data(
             &rrsig,
             "example.com.",
-            1,
+            Class::new(1),
             // Same RRset, different order, with one record repeated.
             &[a_rdata(3), a_rdata(1), a_rdata(2), a_rdata(1)],
         )
@@ -967,9 +970,9 @@ mod tests {
     fn test_signed_data_uses_the_rrsigs_original_ttl() {
         let key = TestKey::generate_p256();
         let mut rrsig = key.rrsig_template("example.com.", rt::A, 3600, "example.com.", 2);
-        let with_3600 = signed_data(&rrsig, "example.com.", 1, &[a_rdata(1)]).unwrap();
+        let with_3600 = signed_data(&rrsig, "example.com.", Class::new(1), &[a_rdata(1)]).unwrap();
         rrsig.original_ttl = 60;
-        let with_60 = signed_data(&rrsig, "example.com.", 1, &[a_rdata(1)]).unwrap();
+        let with_60 = signed_data(&rrsig, "example.com.", Class::new(1), &[a_rdata(1)]).unwrap();
         assert_ne!(
             with_3600, with_60,
             "the TTL in the signed bytes comes from the RRSIG"
@@ -986,10 +989,17 @@ mod tests {
     fn test_ecdsa_p256_signature_verifies() {
         let key = TestKey::generate_p256();
         let rdatas = vec![a_rdata(1), a_rdata(2)];
-        let rrsig = key.sign_rrset("www.example.com.", rt::A, 1, 3600, "example.com.", &rdatas);
+        let rrsig = key.sign_rrset(
+            "www.example.com.",
+            rt::A,
+            Class::new(1),
+            3600,
+            "example.com.",
+            &rdatas,
+        );
 
         let proof = verify_rrset(
-            &Rrset::new("www.example.com.", rt::A, 1, &rdatas),
+            &Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[key.dnskey("example.com.")],
             "example.com.",
@@ -1005,10 +1015,17 @@ mod tests {
     fn test_ecdsa_p384_signature_verifies() {
         let key = TestKey::generate_p384();
         let rdatas = vec![a_rdata(7)];
-        let rrsig = key.sign_rrset("example.com.", rt::A, 1, 300, "example.com.", &rdatas);
+        let rrsig = key.sign_rrset(
+            "example.com.",
+            rt::A,
+            Class::new(1),
+            300,
+            "example.com.",
+            &rdatas,
+        );
 
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::A, 1, &rdatas),
+            &Rrset::new("example.com.", rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[key.dnskey("example.com.")],
             "example.com.",
@@ -1021,10 +1038,17 @@ mod tests {
     fn test_ed25519_signature_verifies() {
         let key = TestKey::generate_ed25519();
         let rdatas = vec![a_rdata(3)];
-        let rrsig = key.sign_rrset("example.com.", rt::A, 1, 300, "example.com.", &rdatas);
+        let rrsig = key.sign_rrset(
+            "example.com.",
+            rt::A,
+            Class::new(1),
+            300,
+            "example.com.",
+            &rdatas,
+        );
 
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::A, 1, &rdatas),
+            &Rrset::new("example.com.", rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[key.dnskey("example.com.")],
             "example.com.",
@@ -1039,11 +1063,18 @@ mod tests {
     fn test_tampered_rrset_is_bogus() {
         let key = TestKey::generate_p256();
         let signed = vec![a_rdata(1)];
-        let rrsig = key.sign_rrset("www.example.com.", rt::A, 1, 3600, "example.com.", &signed);
+        let rrsig = key.sign_rrset(
+            "www.example.com.",
+            rt::A,
+            Class::new(1),
+            3600,
+            "example.com.",
+            &signed,
+        );
 
         let tampered = vec![a_rdata(66)];
         let proof = verify_rrset(
-            &Rrset::new("www.example.com.", rt::A, 1, &tampered),
+            &Rrset::new("www.example.com.", rt::A, Class::new(1), &tampered),
             &[rrsig],
             &[key.dnskey("example.com.")],
             "example.com.",
@@ -1061,10 +1092,22 @@ mod tests {
     fn test_added_record_is_bogus() {
         let key = TestKey::generate_p256();
         let signed = vec![a_rdata(1)];
-        let rrsig = key.sign_rrset("www.example.com.", rt::A, 1, 3600, "example.com.", &signed);
+        let rrsig = key.sign_rrset(
+            "www.example.com.",
+            rt::A,
+            Class::new(1),
+            3600,
+            "example.com.",
+            &signed,
+        );
 
         let proof = verify_rrset(
-            &Rrset::new("www.example.com.", rt::A, 1, &[a_rdata(1), a_rdata(99)]),
+            &Rrset::new(
+                "www.example.com.",
+                rt::A,
+                Class::new(1),
+                &[a_rdata(1), a_rdata(99)],
+            ),
             &[rrsig],
             &[key.dnskey("example.com.")],
             "example.com.",
@@ -1080,10 +1123,17 @@ mod tests {
         let attacker = TestKey::generate_p256();
         let rdatas = vec![a_rdata(6)];
         // Signed correctly, but by evil.test. for a name in example.com.
-        let rrsig = attacker.sign_rrset("www.example.com.", rt::A, 1, 3600, "evil.test.", &rdatas);
+        let rrsig = attacker.sign_rrset(
+            "www.example.com.",
+            rt::A,
+            Class::new(1),
+            3600,
+            "evil.test.",
+            &rdatas,
+        );
 
         let proof = verify_rrset(
-            &Rrset::new("www.example.com.", rt::A, 1, &rdatas),
+            &Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[attacker.dnskey("evil.test.")],
             "example.com.",
@@ -1099,13 +1149,20 @@ mod tests {
     fn test_expired_signature_is_bogus() {
         let key = TestKey::generate_p256();
         let rdatas = vec![a_rdata(1)];
-        let mut rrsig = key.sign_rrset("example.com.", rt::A, 1, 3600, "example.com.", &rdatas);
+        let mut rrsig = key.sign_rrset(
+            "example.com.",
+            rt::A,
+            Class::new(1),
+            3600,
+            "example.com.",
+            &rdatas,
+        );
         let now = current_unix_timestamp();
         rrsig.inception = (now - 7200) as u32;
         rrsig.expiration = (now - 3600) as u32;
 
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::A, 1, &rdatas),
+            &Rrset::new("example.com.", rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[key.dnskey("example.com.")],
             "example.com.",
@@ -1117,7 +1174,7 @@ mod tests {
     #[test]
     fn test_unsigned_rrset_is_not_bogus() {
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::A, 1, &[a_rdata(1)]),
+            &Rrset::new("example.com.", rt::A, Class::new(1), &[a_rdata(1)]),
             &[],
             &[],
             "example.com.",
@@ -1135,7 +1192,14 @@ mod tests {
     fn test_non_zone_key_cannot_sign() {
         let key = TestKey::generate_p256();
         let rdatas = vec![a_rdata(1)];
-        let rrsig = key.sign_rrset("example.com.", rt::A, 1, 3600, "example.com.", &rdatas);
+        let rrsig = key.sign_rrset(
+            "example.com.",
+            rt::A,
+            Class::new(1),
+            3600,
+            "example.com.",
+            &rdatas,
+        );
 
         let mut dnskey = key.dnskey("example.com.");
         dnskey.flags &= !DNSKEY_FLAG_ZONE;
@@ -1145,7 +1209,7 @@ mod tests {
         rrsig.key_tag = dnskey.key_tag();
 
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::A, 1, &rdatas),
+            &Rrset::new("example.com.", rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[dnskey],
             "example.com.",
@@ -1161,12 +1225,19 @@ mod tests {
         let key = TestKey::generate_p256();
         let rdatas = vec![a_rdata(5)];
         // Signed at *.example.com. (2 labels) but served for anything.example.com.
-        let mut rrsig = key.sign_rrset("*.example.com.", rt::A, 1, 3600, "example.com.", &rdatas);
+        let mut rrsig = key.sign_rrset(
+            "*.example.com.",
+            rt::A,
+            Class::new(1),
+            3600,
+            "example.com.",
+            &rdatas,
+        );
         rrsig.owner = "anything.example.com.".to_string();
         rrsig.labels = 2;
 
         let proof = verify_rrset(
-            &Rrset::new("anything.example.com.", rt::A, 1, &rdatas),
+            &Rrset::new("anything.example.com.", rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[key.dnskey("example.com.")],
             "example.com.",
@@ -1327,7 +1398,7 @@ mod tests {
         // 2. The KSK signs the DNSKEY RRset, so the DS reaches both keys.
         let (dnskey_rdatas, dnskey_sig) = zone.signed_dnskey_rrset();
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::DNSKEY, 1, &dnskey_rdatas),
+            &Rrset::new("example.com.", rt::DNSKEY, Class::new(1), &dnskey_rdatas),
             &[dnskey_sig],
             &zone.dnskeys(),
             "example.com.",
@@ -1340,11 +1411,16 @@ mod tests {
 
         // 3. The ZSK signs ordinary data, validated by the keys just proven.
         let rdatas = vec![a_rdata(1)];
-        let sig = zone
-            .zsk
-            .sign_rrset("www.example.com.", rt::A, 1, 300, "example.com.", &rdatas);
+        let sig = zone.zsk.sign_rrset(
+            "www.example.com.",
+            rt::A,
+            Class::new(1),
+            300,
+            "example.com.",
+            &rdatas,
+        );
         let proof = verify_rrset(
-            &Rrset::new("www.example.com.", rt::A, 1, &rdatas),
+            &Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas),
             &[sig],
             &zone.dnskeys(),
             "example.com.",

@@ -30,7 +30,9 @@ use crate::dnssec_denial::{
 };
 use crate::error::DnssecError;
 use crate::utils::record_types as rt;
-use crate::{ParsedRecord, RecordData, ResourceRecord};
+use crate::Class;
+use crate::Rtype;
+use crate::{ParsedRecord, Qtype, RecordData, ResourceRecord};
 use std::collections::HashMap;
 
 /// How much authentication an answer carries (RFC 4035 §4.3).
@@ -279,7 +281,7 @@ pub struct DelegationEvidence {
     /// NSEC3 records offered instead, when there is no DS.
     pub nsec3s: Vec<Nsec3>,
     /// The class the records came in.
-    pub class: u16,
+    pub class: Class,
 }
 
 impl DelegationEvidence {
@@ -292,7 +294,7 @@ impl DelegationEvidence {
             .filter(|rr| canonical_name(&rr.name) == zone)
             .collect();
         DelegationEvidence {
-            class: relevant.first().map(|rr| rr.class).unwrap_or(1),
+            class: relevant.first().map(|rr| rr.class).unwrap_or(Class::new(1)),
             ds: relevant
                 .iter()
                 .filter_map(|rr| Ds::from_record(rr))
@@ -438,7 +440,7 @@ impl<'a> ChainValidator<'a> {
             .filter(|rr| rr.rdata.rtype == rt::DNSKEY && canonical_name(&rr.name) == zone)
             .map(|rr| rr.rdata.clone())
             .collect();
-        let class = records.first().map(|rr| rr.class).unwrap_or(1);
+        let class = records.first().map(|rr| rr.class).unwrap_or(Class::new(1));
         let rrsigs: Vec<Rrsig> = records.iter().filter_map(Rrsig::from_record).collect();
 
         match verify_rrset(
@@ -745,8 +747,8 @@ impl<'a> ChainValidator<'a> {
 /// Split records into RRsets by (owner, type, class), skipping the RRSIGs
 /// themselves — a signature is not an RRset that needs validating, it is what
 /// validates one.
-pub fn group_rrsets(records: &[ResourceRecord]) -> Vec<(String, u16, u16, Vec<RecordData>)> {
-    let mut sets: Vec<(String, u16, u16, Vec<RecordData>)> = Vec::new();
+pub fn group_rrsets(records: &[ResourceRecord]) -> Vec<(String, Rtype, Class, Vec<RecordData>)> {
+    let mut sets: Vec<(String, Rtype, Class, Vec<RecordData>)> = Vec::new();
     for rr in records {
         if rr.rdata.rtype == rt::RRSIG || rr.rdata.rtype == crate::OPT_RECORD_TYPE {
             continue;
@@ -765,8 +767,8 @@ pub fn group_rrsets(records: &[ResourceRecord]) -> Vec<(String, u16, u16, Vec<Re
 
 /// The NSEC/NSEC3 RRsets in a delegation's evidence, in the form
 /// [`verify_rrset`] wants.
-fn denial_rrsets(evidence: &DelegationEvidence) -> Vec<(String, u16, Vec<RecordData>)> {
-    let mut out: Vec<(String, u16, Vec<RecordData>)> = Vec::new();
+fn denial_rrsets(evidence: &DelegationEvidence) -> Vec<(String, Rtype, Vec<RecordData>)> {
+    let mut out: Vec<(String, Rtype, Vec<RecordData>)> = Vec::new();
     for nsec in &evidence.nsecs {
         let rdata = RecordData::from_parsed(&crate::ParsedRecord::NSEC {
             next_domain_name: nsec.next.clone(),
@@ -791,9 +793,9 @@ fn denial_rrsets(evidence: &DelegationEvidence) -> Vec<(String, u16, Vec<RecordD
 }
 
 fn push_rrset(
-    out: &mut Vec<(String, u16, Vec<RecordData>)>,
+    out: &mut Vec<(String, Rtype, Vec<RecordData>)>,
     owner: &str,
-    rtype: u16,
+    rtype: Rtype,
     rdata: RecordData,
 ) {
     let owner = canonical_name(owner);
@@ -842,7 +844,7 @@ pub enum ChainShape {
 /// stray record rarely reaches here; this decides whether what arrived is
 /// coherent, and it holds for an answer that came from anywhere — a forwarder, a
 /// cache, a single upstream response.
-pub fn cname_chain_shape(qname: &str, qtype: u16, answers: &[ResourceRecord]) -> ChainShape {
+pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) -> ChainShape {
     let queried = canonical_name(qname);
 
     // Index the CNAMEs by owner. More than one CNAME at a name is itself
@@ -865,7 +867,7 @@ pub fn cname_chain_shape(qname: &str, qtype: u16, answers: &[ResourceRecord]) ->
     // A query *for* a CNAME is answered by the CNAME itself rather than by
     // following it (RFC 1034 section 3.6.2), so that question follows nothing and
     // its answer sits at the name asked about.
-    let follow = qtype != rt::CNAME;
+    let follow = !qtype.is(rt::CNAME);
 
     // Walk from the question.
     let mut current = queried.clone();
@@ -922,14 +924,15 @@ mod tests {
     use crate::dnssec_denial::build_type_bitmap;
     use crate::dnssec_test_util::{ds_record, TestZone};
     use crate::utils::current_unix_timestamp;
+    use crate::Ttl;
     use crate::{ParsedRecord, ResourceRecord};
     use std::net::Ipv4Addr;
 
     fn a_record(name: &str, last: u8) -> ResourceRecord {
         ResourceRecord {
             name: name.to_string(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, last)))
                 .unwrap(),
         }
@@ -1061,8 +1064,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             0,
             ResourceRecord {
                 name: "example.test.".into(),
-                class: 1,
-                ttl: 3600,
+                class: Class::new(1),
+                ttl: Ttl::from_secs(3600),
                 rdata: crate::dnssec_test_util::dnskey_rdata(&attacker.zsk.dnskey("example.test.")),
             },
         );
@@ -1115,7 +1118,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let ds_rr = ds_record(&child.ds(2), 3600);
+        let ds_rr = ds_record(&child.ds(2), Ttl::from_secs(3600));
         let sig = parent.sign_records(std::slice::from_ref(&ds_rr));
         let evidence = DelegationEvidence::from_authority("example.test.", &[ds_rr, sig]);
 
@@ -1135,8 +1138,10 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let evidence =
-            DelegationEvidence::from_authority("example.test.", &[ds_record(&child.ds(2), 3600)]);
+        let evidence = DelegationEvidence::from_authority(
+            "example.test.",
+            &[ds_record(&child.ds(2), Ttl::from_secs(3600))],
+        );
         let verdict = v.validate_delegation(&evidence, "test.", &parent.dnskeys());
         assert!(
             matches!(verdict, DelegationVerdict::Bogus(_)),
@@ -1154,8 +1159,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 
         let nsec = ResourceRecord {
             name: "example.test.".into(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: "zz.test.".into(),
                 type_bitmap: build_type_bitmap(&[rt::NS, rt::RRSIG, rt::NSEC]),
@@ -1198,8 +1203,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 
         let nsec = ResourceRecord {
             name: "example.test.".into(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: "zz.test.".into(),
                 type_bitmap: build_type_bitmap(&[rt::NS]),
@@ -1293,8 +1298,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let sig = zone.sign_records(std::slice::from_ref(&signed));
         let smuggled = ResourceRecord {
             name: "other.example.test.".into(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(6, 6, 6, 6))).unwrap(),
         };
 
@@ -1310,11 +1315,11 @@ example.test. DS 12345 13 2 ABCDEF0123456789
     // -----------------------------------------------------------------
 
     /// An NSEC resource record, ready to be signed.
-    fn nsec_record(owner: &str, next: &str, types: &[u16]) -> ResourceRecord {
+    fn nsec_record(owner: &str, next: &str, types: &[Rtype]) -> ResourceRecord {
         ResourceRecord {
             name: owner.to_string(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: next.to_string(),
                 type_bitmap: build_type_bitmap(types),
@@ -1519,8 +1524,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
     fn cname(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
             name: owner.to_string(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).unwrap(),
         }
     }
@@ -1528,17 +1533,17 @@ example.test. DS 12345 13 2 ABCDEF0123456789
     fn a(owner: &str, addr: &str) -> ResourceRecord {
         ResourceRecord {
             name: owner.to_string(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A(addr.parse().unwrap())).unwrap(),
         }
     }
 
-    fn rrsig_over(owner: &str, covered: u16) -> ResourceRecord {
+    fn rrsig_over(owner: &str, covered: Rtype) -> ResourceRecord {
         ResourceRecord {
             name: owner.to_string(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
                 type_covered: covered,
                 algorithm: 13,
@@ -1565,7 +1570,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             rrsig_over("c.example.org.", rt::A),
         ];
         assert_eq!(
-            cname_chain_shape("a.example.com.", rt::A, &answers),
+            cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers),
             ChainShape::Intact {
                 final_name: "c.example.org.".to_string()
             }
@@ -1575,7 +1580,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert_eq!(
             cname_chain_shape(
                 "www.example.com.",
-                rt::A,
+                Qtype::of(rt::A),
                 &[a("www.example.com.", "192.0.2.2")]
             ),
             ChainShape::Intact {
@@ -1595,7 +1600,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             // The A is for something else entirely.
             a("attacker.example.net.", "6.6.6.6"),
         ];
-        let shape = cname_chain_shape("a.example.com.", rt::A, &answers);
+        let shape = cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers);
         assert!(
             matches!(&shape, ChainShape::Broken(why) if why.contains("not on the path")),
             "got {shape:?}"
@@ -1610,7 +1615,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             cname("other.example.com.", "b.example.net."),
             a("b.example.net.", "192.0.2.1"),
         ];
-        let shape = cname_chain_shape("a.example.com.", rt::A, &answers);
+        let shape = cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers);
         assert!(matches!(shape, ChainShape::Broken(_)), "got {shape:?}");
     }
 
@@ -1623,7 +1628,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             // The CNAME from b to c is absent, so c is unreachable.
             a("c.example.org.", "192.0.2.1"),
         ];
-        let shape = cname_chain_shape("a.example.com.", rt::A, &answers);
+        let shape = cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers);
         assert!(matches!(shape, ChainShape::Broken(_)), "got {shape:?}");
     }
 
@@ -1633,7 +1638,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             cname("a.example.com.", "b.example.com."),
             cname("b.example.com.", "a.example.com."),
         ];
-        let shape = cname_chain_shape("a.example.com.", rt::A, &answers);
+        let shape = cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers);
         assert!(
             matches!(&shape, ChainShape::Broken(why) if why.contains("loops")),
             "got {shape:?}"
@@ -1649,7 +1654,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             cname("a.example.com.", "b.example.net."),
             cname("a.example.com.", "evil.example.net."),
         ];
-        let shape = cname_chain_shape("a.example.com.", rt::A, &answers);
+        let shape = cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers);
         assert!(
             matches!(&shape, ChainShape::Broken(why) if why.contains("more than one CNAME")),
             "got {shape:?}"
@@ -1666,7 +1671,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             rrsig_over("a.example.com.", rt::CNAME),
         ];
         assert_eq!(
-            cname_chain_shape("a.example.com.", rt::CNAME, &answers),
+            cname_chain_shape("a.example.com.", Qtype::of(rt::CNAME), &answers),
             ChainShape::Intact {
                 final_name: "a.example.com.".to_string()
             }
@@ -1683,7 +1688,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             a("b.EXAMPLE.net.", "192.0.2.1"),
         ];
         assert!(matches!(
-            cname_chain_shape("a.example.com.", rt::A, &answers),
+            cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers),
             ChainShape::Intact { .. }
         ));
     }
@@ -1699,7 +1704,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
                 &format!("n{}.example.com.", i + 1),
             ));
         }
-        let shape = cname_chain_shape("n0.example.com.", rt::A, &answers);
+        let shape = cname_chain_shape("n0.example.com.", Qtype::of(rt::A), &answers);
         assert!(
             matches!(&shape, ChainShape::Broken(why) if why.contains("longer than")),
             "got {shape:?}"

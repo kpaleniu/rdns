@@ -13,6 +13,9 @@
 use crate::dnssec::{key_tag, rrsig_labels, signed_data, Dnskey, Ds, Rrset, Rrsig};
 use crate::dnssec_key::{SigningAlgorithm, SigningKey};
 use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::Class;
+use crate::Rtype;
+use crate::Ttl;
 use crate::{ParsedRecord, RecordData, ResourceRecord};
 
 /// DNSKEY flags for a zone-signing key, and for a key-signing key (which adds
@@ -92,7 +95,7 @@ impl TestKey {
     pub fn rrsig_template(
         &self,
         owner: &str,
-        type_covered: u16,
+        type_covered: Rtype,
         original_ttl: u32,
         signer: &str,
         flags: u16,
@@ -116,8 +119,8 @@ impl TestKey {
     pub fn sign_rrset(
         &self,
         owner: &str,
-        rtype: u16,
-        class: u16,
+        rtype: Rtype,
+        class: Class,
         ttl: u32,
         signer: &str,
         rdatas: &[RecordData],
@@ -168,7 +171,7 @@ impl TestZone {
     pub fn signed_dnskey_rrset(&self) -> (Vec<RecordData>, Rrsig) {
         let rdatas: Vec<RecordData> = self.dnskeys().iter().map(dnskey_rdata).collect();
         let sig = self.ksk.sign_rrset_as(
-            &Rrset::new(&self.name, rt::DNSKEY, 1, &rdatas),
+            &Rrset::new(&self.name, rt::DNSKEY, Class::new(1), &rdatas),
             3600,
             &self.name,
             KSK_FLAGS,
@@ -196,12 +199,12 @@ impl TestZone {
             .into_iter()
             .map(|rdata| ResourceRecord {
                 name: self.name.clone(),
-                class: 1,
-                ttl: 3600,
+                class: Class::new(1),
+                ttl: Ttl::from_secs(3600),
                 rdata,
             })
             .collect();
-        out.push(rrsig_record(&sig, 3600));
+        out.push(rrsig_record(&sig, Ttl::from_secs(3600)));
         out
     }
 
@@ -221,7 +224,7 @@ impl TestZone {
             wildcard,
             first.rdata.rtype,
             first.class,
-            first.ttl.max(0) as u32,
+            first.ttl.as_secs(),
             &self.name,
             &rdatas,
         );
@@ -238,7 +241,7 @@ impl TestZone {
             &first.name,
             first.rdata.rtype,
             first.class,
-            first.ttl.max(0) as u32,
+            first.ttl.as_secs(),
             &self.name,
             &rdatas,
         );
@@ -258,10 +261,10 @@ pub fn dnskey_rdata(key: &Dnskey) -> RecordData {
 }
 
 /// An RRSIG as a resource record.
-pub fn rrsig_record(sig: &Rrsig, ttl: i32) -> ResourceRecord {
+pub fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: sig.owner.clone(),
-        class: 1,
+        class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
             type_covered: sig.type_covered,
@@ -279,10 +282,10 @@ pub fn rrsig_record(sig: &Rrsig, ttl: i32) -> ResourceRecord {
 }
 
 /// A DS as a resource record.
-pub fn ds_record(ds: &Ds, ttl: i32) -> ResourceRecord {
+pub fn ds_record(ds: &Ds, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: ds.owner.clone(),
-        class: 1,
+        class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::DS {
             key_tag: ds.key_tag,

@@ -36,6 +36,8 @@
 //! happened.
 
 use crate::error::{DnssecError, DnssecResult};
+use crate::Class;
+use crate::Ttl;
 use std::path::Path;
 
 use crate::dnssec::{ds_digest, Dnskey, Ds, Rrset};
@@ -622,7 +624,7 @@ pub fn self_signers(zone: &str, records: &[ResourceRecord], now: u64) -> Vec<Dns
         .iter()
         .find(|rr| rr.rdata.rtype == rt::DNSKEY)
         .map(|rr| rr.class)
-        .unwrap_or(1);
+        .unwrap_or(Class::new(1));
     let rrset = Rrset::new(zone, rt::DNSKEY, class, &rdatas);
 
     keys.into_iter()
@@ -802,7 +804,7 @@ fn absolute(name: &str) -> String {
 
 /// A DNSKEY as a resource record, for building test RRsets and for anything that
 /// needs to put a tracked key back on the wire.
-pub fn key_record(key: &Dnskey, ttl: i32) -> Option<ResourceRecord> {
+pub fn key_record(key: &Dnskey, ttl: Ttl) -> Option<ResourceRecord> {
     let rdata = RecordData::from_parsed(&ParsedRecord::DNSKEY {
         flags: key.flags,
         protocol: key.protocol,
@@ -812,7 +814,7 @@ pub fn key_record(key: &Dnskey, ttl: i32) -> Option<ResourceRecord> {
     .ok()?;
     Some(ResourceRecord {
         name: key.owner.clone(),
-        class: 1,
+        class: Class::new(1),
         ttl,
         rdata,
     })
@@ -1421,7 +1423,7 @@ mod tests {
             })
             .collect();
         let sig = signer.sign_rrset_as(
-            &Rrset::new(zone, rt::DNSKEY, 1, &rdatas),
+            &Rrset::new(zone, rt::DNSKEY, Class::new(1), &rdatas),
             3600,
             zone,
             signer_flags,
@@ -1429,9 +1431,9 @@ mod tests {
 
         let mut records: Vec<ResourceRecord> = published
             .iter()
-            .map(|key| key_record(key, 3600).expect("a DNSKEY record"))
+            .map(|key| key_record(key, Ttl::from_secs(3600)).expect("a DNSKEY record"))
             .collect();
-        records.push(rrsig_record(&sig, 3600));
+        records.push(rrsig_record(&sig, Ttl::from_secs(3600)));
         records
     }
 

@@ -31,6 +31,8 @@
 
 use crate::dnssec::{canonical_name, label_count, suffix_labels};
 use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::Qtype;
+use crate::Ttl;
 use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -85,7 +87,7 @@ struct Entries {
     /// By name: this name does not exist, so no type at it does either.
     nxdomain: HashMap<String, Entry>,
     /// By (name, type): the name exists, this type at it does not.
-    nodata: HashMap<(String, u16), Entry>,
+    nodata: HashMap<(String, Qtype), Entry>,
 }
 
 impl Entries {
@@ -120,7 +122,7 @@ impl NegativeCache {
     /// Does nothing for a response that carries answer records — a CNAME chain
     /// ending in NODATA is a negative answer in RFC 2308's terms, but the chain
     /// is data the client needs and this cache has nowhere to put it.
-    pub fn insert(&self, qname: &str, qtype: u16, response: &DnsMessage, secure: bool) {
+    pub fn insert(&self, qname: &str, qtype: Qtype, response: &DnsMessage, secure: bool) {
         if self.max_entries == 0 || !response.answers.is_empty() {
             return;
         }
@@ -146,9 +148,7 @@ impl NegativeCache {
         let Ok(ParsedRecord::SOA { minimum, .. }) = soa_rr.rdata.parse() else {
             return;
         };
-        let ttl = (soa_rr.ttl.max(0) as u32)
-            .min(minimum)
-            .min(MAX_NEGATIVE_TTL);
+        let ttl = soa_rr.ttl.as_secs().min(minimum).min(MAX_NEGATIVE_TTL);
         if ttl == 0 {
             return;
         }
@@ -180,7 +180,7 @@ impl NegativeCache {
     }
 
     /// The cached "no" for this question, or `None` to go and ask.
-    pub fn get(&self, qname: &str, qtype: u16) -> Option<NegativeAnswer> {
+    pub fn get(&self, qname: &str, qtype: Qtype) -> Option<NegativeAnswer> {
         if self.max_entries == 0 {
             return None;
         }
@@ -239,7 +239,7 @@ impl Entry {
                 .authority
                 .iter()
                 .map(|rr| ResourceRecord {
-                    ttl: ttl.min(i32::MAX as u32) as i32,
+                    ttl: Ttl::from_secs(ttl),
                     ..rr.clone()
                 })
                 .collect(),
@@ -287,12 +287,13 @@ fn make_room(entries: &mut Entries, now: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Class;
     use crate::{OpCode, QueryClass, QuerySection, RecordData};
 
-    fn soa_record(zone: &str, minimum: u32, ttl: i32) -> ResourceRecord {
+    fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
         ResourceRecord {
             name: zone.to_string(),
-            class: 1,
+            class: Class::new(1),
             ttl,
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: format!("ns1.{zone}"),
@@ -322,12 +323,13 @@ mod tests {
             rcode,
             queries: vec![QuerySection {
                 qname: qname.to_string(),
-                qtype: rt::A,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             }],
             answers: Vec::new(),
             authorities: authority,
             additionals: Vec::new(),
+            edns: None,
         }
     }
 
@@ -335,7 +337,7 @@ mod tests {
         negative(
             qname,
             ResponseCode::NoSuchDomain,
-            vec![soa_record("example.com.", 300, 3600)],
+            vec![soa_record("example.com.", 300, Ttl::from_secs(3600))],
         )
     }
 
@@ -344,18 +346,18 @@ mod tests {
         let cache = NegativeCache::new(16);
         cache.insert(
             "nope.example.com.",
-            rt::A,
+            Qtype::of(rt::A),
             &nxdomain_for("nope.example.com."),
             false,
         );
 
         for qtype in [rt::A, rt::AAAA, rt::MX, rt::TXT] {
             let answer = cache
-                .get("nope.example.com.", qtype)
+                .get("nope.example.com.", Qtype::of(qtype))
                 .unwrap_or_else(|| panic!("type {qtype} should be denied too"));
             assert_eq!(answer.rcode, ResponseCode::NoSuchDomain);
         }
-        assert!(cache.get("other.example.com.", rt::A).is_none());
+        assert!(cache.get("other.example.com.", Qtype::of(rt::A)).is_none());
     }
 
     /// RFC 8020: nothing exists below a name that does not exist. The resolver's
@@ -365,16 +367,18 @@ mod tests {
         let cache = NegativeCache::new(16);
         cache.insert(
             "gone.example.com.",
-            rt::A,
+            Qtype::of(rt::A),
             &nxdomain_for("gone.example.com."),
             false,
         );
 
-        assert!(cache.get("a.gone.example.com.", rt::A).is_some());
-        assert!(cache.get("deep.b.gone.example.com.", rt::AAAA).is_some());
+        assert!(cache.get("a.gone.example.com.", Qtype::of(rt::A)).is_some());
+        assert!(cache
+            .get("deep.b.gone.example.com.", Qtype::of(rt::AAAA))
+            .is_some());
         // But not above it, and not beside it.
-        assert!(cache.get("example.com.", rt::A).is_none());
-        assert!(cache.get("gone2.example.com.", rt::A).is_none());
+        assert!(cache.get("example.com.", Qtype::of(rt::A)).is_none());
+        assert!(cache.get("gone2.example.com.", Qtype::of(rt::A)).is_none());
     }
 
     /// NODATA is about one type. Denying the others would deny records that
@@ -385,17 +389,21 @@ mod tests {
         let response = negative(
             "www.example.com.",
             ResponseCode::Ok,
-            vec![soa_record("example.com.", 300, 3600)],
+            vec![soa_record("example.com.", 300, Ttl::from_secs(3600))],
         );
-        cache.insert("www.example.com.", rt::AAAA, &response, false);
+        cache.insert("www.example.com.", Qtype::of(rt::AAAA), &response, false);
 
-        let answer = cache.get("www.example.com.", rt::AAAA).expect("cached");
+        let answer = cache
+            .get("www.example.com.", Qtype::of(rt::AAAA))
+            .expect("cached");
         assert_eq!(answer.rcode, ResponseCode::Ok, "NODATA is NOERROR");
         assert!(
-            cache.get("www.example.com.", rt::A).is_none(),
+            cache.get("www.example.com.", Qtype::of(rt::A)).is_none(),
             "another type at the same name says nothing about this one"
         );
-        assert!(cache.get("sub.www.example.com.", rt::AAAA).is_none());
+        assert!(cache
+            .get("sub.www.example.com.", Qtype::of(rt::AAAA))
+            .is_none());
     }
 
     /// RFC 2308 §5: the negative TTL is the lesser of the SOA's MINIMUM and the
@@ -407,27 +415,27 @@ mod tests {
         let minimum_wins = negative(
             "a.example.com.",
             ResponseCode::NoSuchDomain,
-            vec![soa_record("example.com.", 60, 3600)],
+            vec![soa_record("example.com.", 60, Ttl::from_secs(3600))],
         );
-        cache.insert("a.example.com.", rt::A, &minimum_wins, false);
-        assert!(cache.get("a.example.com.", rt::A).unwrap().ttl <= 60);
+        cache.insert("a.example.com.", Qtype::of(rt::A), &minimum_wins, false);
+        assert!(cache.get("a.example.com.", Qtype::of(rt::A)).unwrap().ttl <= 60);
 
         let record_ttl_wins = negative(
             "b.example.com.",
             ResponseCode::NoSuchDomain,
-            vec![soa_record("example.com.", 3600, 30)],
+            vec![soa_record("example.com.", 3600, Ttl::from_secs(30))],
         );
-        cache.insert("b.example.com.", rt::A, &record_ttl_wins, false);
-        assert!(cache.get("b.example.com.", rt::A).unwrap().ttl <= 30);
+        cache.insert("b.example.com.", Qtype::of(rt::A), &record_ttl_wins, false);
+        assert!(cache.get("b.example.com.", Qtype::of(rt::A)).unwrap().ttl <= 30);
 
         // A zone asking for a week gets the ceiling.
         let greedy = negative(
             "c.example.com.",
             ResponseCode::NoSuchDomain,
-            vec![soa_record("example.com.", 604800, 604800)],
+            vec![soa_record("example.com.", 604800, Ttl::from_secs(604800))],
         );
-        cache.insert("c.example.com.", rt::A, &greedy, false);
-        let answer = cache.get("c.example.com.", rt::A).unwrap();
+        cache.insert("c.example.com.", Qtype::of(rt::A), &greedy, false);
+        let answer = cache.get("c.example.com.", Qtype::of(rt::A)).unwrap();
         assert!(answer.ttl <= MAX_NEGATIVE_TTL, "got {}", answer.ttl);
     }
 
@@ -439,13 +447,16 @@ mod tests {
         let response = negative(
             "a.example.com.",
             ResponseCode::NoSuchDomain,
-            vec![soa_record("example.com.", 90, 3600)],
+            vec![soa_record("example.com.", 90, Ttl::from_secs(3600))],
         );
-        cache.insert("a.example.com.", rt::A, &response, false);
+        cache.insert("a.example.com.", Qtype::of(rt::A), &response, false);
 
-        let answer = cache.get("a.example.com.", rt::A).unwrap();
+        let answer = cache.get("a.example.com.", Qtype::of(rt::A)).unwrap();
         assert!(
-            answer.authority.iter().all(|rr| rr.ttl <= 90),
+            answer
+                .authority
+                .iter()
+                .all(|rr| rr.ttl <= Ttl::from_secs(90)),
             "authority TTLs must not exceed the negative TTL"
         );
         assert!(
@@ -461,12 +472,12 @@ mod tests {
         let cache = NegativeCache::new(16);
         cache.insert(
             "a.example.com.",
-            rt::A,
+            Qtype::of(rt::A),
             &negative("a.example.com.", ResponseCode::NoSuchDomain, Vec::new()),
             false,
         );
         assert!(cache.is_empty());
-        assert!(cache.get("a.example.com.", rt::A).is_none());
+        assert!(cache.get("a.example.com.", Qtype::of(rt::A)).is_none());
     }
 
     #[test]
@@ -474,16 +485,16 @@ mod tests {
         let cache = NegativeCache::new(16);
         cache.insert(
             "a.example.com.",
-            rt::A,
+            Qtype::of(rt::A),
             &negative(
                 "a.example.com.",
                 ResponseCode::NoSuchDomain,
-                vec![soa_record("example.com.", 0, 3600)],
+                vec![soa_record("example.com.", 0, Ttl::from_secs(3600))],
             ),
             false,
         );
         assert!(
-            cache.get("a.example.com.", rt::A).is_none(),
+            cache.get("a.example.com.", Qtype::of(rt::A)).is_none(),
             "0 means do not reuse"
         );
     }
@@ -495,11 +506,11 @@ mod tests {
         let cache = NegativeCache::new(16);
         cache.insert(
             "a.example.com.",
-            rt::A,
+            Qtype::of(rt::A),
             &negative(
                 "a.example.com.",
                 ResponseCode::ServerFailure,
-                vec![soa_record("example.com.", 300, 3600)],
+                vec![soa_record("example.com.", 300, Ttl::from_secs(3600))],
             ),
             false,
         );
@@ -514,15 +525,15 @@ mod tests {
         let mut response = negative(
             "www.example.com.",
             ResponseCode::Ok,
-            vec![soa_record("example.com.", 300, 3600)],
+            vec![soa_record("example.com.", 300, Ttl::from_secs(3600))],
         );
         response.answers.push(ResourceRecord {
             name: "www.example.com.".into(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::CNAME("elsewhere.test.".into())).unwrap(),
         });
-        cache.insert("www.example.com.", rt::AAAA, &response, false);
+        cache.insert("www.example.com.", Qtype::of(rt::AAAA), &response, false);
         assert!(cache.is_empty());
     }
 
@@ -532,19 +543,29 @@ mod tests {
         let cache = NegativeCache::new(16);
         cache.insert(
             "a.example.com.",
-            rt::A,
+            Qtype::of(rt::A),
             &nxdomain_for("a.example.com."),
             true,
         );
         cache.insert(
             "b.example.com.",
-            rt::A,
+            Qtype::of(rt::A),
             &nxdomain_for("b.example.com."),
             false,
         );
 
-        assert!(cache.get("a.example.com.", rt::A).unwrap().secure);
-        assert!(!cache.get("b.example.com.", rt::A).unwrap().secure);
+        assert!(
+            cache
+                .get("a.example.com.", Qtype::of(rt::A))
+                .unwrap()
+                .secure
+        );
+        assert!(
+            !cache
+                .get("b.example.com.", Qtype::of(rt::A))
+                .unwrap()
+                .secure
+        );
     }
 
     #[test]
@@ -552,11 +573,11 @@ mod tests {
         let cache = NegativeCache::new(16);
         cache.insert(
             "NoPe.Example.COM.",
-            rt::A,
+            Qtype::of(rt::A),
             &nxdomain_for("NoPe.Example.COM."),
             false,
         );
-        assert!(cache.get("nope.example.com.", rt::A).is_some());
+        assert!(cache.get("nope.example.com.", Qtype::of(rt::A)).is_some());
     }
 
     #[test]
@@ -564,12 +585,12 @@ mod tests {
         let cache = NegativeCache::new(0);
         cache.insert(
             "a.example.com.",
-            rt::A,
+            Qtype::of(rt::A),
             &nxdomain_for("a.example.com."),
             false,
         );
         assert!(cache.is_empty());
-        assert!(cache.get("a.example.com.", rt::A).is_none());
+        assert!(cache.get("a.example.com.", Qtype::of(rt::A)).is_none());
     }
 
     #[test]
@@ -577,13 +598,13 @@ mod tests {
         let cache = NegativeCache::new(4);
         for i in 0..10 {
             let name = format!("nope{i}.example.com.");
-            cache.insert(&name, rt::A, &nxdomain_for(&name), false);
+            cache.insert(&name, Qtype::of(rt::A), &nxdomain_for(&name), false);
             let nodata = negative(
                 &name,
                 ResponseCode::Ok,
-                vec![soa_record("example.com.", 300, 3600)],
+                vec![soa_record("example.com.", 300, Ttl::from_secs(3600))],
             );
-            cache.insert(&name, rt::AAAA, &nodata, false);
+            cache.insert(&name, Qtype::of(rt::AAAA), &nodata, false);
         }
         assert!(cache.len() <= 4, "held {} entries", cache.len());
     }

@@ -1,3 +1,4 @@
+use rdns::Rtype;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,8 +17,8 @@ use rdns::utils::current_unix_timestamp;
 use rdns::utils::record_types;
 use rdns::utils::{recv_error_is_transient, UDP_RECEIVE_BUFFER};
 use rdns::{
-    DnsCache, DnsMessage, Edns, OpCode, QuerySection, ResourceRecord, ResponseCode, EDNS_VERSION,
-    OPT_RECORD_TYPE,
+    DnsCache, DnsMessage, Edns, OpCode, Qtype, QuerySection, ResourceRecord, ResponseCode,
+    EDNS_VERSION, OPT_RECORD_TYPE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -513,7 +514,7 @@ struct AnchorProbe {
 async fn probe_zone(resolver: &Resolver, zone: &str) -> anyhow::Result<AnchorProbe> {
     let query = QuerySection {
         qname: zone.to_string(),
-        qtype: record_types::DNSKEY,
+        qtype: Qtype::of(record_types::DNSKEY),
         qclass: rdns::QueryClass::IN,
     };
     let (response, state) = resolver
@@ -1017,7 +1018,7 @@ async fn handle_query(
                         // seeing without turning anything up.
                         tracing::warn!(
                             qname = %query.qname,
-                            qtype = query.qtype,
+                            qtype = %query.qtype,
                             "DNSSEC validation failed: {why}"
                         );
                         // Fail closed. Data we know we cannot authenticate is worse
@@ -1096,7 +1097,7 @@ async fn handle_query(
                     // operator alerts on.
                     tracing::debug!(
                         qname = %query.qname,
-                        qtype = query.qtype,
+                        qtype = %query.qtype,
                         "resolve failed: {:#}",
                         e
                     );
@@ -1144,7 +1145,7 @@ fn finish(
     // it did not ask for them, they are large, and it has no use for them.
     // Records it asked for by type are a different matter and stay.
     if !client_wants_dnssec {
-        let asked_for = |rtype: u16| query.qtype == rtype;
+        let asked_for = |rtype: Rtype| query.qtype.is(rtype);
         let keep = |rr: &ResourceRecord| match rr.rdata.rtype {
             record_types::RRSIG | record_types::NSEC | record_types::NSEC3 => false,
             record_types::DNSKEY | record_types::DS => asked_for(rr.rdata.rtype),
@@ -1164,7 +1165,7 @@ fn finish(
         // Mirror DO back: it tells the client the signatures it sees were
         // deliberate rather than leftovers.
         edns.do_bit = client_wants_dnssec;
-        resp.set_edns(edns).ok()?;
+        resp.set_edns(edns);
     } else {
         resp.additionals
             .retain(|rr| rr.rdata.rtype != OPT_RECORD_TYPE);
@@ -1186,8 +1187,7 @@ fn edns_error(
     let mut resp = build_response(id, OpCode::Query, query, Vec::new(), rcode, recursion);
     // BADVERS is an extended RCODE, so the OPT record isn't optional here — it
     // carries the code's high bits.
-    resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE))
-        .ok()?;
+    resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE));
     resp.to_bytes_within(client_max).ok()
 }
 
@@ -1219,10 +1219,10 @@ fn unsupported_opcode(msg: &DnsMessage) -> Option<Vec<u8>> {
         answers: Vec::new(),
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     };
     if msg.has_edns() {
-        resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE))
-            .ok()?;
+        resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE));
     }
     resp.to_bytes_within(RDNSR_PAYLOAD_SIZE as usize).ok()
 }
@@ -1256,6 +1256,7 @@ fn build_response(
         answers,
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     }
 }
 
@@ -1297,12 +1298,13 @@ mod tests {
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
                 qname: "example.com.".to_string(),
-                qtype: record_types::A,
+                qtype: Qtype::of(record_types::A),
                 qclass: rdns::QueryClass::IN,
             }],
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         };
         let mut buf = vec![0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("serialize");

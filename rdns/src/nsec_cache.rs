@@ -34,6 +34,9 @@ use crate::dnssec_denial::{
     canonical_sort_key, proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3,
 };
 use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::Qtype;
+use crate::Rtype;
+use crate::Ttl;
 use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -44,8 +47,8 @@ use std::sync::Mutex;
 /// presence in a bitmap describes the *other* types' signatures rather than an
 /// RRSIG RRset of its own. Neither can be reasoned about from a type bitmap, so
 /// both go upstream.
-fn synthesizable_qtype(qtype: u16) -> bool {
-    qtype != 255 && qtype != rt::RRSIG
+fn synthesizable_qtype(qtype: Qtype) -> bool {
+    qtype != Qtype::ANY && !qtype.is(rt::RRSIG)
 }
 
 /// One zone's validated denial material.
@@ -66,7 +69,7 @@ struct ZoneProofs {
     /// NSEC is one about every name in its gap. Keyed by the wildcard rather than
     /// by the name that was asked for, because the name asked for is the one
     /// thing about it that is not reusable.
-    wildcards: HashMap<(String, u16), CachedWildcard>,
+    wildcards: HashMap<(String, Qtype), CachedWildcard>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,7 +220,7 @@ impl NsecCache {
         let zone = canonical_name(&soa_rr.name);
         let now = current_unix_timestamp();
 
-        let soa_ttl = soa_rr.ttl.max(0) as u32;
+        let soa_ttl = soa_rr.ttl.as_secs();
         let negative_ttl = soa_ttl.min(minimum);
         let soa = CachedSoa {
             records: records_at(&response.authorities, &zone, rt::SOA),
@@ -245,7 +248,7 @@ impl NsecCache {
                     if !is_at_or_below(&nsec.owner, &zone) {
                         continue;
                     }
-                    let ttl = (rr.ttl.max(0) as u64).min(MAX_PROOF_TTL);
+                    let ttl = rr.ttl.capped_at(MAX_PROOF_TTL as u32).as_u64();
                     let key = canonical_sort_key(&nsec.owner);
                     let records = records_covering(&response.authorities, &nsec.owner, rt::NSEC);
                     insert_bounded(
@@ -273,7 +276,7 @@ impl NsecCache {
                     if nsec3.opt_out() {
                         continue;
                     }
-                    let ttl = (rr.ttl.max(0) as u64).min(MAX_PROOF_TTL);
+                    let ttl = rr.ttl.capped_at(MAX_PROOF_TTL as u32).as_u64();
                     let key = nsec3.owner_hash.clone();
                     let records = records_covering(&response.authorities, &nsec3.owner, rt::NSEC3);
                     insert_bounded(
@@ -319,7 +322,7 @@ impl NsecCache {
         // Which RRsets in the answer came from a wildcard, and which wildcard.
         // The RRSIG's label count is what says so (RFC 4035 §5.3.4): fewer labels
         // than the owner name has means the signature was made at a wildcard.
-        let mut pending: Vec<(String, String, u16)> = Vec::new();
+        let mut pending: Vec<(String, String, Rtype)> = Vec::new();
         for rr in &response.answers {
             let Some(rrsig) = Rrsig::from_record(rr) else {
                 continue;
@@ -348,7 +351,7 @@ impl NsecCache {
             return;
         };
         for (zone, wildcard, rtype) in pending {
-            if !synthesizable_qtype(rtype) {
+            if !synthesizable_qtype(Qtype::of(rtype)) {
                 continue;
             }
             if !zones.contains_key(&zone) && zones.len() >= self.max_zones {
@@ -384,7 +387,7 @@ impl NsecCache {
             }
             let ttl = records
                 .iter()
-                .map(|rr| (rr.ttl.max(0) as u64).min(MAX_PROOF_TTL))
+                .map(|rr| rr.ttl.capped_at(MAX_PROOF_TTL as u32).as_u64())
                 .min()
                 .unwrap_or(0);
             if ttl == 0 {
@@ -393,7 +396,7 @@ impl NsecCache {
 
             insert_bounded_map(
                 &mut entry.wildcards,
-                (wildcard, rtype),
+                (wildcard, Qtype::of(rtype)),
                 CachedWildcard {
                     records,
                     expires_at: now + ttl,
@@ -414,7 +417,7 @@ impl NsecCache {
                 if !is_at_or_below(&nsec.owner, &zone) {
                     continue;
                 }
-                let ttl = (rr.ttl.max(0) as u64).min(MAX_PROOF_TTL);
+                let ttl = rr.ttl.capped_at(MAX_PROOF_TTL as u32).as_u64();
                 let key = canonical_sort_key(&nsec.owner);
                 let records = records_covering(&response.authorities, &nsec.owner, rt::NSEC);
                 insert_bounded(
@@ -459,7 +462,7 @@ impl NsecCache {
     /// the safe direction. Widening this needs a cached proof about the
     /// *intermediate* names, which is a separate piece of work (see `TODO.md`
     /// #9a's note on aggressive use).
-    pub fn synthesize_wildcard(&self, qname: &str, qtype: u16) -> Option<WildcardSynthesis> {
+    pub fn synthesize_wildcard(&self, qname: &str, qtype: Qtype) -> Option<WildcardSynthesis> {
         if !synthesizable_qtype(qtype) {
             return None;
         }
@@ -513,7 +516,7 @@ impl NsecCache {
     /// Answer `qname`/`qtype` from cached proofs, or `None` to go and ask.
     ///
     /// `None` is always safe and is the answer whenever anything is in doubt.
-    pub fn synthesize(&self, qname: &str, qtype: u16) -> Option<Synthesis> {
+    pub fn synthesize(&self, qname: &str, qtype: Qtype) -> Option<Synthesis> {
         if !synthesizable_qtype(qtype) {
             return None;
         }
@@ -620,18 +623,24 @@ impl ZoneProofs {
         &self,
         qname: &str,
         zone: &str,
-        qtype: u16,
+        qtype: Qtype,
         now: u64,
     ) -> Option<(ResponseCode, Vec<ResourceRecord>, u32)> {
         if let Some(cached) = self.matching_nsec(qname, now) {
             // At a delegation the parent holds only the DS; everything else is
             // the child's to answer, and the real reply is a referral rather
             // than NODATA.
-            if is_delegation(&cached.proof) && qtype != rt::DS {
+            if is_delegation(&cached.proof) && !qtype.is(rt::DS) {
                 return None;
             }
-            if proves_nodata(qname, zone, qtype, std::slice::from_ref(&cached.proof), &[])
-                .is_proved()
+            if proves_nodata(
+                qname,
+                zone,
+                Rtype::new(qtype.to_u16()),
+                std::slice::from_ref(&cached.proof),
+                &[],
+            )
+            .is_proved()
             {
                 return Some((
                     ResponseCode::Ok,
@@ -647,11 +656,18 @@ impl ZoneProofs {
             if !cached.proof.matches(qname).unwrap_or(false) {
                 continue;
             }
-            if cached.proof.has_type(rt::NS) && !cached.proof.has_type(rt::SOA) && qtype != rt::DS {
+            if cached.proof.has_type(rt::NS) && !cached.proof.has_type(rt::SOA) && !qtype.is(rt::DS)
+            {
                 return None;
             }
-            if proves_nodata(qname, zone, qtype, &[], std::slice::from_ref(&cached.proof))
-                .is_proved()
+            if proves_nodata(
+                qname,
+                zone,
+                Rtype::new(qtype.to_u16()),
+                &[],
+                std::slice::from_ref(&cached.proof),
+            )
+            .is_proved()
             {
                 return Some((
                     ResponseCode::Ok,
@@ -806,7 +822,7 @@ fn is_at_or_below(name: &str, ancestor: &str) -> bool {
 }
 
 /// Records of `rtype` at `owner`, plus the RRSIGs that cover them.
-fn records_covering(records: &[ResourceRecord], owner: &str, rtype: u16) -> Vec<ResourceRecord> {
+fn records_covering(records: &[ResourceRecord], owner: &str, rtype: Rtype) -> Vec<ResourceRecord> {
     let owner = canonical_name(owner);
     records
         .iter()
@@ -822,7 +838,7 @@ fn records_covering(records: &[ResourceRecord], owner: &str, rtype: u16) -> Vec<
         .collect()
 }
 
-fn records_at(records: &[ResourceRecord], owner: &str, rtype: u16) -> Vec<ResourceRecord> {
+fn records_at(records: &[ResourceRecord], owner: &str, rtype: Rtype) -> Vec<ResourceRecord> {
     records_covering(records, owner, rtype)
 }
 
@@ -832,7 +848,7 @@ fn with_ttl(records: &[ResourceRecord], ttl: u32) -> Vec<ResourceRecord> {
     records
         .iter()
         .map(|rr| ResourceRecord {
-            ttl: ttl.min(i32::MAX as u32) as i32,
+            ttl: Ttl::from_secs(ttl),
             ..rr.clone()
         })
         .collect()
@@ -845,8 +861,8 @@ fn with_ttl(records: &[ResourceRecord], ttl: u32) -> Vec<ResourceRecord> {
 /// at every level, and this is bounded for the same reason everything else here
 /// is — the alternative is unbounded.
 fn insert_bounded_map(
-    map: &mut HashMap<(String, u16), CachedWildcard>,
-    key: (String, u16),
+    map: &mut HashMap<(String, Qtype), CachedWildcard>,
+    key: (String, Qtype),
     value: CachedWildcard,
     now: u64,
 ) {
@@ -901,12 +917,13 @@ fn evict_zone(zones: &mut HashMap<String, ZoneProofs>, now: u64) {
 mod tests {
     use super::*;
     use crate::dnssec_denial::{base32hex_encode, build_type_bitmap, nsec3_hash};
+    use crate::Class;
     use crate::{OpCode, QueryClass, QuerySection, RecordData};
 
-    fn soa_record(zone: &str, minimum: u32, ttl: i32) -> ResourceRecord {
+    fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
         ResourceRecord {
             name: zone.to_string(),
-            class: 1,
+            class: Class::new(1),
             ttl,
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: format!("ns1.{zone}"),
@@ -921,10 +938,10 @@ mod tests {
         }
     }
 
-    fn nsec_record(owner: &str, next: &str, types: &[u16], ttl: i32) -> ResourceRecord {
+    fn nsec_record(owner: &str, next: &str, types: &[Rtype], ttl: Ttl) -> ResourceRecord {
         ResourceRecord {
             name: owner.to_string(),
-            class: 1,
+            class: Class::new(1),
             ttl,
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: next.to_string(),
@@ -939,14 +956,14 @@ mod tests {
         name: &str,
         next: &[u8],
         flags: u8,
-        types: &[u16],
-        ttl: i32,
+        types: &[Rtype],
+        ttl: Ttl,
     ) -> ResourceRecord {
         let salt = vec![0xaa, 0xbb];
         let hash = nsec3_hash(name, &salt, 3).unwrap();
         ResourceRecord {
             name: format!("{}.{}", base32hex_encode(&hash).to_lowercase(), zone),
-            class: 1,
+            class: Class::new(1),
             ttl,
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
                 hash_algorithm: 1,
@@ -975,12 +992,13 @@ mod tests {
             rcode,
             queries: vec![QuerySection {
                 qname: qname.to_string(),
-                qtype: rt::A,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             }],
             answers: Vec::new(),
             authorities: authority,
             additionals: Vec::new(),
+            edns: None,
         }
     }
 
@@ -992,7 +1010,7 @@ mod tests {
             "nope.example.com.",
             ResponseCode::NoSuchDomain,
             vec![
-                soa_record("example.com.", 3600, 3600),
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
                 // The apex NSEC covers everything from the apex to www, which
                 // includes the wildcard position, so a name in the gap has no
                 // wildcard to fall back on either.
@@ -1000,7 +1018,7 @@ mod tests {
                     "example.com.",
                     "www.example.com.",
                     &[rt::SOA, rt::NS, rt::RRSIG, rt::NSEC],
-                    3600,
+                    Ttl::from_secs(3600),
                 ),
             ],
         ));
@@ -1016,7 +1034,7 @@ mod tests {
             "b.example.com.",
         ] {
             let s = cache
-                .synthesize(name, rt::A)
+                .synthesize(name, Qtype::of(rt::A))
                 .unwrap_or_else(|| panic!("{name} is inside the cached gap"));
             assert_eq!(s.rcode, ResponseCode::NoSuchDomain);
             assert!(
@@ -1033,13 +1051,19 @@ mod tests {
     fn test_names_outside_the_gap_are_not_denied() {
         let cache = cache_with_a_gap();
         // Past the end of the gap.
-        assert!(cache.synthesize("zzz.example.com.", rt::A).is_none());
+        assert!(cache
+            .synthesize("zzz.example.com.", Qtype::of(rt::A))
+            .is_none());
         // The gap's own endpoints exist.
-        assert!(cache.synthesize("www.example.com.", rt::A).is_none());
+        assert!(cache
+            .synthesize("www.example.com.", Qtype::of(rt::A))
+            .is_none());
         // A different zone entirely.
-        assert!(cache.synthesize("nope.example.org.", rt::A).is_none());
+        assert!(cache
+            .synthesize("nope.example.org.", Qtype::of(rt::A))
+            .is_none());
         // And a name above the zone.
-        assert!(cache.synthesize("com.", rt::A).is_none());
+        assert!(cache.synthesize("com.", Qtype::of(rt::A)).is_none());
     }
 
     /// The trap this cache is most likely to fall into. `sub.example.com.` and
@@ -1052,7 +1076,7 @@ mod tests {
             "gone.example.com.",
             ResponseCode::NoSuchDomain,
             vec![
-                soa_record("example.com.", 3600, 3600),
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
                 // A delegation at sub.example.com., with the next name in the
                 // parent zone being www. Canonically, x.sub.example.com. falls
                 // inside (sub.example.com., www.example.com.).
@@ -1060,7 +1084,7 @@ mod tests {
                     "sub.example.com.",
                     "www.example.com.",
                     &[rt::NS, rt::RRSIG, rt::NSEC],
-                    3600,
+                    Ttl::from_secs(3600),
                 ),
             ],
         ));
@@ -1078,10 +1102,14 @@ mod tests {
         );
 
         assert!(
-            cache.synthesize("x.sub.example.com.", rt::A).is_none(),
+            cache
+                .synthesize("x.sub.example.com.", Qtype::of(rt::A))
+                .is_none(),
             "names in a delegated child zone must never be denied from the parent's gap"
         );
-        assert!(cache.synthesize("deep.x.sub.example.com.", rt::A).is_none());
+        assert!(cache
+            .synthesize("deep.x.sub.example.com.", Qtype::of(rt::A))
+            .is_none());
     }
 
     /// At a delegation the parent holds only the DS. A NODATA there is right
@@ -1093,22 +1121,24 @@ mod tests {
             "sub.example.com.",
             ResponseCode::Ok,
             vec![
-                soa_record("example.com.", 3600, 3600),
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
                 nsec_record(
                     "sub.example.com.",
                     "www.example.com.",
                     &[rt::NS, rt::RRSIG, rt::NSEC],
-                    3600,
+                    Ttl::from_secs(3600),
                 ),
             ],
         ));
 
-        let ds = cache.synthesize("sub.example.com.", rt::DS);
+        let ds = cache.synthesize("sub.example.com.", Qtype::of(rt::DS));
         assert!(ds.is_some(), "no DS at the delegation is a real NODATA");
         assert_eq!(ds.unwrap().rcode, ResponseCode::Ok);
 
         assert!(
-            cache.synthesize("sub.example.com.", rt::A).is_none(),
+            cache
+                .synthesize("sub.example.com.", Qtype::of(rt::A))
+                .is_none(),
             "an A query at a delegation is a referral, not NODATA"
         );
     }
@@ -1120,23 +1150,25 @@ mod tests {
             "www.example.com.",
             ResponseCode::Ok,
             vec![
-                soa_record("example.com.", 3600, 3600),
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
                 nsec_record(
                     "www.example.com.",
                     "zzz.example.com.",
                     &[rt::A, rt::RRSIG, rt::NSEC],
-                    3600,
+                    Ttl::from_secs(3600),
                 ),
             ],
         ));
 
         let s = cache
-            .synthesize("www.example.com.", rt::AAAA)
+            .synthesize("www.example.com.", Qtype::of(rt::AAAA))
             .expect("NODATA");
         assert_eq!(s.rcode, ResponseCode::Ok);
         assert!(s.authority.iter().all(|rr| rr.rdata.rtype != rt::A));
         // A is in the bitmap, so that one has to go upstream.
-        assert!(cache.synthesize("www.example.com.", rt::A).is_none());
+        assert!(cache
+            .synthesize("www.example.com.", Qtype::of(rt::A))
+            .is_none());
     }
 
     /// NXDOMAIN needs the wildcard denied as well: a gap alone does not rule
@@ -1150,17 +1182,19 @@ mod tests {
             "nope.example.com.",
             ResponseCode::NoSuchDomain,
             vec![
-                soa_record("example.com.", 3600, 3600),
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
                 nsec_record(
                     "m.example.com.",
                     "zzz.example.com.",
                     &[rt::A, rt::RRSIG, rt::NSEC],
-                    3600,
+                    Ttl::from_secs(3600),
                 ),
             ],
         ));
         assert!(
-            cache.synthesize("nope.example.com.", rt::A).is_none(),
+            cache
+                .synthesize("nope.example.com.", Qtype::of(rt::A))
+                .is_none(),
             "without a wildcard denial a wildcard could still have answered"
         );
     }
@@ -1168,8 +1202,13 @@ mod tests {
     #[test]
     fn test_any_and_rrsig_are_never_synthesized() {
         let cache = cache_with_a_gap();
-        assert!(cache.synthesize("nope.example.com.", 255).is_none(), "ANY");
-        assert!(cache.synthesize("nope.example.com.", rt::RRSIG).is_none());
+        assert!(
+            cache.synthesize("nope.example.com.", Qtype::ANY).is_none(),
+            "ANY"
+        );
+        assert!(cache
+            .synthesize("nope.example.com.", Qtype::of(rt::RRSIG))
+            .is_none());
     }
 
     /// An expired proof denies nothing.
@@ -1180,17 +1219,19 @@ mod tests {
             "nope.example.com.",
             ResponseCode::NoSuchDomain,
             vec![
-                soa_record("example.com.", 0, 0),
+                soa_record("example.com.", 0, Ttl::from_secs(0)),
                 nsec_record(
                     "example.com.",
                     "www.example.com.",
                     &[rt::SOA, rt::NS, rt::RRSIG, rt::NSEC],
-                    0,
+                    Ttl::from_secs(0),
                 ),
             ],
         ));
         assert!(
-            cache.synthesize("nope.example.com.", rt::A).is_none(),
+            cache
+                .synthesize("nope.example.com.", Qtype::of(rt::A))
+                .is_none(),
             "a zero TTL means do not reuse this"
         );
     }
@@ -1206,18 +1247,18 @@ mod tests {
             vec![
                 // SOA MINIMUM of 60 caps the negative answer, even though the
                 // NSEC itself is good for an hour.
-                soa_record("example.com.", 60, 3600),
+                soa_record("example.com.", 60, Ttl::from_secs(3600)),
                 nsec_record(
                     "example.com.",
                     "www.example.com.",
                     &[rt::SOA, rt::NS, rt::RRSIG, rt::NSEC],
-                    3600,
+                    Ttl::from_secs(3600),
                 ),
             ],
         ));
 
         let s = cache
-            .synthesize("nope.example.com.", rt::A)
+            .synthesize("nope.example.com.", Qtype::of(rt::A))
             .expect("denied");
         assert!(
             s.ttl <= 60,
@@ -1225,7 +1266,7 @@ mod tests {
             s.ttl
         );
         assert!(
-            s.authority.iter().all(|rr| rr.ttl <= 60),
+            s.authority.iter().all(|rr| rr.ttl <= Ttl::from_secs(60)),
             "the records handed back must count down too"
         );
     }
@@ -1241,11 +1282,13 @@ mod tests {
                 "example.com.",
                 "www.example.com.",
                 &[rt::SOA, rt::NS],
-                3600,
+                Ttl::from_secs(3600),
             )],
         ));
         assert!(cache.is_empty());
-        assert!(cache.synthesize("nope.example.com.", rt::A).is_none());
+        assert!(cache
+            .synthesize("nope.example.com.", Qtype::of(rt::A))
+            .is_none());
     }
 
     /// A proof from outside the zone that signed the SOA is not that zone's to
@@ -1257,11 +1300,16 @@ mod tests {
             "nope.example.com.",
             ResponseCode::NoSuchDomain,
             vec![
-                soa_record("example.com.", 3600, 3600),
-                nsec_record("a.evil.test.", "z.evil.test.", &[rt::A], 3600),
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
+                nsec_record(
+                    "a.evil.test.",
+                    "z.evil.test.",
+                    &[rt::A],
+                    Ttl::from_secs(3600),
+                ),
             ],
         ));
-        assert!(cache.synthesize("m.evil.test.", rt::A).is_none());
+        assert!(cache.synthesize("m.evil.test.", Qtype::of(rt::A)).is_none());
     }
 
     // -----------------------------------------------------------------
@@ -1278,19 +1326,21 @@ mod tests {
             "nope.example.com.",
             ResponseCode::NoSuchDomain,
             vec![
-                soa_record("example.com.", 3600, 3600),
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
                 nsec3_record(
                     "example.com.",
                     "example.com.",
                     &[0xff; 20],
                     0x01, // opt-out
                     &[rt::SOA, rt::NS],
-                    3600,
+                    Ttl::from_secs(3600),
                 ),
             ],
         ));
         assert!(
-            cache.synthesize("nope.example.com.", rt::A).is_none(),
+            cache
+                .synthesize("nope.example.com.", Qtype::of(rt::A))
+                .is_none(),
             "an opt-out span proves nothing about what is inside it"
         );
     }
@@ -1302,23 +1352,25 @@ mod tests {
             "www.example.com.",
             ResponseCode::Ok,
             vec![
-                soa_record("example.com.", 3600, 3600),
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
                 nsec3_record(
                     "example.com.",
                     "www.example.com.",
                     &[0xff; 20],
                     0x00,
                     &[rt::A, rt::RRSIG],
-                    3600,
+                    Ttl::from_secs(3600),
                 ),
             ],
         ));
 
         let s = cache
-            .synthesize("www.example.com.", rt::AAAA)
+            .synthesize("www.example.com.", Qtype::of(rt::AAAA))
             .expect("the matching NSEC3 denies AAAA");
         assert_eq!(s.rcode, ResponseCode::Ok);
-        assert!(cache.synthesize("www.example.com.", rt::A).is_none());
+        assert!(cache
+            .synthesize("www.example.com.", Qtype::of(rt::A))
+            .is_none());
     }
 
     // -----------------------------------------------------------------
@@ -1334,8 +1386,13 @@ mod tests {
                 &format!("nope.{zone}"),
                 ResponseCode::NoSuchDomain,
                 vec![
-                    soa_record(&zone, 3600, 3600),
-                    nsec_record(&zone, &format!("www.{zone}"), &[rt::SOA, rt::NS], 3600),
+                    soa_record(&zone, 3600, Ttl::from_secs(3600)),
+                    nsec_record(
+                        &zone,
+                        &format!("www.{zone}"),
+                        &[rt::SOA, rt::NS],
+                        Ttl::from_secs(3600),
+                    ),
                 ],
             ));
         }
@@ -1349,12 +1406,19 @@ mod tests {
             "nope.example.com.",
             ResponseCode::NoSuchDomain,
             vec![
-                soa_record("example.com.", 3600, 3600),
-                nsec_record("example.com.", "www.example.com.", &[rt::SOA], 3600),
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
+                nsec_record(
+                    "example.com.",
+                    "www.example.com.",
+                    &[rt::SOA],
+                    Ttl::from_secs(3600),
+                ),
             ],
         ));
         assert!(cache.is_empty());
-        assert!(cache.synthesize("nope.example.com.", rt::A).is_none());
+        assert!(cache
+            .synthesize("nope.example.com.", Qtype::of(rt::A))
+            .is_none());
     }
 
     /// The deepest zone wins: a parent's chain stops at the delegation, so its
@@ -1366,27 +1430,27 @@ mod tests {
             "x.com.",
             ResponseCode::NoSuchDomain,
             vec![
-                soa_record("com.", 3600, 3600),
-                nsec_record("com.", "zzz.com.", &[rt::SOA, rt::NS], 3600),
+                soa_record("com.", 3600, Ttl::from_secs(3600)),
+                nsec_record("com.", "zzz.com.", &[rt::SOA, rt::NS], Ttl::from_secs(3600)),
             ],
         ));
         cache.insert_validated(&negative(
             "nope.example.com.",
             ResponseCode::Ok,
             vec![
-                soa_record("example.com.", 3600, 3600),
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
                 nsec_record(
                     "nope.example.com.",
                     "zzz.example.com.",
                     &[rt::A, rt::RRSIG, rt::NSEC],
-                    3600,
+                    Ttl::from_secs(3600),
                 ),
             ],
         ));
 
         // Answered from example.com.'s NODATA proof, not com.'s gap.
         let s = cache
-            .synthesize("nope.example.com.", rt::AAAA)
+            .synthesize("nope.example.com.", Qtype::of(rt::AAAA))
             .expect("the child zone's proof applies");
         assert_eq!(
             s.rcode,
@@ -1404,14 +1468,14 @@ mod tests {
     fn wildcard_answer(qname: &str, wildcard_labels: u8, nsec: ResourceRecord) -> DnsMessage {
         let a = ResourceRecord {
             name: qname.to_string(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.7".parse().unwrap())).unwrap(),
         };
         let sig = ResourceRecord {
             name: qname.to_string(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
                 type_covered: rt::A,
                 algorithm: 13,
@@ -1427,8 +1491,8 @@ mod tests {
         };
         let nsec_sig = ResourceRecord {
             name: nsec.name.clone(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
                 type_covered: rt::NSEC,
                 algorithm: 13,
@@ -1455,17 +1519,23 @@ mod tests {
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
                 qname: qname.to_string(),
-                qtype: rt::A,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             }],
             answers: vec![a, sig],
             authorities: vec![nsec, nsec_sig],
             additionals: Vec::new(),
+            edns: None,
         }
     }
 
     fn apex_gap() -> ResourceRecord {
-        nsec_record("example.com.", "zzz.example.com.", &[rt::SOA, rt::NS], 300)
+        nsec_record(
+            "example.com.",
+            "zzz.example.com.",
+            &[rt::SOA, rt::NS],
+            Ttl::from_secs(300),
+        )
     }
 
     /// The point of section 5.3: one validated wildcard answer answers for every
@@ -1478,7 +1548,7 @@ mod tests {
         cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
 
         let s = cache
-            .synthesize_wildcard("b.example.com.", rt::A)
+            .synthesize_wildcard("b.example.com.", Qtype::of(rt::A))
             .expect("the same wildcard reaches this name too");
         assert_eq!(
             s.answers
@@ -1492,7 +1562,7 @@ mod tests {
                 rr.name, "b.example.com.",
                 "re-owned onto the name asked for"
             );
-            assert!(rr.ttl as u32 <= 300);
+            assert!(rr.ttl.as_secs() <= 300);
         }
         assert!(
             s.answers.iter().any(|rr| rr.rdata.rtype == rt::RRSIG),
@@ -1522,13 +1592,13 @@ mod tests {
 
         assert!(
             cache
-                .synthesize_wildcard("x.b.example.com.", rt::A)
+                .synthesize_wildcard("x.b.example.com.", Qtype::of(rt::A))
                 .is_none(),
             "*.example.com. does not reach a name two labels down"
         );
         assert!(
             cache
-                .synthesize_wildcard("x.y.z.example.com.", rt::A)
+                .synthesize_wildcard("x.y.z.example.com.", Qtype::of(rt::A))
                 .is_none(),
             "nor any deeper"
         );
@@ -1544,10 +1614,17 @@ mod tests {
         cache.insert_validated_wildcard(&wildcard_answer(
             "a.example.com.",
             2,
-            nsec_record("example.com.", "aa.example.com.", &[rt::SOA, rt::NS], 300),
+            nsec_record(
+                "example.com.",
+                "aa.example.com.",
+                &[rt::SOA, rt::NS],
+                Ttl::from_secs(300),
+            ),
         ));
 
-        assert!(cache.synthesize_wildcard("b.example.com.", rt::A).is_none());
+        assert!(cache
+            .synthesize_wildcard("b.example.com.", Qtype::of(rt::A))
+            .is_none());
     }
 
     /// The type has to match: a wildcard holding an A says nothing about AAAA.
@@ -1556,12 +1633,14 @@ mod tests {
         let cache = NsecCache::new(4);
         cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
 
-        assert!(cache.synthesize_wildcard("b.example.com.", rt::A).is_some());
         assert!(cache
-            .synthesize_wildcard("b.example.com.", rt::AAAA)
+            .synthesize_wildcard("b.example.com.", Qtype::of(rt::A))
+            .is_some());
+        assert!(cache
+            .synthesize_wildcard("b.example.com.", Qtype::of(rt::AAAA))
             .is_none());
         assert!(cache
-            .synthesize_wildcard("b.example.com.", rt::MX)
+            .synthesize_wildcard("b.example.com.", Qtype::of(rt::MX))
             .is_none());
     }
 
@@ -1573,7 +1652,9 @@ mod tests {
         // labels=3 for a three-label owner: signed at its own name.
         cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 3, apex_gap()));
 
-        assert!(cache.synthesize_wildcard("b.example.com.", rt::A).is_none());
+        assert!(cache
+            .synthesize_wildcard("b.example.com.", Qtype::of(rt::A))
+            .is_none());
         assert!(cache.is_empty(), "nothing was stored at all");
     }
 
@@ -1587,12 +1668,17 @@ mod tests {
             "a.example.com.",
             2,
             // The gap's lower edge is a delegation: NS set, no SOA.
-            nsec_record("sub.example.com.", "zzz.example.com.", &[rt::NS], 300),
+            nsec_record(
+                "sub.example.com.",
+                "zzz.example.com.",
+                &[rt::NS],
+                Ttl::from_secs(300),
+            ),
         ));
 
         assert!(
             cache
-                .synthesize_wildcard("x.sub.example.com.", rt::A)
+                .synthesize_wildcard("x.sub.example.com.", Qtype::of(rt::A))
                 .is_none(),
             "the child zone's names are not ours to answer for"
         );
@@ -1636,7 +1722,9 @@ mod tests {
     fn test_a_zero_capacity_cache_holds_no_wildcards() {
         let cache = NsecCache::new(0);
         cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
-        assert!(cache.synthesize_wildcard("b.example.com.", rt::A).is_none());
+        assert!(cache
+            .synthesize_wildcard("b.example.com.", Qtype::of(rt::A))
+            .is_none());
         assert!(cache.is_empty());
     }
 }

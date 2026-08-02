@@ -20,7 +20,7 @@
 use crate::utils::record_types as rt;
 use crate::zone::Zone;
 use crate::{
-    DnsMessage, OpCode, ParsedRecord, QueryClass, QuerySection, ResourceRecord, ResponseCode,
+    DnsMessage, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, ResourceRecord, ResponseCode,
 };
 
 /// How many times a NOTIFY is sent before giving up on a secondary.
@@ -54,12 +54,13 @@ pub fn notify_request(zone: &str, soa: Option<ResourceRecord>, id: u16) -> DnsMe
         rcode: ResponseCode::Ok,
         queries: vec![QuerySection {
             qname: zone.to_string(),
-            qtype: rt::SOA,
+            qtype: Qtype::of(rt::SOA),
             qclass: QueryClass::IN,
         }],
         answers: soa.into_iter().collect(),
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     }
 }
 
@@ -81,6 +82,7 @@ pub fn notify_response(request: &DnsMessage, rcode: ResponseCode) -> DnsMessage 
         answers: Vec::new(),
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     }
 }
 
@@ -91,7 +93,7 @@ pub fn notified_zone(msg: &DnsMessage) -> Option<String> {
     }
     msg.queries
         .first()
-        .filter(|q| q.qtype == rt::SOA)
+        .filter(|q| q.qtype.is(rt::SOA))
         .map(|q| q.qname.clone())
 }
 
@@ -144,7 +146,7 @@ pub fn zone_serials(zones: &[&Zone]) -> Vec<(String, u32)> {
 /// The apex SOA of `zone` as a resource record, ready for a NOTIFY's answer
 /// section.
 pub fn soa_record(zone: &Zone) -> Option<ResourceRecord> {
-    zone.query(zone.origin(), rt::SOA)
+    zone.query(zone.origin(), Qtype::of(rt::SOA))
         .first()
         .map(|soa| ResourceRecord {
             name: zone.origin().to_string(),
@@ -201,7 +203,7 @@ mod tests {
         );
         assert!(!parsed.recursion, "and is not asking anyone to recurse");
         assert_eq!(parsed.queries[0].qname, "example.com.");
-        assert_eq!(parsed.queries[0].qtype, rt::SOA);
+        assert_eq!(parsed.queries[0].qtype, Qtype::of(rt::SOA));
         assert_eq!(
             notified_serial(&parsed),
             Some(7),

@@ -1,4 +1,4 @@
-﻿//! Allocation counts for the paths that matter, as exact assertions.
+//! Allocation counts for the paths that matter, as exact assertions.
 //!
 //! **Why this is a separate test binary.** DHAT works by replacing the global
 //! allocator, and a `#[global_allocator]` applies to a whole binary — putting it
@@ -34,6 +34,8 @@
 //! measurement hides the ones after it, which is a fair price for a count that
 //! is exact on both platforms.
 
+use rdns::Class;
+use rdns::Rtype;
 use std::sync::Mutex;
 
 use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Rrset, RrsetProof};
@@ -42,7 +44,8 @@ use rdns::utils::{current_unix_timestamp, record_types};
 use rdns::zone::{parse_zone_file, NameKind};
 use rdns::zone_signer::{sign_zone, SigningPolicy};
 use rdns::{
-    DnsMessage, Edns, EdnsOption, OpCode, QueryClass, QuerySection, ResourceRecord, ResponseCode,
+    DnsMessage, Edns, EdnsOption, OpCode, Qtype, QueryClass, QuerySection, ResourceRecord,
+    ResponseCode,
 };
 
 #[global_allocator]
@@ -61,6 +64,7 @@ fn allocation_counts() {
     one_zone_load_and_sign();
     one_axfr_out();
     scanning_a_plain_query_for_a_tsig_allocates_nothing();
+    comparing_two_names_allocates_nothing();
     verifying_an_rrset_against_two_candidate_signatures();
 }
 
@@ -137,7 +141,7 @@ mail IN MX  10 mx.example.com.
 mx   IN A   192.0.2.20
 ";
 
-fn query_bytes(qname: &str, qtype: u16) -> Vec<u8> {
+fn query_bytes(qname: &str, qtype: Qtype) -> Vec<u8> {
     query_message(qname, qtype)
         .to_bytes_within(512)
         .expect("serialize the query")
@@ -147,22 +151,24 @@ fn query_bytes(qname: &str, qtype: u16) -> Vec<u8> {
 /// (RFC 7873), which BIND and Unbound both send by default. The cookie is the
 /// point — an OPT record with no options parses into an empty `Vec`, which does
 /// not allocate, so a query without one hides what reading the OPT costs.
-fn query_bytes_with_edns(qname: &str, qtype: u16) -> Vec<u8> {
+fn query_bytes_with_edns(qname: &str, qtype: Qtype) -> Vec<u8> {
     let mut msg = query_message(qname, qtype);
-    msg.set_edns(Edns {
-        udp_payload_size: 1232,
-        version: 0,
-        do_bit: true,
-        options: vec![EdnsOption {
-            code: rdns::EDNS_OPTION_COOKIE,
-            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
-        }],
-    })
-    .expect("set_edns");
+    msg.set_edns(
+        Edns::with_options(
+            1232,
+            0,
+            true,
+            &[EdnsOption {
+                code: rdns::EDNS_OPTION_COOKIE,
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            }],
+        )
+        .expect("encode the options"),
+    );
     msg.to_bytes_within(512).expect("serialize the query")
 }
 
-fn query_message(qname: &str, qtype: u16) -> DnsMessage {
+fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
     DnsMessage {
         id: 0x1234,
         response: false,
@@ -182,6 +188,7 @@ fn query_message(qname: &str, qtype: u16) -> DnsMessage {
         answers: Vec::new(),
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     }
 }
 
@@ -192,7 +199,7 @@ fn query_message(qname: &str, qtype: u16) -> DnsMessage {
 /// point of measuring was never the total.
 fn one_query_end_to_end() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
-    let wire = query_bytes("www.example.com.", record_types::A);
+    let wire = query_bytes("www.example.com.", Qtype::of(record_types::A));
 
     let (parsed, parse_count) =
         allocations(|| DnsMessage::try_from_bytes(&wire).expect("parse the query"));
@@ -203,7 +210,7 @@ fn one_query_end_to_end() {
     within("parse a one-question query", parse_count, 3..=3);
 
     let (answers, lookup_count) = allocations(|| {
-        zone.query("www.example.com.", record_types::A)
+        zone.query("www.example.com.", Qtype::of(record_types::A))
             .into_iter()
             .map(|r| ResourceRecord {
                 name: r.name.clone(),
@@ -294,7 +301,9 @@ fn the_lookups_behind_one_answer_allocate_only_the_answer() {
     let warm = |zone: &rdns::zone::Zone| {
         let cut = zone.delegation_for("www.example.com.");
         let kind = zone.name_kind("www.example.com.");
-        let records = zone.query("www.example.com.", record_types::A).len();
+        let records = zone
+            .query("www.example.com.", Qtype::of(record_types::A))
+            .len();
         (cut, kind, records)
     };
     let _ = warm(&zone);
@@ -320,7 +329,7 @@ fn the_lookups_behind_one_answer_allocate_only_the_answer() {
 /// comparison cannot go stale: `edns()` is still there for a caller that
 /// actually wants the options.
 fn reading_a_requests_edns_parameters_allocates_nothing() {
-    let wire = query_bytes_with_edns("www.example.com.", record_types::A);
+    let wire = query_bytes_with_edns("www.example.com.", Qtype::of(record_types::A));
     let msg = DnsMessage::try_from_bytes(&wire).expect("parse the query");
 
     // One call before the measured one, for the reason the TSIG test gives: a
@@ -335,12 +344,21 @@ fn reading_a_requests_edns_parameters_allocates_nothing() {
     assert_eq!(header.udp_payload_size, 1232);
     within("read a request's EDNS parameters", count, 0..=0);
 
-    let (full, full_count) = allocations(|| msg.edns());
-    assert_eq!(
-        full.expect("parse").expect("OPT").options.len(),
-        1,
-        "one cookie"
-    );
+    // Reaching the OPT record is now free — it is a field, not something to be
+    // found in the additional section (`TODO.md` #13d).
+    let (found, found_count) = allocations(|| msg.edns());
+    let found = found.expect("OPT");
+    within("reach the OPT record", found_count, 0..=0);
+
+    // Building the option list is where the cost went, and it is only paid by a
+    // caller that asks for the options. **This measurement moved**: it used to
+    // call `edns()`, which parsed the list as part of reaching the record and so
+    // read 2 here; `edns()` now allocates nothing and `options()` is the parse.
+    // Same two allocations, charged to the call that actually wants them —
+    // which is the point of the split, and the reason the number is unchanged
+    // rather than lowered (`CLAUDE.md` §10).
+    let (full, full_count) = allocations(|| found.options());
+    assert_eq!(full.expect("well-formed").len(), 1, "one cookie");
     within(
         "and the same three fields through the full option parse",
         full_count,
@@ -354,11 +372,12 @@ fn reading_a_requests_edns_parameters_allocates_nothing() {
 fn a_response_full_of_shared_suffixes() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let mut response =
-        DnsMessage::try_from_bytes(&query_bytes("example.com.", record_types::ANY)).expect("parse");
+        DnsMessage::try_from_bytes(&query_bytes("example.com.", Qtype::of(record_types::ANY)))
+            .expect("parse");
     response.response = true;
     response.authoritive = true;
     for name in ["www.example.com.", "mx.example.com.", "ns1.example.com."] {
-        for record in zone.query(name, record_types::A) {
+        for record in zone.query(name, Qtype::of(record_types::A)) {
             response.answers.push(ResourceRecord {
                 name: name.to_string(),
                 class: record.class,
@@ -413,8 +432,9 @@ fn one_zone_load_and_sign() {
 /// zone size — and #9e says nobody had looked.
 fn one_axfr_out() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
-    let request = DnsMessage::try_from_bytes(&query_bytes("example.com.", record_types::AXFR))
-        .expect("parse");
+    let request =
+        DnsMessage::try_from_bytes(&query_bytes("example.com.", Qtype::of(record_types::AXFR)))
+            .expect("parse");
 
     let (messages, count) =
         allocations(|| rdns::transfer::axfr_messages(&request, &zone).expect("axfr"));
@@ -448,7 +468,7 @@ fn one_axfr_out() {
 /// Found by the DHAT profile rather than by reading, which is the whole point of
 /// #9e's first item: it was not on the hand-written list below it.
 fn scanning_a_plain_query_for_a_tsig_allocates_nothing() {
-    let wire = query_bytes("www.example.com.", record_types::A);
+    let wire = query_bytes("www.example.com.", Qtype::of(record_types::A));
     let keyring = rdns::tsig::TsigKeyring::new(Vec::new());
 
     // One call before the measured one. Whichever code path in the process runs
@@ -464,6 +484,47 @@ fn scanning_a_plain_query_for_a_tsig_allocates_nothing() {
         "a plain query carries no TSIG"
     );
     within("scan a TSIG-less query for a TSIG", count, 0..=0);
+}
+
+/// Comparing two names is a question about bytes, and should cost nothing.
+///
+/// `resolver::names_equal` was `normalize(a) == normalize(b)`, and `normalize`
+/// is `to_ascii_lowercase` — which allocates whether or not there is anything to
+/// fold — plus a `format!` when the trailing dot is missing. So every comparison
+/// built two `String`s and dropped them, inside `.any()` loops over an answer
+/// section. `utils::names_equal` strips at most one trailing dot from each side
+/// and calls `eq_ignore_ascii_case`, which is the same RFC 4343 fold done in
+/// place (`TODO.md` #13b).
+///
+/// The old shape is measured beside the new one on purpose: without it this is
+/// an assertion that zero is zero, and §10 asks for the ratio rather than the
+/// floor wherever one exists.
+fn comparing_two_names_allocates_nothing() {
+    let a = "www.example.com.";
+    let b = "WWW.Example.COM.";
+
+    // The shape this replaced, kept as a measurement rather than as code.
+    let old = |x: &str, y: &str| {
+        let n = |s: &str| {
+            let lowered = s.to_ascii_lowercase();
+            if lowered.ends_with('.') {
+                lowered
+            } else {
+                format!("{lowered}.")
+            }
+        };
+        n(x) == n(y)
+    };
+
+    let _warm = (old(a, b), rdns::utils::names_equal(a, b));
+
+    let (was_equal, before) = allocations(|| old(a, b));
+    assert!(was_equal);
+    within("compare two names, the old way", before, 2..=2);
+
+    let (is_equal, after) = allocations(|| rdns::utils::names_equal(a, b));
+    assert!(is_equal, "the same answer");
+    within("compare two names", after, 0..=0);
 }
 
 /// The fourth is "one recursive resolution with validation", which needs the
@@ -497,9 +558,9 @@ fn verifying_an_rrset_against_two_candidate_signatures() {
     )
     .expect("sign");
 
-    let owned = |name: &str, rtype: u16| -> Vec<ResourceRecord> {
+    let owned = |name: &str, rtype: Rtype| -> Vec<ResourceRecord> {
         signed
-            .query(name, rtype)
+            .query(name, Qtype::of(rtype))
             .into_iter()
             .map(|r| ResourceRecord {
                 name: r.name.clone(),
@@ -518,7 +579,7 @@ fn verifying_an_rrset_against_two_candidate_signatures() {
         .into_iter()
         .map(|r| r.rdata)
         .collect();
-    let rrset = Rrset::new("example.com.", record_types::DNSKEY, 1, &rdatas);
+    let rrset = Rrset::new("example.com.", record_types::DNSKEY, Class::new(1), &rdatas);
     let now = current_unix_timestamp();
 
     let (proof, count) =

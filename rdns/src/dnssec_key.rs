@@ -648,6 +648,7 @@ mod tests {
     use super::*;
     use crate::dnssec::{verify, verify_rrset, RrsetProof};
     use crate::utils::record_types as rt;
+    use crate::Class;
     use crate::{ParsedRecord, RecordData};
 
     fn a_record(addr: &str) -> RecordData {
@@ -663,7 +664,7 @@ mod tests {
         ] {
             let key = SigningKey::generate(algorithm, "example.com.", DNSKEY_FLAG_ZONE).unwrap();
             let rdatas = vec![a_record("192.0.2.1")];
-            let rrset = Rrset::new("www.example.com.", rt::A, 1, &rdatas);
+            let rrset = Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas);
             let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
 
             let proof = verify_rrset(&rrset, &[sig], &[key.dnskey()], "example.com.", 1_500);
@@ -690,7 +691,7 @@ mod tests {
         )
         .unwrap();
         let rdatas = vec![a_record("192.0.2.1")];
-        let rrset = Rrset::new("www.example.com.", rt::A, 1, &rdatas);
+        let rrset = Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas);
         let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
 
         let data = signed_data(&sig, rrset.owner, rrset.class, rrset.rdatas).unwrap();
@@ -715,7 +716,7 @@ mod tests {
         )
         .unwrap();
         let rdatas = vec![a_record("192.0.2.1")];
-        let rrset = Rrset::new("*.example.com.", rt::A, 1, &rdatas);
+        let rrset = Rrset::new("*.example.com.", rt::A, Class::new(1), &rdatas);
         let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
         assert_eq!(sig.labels, 2);
 
@@ -723,7 +724,7 @@ mod tests {
         // still verifies — which is the property the count buys.
         let mut expanded = sig.clone();
         expanded.owner = "anything.example.com.".to_string();
-        let expanded_rrset = Rrset::new("anything.example.com.", rt::A, 1, &rdatas);
+        let expanded_rrset = Rrset::new("anything.example.com.", rt::A, Class::new(1), &rdatas);
         assert!(matches!(
             verify_rrset(
                 &expanded_rrset,
@@ -761,7 +762,7 @@ mod tests {
         // itself the same way: a signature from the loaded copy verifies under
         // the original's published key.
         let rdatas = vec![a_record("192.0.2.1")];
-        let rrset = Rrset::new("example.com.", rt::A, 1, &rdatas);
+        let rrset = Rrset::new("example.com.", rt::A, Class::new(1), &rdatas);
         let sig = back.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
         assert!(matches!(
             verify_rrset(&rrset, &[sig], &[key.dnskey()], "example.com.", 1_500),

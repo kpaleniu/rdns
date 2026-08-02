@@ -21,6 +21,8 @@ use crate::dname::{
     dname_from_bytes, write_bytes, write_label, DNameUnpacker, POINTER_MASK, POINTER_TAG,
 };
 use crate::error::WireError;
+use crate::utils::record_types as rt;
+use crate::Rtype;
 
 /// Per-message table of name suffixes already written, and where.
 ///
@@ -162,20 +164,20 @@ impl NameCompressor {
     /// be read without message context.
     pub fn write_rdata(
         &mut self,
-        rtype: u16,
+        rtype: Rtype,
         rdata: &[u8],
         buf: &mut [u8],
         pos: usize,
     ) -> Result<usize, WireError> {
         match rtype {
             // NS, CNAME, PTR: the RDATA is exactly one domain name.
-            2 | 5 | 12 => {
+            rt::NS | rt::CNAME | rt::PTR => {
                 let (name, rest) = read_name(rdata)?;
                 let pos = self.write_name(&name, buf, pos)?;
                 write_bytes(buf, pos, rest)
             }
             // SOA: MNAME, RNAME, then five 32-bit fields.
-            6 => {
+            rt::SOA => {
                 let (mname, rest) = read_name(rdata)?;
                 let (rname, rest) = read_name(rest)?;
                 let pos = self.write_name(&mname, buf, pos)?;
@@ -183,7 +185,7 @@ impl NameCompressor {
                 write_bytes(buf, pos, rest)
             }
             // MX: 16-bit preference, then EXCHANGE.
-            15 => {
+            rt::MX => {
                 if rdata.len() < 2 {
                     return Err(WireError::Truncated {
                         what: "MX RDATA",
@@ -383,14 +385,16 @@ mod tests {
 
         // NS RDATA: one name, sharing the whole suffix -> "2ns" + pointer.
         let ns = crate::dname::dname_to_bytes("ns.example.com.").unwrap();
-        let end = c.write_rdata(2, &ns, &mut buf, pos).unwrap();
+        let end = c.write_rdata(rt::NS, &ns, &mut buf, pos).unwrap();
         assert_eq!(&buf[pos..end], &[2, b'n', b's', 0xc0, 12]);
 
         // SRV (33) is not on the list: byte-for-byte, pointers or not.
         let srv_start = end;
         let mut srv = vec![0, 10, 0, 20, 0, 80];
         srv.extend_from_slice(&crate::dname::dname_to_bytes("ns.example.com.").unwrap());
-        let end = c.write_rdata(33, &srv, &mut buf, srv_start).unwrap();
+        let end = c
+            .write_rdata(Rtype::new(33), &srv, &mut buf, srv_start)
+            .unwrap();
         assert_eq!(&buf[srv_start..end], &srv[..]);
     }
 
@@ -404,7 +408,7 @@ mod tests {
 
         let mut mx = vec![0, 10];
         mx.extend_from_slice(&crate::dname::dname_to_bytes("mail.example.com.").unwrap());
-        let end = c.write_rdata(15, &mx, &mut buf, pos).unwrap();
+        let end = c.write_rdata(rt::MX, &mx, &mut buf, pos).unwrap();
 
         assert_eq!(
             &buf[pos..end],
@@ -423,7 +427,7 @@ mod tests {
         let mut soa = crate::dname::dname_to_bytes("ns.example.com.").unwrap();
         soa.extend_from_slice(&crate::dname::dname_to_bytes("admin.example.com.").unwrap());
         soa.extend_from_slice(&[9u8; 20]);
-        let end = c.write_rdata(6, &soa, &mut buf, pos).unwrap();
+        let end = c.write_rdata(rt::SOA, &soa, &mut buf, pos).unwrap();
 
         let expected: Vec<u8> = [
             2, b'n', b's', 0xc0, 12, 5, b'a', b'd', b'm', b'i', b'n', 0xc0, 12,

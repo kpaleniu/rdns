@@ -51,11 +51,16 @@ confidence-threshold = 0.8
 # missed it just as thoroughly as no check at all.
 multiple-versions = "deny"
 skip = [
-    # Build-time only, and not ours to fix: `clap_derive` and `num-derive` are on
-    # syn 2 while `serde_derive` and `thiserror-impl` have moved to syn 3. Neither
-    # ends up in the binary — proc-macro crates are compiled for the host and
-    # discarded — so this costs compile time and nothing else. Revisit when clap
-    # moves.
+    # Build-time only, and not ours to fix: `clap_derive`, `tokio-macros` and
+    # `tracing-attributes` are on syn 2 while `serde_derive` and `thiserror-impl`
+    # have moved to syn 3. None ends up in the binary — proc-macro crates are
+    # compiled for the host and discarded — so this costs compile time and
+    # nothing else. Revisit when clap moves.
+    #
+    # `num-derive` used to be named here as the second syn-2 user. It left the
+    # graph with `TODO.md` #13a, which replaced the `OpCode` sentinel it was
+    # deriving `FromPrimitive` for; the duplicate outlived it because the list
+    # was never only those two.
     { crate = "syn", reason = "proc-macro build dependency; clap_derive is on 2, serde_derive on 3" },
 ]
 

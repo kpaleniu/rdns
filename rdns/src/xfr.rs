@@ -23,16 +23,17 @@
 //! assembling is a state machine so it can be tested without one.
 
 use crate::error::{TransferError, TransferResult};
+use crate::Class;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::tsig::{self, TsigError, TsigKey};
-use crate::utils::record_types as rt;
+use crate::utils::{is_at_or_under, record_types as rt};
 use crate::zone::{Zone, ZoneRecord};
 use crate::{
-    DnsMessage, OpCode, ParsedRecord, QueryClass, QuerySection, ResourceRecord, ResponseCode,
+    DnsMessage, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, ResourceRecord, ResponseCode,
 };
 
 /// How long a transfer may take from connect to closing SOA.
@@ -53,15 +54,15 @@ pub const MAX_TRANSFER_RECORDS: usize = 5_000_000;
 
 /// A request for the zone's SOA — the refresh check (RFC 1035 §4.3.5).
 pub fn soa_query(zone: &str, id: u16) -> DnsMessage {
-    question(zone, rt::SOA, id)
+    question(zone, Qtype::of(rt::SOA), id)
 }
 
 /// A request for the whole zone.
 pub fn axfr_request(zone: &str, id: u16) -> DnsMessage {
-    question(zone, rt::AXFR, id)
+    question(zone, Qtype::AXFR, id)
 }
 
-fn question(zone: &str, qtype: u16, id: u16) -> DnsMessage {
+fn question(zone: &str, qtype: Qtype, id: u16) -> DnsMessage {
     DnsMessage {
         id,
         response: false,
@@ -83,6 +84,7 @@ fn question(zone: &str, qtype: u16, id: u16) -> DnsMessage {
         answers: Vec::new(),
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     }
 }
 
@@ -233,7 +235,7 @@ impl AxfrAssembler {
 /// distinguishes an IXFR request from an AXFR one: it says which version the
 /// client already has, so the server can answer with the difference.
 pub fn ixfr_request(zone: &str, current_soa: ResourceRecord, id: u16) -> DnsMessage {
-    let mut msg = question(zone, rt::IXFR, id);
+    let mut msg = question(zone, Qtype::IXFR, id);
     msg.authorities = vec![current_soa];
     msg
 }
@@ -502,13 +504,13 @@ impl IxfrAssembler {
 /// hold will still be serving it in ten minutes.
 fn belongs_here(rr: &ResourceRecord, zone: &str) -> TransferResult<String> {
     let name = absolute(&rr.name);
-    if !in_bailiwick(&name, zone) {
+    if !is_at_or_under(&name, zone) {
         return Err(TransferError::malformed(format!(
             "master sent {name}, which is not in {zone}: a transfer may only carry \
              the zone it is a transfer of"
         )));
     }
-    if rr.class != 1 {
+    if rr.class != Class::new(1) {
         return Err(TransferError::malformed(format!(
             "master sent {name} in class {}, and this server holds only IN zones",
             rr.class
@@ -517,16 +519,12 @@ fn belongs_here(rr: &ResourceRecord, zone: &str) -> TransferResult<String> {
     Ok(name)
 }
 
-/// Whether `name` is the zone apex or below it.
-fn in_bailiwick(name: &str, zone: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    let zone = zone.to_ascii_lowercase();
-    name == zone
-        || zone == "."
-        || name
-            .strip_suffix(&zone)
-            .is_some_and(|prefix| prefix.ends_with('.'))
-}
+// `in_bailiwick` was here: the sixth implementation of "is this name at or under
+// that one", down-casing both sides into fresh `String`s to answer it. It also
+// required the two names to agree about the trailing dot — `strip_suffix` on an
+// absolute name with a relative zone simply failed — where `utils::is_at_or_under`
+// treats the dot as optional on either side, which is the whole reason that one
+// takes the names in whatever form its callers hold them (`TODO.md` #13b).
 
 fn absolute(name: &str) -> String {
     if name.ends_with('.') {
@@ -653,7 +651,7 @@ pub async fn fetch_changes(
 
 /// The apex SOA of a zone as a resource record.
 fn apex_soa(zone: &Zone) -> Option<ResourceRecord> {
-    zone.query(zone.origin(), rt::SOA)
+    zone.query(zone.origin(), Qtype::of(rt::SOA))
         .first()
         .map(|soa| ResourceRecord {
             name: zone.origin().to_string(),
@@ -778,6 +776,7 @@ mod tests {
     use crate::transfer::axfr_messages;
     use crate::tsig::TsigAlgorithm;
     use crate::zone::parse_zone_file;
+    use crate::Ttl;
 
     fn source_zone() -> Zone {
         parse_zone_file(
@@ -820,10 +819,20 @@ mod tests {
         assert_eq!(received.origin(), source.origin());
         assert_eq!(received.serial(), Some(42));
         assert_eq!(received.records().len(), source.records().len());
-        assert_eq!(received.query("www.example.com.", rt::A).len(), 1);
-        assert_eq!(received.query("www.example.com.", rt::AAAA).len(), 1);
         assert_eq!(
-            received.query("anything.example.com.", rt::A).len(),
+            received.query("www.example.com.", Qtype::of(rt::A)).len(),
+            1
+        );
+        assert_eq!(
+            received
+                .query("www.example.com.", Qtype::of(rt::AAAA))
+                .len(),
+            1
+        );
+        assert_eq!(
+            received
+                .query("anything.example.com.", Qtype::of(rt::A))
+                .len(),
             1,
             "the wildcard transferred too"
         );
@@ -850,8 +859,8 @@ mod tests {
             1,
             ResourceRecord {
                 name: "ch.example.com.".to_string(),
-                class: 3,
-                ttl: 300,
+                class: Class::new(3),
+                ttl: Ttl::from_secs(300),
                 rdata: crate::RecordData::from_parsed(&ParsedRecord::TXT(vec![b"chaos".to_vec()]))
                     .unwrap(),
             },
@@ -913,8 +922,8 @@ mod tests {
             1,
             ResourceRecord {
                 name: "www.other-zone.test.".to_string(),
-                class: 1,
-                ttl: 300,
+                class: Class::new(1),
+                ttl: Ttl::from_secs(300),
                 rdata: crate::RecordData::from_parsed(&ParsedRecord::A(
                     "192.0.2.66".parse().unwrap(),
                 ))
@@ -966,18 +975,13 @@ mod tests {
             .contains("not authoritative"));
     }
 
-    #[test]
-    fn test_bailiwick() {
-        assert!(in_bailiwick("example.com.", "example.com."));
-        assert!(in_bailiwick("www.example.com.", "example.com."));
-        assert!(in_bailiwick("a.b.example.com.", "example.com."));
-        assert!(!in_bailiwick("notexample.com.", "example.com."));
-        assert!(!in_bailiwick("com.", "example.com."));
-        assert!(
-            in_bailiwick("anything.", "."),
-            "the root zone holds everything"
-        );
-    }
+    // `test_bailiwick` was here. Once `in_bailiwick` became
+    // `utils::is_at_or_under`, it was a second copy of that module's own
+    // `a_name_is_under_a_zone_only_at_a_label_boundary`, down to the
+    // `notexample.com.` case. What this module owes a test is the *policy* —
+    // that a transfer refuses a record outside the zone it asked for — and
+    // `test_out_of_bailiwick_records_are_refused` above exercises it through
+    // `accept_record`, which is the path a hostile master actually takes.
 
     #[test]
     fn test_soa_serial_reads_the_answer_or_the_authority() {
@@ -1072,12 +1076,23 @@ mod tests {
 
         // What changed, changed; what did not, did not.
         assert_eq!(
-            zone.query("www.example.com.", rt::A)[0].rdata,
-            v2.query("www.example.com.", rt::A)[0].rdata
+            zone.query("www.example.com.", Qtype::of(rt::A))[0].rdata,
+            v2.query("www.example.com.", Qtype::of(rt::A))[0].rdata
         );
-        assert_eq!(zone.query("fresh.example.com.", rt::TXT).len(), 1, "added");
-        assert!(zone.query("gone.example.com.", rt::A).is_empty(), "deleted");
-        assert_eq!(zone.query("keep.example.com.", rt::A).len(), 1, "untouched");
+        assert_eq!(
+            zone.query("fresh.example.com.", Qtype::of(rt::TXT)).len(),
+            1,
+            "added"
+        );
+        assert!(
+            zone.query("gone.example.com.", Qtype::of(rt::A)).is_empty(),
+            "deleted"
+        );
+        assert_eq!(
+            zone.query("keep.example.com.", Qtype::of(rt::A)).len(),
+            1,
+            "untouched"
+        );
 
         // And the result is the zone the master is serving, record for record.
         let mut got: Vec<_> = zone
@@ -1139,12 +1154,12 @@ mod tests {
         assert_eq!(steps, 2);
         assert_eq!(zone.serial(), Some(3));
         assert_eq!(
-            zone.query("www.example.com.", rt::A)[0].rdata,
-            v3.query("www.example.com.", rt::A)[0].rdata,
+            zone.query("www.example.com.", Qtype::of(rt::A))[0].rdata,
+            v3.query("www.example.com.", Qtype::of(rt::A))[0].rdata,
             "the last step's value, not the first's"
         );
         assert_eq!(
-            zone.query("www.example.com.", rt::A).len(),
+            zone.query("www.example.com.", Qtype::of(rt::A)).len(),
             1,
             "not accumulated"
         );
@@ -1168,7 +1183,7 @@ mod tests {
         };
         assert_eq!(zone.serial(), Some(2));
         assert_eq!(zone.records().len(), v2.records().len());
-        assert!(zone.query("gone.example.com.", rt::A).is_empty());
+        assert!(zone.query("gone.example.com.", Qtype::of(rt::A)).is_empty());
     }
 
     #[test]
@@ -1214,7 +1229,10 @@ mod tests {
         };
         assert_eq!(missing_deletions, 1, "`gone` was already absent");
         assert_eq!(zone.serial(), Some(2), "and the update still applied");
-        assert_eq!(zone.query("fresh.example.com.", rt::TXT).len(), 1);
+        assert_eq!(
+            zone.query("fresh.example.com.", Qtype::of(rt::TXT)).len(),
+            1
+        );
     }
 
     /// The same refusals as an AXFR: a cut stream is not a short zone, and a
@@ -1247,8 +1265,8 @@ mod tests {
             2,
             ResourceRecord {
                 name: "www.elsewhere.test.".to_string(),
-                class: 1,
-                ttl: 300,
+                class: Class::new(1),
+                ttl: Ttl::from_secs(300),
                 rdata: crate::RecordData::from_parsed(&ParsedRecord::A(
                     "192.0.2.66".parse().unwrap(),
                 ))
@@ -1276,8 +1294,8 @@ mod tests {
             .messages();
         headless[0].answers[0] = ResourceRecord {
             name: "www.example.com.".to_string(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: crate::RecordData::from_parsed(&ParsedRecord::A("192.0.2.77".parse().unwrap()))
                 .unwrap(),
         };
@@ -1350,15 +1368,16 @@ mod tests {
                             tsig::TsigCheck::Unsigned => return,
                         }
                     }
-                    let replies: Vec<DnsMessage> = if request.queries[0].qtype == rt::AXFR {
-                        axfr_messages(&request, &zone).expect("build the transfer")
-                    } else {
-                        let mut reply = request.clone();
-                        reply.response = true;
-                        reply.authoritive = true;
-                        reply.answers = vec![crate::notify::soa_record(&zone).unwrap()];
-                        vec![reply]
-                    };
+                    let replies: Vec<DnsMessage> =
+                        if request.queries[0].qtype == Qtype::of(rt::AXFR) {
+                            axfr_messages(&request, &zone).expect("build the transfer")
+                        } else {
+                            let mut reply = request.clone();
+                            reply.response = true;
+                            reply.authoritive = true;
+                            reply.answers = vec![crate::notify::soa_record(&zone).unwrap()];
+                            vec![reply]
+                        };
 
                     for reply in replies {
                         let mut buf = vec![0u8; 65535];
@@ -1390,7 +1409,10 @@ mod tests {
             .expect("transfer");
         assert_eq!(received.serial(), Some(42));
         assert_eq!(received.records().len(), source.records().len());
-        assert_eq!(received.query("www.example.com.", rt::A).len(), 1);
+        assert_eq!(
+            received.query("www.example.com.", Qtype::of(rt::A)).len(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -10,6 +10,8 @@
 //! system either way — ordering between two counters would buy nothing and cost
 //! a fence on every query.
 
+use crate::utils::record_types as rt;
+use crate::Qtype;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -286,19 +288,33 @@ impl DnsMetrics {
         zones.retain(|name, _| keep.iter().any(|k| k.eq_ignore_ascii_case(name)));
     }
 
-    /// Track query type
-    pub fn track_query_type(&self, qtype: u16) {
-        match qtype {
-            1 => self.queries_type_a.fetch_add(1, Ordering::Relaxed),
-            28 => self.queries_type_aaaa.fetch_add(1, Ordering::Relaxed),
-            15 => self.queries_type_mx.fetch_add(1, Ordering::Relaxed),
-            2 => self.queries_type_ns.fetch_add(1, Ordering::Relaxed),
-            5 => self.queries_type_cname.fetch_add(1, Ordering::Relaxed),
-            16 => self.queries_type_txt.fetch_add(1, Ordering::Relaxed),
-            6 => self.queries_type_soa.fetch_add(1, Ordering::Relaxed),
-            12 => self.queries_type_ptr.fetch_add(1, Ordering::Relaxed),
-            _ => self.queries_type_other.fetch_add(1, Ordering::Relaxed),
+    /// Track query type.
+    ///
+    /// A [`Qtype`] rather than a `u16`: this counts what clients *ask* for, so
+    /// AXFR, IXFR and ANY are legitimate values here and would be nonsense as
+    /// record types. They land in `other`, which is right — the named counters
+    /// are the eight types a dashboard breaks out.
+    pub fn track_query_type(&self, qtype: Qtype) {
+        let counter = if qtype.is(rt::A) {
+            &self.queries_type_a
+        } else if qtype.is(rt::AAAA) {
+            &self.queries_type_aaaa
+        } else if qtype.is(rt::MX) {
+            &self.queries_type_mx
+        } else if qtype.is(rt::NS) {
+            &self.queries_type_ns
+        } else if qtype.is(rt::CNAME) {
+            &self.queries_type_cname
+        } else if qtype.is(rt::TXT) {
+            &self.queries_type_txt
+        } else if qtype.is(rt::SOA) {
+            &self.queries_type_soa
+        } else if qtype.is(rt::PTR) {
+            &self.queries_type_ptr
+        } else {
+            &self.queries_type_other
         };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Generate Prometheus format metrics output
@@ -670,6 +686,7 @@ mod zone_gauge_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Rtype;
 
     #[test]
     fn test_metrics_creation() {
@@ -691,10 +708,10 @@ mod tests {
     fn test_track_query_type() {
         let metrics = DnsMetrics::new();
 
-        metrics.track_query_type(1); // A
-        metrics.track_query_type(1); // A
-        metrics.track_query_type(28); // AAAA
-        metrics.track_query_type(99); // Unknown
+        metrics.track_query_type(Qtype::of(rt::A)); // A
+        metrics.track_query_type(Qtype::of(rt::A)); // A
+        metrics.track_query_type(Qtype::of(rt::AAAA)); // AAAA
+        metrics.track_query_type(Qtype::of(Rtype::new(99))); // Unknown
 
         assert_eq!(metrics.queries_type_a.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.queries_type_aaaa.load(Ordering::Relaxed), 1);

@@ -17,6 +17,7 @@
 use crate::error::{TransferError, TransferResult};
 use crate::utils::record_types as rt;
 use crate::zone::Zone;
+use crate::Qtype;
 use crate::{DnsMessage, Edns, ResourceRecord, ResponseCode};
 
 /// How much of a message to fill before starting the next one.
@@ -36,7 +37,7 @@ pub const AXFR_TARGET_MESSAGE_SIZE: usize = 16 * 1024;
 pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<DnsMessage>> {
     let apex = zone.origin().to_string();
     let soa = zone
-        .query(&apex, rt::SOA)
+        .query(&apex, Qtype::of(rt::SOA))
         .first()
         .map(|zr| ResourceRecord {
             name: apex.clone(),
@@ -112,7 +113,7 @@ pub(crate) fn pack_transfer_messages(
             // `with_payload_size` carries no options, so this cannot fail. The
             // size is the client's own, echoed: a transfer is framed by the TCP
             // length prefix, so our UDP payload size says nothing useful here.
-            let _ = first.set_edns(Edns::with_payload_size(request.udp_payload_size()));
+            first.set_edns(Edns::with_payload_size(request.udp_payload_size()));
         }
     }
     messages
@@ -140,6 +141,7 @@ pub(crate) fn transfer_message(request: &DnsMessage, answers: Vec<ResourceRecord
         answers,
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     }
 }
 
@@ -163,12 +165,13 @@ mod tests {
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
                 qname: qname.to_string(),
-                qtype: rt::AXFR,
+                qtype: Qtype::of(rt::AXFR),
                 qclass: QueryClass::IN,
             }],
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         }
     }
 
@@ -251,7 +254,7 @@ mod tests {
             assert_eq!(message.rcode, ResponseCode::Ok);
             assert_eq!(message.queries.len(), 1, "the question is echoed");
             assert_eq!(message.queries[0].qname, request.queries[0].qname);
-            assert_eq!(message.queries[0].qtype, rt::AXFR);
+            assert_eq!(message.queries[0].qtype, Qtype::of(rt::AXFR));
         }
     }
 

@@ -1,6 +1,4 @@
 use crate::error::WireError;
-use num_derive::{FromPrimitive, ToPrimitive};
-use num_traits::{FromPrimitive, ToPrimitive};
 use rand::Rng;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -78,14 +76,71 @@ mod macros {
     }
 }
 
-#[derive(Debug, FromPrimitive, ToPrimitive, Clone, Copy, PartialEq, Eq)]
+/// The four-bit OPCODE of RFC 1035 §4.1.1 — "set by the originator of a query
+/// and copied into the response".
+///
+/// `Other` carries the value, and that copying rule is why. This used to be an
+/// `Unknown = 15` sentinel parsed with
+/// `OpCode::from_u8((hi >> 3) & 0x0f).unwrap_or(OpCode::Unknown)`, and 15 is a
+/// real value in a four-bit field, so **eleven of the sixteen opcodes came back
+/// off the wire as 15** — 3 and 7-15, which IANA lists as Unassigned, and
+/// **6, which is DSO (RFC 8490) and assigned**. `rdnsd` answers an opcode it
+/// does not implement with NOTIMP and echoes this field, so a DSO client was
+/// handed a reply whose OPCODE was not the one it sent, which RFC 5452 §9.1 has
+/// it discard.
+///
+/// The third variant of the same mistake, after `QueryClass::None` (which was
+/// 254, a real class) and `ResponseCode::Unknown` (which serialized as
+/// NOERROR). All three had the same cause — `num_derive`'s `FromPrimitive`
+/// hands back an `Option` and invites the `unwrap_or` — and fixing this one
+/// removed the last user of that crate from the workspace. See `CLAUDE.md` §2
+/// and §17.
+///
+/// No explicit discriminants, because a variant with a payload forbids them;
+/// the numbering lives in [`OpCode::from_u8`] and [`OpCode::to_u8`], which are
+/// each other's inverse over the whole four-bit range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpCode {
-    Query = 0,
-    IQuery = 1, // RFC3425: IQUERY obsolete
-    Status = 2,
-    Notify = 4,
-    Update = 5,
-    Unknown = 15,
+    Query,
+    IQuery, // RFC 3425: IQUERY obsolete
+    Status,
+    Notify,
+    Update,
+    /// An opcode this implementation has no name for, kept as it arrived.
+    ///
+    /// Always four bits: [`OpCode::from_u8`] masks, so the field cannot hold a
+    /// value the wire has no room for and [`OpCode::to_u8`] cannot lose one.
+    Other(u8),
+}
+
+impl OpCode {
+    /// Total, by construction: every four-bit value is some opcode.
+    ///
+    /// The mask is the boundary this type's invariant is established at
+    /// (`CLAUDE.md` §2) — OPCODE is four bits, so a larger `u8` is not an
+    /// opcode that got truncated later, it is not an opcode at all.
+    pub fn from_u8(value: u8) -> Self {
+        match value & 0x0f {
+            0 => OpCode::Query,
+            1 => OpCode::IQuery,
+            2 => OpCode::Status,
+            4 => OpCode::Notify,
+            5 => OpCode::Update,
+            other => OpCode::Other(other),
+        }
+    }
+
+    /// Infallible, so echoing a request's opcode cannot silently change it.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            OpCode::Query => 0,
+            OpCode::IQuery => 1,
+            OpCode::Status => 2,
+            OpCode::Notify => 4,
+            OpCode::Update => 5,
+            OpCode::Other(value) => value,
+        }
+    }
 }
 
 // practically always IN (1), classes are supposed to be sort of
@@ -123,6 +178,20 @@ impl QueryClass {
         }
     }
 
+    /// Whether this question selects a record in `class`.
+    ///
+    /// The only comparison of a question's class against stored data. ANY
+    /// matches every class (RFC 1035 §3.2.5), which is why matching it against
+    /// the IN zone is right when IN is the only class this server holds.
+    pub fn matches(self, class: Class) -> bool {
+        self == QueryClass::Any || self.to_u16() == class.to_u16()
+    }
+
+    /// Whether the question is for exactly `class`, with no ANY handling.
+    pub fn is(self, class: Class) -> bool {
+        self.to_u16() == class.to_u16()
+    }
+
     /// Infallible, so round-tripping a question is total: what came off the wire
     /// goes back onto it unchanged.
     pub fn to_u16(self) -> u16 {
@@ -137,12 +206,247 @@ impl QueryClass {
     }
 }
 
+/// The class a *record* is in — CLASS, not QCLASS (RFC 1035 §3.2.4).
+///
+/// The third pair in this file, after [`Rtype`]/[`Qtype`] and beside
+/// [`QueryClass`]. QCLASS is a superset of CLASS (§3.2.5): `*` (255) matches any
+/// class and RFC 2136 §2.4 uses NONE (254) in an UPDATE, and no stored record is
+/// in either. The conversion runs one way, [`Class`] into [`QueryClass`], and
+/// there is no way back.
+///
+/// **This could not be a newtype until OPT stopped being parsed as a resource
+/// record** (`TODO.md` #13d). An OPT record's CLASS field is the requestor's UDP
+/// payload size, not a class at all — the same two-meanings-in-one-field problem
+/// [`Ttl`] had, in the field next door, and fixed by the same change.
+///
+/// §8 of `CLAUDE.md` records what the untyped version cost: the class was parsed,
+/// stored on every record, and then never compared, so a CH question was
+/// answered out of the IN zone and the reply carried `CLASS=CH` in the echoed
+/// question beside `CLASS=IN` records in the answer. That was fixed in `rdnsd`'s
+/// query loop and in the zone parser, which refuses a non-IN record outright —
+/// and it is the parser's refusal, not the type, that makes the class-blind zone
+/// index correct. The type is what stops the *next* pseudo-record quietly
+/// borrowing the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct Class(u16);
+
+impl Class {
+    /// The Internet class, and in practice the only one (RFC 1035 §3.2.4).
+    pub const IN: Class = Class(1);
+    /// CHAOS — used by `version.bind` and little else.
+    pub const CH: Class = Class(3);
+    /// Hesiod.
+    pub const HS: Class = Class(4);
+
+    /// Total: every 16-bit value names some class, known here or not.
+    pub const fn new(value: u16) -> Class {
+        Class(value)
+    }
+
+    /// Infallible, so a record round-trips unchanged.
+    pub const fn to_u16(self) -> u16 {
+        self.0
+    }
+
+    /// Whether this is a QCLASS-only value that no stored record can be in:
+    /// ANY (255) and RFC 2136's NONE (254).
+    ///
+    /// Both arrive in a record's CLASS field in an UPDATE message, where §2.4
+    /// and §2.5 repurpose it to say what to *do* with the record — which is why
+    /// `Class` can hold them and why [`QueryClass::from`] exists.
+    pub const fn is_meta(self) -> bool {
+        matches!(self.0, 254 | 255)
+    }
+}
+
+impl Default for Class {
+    /// IN. Every zone this server holds is IN — `zone::parse_zone_file` refuses
+    /// anything else — so a record built without saying its class is in the only
+    /// one there is. A `derive(Default)` would have given `CLASS0`, which is not
+    /// a class at all.
+    fn default() -> Class {
+        Class::IN
+    }
+}
+
+impl std::fmt::Display for Class {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Class::IN => write!(f, "IN"),
+            Class::CH => write!(f, "CH"),
+            Class::HS => write!(f, "HS"),
+            Class(other) => write!(f, "CLASS{other}"),
+        }
+    }
+}
+
+impl From<Class> for QueryClass {
+    /// Every CLASS is a legal QCLASS (RFC 1035 §3.2.5). The reverse does not
+    /// exist, and that asymmetry is the point of the pair.
+    ///
+    /// This is also how RFC 2136's repurposed CLASS field is read: an UPDATE
+    /// carries ANY or NONE there to mean "any type at this name" or "delete",
+    /// and `update.rs` matches on the `QueryClass` this produces.
+    fn from(class: Class) -> QueryClass {
+        QueryClass::from_u16(class.to_u16())
+    }
+}
+
+/// The type a *record* has — TYPE, not QTYPE (RFC 1035 §3.2.1).
+///
+/// The other half of the pair [`Qtype`] documents. There is no conversion from
+/// `Qtype` to `Rtype`, because most QTYPEs are not record types; the conversion
+/// that does exist runs the other way, since every TYPE is a legal QTYPE.
+///
+/// **A few values appear in a TYPE field and are still not record types.** ANY,
+/// AXFR and IXFR are meta-types (RFC 6895 §3.1): they are legal in a question,
+/// and RFC 2136 §2.4 and §2.5 also put TYPE=ANY in an UPDATE's prerequisite and
+/// update sections to mean "any type at this name". So `Rtype` can hold them —
+/// they arrive on the wire — and [`Rtype::is_meta`] is how code asks whether the
+/// value in hand could ever be a stored record. §3.4.1's prescan is exactly that
+/// question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct Rtype(u16);
+
+impl Rtype {
+    /// Total: every 16-bit value names some type, known here or not.
+    pub const fn new(value: u16) -> Rtype {
+        Rtype(value)
+    }
+
+    /// Infallible, so a record round-trips unchanged.
+    pub const fn to_u16(self) -> u16 {
+        self.0
+    }
+
+    /// Whether this is a meta-type — a value that may appear in a TYPE field but
+    /// that no stored resource record can have (RFC 6895 §3.1).
+    ///
+    /// RFC 2136 §3.4.1's prescan refuses an UPDATE that tries to *add* one, and
+    /// that is the question this answers: not "is this ANY" but "could this ever
+    /// be a record".
+    pub const fn is_meta(self) -> bool {
+        matches!(
+            self.0,
+            utils::record_types::ANY_CODE
+                | utils::record_types::AXFR_CODE
+                | utils::record_types::IXFR_CODE
+        )
+    }
+}
+
+impl std::fmt::Display for Rtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", utils::record_type_name(*self))
+    }
+}
+
+impl From<Rtype> for Qtype {
+    /// Every TYPE is a legal QTYPE (RFC 1035 §3.2.3). The reverse does not
+    /// exist, and that asymmetry is the whole point of the pair.
+    fn from(rtype: Rtype) -> Qtype {
+        Qtype(rtype.0)
+    }
+}
+
+/// The type a *question* asks for — QTYPE, not TYPE (RFC 1035 §3.2.3).
+///
+/// A newtype because the two are different spaces and `u16` let them be
+/// compared. QTYPE is "a superset of TYPE": it holds values **no resource
+/// record can ever have** — ANY (255), AXFR (252), IXFR (251), MAILB (253) and
+/// MAILA (254) — so `record.rtype == question.qtype` is false for every record
+/// in a perfectly good answer whenever the question is one of those.
+///
+/// That has cost this codebase twice. `zone::of_type` returned nothing for
+/// QTYPE=ANY, so an ANY query at a name with data came back as an empty NOERROR
+/// plus the SOA — a NODATA for a name that has data, and none of the shapes
+/// RFC 8482 §4 permits (`CLAUDE.md` §8). That was fixed at the call site, and
+/// the same comparison was still written twice in `resolver.rs`: once to decide
+/// whether a CNAME chase is finished, and once to decide whether an answer is
+/// *negative* — which sent the DNSSEC validator looking for a denial proof that
+/// a positive answer has no reason to carry, so an ANY answer that verified was
+/// reported `Bogus("... was denied without an NSEC or NSEC3 proof")` and
+/// `rdnsr --dnssec-validate` failed closed with SERVFAIL. Nothing on that path
+/// rejects ANY, so a client only had to ask.
+///
+/// The fix is that there is no way to compare the two spaces except
+/// [`Qtype::matches`], which knows what ANY means, and [`Qtype::is`], which asks
+/// the narrower question out loud. See `TODO.md` #13c and `CLAUDE.md` §17.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct Qtype(u16);
+
+impl Qtype {
+    /// `*` — every type at the name (RFC 1035 §3.2.3).
+    pub const ANY: Qtype = Qtype(utils::record_types::ANY_CODE);
+    /// A whole-zone transfer (RFC 5936). TCP only.
+    pub const AXFR: Qtype = Qtype(utils::record_types::AXFR_CODE);
+    /// An incremental transfer (RFC 1995).
+    pub const IXFR: Qtype = Qtype(utils::record_types::IXFR_CODE);
+
+    /// The question that asks for exactly this record type.
+    ///
+    /// `const`, so it can name a `Qtype` wherever `utils::record_types` names a
+    /// TYPE — which is what keeps one registry of numbers rather than two that
+    /// can drift (`CLAUDE.md` §7).
+    pub const fn of(rtype: Rtype) -> Qtype {
+        Qtype(rtype.to_u16())
+    }
+
+    /// Total: every 16-bit value is some QTYPE.
+    pub const fn from_u16(value: u16) -> Qtype {
+        Qtype(value)
+    }
+
+    /// Infallible, so a question round-trips unchanged.
+    pub const fn to_u16(self) -> u16 {
+        self.0
+    }
+
+    /// Whether this question selects a stored record of type `rtype`.
+    ///
+    /// **The only comparison of a question's type against stored data**, and the
+    /// reason this type exists. ANY means every type at the name (RFC 1035
+    /// §3.2.3) — *except* the three DNSSEC meta types, which are not
+    /// answer-section data unless the DO bit asked for them (RFC 4035 §3.1.1)
+    /// and whose signatures are attached by `dnssec_answer::answer_signatures`,
+    /// which knows which ones an answer actually owes. Returning them here would
+    /// hand signatures to a client that cannot read them, duplicate them for one
+    /// that can, and — the correctness bug rather than the noise — make an empty
+    /// non-terminal in an NSEC-signed zone look like a name *with* data, because
+    /// the chain puts an NSEC at it.
+    pub fn matches(self, rtype: Rtype) -> bool {
+        use utils::record_types as rt;
+        if self == Qtype::ANY {
+            !matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3)
+        } else {
+            self.0 == rtype.to_u16()
+        }
+    }
+
+    /// Whether the question is for exactly `rtype` — the narrow question, with
+    /// no ANY handling. Say this when "is the client asking for a DS?" is what
+    /// is meant, so that the site does not read like a [`Qtype::matches`] that
+    /// forgot about ANY.
+    pub const fn is(self, rtype: Rtype) -> bool {
+        self.0 == rtype.to_u16()
+    }
+}
+
+impl std::fmt::Display for Qtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", utils::record_type_name(Rtype::new(self.0)))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QuerySection {
     // Contains the domain name for the question
     pub qname: String,
-    // Query type, matches ResourceRecordKind discriminant
-    pub qtype: u16,
+    /// The type asked for. See [`Qtype`] — a QTYPE is not a TYPE.
+    pub qtype: Qtype,
     pub qclass: QueryClass,
 }
 
@@ -196,7 +500,7 @@ pub enum ParsedRecord {
         public_key: Vec<u8>,
     },
     RRSIG {
-        type_covered: u16,
+        type_covered: Rtype,
         algorithm: u8,
         labels: u8,
         original_ttl: u32,
@@ -226,7 +530,7 @@ pub enum ParsedRecord {
     },
     /// A record type we don't parse. `rtype` is carried by the enclosing
     /// [`RecordData`]; the raw bytes are preserved there too.
-    Unknown(u16),
+    Unknown(Rtype),
 }
 
 /// A record's data, stored as **uncompressed wire-format bytes**.
@@ -244,19 +548,19 @@ pub enum ParsedRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordData {
     /// The RR TYPE code (e.g. 1 = A, 28 = AAAA).
-    pub rtype: u16,
+    pub rtype: Rtype,
     /// Uncompressed wire-format RDATA.
     pub rdata: Box<[u8]>,
 }
 
 impl RecordData {
     /// Map a record-type name (e.g. "A", "AAAA") to its numeric TYPE code.
-    fn to_u16(kind: &str) -> Option<u16> {
+    fn to_u16(kind: &str) -> Option<Rtype> {
         utils::record_type_name_to_code(kind)
     }
 
     /// The RR TYPE code of this record.
-    pub fn rtype(&self) -> u16 {
+    pub fn rtype(&self) -> Rtype {
         self.rtype
     }
 
@@ -267,7 +571,7 @@ impl RecordData {
     /// bytes are self-contained. Types we don't parse are stored verbatim
     /// (RFC 3597), which — unlike the old typed enum — preserves their bytes.
     pub fn from_wire<'a>(
-        record_type: u16,
+        record_type: Rtype,
         rdata: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<Self, WireError> {
@@ -307,24 +611,24 @@ impl ParsedRecord {
     /// Decode wire-format RDATA into a typed record. `unpacker` resolves any
     /// compressed domain names against the message it was built over.
     fn decode<'a>(
-        record_type: u16,
+        record_type: Rtype,
         rdata: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<Self, WireError> {
         match record_type {
-            1 => {
+            utils::record_types::A => {
                 let addr: [u8; 4] = rdata.try_into()?;
                 Ok(ParsedRecord::A(Ipv4Addr::from(addr)))
             }
-            2 => {
+            utils::record_types::NS => {
                 let (nsname, _) = dname_from_bytes(rdata, unpacker)?;
                 Ok(ParsedRecord::NS(nsname))
             }
-            5 => {
+            utils::record_types::CNAME => {
                 let (cname, _) = dname_from_bytes(rdata, unpacker)?;
                 Ok(ParsedRecord::CNAME(cname))
             }
-            6 => {
+            utils::record_types::SOA => {
                 let (mname, rest) = dname_from_bytes(rdata, unpacker)?;
                 let (rname, rest) = dname_from_bytes(rest, unpacker)?;
                 let (serial, rest) = read_be!(u32, rest);
@@ -343,11 +647,11 @@ impl ParsedRecord {
                     minimum,
                 })
             }
-            12 => {
+            utils::record_types::PTR => {
                 let (ptrdname, _) = dname_from_bytes(rdata, unpacker)?;
                 Ok(ParsedRecord::PTR(ptrdname))
             }
-            15 => {
+            utils::record_types::MX => {
                 let (preference, rest) = read_be!(u16, rdata);
                 let (exchange, _) = dname_from_bytes(rest, unpacker)?;
                 Ok(ParsedRecord::MX {
@@ -355,7 +659,7 @@ impl ParsedRecord {
                     exchange,
                 })
             }
-            16 => {
+            utils::record_types::TXT => {
                 // A run of `<character-string>`s: one length byte, then that
                 // many bytes, until the RDATA runs out.
                 let mut strings = Vec::new();
@@ -374,12 +678,12 @@ impl ParsedRecord {
                 }
                 Ok(ParsedRecord::TXT(strings))
             }
-            28 => {
+            utils::record_types::AAAA => {
                 let addr: [u8; 16] = rdata.try_into()?;
                 Ok(ParsedRecord::AAAA(Ipv6Addr::from(addr)))
             }
             // DNSSEC types
-            43 => {
+            utils::record_types::DS => {
                 // DS: key_tag(2) + algorithm(1) + digest_type(1) + digest(variable)
                 let (key_tag, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
@@ -399,7 +703,7 @@ impl ParsedRecord {
                     digest,
                 })
             }
-            46 => {
+            utils::record_types::RRSIG => {
                 // RRSIG (RFC 4034 §3.1): type_covered(2) + algorithm(1) + labels(1)
                 // + original_ttl(4) + expiration(4) + inception(4) + key_tag(2) +
                 // signer_name + signature. Expiration precedes inception on the
@@ -423,7 +727,7 @@ impl ParsedRecord {
                 let (signer_name, rest) = dname_from_bytes(rest, unpacker)?;
                 let signature = rest.to_vec();
                 Ok(ParsedRecord::RRSIG {
-                    type_covered,
+                    type_covered: Rtype::new(type_covered),
                     algorithm,
                     labels,
                     original_ttl,
@@ -434,7 +738,7 @@ impl ParsedRecord {
                     signature,
                 })
             }
-            47 => {
+            utils::record_types::NSEC => {
                 // NSEC: next_domain_name + type_bitmap
                 let (next_domain_name, rest) = dname_from_bytes(rdata, unpacker)?;
                 let type_bitmap = rest.to_vec();
@@ -443,7 +747,7 @@ impl ParsedRecord {
                     type_bitmap,
                 })
             }
-            48 => {
+            utils::record_types::DNSKEY => {
                 // DNSKEY: flags(2) + protocol(1) + algorithm(1) + public_key(variable)
                 let (flags, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
@@ -463,7 +767,7 @@ impl ParsedRecord {
                     public_key,
                 })
             }
-            50 => {
+            utils::record_types::NSEC3 => {
                 // NSEC3: hash_algorithm(1) + flags(1) + iterations(2) + salt_len(1) + salt(variable) + next_hashed_owner + type_bitmap
                 if rdata.len() < 5 {
                     return Err(WireError::Truncated {
@@ -519,20 +823,20 @@ impl ParsedRecord {
     ///
     /// The inverse of [`ParsedRecord::decode`] for the types we parse. Names
     /// are written uncompressed via [`dname_to_bytes`].
-    fn encode(&self) -> Result<(u16, Vec<u8>), WireError> {
+    fn encode(&self) -> Result<(Rtype, Vec<u8>), WireError> {
         let out = match self {
-            ParsedRecord::A(addr) => (1, addr.octets().to_vec()),
-            ParsedRecord::AAAA(addr) => (28, addr.octets().to_vec()),
-            ParsedRecord::NS(name) => (2, dname_to_bytes(name)?),
-            ParsedRecord::CNAME(name) => (5, dname_to_bytes(name)?),
-            ParsedRecord::PTR(name) => (12, dname_to_bytes(name)?),
+            ParsedRecord::A(addr) => (utils::record_types::A, addr.octets().to_vec()),
+            ParsedRecord::AAAA(addr) => (utils::record_types::AAAA, addr.octets().to_vec()),
+            ParsedRecord::NS(name) => (utils::record_types::NS, dname_to_bytes(name)?),
+            ParsedRecord::CNAME(name) => (utils::record_types::CNAME, dname_to_bytes(name)?),
+            ParsedRecord::PTR(name) => (utils::record_types::PTR, dname_to_bytes(name)?),
             ParsedRecord::MX {
                 preference,
                 exchange,
             } => {
                 let mut v = preference.to_be_bytes().to_vec();
                 v.extend_from_slice(&dname_to_bytes(exchange)?);
-                (15, v)
+                (utils::record_types::MX, v)
             }
             ParsedRecord::TXT(strings) => {
                 if strings.is_empty() {
@@ -554,7 +858,7 @@ impl ParsedRecord {
                     v.push(len);
                     v.extend_from_slice(s);
                 }
-                (16, v)
+                (utils::record_types::TXT, v)
             }
             ParsedRecord::SOA {
                 mname,
@@ -572,7 +876,7 @@ impl ParsedRecord {
                 v.extend_from_slice(&retry.to_be_bytes());
                 v.extend_from_slice(&expire.to_be_bytes());
                 v.extend_from_slice(&minimum.to_be_bytes());
-                (6, v)
+                (utils::record_types::SOA, v)
             }
             ParsedRecord::DNSKEY {
                 flags,
@@ -584,7 +888,7 @@ impl ParsedRecord {
                 v.push(*protocol);
                 v.push(*algorithm);
                 v.extend_from_slice(public_key);
-                (48, v)
+                (utils::record_types::DNSKEY, v)
             }
             ParsedRecord::RRSIG {
                 type_covered,
@@ -597,7 +901,7 @@ impl ParsedRecord {
                 signer_name,
                 signature,
             } => {
-                let mut v = type_covered.to_be_bytes().to_vec();
+                let mut v = type_covered.to_u16().to_be_bytes().to_vec();
                 v.push(*algorithm);
                 v.push(*labels);
                 v.extend_from_slice(&original_ttl.to_be_bytes());
@@ -607,7 +911,7 @@ impl ParsedRecord {
                 v.extend_from_slice(&key_tag.to_be_bytes());
                 v.extend_from_slice(&dname_to_bytes(signer_name)?);
                 v.extend_from_slice(signature);
-                (46, v)
+                (utils::record_types::RRSIG, v)
             }
             ParsedRecord::DS {
                 key_tag,
@@ -619,7 +923,7 @@ impl ParsedRecord {
                 v.push(*algorithm);
                 v.push(*digest_type);
                 v.extend_from_slice(digest);
-                (43, v)
+                (utils::record_types::DS, v)
             }
             ParsedRecord::NSEC {
                 next_domain_name,
@@ -627,7 +931,7 @@ impl ParsedRecord {
             } => {
                 let mut v = dname_to_bytes(next_domain_name)?;
                 v.extend_from_slice(type_bitmap);
-                (47, v)
+                (utils::record_types::NSEC, v)
             }
             ParsedRecord::NSEC3 {
                 hash_algorithm,
@@ -648,7 +952,7 @@ impl ParsedRecord {
                 v.push(next_hashed_owner.len() as u8);
                 v.extend_from_slice(next_hashed_owner);
                 v.extend_from_slice(type_bitmap);
-                (50, v)
+                (utils::record_types::NSEC3, v)
             }
             // Opaque types are stored verbatim by `RecordData::from_wire`; there
             // is no typed payload to re-encode here.
@@ -667,9 +971,87 @@ impl ParsedRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRecord {
     pub name: String,
-    pub class: u16,
-    pub ttl: i32, // As per 2.3.3 in RFC 1035
+    /// The class this record is in. See [`Class`].
+    pub class: Class,
+    /// How long this record may be cached. See [`Ttl`].
+    pub ttl: Ttl,
     pub rdata: RecordData,
+}
+
+/// How long a record may be cached, in seconds.
+///
+/// **A `u32`, and clamped at the parse boundary.** RFC 1035 §4.1.3 calls the
+/// field "a 32 bit signed integer", and RFC 2181 §8 corrects it: the TTL is
+/// unsigned, and "implementations should treat TTL values received with the most
+/// significant bit set as if the entire value received was zero". That `.max(0)`
+/// is what [`Ttl::from_wire`] does, once, where the bytes come off the wire.
+///
+/// It used to be an `i32` on [`ResourceRecord`], and the clamp was written out
+/// by hand **fourteen times** — `cache`, `negative_cache`, five in `nsec_cache`,
+/// four in `resolver`, `zone_signer`, two in test helpers — plus five
+/// `.min(i32::MAX as u32) as i32` conversions going the other way. Every one of
+/// them was correct. The one that was missing is the bug `CLAUDE.md` §2 records:
+/// `ttl as u64` on a negative TTL is `u64::MAX`, which `min` then picked as the
+/// smallest TTL in an RRset and pinned a cache entry for the life of the
+/// process. §2's rule is that a clamp belongs at the boundary once rather than
+/// at every use, and this is that rule applied to the value it was written for.
+///
+/// This could not be done before OPT left the additional section (`TODO.md`
+/// #13d): an OPT record's TTL field is not a TTL at all — it packs the extended
+/// RCODE, the EDNS version and the DO bit — so clamping every `ResourceRecord`
+/// TTL at the parse boundary would have corrupted it. One field with two
+/// meanings depending on a sibling field is exactly the conflation the section
+/// is about, and the two halves had to land in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct Ttl(u32);
+
+impl Ttl {
+    /// Zero seconds: do not cache (RFC 1035 §3.2.1).
+    pub const ZERO: Ttl = Ttl(0);
+
+    /// A TTL as it came off the wire, clamped per RFC 2181 §8.
+    ///
+    /// Total, and the only place the sign of the wire field is considered.
+    pub const fn from_wire(seconds: i32) -> Ttl {
+        Ttl(if seconds < 0 { 0 } else { seconds as u32 })
+    }
+
+    /// A TTL from a value already known to be a count of seconds.
+    pub const fn from_secs(seconds: u32) -> Ttl {
+        Ttl(seconds)
+    }
+
+    /// The count of seconds.
+    pub const fn as_secs(self) -> u32 {
+        self.0
+    }
+
+    /// The count of seconds, widened for arithmetic against a timestamp.
+    ///
+    /// A separate accessor rather than `as u64` at each site, because the
+    /// widening is where the original bug lived: it is safe here only because
+    /// the value is already non-negative by construction.
+    pub const fn as_u64(self) -> u64 {
+        self.0 as u64
+    }
+
+    /// This TTL, or `ceiling` if it is larger — the cap every cache applies.
+    pub fn capped_at(self, ceiling: u32) -> Ttl {
+        Ttl(if self.0 > ceiling { ceiling } else { self.0 })
+    }
+
+    /// The wire encoding: RFC 2181 §8 makes the field unsigned, so this is the
+    /// same 32 bits, and a value with the top bit set can no longer be built.
+    pub const fn to_wire(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Ttl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 /// A DNS response code: the 12-bit value of RFC 6891 §6.1.3, not the 4-bit
@@ -793,11 +1175,25 @@ pub struct DnsMessage {
     pub queries: Vec<QuerySection>,
     pub answers: Vec<ResourceRecord>,
     pub authorities: Vec<ResourceRecord>,
+    /// The additional section **without** its OPT record — see [`DnsMessage::edns`].
     pub additionals: Vec<ResourceRecord>,
+    /// The EDNS0 OPT pseudo-record, if the message carries one (RFC 6891).
+    ///
+    /// A field rather than a record in [`DnsMessage::additionals`], because OPT
+    /// is not a resource record: it has no owner name that means anything, its
+    /// CLASS is a payload size and its TTL is a flags word. Keeping it in the
+    /// section cost eight linear scans of that `Vec` per message in this file
+    /// alone, made every filter over the section responsible for remembering to
+    /// spare it (`rdnsr`'s was `retain(|rr| rr.rdata.rtype == OPT_RECORD_TYPE ||
+    /// keep(rr))`), and left a malformed state representable: **two OPT records
+    /// in one message**, which RFC 6891 §6.1.1 says MUST be FORMERR and which
+    /// nothing here rejected — the first was read and both were re-serialized.
+    /// `Option` makes two of them unspellable.
+    pub edns: Option<Edns>,
 }
 
 /// The RR TYPE code of the EDNS0 OPT pseudo-record (RFC 6891).
-pub const OPT_RECORD_TYPE: u16 = 41;
+pub const OPT_RECORD_TYPE: Rtype = Rtype::new(41);
 
 /// The classic (pre-EDNS) UDP message size limit (RFC 1035 §4.2.1).
 pub const CLASSIC_UDP_SIZE: u16 = 512;
@@ -840,6 +1236,21 @@ pub struct EdnsOption {
 /// the message, not of the OPT record, so it lives in [`DnsMessage::rcode`] as a
 /// single 12-bit value and is split across the header and the OPT TTL only at
 /// serialization time. See [`DnsMessage::to_bytes`].
+/// The option list is held **unparsed**, and that is load-bearing rather than an
+/// optimization.
+///
+/// The three fields above it come from the OPT record's CLASS and TTL, so a
+/// parsed record always has them and nothing about them can be malformed —
+/// [`EdnsHeader`] says so already. The option list is the only fallible part,
+/// and if reading it were part of parsing the *message*, a bad list would make
+/// `DnsMessage::try_from_bytes` fail. `rdnsd` returns `Vec::new()` on a parse
+/// failure (`main.rs:1465` and `:2072`) and `error_bytes` needs a parsed message
+/// to answer from, so that would turn today's diagnosable FORMERR into a client
+/// timeout. Keeping the bytes and parsing on demand is what preserves the reply.
+///
+/// It also preserves the allocation profile: the answer path reads the payload
+/// size, the version and the DO bit and never looks at an option, so nothing
+/// builds a `Vec<EdnsOption>` unless something asks for the options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edns {
     /// Requestor's/responder's advertised UDP payload size (OPT CLASS field).
@@ -848,8 +1259,8 @@ pub struct Edns {
     pub version: u8,
     /// DNSSEC OK bit (DO) — the client is willing to receive DNSSEC records.
     pub do_bit: bool,
-    /// Options carried in the OPT RDATA, in wire order.
-    pub options: Vec<EdnsOption>,
+    /// The OPT RDATA: the option list in wire form. See the note above.
+    rdata: Box<[u8]>,
 }
 
 /// The three EDNS parameters a server acts on, without the option list.
@@ -877,24 +1288,7 @@ pub struct EdnsHeader {
     pub do_bit: bool,
 }
 
-impl EdnsHeader {
-    /// Decode the fixed fields of an OPT record: CLASS is the payload size and
-    /// TTL packs the version and the flags (RFC 6891 §6.1.3).
-    ///
-    /// Infallible, and that is the difference between this and the option list:
-    /// these are a `u16` and a `u32` that a parsed record always has, so nothing
-    /// here can be malformed. The extended RCODE in the top byte of the TTL is
-    /// deliberately not read — it is a property of the *message*, and
-    /// [`DnsMessage::to_bytes`] is where the two halves are put back together.
-    fn from_record(rr: &ResourceRecord) -> Self {
-        let flags = rr.ttl as u32;
-        EdnsHeader {
-            udp_payload_size: rr.class,
-            version: ((flags >> 16) & 0xff) as u8,
-            do_bit: (flags & 0x8000) != 0,
-        }
-    }
-}
+impl EdnsHeader {}
 
 impl Edns {
     /// The parameters without the options — see [`EdnsHeader`].
@@ -912,43 +1306,45 @@ impl Edns {
             udp_payload_size: size,
             version: EDNS_VERSION,
             do_bit: false,
-            options: Vec::new(),
+            rdata: Box::new([]),
         }
     }
 
-    /// The data of the first option with `code`, if present.
-    pub fn option(&self, code: u16) -> Option<&[u8]> {
-        self.options
-            .iter()
-            .find(|o| o.code == code)
-            .map(|o| o.data.as_slice())
-    }
-
-    /// Pack version and flags into the 32-bit OPT TTL field. The extended-RCODE
-    /// byte is left zero; [`DnsMessage::to_bytes`] fills it in from the
-    /// message's RCODE.
-    fn flags(&self) -> u32 {
-        let do_flag: u32 = if self.do_bit { 0x8000 } else { 0 };
-        ((self.version as u32) << 16) | do_flag
-    }
-
-    /// Decode EDNS parameters from a parsed OPT [`ResourceRecord`].
-    fn from_record(rr: &ResourceRecord) -> Result<Self, WireError> {
-        let header = EdnsHeader::from_record(rr);
+    /// An OPT carrying `options`, encoded into RDATA once here rather than at
+    /// serialization time.
+    ///
+    /// Errors only if an option's data exceeds the 16-bit length field.
+    pub fn with_options(
+        size: u16,
+        version: u8,
+        do_bit: bool,
+        options: &[EdnsOption],
+    ) -> Result<Self, WireError> {
+        let mut rdata = Vec::new();
+        for opt in options {
+            let len: u16 = opt.data.len().try_into().map_err(|_| WireError::TooLong {
+                what: "EDNS option data",
+                limit: u16::MAX as usize,
+                actual: opt.data.len(),
+            })?;
+            rdata.extend_from_slice(&opt.code.to_be_bytes());
+            rdata.extend_from_slice(&len.to_be_bytes());
+            rdata.extend_from_slice(&opt.data);
+        }
         Ok(Edns {
-            udp_payload_size: header.udp_payload_size,
-            version: header.version,
-            do_bit: header.do_bit,
-            options: Self::parse_options(&rr.rdata.rdata)?,
+            udp_payload_size: size,
+            version,
+            do_bit,
+            rdata: rdata.into_boxed_slice(),
         })
     }
 
-    /// Parse the OPT RDATA option list. A malformed list is an error rather
-    /// than a partial read: a client that sends one deserves FORMERR, not a
-    /// silently truncated view of what it asked for.
-    fn parse_options(rdata: &[u8]) -> Result<Vec<EdnsOption>, WireError> {
+    /// The option list, parsed. A malformed list is an error rather than a
+    /// partial read: a client that sends one deserves FORMERR, not a silently
+    /// truncated view of what it asked for.
+    pub fn options(&self) -> Result<Vec<EdnsOption>, WireError> {
         let mut options = Vec::new();
-        Self::walk_options(rdata, |code, data| {
+        Self::walk_options(&self.rdata, |code, data| {
             options.push(EdnsOption {
                 code,
                 data: data.to_vec(),
@@ -957,12 +1353,36 @@ impl Edns {
         Ok(options)
     }
 
+    /// Whether the option list is well formed, without building it.
+    ///
+    /// This is the FORMERR question, and it is separate from [`Edns::options`]
+    /// because the answer path asks it and never wants the options themselves.
+    pub fn check_options(&self) -> Result<(), WireError> {
+        Self::walk_options(&self.rdata, |_, _| {})
+    }
+
+    /// The data of the first option with `code`, if the list is well formed.
+    pub fn option(&self, code: u16) -> Result<Option<Vec<u8>>, WireError> {
+        let mut found = None;
+        Self::walk_options(&self.rdata, |c, data| {
+            if c == code && found.is_none() {
+                found = Some(data.to_vec());
+            }
+        })?;
+        Ok(found)
+    }
+
+    /// The OPT RDATA as it will go on the wire.
+    fn rdata(&self) -> &[u8] {
+        &self.rdata
+    }
+
     /// Walk the option list, handing each option's code and data to `each`
     /// without copying either.
     ///
-    /// The walk is here once and has two callers because it answers two
-    /// different questions: [`Edns::parse_options`] wants the options, and
-    /// [`DnsMessage::edns_header`] only wants to know that they are well formed
+    /// The walk is here once and has three callers because it answers two
+    /// different questions: [`Edns::options`] wants the options, and
+    /// [`Edns::check_options`] only wants to know that they are well formed
     /// — the answer path reads the payload size, the version and the DO bit and
     /// never looks at an option. A second copy of the TLV arithmetic for the
     /// checking case is exactly the drift `CLAUDE.md` §7 is about, and this one
@@ -991,31 +1411,6 @@ impl Edns {
         }
         Ok(())
     }
-
-    /// Build the OPT [`ResourceRecord`] for the additional section, encoding the
-    /// option list into RDATA.
-    fn to_record(&self) -> Result<ResourceRecord, WireError> {
-        let mut rdata = Vec::new();
-        for opt in &self.options {
-            let len: u16 = opt.data.len().try_into().map_err(|_| WireError::TooLong {
-                what: "EDNS option data",
-                limit: u16::MAX as usize,
-                actual: opt.data.len(),
-            })?;
-            rdata.extend_from_slice(&opt.code.to_be_bytes());
-            rdata.extend_from_slice(&len.to_be_bytes());
-            rdata.extend_from_slice(&opt.data);
-        }
-        Ok(ResourceRecord {
-            name: ".".to_string(),
-            class: self.udp_payload_size,
-            ttl: self.flags() as i32,
-            rdata: RecordData {
-                rtype: OPT_RECORD_TYPE,
-                rdata: rdata.into_boxed_slice(),
-            },
-        })
-    }
 }
 
 impl<'a> TryUnpackFromBytes<'a> for QuerySection {
@@ -1034,7 +1429,9 @@ impl<'a> TryUnpackFromBytes<'a> for QuerySection {
         Ok((
             Self {
                 qname,
-                qtype,
+                // Total: every 16-bit value is a QTYPE, including the ones no
+                // record can hold. See [`Qtype`].
+                qtype: Qtype::from_u16(qtype),
                 // Total, and it has to be: a class we have no name for is
                 // echoed back unchanged, not folded onto one we do.
                 qclass: QueryClass::from_u16(qclass),
@@ -1053,8 +1450,12 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
     ) -> Result<<Self as TryUnpackFromBytes<'a>>::Output, Self::Error> {
         let (name, rest) = dname_from_bytes(data, unpacker)?;
         let (record_type, rest) = read_be!(u16, rest);
+        let record_type = Rtype::new(record_type);
         let (class, rest) = read_be!(u16, rest);
+        let class = Class::new(class);
         let (ttl, rest) = read_be!(i32, rest);
+        // Clamped here, once, and nowhere else (RFC 2181 §8). See [`Ttl`].
+        let ttl = Ttl::from_wire(ttl);
         let (rdatalen, rest) = read_be!(u16, rest);
         // RDLENGTH is attacker-chosen and every other length in this file is
         // checked before it is used — `read_be!` checks its own bytes,
@@ -1089,6 +1490,74 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
     }
 }
 
+/// One record of the additional section: an ordinary record, or the OPT
+/// pseudo-record it is not.
+enum Additional {
+    Record(ResourceRecord),
+    /// The OPT record, and its raw 32-bit flags word — whose top byte is the
+    /// extended RCODE's high bits and belongs to the *message*, not to the OPT
+    /// record. [`Edns`] documents that split; this carries the value across it.
+    Opt(Edns, u32),
+}
+
+impl Additional {
+    /// Read one additional-section record.
+    ///
+    /// OPT is decoded from the wire fields directly rather than being built as a
+    /// [`ResourceRecord`] and taken apart afterwards, and that is a correctness
+    /// requirement rather than tidiness: an OPT record's TTL field is **not a
+    /// TTL**. It packs the extended RCODE, the EDNS version and the DO bit
+    /// (RFC 6891 §6.1.3), so putting it through [`Ttl::from_wire`] — which
+    /// clamps a negative value to zero per RFC 2181 §8 — would erase all three
+    /// whenever the extended RCODE's high byte has its top bit set. Nothing
+    /// sends that today, and "nothing sends that today" is not a reason to
+    /// build a parser that cannot represent it.
+    fn try_from_bytes<'a>(
+        data: &'a [u8],
+        unpacker: &DNameUnpacker<'a>,
+    ) -> Result<(Additional, &'a [u8]), WireError> {
+        // Peek the TYPE without consuming: NAME, then the 16-bit TYPE.
+        let (_, after_name) = dname_from_bytes(data, unpacker)?;
+        let (rtype, _) = read_be!(u16, after_name);
+        if Rtype::new(rtype) != OPT_RECORD_TYPE {
+            let (rr, rest) = ResourceRecord::try_from_bytes(data, unpacker)?;
+            return Ok((Additional::Record(rr), rest));
+        }
+
+        // NAME (root, but whatever arrived), TYPE, CLASS = payload size,
+        // TTL = flags, RDLENGTH, RDATA = the option list.
+        let (_, rest) = dname_from_bytes(data, unpacker)?;
+        let (_rtype, rest) = read_be!(u16, rest);
+        let (udp_payload_size, rest) = read_be!(u16, rest);
+        let (flags, rest) = read_be!(u32, rest);
+        let (rdatalen, rest) = read_be!(u16, rest);
+        let rdatalen = rdatalen as usize;
+        if rest.len() < rdatalen {
+            return Err(WireError::Truncated {
+                what: "OPT RDATA",
+                need: rdatalen,
+                have: rest.len(),
+            });
+        }
+        let (rdata, rest) = rest.split_at(rdatalen);
+        Ok((
+            Additional::Opt(
+                Edns {
+                    udp_payload_size,
+                    version: ((flags >> 16) & 0xff) as u8,
+                    do_bit: (flags & 0x8000) != 0,
+                    // The extended RCODE's high byte lives in the top of
+                    // `flags` and is *not* kept here: it is a property of the
+                    // message, so `DnsMessage` reassembles it into `rcode`.
+                    rdata: rdata.to_vec().into_boxed_slice(),
+                },
+                flags,
+            ),
+            rest,
+        ))
+    }
+}
+
 impl DnsMessage {
     pub fn try_from_bytes(data: &[u8]) -> Result<Self, WireError> {
         if data.len() < 12 {
@@ -1115,7 +1584,12 @@ impl DnsMessage {
         // UPDATE (5) and STATUS (2) all came out as `Unknown` — while the *write*
         // side shifted correctly, so the two disagreed. Nothing noticed because
         // every test used QUERY, whose value survives any mask.
-        let opcode = OpCode::from_u8((hi >> 3) & 0x0f).unwrap_or(OpCode::Unknown);
+        //
+        // Total, and it has to be: an opcode we have no name for is echoed back
+        // unchanged (RFC 1035 §4.1.1), not folded onto one we do. The
+        // `.unwrap_or(OpCode::Unknown)` this replaced turned eleven of the
+        // sixteen into 15 on the way out — see [`OpCode`].
+        let opcode = OpCode::from_u8(hi >> 3);
 
         let mut queries: Vec<QuerySection> = Vec::new();
         for _ in 0..query_len {
@@ -1138,10 +1612,30 @@ impl DnsMessage {
             rest = r;
         }
 
+        // The additional section, with the OPT pseudo-record taken out as it is
+        // read rather than fished back out of a list of resource records.
         let mut additionals = Vec::new();
+        let mut edns: Option<Edns> = None;
+        let mut ext_rcode: u16 = 0;
         for _ in 0..add_len {
-            let (query, r) = ResourceRecord::try_from_bytes(rest, &unpacker)?;
-            additionals.push(query);
+            let (item, r) = Additional::try_from_bytes(rest, &unpacker)?;
+            match item {
+                Additional::Record(rr) => additionals.push(rr),
+                Additional::Opt(opt, flags) => {
+                    // RFC 6891 §6.1.1: "If a query message with more than one
+                    // OPT RR is received, a FORMERR (RCODE=1) MUST be returned."
+                    // Nothing checked this before OPT became a field — the first
+                    // was read and every one of them was written back out.
+                    if edns.is_some() {
+                        return Err(WireError::malformed(
+                            "the additional section",
+                            "more than one OPT record; RFC 6891 §6.1.1 allows one",
+                        ));
+                    }
+                    ext_rcode = (flags >> 24) as u16;
+                    edns = Some(opt);
+                }
+            }
             rest = r;
         }
 
@@ -1149,11 +1643,10 @@ impl DnsMessage {
         // 8 in the OPT record's TTL when the message carries one. Reassemble
         // them so `rcode` is the whole value; without OPT the high bits are 0
         // and this is the classic 4-bit code.
-        let ext_rcode = additionals
-            .iter()
-            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
-            .map(|rr| ((rr.ttl as u32) >> 24) as u16)
-            .unwrap_or(0);
+        // RCODE is 12 bits: the low 4 in the header, the high 8 in the OPT
+        // record's flags word. The option list is *not* read here — a malformed
+        // one must not fail the parse, or the FORMERR that answers it could not
+        // be built (see [`Edns`]).
         let rcode = ResponseCode::from_u16((ext_rcode << 4) | (lo & 0x0f) as u16);
 
         Ok(Self {
@@ -1171,6 +1664,7 @@ impl DnsMessage {
             answers,
             authorities,
             additionals,
+            edns,
         })
     }
 
@@ -1183,7 +1677,7 @@ impl DnsMessage {
 
         pos = write_bytes(output, pos, &self.id.to_be_bytes())?;
 
-        let opcode = self.opcode.to_u8().unwrap_or_default();
+        let opcode = self.opcode.to_u8();
 
         // RCODE is a 12-bit value split across the header (low 4 bits) and the
         // OPT record's TTL (high 8). This used to read
@@ -1199,11 +1693,7 @@ impl DnsMessage {
                 format!("RCODE {rcode} does not fit the 12 bits RFC 6891 §6.1.3 gives it"),
             ));
         }
-        let has_opt = self
-            .additionals
-            .iter()
-            .any(|rr| rr.rdata.rtype == OPT_RECORD_TYPE);
-        if rcode > 0xf && !has_opt {
+        if rcode > 0xf && self.edns.is_none() {
             return Err(WireError::malformed(
                 "the header",
                 format!(
@@ -1226,11 +1716,20 @@ impl DnsMessage {
         pos = write_bytes(output, pos, &(self.queries.len() as u16).to_be_bytes())?;
         pos = write_bytes(output, pos, &(self.answers.len() as u16).to_be_bytes())?;
         pos = write_bytes(output, pos, &(self.authorities.len() as u16).to_be_bytes())?;
-        pos = write_bytes(output, pos, &(self.additionals.len() as u16).to_be_bytes())?;
+        // ARCOUNT counts the OPT record, which is a field here rather than a
+        // member of `additionals`. Getting this wrong is the arithmetic most
+        // likely to break when OPT moved, so it is one expression and not two.
+        let arcount = self.additionals.len() + usize::from(self.edns.is_some());
+        let arcount: u16 = arcount.try_into().map_err(|_| WireError::TooLong {
+            what: "the additional section",
+            limit: u16::MAX as usize,
+            actual: arcount,
+        })?;
+        pos = write_bytes(output, pos, &arcount.to_be_bytes())?;
 
         for q in &self.queries {
             pos = compressor.write_name(q.qname.as_str(), output, pos)?;
-            pos = write_bytes(output, pos, &q.qtype.to_be_bytes())?;
+            pos = write_bytes(output, pos, &q.qtype.to_u16().to_be_bytes())?;
             pos = write_bytes(output, pos, &q.qclass.to_u16().to_be_bytes())?;
         }
 
@@ -1241,17 +1740,9 @@ impl DnsMessage {
         for section in [&self.answers, &self.authorities, &self.additionals] {
             for rr in section {
                 pos = compressor.write_name(rr.name.as_str(), output, pos)?;
-                pos = write_bytes(output, pos, &rr.rdata.rtype.to_be_bytes())?;
-                pos = write_bytes(output, pos, &rr.class.to_be_bytes())?;
-                // The OPT TTL's top byte is the extended RCODE's high 8 bits.
-                // `self.rcode` owns the whole 12-bit value, so stamp it in here
-                // rather than trusting whatever the OPT record was built with.
-                let ttl = if rr.rdata.rtype == OPT_RECORD_TYPE {
-                    (rr.ttl as u32 & 0x00ff_ffff) | ((rcode as u32 >> 4) << 24)
-                } else {
-                    rr.ttl as u32
-                };
-                pos = write_bytes(output, pos, &ttl.to_be_bytes())?;
+                pos = write_bytes(output, pos, &rr.rdata.rtype.to_u16().to_be_bytes())?;
+                pos = write_bytes(output, pos, &rr.class.to_u16().to_be_bytes())?;
+                pos = write_bytes(output, pos, &rr.ttl.to_wire().to_be_bytes())?;
 
                 // RDLEN can only be known once the RDATA is written, since
                 // compression changes its length. Leave a hole and fill it in.
@@ -1269,42 +1760,62 @@ impl DnsMessage {
                 write_bytes(output, rdlen_at, &rdlen.to_be_bytes())?;
             }
         }
+
+        // The OPT record, last in the additional section.
+        //
+        // Last on purpose: `tsig::append_tsig` appends its record to the
+        // finished bytes and bumps ARCOUNT itself, so whatever this writes ends
+        // up before the TSIG — which RFC 8945 §5.1 requires to be final. Writing
+        // OPT before the other additionals would still satisfy that; writing it
+        // here keeps the wire order a client sees closest to what it sent.
+        if let Some(edns) = &self.edns {
+            // NAME is root, TYPE is OPT, CLASS is the payload size and TTL packs
+            // the extended RCODE, the version and the flags (RFC 6891 §6.1.3).
+            pos = write_bytes(output, pos, &[0])?;
+            pos = write_bytes(output, pos, &OPT_RECORD_TYPE.to_u16().to_be_bytes())?;
+            pos = write_bytes(output, pos, &edns.udp_payload_size.to_be_bytes())?;
+            let ttl = ((rcode as u32 >> 4) << 24)
+                | ((edns.version as u32) << 16)
+                | if edns.do_bit { 0x8000 } else { 0 };
+            pos = write_bytes(output, pos, &ttl.to_be_bytes())?;
+            let rdata = edns.rdata();
+            let rdlen: u16 = rdata.len().try_into().map_err(|_| WireError::TooLong {
+                what: "OPT RDATA",
+                limit: u16::MAX as usize,
+                actual: rdata.len(),
+            })?;
+            pos = write_bytes(output, pos, &rdlen.to_be_bytes())?;
+            pos = write_bytes(output, pos, rdata)?;
+        }
         Ok(pos)
     }
 
-    /// The EDNS0 OPT record from the additional section, if the message carries
-    /// one. Errors if the OPT record's option list is malformed — the caller
-    /// should answer FORMERR.
-    pub fn edns(&self) -> Result<Option<Edns>, WireError> {
-        self.additionals
-            .iter()
-            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
-            .map(Edns::from_record)
-            .transpose()
+    /// The message's EDNS parameters, if it carries an OPT record.
+    ///
+    /// Infallible now, and that is the change: the OPT record is a field rather
+    /// than something to be found in [`DnsMessage::additionals`], and its
+    /// option list is carried unparsed (see [`Edns`]). "Does this message do
+    /// EDNS" and "is its option list well formed" were one fallible question
+    /// and are now two.
+    pub fn edns(&self) -> Option<&Edns> {
+        self.edns.as_ref()
     }
 
     /// The EDNS parameters a server acts on, with the option list checked but
-    /// not built — see [`EdnsHeader`]. `Err` on a malformed option list, exactly
-    /// as [`DnsMessage::edns`]: the check is the same walk, so a packet is
-    /// FORMERR here if and only if it is FORMERR there.
+    /// not built — see [`EdnsHeader`]. `Err` on a malformed option list, which
+    /// is the caller's cue to answer FORMERR.
     pub fn edns_header(&self) -> Result<Option<EdnsHeader>, WireError> {
-        let Some(opt) = self
-            .additionals
-            .iter()
-            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
-        else {
+        let Some(edns) = &self.edns else {
             return Ok(None);
         };
-        Edns::walk_options(&opt.rdata.rdata, |_, _| {})?;
-        Ok(Some(EdnsHeader::from_record(opt)))
+        edns.check_options()?;
+        Ok(Some(edns.header()))
     }
 
     /// Whether the message carries an OPT record at all, regardless of whether
     /// its options parse. Use this to decide OPT mirroring (RFC 6891 §6.1.1).
     pub fn has_edns(&self) -> bool {
-        self.additionals
-            .iter()
-            .any(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
+        self.edns.is_some()
     }
 
     /// The requestor's advertised UDP payload size: the EDNS value (floored at
@@ -1314,21 +1825,19 @@ impl DnsMessage {
     /// when the option list is malformed; a bad option list just falls back to
     /// the safe classic size.
     pub fn udp_payload_size(&self) -> u16 {
-        self.additionals
-            .iter()
-            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
-            .map(|rr| rr.class.max(CLASSIC_UDP_SIZE))
+        self.edns
+            .as_ref()
+            .map(|e| e.udp_payload_size.max(CLASSIC_UDP_SIZE))
             .unwrap_or(CLASSIC_UDP_SIZE)
     }
 
-    /// Add the OPT record to the additional section, replacing any existing one.
-    /// Errors only if an option's data exceeds the 16-bit length field.
-    pub fn set_edns(&mut self, edns: Edns) -> Result<(), WireError> {
-        let record = edns.to_record()?;
-        self.additionals
-            .retain(|rr| rr.rdata.rtype != OPT_RECORD_TYPE);
-        self.additionals.push(record);
-        Ok(())
+    /// Set the message's OPT record, replacing any it already had.
+    ///
+    /// Infallible: encoding the option list is [`Edns::with_options`]' job now,
+    /// so there is nothing left here that can fail. The `Result` it used to
+    /// return is kept off deliberately — every caller was writing `let _ =`.
+    pub fn set_edns(&mut self, edns: Edns) {
+        self.edns = Some(edns);
     }
 
     /// Serialize, truncating to `max_len` bytes (RFC 1035 §4.2.1). If the full
@@ -1385,11 +1894,11 @@ impl DnsMessage {
         truncated.truncation = true;
         truncated.answers.clear();
         truncated.authorities.clear();
-        // Keep only the OPT record — the DNS message size limit itself is
-        // signalled via EDNS, so it must survive truncation.
-        truncated
-            .additionals
-            .retain(|rr| rr.rdata.rtype == OPT_RECORD_TYPE);
+        // `truncated.edns` is carried over untouched: the DNS message size
+        // limit is itself signalled via EDNS, so the OPT record must survive
+        // truncation. It used to be a `retain` over the additional section that
+        // had to remember to spare it.
+        truncated.additionals.clear();
 
         // The floor is the classic 512: a header, a question and an OPT record
         // fit there, and a caller that asked for less than a minimal response
@@ -1405,7 +1914,7 @@ impl DnsMessage {
 #[derive(Default)]
 pub struct DnsMessageBuilder {
     id: u16,
-    queries: Vec<(String, u16)>,
+    queries: Vec<(String, Rtype)>,
 }
 
 impl DnsMessageBuilder {
@@ -1448,13 +1957,14 @@ impl DnsMessageBuilder {
                 .iter()
                 .map(|(url, qt)| QuerySection {
                     qname: url.to_owned(),
-                    qtype: *qt,
+                    qtype: Qtype::of(*qt),
                     qclass: QueryClass::IN,
                 })
                 .collect(),
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         }
     }
 }
@@ -1462,6 +1972,7 @@ impl DnsMessageBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::record_types as rt;
 
     /// A record may not declare more RDATA than the message actually carries.
     ///
@@ -1539,7 +2050,7 @@ mod tests {
 
         let query = &msg.queries[0];
         assert_eq!(query.qname, "www.google.fi.");
-        assert_eq!(query.qtype, 1);
+        assert_eq!(query.qtype, Qtype::of(rt::A));
         assert_eq!(query.qclass, QueryClass::IN);
     }
 
@@ -1589,12 +2100,13 @@ mod tests {
                 rcode: ResponseCode::Ok,
                 queries: vec![QuerySection {
                     qname: "example.com.".to_string(),
-                    qtype: 6,
+                    qtype: Qtype::of(rt::SOA),
                     qclass: QueryClass::IN,
                 }],
                 answers: Vec::new(),
                 authorities: Vec::new(),
                 additionals: Vec::new(),
+                edns: None,
             };
             let mut buf = vec![0u8; 512];
             let n = msg.to_bytes(&mut buf).expect("serialize");
@@ -1606,6 +2118,50 @@ mod tests {
             // And the flags either side of it are unharmed.
             assert!(parsed.authoritive, "AA survived alongside {opcode:?}");
             assert!(!parsed.response);
+        }
+    }
+
+    /// The *other* direction, and a different bug from the one above.
+    ///
+    /// `test_every_opcode_survives_the_wire` is the regression test for the
+    /// decoder masking the opcode in place instead of shifting it, and it can
+    /// only cover opcodes this enum has names for — which is exactly why it did
+    /// not catch this. An opcode with no name arrived as an `Unknown = 15`
+    /// sentinel that could not carry the value it stood for, so **eleven of the
+    /// sixteen** went back onto the wire as 15: 3 and 7-15 are Unassigned, and
+    /// **6 is DSO (RFC 8490)**, which is assigned and which this library already
+    /// knows exists — it carries `ResponseCode::DsoTypeNotImplemented` for
+    /// RFC 8490's rcode 11.
+    ///
+    /// It reaches a client. `rdnsd` answers an opcode it does not implement with
+    /// NOTIMP and echoes `msg.opcode` into the reply, and RFC 1035 §4.1.1 says
+    /// that field "is set by the originator of a query and copied into the
+    /// response" — so a DSO client got a NOTIMP whose OPCODE said 15, which is
+    /// not the question it asked. Same shape as `QueryClass::None` and
+    /// `ResponseCode::Unknown` before it (`CLAUDE.md` §2, §17): a sentinel that
+    /// cannot hold what it replaces.
+    ///
+    /// Written from raw bytes rather than from the enum on purpose. A test that
+    /// starts by naming a variant can only reach the values that have names,
+    /// which is the whole of how this survived (`CLAUDE.md` §1).
+    #[test]
+    fn an_opcode_this_library_has_no_name_for_is_echoed_unchanged() {
+        for raw in 0u8..16 {
+            let mut query = vec![0u8; 12];
+            query[0] = 0x12;
+            query[1] = 0x34;
+            query[2] = (raw & 0x0f) << 3;
+
+            let parsed = DnsMessage::try_from_bytes(&query).expect("a bare header parses");
+            let mut buf = vec![0u8; 512];
+            parsed.to_bytes(&mut buf).expect("serialize");
+            let echoed = (buf[2] >> 3) & 0x0f;
+
+            assert_eq!(
+                echoed, raw,
+                "opcode {raw} came back as {echoed} (parsed as {:?})",
+                parsed.opcode
+            );
         }
     }
 
@@ -1670,7 +2226,7 @@ mod tests {
     #[test]
     fn test_txt_with_a_length_past_the_end_is_an_error() {
         let unpacker = crate::dname::DNameUnpacker::new(&[]);
-        let err = RecordData::from_wire(16, b"\x09short", &unpacker).unwrap_err();
+        let err = RecordData::from_wire(rt::TXT, b"\x09short", &unpacker).unwrap_err();
         assert!(err.to_string().contains("character-string"), "got: {err}");
     }
 
@@ -1680,8 +2236,8 @@ mod tests {
 
         let answer = ResourceRecord {
             name: "www.example.com.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         };
         let msg = DnsMessage {
@@ -1697,12 +2253,13 @@ mod tests {
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
                 qname: "www.example.com.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             }],
             answers: vec![answer],
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         };
 
         let mut buf = [0u8; 512];
@@ -1716,9 +2273,9 @@ mod tests {
         );
         let a = &parsed.answers[0];
         assert_eq!(a.name, "www.example.com.");
-        assert_eq!(a.class, 1);
-        assert_eq!(a.ttl, 3600);
-        assert_eq!(a.rdata.rtype, 1);
+        assert_eq!(a.class, Class::new(1));
+        assert_eq!(a.ttl, Ttl::from_secs(3600));
+        assert_eq!(a.rdata.rtype, rt::A);
         assert_eq!(&*a.rdata.rdata, &[192, 0, 2, 1]); // A record: 4 address octets
     }
 
@@ -1731,8 +2288,8 @@ mod tests {
         let answers: Vec<ResourceRecord> = (1..=10)
             .map(|i| ResourceRecord {
                 name: "www.example.com.".to_string(),
-                class: 1,
-                ttl: 3600,
+                class: Class::new(1),
+                ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, i)))
                     .unwrap(),
             })
@@ -1766,15 +2323,15 @@ mod tests {
     fn test_output_compresses_names_inside_rdata() {
         let ns = ResourceRecord {
             name: "example.com.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NS("ns1.example.com.".to_string()))
                 .unwrap(),
         };
         let mx = ResourceRecord {
             name: "example.com.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::MX {
                 preference: 10,
                 exchange: "mail.example.com.".to_string(),
@@ -1783,8 +2340,8 @@ mod tests {
         };
         let cname = ResourceRecord {
             name: "alias.example.com.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::CNAME("www.example.com.".to_string()))
                 .unwrap(),
         };
@@ -1825,10 +2382,10 @@ mod tests {
         srv_rdata.extend_from_slice(&dname_to_bytes("www.example.com.").unwrap());
         let srv = ResourceRecord {
             name: "_sip._tcp.example.com.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData {
-                rtype: 33,
+                rtype: Rtype::new(33),
                 rdata: srv_rdata.clone().into_boxed_slice(),
             },
         };
@@ -1905,12 +2462,13 @@ mod tests {
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
                 qname: "example.com.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             }],
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         }
     }
 
@@ -1965,8 +2523,7 @@ mod tests {
             let mut msg = query_msg(1);
             msg.response = true;
             msg.rcode = ResponseCode::from_u16(value);
-            msg.set_edns(Edns::with_payload_size(4096))
-                .expect("set_edns");
+            msg.set_edns(Edns::with_payload_size(4096));
 
             let bytes = msg.to_bytes_within(512).expect("serialize");
             let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
@@ -2003,10 +2560,132 @@ mod tests {
         assert_eq!(ResponseCode::BadCookie.to_u16(), 23);
     }
 
+    /// An OPT record whose option list is whatever bytes the test wants,
+    /// including bytes that are not a valid list.
+    ///
+    /// `Edns::rdata` is private on purpose — the public constructors encode a
+    /// well-formed list — so this is how a test reaches the malformed case. It
+    /// can, because `mod tests` is a child of the module `Edns` is declared in.
+    fn edns_with_rdata(rdata: &[u8]) -> Edns {
+        Edns {
+            udp_payload_size: 1232,
+            version: EDNS_VERSION,
+            do_bit: false,
+            rdata: rdata.to_vec().into_boxed_slice(),
+        }
+    }
+
+    /// RFC 6891 §6.1.1: "If a query message with more than one OPT RR is
+    /// received, a FORMERR (RCODE=1) MUST be returned."
+    ///
+    /// **Nothing checked this before OPT became a field.** The first OPT was
+    /// read and every one of them was written back out, so a message with two
+    /// went through as if it had one and came back malformed. `Option<Edns>`
+    /// makes the state unrepresentable in the struct; this is the other half —
+    /// refusing it at the door, since the wire can still carry it.
+    #[test]
+    fn more_than_one_opt_record_is_formerr() {
+        // A bare header claiming two additionals, then two OPT records:
+        // root NAME, TYPE 41, CLASS 1232, TTL 0, RDLENGTH 0.
+        let opt = [
+            0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut two = vec![0x12, 0x34, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x00, 0x02];
+        two.extend_from_slice(&opt);
+        two.extend_from_slice(&opt);
+        let err = DnsMessage::try_from_bytes(&two).expect_err("two OPT records are FORMERR");
+        assert!(
+            matches!(
+                err,
+                WireError::Malformed {
+                    what: "the additional section",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+
+        // And exactly one is still fine, so the check is not simply refusing
+        // every OPT record it sees.
+        let mut one = vec![0x12, 0x34, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x00, 0x01];
+        one.extend_from_slice(&opt);
+        let msg = DnsMessage::try_from_bytes(&one).expect("one OPT record parses");
+        assert!(msg.edns().is_some());
+        assert!(
+            msg.additionals.is_empty(),
+            "and it is not left in the section"
+        );
+    }
+
+    /// ARCOUNT counts the OPT record even though it is no longer in
+    /// `additionals` — the arithmetic most likely to break when OPT moved out.
+    #[test]
+    fn arcount_counts_the_opt_record_that_is_not_in_the_section() {
+        let mut msg = query_msg(7);
+        msg.additionals.push(ResourceRecord {
+            name: "ns1.example.com.".to_string(),
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1)))
+                .expect("encode"),
+        });
+        msg.set_edns(Edns::with_payload_size(1232));
+
+        let bytes = msg.to_bytes_within(512).expect("serialize");
+        assert_eq!(
+            u16::from_be_bytes([bytes[10], bytes[11]]),
+            2,
+            "one real additional plus the OPT record"
+        );
+
+        let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
+        assert_eq!(parsed.additionals.len(), 1, "the A record, and only it");
+        assert!(parsed.edns().is_some(), "the OPT record, in its own field");
+    }
+
+    /// RFC 2181 §8, at the boundary that now owns it: "implementations should
+    /// treat TTL values received with the most significant bit set as if the
+    /// entire value received was zero".
+    ///
+    /// Driven from the wire rather than from `Ttl::from_wire`, because the
+    /// claim being tested is that *parsing a record* applies the rule — that is
+    /// what lets fourteen call sites stop applying it themselves.
+    #[test]
+    fn a_ttl_with_the_high_bit_set_parses_as_zero() {
+        for raw in [-1i32, i32::MIN, -3600] {
+            let mut wire = vec![0x12, 0x34, 0x00, 0x00, 0, 0, 0x00, 0x01, 0, 0, 0, 0];
+            wire.push(0x00); // root owner name
+            wire.extend_from_slice(&utils::record_types::A.to_u16().to_be_bytes());
+            wire.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+            wire.extend_from_slice(&raw.to_be_bytes());
+            wire.extend_from_slice(&4u16.to_be_bytes());
+            wire.extend_from_slice(&[192, 0, 2, 1]);
+
+            let msg = DnsMessage::try_from_bytes(&wire).expect("parses");
+            assert_eq!(
+                msg.answers[0].ttl,
+                Ttl::ZERO,
+                "a wire TTL of {raw} is zero seconds, not {} or a huge unsigned value",
+                raw
+            );
+        }
+
+        // And a TTL without the high bit is untouched.
+        let mut wire = vec![0x12, 0x34, 0x00, 0x00, 0, 0, 0x00, 0x01, 0, 0, 0, 0];
+        wire.push(0x00);
+        wire.extend_from_slice(&utils::record_types::A.to_u16().to_be_bytes());
+        wire.extend_from_slice(&1u16.to_be_bytes());
+        wire.extend_from_slice(&3600i32.to_be_bytes());
+        wire.extend_from_slice(&4u16.to_be_bytes());
+        wire.extend_from_slice(&[192, 0, 2, 1]);
+        let msg = DnsMessage::try_from_bytes(&wire).expect("parses");
+        assert_eq!(msg.answers[0].ttl, Ttl::from_secs(3600));
+    }
+
     #[test]
     fn test_edns_absent_defaults_to_512() {
         let msg = query_msg(1);
-        assert!(msg.edns().expect("no OPT to misparse").is_none());
+        assert!(msg.edns().is_none());
         assert!(!msg.has_edns());
         assert_eq!(msg.udp_payload_size(), 512);
     }
@@ -2016,24 +2695,24 @@ mod tests {
         let mut msg = query_msg(1);
         let mut edns = Edns::with_payload_size(4096);
         edns.do_bit = true;
-        msg.set_edns(edns).expect("set_edns");
+        msg.set_edns(edns);
 
-        let got = msg.edns().unwrap().expect("edns present");
+        let got = msg.edns().expect("edns present");
         assert_eq!(got.udp_payload_size, 4096);
         assert!(got.do_bit);
         assert_eq!(got.version, 0);
         assert_eq!(msg.udp_payload_size(), 4096);
 
-        // set_edns replaces rather than accumulates.
-        msg.set_edns(Edns::with_payload_size(1232))
-            .expect("set_edns");
-        assert_eq!(
-            msg.additionals
-                .iter()
-                .filter(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
-                .count(),
-            1
-        );
+        // `set_edns` replaces rather than accumulates. This used to be checked
+        // by counting the OPT records in the additional section and asserting
+        // there was exactly one — a real hazard when `set_edns` pushed onto a
+        // `Vec` and had to `retain` the old one away first. With OPT as an
+        // `Option` field there is no count to get wrong: a second OPT record in
+        // one message is unspellable, which is also what RFC 6891 §6.1.1 says
+        // about receiving one (`TODO.md` #13d).
+        msg.set_edns(Edns::with_payload_size(1232));
+        assert!(msg.additionals.is_empty(), "OPT is not a resource record");
+        assert_eq!(msg.edns().expect("still present").udp_payload_size, 1232);
         assert_eq!(msg.udp_payload_size(), 1232);
     }
 
@@ -2042,22 +2721,21 @@ mod tests {
         let mut msg = query_msg(0xABCD);
         let mut edns = Edns::with_payload_size(4096);
         edns.do_bit = true;
-        msg.set_edns(edns.clone()).expect("set_edns");
+        msg.set_edns(edns.clone());
 
         let mut buf = [0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("to_bytes");
         let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
 
-        let got = parsed.edns().unwrap().expect("edns survives round-trip");
-        assert_eq!(got, edns);
+        let got = parsed.edns().expect("edns survives round-trip");
+        assert_eq!(*got, edns);
     }
 
     #[test]
     fn test_edns_payload_size_floored_at_512() {
         // RFC 6891 §6.2.3: values below 512 are treated as 512.
         let mut msg = query_msg(1);
-        msg.set_edns(Edns::with_payload_size(300))
-            .expect("set_edns");
+        msg.set_edns(Edns::with_payload_size(300));
         assert_eq!(msg.udp_payload_size(), 512);
     }
 
@@ -2079,7 +2757,7 @@ mod tests {
         rdata.extend_from_slice(&dname_to_bytes("example.com.").unwrap());
         rdata.extend_from_slice(&[0xAB; 64]); // signature
 
-        let record = RecordData::from_wire(46, &rdata, &DNameUnpacker::new(&rdata))
+        let record = RecordData::from_wire(rt::RRSIG, &rdata, &DNameUnpacker::new(&rdata))
             .expect("RRSIG should decode");
         let ParsedRecord::RRSIG {
             expiration,
@@ -2106,56 +2784,63 @@ mod tests {
     #[test]
     fn test_edns_options_survive_wire_roundtrip() {
         let mut msg = query_msg(0x0F0F);
-        let mut edns = Edns::with_payload_size(1232);
-        edns.options = vec![
-            EdnsOption {
-                code: EDNS_OPTION_COOKIE,
-                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            },
-            // A zero-length option is legal and must not be dropped.
-            EdnsOption {
-                code: EDNS_OPTION_NSID,
-                data: Vec::new(),
-            },
-        ];
-        msg.set_edns(edns.clone()).expect("set_edns");
+        let edns = Edns::with_options(
+            1232,
+            EDNS_VERSION,
+            false,
+            &[
+                EdnsOption {
+                    code: EDNS_OPTION_COOKIE,
+                    data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                },
+                // A zero-length option is legal and must not be dropped.
+                EdnsOption {
+                    code: EDNS_OPTION_NSID,
+                    data: Vec::new(),
+                },
+            ],
+        )
+        .expect("encode the options");
+        msg.set_edns(edns.clone());
 
         // 2 (code) + 2 (len) + 8 (data), then 2 + 2 + 0.
-        let opt = msg
-            .additionals
-            .iter()
-            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
-            .expect("OPT present");
-        assert_eq!(opt.rdata.rdata.len(), 16);
+        assert_eq!(msg.edns().expect("OPT present").rdata().len(), 16);
 
         let mut buf = [0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("to_bytes");
         let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
 
-        let got = parsed.edns().unwrap().expect("edns present");
-        assert_eq!(got, edns);
+        let got = parsed.edns().expect("edns present");
+        assert_eq!(*got, edns);
         assert_eq!(
-            got.option(EDNS_OPTION_COOKIE),
-            Some(&[1u8, 2, 3, 4, 5, 6, 7, 8][..])
+            got.option(EDNS_OPTION_COOKIE).unwrap(),
+            Some(vec![1u8, 2, 3, 4, 5, 6, 7, 8])
         );
-        assert_eq!(got.option(EDNS_OPTION_NSID), Some(&[][..]));
-        assert_eq!(got.option(EDNS_OPTION_PADDING), None);
+        assert_eq!(got.option(EDNS_OPTION_NSID).unwrap(), Some(Vec::new()));
+        assert_eq!(got.option(EDNS_OPTION_PADDING).unwrap(), None);
     }
 
+    /// A malformed option list is an error — but **not** an error that reaching
+    /// the OPT record produces.
+    ///
+    /// This test used to call `msg.edns()` and expect `Err`. Once OPT became a
+    /// field carrying its RDATA unparsed (`TODO.md` #13d), "does this message
+    /// have EDNS" is infallible and "is its option list well formed" is the
+    /// separate, fallible question. The split is deliberate and is what keeps a
+    /// bad list answerable: if reading it were part of parsing the message,
+    /// `try_from_bytes` would fail, `rdnsd` would return no bytes at all
+    /// (`main.rs:1465`), and the FORMERR this deserves could not be built.
     #[test]
     fn test_malformed_edns_options_surface_error() {
         let mut msg = query_msg(1);
-        msg.set_edns(Edns::with_payload_size(1232))
-            .expect("set_edns");
         // Option claims 8 bytes of data but supplies 2.
-        let opt = msg
-            .additionals
-            .iter_mut()
-            .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
-            .unwrap();
-        opt.rdata.rdata = Box::new([0x00, 0x0a, 0x00, 0x08, 0xde, 0xad]);
+        msg.set_edns(edns_with_rdata(&[0x00, 0x0a, 0x00, 0x08, 0xde, 0xad]));
 
-        let err = msg.edns().expect_err("truncated option must be rejected");
+        let err = msg
+            .edns()
+            .expect("the OPT record itself is readable")
+            .check_options()
+            .expect_err("truncated option must be rejected");
         assert_eq!(
             err,
             WireError::Truncated {
@@ -2200,20 +2885,16 @@ mod tests {
             (512, 1, true, vec![]),
         ] {
             let mut msg = query_msg(1);
-            msg.set_edns(Edns {
-                udp_payload_size: payload,
-                version,
-                do_bit,
-                options,
-            })
-            .expect("set_edns");
+            msg.set_edns(
+                Edns::with_options(payload, version, do_bit, &options).expect("encode the options"),
+            );
             // Through the wire, because that is where a request comes from and
             // the version lives in a field `set_edns` writes and the parser
             // re-reads.
             let bytes = msg.to_bytes_within(512).expect("serialize");
             let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
 
-            let full = parsed.edns().unwrap().expect("OPT present");
+            let full = parsed.edns().expect("OPT present");
             let header = parsed.edns_header().unwrap().expect("OPT present");
             assert_eq!(header, full.header(), "payload {payload} version {version}");
             assert_eq!(header.do_bit, do_bit);
@@ -2234,18 +2915,11 @@ mod tests {
             vec![0x00, 0x0a, 0x00, 0x01, 0xff, 0x00, 0x03, 0x00, 0x04],
         ] {
             let mut msg = query_msg(1);
-            msg.set_edns(Edns::with_payload_size(1232))
-                .expect("set_edns");
-            let opt = msg
-                .additionals
-                .iter_mut()
-                .find(|rr| rr.rdata.rtype == OPT_RECORD_TYPE)
-                .unwrap();
-            opt.rdata.rdata = rdata.clone().into_boxed_slice();
+            msg.set_edns(edns_with_rdata(&rdata));
 
             assert_eq!(
                 msg.edns_header().unwrap_err(),
-                msg.edns().unwrap_err(),
+                msg.edns().expect("OPT present").options().unwrap_err(),
                 "{rdata:02x?}: the same walk, so the same error"
             );
         }
@@ -2257,8 +2931,7 @@ mod tests {
         let mut msg = query_msg(0x2222);
         msg.response = true;
         msg.rcode = ResponseCode::BadOptVersion;
-        msg.set_edns(Edns::with_payload_size(1232))
-            .expect("set_edns");
+        msg.set_edns(Edns::with_payload_size(1232));
 
         let mut buf = [0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("to_bytes");
@@ -2287,8 +2960,7 @@ mod tests {
         let mut msg = query_msg(1);
         msg.response = true;
         msg.rcode = ResponseCode::NoSuchDomain;
-        msg.set_edns(Edns::with_payload_size(4096))
-            .expect("set_edns");
+        msg.set_edns(Edns::with_payload_size(4096));
 
         let mut buf = [0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("to_bytes");
@@ -2306,14 +2978,13 @@ mod tests {
         for i in 0..60u8 {
             msg.answers.push(ResourceRecord {
                 name: format!("host{i}.example.com."),
-                class: 1,
-                ttl: 3600,
+                class: Class::new(1),
+                ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(10, 0, 0, i)))
                     .unwrap(),
             });
         }
-        msg.set_edns(Edns::with_payload_size(4096))
-            .expect("set_edns");
+        msg.set_edns(Edns::with_payload_size(4096));
 
         let bytes = msg.to_bytes_within(512).expect("to_bytes_within");
         assert!(
@@ -2343,8 +3014,8 @@ mod tests {
         msg.response = true;
         msg.answers.push(ResourceRecord {
             name: "example.com.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
         });
 
@@ -2369,8 +3040,8 @@ mod tests {
         msg.response = true;
         msg.answers.push(ResourceRecord {
             name: "example.com.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
         });
 
@@ -2399,8 +3070,8 @@ mod tests {
         msg.response = true;
         msg.answers.push(ResourceRecord {
             name: "example.com.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
         });
         let exact = msg.to_bytes_within(4096).expect("measure").len();
@@ -2425,8 +3096,8 @@ mod tests {
         msg.response = true;
         msg.answers.push(ResourceRecord {
             name: "example.com.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
         });
 
@@ -2484,6 +3155,7 @@ mod tests {
             answers: vec![],
             authorities: vec![],
             additionals: vec![],
+            edns: None,
         };
 
         let mut buf = [0u8; 512];
@@ -2511,6 +3183,7 @@ mod tests {
             answers: vec![],
             authorities: vec![],
             additionals: vec![],
+            edns: None,
         };
 
         let mut buf = [0u8; 512];
@@ -2538,6 +3211,7 @@ mod tests {
             answers: vec![],
             authorities: vec![],
             additionals: vec![],
+            edns: None,
         };
 
         let mut buf = [0u8; 512];
@@ -2566,6 +3240,7 @@ mod tests {
             answers: vec![],
             authorities: vec![],
             additionals: vec![],
+            edns: None,
         };
 
         let mut buf = [0u8; 512];
@@ -2593,6 +3268,7 @@ mod tests {
             answers: vec![],
             authorities: vec![],
             additionals: vec![],
+            edns: None,
         };
 
         let mut buf = [0u8; 512];
@@ -2620,6 +3296,7 @@ mod tests {
             answers: vec![],
             authorities: vec![],
             additionals: vec![],
+            edns: None,
         };
 
         let mut buf = [0u8; 512];

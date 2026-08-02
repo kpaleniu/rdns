@@ -169,7 +169,9 @@ impl DnssecValidator {
 mod tests {
     use super::*;
     use crate::zone::ZoneRecord;
+    use crate::Class;
     use crate::ParsedRecord;
+    use crate::Ttl;
     use std::net::Ipv4Addr;
 
     #[test]
@@ -210,8 +212,8 @@ mod tests {
         let mut zone = Zone::new("example.com.".to_string());
         zone.add_record(ZoneRecord {
             name: "example.com.".to_string(),
-            ttl: 3600,
-            class: 1,
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         });
 
@@ -223,8 +225,8 @@ mod tests {
         let mut zone = Zone::new("example.com.".to_string());
         zone.add_record(ZoneRecord {
             name: "example.com.".to_string(),
-            ttl: 3600,
-            class: 1,
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::DNSKEY {
                 flags: 256,
                 protocol: 3,

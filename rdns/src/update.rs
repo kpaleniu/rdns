@@ -28,6 +28,9 @@
 
 use crate::utils::{is_at_or_under, record_types as rt};
 use crate::zone::Zone;
+use crate::Qtype;
+use crate::Rtype;
+use crate::Ttl;
 use crate::{DnsMessage, OpCode, QueryClass, RecordData, ResourceRecord, ResponseCode};
 
 /// Why an UPDATE was refused, and the RCODE that says so on the wire.
@@ -67,7 +70,7 @@ impl Rejected {
 pub enum Prerequisite {
     /// §2.4.1 — some RRset of this type exists at this name, whatever it holds.
     /// CLASS=ANY, RDLENGTH=0.
-    RrsetExists { name: String, rtype: u16 },
+    RrsetExists { name: String, rtype: Rtype },
     /// §2.4.2 — an RRset of this type exists at this name *and* holds exactly
     /// these records. CLASS is the zone's, and there is RDATA.
     ///
@@ -75,11 +78,11 @@ pub enum Prerequisite {
     /// equality as a set, so a prerequisite naming two of three records fails.
     RrsetExistsWithValue {
         name: String,
-        rtype: u16,
+        rtype: Rtype,
         rdatas: Vec<RecordData>,
     },
     /// §2.4.3 — no RRset of this type exists at this name. CLASS=NONE.
-    RrsetDoesNotExist { name: String, rtype: u16 },
+    RrsetDoesNotExist { name: String, rtype: Rtype },
     /// §2.4.4 — at least one RR exists at this name. CLASS=ANY, TYPE=ANY.
     NameInUse { name: String },
     /// §2.4.5 — no RR exists at this name. CLASS=NONE, TYPE=ANY.
@@ -94,7 +97,7 @@ pub enum Change {
     /// zone's. The only form that carries a TTL that matters.
     Add(ResourceRecord),
     /// §2.5.2 — delete every record of this type at this name. CLASS=ANY.
-    DeleteRrset { name: String, rtype: u16 },
+    DeleteRrset { name: String, rtype: Rtype },
     /// §2.5.3 — delete every RRset at this name. CLASS=ANY, TYPE=ANY.
     DeleteName { name: String },
     /// §2.5.4 — delete the one record that matches this name, type and RDATA.
@@ -102,7 +105,7 @@ pub enum Change {
     /// this carries rdata rather than a whole record.
     DeleteRecord {
         name: String,
-        rtype: u16,
+        rtype: Rtype,
         rdata: RecordData,
     },
 }
@@ -144,7 +147,7 @@ pub fn parse(msg: &DnsMessage) -> Result<UpdateRequest, Rejected> {
             ),
         ));
     };
-    if zone_section.qtype != rt::SOA {
+    if !zone_section.qtype.is(rt::SOA) {
         return Err(Rejected::new(
             ResponseCode::FormatError,
             format!(
@@ -184,7 +187,7 @@ fn read_prerequisite(
     // zero", and §2.4 gives TTL=0 for every form including the value-dependent
     // one. A non-zero TTL is FORMERR rather than something to round off: it
     // means the sender built the section from a template it did not read.
-    if rr.ttl != 0 {
+    if rr.ttl != Ttl::ZERO {
         return Err(Rejected::new(
             ResponseCode::FormatError,
             format!(
@@ -197,7 +200,7 @@ fn read_prerequisite(
 
     let rtype = rr.rdata.rtype;
     let empty = rr.rdata.rdata.is_empty();
-    match QueryClass::from_u16(rr.class) {
+    match QueryClass::from(rr.class) {
         // §2.4.4 / §2.4.1 — ANY: "is anything there?", either at the name or
         // for one type at it.
         QueryClass::Any if rtype == rt::ANY && empty => Ok(Prerequisite::NameInUse {
@@ -252,7 +255,7 @@ fn read_change(
     // §3.4.1 again: a meta-type may never be added, and only ANY may be
     // deleted. "ANY" as something to *add* is not data, it is a question.
     let deleting = matches!(
-        QueryClass::from_u16(rr.class),
+        QueryClass::from(rr.class),
         QueryClass::Any | QueryClass::None
     );
     if !deleting && (rtype == rt::ANY || rtype == rt::AXFR || rtype == rt::IXFR) {
@@ -266,20 +269,22 @@ fn read_change(
         ));
     }
 
-    match QueryClass::from_u16(rr.class) {
+    match QueryClass::from(rr.class) {
         // §2.5.3 / §2.5.2 — ANY: delete everything at the name, or one RRset.
         // Both require an empty RDATA and a zero TTL.
-        QueryClass::Any if rtype == rt::ANY && empty && rr.ttl == 0 => Ok(Change::DeleteName {
-            name: rr.name.clone(),
-        }),
-        QueryClass::Any if empty && rr.ttl == 0 => Ok(Change::DeleteRrset {
+        QueryClass::Any if rtype == rt::ANY && empty && rr.ttl == Ttl::ZERO => {
+            Ok(Change::DeleteName {
+                name: rr.name.clone(),
+            })
+        }
+        QueryClass::Any if empty && rr.ttl == Ttl::ZERO => Ok(Change::DeleteRrset {
             name: rr.name.clone(),
             rtype,
         }),
         // §2.5.4 — NONE with RDATA: delete exactly this record. The TTL is
         // "ignored" by the RFC, which means it must be zero on the wire and is
         // not part of the comparison.
-        QueryClass::None if !empty && rr.ttl == 0 => Ok(Change::DeleteRecord {
+        QueryClass::None if !empty && rr.ttl == Ttl::ZERO => Ok(Change::DeleteRecord {
             name: rr.name.clone(),
             rtype,
             rdata: rr.rdata.clone(),
@@ -329,12 +334,12 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
     // records with the same name and type are one prerequisite naming a whole
     // RRset. Gathering them first is what makes the "exactly this set"
     // comparison below possible at all.
-    let mut value_sets: Vec<(String, u16, Vec<RecordData>)> = Vec::new();
+    let mut value_sets: Vec<(String, Rtype, Vec<RecordData>)> = Vec::new();
 
     for prerequisite in prerequisites {
         match prerequisite {
             Prerequisite::RrsetExists { name, rtype } => {
-                if zone.query(name, *rtype).is_empty() {
+                if zone.query(name, Qtype::of(*rtype)).is_empty() {
                     return Err(Rejected::new(
                         ResponseCode::NoSuchResourceRecordSet,
                         format!("{name} has no {rtype} RRset"),
@@ -342,7 +347,7 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
                 }
             }
             Prerequisite::RrsetDoesNotExist { name, rtype } => {
-                if !zone.query(name, *rtype).is_empty() {
+                if !zone.query(name, Qtype::of(*rtype)).is_empty() {
                     return Err(Rejected::new(
                         ResponseCode::ResourceRecordSetExistsForSomeReason,
                         format!("{name} already has a {rtype} RRset"),
@@ -389,7 +394,7 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
 
     for (name, rtype, wanted) in value_sets {
         let held: Vec<RecordData> = zone
-            .query(&name, rtype)
+            .query(&name, Qtype::of(rtype))
             .into_iter()
             .map(|r| r.rdata.clone())
             .collect();
@@ -432,6 +437,7 @@ fn same_set(held: &[RecordData], wanted: &[RecordData]) -> bool {
 mod tests {
     use super::*;
     use crate::zone::parse_zone_file;
+    use crate::Class;
     use crate::{ParsedRecord, QuerySection};
     use std::net::Ipv4Addr;
 
@@ -470,16 +476,17 @@ mail IN MX  10 mx.example.com.
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
                 qname: "example.com.".to_string(),
-                qtype: rt::SOA,
+                qtype: Qtype::of(rt::SOA),
                 qclass: QueryClass::IN,
             }],
             answers: prerequisites,
             authorities: changes,
             additionals: Vec::new(),
+            edns: None,
         }
     }
 
-    fn rr(name: &str, class: u16, ttl: i32, rdata: RecordData) -> ResourceRecord {
+    fn rr(name: &str, class: Class, ttl: Ttl, rdata: RecordData) -> ResourceRecord {
         ResourceRecord {
             name: name.to_string(),
             class,
@@ -490,7 +497,7 @@ mail IN MX  10 mx.example.com.
 
     /// An empty RDATA of a given type: how §2.4 and §2.5 spell "this type, no
     /// value".
-    fn bare(rtype: u16) -> RecordData {
+    fn bare(rtype: Rtype) -> RecordData {
         RecordData {
             rtype,
             rdata: Vec::new().into_boxed_slice(),
@@ -507,7 +514,12 @@ mail IN MX  10 mx.example.com.
     fn the_five_prerequisite_forms_are_read_as_rfc_2136_defines_them() {
         let cases = vec![
             (
-                rr("www.example.com.", 255, 0, bare(rt::A)),
+                rr(
+                    "www.example.com.",
+                    Class::new(255),
+                    Ttl::from_secs(0),
+                    bare(rt::A),
+                ),
                 Prerequisite::RrsetExists {
                     name: "www.example.com.".to_string(),
                     rtype: rt::A,
@@ -515,7 +527,12 @@ mail IN MX  10 mx.example.com.
                 "§2.4.1 CLASS=ANY, an RRset of this type exists",
             ),
             (
-                rr("www.example.com.", 1, 0, a("192.0.2.10")),
+                rr(
+                    "www.example.com.",
+                    Class::new(1),
+                    Ttl::from_secs(0),
+                    a("192.0.2.10"),
+                ),
                 Prerequisite::RrsetExistsWithValue {
                     name: "www.example.com.".to_string(),
                     rtype: rt::A,
@@ -524,7 +541,12 @@ mail IN MX  10 mx.example.com.
                 "§2.4.2 CLASS=zone, and it holds exactly this",
             ),
             (
-                rr("nope.example.com.", 254, 0, bare(rt::A)),
+                rr(
+                    "nope.example.com.",
+                    Class::new(254),
+                    Ttl::from_secs(0),
+                    bare(rt::A),
+                ),
                 Prerequisite::RrsetDoesNotExist {
                     name: "nope.example.com.".to_string(),
                     rtype: rt::A,
@@ -532,14 +554,24 @@ mail IN MX  10 mx.example.com.
                 "§2.4.3 CLASS=NONE, no such RRset",
             ),
             (
-                rr("www.example.com.", 255, 0, bare(rt::ANY)),
+                rr(
+                    "www.example.com.",
+                    Class::new(255),
+                    Ttl::from_secs(0),
+                    bare(rt::ANY),
+                ),
                 Prerequisite::NameInUse {
                     name: "www.example.com.".to_string(),
                 },
                 "§2.4.4 CLASS=ANY TYPE=ANY, the name is in use",
             ),
             (
-                rr("nope.example.com.", 254, 0, bare(rt::ANY)),
+                rr(
+                    "nope.example.com.",
+                    Class::new(254),
+                    Ttl::from_secs(0),
+                    bare(rt::ANY),
+                ),
                 Prerequisite::NameNotInUse {
                     name: "nope.example.com.".to_string(),
                 },
@@ -560,12 +592,27 @@ mail IN MX  10 mx.example.com.
     fn the_four_update_forms_are_read_as_rfc_2136_defines_them() {
         let cases = vec![
             (
-                rr("new.example.com.", 1, 3600, a("192.0.2.50")),
-                Change::Add(rr("new.example.com.", 1, 3600, a("192.0.2.50"))),
+                rr(
+                    "new.example.com.",
+                    Class::new(1),
+                    Ttl::from_secs(3600),
+                    a("192.0.2.50"),
+                ),
+                Change::Add(rr(
+                    "new.example.com.",
+                    Class::new(1),
+                    Ttl::from_secs(3600),
+                    a("192.0.2.50"),
+                )),
                 "§2.5.1 CLASS=zone, add it",
             ),
             (
-                rr("www.example.com.", 255, 0, bare(rt::A)),
+                rr(
+                    "www.example.com.",
+                    Class::new(255),
+                    Ttl::from_secs(0),
+                    bare(rt::A),
+                ),
                 Change::DeleteRrset {
                     name: "www.example.com.".to_string(),
                     rtype: rt::A,
@@ -573,14 +620,24 @@ mail IN MX  10 mx.example.com.
                 "§2.5.2 CLASS=ANY, delete the RRset",
             ),
             (
-                rr("www.example.com.", 255, 0, bare(rt::ANY)),
+                rr(
+                    "www.example.com.",
+                    Class::new(255),
+                    Ttl::from_secs(0),
+                    bare(rt::ANY),
+                ),
                 Change::DeleteName {
                     name: "www.example.com.".to_string(),
                 },
                 "§2.5.3 CLASS=ANY TYPE=ANY, delete every RRset at the name",
             ),
             (
-                rr("www.example.com.", 254, 0, a("192.0.2.11")),
+                rr(
+                    "www.example.com.",
+                    Class::new(254),
+                    Ttl::from_secs(0),
+                    a("192.0.2.11"),
+                ),
                 Change::DeleteRecord {
                     name: "www.example.com.".to_string(),
                     rtype: rt::A,
@@ -604,7 +661,7 @@ mail IN MX  10 mx.example.com.
         let mut two = update(Vec::new(), Vec::new());
         two.queries.push(QuerySection {
             qname: "other.test.".to_string(),
-            qtype: rt::SOA,
+            qtype: Qtype::of(rt::SOA),
             qclass: QueryClass::IN,
         });
         assert_eq!(
@@ -614,7 +671,7 @@ mail IN MX  10 mx.example.com.
         );
 
         let mut not_soa = update(Vec::new(), Vec::new());
-        not_soa.queries[0].qtype = rt::A;
+        not_soa.queries[0].qtype = Qtype::of(rt::A);
         assert_eq!(
             parse(&not_soa).unwrap_err().rcode,
             ResponseCode::FormatError,
@@ -635,7 +692,12 @@ mail IN MX  10 mx.example.com.
     /// scoped to.
     #[test]
     fn a_record_outside_the_named_zone_is_notzone() {
-        let outside = rr("www.elsewhere.test.", 1, 3600, a("192.0.2.50"));
+        let outside = rr(
+            "www.elsewhere.test.",
+            Class::new(1),
+            Ttl::from_secs(3600),
+            a("192.0.2.50"),
+        );
         assert_eq!(
             parse(&update(Vec::new(), vec![outside.clone()]))
                 .unwrap_err()
@@ -644,7 +706,12 @@ mail IN MX  10 mx.example.com.
             "an update record outside the zone"
         );
 
-        let outside_prereq = rr("www.elsewhere.test.", 255, 0, bare(rt::A));
+        let outside_prereq = rr(
+            "www.elsewhere.test.",
+            Class::new(255),
+            Ttl::from_secs(0),
+            bare(rt::A),
+        );
         assert_eq!(
             parse(&update(vec![outside_prereq], Vec::new()))
                 .unwrap_err()
@@ -656,7 +723,12 @@ mail IN MX  10 mx.example.com.
         // `notexample.com.` ends with the zone's name and is a different zone:
         // the boundary has to land on a label separator (`CLAUDE.md` §7's
         // shared `is_at_or_under`).
-        let lookalike = rr("notexample.com.", 1, 3600, a("192.0.2.50"));
+        let lookalike = rr(
+            "notexample.com.",
+            Class::new(1),
+            Ttl::from_secs(3600),
+            a("192.0.2.50"),
+        );
         assert_eq!(
             parse(&update(Vec::new(), vec![lookalike]))
                 .unwrap_err()
@@ -671,7 +743,12 @@ mail IN MX  10 mx.example.com.
     /// hand-built message gets wrong.
     #[test]
     fn a_meta_type_may_not_be_added_and_a_prerequisite_may_not_carry_a_ttl() {
-        let add_any = rr("www.example.com.", 1, 3600, a("192.0.2.50"));
+        let add_any = rr(
+            "www.example.com.",
+            Class::new(1),
+            Ttl::from_secs(3600),
+            a("192.0.2.50"),
+        );
         let mut add_any = add_any;
         add_any.rdata.rtype = rt::ANY;
         assert_eq!(
@@ -680,7 +757,12 @@ mail IN MX  10 mx.example.com.
             "adding TYPE=ANY"
         );
 
-        let ttl_on_prerequisite = rr("www.example.com.", 255, 3600, bare(rt::A));
+        let ttl_on_prerequisite = rr(
+            "www.example.com.",
+            Class::new(255),
+            Ttl::from_secs(3600),
+            bare(rt::A),
+        );
         assert_eq!(
             parse(&update(vec![ttl_on_prerequisite], Vec::new()))
                 .unwrap_err()
@@ -822,8 +904,18 @@ mail IN MX  10 mx.example.com.
         let zone = zone();
         let message = update(
             vec![
-                rr("www.example.com.", 1, 0, a("192.0.2.10")),
-                rr("www.example.com.", 1, 0, a("192.0.2.11")),
+                rr(
+                    "www.example.com.",
+                    Class::new(1),
+                    Ttl::from_secs(0),
+                    a("192.0.2.10"),
+                ),
+                rr(
+                    "www.example.com.",
+                    Class::new(1),
+                    Ttl::from_secs(0),
+                    a("192.0.2.11"),
+                ),
             ],
             Vec::new(),
         );
@@ -854,7 +946,9 @@ mail IN MX  10 mx.example.com.
         .expect("the wildcard zone parses");
 
         // The wildcard answers for it, but nothing is *at* it.
-        assert!(!zone.query("anything.example.com.", rt::A).is_empty());
+        assert!(!zone
+            .query("anything.example.com.", Qtype::of(rt::A))
+            .is_empty());
         assert_eq!(
             check_prerequisites(
                 &zone,

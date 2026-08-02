@@ -47,7 +47,7 @@ use rdns::validation::RequestValidator;
 use rdns::zone::{parse_zone_file, NameKind, Zone};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
 use rdns::{
-    dnssec_answer, tsig, DnsMessage, Edns, EdnsOption, OpCode, QueryClass, QuerySection,
+    dnssec_answer, tsig, DnsMessage, Edns, EdnsOption, OpCode, Qtype, QueryClass, QuerySection,
     ResourceRecord, ResponseCode,
 };
 
@@ -97,7 +97,7 @@ fn zone_text() -> String {
         .to_string()
 }
 
-fn query_message(qname: &str, qtype: u16) -> DnsMessage {
+fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
     DnsMessage {
         id: 0x1234,
         response: false,
@@ -117,6 +117,7 @@ fn query_message(qname: &str, qtype: u16) -> DnsMessage {
         answers: Vec::new(),
         authorities: Vec::new(),
         additionals: Vec::new(),
+        edns: None,
     }
 }
 
@@ -130,29 +131,31 @@ fn query_message(qname: &str, qtype: u16) -> DnsMessage {
 fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
     let mut out: Vec<(&'static str, Vec<u8>)> = Vec::new();
 
-    let plain = query_message("www.example.com.", record_types::A);
+    let plain = query_message("www.example.com.", Qtype::of(record_types::A));
     out.push((
         "a plain query",
         plain.to_bytes_within(512).expect("serialize"),
     ));
 
-    let mut edns = query_message("www.example.com.", record_types::A);
-    edns.set_edns(Edns {
-        udp_payload_size: 1232,
-        version: 0,
-        do_bit: true,
-        options: vec![
-            EdnsOption {
-                code: rdns::EDNS_OPTION_COOKIE,
-                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            },
-            EdnsOption {
-                code: rdns::EDNS_OPTION_NSID,
-                data: Vec::new(),
-            },
-        ],
-    })
-    .expect("set_edns");
+    let mut edns = query_message("www.example.com.", Qtype::of(record_types::A));
+    edns.set_edns(
+        Edns::with_options(
+            1232,
+            0,
+            true,
+            &[
+                EdnsOption {
+                    code: rdns::EDNS_OPTION_COOKIE,
+                    data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                },
+                EdnsOption {
+                    code: rdns::EDNS_OPTION_NSID,
+                    data: Vec::new(),
+                },
+            ],
+        )
+        .expect("encode the options"),
+    );
     out.push((
         "a query with EDNS and two options",
         edns.to_bytes_within(512).expect("serialize"),
@@ -160,7 +163,7 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
 
     // A response carrying every record shape the zone has, which is where the
     // RDATA parsers and the compression pointers are.
-    let mut answer = query_message("example.com.", record_types::ANY);
+    let mut answer = query_message("example.com.", Qtype::of(record_types::ANY));
     answer.response = true;
     answer.authoritive = true;
     for (name, qtype) in [
@@ -172,7 +175,7 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
         ("example.com.", record_types::SOA),
         ("example.com.", record_types::NS),
     ] {
-        for record in zone.query(name, qtype) {
+        for record in zone.query(name, Qtype::of(qtype)) {
             answer.answers.push(ResourceRecord {
                 name: name.to_string(),
                 class: record.class,
@@ -188,7 +191,7 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
 
     // The DNSSEC shapes: RRSIG, DNSKEY and a denial chain, all with their own
     // length fields and embedded names.
-    let mut secure = query_message("example.com.", record_types::ANY);
+    let mut secure = query_message("example.com.", Qtype::of(record_types::ANY));
     secure.response = true;
     secure.authoritive = true;
     for (name, qtype) in [
@@ -198,7 +201,7 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
         ("example.com.", record_types::NSEC3),
         ("example.com.", record_types::NSEC3PARAM),
     ] {
-        for record in signed.query(name, qtype) {
+        for record in signed.query(name, Qtype::of(qtype)) {
             secure.answers.push(ResourceRecord {
                 name: name.to_string(),
                 class: record.class,
@@ -214,8 +217,8 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
 
     // An IXFR request, the one query that carries a record of its own — in the
     // authority section, which the validator used to reject outright.
-    let mut ixfr = query_message("example.com.", record_types::IXFR);
-    for soa in zone.query("example.com.", record_types::SOA) {
+    let mut ixfr = query_message("example.com.", Qtype::of(record_types::IXFR));
+    for soa in zone.query("example.com.", Qtype::of(record_types::SOA)) {
         ixfr.authorities.push(ResourceRecord {
             name: "example.com.".to_string(),
             class: soa.class,
@@ -233,7 +236,7 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
     let key =
         tsig::TsigKey::parse("hmac-sha256:probe.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=")
             .expect("the key spec parses");
-    let unsigned = query_message("www.example.com.", record_types::A)
+    let unsigned = query_message("www.example.com.", Qtype::of(record_types::A))
         .to_bytes_within(512)
         .expect("serialize");
     if let Ok(signed_query) = tsig::sign_request(unsigned, &key, current_unix_timestamp()) {

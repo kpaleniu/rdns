@@ -20,7 +20,12 @@ use crate::dnssec_chain::{
 };
 use crate::dnssec_denial::{nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, Denial};
 use crate::error::{ResolveError, ResolveResult};
-use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::utils::{
+    absolute_lowered, current_unix_timestamp, is_at_or_under, label_count, names_equal,
+    record_types as rt,
+};
+use crate::Qtype;
+use crate::Rtype;
 use crate::{DnsMessage, Edns, ParsedRecord, QuerySection, ResourceRecord, ResponseCode};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -44,7 +49,7 @@ const TCP_MAX_MESSAGE: usize = u16::MAX as usize;
 /// plain name — a cut answers with a referral, an in-zone name with NODATA —
 /// and neither reveals the leaf being resolved, so there is nothing to trade
 /// off against interoperability here.
-const MINIMIZED_PROBE_TYPE: u16 = 1;
+const MINIMIZED_PROBE_TYPE: Qtype = Qtype::of(rt::A);
 
 /// How many minimized probes are sent before the full QNAME goes out instead.
 ///
@@ -594,9 +599,9 @@ impl Resolution {
         self.cuts
             .iter()
             .filter(|c| {
-                c.zone != normalize(zone)
-                    && is_subdomain(&c.zone, zone)
-                    && is_subdomain(target, &c.zone)
+                !names_equal(&c.zone, zone)
+                    && is_at_or_under(&c.zone, zone)
+                    && is_at_or_under(target, &c.zone)
             })
             .min_by_key(|c| label_count(&c.zone))
     }
@@ -824,6 +829,7 @@ impl Resolver {
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         };
         // Advertise EDNS0 so the responder may exceed 512 bytes, and — when we
         // validate — ask for the signatures with DO. CD goes with it: we are
@@ -833,7 +839,7 @@ impl Resolver {
         let mut edns = Edns::with_payload_size(self.config.udp_payload_size);
         edns.do_bit = self.config.dnssec.is_some();
         msg.cd = self.config.dnssec.is_some();
-        msg.set_edns(edns)?;
+        msg.set_edns(edns);
 
         let mut buf = vec![0; 512];
         let len = msg.to_bytes(&mut buf)?;
@@ -922,7 +928,7 @@ impl Resolver {
                     continue;
                 }
                 answers.push(rr.clone());
-                if rr.rdata.rtype == 5 {
+                if rr.rdata.rtype == rt::CNAME {
                     if let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() {
                         // Extends the chain within this same response.
                         chain.insert(normalize(&target));
@@ -935,18 +941,18 @@ impl Resolver {
             let got_type = response
                 .answers
                 .iter()
-                .any(|rr| rr.rdata.rtype == query.qtype && names_equal(&rr.name, &qname));
+                .any(|rr| query.qtype.matches(rr.rdata.rtype) && names_equal(&rr.name, &qname));
             let cname = response
                 .answers
                 .iter()
-                .filter(|rr| rr.rdata.rtype == 5 && names_equal(&rr.name, &qname))
+                .filter(|rr| rr.rdata.rtype == rt::CNAME && names_equal(&rr.name, &qname))
                 .find_map(|rr| match rr.rdata.parse() {
                     Ok(ParsedRecord::CNAME(target)) => Some(normalize(&target)),
                     _ => None,
                 });
 
             last = Some(response);
-            if got_type || cname.is_none() || query.qtype == 5 {
+            if got_type || cname.is_none() || query.qtype.is(rt::CNAME) {
                 break;
             }
             qname = cname.expect("checked is_none above");
@@ -1208,7 +1214,7 @@ impl Resolver {
         let mut ttl = u64::MAX;
 
         for rr in &response.authorities {
-            if rr.rdata.rtype != 2 {
+            if rr.rdata.rtype != rt::NS {
                 continue; // only NS records delegate
             }
             let owner = normalize(&rr.name);
@@ -1217,10 +1223,10 @@ impl Resolver {
             // referral must be *below* the zone we asked (otherwise `com.` could
             // hand us the servers for `bank.example.`) and must be *at or above*
             // the name we are chasing (otherwise it is not progress toward it).
-            if !is_subdomain(&owner, zone) || owner == *zone {
+            if !is_at_or_under(&owner, zone) || owner == *zone {
                 continue;
             }
-            if !is_subdomain(qname, &owner) {
+            if !is_at_or_under(qname, &owner) {
                 continue;
             }
             match &child_zone {
@@ -1231,7 +1237,7 @@ impl Resolver {
             }
             if let Ok(ParsedRecord::NS(target)) = rr.rdata.parse() {
                 ns_names.push(normalize(&target));
-                ttl = ttl.min(rr.ttl.max(0) as u64);
+                ttl = ttl.min(rr.ttl.as_u64());
             }
         }
 
@@ -1258,18 +1264,18 @@ impl Resolver {
             if !ns_names.iter().any(|ns| names_equal(ns, &owner)) {
                 continue;
             }
-            if !is_subdomain(&owner, zone) {
+            if !is_at_or_under(&owner, zone) {
                 continue;
             }
             let port = self.config.server_port;
             match rr.rdata.parse() {
                 Ok(ParsedRecord::A(addr)) => {
                     glue.push(SocketAddr::new(IpAddr::V4(addr), port));
-                    ttl = ttl.min(rr.ttl.max(0) as u64);
+                    ttl = ttl.min(rr.ttl.as_u64());
                 }
                 Ok(ParsedRecord::AAAA(addr)) => {
                     glue.push(SocketAddr::new(IpAddr::V6(addr), port));
-                    ttl = ttl.min(rr.ttl.max(0) as u64);
+                    ttl = ttl.min(rr.ttl.as_u64());
                 }
                 _ => {}
             }
@@ -1305,7 +1311,7 @@ impl Resolver {
         const AAAA: u16 = 28;
         for name in ns_names {
             let mut addrs: Vec<SocketAddr> = Vec::new();
-            for qtype in [A, AAAA] {
+            for qtype in [Qtype::of(Rtype::new(A)), Qtype::of(Rtype::new(AAAA))] {
                 let lookup = QuerySection {
                     qname: name.clone(),
                     qtype,
@@ -1499,7 +1505,7 @@ impl Resolver {
         let holds_the_answer = response
             .answers
             .iter()
-            .any(|rr| rr.rdata.rtype == query.qtype && normalize(&rr.name) == denied_name);
+            .any(|rr| query.qtype.matches(rr.rdata.rtype) && names_equal(&rr.name, &denied_name));
         let negative = !holds_the_answer;
 
         // A negative answer carries its proof in the authority section, so that
@@ -1626,7 +1632,7 @@ impl Resolver {
         // an answer that validated a moment ago would come back bogus.
         let (mut zone, mut ds_set) = (anchor_zone.clone(), anchor_ds);
         for candidate in ancestors(&normalize(target)) {
-            if is_subdomain(&candidate, &anchor_zone) && self.keys.holds(&candidate) {
+            if is_at_or_under(&candidate, &anchor_zone) && self.keys.holds(&candidate) {
                 // Its keys are cached, so they were validated to the anchor
                 // once already and the DS that got us there is not needed again.
                 zone = candidate;
@@ -1694,7 +1700,7 @@ impl Resolver {
     ) -> Result<(Vec<ResourceRecord>, u64), ResolveError> {
         let query = QuerySection {
             qname: zone.to_string(),
-            qtype: rt::DNSKEY,
+            qtype: Qtype::of(rt::DNSKEY),
             qclass: crate::QueryClass::IN,
         };
         let response = match self.config.mode {
@@ -1705,7 +1711,7 @@ impl Resolver {
             .answers
             .iter()
             .filter(|rr| rr.rdata.rtype == rt::DNSKEY)
-            .map(|rr| rr.ttl.max(0) as u64)
+            .map(|rr| rr.ttl.as_u64())
             .min()
             .unwrap_or(0);
         Ok((response.answers, ttl))
@@ -1744,7 +1750,13 @@ impl Resolver {
         let denial = if response.rcode == ResponseCode::NoSuchDomain {
             proves_nxdomain(denied_name, &zone, &nsecs, &nsec3s)
         } else {
-            proves_nodata(denied_name, &zone, query.qtype, &nsecs, &nsec3s)
+            proves_nodata(
+                denied_name,
+                &zone,
+                Rtype::new(query.qtype.to_u16()),
+                &nsecs,
+                &nsec3s,
+            )
         };
 
         match denial {
@@ -1757,14 +1769,14 @@ impl Resolver {
 }
 
 /// Absolute, lowercased form — the shape every comparison here assumes.
-/// DNS names compare case-insensitively (RFC 4343).
+///
+/// The rule lives in [`crate::utils::absolute_lowered`]; this is the owning
+/// spelling of it, for the call sites that keep the result as a map key or a
+/// set member. A site that only wants to *compare* two names wants
+/// [`crate::utils::names_equal`] instead, which does not allocate at all —
+/// telling those two apart is most of what `TODO.md` #13b was.
 fn normalize(name: &str) -> String {
-    let lowered = name.to_ascii_lowercase();
-    if lowered.ends_with('.') {
-        lowered
-    } else {
-        format!("{lowered}.")
-    }
+    absolute_lowered(name).into_owned()
 }
 
 /// Scramble the case of each ASCII letter in `name`, leaving the labels
@@ -1785,21 +1797,6 @@ fn randomize_case(name: &str) -> String {
         .collect()
 }
 
-fn names_equal(a: &str, b: &str) -> bool {
-    normalize(a) == normalize(b)
-}
-
-/// How many labels a name has, the root (`.`) being zero. `example.com.` is 2.
-fn label_count(name: &str) -> usize {
-    let n = normalize(name);
-    let trimmed = n.trim_end_matches('.');
-    if trimmed.is_empty() {
-        0
-    } else {
-        trimmed.split('.').count()
-    }
-}
-
 /// The `labels`-deep suffix of `qname`: the last `labels` labels of it, plus the
 /// root dot. Used to build a QNAME-minimized query — `example.com.` from
 /// `www.example.com.` at two labels. Zero labels is the root; asking for more
@@ -1816,20 +1813,18 @@ fn suffix_with_labels(qname: &str, labels: usize) -> String {
     format!("{}.", parts[parts.len() - labels..].join("."))
 }
 
-/// Whether `name` is at or below `ancestor` in the tree. Everything is below
-/// the root, and a name is trivially below itself.
-fn is_subdomain(name: &str, ancestor: &str) -> bool {
-    let name = normalize(name);
-    let ancestor = normalize(ancestor);
-    if ancestor == "." || name == ancestor {
-        return true;
-    }
-    name.ends_with(&format!(".{ancestor}"))
-}
+// `is_subdomain` was here, and was the fifth implementation of "is this name at
+// or under that one" in this workspace. It normalized both sides into fresh
+// `String`s and then built a `format!(".{ancestor}")` — three allocations to
+// answer a question about bytes — where `utils::is_at_or_under` compares in
+// place and handles the trailing dot on either side. Same answers, including
+// the `notexample.com.` boundary case both got right (`TODO.md` #13b).
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Class;
+    use crate::Ttl;
     use crate::{ParsedRecord, QueryClass, RecordData, ResourceRecord};
     // The fake servers below are blocking `std::net`, run on their own OS
     // threads; these explicit imports shadow the async tokio `UdpSocket` /
@@ -1844,7 +1839,7 @@ mod tests {
     fn test_query() -> QuerySection {
         QuerySection {
             qname: "example.com.".to_string(),
-            qtype: 1,
+            qtype: Qtype::of(rt::A),
             qclass: QueryClass::IN,
         }
     }
@@ -1888,14 +1883,15 @@ mod tests {
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         }
     }
 
     fn a_record(name: &str, addr: [u8; 4]) -> ResourceRecord {
         ResourceRecord {
             name: name.to_string(),
-            class: 1,
-            ttl: 300,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::from(addr))).unwrap(),
         }
     }
@@ -2041,26 +2037,15 @@ this line has no record and is skipped
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_bailiwick_helpers() {
-        assert!(is_subdomain("www.example.com.", "example.com."));
-        assert!(is_subdomain("example.com.", "com."));
-        assert!(
-            is_subdomain("anything.", "."),
-            "everything is under the root"
-        );
-        assert!(is_subdomain("example.com.", "example.com."), "reflexive");
-
-        // The attack these guard against: a name that merely *ends with* the
-        // zone's text is not inside the zone.
-        assert!(!is_subdomain("notexample.com.", "example.com."));
-        assert!(!is_subdomain("example.com.", "www.example.com."));
-        assert!(!is_subdomain("example.org.", "example.com."));
-
-        // Case and trailing dots do not change the answer (RFC 4343).
-        assert!(is_subdomain("WWW.Example.COM", "example.com."));
-        assert!(names_equal("Example.COM.", "example.com"));
-    }
+    // `test_bailiwick_helpers` was here, and once `is_subdomain` and
+    // `names_equal` became `utils`', it was asserting things about another
+    // module's functions that `utils::a_name_is_under_a_zone_only_at_a_label_boundary`
+    // and `names_are_equal_by_ascii_folding_and_an_optional_trailing_dot`
+    // already assert — including the `notexample.com.` case both were written
+    // for. A second copy of a test drifts exactly as a second copy of the code
+    // does (`CLAUDE.md` §7); what belongs here is a test of what this module
+    // *decides* with the answer, and `test_out_of_bailiwick_referral_is_not_followed`
+    // and `test_out_of_bailiwick_glue_is_ignored` further down are that.
 
     // ---------------------------------------------------------------------
     // Recursion: a fake root / TLD / authoritative hierarchy in-process.
@@ -2151,8 +2136,8 @@ this line has no record and is skipped
     fn ns_record(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
             name: owner.to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NS(target.to_string())).unwrap(),
         }
     }
@@ -2160,8 +2145,8 @@ this line has no record and is skipped
     fn cname_record(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
             name: owner.to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).unwrap(),
         }
     }
@@ -2231,7 +2216,7 @@ this line has no record and is skipped
         let answer = resolver
             .resolve(&QuerySection {
                 qname: "www.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -2269,7 +2254,7 @@ this line has no record and is skipped
         let result = resolver
             .resolve(&QuerySection {
                 qname: "www.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await;
@@ -2322,7 +2307,7 @@ this line has no record and is skipped
         let result = resolver
             .resolve(&QuerySection {
                 qname: "www.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await;
@@ -2370,14 +2355,14 @@ this line has no record and is skipped
         let answer = resolver
             .resolve(&QuerySection {
                 qname: "www.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
             .expect("CNAME should be chased to the address");
 
         assert_eq!(answer.answers.len(), 2, "CNAME and the A it leads to");
-        assert_eq!(answer.answers[0].rdata.rtype, 5);
+        assert_eq!(answer.answers[0].rdata.rtype, rt::CNAME);
         assert_eq!(
             answer.answers[1].rdata.parse().unwrap(),
             ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 9))
@@ -2413,7 +2398,7 @@ this line has no record and is skipped
         let result = resolver
             .resolve(&QuerySection {
                 qname: "a.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await;
@@ -2482,7 +2467,7 @@ this line has no record and is skipped
         let answer = resolver
             .resolve(&QuerySection {
                 qname: "www.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -2519,7 +2504,7 @@ this line has no record and is skipped
         let result = resolver
             .resolve(&QuerySection {
                 qname: "www.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await;
@@ -2599,7 +2584,7 @@ this line has no record and is skipped
         let answer = resolver
             .resolve(&QuerySection {
                 qname: "www.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -2633,7 +2618,7 @@ this line has no record and is skipped
         resolver
             .resolve(&QuerySection {
                 qname: "www.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -2694,7 +2679,7 @@ this line has no record and is skipped
         let answer = resolver
             .resolve(&QuerySection {
                 qname: "www.sub.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -2743,14 +2728,18 @@ this line has no record and is skipped
         // Recorded at *every* server, because the ceiling bounds the minimized
         // probes in the whole resolution and not per zone: the root is asked
         // `test.` and the TLD `example.test.`, and those are two of the ten.
-        let seen: Arc<Mutex<Vec<(String, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: Arc<Mutex<Vec<(String, Qtype)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let a = seen.clone();
         let _auth = spawn_server(auth_sock, move |q| {
             let name = qname_of(q);
-            let qtype = q.queries.first().map(|q| q.qtype).unwrap_or(0);
+            let qtype = q
+                .queries
+                .first()
+                .map(|q| q.qtype)
+                .unwrap_or(Qtype::of(Rtype::new(0)));
             a.lock().unwrap().push((name.clone(), qtype));
-            if name == "a.b.c.d.e.f.g.h.i.j.k.l.example.test." && qtype == 1 {
+            if name == "a.b.c.d.e.f.g.h.i.j.k.l.example.test." && qtype == Qtype::of(rt::A) {
                 authoritative(q, vec![a_record(&name, [192, 0, 2, 9])])
             } else {
                 authoritative(q, vec![])
@@ -2758,9 +2747,13 @@ this line has no record and is skipped
         });
         let t = seen.clone();
         let _tld = spawn_server(tld_sock, move |q| {
-            t.lock()
-                .unwrap()
-                .push((qname_of(q), q.queries.first().map(|q| q.qtype).unwrap_or(0)));
+            t.lock().unwrap().push((
+                qname_of(q),
+                q.queries
+                    .first()
+                    .map(|q| q.qtype)
+                    .unwrap_or(Qtype::of(Rtype::new(0))),
+            ));
             referral(
                 q,
                 "example.test.",
@@ -2770,9 +2763,13 @@ this line has no record and is skipped
         });
         let r = seen.clone();
         let root = spawn_server(root_sock, move |q| {
-            r.lock()
-                .unwrap()
-                .push((qname_of(q), q.queries.first().map(|q| q.qtype).unwrap_or(0)));
+            r.lock().unwrap().push((
+                qname_of(q),
+                q.queries
+                    .first()
+                    .map(|q| q.qtype)
+                    .unwrap_or(Qtype::of(Rtype::new(0))),
+            ));
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
@@ -2780,7 +2777,7 @@ this line has no record and is skipped
         let answer = resolver
             .resolve(&QuerySection {
                 qname: leaf.to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -2792,7 +2789,8 @@ this line has no record and is skipped
         );
 
         let seen = seen.lock().unwrap();
-        let minimized: Vec<&(String, u16)> = seen.iter().filter(|(name, _)| name != leaf).collect();
+        let minimized: Vec<&(String, Qtype)> =
+            seen.iter().filter(|(name, _)| name != leaf).collect();
         assert_eq!(
             minimized.len(),
             MAX_MINIMISE_COUNT,
@@ -2800,8 +2798,10 @@ this line has no record and is skipped
              counts: {seen:?}"
         );
         assert!(
-            minimized.iter().all(|(_, qtype)| *qtype == 1),
-            "an intermediate probe asks for A, not NS: {minimized:?}"
+            minimized
+                .iter()
+                .all(|(_, qtype)| *qtype == MINIMIZED_PROBE_TYPE),
+            "an intermediate probe asks for A, not NS (RFC 9156 §2.3): {minimized:?}"
         );
         // The name is fourteen labels deep, so without the ceiling this would
         // have been thirteen probes and then the leaf.
@@ -2932,7 +2932,7 @@ this line has no record and is skipped
             let answer = resolver
                 .resolve(&QuerySection {
                     qname: name.to_string(),
-                    qtype: 1,
+                    qtype: Qtype::of(rt::A),
                     qclass: QueryClass::IN,
                 })
                 .await
@@ -3069,7 +3069,7 @@ this line has no record and is skipped
             let answer = resolver
                 .resolve(&QuerySection {
                     qname: name.to_string(),
-                    qtype: 1,
+                    qtype: Qtype::of(rt::A),
                     qclass: QueryClass::IN,
                 })
                 .await
@@ -3124,7 +3124,7 @@ this line has no record and is skipped
         let answer = resolver
             .resolve(&QuerySection {
                 qname: "www.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -3492,7 +3492,7 @@ this line has no record and is skipped
 
     /// A DS RRset for `child`, signed by `parent`.
     fn signed_ds(parent: &TestZone, child: &TestZone) -> Vec<ResourceRecord> {
-        let ds = ds_record(&child.ds(2), 3600);
+        let ds = ds_record(&child.ds(2), Ttl::from_secs(3600));
         let sig = parent.sign_records(std::slice::from_ref(&ds));
         vec![ds, sig]
     }
@@ -3502,8 +3502,8 @@ this line has no record and is skipped
     fn signed_no_ds_proof(parent: &TestZone, name: &str) -> Vec<ResourceRecord> {
         let nsec = ResourceRecord {
             name: name.to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: "zz.test.".to_string(),
                 type_bitmap: build_type_bitmap(&[rt::NS, rt::RRSIG, rt::NSEC]),
@@ -3582,8 +3582,12 @@ this line has no record and is skipped
 
         let auth_server = spawn_server(auth_sock, move |q| {
             let name = qname_of(q);
-            let qtype = q.queries.first().map(|x| x.qtype).unwrap_or(0);
-            if name == "example.test." && qtype == rt::DNSKEY {
+            let qtype = q
+                .queries
+                .first()
+                .map(|x| x.qtype)
+                .unwrap_or(Qtype::of(Rtype::new(0)));
+            if name == "example.test." && qtype == Qtype::of(rt::DNSKEY) {
                 authoritative(q, auth_keys.clone())
             } else if name == "www.example.test." {
                 let mut resp = authoritative(q, answers.clone());
@@ -3612,7 +3616,7 @@ this line has no record and is skipped
                 resp.rcode = ResponseCode::NoSuchDomain;
                 resp.authorities = nsec3_incomplete.clone();
                 resp
-            } else if name == "wild-nodata.example.test." && qtype == rt::AAAA {
+            } else if name == "wild-nodata.example.test." && qtype == Qtype::of(rt::AAAA) {
                 // A wildcard NODATA: the name does not exist, `*.example.test.`
                 // answered, and it has an A but no AAAA. NOERROR with an empty
                 // answer section.
@@ -3620,7 +3624,7 @@ this line has no record and is skipped
                 resp.authoritive = true;
                 resp.authorities = wildcard_nodata.clone();
                 resp
-            } else if name == "stripped-wildcard.example.test." && qtype == rt::AAAA {
+            } else if name == "stripped-wildcard.example.test." && qtype == Qtype::of(rt::AAAA) {
                 // The same, with the record at the wildcard removed: what is
                 // left covers the name but says nothing about what a wildcard
                 // would have answered with.
@@ -3638,13 +3642,13 @@ this line has no record and is skipped
                     stripped_alias_cname.clone()
                 };
                 authoritative(q, records)
-            } else if name == "chased.example.test." && qtype == rt::AAAA {
+            } else if name == "chased.example.test." && qtype == Qtype::of(rt::AAAA) {
                 // The end of the chain: an A record but no AAAA, denied properly.
                 let mut resp = response_to(q);
                 resp.authoritive = true;
                 resp.authorities = aliased_nodata.clone();
                 resp
-            } else if name == "unproved.example.test." && qtype == rt::AAAA {
+            } else if name == "unproved.example.test." && qtype == Qtype::of(rt::AAAA) {
                 // The same NODATA with the proof stripped out, which is what an
                 // attacker who cannot forge a signature does instead.
                 let mut resp = response_to(q);
@@ -3659,8 +3663,12 @@ this line has no record and is skipped
 
         let tld_server = spawn_server(tld_sock, move |q| {
             let name = qname_of(q);
-            let qtype = q.queries.first().map(|x| x.qtype).unwrap_or(0);
-            if name == "test." && qtype == rt::DNSKEY {
+            let qtype = q
+                .queries
+                .first()
+                .map(|x| x.qtype)
+                .unwrap_or(Qtype::of(Rtype::new(0)));
+            if name == "test." && qtype == Qtype::of(rt::DNSKEY) {
                 authoritative(q, tld_keys.clone())
             } else {
                 signed_referral(
@@ -3675,8 +3683,12 @@ this line has no record and is skipped
 
         let root_server = spawn_server(root_sock, move |q| {
             let name = qname_of(q);
-            let qtype = q.queries.first().map(|x| x.qtype).unwrap_or(0);
-            if name == "." && qtype == rt::DNSKEY {
+            let qtype = q
+                .queries
+                .first()
+                .map(|x| x.qtype)
+                .unwrap_or(Qtype::of(Rtype::new(0)));
+            if name == "." && qtype == Qtype::of(rt::DNSKEY) {
                 authoritative(q, root_keys.clone())
             } else {
                 signed_referral(q, "test.", "ns.test.", tld_addr, &tld_ds)
@@ -3694,8 +3706,8 @@ this line has no record and is skipped
     fn cname_records(auth: &TestZone, owner: &str, target: &str) -> Vec<ResourceRecord> {
         let cname = ResourceRecord {
             name: owner.to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).unwrap(),
         };
         let sig = auth.sign_records(std::slice::from_ref(&cname));
@@ -3708,8 +3720,8 @@ this line has no record and is skipped
     fn signed_nodata_authority(auth: &TestZone, name: &str) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
             name: "example.test.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: "ns.example.test.".to_string(),
                 rname: "admin.example.test.".to_string(),
@@ -3723,8 +3735,8 @@ this line has no record and is skipped
         };
         let nsec = ResourceRecord {
             name: name.to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: "zz.example.test.".to_string(),
                 type_bitmap: build_type_bitmap(&[rt::A, rt::RRSIG, rt::NSEC]),
@@ -3743,8 +3755,8 @@ this line has no record and is skipped
     fn signed_nxdomain_authority(auth: &TestZone) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
             name: "example.test.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: "ns.example.test.".to_string(),
                 rname: "admin.example.test.".to_string(),
@@ -3758,8 +3770,8 @@ this line has no record and is skipped
         };
         let nsec = ResourceRecord {
             name: "example.test.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: "www.example.test.".to_string(),
                 type_bitmap: build_type_bitmap(&[rt::SOA, rt::NS, rt::RRSIG, rt::NSEC]),
@@ -3800,8 +3812,8 @@ this line has no record and is skipped
 
         let soa = ResourceRecord {
             name: zone.to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: "ns.example.test.".to_string(),
                 rname: "admin.example.test.".to_string(),
@@ -3814,13 +3826,13 @@ this line has no record and is skipped
             .unwrap(),
         };
 
-        let nsec3 = |owner_hash: &[u8], next: &[u8], types: &[u16]| ResourceRecord {
+        let nsec3 = |owner_hash: &[u8], next: &[u8], types: &[Rtype]| ResourceRecord {
             // An NSEC3's owner name is the base32hex of the hash, under the zone
             // — which is why nothing about this shape can be checked without
             // hashing for real.
             name: format!("{}.{zone}", base32hex_encode(owner_hash)),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
                 hash_algorithm: 1,
                 flags: 0,
@@ -3854,8 +3866,8 @@ this line has no record and is skipped
     fn signed_wildcard_nodata_authority(auth: &TestZone, at_wildcard: bool) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
             name: "example.test.".to_string(),
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: "ns.example.test.".to_string(),
                 rname: "admin.example.test.".to_string(),
@@ -3873,8 +3885,8 @@ this line has no record and is skipped
             } else {
                 "m.example.test.".to_string()
             },
-            class: 1,
-            ttl: 3600,
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: "zzz.example.test.".to_string(),
                 type_bitmap: build_type_bitmap(&[rt::A, rt::RRSIG, rt::NSEC]),
@@ -3901,14 +3913,57 @@ this line has no record and is skipped
     }
 
     async fn resolve_www(config: ResolverConfig) -> (DnsMessage, ValidationState) {
+        resolve_www_qtype(config, Qtype::of(rt::A)).await
+    }
+
+    async fn resolve_www_qtype(
+        config: ResolverConfig,
+        qtype: Qtype,
+    ) -> (DnsMessage, ValidationState) {
         Resolver::new(config)
             .resolve_validated(&QuerySection {
                 qname: "www.example.test.".to_string(),
-                qtype: 1,
+                qtype,
                 qclass: QueryClass::IN,
             })
             .await
             .expect("the resolution itself should succeed")
+    }
+
+    /// QTYPE=ANY is a *question* value, not a type any record has (RFC 1035
+    /// §3.2.3), so `rr.rdata.rtype == query.qtype` is false for every record in
+    /// a perfectly good answer. The validator reads that as "the answer does not
+    /// hold what was asked for", sets `negative`, and goes looking for a denial
+    /// proof that a positive answer has no reason to carry — so an answer that
+    /// verifies is reported Bogus, and `rdnsr --dnssec-validate` fails closed
+    /// and returns SERVFAIL.
+    ///
+    /// Nothing on this path rejects or special-cases ANY: `rdnsr/src/main.rs`,
+    /// this module and `validation.rs` do not mention it at all, so a client
+    /// simply asking for it reaches the comparison. The answer here is the same
+    /// signed A RRset `test_signed_hierarchy_validates_as_secure` calls Secure —
+    /// the only thing that changed is the QTYPE on the question.
+    ///
+    /// This is the test `TODO.md` #13c asks for before the `Qtype`/`Rtype`
+    /// newtypes, because it is what decides whether the newtypes are fixing
+    /// something a client can provoke or merely tidying two `u16`s.
+    #[tokio::test]
+    async fn an_any_query_is_a_positive_answer_and_must_not_be_read_as_a_denial() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let (answer, state) = resolve_www_qtype(validating_config(&h), Qtype::of(rt::ANY)).await;
+
+        assert!(
+            answer.answers.iter().any(|rr| matches!(
+                rr.rdata.parse(),
+                Ok(ParsedRecord::A(a)) if a == Ipv4Addr::new(192, 0, 2, 1)
+            )),
+            "the answer holds the A record ANY asked for"
+        );
+        assert_eq!(
+            state,
+            ValidationState::Secure,
+            "an ANY answer that verifies is Secure, not {state}"
+        );
     }
 
     /// The whole chain, end to end: the trust anchor vouches for the root's
@@ -4058,7 +4113,7 @@ this line has no record and is skipped
         let (answer, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
                 qname: "gone.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -4083,7 +4138,7 @@ this line has no record and is skipped
         let (answer, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
                 qname: "nsec3-gone.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -4121,7 +4176,7 @@ this line has no record and is skipped
         let (_, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
                 qname: "nsec3-incomplete.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -4148,7 +4203,7 @@ this line has no record and is skipped
         let (denial, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
                 qname: "gone.example.test.".to_string(),
-                qtype: 1,
+                qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
             .await
@@ -4161,7 +4216,7 @@ this line has no record and is skipped
 
         // A name nobody has ever asked about, answered from the cached gap.
         let synthesized = cache
-            .synthesize("never-queried.example.test.", 1)
+            .synthesize("never-queried.example.test.", Qtype::of(rt::A))
             .expect("the cached gap covers this name too");
         assert_eq!(synthesized.rcode, ResponseCode::NoSuchDomain);
         assert!(
@@ -4175,7 +4230,9 @@ this line has no record and is skipped
 
         // But a name outside the gap still has to be resolved.
         assert!(
-            cache.synthesize("zzz.example.test.", 1).is_none(),
+            cache
+                .synthesize("zzz.example.test.", Qtype::of(rt::A))
+                .is_none(),
             "the gap ends at www.example.test."
         );
     }
@@ -4190,7 +4247,7 @@ this line has no record and is skipped
         let (answer, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
                 qname: "wild-nodata.example.test.".to_string(),
-                qtype: rt::AAAA,
+                qtype: Qtype::of(rt::AAAA),
                 qclass: QueryClass::IN,
             })
             .await
@@ -4215,7 +4272,7 @@ this line has no record and is skipped
         let (_, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
                 qname: "stripped-wildcard.example.test.".to_string(),
-                qtype: rt::AAAA,
+                qtype: Qtype::of(rt::AAAA),
                 qclass: QueryClass::IN,
             })
             .await
@@ -4279,8 +4336,8 @@ this line has no record and is skipped
         if with_proof {
             let nsec = ResourceRecord {
                 name: "*.example.test.".to_string(),
-                class: 1,
-                ttl: 3600,
+                class: Class::new(1),
+                ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                     next_domain_name: "zzz.example.test.".to_string(),
                     type_bitmap: build_type_bitmap(&[rt::A, rt::RRSIG, rt::NSEC]),
@@ -4304,7 +4361,7 @@ this line has no record and is skipped
         let (answer, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
                 qname: "chase.example.test.".to_string(),
-                qtype: rt::AAAA,
+                qtype: Qtype::of(rt::AAAA),
                 qclass: QueryClass::IN,
             })
             .await
@@ -4340,7 +4397,7 @@ this line has no record and is skipped
         let (_, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
                 qname: "stripped-chase.example.test.".to_string(),
-                qtype: rt::AAAA,
+                qtype: Qtype::of(rt::AAAA),
                 qclass: QueryClass::IN,
             })
             .await
@@ -4364,8 +4421,8 @@ this line has no record and is skipped
         let h = signed_hierarchy_with(signed_ds, |auth| {
             let cname = ResourceRecord {
                 name: "www.example.test.".to_string(),
-                class: 1,
-                ttl: 3600,
+                class: Class::new(1),
+                ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::CNAME(
                     "alias.example.test.".to_string(),
                 ))
@@ -4417,7 +4474,7 @@ this line has no record and is skipped
         // gap in the proof runs from `*.example.test.` to `zzz.example.test.`, so
         // this name is inside it and provably absent.
         let synthesized = cache
-            .synthesize_wildcard("never-asked.example.test.", 1)
+            .synthesize_wildcard("never-asked.example.test.", Qtype::of(rt::A))
             .expect("the cached wildcard reaches this name too");
         assert!(
             synthesized.answers.iter().any(|rr| matches!(
@@ -4444,7 +4501,7 @@ this line has no record and is skipped
         // the covering NSEC looks: a wildcard reaches exactly one label.
         assert!(
             cache
-                .synthesize_wildcard("deeper.never-asked.example.test.", 1)
+                .synthesize_wildcard("deeper.never-asked.example.test.", Qtype::of(rt::A))
                 .is_none(),
             "*.example.test. does not reach two labels down"
         );
@@ -4458,7 +4515,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(validating_config(&h));
         let query = QuerySection {
             qname: "www.example.test.".to_string(),
-            qtype: 1,
+            qtype: Qtype::of(rt::A),
             qclass: QueryClass::IN,
         };
 

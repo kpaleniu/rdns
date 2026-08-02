@@ -30,6 +30,9 @@
 //! different name.
 
 use crate::error::ZoneError;
+use crate::Class;
+use crate::Qtype;
+use crate::Ttl;
 use std::path::Path;
 
 use crate::dnssec_denial::{base32hex_encode, bitmap_types_exact};
@@ -94,7 +97,10 @@ pub fn record_to_string(record: &ZoneRecord) -> Result<String, ZoneError> {
         ))
     })?;
     let class = class_name(record.class).ok_or_else(|| {
-        ZoneError::invalid(format!("record {owner}: unknown class {}", record.class))
+        ZoneError::invalid(format!(
+            "record {owner}: unknown class {}",
+            record.class.to_u16()
+        ))
     })?;
 
     let (rtype, rdata) = rdata_to_string(&record.rdata);
@@ -328,11 +334,11 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
-fn class_name(class: u16) -> Option<&'static str> {
+fn class_name(class: Class) -> Option<&'static str> {
     match class {
-        1 => Some("IN"),
-        3 => Some("CH"),
-        4 => Some("HS"),
+        Class::IN => Some("IN"),
+        Class::CH => Some("CH"),
+        Class::HS => Some("HS"),
         _ => None,
     }
 }
@@ -342,15 +348,18 @@ fn class_name(class: u16) -> Option<&'static str> {
 /// Every record carries its own TTL, so this is only ever a default for a record
 /// that does not — which this writer never emits — and a value other tools
 /// insist on seeing. The SOA's minimum is the conventional choice.
-fn default_ttl(zone: &Zone) -> i32 {
+fn default_ttl(zone: &Zone) -> Ttl {
     let soa = zone
-        .query(zone.origin(), record_types::SOA)
+        .query(zone.origin(), Qtype::of(record_types::SOA))
         .first()
         .and_then(|r| r.rdata.parse().ok());
     if let Some(ParsedRecord::SOA { minimum, .. }) = soa {
-        return minimum as i32;
+        return Ttl::from_secs(minimum);
     }
-    zone.records().first().map(|r| r.ttl).unwrap_or(3600)
+    zone.records()
+        .first()
+        .map(|r| r.ttl)
+        .unwrap_or(Ttl::from_secs(3600))
 }
 
 #[cfg(test)]
@@ -358,6 +367,7 @@ mod tests {
     use super::*;
     use crate::utils::record_types as rt;
     use crate::zone::parse_zone_file;
+    use crate::Rtype;
 
     /// Load, write, load again — and hold the two zones to being the same zone,
     /// record for record, RDATA byte for byte. This is the property the module
@@ -406,9 +416,11 @@ mod tests {
 
         assert!(written.contains("$ORIGIN example.com."));
         assert!(written.contains("; serial"), "the SOA is written readably");
-        assert_eq!(second.query("www.example.com.", rt::A).len(), 1);
+        assert_eq!(second.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
         assert_eq!(
-            second.query("anything.example.com.", rt::A).len(),
+            second
+                .query("anything.example.com.", Qtype::of(rt::A))
+                .len(),
             1,
             "wildcard"
         );
@@ -423,8 +435,8 @@ mod tests {
             "$TTL 3600\n@ IN SOA ns1. admin. 1 2 3 4 5\nshort 60 IN A 192.0.2.1\n",
             "example.com.",
         );
-        let record = second.query("short.example.com.", rt::A)[0];
-        assert_eq!(record.ttl, 60);
+        let record = second.query("short.example.com.", Qtype::of(rt::A))[0];
+        assert_eq!(record.ttl, Ttl::from_secs(60));
     }
 
     /// The SOA leads the file whatever order it was loaded in — that is where
@@ -450,7 +462,7 @@ mod tests {
             "example.com.",
         );
 
-        let two = second.query("two.example.com.", rt::TXT)[0];
+        let two = second.query("two.example.com.", Qtype::of(rt::TXT))[0];
         assert!(
             matches!(two.rdata.parse(), Ok(ParsedRecord::TXT(s)) if s.len() == 2),
             "unquoted words stay two strings"
@@ -471,8 +483,8 @@ mod tests {
             .expect("encode");
         zone.add_record(ZoneRecord {
             name: "bin.example.com.".to_string(),
-            ttl: 3600,
-            class: 1,
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
             rdata: rdata.clone(),
         });
 
@@ -480,7 +492,10 @@ mod tests {
         assert!(written.contains("TXT     \\# 4 0300FF1F"), "{written}");
 
         let reread = parse_zone_file(&written, "example.com.").expect("re-parse");
-        assert_eq!(reread.query("bin.example.com.", rt::TXT)[0].rdata, rdata);
+        assert_eq!(
+            reread.query("bin.example.com.", Qtype::of(rt::TXT))[0].rdata,
+            rdata
+        );
     }
 
     /// A type with no parser here still has to survive being persisted, or a
@@ -489,13 +504,13 @@ mod tests {
     fn test_unknown_types_survive_as_generic_records() {
         let mut zone = Zone::new("example.com.".to_string());
         let rdata = RecordData {
-            rtype: 1234,
+            rtype: Rtype::new(1234),
             rdata: vec![0xde, 0xad, 0xbe, 0xef].into_boxed_slice(),
         };
         zone.add_record(ZoneRecord {
             name: "odd.example.com.".to_string(),
-            ttl: 300,
-            class: 1,
+            ttl: Ttl::from_secs(300),
+            class: Class::new(1),
             rdata: rdata.clone(),
         });
 
@@ -503,7 +518,10 @@ mod tests {
         assert!(written.contains("TYPE1234 \\# 4 DEADBEEF"), "{written}");
 
         let reread = parse_zone_file(&written, "example.com.").expect("re-parse");
-        assert_eq!(reread.query("odd.example.com.", 1234)[0].rdata, rdata);
+        assert_eq!(
+            reread.query("odd.example.com.", Qtype::of(Rtype::new(1234)))[0].rdata,
+            rdata
+        );
     }
 
     /// Empty RDATA is legal and has to be written as `\# 0`, with no hex at all.
@@ -512,10 +530,10 @@ mod tests {
         let mut zone = Zone::new("example.com.".to_string());
         zone.add_record(ZoneRecord {
             name: "empty.example.com.".to_string(),
-            ttl: 300,
-            class: 1,
+            ttl: Ttl::from_secs(300),
+            class: Class::new(1),
             rdata: RecordData {
-                rtype: 4321,
+                rtype: Rtype::new(4321),
                 rdata: Vec::new().into_boxed_slice(),
             },
         });
@@ -523,10 +541,12 @@ mod tests {
         let written = zone_to_string(&zone).expect("write");
         assert!(written.contains("TYPE4321 \\# 0"), "{written}");
         let reread = parse_zone_file(&written, "example.com.").expect("re-parse");
-        assert!(reread.query("empty.example.com.", 4321)[0]
-            .rdata
-            .rdata
-            .is_empty());
+        assert!(
+            reread.query("empty.example.com.", Qtype::of(Rtype::new(4321)))[0]
+                .rdata
+                .rdata
+                .is_empty()
+        );
     }
 
     /// The DNSSEC records are the ones a rewrite must be byte-exact for: a
@@ -567,8 +587,8 @@ mod tests {
         );
 
         assert_eq!(
-            first.query("example.com.", rt::NSEC3)[0].rdata,
-            second.query("example.com.", rt::NSEC3)[0].rdata
+            first.query("example.com.", Qtype::of(rt::NSEC3))[0].rdata,
+            second.query("example.com.", Qtype::of(rt::NSEC3))[0].rdata
         );
     }
 
@@ -587,8 +607,8 @@ mod tests {
         .expect("encode");
         zone.add_record(ZoneRecord {
             name: "example.com.".to_string(),
-            ttl: 3600,
-            class: 1,
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
             rdata: padded.clone(),
         });
 
@@ -596,7 +616,7 @@ mod tests {
         assert!(written.contains("NSEC    \\# "), "{written}");
         let reread = parse_zone_file(&written, "example.com.").expect("re-parse");
         assert_eq!(
-            reread.query("example.com.", rt::NSEC)[0].rdata,
+            reread.query("example.com.", Qtype::of(rt::NSEC))[0].rdata,
             padded,
             "the bytes are preserved exactly, padding and all"
         );
@@ -609,8 +629,8 @@ mod tests {
         let mut zone = Zone::new("example.com.".to_string());
         zone.add_record(ZoneRecord {
             name: "has space.example.com.".to_string(),
-            ttl: 300,
-            class: 1,
+            ttl: Ttl::from_secs(300),
+            class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.1".parse().unwrap()))
                 .expect("encode"),
         });
@@ -631,15 +651,15 @@ mod tests {
             .expect("encode");
         zone.add_record(ZoneRecord {
             name: "example.com.".to_string(),
-            ttl: 300,
-            class: 1,
+            ttl: Ttl::from_secs(300),
+            class: Class::new(1),
             rdata: ns.clone(),
         });
 
         let written = zone_to_string(&zone).expect("write");
         assert!(written.contains("NS      \\# "), "{written}");
         let reread = parse_zone_file(&written, "example.com.").expect("re-parse");
-        assert_eq!(reread.query("example.com.", rt::NS)[0].rdata, ns);
+        assert_eq!(reread.query("example.com.", Qtype::of(rt::NS))[0].rdata, ns);
     }
 
     #[test]
@@ -647,8 +667,8 @@ mod tests {
         let mut zone = Zone::new("example.com.".to_string());
         zone.add_record(ZoneRecord {
             name: "ch.example.com.".to_string(),
-            ttl: 300,
-            class: 3,
+            ttl: Ttl::from_secs(300),
+            class: Class::new(3),
             rdata: RecordData::from_parsed(&ParsedRecord::TXT(vec![b"chaos".to_vec()]))
                 .expect("encode"),
         });
@@ -657,8 +677,8 @@ mod tests {
         let mut unknown = Zone::new("example.com.".to_string());
         unknown.add_record(ZoneRecord {
             name: "x.example.com.".to_string(),
-            ttl: 300,
-            class: 42,
+            ttl: Ttl::from_secs(300),
+            class: Class::new(42),
             rdata: RecordData::from_parsed(&ParsedRecord::TXT(vec![b"x".to_vec()]))
                 .expect("encode"),
         });
@@ -685,7 +705,10 @@ mod tests {
         write_zone_file(&zone, &path).expect("write");
         let reloaded = crate::zone::parse_zone_file_at(&path, "example.com.").expect("reload");
         assert_eq!(reloaded.serial(), Some(7));
-        assert_eq!(reloaded.query("www.example.com.", rt::A).len(), 1);
+        assert_eq!(
+            reloaded.query("www.example.com.", Qtype::of(rt::A)).len(),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

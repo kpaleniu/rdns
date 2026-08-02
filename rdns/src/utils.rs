@@ -8,75 +8,74 @@
 //! - Record type constants and conversion
 
 use crate::error::{DnssecError, DnssecResult};
-use crate::{ParsedRecord, RecordData};
+use crate::{ParsedRecord, RecordData, Rtype};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// DNS record type constants
 pub mod record_types {
+    use crate::Rtype;
     /// A record (IPv4 address)
-    pub const A: u16 = 1;
+    pub const A: Rtype = Rtype::new(1);
     /// NS record (nameserver)
-    pub const NS: u16 = 2;
+    pub const NS: Rtype = Rtype::new(2);
     /// CNAME record (canonical name)
-    pub const CNAME: u16 = 5;
+    pub const CNAME: Rtype = Rtype::new(5);
     /// SOA record (start of authority)
-    pub const SOA: u16 = 6;
+    pub const SOA: Rtype = Rtype::new(6);
     /// PTR record (pointer)
-    pub const PTR: u16 = 12;
+    pub const PTR: Rtype = Rtype::new(12);
     /// MX record (mail exchange)
-    pub const MX: u16 = 15;
+    pub const MX: Rtype = Rtype::new(15);
     /// TXT record (text)
-    pub const TXT: u16 = 16;
+    pub const TXT: Rtype = Rtype::new(16);
     /// AAAA record (IPv6 address)
-    pub const AAAA: u16 = 28;
+    pub const AAAA: Rtype = Rtype::new(28);
     /// DS record (delegation signer)
-    pub const DS: u16 = 43;
+    pub const DS: Rtype = Rtype::new(43);
     /// RRSIG record (DNSSEC signature)
-    pub const RRSIG: u16 = 46;
+    pub const RRSIG: Rtype = Rtype::new(46);
     /// NSEC record (next secure)
-    pub const NSEC: u16 = 47;
+    pub const NSEC: Rtype = Rtype::new(47);
     /// DNSKEY record (DNSSEC key)
-    pub const DNSKEY: u16 = 48;
+    pub const DNSKEY: Rtype = Rtype::new(48);
     /// NSEC3 record (next secure v3)
-    pub const NSEC3: u16 = 50;
+    pub const NSEC3: Rtype = Rtype::new(50);
     /// NSEC3PARAM — the salt and iteration count a zone's NSEC3 chain was built
     /// with, published at the apex so an authoritative server can find the chain
     /// it is meant to answer from (RFC 5155 §4). It carries no names and is
     /// stored as opaque RDATA rather than parsed, which is why there is no
     /// `ParsedRecord` arm for it.
-    pub const NSEC3PARAM: u16 = 51;
+    pub const NSEC3PARAM: Rtype = Rtype::new(51);
     /// AXFR — a whole-zone transfer. A QTYPE only: no record ever has this type,
     /// and it is defined over TCP alone (RFC 5936).
-    pub const AXFR: u16 = 252;
+    pub const AXFR: Rtype = Rtype::new(252);
+    /// The raw code, so [`crate::Rtype::is_meta`] and [`crate::Qtype`]'s
+    /// constants can be `const` without a second registry of numbers.
+    pub const AXFR_CODE: u16 = 252;
     /// IXFR — an incremental transfer (RFC 1995). A QTYPE only, and the one
     /// request that carries a record of its own: the client's SOA, in the
     /// authority section, saying which version it already holds.
-    pub const IXFR: u16 = 251;
+    pub const IXFR: Rtype = Rtype::new(251);
+    /// The raw code, so [`crate::Rtype::is_meta`] and [`crate::Qtype`]'s
+    /// constants can be `const` without a second registry of numbers.
+    pub const IXFR_CODE: u16 = 251;
     /// ANY (`*`) — also a QTYPE only.
-    pub const ANY: u16 = 255;
+    pub const ANY: Rtype = Rtype::new(255);
+    /// The raw code, so [`crate::Rtype::is_meta`] and [`crate::Qtype`]'s
+    /// constants can be `const` without a second registry of numbers.
+    pub const ANY_CODE: u16 = 255;
 }
 
-/// Normalize a domain name to lowercase and remove trailing dot
-///
-/// # Examples
-/// ```ignore
-/// assert_eq!(normalize_domain_name("EXAMPLE.COM."), "example.com");
-/// assert_eq!(normalize_domain_name("Example.com"), "example.com");
-/// ```
-pub fn normalize_domain_name(name: &str) -> String {
-    name.to_lowercase().trim_end_matches('.').to_string()
-}
-
-/// Compare two domain names for equality after normalization
-///
-/// # Examples
-/// ```ignore
-/// assert!(normalize_domain_name_for_comparison("EXAMPLE.COM.", "example.com"));
-/// assert!(normalize_domain_name_for_comparison("Example.Com", "EXAMPLE.COM."));
-/// ```
-pub fn normalize_domain_name_for_comparison(a: &str, b: &str) -> bool {
-    normalize_domain_name(a) == normalize_domain_name(b)
-}
+// `normalize_domain_name` and `normalize_domain_name_for_comparison` used to be
+// here, and they were the trap this module also documents the cure for: their
+// body was `name.to_lowercase()`, the full Unicode fold, which turns U+212A
+// KELVIN SIGN into `k` and so makes two names that differ on the wire compare
+// equal (RFC 4343, `CLAUDE.md` §8 — and see [`ascii_lowered`] below, which
+// spends a paragraph saying why). Nothing outside their own tests ever called
+// them, but they had the obvious name, which is worse than useless: the next
+// module to need this would have reached for them. Deleted rather than fixed —
+// [`names_equal`] and [`absolute_lowered`] are what they should have been, and
+// two functions doing this is how the count got to nine (`TODO.md` #13b).
 
 /// WSAEMSGSIZE: the datagram was larger than the buffer offered for it.
 ///
@@ -179,9 +178,76 @@ pub fn ascii_lowered_cow(name: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Whether two names are the same name, by the rules DNS compares them with:
+/// ASCII case folding (RFC 4343) and a trailing dot that is optional on either
+/// side.
+///
+/// **Allocation-free, and that is the point of it being here.** This was
+/// `resolver::names_equal`, written as `normalize(a) == normalize(b)` where
+/// `normalize` is `to_ascii_lowercase` plus a `format!` — so every comparison
+/// built two `String`s and dropped them, inside `.any()` loops over an answer
+/// section. Comparing is not the same operation as producing a normalized name,
+/// and only the latter needs to allocate.
+///
+/// `eq_ignore_ascii_case` is the whole of the fold: the octets 0x41-0x5A match
+/// 0x61-0x7A and every other byte matches only itself, which is exactly what
+/// RFC 4343 says and exactly what `to_lowercase` does not do.
+pub fn names_equal(a: &str, b: &str) -> bool {
+    let a = a.strip_suffix('.').unwrap_or(a);
+    let b = b.strip_suffix('.').unwrap_or(b);
+    a.eq_ignore_ascii_case(b)
+}
+
+/// A name in absolute, ASCII-lowercased form — the shape comparisons and map
+/// keys in this crate assume.
+///
+/// Borrows when the name is already both, which is every name that arrived off
+/// the wire from a client that does not use 0x20 encoding. This was written
+/// twice, identically, as a private `normalize` in `resolver` and in
+/// `special_names`, and both allocated unconditionally (`TODO.md` #13b).
+///
+/// Not to be confused with [`crate::zone::absolutize`], which resolves a
+/// *relative* zone-file name against an origin. This one has no origin to
+/// resolve against: it appends the root dot and nothing more, which is the
+/// right operation for a name that is already fully qualified but may have been
+/// written without its final dot.
+pub fn absolute_lowered(name: &str) -> std::borrow::Cow<'_, str> {
+    let needs_dot = !name.ends_with('.');
+    let needs_fold = name.bytes().any(|b| b.is_ascii_uppercase());
+    if !needs_dot && !needs_fold {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    let mut owned = String::with_capacity(name.len() + usize::from(needs_dot));
+    owned.push_str(name);
+    owned.make_ascii_lowercase();
+    if needs_dot {
+        owned.push('.');
+    }
+    std::borrow::Cow::Owned(owned)
+}
+
+/// How many labels a name has, the root (`.`) being zero. `example.com.` is 2.
+///
+/// Neither case folding nor the trailing dot changes the answer, so this does
+/// neither — the version this replaced called `normalize` first and paid an
+/// allocation to count something normalization cannot affect.
+pub fn label_count(name: &str) -> usize {
+    let trimmed = name.trim_end_matches('.');
+    if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.split('.').count()
+    }
+}
+
 /// Whether `name` is `origin` or sits below it — "is this name in that zone",
-/// which every part of this codebase has to ask and two of them used to answer
-/// separately.
+/// which every part of this codebase has to ask and which **four** of them used
+/// to answer separately: this one, `zone`'s caller, `special_names::in_zone`
+/// (which built a `format!(".{zone}")` per call) and `resolver::is_subdomain`
+/// (which normalized both sides into fresh `String`s and *then* built the
+/// `format!`, three allocations to answer a question about bytes). All of them
+/// got the label-boundary rule right, which is the only reason folding them in
+/// was a cleanup rather than a finding (`TODO.md` #13b).
 ///
 /// **A suffix match is not enough**, and getting that wrong is how a server
 /// answers for somebody else's zone: `notexample.com.` ends with `example.com.`
@@ -278,7 +344,7 @@ pub fn extract_dnskey_fields(key: &ParsedRecord) -> DnssecResult<(u8, Vec<u8>, u
 ///
 /// The type code is carried directly on [`RecordData`], so this is just an
 /// accessor kept for call-site compatibility.
-pub fn record_type_code(rdata: &RecordData) -> u16 {
+pub fn record_type_code(rdata: &RecordData) -> Rtype {
     rdata.rtype
 }
 
@@ -292,10 +358,10 @@ pub fn record_type_code(rdata: &RecordData) -> u16 {
 /// ```ignore
 /// assert_eq!(record_type_name_to_code("A"), Some(1));
 /// assert_eq!(record_type_name_to_code("MX"), Some(15));
-/// assert_eq!(record_type_name_to_code("TYPE1234"), Some(1234));
+/// assert_eq!(record_type_name_to_code("TYPE1234"), Some(Rtype::new(1234)));
 /// assert_eq!(record_type_name_to_code("UNKNOWN"), None);
 /// ```
-pub fn record_type_name_to_code(kind: &str) -> Option<u16> {
+pub fn record_type_name_to_code(kind: &str) -> Option<Rtype> {
     match kind {
         "A" => Some(record_types::A),
         "NS" => Some(record_types::NS),
@@ -313,14 +379,15 @@ pub fn record_type_name_to_code(kind: &str) -> Option<u16> {
         other => other
             .strip_prefix("TYPE")
             .or_else(|| other.strip_prefix("type"))
-            .and_then(|n| n.parse::<u16>().ok()),
+            .and_then(|n| n.parse::<u16>().ok())
+            .map(Rtype::new),
     }
 }
 
 /// The mnemonic for a type code, or its `TYPEnnn` form (RFC 3597 §5) when this
 /// library has none. Always a name the parser reads back, which is what the zone
 /// writer relies on.
-pub fn record_type_name(code: u16) -> String {
+pub fn record_type_name(code: Rtype) -> String {
     match code {
         record_types::A => "A".to_string(),
         record_types::NS => "NS".to_string(),
@@ -335,7 +402,7 @@ pub fn record_type_name(code: u16) -> String {
         record_types::RRSIG => "RRSIG".to_string(),
         record_types::NSEC => "NSEC".to_string(),
         record_types::NSEC3 => "NSEC3".to_string(),
-        other => format!("TYPE{other}"),
+        other => format!("TYPE{}", other.to_u16()),
     }
 }
 
@@ -343,32 +410,73 @@ pub fn record_type_name(code: u16) -> String {
 mod tests {
     use super::*;
 
+    /// The replacement for `normalize_domain_name_for_comparison`, holding the
+    /// same answers it did — plus the one it got wrong.
     #[test]
-    fn test_normalize_domain_name_lowercase() {
-        assert_eq!(normalize_domain_name("EXAMPLE.COM."), "example.com");
-        assert_eq!(normalize_domain_name("Example.Com"), "example.com");
+    fn names_are_equal_by_ascii_folding_and_an_optional_trailing_dot() {
+        assert!(names_equal("EXAMPLE.COM.", "example.com"));
+        assert!(names_equal("Example.Com", "EXAMPLE.COM."));
+        assert!(names_equal("example.com.", "example.com."));
+        assert!(!names_equal("example.com.", "other.com."));
+
+        // The root, written either way.
+        assert!(names_equal(".", "."));
+        assert!(names_equal(".", ""));
+
+        // A suffix is not a name: this is the `notexample.com.` rule that
+        // `is_at_or_under` exists for, and equality must not blur it.
+        assert!(!names_equal("notexample.com.", "example.com."));
+
+        // The fold is ASCII only (RFC 4343). U+212A KELVIN SIGN lowercases to
+        // `k` under Unicode, and the function this replaced used `to_lowercase`
+        // — so it answered `true` here, merging two names that are different
+        // bytes on the wire.
+        assert!(!names_equal("\u{212A}.example.com.", "k.example.com."));
     }
 
+    /// Absolute and folded, borrowing when it is already both.
     #[test]
-    fn test_normalize_domain_name_trailing_dot() {
-        assert_eq!(normalize_domain_name("example.com."), "example.com");
-        assert_eq!(normalize_domain_name("example.com"), "example.com");
+    fn absolute_lowering_copies_only_when_it_has_something_to_do() {
+        use std::borrow::Cow;
+        assert!(matches!(
+            absolute_lowered("www.example.com."),
+            Cow::Borrowed("www.example.com.")
+        ));
+        assert!(matches!(
+            absolute_lowered("www.example.com"),
+            Cow::Owned(ref n) if n == "www.example.com."
+        ));
+        assert!(matches!(
+            absolute_lowered("WWW.Example.COM."),
+            Cow::Owned(ref n) if n == "www.example.com."
+        ));
+        assert!(matches!(
+            absolute_lowered("WWW.Example.COM"),
+            Cow::Owned(ref n) if n == "www.example.com."
+        ));
+        // The empty name is the root, and gets the dot that says so.
+        assert_eq!(absolute_lowered(""), ".");
+        assert!(matches!(absolute_lowered("."), Cow::Borrowed(".")));
+
+        // U+212A is upper case to `char::is_uppercase` and not to
+        // `u8::is_ascii_uppercase`, so it takes the borrowing arm and is left
+        // alone — the same rule [`ascii_lowered_cow`] obeys.
+        assert!(matches!(
+            absolute_lowered("\u{212A}.example.com."),
+            Cow::Borrowed("\u{212A}.example.com.")
+        ));
     }
 
+    /// Counting labels needs neither the fold nor the dot, which is why the
+    /// version this replaced allocated for nothing.
     #[test]
-    fn test_normalize_domain_name_for_comparison() {
-        assert!(normalize_domain_name_for_comparison(
-            "EXAMPLE.COM.",
-            "example.com"
-        ));
-        assert!(normalize_domain_name_for_comparison(
-            "Example.Com",
-            "EXAMPLE.COM."
-        ));
-        assert!(!normalize_domain_name_for_comparison(
-            "example.com.",
-            "other.com."
-        ));
+    fn label_count_ignores_case_and_the_trailing_dot() {
+        assert_eq!(label_count("."), 0);
+        assert_eq!(label_count(""), 0);
+        assert_eq!(label_count("com."), 1);
+        assert_eq!(label_count("example.com"), 2);
+        assert_eq!(label_count("www.example.com."), 3);
+        assert_eq!(label_count("WWW.Example.COM."), 3);
     }
 
     #[test]
@@ -488,8 +596,8 @@ mod tests {
 
     #[test]
     fn test_record_type_code_unknown() {
-        let unknown = RecordData::from_parsed(&ParsedRecord::Unknown(99)).unwrap();
-        assert_eq!(record_type_code(&unknown), 99);
+        let unknown = RecordData::from_parsed(&ParsedRecord::Unknown(Rtype::new(99))).unwrap();
+        assert_eq!(record_type_code(&unknown), Rtype::new(99));
     }
 
     #[test]
@@ -508,16 +616,16 @@ mod tests {
     /// have no mnemonic for from being unwritable.
     #[test]
     fn test_generic_type_names_round_trip() {
-        assert_eq!(record_type_name_to_code("TYPE1234"), Some(1234));
+        assert_eq!(record_type_name_to_code("TYPE1234"), Some(Rtype::new(1234)));
         assert_eq!(record_type_name_to_code("TYPE1"), Some(record_types::A));
-        assert_eq!(record_type_name(1234), "TYPE1234");
+        assert_eq!(record_type_name(Rtype::new(1234)), "TYPE1234");
         assert_eq!(record_type_name(record_types::A), "A");
 
         for code in [1u16, 15, 50, 99, 257, 65535] {
-            let name = record_type_name(code);
+            let name = record_type_name(Rtype::new(code));
             assert_eq!(
                 record_type_name_to_code(&name),
-                Some(code),
+                Some(Rtype::new(code)),
                 "{name} should read back as {code}"
             );
         }
@@ -654,18 +762,18 @@ mod tests {
 
     #[test]
     fn test_record_types_constants() {
-        assert_eq!(record_types::A, 1);
-        assert_eq!(record_types::NS, 2);
-        assert_eq!(record_types::CNAME, 5);
-        assert_eq!(record_types::SOA, 6);
-        assert_eq!(record_types::PTR, 12);
-        assert_eq!(record_types::MX, 15);
-        assert_eq!(record_types::TXT, 16);
-        assert_eq!(record_types::AAAA, 28);
-        assert_eq!(record_types::DS, 43);
-        assert_eq!(record_types::RRSIG, 46);
-        assert_eq!(record_types::NSEC, 47);
-        assert_eq!(record_types::DNSKEY, 48);
-        assert_eq!(record_types::NSEC3, 50);
+        assert_eq!(record_types::A, record_types::A);
+        assert_eq!(record_types::NS, record_types::NS);
+        assert_eq!(record_types::CNAME, record_types::CNAME);
+        assert_eq!(record_types::SOA, record_types::SOA);
+        assert_eq!(record_types::PTR, record_types::PTR);
+        assert_eq!(record_types::MX, record_types::MX);
+        assert_eq!(record_types::TXT, record_types::TXT);
+        assert_eq!(record_types::AAAA, record_types::AAAA);
+        assert_eq!(record_types::DS, record_types::DS);
+        assert_eq!(record_types::RRSIG, record_types::RRSIG);
+        assert_eq!(record_types::NSEC, record_types::NSEC);
+        assert_eq!(record_types::DNSKEY, record_types::DNSKEY);
+        assert_eq!(record_types::NSEC3, record_types::NSEC3);
     }
 }

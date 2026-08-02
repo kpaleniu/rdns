@@ -1,4 +1,5 @@
 use crate::utils::current_unix_timestamp;
+use crate::Qtype;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -131,7 +132,7 @@ pub struct QueryStats {
     pub queries_by_ip: HashMap<IpAddr, u64>,
     /// Per-record-type query counts. Bounded by the key space: there are only
     /// 65536 possible types, and no map of them is a DoS.
-    pub queries_by_type: HashMap<u16, u64>,
+    pub queries_by_type: HashMap<Qtype, u64>,
     /// IPs with rate limiting triggered, bounded the same way.
     pub rate_limited_ips: HashMap<IpAddr, u64>,
     /// Queries from sources there was no room to count individually.
@@ -232,7 +233,7 @@ impl QueryLogger {
     }
 
     /// Log a successful query
-    pub fn log_query(&self, ip: IpAddr, query_type: Option<u16>) {
+    pub fn log_query(&self, ip: IpAddr, query_type: Option<Qtype>) {
         let now = current_unix_timestamp();
 
         let Some(mut inner) = self.locked() else {
@@ -409,6 +410,7 @@ impl Default for QueryLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::record_types as rt;
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
@@ -416,15 +418,15 @@ mod tests {
         let logger = QueryLogger::new();
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
-        logger.log_query(ip, Some(1));
-        logger.log_query(ip, Some(1));
-        logger.log_query(ip, Some(28));
+        logger.log_query(ip, Some(Qtype::of(rt::A)));
+        logger.log_query(ip, Some(Qtype::of(rt::A)));
+        logger.log_query(ip, Some(Qtype::of(rt::AAAA)));
 
         let stats = logger.get_stats();
         assert_eq!(stats.total_queries, 3);
         assert_eq!(*stats.queries_by_ip.get(&ip).unwrap(), 3);
-        assert_eq!(*stats.queries_by_type.get(&1u16).unwrap(), 2);
-        assert_eq!(*stats.queries_by_type.get(&28u16).unwrap(), 1);
+        assert_eq!(*stats.queries_by_type.get(&Qtype::of(rt::A)).unwrap(), 2);
+        assert_eq!(*stats.queries_by_type.get(&Qtype::of(rt::AAAA)).unwrap(), 1);
     }
 
     #[test]
@@ -457,7 +459,7 @@ mod tests {
         let logger = QueryLogger::new();
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
-        logger.log_query(ip, Some(1));
+        logger.log_query(ip, Some(Qtype::of(rt::A)));
         logger.count_error(ip);
 
         logger.reset_stats();
@@ -479,7 +481,7 @@ mod tests {
         for i in 0..(MAX_TRACKED_SOURCES as u32 * 3) {
             logger.log_query(
                 IpAddr::V4(std::net::Ipv4Addr::from(i.wrapping_mul(2_654_435_761))),
-                Some(1),
+                Some(Qtype::of(rt::A)),
             );
             logger.log_rate_limited(IpAddr::V4(std::net::Ipv4Addr::from(i ^ 0xDEAD_BEEF)));
         }
@@ -508,12 +510,12 @@ mod tests {
         let logger = QueryLogger::new();
         let heavy = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         for _ in 0..1_000 {
-            logger.log_query(heavy, Some(1));
+            logger.log_query(heavy, Some(Qtype::of(rt::A)));
         }
         for i in 0..(MAX_TRACKED_SOURCES as u32 * 2) {
             logger.log_query(
                 IpAddr::V4(std::net::Ipv4Addr::from(i.wrapping_mul(2_654_435_761) | 1)),
-                Some(1),
+                Some(Qtype::of(rt::A)),
             );
         }
 
@@ -576,17 +578,17 @@ mod tests {
 
         let start = Instant::now();
         for _ in 0..batch {
-            logger.log_query(ip, Some(1));
+            logger.log_query(ip, Some(Qtype::of(rt::A)));
         }
         let shallow = start.elapsed();
 
         for _ in 0..depth {
-            logger.log_query(ip, Some(1));
+            logger.log_query(ip, Some(Qtype::of(rt::A)));
         }
 
         let start = Instant::now();
         for _ in 0..batch {
-            logger.log_query(ip, Some(1));
+            logger.log_query(ip, Some(Qtype::of(rt::A)));
         }
         let deep = start.elapsed();
 
@@ -627,9 +629,9 @@ mod tests {
         let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
-        logger.log_query(ip1, Some(1));
-        logger.log_query(ip2, Some(1));
-        logger.log_query(ip2, Some(1));
+        logger.log_query(ip1, Some(Qtype::of(rt::A)));
+        logger.log_query(ip2, Some(Qtype::of(rt::A)));
+        logger.log_query(ip2, Some(Qtype::of(rt::A)));
 
         let stats = logger.get_stats();
         assert_eq!(*stats.queries_by_ip.get(&ip1).unwrap(), 1);

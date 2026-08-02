@@ -19,6 +19,7 @@
 //! stale, with the AA bit claiming otherwise (RFC 1035 §3.3.13, RFC 1912 §2.2).
 
 use crate::error::{ConfigError, ConfigResult};
+use crate::Qtype;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -83,7 +84,7 @@ impl RefreshTimers {
 
     /// The timers from a zone's apex SOA, if it has one.
     pub fn from_zone(zone: &Zone) -> Option<Self> {
-        zone.query(zone.origin(), rt::SOA)
+        zone.query(zone.origin(), Qtype::of(rt::SOA))
             .first()
             .and_then(|soa| match soa.rdata.parse() {
                 Ok(ParsedRecord::SOA {

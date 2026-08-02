@@ -9,8 +9,6 @@ description = "DNS library: wire codec, zone files, caching, resolver and DNSSEC
 [dependencies]
 thiserror = "2.0"
 rand = "0.8"
-num-traits = "0.2"
-num-derive = "0.4"
 
 # DNSSEC crypto
 ring = "0.17"

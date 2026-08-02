@@ -37,6 +37,10 @@ use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
 use crate::utils::record_types as rt;
 use crate::zone::{Zone, ZoneRecord};
+use crate::Class;
+use crate::Qtype;
+use crate::Rtype;
+use crate::Ttl;
 use crate::{ParsedRecord, RecordData};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -193,7 +197,7 @@ impl SigningPolicy {
     ///
     /// Never later than [`Self::expiration`]: an operator who asked for 30 days
     /// gets at most 30 days, never 35.
-    pub fn expiry_for(&self, name: &str, rtype: u16) -> u32 {
+    pub fn expiry_for(&self, name: &str, rtype: Rtype) -> u32 {
         let spread = self.validity / EXPIRY_JITTER_FRACTION;
         if spread == 0 {
             return self.expiration;
@@ -208,7 +212,7 @@ impl SigningPolicy {
             .as_bytes()
             .iter()
             .copied()
-            .chain(rtype.to_be_bytes().iter().copied())
+            .chain(rtype.to_u16().to_be_bytes().iter().copied())
         {
             hash ^= u64::from(byte.to_ascii_lowercase());
             hash = hash.wrapping_mul(0x100_0000_01b3);
@@ -309,14 +313,14 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
         signed.add_record(ZoneRecord {
             name: origin.clone(),
             ttl: dnskey_ttl,
-            class: 1,
+            class: Class::new(1),
             rdata: nsec3param_rdata(salt, *iterations),
         });
     }
 
     let layout = Layout::of(&signed, &origin);
 
-    let denial_ttl = minimum.min(i32::MAX as u32) as i32;
+    let denial_ttl = Ttl::from_secs(minimum);
     match &policy.chain {
         DenialChain::Nsec => build_nsec_chain(&layout, denial_ttl, &mut signed)?,
         DenialChain::Nsec3 {
@@ -368,22 +372,22 @@ fn carry_over_records(
     origin: &str,
     policy: &SigningPolicy,
     signed: &mut Zone,
-) -> Result<(i32, u32)> {
-    let mut soa: Option<(i32, u32)> = None;
+) -> Result<(Ttl, u32)> {
+    let mut soa: Option<(Ttl, u32)> = None;
     // The TTL an RRset is signed with has to be one number (RFC 4034 §3.1.3
     // stores it in the RRSIG so a validator can restore it), and RFC 2181 §5.2
     // requires the records to agree on it anyway. Where they do not, the
     // smallest wins: a record cannot be made to live longer than its RRset was
     // told to, and taking the largest would publish data past the point some
     // record of it was meant to expire.
-    let mut ttls: BTreeMap<(String, u16), i32> = BTreeMap::new();
+    let mut ttls: BTreeMap<(String, Rtype), Ttl> = BTreeMap::new();
     let mut carried: Vec<ZoneRecord> = Vec::new();
 
     for record in zone.records() {
         if is_signer_output(record.rdata.rtype) {
             continue;
         }
-        if record.class != 1 {
+        if record.class != Class::new(1) {
             return Err(DnssecError::signing(format!(
                 "{} carries class {}, and DNSSEC is defined per class — a zone mixing them has \
                  no single chain to sign",
@@ -452,7 +456,7 @@ fn carry_over_records(
 }
 
 /// Records this signer generates, and therefore replaces rather than preserves.
-fn is_signer_output(rtype: u16) -> bool {
+fn is_signer_output(rtype: Rtype) -> bool {
     matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3 | rt::NSEC3PARAM)
 }
 
@@ -461,16 +465,16 @@ fn is_signer_output(rtype: u16) -> bool {
 /// A key already in the zone with identical RDATA is left where it is rather
 /// than duplicated — that is the same key, and an RRset holding it twice is one
 /// a validator has to de-duplicate before it can verify anything.
-fn publish_dnskeys(keys: &[SigningKey], origin: &str, soa_ttl: i32, signed: &mut Zone) -> i32 {
+fn publish_dnskeys(keys: &[SigningKey], origin: &str, soa_ttl: Ttl, signed: &mut Zone) -> Ttl {
     let existing: Vec<RecordData> = signed
-        .query(origin, rt::DNSKEY)
+        .query(origin, Qtype::of(rt::DNSKEY))
         .iter()
         .map(|r| r.rdata.clone())
         .collect();
     // An RRset has one TTL: keys already published set it, since changing it
     // would be changing records the operator put there.
     let ttl = signed
-        .query(origin, rt::DNSKEY)
+        .query(origin, Qtype::of(rt::DNSKEY))
         .first()
         .map(|r| r.ttl)
         .unwrap_or(soa_ttl);
@@ -483,7 +487,7 @@ fn publish_dnskeys(keys: &[SigningKey], origin: &str, soa_ttl: i32, signed: &mut
         signed.add_record(ZoneRecord {
             name: origin.to_string(),
             ttl,
-            class: 1,
+            class: Class::new(1),
             rdata,
         });
     }
@@ -498,7 +502,7 @@ fn publish_dnskeys(keys: &[SigningKey], origin: &str, soa_ttl: i32, signed: &mut
 #[derive(Debug, Default, Clone)]
 struct NameEntry {
     /// The types with records at this name, whether or not they are signed.
-    types: BTreeSet<u16>,
+    types: BTreeSet<Rtype>,
     /// A non-apex NS RRset: the zone stops here.
     is_delegation: bool,
     /// Below a delegation, so present in the file but not in the zone.
@@ -517,7 +521,7 @@ impl NameEntry {
     /// authoritative data, so an A record at the delegation point is invisible
     /// to the chain even though the zone file holds it and the server hands it
     /// out as a hint.
-    fn published_types(&self) -> BTreeSet<u16> {
+    fn published_types(&self) -> BTreeSet<Rtype> {
         if self.is_delegation {
             let mut types = BTreeSet::from([rt::NS]);
             if self.types.contains(&rt::DS) {
@@ -654,7 +658,7 @@ fn is_at_or_under(name: &str, origin: &str) -> bool {
 // The denial chains
 // ---------------------------------------------------------------------------
 
-fn build_nsec_chain(layout: &Layout, ttl: i32, signed: &mut Zone) -> Result<()> {
+fn build_nsec_chain(layout: &Layout, ttl: Ttl, signed: &mut Zone) -> Result<()> {
     let names = layout.chain_names(false);
     for (index, name) in names.iter().enumerate() {
         // The last name points back at the apex, closing the loop — which is
@@ -674,7 +678,7 @@ fn build_nsec_chain(layout: &Layout, ttl: i32, signed: &mut Zone) -> Result<()> 
         signed.add_record(ZoneRecord {
             name: name.clone(),
             ttl,
-            class: 1,
+            class: Class::new(1),
             rdata,
         });
     }
@@ -686,7 +690,7 @@ fn build_nsec3_chain(
     salt: &[u8],
     iterations: u16,
     opt_out: bool,
-    ttl: i32,
+    ttl: Ttl,
     signed: &mut Zone,
 ) -> Result<()> {
     let mut hashed: Vec<(Vec<u8>, String)> = Vec::new();
@@ -735,7 +739,7 @@ fn build_nsec3_chain(
                 layout.origin
             ),
             ttl,
-            class: 1,
+            class: Class::new(1),
             rdata,
         });
     }
@@ -785,7 +789,7 @@ fn sign_everything(
     let data_signers = if rest.is_empty() { &all } else { &rest };
 
     // (owner, type) -> the RDATA of that RRset, in the order they were added.
-    let mut rrsets: BTreeMap<(String, u16), (i32, Vec<RecordData>)> = BTreeMap::new();
+    let mut rrsets: BTreeMap<(String, Rtype), (Ttl, Vec<RecordData>)> = BTreeMap::new();
     for record in signed.records() {
         let name = record.name.to_ascii_lowercase();
         let entry = rrsets
@@ -805,8 +809,8 @@ fn sign_everything(
         } else {
             data_signers
         };
-        let original_ttl = ttl.max(0) as u32;
-        let rrset = Rrset::new(&name, rtype, 1, &rdatas);
+        let original_ttl = ttl.as_secs();
+        let rrset = Rrset::new(&name, rtype, Class::new(1), &rdatas);
         // Spread this RRset's expiry back from the window's end, so the zone
         // degrades over a slope rather than expiring as one cliff. Deterministic
         // per (owner, type) — see `SigningPolicy::expiry_for`.
@@ -820,7 +824,7 @@ fn sign_everything(
             signatures.push(ZoneRecord {
                 name: name.clone(),
                 ttl,
-                class: 1,
+                class: Class::new(1),
                 rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
                     type_covered: sig.type_covered,
                     algorithm: sig.algorithm,
@@ -844,7 +848,7 @@ fn sign_everything(
 }
 
 /// Whether this RRset is one the zone is authoritative for, and so must sign.
-fn signable(entry: &NameEntry, name: &str, rtype: u16, origin: &str) -> bool {
+fn signable(entry: &NameEntry, name: &str, rtype: Rtype, origin: &str) -> bool {
     if rtype == rt::RRSIG {
         // A signature over a signature says nothing: a validator checks an
         // RRSIG against a key, never against another RRSIG.
@@ -1115,8 +1119,8 @@ ns.plain IN A  192.0.2.40
     }
 
     /// Every RRset in the zone, grouped as the signer groups them.
-    fn rrsets(zone: &Zone) -> BTreeMap<(String, u16), Vec<RecordData>> {
-        let mut out: BTreeMap<(String, u16), Vec<RecordData>> = BTreeMap::new();
+    fn rrsets(zone: &Zone) -> BTreeMap<(String, Rtype), Vec<RecordData>> {
+        let mut out: BTreeMap<(String, Rtype), Vec<RecordData>> = BTreeMap::new();
         for record in zone.records() {
             out.entry((record.name.clone(), record.rdata.rtype))
                 .or_default()
@@ -1125,9 +1129,9 @@ ns.plain IN A  192.0.2.40
         out
     }
 
-    fn proof_for(zone: &Zone, name: &str, rtype: u16) -> RrsetProof {
+    fn proof_for(zone: &Zone, name: &str, rtype: Rtype) -> RrsetProof {
         let rdatas: Vec<RecordData> = zone
-            .query(name, rtype)
+            .query(name, Qtype::of(rtype))
             .iter()
             .map(|r| r.rdata.clone())
             .collect();
@@ -1137,7 +1141,7 @@ ns.plain IN A  192.0.2.40
             .filter(|s| s.owner == canonical_name(name))
             .collect();
         verify_rrset(
-            &Rrset::new(name, rtype, 1, &rdatas),
+            &Rrset::new(name, rtype, Class::new(1), &rdatas),
             &sigs,
             &published_keys(zone),
             ORIGIN,
@@ -1159,7 +1163,7 @@ ns.plain IN A  192.0.2.40
             }
             let at_name: Vec<_> = sigs.iter().filter(|s| s.owner == name).cloned().collect();
             let proof = verify_rrset(
-                &Rrset::new(&name, rtype, 1, &rdatas),
+                &Rrset::new(&name, rtype, Class::new(1), &rdatas),
                 &at_name,
                 &keys,
                 ORIGIN,
@@ -1205,7 +1209,9 @@ ns.plain IN A  192.0.2.40
     fn glue_below_a_delegation_is_served_but_neither_signed_nor_chained() {
         let zone = sign_test_zone(DenialChain::Nsec);
         assert!(
-            !zone.query("ns.secure.example.com.", rt::A).is_empty(),
+            !zone
+                .query("ns.secure.example.com.", Qtype::of(rt::A))
+                .is_empty(),
             "glue has to still be there to hand out"
         );
         assert!(matches!(
@@ -1213,7 +1219,8 @@ ns.plain IN A  192.0.2.40
             RrsetProof::Unsigned
         ));
         assert!(
-            zone.query("ns.secure.example.com.", rt::NSEC).is_empty(),
+            zone.query("ns.secure.example.com.", Qtype::of(rt::NSEC))
+                .is_empty(),
             "an occluded name has no place in the chain"
         );
     }
@@ -1284,7 +1291,7 @@ ns.plain IN A  192.0.2.40
                 // in the bitmap, while NSEC always is.
                 expected.remove(&rt::NSEC3);
 
-                let lists: Box<dyn Fn(u16) -> bool> = match &chain {
+                let lists: Box<dyn Fn(Rtype) -> bool> = match &chain {
                     DenialChain::Nsec => {
                         let Some(nsec) = nsecs.iter().find(|n| &n.owner == name) else {
                             panic!("{chain:?}: no NSEC at {name}");
@@ -1320,7 +1327,7 @@ ns.plain IN A  192.0.2.40
     fn the_apex_nsec3_lists_nsec3param() {
         let zone = sign_test_zone(DenialChain::nsec3());
         assert_eq!(
-            zone.query(ORIGIN, rt::NSEC3PARAM).len(),
+            zone.query(ORIGIN, Qtype::of(rt::NSEC3PARAM)).len(),
             1,
             "an NSEC3-signed zone publishes NSEC3PARAM at its apex (RFC 5155 §4)"
         );
@@ -1429,7 +1436,7 @@ ns.plain IN A  192.0.2.40
     fn a_wildcards_signature_carries_to_the_names_it_expands_to() {
         let zone = sign_test_zone(DenialChain::Nsec);
         let rdatas: Vec<RecordData> = zone
-            .query("*.example.com.", rt::A)
+            .query("*.example.com.", Qtype::of(rt::A))
             .iter()
             .map(|r| r.rdata.clone())
             .collect();
@@ -1446,7 +1453,7 @@ ns.plain IN A  192.0.2.40
         let mut expanded = sigs[0].clone();
         expanded.owner = "anything.example.com.".to_string();
         let proof = verify_rrset(
-            &Rrset::new("anything.example.com.", rt::A, 1, &rdatas),
+            &Rrset::new("anything.example.com.", rt::A, Class::new(1), &rdatas),
             &[expanded],
             &published_keys(&zone),
             ORIGIN,
@@ -1478,7 +1485,7 @@ ns.plain IN A  192.0.2.40
             iterations: 5,
             opt_out: false,
         });
-        let params = zone.query(ORIGIN, rt::NSEC3PARAM);
+        let params = zone.query(ORIGIN, Qtype::of(rt::NSEC3PARAM));
         assert_eq!(params.len(), 1, "one NSEC3PARAM at the apex");
         // Hash 1, flags 0, five iterations, a four-byte salt.
         assert_eq!(
@@ -1541,7 +1548,7 @@ ns.plain IN A  192.0.2.40
         .unwrap();
 
         let sigs = rrsigs_in(&resources(&zone));
-        let tags = |name: &str, rtype: u16| -> Vec<u16> {
+        let tags = |name: &str, rtype: Rtype| -> Vec<u16> {
             let mut tags: Vec<u16> = sigs
                 .iter()
                 .filter(|s| s.owner == name && s.type_covered == rtype)
@@ -1591,7 +1598,7 @@ ns.plain IN A  192.0.2.40
         let once = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).unwrap();
         let twice = sign_zone(&once, &keys, &policy(DenialChain::Nsec)).unwrap();
 
-        let count = |z: &Zone, rtype: u16| {
+        let count = |z: &Zone, rtype: Rtype| {
             z.records()
                 .iter()
                 .filter(|r| r.rdata.rtype == rtype)
@@ -1629,8 +1636,8 @@ ns.plain IN A  192.0.2.40
         let mut zone = Zone::new(ORIGIN.to_string());
         zone.add_record(ZoneRecord {
             name: "www.example.com.".to_string(),
-            ttl: 3600,
-            class: 1,
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.1".parse().unwrap())).unwrap(),
         });
         let err = sign_zone(&zone, &keys(), &policy(DenialChain::Nsec)).unwrap_err();
@@ -1655,8 +1662,8 @@ ns.plain IN A  192.0.2.40
         )
         .unwrap();
 
-        for record in zone.query("www.example.com.", rt::A) {
-            assert_eq!(record.ttl, 60);
+        for record in zone.query("www.example.com.", Qtype::of(rt::A)) {
+            assert_eq!(record.ttl, Ttl::from_secs(60));
         }
         let sig = rrsigs_in(&resources(&zone))
             .into_iter()

@@ -968,14 +968,15 @@ pub fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DnsMessage, OpCode, QueryClass, QuerySection, ResponseCode};
+    use crate::utils::record_types as rt;
+    use crate::{DnsMessage, OpCode, Qtype, QueryClass, QuerySection, ResponseCode, Rtype};
 
     fn test_key() -> TsigKey {
         // 32 bytes, the natural length for HMAC-SHA256.
         TsigKey::new("transfer.key.", TsigAlgorithm::HmacSha256, vec![0x0b; 32])
     }
 
-    fn query_bytes(qname: &str, qtype: u16) -> Vec<u8> {
+    fn query_bytes(qname: &str, qtype: Qtype) -> Vec<u8> {
         let msg = DnsMessage {
             id: 0x4d2,
             response: false,
@@ -995,6 +996,7 @@ mod tests {
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
+            edns: None,
         };
         let mut buf = vec![0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("serialize");
@@ -1005,6 +1007,57 @@ mod tests {
     // -----------------------------------------------------------------
     // Keys
     // -----------------------------------------------------------------
+
+    /// A message carrying **both** an OPT record and a TSIG must put the TSIG
+    /// last (RFC 8945 §5.1), and the OPT record's move out of `additionals`
+    /// (`TODO.md` #13d) is what makes that worth asserting.
+    ///
+    /// The invariant holds today for a reason that is not the serializer's
+    /// doing: `TSIG_TYPE` appears nowhere outside this module, `append_tsig`
+    /// works on finished bytes rather than on the struct, and `make_response`
+    /// and `error_bytes` both build `additionals: Vec::new()` — so no reply ever
+    /// carries a TSIG *through* `DnsMessage::to_bytes`. Nothing enforces it.
+    /// Since `to_bytes` now writes the OPT record after everything else in the
+    /// section, a future change that put a TSIG in the struct would silently put
+    /// OPT after it.
+    ///
+    /// This is a functional check rather than a byte-offset one: `strip_tsig`
+    /// and the scan in [`check_request`] both require the TSIG to be the last
+    /// record, so if OPT landed after it, verification fails.
+    #[test]
+    fn a_signed_message_with_edns_still_ends_in_its_tsig() {
+        let key = test_key();
+        let keyring = TsigKeyring::new(vec![key.clone()]);
+
+        let mut msg = DnsMessage::try_from_bytes(&query_bytes(
+            "www.example.com.",
+            Qtype::of(crate::utils::record_types::A),
+        ))
+        .expect("the query parses");
+        msg.set_edns(crate::Edns::with_payload_size(1232));
+        assert!(msg.edns().is_some(), "the message really carries an OPT");
+
+        let unsigned = msg.to_bytes_within(512).expect("serialize");
+        let signed = sign_request(unsigned, &key, 1_000).expect("sign");
+
+        match check_request(&signed, &keyring, 1_000) {
+            TsigCheck::Verified(_) => {}
+            other => panic!(
+                "a signed message carrying EDNS must verify; the TSIG has to be                  the last record and OPT is written before it. Got {}",
+                match other {
+                    TsigCheck::Unsigned => "no TSIG found at all".to_string(),
+                    TsigCheck::Rejected(r) => format!("rejected: {}", r.error.reason()),
+                    TsigCheck::Verified(_) => unreachable!(),
+                }
+            ),
+        }
+
+        // And the OPT record survived the signing, in its own field.
+        let parsed = DnsMessage::try_from_bytes(&signed).expect("the signed message parses");
+        assert!(parsed.edns().is_some(), "OPT survived");
+        assert_eq!(parsed.additionals.len(), 1, "the TSIG, and only it");
+        assert_eq!(parsed.additionals[0].rdata.rtype, Rtype::new(TSIG_TYPE));
+    }
 
     #[test]
     fn test_key_specs_parse() {
@@ -1135,13 +1188,13 @@ mod tests {
         let ring = TsigKeyring::new(vec![key.clone()]);
         let now = 1_800_000_000;
 
-        let signed = sign_request(query_bytes("example.com.", 252), &key, now).unwrap();
+        let signed = sign_request(query_bytes("example.com.", Qtype::AXFR), &key, now).unwrap();
 
         // It is still a parseable DNS message, with the TSIG in its additionals.
         let parsed = DnsMessage::try_from_bytes(&signed).expect("still a DNS message");
         assert_eq!(parsed.queries[0].qname, "example.com.");
         assert_eq!(parsed.additionals.len(), 1);
-        assert_eq!(parsed.additionals[0].rdata.rtype, TSIG_TYPE);
+        assert_eq!(parsed.additionals[0].rdata.rtype, Rtype::new(TSIG_TYPE));
 
         match check_request(&signed, &ring, now) {
             TsigCheck::Verified(session) => assert_eq!(session.key_name(), "transfer.key."),
@@ -1154,7 +1207,11 @@ mod tests {
     fn test_an_unsigned_request_is_unsigned_not_rejected() {
         let ring = TsigKeyring::new(vec![test_key()]);
         assert!(matches!(
-            check_request(&query_bytes("example.com.", 1), &ring, 1_800_000_000),
+            check_request(
+                &query_bytes("example.com.", Qtype::of(rt::A)),
+                &ring,
+                1_800_000_000
+            ),
             TsigCheck::Unsigned
         ));
     }
@@ -1166,7 +1223,7 @@ mod tests {
         let key = test_key();
         let ring = TsigKeyring::new(vec![key.clone()]);
         let now = 1_800_000_000;
-        let mut signed = sign_request(query_bytes("example.com.", 252), &key, now).unwrap();
+        let mut signed = sign_request(query_bytes("example.com.", Qtype::AXFR), &key, now).unwrap();
 
         signed[13] ^= 0x20; // 'e' -> 'E' in the question name
         match check_request(&signed, &ring, now) {
@@ -1184,7 +1241,7 @@ mod tests {
             vec![0x0c; 32],
         )]);
         let now = 1_800_000_000;
-        let signed = sign_request(query_bytes("example.com.", 252), &signer, now).unwrap();
+        let signed = sign_request(query_bytes("example.com.", Qtype::AXFR), &signer, now).unwrap();
         match check_request(&signed, &ring, now) {
             TsigCheck::Rejected(r) => assert_eq!(r.error, TsigError::BadSig),
             _ => panic!("the wrong secret must not verify"),
@@ -1195,7 +1252,7 @@ mod tests {
     fn test_an_unknown_key_is_badkey() {
         let key = test_key();
         let now = 1_800_000_000;
-        let signed = sign_request(query_bytes("example.com.", 252), &key, now).unwrap();
+        let signed = sign_request(query_bytes("example.com.", Qtype::AXFR), &key, now).unwrap();
         match check_request(&signed, &TsigKeyring::default(), now) {
             TsigCheck::Rejected(r) => {
                 assert_eq!(r.error, TsigError::BadKey);
@@ -1215,7 +1272,8 @@ mod tests {
         let key = test_key();
         let ring = TsigKeyring::new(vec![key.clone()]);
         let signed_at = 1_800_000_000;
-        let signed = sign_request(query_bytes("example.com.", 252), &key, signed_at).unwrap();
+        let signed =
+            sign_request(query_bytes("example.com.", Qtype::AXFR), &key, signed_at).unwrap();
 
         for skew in [DEFAULT_FUDGE as u64, 0] {
             assert!(
@@ -1245,7 +1303,7 @@ mod tests {
         let key = test_key();
         let ring = TsigKeyring::new(vec![key.clone()]);
         let now = 1_800_000_000;
-        let mut signed = sign_request(query_bytes("example.com.", 252), &key, now).unwrap();
+        let mut signed = sign_request(query_bytes("example.com.", Qtype::AXFR), &key, now).unwrap();
 
         // Append an A record after the TSIG and bump ARCOUNT.
         let extra = b"\x03www\x07example\x03com\x00\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04";
@@ -1266,7 +1324,7 @@ mod tests {
         let now = 1_800_000_000;
 
         // Sign, then shorten the MAC in place — RDLEN, MAC size and the MAC.
-        let signed = sign_request(query_bytes("example.com.", 252), &key, now).unwrap();
+        let signed = sign_request(query_bytes("example.com.", Qtype::AXFR), &key, now).unwrap();
         let (offset, rdata, owner) = find_tsig(&signed).unwrap();
         let mut tsig = Tsig::parse_rdata(&owner, rdata).unwrap();
         tsig.mac.truncate(16);
@@ -1291,7 +1349,7 @@ mod tests {
         let ring = TsigKeyring::new(vec![key.clone()]);
         let now = 1_800_000_000;
 
-        let request = sign_request(query_bytes("example.com.", 252), &key, now).unwrap();
+        let request = sign_request(query_bytes("example.com.", Qtype::AXFR), &key, now).unwrap();
         let request_mac = {
             let (_, rdata, owner) = find_tsig(&request).unwrap();
             Tsig::parse_rdata(&owner, rdata).unwrap().mac
@@ -1300,7 +1358,9 @@ mod tests {
             panic!("the request should verify");
         };
 
-        let response = session.sign(query_bytes("example.com.", 252), now).unwrap();
+        let response = session
+            .sign(query_bytes("example.com.", Qtype::AXFR), now)
+            .unwrap();
         check_response(&response, &key, &request_mac, true, now)
             .expect("the client should accept the reply");
 
@@ -1320,7 +1380,7 @@ mod tests {
         let ring = TsigKeyring::new(vec![key.clone()]);
         let now = 1_800_000_000;
 
-        let request = sign_request(query_bytes("example.com.", 252), &key, now).unwrap();
+        let request = sign_request(query_bytes("example.com.", Qtype::AXFR), &key, now).unwrap();
         let request_mac = {
             let (_, rdata, owner) = find_tsig(&request).unwrap();
             Tsig::parse_rdata(&owner, rdata).unwrap().mac
@@ -1332,7 +1392,7 @@ mod tests {
         let envelopes: Vec<Vec<u8>> = (0..3)
             .map(|i| {
                 session
-                    .sign(query_bytes(&format!("e{i}.example.com."), 252), now)
+                    .sign(query_bytes(&format!("e{i}.example.com."), Qtype::AXFR), now)
                     .unwrap()
             })
             .collect();
@@ -1359,7 +1419,8 @@ mod tests {
         let key = test_key();
         let ring = TsigKeyring::new(vec![key.clone()]);
         let signed_at = 1_800_000_000;
-        let request = sign_request(query_bytes("example.com.", 252), &key, signed_at).unwrap();
+        let request =
+            sign_request(query_bytes("example.com.", Qtype::AXFR), &key, signed_at).unwrap();
 
         // BADKEY: unsigned, empty MAC.
         let TsigCheck::Rejected(badkey) =
@@ -1368,7 +1429,7 @@ mod tests {
             panic!("expected a rejection");
         };
         let reply = badkey
-            .attach(query_bytes("example.com.", 252), signed_at)
+            .attach(query_bytes("example.com.", Qtype::AXFR), signed_at)
             .unwrap();
         let (_, rdata, owner) = find_tsig(&reply).unwrap();
         let tsig = Tsig::parse_rdata(&owner, rdata).unwrap();
@@ -1383,7 +1444,7 @@ mod tests {
         };
         assert_eq!(badtime.error, TsigError::BadTime);
         let reply = badtime
-            .attach(query_bytes("example.com.", 252), later)
+            .attach(query_bytes("example.com.", Qtype::AXFR), later)
             .unwrap();
         let (_, rdata, owner) = find_tsig(&reply).unwrap();
         let tsig = Tsig::parse_rdata(&owner, rdata).unwrap();
@@ -1444,7 +1505,12 @@ mod tests {
         let key = test_key();
         let ring = TsigKeyring::new(vec![key.clone()]);
         let far_future = 1u64 << 40;
-        let signed = sign_request(query_bytes("example.com.", 1), &key, far_future).unwrap();
+        let signed = sign_request(
+            query_bytes("example.com.", Qtype::of(rt::A)),
+            &key,
+            far_future,
+        )
+        .unwrap();
         assert!(matches!(
             check_request(&signed, &ring, far_future),
             TsigCheck::Verified(_)

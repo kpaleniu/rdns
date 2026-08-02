@@ -693,3 +693,76 @@ handed them every zone on the server.
   fields, so a zone list requires the algorithm to be spelled out. Failing at
   startup with a message beats guessing whether the first field looks like an
   algorithm name — and beats reading a zone list as a base64 secret.
+
+---
+
+## 17. Fix it in the type, or fix it again next month
+
+This is §2's "make it unrepresentable" promoted to a rule of its own, because the
+evidence for it is now a controlled experiment this repo ran on itself without
+meaning to. Two defects were fixed by **changing a type** — `QueryClass::Other(u16)`
+and `ResponseCode::Other(u16)`, each replacing a sentinel that could not carry
+what it stood for — and neither has recurred. Every defect in the same class
+fixed **at a call site** has recurred: the TTL clamp is now written out by hand
+fourteen times, the QTYPE-vs-RTYPE comparison is right in `zone::of_type` and
+wrong twice in `resolver.rs`, and the ASCII case fold exists in nine places
+including one in the public API that does the Unicode fold §8 forbids. Same
+authors, same care, same review. The difference is where the invariant lives.
+
+**So when a fix is about to be a check, ask what would have to be true for the
+check to be unnecessary.** Usually the answer is a newtype, and usually it is
+free.
+
+The smells, all of which are currently in this tree (`TODO.md` §13 plans the
+removal, staged, with the measurements each stage has to hold):
+
+- **A primitive that means two things depending on a sibling field.** OPT's
+  CLASS is a UDP payload size and its TTL is a flags word, which is why the TTL
+  cannot simply be clamped at the parse boundary — one field, two meanings, and
+  the clamp has to go somewhere else fourteen times instead. The fix is to stop
+  storing the pseudo-record in the resource-record list, not to special-case
+  rtype 41.
+- **Two `u16`s that name different spaces and can be compared with `==`.** A
+  QTYPE is not an RTYPE (ANY is 255 and no record *is* that type); a QCLASS is
+  not a CLASS. Newtype them and the wrong comparison stops compiling everywhere
+  at once, including the copies nobody knew about.
+- **`unwrap_or` on the parse of a wire field**, and its cause: `num_derive`'s
+  `FromPrimitive`, which hands you an `Option` and invites exactly that. A
+  data-carrying `Other(T)` variant with hand-rolled, total, mutually inverse
+  conversions costs twenty lines and buys a round trip that cannot lose anything.
+- **The same normalization written per module.** If two modules fold a name,
+  compare a name, or clamp a value their own way, one of them is already wrong or
+  will be. Move it, and put the *reason* in the doc comment (§7).
+- **An invariant asserted in a doc comment.** That is a claim to verify, not
+  documentation to trust (§4). If it is worth writing down it is worth making
+  unrepresentable, and if it cannot be, say in the comment why not.
+
+Three limits, so this does not become its own kind of damage:
+
+- **Measure it, do not assume it.** Most of these are `#[repr(transparent)]`
+  newtypes over the primitive that was already there and compile to the same
+  code — but "zero-cost" is a claim about a compiler, not a fact about a diff.
+  `cargo test -p rdns --test allocations -- --nocapture` holds fourteen exact
+  counts and reads the same on Windows and Linux; `cargo bench -p rdns --baseline`
+  is the backstop. **Identical counts or lower**, and a count that moves up is
+  accepted only with the reason written next to the assertion — the same rule as
+  §10's about never lowering a floor.
+- **Not everything wants a type.** A typestate marker to catch one bug that now
+  has a test makes every function in the module generic. `String` inside an error
+  variant is right when the *category* is the typed part (§3). The question is
+  whether a caller would branch on the distinction, not whether the distinction
+  exists.
+- **A type does not settle a question it inherits.** A `Name` newtype over a
+  `String` that might be in presentation form with escapes, or might not, has
+  renamed the ambiguity rather than removed it. Settle what the type *means*
+  first; a newtype wrapping an unanswered question is worse than the `String`,
+  because it looks like an answer.
+
+**And review the plan the way the code gets reviewed.** The first draft of
+`TODO.md` §13 had five claims that did not survive being checked against the
+code and IANA — a citation from memory, a count nobody counted, a hedge standing
+in for a one-line grep, a key type that could not be a map key, and a missed
+prerequisite that could invalidate a whole stage. Every one was a place the plan
+reasoned about what the code *should* look like instead of opening it. §4's rule
+— never state what a function does without reading it — applies to a plan too,
+because a plan is a claim about the code.

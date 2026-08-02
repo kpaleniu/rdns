@@ -3,7 +3,10 @@ use crate::error::ZoneError;
 use crate::utils::record_type_code;
 use crate::utils::record_types as rt;
 use crate::utils::{ascii_lowered_cow, is_at_or_under};
-use crate::{ParsedRecord, RecordData};
+use crate::Class;
+use crate::Rtype;
+use crate::Ttl;
+use crate::{ParsedRecord, Qtype, RecordData};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -13,8 +16,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct ZoneRecord {
     pub name: String,
-    pub ttl: i32,
-    pub class: u16, // typically 1 for IN
+    pub ttl: Ttl,
+    pub class: Class,
     pub rdata: RecordData,
 }
 
@@ -237,7 +240,7 @@ impl Zone {
     /// RFC 4592 §2.2.1 and §4.4). The linear scan this replaced returned the
     /// exact *and* the wildcard records together, merging two owners' data into
     /// one RRset.
-    pub fn query(&self, name: &str, qtype: u16) -> Vec<&ZoneRecord> {
+    pub fn query(&self, name: &str, qtype: Qtype) -> Vec<&ZoneRecord> {
         let key = self.lookup_key(name);
         let positions = match self.name_kind_of_key(&key) {
             NameKind::Exact => self.index.get(key.as_ref()),
@@ -256,7 +259,7 @@ impl Zone {
     /// stale, so it is the one field a zone is compared by — NOTIFY sends it,
     /// and a secondary's refresh check is a comparison of it.
     pub fn serial(&self) -> Option<u32> {
-        self.query(&self.origin, crate::utils::record_types::SOA)
+        self.query(&self.origin, Qtype::of(crate::utils::record_types::SOA))
             .first()
             .and_then(|soa| match soa.rdata.parse() {
                 Ok(crate::ParsedRecord::SOA { serial, .. }) => Some(serial),
@@ -364,7 +367,7 @@ impl Zone {
     }
 
     /// Whether there is an RRset of `rtype` at exactly this key.
-    fn has_type(&self, key: &str, rtype: u16) -> bool {
+    fn has_type(&self, key: &str, rtype: Rtype) -> bool {
         self.index.get(key).is_some_and(|positions| {
             positions
                 .iter()
@@ -411,35 +414,19 @@ impl Zone {
         ascii_lowered_cow(&self.origin)
     }
 
-    /// The records at these positions that are of `qtype`.
+    /// The records at these positions that `qtype` selects.
     ///
-    /// `ANY` (255) is a QTYPE and never an RTYPE, so no stored record could
-    /// equal it and a strict comparison returned nothing. That is what made an
-    /// ANY query at an existing name come back as NODATA — an empty NOERROR
-    /// plus the SOA, which is none of the shapes RFC 8482 §4 permits for it. It
-    /// means "every type at this name" (RFC 1035 §3.2.3), and that is what it
-    /// gets.
-    ///
-    /// **Except the three DNSSEC meta types.** RRSIG, NSEC and NSEC3 are not
-    /// answer-section data: RFC 4035 §3.1.1 says a server includes them only
-    /// when the DO bit asked for them, and the signatures for an answer are
-    /// attached by `dnssec_answer::answer_signatures`, which knows which ones
-    /// the answer actually owes. Returning them from here would put signatures
-    /// in front of a client that cannot read them, duplicate them for one that
-    /// can — and, worse, make an empty non-terminal in an NSEC-signed zone look
-    /// like a name *with* data, because the chain puts an NSEC at it.
-    fn of_type(&self, positions: &[usize], qtype: u16) -> Vec<&ZoneRecord> {
+    /// The rule — what ANY means, and why the three DNSSEC meta types are not
+    /// part of it — is [`Qtype::matches`], and used to be written out here.
+    /// This function was where it was got right, and `resolver` was where the
+    /// same comparison was written as `rtype == qtype` twice and got wrong; one
+    /// definition is the whole point of `TODO.md` #13c, so a second telling of
+    /// it here would be the drift starting again (`CLAUDE.md` §7).
+    fn of_type(&self, positions: &[usize], qtype: Qtype) -> Vec<&ZoneRecord> {
         positions
             .iter()
             .map(|&i| &self.records[i])
-            .filter(|r| {
-                let rtype = record_type_code(&r.rdata);
-                if qtype == rt::ANY {
-                    !matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3)
-                } else {
-                    rtype == qtype
-                }
-            })
+            .filter(|r| qtype.matches(record_type_code(&r.rdata)))
             .collect()
     }
 
@@ -931,7 +918,7 @@ struct ParseState {
     /// origin an `$INCLUDE` named for the file being read.
     origin: String,
     /// The default TTL for records that do not state one (`$TTL`).
-    ttl: i32,
+    ttl: Ttl,
     /// The last owner name seen, absolute, for lines that omit theirs.
     owner: Option<String>,
 }
@@ -963,7 +950,7 @@ fn parse_zone_file_with_base(
     let mut zone = Zone::new(origin.to_string());
     let mut state = ParseState {
         origin: absolute(origin),
-        ttl: 3600,
+        ttl: Ttl::from_secs(3600),
         owner: None,
     };
     parse_into(&mut zone, content, &mut state, base_dir, 0)?;
@@ -980,7 +967,7 @@ fn parse_zone_file_with_base(
 /// three types that describe the name rather than name it: RRSIG signs the
 /// CNAME, and NSEC/NSEC3 deny the types around it (RFC 4035 §2.5).
 fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
-    let mut by_name: HashMap<String, (bool, Vec<u16>)> = HashMap::new();
+    let mut by_name: HashMap<String, (bool, Vec<Rtype>)> = HashMap::new();
     for record in zone.records() {
         let rtype = record_type_code(&record.rdata);
         if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3) {
@@ -1052,7 +1039,8 @@ fn parse_into(
         if first.eq_ignore_ascii_case("$TTL") {
             if let Some(value) = parts.get(1) {
                 state.ttl = value
-                    .parse()
+                    .parse::<u32>()
+                    .map(Ttl::from_secs)
                     .map_err(|e| ZoneError::syntax(ln, format!("invalid $TTL {value:?}: {e}")))?;
             }
             continue;
@@ -1138,11 +1126,14 @@ fn parse_into(
         // needs its own zone, its own apex and its own place in the zone map —
         // that is a feature, and this is the parser refusing to half-have it.
         let mut ttl = state.ttl;
-        let mut class = 1u16; // IN
+        // Always IN: the branch below refuses any other class outright, which
+        // is what makes the class-blind zone index correct rather than merely
+        // untested (`CLAUDE.md` §2, §8).
+        let mut class = Class::IN;
 
         while idx < parts.len() {
             if let Ok(parsed_ttl) = parts[idx].parse::<i32>() {
-                ttl = parsed_ttl;
+                ttl = Ttl::from_wire(parsed_ttl);
                 state.ttl = ttl;
                 idx += 1;
             } else if parts[idx].eq_ignore_ascii_case("IN")
@@ -1159,7 +1150,7 @@ fn parse_into(
                         ),
                     ));
                 }
-                class = 1;
+                class = Class::IN;
                 idx += 1;
             } else {
                 break;
@@ -1584,7 +1575,7 @@ timed 60 IN A 192.0.2.3
             "timed.example.com.",
         ] {
             assert_eq!(
-                zone.query(name, record_types::A).len(),
+                zone.query(name, Qtype::of(record_types::A)).len(),
                 1,
                 "{name} should have loaded"
             );
@@ -1623,14 +1614,14 @@ timed 60 IN A 192.0.2.3
         let zone = parse_zone_file("www.example.com. IN A 192.0.2.5\n", "example.com.").unwrap();
         assert_eq!(zone.records.len(), 1);
         assert_eq!(zone.records[0].name, "www.example.com.");
-        assert_eq!(zone.query("www.example.com.", 1).len(), 1);
+        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
     }
 
     #[test]
     fn test_owner_name_may_contain_digits() {
         let zone = parse_zone_file("www2 IN A 192.0.2.6\n", "example.com.").unwrap();
         assert_eq!(zone.records[0].name, "www2.example.com.", "stored absolute");
-        assert_eq!(zone.query("www2.example.com.", 1).len(), 1);
+        assert_eq!(zone.query("www2.example.com.", Qtype::of(rt::A)).len(), 1);
     }
 
     #[test]
@@ -1640,7 +1631,7 @@ timed 60 IN A 192.0.2.3
         let zone = parse_zone_file("ns IN A 192.0.2.7\n", "example.com.").unwrap();
         assert_eq!(zone.records[0].name, "ns.example.com.");
         assert_eq!(
-            zone.query("ns.example.com.", 1).len(),
+            zone.query("ns.example.com.", Qtype::of(rt::A)).len(),
             1,
             "should be an A record"
         );
@@ -1653,7 +1644,7 @@ timed 60 IN A 192.0.2.3
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         assert_eq!(zone.records.len(), 2);
         assert_eq!(zone.records[1].name, "www.example.com.");
-        assert_eq!(zone.query("www.example.com.", 1).len(), 2);
+        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 2);
     }
 
     #[test]
@@ -1670,13 +1661,13 @@ timed 60 IN A 192.0.2.3
         let zone_content = "@ IN A 192.0.2.1\nwww IN A 192.0.2.2\n";
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         assert_eq!(
-            zone.query("example.com.", 1).len(),
+            zone.query("example.com.", Qtype::of(rt::A)).len(),
             1,
             "@ should match the apex"
         );
-        assert_eq!(zone.query("www.example.com.", 1).len(), 1);
+        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
         // DNS names are case-insensitive (RFC 4343).
-        assert_eq!(zone.query("WWW.Example.COM.", 1).len(), 1);
+        assert_eq!(zone.query("WWW.Example.COM.", Qtype::of(rt::A)).len(), 1);
     }
 
     /// Which of `normalize_name`'s three cases copies, and which hand the
@@ -1714,9 +1705,12 @@ timed 60 IN A 192.0.2.3
     #[test]
     fn test_wildcard_answers_a_name_that_does_not_exist() {
         let zone = parse_zone_file("* IN A 192.0.2.9\n", "example.com.").unwrap();
-        assert_eq!(zone.query("anything.example.com.", 1).len(), 1);
+        assert_eq!(
+            zone.query("anything.example.com.", Qtype::of(rt::A)).len(),
+            1
+        );
         // And it does not answer for the name it hangs off.
-        assert!(zone.query("example.com.", 1).is_empty());
+        assert!(zone.query("example.com.", Qtype::of(rt::A)).is_empty());
     }
 
     /// RFC 4592 §3.3.2's own worked example, which is the authority on how deep
@@ -1732,11 +1726,12 @@ timed 60 IN A 192.0.2.3
     fn test_a_wildcard_synthesizes_at_any_depth() {
         let zone = parse_zone_file("* IN A 192.0.2.9\n", "example.").unwrap();
         assert_eq!(
-            zone.query("_telnet._tcp.host1.example.", 1).len(),
+            zone.query("_telnet._tcp.host1.example.", Qtype::of(rt::A))
+                .len(),
             1,
             "RFC 4592 §3.3.2 synthesizes this from *.example."
         );
-        assert_eq!(zone.query("a.b.example.", 1).len(), 1);
+        assert_eq!(zone.query("a.b.example.", Qtype::of(rt::A)).len(), 1);
         assert!(zone.name_exists("a.b.c.d.e.f.example."));
         assert_eq!(
             zone.name_kind("a.b.example."),
@@ -1756,12 +1751,13 @@ timed 60 IN A 192.0.2.3
             parse_zone_file("* IN A 192.0.2.9\ndeep.a.b IN TXT \"x\"\n", "example.com.").unwrap();
 
         assert_eq!(
-            zone.query("other.example.com.", 1).len(),
+            zone.query("other.example.com.", Qtype::of(rt::A)).len(),
             1,
             "nothing above it"
         );
         assert!(
-            zone.query("x.a.b.example.com.", 1).is_empty(),
+            zone.query("x.a.b.example.com.", Qtype::of(rt::A))
+                .is_empty(),
             "a.b exists, so *.example.com. is not this name's source of synthesis"
         );
         assert_eq!(
@@ -1826,7 +1822,10 @@ timed 60 IN A 192.0.2.3
                 !zone.holds_name(ent),
                 "{ent} still holds no records of its own — the denial path needs that answer"
             );
-            assert!(zone.query(ent, 16).is_empty(), "{ent}: NODATA, no records");
+            assert!(
+                zone.query(ent, Qtype::of(rt::TXT)).is_empty(),
+                "{ent}: NODATA, no records"
+            );
         }
 
         assert_eq!(zone.name_kind("deep.a.b.example.com."), NameKind::Exact);
@@ -1873,14 +1872,18 @@ timed 60 IN A 192.0.2.3
         )
         .unwrap();
 
-        let a = zone.query("www.example.com.", 1);
+        let a = zone.query("www.example.com.", Qtype::of(rt::A));
         assert!(
             a.is_empty(),
             "www exists, so the wildcard must not answer for it: {a:?}"
         );
-        assert_eq!(zone.query("www.example.com.", 28).len(), 1, "its own AAAA");
+        assert_eq!(
+            zone.query("www.example.com.", Qtype::of(rt::AAAA)).len(),
+            1,
+            "its own AAAA"
+        );
         // Any other name still gets the wildcard.
-        assert_eq!(zone.query("other.example.com.", 1).len(), 1);
+        assert_eq!(zone.query("other.example.com.", Qtype::of(rt::A)).len(), 1);
     }
 
     #[test]
@@ -1946,12 +1949,12 @@ timed 60 IN A 192.0.2.3
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
 
         assert_eq!(
-            zone.query("www.example.com.", 1).len(),
+            zone.query("www.example.com.", Qtype::of(rt::A)).len(),
             1,
             "www was read before the $ORIGIN and stays where it was"
         );
-        assert_eq!(zone.query("mail.other.test.", 1).len(), 1);
-        assert!(zone.query("www.other.test.", 1).is_empty());
+        assert_eq!(zone.query("mail.other.test.", Qtype::of(rt::A)).len(), 1);
+        assert!(zone.query("www.other.test.", Qtype::of(rt::A)).is_empty());
     }
 
     /// The `set_origin` re-key, which is what the index needs when a *relative*
@@ -1962,19 +1965,19 @@ timed 60 IN A 192.0.2.3
         let mut zone = Zone::new("example.com.".to_string());
         zone.add_record(ZoneRecord {
             name: "www".to_string(),
-            ttl: 3600,
-            class: 1,
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         });
-        assert_eq!(zone.query("www.example.com.", 1).len(), 1);
+        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
 
         zone.set_origin("other.test.");
         assert_eq!(
-            zone.query("www.other.test.", 1).len(),
+            zone.query("www.other.test.", Qtype::of(rt::A)).len(),
             1,
             "a relative name follows the origin it is relative to"
         );
-        assert!(zone.query("www.example.com.", 1).is_empty());
+        assert!(zone.query("www.example.com.", Qtype::of(rt::A)).is_empty());
     }
 
     /// A record added after the zone is built has to be reachable, or the index
@@ -1982,15 +1985,15 @@ timed 60 IN A 192.0.2.3
     #[test]
     fn test_records_added_later_are_indexed() {
         let mut zone = Zone::new("example.com.".to_string());
-        assert!(zone.query("www.example.com.", 1).is_empty());
+        assert!(zone.query("www.example.com.", Qtype::of(rt::A)).is_empty());
 
         zone.add_record(ZoneRecord {
             name: "www".to_string(),
-            ttl: 3600,
-            class: 1,
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         });
-        assert_eq!(zone.query("www.example.com.", 1).len(), 1);
+        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
         assert!(zone.name_exists("www.example.com."));
     }
 
@@ -2014,7 +2017,7 @@ $TTL 3600
 @   IN  A   192.0.2.1
 "#;
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
-        let soa = zone.query("example.com.", crate::utils::record_types::SOA);
+        let soa = zone.query("example.com.", Qtype::of(crate::utils::record_types::SOA));
         assert_eq!(soa.len(), 1, "the SOA should have loaded");
         match soa[0].rdata.parse().unwrap() {
             ParsedRecord::SOA {
@@ -2030,7 +2033,7 @@ $TTL 3600
             other => panic!("expected an SOA, got {other:?}"),
         }
         // The record after the group is still read as its own line.
-        assert_eq!(zone.query("example.com.", 1).len(), 1);
+        assert_eq!(zone.query("example.com.", Qtype::of(rt::A)).len(), 1);
     }
 
     /// A `;` inside a quoted string is data, not a comment. SPF and DKIM records
@@ -2040,7 +2043,10 @@ $TTL 3600
     fn test_semicolon_inside_a_quoted_string_survives() {
         let zone_content = "txt IN TXT \"v=spf1 include:example.net; -all\"\n";
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
-        let txt = zone.query("txt.example.com.", crate::utils::record_types::TXT);
+        let txt = zone.query(
+            "txt.example.com.",
+            Qtype::of(crate::utils::record_types::TXT),
+        );
         assert_eq!(txt.len(), 1);
         match txt[0].rdata.parse().unwrap() {
             ParsedRecord::TXT(strings) => {
@@ -2062,10 +2068,13 @@ $TTL 3600
     fn test_txt_character_strings_are_split_on_quotes_not_whitespace() {
         let strings_of = |line: &str| -> Vec<Vec<u8>> {
             let zone = parse_zone_file(line, "example.com.").unwrap();
-            match zone.query("txt.example.com.", crate::utils::record_types::TXT)[0]
-                .rdata
-                .parse()
-                .unwrap()
+            match zone.query(
+                "txt.example.com.",
+                Qtype::of(crate::utils::record_types::TXT),
+            )[0]
+            .rdata
+            .parse()
+            .unwrap()
             {
                 ParsedRecord::TXT(strings) => strings,
                 other => panic!("expected TXT, got {other:?}"),
@@ -2174,17 +2183,17 @@ $TTL 3600
 
         let zone = parse_zone_file_at(&main, "example.com.").unwrap();
         assert_eq!(
-            zone.query("mail.example.com.", 1).len(),
+            zone.query("mail.example.com.", Qtype::of(rt::A)).len(),
             1,
             "from the include"
         );
-        assert_eq!(zone.query("www.example.com.", 1).len(), 1);
+        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
         assert_eq!(
-            zone.query("ftp.example.com.", 1).len(),
+            zone.query("ftp.example.com.", Qtype::of(rt::A)).len(),
             1,
             "parsing continues after the include"
         );
-        assert_eq!(zone.query("example.com.", 1).len(), 1);
+        assert_eq!(zone.query("example.com.", Qtype::of(rt::A)).len(), 1);
     }
 
     /// `$INCLUDE file origin` reads the file under that origin — and RFC 1035
@@ -2204,12 +2213,12 @@ $TTL 3600
 
         let zone = parse_zone_file_at(&main, "example.com.").unwrap();
         assert_eq!(
-            zone.query("ns.deeper.example.com.", 1).len(),
+            zone.query("ns.deeper.example.com.", Qtype::of(rt::A)).len(),
             1,
             "the included file's own $ORIGIN applies inside it"
         );
         assert_eq!(
-            zone.query("after.example.com.", 1).len(),
+            zone.query("after.example.com.", Qtype::of(rt::A)).len(),
             1,
             "and neither origin leaks back out to the including file"
         );
@@ -2253,7 +2262,7 @@ $TTL 3600
     #[test]
     fn test_generic_rdata_carries_a_type_we_do_not_parse() {
         let zone = parse_zone_file("odd IN TYPE1234 \\# 4 DEADBEEF\n", "example.com.").unwrap();
-        let record = zone.query("odd.example.com.", 1234);
+        let record = zone.query("odd.example.com.", Qtype::of(Rtype::new(1234)));
         assert_eq!(record.len(), 1);
         assert_eq!(&*record[0].rdata.rdata, &[0xde, 0xad, 0xbe, 0xef]);
     }
@@ -2264,7 +2273,7 @@ $TTL 3600
     fn test_generic_rdata_is_accepted_for_a_known_type() {
         let zone = parse_zone_file("www IN A \\# 4 C0000201\n", "example.com.").unwrap();
         assert!(matches!(
-            zone.query("www.example.com.", record_types::A)[0].rdata.parse(),
+            zone.query("www.example.com.", Qtype::of(record_types::A))[0].rdata.parse(),
             Ok(ParsedRecord::A(addr)) if addr == Ipv4Addr::new(192, 0, 2, 1)
         ));
     }
@@ -2272,10 +2281,12 @@ $TTL 3600
     #[test]
     fn test_generic_rdata_of_zero_length() {
         let zone = parse_zone_file("empty IN TYPE4321 \\# 0\n", "example.com.").unwrap();
-        assert!(zone.query("empty.example.com.", 4321)[0]
-            .rdata
-            .rdata
-            .is_empty());
+        assert!(
+            zone.query("empty.example.com.", Qtype::of(Rtype::new(4321)))[0]
+                .rdata
+                .rdata
+                .is_empty()
+        );
     }
 
     /// The length is checked rather than trusted — it is exactly the field a
@@ -2309,7 +2320,7 @@ $TTL 3600
     fn test_nsec_bitmap_accepts_a_generic_type_name() {
         let zone =
             parse_zone_file("@ IN NSEC www.example.com. A TYPE1234\n", "example.com.").unwrap();
-        let record = zone.query("example.com.", record_types::NSEC)[0];
+        let record = zone.query("example.com.", Qtype::of(record_types::NSEC))[0];
         let ParsedRecord::NSEC { type_bitmap, .. } = record.rdata.parse().unwrap() else {
             panic!("not an NSEC");
         };
@@ -2317,7 +2328,10 @@ $TTL 3600
             &type_bitmap,
             record_types::A
         ));
-        assert!(crate::dnssec_denial::bitmap_has_type(&type_bitmap, 1234));
+        assert!(crate::dnssec_denial::bitmap_has_type(
+            &type_bitmap,
+            Rtype::new(1234)
+        ));
     }
 
     #[test]

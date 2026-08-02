@@ -20,8 +20,11 @@
 //! Special-casing them would break the one thing they exist for, which is being
 //! usable in documentation that people then copy.
 
-use crate::utils::record_types as rt;
+use crate::utils::{absolute_lowered, is_at_or_under, record_types as rt};
+use crate::Class;
+use crate::Ttl;
 use crate::{ParsedRecord, RecordData, ResourceRecord, ResponseCode};
+use crate::{Qtype, Rtype};
 
 /// What the table says to answer.
 pub struct LocalAnswer {
@@ -40,20 +43,20 @@ pub struct LocalAnswer {
 /// TTL on everything synthesized here. An hour: these answers are fixed by
 /// specification, so the only reason not to make it longer is that a client
 /// holding one across a reconfiguration should notice eventually.
-const LOCAL_TTL: i32 = 3600;
+const LOCAL_TTL: Ttl = Ttl::from_secs(3600);
 
 /// The answer for `qname`/`qtype` if it is a name we must not send upstream.
 ///
 /// `None` means "an ordinary name": resolve it as usual.
-pub fn lookup(qname: &str, qtype: u16) -> Option<LocalAnswer> {
-    let name = normalize(qname);
+pub fn lookup(qname: &str, qtype: Qtype) -> Option<LocalAnswer> {
+    let name = absolute_lowered(qname);
 
     // RFC 6761 §6.3: `localhost.` and anything under it is the loopback
     // interface, and must never be sent to a DNS server. The subtree matters —
     // `foo.localhost` is as much the local machine as `localhost` is, and some
     // software relies on it.
     if name == "localhost." || name.ends_with(".localhost.") {
-        return Some(match qtype {
+        return Some(match Rtype::new(qtype.to_u16()) {
             rt::A => positive(
                 qname,
                 loopback_v4(),
@@ -77,14 +80,14 @@ pub fn lookup(qname: &str, qtype: u16) -> Option<LocalAnswer> {
     // The loopback reverse zone, which is the other half of the same statement
     // (RFC 6303 §4.2). 127.0.0.1 resolves to `localhost.`; the rest of 127/8 is
     // still ours to answer for, and the answer is that nothing is there.
-    if name == "1.0.0.127.in-addr.arpa." && qtype == rt::PTR {
+    if name == "1.0.0.127.in-addr.arpa." && qtype.is(rt::PTR) {
         return Some(positive(
             qname,
             RecordData::from_parsed(&ParsedRecord::PTR("localhost.".to_string())).ok()?,
             "127.0.0.1 is localhost (RFC 6303 §4.2)",
         ));
     }
-    if in_zone(&name, "127.in-addr.arpa.") {
+    if is_at_or_under(&name, "127.in-addr.arpa.") {
         return Some(nxdomain(
             "127.in-addr.arpa.",
             "the loopback reverse zone is answered locally (RFC 6303 §4.2)",
@@ -96,7 +99,7 @@ pub fn lookup(qname: &str, qtype: u16) -> Option<LocalAnswer> {
     // does not exist in the DNS. Answering it here also stops the query telling
     // the root servers which machines are on this LAN, and stops it failing
     // slowly, which is what makes software wait seconds for nothing.
-    if in_zone(&name, "local.") {
+    if is_at_or_under(&name, "local.") {
         return Some(nxdomain(
             "local.",
             "`.local` is mDNS, not DNS (RFC 6762 §3)",
@@ -106,7 +109,7 @@ pub fn lookup(qname: &str, qtype: u16) -> Option<LocalAnswer> {
     // RFC 6761 §6.4: `invalid.` is reserved to be unresolvable. Nothing is ever
     // delegated there, so a resolver that asks is asking the root to confirm the
     // obvious.
-    if in_zone(&name, "invalid.") {
+    if is_at_or_under(&name, "invalid.") {
         return Some(nxdomain(
             "invalid.",
             "`invalid.` is reserved to not exist (RFC 6761 §6.4)",
@@ -118,7 +121,7 @@ pub fn lookup(qname: &str, qtype: u16) -> Option<LocalAnswer> {
     // servers it would otherwise reach — AS112 — exist only to absorb the flood
     // of exactly these queries.
     for zone in PRIVATE_REVERSE_ZONES {
-        if in_zone(&name, zone) {
+        if is_at_or_under(&name, zone) {
             return Some(nxdomain(
                 zone,
                 "a private-address reverse lookup is answered locally (RFC 6303 §4)",
@@ -170,18 +173,13 @@ const PRIVATE_REVERSE_ZONES: &[&str] = &[
     "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.",
 ];
 
-/// Whether `name` is `zone` or below it. Both are absolute and down-cased.
-fn in_zone(name: &str, zone: &str) -> bool {
-    name == zone || name.ends_with(&format!(".{zone}"))
-}
-
-fn normalize(name: &str) -> String {
-    let mut name = name.to_ascii_lowercase();
-    if !name.ends_with('.') {
-        name.push('.');
-    }
-    name
-}
+// `in_zone` and `normalize` were here. `in_zone` was a fourth copy of
+// `utils::is_at_or_under` that built a `format!(".{zone}")` per call — and
+// `lookup` calls it once per entry in `PRIVATE_REVERSE_ZONES`, which is 27 of
+// them, for every ordinary name that reaches this table and matches nothing.
+// `normalize` was byte-for-byte the same function as `resolver`'s private one,
+// which is the shape `CLAUDE.md` §7 is entirely about. Both now come from
+// `utils` (`TODO.md` #13b).
 
 fn loopback_v4() -> RecordData {
     RecordData::from_parsed(&ParsedRecord::A(std::net::Ipv4Addr::LOCALHOST))
@@ -198,7 +196,7 @@ fn positive(qname: &str, rdata: RecordData, why: &'static str) -> LocalAnswer {
         rcode: ResponseCode::Ok,
         answers: vec![ResourceRecord {
             name: qname.to_string(),
-            class: 1,
+            class: Class::new(1),
             ttl: LOCAL_TTL,
             rdata,
         }],
@@ -241,12 +239,12 @@ fn synthetic_soa(zone: &str) -> Option<ResourceRecord> {
         refresh: 3600,
         retry: 1200,
         expire: 604_800,
-        minimum: LOCAL_TTL as u32,
+        minimum: LOCAL_TTL.as_secs(),
     })
     .ok()?;
     Some(ResourceRecord {
         name: zone.to_string(),
-        class: 1,
+        class: Class::new(1),
         ttl: LOCAL_TTL,
         rdata,
     })
@@ -256,7 +254,7 @@ fn synthetic_soa(zone: &str) -> Option<ResourceRecord> {
 mod tests {
     use super::*;
 
-    fn answer(qname: &str, qtype: u16) -> LocalAnswer {
+    fn answer(qname: &str, qtype: Qtype) -> LocalAnswer {
         lookup(qname, qtype).unwrap_or_else(|| panic!("{qname} should be answered locally"))
     }
 
@@ -266,41 +264,41 @@ mod tests {
 
     #[test]
     fn test_localhost_is_the_loopback_address() {
-        let v4 = answer("localhost.", rt::A);
+        let v4 = answer("localhost.", Qtype::of(rt::A));
         assert_eq!(v4.rcode, ResponseCode::Ok);
         assert!(
             matches!(parsed(&v4.answers[0]), ParsedRecord::A(a) if a == std::net::Ipv4Addr::LOCALHOST)
         );
 
-        let v6 = answer("localhost.", rt::AAAA);
+        let v6 = answer("localhost.", Qtype::of(rt::AAAA));
         assert!(
             matches!(parsed(&v6.answers[0]), ParsedRecord::AAAA(a) if a == std::net::Ipv6Addr::LOCALHOST)
         );
 
         // Case and the trailing dot are not what makes a name special.
-        assert!(lookup("LocalHost", rt::A).is_some());
-        assert!(lookup("LOCALHOST.", rt::A).is_some());
+        assert!(lookup("LocalHost", Qtype::of(rt::A)).is_some());
+        assert!(lookup("LOCALHOST.", Qtype::of(rt::A)).is_some());
     }
 
     /// RFC 6761 §6.3 reserves the whole subtree, and software relies on it.
     #[test]
     fn test_names_under_localhost_are_local_too() {
-        let a = answer("api.dev.localhost.", rt::A);
+        let a = answer("api.dev.localhost.", Qtype::of(rt::A));
         assert!(
             matches!(parsed(&a.answers[0]), ParsedRecord::A(a) if a == std::net::Ipv4Addr::LOCALHOST)
         );
         assert_eq!(a.answers[0].name, "api.dev.localhost.", "echoed as asked");
 
         // But a name that merely *ends in* those letters is somebody's real host.
-        assert!(lookup("notlocalhost.", rt::A).is_none());
-        assert!(lookup("localhost.example.com.", rt::A).is_none());
+        assert!(lookup("notlocalhost.", Qtype::of(rt::A)).is_none());
+        assert!(lookup("localhost.example.com.", Qtype::of(rt::A)).is_none());
     }
 
     /// The name exists — it just has nothing but addresses. Answering NXDOMAIN
     /// would be a lie about the one name every machine has.
     #[test]
     fn test_localhost_has_no_other_types() {
-        let mx = answer("localhost.", rt::MX);
+        let mx = answer("localhost.", Qtype::of(rt::MX));
         assert_eq!(mx.rcode, ResponseCode::Ok, "NODATA, not NXDOMAIN");
         assert!(mx.answers.is_empty());
         assert_eq!(mx.authority.len(), 1, "with an SOA, so it can be cached");
@@ -308,11 +306,11 @@ mod tests {
 
     #[test]
     fn test_the_loopback_reverse_lookup() {
-        let ptr = answer("1.0.0.127.in-addr.arpa.", rt::PTR);
+        let ptr = answer("1.0.0.127.in-addr.arpa.", Qtype::of(rt::PTR));
         assert!(matches!(parsed(&ptr.answers[0]), ParsedRecord::PTR(n) if n == "localhost."));
 
         // The rest of 127/8 is ours to answer for, and the answer is nothing.
-        let other = answer("2.0.0.127.in-addr.arpa.", rt::PTR);
+        let other = answer("2.0.0.127.in-addr.arpa.", Qtype::of(rt::PTR));
         assert_eq!(other.rcode, ResponseCode::NoSuchDomain);
     }
 
@@ -321,20 +319,26 @@ mod tests {
     #[test]
     fn test_local_is_mdns_and_never_leaves() {
         for name in ["printer.local.", "a.b.local.", "local."] {
-            let a = answer(name, rt::A);
+            let a = answer(name, Qtype::of(rt::A));
             assert_eq!(a.rcode, ResponseCode::NoSuchDomain, "{name}");
             assert!(a.why.contains("mDNS"), "{}", a.why);
         }
-        assert!(lookup("mylocal.", rt::A).is_none(), "not a label boundary");
+        assert!(
+            lookup("mylocal.", Qtype::of(rt::A)).is_none(),
+            "not a label boundary"
+        );
     }
 
     #[test]
     fn test_invalid_is_reserved_to_not_exist() {
         assert_eq!(
-            answer("nope.invalid.", rt::A).rcode,
+            answer("nope.invalid.", Qtype::of(rt::A)).rcode,
             ResponseCode::NoSuchDomain
         );
-        assert_eq!(answer("invalid.", rt::A).rcode, ResponseCode::NoSuchDomain);
+        assert_eq!(
+            answer("invalid.", Qtype::of(rt::A)).rcode,
+            ResponseCode::NoSuchDomain
+        );
     }
 
     /// A PTR for private space describes somebody's internal network. AS112
@@ -351,7 +355,7 @@ mod tests {
             "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa.",
             "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.c.f.ip6.arpa.",
         ] {
-            let a = answer(name, rt::PTR);
+            let a = answer(name, Qtype::of(rt::PTR));
             assert_eq!(a.rcode, ResponseCode::NoSuchDomain, "{name}");
             assert_eq!(a.authority.len(), 1, "{name} should carry an SOA");
         }
@@ -364,13 +368,21 @@ mod tests {
     fn test_the_172_boundary_is_exact() {
         for private in 16..=31 {
             assert!(
-                lookup(&format!("1.1.{private}.172.in-addr.arpa."), rt::PTR).is_some(),
+                lookup(
+                    &format!("1.1.{private}.172.in-addr.arpa."),
+                    Qtype::of(rt::PTR)
+                )
+                .is_some(),
                 "172.{private} is private"
             );
         }
         for public in [15, 32] {
             assert!(
-                lookup(&format!("1.1.{public}.172.in-addr.arpa."), rt::PTR).is_none(),
+                lookup(
+                    &format!("1.1.{public}.172.in-addr.arpa."),
+                    Qtype::of(rt::PTR)
+                )
+                .is_none(),
                 "172.{public} is not"
             );
         }
@@ -388,7 +400,10 @@ mod tests {
             "example.net.",
             "example.org.",
         ] {
-            assert!(lookup(name, rt::A).is_none(), "{name} resolves normally");
+            assert!(
+                lookup(name, Qtype::of(rt::A)).is_none(),
+                "{name} resolves normally"
+            );
         }
     }
 
@@ -409,8 +424,8 @@ mod tests {
             "localdomain.",
             "onion.", // reserved, but not ours to answer (RFC 7686)
         ] {
-            assert!(lookup(name, rt::A).is_none(), "{name}");
-            assert!(lookup(name, rt::PTR).is_none(), "{name}");
+            assert!(lookup(name, Qtype::of(rt::A)).is_none(), "{name}");
+            assert!(lookup(name, Qtype::of(rt::PTR)).is_none(), "{name}");
         }
     }
 
@@ -418,7 +433,7 @@ mod tests {
     /// throws the answer away and asks again.
     #[test]
     fn test_the_synthetic_soa_is_well_formed() {
-        let a = answer("printer.local.", rt::A);
+        let a = answer("printer.local.", Qtype::of(rt::A));
         let soa = &a.authority[0];
         assert_eq!(
             soa.name, "local.",
@@ -429,6 +444,6 @@ mod tests {
             panic!("not an SOA");
         };
         assert_eq!(rname, "nobody.invalid.", "unmistakably synthetic");
-        assert_eq!(minimum, LOCAL_TTL as u32);
+        assert_eq!(minimum, LOCAL_TTL.as_secs());
     }
 }

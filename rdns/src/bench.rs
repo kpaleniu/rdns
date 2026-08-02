@@ -33,6 +33,9 @@
 #[cfg(test)]
 mod benches {
     use crate::logging::QueryLogger;
+    use crate::utils::record_types as rt;
+    use crate::Qtype;
+    use crate::{Class, Ttl};
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Instant;
 
@@ -44,7 +47,7 @@ mod benches {
 
         let start = Instant::now();
         for _ in 0..iterations {
-            logger.log_query(ip, Some(1));
+            logger.log_query(ip, Some(Qtype::of(rt::A)));
         }
         let elapsed = start.elapsed();
 
@@ -102,8 +105,8 @@ mod benches {
         for i in 0..10_000u32 {
             zone.add_record(ZoneRecord {
                 name: format!("host{i}"),
-                ttl: 3600,
-                class: 1,
+                ttl: Ttl::from_secs(3600),
+                class: Class::new(1),
                 rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
                     192,
                     0,
@@ -120,8 +123,10 @@ mod benches {
             // A hit deep in the zone, and a miss — the miss is what a linear
             // scan pays the most for, and what a random-name flood produces.
             let hit = format!("host{}.example.com.", 9_000 + (i % 1_000));
-            assert_eq!(zone.query(&hit, 1).len(), 1);
-            assert!(zone.query("nothing-here.example.com.", 1).is_empty());
+            assert_eq!(zone.query(&hit, Qtype::of(rt::A)).len(), 1);
+            assert!(zone
+                .query("nothing-here.example.com.", Qtype::of(rt::A))
+                .is_empty());
         }
         let elapsed = start.elapsed();
 
