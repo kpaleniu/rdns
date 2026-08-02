@@ -111,12 +111,12 @@ quietly — `git blame` refuses a revision it cannot resolve.
 
 | | Windows | Linux |
 |---|---|---|
-| `rdns` lib | 648 | 633 |
+| `rdns` lib | 655 | 633 |
 | allocations | 1 | 1 |
 | no_input_panics | 1 | 1 |
 | `rdnsd` | 94 | **106** |
 | `rdnsr` | 3 | 3 |
-| **total** | **747** | **744** |
+| **total** | **754** | **744** |
 
 **The Windows column is current and the Linux one is not.** Linux was last
 measured before #13 landed; the gap between the columns is the sixteen
@@ -554,9 +554,14 @@ The numbers are **stable identifiers, not reading order.** They are referenced
 from the code (`ixfr.rs:16` points at "#7 step 6") and from each other, so they
 are never renumbered.
 
-**Everything numbered through #13 is closed; #14 is filed and unstarted.** What
-each was, and where its reasoning now lives — the commit that closed it, and the
-rule it became in `CLAUDE.md`:
+**#14 is closed; #15 and #16 are filed and unstarted. Three things are open and the
+table is where they are:** #7 step 6 (persisted deltas, waiting on #10), #10
+itself (the reading half is in, the writing half is not) and #11 (a stretch
+goal, unscheduled). The line here used to read "everything numbered through #13
+is closed", which was already untrue of those three when it was written and went
+stale again when #14 landed — left corrected rather than quietly reworded,
+per `CLAUDE.md` §11. What each item was, and where its reasoning now lives — the
+commit that closed it, and the rule it became in `CLAUDE.md`:
 
 | # | what it was | closed |
 |---|---|---|
@@ -568,6 +573,8 @@ rule it became in `CLAUDE.md`:
 | **10** | dynamic UPDATE (RFC 2136) | **started 2026-08-02.** The reading half is in (`rdns/src/update.rs`: §2.4/§2.5 forms, §3.1, §3.2, §3.4.1's prescan); the writing half — apply, serial, re-signing, journal — is not. #7 step 6 still waits on it |
 | **11** | data layout and CPU cache friendliness | **a stretch goal, not scheduled.** Its measurement harness exists now (criterion, `--baseline`); what it still lacks is the *diagnostic* half — `perf stat`'s cache-miss and branch-miss counters, which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns) is the number it would have to move |
 | **14** | three candidates #13 left on the table: `Serial`, QR as a type, sealing `RecordData` | **all three done 2026-08-02**, one commit each. 14a removed the second copy of RFC 1982 §3.2 and made `a > b` on two serials a compile error; 14b put all three socket entry points behind one `Request` door; 14c sealed `RecordData` into its own module — and, by asking what invariant it actually holds, found that a legal RFC 2136 UPDATE could not be parsed at all. 14a and 14b are preventative and say so; 14c's finding is under #10, with a regression test watched failing |
+| **16** | simplifications: `Nsec3`'s fallibility, splitting `parse_into`, and a duplication that must stay | **16b done, 16a corrected-and-withdrawn, 16c recorded as not-to-fix, 2026-08-02.** 16a is the interesting one: the filed plan did not survive being checked against `nsec3_hash` and is kept struck through with the reasoning, but the pass it came from found a live defect in `proves_no_ds`. Three more defects in `parse_dnssec_time` fell out of the same sweep |
+| **15** | `WireName` — collapsing `DName`/`UnpackedDName` into one borrowed, pointer-following type | **filed 2026-08-02, unstarted.** One candidate, with its own motivation retired inside it: the allocation case is spent, and the trigger is whether §13e's refused names are ever un-refused. Capped until storage moves to wire form, and then it is one project with it |
 | **12** | pre-authentication panics | **audited 2026-08-01.** No reachable panic in 1.4M mutated inputs; two mutex-poisoning fixes; `rdns/tests/no_input_panics.rs` left behind as the guard |
 | **13** | making illegal states unrepresentable: `OpCode`'s sentinel, the eleven name normalizations, QTYPE-vs-RTYPE, `Ttl` + `Class` + OPT out of the additional section, `Name`/`NameKey` | **done 2026-08-02**, twelve commits. 13a-13d in full; 13e's map keys done and its `Name` half deferred with a reason. Seven live defects fixed on the way. Every stage gated on `rdns/tests/allocations.rs` and every one has held its counts; 13b added a fifteenth measurement that went 2 to 0 |
 
@@ -1985,6 +1992,279 @@ unchanged.
 Genuinely low value, recorded so nobody re-derives them: the EDNS-version check
 duplicated across `rdnsd` and `rdnsr` (two lines of policy each daemon owns),
 and nine `bool` parameters (`dnssec_ok`, `is_tcp`, `deleting`).
+
+### 15. `WireName` — collapsing the name pipeline — one candidate, unstarted
+
+Written 2026-08-02, out of a conversation about the project's original design
+goal: that a domain name should never be copied, only borrowed from the packet
+bytes, with a string-like view over it. This section records what survives of
+that idea, because the honest answer has two halves and only one of them is
+worth building.
+
+**The starting question was allocations, and that motivation is spent.** Say so
+first, so nobody revives this expecting a speed-up. The DHAT pass's biggest find
+— `tokio::spawn` at 1,536 bytes per datagram, 46% of everything a query
+allocated — is fixed (`rdnsd/src/main.rs` records it where the per-datagram
+spawn used to be). Names went from ~14% of the answer path to near zero with
+`ascii_lowered_cow`, `absolute_lowered` and `names_equal` (#13b, #9e). What is
+left on the parse path is 3 allocations for a one-question query, and
+`benches/answer_path.rs`'s header puts one whole answer at ~0.5 µs against ~4 µs
+for the `sendto`/`recvfrom` pair around it. A total victory over name allocation
+is order 1-2% end to end. **Do not do this for speed.**
+
+**What a compressed name actually is.** Not a rope — this was checked, because
+"rope" is what it gets loosely called and it sends you after the wrong crate. A
+rope is a balanced tree whose value is O(log n) concat, split and index on large
+*mutable* text; `ropey` and `crop` are text-editor infrastructure and are UTF-8
+only, which a label (any octet, RFC 1035 §3.1) is not. A compressed name is a
+singly-linked chain of slices — a path through a DAG in the message buffer —
+that is at most 255 octets and 127 labels, immutable, and read front-to-back.
+Every property a rope charges for is one this does not need, and its nodes are
+heap-allocated, which inverts the goal. **No rope.**
+
+**The half that can borrow.** `Label::String(&'a [u8])` already does. What stops
+a name being free is `DName { labels: Vec<Label> }`, the `String` at the end, and
+— now gone — the visited-offsets set. The shape that replaces all three is
+`WireName<'a> { msg: &'a [u8], at: usize }` with an `Iterator<Item = &'a [u8]>`
+over labels that follows pointers as it walks. That is enough for every question
+this codebase asks of a name: equality (zip plus `eq_ignore_ascii_case`,
+RFC 4343), `is_at_or_under`, label count, the closest-encloser walk, and DNSSEC
+canonical ordering.
+
+`DName` and `UnpackedDName` then collapse into it. They are a typestate for "may
+contain a pointer" versus "may not" — `dname.rs` says so — and an iterator that
+resolves pointers as it goes never enters the first state. This is #13's pattern
+again: the guarded-against value stops being representable, so the guard stops
+earning its keep.
+
+**Four things the sketch has to get right**, each of which is where a naive
+attempt goes wrong:
+
+- **Do not make it lazy all the way down.** If `labels()` resolves pointers
+  during iteration it must yield `Result<&[u8], WireError>`, and comparison,
+  suffix matching and the compressor all become fallible for no reason. The
+  shape that works is `WireName::parse(msg, at)` doing **one validating walk**
+  (bounds, the backwards rule, label lengths, total ≤255) and then `labels()`
+  being infallible because parse proved it terminates. The invariant does not
+  disappear, it moves to the constructor — which is the point.
+- **Two length notions, named apart.** Callers need `rest` to keep parsing the
+  record, and that is the *encoded* length at the start position (labels until
+  root-or-pointer, plus 2 if a pointer ended it) — a different number from the
+  resolved name's length. This is the one part that cannot be deferred.
+- **UTF-8 and `unrepresentable_octet` move to the presentation terminal**, and
+  improve by moving. They fire at parse today (`dname.rs`'s `TryInto<String>`).
+  With `labels()` yielding `&[u8]` they fire only in `to_string()`, which is
+  where §13e's own argument puts them: escapes and separators are presentation
+  questions, and comparison and compression have no business asking them.
+- **Right-to-left traversal is the one thing the eager `Vec` was buying.**
+  Suffix matching, `is_at_or_under` and the closest-encloser walk want labels
+  from the end, and length-prefixed labels only iterate forwards. The answer is
+  not a tree: the label count is bounded by the protocol, so collect offsets
+  into a fixed `[u16; 128]` on the stack. No heap, and the reverse walk is an
+  index decrement.
+
+**The half that cannot borrow, and why this is capped.** A zone record outlives
+every packet, so `Zone` and `DnsCache` must own their names — one allocation
+either way, and `String` versus `Box<[u8]>` there is not a performance question
+at all. Worse, a borrowed name carries a lifetime, and §13e already recorded the
+objection: a lifetime parameter would infect `Zone`, `DnsCache` and everything
+holding one. So **the borrow design must stop at the parse boundary** by
+construction.
+
+Which caps the payoff. While `ResourceRecord.name` is a `String`, `WireName`'s
+terminal is `to_string()` on every path that stores anything, so this buys the
+parse side — `allocations.rs` has a one-question query at 3, and this takes it
+toward 1 — plus a meaningfully smaller `dname.rs`. **It does not compound until
+storage moves to wire form**, which is §13e's option 1, the one it deferred.
+
+**So the trigger for starting this is a correctness decision, not a performance
+one:** whether to stop refusing the names §13e's option 3 now rejects (a `.` or
+`\` inside a label). If that is ever reopened, `WireName` and wire-form storage
+are **one project, not two**, and doing the first alone means rebuilding the
+pipeline to arrive at the same place.
+
+### 16. Simplifications — a review pass, and what it did *not* find
+
+Written 2026-08-02, from a sweep asking what could be **deleted** rather than
+added. Half the value of this section is the second list: the candidates that
+looked obvious and did not survive being checked against the code. Every one of
+them is something the next reviewer will otherwise re-derive, and two of them
+were mine.
+
+**Three defects fell out of the same pass and were fixed first**, under "Done so
+far": `parse_dnssec_time` byte-slicing a `&str` after a byte-length check (a
+provoked panic), `days_in_month` returning 0 for an invalid month, and an
+`as u32` on an `i64` epoch. They are one function and were one commit.
+
+#### 16a. `Nsec3::matches`/`covers` — **the plan below was wrong; what it found was a defect**
+
+**Corrected 2026-08-02, in place** (`CLAUDE.md` §11: do not quietly edit a claim
+that turned out to be wrong — the reasoning that produced it is why the mistake
+happened). The section as filed said the fallibility had *one* cause and could be
+removed at the source. It has **three**, and reading `nsec3_hash` rather than
+assuming what it does is what showed it:
+
+1. an unknown hash algorithm — removable at construction, and done;
+2. `iterations > MAX_NSEC3_ITERATIONS`, the RFC 9276 cap;
+3. `dname_to_bytes` failing on the name being hashed — which depends on the
+   **argument**, not on the record, and so cannot be hoisted anywhere.
+
+So `matches`/`covers` cannot become infallible, the thirteen `.unwrap_or(false)`
+sites cannot be deleted, and **16a is not a simplification**. Worse, the
+direction the filed plan proposed was the wrong one: collapsing them to `bool`
+would have discarded the iteration-cap signal at every site, which is §4's quiet
+degradation — the cap firing is exactly what an operator needs named.
+
+This is §17's closing note landing on this very page: a plan is a claim about the
+code, and it has to be reviewed the way code is. The plan reasoned about what
+`nsec3_hash` *should* look like instead of opening it.
+
+**What the pass did find, and what was fixed instead — a live defect in the
+security-relevant proof.** Both NSEC3 loops (`proves_no_ds` and the NODATA path)
+wrote `Err(e) => return Denial::NotProved(...)`, so the **first** record that
+could not be hashed ended the search. RFC 5155 §8.1: "A validator MUST ignore
+NSEC3 RRs with unknown hash types. The practical result of this is that responses
+containing **only** such NSEC3 RRs will generally be considered bogus" — a
+statement about the whole set, not about its first member. The records arrive in
+a *response*, so which ones are in the set is not ours to choose, and one
+ignorable record ahead of a usable one flipped `proves_no_ds` from Proved to
+NotProved on ordering alone. Fixed: skip and keep looking, carry the reason, and
+report it only where the proof would otherwise fail anyway.
+
+Also landed, and the one piece of the original plan that was right:
+`Nsec3::from_record` now drops a record whose hash algorithm is not 1, which is
+§8.1's MUST and was simply not implemented. IANA's registry (RFC 5155 §11)
+reserves 0 and leaves 2-255 unassigned, so 1 is the whole of what exists.
+
+The `.unwrap_or(false)` inconsistency the pass noticed is **still open and still
+real** — `proves_no_ds` diagnosed the error at one loop and discarded it at the
+next, and thirteen sites discard it. That is worth a decision, but the decision
+runs toward *propagating*, not toward deleting, so it belongs under a different
+heading than "simplifications".
+
+<details><summary>The original 16a as filed, kept because it is why the mistake happened</summary>
+
+#### 16a (as filed). `Nsec3::matches`/`covers` are fallible for one reason, and it is fixable at the source
+
+`dnssec_denial.rs:402-432`. Both return `DnssecResult<bool>` solely because
+`hash()` rejects `hash_algorithm != 1`. The cost is **13 call sites writing
+`.unwrap_or(false)`** across `dnssec_denial`, `nsec_cache` and `zone_signer`,
+and two more handling the error as a diagnostic.
+
+`nsec3_ds_denial` does both, which is the argument: `:500` reports "NSEC3 for
+{zone} unusable: {e}" and `:524` silently discards the identical error twenty
+lines below it. That is `CLAUDE.md` §7's drift, inside one function, with no
+second copy to grep for.
+
+`Nsec3::from_record` (`:363`) already returns `Option` and already drops records
+it cannot understand — wrong rtype, undecodable owner label, unparseable rdata.
+Adding the algorithm to that filter is what RFC 5155 §8.1 asks a validator to do
+with an unknown NSEC3 hash type. The NSEC siblings at `:321`/`:331` are
+**already** infallible, so this makes a pair consistent rather than inventing a
+shape.
+
+Two things it must get right:
+
+- **`Nsec3`'s fields are `pub`**, so filtering in `from_record` does not make the
+  bad state unrepresentable — #14c's lesson, and the tests build literals
+  directly. Sealing it properly means its own module and nine accessors, which is
+  more code than the thirteen lines it deletes. The cheaper honest option is to
+  *define* the unsupported case as `false` with the reasoning in one doc comment:
+  the invariant becomes **defined rather than unrepresentable**, and the comment
+  has to say which of the two it is.
+- **The two diagnostic sites lose "unusable: {e}"**, which is a real loss and not
+  a rounding error. The mitigation is for whatever assembles the `Vec<Nsec3>` to
+  report how many records it dropped and why.
+
+*(End of the original filing. It got the second bullet right — the diagnostic
+does matter — and then proposed a change that would have thrown it away
+anyway.)*
+
+</details>
+
+#### 16b. `parse_into` is two functions — **done 2026-08-02**
+
+`rdata_from_fields` now holds the record-type match: `parse_into` went 521 lines
+to **218**, and the extracted function is 306. Behaviour-preserving, so there is
+no failing-first test and the commit says so — the evidence is the existing zone
+tests passing unchanged, plus the allocation gate holding "parse an eight-record
+zone" at **208**.
+
+That count is the part worth keeping. The joined field string is passed **by
+value**, not as `&str`: three arms (NS, CNAME, PTR) move it straight into a
+`ParsedRecord`, and a borrowed parameter made each of them allocate a second
+copy. The first version of the split did exactly that, and the compiler caught it
+as a type error before the gate had to.
+
+**Two things the extraction guard caught that reading had not.** The match needs
+*both* field views — `parts[idx..]` unquoted and `tokens[idx..]` quoted — and the
+first attempt passed only the second, because a `head -20` on the evidence had
+truncated the five `&parts[idx..]` uses out of sight. The lesson is the same one
+§17 keeps recording: the truncation was read as the whole. The script asserted on
+what remained after rewriting rather than trusting the grep, which is what turned
+a silent mistake into a failed assertion.
+
+<details><summary>The original 16b as filed</summary>
+
+#### 16b (as filed). `parse_into` is two functions — `zone.rs:1012-1532`, 521 lines
+
+Roughly 200 lines of line-shape parsing (`$ORIGIN`, `$TTL`, `$INCLUDE`, then
+owner/TTL/class), then a ~310-line `match record_type.as_str()` producing a
+`RecordData`. The match touches neither `zone`, nor `state` mutation, nor
+`depth`: it needs the tokens, the origin and the line number, so it lifts out as
+a pure function that can be tested directly. `parse_generic_rdata` (`:731`)
+already has that shape for the RFC 3597 `\#` case.
+
+**Length alone would not justify this** and the section should not be read as
+saying it does — a flat parser reads perfectly well top to bottom. What justifies
+it is that the two halves have *different inputs*: one mutates parser state, the
+other is pure. The seam is real, and a split that follows a seam is worth more
+than one that follows a line count.
+
+</details>
+
+#### 16c. `listener_failure` is duplicated verbatim — and should stay that way
+
+`rdnsd/src/main.rs:1285` and `rdnsr/src/main.rs:416` are identical modulo
+`anyhow!` versus `anyhow::anyhow!`. That is §7's shape exactly, and it is
+**recorded here as not-to-fix** because the obvious repair collides with §3:
+`rdns` has no `anyhow` dependency and a library that returns `anyhow::Error`
+erases the failure kind from its own API. A typed replacement
+(`enum ListenerFailure` plus a per-binary mapping) is about 22 lines to delete 8.
+
+§7's own precedent is the reason the trade differs: `utils::recv_error_is_transient`
+moved into the library cleanly **because it returns `bool`**. No error type
+crosses the boundary there. This one is an error type, which is precisely where
+§3 draws its line.
+
+#### What the adversarial pass killed
+
+Recorded so nobody re-derives them. Each looked like a rule violation and is not:
+
+- **`Result<_, String>` in six `zone.rs` helpers** — reads as a flat §3
+  violation. Documented at `zone.rs:565` with the reason: they produce a *detail*
+  ("odd number of hexadecimal digits") and only the zone parser knows the line
+  number to attach it to. Compliant, and the comment already says so.
+- **`nsec3_closest_encloser -> Result<String, String>`** (`:851`) — the `Err` is
+  not discarded; it flows into `Denial::NotProved(why)`. §3 explicitly allows a
+  `String` where the *category* is the typed part, and `Denial` is the category.
+- **`parse_root_hints -> Vec<SocketAddr>`** (`resolver.rs:118`) — reads as §4's
+  "never turn an error into an empty value". It is a documented decision: one
+  stray line must not sink an otherwise good hints file, and the caller decides
+  what an empty result means.
+- **"A 563-line `fmt` in `lib.rs`"** — did not exist. An `awk` that measured to
+  the *next* `fn` rather than to the end of the current one; the `Display` impls
+  are three lines each. A measurement artifact reported as a finding is exactly
+  what §10 warns about, and it got as far as being written down.
+- **Hand-rolled calendar arithmetic** — `parse_dnssec_time`, `format_dnssec_time`,
+  `is_leap`, `days_in_month` read as duplication wanting a date crate. They are a
+  matched *inverse pair* already sharing their helpers, and adding a dependency
+  for them would be §14's mistake. (Their real defects are separate and are fixed
+  under "Done so far".)
+- **22 `.lock().unwrap()` and 42 `let _ =`** — counted, not read. Reporting a
+  count as a finding is §17's "a hedge standing in for a one-line grep", so it is
+  not reported as one. **This is unaudited, not clean**, and saying so is the
+  point of the entry.
 
 ## Closed work
 

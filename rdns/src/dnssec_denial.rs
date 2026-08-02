@@ -344,6 +344,13 @@ impl Nsec {
     }
 }
 
+/// The only NSEC3 hash algorithm IANA has assigned: 1, SHA-1.
+///
+/// The "DNSSEC NSEC3 Hash Algorithms" registry (RFC 5155 §11) reserves 0 and
+/// leaves 2-255 available, so anything but 1 is a type we cannot compute and —
+/// per §8.1 — must ignore rather than object to.
+const SHA1_HASH_ALGORITHM: u8 = 1;
+
 /// An NSEC3 record, with its owner hash decoded out of the first label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nsec3 {
@@ -376,7 +383,7 @@ impl Nsec3 {
                 salt,
                 next_hashed_owner,
                 type_bitmap,
-            } => Some(Nsec3 {
+            } if hash_algorithm == SHA1_HASH_ALGORITHM => Some(Nsec3 {
                 owner: owner.clone(),
                 owner_hash,
                 zone: zone.to_string(),
@@ -496,6 +503,20 @@ pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
         return Denial::Proved;
     }
 
+    // A record we cannot hash does not end the search. This loop used to
+    // `return` on the first `Err`, so one unusable NSEC3 anywhere in the set
+    // poisoned a proof that a later record would have completed — and the
+    // records come out of a *response*, so which ones are in the set is not
+    // ours to choose. RFC 5155 §8.1 says to ignore what we cannot hash and
+    // that "responses containing **only** such NSEC3 RRs will generally be
+    // considered bogus", which is a statement about the whole set and not about
+    // the first member of it.
+    //
+    // The reason is kept and reported below only if nothing matched, which is
+    // the case where it is genuinely the explanation. Dropping it entirely
+    // would be the quiet degradation §4 warns about: the RFC 9276 iteration cap
+    // is the likeliest cause and an operator needs to see it named.
+    let mut unusable: Option<String> = None;
     for nsec3 in nsec3s {
         match nsec3.matches(zone) {
             Ok(true) => {
@@ -510,7 +531,7 @@ pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
                 return Denial::Proved;
             }
             Ok(false) => {}
-            Err(e) => return Denial::NotProved(format!("NSEC3 for {zone} unusable: {e}")),
+            Err(e) => unusable = unusable.or(Some(e.to_string())),
         }
     }
 
@@ -526,6 +547,9 @@ pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
         }
     }
 
+    if let Some(why) = unusable {
+        return Denial::NotProved(format!("NSEC3 for {zone} unusable: {why}"));
+    }
     Denial::NotProved(format!("no NSEC or NSEC3 record covers the DS at {zone}"))
 }
 
@@ -589,11 +613,17 @@ pub fn proves_nodata(
         return nodata_bitmap(qtype, qname, |t| nsec.has_type(t));
     }
 
+    // As in `proves_no_ds`: an unusable record is skipped rather than returned
+    // on, so it cannot poison a set a later record would have answered from.
+    // Here the fall-through is the wildcard-NODATA path below, which is a real
+    // answer — so this loop had the more damaging version of the bug, one bad
+    // NSEC3 short-circuiting past a proof that had not been attempted yet.
+    let mut unusable: Option<String> = None;
     for nsec3 in nsec3s {
         match nsec3.matches(qname) {
             Ok(true) => return nodata_bitmap(qtype, qname, |t| nsec3.has_type(t)),
             Ok(false) => {}
-            Err(e) => return Denial::NotProved(format!("NSEC3 for {qname} unusable: {e}")),
+            Err(e) => unusable = unusable.or(Some(e.to_string())),
         }
     }
 
@@ -603,7 +633,19 @@ pub fn proves_nodata(
         return nsec_wildcard_nodata(qname, qtype, nsecs);
     }
     if !nsec3s.is_empty() {
-        return nsec3_wildcard_nodata(qname, zone, qtype, nsec3s);
+        // The reason a record was skipped is reported only if the wildcard
+        // proof *also* failed — putting the check above this branch would have
+        // reintroduced the very short-circuit being removed, one step later.
+        // `nsec3_closest_encloser` inside here swallows the same failure with
+        // `unwrap_or(false)`, so without this the RFC 9276 iteration cap — the
+        // likeliest cause — reaches the operator as "no closest encloser",
+        // which sends them after the wrong thing entirely.
+        return match (nsec3_wildcard_nodata(qname, zone, qtype, nsec3s), unusable) {
+            (Denial::NotProved(_), Some(why)) => {
+                Denial::NotProved(format!("NSEC3 for {qname} unusable: {why}"))
+            }
+            (proof, _) => proof,
+        };
     }
 
     Denial::NotProved(format!(
@@ -1692,5 +1734,94 @@ mod tests {
         assert!(n.matches("child.example.com.").is_err());
         let denial = proves_no_ds("child.example.com.", &[], &[n]);
         assert!(!denial.is_proved(), "{denial:?}");
+    }
+
+    /// One NSEC3 we cannot hash must not poison a set another record answers
+    /// from (RFC 5155 §8.1: a validator MUST *ignore* such records, and it is
+    /// "responses containing **only** such NSEC3 RRs" that are bogus).
+    ///
+    /// **Watched failing first** (`CLAUDE.md` §1): both loops used to `return`
+    /// on the first `Err`, so ordering decided the answer — the usable record
+    /// second in the list was never reached, and `proves_no_ds` came back
+    /// NotProved for a delegation it can prove. The records come out of a
+    /// *response*, so which ones are in the set is not ours to choose.
+    #[test]
+    fn one_unhashable_nsec3_does_not_poison_the_rest_of_the_set() {
+        // Over the RFC 9276 cap, so `matches` on it is an `Err` rather than a
+        // mismatch. Everything else about it is well formed.
+        let mut poison = nsec3_matching("other.example.com.", &[rt::A]);
+        poison.iterations = MAX_NSEC3_ITERATIONS + 1;
+
+        let good = nsec3_matching("example.com.", &[rt::NS]);
+        assert_eq!(
+            proves_no_ds("example.com.", &[], std::slice::from_ref(&good)),
+            Denial::Proved,
+            "the usable record alone proves it",
+        );
+
+        // The same set with the unusable record placed first.
+        assert_eq!(
+            proves_no_ds("example.com.", &[], &[poison, good]),
+            Denial::Proved,
+            "an ignorable record before it must not change the answer",
+        );
+    }
+
+    /// And when *every* record is unusable, the reason still reaches the caller
+    /// rather than being flattened into "nothing covers this".
+    ///
+    /// **Not a regression test, and it must not be counted as one** — it passes
+    /// against the old code too, which returned the reason on the first `Err`
+    /// it met. It is here because that is exactly what the fix above was at risk
+    /// of throwing away: skipping unusable records is the correct change, and
+    /// the obvious way to write it drops the diagnostic with them. This pins the
+    /// half that had to survive (`CLAUDE.md` §1 and §10 — say what a test is a
+    /// regression for, and what it is not).
+    ///
+    /// The RFC 9276 iteration cap is the likeliest cause in practice, so it is
+    /// the one an operator has to be able to read off the failure.
+    #[test]
+    fn a_set_of_only_unhashable_nsec3s_reports_why() {
+        let mut poison = nsec3_matching("example.com.", &[rt::NS]);
+        poison.iterations = MAX_NSEC3_ITERATIONS + 1;
+
+        match proves_no_ds("example.com.", &[], &[poison]) {
+            Denial::NotProved(why) => assert!(
+                why.contains("iteration count"),
+                "the cap should be named, got {why:?}",
+            ),
+            other => panic!("expected NotProved, got {other:?}"),
+        }
+    }
+
+    /// An NSEC3 whose hash algorithm is not SHA-1 is dropped as it is read,
+    /// which is what RFC 5155 §8.1's MUST asks for and what makes the set the
+    /// parser hands on contain only records that can be used.
+    ///
+    /// IANA's "DNSSEC NSEC3 Hash Algorithms" registry (RFC 5155 §11) reserves 0
+    /// and leaves 2-255 unassigned, so 1 is the whole of what exists.
+    #[test]
+    fn an_nsec3_with_an_unknown_hash_algorithm_is_not_read_at_all() {
+        let usable = nsec3_matching("example.com.", &[rt::NS]);
+        let mut rdata = Vec::new();
+        rdata.push(2u8); // hash algorithm 2 — unassigned
+        rdata.push(usable.flags);
+        rdata.extend_from_slice(&usable.iterations.to_be_bytes());
+        rdata.push(usable.salt.len() as u8);
+        rdata.extend_from_slice(&usable.salt);
+        rdata.push(usable.next_hashed_owner.len() as u8);
+        rdata.extend_from_slice(&usable.next_hashed_owner);
+        rdata.extend_from_slice(&usable.type_bitmap);
+
+        let rr = ResourceRecord {
+            name: usable.owner.clone(),
+            class: Class::IN,
+            ttl: Ttl::from_secs(3600),
+            rdata: RecordData::new(rt::NSEC3, rdata).expect("well-formed NSEC3 rdata"),
+        };
+        assert!(
+            Nsec3::from_record(&rr).is_none(),
+            "an unknown hash type must be ignored, not stored",
+        );
     }
 }

@@ -613,46 +613,93 @@ fn is_leap(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-fn days_in_month(month: i32, year: i32) -> i32 {
+/// How many days `month` (1-12) has in `year`, or `None` if that is not a month.
+///
+/// **`None`, and not zero.** It returned `0` for anything outside 1-12, and
+/// [`parse_dnssec_time`] fed it a field it had never range-checked: the month in
+/// `20250013000000` is **13**, contributed zero days, and the whole timestamp
+/// came back as a plausible-looking epoch for a date that does not exist. That
+/// is `CLAUDE.md` §4's "never turn an error into an empty value" in numeric
+/// clothing — a length of zero reads as an answer, and every caller summing
+/// these had no way to tell it apart from one.
+fn days_in_month(month: i32, year: i32) -> Option<i32> {
     match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap(year) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 => Some(if is_leap(year) { 29 } else { 28 }),
+        _ => None,
     }
 }
 
+/// An RRSIG's inception or expiration: a bare epoch, or `YYYYMMDDHHmmSS` in UTC
+/// (RFC 4034 §3.2).
+///
+/// Every field is range-checked, and the result is checked to fit, because
+/// neither used to be true — see the comments at each. The inverse is
+/// [`format_dnssec_time`], and `test_dnssec_time_round_trips` holds them
+/// together.
 pub(crate) fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
     if let Ok(epoch) = time_str.parse::<u32>() {
         return Ok(epoch);
     }
-    if time_str.len() == 14 {
-        let year = time_str[0..4].parse::<i32>().map_err(|e| e.to_string())?;
-        let month = time_str[4..6].parse::<i32>().map_err(|e| e.to_string())?;
-        let day = time_str[6..8].parse::<i32>().map_err(|e| e.to_string())?;
-        let hour = time_str[8..10].parse::<i32>().map_err(|e| e.to_string())?;
-        let min = time_str[10..12].parse::<i32>().map_err(|e| e.to_string())?;
-        let sec = time_str[12..14].parse::<i32>().map_err(|e| e.to_string())?;
 
-        let mut total_days = 0;
-        for y in 1970..year {
-            total_days += if is_leap(y) { 366 } else { 365 };
-        }
-        for m in 1..month {
-            total_days += days_in_month(m, year);
-        }
-        total_days += day - 1;
-
-        let epoch = total_days as i64 * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
-        return Ok(epoch as u32);
+    // Fourteen **ASCII digits**, established before anything is sliced.
+    // `str::len` is a count of bytes and the slicing below indexes by byte, so a
+    // 14-byte string holding a multi-byte character used to *panic* here rather
+    // than fail to parse: `"abcé123456789"` is 14 bytes and `time_str[0..4]`
+    // lands inside the `é`. A zone file is operator input rather than a
+    // stranger's, so this was a bad file taking the load down instead of
+    // returning an error — provoked rather than reasoned about (`TODO.md` #16).
+    if time_str.len() != 14 || !time_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "Invalid DNSSEC time format: {time_str} (want a bare epoch or 14 digits)"
+        ));
     }
-    Err(format!("Invalid DNSSEC time format: {}", time_str))
+
+    let year = time_str[0..4].parse::<i32>().map_err(|e| e.to_string())?;
+    let month = time_str[4..6].parse::<i32>().map_err(|e| e.to_string())?;
+    let day = time_str[6..8].parse::<i32>().map_err(|e| e.to_string())?;
+    let hour = time_str[8..10].parse::<i32>().map_err(|e| e.to_string())?;
+    let min = time_str[10..12].parse::<i32>().map_err(|e| e.to_string())?;
+    let sec = time_str[12..14].parse::<i32>().map_err(|e| e.to_string())?;
+
+    // None of these was checked, and the arithmetic below is happy to run on any
+    // of them: a year before 1970 makes `total_days` negative, which the old
+    // `as u32` then wrapped into the far future rather than rejecting.
+    if year < 1970 {
+        return Err(format!("{time_str}: year {year} is before the POSIX epoch"));
+    }
+    let days_this_month = days_in_month(month, year)
+        .ok_or_else(|| format!("{time_str}: month {month} is not a month"))?;
+    if !(1..=days_this_month).contains(&day) {
+        return Err(format!(
+            "{time_str}: day {day} is not a day of month {month}"
+        ));
+    }
+    // Seconds stop at 59: this converts to POSIX time, which has no leap
+    // seconds, so there is no instant for a `:60` to name.
+    if hour > 23 || min > 59 || sec > 59 {
+        return Err(format!(
+            "{time_str}: {hour:02}:{min:02}:{sec:02} is not a time"
+        ));
+    }
+
+    let mut total_days = 0;
+    for y in 1970..year {
+        total_days += if is_leap(y) { 366 } else { 365 };
+    }
+    for m in 1..month {
+        // Cannot be `None`: `month` is 1-12 by the check above, so `m` is 1-11.
+        total_days += days_in_month(m, year).unwrap_or(0);
+    }
+    total_days += day - 1;
+
+    let epoch = total_days as i64 * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
+    // `as u32` truncated, so `21060207062816` — one second past what the field
+    // can hold — read back as 0, i.e. 1970, and a signature dated the far future
+    // became one that expired at the dawn of time (`CLAUDE.md` §2).
+    u32::try_from(epoch)
+        .map_err(|_| format!("{time_str} is outside the range a 32-bit DNSSEC timestamp can hold"))
 }
 
 /// The `YYYYMMDDHHmmSS` form an RRSIG's times are written in (RFC 4034 §3.2).
@@ -679,9 +726,20 @@ pub(crate) fn format_dnssec_time(epoch: u32) -> String {
         year += 1;
     }
 
+    // Bounded at December rather than trusting the day count to run out. It
+    // cannot overrun — the loop above leaves `days` under 366 — but when
+    // `days_in_month` answered 0 for a month of 13, `days >= 0` was always true
+    // and an overrun would have spun here until `month` overflowed. Making that
+    // impossible by construction costs one `let ... else`.
     let mut month = 1;
-    while days >= days_in_month(month, year) {
-        days -= days_in_month(month, year);
+    while month < 12 {
+        let Some(in_month) = days_in_month(month, year) else {
+            break;
+        };
+        if days < in_month {
+            break;
+        }
+        days -= in_month;
         month += 1;
     }
 
@@ -1009,6 +1067,329 @@ fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
 }
 
 /// Read `content` into `zone`. Recurses for `$INCLUDE`, hence `depth`.
+/// The RDATA half of a zone-file line: everything after the owner name, TTL,
+/// class and type have been read off it.
+///
+/// **Split out of [`parse_into`] because the two halves have different inputs**
+/// (`TODO.md` #16b), and not because that function was long. The half above this
+/// one walks the file and mutates parser state — `$ORIGIN`, `$TTL`, `$INCLUDE`,
+/// the current TTL, the owner name a line inherits from the line before it.
+/// This half touches none of that: given a type and its fields it is a pure
+/// function, and being pure is what lets it be tested directly instead of only
+/// through a whole zone file.
+///
+/// Both views of the fields are passed because both are needed. `rdata` is them
+/// joined by a single space, which is what every type but TXT wants; `fields` is
+/// the same tokens unquoted; `text_fields` keeps the quoting, which TXT needs
+/// because a TXT RR is a *sequence* of character-strings and the quotes are what
+/// say where each one ends (RFC 1035 §3.3.14).
+fn rdata_from_fields(
+    record_type: &str,
+    rdata: String,
+    fields: &[&str],
+    text_fields: &[String],
+    ln: usize,
+) -> Result<RecordData, ZoneError> {
+    Ok(match record_type {
+        "A" => {
+            let addr = rdata
+                .parse::<Ipv4Addr>()
+                .map_err(|e| ZoneError::syntax(ln, format!("invalid A address {rdata:?}: {e}")))?;
+            RecordData::from_parsed(&ParsedRecord::A(addr))
+                .map_err(|e| ZoneError::syntax(ln, format!("A record: {e}")))?
+        }
+        "AAAA" => {
+            let addr = rdata.parse::<Ipv6Addr>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid AAAA address {rdata:?}: {e}"))
+            })?;
+            RecordData::from_parsed(&ParsedRecord::AAAA(addr))
+                .map_err(|e| ZoneError::syntax(ln, format!("AAAA record: {e}")))?
+        }
+        "NS" => RecordData::from_parsed(&ParsedRecord::NS(rdata))
+            .map_err(|e| ZoneError::syntax(ln, format!("NS record: {e}")))?,
+        "CNAME" => RecordData::from_parsed(&ParsedRecord::CNAME(rdata))
+            .map_err(|e| ZoneError::syntax(ln, format!("CNAME record: {e}")))?,
+        "MX" => {
+            let mx_parts: Vec<&str> = rdata.split_whitespace().collect();
+            if mx_parts.len() < 2 {
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!("MX record needs preference and exchange, got {:?}", rdata),
+                ));
+            }
+            let preference = mx_parts[0].parse::<u16>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid MX preference {:?}: {e}", mx_parts[0]))
+            })?;
+            RecordData::from_parsed(&ParsedRecord::MX {
+                preference,
+                exchange: mx_parts[1..].join(" "),
+            })
+            .map_err(|e| ZoneError::syntax(ln, format!("MX record: {e}")))?
+        }
+        "TXT" => {
+            // Every field after the type is one `<character-string>`
+            // (RFC 1035 §3.3.14): `"a b" c` is two strings, `a b c` is
+            // three, and the quotes are what says which. The 255-byte
+            // ceiling is enforced by the encoder, for every caller.
+            // The zone file speaks text; a character-string is octets.
+            let strings: Vec<Vec<u8>> = text_fields.iter().map(|t| t.as_bytes().to_vec()).collect();
+            if strings.is_empty() {
+                return Err(ZoneError::syntax(ln, "TXT record has no text"));
+            }
+            RecordData::from_parsed(&ParsedRecord::TXT(strings))
+                .map_err(|e| ZoneError::syntax(ln, format!("TXT record: {e}")))?
+        }
+        "PTR" => RecordData::from_parsed(&ParsedRecord::PTR(rdata))
+            .map_err(|e| ZoneError::syntax(ln, format!("PTR record: {e}")))?,
+        "SOA" => {
+            let soa_parts: Vec<&str> = rdata.split_whitespace().collect();
+            if soa_parts.len() < 7 {
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!("SOA record needs 7 fields, got {}", soa_parts.len()),
+                ));
+            }
+            let serial = soa_parts[2].parse::<Serial>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid SOA serial {:?}: {e}", soa_parts[2]))
+            })?;
+            let refresh = soa_parts[3].parse::<i32>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid SOA refresh {:?}: {e}", soa_parts[3]))
+            })?;
+            let retry = soa_parts[4].parse::<i32>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid SOA retry {:?}: {e}", soa_parts[4]))
+            })?;
+            let expire = soa_parts[5].parse::<i32>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid SOA expire {:?}: {e}", soa_parts[5]))
+            })?;
+            let minimum = soa_parts[6].parse::<u32>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid SOA minimum {:?}: {e}", soa_parts[6]))
+            })?;
+            RecordData::from_parsed(&ParsedRecord::SOA {
+                mname: soa_parts[0].to_string(),
+                rname: soa_parts[1].to_string(),
+                serial,
+                refresh,
+                retry,
+                expire,
+                minimum,
+            })
+            .map_err(|e| ZoneError::syntax(ln, format!("SOA record: {e}")))?
+        }
+        "DNSKEY" => {
+            let key_parts = fields;
+            if key_parts.len() < 4 {
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!("DNSKEY record needs 4 fields, got {}", key_parts.len()),
+                ));
+            }
+            let flags = key_parts[0].parse::<u16>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid DNSKEY flags {:?}: {e}", key_parts[0]))
+            })?;
+            let protocol = key_parts[1].parse::<u8>().map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid DNSKEY protocol {:?}: {e}", key_parts[1]),
+                )
+            })?;
+            let algorithm = key_parts[2].parse::<u8>().map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid DNSKEY algorithm {:?}: {e}", key_parts[2]),
+                )
+            })?;
+            let b64_key = key_parts[3..].join("");
+            let public_key = base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_key)
+                .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY base64 key: {e}")))?;
+            RecordData::from_parsed(&ParsedRecord::DNSKEY {
+                flags,
+                protocol,
+                algorithm,
+                public_key,
+            })
+            .map_err(|e| ZoneError::syntax(ln, format!("DNSKEY record: {e}")))?
+        }
+        "DS" => {
+            let ds_parts = fields;
+            if ds_parts.len() < 4 {
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!("DS record needs 4 fields, got {}", ds_parts.len()),
+                ));
+            }
+            let key_tag = ds_parts[0].parse::<u16>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid DS key tag {:?}: {e}", ds_parts[0]))
+            })?;
+            let algorithm = ds_parts[1].parse::<u8>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid DS algorithm {:?}: {e}", ds_parts[1]))
+            })?;
+            let digest_type = ds_parts[2].parse::<u8>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid DS digest type {:?}: {e}", ds_parts[2]))
+            })?;
+            let hex_digest = ds_parts[3..].join("");
+            let digest = parse_hex(&hex_digest)
+                .map_err(|e| ZoneError::syntax(ln, format!("invalid DS digest: {e}")))?;
+            RecordData::from_parsed(&ParsedRecord::DS {
+                key_tag,
+                algorithm,
+                digest_type,
+                digest,
+            })
+            .map_err(|e| ZoneError::syntax(ln, format!("DS record: {e}")))?
+        }
+        "RRSIG" => {
+            let rrsig_parts = fields;
+            if rrsig_parts.len() < 9 {
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!("RRSIG record needs 9 fields, got {}", rrsig_parts.len()),
+                ));
+            }
+            let type_covered =
+                crate::utils::record_type_name_to_code(rrsig_parts[0]).ok_or_else(|| {
+                    ZoneError::syntax(
+                        ln,
+                        format!("unknown RRSIG type covered {:?}", rrsig_parts[0]),
+                    )
+                })?;
+            let algorithm = rrsig_parts[1].parse::<u8>().map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid RRSIG algorithm {:?}: {e}", rrsig_parts[1]),
+                )
+            })?;
+            let labels = rrsig_parts[2].parse::<u8>().map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid RRSIG labels {:?}: {e}", rrsig_parts[2]),
+                )
+            })?;
+            let original_ttl = rrsig_parts[3].parse::<u32>().map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid RRSIG original TTL {:?}: {e}", rrsig_parts[3]),
+                )
+            })?;
+            let expiration = parse_dnssec_time(rrsig_parts[4]).map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid RRSIG expiration {:?}: {e}", rrsig_parts[4]),
+                )
+            })?;
+            let inception = parse_dnssec_time(rrsig_parts[5]).map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid RRSIG inception {:?}: {e}", rrsig_parts[5]),
+                )
+            })?;
+            let key_tag = rrsig_parts[6].parse::<u16>().map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid RRSIG key tag {:?}: {e}", rrsig_parts[6]),
+                )
+            })?;
+            let signer_name = rrsig_parts[7].to_string();
+            let b64_sig = rrsig_parts[8..].join("");
+            let signature = base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_sig)
+                .map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid RRSIG base64 signature: {e}"))
+                })?;
+            RecordData::from_parsed(&ParsedRecord::RRSIG {
+                type_covered,
+                algorithm,
+                labels,
+                original_ttl,
+                expiration,
+                inception,
+                key_tag,
+                signer_name,
+                signature,
+            })
+            .map_err(|e| ZoneError::syntax(ln, format!("RRSIG record: {e}")))?
+        }
+        "NSEC" => {
+            let nsec_parts = fields;
+            if nsec_parts.len() < 2 {
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!(
+                        "NSEC record needs next domain and at least one type, got {}",
+                        nsec_parts.len()
+                    ),
+                ));
+            }
+            let next_domain_name = nsec_parts[0].to_string();
+            let type_names: Vec<String> = nsec_parts[1..].iter().map(|s| s.to_string()).collect();
+            let type_bitmap = construct_type_bitmap(&type_names)
+                .map_err(|e| ZoneError::syntax(ln, format!("NSEC record: {e}")))?;
+            RecordData::from_parsed(&ParsedRecord::NSEC {
+                next_domain_name,
+                type_bitmap,
+            })
+            .map_err(|e| ZoneError::syntax(ln, format!("NSEC record: {e}")))?
+        }
+        "NSEC3" => {
+            let nsec3_parts = fields;
+            if nsec3_parts.len() < 5 {
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!(
+                        "NSEC3 record needs at least 5 fields, got {}",
+                        nsec3_parts.len()
+                    ),
+                ));
+            }
+            let hash_algorithm = nsec3_parts[0].parse::<u8>().map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid NSEC3 hash algorithm {:?}: {e}", nsec3_parts[0]),
+                )
+            })?;
+            let flags = nsec3_parts[1].parse::<u8>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid NSEC3 flags {:?}: {e}", nsec3_parts[1]))
+            })?;
+            let iterations = nsec3_parts[2].parse::<u16>().map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid NSEC3 iterations {:?}: {e}", nsec3_parts[2]),
+                )
+            })?;
+            let salt_str = nsec3_parts[3];
+            let salt = if salt_str == "-" {
+                Vec::new()
+            } else {
+                parse_hex(salt_str).map_err(|e| {
+                    ZoneError::syntax(ln, format!("invalid NSEC3 salt {:?}: {e}", salt_str))
+                })?
+            };
+            let next_hashed_owner = parse_base32_hex(nsec3_parts[4]).map_err(|e| {
+                ZoneError::syntax(
+                    ln,
+                    format!("invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4]),
+                )
+            })?;
+            let type_names: Vec<String> = nsec3_parts[5..].iter().map(|s| s.to_string()).collect();
+            let type_bitmap = construct_type_bitmap(&type_names)
+                .map_err(|e| ZoneError::syntax(ln, format!("NSEC3 record: {e}")))?;
+            RecordData::from_parsed(&ParsedRecord::NSEC3 {
+                hash_algorithm,
+                flags,
+                iterations,
+                salt,
+                next_hashed_owner,
+                type_bitmap,
+            })
+            .map_err(|e| ZoneError::syntax(ln, format!("NSEC3 record: {e}")))?
+        }
+        other => {
+            return Err(ZoneError::syntax(
+                ln,
+                format!("unsupported record type {other:?}"),
+            ));
+        }
+    })
+}
+
 fn parse_into(
     zone: &mut Zone,
     content: &str,
@@ -1214,311 +1595,8 @@ fn parse_into(
             continue;
         }
 
-        let rdata: RecordData = match record_type.as_str() {
-            "A" => {
-                let addr = rdata.parse::<Ipv4Addr>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid A address {rdata:?}: {e}"))
-                })?;
-                RecordData::from_parsed(&ParsedRecord::A(addr))
-                    .map_err(|e| ZoneError::syntax(ln, format!("A record: {e}")))?
-            }
-            "AAAA" => {
-                let addr = rdata.parse::<Ipv6Addr>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid AAAA address {rdata:?}: {e}"))
-                })?;
-                RecordData::from_parsed(&ParsedRecord::AAAA(addr))
-                    .map_err(|e| ZoneError::syntax(ln, format!("AAAA record: {e}")))?
-            }
-            "NS" => RecordData::from_parsed(&ParsedRecord::NS(rdata))
-                .map_err(|e| ZoneError::syntax(ln, format!("NS record: {e}")))?,
-            "CNAME" => RecordData::from_parsed(&ParsedRecord::CNAME(rdata))
-                .map_err(|e| ZoneError::syntax(ln, format!("CNAME record: {e}")))?,
-            "MX" => {
-                let mx_parts: Vec<&str> = rdata.split_whitespace().collect();
-                if mx_parts.len() < 2 {
-                    return Err(ZoneError::syntax(
-                        ln,
-                        format!("MX record needs preference and exchange, got {:?}", rdata),
-                    ));
-                }
-                let preference = mx_parts[0].parse::<u16>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid MX preference {:?}: {e}", mx_parts[0]))
-                })?;
-                RecordData::from_parsed(&ParsedRecord::MX {
-                    preference,
-                    exchange: mx_parts[1..].join(" "),
-                })
-                .map_err(|e| ZoneError::syntax(ln, format!("MX record: {e}")))?
-            }
-            "TXT" => {
-                // Every field after the type is one `<character-string>`
-                // (RFC 1035 §3.3.14): `"a b" c` is two strings, `a b c` is
-                // three, and the quotes are what says which. The 255-byte
-                // ceiling is enforced by the encoder, for every caller.
-                // The zone file speaks text; a character-string is octets.
-                let strings: Vec<Vec<u8>> = tokens[idx..]
-                    .iter()
-                    .map(|t| t.as_bytes().to_vec())
-                    .collect();
-                if strings.is_empty() {
-                    return Err(ZoneError::syntax(ln, "TXT record has no text"));
-                }
-                RecordData::from_parsed(&ParsedRecord::TXT(strings))
-                    .map_err(|e| ZoneError::syntax(ln, format!("TXT record: {e}")))?
-            }
-            "PTR" => RecordData::from_parsed(&ParsedRecord::PTR(rdata))
-                .map_err(|e| ZoneError::syntax(ln, format!("PTR record: {e}")))?,
-            "SOA" => {
-                let soa_parts: Vec<&str> = rdata.split_whitespace().collect();
-                if soa_parts.len() < 7 {
-                    return Err(ZoneError::syntax(
-                        ln,
-                        format!("SOA record needs 7 fields, got {}", soa_parts.len()),
-                    ));
-                }
-                let serial = soa_parts[2].parse::<Serial>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid SOA serial {:?}: {e}", soa_parts[2]))
-                })?;
-                let refresh = soa_parts[3].parse::<i32>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid SOA refresh {:?}: {e}", soa_parts[3]))
-                })?;
-                let retry = soa_parts[4].parse::<i32>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid SOA retry {:?}: {e}", soa_parts[4]))
-                })?;
-                let expire = soa_parts[5].parse::<i32>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid SOA expire {:?}: {e}", soa_parts[5]))
-                })?;
-                let minimum = soa_parts[6].parse::<u32>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid SOA minimum {:?}: {e}", soa_parts[6]))
-                })?;
-                RecordData::from_parsed(&ParsedRecord::SOA {
-                    mname: soa_parts[0].to_string(),
-                    rname: soa_parts[1].to_string(),
-                    serial,
-                    refresh,
-                    retry,
-                    expire,
-                    minimum,
-                })
-                .map_err(|e| ZoneError::syntax(ln, format!("SOA record: {e}")))?
-            }
-            "DNSKEY" => {
-                let key_parts = &parts[idx..];
-                if key_parts.len() < 4 {
-                    return Err(ZoneError::syntax(
-                        ln,
-                        format!("DNSKEY record needs 4 fields, got {}", key_parts.len()),
-                    ));
-                }
-                let flags = key_parts[0].parse::<u16>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid DNSKEY flags {:?}: {e}", key_parts[0]))
-                })?;
-                let protocol = key_parts[1].parse::<u8>().map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid DNSKEY protocol {:?}: {e}", key_parts[1]),
-                    )
-                })?;
-                let algorithm = key_parts[2].parse::<u8>().map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid DNSKEY algorithm {:?}: {e}", key_parts[2]),
-                    )
-                })?;
-                let b64_key = key_parts[3..].join("");
-                let public_key =
-                    base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_key).map_err(
-                        |e| ZoneError::syntax(ln, format!("invalid DNSKEY base64 key: {e}")),
-                    )?;
-                RecordData::from_parsed(&ParsedRecord::DNSKEY {
-                    flags,
-                    protocol,
-                    algorithm,
-                    public_key,
-                })
-                .map_err(|e| ZoneError::syntax(ln, format!("DNSKEY record: {e}")))?
-            }
-            "DS" => {
-                let ds_parts = &parts[idx..];
-                if ds_parts.len() < 4 {
-                    return Err(ZoneError::syntax(
-                        ln,
-                        format!("DS record needs 4 fields, got {}", ds_parts.len()),
-                    ));
-                }
-                let key_tag = ds_parts[0].parse::<u16>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid DS key tag {:?}: {e}", ds_parts[0]))
-                })?;
-                let algorithm = ds_parts[1].parse::<u8>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid DS algorithm {:?}: {e}", ds_parts[1]))
-                })?;
-                let digest_type = ds_parts[2].parse::<u8>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid DS digest type {:?}: {e}", ds_parts[2]))
-                })?;
-                let hex_digest = ds_parts[3..].join("");
-                let digest = parse_hex(&hex_digest)
-                    .map_err(|e| ZoneError::syntax(ln, format!("invalid DS digest: {e}")))?;
-                RecordData::from_parsed(&ParsedRecord::DS {
-                    key_tag,
-                    algorithm,
-                    digest_type,
-                    digest,
-                })
-                .map_err(|e| ZoneError::syntax(ln, format!("DS record: {e}")))?
-            }
-            "RRSIG" => {
-                let rrsig_parts = &parts[idx..];
-                if rrsig_parts.len() < 9 {
-                    return Err(ZoneError::syntax(
-                        ln,
-                        format!("RRSIG record needs 9 fields, got {}", rrsig_parts.len()),
-                    ));
-                }
-                let type_covered = crate::utils::record_type_name_to_code(rrsig_parts[0])
-                    .ok_or_else(|| {
-                        ZoneError::syntax(
-                            ln,
-                            format!("unknown RRSIG type covered {:?}", rrsig_parts[0]),
-                        )
-                    })?;
-                let algorithm = rrsig_parts[1].parse::<u8>().map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid RRSIG algorithm {:?}: {e}", rrsig_parts[1]),
-                    )
-                })?;
-                let labels = rrsig_parts[2].parse::<u8>().map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid RRSIG labels {:?}: {e}", rrsig_parts[2]),
-                    )
-                })?;
-                let original_ttl = rrsig_parts[3].parse::<u32>().map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid RRSIG original TTL {:?}: {e}", rrsig_parts[3]),
-                    )
-                })?;
-                let expiration = parse_dnssec_time(rrsig_parts[4]).map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid RRSIG expiration {:?}: {e}", rrsig_parts[4]),
-                    )
-                })?;
-                let inception = parse_dnssec_time(rrsig_parts[5]).map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid RRSIG inception {:?}: {e}", rrsig_parts[5]),
-                    )
-                })?;
-                let key_tag = rrsig_parts[6].parse::<u16>().map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid RRSIG key tag {:?}: {e}", rrsig_parts[6]),
-                    )
-                })?;
-                let signer_name = rrsig_parts[7].to_string();
-                let b64_sig = rrsig_parts[8..].join("");
-                let signature = base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_sig)
-                    .map_err(|e| {
-                        ZoneError::syntax(ln, format!("invalid RRSIG base64 signature: {e}"))
-                    })?;
-                RecordData::from_parsed(&ParsedRecord::RRSIG {
-                    type_covered,
-                    algorithm,
-                    labels,
-                    original_ttl,
-                    expiration,
-                    inception,
-                    key_tag,
-                    signer_name,
-                    signature,
-                })
-                .map_err(|e| ZoneError::syntax(ln, format!("RRSIG record: {e}")))?
-            }
-            "NSEC" => {
-                let nsec_parts = &parts[idx..];
-                if nsec_parts.len() < 2 {
-                    return Err(ZoneError::syntax(
-                        ln,
-                        format!(
-                            "NSEC record needs next domain and at least one type, got {}",
-                            nsec_parts.len()
-                        ),
-                    ));
-                }
-                let next_domain_name = nsec_parts[0].to_string();
-                let type_names: Vec<String> =
-                    nsec_parts[1..].iter().map(|s| s.to_string()).collect();
-                let type_bitmap = construct_type_bitmap(&type_names)
-                    .map_err(|e| ZoneError::syntax(ln, format!("NSEC record: {e}")))?;
-                RecordData::from_parsed(&ParsedRecord::NSEC {
-                    next_domain_name,
-                    type_bitmap,
-                })
-                .map_err(|e| ZoneError::syntax(ln, format!("NSEC record: {e}")))?
-            }
-            "NSEC3" => {
-                let nsec3_parts = &parts[idx..];
-                if nsec3_parts.len() < 5 {
-                    return Err(ZoneError::syntax(
-                        ln,
-                        format!(
-                            "NSEC3 record needs at least 5 fields, got {}",
-                            nsec3_parts.len()
-                        ),
-                    ));
-                }
-                let hash_algorithm = nsec3_parts[0].parse::<u8>().map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid NSEC3 hash algorithm {:?}: {e}", nsec3_parts[0]),
-                    )
-                })?;
-                let flags = nsec3_parts[1].parse::<u8>().map_err(|e| {
-                    ZoneError::syntax(ln, format!("invalid NSEC3 flags {:?}: {e}", nsec3_parts[1]))
-                })?;
-                let iterations = nsec3_parts[2].parse::<u16>().map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid NSEC3 iterations {:?}: {e}", nsec3_parts[2]),
-                    )
-                })?;
-                let salt_str = nsec3_parts[3];
-                let salt = if salt_str == "-" {
-                    Vec::new()
-                } else {
-                    parse_hex(salt_str).map_err(|e| {
-                        ZoneError::syntax(ln, format!("invalid NSEC3 salt {:?}: {e}", salt_str))
-                    })?
-                };
-                let next_hashed_owner = parse_base32_hex(nsec3_parts[4]).map_err(|e| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4]),
-                    )
-                })?;
-                let type_names: Vec<String> =
-                    nsec3_parts[5..].iter().map(|s| s.to_string()).collect();
-                let type_bitmap = construct_type_bitmap(&type_names)
-                    .map_err(|e| ZoneError::syntax(ln, format!("NSEC3 record: {e}")))?;
-                RecordData::from_parsed(&ParsedRecord::NSEC3 {
-                    hash_algorithm,
-                    flags,
-                    iterations,
-                    salt,
-                    next_hashed_owner,
-                    type_bitmap,
-                })
-                .map_err(|e| ZoneError::syntax(ln, format!("NSEC3 record: {e}")))?
-            }
-            other => {
-                return Err(ZoneError::syntax(
-                    ln,
-                    format!("unsupported record type {other:?}"),
-                ));
-            }
-        };
+        let rdata: RecordData =
+            rdata_from_fields(&record_type, rdata, &parts[idx..], &tokens[idx..], ln)?;
 
         zone.add_record(ZoneRecord {
             name: record_name,
@@ -2397,6 +2475,104 @@ $TTL 3600
             assert_eq!(format_dnssec_time(epoch), text, "formatting {epoch}");
             assert_eq!(parse_dnssec_time(text), Ok(epoch), "parsing {text}");
         }
+    }
+
+    /// A 14-*byte* string is not fourteen characters, and the parser sliced by
+    /// byte index after checking `len()`.
+    ///
+    /// **Watched failing first** (`CLAUDE.md` §1): against the old code this
+    /// panicked with "end byte index 4 is not a char boundary; it is inside 'é'"
+    /// rather than returning an error. A zone file is operator input, so the
+    /// reachable consequence was a mangled RRSIG line taking down the zone load
+    /// instead of failing it (`TODO.md` #16).
+    #[test]
+    fn a_fourteen_byte_time_that_is_not_fourteen_digits_is_an_error() {
+        let multibyte = "abcé123456789";
+        assert_eq!(multibyte.len(), 14, "the byte-length check passes");
+        assert!(parse_dnssec_time(multibyte).is_err(), "must not panic");
+
+        // The same shape with the multi-byte character at each slice boundary
+        // the old code used.
+        for probe in ["é12345678901", "1234é678901234", "123456789012é"] {
+            let _ = parse_dnssec_time(probe);
+        }
+    }
+
+    /// Every field is range-checked, because an out-of-range one used to produce
+    /// a *plausible number* rather than an error.
+    ///
+    /// **Watched failing first.** The month case is the one that motivated this:
+    /// `days_in_month(13, ..)` answered 0, so `20250013000000` parsed happily to
+    /// 1_736_726_400 — a real-looking epoch for a date that does not exist.
+    #[test]
+    fn an_out_of_range_field_is_an_error_not_a_plausible_number() {
+        for bad in [
+            "20250013000000", // month 13 — contributed zero days, and parsed
+            "20250000000000", // month 0 — likewise
+            "20250132000000", // 32 January
+            "20250230000000", // 30 February, in a non-leap year
+            "20230229000000", // 29 February, in a non-leap year
+            "20250101240000", // hour 24
+            "20250101006000", // minute 60
+            "20250101000060", // second 60 — POSIX time has no leap second
+            "19690101000000", // before the epoch: negative, and `as u32` wrapped
+        ] {
+            assert!(
+                parse_dnssec_time(bad).is_err(),
+                "{bad} should not parse, got {:?}",
+                parse_dnssec_time(bad)
+            );
+        }
+
+        // 29 February *is* a day in a leap year, so the check is not simply
+        // refusing everything near the boundary.
+        assert!(parse_dnssec_time("20240229000000").is_ok());
+    }
+
+    /// The field is 32 bits (RFC 4034 §3.2), and one second past what it holds
+    /// used to truncate rather than fail — so a signature dated the far future
+    /// read back as one that expired in 1970.
+    ///
+    /// **Watched failing first**: `21060207062816` returned `Ok(0)`.
+    #[test]
+    fn a_time_past_the_end_of_the_field_is_an_error() {
+        // The last representable instant still parses.
+        assert_eq!(parse_dnssec_time("21060207062815"), Ok(u32::MAX));
+        assert!(parse_dnssec_time("21060207062816").is_err(), "one past");
+        assert!(parse_dnssec_time("99991231235959").is_err(), "far past");
+    }
+
+    /// The point of #16b, exercised directly: the RDATA half is a pure function,
+    /// so a type's field handling can be tested without building a zone file,
+    /// an origin, a TTL and an owner name around it.
+    ///
+    /// **Not a regression test** — #16b moved code without changing behaviour,
+    /// and the evidence for that is the 654 tests that already cover zone
+    /// parsing, all of which pass unchanged. This is here because "it can be
+    /// tested on its own now" was the *justification* for the split, and a
+    /// justification nobody exercises is a claim (`CLAUDE.md` §1).
+    #[test]
+    fn the_rdata_half_can_be_tested_without_a_zone_file() {
+        let fields = ["10", "mx.example.com."];
+        let text: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+        let mx = rdata_from_fields("MX", "10 mx.example.com.".into(), &fields, &text, 1)
+            .expect("a well-formed MX");
+        assert_eq!(
+            mx.parse().unwrap(),
+            ParsedRecord::MX {
+                preference: 10,
+                exchange: "mx.example.com.".into(),
+            }
+        );
+
+        // The line number travels with the error, which is the whole reason the
+        // small helpers return a detail and this function attaches the position
+        // to it (see the note above `parse_hex`).
+        let bad = ["notanumber", "mx.example.com."];
+        let text: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+        let err = rdata_from_fields("MX", "notanumber mx.example.com.".into(), &bad, &text, 42)
+            .expect_err("preference is not a number");
+        assert!(err.to_string().contains("42"), "got {err}");
     }
 
     #[test]
