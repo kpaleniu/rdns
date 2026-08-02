@@ -33,7 +33,7 @@
 use crate::error::{TransferError, TransferResult};
 use crate::Class;
 use crate::Qtype;
-use crate::Rtype;
+use crate::Serial;
 use crate::Ttl;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use crate::transfer::{axfr_messages, pack_transfer_messages};
 use crate::utils::{absolute_lowered, record_types as rt, NameKeyBuf};
 use crate::zone::{Zone, ZoneRecord};
-use crate::{DnsMessage, ResourceRecord};
+use crate::{DnsMessage, RecordData, ResourceRecord};
 
 /// How many version steps to remember per zone.
 ///
@@ -53,8 +53,8 @@ pub const MAX_DELTAS_PER_ZONE: usize = 32;
 /// One version step: what it takes to get from `from_serial` to `to_serial`.
 #[derive(Debug, Clone)]
 pub struct ZoneDelta {
-    pub from_serial: u32,
-    pub to_serial: u32,
+    pub from_serial: Serial,
+    pub to_serial: Serial,
     /// The apex SOA as it was at `from_serial` — the header of the deletions.
     pub from_soa: ResourceRecord,
     /// The apex SOA at `to_serial` — the header of the additions.
@@ -117,7 +117,7 @@ pub fn plan_change(old: Option<&Zone>, new: &Zone) -> Option<PlannedDelta> {
     let (Some(old), Some(from), Some(to)) = (old, old.and_then(Zone::serial), new.serial()) else {
         return None;
     };
-    if !crate::secondary::is_newer(to, from) {
+    if !to.is_newer_than(from) {
         return None;
     }
     let delta = diff(old, new)?;
@@ -178,7 +178,7 @@ impl DeltaLog {
     /// Unbroken is the whole requirement: a gap means some change would be
     /// skipped, and a secondary that applied the rest would hold a zone that
     /// never existed — which no serial comparison afterwards could detect.
-    pub fn chain_from(&self, zone: &str, serial: u32) -> Option<Vec<&ZoneDelta>> {
+    pub fn chain_from(&self, zone: &str, serial: Serial) -> Option<Vec<&ZoneDelta>> {
         let history = self.by_zone.get(key(zone).as_str())?;
         let start = history.iter().position(|d| d.from_serial == serial)?;
 
@@ -273,17 +273,46 @@ pub fn diff(old: &Zone, new: &Zone) -> Option<ZoneDelta> {
 /// a TTL change is a deletion and an addition, which is what BIND's
 /// `ixfr-from-differences` produces too. Names compare case-insensitively
 /// (RFC 4343), so the key holds the down-cased form and the original beside it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// **It carries the whole [`RecordData`] rather than its two fields**, so that
+/// [`RecordKey::into_record`] hands back the record it was given instead of
+/// rebuilding one. Once `RecordData`'s fields were sealed (`TODO.md` #14c) a
+/// rebuild would have had to go through the checked constructor — re-parsing
+/// every changed record to re-establish an invariant these bytes never left, on
+/// a path that already walks both versions of the zone.
+///
+/// `Ord` is written out rather than derived for the same reason: it has to keep
+/// comparing TYPE *before* class and TTL, which is the order the derive gave
+/// while those were separate fields, and which decides the order records come
+/// out of the diff in and therefore go onto the wire in.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordKey {
     lowercase_name: String,
-    rtype: Rtype,
     class: Class,
     ttl: Ttl,
-    rdata: Box<[u8]>,
+    rdata: RecordData,
     /// Not part of the ordering in practice — it is a function of
     /// `lowercase_name` — but carried so the record can be rebuilt with the case
     /// it was published under.
     name: String,
+}
+
+impl Ord for RecordKey {
+    fn cmp(&self, other: &RecordKey) -> std::cmp::Ordering {
+        self.lowercase_name
+            .cmp(&other.lowercase_name)
+            .then_with(|| self.rdata.rtype().cmp(&other.rdata.rtype()))
+            .then_with(|| self.class.cmp(&other.class))
+            .then_with(|| self.ttl.cmp(&other.ttl))
+            .then_with(|| self.rdata.bytes().cmp(other.rdata.bytes()))
+            .then_with(|| self.name.cmp(&other.name))
+    }
+}
+
+impl PartialOrd for RecordKey {
+    fn partial_cmp(&self, other: &RecordKey) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl RecordKey {
@@ -292,10 +321,7 @@ impl RecordKey {
             name: self.name,
             class: self.class,
             ttl: self.ttl,
-            rdata: crate::RecordData {
-                rtype: self.rtype,
-                rdata: self.rdata,
-            },
+            rdata: self.rdata,
         }
     }
 }
@@ -304,16 +330,15 @@ fn record_key(zone: &Zone, record: &ZoneRecord) -> RecordKey {
     let name = zone.normalize_name(&record.name);
     RecordKey {
         lowercase_name: name.to_ascii_lowercase(),
-        rtype: record.rdata.rtype,
         class: record.class,
         ttl: record.ttl,
-        rdata: record.rdata.rdata.clone(),
+        rdata: record.rdata.clone(),
         name: name.into_owned(),
     }
 }
 
 fn is_apex_soa(zone: &Zone, record: &ZoneRecord) -> bool {
-    record.rdata.rtype == rt::SOA
+    record.rdata.rtype() == rt::SOA
         && zone
             .normalize_name(&record.name)
             .eq_ignore_ascii_case(zone.origin())
@@ -402,10 +427,9 @@ fn resource_key(zone: &Zone, record: &ResourceRecord) -> RecordKey {
     let name = zone.normalize_name(&record.name);
     RecordKey {
         lowercase_name: name.to_ascii_lowercase(),
-        rtype: record.rdata.rtype,
         class: record.class,
         ttl: record.ttl,
-        rdata: record.rdata.rdata.clone(),
+        rdata: record.rdata.clone(),
         name: name.into_owned(),
     }
 }
@@ -447,11 +471,11 @@ impl IxfrResponse {
 /// about an IXFR request that differs from an AXFR one — and the reason a
 /// validator that forbids authority sections in requests makes IXFR unreceivable
 /// without ever saying so.
-pub fn requested_serial(request: &DnsMessage) -> Option<u32> {
+pub fn requested_serial(request: &DnsMessage) -> Option<Serial> {
     request
         .authorities
         .iter()
-        .filter(|rr| rr.rdata.rtype == rt::SOA)
+        .filter(|rr| rr.rdata.rtype() == rt::SOA)
         .find_map(|rr| match rr.rdata.parse() {
             Ok(crate::ParsedRecord::SOA { serial, .. }) => Some(serial),
             _ => None,
@@ -486,7 +510,7 @@ pub fn ixfr_response(
 
     // Already current — or ahead of us, which happens to a secondary of a
     // primary that was rolled back, and which more data would not fix.
-    if !crate::secondary::is_newer(current, client_serial) {
+    if !current.is_newer_than(client_serial) {
         return Ok(IxfrResponse::UpToDate(pack_transfer_messages(
             request,
             vec![soa],
@@ -600,8 +624,8 @@ mod tests {
         let new = zone_at(2, "www IN A 192.0.2.9\nftp IN A 192.0.2.3\n");
 
         let delta = diff(&old, &new).expect("both zones have an SOA");
-        assert_eq!(delta.from_serial, 1);
-        assert_eq!(delta.to_serial, 2);
+        assert_eq!(delta.from_serial, Serial::new(1));
+        assert_eq!(delta.to_serial, Serial::new(2));
 
         let deleted: Vec<&str> = delta.deleted.iter().map(|r| r.name.as_str()).collect();
         let added: Vec<&str> = delta.added.iter().map(|r| r.name.as_str()).collect();
@@ -638,8 +662,8 @@ mod tests {
 
         let delta = diff(&old, &new).unwrap();
         assert!(delta.is_empty(), "only the serial moved: {delta:?}");
-        assert_eq!(delta.from_soa.rdata.rtype, rt::SOA);
-        assert_eq!(delta.to_soa.rdata.rtype, rt::SOA);
+        assert_eq!(delta.from_soa.rdata.rtype(), rt::SOA);
+        assert_eq!(delta.to_soa.rdata.rtype(), rt::SOA);
     }
 
     /// A TTL change is a change: a secondary caches and re-serves that number.
@@ -671,21 +695,24 @@ mod tests {
         log.note_change(Some(&v2), &v3);
         assert_eq!(log.len("example.com."), 2, "the first load is not a step");
 
-        let chain = log.chain_from("example.com.", 1).expect("a chain from 1");
+        let chain = log
+            .chain_from("example.com.", Serial::new(1))
+            .expect("a chain from 1");
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].from_serial, 1);
-        assert_eq!(chain[1].to_serial, 3);
+        assert_eq!(chain[0].from_serial, Serial::new(1));
+        assert_eq!(chain[1].to_serial, Serial::new(3));
 
         assert_eq!(
-            log.chain_from("example.com.", 2).map(|c| c.len()),
+            log.chain_from("example.com.", Serial::new(2))
+                .map(|c| c.len()),
             Some(1),
             "a client one step behind gets one step"
         );
         assert!(
-            log.chain_from("example.com.", 99).is_none(),
+            log.chain_from("example.com.", Serial::new(99)).is_none(),
             "a serial we never held has no chain"
         );
-        assert!(log.chain_from("other.test.", 1).is_none());
+        assert!(log.chain_from("other.test.", Serial::new(1)).is_none());
     }
 
     /// The history is bounded, and it is the oldest steps that go — a client far
@@ -704,8 +731,11 @@ mod tests {
         }
 
         assert_eq!(log.len("example.com."), MAX_DELTAS_PER_ZONE);
-        assert!(log.chain_from("example.com.", 1).is_none(), "aged out");
-        let newest = MAX_DELTAS_PER_ZONE as u32 + 9;
+        assert!(
+            log.chain_from("example.com.", Serial::new(1)).is_none(),
+            "aged out"
+        );
+        let newest = Serial::new(MAX_DELTAS_PER_ZONE as u32 + 9);
         assert_eq!(
             log.chain_from("example.com.", newest).map(|c| c.len()),
             Some(1)
@@ -771,26 +801,26 @@ mod tests {
         assert_eq!(records, 2, "one deletion, one addition");
 
         let all = answers(&messages);
-        assert_eq!(all[0].rdata.rtype, rt::SOA, "opens with the current SOA");
+        assert_eq!(all[0].rdata.rtype(), rt::SOA, "opens with the current SOA");
         assert_eq!(
-            all[1].rdata.rtype,
+            all[1].rdata.rtype(),
             rt::SOA,
             "then the old SOA: deletions follow"
         );
         assert_eq!(all[2].name, "www.example.com.");
         assert_eq!(
-            all[3].rdata.rtype,
+            all[3].rdata.rtype(),
             rt::SOA,
             "then the new SOA: additions follow"
         );
         assert_eq!(all[4].name, "www.example.com.");
-        assert_eq!(all[5].rdata.rtype, rt::SOA, "closes with the current SOA");
+        assert_eq!(all[5].rdata.rtype(), rt::SOA, "closes with the current SOA");
         assert_eq!(all.len(), 6);
 
         // The second record being an SOA is exactly how a client tells this from
         // a full transfer, so pin the distinction.
         let full = axfr_messages(&request(Some(1)), &v2).unwrap();
-        assert_ne!(answers(&full)[1].rdata.rtype, rt::SOA);
+        assert_ne!(answers(&full)[1].rdata.rtype(), rt::SOA);
     }
 
     #[test]
@@ -802,7 +832,7 @@ mod tests {
         };
         let all = answers(&messages);
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].rdata.rtype, rt::SOA);
+        assert_eq!(all[0].rdata.rtype(), rt::SOA);
 
         // A client *ahead* of us gets the same answer: more data would not fix a
         // primary that was rolled back.
@@ -823,8 +853,8 @@ mod tests {
             panic!("expected a full transfer");
         };
         assert!(why.contains("no unbroken chain"), "got: {why}");
-        assert_eq!(answers(&messages)[0].rdata.rtype, rt::SOA);
-        assert_ne!(answers(&messages)[1].rdata.rtype, rt::SOA, "a full zone");
+        assert_eq!(answers(&messages)[0].rdata.rtype(), rt::SOA);
+        assert_ne!(answers(&messages)[1].rdata.rtype(), rt::SOA, "a full zone");
 
         // No SOA in the request: nothing to compare against.
         let response = ixfr_response(&request(None), &v2, &DeltaLog::new()).unwrap();
@@ -882,7 +912,7 @@ mod tests {
 
     #[test]
     fn test_requested_serial_reads_the_authority_section() {
-        assert_eq!(requested_serial(&request(Some(42))), Some(42));
+        assert_eq!(requested_serial(&request(Some(42))), Some(Serial::new(42)));
         assert_eq!(requested_serial(&request(None)), None);
     }
 }

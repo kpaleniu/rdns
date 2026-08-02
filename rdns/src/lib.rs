@@ -37,6 +37,7 @@ pub mod notify;
 pub mod nsec_cache;
 pub mod persist;
 pub mod readiness;
+mod record_data;
 pub mod resolver;
 pub mod rfc5011;
 pub mod secondary;
@@ -55,6 +56,10 @@ pub mod zone_writer;
 
 // Re-export cache module for public use
 pub use cache::{CacheStats, DnsCache};
+
+/// [`RecordData`] lives in its own module so its fields can be private to it —
+/// see that module's header for why a one-struct module is the point.
+pub use record_data::RecordData;
 
 #[macro_use]
 mod macros {
@@ -465,7 +470,9 @@ pub enum ParsedRecord {
     SOA {
         mname: String,
         rname: String,
-        serial: u32,
+        /// The zone's version. See [`Serial`] — the comparison is RFC 1982's,
+        /// not `>`.
+        serial: Serial,
         refresh: i32,
         retry: i32,
         expire: i32,
@@ -533,88 +540,47 @@ pub enum ParsedRecord {
     Unknown(Rtype),
 }
 
-/// A record's data, stored as **uncompressed wire-format bytes**.
-///
-/// This is the compact, allocation-light form we keep resident (in caches,
-/// zones, and messages). It is 24 bytes regardless of record type, versus the
-/// ~96-byte typed enum it replaces, because the large/rare DNSSEC and SOA
-/// payloads no longer sit inline in every record.
-///
-/// Any domain names embedded in the data are expanded to their full,
-/// uncompressed form when the record is read off the wire (see
-/// [`RecordData::from_wire`]), so the bytes are self-contained: they can be
-/// re-parsed with [`RecordData::parse`] or re-serialized without needing the
-/// original message for compression-pointer resolution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordData {
-    /// The RR TYPE code (e.g. 1 = A, 28 = AAAA).
-    pub rtype: Rtype,
-    /// Uncompressed wire-format RDATA.
-    pub rdata: Box<[u8]>,
-}
-
-impl RecordData {
-    /// Map a record-type name (e.g. "A", "AAAA") to its numeric TYPE code.
-    fn to_u16(kind: &str) -> Option<Rtype> {
-        utils::record_type_name_to_code(kind)
-    }
-
-    /// The RR TYPE code of this record.
-    pub fn rtype(&self) -> Rtype {
-        self.rtype
-    }
-
-    /// Read a record's RDATA off the wire and store it compactly.
-    ///
-    /// `unpacker` is used to follow any compression pointers against the full
-    /// message; the result is re-encoded without compression so the stored
-    /// bytes are self-contained. Types we don't parse are stored verbatim
-    /// (RFC 3597), which — unlike the old typed enum — preserves their bytes.
-    pub fn from_wire<'a>(
-        record_type: Rtype,
-        rdata: &'a [u8],
-        unpacker: &DNameUnpacker<'a>,
-    ) -> Result<Self, WireError> {
-        let parsed = ParsedRecord::decode(record_type, rdata, unpacker)?;
-        if let ParsedRecord::Unknown(_) = parsed {
-            // Opaque type: keep the original bytes exactly as received.
-            return Ok(RecordData {
-                rtype: record_type,
-                rdata: rdata.to_vec().into_boxed_slice(),
-            });
-        }
-        Self::from_parsed(&parsed)
-    }
-
-    /// Parse the stored bytes into a typed [`ParsedRecord`] on demand.
-    ///
-    /// Records that are only cached and re-served never need this, which is the
-    /// whole point of storing raw bytes. Stored names are uncompressed, so no
-    /// message context is required — the decoder is handed an unpacker over the
-    /// rdata itself, which by construction contains no pointers.
-    pub fn parse(&self) -> Result<ParsedRecord, WireError> {
-        let unpacker = DNameUnpacker::new(&self.rdata);
-        ParsedRecord::decode(self.rtype, &self.rdata, &unpacker)
-    }
-
-    /// Encode a typed record into compact, uncompressed wire-format storage.
-    pub fn from_parsed(parsed: &ParsedRecord) -> Result<Self, WireError> {
-        let (rtype, rdata) = parsed.encode()?;
-        Ok(RecordData {
-            rtype,
-            rdata: rdata.into_boxed_slice(),
-        })
-    }
-}
-
 impl ParsedRecord {
     /// Decode wire-format RDATA into a typed record. `unpacker` resolves any
     /// compressed domain names against the message it was built over.
-    fn decode<'a>(
+    pub(crate) fn decode<'a>(
         record_type: Rtype,
         rdata: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<Self, WireError> {
+        // **RDLENGTH=0 is a record that names a type and carries no value**, and
+        // it is legal: RFC 2136 §2.4.1 and §2.4.2 spell "an RRset of this type
+        // exists / does not exist" as TYPE=t, CLASS=ANY or NONE, RDLENGTH=0, and
+        // §2.5.2 and §2.5.3 spell "delete this RRset" the same way. The record
+        // is a *specifier* there, not data, so there is nothing for a per-type
+        // decoder to be given.
+        //
+        // Without this the arms below reject it — an A with no bytes is four
+        // bytes short — and because `RecordData::from_wire` runs per record
+        // while the message is being read, **the whole UPDATE became FORMERR at
+        // the wire layer, before `update.rs` ever saw it**. So the half of
+        // `TODO.md` #10 that exists could not receive the messages it
+        // implements: every value-independent prerequisite and every RRset
+        // deletion was unreadable. Nothing caught it because `update.rs`'s tests
+        // build `DnsMessage` structs directly and never cross the wire, which is
+        // `CLAUDE.md` §1 exactly — the tests were written from the same
+        // understanding as the code, so the boundary the real message crosses
+        // was the one thing never exercised.
+        //
+        // `Unknown` rather than a per-type empty variant, because "no value" is
+        // the same fact whatever the type is, and because it is already what
+        // happens for a type with no decoder: the bytes (none) are kept verbatim
+        // and the TYPE is carried by the enclosing `RecordData`, so the record
+        // goes back out as the zero-length RDATA it arrived as.
+        //
+        // The cost is that an *answer* holding, say, an A with RDLENGTH 0 now
+        // parses rather than making the whole message FORMERR. That is the right
+        // trade: one useless record relayed as it arrived, against refusing an
+        // entire class of legal message — and RFC 3597 §5 already requires an
+        // implementation to carry RDATA it cannot interpret.
+        if rdata.is_empty() {
+            return Ok(ParsedRecord::Unknown(record_type));
+        }
         match record_type {
             utils::record_types::A => {
                 let addr: [u8; 4] = rdata.try_into()?;
@@ -632,6 +598,7 @@ impl ParsedRecord {
                 let (mname, rest) = dname_from_bytes(rdata, unpacker)?;
                 let (rname, rest) = dname_from_bytes(rest, unpacker)?;
                 let (serial, rest) = read_be!(u32, rest);
+                let serial = Serial::new(serial);
                 let (refresh, rest) = read_be!(i32, rest);
                 let (retry, rest) = read_be!(i32, rest);
                 let (expire, rest) = read_be!(i32, rest);
@@ -823,7 +790,7 @@ impl ParsedRecord {
     ///
     /// The inverse of [`ParsedRecord::decode`] for the types we parse. Names
     /// are written uncompressed via [`dname_to_bytes`].
-    fn encode(&self) -> Result<(Rtype, Vec<u8>), WireError> {
+    pub(crate) fn encode(&self) -> Result<(Rtype, Vec<u8>), WireError> {
         let out = match self {
             ParsedRecord::A(addr) => (utils::record_types::A, addr.octets().to_vec()),
             ParsedRecord::AAAA(addr) => (utils::record_types::AAAA, addr.octets().to_vec()),
@@ -871,7 +838,7 @@ impl ParsedRecord {
             } => {
                 let mut v = dname_to_bytes(mname)?;
                 v.extend_from_slice(&dname_to_bytes(rname)?);
-                v.extend_from_slice(&serial.to_be_bytes());
+                v.extend_from_slice(&serial.to_u32().to_be_bytes());
                 v.extend_from_slice(&refresh.to_be_bytes());
                 v.extend_from_slice(&retry.to_be_bytes());
                 v.extend_from_slice(&expire.to_be_bytes());
@@ -1054,6 +1021,100 @@ impl std::fmt::Display for Ttl {
     }
 }
 
+/// A zone's version number: the SOA's SERIAL field (RFC 1035 §3.3.13).
+///
+/// **A newtype whose whole content is what it refuses to do.** It has no
+/// `PartialOrd` and no `Ord`, so `a > b` does not compile and
+/// [`Serial::is_newer_than`] is the only way to ask which of two versions is
+/// later. That is the point: serials are RFC 1982 sequence-space numbers, not
+/// integers. They wrap, and 32 bits at one bump a second is 136 years — but a
+/// zone with a date-style serial that is edited past `4294967295`, or one
+/// carried forward from another server, gets there sooner than that argument
+/// suggests, and `signed_serial` adds hours-since-the-epoch to whatever the
+/// operator wrote (`zone_signer::signed_serial`), which brings the ceiling
+/// closer still.
+///
+/// **What a plain `>` costs is not a wrong answer once.** A secondary that reads
+/// a wrapped increment as a rollback declines the transfer, and declines it
+/// again on every refresh for the rest of the zone's life, because the
+/// comparison that rejected it never changes its mind. The zone is frozen and
+/// nothing is in a failed state to alert on.
+///
+/// This was already known here and already written down twice.
+/// `secondary::is_newer` had it right and said why; `notify::changed_zones` then
+/// wrote the same wrapping arithmetic out inline with its own copy of the
+/// citation — `CLAUDE.md` §7's shape, in the one piece of arithmetic in DNS most
+/// likely to be got wrong with a `>`. Both are gone; this is the copy.
+///
+/// **No live defect prompted this** (`TODO.md` #14a). Nothing in the tree
+/// compared two serials with an operator, so there is no regression test that
+/// fails against the old code — the compile error is the test, and it protects
+/// the sites nobody has written yet. `CLAUDE.md` §17 is the argument: a fix that
+/// lives in a type has not recurred here, and a fix that lives at a call site
+/// always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(transparent)]
+pub struct Serial(u32);
+
+impl Serial {
+    /// Total: every 32-bit value is a serial. There is no invalid one.
+    pub const fn new(value: u32) -> Serial {
+        Serial(value)
+    }
+
+    /// The wire encoding, unchanged, so an SOA round-trips.
+    pub const fn to_u32(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this version is later than `other` (RFC 1982 §3.2).
+    ///
+    /// > s1 < s2 ... if s1 < s2 and (s2 - s1) < 2^(SERIAL_BITS - 1)
+    ///
+    /// Which in wrapping arithmetic is the whole of it: the forward distance is
+    /// in the first half of the space. Equal serials are not newer — an
+    /// unchanged zone is not news, and a secondary must not re-transfer one.
+    ///
+    /// **Not `PartialOrd`.** It cannot be: RFC 1982 §3.2 says so out loud for
+    /// serials exactly half the space apart, where "the result ... is undefined"
+    /// and neither is later. An `Ord` that has to pick one would be lying, and
+    /// deriving one would give the plain `>` this type exists to forbid.
+    pub const fn is_newer_than(self, other: Serial) -> bool {
+        let forward = self.0.wrapping_sub(other.0);
+        forward != 0 && forward < 0x8000_0000
+    }
+
+    /// This serial advanced by `increment`, wrapping (RFC 1982 §3.1).
+    ///
+    /// Wrapping is the defined addition in the sequence space, not an overflow
+    /// to be avoided — which is why this is spelled out rather than left to
+    /// `+`, whose debug panic would be the wrong answer at the one moment it
+    /// mattered.
+    pub const fn wrapping_add(self, increment: u32) -> Serial {
+        Serial(self.0.wrapping_add(increment))
+    }
+}
+
+impl std::fmt::Display for Serial {
+    /// Forwards the whole formatter rather than `write!("{}", self.0)`, so that
+    /// width and alignment survive: `zone_writer` writes `{serial:<12}` into a
+    /// zone file's SOA block and `rdnsctl status` writes `{:>6}` into a column,
+    /// and a `write!` that ignores the flags silently unaligns both.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::str::FromStr for Serial {
+    type Err = std::num::ParseIntError;
+
+    /// The presentation form is a decimal number and nothing else — the zone
+    /// file's SOA field and the secondary state file's second column.
+    fn from_str(text: &str) -> Result<Serial, Self::Err> {
+        text.parse().map(Serial)
+    }
+}
+
 /// A DNS response code: the 12-bit value of RFC 6891 §6.1.3, not the 4-bit
 /// header field.
 ///
@@ -1184,7 +1245,7 @@ pub struct DnsMessage {
     /// CLASS is a payload size and its TTL is a flags word. Keeping it in the
     /// section cost eight linear scans of that `Vec` per message in this file
     /// alone, made every filter over the section responsible for remembering to
-    /// spare it (`rdnsr`'s was `retain(|rr| rr.rdata.rtype == OPT_RECORD_TYPE ||
+    /// spare it (`rdnsr`'s was `retain(|rr| rr.rdata.rtype() == OPT_RECORD_TYPE ||
     /// keep(rr))`), and left a malformed state representable: **two OPT records
     /// in one message**, which RFC 6891 §6.1.1 says MUST be FORMERR and which
     /// nothing here rejected — the first was read and both were re-serialized.
@@ -1766,7 +1827,7 @@ impl DnsMessage {
         for section in [&self.answers, &self.authorities, &self.additionals] {
             for rr in section {
                 pos = compressor.write_name(rr.name.as_str(), output, pos)?;
-                pos = write_bytes(output, pos, &rr.rdata.rtype.to_u16().to_be_bytes())?;
+                pos = write_bytes(output, pos, &rr.rdata.rtype().to_u16().to_be_bytes())?;
                 pos = write_bytes(output, pos, &rr.class.to_u16().to_be_bytes())?;
                 pos = write_bytes(output, pos, &rr.ttl.to_wire().to_be_bytes())?;
 
@@ -1775,7 +1836,7 @@ impl DnsMessage {
                 let rdlen_at = pos;
                 pos = write_bytes(output, pos, &[0u8, 0u8])?;
                 let rdata_at = pos;
-                pos = compressor.write_rdata(rr.rdata.rtype, &rr.rdata.rdata, output, pos)?;
+                pos = compressor.write_rdata(rr.rdata.rtype(), rr.rdata.bytes(), output, pos)?;
                 let rdlen: u16 = (pos - rdata_at)
                     .try_into()
                     .map_err(|_| WireError::TooLong {
@@ -1949,7 +2010,7 @@ impl DnsMessageBuilder {
     }
 
     pub fn with_url(mut self, url: &str, query_type: &str) -> Self {
-        if let Some(q) = RecordData::to_u16(query_type) {
+        if let Some(q) = utils::record_type_name_to_code(query_type) {
             self.queries.push((url.to_owned(), q));
         }
         self
@@ -1999,6 +2060,76 @@ impl DnsMessageBuilder {
 mod tests {
     use super::*;
     use crate::utils::record_types as rt;
+
+    /// RFC 1982 §3.2, which is the whole reason [`Serial`] exists.
+    ///
+    /// This was `secondary::is_newer`'s test and moved here with the function it
+    /// covered. It passed there and passes here — nothing in the tree compared
+    /// serials wrongly, so there is no failing-first regression to show
+    /// (`CLAUDE.md` §1). What the move buys is that the *second* copy of this
+    /// arithmetic, in `notify::changed_zones`, is gone.
+    #[test]
+    fn a_wrapped_serial_is_still_an_increment() {
+        let s = Serial::new;
+        assert!(s(2).is_newer_than(s(1)));
+        assert!(!s(1).is_newer_than(s(2)));
+        assert!(!s(5).is_newer_than(s(5)), "the same serial is not newer");
+        assert!(
+            s(3).is_newer_than(s(u32::MAX - 1)),
+            "RFC 1982 §3.2: the forward distance is 4, so this is an increment"
+        );
+        assert!(!s(u32::MAX - 1).is_newer_than(s(3)));
+    }
+
+    /// Half the space apart, RFC 1982 §3.2 leaves the result undefined — neither
+    /// is later than the other. An `Ord` would have to invent an answer, which
+    /// is one of the two reasons [`Serial`] does not have one.
+    #[test]
+    fn serials_half_the_space_apart_are_neither_newer() {
+        let (a, b) = (Serial::new(0), Serial::new(0x8000_0000));
+        assert!(!a.is_newer_than(b));
+        assert!(!b.is_newer_than(a));
+        assert_ne!(a, b, "and they are still different versions");
+    }
+
+    /// `Display` forwards the formatter, so width and alignment survive.
+    ///
+    /// Not a hypothetical: `zone_writer` lays an SOA out as `{serial:<12}` and
+    /// `rdnsctl status` as `{:>6}`, and the obvious one-line impl —
+    /// `write!(f, "{}", self.0)`, which is what [`Ttl`] next door has — silently
+    /// ignores both. The zone file would still parse, so nothing would fail; the
+    /// column would just stop lining up. Checked here rather than asserted in
+    /// the doc comment (`CLAUDE.md` §4).
+    #[test]
+    fn a_serial_keeps_the_padding_it_is_formatted_with() {
+        assert_eq!(format!("{:<12}|", Serial::new(2026080201)), "2026080201  |");
+        assert_eq!(format!("{:>6}|", Serial::new(42)), "    42|");
+    }
+
+    /// The wire form is unchanged by the newtype, which is the claim `TODO.md`
+    /// #14a's gate is about: an SOA read off the wire and written back out is
+    /// byte-identical, including a serial past the signed ceiling.
+    #[test]
+    fn a_serial_round_trips_through_the_wire_form() {
+        for value in [0, 1, 2_026_080_201, 0x8000_0000, u32::MAX] {
+            let soa = ParsedRecord::SOA {
+                mname: "ns1.example.com.".to_string(),
+                rname: "admin.example.com.".to_string(),
+                serial: Serial::new(value),
+                refresh: 3600,
+                retry: 1800,
+                expire: 604_800,
+                minimum: 86_400,
+            };
+            let encoded = RecordData::from_parsed(&soa).expect("an SOA serializes");
+            assert_eq!(
+                encoded.bytes()[encoded.bytes().len() - 20..encoded.bytes().len() - 16],
+                value.to_be_bytes(),
+                "the serial is the four bytes after the two names"
+            );
+            assert_eq!(encoded.parse().expect("and parses back"), soa);
+        }
+    }
 
     /// A record may not declare more RDATA than the message actually carries.
     ///
@@ -2201,14 +2332,14 @@ mod tests {
     #[test]
     fn test_txt_is_framed_as_character_strings() {
         let one = RecordData::from_parsed(&ParsedRecord::TXT(vec![b"hello".to_vec()])).unwrap();
-        assert_eq!(&*one.rdata, b"\x05hello");
+        assert_eq!(one.bytes(), b"\x05hello");
 
         let two = RecordData::from_parsed(&ParsedRecord::TXT(vec![
             b"v=spf1".to_vec(),
             b"-all".to_vec(),
         ]))
         .unwrap();
-        assert_eq!(&*two.rdata, b"\x06v=spf1\x04-all");
+        assert_eq!(two.bytes(), b"\x06v=spf1\x04-all");
     }
 
     #[test]
@@ -2301,8 +2432,8 @@ mod tests {
         assert_eq!(a.name, "www.example.com.");
         assert_eq!(a.class, Class::new(1));
         assert_eq!(a.ttl, Ttl::from_secs(3600));
-        assert_eq!(a.rdata.rtype, rt::A);
-        assert_eq!(&*a.rdata.rdata, &[192, 0, 2, 1]); // A record: 4 address octets
+        assert_eq!(a.rdata.rtype(), rt::A);
+        assert_eq!(a.rdata.bytes(), [192, 0, 2, 1]); // A record: 4 address octets
     }
 
     /// A response whose records all share the question's owner name should
@@ -2339,7 +2470,7 @@ mod tests {
         assert_eq!(parsed.answers.len(), 10);
         for (i, a) in parsed.answers.iter().enumerate() {
             assert_eq!(a.name, "www.example.com.");
-            assert_eq!(&*a.rdata.rdata, &[192, 0, 2, (i + 1) as u8]);
+            assert_eq!(a.rdata.bytes(), [192, 0, 2, (i + 1) as u8]);
         }
     }
 
@@ -2410,10 +2541,8 @@ mod tests {
             name: "_sip._tcp.example.com.".to_string(),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
-            rdata: RecordData {
-                rtype: Rtype::new(33),
-                rdata: srv_rdata.clone().into_boxed_slice(),
-            },
+            rdata: RecordData::new(Rtype::new(33), srv_rdata.clone())
+                .expect("SRV has no decoder here, so its bytes are opaque"),
         };
 
         let mut msg = query_msg(0x1111);
@@ -2433,7 +2562,7 @@ mod tests {
         );
 
         let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
-        assert_eq!(&*parsed.answers[0].rdata.rdata, srv_rdata.as_slice());
+        assert_eq!(parsed.answers[0].rdata.bytes(), srv_rdata.as_slice());
     }
 
     /// A packet that claims more questions than it carries must be an error,
@@ -2804,7 +2933,7 @@ mod tests {
         assert_eq!(signature.len(), 64);
 
         // And the encoder puts them back in the same order it found them.
-        assert_eq!(&*record.rdata, rdata.as_slice());
+        assert_eq!(record.bytes(), rdata.as_slice());
     }
 
     #[test]

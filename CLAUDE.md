@@ -95,8 +95,9 @@ Both halves of this were violated in code where every *other* length was checked
 
 One rule, and it runs the opposite way in the two places:
 
-- **`rdns` returns typed errors** (`WireError`, `ZoneError`, `DnssecError`,
-  `TransferError`, `ResolveError`, `ConfigError` — all in `rdns::error`). A
+- **`rdns` returns typed errors** (`WireError`, `RequestError`, `ZoneError`,
+  `DnssecError`, `TransferError`, `ResolveError`, `ConfigError` — all in
+  `rdns::error`). A
   library that returns `anyhow::Error` erases the failure kind from its own API,
   and here that kind *is* the answer: a truncated packet is FORMERR, an
   unsupported label is NOTIMP, a signature that does not verify is SERVFAIL and
@@ -290,7 +291,11 @@ Cheap to re-check, expensive to rediscover.
   that arrived at a listening socket, on both daemons. `RequestValidator` accepts
   QR=1 on purpose — it is used on both directions of the wire — so the check
   belongs at the socket. Two servers pointed at each other, or one spoofed
-  datagram, is otherwise a packet loop neither end can see.
+  datagram, is otherwise a packet loop neither end can see. This rule was written
+  down and then omitted from one of `rdnsd`'s two answering paths anyway, which
+  is why it is now a type: `validation::Request` is the only door, and it makes
+  the check on the way through. Reach for it, not `DnsMessage::try_from_bytes`,
+  at anything a stranger can send to.
 - **The opcode is the client's.** Echo it (RFC 1035 §4.1.1) and answer NOTIMP to
   anything unimplemented. Hardcoding `OpCode::Query` in a response builder is what
   hid the missing check.
@@ -726,6 +731,16 @@ removal, staged, with the measurements each stage has to hold):
   QTYPE is not an RTYPE (ANY is 255 and no record *is* that type); a QCLASS is
   not a CLASS. Newtype them and the wrong comparison stops compiling everywhere
   at once, including the copies nobody knew about.
+- **A number whose ordering is not the ordering of the numbers.** An SOA serial
+  is RFC 1982 sequence space: it wraps, so `a > b` is not "a is later" and a
+  secondary that reads a wrapped increment as a rollback declines the transfer
+  and goes on declining it forever, with nothing in a failed state to alert on.
+  The type that carries it must **omit `PartialOrd`** and offer
+  `is_newer_than` instead, so the wrong comparison does not compile. §3.2 leaves
+  the result undefined for two serials half the space apart, which is the second
+  reason: an `Ord` would have to invent an answer there. See `Serial`, and the
+  one place that still compares the raw numbers — with a comment saying why the
+  claim is arithmetical rather than about versions.
 - **`unwrap_or` on the parse of a wire field**, and its cause: `num_derive`'s
   `FromPrimitive`, which hands you an `Option` and invites exactly that. A
   data-carrying `Other(T)` variant with hand-rolled, total, mutually inverse
@@ -736,14 +751,26 @@ removal, staged, with the measurements each stage has to hold):
 - **An invariant asserted in a doc comment.** That is a claim to verify, not
   documentation to trust (§4). If it is worth writing down it is worth making
   unrepresentable, and if it cannot be, say in the comment why not.
+- **A `pub` field beside a constructor that checks something.** `RecordData` had
+  `pub rtype` and `pub rdata` and three checking constructors, so
+  `RecordData { rtype: A, rdata: <seventeen bytes> }` was a value nothing
+  objected to until something read it — which is why `parse` returns a `Result`.
+  Two things about the fix generalize. **Private in the crate root is not
+  private**: it means visible to the root *and every descendant*, so a type whose
+  fields must be sealed against its own crate has to live in a module small
+  enough to be the boundary — a file with one struct in it, on purpose. And
+  **going to seal something is the cheapest way to find out it is not true**:
+  writing down "the RDATA is well formed for its TYPE" is what turned up
+  RFC 2136's RDLENGTH=0 records, and the fact that a legal UPDATE could not be
+  parsed at all.
 
 Three limits, so this does not become its own kind of damage:
 
 - **Measure it, do not assume it.** Most of these are `#[repr(transparent)]`
   newtypes over the primitive that was already there and compile to the same
   code — but "zero-cost" is a claim about a compiler, not a fact about a diff.
-  `cargo test -p rdns --test allocations -- --nocapture` holds fourteen exact
-  counts and reads the same on Windows and Linux; `cargo bench -p rdns --baseline`
+  `cargo test -p rdns --test allocations -- --nocapture` holds eighteen counts,
+  twelve of them exact, and reads the same on Windows and Linux; `cargo bench -p rdns --baseline`
   is the backstop. **Identical counts or lower**, and a count that moves up is
   accepted only with the reason written next to the assertion — the same rule as
   §10's about never lowering a floor.

@@ -323,7 +323,7 @@ fn push_with_signatures(zone: &Zone, record: &ZoneRecord, out: &mut Vec<Resource
         // bytes on an amplification path.
         return;
     }
-    let signatures = signatures_at(zone, &record.name, record.rdata.rtype);
+    let signatures = signatures_at(zone, &record.name, record.rdata.rtype());
     out.push(resource);
     out.extend(signatures);
 }
@@ -696,17 +696,17 @@ deep.a.b IN TXT "down here"
 
             let mut denials = 0;
             for record in &records {
-                if !matches!(record.rdata.rtype, rt::NSEC | rt::NSEC3) {
+                if !matches!(record.rdata.rtype(), rt::NSEC | rt::NSEC3) {
                     continue;
                 }
                 denials += 1;
                 let rdatas: Vec<RecordData> = records
                     .iter()
-                    .filter(|r| r.name == record.name && r.rdata.rtype == record.rdata.rtype)
+                    .filter(|r| r.name == record.name && r.rdata.rtype() == record.rdata.rtype())
                     .map(|r| r.rdata.clone())
                     .collect();
                 let proof = verify_rrset(
-                    &Rrset::new(&record.name, record.rdata.rtype, Class::new(1), &rdatas),
+                    &Rrset::new(&record.name, record.rdata.rtype(), Class::new(1), &rdatas),
                     &sigs,
                     &keys,
                     ORIGIN,

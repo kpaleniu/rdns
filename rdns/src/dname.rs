@@ -1,6 +1,4 @@
 use crate::error::WireError;
-use std::cell::RefCell;
-use std::collections::HashSet;
 use std::str::from_utf8;
 
 /// The two high bits that mark a label as a compression pointer (RFC 1035
@@ -279,22 +277,30 @@ impl<'a> TryFromBytes<'a> for DName<'a> {
  */
 pub struct DNameUnpacker<'a> {
     data: &'a [u8],
-    visited: RefCell<HashSet<usize>>,
 }
 
 impl<'a> DNameUnpacker<'a> {
     pub fn new(data: &'a [u8]) -> DNameUnpacker<'a> {
-        DNameUnpacker {
-            data,
-            visited: RefCell::new(HashSet::new()),
-        }
+        DNameUnpacker { data }
     }
 
+    /// Follow `name`'s compression pointers into the message.
+    ///
+    /// `prev_target` is the offset the *previous* pointer in this chain jumped
+    /// to, and every later one must land strictly before it — see the check
+    /// below for why that is the whole of cycle prevention.
     fn unpack_internal(
         &self,
         name: DName<'a>,
         depth: usize,
+        prev_target: usize,
     ) -> Result<UnpackedDName<'a>, WireError> {
+        // No longer what stops a cycle — nothing here can cycle any more — but
+        // still what bounds the *work*. Strictly decreasing targets terminate,
+        // and an offset is 14 bits, so "terminates" on its own permits ~16k
+        // hops for one name, each of them a recursive call and so a stack depth
+        // a hostile sender would get to choose. This is the cost bound; the
+        // check further down is the correctness one.
         const MAX_DEPTH: usize = 50;
 
         if depth > MAX_DEPTH {
@@ -341,22 +347,48 @@ impl<'a> DNameUnpacker<'a> {
                         ));
                     }
 
-                    // Cycle detection: check if we've already visited this offset
-                    if self.visited.borrow().contains(offset) {
+                    // A pointer must point *backwards*, and that single
+                    // comparison is the whole of cycle prevention: a strictly
+                    // decreasing sequence of `usize` cannot repeat a value, so
+                    // a cycle is unreachable rather than detected.
+                    //
+                    // RFC 1035 §4.1.4 defines compression as replacing a name
+                    // "with a pointer to a prior occurance of the same name"
+                    // (the RFC's spelling), so a pointer that does not go
+                    // backwards is not compression and no real sender emits
+                    // one. What this replaced was a `RefCell<HashSet<usize>>`
+                    // of visited offsets, inserted and removed around every
+                    // hop — a heap allocation per compressed name, on the
+                    // pre-authentication parse path, to answer at run time a
+                    // question arithmetic answers for free.
+                    //
+                    // **The first hop is not constrained, and that is
+                    // deliberate.** A name is parsed from a slice that does not
+                    // know its own offset in the message: `dname_from_bytes`
+                    // is handed the remaining bytes, and every caller in
+                    // `lib.rs` passes a suffix of the RDATA it is walking. So
+                    // there is no start offset to compare the first target
+                    // against, and one forward jump is still accepted. Every
+                    // hop after it must decrease, which is what makes the chain
+                    // finite — termination is the property being bought, and a
+                    // single unconstrained step does not cost it. Threading the
+                    // absolute offset through would buy the stricter rule, and
+                    // the only way to recover it from a suffix slice is pointer
+                    // arithmetic against `self.data`, which is correct exactly
+                    // as long as the caller passes a slice derived from the
+                    // message — an invariant no type here states (`CLAUDE.md`
+                    // §4, §17).
+                    if *offset >= prev_target {
                         return Err(WireError::malformed(
                             "a compression pointer",
-                            format!("offset {offset} points into a cycle"),
+                            format!(
+                                "offset {offset} does not precede the previous target {prev_target}"
+                            ),
                         ));
                     }
 
-                    // Mark offset as visited
-                    self.visited.borrow_mut().insert(*offset);
-
                     let (name, _) = DName::try_from_bytes(&self.data[*offset..])?;
-                    let unpacked = self.unpack_internal(name, depth + 1)?;
-
-                    // Unmark offset (allows same offset in other branches)
-                    self.visited.borrow_mut().remove(offset);
+                    let unpacked = self.unpack_internal(name, depth + 1, *offset)?;
 
                     output.extend(unpacked.labels);
                 }
@@ -366,9 +398,14 @@ impl<'a> DNameUnpacker<'a> {
         Ok(UnpackedDName { labels: output })
     }
 
+    /// `usize::MAX` as the starting `prev_target` is what leaves the first hop
+    /// unconstrained: an offset is 14 bits, so no real target can equal it.
+    ///
+    /// The unpacker holds no mutable state any more, which is why there is
+    /// nothing to reset here. It used to carry a visited-offsets set shared
+    /// across every name in a message, so this function began by clearing it.
     fn unpack(&self, name: DName<'a>) -> Result<UnpackedDName<'a>, WireError> {
-        self.visited.borrow_mut().clear();
-        self.unpack_internal(name, 0)
+        self.unpack_internal(name, 0, usize::MAX)
     }
 }
 
@@ -647,9 +684,14 @@ mod tests {
         );
     }
 
+    /// A name that points at itself is refused — now by arithmetic rather than
+    /// by a visited set.
+    ///
+    /// The first hop is unconstrained (there is no offset to compare it
+    /// against), so this is caught on the *second*: offset 0 is reached, the
+    /// pointer there targets 0 again, and 0 does not precede 0.
     #[test]
     fn test_cycle_detection_works() {
-        // Test that cycle detection catches self-referential pointers
         let data = &[0xc0, 0x00]; // Pointer to offset 0
         let unpacker = DNameUnpacker::new(data);
 
@@ -668,21 +710,96 @@ mod tests {
         );
     }
 
+    /// The depth limit is enforced on a chain that is otherwise **legal**.
+    ///
+    /// This test used to build a chain running *forwards* — `0->2->4->…` — and
+    /// so would now be refused by the backwards rule on its second hop, passing
+    /// while measuring nothing. Every hop below decreases, so the backwards
+    /// check is satisfied throughout and `MAX_DEPTH` is the only thing that can
+    /// fire (`CLAUDE.md` §10: say what a test is a regression for).
     #[test]
     fn test_depth_limit_prevents_deep_recursion() {
-        // Verify depth limit is enforced
-        // Create a deep but valid pointer structure
-        let mut data = vec![0xc0u8; 102];
-        // Each pointer points forward: 0->2->4...
-        for i in 0..50 {
-            data[i * 2 + 1] = ((i + 1) * 2) as u8;
+        // 0x00 at offset 0: a root label, so the chain terminates on its own if
+        // it is ever allowed to run to the end.
+        let mut data = vec![0u8; 200];
+        for i in (2..200).step_by(2) {
+            data[i] = 0xc0;
+            data[i + 1] = (i - 2) as u8;
         }
 
+        // Entering at the top gives 99 strictly decreasing hops, comfortably
+        // past the limit of 50.
         let unpacker = DNameUnpacker::new(&data);
-        let (dname, _) = DName::try_from_bytes(&data[0..2]).expect("should parse");
+        let (dname, _) = DName::try_from_bytes(&data[198..]).expect("should parse");
         let result = unpacker.unpack(dname);
 
-        // Should hit depth limit and fail safely
-        assert!(result.is_err(), "depth limit should be enforced");
+        assert!(
+            matches!(
+                result,
+                Err(WireError::TooLong {
+                    what: "compression pointer nesting",
+                    ..
+                })
+            ),
+            "the depth limit should be what fires, got {result:?}"
+        );
+    }
+
+    /// A pointer must point backwards (RFC 1035 §4.1.4 — a name is replaced
+    /// "with a pointer to a prior occurance of the same name"), and a chain that
+    /// runs forwards is refused.
+    ///
+    /// **Watched failing against the old code** (`CLAUDE.md` §1): with the
+    /// visited-offsets set, this chain has no repeated offset, so it unpacked
+    /// happily to `"a.b."`. Two hops are needed to demonstrate it because the
+    /// first is unconstrained — see `unpack_internal`.
+    #[test]
+    fn a_pointer_chain_that_runs_forwards_is_refused() {
+        let mut data = vec![0u8; 16];
+        data[0] = 0xc0; // offset 0: pointer forwards to 6, and nothing to
+        data[1] = 6; //             compare it against, so it is allowed
+        data[6] = 0x01; // offset 6: the label "a" …
+        data[7] = b'a';
+        data[8] = 0xc0; //           … then a pointer forwards again, to 12,
+        data[9] = 12; //             which does not precede 6
+        data[12] = 0x01; // offset 12: the label "b", then the root
+        data[13] = b'b';
+        data[14] = 0x00;
+
+        let unpacker = DNameUnpacker::new(&data);
+        let (dname, _) = DName::try_from_bytes(&data[0..]).expect("the pointer itself parses");
+        let result = unpacker.unpack(dname);
+
+        assert!(
+            matches!(
+                result,
+                Err(WireError::Malformed {
+                    what: "a compression pointer",
+                    ..
+                })
+            ),
+            "a forward chain is not compression, got {result:?}"
+        );
+    }
+
+    /// The ordinary case, beside the refused one: real compression points
+    /// backwards and still works, including through two hops.
+    #[test]
+    fn an_ordinary_backwards_pointer_chain_still_resolves() {
+        // offset 0: "b." (the tail every name below shares)
+        // offset 4: the label "a" then a pointer back to 0  => "a.b."
+        // offset 8: the label "w" then a pointer back to 4  => "w.a.b."
+        let data = vec![
+            0x01, b'b', 0x00, 0x00, // 0: "b.", then a spare byte
+            0x01, b'a', 0xc0, 0x00, // 4: "a" -> 0
+            0x01, b'w', 0xc0, 0x04, // 8: "w" -> 4
+        ];
+        let unpacker = DNameUnpacker::new(&data);
+
+        let (name, _) = dname_from_bytes(&data[4..], &unpacker).expect("one hop");
+        assert_eq!(name, "a.b.");
+
+        let (name, _) = dname_from_bytes(&data[8..], &unpacker).expect("two hops");
+        assert_eq!(name, "w.a.b.");
     }
 }

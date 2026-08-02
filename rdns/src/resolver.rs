@@ -570,7 +570,7 @@ impl Resolution {
         self.denials.extend(
             authorities
                 .iter()
-                .filter(|rr| matches!(rr.rdata.rtype, rt::NSEC | rt::NSEC3 | rt::RRSIG))
+                .filter(|rr| matches!(rr.rdata.rtype(), rt::NSEC | rt::NSEC3 | rt::RRSIG))
                 .cloned(),
         );
     }
@@ -928,7 +928,7 @@ impl Resolver {
                     continue;
                 }
                 answers.push(rr.clone());
-                if rr.rdata.rtype == rt::CNAME {
+                if rr.rdata.rtype() == rt::CNAME {
                     if let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() {
                         // Extends the chain within this same response.
                         chain.insert(normalize(&target));
@@ -941,11 +941,11 @@ impl Resolver {
             let got_type = response
                 .answers
                 .iter()
-                .any(|rr| query.qtype.matches(rr.rdata.rtype) && names_equal(&rr.name, &qname));
+                .any(|rr| query.qtype.matches(rr.rdata.rtype()) && names_equal(&rr.name, &qname));
             let cname = response
                 .answers
                 .iter()
-                .filter(|rr| rr.rdata.rtype == rt::CNAME && names_equal(&rr.name, &qname))
+                .filter(|rr| rr.rdata.rtype() == rt::CNAME && names_equal(&rr.name, &qname))
                 .find_map(|rr| match rr.rdata.parse() {
                     Ok(ParsedRecord::CNAME(target)) => Some(normalize(&target)),
                     _ => None,
@@ -1214,7 +1214,7 @@ impl Resolver {
         let mut ttl = u64::MAX;
 
         for rr in &response.authorities {
-            if rr.rdata.rtype != rt::NS {
+            if rr.rdata.rtype() != rt::NS {
                 continue; // only NS records delegate
             }
             let owner = normalize(&rr.name);
@@ -1505,7 +1505,7 @@ impl Resolver {
         let holds_the_answer = response
             .answers
             .iter()
-            .any(|rr| query.qtype.matches(rr.rdata.rtype) && names_equal(&rr.name, &denied_name));
+            .any(|rr| query.qtype.matches(rr.rdata.rtype()) && names_equal(&rr.name, &denied_name));
         let negative = !holds_the_answer;
 
         // A negative answer carries its proof in the authority section, so that
@@ -1710,7 +1710,7 @@ impl Resolver {
         let ttl = response
             .answers
             .iter()
-            .filter(|rr| rr.rdata.rtype == rt::DNSKEY)
+            .filter(|rr| rr.rdata.rtype() == rt::DNSKEY)
             .map(|rr| rr.ttl.as_u64())
             .min()
             .unwrap_or(0);
@@ -1743,7 +1743,7 @@ impl Resolver {
         let zone = response
             .authorities
             .iter()
-            .find(|rr| rr.rdata.rtype == rt::SOA)
+            .find(|rr| rr.rdata.rtype() == rt::SOA)
             .map(|rr| normalize(&rr.name))
             .unwrap_or_else(|| denied_name.to_string());
 
@@ -1824,6 +1824,7 @@ fn suffix_with_labels(qname: &str, labels: usize) -> String {
 mod tests {
     use super::*;
     use crate::Class;
+    use crate::Serial;
     use crate::Ttl;
     use crate::{ParsedRecord, QueryClass, RecordData, ResourceRecord};
     // The fake servers below are blocking `std::net`, run on their own OS
@@ -2362,7 +2363,7 @@ this line has no record and is skipped
             .expect("CNAME should be chased to the address");
 
         assert_eq!(answer.answers.len(), 2, "CNAME and the A it leads to");
-        assert_eq!(answer.answers[0].rdata.rtype, rt::CNAME);
+        assert_eq!(answer.answers[0].rdata.rtype(), rt::CNAME);
         assert_eq!(
             answer.answers[1].rdata.parse().unwrap(),
             ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 9))
@@ -3725,7 +3726,7 @@ this line has no record and is skipped
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: "ns.example.test.".to_string(),
                 rname: "admin.example.test.".to_string(),
-                serial: 1,
+                serial: Serial::new(1),
                 refresh: 10800,
                 retry: 3600,
                 expire: 604800,
@@ -3760,7 +3761,7 @@ this line has no record and is skipped
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: "ns.example.test.".to_string(),
                 rname: "admin.example.test.".to_string(),
-                serial: 1,
+                serial: Serial::new(1),
                 refresh: 10800,
                 retry: 3600,
                 expire: 604800,
@@ -3817,7 +3818,7 @@ this line has no record and is skipped
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: "ns.example.test.".to_string(),
                 rname: "admin.example.test.".to_string(),
-                serial: 1,
+                serial: Serial::new(1),
                 refresh: 10800,
                 retry: 3600,
                 expire: 604800,
@@ -3871,7 +3872,7 @@ this line has no record and is skipped
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: "ns.example.test.".to_string(),
                 rname: "admin.example.test.".to_string(),
-                serial: 1,
+                serial: Serial::new(1),
                 refresh: 10800,
                 retry: 3600,
                 expire: 604800,
@@ -3931,7 +3932,7 @@ this line has no record and is skipped
     }
 
     /// QTYPE=ANY is a *question* value, not a type any record has (RFC 1035
-    /// §3.2.3), so `rr.rdata.rtype == query.qtype` is false for every record in
+    /// §3.2.3), so `rr.rdata.rtype() == query.qtype` is false for every record in
     /// a perfectly good answer. The validator reads that as "the answer does not
     /// hold what was asked for", sets `negative`, and goes looking for a denial
     /// proof that a positive answer has no reason to carry — so an answer that
@@ -3983,7 +3984,10 @@ this line has no record and is skipped
             "the validated answer must still carry the address"
         );
         assert!(
-            answer.answers.iter().any(|rr| rr.rdata.rtype == rt::RRSIG),
+            answer
+                .answers
+                .iter()
+                .any(|rr| rr.rdata.rtype() == rt::RRSIG),
             "DO was set, so the signatures come back with the answer"
         );
     }
@@ -4124,7 +4128,7 @@ this line has no record and is skipped
         assert!(answer
             .authorities
             .iter()
-            .any(|rr| rr.rdata.rtype == rt::NSEC));
+            .any(|rr| rr.rdata.rtype() == rt::NSEC));
     }
 
     /// The NSEC3 denial path, end to end — the gap this closes is that every
@@ -4150,14 +4154,14 @@ this line has no record and is skipped
             answer
                 .authorities
                 .iter()
-                .any(|rr| rr.rdata.rtype == rt::NSEC3),
+                .any(|rr| rr.rdata.rtype() == rt::NSEC3),
             "the proof that came back is the hashed kind"
         );
         assert!(
             !answer
                 .authorities
                 .iter()
-                .any(|rr| rr.rdata.rtype == rt::NSEC),
+                .any(|rr| rr.rdata.rtype() == rt::NSEC),
             "and only the hashed kind — this zone has no plain NSEC to fall back on"
         );
     }
@@ -4223,7 +4227,7 @@ this line has no record and is skipped
             synthesized
                 .authority
                 .iter()
-                .any(|rr| rr.rdata.rtype == rt::SOA),
+                .any(|rr| rr.rdata.rtype() == rt::SOA),
             "RFC 2308 §2.1 wants the SOA on a negative answer"
         );
         assert!(synthesized.ttl <= 300, "bounded by the SOA MINIMUM");
@@ -4369,11 +4373,14 @@ this line has no record and is skipped
 
         assert_eq!(state, ValidationState::Secure, "{state}");
         assert!(
-            answer.answers.iter().any(|rr| rr.rdata.rtype == rt::CNAME),
+            answer
+                .answers
+                .iter()
+                .any(|rr| rr.rdata.rtype() == rt::CNAME),
             "the chain is still handed to the client"
         );
         assert!(
-            !answer.answers.iter().any(|rr| rr.rdata.rtype == rt::AAAA),
+            !answer.answers.iter().any(|rr| rr.rdata.rtype() == rt::AAAA),
             "and it holds no AAAA, which is what makes this a negative answer"
         );
     }
@@ -4437,7 +4444,10 @@ this line has no record and is skipped
         let (answer, state) = resolve_www(validating_config(&h)).await;
         assert_eq!(state, ValidationState::Secure, "{state}");
         assert!(
-            answer.answers.iter().any(|rr| rr.rdata.rtype == rt::CNAME),
+            answer
+                .answers
+                .iter()
+                .any(|rr| rr.rdata.rtype() == rt::CNAME),
             "the chain itself comes back"
         );
         assert!(
@@ -4493,7 +4503,7 @@ this line has no record and is skipped
             synthesized
                 .authority
                 .iter()
-                .any(|rr| rr.rdata.rtype == rt::NSEC),
+                .any(|rr| rr.rdata.rtype() == rt::NSEC),
             "with the denial that makes the wildcard apply"
         );
 

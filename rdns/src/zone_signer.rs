@@ -40,6 +40,7 @@ use crate::zone::{Zone, ZoneRecord};
 use crate::Class;
 use crate::Qtype;
 use crate::Rtype;
+use crate::Serial;
 use crate::Ttl;
 use crate::{ParsedRecord, RecordData};
 use std::collections::{BTreeMap, BTreeSet};
@@ -224,7 +225,7 @@ impl SigningPolicy {
 
     /// The SOA serial to serve for the zone this policy signs.
     /// See [`signed_serial`] for why it is what it is.
-    pub fn serial_for(&self, file_serial: u32) -> u32 {
+    pub fn serial_for(&self, file_serial: Serial) -> Serial {
         signed_serial(file_serial, self.signed_at)
     }
 }
@@ -263,8 +264,12 @@ impl SigningPolicy {
 /// days is far coarser than an hour anyway. And hours since the *epoch* rather
 /// than a fraction of the validity, so that changing `--signature-validity` does
 /// not move the serial backwards.
-pub fn signed_serial(file_serial: u32, signed_at: u64) -> u32 {
+pub fn signed_serial(file_serial: Serial, signed_at: u64) -> Serial {
     const HOUR: u64 = 3600;
+    // Wrapping, and [`Serial::wrapping_add`] says so in its own name: RFC 1982
+    // §3.1 defines addition in the sequence space that way, so passing the
+    // ceiling is an increment rather than the overflow a bare `+` would panic on
+    // in a debug build.
     file_serial.wrapping_add((signed_at / HOUR) as u32)
 }
 
@@ -384,7 +389,7 @@ fn carry_over_records(
     let mut carried: Vec<ZoneRecord> = Vec::new();
 
     for record in zone.records() {
-        if is_signer_output(record.rdata.rtype) {
+        if is_signer_output(record.rdata.rtype()) {
             continue;
         }
         if record.class != Class::new(1) {
@@ -401,7 +406,7 @@ fn carry_over_records(
             )));
         }
         let mut record = record.clone();
-        if record.rdata.rtype == rt::SOA && name == origin {
+        if record.rdata.rtype() == rt::SOA && name == origin {
             let ParsedRecord::SOA {
                 mname,
                 rname,
@@ -436,7 +441,7 @@ fn carry_over_records(
             })
             .map_err(|e| DnssecError::signing(format!("re-encoding the apex SOA: {e}")))?;
         }
-        let key = (name.clone(), record.rdata.rtype);
+        let key = (name.clone(), record.rdata.rtype());
         ttls.entry(key)
             .and_modify(|t| *t = (*t).min(record.ttl))
             .or_insert(record.ttl);
@@ -444,7 +449,7 @@ fn carry_over_records(
     }
 
     for mut record in carried {
-        record.ttl = ttls[&(record.name.clone(), record.rdata.rtype)];
+        record.ttl = ttls[&(record.name.clone(), record.rdata.rtype())];
         signed.add_record(record);
     }
 
@@ -556,7 +561,7 @@ impl Layout {
         let mut names: BTreeMap<String, NameEntry> = BTreeMap::new();
         for record in zone.records() {
             let entry = names.entry(record.name.to_ascii_lowercase()).or_default();
-            entry.types.insert(record.rdata.rtype);
+            entry.types.insert(record.rdata.rtype());
         }
         for (name, entry) in names.iter_mut() {
             entry.is_delegation = name != origin && entry.types.contains(&rt::NS);
@@ -761,10 +766,7 @@ fn nsec3param_rdata(salt: &[u8], iterations: u16) -> RecordData {
     rdata.extend_from_slice(&iterations.to_be_bytes());
     rdata.push(salt.len() as u8);
     rdata.extend_from_slice(salt);
-    RecordData {
-        rtype: rt::NSEC3PARAM,
-        rdata: rdata.into_boxed_slice(),
-    }
+    RecordData::new(rt::NSEC3PARAM, rdata).expect("an NSEC3PARAM we just built decodes")
 }
 
 // ---------------------------------------------------------------------------
@@ -793,7 +795,7 @@ fn sign_everything(
     for record in signed.records() {
         let name = record.name.to_ascii_lowercase();
         let entry = rrsets
-            .entry((name, record.rdata.rtype))
+            .entry((name, record.rdata.rtype()))
             .or_insert((record.ttl, Vec::new()));
         entry.1.push(record.rdata.clone());
     }
@@ -872,10 +874,7 @@ fn signable(entry: &NameEntry, name: &str, rtype: Rtype, origin: &str) -> bool {
 }
 
 fn dnskey_rdata(key: &Dnskey) -> RecordData {
-    RecordData {
-        rtype: rt::DNSKEY,
-        rdata: key.rdata().into_boxed_slice(),
-    }
+    RecordData::new(rt::DNSKEY, key.rdata()).expect("a DNSKEY we just built decodes")
 }
 
 #[cfg(test)]
@@ -1024,7 +1023,7 @@ ns.plain IN A  192.0.2.40
     fn signing_moves_the_soa_serial_and_keeps_moving_it() {
         let unsigned = parse_zone_file(ZONE, ORIGIN).expect("parses");
         let file_serial = unsigned.serial().expect("the file has a serial");
-        assert_eq!(file_serial, 2024051300);
+        assert_eq!(file_serial, Serial::new(2024051300));
 
         let first = sign_zone(&unsigned, &keys(), &policy(DenialChain::Nsec)).expect("signs");
         let first_serial = first.serial().expect("still has one");
@@ -1043,7 +1042,7 @@ ns.plain IN A  192.0.2.40
             .serial()
             .expect("has a serial");
         assert!(
-            crate::secondary::is_newer(later_serial, first_serial),
+            later_serial.is_newer_than(first_serial),
             "{later_serial} must be newer than {first_serial} by RFC 1982"
         );
         let again = sign_zone(&unsigned, &keys(), &policy(DenialChain::Nsec))
@@ -1059,20 +1058,25 @@ ns.plain IN A  192.0.2.40
     /// as "requiring epoch-based backend serials" for exactly this reason.
     #[test]
     fn a_date_style_serial_still_moves() {
-        let date_style = 2_026_073_001u32;
+        let date_style = Serial::new(2_026_073_001);
         let signed = signed_serial(date_style, NOW);
         assert!(
-            crate::secondary::is_newer(signed, date_style),
+            signed.is_newer_than(date_style),
             "{signed} must be newer than {date_style}"
         );
+        // Deliberately the *plain* comparison, on the numbers rather than on the
+        // serials, and the only place in the tree that unwraps a `Serial` to make
+        // one. The claim is arithmetical — the result is larger than the input, so
+        // the time term was added and not `max`ed — and `is_newer_than` above
+        // cannot carry it, because a wrapped serial would satisfy that too.
         assert!(
-            signed > date_style,
+            signed.to_u32() > date_style.to_u32(),
             "and it is addition, not max — max would have returned the file's number"
         );
         // An operator's own bump still registers as one.
         assert_eq!(
-            signed_serial(date_style + 1, NOW),
-            signed + 1,
+            signed_serial(date_style.wrapping_add(1), NOW),
+            signed.wrapping_add(1),
             "editing the file by one moves the served serial by one"
         );
     }
@@ -1122,7 +1126,7 @@ ns.plain IN A  192.0.2.40
     fn rrsets(zone: &Zone) -> BTreeMap<(String, Rtype), Vec<RecordData>> {
         let mut out: BTreeMap<(String, Rtype), Vec<RecordData>> = BTreeMap::new();
         for record in zone.records() {
-            out.entry((record.name.clone(), record.rdata.rtype))
+            out.entry((record.name.clone(), record.rdata.rtype()))
                 .or_default()
                 .push(record.rdata.clone());
         }
@@ -1489,7 +1493,7 @@ ns.plain IN A  192.0.2.40
         assert_eq!(params.len(), 1, "one NSEC3PARAM at the apex");
         // Hash 1, flags 0, five iterations, a four-byte salt.
         assert_eq!(
-            params[0].rdata.rdata.as_ref(),
+            params[0].rdata.bytes(),
             &[1, 0, 0, 5, 4, 0xde, 0xad, 0xbe, 0xef]
         );
 
@@ -1601,7 +1605,7 @@ ns.plain IN A  192.0.2.40
         let count = |z: &Zone, rtype: Rtype| {
             z.records()
                 .iter()
-                .filter(|r| r.rdata.rtype == rtype)
+                .filter(|r| r.rdata.rtype() == rtype)
                 .count()
         };
         assert_eq!(count(&once, rt::NSEC), count(&twice, rt::NSEC));

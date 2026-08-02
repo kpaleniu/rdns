@@ -1056,7 +1056,7 @@ mod tests {
         let parsed = DnsMessage::try_from_bytes(&signed).expect("the signed message parses");
         assert!(parsed.edns().is_some(), "OPT survived");
         assert_eq!(parsed.additionals.len(), 1, "the TSIG, and only it");
-        assert_eq!(parsed.additionals[0].rdata.rtype, Rtype::new(TSIG_TYPE));
+        assert_eq!(parsed.additionals[0].rdata.rtype(), Rtype::new(TSIG_TYPE));
     }
 
     #[test]
@@ -1194,7 +1194,7 @@ mod tests {
         let parsed = DnsMessage::try_from_bytes(&signed).expect("still a DNS message");
         assert_eq!(parsed.queries[0].qname, "example.com.");
         assert_eq!(parsed.additionals.len(), 1);
-        assert_eq!(parsed.additionals[0].rdata.rtype, Rtype::new(TSIG_TYPE));
+        assert_eq!(parsed.additionals[0].rdata.rtype(), Rtype::new(TSIG_TYPE));
 
         match check_request(&signed, &ring, now) {
             TsigCheck::Verified(session) => assert_eq!(session.key_name(), "transfer.key."),

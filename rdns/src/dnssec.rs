@@ -97,7 +97,7 @@ pub struct Dnskey {
 impl Dnskey {
     /// Interpret a resource record as a DNSKEY, or `None` if it is not one.
     pub fn from_record(rr: &ResourceRecord) -> Option<Self> {
-        if rr.rdata.rtype != rt::DNSKEY {
+        if rr.rdata.rtype() != rt::DNSKEY {
             return None;
         }
         match rr.rdata.parse().ok()? {
@@ -162,7 +162,7 @@ pub struct Rrsig {
 
 impl Rrsig {
     pub fn from_record(rr: &ResourceRecord) -> Option<Self> {
-        if rr.rdata.rtype != rt::RRSIG {
+        if rr.rdata.rtype() != rt::RRSIG {
             return None;
         }
         match rr.rdata.parse().ok()? {
@@ -231,7 +231,7 @@ pub struct Ds {
 
 impl Ds {
     pub fn from_record(rr: &ResourceRecord) -> Option<Self> {
-        if rr.rdata.rtype != rt::DS {
+        if rr.rdata.rtype() != rt::DS {
             return None;
         }
         match rr.rdata.parse().ok()? {
@@ -367,7 +367,7 @@ pub fn rrsig_labels(owner: &str) -> u8 {
 /// through unchanged, which is a signature failure rather than a false accept
 /// if one ever shows up mixed-case.
 pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
-    let lowered = match record.rtype {
+    let lowered = match record.rtype() {
         rt::NS | rt::CNAME | rt::PTR | rt::SOA | rt::MX | rt::RRSIG | rt::NSEC => {
             match record.parse()? {
                 ParsedRecord::NS(n) => Some(ParsedRecord::NS(canonical_name(&n))),
@@ -432,8 +432,8 @@ pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
     };
 
     match lowered {
-        Some(parsed) => Ok(RecordData::from_parsed(&parsed)?.rdata.to_vec()),
-        None => Ok(record.rdata.to_vec()),
+        Some(parsed) => Ok(RecordData::from_parsed(&parsed)?.bytes().to_vec()),
+        None => Ok(record.bytes().to_vec()),
     }
 }
 
@@ -848,7 +848,7 @@ pub fn verify_records(
     };
     let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
     verify_rrset(
-        &Rrset::new(&first.name, first.rdata.rtype, first.class, &rdatas),
+        &Rrset::new(&first.name, first.rdata.rtype(), first.class, &rdatas),
         rrsigs,
         keys,
         zone,
@@ -893,7 +893,7 @@ mod tests {
         let want = RecordData::from_parsed(&ParsedRecord::NS("ns1.example.com.".into())).unwrap();
         assert_eq!(
             lowered,
-            want.rdata.to_vec(),
+            want.bytes().to_vec(),
             "NS is on the RFC 4034 §6.2 list"
         );
 

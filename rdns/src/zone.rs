@@ -5,6 +5,7 @@ use crate::utils::record_types as rt;
 use crate::utils::{ascii_lowered_cow, is_at_or_under, NameKeyBuf};
 use crate::Class;
 use crate::Rtype;
+use crate::Serial;
 use crate::Ttl;
 use crate::{ParsedRecord, Qtype, RecordData};
 use std::borrow::Cow;
@@ -221,7 +222,7 @@ impl Zone {
     /// under something wrong — it cannot be part of a chain a validator can
     /// walk either.
     fn chain_key(&self, record: &ZoneRecord) -> Option<(Chain, Vec<u8>)> {
-        match record.rdata.rtype {
+        match record.rdata.rtype() {
             crate::utils::record_types::NSEC => Some((
                 Chain::Nsec,
                 canonical_sort_key(&self.normalize_name(&record.name)),
@@ -261,7 +262,7 @@ impl Zone {
     /// The serial is how every other server decides whether what it holds is
     /// stale, so it is the one field a zone is compared by — NOTIFY sends it,
     /// and a secondary's refresh check is a comparison of it.
-    pub fn serial(&self) -> Option<u32> {
+    pub fn serial(&self) -> Option<Serial> {
         self.query(&self.origin, Qtype::of(crate::utils::record_types::SOA))
             .first()
             .and_then(|soa| match soa.rdata.parse() {
@@ -746,16 +747,15 @@ fn parse_generic_rdata(record_type: &str, fields: &[&str]) -> Result<RecordData,
         ));
     }
 
-    let stored = RecordData {
-        rtype,
-        rdata: bytes.into_boxed_slice(),
-    };
-    // A type with no parser reads back as `Unknown` rather than failing, so this
-    // only ever rejects a known type whose bytes are not that type.
-    stored
-        .parse()
-        .map_err(|e| format!("generic rdata is not valid {record_type}: {e}"))?;
-    Ok(stored)
+    // `RecordData::new` is this check, and it used to be written out here: build
+    // the pair, then parse it to find out whether the bytes are what the TYPE
+    // says. A type with no parser reads back as `Unknown` rather than failing, so
+    // it only ever rejects a known type whose bytes are not that type. When
+    // `RecordData` was sealed (`TODO.md` #14c) that became every constructor's
+    // job rather than this one's, which is §7's rule applied to a check instead
+    // of to a function.
+    RecordData::new(rtype, bytes)
+        .map_err(|e| format!("generic rdata is not valid {record_type}: {e}"))
 }
 
 /// One record or directive, assembled from as many physical lines as it spans.
@@ -1276,7 +1276,7 @@ fn parse_into(
                         format!("SOA record needs 7 fields, got {}", soa_parts.len()),
                     ));
                 }
-                let serial = soa_parts[2].parse::<u32>().map_err(|e| {
+                let serial = soa_parts[2].parse::<Serial>().map_err(|e| {
                     ZoneError::syntax(ln, format!("invalid SOA serial {:?}: {e}", soa_parts[2]))
                 })?;
                 let refresh = soa_parts[3].parse::<i32>().map_err(|e| {
@@ -2056,7 +2056,11 @@ $TTL 3600
                 ..
             } => {
                 assert_eq!(mname, "ns1.example.com.");
-                assert_eq!(serial, 2021010101, "comments inside the group are not data");
+                assert_eq!(
+                    serial,
+                    Serial::new(2021010101),
+                    "comments inside the group are not data"
+                );
                 assert_eq!(minimum, 86400);
             }
             other => panic!("expected an SOA, got {other:?}"),
@@ -2293,7 +2297,7 @@ $TTL 3600
         let zone = parse_zone_file("odd IN TYPE1234 \\# 4 DEADBEEF\n", "example.com.").unwrap();
         let record = zone.query("odd.example.com.", Qtype::of(Rtype::new(1234)));
         assert_eq!(record.len(), 1);
-        assert_eq!(&*record[0].rdata.rdata, &[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(record[0].rdata.bytes(), [0xde, 0xad, 0xbe, 0xef]);
     }
 
     /// RFC 3597 §5 permits the generic form for a known type too, and the writer
@@ -2313,7 +2317,7 @@ $TTL 3600
         assert!(
             zone.query("empty.example.com.", Qtype::of(Rtype::new(4321)))[0]
                 .rdata
-                .rdata
+                .bytes()
                 .is_empty()
         );
     }

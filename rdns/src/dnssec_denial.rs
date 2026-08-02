@@ -301,7 +301,7 @@ pub struct Nsec {
 
 impl Nsec {
     pub fn from_record(rr: &ResourceRecord) -> Option<Self> {
-        if rr.rdata.rtype != rt::NSEC {
+        if rr.rdata.rtype() != rt::NSEC {
             return None;
         }
         match rr.rdata.parse().ok()? {
@@ -362,7 +362,7 @@ pub struct Nsec3 {
 
 impl Nsec3 {
     pub fn from_record(rr: &ResourceRecord) -> Option<Self> {
-        if rr.rdata.rtype != rt::NSEC3 {
+        if rr.rdata.rtype() != rt::NSEC3 {
             return None;
         }
         let owner = rr.name.to_ascii_lowercase();

@@ -16,7 +16,7 @@ is one line each under "Done so far", pointing at the commit that carries its
 reasoning, RFC citations and verification.
 
 **The short version, if you read nothing else:** **every numbered item through
-#13 is closed; #14 is three filed candidates with none started.** The operational
+#14 is closed.** The operational
 shell is finished; #9's five-way review went in full, its last performance item
 closed by measuring rather than fixing it; #12's audit found no reachable panic
 and left a fuzzer behind to keep it that way; and **#13 moved five families of
@@ -111,15 +111,26 @@ quietly — `git blame` refuses a revision it cannot resolve.
 
 | | Windows | Linux |
 |---|---|---|
-| `rdns` lib | 630 | 633 |
+| `rdns` lib | 648 | 633 |
 | allocations | 1 | 1 |
 | no_input_panics | 1 | 1 |
-| `rdnsd` | 93 | **106** |
+| `rdnsd` | 94 | **106** |
 | `rdnsr` | 3 | 3 |
-| **total** | **728** | **744** |
+| **total** | **747** | **744** |
+
+**The Windows column is current and the Linux one is not.** Linux was last
+measured before #13 landed; the gap between the columns is the sixteen
+`#[cfg(unix)]` tests below plus whatever has been added since, and it is no
+longer safe to read it as only the former. Re-run the Linux recipe under "Running
+the Linux half by hand" before quoting the right-hand column.
 
 **Two of those single tests are worth more than their count suggests.**
-`allocations` holds fourteen exact measurements and `no_input_panics` runs 1,506
+`allocations` reports **nineteen** measurements, **thirteen** of them exact
+(`n..=n`) — the earlier claim of "fourteen exact" on this page was never counted
+and was wrong both ways; five are deliberate ranges and one
+(`verify a DNSKEY RRset with two candidate signatures`) is `0..=u64::MAX`, a
+figure printed on purpose and asserted on purpose not at all, because §10 found
+it is a time problem and not a count problem. `no_input_panics` runs 1,506
 mutated messages through the pre-authentication path — 1.4 million of them when
 soaked. A test count is a poor summary of a suite and this is where it shows.
 
@@ -139,12 +150,13 @@ underneath. Every exact assertion in `rdns/tests/allocations.rs` (0, 1, 2, 2, 3,
 so that half is checked by CI now and was checked nowhere before.
 
 **Errors are typed in the library and `anyhow` in the binaries.** The convention
-used to run the other way round. `rdns::error` holds six types (`WireError`,
-`ZoneError`, `DnssecError`, `TransferError`, `ResolveError`, `ConfigError`) whose
-variants are the decisions a caller actually makes: truncated is FORMERR and
-unsupported is NOTIMP, a bogus signature is SERVFAIL and an unknown algorithm is
-insecure, a transfer timeout is retried and a malformed one is not. See
-`CLAUDE.md` §3.
+used to run the other way round. `rdns::error` holds seven types (`WireError`,
+`RequestError`, `ZoneError`, `DnssecError`, `TransferError`, `ResolveError`,
+`ConfigError`) whose variants are the decisions a caller actually makes:
+truncated is FORMERR and unsupported is NOTIMP, a bogus signature is SERVFAIL and
+an unknown algorithm is insecure, a transfer timeout is retried and a malformed
+one is not — and a packet that decoded perfectly but has QR=1 gets no reply at
+all, which is why that one is not a `WireError`. See `CLAUDE.md` §3.
 
 **Green did not mean conformant, and the fix for that is `CLAUDE.md`.** The suite
 passed at 590 tests while `rdnsd` could not serve a CNAME, a delegation or a
@@ -247,7 +259,7 @@ docker run -d -p 53:5353/udp -p 53:5353/tcp -p 9153:9153 \
 cargo run --release -p rdnsd --features dhat-heap -- --port 15353 --zone-file example.com.zone
 
 # The same numbers as assertions, in their own test binary so the global
-# allocator does not slow the other unit tests. One `#[test]` holding fourteen
+# allocator does not slow the other unit tests. One `#[test]` holding eighteen
 # measurements, on purpose — `--nocapture` is how you read them.
 cargo test -p rdns --test allocations -- --nocapture
 
@@ -555,7 +567,7 @@ rule it became in `CLAUDE.md`:
 | **9** | what a five-way review found: 48 defects in six groups (9a-9f) | **all done, 2026-07-27 → 2026-08-01.** The patterns became `CLAUDE.md`, which is the useful artefact; the 2,435 lines of finding text are in `git log -p TODO.md` |
 | **10** | dynamic UPDATE (RFC 2136) | **started 2026-08-02.** The reading half is in (`rdns/src/update.rs`: §2.4/§2.5 forms, §3.1, §3.2, §3.4.1's prescan); the writing half — apply, serial, re-signing, journal — is not. #7 step 6 still waits on it |
 | **11** | data layout and CPU cache friendliness | **a stretch goal, not scheduled.** Its measurement harness exists now (criterion, `--baseline`); what it still lacks is the *diagnostic* half — `perf stat`'s cache-miss and branch-miss counters, which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns) is the number it would have to move |
-| **14** | three candidates #13 left on the table: `Serial`, QR as a type, sealing `RecordData` | **filed 2026-08-02, none started.** Independent of each other, one commit each; the pass that produced them also fixed `rdnsd` answering a response on its UDP port |
+| **14** | three candidates #13 left on the table: `Serial`, QR as a type, sealing `RecordData` | **all three done 2026-08-02**, one commit each. 14a removed the second copy of RFC 1982 §3.2 and made `a > b` on two serials a compile error; 14b put all three socket entry points behind one `Request` door; 14c sealed `RecordData` into its own module — and, by asking what invariant it actually holds, found that a legal RFC 2136 UPDATE could not be parsed at all. 14a and 14b are preventative and say so; 14c's finding is under #10, with a regression test watched failing |
 | **12** | pre-authentication panics | **audited 2026-08-01.** No reachable panic in 1.4M mutated inputs; two mutex-poisoning fixes; `rdns/tests/no_input_panics.rs` left behind as the guard |
 | **13** | making illegal states unrepresentable: `OpCode`'s sentinel, the eleven name normalizations, QTYPE-vs-RTYPE, `Ttl` + `Class` + OPT out of the additional section, `Name`/`NameKey` | **done 2026-08-02**, twelve commits. 13a-13d in full; 13e's map keys done and its `Name` half deferred with a reason. Seven live defects fixed on the way. Every stage gated on `rdns/tests/allocations.rs` and every one has held its counts; 13b added a fifteenth measurement that went 2 to 0 |
 
@@ -591,7 +603,9 @@ the useful part** (`CLAUDE.md` §11 — correct in place, never quietly):
 
 ### Where to pick up next
 
-#14 is filed but unstarted; everything here is a choice rather than a queue.
+**#14 is closed.** All three candidates landed on 2026-08-02, and 14c turned
+up a live defect in #10 on the way. Everything here is a choice rather than a
+queue.
 
 > **1. Push, and read the second CI run.** Everything the first one reported is
 > fixed locally and unpushed. There were two findings, not three:
@@ -612,11 +626,16 @@ the useful part** (`CLAUDE.md` §11 — correct in place, never quietly):
 > image has no clippy package, so that half had only ever run on Windows. They
 > may have passed silently; nobody has looked.
 >
-> **2. #14a, `Serial`** — the cheapest of the three candidates #13 left, and the
-> only one with a second copy of its rule already in the tree: `notify.rs`
-> reproduces `secondary::is_newer`'s RFC 1982 comparison inline. A `Serial(u32)`
-> without `PartialOrd` makes `a > b` a compile error. ~15 sites, and the
-> span-driven rewrite from 13c/13d applies unchanged. See §14.
+> **2. #10, dynamic UPDATE (RFC 2136)** — and it is more urgent than it was.
+> The reading half is in and, until 2026-08-02, could not be reached from the
+> wire at all: an RDLENGTH=0 record made the whole message FORMERR before
+> `update.rs` ran (see §10). That is fixed, so the writing half now builds on
+> something shown to work end to end rather than only in memory. Read §10 first
+> — it says which four of the six original items are still on the far side of
+> the seam, and the serial one has to be designed together with #8.
+>
+> **#14 is closed** — 14a (`Serial`), 14b (`Request`) and 14c (sealing
+> `RecordData`) all landed on 2026-08-02. See §14.
 >
 > **3. #10, dynamic UPDATE (RFC 2136)** — **started, one piece in.**
 > `rdns/src/update.rs` reads an UPDATE and checks its prerequisites; nothing
@@ -683,6 +702,27 @@ an IXFR delta both want. What is in:
   NOTZONE and not REFUSED), and **§3.2's four rcodes**, one per prerequisite
   form. They are not interchangeable: a client uses them to tell "the name is not
   there" from "the name is there and this type is not".
+
+**A defect found on 2026-08-02, after the reading half landed: none of this
+could be reached from the wire.** RFC 2136 spells six of its ten forms — §2.4.1,
+§2.4.3, §2.4.4, §2.4.5, §2.5.2 and §2.5.3 — as a record with **RDLENGTH=0**, a
+TYPE naming what the condition or deletion is about and no value.
+`ParsedRecord::decode` rejected an empty RDATA for every type it had a decoder
+for (an A with no bytes is four bytes short), and `RecordData::from_wire` runs
+per record while the message is being read, so **the whole UPDATE was FORMERR at
+the wire layer before `update.rs` ran at all**. Every value-independent
+prerequisite and every RRset deletion was unreadable.
+
+Nothing caught it because every test in `update.rs` hands `parse` a `DnsMessage`
+built in memory — the boundary a real message crosses was the one thing never
+exercised, which is `CLAUDE.md` §1 from a new direction: not a test that agrees
+with the code, but a test that never reaches the code that disagrees. The fix is
+in `ParsedRecord::decode` (empty RDATA is `Unknown`, kept verbatim, per RFC 3597
+§5) and the regression test is
+`update::tests::an_update_survives_the_wire_including_its_empty_rdata`, watched
+failing against the old decoder. It was turned up by #14c asking what invariant
+`RecordData` actually holds — the answer being that "well formed for its TYPE" is
+not true on the wire, and RFC 2136 is where it is not.
 
 Two rules in it are the kind that pass a careless test, so each was watched
 failing against the careless implementation before it landed. §3.2.3 compares a
@@ -809,7 +849,7 @@ a stage lands. Each stage is measured **before and after, on the same machine,
 in the same session**:
 
 ```sh
-cargo test -p rdns --test allocations -- --nocapture   # 14 exact counts
+cargo test -p rdns --test allocations -- --nocapture   # 18 counts, 12 exact
 cargo bench -p rdns -- --save-baseline before          # then do the stage
 cargo bench -p rdns -- --baseline before
 ```
@@ -1740,13 +1780,13 @@ in full before anything landed because it was five interlocking changes with a
 forced order. These are independent, and any one of them is a self-contained
 commit.
 
-#### 14a. `Serial(u32)` — RFC 1982 serial arithmetic
+#### 14a. `Serial(u32)` — RFC 1982 serial arithmetic — **done 2026-08-02**
 
 The cheapest, and the one with a second copy already in the tree.
-`secondary::is_newer` implements RFC 1982 §3.2 correctly and says why: "a serial
+`secondary::is_newer` implemented RFC 1982 §3.2 correctly and said why: "a serial
 that wraps past 2^32 is still an increment, and a plain `>` would read it as a
 rollback and leave the zone frozen for the rest of its life."
-`notify.rs:124-127` then writes the same wrapping comparison out inline, with its
+`notify.rs:124-127` then wrote the same wrapping comparison out inline, with its
 own copy of the citation. That is `CLAUDE.md` §7's shape, in the one piece of
 arithmetic in DNS most likely to be got wrong with a `>`.
 
@@ -1760,7 +1800,52 @@ Not unlocked by #13 — it was always available. It is here because it is the sa
 class, the span-driven tooling from 13c/13d applies unchanged, and the second
 copy is already written.
 
-#### 14b. QR as a type
+**Done.** Landed as planned. Both implementations of RFC 1982 §3.2 are gone and
+`Serial::is_newer_than` is the one copy, with `secondary::is_newer`'s reasoning
+moved onto the type. Fifteen was about right: the type reached
+`ParsedRecord::SOA`, `Zone::serial`, `xfr` (`soa_serial`, `fetch_soa`, both
+assemblers, `IxfrOutcome::UpToDate`), `ixfr` (`ZoneDelta`, `chain_from`,
+`requested_serial`), `notify` (`changed_zones`, `zone_serials`,
+`notified_serial`), `secondary::TransferState`, `zone_signer::signed_serial`,
+`metrics` (`ZoneGauge`, `ZoneFacts`, `set_zone_serial`), and in `rdnsd` the
+announcement tuples, `send_notify`, `announce_transfer` and `record_state`.
+
+Four things worth keeping:
+
+- **There was no live defect, and this says so rather than manufacturing a
+  failing test.** `CLAUDE.md` §1 requires a regression test to be watched failing
+  against the old behaviour; there is no such test here, because nothing in the
+  tree compared two serials with an operator — grepped for, not assumed. The
+  compile error is the guard, and it protects the sites nobody has written yet.
+  §17's argument is what justifies the change without one.
+- **`Display` had to forward the whole formatter**, not `write!(f, "{}", self.0)`
+  — which is what [`Ttl`] next door does. `zone_writer` lays an SOA out as
+  `{serial:<12}` and `rdnsctl status` as `{:>6}`, and the one-line impl ignores
+  both silently: the zone file still parses, the column just stops lining up.
+  There is a test for it, because the claim was about to go in a doc comment
+  unchecked (§4).
+- **One `>` on serials existed after all, in a test, and it was right.**
+  `a_date_style_serial_still_moves` asserts `signed > date_style` to show that
+  `signed_serial` *adds* the time term rather than `max`ing it — an arithmetical
+  claim that `is_newer_than` cannot carry, since a wrapped serial satisfies that
+  too. It is now `signed.to_u32() > date_style.to_u32()`, the only place in the
+  tree that unwraps a `Serial` to compare one, with a comment saying why.
+- **`FromStr`, because the presentation form is a decimal number in two places**
+  — the zone file's SOA field and the secondary state file's second column —
+  and both already read it with `.parse()`.
+
+Verified: `cargo test --workspace` is 640/1/1/94/3, against 637/1/1/94/3 before
+(one test left `secondary`, four arrived beside `Serial`); clippy with
+`-D warnings` and `cargo fmt --all --check` clean. `cargo deny` was not re-run
+and does not apply: no dependency moved.
+**All eighteen allocation counts unchanged** — 3, 4, 3, 2, 1, 0, 6, 0, 2, 7, 208,
+922, 24, 19, 0, 2, 0, 22 before and after. Criterion was **not** run and does not
+need to be: §13's gate calls it the backstop for a change that trades an
+allocation for time, and a `#[repr(transparent)]` newtype carrying the same `u32`
+through the same arithmetic trades nothing. The allocation counts are the claim,
+and they are exact.
+
+#### 14b. QR as a type — **done 2026-08-02**
 
 The defect above is the whole argument, so it needs no other one. Two answering
 paths in `rdnsd`, one check, and the rule written down in `CLAUDE.md` §8 since
@@ -1773,7 +1858,54 @@ rather than all of `DnsMessage`: the resolver sends queries and reads responses,
 `tsig` validates both directions, and `DnsMessage` has to stay usable for all of
 that — so this is a wrapper at the door, not a split of the message type.
 
-#### 14c. Seal `RecordData`
+**Done.** `rdns::validation::Request` is that door, and all three socket entry
+points go through it: `rdnsd`'s `answer` (TCP) and `answer_datagram` (UDP), and
+`rdnsr`'s `handle_query`. It `Deref`s to `DnsMessage` for reading and
+deliberately has **no `DerefMut`**, since `request.response = true` would put the
+value back in the state the type exists to exclude.
+
+Three things the plan did not say:
+
+- **"Impossible to omit" was too strong, and the type's doc comment now says
+  so.** `DnsMessage::try_from_bytes` is still public and still correct for the
+  resolver, for `xfr`, and for a test, so a new answering path *could* call it
+  and skip the check exactly as `answer_datagram` did. What actually changed is
+  that there is one named door with the reason attached, that the drop decision
+  is written once rather than once per path, and that the next path will be
+  copied from something that checks. Real teeth would mean `make_response` and
+  its siblings taking `&Request`, which is a bigger change than this scopes and
+  would push every unit test of them through a serialize-and-reparse round trip.
+  Overclaiming it in the doc comment would have been §4's mistake exactly.
+- **It needed a seventh error type**, `error::RequestError`, with two variants —
+  and the second is why: a caller branches on them. `Wire` is garbage or a parser
+  probe; `NotAQuestion` is a traffic loop or a spoofed source, and `rdnsd` logs
+  them differently because an operator chasing one needs to tell them apart.
+  A QR=1 packet is emphatically *not* a `WireError`: it decoded perfectly, and
+  none of that type's four variants is the answer, because the answer is silence
+  rather than FORMERR, NOTIMP or a limit.
+- **`rdnsr` has nothing to branch on**, so it stays `Request::from_bytes(&data).ok()?`
+  — both failures are silence there. That asymmetry is the honest one: the
+  variants exist because one caller uses them, not because both do.
+
+**No failing-first regression test, for the second time in this section.** The
+defect — `rdnsd` answering a response on its UDP port — was fixed at the call
+site in `6c66816`, before this was filed, so there is nothing left to watch fail
+(`CLAUDE.md` §1). The three behavioural tests that cover it
+(`a_response_to_the_udp_port_is_not_answered`,
+`a_response_sent_to_the_server_port_is_dropped`,
+`a_response_is_dropped_rather_than_resolved`) were kept and still pass through
+the new door, which is the point: they say what the behaviour is, and the type
+says it cannot be forgotten.
+
+Verified: `cargo test --workspace` 642/1/1/94/3 (+2 in `validation`, for the
+constructor refusing QR=1 and for the two error variants staying apart); clippy
+with `-D warnings` and `cargo fmt --all --check` clean; **all eighteen allocation
+counts unchanged**. Also repaired on the way: a string literal in
+`a_response_to_the_udp_port_is_not_answered`'s assertion message that a
+search-and-replace had left with eighteen spaces in the middle of a sentence —
+§12's warning about `format_strings` being off, in the wild.
+
+#### 14c. Seal `RecordData` — **done 2026-08-02**
 
 **The one genuinely unlocked by #13.** `RecordData`'s fields are `pub`, and
 **twenty sites construct one directly**, bypassing `from_wire` and
@@ -1786,6 +1918,55 @@ Sealing the pair only *means* anything now that `rtype` is an [`Rtype`] rather
 than a `u16` anyone can invent, which is why this was not worth doing before
 13c. Cost: twenty constructions become constructor calls, and eleven
 `.rdata.rdata` reads become an accessor.
+
+**Done**, and it cost more than the estimate in one place and less in another.
+
+- **"Twenty constructions" was fourteen** — counted this time, with
+  `grep -rn 'RecordData {'`, which is what the estimate should have been in the
+  first place (§17's closing rule about reviewing a plan the way code gets
+  reviewed). Eleven `.rdata.rdata` reads was exactly right, and the number the
+  plan did not mention is the one that dominated the diff: **128**
+  `.rdata.rtype` reads became `.rdata.rtype()`. Mechanical, but it is the bulk
+  of the change.
+- **Private fields in `lib.rs` would have sealed nothing.** `RecordData` lived
+  in the crate root, and private *there* means visible to the crate root and
+  every descendant module — the whole library, which is where all fourteen
+  constructions were. A field is only sealed against the module it is declared
+  in, so the type moved to `rdns/src/record_data.rs`, a module holding one
+  struct on purpose. The plan missed this entirely, and it is the part that
+  decides whether the item is worth doing at all.
+- **A third door was needed.** `from_wire` and `from_parsed` do not cover
+  "wire-format bytes some other code produced" — a signer building a DNSKEY, a
+  zone file's RFC 3597 escape, a test. `RecordData::new(rtype, bytes)` is that
+  door and it *checks*: build the pair, parse it, refuse a known type whose
+  bytes are not that type. `zone.rs`'s generic-rdata path had already written
+  that check out by hand, and now calls it instead (§7).
+- **`ixfr::RecordKey` had to stop splitting the pair.** It carried `rtype` and
+  `rdata` separately for its ordering and rebuilt a `RecordData` in
+  `into_record`; after sealing, that rebuild would have gone through the checked
+  constructor and re-parsed every changed record. It carries the whole
+  `RecordData` now, with `Ord` written out rather than derived so that TYPE
+  still sorts before class and TTL — which is the order records come out of a
+  diff in, and therefore go onto the wire in.
+- **It found a live defect before it found anything else**, recorded under #10
+  above: the invariant it was about to assert is *false on the wire*, because
+  RFC 2136 §2.4 and §2.5 spell six of their ten forms with RDLENGTH=0 and
+  `ParsedRecord::decode` rejected that — so a legal UPDATE was FORMERR before
+  `update.rs` ran. That is its own commit, landed first, with a regression test
+  watched failing.
+
+**One allocation count moved up, 922 to 924**, and the reason is written next to
+the assertion rather than waved through (§10, and §13's gate pointed the other
+way). `zone_signer::dnskey_rdata` now goes through the checked constructor,
+whose parse allocates one `Vec` for a DNSKEY's public key; the measured zone is
+signed with two keys and no NSEC3, so it is exactly two — arrived at by counting
+the callers, not by rounding. Two allocations once per signing run, to make "the
+RDATA is what its TYPE says" true by construction.
+
+Verified: `cargo test --workspace` 646/1/1/94/3, against 643/1/1/94/3 before
+(three new tests in `record_data`); clippy with `-D warnings` and
+`cargo fmt --all --check` clean; the other seventeen allocation counts
+unchanged.
 
 #### Two that were checked and dropped, because a survey that only adds is not a survey
 
@@ -3169,6 +3350,48 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **A compression pointer points backwards, so a cycle cannot be built** —
+  RFC 1035 §4.1.4 defines compression as replacing a name "with a pointer to a
+  prior occurance of the same name" (the RFC's spelling, checked against the
+  text rather than quoted from memory), so a forward pointer is not compression
+  and no real sender emits one. Requiring each hop to land strictly before the
+  previous one makes a cycle **unreachable rather than detected**: a strictly
+  decreasing sequence of `usize` cannot repeat. That deleted
+  `DNameUnpacker`'s `RefCell<HashSet<usize>>` and the insert/remove around every
+  hop — the unpacker now holds no mutable state at all.
+
+  **`MAX_DEPTH` stays, and its job changed**, which is the part worth reading:
+  it is no longer what stops a cycle, it is what bounds the *work*. Strictly
+  decreasing targets terminate, but an offset is 14 bits, so termination alone
+  still permits ~16k recursive hops for one name — a stack depth a hostile
+  sender would get to choose. Correctness and cost are two limits, and they are
+  now two mechanisms.
+
+  **The first hop is deliberately unconstrained**, and the comment says so: a
+  name is parsed from a slice that does not know its own offset
+  (`dname_from_bytes` is handed the remaining bytes), so there is nothing to
+  compare the first target against. One forward jump is still accepted; every
+  hop after it must decrease, which is what makes the chain finite. Recovering
+  the absolute offset would mean pointer arithmetic against the message slice,
+  correct only under an invariant no type here states.
+
+  Verified: `a_pointer_chain_that_runs_forwards_is_refused` watched failing
+  against the old code, where it unpacked happily to `"a.b."` (§1). Two existing
+  tests needed the change and both are recorded in place —
+  `test_depth_limit_prevents_deep_recursion` built its chain running *forwards*,
+  so it would have passed under the new rule while measuring nothing, and now
+  uses a strictly decreasing chain; `test_cycle_detection_works` still passes and
+  its comment now says the self-pointer is caught on the second hop by
+  arithmetic. A nineteenth allocation measurement was added because nothing in
+  that file parsed a *compressed* name — the only path `DNameUnpacker`'s pointer
+  following is on — and it is what makes the claim a number: **20 allocations
+  with the visited set, 19 without**, measured by stashing the source and
+  re-running the probe. Per *message* containing a pointer, not per name, since
+  `HashSet` allocates on first insert and `unpack` cleared rather than dropped
+  it — the smaller of the two claims and the true one. 1.5M mutated cases
+  through `no_input_panics` with no panics, this being a pre-authentication path
+  (#12).
+
 - **A map key is a folded name, and now says so** — #13e, the half of it worth
   having. `NameKeyBuf` folds in its only constructor, so a map cannot be keyed on
   a name nobody normalized — the `cache` bug that `utils::ascii_lowered`'s doc
@@ -4031,7 +4254,7 @@ secondary::MasterSpec::parse("example.com@192.0.2.1:53#transfer.key.")?;
 let timers = secondary::RefreshTimers::from_zone(&zone).unwrap_or_default();
 timers.after_success();  timers.after_failure();
 timers.has_expired(last_contact, now);          // -> stop serving the zone
-secondary::is_newer(remote_serial, ours);       // RFC 1982, never `>`
+remote_serial.is_newer_than(ours);              // RFC 1982; `>` will not compile
 
 let mut state = secondary::StateFile::load(&secondary::state_file_path(dir));
 state.get("example.com.", master);              // Option<&TransferState>

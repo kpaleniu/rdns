@@ -198,8 +198,8 @@ fn read_prerequisite(
     }
     in_zone_or_notzone(&rr.name, zone, "prerequisite")?;
 
-    let rtype = rr.rdata.rtype;
-    let empty = rr.rdata.rdata.is_empty();
+    let rtype = rr.rdata.rtype();
+    let empty = rr.rdata.bytes().is_empty();
     match QueryClass::from(rr.class) {
         // §2.4.4 / §2.4.1 — ANY: "is anything there?", either at the name or
         // for one type at it.
@@ -250,8 +250,8 @@ fn read_change(
     // zone's data.
     in_zone_or_notzone(&rr.name, zone, "update")?;
 
-    let rtype = rr.rdata.rtype;
-    let empty = rr.rdata.rdata.is_empty();
+    let rtype = rr.rdata.rtype();
+    let empty = rr.rdata.bytes().is_empty();
     // §3.4.1 again: a meta-type may never be added, and only ANY may be
     // deleted. "ANY" as something to *add* is not data, it is a question.
     let deleting = matches!(
@@ -498,10 +498,7 @@ mail IN MX  10 mx.example.com.
     /// An empty RDATA of a given type: how §2.4 and §2.5 spell "this type, no
     /// value".
     fn bare(rtype: Rtype) -> RecordData {
-        RecordData {
-            rtype,
-            rdata: Vec::new().into_boxed_slice(),
-        }
+        RecordData::new(rtype, Vec::new()).expect("a type with no value is storable")
     }
 
     /// All five prerequisite forms of RFC 2136 §2.4, each identified by the
@@ -738,19 +735,92 @@ mail IN MX  10 mx.example.com.
         );
     }
 
+    /// **The whole of §2.4 and §2.5, over an actual wire.**
+    ///
+    /// Every other test in this module hands [`parse`] a `DnsMessage` built in
+    /// memory, which is `CLAUDE.md` §1's failure mode written out: the message
+    /// never crossed the boundary a real one crosses, so the reading half was
+    /// checked against nothing but itself.
+    ///
+    /// It was hiding a defect that made this whole module unreachable. §2.4.1,
+    /// §2.4.3, §2.4.4, §2.4.5, §2.5.2 and §2.5.3 all spell their record with
+    /// **RDLENGTH=0** — it names a type and carries no value — and
+    /// `ParsedRecord::decode` rejected that for every type it had a decoder for,
+    /// because an A with no bytes is four bytes short. `RecordData::from_wire`
+    /// runs per record as the message is read, so the whole UPDATE was FORMERR
+    /// before a line of this file ran: every value-independent prerequisite and
+    /// every RRset deletion was unreadable.
+    ///
+    /// **Watched failing against the old decoder**, which is what makes this a
+    /// regression test rather than a restatement (§1): `try_from_bytes` returned
+    /// `Malformed { what: "RDATA", detail: "a fixed-width field has the wrong
+    /// length" }`, and the `expect` below fired.
+    #[test]
+    fn an_update_survives_the_wire_including_its_empty_rdata() {
+        // §2.4.1 RRset exists (value independent) and §2.4.3 RRset does not
+        // exist; then §2.5.2 delete an RRset, and one ordinary §2.5.1 add so the
+        // message is not made only of the interesting case.
+        let prerequisites = vec![
+            rr("www.example.com.", Class::new(255), Ttl::ZERO, bare(rt::A)),
+            rr("new.example.com.", Class::new(254), Ttl::ZERO, bare(rt::A)),
+        ];
+        let changes = vec![
+            rr("old.example.com.", Class::new(255), Ttl::ZERO, bare(rt::A)),
+            rr(
+                "add.example.com.",
+                Class::new(1),
+                Ttl::from_secs(3600),
+                a("192.0.2.7"),
+            ),
+        ];
+
+        let message = update(prerequisites, changes);
+        let mut buf = vec![0u8; 4096];
+        let n = message.to_bytes(&mut buf).expect("an UPDATE serializes");
+        let back = DnsMessage::try_from_bytes(&buf[..n])
+            .expect("and reads back — RFC 2136 §2.4/§2.5 records carry RDLENGTH=0");
+
+        let request = parse(&back).expect("and is a well-formed UPDATE");
+        assert_eq!(
+            request.prerequisites,
+            vec![
+                Prerequisite::RrsetExists {
+                    name: "www.example.com.".to_string(),
+                    rtype: rt::A,
+                },
+                Prerequisite::RrsetDoesNotExist {
+                    name: "new.example.com.".to_string(),
+                    rtype: rt::A,
+                },
+            ],
+            "the forms survive the round trip, not just the bytes"
+        );
+        assert_eq!(
+            request.changes[0],
+            Change::DeleteRrset {
+                name: "old.example.com.".to_string(),
+                rtype: rt::A,
+            }
+        );
+        assert!(matches!(request.changes[1], Change::Add(_)));
+    }
+
     /// §3.4.1 forbids adding a meta-type, and §2.4 requires a zero TTL on every
     /// prerequisite. Both are FORMERR, and both are the kind of thing a
     /// hand-built message gets wrong.
     #[test]
     fn a_meta_type_may_not_be_added_and_a_prerequisite_may_not_carry_a_ttl() {
+        // TYPE=ANY with CLASS=the zone's is §2.5.1's "add", and ANY is a
+        // meta-type, so §3.4.1's prescan must refuse it. Built through the
+        // checked constructor rather than by reaching into the record after the
+        // fact: ANY has no decoder, so the bytes are opaque and kept verbatim,
+        // which is what a meta-type in a TYPE field is.
         let add_any = rr(
             "www.example.com.",
             Class::new(1),
             Ttl::from_secs(3600),
-            a("192.0.2.50"),
+            RecordData::new(rt::ANY, vec![192, 0, 2, 50]).expect("opaque rdata"),
         );
-        let mut add_any = add_any;
-        add_any.rdata.rtype = rt::ANY;
         assert_eq!(
             parse(&update(Vec::new(), vec![add_any])).unwrap_err().rcode,
             ResponseCode::FormatError,

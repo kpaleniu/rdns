@@ -54,7 +54,7 @@ pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<Dn
     records.push(soa.clone());
     for zr in zone.records() {
         let name = zone.normalize_name(&zr.name);
-        if zr.rdata.rtype == rt::SOA && name.eq_ignore_ascii_case(&apex) {
+        if zr.rdata.rtype() == rt::SOA && name.eq_ignore_ascii_case(&apex) {
             continue;
         }
         records.push(ResourceRecord {
@@ -87,7 +87,7 @@ pub(crate) fn pack_transfer_messages(
     let mut current: Vec<ResourceRecord> = Vec::new();
     let mut estimated = 0usize;
     for rr in records {
-        let cost = rr.name.len() + 2 + 10 + rr.rdata.rdata.len();
+        let cost = rr.name.len() + 2 + 10 + rr.rdata.bytes().len();
         if !current.is_empty() && estimated + cost > AXFR_TARGET_MESSAGE_SIZE {
             messages.push(transfer_message(request, std::mem::take(&mut current)));
             estimated = 0;
@@ -198,13 +198,13 @@ mod tests {
         let all: Vec<&ResourceRecord> = messages.iter().flat_map(|m| m.answers.iter()).collect();
         assert!(all.len() >= 2);
         assert_eq!(
-            all.first().unwrap().rdata.rtype,
+            all.first().unwrap().rdata.rtype(),
             rt::SOA,
             "opens with the SOA"
         );
-        assert_eq!(all.last().unwrap().rdata.rtype, rt::SOA, "closes with it");
+        assert_eq!(all.last().unwrap().rdata.rtype(), rt::SOA, "closes with it");
         assert_eq!(
-            all.iter().filter(|rr| rr.rdata.rtype == rt::SOA).count(),
+            all.iter().filter(|rr| rr.rdata.rtype() == rt::SOA).count(),
             2,
             "and exactly twice — an SOA in the middle would end the transfer early"
         );
@@ -288,11 +288,18 @@ mod tests {
                 .first()
                 .unwrap()
                 .rdata
-                .rtype,
+                .rtype(),
             rt::SOA
         );
         assert_eq!(
-            messages.last().unwrap().answers.last().unwrap().rdata.rtype,
+            messages
+                .last()
+                .unwrap()
+                .answers
+                .last()
+                .unwrap()
+                .rdata
+                .rtype(),
             rt::SOA
         );
         // Every record made it exactly once, plus the SOA twice.

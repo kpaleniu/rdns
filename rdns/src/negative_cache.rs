@@ -141,7 +141,7 @@ impl NegativeCache {
         let Some(soa_rr) = response
             .authorities
             .iter()
-            .find(|rr| rr.rdata.rtype == rt::SOA)
+            .find(|rr| rr.rdata.rtype() == rt::SOA)
         else {
             return;
         };
@@ -292,6 +292,7 @@ fn make_room(entries: &mut Entries, now: u64) {
 mod tests {
     use super::*;
     use crate::Class;
+    use crate::Serial;
     use crate::{OpCode, QueryClass, QuerySection, RecordData};
 
     fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
@@ -302,7 +303,7 @@ mod tests {
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: format!("ns1.{zone}"),
                 rname: format!("admin.{zone}"),
-                serial: 1,
+                serial: Serial::new(1),
                 refresh: 10800,
                 retry: 3600,
                 expire: 604800,
@@ -464,7 +465,10 @@ mod tests {
             "authority TTLs must not exceed the negative TTL"
         );
         assert!(
-            answer.authority.iter().any(|rr| rr.rdata.rtype == rt::SOA),
+            answer
+                .authority
+                .iter()
+                .any(|rr| rr.rdata.rtype() == rt::SOA),
             "RFC 2308 §2.1 wants the SOA on a negative answer"
         );
     }

@@ -59,7 +59,7 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
     // loaded in, so rewriting an unchanged zone produces an unchanged file and a
     // diff between two versions shows what actually moved.
     let apex_soa = |r: &ZoneRecord| {
-        r.rdata.rtype == record_types::SOA && r.name.eq_ignore_ascii_case(zone.origin())
+        r.rdata.rtype() == record_types::SOA && r.name.eq_ignore_ascii_case(zone.origin())
     };
     for record in zone.records().iter().filter(|r| apex_soa(r)) {
         out.push_str(&record_to_string(record)?);
@@ -120,14 +120,14 @@ pub fn record_to_string(record: &ZoneRecord) -> Result<String, ZoneError> {
 /// the round trip — without this module having to enumerate those cases or
 /// notice when a new one appears.
 fn rdata_to_string(stored: &RecordData) -> (String, String) {
-    let name = record_type_name(stored.rtype);
+    let name = record_type_name(stored.rtype());
     let generic = (name.clone(), generic_rdata(stored));
 
     let Ok(parsed) = stored.parse() else {
         return generic;
     };
     match RecordData::from_parsed(&parsed) {
-        Ok(reencoded) if reencoded.rdata == stored.rdata => {}
+        Ok(reencoded) if reencoded.bytes() == stored.bytes() => {}
         _ => return generic,
     }
     match presentation_rdata(&parsed) {
@@ -138,10 +138,10 @@ fn rdata_to_string(stored: &RecordData) -> (String, String) {
 
 /// `\# <length> <hex>` (RFC 3597 §5) — the form that is exact for anything.
 fn generic_rdata(stored: &RecordData) -> String {
-    let mut out = format!("\\# {}", stored.rdata.len());
-    if !stored.rdata.is_empty() {
+    let mut out = format!("\\# {}", stored.bytes().len());
+    if !stored.bytes().is_empty() {
         out.push(' ');
-        for byte in stored.rdata.iter() {
+        for byte in stored.bytes() {
             out.push_str(&format!("{byte:02X}"));
         }
     }
@@ -368,6 +368,7 @@ mod tests {
     use crate::utils::record_types as rt;
     use crate::zone::parse_zone_file;
     use crate::Rtype;
+    use crate::Serial;
 
     /// Load, write, load again — and hold the two zones to being the same zone,
     /// record for record, RDATA byte for byte. This is the property the module
@@ -388,8 +389,8 @@ mod tests {
             .iter()
             .map(|r| (r.name.clone(), r.ttl, r.class, r.rdata.clone()))
             .collect();
-        before.sort_by_key(|r| (r.0.clone(), r.3.rtype));
-        after.sort_by_key(|r| (r.0.clone(), r.3.rtype));
+        before.sort_by_key(|r| (r.0.clone(), r.3.rtype()));
+        after.sort_by_key(|r| (r.0.clone(), r.3.rtype()));
         assert_eq!(
             before, after,
             "round trip changed the zone\n---\n{written}\n---"
@@ -424,7 +425,7 @@ mod tests {
             1,
             "wildcard"
         );
-        assert_eq!(second.serial(), Some(2021010101));
+        assert_eq!(second.serial(), Some(Serial::new(2021010101)));
     }
 
     /// A per-record TTL is what makes each line independent, so it has to
@@ -503,10 +504,8 @@ mod tests {
     #[test]
     fn test_unknown_types_survive_as_generic_records() {
         let mut zone = Zone::new("example.com.".to_string());
-        let rdata = RecordData {
-            rtype: Rtype::new(1234),
-            rdata: vec![0xde, 0xad, 0xbe, 0xef].into_boxed_slice(),
-        };
+        let rdata = RecordData::new(Rtype::new(1234), vec![0xde, 0xad, 0xbe, 0xef])
+            .expect("a type with no decoder is stored verbatim");
         zone.add_record(ZoneRecord {
             name: "odd.example.com.".to_string(),
             ttl: Ttl::from_secs(300),
@@ -532,10 +531,7 @@ mod tests {
             name: "empty.example.com.".to_string(),
             ttl: Ttl::from_secs(300),
             class: Class::new(1),
-            rdata: RecordData {
-                rtype: Rtype::new(4321),
-                rdata: Vec::new().into_boxed_slice(),
-            },
+            rdata: RecordData::new(Rtype::new(4321), Vec::new()).expect("zero-length rdata"),
         });
 
         let written = zone_to_string(&zone).expect("write");
@@ -544,7 +540,7 @@ mod tests {
         assert!(
             reread.query("empty.example.com.", Qtype::of(Rtype::new(4321)))[0]
                 .rdata
-                .rdata
+                .bytes()
                 .is_empty()
         );
     }
@@ -704,7 +700,7 @@ mod tests {
 
         write_zone_file(&zone, &path).expect("write");
         let reloaded = crate::zone::parse_zone_file_at(&path, "example.com.").expect("reload");
-        assert_eq!(reloaded.serial(), Some(7));
+        assert_eq!(reloaded.serial(), Some(Serial::new(7)));
         assert_eq!(
             reloaded.query("www.example.com.", Qtype::of(rt::A)).len(),
             1

@@ -66,7 +66,7 @@ impl DnssecValidator {
     pub fn is_zone_signed(zone: &Zone) -> bool {
         zone.records()
             .iter()
-            .any(|r| r.rdata.rtype == record_types::DNSKEY)
+            .any(|r| r.rdata.rtype() == record_types::DNSKEY)
     }
 
     /// Validate records in a response before sending
@@ -105,7 +105,7 @@ impl DnssecValidator {
         let keys: Vec<Dnskey> = zone
             .records()
             .iter()
-            .filter(|r| r.rdata.rtype == record_types::DNSKEY)
+            .filter(|r| r.rdata.rtype() == record_types::DNSKEY)
             .filter_map(|r| {
                 Dnskey::from_record(&ResourceRecord {
                     name: r.name.clone(),
@@ -124,7 +124,7 @@ impl DnssecValidator {
         let rrsigs: Vec<Rrsig> = zone
             .records()
             .iter()
-            .filter(|r| r.rdata.rtype == record_types::RRSIG)
+            .filter(|r| r.rdata.rtype() == record_types::RRSIG)
             .filter_map(|r| {
                 Rrsig::from_record(&ResourceRecord {
                     name: r.name.clone(),
@@ -137,7 +137,7 @@ impl DnssecValidator {
 
         let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
         let proof = verify_rrset(
-            &Rrset::new(&first.name, first.rdata.rtype, first.class, &rdatas),
+            &Rrset::new(&first.name, first.rdata.rtype(), first.class, &rdatas),
             &rrsigs,
             &keys,
             zone.origin(),

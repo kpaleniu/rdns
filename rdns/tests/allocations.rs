@@ -412,6 +412,33 @@ fn a_response_full_of_shared_suffixes() {
     // narrow rather than exact because the two compressor vectors grow with the
     // number of distinct names, and where they choose to reallocate is theirs.
     within("serialize four names sharing a suffix", count, 5..=10);
+
+    // And the same message read back, which is what a resolver does to every
+    // reply it gets and a secondary to every AXFR message. Nothing else in this
+    // file parses a name that is actually *compressed* — the query path can't,
+    // a QNAME having nothing before it to point at — so this is the only
+    // measurement that covers `DNameUnpacker`'s pointer-following at all.
+    //
+    // **What it holds down is the visited-offsets set.** Cycle prevention used
+    // to be a `RefCell<HashSet<usize>>` on the unpacker, and a `HashSet`
+    // allocates its table on the first `insert` — so the first compressed name
+    // in a message bought one, and later names reused it, `unpack` having
+    // `clear`ed rather than dropped it. Requiring a pointer to point backwards
+    // (RFC 1035 §4.1.4) makes a cycle unreachable instead of detected, so the
+    // set is gone. Measured either side of that change, by stashing the source
+    // and re-running this probe: **20 with it, 19 without**. One allocation per
+    // message containing a compression pointer, which is per *message* and not
+    // per name — the smaller of the two claims, and the true one. The rest of
+    // the 19 is the message itself: four names, their label vectors and the
+    // section vectors, none of which this change touches.
+    let wire = response.to_bytes_within(4096).expect("serialize");
+    let (reparsed, count) = allocations(|| DnsMessage::try_from_bytes(&wire).expect("parse back"));
+    assert_eq!(
+        reparsed.answers.len(),
+        3,
+        "the measurement is only meaningful if it parsed"
+    );
+    within("parse a response with compressed names", count, 19..=19);
 }
 
 /// The second thing to measure: a full zone load and sign. Nobody had looked at
@@ -440,6 +467,15 @@ fn one_zone_load_and_sign() {
 
     let (signed, sign_count) = allocations(|| sign_zone(&zone, &keys, &policy).expect("sign"));
     assert!(signed.records().len() > zone.records().len());
+    // **Moved 922 -> 924 on 2026-08-02, and the reason is written here rather
+    // than waved through** (`CLAUDE.md` §10, `TODO.md` §13's gate pointed the
+    // other way). Sealing `RecordData` (#14c) made `zone_signer::dnskey_rdata`
+    // go through the checked constructor, which parses what it was handed; a
+    // DNSKEY's decoder allocates one `Vec` for the public key. Two keys above,
+    // KSK and ZSK, so exactly two allocations — not an estimate: NSEC3 is off in
+    // this policy, so `nsec3param_rdata`, the only other new caller, does not
+    // run at all. Two allocations once per signing run, to make "the RDATA is
+    // what its TYPE says" true by construction.
     within("sign an eight-record zone", sign_count, 600..=1_400);
 }
 

@@ -16,6 +16,7 @@ use rdns::special_names;
 use rdns::utils::current_unix_timestamp;
 use rdns::utils::record_types;
 use rdns::utils::{recv_error_is_transient, UDP_RECEIVE_BUFFER};
+use rdns::validation::Request;
 use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, Qtype, QuerySection, ResourceRecord, ResponseCode,
     EDNS_VERSION, OPT_RECORD_TYPE,
@@ -797,17 +798,18 @@ async fn handle_query(
     caches: &Arc<Caches>,
     transport: Transport,
 ) -> Option<Vec<u8>> {
-    let msg = DnsMessage::try_from_bytes(&data).ok()?;
-
-    // A *response* is not a query, and answering one is how a resolver becomes a
-    // packet engine. `handle_query` used to go straight to `queries.first()`,
-    // which a response also has — so two instances pointed at each other, or one
-    // spoofed datagram with a forged source, is a self-sustaining loop between
-    // them: each reply is parsed as a question and answered with another reply.
-    // There is nothing to send back here, because the peer did not ask anything.
-    if msg.response {
-        return None;
-    }
+    // Parse, and refuse a *response*: answering one is how a resolver becomes a
+    // packet engine. This used to go straight to `queries.first()`, which a
+    // response also has — so two instances pointed at each other, or one spoofed
+    // datagram with a forged source, is a self-sustaining loop between them, each
+    // reply parsed as a question and answered with another reply. `None` is the
+    // whole reply, because the peer did not ask anything.
+    //
+    // Both failures are silence here, so unlike `rdnsd` there is nothing to
+    // branch on — this resolver says nothing per packet at the default log level
+    // either way. The type is what makes the check unskippable; see
+    // `rdns::validation::Request`.
+    let msg = Request::from_bytes(&data).ok()?;
 
     // Every opcode but QUERY is something this resolver does not implement, and
     // saying so is more useful than answering a NOTIFY or an UPDATE with a
@@ -1146,15 +1148,15 @@ fn finish(
     // Records it asked for by type are a different matter and stay.
     if !client_wants_dnssec {
         let asked_for = |rtype: Rtype| query.qtype.is(rtype);
-        let keep = |rr: &ResourceRecord| match rr.rdata.rtype {
+        let keep = |rr: &ResourceRecord| match rr.rdata.rtype() {
             record_types::RRSIG | record_types::NSEC | record_types::NSEC3 => false,
-            record_types::DNSKEY | record_types::DS => asked_for(rr.rdata.rtype),
+            record_types::DNSKEY | record_types::DS => asked_for(rr.rdata.rtype()),
             _ => true,
         };
         resp.answers.retain(keep);
         resp.authorities.retain(keep);
         resp.additionals
-            .retain(|rr| rr.rdata.rtype == OPT_RECORD_TYPE || keep(rr));
+            .retain(|rr| rr.rdata.rtype() == OPT_RECORD_TYPE || keep(rr));
     }
 
     // Only include an OPT record when the client used EDNS (RFC 6891 §6.1.1);
@@ -1168,7 +1170,7 @@ fn finish(
         resp.set_edns(edns);
     } else {
         resp.additionals
-            .retain(|rr| rr.rdata.rtype != OPT_RECORD_TYPE);
+            .retain(|rr| rr.rdata.rtype() != OPT_RECORD_TYPE);
     }
 
     // Honor the client's advertised UDP size: truncates (TC=1) if it overflows.

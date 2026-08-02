@@ -419,7 +419,7 @@ pub fn extract_dnskey_fields(key: &ParsedRecord) -> DnssecResult<(u8, Vec<u8>, u
 /// The type code is carried directly on [`RecordData`], so this is just an
 /// accessor kept for call-site compatibility.
 pub fn record_type_code(rdata: &RecordData) -> Rtype {
-    rdata.rtype
+    rdata.rtype()
 }
 
 /// Convert record type name to its numeric code

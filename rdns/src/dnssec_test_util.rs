@@ -222,7 +222,7 @@ impl TestZone {
         let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
         let mut sig = self.zsk.sign_rrset(
             wildcard,
-            first.rdata.rtype,
+            first.rdata.rtype(),
             first.class,
             first.ttl.as_secs(),
             &self.name,
@@ -239,7 +239,7 @@ impl TestZone {
         let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
         let sig = self.zsk.sign_rrset(
             &first.name,
-            first.rdata.rtype,
+            first.rdata.rtype(),
             first.class,
             first.ttl.as_secs(),
             &self.name,

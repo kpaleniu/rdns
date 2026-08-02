@@ -437,7 +437,7 @@ impl<'a> ChainValidator<'a> {
 
         let rdatas: Vec<RecordData> = records
             .iter()
-            .filter(|rr| rr.rdata.rtype == rt::DNSKEY && canonical_name(&rr.name) == zone)
+            .filter(|rr| rr.rdata.rtype() == rt::DNSKEY && canonical_name(&rr.name) == zone)
             .map(|rr| rr.rdata.clone())
             .collect();
         let class = records.first().map(|rr| rr.class).unwrap_or(Class::new(1));
@@ -716,7 +716,7 @@ impl<'a> ChainValidator<'a> {
         let mut nsecs = Vec::new();
         let mut nsec3s = Vec::new();
         for rr in records {
-            let rtype = rr.rdata.rtype;
+            let rtype = rr.rdata.rtype();
             if rtype != rt::NSEC && rtype != rt::NSEC3 {
                 continue;
             }
@@ -750,16 +750,16 @@ impl<'a> ChainValidator<'a> {
 pub fn group_rrsets(records: &[ResourceRecord]) -> Vec<(String, Rtype, Class, Vec<RecordData>)> {
     let mut sets: Vec<(String, Rtype, Class, Vec<RecordData>)> = Vec::new();
     for rr in records {
-        if rr.rdata.rtype == rt::RRSIG || rr.rdata.rtype == crate::OPT_RECORD_TYPE {
+        if rr.rdata.rtype() == rt::RRSIG || rr.rdata.rtype() == crate::OPT_RECORD_TYPE {
             continue;
         }
         let owner = canonical_name(&rr.name);
         match sets
             .iter_mut()
-            .find(|(n, t, c, _)| *n == owner && *t == rr.rdata.rtype && *c == rr.class)
+            .find(|(n, t, c, _)| *n == owner && *t == rr.rdata.rtype() && *c == rr.class)
         {
             Some((_, _, _, rdatas)) => rdatas.push(rr.rdata.clone()),
-            None => sets.push((owner, rr.rdata.rtype, rr.class, vec![rr.rdata.clone()])),
+            None => sets.push((owner, rr.rdata.rtype(), rr.class, vec![rr.rdata.clone()])),
         }
     }
     sets
@@ -851,7 +851,7 @@ pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) 
     // malformed: a CNAME is by definition the only record at its owner
     // (RFC 1034 section 3.6.2), so two of them cannot both be followed.
     let mut cnames: Vec<(String, String)> = Vec::new();
-    for rr in answers.iter().filter(|rr| rr.rdata.rtype == rt::CNAME) {
+    for rr in answers.iter().filter(|rr| rr.rdata.rtype() == rt::CNAME) {
         let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() else {
             return ChainShape::Broken(format!("a CNAME at {} does not parse", rr.name));
         };
@@ -891,13 +891,13 @@ pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) 
     // either an answer to something else or an attempt to have one taken for
     // this answer.
     for rr in answers {
-        if rr.rdata.rtype == rt::RRSIG {
+        if rr.rdata.rtype() == rt::RRSIG {
             // A signature is attached to an RRset rather than being one, and the
             // RRset it covers is checked on its own account.
             continue;
         }
         let owner = canonical_name(&rr.name);
-        let on_the_path = if rr.rdata.rtype == rt::CNAME {
+        let on_the_path = if rr.rdata.rtype() == rt::CNAME {
             // Either a link the walk followed, or — for a query that asked for a
             // CNAME — the answer itself.
             followed.contains(&owner) || (!follow && owner == current)
@@ -907,7 +907,7 @@ pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) 
         if !on_the_path {
             return ChainShape::Broken(format!(
                 "{owner} type {} is in the answer but not on the path from {queried}",
-                rr.rdata.rtype
+                rr.rdata.rtype()
             ));
         }
     }

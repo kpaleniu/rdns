@@ -21,14 +21,14 @@ use rdns::{
     dnssec_answer,
     dnssec_key::{SigningAlgorithm, SigningKey},
     dnssec_validation_mode::DnssecValidator,
+    error::RequestError,
     ixfr::{ixfr_response, plan_change, DeltaLog, IxfrResponse, PlannedDelta},
     logging::{LogLevel, QueryLogger},
     metrics::{DnsMetrics, LatencyTimer},
     metrics_server, notify,
     readiness::Readiness,
     secondary::{
-        is_newer, state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile,
-        TransferState,
+        state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile, TransferState,
     },
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
     shutdown::{stop_signal, Busy, Lifecycle, Shutdown, Stop},
@@ -38,12 +38,13 @@ use rdns::{
         current_unix_timestamp, is_at_or_under, record_types, recv_error_is_transient,
         UDP_RECEIVE_BUFFER,
     },
-    validation::RequestValidator,
+    validation::{Request, RequestValidator},
     xfr,
     zone::{parse_zone_file_at, NameKind, Zone},
     zone_signer::{sign_zone, DenialChain, SigningPolicy},
     zone_writer::write_zone_file,
-    DnsMessage, Edns, OpCode, Qtype, QueryClass, ResourceRecord, ResponseCode, EDNS_VERSION,
+    DnsMessage, Edns, OpCode, Qtype, QueryClass, ResourceRecord, ResponseCode, Serial,
+    EDNS_VERSION,
 };
 
 /// UDP payload size rdnsd advertises to clients via EDNS0.
@@ -1469,25 +1470,30 @@ impl Server {
             return Vec::new();
         }
 
-        let Ok(msg) = DnsMessage::try_from_bytes(packet) else {
-            bad_request!(self.logger, ip, "failed to parse DNS message");
-            return Vec::new();
+        // `Request` is the door: it parses, and it refuses QR=1. Both halves of
+        // that used to be written out here and only half of them was written out
+        // on the UDP path (`rdns::validation::Request`, `TODO.md` #14b).
+        // `RequestValidator` deliberately accepts QR=1 — it runs on both
+        // directions of the wire — so the check belongs *here*, where we know
+        // this packet arrived at a listening socket.
+        let msg = match Request::from_bytes(packet) {
+            Ok(msg) => msg,
+            Err(RequestError::Wire(_)) => {
+                bad_request!(self.logger, ip, "failed to parse DNS message");
+                return Vec::new();
+            }
+            Err(RequestError::NotAQuestion) => {
+                // Silence, not a reply: answering turns a pair of servers, or one
+                // spoofed datagram, into a packet loop, and there is nothing to
+                // answer because the sender did not ask anything.
+                bad_request!(
+                    self.logger,
+                    ip,
+                    "a response was sent to a server port; dropped"
+                );
+                return Vec::new();
+            }
         };
-
-        // A response is not a question. `RequestValidator` deliberately accepts
-        // QR=1 — it is used on both directions of the wire and a response
-        // legitimately carries answers — so the check belongs here, where we know
-        // this packet arrived at a listening socket. Answering one turns a pair
-        // of servers, or one spoofed datagram, into a packet loop; and there is
-        // no reply to send, because the sender did not ask anything.
-        if msg.response {
-            bad_request!(
-                self.logger,
-                ip,
-                "a response was sent to a server port; dropped"
-            );
-            return Vec::new();
-        }
 
         let qtype = msg.queries.first().map(|q| q.qtype);
         self.logger.log_query(ip, qtype);
@@ -2078,33 +2084,33 @@ impl Server {
             ..
         } = self;
 
-        let Ok(msg) = DnsMessage::try_from_bytes(packet) else {
-            bad_request!(logger, peer.ip(), "failed to parse DNS message");
-            return;
-        };
-
-        // A response is not a question (`CLAUDE.md` §8). `RequestValidator`
-        // deliberately accepts QR=1 — it is used on both directions of the wire
-        // — so the check belongs here, where we know the packet arrived at a
-        // listening socket.
+        // The same door as the TCP path above, and now literally the same code.
         //
-        // **This was missing on UDP only**, which is the transport it matters
-        // on: `fn answer`, the TCP path, has had the same check since the rule
-        // was written, and this one was never given it. Two servers pointed at
-        // each other, or one spoofed datagram naming another server as its
-        // source, was a packet loop neither end could see — and unlike TCP,
-        // nothing about UDP makes the peer prove its address first. The rule
-        // says "on both daemons"; `rdnsr` has one `handle_query` for both of its
-        // transports and so could not drift, while `rdnsd` has two answering
-        // paths and did (`CLAUDE.md` §7 — the second copy is where the bug is).
-        if msg.response {
-            bad_request!(
-                logger,
-                peer.ip(),
-                "a response was sent to a server port; dropped"
-            );
-            return;
-        }
+        // **The QR check was missing here and only here**, which is the transport
+        // it matters on: `fn answer` has had it since the rule was written and
+        // this one was never given it, so two servers pointed at each other — or
+        // one spoofed datagram naming another server as its source — was a packet
+        // loop neither end could see, with nothing about UDP making the peer
+        // prove its address first. `CLAUDE.md` §8 says "on both daemons";
+        // `rdnsr` has one `handle_query` for both of its transports and so could
+        // not drift, while `rdnsd` has two answering paths and did (§7 — the
+        // second copy is where the bug is). The fix was written out here once and
+        // is now a type that cannot be left out (`TODO.md` #14b).
+        let msg = match Request::from_bytes(packet) {
+            Ok(msg) => msg,
+            Err(RequestError::Wire(_)) => {
+                bad_request!(logger, peer.ip(), "failed to parse DNS message");
+                return;
+            }
+            Err(RequestError::NotAQuestion) => {
+                bad_request!(
+                    logger,
+                    peer.ip(),
+                    "a response was sent to a server port; dropped"
+                );
+                return;
+            }
+        };
 
         // Log successful query parsing
         let qtype = msg.queries.first().map(|q| q.qtype);
@@ -2334,10 +2340,10 @@ async fn reload_once(
     source: &ZoneSource,
     served: &Served,
     notify_targets: &[SocketAddr],
-    announced: Vec<(String, u32)>,
+    announced: Vec<(String, Serial)>,
     busy: &Busy,
     trigger: ReloadTrigger,
-) -> Vec<(String, u32)> {
+) -> Vec<(String, Serial)> {
     let why = trigger.why();
     let (announced, outcome) = match reloading.load(source).await {
         Ok(new_zones) => {
@@ -2401,7 +2407,7 @@ fn spawn_zone_maintenance(
     served: Served,
     source: ZoneSource,
     notify_targets: Vec<SocketAddr>,
-    announced: Vec<(String, u32)>,
+    announced: Vec<(String, Serial)>,
     reloading: Reloading,
     lifecycle: Lifecycle,
 ) -> mpsc::Sender<ReloadTrigger> {
@@ -2567,10 +2573,10 @@ fn parse_notify_targets(specs: &[String]) -> Result<Vec<SocketAddr>> {
 /// ignore it, so sending would be noise.
 async fn announce_zones(
     zone_map: &Arc<RwLock<Zones>>,
-    announced: &[(String, u32)],
+    announced: &[(String, Serial)],
     targets: &[SocketAddr],
     busy: &Busy,
-) -> Vec<(String, u32)> {
+) -> Vec<(String, Serial)> {
     let (current, pending) = {
         let zones = zone_map.read().await;
         let all: Vec<&Zone> = zones.values().collect();
@@ -2579,7 +2585,7 @@ async fn announce_zones(
         // Build the messages under the lock, send them outside it: a NOTIFY that
         // goes unanswered takes seconds to retry, and holding the zone map that
         // long would block a reload behind the network.
-        let pending: Vec<(String, u32, Option<rdns::ResourceRecord>)> = changed
+        let pending: Vec<(String, Serial, Option<rdns::ResourceRecord>)> = changed
             .iter()
             .filter_map(|(name, serial)| {
                 zones
@@ -2625,7 +2631,7 @@ async fn announce_zones(
 /// not be held behind the network to tell somebody about work it has finished.
 fn announce_transfer(
     zone: &str,
-    serial: u32,
+    serial: Serial,
     soa: Option<ResourceRecord>,
     targets: &[SocketAddr],
     busy: &Busy,
@@ -2651,7 +2657,7 @@ fn announce_transfer(
 /// is the backstop this is an optimisation over.
 async fn send_notify(
     zone: &str,
-    serial: u32,
+    serial: Serial,
     soa: Option<rdns::ResourceRecord>,
     target: SocketAddr,
 ) {
@@ -3203,7 +3209,7 @@ async fn refresh_once(
     // there was anything new to fetch — the zone is confirmed current, which is
     // exactly what "not stale" means.
     if let Some(held) = held {
-        if !is_newer(remote, held) {
+        if !remote.is_newer_than(held) {
             record_state(state, spec, held, now, metrics).await?;
             return Ok(format!("serial {held} is current"));
         }
@@ -3301,7 +3307,7 @@ async fn refresh_once(
 async fn record_state(
     state: &Arc<Mutex<StateFile>>,
     spec: &MasterSpec,
-    serial: u32,
+    serial: Serial,
     now: u64,
     metrics: &DnsMetrics,
 ) -> Result<()> {
@@ -4074,7 +4080,7 @@ fn signed_rrsets(zone: &Zone) -> Vec<(String, Rtype)> {
     let mut seen: Vec<(String, Rtype)> = zone
         .records()
         .iter()
-        .filter(|r| r.rdata.rtype == record_types::RRSIG)
+        .filter(|r| r.rdata.rtype() == record_types::RRSIG)
         .filter_map(|r| {
             rdns::dnssec::Rrsig::from_record(&ResourceRecord {
                 name: r.name.clone(),
@@ -4692,9 +4698,13 @@ mod tests {
         /// daemons**. Two servers pointed at each other, or one spoofed
         /// datagram, is otherwise a packet loop neither end can see."
         ///
-        /// `fn answer` — the TCP path — makes that test. `answer_datagram` does
-        /// not, and UDP is the transport where a spoofed source and a packet
-        /// loop actually matter.
+        /// `fn answer` — the TCP path — made that test from the day the rule was
+        /// written, and this path never did; UDP is the transport where a spoofed
+        /// source and a packet loop actually matter. Both go through
+        /// `rdns::validation::Request` now, which is the only way to get a message
+        /// out of a packet here and refuses QR=1 itself (`TODO.md` #14b). This
+        /// test outlives that change on purpose: the type makes the omission
+        /// impossible, and this says what the behaviour is when it is not omitted.
         #[tokio::test]
         async fn a_response_to_the_udp_port_is_not_answered() {
             let server = server_with(one_record_zone());
@@ -4713,7 +4723,8 @@ mod tests {
 
             assert!(
                 scratch.is_empty(),
-                "a QR=1 datagram was answered; two such servers pointed at each                  other are a packet loop"
+                "a QR=1 datagram was answered; two such servers pointed at each \
+                 other are a packet loop"
             );
         }
 
@@ -4871,7 +4882,7 @@ mod tests {
                 let closed = msg
                     .answers
                     .last()
-                    .is_some_and(|rr| rr.rdata.rtype == record_types::SOA);
+                    .is_some_and(|rr| rr.rdata.rtype() == record_types::SOA);
                 if closed {
                     break;
                 }
@@ -5038,7 +5049,7 @@ mod tests {
             let zone = rdns::xfr::fetch_zone(master, "example.com.", Some(&scoped))
                 .await
                 .expect("a key naming this zone must transfer it");
-            assert_eq!(zone.serial(), Some(1));
+            assert_eq!(zone.serial(), Some(Serial::new(1)));
         }
 
         /// Case-insensitively, and with or without the trailing dot — a zone name
@@ -5053,7 +5064,7 @@ mod tests {
             let zone = rdns::xfr::fetch_zone(master, "example.com.", Some(&scoped))
                 .await
                 .expect("case and the trailing dot must not decide authorization");
-            assert_eq!(zone.serial(), Some(1));
+            assert_eq!(zone.serial(), Some(Serial::new(1)));
         }
 
         /// The preserved default, stated as a test so that changing it is a
@@ -5068,7 +5079,7 @@ mod tests {
             let zone = rdns::xfr::fetch_zone(master, "example.com.", Some(&unscoped))
                 .await
                 .expect("an unscoped key is unrestricted, as it always was");
-            assert_eq!(zone.serial(), Some(1));
+            assert_eq!(zone.serial(), Some(Serial::new(1)));
         }
     }
 
@@ -5210,7 +5221,7 @@ mod tests {
         // Served from memory...
         let zones = r.served.zone_map.read().await;
         let held = zones.get("example.com.").expect("the zone is now served");
-        assert_eq!(held.serial(), Some(7));
+        assert_eq!(held.serial(), Some(Serial::new(7)));
         assert_eq!(
             held.query("www.example.com.", Qtype::of(record_types::A))
                 .len(),
@@ -5221,7 +5232,7 @@ mod tests {
         // ...written to disk, in the form the ordinary load path reads...
         let path = zone_file_path(&dir.0, "example.com.");
         let reloaded = parse_zone_file_at(&path, "example.com.").expect("reload from disk");
-        assert_eq!(reloaded.serial(), Some(7));
+        assert_eq!(reloaded.serial(), Some(Serial::new(7)));
         assert_eq!(reloaded.records().len(), 4);
 
         // ...and remembered, so a restart knows when contact was last made.
@@ -5232,7 +5243,7 @@ mod tests {
             .get("example.com.", master)
             .cloned()
             .expect("state recorded");
-        assert_eq!(entry.serial, 7);
+        assert_eq!(entry.serial, Serial::new(7));
         assert!(entry.refreshed_at > 0);
 
         // ...*on disk*, and not only in the copy held in memory. The assertion
@@ -5245,7 +5256,7 @@ mod tests {
             .get("example.com.", master)
             .cloned()
             .expect("the sidecar on disk has the entry, not just the copy in memory");
-        assert_eq!(on_disk.serial, 7);
+        assert_eq!(on_disk.serial, Serial::new(7));
         assert_eq!(on_disk.refreshed_at, entry.refreshed_at);
     }
 
@@ -5279,7 +5290,7 @@ mod tests {
                 .get("example.com.")
                 .unwrap()
                 .serial(),
-            Some(7)
+            Some(Serial::new(7))
         );
     }
 
@@ -5330,7 +5341,7 @@ mod tests {
         assert!(outcome.contains("serial 7 -> 8"), "got: {outcome}");
         let zones = r.served.zone_map.read().await;
         let held = zones.get("example.com.").unwrap();
-        assert_eq!(held.serial(), Some(8));
+        assert_eq!(held.serial(), Some(Serial::new(8)));
         assert!(
             held.query("www.example.com.", Qtype::of(record_types::A))
                 .is_empty(),
@@ -5363,7 +5374,7 @@ mod tests {
         state_file
             .record(TransferState {
                 zone: "example.com.".to_string(),
-                serial: 7,
+                serial: Serial::new(7),
                 refreshed_at: current_unix_timestamp() - timers.expire - 1,
                 master,
             })
@@ -5414,7 +5425,7 @@ mod tests {
         state_file
             .record(TransferState {
                 zone: "example.com.".to_string(),
-                serial: 7,
+                serial: Serial::new(7),
                 refreshed_at: current_unix_timestamp() - 60,
                 master,
             })
@@ -5478,7 +5489,7 @@ mod tests {
 
         let zones = r.served.zone_map.read().await;
         let held = zones.get("example.com.").expect("still served");
-        assert_eq!(held.serial(), Some(8));
+        assert_eq!(held.serial(), Some(Serial::new(8)));
         assert_eq!(
             held.query("extra.example.com.", Qtype::of(record_types::TXT))
                 .len(),
@@ -5511,7 +5522,7 @@ mod tests {
                     )
                 })
                 .collect();
-            rows.sort_by_key(|r| (r.0.clone(), r.2.rtype));
+            rows.sort_by_key(|r| (r.0.clone(), r.2.rtype()));
             rows
         };
         assert_eq!(
@@ -5565,7 +5576,7 @@ mod tests {
         );
         assert_eq!(
             notify::notified_serial(&msg),
-            Some(11),
+            Some(Serial::new(11)),
             "carrying the serial we just transferred, so the downstream \
              secondary need not ask"
         );
@@ -5648,9 +5659,11 @@ mod tests {
 
         let log = r.served.deltas.read().await;
         assert_eq!(log.len("example.com."), 1, "the change was recorded");
-        let chain = log.chain_from("example.com.", 7).expect("a chain from 7");
+        let chain = log
+            .chain_from("example.com.", Serial::new(7))
+            .expect("a chain from 7");
         assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].to_serial, 8);
+        assert_eq!(chain[0].to_serial, Serial::new(8));
         // www's address changed: one deletion, one addition.
         assert_eq!(chain[0].deleted.len(), 1);
         assert_eq!(chain[0].added.len(), 1);
@@ -6052,7 +6065,7 @@ mod tests {
             state
                 .record(TransferState {
                     zone: "example.com.".to_string(),
-                    serial: 7,
+                    serial: Serial::new(7),
                     refreshed_at,
                     master: master.parse().unwrap(),
                 })
@@ -6397,7 +6410,10 @@ ns.sub   IN A   192.0.2.20
         }
 
         fn rdatas(records: &[ResourceRecord], rtype: Rtype) -> Vec<&ResourceRecord> {
-            records.iter().filter(|r| r.rdata.rtype == rtype).collect()
+            records
+                .iter()
+                .filter(|r| r.rdata.rtype() == rtype)
+                .collect()
         }
 
         /// The wire shape that used to go out for every CNAME in every zone this
@@ -6439,7 +6455,7 @@ ns.sub   IN A   192.0.2.20
         fn a_cname_query_is_not_chased() {
             let response = ask("www.example.com.", Qtype::of(record_types::CNAME));
             assert_eq!(response.answers.len(), 1);
-            assert_eq!(response.answers[0].rdata.rtype, record_types::CNAME);
+            assert_eq!(response.answers[0].rdata.rtype(), record_types::CNAME);
         }
 
         /// A broken zone must not hang the server. Two aliases pointing at each
@@ -6700,7 +6716,7 @@ ns.sub   IN A   192.0.2.20
             let response = ask("host.example.com.", Qtype::of(record_types::ANY));
             assert_eq!(response.rcode, ResponseCode::Ok);
             assert_eq!(response.answers.len(), 1);
-            assert_eq!(response.answers[0].rdata.rtype, record_types::A);
+            assert_eq!(response.answers[0].rdata.rtype(), record_types::A);
         }
 
         /// A CNAME is the only type at its owner (RFC 1034 §3.6.2), so ANY
@@ -6711,7 +6727,7 @@ ns.sub   IN A   192.0.2.20
             let response = ask("www.example.com.", Qtype::of(record_types::ANY));
             assert_eq!(response.rcode, ResponseCode::Ok);
             assert_eq!(response.answers.len(), 1);
-            assert_eq!(response.answers[0].rdata.rtype, record_types::CNAME);
+            assert_eq!(response.answers[0].rdata.rtype(), record_types::CNAME);
             assert_eq!(response.answers[0].name, "www.example.com.");
         }
 
@@ -6884,7 +6900,7 @@ ns.plain  IN A   192.0.2.30
                 let rdatas: Vec<RecordData> = response
                     .answers
                     .iter()
-                    .filter(|r| r.rdata.rtype == record_types::A)
+                    .filter(|r| r.rdata.rtype() == record_types::A)
                     .map(|r| r.rdata.clone())
                     .collect();
                 assert_eq!(rdatas.len(), 1, "nsec3={nsec3}: no wildcard answer");
@@ -6951,15 +6967,15 @@ ns.plain  IN A   192.0.2.30
                 // would also make an empty non-terminal look like data.
                 for rtype in [record_types::SOA, record_types::NS, record_types::DNSKEY] {
                     assert!(
-                        response.answers.iter().any(|r| r.rdata.rtype == rtype),
+                        response.answers.iter().any(|r| r.rdata.rtype() == rtype),
                         "nsec3={nsec3}: type {rtype} missing from the ANY answer"
                     );
                 }
                 assert!(
-                    !response
-                        .answers
-                        .iter()
-                        .any(|r| matches!(r.rdata.rtype, record_types::NSEC | record_types::NSEC3)),
+                    !response.answers.iter().any(|r| matches!(
+                        r.rdata.rtype(),
+                        record_types::NSEC | record_types::NSEC3
+                    )),
                     "nsec3={nsec3}: a denial record is not answer-section data"
                 );
 
@@ -6971,7 +6987,7 @@ ns.plain  IN A   192.0.2.30
                     let rdatas: Vec<RecordData> = response
                         .answers
                         .iter()
-                        .filter(|r| r.rdata.rtype == rtype)
+                        .filter(|r| r.rdata.rtype() == rtype)
                         .map(|r| r.rdata.clone())
                         .collect();
                     let proof = verify_rrset(
@@ -7005,7 +7021,7 @@ ns.plain  IN A   192.0.2.30
                 assert_eq!(response.rcode, ResponseCode::Ok, "nsec3={nsec3}");
                 assert!(
                     !response.answers.iter().any(|r| matches!(
-                        r.rdata.rtype,
+                        r.rdata.rtype(),
                         record_types::RRSIG | record_types::NSEC | record_types::NSEC3
                     )),
                     "nsec3={nsec3}: DNSSEC records went out to a client that did not set DO"
@@ -7014,7 +7030,7 @@ ns.plain  IN A   192.0.2.30
                     response
                         .answers
                         .iter()
-                        .any(|r| r.rdata.rtype == record_types::SOA),
+                        .any(|r| r.rdata.rtype() == record_types::SOA),
                     "nsec3={nsec3}: but the zone's own data is still there"
                 );
             }
@@ -7036,7 +7052,7 @@ ns.plain  IN A   192.0.2.30
                 let ds: Vec<RecordData> = response
                     .authorities
                     .iter()
-                    .filter(|r| r.rdata.rtype == record_types::DS)
+                    .filter(|r| r.rdata.rtype() == record_types::DS)
                     .map(|r| r.rdata.clone())
                     .collect();
                 assert_eq!(
@@ -7084,7 +7100,7 @@ ns.plain  IN A   192.0.2.30
                     !response
                         .authorities
                         .iter()
-                        .any(|r| r.rdata.rtype == record_types::DS),
+                        .any(|r| r.rdata.rtype() == record_types::DS),
                     "nsec3={nsec3}: this child is not signed"
                 );
                 let denial = proves_no_ds(
@@ -7113,7 +7129,7 @@ ns.plain  IN A   192.0.2.30
             let rdatas: Vec<RecordData> = response
                 .answers
                 .iter()
-                .filter(|r| r.rdata.rtype == record_types::A)
+                .filter(|r| r.rdata.rtype() == record_types::A)
                 .map(|r| r.rdata.clone())
                 .collect();
             let proof = verify_rrset(
@@ -7178,7 +7194,7 @@ ns.plain  IN A   192.0.2.30
             assert!(denial
                 .authorities
                 .iter()
-                .any(|r| r.rdata.rtype == record_types::SOA));
+                .any(|r| r.rdata.rtype() == record_types::SOA));
         }
 
         #[test]
@@ -7279,7 +7295,7 @@ ns.plain  IN A   192.0.2.30
             let mut edited = Zone::new(zone.origin().to_string());
             for record in zone.records() {
                 let mut record = record.clone();
-                if record.name == "www.example.com." && record.rdata.rtype == record_types::A {
+                if record.name == "www.example.com." && record.rdata.rtype() == record_types::A {
                     record.rdata = RecordData::from_parsed(&rdns::ParsedRecord::A(
                         "198.51.100.9".parse().unwrap(),
                     ))

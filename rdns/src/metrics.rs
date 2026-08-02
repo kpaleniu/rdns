@@ -13,6 +13,7 @@
 use crate::utils::record_types as rt;
 use crate::utils::NameKeyBuf;
 use crate::Qtype;
+use crate::Serial;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -61,7 +62,7 @@ fn escape_label(value: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneFacts {
     pub zone: String,
-    pub serial: u32,
+    pub serial: Serial,
     /// `None` for a zone we are primary for, and for a secondary that has never
     /// reached its master. Those are different from each other and from zero,
     /// which is 1970 and would fire every staleness alert there is.
@@ -74,7 +75,7 @@ struct ZoneGauge {
     /// The SOA serial being served, which is the one number that says *which
     /// version* of a zone a server has — the thing you compare across a primary
     /// and its secondaries to find the one that is behind.
-    serial: u32,
+    serial: Serial,
     /// Unix seconds of the last successful *contact with a master*, for a zone
     /// we replicate — which is what EXPIRE counts from, and so what decides
     /// whether the zone is still ours to answer for. A refresh that found
@@ -226,7 +227,7 @@ impl DnsMetrics {
     ///
     /// Call it wherever a zone is installed — that is the only moment the
     /// answer changes, and it is the moment we already hold the version.
-    pub fn set_zone_serial(&self, zone: &str, serial: u32) {
+    pub fn set_zone_serial(&self, zone: &str, serial: Serial) {
         let Ok(mut zones) = self.zones.write() else {
             // A poisoned lock costs a stale gauge. Refusing to serve DNS over it
             // would be absurd (`CLAUDE.md` §6).
@@ -616,8 +617,8 @@ mod zone_gauge_tests {
     #[test]
     fn a_zone_reports_its_serial_and_a_replica_its_last_contact() {
         let metrics = DnsMetrics::new();
-        metrics.set_zone_serial("example.com.", 42);
-        metrics.set_zone_serial("replica.test.", 7);
+        metrics.set_zone_serial("example.com.", Serial::new(42));
+        metrics.set_zone_serial("replica.test.", Serial::new(7));
         metrics.note_zone_transfer("replica.test.", 1_700_000_000);
 
         assert_eq!(
@@ -641,7 +642,7 @@ mod zone_gauge_tests {
     #[test]
     fn a_withdrawn_zone_disappears_rather_than_freezing() {
         let metrics = DnsMetrics::new();
-        metrics.set_zone_serial("gone.test.", 1);
+        metrics.set_zone_serial("gone.test.", Serial::new(1));
         metrics.note_zone_transfer("gone.test.", 1_700_000_000);
         assert_eq!(lines(&metrics, "dns_zone_serial{").len(), 1);
 
@@ -655,9 +656,9 @@ mod zone_gauge_tests {
     #[test]
     fn a_reload_keeps_only_the_zones_it_installed() {
         let metrics = DnsMetrics::new();
-        metrics.set_zone_serial("kept.test.", 5);
+        metrics.set_zone_serial("kept.test.", Serial::new(5));
         metrics.note_zone_transfer("kept.test.", 1_700_000_000);
-        metrics.set_zone_serial("dropped.test.", 9);
+        metrics.set_zone_serial("dropped.test.", Serial::new(9));
 
         metrics.retain_zones(&["KEPT.test.".to_string()]);
 
@@ -679,7 +680,7 @@ mod zone_gauge_tests {
     #[test]
     fn a_label_value_that_could_break_the_format_is_escaped() {
         let metrics = DnsMetrics::new();
-        metrics.set_zone_serial("od\"d\\.test.", 1);
+        metrics.set_zone_serial("od\"d\\.test.", Serial::new(1));
         let rendered = lines(&metrics, "dns_zone_serial{");
         assert_eq!(rendered, ["dns_zone_serial{zone=\"od\\\"d\\\\.test.\"} 1"]);
         assert_eq!(escape_label("plain.test."), "plain.test.");

@@ -22,6 +22,7 @@
 
 use crate::utils::{absolute_lowered, is_at_or_under, record_types as rt};
 use crate::Class;
+use crate::Serial;
 use crate::Ttl;
 use crate::{ParsedRecord, RecordData, ResourceRecord, ResponseCode};
 use crate::{Qtype, Rtype};
@@ -235,7 +236,7 @@ fn synthetic_soa(zone: &str) -> Option<ResourceRecord> {
     let rdata = RecordData::from_parsed(&ParsedRecord::SOA {
         mname: zone.to_string(),
         rname: "nobody.invalid.".to_string(),
-        serial: 1,
+        serial: Serial::new(1),
         refresh: 3600,
         retry: 1200,
         expire: 604_800,
@@ -439,7 +440,7 @@ mod tests {
             soa.name, "local.",
             "owned by the zone, not the queried name"
         );
-        assert_eq!(soa.rdata.rtype, rt::SOA);
+        assert_eq!(soa.rdata.rtype(), rt::SOA);
         let ParsedRecord::SOA { rname, minimum, .. } = parsed(soa) else {
             panic!("not an SOA");
         };

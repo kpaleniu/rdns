@@ -33,7 +33,8 @@ use crate::tsig::{self, TsigError, TsigKey};
 use crate::utils::{is_at_or_under, record_types as rt};
 use crate::zone::{Zone, ZoneRecord};
 use crate::{
-    DnsMessage, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, ResourceRecord, ResponseCode,
+    DnsMessage, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, ResourceRecord,
+    ResponseCode, Serial,
 };
 
 /// How long a transfer may take from connect to closing SOA.
@@ -89,11 +90,11 @@ fn question(zone: &str, qtype: Qtype, id: u16) -> DnsMessage {
 }
 
 /// The serial in a response's SOA answer, if it has one.
-pub fn soa_serial(msg: &DnsMessage) -> Option<u32> {
+pub fn soa_serial(msg: &DnsMessage) -> Option<Serial> {
     msg.answers
         .iter()
         .chain(msg.authorities.iter())
-        .filter(|rr| rr.rdata.rtype == rt::SOA)
+        .filter(|rr| rr.rdata.rtype() == rt::SOA)
         .find_map(|rr| match rr.rdata.parse() {
             Ok(ParsedRecord::SOA { serial, .. }) => Some(serial),
             _ => None,
@@ -117,7 +118,7 @@ pub struct AxfrAssembler {
     zone: String,
     records: Vec<ResourceRecord>,
     /// The apex SOA that opened the transfer, and the serial it carried.
-    opening_soa: Option<(ResourceRecord, u32)>,
+    opening_soa: Option<(ResourceRecord, Serial)>,
     complete: bool,
 }
 
@@ -132,7 +133,7 @@ impl AxfrAssembler {
     }
 
     /// The serial the transfer opened with, once the first record has arrived.
-    pub fn serial(&self) -> Option<u32> {
+    pub fn serial(&self) -> Option<Serial> {
         self.opening_soa.as_ref().map(|(_, serial)| *serial)
     }
 
@@ -169,7 +170,7 @@ impl AxfrAssembler {
     fn accept_record(&mut self, rr: &ResourceRecord) -> TransferResult<Progress> {
         let name = belongs_here(rr, &self.zone)?;
 
-        let is_apex_soa = rr.rdata.rtype == rt::SOA && name.eq_ignore_ascii_case(&self.zone);
+        let is_apex_soa = rr.rdata.rtype() == rt::SOA && name.eq_ignore_ascii_case(&self.zone);
 
         match &self.opening_soa {
             // RFC 5936 §2.2: the first record is the zone's SOA. Anything else
@@ -178,7 +179,8 @@ impl AxfrAssembler {
                 if !is_apex_soa {
                     return Err(TransferError::malformed(format!(
                         "transfer does not open with the SOA of {}, but with {name} type {}",
-                        self.zone, rr.rdata.rtype
+                        self.zone,
+                        rr.rdata.rtype()
                     )));
                 }
                 let Ok(ParsedRecord::SOA { serial, .. }) = rr.rdata.parse() else {
@@ -243,7 +245,7 @@ pub fn ixfr_request(zone: &str, current_soa: ResourceRecord, id: u16) -> DnsMess
 /// What an incremental transfer turned out to be.
 pub enum IxfrOutcome {
     /// The server answered with a single SOA: we are already current.
-    UpToDate(u32),
+    UpToDate(Serial),
     /// Difference sequences, applied in order.
     Updated {
         zone: Zone,
@@ -296,7 +298,7 @@ enum IxfrState {
 /// header of a delete section and start deleting things.
 pub struct IxfrAssembler {
     zone: String,
-    current_serial: Option<u32>,
+    current_serial: Option<Serial>,
     state: IxfrState,
     records_seen: usize,
     sequences: Vec<Sequence>,
@@ -365,7 +367,7 @@ impl IxfrAssembler {
         let name = belongs_here(rr, &self.zone)?;
         self.records_seen += 1;
 
-        let soa_serial = if rr.rdata.rtype == rt::SOA && name.eq_ignore_ascii_case(&self.zone) {
+        let soa_serial = if rr.rdata.rtype() == rt::SOA && name.eq_ignore_ascii_case(&self.zone) {
             match rr.rdata.parse() {
                 Ok(ParsedRecord::SOA { serial, .. }) => Some(serial),
                 _ => {
@@ -548,7 +550,7 @@ pub async fn fetch_soa(
     master: std::net::SocketAddr,
     zone: &str,
     key: Option<&TsigKey>,
-) -> TransferResult<u32> {
+) -> TransferResult<Serial> {
     let deadline = tokio::time::timeout(SOA_TIMEOUT, async {
         let mut stream = connect(master).await?;
         let id = rand_id();
@@ -813,11 +815,11 @@ mod tests {
             progress = assembler.accept(&msg).expect("accept");
         }
         assert_eq!(progress, Progress::Complete, "the closing SOA arrived");
-        assert_eq!(assembler.serial(), Some(42));
+        assert_eq!(assembler.serial(), Some(Serial::new(42)));
 
         let received = assembler.into_zone().expect("assemble");
         assert_eq!(received.origin(), source.origin());
-        assert_eq!(received.serial(), Some(42));
+        assert_eq!(received.serial(), Some(Serial::new(42)));
         assert_eq!(received.records().len(), source.records().len());
         assert_eq!(
             received.query("www.example.com.", Qtype::of(rt::A)).len(),
@@ -989,12 +991,12 @@ mod tests {
         let mut reply = soa_query("example.com.", 1);
         reply.response = true;
         reply.answers = vec![crate::notify::soa_record(&zone).unwrap()];
-        assert_eq!(soa_serial(&reply), Some(42));
+        assert_eq!(soa_serial(&reply), Some(Serial::new(42)));
 
         let mut in_authority = soa_query("example.com.", 1);
         in_authority.response = true;
         in_authority.authorities = vec![crate::notify::soa_record(&zone).unwrap()];
-        assert_eq!(soa_serial(&in_authority), Some(42));
+        assert_eq!(soa_serial(&in_authority), Some(Serial::new(42)));
 
         assert_eq!(soa_serial(&soa_query("example.com.", 1)), None);
     }
@@ -1072,7 +1074,7 @@ mod tests {
         };
         assert_eq!(steps, 1);
         assert_eq!(missing_deletions, 0);
-        assert_eq!(zone.serial(), Some(2), "the SOA moved with it");
+        assert_eq!(zone.serial(), Some(Serial::new(2)), "the SOA moved with it");
 
         // What changed, changed; what did not, did not.
         assert_eq!(
@@ -1105,8 +1107,8 @@ mod tests {
             .iter()
             .map(|r| (r.name.to_lowercase(), r.rdata.clone()))
             .collect();
-        got.sort_by_key(|r| (r.0.clone(), r.1.rtype));
-        want.sort_by_key(|r| (r.0.clone(), r.1.rtype));
+        got.sort_by_key(|r| (r.0.clone(), r.1.rtype()));
+        want.sort_by_key(|r| (r.0.clone(), r.1.rtype()));
         assert_eq!(
             got, want,
             "the increment reproduced the master's zone exactly"
@@ -1152,7 +1154,7 @@ mod tests {
             panic!("expected an incremental update");
         };
         assert_eq!(steps, 2);
-        assert_eq!(zone.serial(), Some(3));
+        assert_eq!(zone.serial(), Some(Serial::new(3)));
         assert_eq!(
             zone.query("www.example.com.", Qtype::of(rt::A))[0].rdata,
             v3.query("www.example.com.", Qtype::of(rt::A))[0].rdata,
@@ -1181,7 +1183,7 @@ mod tests {
         let IxfrOutcome::FullTransfer(zone) = outcome else {
             panic!("expected a full transfer");
         };
-        assert_eq!(zone.serial(), Some(2));
+        assert_eq!(zone.serial(), Some(Serial::new(2)));
         assert_eq!(zone.records().len(), v2.records().len());
         assert!(zone.query("gone.example.com.", Qtype::of(rt::A)).is_empty());
     }
@@ -1193,7 +1195,7 @@ mod tests {
             .into_outcome(&v2)
             .expect("outcome");
         assert!(
-            matches!(outcome, IxfrOutcome::UpToDate(2)),
+            matches!(outcome, IxfrOutcome::UpToDate(s) if s == Serial::new(2)),
             "expected up to date"
         );
     }
@@ -1228,7 +1230,11 @@ mod tests {
             panic!("expected an incremental update");
         };
         assert_eq!(missing_deletions, 1, "`gone` was already absent");
-        assert_eq!(zone.serial(), Some(2), "and the update still applied");
+        assert_eq!(
+            zone.serial(),
+            Some(Serial::new(2)),
+            "and the update still applied"
+        );
         assert_eq!(
             zone.query("fresh.example.com.", Qtype::of(rt::TXT)).len(),
             1
@@ -1407,7 +1413,7 @@ mod tests {
         let received = fetch_zone(master, "example.com.", None)
             .await
             .expect("transfer");
-        assert_eq!(received.serial(), Some(42));
+        assert_eq!(received.serial(), Some(Serial::new(42)));
         assert_eq!(received.records().len(), source.records().len());
         assert_eq!(
             received.query("www.example.com.", Qtype::of(rt::A)).len(),
@@ -1420,7 +1426,7 @@ mod tests {
         let master = spawn_master(source_zone(), None).await;
         assert_eq!(
             fetch_soa(master, "example.com.", None).await.unwrap(),
-            42,
+            Serial::new(42),
             "the master's apex SOA carries serial 42"
         );
     }
@@ -1440,7 +1446,7 @@ mod tests {
         let received = fetch_zone(master, "example.com.", Some(&key))
             .await
             .expect("signed transfer");
-        assert_eq!(received.serial(), Some(42));
+        assert_eq!(received.serial(), Some(Serial::new(42)));
     }
 
     /// The signature has to be *checked*, not merely present: a client holding

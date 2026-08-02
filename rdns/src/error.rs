@@ -75,6 +75,29 @@ impl From<std::str::Utf8Error> for WireError {
     }
 }
 
+/// A packet that arrived at a listening socket and is not a question.
+///
+/// Two variants because a server does two different things about them, and both
+/// are *drop it and log which* — but which one is the operational signal.
+/// `Wire` is somebody's garbage, or somebody probing the parser. `NotAQuestion`
+/// is a reply arriving where a question should be, which means either two
+/// servers pointed at each other or a spoofed source address naming one, and an
+/// operator chasing a traffic loop needs to be able to tell those apart in a
+/// log.
+///
+/// The QR check is *not* a `WireError`: the packet decoded perfectly, and none
+/// of that type's four variants is the answer, because none of FORMERR, NOTIMP
+/// or a length limit is what a server does here (it says nothing at all — see
+/// [`crate::validation::Request`]).
+#[derive(Debug, thiserror::Error)]
+pub enum RequestError {
+    #[error(transparent)]
+    Wire(#[from] WireError),
+    /// QR=1: this is somebody's answer, and nobody asked us anything.
+    #[error("a response arrived at a listening socket")]
+    NotAQuestion,
+}
+
 /// A zone that will not load, or will not be written back out.
 #[derive(Debug, thiserror::Error)]
 pub enum ZoneError {
@@ -274,6 +297,7 @@ impl From<std::array::TryFromSliceError> for WireError {
 /// `Result<Zone>` rather than `Result<Zone, DnssecError>` — the same shape
 /// `anyhow::Result` gave, without the erasure.
 pub type WireResult<T> = std::result::Result<T, WireError>;
+pub type RequestResult<T> = std::result::Result<T, RequestError>;
 pub type ZoneResult<T> = std::result::Result<T, ZoneError>;
 pub type DnssecResult<T> = std::result::Result<T, DnssecError>;
 pub type TransferResult<T> = std::result::Result<T, TransferError>;

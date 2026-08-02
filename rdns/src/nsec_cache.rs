@@ -210,7 +210,7 @@ impl NsecCache {
         let Some(soa_rr) = response
             .authorities
             .iter()
-            .find(|rr| rr.rdata.rtype == rt::SOA)
+            .find(|rr| rr.rdata.rtype() == rt::SOA)
         else {
             return;
         };
@@ -238,7 +238,7 @@ impl NsecCache {
         entry.soa = Some(soa);
 
         for rr in &response.authorities {
-            match rr.rdata.rtype {
+            match rr.rdata.rtype() {
                 rt::NSEC => {
                     let Some(nsec) = Nsec::from_record(rr) else {
                         continue;
@@ -365,7 +365,7 @@ impl NsecCache {
                 &response
                     .answers
                     .iter()
-                    .find(|rr| rr.rdata.rtype == rtype)
+                    .find(|rr| rr.rdata.rtype() == rtype)
                     .map(|rr| rr.name.clone())
                     .unwrap_or_default(),
             );
@@ -374,7 +374,7 @@ impl NsecCache {
                 response
                     .answers
                     .iter()
-                    .filter(|rr| rr.rdata.rtype == rt::RRSIG)
+                    .filter(|rr| rr.rdata.rtype() == rt::RRSIG)
                     .filter(|rr| {
                         Rrsig::from_record(rr).is_some_and(|s| {
                             s.type_covered == rtype && canonical_name(&s.owner) == owner
@@ -408,7 +408,7 @@ impl NsecCache {
             // wildcard answer, and it is what a later synthesis needs to show the
             // *next* name absent too.
             for rr in &response.authorities {
-                if rr.rdata.rtype != rt::NSEC {
+                if rr.rdata.rtype() != rt::NSEC {
                     continue;
                 }
                 let Some(nsec) = Nsec::from_record(rr) else {
@@ -828,7 +828,7 @@ fn records_covering(records: &[ResourceRecord], owner: &str, rtype: Rtype) -> Ve
         .iter()
         .filter(|rr| canonical_name(&rr.name) == owner)
         .filter(|rr| {
-            rr.rdata.rtype == rtype
+            rr.rdata.rtype() == rtype
                 || matches!(
                     rr.rdata.parse(),
                     Ok(ParsedRecord::RRSIG { type_covered, .. }) if type_covered == rtype
@@ -918,6 +918,7 @@ mod tests {
     use super::*;
     use crate::dnssec_denial::{base32hex_encode, build_type_bitmap, nsec3_hash};
     use crate::Class;
+    use crate::Serial;
     use crate::{OpCode, QueryClass, QuerySection, RecordData};
 
     fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
@@ -928,7 +929,7 @@ mod tests {
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: format!("ns1.{zone}"),
                 rname: format!("admin.{zone}"),
-                serial: 1,
+                serial: Serial::new(1),
                 refresh: 10800,
                 retry: 3600,
                 expire: 604800,
@@ -1038,10 +1039,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} is inside the cached gap"));
             assert_eq!(s.rcode, ResponseCode::NoSuchDomain);
             assert!(
-                s.authority.iter().any(|rr| rr.rdata.rtype == rt::SOA),
+                s.authority.iter().any(|rr| rr.rdata.rtype() == rt::SOA),
                 "a negative answer must carry the SOA (RFC 2308 2.1)"
             );
-            assert!(s.authority.iter().any(|rr| rr.rdata.rtype == rt::NSEC));
+            assert!(s.authority.iter().any(|rr| rr.rdata.rtype() == rt::NSEC));
             assert!(s.ttl > 0 && s.ttl <= 3600);
         }
     }
@@ -1164,7 +1165,7 @@ mod tests {
             .synthesize("www.example.com.", Qtype::of(rt::AAAA))
             .expect("NODATA");
         assert_eq!(s.rcode, ResponseCode::Ok);
-        assert!(s.authority.iter().all(|rr| rr.rdata.rtype != rt::A));
+        assert!(s.authority.iter().all(|rr| rr.rdata.rtype() != rt::A));
         // A is in the bitmap, so that one has to go upstream.
         assert!(cache
             .synthesize("www.example.com.", Qtype::of(rt::A))
@@ -1553,7 +1554,7 @@ mod tests {
         assert_eq!(
             s.answers
                 .iter()
-                .filter(|rr| rr.rdata.rtype == rt::A)
+                .filter(|rr| rr.rdata.rtype() == rt::A)
                 .count(),
             1
         );
@@ -1565,11 +1566,11 @@ mod tests {
             assert!(rr.ttl.as_secs() <= 300);
         }
         assert!(
-            s.answers.iter().any(|rr| rr.rdata.rtype == rt::RRSIG),
+            s.answers.iter().any(|rr| rr.rdata.rtype() == rt::RRSIG),
             "the signature goes with it: it verifies at the new name unchanged"
         );
         assert!(
-            s.authority.iter().any(|rr| rr.rdata.rtype == rt::NSEC),
+            s.authority.iter().any(|rr| rr.rdata.rtype() == rt::NSEC),
             "with the proof the name does not exist, so a client can check it"
         );
         assert!(

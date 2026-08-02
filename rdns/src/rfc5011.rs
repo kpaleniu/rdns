@@ -617,12 +617,12 @@ pub fn self_signers(zone: &str, records: &[ResourceRecord], now: u64) -> Vec<Dns
 
     let rdatas: Vec<RecordData> = records
         .iter()
-        .filter(|rr| rr.rdata.rtype == rt::DNSKEY)
+        .filter(|rr| rr.rdata.rtype() == rt::DNSKEY)
         .map(|rr| rr.rdata.clone())
         .collect();
     let class = records
         .iter()
-        .find(|rr| rr.rdata.rtype == rt::DNSKEY)
+        .find(|rr| rr.rdata.rtype() == rt::DNSKEY)
         .map(|rr| rr.class)
         .unwrap_or(Class::new(1));
     let rrset = Rrset::new(zone, rt::DNSKEY, class, &rdatas);
@@ -1579,7 +1579,7 @@ mod tests {
         // Nothing signed at all is nobody, not everybody.
         let unsigned: Vec<ResourceRecord> = records
             .iter()
-            .filter(|rr| rr.rdata.rtype != rt::RRSIG)
+            .filter(|rr| rr.rdata.rtype() != rt::RRSIG)
             .cloned()
             .collect();
         assert!(self_signers(".", &unsigned, t0).is_empty());

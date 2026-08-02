@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use crate::utils::record_types as rt;
 use crate::zone::Zone;
-use crate::ParsedRecord;
+use crate::{ParsedRecord, Serial};
 
 /// The floor under REFRESH and RETRY.
 ///
@@ -117,16 +117,6 @@ impl RefreshTimers {
     }
 }
 
-/// Whether `new` is later than `old` in RFC 1982 serial arithmetic.
-///
-/// The comparison a secondary is built on: a serial that wraps past 2^32 is
-/// still an increment, and a plain `>` would read it as a rollback and leave the
-/// zone frozen for the rest of its life.
-pub fn is_newer(new: u32, old: u32) -> bool {
-    let forward = new.wrapping_sub(old);
-    forward != 0 && forward < 0x8000_0000
-}
-
 /// One zone to replicate, and where from: `zone@master[:port][#keyname]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterSpec {
@@ -204,7 +194,7 @@ fn absolute(name: &str) -> String {
 pub struct TransferState {
     pub zone: String,
     /// The serial of the copy on disk.
-    pub serial: u32,
+    pub serial: Serial,
     /// When the master last answered, as a Unix timestamp. The EXPIRE clock runs
     /// from here.
     pub refreshed_at: u64,
@@ -516,17 +506,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_serial_comparison_wraps() {
-        assert!(is_newer(2, 1));
-        assert!(!is_newer(1, 2));
-        assert!(!is_newer(5, 5), "the same serial is not newer");
-        assert!(
-            is_newer(3, u32::MAX - 1),
-            "RFC 1982: wrapping is an increment"
-        );
-        assert!(!is_newer(u32::MAX - 1, 3));
-    }
+    // The serial comparison this module used to own is now `Serial::is_newer_than`
+    // in `lib.rs`, with its tests beside it — there were two implementations of
+    // RFC 1982 §3.2 in this crate and the type is the one copy (`TODO.md` #14a).
 
     // -----------------------------------------------------------------
     // The sidecar
@@ -562,7 +544,7 @@ mod tests {
         state
             .record(TransferState {
                 zone: "example.com.".to_string(),
-                serial: 42,
+                serial: Serial::new(42),
                 refreshed_at: 1_700_000_000,
                 master: addr("192.0.2.1:53"),
             })
@@ -573,7 +555,7 @@ mod tests {
         let entry = reloaded
             .get("example.com.", addr("192.0.2.1:53"))
             .expect("the entry is there");
-        assert_eq!(entry.serial, 42);
+        assert_eq!(entry.serial, Serial::new(42));
         assert_eq!(entry.refreshed_at, 1_700_000_000);
 
         // Keyed by both: the same zone from another master is another entry.
@@ -592,7 +574,7 @@ mod tests {
             state
                 .record(TransferState {
                     zone: "example.com.".to_string(),
-                    serial,
+                    serial: Serial::new(serial),
                     refreshed_at: 1_700_000_000 + serial as u64,
                     master,
                 })
@@ -601,7 +583,10 @@ mod tests {
 
         let reloaded = StateFile::load(&path);
         assert_eq!(reloaded.entries().len(), 1, "one line, not three");
-        assert_eq!(reloaded.get("example.com.", master).unwrap().serial, 3);
+        assert_eq!(
+            reloaded.get("example.com.", master).unwrap().serial,
+            Serial::new(3)
+        );
     }
 
     /// An expired zone's entry is *kept*, because it is the record of when
@@ -619,7 +604,7 @@ mod tests {
         state
             .record(TransferState {
                 zone: "example.com.".to_string(),
-                serial: 1,
+                serial: Serial::new(1),
                 refreshed_at: 1_000_000,
                 master,
             })
@@ -658,14 +643,14 @@ mod tests {
                 .get("example.com.", addr("192.0.2.1:53"))
                 .unwrap()
                 .serial,
-            42
+            Serial::new(42)
         );
         assert_eq!(
             state
                 .get("good.test.", addr("192.0.2.2:53"))
                 .unwrap()
                 .serial,
-            7
+            Serial::new(7)
         );
 
         // And a file that is not there at all is the same thing: fetch.

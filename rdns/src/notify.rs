@@ -20,7 +20,8 @@
 use crate::utils::record_types as rt;
 use crate::zone::Zone;
 use crate::{
-    DnsMessage, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, ResourceRecord, ResponseCode,
+    DnsMessage, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, ResourceRecord,
+    ResponseCode, Serial,
 };
 
 /// How many times a NOTIFY is sent before giving up on a secondary.
@@ -109,22 +110,22 @@ pub fn acknowledges(reply: &DnsMessage, id: u16) -> bool {
 /// Which zones changed between two loads, as (zone, new serial).
 ///
 /// A zone whose serial is unchanged is not news, and a zone that has gone
-/// backwards is not either — a secondary compares serials with RFC 1982 serial
-/// arithmetic and would ignore it, so sending is just noise. A zone that is new
-/// since the last load *is* news: nobody has heard about it yet.
-pub fn changed_zones(before: &[(String, u32)], after: &[(String, u32)]) -> Vec<(String, u32)> {
+/// backwards is not either — a secondary compares serials the same way and would
+/// ignore it, so sending is just noise. A zone that is new since the last load
+/// *is* news: nobody has heard about it yet.
+///
+/// The comparison used to be RFC 1982 §3.2 written out inline here, beside a
+/// second implementation of it in `secondary::is_newer`. Both are now
+/// [`Serial::is_newer_than`] (`TODO.md` #14a).
+pub fn changed_zones(
+    before: &[(String, Serial)],
+    after: &[(String, Serial)],
+) -> Vec<(String, Serial)> {
     after
         .iter()
         .filter(
             |(zone, serial)| match before.iter().find(|(z, _)| z == zone) {
-                // RFC 1982 §3.2: `new` is later than `old` when the difference,
-                // taken in 32-bit wrapping arithmetic, is in the first half of the
-                // space. That is what makes a serial that wraps past 2^32 still read
-                // as an increment.
-                Some((_, previous)) => {
-                    serial.wrapping_sub(*previous) != 0
-                        && serial.wrapping_sub(*previous) < 0x8000_0000
-                }
+                Some((_, previous)) => serial.is_newer_than(*previous),
                 None => true,
             },
         )
@@ -133,7 +134,7 @@ pub fn changed_zones(before: &[(String, u32)], after: &[(String, u32)]) -> Vec<(
 }
 
 /// Every zone's name and serial, for comparing one load against the next.
-pub fn zone_serials(zones: &[&Zone]) -> Vec<(String, u32)> {
+pub fn zone_serials(zones: &[&Zone]) -> Vec<(String, Serial)> {
     zones
         .iter()
         .filter_map(|zone| {
@@ -157,10 +158,10 @@ pub fn soa_record(zone: &Zone) -> Option<ResourceRecord> {
 }
 
 /// The serial in a NOTIFY's answer section, if it carried its SOA.
-pub fn notified_serial(msg: &DnsMessage) -> Option<u32> {
+pub fn notified_serial(msg: &DnsMessage) -> Option<Serial> {
     msg.answers
         .iter()
-        .filter(|rr| rr.rdata.rtype == rt::SOA)
+        .filter(|rr| rr.rdata.rtype() == rt::SOA)
         .find_map(|rr| match rr.rdata.parse() {
             Ok(ParsedRecord::SOA { serial, .. }) => Some(serial),
             _ => None,
@@ -206,7 +207,7 @@ mod tests {
         assert_eq!(parsed.queries[0].qtype, Qtype::of(rt::SOA));
         assert_eq!(
             notified_serial(&parsed),
-            Some(7),
+            Some(Serial::new(7)),
             "the SOA rides along so the secondary sees the new serial at once"
         );
         assert_eq!(notified_zone(&parsed).as_deref(), Some("example.com."));
@@ -253,38 +254,37 @@ mod tests {
 
     #[test]
     fn test_only_changed_zones_are_news() {
-        let before = vec![("a.test.".to_string(), 10), ("b.test.".to_string(), 20)];
+        let at = |zone: &str, serial: u32| (zone.to_string(), Serial::new(serial));
+        let before = vec![at("a.test.", 10), at("b.test.", 20)];
         let after = vec![
-            ("a.test.".to_string(), 11), // bumped
-            ("b.test.".to_string(), 20), // unchanged
-            ("c.test.".to_string(), 1),  // new zone
+            at("a.test.", 11), // bumped
+            at("b.test.", 20), // unchanged
+            at("c.test.", 1),  // new zone
         ];
         let changed = changed_zones(&before, &after);
-        assert_eq!(
-            changed,
-            vec![("a.test.".to_string(), 11), ("c.test.".to_string(), 1)]
-        );
+        assert_eq!(changed, vec![at("a.test.", 11), at("c.test.", 1)]);
     }
 
     /// A serial that has gone *backwards* is not an update: a secondary comparing
     /// serials would ignore it, so telling it would be noise.
     #[test]
     fn test_a_serial_that_went_backwards_is_not_news() {
-        let before = vec![("a.test.".to_string(), 10)];
-        let after = vec![("a.test.".to_string(), 9)];
+        let before = vec![("a.test.".to_string(), Serial::new(10))];
+        let after = vec![("a.test.".to_string(), Serial::new(9))];
         assert!(changed_zones(&before, &after).is_empty());
     }
 
-    /// RFC 1982 serial arithmetic: a serial that wraps past 2^32 is still an
-    /// increment, and a naive `>` comparison would call it a rollback and stay
-    /// silent for the rest of the zone's life.
+    /// RFC 1982 serial arithmetic reaches this far out: a wrapped serial is still
+    /// an increment, and a naive `>` would call it a rollback and stay silent for
+    /// the rest of the zone's life. The arithmetic itself is tested beside
+    /// [`Serial`]; this is that it is the arithmetic *this* function uses.
     #[test]
     fn test_a_wrapped_serial_is_still_an_increment() {
-        let before = vec![("a.test.".to_string(), u32::MAX - 1)];
-        let after = vec![("a.test.".to_string(), 3)];
+        let before = vec![("a.test.".to_string(), Serial::new(u32::MAX - 1))];
+        let after = vec![("a.test.".to_string(), Serial::new(3))];
         assert_eq!(
             changed_zones(&before, &after),
-            vec![("a.test.".to_string(), 3)],
+            vec![("a.test.".to_string(), Serial::new(3))],
             "3 is four ahead of 0xfffffffe in serial arithmetic"
         );
     }
@@ -294,7 +294,7 @@ mod tests {
         let zone = zone_with_serial(20260726);
         assert_eq!(
             zone_serials(&[&zone]),
-            vec![("example.com.".to_string(), 20260726)]
+            vec![("example.com.".to_string(), Serial::new(20260726))]
         );
 
         // A zone with no SOA has no serial to compare, so it is never news.

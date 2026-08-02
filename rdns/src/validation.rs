@@ -1,4 +1,84 @@
-use crate::error::WireError;
+use crate::error::{RequestError, RequestResult, WireError};
+use crate::DnsMessage;
+
+/// A message that arrived at a listening socket **and is a question**.
+///
+/// The only way to build one is [`Request::from_bytes`], which refuses QR=1. So
+/// a path holding a `Request` has made the check, and "did this one remember?"
+/// is answered by its type rather than by reading fifty lines of it.
+///
+/// **What that is and is not worth, stated plainly, because a doc comment
+/// asserting an invariant is a claim to verify (`CLAUDE.md` §4).** This does
+/// *not* make the omission impossible: [`DnsMessage::try_from_bytes`] is still
+/// public and still the right call for the resolver, for `xfr`, and for a test.
+/// A new answering path could call it and skip the check exactly as
+/// `answer_datagram` did. What changed is that there is now one named door with
+/// the reason attached to it, that both of `rdnsd`'s answering paths and
+/// `rdnsr`'s go through it, and that the drop decision is written once instead
+/// of once per path — so the next path is *copied from* something that checks,
+/// rather than from something that happened not to. Real teeth would mean
+/// `make_response` and its siblings taking `&Request`, which is a larger change
+/// than `TODO.md` #14b scopes and would push every unit test of them through a
+/// serialize-and-reparse round trip.
+///
+/// **The bug this is the fix for is in the log.** `CLAUDE.md` §8 has said "test
+/// QR before doing anything with a packet that arrived at a listening socket, on
+/// both daemons" since before either of `rdnsd`'s two answering paths was last
+/// touched. `fn answer` (TCP) had the check; `answer_datagram` (UDP) never did,
+/// and UDP is the transport it matters on — nothing makes the peer prove its
+/// address first, so a spoofed datagram naming another server as its source was
+/// a packet loop neither end could see. `rdnsr` has one `handle_query` shared by
+/// both of its transports and so could not drift. Two answering paths, one
+/// check: §7's shape, and §17's answer to it — a rule written down is a rule
+/// somebody has to remember, and a type is not.
+///
+/// **A wrapper at the door, not a split of [`DnsMessage`].** The resolver sends
+/// queries and reads responses, `tsig` verifies both directions of the wire, and
+/// `xfr` reads a stream of replies; all of those need a message that may have
+/// QR=1, and none of them is a socket a stranger can talk to. So `DnsMessage`
+/// keeps its `response` field and this type is the narrow thing that guards the
+/// one place where the answer is fixed.
+///
+/// `Deref` gives read access to every field, and there is deliberately **no
+/// `DerefMut` and no `&mut` accessor**: `request.response = true` would put the
+/// value back in the state the type exists to exclude.
+///
+/// **What it does not do**, so nothing reads more into it than is there: it does
+/// not run [`RequestValidator`] (which is configured per server and, on UDP,
+/// runs before admission so a datagram is rejected before it is copied), it does
+/// not check the opcode (that is each daemon's policy, and the answer is NOTIMP
+/// rather than silence), and it does not verify a TSIG. It answers one question,
+/// and it answers it every time.
+#[derive(Debug, Clone)]
+pub struct Request(DnsMessage);
+
+impl Request {
+    /// Parse a packet that arrived at a socket this server is listening on.
+    ///
+    /// `Err(RequestError::NotAQuestion)` for QR=1, and the caller's only correct
+    /// response to that is **silence**: there is no reply to send, because the
+    /// sender did not ask anything, and sending one is what closes the loop.
+    pub fn from_bytes(packet: &[u8]) -> RequestResult<Request> {
+        let msg = DnsMessage::try_from_bytes(packet)?;
+        if msg.response {
+            return Err(RequestError::NotAQuestion);
+        }
+        Ok(Request(msg))
+    }
+
+    /// The message, for the code that builds a reply to it.
+    pub fn message(&self) -> &DnsMessage {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Request {
+    type Target = DnsMessage;
+
+    fn deref(&self) -> &DnsMessage {
+        &self.0
+    }
+}
 
 /// Upper bound on additional records in a request. A legitimate request carries
 /// at most an OPT plus a TSIG/SIG(0); the slack is for forward compatibility.
@@ -311,6 +391,58 @@ impl RequestValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same 25-byte query as `test_valid_small_packet`, with the QR bit the
+    /// only thing that moves between the two calls below.
+    fn query_packet(response: bool) -> Vec<u8> {
+        let mut packet = vec![
+            0x00, 0x01, // ID
+            0x00, 0x00, // flags: QR=0, opcode QUERY
+            0x00, 0x01, // 1 query
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // no other sections
+            0x03, 0x77, 0x77, 0x77, // "www"
+            0x03, 0x63, 0x6f, 0x6d, // "com"
+            0x00, // root
+            0x00, 0x01, // A
+            0x00, 0x01, // IN
+        ];
+        if response {
+            packet[2] |= 0x80;
+        }
+        packet
+    }
+
+    /// A response arriving at a listening socket is not a question, and the
+    /// answer is silence (`CLAUDE.md` §8).
+    ///
+    /// **Not a failing-first regression test, and it should not be read as
+    /// one.** The defect this type exists for — `rdnsd` answering a response on
+    /// its UDP port — was fixed at the call site in an earlier commit, so there
+    /// is nothing left here to watch fail (`CLAUDE.md` §1). What this asserts is
+    /// that the constructor refuses; what actually stops the defect coming back
+    /// is that there is no other constructor, and that is a compile-time fact no
+    /// test can express.
+    #[test]
+    fn a_response_is_not_a_request() {
+        assert!(matches!(
+            Request::from_bytes(&query_packet(true)),
+            Err(RequestError::NotAQuestion)
+        ));
+
+        let request = Request::from_bytes(&query_packet(false)).expect("a question parses");
+        assert!(!request.response, "and it is still a question afterwards");
+        assert_eq!(request.queries[0].qname, "www.com.");
+    }
+
+    /// The two failure modes stay apart, because they are different operational
+    /// signals: garbage or a parser probe, against a traffic loop.
+    #[test]
+    fn a_malformed_packet_is_not_reported_as_a_response() {
+        assert!(matches!(
+            Request::from_bytes(&[0x00, 0x01, 0x00]),
+            Err(RequestError::Wire(_))
+        ));
+    }
 
     #[test]
     fn test_valid_small_packet() {

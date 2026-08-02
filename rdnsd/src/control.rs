@@ -258,7 +258,7 @@ async fn status(control: &Control) -> String {
 
     struct Row {
         zone: String,
-        serial: u32,
+        serial: Serial,
         records: usize,
         signing: &'static str,
         replicated: bool,
@@ -282,7 +282,7 @@ async fn status(control: &Control) -> String {
                     serial: gauge
                         .map(|g| g.serial)
                         .or_else(|| zone.serial())
-                        .unwrap_or(0),
+                        .unwrap_or(Serial::new(0)),
                     records: zone.records().len(),
                     signing: if zone.has_nsec3_chain() {
                         "NSEC3"
