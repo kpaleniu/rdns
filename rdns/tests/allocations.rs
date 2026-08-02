@@ -346,6 +346,22 @@ fn reading_a_requests_edns_parameters_allocates_nothing() {
 
     // Reaching the OPT record is now free — it is a field, not something to be
     // found in the additional section (`TODO.md` #13d).
+    // Parsing the query in the first place, which is what a server does before
+    // any of the above. **This measurement was added during review of #13**,
+    // because nothing covered parsing an EDNS-bearing query and the OPT record's
+    // move into its own field changed exactly that path — a gap the gate could
+    // not see through, and it hid a regression for two commits.
+    //
+    // Measured against `main` with the same probe: **7 before #13, 8 after the
+    // first version of `Additional::try_from_bytes` — which parsed the owner
+    // name twice to peek at the TYPE — and 6 once the fields are read once and
+    // branched on.** The extra one below `main` is the `RecordData` that an OPT
+    // record no longer needs building on the way past, since it never becomes a
+    // `ResourceRecord` at all.
+    let (parsed, parse_count) = allocations(|| DnsMessage::try_from_bytes(&wire));
+    assert!(parsed.expect("parses").edns().is_some(), "the OPT is there");
+    within("parse a query that carries EDNS", parse_count, 6..=6);
+
     let (found, found_count) = allocations(|| msg.edns());
     let found = found.expect("OPT");
     within("reach the OPT record", found_count, 0..=0);

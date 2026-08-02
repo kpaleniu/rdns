@@ -226,6 +226,80 @@ pub fn absolute_lowered(name: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(owned)
 }
 
+/// The only form a name may be a map **key** in: absolute and ASCII case-folded
+/// (RFC 4343).
+///
+/// There is one constructor and it folds, so a key that has not been through
+/// [`absolute_lowered`] cannot be inserted. That is the bug this exists to make
+/// unspellable: `cache` once keyed on the name as it arrived, so `WWW.example.com.`
+/// and `www.example.com.` were two entries for one owner — and the fix was a call
+/// to a helper that the next map to be written would have had to remember.
+///
+/// **Borrowed lookup is `Borrow<str>`, not a borrowed newtype**, and that is a
+/// deliberate limit rather than an oversight. The `str`/`String`-shaped pair —
+/// an unsized `NameKey(str)` with `Borrow<NameKey>` — is what `std` does for
+/// `Path`/`PathBuf`, and it cannot be built without transmuting `&str` to
+/// `&NameKey`. This workspace contains **no `unsafe` at all**, and a newtype's
+/// ergonomics is not a good enough reason to introduce the first of it.
+///
+/// What that costs: a *lookup* takes a `&str` the caller folded (with
+/// `absolute_lowered`, which borrows when there is nothing to fold, so nothing
+/// allocates). What it keeps: an *insertion* cannot skip the fold, which is the
+/// direction the bug came from. See `TODO.md` #13e.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NameKeyBuf(String);
+
+impl NameKeyBuf {
+    /// Fold `name` into key form. The only way to make one.
+    pub fn new(name: &str) -> NameKeyBuf {
+        NameKeyBuf(absolute_lowered(name).into_owned())
+    }
+
+    /// Take ownership of a string that is **already** in key form.
+    ///
+    /// For the one caller that has done the work: `Zone`'s lookup key is
+    /// `absolutize`-against-the-origin *then* fold, which [`NameKeyBuf::new`]
+    /// cannot express because it has no origin. Without this, `add_record`
+    /// folded a second time and allocated twice per record — caught by
+    /// `tests/allocations.rs` as 208 -> 215 on an eight-record zone, which is
+    /// what that file is for.
+    ///
+    /// The invariant is checked in debug rather than taken on trust, and checked
+    /// *without allocating*, because the allocation test runs in debug and a
+    /// checking `absolute_lowered` would have shown up as the very number it is
+    /// there to hold.
+    pub fn from_folded(name: String) -> NameKeyBuf {
+        debug_assert!(
+            name.ends_with('.') && !name.bytes().any(|b| b.is_ascii_uppercase()),
+            "from_folded was handed {name:?}, which is not in key form"
+        );
+        NameKeyBuf(name)
+    }
+
+    /// The key as text, for the callers that still hold names as `String`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for NameKeyBuf {
+    /// What makes `map.get(absolute_lowered(name).as_ref())` work without
+    /// building a key — the lookup path allocates nothing.
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for NameKeyBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// How many labels a name has, the root (`.`) being zero. `example.com.` is 2.
 ///
 /// Neither case folding nor the trailing dot changes the answer, so this does

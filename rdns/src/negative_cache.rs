@@ -30,7 +30,7 @@
 //!   it, so the AD bit a second client sees is the one the first client saw.
 
 use crate::dnssec::{canonical_name, label_count, suffix_labels};
-use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf};
 use crate::Qtype;
 use crate::Ttl;
 use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};
@@ -85,7 +85,7 @@ impl Entry {
 #[derive(Debug, Default)]
 struct Entries {
     /// By name: this name does not exist, so no type at it does either.
-    nxdomain: HashMap<String, Entry>,
+    nxdomain: HashMap<NameKeyBuf, Entry>,
     /// By (name, type): the name exists, this type at it does not.
     nodata: HashMap<(String, Qtype), Entry>,
 }
@@ -166,10 +166,10 @@ impl NegativeCache {
         };
 
         if nxdomain {
-            if !entries.nxdomain.contains_key(&name) && entries.len() >= self.max_entries {
+            if !entries.nxdomain.contains_key(name.as_str()) && entries.len() >= self.max_entries {
                 make_room(&mut entries, now);
             }
-            entries.nxdomain.insert(name, entry);
+            entries.nxdomain.insert(NameKeyBuf::new(&name), entry);
         } else {
             let key = (name, qtype);
             if !entries.nodata.contains_key(&key) && entries.len() >= self.max_entries {
@@ -195,7 +195,11 @@ impl NegativeCache {
         // first, bounded by the label count.
         for depth in (0..=label_count(&name)).rev() {
             let ancestor = suffix_labels(&name, depth);
-            if let Some(entry) = entries.nxdomain.get(&ancestor).filter(|e| e.live(now)) {
+            if let Some(entry) = entries
+                .nxdomain
+                .get(ancestor.as_str())
+                .filter(|e| e.live(now))
+            {
                 return Some(entry.answer(now));
             }
         }

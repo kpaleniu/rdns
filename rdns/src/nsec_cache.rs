@@ -33,7 +33,7 @@ use crate::dnssec::{canonical_name, label_count, suffix_labels, Rrsig};
 use crate::dnssec_denial::{
     canonical_sort_key, proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3,
 };
-use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf};
 use crate::Qtype;
 use crate::Rtype;
 use crate::Ttl;
@@ -168,7 +168,7 @@ fn wildcard_for_parent_of(name: &str) -> Option<String> {
 /// Validated NSEC/NSEC3 proofs, searchable by range.
 #[derive(Debug)]
 pub struct NsecCache {
-    zones: Mutex<HashMap<String, ZoneProofs>>,
+    zones: Mutex<HashMap<NameKeyBuf, ZoneProofs>>,
     /// Zones to remember. Combined with [`MAX_PROOFS_PER_ZONE`] this bounds the
     /// whole structure; a zone with a large NSEC chain cannot crowd out the
     /// rest, and a flood of one-off zones cannot grow it without limit.
@@ -231,10 +231,10 @@ impl NsecCache {
         let Ok(mut zones) = self.zones.lock() else {
             return;
         };
-        if !zones.contains_key(&zone) && zones.len() >= self.max_zones {
+        if !zones.contains_key(zone.as_str()) && zones.len() >= self.max_zones {
             evict_zone(&mut zones, now);
         }
-        let entry = zones.entry(zone.clone()).or_default();
+        let entry = zones.entry(NameKeyBuf::new(&zone)).or_default();
         entry.soa = Some(soa);
 
         for rr in &response.authorities {
@@ -354,10 +354,10 @@ impl NsecCache {
             if !synthesizable_qtype(Qtype::of(rtype)) {
                 continue;
             }
-            if !zones.contains_key(&zone) && zones.len() >= self.max_zones {
+            if !zones.contains_key(zone.as_str()) && zones.len() >= self.max_zones {
                 evict_zone(&mut zones, now);
             }
-            let entry = zones.entry(zone.clone()).or_default();
+            let entry = zones.entry(NameKeyBuf::new(&zone)).or_default();
 
             // The RRset as it arrived, plus its signatures. `records_at` keeps
             // the owner name it came under; synthesis rewrites it.
@@ -473,8 +473,8 @@ impl NsecCache {
 
         let (_, zone) = zones
             .iter()
-            .filter(|(z, _)| is_at_or_below(&qname, z))
-            .max_by_key(|(z, _)| label_count(z))?;
+            .filter(|(z, _)| is_at_or_below(&qname, z.as_str()))
+            .max_by_key(|(z, _)| label_count(z.as_str()))?;
 
         let cached = zone
             .wildcards
@@ -528,14 +528,14 @@ impl NsecCache {
         // chain covers it; a shallower zone's chain stops at the delegation.
         let (zone_name, zone) = zones
             .iter()
-            .filter(|(z, _)| is_at_or_below(&qname, z))
-            .max_by_key(|(z, _)| label_count(z))?;
+            .filter(|(z, _)| is_at_or_below(&qname, z.as_str()))
+            .max_by_key(|(z, _)| label_count(z.as_str()))?;
 
         let soa = zone.soa.as_ref().filter(|s| s.expires_at > now)?;
 
         let (rcode, proof_records, proof_ttl) = zone
-            .synthesize_nodata(&qname, zone_name, qtype, now)
-            .or_else(|| zone.synthesize_nxdomain(&qname, zone_name, now))?;
+            .synthesize_nodata(&qname, zone_name.as_str(), qtype, now)
+            .or_else(|| zone.synthesize_nxdomain(&qname, zone_name.as_str(), now))?;
 
         // The answer lives as long as the shortest-lived thing it rests on: the
         // proof records, the SOA's negative TTL (RFC 2308 §5), and what is left
@@ -902,7 +902,7 @@ fn insert_bounded<T>(
     map.insert(key, value);
 }
 
-fn evict_zone(zones: &mut HashMap<String, ZoneProofs>, now: u64) {
+fn evict_zone(zones: &mut HashMap<NameKeyBuf, ZoneProofs>, now: u64) {
     zones.retain(|_, z| z.soa.as_ref().is_some_and(|s| s.expires_at > now));
     if let Some(soonest) = zones
         .iter()

@@ -2,7 +2,7 @@ use crate::dnssec_denial::{base32hex_decode, canonical_sort_key};
 use crate::error::ZoneError;
 use crate::utils::record_type_code;
 use crate::utils::record_types as rt;
-use crate::utils::{ascii_lowered_cow, is_at_or_under};
+use crate::utils::{ascii_lowered_cow, is_at_or_under, NameKeyBuf};
 use crate::Class;
 use crate::Rtype;
 use crate::Ttl;
@@ -47,7 +47,7 @@ pub struct Zone {
     origin: String,
     records: Vec<ZoneRecord>,
     /// Positions in `records`, by [`Zone::lookup_key`] of the owner name.
-    index: HashMap<String, Vec<usize>>,
+    index: HashMap<NameKeyBuf, Vec<usize>>,
     /// The NSEC chain, keyed by canonical sort order, and the NSEC3 chain,
     /// keyed by hash — both empty for the unsigned zones that are most of them.
     ///
@@ -68,7 +68,7 @@ pub struct Zone {
     /// zone's own data off the internet. Kept as its own set rather than folded
     /// into `index` because the denial path needs the literal question too, and
     /// [`Zone::holds_name`] is where that lives.
-    non_terminals: HashSet<String>,
+    non_terminals: HashSet<NameKeyBuf>,
 }
 
 /// Why a name has an answer in this zone, or has none — the distinction
@@ -141,7 +141,10 @@ impl Zone {
         let key = self.lookup_key(&record.name).into_owned();
         let position = self.records.len();
         self.note_non_terminals(&key);
-        self.index.entry(key).or_default().push(position);
+        self.index
+            .entry(NameKeyBuf::from_folded(key))
+            .or_default()
+            .push(position);
         match self.chain_key(&record) {
             Some((Chain::Nsec, k)) => {
                 self.nsec_chain.insert(k, position);
@@ -244,7 +247,7 @@ impl Zone {
         let key = self.lookup_key(name);
         let positions = match self.name_kind_of_key(&key) {
             NameKind::Exact => self.index.get(key.as_ref()),
-            NameKind::Wildcard(ref wildcard) => self.index.get(wildcard),
+            NameKind::Wildcard(ref wildcard) => self.index.get(wildcard.as_str()),
             NameKind::EmptyNonTerminal | NameKind::NotFound => None,
         };
         match positions {
@@ -323,7 +326,7 @@ impl Zone {
                 return NameKind::NotFound;
             }
             let wildcard = format!("*.{encloser}");
-            return if self.index.contains_key(&wildcard) {
+            return if self.index.contains_key(wildcard.as_str()) {
                 NameKind::Wildcard(wildcard)
             } else {
                 NameKind::NotFound
@@ -396,7 +399,7 @@ impl Zone {
             }
             let parent = parent.to_string();
             let reached_apex = parent == origin;
-            if !self.non_terminals.insert(parent.clone()) || reached_apex {
+            if !self.non_terminals.insert(NameKeyBuf::new(&parent)) || reached_apex {
                 return;
             }
             name = parent;
@@ -441,7 +444,10 @@ impl Zone {
         self.non_terminals.clear();
         for (position, key) in keys.into_iter().enumerate() {
             self.note_non_terminals(&key);
-            self.index.entry(key).or_default().push(position);
+            self.index
+                .entry(NameKeyBuf::from_folded(key))
+                .or_default()
+                .push(position);
         }
 
         // The chains are keyed by the *absolute* name too, so moving the origin
@@ -1102,6 +1108,29 @@ fn parse_into(
                 )
             })?
         } else {
+            // An escape has no spelling in the form a name is stored in here,
+            // and is refused rather than mis-encoded. RFC 1035 §5.1 gives `\.`
+            // the meaning "a literal dot *inside* a label", so `a\.b` is one
+            // label of three octets — but a stored name is presentation text
+            // with `.` as the separator, so nothing resolved the escape and the
+            // name became **two** labels, `a\` and `b`. `dname::write_label`
+            // refuses that on the way out; catching it here means a zone with
+            // one fails to *load* rather than failing the first query for it.
+            //
+            // `TODO.md` #13e records why refusing beats resolving: resolving
+            // needs a stored form that can hold a dot inside a label, which this
+            // one cannot. The zone writer already refuses to emit such a name
+            // (`zone_writer::writable_name`), so accepting one only ever made a
+            // zone that could not be written back out.
+            if first.contains('\\') {
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!(
+                        "owner name {first:?} contains an escape, which this parser does not \
+                         resolve and cannot represent; see RFC 1035 §5.1"
+                    ),
+                ));
+            }
             let name = absolutize(first, &state.origin).into_owned();
             state.owner = Some(name.clone());
             idx += 1;
@@ -2371,5 +2400,37 @@ $TTL 3600
         let zone_content = "$TTL notanumber\nwww IN A 192.0.2.1\n";
         let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
         assert!(err.to_string().contains("$TTL"), "got: {err}");
+    }
+    /// An escape in a name is refused rather than mis-encoded.
+    ///
+    /// RFC 1035 §5.1 gives `\.` the meaning "a literal dot *inside* a label",
+    /// so `a\.b.example.com.` is a four-label name whose first label is the
+    /// three octets `a.b`. This parser stores names as presentation text with
+    /// `.` as the separator and never resolved the escape, so the name came out
+    /// as **two** labels, `a\` and `b` — a different name, with a backslash in
+    /// it, that round-tripped through this library unchanged (`TODO.md` #13e).
+    ///
+    /// Refusing is the deliberate choice over resolving: resolving requires the
+    /// stored form to be able to hold a dot inside a label, which presentation
+    /// text cannot. The zone *writer* already refuses to emit such a name
+    /// (`zone_writer::writable_name`), so accepting one on the way in only ever
+    /// produced a zone that could not be written back out.
+    #[test]
+    fn an_escape_in_a_name_is_refused_rather_than_mis_encoded() {
+        let err = parse_zone_file("a\\.b IN A 192.0.2.1\n", "example.com.")
+            .expect_err("an escaped dot in an owner name");
+        assert!(
+            err.to_string().contains("escape"),
+            "the error should say what it refused: {err}"
+        );
+
+        // The same in a name-valued RDATA field.
+        assert!(
+            parse_zone_file("www IN CNAME a\\.b.example.com.\n", "example.com.").is_err(),
+            "an escaped dot in a CNAME target"
+        );
+
+        // And an ordinary name with no escape still parses.
+        parse_zone_file("www IN A 192.0.2.1\n", "example.com.").expect("no escape, no problem");
     }
 }

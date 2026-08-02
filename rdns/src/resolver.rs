@@ -22,7 +22,7 @@ use crate::dnssec_denial::{nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, 
 use crate::error::{ResolveError, ResolveResult};
 use crate::utils::{
     absolute_lowered, current_unix_timestamp, is_at_or_under, label_count, names_equal,
-    record_types as rt,
+    record_types as rt, NameKeyBuf,
 };
 use crate::Qtype;
 use crate::Rtype;
@@ -297,7 +297,7 @@ impl Default for ResolverConfig {
 /// rate-limit it. With it, the root is consulted roughly once per TLD per TTL.
 #[derive(Debug)]
 struct DelegationCache {
-    entries: Mutex<HashMap<String, CachedDelegation>>,
+    entries: Mutex<HashMap<NameKeyBuf, CachedDelegation>>,
     capacity: usize,
 }
 
@@ -339,14 +339,14 @@ impl DelegationCache {
         let mut entries = self.entries.lock().ok()?;
 
         for candidate in ancestors(&name) {
-            match entries.get(&candidate) {
+            match entries.get(candidate.as_str()) {
                 Some(entry) if entry.expires_at > now && accept(&candidate) => {
                     return Some((candidate, entry.servers.clone()));
                 }
                 // Live, but the caller does not want to start here.
                 Some(entry) if entry.expires_at > now => {}
                 Some(_) => {
-                    entries.remove(&candidate);
+                    entries.remove(candidate.as_str());
                 }
                 None => {}
             }
@@ -381,7 +381,7 @@ impl DelegationCache {
         }
 
         entries.insert(
-            normalize(zone),
+            NameKeyBuf::new(zone),
             CachedDelegation {
                 servers,
                 expires_at: current_unix_timestamp() + ttl.min(MAX_DELEGATION_TTL),
@@ -392,7 +392,7 @@ impl DelegationCache {
     /// Drop a zone's entry, for when the servers in it turn out not to work.
     fn forget(&self, zone: &str) {
         if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(&normalize(zone));
+            entries.remove(normalize(zone).as_str());
         }
     }
 }
@@ -619,7 +619,7 @@ impl Resolution {
 /// load-bearing, hence the cap.
 #[derive(Debug)]
 struct KeyCache {
-    entries: Mutex<HashMap<String, CachedKeys>>,
+    entries: Mutex<HashMap<NameKeyBuf, CachedKeys>>,
     capacity: usize,
 }
 
@@ -675,7 +675,7 @@ impl KeyCache {
             }
         }
         entries.insert(
-            normalize(zone),
+            NameKeyBuf::new(zone),
             CachedKeys {
                 keys,
                 expires_at: current_unix_timestamp() + ttl.min(MAX_KEY_TTL),
@@ -3000,7 +3000,7 @@ this line has no record and is skipped
         {
             let mut entries = cache.entries.lock().unwrap();
             entries.insert(
-                "stale.test.".to_string(),
+                NameKeyBuf::new("stale.test."),
                 CachedDelegation {
                     servers: vec![server],
                     expires_at: current_unix_timestamp().saturating_sub(1),

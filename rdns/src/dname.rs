@@ -33,12 +33,54 @@ pub(crate) fn write_bytes(buf: &mut [u8], pos: usize, bytes: &[u8]) -> Result<us
     Ok(end)
 }
 
+/// Why a label cannot be carried in this library's presentation-text form, if
+/// it cannot.
+///
+/// A wire label may hold **any** octet (RFC 1035 §3.1), and a name here is a
+/// `String` in presentation form where `.` separates labels and `\` would be
+/// RFC 1035 §5.1's escape. Two octets therefore have no faithful spelling:
+///
+/// - **`.`** — the separator. A one-label name `a.b` and the two-label name
+///   `a` + `b` are different names that both read as the string `"a.b."`, so the
+///   representation stops being injective: every name-keyed map merges them, and
+///   `is_at_or_under("evil.com.", "com.")` answers *true* for a single label
+///   that is a sibling of `com.` rather than a child.
+/// - **`\`** — the escape. A name holding one is written into a zone file that
+///   no correct reader, this one included, reads back as the same name.
+///
+/// Refusing is the deliberate choice over resolving escapes: resolving requires
+/// a stored form that can hold a dot *inside* a label, which presentation text
+/// cannot, and that is a different representation (labels or wire bytes — what
+/// PowerDNS, hickory-dns and dnspython all store). `TODO.md` #13e records the
+/// three options and why this is the one taken.
+///
+/// **Which arm fires where.** The `.` arm is live only at the decode boundary in
+/// [`UnpackedDName`]'s `TryInto<String>`: both encoders split the name on `.`
+/// before calling [`write_label`], so no label they produce can contain one. It
+/// is checked there anyway because the two callers of this function are the two
+/// ends of the same invariant, and a future encoder that builds labels some
+/// other way should not have to rediscover the rule. The `\` arm is live at
+/// both — splitting `a\.b` on `.` yields the label `a\`, which is how a zone
+/// file's escape reaches the writer.
+fn unrepresentable_octet(label: &str) -> Option<&'static str> {
+    if label.as_bytes().contains(&b'.') {
+        return Some("a label containing the label separator");
+    }
+    if label.as_bytes().contains(&b'\\') {
+        return Some("a label containing an escape character");
+    }
+    None
+}
+
 /// Write one length-prefixed label, validating it first.
 ///
 /// The single place a label becomes bytes — shared by [`dname_to_bytes`] (which
 /// writes whole names uncompressed) and the message compressor (which writes the
 /// labels ahead of a pointer).
 pub(crate) fn write_label(buf: &mut [u8], pos: usize, label: &str) -> Result<usize, WireError> {
+    if let Some(what) = unrepresentable_octet(label) {
+        return Err(WireError::Unsupported { what });
+    }
     if label.is_empty() {
         return Err(WireError::malformed(
             "domain name",
@@ -413,6 +455,12 @@ impl<'a> TryInto<String> for UnpackedDName<'a> {
             match l {
                 Label::String(s) => {
                     let label_str = std::str::from_utf8(s)?;
+                    // The other end of `unrepresentable_octet`: a name that
+                    // cannot be spelled is refused as it is read, so no such
+                    // `String` ever exists to be compared, keyed on or written.
+                    if let Some(what) = unrepresentable_octet(label_str) {
+                        return Err(WireError::Unsupported { what });
+                    }
                     result.push_str(label_str);
                     result.push('.');
                 }
@@ -529,6 +577,50 @@ mod tests {
     fn test_dname_to_bytes_root() {
         assert_eq!(dname_to_bytes(".").unwrap(), vec![0]);
         assert_eq!(dname_to_bytes("").unwrap(), vec![0]);
+    }
+
+    /// A label may hold any octet (RFC 1035 §3.1), `.` included — and this
+    /// library stores a name as presentation text in which `.` is the label
+    /// separator. Both cannot be true, so the name is refused rather than
+    /// silently flattened.
+    ///
+    /// Before this check, the one-label name `[03 'a' '.' 'b']` and the
+    /// two-label name `[01 'a' 01 'b']` both read as `"a.b."` — two distinct
+    /// names collapsing onto one string, which every name-keyed map and every
+    /// tree-shaped question in this codebase assumes cannot happen. The visible
+    /// consequence was `is_at_or_under("evil.com.", "com.")` answering **true**
+    /// for a single label that is a *sibling* of `com.`, not a child of it.
+    ///
+    /// NOTIMP rather than FORMERR: the sender is not at fault. This is a legal
+    /// encoding we decline to represent, the same judgement `Label` already
+    /// makes about binary labels (`TODO.md` #13e).
+    #[test]
+    fn a_label_containing_the_separator_is_refused() {
+        // ONE label: 'a', '.', 'b'.
+        let one_label: &[u8] = &[0x03, b'a', b'.', b'b', 0x00];
+        let unpacker = DNameUnpacker::new(one_label);
+        let err = dname_from_bytes(one_label, &unpacker)
+            .expect_err("a dot inside a label cannot be represented");
+        assert!(matches!(err, WireError::Unsupported { .. }), "got {err:?}");
+
+        // TWO labels spelling the same string are the ordinary name, and fine.
+        let two_labels: &[u8] = &[0x01, b'a', 0x01, b'b', 0x00];
+        let unpacker = DNameUnpacker::new(two_labels);
+        let (name, _) = dname_from_bytes(two_labels, &unpacker).expect("an ordinary name");
+        assert_eq!(name, "a.b.");
+    }
+
+    /// The same judgement for a backslash, and for the same reason one step
+    /// removed: a stored name is presentation text, and presentation text reads
+    /// `\` as an escape (RFC 1035 §5.1). A label holding one would be written
+    /// into a zone file that no correct reader — including this one — reads back
+    /// as the same name.
+    #[test]
+    fn a_label_containing_a_backslash_is_refused() {
+        let wire: &[u8] = &[0x03, b'a', 0x5c, b'b', 0x00];
+        let unpacker = DNameUnpacker::new(wire);
+        let err = dname_from_bytes(wire, &unpacker).expect_err("an escape character");
+        assert!(matches!(err, WireError::Unsupported { .. }), "got {err:?}");
     }
 
     #[test]

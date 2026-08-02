@@ -16,12 +16,17 @@ is one line each under "Done so far", pointing at the commit that carries its
 reasoning, RFC citations and verification.
 
 **The short version, if you read nothing else:** **every numbered item through
-#12 is closed, and #13 is planned with nothing landed.** The operational shell is
-finished; #9's five-way review went in full, its last performance item closed by
-measuring rather than fixing it; and #12's audit found no reachable panic and
-left a fuzzer behind to keep it that way. What is left is a stretch goal (#11), a
-feature nobody has scheduled (#10), **#13 — five staged commits that move
-invariants this codebase currently re-asserts per call site into the types**,
+#13 is closed; #14 is three filed candidates with none started.** The operational
+shell is finished; #9's five-way review went in full, its last performance item
+closed by measuring rather than fixing it; #12's audit found no reachable panic
+and left a fuzzer behind to keep it that way; and **#13 moved five families of
+invariant out of per-call-site checks and into the types, in twelve commits,
+fixing seven live defects on the way** — an opcode field that rewrote eleven of
+its sixteen values, a QTYPE=ANY answer that SERVFAILed a good signature, two OPT
+records where RFC 6891 requires FORMERR, an escaped dot encoded as two labels,
+two distinct wire names collapsing onto one string, a fifth copy of the ANY rule,
+and `rdnsd` answering a response sent to its UDP port. What is left is a stretch
+goal (#11), a feature nobody has scheduled (#10), three candidates (#14),
 and the first thing worth doing: **CI runs now, and its first run failed.** Build
 and test with the four commands at the top of `CLAUDE.md`; `cargo bench -p rdns`
 is the fifth. **Do not push** — commit locally and leave it; every push spends
@@ -537,7 +542,7 @@ The numbers are **stable identifiers, not reading order.** They are referenced
 from the code (`ixfr.rs:16` points at "#7 step 6") and from each other, so they
 are never renumbered.
 
-**Everything numbered through #12 is closed; #13 is planned and unstarted.** What
+**Everything numbered through #13 is closed; #14 is filed and unstarted.** What
 each was, and where its reasoning now lives — the commit that closed it, and the
 rule it became in `CLAUDE.md`:
 
@@ -550,8 +555,9 @@ rule it became in `CLAUDE.md`:
 | **9** | what a five-way review found: 48 defects in six groups (9a-9f) | **all done, 2026-07-27 → 2026-08-01.** The patterns became `CLAUDE.md`, which is the useful artefact; the 2,435 lines of finding text are in `git log -p TODO.md` |
 | **10** | dynamic UPDATE (RFC 2136) | **started 2026-08-02.** The reading half is in (`rdns/src/update.rs`: §2.4/§2.5 forms, §3.1, §3.2, §3.4.1's prescan); the writing half — apply, serial, re-signing, journal — is not. #7 step 6 still waits on it |
 | **11** | data layout and CPU cache friendliness | **a stretch goal, not scheduled.** Its measurement harness exists now (criterion, `--baseline`); what it still lacks is the *diagnostic* half — `perf stat`'s cache-miss and branch-miss counters, which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns) is the number it would have to move |
+| **14** | three candidates #13 left on the table: `Serial`, QR as a type, sealing `RecordData` | **filed 2026-08-02, none started.** Independent of each other, one commit each; the pass that produced them also fixed `rdnsd` answering a response on its UDP port |
 | **12** | pre-authentication panics | **audited 2026-08-01.** No reachable panic in 1.4M mutated inputs; two mutex-poisoning fixes; `rdns/tests/no_input_panics.rs` left behind as the guard |
-| **13** | making illegal states unrepresentable: `OpCode`'s sentinel, the eleven name normalizations, QTYPE-vs-RTYPE, `Ttl` + `Class` + OPT out of the additional section, `Name`/`NameKey` | **started 2026-08-02. 13a-13d done**; only 13e remains, and it is the one stage the section says is legitimate to abandon. Every stage gated on `rdns/tests/allocations.rs` and every one has held its counts; 13b added a fifteenth measurement that went 2 to 0 |
+| **13** | making illegal states unrepresentable: `OpCode`'s sentinel, the eleven name normalizations, QTYPE-vs-RTYPE, `Ttl` + `Class` + OPT out of the additional section, `Name`/`NameKey` | **done 2026-08-02**, twelve commits. 13a-13d in full; 13e's map keys done and its `Name` half deferred with a reason. Seven live defects fixed on the way. Every stage gated on `rdns/tests/allocations.rs` and every one has held its counts; 13b added a fifteenth measurement that went 2 to 0 |
 
 **What the letters mean**, because comments in the code and lines further down
 this page still name them and the sections they named are gone:
@@ -585,7 +591,7 @@ the useful part** (`CLAUDE.md` §11 — correct in place, never quietly):
 
 ### Where to pick up next
 
-#13 is open and staged; everything else here is a choice rather than a queue.
+#14 is filed but unstarted; everything here is a choice rather than a queue.
 
 > **1. Push, and read the second CI run.** Everything the first one reported is
 > fixed locally and unpushed. There were two findings, not three:
@@ -606,14 +612,11 @@ the useful part** (`CLAUDE.md` §11 — correct in place, never quietly):
 > image has no clippy package, so that half had only ever run on Windows. They
 > may have passed silently; nobody has looked.
 >
-> **2. #13e, `Name`/`NameKey` — or the decision not to.** 13a through 13d are
-> done (see §13). 13e is the last stage and the one the section says is
-> legitimate to abandon: it has an unsettled prerequisite that 13b surfaced and
-> did not answer — whether a name in this codebase is in *presentation* form
-> (escapes intact, so `str::len()` is not the wire length) or something else,
-> which `zone.rs:885` and `dname_to_bytes` currently disagree about. **Settle
-> that first.** If the answer needs its own design, stop after 13d and file the
-> rest; four fifths of §13's value is already in.
+> **2. #14a, `Serial`** — the cheapest of the three candidates #13 left, and the
+> only one with a second copy of its rule already in the tree: `notify.rs`
+> reproduces `secondary::is_newer`'s RFC 1982 comparison inline. A `Serial(u32)`
+> without `PartialOrd` makes `a > b` a compile error. ~15 sites, and the
+> span-driven rewrite from 13c/13d applies unchanged. See §14.
 >
 > **3. #10, dynamic UPDATE (RFC 2136)** — **started, one piece in.**
 > `rdns/src/update.rs` reads an UPDATE and checks its prerequisites; nothing
@@ -1401,7 +1404,7 @@ ok, **all sixteen allocation counts unchanged**. That is three commits in the
 forced order the section predicted, and each of the two newtypes was only
 correct because the one before it had landed.
 
-#### 13e. `Name` and `NameKey` — the pipeline that ends in `String`
+#### 13e. `Name` and `NameKey` — the pipeline that ends in `String` (**partly done**)
 
 `dname.rs` states the intent already: "The design is you can only go
 `bytes -> DName -> unpacker -> UnpackedDName -> String`. This way the type system
@@ -1417,8 +1420,121 @@ and *not* checked by `dname_to_bytes`, which validates label length and total
 length never), and **non-empty labels of ≤63 octets** (checked at
 `write_label`, i.e. at serialization, which is the last possible moment).
 
-**Settle the escape question before writing any type. This is a real
-prerequisite and the section was drafted without it.** A name in this codebase
+**The escape question is settled, and the answer is that both of our functions
+are half of a design and neither is the whole of one.** Researched 2026-08-02;
+what follows replaces the open question the section was drafted with.
+
+**What the RFCs say.** Backslash escapes are defined only in RFC 1035 **§5.1**,
+which is the *master file* format: "`\X` where X is any character other than a
+digit (0-9), is used to quote that character so that its special meaning does not
+apply. For example, `\.` can be used to place a dot character in a label."
+§3.1 defines the wire form with no escapes at all — "each label is represented as
+a one octet length field followed by that number of octets" — and says a label
+may hold anything: "although labels can contain any 8 bit values in octets that
+make up a label…". So an escape is a *presentation* device, and `.` inside a
+label is an ordinary octet on the wire. A representation that stores presentation
+text and then treats `.` as a separator is conflating the two.
+
+**What everyone else does**, checked rather than assumed:
+
+| implementation | stores | evidence |
+|---|---|---|
+| PowerDNS `DNSName` | wire | "accept escaped ascii presentations of DNS names and store them **'natively'**"; `string_t d_storage`, chosen to allow "non-printable characters" in labels |
+| hickory-dns `Name` | decoded labels | `Name::from_ascii("email\.name.example.com.")` is documented as **equal to** `Name::from_labels(["email.name", …])` — one label containing a dot |
+| dnspython `dns.name.Name` | decoded labels | `labels` is "a tuple of `bytes` in DNS wire format specifying the DNS labels" |
+| miekg/dns (Go) | **presentation strings** | "Resource records are native types. They are not stored in wire format" — the counter-example |
+
+Three of four resolve escapes at the presentation boundary and store decoded
+content. The fourth keeps presentation strings — **and still never splits on
+`'.'`**: it ships `NextLabel`, `PrevLabel`, `Split`, `SplitDomainName`,
+`CountLabel` and `IsDomainName` precisely because a naive split is wrong. This
+codebase picked presentation storage *and* the naive split, which is neither
+design.
+
+**Two live defects follow, and both were provoked rather than reasoned about:**
+
+- **A zone file mis-encodes an escaped dot.** `a\.b IN A 192.0.2.1` should be
+  one label `a.b` (`03 61 2e 62`). It becomes **two** labels, `a\` and `b`
+  (`02 61 5c | 01 62`): the tokenizer keeps the backslash (`zone.rs:885` says
+  names are not its business), nothing ever resolves it, and `dname_to_bytes`
+  splits on the dot. It round-trips through our own parser unchanged, which is
+  §1's warning about a parser agreeing with its own serializer.
+- **Two distinct wire names collapse to one string.** The one-label name
+  `[03 'a' '.' 'b']` and the two-label name `[01 'a' 01 'b']` both read as
+  `"a.b."`. That breaks the injectivity every name-keyed map and every
+  tree-shaped question assumes: `is_at_or_under("evil.com.", "com.")` answers
+  **true** for a single-label name that is a *sibling* of `com.`, not a child.
+  This arrives off the wire, so it is reachable by a remote party. **No
+  end-to-end exploit has been demonstrated and this should not be described as
+  one** — what is demonstrated is that the representation is not injective and
+  that a bailiwick answer derived from it can be wrong about the tree.
+
+**Which leaves three options for 13e**, and the sketch below assumes the first:
+
+1. **Store decoded labels** — `Name(Vec<Label>)` or wire form, escapes resolved
+   at the zone parser and re-escaped by the writer. What PowerDNS, hickory and
+   dnspython do. Fixes both defects. The largest change in §13 by some way, and
+   it is not `Name(String)`: a decoded label containing a literal dot cannot be
+   joined into a `String` without becoming ambiguous again, which is the flaw in
+   this section's original sketch.
+2. **Keep presentation strings and make every operation escape-aware** — the Go
+   design. `dname_to_bytes`, `label_count`, `is_at_or_under`, `absolute_lowered`
+   and the zone index all need escape-aware label walks. Fixes both defects,
+   spreads the rule across every name operation rather than concentrating it,
+   and is the design that library ships helpers for because it is easy to get
+   wrong.
+3. **Refuse what cannot be represented** — reject an escape in an owner name at
+   the zone parser, and reject a `.` inside a label coming off the wire. The
+   codebase is already half-committed to this: `zone_writer::writable_name`
+   refuses any name containing `\`, so such a zone cannot be written out today.
+   Cheapest by far, makes the invariant true rather than merely documented, and
+   costs the ability to serve a legal-but-vanishingly-rare name.
+
+**Recommendation: 3, then reassess.** It closes both defects in an afternoon,
+makes `Name`'s invariant honest (a name has no dots inside labels, so `.` *is*
+the separator), and leaves 1 available later without having built anything that
+has to be undone. It is also the only one of the three that can be verified by a
+test that fails today. What it must not be is silent: refusing input is a
+behaviour change and belongs in the release notes, not just in a type.
+
+**Option 3 is done.** Both defects are closed, at the two boundaries where a name
+enters or leaves as a `String`:
+
+- **`dname::unrepresentable_octet`** names the two octets that have no faithful
+  spelling in presentation text — `.`, the separator, and `\`, the escape — and
+  is checked in `UnpackedDName`'s `TryInto<String>` (wire → `String`) and in
+  `write_label` (`String` → wire). A refused name is `WireError::Unsupported`,
+  which reads as **NOTIMP rather than FORMERR**: the sender is not at fault, this
+  is a legal encoding we decline to represent, and it is the same judgement
+  `Label::try_from_bytes` already makes about binary labels.
+- **The zone parser refuses an escape in an owner name**, so a zone carrying one
+  fails to *load* rather than failing the first query for it. A name-valued RDATA
+  field is caught by `write_label` at `RecordData::from_parsed`, which is still
+  parse time.
+
+The invariant this buys is the one 13e's `Name` needs and could not previously
+state: **a stored name contains no dots inside labels and no escapes, so `.` is
+the separator and `str::len()` is the wire length.** That was the blocker.
+
+Verified: both wire tests and the zone test were watched failing first.
+`cargo test --workspace` 637/1/1/93/3 (+3), clippy and fmt clean, sixteen
+allocation counts unchanged, and **720,006 mutated cases through
+`no_input_panics` with no panics** — worth the soak because this changes a
+pre-authentication path (`TODO.md` #12).
+
+**What it costs, stated plainly rather than buried:** a name with a dot or a
+backslash inside a label is now refused instead of mangled. Such names are legal
+(RFC 1035 §3.1) and vanishingly rare, `zone_writer::writable_name` already
+refused to emit one, and every alternative required changing how every name in
+the codebase is stored. This is a behaviour change and belongs in release notes.
+
+**13e is no longer blocked**, and the remaining question is narrower than it was:
+with the invariant true, `Name(String)`/`NameKeyBuf` is sound — the objection was
+never the newtype, it was that the newtype would have been asserting something
+false.
+
+**The original open question, kept because it is why the section nearly shipped
+a `Name(String)` that could not work:** A name in this codebase
 may be in *presentation* form, and presentation form has escapes: `zone.rs:885`
 says so in as many words — "a bare token like `a\.b` is a name whose meaning
 changes if the backslash is dropped, and names are not this function's business"
@@ -1480,6 +1596,70 @@ outcome rather than a failure: if the escape question turns out to need its own
 decision, stop after 13d and file the rest. Four fifths of this section's value
 is in 13a-13d, none of which depends on 13e.
 
+**Done: the map keys. Not done: `Name` on `ResourceRecord`/`QuerySection`.** Two
+constraints found while building it changed what this stage can be, and both are
+worth more than the code:
+
+**1. The `str`/`String`-shaped pair needs `unsafe`, and this workspace has
+none.** `NameKey(str)` unsized with `Borrow<NameKey>` — the `Path`/`PathBuf`
+shape the plan sketched — cannot be constructed without transmuting `&str` to
+`&NameKey`. `grep -rn unsafe` over all five crates returns **zero**, and a
+newtype's ergonomics is not a good enough reason to introduce the first of it.
+What landed instead is `NameKeyBuf(String)` with `Borrow<str>`: an *insertion*
+cannot skip the fold, a *lookup* takes a `&str` the caller folded with
+`absolute_lowered` (which borrows, so nothing allocates). That is the direction
+the `cache` bug came from, so it is the half worth having — but it is half.
+
+**2. A tuple key cannot borrow, so `(name, qtype)` maps keep `String`.**
+`HashMap<(NameKeyBuf, Qtype), V>::get` has no way to accept a borrowed name:
+`Borrow` cannot decompose a tuple, so every lookup would have to *build* a
+`NameKeyBuf` and allocate — on `DnsCache::get`, which is on `rdnsr`'s query path.
+`cache`, `negative_cache`'s NODATA map and `nsec_cache`'s wildcard map therefore
+keep `(String, Qtype)`. The fix is a nested `HashMap<NameKeyBuf, HashMap<Qtype,
+V>>`, which is a data-structure change with its own eviction consequences and is
+not what this stage is for. **Filed, not forgotten.**
+
+So the maps that are keyed by a name alone are typed — `Zone`'s `index` and
+`non_terminals`, `negative_cache`'s NXDOMAIN map, `nsec_cache`'s zone proofs,
+`resolver`'s delegation and key caches, `ixfr`'s delta log, `metrics`' zone
+gauges — and the three tuple-keyed caches are not.
+
+**The gate did its job, and this is the entry it exists for.** The first version
+allocated twice per record in `Zone::add_record`: `lookup_key(…).into_owned()`
+and then `NameKeyBuf::new` folding it a second time.
+`tests/allocations.rs` read **208 → 215** on an eight-record zone and **922 →
+949** on signing one, and refused to pass. The cause was fixed rather than the
+number moved (§10): `NameKeyBuf::from_folded` takes a string already in key form,
+for the one caller — `Zone`, whose key is absolutize-against-the-origin *then*
+fold, which `NameKeyBuf::new` cannot express because it has no origin. Its
+invariant is `debug_assert`ed, and checked *without allocating*, because the
+allocation test runs in debug and a checking `absolute_lowered` would have shown
+up as the very number it is there to hold.
+
+**A review of the ten commits found one regression the gate could not see, and
+that gap is now closed.** Nothing in `tests/allocations.rs` measured *parsing* an
+EDNS-bearing query — the measurements around EDNS all worked on an
+already-parsed message — which is exactly the path 13d's OPT commit changed. The
+first `Additional::try_from_bytes` peeked at a record's TYPE by parsing the owner
+name a second time, costing an extra `String` on every modern query. Measured
+against `main` with the same probe: **7 before #13, 8 after that commit, 6 once
+the fields are read once and branched on** — `read_record_parts`, which is also
+the removal of a second copy of the field arithmetic (§7). The extra one below
+`main` is the `RecordData` an OPT record no longer needs building on the way
+past.
+
+The measurement is now permanent, with that history next to it, because a number
+that has moved three times is exactly the kind that gets argued about later.
+
+**Left for later, deliberately:** `Name` on `ResourceRecord::name`,
+`ZoneRecord::name`, `QuerySection::qname` and the name fields of `ParsedRecord`
+— roughly 460 sites. Its value is lower than it was when this section was
+drafted: 13b moved every fold and every comparison behind `utils`, and #13e's
+option-3 commit made the invariant those functions assume actually true. A `Name`
+that derefs to `str` would add little the constructors do not already give;
+one that does not deref is the 460 sites. Worth doing when something else needs
+to touch that surface anyway, not on its own.
+
 #### Order, and why it is this order
 
 1. **13a** — smallest, verified, fixes a live conformance bug, removes two
@@ -1538,6 +1718,92 @@ The through-line: every one of the five was a place the draft reasoned about
 what the code *should* look like instead of opening it. Which is §4's rule
 about never stating what a function does without reading it, applied to one's
 own plan — a plan is a claim about the code too.
+
+### 14. What #13 left on the table — three candidates, not a plan
+
+Written 2026-08-02, from a pass over the code *after* #13 landed, asking what
+the new types unlocked. **The pass found a live defect before it found any
+candidates**, and that defect is the argument for the second item below.
+
+**Fixed on the way, not filed:** `rdnsd` answered a response sent to its **UDP**
+port. §8 of `CLAUDE.md` says to test QR "on both daemons", so both *transports*
+of both daemons were checked rather than the rule taken as read. `fn answer`
+(TCP) has made that test since the rule was written; `answer_datagram` (UDP)
+never had it, and UDP is the transport it matters on — nothing makes the peer
+prove its address first, so a spoofed datagram naming another server as its
+source was a packet loop neither end could see. `rdnsr` has one `handle_query`
+shared by both of its transports and so could not drift; `rdnsd` has two
+answering paths and one of them was simply never given the check.
+
+These three are **candidates, deliberately not a staged plan**. #13 was planned
+in full before anything landed because it was five interlocking changes with a
+forced order. These are independent, and any one of them is a self-contained
+commit.
+
+#### 14a. `Serial(u32)` — RFC 1982 serial arithmetic
+
+The cheapest, and the one with a second copy already in the tree.
+`secondary::is_newer` implements RFC 1982 §3.2 correctly and says why: "a serial
+that wraps past 2^32 is still an increment, and a plain `>` would read it as a
+rollback and leave the zone frozen for the rest of its life."
+`notify.rs:124-127` then writes the same wrapping comparison out inline, with its
+own copy of the citation. That is `CLAUDE.md` §7's shape, in the one piece of
+arithmetic in DNS most likely to be got wrong with a `>`.
+
+A `Serial(u32)` that **deliberately does not implement `PartialOrd`** makes
+`a > b` a compile error and leaves `a.is_newer_than(b)` as the only comparison.
+Roughly fifteen sites: `ixfr`'s `from_serial`/`to_serial` and `chain_from`,
+`notify`, `metrics::set_zone_serial`, `secondary`, `zone::serial`,
+`xfr::soa_serial`, and `ParsedRecord::SOA`.
+
+Not unlocked by #13 — it was always available. It is here because it is the same
+class, the span-driven tooling from 13c/13d applies unchanged, and the second
+copy is already written.
+
+#### 14b. QR as a type
+
+The defect above is the whole argument, so it needs no other one. Two answering
+paths in `rdnsd`, one check, and the rule written down in `CLAUDE.md` §8 since
+before either was last touched.
+
+A `Request` newtype that can only be produced by a "parse a packet that arrived
+at a listening socket" constructor makes the test impossible to omit rather than
+something each path has to remember. The blast radius is the socket entry points
+rather than all of `DnsMessage`: the resolver sends queries and reads responses,
+`tsig` validates both directions, and `DnsMessage` has to stay usable for all of
+that — so this is a wrapper at the door, not a split of the message type.
+
+#### 14c. Seal `RecordData`
+
+**The one genuinely unlocked by #13.** `RecordData`'s fields are `pub`, and
+**twenty sites construct one directly**, bypassing `from_wire` and
+`from_parsed`. So "the RDATA is well formed for this TYPE" is not an invariant,
+which is why `RecordData::parse` returns a `Result` at all — a caller can build
+`RecordData { rtype: A, rdata: <seventeen bytes> }` and nothing objects until
+something tries to read it.
+
+Sealing the pair only *means* anything now that `rtype` is an [`Rtype`] rather
+than a `u16` anyone can invent, which is why this was not worth doing before
+13c. Cost: twenty constructions become constructor calls, and eleven
+`.rdata.rdata` reads become an accessor.
+
+#### Two that were checked and dropped, because a survey that only adds is not a survey
+
+- **DNSSEC algorithm and digest type as `u8`.** Expected to be a finding; it is
+  not. An algorithm this library cannot read falls through to
+  `CryptoError::UnsupportedAlgorithm(other)` — already a data-carrying variant,
+  already total, already what §2 asks for. A newtype would add a name and
+  nothing else.
+- **`if rcode > 0xfff` in `to_bytes`.** Reads like a runtime check standing in
+  for an invariant, and is structurally unreachable from the wire: the extended
+  RCODE byte is eight bits, so `(ext << 4) | (lo & 0xf)` cannot exceed 0xfff by
+  construction. Only a hand-built `ResponseCode::Other` can trip it, and that is
+  a caller's bug rather than a wire condition — which is what the check already
+  says.
+
+Genuinely low value, recorded so nobody re-derives them: the EDNS-version check
+duplicated across `rdnsd` and `rdnsr` (two lines of policy each daemon owns),
+and nine `bool` parameters (`dnssec_ok`, `is_tcp`, `deleting`).
 
 ## Closed work
 
@@ -2902,6 +3168,17 @@ cache carries the same AD bit the first client saw and no other.
 
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
+
+- **A map key is a folded name, and now says so** — #13e, the half of it worth
+  having. `NameKeyBuf` folds in its only constructor, so a map cannot be keyed on
+  a name nobody normalized — the `cache` bug that `utils::ascii_lowered`'s doc
+  comment describes. Two constraints shaped it and are recorded in §13e: the
+  `Path`/`PathBuf`-style borrowed newtype needs the workspace's first `unsafe`
+  and was refused, and a `(name, qtype)` tuple key cannot borrow, so the three
+  tuple-keyed caches keep `String` rather than pay an allocation per lookup on a
+  query path. The allocation gate caught a genuine regression (208 to 215 on a
+  zone parse, 922 to 949 on a signing) and the cause was fixed rather than the
+  number moved. Sixteen counts back at baseline.
 
 - **A CLASS is not a QCLASS, and now not a `u16`** — #13d, third of three, and
   the last of it. `Class(u16)` on `ResourceRecord` and `ZoneRecord`, with the

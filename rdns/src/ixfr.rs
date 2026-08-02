@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use crate::transfer::{axfr_messages, pack_transfer_messages};
-use crate::utils::{absolute_lowered, record_types as rt};
+use crate::utils::{absolute_lowered, record_types as rt, NameKeyBuf};
 use crate::zone::{Zone, ZoneRecord};
 use crate::{DnsMessage, ResourceRecord};
 
@@ -86,7 +86,7 @@ impl ZoneDelta {
 /// consumes.
 #[derive(Debug, Default)]
 pub struct DeltaLog {
-    by_zone: HashMap<String, Vec<ZoneDelta>>,
+    by_zone: HashMap<NameKeyBuf, Vec<ZoneDelta>>,
 }
 
 /// A version step that has been computed but not yet recorded.
@@ -154,7 +154,10 @@ impl DeltaLog {
     /// lock and records under its write lock so that a diff of every record in
     /// the zone is not something every query waits behind.
     pub fn record(&mut self, planned: PlannedDelta) {
-        let history = self.by_zone.entry(planned.zone).or_default();
+        let history = self
+            .by_zone
+            .entry(NameKeyBuf::new(&planned.zone))
+            .or_default();
         history.push(planned.delta);
         // Oldest first, so the oldest steps are the ones dropped.
         if history.len() > MAX_DELTAS_PER_ZONE {
@@ -166,7 +169,7 @@ impl DeltaLog {
     /// its history with it. Serving increments of a zone we no longer hold would
     /// be answering for something we have withdrawn.
     pub fn forget(&mut self, zone: &str) {
-        self.by_zone.remove(&key(zone));
+        self.by_zone.remove(key(zone).as_str());
     }
 
     /// The chain of steps from `serial` up to the newest one remembered, or
@@ -176,7 +179,7 @@ impl DeltaLog {
     /// skipped, and a secondary that applied the rest would hold a zone that
     /// never existed — which no serial comparison afterwards could detect.
     pub fn chain_from(&self, zone: &str, serial: u32) -> Option<Vec<&ZoneDelta>> {
-        let history = self.by_zone.get(&key(zone))?;
+        let history = self.by_zone.get(key(zone).as_str())?;
         let start = history.iter().position(|d| d.from_serial == serial)?;
 
         let mut chain = Vec::new();
@@ -193,7 +196,7 @@ impl DeltaLog {
 
     /// How many steps are remembered for a zone, for logging and tests.
     pub fn len(&self, zone: &str) -> usize {
-        self.by_zone.get(&key(zone)).map_or(0, Vec::len)
+        self.by_zone.get(key(zone).as_str()).map_or(0, Vec::len)
     }
 
     pub fn is_empty(&self) -> bool {

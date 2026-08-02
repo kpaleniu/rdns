@@ -1441,6 +1441,69 @@ impl<'a> TryUnpackFromBytes<'a> for QuerySection {
     }
 }
 
+/// The fields of one resource record, read straight off the wire.
+///
+/// Exists because the additional section has to know a record's TYPE *before* it
+/// can decide whether the record is a resource record at all — an OPT is not —
+/// and the first version answered that by parsing the owner name twice. That
+/// cost an extra `String` per OPT-bearing message, which is every modern query:
+/// `tests/allocations.rs` put it at **8 allocations to parse an EDNS query
+/// against 7 before**, found while reviewing #13 rather than by the gate, since
+/// nothing measured that path. Reading the fields once and branching afterwards
+/// is both the fix and the removal of a second copy of this field arithmetic
+/// (`CLAUDE.md` §7).
+///
+/// `ttl_bits` is deliberately raw. An OPT record's TTL field is not a TTL — it
+/// packs the extended RCODE, the EDNS version and the DO bit — so the clamp of
+/// RFC 2181 §8 belongs to whichever branch knows it is holding a real record.
+struct RecordParts<'a> {
+    name: String,
+    rtype: Rtype,
+    class: u16,
+    ttl_bits: i32,
+    rdata: &'a [u8],
+}
+
+fn read_record_parts<'a>(
+    data: &'a [u8],
+    unpacker: &DNameUnpacker<'a>,
+) -> Result<(RecordParts<'a>, &'a [u8]), WireError> {
+    let (name, rest) = dname_from_bytes(data, unpacker)?;
+    let (rtype, rest) = read_be!(u16, rest);
+    let (class, rest) = read_be!(u16, rest);
+    let (ttl_bits, rest) = read_be!(i32, rest);
+    let (rdatalen, rest) = read_be!(u16, rest);
+    // RDLENGTH is attacker-chosen and every other length in this file is
+    // checked before it is used — `read_be!` checks its own bytes,
+    // `Label::try_from_bytes` checks before slicing, `walk_options` checks each
+    // option. This one was not, and a record declaring more RDATA than the
+    // message carries panicked the parser on a bare slice. That is reachable
+    // before any authentication on both transports, in `rdnsr` where no
+    // validator runs at all, and from a primary during a transfer — where it
+    // kills a replication task that is never restarted, so the zone silently
+    // stops refreshing until EXPIRE. `split_at` cannot be used until the length
+    // is known good, which is the whole point.
+    let rdatalen = rdatalen as usize;
+    if rest.len() < rdatalen {
+        return Err(WireError::Truncated {
+            what: "RDATA",
+            need: rdatalen,
+            have: rest.len(),
+        });
+    }
+    let (rdata, rest) = rest.split_at(rdatalen);
+    Ok((
+        RecordParts {
+            name,
+            rtype: Rtype::new(rtype),
+            class,
+            ttl_bits,
+            rdata,
+        },
+        rest,
+    ))
+}
+
 impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
     type Output = (ResourceRecord, &'a [u8]);
     type Error = WireError;
@@ -1448,45 +1511,21 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
         data: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<<Self as TryUnpackFromBytes<'a>>::Output, Self::Error> {
-        let (name, rest) = dname_from_bytes(data, unpacker)?;
-        let (record_type, rest) = read_be!(u16, rest);
-        let record_type = Rtype::new(record_type);
-        let (class, rest) = read_be!(u16, rest);
-        let class = Class::new(class);
-        let (ttl, rest) = read_be!(i32, rest);
-        // Clamped here, once, and nowhere else (RFC 2181 §8). See [`Ttl`].
-        let ttl = Ttl::from_wire(ttl);
-        let (rdatalen, rest) = read_be!(u16, rest);
-        // RDLENGTH is attacker-chosen and every other length in this file is
-        // checked before it is used — `read_be!` checks its own bytes,
-        // `Label::try_from_bytes` checks before slicing, `parse_options` checks
-        // each option. This one was not, and a record declaring more RDATA than
-        // the message carries panicked the parser on a bare slice. That is
-        // reachable before any authentication on both transports, in `rdnsr`
-        // where no validator runs at all, and from a primary during a transfer —
-        // where it kills a replication task that is never restarted, so the zone
-        // silently stops refreshing until EXPIRE. `split_at` cannot be used
-        // until the length is known good, which is the whole point.
-        let rdatalen = rdatalen as usize;
-        if rest.len() < rdatalen {
-            return Err(WireError::Truncated {
-                what: "RDATA",
-                need: rdatalen,
-                have: rest.len(),
-            });
-        }
-        let (rdata, rest) = rest.split_at(rdatalen);
+        let (parts, rest) = read_record_parts(data, unpacker)?;
+        Ok((ResourceRecord::from_parts(parts, unpacker)?, rest))
+    }
+}
 
-        let rdata = RecordData::from_wire(record_type, rdata, unpacker)?;
-        Ok((
-            Self {
-                name,
-                class,
-                ttl,
-                rdata,
-            },
-            rest,
-        ))
+impl ResourceRecord {
+    /// Assemble a record from its wire fields. This is where a real record's
+    /// TTL is clamped (RFC 2181 §8) — see [`RecordParts::ttl_bits`].
+    fn from_parts(parts: RecordParts<'_>, unpacker: &DNameUnpacker<'_>) -> Result<Self, WireError> {
+        Ok(ResourceRecord {
+            name: parts.name,
+            class: Class::new(parts.class),
+            ttl: Ttl::from_wire(parts.ttl_bits),
+            rdata: RecordData::from_wire(parts.rtype, parts.rdata, unpacker)?,
+        })
     }
 }
 
@@ -1516,40 +1555,27 @@ impl Additional {
         data: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<(Additional, &'a [u8]), WireError> {
-        // Peek the TYPE without consuming: NAME, then the 16-bit TYPE.
-        let (_, after_name) = dname_from_bytes(data, unpacker)?;
-        let (rtype, _) = read_be!(u16, after_name);
-        if Rtype::new(rtype) != OPT_RECORD_TYPE {
-            let (rr, rest) = ResourceRecord::try_from_bytes(data, unpacker)?;
-            return Ok((Additional::Record(rr), rest));
+        let (parts, rest) = read_record_parts(data, unpacker)?;
+        if parts.rtype != OPT_RECORD_TYPE {
+            return Ok((
+                Additional::Record(ResourceRecord::from_parts(parts, unpacker)?),
+                rest,
+            ));
         }
-
-        // NAME (root, but whatever arrived), TYPE, CLASS = payload size,
-        // TTL = flags, RDLENGTH, RDATA = the option list.
-        let (_, rest) = dname_from_bytes(data, unpacker)?;
-        let (_rtype, rest) = read_be!(u16, rest);
-        let (udp_payload_size, rest) = read_be!(u16, rest);
-        let (flags, rest) = read_be!(u32, rest);
-        let (rdatalen, rest) = read_be!(u16, rest);
-        let rdatalen = rdatalen as usize;
-        if rest.len() < rdatalen {
-            return Err(WireError::Truncated {
-                what: "OPT RDATA",
-                need: rdatalen,
-                have: rest.len(),
-            });
-        }
-        let (rdata, rest) = rest.split_at(rdatalen);
+        // CLASS is the requestor's UDP payload size and TTL is a flags word
+        // (RFC 6891 §6.1.3). Neither goes through `Class` or `Ttl`, because
+        // neither is one.
+        let flags = parts.ttl_bits as u32;
         Ok((
             Additional::Opt(
                 Edns {
-                    udp_payload_size,
+                    udp_payload_size: parts.class,
                     version: ((flags >> 16) & 0xff) as u8,
                     do_bit: (flags & 0x8000) != 0,
                     // The extended RCODE's high byte lives in the top of
                     // `flags` and is *not* kept here: it is a property of the
                     // message, so `DnsMessage` reassembles it into `rcode`.
-                    rdata: rdata.to_vec().into_boxed_slice(),
+                    rdata: parts.rdata.to_vec().into_boxed_slice(),
                 },
                 flags,
             ),

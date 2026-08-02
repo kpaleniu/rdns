@@ -11,6 +11,7 @@
 //! a fence on every query.
 
 use crate::utils::record_types as rt;
+use crate::utils::NameKeyBuf;
 use crate::Qtype;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -130,7 +131,7 @@ pub struct DnsMetrics {
     /// Not bounded, and it does not need to be (`CLAUDE.md` §5): the key space
     /// is zone names from the configuration, not anything a client can put on
     /// the wire.
-    zones: Arc<RwLock<BTreeMap<String, ZoneGauge>>>,
+    zones: Arc<RwLock<BTreeMap<NameKeyBuf, ZoneGauge>>>,
 
     // Record type counters
     pub queries_type_a: Arc<AtomicU64>,
@@ -231,7 +232,7 @@ impl DnsMetrics {
             // would be absurd (`CLAUDE.md` §6).
             return;
         };
-        zones.entry(zone.to_string()).or_default().serial = serial;
+        zones.entry(NameKeyBuf::new(zone)).or_default().serial = serial;
     }
 
     /// Record that `zone` was in contact with its master at `at` (Unix seconds).
@@ -239,7 +240,10 @@ impl DnsMetrics {
         let Ok(mut zones) = self.zones.write() else {
             return;
         };
-        zones.entry(zone.to_string()).or_default().last_transfer = Some(at);
+        zones
+            .entry(NameKeyBuf::new(zone))
+            .or_default()
+            .last_transfer = Some(at);
     }
 
     /// Stop reporting `zone` — it was removed from the configuration, or
@@ -273,7 +277,7 @@ impl DnsMetrics {
         zones
             .iter()
             .map(|(zone, gauge)| ZoneFacts {
-                zone: zone.clone(),
+                zone: zone.to_string(),
                 serial: gauge.serial,
                 last_transfer: gauge.last_transfer,
             })
@@ -285,7 +289,7 @@ impl DnsMetrics {
         let Ok(mut zones) = self.zones.write() else {
             return;
         };
-        zones.retain(|name, _| keep.iter().any(|k| k.eq_ignore_ascii_case(name)));
+        zones.retain(|name, _| keep.iter().any(|k| k.eq_ignore_ascii_case(name.as_str())));
     }
 
     /// Track query type.
@@ -485,7 +489,7 @@ impl DnsMetrics {
             for (zone, gauge) in zones.iter() {
                 output.push_str(&format!(
                     "dns_zone_serial{{zone=\"{}\"}} {}\n",
-                    escape_label(zone),
+                    escape_label(zone.as_str()),
                     gauge.serial
                 ));
             }
@@ -511,7 +515,7 @@ impl DnsMetrics {
                 if let Some(at) = gauge.last_transfer {
                     output.push_str(&format!(
                         "dns_zone_last_refresh_timestamp_seconds{{zone=\"{}\"}} {at}\n",
-                        escape_label(zone)
+                        escape_label(zone.as_str())
                     ));
                 }
             }

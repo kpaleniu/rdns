@@ -2083,6 +2083,29 @@ impl Server {
             return;
         };
 
+        // A response is not a question (`CLAUDE.md` §8). `RequestValidator`
+        // deliberately accepts QR=1 — it is used on both directions of the wire
+        // — so the check belongs here, where we know the packet arrived at a
+        // listening socket.
+        //
+        // **This was missing on UDP only**, which is the transport it matters
+        // on: `fn answer`, the TCP path, has had the same check since the rule
+        // was written, and this one was never given it. Two servers pointed at
+        // each other, or one spoofed datagram naming another server as its
+        // source, was a packet loop neither end could see — and unlike TCP,
+        // nothing about UDP makes the peer prove its address first. The rule
+        // says "on both daemons"; `rdnsr` has one `handle_query` for both of its
+        // transports and so could not drift, while `rdnsd` has two answering
+        // paths and did (`CLAUDE.md` §7 — the second copy is where the bug is).
+        if msg.response {
+            bad_request!(
+                logger,
+                peer.ip(),
+                "a response was sent to a server port; dropped"
+            );
+            return;
+        }
+
         // Log successful query parsing
         let qtype = msg.queries.first().map(|q| q.qtype);
         logger.log_query(peer.ip(), qtype);
@@ -4660,6 +4683,38 @@ mod tests {
                 .await
                 .expect("the worker joins")
                 .expect("no io error");
+        }
+
+        /// A response sent to the UDP port must not be answered.
+        ///
+        /// `CLAUDE.md` §8: "A response is not a question. Test QR before doing
+        /// anything with a packet that arrived at a listening socket, **on both
+        /// daemons**. Two servers pointed at each other, or one spoofed
+        /// datagram, is otherwise a packet loop neither end can see."
+        ///
+        /// `fn answer` — the TCP path — makes that test. `answer_datagram` does
+        /// not, and UDP is the transport where a spoofed source and a packet
+        /// loop actually matter.
+        #[tokio::test]
+        async fn a_response_to_the_udp_port_is_not_answered() {
+            let server = server_with(one_record_zone());
+            let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+            let peer = client.local_addr().expect("addr");
+
+            let mut msg = query("www.example.com.", Qtype::of(record_types::A), false);
+            msg.response = true; // QR=1: this is somebody's answer, not a question.
+            let packet = msg.to_bytes_within(4096).expect("serialize");
+
+            let mut scratch = Vec::new();
+            server
+                .answer_datagram(&packet, peer, &socket, &mut scratch)
+                .await;
+
+            assert!(
+                scratch.is_empty(),
+                "a QR=1 datagram was answered; two such servers pointed at each                  other are a packet loop"
+            );
         }
 
         /// The response buffer is the worker's, not the datagram's.
