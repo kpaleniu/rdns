@@ -579,8 +579,13 @@ from the code (`ixfr.rs:16` points at "#7 step 6") and from each other, so they
 are never renumbered.
 
 **#14 and #16 are closed; #15 is withdrawn; #7 and #10 closed on 2026-08-03.
-**One thing is open** and the table is where it is: #11, a stretch goal blocked
-on hardware counters this machine cannot read.
+**One thing is open** and the table is where it is: **#22**, filed 2026-08-04 as
+the redirect #11 produced — the zone lookup turned out to be hash-bound rather
+than cache-bound.
+
+~~#11, a stretch goal blocked on hardware counters this machine cannot read~~ —
+**answered no on 2026-08-04**, and the blocker did not exist: the Linux side has a
+virtualized core PMU, and the question was settled with cachegrind anyway.
 
 **#21 is not open work**, it is the inventory: the four deviations from the RFCs
 this code makes on purpose, and the list of things not implemented. Neither was
@@ -621,7 +626,8 @@ it, and the rule it became in `CLAUDE.md`:
 | **8** | what signing turned up — the re-signing timer and its serial | done |
 | **9** | what a five-way review found: 48 defects in six groups (9a-9f) | **all done, 2026-07-27 → 2026-08-01.** The patterns became `CLAUDE.md`, which is the useful artefact; the 2,435 lines of finding text are in `git log -p TODO.md` |
 | **10** | dynamic UPDATE (RFC 2136) | **done 2026-08-03**, seven commits. Reading (`2f94124`, `1461036`), applying and the serial (`dcfe861`), authorization (`9051d4e`), dispatch and persistence (`8169f0d`). Incremental re-signing (`3b2886a`) and the journal (#7 step 6) closed it |
-| **11** | data layout and CPU cache friendliness | **a stretch goal, not scheduled.** Its measurement harness exists now (criterion, `--baseline`); what it still lacks is the *diagnostic* half — `perf stat`'s cache-miss and branch-miss counters, which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns) is the number it would have to move |
+| **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
+| **11** | data layout and CPU cache friendliness | **answered no 2026-08-04.** Measured with cachegrind: a miss costs 2,786 instructions and under 0.08 D1 misses, a hit 1,052 and 6.4 — all L2-resident, zero LL misses either way. There is no pointer chase to remove. The `perf` blocker it carried for months was checked and did not exist; the probe is `rdns/examples/zone_lookup_probe.rs` |
 | **14** | three candidates #13 left on the table: `Serial`, QR as a type, sealing `RecordData` | **all three done 2026-08-02**, one commit each. 14a removed the second copy of RFC 1982 §3.2 and made `a > b` on two serials a compile error; 14b put all three socket entry points behind one `Request` door; 14c sealed `RecordData` into its own module — and, by asking what invariant it actually holds, found that a legal RFC 2136 UPDATE could not be parsed at all. 14a and 14b are preventative and say so; 14c's finding is under #10, with a regression test watched failing |
 | **16** | simplifications: `Nsec3`'s fallibility, splitting `parse_into`, and a duplication that must stay | **16b done, 16a corrected-and-withdrawn, 16c recorded as not-to-fix, 2026-08-02.** 16a is the interesting one: the filed plan did not survive being checked against `nsec3_hash` and is kept struck through with the reasoning, but the pass it came from found a live defect in `proves_no_ds`. Three more defects in `parse_dnssec_time` fell out of the same sweep |
 | **15** | collapsing `DName`/`UnpackedDName` into one borrowed, pointer-following `DName` | **withdrawn 2026-08-03**, filed 2026-08-02 and never started. Reviewed against the code rather than the plan: the typestate is already invisible outside `dname.rs`, the volume breaks even, the allocation motive was spent before it was filed, and the price is threading absolute offsets through every parse site — declined. The section keeps the three findings and the two fixes the review *did* produce (the unenforced 255-octet name limit, the LDH `TODO` that would have been a bug) |
@@ -659,9 +665,35 @@ the useful part** (`CLAUDE.md` §11 — correct in place, never quietly):
   libtest's own bookkeeping on its other threads, which is why
   `rdns/tests/allocations.rs` is one `#[test]` today.
 
-**One decision is the copyright holder's, not a bug:** the manifests say
+~~**One decision is the copyright holder's, not a bug:** the manifests say
 `MIT OR Apache-2.0` and the repository ships only an MIT `LICENSE`. Either add
-`LICENSE-APACHE` or narrow the manifests. `cargo deny` passes either way.
+`LICENSE-APACHE` or narrow the manifests. `cargo deny` passes either way.~~
+
+**Taken 2026-08-04: narrowed to MIT.** `license = "MIT"` in the workspace
+manifest, which is the one place it is declared — the five crate manifests all
+say `license.workspace = true`.
+
+Checked before changing it, because "can I" is a different question from "should
+I":
+
+- **Sole human author** (`git log --format='%an'`), so nobody else's consent is
+  in play — and it would not have been anyway: narrowing from `A OR B` to `A`
+  takes away no permission anyone previously had, since every past version
+  already offered MIT as one of two choices.
+- **No copyleft or reciprocal dependency.** 138 third-party crates, all
+  permissive; the audit is in the commit. Nothing forces a licence on the
+  combined work.
+- **No vendored third-party source** — no foreign copyright header or
+  `SPDX-License-Identifier` anywhere in the tracked tree, so there is no code
+  here carrying obligations of its own.
+
+**What it costs, which is the only thing that changes for a user:** Apache-2.0 §3
+grants patent rights expressly and MIT does not. That grant is why the Rust
+ecosystem dual-licenses by default, and dropping it is the substance of this
+decision rather than a side effect of tidying a manifest.
+
+`deny.toml` is untouched: its allow-list is about what *dependencies* may be
+licensed under, which this does not affect.
 
 ### Where to pick up next
 
@@ -1022,24 +1054,164 @@ estimate priced the decisions rather than the code, which is usually right, and
 missed that this codebase had made most of those decisions already. The one it
 under-priced was the item filed as trivial.
 
-### 11. Data layout and CPU cache friendliness — a stretch goal, on purpose
+### 11. Data layout and CPU cache friendliness — **answered no, 2026-08-04**
 
 Wanted because it was asked for, not because a measurement demanded it. The
 zone index is a `HashMap<String, Vec<usize>>` into one record vector; the
 question is whether a layout with fewer pointer chases per lookup is worth
 having.
 
-**The prerequisite is met and the blocker is not.** `cargo bench -p rdns` with
-`--save-baseline`/`--baseline` can now judge a single-digit-percent change, which
-is what this needs and what `bench.rs` could never give. What is still missing is
-the *diagnostic* half: cache misses and branch mispredicts per query, which means
-`perf stat` on Linux, since the Windows box this was developed on has no
-equivalent worth trusting. Without it, any change here is a guess with a
-stopwatch attached.
+**The answer is no, and the measurement is what says so.** `rdns/examples/zone_lookup_probe.rs`
+under cachegrind, per lookup, setup cancelled by subtracting an `n=100_000` run
+from an `n=200_000` one:
 
-`zone/miss in a 10k-record zone` (159 ns) is the number it would have to move,
-and "Current state" has the context that decides whether moving it matters: the
-whole answer is 522 ns against a 4 µs syscall pair.
+| | instructions | cond. branches | D1 read misses | LL read misses |
+|---|---|---|---|---|
+| **hit** | 1,052 | 122 | 6.4 | **0** |
+| **miss** | 2,786 | 338 | **< 0.08** | **0** |
+
+**On the miss path there is no pointer chase to remove.** That is the path this
+item was about — `benches/answer_path.rs` calls the miss "the one to watch: it is
+what a random-name flood produces, and the case #11 would move, if anything
+does" — and it touches essentially no memory. A miss costs 2.6× a hit in
+instructions while costing *less* in cache.
+
+**On the hit path there is a real chase, and it is already free.** 6.4 D1 read
+misses walking `index` → `Vec<usize>` → `records[i]`, every one served by L2:
+the LL miss count is identical to the digit across every run at both sizes. A
+10k-record zone fits, so the layout question answers itself.
+
+#### Where the time actually goes
+
+`cg_annotate` on the miss run: **SipHash is 19.8% of every instruction executed
+and 23.2% of every branch mispredict.** `name_kind_of_key` is 3.2% and
+`lookup_key` 2.1%.
+
+The reason is the shape of a miss, not the shape of the data. `name_kind_of_key`
+probes `index`, then `non_terminals`, then walks up the name probing both again
+at each level, then `format!`s a `*.encloser` key and probes once more — five or
+six hashes of a ~25-octet string, plus an allocation, before it can say "no".
+
+So the useful output of this item is a **redirect**, which `CLAUDE.md` §10 says is
+worth as much as a finding: the cost is hashes per miss, and it is filed as #22.
+
+#### The callgrind pass, and the 31.8% it found — 2026-08-04
+
+Cachegrind says what a lookup costs; **callgrind says how many times and from
+where**, which is what turned the redirect into a change. Collected with
+`--collect-atstart=no --toggle-collect='*probe_loop*'` so setup is excluded by
+instrumentation rather than subtraction — and the two methods agree to the
+instruction, 2,786 Ir per miss either way, which is the cross-check that makes
+both believable.
+
+| | Ir/miss | share |
+|---|---|---|
+| `name_kind_of_key` (inclusive) | 2,411 | **86.5%** |
+| `format!("*.{encloser}")` | 454 | **16.3%** |
+| `lookup_key` | 294 | 10.6% |
+| `is_at_or_under` | 227 | 8.2% |
+| `delegation_for_key` | 181 | 6.5% |
+
+**`hash_one::<&str>` is called exactly three times per miss** — 60,000 for 20,000
+lookups, from three distinct sites. §11's first write-up said "five or six", read
+off the code the day before; that is corrected in place here and in the probe,
+because the wrong guess is precisely why the callgrind pass was worth running.
+Call counts are the one thing cachegrind cannot give.
+
+**What that bought: `Zone::has_wildcards`, and 31.8% off the miss path.** Once
+`name_kind_of_key` has found the closest encloser, both remaining branches — a
+delegation between there and the apex, or no `*` below the encloser — end in
+`NameKind::NotFound`. So for a zone holding no wildcard at all, the `format!`,
+the delegation lookup and one of the three hashes are dead work with a single
+possible outcome. One `bool`, maintained in `add_record` and rebuilt in
+`reindex`, skips them:
+
+- **miss: 2,786 → 1,900 Ir, −31.8%**
+- **hit: 1,052 → 1,052 Ir**, unchanged to the instruction, because a hit returns
+  `Exact` before the walk begins.
+
+No security dimension and no tradeoff — it removes work that provably cannot
+change an answer. A zone that *does* hold a wildcard pays one predictable branch
+and behaves exactly as before.
+
+**Watched failing**, per §1: forcing the short-circuit to fire unconditionally
+breaks **10 tests across four modules** — `zone`, `dnssec_answer`, `update` and
+`rdnsd`'s answer path — so the suite genuinely guards it rather than merely
+passing alongside it.
+
+#### Two things about the method worth keeping
+
+**The blocker this item carried for months did not exist.** It said `perf stat`
+was needed and "the Windows box this was developed on has no equivalent worth
+trusting". Checked on 2026-08-04: the Linux side (kernel 6.18) has a virtualized
+core PMU and `perf stat -e cycles,instructions,cache-misses,branch-misses`
+returns real counts. What is *not* exposed is the uncore — no `amd_l3`, and
+`LLC-loads` reports "not supported" — so `perf` could not have answered the L3
+half of the question here regardless. **Neither could VTune**, which is Intel-only
+for PMU work and collects nothing microarchitectural on this Zen 5 part; the AMD
+counterpart is uProf, and the only thing it adds is those uncore events.
+
+Which would have measured nothing anyway, and that is the second thing: this
+machine is a **9800X3D with 96 MiB of L3**. A 10k-record zone never leaves last
+level cache, so a real LLC counter reads ~0 whatever the layout is. Cachegrind
+simulates the cache it is told to, which is why it could answer a question the
+hardware on this desk cannot. It is also deterministic, which matters more —
+except where it turned out not to be:
+
+**The miss-path D1 figure is a bound, not a measurement, and the write-up says so
+rather than quoting a point estimate.** `HashMap`'s `RandomState` reseeds per
+process, so the probe sequence and therefore the lines touched differ run to run:
+three identical runs spread **7,776** D1 read misses against a signal of 3,630.
+The signal was under the noise. §10's rule about checking a count is stable
+before trusting it, applied to a count that was not — and the conclusion survives
+because a cost beneath its own measurement floor is not one to restructure a data
+layout for. Tightening it means giving `Zone` a fixed-seed `BuildHasher`, which
+changes the type under test and was not worth it for an answer already decisive.
+
+**What is *not* claimed:** that this generalizes off this machine. 96 MiB of L3
+is unusual; on a 32 MiB server part a larger zone could genuinely miss to memory,
+and the hit path's 6.4 L2-resident misses could become LL misses that cost real
+time. The measurement above is about a 10k-record zone on this desk. The probe is
+kept so the next person can re-run it somewhere else rather than re-derive it.
+
+---
+
+### 22. The zone lookup is hash-bound — filed 2026-08-04 from #11
+
+**Filed as a redirect rather than found as a defect.** #11 went looking for cache
+misses and found that a miss lookup spends its time in SipHash: 19.8% of all
+instructions and 23.2% of all branch mispredicts in that run, across the ~~five
+or six~~ **three** hashes `name_kind_of_key` performs before it can answer "no".
+(Callgrind counted them the next day; the estimate had been read off the code.)
+
+**Partly closed 2026-08-03 by `Zone::has_wildcards`**, which removed one of those
+three hashes along with the `format!` and the delegation lookup behind it — 31.8%
+off the miss path, measured. See #11. What is below is what is left.
+
+Two directions, and the first is much safer than the second.
+
+- [ ] **Fewer hashes per miss — the half that is left.** `node_exists` asks
+      `index` and `non_terminals` separately at every level, and the two could be
+      one lookup into a map whose value says which kind of node it is. That is
+      the remaining redundant hash. The `format!` half is done (see #11), so what
+      is left is worth measuring before it is worth doing: on a zone with no
+      wildcards the walk is now 1,900 Ir and this would take perhaps a further
+      200. **No security dimension**, and it keeps the hash function's guarantees
+      while doing less work.
+- [ ] **A faster hasher — and this one is a decision, not an optimization.**
+      SipHash is chosen for HashDoS resistance and the seed is random per
+      process. Swapping in FxHash or aHash would take a large bite out of that
+      19.8%, and it would also make bucket assignment predictable to anyone who
+      knows the zone's contents. The keys are the operator's names and the
+      *lookups* are attacker-chosen, which is the weaker of the two exposures —
+      an attacker cannot insert colliding keys, only aim probes at a bucket they
+      have worked out — but "weaker" is not "none", and this codebase has a rule
+      about which way a bound fails (`CLAUDE.md` §5). **Do not take this one
+      without writing down the threat model**, and measure it against the first
+      item rather than instead of it.
+
+Re-measure with `rdns/examples/zone_lookup_probe.rs`, which is what produced the
+numbers above and prints nothing that would need re-deriving.
 
 ### 12. Pre-authentication panics — audited 2026-08-01
 

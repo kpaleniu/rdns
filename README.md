@@ -621,6 +621,26 @@ disk so a restart does not drop every secondary to a full transfer.
 
 ## Licence
 
-The manifests say `MIT OR Apache-2.0` and the repository ships only an MIT
-`LICENSE`. That is a discrepancy the copyright holder has to resolve — either add
-`LICENSE-APACHE` or narrow the manifests.
+**MIT**, and only MIT. `LICENSE` is the text; `license = "MIT"` in the workspace
+manifest is the declaration; the container image carries the notice at
+`/usr/share/licenses/rdns/LICENSE`, because an image is a distribution and the
+MIT terms ask for the notice to travel with it.
+
+The manifests used to say `MIT OR Apache-2.0` while the repository shipped only
+an MIT `LICENSE` — the Rust ecosystem's default dual licence, left in place from
+`cargo new`. Resolved on 2026-08-04 by narrowing rather than by adding
+`LICENSE-APACHE`, which is the copyright holder's call and was taken
+deliberately.
+
+**What narrowing costs, stated because it is the only thing that changes for a
+user:** Apache-2.0 §3 grants patent rights expressly and MIT does not. That
+grant is the usual reason Rust projects dual-license, so anyone who was relying
+on it no longer has it. Nothing else moves — MIT was already one of the two
+options every previous version offered, so no past release is affected and no
+downstream use that was permitted becomes impermissible.
+
+Dependency licences are a separate question and unchanged: 138 third-party
+crates, all permissive (MIT, Apache-2.0, BSD, ISC, Unlicense, Zlib, Unicode-3.0),
+with no copyleft anywhere. `deny.toml`'s allow-list governs those and is not
+affected by this. They keep their own terms; `ring` in particular is
+`Apache-2.0 AND ISC` and its notices ride with it.

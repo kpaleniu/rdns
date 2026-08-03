@@ -59,6 +59,27 @@ pub struct Zone {
     /// path — the same mistake the name index exists to have fixed.
     nsec_chain: BTreeMap<Vec<u8>, usize>,
     nsec3_chain: BTreeMap<Vec<u8>, usize>,
+    /// Whether any record in this zone is owned by a wildcard name.
+    ///
+    /// **A cache of "is the closest-encloser walk allowed to synthesize", and it
+    /// pays for itself on the path that never synthesizes.** Once
+    /// [`Zone::name_kind_of_key`] has found the closest encloser, both remaining
+    /// branches — a delegation between here and the apex, or no `*` below the
+    /// encloser — end in [`NameKind::NotFound`]. So for a zone holding no
+    /// wildcard at all, that whole tail is `NotFound` and everything it does to
+    /// get there is dead work.
+    ///
+    /// Measured with `examples/zone_lookup_probe.rs` under callgrind before this
+    /// existed: on a miss in a 10k-record zone with no wildcards, the
+    /// `format!("*.{encloser}")` alone was **16.3%** of the lookup and
+    /// `delegation_for_key` a further **6.5%**, plus one of the three SipHash
+    /// invocations. `TODO.md` #11 has the numbers.
+    ///
+    /// It is a `bool` rather than a count because nothing needs to know how
+    /// many: the question is only whether synthesis is possible at all, and a
+    /// count would have to be maintained on a removal path `Zone` deliberately
+    /// does not have.
+    has_wildcards: bool,
     /// Every ancestor, up to the apex, of a name that is in `index` — the names
     /// that exist because something below them does.
     ///
@@ -108,6 +129,7 @@ impl Zone {
             index: HashMap::new(),
             nsec_chain: BTreeMap::new(),
             nsec3_chain: BTreeMap::new(),
+            has_wildcards: false,
             non_terminals: HashSet::new(),
         }
     }
@@ -141,6 +163,7 @@ impl Zone {
         // and the two statements after this one need `&mut self`.
         let key = self.lookup_key(&record.name).into_owned();
         let position = self.records.len();
+        self.has_wildcards |= key.starts_with("*.");
         self.note_non_terminals(&key);
         self.index
             .entry(NameKeyBuf::from_folded(key))
@@ -323,6 +346,13 @@ impl Zone {
             // it is the child's data, not ours (RFC 4592 §2.2.1) — so a
             // delegation between here and the apex means no synthesis at all,
             // and the caller owes a referral instead.
+            // Nothing below here can synthesize, so both remaining answers are
+            // `NotFound` and the work to tell them apart is work with one
+            // outcome. See [`Zone::has_wildcards`] for what that costs on a
+            // miss when it is not skipped.
+            if !self.has_wildcards {
+                return NameKind::NotFound;
+            }
             if self.delegation_for_key(encloser).is_some() {
                 return NameKind::NotFound;
             }
@@ -443,7 +473,12 @@ impl Zone {
             .collect();
         self.index.clear();
         self.non_terminals.clear();
+        // Rebuilt rather than carried: `set_origin` can turn a relative `*`
+        // into an absolute wildcard name, so the answer is a function of the
+        // keys and has to be recomputed with them.
+        self.has_wildcards = false;
         for (position, key) in keys.into_iter().enumerate() {
+            self.has_wildcards |= key.starts_with("*.");
             self.note_non_terminals(&key);
             self.index
                 .entry(NameKeyBuf::from_folded(key))

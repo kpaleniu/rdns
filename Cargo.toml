@@ -16,7 +16,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 # Pinned so a build that would fail on the toolchain the README promises fails in
 # CI rather than at a user. Verified by the `msrv` job, not asserted.
 rust-version = "1.95"
