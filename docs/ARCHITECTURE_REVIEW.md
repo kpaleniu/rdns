@@ -29,7 +29,7 @@ and the reasoning that found it, is the half worth keeping (`CLAUDE.md` §11).
 | **A3** `zone_signer` shadows `is_at_or_under` | fixed, `85c864c` — #19b |
 | **A4** broken string literal | fixed, `85c864c` — #19h |
 | **B1** the operational shell | fixed, `b523861` — #18 |
-| **B2** `main.rs` is eleven subsystems | **open, and never filed.** Now `TODO.md` #20 |
+| **B2** `main.rs` is eleven subsystems | fixed, `0748111`+`e51659b`+`e756a6a` — #20. Two corrections to the plan on the way |
 | **B3** six copies of `fn absolute` | fixed, `85c864c` — #19c |
 | **B4** three metrics nothing increments | fixed, `b523861` — #19d, by moving them to `rdnsr` |
 | **B5** `RequestValidator` duplicates the parser | fixed, `85c864c` — #19e, and renamed `AdmissionCheck` |
@@ -255,7 +255,10 @@ here.
 
 ### B2. `rdnsd/src/main.rs` is 4 316 lines of code and eleven subsystems
 
-> **The one finding here that is still open, and it was never filed.** #17, #18
+> **Done 2026-08-03** — see `TODO.md` #20 for the two plan corrections it needed.
+> The note below is as filed.
+>
+> **The one finding here that was still open, and was never filed.** #17, #18
 > and #19 took the rest; this fell between them because it is not a defect and
 > has no natural sub-item. Filed as `TODO.md` #20 on 2026-08-03. The number in
 > the heading is also now low: the file is **8 340 lines** after dynamic UPDATE

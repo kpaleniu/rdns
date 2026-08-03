@@ -579,10 +579,8 @@ from the code (`ixfr.rs:16` points at "#7 step 6") and from each other, so they
 are never renumbered.
 
 **#14 and #16 are closed; #15 is withdrawn; #7 and #10 closed on 2026-08-03.
-**Two things are open** and the table is where they are: #11, a stretch goal
-blocked on hardware counters this machine cannot read, and **#20**, filed
-2026-08-03 from the architecture review's B2 — the one finding of that review
-that never got a number when #17, #18 and #19 took the rest.
+**One thing is open** and the table is where it is: #11, a stretch goal blocked
+on hardware counters this machine cannot read.
 
 **#21 is not open work**, it is the inventory: the four deviations from the RFCs
 this code makes on purpose, and the list of things not implemented. Neither was
@@ -632,7 +630,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **17** | the TCP length prefix wraps to 0 on a TSIG-signed answer near 64 KB, and the framing is written out five times | **fixed 2026-08-03.** The one confirmed bug of the review — provoked, not argued: a wrapped prefix of 0 is what both read loops treat as a broken peer, so the client's connection is dropped with no answer. `append_tsig` is what pushes a message past the size it was serialized to |
 | **18** | `rdnsr` has none of the operational shell — no rate limiter, no response budget, no logger, no metrics, no probes, no validator | **fixed 2026-08-03.** Seven library facilities `rdnsd` uses and `rdnsr` does not, all of them tested and reachable. The asymmetry runs the wrong way round: the resolver is the more amplifying of the two and the unobservable one. Probably #9d being scoped to `rdnsd` |
 | **21** | the deviations and the not-implemented list | **an inventory, not a queue**, filed 2026-08-03. Four deliberate deviations (D-1, D-5, D-6, D-7) and eight unimplemented things, each with the decision that produced it. Names the two worth reopening if anything here ever is: D-1's cost is the argument #15 was *not* withdrawn against, and DNAME is the only absence that produces a wrong answer rather than an incomplete one |
-| **20** | `rdnsd/src/main.rs` is one file and eleven subsystems | **open, filed 2026-08-03** from the architecture review's B2, which had no `TODO` number until now. Not a defect — three seams that already exist and would lift cleanly, to be moved with no behaviour change |
+| **20** | `rdnsd/src/main.rs` is one file and eleven subsystems | **done 2026-08-03**, one commit per seam: `answer.rs`, `zones.rs`, `replication.rs`. 8,328 → 5,956 lines, every move diffed against `HEAD` to prove it changed nothing. Two corrections to the filed plan, both from measuring what each name drags behind it |
 | **19** | the review's smaller items, 19a-19h | **closed 2026-08-03.** Five stragglers of consolidations that caught most copies and missed one (19a-19c, 19h), one duplicated check (19e), one candidate that may not be worth it (19f), and two documentation items (19g and the `#13e` correction below). Includes the list of what the pass checked and found *nothing* wrong with, which is the half of §16 that turned out to be most useful |
 
 **What the letters mean**, because comments in the code and lines further down
@@ -2891,7 +2889,7 @@ counted-not-read, which are still unread. One was met in passing —
 `expire_if_out_of_contact`'s `.expect("state mutex")` on the replication path —
 and left there rather than reporting a sample as a survey.
 
-### 20. `rdnsd/src/main.rs` is one file and eleven subsystems
+### 20. `rdnsd/src/main.rs` is one file and eleven subsystems — **done 2026-08-03**
 
 **Filed 2026-08-03**, from the architecture review's B2 — and filed late, which
 is the first thing worth recording about it. #17, #18 and #19 took every other
@@ -2928,7 +2926,7 @@ review, and that cost is paid by every future change rather than once.
 That leaves `main.rs` as the server struct, the two transport loops, the UPDATE
 path and startup.
 
-- [ ] **Do it as its own commit with no behaviour change** (`CLAUDE.md` §12's rule
+- [x] **Do it as its own commit with no behaviour change** (`CLAUDE.md` §12's rule
       about reformats, for the same reason: a move mixed into a behaviour change
       makes the diff unreviewable and the blame useless). The ~3,900 lines of
       tests move with the code they cover, which is most of the diff and most of
@@ -2953,6 +2951,50 @@ path and startup.
 or splitting `main.rs` further than these three. The argument here is about
 subsystems that have an owner and a lifetime, not about file length — the review
 led with the line count and that turned out to be the weakest part of its case.
+
+---
+
+**Done 2026-08-03**, one commit per seam: `0748111` (`answer.rs`), `e51659b`
+(`zones.rs`), `e756a6a` (`replication.rs`). `main.rs` 8,328 → 5,956 lines.
+
+**Every seam was verified content-preserving rather than assumed to be.** Each
+move was diffed against `git show HEAD:` with visibility markers stripped, and in
+all three the *only* difference was a signature rustfmt rewrapped because
+`pub(crate)` pushed it past 100 columns. The test inventory was compared the same
+way: 101 rdnsd tests before and after each seam, and after stripping module paths
+the lists match exactly. Doing this by eye would not have been convincing at 2,372
+lines moved.
+
+**Two corrections the plan needed**, both found by measuring rather than reading:
+
+- **The `zones.rs` list included the reload task** — `Reloading`, `ReloadTrigger`,
+  `reload_once`, `spawn_zone_maintenance`. Including them means the module reaches
+  back into `main` for **nine** things (signals, NOTIFY, `withdraw_unvouched_zones`);
+  excluding them, **two**. A reload is a *caller* of the zone-map lifecycle, not a
+  part of it. The filed list grouped by name and not by what each name drags
+  behind it, which is the same mistake in both corrections.
+- **The secondary tests could not travel with their code.** A secondary test needs
+  a live primary to fetch from, so it is built on `spawn_primary`, `served` and
+  `test_shutdown` — scaffolding around `Server`, which is `main`'s and is shared
+  with the transfer and UPDATE clusters. Moving them means relocating that harness
+  to a third place used by three clusters, which is a bigger change than the seam
+  and wants its own decision. `replication.rs` says so at the top, because the
+  harm the rule guards against is a reader concluding the file is untested.
+
+`testutil.rs` is the one thing the work *added*: `query` and `ScratchDir` were
+each used by two or three test clusters that now live in different files, so they
+needed a home that is neither. One thing in `query` was worth checking rather than
+tidying — it attaches an OPT record unconditionally and only moves the DO bit, so
+every test using it exercises `make_response`'s OPT-mirroring path. A neater
+version that attached the record only when DO was wanted would have quietly
+stopped testing that.
+
+**A hazard worth naming for next time:** deleting a function or a module leaves
+its doc comment behind, silently attached to whatever follows. It happened twice
+here — the `answer_path` banner would have ended up documenting the DNSSEC test
+module — and clippy only catches it when a blank line separates the two. `cargo
+fmt --check` caught one of them by accident. After any move, grep the seam for an
+orphaned `///`.
 
 ---
 
