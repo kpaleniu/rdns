@@ -6,17 +6,21 @@ use std::time::Duration;
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use rdns::dnssec_chain::{TrustAnchors, ValidationState};
-use rdns::logging::LogLevel;
+use rdns::logging::{LogLevel, QueryLogger};
+use rdns::metrics::{DnsMetrics, LatencyTimer};
+use rdns::metrics_server;
 use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
+use rdns::readiness::Readiness;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::rfc5011::{self, AnchorChange, ManagedAnchors};
+use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl};
 use rdns::shutdown::{stop_signal, Busy, Shutdown, Stop};
 use rdns::special_names;
 use rdns::utils::current_unix_timestamp;
 use rdns::utils::record_types;
 use rdns::utils::{recv_error_is_transient, UDP_RECEIVE_BUFFER};
-use rdns::validation::Request;
+use rdns::validation::{Request, RequestValidator};
 use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, Qtype, QuerySection, ResourceRecord, ResponseCode,
     EDNS_VERSION, OPT_RECORD_TYPE,
@@ -190,6 +194,107 @@ struct Cli {
     /// nothing else per-packet is above `debug`.
     #[arg(long, value_name = "QUERIES", default_value_t = MAX_INFLIGHT_UDP)]
     max_inflight_udp: usize,
+    /// Queries per second, per client address. 0 turns the limit off.
+    ///
+    /// **The default is 200 where `rdnsd`'s is 1000**, and the difference is the
+    /// point rather than an oversight. `rdnsd` is authoritative: its clients are
+    /// resolvers, and one resolver behind one address legitimately asks orders of
+    /// magnitude more than one person does. A recursive resolver's clients are
+    /// end users and their devices, so the same number would be a limit that
+    /// never fires.
+    ///
+    /// Stated in queries per second because that is the unit an operator thinks
+    /// in — `CLAUDE.md` §14, which exists because this was once "100 tokens per
+    /// 10-second window" and therefore silently ten a second.
+    #[arg(long, value_name = "QUERIES_PER_SEC", default_value = "200")]
+    query_rate: u32,
+    /// How many queries may arrive at once before `--query-rate` applies.
+    ///
+    /// A DNS client sends its queries in bursts by nature — one page load is
+    /// dozens of names at once — so a limiter with no burst allowance drops
+    /// traffic that is not a flood at all.
+    #[arg(long, value_name = "QUERIES", default_value = "100")]
+    query_burst: u32,
+    /// An address or CIDR prefix the query rate limit does not apply to,
+    /// repeatable.
+    ///
+    /// For a monitoring probe whose whole job is to query more often than a
+    /// client would, and for a forwarder in front of this one. Without it the
+    /// only way to spare a known-good source is to raise the limit for everybody.
+    #[arg(long, value_name = "ADDR|CIDR")]
+    query_rate_exempt: Vec<String>,
+    /// Response bytes per second, per client address. 0 turns the budget off.
+    ///
+    /// **A resolver needs this more than an authoritative server does**, which
+    /// is why the asymmetry that left it out ran the wrong way round
+    /// (`TODO.md` #18). A 30-byte query here can produce a 4 KB validated
+    /// answer, and `--dnssec-validate` makes that the ordinary case rather than
+    /// the exception. Meters what leaves rather than what arrives, because that
+    /// is what an amplification attack is made of, and applies to UDP only: a
+    /// TCP query has completed a handshake, so there is nobody to reflect at.
+    #[arg(long, value_name = "BYTES_PER_SEC", default_value = "8192")]
+    response_rate: u32,
+    /// Serve Prometheus metrics and a liveness probe on this address.
+    ///
+    /// **No `/readyz`, deliberately.** A resolver has nothing to wait for — no
+    /// zone has to arrive before it can answer — so a readiness probe would be a
+    /// liveness probe under another name. `/healthz` is the one that means
+    /// something here, and `metrics_server` serves `/readyz` too because it is
+    /// shared with `rdnsd`; it answers ready as soon as it is up.
+    #[arg(long, value_name = "ADDR:PORT")]
+    metrics_listen: Option<String>,
+}
+
+/// Everything the resolver needs that is not resolving.
+///
+/// One struct rather than five more parameters on `udp_main`, `tcp_main` and
+/// `handle_query` — `CLAUDE.md` §14, and clippy objects at seven for the same
+/// reason. They are grouped because they are one thing: the operational shell
+/// `TODO.md` #18 was filed about, all of it already in `rdns` and already tested,
+/// and none of it wired into this binary until now.
+struct Shell {
+    /// Queries per second per source. The bound is `RateLimiter`'s own, which
+    /// **allows** an untracked source rather than refusing it: failing closed
+    /// would let one flood deny service to everybody (`CLAUDE.md` §5).
+    limiter: Arc<RateLimiter>,
+    /// Response bytes per second per source, UDP only.
+    responses: Arc<ResponseLimiter>,
+    metrics: Arc<DnsMetrics>,
+    logger: Arc<QueryLogger>,
+    /// Size and section-count checks on the raw datagram, before anything is
+    /// parsed or admitted.
+    ///
+    /// **Wired in rather than declined**, which `TODO.md` #18 asked to be
+    /// decided out loud. The argument for leaving it out was never written down;
+    /// the argument for it is that it is a handful of comparisons on bytes that
+    /// have not been trusted yet, on the path where the cheapest possible
+    /// rejection is worth the most. A resolver is the more amplifying of the two
+    /// daemons, so it wants the pre-admission check at least as much.
+    validator: Arc<RequestValidator>,
+}
+
+impl Shell {
+    /// Count one answer leaving, by rcode, and record how long it took.
+    ///
+    /// **The rcodes counted are the ones an operator pages on for a resolver**,
+    /// which is not the same set as for an authoritative server: SERVFAIL
+    /// climbing here means upstream trouble or a validation failure, REFUSED
+    /// means something asked for what this resolver will not do, and NXDOMAIN is
+    /// ordinary traffic. `CLAUDE.md` §14 — a counter's name is a claim about
+    /// what it counts, so `queries_authoritative` is deliberately never touched:
+    /// this daemon is never authoritative for anything.
+    fn record_answer(&self, rcode: ResponseCode, timer: LatencyTimer) {
+        let metrics = &self.metrics;
+        metrics.count(&metrics.responses_sent);
+        match rcode {
+            ResponseCode::Ok => metrics.count(&metrics.responses_noerror),
+            ResponseCode::NoSuchDomain => metrics.count(&metrics.responses_nxdomain),
+            ResponseCode::ServerFailure => metrics.count(&metrics.responses_servfail),
+            ResponseCode::Refused => metrics.count(&metrics.responses_refused),
+            _ => {}
+        }
+        metrics.observe_latency_ms(timer.elapsed_ms());
+    }
 }
 
 #[tokio::main]
@@ -344,6 +449,32 @@ async fn main() -> anyhow::Result<()> {
     // refused and the query simply fails.
     let socket = Arc::new(UdpSocket::bind(&addr).await?);
     let listener = TcpListener::bind(&addr).await?;
+    // Bound before anything is announced, so a typo in `--metrics-listen` stops
+    // the start the same way a typo in `--port` does rather than leaving a
+    // resolver running without the observability the operator asked for.
+    let metrics_listener = match &cli.metrics_listen {
+        Some(spec) => Some(
+            TcpListener::bind(spec)
+                .await
+                .with_context(|| format!("--metrics-listen {spec}"))?,
+        ),
+        None => None,
+    };
+
+    let query_limit = RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(
+        TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
+    );
+    let shell = Arc::new(Shell {
+        limiter: Arc::new(RateLimiter::new(query_limit)),
+        responses: Arc::new(if cli.response_rate == 0 {
+            ResponseLimiter::disabled()
+        } else {
+            ResponseLimiter::new(cli.response_rate, cli.response_rate.saturating_mul(4), 2)
+        }),
+        metrics: Arc::new(DnsMetrics::new()),
+        logger: Arc::new(QueryLogger::new()),
+        validator: Arc::new(RequestValidator::with_defaults()),
+    });
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, UDP in flight: {}",
         addr,
@@ -358,6 +489,36 @@ async fn main() -> anyhow::Result<()> {
         // control nobody can observe is a control nobody can debug.
         cli.max_inflight_udp.max(1),
     );
+    // And the two limits, for exactly the same reason: both drop in silence, so
+    // an operator who cannot see the effective policy concludes it is the
+    // network. This is the line that was missing from this daemon entirely
+    // (`TODO.md` #18).
+    tracing::info!(
+        "query rate: {}, response budget: {}, metrics: {}",
+        if cli.query_rate == 0 {
+            "unlimited (--query-rate 0)".to_string()
+        } else {
+            format!(
+                "{}/s per client, burst {}{}",
+                cli.query_rate,
+                cli.query_burst,
+                if cli.query_rate_exempt.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} exempt", cli.query_rate_exempt.len())
+                }
+            )
+        },
+        if cli.response_rate == 0 {
+            "off (--response-rate 0)".to_string()
+        } else {
+            format!("{} bytes/s per client", cli.response_rate)
+        },
+        match &cli.metrics_listen {
+            Some(spec) => format!("{spec}/metrics"),
+            None => "off (--metrics-listen)".to_string(),
+        },
+    );
 
     // A `JoinSet` rather than two `JoinHandle`s in a `select!`, which dropped
     // the loser — and dropping a `JoinHandle` detaches the task rather than
@@ -365,10 +526,12 @@ async fn main() -> anyhow::Result<()> {
     // and replies still queued in a per-connection `mpsc`. `join_next` is
     // cancel-safe, so first-one-wins keeps both tasks owned and joinable.
     let mut loops = JoinSet::new();
+    let (shutdown_stop, shutdown_busy) = (shutdown.stop_handle(), shutdown.busy());
     loops.spawn(udp_main(
         socket,
         resolver.clone(),
         caches.clone(),
+        shell.clone(),
         cli.max_inflight_udp,
         shutdown.stop_handle(),
         shutdown.busy(),
@@ -377,9 +540,29 @@ async fn main() -> anyhow::Result<()> {
         listener,
         resolver,
         caches,
+        shell.clone(),
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
+    // The scrape endpoint is a listener like the others: if it dies, the process
+    // does. A resolver whose metrics silently stopped is one nobody is watching,
+    // which is worse than one that is plainly down.
+    if let Some(metrics_listener) = metrics_listener {
+        loops.spawn(async move {
+            metrics_server::serve(
+                metrics_listener,
+                shell.metrics.clone(),
+                // A resolver has nothing to wait for — no zone has to arrive
+                // before it can answer — so it is ready as soon as it is up, and
+                // `/readyz` is a liveness probe under another name. `/healthz`
+                // is the one that means something here. See `TODO.md` #18.
+                Readiness::ready(),
+                shutdown_stop,
+                shutdown_busy,
+            )
+            .await
+        });
+    }
 
     // Neither loop returns in normal operation; whichever ends first ends the
     // process rather than leaving us serving one transport — cooperatively now.
@@ -605,6 +788,34 @@ fn report(change: &AnchorChange) {
     }
 }
 
+/// The same answer with TC=1 and no records: what a client over its response
+/// budget gets instead of the answer.
+///
+/// It is smaller than the query that asked for it, so it is useless for
+/// amplification, and RFC 1035 §4.2.1 has the client retry over TCP — where the
+/// handshake proves the source address and the budget no longer applies. Going
+/// silent instead would leave a legitimate client with a timeout and no idea
+/// that TCP would work.
+///
+/// Built by reading our own reply back rather than by editing its header in
+/// place. That costs a parse on a path taken only when a source is already over
+/// budget, and it buys the header flags, the echoed question and the OPT record
+/// being whatever `to_bytes_within` would have written — `CLAUDE.md` §7's
+/// "two functions that build the same kind of message are one function with a
+/// parameter", and `rdnsd`'s `truncated_reply` is the sibling that got AA and
+/// the payload size wrong by being written separately.
+fn truncate_reply(reply: &[u8]) -> Option<Vec<u8>> {
+    let mut msg = DnsMessage::try_from_bytes(reply).ok()?;
+    msg.truncation = true;
+    msg.answers.clear();
+    msg.authorities.clear();
+    msg.additionals.clear();
+    // `to_bytes_within` needs a ceiling; the reply carries no records now, so
+    // the classic 512 is more than enough and does not depend on what the
+    // client advertised.
+    msg.to_bytes_within(rdns::CLASSIC_UDP_SIZE as usize).ok()
+}
+
 /// Receive datagrams and resolve each in its own task, up to `max_inflight`.
 ///
 /// The spawn stays — see [`MAX_INFLIGHT_UDP`] for why a resolver is the case
@@ -617,6 +828,7 @@ async fn udp_main(
     socket: Arc<UdpSocket>,
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
+    shell: Arc<Shell>,
     max_inflight: usize,
     stop: Stop,
     busy: Busy,
@@ -645,11 +857,28 @@ async fn udp_main(
             Err(e) if recv_error_is_transient(&e) => continue,
             Err(e) => return Err(e),
         };
+        // Rate limit first, because it is the cheapest rejection and the one
+        // that should fire on a flood: a hash lookup and a token, before the
+        // packet is even looked at. Dropping is silent — a reply to a spoofed
+        // source is what an amplifier sends — which is exactly why the effective
+        // policy is printed at startup and counted here (`CLAUDE.md` §14).
+        if !shell.limiter.should_allow(peer.ip()) {
+            shell.logger.log_rate_limited(peer.ip());
+            shell.metrics.count(&shell.metrics.rate_limited);
+            continue;
+        }
+        // Then the structural checks, on bytes nothing has trusted yet.
+        let validation = shell.validator.validate_packet(&buf[..n], false);
+        if !validation.is_valid() {
+            shell.metrics.count(&shell.metrics.validation_errors);
+            continue;
+        }
         // Before the copy, before the clones, before the task: at the ceiling
         // this datagram costs one comparison and nothing else. The semaphore is
         // never closed, so the only failure is "full".
         let Ok(permit) = in_flight.clone().try_acquire_owned() else {
             tracing::debug!(%peer, "dropped: {max_inflight} UDP queries already in flight");
+            shell.metrics.count(&shell.metrics.queries_dropped);
             continue;
         };
         let data = buf[..n].to_vec();
@@ -659,11 +888,33 @@ async fn udp_main(
         // A recursive answer can take seconds and the client is already waiting
         // on it, so it is worth the drain rather than being dropped.
         let busy = busy.clone();
+        let shell = shell.clone();
         tokio::spawn(async move {
             let _busy = busy;
             let _permit = permit;
-            if let Some(reply) = handle_query(data, &resolver, &caches, Transport::Udp).await {
-                let _ = socket.send_to(&reply, peer).await;
+            if let Some(reply) =
+                handle_query(data, &resolver, &caches, &shell, Transport::Udp).await
+            {
+                // Charge the response, not the query. Over budget, a truncated
+                // reply is the useful refusal: it carries no records, so it
+                // cannot amplify, and a real client reads TC=1 and asks again
+                // over TCP where the handshake proves who it is.
+                match shell.responses.admit(peer.ip(), reply.len()) {
+                    ResponseVerdict::Send => {
+                        let _ = socket.send_to(&reply, peer).await;
+                    }
+                    ResponseVerdict::Truncate => {
+                        shell.logger.log_rate_limited(peer.ip());
+                        shell.metrics.count(&shell.metrics.rate_limited);
+                        if let Some(short) = truncate_reply(&reply) {
+                            let _ = socket.send_to(&short, peer).await;
+                        }
+                    }
+                    ResponseVerdict::Drop => {
+                        shell.logger.log_rate_limited(peer.ip());
+                        shell.metrics.count(&shell.metrics.queries_dropped);
+                    }
+                }
             }
         });
     }
@@ -674,6 +925,7 @@ async fn tcp_main(
     listener: TcpListener,
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
+    shell: Arc<Shell>,
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
@@ -682,10 +934,19 @@ async fn tcp_main(
         // Stop accepting on shutdown; connections already open drain in their
         // own tasks below. `accept` is cancel-safe, so a connection lost to this
         // race stays in the kernel backlog rather than being half-taken.
-        let (stream, _peer) = tokio::select! {
+        let (stream, peer) = tokio::select! {
             accepted = listener.accept() => accepted?,
             _ = stop.wait() => return Ok(()),
         };
+        // The rate limit applies to TCP too. The response *budget* does not —
+        // a peer that completed a handshake is not one anybody is reflecting
+        // at — but a flood of connections is still a flood, and the limiter is
+        // what bounds it per source.
+        if !shell.limiter.should_allow(peer.ip()) {
+            shell.logger.log_rate_limited(peer.ip());
+            shell.metrics.count(&shell.metrics.rate_limited);
+            continue;
+        }
         // The semaphore is never closed, so acquiring only fails if we drop it.
         let Ok(permit) = permits.clone().acquire_owned().await else {
             continue;
@@ -694,8 +955,9 @@ async fn tcp_main(
         let caches = caches.clone();
         let stop = stop.clone();
         let busy = busy.clone();
+        let shell = shell.clone();
         tokio::spawn(async move {
-            serve_connection(stream, resolver, caches, stop).await;
+            serve_connection(stream, resolver, caches, shell, stop).await;
             drop(permit);
             drop(busy);
         });
@@ -713,6 +975,7 @@ async fn serve_connection(
     stream: TcpStream,
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
+    shell: Arc<Shell>,
     stop: Stop,
 ) {
     let (mut reader, mut writer) = stream.into_split();
@@ -768,16 +1031,24 @@ async fn serve_connection(
         let resolver = resolver.clone();
         let caches = caches.clone();
         let tx = tx.clone();
+        let shell = shell.clone();
         tokio::spawn(async move {
-            if let Some(reply) = handle_query(buf, &resolver, &caches, Transport::Tcp).await {
+            if let Some(reply) = handle_query(buf, &resolver, &caches, &shell, Transport::Tcp).await
+            {
                 // Length prefix and message in one buffer, so the writer emits
-                // them in a single call.
-                let mut framed = Vec::with_capacity(2 + reply.len());
-                framed.extend_from_slice(&(reply.len() as u16).to_be_bytes());
-                framed.extend_from_slice(&reply);
-                // A send error means the writer is gone (the peer hung up);
-                // there is nowhere left to put the reply.
-                let _ = tx.send(framed).await;
+                // them in a single call. A reply too long to frame is dropped
+                // with a line saying so rather than sent with a wrapped prefix,
+                // which the peer would read as a broken stream (`TODO.md` #17).
+                match rdns::framed(&reply) {
+                    Ok(framed) => {
+                        // A send error means the writer is gone (the peer hung
+                        // up); there is nowhere left to put the reply.
+                        let _ = tx.send(framed).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("could not frame a {}-octet reply: {e}", reply.len());
+                    }
+                }
             }
             drop(permit);
         });
@@ -796,6 +1067,7 @@ async fn handle_query(
     data: Vec<u8>,
     resolver: &Arc<Resolver>,
     caches: &Arc<Caches>,
+    shell: &Shell,
     transport: Transport,
 ) -> Option<Vec<u8>> {
     // Parse, and refuse a *response*: answering one is how a resolver becomes a
@@ -810,11 +1082,17 @@ async fn handle_query(
     // either way. The type is what makes the check unskippable; see
     // `rdns::validation::Request`.
     let msg = Request::from_bytes(&data).ok()?;
+    let timer = LatencyTimer::new();
+    shell.metrics.count(&shell.metrics.queries_received);
+    if let Some(q) = msg.queries.first() {
+        shell.metrics.track_query_type(q.qtype);
+    }
 
     // Every opcode but QUERY is something this resolver does not implement, and
     // saying so is more useful than answering a NOTIFY or an UPDATE with a
     // plausible QUERY-shaped reply the sender will misread (RFC 1035 §4.1.1).
     if msg.opcode != OpCode::Query {
+        shell.record_answer(ResponseCode::NotImplemented, timer);
         return unsupported_opcode(&msg);
     }
 
@@ -839,7 +1117,10 @@ async fn handle_query(
     // without building it, so a FORMERR is still a FORMERR.
     let client_edns = match msg.edns_header() {
         Ok(edns) => edns,
-        Err(_) => return edns_error(id, &query, ResponseCode::FormatError, recursion, client_max),
+        Err(_) => {
+            shell.record_answer(ResponseCode::FormatError, timer);
+            return edns_error(id, &query, ResponseCode::FormatError, recursion, client_max);
+        }
     };
     if client_edns.is_some_and(|edns| edns.version > EDNS_VERSION) {
         return edns_error(
@@ -892,6 +1173,8 @@ async fn handle_query(
             client_wants_dnssec,
             &query,
             client_max,
+            shell,
+            timer,
         );
     }
 
@@ -934,12 +1217,15 @@ async fn handle_query(
                 client_wants_dnssec,
                 &query,
                 client_max,
+                shell,
+                timer,
             );
         }
     }
 
     if !checking_disabled {
         if let Some(denial) = caches.denials.synthesize(&query.qname, query.qtype) {
+            shell.metrics.count(&shell.metrics.cache_hits);
             let mut resp = build_response(
                 id,
                 OpCode::Query,
@@ -958,6 +1244,8 @@ async fn handle_query(
                 client_wants_dnssec,
                 &query,
                 client_max,
+                shell,
+                timer,
             );
         }
     }
@@ -968,6 +1256,7 @@ async fn handle_query(
     // above, nothing here is synthesized: this is the answer this question got,
     // so a CD client may have it too.
     if let Some(negative) = caches.negatives.get(&query.qname, query.qtype) {
+        shell.metrics.count(&shell.metrics.cache_hits);
         let mut resp = build_response(
             id,
             OpCode::Query,
@@ -985,12 +1274,15 @@ async fn handle_query(
             client_wants_dnssec,
             &query,
             client_max,
+            shell,
+            timer,
         );
     }
 
     // Build the response: from cache if we have it, else by resolving.
     let (mut resp, secure) =
         if let Some((records, secure)) = caches.answers.get_validated(&query.qname, query.qtype) {
+            shell.metrics.count(&shell.metrics.cache_hits);
             (
                 build_response(
                     id,
@@ -1003,6 +1295,13 @@ async fn handle_query(
                 secure,
             )
         } else {
+            // Everything above answered from something already held; from here
+            // the query costs a recursion. That is the line a resolver's cache
+            // hit rate is drawn on, and it is why these two counters live here
+            // and not in `rdnsd`, which has no cache and never incremented them
+            // (`TODO.md` #19d).
+            shell.metrics.count(&shell.metrics.cache_misses);
+            shell.metrics.count(&shell.metrics.queries_recursive);
             // Resolver::resolve_validated is async — each upstream round trip is an
             // await, so this yields the task rather than holding a thread.
             match resolver.resolve_validated(&query).await {
@@ -1044,6 +1343,8 @@ async fn handle_query(
                                 client_wants_dnssec,
                                 &query,
                                 client_max,
+                                shell,
+                                timer,
                             );
                         }
                     }
@@ -1131,6 +1432,8 @@ async fn handle_query(
         client_wants_dnssec,
         &query,
         client_max,
+        shell,
+        timer,
     )
 }
 
@@ -1142,7 +1445,15 @@ fn finish(
     client_wants_dnssec: bool,
     query: &QuerySection,
     client_max: usize,
+    shell: &Shell,
+    timer: LatencyTimer,
 ) -> Option<Vec<u8>> {
+    // Counted here because this is where every ordinary answer leaves, whatever
+    // produced it — cache, denial cache, negative cache or a full recursion. The
+    // rcode is what an operator pages on: SERVFAIL climbing on a resolver means
+    // upstream trouble or a validation failure, and NXDOMAIN is ordinary
+    // (`CLAUDE.md` §14).
+    shell.record_answer(resp.rcode, timer);
     // A client that did not set DO gets no DNSSEC records (RFC 4035 §3.2.1) —
     // it did not ask for them, they are large, and it has no use for them.
     // Records it asked for by type are a different matter and stay.
@@ -1268,6 +1579,136 @@ mod tests {
 
     /// A resolver that will never be reached: every test below is about a packet
     /// rejected before any resolution is attempted.
+    /// **A source over its query rate is dropped, and the drop is counted.**
+    ///
+    /// Both halves, because silence is the correct answer here and a control
+    /// nobody can observe is a control nobody can debug (`CLAUDE.md` §14): a
+    /// reply to a spoofed source is what an amplifier sends, so dropping is
+    /// right — and it is exactly why the counter has to exist.
+    ///
+    /// **Watched failing** against `udp_main` without the limiter check: all
+    /// four datagrams were answered and `rate_limited` stayed at 0.
+    #[tokio::test]
+    async fn a_source_over_its_query_rate_is_dropped_and_counted() {
+        let (resolver, caches) = context();
+
+        // One query per second, burst of one: the second datagram in a burst is
+        // over the limit whatever the clock does.
+        let shell = Arc::new(Shell {
+            limiter: Arc::new(RateLimiter::new(RateLimitConfig::per_second(1, 1))),
+            responses: Arc::new(ResponseLimiter::disabled()),
+            metrics: Arc::new(DnsMetrics::new()),
+            logger: Arc::new(QueryLogger::new()),
+            validator: Arc::new(RequestValidator::with_defaults()),
+        });
+        let metrics = shell.metrics.clone();
+
+        let shutdown = Shutdown::new();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let addr = socket.local_addr().expect("addr");
+        let server = tokio::spawn(udp_main(
+            socket,
+            resolver,
+            caches,
+            shell,
+            16,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+        for _ in 0..4 {
+            client
+                .send_to(&message(OpCode::Query, false), addr)
+                .await
+                .expect("send");
+        }
+        // Long enough for the loop to have taken all four off the socket.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            metrics.rate_limited.load(std::sync::atomic::Ordering::Relaxed) >= 3,
+            "three of four datagrams are over a burst of one, and each drop is              counted: {}",
+            metrics.rate_limited.load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        shutdown.begin();
+        let _ = server.await;
+    }
+
+    /// An exempt source is not limited, which is the escape hatch every knob
+    /// needs — for a monitoring probe whose whole job is to query more often
+    /// than a client would (`CLAUDE.md` §14).
+    #[test]
+    fn an_exempt_source_is_not_rate_limited() {
+        let limiter = RateLimiter::new(
+            RateLimitConfig::per_second(1, 1)
+                .exempting(TransferAcl::parse_named(&["127.0.0.1".to_string()], "--test").unwrap()),
+        );
+        let exempt: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let other: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..10 {
+            assert!(limiter.should_allow(exempt), "an exempt source never trips");
+        }
+        assert!(limiter.should_allow(other));
+        assert!(
+            !limiter.should_allow(other),
+            "and a source that is not exempt still does"
+        );
+    }
+
+    /// A reply over the response budget comes back truncated rather than whole:
+    /// TC=1 carries no records, so it cannot amplify, and RFC 1035 §4.2.1 has
+    /// the client retry over TCP where the handshake proves the address.
+    #[test]
+    fn a_truncated_reply_carries_no_records_and_keeps_its_question() {
+        let query = QuerySection {
+            qname: "www.example.com.".to_string(),
+            qtype: Qtype::of(record_types::A),
+            qclass: rdns::QueryClass::IN,
+        };
+        let mut resp = build_response(
+            0x4242,
+            OpCode::Query,
+            &query,
+            vec![ResourceRecord {
+                name: "www.example.com.".to_string(),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(60),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    "192.0.2.1".parse().unwrap(),
+                ))
+                .unwrap(),
+            }],
+            ResponseCode::Ok,
+            true,
+        );
+        resp.response = true;
+        let full = resp.to_bytes_within(4096).expect("serializes");
+
+        let short = truncate_reply(&full).expect("truncates");
+        assert!(
+            short.len() < full.len(),
+            "and is smaller than what it replaces"
+        );
+        let parsed = DnsMessage::try_from_bytes(&short).expect("a well-formed reply");
+        assert!(parsed.truncation, "TC=1");
+        assert!(parsed.answers.is_empty(), "carrying no records");
+        assert_eq!(parsed.id, 0x4242, "the client can still match it");
+        assert_eq!(parsed.queries.len(), 1, "with its question echoed");
+    }
+
+    /// A shell with every limit off, so a test measures the thing it names and
+    /// not the rate limiter.
+    fn test_shell() -> Arc<Shell> {
+        Arc::new(Shell {
+            limiter: Arc::new(RateLimiter::new(RateLimitConfig::per_second(0, 0))),
+            responses: Arc::new(ResponseLimiter::disabled()),
+            metrics: Arc::new(DnsMetrics::new()),
+            logger: Arc::new(QueryLogger::new()),
+            validator: Arc::new(RequestValidator::with_defaults()),
+        })
+    }
+
     fn context() -> (Arc<Resolver>, Arc<Caches>) {
         let config = ResolverConfig {
             mode: ResolverMode::Forward,
@@ -1328,6 +1769,7 @@ mod tests {
             message(OpCode::Query, true),
             &resolver,
             &caches,
+            &test_shell(),
             Transport::Udp,
         )
         .await;
@@ -1345,9 +1787,15 @@ mod tests {
     async fn an_unimplemented_opcode_is_notimp_with_the_opcode_echoed() {
         let (resolver, caches) = context();
         for opcode in [OpCode::Notify, OpCode::Update, OpCode::Status] {
-            let bytes = handle_query(message(opcode, false), &resolver, &caches, Transport::Udp)
-                .await
-                .unwrap_or_else(|| panic!("{opcode:?} should be answered, not dropped"));
+            let bytes = handle_query(
+                message(opcode, false),
+                &resolver,
+                &caches,
+                &test_shell(),
+                Transport::Udp,
+            )
+            .await
+            .unwrap_or_else(|| panic!("{opcode:?} should be answered, not dropped"));
             let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
 
             assert!(reply.response, "{opcode:?}");
@@ -1398,6 +1846,7 @@ mod tests {
             socket,
             resolver,
             caches,
+            test_shell(),
             1,
             shutdown.stop_handle(),
             shutdown.busy(),

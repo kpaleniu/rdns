@@ -1038,6 +1038,32 @@ fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> ConfigResult<Vec<u8>> {
         .checked_add(1)
         .ok_or_else(|| ConfigError::new("additional count would overflow"))?;
     message[10..12].copy_from_slice(&ar.to_be_bytes());
+
+    // **This is the only path that can grow a message past the size it was
+    // serialized to**, and until this check existed it did so silently.
+    // `to_bytes_within(u16::MAX)` cannot return more than 65,535 octets — the
+    // scratch buffer is exactly that big, so anything larger comes back as a
+    // TC=1 reply instead — and then these ~82 octets are appended to the
+    // finished bytes. The ARCOUNT overflow above was the only thing checked.
+    //
+    // The consequence was not a wrong length but a *wrapped* one: at exactly
+    // 65,536 octets the TCP framing prefix is 0, which every read loop here
+    // treats as a broken peer, so a signed answer in an 82-octet window below
+    // 64 KB dropped the client's connection with nothing said. Refusing here is
+    // the right place because it is the only place that knows both halves —
+    // `framed` sees a buffer that is already too long and cannot say why.
+    //
+    // A caller that hits this has a genuinely oversized answer and its options
+    // are the protocol's: send it over TCP in pieces, as a transfer does, or
+    // truncate. Neither is something this function can choose.
+    let tsig_octets = owner.len() + 10 + rdata.len();
+    if message.len() > u16::MAX as usize {
+        return Err(ConfigError::new(format!(
+            "a signed message is {} octets, and RFC 1035 §4.2.2's length prefix              cannot express more than {} — the TSIG record added {tsig_octets}              to a message that was already within that of the limit",
+            message.len(),
+            u16::MAX,
+        )));
+    }
     Ok(message)
 }
 
@@ -1180,6 +1206,107 @@ mod tests {
         let n = msg.to_bytes(&mut buf).expect("serialize");
         buf.truncate(n);
         buf
+    }
+
+    /// **A signed message that will not fit a length prefix is refused, not
+    /// framed with a wrapped one** (`TODO.md` #17).
+    ///
+    /// `to_bytes_within(u16::MAX)` cannot return more than 65,535 octets, so
+    /// this is the only path that can grow a message past the size it was
+    /// serialized to: `append_tsig` adds ~82 octets to the *finished* bytes and
+    /// used to check only that ARCOUNT did not overflow. A serialized length in
+    /// 65,454..=65,535 therefore produced a message of 65,536 or more, and at
+    /// exactly 65,536 the framing prefix is **0** — which every read loop here
+    /// treats as a broken peer, so the client's connection was dropped with no
+    /// answer and nothing saying why.
+    ///
+    /// The sweep is the one recorded in `TODO.md` #17, kept because the window
+    /// is only 82 octets wide out of 65,536 sizes and a single hand-picked case
+    /// would sit next to it as easily as on it. Each step asserts the thing that
+    /// actually matters: **the prefix agrees with the body**, or there is no
+    /// message at all. Asserting on the error type instead would pass against an
+    /// implementation that refused everything.
+    ///
+    /// **Watched failing** against the unchecked `append_tsig`, at exactly the
+    /// size `TODO.md` #17's original sweep recorded: "a signature that fits must
+    /// actually fit: **65536** octets". That is the assertion that fires, one
+    /// line before the framing — `framed` refuses 65,536 outright now, so the
+    /// prefix-of-0 the bug produced is no longer reachable through it, and the
+    /// check that catches the bug is the one on the signed length.
+    #[test]
+    fn a_signed_message_too_long_to_frame_is_refused_rather_than_wrapped() {
+        let key = test_key();
+        let mut refused = 0usize;
+        let mut framed_ok = 0usize;
+
+        // 255 character-strings of 255 octets is 65,280 octets of RDATA, which
+        // with the header, question and record overhead lands the serialized
+        // message just below the ceiling; `pad` then walks it through the
+        // 82-octet window an octet at a time.
+        for pad in 0..250usize {
+            // A TXT RRset sized to walk the serialized length through the
+            // boundary an octet at a time.
+            let mut msg = DnsMessage::try_from_bytes(&query_bytes(
+                "big.example.com.",
+                Qtype::of(crate::utils::record_types::TXT),
+            ))
+            .expect("a query parses");
+            msg.response = true;
+            let filler = vec![b'x'; 255];
+            let chunks = 255;
+            let mut strings: Vec<Vec<u8>> = (0..chunks).map(|_| filler.clone()).collect();
+            strings.push(vec![b'y'; pad]);
+            msg.answers.push(crate::ResourceRecord {
+                name: "big.example.com.".to_string(),
+                class: crate::Class::new(1),
+                ttl: crate::Ttl::from_secs(60),
+                rdata: crate::RecordData::from_parsed(&crate::ParsedRecord::TXT(strings))
+                    .expect("a TXT encodes"),
+            });
+
+            let Ok(bytes) = msg.to_bytes_within(u16::MAX as usize) else {
+                continue;
+            };
+            // Only the sizes near the ceiling are interesting; below that the
+            // message is nowhere near the boundary and proves nothing.
+            if bytes.len() < 65_300 {
+                continue;
+            }
+
+            match sign_request(bytes.clone(), &key, 1_000) {
+                Ok(signed) => {
+                    assert!(
+                        signed.len() <= u16::MAX as usize,
+                        "a signature that fits must actually fit: {} octets",
+                        signed.len()
+                    );
+                    let framed = crate::framed(&signed).expect("and frames");
+                    let prefix = u16::from_be_bytes([framed[0], framed[1]]) as usize;
+                    assert_eq!(
+                        prefix,
+                        signed.len(),
+                        "the prefix must agree with the body it introduces \
+                         (serialized {}, signed {})",
+                        bytes.len(),
+                        signed.len()
+                    );
+                    framed_ok += 1;
+                }
+                // Refused, which is the correct answer for a message that
+                // cannot be expressed on the wire at all.
+                Err(_) => refused += 1,
+            }
+        }
+
+        assert!(
+            framed_ok > 0,
+            "the sweep must include sizes that legitimately fit"
+        );
+        assert!(
+            refused > 0,
+            "and sizes that do not — otherwise the boundary was never crossed \
+             and this test proves nothing"
+        );
     }
 
     // -----------------------------------------------------------------

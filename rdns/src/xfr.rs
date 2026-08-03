@@ -690,8 +690,8 @@ async fn send_request(
             .ok_or_else(|| TransferError::tsig("just-signed request has no TSIG"))?;
     }
 
-    let mut framed = (packet.len() as u16).to_be_bytes().to_vec();
-    framed.extend_from_slice(&packet);
+    let framed = crate::framed(&packet)
+        .map_err(|e| TransferError::malformed(format!("framing the request: {e}")))?;
     stream
         .write_all(&framed)
         .await

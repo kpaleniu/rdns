@@ -1641,7 +1641,7 @@ impl Server {
                     None => return Vec::new(),
                 };
                 return match rejection.attach(response, now) {
-                    Ok(bytes) => vec![frame(&bytes)],
+                    Ok(bytes) => frame(&bytes).into_iter().collect(),
                     Err(e) => {
                         serving_error!(self.logger, ip, "TSIG error reply: {e}");
                         Vec::new()
@@ -1697,13 +1697,13 @@ impl Server {
         // to one question being replayed as the reply to another.
         match session.as_mut() {
             Some(session) => match session.sign(bytes, now) {
-                Ok(signed) => vec![frame(&signed)],
+                Ok(signed) => frame(&signed).into_iter().collect(),
                 Err(e) => {
                     serving_error!(self.logger, ip, "TSIG signing failed: {e}");
                     Vec::new()
                 }
             },
-            None => vec![frame(&bytes)],
+            None => frame(&bytes).into_iter().collect(),
         }
     }
 
@@ -1864,7 +1864,17 @@ impl Server {
                 },
                 None => bytes,
             };
-            frames.push(frame(&bytes));
+            // A transfer envelope that cannot be framed abandons the whole
+            // transfer rather than sending a short stream: a client reading
+            // envelopes until the closing SOA would otherwise wait for one that
+            // is never coming. Envelopes target 16 KiB
+            // (`AXFR_TARGET_MESSAGE_SIZE`), so this is not the exposure #17 was
+            // filed for — but it is the same check, and the alternative here is
+            // a hang rather than a dropped connection.
+            let Some(framed) = frame(&bytes) else {
+                return self.transfer_error(msg, ResponseCode::ServerFailure, ip, None);
+            };
+            frames.push(framed);
         }
         // A transfer is an answer too, and this is the only path that does not
         // go through `make_response`.
@@ -1921,7 +1931,7 @@ impl Server {
             },
             None => bytes,
         };
-        vec![frame(&bytes)]
+        frame(&bytes).into_iter().collect()
     }
 
     /// Answer a dynamic UPDATE (RFC 2136).
@@ -2261,13 +2271,25 @@ fn apply_update_to_file(
     Ok((Some(installed), applied))
 }
 
-/// A message with its RFC 1035 §4.2.2 length prefix, in one buffer so the writer
-/// emits both in a single call.
-fn frame(bytes: &[u8]) -> Vec<u8> {
-    let mut framed = Vec::with_capacity(2 + bytes.len());
-    framed.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-    framed.extend_from_slice(bytes);
-    framed
+/// A message with its RFC 1035 §4.2.2 length prefix, or nothing plus a log line.
+///
+/// The framing itself is `rdns::framed`, which is where the length check lives
+/// (`TODO.md` #17). This wrapper exists because every caller here is on a path
+/// that returns `Vec<Vec<u8>>` — a list of framed messages — and has no channel
+/// for an error: a reply that cannot be framed is a reply that cannot be sent,
+/// and the useful thing is that the operator can see why rather than that the
+/// caller can branch on it.
+fn frame(bytes: &[u8]) -> Option<Vec<u8>> {
+    match rdns::framed(bytes) {
+        Ok(framed) => Some(framed),
+        Err(e) => {
+            // ERROR, not DEBUG: this means a client got no answer at all, and
+            // before the check existed it got a dropped connection instead with
+            // nothing anywhere saying why.
+            tracing::error!("could not frame a {}-octet reply: {e}", bytes.len());
+            None
+        }
+    }
 }
 
 /// An empty TC=1 answer to `request`: the question echoed, no records.
@@ -5860,7 +5882,10 @@ mod tests {
     async fn round_trip(addr: SocketAddr, bytes: Vec<u8>) -> DnsMessage {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = TcpStream::connect(addr).await.expect("connect");
-        stream.write_all(&frame(&bytes)).await.expect("write");
+        stream
+            .write_all(&frame(&bytes).expect("the test message frames"))
+            .await
+            .expect("write");
         let mut len = [0u8; 2];
         stream.read_exact(&mut len).await.expect("length prefix");
         let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];

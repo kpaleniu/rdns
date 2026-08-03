@@ -156,9 +156,7 @@ fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
         .set_read_timeout(Some(READ_TIMEOUT))
         .context("setting the read timeout")?;
 
-    let mut framed = Vec::with_capacity(2 + query.len());
-    framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
-    framed.extend_from_slice(query);
+    let framed = rdns::framed(query).context("framing the query")?;
     stream.write_all(&framed).context("sending over TCP")?;
 
     let mut prefix = [0u8; 2];

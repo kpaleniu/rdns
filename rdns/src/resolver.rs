@@ -1427,10 +1427,11 @@ impl Resolver {
         let timeout = Duration::from_millis(self.config.timeout_ms / 2);
         let mut stream = tokio::time::timeout(timeout, TcpStream::connect(upstream)).await??;
 
-        // Prefix and message go out in one write so they share a segment.
-        let mut framed = Vec::with_capacity(2 + out.buf.len());
-        framed.extend_from_slice(&(out.buf.len() as u16).to_be_bytes());
-        framed.extend_from_slice(&out.buf);
+        // Prefix and message go out in one write so they share a segment. The
+        // length is checked rather than cast: a query we could not frame would
+        // go out with a wrapped prefix and the upstream would read it as a
+        // broken stream (`TODO.md` #17).
+        let framed = crate::framed(&out.buf)?;
         tokio::time::timeout(timeout, stream.write_all(&framed)).await??;
 
         let mut len_buf = [0u8; 2];

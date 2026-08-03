@@ -1264,6 +1264,41 @@ pub const CLASSIC_UDP_SIZE: u16 = 512;
 /// (RFC 6891 §6.1.3).
 pub const EDNS_VERSION: u8 = 0;
 
+/// A message with its RFC 1035 §4.2.2 two-octet length prefix, in one buffer so
+/// a writer emits both in a single call.
+///
+/// **The check is the point.** This existed five times over as
+/// `bytes.len() as u16`, once per binary and twice in the library, and a message
+/// past 65,535 octets was therefore framed with a *wrapped* length. At exactly
+/// 65,536 the prefix is **0**, which every read loop here treats as a broken
+/// peer: the connection is dropped with no answer and nothing on either side
+/// saying why. Larger overshoots give a small non-zero prefix instead, which
+/// desynchronises the stream — the reader takes the next N octets of a message
+/// body for a whole message.
+///
+/// `CLAUDE.md` §2 is about `as` on a value coming *off* the wire; this is the
+/// same cast going the other way, and [`DnsMessage::to_bytes`] is the sibling
+/// that shows the shape it should have — RDLENGTH, ARCOUNT and the OPT RDLENGTH
+/// all go through `try_into` and a [`WireError::TooLong`], within twenty lines
+/// of each other in this same file.
+///
+/// **How a message gets here over the limit at all**, since `to_bytes_within`
+/// cannot return more than it was given: [`crate::tsig`] appends a TSIG record
+/// to the *finished* bytes. That is the one path that can grow a message past
+/// the size it was serialized to, and it now refuses rather than producing
+/// something no framing can express.
+pub fn framed(bytes: &[u8]) -> Result<Vec<u8>, WireError> {
+    let len: u16 = bytes.len().try_into().map_err(|_| WireError::TooLong {
+        what: "a TCP message",
+        limit: u16::MAX as usize,
+        actual: bytes.len(),
+    })?;
+    let mut out = Vec::with_capacity(2 + bytes.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
 // EDNS option codes from the IANA "DNS EDNS0 Option Codes" registry. We don't
 // interpret any of these yet — options round-trip as opaque bytes — but naming
 // the common ones keeps call sites readable.

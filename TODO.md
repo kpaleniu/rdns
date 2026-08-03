@@ -618,8 +618,8 @@ it, and the rule it became in `CLAUDE.md`:
 | **15** | collapsing `DName`/`UnpackedDName` into one borrowed, pointer-following `DName` | **withdrawn 2026-08-03**, filed 2026-08-02 and never started. Reviewed against the code rather than the plan: the typestate is already invisible outside `dname.rs`, the volume breaks even, the allocation motive was spent before it was filed, and the price is threading absolute offsets through every parse site — declined. The section keeps the three findings and the two fixes the review *did* produce (the unenforced 255-octet name limit, the LDH `TODO` that would have been a bug) |
 | **12** | pre-authentication panics | **audited 2026-08-01.** No reachable panic in 1.4M mutated inputs; two mutex-poisoning fixes; `rdns/tests/no_input_panics.rs` left behind as the guard |
 | **13** | making illegal states unrepresentable: `OpCode`'s sentinel, the eleven name normalizations, QTYPE-vs-RTYPE, `Ttl` + `Class` + OPT out of the additional section, `Name`/`NameKey` | **done 2026-08-02**, twelve commits. 13a-13d in full; 13e's map keys done and its `Name` half deferred with a reason. Seven live defects fixed on the way. Every stage gated on `rdns/tests/allocations.rs` and every one has held its counts; 13b added a fifteenth measurement that went 2 to 0 |
-| **17** | the TCP length prefix wraps to 0 on a TSIG-signed answer near 64 KB, and the framing is written out five times | **open, filed 2026-08-03.** The one confirmed bug of the review — provoked, not argued: a wrapped prefix of 0 is what both read loops treat as a broken peer, so the client's connection is dropped with no answer. `append_tsig` is what pushes a message past the size it was serialized to |
-| **18** | `rdnsr` has none of the operational shell — no rate limiter, no response budget, no logger, no metrics, no probes, no validator | **open, filed 2026-08-03.** Seven library facilities `rdnsd` uses and `rdnsr` does not, all of them tested and reachable. The asymmetry runs the wrong way round: the resolver is the more amplifying of the two and the unobservable one. Probably #9d being scoped to `rdnsd` |
+| **17** | the TCP length prefix wraps to 0 on a TSIG-signed answer near 64 KB, and the framing is written out five times | **fixed 2026-08-03.** The one confirmed bug of the review — provoked, not argued: a wrapped prefix of 0 is what both read loops treat as a broken peer, so the client's connection is dropped with no answer. `append_tsig` is what pushes a message past the size it was serialized to |
+| **18** | `rdnsr` has none of the operational shell — no rate limiter, no response budget, no logger, no metrics, no probes, no validator | **fixed 2026-08-03.** Seven library facilities `rdnsd` uses and `rdnsr` does not, all of them tested and reachable. The asymmetry runs the wrong way round: the resolver is the more amplifying of the two and the unobservable one. Probably #9d being scoped to `rdnsd` |
 | **19** | the review's smaller items, 19a-19h | **open, filed 2026-08-03.** Five stragglers of consolidations that caught most copies and missed one (19a-19c, 19h), one duplicated check (19e), one candidate that may not be worth it (19f), and two documentation items (19g and the `#13e` correction below). Includes the list of what the pass checked and found *nothing* wrong with, which is the half of §16 that turned out to be most useful |
 
 **What the letters mean**, because comments in the code and lines further down
@@ -2493,7 +2493,7 @@ Recorded so nobody re-derives them. Each looked like a rule violation and is not
   not reported as one. **This is unaudited, not clean**, and saying so is the
   point of the entry.
 
-### 17. The TCP length prefix wraps, and the framing is written out five times
+### 17. The TCP length prefix wraps, and the framing is written out five times — **fixed 2026-08-03**
 
 **Filed 2026-08-03 from the architecture review** (`docs/ARCHITECTURE_REVIEW.md`
 A1). A bug, confirmed by provoking it rather than by reading the diff, plus the
@@ -2550,10 +2550,10 @@ answer over TCP is, which needs a ~64 KB RRset at one name — unusual, entirely
 constructible in a zone file, and not something a client has to be hostile to
 ask for.
 
-- [ ] **A length check in `append_tsig`.** It is the only thing that can push a
+- [x] **A length check in `append_tsig`.** It is the only thing that can push a
       message past the size it was serialized to, and it already returns
       `ConfigResult<Vec<u8>>`, so there is a channel for the error.
-- [ ] **One `rdns::` helper for the framing**, and five call sites deleted:
+- [x] **One `rdns::` helper for the framing**, and five call sites deleted:
 
       ```rust
       /// A message with its RFC 1035 §4.2.2 length prefix, in one buffer.
@@ -2565,7 +2565,7 @@ ask for.
       and `rdns` has no `anyhow`. This returns a `WireError`, which is the
       library's own. The precedent is `utils::recv_error_is_transient`, which
       moved cleanly because nothing foreign crossed the boundary.
-- [ ] **The regression test writes itself** from the sweep above, and it has been
+- [x] **The regression test writes itself** from the sweep above, and it has been
       watched failing against today's code (`CLAUDE.md` §1). Assert on the
       *prefix against the body length*, not on an error type — the point is that
       the two agree.
@@ -2576,7 +2576,7 @@ loops read a prefix and then `read_exact`, with different timeouts and different
 treatment of a zero length. Recorded here so the next reader does not think the
 write side was the whole of it.
 
-### 18. `rdnsr` has none of the operational shell
+### 18. `rdnsr` has none of the operational shell — **fixed 2026-08-03**
 
 **Filed 2026-08-03** (`docs/ARCHITECTURE_REVIEW.md` B1, `docs/spec/07` G-1/G-2).
 Not a bug — an asymmetry that runs the wrong way round.
@@ -2616,18 +2616,18 @@ Staged, this is small. The admission point already exists: `udp_main` checks its
 semaphore *before* copying the datagram, which is exactly where a rate limiter
 goes.
 
-- [ ] **`--query-rate` / `--query-burst` / `--query-rate-exempt`**, the same
+- [x] **`--query-rate` / `--query-burst` / `--query-rate-exempt`**, the same
       flags and the same `RateLimitConfig::per_second` units `rdnsd` uses, so the
       number in the config is the number in the head (`CLAUDE.md` §14). The
       effective policy goes in the startup banner for the same reason it does
       there: dropping is silent, so it has to be visible somewhere.
-- [ ] **`--response-rate`**, with the slip behaviour `ResponseLimiter` already
+- [x] **`--response-rate`**, with the slip behaviour `ResponseLimiter` already
       implements.
-- [ ] **`--metrics-listen`.** What needs a *decision* rather than code is which
+- [x] **`--metrics-listen`.** What needs a *decision* rather than code is which
       counters a resolver should have: `rdnsd`'s set is authoritative-shaped, and
       cache hit rate — meaningless there, see #19d — is the headline number here.
       Do not copy the struct; ask what an operator pages on for a resolver.
-- [ ] **Decide about `RequestValidator` out loud.** After #19e it is a size and
+- [x] **Decide about `RequestValidator` out loud.** After #19e it is a size and
       section-count check, which is cheap and belongs on the pre-admission path.
       Either wire it in or write down why a resolver does not want it — the
       current state is that the difference is recorded with no reason attached.
@@ -2728,6 +2728,15 @@ about what it counts" — left the fields, the `# HELP`/`# TYPE` lines and the
 A dashboard computing `hits / (hits + misses)` gets 0/0. Delete all three, or —
 if #18 lands — move the two cache counters to wherever `rdnsr`'s metrics live,
 where they would mean something.
+
+**Resolved by #18 on 2026-08-03, by the second route.** `rdnsr` now uses
+`DnsMetrics`, and all three counters mean something there: `cache_hits` on each
+of the three cache paths (denial, negative, answer), `cache_misses` and
+`queries_recursive` together at the point a query falls through to an actual
+recursion. Nothing was deleted, because nothing needed to be — the fields were
+never wrong, they were in a binary with no cache. `queries_authoritative` is now
+the counter with no home in `rdnsr`, and it is deliberately never touched there:
+that daemon is never authoritative for anything.
 
 #### 19e. `RequestValidator` is a second, weaker copy of the parser's checks
 

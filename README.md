@@ -80,6 +80,11 @@ bottom; `rdnsc` is one command.
   selection, and a total query budget as the NXNSAttack defence
 - Answer, negative (RFC 2308) and denial caches
 - Special-use names answered locally and never forwarded (RFC 6761, 6762, 6303)
+- The same operational shell as `rdnsd`: per-source rate limit
+  (`--query-rate`), a response-byte budget (`--response-rate`), request
+  validation, Prometheus metrics and `/healthz` (`--metrics-listen`). Cache hit
+  rate is the headline counter here, where on an authoritative server it means
+  nothing
 
 **Operations**
 
@@ -507,10 +512,20 @@ forwards.
   presentation format. The second is *rewritten* as keys roll (RFC 5011)
 - `--cache-size <N>` (10000), `--no-cache`, `--root-hints <FILE>`,
   `--max-inflight-udp <N>` (1024)
+- `--query-rate <QUERIES_PER_SEC>` (200), with `--query-burst` (100) and
+  `--query-rate-exempt`. **The default is a fifth of `rdnsd`'s** because the
+  clients differ: an authoritative server answers resolvers, which legitimately
+  ask far more from one address than a person does
+- `--response-rate <BYTES_PER_SEC>` (8192; 0 disables). A resolver needs this
+  more than an authoritative server does — a 30-byte query can produce a 4 KB
+  validated answer, and `--dnssec-validate` makes that ordinary
+- `--metrics-listen <ADDR:PORT>` - Prometheus metrics and `/healthz`. No
+  `/readyz` that means anything: a resolver has nothing to wait for before it
+  can answer
 
-> **`rdnsr` has none of `rdnsd`'s operational shell** — no per-source rate limit,
-> no response-byte budget, no metrics and no probes. That is a known gap, not a
-> design decision; see `TODO.md` §18. Do not put it on a public address.
+> **It still binds 127.0.0.1 by default.** The operational shell landed in
+> `TODO.md` §18, so the gap that used to be warned about here is closed — but
+> the default bind is a separate decision and has not changed.
 
 ### Query client
 
