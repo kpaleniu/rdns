@@ -13,6 +13,18 @@ pub(crate) const POINTER_MASK: u16 = 0x3fff;
 /// The longest a single label may be (RFC 1035 §2.3.4).
 pub(crate) const MAX_LABEL_LEN: usize = 63;
 
+/// The longest a whole name may be, *encoded*: RFC 1035 §2.3.4's "names 255
+/// octets or less", which counts each label's length octet and the root's
+/// terminating zero.
+///
+/// This limit went unenforced for the first two years of this repo while the
+/// 63-octet one above was checked on every label — a name of five 63-octet
+/// labels parsed to a 320-character `String` without complaint. Which is
+/// `CLAUDE.md` §2 exactly: the length that was checked was the one that looked
+/// like a length, and the aggregate nobody was looking at came off the same
+/// wire.
+pub(crate) const MAX_NAME_LEN: usize = 255;
+
 /// Copy `bytes` into `buf` at `pos`, returning the position just past them.
 ///
 /// This is the one bounds-checked write every wire serializer goes through.
@@ -220,30 +232,21 @@ pub(crate) struct DName<'a> {
     labels: Vec<Label<'a>>,
 }
 
-/*
-Quoting from RFC 1035:
-> The following syntax will result in fewer problems with many
-> applications that use domain names (e.g., mail, TELNET).
-
-> <domain> ::= <subdomain> | " "
-
-> <subdomain> ::= <label> | <subdomain> "." <label>
-
-> <label> ::= <letter> [ [ <ldh-str> ] <let-dig> ]
-
-> <ldh-str> ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
-
-> <let-dig-hyp> ::= <let-dig> | "-"
-
-> <let-dig> ::= <letter> | <digit>
-
-> <letter> ::= any one of the 52 alphabetic characters A through Z in
-> upper case and a through z in lower case
-
-> <digit> ::= any one of the ten digits 0 through 9
-
-TODO: Implement validation to enforce this pattern
-*/
+// RFC 1035 §2.3.1's `<label> ::= <letter> [ [ <ldh-str> ] <let-dig> ]` is
+// deliberately **not** enforced here, and this comment replaces the standing
+// `TODO: Implement validation to enforce this pattern` that asked for it —
+// deleted rather than done, because doing it would be a bug. §2.3.1 offers a
+// "preferred name syntax" that "will result in fewer problems with many
+// applications that use domain names (e.g., mail, TELNET)": advice to whoever
+// *chooses* a hostname, not a rule about what the protocol carries. RFC 2181
+// §11 settles it — "the DNS itself places only one restriction on the
+// particular labels that can be used to identify resource records", that one
+// being the length, and "any binary string whatever can be used as the label
+// of any resource record". Enforcing LDH at parse time would refuse `_dmarc`,
+// every `_tcp` SRV owner, DNS-SD's instance names and the wildcard `*` itself.
+//
+// What *is* enforced is what §2.3.4 limits: `MAX_LABEL_LEN` per label, and
+// `MAX_NAME_LEN` over the whole name in `UnpackedDName::new`.
 impl<'a> TryFromBytes<'a> for DName<'a> {
     type Output = (DName<'a>, &'a [u8]);
     type Error = WireError;
@@ -326,7 +329,7 @@ impl<'a> DNameUnpacker<'a> {
             if matches!(labels.last(), Some(Label::Root)) {
                 labels.pop();
             }
-            return Ok(UnpackedDName { labels });
+            return UnpackedDName::new(labels);
         }
 
         let mut output = Vec::new();
@@ -395,7 +398,7 @@ impl<'a> DNameUnpacker<'a> {
                 Label::Root => break,
             }
         }
-        Ok(UnpackedDName { labels: output })
+        UnpackedDName::new(output)
     }
 
     /// `usize::MAX` as the starting `prev_target` is what leaves the first hop
@@ -422,6 +425,53 @@ pub(crate) trait TryUnpackFromBytes<'a> {
 #[derive(Debug)]
 pub(crate) struct UnpackedDName<'a> {
     labels: Vec<Label<'a>>,
+}
+
+impl<'a> UnpackedDName<'a> {
+    /// The only way to build one, which is what makes a name longer than
+    /// RFC 1035 §2.3.4 allows unrepresentable rather than merely unwelcome
+    /// (`CLAUDE.md` §17).
+    ///
+    /// The bound lives here rather than at the two places that assemble labels
+    /// — a name that arrived without a pointer, and one spliced together across
+    /// pointers — because a bound belongs at the boundary, once (`CLAUDE.md`
+    /// §2), and this type *is* the boundary: every name the parser resolves
+    /// becomes one before anything reads it. Putting it here also bounds the
+    /// recursive case for nothing extra, since every intermediate hop is built
+    /// through this function too, so a chain is cut off as it grows instead of
+    /// after the last hop returns.
+    ///
+    /// Measured on the **encoded** length, because that is what §2.3.4 limits:
+    /// `Label::len` already includes each label's length octet, and the root's
+    /// terminating zero is added back here — `unpack_internal` strips the
+    /// trailing `Root` before this is called, so there is no label standing in
+    /// for it.
+    fn new(labels: Vec<Label<'a>>) -> Result<UnpackedDName<'a>, WireError> {
+        check_name_len(labels.iter().map(Label::len).sum::<usize>() + 1)?;
+        Ok(UnpackedDName { labels })
+    }
+}
+
+/// The one place RFC 1035 §2.3.4's 255-octet name limit is compared, so the two
+/// doors into this module cannot drift apart about what it counts
+/// (`CLAUDE.md` §7).
+///
+/// The doors are a name resolved off the wire (`UnpackedDName::new`) and a name
+/// encoded from presentation text (`dname_to_bytes`), and they arrive at
+/// `encoded` by different arithmetic — a sum over `Label::len` on one side and
+/// over `str::len() + 1` on the other. What they must agree on is that the
+/// number being compared is the *encoded* length including every length octet
+/// and the root's terminating zero, which is the part a second copy of this
+/// comparison would eventually get wrong.
+fn check_name_len(encoded: usize) -> Result<(), WireError> {
+    if encoded > MAX_NAME_LEN {
+        return Err(WireError::TooLong {
+            what: "a domain name",
+            limit: MAX_NAME_LEN,
+            actual: encoded,
+        });
+    }
+    Ok(())
 }
 
 /***
@@ -456,6 +506,17 @@ pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, WireError> {
     // than being checked twice.
     let labels: Vec<&str> = name.split('.').collect();
     let size: usize = labels.iter().map(|l| l.len() + 1).sum::<usize>() + 1;
+
+    // `size` is already the encoded length RFC 1035 §2.3.4 limits, so the check
+    // is the same one the parse path makes and goes through the same function
+    // (`check_name_len`). One octet per byte of presentation text holds because
+    // a label containing `.` or `\` is refused outright rather than escaped
+    // (`TODO.md` #13e), so there is no escape sequence here that would encode
+    // shorter than it reads.
+    //
+    // Before the buffer, not after: a name we are about to refuse should not be
+    // allocated for (`CLAUDE.md` §13).
+    check_name_len(size)?;
 
     let mut out = vec![0u8; size];
     let mut pos = 0;
@@ -596,6 +657,49 @@ mod tests {
         // The boundary case either side: exactly enough, and one short.
         assert!(Label::try_from_bytes(&[0x02, b'a', b'b']).is_ok());
         assert!(Label::try_from_bytes(&[0x02, b'a']).is_err());
+    }
+
+    /// The encode door holds the same 255-octet limit as the parse door
+    /// (RFC 1035 §2.3.4), so a name that arrived from a zone file rather than
+    /// off the wire cannot be written over-long either.
+    ///
+    /// This was left open by the commit that closed the parse side and is the
+    /// other half of it: `dname_to_bytes` is what a zone file's names go
+    /// through, and it sized its buffer from the name without ever asking
+    /// whether the total was legal. Watched failing against that behaviour —
+    /// without `check_name_len` the over-long cases return `Ok` with a 256- and
+    /// a 321-octet buffer.
+    ///
+    /// The boundary is tested either side, in presentation lengths: four labels
+    /// encoding to exactly 255 octets is fine, and one octet more is not.
+    #[test]
+    fn a_name_over_255_octets_is_not_encoded() {
+        let label = "x".repeat(MAX_LABEL_LEN);
+
+        // 3 x 63 = 192 encoded octets, plus a 61-octet label (62) plus the
+        // root's zero is exactly 255.
+        let exact = format!("{label}.{label}.{label}.{}.", "x".repeat(61));
+        let bytes = dname_to_bytes(&exact).expect("exactly 255 octets");
+        assert_eq!(bytes.len(), MAX_NAME_LEN);
+
+        // The same name with one more octet in the last label is 256.
+        let over = format!("{label}.{label}.{label}.{}.", "x".repeat(62));
+        let err = dname_to_bytes(&over).expect_err("256 octets");
+        assert!(
+            matches!(
+                err,
+                WireError::TooLong {
+                    what: "a domain name",
+                    limit: MAX_NAME_LEN,
+                    actual: 256,
+                }
+            ),
+            "got {err:?}"
+        );
+
+        // And the case that found the parse-side hole, from this direction.
+        let five = format!("{label}.{label}.{label}.{label}.{label}.");
+        assert!(dname_to_bytes(&five).is_err(), "321 octets");
     }
 
     /// Encoding rejects what it cannot represent, rather than truncating.
@@ -801,5 +905,115 @@ mod tests {
 
         let (name, _) = dname_from_bytes(&data[8..], &unpacker).expect("two hops");
         assert_eq!(name, "w.a.b.");
+    }
+
+    /// Build an uncompressed name of `labels` labels of `len` octets each,
+    /// root-terminated. Its encoded length is `labels * (len + 1) + 1`, which is
+    /// the number RFC 1035 §2.3.4 limits.
+    fn wire_name(labels: usize, len: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        for _ in 0..labels {
+            data.push(len as u8);
+            data.extend(std::iter::repeat_n(b'x', len));
+        }
+        data.push(0);
+        data
+    }
+
+    /// A name over 255 encoded octets is refused (RFC 1035 §2.3.4: "names 255
+    /// octets or less"), with the boundary tested on both sides.
+    ///
+    /// This limit was unenforced until 2026-08-03 while the 63-octet per-label
+    /// one was checked on every label — five 63-octet labels parsed to a
+    /// 320-character `String` and nothing objected. Watched failing against the
+    /// old code: without `UnpackedDName::new`'s check the `is_err` assertions
+    /// below fail and the 320-character name comes back `Ok`.
+    ///
+    /// No pointer is involved in any of these, which is the point: the hole was
+    /// not in the compression logic, it was in the total nobody was keeping.
+    #[test]
+    fn a_name_over_255_octets_is_refused() {
+        // 5 x 63 = 321 encoded octets. The case from the probe that found this.
+        let data = wire_name(5, MAX_LABEL_LEN);
+        let unpacker = DNameUnpacker::new(&data);
+        let err = dname_from_bytes(&data, &unpacker).expect_err("321 octets");
+        assert!(
+            matches!(
+                err,
+                WireError::TooLong {
+                    what: "a domain name",
+                    limit: MAX_NAME_LEN,
+                    actual: 321,
+                }
+            ),
+            "got {err:?}"
+        );
+
+        // The boundary either side. 3 x 63 = 192, plus a 61-octet label (62)
+        // plus the root's zero is exactly 255; making that label 62 octets is
+        // 256. An off-by-one in the check lands between these two.
+        let mut exact = wire_name(3, MAX_LABEL_LEN);
+        exact.pop(); // the root, put back after the fourth label
+        exact.push(61);
+        exact.extend(std::iter::repeat_n(b'x', 61));
+        exact.push(0);
+        assert_eq!(exact.len(), MAX_NAME_LEN);
+        let unpacker = DNameUnpacker::new(&exact);
+        let (name, _) = dname_from_bytes(&exact, &unpacker).expect("exactly 255 octets");
+        assert_eq!(name.len(), 63 * 3 + 61 + 4, "three dots and one more");
+
+        let mut over = wire_name(3, MAX_LABEL_LEN);
+        over.pop();
+        over.push(62);
+        over.extend(std::iter::repeat_n(b'x', 62));
+        over.push(0);
+        assert_eq!(over.len(), MAX_NAME_LEN + 1);
+        let unpacker = DNameUnpacker::new(&over);
+        assert!(
+            dname_from_bytes(&over, &unpacker).is_err(),
+            "256 octets is one too many"
+        );
+    }
+
+    /// The same limit holds for a name *assembled* across compression pointers,
+    /// which is the second of the two paths through `unpack_internal` and a
+    /// separate branch of code from the one above.
+    ///
+    /// Both halves are legal on their own — 128 and 126 encoded octets — so this
+    /// fails against any check placed on the parse of a single name rather than
+    /// on the resolved total, which is why the bound sits in `UnpackedDName::new`
+    /// where both paths meet.
+    #[test]
+    fn a_compressed_name_whose_total_exceeds_255_is_refused() {
+        // offset 0: two 63-octet labels, then the root. 128 octets.
+        let mut data = wire_name(2, MAX_LABEL_LEN);
+        let tail = data.len();
+        // Then two more 63-octet labels followed by a pointer back to 0, so the
+        // resolved name is four 63-octet labels: 4 * 64 + 1 = 257 octets.
+        for _ in 0..2 {
+            data.push(MAX_LABEL_LEN as u8);
+            data.extend(std::iter::repeat_n(b'y', MAX_LABEL_LEN));
+        }
+        data.push(0xc0);
+        data.push(0x00);
+
+        let unpacker = DNameUnpacker::new(&data);
+
+        // The prefix alone resolves: this is not a message that is broken.
+        let (name, _) = dname_from_bytes(&data[..tail], &unpacker).expect("the 128-octet half");
+        assert_eq!(name.len(), 63 * 2 + 2);
+
+        let err = dname_from_bytes(&data[tail..], &unpacker).expect_err("257 octets resolved");
+        assert!(
+            matches!(
+                err,
+                WireError::TooLong {
+                    what: "a domain name",
+                    limit: MAX_NAME_LEN,
+                    actual: 257,
+                }
+            ),
+            "got {err:?}"
+        );
     }
 }

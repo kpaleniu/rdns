@@ -554,7 +554,7 @@ The numbers are **stable identifiers, not reading order.** They are referenced
 from the code (`ixfr.rs:16` points at "#7 step 6") and from each other, so they
 are never renumbered.
 
-**#14 is closed; #15 and #16 are filed and unstarted. Three things are open and the
+**#14 and #16 are closed; #15 is withdrawn. Three things are open and the
 table is where they are:** #7 step 6 (persisted deltas, waiting on #10), #10
 itself (the reading half is in, the writing half is not) and #11 (a stretch
 goal, unscheduled). The line here used to read "everything numbered through #13
@@ -574,7 +574,7 @@ commit that closed it, and the rule it became in `CLAUDE.md`:
 | **11** | data layout and CPU cache friendliness | **a stretch goal, not scheduled.** Its measurement harness exists now (criterion, `--baseline`); what it still lacks is the *diagnostic* half — `perf stat`'s cache-miss and branch-miss counters, which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns) is the number it would have to move |
 | **14** | three candidates #13 left on the table: `Serial`, QR as a type, sealing `RecordData` | **all three done 2026-08-02**, one commit each. 14a removed the second copy of RFC 1982 §3.2 and made `a > b` on two serials a compile error; 14b put all three socket entry points behind one `Request` door; 14c sealed `RecordData` into its own module — and, by asking what invariant it actually holds, found that a legal RFC 2136 UPDATE could not be parsed at all. 14a and 14b are preventative and say so; 14c's finding is under #10, with a regression test watched failing |
 | **16** | simplifications: `Nsec3`'s fallibility, splitting `parse_into`, and a duplication that must stay | **16b done, 16a corrected-and-withdrawn, 16c recorded as not-to-fix, 2026-08-02.** 16a is the interesting one: the filed plan did not survive being checked against `nsec3_hash` and is kept struck through with the reasoning, but the pass it came from found a live defect in `proves_no_ds`. Three more defects in `parse_dnssec_time` fell out of the same sweep |
-| **15** | `WireName` — collapsing `DName`/`UnpackedDName` into one borrowed, pointer-following type | **filed 2026-08-02, unstarted.** One candidate, with its own motivation retired inside it: the allocation case is spent, and the trigger is whether §13e's refused names are ever un-refused. Capped until storage moves to wire form, and then it is one project with it |
+| **15** | collapsing `DName`/`UnpackedDName` into one borrowed, pointer-following `DName` | **withdrawn 2026-08-03**, filed 2026-08-02 and never started. Reviewed against the code rather than the plan: the typestate is already invisible outside `dname.rs`, the volume breaks even, the allocation motive was spent before it was filed, and the price is threading absolute offsets through every parse site — declined. The section keeps the three findings and the two fixes the review *did* produce (the unenforced 255-octet name limit, the LDH `TODO` that would have been a bug) |
 | **12** | pre-authentication panics | **audited 2026-08-01.** No reachable panic in 1.4M mutated inputs; two mutex-poisoning fixes; `rdns/tests/no_input_panics.rs` left behind as the guard |
 | **13** | making illegal states unrepresentable: `OpCode`'s sentinel, the eleven name normalizations, QTYPE-vs-RTYPE, `Ttl` + `Class` + OPT out of the additional section, `Name`/`NameKey` | **done 2026-08-02**, twelve commits. 13a-13d in full; 13e's map keys done and its `Name` half deferred with a reason. Seven live defects fixed on the way. Every stage gated on `rdns/tests/allocations.rs` and every one has held its counts; 13b added a fifteenth measurement that went 2 to 0 |
 
@@ -1993,95 +1993,48 @@ Genuinely low value, recorded so nobody re-derives them: the EDNS-version check
 duplicated across `rdnsd` and `rdnsr` (two lines of policy each daemon owns),
 and nine `bool` parameters (`dnssec_ok`, `is_tcp`, `deleting`).
 
-### 15. `WireName` — collapsing the name pipeline — one candidate, unstarted
+### 15. `DName` — collapsing the name pipeline — withdrawn
 
-Written 2026-08-02, out of a conversation about the project's original design
-goal: that a domain name should never be copied, only borrowed from the packet
-bytes, with a string-like view over it. This section records what survives of
-that idea, because the honest answer has two halves and only one of them is
-worth building.
+Filed 2026-08-02, **withdrawn 2026-08-03** — the number stays because they are
+stable identifiers and are never reused (§11 above). The proposal was to replace
+`DName { labels: Vec<Label> }` and `UnpackedDName` with one borrowed
+`DName<'a> { msg, at }` that follows compression pointers as it iterates. Three
+findings killed it, and they are the whole of what is worth keeping:
 
-**The starting question was allocations, and that motivation is spent.** Say so
-first, so nobody revives this expecting a speed-up. The DHAT pass's biggest find
-— `tokio::spawn` at 1,536 bytes per datagram, 46% of everything a query
-allocated — is fixed (`rdnsd/src/main.rs` records it where the per-datagram
-spawn used to be). Names went from ~14% of the answer path to near zero with
-`ascii_lowered_cow`, `absolute_lowered` and `names_equal` (#13b, #9e). What is
-left on the parse path is 3 allocations for a one-question query, and
-`benches/answer_path.rs`'s header puts one whole answer at ~0.5 µs against ~4 µs
-for the `sendto`/`recvfrom` pair around it. A total victory over name allocation
-is order 1-2% end to end. **Do not do this for speed.**
+- **The stated motive was allocations, and that motive was already spent.** The
+  DHAT pass's biggest find (`tokio::spawn` at 1,536 bytes per datagram, 46% of a
+  query's allocations) is fixed, names went from ~14% of the answer path to near
+  zero with #13b and #9e, and `benches/answer_path.rs` puts a whole answer at
+  ~0.5 µs against ~4 µs of syscalls around it. Total victory over name
+  allocation is worth 1-2% end to end.
+- **It would not have simplified anything.** `DName` and `UnpackedDName` appear
+  in **no file outside `dname.rs`** — only `DNameUnpacker` and
+  `dname_from_bytes`/`dname_to_bytes` cross the boundary — so the typestate is
+  already invisible to the codebase. Inside the module the volume breaks even:
+  out go a `Vec` and one unreachable match arm, in come a validating walk, a
+  pointer-following iterator, a stack offset array for right-to-left traversal,
+  and `rest` as a computation separate from the resolved length.
+- **The price was absolute offsets, and they are not wanted.** A borrowed
+  `DName { msg, at }` needs a name's offset in the message; all twelve parse
+  sites hold *suffix slices* and cannot know theirs (`dname.rs` says so where it
+  explains why the first pointer hop is unconstrained). Threading
+  `(msg, offset)` through `RecordParts`, `from_parts` and every RDATA walk in
+  `lib.rs` is the real cost, and it was missing from the estimate.
+  **Decided 2026-08-03: not worth it.**
 
-**What a compressed name actually is.** Not a rope — this was checked, because
-"rope" is what it gets loosely called and it sends you after the wrong crate. A
-rope is a balanced tree whose value is O(log n) concat, split and index on large
-*mutable* text; `ropey` and `crop` are text-editor infrastructure and are UTF-8
-only, which a label (any octet, RFC 1035 §3.1) is not. A compressed name is a
-singly-linked chain of slices — a path through a DAG in the message buffer —
-that is at most 255 octets and 127 labels, immutable, and read front-to-back.
-Every property a rope charges for is one this does not need, and its nodes are
-heap-allocated, which inverts the goal. **No rope.**
+Two things came out of the review that were worth having, and they did not need
+any of the above — see the commits: RFC 1035 §2.3.4's 255-octet total name
+length is now enforced in `UnpackedDName::new` (it never was, and a name of five
+63-octet labels parsed to a 320-character `String`), and `dname.rs`'s standing
+`TODO: Implement validation to enforce this pattern` under RFC 1035 §2.3.1's
+grammar is gone, because doing it would refuse `_dmarc`, every `_tcp` SRV owner
+and `*` itself — RFC 2181 §11 says any binary string may be a label.
 
-**The half that can borrow.** `Label::String(&'a [u8])` already does. What stops
-a name being free is `DName { labels: Vec<Label> }`, the `String` at the end, and
-— now gone — the visited-offsets set. The shape that replaces all three is
-`WireName<'a> { msg: &'a [u8], at: usize }` with an `Iterator<Item = &'a [u8]>`
-over labels that follows pointers as it walks. That is enough for every question
-this codebase asks of a name: equality (zip plus `eq_ignore_ascii_case`,
-RFC 4343), `is_at_or_under`, label count, the closest-encloser walk, and DNSSEC
-canonical ordering.
-
-`DName` and `UnpackedDName` then collapse into it. They are a typestate for "may
-contain a pointer" versus "may not" — `dname.rs` says so — and an iterator that
-resolves pointers as it goes never enters the first state. This is #13's pattern
-again: the guarded-against value stops being representable, so the guard stops
-earning its keep.
-
-**Four things the sketch has to get right**, each of which is where a naive
-attempt goes wrong:
-
-- **Do not make it lazy all the way down.** If `labels()` resolves pointers
-  during iteration it must yield `Result<&[u8], WireError>`, and comparison,
-  suffix matching and the compressor all become fallible for no reason. The
-  shape that works is `WireName::parse(msg, at)` doing **one validating walk**
-  (bounds, the backwards rule, label lengths, total ≤255) and then `labels()`
-  being infallible because parse proved it terminates. The invariant does not
-  disappear, it moves to the constructor — which is the point.
-- **Two length notions, named apart.** Callers need `rest` to keep parsing the
-  record, and that is the *encoded* length at the start position (labels until
-  root-or-pointer, plus 2 if a pointer ended it) — a different number from the
-  resolved name's length. This is the one part that cannot be deferred.
-- **UTF-8 and `unrepresentable_octet` move to the presentation terminal**, and
-  improve by moving. They fire at parse today (`dname.rs`'s `TryInto<String>`).
-  With `labels()` yielding `&[u8]` they fire only in `to_string()`, which is
-  where §13e's own argument puts them: escapes and separators are presentation
-  questions, and comparison and compression have no business asking them.
-- **Right-to-left traversal is the one thing the eager `Vec` was buying.**
-  Suffix matching, `is_at_or_under` and the closest-encloser walk want labels
-  from the end, and length-prefixed labels only iterate forwards. The answer is
-  not a tree: the label count is bounded by the protocol, so collect offsets
-  into a fixed `[u16; 128]` on the stack. No heap, and the reverse walk is an
-  index decrement.
-
-**The half that cannot borrow, and why this is capped.** A zone record outlives
-every packet, so `Zone` and `DnsCache` must own their names — one allocation
-either way, and `String` versus `Box<[u8]>` there is not a performance question
-at all. Worse, a borrowed name carries a lifetime, and §13e already recorded the
-objection: a lifetime parameter would infect `Zone`, `DnsCache` and everything
-holding one. So **the borrow design must stop at the parse boundary** by
-construction.
-
-Which caps the payoff. While `ResourceRecord.name` is a `String`, `WireName`'s
-terminal is `to_string()` on every path that stores anything, so this buys the
-parse side — `allocations.rs` has a one-question query at 3, and this takes it
-toward 1 — plus a meaningfully smaller `dname.rs`. **It does not compound until
-storage moves to wire form**, which is §13e's option 1, the one it deferred.
-
-**So the trigger for starting this is a correctness decision, not a performance
-one:** whether to stop refusing the names §13e's option 3 now rejects (a `.` or
-`\` inside a label). If that is ever reopened, `WireName` and wire-form storage
-are **one project, not two**, and doing the first alone means rebuilding the
-pipeline to arrive at the same place.
+A third fix followed from the second: `dname_to_bytes` had no total-length check
+either, so the encode door — a name reaching the wire from a zone file rather
+than off it — was still open when the parse door closed. Both now go through one
+`check_name_len`, because two doors comparing the same limit by different
+arithmetic is how the copies in §7 start.
 
 ### 16. Simplifications — a review pass, and what it did *not* find
 
