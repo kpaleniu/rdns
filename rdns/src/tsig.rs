@@ -111,6 +111,78 @@ impl TsigAlgorithm {
     }
 }
 
+/// What a TSIG key may rewrite through dynamic UPDATE (RFC 2136 §3.3).
+///
+/// §3.3 is one paragraph and it specifies almost nothing: the authorization
+/// mechanism is "implementation dependent", and the only thing it fixes is that
+/// a requestor who fails it is told REFUSED. So the shape below is this
+/// codebase's decision, and it is the one `CLAUDE.md` §16 arrived at for
+/// transfers — authentication is not authorization, and the check hangs off the
+/// session that already knows which key verified rather than looking the name up
+/// a second time.
+///
+/// **Denied by default, which is the opposite of the transfer scope beside it,
+/// and deliberately so.** [`TsigKey::zones`] treats an empty list as *every*
+/// zone, and §16 records why that default was left alone: narrowing it would
+/// mean a binary upgrade silently stops every transfer on a working deployment,
+/// which is a worse failure than the one it fixes.
+///
+/// Neither half of that argument survives the move to UPDATE. There is no
+/// working deployment to break, because nothing has ever served an UPDATE here;
+/// and the consequence runs the other way, since a transfer hands over a copy
+/// and an update rewrites the original. Had this reused the transfer scope,
+/// every key that exists — all of them unscoped, because scoping is opt-in —
+/// would have silently gained write access to every zone on the server on the
+/// first release that dispatched an UPDATE. That is `CLAUDE.md` §16's opening
+/// bug exactly, arrived at from the other direction.
+///
+/// **Three states rather than a `Vec` with an overloaded empty case**
+/// (`CLAUDE.md` §17). "No zones" and "all zones" are the two answers furthest
+/// apart, and a sentinel meaning one of them depending on which field you are
+/// reading is how `QueryClass::None` and `ResponseCode::Unknown` both went
+/// wrong. Here the compiler makes the caller name which one it meant.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum UpdatePolicy {
+    /// No zone, by any key holder. The default, and what every key configured
+    /// without an explicit update scope has.
+    #[default]
+    Denied,
+    /// These zone apexes, absolute and down-cased.
+    Zones(Vec<String>),
+    /// Every zone this server is authoritative for. Spelled `*` in a key spec,
+    /// so that granting it is something an operator typed.
+    Any,
+}
+
+impl UpdatePolicy {
+    /// Whether this policy authorizes rewriting the zone at `apex`.
+    ///
+    /// Against the *apex*, for the reason [`TsigKey::may_transfer`] gives: an
+    /// UPDATE names one zone in its Zone section (RFC 2136 §3.1) and every
+    /// change in it is confined to that zone by §3.4.1's prescan, so the apex is
+    /// the whole of what is being authorized. A rule matching anything less
+    /// specific would authorize more than it names.
+    pub fn allows(&self, apex: &str) -> bool {
+        match self {
+            UpdatePolicy::Denied => false,
+            UpdatePolicy::Any => true,
+            UpdatePolicy::Zones(zones) => zones.contains(&canonical_key_name(apex)),
+        }
+    }
+}
+
+impl std::fmt::Display for UpdatePolicy {
+    /// For the startup banner, where what a key may rewrite has to be readable
+    /// without cross-referencing the flag that set it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdatePolicy::Denied => write!(f, "no zones"),
+            UpdatePolicy::Any => write!(f, "every zone"),
+            UpdatePolicy::Zones(zones) => write!(f, "{}", zones.join(", ")),
+        }
+    }
+}
+
 /// A shared secret and the name it is known by.
 #[derive(Debug, Clone)]
 pub struct TsigKey {
@@ -136,6 +208,9 @@ pub struct TsigKey {
     /// operator is editing the whole policy at once rather than reading a
     /// changelog. See `TODO.md` #9d.
     zones: Vec<String>,
+    /// What this key may rewrite through dynamic UPDATE. See [`UpdatePolicy`]
+    /// for why this one denies by default where `zones` permits.
+    update: UpdatePolicy,
 }
 
 impl TsigKey {
@@ -145,6 +220,7 @@ impl TsigKey {
             algorithm,
             secret,
             zones: Vec::new(),
+            update: UpdatePolicy::Denied,
         }
     }
 
@@ -174,6 +250,27 @@ impl TsigKey {
         self.zones.contains(&apex)
     }
 
+    /// Restrict — or grant — what this key may rewrite through dynamic UPDATE.
+    pub fn for_updates(mut self, policy: UpdatePolicy) -> Self {
+        self.update = policy;
+        self
+    }
+
+    /// Whether this key authorizes a dynamic UPDATE of the zone at `apex`.
+    ///
+    /// Separate from [`TsigKey::may_transfer`] and not derived from it: reading
+    /// a zone and rewriting it are two permissions, and a key granted one has
+    /// said nothing about the other. See [`UpdatePolicy`] for why the defaults
+    /// differ.
+    pub fn may_update(&self, apex: &str) -> bool {
+        self.update.allows(apex)
+    }
+
+    /// What this key may rewrite, for the startup banner.
+    pub fn update_scope(&self) -> &UpdatePolicy {
+        &self.update
+    }
+
     /// The zones this key is restricted to, or `None` if it is unrestricted.
     ///
     /// For the startup banner: an unscoped key is a policy decision and has to be
@@ -187,8 +284,8 @@ impl TsigKey {
         }
     }
 
-    /// Parse `[algorithm:]name:base64secret[:zone,zone,...]`, the first three
-    /// fields being the shape `dig -y` uses.
+    /// Parse `[algorithm:]name:base64secret[:transfer-zones[:update-zones]]`,
+    /// the first three fields being the shape `dig -y` uses.
     ///
     /// The algorithm defaults to HMAC-SHA256 when omitted — but **a zone list
     /// requires it to be spelled out**, because `name:secret:zones` and
@@ -197,6 +294,18 @@ impl TsigKey {
     /// happens to look like an algorithm name. Requiring the algorithm is the
     /// less surprising of the two: it fails at startup with a message, rather
     /// than reading a zone list as a secret.
+    ///
+    /// **The fifth field is the update scope, and it needs no disambiguation**:
+    /// four fields already require the algorithm, so five cannot collide with
+    /// anything (§16's rule about an ambiguous new field is satisfied by the
+    /// rule that was already there). Absent means [`UpdatePolicy::Denied`] —
+    /// every key that predates this keeps exactly the permissions it had.
+    ///
+    /// `*` in either list means every zone. It is what lets a key be
+    /// unrestricted for transfers *and* scoped for updates, which the
+    /// positional fields would otherwise make unsayable — the fourth field
+    /// cannot be left empty, since an empty list means "every zone" and an empty
+    /// *field* reads as a narrowing the operator typed.
     ///
     /// An unparsable spec is an error rather than a skip: a key the operator
     /// believes is configured but is not would fail every transfer, and the
@@ -207,18 +316,28 @@ impl TsigKey {
             TsigAlgorithm::from_name(alg)
                 .ok_or_else(|| ConfigError::new(format!("unknown TSIG algorithm {alg:?}")))
         };
-        // `None` for "no zone field at all" rather than `""`, because an *empty*
-        // fourth field has to be an error: it reads as a narrowing the operator
-        // typed, and an empty list means the opposite — every zone.
-        let (algorithm, name, secret, zones) = match parts.as_slice() {
-            [name, secret] => (TsigAlgorithm::HmacSha256, *name, *secret, None),
-            [alg, name, secret] => (named_algorithm(alg)?, *name, *secret, None),
-            [alg, name, secret, zones] => (named_algorithm(alg)?, *name, *secret, Some(*zones)),
+        // `None` for "no field at all" rather than `""`, because an *empty*
+        // field has to be an error: it reads as a narrowing the operator typed,
+        // and an empty list means the opposite — every zone.
+        let (algorithm, name, secret, zones, updates) = match parts.as_slice() {
+            [name, secret] => (TsigAlgorithm::HmacSha256, *name, *secret, None, None),
+            [alg, name, secret] => (named_algorithm(alg)?, *name, *secret, None, None),
+            [alg, name, secret, zones] => {
+                (named_algorithm(alg)?, *name, *secret, Some(*zones), None)
+            }
+            [alg, name, secret, zones, updates] => (
+                named_algorithm(alg)?,
+                *name,
+                *secret,
+                Some(*zones),
+                Some(*updates),
+            ),
             _ => {
                 return Err(ConfigError::new(format!(
-                    "TSIG key {spec:?} is not [algorithm:]name:base64secret[:zone,zone,...] \
+                    "TSIG key {spec:?} is not \
+                     [algorithm:]name:base64secret[:transfer-zones[:update-zones]] \
                      (a zone list needs the algorithm spelled out, since otherwise it cannot \
-                     be told apart from one)"
+                     be told apart from one; `*` means every zone)"
                 )))
             }
         };
@@ -236,22 +355,55 @@ impl TsigKey {
             )));
         }
 
-        // An empty entry — a trailing comma, or a bare trailing colon — means the
-        // operator wrote something they did not mean. Refusing beats silently
-        // narrowing the list, and beats silently *widening* it to every zone,
-        // which is what an empty list means.
-        let mut allowed = Vec::new();
-        for zone in zones.into_iter().flat_map(|z| z.split(',')) {
-            if zone.trim().is_empty() {
-                return Err(ConfigError::new(format!(
-                    "TSIG key {name:?} has an empty zone in its list {:?}",
-                    zones.unwrap_or_default()
-                )));
-            }
-            allowed.push(zone.trim().to_string());
-        }
-        Ok(TsigKey::new(name, algorithm, secret).for_zones(allowed))
+        // An unrestricted transfer scope is the empty list, which is what `*`
+        // and an absent field both come back as.
+        let allowed = match zones {
+            Some(list) => parse_key_zone_list(name, "transfer", list)?.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let update = match updates {
+            None => UpdatePolicy::Denied,
+            Some(list) => match parse_key_zone_list(name, "update", list)? {
+                None => UpdatePolicy::Any,
+                Some(zones) => {
+                    UpdatePolicy::Zones(zones.iter().map(|z| canonical_key_name(z)).collect())
+                }
+            },
+        };
+        Ok(TsigKey::new(name, algorithm, secret)
+            .for_zones(allowed)
+            .for_updates(update))
     }
+}
+
+/// One comma-separated zone list from a key spec: `None` for `*`, which means
+/// every zone, and the entries otherwise.
+///
+/// One function for both lists rather than the rule written twice, because the
+/// two differ only in what "every zone" is spelled as at the far end — and a
+/// second copy is where the empty-entry check would have gone missing
+/// (`CLAUDE.md` §7). `field` is in the message so the error says *which* list
+/// has the typo, which is the whole of what `TransferAcl::parse_named` cost and
+/// bought.
+///
+/// An empty entry — a trailing comma, or a bare trailing colon — means the
+/// operator wrote something they did not mean. Refusing beats silently narrowing
+/// the list, and beats silently *widening* it, which is what an empty list means
+/// for transfers.
+fn parse_key_zone_list(name: &str, field: &str, list: &str) -> ConfigResult<Option<Vec<String>>> {
+    if list.trim() == "*" {
+        return Ok(None);
+    }
+    let mut zones = Vec::new();
+    for zone in list.split(',') {
+        if zone.trim().is_empty() {
+            return Err(ConfigError::new(format!(
+                "TSIG key {name:?} has an empty zone in its {field} list {list:?}"
+            )));
+        }
+        zones.push(zone.trim().to_string());
+    }
+    Ok(Some(zones))
 }
 
 /// The keys a server knows, by name.
@@ -301,16 +453,29 @@ impl TsigKeyring {
         self.keys.iter()
     }
 
-    /// One line per key: its name and what it may transfer.
+    /// One line per key: its name, what it may transfer, and what it may
+    /// rewrite.
     ///
     /// Printed at startup because "this key can transfer everything" is a
     /// decision, and an undisplayed decision is one nobody reviews.
+    ///
+    /// The update scope is named only when it is not [`UpdatePolicy::Denied`],
+    /// which is every key until an operator grants one. The banner would
+    /// otherwise carry "updates no zones" for every key on every server that has
+    /// never used dynamic UPDATE — noise that trains the reader to skip the line
+    /// where the interesting case appears.
     pub fn describe(&self) -> String {
         self.keys
             .iter()
-            .map(|key| match key.zone_scope() {
-                Some(zones) => format!("{} -> {}", key.name, zones.join(",")),
-                None => format!("{} -> every zone", key.name),
+            .map(|key| {
+                let transfer = match key.zone_scope() {
+                    Some(zones) => zones.join(","),
+                    None => "every zone".to_string(),
+                };
+                match key.update_scope() {
+                    UpdatePolicy::Denied => format!("{} -> {transfer}", key.name),
+                    granted => format!("{} -> {transfer}, updates {granted}", key.name),
+                }
             })
             .collect::<Vec<_>>()
             .join("; ")
@@ -498,6 +663,19 @@ impl TsigSession {
     /// attacker-supplied until the MAC verifies.
     pub fn may_transfer(&self, apex: &str) -> bool {
         self.key.may_transfer(apex)
+    }
+
+    /// Whether the key that authenticated this request may rewrite `apex`
+    /// through dynamic UPDATE (RFC 2136 §3.3).
+    ///
+    /// On the session for the same reason as [`TsigSession::may_transfer`], and
+    /// it is worth restating because this is the more dangerous of the two: the
+    /// session *is* the answer to "which key was this", and a key name in a
+    /// request is attacker-supplied until the MAC verifies. Looking the name up
+    /// again to decide who may rewrite a zone would be a second chance to get
+    /// that wrong.
+    pub fn may_update(&self, apex: &str) -> bool {
+        self.key.may_update(apex)
     }
 
     /// Sign one response message, returning the bytes with a TSIG appended.
@@ -1122,6 +1300,119 @@ mod tests {
         let unscoped = TsigKey::parse("hmac-sha256:any.key:AAECAwQFBgcICQoLDA0ODw==").unwrap();
         assert_eq!(unscoped.zone_scope(), None);
         assert!(unscoped.may_transfer("anything.test."));
+    }
+
+    /// **A key that may transfer a zone may not thereby rewrite it.**
+    ///
+    /// RFC 2136 §3.3 leaves the mechanism to the implementation, so the shape is
+    /// this codebase's decision — but the *default* is the security-relevant
+    /// part, and it runs opposite to the transfer scope beside it. An unscoped
+    /// key transfers everything, which `CLAUDE.md` §16 kept deliberately because
+    /// narrowing it would stop every transfer on a working deployment. Reusing
+    /// that for updates would have handed write access to every zone to every
+    /// key already in every keyring, on the first release that dispatched an
+    /// UPDATE — §16's opening bug, arrived at from the other direction.
+    ///
+    /// **Watched failing** against `may_update` delegating to `may_transfer`:
+    /// the unscoped key rewrote `anything.test.` and the transfer-scoped key
+    /// rewrote `example.com.`, and the first two assertions below fired.
+    #[test]
+    fn a_key_that_may_transfer_a_zone_may_not_thereby_rewrite_it() {
+        let unscoped = TsigKey::parse("hmac-sha256:any.key:AAECAwQFBgcICQoLDA0ODw==").unwrap();
+        assert!(
+            unscoped.may_transfer("anything.test."),
+            "the transfer default is unchanged"
+        );
+        assert!(
+            !unscoped.may_update("anything.test."),
+            "and grants nothing at all for UPDATE"
+        );
+
+        let transfer_only =
+            TsigKey::parse("hmac-sha256:partner.key:AAECAwQFBgcICQoLDA0ODw==:example.com.")
+                .unwrap();
+        assert!(transfer_only.may_transfer("example.com."));
+        assert!(
+            !transfer_only.may_update("example.com."),
+            "reading a zone is not permission to rewrite it"
+        );
+        assert_eq!(transfer_only.update_scope(), &UpdatePolicy::Denied);
+
+        // Granted, and scoped: the fifth field.
+        let writer = TsigKey::parse(
+            "hmac-sha256:dhcp.key:AAECAwQFBgcICQoLDA0ODw==:*:dyn.example.com.,other.test",
+        )
+        .expect("a five-field spec parses");
+        assert!(
+            writer.may_transfer("anything.test."),
+            "`*` in the fourth field is the unrestricted transfer scope"
+        );
+        assert!(writer.may_update("dyn.example.com."));
+        assert!(
+            writer.may_update("OTHER.TEST"),
+            "a zone name is a domain name: ASCII case and the trailing dot do \
+             not decide authorization (RFC 4343)"
+        );
+        assert!(
+            !writer.may_update("example.com."),
+            "a zone it does not name is refused"
+        );
+        assert!(
+            !writer.may_update("sub.dyn.example.com."),
+            "and so is a child — an UPDATE names one zone in its Zone section, \
+             so anything less specific than the apex authorizes more than it names"
+        );
+
+        // And the explicit grant of everything, which has to be typed.
+        let any = TsigKey::parse("hmac-sha256:root.key:AAECAwQFBgcICQoLDA0ODw==:*:*").unwrap();
+        assert_eq!(any.update_scope(), &UpdatePolicy::Any);
+        assert!(any.may_update("whatever.test."));
+    }
+
+    /// The fifth field needs no disambiguation — four already require the
+    /// algorithm — but the empty-entry rule has to apply to it too, and the
+    /// error has to say *which* list is wrong.
+    #[test]
+    fn an_update_scope_reports_its_own_typos() {
+        let with_bad_update =
+            TsigKey::parse("hmac-sha256:k:AAECAwQFBgcICQoLDA0ODw==:*:example.com.,");
+        let err = with_bad_update.expect_err("a trailing comma").to_string();
+        assert!(
+            err.contains("update"),
+            "the message names the list with the typo, not just 'a list': {err}"
+        );
+
+        let with_bad_transfer =
+            TsigKey::parse("hmac-sha256:k:AAECAwQFBgcICQoLDA0ODw==:example.com.,:*");
+        let err = with_bad_transfer.expect_err("a trailing comma").to_string();
+        assert!(err.contains("transfer"), "{err}");
+
+        // Six fields is not a spec.
+        assert!(TsigKey::parse("hmac-sha256:k:AAECAwQFBgcICQoLDA0ODw==:*:*:extra").is_err());
+    }
+
+    /// The banner names an update grant, and stays quiet when there is none.
+    ///
+    /// Both halves matter: an ungranted key is the overwhelming majority, and a
+    /// banner carrying "updates no zones" for every one of them is what trains
+    /// the reader to skip the line where the granted key appears.
+    #[test]
+    fn the_banner_names_an_update_grant_and_only_a_grant() {
+        let ring = TsigKeyring::new(vec![
+            TsigKey::new("reader.key.", TsigAlgorithm::HmacSha256, vec![1; 32]),
+            TsigKey::new("writer.key.", TsigAlgorithm::HmacSha256, vec![2; 32])
+                .for_zones(["example.com."])
+                .for_updates(UpdatePolicy::Zones(vec!["dyn.example.com.".to_string()])),
+        ]);
+        let described = ring.describe();
+        assert!(
+            described.contains("reader.key. -> every zone;"),
+            "no update clause for a key with no grant: {described}"
+        );
+        assert!(
+            described.contains("writer.key. -> example.com., updates dyn.example.com."),
+            "{described}"
+        );
     }
 
     /// A zone list needs the algorithm spelled out, because `name:secret:zones`

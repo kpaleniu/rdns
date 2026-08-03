@@ -370,7 +370,7 @@ surprises a host that happens to be named in a zone.
 secondary role, no master to be told by, and nothing to fetch. The attempt is
 logged either way — a NOTIFY from an unexpected source is worth seeing.
 
-### `--tsig-key <[ALG:]NAME:SECRET>`
+### `--tsig-key <[ALG:]NAME:SECRET[:TRANSFER-ZONES[:UPDATE-ZONES]]>`
 
 A TSIG key (RFC 8945). **Repeatable**, and available on both subcommands.
 
@@ -394,10 +394,35 @@ a keyed MAC over the message.
 - A malformed key spec stops the server rather than leaving a key the operator
   believes is configured silently absent.
 
+**The two zone lists, and why their defaults are opposite.** Both are
+comma-separated, both take `*` for "every zone", and a list of either kind
+requires the algorithm to be spelled out — `name:secret:zones` and
+`alg:name:secret` are both three fields and cannot otherwise be told apart.
+
+- **Transfer zones (the fourth field). Absent means every zone.** Narrowing that
+  default would mean upgrading the binary silently stops every transfer on a
+  working deployment, which is worse than the thing it fixes. Scoping is
+  therefore opt-in, and the startup banner prints what each key may transfer so
+  an unscoped key is a visible decision rather than an invisible one.
+- **Update zones (the fifth field). Absent means no zone.** A transfer hands over
+  a copy; an update rewrites the original. Nothing had ever served an UPDATE
+  before this existed, so there was no working deployment for a deny-by-default
+  to break — and reusing the transfer scope would have handed write access to
+  every zone to every key already configured. Granting has to be typed.
+
+`*` in the fourth field is how a key is left unrestricted for transfers *and*
+scoped for updates: the fifth field is positional, so the fourth cannot simply be
+left off, and an empty fourth field is refused because it reads as a narrowing
+while an empty *list* means the opposite.
+
 ```bash
-# Transfers to whoever holds the key, from anywhere.
+# Transfers to whoever holds the key, from anywhere. No update rights.
 rdnsd --zone-file example.com.zone \
   --tsig-key hmac-sha256:transfer.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=
+
+# A DHCP server that may rewrite one zone and transfer any.
+rdnsd --zone-dir /etc/rdns/zones \
+  --tsig-key hmac-sha256:dhcp.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=:*:dyn.example.com.
 
 # Belt and braces: the key, and only from the secondary's address.
 rdnsd --zone-file example.com.zone \

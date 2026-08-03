@@ -6,6 +6,14 @@ mistakes this codebase has already made and the rules that follow from them.
 Read both before planning; the first rule in `CLAUDE.md` is why a green suite
 here has twice not meant what it looked like.
 
+**`docs/spec/` is the third of the three, added 2026-08-03**, and it answers the
+question the other two do not: *what does this actually do*. Seven files derived
+by reading the code, not by reading intent — the wire codec, the zone model, each
+daemon, DNSSEC, operations, and an RFC conformance table that collects every
+known deviation and gap in one place. Reach for it when you need the behaviour
+rather than the history; reach for here when you need to know what is open.
+`docs/ARCHITECTURE_REVIEW.md` is the review that produced it and #17-#19.
+
 **Starting cold, read in this order:** "Current state" for what works today and
 what is unproven, "How to run" for the commands, the four environment traps under
 "Verifying" (each has cost an hour) plus the Linux recipe beside them for anything
@@ -15,8 +23,13 @@ are the part of this file that is not written down anywhere else. Finished work
 is one line each under "Done so far", pointing at the commit that carries its
 reasoning, RFC citations and verification.
 
-**The short version, if you read nothing else:** **every numbered item through
-#14 is closed.** The operational
+**The short version, if you read nothing else:** **#12, #13, #14 and #16 are
+closed and #15 is withdrawn** — this line read "every numbered item through #14
+is closed" until 2026-08-03, which was never true of #7 step 6, #10 or #11, all
+three of which the "Open work" table already listed as open two screens below.
+Corrected in place rather than reworded (`CLAUDE.md` §11), because it is the
+third time a *count* in a preamble has gone stale on this page and the shape is
+the lesson: read the table, not the summary. The operational
 shell is finished; #9's five-way review went in full, its last performance item
 closed by measuring rather than fixing it; #12's audit found no reachable panic
 and left a fuzzer behind to keep it that way; and **#13 moved five families of
@@ -25,13 +38,24 @@ fixing seven live defects on the way** — an opcode field that rewrote eleven o
 its sixteen values, a QTYPE=ANY answer that SERVFAILed a good signature, two OPT
 records where RFC 6891 requires FORMERR, an escaped dot encoded as two labels,
 two distinct wire names collapsing onto one string, a fifth copy of the ANY rule,
-and `rdnsd` answering a response sent to its UDP port. What is left is a stretch
-goal (#11), a feature nobody has scheduled (#10), three candidates (#14),
-and the first thing worth doing: **CI runs now, and its first run failed.** Build
-and test with the four commands at the top of `CLAUDE.md`; `cargo bench -p rdns`
-is the fifth. **Do not push** — commit locally and leave it; every push spends
-the owner's GitHub Actions minutes on a private repository. Nothing is
-half-applied and the tree is clean.
+and `rdnsd` answering a response sent to its UDP port.
+
+**What is left**: a stretch goal (#11), a feature half-built on purpose (#10),
+and **three sections filed on 2026-08-03 from an architecture review** —
+**#17**, the one confirmed bug in the tree (a TCP length prefix that wraps to 0
+on a TSIG-signed answer near 64 KB, so the connection is dropped with no answer);
+**#18**, seven operational facilities that exist in the library and are wired
+into `rdnsd` only, leaving `rdnsr` with no rate limit and no metrics at all; and
+**#19**, eight smaller items, five of which are stragglers of consolidations that
+caught most copies and missed one. The review also left `docs/spec/` behind — a
+seven-file description of what the code actually does, with the RFC deviations
+and gaps collected in one table. Also still true: **CI runs now, and its first
+run failed** (the test's fault, fixed locally, unpushed).
+
+Build and test with the four commands at the top of `CLAUDE.md`;
+`cargo bench -p rdns` is the fifth. **Do not push** — commit locally and leave
+it; every push spends the owner's GitHub Actions minutes on a private
+repository. Nothing is half-applied and the tree is clean.
 
 **This file was cut from 6,067 lines to about a third of that on 2026-08-02**,
 when the last numbered item closed. What went was the full text of findings that
@@ -44,7 +68,7 @@ this page turned out to be wrong.
 
 ---
 
-## Current state (last updated 2026-08-02)
+## Current state (last updated 2026-08-03)
 
 **Workspace** — five members, all on branch `main` (it was `master` until
 2026-08-01; the rename is why older commit messages say the other one):
@@ -554,29 +578,49 @@ The numbers are **stable identifiers, not reading order.** They are referenced
 from the code (`ixfr.rs:16` points at "#7 step 6") and from each other, so they
 are never renumbered.
 
-**#14 and #16 are closed; #15 is withdrawn. Three things are open and the
-table is where they are:** #7 step 6 (persisted deltas, waiting on #10), #10
-itself (the reading half is in, the writing half is not) and #11 (a stretch
-goal, unscheduled). The line here used to read "everything numbered through #13
-is closed", which was already untrue of those three when it was written and went
-stale again when #14 landed — left corrected rather than quietly reworded,
-per `CLAUDE.md` §11. What each item was, and where its reasoning now lives — the
-commit that closed it, and the rule it became in `CLAUDE.md`:
+**#14 and #16 are closed; #15 is withdrawn; #7 and #10 closed on 2026-08-03.
+Four things are open and the table is where they are:** #11 (a stretch goal,
+unscheduled), and **#17, #18 and #19, filed 2026-08-03 from an architecture
+review** — a confirmed bug, a feature gap, and a bucket of smaller items.
+
+~~#7 step 6 (persisted deltas, no longer blocked — see below), #10 itself (the
+writing half is in too; what is left is incremental re-signing and the
+journal)~~ — both of those went the same day, which is the fourth time this
+paragraph has gone stale.
+
+This line has now gone stale four times and is left corrected in place every
+time rather than quietly reworded, per `CLAUDE.md` §11. It first read "everything
+numbered through #13 is closed", which was already untrue of three items when it
+was written; then "three things are open", which #17-#19 falsified the day they
+were filed; and now the #10 parenthetical, falsified the same day by three
+commits against it. **The lesson is in the shape, not the wording: a count in a
+preamble is a claim that goes stale whenever the list below it changes**, which
+is why the table is the thing to read and this paragraph is not. The third
+instance says something the first two did not, though: the stale claim was not a
+count this time but a *status*, and a status goes stale faster than a count
+does. The fourth went stale within hours of the third, which is the same lesson
+with the volume turned up.
+
+What each item was, and where its reasoning now lives — the commit that closed
+it, and the rule it became in `CLAUDE.md`:
 
 | # | what it was | closed |
 |---|---|---|
 | **1-4, 6** | recursor, DNSSEC and NSEC3 follow-ups, zone lookup, special-use names | see "Closed work" below |
 | **5** | smaller items: AXFR, TSIG, NOTIFY, IXFR, amplification, negative caching, `$INCLUDE`, TXT framing | all done; see "Done so far" |
-| **7** | the secondary role, in six steps | 5 of 6 done; step 6 (persisted deltas) waits on #10 and is the one unchecked box in this file |
+| **7** | the secondary role, in six steps | **all six done 2026-08-03.** Step 6, persisted deltas, waited on #10 and landed with it: `rdns/src/journal.rs` |
 | **8** | what signing turned up — the re-signing timer and its serial | done |
 | **9** | what a five-way review found: 48 defects in six groups (9a-9f) | **all done, 2026-07-27 → 2026-08-01.** The patterns became `CLAUDE.md`, which is the useful artefact; the 2,435 lines of finding text are in `git log -p TODO.md` |
-| **10** | dynamic UPDATE (RFC 2136) | **started 2026-08-02.** The reading half is in (`rdns/src/update.rs`: §2.4/§2.5 forms, §3.1, §3.2, §3.4.1's prescan); the writing half — apply, serial, re-signing, journal — is not. #7 step 6 still waits on it |
+| **10** | dynamic UPDATE (RFC 2136) | **done 2026-08-03**, seven commits. Reading (`2f94124`, `1461036`), applying and the serial (`dcfe861`), authorization (`9051d4e`), dispatch and persistence (`8169f0d`). Incremental re-signing (`3b2886a`) and the journal (#7 step 6) closed it |
 | **11** | data layout and CPU cache friendliness | **a stretch goal, not scheduled.** Its measurement harness exists now (criterion, `--baseline`); what it still lacks is the *diagnostic* half — `perf stat`'s cache-miss and branch-miss counters, which this Windows machine cannot read. `zone/miss in a 10k-record zone` (159 ns) is the number it would have to move |
 | **14** | three candidates #13 left on the table: `Serial`, QR as a type, sealing `RecordData` | **all three done 2026-08-02**, one commit each. 14a removed the second copy of RFC 1982 §3.2 and made `a > b` on two serials a compile error; 14b put all three socket entry points behind one `Request` door; 14c sealed `RecordData` into its own module — and, by asking what invariant it actually holds, found that a legal RFC 2136 UPDATE could not be parsed at all. 14a and 14b are preventative and say so; 14c's finding is under #10, with a regression test watched failing |
 | **16** | simplifications: `Nsec3`'s fallibility, splitting `parse_into`, and a duplication that must stay | **16b done, 16a corrected-and-withdrawn, 16c recorded as not-to-fix, 2026-08-02.** 16a is the interesting one: the filed plan did not survive being checked against `nsec3_hash` and is kept struck through with the reasoning, but the pass it came from found a live defect in `proves_no_ds`. Three more defects in `parse_dnssec_time` fell out of the same sweep |
 | **15** | collapsing `DName`/`UnpackedDName` into one borrowed, pointer-following `DName` | **withdrawn 2026-08-03**, filed 2026-08-02 and never started. Reviewed against the code rather than the plan: the typestate is already invisible outside `dname.rs`, the volume breaks even, the allocation motive was spent before it was filed, and the price is threading absolute offsets through every parse site — declined. The section keeps the three findings and the two fixes the review *did* produce (the unenforced 255-octet name limit, the LDH `TODO` that would have been a bug) |
 | **12** | pre-authentication panics | **audited 2026-08-01.** No reachable panic in 1.4M mutated inputs; two mutex-poisoning fixes; `rdns/tests/no_input_panics.rs` left behind as the guard |
 | **13** | making illegal states unrepresentable: `OpCode`'s sentinel, the eleven name normalizations, QTYPE-vs-RTYPE, `Ttl` + `Class` + OPT out of the additional section, `Name`/`NameKey` | **done 2026-08-02**, twelve commits. 13a-13d in full; 13e's map keys done and its `Name` half deferred with a reason. Seven live defects fixed on the way. Every stage gated on `rdns/tests/allocations.rs` and every one has held its counts; 13b added a fifteenth measurement that went 2 to 0 |
+| **17** | the TCP length prefix wraps to 0 on a TSIG-signed answer near 64 KB, and the framing is written out five times | **open, filed 2026-08-03.** The one confirmed bug of the review — provoked, not argued: a wrapped prefix of 0 is what both read loops treat as a broken peer, so the client's connection is dropped with no answer. `append_tsig` is what pushes a message past the size it was serialized to |
+| **18** | `rdnsr` has none of the operational shell — no rate limiter, no response budget, no logger, no metrics, no probes, no validator | **open, filed 2026-08-03.** Seven library facilities `rdnsd` uses and `rdnsr` does not, all of them tested and reachable. The asymmetry runs the wrong way round: the resolver is the more amplifying of the two and the unobservable one. Probably #9d being scoped to `rdnsd` |
+| **19** | the review's smaller items, 19a-19h | **open, filed 2026-08-03.** Five stragglers of consolidations that caught most copies and missed one (19a-19c, 19h), one duplicated check (19e), one candidate that may not be worth it (19f), and two documentation items (19g and the `#13e` correction below). Includes the list of what the pass checked and found *nothing* wrong with, which is the half of §16 that turned out to be most useful |
 
 **What the letters mean**, because comments in the code and lines further down
 this page still name them and the sections they named are gone:
@@ -633,36 +677,53 @@ queue.
 > image has no clippy package, so that half had only ever run on Windows. They
 > may have passed silently; nobody has looked.
 >
-> **2. #10, dynamic UPDATE (RFC 2136)** — and it is more urgent than it was.
-> The reading half is in and, until 2026-08-02, could not be reached from the
-> wire at all: an RDLENGTH=0 record made the whole message FORMERR before
-> `update.rs` ran (see §10). That is fixed, so the writing half now builds on
-> something shown to work end to end rather than only in memory. Read §10 first
-> — it says which four of the six original items are still on the far side of
-> the seam, and the serial one has to be designed together with #8.
+> **2. #17, the TCP length prefix** — **the only confirmed bug on this page**,
+> and the shortest item on it. A TSIG-signed answer whose serialized form lands
+> in an 82-octet window below 64 KB is framed with a prefix of **0**, which both
+> daemons' read loops treat as a broken peer: the connection is dropped with no
+> answer and nothing saying why. Provoked and watched, so the regression test is
+> already written in §17 and has been seen failing. Two boxes — a length check in
+> `append_tsig`, and one `rdns::framed` helper replacing five unchecked
+> `as u16`s.
 >
-> **#14 is closed** — 14a (`Serial`), 14b (`Request`) and 14c (sealing
-> `RecordData`) all landed on 2026-08-02. See §14.
+> **3. #10, dynamic UPDATE (RFC 2136)** — ~~**started, one piece in**, and more
+> urgent than it was~~ **— done as of 2026-08-03**, apart from incremental
+> re-signing and the journal. The paragraph that was here said "the next piece is
+> applying the changes, and it must be designed together with the serial: an
+> UPDATE bumps it and so does re-signing (#8), and both then have to survive a
+> reload that re-reads a file saying something older." That was the right
+> instruction and the answer it produced is in §10 — the two compose rather than
+> collide, because `signed_serial` **adds** its time term instead of `max`ing it,
+> which is the correction #8 had already taken from PowerDNS's docs. What the
+> instruction did *not* anticipate is the thing that actually set the design, and
+> it is in §10 under "the finding": the reload it mentions is not only a restart
+> or a SIGHUP, it is the **re-signing timer**, which reloads from the file every
+> cycle — so persistence was a precondition for dispatch rather than a step after
+> it.
 >
-> **3. #10, dynamic UPDATE (RFC 2136)** — **started, one piece in.**
-> `rdns/src/update.rs` reads an UPDATE and checks its prerequisites; nothing
-> applies one yet. The next piece is applying the changes, and it must be
-> designed together with the serial: an UPDATE bumps it and so does re-signing
-> (#8), and both then have to survive a reload that re-reads a file saying
-> something older. Read §10 below before starting — it says which four of the
-> six original items are still on the far side of the seam.
+> **4. #18, `rdnsr`'s operational shell** — seven library facilities that exist,
+> are tested, and are wired into one daemon. Staged it is small, and one of the
+> four boxes is a *decision* rather than code: which counters a resolver should
+> have, since `rdnsd`'s set is authoritative-shaped.
 >
-> **4. The rest of #13 (13b-13e)** — subtraction first (13b deletes six
-> duplicate normalizations, including a `to_lowercase` in the public API that
-> §8 forbids), then the two zero-cost newtypes, then the deep one. 13d is where
-> the work is: OPT comes out of the additional section, which is what lets the
-> TTL clamp move to the parse boundary, and the two halves land in that order
-> because the second is only correct after the first.
+> **5. #19, the smaller items** — 19a-19h, none of them large. 19d (three metrics
+> nothing increments) and 19h's one-liners are the cheapest; 19e is a
+> prerequisite for #18's last box.
 >
-> **5. #11, cache locality** — wanted, but blocked on hardware counters this
+> **6. #11, cache locality** — wanted, but blocked on hardware counters this
 > machine cannot read. Its harness is ready. Note that **#13e deliberately stops
 > short of this**: a `Name` with inline or wire-format storage is #11's question,
 > and doing both at once means neither measurement can be read.
+
+> **Two corrections to this list, 2026-08-03** (`CLAUDE.md` §11 — in place, not
+> quietly). It had **#10 as both item 2 and item 3**, saying much the same thing
+> twice with the second one more accurate, and a stray "#14 is closed" repeated
+> between them from the paragraph directly above. And **item 4 was "the rest of
+> #13 (13b-13e)"**, which went stale on 2026-08-02 when #13 closed in full —
+> a queue that outlived the work it described. Both are folded into the list
+> above. The pattern is the one the "Open work" preamble just recorded: a
+> hand-maintained ordering is a claim that goes stale whenever the sections move,
+> and nothing checks it.
 
 **Read `benches/answer_path.rs`'s header before quoting anything from it.** One
 whole answer is 522 ns and one `sendto`+`recvfrom` pair is 4 µs, so the entire
@@ -677,25 +738,212 @@ zone@master[:port][#key]`, IXFR-out from in-memory diffs, and IXFR-in. See
 "Architecture: the secondary role" and "Architecture: incremental transfer" for
 the shapes, and "Done so far" for the commits.
 
-- [ ] **6. Persisted deltas**, only if dynamic UPDATE (RFC 2136) ever arrives —
-      that is what really needs a journal, because then the journal *is* the
-      record of what happened rather than something recomputed from two versions
-      that are both still in memory. `ixfr.rs:16` points here. Until then a
-      restart forgetting its deltas is correct, permitted unconditionally by
-      RFC 1995 §4, and self-correcting: the next change after a restart has a
-      delta again.
+- [x] **6. Persisted deltas** — ~~only if dynamic UPDATE (RFC 2136) ever
+      arrives~~ **done 2026-08-03**: it arrived (#10), so the condition this
+      box was waiting on was met, and `rdns/src/journal.rs` is the result. The reasoning it was filed with still holds and
+      is why it is worth doing now rather than merely possible — a journal is the
+      record of what *happened*, where a diff between two in-memory versions is
+      something recomputed after the fact. `ixfr.rs:16` points here.
 
-### 10. Dynamic UPDATE (RFC 2136) — started 2026-08-02, one piece in
+      **What changed about the argument.** The original said a restart forgetting
+      its deltas is "correct, permitted unconditionally by RFC 1995 §4, and
+      self-correcting". All three are still true and none of them is the point
+      any more. With UPDATE served, the zone changes between reloads rather than
+      only at them, and `install_zone` records one delta per update — so a busy
+      zone can now exhaust `MAX_DELTAS_PER_ZONE` (32) in thirty-two updates and
+      drop every secondary to a full transfer, which it could not do when the
+      only source of change was an operator editing a file. That is a *capacity*
+      argument the file version never had, and it is the one to size the journal
+      against.
 
-**The reading half is done and the writing half is not.** `rdns/src/update.rs`
-turns an UPDATE message into a checked list of prerequisites and changes and
-evaluates the prerequisites against a zone. It never mutates a zone, touches a
-file, bumps a serial or looks at a key.
+      **What was built.** A per-zone file beside the zone, holding each version
+      step as the RFC 1995 difference sequence a client would receive — old SOA,
+      deletions, new SOA, additions — in the presentation format `zone_writer`
+      emits and `zone::parse_zone_file` reads. Reusing both is §7, but the reason
+      that matters is that the *positional* read is the same one `ixfr_response`
+      writes and `secondary` consumes, so a journal entry and a wire increment
+      cannot drift into meaning different things. Safe because `ixfr::diff`
+      excludes the apex SOA from both lists: the only apex SOAs in a sequence are
+      the two framing it.
 
-That seam was chosen rather than found: of the six things listed below, four are
-policy or persistence, and all four sit on the far side of "here is what this
+      **Rewritten whole rather than appended to**, which is the trade to state
+      rather than hide. A partial append corrupts the tail of a file whose reader
+      is this same server at its next start, and append-atomicity is a protocol to
+      design and test; `persist::write_atomically` already gives all-or-nothing,
+      and the history is bounded at 32 sequences of a handful of records. That is
+      the wrong trade for a journal of unbounded size and the right one here.
+
+      **A corrupt journal is a warning, not a refusal to start** — the opposite of
+      the secondary state file, and the difference is worth keeping straight.
+      Forgetting a last-contact time is the difference between a withdrawn zone
+      and a stale one served with AA set, so that file is fatal (`CLAUDE.md` §4).
+      Losing a journal costs some secondaries a full transfer, which RFC 1995 §4
+      permits at any time and which is what happened on every restart before this
+      existed. Refusing to start over it would turn a cosmetic loss into an
+      outage. A journal that does not link end to end is refused at *load*, though,
+      because a gap would send a secondary a version that never existed and no
+      serial comparison afterwards could detect it — and a file on disk is a thing
+      an operator can edit.
+
+      A journal whose last step does not reach the serial actually loaded is
+      discarded: the zone moved past it by some route the journal never saw, an
+      operator editing the file while the process was down being the ordinary one.
+
+### 10. Dynamic UPDATE (RFC 2136) — served end to end 2026-08-03
+
+**Done, apart from incremental re-signing and the journal.** A TSIG-signed
+UPDATE reaches `rdnsd` on either transport, is authorized against the key's own
+scope, has its prerequisites checked, is applied, is written to the zone file and
+is served — in that order, with the write before the install. Five commits:
+
+| | |
+|---|---|
+| `2f94124` | read an UPDATE and check its prerequisites |
+| `1461036` | RDLENGTH=0 is a record, so a legal UPDATE could be parsed at all |
+| `dcfe861` | apply the changes, and settle the serial |
+| `9051d4e` | a key that may transfer a zone may not thereby rewrite it |
+| `8169f0d` | serve it, and persist it before answering |
+
+**The finding, which set the shape of the last commit and was not in the plan.**
+Persisting an update looks like a step *after* dispatch — the reason to do it is
+a restart, and a restart is survivable. That is wrong here, and the reason is
+`ZoneSigning::resign_interval`: the re-signing timer does its work **by
+reloading every zone from its file**, because the served serial is the file's
+serial plus a time term and re-signing the in-memory copy would apply that
+derivation to its own output and compound the bump every cycle. So a change that
+lived only in the zone map is discarded within one re-signing interval, with
+nothing logged and no error anywhere — a write the client was told had succeeded,
+with a timer on it. Persistence was a precondition for dispatch, not a follow-on.
+
+The shape that falls out: **an UPDATE is a zone-file edit followed by the load
+path.** Read the zone as the file has it, check §3.2 against that, apply, write
+atomically, sign the result the way a reload would, install. The file stays the
+input to every derivation, which is what makes the whole thing idempotent and
+what keeps `signed_serial` from compounding.
+
+**The serial collision with #8 resolved in #8's favour without any work.** An
+UPDATE bumps the file's serial by one (§3.6); signing serves `file + hours`.
+Because that term is **added** and not `max`ed — the correction #8 had already
+taken from PowerDNS's "requiring epoch-based backend serials" — the +1 survives
+signing as a +1 in the served number. Under a `max`, every update inside one hour
+would have served one serial and no secondary would have fetched any of them.
+`update::tests::an_updates_serial_bump_survives_signing` holds both halves,
+including what the `max` would have done.
+
+**Two RFC readings that needed a decision rather than a transcription.**
+§3.4.2.2's prose ignores an SOA whose serial is "lower ... than or equal to" the
+current one, while §3.4.2.7's pseudocode spells the same test as
+`zone.serial > rr.serial`, which *accepts* equal. The prose wins: the
+pseudocode's reading lets an UPDATE rewrite MNAME, RNAME or the timers while
+leaving the version number alone, and §3.6 calls it "imperative that the zone's
+contents and the SOA's SERIAL be tightly synchronized". And §3.6's automatic bump
+fires **only when something changed** — the increment is owed "prior to including
+the SOA or any modified resource records", and an UPDATE that modified nothing
+has none; bumping unconditionally makes a DHCP client's retried deletion cost a
+re-signing run and an IXFR to every secondary.
+
+**The authorization default runs opposite to the transfer scope, deliberately.**
+`TsigKey::zones` treats an empty list as *every* zone and `CLAUDE.md` §16 records
+why that was left alone: narrowing it would stop every transfer on a working
+deployment. Neither half of that argument survives here — nothing had ever served
+an UPDATE, so there was no deployment to break, and a transfer hands over a copy
+where an update rewrites the original. Reusing the transfer scope would have
+handed write access to every zone to every key in every keyring on the first
+release that dispatched an UPDATE, which is §16's opening bug reached from the
+other side. Hence `UpdatePolicy::Denied` as the `Default`, a fifth spec field,
+and `update-zones` beside `zones` in the config with the opposite default
+adjacent to it.
+
+**Four refusals, and they are not interchangeable.** Unsigned is REFUSED, with no
+address-based path in: `--allow-transfer` exists because a transfer is a read and
+an address is a weak but real answer to "who is this", and a write is not
+something to grant on an address UDP makes nobody prove. A zone we do not serve
+is **NOTAUTH** (§3.1.1) — the opposite of the query path's rule that an unserved
+zone is REFUSED (`CLAUDE.md` §8), because the two answer different questions. A
+zone we *replicate* is REFUSED: it is the master's copy and the next refresh
+would transfer over the change, which is the same "write with a timer on it"
+failure by another route. A zone with no writable file is REFUSED.
+
+**What was left, and is now done** — both landed the same day this section was
+rewritten, so the list below is history rather than a queue:
+
+- [x] **Incremental re-signing** — **done 2026-08-03.** ~~This re-signs the whole zone per update, which
+      is correct and is wrong for a DHCP-rate workload — `sign_zone` rebuilds
+      every RRSIG and the whole denial chain. Right at load, wrong per update.
+
+      **It is not only a CPU problem, and that was measured rather than
+      assumed.** Every RRSIG's inception and expiration derive from the run's
+      `signed_at` (`SigningPolicy::valid_for`), so two runs a minute apart
+      produce different RDATA for *every* signature in the zone. `ixfr::diff`
+      compares whole records — correctly — so all of them land in the delta.
+      Measured on the signer's own test zone: **53 records, 23 RRSIGs, one
+      record added, and a delta of 52 records.** That is the whole zone, one
+      short of the threshold at which `ixfr_response` gives up and sends an AXFR
+      — so a secondary gets an "incremental" transfer the size of a full one,
+      and `DeltaLog` keeps 32 of those per zone. The characterization test is
+      `zone_signer::tests::re_signing_after_an_update_currently_rewrites_every_signature`,
+      written to fail when this is fixed rather than to keep passing.
+
+      So this item has three motives, not one: ECDSA cost per update, IXFR
+      degraded to AXFR for every signed zone, and a delta log holding 32
+      whole-zone-sized entries.
+
+      **The shape the fix probably wants**, and the trap in it. Sign fully is
+      wrong; sign-only-what-changed is nearly right. A signature may be carried
+      forward when the RRset it covers is byte-identical to the previous
+      version's *and* the old signature is not near expiry — the second half
+      matters because the periodic timer must stay the thing that refreshes
+      expiring signatures, and an update that silently renewed them would hide a
+      signing run that had stopped happening. The trap is the denial chain: an
+      NSEC's bitmap lists every type at its name and its `next` points at its
+      successor (`CLAUDE.md` §8), so adding one name changes the NSEC at that
+      name *and* at its predecessor. "The changed names" is the changed names
+      plus their chain neighbours, and getting that wrong produces a chain that
+      validates against itself and denies a name that exists.
+
+      A cheap way to get the neighbour question right for free: generate the new
+      chain in full, then carry forward the old RRSIG for any denial record that
+      came out byte-identical. That pays the chain construction but not the
+      signing, and it cannot get the neighbour set wrong because it never
+      computes one.~~
+
+      **That is what was built** (`sign_zone_incrementally`), and the predicted
+      shape held. Measured on the same case as above: the full re-sign's
+      **52**-record delta becomes **10**, and its composition is exactly the
+      three things that should be there — the apex RRSIG (the serial moved), the
+      new name's A with its two RRSIGs and its NSEC, and `mail`'s NSEC and RRSIG,
+      `mail` being the *predecessor* whose `next` now points at the inserted
+      name. The neighbour case handled itself, as predicted, because the chain is
+      built in full and only the signing is skipped.
+
+      Four conditions gate a carried signature, each a way reuse would otherwise
+      be wrong: the RRset is identical as a *set* (RFC 2181 §5 — an RRset has no
+      order), there was at least one signature, the signing keys are unchanged
+      compared by key tag as a set (a key added is a rollover starting and needs
+      its signature; one removed must not outlive its signatures), and nothing
+      carried has already expired.
+
+      **What is deliberately not a condition: being near expiry.** A signature
+      with a day left is carried forward untouched. Refreshing it here would mean
+      any single UPDATE re-signs every stale RRset in the zone — the whole-zone
+      delta this exists to remove — and worse, it would let update traffic stand
+      in for the re-signing timer, so a zone whose timer had died would degrade
+      differently depending on whether anyone was writing to it. Expiry stays
+      `resign_interval`'s business.
+- [x] **The journal** (#7 step 6) — **done 2026-08-03**, `rdns/src/journal.rs`.
+      See that box for the format, the rewrite-whole trade and why a corrupt
+      journal warns where a corrupt state file is fatal.
+
+---
+
+**What the reading half was**, kept because the seam it describes is why the rest
+went in cleanly. `rdns/src/update.rs` turns an UPDATE message into a checked list
+of prerequisites and changes and evaluates the prerequisites against a zone.
+
+That seam was chosen rather than found: of the six things originally listed, four
+are policy or persistence, and all four sit on the far side of "here is what this
 message would change" — which is also the shape a journal entry (#7 step 6) and
-an IXFR delta both want. What is in:
+an IXFR delta both want. What was in:
 
 - **§2.2's renamed sections**, which needed no wire work at all: question is
   Zone, answer is Prerequisite, authority is Update, additional stays itself.
@@ -740,27 +988,28 @@ two A records is the case that shows it. And §2.4.4's "name is in use" is
 true for a name a wildcard reaches and for an empty non-terminal, so an update
 would otherwise believe a name exists because something could synthesize it.
 
-**What is left is the writing half**, and the four items below that this
-deliberately stopped short of. Applying the changes is `ixfr::apply_changes`'
-shape; what it drags with it is the serial, and that is the one that must not be
-designed alone. The six original items follow.
+**The six original items, and what became of each.** Kept rather than deleted,
+because the list is the estimate this section was filed with and comparing it to
+what happened is the only way the next estimate gets better.
 
-Estimate for what remains: the bulk of the original **1.5-2 weeks**, since the
-part now done is the part with no policy in it.
+| the item, as filed | outcome |
+|---|---|
+| the prerequisite section (§2.4), a small query language checked before any change | done in `2f94124`, and it was the largest of the six |
+| authorization per zone on top of TSIG, inheriting #9d's shape | done in `9051d4e`. The shape was inherited; the *default* was not, and that turned out to be the whole decision |
+| serial handling, which **collides with #8** | done in `dcfe861`, and the collision was not one: #8's `add`-rather-than-`max` had already settled it. Worth noting as an estimate that was pessimistic for a good reason — the earlier decision was right for reasons that also covered this |
+| re-signing the changed names only | **still open**, and now the only performance item here |
+| writing the zone back out, which `zone_writer` already does | done in `8169f0d`. Filed as the small one; it was the one that set the design, for the reason under "the finding" above |
+| then #7.6, the journal | **still open**, and unblocked rather than done |
 
-- The prerequisite section (§2.4), which is a small query language of its own and
-  is checked against the zone *before* any change is applied.
-- Authorization per zone on top of TSIG. §3.3 leaves policy to the
-  implementation, and "any key may update any zone" is the mistake #9d records
-  for transfers; that one is fixed, and this inherits its shape (`CLAUDE.md` §16).
-- Serial handling, which **collides with #8**: an UPDATE bumps the serial and so
-  does re-signing, and both then have to survive a reload that re-reads a file
-  saying something older.
-- Re-signing the changed names only, rather than the whole zone — `sign_zone`
-  rebuilds everything, which is right at load and wrong per update.
-- Writing the zone back out, which `zone_writer` already does.
-- Then #7.6, the journal, so a restart does not lose changes that exist nowhere
-  else.
+Estimate at filing: **1.5-2 weeks**, and after the reading half landed, "the bulk
+of the original ... since the part now done is the part with no policy in it".
+Both were wrong in the same direction and it is worth writing down why. The four
+remaining items were called policy-heavy and therefore slow; three of them were
+short because the policy questions had *already been answered elsewhere* — §16
+for authorization, #8 for the serial, `persist`/`zone_writer` for the write. The
+estimate priced the decisions rather than the code, which is usually right, and
+missed that this codebase had made most of those decisions already. The one it
+under-priced was the item filed as trivial.
 
 ### 11. Data layout and CPU cache friendliness — a stretch goal, on purpose
 
@@ -814,7 +1063,19 @@ fuzz-clean with a permanent regression test, so the trade costs nothing today,
 and the alternative — respawning a panicked worker and counting it — would turn a
 defect into a metric nobody reads.
 
-### 13. Making illegal states unrepresentable — planned 2026-08-02, nothing landed
+### 13. Making illegal states unrepresentable — done 2026-08-02, twelve commits
+
+> **Heading corrected 2026-08-03.** It read "planned 2026-08-02, nothing landed"
+> while the "Open work" table two screens above said "**done 2026-08-02**, twelve
+> commits", and the body below closes each of 13a-13e in turn. The heading was
+> written when the section was filed and never touched again when the work
+> landed — the fourth stale claim found on this page in one review, after the
+> summary count, the "Open work" preamble count, and the "Where to pick up next"
+> ordering. **All four are the same defect in different clothes: a status
+> written in one place and the work recorded in another, with nothing that fails
+> when they disagree.** `CLAUDE.md` §4's rule about doc comments — "a comment
+> asserting a property is a claim to verify, not documentation to trust" —
+> applies to this file as much as to the code, and this is the evidence.
 
 **The argument is an asymmetry in this repo's own history, not a preference.**
 Of the defects `CLAUDE.md` records, two were fixed by *changing a type* —
@@ -1466,6 +1727,19 @@ key, and `cache` got it wrong once), **≤255 octets** (checked by
 and *not* checked by `dname_to_bytes`, which validates label length and total
 length never), and **non-empty labels of ≤63 octets** (checked at
 `write_label`, i.e. at serialization, which is the last possible moment).
+
+> **Correction, 2026-08-03: the `dname_to_bytes` half of that sentence is no
+> longer true, and was already false when #15 closed.** Both doors go through one
+> `dname::check_name_len` (`dname.rs:466`) now — the encode side was the third of
+> the three fixes §15 produced, and §15 says so at "A third fix followed from the
+> second". Corrected here rather than reworded above, per `CLAUDE.md` §11: the
+> sentence is *why* the fix happened, and deleting it would remove the evidence
+> that the invariant was live in four places and typed in none.
+>
+> Two of the four invariants listed above are now in types (`NameKeyBuf` for the
+> fold, `check_name_len` for the length); **the "absolute or relative" one still
+> is not**, which is what 19c's six copies of `fn absolute` are made of.
+> `RequestValidator`'s own 255-octet check is off by one and is 19e.
 
 **The escape question is settled, and the answer is that both of our functions
 are half of a design and neither is the whole of one.** Researched 2026-08-02;
@@ -2218,6 +2492,371 @@ Recorded so nobody re-derives them. Each looked like a rule violation and is not
   count as a finding is §17's "a hedge standing in for a one-line grep", so it is
   not reported as one. **This is unaudited, not clean**, and saying so is the
   point of the entry.
+
+### 17. The TCP length prefix wraps, and the framing is written out five times
+
+**Filed 2026-08-03 from the architecture review** (`docs/ARCHITECTURE_REVIEW.md`
+A1). A bug, confirmed by provoking it rather than by reading the diff, plus the
+duplication that let it exist in five places at once.
+
+**The bug.** Every writer of an RFC 1035 §4.2.2 length prefix computes it as
+`bytes.len() as u16` with no check:
+
+| site | what it frames |
+|---|---|
+| `rdnsd/src/main.rs:1833` (`frame`) | every TCP reply, every transfer envelope |
+| `rdnsr/src/main.rs:776` | every TCP reply |
+| `rdns/src/resolver.rs:1432` | an outgoing upstream TCP query |
+| `rdns/src/xfr.rs:693` | an outgoing transfer request |
+| `rdnsc/src/main.rs:160` | the client's TCP retry |
+
+`CLAUDE.md` §2 is about `as` on a value coming *off* the wire. This is the same
+cast going the other way, and `DnsMessage::to_bytes` is the sibling that shows
+the shape it should have: RDLENGTH, ARCOUNT and OPT RDLENGTH all go through
+`try_into().map_err(|_| WireError::TooLong { .. })`, twenty lines apart, in the
+same file.
+
+**How a message gets past the limit it was serialized to.**
+`to_bytes_within(u16::MAX as usize)` cannot return more than 65,535 octets — the
+scratch buffer is exactly that size, so anything larger comes back as a 33-byte
+TC=1 reply instead. Then `tsig::append_tsig` (`tsig.rs:844`) appends a TSIG
+record to the *finished bytes* and checks only that ARCOUNT does not overflow.
+Nothing checks the total.
+
+**Provoked, not argued.** A throwaway integration test swept a TXT RRset's size
+one octet at a time through the boundary, signing each result with a real
+`TsigSession`:
+
+```
+pad= 15 serialized=65452 signed=65534 prefix=65534 ok
+pad= 16 serialized=65453 signed=65535 prefix=65535 ok
+WRAPPED at pad=17: serialized 65454 + TSIG 82 = 65536 bytes,
+                   but the frame prefix says 0
+```
+
+**The failure is worse than a wrong length.** 65536 mod 65536 is **0**, and a
+zero-length prefix is exactly what both daemons' read loops treat as a broken
+peer — `rdnsd/src/main.rs:1390` logs "zero-length TCP message" and closes the
+connection, `rdnsr/src/main.rs:751` breaks out of the loop. So the client's
+connection is dropped with no answer and nothing on either side saying why.
+Larger overshoots give a small non-zero prefix instead, which desynchronises the
+stream rather than closing it.
+
+The window is **82 octets wide** — one hmac-sha256 TSIG record with a ten-octet
+key name — out of 65,536 possible sizes: serialized lengths 65,454..=65,535 all
+wrap, and a longer key name widens it. AXFR is **not** the exposure, since
+envelopes target 16 KiB (`AXFR_TARGET_MESSAGE_SIZE`); a TSIG-signed ordinary
+answer over TCP is, which needs a ~64 KB RRset at one name — unusual, entirely
+constructible in a zone file, and not something a client has to be hostile to
+ask for.
+
+- [ ] **A length check in `append_tsig`.** It is the only thing that can push a
+      message past the size it was serialized to, and it already returns
+      `ConfigResult<Vec<u8>>`, so there is a channel for the error.
+- [ ] **One `rdns::` helper for the framing**, and five call sites deleted:
+
+      ```rust
+      /// A message with its RFC 1035 §4.2.2 length prefix, in one buffer.
+      pub fn framed(bytes: &[u8]) -> Result<Vec<u8>, WireError>
+      ```
+
+      **§16c's argument against moving `listener_failure` does not apply here**,
+      and the difference is the one §16c itself names: that one is an error type,
+      and `rdns` has no `anyhow`. This returns a `WireError`, which is the
+      library's own. The precedent is `utils::recv_error_is_transient`, which
+      moved cleanly because nothing foreign crossed the boundary.
+- [ ] **The regression test writes itself** from the sweep above, and it has been
+      watched failing against today's code (`CLAUDE.md` §1). Assert on the
+      *prefix against the body length*, not on an error type — the point is that
+      the two agree.
+
+**The read side is duplicated too** and is not part of this item, because the
+copies are not identical and folding them would be #18's or #19f's business: five
+loops read a prefix and then `read_exact`, with different timeouts and different
+treatment of a zero length. Recorded here so the next reader does not think the
+write side was the whole of it.
+
+### 18. `rdnsr` has none of the operational shell
+
+**Filed 2026-08-03** (`docs/ARCHITECTURE_REVIEW.md` B1, `docs/spec/07` G-1/G-2).
+Not a bug — an asymmetry that runs the wrong way round.
+
+| facility | `rdnsd` | `rdnsr` |
+|---|---|---|
+| `security::RateLimiter` (per-source q/s) | yes | **no** |
+| `security::ResponseLimiter` (per-source bytes/s) | yes | **no** |
+| `logging::QueryLogger` | yes | **no** |
+| `metrics::DnsMetrics` | yes | **no** |
+| `metrics_server` (`/metrics`, `/healthz`, `/readyz`) | yes | **no** |
+| `validation::RequestValidator` | yes | **no** |
+| `readiness::Readiness` | yes | **no** |
+| `shutdown::{Stop, Busy}` | yes | yes |
+| `validation::Request` (the QR door) | yes | yes |
+
+Every one of the seven lives in `rdns`, is tested, and is reachable. `rdnsr`'s
+only mitigations are a 127.0.0.1 default bind and `--max-inflight-udp`.
+
+**Why this is the wrong way round.** A recursive resolver is the *more*
+amplifying of the two — a 30-byte query can produce a 4 KB validated answer, and
+`--dnssec-validate` makes that the normal case — and it is the one with no byte
+budget and no per-source rate limit. It is also completely unobservable: no
+counters, no probes, so "is it up and answering" has no answer that does not
+involve sending it a query.
+
+**Where this came from, most likely:** #9d's operational review was scoped to
+`rdnsd`, and the library types it produced were never wired into the second
+daemon. "Architecture: why `rdnsr` is separate from `rdnsd`" argues the split
+convincingly on trust model, data and lifecycle, and **none of those arguments
+implies "and therefore no rate limit"**. The one line that touches it — "Two
+things `rdnsr` does *not* share with `rdnsd`: it doesn't run the
+`RequestValidator`, and it has no zone storage" — states the first without a
+reason and does not mention the other five.
+
+Staged, this is small. The admission point already exists: `udp_main` checks its
+semaphore *before* copying the datagram, which is exactly where a rate limiter
+goes.
+
+- [ ] **`--query-rate` / `--query-burst` / `--query-rate-exempt`**, the same
+      flags and the same `RateLimitConfig::per_second` units `rdnsd` uses, so the
+      number in the config is the number in the head (`CLAUDE.md` §14). The
+      effective policy goes in the startup banner for the same reason it does
+      there: dropping is silent, so it has to be visible somewhere.
+- [ ] **`--response-rate`**, with the slip behaviour `ResponseLimiter` already
+      implements.
+- [ ] **`--metrics-listen`.** What needs a *decision* rather than code is which
+      counters a resolver should have: `rdnsd`'s set is authoritative-shaped, and
+      cache hit rate — meaningless there, see #19d — is the headline number here.
+      Do not copy the struct; ask what an operator pages on for a resolver.
+- [ ] **Decide about `RequestValidator` out loud.** After #19e it is a size and
+      section-count check, which is cheap and belongs on the pre-admission path.
+      Either wire it in or write down why a resolver does not want it — the
+      current state is that the difference is recorded with no reason attached.
+
+**Not on this list: `/readyz`.** A resolver has nothing to wait for — no zone has
+to arrive before it can answer — so a readiness probe would be a liveness probe
+under another name. `/healthz` is the one that means something here.
+
+### 19. What the 2026-08-03 architecture review found — the smaller items
+
+**Filed 2026-08-03.** A read of the whole workspace against `CLAUDE.md`'s rules,
+producing `docs/ARCHITECTURE_REVIEW.md` and `docs/spec/`. #17 and #18 came out of
+it and are their own sections; what is left is below, smallest last. **Five of
+these are stragglers of consolidations that caught most copies and missed one**,
+which is evidence for `CLAUDE.md` §17 rather than against those consolidations.
+
+**Three claims in the first draft of the review did not survive being checked**,
+and they are kept here because the reasoning is the useful part (`CLAUDE.md`
+§11): "six byte-identical copies of `absolute`" was four identical and two
+differing in a parameter name; "~10^5 allocations per signing run" in 19b was
+arithmetic done in the head and never measured — struck, and it is exactly the
+"count nobody counted" this file warns about; and the `RrsetProof` enum was
+written down as `Verified/Bogus/Insecure` when it is
+`Verified/Unsigned/Bogus/Unsupported`, conflating it with `ValidationState`.
+
+#### 19a. Two live `str::to_lowercase` on wire-supplied names
+
+`rdnsd/src/main.rs:1915` — the NOTIFY zone-name lookup key — and the matching
+insert at `:3064`. RFC 4343 and `CLAUDE.md` §8: the fold is ASCII-only, and
+`to_lowercase` folds U+212A KELVIN SIGN onto `k`.
+
+The two agree with each other and `MasterSpec::parse` absolutizes, so the
+`Secondaries` table is self-consistent; the master-address check still gates the
+refresh. The exposure is bounded to "a NOTIFY naming a Kelvin-sign variant of a
+replicated zone folds onto that zone". It is on the list because it is the rule
+this codebase wrote down, on a name a stranger chooses, and because
+`utils::absolute_lowered` is one call away and borrows in the common case.
+
+Every other `to_lowercase()` in the tree is on `base32hex_encode` output (ASCII
+by construction — still worth `make_ascii_lowercase`) or in tests.
+
+#### 19b. `zone_signer` shadows `utils::is_at_or_under` with a worse copy
+
+`zone_signer.rs:652` — a **private function shadowing a public one of the same
+name in the same crate**, which is why #13b's four-copy sweep did not see it:
+nothing greps as a second definition when the call sites read identically.
+
+```rust
+fn is_at_or_under(name: &str, origin: &str) -> bool {
+    if origin == "." { return true; }
+    name.eq_ignore_ascii_case(origin)
+        || name.to_ascii_lowercase()
+               .ends_with(&format!(".{}", origin.to_ascii_lowercase()))
+}
+```
+
+**It disagrees with the shared version.** `utils::is_at_or_under` makes the
+trailing dot optional on either side, so
+`is_at_or_under("www.example.com", "example.com.")` is `true` there and `false`
+here. Not currently reachable — its one caller, `Layout::chain_names`
+(`zone_signer.rs:613`), passes `canonical_name` output — but that is a property
+of the caller, not of the function, and it is §7's drift.
+
+It also allocates two `String`s and a `format!` per call, which is word for word
+what `utils::is_at_or_under`'s doc comment says it was written to remove from
+`resolver::is_subdomain`. **The cost has not been measured** and the
+order-of-magnitude claim that was here first is struck; the disagreement stands
+on its own without a number.
+
+While in that loop: `ancestors_of` (`zone_signer.rs:635`) allocates a
+`Vec<String>` of **every** ancestor including the ones above the origin —
+`com.`, `.` — which `is_under` then rejects one at a time. The same walk
+`zone::parent_name` does by borrowing. Worth looking at second, not first.
+
+#### 19c. Six copies of `fn absolute`
+
+`rfc5011.rs:797`, `secondary.rs:180`, `xfr.rs:531` and `zone.rs:557` are
+byte-identical; `rdnsd/config.rs:234` differs only in its parameter name and
+`rdnsd/main.rs:1949` only in the function name (`absolute_name`). All six are the
+same three lines: add a trailing dot if there is not one.
+
+`utils` has `absolute_lowered` — absolutize **and** fold, returning a `Cow` — and
+no plain "add the dot". Six copies is what happens when the shared module is one
+accessor short. `utils::absolute(name) -> Cow<'_, str>`, borrowing when the name
+already ends in a dot, which is most of them. `answer_transfer` computes
+`absolute_name(&qname)` twice sixteen lines apart (`main.rs:1631` and `:1665`),
+which the `Cow` version makes free.
+
+#### 19d. Three exported metrics that nothing increments
+
+`dns_cache_hits_total`, `dns_cache_misses_total`, `dns_queries_recursive_total`.
+`DnsMetrics` is used only by `rdnsd`, which has no cache and never recurses; the
+fields are written in `new()` and in one test, and nowhere else. The change that
+removed the misnamed *call sites* — `CLAUDE.md` §14, "a counter's name is a claim
+about what it counts" — left the fields, the `# HELP`/`# TYPE` lines and the
+`MetricsSnapshot` members behind.
+
+A dashboard computing `hits / (hits + misses)` gets 0/0. Delete all three, or —
+if #18 lands — move the two cache counters to wherever `rdnsr`'s metrics live,
+where they would mean something.
+
+#### 19e. `RequestValidator` is a second, weaker copy of the parser's checks
+
+`validation.rs:159`. Two of the things it does are real and cheap, one is neither.
+
+**Real:** the packet-size caps (512 UDP / 16 KiB TCP) and the per-section count
+caps. Neither has an equivalent in `DnsMessage::try_from_bytes`, and both are
+header arithmetic that runs before anything is allocated. This is the part that
+earns its place on the pre-admission path.
+
+**Redundant:** `validate_domain_names` walks the first question's name a second
+time, with its own label-length check, its own 255-octet check and its own
+pointer handling — all of which `dname.rs` does immediately afterwards and does
+better. **The copies already disagree, in four ways:**
+
+- `MAX_DEPTH` is 10 here and 50 in `dname.rs`;
+- this one does not require a pointer to point backwards, which is the whole of
+  `dname.rs`'s cycle prevention;
+- it validates only the **first** question and ignores the rest;
+- its `total_size` omits the terminating root octet, so it is off by one against
+  `MAX_NAME_LEN` and admits a name one octet over.
+
+All four are in the safe direction today, because the real parser runs
+afterwards. They are still two implementations of one rule, and the weaker one
+runs first.
+
+Also here: `validate_header` hand-rolls `(data[2] >> 3) & 0x0f` for the opcode
+and `data[2] & 0x80` for QR, where `OpCode::from_u8(hi >> 3)` exists — and two
+doc comments are wrong, `max_udp_size` citing "RFC 512" and `max_labels: 127`
+attributed to RFC 1035, which states no such limit (127 is derived from 255
+octets at two per label).
+
+- [ ] Keep the size and count caps, delete the name walk, and **rename the type
+      to say what it is** — an admission check, not a validator. About 100 lines
+      out and one fewer place for the name rules to live. Prerequisite for #18's
+      last box.
+
+#### 19f. Two near-identical TCP `serve_connection` implementations
+
+`rdnsd/src/main.rs:1345` and `rdnsr/src/main.rs:712`, ~80 lines each: same
+split-writer task, same `Semaphore`, same read loop, same framing, same
+drop-the-sender drain. The differences are that `rdnsd` logs, `rdnsd` returns a
+`Vec<Vec<u8>>` because a transfer is several messages where `rdnsr` returns one,
+and `rdnsd` names the zero-length case in its log.
+
+**A candidate, not a plan.** The honest version is a generic over the answer
+function plus a logging trait, and that may well cost more than the eight lines
+it deletes — the same trade §16c recorded for `listener_failure`. Filed so the
+next reader does not have to re-derive the shape. What is *not* debatable is the
+framing inside it, which is #17.
+
+#### 19g. `docs/CLI_USAGE.md` says "Complete reference" and covers half the flags
+
+`rdnsd` has 27 flags. `CLI_USAGE.md` has a `### --flag` section for **14** of
+them; the other thirteen appear in passing, in an example, or not at all:
+
+```
+--allow-partial-load  --check-config  --config       --key-algorithm
+--metrics-listen      --nsec3         --nsec3-opt-out
+--query-burst         --query-rate    --query-rate-exempt
+--require-signed      --secondary     --signature-validity
+```
+
+Two of those matter more than the rest. **The three `--query-rate*` flags** are
+the control that drops traffic silently — no REFUSED, no SERVFAIL, nothing on the
+wire — and §9d's whole reason for existing was that the hardcoded 10 q/s version
+of it blackholed traffic with no way for an operator to learn the limit existed.
+The startup banner fixed "no way to learn the number"; the CLI guide is where you
+look for "what is this and how do I change it", and it is not there. Meanwhile
+`--response-rate`, the one control that at least answers TC=1, has a 35-line
+section. **`--secondary`** is the second: the entire secondary role has no
+section, and is mentioned only in one table row and in the `--also-notify` prose,
+both of which assume you know what it does.
+
+- [ ] Either document them or change the first line, which currently promises
+      something the file does not deliver. A reference that is silently partial is
+      §4's quiet degradation in documentation form: a reader who does not find
+      `--query-rate` there concludes there is no such control.
+
+#### 19h. The small ones
+
+| item | where | note |
+|---|---|---|
+| a wrecked `\` continuation in an operator-facing error | `lib.rs:1787` | 22 literal spaces mid-sentence, in the extended-RCODE message. Exactly what `CLAUDE.md` §12 predicts: rustfmt does not touch string literals, so a careless search-and-replace wrecks a continuation and nothing notices |
+| `pub mod bench` is empty in a non-test build | `lib.rs:15`, `bench.rs` | the file is entirely `#[cfg(test)] mod benches`, so the library exports an empty public module. Should be `#[cfg(test)] mod bench;`. The *filename* is kept on purpose (§10 argues from `bench_logger_throughput`); the `pub` is not |
+| `impl EdnsHeader {}` | `lib.rs:1352` | an empty impl block |
+| `// TODO: TryToBytes and others` | `dname.rs:118` | the only bare `TODO` left in the tree. `dname.rs:237` records that the *other* one was deleted-rather-than-done, with the reasoning; this one deserves the same treatment either way |
+| `rdnsd::in_zone` is a private `is_at_or_under` | `main.rs:765` | allocates `zone.origin().to_ascii_lowercase()` **per call**, and both call sites (`:740`, `:910`) additionally allocate on the name to feed it. On the CNAME-chase and referral-glue paths. `utils::is_at_or_under` needs neither. Same family as 19b |
+| `xfr::rand_id` and `rdnsd::rand_id` | `xfr.rs:770`, `main.rs:3476` | same name, different entropy: `rand::thread_rng()` against folded `subsec_nanos()`. Two NOTIFYs in one clock tick share an id. The stated reason holds for the threat and still leaves two same-named functions with different security properties |
+| `rdnsc` cannot set DO or send an OPT | `rdnsc/src/main.rs` | the shipped client cannot exercise the server's most complex feature, which is *why* every DNSSEC recipe in this file reaches for dnspython. A `--dnssec` flag and an `Edns` on the builder is a small change with a disproportionate payoff for the verification workflow |
+| `metrics_server::serve` has no connection ceiling | `metrics_server.rs:44` | the only accept loop in the workspace without one. Management port with a 5 s read timeout, so low — but the pattern is established three times elsewhere |
+
+#### What the pass checked and found nothing wrong with
+
+Recorded so nobody re-derives it — §16's second list is the precedent and the
+more useful half of that section.
+
+- **`Qtype`/`Rtype`/`Class`/`QueryClass`.** The four newtypes and their one-way
+  conversions are consistent; `Qtype::matches` is the only type comparison
+  against stored data, and `zone::of_type`, `dnssec_answer::answer_signatures`
+  and the two former `resolver.rs` sites all go through it.
+- **`Serial`.** No `Ord`, `is_newer_than` is RFC 1982 §3.2 verbatim, and the one
+  raw comparison left carries a comment saying why the claim is arithmetical.
+- **`Ttl`.** One clamp, at `from_wire`, and OPT's TTL field correctly bypasses it.
+- **The wire parser's length checks.** `read_be!`, `Label::try_from_bytes`,
+  `walk_options` and `read_record_parts` all check before slicing.
+- **`dnssec_answer`.** All four answer shapes owe what RFC 4035 says they owe,
+  and the tests judge the output with `verify_rrset`/`proves_nxdomain`/
+  `proves_nodata` rather than by inspection.
+- **`answer_transfer`'s authorization.** Against the apex, before the zone
+  lookup, off the `TsigSession` rather than a second key lookup, every error path
+  signed.
+- **`security::RateLimiter`/`ResponseLimiter`.** Both bounded, both with a
+  written-down direction of failure and a shortfall counter.
+- **`shutdown`.** The `Stop`/`Busy` split, the sender-drop drain and the
+  cancel-safety reasoning all hold up; the Windows four-signal handler is right.
+- **`Zone`'s index, chains and non-terminals.** Derived state is private,
+  `reindex` rebuilds all three, and `matches_query` asks `name_kind_of_key`
+  rather than re-deriving the wildcard rule.
+- **`CLI_USAGE.md:150`'s "no rate limiter of its own"** — read as a query-rate
+  claim it would be a finding. In context it is unambiguously about *log* volume
+  and journald's per-unit limiter. Checked before reporting.
+
+**What the pass did *not* audit**, so this is not read as broader than it is: the
+crypto primitives beyond algorithm dispatch and key formats; the Linux half; and
+the **22 `.lock().unwrap()` and 42 `let _ =` sites** §16 flagged as
+counted-not-read, which are still unread. One was met in passing —
+`expire_if_out_of_contact`'s `.expect("state mutex")` on the replication path —
+and left there rather than reporting a sample as a survey.
 
 ## Closed work
 

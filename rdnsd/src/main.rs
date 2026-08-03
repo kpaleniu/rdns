@@ -23,6 +23,7 @@ use rdns::{
     dnssec_validation_mode::DnssecValidator,
     error::RequestError,
     ixfr::{ixfr_response, plan_change, DeltaLog, IxfrResponse, PlannedDelta},
+    journal::Journal,
     logging::{LogLevel, QueryLogger},
     metrics::{DnsMetrics, LatencyTimer},
     metrics_server, notify,
@@ -34,6 +35,7 @@ use rdns::{
     shutdown::{stop_signal, Busy, Lifecycle, Shutdown, Stop},
     transfer::axfr_messages,
     tsig::{self, TsigAlgorithm, TsigCheck, TsigKey, TsigKeyring, TsigSession},
+    update,
     utils::{
         current_unix_timestamp, is_at_or_under, record_types, recv_error_is_transient,
         UDP_RECEIVE_BUFFER,
@@ -41,7 +43,7 @@ use rdns::{
     validation::{Request, RequestValidator},
     xfr,
     zone::{parse_zone_file_at, NameKind, Zone},
-    zone_signer::{sign_zone, DenialChain, SigningPolicy},
+    zone_signer::{sign_zone, sign_zone_incrementally, DenialChain, SigningPolicy},
     zone_writer::write_zone_file,
     DnsMessage, Edns, OpCode, Qtype, QueryClass, ResourceRecord, ResponseCode, Serial,
     EDNS_VERSION,
@@ -440,6 +442,45 @@ enum ZoneSource {
     /// can express this, because only a config file has somewhere to say the
     /// origin out loud.
     Files(Vec<(String, String)>),
+}
+
+impl ZoneSource {
+    /// The file a zone's records live in, or `None` if this source has none for
+    /// it.
+    ///
+    /// **Derived by the same function the loader derives it with**, which is the
+    /// whole point of it being here rather than reconstructed at the call site
+    /// (`CLAUDE.md` §7). A write that landed anywhere but where the next load
+    /// reads from would be an update that vanished at the next reload, and the
+    /// server would go on answering from the version it still held in memory —
+    /// so the mistake would be invisible until a restart.
+    ///
+    /// The directory case scans rather than composing `<dir>/<origin>.zone`,
+    /// because that is not the rule: `enumerate_zone_files` derives each origin
+    /// *from its file name* and a zone's own `$ORIGIN` may say something else
+    /// entirely. Composing the path would write `other.test.` into
+    /// `example.com.zone` on exactly the deployment that trap already exists on.
+    fn file_for(&self, origin: &str) -> Option<PathBuf> {
+        let wanted = absolute_name(origin);
+        let matches = |candidate: &str| absolute_name(candidate).eq_ignore_ascii_case(&wanted);
+        match self {
+            ZoneSource::SingleFile(path) => {
+                matches(&extract_zone_origin_from_path(path)).then(|| PathBuf::from(path))
+            }
+            ZoneSource::Files(files) => files
+                .iter()
+                .find(|(zone, _)| matches(zone))
+                .map(|(_, path)| PathBuf::from(path)),
+            ZoneSource::Directory(dir) => std::fs::read_dir(dir)
+                .ok()?
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.extension().and_then(|s| s.to_str()) == Some("zone")
+                        && matches(&extract_zone_origin_from_path(&path.to_string_lossy()))
+                }),
+        }
+    }
 }
 
 /// Build a DNS response for the given query message
@@ -981,6 +1022,70 @@ struct Server {
     /// can answer with the difference rather than the whole zone. Derived from
     /// the zone map, so the two are only ever updated together.
     deltas: Arc<RwLock<DeltaLog>>,
+    /// What a dynamic UPDATE needs beyond what a query needs. `None` on a server
+    /// with no writable zone source, where every UPDATE is refused.
+    updates: Arc<UpdateHandling>,
+    /// Where the delta log is persisted. Carried here so `Server::served` can
+    /// hand `install_zone` the whole group rather than three quarters of it.
+    journal: Option<Arc<Journal>>,
+}
+
+/// What answering a dynamic UPDATE (RFC 2136) needs beyond what a query needs.
+///
+/// **Persisting the result is a precondition for serving an UPDATE at all, not
+/// a later refinement**, and the reason is not the obvious one about restarts.
+/// The re-signing timer *reloads every zone from its file* — see
+/// [`ZoneSigning::resign_interval`], which explains why it must: the served
+/// serial is the file's plus a time term, so re-signing the in-memory copy would
+/// apply that derivation to its own output and compound the bump every cycle.
+/// A signed zone's in-memory edits are therefore discarded within one re-signing
+/// interval, with nothing logged and no error anywhere. An UPDATE that only
+/// changed the map would be a write the client was told had succeeded, which
+/// disappears on a timer.
+///
+/// So the flow is: apply to the zone *as the file has it*, write the file, sign
+/// what results, install that. The file stays the input to every derivation, and
+/// an UPDATE is the same shape as an operator editing the file and reloading —
+/// which is the shape everything else here is already built around.
+struct UpdateHandling {
+    /// Where the zone files are, for reading a zone back and writing it out.
+    /// `None` when the server was given no source it can write (a secondary's
+    /// replicated zones are the master's copy and are not ours to edit).
+    source: Option<ZoneSource>,
+    /// The signing policy, so the installed version is signed the way a loaded
+    /// one would be.
+    signing: Option<Arc<ZoneSigning>>,
+    /// Serializes the read-modify-write, which RFC 2136 §3.7 requires: "the
+    /// server must ensure atomicity with respect to other (concurrent) UPDATE or
+    /// QUERY transactions", and concurrent updates touching the same names "must
+    /// be serialized".
+    ///
+    /// One lock for every zone rather than one per zone, because two UPDATEs at
+    /// once is not a workload this has — and a lock that is only ever contended
+    /// by a thing that does not happen is a lock whose granularity nobody should
+    /// be paying attention to. It is held across file I/O and a signing run, so
+    /// it is a `tokio::Mutex` and not a `std` one (`CLAUDE.md` §9).
+    applying: tokio::sync::Mutex<()>,
+}
+
+impl UpdateHandling {
+    /// A server that refuses every UPDATE.
+    ///
+    /// `#[cfg(test)]` because `serve` always has a zone source to hand and so
+    /// always builds the configured form. The `None` case is still worth
+    /// carrying rather than making the field non-optional: it is what the
+    /// refusal branch in `answer_update` is *for*, and a shape that made it
+    /// unrepresentable would delete a check that stops an UPDATE being applied
+    /// to memory alone. `an_update_is_refused_without_a_writable_source` is the
+    /// test that keeps it honest.
+    #[cfg(test)]
+    fn disabled() -> Self {
+        UpdateHandling {
+            source: None,
+            signing: None,
+            applying: tokio::sync::Mutex::new(()),
+        }
+    }
 }
 
 /// The policy knobs `serve` applies, grouped because they all come from the
@@ -1003,6 +1108,12 @@ struct ServePolicy {
     /// Whether every zone this server answers for is in the map yet, for
     /// `/readyz` on that same listener.
     readiness: Readiness,
+    /// What a dynamic UPDATE needs; refuses everything when unconfigured.
+    updates: Arc<UpdateHandling>,
+    /// Where the delta log is persisted, if anywhere. Carried through here
+    /// rather than as a ninth argument to `serve` — clippy objects at seven and
+    /// is right for the reason `CLAUDE.md` §14 gives.
+    journal: Option<Arc<Journal>>,
     /// The control socket, and what a `reload` on it pokes.
     control: ControlPolicy,
 }
@@ -1047,6 +1158,8 @@ async fn serve(
         udp_workers,
         metrics_listen,
         readiness,
+        updates,
+        journal,
         control,
     } = policy;
     // Floored, not refused: `--udp-workers 0` is a server that binds the UDP
@@ -1136,6 +1249,8 @@ async fn serve(
         }),
         secondaries,
         deltas,
+        updates,
+        journal,
     });
     // INFO, and the default level is INFO so it is seen: `CLAUDE.md` §14 —
     // the effective policy is printed at startup because a control nobody can
@@ -1547,6 +1662,15 @@ impl Server {
                 .await;
         }
 
+        // An UPDATE is answered here for the same reasons a transfer is, and one
+        // more: it is the only request that changes what this server says next,
+        // so it must not go anywhere near `make_response`, which holds a read
+        // guard on the zone map that installing the result would deadlock
+        // against.
+        if msg.opcode == OpCode::Update {
+            return self.answer_update(&msg, peer, session.as_mut()).await;
+        }
+
         // Hold the zone lock only as long as it takes to build and serialize the
         // response — never across a socket write, or a SIGHUP zone reload would
         // queue behind a slow client for the life of its connection.
@@ -1800,6 +1924,238 @@ impl Server {
         vec![frame(&bytes)]
     }
 
+    /// Answer a dynamic UPDATE (RFC 2136).
+    ///
+    /// Answered here rather than in `make_response` for the same reason a
+    /// transfer is: it is gated on a permission, it touches the disk, and it is
+    /// the only request that *changes* what this server will say next.
+    ///
+    /// The order of the checks is the RFC's and it is not arbitrary — each one
+    /// exists to keep the next from running. §3.1 reads the message, §3.1.1 asks
+    /// whether the zone is ours, §3.3 asks whether the requestor may write it,
+    /// §3.2 checks the prerequisites, and only then does §3.4 change anything.
+    /// Authorization before the zone is even loaded is `CLAUDE.md` §16's "check
+    /// before doing the work, not before sending it".
+    async fn answer_update(
+        &self,
+        msg: &DnsMessage,
+        peer: SocketAddr,
+        session: Option<&mut TsigSession>,
+    ) -> Vec<Vec<u8>> {
+        let ip = peer.ip();
+
+        // §3.1: read it, and reject the ways it can be malformed.
+        let request = match update::parse(msg) {
+            Ok(request) => request,
+            Err(rejected) => {
+                serving_error!(self.logger, ip, "UPDATE rejected: {rejected}");
+                return self.update_reply(msg, rejected.rcode, ip, session);
+            }
+        };
+        let zone_name = absolute_name(&request.zone);
+
+        // §3.3: "If the requestor does not have permission to perform these
+        // updates, the server may ... signal REFUSED to the requestor."
+        //
+        // **An unsigned UPDATE is refused outright**, with no address-based
+        // alternative. `--allow-transfer` exists because a transfer is a read
+        // and an address is a weak but real answer to "who is this"; a write is
+        // not something to hand out on the strength of a source address that
+        // UDP does not make anyone prove. A key is the only credential here, and
+        // it must be scoped: see `rdns::tsig::UpdatePolicy` for why that scope
+        // denies by default where the transfer scope permits.
+        let Some(session) = session else {
+            serving_error!(
+                self.logger,
+                ip,
+                "UPDATE of {zone_name} REFUSED: unsigned, and an UPDATE needs a TSIG key"
+            );
+            return self.update_reply(msg, ResponseCode::Refused, ip, None);
+        };
+        if !session.may_update(&zone_name) {
+            serving_error!(
+                self.logger,
+                ip,
+                "UPDATE of {zone_name} REFUSED: key {} may not rewrite it",
+                session.key_name()
+            );
+            return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
+        }
+
+        // §3.1.1: "the ZNAME and ZCLASS are checked to see if the zone so named
+        // is one of this server's authority zones, else signal NOTAUTH".
+        //
+        // NOTAUTH and not REFUSED, which is the opposite of the *query* path's
+        // rule (`CLAUDE.md` §8: REFUSED for a zone we do not serve). The two are
+        // answering different questions — a query asks us to speak about a name,
+        // an UPDATE names the zone it belongs to and asks whether we are its
+        // authority — and RFC 2136 gives that its own code.
+        // Cloned rather than merely tested for, because the version being served
+        // is also what the re-signing carries signatures forward from. Taken in
+        // the one read guard so the answer to "do we serve it" and the copy the
+        // signer works against cannot be two different versions.
+        let previous = {
+            let zones = self.zone_map.read().await;
+            zones.matching(&zone_name).cloned()
+        };
+        let Some(previous) = previous else {
+            tracing::info!(peer = %ip, "UPDATE of {zone_name}: NOTAUTH (not a zone served here)");
+            return self.update_reply(msg, ResponseCode::NotAuthorized, ip, Some(session));
+        };
+
+        // **A zone we replicate is not ours to rewrite.** It is the master's
+        // copy: the next refresh would transfer over the change, so the client
+        // would be told a write succeeded that has a timer on it. RFC 2136 §3.1
+        // is about being an authority for the zone, and a secondary's authority
+        // is delegated — an update belongs at the primary, which is what a
+        // client that gets this refusal will go and find.
+        if self
+            .secondaries
+            .contains_key(&zone_name.to_ascii_lowercase())
+        {
+            serving_error!(
+                self.logger,
+                ip,
+                "UPDATE of {zone_name} REFUSED: this server replicates that zone, \
+                 so its master owns it"
+            );
+            return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
+        }
+
+        // A zone we serve but cannot write back is one we must not update: the
+        // change would live only in memory and be discarded by the next reload
+        // or re-signing run, having told the client it succeeded. See
+        // [`UpdateHandling`].
+        let Some(source) = self.updates.source.as_ref() else {
+            serving_error!(
+                self.logger,
+                ip,
+                "UPDATE of {zone_name} REFUSED: this server has no writable zone source"
+            );
+            return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
+        };
+        let Some(path) = source.file_for(&zone_name) else {
+            serving_error!(
+                self.logger,
+                ip,
+                "UPDATE of {zone_name} REFUSED: no zone file to write it back to"
+            );
+            return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
+        };
+
+        // §3.7's serialization, held across the whole read-modify-write.
+        let _applying = self.updates.applying.lock().await;
+
+        // Everything from here to the installed zone is blocking — a parse, a
+        // full ECDSA signing run, and two file operations — so it goes to a
+        // blocking thread rather than stalling a worker that is also answering
+        // queries (`CLAUDE.md` §9).
+        let signing = self.updates.signing.clone();
+        let changes = request.changes.clone();
+        let prerequisites = request.prerequisites.clone();
+        let origin = zone_name.clone();
+        let applied = tokio::task::spawn_blocking(move || {
+            apply_update_to_file(
+                &path,
+                &origin,
+                &previous,
+                &prerequisites,
+                &changes,
+                signing.as_deref(),
+            )
+        })
+        .await;
+
+        let outcome = match applied {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                serving_error!(
+                    self.logger,
+                    ip,
+                    "UPDATE of {zone_name}: the task failed: {e}"
+                );
+                return self.update_reply(msg, ResponseCode::ServerFailure, ip, Some(session));
+            }
+        };
+
+        let (installed, report) = match outcome {
+            Ok(applied) => applied,
+            Err(UpdateFailure::Prerequisite(rejected)) => {
+                tracing::info!(peer = %ip, "UPDATE of {zone_name}: {rejected}");
+                return self.update_reply(msg, rejected.rcode, ip, Some(session));
+            }
+            // §3.4.2.1: "If any system failure ... occurs during the processing
+            // of this section, signal SERVFAIL to the requestor and undo all
+            // updates applied to the zone during this transaction." Nothing is
+            // installed on this path, so there is nothing to undo — the write is
+            // atomic and the map is untouched until it has succeeded.
+            Err(UpdateFailure::System(e)) => {
+                serving_error!(self.logger, ip, "UPDATE of {zone_name} failed: {e:#}");
+                return self.update_reply(msg, ResponseCode::ServerFailure, ip, Some(session));
+            }
+        };
+
+        for ignored in &report.ignored {
+            // INFO and not DEBUG: RFC 2136 requires these be dropped while the
+            // UPDATE still succeeds, so the client is told nothing. If the log
+            // does not say it, nothing does.
+            tracing::info!(peer = %ip, "UPDATE of {zone_name}: ignored {ignored}");
+        }
+
+        match installed {
+            Some(zone) => {
+                let serial = zone.serial();
+                install_zone(&self.served(), zone).await;
+                tracing::info!(
+                    peer = %ip,
+                    "UPDATE of {zone_name} by key {}: {} record{} changed, serial now {}",
+                    session.key_name(),
+                    report.changed,
+                    if report.changed == 1 { "" } else { "s" },
+                    serial.map_or_else(|| "unknown".to_string(), |s| s.to_string())
+                );
+            }
+            // Nothing changed, so nothing was written and nothing is installed.
+            // Still NOERROR: the UPDATE was well-formed, permitted, and its
+            // prerequisites held, which is success (§3.4.2.5).
+            None => tracing::info!(
+                peer = %ip,
+                "UPDATE of {zone_name} by key {}: nothing changed",
+                session.key_name()
+            ),
+        }
+
+        drop(_applying);
+        self.update_reply(msg, ResponseCode::Ok, ip, Some(session))
+    }
+
+    /// The four things `install_zone` moves together.
+    fn served(&self) -> Served {
+        Served {
+            zone_map: Arc::clone(&self.zone_map),
+            deltas: Arc::clone(&self.deltas),
+            metrics: Arc::clone(&self.metrics),
+            journal: self.journal.clone(),
+        }
+    }
+
+    /// A reply to an UPDATE, signed when the request was.
+    ///
+    /// **Signed even when it is a refusal** (RFC 8945 §5.3), which is the bug
+    /// `CLAUDE.md` §16 records on the transfer path: an unsigned REFUSED leaves
+    /// the client unable to tell a policy decision from a tampered reply, and
+    /// dnspython reports it as a malformed TSIG, which sends the reader after a
+    /// key mismatch that does not exist.
+    fn update_reply(
+        &self,
+        msg: &DnsMessage,
+        rcode: ResponseCode,
+        ip: IpAddr,
+        session: Option<&mut TsigSession>,
+    ) -> Vec<Vec<u8>> {
+        self.transfer_error(msg, rcode, ip, session)
+    }
+
     /// An empty response to `msg` carrying `rcode`, serialized.
     fn error_bytes(&self, msg: &DnsMessage, rcode: ResponseCode) -> Option<Vec<u8>> {
         let mut resp = DnsMessage {
@@ -1824,6 +2180,85 @@ impl Server {
         }
         resp.to_bytes_within(u16::MAX as usize).ok()
     }
+}
+
+/// Why an UPDATE could not be applied, split by what the client is owed.
+///
+/// Two variants because the caller branches on them and they are not the same
+/// answer: a prerequisite that did not hold carries the specific RCODE RFC 2136
+/// §3.2 assigns to its form, and everything else is §3.4.2.1's SERVFAIL. A
+/// single error type would have made the four §3.2 codes — which a client uses
+/// to tell "the name is not there" from "the name is there and this type is
+/// not" — indistinguishable from a full disk.
+enum UpdateFailure {
+    Prerequisite(update::Rejected),
+    System(anyhow::Error),
+}
+
+/// Apply an UPDATE to the zone as its *file* has it, persist it, and return the
+/// version to install.
+///
+/// `Ok((None, report))` when nothing changed: no write, nothing to install, and
+/// the client still gets NOERROR. See [`UpdateHandling`] for why the file rather
+/// than the copy in memory is what gets read and written.
+///
+/// **The order is write-then-install, and it is the safe way round.** A crash
+/// between them loses nothing: the file holds the new version and the next load
+/// picks it up. The other order would serve a change that no longer existed
+/// after a restart, which is the one failure a client cannot detect — it was
+/// told the write succeeded, and the record was there when it looked.
+///
+/// The write is atomic (`rdns::persist`, via `write_zone_file`), so a reader —
+/// which is this same server on its next reload — sees the old file or the new
+/// one and never a mixture.
+#[allow(clippy::type_complexity)]
+fn apply_update_to_file(
+    path: &Path,
+    origin: &str,
+    previous: &Zone,
+    prerequisites: &[update::Prerequisite],
+    changes: &[update::Change],
+    signing: Option<&ZoneSigning>,
+) -> Result<(Option<Zone>, update::Applied), UpdateFailure> {
+    // The zone as the file has it: unsigned, and carrying the serial the
+    // operator's number line is on. Re-read rather than kept beside the served
+    // copy, so that an operator's edit since the last load is not silently
+    // reverted by the next UPDATE — the file is the source of truth for
+    // everything else here and this does not make it a second one.
+    let source = parse_zone_file_at(path, origin)
+        .with_context(|| format!("re-reading {} to update it", path.display()))
+        .map_err(UpdateFailure::System)?;
+
+    // §3.2, against the zone as stored. Checked against the *unsigned* zone
+    // deliberately: a prerequisite naming RRSIG or NSEC would otherwise be
+    // asserting on this server's signing configuration rather than on the
+    // operator's data, and the answer would change when signing was turned on.
+    update::check_prerequisites(&source, prerequisites).map_err(UpdateFailure::Prerequisite)?;
+
+    let applied = update::apply(&source, changes);
+    if applied.changed == 0 {
+        return Ok((None, applied));
+    }
+
+    rdns::zone_writer::write_zone_file(&applied.zone, path)
+        .with_context(|| format!("writing {} back after an update", path.display()))
+        .map_err(UpdateFailure::System)?;
+
+    // Signed the way a load would sign it, from the file's serial — which is
+    // now the bumped one, so the served number moves too. `signed_serial` adds
+    // its time term rather than `max`ing it, which is what carries the +1
+    // through (see `rdns::update`'s module docs).
+    //
+    // Incrementally, against the version already being served: a full re-sign
+    // would give every RRSIG a new inception and expiration and put the whole
+    // zone into the next IXFR delta. See `ZoneSigning::sign_one_incrementally`.
+    let installed = match signing {
+        Some(signing) => signing
+            .sign_one_incrementally(previous, &applied.zone)
+            .map_err(UpdateFailure::System)?,
+        None => applied.zone.clone(),
+    };
+    Ok((Some(installed), applied))
 }
 
 /// A message with its RFC 1035 §4.2.2 length prefix, in one buffer so the writer
@@ -2163,6 +2598,23 @@ impl Server {
         metrics.count(&metrics.queries_received);
         if let Some(qtype) = qtype {
             metrics.track_query_type(qtype);
+        }
+
+        // An UPDATE over UDP is permitted (RFC 2136 §1) and goes through exactly
+        // the same handler as over TCP — the checks, the ordering and the
+        // persistence are the request's, not the transport's. The reply is
+        // already framed for TCP, so the prefix comes off here rather than the
+        // handler learning which socket it was reached from; this is the one
+        // request whose answer is a single small message either way.
+        if msg.opcode == OpCode::Update {
+            for framed in self.answer_update(&msg, peer, session.as_mut()).await {
+                if let Some(bytes) = framed.get(2..) {
+                    if let Err(e) = socket.send_to(bytes, peer).await {
+                        bad_request!(logger, peer.ip(), "socket send error: {e}");
+                    }
+                }
+            }
+            return;
         }
 
         // Build the response under the zone lock, then drop it before
@@ -2727,7 +3179,9 @@ async fn install_zone(served: &Served, zone: Zone) {
         zone_map,
         deltas,
         metrics,
+        journal,
     } = served;
+    let origin = zone.origin().to_string();
     if let Some(serial) = zone.serial() {
         metrics.set_zone_serial(zone.origin(), serial);
     }
@@ -2752,8 +3206,26 @@ async fn install_zone(served: &Served, zone: Zone) {
     } else {
         plan_change(zones.matching(zone.origin()), &zone)
     };
+    let recorded = planned.is_some();
     if let Some(planned) = planned {
         log.record(planned);
+    }
+    // Persisted under the same guard that recorded it, for the reason `Served`
+    // gives: the journal is the delta log on disk, and a window where they
+    // disagree is a window in which a restart serves a chain that does not
+    // describe the zone. The write is `write_atomically`, so what a reader can
+    // see is the old file or the new one and never a mixture.
+    //
+    // A failure to write is logged and nothing more. Losing a journal costs some
+    // secondaries a full transfer, which RFC 1995 §4 permits at any time and
+    // which is what happened on every restart before the journal existed — so
+    // refusing the update over it would trade a real change for a cosmetic one.
+    if recorded {
+        if let Some(journal) = journal {
+            if let Err(e) = journal.save(&origin, &log.all(&origin)) {
+                tracing::warn!("could not persist the delta log for {origin}: {e}");
+            }
+        }
     }
     let displaced = zones.insert(zone);
     drop(log);
@@ -2775,6 +3247,7 @@ async fn install_all_zones(served: &Served, new_zones: HashMap<String, Zone>) {
         zone_map,
         deltas,
         metrics,
+        journal,
     } = served;
     // A reload replaces the set, so a zone that has gone takes its gauges with
     // it. Leaving them behind would show a zone nobody serves any more as
@@ -2800,11 +3273,25 @@ async fn install_all_zones(served: &Served, new_zones: HashMap<String, Zone>) {
     if zones.generation() != generation {
         plan = plan_reload(&zones, &new_zones);
     }
+    let mut touched: Vec<String> = Vec::new();
     for gone in plan.forgotten {
         log.forget(&gone);
+        // On disk too: a zone withdrawn from the configuration must not come
+        // back after a restart offering increments of something nobody serves.
+        if let Some(journal) = journal {
+            journal.forget(&gone);
+        }
     }
     for planned in plan.recorded {
+        touched.push(planned.zone().to_string());
         log.record(planned);
+    }
+    if let Some(journal) = journal {
+        for zone in &touched {
+            if let Err(e) = journal.save(zone, &log.all(zone)) {
+                tracing::warn!("could not persist the delta log for {zone}: {e}");
+            }
+        }
     }
 
     let displaced = zones.replace_all(new_zones);
@@ -2813,6 +3300,58 @@ async fn install_all_zones(served: &Served, new_zones: HashMap<String, Zone>) {
     // Outside the guards on purpose: freeing the set we just replaced is one
     // deallocation per record of every zone, and no query needs to wait for it.
     drop(displaced);
+}
+
+/// Prime the delta log from the journals on disk, so a restart does not drop
+/// every secondary to a full transfer.
+///
+/// **Every failure here is a warning and nothing more, which is the opposite of
+/// how this file treats the secondary state file.** That one is fatal because
+/// forgetting a last-contact time is the difference between a withdrawn zone and
+/// a stale one served with AA set (`CLAUDE.md` §4). Nothing here has teeth: a
+/// journal that will not read means some secondaries take a full transfer, which
+/// RFC 1995 §4 permits at any time and which is exactly what happened on every
+/// restart before journals existed. Refusing to start over it would turn a
+/// cosmetic loss into an outage.
+///
+/// A journal whose last step does not reach the serial we actually loaded is
+/// dropped rather than kept. The zone moved past it by some route the journal
+/// never saw — an operator editing the file while the process was down is the
+/// ordinary one — and chaining onto it would offer a secondary a path to a
+/// version nobody is serving.
+async fn restore_journals(
+    journal: &Journal,
+    zone_map: &Arc<RwLock<Zones>>,
+    deltas: &Arc<RwLock<DeltaLog>>,
+) {
+    let zones = zone_map.read().await;
+    let mut log = deltas.write().await;
+    for (name, zone) in zones.iter() {
+        let loaded = match journal.load(name) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                tracing::warn!("ignoring the journal for {name}: {e}");
+                continue;
+            }
+        };
+        if loaded.is_empty() {
+            continue;
+        }
+        if !rdns::journal::usable_against(&loaded, zone) {
+            tracing::info!(
+                "the journal for {name} stops short of the serial loaded from disk; \
+                 discarding it, so a secondary asking for an increment gets a full transfer"
+            );
+            journal.forget(name);
+            continue;
+        }
+        tracing::info!(
+            "restored {} version step{} for {name} from its journal",
+            loaded.len(),
+            if loaded.len() == 1 { "" } else { "s" }
+        );
+        log.restore(name, loaded);
+    }
 }
 
 /// What a reload does to the delta log: which zones leave it, and which gain a
@@ -2983,6 +3522,16 @@ struct Served {
     zone_map: Arc<RwLock<Zones>>,
     deltas: Arc<RwLock<DeltaLog>>,
     metrics: Arc<DnsMetrics>,
+    /// Where the delta log is persisted, so a restart does not drop every
+    /// secondary to a full transfer. `None` when there is no directory to put it
+    /// in, which is `--zone-file` and the tests.
+    ///
+    /// Part of this group rather than beside it because it is the same fact
+    /// written down twice: the journal *is* the delta log, on disk. A swap that
+    /// updated one and not the other would offer an IXFR chain after a restart
+    /// that does not describe the zone being served — the exact hazard the
+    /// grouping exists to prevent.
+    journal: Option<Arc<Journal>>,
 }
 
 /// One replicated zone, as a NOTIFY needs to see it.
@@ -3374,6 +3923,7 @@ async fn expire_if_out_of_contact(
         zone_map,
         deltas,
         metrics,
+        journal: _,
     } = served;
     let last_contact = state
         .lock()
@@ -3436,6 +3986,7 @@ async fn withdraw_unvouched_zones(specs: &[MasterSpec], served: &Served, zone_di
         zone_map,
         deltas,
         metrics,
+        journal: _,
     } = served;
     let state = StateFile::load(&state_file_path(zone_dir));
     let now = current_unix_timestamp();
@@ -3652,12 +4203,24 @@ async fn main() -> Result<()> {
     // instead, which RFC 1995 §4 permits unconditionally and which corrects
     // itself at the next change. See "Architecture: incremental transfer".
     let deltas = Arc::new(RwLock::new(DeltaLog::new()));
-    // The three that are only ever updated together. See [`Served`].
+    // Where those steps are persisted, so the paragraph above stops being true
+    // across a restart. Only a directory-shaped source has somewhere to put it:
+    // `--zone-file` names one file and writing a journal beside it would put a
+    // file into a directory the operator did not give us.
+    let journal = match &source {
+        ZoneSource::Directory(dir) => Some(Arc::new(Journal::new(PathBuf::from(dir)))),
+        ZoneSource::SingleFile(_) | ZoneSource::Files(_) => None,
+    };
+    // The four that are only ever updated together. See [`Served`].
     let served = Served {
         zone_map: zone_map.clone(),
         deltas: deltas.clone(),
         metrics: metrics.clone(),
+        journal: journal.clone(),
     };
+    if let Some(journal) = &journal {
+        restore_journals(journal, &zone_map, &deltas).await;
+    }
     let addr = format!("{}:{}", cli.host, cli.port);
 
     // Before anything is served: a replicated zone whose copy on disk went out
@@ -3725,6 +4288,17 @@ async fn main() -> Result<()> {
         .map(|spec| spec.zone.clone())
         .collect();
 
+    // What a dynamic UPDATE needs, taken before `source` and `signing` are moved
+    // into the maintenance task. It holds the same two things that task does, on
+    // purpose: an UPDATE is a zone-file edit followed by the load path, so it has
+    // to read and sign exactly the way a reload does or the two will disagree
+    // about what the zone is.
+    let updates = Arc::new(UpdateHandling {
+        source: Some(source.clone()),
+        signing: signing.clone(),
+        applying: tokio::sync::Mutex::new(()),
+    });
+
     // Reload on SIGHUP or on the control socket, and re-sign on the signature
     // timer. The sender it hands back is how `rdnsctl reload` reaches the same
     // loop rather than becoming a second implementation of a reload.
@@ -3755,6 +4329,8 @@ async fn main() -> Result<()> {
             udp_workers: cli.udp_workers,
             metrics_listen: cli.metrics_listen,
             readiness,
+            updates,
+            journal,
             control: ControlPolicy {
                 socket: cli.control_socket,
                 reloads,
@@ -4003,6 +4579,27 @@ impl ZoneSigning {
     /// served unsigned: its parent has a DS pointing at one of these keys, so
     /// the unsigned answer would be bogus at every validating client rather
     /// than merely unvalidated.
+    /// Sign one zone against the version already being served, carrying forward
+    /// every signature whose RRset did not move.
+    ///
+    /// This is the dynamic-UPDATE path and not the load path. A full re-sign
+    /// gives every RRSIG in the zone a new inception and expiration, so the IXFR
+    /// delta for a one-record update is the whole zone — measured at 52 records
+    /// out of 53 before this existed, against 10 after (`TODO.md` #10). At load
+    /// there is no previous version to carry anything forward from and
+    /// [`ZoneSigning::apply`] is the right call; here there is.
+    ///
+    /// A zone with no key is returned unchanged, exactly as `apply` skips it.
+    fn sign_one_incrementally(&self, previous: &Zone, zone: &Zone) -> Result<Zone> {
+        let origin = zone.origin().to_string();
+        let Some(keys) = self.keys.get(&origin.to_ascii_lowercase()) else {
+            return Ok(zone.clone());
+        };
+        let policy = self.policy_for(&origin, current_unix_timestamp());
+        sign_zone_incrementally(previous, zone, keys, &policy)
+            .with_context(|| format!("re-signing {origin} after an update"))
+    }
+
     fn apply(&self, zones: &mut HashMap<String, Zone>) -> Result<()> {
         // One moment for the whole run — see `policy_for`.
         let signed_at = current_unix_timestamp();
@@ -4590,6 +5187,7 @@ mod tests {
             zone_map: zone_map.clone(),
             deltas: deltas.clone(),
             metrics: Arc::new(DnsMetrics::new()),
+            journal: None,
         }
     }
 
@@ -4621,11 +5219,13 @@ mod tests {
             validator: Arc::new(RequestValidator::with_defaults()),
             logger: Arc::new(QueryLogger::new()),
             metrics: Arc::new(DnsMetrics::new()),
+            journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl")),
             tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
             response_limiter: Arc::new(ResponseLimiter::disabled()),
             secondaries: Arc::new(HashMap::new()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            updates: Arc::new(UpdateHandling::disabled()),
         })
     }
 
@@ -5137,6 +5737,8 @@ mod tests {
             response_limiter: Arc::new(ResponseLimiter::disabled()),
             secondaries: Arc::new(HashMap::new()),
             deltas: Arc::new(RwLock::new(log)),
+            updates: Arc::new(UpdateHandling::disabled()),
+            journal: None,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -5151,6 +5753,374 @@ mod tests {
             }
         });
         addr
+    }
+
+    // -----------------------------------------------------------------
+    // Dynamic UPDATE, end to end (RFC 2136)
+    // -----------------------------------------------------------------
+
+    /// The zone every UPDATE test starts from.
+    const UPDATE_ZONE: &str = "$ORIGIN example.com.\n\
+         $TTL 3600\n\
+         @    IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+         @    IN NS  ns1.example.com.\n\
+         ns1  IN A   192.0.2.1\n\
+         www  IN A   192.0.2.10\n";
+
+    fn update_key(zones: rdns::tsig::UpdatePolicy) -> TsigKey {
+        TsigKey::new("dhcp.key.", TsigAlgorithm::HmacSha256, vec![7u8; 32]).for_updates(zones)
+    }
+
+    /// A server serving `example.com.` out of a real directory it can write.
+    async fn spawn_updatable(dir: &Path, key: TsigKey) -> SocketAddr {
+        spawn_updatable_with_journal(dir, key, None).await
+    }
+
+    async fn spawn_updatable_with_journal(
+        dir: &Path,
+        key: TsigKey,
+        journal: Option<Arc<rdns::journal::Journal>>,
+    ) -> SocketAddr {
+        std::fs::write(dir.join("example.com.zone"), UPDATE_ZONE).expect("write the zone file");
+        let source = ZoneSource::Directory(dir.to_string_lossy().to_string());
+        let zones = load_zones_from_source(&source, false, false).expect("load");
+
+        let server = Arc::new(Server {
+            zone_map: Arc::new(RwLock::new(Zones::new(zones))),
+            rate_limiter: Arc::new(RateLimiter::with_defaults()),
+            validator: Arc::new(RequestValidator::with_defaults()),
+            logger: Arc::new(QueryLogger::new()),
+            metrics: Arc::new(DnsMetrics::new()),
+            transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
+            tsig_keys: Arc::new(TsigKeyring::new(vec![key])),
+            response_limiter: Arc::new(ResponseLimiter::disabled()),
+            secondaries: Arc::new(HashMap::new()),
+            deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            updates: Arc::new(UpdateHandling {
+                source: Some(source),
+                signing: None,
+                applying: tokio::sync::Mutex::new(()),
+            }),
+            journal,
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                tokio::spawn(server.clone().serve_connection(
+                    stream,
+                    peer,
+                    test_shutdown().stop_handle(),
+                ));
+            }
+        });
+        addr
+    }
+
+    /// An UPDATE message adding `name` with one A record, or whatever `changes`
+    /// says.
+    fn update_message(zone: &str, changes: Vec<ResourceRecord>) -> DnsMessage {
+        DnsMessage {
+            id: 0x2136,
+            response: false,
+            opcode: OpCode::Update,
+            authoritive: false,
+            truncation: false,
+            recursion: false,
+            recursion_ok: false,
+            ad: false,
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![rdns::QuerySection {
+                qname: zone.to_string(),
+                qtype: Qtype::of(record_types::SOA),
+                qclass: QueryClass::IN,
+            }],
+            answers: Vec::new(),
+            authorities: changes,
+            additionals: Vec::new(),
+            edns: None,
+        }
+    }
+
+    fn a_record(name: &str, addr: &str) -> ResourceRecord {
+        ResourceRecord {
+            name: name.to_string(),
+            class: rdns::Class::new(1),
+            ttl: Ttl::from_secs(3600),
+            rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                addr.parse().expect("an address"),
+            ))
+            .expect("encodes"),
+        }
+    }
+
+    /// Send one message over TCP and read one reply.
+    async fn round_trip(addr: SocketAddr, bytes: Vec<u8>) -> DnsMessage {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(&frame(&bytes)).await.expect("write");
+        let mut len = [0u8; 2];
+        stream.read_exact(&mut len).await.expect("length prefix");
+        let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
+        stream.read_exact(&mut buf).await.expect("body");
+        DnsMessage::try_from_bytes(&buf).expect("a reply")
+    }
+
+    /// **An UPDATE reaches the zone file, not just the zone map.**
+    ///
+    /// This is the assertion the whole design turns on, and it is why write-back
+    /// is a precondition rather than a follow-on: the re-signing timer reloads
+    /// every zone from its file (`ZoneSigning::resign_interval` explains why it
+    /// must), so a change that lived only in memory would be discarded within one
+    /// interval, silently, having told the client it succeeded. Asserting on the
+    /// map alone would pass against exactly that bug.
+    ///
+    /// **Watched failing** against a handler that installed the new zone without
+    /// writing the file: the map assertion passed, the file assertion did not.
+    #[tokio::test]
+    async fn an_update_is_applied_persisted_and_served() {
+        let dir = ScratchDir::new("update-applied");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let addr = spawn_updatable(&dir.0, key.clone()).await;
+
+        let message = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        );
+        let bytes = message.to_bytes_within(4096).expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+        let reply = round_trip(addr, signed).await;
+
+        assert_eq!(reply.rcode, ResponseCode::Ok, "RFC 2136 §3.4.2.5");
+        assert_eq!(reply.opcode, OpCode::Update, "the opcode is echoed");
+
+        // Served: asked over the same socket, so this is the zone map answering
+        // and not an inspection of internals.
+        let asked = round_trip(
+            addr,
+            query("new.example.com.", Qtype::of(record_types::A), false)
+                .to_bytes_within(4096)
+                .expect("serialize"),
+        )
+        .await;
+        assert_eq!(asked.rcode, ResponseCode::Ok);
+        assert_eq!(
+            asked.answers.len(),
+            1,
+            "the new record is being served: {:?}",
+            asked.answers
+        );
+
+        // The file, which is the half that survives a reload.
+        let written = std::fs::read_to_string(dir.0.join("example.com.zone")).expect("read back");
+        assert!(
+            written.contains("new.example.com."),
+            "the record reached the file:\n{written}"
+        );
+
+        // And it reads back as a zone with the record and a moved serial, rather
+        // than merely containing the right substring.
+        let reloaded = rdns::zone::parse_zone_file(&written, "example.com.").expect("reparses");
+        assert_eq!(
+            reloaded
+                .query("new.example.com.", Qtype::of(record_types::A))
+                .len(),
+            1
+        );
+        assert_eq!(
+            reloaded.serial(),
+            Some(Serial::new(2)),
+            "RFC 2136 §3.6: the serial moved with the contents"
+        );
+    }
+
+    /// The three refusals, each with the code RFC 2136 gives it.
+    ///
+    /// They are not interchangeable and that is the point: NOTAUTH says "not my
+    /// zone" (§3.1.1) and REFUSED says "not you" (§3.3), and a client uses the
+    /// difference to decide whether to look for a different server or a
+    /// different key.
+    #[tokio::test]
+    async fn an_unauthorized_update_is_refused_and_an_unknown_zone_is_notauth() {
+        let dir = ScratchDir::new("update-refused");
+        // Scoped to a zone this server does not serve, so the key is valid and
+        // grants nothing here.
+        let key = update_key(rdns::tsig::UpdatePolicy::Zones(vec![
+            "elsewhere.test.".to_string()
+        ]));
+        let addr = spawn_updatable(&dir.0, key.clone()).await;
+        let changes = vec![a_record("new.example.com.", "192.0.2.50")];
+
+        // Unsigned: an UPDATE has no address-based path in, by design.
+        let unsigned = update_message("example.com.", changes.clone())
+            .to_bytes_within(4096)
+            .expect("serialize");
+        assert_eq!(
+            round_trip(addr, unsigned).await.rcode,
+            ResponseCode::Refused,
+            "§3.3: an unsigned UPDATE has no credential"
+        );
+
+        // Signed with a key scoped to another zone.
+        let bytes = update_message("example.com.", changes)
+            .to_bytes_within(4096)
+            .expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::Refused,
+            "§3.3: the key may not rewrite this zone"
+        );
+
+        // A zone this server is not authoritative for is NOTAUTH, not REFUSED —
+        // the opposite of the query path's rule (`CLAUDE.md` §8).
+        let elsewhere = update_message(
+            "elsewhere.test.",
+            vec![a_record("new.elsewhere.test.", "192.0.2.50")],
+        )
+        .to_bytes_within(4096)
+        .expect("serialize");
+        let signed = rdns::tsig::sign_request(elsewhere, &key, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::NotAuthorized,
+            "§3.1.1: not one of this server's authority zones"
+        );
+
+        // Nothing was written on any of the three paths.
+        let written = std::fs::read_to_string(dir.0.join("example.com.zone")).expect("read back");
+        assert!(
+            !written.contains("new.example.com."),
+            "a refused UPDATE changes nothing:\n{written}"
+        );
+    }
+
+    /// A server with no writable zone source refuses an UPDATE rather than
+    /// applying it to memory alone.
+    ///
+    /// The distinction this protects is the one in [`UpdateHandling`]'s docs: an
+    /// in-memory-only change is discarded by the next reload or re-signing run,
+    /// silently, after the client was told it succeeded. Refusing is the honest
+    /// answer, and it is the branch that exists because the field is an `Option`.
+    #[tokio::test]
+    async fn an_update_is_refused_without_a_writable_source() {
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let zone = rdns::zone::parse_zone_file(UPDATE_ZONE, "example.com.").expect("parse");
+        let addr = spawn_primary_with_keys(
+            zone,
+            &[],
+            DeltaLog::new(),
+            TsigKeyring::new(vec![key.clone()]),
+        )
+        .await;
+
+        let bytes = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        )
+        .to_bytes_within(4096)
+        .expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::Refused,
+            "a key that grants everything still cannot write a zone we cannot persist"
+        );
+    }
+
+    /// **An UPDATE leaves a journal, and the journal answers an IXFR from
+    /// before it.**
+    ///
+    /// This is `TODO.md` #7 step 6's whole point, and asserting on the file
+    /// alone would not show it: what matters is that a *fresh* `DeltaLog` — one
+    /// that has never seen the update, as after a restart — can chain from the
+    /// serial a secondary was holding beforehand. Anything less is a file that
+    /// exists rather than a history that works.
+    ///
+    /// **Watched failing** with the journal write removed from `install_zone`:
+    /// the update still applied and was still served, and `Journal::load` came
+    /// back empty, so `chain_from` had nothing to answer with — which is
+    /// precisely the pre-journal behaviour it is meant to replace.
+    #[tokio::test]
+    async fn an_update_leaves_a_journal_that_survives_the_process() {
+        let dir = ScratchDir::new("update-journal");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let journal = Arc::new(rdns::journal::Journal::new(dir.0.clone()));
+        let addr = spawn_updatable_with_journal(&dir.0, key.clone(), Some(journal.clone())).await;
+
+        for (n, addr_text) in [(1u8, "192.0.2.51"), (2, "192.0.2.52")] {
+            let bytes = update_message(
+                "example.com.",
+                vec![a_record(&format!("host{n}.example.com."), addr_text)],
+            )
+            .to_bytes_within(4096)
+            .expect("serialize");
+            let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+            assert_eq!(round_trip(addr, signed).await.rcode, ResponseCode::Ok);
+        }
+
+        // A new process would see exactly this: the file, and nothing in memory.
+        let restored = journal
+            .load("example.com.")
+            .expect("the journal reads back");
+        assert_eq!(restored.len(), 2, "one step per update");
+        assert_eq!(restored[0].from_serial, Serial::new(1), "the zone's serial");
+        assert_eq!(restored[1].to_serial, Serial::new(3), "after two bumps");
+
+        let mut log = DeltaLog::new();
+        log.restore("example.com.", restored);
+        let chain = log
+            .chain_from("example.com.", Serial::new(1))
+            .expect("a secondary at the pre-update serial can still be caught up");
+        assert_eq!(chain.len(), 2);
+        assert!(
+            chain
+                .iter()
+                .flat_map(|d| d.added.iter())
+                .any(|r| r.name == "host1.example.com."),
+            "and the records it was missing are in it"
+        );
+    }
+
+    /// A prerequisite that does not hold stops the update, with its own RCODE
+    /// (§3.2) and with the zone untouched — which is what makes an UPDATE a
+    /// transaction rather than a sequence of edits.
+    #[tokio::test]
+    async fn a_failed_prerequisite_leaves_the_zone_alone() {
+        let dir = ScratchDir::new("update-prereq");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let addr = spawn_updatable(&dir.0, key.clone()).await;
+
+        let mut message = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        );
+        // §2.4.3 CLASS=NONE: "no RRset of this type exists at this name" — and
+        // `www` has an A, so it does not hold.
+        message.answers = vec![ResourceRecord {
+            name: "www.example.com.".to_string(),
+            class: rdns::Class::new(254),
+            ttl: Ttl::ZERO,
+            rdata: rdns::RecordData::new(record_types::A, Vec::new()).expect("bare"),
+        }];
+        let bytes = message.to_bytes_within(4096).expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::ResourceRecordSetExistsForSomeReason,
+            "§3.2.2 YXRRSET, not a generic failure"
+        );
+        let written = std::fs::read_to_string(dir.0.join("example.com.zone")).expect("read back");
+        assert!(!written.contains("new.example.com."), "{written}");
+        let reloaded = rdns::zone::parse_zone_file(&written, "example.com.").expect("reparses");
+        assert_eq!(
+            reloaded.serial(),
+            Some(Serial::new(1)),
+            "and the serial did not move either"
+        );
     }
 
     struct ScratchDir(PathBuf);
@@ -5180,6 +6150,7 @@ mod tests {
                 zone_map: Arc::new(RwLock::new(Zones::default())),
                 deltas: Arc::new(RwLock::new(DeltaLog::new())),
                 metrics: Arc::new(DnsMetrics::new()),
+                journal: None,
             },
             state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&dir.0)))),
             zone_dir: dir.0.clone(),
@@ -5386,6 +6357,7 @@ mod tests {
                 zone_map: zone_map.clone(),
                 deltas: Arc::new(RwLock::new(DeltaLog::new())),
                 metrics: Arc::new(DnsMetrics::new()),
+                journal: None,
             },
             state: state.clone(),
             zone_dir: dir.0.clone(),
@@ -5437,6 +6409,7 @@ mod tests {
                 zone_map: zone_map.clone(),
                 deltas: Arc::new(RwLock::new(DeltaLog::new())),
                 metrics: Arc::new(DnsMetrics::new()),
+                journal: None,
             },
             state: state.clone(),
             zone_dir: dir.0.clone(),
@@ -6289,11 +7262,13 @@ mod tests {
             validator: Arc::new(RequestValidator::with_defaults()),
             logger: Arc::new(QueryLogger::new()),
             metrics: Arc::new(DnsMetrics::new()),
+            journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
             tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
             response_limiter: Arc::new(ResponseLimiter::disabled()),
             secondaries: Arc::new(HashMap::new()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            updates: Arc::new(UpdateHandling::disabled()),
         };
         let peer: SocketAddr = "192.0.2.9:5353".parse().unwrap();
 

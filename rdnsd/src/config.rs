@@ -169,6 +169,19 @@ pub struct Key {
     /// `rdns::tsig::TsigKey`, where the same default is spelled out and argued.
     #[serde(default)]
     pub zones: Vec<String>,
+    /// The zones this key may rewrite through dynamic UPDATE (RFC 2136 §3.3).
+    ///
+    /// **Empty means none**, which is the opposite of `zones` directly above.
+    /// The argument is at `rdns::tsig::UpdatePolicy`: a transfer hands over a
+    /// copy and an update rewrites the original, and no working deployment can
+    /// be broken by denying something nothing has ever served. `["*"]` grants
+    /// every zone, and has to be typed.
+    ///
+    /// The two lists sit next to each other with opposite defaults on purpose —
+    /// an operator reading this table is deciding both at once, which is where
+    /// `CLAUDE.md` §16 says narrowing belongs.
+    #[serde(default)]
+    pub update_zones: Vec<String>,
 }
 
 fn default_algorithm() -> String {
@@ -353,9 +366,20 @@ impl Config {
                 _ => unreachable!("checked in Config::check"),
             };
             let mut spec = format!("{}:{name}:{secret}", key.algorithm);
-            if !key.zones.is_empty() {
+            // The update scope is the fifth field, so granting one means
+            // spelling the fourth: `*` is how the unrestricted transfer scope is
+            // written when it cannot simply be left off the end.
+            if !key.zones.is_empty() || !key.update_zones.is_empty() {
                 spec.push(':');
-                spec.push_str(&key.zones.join(","));
+                if key.zones.is_empty() {
+                    spec.push('*');
+                } else {
+                    spec.push_str(&key.zones.join(","));
+                }
+            }
+            if !key.update_zones.is_empty() {
+                spec.push(':');
+                spec.push_str(&key.update_zones.join(","));
             }
             specs.push(spec);
         }
@@ -590,6 +614,71 @@ zones = ["example.com.", "other.test."]
         assert!(key.may_transfer("example.com."));
         assert!(key.may_transfer("other.test."));
         assert!(!key.may_transfer("third.test."));
+        assert!(
+            !key.may_update("example.com."),
+            "a key with no update-zones may rewrite nothing"
+        );
+    }
+
+    /// `update-zones` reaches the flag parser as the fifth field, including the
+    /// case the positional syntax makes awkward: unrestricted for transfers and
+    /// scoped for updates, which needs the fourth field written as `*`.
+    #[test]
+    fn an_update_scope_round_trips_through_the_flag_parser() {
+        let config = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+[keys."dhcp.key."]
+secret = "AAECAwQFBgcICQoLDA0ODw=="
+update-zones = ["dyn.example.com."]
+[keys."scoped.key."]
+secret = "AAECAwQFBgcICQoLDA0ODw=="
+zones = ["example.com."]
+update-zones = ["*"]
+"#,
+        )
+        .expect("parses");
+        let keys: Vec<rdns::tsig::TsigKey> = config
+            .tsig_specs()
+            .expect("specs")
+            .iter()
+            .map(|spec| rdns::tsig::TsigKey::parse(spec).expect("the flag parser accepts it"))
+            .collect();
+
+        let dhcp = keys.iter().find(|k| k.name == "dhcp.key.").expect("dhcp");
+        assert!(
+            dhcp.may_transfer("anything.test."),
+            "no zones means the transfer default is untouched"
+        );
+        assert!(dhcp.may_update("dyn.example.com."));
+        assert!(!dhcp.may_update("example.com."));
+
+        let scoped = keys
+            .iter()
+            .find(|k| k.name == "scoped.key.")
+            .expect("scoped");
+        assert!(scoped.may_transfer("example.com."));
+        assert!(!scoped.may_transfer("other.test."));
+        assert_eq!(scoped.update_scope(), &rdns::tsig::UpdatePolicy::Any);
+    }
+
+    /// A key with neither list must not grow a trailing colon, which the parser
+    /// reads as an empty zone list and refuses.
+    #[test]
+    fn a_key_with_no_lists_has_three_fields() {
+        let config = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+[keys."plain.key."]
+secret = "AAECAwQFBgcICQoLDA0ODw=="
+"#,
+        )
+        .expect("parses");
+        let specs = config.tsig_specs().expect("specs");
+        assert_eq!(specs[0].split(':').count(), 3, "got {:?}", specs[0]);
+        rdns::tsig::TsigKey::parse(&specs[0]).expect("and parses");
     }
 
     #[test]

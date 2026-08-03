@@ -29,6 +29,7 @@ mod dnssec_test_util;
 pub mod dnssec_validation_mode;
 pub mod error;
 pub mod ixfr;
+pub mod journal;
 pub mod logging;
 pub mod metrics;
 pub mod metrics_server;

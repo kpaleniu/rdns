@@ -286,6 +286,48 @@ pub fn signed_serial(file_serial: Serial, signed_at: u64) -> Serial {
 /// a key published without its private half is how every rollover starts and
 /// deleting it would undo the operator's preparation.
 pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Result<Zone> {
+    sign_zone_inner(zone, keys, policy, None)
+}
+
+/// Sign `zone`, carrying forward any signature from `previous` that still
+/// covers exactly what it covered before.
+///
+/// **For applying a dynamic UPDATE, where re-signing everything is not merely
+/// expensive but actively harmful.** Every RRSIG's inception and expiration
+/// derive from the run's `signed_at` ([`SigningPolicy::valid_for`]), so a full
+/// re-sign a minute after the last one produces different RDATA for *every*
+/// signature in the zone — and `ixfr::diff` compares whole records, so all of
+/// them land in the delta. Measured on the signer's own test zone before this
+/// existed: a one-record UPDATE to a 53-record zone produced a **52-record**
+/// delta, which is a full transfer wearing an incremental's framing, retained 32
+/// times over by `DeltaLog`. See `TODO.md` #10.
+///
+/// **The chain is still built in full**, and that is the point rather than a
+/// shortcut not taken. An NSEC's bitmap lists every type at its name and its
+/// `next` names its successor (RFC 4034 §4.1.2, RFC 5155 §7.1), so adding one
+/// name changes the denial record at that name *and* at its predecessor.
+/// Computing "the changed names plus their chain neighbours" is a thing to get
+/// wrong — and getting it wrong yields a chain that validates against itself
+/// while denying a name that exists. Building the chain and then asking which
+/// records came out identical never computes a neighbour set at all, so it
+/// cannot compute one incorrectly. What is saved is the signing, which is the
+/// expensive half.
+pub fn sign_zone_incrementally(
+    previous: &Zone,
+    zone: &Zone,
+    keys: &[SigningKey],
+    policy: &SigningPolicy,
+) -> Result<Zone> {
+    let carried = PreviousSignatures::of(previous);
+    sign_zone_inner(zone, keys, policy, Some(&carried))
+}
+
+fn sign_zone_inner(
+    zone: &Zone,
+    keys: &[SigningKey],
+    policy: &SigningPolicy,
+    previous: Option<&PreviousSignatures>,
+) -> Result<Zone> {
     policy.chain.check()?;
     let origin = canonical_name(zone.origin());
     check_keys(keys, &origin)?;
@@ -342,8 +384,138 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
         )?,
     }
 
-    sign_everything(&layout, keys, policy, &mut signed)?;
+    sign_everything(&layout, keys, policy, previous, &mut signed)?;
     Ok(signed)
+}
+
+/// A previous signed version of a zone, indexed so that an RRset which has not
+/// moved can keep the signature it already had.
+///
+/// Both halves are needed and neither is sufficient. The RRsets answer "is this
+/// exactly what was signed"; the signatures answer "and what was the answer".
+/// Keeping a signature because the *name* still exists, without checking the
+/// records under it, is how a zone comes to serve a signature over data it no
+/// longer holds.
+struct PreviousSignatures {
+    /// (folded owner, type) -> the RRset as it was signed: its TTL, and its
+    /// RDATA in the order the previous run saw them.
+    rrsets: BTreeMap<(String, Rtype), (Ttl, Vec<RecordData>)>,
+    /// (folded owner, covered type) -> the signatures over that RRset.
+    signatures: BTreeMap<(String, Rtype), Vec<CarriedSignature>>,
+}
+
+/// One RRSIG from the previous run, with the two fields the reuse decision
+/// turns on read out once rather than per lookup.
+struct CarriedSignature {
+    rdata: RecordData,
+    expiration: u32,
+    key_tag: u16,
+}
+
+impl PreviousSignatures {
+    fn of(previous: &Zone) -> Self {
+        let mut rrsets: BTreeMap<(String, Rtype), (Ttl, Vec<RecordData>)> = BTreeMap::new();
+        let mut signatures: BTreeMap<(String, Rtype), Vec<CarriedSignature>> = BTreeMap::new();
+
+        for record in previous.records() {
+            let name = record.name.to_ascii_lowercase();
+            if record.rdata.rtype() == rt::RRSIG {
+                // An RRSIG that will not parse is one this run cannot reason
+                // about, so it is simply not offered for reuse and the RRset it
+                // covers gets a fresh signature.
+                if let Ok(ParsedRecord::RRSIG {
+                    type_covered,
+                    expiration,
+                    key_tag,
+                    ..
+                }) = record.rdata.parse()
+                {
+                    signatures
+                        .entry((name, type_covered))
+                        .or_default()
+                        .push(CarriedSignature {
+                            rdata: record.rdata.clone(),
+                            expiration,
+                            key_tag,
+                        });
+                }
+                continue;
+            }
+            let entry = rrsets
+                .entry((name, record.rdata.rtype()))
+                .or_insert((record.ttl, Vec::new()));
+            entry.1.push(record.rdata.clone());
+        }
+
+        PreviousSignatures { rrsets, signatures }
+    }
+
+    /// The signatures to carry forward for this RRset, or `None` to sign it
+    /// afresh.
+    ///
+    /// Four conditions, and each one is a way the reuse would otherwise be
+    /// wrong:
+    ///
+    /// 1. **The RRset is byte-identical**, as a set — same TTL, same RDATA, no
+    ///    member added or removed. Compared as a set rather than a sequence
+    ///    because an RRset has no order (RFC 2181 §5) and the two runs walk the
+    ///    zone's record vector, which an update rebuilds.
+    /// 2. **There is at least one signature**, so an RRset that was somehow
+    ///    unsigned before does not stay unsigned by being copied.
+    /// 3. **The signing keys have not changed**, compared by key tag as a set.
+    ///    A key added is a rollover starting and the RRset needs the new
+    ///    signature; a key removed is one leaving and its signature must not
+    ///    survive it.
+    /// 4. **No carried signature has already expired.** Anything else would
+    ///    publish a signature known to be dead at the moment of writing it,
+    ///    while holding the key that could have replaced it.
+    ///
+    /// **What is deliberately *not* a condition: being close to expiry.** A
+    /// signature with a day left is carried forward unchanged. Refreshing it
+    /// here would mean any single UPDATE re-signs every stale RRset in the
+    /// zone — which is the whole-zone delta this exists to avoid, and worse, it
+    /// would let update traffic quietly stand in for the re-signing timer. A
+    /// zone whose timer has died must degrade the same way whether or not
+    /// anyone is updating it, because that is the failure the operator has
+    /// alerts for. Expiry is [`SigningPolicy::resign_interval`]'s business and
+    /// this does not take it on.
+    fn reuse(
+        &self,
+        name: &str,
+        rtype: Rtype,
+        ttl: Ttl,
+        rdatas: &[RecordData],
+        key_tags: &[u16],
+        signed_at: u64,
+    ) -> Option<&[CarriedSignature]> {
+        let (was_ttl, was) = self.rrsets.get(&(name.to_string(), rtype))?;
+        if *was_ttl != ttl || was.len() != rdatas.len() {
+            return None;
+        }
+        if !was.iter().all(|r| rdatas.contains(r)) || !rdatas.iter().all(|r| was.contains(r)) {
+            return None;
+        }
+
+        let carried = self.signatures.get(&(name.to_string(), rtype))?;
+        if carried.is_empty() {
+            return None;
+        }
+        if u64::from(carried.iter().map(|s| s.expiration).min()?) <= signed_at {
+            return None;
+        }
+
+        let mut had: Vec<u16> = carried.iter().map(|s| s.key_tag).collect();
+        had.sort_unstable();
+        had.dedup();
+        let mut want: Vec<u16> = key_tags.to_vec();
+        want.sort_unstable();
+        want.dedup();
+        if had != want {
+            return None;
+        }
+
+        Some(carried)
+    }
 }
 
 /// The keys must all belong to this zone, and at least one must be able to sign
@@ -777,6 +949,7 @@ fn sign_everything(
     layout: &Layout,
     keys: &[SigningKey],
     policy: &SigningPolicy,
+    previous: Option<&PreviousSignatures>,
     signed: &mut Zone,
 ) -> Result<()> {
     // The convention every real zone follows: the key the parent's DS points at
@@ -811,6 +984,28 @@ fn sign_everything(
         } else {
             data_signers
         };
+
+        // Unchanged since the last run, and signed by exactly these keys: keep
+        // what is there. This is the whole of the incremental path — the RRset
+        // is not re-signed, so its RDATA does not move, so it does not appear in
+        // the next IXFR delta.
+        if let Some(previous) = previous {
+            let tags: Vec<u16> = signers.iter().map(|k| k.key_tag()).collect();
+            if let Some(carried) =
+                previous.reuse(&name, rtype, ttl, &rdatas, &tags, policy.signed_at)
+            {
+                for signature in carried {
+                    signatures.push(ZoneRecord {
+                        name: name.clone(),
+                        ttl,
+                        class: Class::new(1),
+                        rdata: signature.rdata.clone(),
+                    });
+                }
+                continue;
+            }
+        }
+
         let original_ttl = ttl.as_secs();
         let rrset = Rrset::new(&name, rtype, Class::new(1), &rdatas);
         // Spread this RRset's expiry back from the window's end, so the zone
@@ -1591,6 +1786,239 @@ ns.plain IN A  192.0.2.40
             proof_for(&zone, ORIGIN, rt::DNSKEY),
             RrsetProof::Verified { .. }
         ));
+    }
+
+    /// **A one-record UPDATE to a signed zone currently produces a whole-zone
+    /// IXFR delta**, and this measures it rather than describing it.
+    ///
+    /// Every RRSIG's inception and expiration derive from the signing run's
+    /// `signed_at` ([`SigningPolicy::valid_for`]), so two runs a minute apart
+    /// produce different RDATA for *every* signature in the zone. `ixfr::diff`
+    /// compares whole records, correctly, so all of them land in the delta —
+    /// and the one A record the client actually added is lost among them.
+    ///
+    /// Measured here: a 53-record zone with 23 RRSIGs, one record added, and a
+    /// delta of **52 records**. That is the whole zone, one short of the
+    /// threshold at which `ixfr_response` would give up and send an AXFR
+    /// instead — so a secondary receives an "incremental" transfer the size of a
+    /// full one, and `DeltaLog` keeps 32 of them per zone.
+    ///
+    /// **This is a characterization test, not a regression test** (`CLAUDE.md`
+    /// §10 — say what a test is and what it is not). It asserts what the code
+    /// does today so that the number moves visibly when incremental re-signing
+    /// lands (`TODO.md` #10); it is not asserting that this behaviour is
+    /// correct, and the assertion below is written to *fail* once the fix
+    /// arrives rather than to quietly keep passing.
+    #[test]
+    fn re_signing_after_an_update_currently_rewrites_every_signature() {
+        use crate::ixfr::diff;
+
+        let keys = keys();
+        let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
+        let before = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).unwrap();
+
+        // The smallest possible update: one A record, and the §3.6 serial bump.
+        let updated = crate::update::apply(
+            &zone,
+            &[crate::update::Change::Add(ResourceRecord {
+                name: "new.example.com.".to_string(),
+                class: Class::new(1),
+                ttl: Ttl::from_secs(3600),
+                rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.77".parse().unwrap()))
+                    .unwrap(),
+            })],
+        );
+        assert_eq!(updated.changed, 1, "one record changed");
+
+        // Signed a minute later, as a real update would be.
+        let later = SigningPolicy::valid_for(NOW + 60, 30 * 86_400).with_chain(DenialChain::Nsec);
+        let after = sign_zone(&updated.zone, &keys, &later).unwrap();
+
+        let delta = diff(&before, &after).expect("both versions have an SOA");
+        let signatures = before
+            .records()
+            .iter()
+            .filter(|r| r.rdata.rtype() == rt::RRSIG)
+            .count();
+        let signatures_deleted = delta
+            .deleted
+            .iter()
+            .filter(|r| r.rdata.rtype() == rt::RRSIG)
+            .count();
+
+        assert_eq!(
+            signatures_deleted, signatures,
+            "every signature in the zone is in the delta, not just the changed one"
+        );
+        assert!(
+            delta.len() > before.records().len() / 2,
+            "the delta ({}) is most of the zone ({}) for a one-record change",
+            delta.len(),
+            before.records().len()
+        );
+
+        // And the fix, measured against the same case: signing incrementally
+        // carries every untouched signature forward, so the delta collapses to
+        // the records that actually moved plus the denial chain around them.
+        let incremental =
+            sign_zone_incrementally(&before, &updated.zone, &keys, &later).expect("signs");
+        let small = diff(&before, &incremental).expect("both have an SOA");
+        assert!(
+            small.len() * 4 < delta.len(),
+            "the incremental delta ({}) must be a small fraction of the full one ({})",
+            small.len(),
+            delta.len()
+        );
+        assert!(
+            small
+                .deleted
+                .iter()
+                .chain(small.added.iter())
+                .all(|r| r.rdata.rtype() != rt::RRSIG
+                    || r.name == "new.example.com."
+                    || r.name == ORIGIN
+                    || small
+                        .added
+                        .iter()
+                        .any(|a| a.name == r.name && a.rdata.rtype() == rt::NSEC)
+                    || small
+                        .deleted
+                        .iter()
+                        .any(|d| d.name == r.name && d.rdata.rtype() == rt::NSEC)),
+            "the only signatures that moved belong to the new name, the apex \
+             whose SOA changed, or a denial record the insertion displaced: {:?}",
+            small
+                .deleted
+                .iter()
+                .chain(small.added.iter())
+                .filter(|r| r.rdata.rtype() == rt::RRSIG)
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The incremental path must still produce a zone that *verifies*, which is
+    /// the assertion that matters: carrying a signature forward is only sound if
+    /// it still covers what it says it covers.
+    ///
+    /// Judged with `proof_for` — the same code that judges a real zone off the
+    /// internet — rather than by comparing our output to our own expectations
+    /// (`CLAUDE.md` §1).
+    #[test]
+    fn an_incrementally_signed_zone_still_verifies() {
+        let keys = keys();
+        let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
+        let before = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).unwrap();
+
+        let updated = crate::update::apply(
+            &zone,
+            &[crate::update::Change::Add(ResourceRecord {
+                name: "new.example.com.".to_string(),
+                class: Class::new(1),
+                ttl: Ttl::from_secs(3600),
+                rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.77".parse().unwrap()))
+                    .unwrap(),
+            })],
+        );
+        let later = SigningPolicy::valid_for(NOW + 60, 30 * 86_400).with_chain(DenialChain::Nsec);
+        let signed = sign_zone_incrementally(&before, &updated.zone, &keys, &later).unwrap();
+
+        // The record the update added, whose signature is new.
+        assert!(matches!(
+            proof_for(&signed, "new.example.com.", rt::A),
+            RrsetProof::Verified { .. }
+        ));
+        // One that was carried forward untouched.
+        assert!(matches!(
+            proof_for(&signed, "www.example.com.", rt::A),
+            RrsetProof::Verified { .. }
+        ));
+        // The apex SOA, which moved because the serial did.
+        assert!(matches!(
+            proof_for(&signed, ORIGIN, rt::SOA),
+            RrsetProof::Verified { .. }
+        ));
+        assert!(matches!(
+            proof_for(&signed, ORIGIN, rt::DNSKEY),
+            RrsetProof::Verified { .. }
+        ));
+    }
+
+    /// A carried-forward signature must not outlive the RRset it covers, and the
+    /// three ways it could are each refused.
+    #[test]
+    fn a_signature_is_not_carried_forward_when_anything_it_covers_changed() {
+        let keys = keys();
+        let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
+        let before = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).unwrap();
+        let later = SigningPolicy::valid_for(NOW + 60, 30 * 86_400).with_chain(DenialChain::Nsec);
+
+        let sig_at = |z: &Zone, name: &str, covered: Rtype| -> Vec<RecordData> {
+            z.records()
+                .iter()
+                .filter(|r| {
+                    r.name == name
+                        && r.rdata.rtype() == rt::RRSIG
+                        && matches!(
+                            r.rdata.parse(),
+                            Ok(ParsedRecord::RRSIG { type_covered, .. }) if type_covered == covered
+                        )
+                })
+                .map(|r| r.rdata.clone())
+                .collect()
+        };
+
+        // A record added to an existing RRset: its signature must be remade.
+        let mut grown = zone.clone();
+        grown.add_record(ZoneRecord {
+            name: "www.example.com.".to_string(),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+            rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.88".parse().unwrap()))
+                .unwrap(),
+        });
+        let signed = sign_zone_incrementally(&before, &grown, &keys, &later).unwrap();
+        assert_ne!(
+            sig_at(&signed, "www.example.com.", rt::A),
+            sig_at(&before, "www.example.com.", rt::A),
+            "an RRset that gained a record is signed afresh"
+        );
+
+        // A TTL change with the same RDATA. The RRSIG stores the original TTL
+        // (RFC 4034 §3.1.3), so keeping the old signature would publish one
+        // covering a TTL the RRset no longer has.
+        let retimed = crate::update::apply(
+            &zone,
+            &[crate::update::Change::Add(ResourceRecord {
+                name: "www.example.com.".to_string(),
+                class: Class::new(1),
+                ttl: Ttl::from_secs(60),
+                rdata: zone.query("www.example.com.", Qtype::of(rt::A))[0]
+                    .rdata
+                    .clone(),
+            })],
+        );
+        let signed = sign_zone_incrementally(&before, &retimed.zone, &keys, &later).unwrap();
+        assert_ne!(
+            sig_at(&signed, "www.example.com.", rt::A),
+            sig_at(&before, "www.example.com.", rt::A),
+            "a TTL change is a change: the RRSIG carries the original TTL"
+        );
+
+        // A key added — the start of a rollover. Every RRset the new key must
+        // also sign has to be signed afresh, or the zone publishes a DNSKEY
+        // whose signatures are missing.
+        let mut rolling = keys;
+        rolling.push(
+            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+                .unwrap(),
+        );
+        let signed = sign_zone_incrementally(&before, &zone, &rolling, &later).unwrap();
+        assert_eq!(
+            sig_at(&signed, "www.example.com.", rt::A).len(),
+            2,
+            "both zone-signing keys now sign it"
+        );
     }
 
     #[test]

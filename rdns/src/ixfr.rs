@@ -106,6 +106,15 @@ pub struct PlannedDelta {
     delta: ZoneDelta,
 }
 
+impl PlannedDelta {
+    /// Which zone this step belongs to, folded — so a caller persisting the log
+    /// after recording knows which history to write out without re-deriving the
+    /// key from the zone it no longer holds.
+    pub fn zone(&self) -> &str {
+        &self.zone
+    }
+}
+
 /// Work out the step from `old` to `new`, without recording it anywhere.
 ///
 /// `None` when there is no step worth keeping, which is the same three cases
@@ -192,6 +201,41 @@ impl DeltaLog {
             chain.push(delta);
         }
         Some(chain)
+    }
+
+    /// Every step remembered for a zone, oldest first — what
+    /// [`crate::journal::Journal::save`] writes out.
+    ///
+    /// Borrowed rather than cloned: a caller persisting these is holding the
+    /// lock anyway, and the whole history of a busy zone is not a thing to copy
+    /// on the way to a file.
+    pub fn all(&self, zone: &str) -> Vec<&ZoneDelta> {
+        self.by_zone
+            .get(key(zone).as_str())
+            .map(|history| history.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Put a history back, as read from a journal at startup.
+    ///
+    /// Replaces rather than appends, and bounded on the way in like everything
+    /// else here: a journal an operator has grown by hand must not be able to
+    /// make this process hold more than [`MAX_DELTAS_PER_ZONE`] steps, which is
+    /// the same argument `CLAUDE.md` §5 makes about every other table keyed on
+    /// something outside this process's control.
+    ///
+    /// It does *not* check that the steps link, because
+    /// [`crate::journal::Journal::load`] already refused a chain with a gap and
+    /// doing it twice would make the second copy the one nobody maintains (§7).
+    pub fn restore(&mut self, zone: &str, mut deltas: Vec<ZoneDelta>) {
+        if deltas.len() > MAX_DELTAS_PER_ZONE {
+            deltas.drain(..deltas.len() - MAX_DELTAS_PER_ZONE);
+        }
+        if deltas.is_empty() {
+            self.by_zone.remove(key(zone).as_str());
+            return;
+        }
+        self.by_zone.insert(NameKeyBuf::new(&key(zone)), deltas);
     }
 
     /// How many steps are remembered for a zone, for logging and tests.
