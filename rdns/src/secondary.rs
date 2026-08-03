@@ -177,12 +177,10 @@ fn parse_address(text: &str, spec: &str) -> ConfigResult<SocketAddr> {
     }
 }
 
+/// [`crate::utils::absolute`], owned — this module's callers all keep the
+/// result. One line rather than the three it replaces (`TODO.md` #19c).
 fn absolute(name: &str) -> String {
-    if name.ends_with('.') {
-        name.to_string()
-    } else {
-        format!("{name}.")
-    }
+    crate::utils::absolute(name).into_owned()
 }
 
 // ---------------------------------------------------------------------------

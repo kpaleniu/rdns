@@ -37,6 +37,19 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// and a `GET /metrics HTTP/1.1` with headers is well under this.
 const MAX_REQUEST: usize = 8 * 1024;
 
+/// Concurrent scrape connections.
+///
+/// This was the only accept loop in the workspace without a ceiling
+/// (`TODO.md` #19h), where `rdnsd` and `rdnsr` both bound theirs three times
+/// over. The risk is low — a management port with a five-second read timeout —
+/// but "low" is an argument about who reaches it, not about what the loop does,
+/// and the pattern is established.
+///
+/// Smaller than the DNS loops' 128 on purpose: a scrape is one request from a
+/// handful of collectors, so a number this size is already far past what a
+/// working deployment uses, and anything more is a queue nobody is waiting on.
+const MAX_SCRAPES: usize = 16;
+
 /// Serve `GET /metrics`, `GET /healthz` and `GET /readyz` until told to stop.
 ///
 /// Returns when [`Stop`] fires, holding a [`Busy`] for each connection so a
@@ -48,16 +61,26 @@ pub async fn serve(
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_SCRAPES));
     loop {
         let (stream, _peer) = tokio::select! {
             accepted = listener.accept() => accepted?,
             _ = stop.wait() => return Ok(()),
+        };
+        // `try_acquire` and not `acquire`: a scraper that has to wait is one
+        // whose sample is already stale by the time it is served, and holding
+        // the connection open would keep the queue growing. Dropping it closes
+        // the socket, which a collector reads as a failed scrape — the honest
+        // answer, and one its own alerting already knows what to do with.
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            continue;
         };
         let metrics = metrics.clone();
         let readiness = readiness.clone();
         let busy = busy.clone();
         tokio::spawn(async move {
             let _busy = busy;
+            let _permit = permit;
             // A scraper that misbehaves is not worth a log line on a DNS
             // server's stderr — it cannot affect an answer, and the flood item
             // in TODO.md #9d is about exactly this shape of noise.

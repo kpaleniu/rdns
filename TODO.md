@@ -579,16 +579,27 @@ from the code (`ixfr.rs:16` points at "#7 step 6") and from each other, so they
 are never renumbered.
 
 **#14 and #16 are closed; #15 is withdrawn; #7 and #10 closed on 2026-08-03.
-Four things are open and the table is where they are:** #11 (a stretch goal,
-unscheduled), and **#17, #18 and #19, filed 2026-08-03 from an architecture
-review** — a confirmed bug, a feature gap, and a bucket of smaller items.
+**Two things are open** and the table is where they are: #11, a stretch goal
+blocked on hardware counters this machine cannot read, and **#20**, filed
+2026-08-03 from the architecture review's B2 — the one finding of that review
+that never got a number when #17, #18 and #19 took the rest.
+
+**#21 is not open work**, it is the inventory: the four deviations from the RFCs
+this code makes on purpose, and the list of things not implemented. Neither was
+recorded here before, so the only evidence they had been *decided* rather than
+overlooked lived in `docs/spec/`, which is not what anyone reads before starting.
+
+~~Four things are open ... #17, #18 and #19, filed 2026-08-03 from an
+architecture review~~ — all three closed on 2026-08-03, the day they were filed.
+That is the fifth correction to this paragraph, and by now the paragraph is the
+exhibit rather than the record: **do not read a count here, read the table.**
 
 ~~#7 step 6 (persisted deltas, no longer blocked — see below), #10 itself (the
 writing half is in too; what is left is incremental re-signing and the
 journal)~~ — both of those went the same day, which is the fourth time this
 paragraph has gone stale.
 
-This line has now gone stale four times and is left corrected in place every
+This line has now gone stale five times and is left corrected in place every
 time rather than quietly reworded, per `CLAUDE.md` §11. It first read "everything
 numbered through #13 is closed", which was already untrue of three items when it
 was written; then "three things are open", which #17-#19 falsified the day they
@@ -620,7 +631,9 @@ it, and the rule it became in `CLAUDE.md`:
 | **13** | making illegal states unrepresentable: `OpCode`'s sentinel, the eleven name normalizations, QTYPE-vs-RTYPE, `Ttl` + `Class` + OPT out of the additional section, `Name`/`NameKey` | **done 2026-08-02**, twelve commits. 13a-13d in full; 13e's map keys done and its `Name` half deferred with a reason. Seven live defects fixed on the way. Every stage gated on `rdns/tests/allocations.rs` and every one has held its counts; 13b added a fifteenth measurement that went 2 to 0 |
 | **17** | the TCP length prefix wraps to 0 on a TSIG-signed answer near 64 KB, and the framing is written out five times | **fixed 2026-08-03.** The one confirmed bug of the review — provoked, not argued: a wrapped prefix of 0 is what both read loops treat as a broken peer, so the client's connection is dropped with no answer. `append_tsig` is what pushes a message past the size it was serialized to |
 | **18** | `rdnsr` has none of the operational shell — no rate limiter, no response budget, no logger, no metrics, no probes, no validator | **fixed 2026-08-03.** Seven library facilities `rdnsd` uses and `rdnsr` does not, all of them tested and reachable. The asymmetry runs the wrong way round: the resolver is the more amplifying of the two and the unobservable one. Probably #9d being scoped to `rdnsd` |
-| **19** | the review's smaller items, 19a-19h | **open, filed 2026-08-03.** Five stragglers of consolidations that caught most copies and missed one (19a-19c, 19h), one duplicated check (19e), one candidate that may not be worth it (19f), and two documentation items (19g and the `#13e` correction below). Includes the list of what the pass checked and found *nothing* wrong with, which is the half of §16 that turned out to be most useful |
+| **21** | the deviations and the not-implemented list | **an inventory, not a queue**, filed 2026-08-03. Four deliberate deviations (D-1, D-5, D-6, D-7) and eight unimplemented things, each with the decision that produced it. Names the two worth reopening if anything here ever is: D-1's cost is the argument #15 was *not* withdrawn against, and DNAME is the only absence that produces a wrong answer rather than an incomplete one |
+| **20** | `rdnsd/src/main.rs` is one file and eleven subsystems | **open, filed 2026-08-03** from the architecture review's B2, which had no `TODO` number until now. Not a defect — three seams that already exist and would lift cleanly, to be moved with no behaviour change |
+| **19** | the review's smaller items, 19a-19h | **closed 2026-08-03.** Five stragglers of consolidations that caught most copies and missed one (19a-19c, 19h), one duplicated check (19e), one candidate that may not be worth it (19f), and two documentation items (19g and the `#13e` correction below). Includes the list of what the pass checked and found *nothing* wrong with, which is the half of §16 that turned out to be most useful |
 
 **What the letters mean**, because comments in the code and lines further down
 this page still name them and the sections they named are gone:
@@ -2636,7 +2649,7 @@ goes.
 to arrive before it can answer — so a readiness probe would be a liveness probe
 under another name. `/healthz` is the one that means something here.
 
-### 19. What the 2026-08-03 architecture review found — the smaller items
+### 19. What the 2026-08-03 architecture review found — the smaller items — **closed 2026-08-03**
 
 **Filed 2026-08-03.** A read of the whole workspace against `CLAUDE.md`'s rules,
 producing `docs/ARCHITECTURE_REVIEW.md` and `docs/spec/`. #17 and #18 came out of
@@ -2653,7 +2666,7 @@ arithmetic done in the head and never measured — struck, and it is exactly the
 written down as `Verified/Bogus/Insecure` when it is
 `Verified/Unsigned/Bogus/Unsupported`, conflating it with `ValidationState`.
 
-#### 19a. Two live `str::to_lowercase` on wire-supplied names
+#### 19a. Two live `str::to_lowercase` on wire-supplied names — **done**
 
 `rdnsd/src/main.rs:1915` — the NOTIFY zone-name lookup key — and the matching
 insert at `:3064`. RFC 4343 and `CLAUDE.md` §8: the fold is ASCII-only, and
@@ -2669,7 +2682,7 @@ this codebase wrote down, on a name a stranger chooses, and because
 Every other `to_lowercase()` in the tree is on `base32hex_encode` output (ASCII
 by construction — still worth `make_ascii_lowercase`) or in tests.
 
-#### 19b. `zone_signer` shadows `utils::is_at_or_under` with a worse copy
+#### 19b. `zone_signer` shadows `utils::is_at_or_under` with a worse copy — **done**
 
 `zone_signer.rs:652` — a **private function shadowing a public one of the same
 name in the same crate**, which is why #13b's four-copy sweep did not see it:
@@ -2702,7 +2715,7 @@ While in that loop: `ancestors_of` (`zone_signer.rs:635`) allocates a
 `com.`, `.` — which `is_under` then rejects one at a time. The same walk
 `zone::parent_name` does by borrowing. Worth looking at second, not first.
 
-#### 19c. Six copies of `fn absolute`
+#### 19c. Six copies of `fn absolute` — **done**
 
 `rfc5011.rs:797`, `secondary.rs:180`, `xfr.rs:531` and `zone.rs:557` are
 byte-identical; `rdnsd/config.rs:234` differs only in its parameter name and
@@ -2716,7 +2729,7 @@ already ends in a dot, which is most of them. `answer_transfer` computes
 `absolute_name(&qname)` twice sixteen lines apart (`main.rs:1631` and `:1665`),
 which the `Cow` version makes free.
 
-#### 19d. Three exported metrics that nothing increments
+#### 19d. Three exported metrics that nothing increments — **done via #18**
 
 `dns_cache_hits_total`, `dns_cache_misses_total`, `dns_queries_recursive_total`.
 `DnsMetrics` is used only by `rdnsd`, which has no cache and never recurses; the
@@ -2738,7 +2751,7 @@ never wrong, they were in a binary with no cache. `queries_authoritative` is now
 the counter with no home in `rdnsr`, and it is deliberately never touched there:
 that daemon is never authoritative for anything.
 
-#### 19e. `RequestValidator` is a second, weaker copy of the parser's checks
+#### 19e. `RequestValidator` is a second, weaker copy of the parser's checks — **done**
 
 `validation.rs:159`. Two of the things it does are real and cheap, one is neither.
 
@@ -2769,12 +2782,12 @@ doc comments are wrong, `max_udp_size` citing "RFC 512" and `max_labels: 127`
 attributed to RFC 1035, which states no such limit (127 is derived from 255
 octets at two per label).
 
-- [ ] Keep the size and count caps, delete the name walk, and **rename the type
+- [x] Keep the size and count caps, delete the name walk, and **rename the type
       to say what it is** — an admission check, not a validator. About 100 lines
       out and one fewer place for the name rules to live. Prerequisite for #18's
       last box.
 
-#### 19f. Two near-identical TCP `serve_connection` implementations
+#### 19f. Two near-identical TCP `serve_connection` implementations — **declined 2026-08-03**
 
 `rdnsd/src/main.rs:1345` and `rdnsr/src/main.rs:712`, ~80 lines each: same
 split-writer task, same `Semaphore`, same read loop, same framing, same
@@ -2788,7 +2801,18 @@ it deletes — the same trade §16c recorded for `listener_failure`. Filed so th
 next reader does not have to re-derive the shape. What is *not* debatable is the
 framing inside it, which is #17.
 
-#### 19g. `docs/CLI_USAGE.md` says "Complete reference" and covers half the flags
+**Declined, and the reason is now stronger than when this was filed.** #17 moved
+the framing into `rdns::framed`, which was the one part of these two functions
+that was genuinely the same rule in two places — and #18 then made the two
+functions *less* alike rather than more, because `rdnsr`'s now takes a `Shell`
+and applies a rate limit at accept time where `rdnsd`'s does not. What is left in
+common is the shape of a bounded accept loop with a split writer, which is a
+pattern rather than a duplicated rule: there is no invariant that can drift,
+because there is no shared invariant left. §7 is about the *reason* being shared,
+not about the code looking alike, and that distinction is the whole of this
+decision.
+
+#### 19g. `docs/CLI_USAGE.md` says "Complete reference" and covers half the flags — **done**
 
 `rdnsd` has 27 flags. `CLI_USAGE.md` has a `### --flag` section for **14** of
 them; the other thirteen appear in passing, in an example, or not at all:
@@ -2811,12 +2835,12 @@ section. **`--secondary`** is the second: the entire secondary role has no
 section, and is mentioned only in one table row and in the `--also-notify` prose,
 both of which assume you know what it does.
 
-- [ ] Either document them or change the first line, which currently promises
+- [x] Either document them or change the first line, which currently promises
       something the file does not deliver. A reference that is silently partial is
       §4's quiet degradation in documentation form: a reader who does not find
       `--query-rate` there concludes there is no such control.
 
-#### 19h. The small ones
+#### 19h. The small ones — **done**
 
 | item | where | note |
 |---|---|---|
@@ -2866,6 +2890,118 @@ the **22 `.lock().unwrap()` and 42 `let _ =` sites** §16 flagged as
 counted-not-read, which are still unread. One was met in passing —
 `expire_if_out_of_contact`'s `.expect("state mutex")` on the replication path —
 and left there rather than reporting a sample as a survey.
+
+### 20. `rdnsd/src/main.rs` is one file and eleven subsystems
+
+**Filed 2026-08-03**, from the architecture review's B2 — and filed late, which
+is the first thing worth recording about it. #17, #18 and #19 took every other
+finding in that review the day it landed; this one fell between them because it
+is not a defect and had no natural sub-item to hang on. A review finding with no
+number is a review finding nobody schedules.
+
+**The measurement, taken rather than remembered.** 8,340 lines, of which
+**1,081 are code** and the rest are the test module beginning at line 4,962.
+The review said "4,316 lines of code"; that number is from before dynamic UPDATE
+landed and the *code* half has since shrunk relative to it, because most of what
+#10 added was tests. So the headline number moved the wrong way for the wrong
+reason, and the honest statement is narrower than the review's: the problem is
+not line count, it is that one file owns eleven independent things.
+
+`mod config` and `mod control` are split out. Everything else is here: the answer
+path (`make_response`, `resolve_in_zone`, six builders), the UDP worker pool, the
+TCP accept and connection loops, the transfer server, dynamic UPDATE, NOTIFY in
+both directions, the whole secondary role, the reload machinery, zone loading and
+signing, key generation, CLI parsing, signal handling and `main`.
+
+Nothing here is *wrong* — the seams are visible and the doc comments are the best
+part of the file. The cost is that a change to any one subsystem is expensive to
+review, and that cost is paid by every future change rather than once.
+
+**Three seams are already drawn and would lift cleanly:**
+
+| module | contents | why it is a seam |
+|---|---|---|
+| `answer.rs` | `make_response`, `Outcome`, `resolve_in_zone`, `add_*`, `refer_to_child`, `find_zone_for_query`, `negative_ttl`, `in_zone` | synchronous functions of `(&DnsMessage, &HashMap<String, Zone>, &DnsMetrics)` — no sockets, no lock guards, nothing `async`. `notify_reply` stays behind: it needs `&Secondaries` and the peer address |
+| `secondary.rs` | `spawn_secondaries`, `secondary_loop`, `refresh_once`, `record_state`, `expire_if_out_of_contact`, `withdraw_unvouched_zones` | one owner, one lifetime, already talks to the rest through `Replication` and `Served` |
+| `zones.rs` | `Zones`, `Served`, `Reloading`, `plan_reload`, `install_*`, `note_serials`, `load_zones_from_source`, `enumerate_zone_files`, `ZoneSigning`, `restore_journals` | the zone-map lifecycle, which `Reloading`'s doc comment already treats as a unit |
+
+That leaves `main.rs` as the server struct, the two transport loops, the UPDATE
+path and startup.
+
+- [ ] **Do it as its own commit with no behaviour change** (`CLAUDE.md` §12's rule
+      about reformats, for the same reason: a move mixed into a behaviour change
+      makes the diff unreviewable and the blame useless). The ~3,900 lines of
+      tests move with the code they cover, which is most of the diff and most of
+      the value — a test module that does not travel with its subject is how the
+      next reader stops finding the tests.
+
+**Two things to check before starting, because they would change the shape:**
+
+- **`answer.rs` is the seam to take first and alone.** It is the only one of the
+  three with no `async` in it at all, so it is the one whose move cannot
+  accidentally change a lock's lifetime. The other two hold guards across
+  `.await` points by design, and moving them is where a reviewer would have to
+  re-derive §9's reasoning about what is held across what.
+- **`Served` and `Replication` are the coupling.** Both already exist precisely
+  to pass the zone-map lifecycle around as one thing, so the seam is real — but
+  `Served` gained a `journal` field on 2026-08-03 and `install_zone` now writes
+  through it under the same guard that records a delta. Any split has to keep
+  those two together or it reintroduces the window `Served`'s doc comment exists
+  to close.
+
+**Not worth doing on its own account:** splitting the test module out separately,
+or splitting `main.rs` further than these three. The argument here is about
+subsystems that have an owner and a lifetime, not about file length — the review
+led with the line count and that turned out to be the weakest part of its case.
+
+---
+
+### 21. The deviations and the not-implemented list — decisions, not open work
+
+**Filed 2026-08-03**, after the architecture review's findings were closed and
+`docs/spec/` was committed. Every *gap* that review found (G-1 to G-5) is fixed;
+what is left in the spec are four **deviations** — places the code and an RFC
+disagree on purpose — and a list of things simply not implemented. None of them
+was in this file, which meant the only record that they had been *decided* rather
+than overlooked lived in a document nobody reads before starting work.
+
+**This section is not a queue.** It exists so the next person to notice one of
+these finds the decision instead of re-deriving it, which is the same job
+`CLAUDE.md` §16's "what the pass checked and found nothing wrong with" does. If
+one of these is ever taken up it gets its own number.
+
+#### The four live deviations
+
+| | what | decided |
+|---|---|---|
+| **D-1** | a label that is not valid UTF-8 is refused, where RFC 2181 §11 allows any binary string | **Deliberate, and the one with a real cost.** Names are `String`s in presentation form throughout; the alternative is a different representation (labels, or wire bytes), which is what **#13e** scopes — its map-key half is done and its `Name` half is *deferred*, not declined, and #11 owns the storage question. The consequence is easy to under-read: a zone containing such a name cannot be served, *and* a response containing one is unparseable, so `rdnsr` cannot relay someone else's zone that has one. **That last clause is the strongest argument anywhere on this page for taking #13e's `Name` half**, and it is not among the reasons #13e was deferred — those were about allocation counts and churn. (Not #15, which is a different question: that was the `DName`/`UnpackedDName` typestate collapse, withdrawn on its own merits, and it would not have changed what a label may contain.) |
+| **D-5** | RFC 1035 §2.3.1's LDH "preferred name syntax" is not enforced | **Deliberate, and enforcing it would be a bug.** RFC 2181 §11 settles it; enforcing LDH would refuse `_dmarc`, every `_tcp` SRV owner, DNS-SD instance names and the wildcard `*`. #15 records that a `TODO` asking for this was deleted rather than done, because doing it was the defect |
+| **D-6** | the first compression pointer in a chain may point forward | **Deliberate.** Every *subsequent* pointer must strictly decrease, which is what makes cycles unreachable without a visited-set; the first is unconstrained because a name is parsed from a suffix slice that does not know its own offset. Termination is unaffected, and the reasoning and the cost of the alternative are written at `dname.rs` |
+| **D-7** | class CH and HS are refused rather than served | **Deliberate.** RFC 1034 §4.3.2 step 1 searches the zones *of the question's class*, and holding none in a class is the same situation as holding no zone. The visible cost is that `version.bind CH TXT` — which BIND, NSD and Knot all answer — is not answered here. Serving it would mean a second class in the zone index, which #13d's class-blind index deliberately made unrepresentable |
+
+#### Not implemented
+
+Scope, not defects. Listed so "is this missing on purpose?" has an answer.
+
+| | note |
+|---|---|
+| DNAME (RFC 6672) | the only one of these that changes *answers* rather than adding a transport or a type. A resolver that meets one today gets the records without following the redirection |
+| DoT / DoH / DoQ (7858 / 8484 / 9250) | each is a transport, and each drags in a TLS stack — the dependency argument §14 makes about the OTLP exporter applies with more force here |
+| SIG(0) (RFC 2931) | TSIG covers the transaction-authentication case this server actually has. SIG(0) matters for a client that cannot share a secret in advance, which is not a deployment this serves |
+| SVCB / HTTPS (RFC 9460) | round-trips as opaque RDATA per RFC 3597, so it can be *stored and served*; what is missing is parsing and presentation-format writing |
+| DNS Cookies (RFC 7873) | round-trips as an opaque EDNS option. Implementing it properly is a second anti-spoofing mechanism beside the response budget, and the budget is the one that is there |
+| `$GENERATE` | a BIND zone-file extension, not an RFC. Absent because nothing here needed it |
+| white lies / minimally-covering NSEC (RFC 4470) | the denial chain is precomputed at signing time, so a lie would have to be signed online. That is a different signing model, not a feature |
+| key-rollover *automation* (RFC 6781) | rollover is manual and the signer will not delete a published DNSKEY, which is the half that matters: a key published without its private half is how every rollover starts, and deleting it would undo the operator's preparation |
+
+**One of these is a stronger candidate than the rest**, and saying which is the
+point of writing the list down: **DNAME**, because it is the only entry that
+makes this server give a *wrong* answer rather than an incomplete one — a name
+under a DNAME gets NXDOMAIN or NODATA where an implementation that followed it
+would synthesize a CNAME. Everything else on the list is something absent that
+announces its own absence.
+
+---
 
 ## Closed work
 

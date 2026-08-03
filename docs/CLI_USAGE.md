@@ -1,6 +1,13 @@
 # rdns CLI Usage Guide
 
-Complete reference for command-line options and examples for rdnsd (DNS server).
+Complete reference for `rdnsd`'s command-line options, with examples.
+
+"Complete" is a claim, and it was false until 2026-08-03: this file had a section
+for 14 of 27 flags, and the missing thirteen included all three `--query-rate*`
+controls — the ones that drop traffic silently — and `--secondary`, the whole
+secondary role. A reference that is quietly partial is `CLAUDE.md` §4's failure
+mode in documentation form: a reader who does not find `--query-rate` here
+concludes there is no such control. See `TODO.md` #19g.
 
 ## Table of Contents
 
@@ -189,6 +196,158 @@ Measured on a zone with a 2.5 KB TXT RRset, flooding for 5.5 s from one address:
 **32.7 KB/s** of responses with the budget off, **13.2 KB/s** with the default
 (the 8 KB/s rate plus the burst allowance spread across the window), and the
 truncated replies keep a legitimate client working.
+
+### `--query-rate <QUERIES_PER_SEC>`, `--query-burst`, `--query-rate-exempt`
+
+Queries per second, per client address, with a burst allowance and an exemption
+list. Defaults: **1000/s**, burst **200**, no exemptions. `--query-rate 0`
+disables the limiter entirely.
+
+**Over the limit a query is dropped in silence** — no REFUSED, no SERVFAIL,
+nothing on the wire at all. That is the correct behaviour, because a reply to a
+spoofed source is exactly what an amplifier sends; it is also why the effective
+policy is printed in the startup banner, and why this section exists. A control
+that drops traffic invisibly and is not documented is one an operator concludes
+is the network.
+
+The unit is the one you think in. This was once "100 tokens per 10-second window
+with a burst of 20", hardcoded and unreachable from the command line — which
+reads like a hundred queries and **is ten a second**. Measured before it was
+fixed: a 60-query burst from one address got 20 answers and 40 silent drops. Put
+that in front of a busy resolver and you blackhole the bulk of its traffic while
+`dig` from a laptop works perfectly.
+
+The default is 1000 because `rdnsd` is authoritative: its clients are resolvers,
+not people, and one resolver behind one address legitimately asks orders of
+magnitude more than one person does. The limiter is a backstop against a flood,
+not a quota. (`rdnsr` defaults to 200 for the mirror-image reason — its clients
+*are* people and their devices.)
+
+`--query-burst` matters more than it looks. A DNS client sends in bursts by
+nature: one page load is dozens of names at once, so a limiter with no burst
+allowance drops traffic that is not a flood at all. A burst of 0 is floored to 1
+rather than refused — a bucket starts full, and a full bucket of nothing has no
+token to spend, so a mistyped flag would refuse every query.
+
+`--query-rate-exempt` takes an address or CIDR prefix, repeatable, and is parsed
+by the same code as `--allow-transfer` — including the rule that a v4 prefix
+never matches a v4-mapped v6 peer. It is for the resolvers you run yourself and
+for a monitoring probe whose whole job is to query more often than a client
+would. Without it, the only way to spare a known-good source is to raise the
+limit for everybody.
+
+```bash
+# A busy authoritative server, with your own resolvers and a prober spared.
+rdnsd --zone-dir ./zones \
+  --query-rate 5000 --query-burst 1000 \
+  --query-rate-exempt 192.0.2.0/24 --query-rate-exempt 198.51.100.7
+
+# Off, for a lab.
+rdnsd --zone-dir ./zones --query-rate 0
+```
+
+### `--secondary <ZONE@MASTER[:PORT][#KEY]>`
+
+Replicate a zone from a master. Repeatable, and **requires `--zone-dir`**: the
+fetched zone is written there, so a restart serves it without waiting for a
+transfer.
+
+The whole secondary role is behind this one flag. It starts a refresh task per
+zone-and-master pair, which:
+
+- fetches the zone (AXFR, or IXFR when it already holds a version), and writes
+  it out with write-temp-then-rename so a reader never sees a half-written file;
+- honours the SOA's REFRESH and RETRY timers, and wakes early on a NOTIFY from
+  one of that zone's configured masters — a NOTIFY from anywhere else is ignored;
+- applies **EXPIRE**: a zone out of contact with every master for longer than its
+  SOA says is *withdrawn*, not served stale. Serving a stale zone with AA set is
+  worse than serving nothing;
+- records the serial and last-contact time in a sidecar (`rdnsd.state`) beside
+  the zones, so EXPIRE survives a restart. A restart that forgot the last-contact
+  time would read "nothing known" as "fetch and serve".
+
+`#KEY` names a TSIG key from `--tsig-key`, used to sign the transfer request.
+
+```bash
+# Two masters for one zone; either can answer, both may NOTIFY.
+rdnsd --zone-dir ./zones \
+  --secondary example.com@192.0.2.1 \
+  --secondary example.com@192.0.2.2#transfer.key
+
+# A master on a non-standard port.
+rdnsd --zone-dir ./zones --secondary example.com@192.0.2.1:5353
+```
+
+`rdnsctl status` reports `secondary` for these from the configuration rather than
+inferring it from an absent last-contact time — which a primary also has.
+
+### `--metrics-listen <ADDR:PORT>`
+
+Serve Prometheus metrics on `/metrics`, plus `/healthz` (liveness) and `/readyz`
+(readiness) on the same listener. Off by default.
+
+The two probes answer different questions, and conflating them is the usual
+mistake: `/healthz` is "this process is alive", `/readyz` is "every zone this
+server answers for is loaded". A secondary that has not completed its first
+transfer is alive and **not** ready, and routing traffic to it would mean REFUSED
+for a zone it is about to hold.
+
+Counters are RED-shaped — requests, errors, duration — plus per-zone serial and
+last-transfer gauges. A zone with no last-transfer time (a primary, or a
+secondary that has never fetched) is **omitted** rather than reported as 0,
+because 0 is 1970 and would fire every staleness alert there is.
+
+A typo here stops the server rather than leaving it running without the
+observability you asked for, the same as a typo in `--port`.
+
+### `--config <FILE>` and `--check-config`
+
+Read settings from a TOML file instead of flags. **Mutually exclusive with the
+flags above** — `--config` together with `--port` is an error, not a precedence
+rule. Every precedence rule is one somebody has to remember at 3am to work out
+why the server is not where the file says, and the failure is silent because both
+values are valid.
+
+Two things the file expresses that the flags cannot: a secret in a file of its
+own (`secret-file`, mode-checked and refused if group- or world-readable on
+Unix), and per-zone signing settings.
+
+`--check-config` is a dry run that **runs everything that does not bind a
+socket**: the file parses, the secrets are read and mode-checked, every zone
+loads, every zone is signed and every signature verified. A shallower check would
+pass for the failures that actually break a deploy.
+
+```bash
+rdnsd --config /etc/rdns/rdnsd.toml --check-config && systemctl reload rdns
+```
+
+### Signing policy: `--signature-validity`, `--nsec3`, `--nsec3-opt-out`, `--key-algorithm`, `--require-signed`
+
+These modify `--signing-key-dir`, below, and are no-ops without it.
+
+- `--signature-validity <DAYS>` (30). How long an RRSIG is good for. Re-signing
+  runs at **a third** of this, so a failed run has two more chances before
+  anything expires. Expiry is spread deterministically across a fifth of the
+  window, so the zone degrades on a slope rather than expiring in one second at
+  every validator at once.
+- `--nsec3` / `--nsec3-opt-out`. NSEC3 instead of NSEC, and opt-out for insecure
+  delegations. Empty salt and zero iterations (RFC 9276 §3.1); signing above the
+  iteration cap is refused rather than quietly clamped.
+- `--key-algorithm <ALG>`. For `--generate-keys`. ECDSA P-256 by default;
+  Ed25519 also available. RSA keys cannot be generated here.
+- `--require-signed`. Refuse to start if a zone that has keys did not end up
+  signed. Without it a signing failure is a warning and the zone is served
+  unsigned — which, for a zone whose parent has a DS, is worse than not serving
+  it: every validating client sees bogus rather than merely unvalidated.
+
+### `--allow-partial-load`
+
+Serve the zones that loaded when some did not. **Off by default, and the default
+is the point**: one typo plus a deploy is otherwise a lame delegation for that
+zone, 39 green dashboards, and a log line that scrolled past hours ago. The flag
+exists because the behaviour is defensible when the alternative is worse — a
+secondary holding 40 zones would rather serve 39 than none — but it should be a
+decision rather than what happens when nobody looked.
 
 ### `--udp-workers <TASKS>` (applies to UDP)
 

@@ -1,5 +1,5 @@
 use crate::error::{RequestError, RequestResult, WireError};
-use crate::DnsMessage;
+use crate::{DnsMessage, OpCode};
 
 /// A message that arrived at a listening socket **and is a question**.
 ///
@@ -44,7 +44,7 @@ use crate::DnsMessage;
 /// value back in the state the type exists to exclude.
 ///
 /// **What it does not do**, so nothing reads more into it than is there: it does
-/// not run [`RequestValidator`] (which is configured per server and, on UDP,
+/// not run [`AdmissionCheck`] (which is configured per server and, on UDP,
 /// runs before admission so a datagram is rejected before it is copied), it does
 /// not check the opcode (that is each daemon's policy, and the answer is NOTIMP
 /// rather than silence), and it does not verify a TSIG. It answers one question,
@@ -84,33 +84,23 @@ impl std::ops::Deref for Request {
 /// at most an OPT plus a TSIG/SIG(0); the slack is for forward compatibility.
 const MAX_REQUEST_ADDITIONALS: usize = 4;
 
-/// The QUERY opcode, which is the only one whose requests carry no records of
-/// their own — see the section checks in [`RequestValidator::validate_header`].
-const OPCODE_QUERY: u8 = 0;
-
 /// Configuration for request validation
 #[derive(Debug, Clone)]
-pub struct ValidationConfig {
-    /// Maximum UDP packet size (RFC 512)
+pub struct AdmissionLimits {
+    /// Largest UDP request accepted (RFC 1035 §4.2.1's 512).
+    ///
+    /// The doc comment here used to cite "RFC 512", which is not a document.
     pub max_udp_size: usize,
-    /// Maximum TCP packet size
+    /// Largest TCP request accepted. Not a protocol limit — the length prefix
+    /// allows 65,535 — but a request has no legitimate reason to be larger.
     pub max_tcp_size: usize,
-    /// Maximum labels in a domain name
-    pub max_labels: usize,
-    /// Maximum bytes in a single label
-    pub max_label_size: usize,
-    /// Maximum total domain name size
-    pub max_name_size: usize,
 }
 
-impl Default for ValidationConfig {
+impl Default for AdmissionLimits {
     fn default() -> Self {
-        ValidationConfig {
-            max_udp_size: 512,       // RFC 1035 standard
-            max_tcp_size: 16 * 1024, // 16KB for TCP
-            max_labels: 127,         // RFC 1035 limit
-            max_label_size: 63,      // RFC 1035 limit
-            max_name_size: 255,      // RFC 1035 limit
+        AdmissionLimits {
+            max_udp_size: 512,       // RFC 1035 §4.2.1
+            max_tcp_size: 16 * 1024, // not a protocol limit; see the field
         }
     }
 }
@@ -141,18 +131,31 @@ impl ValidationResult {
     }
 }
 
-/// DNS request validator
-pub struct RequestValidator {
-    config: ValidationConfig,
+/// Whether a datagram is worth parsing at all.
+///
+/// **Named for what it does, which is not validation** (`TODO.md` #19e). It was
+/// `RequestValidator`, and the name was a claim it could not keep: two of the
+/// three things it did were cheap header arithmetic with no equivalent in the
+/// parser, and the third was a second, weaker copy of the parser's own name
+/// rules that ran *first*. The copy is gone; what is left is an admission
+/// check — size caps and per-section count caps, on bytes nothing has trusted
+/// yet, before anything is allocated.
+///
+/// The distinction matters at the call site. A caller reaching for a
+/// "validator" reasonably assumes a packet that passes is well formed, and it is
+/// not: `DnsMessage::try_from_bytes` is the thing that decides that, and it runs
+/// afterwards.
+pub struct AdmissionCheck {
+    config: AdmissionLimits,
 }
 
-impl RequestValidator {
-    pub fn new(config: ValidationConfig) -> Self {
-        RequestValidator { config }
+impl AdmissionCheck {
+    pub fn new(config: AdmissionLimits) -> Self {
+        AdmissionCheck { config }
     }
 
     pub fn with_defaults() -> Self {
-        Self::new(ValidationConfig::default())
+        Self::new(AdmissionLimits::default())
     }
 
     /// Validate a DNS request packet
@@ -186,11 +189,21 @@ impl RequestValidator {
             return ValidationResult::Invalid(e);
         }
 
-        // Parse and validate domain names in queries
-        if let Err(e) = self.validate_domain_names(data) {
-            return ValidationResult::Invalid(e);
-        }
-
+        // **No name walk here.** There used to be one, and it was a second,
+        // weaker implementation of what `dname.rs` does immediately afterwards:
+        // its own label-length check, its own 255-octet check and its own
+        // pointer handling. The two already disagreed in four ways
+        // (`TODO.md` #19e) — `MAX_DEPTH` 10 against 50, no requirement that a
+        // pointer point backwards (which is the whole of `dname.rs`'s cycle
+        // prevention), only the *first* question validated, and a `total_size`
+        // omitting the terminating root octet, so it admitted a name one octet
+        // over the limit.
+        //
+        // All four erred safe, because the real parser ran afterwards. That is
+        // the argument for deleting them rather than for keeping them: they were
+        // two implementations of one rule where the weaker one ran first, and
+        // the safe direction was a property of the call order rather than of the
+        // code. What is left is the part with no equivalent in the parser.
         ValidationResult::Valid
     }
 
@@ -243,10 +256,13 @@ impl RequestValidator {
         // request has no legitimate reason to carry many records, and that is a
         // statement about resources rather than a guess about which protocol
         // extensions exist.
+        // Read through the types rather than by shifting bits here: `OpCode`
+        // and the QR flag both have one definition already, and a second
+        // hand-rolled one is how the two come to disagree (`TODO.md` #19e).
         let qr_flag = data[2] & 0x80 != 0;
-        let opcode = (data[2] >> 3) & 0x0f;
+        let opcode = OpCode::from_u8((data[2] >> 3) & 0x0f);
         if !qr_flag {
-            if opcode == OPCODE_QUERY && answer_count > 0 {
+            if opcode == OpCode::Query && answer_count > 0 {
                 return Err(WireError::malformed(
                     "a request",
                     "a QUERY carries no answer records",
@@ -269,122 +285,6 @@ impl RequestValidator {
         }
 
         Ok(())
-    }
-
-    /// Validate domain names in the packet
-    fn validate_domain_names(&self, data: &[u8]) -> Result<(), WireError> {
-        let mut offset = 12; // Start after header
-
-        // Parse query names (basic validation without full parsing)
-        if offset < data.len() {
-            // Attempt to validate first query domain name
-            self.validate_domain_name_at(data, &mut offset, 0)?;
-        }
-
-        Ok(())
-    }
-
-    /// Validate a domain name at offset, following pointers
-    fn validate_domain_name_at(
-        &self,
-        data: &[u8],
-        offset: &mut usize,
-        depth: usize,
-    ) -> Result<(), WireError> {
-        const MAX_DEPTH: usize = 10;
-
-        if depth > MAX_DEPTH {
-            return Err(WireError::TooLong {
-                what: "compression pointer nesting",
-                limit: MAX_DEPTH,
-                actual: depth,
-            });
-        }
-
-        let mut label_count = 0;
-        let mut total_size = 0;
-
-        loop {
-            if *offset >= data.len() {
-                return Err(WireError::Truncated {
-                    what: "a domain name",
-                    need: *offset + 1,
-                    have: data.len(),
-                });
-            }
-
-            let len_byte = data[*offset];
-            *offset += 1;
-
-            // Check for pointer (top 2 bits = 11)
-            if len_byte & 0xc0 == 0xc0 {
-                if *offset >= data.len() {
-                    return Err(WireError::Truncated {
-                        what: "a compression pointer",
-                        need: 2,
-                        // Cannot underflow, and the proof is four lines up: the
-                        // loop head returns unless `*offset < data.len()`, and
-                        // only one byte has been consumed since, so reaching
-                        // here means `*offset == data.len()` exactly. Written
-                        // down because this is a subtraction of two
-                        // wire-derived lengths on the pre-authentication path
-                        // (`TODO.md` #12) — the class of thing that is safe
-                        // until somebody adds a second `+= 1` above it.
-                        have: data.len() - *offset,
-                    });
-                }
-                // Skip pointer offset byte (pointer is 2 bytes total, we already consumed first)
-                *offset += 1;
-                return Ok(()); // Pointers end the name
-            }
-
-            // Normal label
-            let label_len = len_byte as usize;
-
-            // Root label
-            if label_len == 0 {
-                return Ok(());
-            }
-
-            // Validate label length
-            if label_len > self.config.max_label_size {
-                return Err(WireError::TooLong {
-                    what: "a label",
-                    limit: self.config.max_label_size,
-                    actual: label_len,
-                });
-            }
-
-            // Check bounds
-            if *offset + label_len > data.len() {
-                return Err(WireError::Truncated {
-                    what: "a label",
-                    need: *offset + label_len,
-                    have: data.len(),
-                });
-            }
-
-            *offset += label_len;
-            label_count += 1;
-            total_size += label_len + 1;
-
-            // Validate counts
-            if label_count > self.config.max_labels {
-                return Err(WireError::TooLong {
-                    what: "the label count of a domain name",
-                    limit: self.config.max_labels,
-                    actual: label_count,
-                });
-            }
-
-            if total_size > self.config.max_name_size {
-                return Err(WireError::TooLong {
-                    what: "a domain name",
-                    limit: self.config.max_name_size,
-                    actual: total_size,
-                });
-            }
-        }
     }
 }
 
@@ -446,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_valid_small_packet() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
 
         // Minimal valid DNS query header (12 bytes) + minimal query (www.com.)
         let packet = vec![
@@ -469,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_packet_too_large_udp() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
         let packet = vec![0u8; 513]; // Over 512 byte limit for UDP
 
         let result = validator.validate_packet(&packet, false);
@@ -488,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_packet_size_ok_tcp() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
         let packet = vec![0u8; 600]; // Valid for TCP
 
         // But invalid because it's malformed DNS
@@ -508,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_packet_too_small() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
         let packet = vec![0u8; 11]; // Less than 12-byte header
 
         let result = validator.validate_packet(&packet, false);
@@ -517,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_request_with_answer_section() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
 
         // Query with QR=0 (request) but answer_count > 0 (invalid)
         let packet = vec![
@@ -551,7 +451,7 @@ mod tests {
     /// caught it.
     #[test]
     fn test_a_notify_may_carry_its_soa_and_an_ixfr_may_carry_its_own() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
         let header = |opcode: u8, answers: u8, authorities: u8| {
             vec![
                 0x00,
@@ -608,7 +508,7 @@ mod tests {
 
     #[test]
     fn test_request_with_opt_record_is_allowed() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
 
         // An EDNS0 query: one question plus an OPT record in the additional
         // section. Rejecting this would reject every EDNS-capable client.
@@ -636,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_request_with_too_many_additionals() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
 
         let packet = vec![
             0x00, 0x01, // ID
@@ -663,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_too_many_queries() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
 
         let packet = vec![
             0x00, 0x01, // ID
@@ -680,7 +580,7 @@ mod tests {
 
     #[test]
     fn test_response_packet_allowed() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
 
         // Response (QR=1) with answers is valid
         let packet = vec![
@@ -706,11 +606,26 @@ mod tests {
         );
     }
 
+    /// **A fifth way the two name checks disagreed, found by re-pointing this
+    /// test rather than by reading either of them.**
+    ///
+    /// `TODO.md` #19e listed four disagreements between the admission check's
+    /// name walk and `dname.rs`. Here is the fifth: this test was called
+    /// `test_oversized_label` and its packet carries `0x41`, described in its
+    /// own comment as "Label length: 65 (exceeds 63 max)". It is not a length at
+    /// all. The top two bits of a length octet are a *type* (RFC 1035 §4.1.4),
+    /// and `01` is RFC 2673's binary label — so `dname.rs` calls it
+    /// `Unsupported { what: "a binary label" }`, which is right, while the
+    /// deleted copy read the low six bits as a length and called it `TooLong`,
+    /// which is not.
+    ///
+    /// A label longer than 63 octets cannot be spelled on the wire in the first
+    /// place: `00` is the only type that means "a length", and six bits hold 63.
+    /// So the check that was deleted was rejecting an impossible case with the
+    /// wrong reason, and the test agreed with it because both were written from
+    /// the same misreading — `CLAUDE.md` §1, exactly.
     #[test]
-    fn test_oversized_label() {
-        let validator = RequestValidator::with_defaults();
-
-        // Create packet with a label longer than 63 bytes
+    fn an_extended_label_type_is_refused_by_the_parser() {
         let mut packet = vec![
             0x00, 0x01, // ID
             0x00, 0x00, // flags (query)
@@ -718,32 +633,33 @@ mod tests {
             0x00, 0x00, // 0 answers
             0x00, 0x00, // 0 authorities
             0x00, 0x00, // 0 additionals
-            0x41, // Label length: 65 (exceeds 63 max)
+            0x41, // *not* a length: top bits `01` is RFC 2673's binary label
         ];
-
-        // Add 65 bytes of data
         packet.extend_from_slice(&[0x61; 65]);
 
-        let result = validator.validate_packet(&packet, false);
-        assert!(!result.is_valid());
+        // Admitted: it is small, and its counts are sane. That is all this check
+        // now claims to know.
+        assert!(AdmissionCheck::with_defaults()
+            .validate_packet(&packet, false)
+            .is_valid());
+
+        // And refused a moment later, by the one implementation of the rule,
+        // with the reason that is actually true of these bytes.
+        let err = DnsMessage::try_from_bytes(&packet).expect_err("an extended label type");
         assert!(
             matches!(
-                result.error(),
-                Some(WireError::TooLong {
-                    what: "a label",
-                    ..
-                }) | Some(WireError::Truncated {
-                    what: "a label",
-                    ..
-                })
+                err,
+                WireError::Unsupported {
+                    what: "a binary label"
+                }
             ),
-            "got {result:?}"
+            "asserting on the variant, not the message (`CLAUDE.md` §3): {err:?}"
         );
     }
 
     #[test]
     fn test_max_tcp_size_accepted() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
 
         // 16KB should be accepted for TCP
         let packet = vec![0u8; 16 * 1024];
@@ -763,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_exceeds_tcp_size() {
-        let validator = RequestValidator::with_defaults();
+        let validator = AdmissionCheck::with_defaults();
 
         // Exceed 16KB for TCP
         let packet = vec![0u8; 16 * 1024 + 1];
@@ -771,10 +687,12 @@ mod tests {
         assert!(!result.is_valid());
     }
 
+    /// A truncated compression pointer is refused by the parser, for the same
+    /// reason as the test above. `dname.rs` is also the only one of the two that
+    /// ever required a pointer to point *backwards*, which is the whole of its
+    /// cycle prevention.
     #[test]
-    fn test_pointer_with_incomplete_offset() {
-        let validator = RequestValidator::with_defaults();
-
+    fn a_truncated_pointer_is_refused_by_the_parser() {
         let packet = vec![
             0x00, 0x01, // ID
             0x00, 0x00, // flags
@@ -782,10 +700,12 @@ mod tests {
             0x00, 0x00, // 0 answers
             0x00, 0x00, // 0 authorities
             0x00, 0x00, // 0 additionals
-            0xc0, // Pointer marker (incomplete)
+            0xc0, // a pointer marker with no second octet
         ];
 
-        let result = validator.validate_packet(&packet, false);
-        assert!(!result.is_valid());
+        assert!(AdmissionCheck::with_defaults()
+            .validate_packet(&packet, false)
+            .is_valid());
+        assert!(DnsMessage::try_from_bytes(&packet).is_err());
     }
 }

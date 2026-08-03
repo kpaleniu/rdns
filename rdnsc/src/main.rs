@@ -39,6 +39,13 @@ struct Cli {
     pub dns_server: String,
     pub record: String,
     pub hostname: String,
+    /// Ask for DNSSEC records: EDNS0 with the DO bit set (RFC 4035 §3.2.1).
+    ///
+    /// Without it a server is *required* not to send RRSIG, NSEC or NSEC3, so
+    /// this client could not see any of the signing `rdnsd` does — which is why
+    /// every DNSSEC recipe in `TODO.md` reaches for dnspython (`TODO.md` #19h).
+    #[arg(long)]
+    pub dnssec: bool,
 }
 
 fn main() -> Result<()> {
@@ -48,6 +55,7 @@ fn main() -> Result<()> {
 
     let request = DnsMessageBuilder::new()
         .with_url(&args.hostname, &args.record)
+        .with_dnssec(args.dnssec)
         .build();
     if request.queries.is_empty() {
         bail!(
@@ -59,7 +67,7 @@ fn main() -> Result<()> {
     // Serialize once and send exactly what was written. `to_bytes` returns the
     // length and it used to be discarded — `sock.send_to(&buf, ..)` on a
     // `[u8; 512]` sent a 31-byte query as 512 bytes with 481 trailing zeros.
-    // This project's own `RequestValidator` caps a UDP request at exactly 512,
+    // This project's own `AdmissionCheck` caps a UDP request at exactly 512,
     // so the client was one EDNS option byte away from being rejected by the
     // server it ships with.
     let mut buf = [0u8; 512];

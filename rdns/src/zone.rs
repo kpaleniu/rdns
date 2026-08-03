@@ -554,12 +554,10 @@ fn parent_name(name: &str) -> Option<&str> {
 }
 
 /// A name with its trailing dot.
+/// [`crate::utils::absolute`], owned — this module's callers all keep the
+/// result. One line rather than the three it replaces (`TODO.md` #19c).
 fn absolute(name: &str) -> String {
-    if name.ends_with('.') {
-        name.to_string()
-    } else {
-        format!("{name}.")
-    }
+    crate::utils::absolute(name).into_owned()
 }
 
 /// The small parse helpers below return `Result<_, String>` on purpose, and it

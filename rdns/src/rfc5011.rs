@@ -794,12 +794,10 @@ fn base64(bytes: &[u8]) -> String {
     base64::Engine::encode(&base64::prelude::BASE64_STANDARD, bytes)
 }
 
+/// [`crate::utils::absolute`], owned — this module's callers all keep the
+/// result. One line rather than the three it replaces (`TODO.md` #19c).
 fn absolute(name: &str) -> String {
-    if name.ends_with('.') {
-        name.to_string()
-    } else {
-        format!("{name}.")
-    }
+    crate::utils::absolute(name).into_owned()
 }
 
 /// A DNSKEY as a resource record, for building test RRsets and for anything that

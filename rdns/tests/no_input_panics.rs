@@ -43,7 +43,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::utils::{current_unix_timestamp, record_types};
-use rdns::validation::RequestValidator;
+use rdns::validation::AdmissionCheck;
 use rdns::zone::{parse_zone_file, NameKind, Zone};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
 use rdns::{
@@ -322,7 +322,7 @@ fn mutate(rng: &mut Rng, seed_bytes: &[u8]) -> Vec<u8> {
 /// out. The last one matters as much as the first: a response echoes the
 /// client's question, so an attacker-shaped name goes through the *writer* too.
 fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring, now: u64) {
-    let validator = RequestValidator::with_defaults();
+    let validator = AdmissionCheck::with_defaults();
     let _ = validator.validate_packet(data, false);
     let _ = validator.validate_packet(data, true);
     let _ = tsig::check_request(data, keyring, now);

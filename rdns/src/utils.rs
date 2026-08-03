@@ -198,6 +198,53 @@ pub fn names_equal(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// A random DNS transaction id.
+///
+/// **One implementation, because there were two of the same name with different
+/// security properties** (`TODO.md` #19h, `docs/spec` D-3): `xfr::rand_id` used
+/// `rand::thread_rng()`, and `rdnsd`'s used `SystemTime`'s `subsec_nanos()`
+/// XOR-folded to 16 bits, so two NOTIFYs sent in the same clock tick shared an
+/// id. The stated reason for the second — "a full CSPRNG is overkill for a
+/// message we also match by source and opcode, and the workspace's `rand` is a
+/// library dependency rather than this crate's" — held for the threat, and did
+/// not make it a good idea to have two functions of one name that a reader would
+/// assume were the same.
+///
+/// The dependency argument is what this removes: `rdns` already has `rand`, so
+/// exposing the good one costs `rdnsd` nothing and needs no new dependency.
+///
+/// An id is not a security boundary here — a NOTIFY is matched by source address
+/// and opcode as well, and a transfer runs over TCP — but "not a boundary" is a
+/// reason to keep it cheap, not a reason to make it predictable.
+pub fn rand_id() -> u16 {
+    use rand::Rng;
+    rand::thread_rng().gen()
+}
+
+/// A name in absolute form — the trailing root dot added if it is not there.
+///
+/// **Six copies of these three lines existed** (`TODO.md` #19c): `rfc5011`,
+/// `secondary`, `xfr` and `zone` byte-identical, `rdnsd::config` differing only
+/// in a parameter name and `rdnsd::absolute_name` only in the function name.
+/// That is what happens when the shared module is one accessor short — `utils`
+/// had [`absolute_lowered`], which absolutizes *and* folds, and no way to ask
+/// for only the first half. A caller that wanted the dot and not the fold had
+/// nowhere to go, so it wrote the three lines.
+///
+/// Borrows when the name is already absolute, which is every name that arrived
+/// off the wire; the copies all returned a fresh `String` unconditionally.
+///
+/// Not to be confused with [`crate::zone::absolutize`], which resolves a
+/// *relative* zone-file name against an origin. This one has no origin to
+/// resolve against: it appends the root dot and nothing more.
+pub fn absolute(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.ends_with('.') {
+        std::borrow::Cow::Borrowed(name)
+    } else {
+        std::borrow::Cow::Owned(format!("{name}."))
+    }
+}
+
 /// A name in absolute, ASCII-lowercased form — the shape comparisons and map
 /// keys in this crate assume.
 ///

@@ -46,7 +46,7 @@ use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::logging::QueryLogger;
 use rdns::security::RateLimiter;
 use rdns::utils::{current_unix_timestamp, record_types};
-use rdns::validation::RequestValidator;
+use rdns::validation::AdmissionCheck;
 use rdns::zone::{parse_zone_file, Zone, ZoneRecord};
 use rdns::zone_signer::{sign_zone, SigningPolicy};
 use rdns::{
@@ -239,7 +239,7 @@ fn zone_index(c: &mut Criterion) {
 /// decided the packet is worth answering.
 fn admission(c: &mut Criterion) {
     let limiter = RateLimiter::with_defaults();
-    let validator = RequestValidator::with_defaults();
+    let validator = AdmissionCheck::with_defaults();
     let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
     let packet = query_message("www.example.com.", Qtype::of(record_types::A))
         .to_bytes_within(512)

@@ -528,12 +528,10 @@ fn belongs_here(rr: &ResourceRecord, zone: &str) -> TransferResult<String> {
 // treats the dot as optional on either side, which is the whole reason that one
 // takes the names in whatever form its callers hold them (`TODO.md` #13b).
 
+/// [`crate::utils::absolute`], owned — this module's callers all keep the
+/// result. One line rather than the three it replaces (`TODO.md` #19c).
 fn absolute(name: &str) -> String {
-    if name.ends_with('.') {
-        name.to_string()
-    } else {
-        format!("{name}.")
-    }
+    crate::utils::absolute(name).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -767,10 +765,7 @@ async fn read_reply(
     Ok((msg, mac))
 }
 
-fn rand_id() -> u16 {
-    use rand::Rng;
-    rand::thread_rng().gen()
-}
+use crate::utils::rand_id;
 
 #[cfg(test)]
 mod tests {

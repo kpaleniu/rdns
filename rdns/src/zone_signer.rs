@@ -572,7 +572,7 @@ fn carry_over_records(
             )));
         }
         let name = canonical_name(&zone.normalize_name(&record.name));
-        if !is_at_or_under(&name, origin) {
+        if !crate::utils::is_at_or_under(&name, origin) {
             return Err(DnssecError::signing(format!(
                 "{name} is not in {origin}, so this zone has no authority to sign it",
             )));
@@ -817,18 +817,22 @@ fn ancestors_of(name: &str) -> Vec<String> {
 }
 
 /// Whether `name` is strictly below `origin`.
+///
+/// The containment test is [`crate::utils::is_at_or_under`]. This module used to
+/// carry a **private function of the same name shadowing the public one in the
+/// same crate**, which is why #13b's four-copy sweep did not find it: nothing
+/// greps as a second definition when the call sites read identically
+/// (`TODO.md` #19b).
+///
+/// The two disagreed. The shared version makes the trailing dot optional on
+/// either side, so `is_at_or_under("www.example.com", "example.com.")` is true
+/// there and was false here — unreachable in practice, because the one caller
+/// passes `canonical_name` output, but that is a property of the caller and not
+/// of the function. The copy also built two `String`s and a `format!` per call,
+/// which is word for word what `utils::is_at_or_under`'s doc comment says it was
+/// written to remove from `resolver::is_subdomain`.
 fn is_under(name: &str, origin: &str) -> bool {
-    name != origin && is_at_or_under(name, origin)
-}
-
-fn is_at_or_under(name: &str, origin: &str) -> bool {
-    if origin == "." {
-        return true;
-    }
-    name.eq_ignore_ascii_case(origin)
-        || name
-            .to_ascii_lowercase()
-            .ends_with(&format!(".{}", origin.to_ascii_lowercase()))
+    name != origin && crate::utils::is_at_or_under(name, origin)
 }
 
 // ---------------------------------------------------------------------------

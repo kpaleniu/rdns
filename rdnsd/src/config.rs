@@ -244,12 +244,9 @@ impl ZoneSigningOverride {
 /// A zone name as an absolute domain name, which is how everything downstream
 /// keys on it. `[zones."example.com"]` and `[zones."example.com."]` are the same
 /// zone and must not become two.
+/// [`rdns::utils::absolute`], owned. See `TODO.md` #19c.
 fn absolute(zone: &str) -> String {
-    if zone.ends_with('.') {
-        zone.to_string()
-    } else {
-        format!("{zone}.")
-    }
+    rdns::utils::absolute(zone).into_owned()
 }
 
 impl Config {

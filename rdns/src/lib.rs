@@ -12,7 +12,12 @@ use dname::{dname_from_bytes, dname_to_bytes, write_bytes, DNameUnpacker, TryUnp
 /// which is what an operator needs when asked which build is running.
 pub const VERSION: &str = env!("RDNS_VERSION");
 
-pub mod bench;
+// The *file name* is kept on purpose — `TODO.md` §10 argues from
+// `bench_logger_throughput` by name — but the module is entirely
+// `#[cfg(test)]`, so a `pub mod` exported an empty public module from every
+// release build (`TODO.md` #19h).
+#[cfg(test)]
+mod bench;
 pub mod cache;
 pub mod compression;
 pub mod control;
@@ -1385,8 +1390,6 @@ pub struct EdnsHeader {
     pub do_bit: bool,
 }
 
-impl EdnsHeader {}
-
 impl Edns {
     /// The parameters without the options — see [`EdnsHeader`].
     pub fn header(&self) -> EdnsHeader {
@@ -1820,7 +1823,7 @@ impl DnsMessage {
             return Err(WireError::malformed(
                 "the header",
                 format!(
-                    "extended RCODE {rcode} needs an EDNS0 OPT record to carry its high                      bits (RFC 6891 §6.1.3)"
+                    "extended RCODE {rcode} needs an EDNS0 OPT record to carry                      its high bits (RFC 6891 §6.1.3)"
                 ),
             ));
         }
@@ -2038,6 +2041,12 @@ impl DnsMessage {
 pub struct DnsMessageBuilder {
     id: u16,
     queries: Vec<(String, Rtype)>,
+    /// Whether to attach an OPT record, and with DO set.
+    ///
+    /// The shipped client could not ask for DNSSEC at all, which meant it could
+    /// not exercise this library's most complex feature — and *that* is why
+    /// every DNSSEC recipe in `TODO.md` reaches for dnspython (`TODO.md` #19h).
+    dnssec: bool,
 }
 
 impl DnsMessageBuilder {
@@ -2054,6 +2063,16 @@ impl DnsMessageBuilder {
 
     pub fn with_id(mut self, id: u16) -> Self {
         self.id = id;
+        self
+    }
+
+    /// Ask for DNSSEC records: an EDNS0 OPT with DO set (RFC 4035 §3.2.1).
+    ///
+    /// Without DO a server is *required* not to send RRSIG, NSEC or NSEC3, so a
+    /// client that cannot set it cannot see any of the signing this library
+    /// does.
+    pub fn with_dnssec(mut self, dnssec: bool) -> Self {
+        self.dnssec = dnssec;
         self
     }
 
@@ -2087,8 +2106,48 @@ impl DnsMessageBuilder {
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
-            edns: None,
+            edns: self.dnssec.then(|| {
+                let mut edns = Edns::with_payload_size(4096);
+                edns.do_bit = true;
+                edns
+            }),
         }
+    }
+}
+
+#[cfg(test)]
+mod builder_dnssec_tests {
+    use super::*;
+
+    /// `--dnssec` has to produce an OPT record with DO set, and survive the
+    /// wire — a client that cannot ask for DNSSEC cannot see any of the signing
+    /// this library does (`TODO.md` #19h).
+    ///
+    /// Round-tripped rather than inspected, because the flag only matters if a
+    /// *server* reads it: `edns_header` is the same call `rdnsd` makes to decide
+    /// whether to attach signatures.
+    #[test]
+    fn the_dnssec_flag_sets_do_and_survives_the_wire() {
+        let plain = DnsMessageBuilder::new()
+            .with_url("example.com", "A")
+            .build();
+        assert!(plain.edns.is_none(), "no OPT unless asked for");
+
+        let asked = DnsMessageBuilder::new()
+            .with_url("example.com", "A")
+            .with_dnssec(true)
+            .build();
+        let mut buf = vec![0u8; 512];
+        let n = asked.to_bytes(&mut buf).expect("serializes");
+        let back = DnsMessage::try_from_bytes(&buf[..n]).expect("and reads back");
+        let edns = back
+            .edns_header()
+            .expect("a well-formed OPT")
+            .expect("which is there");
+        assert!(
+            edns.do_bit,
+            "DO is what asks for RRSIG/NSEC (RFC 4035 §3.2.1)"
+        );
     }
 }
 
@@ -2192,7 +2251,7 @@ mod tests {
     }
 
     /// The same shape in the additional section, which is the one that gets past
-    /// `RequestValidator::validate_packet` — OPT and TSIG legitimately live
+    /// `AdmissionCheck::validate_packet` — OPT and TSIG legitimately live
     /// there, so it is only count-capped, and this arrives as a well-formed
     /// QUERY rather than as an obviously bogus response.
     #[test]

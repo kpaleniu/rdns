@@ -40,7 +40,7 @@ use rdns::{
         current_unix_timestamp, is_at_or_under, record_types, recv_error_is_transient,
         UDP_RECEIVE_BUFFER,
     },
-    validation::{Request, RequestValidator},
+    validation::{AdmissionCheck, Request},
     xfr,
     zone::{parse_zone_file_at, NameKind, Zone},
     zone_signer::{sign_zone, sign_zone_incrementally, DenialChain, SigningPolicy},
@@ -777,6 +777,8 @@ fn resolve_in_zone(zone: &Zone, qname: &str, qtype: Qtype) -> Outcome {
         chain.push(name.clone());
         visited.push(zone.normalize_name(&name).to_ascii_lowercase());
 
+        // Still folded for `visited`, which is an equality test against a list
+        // of folded names; `in_zone` no longer needs it to be.
         let target_key = zone.normalize_name(&target).to_ascii_lowercase();
         if !in_zone(zone, &target_key) || visited.contains(&target_key) {
             return Outcome::ChainLeftZone { chain };
@@ -802,13 +804,17 @@ fn cname_target(zone: &Zone, name: &str) -> Option<String> {
         })
 }
 
-/// Whether an absolute, down-cased name is at or below this zone's apex.
+/// Whether a name is at or below this zone's apex.
+///
+/// [`rdns::utils::is_at_or_under`], which is a fourth copy of the same rule this
+/// used to be — the same family as the one `zone_signer` was shadowing
+/// (`TODO.md` #19b, #19h). The copy allocated `zone.origin().to_ascii_lowercase()`
+/// **per call**, on the CNAME-chase and referral-glue paths, and both call sites
+/// additionally allocated on the name to feed it something already folded. The
+/// shared version compares case-insensitively itself, so neither allocation is
+/// needed and the callers hand it the name they already have.
 fn in_zone(zone: &Zone, name: &str) -> bool {
-    let origin = zone.origin().to_ascii_lowercase();
-    name == origin
-        || (name.len() > origin.len()
-            && name.ends_with(&origin)
-            && name.as_bytes()[name.len() - origin.len() - 1] == b'.')
+    rdns::utils::is_at_or_under(name, zone.origin())
 }
 
 /// Put the records of `qtype` at `name` into the answer section, with their
@@ -947,8 +953,10 @@ fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMes
     // anything discards the latter, and sending it is how cache-poisoning
     // attempts look (RFC 1034 §4.2.1).
     for target in targets {
-        let key = zone.normalize_name(&target).to_ascii_lowercase();
-        if !in_zone(zone, &key) {
+        // No fold: `is_at_or_under` compares case-insensitively, so the
+        // `to_ascii_lowercase` this used to do per glue target was paying for a
+        // guarantee the callee already gives (`TODO.md` #19h).
+        if !in_zone(zone, &zone.normalize_name(&target)) {
             continue;
         }
         for rtype in [record_types::A, record_types::AAAA] {
@@ -1006,7 +1014,7 @@ fn find_zone_for_query<'a>(qname: &str, zone_map: &'a HashMap<String, Zone>) -> 
 struct Server {
     zone_map: Arc<RwLock<Zones>>,
     rate_limiter: Arc<RateLimiter>,
-    validator: Arc<RequestValidator>,
+    validator: Arc<AdmissionCheck>,
     logger: Arc<QueryLogger>,
     metrics: Arc<DnsMetrics>,
     /// Who may ask for a zone transfer. Empty by default, which refuses everyone.
@@ -1237,7 +1245,7 @@ async fn serve(
     let server = Arc::new(Server {
         zone_map,
         rate_limiter: Arc::new(RateLimiter::new(query_limit)),
-        validator: Arc::new(RequestValidator::with_defaults()),
+        validator: Arc::new(AdmissionCheck::with_defaults()),
         logger: Arc::new(QueryLogger::new()),
         metrics,
         transfer_acl: Arc::new(transfer_acl),
@@ -1588,7 +1596,7 @@ impl Server {
         // `Request` is the door: it parses, and it refuses QR=1. Both halves of
         // that used to be written out here and only half of them was written out
         // on the UDP path (`rdns::validation::Request`, `TODO.md` #14b).
-        // `RequestValidator` deliberately accepts QR=1 — it runs on both
+        // `AdmissionCheck` deliberately accepts QR=1 — it runs on both
         // directions of the wire — so the check belongs *here*, where we know
         // this packet arrived at a listening socket.
         let msg = match Request::from_bytes(packet) {
@@ -1786,7 +1794,9 @@ impl Server {
         // enclosing-zone lookup an ordinary query does.
         let messages = {
             let zones = self.zone_map.read().await;
-            let apex = absolute_name(&qname);
+            // `apex` is the one computed above, sixteen lines up: it was derived
+            // twice from the same `qname` before `absolute_name` borrowed
+            // (`TODO.md` #19c).
             let Some(zone) = zones
                 .values()
                 .find(|z| z.origin().eq_ignore_ascii_case(&apex))
@@ -1962,7 +1972,7 @@ impl Server {
                 return self.update_reply(msg, rejected.rcode, ip, session);
             }
         };
-        let zone_name = absolute_name(&request.zone);
+        let zone_name = absolute_name(&request.zone).into_owned();
 
         // §3.3: "If the requestor does not have permission to perform these
         // updates, the server may ... signal REFUSED to the requestor."
@@ -2019,9 +2029,11 @@ impl Server {
         // is about being an authority for the zone, and a secondary's authority
         // is delegated — an update belongs at the primary, which is what a
         // client that gets this refusal will go and find.
+        // Folded through the same helper the table is keyed with, so the two
+        // cannot disagree (`TODO.md` #19a).
         if self
             .secondaries
-            .contains_key(&zone_name.to_ascii_lowercase())
+            .contains_key(rdns::utils::absolute_lowered(&zone_name).as_ref())
         {
             serving_error!(
                 self.logger,
@@ -2369,9 +2381,17 @@ fn notify_reply(
     peer: SocketAddr,
 ) -> DnsMessage {
     let zone = notify::notified_zone(msg).unwrap_or_default();
-    let key = absolute_name(&zone).to_lowercase();
+    // `absolute_lowered`, not `absolute_name(..).to_lowercase()`: the fold is
+    // ASCII-only (RFC 4343, `CLAUDE.md` §8), and `str::to_lowercase` folds
+    // U+212A KELVIN SIGN onto `k` — so a NOTIFY naming a Kelvin-sign variant of
+    // a replicated zone folded onto that zone. The exposure was bounded, since
+    // the master-address check below still gated the refresh, but this is the
+    // rule this codebase wrote down, on a name a stranger chooses
+    // (`TODO.md` #19a). It also borrows in the common case, where the pair it
+    // replaced allocated twice.
+    let key = rdns::utils::absolute_lowered(&zone);
 
-    if let Some(replicated) = secondaries.get(&key) {
+    if let Some(replicated) = secondaries.get(key.as_ref()) {
         if replicated.masters.contains(&peer.ip()) {
             // `notify_one` rather than waking every waiter: it leaves a permit
             // for a task that is mid-transfer right now, so a NOTIFY that
@@ -2403,12 +2423,15 @@ fn notify_reply(
 }
 
 /// A name in absolute form, so it can be compared with a zone origin.
-fn absolute_name(name: &str) -> String {
-    if name.ends_with('.') {
-        name.to_string()
-    } else {
-        format!("{name}.")
-    }
+/// [`rdns::utils::absolute`] under this module's name for it.
+///
+/// Kept as a name rather than inlined at eleven call sites: `absolute_name`
+/// reads better here than a `utils::` path, and it is now three lines shorter
+/// than the copy it replaced (`TODO.md` #19c). It returns the `Cow` rather than
+/// an owned `String` so that the common case — a name off the wire, already
+/// absolute — borrows.
+fn absolute_name(name: &str) -> std::borrow::Cow<'_, str> {
+    rdns::utils::absolute(name)
 }
 
 /// Receive datagrams and answer them, as one of `--udp-workers` identical tasks
@@ -3147,7 +3170,7 @@ async fn send_notify(
 
     let mut wait = Duration::from_secs(notify::NOTIFY_RETRY_SECS);
     for attempt in 1..=notify::NOTIFY_ATTEMPTS {
-        let id = rand_id();
+        let id = rdns::utils::rand_id();
         let msg = notify::notify_request(zone, soa.clone(), id);
         let mut buf = vec![0u8; 512];
         let Ok(len) = msg.to_bytes(&mut buf) else {
@@ -3632,7 +3655,11 @@ fn spawn_secondaries(
 
         let wake = Arc::new(Notify::new());
         let entry = registry
-            .entry(spec.zone.to_lowercase())
+            // The matching insert for the lookup in `notify_reply`, and folded
+            // the same way for the same reason (`TODO.md` #19a). The two agreed
+            // with each other before, which is what kept the table
+            // self-consistent while both were wrong.
+            .entry(rdns::utils::absolute_lowered(&spec.zone).into_owned())
             .or_insert_with(|| ReplicatedZone {
                 masters: Vec::new(),
                 wake: Vec::new(),
@@ -4043,18 +4070,6 @@ async fn withdraw_unvouched_zones(specs: &[MasterSpec], served: &Served, zone_di
             );
         }
     }
-}
-
-/// A transaction id for a NOTIFY. Random, for the same reason a query's is.
-fn rand_id() -> u16 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // A full CSPRNG is overkill for a message we also match by source and opcode,
-    // and the workspace's `rand` is a library dependency rather than this crate's.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    (nanos ^ (nanos >> 16)) as u16
 }
 
 /// DHAT's allocator shim, only under `--features dhat-heap`.
@@ -4514,7 +4529,7 @@ impl ZoneSigning {
     fn policy_for(&self, origin: &str, signed_at: u64) -> SigningPolicy {
         let over = self
             .per_zone
-            .get(&absolute_name(origin))
+            .get(absolute_name(origin).as_ref())
             .copied()
             .unwrap_or_default();
         let validity = over
@@ -5238,7 +5253,7 @@ mod tests {
         Arc::new(Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             rate_limiter: Arc::new(RateLimiter::with_defaults()),
-            validator: Arc::new(RequestValidator::with_defaults()),
+            validator: Arc::new(AdmissionCheck::with_defaults()),
             logger: Arc::new(QueryLogger::new()),
             metrics: Arc::new(DnsMetrics::new()),
             journal: None,
@@ -5751,7 +5766,7 @@ mod tests {
         let server = Arc::new(Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             rate_limiter: Arc::new(RateLimiter::with_defaults()),
-            validator: Arc::new(RequestValidator::with_defaults()),
+            validator: Arc::new(AdmissionCheck::with_defaults()),
             logger: Arc::new(QueryLogger::new()),
             metrics: Arc::new(DnsMetrics::new()),
             transfer_acl: Arc::new(TransferAcl::parse(acl).expect("acl")),
@@ -5810,7 +5825,7 @@ mod tests {
         let server = Arc::new(Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             rate_limiter: Arc::new(RateLimiter::with_defaults()),
-            validator: Arc::new(RequestValidator::with_defaults()),
+            validator: Arc::new(AdmissionCheck::with_defaults()),
             logger: Arc::new(QueryLogger::new()),
             metrics: Arc::new(DnsMetrics::new()),
             transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
@@ -7265,7 +7280,7 @@ mod tests {
 
     /// A *response* arriving at the server port is dropped, not answered.
     ///
-    /// `RequestValidator` deliberately accepts QR=1 — it is used on both
+    /// `AdmissionCheck` deliberately accepts QR=1 — it is used on both
     /// directions of the wire — so nothing between the socket and the zone lookup
     /// tested it, and `make_response` would happily build a reply to a reply. Two
     /// servers pointed at each other, or one spoofed datagram with a forged
@@ -7284,7 +7299,7 @@ mod tests {
         let server = Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             rate_limiter: Arc::new(RateLimiter::with_defaults()),
-            validator: Arc::new(RequestValidator::with_defaults()),
+            validator: Arc::new(AdmissionCheck::with_defaults()),
             logger: Arc::new(QueryLogger::new()),
             metrics: Arc::new(DnsMetrics::new()),
             journal: None,

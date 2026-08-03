@@ -20,7 +20,7 @@ use rdns::special_names;
 use rdns::utils::current_unix_timestamp;
 use rdns::utils::record_types;
 use rdns::utils::{recv_error_is_transient, UDP_RECEIVE_BUFFER};
-use rdns::validation::{Request, RequestValidator};
+use rdns::validation::{AdmissionCheck, Request};
 use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, Qtype, QuerySection, ResourceRecord, ResponseCode,
     EDNS_VERSION, OPT_RECORD_TYPE,
@@ -270,7 +270,7 @@ struct Shell {
     /// have not been trusted yet, on the path where the cheapest possible
     /// rejection is worth the most. A resolver is the more amplifying of the two
     /// daemons, so it wants the pre-admission check at least as much.
-    validator: Arc<RequestValidator>,
+    validator: Arc<AdmissionCheck>,
 }
 
 impl Shell {
@@ -473,7 +473,7 @@ async fn main() -> anyhow::Result<()> {
         }),
         metrics: Arc::new(DnsMetrics::new()),
         logger: Arc::new(QueryLogger::new()),
-        validator: Arc::new(RequestValidator::with_defaults()),
+        validator: Arc::new(AdmissionCheck::with_defaults()),
     });
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, UDP in flight: {}",
@@ -1599,7 +1599,7 @@ mod tests {
             responses: Arc::new(ResponseLimiter::disabled()),
             metrics: Arc::new(DnsMetrics::new()),
             logger: Arc::new(QueryLogger::new()),
-            validator: Arc::new(RequestValidator::with_defaults()),
+            validator: Arc::new(AdmissionCheck::with_defaults()),
         });
         let metrics = shell.metrics.clone();
 
@@ -1705,7 +1705,7 @@ mod tests {
             responses: Arc::new(ResponseLimiter::disabled()),
             metrics: Arc::new(DnsMetrics::new()),
             logger: Arc::new(QueryLogger::new()),
-            validator: Arc::new(RequestValidator::with_defaults()),
+            validator: Arc::new(AdmissionCheck::with_defaults()),
         })
     }
 

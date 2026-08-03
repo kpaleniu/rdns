@@ -115,7 +115,12 @@ pub(crate) trait TryFromBytes<'a> {
     fn try_from_bytes(data: &'a [u8]) -> Result<Self::Output, Self::Error>;
 }
 
-// TODO: TryToBytes and others
+// The `TryToBytes`/`TryFromBytes` traits this once pointed at were not written,
+// and the reason is the one recorded at the bottom of this file for the other
+// bare `TODO` that was deleted rather than done: the two conversions a name
+// needs already exist as inherent methods with the error types the callers
+// branch on, and a trait would buy generic code nobody writes at the cost of
+// making the failure modes uniform when they are not (`TODO.md` #19h).
 
 #[derive(Debug, PartialEq, Clone)]
 enum Label<'a> {
