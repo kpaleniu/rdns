@@ -118,7 +118,7 @@ pub fn proof_of_absence(zone: &Zone, qname: &str) -> Vec<ResourceRecord> {
     let qname = canonical_name(qname);
     let mut out = Vec::new();
     if zone.has_nsec3_chain() {
-        let Some(params) = Nsec3Params::of(zone) else {
+        let Some(params) = Nsec3Chain::of(zone) else {
             return out;
         };
         let Some(encloser) = params.closest_encloser(zone, &qname) else {
@@ -230,7 +230,7 @@ pub fn delegation_proof(zone: &Zone, cut: &str) -> Vec<ResourceRecord> {
 fn wildcard_denial(zone: &Zone, qname: &str) -> Vec<ResourceRecord> {
     let mut out = Vec::new();
     if zone.has_nsec3_chain() {
-        let Some(params) = Nsec3Params::of(zone) else {
+        let Some(params) = Nsec3Chain::of(zone) else {
             return out;
         };
         let Some(encloser) = params.closest_encloser(zone, qname) else {
@@ -251,7 +251,7 @@ fn wildcard_denial(zone: &Zone, qname: &str) -> Vec<ResourceRecord> {
 /// The denial record sitting *at* `name`, with its signatures.
 fn match_at_name(zone: &Zone, name: &str, out: &mut Vec<ResourceRecord>) {
     if zone.has_nsec3_chain() {
-        if let Some(params) = Nsec3Params::of(zone) {
+        if let Some(params) = Nsec3Chain::of(zone) {
             push_matching_nsec3(zone, &params, name, out);
         }
         return;
@@ -330,13 +330,18 @@ fn push_with_signatures(zone: &Zone, record: &ZoneRecord, out: &mut Vec<Resource
 // NSEC3: the chain is over hashes, so every lookup goes through the parameters
 // ---------------------------------------------------------------------------
 
-/// The salt and iteration count this zone's NSEC3 chain was built with.
-struct Nsec3Params {
+/// The salt and iteration count this zone's NSEC3 chain was built with, and the
+/// lookups that go through them.
+///
+/// Not [`crate::dnssec_denial::Nsec3Params`], which is the borrowed triple a
+/// *record* hashes under: this one is owned, is derived from a whole zone, and
+/// answers questions about the chain rather than about one record.
+struct Nsec3Chain {
     salt: Vec<u8>,
     iterations: u16,
 }
 
-impl Nsec3Params {
+impl Nsec3Chain {
     /// Read them off the chain itself rather than off NSEC3PARAM.
     ///
     /// NSEC3PARAM is what tells a *server* which chain to use when a zone is
@@ -348,7 +353,7 @@ impl Nsec3Params {
     fn of(zone: &Zone) -> Option<Self> {
         zone.any_nsec3()
             .and_then(|r| Nsec3::from_record(&to_resource(r)))
-            .map(|n| Nsec3Params {
+            .map(|n| Nsec3Chain {
                 salt: n.salt,
                 iterations: n.iterations,
             })
@@ -393,7 +398,7 @@ impl Nsec3Params {
 
 fn push_matching_nsec3(
     zone: &Zone,
-    params: &Nsec3Params,
+    params: &Nsec3Chain,
     name: &str,
     out: &mut Vec<ResourceRecord>,
 ) {
@@ -407,7 +412,7 @@ fn push_matching_nsec3(
 
 fn push_covering_nsec3(
     zone: &Zone,
-    params: &Nsec3Params,
+    params: &Nsec3Chain,
     name: &str,
     out: &mut Vec<ResourceRecord>,
 ) {

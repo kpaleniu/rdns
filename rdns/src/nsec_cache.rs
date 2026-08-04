@@ -28,7 +28,7 @@
 
 use crate::dnssec::{canonical_name, label_count, suffix_labels, Rrsig};
 use crate::dnssec_denial::{
-    canonical_sort_key, proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3,
+    canonical_sort_key, proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Params,
 };
 use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf};
 use crate::Qtype;
@@ -36,6 +36,7 @@ use crate::Rtype;
 use crate::Ttl;
 use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::sync::Mutex;
 
 /// Query types we will not answer from a gap.
@@ -512,37 +513,54 @@ impl NsecCache {
         }
         let qname = canonical_name(qname);
         let now = current_unix_timestamp();
-        let zones = self.zones.lock().ok()?;
 
-        // The deepest cached zone enclosing the name is the one whose NSEC
-        // chain covers it; a shallower zone's chain stops at the delegation.
-        let (zone_name, zone) = zones
-            .iter()
-            .filter(|(z, _)| is_at_or_below(&qname, z.as_str()))
-            .max_by_key(|(z, _)| label_count(z.as_str()))?;
+        // Under the lock: find the zone, take what bears on the question, and
+        // get out. Whether it proves anything is decided below, with the guard
+        // dropped — see [`Gathered`].
+        let (zone_name, soa_records, soa_ttl, gathered) = {
+            let zones = self.zones.lock().ok()?;
 
-        let soa = zone.soa.as_ref().filter(|s| s.expires_at > now)?;
+            // The deepest cached zone enclosing the name is the one whose NSEC
+            // chain covers it; a shallower zone's chain stops at the delegation.
+            let (zone_name, zone) = zones
+                .iter()
+                .filter(|(z, _)| is_at_or_below(&qname, z.as_str()))
+                .max_by_key(|(z, _)| label_count(z.as_str()))?;
 
-        let (rcode, proof_records, proof_ttl) = zone
-            .synthesize_nodata(&qname, zone_name.as_str(), qtype, now)
-            .or_else(|| zone.synthesize_nxdomain(&qname, zone_name.as_str(), now))?;
+            let soa = zone.soa.as_ref().filter(|s| s.expires_at > now)?;
+            let gathered = zone
+                .gather_nodata(&qname, qtype, now)
+                .or_else(|| zone.gather_nxdomain(&qname, zone_name.as_str(), now))?;
+
+            let soa_ttl = soa
+                .negative_ttl
+                .min(soa.expires_at.saturating_sub(now).min(u32::MAX as u64) as u32);
+            (
+                zone_name.as_str().to_string(),
+                soa.records.clone(),
+                soa_ttl,
+                gathered,
+            )
+        };
+
+        if !gathered.proved(&qname, &zone_name, qtype) {
+            return None;
+        }
 
         // The answer lives as long as the shortest-lived thing it rests on: the
         // proof records, the SOA's negative TTL (RFC 2308 §5), and what is left
         // of the SOA itself. Applied once, here, to every record going out —
         // handing back a proof still carrying its original TTL would let a
         // client re-cache it for longer than we may hold it ourselves.
-        let ttl = proof_ttl
-            .min(soa.negative_ttl)
-            .min(soa.expires_at.saturating_sub(now) as u32);
+        let ttl = gathered.ttl.min(soa_ttl);
         if ttl == 0 {
             return None;
         }
 
-        let mut authority = with_ttl(&soa.records, ttl);
-        authority.extend(with_ttl(&proof_records, ttl));
+        let mut authority = with_ttl(&soa_records, ttl);
+        authority.extend(with_ttl(&gathered.records, ttl));
         Some(Synthesis {
-            rcode,
+            rcode: gathered.rcode,
             authority,
             ttl,
         })
@@ -603,19 +621,70 @@ impl ZoneProofs {
             .filter(|c| c.live(now))
     }
 
+    /// The distinct NSEC3 hash parameters among the live records — one, unless
+    /// the zone is mid-NSEC3PARAM roll and publishing two chains.
+    ///
+    /// A name is hashed once per set of these, which is the whole difference
+    /// between this and what it replaced (`TODO.md` #23).
+    fn nsec3_params(&self, now: u64) -> Vec<Nsec3Params<'_>> {
+        let mut sets: Vec<Nsec3Params<'_>> = Vec::new();
+        for cached in self.nsec3s.values().filter(|c| c.live(now)) {
+            let params = cached.proof.params();
+            if !sets.contains(&params) {
+                sets.push(params);
+            }
+        }
+        sets
+    }
+
+    /// The live NSEC3 whose owner hash *is* `hash`.
+    fn matching_nsec3(
+        &self,
+        hash: &[u8],
+        params: &Nsec3Params,
+        now: u64,
+    ) -> Option<&CachedProof<Nsec3>> {
+        self.nsec3s
+            .get(hash)
+            .filter(|c| c.live(now) && c.proof.params() == *params)
+    }
+
+    /// The live NSEC3 whose span contains `hash`.
+    ///
+    /// The map is keyed by owner hash, so this is the predecessor — and, when
+    /// nothing sorts below it, the last record, whose span wraps around the end
+    /// of the chain. Records under other parameters are skipped rather than
+    /// ending the walk: two interleaved chains share this map, and the
+    /// predecessor in one is not the predecessor in the other.
+    fn covering_nsec3(
+        &self,
+        hash: &[u8],
+        params: &Nsec3Params,
+        now: u64,
+    ) -> Option<&CachedProof<Nsec3>> {
+        let usable = |c: &&CachedProof<Nsec3>| c.live(now) && c.proof.params() == *params;
+        let candidate = self
+            .nsec3s
+            .range::<[u8], _>((Bound::Unbounded, Bound::Excluded(hash)))
+            .rev()
+            .map(|(_, v)| v)
+            .find(usable)
+            .or_else(|| self.nsec3s.values().rev().find(usable))?;
+        candidate.proof.covers_hash(hash).then_some(candidate)
+    }
+
     /// NODATA: the name exists, but not with this type.
     ///
     /// Only the record *at* the name is consulted, so `proves_nodata`'s wildcard
     /// case never comes into play here. That is deliberate: answering NODATA for
     /// a name that does not exist means synthesizing from a wildcard, which is
     /// the RFC 8198 §5.3 step this cache does not take.
-    fn synthesize_nodata(
-        &self,
-        qname: &str,
-        zone: &str,
-        qtype: Qtype,
-        now: u64,
-    ) -> Option<(ResponseCode, Vec<ResourceRecord>, u32)> {
+    ///
+    /// `Some` says a record sits at the name, not that it proves anything — see
+    /// [`Gathered`]. That record also settles NXDOMAIN, since the name plainly
+    /// exists, which is why the caller does not fall through to
+    /// [`ZoneProofs::gather_nxdomain`] when this returns `Some`.
+    fn gather_nodata(&self, qname: &str, qtype: Qtype, now: u64) -> Option<Gathered> {
         if let Some(cached) = self.matching_nsec(qname, now) {
             // At a delegation the parent holds only the DS; everything else is
             // the child's to answer, and the real reply is a referral rather
@@ -623,68 +692,46 @@ impl ZoneProofs {
             if is_delegation(&cached.proof) && !qtype.is(rt::DS) {
                 return None;
             }
-            if proves_nodata(
-                qname,
-                zone,
-                Rtype::new(qtype.to_u16()),
-                std::slice::from_ref(&cached.proof),
-                &[],
-            )
-            .is_proved()
-            {
-                return Some((
-                    ResponseCode::Ok,
-                    with_ttl(&cached.records, cached.remaining(now)),
-                    cached.remaining(now),
-                ));
-            }
-            return None;
+            return Some(Gathered {
+                rcode: ResponseCode::Ok,
+                nsecs: vec![cached.proof.clone()],
+                nsec3s: Vec::new(),
+                records: cached.records.clone(),
+                ttl: cached.remaining(now),
+            });
         }
 
-        // NSEC3: the record for a name that exists is the one its hash matches.
-        for cached in self.nsec3s.values().filter(|c| c.live(now)) {
-            if !cached.proof.matches(qname).unwrap_or(false) {
+        // NSEC3: the record for a name that exists is the one its hash matches,
+        // and the map is already keyed by that hash.
+        for params in self.nsec3_params(now) {
+            let Ok(hash) = params.hash(qname) else {
                 continue;
-            }
+            };
+            let Some(cached) = self.matching_nsec3(&hash, &params, now) else {
+                continue;
+            };
             if cached.proof.has_type(rt::NS) && !cached.proof.has_type(rt::SOA) && !qtype.is(rt::DS)
             {
                 return None;
             }
-            if proves_nodata(
-                qname,
-                zone,
-                Rtype::new(qtype.to_u16()),
-                &[],
-                std::slice::from_ref(&cached.proof),
-            )
-            .is_proved()
-            {
-                return Some((
-                    ResponseCode::Ok,
-                    with_ttl(&cached.records, cached.remaining(now)),
-                    cached.remaining(now),
-                ));
-            }
-            return None;
+            return Some(Gathered {
+                rcode: ResponseCode::Ok,
+                nsecs: Vec::new(),
+                nsec3s: vec![cached.proof.clone()],
+                records: cached.records.clone(),
+                ttl: cached.remaining(now),
+            });
         }
         None
     }
 
     /// NXDOMAIN: the name does not exist, and no wildcard would have answered.
-    fn synthesize_nxdomain(
-        &self,
-        qname: &str,
-        zone: &str,
-        now: u64,
-    ) -> Option<(ResponseCode, Vec<ResourceRecord>, u32)> {
-        // Gather the records that could bear on it, then let the same proof
-        // logic that validated them decide. Re-deriving the argument here would
-        // be a second implementation of it, and the two would drift.
+    fn gather_nxdomain(&self, qname: &str, zone: &str, now: u64) -> Option<Gathered> {
         let mut candidates: Vec<&CachedProof<Nsec>> = Vec::new();
         if let Some(covering) = self.covering_nsec(qname, now) {
             candidates.push(covering);
         } else if self.nsecs.is_empty() {
-            return self.synthesize_nxdomain_nsec3(qname, zone, now);
+            return self.gather_nxdomain_nsec3(qname, zone, now);
         } else {
             return None;
         }
@@ -702,95 +749,153 @@ impl ZoneProofs {
                 }
             }
         }
-
-        let proofs: Vec<Nsec> = candidates.iter().map(|c| c.proof.clone()).collect();
-        if !proves_nxdomain(qname, zone, &proofs, &[]).is_proved() {
-            return None;
-        }
-
-        let ttl = candidates
-            .iter()
-            .map(|c| c.remaining(now))
-            .min()
-            .unwrap_or(0);
-        let mut records = Vec::new();
-        for cached in candidates {
-            records.extend(with_ttl(&cached.records, ttl));
-        }
-        Some((ResponseCode::NoSuchDomain, records, ttl))
+        Some(Gathered {
+            rcode: ResponseCode::NoSuchDomain,
+            nsecs: candidates.iter().map(|c| c.proof.clone()).collect(),
+            nsec3s: Vec::new(),
+            records: candidates
+                .iter()
+                .flat_map(|c| c.records.iter().cloned())
+                .collect(),
+            ttl: candidates
+                .iter()
+                .map(|c| c.remaining(now))
+                .min()
+                .unwrap_or(0),
+        })
     }
 
-    /// The NSEC3 form of the same thing: the closest-encloser proof needs the
-    /// record matching some ancestor, one covering the name below it, and one
-    /// accounting for the wildcard.
-    fn synthesize_nxdomain_nsec3(
+    /// The NSEC3 form of the same thing: the closest-encloser proof of
+    /// RFC 5155 §8.4 needs the record matching the deepest ancestor that exists,
+    /// one covering the name a label below it, and one accounting for the
+    /// wildcard there.
+    fn gather_nxdomain_nsec3(&self, qname: &str, zone: &str, now: u64) -> Option<Gathered> {
+        self.nsec3_params(now)
+            .iter()
+            .find_map(|params| self.gather_nxdomain_under(qname, zone, params, now))
+    }
+
+    /// One chain's attempt at that proof: three names hashed, and a map lookup
+    /// for each.
+    ///
+    /// What it replaced hashed two names per label of the QNAME against every
+    /// one of the 256 cached records, twice over — 1 156 ms of CPU on one query
+    /// (`TODO.md` #23). The walk still starts at the QNAME and stops at the
+    /// first ancestor with a record, as RFC 5155 §8.3 does: a responder includes
+    /// the encloser's own record and none of its ancestors', so a cache holding
+    /// a deep encloser need not hold anything above it, and a walk downwards
+    /// from the apex would stop at the first name nobody had asked about.
+    fn gather_nxdomain_under(
         &self,
         qname: &str,
         zone: &str,
+        params: &Nsec3Params,
         now: u64,
-    ) -> Option<(ResponseCode, Vec<ResourceRecord>, u32)> {
-        let live: Vec<&CachedProof<Nsec3>> = self.nsec3s.values().filter(|c| c.live(now)).collect();
-        if live.is_empty() {
-            return None;
-        }
-
-        // Anything the proof might reference: every ancestor of the name, the
-        // names one label below them, and their wildcards.
-        let mut names: Vec<String> = Vec::new();
-        for depth in label_count(zone)..=label_count(qname) {
-            let ancestor = suffix_labels(qname, depth);
-            names.push(format!("*.{ancestor}"));
-            names.push(ancestor);
-        }
-
-        let mut candidates: Vec<&CachedProof<Nsec3>> = Vec::new();
-        for name in &names {
-            for cached in &live {
-                let relevant = cached.proof.matches(name).unwrap_or(false)
-                    || cached.proof.covers(name).unwrap_or(false);
-                if relevant
-                    && !candidates
-                        .iter()
-                        .any(|c| c.proof.owner_hash == cached.proof.owner_hash)
-                {
-                    candidates.push(cached);
-                }
-            }
-        }
-        if candidates.is_empty() {
-            return None;
-        }
-
-        // Same delegation trap as NSEC: if the closest encloser we can prove is
-        // a delegation, the name below it belongs to the child zone.
-        for cached in &candidates {
-            let is_delegation = cached.proof.has_type(rt::NS) && !cached.proof.has_type(rt::SOA);
-            if !is_delegation {
+    ) -> Option<Gathered> {
+        let qlabels = label_count(qname);
+        let mut encloser = None;
+        for depth in (label_count(zone)..=qlabels).rev() {
+            let candidate = suffix_labels(qname, depth);
+            let hash = params.hash(&candidate).ok()?;
+            let Some(cached) = self.matching_nsec3(&hash, params, now) else {
                 continue;
+            };
+            // A record at the name itself says it exists, so there is nothing
+            // here to deny.
+            if depth == qlabels {
+                return None;
             }
-            for depth in label_count(zone)..label_count(qname) {
-                let ancestor = suffix_labels(qname, depth);
-                if cached.proof.matches(&ancestor).unwrap_or(false) {
-                    return None;
-                }
-            }
+            encloser = Some((depth, candidate, cached));
+            break;
         }
+        let (depth, encloser_name, matching) = encloser?;
 
-        let proofs: Vec<Nsec3> = candidates.iter().map(|c| c.proof.clone()).collect();
-        if !matches!(proves_nxdomain(qname, zone, &[], &proofs), Denial::Proved) {
+        // The same delegation trap as NSEC: below a delegation the names are the
+        // child's, and this zone's chain says nothing about them.
+        if matching.proof.has_type(rt::NS) && !matching.proof.has_type(rt::SOA) {
             return None;
         }
+        let mut candidates = vec![matching];
 
-        let ttl = candidates
-            .iter()
-            .map(|c| c.remaining(now))
-            .min()
-            .unwrap_or(0);
-        let mut records = Vec::new();
-        for cached in candidates {
-            records.extend(with_ttl(&cached.records, ttl));
+        // The next closer name must be absent...
+        let next_closer = suffix_labels(qname, depth + 1);
+        let hash = params.hash(&next_closer).ok()?;
+        push_unique(&mut candidates, self.covering_nsec3(&hash, params, now)?);
+
+        // ...and the wildcard at the encloser must be accounted for, whether by
+        // being absent or by existing and not having been expanded.
+        let wildcard = format!("*.{encloser_name}");
+        let hash = params.hash(&wildcard).ok()?;
+        let accounted = self
+            .matching_nsec3(&hash, params, now)
+            .or_else(|| self.covering_nsec3(&hash, params, now))?;
+        push_unique(&mut candidates, accounted);
+
+        Some(Gathered {
+            rcode: ResponseCode::NoSuchDomain,
+            nsecs: Vec::new(),
+            nsec3s: candidates.iter().map(|c| c.proof.clone()).collect(),
+            records: candidates
+                .iter()
+                .flat_map(|c| c.records.iter().cloned())
+                .collect(),
+            ttl: candidates
+                .iter()
+                .map(|c| c.remaining(now))
+                .min()
+                .unwrap_or(0),
+        })
+    }
+}
+
+/// What a lookup found, before the proof logic has been asked whether it stands.
+///
+/// The two halves are split so the verdict is reached with the cache's lock
+/// already dropped: verifying re-derives the closest encloser, which hashes once
+/// per label of a name the *client* chose, and that is not work to hold every
+/// other zone's lookups behind (`TODO.md` #23).
+struct Gathered {
+    rcode: ResponseCode,
+    /// What the proof rests on, in the form the `proves_*` functions take.
+    /// Asking them rather than deciding here is what keeps this from becoming a
+    /// second implementation of the rules that validated these records on the
+    /// way in — the two would drift.
+    nsecs: Vec<Nsec>,
+    nsec3s: Vec<Nsec3>,
+    /// The proof records as cached, and what is left of the shortest-lived of
+    /// them. The TTL going out is lower still; `synthesize` applies it.
+    records: Vec<ResourceRecord>,
+    ttl: u32,
+}
+
+impl Gathered {
+    fn proved(&self, qname: &str, zone: &str, qtype: Qtype) -> bool {
+        match self.rcode {
+            ResponseCode::NoSuchDomain => {
+                matches!(
+                    proves_nxdomain(qname, zone, &self.nsecs, &self.nsec3s),
+                    Denial::Proved
+                )
+            }
+            _ => proves_nodata(
+                qname,
+                zone,
+                Rtype::new(qtype.to_u16()),
+                &self.nsecs,
+                &self.nsec3s,
+            )
+            .is_proved(),
         }
-        Some((ResponseCode::NoSuchDomain, records, ttl))
+    }
+}
+
+/// Add a proof to the list unless that record is already in it.
+fn push_unique<'a>(candidates: &mut Vec<&'a CachedProof<Nsec3>>, cached: &'a CachedProof<Nsec3>) {
+    if !candidates
+        .iter()
+        .any(|c| c.proof.owner_hash == cached.proof.owner_hash)
+    {
+        candidates.push(cached);
     }
 }
 
@@ -1014,6 +1119,102 @@ mod tests {
             ],
         ));
         cache
+    }
+
+    /// A zone's worth of NSEC3 that proves nothing about anything: every span is
+    /// one hash wide, so no name is covered and only the `fill` names match.
+    ///
+    /// The worst case for a scan, and what a flood of random names produces —
+    /// the cache fills with real proofs about names nobody asks for twice.
+    fn cache_of_n_nsec3s(n: usize) -> NsecCache {
+        let salt = vec![0xaa, 0xbb];
+        let mut authority = vec![soa_record("example.com.", 3600, Ttl::from_secs(3600))];
+        let mut i = 0;
+        while authority.len() <= n {
+            let hash = nsec3_hash(&format!("fill{i}.example.com."), &salt, 3).unwrap();
+            i += 1;
+            // The span runs from the owner to the same hash with its last octet
+            // at 0xff, so it wraps around nothing and contains nothing. A hash
+            // already ending in 0xff would make the range empty *and* wrapped,
+            // which covers everything instead.
+            if *hash.last().unwrap() == 0xff {
+                continue;
+            }
+            let mut next = hash.clone();
+            *next.last_mut().unwrap() = 0xff;
+            authority.push(ResourceRecord {
+                name: format!("{}.example.com.", base32hex_encode(&hash).to_lowercase()),
+                class: Class::new(1),
+                ttl: Ttl::from_secs(3600),
+                rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
+                    hash_algorithm: 1,
+                    flags: 0,
+                    iterations: 3,
+                    salt: salt.clone(),
+                    next_hashed_owner: next,
+                    type_bitmap: build_type_bitmap(&[rt::A]),
+                })
+                .unwrap(),
+            });
+        }
+        let cache = NsecCache::new(4);
+        cache.insert_validated(&negative(
+            "nope.example.com.",
+            ResponseCode::NoSuchDomain,
+            authority,
+        ));
+        cache
+    }
+
+    /// A name as deep as the protocol allows, which is the multiplier the client
+    /// chooses.
+    fn deepest_name() -> String {
+        format!("{}example.com.", "a.".repeat(115))
+    }
+
+    /// Filling the cache must not make a lookup in it slower. The NSEC3 half is
+    /// keyed by owner hash and hashes a name once per chain, so what is cached
+    /// is not in the cost (`TODO.md` #23).
+    ///
+    /// A ratio rather than a floor (`CLAUDE.md` §10): the absolute numbers are
+    /// the machine's, the complexity class is the code's. Watched failing
+    /// against the scan this replaced — 31.6× and 1.6 s per lookup in a debug
+    /// build, where the query the finding came from cost 1 156 ms of CPU in a
+    /// release one, with the cache's one lock held for all of it.
+    #[test]
+    fn a_lookup_costs_the_same_however_many_proofs_are_cached() {
+        use std::time::Instant;
+
+        let qname = deepest_name();
+        let few = cache_of_n_nsec3s(8);
+        let many = cache_of_n_nsec3s(MAX_PROOFS_PER_ZONE);
+        // Nothing in either cache bears on the name, which is the case a flood
+        // produces and the one the scan was worst at.
+        assert!(few.synthesize(&qname, Qtype::of(rt::A)).is_none());
+        assert!(many.synthesize(&qname, Qtype::of(rt::A)).is_none());
+
+        let batch = 20;
+        let time = |cache: &NsecCache| {
+            let start = Instant::now();
+            for _ in 0..batch {
+                cache.synthesize(&qname, Qtype::of(rt::A));
+            }
+            start.elapsed()
+        };
+        // Once through each before measuring: the first call in a process pays
+        // for pages nobody has touched yet.
+        time(&few);
+        time(&many);
+
+        let small = time(&few);
+        let large = time(&many);
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 3.0,
+            "a lookup got {ratio:.1}x slower with {} cached proofs instead of 8 \
+             ({small:?} -> {large:?}); the NSEC3 lookup is scanning them again",
+            MAX_PROOFS_PER_ZONE
+        );
     }
 
     #[test]
@@ -1361,6 +1562,123 @@ mod tests {
         assert_eq!(s.rcode, ResponseCode::Ok);
         assert!(cache
             .synthesize("www.example.com.", Qtype::of(rt::A))
+            .is_none());
+    }
+
+    /// An NSEC3 with the owner and next hashes given outright. The cache reads
+    /// the owner hash out of the first label, so a chain can be laid out by hand
+    /// rather than by finding names that hash where they are wanted.
+    fn nsec3_span(owner: &[u8], next: &[u8], types: &[Rtype]) -> ResourceRecord {
+        ResourceRecord {
+            name: format!("{}.example.com.", base32hex_encode(owner).to_lowercase()),
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
+            rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
+                hash_algorithm: 1,
+                flags: 0,
+                iterations: 3,
+                salt: vec![0xaa, 0xbb],
+                next_hashed_owner: next.to_vec(),
+                type_bitmap: build_type_bitmap(types),
+            })
+            .unwrap(),
+        }
+    }
+
+    /// A span containing `name`'s hash and, for these purposes, nothing else:
+    /// the same hash with its last octet at 0x00 and at 0xff.
+    fn span_around(name: &str) -> (Vec<u8>, Vec<u8>) {
+        let hash = nsec3_hash(name, &[0xaa, 0xbb], 3).unwrap();
+        let last = *hash.last().unwrap();
+        assert!(
+            last != 0x00 && last != 0xff,
+            "{name} hashes to something this fixture cannot bracket"
+        );
+        let mut owner = hash.clone();
+        let mut next = hash;
+        *owner.last_mut().unwrap() = 0x00;
+        *next.last_mut().unwrap() = 0xff;
+        (owner, next)
+    }
+
+    /// The closest-encloser proof of RFC 5155 §8.4, out of the cache: the apex
+    /// matched, the queried name covered, and the wildcard covered.
+    ///
+    /// This shape had no test before the lookup was rewritten (`TODO.md` #23),
+    /// which is how a scan and a map lookup could have disagreed about it in
+    /// silence.
+    fn cache_with_an_nsec3_chain() -> NsecCache {
+        let apex = nsec3_hash("example.com.", &[0xaa, 0xbb], 3).unwrap();
+        let mut apex_next = apex.clone();
+        *apex_next.last_mut().unwrap() = apex.last().unwrap().wrapping_add(1);
+        let (nope_owner, nope_next) = span_around("nope.example.com.");
+        let (star_owner, star_next) = span_around("*.example.com.");
+
+        let cache = NsecCache::new(16);
+        cache.insert_validated(&negative(
+            "nope.example.com.",
+            ResponseCode::NoSuchDomain,
+            vec![
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
+                nsec3_span(&apex, &apex_next, &[rt::SOA, rt::NS, rt::DNSKEY]),
+                nsec3_span(&nope_owner, &nope_next, &[rt::A]),
+                nsec3_span(&star_owner, &star_next, &[rt::A]),
+            ],
+        ));
+        cache
+    }
+
+    #[test]
+    fn test_nsec3_nxdomain_is_synthesized() {
+        let cache = cache_with_an_nsec3_chain();
+        let s = cache
+            .synthesize("nope.example.com.", Qtype::of(rt::A))
+            .expect("apex matched, name covered, wildcard covered");
+        assert_eq!(s.rcode, ResponseCode::NoSuchDomain);
+        assert!(s.authority.iter().any(|rr| rr.rdata.rtype() == rt::SOA));
+        assert_eq!(
+            s.authority
+                .iter()
+                .filter(|rr| rr.rdata.rtype() == rt::NSEC3)
+                .count(),
+            3,
+            "the encloser, the next closer and the wildcard"
+        );
+    }
+
+    /// A name the chain says nothing about must go upstream. `nope` and
+    /// `elsewhere` differ only in where they hash, which is the whole of what
+    /// the lookup keys on.
+    #[test]
+    fn test_nsec3_nxdomain_needs_the_name_covered() {
+        let cache = cache_with_an_nsec3_chain();
+        assert!(cache
+            .synthesize("elsewhere.example.com.", Qtype::of(rt::A))
+            .is_none());
+    }
+
+    /// The wildcard is the half that is easy to drop: without a record
+    /// accounting for `*.example.com.`, a wildcard could have answered and the
+    /// name is not proved absent (RFC 5155 §8.4).
+    #[test]
+    fn test_nsec3_nxdomain_needs_the_wildcard_accounted_for() {
+        let apex = nsec3_hash("example.com.", &[0xaa, 0xbb], 3).unwrap();
+        let mut apex_next = apex.clone();
+        *apex_next.last_mut().unwrap() = apex.last().unwrap().wrapping_add(1);
+        let (nope_owner, nope_next) = span_around("nope.example.com.");
+
+        let cache = NsecCache::new(16);
+        cache.insert_validated(&negative(
+            "nope.example.com.",
+            ResponseCode::NoSuchDomain,
+            vec![
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
+                nsec3_span(&apex, &apex_next, &[rt::SOA, rt::NS, rt::DNSKEY]),
+                nsec3_span(&nope_owner, &nope_next, &[rt::A]),
+            ],
+        ));
+        assert!(cache
+            .synthesize("nope.example.com.", Qtype::of(rt::A))
             .is_none());
     }
 

@@ -351,6 +351,35 @@ impl Nsec {
 /// per §8.1 — must ignore rather than object to.
 const SHA1_HASH_ALGORITHM: u8 = 1;
 
+/// The three fields an NSEC3 hash is a function of (RFC 5155 §5).
+///
+/// Borrowed, and separate from [`Nsec3`], because the hash does not depend on
+/// anything else in the record: every record of one chain carries the same
+/// three, so a caller searching a chain hashes a name once for the whole of it
+/// rather than once per record. Doing the latter cost 1 156 ms of CPU on one
+/// query (`TODO.md` #23). A zone mid-NSEC3PARAM roll publishes two chains at
+/// once, so a *set* of records is not always one chain — hence a value to
+/// compare rather than an assumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Nsec3Params<'a> {
+    pub hash_algorithm: u8,
+    pub iterations: u16,
+    pub salt: &'a [u8],
+}
+
+impl Nsec3Params<'_> {
+    /// The hash of `name` under these parameters.
+    pub fn hash(&self, name: &str) -> DnssecResult<Vec<u8>> {
+        if self.hash_algorithm != SHA1_HASH_ALGORITHM {
+            return Err(DnssecError::parse(format!(
+                "unsupported NSEC3 hash algorithm {}",
+                self.hash_algorithm,
+            )));
+        }
+        nsec3_hash(name, self.salt, self.iterations)
+    }
+}
+
 /// An NSEC3 record, with its owner hash decoded out of the first label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nsec3 {
@@ -405,42 +434,111 @@ impl Nsec3 {
         self.flags & 0x01 != 0
     }
 
+    /// What this record's hashes are computed under.
+    pub fn params(&self) -> Nsec3Params<'_> {
+        Nsec3Params {
+            hash_algorithm: self.hash_algorithm,
+            iterations: self.iterations,
+            salt: &self.salt,
+        }
+    }
+
     /// The hash of `name` under this record's parameters.
     pub fn hash(&self, name: &str) -> DnssecResult<Vec<u8>> {
-        if self.hash_algorithm != 1 {
-            return Err(DnssecError::parse(format!(
-                "unsupported NSEC3 hash algorithm {}",
-                self.hash_algorithm,
-            )));
-        }
-        nsec3_hash(name, &self.salt, self.iterations)
+        self.params().hash(name)
+    }
+
+    /// Whether this NSEC3 is the record for the name whose hash is `hash`.
+    ///
+    /// Split out of [`Nsec3::matches`] so a caller with the hash already in hand
+    /// — one per chain rather than one per record — can ask without recomputing
+    /// it. The caller owns the check that [`Nsec3::params`] agree; a hash under
+    /// other parameters answers a different question.
+    pub fn matches_hash(&self, hash: &[u8]) -> bool {
+        hash == self.owner_hash
     }
 
     /// Whether this NSEC3 is the record *for* `name`.
     pub fn matches(&self, name: &str) -> DnssecResult<bool> {
-        Ok(self.hash(name)? == self.owner_hash)
+        Ok(self.matches_hash(&self.hash(name)?))
+    }
+
+    /// Whether `hash` falls strictly inside this record's span. The hash half of
+    /// [`Nsec3::covers`], on the same terms as [`Nsec3::matches_hash`].
+    pub fn covers_hash(&self, hash: &[u8]) -> bool {
+        if hash.is_empty() || self.owner_hash.is_empty() || self.next_hashed_owner.is_empty() {
+            return false;
+        }
+        let after = hash > self.owner_hash.as_slice();
+        let before = hash < self.next_hashed_owner.as_slice();
+        if self.next_hashed_owner.as_slice() > self.owner_hash.as_slice() {
+            after && before
+        } else {
+            // The last NSEC3 wraps around to the first.
+            after || before
+        }
     }
 
     /// Whether `name`'s hash falls strictly inside this record's span.
     pub fn covers(&self, name: &str) -> DnssecResult<bool> {
-        let hash = self.hash(name)?;
-        if hash.is_empty() || self.owner_hash.is_empty() || self.next_hashed_owner.is_empty() {
-            return Ok(false);
-        }
-        let after = hash.as_slice() > self.owner_hash.as_slice();
-        let before = hash.as_slice() < self.next_hashed_owner.as_slice();
-        Ok(
-            if self.next_hashed_owner.as_slice() > self.owner_hash.as_slice() {
-                after && before
-            } else {
-                // The last NSEC3 wraps around to the first.
-                after || before
-            },
-        )
+        Ok(self.covers_hash(&self.hash(name)?))
     }
 
     pub fn has_type(&self, rtype: Rtype) -> bool {
         bitmap_has_type(&self.type_bitmap, rtype)
+    }
+}
+
+/// One name's NSEC3 hash, computed once per set of parameters it is asked for.
+///
+/// A set of NSEC3 records is normally one chain and shares one set of
+/// parameters, so this holds a single entry and refills it only on the rare
+/// change — a zone published under two chains at once during an NSEC3PARAM roll.
+/// Ask it rather than the record when the same name is tested against several
+/// records: [`Nsec3::matches`] and [`Nsec3::covers`] each recompute the salted,
+/// iterated SHA-1 the previous record just computed, which is up to
+/// `MAX_NSEC3_ITERATIONS + 1` SHA-1 passes thrown away per record
+/// (`TODO.md` #23).
+struct NameHash<'a> {
+    name: &'a str,
+    /// The parameters `hash` was computed under, and the hash. `None` until the
+    /// first record asks, and replaced whenever a record's parameters differ.
+    computed: Option<(Nsec3Params<'a>, Vec<u8>)>,
+}
+
+impl<'a> NameHash<'a> {
+    fn new(name: &'a str) -> Self {
+        NameHash {
+            name,
+            computed: None,
+        }
+    }
+
+    fn under<'r: 'a>(&mut self, record: &'r Nsec3) -> DnssecResult<&[u8]> {
+        let params = record.params();
+        match &self.computed {
+            Some((have, _)) if *have == params => {}
+            _ => self.computed = Some((params, params.hash(self.name)?)),
+        }
+        Ok(&self.computed.as_ref().expect("just filled").1)
+    }
+
+    fn matches<'r: 'a>(&mut self, record: &'r Nsec3) -> DnssecResult<bool> {
+        Ok(record.matches_hash(self.under(record)?))
+    }
+
+    fn covers<'r: 'a>(&mut self, record: &'r Nsec3) -> DnssecResult<bool> {
+        Ok(record.covers_hash(self.under(record)?))
+    }
+
+    /// Whether any of these records is the one for the name.
+    fn matched_by<'r: 'a>(&mut self, records: &'r [Nsec3]) -> bool {
+        records.iter().any(|n| self.matches(n).unwrap_or(false))
+    }
+
+    /// Whether any of these records' spans contains the name.
+    fn covered_by<'r: 'a>(&mut self, records: &'r [Nsec3]) -> bool {
+        records.iter().any(|n| self.covers(n).unwrap_or(false))
     }
 }
 
@@ -517,8 +615,9 @@ pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
     // would be the quiet degradation §4 warns about: the RFC 9276 iteration cap
     // is the likeliest cause and an operator needs to see it named.
     let mut unusable: Option<String> = None;
+    let mut hash = NameHash::new(zone);
     for nsec3 in nsec3s {
-        match nsec3.matches(zone) {
+        match hash.matches(nsec3) {
             Ok(true) => {
                 if nsec3.has_type(rt::DS) {
                     return Denial::NotProved(format!("the NSEC3 for {zone} says a DS does exist"));
@@ -542,7 +641,7 @@ pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
     // record proves the name does not exist at all — and it plainly does, since
     // we were just referred to it — so it proves nothing here.
     for nsec3 in nsec3s {
-        if nsec3.opt_out() && nsec3.covers(zone).unwrap_or(false) {
+        if nsec3.opt_out() && hash.covers(nsec3).unwrap_or(false) {
             return Denial::Proved;
         }
     }
@@ -619,8 +718,9 @@ pub fn proves_nodata(
     // answer — so this loop had the more damaging version of the bug, one bad
     // NSEC3 short-circuiting past a proof that had not been attempted yet.
     let mut unusable: Option<String> = None;
+    let mut hash = NameHash::new(qname);
     for nsec3 in nsec3s {
-        match nsec3.matches(qname) {
+        match hash.matches(nsec3) {
             Ok(true) => return nodata_bitmap(qtype, qname, |t| nsec3.has_type(t)),
             Ok(false) => {}
             Err(e) => unusable = unusable.or(Some(e.to_string())),
@@ -699,10 +799,8 @@ fn nsec3_wildcard_nodata(qname: &str, zone: &str, qtype: Rtype, nsec3s: &[Nsec3]
         Err(why) => return Denial::NotProved(why),
     };
     let wildcard = format!("*.{encloser}");
-    let Some(matching) = nsec3s
-        .iter()
-        .find(|n| n.matches(&wildcard).unwrap_or(false))
-    else {
+    let mut hash = NameHash::new(&wildcard);
+    let Some(matching) = nsec3s.iter().find(|n| hash.matches(n).unwrap_or(false)) else {
         return Denial::NotProved(format!(
             "{qname} does not exist and no NSEC3 matches the wildcard {wildcard}"
         ));
@@ -790,9 +888,10 @@ pub fn proves_wildcard_expansion(
         // wildcard's own position is what pins the expansion to the right depth.
         let next_closer =
             crate::dnssec::suffix_labels(&owner, crate::dnssec::label_count(&encloser) + 1);
+        let mut hash = NameHash::new(&next_closer);
         if nsec3s
             .iter()
-            .any(|n| !n.opt_out() && n.covers(&next_closer).unwrap_or(false))
+            .any(|n| !n.opt_out() && hash.covers(n).unwrap_or(false))
         {
             return WildcardVerdict::Proved;
         }
@@ -800,10 +899,7 @@ pub fn proves_wildcard_expansion(
         // (RFC 5155 §6). If the next closer name were one of them, `owner` lives
         // in a child zone and a referral was the honest answer — so this proves
         // nothing, without being evidence of anything either.
-        if nsec3s
-            .iter()
-            .any(|n| n.covers(&next_closer).unwrap_or(false))
-        {
+        if hash.covered_by(nsec3s) {
             return WildcardVerdict::Unjudgeable(format!(
                 "the NSEC3 covering the next closer name {next_closer} has Opt-Out set"
             ));
@@ -872,9 +968,8 @@ fn nsec3_closest_encloser_proof(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> De
         Err(why) => return Denial::NotProved(why),
     };
     let wildcard = format!("*.{encloser}");
-    let wildcard_denied = nsec3s
-        .iter()
-        .any(|n| n.covers(&wildcard).unwrap_or(false) || n.matches(&wildcard).unwrap_or(false));
+    let mut hash = NameHash::new(&wildcard);
+    let wildcard_denied = hash.covered_by(nsec3s) || hash.matched_by(nsec3s);
     if !wildcard_denied {
         return Denial::NotProved(format!("no NSEC3 accounts for the wildcard {wildcard}"));
     }
@@ -900,10 +995,7 @@ fn nsec3_closest_encloser(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Result<S
     // always exists, so the search terminates there at the latest.
     for depth in (zlabels..=qlabels).rev() {
         let candidate = crate::dnssec::suffix_labels(&qname, depth);
-        let matched = nsec3s
-            .iter()
-            .any(|n| n.matches(&candidate).unwrap_or(false));
-        if !matched {
+        if !NameHash::new(&candidate).matched_by(nsec3s) {
             continue;
         }
         if depth == qlabels {
@@ -911,10 +1003,7 @@ fn nsec3_closest_encloser(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Result<S
         }
         // The "next closer" name: one label longer than the encloser.
         let next_closer = crate::dnssec::suffix_labels(&qname, depth + 1);
-        if !nsec3s
-            .iter()
-            .any(|n| n.covers(&next_closer).unwrap_or(false))
-        {
+        if !NameHash::new(&next_closer).covered_by(nsec3s) {
             return Err(format!(
                 "no NSEC3 covers the next closer name {next_closer}"
             ));

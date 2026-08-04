@@ -199,6 +199,13 @@ no trimming in two of them.
 - Per-key counters are the wrong shape for an unbounded key space anyway. A bound
   plus a visible shortfall counter (`untracked_sources`) beats a map that is
   quietly a lie.
+- Memory is not the only thing they choose. `NsecCache::synthesize` hashed a name
+  once per cached record, for two candidate names per label of the QNAME: both
+  multipliers were the client's, and one query cost 1 124 ms of CPU with the
+  cache's one mutex held for all of it. A bound did exist —
+  `MAX_NSEC3_ITERATIONS`, on the *third* multiplier — which is exactly what made
+  the other two look like they had one. Count the multipliers, and time the worst
+  case rather than reading the loop.
 
 ## 6. Wall-clock time is not monotonic
 
@@ -474,6 +481,11 @@ git config blame.ignoreRevsFile .git-blame-ignore-revs
   because every suffix carried its own copy of the shared tail. One lowercased
   copy in an arena plus ranges into it is smaller and faster, and a linear scan
   beats the hash when a message holds a handful of distinct names.
+- A scan beside the index that would have answered it. The denial cache kept its
+  NSEC3 records in a `BTreeMap` keyed by owner hash and looked them up by walking
+  every entry and *re-deriving that key* — a salted, iterated SHA-1 per record,
+  and again per candidate name. `matches` was a `get` and `covers` a `range` the
+  whole time. Before writing a loop over a map, ask what the map is keyed by.
 - Halving a map with `select_nth_unstable` beats `min_by_key` in a loop. Cache
   eviction re-scanned the whole map for *one* victim and cloned its `String` key
   to remove it: O(n²) plus an allocation per removal, under the global lock, ~37

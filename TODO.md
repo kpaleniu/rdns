@@ -342,6 +342,12 @@ cargo bench -p rdns
 cargo bench -p rdns -- --save-baseline before   # then change something
 cargo bench -p rdns -- --baseline before        # and compare against it
 
+# The two probes, which measure one thing each and are not part of any suite.
+# Their headers carry what they measured and when; read those before quoting a
+# number. Arguments are the multipliers, so a run is a table row.
+cargo run --release -p rdns --example zone_lookup_probe -- miss 100000   # #11, #22
+cargo run --release -p rdns --example nsec3_cache_probe -- 150 115       # #23
+
 # Both daemons stop gracefully: SIGTERM or SIGINT on Unix, Ctrl-C/Ctrl-Break/
 # console-close/shutdown on Windows. They stop accepting, let the work already
 # accepted finish (5s budget), print "drained cleanly", and exit 0 — so an
@@ -601,8 +607,10 @@ are never renumbered.
 the redirect #11 produced — the zone lookup turned out to be hash-bound rather
 than cache-bound.~~ — **stale within the day, for the sixth time. #23-#26 were
 filed later on 2026-08-04** from a second architecture review, this one aimed at
-algorithmic shape rather than structure. **#23 is the one with teeth**: a query
-that costs a second of CPU on `rdnsr --dnssec-validate`, provoked and timed.
+algorithmic shape rather than structure. ~~**#23 is the one with teeth**: a query
+that costs a second of CPU on `rdnsr --dnssec-validate`, provoked and timed.~~
+**#23 is fixed** (`71126f1`, 2026-08-04) — seventh time, same day again. #22 and
+#24-#26 are open.
 
 ~~#11, a stretch goal blocked on hardware counters the development machine cannot read~~ —
 **answered no on 2026-08-04**, and the blocker did not exist: the Linux side has a
@@ -647,7 +655,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **8** | what signing turned up — the re-signing timer and its serial | done |
 | **9** | what a five-way review found: 48 defects in six groups (9a-9f) | **all done, 2026-07-27 → 2026-08-01.** The patterns became `CLAUDE.md`, which is the useful artefact; the 2,435 lines of finding text are in `git log -p TODO.md` |
 | **10** | dynamic UPDATE (RFC 2136) | **done 2026-08-03**, seven commits. Reading (`2f94124`, `1461036`), applying and the serial (`dcfe861`), authorization (`9051d4e`), dispatch and persistence (`8169f0d`). Incremental re-signing (`3b2886a`) and the journal (#7 step 6) closed it |
-| **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **open, filed 2026-08-04.** One query measured at 1 156 ms of CPU with the cache's global lock held, on `rdnsr --dnssec-validate`. The QNAME's label count is the multiplier and the client picks it; 105 ms even at `iterations = 0`. The map is already keyed by owner hash |
+| **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`71126f1`), the day after it was filed. 1 124 ms → 1.28 ms on the same probe. The fix is a type — `Nsec3Params`, the triple a hash is a function of — plus the map lookup the key was already there for, and the proof moved out from under the lock. One of the four filed boxes did not survive being checked against the code: NSEC3 hides how deep a cached name is, so the depth bound it asked for is not available to take |
 | **24** | three costs that grow with something the operator chose | **open, filed 2026-08-04.** Zone selection is O(zones per query) — 54 µs at ten thousand zones; name compression is O(n²) in the records of one message, which is where AXFR envelopes live; and an AXFR materializes the zone three times over |
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
@@ -723,16 +731,18 @@ licensed under, which this does not affect.
 ### Where to pick up next
 
 **#14 is closed.** All three candidates landed on 2026-08-02, and 14c turned
-up a live defect in #10 on the way. Everything here is a choice rather than a
-queue — **except #23, which is not.**
+up a live defect in #10 on the way. ~~Everything here is a choice rather than a
+queue — **except #23, which is not.**~~ #23 closed on 2026-08-04, so it is all a
+choice again; the numbered order below is age, not priority.
 
-> **0. #23, the NSEC3 cache scan.** Filed 2026-08-04, and the only item on this
+> ~~**0. #23, the NSEC3 cache scan.** Filed 2026-08-04, and the only item on this
 > page that a stranger can point at the server. `rdnsr --dnssec-validate` spends
 > up to a second of CPU on one query, holding the denial cache's global mutex for
 > the whole of it, because the NSEC3 lookup re-hashes the name once per cached
 > record instead of once. The map it should be asking is already keyed by the
 > hash. Timed, not argued — the numbers and the shape of the regression test are
-> in §23.
+> in §23.~~ — **fixed the day after it was filed** (`71126f1`), 1 124 ms → 1.28
+> ms. Everything below is a choice again.
 
 > **1. Push, and read the second CI run.** Everything the first one reported is
 > fixed locally and unpushed. There were two findings, not three:
@@ -1249,7 +1259,7 @@ Two directions, and the first is much safer than the second.
 Re-measure with `rdns/examples/zone_lookup_probe.rs`, which is what produced the
 numbers above and prints nothing that would need re-deriving.
 
-### 23. `NsecCache::synthesize` hashes once per cached record, under one mutex — filed 2026-08-04
+### 23. `NsecCache::synthesize` hashes once per cached record, under one mutex — **fixed 2026-08-04** (`71126f1`)
 
 **A remote CPU-exhaustion vector in `rdnsr --dnssec-validate`, provoked rather
 than argued.** One query measured at **1 156 ms** of CPU, with the cache's global
@@ -1289,24 +1299,82 @@ to a zone they signed themselves — and the cost is **linear in what is cached*
 so a full table is not a precondition, only the worst case. At `iterations = 0`
 it is still ~10 queries per second to saturate a core.
 
-- [ ] **Hash the name once per (salt, iterations), then use the map.** `matches`
+- [x] **Hash the name once per (salt, iterations), then use the map.** `matches`
       becomes `nsec3s.get(&hash)`, `covers` becomes
       `nsec3s.range(..hash).next_back()` — the same shape `zone::nsec3_covering`
       already uses on the authoritative side. The per-record `hash()` stays for
       the handful of records that arrive in one answer, where the loop is bounded
       by the message.
-- [ ] **Bound the candidate-name walk by the zone's depth, not the QNAME's.** A
+
+      Done as a type: `Nsec3Params` is the borrowed (algorithm, iterations, salt)
+      a hash is a function of, and `matches_hash`/`covers_hash` take a hash the
+      caller already has. §17's rule — the check that a caller "should" hash once
+      is a check; the type is what makes hashing per record stop being the
+      obvious spelling. One wrinkle the plan did not have: the map holds every
+      chain the zone has published, so a range walk skips records under other
+      parameters instead of stopping at them. A zone mid-NSEC3PARAM roll has two.
+- [x] ~~**Bound the candidate-name walk by the zone's depth, not the QNAME's.** A
       closest-encloser proof cannot reach further than the deepest cached record,
-      so 118 labels of candidate names is work that was never going to match.
-- [ ] **Do not hold the cache mutex across synthesis.** Clone the candidate
-      proofs out under the lock, or take the lock per lookup.
-- [ ] **Regression test in the shape of the probe:** fill the cache, time one
+      so 118 labels of candidate names is work that was never going to match.~~
+      **Wrong as written, and the reasoning is why.** NSEC3 publishes hashes, so
+      the cache does not know how deep any cached name is — that is the point of
+      the record. The bound is not available to be taken.
+
+      Walking *down* from the apex instead, and stopping at the first ancestor
+      with no record, would be a real bound. It is also wrong: a responder's
+      closest-encloser proof carries the encloser's own record and none of its
+      ancestors', so a cache holding a deep encloser need hold nothing above it,
+      and the walk would stop at the first name nobody had asked about. It would
+      cost hits, not correctness — but it would cost them for nothing, because
+      `proves_nxdomain` re-derives the encloser from the QNAME (RFC 5155 §8.3)
+      and cannot do otherwise for the same reason. The QNAME's label count is a
+      multiplier in any validator; what was wrong here was multiplying it by the
+      cache.
+
+      What landed is the §8.3 walk, stopping at the first match, and three names
+      hashed per chain instead of two per label against all 256 records.
+- [x] **Do not hold the cache mutex across synthesis.** Clone the candidate
+      proofs out under the lock, or take the lock per lookup. — the first:
+      `Gathered` is what the lookup found, and `proves_nodata`/`proves_nxdomain`
+      judge it with the guard dropped. The verdict was never the cache's to
+      reach.
+- [x] **Regression test in the shape of the probe:** fill the cache, time one
       `synthesize`, assert a ceiling with the factor-of-a-hundred headroom §10
-      asks for. It fails against today's code — watched.
+      asks for. It fails against today's code — watched. — landed as a *ratio*
+      instead (8 cached proofs against 256), which §10 prefers where one exists:
+      the complexity class is the finding, and a ceiling would also have to be a
+      number about this machine. Watched failing at 31.6×.
+
+      The pass turned up the more useful gap: **NSEC3 NXDOMAIN synthesis had no
+      test at all**, which is the path the fix rewrote most. Three added, and run
+      against both the old implementation and the new — they agree, which is what
+      makes them coverage rather than a description of the rewrite (§1).
 
 `dnssec_denial::nsec3_closest_encloser` has the same shape bounded by one
 message's records rather than by a cache, so it is not this — but it is the same
-mistake at a survivable size, and worth fixing in the same pass.
+mistake at a survivable size, and worth fixing in the same pass. **Done in the
+same commit**: `NameHash` holds one name's hash per parameter set, so a set of
+records is scanned with one hash rather than one per record.
+
+**Measured before and after** with `rdns/examples/nsec3_cache_probe.rs`, which is
+kept — the numbers in the table above came from a probe that was not, and had to
+be rebuilt to check them. Release, 256 cached records, per `synthesize`:
+
+| iterations | QNAME | before | after |
+|---|---|---|---|
+| 0 (RFC 9276's recommendation) | 117 labels, 243 octets | 102 ms | 237 µs |
+| 10 | 117 labels | 171 ms | 307 µs |
+| 150 (`MAX_NSEC3_ITERATIONS`) | 10 labels, 29 octets | 84 ms | 95 µs |
+| 150 | 117 labels | 1 124 ms | 1.28 ms |
+
+**What is left, and why it is not the hash.** At iterations 0 the walk still
+costs 2.1 µs per label, all of it `suffix_labels` rebuilding the name — a
+`canonical_name` copy, a `Vec<&str>` of its labels, a join and a `format!`, per
+ancestor. The 150-iteration column adds ~7.6 µs per label on top, which is the
+150 extra SHA-1 rounds the zone asked for and RFC 9276 §3.1 asks it not to. So
+the residual worst case is 1.28 ms, ~900× down and still linear in a label count
+the client picks; taking it further is #25's question about a name that can yield
+a suffix without allocating, not this one's.
 
 ### 24. Three costs that grow with something the operator chose — filed 2026-08-04
 
