@@ -52,6 +52,17 @@ seven-file description of what the code actually does, with the RFC deviations
 and gaps collected in one table. Also still true: **CI runs now, and its first
 run failed** (the test's fault, fixed locally, unpushed).
 
+**A second review, 2026-08-04, aimed at algorithmic shape rather than
+structure**, filed **#23-#26**. The one to read first is **#23**: `rdnsr
+--dnssec-validate` spends up to a second of CPU on a single query — timed, not
+argued — because the aggressive-denial cache re-hashes the queried name once per
+cached NSEC3 record while holding one global mutex. #24 is three costs that grow
+with a number the operator chose (zones served, records per message, zone size),
+#25 is eight small per-answer items on paths #9e already measured, and #26 is
+another crop of §7 duplicates — one of which, 26j, is a correction to this page:
+the wrecked string literal #19h records as fixed had never been fixed, and now
+is, with the assertion that would have caught it.
+
 Build and test with the four commands at the top of `CLAUDE.md`;
 `cargo bench -p rdns` is the fifth. **Do not push** — commit locally and leave
 it; every push spends the owner's GitHub Actions minutes on a private
@@ -135,18 +146,31 @@ quietly — `git blame` refuses a revision it cannot resolve.
 
 | | Windows | Linux |
 |---|---|---|
-| `rdns` lib | 655 | 633 |
+| `rdns` lib | 684 | **687** |
 | allocations | 1 | 1 |
 | no_input_panics | 1 | 1 |
-| `rdnsd` | 94 | **106** |
-| `rdnsr` | 3 | 3 |
-| **total** | **754** | **744** |
+| `rdnsd` | 101 | **114** |
+| `rdnsr` | 6 | 6 |
+| **total** | **793** | **809** |
 
-**The Windows column is current and the Linux one is not.** Linux was last
+~~**The Windows column is current and the Linux one is not.** Linux was last
 measured before #13 landed; the gap between the columns is the sixteen
 `#[cfg(unix)]` tests below plus whatever has been added since, and it is no
 longer safe to read it as only the former. Re-run the Linux recipe under "Running
-the Linux half by hand" before quoting the right-hand column.
+the Linux half by hand" before quoting the right-hand column.~~
+
+**Both columns re-measured 2026-08-04, on the same tree, minutes apart** — the
+numbers above replace the stale pair (655/633, 94/106, 754/744). The gap is
+**16**, and it is exactly the sixteen `#[cfg(unix)]` tests described below: +3 in
+the library (the mode checks) and +13 in `rdnsd` (the control socket). That the
+difference is now *only* the cfg-gated tests is the check worth making, and it is
+the one §1 of `CLAUDE.md` says a differing count is the tell for — the previous
+pair had Windows *ahead*, which cannot be right and was the stale column showing.
+
+The Linux run was `cargo test --workspace` **on the mount**, against the warning
+under "Running the Linux half by hand" — which turns out not to apply to the
+three tests it is about; see the note there. `cargo clippy --workspace
+--all-targets` is clean there too, which is the half Windows cannot check at all.
 
 **Two of those single tests are worth more than their count suggests.**
 `allocations` reports **nineteen** measurements, **thirteen** of them exact
@@ -170,8 +194,21 @@ underneath. Every exact assertion in `rdns/tests/allocations.rs` (0, 1, 2, 2, 3,
 3 and 4) reads the same on the Linux side.
 
 `cargo clippy --workspace --all-targets` and `cargo fmt --all --check` are clean
-**on Windows**; the Linux image used for the Linux runs has no clippy package,
-so that half is checked by CI now and was checked nowhere before.
+**on Windows**; ~~the Linux image used for the Linux runs has no clippy package,
+so that half is checked by CI now and was checked nowhere before.~~
+
+**Corrected 2026-08-04: the Linux image has clippy, and always may have.**
+`cargo clippy --version` there is `clippy 0.1.97`, `cargo-clippy` and
+`clippy-driver` are both in `/usr/sbin`, and
+`cargo clippy --workspace --all-targets` on the repository **is clean** —
+which is a stronger statement than the Windows run can make, because it is the
+only one that compiles `rdnsd/src/control.rs` and the rest of the `#[cfg(unix)]`
+half at all. The claim went into this file, into "Where to pick up next" and into
+one more place below without anyone typing the command; `CLAUDE.md` §1's own Linux
+recipe has *contained* `cargo clippy` the whole time, so the two documents
+disagreed and neither was checked. §4, again, and the same shape as #26j: a
+statement about a tool, written from memory of a failure rather than from running
+it.
 
 **Errors are typed in the library and `anyhow` in the binaries.** The convention
 used to run the other way round. `rdns::error` holds seven types (`WireError`,
@@ -460,8 +497,21 @@ Three things to know before trusting a run there:
   `chmod` is a no-op without the `metadata` mount option, so every
   permission-related test would either pass or fail for reasons that have
   nothing to do with the code. `~` is ext4 and behaves.
-- **That image has no `clippy`.** `cargo clippy` fails with "no such command", so
-  the lint half of the four commands is Windows-only for now.
+
+  **Narrowed 2026-08-04, having relied on it:** the three permission tests do
+  *not* depend on this, because all three write to `std::env::temp_dir()` —
+  `/tmp`, ext4 — rather than beside the source
+  (`dnssec_key.rs:899`, `persist.rs:289`, `:334`). A `--workspace` run from
+  The mount is therefore trustworthy today, and the advice stands only for build
+  speed and for the next test that writes into the tree. Worth the two lines
+  because the warning as written says a run I made was worthless, and it was
+  not — the reason is a property of those tests, so it is where the tests can
+  change.
+- ~~**That image has no `clippy`.** `cargo clippy` fails with "no such command", so
+  the lint half of the four commands is Windows-only for now.~~ **Wrong, corrected
+  2026-08-04.** It has `clippy 0.1.97`, and the workspace is clean under it. See
+  "Current state" for how the claim survived: it is the only statement here about
+  a *tool* rather than about the code, and nothing that reads this page runs it.
 - **The copy is a copy.** Re-sync before each run or you are testing whatever was
   there last time; the tar line above is cheap enough to repeat.
 
@@ -579,9 +629,12 @@ from the code (`ixfr.rs:16` points at "#7 step 6") and from each other, so they
 are never renumbered.
 
 **#14 and #16 are closed; #15 is withdrawn; #7 and #10 closed on 2026-08-03.
-**One thing is open** and the table is where it is: **#22**, filed 2026-08-04 as
+~~**One thing is open** and the table is where it is: **#22**, filed 2026-08-04 as
 the redirect #11 produced — the zone lookup turned out to be hash-bound rather
-than cache-bound.
+than cache-bound.~~ — **stale within the day, for the sixth time. #23-#26 were
+filed later on 2026-08-04** from a second architecture review, this one aimed at
+algorithmic shape rather than structure. **#23 is the one with teeth**: a query
+that costs a second of CPU on `rdnsr --dnssec-validate`, provoked and timed.
 
 ~~#11, a stretch goal blocked on hardware counters this machine cannot read~~ —
 **answered no on 2026-08-04**, and the blocker did not exist: the Linux side has a
@@ -626,6 +679,10 @@ it, and the rule it became in `CLAUDE.md`:
 | **8** | what signing turned up — the re-signing timer and its serial | done |
 | **9** | what a five-way review found: 48 defects in six groups (9a-9f) | **all done, 2026-07-27 → 2026-08-01.** The patterns became `CLAUDE.md`, which is the useful artefact; the 2,435 lines of finding text are in `git log -p TODO.md` |
 | **10** | dynamic UPDATE (RFC 2136) | **done 2026-08-03**, seven commits. Reading (`2f94124`, `1461036`), applying and the serial (`dcfe861`), authorization (`9051d4e`), dispatch and persistence (`8169f0d`). Incremental re-signing (`3b2886a`) and the journal (#7 step 6) closed it |
+| **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **open, filed 2026-08-04.** One query measured at 1 156 ms of CPU with the cache's global lock held, on `rdnsr --dnssec-validate`. The QNAME's label count is the multiplier and the client picks it; 105 ms even at `iterations = 0`. The map is already keyed by owner hash |
+| **24** | three costs that grow with something the operator chose | **open, filed 2026-08-04.** Zone selection is O(zones per query) — 54 µs at ten thousand zones; name compression is O(n²) in the records of one message, which is where AXFR envelopes live; and an AXFR materializes the zone three times over |
+| **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
+| **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
 | **11** | data layout and CPU cache friendliness | **answered no 2026-08-04.** Measured with cachegrind: a miss costs 2,786 instructions and under 0.08 D1 misses, a hit 1,052 and 6.4 — all L2-resident, zero LL misses either way. There is no pointer chase to remove. The `perf` blocker it carried for months was checked and did not exist; the probe is `rdns/examples/zone_lookup_probe.rs` |
 | **14** | three candidates #13 left on the table: `Serial`, QR as a type, sealing `RecordData` | **all three done 2026-08-02**, one commit each. 14a removed the second copy of RFC 1982 §3.2 and made `a > b` on two serials a compile error; 14b put all three socket entry points behind one `Request` door; 14c sealed `RecordData` into its own module — and, by asking what invariant it actually holds, found that a legal RFC 2136 UPDATE could not be parsed at all. 14a and 14b are preventative and say so; 14c's finding is under #10, with a regression test watched failing |
@@ -699,7 +756,15 @@ licensed under, which this does not affect.
 
 **#14 is closed.** All three candidates landed on 2026-08-02, and 14c turned
 up a live defect in #10 on the way. Everything here is a choice rather than a
-queue.
+queue — **except #23, which is not.**
+
+> **0. #23, the NSEC3 cache scan.** Filed 2026-08-04, and the only item on this
+> page that a stranger can point at the server. `rdnsr --dnssec-validate` spends
+> up to a second of CPU on one query, holding the denial cache's global mutex for
+> the whole of it, because the NSEC3 lookup re-hashes the name once per cached
+> record instead of once. The map it should be asking is already keyed by the
+> hash. Timed, not argued — the numbers and the shape of the regression test are
+> in §23.
 
 > **1. Push, and read the second CI run.** Everything the first one reported is
 > fixed locally and unpushed. There were two findings, not three:
@@ -716,9 +781,11 @@ queue.
 >   complained about.
 >
 > Five jobs have still never actually been read: msrv (1.95), deny, the container
-> image, the `dhat-heap` feature build, and clippy on *Linux* — the Linux
-> image has no clippy package, so that half had only ever run on Windows. They
-> may have passed silently; nobody has looked.
+> image, the `dhat-heap` feature build, and clippy on *Linux* — ~~the Linux
+> image has no clippy package, so that half had only ever run on Windows~~
+> (**wrong; corrected 2026-08-04 — it has clippy, and the workspace is clean
+> under it, `#[cfg(unix)]` half included**). They may have passed silently;
+> nobody has looked.
 >
 > **2. #17, the TCP length prefix** — **the only confirmed bug on this page**,
 > and the shortest item on it. A TSIG-signed answer whose serialized form lands
@@ -1212,6 +1279,296 @@ Two directions, and the first is much safer than the second.
 
 Re-measure with `rdns/examples/zone_lookup_probe.rs`, which is what produced the
 numbers above and prints nothing that would need re-deriving.
+
+### 23. `NsecCache::synthesize` hashes once per cached record, under one mutex — filed 2026-08-04
+
+**A remote CPU-exhaustion vector in `rdnsr --dnssec-validate`, provoked rather
+than argued.** One query measured at **1 156 ms** of CPU, with the cache's global
+mutex held for all of it.
+
+The NSEC half of `nsec_cache.rs` is right: `matching_nsec` (`:600`) is a
+`BTreeMap` lookup by canonical sort key, and `covering_nsec` is a range query.
+The NSEC3 half in the same file is not. `synthesize_nodata` (`:645`) and
+`synthesize_nxdomain_nsec3` (`:732`) scan **every cached record** and call
+`Nsec3::matches` / `covers`, each of which recomputes the salted, iterated SHA-1
+of the name (`dnssec_denial.rs:420-426`) — and `matches` returning false is
+followed by `covers` hashing the same name again. The hash is a function of
+(name, salt, iterations); every record in one zone's chain shares the salt and
+the iteration count, and `nsec3s` is **already keyed by owner hash**, so the
+whole scan is one hash plus a `get` and a `range`.
+
+The multiplier is the QNAME's label count, which the client chooses:
+`synthesize_nxdomain_nsec3` builds two candidate names per label between the zone
+and the name, and walks all 256 records (`MAX_PROOFS_PER_ZONE`) for each.
+
+Measured on Windows, release, 256 cached records, every call returning `None` —
+which is the worst case *and* what a random-name flood produces:
+
+| iterations | QNAME | one `synthesize` |
+|---|---|---|
+| 0 (RFC 9276's recommendation) | 249 octets, 118 labels | **105 ms** |
+| 10 | 249 octets | **176 ms** |
+| 150 (`MAX_NSEC3_ITERATIONS`) | 33 octets, 10 labels | **102 ms** |
+| 150 | 249 octets | **1 156 ms** |
+
+Reachable: `rdnsr` calls `synthesize` on every query before consulting the answer
+cache (`rdnsr/src/main.rs:1227`), and holds `self.zones` — one `Mutex` for the
+whole cache — across it, so the cost is also every other thread's cache lookups
+blocked behind it. Filling the table costs the attacker a denial per few records
+— a negative answer carries about three NSEC3s, so on the order of ninety queries
+to a zone they signed themselves — and the cost is **linear in what is cached**,
+so a full table is not a precondition, only the worst case. At `iterations = 0`
+it is still ~10 queries per second to saturate a core.
+
+- [ ] **Hash the name once per (salt, iterations), then use the map.** `matches`
+      becomes `nsec3s.get(&hash)`, `covers` becomes
+      `nsec3s.range(..hash).next_back()` — the same shape `zone::nsec3_covering`
+      already uses on the authoritative side. The per-record `hash()` stays for
+      the handful of records that arrive in one answer, where the loop is bounded
+      by the message.
+- [ ] **Bound the candidate-name walk by the zone's depth, not the QNAME's.** A
+      closest-encloser proof cannot reach further than the deepest cached record,
+      so 118 labels of candidate names is work that was never going to match.
+- [ ] **Do not hold the cache mutex across synthesis.** Clone the candidate
+      proofs out under the lock, or take the lock per lookup.
+- [ ] **Regression test in the shape of the probe:** fill the cache, time one
+      `synthesize`, assert a ceiling with the factor-of-a-hundred headroom §10
+      asks for. It fails against today's code — watched.
+
+`dnssec_denial::nsec3_closest_encloser` has the same shape bounded by one
+message's records rather than by a cache, so it is not this — but it is the same
+mistake at a survivable size, and worth fixing in the same pass.
+
+### 24. Three costs that grow with something the operator chose — filed 2026-08-04
+
+None of these is wrong on the zone this repo tests with. All three grow with a
+number an operator sets and nothing measures.
+
+#### 24a. Zone selection is a linear scan of the zone map, per query
+
+`rdnsd/src/answer.rs:548`. The allocations were taken out of it and the
+O(zones) was left; `Zones::matching_key` (`zones.rs:407`), `Zones::matching`
+(`:415`) and `answer_transfer`'s apex lookup (`main.rs:1222`) are three more
+copies of the same scan.
+
+| zones | `find_zone_for_query` | a suffix walk over the same map |
+|---|---|---|
+| 1 | 15.7 ns | 20.0 ns |
+| 100 | 540 ns | 23.1 ns |
+| 1 000 | 7.3 µs | 22.9 ns |
+| 10 000 | 53.7 µs | 20.4 ns |
+
+At a thousand zones, choosing the zone costs more than the rest of the query
+including both syscalls (#9e: 522 ns of library work, ~4 µs of `sendto`+`recvfrom`).
+
+The cause is a type. `HashMap<String, Zone>` is keyed by `zone.origin().to_string()`
+in whatever case the zone file was written in (`zones.rs:378`), so nothing can
+hash a QNAME against it and every lookup has to compare case-insensitively
+against every key. `utils::NameKeyBuf` exists for exactly this and is not used
+here — `CLAUDE.md` §17's own prediction, unclaimed.
+
+- [ ] Key the map on `NameKeyBuf`. `matching_key`'s case-insensitive scan then
+      has nothing left to do, and `insert`'s "remove by the key already there"
+      dance goes with it.
+- [ ] Replace the scan with the parent walk `Zone::name_kind_of_key` already
+      does: at most 127 hash lookups, in practice four, independent of how many
+      zones are served.
+
+#### 24b. Name compression is quadratic in the records of one message
+
+`compression.rs:153`. `lookup` is a linear scan of `seen`, which grows by one
+entry per label per distinct name. The doc comment justifies it with "one message
+holds a handful of distinct names" — true of a query response, false of every
+other caller of `to_bytes`.
+
+| distinct names in the message | ns/message | ns/record |
+|---|---|---|
+| 25 | 2 359 | 94 |
+| 100 | 14 522 | 145 |
+| 400 | 148 464 | 371 |
+| 800 | 572 332 | **715** |
+
+An AXFR envelope targets 16 KiB (`transfer.rs:29`), which is 300-500 records, so
+transfers sit in the quadratic region — and it worsens in exactly the direction
+anyone tuning envelope size would push.
+
+- [ ] Bucket `seen` by something cheap (first label length, or its first byte)
+      before comparing, or put the suffix map back as a hash over ranges into the
+      arena — the arena is what made the old `HashMap<String, u16>` expensive,
+      not the hashing.
+- [ ] Whatever is done, assert the shape rather than a time: ns/record for 25
+      names against 800 is a ratio and does not care what else is running (§10).
+
+#### 24c. An AXFR materializes the zone three times over
+
+`transfer::axfr_messages` clones every record into a `Vec<ResourceRecord>`,
+`pack_transfer_messages` moves those into a `Vec<DnsMessage>`, and `rdnsd` builds
+**all** frames before writing any (`main.rs:1262-1300`) — each frame a `Vec` with
+64 KiB of capacity (see 25b). For a million-record zone that is the zone, plus the
+zone again as messages, plus ~2 500 × 64 KiB of frame capacity, per concurrent
+transfer. ACL-gated, so not pre-auth; a secondary reconnecting in a loop
+multiplies it.
+
+- [ ] Make the envelope sequence an iterator the writer pulls from, so at most
+      one envelope is materialized at a time. The framing and signing loop already
+      has the right shape for it.
+
+### 25. Per-answer waste on paths already measured — filed 2026-08-04
+
+Small individually. Together they are a large fraction of the 455 ns (Windows)
+that #9e measured for one library-side answer. Absolute nanoseconds on this
+machine moved between runs — the same `to_bytes` read 106 ns in one run and
+250 ns in three later ones — so **every number below is a delta or a ratio**, and
+anything re-measured should be too.
+
+- [ ] **25a. The answer path walks the zone three times to answer once.**
+      `answer.rs:282-330`: `delegation_for` (an ancestor walk), then `name_kind`
+      (another), then `zone.query(...).is_empty()` — which recomputes
+      `name_kind_of_key` internally and allocates a `Vec` to answer a boolean —
+      then `add_answer` calls `query` a third time for the records it wanted all
+      along. `Zone::query` alone is 61-69 ns; what `resolve_in_zone` +
+      `add_answer` do is 190-215 ns. Have `name_kind` hand back the positions it
+      found, or give `of_type` an iterator form.
+- [ ] **25b. Every TCP reply allocates and zeroes 64 KiB.** `main.rs:1119`,
+      `:1267`, `:1625` call `to_bytes_within(u16::MAX)`, and
+      `to_bytes_within_buf` does `clear()` then `resize(max_len, 0)` — a full
+      memset of the ceiling, plus a fresh 64 KiB allocation in the non-`buf`
+      form. Three runs: 591/632/618 ns against 227/252/255 ns for the same work
+      into a live `[u8]`. The zeroing buys nothing, since the caller reads only
+      `..n`. The UDP path already keeps a per-worker scratch buffer
+      (`main.rs:2070`); the TCP path is the caller §13 stopped one short of.
+- [ ] **25c. The latency histogram costs eight atomic RMWs per answer.**
+      `metrics.rs:213` increments every cumulative bucket at or above the sample,
+      so a healthy 50 µs answer touches all eight, plus count and sum, on shared
+      cache lines. `observe_latency_ms` + `count_response` is 46.7 ns; bucketing
+      once and cumulating at scrape time — what every Prometheus client library
+      does, for identical output — is 12.5 ns. Related and cheaper still:
+      `DnsMetrics` is **26 `Arc` fields, 24 of them `Arc<AtomicU64>`** (counted,
+      not estimated), so it is 26 allocations and 26 refcount operations per
+      clone where one `Arc<Inner>` with plain fields is the same public API.
+- [ ] **25d. Canonical ordering allocates a `String` per label, per comparison.**
+      `dnssec_denial.rs:47` and `:77` both go through `reversed_labels`, which
+      builds a `Vec<String>`. `canonical_name_cmp` is 302-324 ns and
+      `canonical_sort_key` 176-185 ns, against 52-56 ns for the same answer from
+      `rsplit('.')` and `Iterator::cmp` over folded bytes. `Nsec::covers` calls
+      the first three times, so a validating resolver pays ~1 µs and twelve
+      allocations per candidate NSEC; `Zone::reindex` pays the second per record.
+- [ ] **25e. A cache lookup allocates its key.** `cache.rs:93` —
+      `HashMap<(String, Qtype), _>` has no `Borrow` for a tuple, so
+      `get_validated` calls `ascii_lowered` (unconditional `String`) on every
+      lookup. `NameKeyBuf`'s own doc comment describes the fix and the map does
+      not use it; a two-level map, or `HashMap<NameKeyBuf, …>` with the type
+      beside the entry, makes the read path allocation-free. Same shape in
+      `negative_cache.rs:86` and `nsec_cache.rs:69`.
+- [ ] **25f. The rate limiter takes two global mutexes per datagram.**
+      `security.rs:125` locks `last_cleanup` to compare a timestamp before
+      `should_allow` locks `buckets` at all. The first wants an `AtomicU64` with a
+      compare-and-swap on the rare path. The second is one lock for every UDP
+      worker — not the bottleneck at 4 µs/query of syscall, but it is the ceiling,
+      and it should be said out loud somewhere rather than discovered.
+- [ ] **25g. The one loop in this tree with a SIMD shape the code prevents.**
+      `utils::ascii_lowered_cow` and `absolute_lowered` decide whether to copy
+      with `name.bytes().any(|b| b.is_ascii_uppercase())`. LLVM will not vectorize
+      a loop with a data-dependent exit, so that test runs **one byte per
+      iteration** while the `make_ascii_lowercase` it is trying to avoid runs 32
+      — both visible in the same function's disassembly (`movzbl`/`add
+      $0xbf`/`cmp $0x1a`/`jae` against `movdqu`/`paddb`/`pminub`/`pcmpeqb`).
+      `write_name` shows the contrast twice over: its identical `.` scan
+      vectorizes where it is written as `.count()` and stays scalar where it is
+      written as a search. Written as a branchless OR-reduction it is 3.25 → 2.14
+      ns at 16 octets and **61.1 → 7.9 ns at 200** — and the name length is the
+      client's choice, which is the half worth caring about. Three lines, no
+      `unsafe`, no intrinsics.
+- [ ] **25h. `zone::nsec3_covering` allocates its range bound.**
+      `zone.rs:232` — `range(..hash.to_vec())` where `range::<[u8], _>(..hash)`
+      is the same call without the `Vec`.
+
+**Checked and not worth doing**, recorded so the next pass does not re-derive it
+(§10's rule about negative results):
+
+- **`lto = "fat"` + `codegen-units = 1`.** Measured: zone lookup 195 → 190 ns,
+  serialization worse in the same run, and run-to-run variance on this machine is
+  larger than either. Not a recommendation in either direction until it is
+  measured somewhere quieter.
+- **SHA-1 and SHA-256 already reach SHA-NI** at run time through `cpufeatures`
+  (`sha1 0.10`'s `x86.rs` backend). There is nothing to enable.
+- **`std` is already wide where it matters**:
+  `<[u8]>::eq_ignore_ascii_case_chunks::<16>` is 16 bytes per iteration, so
+  `is_at_or_under`, `names_equal` and the compressor's suffix comparison are
+  vectorized already.
+- **base32hex, the NSEC3 type bitmap and the wire parser** look like SIMD
+  candidates and are not: twenty-byte payloads, tens of bytes, and a
+  branch-dense per-record state machine respectively.
+
+### 26. Helpers written twice, and hand-rolls with a standard spelling — filed 2026-08-04
+
+The §7 family again, found by reading rather than by grepping for a name — which
+is why #13b's sweep did not turn them up.
+
+| | what | note |
+|---|---|---|
+| **26a** | two `fn hex`, byte-identical | `rfc5011.rs:778`, `zone_writer.rs:324`, both `bytes.iter().map(\|b\| format!("{b:02X}")).collect()` — **one heap allocation per output byte**. `rdnsctl dump` of a signed zone runs it over every DS digest and NSEC3 salt |
+| **26b** | two base32hex decoders that disagree | `zone::parse_base32_hex` (`:619`) against `dnssec_denial::base32hex_decode` (`:226`). The first does `to_uppercase()` — the Unicode fold §8 forbids, plus an allocation — and a linear `position()` over the 32-byte alphabet per character; the second is a range match. They also disagree about `=` padding |
+| **26c** | two `parse_hex` | `rfc5011.rs:764`, `zone.rs:604`. The second collects a `Vec<char>` (four bytes per input character) to index pairs, where `as_bytes().chunks_exact(2)` does it in place |
+| **26d** | two `fn base64` | `rfc5011.rs:781`, `zone_writer.rs:320`, identical one-line wrappers |
+| **26e** | `ancestors_of` / `ancestors` allocate a `String` per ancestor | `zone_signer.rs:785` (a `Vec<&str>`, then a `join` **and** a `format!` per ancestor) and `resolver.rs:482`. Ancestors are suffix slices of the input. `Layout::of` runs it once per name and `chain_names` runs it again per name, at every load and every re-signing. Flagged as "the next function to look at" by the 2026-08-03 review and still there |
+| **26f** | `resolver::normalize` allocates unconditionally | `resolver.rs:1779`; `utils::absolute_lowered` returns a `Cow` and borrows the common case. A straggler of #13b |
+| **26g** | `canonical_name_cmp` hand-rolls `Iterator::cmp` | `dnssec_denial.rs:50` — `for i in 0.. { match (a.get(i), b.get(i)) … }` with an `unreachable!()` to close it |
+| **26h** | `utils::record_type_name` returns `String` for a constant | thirteen known mnemonics, each `"A".to_string()`. `&'static str` with a `Cow` for the `TYPEnnn` arm costs nothing and removes an allocation per record written |
+| **26i** | `dnssec_denial.rs:189` walks a bitmap byte bit by bit | `trailing_zeros` is the idiom. Writer-side only, so smallest here |
+
+#### 26j. The wrecked string literal 19h says it fixed is still wrecked — **fixed 2026-08-04**
+
+**A correction to this page, in place (`CLAUDE.md` §11).** #19h's table records
+"a wrecked `\` continuation in an operator-facing error" as **done**, and
+`85c864c`'s message says so too. It is not done. The commit moved the twenty-two
+spaces from one side of a word to the other:
+
+```
+85c864c^:  ...to carry its high                      bits (RFC 6891 §6.1.3)
+85c864c :  ...to carry                      its high bits (RFC 6891 §6.1.3)
+bb4b812 :  ...to carry                      its high bits (RFC 6891 §6.1.3)
+```
+
+`rdns/src/lib.rs:1790`. The defect is cosmetic; **the reason it is filed here
+rather than fixed silently is that it is §4 exactly** — a claim about the result
+of a change, written without opening the result, which then propagated into a
+commit message, this page, and `docs/ARCHITECTURE_REVIEW.md`'s status table. The
+same three places said the same wrong thing because each copied the one before.
+
+- [x] Fix the literal, and correct the status in `docs/ARCHITECTURE_REVIEW.md`'s
+      table rather than deleting the row.
+
+**Done in the commit carrying this line**, and the interesting half is the test.
+`test_extended_rcode_without_opt_is_an_error` asserted
+`err.to_string().contains("OPT record")` — true of the broken message and of the
+fixed one, which is why a green suite covered this for months and why *reading*
+the row was never going to find it (§1: a test that agrees with the code is not
+evidence). It now asserts the whole message has no double space, watched failing
+against the old literal with the leaked indentation printed:
+
+```
+a wrapped literal leaked its indentation: malformed the header: extended RCODE 16
+needs an EDNS0 OPT record to carry                      its high bits (RFC 6891 §6.1.3)
+```
+
+That assertion is the general guard, not a guard for this one string: any `\`
+continuation in this crate that loses its backslash now fails a test rather than
+reaching an operator.
+
+#### What this pass checked and found nothing wrong with
+
+- **The wire parser's bounds**, again, from the other direction: everything
+  `no_input_panics` covers still checks before slicing.
+- **`cache::evict_oldest`.** The `select_nth_unstable` rewrite and its tie
+  handling are right, and the comment about whole-second expiries is the reason
+  a naive `retain` would empty the cache.
+- **`Zone`'s index, chains and non-terminals**, and `has_wildcards` — the
+  #11/#22 work holds up; the miss path is three hash lookups and no allocation.
+- **`security::ResponseLimiter` and the transfer ACL.** Bounded, with the
+  direction of failure written down.
+- **`shutdown`, `readiness`, `journal`.** Not re-read in depth; nothing in the
+  paths that touch them contradicted #7 or #9d.
 
 ### 12. Pre-authentication panics — audited 2026-08-01
 
@@ -3014,7 +3371,7 @@ both of which assume you know what it does.
 
 | item | where | note |
 |---|---|---|
-| a wrecked `\` continuation in an operator-facing error | `lib.rs:1787` | 22 literal spaces mid-sentence, in the extended-RCODE message. Exactly what `CLAUDE.md` §12 predicts: rustfmt does not touch string literals, so a careless search-and-replace wrecks a continuation and nothing notices |
+| a wrecked `\` continuation in an operator-facing error — **this row was wrong; really fixed 2026-08-04, see 26j** | `lib.rs:1787`, now `:1790` | 22 literal spaces mid-sentence, in the extended-RCODE message. Exactly what `CLAUDE.md` §12 predicts: rustfmt does not touch string literals, so a careless search-and-replace wrecks a continuation and nothing notices. **This row said "done" and was wrong.** `85c864c` moved the spaces from before `bits` to before `its` and left the literal broken; the claim then reached the commit message, this table and `docs/ARCHITECTURE_REVIEW.md`'s status table, each copying the one before (`CLAUDE.md` §4) |
 | `pub mod bench` is empty in a non-test build | `lib.rs:15`, `bench.rs` | the file is entirely `#[cfg(test)] mod benches`, so the library exports an empty public module. Should be `#[cfg(test)] mod bench;`. The *filename* is kept on purpose (§10 argues from `bench_logger_throughput`); the `pub` is not |
 | `impl EdnsHeader {}` | `lib.rs:1352` | an empty impl block |
 | `// TODO: TryToBytes and others` | `dname.rs:118` | the only bare `TODO` left in the tree. `dname.rs:237` records that the *other* one was deleted-rather-than-done, with the reasoning; this one deserves the same treatment either way |

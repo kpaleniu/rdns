@@ -1787,7 +1787,8 @@ impl DnsMessage {
             return Err(WireError::malformed(
                 "the header",
                 format!(
-                    "extended RCODE {rcode} needs an EDNS0 OPT record to carry                      its high bits (RFC 6891 §6.1.3)"
+                    "extended RCODE {rcode} needs an EDNS0 OPT record to carry \
+                     its high bits (RFC 6891 §6.1.3)"
                 ),
             ));
         }
@@ -3166,6 +3167,14 @@ mod tests {
             .to_bytes(&mut buf)
             .expect_err("extended RCODE needs an OPT record");
         assert!(err.to_string().contains("OPT record"), "got: {err}");
+        // The whole message, not a substring of it: this literal carried 22
+        // spaces where a `\` continuation belonged, and the assertion above was
+        // true throughout. rustfmt does not touch string literals (§12), so a
+        // wrapped one has no other check.
+        assert!(
+            !err.to_string().contains("  "),
+            "a wrapped literal leaked its indentation: {err}"
+        );
     }
 
     #[test]
