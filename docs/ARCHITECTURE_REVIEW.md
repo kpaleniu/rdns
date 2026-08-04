@@ -513,7 +513,7 @@ stranger holding a core for a second at a time.
 
 Measurements come from a throwaway crate outside the tree (`rdns` as a path
 dependency, release profile, Windows 11, five binaries); disassembly from the
-same code built on the Linux side with `objdump -d`, same LLVM, same baseline
+same code built on Linux with `objdump -d`, same LLVM, same baseline
 `x86-64` target with no `target-cpu`.
 
 **Absolute nanoseconds on this machine are not reproducible between runs** — the

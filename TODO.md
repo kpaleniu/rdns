@@ -16,8 +16,15 @@ rather than the history; reach for here when you need to know what is open.
 
 **Starting cold, read in this order:** "Current state" for what works today and
 what is unproven, "How to run" for the commands, the four environment traps under
-"Verifying" (each has cost an hour) plus the Linux recipe beside them for anything
-`#[cfg(unix)]` or containerized, and then "Where to pick up next". The
+"Verifying" (each has cost an hour), and then "Where to pick up next".
+
+**Nothing here describes a particular machine.** Paths, the Linux image and its
+invocation, the git remote, what is installed and why port 53 misbehaves live in
+`CLAUDE.local.md`, which is untracked and imported by `CLAUDE.md` — moved out on
+2026-08-04, because a checked-in file describing one laptop is wrong for every
+other reader and silently so. What stayed is every *measurement* and every caveat
+needed to trust one; those say "the development machine" and the local file says
+which. The
 "Architecture" sections describe what exists and why it is shaped that way — they
 are the part of this file that is not written down anywhere else. Finished work
 is one line each under "Done so far", pointing at the commit that carries its
@@ -65,8 +72,8 @@ is, with the assertion that would have caught it.
 
 Build and test with the four commands at the top of `CLAUDE.md`;
 `cargo bench -p rdns` is the fifth. **Do not push** — commit locally and leave
-it; every push spends the owner's GitHub Actions minutes on a private
-repository. Nothing is half-applied and the tree is clean.
+it; the reason is in `CLAUDE.local.md` and it is about the account, not the code.
+Nothing is half-applied and the tree is clean.
 
 **This file was cut from 6,067 lines to about a third of that on 2026-08-02**,
 when the last numbered item closed. What went was the full text of findings that
@@ -92,24 +99,21 @@ this page turned out to be wrong.
 | `rdnsd`   | authoritative server — serves zone files over UDP and TCP in one process |
 | `rdnsr`   | recursive resolver with a caching layer; forwards on `--upstream` |
 
-**There is a remote, and CI has run at last (2026-08-01).** `origin` is
-The remote is **private**, and
-`.github/workflows/ci.yml` finally has somewhere to execute. Seven job-runs per
-push — `test` on Linux *and* Windows, plus lint, msrv, deny, image and features —
-of which the Windows leg bills at twice the rate against the free-tier allowance.
+**There is a remote, and CI has run at last (2026-08-01).**
+`.github/workflows/ci.yml` finally has somewhere to execute: seven job-runs per
+push — `test` on Linux *and* Windows, plus lint, msrv, deny, image and features.
 `concurrency` with `cancel-in-progress` is set, so a second push abandons the
-first run rather than paying for both.
+first run rather than running both.
 
-**Do not push from a session.** Commit locally and stop; the owner pushes when
-they choose to. This is why: the account has a cap, and a session that pushes on
-every commit spends it on runs nobody asked for.
+**Do not push from a session.** Commit locally and stop. Which remote, and why a
+push costs something, are in `CLAUDE.local.md`.
 
 **The first CI run failed, and the failure was the test's fault rather than the
 code's.** One job failed and one warning appeared across several; both are fixed
 locally and unpushed, and nothing was wrong with the code CI was checking. The
 Windows `build and test` job failed
 `a_reload_does_not_hold_the_write_lock_across_its_diffs` at 71% of samples locked
-out, where this machine measures 0.3% for the same code. `tokio::sync::RwLock` is
+out, where the development machine measures 0.3% for the same code. `tokio::sync::RwLock` is
 fair, so `try_read` fails while a writer is merely *queued*: the metric was
 measuring scheduler wake latency, and its denominator was the sampler's own spin
 rate, which is not a clock. The test measures a window of *time* against a
@@ -167,10 +171,11 @@ difference is now *only* the cfg-gated tests is the check worth making, and it i
 the one §1 of `CLAUDE.md` says a differing count is the tell for — the previous
 pair had Windows *ahead*, which cannot be right and was the stale column showing.
 
-The Linux run was `cargo test --workspace` **on the mount**, against the warning
-under "Running the Linux half by hand" — which turns out not to apply to the
-three tests it is about; see the note there. `cargo clippy --workspace
---all-targets` is clean there too, which is the half Windows cannot check at all.
+The Linux run was `cargo test --workspace` **against the Windows-mounted tree**
+rather than a copy inside the image, against the warning under "Running the Linux
+half by hand" — which turns out not to apply to the three tests it is about; see
+the note there. `cargo clippy --workspace --all-targets` is clean there too,
+which is the half Windows cannot check at all.
 
 **Two of those single tests are worth more than their count suggests.**
 `allocations` reports **nineteen** measurements, **thirteen** of them exact
@@ -191,24 +196,22 @@ which needs a Unix domain socket and so is `#[cfg(unix)]` in its entirety.
 because it is not obvious: `dhat` counts calls into the global allocator, so what
 it measures does not depend on whether glibc's malloc or Windows' heap is
 underneath. Every exact assertion in `rdns/tests/allocations.rs` (0, 1, 2, 2, 3,
-3 and 4) reads the same on the Linux side.
+3 and 4) reads the same on Linux.
 
 `cargo clippy --workspace --all-targets` and `cargo fmt --all --check` are clean
 **on Windows**; ~~the Linux image used for the Linux runs has no clippy package,
 so that half is checked by CI now and was checked nowhere before.~~
 
-**Corrected 2026-08-04: the Linux image has clippy, and always may have.**
-`cargo clippy --version` there is `clippy 0.1.97`, `cargo-clippy` and
-`clippy-driver` are both in `/usr/sbin`, and
-`cargo clippy --workspace --all-targets` on the repository **is clean** —
-which is a stronger statement than the Windows run can make, because it is the
-only one that compiles `rdnsd/src/control.rs` and the rest of the `#[cfg(unix)]`
-half at all. The claim went into this file, into "Where to pick up next" and into
-one more place below without anyone typing the command; `CLAUDE.md` §1's own Linux
-recipe has *contained* `cargo clippy` the whole time, so the two documents
+**Corrected 2026-08-04: it has clippy, and always may have.** The workspace is
+**clean** under `cargo clippy --workspace --all-targets` there — a stronger
+statement than the Windows run can make, because Linux is the only side that
+compiles `rdnsd/src/control.rs` and the rest of the `#[cfg(unix)]` half at all.
+The claim went into this file, into "Where to pick up next" and into one more
+place below without anyone typing the command; `CLAUDE.md` §1's own instruction
+has said to run clippy on the other side the whole time, so the two documents
 disagreed and neither was checked. §4, again, and the same shape as #26j: a
-statement about a tool, written from memory of a failure rather than from running
-it.
+statement about a *tool*, written from memory of one failure rather than from
+running it. The version and the paths are in `CLAUDE.local.md`.
 
 **Errors are typed in the library and `anyhow` in the binaries.** The convention
 used to run the other way round. `rdns::error` holds seven types (`WireError`,
@@ -308,7 +311,7 @@ cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone   --metrics-list
 # 200 immediately on a primary — whose zones were all loaded, signed and verified
 # before anything bound a socket. A one-way latch: see rdns/src/readiness.rs.
 
-# The container image. Never built on this machine (no runtime here); the `image`
+# The container image. Never built on the Windows side (no runtime there); the `image`
 # job in CI builds it, runs it, probes both endpoints and stops it.
 docker build -t rdns .
 docker run -d -p 53:5353/udp -p 53:5353/tcp -p 9153:9153 \
@@ -437,17 +440,13 @@ cargo run -p rdnsr -- --port 15354 --dnssec-validate --auto-trust-anchor ./root.
 
 ### Verifying, and one trap that invalidates it
 
-**Check first whether the network hijacks port 53.** Send any DNS query to
-`192.0.2.1` — TEST-NET-1, reserved for documentation, which cannot host a
-server. If something answers, every outbound port-53 query on this machine is
-being intercepted and answered by a middlebox:
+**Check first whether the network hijacks port 53** — a middlebox that answers
+every outbound port-53 query invalidates anything measured through it, and the
+one-line probe for it is in `CLAUDE.local.md` (untracked: it is a fact about a
+network, not about the code).
 
-```sh
-python -c "import socket;s=socket.socket(2,2);s.settimeout(3);s.sendto(bytes.fromhex('424201000001000000000000') + b'\x07example\x03com\x00\x00\x01\x00\x01',('192.0.2.1',53));print('INTERCEPTED:',len(s.recv(512)),'bytes')"
-```
-
-That is the case on the machine this was developed on, and it has two
-consequences worth knowing before trusting any measurement in this repo:
+**That is the case on the development machine**, and it has two consequences
+worth knowing before trusting any measurement in this repo:
 
 - **Recursion cannot be verified here.** Iterative (RD=0) queries to the real
   root addresses get SERVFAIL from the interceptor, so `rdnsr`'s default mode
@@ -459,65 +458,34 @@ consequences worth knowing before trusting any measurement in this repo:
 For local verification, `nslookup` is unreliable against a non-53 port on
 Windows — it reports "No response from server" even when the server replied.
 Probe with a raw `System.Net.Sockets.UdpClient` in PowerShell and read the
-bytes; that is how the "verified live" claims here were checked.
+bytes; that is how the "verified live" claims here were checked. (A property of
+`nslookup`, not of any one machine, which is why it is here and not in the local
+notes.)
 
 ### Running the Linux half by hand
 
 CI covers this now, but a session still cannot push (see "Current state"), so
 this is how the Linux half gets checked before a commit rather than after one.
-This is a Windows machine, so anything `#[cfg(unix)]` is invisible here — that is
-how `rdnsd` went months without compiling on Unix. **The Linux image
-has a full toolchain** (cargo, rustc, gcc) and is where every Linux number in
-this file comes from:
+Development happens on Windows, so anything `#[cfg(unix)]` is invisible there —
+that is how `rdnsd` went months without compiling on Unix, and it is why
+`CLAUDE.md` §1 requires the other side to be run before committing anything
+cfg-gated.
 
-```sh
-# Copy the tree in. Excluding target/ matters: it is large, and a Windows
-# target/ is useless to a Linux build anyway.
-rm -rf "$SCRATCH" && mkdir -p "$SCRATCH" \
-  && cd "$REPO" && tar cf - --exclude=target --exclude=.git . \
-  | (cd ~/rdns && tar xf -)"
-cargo build --workspace --all-targets && cargo test --workspace
-```
+**The invocation is in `CLAUDE.local.md`**, along with which image, which
+paths, how the container image gets built, and the filesystem and toolchain traps that
+come with them. Untracked, because none of it is a fact about this project — it
+is a fact about one machine, and a checked-in copy of it fails silently on any
+other.
 
-**That image also has docker** (29.6.2), which is where the container image was
-built and exercised before CI's `image` job existed to do it on every push. The
-user is in `wheel` and not `docker`, so every command needs `sudo -n`:
+What belongs here rather than there, because it is about the *code*:
 
-```sh
-sudo -n docker build -t rdns:local \
-  --build-arg RDNS_GIT_DESCRIBE=$(git describe --always --dirty --tags) .
-```
-
-The build arg matters: the build context has no `.git` in it on purpose, so
-without it the image reports a bare `0.1.0`.
-
-Three things to know before trusting a run there:
-
-- **Build on a native filesystem, not the mount.** It reports everything as 0777 and
-  `chmod` is a no-op without the `metadata` mount option, so every
-  permission-related test would either pass or fail for reasons that have
-  nothing to do with the code. `~` is ext4 and behaves.
-
-  **Narrowed 2026-08-04, having relied on it:** the three permission tests do
-  *not* depend on this, because all three write to `std::env::temp_dir()` —
-  `/tmp`, ext4 — rather than beside the source
-  (`dnssec_key.rs:899`, `persist.rs:289`, `:334`). A `--workspace` run from
-  The mount is therefore trustworthy today, and the advice stands only for build
-  speed and for the next test that writes into the tree. Worth the two lines
-  because the warning as written says a run I made was worthless, and it was
-  not — the reason is a property of those tests, so it is where the tests can
-  change.
-- ~~**That image has no `clippy`.** `cargo clippy` fails with "no such command", so
-  the lint half of the four commands is Windows-only for now.~~ **Wrong, corrected
-  2026-08-04.** It has `clippy 0.1.97`, and the workspace is clean under it. See
-  "Current state" for how the claim survived: it is the only statement here about
-  a *tool* rather than about the code, and nothing that reads this page runs it.
-- **The copy is a copy.** Re-sync before each run or you are testing whatever was
-  there last time; the tar line above is cheap enough to repeat.
-
-One older image has cargo but **no C compiler**,
-so every build there dies at `linker \`cc\` not found` — ring needs one. Use
-the Linux image.
+- **Every Linux number in this file comes from that image**, so the two columns
+  in "Current state" are one tree measured twice, not two trees.
+- **The permission tests are not affected by where the tree is built.** All three
+  write to `std::env::temp_dir()` rather than beside the source
+  (`dnssec_key.rs:899`, `persist.rs:289`, `:334`), which is what makes a run from
+  a Windows-mounted path trustworthy — a property of the tests, so it changes when
+  they do.
 
 **`rdnsc` works against a non-53 port now** (#9f), which it could not before —
 that is the reason the recipes here reach for something else. It checks the id
@@ -537,7 +505,7 @@ r.setServers(['127.0.0.1:15353']);
 r.resolve4('www.example.com', console.log);
 ```
 
-**dnspython is installed on this machine** (2.8.0, `pip install dnspython`) and is
+**dnspython** (`pip install dnspython`) is
 the better tool for anything cryptographic, because its TSIG is interop-tested
 against BIND — it signs, verifies, and does AXFR with a keyring, so it can be put
 on either side of an exchange. It is *not* a project dependency; it exists so a
@@ -636,7 +604,7 @@ filed later on 2026-08-04** from a second architecture review, this one aimed at
 algorithmic shape rather than structure. **#23 is the one with teeth**: a query
 that costs a second of CPU on `rdnsr --dnssec-validate`, provoked and timed.
 
-~~#11, a stretch goal blocked on hardware counters this machine cannot read~~ —
+~~#11, a stretch goal blocked on hardware counters the development machine cannot read~~ —
 **answered no on 2026-08-04**, and the blocker did not exist: the Linux side has a
 virtualized core PMU, and the question was settled with cachegrind anyway.
 
@@ -1235,7 +1203,8 @@ because a cost beneath its own measurement floor is not one to restructure a dat
 layout for. Tightening it means giving `Zone` a fixed-seed `BuildHasher`, which
 changes the type under test and was not worth it for an answer already decisive.
 
-**What is *not* claimed:** that this generalizes off this machine. 96 MiB of L3
+**What is *not* claimed:** that this generalizes off the machine it was measured
+on. 96 MiB of L3
 is unusual; on a 32 MiB server part a larger zone could genuinely miss to memory,
 and the hit path's 6.4 L2-resident misses could become LL misses that cost real
 time. The measurement above is about a 10k-record zone on this desk. The probe is
@@ -1487,7 +1456,8 @@ anything re-measured should be too.
 (§10's rule about negative results):
 
 - **`lto = "fat"` + `codegen-units = 1`.** Measured: zone lookup 195 → 190 ns,
-  serialization worse in the same run, and run-to-run variance on this machine is
+  serialization worse in the same run, and run-to-run variance on the development
+  machine is
   larger than either. Not a recommendation in either direction until it is
   measured somewhere quieter.
 - **SHA-1 and SHA-256 already reach SHA-NI** at run time through `cpufeatures`
@@ -1664,7 +1634,7 @@ cargo bench -p rdns -- --baseline before
 
 **The allocation counts are the real gate.** They are exact, they do not care
 what else is running, and `TODO.md`'s "Current state" records that they read the
-same on Windows and on the Linux side — `dhat` counts calls into the global allocator, so
+same on Windows and on Linux — `dhat` counts calls into the global allocator, so
 the number does not depend on which malloc is underneath. The bar is **identical
 counts, or lower**. A count that moves up may not be waved through as noise,
 because it cannot be noise; it may only be accepted with the reason written next
@@ -5142,7 +5112,7 @@ commit message.
   25,715 blocks → 20,712, five per query, both sites gone from the profile. Four
   assertions, two of them exact allocation counts (5 → 1 for the three lookups
   behind one answer), each watched failing against the reverted code and
-  identical on the Linux side.
+  identical on Linux.
 - **A readiness probe and a container image** — closes 9d's last operability
   item, and with it 9d. `GET /readyz` on `--metrics-listen` is 503 (naming the
   zones) until every `--secondary` zone has transferred at least once, and 200

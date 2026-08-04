@@ -3,3 +3,9 @@
 # DHAT writes this next to wherever the profiled binary was run from
 # (`--features dhat-heap`). It is a measurement, not a source artifact.
 dhat-heap.json
+
+# Facts about one developer's box — paths, the Linux image, what is installed, the
+# git remote, why port 53 misbehaves here. Imported by CLAUDE.md. A checked-in
+# file describing a laptop goes wrong silently for anyone else and tells a reader
+# nothing about the project.
+CLAUDE.local.md

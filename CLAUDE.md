@@ -4,6 +4,14 @@ Orientation lives in `TODO.md`: what each crate is, what is open, how to run the
 binaries, how to verify against dnspython, and four environment traps. Read it
 before planning.
 
+@CLAUDE.local.md
+
+That import is the *machine*: paths, the Linux image and its exact invocation, what
+is installed, the git remote and why nothing may be pushed, and why port 53 does
+not behave here. It is untracked, so a clone without it loses nothing but
+convenience — every tracked file states its own conclusions and none depends on
+it being present.
+
 This file is the list of mistakes this codebase has made, written as rules. A
 five-way review in July 2026 found 48 defects; they were a dozen patterns,
 repeated.
@@ -52,12 +60,10 @@ says nothing about the subject.
   `cargo test --workspace` reported 793 passing for several commits over a module
   that did not build. CI is Linux and had been red the whole time. The gap is
   visible in the number — 793 here against 809 there — so a test count that
-  differs by platform is the tell. Before committing anything that touches a
-  cfg-gated file, run it on the other side:
-
-  ```sh
-  cargo clippy --workspace --all-targets && cargo test --workspace
-  ```
+  differs by platform is the tell. **Before committing anything that touches a
+  cfg-gated file, run the suite and clippy on the other side** — the exact
+  invocation for this machine is in `CLAUDE.local.md`, which is untracked because
+  it is a fact about one box rather than about the code.
 
   And when reporting a verification, say which platform it ran on. "Clippy clean"
   that means "clean on the half of the tree this OS compiles" is the same claim
