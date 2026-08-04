@@ -26,6 +26,7 @@ use rdns::metrics::ZoneFacts;
 use rdns::shutdown::{Busy, Stop};
 use rdns::utils::current_unix_timestamp;
 use rdns::zone_writer::zone_to_string;
+use rdns::Serial;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
@@ -455,7 +456,7 @@ mod tests {
         let mut zones = HashMap::new();
         zones.insert("example.com.".to_string(), zone());
         let metrics = Arc::new(rdns::metrics::DnsMetrics::new());
-        metrics.set_zone_serial("example.com.", 42);
+        metrics.set_zone_serial("example.com.", Serial::new(42));
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         (
             Arc::new(Control {
@@ -463,6 +464,7 @@ mod tests {
                     zone_map: Arc::new(RwLock::new(crate::Zones::new(zones))),
                     deltas: Arc::new(RwLock::new(rdns::ixfr::DeltaLog::new())),
                     metrics,
+                    journal: None,
                 },
                 replicated,
                 reloads: tx,

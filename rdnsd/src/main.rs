@@ -779,6 +779,7 @@ async fn serve(
                     zone_map: server.zone_map.clone(),
                     deltas: server.deltas.clone(),
                     metrics: server.metrics.clone(),
+                    journal: server.journal.clone(),
                 },
                 replicated,
                 reloads,

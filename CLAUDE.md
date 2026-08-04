@@ -46,6 +46,22 @@ says nothing about the subject.
   `verify_rrset` / `proves_nxdomain` / `proves_nodata`, and anything
   cryptographic through dnspython as well. Our parser agreeing with our
   serializer proves nothing.
+- **A green suite on one platform is not a green suite.** This repo is developed
+  on Windows, where `#[cfg(unix)]` code is never compiled: `rdnsd/src/control.rs`
+  had an unimported `Serial` and two `Served` initializers missing a field, and
+  `cargo test --workspace` reported 793 passing for several commits over a module
+  that did not build. CI is Linux and had been red the whole time. The gap is
+  visible in the number — 793 here against 809 there — so a test count that
+  differs by platform is the tell. Before committing anything that touches a
+  cfg-gated file, run it on the other side:
+
+  ```sh
+  cargo clippy --workspace --all-targets && cargo test --workspace
+  ```
+
+  And when reporting a verification, say which platform it ran on. "Clippy clean"
+  that means "clean on the half of the tree this OS compiles" is the same claim
+  as a comment asserting an invariant nothing checks (§4).
 
 ## 2. Wire input: check every length, and never widen a signed field
 
