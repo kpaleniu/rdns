@@ -324,34 +324,23 @@ pub(crate) fn note_serials(metrics: &DnsMetrics, zones: &HashMap<String, Zone>) 
 /// The zones this server answers from, and a counter that moves whenever the
 /// set does.
 ///
-/// **The counter is the whole reason this is not a bare `HashMap`.** Installing
-/// a zone has to diff it against the version it replaces, and `ixfr::diff` walks
-/// every record of both into a `BTreeMap`. Doing that while holding the *write*
-/// lock blocks every query for the length of the walk — and on a `SIGHUP`
-/// reload, which installs every zone under one guard, for the sum of all of
-/// them. So the diff is planned under the read lock, where queries run
-/// alongside it, and only recorded under the write lock.
+/// The counter is why this is not a bare `HashMap`. `ixfr::diff` walks every
+/// record of both versions, so it is planned under the read lock and only
+/// recorded under the write lock — under the write lock it would block every
+/// query for the length of the walk, and on a SIGHUP for the sum of all of them.
 ///
-/// That split leaves a window: between dropping the read guard and taking the
-/// write guard, another task can install, expire or withdraw a zone. A plan made
-/// before that window may no longer describe the version it would be recorded
-/// against, and a delta computed from the wrong old version is precisely the
-/// "IXFR chain that does not describe the zone we serve" that `install_zone`'s
-/// comment is about — a secondary applying it ends up holding a zone that never
-/// existed. `generation` closes the window: equal means nothing moved and the
-/// plan still stands, different means throw it away and re-plan under the write
-/// lock, which is correct and rare.
+/// That split leaves a window between dropping the read guard and taking the
+/// write guard, in which another task can install, expire or withdraw a zone. A
+/// delta computed against the wrong old version hands a secondary a zone that
+/// never existed. `generation` closes it: equal means the plan still stands,
+/// different means re-plan under the write lock.
 ///
-/// **A serial comparison would not have done**, which is why this is a counter
-/// and not `Option<u32>`: two different versions of a zone can carry the same
-/// serial — an edited file reloaded without a bump is the ordinary way — so
-/// "same serial" does not mean "same records", and the check has to be about
-/// identity rather than about version.
+/// A serial comparison would not do, which is why this is a counter and not
+/// `Option<u32>`: an edited file reloaded without a bump carries the same serial
+/// over different records, so the check has to be about identity.
 ///
 /// Mutation goes through the methods below and there is no `DerefMut`, so the
-/// counter cannot be forgotten at a call site. That is the same reasoning as
-/// `DeltaLog::note_change` taking both versions rather than trusting the caller
-/// to remember the old one (`CLAUDE.md` §2, make it unrepresentable).
+/// counter cannot be forgotten at a call site.
 #[derive(Debug, Default)]
 pub(crate) struct Zones {
     by_name: HashMap<String, Zone>,
@@ -779,27 +768,22 @@ pub(crate) fn signed_rrsets(zone: &Zone) -> Vec<(String, Rtype)> {
 
 /// Load zones from source (single file or directory)
 ///
-/// Three questions that used to be one, and conflating them is what let a broken
-/// zone file pass for a configuration choice:
+/// Three questions that used to be one:
 ///
-/// - **Could the directory be read?** Always fatal. An `Err` here used to become
+/// - Could the directory be read? Always fatal. An `Err` here used to become
 ///   `Ok(empty)` on the `--secondary` path, so a permission change left the
-///   server up, listening, and answering REFUSED for every name it is
-///   authoritative for.
-/// - **Did every zone file parse?** Fatal unless `--allow-partial-load`. See
+///   server up, listening, and answering REFUSED for every name it serves.
+/// - Did every zone file parse? Fatal unless `--allow-partial-load`. See
 ///   [`enumerate_zone_files`].
-/// - **Is the directory empty?** Fatal *except* when replicating. A secondary's
-///   first start has nothing on disk yet, and refusing to run until a zone
-///   arrives would mean it never could — while for a primary an empty
-///   `--zone-dir` is a typo in the path, and serving nothing is not what was
-///   asked for.
+/// - Is the directory empty? Fatal except when replicating: a secondary's first
+///   start has nothing on disk yet, while for a primary an empty `--zone-dir` is
+///   a typo in the path.
 ///
 /// The emptiness check lives here rather than in `enumerate_zone_files` because
-/// only this function knows which of its callers is a secondary.
+/// only this function knows which caller is a secondary.
 ///
-/// **Blocking, and says so.** It was an `async fn` with no await point in it,
-/// which reads as if it yields and does not: `read_dir`, then a
-/// `read_to_string` and a full parse per zone. The callers that run while the
+/// Blocking, and says so: `read_dir`, then a `read_to_string` and a full parse
+/// per zone. It was an `async fn` with no await point. Callers that run while the
 /// listeners are live put it on a blocking thread; see [`Reloading::load`].
 pub(crate) fn load_zones_from_source(
     source: &ZoneSource,

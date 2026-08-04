@@ -1,13 +1,11 @@
 //! The client half of a zone transfer: asking for a zone and assembling it.
 //!
-//! [`crate::transfer`] turns a zone into the messages an AXFR is; this turns
-//! those messages back into a zone. They are deliberately separate, and not only
-//! because one is a server and the other a client: the server's half is handed a
-//! zone it already trusts, while this half is handed a stream by somebody else
-//! and has to decide what of it to believe.
+//! [`crate::transfer`] turns a zone into the messages an AXFR is; this turns them
+//! back into a zone. Separate because the server's half is handed a zone it
+//! already trusts, while this half is handed a stream by somebody else.
 //!
-//! **What it refuses is the interesting part.** A transfer that is merely
-//! *received* is not a zone:
+//! What it refuses is the interesting part — a transfer that is merely received
+//! is not a zone:
 //!
 //! - **It must open and close with the apex SOA** (RFC 5936 §2.2). The closing
 //!   SOA is the only thing that distinguishes a complete transfer from a

@@ -3,52 +3,27 @@ use crate::{DnsMessage, OpCode};
 
 /// A message that arrived at a listening socket **and is a question**.
 ///
-/// The only way to build one is [`Request::from_bytes`], which refuses QR=1. So
-/// a path holding a `Request` has made the check, and "did this one remember?"
-/// is answered by its type rather than by reading fifty lines of it.
+/// The only way to build one is [`Request::from_bytes`], which refuses QR=1, so
+/// a path holding a `Request` has made the check.
 ///
-/// **What that is and is not worth, stated plainly, because a doc comment
-/// asserting an invariant is a claim to verify (`CLAUDE.md` §4).** This does
-/// *not* make the omission impossible: [`DnsMessage::try_from_bytes`] is still
-/// public and still the right call for the resolver, for `xfr`, and for a test.
-/// A new answering path could call it and skip the check exactly as
-/// `answer_datagram` did. What changed is that there is now one named door with
-/// the reason attached to it, that both of `rdnsd`'s answering paths and
-/// `rdnsr`'s go through it, and that the drop decision is written once instead
-/// of once per path — so the next path is *copied from* something that checks,
-/// rather than from something that happened not to. Real teeth would mean
-/// `make_response` and its siblings taking `&Request`, which is a larger change
-/// than `TODO.md` #14b scopes and would push every unit test of them through a
-/// serialize-and-reparse round trip.
+/// It does not make the omission impossible: [`DnsMessage::try_from_bytes`] is
+/// still public and still right for the resolver, for `xfr`, and for tests. What
+/// it buys is one named door that all three answering paths go through, so the
+/// next one is copied from something that checks. Real teeth would mean
+/// `make_response` and its siblings taking `&Request`, which is larger than
+/// `TODO.md` #14b scopes.
 ///
-/// **The bug this is the fix for is in the log.** `CLAUDE.md` §8 has said "test
-/// QR before doing anything with a packet that arrived at a listening socket, on
-/// both daemons" since before either of `rdnsd`'s two answering paths was last
-/// touched. `fn answer` (TCP) had the check; `answer_datagram` (UDP) never did,
-/// and UDP is the transport it matters on — nothing makes the peer prove its
-/// address first, so a spoofed datagram naming another server as its source was
-/// a packet loop neither end could see. `rdnsr` has one `handle_query` shared by
-/// both of its transports and so could not drift. Two answering paths, one
-/// check: §7's shape, and §17's answer to it — a rule written down is a rule
-/// somebody has to remember, and a type is not.
+/// The bug: `fn answer` (TCP) tested QR and `answer_datagram` (UDP) never did,
+/// and UDP is where it matters — a spoofed datagram naming another server as its
+/// source was a packet loop neither end could see.
 ///
-/// **A wrapper at the door, not a split of [`DnsMessage`].** The resolver sends
-/// queries and reads responses, `tsig` verifies both directions of the wire, and
-/// `xfr` reads a stream of replies; all of those need a message that may have
-/// QR=1, and none of them is a socket a stranger can talk to. So `DnsMessage`
-/// keeps its `response` field and this type is the narrow thing that guards the
-/// one place where the answer is fixed.
+/// A wrapper at the door rather than a split of [`DnsMessage`], because the
+/// resolver, `tsig` and `xfr` all need messages that may have QR=1.
 ///
-/// `Deref` gives read access to every field, and there is deliberately **no
-/// `DerefMut` and no `&mut` accessor**: `request.response = true` would put the
-/// value back in the state the type exists to exclude.
+/// `Deref` gives read access to every field. No `DerefMut` and no `&mut`
+/// accessor: `request.response = true` would restore the excluded state.
 ///
-/// **What it does not do**, so nothing reads more into it than is there: it does
-/// not run [`AdmissionCheck`] (which is configured per server and, on UDP,
-/// runs before admission so a datagram is rejected before it is copied), it does
-/// not check the opcode (that is each daemon's policy, and the answer is NOTIMP
-/// rather than silence), and it does not verify a TSIG. It answers one question,
-/// and it answers it every time.
+/// It does not run [`AdmissionCheck`], check the opcode, or verify a TSIG.
 #[derive(Debug, Clone)]
 pub struct Request(DnsMessage);
 
@@ -232,30 +207,20 @@ impl AdmissionCheck {
             });
         }
 
-        // Which sections a *request* may carry is a question per section, not one
-        // blanket rule — and the blanket version of it has now silently killed a
-        // feature three times, because the symptom is always the same: the
-        // message is dropped before anything reads the opcode, so the feature
-        // simply never happens and nothing says why.
+        // Which sections a request may carry is a question per section. A blanket
+        // rule has silently killed a feature three times: the message is dropped
+        // before anything reads the opcode, so nothing says why.
         //
-        // - **The answer section** is empty in a QUERY: no query type carries
-        //   answers to a question it is still asking. A **NOTIFY** does carry
-        //   one — the zone's SOA (RFC 1996 §3.7), which is how a secondary learns
-        //   the new serial without asking a second question. Forbidden for QUERY,
-        //   capped otherwise.
-        // - **The authority section** cannot be forbidden at all: an **IXFR**
-        //   request is a QUERY that carries the client's current SOA there
-        //   (RFC 1995 §3), and that record is the whole of what makes it
-        //   incremental rather than an AXFR. Capped.
-        // - **The additional section** is where a request carries its OPT (EDNS0,
-        //   RFC 6891 §6.1.1) and its TSIG/SIG(0), so rejecting a non-empty one
-        //   rejects every signed or EDNS query — which is precisely what it used
-        //   to do, leaving EDNS dead on arrival. Capped.
+        // - Answer: empty in a QUERY, but a NOTIFY carries the zone's SOA
+        //   (RFC 1996 §3.7). Forbidden for QUERY, capped otherwise.
+        // - Authority: cannot be forbidden — an IXFR request is a QUERY carrying
+        //   the client's current SOA there (RFC 1995 §3). Capped.
+        // - Additional: where a request carries its OPT (RFC 6891 §6.1.1) and its
+        //   TSIG/SIG(0), so forbidding it kills every signed or EDNS query, which
+        //   it used to. Capped.
         //
-        // A cap rather than a prohibition is the shape this check wants: a
-        // request has no legitimate reason to carry many records, and that is a
-        // statement about resources rather than a guess about which protocol
-        // extensions exist.
+        // A cap rather than a prohibition: a statement about resources rather
+        // than a guess about which protocol extensions exist.
         // Read through the types rather than by shifting bits here: `OpCode`
         // and the QR flag both have one definition already, and a second
         // hand-rolled one is how the two come to disagree (`TODO.md` #19e).

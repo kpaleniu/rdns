@@ -33,30 +33,21 @@ use crate::{ParsedRecord, Rtype};
 /// re-parsed with [`RecordData::parse`] or re-serialized without needing the
 /// original message for compression-pointer resolution.
 ///
-/// **The fields are private, and that is the invariant.** The bytes decode as
-/// their TYPE, because the three constructors are the only way in and each
-/// establishes it. Sealing them only *means* anything now that `rtype` is an
-/// [`Rtype`] rather than a `u16` anyone can invent (`TODO.md` #13c), which is
-/// why this was not worth doing before.
+/// The fields are private, and that is the invariant: the bytes decode as their
+/// TYPE, because the three constructors are the only way in. Sealing them only
+/// means anything now that `rtype` is an [`Rtype`] rather than a `u16` anyone can
+/// invent (`TODO.md` #13c).
 ///
-/// **What the invariant does not say**, so it is not read for more than it is:
+/// What the invariant does not say:
 ///
-/// - **A type with no decoder here is stored verbatim** (RFC 3597 §5) and
-///   checked only for being storable, because there is nothing to check it
-///   against. So does an RDLENGTH of zero, which RFC 2136 §2.4 and §2.5 use to
-///   mean "this type, no value" — a record that is a specifier rather than data.
-///   That case is where the invariant *would* have been wrong, and finding it is
-///   what this change was worth: see the commit that fixed
-///   `ParsedRecord::decode` for it.
-/// - **[`RecordData::parse`] still returns a `Result`.** Making it infallible
-///   would mean proving that every `ParsedRecord` re-encodes to bytes that
-///   decode again, which is a round-trip property nothing here establishes. The
-///   `Result` is now "this should not happen" rather than "a caller may have
-///   built nonsense", which is a smaller claim than removing it would be.
-/// - **Nothing bounds the length.** RDLENGTH is 16 bits, and a longer RDATA
-///   fails when the message it is in is serialized rather than here. Left alone
-///   deliberately: the check exists where the limit exists, and duplicating it
-///   is §7's shape.
+/// - A type with no decoder here is stored verbatim (RFC 3597 §5), checked only
+///   for being storable. So is an RDLENGTH of zero, which RFC 2136 §2.4 and §2.5
+///   use to mean "this type, no value".
+/// - [`RecordData::parse`] still returns a `Result`. Making it infallible would
+///   mean proving every `ParsedRecord` re-encodes to bytes that decode again.
+/// - Nothing bounds the length. RDLENGTH is 16 bits, and a longer RDATA fails
+///   when the message it is in is serialized — the check lives where the limit
+///   does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordData {
     /// The RR TYPE code (e.g. 1 = A, 28 = AAAA).

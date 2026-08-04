@@ -1,37 +1,27 @@
 //! `--config`: the same settings as the command line, in a file, plus the two
 //! things a command line cannot express.
 //!
-//! **Why this exists.** `--tsig-key alg:name:SECRET` puts a base64 HMAC secret in
-//! `argv`, which is world-readable in `ps aux` and `/proc/<pid>/cmdline`, lands in
-//! shell history, and gets copied verbatim into the systemd unit the README tells
-//! you to write. And at forty zones and six keys the exec line is a multi-kilobyte
-//! undiffable string maintained by hand — one `--secondary` per zone, one
-//! `--tsig-key` per key, one `--also-notify` per target.
+//! `--tsig-key alg:name:SECRET` puts a base64 HMAC secret in `argv`, where
+//! `ps aux` and `/proc/<pid>/cmdline` expose it and shell history keeps it. At
+//! forty zones and six keys the exec line is also a multi-kilobyte undiffable
+//! string maintained by hand.
 //!
-//! Two things the flags could never express, and this can:
+//! Two things the flags cannot express:
 //!
-//! - **A secret in a file of its own**, so it appears in neither `argv` nor the
-//!   main config. `secret-file` reads it, and refuses a file group- or
-//!   world-readable on Unix — a key an operator believes is private and is not is
-//!   worse than one they know is exposed.
-//! - **Per-zone settings.** Every zone used to get the same signing policy, the
-//!   same NSEC/NSEC3 choice and the same validity, because there was one flag for
-//!   each and no way to say "except this one".
+//! - A secret in a file of its own, in neither `argv` nor the main config.
+//!   `secret-file` reads it and refuses one that is group- or world-readable on
+//!   Unix.
+//! - Per-zone settings. One flag each meant one signing policy, NSEC/NSEC3 choice
+//!   and validity for every zone.
 //!
-//! **A file and the flags are mutually exclusive, deliberately.** `--config` with
-//! `--port` is an error, not a precedence rule. Every precedence rule is a rule
-//! somebody has to remember at 3am to explain why the server is not listening
-//! where the file says it is — and the failure is silent, because both values are
-//! valid. Refusing costs one restart and no confusion. `--check-config`,
-//! `--generate-keys` and `--config` itself are the exceptions, since none of them
-//! is a setting.
+//! A file and the flags are mutually exclusive: `--config` with `--port` is an
+//! error, not a precedence rule, because both values are valid and the failure
+//! would be silent. `--check-config`, `--generate-keys` and `--config` itself are
+//! exceptions, being settings of nothing.
 //!
-//! **TOML, via `toml` and `serde`, and yes that is nine crates.** Deleting the
-//! OpenTelemetry stack removed eighty-three; the argument there was never "no
-//! dependencies", it was "no dependencies that do not do anything". This one does
-//! the whole job, and a hand-rolled subset parser that misreads a config file is
-//! precisely the class of bug this codebase keeps finding — reading configuration
-//! wrong is worse than not having any.
+//! TOML via `toml` and `serde` — nine crates, against the eighty-three deleting
+//! the OpenTelemetry stack removed. A hand-rolled subset parser that misreads a
+//! config is worse than the dependency.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -5,30 +5,18 @@
 //! costs the same as a fresh copy — and it is why a secondary with a short
 //! REFRESH is expensive to be.
 //!
-//! **Where the deltas come from is the design decision.** BIND keeps a journal
-//! on disk (`.jnl`), which is what you need when the zone is edited in place by
-//! dynamic UPDATE: the journal *is* the record of what happened. Here a zone
-//! comes from a file and changes in discrete events — a reload, or a transfer
-//! from a master — so the difference between two versions can simply be computed
-//! when the new one arrives and kept in memory. That is BIND's
-//! `ixfr-from-differences` semantics without the journal, and it is the same
-//! decision NSD made: it answered AXFR as a primary for years rather than carry
-//! one. A journal earns its keep when dynamic UPDATE arrives (#7 step 6) and not
-//! before.
+//! Deltas are computed when a new version arrives and kept in memory — BIND's
+//! `ixfr-from-differences` semantics — because a zone here changes in discrete
+//! events (a reload, a transfer from a master) rather than being edited in
+//! place. `journal.rs` persists them, which dynamic UPDATE made necessary; before
+//! that a restart forgot them and every secondary asking for an increment got a
+//! full transfer, which RFC 1995 §4 permits unconditionally.
 //!
-//! The consequence, stated plainly so nobody is surprised by it: **a restart
-//! forgets the deltas**. Every secondary that asks for an increment across a
-//! restart gets a full transfer instead, which is correct, permitted
-//! unconditionally by RFC 1995 §4, and self-correcting — the next change after
-//! that has a delta again.
-//!
-//! **The response format** (RFC 1995 §4) is the part that is easy to get subtly
-//! wrong. It is not "the changed records": it is the current SOA, then one
-//! *difference sequence* per version step — the old SOA, the records deleted,
-//! the new SOA, the records added — and then the current SOA again. A client
-//! reads the second record of the stream to decide what it is holding: another
-//! SOA means an increment, anything else means the server has fallen back to
-//! sending the whole zone.
+//! The response format (RFC 1995 §4) is not "the changed records": it is the
+//! current SOA, then one difference sequence per version step — old SOA, records
+//! deleted, new SOA, records added — then the current SOA again. A client reads
+//! the second record of the stream to decide what it is holding: another SOA
+//! means an increment, anything else means a full zone.
 
 use crate::error::{TransferError, TransferResult};
 use crate::Class;

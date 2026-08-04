@@ -1,12 +1,13 @@
 # 7. RFC conformance, deviations and gaps
 
-Compiled by reading the code on 2026-08-03 at commit `6882b1e`, and **revised
-the same day at `e2ebaef`**, by which point nine commits had closed most of what
-it recorded. Closed entries are struck through and kept rather than deleted: what
-a gap *was* is the useful half, and a conformance table that only ever showed the
-present state would lose the reason each row exists (`CLAUDE.md` §11). A row marked
-**yes** means the behaviour is implemented *and* has a test that names the RFC
-section; **partial** means implemented with a stated limit; **no** means absent.
+Compiled by reading the code on 2026-08-03 at commit `6882b1e`, revised the same
+day at `e2ebaef`, by which point nine commits had closed most of what it
+recorded. Closed entries are struck through and kept: what a gap *was* is the
+useful half, and a table showing only the present state would lose the reason
+each row exists (`CLAUDE.md` §11).
+
+"yes" means implemented *and* covered by a test that names the RFC section;
+"partial" means implemented with a stated limit; "no" means absent.
 
 ---
 
@@ -94,11 +95,11 @@ marked otherwise.
 label of any resource record". This implementation rejects such a label with
 `WireError::Malformed`, which a daemon answers FORMERR.
 
-**Deliberate**, and the trade is stated in `dname.rs`: names are `String`s in
+Deliberate, and the trade is stated in `dname.rs`: names are `String`s in
 presentation form throughout, and the alternative is a different representation
 (labels or wire bytes) — a change `TODO.md` #13e scopes and defers, and which
 `TODO.md` #21 records as the one deviation with a cost worth reopening for.
-**Consequence:** a zone containing such a name cannot be served, and a response
+Consequence: a zone containing such a name cannot be served, and a response
 containing one is unparseable, so a resolver cannot relay it.
 
 ### D-2 — the TCP length prefix is an unchecked cast — **fixed 2026-08-03**
@@ -148,13 +149,13 @@ having been written to match.
 RFC 1035 §2.3.1's "preferred name syntax" is advice to whoever *chooses* a
 hostname, not a rule about what the protocol carries; RFC 2181 §11 settles it.
 Enforcing it would refuse `_dmarc`, every `_tcp` SRV owner, DNS-SD instance names
-and the wildcard `*` itself. **Deliberate**, and documented in place.
+and the wildcard `*` itself. Deliberate, and documented in place.
 
 ### D-6 — the first compression pointer in a chain may point forward
 
 `dname.rs:384`. Every *subsequent* pointer must strictly decrease, which is what
 makes cycles unreachable; the first is unconstrained because a name is parsed
-from a suffix slice that does not know its own offset. **Deliberate**, with the
+from a suffix slice that does not know its own offset. Deliberate, with the
 reasoning and the cost of the alternative written in place. Termination is
 unaffected.
 
@@ -162,7 +163,7 @@ unaffected.
 
 `Class::CH` and `Class::HS` exist as types, the zone parser refuses a non-IN
 record, and a non-IN question is REFUSED. So `version.bind CH TXT` — which BIND,
-NSD and Knot all answer — is not answered. **Deliberate**: RFC 1034 §4.3.2 step 1
+NSD and Knot all answer — is not answered. Deliberate: RFC 1034 §4.3.2 step 1
 searches the zones of the question's class, and holding none is the same as
 holding no zone.
 
@@ -221,9 +222,9 @@ authorized per key, applied, persisted to the zone file and served. See
 `TODO.md` #10.
 
 The observation that produced this row is worth keeping even though the row is
-closed, because it generalizes past this feature: **a library that carries a
+closed, because it generalizes past this feature: a library that carries a
 tested, unreachable feature has a test suite that cannot tell it from a working
-one.** That is `CLAUDE.md` §1 at module scale, and it is exactly how the
+one. That is `CLAUDE.md` §1 at module scale, and it is exactly how the
 RDLENGTH=0 defect (`1461036`) survived — every test in `update.rs` built its
 message in memory, so the one boundary a real UPDATE crosses was the one nothing
 exercised. The end-to-end tests added with the dispatch cross it deliberately.
@@ -243,12 +244,12 @@ the honest answer.
 
 ## 7.5 How to re-check any row
 
-- **Against another implementation.** dnspython is the reference used throughout
+- Against another implementation: dnspython is the reference used throughout
   `TODO.md`; the four environment traps that make a comparison lie are recorded
   there under "Verifying".
-- **Against ourselves.** A signed answer is judged with `verify_rrset`,
+- Against ourselves: a signed answer is judged with `verify_rrset`,
   `proves_nxdomain` and `proves_nodata` — the same code that judges a real zone
   off the internet. Our parser agreeing with our serializer proves nothing
   (`CLAUDE.md` §1).
-- **A new regression test must be shown to fail against the old behaviour.**
-  Revert the fix, run the test, watch it fail, put the fix back.
+- A new regression test must be shown to fail against the old behaviour. Revert
+  the fix, run the test, watch it fail, put the fix back.

@@ -554,36 +554,26 @@ impl ParsedRecord {
         rdata: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<Self, WireError> {
-        // **RDLENGTH=0 is a record that names a type and carries no value**, and
-        // it is legal: RFC 2136 §2.4.1 and §2.4.2 spell "an RRset of this type
-        // exists / does not exist" as TYPE=t, CLASS=ANY or NONE, RDLENGTH=0, and
-        // §2.5.2 and §2.5.3 spell "delete this RRset" the same way. The record
-        // is a *specifier* there, not data, so there is nothing for a per-type
-        // decoder to be given.
+        // RDLENGTH=0 names a type and carries no value, and it is legal:
+        // RFC 2136 §2.4.1/§2.4.2 spell "an RRset of this type exists / does not
+        // exist" as TYPE=t, CLASS=ANY or NONE, RDLENGTH=0, and §2.5.2/§2.5.3
+        // spell "delete this RRset" the same way. The record is a specifier, not
+        // data.
         //
         // Without this the arms below reject it — an A with no bytes is four
-        // bytes short — and because `RecordData::from_wire` runs per record
-        // while the message is being read, **the whole UPDATE became FORMERR at
-        // the wire layer, before `update.rs` ever saw it**. So the half of
-        // `TODO.md` #10 that exists could not receive the messages it
-        // implements: every value-independent prerequisite and every RRset
-        // deletion was unreadable. Nothing caught it because `update.rs`'s tests
-        // build `DnsMessage` structs directly and never cross the wire, which is
-        // `CLAUDE.md` §1 exactly — the tests were written from the same
-        // understanding as the code, so the boundary the real message crosses
-        // was the one thing never exercised.
+        // bytes short — and since `RecordData::from_wire` runs per record while
+        // the message is read, the whole UPDATE became FORMERR before
+        // `update.rs` saw it. Nothing caught that because `update.rs`'s tests
+        // build `DnsMessage` structs directly and never cross the wire.
         //
-        // `Unknown` rather than a per-type empty variant, because "no value" is
-        // the same fact whatever the type is, and because it is already what
-        // happens for a type with no decoder: the bytes (none) are kept verbatim
-        // and the TYPE is carried by the enclosing `RecordData`, so the record
-        // goes back out as the zero-length RDATA it arrived as.
+        // `Unknown` rather than a per-type empty variant: "no value" is the same
+        // fact whatever the type, the bytes (none) are kept verbatim, and the
+        // TYPE is carried by the enclosing `RecordData`.
         //
-        // The cost is that an *answer* holding, say, an A with RDLENGTH 0 now
-        // parses rather than making the whole message FORMERR. That is the right
-        // trade: one useless record relayed as it arrived, against refusing an
-        // entire class of legal message — and RFC 3597 §5 already requires an
-        // implementation to carry RDATA it cannot interpret.
+        // The cost is that an answer holding an A with RDLENGTH 0 parses rather
+        // than making the message FORMERR — one useless record relayed as it
+        // arrived, against refusing a class of legal message. RFC 3597 §5 already
+        // requires carrying RDATA we cannot interpret.
         if rdata.is_empty() {
             return Ok(ParsedRecord::Unknown(record_type));
         }
@@ -953,28 +943,21 @@ pub struct ResourceRecord {
 
 /// How long a record may be cached, in seconds.
 ///
-/// **A `u32`, and clamped at the parse boundary.** RFC 1035 §4.1.3 calls the
-/// field "a 32 bit signed integer", and RFC 2181 §8 corrects it: the TTL is
-/// unsigned, and "implementations should treat TTL values received with the most
-/// significant bit set as if the entire value received was zero". That `.max(0)`
-/// is what [`Ttl::from_wire`] does, once, where the bytes come off the wire.
+/// A `u32`, clamped at the parse boundary. RFC 1035 §4.1.3 calls the field "a 32
+/// bit signed integer"; RFC 2181 §8 corrects it — the TTL is unsigned, and a
+/// value with the top bit set is treated as zero. [`Ttl::from_wire`] does that
+/// `.max(0)` once, where the bytes come off the wire.
 ///
-/// It used to be an `i32` on [`ResourceRecord`], and the clamp was written out
-/// by hand **fourteen times** — `cache`, `negative_cache`, five in `nsec_cache`,
-/// four in `resolver`, `zone_signer`, two in test helpers — plus five
-/// `.min(i32::MAX as u32) as i32` conversions going the other way. Every one of
-/// them was correct. The one that was missing is the bug `CLAUDE.md` §2 records:
-/// `ttl as u64` on a negative TTL is `u64::MAX`, which `min` then picked as the
-/// smallest TTL in an RRset and pinned a cache entry for the life of the
-/// process. §2's rule is that a clamp belongs at the boundary once rather than
-/// at every use, and this is that rule applied to the value it was written for.
+/// It was an `i32` on [`ResourceRecord`] with the clamp written out fourteen
+/// times, plus five `.min(i32::MAX as u32) as i32` going the other way. Every one
+/// was correct; the missing one is `CLAUDE.md` §2's bug — `ttl as u64` on a
+/// negative TTL is `u64::MAX`, which `min` picked as the smallest TTL in an RRset
+/// and pinned a cache entry for the life of the process.
 ///
 /// This could not be done before OPT left the additional section (`TODO.md`
-/// #13d): an OPT record's TTL field is not a TTL at all — it packs the extended
-/// RCODE, the EDNS version and the DO bit — so clamping every `ResourceRecord`
-/// TTL at the parse boundary would have corrupted it. One field with two
-/// meanings depending on a sibling field is exactly the conflation the section
-/// is about, and the two halves had to land in this order.
+/// #13d): an OPT record's TTL field packs the extended RCODE, the EDNS version
+/// and the DO bit, so clamping every `ResourceRecord` TTL would have corrupted
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct Ttl(u32);
@@ -1029,35 +1012,22 @@ impl std::fmt::Display for Ttl {
 
 /// A zone's version number: the SOA's SERIAL field (RFC 1035 §3.3.13).
 ///
-/// **A newtype whose whole content is what it refuses to do.** It has no
-/// `PartialOrd` and no `Ord`, so `a > b` does not compile and
-/// [`Serial::is_newer_than`] is the only way to ask which of two versions is
-/// later. That is the point: serials are RFC 1982 sequence-space numbers, not
-/// integers. They wrap, and 32 bits at one bump a second is 136 years — but a
-/// zone with a date-style serial that is edited past `4294967295`, or one
-/// carried forward from another server, gets there sooner than that argument
-/// suggests, and `signed_serial` adds hours-since-the-epoch to whatever the
-/// operator wrote (`zone_signer::signed_serial`), which brings the ceiling
-/// closer still.
+/// No `PartialOrd` and no `Ord`, so `a > b` does not compile and
+/// [`Serial::is_newer_than`] is the only way to ask which version is later.
+/// Serials are RFC 1982 sequence-space numbers: they wrap, and `signed_serial`
+/// adds hours-since-the-epoch to whatever the operator wrote, which brings the
+/// 32-bit ceiling closer than "136 years at one bump a second" suggests.
 ///
-/// **What a plain `>` costs is not a wrong answer once.** A secondary that reads
-/// a wrapped increment as a rollback declines the transfer, and declines it
-/// again on every refresh for the rest of the zone's life, because the
-/// comparison that rejected it never changes its mind. The zone is frozen and
-/// nothing is in a failed state to alert on.
+/// A plain `>` does not cost one wrong answer: a secondary that reads a wrapped
+/// increment as a rollback declines the transfer and goes on declining it, with
+/// nothing in a failed state to alert on.
 ///
-/// This was already known here and already written down twice.
-/// `secondary::is_newer` had it right and said why; `notify::changed_zones` then
-/// wrote the same wrapping arithmetic out inline with its own copy of the
-/// citation — `CLAUDE.md` §7's shape, in the one piece of arithmetic in DNS most
-/// likely to be got wrong with a `>`. Both are gone; this is the copy.
+/// The arithmetic used to be written out twice, in `secondary::is_newer` and
+/// `notify::changed_zones`. Both are gone; this is the copy.
 ///
-/// **No live defect prompted this** (`TODO.md` #14a). Nothing in the tree
-/// compared two serials with an operator, so there is no regression test that
-/// fails against the old code — the compile error is the test, and it protects
-/// the sites nobody has written yet. `CLAUDE.md` §17 is the argument: a fix that
-/// lives in a type has not recurred here, and a fix that lives at a call site
-/// always has.
+/// No live defect prompted this (`TODO.md` #14a) — nothing compared two serials
+/// with an operator, so there is no regression test and the compile error is the
+/// test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(transparent)]
 pub struct Serial(u32);
@@ -1338,21 +1308,15 @@ pub struct EdnsOption {
 /// the message, not of the OPT record, so it lives in [`DnsMessage::rcode`] as a
 /// single 12-bit value and is split across the header and the OPT TTL only at
 /// serialization time. See [`DnsMessage::to_bytes`].
-/// The option list is held **unparsed**, and that is load-bearing rather than an
-/// optimization.
+/// The option list is held unparsed, which is load-bearing rather than an
+/// optimization: it is the only fallible part, so parsing it with the message
+/// would make a bad list fail `DnsMessage::try_from_bytes` — and `error_bytes`
+/// needs a parsed message to answer from, turning a diagnosable FORMERR into a
+/// client timeout.
 ///
-/// The three fields above it come from the OPT record's CLASS and TTL, so a
-/// parsed record always has them and nothing about them can be malformed —
-/// [`EdnsHeader`] says so already. The option list is the only fallible part,
-/// and if reading it were part of parsing the *message*, a bad list would make
-/// `DnsMessage::try_from_bytes` fail. `rdnsd` returns `Vec::new()` on a parse
-/// failure (`main.rs:1465` and `:2072`) and `error_bytes` needs a parsed message
-/// to answer from, so that would turn today's diagnosable FORMERR into a client
-/// timeout. Keeping the bytes and parsing on demand is what preserves the reply.
-///
-/// It also preserves the allocation profile: the answer path reads the payload
-/// size, the version and the DO bit and never looks at an option, so nothing
-/// builds a `Vec<EdnsOption>` unless something asks for the options.
+/// It also keeps the allocation profile: the answer path reads the payload size,
+/// the version and the DO bit and never looks at an option, so nothing builds a
+/// `Vec<EdnsOption>` unless something asks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edns {
     /// Requestor's/responder's advertised UDP payload size (OPT CLASS field).

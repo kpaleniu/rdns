@@ -1,23 +1,17 @@
 //! The control channel's protocol: one line in, a status line and a body out.
 //!
-//! **Only the protocol lives here.** The commands are `rdnsd`'s and the accept
-//! loop is `rdnsd`'s; what both ends of the socket have to agree on is this
-//! module, and it is shared so the daemon and `rdnsctl` cannot drift about what
-//! a reply means (`CLAUDE.md` §7).
+//! Only the protocol lives here. The commands and the accept loop are `rdnsd`'s;
+//! this is what both ends have to agree on, shared so the daemon and `rdnsctl`
+//! cannot drift about what a reply means (`CLAUDE.md` §7).
 //!
-//! **The shape, and why it is this one.** Every DNS server has a control
-//! channel and they converge on a Unix socket with filesystem permissions —
-//! Knot's `knotc`, PowerDNS's `pdns_control`, Unbound with `control-interface:
-//! /path`. The two that use TCP do not leave it open: BIND's `rndc` carries an
-//! HMAC over the connection and NSD's `nsd-control` wants a client certificate.
-//! Nobody ships an unauthenticated control port, which is the whole argument
-//! against bolting `reload` onto the metrics endpoint, where it would be a POST
-//! with no credential in front of it.
+//! A Unix socket with filesystem permissions, as `knotc`, `pdns_control` and
+//! `unbound-control` use. The two that use TCP put something in front of it —
+//! `rndc` an HMAC, `nsd-control` a client certificate — which is the argument
+//! against bolting `reload` onto the metrics endpoint as an uncredentialed POST.
 //!
-//! So: text, one command per connection, terminated by the close. That makes
-//! `printf 'status\n' | socat - UNIX-CONNECT:/run/rdns/rdnsd.sock` a working
-//! client, which matters more than it sounds — the day the control socket is
-//! needed is the day the box has nothing else installed on it.
+//! Text, one command per connection, terminated by the close, so
+//! `printf 'status\n' | socat - UNIX-CONNECT:/run/rdns/rdnsd.sock` is a working
+//! client on a box with nothing else installed.
 //!
 //! ```text
 //! -> status\n

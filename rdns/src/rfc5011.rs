@@ -1,39 +1,28 @@
 //! Following a trust anchor as it rolls (RFC 5011).
 //!
-//! A trust anchor is a key you decided to believe out of band, which means every
-//! change to one is an out-of-band event: a new build, or an operator editing a
-//! file. That is fine until the key rolls, and the root KSK does roll — at which
-//! point every validator that has not been updated fails closed on the entire
-//! internet. RFC 5011 turns the roll into something a resolver can follow by
-//! itself, using the zone's own signed DNSKEY RRset as the announcement channel.
+//! A trust anchor is a key believed out of band, so every change to one is
+//! normally an out-of-band event — until the key rolls, and the root KSK does.
+//! RFC 5011 makes the roll followable using the zone's own signed DNSKEY RRset as
+//! the announcement channel.
 //!
-//! **The whole safety argument rests on two rules**, and everything here exists
-//! to enforce them:
+//! Two rules carry the safety argument:
 //!
-//! - **A new key is only trusted after a hold-down.** Seeing a key in a
-//!   validated DNSKEY RRset is not enough — it must stay there for 30 days
-//!   ([`ADD_HOLD_DOWN`]). The point is time: an attacker who compromises the
-//!   zone's keys long enough to publish a key of their own has to keep the
-//!   compromise up, and visible, for a month before any validator adopts it.
-//! - **A key is only revoked by itself.** The REVOKE bit means "stop trusting
-//!   this key", and it counts only when the DNSKEY RRset carrying it is signed
-//!   *by that key* (RFC 5011 §2.1). Without that rule, whoever holds any one of
-//!   a zone's keys could retire the others.
+//! - A new key is trusted only after staying in a validated DNSKEY RRset for 30
+//!   days ([`ADD_HOLD_DOWN`]), so an attacker holding the zone's keys must keep
+//!   the compromise up, and visible, for a month before anyone adopts theirs.
+//! - A key is revoked only by itself: the REVOKE bit counts only when the DNSKEY
+//!   RRset carrying it is signed by that key (RFC 5011 §2.1). Otherwise whoever
+//!   holds any one of a zone's keys could retire the others.
 //!
-//! **Everything here presumes the input was validated.** [`ManagedAnchors::observe`]
-//! does not check a signature; it is handed a DNSKEY RRset the caller has already
-//! validated to a currently-trusted anchor, and its whole job is deciding what
-//! that observation means over time. Feeding it unvalidated records is handing an
-//! attacker the trust anchor set, which is the one thing a validator has that
-//! nothing else can re-derive. This is the same posture — and the same warning —
-//! as `NsecCache::insert_validated`.
+//! [`ManagedAnchors::observe`] checks no signature — it is handed an RRset the
+//! caller has already validated to a currently-trusted anchor, and feeding it
+//! unvalidated records hands an attacker the anchor set. Same posture as
+//! `NsecCache::insert_validated`.
 //!
-//! **Key identity here is (algorithm, protocol, public key), not the whole
-//! record.** Revoking a key changes its flags, and therefore its key tag
-//! (RFC 5011 §2.1 is explicit that the tag is computed with the REVOKE bit set).
-//! A tracker that identified keys by tag or by RDATA would see a revocation as an
-//! unrelated new key and start a hold-down on it, which is the opposite of what
-//! happened.
+//! Key identity is (algorithm, protocol, public key), not the whole record:
+//! revoking changes the flags and therefore the key tag (RFC 5011 §2.1), so a
+//! tracker keyed on tag or RDATA would read a revocation as a new key and start a
+//! hold-down on it.
 
 use crate::error::{DnssecError, DnssecResult};
 use crate::Class;

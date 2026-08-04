@@ -1,53 +1,28 @@
 //! Persisting the version steps a zone has been through (`TODO.md` #7 step 6).
 //!
-//! **Why this exists now and did not before.** `ixfr::DeltaLog` remembers what
-//! changed between versions so a secondary can be sent an increment. Until
-//! dynamic UPDATE arrived those steps were recomputed from two versions that
-//! were both still in memory, and forgetting them on restart was correct,
-//! permitted unconditionally by RFC 1995 §4, and self-correcting — the next
-//! change after a restart has a delta again. `ixfr.rs`'s module docs say so, and
-//! they were right.
+//! Needed once dynamic UPDATE was served: the zone moves between reloads, so a
+//! restart discards deltas nothing will recreate, and `MAX_DELTAS_PER_ZONE` (32)
+//! is a long history for an operator editing a file and thirty-two updates for a
+//! DHCP client. Before that, recomputing from two in-memory versions was correct
+//! and self-correcting.
 //!
-//! Two things changed when UPDATE started being served. The zone now moves
-//! **between** reloads rather than only at them, so a restart discards work that
-//! nothing will recreate: the previous versions no longer exist anywhere. And
-//! `MAX_DELTAS_PER_ZONE` is 32, which is a generous history when the only source
-//! of change is an operator editing a file and **thirty-two updates** when it is
-//! a DHCP client. Both of those are capacity arguments the in-memory design
-//! never had to answer.
+//! The format is the zone file's and the framing is RFC 1995's: old SOA, records
+//! deleted, new SOA, records added, in the presentation format `zone_writer`
+//! emits and `zone::parse_zone_file` reads. The positional read below is the same
+//! one `ixfr_response` writes and `secondary` consumes, so a journal entry and a
+//! wire increment cannot drift apart. Safe because `ixfr::diff` excludes the apex
+//! SOA from both lists, so the only apex SOAs in a sequence are the two framing
+//! it.
 //!
-//! **The format is the zone file's, and the framing is RFC 1995's.** Each delta
-//! is written as the difference sequence a client would receive — the old SOA,
-//! the records deleted, the new SOA, the records added — in the presentation
-//! format `zone_writer` already emits and `zone::parse_zone_file` already reads.
-//! Two reasons, and the second is the one that matters. The obvious one is §7:
-//! no second definition of what a record looks like on disk, and the round trip
-//! is already tested. The other is that the *positional* read below — first
-//! record is the old SOA, records until the next apex SOA are deletions, the
-//! rest are additions — is the same read `ixfr_response` writes and `secondary`
-//! consumes, so a journal entry and a wire increment cannot drift into meaning
-//! different things. It is safe because `ixfr::diff` excludes the apex SOA from
-//! both lists: the only apex SOAs in a sequence are the two framing it.
+//! Rewritten whole rather than appended to: `persist::write_atomically` gives
+//! all-or-nothing for a few tens of kilobytes per update. That trade is wrong for
+//! a journal of unbounded size and right for this one.
 //!
-//! **Rewritten whole rather than appended to.** A partial append corrupts the
-//! tail of a file whose reader is this same server at its next start, and
-//! getting append-atomicity right is a protocol to design and test.
-//! `persist::write_atomically` already gives all-or-nothing by writing a
-//! temporary file and renaming it, and the journal is bounded at
-//! `MAX_DELTAS_PER_ZONE` entries of a handful of records each — so rewriting
-//! costs a few tens of kilobytes per update and buys a file that cannot be
-//! half-written. That trade is stated rather than hidden: it is the wrong one
-//! for a journal of unbounded size, and this one is not.
-//!
-//! **A journal that will not read is not fatal.** This is the opposite of the
-//! secondary's state file, where `TODO.md` records that a corrupt file must stop
-//! the server — forgetting a serial there costs a refresh, and forgetting a
-//! *last-contact time* is the difference between a withdrawn zone and a stale
-//! one served with AA set (`CLAUDE.md` §4). Nothing here has teeth: a journal
-//! that cannot be read means some secondaries take a full transfer, which is
-//! what RFC 1995 §4 permits at any time and what happened on every restart
-//! before this file existed. So [`Journal::load`] reports the failure to its
-//! caller to log and carries on, and the caller starts with an empty history.
+//! A journal that will not read is not fatal — unlike the secondary's state file,
+//! where a lost last-contact time is the difference between a withdrawn zone and
+//! a stale one served with AA set. Here it costs some secondaries a full
+//! transfer, which RFC 1995 §4 permits at any time. [`Journal::load`] reports the
+//! failure for its caller to log and starts with an empty history.
 
 use std::path::{Path, PathBuf};
 

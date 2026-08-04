@@ -1,31 +1,13 @@
-//! What one zone lookup costs in cache misses and branch mispredicts.
+//! What one zone lookup costs in cache misses and branch mispredicts — the
+//! diagnostic half of `TODO.md` #11.
 //!
-//! **The diagnostic half of `TODO.md` #11.** `cargo bench` says a miss in a
-//! 10k-record zone is 159 ns; it cannot say whether that is pointer chasing, and
-//! without that a layout change is a guess with a stopwatch attached.
+//! Run under cachegrind, which simulates the cache rather than reading a PMU: it
+//! is deterministic, it models whatever cache size it is told to (the dev box
+//! has 96 MiB of L3, so a 10k-record zone never leaves it and a real LLC counter
+//! would read ~0), and the uncore PMU is not exposed on the Linux side anyway.
 //!
-//! Run under cachegrind, which *simulates* the cache rather than reading a PMU.
-//! Three reasons that is the right instrument here and not a fallback:
-//!
-//! 1. **It is deterministic.** Two runs give identical counts, so a difference
-//!    of a few per cent is signal rather than noise — which is exactly what
-//!    `CLAUDE.md` §10 means by preferring a deterministic assertion to a
-//!    stopwatch.
-//! 2. **It does not care what machine it is on.** The box this was developed on
-//!    is a 9800X3D with **96 MiB of L3**, so a 10k-record zone never leaves last
-//!    level cache and a real LLC counter would read ~0 whatever the layout is.
-//!    Cachegrind simulates whatever cache it is told to, so the question stays
-//!    answerable.
-//! 3. **The uncore PMU is not exposed on the Linux side anyway** — the core counters
-//!    are (verified), but `amd_l3` is not, so `perf` could not read LL misses
-//!    here even if the L3 were small enough for them to mean anything.
-//!
-//! **Setup is cancelled by subtraction, not by instrumentation control.**
-//! Cachegrind counts the whole process, and building a 10k-record zone dwarfs
-//! the lookups. Rather than reach for client requests and a C shim, run the same
-//! binary at `n` and `2n` and subtract: everything that is not a lookup appears
-//! in both and cancels. That is the same shape as
-//! `logging_a_query_costs_the_same_however_many_came_before`.
+//! Setup is cancelled by subtraction: run the same binary at `n` and `2n` and
+//! subtract, so building the zone appears in both.
 //!
 //! ```sh
 //! cargo build --release --example zone_lookup_probe
@@ -33,52 +15,31 @@
 //!     ./target/release/examples/zone_lookup_probe miss 100000
 //! ```
 //!
-//! # What it measured, 2026-08-04
+//! # Measured 2026-08-04
 //!
-//! Per lookup, by subtracting the `n=100_000` run from the `n=200_000` one so
-//! that building the zone cancels. On the Linux side, cachegrind's default
-//! model (32 KiB I1, 48 KiB D1, 128 MiB LL).
+//! Per lookup, `n=200_000` minus `n=100_000`. On the Linux side, cachegrind's
+//! default model (32 KiB I1, 48 KiB D1, 128 MiB LL).
 //!
 //! | | instructions | cond. branches | D1 read misses | LL read misses |
 //! |---|---|---|---|---|
-//! | **hit** | 1,052 | 122 | 6.4 | **0** |
-//! | **miss** | 2,786 | 338 | **< 0.08** | **0** |
+//! | hit | 1,052 | 122 | 6.4 | 0 |
+//! | miss | 2,786 | 338 | < 0.08 | 0 |
 //!
-//! **A miss costs 2.6× a hit and touches almost no memory to do it.** That is
-//! the answer to #11 on the path #11 cared about: `benches/answer_path.rs` calls
-//! the miss "the one to watch: it is what a random-name flood produces", and it
-//! is compute, not pointer chasing. `cg_annotate` says where: **SipHash is 19.8%
-//! of all instructions in the run and 23.2% of all branch mispredicts.** A miss
-//! probes `index`, then `non_terminals`, then walks up the name probing both
-//! again per level, then `format!`s a `*.encloser` key and probes once more —
-//! ~~five or six hashes~~ **three** of a ~25-octet string, plus an allocation.
-//! (The count was a guess from reading the code; callgrind measured it at
-//! exactly three. Corrected here rather than silently, because the guess is why
-//! the callgrind pass was worth running.)
+//! A miss costs 2.6× a hit and touches almost no memory doing it: it is compute,
+//! not pointer chasing. SipHash is 19.8% of all instructions and 23.2% of all
+//! branch mispredicts. The hit path has the real pointer chase (`index` →
+//! `Vec<usize>` → `records[i]`), all of it served by L2.
 //!
-//! **The hit path is the one with a real pointer chase** — 6.4 D1 read misses
-//! walking `index` → `Vec<usize>` → `records[i]` — and every one of them is
-//! served by L2, because the LL miss count is *identical to the digit* across
-//! every run at both sizes. A 10k-record zone simply fits.
+//! The miss-path D1 figure is a bound, not a measurement: `RandomState` reseeds
+//! per process, so three identical runs spread 7,776 D1 read misses against a
+//! signal of 3,630. Tightening it means a fixed-seed `BuildHasher` on `Zone`,
+//! which changes the type under test.
 //!
-//! # The miss-path D1 figure is a bound, not a measurement
+//! # Callgrind, same date
 //!
-//! `HashMap`'s `RandomState` reseeds per process, so the probe sequence — and
-//! therefore which lines are touched — differs run to run. Three identical runs
-//! spread **7,776** D1 read misses, against a signal of 3,630 between `n` and
-//! `2n`. The signal is under the noise, which is why the table says `< 0.08`
-//! rather than a number: `CLAUDE.md` §10's rule about checking a count is stable
-//! before trusting it, applied to a count that turned out not to be.
-//!
-//! # What callgrind added, 2026-08-04
-//!
-//! Cachegrind says what a lookup *costs*; callgrind says how many times and from
-//! where. Run with `--collect-atstart=no --toggle-collect='*probe_loop*'`, so
-//! setup is excluded by instrumentation rather than by subtraction — the two
-//! methods agree to the instruction (2,786 Ir per miss either way), which is
-//! the cross-check that makes both believable.
-//!
-//! Per miss lookup, before the `has_wildcards` short-circuit:
+//! `--collect-atstart=no --toggle-collect='*probe_loop*'`, which agrees with
+//! cachegrind to the instruction (2,786 Ir per miss). Per miss, before the
+//! `has_wildcards` short-circuit:
 //!
 //! | | Ir | share |
 //! |---|---|---|
@@ -88,23 +49,13 @@
 //! | `is_at_or_under` | 227 | 8.2% |
 //! | `delegation_for_key` | 181 | 6.5% |
 //!
-//! **`hash_one::<&str>` is called exactly 3 times per miss**, not the five or
-//! six a reading of the code suggests — 60,000 calls for 20,000 lookups, from
-//! three distinct sites. Call counts are the thing cachegrind could not give,
-//! and the guess they corrected had already been written down.
+//! `hash_one::<&str>` is called exactly 3 times per miss, from three sites — not
+//! the five or six a reading of the code suggests.
 //!
-//! That table is what produced `Zone::has_wildcards`: once the closest encloser
-//! is found, a zone with no wildcard has both remaining branches ending in
-//! `NotFound`, so the `format!`, the delegation check and one of the three
-//! hashes are dead work. Skipping them took the miss path from **2,786 to 1,900
-//! instructions, 31.8%**, with the hit path unchanged to the instruction (1,052
-//! either way, because a hit returns `Exact` before the walk).
-//!
-//! It does not weaken the conclusion — a per-lookup cost buried beneath its own
-//! measurement floor is not a cost worth restructuring a data layout for — but
-//! the honest form of the claim is the bound. Tightening it means giving `Zone`
-//! a fixed-seed `BuildHasher`, which is a change to the type under test and was
-//! not worth it for an answer that is already decisive.
+//! That table produced `Zone::has_wildcards`: with no wildcard in the zone, both
+//! branches after the closest encloser end in `NotFound`, so the `format!`, the
+//! delegation check and one hash are dead work. Skipping them took the miss path
+//! from 2,786 to 1,900 instructions (31.8%), hit path unchanged.
 
 use std::hint::black_box;
 use std::net::Ipv4Addr;

@@ -1,47 +1,30 @@
 //! Dynamic update (RFC 2136): reading an UPDATE, and applying what it asks for.
 //!
-//! **What this module does and does not do.** It turns an UPDATE message into a
-//! checked list of prerequisites and changes, evaluates the prerequisites
-//! against a zone, and applies the changes to produce a new zone — carrying the
-//! serial forward as §3.6 requires. It still never touches a file, looks at a
-//! TSIG key, or decides who may update what. That seam is deliberate:
-//! `TODO.md` #10 lists six things dynamic UPDATE drags in — the prerequisite
-//! language, per-zone authorization, serial handling that collides with
-//! re-signing (#8), incremental re-signing, writing the zone back out, and the
-//! journal (#7 step 6) — and says they must not be designed separately. What is
-//! left on the far side of this module is the *persistence and policy* half.
-//! What it produces is also the shape a journal entry and an IXFR delta both
-//! want.
+//! Turns an UPDATE message into a checked list of prerequisites and changes,
+//! evaluates the prerequisites against a zone, and applies the changes to produce
+//! a new zone, carrying the serial forward as §3.6 requires. It never touches a
+//! file, looks at a TSIG key, or decides who may update what — that is the
+//! persistence-and-policy half, in `rdnsd`. What it produces is also the shape a
+//! journal entry and an IXFR delta both want.
 //!
-//! **The serial is settled here, and it composes with #8 rather than fighting
-//! it.** An UPDATE moves the zone's own serial by one (§3.6); signing serves
-//! `file_serial + hours-since-epoch` ([`crate::zone_signer::signed_serial`]).
-//! Because that term is *added* rather than `max`ed — which is the correction
-//! #8 recorded from PowerDNS's docs — an UPDATE's `+1` survives signing as a
-//! `+1` in the served number, within the same hour and across one. Had signing
-//! taken a `max`, every UPDATE inside one hour would have served the same
-//! serial and no secondary would ever have fetched the change.
+//! The serial: an UPDATE moves the zone's own serial by one (§3.6), and signing
+//! serves `file_serial + hours-since-epoch`
+//! ([`crate::zone_signer::signed_serial`]). Because that term is added rather
+//! than `max`ed, an UPDATE's `+1` survives signing as a `+1` in the served
+//! number; under a `max` every UPDATE inside one hour would serve one serial and
+//! no secondary would fetch any of them.
 //!
-//! The one thing this cannot do for itself: the bumped serial has to be
-//! **persisted**, or a reload re-reads the file's older number and the served
-//! serial goes backwards — which RFC 1982 makes worse than it sounds, since a
-//! secondary reads a lower serial as older and declines to transfer, keeping
-//! signatures that are about to expire. That is the write-back item, and the
-//! reason the journal exists.
+//! The bumped serial has to be persisted by the caller, or a reload re-reads the
+//! file's older number and the served serial goes backwards — which a secondary
+//! reads as older, declining to transfer while its signatures expire.
 //!
-//! **The sections are the ordinary four, renamed** (RFC 2136 §2.2). The question
-//! section is the Zone section, the answer section is the Prerequisite section,
-//! the authority section is the Update section, and the additional section stays
-//! itself — which is where a TSIG goes. So no new wire parsing is needed and
-//! none is done here: [`DnsMessage`] already carries all of it.
+//! The sections are the ordinary four, renamed (RFC 2136 §2.2): question = Zone,
+//! answer = Prerequisite, authority = Update, additional unchanged (where a TSIG
+//! goes). [`DnsMessage`] already carries all of it, so no new wire parsing.
 //!
-//! **Class is the verb.** This is the part of RFC 2136 that surprises people and
-//! the reason the parsing below is a table rather than a few `if`s: an update
-//! record's CLASS says what to *do* with it, not what kind of data it is. The
-//! zone's own class means add, `ANY` (255) means delete a whole RRset or name,
-//! and `NONE` (254) means delete one specific record. `QueryClass::None` being a
-//! real value with a real meaning here — rather than a sentinel — is why
-//! `CLAUDE.md` §2 insisted the parse keep it.
+//! Class is the verb, which is why the parsing below is a table: the zone's own
+//! class means add, `ANY` (255) means delete a whole RRset or name, `NONE` (254)
+//! means delete one specific record.
 
 use crate::utils::{is_at_or_under, record_types as rt};
 use crate::zone::{Zone, ZoneRecord};

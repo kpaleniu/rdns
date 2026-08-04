@@ -1,26 +1,17 @@
 //! What one query costs, measured on optimized code.
 //!
-//! **Why this exists.** `src/bench.rs` timed the same sort of thing from inside
-//! `#[cfg(test)]`, which means every number it printed was a *debug* number —
-//! useless for deciding whether an optimization worked, and unable to see the
-//! defects #9e was about (`TODO.md` #9e's last item). Criterion runs benches
-//! under the release profile, samples until the confidence interval is narrow,
-//! and can compare a run against a saved baseline, which is what an optimization
-//! actually needs. What is left in `src/bench.rs` are two wall-clock *floors*
-//! that guard a complexity class; they are not benchmarks and say so.
+//! Criterion, so these run under the release profile and can be compared against
+//! a saved baseline. `src/bench.rs` timed debug builds; what is left there are two
+//! wall-clock floors guarding a complexity class, which are not benchmarks.
 //!
-//! **Read every number here against the cost of the datagram it sits in.**
-//! Measured on the development machine, 2026-08-01: one `sendto` + one
-//! `recvfrom` on loopback is **3.6 µs on Linux and 4.1 µs on Windows**, and the
-//! whole library-side answer to a plain A query — parse, look up, build,
-//! serialize — is **231 ns on Linux, 455 ns on Windows**. So the entire contents
-//! of this file is around 6% of what a query costs a server, and a 20%
-//! improvement in any of it is worth about 1% end to end. That is not an
-//! argument against measuring; it is the number that stops a 20% win being
-//! reported as one. Anything that claims a *query* got faster has to be measured
-//! against a query, syscalls included.
+//! Read every number here against the cost of the datagram it sits in. Measured
+//! 2026-08-01: one `sendto` + one `recvfrom` on loopback is 3.6 µs on Linux and
+//! 4.1 µs on Windows, and the whole library-side answer to a plain A query is
+//! 231 ns on Linux, 455 ns on Windows. This file is about 6% of what a query
+//! costs a server, so a 20% win here is ~1% end to end. Anything claiming a
+//! *query* got faster has to be measured against a query, syscalls included.
 //!
-//! **Running it.**
+//! Running it:
 //!
 //! ```sh
 //! cargo bench -p rdns                        # everything

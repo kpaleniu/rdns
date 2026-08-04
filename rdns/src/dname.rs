@@ -58,20 +58,16 @@ pub(crate) fn write_bytes(buf: &mut [u8], pos: usize, bytes: &[u8]) -> Result<us
 /// - **`\`** — the escape. A name holding one is written into a zone file that
 ///   no correct reader, this one included, reads back as the same name.
 ///
-/// Refusing is the deliberate choice over resolving escapes: resolving requires
-/// a stored form that can hold a dot *inside* a label, which presentation text
-/// cannot, and that is a different representation (labels or wire bytes — what
-/// PowerDNS, hickory-dns and dnspython all store). `TODO.md` #13e records the
-/// three options and why this is the one taken.
+/// Refusing rather than resolving escapes: resolving needs a stored form that can
+/// hold a dot inside a label, which presentation text cannot — that is a
+/// different representation (labels or wire bytes, what PowerDNS, hickory-dns and
+/// dnspython store). `TODO.md` #13e records the options.
 ///
-/// **Which arm fires where.** The `.` arm is live only at the decode boundary in
-/// [`UnpackedDName`]'s `TryInto<String>`: both encoders split the name on `.`
-/// before calling [`write_label`], so no label they produce can contain one. It
-/// is checked there anyway because the two callers of this function are the two
-/// ends of the same invariant, and a future encoder that builds labels some
-/// other way should not have to rediscover the rule. The `\` arm is live at
-/// both — splitting `a\.b` on `.` yields the label `a\`, which is how a zone
-/// file's escape reaches the writer.
+/// The `.` arm is live only at the decode boundary in [`UnpackedDName`]'s
+/// `TryInto<String>`, since both encoders split on `.` before calling
+/// [`write_label`]; it is checked at both ends anyway so a future encoder does
+/// not have to rediscover the rule. The `\` arm is live at both — splitting
+/// `a\.b` on `.` yields the label `a\`.
 fn unrepresentable_octet(label: &str) -> Option<&'static str> {
     if label.as_bytes().contains(&b'.') {
         return Some("a label containing the label separator");
@@ -355,37 +351,24 @@ impl<'a> DNameUnpacker<'a> {
                         ));
                     }
 
-                    // A pointer must point *backwards*, and that single
-                    // comparison is the whole of cycle prevention: a strictly
-                    // decreasing sequence of `usize` cannot repeat a value, so
-                    // a cycle is unreachable rather than detected.
+                    // A pointer must point backwards, and that comparison is
+                    // the whole of cycle prevention: a strictly decreasing
+                    // sequence of `usize` cannot repeat, so a cycle is
+                    // unreachable rather than detected. RFC 1035 §4.1.4 defines
+                    // compression as a pointer "to a prior occurance of the
+                    // same name" (the RFC's spelling), so no real sender emits
+                    // a forward one. This replaced a `RefCell<HashSet<usize>>`
+                    // of visited offsets — a heap allocation per compressed
+                    // name, on the pre-authentication parse path.
                     //
-                    // RFC 1035 §4.1.4 defines compression as replacing a name
-                    // "with a pointer to a prior occurance of the same name"
-                    // (the RFC's spelling), so a pointer that does not go
-                    // backwards is not compression and no real sender emits
-                    // one. What this replaced was a `RefCell<HashSet<usize>>`
-                    // of visited offsets, inserted and removed around every
-                    // hop — a heap allocation per compressed name, on the
-                    // pre-authentication parse path, to answer at run time a
-                    // question arithmetic answers for free.
-                    //
-                    // **The first hop is not constrained, and that is
-                    // deliberate.** A name is parsed from a slice that does not
-                    // know its own offset in the message: `dname_from_bytes`
-                    // is handed the remaining bytes, and every caller in
-                    // `lib.rs` passes a suffix of the RDATA it is walking. So
-                    // there is no start offset to compare the first target
-                    // against, and one forward jump is still accepted. Every
-                    // hop after it must decrease, which is what makes the chain
-                    // finite — termination is the property being bought, and a
-                    // single unconstrained step does not cost it. Threading the
-                    // absolute offset through would buy the stricter rule, and
-                    // the only way to recover it from a suffix slice is pointer
-                    // arithmetic against `self.data`, which is correct exactly
-                    // as long as the caller passes a slice derived from the
-                    // message — an invariant no type here states (`CLAUDE.md`
-                    // §4, §17).
+                    // The first hop is unconstrained, deliberately: a name is
+                    // parsed from a suffix slice that does not know its own
+                    // offset, so there is nothing to compare the first target
+                    // against. Termination is the property being bought, and
+                    // one unconstrained step does not cost it. Recovering the
+                    // absolute offset would mean pointer arithmetic against
+                    // `self.data`, correct only if every caller passes a slice
+                    // derived from the message — an invariant no type states.
                     if *offset >= prev_target {
                         return Err(WireError::malformed(
                             "a compression pointer",

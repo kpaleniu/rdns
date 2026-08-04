@@ -1,18 +1,9 @@
 # 5. The resolver (`rdns::resolver`, `rdnsr`)
 
-Recursion and forwarding are **two modes of one resolver**, not two programs —
-the client-facing half is identical and only the means of obtaining an answer
-differs, which is how BIND, Unbound, Knot Resolver and PowerDNS Recursor all
-model it. Mixed deployments (forward one zone, recurse the rest) are ordinary.
+Recursion and forwarding are two modes of one resolver; only the means of
+obtaining an answer differs. `rdnsr` is a separate binary from `rdnsd`.
 
-`rdnsr` is a **separate binary from `rdnsd`**, following the NSD/Unbound and
-Knot/Knot-Resolver precedent: opposite trust models (serving the public versus
-serving your clients), different data (zones versus a cache), independent
-lifecycle, and no risk of an accidental open resolver.
-
-Everything is async `tokio::net`. Each hop is an `await` on a socket, so a
-resolution taking several round trips yields at every one rather than pinning a
-thread for the sum of them.
+Everything is async `tokio::net`. Each hop is an `await` on a socket.
 
 ---
 
@@ -24,43 +15,35 @@ thread for the sum of them.
 |---|---|---|
 | `mode` | `Recurse` | any `--upstream` switches to `Forward` |
 | `upstream_servers` | 8.8.8.8:53, 1.1.1.1:53 | Forward mode only |
-| `root_hints` | built-in, **v4/v6 interleaved** | so whichever family the host has is reached in the first hop or two, before RTT selection has data |
+| `root_hints` | built-in, v4/v6 interleaved | so either family is reached in the first hop or two, before RTT selection has data |
 | `timeout_ms` | 5000 | per query |
 | `max_delegations` | 16 | referrals followed before giving up |
 | `max_cname_hops` | 8 | |
-| `query_budget` | **64** | total upstream queries one `resolve` may spend |
+| `query_budget` | 64 | total upstream queries one `resolve` may spend |
 | `udp_payload_size` | 4096 | advertised upstream |
 | `delegation_cache_size` | 10 000 | 0 disables, which restarts every query at the root |
-| `qname_minimization` | **on** | RFC 9156 |
-| `zero_x20` | **on** | draft-vixie-dnsext-dns0x20 |
-| `server_port` | 53 | configurable only so tests can stand up a fake hierarchy |
-| `dnssec` | `None` | off by default: validation costs round trips and turns a misconfigured zone into a failure |
+| `qname_minimization` | on | RFC 9156 |
+| `zero_x20` | on | draft-vixie-dnsext-dns0x20 |
+| `server_port` | 53 | configurable so tests can stand up a fake hierarchy |
+| `dnssec` | `None` | off by default |
 
 `--root-hints <file>` reads named.root format. A stray line is skipped rather
-than sinking the file (`parse_root_hints` returns a `Vec`), and the caller decides
-what an empty result means.
+than sinking the file (`parse_root_hints` returns a `Vec`).
 
 ---
 
 ## 5.2 Query hygiene — what goes out
 
-Every outgoing query carries:
-
-- a **random transaction id**;
-- a **random source port** (a fresh socket per query);
-- **0x20 case randomization** of the QNAME when enabled. A response must echo the
-  question, so the casing is entropy an off-path spoofer must guess on top of the
-  id and the port.
+Every outgoing query carries a random transaction id, a random source port (a
+fresh socket per query), and 0x20 case randomization of the QNAME when enabled.
 
 Every response is checked against the query it answers (`response_matches`):
-transaction id, question count, QNAME **byte-exact** when 0x20 is on and
+transaction id, question count, QNAME byte-exact when 0x20 is on and
 case-insensitively when it is off, QTYPE and QCLASS. A mismatch is discarded, not
 answered from.
 
-With `--dnssec-validate`, every query also carries **DO** (so servers include
-signatures) and **CD** (so a forwarded query reaches us unfiltered — an upstream
-that validates on our behalf and hands back SERVFAIL leaves us nothing to check,
-which is the same as trusting it).
+With `--dnssec-validate`, every query also carries DO and CD — an upstream that
+validates on our behalf and returns SERVFAIL leaves us nothing to check.
 
 ---
 
@@ -80,125 +63,91 @@ loop, bounded by max_delegations and by the query budget:
 
 ### Bailiwick rules
 
-- **A referral must be a descendant of the zone that gave it.** A zone answering
-  with a referral to something above or beside itself is ignored — that is a
-  redirection out of its authority.
-- **Glue is used only when in bailiwick.** An address record for a name outside
-  the referring zone is discarded; a nameserver with no usable glue is resolved
-  separately (a "glueless delegation"), and that resolution spends from the same
-  budget.
+- A referral must be a descendant of the zone that gave it; anything above or
+  beside is ignored.
+- Glue is used only when in bailiwick. A nameserver with no usable glue is
+  resolved separately, spending from the same budget.
 
-### The budget — the NXNSAttack defence
+### The budget
 
-One `resolve` may spend `query_budget` upstream queries **in total**, across
-delegations, CNAME hops and nameserver-address lookups. A hostile zone can answer
-with a referral naming dozens of glueless nameservers, each costing a full
-resolution; bounding the *total* is what stops one client query becoming hundreds.
-
-Exhausting it is `ResolveError::BudgetExhausted` — a distinct variant because it
-is an operational signal, not a lookup failure.
+One `resolve` may spend `query_budget` upstream queries in total, across
+delegations, CNAME hops and nameserver-address lookups — the NXNSAttack defence.
+Exhausting it is `ResolveError::BudgetExhausted`.
 
 ### QNAME minimisation (RFC 9156)
 
-Each server up the chain is asked only for the label being delegated, so the root
-learns the TLD and no more; the leaf is revealed only to the server authoritative
-for it.
+Each server up the chain is asked only for the label being delegated.
 
-- The probe QTYPE is **A**, not NS. RFC 9156 §2.3 replaced RFC 7816's NS advice
-  with "the QTYPE least likely to raise issues in DNS software and middleboxes".
-- **`MAX_MINIMISE_COUNT` is capped at the RFC's recommended 10.** Without the
-  ceiling a 34-label reverse-IPv6 PTR spent ~30 round trips and exhausted the
-  budget, so a deep name failed outright where it should degrade to a full-QNAME
-  query that still resolves.
-- An empty non-terminal encountered mid-walk is probed and passed through rather
-  than mistaken for the end of the chain.
+- The probe QTYPE is A, not NS (RFC 9156 §2.3).
+- `MAX_MINIMISE_COUNT` is 10, the RFC's recommendation; past it the resolver
+  degrades to a full-QNAME query.
+- An empty non-terminal encountered mid-walk is probed and passed through.
 
 ### Server selection — `RttStore`
 
 Smoothed RTT per server address, capacity-bounded, evicting the slowest. Servers
 for a zone are tried fastest-first; a server that fails is deprioritised
-immediately rather than after the next timeout.
+immediately.
 
 ### The delegation cache
 
-`zone -> (servers, expiry)`, keyed by name, longest-match. This is the difference
-between a toy recursor and a usable one: without it every client query costs a
-root round trip, which is slow and — at volume — abusive enough that root
-operators rate-limit it. With it, the root is consulted roughly once per TLD per
-TTL. A stale entry falls back to the root.
+`zone -> (servers, expiry)`, keyed by name, longest-match. The root is consulted
+roughly once per TLD per TTL. A stale entry falls back to the root.
 
 ### Truncation
 
-A UDP response with TC=1 is retried over TCP by the resolver itself
-(`query_upstream_tcp`). A TCP response that is *still* truncated is returned as
-it is — there is nowhere further to go. A zero-length TCP frame from an upstream
-is an error, not an empty answer.
+A UDP response with TC=1 is retried over TCP (`query_upstream_tcp`). A TCP
+response that is still truncated is returned as it is. A zero-length TCP frame
+from an upstream is an error, not an empty answer.
 
 ---
 
 ## 5.4 `rdnsr` — the daemon
 
 UDP and TCP on one host:port, both spawned; whichever fails first takes the
-process down. Binds **127.0.0.1 by default**, so it is not accidentally exposed
-as an open resolver.
+process down. Binds 127.0.0.1 by default.
 
 ### Per-query path (`handle_query`, shared by both transports)
 
-1. **`validation::Request::from_bytes`** — parses and refuses QR=1. Both failures
-   are silence: the peer did not ask anything, and answering a response is how a
-   resolver becomes a packet engine between two instances pointed at each other.
-2. **Opcode**: anything but QUERY is NOTIMP with the opcode echoed.
-3. **EDNS sanity**: malformed option list → FORMERR; version > 0 → BADVERS.
-4. **Special-use names** (`special_names::lookup`) — answered locally, never
-   forwarded, **before every cache and before any resolution**: for these the
-   table *is* the answer. AD is never set — nothing here was validated, it was
-   decided by specification. Not skipped for a client with CD, which is a
-   statement about DNSSEC and not a request to be told what a public server
-   thinks `localhost` is. See §5.6.
-5. **RFC 8198 synthesis from validated denials**, skipped when the client set CD
-   (an answer we invented from cached proofs is exactly what CD asks us not to
-   do). Checked **before** the answer cache: a cached NSEC answers every question
-   in its gap, so a flood of random names under one zone costs one upstream query
-   rather than one per name. The **positive** half (§5.3, a validated wildcard
-   answering a name nobody has asked about yet) is tried first — the two are
-   mutually exclusive by construction, since a cached NXDOMAIN needs the wildcard
-   *denied*.
-6. **Answer cache**, then **negative cache**.
-7. **Miss** → `Resolver::resolve` (recursion or forwarding).
-8. **Validation**, if `--dnssec-validate`: AD is set only on `Secure`; `Bogus` is
+1. `validation::Request::from_bytes` — parses and refuses QR=1. Both failures are
+   silence.
+2. Opcode: anything but QUERY is NOTIMP with the opcode echoed.
+3. EDNS sanity: malformed option list → FORMERR; version > 0 → BADVERS.
+4. Special-use names (`special_names::lookup`) — answered locally, never
+   forwarded, before every cache and before any resolution. AD is never set. Not
+   skipped for a client with CD. See §5.6.
+5. RFC 8198 synthesis from validated denials, skipped when the client set CD.
+   Checked before the answer cache, so a flood of random names under one zone
+   costs one upstream query rather than one per name. The positive half (a
+   validated wildcard) is tried first; the two are mutually exclusive by
+   construction.
+6. Answer cache, then negative cache.
+7. Miss → `Resolver::resolve`.
+8. Validation, if `--dnssec-validate`: AD is set only on `Secure`; `Bogus` is
    SERVFAIL unless the client set CD.
-9. **Cache store** by (name, type) with the answer's TTL, **and its validation
-   state alongside it** — so an answer served from cache carries the same AD bit
-   the first client saw and no other.
-10. **Reply**, echoing the transaction id with RA set and the OPT record mirrored
-   only if the client used EDNS, sized by transport (`Transport::Udp` uses the
-   client's advertised payload size; `Transport::Tcp` uses the 2-byte frame).
+9. Cache store by (name, type) with the answer's TTL, and its validation state
+   alongside it, so a cached answer carries the same AD bit the first client saw.
+10. Reply, echoing the transaction id with RA set and the OPT record mirrored
+    only if the client used EDNS, sized by transport (`Transport::Udp` uses the
+    client's advertised payload size; `Transport::Tcp` uses the 2-byte frame).
 
 ### Concurrency
 
 | bound | value | note |
 |---|---|---|
-| `--max-inflight-udp` | 1024 | a task per datagram; a recursion is *seconds* of waiting, so a small worker pool would be idle and slow at once. Floored at 1, no off switch: "off" here is the defect this closes |
-| `MAX_TCP_CONNECTIONS` | 128 | without one, an accept loop that spawns per connection is a free fd-exhaustion vector |
-| `MAX_INFLIGHT_PER_CONNECTION` | 16 | also the reply channel's depth, so a client pipelining faster than it reads pushes back on the read loop rather than growing a queue |
+| `--max-inflight-udp` | 1024 | a task per datagram; a recursion is seconds of waiting. Floored at 1, no off switch |
+| `MAX_TCP_CONNECTIONS` | 128 | |
+| `MAX_INFLIGHT_PER_CONNECTION` | 16 | also the reply channel's depth, so a client pipelining faster than it reads pushes back on the read loop |
 
-Over the UDP ceiling the datagram is dropped **before** it is copied and before
-any task is spawned. Dropping is silent and logged at `debug` — a reply to a
-spoofed source is what an amplifier sends.
+Over the UDP ceiling the datagram is dropped before it is copied and before any
+task is spawned, silently, logged at `debug`.
 
-> **Gap G-1 — fixed 2026-08-03.** ~~`rdnsr` runs no per-source rate limiter, no
-> response-byte budget, no query logger, no metrics and no readiness probe.
-> `rdnsd` has all five, and the implementations are in the shared library.~~
-> `--query-rate` (200/s, burst 100, with exemptions), `--response-rate` (8192)
-> and `--metrics-listen` are all wired in through those same library types. No
-> `/readyz` that means anything: a resolver has nothing to wait for before it can
-> answer. See `07-rfc-conformance.md`.
-
-> **Gap G-2 — fixed 2026-08-03.** ~~`rdnsr` does not run `RequestValidator`, so
-> a request over the UDP size cap or with absurd section counts reaches the
-> parser rather than being refused before it.~~ It runs `AdmissionCheck` on the
-> pre-admission path now, after the rate limit and before the in-flight
-> semaphore. See `07-rfc-conformance.md`.
+> Gaps G-1 and G-2 — fixed 2026-08-03. ~~`rdnsr` runs no per-source rate limiter,
+> response-byte budget, query logger, metrics, readiness probe or request
+> validator.~~ `--query-rate` (200/s, burst 100, with exemptions),
+> `--response-rate` (8192), `--metrics-listen` and `AdmissionCheck` are all wired
+> in through the shared library types. No `/readyz`: a resolver has nothing to
+> wait for. See `07-rfc-conformance.md`.
 
 ---
 
@@ -210,24 +159,21 @@ spoofed source is what an amplifier sends.
 | `NegativeCache` (RFC 2308) | (folded name, qtype) | its own | `MAX_NEGATIVE_TTL` = 3600 s |
 | `NsecCache` (RFC 8198) | zone → validated denial records | 1000 zones | the records' own |
 
-- Keys go through `utils::NameKeyBuf`, whose only constructor folds — so
-  `WWW.example.com.` and `www.example.com.` cannot become two entries.
-- **The negative TTL is `min(SOA MINIMUM, the SOA record's own TTL)`**
+- Keys go through `utils::NameKeyBuf`, whose only constructor folds.
+- The negative TTL is `min(SOA MINIMUM, the SOA record's own TTL)`
   (RFC 2308 §3).
-- `--no-cache` is a **zero-capacity `DnsCache`** (`put` is a no-op at 0) rather
-  than an `Option`, so there is no second code path to keep in step.
-- Eviction halves the map with `select_nth_unstable` rather than re-scanning for
-  a single victim. Expiries are whole seconds, so a cache filled in one burst has
-  every entry on one value — `retain(|e| e.expires_at > cutoff)` would empty the
-  whole cache instead of halving it, and the tie case has its own test.
+- `--no-cache` is a zero-capacity `DnsCache` (`put` is a no-op at 0), not an
+  `Option`.
+- Eviction halves the map with `select_nth_unstable`. Expiries are whole seconds,
+  so a burst-filled cache has every entry on one value and a `retain` on the
+  cutoff would empty it instead of halving it.
 
 ---
 
 ## 5.6 Names that never leave (`special_names.rs`)
 
-Answered locally, never forwarded, each with a reason recorded for the log
-because "the resolver said this name does not exist" is a thing people debug.
-Local TTL 3600.
+Answered locally, never forwarded, each with a reason recorded for the log. Local
+TTL 3600.
 
 | name | answer | RFC |
 |---|---|---|
@@ -235,7 +181,7 @@ Local TTL 3600.
 | `1.0.0.127.in-addr.arpa.` PTR | `localhost.` | 6303 §4.2 |
 | `127.in-addr.arpa.` and below | NXDOMAIN | 6303 §4.2 |
 | `local.` and below | NXDOMAIN — mDNS, not DNS | 6762 §3 |
-| `invalid.` and below | NXDOMAIN — reserved to not exist | 6761 §6.4 |
+| `invalid.` and below | NXDOMAIN | 6761 §6.4 |
 | RFC 1918 reverse zones (`10.`, `16–31.172.`, `168.192.in-addr.arpa.`) | NXDOMAIN | 6303 §4 |
 
 ---
@@ -248,7 +194,5 @@ rules, rewrites the file, and swaps the live anchor set through `SharedAnchors`
 without a restart. Every change is reported at `info`.
 
 `SharedAnchors` is a `std::sync::RwLock`, not tokio's: every use is a
-clone-and-release with no await inside, so an async lock would buy nothing and
-cost the chance of holding a guard across a suspension point. A **poisoned** lock
-uses the recovered value rather than panicking — validating against a set nobody
-finished writing is worse than not validating.
+clone-and-release with no await inside. A poisoned lock uses the recovered value
+rather than panicking.

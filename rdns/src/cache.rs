@@ -517,16 +517,13 @@ mod tests {
     /// see any of this — it only ever calls `get` on an empty cache.
     /// A panic under the cache mutex must cost the cache, not the process.
     ///
-    /// `.lock().unwrap()` was on all four of this type's lock sites, two of them
-    /// on `rdnsr`'s query path — and mutex poisoning is *permanent*, so one
-    /// panic under that lock, ever, would have made every later query panic as
-    /// well. A resolver taken off the air by a fault it had already survived,
-    /// which is `CLAUDE.md` §6's "one reachable panic under a shared lock takes
-    /// the whole process off the air permanently".
+    /// `.lock().unwrap()` was on all four of this type's lock sites, two on
+    /// `rdnsr`'s query path. Mutex poisoning is permanent, so one panic under
+    /// that lock would make every later query panic too.
     ///
-    /// Degrading is what a cache may do (§4): the answers are gone, the next
-    /// client pays a round trip, and the process keeps serving. Against the old
-    /// code every assertion below panics instead of failing.
+    /// Degrading is what a cache may do: the answers are gone, the next client
+    /// pays a round trip, the process keeps serving. Against the old code every
+    /// assertion below panics instead of failing.
     #[test]
     fn a_poisoned_lock_costs_the_cache_and_not_the_process() {
         let cache = DnsCache::with_defaults();

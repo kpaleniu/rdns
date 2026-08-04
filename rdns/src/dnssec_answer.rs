@@ -1,14 +1,12 @@
 //! What a signed answer carries beyond the records themselves.
 //!
-//! A signed zone is not a signed *answer*. The signatures sit in the zone
-//! beside the data, and until something puts the right ones in the right
-//! section of the right reply, a validating client sees an unsigned answer from
-//! a zone the parent says is secure — which is not "insecure", it is bogus.
-//! This module is the step in between: given the zone and the question, it says
-//! which DNSSEC records the reply needs.
+//! A signed zone is not a signed answer: until the right signatures are in the
+//! right section of the right reply, a validating client sees an unsigned answer
+//! from a zone the parent says is secure — which is bogus, not insecure. Given
+//! the zone and the question, this says which DNSSEC records the reply needs.
 //!
-//! **Nothing here is optional to a validator, and that is the design
-//! constraint.** Three of the four shapes owe a proof rather than a signature:
+//! Nothing here is optional to a validator. Three of the four shapes owe a proof
+//! rather than a signature:
 //!
 //! - a wildcard answer owes a denial of the name that was actually asked for,
 //!   because the same signature verifies at every name that wildcard reaches

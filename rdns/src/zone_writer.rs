@@ -1,33 +1,24 @@
 //! Writing a [`Zone`] back out as a zone file.
 //!
-//! The format is the text presentation format the parser already reads, chosen
-//! over anything more compact for one reason: the load path is then the one that
-//! is already written, already tested, and already the thing operators hand the
-//! server. A private serialization would be a second definition of what a zone
-//! is, and the two would drift.
+//! The format is the presentation format the parser already reads, so the load
+//! path is the one already written and tested. A private serialization would be
+//! a second definition of what a zone is.
 //!
-//! **Every line stands on its own.** Owner names are written absolute and every
-//! record states its TTL and class, so nothing in the file depends on which
-//! directives precede it. `$ORIGIN` and `$TTL` are still emitted — other tools
-//! expect them, and the origin is worth recording in the file rather than
-//! leaving it implied by the file's name — but removing them would not change
-//! how any of this reads back.
+//! Every line stands on its own: owner names absolute, TTL and class stated, so
+//! nothing depends on which directives precede it. `$ORIGIN` and `$TTL` are still
+//! emitted because other tools expect them.
 //!
-//! **The rule the whole module is built around: what is written must read back
-//! as the same bytes.** A zone this server fetched may be signed, and a
-//! signature covers RDATA octet for octet — re-spelling a record in a way that
-//! re-encodes even slightly differently turns a valid RRset into a bogus one,
-//! and the failure would appear at a validating client rather than here. So
-//! every record is rendered type-specifically only when that rendering provably
-//! round-trips; otherwise it goes out in RFC 3597 §5's generic `\# <len> <hex>`
-//! form, which is exact by construction. That fallback is also what lets a zone
-//! holding types this library has no parser for be persisted at all.
+//! The rule the module is built around: what is written must read back as the
+//! same bytes. A fetched zone may be signed, and a signature covers RDATA octet
+//! for octet, so a re-spelling that re-encodes differently turns a valid RRset
+//! bogus at a validating client. A record is therefore rendered
+//! type-specifically only where that provably round-trips, and otherwise in
+//! RFC 3597 §5's `\# <len> <hex>` form — which is also what lets a zone holding
+//! unparsed types be persisted at all.
 //!
-//! The one thing that cannot fall back is an owner name: it is the first field
-//! of the line, not RDATA, and this parser has no escape syntax for a label
-//! containing a dot or a space (see the zone-parser gaps in TODO.md). Such a
-//! name is refused rather than written as something that would read back as a
-//! different name.
+//! An owner name cannot fall back: it is the first field of the line, not RDATA,
+//! and this parser has no escape syntax for a label containing a dot or a space.
+//! Such a name is refused rather than written as a different name.
 
 use crate::error::ZoneError;
 use crate::Class;

@@ -486,30 +486,23 @@ pub(crate) async fn expire_if_out_of_contact(
 
 /// Withdraw every replicated zone whose age we cannot vouch for.
 ///
-/// **Called after each time the zone map is filled from disk** — at startup and
-/// after every reload — because that is exactly when a file whose contents
-/// expired can come back. It used to run from `main` only, so a `SIGHUP` re-read
-/// every `.zone` file and served it again without consulting the sidecar: a zone
-/// correctly withdrawn because its primary had been unreachable for a week came
-/// straight back, **with AA set**, which is the "permanently wrong answers nobody
-/// can see are wrong" the withdrawal exists to prevent. Expiry that lasts only
-/// until the next deploy is not expiry.
+/// Called after each fill of the zone map from disk — startup and every reload —
+/// because that is when a file whose contents expired can come back. Running it
+/// from `main` only meant a SIGHUP re-read every `.zone` file and served it again
+/// with AA set, so a zone withdrawn because its primary had been unreachable for
+/// a week returned at the next deploy.
 ///
-/// Two ways a zone fails to earn an answer, and the second one was the hole:
+/// Two ways a zone fails to earn an answer:
 ///
-/// - Its last successful contact is older than the SOA's EXPIRE. The plain case.
-/// - **There is no record of contact at all**, while the zone is loaded — so it
-///   came off disk. A missing sidecar, an unreadable one, or an entry for another
-///   master all land here. `StateFile::load` returns empty by design and never
-///   fails, which is right for a cache and wrong for expiry: forgetting the
-///   last-contact time *is* the difference between withdrawn and served, so
-///   unknown age has to mean "do not serve" rather than "serve and hope". The
-///   zone comes back at the first successful transfer, which is seconds away and
-///   is the thing that makes it ours to answer for.
+/// - Its last successful contact is older than the SOA's EXPIRE.
+/// - There is no record of contact at all while the zone is loaded, so it came
+///   off disk — a missing sidecar, an unreadable one, or an entry for another
+///   master. `StateFile::load` returns empty and never fails, which is right for
+///   a cache and wrong for expiry, so unknown age means "do not serve". The zone
+///   returns at the first successful transfer.
 ///
 /// A zone we hold but do not replicate is never touched: the loop is over the
-/// `--secondary` specs, so a primary zone sharing the directory is not this
-/// function's business.
+/// `--secondary` specs.
 pub(crate) async fn withdraw_unvouched_zones(
     specs: &[MasterSpec],
     served: &Served,

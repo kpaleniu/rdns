@@ -1,22 +1,15 @@
 //! Two wall-clock floors that guard a complexity class. **Not benchmarks.**
 //!
-//! The benchmarks are in `benches/answer_path.rs` and run under criterion, which
-//! measures optimized code and can compare a run against a saved baseline. This
-//! file used to hold nine `#[test]`s that timed things in a **debug** build and
-//! asserted an ops/sec floor, which is neither: a debug number cannot judge an
-//! optimization, and most of those floors guarded nothing that could regress in
-//! a way a floor would notice (`TODO.md` #9e).
+//! The benchmarks are in `benches/answer_path.rs`, under criterion. This file
+//! used to hold nine `#[test]`s timing a *debug* build against an ops/sec floor,
+//! which is neither (`TODO.md` #9e).
 //!
-//! What is left are the two where the floor *is* the point — where the thing
-//! being asserted is not "this is fast" but "this has not gone back to being
-//! O(n)". Those belong in `cargo test`, where CI runs them on every commit,
-//! rather than in a benchmark nobody runs before a change. Both have a factor of
-//! ten or more of headroom for exactly the reason `CLAUDE.md` §10 gives: a
-//! wall-clock assertion with no headroom is a coin toss, not a test.
+//! What is left are the two where the assertion is "this has not gone back to
+//! being O(n)" rather than "this is fast", so they belong in `cargo test` where
+//! CI runs them. Both have a factor of ten or more of headroom (`CLAUDE.md` §10).
 //!
-//! The file keeps its name because the history references it — `CLAUDE.md` §10
-//! and several `TODO.md` entries name `bench_logger_throughput` and
-//! `bench_zone_lookup` as the examples they argue from.
+//! The file keeps its name because `CLAUDE.md` §10 and several `TODO.md` entries
+//! argue from `bench_logger_throughput` and `bench_zone_lookup` by name.
 //!
 //! Seven went, and what replaced each:
 //!

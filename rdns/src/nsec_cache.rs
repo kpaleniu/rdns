@@ -1,20 +1,17 @@
 //! Aggressive use of DNSSEC-validated denial of existence (RFC 8198).
 //!
-//! An NSEC record does not say "this one name does not exist". It says "nothing
-//! exists between these two names", and it is signed. So a validator that has
-//! one in hand already knows the answer for *every* name in that gap, and
-//! asking the authoritative server again learns nothing it was not already
-//! told. Caching the gap rather than the question is what turns a random-name
-//! flood — the shape of a water-torture attack, and of any typo storm — from
-//! one upstream query per name into one query per zone.
+//! A signed NSEC says "nothing exists between these two names", so a validator
+//! holding one already knows the answer for every name in that gap. Caching the
+//! gap rather than the question turns a random-name flood into one upstream query
+//! per zone.
 //!
-//! This is not the ordinary cache with a different key. [`crate::DnsCache`] maps
-//! `(name, type)` to records, which can only ever answer the question it was
-//! asked; a gap has to be searched by *range*, which is why the proofs live here
-//! in a `BTreeMap` ordered by [`canonical_sort_key`] instead.
+//! Not the ordinary cache with a different key: [`crate::DnsCache`] maps
+//! `(name, type)` to records and can only answer the question it was asked, where
+//! a gap has to be searched by range — hence the `BTreeMap` ordered by
+//! [`canonical_sort_key`].
 //!
-//! Everything here is a way of *not* asking, so every mistake is invisible until
-//! it denies a name that exists. The rules that keep that from happening:
+//! Every mistake here is invisible until it denies a name that exists. The rules
+//! that prevent that:
 //!
 //! - **Only Secure material.** An unvalidated NSEC is an attacker's assertion
 //!   about which names do not exist, which is a denial-of-service primitive.
@@ -438,30 +435,23 @@ impl NsecCache {
     ///
     /// Two things must hold, and the second is the one that is easy to get wrong.
     ///
-    /// **The name must be proved not to exist**, by a cached NSEC covering it —
-    /// otherwise a wildcard would be answering for a name that has records of its
-    /// own, which an existing name shadows entirely (RFC 1034 §4.3.3).
+    /// The name must be proved not to exist by a cached NSEC covering it —
+    /// otherwise a wildcard would answer for a name that has records of its own,
+    /// which shadow it entirely (RFC 1034 §4.3.3).
     ///
-    /// **The wildcard must be the one that governs the name**, which here means
-    /// `*.<the name's immediate parent>` and nothing shallower.
+    /// The wildcard must be `*.<the name's immediate parent>` and nothing
+    /// shallower. Real synthesis is not limited to one label (RFC 4592 §3.3.1,
+    /// §3.3.2), and the restriction here is the safety property: choosing the
+    /// closest encloser needs to know which intermediate names exist, which a
+    /// resolver's cache does not. `*.example.com.` may answer for
+    /// `a.b.example.com.` only if `b.example.com.` does not exist, and a covering
+    /// NSEC cannot establish that — a name sorts before everything beneath it, so
+    /// `b.example.com.`'s own NSEC covers `a.b.example.com.` either way. Deriving
+    /// the wildcard from the queried name rather than searching for one that fits
+    /// makes the mistake unavailable.
     ///
-    /// A wildcard is *not* limited to one label — the source of synthesis is the
-    /// wildcard immediately below the closest encloser, which may be several
-    /// labels up (RFC 4592 §3.3.1, §3.3.2). This cache restricts itself to the
-    /// immediate parent anyway, and the restriction is the safety property:
-    /// deciding the closest encloser needs to know which intermediate names
-    /// *exist*, and a resolver's cache does not know that. `*.example.com.` may
-    /// legitimately answer for `a.b.example.com.` — but only if `b.example.com.`
-    /// does not exist, and "some cached NSEC covers the name" cannot establish
-    /// that: a name sorts before everything beneath it, so `b.example.com.`'s own
-    /// NSEC covers `a.b.example.com.` whether or not `b` is there. Deriving the
-    /// wildcard from the queried name rather than searching for one that fits is
-    /// what makes the mistake unavailable.
-    ///
-    /// The cost is a missed synthesis, which is a cache miss and a real query —
-    /// the safe direction. Widening this needs a cached proof about the
-    /// *intermediate* names, which is a separate piece of work (see `TODO.md`
-    /// #9a's note on aggressive use).
+    /// The cost is a missed synthesis: a cache miss and a real query. Widening it
+    /// needs a cached proof about the intermediate names (`TODO.md` #9a).
     pub fn synthesize_wildcard(&self, qname: &str, qtype: Qtype) -> Option<WildcardSynthesis> {
         if !synthesizable_qtype(qtype) {
             return None;

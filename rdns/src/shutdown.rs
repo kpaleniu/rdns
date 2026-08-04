@@ -1,24 +1,18 @@
 //! Cooperative shutdown: stop accepting, finish what was accepted, exit.
 //!
-//! Shared by both daemons because both had the same hole and the same shape of
-//! it — no SIGTERM handler of any kind (a grep for SIGTERM, SIGINT or `ctrl_c`
-//! across all four crates returned nothing, only SIGHUP), and a `tokio::select!`
-//! over two `JoinHandle`s that **dropped the loser**, which detaches a task
-//! rather than cancelling it. Writing that twice is how the ICMP predicate
-//! ended up with the oversized-datagram case fixed in one copy and not the
-//! other; see `CLAUDE.md` §7.
+//! Shared by both daemons, which had the same hole: no SIGTERM handler at all,
+//! and a `tokio::select!` over two `JoinHandle`s that dropped the loser — which
+//! detaches a task rather than cancelling it.
 //!
-//! The model is two types, deliberately separate:
+//! Two types, deliberately separate:
 //!
 //! - [`Stop`] is the signal. Cloning it claims nothing, so a loop can watch for
-//!   shutdown without being the thing that prevents it.
-//! - [`Busy`] is a claim on the drain, held for as long as one unit of work is
-//!   unfinished.
+//!   shutdown without preventing it.
+//! - [`Busy`] is a claim on the drain, held while one unit of work is unfinished.
 //!
-//! Splitting them is not fussiness. A single type carrying both would mean the
-//! accept loops — which hold the signal for the life of the process — also hold
-//! the drain open, so every shutdown would wait out its full budget and the
-//! feature would look like it worked while doing nothing.
+//! One type carrying both would mean the accept loops, which hold the signal for
+//! the life of the process, also hold the drain open — so every shutdown would
+//! wait out its full budget while looking like it worked.
 
 use std::time::Duration;
 

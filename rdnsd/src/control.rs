@@ -1,30 +1,20 @@
 //! The control socket: what an operator asks a running `rdnsd` at 3am.
 //!
-//! Four questions were listed under `TODO.md` #9d and exactly one of them could
-//! be answered before this existed. *"Is example.com loaded, at what serial?"* —
-//! query the SOA. *"Is broken.test loaded?"* — REFUSED, which is what a zone
-//! that was never configured also answers, so the two most different situations
-//! on the box look identical from outside it. *"Is the secondary in sync?"* —
-//! read the state sidecar off the disk by hand. *"Why did that reload not take
-//! effect?"* — grep the log and hope it was at a level somebody left on.
+//! Of the four questions under `TODO.md` #9d, one could be answered before this
+//! existed. "Is example.com loaded, at what serial?" — query the SOA. "Is
+//! broken.test loaded?" — REFUSED, which a zone that was never configured also
+//! answers. "Is the secondary in sync?" — read the state sidecar by hand. "Why
+//! did that reload not take effect?" — grep the log and hope the level was left
+//! on. `status`, `reload` and `dump` answer all four, from the process that
+//! knows.
 //!
-//! `status`, `reload` and `dump` answer all four, and they answer them from the
-//! process that knows rather than from a file that describes what it once knew.
+//! A Unix socket and no TCP; see [`rdns::control`] for the survey that settled
+//! it. That is also why `reload` is not a `POST` on the metrics listener.
 //!
-//! **A Unix socket, and no TCP.** See [`rdns::control`] for the survey that
-//! settled it: the servers that put a control channel on TCP put an HMAC or a
-//! client certificate in front of it, and the ones that do not use a socket
-//! whose permissions the filesystem enforces. There is no third option in which
-//! an unauthenticated port is fine, which is why `reload` is not a `POST` on
-//! the metrics listener.
-//!
-//! **Unix-only, and it says so rather than pretending.** `tokio` has no
-//! `UnixListener` on Windows — AF_UNIX exists there since Windows 10 1803 but
-//! neither `std` nor `tokio` exposes it — so this module is `#[cfg(unix)]`, the
-//! same shape SIGHUP reloading has. `--control-socket` on Windows is refused at
-//! startup with that sentence, and not accepted-and-ignored: a setting the
-//! operator believes is in force and is not is the failure `CLAUDE.md` §15 is
-//! about.
+//! Unix-only: `tokio` exposes no `UnixListener` on Windows (AF_UNIX exists there
+//! since 10 1803, but neither `std` nor `tokio` exposes it), so this module is
+//! `#[cfg(unix)]` and `--control-socket` is refused at startup rather than
+//! accepted and ignored.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

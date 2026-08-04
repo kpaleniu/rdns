@@ -1,26 +1,16 @@
 //! The error types this library returns.
 //!
-//! **Typed, not `anyhow`, because this is a library.** An `anyhow::Error` is a
-//! message: it tells a human what went wrong and tells a caller nothing it can
-//! branch on. That is the right trade in a binary, where the only consumer is a
-//! log line, and the wrong one here — a DNS server has to turn a failure into a
-//! *response code*, and "the packet was truncated" and "the packet asked for
-//! something we do not implement" are FORMERR and NOTIMP respectively. With a
-//! string in hand there is nothing to match on and the choice cannot be made.
-//! See `CLAUDE.md` for the convention.
+//! Typed, not `anyhow`, because this is a library: a server has to turn a failure
+//! into a response code, and "truncated" and "not implemented" are FORMERR and
+//! NOTIMP. A string cannot be matched on. See `CLAUDE.md` §3.
 //!
-//! They live in one module rather than beside each of their callers because the
-//! conversions between them are the interesting part — `DnssecError` wraps
-//! `WireError` because verifying a signature means re-encoding records, and
-//! `TransferError` wraps both — and a reader checking that those nest sensibly
-//! should not have to open six files to do it.
+//! One module rather than one per caller, because the conversions are the
+//! interesting part — `DnssecError` wraps `WireError` (verifying a signature
+//! means re-encoding records) and `TransferError` wraps both.
 //!
-//! **Where a variant carries a `String`, that is deliberate and bounded.** The
-//! structural ways a DNS message can be wrong are open-ended and mostly
-//! one-off; enumerating all of them would produce a hundred variants nobody
-//! matches on, while losing the text would make a malformed packet
-//! undiagnosable. So the *category* is typed — which is what a caller branches
-//! on — and the detail stays human-readable inside it.
+//! A `String` inside a variant is deliberate where the category is the typed
+//! part: the structural ways a message can be wrong are open-ended, and dropping
+//! the text would make a malformed packet undiagnosable.
 
 use std::io;
 

@@ -1,35 +1,24 @@
 //! No input panics: the pre-authentication path against mutated wire data.
 //!
-//! **What this is for.** Everything a datagram touches before a TSIG MAC has
-//! been verified — which for an unsigned query is *everything*, up to and
-//! including the answer being serialized — runs on bytes a stranger chose. A
-//! panic there used to cost one lost answer, because `rdnsd` spawned a task per
-//! datagram and `tokio::spawn` swallows a task's panic. Since 2026-08-01 a fixed
-//! pool of workers answers inline, so a panic ends the worker, `serve` treats a
-//! stopped listener as fatal, and the **process exits**. That trade was taken
-//! deliberately — a server that keeps accepting queries while every answer
-//! panics is the quiet degradation this codebase keeps being bitten by — but it
-//! converts any reachable panic into a remote kill switch. `TODO.md` #12 is the
-//! audit that follows from it; this file is its empirical half.
+//! Everything a datagram touches before a TSIG MAC is verified — for an unsigned
+//! query, everything up to and including serializing the answer — runs on bytes a
+//! stranger chose. Since the UDP path answers inline rather than per-task, a
+//! panic there ends the worker and `serve` ends the process, which makes any
+//! reachable panic a remote kill switch. `TODO.md` #12 is the audit; this file is
+//! its empirical half.
 //!
-//! **Why a property test rather than a unit test.** The property needs no
-//! oracle: there is no correct answer to check, only "this returned rather than
-//! unwound". That is the cheapest useful test there is, and it would have caught
-//! the RDLENGTH slice of #9b — `&rest[..rdatalen as usize]` with no bounds
-//! check, a pre-authentication remote panic on both transports — inside the
-//! first hundred inputs.
+//! A property test because the property needs no oracle: only "this returned
+//! rather than unwound". It would have caught #9b's unchecked
+//! `&rest[..rdatalen as usize]` inside the first hundred inputs.
 //!
-//! **Why it is hand-rolled.** `cargo-fuzz` is nightly-only and this workspace
-//! pins stable 1.95. `proptest` would do, but the generator here is not the
-//! interesting part: random bytes essentially never get past the header check,
-//! so what finds anything is *mutating valid messages* — flipping bits in a real
-//! compression pointer, cutting a real RDLENGTH short. That corpus has to be
-//! built out of this library either way, and once it is, the rest is a seeded
-//! xorshift and a mutation switch. No dependency, and the seed makes every
-//! failure reproducible.
+//! Hand-rolled because `cargo-fuzz` is nightly-only and the generator is not the
+//! interesting part: random bytes never get past the header check, so what finds
+//! anything is mutating valid messages — flipping bits in a real compression
+//! pointer, cutting a real RDLENGTH short. That corpus has to be built out of
+//! this library either way; the rest is a seeded xorshift and a mutation switch.
 //!
-//! **Running it longer.** The suite runs `ITERATIONS` cases so it stays inside a
-//! second. A real soak is the same test with more of them:
+//! The suite runs `ITERATIONS` cases so it stays inside a second. A soak is the
+//! same test with more:
 //!
 //! ```sh
 //! RDNS_FUZZ_ITERATIONS=2000000 cargo test -p rdns --test no_input_panics -- --nocapture

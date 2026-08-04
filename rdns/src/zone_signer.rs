@@ -8,25 +8,20 @@
 //! output is checked against the same code that judges a real zone off the
 //! internet rather than against a second opinion written alongside it.
 //!
-//! **Signing is done in memory, on load, and the zone file is never rewritten.**
-//! The file on disk stays the unsigned thing an operator edits. That is one
-//! decision with three reasons: a signer that rewrites its input has to solve
-//! the same "who owns this file" problem the transfer sidecar deliberately
-//! stepped around (see "Architecture: persistence"), an editor and a resigning
-//! timer racing for one file is a way to lose a zone, and — most of all —
-//! nothing here needs the file, because what a client validates is what leaves
-//! the socket. Writing the signed form out is available
-//! ([`crate::zone_writer`] will spell it) but is a debugging convenience, not
-//! where the signatures live.
+//! Signing is done in memory, on load; the file on disk stays the unsigned thing
+//! an operator edits. Three reasons: a signer that rewrites its input inherits
+//! the "who owns this file" problem the transfer sidecar stepped around, an
+//! editor racing a re-signing timer for one file is a way to lose a zone, and
+//! what a client validates is what leaves the socket. [`crate::zone_writer`] can
+//! spell the signed form out as a debugging convenience.
 //!
-//! **What does not get signed is as important as what does.** A zone's
-//! authority stops at a delegation: the NS RRset that points down is not
-//! authoritative data and carries no signature, the glue below it is not in the
-//! zone at all, and the only signed thing at a delegation point is the DS that
-//! says the child is secure — plus the denial record, which exists precisely so
-//! the *absence* of a DS can be proved. Signing a delegation's NS RRset is the
-//! classic signer bug: every validator ignores the signature, and the extra
-//! RRSIG turns up in the parent's NSEC bitmap as a type that is not there.
+//! What does not get signed matters as much as what does. A zone's authority
+//! stops at a delegation: the NS RRset pointing down is not authoritative data
+//! and carries no signature, the glue below it is not in the zone, and the only
+//! signed thing at a delegation point is the DS — plus the denial record that
+//! lets the absence of a DS be proved. Signing a delegation's NS RRset is the
+//! classic signer bug: validators ignore the signature, and the extra RRSIG turns
+//! up in the parent's NSEC bitmap as a type that is not there.
 
 use crate::dnssec::{canonical_name, Dnskey, Rrset};
 use crate::dnssec_denial::{
@@ -232,38 +227,30 @@ impl SigningPolicy {
 
 /// The serial to serve for a zone we signed ourselves.
 ///
-/// **The problem.** Re-signing produces a new version of the zone as far as a
-/// secondary is concerned — new RRSIGs are new data — and a secondary decides
-/// whether to transfer by comparing serials. Without a bump the replica keeps
-/// the signatures it already has and they expire underneath it, which is the same
-/// outage as never re-signing at all, one hop downstream.
+/// Re-signing is a new version of the zone as far as a secondary is concerned,
+/// and a secondary decides whether to transfer by comparing serials. Without a
+/// bump the replica keeps signatures that then expire underneath it.
 ///
-/// **How everyone else does it.** BIND's inline-signing keeps a signed copy with
-/// its *own* serial and increments it on every re-signing run, so the number it
-/// serves diverges from the number in the file — one report has a file at
-/// `2016090105` being served as `2016090133`. Knot takes the field away from the
-/// operator entirely (`zonefile-load: difference-no-serial`). Both persist the
-/// divergence in a **journal**, and we have none (`TODO.md` #7 step 6), so
-/// neither is available: without persistence a restart would go *backwards*, and
-/// RFC 1982 makes that worse than it sounds — a secondary that saw `N` and then
-/// sees `N-k` reads it as older and will not transfer, so it keeps the signatures
-/// that are about to expire. The outage moves to restart time.
+/// BIND's inline-signing serves a serial of its own that diverges from the file's
+/// (one report: file at `2016090105`, served as `2016090133`); Knot takes the
+/// field from the operator entirely. Both persist the divergence in a journal,
+/// which this did not have when it was written — and without persistence a
+/// restart goes backwards, which a secondary reads as older and declines to
+/// transfer, keeping signatures that are about to expire.
 ///
-/// **So the time is the counter.** Hours since the Unix epoch, *added* to the
-/// file's serial. That is monotone in wall time by construction, needs nothing
-/// persisted, and an operator's `+1` in the file still shows up as `+1` served.
+/// So the time is the counter: hours since the Unix epoch, added to the file's
+/// serial. Monotone in wall time by construction, nothing to persist, and an
+/// operator's `+1` still shows up as `+1` served.
 ///
-/// Added rather than `max`ed, which is the correction to the obvious design:
-/// PowerDNS's `INCEPTION-EPOCH` documents itself as "requiring epoch-based
-/// backend serials" for exactly this reason — a date-style serial like
-/// `2026073001` is numerically *larger* than any current Unix timestamp, so a
-/// `max` would keep the file's number and never bump at all.
+/// Added rather than `max`ed: PowerDNS's `INCEPTION-EPOCH` documents itself as
+/// "requiring epoch-based backend serials" because a date-style serial like
+/// `2026073001` is larger than any current Unix timestamp, so a `max` never
+/// bumps.
 ///
-/// Hours, not seconds: the term stays small (about 495,000 today) so it does not
-/// crowd a date-style serial towards the 32-bit ceiling, and a re-sign every ten
-/// days is far coarser than an hour anyway. And hours since the *epoch* rather
-/// than a fraction of the validity, so that changing `--signature-validity` does
-/// not move the serial backwards.
+/// Hours, not seconds, so the term stays small (~495,000 today) and does not
+/// crowd a date-style serial towards the 32-bit ceiling. Hours since the *epoch*
+/// rather than a fraction of the validity, so changing `--signature-validity`
+/// cannot move the serial backwards.
 pub fn signed_serial(file_serial: Serial, signed_at: u64) -> Serial {
     const HOUR: u64 = 3600;
     // Wrapping, and [`Serial::wrapping_add`] says so in its own name: RFC 1982
@@ -453,32 +440,23 @@ impl PreviousSignatures {
     /// The signatures to carry forward for this RRset, or `None` to sign it
     /// afresh.
     ///
-    /// Four conditions, and each one is a way the reuse would otherwise be
-    /// wrong:
+    /// Four conditions, each a way the reuse would otherwise be wrong:
     ///
-    /// 1. **The RRset is byte-identical**, as a set — same TTL, same RDATA, no
-    ///    member added or removed. Compared as a set rather than a sequence
-    ///    because an RRset has no order (RFC 2181 §5) and the two runs walk the
-    ///    zone's record vector, which an update rebuilds.
-    /// 2. **There is at least one signature**, so an RRset that was somehow
-    ///    unsigned before does not stay unsigned by being copied.
-    /// 3. **The signing keys have not changed**, compared by key tag as a set.
-    ///    A key added is a rollover starting and the RRset needs the new
-    ///    signature; a key removed is one leaving and its signature must not
-    ///    survive it.
-    /// 4. **No carried signature has already expired.** Anything else would
-    ///    publish a signature known to be dead at the moment of writing it,
-    ///    while holding the key that could have replaced it.
+    /// 1. The RRset is byte-identical as a *set* — same TTL, same RDATA, nothing
+    ///    added or removed. As a set because an RRset has no order
+    ///    (RFC 2181 §5) and the two runs walk a record vector an update rebuilds.
+    /// 2. There is at least one signature, so an unsigned RRset does not stay
+    ///    unsigned by being copied.
+    /// 3. The signing keys are unchanged, by key tag as a set. A key added is a
+    ///    rollover starting; a key removed must not leave its signature behind.
+    /// 4. No carried signature has already expired.
     ///
-    /// **What is deliberately *not* a condition: being close to expiry.** A
-    /// signature with a day left is carried forward unchanged. Refreshing it
-    /// here would mean any single UPDATE re-signs every stale RRset in the
-    /// zone — which is the whole-zone delta this exists to avoid, and worse, it
-    /// would let update traffic quietly stand in for the re-signing timer. A
-    /// zone whose timer has died must degrade the same way whether or not
-    /// anyone is updating it, because that is the failure the operator has
-    /// alerts for. Expiry is [`SigningPolicy::resign_interval`]'s business and
-    /// this does not take it on.
+    /// Being close to expiry is deliberately not a condition. Refreshing here
+    /// would mean any single UPDATE re-signs every stale RRset in the zone — the
+    /// whole-zone delta this exists to avoid — and would let update traffic stand
+    /// in for the re-signing timer, so a zone with a dead timer would degrade
+    /// differently depending on whether anyone was writing to it. Expiry is
+    /// [`SigningPolicy::resign_interval`]'s business.
     fn reuse(
         &self,
         name: &str,

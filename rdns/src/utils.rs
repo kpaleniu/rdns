@@ -361,31 +361,21 @@ pub fn label_count(name: &str) -> usize {
     }
 }
 
-/// Whether `name` is `origin` or sits below it — "is this name in that zone",
-/// which every part of this codebase has to ask and which **four** of them used
-/// to answer separately: this one, `zone`'s caller, `special_names::in_zone`
-/// (which built a `format!(".{zone}")` per call) and `resolver::is_subdomain`
-/// (which normalized both sides into fresh `String`s and *then* built the
-/// `format!`, three allocations to answer a question about bytes). All of them
-/// got the label-boundary rule right, which is the only reason folding them in
-/// was a cleanup rather than a finding (`TODO.md` #13b).
+/// Whether `name` is `origin` or sits below it — "is this name in that zone".
+/// Four modules used to answer it separately, two of them allocating to do so
+/// (`TODO.md` #13b).
 ///
-/// **A suffix match is not enough**, and getting that wrong is how a server
-/// answers for somebody else's zone: `notexample.com.` ends with `example.com.`
-/// and is a different name entirely, so the boundary has to land on a label
-/// separator.
+/// A suffix match is not enough: `notexample.com.` ends with `example.com.` and
+/// is a different name, so the boundary has to land on a label separator.
 ///
-/// The trailing dot is optional on either side, because the two callers hold
-/// their names in different forms — `zone` walks absolute names, `rdnsd`
-/// compares a QNAME against a zone origin — and which form they are in is not
-/// the question being asked. An empty origin is the root, which contains
-/// everything including itself.
+/// The trailing dot is optional on either side, because callers hold names in
+/// different forms and which one is not the question being asked. An empty origin
+/// is the root, which contains everything including itself.
 ///
 /// Comparison is ASCII case-insensitive (RFC 4343), so neither side has to be
-/// folded first: folding costs an allocation, and this sits on the query path.
-/// It compares bytes rather than `str`s, which also means no slice of it can
-/// land inside a multi-byte character and panic on a name that came off the
-/// wire.
+/// folded first — folding costs an allocation and this sits on the query path.
+/// It compares bytes, so no slice can land inside a multi-byte character and
+/// panic on a name off the wire.
 pub fn is_at_or_under(name: &str, origin: &str) -> bool {
     let name = name.strip_suffix('.').unwrap_or(name).as_bytes();
     let origin = origin.strip_suffix('.').unwrap_or(origin).as_bytes();

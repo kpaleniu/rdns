@@ -1,42 +1,26 @@
-//! Ready is not the same question as alive, and answering both with one
-//! endpoint is how a rolling restart moves traffic onto a server that cannot
-//! serve it.
+//! Ready is not the same question as alive: `/healthz` is for a supervisor
+//! deciding whether to restart, `/readyz` for a load balancer deciding whether to
+//! send traffic. A server can be alive and hold none of its zones.
 //!
-//! `/healthz` says the process is running and its runtime is scheduling tasks.
-//! That is all a liveness probe should ever claim, and it is the right thing for
-//! a supervisor deciding whether to *restart* something. It is the wrong thing
-//! for a load balancer deciding whether to *send traffic*, because a server can
-//! be perfectly alive and hold none of the zones it is configured to answer for.
+//! Ready here means every configured zone is in the zone map. A primary loads,
+//! signs and verifies before the sockets bind, so it is ready as soon as it is
+//! alive, with an empty waiting list rather than a special case.
 //!
-//! **What "ready" means here**: every zone this server is configured to serve is
-//! in the zone map. On a primary that is true before the sockets bind — the zone
-//! files are loaded, signed and verified in `main`, and a failure there stops the
-//! start — so a primary is ready the moment it is alive, and this type says so
-//! with an empty waiting list rather than with a special case.
+//! A secondary is the case this exists for: `withdraw_unvouched_zones` removes
+//! every replicated zone whose age cannot be vouched for — at a cold start with
+//! no state sidecar, all of them — and the server then binds and answers REFUSED
+//! until the first transfer lands. Nothing else reports that window; the zone
+//! gauges are *absent* for a zone we do not hold, and a probe cannot be pointed
+//! at an absence.
 //!
-//! A **secondary** is the case that made this worth writing. `withdraw_unvouched_zones`
-//! removes every replicated zone whose age cannot be vouched for, which at a cold
-//! start with no state sidecar is all of them. The server then binds, answers
-//! REFUSED for those names, and stays that way for as long as the first transfer
-//! takes. That is the "bound but not serving" window a readiness gate exists to
-//! cover, and nothing else in this codebase reports it: the zone gauges are
-//! *absent* for a zone we do not hold (which is right — see `CLAUDE.md` §14), and
-//! absence is not something a probe can be pointed at.
+//! A one-way latch, on purpose. Every replica of a zone expires at the same
+//! moment — they share the master's EXPIRE — so a readiness signal following
+//! expiry would pull every server out of rotation at once, turning stale data
+//! into no server. Staleness is what `dns_zone_last_refresh_timestamp_seconds`
+//! and the alert on it are for.
 //!
-//! **It is a one-way latch, on purpose.** Once every zone has arrived this stays
-//! ready, and a zone withdrawn later by EXPIRE does not take it back to
-//! not-ready. The reason is that every replica of a zone expires at the *same
-//! moment* — they share the master's EXPIRE and they all lost contact when the
-//! master went away — so a readiness signal that followed expiry would pull every
-//! server out of rotation at once and turn "the data is stale" into "there is no
-//! server". Staleness is what `dns_zone_last_refresh_timestamp_seconds` and the
-//! alert on it in the README are for. Readiness answers one question, once:
-//! *has this process finished starting?*
-//!
-//! **No lock.** The set of things to wait for is fixed at construction and only
-//! ever shrinks, so an atomic per entry plus a counter says everything a mutex
-//! would, and `CLAUDE.md` §6's rule about never panicking under a lock on a path
-//! a query can reach does not have to be argued about.
+//! No lock: the set of things to wait for is fixed at construction and only ever
+//! shrinks, so an atomic per entry plus a counter says everything a mutex would.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;

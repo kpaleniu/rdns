@@ -240,25 +240,19 @@ pub enum ResponseVerdict {
 
 /// A per-client budget on response *bytes*, not queries.
 ///
-/// The query limiter above counts requests, which says nothing about
-/// amplification: a query is a query whether the answer is 60 bytes or 4000. An
-/// attacker forging a victim's source address picks the query whose answer is
-/// largest and lets the server do the work — the reflected traffic is what
-/// matters, so the reflected traffic is what has to be metered (RFC 5358 on the
-/// attack, and the technique authoritative servers call Response Rate Limiting).
+/// The query limiter counts requests, which says nothing about amplification: an
+/// attacker forging a victim's source address picks the query with the largest
+/// answer, so the reflected traffic is what has to be metered (RFC 5358; what
+/// authoritative servers call Response Rate Limiting).
 ///
-/// Two things make this usable rather than merely strict:
+/// Two things make it usable rather than merely strict:
 ///
-/// - **Slip.** Every `slip`-th response over budget is answered TC=1 instead of
-///   dropped. That reply carries no records, so it cannot amplify — while a
-///   legitimate client, which is what a rate limiter mostly catches, sees
-///   truncation and retries over TCP, where the handshake proves the source
-///   address and the budget does not apply.
-/// - **A bounded table.** Tracking is per address, and a spoofed flood arrives
-///   from every address there is, so the table itself would be the next
-///   amplification vector. Above `max_tracked` it stops growing and every
-///   response is truncated instead: small, still answerable over TCP, and no
-///   longer proportional to the number of forged sources.
+/// - Slip: every `slip`-th response over budget is answered TC=1 rather than
+///   dropped. It carries no records, so it cannot amplify, and a legitimate
+///   client retries over TCP where the handshake proves the address.
+/// - A bounded table: a spoofed flood arrives from every address there is, so the
+///   table would otherwise be the next amplification vector. Above `max_tracked`
+///   it stops growing and every response is truncated instead.
 ///
 /// Only for UDP. A TCP query has completed a handshake, so its source address is
 /// real and there is nobody to reflect at.

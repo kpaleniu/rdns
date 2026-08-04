@@ -1169,21 +1169,18 @@ impl Server {
         // An IXFR is gated identically, and for the identical reason: it may
         // *answer* with the whole zone (RFC 1995 §4), so a policy that let it
         // through would be no policy at all.
-        // A key is not a licence to transfer *everything*. This used to ask only
+        // A key is not a licence to transfer everything. This used to ask only
         // whether a session existed, so holding any key in the keyring
-        // transferred any zone and bypassed `--allow-transfer` entirely: hand a
-        // per-customer key to one partner and you handed them every zone on the
-        // server, including ones whose ACL named nobody.
+        // transferred any zone and bypassed `--allow-transfer` entirely.
         //
-        // Checked here, before the zone is looked up and before any message is
-        // built — the point of an authorization check is that the work does not
-        // happen. A key with no zone list still authorizes everything; see
-        // `TsigKey::zones` for why the default did not change, and the startup
-        // banner for how an operator finds out.
+        // Checked before the zone is looked up and before any message is built.
+        // A key with no zone list still authorizes everything; see
+        // `TsigKey::zones` for why, and the startup banner for how an operator
+        // finds out.
         //
-        // A refused *authenticated* request is still REFUSED rather than NOTAUTH:
-        // the peer proved who it is and the answer is no, which is a policy
-        // decision about this server, not a statement about the zone's authority.
+        // A refused authenticated request is REFUSED, not NOTAUTH: the peer
+        // proved who it is and the answer is no, which is a policy decision about
+        // this server rather than a statement about the zone's authority.
         let apex = absolute_name(&qname);
         let unauthorized = session
             .as_ref()
@@ -1737,20 +1734,16 @@ fn frame(bytes: &[u8]) -> Option<Vec<u8>> {
 /// silent instead would leave a legitimate client with a timeout and no idea that
 /// TCP would work.
 ///
-/// Two things this got wrong, both of which `error_bytes` twenty lines up gets
-/// right — which is the tell that they were written apart and drifted (see
-/// `CLAUDE.md` §7):
+/// Two things this got wrong that `error_bytes` twenty lines up gets right — the
+/// tell that they were written apart and drifted (`CLAUDE.md` §7):
 ///
-/// - **AA was set** on a reply carrying no authoritative data. It carries no
-///   data at all; the bit is a claim about an answer that is not here, and a
-///   client is entitled to read it as one.
-/// - **The size was hardcoded at 512**, ignoring `udp_payload_size()`. RFC 6891
-///   §6.2.4 says a response to an EDNS query is bounded by what the *requestor*
-///   advertised, and truncating below that is how a client that could have taken
-///   the answer is sent to TCP for nothing. It makes no difference to the bytes
-///   here, since the message is empty either way — it is the wrong rule applied
-///   in a place where it happens not to bite, which is where the next reader
-///   copies it from.
+/// - AA was set on a reply carrying no data at all, which is a claim about an
+///   answer that is not here.
+/// - The size was hardcoded at 512, ignoring `udp_payload_size()`. RFC 6891
+///   §6.2.4 bounds a response to an EDNS query by what the requestor advertised.
+///   It changes no bytes here, the message being empty either way — it is the
+///   wrong rule in a place where it happens not to bite, which is where the next
+///   reader copies it from.
 fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
     let mut resp = DnsMessage {
         id: request.id,
@@ -1861,47 +1854,22 @@ fn absolute_name(name: &str) -> std::borrow::Cow<'_, str> {
 /// Receive datagrams and answer them, as one of `--udp-workers` identical tasks
 /// sharing the socket.
 ///
-/// **No task per datagram, and the reason is not only the bound.** This loop
-/// used to `to_vec()` the packet, clone two `Arc`s and `tokio::spawn`, and only
-/// then — inside the spawned future — ask the rate limiter whether to drop it.
-/// Everything was paid before anything decided. DHAT put a number on the task
-/// itself: **1,536 bytes per datagram, 46% of every byte a query allocated**,
-/// larger than the whole rest of the answer path put together.
+/// No task per datagram. Answering from an in-memory zone has two await points
+/// (the zone-map read guard and `send_to`) and takes microseconds, so a fixed
+/// pool bounds concurrency *before* the packet is copied rather than after, and
+/// the overflow queues in the socket receive buffer where the kernel drops and
+/// counts it (`netstat -su`). The spawn it replaced cost 1,536 bytes per
+/// datagram, 46% of everything a query allocated.
 ///
-/// The finding proposed keeping the spawn and putting a `Semaphore` in front of
-/// it. This does the other thing, because for `rdnsd` the work is wrong for a
-/// task: answering from an in-memory zone has exactly two await points — the
-/// zone-map read guard and `send_to` — and takes microseconds. A fixed pool of
-/// workers gives the same bound (concurrency is the worker count) and gives it
-/// *before* the packet is copied rather than after, and the queue it pushes back
-/// into is the socket receive buffer, which is where a UDP queue belongs: the
-/// kernel drops the overflow for free and counts it (`netstat -su`) instead of
-/// us allocating a task in order to throw it away. Shedding is still the policy;
-/// it just happens one layer down.
+/// Costs one 64 KB receive buffer per worker — see [`default_udp_workers`].
 ///
-/// What that buys, all of it measured rather than argued: the 1,536-byte task
-/// and the 33-byte packet copy are gone, and the response scratch buffer becomes
-/// per-worker rather than per-datagram, so a plain answer allocates nothing to
-/// send at all.
+/// This loop must not block: a worker stuck here is a worker not receiving. TCP
+/// keeps a task per connection for that reason, and so does `rdnsr`, where one
+/// query is seconds of recursion.
 ///
-/// It costs one 64 KB receive buffer per worker, which is why the default is a
-/// handful and not a hundred (see [`default_udp_workers`]).
-///
-/// The one thing this shape must not do is block: a worker stuck in here is a
-/// worker not receiving. That is why the *slow* transport, TCP, still gets a
-/// task per connection, and why `rdnsr` — where one query is seconds of
-/// recursion — keeps its spawn and bounds it with a semaphore instead.
-///
-/// **One consequence is a deliberate change and worth stating.** A panic while
-/// answering used to be swallowed: the spawned task died, the datagram went
-/// unanswered, and the loop carried on. Here it ends the worker, and `serve`
-/// ends the process on a listener that stopped. That is the trade being taken
-/// on purpose — a panic on this path means a broken invariant (a poisoned
-/// mutex, a parse we thought was total), and a server that keeps accepting
-/// queries while every answer panics is the quiet degradation this codebase
-/// keeps being bitten by, not a server that survived. It is also why the parse
-/// in front of it is the code that gets hardened: see #9b's RDLENGTH panic,
-/// which was pre-authentication and remote.
+/// A panic while answering ends the worker, and `serve` then ends the process.
+/// Deliberate: a panic here means a broken invariant, and a server answering
+/// every query with a panic is not a server that survived.
 async fn udp_loop(
     socket: Arc<UdpSocket>,
     server: Arc<Server>,
@@ -4736,51 +4704,27 @@ mod tests {
         assert_eq!(zone_map.read().await.len(), 1);
     }
 
-    /// A reload must not block every query for the length of its diffs.
+    /// A reload must not block every query for the length of its diffs:
+    /// `ixfr::diff` runs under the read lock, and only the swap under the write
+    /// lock.
     ///
-    /// `install_all_zones` used to take the zone map's *write* lock and then run
-    /// `ixfr::diff` inside it — a walk of every record of both versions of every
-    /// zone — so a query arriving during a reload waited for the sum of all of
-    /// them. The planning happens under the *read* lock now, where queries run
-    /// alongside it; only the swap is under the write lock.
+    /// The assertion calibrates against this machine (`CLAUDE.md` §10): time one
+    /// unlocked diff, then require a contiguous window at least half that long
+    /// inside the reload in which a reader could have been admitted. Such a
+    /// window can only exist if the diff ran under a shared lock, and a slower
+    /// box stretches baseline and window together. Measured pinned to two cores:
+    /// 90% of the reload with the split, 9% with the diff back under the write
+    /// lock.
     ///
-    /// **The assertion calibrates against this machine, at this moment**
-    /// (`CLAUDE.md` §10). The test times one unlocked diff itself, then requires
-    /// that somewhere inside the reload there was a *contiguous window* at least
-    /// half that long in which a reader could have been admitted. A window that
-    /// long can only exist if the diff ran under a shared lock. It does not care
-    /// how fast the machine is, because a slower box stretches the baseline and
-    /// the window together.
+    /// Not a ratio of `try_read` samples — that version failed CI on Windows at
+    /// 71% where this machine reads 0.3%, with nothing regressed.
+    /// `tokio::sync::RwLock` is fair, so `try_read` fails while a writer is
+    /// merely queued, which made the number measure wake latency; and the
+    /// denominator was the sampler's own spin rate, which is not a clock.
     ///
-    /// **It used to be a ratio of samples, and that was wrong.** It counted the
-    /// fraction of `try_read` probes that failed; CI failed it on Windows at 71%
-    /// where this machine measures 0.3%, and nothing had regressed. Two reasons,
-    /// either of which is fatal to that metric:
-    ///
-    /// - **`tokio::sync::RwLock` is fair, so `try_read` fails while a writer is
-    ///   merely *queued*** — not only while one holds the lock. Verified with a
-    ///   probe rather than assumed. Every sample taken between the reload asking
-    ///   for the write lock and the scheduler waking it counted as a query
-    ///   "locked out", so the number was really measuring *wake latency*: single
-    ///   digit microseconds here, unbounded on a contended 2-vCPU runner with
-    ///   ninety other tests on it.
-    /// - **The denominator was the sampler's own spin rate, which is not a
-    ///   clock.** The sampler is a `yield_now` loop, so it competes for the CPU
-    ///   it is measuring, and takes more samples per unit of the reload's
-    ///   progress the busier the machine gets.
-    ///
-    /// Measured with the whole test binary pinned to two cores: the longest
-    /// admitted window is **90% of the reload** with the split, and **9%** with
-    /// the diff put back under the write lock, against a baseline diff of ~4 ms.
-    /// The old sample ratio read 0.2% and 93% for those same two runs — it
-    /// separated them perfectly *here*, which is exactly how it survived to fail
-    /// on a machine that was not here.
-    ///
-    /// **Multi-threaded on purpose.** The diff is synchronous CPU work with no
-    /// `.await` in it, so on the single-threaded runtime the reload would run to
-    /// completion before the reader was ever polled, and the test would pass
-    /// against both versions — a test agreeing with the code rather than
-    /// checking it (§1).
+    /// Multi-threaded on purpose: the diff has no `.await`, so on the
+    /// single-threaded runtime the reload would finish before the reader was
+    /// polled and the test would pass against both versions (§1).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reload_does_not_hold_the_write_lock_across_its_diffs() {
         // Every record differs between the two versions, so nothing cancels out

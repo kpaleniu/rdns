@@ -1,18 +1,14 @@
 //! TSIG: authenticating a DNS message with a shared secret (RFC 8945).
 //!
-//! An address is not an identity. `--allow-transfer` decides who may pull a zone
-//! by looking at the source address, which is the right default-deny gate and
-//! still trusts the network to be telling the truth about who is calling. TSIG
-//! replaces that trust with a keyed MAC over the message: a secondary proves it
-//! holds the key, and the primary proves the same to the secondary in the reply.
+//! An address is not an identity. Where `--allow-transfer` trusts the network to
+//! say who is calling, TSIG proves it with a keyed MAC over the message, in both
+//! directions.
 //!
-//! The mechanism is a pseudo-record. A TSIG RR is appended as the **last record
-//! of the additional section**, and it is not really part of the message: it
-//! covers the message, so verifying means removing it again and hashing what is
-//! left. That is why almost everything here works on bytes rather than on a
-//! parsed [`crate::DnsMessage`] — a re-serialized message is not necessarily the
-//! same bytes (name compression is a choice), and the MAC is over the bytes that
-//! were actually sent.
+//! The mechanism is a pseudo-record: a TSIG RR appended as the last record of the
+//! additional section, covering the message, so verifying means removing it again
+//! and hashing what is left. Almost everything here therefore works on bytes
+//! rather than on a parsed [`crate::DnsMessage`] — name compression is a choice,
+//! so a re-serialized message is not necessarily the bytes that were sent.
 //!
 //! What the digest covers (RFC 8945 §4.3.3, §5.4.2):
 //!
@@ -113,34 +109,22 @@ impl TsigAlgorithm {
 
 /// What a TSIG key may rewrite through dynamic UPDATE (RFC 2136 §3.3).
 ///
-/// §3.3 is one paragraph and it specifies almost nothing: the authorization
-/// mechanism is "implementation dependent", and the only thing it fixes is that
-/// a requestor who fails it is told REFUSED. So the shape below is this
-/// codebase's decision, and it is the one `CLAUDE.md` §16 arrived at for
-/// transfers — authentication is not authorization, and the check hangs off the
-/// session that already knows which key verified rather than looking the name up
-/// a second time.
+/// §3.3 fixes almost nothing — the mechanism is "implementation dependent" and
+/// only the REFUSED on failure is specified — so the shape below is this
+/// codebase's, following `CLAUDE.md` §16: the check hangs off the session that
+/// already knows which key verified.
 ///
-/// **Denied by default, which is the opposite of the transfer scope beside it,
-/// and deliberately so.** [`TsigKey::zones`] treats an empty list as *every*
-/// zone, and §16 records why that default was left alone: narrowing it would
-/// mean a binary upgrade silently stops every transfer on a working deployment,
-/// which is a worse failure than the one it fixes.
+/// Denied by default, the opposite of [`TsigKey::zones`], where an empty list
+/// means every zone. That default was left alone because narrowing it would stop
+/// every transfer on a working deployment at a binary upgrade. Neither half of
+/// that argument holds here: nothing had ever served an UPDATE, and an update
+/// rewrites the original where a transfer hands over a copy. Reusing the
+/// transfer scope would have given every existing (unscoped) key write access to
+/// every zone on the first release that dispatched an UPDATE.
 ///
-/// Neither half of that argument survives the move to UPDATE. There is no
-/// working deployment to break, because nothing has ever served an UPDATE here;
-/// and the consequence runs the other way, since a transfer hands over a copy
-/// and an update rewrites the original. Had this reused the transfer scope,
-/// every key that exists — all of them unscoped, because scoping is opt-in —
-/// would have silently gained write access to every zone on the server on the
-/// first release that dispatched an UPDATE. That is `CLAUDE.md` §16's opening
-/// bug exactly, arrived at from the other direction.
-///
-/// **Three states rather than a `Vec` with an overloaded empty case**
-/// (`CLAUDE.md` §17). "No zones" and "all zones" are the two answers furthest
-/// apart, and a sentinel meaning one of them depending on which field you are
-/// reading is how `QueryClass::None` and `ResponseCode::Unknown` both went
-/// wrong. Here the compiler makes the caller name which one it meant.
+/// Three states rather than a `Vec` with an overloaded empty case: "no zones" and
+/// "all zones" are the two answers furthest apart, and the compiler makes the
+/// caller name which one it meant.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum UpdatePolicy {
     /// No zone, by any key holder. The default, and what every key configured
@@ -287,29 +271,23 @@ impl TsigKey {
     /// Parse `[algorithm:]name:base64secret[:transfer-zones[:update-zones]]`,
     /// the first three fields being the shape `dig -y` uses.
     ///
-    /// The algorithm defaults to HMAC-SHA256 when omitted — but **a zone list
-    /// requires it to be spelled out**, because `name:secret:zones` and
-    /// `alg:name:secret` are both three colon-separated fields and there is no
-    /// way to tell them apart that does not turn on whether the first field
-    /// happens to look like an algorithm name. Requiring the algorithm is the
-    /// less surprising of the two: it fails at startup with a message, rather
-    /// than reading a zone list as a secret.
+    /// The algorithm defaults to HMAC-SHA256 when omitted, but a zone list
+    /// requires it spelled out: `name:secret:zones` and `alg:name:secret` are
+    /// both three fields, and the only alternative is guessing whether the first
+    /// field looks like an algorithm name.
     ///
-    /// **The fifth field is the update scope, and it needs no disambiguation**:
-    /// four fields already require the algorithm, so five cannot collide with
-    /// anything (§16's rule about an ambiguous new field is satisfied by the
-    /// rule that was already there). Absent means [`UpdatePolicy::Denied`] —
-    /// every key that predates this keeps exactly the permissions it had.
+    /// The fifth field is the update scope and needs no disambiguation, since
+    /// four fields already require the algorithm. Absent means
+    /// [`UpdatePolicy::Denied`], so a key that predates this keeps the
+    /// permissions it had.
     ///
-    /// `*` in either list means every zone. It is what lets a key be
-    /// unrestricted for transfers *and* scoped for updates, which the
-    /// positional fields would otherwise make unsayable — the fourth field
-    /// cannot be left empty, since an empty list means "every zone" and an empty
-    /// *field* reads as a narrowing the operator typed.
+    /// `*` in either list means every zone, which is what lets a key be
+    /// unrestricted for transfers and scoped for updates: the fourth field cannot
+    /// be left empty, because an empty *list* means every zone while an empty
+    /// field reads as a narrowing the operator typed.
     ///
     /// An unparsable spec is an error rather than a skip: a key the operator
-    /// believes is configured but is not would fail every transfer, and the
-    /// reason would not be visible.
+    /// believes is configured but is not would fail every transfer invisibly.
     pub fn parse(spec: &str) -> ConfigResult<Self> {
         let parts: Vec<&str> = spec.split(':').collect();
         let named_algorithm = |alg: &str| {
@@ -1208,31 +1186,23 @@ mod tests {
         buf
     }
 
-    /// **A signed message that will not fit a length prefix is refused, not
-    /// framed with a wrapped one** (`TODO.md` #17).
+    /// A signed message that will not fit a length prefix is refused, not framed
+    /// with a wrapped one (`TODO.md` #17).
     ///
-    /// `to_bytes_within(u16::MAX)` cannot return more than 65,535 octets, so
-    /// this is the only path that can grow a message past the size it was
-    /// serialized to: `append_tsig` adds ~82 octets to the *finished* bytes and
-    /// used to check only that ARCOUNT did not overflow. A serialized length in
-    /// 65,454..=65,535 therefore produced a message of 65,536 or more, and at
-    /// exactly 65,536 the framing prefix is **0** — which every read loop here
-    /// treats as a broken peer, so the client's connection was dropped with no
-    /// answer and nothing saying why.
+    /// `append_tsig` is the only path that can grow a message past the size it
+    /// was serialized to: it adds ~82 octets to the finished bytes and used to
+    /// check only ARCOUNT. A serialized length in 65,454..=65,535 produced 65,536
+    /// or more, and at exactly 65,536 the framing prefix is 0 — which every read
+    /// loop treats as a broken peer, so the connection was dropped with no answer.
     ///
-    /// The sweep is the one recorded in `TODO.md` #17, kept because the window
-    /// is only 82 octets wide out of 65,536 sizes and a single hand-picked case
-    /// would sit next to it as easily as on it. Each step asserts the thing that
-    /// actually matters: **the prefix agrees with the body**, or there is no
-    /// message at all. Asserting on the error type instead would pass against an
-    /// implementation that refused everything.
+    /// A sweep rather than one case, because the window is 82 octets wide out of
+    /// 65,536. Each step asserts that the prefix agrees with the body, or that
+    /// there is no message at all; asserting on the error type would pass against
+    /// an implementation that refused everything.
     ///
-    /// **Watched failing** against the unchecked `append_tsig`, at exactly the
-    /// size `TODO.md` #17's original sweep recorded: "a signature that fits must
-    /// actually fit: **65536** octets". That is the assertion that fires, one
-    /// line before the framing — `framed` refuses 65,536 outright now, so the
-    /// prefix-of-0 the bug produced is no longer reachable through it, and the
-    /// check that catches the bug is the one on the signed length.
+    /// Watched failing against the unchecked `append_tsig` at 65,536 octets. That
+    /// assertion fires one line before the framing, since `framed` now refuses
+    /// 65,536 outright and the prefix-of-0 is unreachable through it.
     #[test]
     fn a_signed_message_too_long_to_frame_is_refused_rather_than_wrapped() {
         let key = test_key();

@@ -1,17 +1,13 @@
 //! Negative caching, the plain kind (RFC 2308).
 //!
-//! A "no" is an answer and costs the same to obtain as a "yes", so not caching
-//! it means every repeat of a failing lookup is a fresh walk to the
-//! authoritative server. That is not a rare case: a typo, a stale link, a
-//! Windows box asking for a name that will never exist, a random-name flood —
-//! all of it re-resolved from the root, every time.
+//! A "no" costs the same to obtain as a "yes", so without this every repeat of a
+//! failing lookup is a fresh walk from the root — a typo, a stale link, a
+//! random-name flood.
 //!
-//! [`crate::nsec_cache`] already caches denials, but only ones that *validated*,
-//! because everything it does rests on the proof having been checked. Validation
-//! is opt-in, so for most deployments that cache is switched off entirely and
-//! nothing here was cached at all. This is the other half: no signatures
-//! required, no synthesis, no cleverness — the same question asked again gets the
-//! same answer back, and nothing else does.
+//! [`crate::nsec_cache`] caches denials too, but only validated ones, and
+//! validation is opt-in, so for most deployments it is switched off entirely.
+//! This is the other half: no signatures required, no synthesis — the same
+//! question asked again gets the same answer back, and nothing else does.
 //!
 //! What keeps it honest:
 //!

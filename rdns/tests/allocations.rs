@@ -1,38 +1,21 @@
 //! Allocation counts for the paths that matter, as exact assertions.
 //!
-//! **Why this is a separate test binary.** DHAT works by replacing the global
-//! allocator, and a `#[global_allocator]` applies to a whole binary — putting it
-//! in `rdns`'s unit tests would make all 593 of them record a backtrace per
-//! allocation. Here it costs only the handful of tests in this file.
+//! A separate test binary because `#[global_allocator]` applies to the whole
+//! binary: in `rdns`'s unit tests, DHAT would make all 593 of them record a
+//! backtrace per allocation.
 //!
-//! **Why counts rather than timings.** An allocation count is exact and does not
-//! care what else is running on the machine. `bench.rs`'s wall-clock floors do,
-//! which is how the `log_query` quadratic survived being caught: the floor was
-//! lowered and the regression was blamed on competing load. See `CLAUDE.md` §10.
+//! Counts rather than timings, because a count is exact and does not care what
+//! else is running (`CLAUDE.md` §10). A number here is a measurement, not a
+//! target: assertions are ranges where the thing measured has a degree of freedom
+//! (a `HashMap` growing differently) and exact where it does not. Update them
+//! with the reason, as a benchmark floor is updated.
 //!
-//! **What a number here means.** It is a measurement, not a target. A count that
-//! moves is a change in what the code allocates, which is worth a look and is
-//! sometimes entirely correct — the assertions are ranges where the thing
-//! measured has a degree of freedom (a `HashMap` growing differently) and exact
-//! where it does not. Update them *with* the reason, the same way a benchmark
-//! floor is (§10).
-//!
-//! **Why this file is one `#[test]`.** Because the profiler is global and the
-//! *test harness* is not something a mutex in this file can serialize. The
-//! measurements used to be a `#[test]` each, holding a mutex for the whole of
-//! every body so that no two bodies could overlap — and that much was true: two
-//! overlapping bodies would make `dhat::Profiler::builder().build()` panic
-//! rather than mis-count, and it never panicked. What still overlapped was
-//! libtest's own work on its other threads: the per-test bookkeeping that
-//! happens *around* a body, outside anything this file can hold a lock across.
-//! One measurement read 15 where it reads 7, on three runs out of five on Linux
-//! and none observed on Windows, which is the worst way for a number to be
-//! wrong. With one test there is one thread doing anything at all.
-//!
-//! So: **do not add a second `#[test]` here.** Add a function and call it from
-//! [`allocation_counts`]. The cost of the arrangement is that the first failing
-//! measurement hides the ones after it, which is a fair price for a count that
-//! is exact on both platforms.
+//! Do not add a second `#[test]` here — add a function and call it from
+//! [`allocation_counts`]. The profiler is global, and libtest's per-test
+//! bookkeeping runs on other threads around a body, outside anything a mutex in
+//! this file can hold. As separate tests, one measurement read 15 where it reads
+//! 7, on three runs out of five on Linux. The cost is that the first failing
+//! measurement hides the ones after it.
 
 use rdns::Class;
 use rdns::Rtype;
