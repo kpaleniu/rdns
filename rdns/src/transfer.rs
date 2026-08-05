@@ -28,48 +28,103 @@ use crate::{DnsMessage, Edns, ResourceRecord, ResponseCode};
 /// pack them ignores name compression, which can only make the result smaller.
 pub const AXFR_TARGET_MESSAGE_SIZE: usize = 16 * 1024;
 
-/// The messages of an AXFR response for `zone`, in the order they go on the wire.
+/// The messages of an AXFR response for `zone`, **one at a time**.
+///
+/// The caller decides how many exist at once, and a caller that serializes and
+/// writes each envelope before asking for the next holds one. That is the whole
+/// of `TODO.md` #24c: this used to clone every record of the zone into a `Vec`,
+/// move that into a `Vec<DnsMessage>`, and hand both to a caller that then built
+/// every frame before writing any — the zone three times over, per concurrent
+/// transfer, for a zone that is already in memory.
 ///
 /// `Err` when the zone has no SOA at its apex: without one there is nothing to
 /// open and close the transfer with, and a client cannot tell that what it
 /// received is complete. That is a broken zone rather than a bad request, so the
-/// caller should answer SERVFAIL.
-pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<DnsMessage>> {
-    let apex = zone.origin().to_string();
+/// caller should answer SERVFAIL. It is checked here, before the first envelope,
+/// so a caller that is streaming has not sent anything yet when it fails.
+pub fn axfr_envelopes<'a>(
+    request: &'a DnsMessage,
+    zone: &'a Zone,
+) -> TransferResult<impl Iterator<Item = DnsMessage> + 'a> {
+    let apex = zone.origin();
     let soa = zone
-        .query(&apex, Qtype::of(rt::SOA))
+        .query(apex, Qtype::of(rt::SOA))
         .first()
         .map(|zr| ResourceRecord {
-            name: apex.clone(),
+            name: apex.to_string(),
             class: zr.class,
             ttl: zr.ttl,
             rdata: zr.rdata.clone(),
         })
         .ok_or_else(|| TransferError::malformed(format!("zone {apex} has no SOA at its apex")))?;
 
-    // SOA first, everything else in load order, SOA again (RFC 5936 §2.2). The
-    // apex SOA is skipped in the middle so it appears exactly twice — a client
-    // that sees the closing SOA early would stop reading there.
-    let mut records = Vec::with_capacity(zone.records().len() + 2);
-    records.push(soa.clone());
-    for zr in zone.records() {
-        let name = zone.normalize_name(&zr.name);
-        if zr.rdata.rtype() == rt::SOA && name.eq_ignore_ascii_case(&apex) {
-            continue;
-        }
-        records.push(ResourceRecord {
-            name: name.into_owned(),
-            class: zr.class,
-            ttl: zr.ttl,
-            rdata: zr.rdata.clone(),
-        });
-    }
-    records.push(soa);
-
-    Ok(pack_transfer_messages(request, records))
+    Ok(Envelopes::new(request, AxfrRecords::new(zone, soa)))
 }
 
-/// Split a transfer's records into messages that each fit a TCP frame.
+/// The whole of an AXFR response, materialized.
+///
+/// [`axfr_envelopes`] collected, for the callers that want the sequence in hand:
+/// the tests, and [`crate::ixfr`]'s fallback to a full transfer. A caller serving
+/// a real zone to a socket should pull the iterator instead.
+pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<DnsMessage>> {
+    Ok(axfr_envelopes(request, zone)?.collect())
+}
+
+/// The records of an AXFR in wire order: the apex SOA, the zone in load order
+/// without that SOA, then the apex SOA again (RFC 5936 §2.2).
+///
+/// The middle SOA is skipped so the record appears exactly twice — a client that
+/// saw the closing SOA early would stop reading there.
+struct AxfrRecords<'a> {
+    zone: &'a Zone,
+    soa: ResourceRecord,
+    next: usize,
+    opened: bool,
+    closed: bool,
+}
+
+impl<'a> AxfrRecords<'a> {
+    fn new(zone: &'a Zone, soa: ResourceRecord) -> Self {
+        AxfrRecords {
+            zone,
+            soa,
+            next: 0,
+            opened: false,
+            closed: false,
+        }
+    }
+}
+
+impl Iterator for AxfrRecords<'_> {
+    type Item = ResourceRecord;
+
+    fn next(&mut self) -> Option<ResourceRecord> {
+        if !self.opened {
+            self.opened = true;
+            return Some(self.soa.clone());
+        }
+        while let Some(zr) = self.zone.records().get(self.next) {
+            self.next += 1;
+            let name = self.zone.normalize_name(&zr.name);
+            if zr.rdata.rtype() == rt::SOA && name.eq_ignore_ascii_case(self.zone.origin()) {
+                continue;
+            }
+            return Some(ResourceRecord {
+                name: name.into_owned(),
+                class: zr.class,
+                ttl: zr.ttl,
+                rdata: zr.rdata.clone(),
+            });
+        }
+        if !self.closed {
+            self.closed = true;
+            return Some(self.soa.clone());
+        }
+        None
+    }
+}
+
+/// A transfer's records, split into messages that each fit a TCP frame.
 ///
 /// Shared with the incremental transfer in [`crate::ixfr`], because the framing
 /// is a property of a transfer rather than of which kind it is: same target size,
@@ -79,44 +134,76 @@ pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<Dn
 /// at most its text length plus two, and the fixed part of a record is ten bytes.
 /// An estimate that can only be too large is the safe direction, since the real
 /// limit is the 64 KiB length prefix.
+pub(crate) struct Envelopes<'a, I> {
+    request: &'a DnsMessage,
+    records: I,
+    /// The record that did not fit the envelope just yielded. Held rather than
+    /// re-read, because the source is an iterator with no way back.
+    carried: Option<ResourceRecord>,
+    first: bool,
+}
+
+impl<'a, I> Envelopes<'a, I> {
+    pub(crate) fn new(request: &'a DnsMessage, records: I) -> Self {
+        Envelopes {
+            request,
+            records,
+            carried: None,
+            first: true,
+        }
+    }
+}
+
+impl<I: Iterator<Item = ResourceRecord>> Iterator for Envelopes<'_, I> {
+    type Item = DnsMessage;
+
+    fn next(&mut self) -> Option<DnsMessage> {
+        let cost = |rr: &ResourceRecord| rr.name.len() + 2 + 10 + rr.rdata.bytes().len();
+        let mut current: Vec<ResourceRecord> = Vec::new();
+        let mut estimated = 0usize;
+        if let Some(rr) = self.carried.take() {
+            estimated += cost(&rr);
+            current.push(rr);
+        }
+        for rr in self.records.by_ref() {
+            let rr_cost = cost(&rr);
+            if !current.is_empty() && estimated + rr_cost > AXFR_TARGET_MESSAGE_SIZE {
+                self.carried = Some(rr);
+                break;
+            }
+            estimated += rr_cost;
+            current.push(rr);
+        }
+        if current.is_empty() {
+            return None;
+        }
+
+        let mut message = transfer_message(self.request, current);
+        // RFC 6891 §6.1.1 — a response to a request that carried an OPT record
+        // carries one — applies to a transfer as much as to a lookup, and the
+        // transfer path was the one that never did it. On the *first* message
+        // only: a multi-message transfer is one response, BIND puts the OPT there
+        // and nowhere else, and repeating it would put a second OPT in what
+        // §6.1.1 treats as a single exchange.
+        //
+        // Before the TSIG, if one follows: RFC 8945 §5.1 requires the TSIG to be
+        // the last record in the additional section, and the signer appends after
+        // this.
+        if std::mem::take(&mut self.first) && self.request.has_edns() {
+            // `with_payload_size` carries no options, so this cannot fail. The
+            // size is the client's own, echoed: a transfer is framed by the TCP
+            // length prefix, so our UDP payload size says nothing useful here.
+            message.set_edns(Edns::with_payload_size(self.request.udp_payload_size()));
+        }
+        Some(message)
+    }
+}
+
 pub(crate) fn pack_transfer_messages(
     request: &DnsMessage,
     records: Vec<ResourceRecord>,
 ) -> Vec<DnsMessage> {
-    let mut messages = Vec::new();
-    let mut current: Vec<ResourceRecord> = Vec::new();
-    let mut estimated = 0usize;
-    for rr in records {
-        let cost = rr.name.len() + 2 + 10 + rr.rdata.bytes().len();
-        if !current.is_empty() && estimated + cost > AXFR_TARGET_MESSAGE_SIZE {
-            messages.push(transfer_message(request, std::mem::take(&mut current)));
-            estimated = 0;
-        }
-        estimated += cost;
-        current.push(rr);
-    }
-    if !current.is_empty() {
-        messages.push(transfer_message(request, current));
-    }
-
-    // RFC 6891 §6.1.1 — a response to a request that carried an OPT record
-    // carries one — applies to a transfer as much as to a lookup, and the
-    // transfer path was the one that never did it. On the *first* message only:
-    // a multi-message transfer is one response, BIND puts the OPT there and
-    // nowhere else, and repeating it would put a second OPT in what §6.1.1
-    // treats as a single exchange.
-    //
-    // Before the TSIG, if one follows: RFC 8945 §5.1 requires the TSIG to be the
-    // last record in the additional section, and the signer appends after this.
-    if let Some(first) = messages.first_mut() {
-        if request.has_edns() {
-            // `with_payload_size` carries no options, so this cannot fail. The
-            // size is the client's own, echoed: a transfer is framed by the TCP
-            // length prefix, so our UDP payload size says nothing useful here.
-            first.set_edns(Edns::with_payload_size(request.udp_payload_size()));
-        }
-    }
-    messages
+    Envelopes::new(request, records.into_iter()).collect()
 }
 
 /// One message of a transfer: the request's id and question, authoritative, with

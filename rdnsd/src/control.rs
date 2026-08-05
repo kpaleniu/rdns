@@ -450,18 +450,17 @@ mod tests {
     fn control(
         replicated: Vec<String>,
     ) -> (Arc<Control>, tokio::sync::mpsc::Receiver<ReloadTrigger>) {
-        use std::collections::HashMap;
         use tokio::sync::RwLock;
 
-        let mut zones = HashMap::new();
-        zones.insert("example.com.".to_string(), zone());
+        let mut zones = crate::Zones::default();
+        drop(zones.insert(zone()));
         let metrics = Arc::new(rdns::metrics::DnsMetrics::new());
         metrics.set_zone_serial("example.com.", Serial::new(42));
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         (
             Arc::new(Control {
                 served: Served {
-                    zone_map: Arc::new(RwLock::new(crate::Zones::new(zones))),
+                    zone_map: Arc::new(RwLock::new(zones)),
                     deltas: Arc::new(RwLock::new(rdns::ixfr::DeltaLog::new())),
                     metrics,
                     journal: None,

@@ -481,18 +481,26 @@ pub enum IxfrResponse {
     },
     /// No usable chain, so the whole zone — always permitted (RFC 1995 §4), and
     /// what a client is required to cope with.
-    FullTransfer {
-        messages: Vec<DnsMessage>,
-        why: &'static str,
-    },
+    ///
+    /// **The messages are not in here**, which is `TODO.md` #24c: this is the
+    /// path a secondary that fell behind takes, so it is exactly the case where
+    /// materializing the zone twice over is worst. The decision is cheap and the
+    /// answer is a whole zone; the caller builds it, and can stream it.
+    FullTransfer { why: &'static str },
 }
 
 impl IxfrResponse {
-    pub fn messages(self) -> Vec<DnsMessage> {
+    /// This response as messages, in hand.
+    ///
+    /// A full transfer needs `zone` and `request` back, because it no longer
+    /// carries a copy of the zone. A caller writing to a socket should pull
+    /// [`crate::transfer::axfr_envelopes`] for that case instead of calling this.
+    pub fn messages(self, request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<DnsMessage>> {
         match self {
-            IxfrResponse::UpToDate(messages)
-            | IxfrResponse::Incremental { messages, .. }
-            | IxfrResponse::FullTransfer { messages, .. } => messages,
+            IxfrResponse::UpToDate(messages) | IxfrResponse::Incremental { messages, .. } => {
+                Ok(messages)
+            }
+            IxfrResponse::FullTransfer { .. } => axfr_messages(request, zone),
         }
     }
 }
@@ -535,7 +543,6 @@ pub fn ixfr_response(
     // everything".
     let Some(client_serial) = requested_serial(request) else {
         return Ok(IxfrResponse::FullTransfer {
-            messages: axfr_messages(request, zone)?,
             why: "the request carried no SOA to compare against",
         });
     };
@@ -551,7 +558,6 @@ pub fn ixfr_response(
 
     let Some(chain) = deltas.chain_from(apex, client_serial) else {
         return Ok(IxfrResponse::FullTransfer {
-            messages: axfr_messages(request, zone)?,
             why: "no unbroken chain of changes back to the client's serial",
         });
     };
@@ -560,7 +566,6 @@ pub fn ixfr_response(
         // means the zone moved by some route the log did not see. Sending it
         // would leave the client short of where it thinks it got to.
         return Ok(IxfrResponse::FullTransfer {
-            messages: axfr_messages(request, zone)?,
             why: "the remembered changes do not reach the zone's current serial",
         });
     }
@@ -571,7 +576,6 @@ pub fn ixfr_response(
     let records: usize = chain.iter().map(|d| d.len()).sum();
     if records >= zone.records().len() {
         return Ok(IxfrResponse::FullTransfer {
-            messages: axfr_messages(request, zone)?,
             why: "the changes are no smaller than the zone itself",
         });
     }
@@ -881,9 +885,10 @@ mod tests {
 
         // No chain at all.
         let response = ixfr_response(&request(Some(1)), &v2, &DeltaLog::new()).unwrap();
-        let IxfrResponse::FullTransfer { messages, why } = response else {
+        let IxfrResponse::FullTransfer { why } = response else {
             panic!("expected a full transfer");
         };
+        let messages = axfr_messages(&request(Some(1)), &v2).expect("build the full transfer");
         assert!(why.contains("no unbroken chain"), "got: {why}");
         assert_eq!(answers(&messages)[0].rdata.rtype(), rt::SOA);
         assert_ne!(answers(&messages)[1].rdata.rtype(), rt::SOA, "a full zone");

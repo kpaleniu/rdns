@@ -100,6 +100,26 @@ fn allocations<T>(body: impl FnOnce() -> T) -> (T, u64) {
     (out, after - before)
 }
 
+/// Run `body` under a profiler and report the most memory it held at once.
+///
+/// The other half of the question [`allocations`] answers. A transfer that
+/// materializes the whole zone calls the allocator about as often as one that
+/// streams it; what it does differently is hold all of it at the same time, and
+/// that is the number `TODO.md` #24c is about. Peak rather than final, because
+/// the intermediate `Vec<ResourceRecord>` was dropped before the caller saw the
+/// messages it became.
+///
+/// Call only while holding [`exclusive`].
+fn peak_bytes<T>(body: impl FnOnce() -> T) -> (T, usize) {
+    let profiler = dhat::Profiler::builder().testing().build();
+    let out = body();
+    // Read while `out` is still alive: for the materializing case, what it holds
+    // *is* the measurement.
+    let peak = dhat::HeapStats::get().max_bytes;
+    drop(profiler);
+    (out, peak)
+}
+
 /// Assert a count is in `range`, printing the actual number either way so a
 /// failure says what to change the range to and a pass leaves the figure in the
 /// test log.
@@ -492,6 +512,102 @@ fn one_axfr_out() {
     // already seen, 19 after — the biggest proportional move of the four, because
     // a transfer is nothing but names.
     within("serialize one AXFR message", serialize_count, 14..=26);
+
+    the_first_envelope_costs_the_same_however_big_the_zone_is(&request);
+}
+
+/// **The cost of the first envelope must not grow with the zone**, which is the
+/// whole of `TODO.md` #24c and the one property a count can state exactly.
+///
+/// `axfr_messages` clones every record of the zone into a `Vec`, moves that into
+/// a `Vec<DnsMessage>`, and (in `rdnsd`) had every frame built before the first
+/// byte went out — the zone three times over, per concurrent transfer. The
+/// envelope iterator materializes one envelope, so the first one costs the same
+/// whether the zone behind it holds 600 records or 1,200.
+///
+/// Equality rather than a bound: the two zones are built to differ only in how
+/// many records follow the envelope that is measured, so anything the iterator
+/// did eagerly would show up as a difference (§10 — a ratio does not care what
+/// else is running, and this does not even care what machine it is).
+fn the_first_envelope_costs_the_same_however_big_the_zone_is(request: &DnsMessage) {
+    let small = big_zone(600);
+    let large = big_zone(1_200);
+
+    let (envelopes, small_count) = allocations(|| {
+        rdns::transfer::axfr_envelopes(request, &small)
+            .expect("envelopes")
+            .next()
+            .expect("one envelope")
+    });
+    let held = envelopes.answers.len();
+    assert!(
+        held < 600,
+        "the zones have to be bigger than one envelope for this to measure anything: {held}"
+    );
+    let (_, large_count) = allocations(|| {
+        rdns::transfer::axfr_envelopes(request, &large)
+            .expect("envelopes")
+            .next()
+            .expect("one envelope")
+    });
+    assert_eq!(
+        small_count, large_count,
+        "the first envelope of a 1,200-record zone cost {large_count} against {small_count} \
+         for a 600-record one: the zone is being materialized ahead of the writer"
+    );
+    within(
+        "build the first envelope of an AXFR",
+        small_count,
+        1..=4_000,
+    );
+
+    // And the whole thing, for the contrast the item was filed on: this is what
+    // the daemon used to pay before sending anything.
+    let (_, whole_count) =
+        allocations(|| rdns::transfer::axfr_messages(request, &large).expect("axfr"));
+    assert!(
+        whole_count > large_count,
+        "materializing the whole transfer cannot cost less than one envelope of it"
+    );
+    within(
+        "build every envelope of the same AXFR",
+        whole_count,
+        2_200..=2_700,
+    );
+
+    // **The count is not the point; the peak is.** Streaming a zone calls the
+    // allocator about as often as materializing it — the difference is how much
+    // is alive at once, which is what a transfer of a large zone costs a server
+    // and what #24c was filed about.
+    let whole = big_zone(5_000);
+    let (_envelope, envelope_peak) = peak_bytes(|| {
+        rdns::transfer::axfr_envelopes(request, &whole)
+            .expect("envelopes")
+            .next()
+            .expect("one envelope")
+    });
+    let (_messages, whole_peak) =
+        peak_bytes(|| rdns::transfer::axfr_messages(request, &whole).expect("axfr"));
+    assert!(
+        whole_peak > envelope_peak * 4,
+        "one envelope of a 5,000-record zone held {envelope_peak} bytes at its peak and the \
+         whole transfer {whole_peak}: the sequence is not being built lazily"
+    );
+    println!("peak bytes: one envelope {envelope_peak}, the whole transfer {whole_peak}");
+}
+
+/// A zone of `records` A records, all sharing one suffix, plus its apex SOA.
+fn big_zone(records: usize) -> rdns::zone::Zone {
+    let mut text = String::from(
+        "$ORIGIN example.com.\n\
+         $TTL 3600\n\
+         @ IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+         @ IN NS  ns1.example.com.\n",
+    );
+    for i in 0..records {
+        text.push_str(&format!("h{i} IN A 192.0.2.{}\n", i % 254 + 1));
+    }
+    parse_zone_file(&text, "example.com.").expect("parse")
 }
 
 /// Every packet the server receives is scanned for a TSIG record, and that scan

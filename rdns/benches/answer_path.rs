@@ -163,6 +163,42 @@ fn answer(c: &mut Criterion) {
         })
     });
 
+    // And the shape no bench covered until `TODO.md` #24b: a transfer envelope,
+    // which targets 16 KiB (`transfer::ENVELOPE_TARGET`) and so carries 300-500
+    // records, nearly all of them distinct owner names. The compressor's table is
+    // hundreds of entries here rather than a handful, which is the one message
+    // shape the "a scan beats a hash for a handful of names" reasoning is false
+    // of. Names are short so the message stays inside the 14-bit pointer range,
+    // as a real envelope does.
+    let mut envelope = query_message("example.com.", Qtype::AXFR);
+    envelope.response = true;
+    envelope.authoritive = true;
+    for i in 0..400 {
+        envelope.answers.push(ResourceRecord {
+            name: format!("h{i}.e.com."),
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
+                192,
+                0,
+                2,
+                (i % 254) as u8 + 1,
+            )))
+            .expect("build the rdata"),
+        });
+    }
+    let mut envelope_scratch = Vec::with_capacity(65_535);
+    envelope
+        .to_bytes_within_buf(65_535, &mut envelope_scratch)
+        .expect("warm the buffer");
+    group.bench_function("serialize a 400-record transfer envelope", |b| {
+        b.iter(|| {
+            envelope
+                .to_bytes_within_buf(65_535, black_box(&mut envelope_scratch))
+                .expect("serialize")
+        })
+    });
+
     // Parse, look up, build, serialize: the library's share of one query, and
     // the number the #9e work moved.
     group.bench_function("one whole answer", |b| {

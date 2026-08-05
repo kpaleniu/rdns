@@ -1038,7 +1038,7 @@ mod tests {
     ) -> IxfrAssembler {
         let response = crate::ixfr::ixfr_response(request, serving, log).expect("build a response");
         let mut assembler = IxfrAssembler::new("example.com.");
-        for msg in response.messages() {
+        for msg in response.messages(request, serving).expect("materialize") {
             if assembler.accept(&msg).expect("accept") == Progress::Complete {
                 break;
             }
@@ -1242,7 +1242,7 @@ mod tests {
 
         // Cut the stream before the closing SOA.
         let response = crate::ixfr::ixfr_response(&ixfr_from(&v1), &v2, &log).unwrap();
-        let mut messages = response.messages();
+        let mut messages = response.messages(&ixfr_from(&v1), &v2).unwrap();
         messages[0].answers.pop();
         let mut assembler = IxfrAssembler::new("example.com.");
         for msg in &messages {
@@ -1259,7 +1259,8 @@ mod tests {
         // A record from another zone.
         let mut out_of_bailiwick = crate::ixfr::ixfr_response(&ixfr_from(&v1), &v2, &log)
             .unwrap()
-            .messages();
+            .messages(&ixfr_from(&v1), &v2)
+            .unwrap();
         out_of_bailiwick[0].answers.insert(
             2,
             ResourceRecord {
@@ -1290,7 +1291,8 @@ mod tests {
         let mut assembler = IxfrAssembler::new("example.com.");
         let mut headless = crate::ixfr::ixfr_response(&ixfr_from(&v1), &v2, &log)
             .unwrap()
-            .messages();
+            .messages(&ixfr_from(&v1), &v2)
+            .unwrap();
         headless[0].answers[0] = ResourceRecord {
             name: "www.example.com.".to_string(),
             class: Class::new(1),

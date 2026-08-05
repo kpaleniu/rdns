@@ -150,12 +150,12 @@ quietly — `git blame` refuses a revision it cannot resolve.
 
 | | Windows | Linux |
 |---|---|---|
-| `rdns` lib | 684 | **687** |
+| `rdns` lib | 691 | **694** |
 | allocations | 1 | 1 |
 | no_input_panics | 1 | 1 |
-| `rdnsd` | 101 | **114** |
+| `rdnsd` | 106 | **119** |
 | `rdnsr` | 6 | 6 |
-| **total** | **793** | **809** |
+| **total** | **805** | **821** |
 
 ~~**The Windows column is current and the Linux one is not.** Linux was last
 measured before #13 landed; the gap between the columns is the sixteen
@@ -163,8 +163,9 @@ measured before #13 landed; the gap between the columns is the sixteen
 longer safe to read it as only the former. Re-run the Linux recipe under "Running
 the Linux half by hand" before quoting the right-hand column.~~
 
-**Both columns re-measured 2026-08-04, on the same tree, minutes apart** — the
-numbers above replace the stale pair (655/633, 94/106, 754/744). The gap is
+**Both columns re-measured 2026-08-05, on the same tree, minutes apart** — the
+numbers above replace 2026-08-04's pair (684/687, 101/114, 793/809), which
+replaced a staler one (655/633, 94/106, 754/744). The gap is
 **16**, and it is exactly the sixteen `#[cfg(unix)]` tests described below: +3 in
 the library (the mode checks) and +13 in `rdnsd` (the control socket). That the
 difference is now *only* the cfg-gated tests is the check worth making, and it is
@@ -609,8 +610,9 @@ than cache-bound.~~ — **stale within the day, for the sixth time. #23-#26 were
 filed later on 2026-08-04** from a second architecture review, this one aimed at
 algorithmic shape rather than structure. ~~**#23 is the one with teeth**: a query
 that costs a second of CPU on `rdnsr --dnssec-validate`, provoked and timed.~~
-**#23 is fixed** (`71126f1`, 2026-08-04) — seventh time, same day again. #22 and
-#24-#26 are open.
+**#23 is fixed** (`71126f1`, 2026-08-04) — seventh time, same day again. ~~#22 and
+#24-#26 are open.~~ — **all of #24 fixed 2026-08-05**, so read the table: #22,
+#25 and #26 are open.
 
 ~~#11, a stretch goal blocked on hardware counters the development machine cannot read~~ —
 **answered no on 2026-08-04**, and the blocker did not exist: the Linux side has a
@@ -656,7 +658,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **9** | what a five-way review found: 48 defects in six groups (9a-9f) | **all done, 2026-07-27 → 2026-08-01.** The patterns became `CLAUDE.md`, which is the useful artefact; the 2,435 lines of finding text are in `git log -p TODO.md` |
 | **10** | dynamic UPDATE (RFC 2136) | **done 2026-08-03**, seven commits. Reading (`2f94124`, `1461036`), applying and the serial (`dcfe861`), authorization (`9051d4e`), dispatch and persistence (`8169f0d`). Incremental re-signing (`3b2886a`) and the journal (#7 step 6) closed it |
 | **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`71126f1`), the day after it was filed. 1 124 ms → 1.28 ms on the same probe. The fix is a type — `Nsec3Params`, the triple a hash is a function of — plus the map lookup the key was already there for, and the proof moved out from under the lock. One of the four filed boxes did not survive being checked against the code: NSEC3 hides how deep a cached name is, so the depth bound it asked for is not available to take |
-| **24** | three costs that grow with something the operator chose | **open, filed 2026-08-04.** Zone selection is O(zones per query) — 54 µs at ten thousand zones; name compression is O(n²) in the records of one message, which is where AXFR envelopes live; and an AXFR materializes the zone three times over |
+| **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection was O(zones per query) — 55 µs at ten thousand zones, now 32 ns and flat, keyed on `NameKeyBuf` with a walk up the QNAME, and the walk brought a second multiplier with it that the client picks. Name compression was O(n²) in the records of one message, so a 400-record transfer envelope cost 130.7 µs to serialize and now costs 42.8; the index that fixes it is built lazily, because the threshold that helps a transfer hurt a 60-name response by 26%. And an AXFR held the zone three times over before the first byte went out; the envelopes are an iterator now, at 10.5× less peak memory, which needed `Arc<Zone>` in the map because the lock cannot be held across a socket write |
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
@@ -1381,7 +1383,7 @@ a suffix without allocating, not this one's.
 None of these is wrong on the zone this repo tests with. All three grow with a
 number an operator sets and nothing measures.
 
-#### 24a. Zone selection is a linear scan of the zone map, per query
+#### 24a. Zone selection is a linear scan of the zone map, per query — **fixed 2026-08-05**
 
 `rdnsd/src/answer.rs:548`. The allocations were taken out of it and the
 O(zones) was left; `Zones::matching_key` (`zones.rs:407`), `Zones::matching`
@@ -1404,14 +1406,58 @@ hash a QNAME against it and every lookup has to compare case-insensitively
 against every key. `utils::NameKeyBuf` exists for exactly this and is not used
 here — `CLAUDE.md` §17's own prediction, unclaimed.
 
-- [ ] Key the map on `NameKeyBuf`. `matching_key`'s case-insensitive scan then
+- [x] Key the map on `NameKeyBuf`. `matching_key`'s case-insensitive scan then
       has nothing left to do, and `insert`'s "remove by the key already there"
       dance goes with it.
-- [ ] Replace the scan with the parent walk `Zone::name_kind_of_key` already
+- [x] Replace the scan with the parent walk `Zone::name_kind_of_key` already
       does: at most 127 hash lookups, in practice four, independent of how many
       zones are served.
 
-#### 24b. Name compression is quadratic in the records of one message
+**Both boxes done, and the walk needed a bound the plan did not ask for.**
+`rdnsd::zones::ZoneMap` is `HashMap<NameKeyBuf, Zone>`, the lookup is
+`Zones::for_query`, and `Zones::matching`, `notify_reply`'s "is this ours",
+`plan_reload`'s "is this zone still configured" and `answer_transfer`'s apex
+lookup are all `get`/`contains_key` now. `rdns::utils::parent_name` was moved out
+of `zone.rs` so both walks use one (§7).
+
+Measured on the same probe as the table above, release, one run each:
+
+| zones | before | after | 34-label miss, after |
+|---|---|---|---|
+| 1 | 10.3 ns | 30.3 ns | 53 ns |
+| 100 | 337 ns | 31.0 ns | 53 ns |
+| 1 000 | 4 143 ns | 31.4 ns | 53 ns |
+| 10 000 | 55 725 ns | 32.1 ns | 53 ns |
+
+The **34-label** column is the finding. A walk costs one lookup per label of the
+*client's* name, so a reverse-IPv6 PTR hashed 34 suffixes on a server whose zones
+are two labels deep, where only the last two can match: 598 ns against 40 for an
+ordinary name — a multiplier a stranger picks, on a path the scan had been immune
+to (it read 3.6 ns for the same query, because its cost was the zone count and
+never the name). Two things fix it, and only together:
+
+- `Zones::deepest`, the deepest origin held in labels, is where the walk starts;
+  anything longer cannot be an origin. It only ever grows — `insert` raises it,
+  `remove` leaves it, `replace_all` recomputes — because too large costs a few
+  wasted lookups and too small loses a zone we serve (`CLAUDE.md` §5's rule about
+  deciding which way a bound fails).
+- Reaching that suffix has to be one pass over the last few labels
+  (`rmatch_indices(…).nth(deepest)`), and the fold has to come *after* it.
+  Counting labels from the left and stepping down with `parent_name` re-read the
+  name once per label and left it at 340 ns: the hashing was gone and the scanning
+  was not.
+
+Two ratio tests in `zones.rs` hold both shapes, each watched failing —
+`choosing_a_zone_costs_the_same_however_many_are_served` at 554× against the old
+scan, and `a_long_qname_does_not_cost_more_than_a_short_one` at 10.9× against the
+first version of the walk. The second is a regression test for a defect this
+change *introduced*, which is worth saying out loud (§10).
+
+The first version also regressed the one-zone case, 10.3 → 43 ns, by hashing
+three suffixes where the scan compared one origin. The bound took that back to
+30 ns, which is now below the scan.
+
+#### 24b. Name compression is quadratic in the records of one message — **fixed 2026-08-05**
 
 `compression.rs:153`. `lookup` is a linear scan of `seen`, which grows by one
 entry per label per distinct name. The doc comment justifies it with "one message
@@ -1429,14 +1475,55 @@ An AXFR envelope targets 16 KiB (`transfer.rs:29`), which is 300-500 records, so
 transfers sit in the quadratic region — and it worsens in exactly the direction
 anyone tuning envelope size would push.
 
-- [ ] Bucket `seen` by something cheap (first label length, or its first byte)
+- [x] Bucket `seen` by something cheap (first label length, or its first byte)
       before comparing, or put the suffix map back as a hash over ranges into the
       arena — the arena is what made the old `HashMap<String, u16>` expensive,
       not the hashing.
-- [ ] Whatever is done, assert the shape rather than a time: ns/record for 25
+- [x] Whatever is done, assert the shape rather than a time: ns/record for 25
       names against 800 is a ratio and does not care what else is running (§10).
 
-#### 24c. An AXFR materializes the zone three times over
+**The second box, taken literally, is what caught the first attempt.** The fix is
+`NameCompressor::index`, a `HashMap<u64, u32>` from the ASCII-folded hash of a
+suffix to its entry in `seen` — the second option, and the box's parenthesis was
+right that the arena was the expense and not the hashing.
+
+Three things it needed that the filed plan did not say:
+
+- **The index is built lazily, past `SCAN_LIMIT` suffixes.** A `HashMap`
+  allocates on its first insert, and `tests/allocations.rs` holds a one-record
+  response at exactly three allocations and a reused-buffer one at two. Both are
+  unchanged, because a response never reaches the threshold.
+- **`SCAN_LIMIT` is 128, and the first answer of 32 was wrong.** 32 came from
+  timing the compressor alone, where the crossover looks like the thirties; on
+  whole messages it made `serialize a full-size response` — 60 names, an
+  existing bench — **26% slower**. §10's rule about measuring the thing rather
+  than a proxy for it, caught by a bench that already existed.
+- **A hash collision drops the newer suffix instead of chaining it.** Compression
+  is optional (RFC 1035 §4.1.4), so the cost is a few bytes on the wire, and the
+  alternative is a bucket allocation per distinct name. The value is one index,
+  and both arms of `lookup` still compare against the arena — a hash equal to a
+  different suffix's would otherwise be a pointer to the wrong name.
+
+Through `to_bytes_within_buf`, and there is now a bench for the envelope shape
+(`cargo bench -p rdns -- "serialize a"`):
+
+| | before | after |
+|---|---|---|
+| one record | 134.0 ns | 134.5 ns |
+| 60 names | 5.55 µs | 5.56 µs |
+| **400-record envelope** | **130.7 µs** | **42.8 µs** |
+
+Per name written, the ratio the second box asks for: 51 ns at 25 names and 663 at
+800 before, 53 and 112 after — 13× down to 2.1×, and what is left is cache rather
+than the table. `writing_a_name_costs_the_same_however_many_the_message_holds`
+holds it at 5× and was watched failing at 8.1×.
+
+One thing found on the way and worth knowing before touching `lookup`: the scan
+is sensitive to how the comparison is *spelled*. As a method on `&self`, and
+again as one closure both arms call, it cost 51 → 75 ns per name. It is written
+out twice on purpose, with that measurement beside it.
+
+#### 24c. An AXFR materializes the zone three times over — **fixed 2026-08-05**
 
 `transfer::axfr_messages` clones every record into a `Vec<ResourceRecord>`,
 `pack_transfer_messages` moves those into a `Vec<DnsMessage>`, and `rdnsd` builds
@@ -1446,9 +1533,59 @@ zone again as messages, plus ~2 500 × 64 KiB of frame capacity, per concurrent
 transfer. ACL-gated, so not pre-auth; a secondary reconnecting in a loop
 multiplies it.
 
-- [ ] Make the envelope sequence an iterator the writer pulls from, so at most
+- [x] Make the envelope sequence an iterator the writer pulls from, so at most
       one envelope is materialized at a time. The framing and signing loop already
       has the right shape for it.
+
+`transfer::axfr_envelopes` yields one envelope at a time and `axfr_messages` is
+its `collect()`, so every other caller and every existing test is unchanged; one
+packer (`transfer::Envelopes`) serves both it and the incremental path. `rdnsd`
+serializes, signs, frames and hands over each envelope before the next exists.
+
+Measured as allocation counts and peak live bytes, which are exact and read the
+same on Windows and Linux (`rdns/tests/allocations.rs`):
+
+| | first envelope | whole transfer |
+|---|---|---|
+| blocks, 1 200-record zone | 1 011 | 2 439 |
+| **peak bytes, 5 000-record zone** | **39 208** | **412 839** |
+
+The count is not the point — streaming calls the allocator about as often. The
+peak is: 10.5× less held at once, and the ratio grows with the zone, which is why
+the item was about a number the operator chose.
+
+Three things the plan did not mention:
+
+- **The prerequisite was the zone map, not the iterator.** Pulling envelopes
+  lazily means the zone has to stay readable across socket writes, and
+  `CLAUDE.md` §9 forbids holding the lock there — which is *why* the old code
+  copied every record out from under the guard. `ZoneMap` is
+  `HashMap<NameKeyBuf, Arc<Zone>>` now and `Zones::snapshot` hands out a version:
+  one that a reload replaces the map around rather than mutating, so the transfer
+  is of a single version throughout. Half of one version and half of the next is
+  a zone that never existed, and a secondary would store it and serve it with AA
+  set.
+- **`IxfrResponse::FullTransfer` had to stop carrying its messages.** It is the
+  branch a secondary that fell behind takes, so it is the worst case for
+  materializing, and it was calling `axfr_messages` inside `ixfr_response`. It
+  carries only `why` now and the caller builds the answer, which is what lets that
+  path stream too.
+- **A failure after the first envelope cannot be an error response.** The old
+  code built every frame before sending any, so "half a transfer is worse than
+  none" was free; streaming gives that up. `Reply::Abort` closes the connection
+  instead, and the missing closing SOA (RFC 5936 §2.2) is what tells the client
+  the stream is not a transfer — prompt, where falling silent would leave it
+  waiting out a timeout. `answer` sends into the connection's channel rather than
+  returning a `Vec` for the same reason, and the bounded channel means a slow
+  client back-pressures the *next* envelope instead of the whole zone being built
+  ahead of it.
+
+**Verified against dnspython**, which is the third party for anything on this
+path: a 2 003-record zone transferred as 11 envelopes, plain and TSIG-signed,
+both arriving at the same 2 002 names with every envelope's MAC verified and
+chained (RFC 8945 §5.3.1); an IXFR from a serial with no chain streaming the same
+11 envelopes as a full transfer; and an IXFR from the current serial answering
+with one SOA.
 
 ### 25. Per-answer waste on paths already measured — filed 2026-08-04
 

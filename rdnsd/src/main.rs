@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zones::{
     install_all_zones, install_zone, load_zones_from_source, note_serials, restore_journals,
-    validate_zone_source, verify_zones, Served, ZoneSigning, ZoneSource, Zones,
+    validate_zone_source, verify_zones, Served, ZoneMap, ZoneSigning, ZoneSource, Zones,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -41,7 +41,7 @@ use rdns::{
     secondary::{state_file_path, MasterSpec, StateFile},
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
     shutdown::{stop_signal, Busy, Lifecycle, Shutdown, Stop},
-    transfer::axfr_messages,
+    transfer::axfr_envelopes,
     tsig::{self, TsigCheck, TsigKeyring, TsigSession},
     update,
     utils::{current_unix_timestamp, recv_error_is_transient, UDP_RECEIVE_BUFFER},
@@ -892,7 +892,7 @@ impl Server {
     /// cutting it mid-answer costs an AXFR client a zone it believes is complete.
     async fn serve_connection(self: Arc<Self>, stream: TcpStream, peer: SocketAddr, stop: Stop) {
         let (mut reader, mut writer) = stream.into_split();
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_INFLIGHT_PER_CONNECTION);
+        let (tx, mut rx) = mpsc::channel::<Reply>(MAX_INFLIGHT_PER_CONNECTION);
 
         // One task owns the write half. Answers may complete out of order —
         // RFC 7766 §6.2.1.1 allows that, and clients match on the transaction
@@ -900,7 +900,13 @@ impl Server {
         // every reply funnels through here.
         let writer_logger = self.logger.clone();
         let writer_task = tokio::spawn(async move {
-            while let Some(framed) = rx.recv().await {
+            while let Some(reply) = rx.recv().await {
+                let Reply::Frame(framed) = reply else {
+                    // See `Reply::Abort`: dropping the write half is how a peer
+                    // is told that the transfer it is halfway through will not
+                    // be finished.
+                    break;
+                };
                 if let Err(e) = writer.write_all(&framed).await {
                     bad_request!(writer_logger, peer.ip(), "socket write error: {e}");
                     break;
@@ -970,13 +976,13 @@ impl Server {
                 // One sender keeps that order; another query's reply may land
                 // between them, which is legal — a client demultiplexes on the
                 // transaction id.
-                for framed in server.answer(&packet, peer).await {
-                    // A send error means the writer is gone (the peer hung up);
-                    // there is nowhere left to put the rest.
-                    if tx.send(framed).await.is_err() {
-                        break;
-                    }
-                }
+                //
+                // `answer` sends rather than returning a `Vec` so that a transfer
+                // can hand over one envelope at a time (`TODO.md` #24c). The
+                // channel is bounded, so a slow client back-pressures the
+                // envelope after the one it is still reading instead of the whole
+                // zone being built ahead of it.
+                server.answer(&packet, peer, &tx).await;
                 drop(permit);
             });
         }
@@ -988,17 +994,20 @@ impl Server {
         let _ = writer_task.await;
     }
 
-    /// Answer one query, returning the length-prefixed messages to write back.
+    /// Answer one query, sending each length-prefixed message to the connection's
+    /// writer as it is built.
     ///
-    /// A list rather than one message, because an AXFR response is a sequence
-    /// (RFC 5936 §2.2). Empty means the query earned no response at all.
-    async fn answer(&self, packet: &[u8], peer: SocketAddr) -> Vec<Vec<u8>> {
+    /// A sequence rather than one message, because an AXFR response is one
+    /// (RFC 5936 §2.2) — and sent rather than returned, because a transfer of a
+    /// large zone must not exist all at once (`TODO.md` #24c). Sending nothing is
+    /// how a query earns no response at all.
+    async fn answer(&self, packet: &[u8], peer: SocketAddr, out: &mpsc::Sender<Reply>) {
         let ip = peer.ip();
 
         if !self.rate_limiter.should_allow(ip) {
             self.logger.log_rate_limited(ip);
             self.metrics.count(&self.metrics.rate_limited);
-            return Vec::new();
+            return;
         }
 
         let validation = self.validator.validate_packet(packet, true);
@@ -1015,7 +1024,7 @@ impl Server {
                     .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
             );
             self.metrics.count(&self.metrics.validation_errors);
-            return Vec::new();
+            return;
         }
 
         // `Request` is the door: it parses, and it refuses QR=1. Both halves of
@@ -1028,7 +1037,7 @@ impl Server {
             Ok(msg) => msg,
             Err(RequestError::Wire(_)) => {
                 bad_request!(self.logger, ip, "failed to parse DNS message");
-                return Vec::new();
+                return;
             }
             Err(RequestError::NotAQuestion) => {
                 // Silence, not a reply: answering turns a pair of servers, or one
@@ -1039,7 +1048,7 @@ impl Server {
                     ip,
                     "a response was sent to a server port; dropped"
                 );
-                return Vec::new();
+                return;
             }
         };
 
@@ -1069,17 +1078,16 @@ impl Server {
                     rejection.key_name(),
                     rejection.error.reason()
                 );
-                let response = match self.error_bytes(&msg, ResponseCode::NotAuthorized) {
-                    Some(bytes) => bytes,
-                    None => return Vec::new(),
+                let Some(response) = self.error_bytes(&msg, ResponseCode::NotAuthorized) else {
+                    return;
                 };
-                return match rejection.attach(response, now) {
-                    Ok(bytes) => frame(&bytes).into_iter().collect(),
-                    Err(e) => {
-                        serving_error!(self.logger, ip, "TSIG error reply: {e}");
-                        Vec::new()
+                match rejection.attach(response, now) {
+                    Ok(bytes) => {
+                        send_framed(out, &bytes).await;
                     }
-                };
+                    Err(e) => serving_error!(self.logger, ip, "TSIG error reply: {e}"),
+                }
+                return;
             }
         };
 
@@ -1090,9 +1098,9 @@ impl Server {
             msg.queries.first().map(|q| q.qtype),
             Some(Qtype::AXFR) | Some(Qtype::IXFR)
         ) {
-            return self
-                .answer_transfer(&msg, peer, session.as_mut(), now)
+            self.answer_transfer(&msg, peer, session.as_mut(), now, out)
                 .await;
+            return;
         }
 
         // An UPDATE is answered here for the same reasons a transfer is, and one
@@ -1101,7 +1109,10 @@ impl Server {
         // guard on the zone map that installing the result would deadlock
         // against.
         if msg.opcode == OpCode::Update {
-            return self.answer_update(&msg, peer, session.as_mut()).await;
+            for framed in self.answer_update(&msg, peer, session.as_mut()).await {
+                let _ = out.send(Reply::Frame(framed)).await;
+            }
+            return;
         }
 
         // Hold the zone lock only as long as it takes to build and serialize the
@@ -1120,7 +1131,7 @@ impl Server {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     serving_error!(self.logger, ip, "serialization error: {e}");
-                    return Vec::new();
+                    return;
                 }
             }
         };
@@ -1130,13 +1141,14 @@ impl Server {
         // to one question being replayed as the reply to another.
         match session.as_mut() {
             Some(session) => match session.sign(bytes, now) {
-                Ok(signed) => frame(&signed).into_iter().collect(),
-                Err(e) => {
-                    serving_error!(self.logger, ip, "TSIG signing failed: {e}");
-                    Vec::new()
+                Ok(signed) => {
+                    send_framed(out, &signed).await;
                 }
+                Err(e) => serving_error!(self.logger, ip, "TSIG signing failed: {e}"),
             },
-            None => frame(&bytes).into_iter().collect(),
+            None => {
+                send_framed(out, &bytes).await;
+            }
         }
     }
 
@@ -1146,13 +1158,19 @@ impl Server {
     /// knowing it happened matters as much as whether it was permitted — a
     /// refused one is a probe, and an allowed one is a copy of the zone leaving
     /// the building.
+    ///
+    /// **Written to `out` one envelope at a time**, which is `TODO.md` #24c: the
+    /// zone used to be materialized as records, again as messages and again as
+    /// frames, all three before the first byte went out. What that costs in
+    /// failure handling is on [`Server::abandon_transfer`].
     async fn answer_transfer(
         &self,
         msg: &DnsMessage,
         peer: SocketAddr,
         mut session: Option<&mut TsigSession>,
         now: u64,
-    ) -> Vec<Vec<u8>> {
+        out: &mpsc::Sender<Reply>,
+    ) {
         let ip = peer.ip();
         let qname = msg
             .queries
@@ -1196,7 +1214,9 @@ impl Server {
                 ip,
                 "{kind} of {qname} REFUSED: key {key_name} is scoped to other zones"
             );
-            return self.transfer_error(msg, ResponseCode::Refused, ip, session);
+            self.send_transfer_error(msg, ResponseCode::Refused, ip, session, out)
+                .await;
+            return;
         }
 
         let authenticated_by = session.as_ref().map(|s| s.key_name().to_string());
@@ -1207,32 +1227,42 @@ impl Server {
                 "{kind} of {qname} REFUSED: no TSIG key, and not in --allow-transfer"
             );
             // No session on this path by construction — it is the "no key" case.
-            return self.transfer_error(msg, ResponseCode::Refused, ip, None);
+            self.send_transfer_error(msg, ResponseCode::Refused, ip, None, out)
+                .await;
+            return;
         }
 
         // A transfer names a zone apex, not any name within it: transferring
         // example.com. because www.example.com. was asked for would hand over a
         // zone nobody named. So this is an exact match on the origin, not the
         // enclosing-zone lookup an ordinary query does.
-        let messages = {
+        //
+        // **A snapshot, not the guard.** What follows writes a whole zone to a
+        // socket, and the lock may not be held across that (`CLAUDE.md` §9) — but
+        // the transfer still has to be of one version throughout, since half of
+        // one and half of the next is a zone that never existed. `Zones::snapshot`
+        // is both: an `Arc` of the version current now, which reloads replace the
+        // map around rather than mutate (`TODO.md` #24c).
+        let (zone, prepared) = {
             let zones = self.zone_map.read().await;
             // `apex` is the one computed above, sixteen lines up: it was derived
             // twice from the same `qname` before `absolute_name` borrowed
             // (`TODO.md` #19c).
-            let Some(zone) = zones
-                .values()
-                .find(|z| z.origin().eq_ignore_ascii_case(&apex))
-            else {
+            let Some(zone) = zones.snapshot(&apex) else {
                 tracing::info!(peer = %ip, "{kind} of {qname}: NOTAUTH (not a zone served here)");
-                return self.transfer_error(msg, ResponseCode::NotAuthorized, ip, session);
+                self.send_transfer_error(msg, ResponseCode::NotAuthorized, ip, session, out)
+                    .await;
+                return;
             };
-            let built = if incremental {
+            if !incremental {
+                (zone, Vec::new())
+            } else {
                 // The delta log is read under the zone lock, so the increments
                 // and the zone they are increments *of* are the same version.
                 // Taken separately, a reload between the two reads would produce
                 // a chain that does not match the SOA framing it is wrapped in.
                 let deltas = self.deltas.read().await;
-                ixfr_response(msg, zone, &deltas).map(|response| {
+                let built = ixfr_response(msg, &zone, &deltas).and_then(|response| {
                     match &response {
                         IxfrResponse::UpToDate(_) => {
                             tracing::info!(peer = %ip, "IXFR of {qname}: already current, sending one SOA")
@@ -1246,36 +1276,70 @@ impl Server {
                             "IXFR of {qname}: sending the whole zone instead ({why})"
                         ),
                     }
-                    response.messages()
-                })
-            } else {
-                axfr_messages(msg, zone)
-            };
-            match built {
-                Ok(messages) => messages,
-                Err(e) => {
-                    serving_error!(self.logger, ip, "{kind} of {qname}: {e}");
-                    return self.transfer_error(msg, ResponseCode::ServerFailure, ip, session);
+                    // A full transfer is left unbuilt on purpose: it is the whole
+                    // zone, which is what the envelope iterator below exists not
+                    // to materialize. Everything else is bounded by the delta log.
+                    match response {
+                        IxfrResponse::FullTransfer { .. } => Ok(Vec::new()),
+                        other => other.messages(msg, &zone),
+                    }
+                });
+                match built {
+                    Ok(messages) => (zone, messages),
+                    Err(e) => {
+                        serving_error!(self.logger, ip, "{kind} of {qname}: {e}");
+                        self.send_transfer_error(
+                            msg,
+                            ResponseCode::ServerFailure,
+                            ip,
+                            session,
+                            out,
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
         };
 
-        let mut frames = Vec::with_capacity(messages.len());
+        // One envelope at a time: built, serialized, signed, framed and handed to
+        // the writer before the next one exists. The whole point of #24c, and the
+        // reason the sequence is an iterator — a million-record zone used to be
+        // materialized as records, again as messages, and again as frames, all
+        // three of them before the first byte reached the socket.
+        // `+ Send`, because this runs in a spawned task: the iterator is alive
+        // across the `await` on every envelope handed to the writer.
+        let envelopes: Box<dyn Iterator<Item = DnsMessage> + Send + '_> = if prepared.is_empty() {
+            match axfr_envelopes(msg, &zone) {
+                Ok(envelopes) => Box::new(envelopes),
+                Err(e) => {
+                    // Nothing has been sent yet, so this is still an ordinary
+                    // error response: the zone has no apex SOA and there is
+                    // nothing to open a transfer with.
+                    serving_error!(self.logger, ip, "{kind} of {qname}: {e}");
+                    self.send_transfer_error(msg, ResponseCode::ServerFailure, ip, session, out)
+                        .await;
+                    return;
+                }
+            }
+        } else {
+            Box::new(prepared.into_iter())
+        };
+
         let mut records = 0;
-        for message in &messages {
+        let mut sent = 0usize;
+        for message in envelopes {
             records += message.answers.len();
             let bytes = match message.to_bytes_within(u16::MAX as usize) {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    // Half a transfer is worse than none: the client cannot tell
-                    // a stream that stopped early from one that finished, so give
-                    // up on the whole thing rather than send a prefix of it.
                     serving_error!(
                         self.logger,
                         ip,
                         "{kind} of {qname}: serialization error: {e}"
                     );
-                    return self.transfer_error(msg, ResponseCode::ServerFailure, ip, session);
+                    self.abandon_transfer(msg, ip, session, sent, out).await;
+                    return;
                 }
             };
             // Every envelope is signed, and the MACs chain (RFC 8945 §5.3.1): a
@@ -1290,24 +1354,28 @@ impl Server {
                             ip,
                             "{kind} of {qname}: TSIG signing failed: {e}"
                         );
-                        // Deliberately unsigned: signing is what just failed.
-                        return self.transfer_error(msg, ResponseCode::ServerFailure, ip, None);
+                        // Deliberately unsigned, if anything is sent at all:
+                        // signing is what just failed.
+                        self.abandon_transfer(msg, ip, None, sent, out).await;
+                        return;
                     }
                 },
                 None => bytes,
             };
-            // A transfer envelope that cannot be framed abandons the whole
-            // transfer rather than sending a short stream: a client reading
-            // envelopes until the closing SOA would otherwise wait for one that
-            // is never coming. Envelopes target 16 KiB
-            // (`AXFR_TARGET_MESSAGE_SIZE`), so this is not the exposure #17 was
-            // filed for — but it is the same check, and the alternative here is
-            // a hang rather than a dropped connection.
-            let Some(framed) = frame(&bytes) else {
-                return self.transfer_error(msg, ResponseCode::ServerFailure, ip, None);
-            };
-            frames.push(framed);
+            // Envelopes target 16 KiB (`AXFR_TARGET_MESSAGE_SIZE`), so an
+            // unframeable one is not the exposure #17 was filed for — but it is
+            // the same check, and a client reading envelopes until the closing
+            // SOA would otherwise wait for one that is never coming.
+            if !send_framed(out, &bytes).await {
+                // Either the frame is impossible or the peer hung up. The first
+                // needs the connection closed; the second closed it already, and
+                // telling a writer that is gone to stop costs nothing.
+                self.abandon_transfer(msg, ip, None, sent, out).await;
+                return;
+            }
+            sent += 1;
         }
+
         // A transfer is an answer too, and this is the only path that does not
         // go through `make_response`.
         self.metrics.count(&self.metrics.responses_sent);
@@ -1317,10 +1385,55 @@ impl Server {
         };
         tracing::info!(
             peer = %ip,
-            "{kind} of {qname}: {records} records in {} message(s), authenticated by {how}",
-            frames.len()
+            "{kind} of {qname}: {records} records in {sent} message(s), authenticated by {how}"
         );
-        frames
+    }
+
+    /// Give up on a transfer, in whichever of the two ways is still available.
+    ///
+    /// Nothing sent yet means the client can still be told why, as an error
+    /// response. Once an envelope has gone there is no way back — an error
+    /// response would be read as another envelope — so the connection is closed,
+    /// and the missing closing SOA is what tells the client that what it holds is
+    /// not a zone (RFC 5936 §2.2). That is the one behaviour `TODO.md` #24c
+    /// changed: the old code built every frame before sending any, so a failure
+    /// was always of the first kind — at the price of the zone existing three
+    /// times over before the first byte went out.
+    async fn abandon_transfer(
+        &self,
+        msg: &DnsMessage,
+        ip: IpAddr,
+        session: Option<&mut TsigSession>,
+        sent: usize,
+        out: &mpsc::Sender<Reply>,
+    ) {
+        if sent == 0 {
+            self.send_transfer_error(msg, ResponseCode::ServerFailure, ip, session, out)
+                .await;
+            return;
+        }
+        tracing::error!(
+            peer = %ip,
+            "transfer abandoned after {sent} envelope(s); closing the connection so the \
+             client sees an incomplete stream rather than waiting for a closing SOA"
+        );
+        let _ = out.send(Reply::Abort).await;
+    }
+
+    /// [`Server::transfer_error`], sent.
+    async fn send_transfer_error(
+        &self,
+        msg: &DnsMessage,
+        rcode: ResponseCode,
+        ip: IpAddr,
+        session: Option<&mut TsigSession>,
+        out: &mpsc::Sender<Reply>,
+    ) {
+        for framed in self.transfer_error(msg, rcode, ip, session) {
+            if out.send(Reply::Frame(framed)).await.is_err() {
+                return;
+            }
+        }
     }
 
     /// One framed error response to a transfer request, **signed if the request
@@ -1713,6 +1826,32 @@ fn apply_update_to_file(
 /// for an error: a reply that cannot be framed is a reply that cannot be sent,
 /// and the useful thing is that the operator can see why rather than that the
 /// caller can branch on it.
+/// What a connection's writer task can be handed.
+///
+/// A transfer is answered one envelope at a time (`TODO.md` #24c), so a failure
+/// can now happen with part of the answer already on the wire. There is no way
+/// back from that: the client is mid-stream and an error response would be read
+/// as another envelope.
+enum Reply {
+    /// One length-prefixed message, to be written.
+    Frame(Vec<u8>),
+    /// Stop writing and close the connection.
+    ///
+    /// EOF is the only thing left to say. A transfer is complete when its closing
+    /// SOA arrives (RFC 5936 §2.2), so a stream that ends before one is an
+    /// incomplete transfer the client must discard — and closing says so at once,
+    /// where falling silent would leave it waiting out its timeout.
+    Abort,
+}
+
+/// Frame `bytes` and hand them to the writer. `false` if the connection is gone.
+async fn send_framed(out: &mpsc::Sender<Reply>, bytes: &[u8]) -> bool {
+    let Some(framed) = frame(bytes) else {
+        return false;
+    };
+    out.send(Reply::Frame(framed)).await.is_ok()
+}
+
 fn frame(bytes: &[u8]) -> Option<Vec<u8>> {
     match rdns::framed(bytes) {
         Ok(framed) => Some(framed),
@@ -1794,7 +1933,7 @@ fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
 /// the zone's SOA — a plausible-looking reply to a message that asked nothing.
 fn notify_reply(
     msg: &DnsMessage,
-    zone_map: &HashMap<String, Zone>,
+    zone_map: &ZoneMap,
     secondaries: &Secondaries,
     peer: SocketAddr,
 ) -> DnsMessage {
@@ -1828,9 +1967,9 @@ fn notify_reply(
         return notify::notify_response(msg, ResponseCode::Refused);
     }
 
-    let ours = zone_map
-        .values()
-        .any(|z| z.origin().eq_ignore_ascii_case(&absolute_name(&zone)));
+    // The same folded key the secondaries were asked with: the zone map is keyed
+    // in that form, so this is a lookup rather than a scan of every origin.
+    let ours = zone_map.contains_key(key.as_ref());
     let why = if ours {
         "this server is its primary, not a secondary"
     } else {
@@ -2157,7 +2296,7 @@ impl Reloading {
     /// The old signature was the trap rather than the cost: an `async fn`
     /// containing *zero* await points reads as though it yields somewhere, and
     /// nothing about calling it said otherwise (`CLAUDE.md` §9).
-    async fn load(&self, source: &ZoneSource) -> Result<HashMap<String, Zone>> {
+    async fn load(&self, source: &ZoneSource) -> Result<ZoneMap> {
         let reloading = self.clone();
         let source = source.clone();
         tokio::task::spawn_blocking(move || reloading.load_blocking(&source))
@@ -2166,7 +2305,7 @@ impl Reloading {
     }
 
     /// The blocking half of [`Reloading::load`], and named so at the call site.
-    fn load_blocking(&self, source: &ZoneSource) -> Result<HashMap<String, Zone>> {
+    fn load_blocking(&self, source: &ZoneSource) -> Result<ZoneMap> {
         let mut zones = load_zones_from_source(source, self.replicating, self.allow_partial)?;
         if let Some(signing) = &self.signing {
             signing.apply(&mut zones)?;
@@ -2469,7 +2608,7 @@ async fn announce_zones(
 ) -> Vec<(String, Serial)> {
     let (current, pending) = {
         let zones = zone_map.read().await;
-        let all: Vec<&Zone> = zones.values().collect();
+        let all: Vec<&Zone> = zones.values().map(Arc::as_ref).collect();
         let current = notify::zone_serials(&all);
         let changed = notify::changed_zones(announced, &current);
         // Build the messages under the lock, send them outside it: a NOTIFY that
@@ -2479,7 +2618,7 @@ async fn announce_zones(
             .iter()
             .filter_map(|(name, serial)| {
                 zones
-                    .get(name)
+                    .get(name.as_str())
                     .map(|zone| (name.clone(), *serial, notify::soa_record(zone)))
             })
             .collect();
@@ -2987,7 +3126,7 @@ mod tests {
     use super::*;
     use crate::replication::{expire_if_out_of_contact, refresh_once, ReplicatedZone};
     use crate::testutil::query;
-    use crate::zones::{enumerate_zone_files, plan_reload};
+    use crate::zones::{enumerate_zone_files, plan_reload, zone_key};
     use rdns::secondary::{zone_file_path, RefreshTimers, TransferState};
     use rdns::tsig::{TsigAlgorithm, TsigKey};
     use rdns::utils::record_types;
@@ -2997,6 +3136,21 @@ mod tests {
     use rdns::Ttl;
     use std::collections::BTreeMap;
     use tokio::sync::Notify;
+
+    /// `Server::answer` collected, for the tests that want the whole reply in
+    /// hand. It sends rather than returning so a transfer need not exist all at
+    /// once (`TODO.md` #24c); nothing in a test is large enough to fill the
+    /// channel before it is drained here.
+    async fn answered(server: &Server, packet: &[u8], peer: SocketAddr) -> Vec<Vec<u8>> {
+        let (tx, mut rx) = mpsc::channel::<Reply>(1024);
+        server.answer(packet, peer, &tx).await;
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(Reply::Frame(framed)) = rx.recv().await {
+            replies.push(framed);
+        }
+        replies
+    }
 
     /// A suppressed log line must not build its message.
     ///
@@ -3230,7 +3384,7 @@ mod tests {
     /// disagree about what a default server is (`CLAUDE.md` §7).
     fn server_with(zone: Zone) -> Arc<Server> {
         let mut zones = HashMap::new();
-        zones.insert(zone.origin().to_string(), zone);
+        zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
         Arc::new(Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             rate_limiter: Arc::new(RateLimiter::with_defaults()),
@@ -3742,7 +3896,7 @@ mod tests {
         keys: TsigKeyring,
     ) -> SocketAddr {
         let mut zones = HashMap::new();
-        zones.insert(zone.origin().to_string(), zone);
+        zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
 
         let server = Arc::new(Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
@@ -4358,7 +4512,7 @@ mod tests {
         let zone = rdns::zone::parse_zone_file(&zone_text(7), "example.com.").expect("zone");
         let timers = RefreshTimers::from_zone(&zone).expect("timers");
         let mut zones = HashMap::new();
-        zones.insert(zone.origin().to_string(), zone);
+        zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
         let zone_map = Arc::new(RwLock::new(Zones::new(zones)));
 
         let mut state_file = StateFile::load(&state_file_path(&dir.0));
@@ -4411,7 +4565,7 @@ mod tests {
         let zone = rdns::zone::parse_zone_file(&zone_text(7), "example.com.").expect("zone");
         let timers = RefreshTimers::from_zone(&zone).expect("timers");
         let mut zones = HashMap::new();
-        zones.insert(zone.origin().to_string(), zone);
+        zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
         let zone_map = Arc::new(RwLock::new(Zones::new(zones)));
 
         let mut state_file = StateFile::load(&state_file_path(&dir.0));
@@ -4681,8 +4835,8 @@ mod tests {
             "other.test.",
         );
         let mut initial = HashMap::new();
-        initial.insert(v7.origin().to_string(), v7);
-        initial.insert(other.origin().to_string(), other);
+        initial.insert(zone_key(&v7), std::sync::Arc::new(v7));
+        initial.insert(zone_key(&other), std::sync::Arc::new(other));
         install_all_zones(&served(&zone_map, &deltas), initial).await;
         assert!(deltas.read().await.is_empty(), "nothing to differ from yet");
 
@@ -4696,7 +4850,7 @@ mod tests {
             "example.com.",
         );
         let mut reloaded = HashMap::new();
-        reloaded.insert(v8.origin().to_string(), v8);
+        reloaded.insert(zone_key(&v8), std::sync::Arc::new(v8));
         install_all_zones(&served(&zone_map, &deltas), reloaded).await;
 
         let log = deltas.read().await;
@@ -4761,7 +4915,7 @@ mod tests {
             let zone_map = Arc::new(RwLock::new(Zones::default()));
             let deltas = Arc::new(RwLock::new(DeltaLog::new()));
             let mut initial = HashMap::new();
-            initial.insert(v1.origin().to_string(), v1.clone());
+            initial.insert(zone_key(&v1), std::sync::Arc::new(v1.clone()));
             install_all_zones(&served(&zone_map, &deltas), initial).await;
 
             // What one diff costs on this machine right now, with no locks and
@@ -4770,7 +4924,7 @@ mod tests {
             // the assertion portable — CI's runner is several times slower than
             // this one and the comparison has to survive that.
             let mut baseline_zones = HashMap::new();
-            baseline_zones.insert(v2.origin().to_string(), v2.clone());
+            baseline_zones.insert(zone_key(&v2), std::sync::Arc::new(v2.clone()));
             let baseline = {
                 let zones = zone_map.read().await;
                 let started = std::time::Instant::now();
@@ -4781,7 +4935,7 @@ mod tests {
             };
 
             let mut reloaded = HashMap::new();
-            reloaded.insert(v2.origin().to_string(), v2.clone());
+            reloaded.insert(zone_key(&v2), std::sync::Arc::new(v2.clone()));
             let reloading = served(&zone_map, &deltas);
             let reload = tokio::spawn(async move {
                 install_all_zones(&reloading, reloaded).await;
@@ -5016,7 +5170,7 @@ mod tests {
             let dir = ScratchDir::new(tag);
             let zone = rdns::zone::parse_zone_file(REPLICATED, "example.com.").expect("zone");
             let mut zones = HashMap::new();
-            zones.insert(zone.origin().to_string(), zone);
+            zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
             let specs = vec![MasterSpec {
                 zone: "example.com.".to_string(),
                 master: "192.0.2.1:53".parse().unwrap(),
@@ -5071,7 +5225,7 @@ mod tests {
             // Now the reload: the file is still on disk, so it comes back.
             let zone = rdns::zone::parse_zone_file(REPLICATED, "example.com.").unwrap();
             let mut reloaded = HashMap::new();
-            reloaded.insert(zone.origin().to_string(), zone);
+            reloaded.insert(zone_key(&zone), std::sync::Arc::new(zone));
             install_all_zones(&served(&zone_map, &deltas), reloaded).await;
             assert_eq!(zone_map.read().await.len(), 1, "a reload re-reads the file");
 
@@ -5252,7 +5406,7 @@ mod tests {
         )
         .expect("parse the zone");
         let mut zones = HashMap::new();
-        zones.insert(zone.origin().to_string(), zone);
+        zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
         let server = Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             rate_limiter: Arc::new(RateLimiter::with_defaults()),
@@ -5279,14 +5433,14 @@ mod tests {
         // The control: the same question, asked as a question, is answered.
         let mut question = query("ns1.example.com.", Qtype::of(record_types::A), false);
         assert!(
-            !server.answer(&wire(&question), peer).await.is_empty(),
+            !answered(&server, &wire(&question), peer).await.is_empty(),
             "a real query must still be answered — the check has to be narrow"
         );
 
         // The same bytes with QR set are a response, and get nothing back.
         question.response = true;
         assert!(
-            server.answer(&wire(&question), peer).await.is_empty(),
+            answered(&server, &wire(&question), peer).await.is_empty(),
             "a response is not a question, and replying to one is a packet loop"
         );
     }
@@ -5310,7 +5464,7 @@ mod tests {
         let primary_zone =
             rdns::zone::parse_zone_file(&zone_text(1), "example.com.").expect("zone");
         let mut zones = HashMap::new();
-        zones.insert(primary_zone.origin().to_string(), primary_zone);
+        zones.insert(zone_key(&primary_zone), std::sync::Arc::new(primary_zone));
 
         let from = |zone: &str, ip: &str| {
             let msg = notify::notify_request(zone, None, 1);
@@ -5366,7 +5520,7 @@ deep.a.b IN TXT "down here"
 "#;
 
         /// A server holding one signed zone, and the keys it was signed with.
-        fn signed_server(nsec3: bool) -> (HashMap<String, Zone>, Vec<SigningKey>) {
+        fn signed_server(nsec3: bool) -> (Zones, Vec<SigningKey>) {
             let keys = vec![
                 SigningKey::generate(
                     SigningAlgorithm::EcdsaP256Sha256,
@@ -5393,12 +5547,12 @@ deep.a.b IN TXT "down here"
                 &policy,
             )
             .unwrap();
-            let mut zones = HashMap::new();
-            zones.insert(zone.origin().to_string(), zone);
+            let mut zones = Zones::default();
+            drop(zones.insert(zone));
             (zones, keys)
         }
 
-        fn keys_of(zones: &HashMap<String, Zone>) -> Vec<Dnskey> {
+        fn keys_of(zones: &Zones) -> Vec<Dnskey> {
             let zone = &zones["example.com."];
             dnskeys_in(
                 &zone
@@ -5431,7 +5585,7 @@ plain     IN NS  ns.plain.example.com.
 ns.plain  IN A   192.0.2.30
 "#;
 
-        fn signed_zones(text: &str, nsec3: bool) -> (HashMap<String, Zone>, Vec<SigningKey>) {
+        fn signed_zones(text: &str, nsec3: bool) -> (Zones, Vec<SigningKey>) {
             let keys = vec![
                 SigningKey::generate(
                     SigningAlgorithm::EcdsaP256Sha256,
@@ -5458,8 +5612,8 @@ ns.plain  IN A   192.0.2.30
                 &policy,
             )
             .unwrap();
-            let mut zones = HashMap::new();
-            zones.insert(zone.origin().to_string(), zone);
+            let mut zones = Zones::default();
+            drop(zones.insert(zone));
             (zones, keys)
         }
 
@@ -5799,9 +5953,8 @@ ns.plain  IN A   192.0.2.30
 
         #[test]
         fn an_unsigned_zone_answers_a_do_query_the_way_it_answers_any_other() {
-            let mut zones = HashMap::new();
-            let zone = parse_zone_file(SIGNED_ZONE, "example.com.").unwrap();
-            zones.insert(zone.origin().to_string(), zone);
+            let mut zones = Zones::default();
+            drop(zones.insert(parse_zone_file(SIGNED_ZONE, "example.com.").unwrap()));
             let metrics = DnsMetrics::new();
 
             let response = make_response(
@@ -5845,6 +5998,7 @@ ns.plain  IN A   192.0.2.30
             validator.set_require_signed(true);
             verify_zones(&zones, &validator).expect("the zone we just signed verifies");
 
+            let zones = Zones::new(zones);
             let metrics = DnsMetrics::new();
             let response = make_response(
                 &query("www.example.com.", Qtype::of(record_types::A), true),
@@ -5858,7 +6012,7 @@ ns.plain  IN A   192.0.2.30
         fn require_signed_refuses_an_unsigned_zone_rather_than_serving_it() {
             let zone = parse_zone_file(SIGNED_ZONE, "example.com.").unwrap();
             let mut zones = HashMap::new();
-            zones.insert(zone.origin().to_string(), zone);
+            zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
 
             let mut validator = DnssecValidator::new(true);
             validator.set_require_signed(true);
@@ -5877,19 +6031,23 @@ ns.plain  IN A   192.0.2.30
             // the signatures were not renewed, so what goes out is signed data
             // that no longer says what the signature says it says.
             let (mut zones, _keys) = signed_server(false);
-            let zone = zones.get_mut("example.com.").unwrap();
-            let mut edited = Zone::new(zone.origin().to_string());
-            for record in zone.records() {
-                let mut record = record.clone();
-                if record.name == "www.example.com." && record.rdata.rtype() == record_types::A {
-                    record.rdata = RecordData::from_parsed(&rdns::ParsedRecord::A(
-                        "198.51.100.9".parse().unwrap(),
-                    ))
-                    .unwrap();
+            let edited = {
+                let zone = zones.matching("example.com.").expect("the signed zone");
+                let mut edited = Zone::new(zone.origin().to_string());
+                for record in zone.records() {
+                    let mut record = record.clone();
+                    if record.name == "www.example.com." && record.rdata.rtype() == record_types::A
+                    {
+                        record.rdata = RecordData::from_parsed(&rdns::ParsedRecord::A(
+                            "198.51.100.9".parse().unwrap(),
+                        ))
+                        .unwrap();
+                    }
+                    edited.add_record(record);
                 }
-                edited.add_record(record);
-            }
-            *zone = edited;
+                edited
+            };
+            drop(zones.insert(edited));
 
             let validator = DnssecValidator::new(true);
             let err = verify_zones(&zones, &validator).unwrap_err();

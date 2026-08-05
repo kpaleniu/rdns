@@ -2,7 +2,7 @@ use crate::dnssec_denial::{base32hex_decode, canonical_sort_key};
 use crate::error::ZoneError;
 use crate::utils::record_type_code;
 use crate::utils::record_types as rt;
-use crate::utils::{ascii_lowered_cow, is_at_or_under, NameKeyBuf};
+use crate::utils::{ascii_lowered_cow, is_at_or_under, parent_name, NameKeyBuf};
 use crate::Class;
 use crate::Rtype;
 use crate::Serial;
@@ -576,16 +576,6 @@ fn absolutize<'a>(name: &'a str, origin: &'a str) -> Cow<'a, str> {
     } else {
         Cow::Owned(format!("{name}.{origin}"))
     }
-}
-
-/// The parent of an absolute name: its first label removed. `None` at the root,
-/// which is what terminates every walk up the tree.
-fn parent_name(name: &str) -> Option<&str> {
-    if name == "." {
-        return None;
-    }
-    let (_first_label, rest) = name.split_once('.')?;
-    Some(if rest.is_empty() { "." } else { rest })
 }
 
 /// A name with its trailing dot.

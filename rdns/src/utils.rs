@@ -361,6 +361,25 @@ pub fn label_count(name: &str) -> usize {
     }
 }
 
+/// The parent of an absolute name: its first label removed. `None` at the root,
+/// which is what terminates every walk up the tree.
+///
+/// Here rather than in `zone`, because the walk is the shape that answers "which
+/// of the names I hold is the closest ancestor of this one" — a zone's closest
+/// encloser and `rdnsd`'s choice of zone are the same question against different
+/// maps (`CLAUDE.md` §7, and `TODO.md` #24a for what the second one cost as a
+/// scan).
+///
+/// A relative name loses its last label at the root instead of terminating, so
+/// callers pass a key form: absolute, and folded if the map they walk is.
+pub fn parent_name(name: &str) -> Option<&str> {
+    if name == "." {
+        return None;
+    }
+    let (_first_label, rest) = name.split_once('.')?;
+    Some(if rest.is_empty() { "." } else { rest })
+}
+
 /// Whether `name` is `origin` or sits below it — "is this name in that zone".
 /// Four modules used to answer it separately, two of them allocating to do so
 /// (`TODO.md` #13b).

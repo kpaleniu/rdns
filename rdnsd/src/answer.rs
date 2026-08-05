@@ -13,10 +13,8 @@
 //! protocol reasoning whose test module names each wire shape it used to get
 //! wrong, and reading the two together is how the next person checks them.
 
-use std::collections::HashMap;
-
 use rdns::metrics::{DnsMetrics, LatencyTimer};
-use rdns::utils::{is_at_or_under, record_types};
+use rdns::utils::record_types;
 use rdns::zone::{NameKind, Zone};
 use rdns::Qtype;
 use rdns::Ttl;
@@ -24,16 +22,13 @@ use rdns::{
     dnssec_answer, DnsMessage, Edns, OpCode, QueryClass, ResourceRecord, ResponseCode, EDNS_VERSION,
 };
 
+use crate::zones::Zones;
 use crate::RDNSD_PAYLOAD_SIZE;
 
 /// Build a DNS response for the given query message
 ///
 /// Looks up the zone based on the query name and returns appropriate response
-pub(crate) fn make_response(
-    msg: &DnsMessage,
-    zone_map: &HashMap<String, Zone>,
-    metrics: &DnsMetrics,
-) -> DnsMessage {
+pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetrics) -> DnsMessage {
     let timer = LatencyTimer::new();
     let mut response = DnsMessage {
         id: msg.id,
@@ -155,7 +150,7 @@ pub(crate) fn make_response(
         // implementation of the interesting parts. The SOA discloses nothing an
         // ordinary SOA query does not, so it needs no ACL of its own.
         if query.qtype == Qtype::IXFR {
-            if let Some(zone) = find_zone_for_query(&query.qname, zone_map) {
+            if let Some(zone) = zones.for_query(&query.qname) {
                 for soa in zone.query(zone.origin(), Qtype::of(record_types::SOA)) {
                     response.answers.push(ResourceRecord {
                         name: zone.origin().to_string(),
@@ -172,7 +167,7 @@ pub(crate) fn make_response(
         }
 
         // Find the matching zone for this query
-        let zone = find_zone_for_query(&query.qname, zone_map);
+        let zone = zones.for_query(&query.qname);
 
         if let Some(zone) = zone {
             match resolve_in_zone(zone, &query.qname, query.qtype) {
@@ -521,36 +516,6 @@ fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMes
     }
 }
 
-/// Find the zone that should handle this query
-///
-/// Matches the query name against zone origins, preferring the most specific (longest) match
-pub(crate) fn find_zone_for_query<'a>(
-    qname: &str,
-    zone_map: &'a HashMap<String, Zone>,
-) -> Option<&'a Zone> {
-    // The containment test is `utils::is_at_or_under`, which the zone index also
-    // walks with: the trailing dot on either side is its business rather than
-    // ours, the root zone serves everything, and a zone for `example.com` does
-    // not capture `notexample.com`.
-    //
-    // This used to lower-case the qname and every zone origin into fresh
-    // `String`s — three allocations per query, more on a server holding more
-    // than one zone, and the largest single site left on the answer path once
-    // `zone::absolutize` stopped copying (`TODO.md` #9e). It folded with
-    // `str::to_lowercase`, too, which is Unicode where the rest of this codebase
-    // is ASCII-only: U+212A KELVIN SIGN folds to `k`, so a query for a name that
-    // differs from a zone's on the wire could select that zone (`CLAUDE.md` §8).
-    //
-    // No `Vec` of candidates either: `max_by_key` reads one element and never
-    // needed the rest collected. Longest origin wins, which is the most specific
-    // zone — a server holding both `example.com` and `sub.example.com` must
-    // answer for the child from the child's zone.
-    zone_map
-        .values()
-        .filter(|zone| is_at_or_under(qname, zone.origin()))
-        .max_by_key(|z| z.origin().len())
-}
-
 /// **RFC 1034 §4.3.2: the four cases an authoritative answer can be.**
 ///
 /// Three of the four were missing here, and the suite was green the whole time
@@ -583,10 +548,10 @@ sub      IN NS  ns.other.test.
 ns.sub   IN A   192.0.2.20
 "#;
 
-    fn server() -> HashMap<String, Zone> {
+    fn server() -> Zones {
         let zone = parse_zone_file(ZONE, "example.com.").expect("the test zone parses");
-        let mut zones = HashMap::new();
-        zones.insert(zone.origin().to_string(), zone);
+        let mut zones = Zones::default();
+        drop(zones.insert(zone));
         zones
     }
 
@@ -716,8 +681,8 @@ ns.sub   IN A   192.0.2.20
              0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\n",
         );
         let zone = parse_zone_file(&text, "example.com.").unwrap();
-        let mut zones = HashMap::new();
-        zones.insert(zone.origin().to_string(), zone);
+        let mut zones = Zones::default();
+        drop(zones.insert(zone));
 
         let response = make_response(
             &query("sub.example.com.", Qtype::of(record_types::DS), false),
@@ -823,7 +788,7 @@ ns.sub   IN A   192.0.2.20
     /// Choosing a zone folds ASCII case and nothing else (RFC 4343), which
     /// is what the zone index inside it has always done.
     ///
-    /// `find_zone_for_query` lower-cased both sides with `str::to_lowercase`
+    /// The lookup lower-cased both sides with `str::to_lowercase`
     /// — the full Unicode mapping, which folds U+212A KELVIN SIGN to `k`. A
     /// query for `\u{212A}.example.com.` therefore *selected* the zone
     /// `k.example.com.`, two names that are different bytes on the wire. The
@@ -842,8 +807,8 @@ ns.sub   IN A   192.0.2.20
             "k.example.com.",
         )
         .expect("the test zone parses");
-        let mut zones = HashMap::new();
-        zones.insert(zone.origin().to_string(), zone);
+        let mut zones = Zones::default();
+        drop(zones.insert(zone));
 
         let refused = make_response(
             &query("\u{212A}.example.com.", Qtype::of(record_types::SOA), false),
@@ -863,6 +828,53 @@ ns.sub   IN A   192.0.2.20
         assert_eq!(answered.rcode, ResponseCode::Ok);
         assert!(answered.authoritive);
         assert_eq!(rdatas(&answered.answers, record_types::SOA).len(), 1);
+    }
+
+    /// A child zone answers for its own names even when its parent is served
+    /// here too — the most specific zone wins, which is what the walk finds
+    /// first and what the scan's `max_by_key` found by length.
+    ///
+    /// Preventative, not a regression (§10): both spellings of the lookup get
+    /// this right. It is here because the walk is the *only* thing that decides
+    /// it now, and a walk that started at the apex instead of the QNAME would
+    /// pass every other test in this file.
+    #[test]
+    fn the_child_zone_answers_for_names_below_the_cut() {
+        let parent = parse_zone_file(ZONE, "example.com.").expect("the parent zone parses");
+        let child = parse_zone_file(
+            "$ORIGIN sub.example.com.\n\
+             $TTL 3600\n\
+             @   IN SOA ns.sub.example.com. admin.sub.example.com. ( 1 3600 600 604800 300 )\n\
+             @   IN NS  ns.sub.example.com.\n\
+             ns  IN A   192.0.2.20\n\
+             www IN A   192.0.2.21\n",
+            "sub.example.com.",
+        )
+        .expect("the child zone parses");
+        let mut zones = Zones::default();
+        drop(zones.insert(parent));
+        drop(zones.insert(child));
+
+        let from_child = make_response(
+            &query("www.sub.example.com.", Qtype::of(record_types::A), false),
+            &zones,
+            &DnsMetrics::new(),
+        );
+        // From the parent this name is below a delegation, so a referral with AA
+        // clear is what selecting the wrong zone looks like.
+        assert!(
+            from_child.authoritive,
+            "answered from the child, not referred"
+        );
+        assert_eq!(rdatas(&from_child.answers, record_types::A).len(), 1);
+
+        let from_parent = make_response(
+            &query("host.example.com.", Qtype::of(record_types::A), false),
+            &zones,
+            &DnsMetrics::new(),
+        );
+        assert!(from_parent.authoritive);
+        assert_eq!(rdatas(&from_parent.answers, record_types::A).len(), 1);
     }
 
     /// QTYPE=ANY is 255, which is a QTYPE and never an RTYPE, so the strict

@@ -246,8 +246,7 @@ async fn zone_timers(zone_map: &Arc<RwLock<Zones>>, zone: &str) -> RefreshTimers
     zone_map
         .read()
         .await
-        .values()
-        .find(|z| z.origin().eq_ignore_ascii_case(zone))
+        .matching(zone)
         .and_then(RefreshTimers::from_zone)
         .unwrap_or_default()
 }
@@ -272,12 +271,7 @@ pub(crate) async fn refresh_once(
     // A clone rather than a borrow: an incremental transfer applies its changes
     // to this version, and holding the read lock across a network round trip
     // would block every reload and every swap for the length of the transfer.
-    let base = zone_map
-        .read()
-        .await
-        .values()
-        .find(|z| z.origin().eq_ignore_ascii_case(&spec.zone))
-        .cloned();
+    let base = zone_map.read().await.matching(&spec.zone).cloned();
     let held = base.as_ref().and_then(Zone::serial);
 
     let remote = xfr::fetch_soa(spec.master, &spec.zone, key).await?;
