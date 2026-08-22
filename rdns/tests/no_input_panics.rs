@@ -1,32 +1,18 @@
-//! No input panics: the pre-authentication path against mutated wire data.
+//! The pre-authentication path against mutated wire data: everything a
+//! datagram touches before a TSIG MAC is verified, and for an unsigned query
+//! everything up to serializing the answer.
 //!
-//! Everything a datagram touches before a TSIG MAC is verified — for an unsigned
-//! query, everything up to and including serializing the answer — runs on bytes a
-//! stranger chose. Since the UDP path answers inline rather than per-task, a
-//! panic there ends the worker and `serve` ends the process, which makes any
-//! reachable panic a remote kill switch. `TODO.md` #12 is the audit; this file is
-//! its empirical half.
+//! The UDP path answers inline, so a panic there ends the worker and `serve`
+//! ends the process: any reachable panic is a remote kill switch. Hand-rolled
+//! rather than `cargo-fuzz` (nightly-only) because random bytes never get past
+//! the header check — what finds anything is mutating valid messages.
 //!
-//! A property test because the property needs no oracle: only "this returned
-//! rather than unwound". It would have caught #9b's unchecked
-//! `&rest[..rdatalen as usize]` inside the first hundred inputs.
-//!
-//! Hand-rolled because `cargo-fuzz` is nightly-only and the generator is not the
-//! interesting part: random bytes never get past the header check, so what finds
-//! anything is mutating valid messages — flipping bits in a real compression
-//! pointer, cutting a real RDLENGTH short. That corpus has to be built out of
-//! this library either way; the rest is a seeded xorshift and a mutation switch.
-//!
-//! The suite runs `ITERATIONS` cases so it stays inside a second. A soak is the
-//! same test with more:
+//! A soak is the same test with more cases:
 //!
 //! ```sh
 //! RDNS_FUZZ_ITERATIONS=2000000 cargo test -p rdns --test no_input_panics -- --nocapture
 //! RDNS_FUZZ_SEED=12345 cargo test -p rdns --test no_input_panics
 //! ```
-//!
-//! A failure prints the seed, the case number and the bytes as hex, which is
-//! everything needed to write the regression test that goes with the fix.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -40,8 +26,7 @@ use rdns::{
     ResourceRecord, ResponseCode,
 };
 
-/// Cases per corpus entry. Small enough to stay under a second in CI; the env
-/// var is what a soak run turns up.
+/// Cases per corpus entry. Small enough to stay under a second in CI.
 const ITERATIONS: usize = 250;
 
 /// A seeded xorshift64*, so a failing run is reproducible from its seed alone.
@@ -49,8 +34,8 @@ struct Rng(u64);
 
 impl Rng {
     fn next(&mut self) -> u64 {
-        // xorshift64*, Marsaglia. Not cryptographic and does not need to be: it
-        // decides which byte to corrupt, not what a key is.
+        // Not cryptographic and does not need to be: it decides which byte to
+        // corrupt, not what a key is.
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -113,10 +98,9 @@ fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
 /// Valid messages to mutate, covering the shapes whose parsers have length
 /// fields, pointers or nesting in them.
 ///
-/// Building them through the library rather than by hand is the point: the
-/// compression pointers, RDLENGTHs and OPT option lengths are all *correct*
-/// here, so a mutation lands on a real field rather than on a byte the parser
-/// was going to reject anyway.
+/// Built through the library so the pointers, RDLENGTHs and option lengths are
+/// correct: a mutation then lands on a real field rather than on a byte the
+/// parser was going to reject anyway.
 fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
     let mut out: Vec<(&'static str, Vec<u8>)> = Vec::new();
 
@@ -150,8 +134,8 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
         edns.to_bytes_within(512).expect("serialize"),
     ));
 
-    // A response carrying every record shape the zone has, which is where the
-    // RDATA parsers and the compression pointers are.
+    // Every record shape the zone has: the RDATA parsers and the compression
+    // pointers.
     let mut answer = query_message("example.com.", Qtype::of(record_types::ANY));
     answer.response = true;
     answer.authoritive = true;
@@ -178,8 +162,8 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
         answer.to_bytes_within(4096).expect("serialize"),
     ));
 
-    // The DNSSEC shapes: RRSIG, DNSKEY and a denial chain, all with their own
-    // length fields and embedded names.
+    // RRSIG, DNSKEY and a denial chain: their own length fields and embedded
+    // names.
     let mut secure = query_message("example.com.", Qtype::of(record_types::ANY));
     secure.response = true;
     secure.authoritive = true;
@@ -204,8 +188,7 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
         secure.to_bytes_within(65_535).expect("serialize"),
     ));
 
-    // An IXFR request, the one query that carries a record of its own — in the
-    // authority section, which the validator used to reject outright.
+    // The one query that carries a record of its own, in the authority section.
     let mut ixfr = query_message("example.com.", Qtype::of(record_types::IXFR));
     for soa in zone.query("example.com.", Qtype::of(record_types::SOA)) {
         ixfr.authorities.push(ResourceRecord {
@@ -220,8 +203,7 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
         ixfr.to_bytes_within(512).expect("serialize"),
     ));
 
-    // A TSIG-signed query, so the scan in `find_tsig` and the MAC check get
-    // mutated input too.
+    // So `find_tsig`'s scan and the MAC check get mutated input too.
     let key =
         tsig::TsigKey::parse("hmac-sha256:probe.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=")
             .expect("the key spec parses");
@@ -237,11 +219,9 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
 
 /// One mutation of `seed_bytes`, chosen by `rng`.
 ///
-/// The mix is deliberate. Bit flips and byte writes find the parsers that
-/// believe a length; truncation finds the ones that read past what arrived;
-/// biasing written bytes towards `0xc0` and `0xff` aims at the two values that
-/// mean something structural on the wire — a compression pointer and a maximal
-/// length field.
+/// Truncation finds parsers that read past what arrived; the bias towards `0xc0`
+/// and `0xff` aims at the two structurally meaningful values on the wire, a
+/// compression pointer and a maximal length field.
 fn mutate(rng: &mut Rng, seed_bytes: &[u8]) -> Vec<u8> {
     let mut data = seed_bytes.to_vec();
     if data.is_empty() {
@@ -293,8 +273,7 @@ fn mutate(rng: &mut Rng, seed_bytes: &[u8]) -> Vec<u8> {
                 }
             }
         }
-        // Something completely arbitrary, occasionally longer than any datagram
-        // this server would accept.
+        // Arbitrary, occasionally longer than any datagram this server accepts.
         _ => {
             let len = rng.below(600);
             data = (0..len).map(|_| (rng.next() & 0xff) as u8).collect();
@@ -303,13 +282,11 @@ fn mutate(rng: &mut Rng, seed_bytes: &[u8]) -> Vec<u8> {
     data
 }
 
-/// Everything a stranger's bytes reach before anything has authenticated them.
+/// Everything a stranger's bytes reach before anything has authenticated them,
+/// ordered as the daemons order it.
 ///
-/// Ordered as the daemons order it: validate, parse, scan for a TSIG, then —
-/// because `make_response` does all of this with the qname it was handed — the
-/// zone lookups, the DNSSEC answer machinery, and serializing the result back
-/// out. The last one matters as much as the first: a response echoes the
-/// client's question, so an attacker-shaped name goes through the *writer* too.
+/// Serializing back out belongs here as much as parsing: a response echoes the
+/// client's question, so an attacker-shaped name goes through the writer too.
 fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring, now: u64) {
     let validator = AdmissionCheck::with_defaults();
     let _ = validator.validate_packet(data, false);
@@ -321,7 +298,6 @@ fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring
         return;
     };
 
-    // The EDNS readers, both of them, and the size the reply is bounded by.
     let _ = msg.edns();
     let _ = msg.edns_header();
     let _ = msg.has_edns();
@@ -338,7 +314,7 @@ fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring
             let _ = z.normalize_name(&query.qname);
             let _ = z.matches_query("www.example.com.", &query.qname);
 
-            // The DO-bit path: signatures for an answer, and the three denials.
+            // The DO-bit path: signatures, and the three denials.
             let _ = dnssec_answer::answer_signatures(z, &query.qname, query.qtype);
             let _ = dnssec_answer::negative_proof(z, &query.qname, &kind);
             let _ = dnssec_answer::negative_proof(z, &query.qname, &NameKind::NotFound);
@@ -347,7 +323,7 @@ fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring
         }
     }
 
-    // And back out onto the wire, at both the UDP and the TCP ceiling.
+    // Back onto the wire, at both the UDP and the TCP ceiling.
     let mut scratch = Vec::new();
     let _ = msg.to_bytes_within_buf(512, &mut scratch);
     let _ = msg.to_bytes_within_buf(65_535, &mut scratch);
@@ -379,9 +355,8 @@ fn no_input_panics_before_authentication() {
         )
         .expect("zsk"),
     ];
-    // NSEC3 rather than NSEC: it has a hash, a salt, an iteration count and a
-    // base32 label, which is more arithmetic on wire-derived values than the
-    // NSEC chain has.
+    // NSEC3 rather than NSEC: a hash, a salt, an iteration count and a base32
+    // label is more arithmetic on wire-derived values.
     let policy = SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400).with_chain(
         DenialChain::Nsec3 {
             salt: vec![0xab, 0xcd],
@@ -407,8 +382,7 @@ fn no_input_panics_before_authentication() {
     );
 
     for (what, seed_bytes) in &corpus {
-        // The unmutated message first: if the corpus itself panics, everything
-        // after it is noise.
+        // Unmutated first: if the corpus itself panics, the rest is noise.
         check(seed_bytes, what, seed, cases, &zone, &signed, &keyring, now);
         cases += 1;
 
@@ -422,11 +396,8 @@ fn no_input_panics_before_authentication() {
     println!("{cases} cases, no panics");
 }
 
-/// Run one case, and turn a panic into a message that says how to reproduce it.
-///
-/// The bytes are what the next reader needs: a panic with no input is a bug
-/// report nobody can act on, and the whole value of a generated case is being
-/// able to paste it into a `#[test]` as the regression that goes with the fix.
+/// Run one case, and turn a panic into a message that says how to reproduce it:
+/// the seed, and the bytes to paste into the regression test.
 #[allow(clippy::too_many_arguments)]
 fn check(
     data: &[u8],

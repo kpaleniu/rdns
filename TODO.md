@@ -160,7 +160,7 @@ quietly — `git blame` refuses a revision it cannot resolve.
 ~~**The Windows column is current and the Linux one is not.** Linux was last
 measured before #13 landed; the gap between the columns is the sixteen
 `#[cfg(unix)]` tests below plus whatever has been added since, and it is no
-longer safe to read it as only the former. Re-run the Linux recipe under "Running
+longer safe to read it as only the former. Re-run the recipe under "Running
 the Linux half by hand" before quoting the right-hand column.~~
 
 **Both columns re-measured 2026-08-05, on the same tree, minutes apart** — the
@@ -200,7 +200,7 @@ underneath. Every exact assertion in `rdns/tests/allocations.rs` (0, 1, 2, 2, 3,
 3 and 4) reads the same on Linux.
 
 `cargo clippy --workspace --all-targets` and `cargo fmt --all --check` are clean
-**on Windows**; ~~the Linux image used for the Linux runs has no clippy package,
+**on Windows**; ~~the image used for the Linux runs has no clippy package,
 so that half is checked by CI now and was checked nowhere before.~~
 
 **Corrected 2026-08-04: it has clippy, and always may have.** The workspace is
@@ -478,8 +478,8 @@ that is how `rdnsd` went months without compiling on Unix, and it is why
 `CLAUDE.md` §1 requires the other side to be run before committing anything
 cfg-gated.
 
-**The invocation is in `CLAUDE.local.md`**, along with which image, which
-paths, how the container image gets built, and the filesystem and toolchain traps that
+**The invocation is in `CLAUDE.local.md`**, along with which image, which paths,
+how the container image gets built, and the filesystem and toolchain traps that
 come with them. Untracked, because none of it is a fact about this project — it
 is a fact about one machine, and a checked-in copy of it fails silently on any
 other.
@@ -615,8 +615,8 @@ that costs a second of CPU on `rdnsr --dnssec-validate`, provoked and timed.~~
 #25 and #26 are open.
 
 ~~#11, a stretch goal blocked on hardware counters the development machine cannot read~~ —
-**answered no on 2026-08-04**, and the blocker did not exist: the Linux side has a
-virtualized core PMU, and the question was settled with cachegrind anyway.
+**answered no on 2026-08-04**, and the blocker did not exist: the Linux side has
+a virtualized core PMU, and the question was settled with cachegrind anyway.
 
 **#21 is not open work**, it is the inventory: the four deviations from the RFCs
 this code makes on purpose, and the list of things not implemented. Neither was

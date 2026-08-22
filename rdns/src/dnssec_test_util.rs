@@ -1,14 +1,8 @@
 //! Test-only DNSSEC signing: real keys, real signatures, no network.
 //!
-//! Port 53 is intercepted on the machine this was developed on, so there is no
-//! live signed zone to validate against and never was — which is how the
-//! validator came to be written without a single genuine signature ever
-//! reaching it. The answer is to sign in-process: `ring` can generate a P-256
-//! keypair and produce a real signature in microseconds, so a test can stand up
-//! a signed zone (KSK, ZSK, DS in the parent, signed answers) and put the
-//! actual verification path through it.
-//!
-//! Nothing here is compiled into a release build.
+//! `ring` generates a P-256 keypair and signs in microseconds, so a test can
+//! stand up a signed zone — KSK, ZSK, DS in the parent, signed answers — and put
+//! the real verification path through it rather than a mock.
 
 use crate::dnssec::{key_tag, rrsig_labels, signed_data, Dnskey, Ds, Rrset, Rrsig};
 use crate::dnssec_key::{SigningAlgorithm, SigningKey};
@@ -25,12 +19,11 @@ pub const KSK_FLAGS: u16 = 0x0101;
 
 /// A keypair that can actually sign.
 ///
-/// The signing itself is [`SigningKey`]'s, which is the same code `rdnsd` signs
-/// a zone with — so what these tests verify against is what the server
-/// produces, rather than a second implementation that could agree with the
-/// validator while the real one does not. What stays here is the freedom to
-/// publish one key at several owner names and flag combinations, which a signer
-/// has no business offering and a test of the chain walk needs constantly.
+/// The signing is [`SigningKey`]'s, the same code `rdnsd` uses, so a second
+/// implementation cannot agree with the validator while the real one does not.
+/// What is added here is publishing one key at several owner names and flag
+/// combinations, which a signer has no business offering and a chain-walk test
+/// needs constantly.
 pub struct TestKey {
     key: SigningKey,
 }
@@ -48,9 +41,8 @@ impl TestKey {
         Self::generate(SigningAlgorithm::Ed25519)
     }
 
-    /// The owner and flags given here are placeholders: every method that
-    /// publishes this key takes the name and flags it is published under, so
-    /// the ones baked into the key are never the ones used.
+    /// The owner and flags here are placeholders; every publishing method takes
+    /// its own.
     fn generate(algorithm: SigningAlgorithm) -> Self {
         TestKey {
             key: SigningKey::generate(algorithm, ".", ZSK_FLAGS).expect("generate key"),
@@ -144,9 +136,9 @@ impl TestKey {
     }
 }
 
-/// A signed zone: a KSK the parent's DS points at, and a ZSK that signs the
-/// data. Splitting the two is not required by the protocol but is what every
-/// real zone does, and it is the arrangement the chain walk has to handle.
+/// A signed zone: a KSK the parent's DS points at, and a ZSK signing the data.
+/// The split is not required by the protocol, but it is what real zones do and
+/// what the chain walk has to handle.
 pub struct TestZone {
     pub name: String,
     pub ksk: TestKey,
@@ -208,15 +200,12 @@ impl TestZone {
         out
     }
 
-    /// Sign `records` the way a server answering from a wildcard does: the
-    /// signature is made over `wildcard`, which is the name really in the zone,
-    /// but the RRSIG is published at the expanded owner name with the wildcard's
-    /// (shorter) label count.
+    /// Sign as a server answering from a wildcard does: over `wildcard`, the
+    /// name really in the zone, but published at the expanded owner with the
+    /// wildcard's shorter label count.
     ///
-    /// That shape is what a validator has to notice — and it is also the shape
-    /// of the attack, because the same signature verifies at every name the
-    /// wildcard could reach. A test can therefore re-own the result onto any
-    /// name under the wildcard and it will still verify.
+    /// The same signature verifies at every name the wildcard could reach, so a
+    /// test may re-own the result onto any of them.
     pub fn sign_as_wildcard(&self, records: &[ResourceRecord], wildcard: &str) -> ResourceRecord {
         let first = records.first().expect("an RRset has at least one record");
         let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();

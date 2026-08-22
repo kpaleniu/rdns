@@ -5,14 +5,11 @@
 //! is [`crate::dnssec_chain`]'s job. This module answers one question at a time:
 //! do these bytes verify under this key, does this DNSKEY hash to this DS.
 //!
-//! The load-bearing part is [`signed_data`]. A signature is not over the RRset
-//! as it appeared on the wire; it is over `RRSIG_RDATA(signature field removed)
-//! || canonical RRset` (RFC 4035 §5.3.2), where canonical means owner names
-//! down-cased, the RRSIG's original TTL rather than the received one, embedded
-//! names down-cased for the RFC 4034 §6.2 types, RRs sorted by their canonical
-//! RDATA and duplicates dropped. Get any of that wrong and every signature
-//! fails — or, worse, the verification never runs at all and the failure looks
-//! like success.
+//! The load-bearing part is [`signed_data`]. A signature covers
+//! `RRSIG_RDATA(signature field removed) || canonical RRset` (RFC 4035 §5.3.2),
+//! not the RRset as it appeared on the wire: owner names down-cased, the RRSIG's
+//! original TTL rather than the received one, embedded names down-cased for the
+//! RFC 4034 §6.2 types, RRs sorted by canonical RDATA, duplicates dropped.
 
 use crate::dname::dname_to_bytes;
 use crate::error::WireError;
@@ -23,24 +20,20 @@ use crate::Rtype;
 use crate::{ParsedRecord, RecordData, ResourceRecord};
 use ring::signature;
 
-/// DNSKEY flags bit 7 (0x0100): the key is a zone key, i.e. it may sign RRsets
-/// in its own zone. RFC 4034 §2.1.1 — a DNSKEY without it must not be used to
-/// validate anything.
+/// DNSKEY flags bit 7 (0x0100): a zone key, which may sign RRsets in its own
+/// zone. A DNSKEY without it must not validate anything (RFC 4034 §2.1.1).
 pub const DNSKEY_FLAG_ZONE: u16 = 0x0100;
 
-/// DNSKEY flags bit 15 (0x0001): Secure Entry Point. A hint that this is the
-/// key a DS points at; RFC 4034 §2.1.1 is explicit that it is only a hint, so
-/// nothing here treats it as more than one.
+/// DNSKEY flags bit 15 (0x0001): Secure Entry Point. RFC 4034 §2.1.1 makes it
+/// only a hint that a DS points here, and nothing treats it as more.
 pub const DNSKEY_FLAG_SEP: u16 = 0x0001;
 
 /// The DNSSEC algorithms we can verify, by IANA number (RFC 8624 §3.1).
 ///
 /// Everything else — RSAMD5 (1), DSA (3 and 6), GOST (12), Ed448 (16) — is
-/// *unsupported* rather than *invalid*, which is a distinction the chain
-/// validator depends on: RFC 4035 §5.2 says a delegation whose DS records name
-/// only algorithms we cannot verify is treated as **insecure**, not bogus. We
-/// have no basis to call an answer forged when we simply cannot read the
-/// signature.
+/// *unsupported*, not *invalid*: RFC 4035 §5.2 makes a delegation whose DS
+/// records name only unreadable algorithms insecure rather than bogus. An
+/// unreadable signature is no basis for calling an answer forged.
 pub fn algorithm_supported(algorithm: u8) -> bool {
     matches!(algorithm, 5 | 7 | 8 | 10 | 13 | 14 | 15)
 }
@@ -53,10 +46,8 @@ pub fn digest_type_supported(digest_type: u8) -> bool {
 
 /// Why a signature could not be checked, as opposed to checked and rejected.
 ///
-/// Kept apart from a plain `false` because the two lead to opposite answers: a
-/// signature that fails verification is an attack or a misconfiguration
-/// (bogus), while one we lack the algorithm for is merely unreadable
-/// (insecure).
+/// Not a plain `false`, because the two lead to opposite answers: a failed
+/// verification is bogus, an unreadable algorithm is insecure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CryptoError {
     /// We do not implement this DNSSEC algorithm number.
@@ -76,15 +67,13 @@ impl std::fmt::Display for CryptoError {
 
 impl std::error::Error for CryptoError {}
 
-// ---------------------------------------------------------------------------
 // Typed views of the three records the chain of trust is built from
-// ---------------------------------------------------------------------------
 
 /// A DNSKEY together with the name it was published at.
 ///
-/// The owner name is not in the RDATA but is part of what a DS hashes and of
-/// what a signature is checked against, so carrying it alongside is what keeps
-/// a key from being applied to the wrong zone.
+/// The owner is not in the RDATA but is part of what a DS hashes and what a
+/// signature is checked against, so carrying it keeps a key from being applied
+/// to the wrong zone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dnskey {
     pub owner: String,
@@ -117,9 +106,9 @@ impl Dnskey {
         }
     }
 
-    /// The key tag (RFC 4034 Appendix B) — a cheap, *non-unique* index used to
-    /// narrow which key an RRSIG or DS refers to. Collisions are legal, so it
-    /// selects candidates and never decides anything on its own.
+    /// The key tag (RFC 4034 Appendix B): a cheap, non-unique index narrowing
+    /// which key an RRSIG or DS means. Collisions are legal, so it selects
+    /// candidates and decides nothing.
     pub fn key_tag(&self) -> u16 {
         key_tag(self.flags, self.protocol, self.algorithm, &self.public_key)
     }
@@ -194,9 +183,8 @@ impl Rrsig {
 
     /// Whether `now` falls inside the signature's validity window.
     ///
-    /// Both bounds are serial-number arithmetic in the RFC (§3.1.5), but the
-    /// wrap only bites in 2106; a plain comparison is what every implementation
-    /// does and is what this does.
+    /// The RFC makes both bounds serial-number arithmetic (§3.1.5), but the wrap
+    /// only bites in 2106; a plain comparison is what implementations do.
     pub fn is_current(&self, now: u64) -> bool {
         now >= self.inception as u64 && now <= self.expiration as u64
     }
@@ -205,13 +193,11 @@ impl Rrsig {
     /// to reach `owner` (RFC 4035 §5.3.4): the label count in the RRSIG is
     /// fewer than the owner name actually has.
     ///
-    /// The label arithmetic alone is not enough. The labels field never counts a
-    /// leading `*` (RFC 4034 §3.1.3), so the RRset sitting *at* the wildcard —
-    /// which every signed zone with a wildcard publishes, and which appears in
-    /// the authority section of every wildcard-aware denial — has one label more
-    /// than the RRSIG over it claims, and would read as an expansion. Comparing
-    /// against the name that was actually signed tells the two apart: an
-    /// expansion is precisely the case where the signed name is not the owner.
+    /// The label arithmetic alone is not enough: the labels field never counts a
+    /// leading `*` (RFC 4034 §3.1.3), so the RRset sitting *at* the wildcard has
+    /// one label more than its RRSIG claims and would read as an expansion.
+    /// Comparing against the signed name separates them — an expansion is
+    /// exactly where the signed name is not the owner.
     pub fn is_wildcard_expansion(&self) -> bool {
         (self.labels as usize) < label_count(&self.owner)
             && signed_owner(&self.owner, self.labels) != canonical_name(&self.owner)
@@ -251,18 +237,15 @@ impl Ds {
         }
     }
 
-    /// Whether `key` is the DNSKEY this DS commits to: same tag and algorithm,
-    /// and the digest of the key matches (RFC 4035 §5.2).
-    ///
-    /// The tag and algorithm are checked first only as a filter — the digest is
-    /// what actually decides, because a key tag is not unique.
+    /// Whether `key` is the DNSKEY this DS commits to (RFC 4035 §5.2). The tag
+    /// and algorithm only filter; the digest decides, since a tag is not unique.
     pub fn matches_key(&self, key: &Dnskey) -> DnssecResult<bool> {
         if self.key_tag != key.key_tag() || self.algorithm != key.algorithm {
             return Ok(false);
         }
         let computed = ds_digest(key, self.digest_type)?;
-        // Constant-time-ish: digests are public values, so a plain compare is
-        // fine here; there is no secret to leak by timing.
+        // A plain compare: digests are public, so there is nothing to leak by
+        // timing.
         Ok(computed == self.digest)
     }
 }
@@ -282,9 +265,7 @@ pub fn ds_in(records: &[ResourceRecord]) -> Vec<Ds> {
     records.iter().filter_map(Ds::from_record).collect()
 }
 
-// ---------------------------------------------------------------------------
 // Canonical form (RFC 4034 §6)
-// ---------------------------------------------------------------------------
 
 /// Absolute, lowercased form. DNS names compare case-insensitively (RFC 4343)
 /// and canonical DNSSEC form is down-cased (RFC 4034 §6.2).
@@ -339,11 +320,10 @@ pub fn signed_owner(owner: &str, rrsig_labels: u8) -> String {
 
 /// The label count an RRSIG over `owner` must carry (RFC 4034 §3.1.3).
 ///
-/// The root and a leading `*` are not counted. Not counting the `*` is the
-/// whole of wildcard signing: it is what makes one signature verify at every
-/// name the wildcard expands to, because a validator reconstructs the signed
-/// owner name from this number ([`signed_owner`] is the same rule read
-/// backwards).
+/// The root and a leading `*` are not counted. Not counting the `*` is the whole
+/// of wildcard signing: a validator reconstructs the signed owner from this
+/// number, so one signature verifies at every name the wildcard expands to.
+/// [`signed_owner`] is the same rule read backwards.
 pub fn rrsig_labels(owner: &str) -> u8 {
     let labels = label_count(owner);
     let counted = if owner.starts_with("*.") {
@@ -351,21 +331,18 @@ pub fn rrsig_labels(owner: &str) -> u8 {
     } else {
         labels
     };
-    // A name cannot have more than 127 labels and still fit the 255-octet
-    // limit, so the cast is total; saturating rather than wrapping keeps a
-    // hypothetical monster name from claiming *fewer* labels than it has.
+    // 127 labels is the most that fits in 255 octets, so the cast is total;
+    // saturating keeps a monster name from claiming *fewer* labels than it has.
     counted.min(u8::MAX as usize) as u8
 }
 
 /// A record's RDATA in canonical form: identical to the stored bytes except for
 /// the RFC 4034 §6.2 types, whose embedded domain names are down-cased.
 ///
-/// RFC 6840 §5.1 froze that list — a name inside a type not on it is left
-/// exactly as received. Of the listed types we parse NS, CNAME, SOA, PTR, MX,
-/// RRSIG and NSEC; the rest (MD, MF, MB, MG, MR, MINFO, RP, AFSDB, RT, SIG, PX,
-/// NXT, NAPTR, KX, SRV, DNAME, A6) are obsolete or unparsed here and pass
-/// through unchanged, which is a signature failure rather than a false accept
-/// if one ever shows up mixed-case.
+/// RFC 6840 §5.1 froze that list, so a name inside any other type is left as
+/// received. Of the listed types we parse NS, CNAME, SOA, PTR, MX, RRSIG and
+/// NSEC; the rest are obsolete or unparsed and pass through unchanged — a
+/// signature failure rather than a false accept, should one arrive mixed-case.
 pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
     let lowered = match record.rtype() {
         rt::NS | rt::CNAME | rt::PTR | rt::SOA | rt::MX | rt::RRSIG | rt::NSEC => {
@@ -444,12 +421,11 @@ pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
 /// RDATA of every record in the RRset — which must be the complete RRset, since
 /// a signature covers all of it or none of it.
 ///
-/// Four things here are easy to leave out and each one silently breaks every
-/// signature: the RRSIG's own RDATA goes in front (minus the signature field);
-/// the TTL written is the RRSIG's *original* TTL, not the one the record
-/// arrived with; the owner name is down-cased and, for a wildcard-expanded
-/// answer, replaced by the wildcard that was really signed; and the records are
-/// sorted by canonical RDATA with duplicates removed.
+/// Four parts, each of which silently breaks every signature if left out: the
+/// RRSIG's own RDATA goes in front, minus the signature field; the TTL is the
+/// RRSIG's *original* TTL, not the received one; the owner is down-cased and,
+/// for a wildcard-expanded answer, replaced by the wildcard really signed; and
+/// the records are sorted by canonical RDATA with duplicates removed.
 pub fn signed_data(
     rrsig: &Rrsig,
     owner: &str,
@@ -475,10 +451,8 @@ pub fn signed_data(
 
     let name_wire = dname_to_bytes(&signed_owner(owner, rrsig.labels))?;
 
-    // Sort by canonical RDATA alone — not by the whole encoded RR. The RDLEN
-    // field sits between the fixed prefix and the RDATA, so sorting encoded RRs
-    // would order by length first and put a short RDATA ahead of a longer one
-    // that sorts before it.
+    // By canonical RDATA alone, not the whole encoded RR: RDLEN sits before the
+    // RDATA, so sorting encoded RRs orders by length first.
     let mut canonical: Vec<Vec<u8>> = rdatas
         .iter()
         .map(canonical_rdata)
@@ -503,9 +477,7 @@ pub fn signed_data(
     Ok(data)
 }
 
-// ---------------------------------------------------------------------------
 // Key tags and DS digests
-// ---------------------------------------------------------------------------
 
 /// The key tag of a DNSKEY, per RFC 4034 Appendix B.
 ///
@@ -562,9 +534,7 @@ pub fn ds_digest(key: &Dnskey, digest_type: u8) -> DnssecResult<Vec<u8>> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // Signature verification
-// ---------------------------------------------------------------------------
 
 /// Verify `signature` over `data` with a DNSKEY's public key.
 ///
@@ -668,9 +638,7 @@ fn rsa_key_parts(public_key: &[u8]) -> Result<(&[u8], &[u8]), CryptoError> {
     ))
 }
 
-// ---------------------------------------------------------------------------
 // The leaf validator: one RRset against its signatures
-// ---------------------------------------------------------------------------
 
 /// What checking an RRset's signatures established.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -868,10 +836,6 @@ mod tests {
         RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, last))).unwrap()
     }
 
-    // -----------------------------------------------------------------
-    // Canonical form
-    // -----------------------------------------------------------------
-
     #[test]
     fn test_signed_owner_rebuilds_the_wildcard() {
         // A 3-label name signed with labels=2 was expanded from *.example.com.
@@ -979,11 +943,9 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // Real crypto. These are the tests the old suite could not make:
     // every signature below is produced by ring at test time, so a
     // verifier that never actually runs cannot pass them.
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_ecdsa_p256_signature_verifies() {
@@ -1251,9 +1213,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // DS
-    // -----------------------------------------------------------------
 
     /// The DS digest covers the owner name as well as the RDATA, so the same
     /// key published at two names has two different DS records.
@@ -1322,9 +1282,7 @@ mod tests {
         assert_ne!(altered.key_tag(), original);
     }
 
-    // -----------------------------------------------------------------
     // Key parsing
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_rsa_key_parts_both_length_forms() {
@@ -1372,9 +1330,7 @@ mod tests {
         assert!(matches!(err, CryptoError::MalformedKey(_)), "{err:?}");
     }
 
-    // -----------------------------------------------------------------
     // A whole signed zone, end to end
-    // -----------------------------------------------------------------
 
     /// KSK signs the DNSKEY RRset, ZSK signs the data, the parent's DS commits
     /// to the KSK: the shape every signed zone actually has.

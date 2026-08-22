@@ -1,24 +1,9 @@
 //! The client half of a zone transfer: asking for a zone and assembling it.
 //!
-//! [`crate::transfer`] turns a zone into the messages an AXFR is; this turns them
-//! back into a zone. Separate because the server's half is handed a zone it
-//! already trusts, while this half is handed a stream by somebody else.
-//!
-//! What it refuses is the interesting part — a transfer that is merely received
-//! is not a zone:
-//!
-//! - **It must open and close with the apex SOA** (RFC 5936 §2.2). The closing
-//!   SOA is the only thing that distinguishes a complete transfer from a
-//!   connection that was cut, and a secondary that swapped in a truncated zone
-//!   would start answering NXDOMAIN for everything the stream did not reach.
-//! - **Every record must be in bailiwick.** A master for `example.com.` has no
-//!   business sending records for anything outside it, and accepting them would
-//!   let one zone's master write into a name it is not authoritative for.
-//! - **The stream is bounded.** A master that never sends the closing SOA is
-//!   otherwise a slow way to run this process out of memory.
-//!
-//! Nothing here opens a socket except [`fetch_zone`] and [`fetch_soa`]; the
-//! assembling is a state machine so it can be tested without one.
+//! A stream from somebody else is not a zone until it opens and closes with the
+//! apex SOA (RFC 5936 §2.2), carries only in-bailiwick records, and stays under
+//! [`MAX_TRANSFER_RECORDS`]. Only [`fetch_zone`] and [`fetch_soa`] touch a
+//! socket; assembling is a state machine so it can be tested without one.
 
 use crate::error::{TransferError, TransferResult};
 use crate::Class;
@@ -36,9 +21,6 @@ use crate::{
 };
 
 /// How long a transfer may take from connect to closing SOA.
-///
-/// A master that accepts the connection and then stalls is otherwise a task that
-/// never finishes and a zone that never refreshes.
 pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long to wait for a single SOA probe.
@@ -46,9 +28,8 @@ pub const SOA_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most records a transfer may carry before we stop believing it is one.
 ///
-/// Every bound in this codebase exists because the alternative is unbounded, and
-/// this one is the memory a hostile or broken master can make us allocate before
-/// it has proved anything by closing the stream.
+/// Bounds the memory a master can make us allocate before it has closed the
+/// stream.
 pub const MAX_TRANSFER_RECORDS: usize = 5_000_000;
 
 /// A request for the zone's SOA — the refresh check (RFC 1035 §4.3.5).
@@ -68,8 +49,7 @@ fn question(zone: &str, qtype: Qtype, id: u16) -> DnsMessage {
         opcode: OpCode::Query,
         authoritive: false,
         truncation: false,
-        // A master is authoritative for the zone being asked about; asking it to
-        // recurse would be asking the wrong question of the wrong server.
+        // A master is authoritative for the zone; RD would be the wrong question.
         recursion: false,
         recursion_ok: false,
         ad: false,
@@ -110,8 +90,7 @@ pub enum Progress {
 
 /// Assembles the messages of an AXFR into a zone, refusing what is not one.
 ///
-/// Fed one message at a time so the caller can stop reading as soon as the
-/// transfer closes — and so that all of this is testable without a socket.
+/// Fed one message at a time, so the caller can stop reading at the closing SOA.
 pub struct AxfrAssembler {
     zone: String,
     records: Vec<ResourceRecord>,
@@ -149,8 +128,7 @@ impl AxfrAssembler {
             )));
         }
         if !msg.authoritive {
-            // AA is how the master says the zone is its to hand out. Without it
-            // this is some other server's idea of the zone.
+            // AA is how the master says the zone is its to hand out.
             return Err(TransferError::malformed(
                 "transfer message is not authoritative",
             ));
@@ -171,8 +149,7 @@ impl AxfrAssembler {
         let is_apex_soa = rr.rdata.rtype() == rt::SOA && name.eq_ignore_ascii_case(&self.zone);
 
         match &self.opening_soa {
-            // RFC 5936 §2.2: the first record is the zone's SOA. Anything else
-            // and this is not a transfer we can bracket.
+            // The first record is the zone's SOA (RFC 5936 §2.2).
             None => {
                 if !is_apex_soa {
                     return Err(TransferError::malformed(format!(
@@ -188,7 +165,7 @@ impl AxfrAssembler {
                 self.records.push(rr.clone());
                 Ok(Progress::More)
             }
-            // The same SOA again closes it. Everything after is not ours to keep.
+            // The apex SOA again closes it; anything after is not ours to keep.
             Some(_) if is_apex_soa => {
                 self.complete = true;
                 Ok(Progress::Complete)
@@ -207,8 +184,7 @@ impl AxfrAssembler {
 
     /// The assembled zone, if the transfer closed properly.
     ///
-    /// A stream that stopped early is an error rather than a short zone: the
-    /// whole purpose of the closing SOA is that the difference is visible.
+    /// A stream that stopped early is an error, not a short zone.
     pub fn into_zone(self) -> TransferResult<Zone> {
         if !self.complete {
             return Err(TransferError::malformed(format!(
@@ -231,9 +207,8 @@ impl AxfrAssembler {
 
 /// A request for the changes since the version we hold (RFC 1995 §3).
 ///
-/// `current_soa` goes in the *authority* section, and that is the whole of what
-/// distinguishes an IXFR request from an AXFR one: it says which version the
-/// client already has, so the server can answer with the difference.
+/// `current_soa` rides in the *authority* section; that is the only thing
+/// distinguishing an IXFR request from an AXFR one.
 pub fn ixfr_request(zone: &str, current_soa: ResourceRecord, id: u16) -> DnsMessage {
     let mut msg = question(zone, Qtype::IXFR, id);
     msg.authorities = vec![current_soa];
@@ -249,12 +224,12 @@ pub enum IxfrOutcome {
         zone: Zone,
         /// How many version steps were applied.
         steps: usize,
-        /// Deletions the zone did not actually hold — a disagreement worth
-        /// logging, never worth failing over.
+        /// Deletions the zone did not hold — worth logging, never worth failing
+        /// over.
         missing_deletions: usize,
     },
     /// The server sent the whole zone instead, which it may always do
-    /// (RFC 1995 §4). Not a failure and not something to retry differently.
+    /// (RFC 1995 §4).
     FullTransfer(Zone),
 }
 
@@ -271,10 +246,9 @@ struct Sequence {
 enum IxfrState {
     /// Nothing yet. The first record is the server's current SOA.
     AwaitingFirstSoa,
-    /// After the first SOA, and after each completed sequence. What comes next
-    /// decides everything: an SOA whose serial is the current one closes the
-    /// transfer, another SOA opens a sequence, and *anything else* means the
-    /// server chose to send the whole zone.
+    /// After the first SOA and after each completed sequence. An SOA at the
+    /// current serial closes the transfer, another SOA opens a sequence, and
+    /// anything else means the server chose to send the whole zone.
     BetweenSequences,
     /// Inside a sequence's deletions; the next SOA ends them.
     Deletions,
@@ -287,21 +261,16 @@ enum IxfrState {
 
 /// Assembles the answer to an IXFR, whichever of the three shapes it takes.
 ///
-/// **A client cannot ask for an incremental transfer and assume it gets one.**
-/// RFC 1995 §4 lets a server answer with the entire zone at any time and for any
-/// reason, and the signal is positional rather than flagged: the *second* record
-/// of the stream. Another SOA means difference sequences follow; anything else
-/// means this is a full transfer wearing an IXFR's question. A client that
-/// assumed the first shape would read a zone's first ordinary record as the
-/// header of a delete section and start deleting things.
+/// A server may answer with the whole zone at any time (RFC 1995 §4), and the
+/// signal is positional: the *second* record. Another SOA means difference
+/// sequences follow, anything else means a full transfer.
 pub struct IxfrAssembler {
     zone: String,
     current_serial: Option<Serial>,
     state: IxfrState,
     records_seen: usize,
     sequences: Vec<Sequence>,
-    /// The AXFR-style path, reusing the assembler that already knows how to
-    /// refuse a bad one rather than growing a second copy of those rules.
+    /// The AXFR-style path, reusing the assembler's refusal rules.
     full: AxfrAssembler,
 }
 
@@ -349,11 +318,9 @@ impl IxfrAssembler {
             }
         }
 
-        // A lone SOA and nothing else is RFC 1995 §2's "you are already current".
-        // It is the one answer with no terminator of its own, so it is recognised
-        // by being the whole of the first message: a server with sequences to send
-        // packs them into the same message rather than sending one record and
-        // pausing.
+        // A lone SOA is "you are already current" (RFC 1995 §2). It has no
+        // terminator of its own, so it is recognised by being the whole of the
+        // first message; a server with sequences packs them into that message.
         if self.state == IxfrState::BetweenSequences && self.records_seen == 1 {
             self.state = IxfrState::Complete;
             return Ok(Progress::Complete);
@@ -381,9 +348,8 @@ impl IxfrAssembler {
         match (&self.state, soa_serial) {
             (IxfrState::AwaitingFirstSoa, Some(serial)) => {
                 self.current_serial = Some(serial);
-                // The full-transfer path needs this record too, since it is the
-                // SOA that opens an AXFR — replayed rather than re-derived, so
-                // the two readings of the stream see the same bytes.
+                // Replayed into the full-transfer path: it is also the SOA that
+                // would open an AXFR, and both readings must see the same bytes.
                 self.full.accept_record(rr)?;
                 self.state = IxfrState::BetweenSequences;
             }
@@ -414,10 +380,8 @@ impl IxfrAssembler {
             }
             (IxfrState::Deletions, None) => self.current_sequence().deleted.push(rr.clone()),
 
-            // An SOA here is either this sequence's successor or the closing
-            // record. The distinction is the serial: a following sequence starts
-            // where this one ended, which is only the current serial once there
-            // is nothing left to send.
+            // An SOA here opens the next sequence or closes the transfer; the
+            // serial tells them apart.
             (IxfrState::Additions, Some(serial)) => {
                 if Some(serial) == self.current_serial {
                     self.state = IxfrState::Complete;
@@ -443,9 +407,8 @@ impl IxfrAssembler {
 
     /// Apply what arrived to `base`, the zone we already hold.
     ///
-    /// `base` must be the version whose serial was sent in the request — the
-    /// sequences describe changes *from* it, and applying them to anything else
-    /// produces a zone that never existed.
+    /// `base` must be the version whose serial was sent in the request;
+    /// applying the sequences to anything else produces a zone that never was.
     pub fn into_outcome(self, base: &Zone) -> TransferResult<IxfrOutcome> {
         if self.state != IxfrState::Complete {
             return Err(TransferError::malformed(format!(
@@ -486,22 +449,12 @@ impl IxfrAssembler {
 /// The two things a record has to be before a transfer keeps it: in this zone,
 /// and in a class this server can hold. Returns the absolute owner name.
 ///
-/// Both assemblers had the bailiwick half, separately and identically; the class
-/// half is new and belongs beside it rather than at either assembler's exit,
-/// which is where writing it twice would have started (`CLAUDE.md` §7).
+/// The class check matters because `zone_writer` spells CH and HS happily while
+/// `zone::parse` refuses them, so a CH record accepted here would be served,
+/// written to disk, and then fail to load on the next start.
 ///
-/// **Why the class matters here at all.** The request went out in class IN (see
-/// [`question`]), and `zone::parse` refuses a non-IN record in a zone *file* —
-/// but `zone_writer` spells CH and HS quite happily, so without this check a
-/// primary sending one CH record would have a secondary assemble the zone, serve
-/// it, write it to disk, and then fail to read its own file back on the next
-/// start, with the whole server refusing to come up (a zone file that will not
-/// parse fails the load by design, #9c). A boundary that holds on one of the two
-/// ways in is not a boundary.
-///
-/// Malformed rather than a timeout, deliberately: a secondary retries a timeout
-/// and gives up on a malformed transfer, and a primary serving a class we cannot
-/// hold will still be serving it in ten minutes.
+/// Malformed rather than a timeout: a secondary retries a timeout and gives up
+/// on a malformed transfer, and neither fault clears by waiting.
 fn belongs_here(rr: &ResourceRecord, zone: &str) -> TransferResult<String> {
     let name = absolute(&rr.name);
     if !is_at_or_under(&name, zone) {
@@ -519,29 +472,17 @@ fn belongs_here(rr: &ResourceRecord, zone: &str) -> TransferResult<String> {
     Ok(name)
 }
 
-// `in_bailiwick` was here: the sixth implementation of "is this name at or under
-// that one", down-casing both sides into fresh `String`s to answer it. It also
-// required the two names to agree about the trailing dot — `strip_suffix` on an
-// absolute name with a relative zone simply failed — where `utils::is_at_or_under`
-// treats the dot as optional on either side, which is the whole reason that one
-// takes the names in whatever form its callers hold them (`TODO.md` #13b).
-
 /// [`crate::utils::absolute`], owned — this module's callers all keep the
-/// result. One line rather than the three it replaces (`TODO.md` #19c).
+/// result.
 fn absolute(name: &str) -> String {
     crate::utils::absolute(name).into_owned()
 }
 
-// ---------------------------------------------------------------------------
-// The socket half
-// ---------------------------------------------------------------------------
-
 /// Ask `master` for the zone's SOA serial, over TCP.
 ///
-/// The refresh check is usually a UDP query, and this uses the connection it
-/// would need anyway if the answer says a transfer is due: one round trip either
-/// way, no truncation to handle, and the handshake means the reply came from the
-/// address we asked rather than from whoever guessed the transaction id first.
+/// TCP rather than UDP: it is the connection a due transfer needs anyway, there
+/// is no truncation to handle, and the handshake proves the reply came from the
+/// address we asked.
 pub async fn fetch_soa(
     master: std::net::SocketAddr,
     zone: &str,
@@ -581,9 +522,9 @@ pub async fn fetch_zone(
         let signed = send_request(&mut stream, &request, key, id).await?;
 
         let mut assembler = AxfrAssembler::new(zone);
-        // The first envelope's MAC is computed over the request's; after that
-        // each is computed over the one before (RFC 8945 §5.3.1), so a dropped
-        // or reordered envelope fails here rather than passing for a zone.
+        // The first envelope's MAC is over the request's, each later one over
+        // its predecessor (RFC 8945 §5.3.1), so a dropped or reordered envelope
+        // fails here.
         let mut previous_mac = signed.clone();
         let mut first = true;
         loop {
@@ -605,11 +546,8 @@ pub async fn fetch_zone(
 
 /// Ask `master` only for what changed since `base`, over TCP.
 ///
-/// TCP rather than UDP even though RFC 1995 §2 suggests trying UDP first: the
-/// answer may be the whole zone at the server's discretion, so a UDP attempt is a
-/// round trip that has to be prepared to be told to come back over TCP anyway.
-/// One connection, one answer, no second code path — and the same connection an
-/// AXFR would have needed.
+/// RFC 1995 §2 suggests trying UDP first, but the answer may be the whole zone
+/// at the server's discretion, so the UDP attempt only buys a second code path.
 pub async fn fetch_changes(
     master: std::net::SocketAddr,
     base: &Zone,
@@ -666,7 +604,7 @@ async fn connect(master: std::net::SocketAddr) -> TransferResult<TcpStream> {
 }
 
 /// Serialize, sign if there is a key, and send. Returns the request's MAC, which
-/// is what the first reply's signature is computed over.
+/// the first reply's signature is computed over.
 async fn send_request(
     stream: &mut TcpStream,
     request: &DnsMessage,
@@ -727,13 +665,9 @@ async fn read_reply(
         match tsig::check_response(&packet, key, previous_mac, first, tsig::now()) {
             Ok(next) => mac = Some(next),
             Err(TsigError::FormErr) if !first => {
-                // An intermediate envelope may go unsigned (RFC 8945 §5.3.1
-                // requires only the first and last). It still enters the digest
-                // of the next signed one, which `check_response` cannot see — so
-                // rather than accept a gap we cannot account for, this is where
-                // an unsigned intermediate would have to be handled. Refusing is
-                // the honest position: a message we did not authenticate is not
-                // one to build a zone from.
+                // RFC 8945 §5.3.1 lets an intermediate envelope go unsigned, but
+                // it still enters the next signed digest, which `check_response`
+                // cannot see. Refused rather than accepted unauthenticated.
                 return Err(TransferError::tsig(
                     "an envelope of the transfer carried no TSIG, and a key was configured",
                 ));
@@ -798,7 +732,7 @@ mod tests {
             .collect()
     }
 
-    /// The whole point: what the server sends is what the client reconstructs.
+    /// What the server sends is what the client reconstructs.
     #[test]
     fn test_a_transfer_reassembles_into_the_zone_it_came_from() {
         let source = source_zone();
@@ -834,18 +768,8 @@ mod tests {
     }
 
     /// The transfer asked in class IN, so a record in another class is a
-    /// malformed answer rather than data to keep — and refusing it is what keeps
-    /// the *other* boundary honest. `zone::parse` refuses a non-IN record in a
-    /// zone file; `zone_writer` spells CH and HS quite happily. Without this
-    /// check a primary sending one record of class CH would have a secondary
-    /// assemble the zone, serve it, write it to disk, and then fail to read its
-    /// own file back on the next start — with the whole server refusing to come
-    /// up, since a zone file that will not parse fails the load by design (#9c).
-    ///
-    /// Asserted on the variant rather than the message (`CLAUDE.md` §3): the
-    /// category matters because a secondary retries a timeout and gives up on a
-    /// malformed transfer, and a primary serving a class we cannot hold will
-    /// still be serving it in ten minutes.
+    /// malformed answer rather than data to keep — a CH record written to disk
+    /// would fail to load on the next start.
     #[test]
     fn a_transfer_carrying_a_class_we_do_not_serve_is_malformed() {
         let source = source_zone();
@@ -872,9 +796,8 @@ mod tests {
         );
     }
 
-    /// A stream that stops before the closing SOA is not a short zone, it is a
-    /// cut connection — and swapping it in would answer NXDOMAIN for whatever it
-    /// did not reach.
+    /// A stream that stops before the closing SOA is a cut connection, not a
+    /// short zone: swapping it in answers NXDOMAIN for what it did not reach.
     #[test]
     fn test_a_transfer_without_its_closing_soa_is_refused() {
         let source = source_zone();
@@ -906,9 +829,7 @@ mod tests {
         );
     }
 
-    /// A master for one zone must not be able to write into another. The records
-    /// go into a zone we then answer from, so this is the transfer's bailiwick
-    /// rule — the same argument as the resolver's, for the same reason.
+    /// A master for one zone must not be able to write into another.
     #[test]
     fn test_out_of_bailiwick_records_are_refused() {
         let mut assembler = AxfrAssembler::new("example.com.");
@@ -958,8 +879,7 @@ mod tests {
             .to_string()
             .contains("Refused"));
 
-        // Nor is a non-authoritative one: AA is how the master says the zone is
-        // its to hand out.
+        // Nor is a non-authoritative one.
         let mut not_auth = transfer_of(&source_zone())[0].clone();
         not_auth.authoritive = false;
         let mut assembler = AxfrAssembler::new("example.com.");
@@ -969,14 +889,6 @@ mod tests {
             .to_string()
             .contains("not authoritative"));
     }
-
-    // `test_bailiwick` was here. Once `in_bailiwick` became
-    // `utils::is_at_or_under`, it was a second copy of that module's own
-    // `a_name_is_under_a_zone_only_at_a_label_boundary`, down to the
-    // `notexample.com.` case. What this module owes a test is the *policy* —
-    // that a transfer refuses a record outside the zone it asked for — and
-    // `test_out_of_bailiwick_records_are_refused` above exercises it through
-    // `accept_record`, which is the path a hostile master actually takes.
 
     #[test]
     fn test_soa_serial_reads_the_answer_or_the_authority() {
@@ -993,10 +905,6 @@ mod tests {
 
         assert_eq!(soa_serial(&soa_query("example.com.", 1)), None);
     }
-
-    // -----------------------------------------------------------------
-    // Incremental transfer, client side
-    // -----------------------------------------------------------------
 
     /// The two versions the incremental tests move between, and the server-side
     /// delta that connects them.
@@ -1028,9 +936,8 @@ mod tests {
         (v1, v2, log)
     }
 
-    /// Feed the server's own IXFR answer to the client and see what it makes of
-    /// it — the two halves against each other, which is the only way the
-    /// positional format gets checked rather than assumed.
+    /// Feed the server's own IXFR answer to the client: the two halves against
+    /// each other, which is how the positional format gets checked.
     fn assemble(
         request: &DnsMessage,
         serving: &Zone,
@@ -1108,8 +1015,8 @@ mod tests {
         );
     }
 
-    /// Several steps at once, applied in order — the case where applying them as
-    /// a set rather than a sequence would silently produce a different zone.
+    /// Several steps at once: applying them as a set rather than a sequence
+    /// silently produces a different zone.
     #[test]
     fn test_several_steps_are_applied_in_order() {
         // Padded, so the two steps stay smaller than the zone — otherwise the
@@ -1160,10 +1067,8 @@ mod tests {
         );
     }
 
-    /// A server may answer an IXFR with the whole zone whenever it likes
-    /// (RFC 1995 §4), and the signal is the *second* record. A client that
-    /// assumed sequences would read the zone's first ordinary record as the
-    /// header of a delete section.
+    /// A server may answer an IXFR with the whole zone (RFC 1995 §4); the signal
+    /// is the *second* record.
     #[test]
     fn test_a_full_transfer_in_answer_to_an_ixfr_is_recognised() {
         let (v1, v2, _) = versions();
@@ -1194,8 +1099,7 @@ mod tests {
     }
 
     /// A deletion for a record we do not hold is a disagreement, not a reason to
-    /// refuse: the record is meant to be gone either way, and failing would
-    /// strand the secondary on a version it can never leave.
+    /// refuse: failing strands the secondary on a version it can never leave.
     #[test]
     fn test_a_deletion_we_cannot_make_is_counted_not_fatal() {
         let (v1, v2, log) = versions();
@@ -1283,11 +1187,9 @@ mod tests {
             "got: {err}"
         );
 
-        // And an answer that does not open with the zone's SOA at all. Note that
-        // simply dropping the first record would *not* be caught: the second
-        // record of an increment is an SOA too, so the stream still looks like
-        // one that opens correctly — just from the wrong version. The serial is
-        // what makes that safe, since it is the base we apply against.
+        // And an answer that does not open with the zone's SOA. Dropping the
+        // first record would *not* be caught — the second record is an SOA too —
+        // which is safe only because the serial names the base we apply against.
         let mut assembler = IxfrAssembler::new("example.com.");
         let mut headless = crate::ixfr::ixfr_response(&ixfr_from(&v1), &v2, &log)
             .unwrap()
@@ -1309,15 +1211,10 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Over a real socket, against a server that speaks the other half
-    // -----------------------------------------------------------------
-
     /// Serve one AXFR on a loopback port and hand back its address.
     ///
-    /// Deliberately built from `transfer::axfr_messages` — the same code `rdnsd`
-    /// answers a transfer with — so this exercises the two halves against each
-    /// other rather than against a mock of one of them.
+    /// Built from `transfer::axfr_messages`, the same code `rdnsd` answers a
+    /// transfer with, so this is the two halves against each other, not a mock.
     async fn spawn_master(zone: Zone, key: Option<TsigKey>) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1344,9 +1241,8 @@ mod tests {
                     let request = DnsMessage::try_from_bytes(&packet).expect("parse the request");
 
                     // A request that does not verify is answered with the
-                    // rejection, as a real master does — not by hanging up,
-                    // which would test the client's error handling for a
-                    // different failure than the one intended.
+                    // rejection, as a real master does; hanging up would test a
+                    // different failure.
                     let mut session = None;
                     if let Some(k) = key.as_ref() {
                         let keyring = crate::tsig::TsigKeyring::new(vec![k.clone()]);
@@ -1426,9 +1322,8 @@ mod tests {
         );
     }
 
-    /// A signed transfer, MACs chained across every envelope — the case a
-    /// hand-rolled client gets wrong silently, since an unverified stream still
-    /// parses into a perfectly good-looking zone.
+    /// A signed transfer, MACs chained across every envelope. Fails silently if
+    /// got wrong: an unverified stream still parses into a good-looking zone.
     #[tokio::test]
     async fn test_a_signed_transfer_verifies_end_to_end() {
         let key = TsigKey::new(
@@ -1444,8 +1339,7 @@ mod tests {
         assert_eq!(received.serial(), Some(Serial::new(42)));
     }
 
-    /// The signature has to be *checked*, not merely present: a client holding
-    /// the wrong key must not end up with a zone.
+    /// A client holding the wrong key must not end up with a zone.
     #[tokio::test]
     async fn test_a_transfer_signed_with_another_key_is_refused() {
         let master_key = TsigKey::new(

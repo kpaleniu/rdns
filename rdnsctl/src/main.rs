@@ -1,27 +1,16 @@
 //! `rdnsctl` — ask a running `rdnsd` what it is doing, and tell it to reload.
 //!
-//! One connect, one command, one reply, and the connection closes. That is the
-//! whole protocol ([`rdns::control`]), which is why this is `std` and not
-//! `tokio`: there is nothing here to overlap.
+//! One connect, one command, one reply, then close ([`rdns::control`]). Nothing
+//! to overlap, so `std` rather than `tokio`.
 //!
-//! **A separate binary rather than a subcommand.** Every DNS server ships one —
-//! `rndc`, `knotc`, `nsd-control`, `pdns_control`, `unbound-control` — and an
-//! operator reaching for a control channel is reaching for a command, not for a
-//! flag on the daemon. It also keeps the two apart on the box: this can be
-//! installed where an admin's PATH is without the daemon being there.
-//!
-//! **Unix only**, because the socket is. On Windows it says so and exits 2
-//! rather than not existing, so `cargo build --workspace` covers it and nobody
-//! discovers the gap by finding the command missing.
+//! Unix only, because the socket is. On Windows it says so and exits 2 rather
+//! than not existing, so `cargo build --workspace` still covers it.
 
 use clap::Parser;
 
-/// Where a control socket lives when nobody says otherwise.
-///
-/// `/run` rather than `/var/run` (its symlink) and rather than `/tmp`: it is
-/// tmpfs, it is cleared on boot so a stale socket cannot survive a crash across
-/// one, and a directory under it is what a systemd unit's `RuntimeDirectory=`
-/// creates with the service's own ownership.
+/// `/run` rather than `/var/run` (its symlink) or `/tmp`: tmpfs, cleared on
+/// boot so a stale socket cannot outlive a crash, and what a systemd unit's
+/// `RuntimeDirectory=` creates with the service's own ownership.
 const DEFAULT_SOCKET: &str = "/run/rdns/rdnsd.sock";
 
 #[derive(Parser)]
@@ -32,12 +21,8 @@ struct Cli {
     socket: std::path::PathBuf,
     /// How long to wait for a reply, in seconds.
     ///
-    /// Longer than it sounds on purpose: `reload` re-reads, signs and verifies
-    /// every zone before answering, and the server bounds its own reply at 120
-    /// seconds. A shorter value here would time out on exactly the reload worth
-    /// watching. Lower it for `status` on a server suspected of being wedged —
-    /// the control socket is answered independently of the DNS path, so a hang
-    /// there is a real symptom rather than load.
+    /// Long because `reload` re-reads, signs and verifies every zone before
+    /// answering, and the server bounds its own reply at 120 seconds.
     #[arg(short, long, value_name = "SECONDS", default_value = "150")]
     timeout: u64,
     /// `status`, `reload`, `dump <zone>`, `version`, or `help`.
@@ -48,11 +33,9 @@ struct Cli {
     args: Vec<String>,
 }
 
-/// 0 the command worked, 1 the server refused it, 2 we could not ask.
-///
-/// Three codes and not two, because a script retrying a `reload` needs to tell
-/// "the server said no" from "there was no server": the first is a config that
-/// needs fixing and the second is a daemon that needs starting.
+/// 0 the command worked, 1 the server refused it, 2 we could not ask. A script
+/// retrying a `reload` must tell a config that needs fixing from a daemon that
+/// needs starting.
 #[cfg_attr(not(unix), allow(dead_code))]
 const EXIT_REFUSED: i32 = 1;
 const EXIT_UNREACHABLE: i32 = 2;
@@ -62,9 +45,8 @@ fn main() -> std::process::ExitCode {
     match run(&cli) {
         Ok(code) => code,
         Err(e) => {
-            // `{e:#}` for the whole context chain: "connecting to /run/...: No
-            // such file or directory" is the message, and the outermost clause
-            // alone would be half of it.
+            // `{e:#}` for the whole context chain; the outermost clause alone
+            // is half the message.
             eprintln!("rdnsctl: {e:#}");
             std::process::ExitCode::from(EXIT_UNREACHABLE as u8)
         }
@@ -98,8 +80,7 @@ fn run(cli: &Cli) -> anyhow::Result<std::process::ExitCode> {
         .write_all(request.encode().as_bytes())
         .context("sending the command")?;
     // Half-close, so a server reading to end-of-line *or* to EOF sees the end
-    // of the request either way, and a bug on either side shows up as an error
-    // rather than as both ends waiting for the other.
+    // of the request either way rather than both ends waiting.
     stream.shutdown(std::net::Shutdown::Write).ok();
 
     let mut reply = String::new();
@@ -109,9 +90,8 @@ fn run(cli: &Cli) -> anyhow::Result<std::process::ExitCode> {
 
     match parse_reply(&reply) {
         Reply::Ok(body) => {
-            // The body goes to stdout unchanged and unadorned: `rdnsctl dump
-            // example.com. > example.com.zone` has to produce a zone file, not
-            // a zone file with a status line in it.
+            // Unadorned: `rdnsctl dump example.com. > example.com.zone` has to
+            // produce a zone file, not one with a status line in it.
             print!("{body}");
             std::io::stdout().flush().ok();
             Ok(std::process::ExitCode::SUCCESS)

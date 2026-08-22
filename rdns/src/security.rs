@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 /// Configuration for rate limiting
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
-    /// Number of tokens available per window. **Zero turns the limiter off.**
+    /// Number of tokens available per window. Zero turns the limiter off.
     pub tokens_per_window: u32,
     /// Window size in seconds
     pub window_size_secs: u64,
@@ -36,18 +36,11 @@ impl Default for RateLimitConfig {
 }
 
 impl RateLimitConfig {
-    /// A limit stated the way an operator states it: queries per second, and how
+    /// A limit in the unit an operator states it in: queries per second, and how
     /// many may arrive at once before the rate applies.
     ///
-    /// `per_sec` of **0 disables the limiter entirely**, which is a position an
-    /// authoritative server can reasonably take — it fronts resolvers, not end
-    /// users, and the response-byte budget ([`ResponseLimiter`]) is the control
-    /// that actually stops amplification.
-    ///
-    /// The defaults these replace were a trap: 100 tokens per 10-second window
-    /// with a burst of 20 reads as "100 queries" and is **10 queries a second**,
-    /// which is below what one busy resolver sends. Stating the rate in the unit
-    /// the operator thinks in is most of the fix.
+    /// `per_sec` of 0 disables the limiter entirely; [`ResponseLimiter`] is the
+    /// control that actually stops amplification.
     pub fn per_second(per_sec: u32, burst: u32) -> Self {
         RateLimitConfig {
             tokens_per_window: per_sec,
@@ -75,22 +68,12 @@ struct TokenBucket {
 
 /// Rate limiter using token bucket algorithm.
 ///
-/// Two properties here are not about rate limiting at all, and both were missing:
+/// The table is attacker-keyed: a bucket is created before anything validates the
+/// packet. Above `max_tracked` no new bucket is created and the packet is
+/// *allowed*, because failing closed lets one flood deny service to everybody.
 ///
-/// - **The table is bounded.** A bucket is created *before* anything validates
-///   the packet, so it costs an attacker one spoofed 12-byte datagram per entry,
-///   and cleanup ran only every `cleanup_interval_secs` — ten minutes of
-///   unbounded growth with IPv6 source addresses, followed by a full-map walk
-///   under the lock. Above `max_tracked` no new bucket is created and the packet
-///   is allowed on the same terms an untracked source would get, because failing
-///   *closed* here would mean one flood denies service to everybody. See
-///   [`ResponseLimiter`], which had this from the start.
-/// - **Time arithmetic saturates.** `current_unix_timestamp` is `SystemTime`, not
-///   monotonic. An NTP step backwards made `now - last_refill` underflow: in
-///   debug a panic *with the mutex held*, which poisons it and makes every later
-///   `should_allow` panic in turn — a clock correction taking the server off the
-///   air permanently — and in release a wrap to ~1.8e19, which refills every
-///   bucket to full and silently disables the limiter.
+/// `current_unix_timestamp` is wall-clock, so all time arithmetic here saturates:
+/// a backwards NTP step would otherwise underflow and refill every bucket.
 pub struct RateLimiter {
     config: RateLimitConfig,
     buckets: Arc<Mutex<HashMap<IpAddr, TokenBucket>>>,
@@ -112,9 +95,8 @@ impl RateLimiter {
 
     /// Check if a request from the given IP should be allowed
     pub fn should_allow(&self, ip: IpAddr) -> bool {
-        // Both of these short-circuit before the lock and before a bucket is
-        // created, so an exempt source costs nothing and a disabled limiter is
-        // not a mutex on every query.
+        // Before the lock and before a bucket is created: a disabled limiter must
+        // not be a mutex on every query.
         if self.config.tokens_per_window == 0 || self.config.exempt.allows(ip) {
             return true;
         }
@@ -125,10 +107,8 @@ impl RateLimiter {
         self.cleanup_if_needed(now);
 
         let Ok(mut buckets) = self.buckets.lock() else {
-            // A poisoned lock means some other thread panicked holding it. The
-            // limiter's state is unknown; allowing the query is the honest
-            // failure mode, since the alternative is a server that answers
-            // nothing at all until it is restarted.
+            // Poisoned: state unknown. Allow, rather than answer nothing until
+            // restarted.
             return true;
         };
         if !buckets.contains_key(&ip) && buckets.len() >= self.config.max_tracked {
@@ -139,8 +119,7 @@ impl RateLimiter {
             last_refill: now,
         });
 
-        // Refill tokens based on time elapsed. Saturating because the clock is
-        // wall-clock and can step backwards.
+        // Saturating: the clock is wall-clock and can step backwards.
         let time_elapsed = now.saturating_sub(bucket.last_refill);
         let tokens_to_add = (time_elapsed as f64 / self.config.window_size_secs as f64)
             * self.config.tokens_per_window as f64;
@@ -157,15 +136,10 @@ impl RateLimiter {
         }
     }
 
-    /// Get current remaining tokens for an IP (for monitoring/logging)
+    /// Get current remaining tokens for an IP (for monitoring/logging).
     ///
-    /// A poisoned lock reads as a full bucket, which is what an untracked source
-    /// reads as anyway and matches the direction [`RateLimiter::should_allow`]
-    /// fails in — open, because failing closed lets one flood deny service to
-    /// everybody (`CLAUDE.md` §5). The three other lock sites in this file
-    /// already did this; these two monitoring ones were left on `.unwrap()`,
-    /// where a single poisoning would panic whoever asked for the number
-    /// (`CLAUDE.md` §6).
+    /// A poisoned lock reads as a full bucket, matching the direction
+    /// [`RateLimiter::should_allow`] fails in.
     pub fn get_tokens(&self, ip: IpAddr) -> f64 {
         let Ok(buckets) = self.buckets.lock() else {
             return self.config.burst_size as f64;
@@ -191,19 +165,14 @@ impl RateLimiter {
             return;
         };
 
-        // Remove entries that haven't been used in the last cleanup interval.
-        // Saturating again: a clock step backwards would otherwise underflow and
-        // keep every entry — or, in debug, panic while holding both locks.
+        // Saturating: a clock step backwards would otherwise underflow, and in
+        // debug panic while holding both locks.
         buckets.retain(|_, bucket| {
             now.saturating_sub(bucket.last_refill) < self.config.cleanup_interval_secs
         });
     }
 
-    /// Get statistics (for monitoring)
-    ///
-    /// Zeros for a poisoned lock, for the reason [`RateLimiter::get_tokens`]
-    /// gives: a number nobody can read is worse than a number that is wrong in
-    /// a direction the comment names.
+    /// Get statistics (for monitoring). Zeros for a poisoned lock.
     pub fn get_stats(&self) -> RateLimiterStats {
         let Ok(buckets) = self.buckets.lock() else {
             return RateLimiterStats {
@@ -229,33 +198,21 @@ pub struct RateLimiterStats {
 pub enum ResponseVerdict {
     /// Send it as built.
     Send,
-    /// Send a truncated (TC=1) reply instead — no records, so it is about the
-    /// size of the query. A legitimate client retries over TCP and gets its
-    /// answer; a spoofed source receives a packet no larger than the one
-    /// supposedly sent, which is the whole point.
+    /// Send a truncated (TC=1) reply instead — no records, so it cannot amplify.
+    /// A legitimate client retries over TCP.
     Truncate,
     /// Send nothing.
     Drop,
 }
 
-/// A per-client budget on response *bytes*, not queries.
+/// A per-client budget on response *bytes*, not queries — the reflected traffic
+/// is what amplification is measured in (RFC 5358; Response Rate Limiting).
 ///
-/// The query limiter counts requests, which says nothing about amplification: an
-/// attacker forging a victim's source address picks the query with the largest
-/// answer, so the reflected traffic is what has to be metered (RFC 5358; what
-/// authoritative servers call Response Rate Limiting).
+/// Above `max_tracked` the table stops growing and every response is truncated:
+/// a spoofed flood arrives from every address there is, so the table would
+/// otherwise be the next amplification vector.
 ///
-/// Two things make it usable rather than merely strict:
-///
-/// - Slip: every `slip`-th response over budget is answered TC=1 rather than
-///   dropped. It carries no records, so it cannot amplify, and a legitimate
-///   client retries over TCP where the handshake proves the address.
-/// - A bounded table: a spoofed flood arrives from every address there is, so the
-///   table would otherwise be the next amplification vector. Above `max_tracked`
-///   it stops growing and every response is truncated instead.
-///
-/// Only for UDP. A TCP query has completed a handshake, so its source address is
-/// real and there is nobody to reflect at.
+/// UDP only. A TCP query completed a handshake, so there is nobody to reflect at.
 pub struct ResponseLimiter {
     /// Sustained bytes per second per client. Zero disables the limiter.
     bytes_per_sec: u32,
@@ -288,13 +245,9 @@ impl ResponseLimiter {
         }
     }
 
-    /// 8 KiB/s sustained per client with a 32 KiB burst, truncating every second
-    /// response over budget.
-    ///
-    /// A stub resolver asking real questions is nowhere near this: 8 KiB is some
-    /// twenty full-size answers a second, sustained, from one address. The burst
-    /// is four seconds' worth so that a browser opening a page — a dozen names at
-    /// once — is never touched. The slip of 2 is what BIND's own default is.
+    /// 8 KiB/s sustained per client with a 32 KiB burst (four seconds' worth, so
+    /// a page load's dozen names is never touched), truncating every second
+    /// response over budget — BIND's own slip default.
     pub fn with_defaults() -> Self {
         Self::new(8192, 32768, 2)
     }
@@ -368,18 +321,11 @@ impl ResponseLimiter {
     }
 }
 
-/// Who may ask for a zone transfer.
-///
-/// **Empty means nobody, and empty is the default.** An AXFR hands over every
-/// name in the zone in one request: hosts that were never meant to be found,
-/// internal naming, the shape of the network. It is the one query where the
-/// answer is the whole database, so it is allowed by list and refused otherwise —
-/// the opposite of how the rest of a nameserver works.
+/// Who may ask for a zone transfer. Empty means nobody, and empty is the
+/// default — an AXFR is the whole database, so it is allowed by list only.
 ///
 /// A rule is a bare address or a CIDR prefix. Address families do not mix: a v4
-/// rule never matches a v6 peer, including a v4-mapped one, because
-/// `::ffff:10.0.0.1` reaching a `10.0.0.0/8` rule would be a way around the list
-/// rather than an application of it.
+/// rule never matches a v4-mapped v6 peer, which would be a way around the list.
 #[derive(Debug, Clone, Default)]
 pub struct TransferAcl {
     rules: Vec<AclRule>,
@@ -395,22 +341,15 @@ struct AclRule {
 impl TransferAcl {
     /// Parse rules like `192.0.2.1`, `10.0.0.0/8`, `2001:db8::/32`.
     ///
-    /// A rule that does not parse is an error rather than a skip: a typo in an
-    /// ACL must stop the server, not silently leave the list shorter than the
-    /// operator believes it to be.
+    /// A rule that does not parse is an error rather than a skip: a typo must
+    /// stop the server, not leave the list shorter than the operator believes.
     pub fn parse(specs: &[String]) -> ConfigResult<Self> {
         Self::parse_named(specs, "transfer ACL")
     }
 
-    /// [`Self::parse`] for an address list that is not the transfer ACL — the
-    /// query-rate exemption list, today.
-    ///
-    /// Same syntax and the same refusal to skip a rule it cannot read; only the
-    /// error text differs, so an operator running two lists is told which one has
-    /// the typo. Sharing the parser rather than writing a second one is
-    /// `CLAUDE.md` §7: a CIDR matcher that exists twice is a CIDR matcher where
-    /// one copy has the v4-mapped-v6 hole that the doc comment above this type
-    /// exists to warn about.
+    /// [`Self::parse`] for another address list — the query-rate exemptions.
+    /// Only the error text differs, so an operator running two lists is told
+    /// which one has the typo.
     pub fn parse_named(specs: &[String], what: &str) -> ConfigResult<Self> {
         let mut rules = Vec::new();
         for spec in specs {
@@ -536,13 +475,8 @@ mod tests {
         );
     }
 
-    /// The table an attacker keys. A bucket is created before anything validates
-    /// the packet, so one spoofed 12-byte datagram per source address is the
-    /// whole cost of making the server allocate — and with IPv6 there are as
-    /// many source addresses as the attacker cares to type.
-    ///
-    /// Bounded, the flood stops costing memory. Unbounded, the *rate limiter* was
-    /// the memory-exhaustion vector.
+    /// Unbounded, the rate limiter is itself the memory-exhaustion vector: one
+    /// spoofed 12-byte datagram per source address buys an entry.
     #[test]
     fn a_flood_of_source_addresses_does_not_grow_the_table_without_bound() {
         let config = RateLimitConfig {
@@ -563,9 +497,8 @@ mod tests {
         );
     }
 
-    /// And at the bound the answer is "allow", not "deny": failing closed would
-    /// let one flood take the server off the air for every legitimate client,
-    /// which is the outcome the limiter exists to prevent.
+    /// At the bound the answer is "allow": failing closed would let one flood
+    /// take the server off the air for every legitimate client.
     #[test]
     fn a_source_the_table_has_no_room_for_is_still_served() {
         let config = RateLimitConfig {
@@ -594,25 +527,13 @@ mod tests {
     }
 
     /// A clock step backwards must not panic, and must not silently refill every
-    /// bucket either.
-    ///
-    /// `current_unix_timestamp` is wall-clock, so an NTP correction can move it
-    /// backwards. `now - bucket.last_refill` then underflowed: in debug a panic
-    /// **with the mutex held**, poisoning it so that every later `should_allow`
-    /// panicked too — a clock correction taking the server off the air until it
-    /// was restarted — and in release a wrap to ~1.8e19 tokens, which refilled
-    /// every bucket to full and turned the limiter off without saying so.
-    ///
-    /// The bucket is reached through the public API with a `last_refill` in the
-    /// future, which is what the clock stepping back looks like from here.
+    /// bucket either. A `last_refill` in the future is what it looks like here.
     #[test]
     fn a_clock_step_backwards_neither_panics_nor_refills_the_bucket() {
         let limiter = RateLimiter::with_defaults();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
         assert!(limiter.should_allow(ip));
-        // Move the bucket's stamp an hour into the future: the same arithmetic a
-        // backwards step produces.
         limiter
             .buckets
             .lock()
@@ -621,8 +542,8 @@ mod tests {
             .expect("a bucket")
             .last_refill = current_unix_timestamp() + 3600;
 
-        // Drain it. Without saturation the first call here refills to burst on
-        // an underflowed elapsed time, so the bucket never empties.
+        // Without saturation the first call refills to burst on an underflowed
+        // elapsed time, so the bucket never empties.
         for _ in 0..19 {
             limiter.should_allow(ip);
         }
@@ -698,11 +619,8 @@ mod tests {
         assert!(!limiter.should_allow(ip));
     }
 
-    /// The limit is a *rate*, and the units it was configured in were not the
-    /// units it read as: 100 tokens per 10-second window with a burst of 20 is
-    /// **10 queries a second**, which is below what one busy resolver sends, and
-    /// it was hardcoded with no flag. Measured live before the change: a
-    /// 60-query burst from one address got 20 answers and 40 silent drops.
+    /// The limit is a *rate*: 100 tokens per 10-second window reads as "100
+    /// queries" and is 10 a second, below what one busy resolver sends.
     #[test]
     fn a_per_second_limit_means_what_it_says() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
@@ -717,8 +635,7 @@ mod tests {
             "and the burst is a bound, not a suggestion"
         );
 
-        // The old default, stated in its own units, is the 10 q/s that caused
-        // the problem — kept here so the number is written down somewhere.
+        // The default, stated in its own units, is 10 q/s.
         let old = RateLimitConfig::default();
         assert_eq!(
             old.tokens_per_window as f64 / old.window_size_secs as f64,
@@ -726,9 +643,7 @@ mod tests {
         );
     }
 
-    /// 0 turns the limiter off outright, which is a defensible position for an
-    /// authoritative server: it fronts resolvers rather than end users, and
-    /// [`ResponseLimiter`] is the control that actually stops amplification.
+    /// 0 turns the limiter off outright rather than refusing everything.
     #[test]
     fn a_rate_of_zero_disables_the_limiter_rather_than_refusing_everything() {
         let limiter = RateLimiter::new(RateLimitConfig::per_second(0, 1));
@@ -740,8 +655,7 @@ mod tests {
         assert_eq!(limiter.get_stats().tracked_ips, 0);
     }
 
-    /// An exempt source is never limited, and — the half worth testing — being
-    /// exempt does not exempt anybody else.
+    /// An exempt source is never limited, and does not exempt anybody else.
     #[test]
     fn an_exempt_source_is_not_rate_limited_and_its_neighbours_still_are() {
         let limiter = RateLimiter::new(RateLimitConfig::per_second(10, 2).exempting(
@@ -761,9 +675,8 @@ mod tests {
         );
     }
 
-    /// A burst of zero would refuse every query outright — a bucket starts full,
-    /// and a full bucket of nothing has no token to spend. `per_second` floors
-    /// it at one so a mistyped flag cannot turn the server off.
+    /// A burst of zero would refuse every query — a bucket starts full, and a
+    /// full bucket of nothing has no token to spend.
     #[test]
     fn a_burst_of_zero_does_not_become_a_total_outage() {
         let limiter = RateLimiter::new(RateLimitConfig::per_second(10, 0));
@@ -799,17 +712,12 @@ mod tests {
         assert_eq!(total_allowed, 200);
     }
 
-    // -----------------------------------------------------------------
-    // The zone-transfer ACL
-    // -----------------------------------------------------------------
-
     fn parse_acl(specs: &[&str]) -> TransferAcl {
         TransferAcl::parse(&specs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
             .expect("should parse")
     }
 
-    /// The default is the one that matters: an AXFR is the whole zone, so with
-    /// no list there is nobody to give it to.
+    /// An AXFR is the whole zone, so with no list there is nobody to give it to.
     #[test]
     fn test_an_empty_acl_allows_nobody() {
         let acl = TransferAcl::default();
@@ -843,8 +751,7 @@ mod tests {
         assert!(!acl.allows("2001:db9::5".parse().unwrap()));
     }
 
-    /// A v4 rule must not admit a v6 peer, mapped or otherwise — that would be a
-    /// way around the list rather than an application of it.
+    /// A v4 rule must not admit a v6 peer, mapped or otherwise.
     #[test]
     fn test_families_do_not_mix() {
         let acl = parse_acl(&["10.0.0.0/8"]);
@@ -859,8 +766,7 @@ mod tests {
         assert!(!v6.allows("10.0.0.1".parse().unwrap()));
     }
 
-    /// A typo has to stop the server. Leaving the list shorter than the operator
-    /// wrote it is how a rule silently stops applying.
+    /// A typo has to stop the server, not shorten the list silently.
     #[test]
     fn test_a_bad_rule_is_an_error() {
         assert!(TransferAcl::parse(&["not-an-address".to_string()]).is_err());
@@ -872,13 +778,7 @@ mod tests {
         assert!(TransferAcl::parse(&["10.0.0.0/eight".to_string()]).is_err());
     }
 
-    // -----------------------------------------------------------------
-    // The response byte budget
-    // -----------------------------------------------------------------
-
-    /// The thing the query counter could not see: one query, a big answer. A
-    /// budget in bytes is spent by the size of what goes out, so a client asking
-    /// for large RRsets runs out sooner than one asking for addresses.
+    /// What the query counter cannot see: one query, a big answer.
     #[test]
     fn test_a_big_answer_costs_more_than_a_small_one() {
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
@@ -909,7 +809,7 @@ mod tests {
         );
     }
 
-    /// Slip: every second response over budget is truncated rather than dropped,
+    /// Slip: every second over-budget response is truncated rather than dropped,
     /// so a legitimate client learns to use TCP instead of going silent.
     #[test]
     fn test_slip_truncates_every_second_over_budget_response() {
@@ -962,8 +862,7 @@ mod tests {
     }
 
     /// A spoofed flood arrives from every address there is, so the tracking
-    /// table is the next thing to exhaust. Past its bound it stops growing and
-    /// truncates instead — small, still answerable over TCP.
+    /// table is the next thing to exhaust.
     #[test]
     fn test_the_client_table_is_bounded() {
         let mut limiter = ResponseLimiter::new(8192, 32768, 2);
@@ -998,8 +897,7 @@ mod tests {
         }
     }
 
-    /// The default has to be generous enough that ordinary use never sees it:
-    /// a page load is a dozen names at once, and that must go through untouched.
+    /// The default must be generous enough that a page load never sees it.
     #[test]
     fn test_the_default_budget_passes_an_ordinary_burst() {
         let ip: IpAddr = "192.0.2.7".parse().unwrap();

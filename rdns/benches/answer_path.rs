@@ -1,17 +1,9 @@
 //! What one query costs, measured on optimized code.
 //!
-//! Criterion, so these run under the release profile and can be compared against
-//! a saved baseline. `src/bench.rs` timed debug builds; what is left there are two
-//! wall-clock floors guarding a complexity class, which are not benchmarks.
-//!
-//! Read every number here against the cost of the datagram it sits in. Measured
-//! 2026-08-01: one `sendto` + one `recvfrom` on loopback is 3.6 µs on Linux and
-//! 4.1 µs on Windows, and the whole library-side answer to a plain A query is
-//! 231 ns on Linux, 455 ns on Windows. This file is about 6% of what a query
-//! costs a server, so a 20% win here is ~1% end to end. Anything claiming a
-//! *query* got faster has to be measured against a query, syscalls included.
-//!
-//! Running it:
+//! Everything here is about 6% of what a query costs a server — one `sendto`
+//! plus one `recvfrom` on loopback is ~3.6 µs against ~231 ns of library work —
+//! so a claim that a *query* got faster has to be measured against a query,
+//! syscalls included.
 //!
 //! ```sh
 //! cargo bench -p rdns                        # everything
@@ -19,9 +11,6 @@
 //! cargo bench -p rdns -- --save-baseline before
 //! cargo bench -p rdns -- --baseline before   # after a change
 //! ```
-//!
-//! The baseline pair is the point for `TODO.md` #11 and #13, both of which are
-//! single-digit-percent questions that no allocation count can answer.
 
 use rdns::Class;
 use rdns::Ttl;
@@ -92,13 +81,9 @@ fn owned(zone: &Zone, name: &str, qtype: Qtype) -> Vec<ResourceRecord> {
         .collect()
 }
 
-/// The four steps between a datagram arriving and one leaving, separately and
-/// together.
-///
-/// Separately because the whole is what an operator cares about and the parts
-/// are what a change moves: the allocation work under #9e took the *together*
-/// number from 25.7 allocations per query to 13.7 without any single part
-/// obviously dominating.
+/// The steps between a datagram arriving and one leaving, separately and
+/// together: the whole is what an operator cares about, the parts are what a
+/// change moves.
 fn answer(c: &mut Criterion) {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse the zone");
     let wire = query_message("www.example.com.", Qtype::of(record_types::A))
@@ -115,8 +100,8 @@ fn answer(c: &mut Criterion) {
         b.iter(|| zone.query(black_box("www.example.com."), Qtype::of(record_types::A)))
     });
 
-    // Into a warm buffer, because that is what the UDP workers do — one scratch
-    // buffer each, reused for the life of the process.
+    // Into a warm buffer: the UDP workers keep one scratch buffer each for the
+    // life of the process.
     let mut response = DnsMessage::try_from_bytes(&wire).expect("parse");
     response.response = true;
     response.authoritive = true;
@@ -133,9 +118,8 @@ fn answer(c: &mut Criterion) {
         })
     });
 
-    // A full-size answer is a different shape: 4 KB of records sharing a suffix,
-    // where name compression and the answer vector are doing real work rather
-    // than being one record's worth of overhead.
+    // 4 KB of records sharing a suffix: name compression and the answer vector
+    // doing real work rather than one record's worth of overhead.
     let mut big = query_message("example.com.", Qtype::of(record_types::A));
     big.response = true;
     big.authoritive = true;
@@ -163,13 +147,10 @@ fn answer(c: &mut Criterion) {
         })
     });
 
-    // And the shape no bench covered until `TODO.md` #24b: a transfer envelope,
-    // which targets 16 KiB (`transfer::ENVELOPE_TARGET`) and so carries 300-500
-    // records, nearly all of them distinct owner names. The compressor's table is
-    // hundreds of entries here rather than a handful, which is the one message
-    // shape the "a scan beats a hash for a handful of names" reasoning is false
-    // of. Names are short so the message stays inside the 14-bit pointer range,
-    // as a real envelope does.
+    // A transfer envelope: 300-500 records, nearly all distinct owner names, so
+    // the compressor's table is hundreds of entries rather than a handful — the
+    // one shape "a scan beats a hash for a few names" is false of. Names are
+    // short so the message stays inside the 14-bit pointer range.
     let mut envelope = query_message("example.com.", Qtype::AXFR);
     envelope.response = true;
     envelope.authoritive = true;
@@ -199,8 +180,7 @@ fn answer(c: &mut Criterion) {
         })
     });
 
-    // Parse, look up, build, serialize: the library's share of one query, and
-    // the number the #9e work moved.
+    // Parse, look up, build, serialize: the library's share of one query.
     group.bench_function("one whole answer", |b| {
         b.iter(|| {
             let parsed = DnsMessage::try_from_bytes(black_box(&wire)).expect("parse");
@@ -219,9 +199,8 @@ fn answer(c: &mut Criterion) {
 
 /// The index, on a zone big enough for the shape of the lookup to show.
 ///
-/// The miss is the one to watch: it is what a random-name flood produces, and
-/// what the linear scan this replaced paid the most for. It is also the case
-/// `TODO.md` #11 (data layout) would move, if anything does.
+/// The miss is the one to watch: what a random-name flood produces, and what the
+/// linear scan this replaced paid the most for.
 fn zone_index(c: &mut Criterion) {
     let mut zone = Zone::new("example.com.".to_string());
     for i in 0..10_000u32 {
@@ -259,11 +238,8 @@ fn zone_index(c: &mut Criterion) {
     group.finish();
 }
 
-/// What every datagram pays before anything looks at the question.
-///
-/// Both of these are per-packet and neither is on anyone's list of costs, which
-/// is exactly why they are worth a number: they run before the rate limiter has
-/// decided the packet is worth answering.
+/// What every datagram pays before anything looks at the question — including
+/// before the rate limiter has decided the packet is worth answering.
 fn admission(c: &mut Criterion) {
     let limiter = RateLimiter::with_defaults();
     let validator = AdmissionCheck::with_defaults();
@@ -282,19 +258,15 @@ fn admission(c: &mut Criterion) {
     group.finish();
 }
 
-/// The two pieces of shared state a query touches, at the depth that hurts.
-///
-/// Both are here because the old bench measured them where they cost nothing:
-/// `bench_cache_throughput` only ever called `get` on an *empty* cache, so it
-/// never reached `evict_oldest` and could not have seen the O(n²) eviction it
-/// was meant to be watching. A cache is interesting when it is full and a
-/// logger is interesting when it is tracking a lot of sources.
+/// The two pieces of shared state a query touches, at the depth that hurts: a
+/// cache is interesting when it is full and a logger when it tracks many
+/// sources.
 fn shared_state(c: &mut Criterion) {
     let mut group = c.benchmark_group("state");
 
-    // Amortized over 100 inserts, because eviction is not per-insert: the cache
-    // halves itself when it goes over, so one insert in thousands pays for the
-    // rest and a per-insert timing would report the median instead of the cost.
+    // Amortized over 100 inserts: the cache halves itself when it goes over, so
+    // one insert in thousands pays for the rest and a per-insert timing would
+    // report the median instead of the cost.
     let cache = DnsCache::new(20_000);
     let record = |name: &str| ResourceRecord {
         name: name.to_string(),
@@ -322,8 +294,8 @@ fn shared_state(c: &mut Criterion) {
         })
     });
 
-    // A thousand distinct sources tracked, which is the depth the per-window
-    // scan used to be quadratic in (`CLAUDE.md` §10).
+    // A thousand distinct sources tracked: the depth `log_query` was quadratic
+    // in.
     let logger = QueryLogger::new();
     for i in 0..1_000u32 {
         logger.log_query(
@@ -342,25 +314,14 @@ fn ip_of(n: u32) -> IpAddr {
     IpAddr::V4(Ipv4Addr::from(n.to_be_bytes()))
 }
 
-/// The item this harness exists for: `TODO.md` #9e's DNSSEC canonicalization.
+/// DNSSEC canonicalization, which `verify_rrset` rebuilds per candidate RRSIG.
 ///
-/// `verify_rrset` rebuilds the canonical form of the whole RRset for each
-/// candidate RRSIG, and the DHAT pass said in as many words that this is a
-/// *time* problem rather than a count one — so a benchmark is the only thing
-/// that can say whether fixing it is worth anything.
-///
-/// **Two shapes, because one of them cannot show the cost.** The DNSKEY RRset
-/// signed by a KSK and a ZSK is the case the allocation test measures, and it is
-/// the wrong case for this question: `verify_rrset` **returns on the first
-/// signature that verifies**, so the second candidate is never canonicalized at
-/// all and what the number contains is one canonicalization and one ECDSA
-/// verify. The rebuild only happens when a candidate is *rejected*, which is a
-/// key rollover or an attack, not the ordinary path.
-///
-/// So the second pair is the decomposition: the same verification over an RRset
-/// of 1 record and of 20. Canonicalization scales with the record count and the
-/// crypto does not, so the difference between them is the canonicalization, and
-/// the ratio to the whole is what says whether #13 is worth doing.
+/// Two shapes, because the two-signature one cannot show the cost:
+/// `verify_rrset` returns on the first signature that verifies, so the second
+/// candidate is never canonicalized unless one is *rejected* — a rollover or an
+/// attack, not the ordinary path. The 1-record and 20-record pair is the
+/// decomposition: canonicalization scales with the record count and the crypto
+/// does not, so the difference between them is the canonicalization.
 fn dnssec(c: &mut Criterion) {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse the zone");
     let keys = vec![
@@ -414,8 +375,8 @@ fn dnssec(c: &mut Criterion) {
         })
     });
 
-    // The decomposition: one RRset of 1 A record and one of 20, each signed
-    // once. Everything but the canonicalization is identical between them.
+    // One RRset of 1 A record and one of 20, each signed once: everything but
+    // the canonicalization is identical between them.
     for count in [1usize, 20] {
         let mut text = String::from(ZONE);
         for i in 0..count {
@@ -454,10 +415,9 @@ fn dnssec(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    // Three seconds of samples after one of warm-up. The default is five and
-    // three, which is more than these need — every one of them is sub-microsecond
-    // except the cache batch — and the whole file should stay runnable in under a
-    // minute or nobody will run it before a change.
+    // Below criterion's five-and-three default: everything here is
+    // sub-microsecond except the cache batch, and a file that takes over a
+    // minute does not get run before a change.
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));

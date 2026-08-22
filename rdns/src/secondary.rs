@@ -1,22 +1,17 @@
 //! Being a replica of somebody else's zone: what to fetch, when, and what to
 //! remember between restarts.
 //!
-//! [`crate::xfr`] knows how to obtain a zone; this knows when it is due, when it
-//! has gone stale, and what survives a restart. The split matters because the
-//! timing rules are the half with no I/O in them and every interesting edge case:
-//! they can be tested by moving a clock rather than by waiting.
+//! [`crate::xfr`] obtains a zone; this decides when it is due, when it has gone
+//! stale, and what survives a restart. Split so the timing rules — the half with
+//! no I/O and every edge case — are testable by moving a clock.
 //!
-//! **The shape of replication here** is single-writer, asynchronous and
-//! pull-based. One primary holds the editable copy; a secondary asks for it, is
-//! read-only, and never resolves a conflict because it never accepts a write. A
-//! NOTIFY is a hint that shortens the wait, not a channel the data arrives on —
-//! which is why losing one costs a delay and nothing else.
+//! Replication is single-writer, asynchronous and pull-based. A secondary is
+//! read-only and never resolves a conflict because it never accepts a write. A
+//! NOTIFY only shortens the wait, so losing one costs a delay and nothing else.
 //!
-//! **EXPIRE is the timer with teeth.** REFRESH and RETRY only decide how eagerly
-//! we ask. EXPIRE says how long a secondary may keep answering *authoritatively*
-//! for a zone it has lost contact with — and past it the honest answer is to stop
-//! serving the zone rather than to keep handing out data that may be arbitrarily
-//! stale, with the AA bit claiming otherwise (RFC 1035 §3.3.13, RFC 1912 §2.2).
+//! EXPIRE is the timer with teeth: past it, a secondary must stop serving rather
+//! than keep handing out arbitrarily stale data with AA set (RFC 1035 §3.3.13,
+//! RFC 1912 §2.2).
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::Qtype;
@@ -28,15 +23,12 @@ use crate::utils::record_types as rt;
 use crate::zone::Zone;
 use crate::{ParsedRecord, Serial};
 
-/// The floor under REFRESH and RETRY.
-///
-/// A zone whose SOA says refresh every 0 seconds would otherwise be a loop that
-/// asks its master as fast as the network allows. The RFCs set no floor because
-/// they did not imagine one being needed; every implementation has learned to.
+/// The floor under REFRESH and RETRY. A SOA saying "refresh every 0 seconds" is
+/// otherwise a loop asking the master as fast as the network allows; the RFCs
+/// set no floor, every implementation does.
 pub const MIN_TIMER_SECS: u64 = 60;
 
-/// What to use before we have ever seen the zone's SOA — a zone we have not
-/// fetched yet has no timers of its own to obey.
+/// Before the zone's SOA has been seen, there are no timers of its own to obey.
 pub const DEFAULT_REFRESH_SECS: u64 = 3600;
 
 /// The three timers a secondary lives by, from the zone's apex SOA.
@@ -55,8 +47,7 @@ impl Default for RefreshTimers {
         RefreshTimers {
             refresh: DEFAULT_REFRESH_SECS,
             retry: MIN_TIMER_SECS,
-            // A zone we have never reached cannot expire — there is nothing to
-            // withdraw, and this value is replaced the moment one arrives.
+            // A zone never reached cannot expire: there is nothing to withdraw.
             expire: u64::MAX,
         }
     }
@@ -65,19 +56,15 @@ impl Default for RefreshTimers {
 impl RefreshTimers {
     /// The timers in a zone's apex SOA, clamped to something a server can obey.
     ///
-    /// The SOA fields are signed and written by hand, so a negative or absurd
-    /// value is not a theoretical concern. Clamping rather than rejecting is
-    /// deliberate: a secondary that refuses to serve a zone because its master
-    /// wrote `retry 0` has turned a cosmetic mistake into an outage.
+    /// Clamped rather than rejected: a secondary refusing a zone because its
+    /// master wrote `retry 0` turns a cosmetic mistake into an outage.
     pub fn from_soa(refresh: i32, retry: i32, expire: i32) -> Self {
         let floor = |value: i32| (value.max(0) as u64).max(MIN_TIMER_SECS);
         RefreshTimers {
             refresh: floor(refresh),
             retry: floor(retry),
-            // EXPIRE has no floor of its own: it is a limit on staleness, and
-            // raising a small one would keep a zone alive longer than its
-            // operator said to. Zero means "expire as soon as contact is lost",
-            // which is a strange thing to write but an unambiguous one.
+            // No floor on EXPIRE: it limits staleness, and raising a small one
+            // keeps a zone alive longer than its operator said to.
             expire: expire.max(0) as u64,
         }
     }
@@ -107,11 +94,8 @@ impl RefreshTimers {
         Duration::from_secs(self.retry)
     }
 
-    /// Whether a zone last reached at `last_contact` may still be served at `now`.
-    ///
-    /// Measured from the last time the master *answered*, not from the last time
-    /// the zone changed: a zone that has not changed in a year is not stale, and
-    /// one whose master vanished an hour ago may be.
+    /// Measured from when the master last *answered*, not when the zone last
+    /// changed: a zone unchanged for a year is not stale.
     pub fn has_expired(&self, last_contact: u64, now: u64) -> bool {
         now.saturating_sub(last_contact) > self.expire
     }
@@ -123,8 +107,8 @@ pub struct MasterSpec {
     /// The zone's apex, absolute.
     pub zone: String,
     pub master: SocketAddr,
-    /// The TSIG key to sign the transfer with, by name — looked up in the keys
-    /// `--tsig-key` defines, so a secret is written down in exactly one place.
+    /// By name, looked up in the keys `--tsig-key` defines, so a secret is
+    /// written down in one place.
     pub key_name: Option<String>,
 }
 
@@ -160,11 +144,9 @@ impl MasterSpec {
     }
 }
 
-/// `addr` or `addr:port`, defaulting to 53.
-///
-/// A bare IPv6 address has colons of its own, so `[::1]:5353` is the only
-/// unambiguous way to give one a port — the shape `SocketAddr` already parses,
-/// rather than a convention of ours.
+/// `addr` or `addr:port`, defaulting to 53. A bare IPv6 address has colons, so
+/// `[::1]:5353` is the only unambiguous way to give one a port — which is what
+/// `SocketAddr` already parses.
 fn parse_address(text: &str, spec: &str) -> ConfigResult<SocketAddr> {
     if let Ok(addr) = text.parse::<SocketAddr>() {
         return Ok(addr);
@@ -177,15 +159,12 @@ fn parse_address(text: &str, spec: &str) -> ConfigResult<SocketAddr> {
     }
 }
 
-/// [`crate::utils::absolute`], owned — this module's callers all keep the
-/// result. One line rather than the three it replaces (`TODO.md` #19c).
+/// [`crate::utils::absolute`], owned: this module's callers all keep the result.
 fn absolute(name: &str) -> String {
     crate::utils::absolute(name).into_owned()
 }
 
-// ---------------------------------------------------------------------------
 // The state sidecar
-// ---------------------------------------------------------------------------
 
 /// What is known about one replicated zone between restarts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,23 +172,17 @@ pub struct TransferState {
     pub zone: String,
     /// The serial of the copy on disk.
     pub serial: Serial,
-    /// When the master last answered, as a Unix timestamp. The EXPIRE clock runs
-    /// from here.
+    /// When the master last answered. The EXPIRE clock runs from here.
     pub refreshed_at: u64,
     pub master: SocketAddr,
 }
 
 /// The sidecar file: one line per replicated zone.
 ///
-/// Kept out of the zone file itself on purpose. BIND leans on the zone file's
-/// mtime for this and pays in imprecision — an unrelated touch resets the
-/// refresh clock, and a copy preserves a timestamp that then describes the wrong
-/// event (this repo has already been bitten by `Copy-Item` doing exactly that).
-/// A line of text says what it means.
-///
-/// Text rather than anything structured because it is a few hundred bytes that a
-/// person may need to read, edit or delete while a server is down, and because
-/// every alternative costs a dependency to store less than a kilobyte.
+/// Not the zone file's mtime, which is what BIND uses: an unrelated touch resets
+/// the refresh clock, and a copy preserves a timestamp describing the wrong
+/// event. Text, because it is a few hundred bytes a person may need to read or
+/// delete while a server is down.
 pub struct StateFile {
     path: PathBuf,
     entries: Vec<TransferState>,
@@ -218,13 +191,10 @@ pub struct StateFile {
 impl StateFile {
     /// Read the sidecar, or start empty.
     ///
-    /// **Never fails.** A missing file means nothing has been fetched yet; an
-    /// unreadable or half-written one means the same thing, because the only
-    /// consequence of forgetting is fetching again. Refusing to start over a
-    /// corrupt cache of something re-obtainable would turn a scratch file into a
-    /// single point of failure. Lines that do not parse are skipped and named on
-    /// stderr rather than silently dropped — a state file going bad is worth
-    /// seeing even though it is survivable.
+    /// Never fails: the only cost of forgetting is fetching again, and refusing
+    /// to start over a corrupt cache of something re-obtainable makes a scratch
+    /// file a single point of failure. Unparseable lines are skipped and logged;
+    /// survivable is not the same as unremarkable.
     pub fn load(path: &Path) -> Self {
         let mut entries = Vec::new();
         if let Ok(text) = std::fs::read_to_string(path) {
@@ -262,11 +232,9 @@ impl StateFile {
 
     /// Record what is now true, and write the file.
     ///
-    /// Written whole and atomically every time rather than appended to: the file
-    /// is small, and a reader must never see a line half-updated.
-    ///
-    /// **The write is the expensive half**, and a caller that holds a lock or
-    /// runs on an async runtime should not do it here — see [`StateFile::set`].
+    /// Written whole and atomically, never appended to: a reader must not see a
+    /// line half-updated. A caller holding a lock or on an async runtime wants
+    /// [`StateFile::set`] instead — the write is the expensive half.
     pub fn record(&mut self, state: TransferState) -> ConfigResult<()> {
         self.set(state);
         let (path, text) = self.snapshot();
@@ -275,14 +243,11 @@ impl StateFile {
 
     /// Update what is known, writing nothing.
     ///
-    /// Split out of [`StateFile::record`] because the write ends in an `fsync`
-    /// of the file *and* of its directory, and `rdnsd` reaches this through an
-    /// `Arc<Mutex<StateFile>>` from an async task. Doing the write here would
-    /// hold a `std::sync::Mutex` across that fsync — which every other
-    /// secondary's refresh loop then spins on rather than yielding — and would
-    /// block a runtime worker that is also answering queries (`CLAUDE.md` §9).
-    /// The caller updates under the guard, takes a [`StateFile::snapshot`],
-    /// drops the guard, and writes.
+    /// The write ends in an fsync of the file *and* its directory, and `rdnsd`
+    /// reaches this through an `Arc<Mutex<StateFile>>` from an async task —
+    /// writing here would hold a `std::sync::Mutex` across that fsync on a
+    /// worker also answering queries. The caller updates under the guard, takes
+    /// a [`StateFile::snapshot`], drops the guard, and writes.
     pub fn set(&mut self, state: TransferState) {
         match self
             .entries
@@ -294,10 +259,8 @@ impl StateFile {
         }
     }
 
-    /// The path and the exact contents [`StateFile::record`] would write.
-    ///
-    /// Owned rather than borrowed, so it can outlive the guard it was taken
-    /// under — which is the entire point of it existing.
+    /// The path and the exact contents [`StateFile::record`] would write, owned
+    /// so they outlive the guard they were taken under.
     pub fn snapshot(&self) -> (PathBuf, String) {
         let mut text = String::from(
             "# rdnsd transfer state: zone serial refreshed-at master\n\
@@ -313,10 +276,8 @@ impl StateFile {
     }
 }
 
-/// Write a snapshot taken by [`StateFile::snapshot`].
-///
-/// Free-standing because by the time this runs the caller has deliberately let
-/// go of the `StateFile` — and of whatever lock it sits behind.
+/// Write a snapshot taken by [`StateFile::snapshot`]. Free-standing because by
+/// now the caller has let go of the `StateFile` and its lock.
 pub fn write_snapshot(path: &Path, text: &str) -> ConfigResult<()> {
     crate::persist::write_atomically_str(path, text)
         .map_err(|e| ConfigError::new(format!("writing {}: {e}", path.display())))
@@ -344,11 +305,9 @@ fn parse_state_line(line: &str) -> ConfigResult<TransferState> {
     })
 }
 
-/// Where a replicated zone's file goes, given the directory zones live in.
-///
-/// The name is the origin, which is how `rdnsd` already decides what a zone file
-/// on disk is a zone *of* — so a fetched zone is loaded by the ordinary path on
-/// the next start, with nothing to tell it apart from one an operator wrote.
+/// Where a replicated zone's file goes. The name is the origin, which is how
+/// `rdnsd` decides what a zone file is a zone *of*, so a fetched zone loads by
+/// the ordinary path on the next start.
 pub fn zone_file_path(dir: &Path, zone: &str) -> PathBuf {
     dir.join(format!("{}zone", absolute(zone)))
 }
@@ -366,10 +325,6 @@ mod tests {
     fn addr(text: &str) -> SocketAddr {
         text.parse().expect("test address")
     }
-
-    // -----------------------------------------------------------------
-    // Master specs
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_master_spec_parses() {
@@ -392,8 +347,7 @@ mod tests {
         );
     }
 
-    /// An IPv6 master has colons of its own, so the bracketed form is the only
-    /// one that can carry a port — and the unbracketed one must still work.
+    /// Only the bracketed form can carry a port; the bare one must still work.
     #[test]
     fn test_master_spec_takes_ipv6() {
         assert_eq!(
@@ -408,9 +362,6 @@ mod tests {
         );
     }
 
-    /// A spec that does not parse stops the server. A secondary silently not
-    /// replicating a zone it was told to replicate is the failure nobody notices
-    /// until the primary is gone.
     #[test]
     fn test_a_malformed_master_spec_is_an_error() {
         for spec in [
@@ -425,10 +376,6 @@ mod tests {
             );
         }
     }
-
-    // -----------------------------------------------------------------
-    // Timers
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_timers_come_from_the_soa() {
@@ -459,8 +406,6 @@ mod tests {
         assert_eq!(RefreshTimers::from_zone(&bare), None);
     }
 
-    /// A zone that says "refresh every 0 seconds" must not become a loop that
-    /// asks its master as fast as the network allows.
     #[test]
     fn test_absurd_timers_are_clamped_rather_than_refused() {
         let timers = RefreshTimers::from_soa(0, -5, 86400);
@@ -492,8 +437,7 @@ mod tests {
         );
     }
 
-    /// The default is what applies before any zone has arrived: ask soon, never
-    /// expire, because there is nothing yet to withdraw.
+    /// Before any zone has arrived: ask soon, never expire.
     #[test]
     fn test_default_timers_cannot_expire() {
         let timers = RefreshTimers::default();
@@ -503,14 +447,6 @@ mod tests {
             Duration::from_secs(DEFAULT_REFRESH_SECS)
         );
     }
-
-    // The serial comparison this module used to own is now `Serial::is_newer_than`
-    // in `lib.rs`, with its tests beside it — there were two implementations of
-    // RFC 1982 §3.2 in this crate and the type is the one copy (`TODO.md` #14a).
-
-    // -----------------------------------------------------------------
-    // The sidecar
-    // -----------------------------------------------------------------
 
     struct ScratchDir(PathBuf);
 
@@ -587,10 +523,8 @@ mod tests {
         );
     }
 
-    /// An expired zone's entry is *kept*, because it is the record of when
-    /// contact was last made — and that is what makes expiry survive a restart.
-    /// Deleting it would read as "never fetched", which means "fetch", which
-    /// means serving the stale copy again until the next failure.
+    /// An expired zone's entry is kept: it records when contact was last made,
+    /// and deleting it reads as "never fetched", which means "fetch and serve".
     #[test]
     fn test_expiry_is_derived_from_the_state_rather_than_stored() {
         let dir = ScratchDir::new("expiry");
@@ -616,9 +550,6 @@ mod tests {
         );
     }
 
-    /// Nothing here is worth failing to start over: the only cost of forgetting
-    /// is a refresh, and refusing to run because a scratch file went bad would
-    /// make it a single point of failure.
     #[test]
     fn test_a_damaged_state_file_degrades_to_knowing_nothing() {
         let dir = ScratchDir::new("damaged");
@@ -651,7 +582,7 @@ mod tests {
             Serial::new(7)
         );
 
-        // And a file that is not there at all is the same thing: fetch.
+        // A file that is not there at all is the same thing: fetch.
         assert!(StateFile::load(&dir.0.join("no-such-file"))
             .entries()
             .is_empty());

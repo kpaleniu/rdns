@@ -3,20 +3,16 @@
 //! The other half of [`crate::dnssec`], which holds the public side and can say
 //! whether a signature is good but cannot make one.
 //!
-//! The key file is ours and does not pretend otherwise. BIND's `.private` body
-//! differs per algorithm (a raw ECDSA scalar, an Ed25519 seed, eight labelled
-//! RSA components) with the public half in a separate `.key`; `ring` wants
-//! PKCS#8, and for ECDSA and Ed25519 the public key with the private one so it
-//! can check they belong together. Reassembling PKCS#8 per algorithm from two
-//! files is a conversion whose failure mode is a key that signs with the wrong
-//! identity. So: PKCS#8 as `ring` hands it over, base64, owner name and flags
-//! beside it, extension `.rdnskey`. `openssl genpkey` output imports as-is.
+//! The key file format is ours: PKCS#8 as `ring` hands it over, base64, with the
+//! owner name and flags beside it, extension `.rdnskey`. BIND's `.private` body
+//! differs per algorithm and keeps the public half in a separate `.key`, and
+//! reassembling PKCS#8 from the two is a conversion whose failure mode is a key
+//! signing with the wrong identity. `openssl genpkey` output imports as-is.
 //!
-//! The owner name and flags live in the file, not in the caller. A key is only
-//! meaningful at a name, and the flags are part of the DNSKEY RDATA and so part
-//! of what the key tag is computed over — decided at the call site, the same key
-//! would have a different tag depending on who loaded it, and every RRSIG naming
-//! that tag would point at a key nobody can find.
+//! The owner and flags live in the file, not in the caller: both feed the key
+//! tag, so deciding them at the call site would give one key different tags
+//! depending on who loaded it, and every RRSIG naming that tag would point at a
+//! key nobody can find.
 
 use crate::dnssec::{
     ds_digest, key_tag, rrsig_labels, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP,
@@ -34,13 +30,10 @@ use std::path::{Path, PathBuf};
 /// The extension a key file carries, and what a key directory is scanned for.
 pub const KEY_FILE_EXTENSION: &str = "rdnskey";
 
-/// An algorithm we can sign with.
-///
-/// Deliberately a subset of what [`crate::dnssec::verify`] accepts. A validator
-/// has to read whatever the internet signed with, including algorithms nobody
-/// should still be choosing; a signer picks, and RFC 8624 §3.1 is the list of
-/// what may be picked. RSA/SHA-1 (5 and 7) is therefore verifiable here and not
-/// signable, which is the asymmetry that table describes.
+/// An algorithm we can sign with — a subset of what [`crate::dnssec::verify`]
+/// accepts. A validator must read whatever the internet signed with; a signer
+/// picks, and RFC 8624 §3.1 is the list of what may be picked. So RSA/SHA-1 (5
+/// and 7) is verifiable and not signable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigningAlgorithm {
     /// 13 — RFC 6605. The default: small keys, small signatures, universally
@@ -68,8 +61,7 @@ impl SigningAlgorithm {
         }
     }
 
-    /// The mnemonic the DNSSEC registry gives it, as it appears in a key file's
-    /// comment and in `--algorithm`.
+    /// The registry mnemonic, as it appears in a key file and in `--algorithm`.
     pub fn name(self) -> &'static str {
         match self {
             SigningAlgorithm::RsaSha256 => "RSASHA256",
@@ -102,8 +94,7 @@ impl SigningAlgorithm {
         })
     }
 
-    /// Accepts either the number or the mnemonic, since both are what people
-    /// have in front of them.
+    /// Either the number or the mnemonic.
     pub fn parse(text: &str) -> Result<Self> {
         if let Ok(code) = text.trim().parse::<u8>() {
             return Self::from_code(code);
@@ -125,8 +116,8 @@ impl SigningAlgorithm {
         })
     }
 
-    /// Whether a key of this algorithm can be created here, as opposed to only
-    /// loaded. `ring` has no RSA key generation, by design.
+    /// Whether a key of this algorithm can be created here rather than only
+    /// loaded. `ring` has no RSA key generation.
     pub fn can_generate(self) -> bool {
         !matches!(
             self,
@@ -135,10 +126,8 @@ impl SigningAlgorithm {
     }
 }
 
-/// The `ring` keypair behind a [`SigningKey`].
-///
-/// All three boxed: an `EcdsaKeyPair` alone is 240 bytes, and a key is held for
-/// the life of the process and reached through one pointer either way.
+/// The `ring` keypair behind a [`SigningKey`]. All three boxed: an
+/// `EcdsaKeyPair` alone is 240 bytes.
 enum Pair {
     Ecdsa(Box<EcdsaKeyPair>),
     Ed25519(Box<Ed25519KeyPair>),
@@ -150,18 +139,16 @@ pub struct SigningKey {
     owner: String,
     flags: u16,
     algorithm: SigningAlgorithm,
-    /// The public half in DNSKEY form — which is not `ring`'s form for either
-    /// ECDSA or RSA, and the conversion is where a signer usually goes wrong.
+    /// The public half in DNSKEY form, which is not `ring`'s form for ECDSA or
+    /// RSA.
     public_key: Vec<u8>,
-    /// The PKCS#8 we were handed or generated, kept so the key can be written
-    /// back out without a second encoding path that might not agree.
+    /// Kept so the key writes back out without a second encoding path.
     pkcs8: Vec<u8>,
     pair: Pair,
 }
 
 impl std::fmt::Debug for SigningKey {
-    /// Hand-written so that a key never reaches a log through a derived
-    /// `Debug`. The private bytes are the whole of the secret.
+    /// Hand-written so the private bytes never reach a log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SigningKey")
             .field("owner", &self.owner)
@@ -232,9 +219,8 @@ impl SigningKey {
                 (Pair::Ecdsa(Box::new(pair)), public)
             }
             SigningAlgorithm::Ed25519 => {
-                // PKCS#8 v2 carries the public key alongside the seed and ring
-                // checks the two agree; v1 (what OpenSSL writes) carries only
-                // the seed, and refusing those would refuse every imported key.
+                // v2 carries the public key beside the seed and ring checks
+                // they agree; v1 — what OpenSSL writes — carries only the seed.
                 let pair = Ed25519KeyPair::from_pkcs8(pkcs8)
                     .or_else(|_| Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8))
                     .map_err(|e| DnssecError::key(format!("reading an Ed25519 key: {e}")))?;
@@ -278,8 +264,8 @@ impl SigningKey {
         self.algorithm
     }
 
-    /// Whether this key is published as a Secure Entry Point — the key a parent's
-    /// DS points at, and by convention the one that signs the DNSKEY RRset.
+    /// Whether this key is a Secure Entry Point: the one a parent's DS points
+    /// at, and by convention the one signing the DNSKEY RRset.
     pub fn is_sep(&self) -> bool {
         self.flags & DNSKEY_FLAG_SEP != 0
     }
@@ -316,13 +302,12 @@ impl SigningKey {
         })
     }
 
-    /// Sign arbitrary bytes. The caller is responsible for those bytes being
-    /// the canonical form — see [`SigningKey::sign_rrset`], which is the way in.
+    /// Sign arbitrary bytes; the caller owes the canonical form. The way in is
+    /// [`SigningKey::sign_rrset`].
     pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
         match &self.pair {
-            // ECDSA signatures in DNSSEC are the fixed-width r||s pair
-            // (RFC 6605 §4), not the ASN.1 sequence ECDSA usually travels as —
-            // which is why the signing algorithm above is the `_FIXED_` one.
+            // DNSSEC wants the fixed-width r||s pair (RFC 6605 §4), not the
+            // ASN.1 sequence — hence the `_FIXED_` signing algorithm above.
             Pair::Ecdsa(pair) => {
                 let rng = SystemRandom::new();
                 Ok(pair
@@ -349,15 +334,13 @@ impl SigningKey {
 
     /// A genuine RRSIG over `rrset`, valid from `inception` until `expiration`.
     ///
-    /// `original_ttl` is the TTL the records are published with — not a TTL a
-    /// cache has counted down, which is the whole reason the field exists
-    /// (RFC 4034 §3.1.3): a validator restores it before hashing, so a signature
-    /// keeps verifying as the records age.
+    /// `original_ttl` is the TTL the records are published with, not one a cache
+    /// counted down: a validator restores it before hashing, so a signature
+    /// keeps verifying as the records age (RFC 4034 §3.1.3).
     ///
-    /// The signer name is this key's owner and cannot be passed in. A signature
-    /// naming some other zone is not a signature over this RRset by any
-    /// validator's reckoning — [`crate::dnssec::verify_rrset`] rejects it before
-    /// looking at the bytes — so there is no call for the flexibility.
+    /// The signer name is this key's owner and cannot be passed in — a signature
+    /// naming another zone is rejected by [`crate::dnssec::verify_rrset`] before
+    /// the bytes are looked at.
     pub fn sign_rrset(
         &self,
         rrset: &Rrset<'_>,
@@ -383,8 +366,8 @@ impl SigningKey {
         Ok(rrsig)
     }
 
-    /// The conventional file name: `K<owner>+<algorithm>+<tag>.rdnskey`, which
-    /// makes a key directory readable without opening anything in it.
+    /// `K<owner>+<algorithm>+<tag>.rdnskey`, so a key directory is readable
+    /// without opening anything in it.
     pub fn file_name(&self) -> String {
         format!(
             "K{}+{:03}+{:05}.{KEY_FILE_EXTENSION}",
@@ -396,11 +379,9 @@ impl SigningKey {
 
     /// The key file's text.
     ///
-    /// The key tag is a comment rather than a field. It is derived from the
-    /// flags and the public key, so as a field it would be a second copy of
-    /// something already here — and the first thing to disagree after somebody
-    /// edits `Flags` by hand during a rollover, turning a legitimate change into
-    /// a load failure.
+    /// The key tag is a comment, not a field: it is derived from the flags and
+    /// the public key, so a field would be a second copy — and the first thing
+    /// to disagree after a hand-edited `Flags` during a rollover.
     pub fn to_key_file(&self) -> String {
         format!(
             "; rdns DNSSEC signing key. Anyone who can read this file can sign {owner}\n\
@@ -451,8 +432,8 @@ impl SigningKey {
                             .map_err(|e| DnssecError::key(format!("the PrivateKey: {e}")))?,
                     )
                 }
-                // Unknown fields are ignored so a file written by a later
-                // version still loads, the same rule the anchor file follows.
+                // Unknown fields ignored so a file from a later version loads,
+                // as the anchor file does.
                 _ => {}
             }
         }
@@ -472,16 +453,12 @@ impl SigningKey {
     /// Write the key into `dir` under [`SigningKey::file_name`], returning the
     /// path.
     ///
-    /// Readable by its owner alone where the platform has a way to say so —
-    /// Windows has no mode bits, so there it is the directory's permissions or
-    /// nothing, and this says so rather than implying a guarantee it cannot
-    /// make.
+    /// Readable by its owner alone where the platform can say so. Windows has no
+    /// mode bits, so there it is the directory's permissions or nothing.
     ///
-    /// The restriction is applied before the file reaches its final name and a
-    /// failure to apply it fails the write; both belong to
-    /// [`crate::persist::write_atomically_private`], where the reasoning is.
-    /// It used to be a `let _ =` on a `set_permissions` *after* the rename,
-    /// which both ignored the failure and left a window at 0644.
+    /// The restriction is applied before the file reaches its final name, and
+    /// failing to apply it fails the write — see
+    /// [`crate::persist::write_atomically_private`].
     pub fn write_to_dir(&self, dir: &Path) -> Result<PathBuf> {
         let path = dir.join(self.file_name());
         crate::persist::write_atomically_private(&path, &self.to_key_file())
@@ -491,10 +468,9 @@ impl SigningKey {
 
     /// Every key file in `dir`.
     ///
-    /// A file that will not parse is an error, never a skip. Quietly dropping a
-    /// key means the zone comes up short a signature — and an RRset signed by
-    /// only some of the keys it should be is exactly what a rollover looks like,
-    /// so nothing downstream would report it either.
+    /// A file that will not parse is an error, never a skip: a dropped key means
+    /// a zone short a signature, which looks exactly like a rollover in
+    /// progress, so nothing downstream reports it either.
     pub fn load_dir(dir: &Path) -> Result<Vec<SigningKey>> {
         let mut keys = Vec::new();
         let entries = std::fs::read_dir(dir).map_err(|e| {
@@ -509,12 +485,9 @@ impl SigningKey {
             if path.extension().and_then(|e| e.to_str()) != Some(KEY_FILE_EXTENSION) {
                 continue;
             }
-            // Checked on the way in, not just set on the way out. A key this
-            // server wrote is 0600, but a key directory restored from backup or
-            // walked by a `chmod -R` is the ordinary way a private key stops
-            // being private, and reading one without complaint is how nobody
-            // ever finds out. This is a zone-signing key: whoever has it can
-            // sign anything in the zone.
+            // Checked on the way in, not only set on the way out: a backup
+            // restore or a `chmod -R` is the ordinary way a private key stops
+            // being private, and whoever can read this can sign the zone.
             crate::persist::ensure_private(&path, "a DNSSEC private key")
                 .map_err(|e| DnssecError::key(e.to_string()))?;
             let text = std::fs::read_to_string(&path)
@@ -523,11 +496,10 @@ impl SigningKey {
                 .map_err(|e| DnssecError::key(format!("in {}: {e}", path.display(),)))?;
             keys.push(key);
         }
-        // A directory listing has no order worth relying on, and the DNSKEY
-        // RRset's order does not matter to a signature (canonical sorting
-        // handles that) — but the *order signatures are generated in* shows up
-        // in a written zone file, and a zone that reshuffles itself on every
-        // reload makes a diff useless.
+        // A directory listing has no reliable order. Canonical sorting makes it
+        // irrelevant to a signature, but the order signatures are *generated*
+        // in shows up in the written zone file, and a zone that reshuffles on
+        // every reload makes a diff useless.
         keys.sort_by_key(|k| (k.owner.clone(), k.algorithm.code(), k.key_tag()));
         Ok(keys)
     }
@@ -536,12 +508,11 @@ impl SigningKey {
 /// The DNSKEY form of an RSA public key (RFC 3110 §2): the exponent's length,
 /// then the exponent, then the modulus.
 ///
-/// `ring` publishes the key as the DER `RSAPublicKey` structure —
-/// `SEQUENCE { modulus INTEGER, publicExponent INTEGER }` — so the two numbers
-/// have to be lifted out and re-laid in the other order. DER integers are
-/// signed, so one whose top bit is set carries a leading zero byte that is
-/// padding rather than part of the number; leaving it in changes the key, and
-/// with it the key tag, so every RRSIG would name a key that is not there.
+/// `ring` publishes DER `RSAPublicKey` — `SEQUENCE { modulus, publicExponent }`
+/// — so the two numbers are lifted out and re-laid in the other order. DER
+/// integers are signed, so one with its top bit set carries a leading zero byte
+/// of padding; leaving it in changes the key tag, and every RRSIG then names a
+/// key that is not there.
 fn rsa_dnskey_public_key(der: &[u8]) -> Result<Vec<u8>> {
     let body = der_expect(der, 0x30)
         .map_err(|e| DnssecError::key(format!("the RSA public key's outer SEQUENCE: {e}")))?;
@@ -699,8 +670,7 @@ mod tests {
     #[test]
     fn a_wildcards_signature_counts_labels_without_the_star() {
         // The label count is what lets one signature cover every name the
-        // wildcard reaches, so getting it wrong here breaks wildcards in a way
-        // that only shows up at a validator.
+        // wildcard reaches; wrong here, wildcards break only at a validator.
         let key = SigningKey::generate(
             SigningAlgorithm::EcdsaP256Sha256,
             "example.com.",
@@ -712,8 +682,7 @@ mod tests {
         let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
         assert_eq!(sig.labels, 2);
 
-        // And the same signature, re-owned onto a name the wildcard expands to,
-        // still verifies — which is the property the count buys.
+        // Re-owned onto a name the wildcard expands to, it still verifies.
         let mut expanded = sig.clone();
         expanded.owner = "anything.example.com.".to_string();
         let expanded_rrset = Rrset::new("anything.example.com.", rt::A, Class::new(1), &rdatas);
@@ -750,9 +719,8 @@ mod tests {
         assert_eq!(back.dnskey().public_key, key.dnskey().public_key);
         assert!(back.is_sep());
 
-        // And it is the same *private* key, not merely one that describes
-        // itself the same way: a signature from the loaded copy verifies under
-        // the original's published key.
+        // The same *private* key, not one that merely describes itself the
+        // same: a signature from the loaded copy verifies under the original.
         let rdatas = vec![a_record("192.0.2.1")];
         let rrset = Rrset::new("example.com.", rt::A, Class::new(1), &rdatas);
         let sig = back.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
@@ -777,9 +745,9 @@ mod tests {
 
     #[test]
     fn a_key_without_the_zone_bit_is_refused() {
-        // RFC 4034 §2.1.1: a DNSKEY without it is not a key for zone data, so a
-        // signature made by one verifies against nothing. Better to fail at the
-        // point the key is loaded than to sign a zone nobody can validate.
+        // RFC 4034 §2.1.1: without it the DNSKEY is not a key for zone data, so
+        // its signatures verify against nothing. Fail at load, not after
+        // signing a zone nobody can validate.
         let err = SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", 0).unwrap_err();
         assert!(err.to_string().contains("Zone Key"), "{err}");
     }
@@ -859,10 +827,9 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(tags, expected);
 
-        // 0600 on purpose: `fs::write` leaves 0644 under the usual umask, and
-        // `load_dir` refuses a world-readable key *before* it parses it — so
-        // without this the assertion below would pass on the permission error
-        // and this test would quietly stop being about a broken key at all.
+        // 0600: `fs::write` leaves 0644, and `load_dir` refuses a world-readable
+        // key *before* parsing it, so the assertion below would pass on the
+        // permission error instead of on the broken key.
         let broken = dir.join("broken.rdnskey");
         std::fs::write(&broken, "Owner: example.com.\n").unwrap();
         restrict(&broken);
@@ -885,17 +852,11 @@ mod tests {
     #[cfg(not(unix))]
     fn restrict(_path: &Path) {}
 
-    /// A private key anybody can read is refused, not loaded with a shrug.
+    /// A private key anybody can read is refused.
     ///
-    /// `--generate-keys` writes 0600, so the way this happens is never the
-    /// server's own doing: a key directory restored from backup as 0644, or a
-    /// `chmod -R` in a deploy script. Whoever can read this file can sign
-    /// anything in the zone, so reading it without complaint is how an operator
-    /// never finds out.
-    ///
-    /// **Unix only, and the check genuinely does not exist on Windows** — there
-    /// are no mode bits to read. Stated here rather than left for someone to
-    /// infer from a green suite on the wrong platform.
+    /// Unix only, and the check genuinely does not exist on Windows — there are
+    /// no mode bits to read. Said here so a green suite on the wrong platform is
+    /// not mistaken for coverage.
     #[cfg(unix)]
     #[test]
     fn a_world_readable_private_key_is_refused_by_the_loader() {

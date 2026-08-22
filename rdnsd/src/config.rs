@@ -1,27 +1,15 @@
-//! `--config`: the same settings as the command line, in a file, plus the two
-//! things a command line cannot express.
+//! `--config`: the same settings as the command line, in a file, plus two things
+//! the flags cannot express.
 //!
-//! `--tsig-key alg:name:SECRET` puts a base64 HMAC secret in `argv`, where
-//! `ps aux` and `/proc/<pid>/cmdline` expose it and shell history keeps it. At
-//! forty zones and six keys the exec line is also a multi-kilobyte undiffable
-//! string maintained by hand.
+//! - A secret in a file of its own, in neither `argv` (where `ps` and shell
+//!   history expose it) nor the main config. `secret-file` refuses one that is
+//!   group- or world-readable on Unix.
+//! - Per-zone settings: one flag each meant one signing policy for every zone.
 //!
-//! Two things the flags cannot express:
-//!
-//! - A secret in a file of its own, in neither `argv` nor the main config.
-//!   `secret-file` reads it and refuses one that is group- or world-readable on
-//!   Unix.
-//! - Per-zone settings. One flag each meant one signing policy, NSEC/NSEC3 choice
-//!   and validity for every zone.
-//!
-//! A file and the flags are mutually exclusive: `--config` with `--port` is an
+//! A file and the flags are mutually exclusive — `--config` with `--port` is an
 //! error, not a precedence rule, because both values are valid and the failure
 //! would be silent. `--check-config`, `--generate-keys` and `--config` itself are
-//! exceptions, being settings of nothing.
-//!
-//! TOML via `toml` and `serde` — nine crates, against the eighty-three deleting
-//! the OpenTelemetry stack removed. A hand-rolled subset parser that misreads a
-//! config is worse than the dependency.
+//! exempt, being settings of nothing.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -161,7 +149,7 @@ pub struct Key {
     pub zones: Vec<String>,
     /// The zones this key may rewrite through dynamic UPDATE (RFC 2136 §3.3).
     ///
-    /// **Empty means none**, which is the opposite of `zones` directly above.
+    /// Empty means none, which is the opposite of `zones` directly above.
     /// The argument is at `rdns::tsig::UpdatePolicy`: a transfer hands over a
     /// copy and an update rewrites the original, and no working deployment can
     /// be broken by denying something nothing has ever served. `["*"]` grants
@@ -234,7 +222,7 @@ impl ZoneSigningOverride {
 /// A zone name as an absolute domain name, which is how everything downstream
 /// keys on it. `[zones."example.com"]` and `[zones."example.com."]` are the same
 /// zone and must not become two.
-/// [`rdns::utils::absolute`], owned. See `TODO.md` #19c.
+/// [`rdns::utils::absolute`], owned.
 fn absolute(zone: &str) -> String {
     rdns::utils::absolute(zone).into_owned()
 }

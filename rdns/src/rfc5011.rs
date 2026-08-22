@@ -1,28 +1,17 @@
-//! Following a trust anchor as it rolls (RFC 5011).
+//! Following a trust anchor as it rolls (RFC 5011), using the zone's own signed
+//! DNSKEY RRset as the announcement channel.
 //!
-//! A trust anchor is a key believed out of band, so every change to one is
-//! normally an out-of-band event — until the key rolls, and the root KSK does.
-//! RFC 5011 makes the roll followable using the zone's own signed DNSKEY RRset as
-//! the announcement channel.
-//!
-//! Two rules carry the safety argument:
-//!
-//! - A new key is trusted only after staying in a validated DNSKEY RRset for 30
-//!   days ([`ADD_HOLD_DOWN`]), so an attacker holding the zone's keys must keep
-//!   the compromise up, and visible, for a month before anyone adopts theirs.
+//! - A new key is trusted only after staying in a validated DNSKEY RRset for
+//!   [`ADD_HOLD_DOWN`].
 //! - A key is revoked only by itself: the REVOKE bit counts only when the DNSKEY
-//!   RRset carrying it is signed by that key (RFC 5011 §2.1). Otherwise whoever
-//!   holds any one of a zone's keys could retire the others.
+//!   RRset carrying it is signed by that key (RFC 5011 §2.1).
 //!
-//! [`ManagedAnchors::observe`] checks no signature — it is handed an RRset the
-//! caller has already validated to a currently-trusted anchor, and feeding it
-//! unvalidated records hands an attacker the anchor set. Same posture as
-//! `NsecCache::insert_validated`.
+//! [`ManagedAnchors::observe`] checks no signature — it must be handed an RRset
+//! the caller already validated to a currently-trusted anchor.
 //!
-//! Key identity is (algorithm, protocol, public key), not the whole record:
-//! revoking changes the flags and therefore the key tag (RFC 5011 §2.1), so a
-//! tracker keyed on tag or RDATA would read a revocation as a new key and start a
-//! hold-down on it.
+//! Key identity is (algorithm, protocol, public key): revoking changes the flags
+//! and therefore the key tag (§2.1), so a tracker keyed on tag or RDATA would
+//! read a revocation as a new key.
 
 use crate::error::{DnssecError, DnssecResult};
 use crate::Class;
@@ -41,14 +30,11 @@ pub const DNSKEY_FLAG_REVOKE: u16 = 0x0080;
 pub const ADD_HOLD_DOWN: u64 = 30 * 86_400;
 
 /// How long a revoked key is remembered before it is forgotten (§2.4.2).
-///
-/// It is already untrusted from the moment the revocation is seen; the wait is
-/// so that a validator which was offline still learns the key was revoked rather
-/// than merely finding it gone.
+/// Untrusted from the moment the revocation is seen; the wait is so a validator
+/// that was offline learns it was revoked rather than merely finding it gone.
 pub const REMOVE_HOLD_DOWN: u64 = 30 * 86_400;
 
-/// The digest algorithm used when turning a tracked key back into a DS for the
-/// validator: SHA-256 (RFC 4509), which every deployed zone supports.
+/// Digest algorithm for turning a tracked key back into a DS: SHA-256 (RFC 4509).
 const DS_DIGEST_SHA256: u8 = 2;
 
 /// Where a key is in its life as a trust anchor (RFC 5011 §4).
@@ -58,12 +44,8 @@ pub enum KeyState {
     AddPend,
     /// Trusted. This is what a validator gets to use.
     Valid,
-    /// Trusted, but absent from the last DNSKEY RRset we saw.
-    ///
-    /// Still an anchor, deliberately: a key vanishing without being revoked is
-    /// far more likely to be a zone publishing badly, or a spoofed answer that
-    /// somehow validated, than a key the operator meant to retire. Retiring one
-    /// has a mechanism, and it is the REVOKE bit.
+    /// Trusted, but absent from the last DNSKEY RRset we saw. Still an anchor:
+    /// retiring a key has a mechanism, and it is the REVOKE bit.
     Missing,
     /// The zone said, in a message signed by this key, to stop trusting it. Not
     /// an anchor, and never again.
@@ -113,8 +95,7 @@ impl TrackedKey {
     }
 }
 
-/// What changed in an [`ManagedAnchors::observe`] — for the log, because a trust
-/// anchor moving is an event an operator wants to have been told about.
+/// What changed in an [`ManagedAnchors::observe`], for the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorChange {
     /// A key we had not seen before is now in its hold-down.
@@ -135,13 +116,9 @@ pub enum AnchorChange {
 
 /// The trust anchors being followed, and their state.
 ///
-/// Holds two kinds of thing, because a validator is bootstrapped with one and
-/// tracks the other. **DS anchors** are what an operator (or the built-in ICANN
-/// anchor) configures: a digest saying "trust whichever key hashes to this".
-/// **Tracked keys** are what RFC 5011 accumulates from watching the zone. A DS
-/// anchor is never modified by the state machine — it was not learned, so it is
-/// not ours to retire — and a key matching one starts out trusted rather than in
-/// a hold-down, since it already *is* an anchor by the operator's decision.
+/// DS anchors are operator-configured and never modified here; tracked keys are
+/// what RFC 5011 accumulates from watching the zone. A key matching a DS anchor
+/// starts Valid rather than in a hold-down.
 #[derive(Debug, Clone, Default)]
 pub struct ManagedAnchors {
     ds: Vec<Ds>,
@@ -184,18 +161,10 @@ impl ManagedAnchors {
 
     /// Everything currently usable as a trust anchor, as DS records — the form
     /// the chain validator already takes.
-    ///
-    /// Converting rather than teaching the validator about DNSKEY anchors is
-    /// deliberate: a DS *is* the statement "a key with this digest is trusted at
-    /// this name", which is exactly what a tracked key means, and it keeps one
-    /// definition of what an anchor is instead of two.
     pub fn trust_anchors(&self) -> crate::dnssec_chain::TrustAnchors {
-        // A revocation outranks a configured DS. The operator wrote down "trust
-        // the key with this digest"; the key itself has since said, with its own
-        // signature, to stop. Leaving the DS in place would mean a static anchor
-        // could never be retired by the mechanism designed to retire it — and
-        // the built-in ICANN root anchor is exactly such a DS, so this is the
-        // case that matters most.
+        // A revocation outranks a configured DS, or a static anchor (the
+        // built-in ICANN root among them) could never be retired by the
+        // mechanism designed to retire it.
         let revoked: Vec<&TrackedKey> = self
             .keys
             .iter()
@@ -232,11 +201,8 @@ impl ManagedAnchors {
 
     /// Whether we still hold any anchor for `zone`.
     ///
-    /// RFC 5011 §5: once the last anchor for a zone is gone, a resolver must not
-    /// bootstrap itself a new one from the zone's own data — that would be
-    /// trusting an unauthenticated key. The zone becomes unvalidatable until
-    /// somebody configures an anchor out of band, which is the correct and
-    /// deliberately painful outcome.
+    /// RFC 5011 §5: with the last anchor gone, a new one is never bootstrapped
+    /// from the zone's own data — it must be configured out of band.
     pub fn has_anchor_for(&self, zone: &str) -> bool {
         let zone = zone.to_ascii_lowercase();
         self.ds
@@ -248,15 +214,12 @@ impl ManagedAnchors {
                 .any(|k| k.state.is_anchor() && k.key.owner.eq_ignore_ascii_case(&zone))
     }
 
-    /// Take in a **validated** DNSKEY RRset for `zone` and move the state machine
+    /// Take in a validated DNSKEY RRset for `zone` and move the state machine
     /// on.
     ///
-    /// `seen` is every DNSKEY in the RRset. `self_signers` is the subset of them
-    /// whose signature over that RRset the caller verified — which is what makes
-    /// a revocation believable, and nothing else here depends on it.
-    ///
-    /// Does nothing at all if we hold no anchor for the zone: with nothing to
-    /// have validated against, there is no basis for any of this.
+    /// `seen` is every DNSKEY in the RRset. `self_signers` is the subset whose
+    /// signature over that RRset the caller verified; only revocation depends on
+    /// it. Does nothing if we hold no anchor for the zone.
     pub fn observe(
         &mut self,
         zone: &str,
@@ -272,15 +235,12 @@ impl ManagedAnchors {
         let in_zone = |owner: &str| owner.eq_ignore_ascii_case(&zone_lc);
 
         // Revocations first: a revoked key must not also be read as "present and
-        // healthy" by the pass below, and a key that revokes itself in the same
-        // RRset it appears in is the ordinary case rather than an odd one.
+        // healthy" by the pass below.
         for key in seen.iter().filter(|k| in_zone(&k.owner)) {
             if key.flags & DNSKEY_FLAG_REVOKE == 0 {
                 continue;
             }
-            // §2.1: only the key itself may revoke it. Anything else is one of
-            // the zone's other keys — or an attacker holding one — retiring an
-            // anchor it does not own.
+            // §2.1: only the key itself may revoke it.
             if !self_signers.iter().any(|signer| same_key(signer, key)) {
                 continue;
             }
@@ -288,16 +248,9 @@ impl ManagedAnchors {
                 if tracked.state != KeyState::Revoked {
                     tracked.state = KeyState::Revoked;
                     tracked.since = now;
-                    // The key is kept in the form it was *published in before*
-                    // the revocation, deliberately. A DS digest covers the flags,
-                    // so a DS anchor only matches the unrevoked form — and the
-                    // whole point of recording this is to be able to say that a
-                    // configured anchor has been retired. The revocation lives in
-                    // the state, which is where it belongs.
-                    // The *tracked* tag, not the revoked key's. Setting REVOKE
-                    // changes the tag, so reporting the one on the wire would
-                    // make a log read as two unrelated keys — one that appeared
-                    // and revoked itself, and one that silently vanished.
+                    // Kept in its pre-revocation form, and reported under the
+                    // tracked tag: a DS digest covers the flags, and setting
+                    // REVOKE changes the tag.
                     changes.push(AnchorChange::Revoked {
                         zone: zone_lc.clone(),
                         key_tag: tracked.key.key_tag(),
@@ -317,9 +270,8 @@ impl ManagedAnchors {
 
             match self.keys.iter_mut().find(|t| same_key(&t.key, key)) {
                 None => {
-                    // A key matching a configured DS anchor is already trusted by
-                    // the operator's decision; there is nothing for a hold-down
-                    // to establish.
+                    // A key matching a configured DS anchor is already trusted;
+                    // a hold-down has nothing to establish.
                     let anchored = self.ds.iter().any(|ds| {
                         ds.owner.eq_ignore_ascii_case(&key.owner)
                             && ds.matches_key(key).unwrap_or(false)
@@ -355,9 +307,8 @@ impl ManagedAnchors {
                             key_tag: key.key_tag(),
                         });
                     }
-                    // Still waiting: `since` is deliberately *not* refreshed, or
-                    // the hold-down would restart with every observation and
-                    // never elapse.
+                    // `since` is not refreshed, or the hold-down would restart
+                    // with every observation and never elapse.
                     KeyState::AddPend => {}
                     KeyState::Missing => {
                         tracked.state = KeyState::Valid;
@@ -368,9 +319,8 @@ impl ManagedAnchors {
                         });
                     }
                     KeyState::Valid => {}
-                    // A revoked key reappearing unrevoked is either a zone that
-                    // has made a serious mistake or an attacker trying to undo a
-                    // revocation. §2.1 is unambiguous: never again.
+                    // §2.1: a revocation cannot be taken back, however the key
+                    // is republished.
                     KeyState::Revoked => {}
                 },
             }
@@ -383,8 +333,7 @@ impl ManagedAnchors {
                 continue;
             }
             match tracked.state {
-                // Never completed its hold-down and is gone again: it was never
-                // an anchor, so nothing is lost by dropping it.
+                // Never completed its hold-down, so it was never an anchor.
                 KeyState::AddPend => {
                     forgotten.push(tracked.key.clone());
                     changes.push(AnchorChange::Withdrawn {
@@ -418,10 +367,6 @@ impl ManagedAnchors {
         changes
     }
 
-    // -----------------------------------------------------------------
-    // The file
-    // -----------------------------------------------------------------
-
     /// Parse a managed anchor file.
     ///
     /// Lines are DS or DNSKEY records in presentation format, with the state
@@ -432,28 +377,20 @@ impl ManagedAnchors {
     /// . 172800 IN DNSKEY 257 3 8 AwEAA...  ;;state=VALID ;;since=1700000000
     /// ```
     ///
-    /// A DNSKEY line with no annotation is read as **VALID from now** — that is
-    /// an operator writing down a key they have decided to trust, and making
-    /// them add bookkeeping fields by hand to be believed would be a trap.
-    ///
-    /// A line that does not parse is an error rather than a skip, as it is for
-    /// the static anchor file: a typo must stop the resolver rather than quietly
-    /// leave it trusting less, or differently, than intended.
+    /// A DNSKEY line with no annotation is read as VALID from now: an operator
+    /// wrote down a key they trust. A line that does not parse is an error, not
+    /// a skip.
     pub fn parse(text: &str, now: u64) -> DnssecResult<Self> {
         let mut ds = Vec::new();
         let mut keys = Vec::new();
 
         for (number, raw) in text.lines().enumerate() {
             let line = raw.trim();
-            // A whole-line comment first, and only then the split — otherwise a
-            // comment that happens to contain `;;` (this file's own header does)
-            // is read as a record with annotations after it.
+            // Whole-line comments first: this file's own header contains `;;`
+            // and would otherwise parse as a record with annotations.
             if line.starts_with(';') || line.starts_with('#') {
                 continue;
             }
-            // Everything up to the first `;` is the record; the rest may carry
-            // `;;name=value` annotations, and an ordinary trailing comment simply
-            // has none for `parse_annotations` to find.
             let (record, annotations) = match line.find(';') {
                 Some(at) => (&line[..at], &line[at..]),
                 None => (line, ""),
@@ -488,9 +425,8 @@ impl ManagedAnchors {
 
     /// The file's contents, ready to be written.
     pub fn format(&self) -> String {
-        // Deliberately ASCII: this is a file an operator opens in whatever editor
-        // is to hand, and a Windows one reading UTF-8 as the ANSI codepage turns
-        // a stray em-dash into mojibake in the first thing they see.
+        // ASCII only: an editor reading UTF-8 as the ANSI codepage turns a
+        // stray em-dash into mojibake.
         let mut out = String::from(
             "; Managed DNSSEC trust anchors (RFC 5011). Written by rdnsr.\n\
              ; An edit here is honoured. A DNSKEY line without a ;;state=\n\
@@ -523,13 +459,8 @@ impl ManagedAnchors {
     }
 
     /// Read the file, or start from the configured DS anchors if it is not there
-    /// yet.
-    ///
-    /// Unlike the transfer sidecar, a *corrupt* file here is fatal rather than
-    /// something to shrug off. Forgetting a zone's serial costs a refresh;
-    /// forgetting a trust anchor's state means either failing to validate the
-    /// internet or restarting a hold-down that had nearly elapsed, and neither is
-    /// something to do silently.
+    /// yet. A corrupt file is fatal: losing anchor state means either failing to
+    /// validate anything or restarting a hold-down that had nearly elapsed.
     pub fn load_or_seed(
         path: &Path,
         seed: &crate::dnssec_chain::TrustAnchors,
@@ -552,35 +483,19 @@ impl ManagedAnchors {
     }
 }
 
-/// Whether a published key is one that could ever become a trust anchor.
+/// Whether a published key could ever become a trust anchor: a zone key
+/// (RFC 4034 §2.1.1), and a secure entry point.
 ///
-/// Two requirements, and the second is a deliberate narrowing found by running
-/// this against the real root zone.
-///
-/// **A zone key**, because a key that may not sign RRsets can never anchor
-/// anything (RFC 4034 §2.1.1).
-///
-/// **A secure entry point.** Tracking every key in the RRset is the literal
-/// reading of RFC 5011 §4, and against the root it means tracking the ZSK — a key
-/// nobody will ever point a DS at. The root rolls its ZSK quarterly and retires
-/// each one by simply dropping it, never by revoking it, and a key that vanishes
-/// without a revocation stays trusted by design. So the literal reading
-/// accumulates a stale trust anchor every three months, for ever. SEP is formally
-/// only a hint (§2.1.1), so this does mean a zone rolling to a KSK that forgot to
-/// set it would not be followed — an unusual mistake, visible in the log as
-/// nothing happening, and with `--trust-anchor` as the way out. Growing the
-/// trusted set without bound is the worse failure, because nothing makes it
-/// visible at all.
+/// A narrowing of RFC 5011 §4's literal "track every key": a vanished key stays
+/// trusted, so tracking ZSKs accumulates a stale anchor per roll. SEP is only a
+/// hint (RFC 4034 §2.1.1), so a KSK without it needs `--trust-anchor`.
 pub fn is_candidate_anchor(key: &Dnskey) -> bool {
     key.is_zone_key() && key.is_sep()
 }
 
-/// Whether two DNSKEYs are the same key.
-///
-/// Flags are deliberately not compared: revoking a key sets a flag bit and so
-/// changes its key tag too (RFC 5011 §2.1). Comparing whole records would make a
-/// revocation look like the arrival of an unrelated key, and start a hold-down on
-/// the very key that was being retired.
+/// Whether two DNSKEYs are the same key. Flags are not compared: revoking sets a
+/// flag bit and changes the key tag (RFC 5011 §2.1), so comparing whole records
+/// would read a revocation as the arrival of an unrelated key.
 pub fn same_key(a: &Dnskey, b: &Dnskey) -> bool {
     a.algorithm == b.algorithm
         && a.protocol == b.protocol
@@ -590,9 +505,8 @@ pub fn same_key(a: &Dnskey, b: &Dnskey) -> bool {
 
 /// Which of `keys` actually signed this DNSKEY RRset.
 ///
-/// The check a revocation rests on. Each candidate is verified *alone* against
-/// the RRSIGs, so "some key signed it" can never be mistaken for "this key signed
-/// it" — which is the whole distinction RFC 5011 §2.1 draws.
+/// Each candidate is verified *alone*, so "some key signed it" cannot be
+/// mistaken for "this key signed it" — what RFC 5011 §2.1 rests a revocation on.
 pub fn self_signers(zone: &str, records: &[ResourceRecord], now: u64) -> Vec<Dnskey> {
     let keys: Vec<Dnskey> = records.iter().filter_map(Dnskey::from_record).collect();
     let rrsigs: Vec<crate::dnssec::Rrsig> = records
@@ -629,10 +543,8 @@ pub fn self_signers(zone: &str, records: &[ResourceRecord], now: u64) -> Vec<Dns
 /// How long to wait before asking for the DNSKEY RRset again (RFC 5011 §2.3).
 ///
 /// `MAX(1 hour, MIN(15 days, ½ × the RRset's original TTL, ½ × the time left on
-/// its signature))`. The shape matters more than the numbers: it is bounded below
-/// so a zone publishing a tiny TTL cannot turn a validator into a query flood,
-/// and bounded above so a zone publishing a huge one cannot make a validator miss
-/// a roll it was told about.
+/// its signature))`. Bounded below so a tiny TTL cannot make a validator flood,
+/// above so a huge one cannot make it miss a roll.
 pub fn query_interval(original_ttl: u32, signature_remaining: u64) -> u64 {
     const HOUR: u64 = 3_600;
     const FIFTEEN_DAYS: u64 = 15 * 86_400;
@@ -642,7 +554,7 @@ pub fn query_interval(original_ttl: u32, signature_remaining: u64) -> u64 {
 }
 
 /// How long to wait after a failed probe (§2.3): the same shape, an order of
-/// magnitude smaller, so a transient failure is retried without hammering.
+/// magnitude smaller.
 pub fn retry_interval(original_ttl: u32, signature_remaining: u64) -> u64 {
     const HOUR: u64 = 3_600;
     const DAY: u64 = 86_400;
@@ -650,10 +562,6 @@ pub fn retry_interval(original_ttl: u32, signature_remaining: u64) -> u64 {
     let tenth_signature = signature_remaining / 10;
     HOUR.max(DAY.min(tenth_ttl).min(tenth_signature))
 }
-
-// ---------------------------------------------------------------------------
-// Line parsing
-// ---------------------------------------------------------------------------
 
 enum AnchorLine {
     Ds(Ds),
@@ -783,14 +691,12 @@ fn base64(bytes: &[u8]) -> String {
     base64::Engine::encode(&base64::prelude::BASE64_STANDARD, bytes)
 }
 
-/// [`crate::utils::absolute`], owned — this module's callers all keep the
-/// result. One line rather than the three it replaces (`TODO.md` #19c).
+/// [`crate::utils::absolute`], owned — this module's callers all keep the result.
 fn absolute(name: &str) -> String {
     crate::utils::absolute(name).into_owned()
 }
 
-/// A DNSKEY as a resource record, for building test RRsets and for anything that
-/// needs to put a tracked key back on the wire.
+/// A DNSKEY as a resource record.
 pub fn key_record(key: &Dnskey, ttl: Ttl) -> Option<ResourceRecord> {
     let rdata = RecordData::from_parsed(&ParsedRecord::DNSKEY {
         flags: key.flags,
@@ -820,8 +726,7 @@ mod tests {
             flags,
             protocol: 3,
             algorithm: 8,
-            // Distinct material per key, so the tags differ and `same_key` has
-            // something real to compare.
+            // Distinct material per key, so the tags differ.
             public_key: vec![tagseed; 64],
         }
     }
@@ -844,12 +749,7 @@ mod tests {
         ManagedAnchors::new(vec![ds], Vec::new())
     }
 
-    // -----------------------------------------------------------------
-    // Adding a key
-    // -----------------------------------------------------------------
-
-    /// The hold-down is the whole security argument: a new key is not trusted
-    /// because it appeared, it is trusted because it stayed.
+    /// A new key is trusted because it stayed, not because it appeared.
     #[test]
     fn test_a_new_key_is_not_trusted_until_the_hold_down_elapses() {
         let existing = zone_key(1);
@@ -857,8 +757,8 @@ mod tests {
         let mut anchors = anchored_on(&existing);
         let t0 = 1_700_000_000;
 
-        // Both keys published. The existing one is anchored by DS, so it is
-        // trusted at once; the new one starts its hold-down.
+        // The existing key is anchored by DS and trusted at once; the new one
+        // starts its hold-down.
         let changes = anchors.observe(".", &[existing.clone(), fresh.clone()], &[], t0);
         assert!(changes.contains(&AnchorChange::Trusted {
             zone: ".".to_string(),
@@ -907,8 +807,7 @@ mod tests {
     }
 
     /// The hold-down must not restart every time we look, or it never elapses
-    /// and the key is never adopted — a failure that would only show up 30 days
-    /// after a roll, in production.
+    /// and the key is never adopted.
     #[test]
     fn test_the_hold_down_is_not_restarted_by_being_observed() {
         let existing = zone_key(1);
@@ -917,8 +816,7 @@ mod tests {
         let t0 = 1_700_000_000;
 
         anchors.observe(".", &[existing.clone(), fresh.clone()], &[], t0);
-        // Probed daily, as a resolver would. Day 30 is the first observation at
-        // or past the hold-down; every one before it must leave the clock alone.
+        // Day 30 is the first observation at or past the hold-down.
         for day in 1..30 {
             anchors.observe(".", &[existing.clone(), fresh.clone()], &[], t0 + day * DAY);
             assert_eq!(
@@ -931,8 +829,8 @@ mod tests {
         assert_eq!(state_of(&anchors, &fresh), Some(KeyState::Valid));
     }
 
-    /// A key that vanishes mid-hold-down was never an anchor, so it is simply
-    /// forgotten — and a later reappearance starts the clock again.
+    /// A key that vanishes mid-hold-down was never an anchor; a later
+    /// reappearance starts the clock again.
     #[test]
     fn test_a_key_withdrawn_during_its_hold_down_is_forgotten() {
         let existing = zone_key(1);
@@ -948,7 +846,7 @@ mod tests {
         }));
         assert_eq!(state_of(&anchors, &fresh), None);
 
-        // It comes back; the hold-down starts over rather than resuming.
+        // Back again: the hold-down starts over rather than resuming.
         anchors.observe(".", &[existing.clone(), fresh.clone()], &[], t0 + 2 * DAY);
         assert_eq!(state_of(&anchors, &fresh), Some(KeyState::AddPend));
         anchors.observe(
@@ -963,10 +861,6 @@ mod tests {
             "the clock restarted from the second sighting"
         );
     }
-
-    // -----------------------------------------------------------------
-    // Revocation
-    // -----------------------------------------------------------------
 
     /// A key revokes itself, and only itself.
     #[test]
@@ -992,8 +886,7 @@ mod tests {
         );
         assert!(changes.contains(&AnchorChange::Revoked {
             zone: ".".to_string(),
-            // The stable tag, not the one the REVOKE bit produces: a key that
-            // changed identifier as it retired would be two keys in a log.
+            // The stable tag, not the one the REVOKE bit produces.
             key_tag: old.key_tag()
         }));
         assert_eq!(state_of(&anchors, &old), Some(KeyState::Revoked));
@@ -1015,8 +908,8 @@ mod tests {
         );
     }
 
-    /// The signature requirement is the whole of §2.1: without it, whoever holds
-    /// any one of a zone's keys could retire the others.
+    /// §2.1: without the signature requirement, whoever holds any one of a
+    /// zone's keys could retire the others.
     #[test]
     fn test_a_revocation_signed_by_another_key_is_ignored() {
         let old = zone_key(1);
@@ -1045,8 +938,8 @@ mod tests {
         assert_eq!(state_of(&anchors, &old), Some(KeyState::Valid));
     }
 
-    /// A revoked key is remembered for the remove hold-down and then forgotten —
-    /// and never comes back, however it is republished.
+    /// A revoked key is remembered for the remove hold-down, then forgotten, and
+    /// never comes back however it is republished.
     #[test]
     fn test_a_revoked_key_is_forgotten_after_the_hold_down_and_never_returns() {
         let old = zone_key(1);
@@ -1106,7 +999,7 @@ mod tests {
     }
 
     /// Revoking changes the flags and therefore the key tag, so identity cannot
-    /// be either of those. This is the test that pins why `same_key` exists.
+    /// be either of those.
     #[test]
     fn test_revoking_changes_the_key_tag_but_not_the_key() {
         let k = zone_key(1);
@@ -1118,12 +1011,7 @@ mod tests {
         assert!(!same_key(&k, &zone_key(2)));
     }
 
-    // -----------------------------------------------------------------
-    // Absence, and the refusal to bootstrap
-    // -----------------------------------------------------------------
-
-    /// A trusted key that simply vanishes stays an anchor. Retiring one has a
-    /// mechanism, and it is not "stopped appearing".
+    /// A trusted key that simply vanishes stays an anchor.
     #[test]
     fn test_a_missing_key_is_still_an_anchor() {
         let old = zone_key(1);
@@ -1167,8 +1055,7 @@ mod tests {
     }
 
     /// RFC 5011 §5: with no anchor for a zone there is nothing to have validated
-    /// against, so nothing observed about it can be believed. A resolver that
-    /// bootstrapped itself here would be trusting whatever answered.
+    /// against, so nothing observed about it can be believed.
     #[test]
     fn test_nothing_is_learned_about_a_zone_we_have_no_anchor_for() {
         let mut anchors = ManagedAnchors::default();
@@ -1179,13 +1066,6 @@ mod tests {
     }
 
     /// Only a zone key that is also a secure entry point is a candidate.
-    ///
-    /// The ZSK half of this was found by pointing the resolver at the real root:
-    /// it tracked key 57780, the root's ZSK, as a future trust anchor. Nobody
-    /// will ever publish a DS for a ZSK, and the root replaces its ZSK quarterly
-    /// by dropping it rather than revoking it — and a key that merely disappears
-    /// stays trusted. Left alone, that is one more permanently trusted key every
-    /// three months.
     #[test]
     fn test_only_secure_entry_points_are_tracked() {
         let anchor = zone_key(1);
@@ -1229,10 +1109,6 @@ mod tests {
         assert_eq!(state_of(&anchors, &elsewhere), None);
     }
 
-    // -----------------------------------------------------------------
-    // The file
-    // -----------------------------------------------------------------
-
     #[test]
     fn test_the_file_round_trips() {
         let old = zone_key(1);
@@ -1259,8 +1135,7 @@ mod tests {
         }
     }
 
-    /// A key an operator wrote down by hand, with no bookkeeping, is one they
-    /// have decided to trust. Requiring annotations would be a trap.
+    /// A key an operator wrote down by hand is one they have decided to trust.
     #[test]
     fn test_a_hand_written_key_is_trusted_as_written() {
         let text = format!(
@@ -1273,8 +1148,7 @@ mod tests {
         assert_eq!(anchors.keys()[0].since, 4_242, "the clock starts now");
     }
 
-    /// A DS line is a configured anchor and is left alone by the state machine —
-    /// it was not learned, so it is not ours to retire.
+    /// A DS line was configured, not learned, so the state machine leaves it be.
     #[test]
     fn test_ds_anchors_are_read_and_never_modified() {
         let anchor = zone_key(1);
@@ -1295,9 +1169,8 @@ mod tests {
         assert!(anchors.has_anchor_for("."));
     }
 
-    /// Fatal rather than shrugged off, unlike the transfer sidecar: forgetting a
-    /// serial costs a refresh, forgetting anchor state costs either the internet
-    /// or a hold-down that had nearly elapsed.
+    /// Fatal, not shrugged off: losing anchor state means validating nothing, or
+    /// restarting a hold-down that had nearly elapsed.
     #[test]
     fn test_a_damaged_file_is_an_error() {
         assert!(ManagedAnchors::parse(". IN DS nonsense\n", 1).is_err());
@@ -1349,10 +1222,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -----------------------------------------------------------------
-    // Timers
-    // -----------------------------------------------------------------
-
     #[test]
     fn test_query_interval_is_bounded_at_both_ends() {
         // An hour at least, whatever the zone says.
@@ -1375,16 +1244,9 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Against real signatures
-    // -----------------------------------------------------------------
-    //
-    // Everything above drives the state machine with keys that were never used
-    // to sign anything, which is the right way to test *timing* and the wrong
-    // way to test the one rule that rests on cryptography: that a key revokes
-    // only itself. The DNSSEC work in this repo was written that way throughout
-    // and did not work when a genuine signature first reached it, so the roll is
-    // also played out here with keys that really sign.
+    // The tests above drive the state machine with keys that never signed
+    // anything, which cannot exercise the one rule resting on cryptography: a
+    // key revokes only itself. Below, the roll is played out with real keys.
 
     use crate::dnssec_test_util::{rrsig_record, TestKey};
 
@@ -1480,11 +1342,8 @@ mod tests {
         assert_eq!(state_of(&anchors, &old_key), Some(KeyState::Revoked));
         assert_eq!(state_of(&anchors, &new_key), Some(KeyState::Valid));
 
-        // And the roll is complete: the successor is the anchor, and the
-        // *configured DS* for the retired key is gone with it. That last part is
-        // the one worth pinning — a static anchor that could not be retired by
-        // the mechanism designed to retire it would leave the resolver trusting
-        // a key its owner has publicly withdrawn.
+        // The successor is the anchor, and the *configured DS* for the retired
+        // key is gone with it: a static anchor must be retirable by revocation.
         let in_force = anchors.trust_anchors();
         assert!(
             in_force
@@ -1503,9 +1362,8 @@ mod tests {
         );
     }
 
-    /// The signature check is not decoration: a revocation signed by the zone's
-    /// *other* key must not retire an anchor. Same shape as the unit test above,
-    /// but with signatures that really are and really are not the key's own.
+    /// A revocation signed by the zone's *other* key must not retire an anchor,
+    /// with real signatures this time.
     #[test]
     fn test_a_forged_revocation_does_not_retire_a_key_with_real_signatures() {
         let old = TestKey::generate_p256();

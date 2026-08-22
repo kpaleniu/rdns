@@ -1,13 +1,11 @@
 //! The control channel's protocol: one line in, a status line and a body out.
 //!
-//! Only the protocol lives here. The commands and the accept loop are `rdnsd`'s;
-//! this is what both ends have to agree on, shared so the daemon and `rdnsctl`
-//! cannot drift about what a reply means (`CLAUDE.md` §7).
+//! Only the protocol. The commands and the accept loop are `rdnsd`'s; this is
+//! what both ends must agree on, so the daemon and `rdnsctl` cannot drift.
 //!
 //! A Unix socket with filesystem permissions, as `knotc`, `pdns_control` and
-//! `unbound-control` use. The two that use TCP put something in front of it —
-//! `rndc` an HMAC, `nsd-control` a client certificate — which is the argument
-//! against bolting `reload` onto the metrics endpoint as an uncredentialed POST.
+//! `unbound-control` use — authorization by file mode, so nothing here
+//! authenticates.
 //!
 //! Text, one command per connection, terminated by the close, so
 //! `printf 'status\n' | socat - UNIX-CONNECT:/run/rdns/rdnsd.sock` is a working
@@ -31,19 +29,14 @@ pub const OK: &str = "+OK";
 /// The first line of a reply that did not, followed by why.
 pub const ERR: &str = "-ERR";
 
-/// Longest request we will read before giving up on the sender.
-///
-/// A command and a zone name; a name is at most 255 bytes on the wire and more
-/// than that in presentation form, so this is generous by a wide margin and
-/// still bounds what one connection can make us buffer.
+/// Longest request read before giving up on the sender. A command and a zone
+/// name need far less; this bounds what one connection can make us buffer.
 pub const MAX_REQUEST: usize = 4096;
 
 /// One request: a command and its arguments, whitespace-separated.
 ///
-/// Deliberately not a parser with quoting rules. The arguments this protocol
-/// carries are zone names, and a DNS name cannot contain a space that is not
-/// escaped — so a syntax for spaces would be a syntax nothing needs and one
-/// more thing for the two ends to disagree about.
+/// No quoting rules. The arguments are zone names, and a DNS name cannot carry
+/// an unescaped space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub command: String,
@@ -97,18 +90,15 @@ pub fn ok(body: &str) -> String {
 /// A refusal, with the reason on the status line where a client can print it
 /// without having to guess how much of the body is the error.
 pub fn err(why: &str) -> String {
-    // Newlines in `why` would make the rest of it look like a body, so they are
-    // flattened rather than trusted. The reason text comes from an io::Error or
-    // a zone name often enough that "it will not contain one" is not a claim
-    // worth making.
+    // A newline in `why` would make the rest of it look like a body. The text
+    // comes from an io::Error or a zone name, so it can contain one.
     format!("{ERR} {}\n", why.replace('\n', "; "))
 }
 
 /// What the client makes of the bytes it read.
 ///
-/// A reply with no recognizable status line is an error rather than a body:
-/// something that is not this server is on the other end of the socket, and
-/// printing its output as though it were a zone would be worse than saying so.
+/// No recognizable status line is an error, not a body: something other than
+/// this server is on the socket, and printing its output as a zone is worse.
 pub fn parse_reply(text: &str) -> Reply {
     let (first, rest) = match text.split_once('\n') {
         Some((first, rest)) => (first.trim_end_matches('\r'), rest),
@@ -168,17 +158,14 @@ mod tests {
         );
     }
 
-    /// The body is handed back whole, including a trailing newline the daemon
-    /// added, because a zone dump is compared byte for byte by whoever asked
-    /// for it.
+    /// The body is handed back whole: a zone dump is compared byte for byte.
     #[test]
     fn a_body_without_a_trailing_newline_gets_one_and_keeps_its_shape() {
         assert_eq!(ok("one line"), "+OK\none line\n");
         assert_eq!(ok("two\nlines\n"), "+OK\ntwo\nlines\n");
     }
 
-    /// A multi-line reason would put the rest of itself where a body goes, and
-    /// the client would print half an error as though it were output.
+    /// A multi-line reason would put its tail where a body goes.
     #[test]
     fn a_reason_with_a_newline_in_it_stays_on_one_line() {
         let reply = err("could not open the file\nbecause it is not there");

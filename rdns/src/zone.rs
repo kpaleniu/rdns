@@ -24,25 +24,14 @@ pub struct ZoneRecord {
 
 /// In-memory DNS zone storage.
 ///
-/// Records are held in one vector and reached through an index built as they are
-/// added: the absolute, down-cased owner name to the positions of the records at
-/// it. Without it, answering a query means filtering the whole vector and
-/// normalizing *both* names into fresh `String`s for every record touched — two
-/// allocations per record per query, which on a 10k-record zone measured 4.4 ms
-/// and 20k allocations for a single lookup.
+/// Records live in one vector, reached through an index keyed by owner name
+/// only. Keying on (name, type) would answer "which records of this type are
+/// here" but not "does this name exist at all" — the question that tells
+/// NXDOMAIN from NODATA — without probing 65535 types.
 ///
-/// Keying on the name rather than on (name, type) is deliberate. A server needs
-/// two questions answered, and the second one is what tells NXDOMAIN from
-/// NODATA: "which records of this type are at this name", and "does this name
-/// exist at all". A (name, type) map answers the first and cannot answer the
-/// second without probing 65535 types, whereas the records at one name are a
-/// handful, so selecting a type from them costs nothing measurable. It is also
-/// how NSD and Knot store a zone — a node per name, holding its RRsets.
-///
-/// `origin` and `records` are private because the index is derived from both: a
-/// record appended behind its back, or an origin changed without a rebuild,
-/// leaves the zone answering NXDOMAIN for data it holds. That bug has already
-/// happened here once, before there was an index to get wrong.
+/// `origin` and `records` are private because the index is derived from both:
+/// a record appended behind its back leaves the zone answering NXDOMAIN for
+/// data it holds.
 #[derive(Debug, Clone)]
 pub struct Zone {
     origin: String,
@@ -50,55 +39,28 @@ pub struct Zone {
     /// Positions in `records`, by [`Zone::lookup_key`] of the owner name.
     index: HashMap<NameKeyBuf, Vec<usize>>,
     /// The NSEC chain, keyed by canonical sort order, and the NSEC3 chain,
-    /// keyed by hash — both empty for the unsigned zones that are most of them.
+    /// keyed by hash — both empty for an unsigned zone.
     ///
-    /// Ordered, where the name index is not, because the question a denial asks
-    /// is a range one: "which record's span contains this name". A hash map
-    /// cannot answer that without looking at every entry, and answering it by
-    /// scanning the zone would put an O(records) walk on the negative-answer
-    /// path — the same mistake the name index exists to have fixed.
+    /// Ordered, where the name index is not, because a denial asks a range
+    /// question: which record's span contains this name.
     nsec_chain: BTreeMap<Vec<u8>, usize>,
     nsec3_chain: BTreeMap<Vec<u8>, usize>,
-    /// Whether any record in this zone is owned by a wildcard name.
-    ///
-    /// **A cache of "is the closest-encloser walk allowed to synthesize", and it
-    /// pays for itself on the path that never synthesizes.** Once
-    /// [`Zone::name_kind_of_key`] has found the closest encloser, both remaining
-    /// branches — a delegation between here and the apex, or no `*` below the
-    /// encloser — end in [`NameKind::NotFound`]. So for a zone holding no
-    /// wildcard at all, that whole tail is `NotFound` and everything it does to
-    /// get there is dead work.
-    ///
-    /// Measured with `examples/zone_lookup_probe.rs` under callgrind before this
-    /// existed: on a miss in a 10k-record zone with no wildcards, the
-    /// `format!("*.{encloser}")` alone was **16.3%** of the lookup and
-    /// `delegation_for_key` a further **6.5%**, plus one of the three SipHash
-    /// invocations. `TODO.md` #11 has the numbers.
-    ///
-    /// It is a `bool` rather than a count because nothing needs to know how
-    /// many: the question is only whether synthesis is possible at all, and a
-    /// count would have to be maintained on a removal path `Zone` deliberately
-    /// does not have.
+    /// Whether any record is owned by a wildcard name: false lets
+    /// [`Zone::name_kind_of_key`] answer [`NameKind::NotFound`] without the
+    /// rest of the closest-encloser tail, which has that one outcome anyway.
+    /// 23% of a miss in a 10k-record zone with no wildcards.
     has_wildcards: bool,
-    /// Every ancestor, up to the apex, of a name that is in `index` — the names
-    /// that exist because something below them does.
-    ///
-    /// `index` cannot answer this: a zone holding only `deep.a.b.example.com.`
-    /// has records at one name and *four* names that exist. RFC 4592 §2.2.2
-    /// says so, and the difference is NODATA against NXDOMAIN for `a.b` and
-    /// `b` — which an RFC 8020 resolver then extends downwards, taking the
-    /// zone's own data off the internet. Kept as its own set rather than folded
-    /// into `index` because the denial path needs the literal question too, and
-    /// [`Zone::holds_name`] is where that lives.
+    /// Every ancestor, up to the apex, of a name in `index` — the names that
+    /// exist because something below them does (RFC 4592 §2.2.2), which is
+    /// NODATA rather than NXDOMAIN. Kept apart from `index` because
+    /// [`Zone::holds_name`] needs the literal question too.
     non_terminals: HashSet<NameKeyBuf>,
 }
 
-/// Why a name has an answer in this zone, or has none — the distinction
-/// RFC 1034 §4.3.2 and RFC 2308 both turn on.
+/// Why a name has an answer in this zone, or has none (RFC 1034 §4.3.2).
 ///
-/// Three of these are "the name exists" and only one is NXDOMAIN, which is the
-/// whole reason it is an enum rather than a bool: an empty non-terminal and a
-/// wildcard match are NODATA, and each owes a *different* DNSSEC proof (see
+/// Not a bool: three of the four are "the name exists", and an empty
+/// non-terminal and a wildcard match each owe a *different* DNSSEC proof (see
 /// [`crate::dnssec_answer::negative_proof`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameKind {
@@ -146,12 +108,9 @@ impl Zone {
 
     /// Move the zone's apex, as a top-level `$ORIGIN` does.
     ///
-    /// The index keys are absolute names, so any record still held under a
-    /// *relative* name has to be re-keyed — that is what the rebuild is for.
-    /// Records the zone parser added are already absolute (it resolves each owner
-    /// name against the origin in force at its line, which is what makes
-    /// `$ORIGIN` apply to the lines below it), so this only moves records added
-    /// through [`Zone::add_record`] with a relative name.
+    /// Index keys are absolute, so a record held under a *relative* name has to
+    /// be re-keyed; the parser's records are already absolute, so only names
+    /// added relative through [`Zone::add_record`] move.
     pub fn set_origin(&mut self, origin: &str) {
         self.origin = absolute(origin);
         self.reindex();
@@ -159,8 +118,8 @@ impl Zone {
 
     /// Add a record to the zone
     pub fn add_record(&mut self, record: ZoneRecord) {
-        // Owned here and not borrowed: the key is about to become an index entry
-        // and the two statements after this one need `&mut self`.
+        // Owned: the key becomes an index entry, and the statements below need
+        // `&mut self`.
         let key = self.lookup_key(&record.name).into_owned();
         let position = self.records.len();
         self.has_wildcards |= key.starts_with("*.");
@@ -183,11 +142,10 @@ impl Zone {
 
     /// Whether the zone holds records at exactly this name — no wildcard.
     ///
-    /// [`Zone::name_exists`] answers a different question, the one a query
-    /// needs: it says yes for a name a wildcard reaches. Denial of existence
-    /// needs the literal one, because a name that only exists through a
-    /// wildcard is precisely the name a wildcard answer has to prove does
-    /// *not* exist (RFC 4035 §3.1.3).
+    /// Denial of existence needs the literal question, because a name reached
+    /// only through a wildcard is exactly the name a wildcard answer must prove
+    /// does *not* exist (RFC 4035 §3.1.3). [`Zone::name_exists`] is the other
+    /// question.
     pub fn holds_name(&self, name: &str) -> bool {
         self.index.contains_key(self.lookup_key(name).as_ref())
     }
@@ -211,12 +169,9 @@ impl Zone {
 
     /// The NSEC whose span contains `name` — the record that denies it exists.
     ///
-    /// Strictly *between* two names: an NSEC sitting at `name` itself proves
-    /// the opposite, that the name is there, so the search is exclusive at the
-    /// low end. When nothing sorts before `name` the answer is the last record
-    /// in the chain, because the chain is a loop — its final NSEC points back
-    /// at the apex and so covers everything after the last name in the zone
-    /// *and* everything before the first (RFC 4034 §4.1.1).
+    /// Exclusive at the low end: an NSEC *at* `name` proves the opposite. When
+    /// nothing sorts before `name` the answer is the last record, because the
+    /// chain is a loop back to the apex (RFC 4034 §4.1.1).
     pub fn nsec_covering(&self, name: &str) -> Option<&ZoneRecord> {
         let key = canonical_sort_key(name);
         let position = self
@@ -240,10 +195,8 @@ impl Zone {
     /// Where a denial record belongs in the ordered chains, if it is one.
     ///
     /// An NSEC is filed under its owner name; an NSEC3 under the hash in its
-    /// owner's first label, which is the value the chain is actually ordered
-    /// by. A record whose label will not decode is left out rather than filed
-    /// under something wrong — it cannot be part of a chain a validator can
-    /// walk either.
+    /// owner's first label, which is what the chain is ordered by. A label that
+    /// will not decode is left out rather than filed under something wrong.
     fn chain_key(&self, record: &ZoneRecord) -> Option<(Chain, Vec<u8>)> {
         match record.rdata.rtype() {
             crate::utils::record_types::NSEC => Some((
@@ -262,11 +215,9 @@ impl Zone {
     /// Query records by name and type.
     ///
     /// A wildcard is consulted only when the queried name does not exist at
-    /// all: an existing name shadows the wildcard entirely, types it does not
-    /// carry included, and so does an empty non-terminal (RFC 1034 §4.3.3,
-    /// RFC 4592 §2.2.1 and §4.4). The linear scan this replaced returned the
-    /// exact *and* the wildcard records together, merging two owners' data into
-    /// one RRset.
+    /// all: an existing name shadows it entirely, types it does not carry
+    /// included, and so does an empty non-terminal (RFC 1034 §4.3.3,
+    /// RFC 4592 §2.2.1 and §4.4).
     pub fn query(&self, name: &str, qtype: Qtype) -> Vec<&ZoneRecord> {
         let key = self.lookup_key(name);
         let positions = match self.name_kind_of_key(&key) {
@@ -281,10 +232,6 @@ impl Zone {
     }
 
     /// The serial from the apex SOA, if the zone has one.
-    ///
-    /// The serial is how every other server decides whether what it holds is
-    /// stale, so it is the one field a zone is compared by — NOTIFY sends it,
-    /// and a secondary's refresh check is a comparison of it.
     pub fn serial(&self) -> Option<Serial> {
         self.query(&self.origin, Qtype::of(crate::utils::record_types::SOA))
             .first()
@@ -295,9 +242,8 @@ impl Zone {
     }
 
     /// Whether the zone holds anything at `name` — by that name, because
-    /// something below it exists, or through a wildcard. This is the NXDOMAIN
-    /// question: a name that exists with no record of the queried type is
-    /// NODATA, which is a different answer.
+    /// something below it exists, or through a wildcard. The NXDOMAIN question;
+    /// an existing name with no record of the queried type is NODATA.
     pub fn name_exists(&self, name: &str) -> bool {
         !matches!(self.name_kind(name), NameKind::NotFound)
     }
@@ -309,19 +255,11 @@ impl Zone {
 
     /// [`Zone::name_kind`] for a name already in [`Zone::lookup_key`] form.
     ///
-    /// The wildcard search is a closest-encloser walk, not a single lookup, and
-    /// that is the whole of the correction here. A wildcard synthesizes to any
-    /// depth: RFC 4592 §3.3.2's worked example answers `_telnet._tcp.host1.example.`
-    /// from `*.example.`, two labels down. The single `split_once` this replaced
-    /// reached exactly one label, citing §2.1.1 — which is about `*` being
-    /// special only as the leftmost label of a zone-file owner name, and says
-    /// nothing about how deep synthesis reaches.
-    ///
-    /// The walk stops at the first ancestor that exists, and the *only* wildcard
-    /// that may answer is the one directly below it (§3.3.1). Going on to try
-    /// `*.<grandparent>` would answer for a name whose parent exists, which
-    /// §4.4 forbids: an existing name — an empty non-terminal included — ends
-    /// the search whether or not it has the type asked for.
+    /// A closest-encloser walk, not a single lookup: synthesis reaches any
+    /// depth (RFC 4592 §3.3.2 answers `_telnet._tcp.host1.example.` from
+    /// `*.example.`). The walk stops at the first ancestor that exists and only
+    /// the wildcard directly below it may answer (§3.3.1) — an existing name,
+    /// empty non-terminal included, ends the search (§4.4).
     fn name_kind_of_key(&self, key: &str) -> NameKind {
         if self.index.contains_key(key) {
             return NameKind::Exact;
@@ -334,22 +272,16 @@ impl Zone {
         let mut name = key;
         while let Some(encloser) = parent_name(name) {
             if !is_at_or_under(encloser, &origin) {
-                // Walked out of the zone without finding anything, which means
-                // the query was never in it to begin with.
+                // Out of the zone: the query was never in it.
                 return NameKind::NotFound;
             }
             if !self.node_exists(encloser) {
                 name = encloser;
                 continue;
             }
-            // The closest encloser. A wildcard below a zone cut is occluded —
-            // it is the child's data, not ours (RFC 4592 §2.2.1) — so a
-            // delegation between here and the apex means no synthesis at all,
-            // and the caller owes a referral instead.
-            // Nothing below here can synthesize, so both remaining answers are
-            // `NotFound` and the work to tell them apart is work with one
-            // outcome. See [`Zone::has_wildcards`] for what that costs on a
-            // miss when it is not skipped.
+            // The closest encloser. A wildcard below a zone cut is the child's
+            // data, not ours (RFC 4592 §2.2.1), so a delegation between here
+            // and the apex means a referral rather than synthesis.
             if !self.has_wildcards {
                 return NameKind::NotFound;
             }
@@ -372,13 +304,11 @@ impl Zone {
         self.index.contains_key(key) || self.non_terminals.contains(key)
     }
 
-    /// The delegation point at or above `name`, if the zone's authority stops
-    /// before reaching it.
+    /// The delegation point at or above `name`: the deepest ancestor-or-self
+    /// other than the apex with an NS RRset (RFC 1034 §4.2.1).
     ///
-    /// The deepest ancestor-or-self other than the apex with an NS RRset
-    /// (RFC 1034 §4.2.1). `Some` means the answer owes a referral — the NS
-    /// RRset, its glue, and AA **clear** — rather than data or a denial. The
-    /// apex is excluded because its NS RRset is this zone's own, not a cut.
+    /// `Some` means the answer owes a referral — NS RRset, glue, and AA
+    /// clear. The apex is excluded: its NS RRset is this zone's own.
     pub fn delegation_for(&self, name: &str) -> Option<String> {
         self.delegation_for_key(&self.lookup_key(name))
     }
@@ -411,21 +341,17 @@ impl Zone {
 
     /// Record every ancestor of `key`, up to the apex, as a name that exists.
     ///
-    /// Stops as soon as an ancestor is already known, because ancestors are
-    /// always noted all the way to the apex — so one being present means the
-    /// rest are too. That makes the whole of index construction linear in the
-    /// zone rather than in names × labels.
+    /// Stops at the first ancestor already known: ancestors are always noted
+    /// all the way to the apex, so one present means the rest are. Keeps index
+    /// construction linear in the zone rather than in names × labels.
     fn note_non_terminals(&mut self, key: &str) {
-        // Owned, because the loop below takes `&mut self` and a borrowed origin
-        // would still be alive across it. This is the load path, once per
-        // record; the query path is where the borrow matters.
+        // Owned: the loop below takes `&mut self`.
         let origin = self.origin_key().into_owned();
         let mut name = key.to_string();
         while let Some(parent) = parent_name(&name) {
             if !is_at_or_under(parent, &origin) {
-                // A record whose owner is outside the zone — glue written with
-                // a foreign absolute name, say. Its ancestors are somebody
-                // else's names and must not be claimed to exist here.
+                // An owner outside the zone — foreign glue, say. Its ancestors
+                // are somebody else's names and do not exist here.
                 return;
             }
             let parent = parent.to_string();
@@ -437,25 +363,14 @@ impl Zone {
         }
     }
 
-    /// The apex in [`Zone::lookup_key`] form.
-    ///
-    /// Borrowed for an origin that is already lower case, which is every zone
-    /// file anyone writes — the walk in [`Zone::name_kind_of_key`] and the one in
-    /// [`Zone::delegation_for_key`] each ask for this once per query, so an
-    /// unconditional copy here would have been two of the allocations the
-    /// borrowing lookup key exists to remove.
+    /// The apex in [`Zone::lookup_key`] form. Borrowed for an already
+    /// lower-case origin: two walks ask for this per query.
     fn origin_key(&self) -> Cow<'_, str> {
         ascii_lowered_cow(&self.origin)
     }
 
-    /// The records at these positions that `qtype` selects.
-    ///
-    /// The rule — what ANY means, and why the three DNSSEC meta types are not
-    /// part of it — is [`Qtype::matches`], and used to be written out here.
-    /// This function was where it was got right, and `resolver` was where the
-    /// same comparison was written as `rtype == qtype` twice and got wrong; one
-    /// definition is the whole point of `TODO.md` #13c, so a second telling of
-    /// it here would be the drift starting again (`CLAUDE.md` §7).
+    /// The records at these positions that `qtype` selects. What ANY means, and
+    /// why the DNSSEC meta types are excluded, is [`Qtype::matches`]'s to say.
     fn of_type(&self, positions: &[usize], qtype: Qtype) -> Vec<&ZoneRecord> {
         positions
             .iter()
@@ -473,9 +388,8 @@ impl Zone {
             .collect();
         self.index.clear();
         self.non_terminals.clear();
-        // Rebuilt rather than carried: `set_origin` can turn a relative `*`
-        // into an absolute wildcard name, so the answer is a function of the
-        // keys and has to be recomputed with them.
+        // Recomputed, not carried: `set_origin` can turn a relative `*` into an
+        // absolute wildcard name.
         self.has_wildcards = false;
         for (position, key) in keys.into_iter().enumerate() {
             self.has_wildcards |= key.starts_with("*.");
@@ -486,9 +400,8 @@ impl Zone {
                 .push(position);
         }
 
-        // The chains are keyed by the *absolute* name too, so moving the origin
-        // moves them — an NSEC filed under a relative name would be findable
-        // only by a query that happened to ask the same way.
+        // The chains are keyed by the absolute name too, so moving the origin
+        // moves them.
         let chain_keys: Vec<Option<(Chain, Vec<u8>)>> =
             self.records.iter().map(|r| self.chain_key(r)).collect();
         self.nsec_chain.clear();
@@ -508,14 +421,10 @@ impl Zone {
 
     /// The form a name is indexed and looked up under: absolute, and down-cased
     /// because DNS names compare case-insensitively (RFC 4343 — ASCII only,
-    /// which is why this is `make_ascii_lowercase` and not `to_lowercase`).
+    /// hence `make_ascii_lowercase` rather than `to_lowercase`).
     ///
-    /// A key that needs neither step is handed straight back, and
-    /// `HashMap<String, _>::get` takes a `&str` — so the ordinary query, whose
-    /// name is absolute and lower case already, reaches the index without
-    /// allocating at all. The owned arm is not wasted work either way: a name
-    /// that had to be absolutized is a fresh `String` nobody else holds, so it
-    /// can be down-cased in place.
+    /// A key needing neither step is handed back borrowed, so the ordinary
+    /// query reaches the index without allocating.
     fn lookup_key<'a>(&'a self, name: &'a str) -> Cow<'a, str> {
         match self.normalize_name(name) {
             Cow::Borrowed(key) => ascii_lowered_cow(key),
@@ -526,12 +435,9 @@ impl Zone {
         }
     }
 
-    /// Helper to match domain names, handling wildcards and relative names.
-    ///
-    /// Both sides are normalized to absolute form first, so a record stored as
-    /// `@` or `www` matches a query for the origin or `www.<origin>.`. This is
-    /// the definition of matching that the index encodes; a test holds the two
-    /// to the same answers.
+    /// Whether `record_name` answers `query_name`, wildcards and relative names
+    /// included. The definition of matching the index encodes; a test holds the
+    /// two to the same answers.
     pub fn matches_query(&self, record_name: &str, query_name: &str) -> bool {
         let record_name = self.lookup_key(record_name);
         let query_name = self.lookup_key(query_name);
@@ -539,18 +445,14 @@ impl Zone {
         if record_name == query_name {
             return true;
         }
-        // Which wildcard reaches a name is a question about the whole zone, not
-        // about the two names — the closest encloser decides it. Asking
-        // `name_kind` rather than re-deriving it here is what keeps this in step
-        // with the index instead of drifting from it.
+        // Which wildcard reaches a name is a question about the whole zone —
+        // the closest encloser decides it — so ask `name_kind` rather than
+        // re-deriving it here.
         matches!(self.name_kind_of_key(&query_name), NameKind::Wildcard(w) if w == record_name)
     }
 
-    /// Normalize domain names to absolute form with trailing dot.
-    ///
-    /// Borrows the argument back when it is already absolute, which is every
-    /// name that arrived on the wire; a caller that needs to keep the result
-    /// says `.into_owned()` and pays for it there. See [`absolutize`].
+    /// Normalize a domain name to absolute form with a trailing dot. Borrows
+    /// back a name that is already absolute. See [`absolutize`].
     pub fn normalize_name<'a>(&'a self, name: &'a str) -> Cow<'a, str> {
         absolutize(name, &self.origin)
     }
@@ -560,13 +462,8 @@ impl Zone {
 /// the empty name are the origin itself, a name ending in `.` is already
 /// absolute, and anything else is relative to it.
 ///
-/// Two of the three cases have nothing to do, and the one a query takes is one
-/// of them: a name off the wire is always absolute, so the `String` this used to
-/// return unconditionally was a copy of its own argument. Four per query, ~14%
-/// of the allocations on the answer path (`TODO.md` #9e) — one each for
-/// `delegation_for`, `name_kind` and the two `query` calls a single answer
-/// makes. Relative names are the zone parser's case and still allocate, which is
-/// right: there the result is a name that does not exist anywhere yet.
+/// Only the relative case allocates, and it is the zone parser's; a name off
+/// the wire is absolute, and a query takes four of these.
 fn absolutize<'a>(name: &'a str, origin: &'a str) -> Cow<'a, str> {
     let name = name.trim();
     if name.is_empty() || name == "@" {
@@ -578,19 +475,14 @@ fn absolutize<'a>(name: &'a str, origin: &'a str) -> Cow<'a, str> {
     }
 }
 
-/// A name with its trailing dot.
-/// [`crate::utils::absolute`], owned — this module's callers all keep the
-/// result. One line rather than the three it replaces (`TODO.md` #19c).
+/// [`crate::utils::absolute`], owned — this module's callers all keep it.
 fn absolute(name: &str) -> String {
     crate::utils::absolute(name).into_owned()
 }
 
-/// The small parse helpers below return `Result<_, String>` on purpose, and it
-/// is the one place in this library that shape is right: they produce a *detail*
-/// — "odd number of hexadecimal digits" — and the caller is the zone parser,
-/// which is the only thing that knows the line number to attach it to. Giving
-/// them a `ZoneError` would mean inventing a line number they do not have. See
-/// `CLAUDE.md` §3.
+/// The small parse helpers below return `Result<_, String>` on purpose: they
+/// produce a *detail*, and only their caller — the zone parser — knows the line
+/// number to attach it to. A `ZoneError` here would have to invent one.
 fn parse_hex(hex_str: &str) -> Result<Vec<u8>, String> {
     let hex_str = hex_str.trim();
     if !hex_str.len().is_multiple_of(2) {
@@ -636,15 +528,10 @@ fn is_leap(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-/// How many days `month` (1-12) has in `year`, or `None` if that is not a month.
-///
-/// **`None`, and not zero.** It returned `0` for anything outside 1-12, and
-/// [`parse_dnssec_time`] fed it a field it had never range-checked: the month in
-/// `20250013000000` is **13**, contributed zero days, and the whole timestamp
-/// came back as a plausible-looking epoch for a date that does not exist. That
-/// is `CLAUDE.md` §4's "never turn an error into an empty value" in numeric
-/// clothing — a length of zero reads as an answer, and every caller summing
-/// these had no way to tell it apart from one.
+/// How many days `month` (1-12) has in `year`, or `None` if that is not a
+/// month. `None` and not zero: zero reads as an answer to a caller summing
+/// days, which turns month 13 into a plausible epoch for a date that does not
+/// exist.
 fn days_in_month(month: i32, year: i32) -> Option<i32> {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
@@ -655,24 +542,16 @@ fn days_in_month(month: i32, year: i32) -> Option<i32> {
 }
 
 /// An RRSIG's inception or expiration: a bare epoch, or `YYYYMMDDHHmmSS` in UTC
-/// (RFC 4034 §3.2).
-///
-/// Every field is range-checked, and the result is checked to fit, because
-/// neither used to be true — see the comments at each. The inverse is
-/// [`format_dnssec_time`], and `test_dnssec_time_round_trips` holds them
-/// together.
+/// (RFC 4034 §3.2). Every field is range-checked and the result is checked to
+/// fit. The inverse is [`format_dnssec_time`].
 pub(crate) fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
     if let Ok(epoch) = time_str.parse::<u32>() {
         return Ok(epoch);
     }
 
-    // Fourteen **ASCII digits**, established before anything is sliced.
-    // `str::len` is a count of bytes and the slicing below indexes by byte, so a
-    // 14-byte string holding a multi-byte character used to *panic* here rather
-    // than fail to parse: `"abcé123456789"` is 14 bytes and `time_str[0..4]`
-    // lands inside the `é`. A zone file is operator input rather than a
-    // stranger's, so this was a bad file taking the load down instead of
-    // returning an error — provoked rather than reasoned about (`TODO.md` #16).
+    // Fourteen ASCII digits, established before anything is sliced: the
+    // slicing below is by byte, so a 14-byte string holding a multi-byte
+    // character would panic on a boundary rather than fail to parse.
     if time_str.len() != 14 || !time_str.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!(
             "Invalid DNSSEC time format: {time_str} (want a bare epoch or 14 digits)"
@@ -686,9 +565,8 @@ pub(crate) fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
     let min = time_str[10..12].parse::<i32>().map_err(|e| e.to_string())?;
     let sec = time_str[12..14].parse::<i32>().map_err(|e| e.to_string())?;
 
-    // None of these was checked, and the arithmetic below is happy to run on any
-    // of them: a year before 1970 makes `total_days` negative, which the old
-    // `as u32` then wrapped into the far future rather than rejecting.
+    // A year before 1970 makes `total_days` negative, which widens into the far
+    // future rather than failing.
     if year < 1970 {
         return Err(format!("{time_str}: year {year} is before the POSIX epoch"));
     }
@@ -718,23 +596,17 @@ pub(crate) fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
     total_days += day - 1;
 
     let epoch = total_days as i64 * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
-    // `as u32` truncated, so `21060207062816` — one second past what the field
-    // can hold — read back as 0, i.e. 1970, and a signature dated the far future
-    // became one that expired at the dawn of time (`CLAUDE.md` §2).
+    // Checked, not `as`: one second past the field truncates to 0, turning a
+    // signature dated the far future into one that expired in 1970.
     u32::try_from(epoch)
         .map_err(|_| format!("{time_str} is outside the range a 32-bit DNSSEC timestamp can hold"))
 }
 
-/// The `YYYYMMDDHHmmSS` form an RRSIG's times are written in (RFC 4034 §3.2).
+/// The `YYYYMMDDHHmmSS` form an RRSIG's times are written in, UTC
+/// (RFC 4034 §3.2). The inverse of [`parse_dnssec_time`].
 ///
-/// The inverse of [`parse_dnssec_time`], and deliberately next to it: the two
-/// share the calendar arithmetic, and a formatter that disagreed with the parser
-/// would write signature validity times that read back as different instants.
-/// Kept in UTC, which is the only zone a DNSSEC timestamp has.
-///
-/// The parser also accepts a bare epoch, and writing that would be shorter — but
-/// nothing else in the ecosystem does, and a dumped zone whose signatures cannot
-/// be read at a glance is a zone nobody can debug.
+/// The parser also accepts a bare epoch and writing that would be shorter, but
+/// nothing else in the ecosystem does.
 pub(crate) fn format_dnssec_time(epoch: u32) -> String {
     let mut days = (epoch / 86400) as i32;
     let seconds = epoch % 86400;
@@ -749,11 +621,8 @@ pub(crate) fn format_dnssec_time(epoch: u32) -> String {
         year += 1;
     }
 
-    // Bounded at December rather than trusting the day count to run out. It
-    // cannot overrun — the loop above leaves `days` under 366 — but when
-    // `days_in_month` answered 0 for a month of 13, `days >= 0` was always true
-    // and an overrun would have spun here until `month` overflowed. Making that
-    // impossible by construction costs one `let ... else`.
+    // Bounded at December rather than trusting the day count to run out: a
+    // month contributing zero days would spin until `month` overflowed.
     let mut month = 1;
     while month < 12 {
         let Some(in_month) = days_in_month(month, year) else {
@@ -778,15 +647,9 @@ pub(crate) fn format_dnssec_time(epoch: u32) -> String {
 /// The type bitmap for a list of type names, as an NSEC or NSEC3 line writes
 /// them.
 ///
-/// A name with no type code is an error rather than a silent omission: this used
-/// to drop what it did not recognize, which turns an NSEC that denies six types
-/// into one that denies five — a signed record quietly changed into a different
-/// signed record. `TYPEnnn` (RFC 3597 §5) means every type has a spelling, so
-/// there is no longer a case where dropping one would be the lesser evil.
-///
-/// The bits are laid out by [`crate::dnssec_denial::build_type_bitmap`], the
-/// same function the validator's own denials are built with, so a bitmap read
-/// here and one synthesized there cannot drift apart.
+/// An unrecognized name is an error, not a silent omission: dropping one turns
+/// an NSEC denying six types into one denying five. `TYPEnnn` (RFC 3597 §5)
+/// gives every type a spelling, so there is no case where dropping is better.
 fn construct_type_bitmap(types: &[String]) -> Result<Vec<u8>, String> {
     let mut codes = Vec::with_capacity(types.len());
     for name in types {
@@ -801,14 +664,9 @@ fn construct_type_bitmap(types: &[String]) -> Result<Vec<u8>, String> {
 
 /// Read `\# <length> <hex>` (RFC 3597 §5) into stored form.
 ///
-/// The stated length is checked against the digits rather than trusted: the two
-/// disagreeing means the record was mangled somewhere, and a length field is
-/// exactly the sort of thing a hand-edit gets wrong.
-///
-/// A known type is parsed once after decoding, purely to reject it — the bytes
-/// are kept either way, but RDATA that cannot be read as the type it claims is a
-/// malformed record, and this parser's rule is that a malformed record fails the
-/// load rather than waiting to fail a query.
+/// The stated length is checked against the digits rather than trusted, and a
+/// known type is parsed once to reject RDATA that is not that type: a malformed
+/// record fails the load rather than waiting to fail a query.
 fn parse_generic_rdata(record_type: &str, fields: &[&str]) -> Result<RecordData, String> {
     let rtype = crate::utils::record_type_name_to_code(record_type)
         .ok_or_else(|| format!("unknown record type {record_type:?}"))?;
@@ -828,13 +686,8 @@ fn parse_generic_rdata(record_type: &str, fields: &[&str]) -> Result<RecordData,
         ));
     }
 
-    // `RecordData::new` is this check, and it used to be written out here: build
-    // the pair, then parse it to find out whether the bytes are what the TYPE
-    // says. A type with no parser reads back as `Unknown` rather than failing, so
-    // it only ever rejects a known type whose bytes are not that type. When
-    // `RecordData` was sealed (`TODO.md` #14c) that became every constructor's
-    // job rather than this one's, which is §7's rule applied to a check instead
-    // of to a function.
+    // `RecordData::new` is the check: a type with no parser reads back as
+    // `Unknown`, so it only rejects a known type whose bytes are not that type.
     RecordData::new(rtype, bytes)
         .map_err(|e| format!("generic rdata is not valid {record_type}: {e}"))
 }
@@ -852,16 +705,8 @@ struct LogicalLine {
 
 /// Split a zone file into logical lines (RFC 1035 §5.1).
 ///
-/// Three things make this more than `content.lines()`:
-///
-/// - **Parentheses group data across a line boundary**, which is how every real
-///   SOA is written. A parenthesized SOA used to fail the load outright, so the
-///   zone files this server could read were the ones nothing else writes.
-/// - **A `;` begins a comment — except inside a quoted string**, where it is
-///   data. TXT records are full of semicolons (SPF, DKIM), and cutting the line
-///   at the first one turned them silently into something shorter.
-/// - **A quoted string may hold parentheses too**, which must not open or close
-///   a group, and `\` escapes whatever follows it.
+/// Not `content.lines()`: parentheses group data across a line boundary, and `;`
+/// begins a comment except inside a quoted string.
 fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, ZoneError> {
     let mut out: Vec<LogicalLine> = Vec::new();
     let mut pending: Option<LogicalLine> = None;
@@ -889,8 +734,7 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, ZoneError> {
                     text.push(c);
                 }
                 ';' if !quoted => break, // comment, to the end of the line
-                // The parentheses themselves are not data. Replacing them with a
-                // space keeps `(1` and `1)` from becoming tokens.
+                // Replaced with a space, not dropped: `(1` must not be a token.
                 '(' if !quoted => {
                     depth += 1;
                     text.push(' ');
@@ -950,14 +794,10 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, ZoneError> {
 
 /// Split an assembled line into fields, keeping a quoted string whole.
 ///
-/// Whitespace splitting alone cannot express a TXT record: `"two words"` is one
-/// `<character-string>` and `two words` is two, and the quotes are the only
-/// thing that says which. A quoted field also survives being empty (`""`), which
-/// is a legal TXT string and disappears under `split_whitespace`.
-///
-/// Escapes are resolved inside quotes and nowhere else — a bare token like
-/// `a\.b` is a name whose meaning changes if the backslash is dropped, and names
-/// are not this function's business.
+/// Quotes are what say where one `<character-string>` ends, and an empty one
+/// (`""`) is legal — neither survives `split_whitespace`. Escapes are resolved
+/// inside quotes only: a bare `a\.b` is a name, and names are not this
+/// function's business.
 fn tokenize(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -995,8 +835,8 @@ fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
-/// How deep `$INCLUDE` may nest. A file that includes itself is a loop, and the
-/// only way to notice is to stop counting somewhere.
+/// How deep `$INCLUDE` may nest. A file that includes itself is otherwise a
+/// loop with nothing to stop it.
 const MAX_INCLUDE_DEPTH: usize = 8;
 
 /// What the parser carries from one line to the next.
@@ -1012,10 +852,8 @@ struct ParseState {
 
 /// Parse a BIND-format zone file.
 ///
-/// `$INCLUDE` resolves relative paths against the process's working directory
-/// here, because a string of content has no directory of its own. Use
-/// [`parse_zone_file_at`] when the file is on disk — that resolves them the way
-/// an operator expects, next to the file doing the including.
+/// `$INCLUDE` resolves against the working directory: a string of content has no
+/// directory of its own. Use [`parse_zone_file_at`] for a file on disk.
 pub fn parse_zone_file(content: &str, origin: &str) -> Result<Zone, ZoneError> {
     parse_zone_file_with_base(content, origin, None)
 }
@@ -1045,14 +883,11 @@ fn parse_zone_file_with_base(
     Ok(zone)
 }
 
-/// RFC 1034 §3.6.2: a CNAME must be the only type at its owner name.
+/// RFC 1034 §3.6.2: a CNAME must be the only type at its owner name. Refused at
+/// load, because there is no correct answer to give at query time.
 ///
-/// Refused at load rather than coped with at query time, because there is no
-/// correct answer for the shape. An alias says "this name is really that name",
-/// so data beside it contradicts it, and a server has to pick one — which means
-/// two servers loading the same file answer differently. The exceptions are the
-/// three types that describe the name rather than name it: RRSIG signs the
-/// CNAME, and NSEC/NSEC3 deny the types around it (RFC 4035 §2.5).
+/// RRSIG, NSEC and NSEC3 are excepted — they describe the name rather than name
+/// it (RFC 4035 §2.5).
 fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
     let mut by_name: HashMap<String, (bool, Vec<Rtype>)> = HashMap::new();
     for record in zone.records() {
@@ -1089,23 +924,14 @@ fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
     Ok(())
 }
 
-/// Read `content` into `zone`. Recurses for `$INCLUDE`, hence `depth`.
 /// The RDATA half of a zone-file line: everything after the owner name, TTL,
-/// class and type have been read off it.
+/// class and type have been read off it. Pure, unlike [`parse_into`], which
+/// mutates parser state.
 ///
-/// **Split out of [`parse_into`] because the two halves have different inputs**
-/// (`TODO.md` #16b), and not because that function was long. The half above this
-/// one walks the file and mutates parser state — `$ORIGIN`, `$TTL`, `$INCLUDE`,
-/// the current TTL, the owner name a line inherits from the line before it.
-/// This half touches none of that: given a type and its fields it is a pure
-/// function, and being pure is what lets it be tested directly instead of only
-/// through a whole zone file.
-///
-/// Both views of the fields are passed because both are needed. `rdata` is them
-/// joined by a single space, which is what every type but TXT wants; `fields` is
-/// the same tokens unquoted; `text_fields` keeps the quoting, which TXT needs
-/// because a TXT RR is a *sequence* of character-strings and the quotes are what
-/// say where each one ends (RFC 1035 §3.3.14).
+/// Three views of the fields: `rdata` joined by a space (what every type but TXT
+/// wants), `fields` unquoted, and `text_fields` still quoted — a TXT RR is a
+/// sequence of character-strings and the quotes say where each ends
+/// (RFC 1035 §3.3.14).
 fn rdata_from_fields(
     record_type: &str,
     rdata: String,
@@ -1151,10 +977,8 @@ fn rdata_from_fields(
         }
         "TXT" => {
             // Every field after the type is one `<character-string>`
-            // (RFC 1035 §3.3.14): `"a b" c` is two strings, `a b c` is
-            // three, and the quotes are what says which. The 255-byte
-            // ceiling is enforced by the encoder, for every caller.
-            // The zone file speaks text; a character-string is octets.
+            // (RFC 1035 §3.3.14): `"a b" c` is two, `a b c` is three. The
+            // 255-byte ceiling is the encoder's, for every caller.
             let strings: Vec<Vec<u8>> = text_fields.iter().map(|t| t.as_bytes().to_vec()).collect();
             if strings.is_empty() {
                 return Err(ZoneError::syntax(ln, "TXT record has no text"));
@@ -1430,14 +1254,11 @@ fn parse_into(
             continue;
         };
 
-        // Handle $ORIGIN directive
         if first.eq_ignore_ascii_case("$ORIGIN") {
             if let Some(new_origin) = parts.get(1) {
                 state.origin = absolutize(new_origin, &state.origin).into_owned();
-                // The apex is the zone's identity, so only the file that *is*
-                // the zone may move it — an included fragment redefining the
-                // zone it was pulled into would be a surprise, and RFC 1035
-                // §5.1 keeps an include's origin to the included file anyway.
+                // Only the top-level file may move the apex: RFC 1035 §5.1 keeps
+                // an include's origin to the included file.
                 if depth == 0 {
                     zone.set_origin(&state.origin.clone());
                 }
@@ -1445,7 +1266,6 @@ fn parse_into(
             continue;
         }
 
-        // Handle $TTL directive
         if first.eq_ignore_ascii_case("$TTL") {
             if let Some(value) = parts.get(1) {
                 state.ttl = value
@@ -1456,7 +1276,7 @@ fn parse_into(
             continue;
         }
 
-        // Handle $INCLUDE directive: `$INCLUDE <file> [origin]`
+        // `$INCLUDE <file> [origin]`
         if first.eq_ignore_ascii_case("$INCLUDE") {
             let Some(&file) = parts.get(1) else {
                 return Err(ZoneError::syntax(ln, "$INCLUDE needs a file name"));
@@ -1474,12 +1294,9 @@ fn parse_into(
             let included = std::fs::read_to_string(&path)
                 .map_err(|e| ZoneError::syntax(ln, format!("$INCLUDE {}: {e}", path.display())))?;
 
-            // RFC 1035 §5.1: the origin an $INCLUDE names is for the included
-            // file, and nothing the included file does changes the origin of the
-            // file that included it. So the state goes in as a copy and none of
-            // it comes back — the owner name does not carry across either, since
-            // a fragment inheriting an owner from wherever it happened to be
-            // included is not something anyone can read.
+            // RFC 1035 §5.1: the origin is for the included file only, so the
+            // state goes in as a copy and none of it comes back. The owner name
+            // does not carry across either.
             let mut inner = ParseState {
                 origin: parts
                     .get(2)
@@ -1492,17 +1309,12 @@ fn parse_into(
             continue;
         }
 
-        // Parse record: [name] [ttl] [class] type rdata...
+        // `[name] [ttl] [class] type rdata...` — position tells the owner name
+        // from a TTL/class/type, not the token's shape: `ns IN A …` is a host
+        // called `ns`, not an NS record.
         //
-        // Position is what tells an owner name apart from a TTL/class/type, not
-        // the token's shape: a name may end in '.' (an FQDN) or contain digits
-        // (`www2`), and common host names collide with type mnemonics (`ns IN A
-        // …` — `ns` is the owner there, not an NS record).
-        //
-        // The name is resolved against the origin *in force here* rather than
-        // stored relative, which is what makes `$ORIGIN` apply to the lines
-        // below it only and what lets an `$INCLUDE` bring records in under a
-        // different origin.
+        // Resolved against the origin in force here, which is what makes
+        // `$ORIGIN` apply to the lines below it only.
         let mut idx = 0;
         let record_name = if logical.omits_owner {
             state.owner.clone().ok_or_else(|| {
@@ -1512,20 +1324,10 @@ fn parse_into(
                 )
             })?
         } else {
-            // An escape has no spelling in the form a name is stored in here,
-            // and is refused rather than mis-encoded. RFC 1035 §5.1 gives `\.`
-            // the meaning "a literal dot *inside* a label", so `a\.b` is one
-            // label of three octets — but a stored name is presentation text
-            // with `.` as the separator, so nothing resolved the escape and the
-            // name became **two** labels, `a\` and `b`. `dname::write_label`
-            // refuses that on the way out; catching it here means a zone with
-            // one fails to *load* rather than failing the first query for it.
-            //
-            // `TODO.md` #13e records why refusing beats resolving: resolving
-            // needs a stored form that can hold a dot inside a label, which this
-            // one cannot. The zone writer already refuses to emit such a name
-            // (`zone_writer::writable_name`), so accepting one only ever made a
-            // zone that could not be written back out.
+            // RFC 1035 §5.1 makes `a\.b` one label of three octets, which a
+            // name stored as presentation text with `.` as the separator cannot
+            // represent. Refused at load rather than mis-encoded into two
+            // labels; resolving would need a different stored form.
             if first.contains('\\') {
                 return Err(ZoneError::syntax(
                     ln,
@@ -1541,27 +1343,11 @@ fn parse_into(
             name
         };
 
-        // Parse TTL and class.
-        //
-        // The class is read and then **required to be IN**, which is narrower
-        // than it looks. CH and HS used to be accepted here and stored on the
-        // record, and nothing downstream ever looked at the field again: neither
-        // `Zone::query` nor `name_exists` compares it, so a CH record sat in the
-        // IN zone's index and answered IN queries — and a CH *question* was
-        // answered from the IN zone, which puts `CLASS=CH` in the echoed question
-        // beside `CLASS=IN` answer records. That pairing is malformed, and no
-        // resolver can do anything sensible with it.
-        //
-        // Refusing at the boundary rather than filtering at every lookup is
-        // `CLAUDE.md` §2's rule: a zone loaded from a file is single-class by
-        // construction now, so the class-blind index is *correct* instead of
-        // being three lookups away from a class check nobody wrote. A CH zone
-        // needs its own zone, its own apex and its own place in the zone map —
-        // that is a feature, and this is the parser refusing to half-have it.
         let mut ttl = state.ttl;
-        // Always IN: the branch below refuses any other class outright, which
-        // is what makes the class-blind zone index correct rather than merely
-        // untested (`CLAUDE.md` §2, §8).
+        // Always IN: the branch below refuses any other class outright. A zone
+        // is single-class by construction, which is what makes the class-blind
+        // index correct rather than merely untested. A CH zone needs its own
+        // apex and its own place in the zone map.
         let mut class = Class::IN;
 
         while idx < parts.len() {
@@ -1594,18 +1380,14 @@ fn parse_into(
             continue;
         }
 
-        // Parse record type and data
         let record_type = parts[idx].to_uppercase();
         idx += 1;
         let rdata = parts[idx..].join(" ");
 
-        // RFC 3597 §5's generic form: `\# <length> <hex>`, which says nothing
-        // about what the RDATA means and so can carry any type at all. It is the
-        // only way to write a type this library has no parser for — and the way
-        // the zone writer emits anything whose type-specific spelling would not
-        // read back as the same bytes. Accepted for known types too (§5 permits
-        // it), because refusing it would make a written zone unreadable by the
-        // program that wrote it.
+        // RFC 3597 §5's generic form, `\# <length> <hex>`: the only way to write
+        // a type with no parser here, and what the zone writer emits when the
+        // type-specific spelling would not read back as the same bytes. §5
+        // permits it for known types too, so it is accepted for them.
         if parts.get(idx).is_some_and(|token| *token == "\\#") {
             let rdata = parse_generic_rdata(&record_type, &parts[idx + 1..])
                 .map_err(|e| ZoneError::syntax(ln, format!("{record_type} record: {e}")))?;
@@ -1660,13 +1442,8 @@ mail IN A   192.0.2.3
         assert!(zone.records.len() >= 4);
     }
 
-    /// A CH or HS record used to load into an IN zone and then be indistinguishable
-    /// from an IN one: the class was stored on the record and no lookup ever
-    /// compared it, so `Zone::query` handed it out for IN questions. Refusing it
-    /// at the parse boundary is what makes the class-blind index correct rather
-    /// than merely untested (`CLAUDE.md` §2).
-    ///
-    /// Asserted on the variant, not the message (`CLAUDE.md` §3).
+    /// A record in a class this zone does not serve must not load: the index is
+    /// class-blind, so it would answer IN questions.
     #[test]
     fn a_record_in_a_class_this_zone_does_not_serve_is_refused_at_load() {
         for class in ["CH", "HS"] {
@@ -1686,8 +1463,7 @@ mail IN A   192.0.2.3
         }
     }
 
-    /// And IN still loads, with or without the token — the fix must not make the
-    /// class field mandatory, since `$TTL`-only lines are ordinary zone syntax.
+    /// The class field stays optional: `$TTL`-only lines are ordinary syntax.
     #[test]
     fn an_in_record_loads_whether_or_not_it_names_its_class() {
         let zone_content = r#"$ORIGIN example.com.
@@ -1739,8 +1515,6 @@ timed 60 IN A 192.0.2.3
 
     #[test]
     fn test_fully_qualified_owner_name_parses() {
-        // An FQDN owner ends in '.', which the old lookahead mistook for a
-        // TTL/class token and then tried to read as a record type.
         let zone = parse_zone_file("www.example.com. IN A 192.0.2.5\n", "example.com.").unwrap();
         assert_eq!(zone.records.len(), 1);
         assert_eq!(zone.records[0].name, "www.example.com.");
@@ -1756,8 +1530,7 @@ timed 60 IN A 192.0.2.3
 
     #[test]
     fn test_owner_name_may_look_like_a_record_type() {
-        // "ns IN A ..." is a host called `ns`, not an NS record — position, not
-        // the token's spelling, decides what the first field is.
+        // Position, not the token's spelling, decides what the first field is.
         let zone = parse_zone_file("ns IN A 192.0.2.7\n", "example.com.").unwrap();
         assert_eq!(zone.records[0].name, "ns.example.com.");
         assert_eq!(
@@ -1800,14 +1573,8 @@ timed 60 IN A 192.0.2.3
         assert_eq!(zone.query("WWW.Example.COM.", Qtype::of(rt::A)).len(), 1);
     }
 
-    /// Which of `normalize_name`'s three cases copies, and which hand the
-    /// argument back — the contract behind #9e's largest item.
-    ///
-    /// Asserted on the `Cow` arm and not only on the value, because the value is
-    /// the same either way and the whole point of the change is *which* one it
-    /// is: a name off the wire is absolute, and absolutizing it used to mean
-    /// copying it four times per query. `rdns/tests/allocations.rs` measures the
-    /// consequence; this says what the rule is.
+    /// Which of `normalize_name`'s three cases copies. Asserted on the `Cow` arm,
+    /// not the value, which is the same either way.
     #[test]
     fn normalizing_a_name_copies_only_when_it_changes() {
         let zone = parse_zone_file("@ IN A 192.0.2.1\n", "example.com.").unwrap();
@@ -1828,10 +1595,6 @@ timed 60 IN A 192.0.2.3
         ));
     }
 
-    // -----------------------------------------------------------------
-    // The index: wildcards, existence, and staying in step with the origin
-    // -----------------------------------------------------------------
-
     #[test]
     fn test_wildcard_answers_a_name_that_does_not_exist() {
         let zone = parse_zone_file("* IN A 192.0.2.9\n", "example.com.").unwrap();
@@ -1843,15 +1606,9 @@ timed 60 IN A 192.0.2.3
         assert!(zone.query("example.com.", Qtype::of(rt::A)).is_empty());
     }
 
-    /// RFC 4592 §3.3.2's own worked example, which is the authority on how deep
-    /// synthesis reaches: `*.example.` answers `_telnet._tcp.host1.example.` —
-    /// three labels below the wildcard's parent.
-    ///
-    /// This asserted the opposite for a long time, citing §2.1.1. That section
-    /// is about `*` being special only as the **leftmost label of a zone-file
-    /// owner name**; it says nothing about matching depth. The test agreed with
-    /// the code because both were written from the same misreading, which is why
-    /// a green suite was no evidence here.
+    /// RFC 4592 §3.3.2's worked example: `*.example.` answers
+    /// `_telnet._tcp.host1.example.`, three labels below the wildcard's parent.
+    /// §2.1.1 is about `*` in zone-file syntax and says nothing about depth.
     #[test]
     fn test_a_wildcard_synthesizes_at_any_depth() {
         let zone = parse_zone_file("* IN A 192.0.2.9\n", "example.").unwrap();
@@ -1869,12 +1626,8 @@ timed 60 IN A 192.0.2.3
         );
     }
 
-    /// An existing name ends the search, whether or not it has the type asked
-    /// for and whether or not it has records at all (RFC 4592 §4.4).
-    ///
-    /// The wildcard at the apex must not reach past `b.example.com.` — which
-    /// exists as an empty non-terminal — to answer for names under it. Only
-    /// `*.b.example.com.` could do that, and there isn't one.
+    /// An existing name ends the search, empty non-terminals included
+    /// (RFC 4592 §4.4).
     #[test]
     fn test_an_existing_name_stops_the_wildcard_search() {
         let zone =
@@ -1921,8 +1674,7 @@ timed 60 IN A 192.0.2.3
             NameKind::NotFound,
             "occluded: the wildcard is below the cut, so it is not ours to expand"
         );
-        // The apex NS RRset is not a cut — the zone starts there, it does not
-        // stop there.
+        // The apex NS RRset is not a cut.
         assert_eq!(zone.delegation_for("www.example.com."), None);
         // A query at the cut itself is still a referral.
         assert_eq!(
@@ -1931,12 +1683,9 @@ timed 60 IN A 192.0.2.3
         );
     }
 
-    /// An empty non-terminal exists (RFC 4592 §2.2.2): a name with descendants
-    /// and no records of its own is NODATA, not NXDOMAIN.
-    ///
-    /// The consequence of getting this wrong is that the zone takes *its own
-    /// data* offline — an RFC 8020 resolver caches the NXDOMAIN for `a.b` and
-    /// extends it to everything below, `deep.a.b` included.
+    /// A name with descendants exists (RFC 4592 §2.2.2): NODATA, not NXDOMAIN,
+    /// which an RFC 8020 resolver would extend downwards over the zone's own
+    /// data.
     #[test]
     fn test_empty_non_terminals_exist() {
         let zone = parse_zone_file("deep.a.b IN TXT \"down here\"\n", "example.com.").unwrap();
@@ -1960,13 +1709,12 @@ timed 60 IN A 192.0.2.3
 
         assert_eq!(zone.name_kind("deep.a.b.example.com."), NameKind::Exact);
         assert_eq!(zone.name_kind("gone.a.b.example.com."), NameKind::NotFound);
-        // Names outside the zone are not conjured into existence by the walk.
+        // The walk does not conjure names outside the zone into existence.
         assert_eq!(zone.name_kind("com."), NameKind::NotFound);
         assert_eq!(zone.name_kind("elsewhere.test."), NameKind::NotFound);
     }
 
-    /// RFC 1034 §3.6.2: a CNAME is the only type at its owner, and the load
-    /// fails rather than the server picking one at query time.
+    /// RFC 1034 §3.6.2: a CNAME is the only type at its owner.
     #[test]
     fn test_a_cname_may_not_share_its_owner_name() {
         let err = parse_zone_file(
@@ -1979,9 +1727,8 @@ timed 60 IN A 192.0.2.3
             "the error should say why: {err}"
         );
 
-        // RRSIG, NSEC and NSEC3 are the exceptions — they describe the name
-        // rather than name it (RFC 4035 §2.5), and a signed zone with a CNAME in
-        // it has all three.
+        // RRSIG, NSEC and NSEC3 describe the name rather than name it
+        // (RFC 4035 §2.5).
         parse_zone_file(
             "www IN CNAME host.example.com.\n\
              www IN NSEC x.example.com. CNAME RRSIG NSEC\n",
@@ -1990,10 +1737,8 @@ timed 60 IN A 192.0.2.3
         .expect("a signed CNAME is not a conflict");
     }
 
-    /// An existing name shadows the wildcard completely — including for types it
-    /// does not carry (RFC 1034 §4.3.3, RFC 4592 §2.2.1). The linear scan this
-    /// replaced returned both the exact and the wildcard record for one query,
-    /// merging two owners' data into a single RRset.
+    /// An existing name shadows the wildcard completely, types it does not carry
+    /// included (RFC 1034 §4.3.3, RFC 4592 §2.2.1).
     #[test]
     fn test_an_existing_name_shadows_the_wildcard() {
         let zone = parse_zone_file(
@@ -2036,9 +1781,8 @@ timed 60 IN A 192.0.2.3
         assert!(!zone.name_exists("elsewhere.test."));
     }
 
-    /// The index encodes what `matches_query` defines, so the two must agree.
-    /// They are separate code, and a divergence would show up as a zone serving
-    /// NXDOMAIN for records it holds.
+    /// The index encodes what `matches_query` defines; separate code, so hold
+    /// them to the same answers.
     #[test]
     fn test_the_index_and_matches_query_agree() {
         let zone = parse_zone_file(
@@ -2069,10 +1813,8 @@ timed 60 IN A 192.0.2.3
         }
     }
 
-    /// `$ORIGIN` applies to the lines *below* it (RFC 1035 §5.1): a name already
-    /// read keeps the origin it was read under. Owner names are resolved as they
-    /// are parsed, which is what makes that true — and what `$INCLUDE`'s optional
-    /// origin needs in order to mean anything.
+    /// `$ORIGIN` applies to the lines below it (RFC 1035 §5.1): a name already
+    /// read keeps the origin it was read under.
     #[test]
     fn test_origin_applies_only_to_the_lines_below_it() {
         let zone_content = "www IN A 192.0.2.1\n$ORIGIN other.test.\nmail IN A 192.0.2.2\n";
@@ -2087,9 +1829,8 @@ timed 60 IN A 192.0.2.3
         assert!(zone.query("www.other.test.", Qtype::of(rt::A)).is_empty());
     }
 
-    /// The `set_origin` re-key, which is what the index needs when a *relative*
-    /// name is added through the API and the origin moves afterwards. The parser
-    /// resolves names as it goes, so this is the path that still depends on it.
+    /// The `set_origin` re-key. Only names added relative through the API need
+    /// it; the parser resolves as it goes.
     #[test]
     fn test_set_origin_rekeys_relative_records() {
         let mut zone = Zone::new("example.com.".to_string());
@@ -2110,8 +1851,7 @@ timed 60 IN A 192.0.2.3
         assert!(zone.query("www.example.com.", Qtype::of(rt::A)).is_empty());
     }
 
-    /// A record added after the zone is built has to be reachable, or the index
-    /// is a cache that silently hides data.
+    /// A record added after the zone is built has to be reachable.
     #[test]
     fn test_records_added_later_are_indexed() {
         let mut zone = Zone::new("example.com.".to_string());
@@ -2127,13 +1867,7 @@ timed 60 IN A 192.0.2.3
         assert!(zone.name_exists("www.example.com."));
     }
 
-    // -----------------------------------------------------------------
-    // Logical lines: parentheses, comments and quoted strings
-    // -----------------------------------------------------------------
-
-    /// The SOA as every zone file in the world actually writes it. This failed
-    /// the load outright before: the first line ended after `(`, so the record
-    /// had no type and the numbers on the lines below were parsed as owner names.
+    /// A parenthesized SOA, which is how every zone file writes one.
     #[test]
     fn test_parenthesized_soa_loads() {
         let zone_content = r#"
@@ -2170,9 +1904,8 @@ $TTL 3600
         assert_eq!(zone.query("example.com.", Qtype::of(rt::A)).len(), 1);
     }
 
-    /// A `;` inside a quoted string is data, not a comment. SPF and DKIM records
-    /// are mostly semicolons, and cutting the line at the first one silently
-    /// shortened them.
+    /// A `;` inside a quoted string is data, not a comment — SPF and DKIM
+    /// records are mostly semicolons.
     #[test]
     fn test_semicolon_inside_a_quoted_string_survives() {
         let zone_content = "txt IN TXT \"v=spf1 include:example.net; -all\"\n";
@@ -2195,9 +1928,8 @@ $TTL 3600
         }
     }
 
-    /// Quotes are what says where one `<character-string>` ends and the next
-    /// begins (RFC 1035 §3.3.14), which whitespace splitting alone cannot
-    /// express: `"a b"` is one string and `a b` is two.
+    /// Quotes say where one `<character-string>` ends (RFC 1035 §3.3.14):
+    /// `"a b"` is one string and `a b` is two.
     #[test]
     fn test_txt_character_strings_are_split_on_quotes_not_whitespace() {
         let strings_of = |line: &str| -> Vec<Vec<u8>> {
@@ -2242,8 +1974,8 @@ $TTL 3600
         );
     }
 
-    /// A string too long for its one-byte length is the zone's mistake, and has
-    /// to fail the load — splitting it silently would change what it says.
+    /// A string too long for its one-byte length fails the load; splitting it
+    /// silently would change what it says.
     #[test]
     fn test_txt_string_over_255_bytes_fails_the_load() {
         let long = "z".repeat(256);
@@ -2274,12 +2006,8 @@ $TTL 3600
         assert!(err.to_string().contains("unterminated"), "got: {err}");
     }
 
-    // -----------------------------------------------------------------
-    // $INCLUDE
-    // -----------------------------------------------------------------
-
-    /// A scratch directory that removes itself, for the include tests — they
-    /// need real files, because resolving `$INCLUDE` is the thing being tested.
+    /// A scratch directory that removes itself. The include tests need real
+    /// files, since resolving `$INCLUDE` is what is under test.
     struct ScratchDir(std::path::PathBuf);
 
     impl ScratchDir {
@@ -2330,9 +2058,8 @@ $TTL 3600
         assert_eq!(zone.query("example.com.", Qtype::of(rt::A)).len(), 1);
     }
 
-    /// `$INCLUDE file origin` reads the file under that origin — and RFC 1035
-    /// §5.1 is explicit that it does not change the origin of the file doing the
-    /// including, however the included file plays with it.
+    /// `$INCLUDE file origin` reads the file under that origin and does not
+    /// change the including file's (RFC 1035 §5.1).
     #[test]
     fn test_include_origin_applies_to_the_included_file_only() {
         let dir = ScratchDir::new("include-origin");
@@ -2374,7 +2101,7 @@ $TTL 3600
         );
     }
 
-    /// A file that includes itself would recurse until the stack ran out.
+    /// A file that includes itself recurses until the stack runs out.
     #[test]
     fn test_include_cycle_is_refused() {
         let dir = ScratchDir::new("include-cycle");
@@ -2389,10 +2116,6 @@ $TTL 3600
         assert!(err.to_string().contains("needs a file name"), "got: {err}");
     }
 
-    // -----------------------------------------------------------------
-    // RFC 3597: types with no mnemonic, and rdata written as raw bytes
-    // -----------------------------------------------------------------
-
     #[test]
     fn test_generic_rdata_carries_a_type_we_do_not_parse() {
         let zone = parse_zone_file("odd IN TYPE1234 \\# 4 DEADBEEF\n", "example.com.").unwrap();
@@ -2401,8 +2124,7 @@ $TTL 3600
         assert_eq!(record[0].rdata.bytes(), [0xde, 0xad, 0xbe, 0xef]);
     }
 
-    /// RFC 3597 §5 permits the generic form for a known type too, and the writer
-    /// uses it whenever the type-specific spelling would not read back exactly.
+    /// RFC 3597 §5 permits the generic form for a known type too.
     #[test]
     fn test_generic_rdata_is_accepted_for_a_known_type() {
         let zone = parse_zone_file("www IN A \\# 4 C0000201\n", "example.com.").unwrap();
@@ -2423,8 +2145,7 @@ $TTL 3600
         );
     }
 
-    /// The length is checked rather than trusted — it is exactly the field a
-    /// hand-edit gets wrong, and believing it would store the wrong bytes.
+    /// The stated length is checked against the digits, not trusted.
     #[test]
     fn test_generic_rdata_length_must_match_the_digits() {
         let err = parse_zone_file("odd IN TYPE1234 \\# 8 DEADBEEF\n", "example.com.").unwrap_err();
@@ -2447,9 +2168,8 @@ $TTL 3600
         assert!(err.to_string().contains("needs a length"), "got: {err}");
     }
 
-    /// A type bitmap may list a type this library has no name for; `TYPEnnn` is
-    /// how RFC 3597 §5 says to write it, and dropping it would turn a signed
-    /// NSEC into a different signed NSEC.
+    /// A bitmap may list a type with no mnemonic; `TYPEnnn` (RFC 3597 §5) is how
+    /// it is written, and dropping it would change a signed NSEC.
     #[test]
     fn test_nsec_bitmap_accepts_a_generic_type_name() {
         let zone =
@@ -2478,12 +2198,8 @@ $TTL 3600
         );
     }
 
-    // -----------------------------------------------------------------
-    // DNSSEC timestamps
-    // -----------------------------------------------------------------
-
-    /// The formatter and the parser are inverses, or a rewritten RRSIG would
-    /// claim a different validity period from the one it was signed with.
+    /// The formatter and the parser are inverses, or a rewritten RRSIG claims a
+    /// different validity period from the one it was signed with.
     #[test]
     fn test_dnssec_time_round_trips() {
         for (epoch, text) in [
@@ -2500,45 +2216,34 @@ $TTL 3600
         }
     }
 
-    /// A 14-*byte* string is not fourteen characters, and the parser sliced by
-    /// byte index after checking `len()`.
-    ///
-    /// **Watched failing first** (`CLAUDE.md` §1): against the old code this
-    /// panicked with "end byte index 4 is not a char boundary; it is inside 'é'"
-    /// rather than returning an error. A zone file is operator input, so the
-    /// reachable consequence was a mangled RRSIG line taking down the zone load
-    /// instead of failing it (`TODO.md` #16).
+    /// A 14-*byte* string is not fourteen characters, and the slicing is by
+    /// byte: a multi-byte character must not panic on a char boundary.
     #[test]
     fn a_fourteen_byte_time_that_is_not_fourteen_digits_is_an_error() {
         let multibyte = "abcé123456789";
         assert_eq!(multibyte.len(), 14, "the byte-length check passes");
         assert!(parse_dnssec_time(multibyte).is_err(), "must not panic");
 
-        // The same shape with the multi-byte character at each slice boundary
-        // the old code used.
+        // The same shape with the multi-byte character at each slice boundary.
         for probe in ["é12345678901", "1234é678901234", "123456789012é"] {
             let _ = parse_dnssec_time(probe);
         }
     }
 
-    /// Every field is range-checked, because an out-of-range one used to produce
-    /// a *plausible number* rather than an error.
-    ///
-    /// **Watched failing first.** The month case is the one that motivated this:
-    /// `days_in_month(13, ..)` answered 0, so `20250013000000` parsed happily to
-    /// 1_736_726_400 — a real-looking epoch for a date that does not exist.
+    /// Every field is range-checked: an out-of-range one otherwise produces a
+    /// plausible epoch for a date that does not exist.
     #[test]
     fn an_out_of_range_field_is_an_error_not_a_plausible_number() {
         for bad in [
-            "20250013000000", // month 13 — contributed zero days, and parsed
-            "20250000000000", // month 0 — likewise
+            "20250013000000", // month 13
+            "20250000000000", // month 0
             "20250132000000", // 32 January
             "20250230000000", // 30 February, in a non-leap year
             "20230229000000", // 29 February, in a non-leap year
             "20250101240000", // hour 24
             "20250101006000", // minute 60
             "20250101000060", // second 60 — POSIX time has no leap second
-            "19690101000000", // before the epoch: negative, and `as u32` wrapped
+            "19690101000000", // before the epoch: negative
         ] {
             assert!(
                 parse_dnssec_time(bad).is_err(),
@@ -2547,16 +2252,13 @@ $TTL 3600
             );
         }
 
-        // 29 February *is* a day in a leap year, so the check is not simply
-        // refusing everything near the boundary.
+        // 29 February is a day in a leap year: the check is not refusing
+        // everything near the boundary.
         assert!(parse_dnssec_time("20240229000000").is_ok());
     }
 
-    /// The field is 32 bits (RFC 4034 §3.2), and one second past what it holds
-    /// used to truncate rather than fail — so a signature dated the far future
-    /// read back as one that expired in 1970.
-    ///
-    /// **Watched failing first**: `21060207062816` returned `Ok(0)`.
+    /// The field is 32 bits (RFC 4034 §3.2). One second past it must fail, not
+    /// truncate a far-future signature into one that expired in 1970.
     #[test]
     fn a_time_past_the_end_of_the_field_is_an_error() {
         // The last representable instant still parses.
@@ -2565,15 +2267,9 @@ $TTL 3600
         assert!(parse_dnssec_time("99991231235959").is_err(), "far past");
     }
 
-    /// The point of #16b, exercised directly: the RDATA half is a pure function,
-    /// so a type's field handling can be tested without building a zone file,
-    /// an origin, a TTL and an owner name around it.
-    ///
-    /// **Not a regression test** — #16b moved code without changing behaviour,
-    /// and the evidence for that is the 654 tests that already cover zone
-    /// parsing, all of which pass unchanged. This is here because "it can be
-    /// tested on its own now" was the *justification* for the split, and a
-    /// justification nobody exercises is a claim (`CLAUDE.md` §1).
+    /// The RDATA half is a pure function: a type's field handling is testable
+    /// without a zone file, an origin, a TTL and an owner name around it. Not a
+    /// regression test.
     #[test]
     fn the_rdata_half_can_be_tested_without_a_zone_file() {
         let fields = ["10", "mx.example.com."];
@@ -2588,9 +2284,8 @@ $TTL 3600
             }
         );
 
-        // The line number travels with the error, which is the whole reason the
-        // small helpers return a detail and this function attaches the position
-        // to it (see the note above `parse_hex`).
+        // The line number travels with the error: the helpers return a detail
+        // and this function attaches the position.
         let bad = ["notanumber", "mx.example.com."];
         let text: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
         let err = rdata_from_fields("MX", "notanumber mx.example.com.".into(), &bad, &text, 42)
@@ -2604,20 +2299,9 @@ $TTL 3600
         let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
         assert!(err.to_string().contains("$TTL"), "got: {err}");
     }
-    /// An escape in a name is refused rather than mis-encoded.
-    ///
-    /// RFC 1035 §5.1 gives `\.` the meaning "a literal dot *inside* a label",
-    /// so `a\.b.example.com.` is a four-label name whose first label is the
-    /// three octets `a.b`. This parser stores names as presentation text with
-    /// `.` as the separator and never resolved the escape, so the name came out
-    /// as **two** labels, `a\` and `b` — a different name, with a backslash in
-    /// it, that round-tripped through this library unchanged (`TODO.md` #13e).
-    ///
-    /// Refusing is the deliberate choice over resolving: resolving requires the
-    /// stored form to be able to hold a dot inside a label, which presentation
-    /// text cannot. The zone *writer* already refuses to emit such a name
-    /// (`zone_writer::writable_name`), so accepting one on the way in only ever
-    /// produced a zone that could not be written back out.
+    /// An escape in a name is refused rather than mis-encoded. RFC 1035 §5.1
+    /// makes `a\.b` one label of three octets, which presentation text with `.`
+    /// as the separator cannot hold.
     #[test]
     fn an_escape_in_a_name_is_refused_rather_than_mis_encoded() {
         let err = parse_zone_file("a\\.b IN A 192.0.2.1\n", "example.com.")

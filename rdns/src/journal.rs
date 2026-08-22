@@ -1,28 +1,14 @@
-//! Persisting the version steps a zone has been through (`TODO.md` #7 step 6).
-//!
-//! Needed once dynamic UPDATE was served: the zone moves between reloads, so a
-//! restart discards deltas nothing will recreate, and `MAX_DELTAS_PER_ZONE` (32)
-//! is a long history for an operator editing a file and thirty-two updates for a
-//! DHCP client. Before that, recomputing from two in-memory versions was correct
-//! and self-correcting.
+//! Persisting the version steps a zone has been through.
 //!
 //! The format is the zone file's and the framing is RFC 1995's: old SOA, records
-//! deleted, new SOA, records added, in the presentation format `zone_writer`
-//! emits and `zone::parse_zone_file` reads. The positional read below is the same
-//! one `ixfr_response` writes and `secondary` consumes, so a journal entry and a
-//! wire increment cannot drift apart. Safe because `ixfr::diff` excludes the apex
-//! SOA from both lists, so the only apex SOAs in a sequence are the two framing
-//! it.
+//! deleted, new SOA, records added. `ixfr::diff` excludes the apex SOA from both
+//! lists, so the only apex SOAs in a sequence are the two framing it.
 //!
-//! Rewritten whole rather than appended to: `persist::write_atomically` gives
-//! all-or-nothing for a few tens of kilobytes per update. That trade is wrong for
-//! a journal of unbounded size and right for this one.
+//! Rewritten whole rather than appended to; all-or-nothing is affordable for a
+//! few tens of kilobytes per update.
 //!
-//! A journal that will not read is not fatal — unlike the secondary's state file,
-//! where a lost last-contact time is the difference between a withdrawn zone and
-//! a stale one served with AA set. Here it costs some secondaries a full
-//! transfer, which RFC 1995 §4 permits at any time. [`Journal::load`] reports the
-//! failure for its caller to log and starts with an empty history.
+//! A journal that will not read is not fatal — it costs some secondaries a full
+//! transfer, which RFC 1995 §4 permits at any time.
 
 use std::path::{Path, PathBuf};
 
@@ -35,9 +21,8 @@ use crate::{ParsedRecord, ResourceRecord, Serial};
 
 /// The line that separates one difference sequence from the next.
 ///
-/// A zone-file comment, so that a journal is also a readable — if odd — zone
-/// file fragment, and so an operator looking at one is not reading an invented
-/// syntax. The split happens before parsing; the parser only ever sees records.
+/// A zone-file comment, so a journal is still a readable zone file fragment. The
+/// split happens before parsing; the parser only ever sees records.
 const SEPARATOR: &str = "; ---- delta ----";
 
 /// Where a zone's persisted version steps live.
@@ -53,25 +38,20 @@ impl Journal {
 
     /// The file a zone's journal lives in.
     ///
-    /// Named from the folded zone name rather than from whatever file the zone
-    /// was loaded out of, because those are not the same thing: a zone's origin
-    /// comes from its `$ORIGIN` and the file name is only a default
-    /// (`enumerate_zone_files`). Keying on the origin means the journal follows
-    /// the zone, not the path.
+    /// Keyed on the folded origin, not the file the zone was loaded from, so the
+    /// journal follows the zone rather than the path.
     pub fn path_for(&self, zone: &str) -> PathBuf {
         self.dir.join(format!("{}journal", absolute_lowered(zone)))
     }
 
     /// Write a zone's history, replacing whatever was there.
     ///
-    /// An empty history removes the file rather than leaving a stale one: a
-    /// zone we no longer hold increments for must not appear to offer them
-    /// after a restart.
+    /// An empty history removes the file: a zone we no longer hold increments
+    /// for must not appear to offer them after a restart.
     pub fn save(&self, zone: &str, deltas: &[&ZoneDelta]) -> Result<(), ZoneError> {
         let path = self.path_for(zone);
         if deltas.is_empty() {
-            // A missing file and an empty one mean the same thing to `load`, so
-            // failing to remove one is not worth propagating.
+            // A missing file and an empty one mean the same thing to `load`.
             let _ = std::fs::remove_file(&path);
             return Ok(());
         }
@@ -100,11 +80,8 @@ impl Journal {
 
     /// Read a zone's history back, oldest first.
     ///
-    /// `Ok(vec![])` when there is no journal, which is the ordinary case for a
-    /// zone that has never changed and for the first start after this existed.
-    /// An unreadable or malformed journal is an `Err` the caller logs and
-    /// otherwise ignores — see the module docs for why that is right here and
-    /// wrong for the secondary's state file.
+    /// `Ok(vec![])` when there is no journal. An unreadable or malformed journal
+    /// is an `Err` the caller logs and otherwise ignores.
     pub fn load(&self, zone: &str) -> Result<Vec<ZoneDelta>, ZoneError> {
         let path = self.path_for(zone);
         let text = match std::fs::read_to_string(&path) {
@@ -131,10 +108,9 @@ impl Journal {
             deltas.push(delta);
         }
 
-        // A chain with a gap in it would send a secondary a version that never
-        // existed, which no serial comparison afterwards could detect —
-        // `DeltaLog::chain_from` refuses one at read time and this refuses one at
-        // load time, because a journal is a thing an operator can edit.
+        // A gap would send a secondary a version that never existed, and no
+        // serial comparison afterwards could detect it. A journal is a file an
+        // operator can edit, so check here as well as in `chain_from`.
         for pair in deltas.windows(2) {
             if pair[0].to_serial != pair[1].from_serial {
                 return Err(ZoneError::invalid(format!(
@@ -151,9 +127,8 @@ impl Journal {
 
     /// Forget a zone's history, as `DeltaLog::forget` does in memory.
     ///
-    /// A zone that has been withdrawn — expired, or removed from the
-    /// configuration — must not come back after a restart offering increments of
-    /// something nobody serves.
+    /// A withdrawn zone must not come back after a restart offering increments
+    /// of something nobody serves.
     pub fn forget(&self, zone: &str) {
         let _ = std::fs::remove_file(self.path_for(zone));
     }
@@ -175,9 +150,8 @@ fn write_record(out: &mut String, record: &ResourceRecord) -> Result<(), ZoneErr
 
 /// One difference sequence, read positionally in RFC 1995 §4's order.
 fn read_delta(block: &str, origin: &str) -> Result<ZoneDelta, ZoneError> {
-    // The parser, not a second reader for the same syntax. What comes back is a
-    // `Zone` whose `records()` preserve insertion order and duplicates, which is
-    // what a sequence needs — it is a list, not a set.
+    // The zone parser, not a second reader for the same syntax. `records()`
+    // preserves insertion order and duplicates; a sequence is a list, not a set.
     let parsed = parse_zone_file(block, origin)?;
     let records: Vec<ResourceRecord> = parsed
         .records()
@@ -230,10 +204,9 @@ fn serial_of(soa: &ResourceRecord) -> Result<Serial, ZoneError> {
 
 /// Every zone with a journal in this directory, for priming the log at startup.
 ///
-/// Reading the directory rather than being told which zones to look for, so a
-/// journal left behind by a zone that has since been removed is *found* and can
-/// be cleaned up, instead of sitting there until someone re-adds the zone and is
-/// handed a history from before it left.
+/// Read from the directory rather than from the zone list, so a journal left by
+/// a removed zone is found and cleaned up instead of resurfacing if that zone is
+/// ever re-added.
 pub fn journalled_zones(dir: &Path) -> std::io::Result<Vec<String>> {
     let mut zones = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -248,15 +221,11 @@ pub fn journalled_zones(dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(zones)
 }
 
-/// The zone a journal describes, for a caller that already has one loaded.
+/// Whether a journal still describes this zone.
 ///
-/// A journal whose last sequence does not end at the zone's current serial is
-/// one the zone has moved past by some route the journal did not see — a reload
-/// from an edited file, or a transfer. Chaining onto it would offer a secondary
-/// a path to a version we are not serving, which is exactly what
-/// `DeltaLog::chain_from`'s caller checks for at answer time; checking it here
-/// as well means the bad history is dropped rather than carried and rejected on
-/// every query.
+/// A last sequence not ending at the zone's current serial means the zone moved
+/// by some route the journal did not see (an edited file, a transfer); chaining
+/// onto it would offer a secondary a version nobody serves.
 pub fn usable_against(deltas: &[ZoneDelta], zone: &Zone) -> bool {
     match (deltas.last(), zone.serial()) {
         (Some(last), Some(current)) => last.to_serial == current,
@@ -303,10 +272,8 @@ mod tests {
         .expect("zone should parse")
     }
 
-    /// **A delta survives a round trip through the disk unchanged.**
-    ///
-    /// Record for record, TTL included, because a secondary applies these and a
-    /// TTL that shifted in the journal is a TTL that shifts on the replica.
+    /// A delta round trips record for record, TTL included: a secondary applies
+    /// these, so a TTL that shifts in the journal shifts on the replica.
     #[test]
     fn a_delta_round_trips_through_the_journal() {
         let scratch = Scratch::new("round-trip");
@@ -339,9 +306,8 @@ mod tests {
         assert_eq!(shape(&back[0]), shape(&delta), "record for record");
     }
 
-    /// A chain of steps reloads as a chain, and `DeltaLog` can answer from it —
-    /// which is the whole point, so it is asserted through `chain_from` rather
-    /// than by inspecting the vector.
+    /// A chain reloads as a chain. Asserted through `chain_from` rather than by
+    /// inspecting the vector, because answering is the point.
     #[test]
     fn a_restored_chain_answers_an_ixfr_from_before_the_restart() {
         let scratch = Scratch::new("chain");
@@ -373,17 +339,9 @@ mod tests {
         assert_eq!(chain[2].to_serial, Serial::new(4));
     }
 
-    /// A journal whose sequences do not link is refused rather than half-used.
-    ///
-    /// A gap means some change would be skipped, and a secondary that applied
-    /// the rest would hold a zone that never existed — with a serial saying it
-    /// is current, which nothing downstream could detect. `DeltaLog::chain_from`
-    /// refuses a gap at answer time; this refuses one at load time, because a
-    /// file on disk is a thing an operator can edit.
-    ///
-    /// **Watched failing** against a `load` with no linkage check: the truncated
-    /// journal loaded as two unrelated sequences and `chain_from` then happily
-    /// returned the second one on its own.
+    /// A journal whose sequences do not link is refused rather than half-used: a
+    /// secondary applying the rest would hold a zone that never existed, with a
+    /// serial claiming it is current.
     #[test]
     fn a_journal_with_a_gap_is_refused() {
         let scratch = Scratch::new("gap");
@@ -403,8 +361,7 @@ mod tests {
         assert!(err.to_string().contains("do not link"), "got: {err}");
     }
 
-    /// Nothing on disk is not an error: it is the first start, and every zone
-    /// that has never changed.
+    /// Nothing on disk is not an error: it is every zone that has never changed.
     #[test]
     fn a_missing_journal_is_an_empty_history() {
         let scratch = Scratch::new("missing");
@@ -415,8 +372,8 @@ mod tests {
             .is_empty());
     }
 
-    /// An empty history removes the file. A zone that has been withdrawn must
-    /// not come back after a restart offering increments of itself.
+    /// An empty history removes the file: a withdrawn zone must not come back
+    /// after a restart offering increments of itself.
     #[test]
     fn saving_nothing_removes_the_file_and_so_does_forgetting() {
         let scratch = Scratch::new("withdraw");
@@ -435,11 +392,7 @@ mod tests {
         assert!(!journal.path_for("example.com.").exists());
     }
 
-    /// A journal that does not match the zone it belongs to is not used.
-    ///
-    /// The zone moved past it by some route the journal did not see — a reload
-    /// from an edited file, or a transfer. Chaining onto it would offer a
-    /// secondary a path to a version nobody is serving.
+    /// A journal that does not reach the zone's current serial is not used.
     #[test]
     fn a_journal_that_does_not_reach_the_current_serial_is_not_used() {
         let v1 = zone_at(1, "www IN A 192.0.2.1\n");
@@ -452,8 +405,7 @@ mod tests {
         assert!(usable_against(&[], &v5), "no history is always usable");
     }
 
-    /// A journal whose records will not parse is an error the caller logs, not
-    /// a panic and not a silently empty history.
+    /// Garbage is an error the caller logs, not a silently empty history.
     #[test]
     fn a_corrupt_journal_is_an_error_rather_than_an_empty_one() {
         let scratch = Scratch::new("corrupt");
@@ -470,8 +422,8 @@ mod tests {
         assert!(err.to_string().contains("unreadable"), "got: {err}");
     }
 
-    /// A sequence that does not open with the apex SOA has lost its framing, and
-    /// reading it positionally anyway would take a deletion for the header.
+    /// Without the opening apex SOA a positional read would take a deletion for
+    /// the header.
     #[test]
     fn a_sequence_without_its_framing_is_refused() {
         let scratch = Scratch::new("framing");

@@ -1,82 +1,52 @@
-//! [`RecordData`] and nothing else, so that its two fields can be private *to
-//! this file*.
+//! [`RecordData`] and nothing else.
 //!
-//! **A module for one struct is the point, not an accident** (`TODO.md` #14c).
-//! `RecordData` used to live in `lib.rs` with `pub` fields, and fourteen sites
-//! across the crate built one directly: `RecordData { rtype: A, rdata:
-//! <seventeen bytes> }` was a value nothing objected to until something tried to
-//! read it, which is why [`RecordData::parse`] returns a `Result` at all.
-//! Marking the fields private in the crate root would have changed nothing —
-//! private there means visible to the crate root *and every descendant module*,
-//! which is the whole library. A field is only sealed against the module it is
-//! declared in, so the type had to move somewhere small.
-//!
-//! The three doors are [`RecordData::from_wire`] (bytes off the wire, names
-//! decompressed), [`RecordData::from_parsed`] (a typed record encoded) and
-//! [`RecordData::new`] (bytes some other code produced, checked). All three
-//! establish the same thing: the bytes decode as their TYPE.
+//! A field is sealed only against the module declaring it — private in the crate
+//! root means visible to the whole library — so a type whose fields must be
+//! sealed against its own crate needs a file of its own.
 
 use crate::dname::DNameUnpacker;
 use crate::error::WireError;
 use crate::{ParsedRecord, Rtype};
 
-/// A record's data, stored as **uncompressed wire-format bytes**.
+/// A record's data, stored as uncompressed wire-format bytes.
 ///
-/// This is the compact, allocation-light form we keep resident (in caches,
-/// zones, and messages). It is 24 bytes regardless of record type, versus the
-/// ~96-byte typed enum it replaces, because the large/rare DNSSEC and SOA
-/// payloads no longer sit inline in every record.
+/// 24 bytes whatever the type, since the large DNSSEC and SOA payloads no longer
+/// sit inline in every record. Embedded names are expanded on the way in, so the
+/// bytes are self-contained: re-parsing or re-serializing needs no access to the
+/// message they came from.
 ///
-/// Any domain names embedded in the data are expanded to their full,
-/// uncompressed form when the record is read off the wire (see
-/// [`RecordData::from_wire`]), so the bytes are self-contained: they can be
-/// re-parsed with [`RecordData::parse`] or re-serialized without needing the
-/// original message for compression-pointer resolution.
+/// Private fields are the invariant — the bytes decode as their TYPE, and the
+/// three constructors are the only way in. What it does not claim:
 ///
-/// The fields are private, and that is the invariant: the bytes decode as their
-/// TYPE, because the three constructors are the only way in. Sealing them only
-/// means anything now that `rtype` is an [`Rtype`] rather than a `u16` anyone can
-/// invent (`TODO.md` #13c).
-///
-/// What the invariant does not say:
-///
-/// - A type with no decoder here is stored verbatim (RFC 3597 §5), checked only
-///   for being storable. So is an RDLENGTH of zero, which RFC 2136 §2.4 and §2.5
-///   use to mean "this type, no value".
+/// - A type with no decoder here is stored verbatim (RFC 3597 §5), as is an
+///   RDLENGTH of zero, which RFC 2136 §2.4 and §2.5 use to mean "this type, no
+///   value".
 /// - [`RecordData::parse`] still returns a `Result`. Making it infallible would
 ///   mean proving every `ParsedRecord` re-encodes to bytes that decode again.
-/// - Nothing bounds the length. RDLENGTH is 16 bits, and a longer RDATA fails
-///   when the message it is in is serialized — the check lives where the limit
-///   does.
+/// - Nothing bounds the length; that check lives where the 16-bit RDLENGTH is
+///   written, at message serialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordData {
-    /// The RR TYPE code (e.g. 1 = A, 28 = AAAA).
     rtype: Rtype,
-    /// Uncompressed wire-format RDATA.
     rdata: Box<[u8]>,
 }
 
 impl RecordData {
-    /// The RR TYPE code of this record.
     pub fn rtype(&self) -> Rtype {
         self.rtype
     }
 
     /// The stored bytes: uncompressed wire-format RDATA.
     ///
-    /// Read-only on purpose. A `&mut` to these would be a way to make the
-    /// contents disagree with `rtype` again, which is the thing this type
-    /// stopped allowing.
+    /// Read-only: a `&mut` would let the contents disagree with `rtype`.
     pub fn bytes(&self) -> &[u8] {
         &self.rdata
     }
 
     /// Read a record's RDATA off the wire and store it compactly.
     ///
-    /// `unpacker` is used to follow any compression pointers against the full
-    /// message; the result is re-encoded without compression so the stored
-    /// bytes are self-contained. Types we don't parse are stored verbatim
-    /// (RFC 3597), which — unlike the old typed enum — preserves their bytes.
+    /// `unpacker` follows compression pointers against the full message; the
+    /// result is re-encoded uncompressed so the stored bytes stand alone.
     pub fn from_wire<'a>(
         record_type: Rtype,
         rdata: &'a [u8],
@@ -104,16 +74,12 @@ impl RecordData {
     }
 
     /// Wire-format RDATA that some other code produced — a signer building a
-    /// DNSKEY or an NSEC3PARAM, a zone file's RFC 3597 `\#` escape, a test.
+    /// DNSKEY, a zone file's RFC 3597 `\#` escape, a test.
     ///
     /// Checked, not trusted: the bytes must decode as `rtype`. A type with no
-    /// decoder here reads back as [`ParsedRecord::Unknown`] rather than failing,
-    /// so this only ever rejects a *known* type whose bytes are not that type —
-    /// which is exactly the case the public fields used to let through.
-    ///
-    /// The names inside must already be uncompressed, since the stored form is
-    /// self-contained by definition and there is no message here to resolve a
-    /// pointer against.
+    /// decoder reads back as [`ParsedRecord::Unknown`], so only a *known* type
+    /// whose bytes are not that type is rejected. Names must already be
+    /// uncompressed; there is no message here to resolve a pointer against.
     pub fn new(rtype: Rtype, rdata: impl Into<Box<[u8]>>) -> Result<Self, WireError> {
         let stored = RecordData {
             rtype,
@@ -125,10 +91,8 @@ impl RecordData {
 
     /// Parse the stored bytes into a typed [`ParsedRecord`] on demand.
     ///
-    /// Records that are only cached and re-served never need this, which is the
-    /// whole point of storing raw bytes. Stored names are uncompressed, so no
-    /// message context is required — the decoder is handed an unpacker over the
-    /// rdata itself, which by construction contains no pointers.
+    /// Records only cached and re-served never need this. Stored names are
+    /// uncompressed, so the unpacker over the rdata itself suffices.
     pub fn parse(&self) -> Result<ParsedRecord, WireError> {
         let unpacker = DNameUnpacker::new(&self.rdata);
         ParsedRecord::decode(self.rtype, &self.rdata, &unpacker)
@@ -140,14 +104,8 @@ mod tests {
     use super::*;
     use crate::utils::record_types as rt;
 
-    /// The value the public fields used to allow: a TYPE that says A, and bytes
-    /// that are not an address.
-    ///
-    /// **Not a failing-first test, and it cannot be one** (`CLAUDE.md` §1). The
-    /// old code let you *write* `RecordData { rtype: A, rdata: <seventeen bytes>
-    /// }`, so the thing this change prevents is a line that no longer compiles,
-    /// and a test cannot contain it. What is testable is the constructor that
-    /// replaced it, which is what this is.
+    /// A TYPE that says A, and bytes that are not an address. Cannot be a
+    /// failing-first test: what it guards is a line that no longer compiles.
     #[test]
     fn rdata_that_is_not_its_type_is_refused() {
         assert!(
@@ -158,12 +116,9 @@ mod tests {
     }
 
     /// Two cases the invariant deliberately does not cover, because the wire has
-    /// them: a type with no decoder here (RFC 3597 §5), and an RDLENGTH of zero,
-    /// which RFC 2136 §2.4 and §2.5 use to mean "this type, no value".
-    ///
-    /// The second is the one that mattered. Assuming it away is what made a legal
-    /// UPDATE unparseable, and asserting it here is what stops the assumption
-    /// coming back through this door instead.
+    /// them: a type with no decoder (RFC 3597 §5), and an RDLENGTH of zero,
+    /// which RFC 2136 §2.4 and §2.5 use to mean "this type, no value". Assuming
+    /// the second away makes a legal UPDATE unparseable.
     #[test]
     fn opaque_and_empty_rdata_are_both_storable() {
         let unknown = RecordData::new(Rtype::new(64_999), vec![0xde, 0xad])
@@ -176,8 +131,7 @@ mod tests {
         assert!(empty.bytes().is_empty());
     }
 
-    /// What sealing bought, stated as the property rather than as a refusal:
-    /// anything that exists parses, so `parse`'s `Result` is now "this should not
+    /// Anything that exists parses, so `parse`'s `Result` means "should not
     /// happen" rather than "a caller may have built nonsense".
     #[test]
     fn every_constructor_leaves_something_that_parses() {

@@ -9,17 +9,12 @@
 //!   → the last zone's ZSK signs the answer
 //! ```
 //!
-//! Everything here is synchronous and takes the records as arguments: fetching
-//! them means asking servers, which is the resolver's job, not this module's.
-//! The resolver drives the loop and calls in at each step.
+//! Synchronous: the records are arguments, because fetching them is the
+//! resolver's job. The resolver drives the loop and calls in at each step.
 //!
-//! The outcome is one of four states, and the difference between two of them is
-//! the whole point. **Insecure** means the chain legitimately ends — some zone
-//! along the way proved it has no DS, so nothing below it is signed and there
-//! is nothing to check. **Bogus** means the chain was supposed to continue and
-//! did not: a signature that failed, a DS with no matching key, a missing proof.
-//! Most of the internet is insecure and must keep resolving; bogus is an attack
-//! or a broken zone and must not be served.
+//! Insecure means the chain legitimately ends — a zone proved it has no DS — and
+//! must still be served. Bogus means the chain was supposed to continue and did
+//! not, and must not be.
 
 use crate::dnssec::{
     algorithm_supported, canonical_name, digest_type_supported, label_count, verify_rrset, Dnskey,
@@ -38,19 +33,15 @@ use std::collections::HashMap;
 /// How much authentication an answer carries (RFC 4035 §4.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationState {
-    /// Signed, and every signature verified up to a trust anchor. This is the
-    /// only state that earns the AD bit.
+    /// Verified up to a trust anchor. The only state that earns the AD bit.
     Secure,
-    /// Provably unsigned: some zone on the path proved it has no DS. The
-    /// ordinary case for most of the internet — serve it, without AD.
+    /// Provably unsigned: some zone on the path proved it has no DS. Serve it,
+    /// without AD.
     Insecure,
-    /// Signed, but the signatures do not add up. Withhold it: SERVFAIL is the
-    /// correct answer, because handing over data we know to be unverifiable is
-    /// worse than handing over nothing.
+    /// Signed, but the signatures do not add up. SERVFAIL.
     Bogus(String),
-    /// We have no trust anchor covering this name, so there is no chain to
-    /// walk. Treated like insecure when serving, but it is a different fact:
-    /// insecure was *proven*, this was never in scope.
+    /// No trust anchor covers this name, so there is no chain to walk. Served
+    /// like insecure, but insecure was *proven* and this was never in scope.
     Indeterminate(String),
 }
 
@@ -84,15 +75,10 @@ impl std::fmt::Display for ValidationState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Trust anchors
-// ---------------------------------------------------------------------------
-
 /// The keys we trust a priori, in DS form.
 ///
-/// DS rather than DNSKEY on purpose: an anchor is a commitment to a key, and
-/// holding the hash means a zone can publish a new key under the same anchor
-/// without us shipping a new build. It is also the form IANA publishes.
+/// DS rather than DNSKEY: holding the hash lets a zone publish a new key under
+/// the same anchor, and it is the form IANA publishes.
 #[derive(Debug, Clone, Default)]
 pub struct TrustAnchors {
     anchors: Vec<Ds>,
@@ -100,11 +86,8 @@ pub struct TrustAnchors {
 
 /// The ICANN root zone KSK (KSK-2017, key tag 20326) as a SHA-256 DS.
 ///
-/// Compiled in as a fallback so a fresh install validates without
-/// configuration, which is the whole reason to hardcode anything. It is also
-/// why `--trust-anchor` exists: the root KSK does roll over, and when it does a
-/// build shipped before the roll is wrong until it is rebuilt. A file beats a
-/// rebuild, and a file plus this fallback beats a file alone.
+/// A fallback so a fresh install validates unconfigured. The root KSK rolls, so
+/// `--trust-anchor` overrides it without a rebuild.
 const ICANN_ROOT_DS: &str =
     ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D";
 
@@ -134,10 +117,8 @@ impl TrustAnchors {
     /// example.test. DS 12345 13 2 ABCD...
     /// ```
     ///
-    /// The class is optional, as it is in a zone file. A line that does not
-    /// parse is an error rather than a skip: a trust anchor file with a typo in
-    /// it should stop the process, not quietly leave us trusting less than the
-    /// operator intended.
+    /// The class is optional, as in a zone file. A line that does not parse is
+    /// an error rather than a skip: a typo must not quietly narrow what we trust.
     pub fn parse(text: &str) -> Result<Self, DnssecError> {
         let mut anchors = Vec::new();
         for (lineno, raw) in text.lines().enumerate() {
@@ -178,9 +159,8 @@ impl TrustAnchors {
             .collect()
     }
 
-    /// The deepest anchored zone at or above `name` — where a chain walk for
-    /// that name has to start. `None` means the name is outside every island of
-    /// trust we hold, which is [`ValidationState::Indeterminate`].
+    /// The deepest anchored zone at or above `name` — where a chain walk starts.
+    /// `None` is [`ValidationState::Indeterminate`].
     pub fn deepest_enclosing(&self, name: &str) -> Option<String> {
         let name = canonical_name(name);
         self.anchors
@@ -201,8 +181,8 @@ fn parse_ds_line(line: &str) -> Result<Ds, DnssecError> {
         )));
     }
     let owner = canonical_name(tokens.remove(0));
-    // A TTL and a class may sit between the owner and the type keyword, in
-    // either order and either optional — the same latitude a zone file gives.
+    // A TTL and a class may sit between owner and type, in either order and
+    // either optional — the same latitude a zone file gives.
     let mut skipped = 0;
     while !tokens.is_empty() && !tokens[0].eq_ignore_ascii_case("DS") && skipped < 2 {
         tokens.remove(0);
@@ -259,15 +239,11 @@ fn is_at_or_below(name: &str, ancestor: &str) -> bool {
     ancestor == "." || name == ancestor || name.ends_with(&format!(".{ancestor}"))
 }
 
-// ---------------------------------------------------------------------------
-// What a delegation told us
-// ---------------------------------------------------------------------------
-
 /// Everything a referral said about whether the child zone is signed.
 ///
-/// Collected while walking the delegation chain, because that is the only
-/// moment the parent's side of the cut is in front of us: ask the child for its
-/// own DS afterwards and the child gets to answer a question about itself.
+/// Collected while walking the delegation chain: that is the only moment the
+/// parent's side of the cut is in front of us, and asking the child for its own
+/// DS lets the child answer a question about itself.
 #[derive(Debug, Clone, Default)]
 pub struct DelegationEvidence {
     /// The child zone being delegated to.
@@ -325,10 +301,8 @@ pub type KeyStore = HashMap<String, Vec<Dnskey>>;
 
 /// An RRset that turned out to have been synthesized from a wildcard.
 ///
-/// Kept rather than discarded because verifying its signature is only half of
-/// what RFC 4035 §5.3.4 asks: the other half is a denial, and the records that
-/// carry it are in a different section of the response from the ones that were
-/// just checked.
+/// Verifying the signature is only half of RFC 4035 §5.3.4; the denial that is
+/// the other half lives in another section of the response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WildcardExpansion {
     /// The name the records were served at.
@@ -342,10 +316,9 @@ pub struct WildcardExpansion {
 
 /// What validating a set of records established.
 ///
-/// `state` is not the whole verdict on its own: a `Secure` state alongside a
-/// non-empty `wildcards` means every signature checked out *and* one or more
-/// answers still owe a proof that the name they were served at does not exist
-/// (RFC 4035 §5.3.4). [`ChainValidator::validate_wildcard_proofs`] settles that.
+/// `Secure` with a non-empty `wildcards` is not yet a verdict: those answers
+/// still owe a denial of the name they were served at (RFC 4035 §5.3.4), which
+/// [`ChainValidator::validate_wildcard_proofs`] settles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordsVerdict {
     pub state: ValidationState,
@@ -360,10 +333,6 @@ impl RecordsVerdict {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// The validator
-// ---------------------------------------------------------------------------
 
 pub struct ChainValidator<'a> {
     anchors: &'a TrustAnchors,
@@ -384,11 +353,10 @@ impl<'a> ChainValidator<'a> {
 
     /// Establish a zone's DNSKEY set from the DS records that commit to it.
     ///
-    /// The DS decides which key is allowed to sign the DNSKEY RRset; that
-    /// signature then extends trust to *every* key in the set, which is how a
-    /// zone can use a separate ZSK for its data without publishing a DS for it.
-    /// Skipping the signature check and simply trusting each key the DS names
-    /// would work for the KSK and quietly trust an attacker's injected ZSK.
+    /// The DS decides which key may sign the DNSKEY RRset; that signature then
+    /// extends trust to *every* key in the set, so a zone can use a separate ZSK
+    /// without a DS for it. Trusting the DS-named keys directly instead would
+    /// also trust an injected ZSK.
     pub fn validate_dnskeys(
         &self,
         zone: &str,
@@ -473,10 +441,8 @@ impl<'a> ChainValidator<'a> {
         let parent_zone = canonical_name(parent_zone);
 
         if evidence.ds.is_empty() {
-            // No DS: the parent must *prove* that, or an attacker who simply
-            // deletes the DS records from a referral turns a signed zone into
-            // an unsigned one. That is why the proof is mandatory here rather
-            // than best-effort.
+            // No DS: the parent must *prove* it, or deleting the DS from a
+            // referral downgrades a signed zone to an unsigned one.
             if let Denial::NotProved(why) =
                 proves_no_ds(&evidence.zone, &evidence.nsecs, &evidence.nsec3s)
             {
@@ -485,8 +451,8 @@ impl<'a> ChainValidator<'a> {
                     evidence.zone
                 ));
             }
-            // The proof itself is a signed RRset and has to be verified as one,
-            // otherwise it is just bytes an attacker supplied.
+            // The proof is itself a signed RRset; unverified it is just bytes an
+            // attacker supplied.
             return match self.verify_denial_records(evidence, &parent_zone, parent_keys) {
                 Ok(()) => {
                     DelegationVerdict::Insecure(format!("{} is provably unsigned", evidence.zone))
@@ -541,7 +507,6 @@ impl<'a> ChainValidator<'a> {
         parent_zone: &str,
         parent_keys: &[Dnskey],
     ) -> Result<(), ValidationState> {
-        // Rebuild the RRsets from the typed views we kept, and check each one.
         // A proof nobody signed proves nothing.
         let mut checked_any = false;
         for (owner, rtype, rdatas) in denial_rrsets(evidence) {
@@ -583,11 +548,7 @@ impl<'a> ChainValidator<'a> {
     ///
     /// An RRset whose RRSIG names a zone we have no keys for is bogus, not
     /// unsigned: we walked to that zone precisely because it was signed.
-    ///
-    /// A `Secure` state here is a statement about signatures only. Any RRset
-    /// that came from a wildcard is reported in
-    /// [`RecordsVerdict::wildcards`] and is not fully validated until its
-    /// denial has been checked too.
+    /// `Secure` here is about signatures only — see [`RecordsVerdict`].
     pub fn validate_records(&self, records: &[ResourceRecord], keys: &KeyStore) -> RecordsVerdict {
         let rrsigs: Vec<Rrsig> = records.iter().filter_map(Rrsig::from_record).collect();
         let mut validated_any = false;
@@ -652,7 +613,7 @@ impl<'a> ChainValidator<'a> {
             ValidationState::Secure
         } else {
             // Nothing to check — an empty answer. The caller decides whether a
-            // denial-of-existence proof is owed.
+            // denial of existence is owed.
             ValidationState::Insecure
         };
         RecordsVerdict { state, wildcards }
@@ -661,11 +622,9 @@ impl<'a> ChainValidator<'a> {
     /// Check that each wildcard-expanded RRset comes with a signed denial of the
     /// name it was served at (RFC 4035 §5.3.4).
     ///
-    /// `proofs` is where the NSEC/NSEC3 records may be found — the authority
-    /// section of the response, plus whatever earlier hops of a CNAME chase
-    /// carried. They are re-verified here rather than taken on trust: an NSEC an
-    /// attacker appended is exactly as easy to append as the answer it excuses,
-    /// and only the zone that signed the answer can deny a name in it.
+    /// `proofs` is the authority section plus whatever earlier hops of a CNAME
+    /// chase carried. They are re-verified here: only the zone that signed the
+    /// answer can deny a name in it.
     pub fn validate_wildcard_proofs(
         &self,
         expansions: &[WildcardExpansion],
@@ -699,13 +658,11 @@ impl<'a> ChainValidator<'a> {
 
     /// The NSEC and NSEC3 records in `records` that `zone` really signed.
     ///
-    /// One that does not verify is dropped rather than reported: it is not
-    /// evidence of anything, and dropping it leaves whatever obligation needed
-    /// it unmet — a refusal by the same route, with one error path instead of
-    /// two. Each record is verified as an RRset of its own, which NSEC and NSEC3
-    /// always are (RFC 4034 §4.1.3 allows exactly one per owner name), so a
-    /// forged record spliced in beside a genuine one is discarded on its own
-    /// rather than invalidating the record it was meant to hide.
+    /// One that does not verify is dropped, not reported: the obligation it
+    /// would have met stays unmet, which refuses by the same route. Each record
+    /// is verified as its own RRset — NSEC and NSEC3 always are, one per owner
+    /// name (RFC 4034 §4.1.3) — so a forged record spliced in beside a genuine
+    /// one does not invalidate it.
     fn verified_denials(
         &self,
         records: &[ResourceRecord],
@@ -744,9 +701,8 @@ impl<'a> ChainValidator<'a> {
     }
 }
 
-/// Split records into RRsets by (owner, type, class), skipping the RRSIGs
-/// themselves — a signature is not an RRset that needs validating, it is what
-/// validates one.
+/// Split records into RRsets by (owner, type, class), skipping RRSIGs — a
+/// signature is not an RRset to validate, it is what validates one.
 pub fn group_rrsets(records: &[ResourceRecord]) -> Vec<(String, Rtype, Class, Vec<RecordData>)> {
     let mut sets: Vec<(String, Rtype, Class, Vec<RecordData>)> = Vec::new();
     for rr in records {
@@ -805,13 +761,8 @@ fn push_rrset(
     }
 }
 
-// ---------------------------------------------------------------------------
-// CNAME chains
-// ---------------------------------------------------------------------------
-
-/// How many CNAMEs an answer may chain through before we stop believing it is a
-/// chain. RFC 1034 sets no limit; every implementation picks one, because the
-/// alternative is following a loop somebody built on purpose.
+/// How many CNAMEs an answer may chain through. RFC 1034 sets no limit; the
+/// alternative to picking one is following a deliberate loop.
 pub const MAX_CNAME_CHAIN: usize = 16;
 
 /// What the shape of an answer's CNAME chain turned out to be.
@@ -825,31 +776,22 @@ pub enum ChainShape {
 
 /// Whether an answer section really is the CNAME chain the query asked for.
 ///
-/// **Verifying each RRset is not the same as verifying the chain.** Every record
-/// here may carry a perfectly good signature from the zone that owns it, and the
-/// collection can still be an answer to a different question: a genuine
-/// `a.example.com. CNAME b.example.net.` beside a genuine
-/// `something-else.example.net. A 6.6.6.6` is two authentic RRsets and no chain
-/// at all. A consumer that takes "the A record in the answer" as the answer has
-/// then been handed an address for a name nobody asked about.
+/// Verifying each RRset is not verifying the chain: two authentically signed
+/// RRsets can still answer a different question, and a consumer taking "the A
+/// record in the answer" gets an address for a name nobody asked about.
 ///
 /// So the shape is checked independently of the signatures: walk from the queried
-/// name, follow each CNAME to its target, and require that *every* record in the
-/// answer is either a link in that walk or an RRset of the queried type at the
-/// name the walk ends on. Anything left over means the answer contains records
-/// that are not on the path from the question to its answer.
+/// name following each CNAME, and require every record to be either a link in
+/// that walk or an RRset of the queried type at the name it ends on.
 ///
-/// This is deliberately not the same check as the resolver's `chain` filter while
-/// it fetches. That decides what to *accept* hop by hop and is the reason a
-/// stray record rarely reaches here; this decides whether what arrived is
-/// coherent, and it holds for an answer that came from anywhere — a forwarder, a
-/// cache, a single upstream response.
+/// Not the resolver's hop-by-hop `chain` filter, which decides what to *accept*
+/// while fetching. This decides whether what arrived is coherent, wherever it
+/// came from.
 pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) -> ChainShape {
     let queried = canonical_name(qname);
 
-    // Index the CNAMEs by owner. More than one CNAME at a name is itself
-    // malformed: a CNAME is by definition the only record at its owner
-    // (RFC 1034 section 3.6.2), so two of them cannot both be followed.
+    // A CNAME is the only record at its owner (RFC 1034 §3.6.2), so two of them
+    // cannot both be followed.
     let mut cnames: Vec<(String, String)> = Vec::new();
     for rr in answers.iter().filter(|rr| rr.rdata.rtype() == rt::CNAME) {
         let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() else {
@@ -865,11 +807,9 @@ pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) 
     }
 
     // A query *for* a CNAME is answered by the CNAME itself rather than by
-    // following it (RFC 1034 section 3.6.2), so that question follows nothing and
-    // its answer sits at the name asked about.
+    // following it (RFC 1034 §3.6.2).
     let follow = !qtype.is(rt::CNAME);
 
-    // Walk from the question.
     let mut current = queried.clone();
     let mut followed: Vec<String> = Vec::new();
     if follow {
@@ -887,19 +827,15 @@ pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) 
         }
     }
 
-    // Everything in the answer must be on that path. A record that is not is
-    // either an answer to something else or an attempt to have one taken for
-    // this answer.
+    // Everything in the answer must be on that path; anything else is an answer
+    // to a different question.
     for rr in answers {
         if rr.rdata.rtype() == rt::RRSIG {
-            // A signature is attached to an RRset rather than being one, and the
-            // RRset it covers is checked on its own account.
             continue;
         }
         let owner = canonical_name(&rr.name);
         let on_the_path = if rr.rdata.rtype() == rt::CNAME {
-            // Either a link the walk followed, or — for a query that asked for a
-            // CNAME — the answer itself.
+            // A link the walk followed, or — for a CNAME query — the answer.
             followed.contains(&owner) || (!follow && owner == current)
         } else {
             owner == current
@@ -937,10 +873,6 @@ mod tests {
                 .unwrap(),
         }
     }
-
-    // -----------------------------------------------------------------
-    // Trust anchors
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_builtin_root_anchor_parses() {
@@ -1020,10 +952,6 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert!(island.deepest_enclosing("a.example.test.").is_some());
     }
 
-    // -----------------------------------------------------------------
-    // DNSKEY validation against a DS
-    // -----------------------------------------------------------------
-
     #[test]
     fn test_dnskey_rrset_validates_against_its_ds() {
         let zone = TestZone::new("example.test.");
@@ -1050,8 +978,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert!(err.is_bogus(), "{err:?}");
     }
 
-    /// The attack the DNSKEY signature check exists to stop: an extra key
-    /// spliced into the RRset alongside the genuine, DS-vouched one.
+    /// An extra key spliced into the RRset beside the genuine, DS-vouched one.
     #[test]
     fn test_injected_dnskey_breaks_the_rrset_signature() {
         let zone = TestZone::new("example.test.");
@@ -1106,10 +1033,6 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert!(err.is_bogus(), "{err:?}");
     }
 
-    // -----------------------------------------------------------------
-    // Delegations
-    // -----------------------------------------------------------------
-
     /// A parent signing a DS for its child: the ordinary secure delegation.
     #[test]
     fn test_signed_ds_delegation_is_secure() {
@@ -1129,8 +1052,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         }
     }
 
-    /// An unsigned DS is an injected DS. The parent zone is signed, so
-    /// everything authoritative in it carries a signature.
+    /// An unsigned DS is an injected DS: the parent zone signs everything
+    /// authoritative in it.
     #[test]
     fn test_unsigned_ds_is_bogus() {
         let child = TestZone::new("example.test.");
@@ -1149,8 +1072,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    /// A signed NSEC proving there is no DS: the child really is unsigned, and
-    /// the walk stops there without calling anything bogus.
+    /// A signed NSEC proving there is no DS: the walk stops, nothing is bogus.
     #[test]
     fn test_proven_unsigned_delegation_is_insecure() {
         let parent = TestZone::new("test.");
@@ -1177,8 +1099,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    /// The downgrade attack: strip the DS from a referral and offer nothing in
-    /// its place. Without a proof, "unsigned" is a claim, not a fact.
+    /// The downgrade attack: strip the DS and offer nothing in its place.
+    /// Without a proof, "unsigned" is a claim, not a fact.
     #[test]
     fn test_stripped_ds_with_no_proof_is_bogus() {
         let parent = TestZone::new("test.");
@@ -1193,8 +1115,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    /// And an *unsigned* denial is no better than none: the attacker can write
-    /// NSEC records too.
+    /// An *unsigned* denial is no better than none: anyone can write an NSEC.
     #[test]
     fn test_unsigned_no_ds_proof_is_bogus() {
         let parent = TestZone::new("test.");
@@ -1218,10 +1139,6 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             "{verdict:?}"
         );
     }
-
-    // -----------------------------------------------------------------
-    // Answers
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_signed_answer_is_secure() {
@@ -1286,8 +1203,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert!(state.is_bogus(), "{state:?}");
     }
 
-    /// Two RRsets, one signed and one not: the answer as a whole is bogus. It
-    /// is not enough for *some* of what we return to be authentic.
+    /// Two RRsets, one signed and one not: the answer as a whole is bogus.
     #[test]
     fn test_one_unsigned_rrset_taints_the_answer() {
         let zone = TestZone::new("example.test.");
@@ -1310,10 +1226,6 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert!(state.is_bogus(), "{state:?}");
     }
 
-    // -----------------------------------------------------------------
-    // Wildcard answers
-    // -----------------------------------------------------------------
-
     /// An NSEC resource record, ready to be signed.
     fn nsec_record(owner: &str, next: &str, types: &[Rtype]) -> ResourceRecord {
         ResourceRecord {
@@ -1328,8 +1240,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         }
     }
 
-    /// A wildcard-expanded answer verifies, and is reported as owing a proof
-    /// rather than being taken as complete.
+    /// A wildcard-expanded answer verifies, and is reported as owing a proof.
     #[test]
     fn test_wildcard_answer_is_reported_as_owing_a_proof() {
         let zone = TestZone::new("example.test.");
@@ -1358,8 +1269,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert_eq!(verdict.wildcards[0].signer, "example.test.");
     }
 
-    /// The whole point: with the signed NSEC the answer is secure; without it,
-    /// the same signature is not enough.
+    /// With the signed NSEC the answer is secure; without it the same signature
+    /// is not enough.
     #[test]
     fn test_wildcard_answer_needs_its_nsec() {
         let zone = TestZone::new("example.test.");
@@ -1372,9 +1283,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         keys.insert("example.test.".into(), zone.dnskeys());
         let expansions = v.validate_records(&[answer, sig], &keys).wildcards;
 
-        // The zone's own NSEC at the wildcard, which covers everything from
-        // `*.example.test.` up to `www.example.test.` — `a.example.test.`
-        // included, because `*` sorts before every ordinary label.
+        // The zone's own NSEC at the wildcard covers `a.example.test.`: `*`
+        // sorts before every ordinary label.
         let nsec = nsec_record(
             "*.example.test.",
             "www.example.test.",
@@ -1395,8 +1305,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert!(state.is_bogus(), "unsigned proof: {state:?}");
     }
 
-    /// A proof signed by somebody else does not count, even when we hold their
-    /// keys — only the zone that expanded the wildcard can say what is in it.
+    /// Only the zone that expanded the wildcard can say what is in it, even
+    /// when we hold the other zone's keys.
     #[test]
     fn test_wildcard_proof_from_another_zone_is_refused() {
         let zone = TestZone::new("example.test.");
@@ -1422,11 +1332,9 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert!(state.is_bogus(), "{state:?}");
     }
 
-    /// The substitution a wildcard signature makes possible: the RRset and its
-    /// RRSIG are genuine and verify at the re-owned name, because that is what
-    /// signing a wildcard means. `b.example.test.` exists, so this name's
-    /// closest encloser is `b.example.test.` and `*.example.test.` never applied
-    /// to it — and the NSEC the attacker has to offer says exactly that.
+    /// A wildcard signature verifies at any re-owned name, so the denial is what
+    /// catches it: `b.example.test.` exists, so it is the closest encloser and
+    /// `*.example.test.` never applied below it (RFC 4592 §3.3.1).
     #[test]
     fn test_wildcard_answer_re_owned_below_an_existing_name_is_bogus() {
         let zone = TestZone::new("example.test.");
@@ -1445,8 +1353,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             "the signature really does verify at the re-owned name — that is the problem"
         );
 
-        // The genuine NSEC at `b.example.test.`, which does cover the re-owned
-        // name: a name sorts before everything beneath it.
+        // The genuine NSEC at `b.example.test.` covers the re-owned name: a name
+        // sorts before everything beneath it.
         let nsec = nsec_record(
             "b.example.test.",
             "c.example.test.",
@@ -1461,11 +1369,9 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    /// A record sitting *at* a wildcard is not an expansion of it, even though
-    /// the RRSIG's label count is one short of the owner's — the labels field
-    /// never counts the `*`. Getting this wrong demands a proof that
-    /// `*.example.test.` does not exist, which would break every wildcard-aware
-    /// denial, since those carry precisely that record.
+    /// A record sitting *at* a wildcard is not an expansion, though the RRSIG's
+    /// label count is one short of the owner's: the labels field never counts
+    /// the `*` (RFC 4034 §3.1.3).
     #[test]
     fn test_the_wildcards_own_rrset_is_not_an_expansion() {
         let zone = TestZone::new("example.test.");
@@ -1485,8 +1391,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    /// A DS is computed over the down-cased owner name, so the case a zone
-    /// happens to be written in cannot change its digest.
+    /// A DS digest is computed over the down-cased owner name (RFC 4034 §6.2).
     #[test]
     fn test_ds_digest_is_case_insensitive_in_the_owner() {
         let zone = TestZone::new("example.test.");
@@ -1517,9 +1422,6 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert_eq!(sets[0].3.len(), 2, "two addresses at the first name");
         assert_eq!(sets[1].3.len(), 1);
     }
-    // -----------------------------------------------------------------
-    // CNAME chains
-    // -----------------------------------------------------------------
 
     fn cname(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
@@ -1589,10 +1491,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    /// The case the check exists for: two RRsets that are each perfectly
-    /// authentic, and together are not an answer to this question. A consumer
-    /// reading "the A record in the answer" would take an address for a name
-    /// nobody asked about.
+    /// Two individually authentic RRsets that together answer a different
+    /// question.
     #[test]
     fn test_a_record_off_the_path_breaks_the_chain() {
         let answers = vec![
@@ -1607,8 +1507,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    /// The first link has to start at the name that was asked about, or the chain
-    /// is somebody else's.
+    /// The first link must start at the name asked about.
     #[test]
     fn test_a_chain_that_does_not_start_at_the_question_is_broken() {
         let answers = vec![
@@ -1619,8 +1518,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert!(matches!(shape, ChainShape::Broken(_)), "got {shape:?}");
     }
 
-    /// A missing link is not a shorter chain: the records after the gap are not
-    /// reachable from the question.
+    /// A missing link is not a shorter chain: records after the gap are
+    /// unreachable from the question.
     #[test]
     fn test_a_missing_link_breaks_the_chain() {
         let answers = vec![
@@ -1645,9 +1544,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    /// A CNAME is by definition the only record at its owner (RFC 1034 section
-    /// 3.6.2), so two of them cannot both be followed — and picking one would be
-    /// letting whoever sent them choose.
+    /// A CNAME is the only record at its owner (RFC 1034 §3.6.2); picking one of
+    /// two would let the sender choose.
     #[test]
     fn test_two_cnames_at_one_name_are_refused() {
         let answers = vec![
@@ -1661,9 +1559,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    /// A query *for* a CNAME is answered by the CNAME itself rather than by
-    /// following it (RFC 1034 section 3.6.2), so the walk must stop at the first
-    /// hop — otherwise the answer to the question looks like a record off the path.
+    /// A query *for* a CNAME is answered by the CNAME itself (RFC 1034 §3.6.2),
+    /// so the walk stops at the first hop.
     #[test]
     fn test_a_query_for_a_cname_is_answered_by_it() {
         let answers = vec![
@@ -1678,9 +1575,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    /// Names compare case-insensitively (RFC 4343), and a chain that broke on
-    /// capitalisation would break on every answer from a 0x20-randomizing
-    /// resolver — which this one is.
+    /// Names compare case-insensitively (RFC 4343); this resolver randomizes
+    /// 0x20, so every answer would break otherwise.
     #[test]
     fn test_the_chain_is_case_insensitive() {
         let answers = vec![

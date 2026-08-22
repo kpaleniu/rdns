@@ -1,27 +1,9 @@
-//! Two wall-clock floors that guard a complexity class. **Not benchmarks.**
+//! Two wall-clock floors that guard a complexity class. Not benchmarks —
+//! those are in `benches/answer_path.rs`, under criterion.
 //!
-//! The benchmarks are in `benches/answer_path.rs`, under criterion. This file
-//! used to hold nine `#[test]`s timing a *debug* build against an ops/sec floor,
-//! which is neither (`TODO.md` #9e).
-//!
-//! What is left are the two where the assertion is "this has not gone back to
-//! being O(n)" rather than "this is fast", so they belong in `cargo test` where
-//! CI runs them. Both have a factor of ten or more of headroom (`CLAUDE.md` §10).
-//!
-//! The file keeps its name because `CLAUDE.md` §10 and several `TODO.md` entries
-//! argue from `bench_logger_throughput` and `bench_zone_lookup` by name.
-//!
-//! Seven went, and what replaced each:
-//!
-//! | deleted | why |
-//! |---|---|
-//! | `bench_rate_limiter_throughput` | measured in release now as `admission/rate limiter`; the floor guarded no complexity class |
-//! | `bench_validator_throughput` | `admission/request validator` |
-//! | `bench_cache_throughput` | it only ever called `get` on an *empty* cache, so it never reached `evict_oldest` and could not see the O(n²) eviction it looked like it was watching. `cache::tests::evicting_a_large_cache_is_linear_not_quadratic` is the tripwire; `state/100 puts into a full cache` is the measurement |
-//! | `bench_metrics_throughput` | a floor on `AtomicU64::fetch_add`, which measures the machine |
-//! | `bench_combined_pipeline` | a synthetic pipeline that did not parse, look up or serialize anything — `answer/one whole answer` is the real one |
-//! | `bench_nested_record_type_matching` | it asserted that reading a `u16` field is fast, after the enum match it was written for stopped existing |
-//! | `bench_recorddata_clone_performance` | a `Box<[u8]>` clone, measured now where it actually happens, on the answer path |
+//! Each asserts "this has not gone back to being O(n)" rather than "this is
+//! fast", so they belong in `cargo test`. Both have a factor of ten or more of
+//! headroom.
 
 #[cfg(test)]
 mod benches {
@@ -52,21 +34,11 @@ mod benches {
             iterations
         );
 
-        // The floor has moved twice and the history is the point. It was 45k —
-        // exactly what an idle machine measured — so any competing load failed
-        // the suite; it was lowered to 10k and blamed on that competing load,
-        // which ratified the O(window) regression in `log_query` the benchmark
-        // had correctly caught (`CLAUDE.md` §10). With the window replaced by a
-        // count this measures ~3.1M ops/sec in debug, so 100k is well past the
-        // factor of ten of headroom `bench_zone_lookup` sets as the rule, and
-        // still an order of magnitude above what the quadratic could reach.
-        //
-        // The floor is not the real guard, though: it is a wall-clock number and
-        // a busy machine can still move it. `logging::tests::
-        // logging_a_query_costs_the_same_however_many_came_before` asserts the
-        // shape — cost independent of depth — as a ratio, which is what actually
-        // catches this class coming back. `state/log a query with 1k sources
-        // tracked` in `benches/answer_path.rs` is the number in release: 49 ns.
+        // ~3.1M ops/sec in debug, so 100k is a factor of thirty of headroom and
+        // still an order of magnitude above what the O(window) `log_query`
+        // reached. A wall-clock floor is not the real guard:
+        // `logging::tests::logging_a_query_costs_the_same_however_many_came_before`
+        // asserts the shape as a ratio.
         assert!(
             ops_per_sec > 100_000.0,
             "logger too slow: {:.0} ops/sec",
@@ -74,20 +46,12 @@ mod benches {
         );
     }
 
-    /// Zone lookup on a zone big enough for the difference to matter.
+    /// A guard against `Zone::query` going back to scanning the whole record
+    /// vector per query, not a claim about this machine.
     ///
-    /// `Zone::query` used to filter the whole record vector per query, and the
-    /// name comparison normalized and lower-cased *both* names into fresh
-    /// `String`s for every record it touched — so one lookup on a 10k-record
-    /// zone did 20k allocations. Measured here before and after the index went
-    /// in: **227 lookups/sec (4.4 ms each) → 1.32M lookups/sec (0.755 µs)**, in
-    /// a debug build.
-    ///
-    /// The floor asserted below is an order of magnitude under the second figure
-    /// and three under the first: it is a guard against going back to a linear
-    /// scan, not a claim about how fast this machine is on any given day. The
-    /// release figures are `zone/hit in a 10k-record zone` (64 ns) and
-    /// `zone/miss in a 10k-record zone` (165 ns) in `benches/answer_path.rs`.
+    /// Debug build, before and after the index: 227 lookups/sec against 1.32M.
+    /// The floor below is an order of magnitude under the second and three above
+    /// the first.
     #[test]
     fn bench_zone_lookup() {
         use crate::zone::{Zone, ZoneRecord};
@@ -113,8 +77,8 @@ mod benches {
         let iterations = 20_000;
         let start = Instant::now();
         for i in 0..iterations {
-            // A hit deep in the zone, and a miss — the miss is what a linear
-            // scan pays the most for, and what a random-name flood produces.
+            // The miss is what a linear scan pays the most for, and what a
+            // random-name flood produces.
             let hit = format!("host{}.example.com.", 9_000 + (i % 1_000));
             assert_eq!(zone.query(&hit, Qtype::of(rt::A)).len(), 1);
             assert!(zone

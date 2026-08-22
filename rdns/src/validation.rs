@@ -1,27 +1,14 @@
 use crate::error::{RequestError, RequestResult, WireError};
 use crate::{DnsMessage, OpCode};
 
-/// A message that arrived at a listening socket **and is a question**.
+/// A message that arrived at a listening socket and is a question.
 ///
-/// The only way to build one is [`Request::from_bytes`], which refuses QR=1, so
-/// a path holding a `Request` has made the check.
+/// The only constructor is [`Request::from_bytes`], which refuses QR=1: a
+/// response answered at a listening socket is a packet loop neither end can see.
+/// A wrapper rather than a split of [`DnsMessage`], because the resolver, `tsig`
+/// and `xfr` all need messages that may have QR=1.
 ///
-/// It does not make the omission impossible: [`DnsMessage::try_from_bytes`] is
-/// still public and still right for the resolver, for `xfr`, and for tests. What
-/// it buys is one named door that all three answering paths go through, so the
-/// next one is copied from something that checks. Real teeth would mean
-/// `make_response` and its siblings taking `&Request`, which is larger than
-/// `TODO.md` #14b scopes.
-///
-/// The bug: `fn answer` (TCP) tested QR and `answer_datagram` (UDP) never did,
-/// and UDP is where it matters — a spoofed datagram naming another server as its
-/// source was a packet loop neither end could see.
-///
-/// A wrapper at the door rather than a split of [`DnsMessage`], because the
-/// resolver, `tsig` and `xfr` all need messages that may have QR=1.
-///
-/// `Deref` gives read access to every field. No `DerefMut` and no `&mut`
-/// accessor: `request.response = true` would restore the excluded state.
+/// `Deref` only — `request.response = true` would restore the excluded state.
 ///
 /// It does not run [`AdmissionCheck`], check the opcode, or verify a TSIG.
 #[derive(Debug, Clone)]
@@ -30,9 +17,8 @@ pub struct Request(DnsMessage);
 impl Request {
     /// Parse a packet that arrived at a socket this server is listening on.
     ///
-    /// `Err(RequestError::NotAQuestion)` for QR=1, and the caller's only correct
-    /// response to that is **silence**: there is no reply to send, because the
-    /// sender did not ask anything, and sending one is what closes the loop.
+    /// `Err(RequestError::NotAQuestion)` for QR=1; the only correct reply to
+    /// that is silence, since replying is what closes the loop.
     pub fn from_bytes(packet: &[u8]) -> RequestResult<Request> {
         let msg = DnsMessage::try_from_bytes(packet)?;
         if msg.response {
@@ -63,8 +49,6 @@ const MAX_REQUEST_ADDITIONALS: usize = 4;
 #[derive(Debug, Clone)]
 pub struct AdmissionLimits {
     /// Largest UDP request accepted (RFC 1035 §4.2.1's 512).
-    ///
-    /// The doc comment here used to cite "RFC 512", which is not a document.
     pub max_udp_size: usize,
     /// Largest TCP request accepted. Not a protocol limit — the length prefix
     /// allows 65,535 — but a request has no legitimate reason to be larger.
@@ -92,12 +76,8 @@ impl ValidationResult {
         matches!(self, ValidationResult::Valid)
     }
 
-    /// Why the packet was rejected, as something a caller can branch on.
-    ///
-    /// Typed rather than a message, because the decision this feeds is a
-    /// *response code*: [`WireError::Unsupported`] is NOTIMP and the rest are
-    /// FORMERR. Stringifying it here threw that away and forced every caller to
-    /// grep the wording.
+    /// Why the packet was rejected. Typed because it decides a response code:
+    /// [`WireError::Unsupported`] is NOTIMP, the rest FORMERR.
     pub fn error(&self) -> Option<&WireError> {
         match self {
             ValidationResult::Valid => None,
@@ -106,20 +86,11 @@ impl ValidationResult {
     }
 }
 
-/// Whether a datagram is worth parsing at all.
+/// Whether a datagram is worth parsing at all: size caps and per-section count
+/// caps, applied before anything is allocated.
 ///
-/// **Named for what it does, which is not validation** (`TODO.md` #19e). It was
-/// `RequestValidator`, and the name was a claim it could not keep: two of the
-/// three things it did were cheap header arithmetic with no equivalent in the
-/// parser, and the third was a second, weaker copy of the parser's own name
-/// rules that ran *first*. The copy is gone; what is left is an admission
-/// check — size caps and per-section count caps, on bytes nothing has trusted
-/// yet, before anything is allocated.
-///
-/// The distinction matters at the call site. A caller reaching for a
-/// "validator" reasonably assumes a packet that passes is well formed, and it is
-/// not: `DnsMessage::try_from_bytes` is the thing that decides that, and it runs
-/// afterwards.
+/// Not validation. A packet that passes is not known to be well formed;
+/// [`DnsMessage::try_from_bytes`] decides that, afterwards.
 pub struct AdmissionCheck {
     config: AdmissionLimits,
 }
@@ -164,21 +135,8 @@ impl AdmissionCheck {
             return ValidationResult::Invalid(e);
         }
 
-        // **No name walk here.** There used to be one, and it was a second,
-        // weaker implementation of what `dname.rs` does immediately afterwards:
-        // its own label-length check, its own 255-octet check and its own
-        // pointer handling. The two already disagreed in four ways
-        // (`TODO.md` #19e) — `MAX_DEPTH` 10 against 50, no requirement that a
-        // pointer point backwards (which is the whole of `dname.rs`'s cycle
-        // prevention), only the *first* question validated, and a `total_size`
-        // omitting the terminating root octet, so it admitted a name one octet
-        // over the limit.
-        //
-        // All four erred safe, because the real parser ran afterwards. That is
-        // the argument for deleting them rather than for keeping them: they were
-        // two implementations of one rule where the weaker one ran first, and
-        // the safe direction was a property of the call order rather than of the
-        // code. What is left is the part with no equivalent in the parser.
+        // No name walk here: `dname.rs` owns the label, length and pointer
+        // rules, and a second implementation only drifts from it.
         ValidationResult::Valid
     }
 
@@ -207,23 +165,14 @@ impl AdmissionCheck {
             });
         }
 
-        // Which sections a request may carry is a question per section. A blanket
-        // rule has silently killed a feature three times: the message is dropped
-        // before anything reads the opcode, so nothing says why.
+        // Per section, and capped rather than forbidden — a cap is a statement
+        // about resources, not a guess about which extensions exist:
         //
         // - Answer: empty in a QUERY, but a NOTIFY carries the zone's SOA
-        //   (RFC 1996 §3.7). Forbidden for QUERY, capped otherwise.
-        // - Authority: cannot be forbidden — an IXFR request is a QUERY carrying
-        //   the client's current SOA there (RFC 1995 §3). Capped.
-        // - Additional: where a request carries its OPT (RFC 6891 §6.1.1) and its
-        //   TSIG/SIG(0), so forbidding it kills every signed or EDNS query, which
-        //   it used to. Capped.
-        //
-        // A cap rather than a prohibition: a statement about resources rather
-        // than a guess about which protocol extensions exist.
-        // Read through the types rather than by shifting bits here: `OpCode`
-        // and the QR flag both have one definition already, and a second
-        // hand-rolled one is how the two come to disagree (`TODO.md` #19e).
+        //   (RFC 1996 §3.7).
+        // - Authority: an IXFR request is a QUERY carrying the client's SOA
+        //   there (RFC 1995 §3).
+        // - Additional: the OPT (RFC 6891 §6.1.1) and the TSIG/SIG(0).
         let qr_flag = data[2] & 0x80 != 0;
         let opcode = OpCode::from_u8((data[2] >> 3) & 0x0f);
         if !qr_flag {
@@ -257,8 +206,6 @@ impl AdmissionCheck {
 mod tests {
     use super::*;
 
-    /// The same 25-byte query as `test_valid_small_packet`, with the QR bit the
-    /// only thing that moves between the two calls below.
     fn query_packet(response: bool) -> Vec<u8> {
         let mut packet = vec![
             0x00, 0x01, // ID
@@ -278,15 +225,10 @@ mod tests {
     }
 
     /// A response arriving at a listening socket is not a question, and the
-    /// answer is silence (`CLAUDE.md` §8).
+    /// answer is silence.
     ///
-    /// **Not a failing-first regression test, and it should not be read as
-    /// one.** The defect this type exists for — `rdnsd` answering a response on
-    /// its UDP port — was fixed at the call site in an earlier commit, so there
-    /// is nothing left here to watch fail (`CLAUDE.md` §1). What this asserts is
-    /// that the constructor refuses; what actually stops the defect coming back
-    /// is that there is no other constructor, and that is a compile-time fact no
-    /// test can express.
+    /// Asserts only that the constructor refuses; what stops the defect
+    /// recurring is that there is no other constructor.
     #[test]
     fn a_response_is_not_a_request() {
         assert!(matches!(
@@ -299,8 +241,7 @@ mod tests {
         assert_eq!(request.queries[0].qname, "www.com.");
     }
 
-    /// The two failure modes stay apart, because they are different operational
-    /// signals: garbage or a parser probe, against a traffic loop.
+    /// Garbage and a traffic loop are different operational signals.
     #[test]
     fn a_malformed_packet_is_not_reported_as_a_response() {
         assert!(matches!(
@@ -411,9 +352,7 @@ mod tests {
     /// A NOTIFY carries the zone's SOA in its answer section (RFC 1996 §3.7),
     /// and an IXFR request carries the client's SOA in its authority section
     /// (RFC 1995 §3). Rejecting either here is invisible — the message is
-    /// dropped before anything reads the opcode — and it made NOTIFY silently
-    /// undeliverable to this server's own secondary role until a live test
-    /// caught it.
+    /// dropped before anything reads the opcode.
     #[test]
     fn test_a_notify_may_carry_its_soa_and_an_ixfr_may_carry_its_own() {
         let validator = AdmissionCheck::with_defaults();
@@ -571,24 +510,9 @@ mod tests {
         );
     }
 
-    /// **A fifth way the two name checks disagreed, found by re-pointing this
-    /// test rather than by reading either of them.**
-    ///
-    /// `TODO.md` #19e listed four disagreements between the admission check's
-    /// name walk and `dname.rs`. Here is the fifth: this test was called
-    /// `test_oversized_label` and its packet carries `0x41`, described in its
-    /// own comment as "Label length: 65 (exceeds 63 max)". It is not a length at
-    /// all. The top two bits of a length octet are a *type* (RFC 1035 §4.1.4),
-    /// and `01` is RFC 2673's binary label — so `dname.rs` calls it
-    /// `Unsupported { what: "a binary label" }`, which is right, while the
-    /// deleted copy read the low six bits as a length and called it `TooLong`,
-    /// which is not.
-    ///
-    /// A label longer than 63 octets cannot be spelled on the wire in the first
-    /// place: `00` is the only type that means "a length", and six bits hold 63.
-    /// So the check that was deleted was rejecting an impossible case with the
-    /// wrong reason, and the test agreed with it because both were written from
-    /// the same misreading — `CLAUDE.md` §1, exactly.
+    /// The top two bits of a length octet are a type (RFC 1035 §4.1.4), and `01`
+    /// is RFC 2673's binary label — not an oversized length. A label longer than
+    /// 63 octets cannot be spelled on the wire at all.
     #[test]
     fn an_extended_label_type_is_refused_by_the_parser() {
         let mut packet = vec![
@@ -602,14 +526,12 @@ mod tests {
         ];
         packet.extend_from_slice(&[0x61; 65]);
 
-        // Admitted: it is small, and its counts are sane. That is all this check
-        // now claims to know.
+        // Admitted: small, sane counts. That is all this check claims to know.
         assert!(AdmissionCheck::with_defaults()
             .validate_packet(&packet, false)
             .is_valid());
 
-        // And refused a moment later, by the one implementation of the rule,
-        // with the reason that is actually true of these bytes.
+        // And refused by the one implementation of the rule.
         let err = DnsMessage::try_from_bytes(&packet).expect_err("an extended label type");
         assert!(
             matches!(
@@ -618,7 +540,7 @@ mod tests {
                     what: "a binary label"
                 }
             ),
-            "asserting on the variant, not the message (`CLAUDE.md` §3): {err:?}"
+            "asserting on the variant, not the message: {err:?}"
         );
     }
 
@@ -652,10 +574,8 @@ mod tests {
         assert!(!result.is_valid());
     }
 
-    /// A truncated compression pointer is refused by the parser, for the same
-    /// reason as the test above. `dname.rs` is also the only one of the two that
-    /// ever required a pointer to point *backwards*, which is the whole of its
-    /// cycle prevention.
+    /// A truncated compression pointer is the parser's business, not this
+    /// check's.
     #[test]
     fn a_truncated_pointer_is_refused_by_the_parser() {
         let packet = vec![

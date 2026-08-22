@@ -1,18 +1,10 @@
 //! Zone transfer: building an AXFR response (RFC 5936).
 //!
-//! An AXFR is the one query whose answer is the entire zone, which makes it two
-//! things at once: the mechanism every secondary nameserver is built on, and a
-//! whole-database disclosure to anyone allowed to ask. This module does the
-//! first part — turning a zone into the sequence of messages a transfer is —
-//! and knows nothing about who may ask. That decision is
-//! [`crate::security::TransferAcl`]'s, and it defaults to nobody.
+//! Who may ask is [`crate::security::TransferAcl`]'s decision, not this module's.
 //!
-//! The shape of the response is the part worth stating. A transfer is not one
-//! message: it is a series, and RFC 5936 §2.2 requires the first to begin with
-//! the zone's SOA and the last to end with the same SOA. That framing is how the
-//! client knows where the transfer starts and, more importantly, that it
-//! finished — a truncated stream is otherwise indistinguishable from a small
-//! zone.
+//! A transfer is a series of messages, the first beginning and the last ending
+//! with the zone's SOA (RFC 5936 §2.2). Without that framing a truncated stream
+//! is indistinguishable from a small zone.
 
 use crate::error::{TransferError, TransferResult};
 use crate::utils::record_types as rt;
@@ -23,25 +15,16 @@ use crate::{DnsMessage, Edns, ResourceRecord, ResponseCode};
 /// How much of a message to fill before starting the next one.
 ///
 /// Not a protocol limit — the TCP length prefix allows 64 KiB (RFC 1035 §4.2.2)
-/// and RFC 5936 §2.2 leaves the split to the server. This is a size that keeps
-/// every message comfortably inside the frame even though the estimate used to
-/// pack them ignores name compression, which can only make the result smaller.
+/// and RFC 5936 §2.2 leaves the split to the server. Small enough that the
+/// packing estimate, which ignores name compression, stays inside the frame.
 pub const AXFR_TARGET_MESSAGE_SIZE: usize = 16 * 1024;
 
-/// The messages of an AXFR response for `zone`, **one at a time**.
+/// The messages of an AXFR response for `zone`, one at a time, so a caller that
+/// writes each envelope before asking for the next holds only one.
 ///
-/// The caller decides how many exist at once, and a caller that serializes and
-/// writes each envelope before asking for the next holds one. That is the whole
-/// of `TODO.md` #24c: this used to clone every record of the zone into a `Vec`,
-/// move that into a `Vec<DnsMessage>`, and hand both to a caller that then built
-/// every frame before writing any — the zone three times over, per concurrent
-/// transfer, for a zone that is already in memory.
-///
-/// `Err` when the zone has no SOA at its apex: without one there is nothing to
-/// open and close the transfer with, and a client cannot tell that what it
-/// received is complete. That is a broken zone rather than a bad request, so the
-/// caller should answer SERVFAIL. It is checked here, before the first envelope,
-/// so a caller that is streaming has not sent anything yet when it fails.
+/// `Err` when the zone has no SOA at its apex — a broken zone, so SERVFAIL.
+/// Checked before the first envelope, so a streaming caller has sent nothing yet
+/// when it fails.
 pub fn axfr_envelopes<'a>(
     request: &'a DnsMessage,
     zone: &'a Zone,
@@ -61,11 +44,8 @@ pub fn axfr_envelopes<'a>(
     Ok(Envelopes::new(request, AxfrRecords::new(zone, soa)))
 }
 
-/// The whole of an AXFR response, materialized.
-///
-/// [`axfr_envelopes`] collected, for the callers that want the sequence in hand:
-/// the tests, and [`crate::ixfr`]'s fallback to a full transfer. A caller serving
-/// a real zone to a socket should pull the iterator instead.
+/// [`axfr_envelopes`] collected, for callers that want the sequence in hand. A
+/// caller serving a real zone to a socket should pull the iterator instead.
 pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<DnsMessage>> {
     Ok(axfr_envelopes(request, zone)?.collect())
 }
@@ -73,8 +53,8 @@ pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<Dn
 /// The records of an AXFR in wire order: the apex SOA, the zone in load order
 /// without that SOA, then the apex SOA again (RFC 5936 §2.2).
 ///
-/// The middle SOA is skipped so the record appears exactly twice — a client that
-/// saw the closing SOA early would stop reading there.
+/// Skipping the middle one keeps the count at two; a client that saw the closing
+/// SOA early would stop reading there.
 struct AxfrRecords<'a> {
     zone: &'a Zone,
     soa: ResourceRecord,
@@ -124,21 +104,17 @@ impl Iterator for AxfrRecords<'_> {
     }
 }
 
-/// A transfer's records, split into messages that each fit a TCP frame.
+/// A transfer's records, split into messages that each fit a TCP frame. Shared
+/// with [`crate::ixfr`]: the framing belongs to a transfer, not to its kind.
 ///
-/// Shared with the incremental transfer in [`crate::ixfr`], because the framing
-/// is a property of a transfer rather than of which kind it is: same target size,
-/// same estimate, same one-well-formed-answer-per-message rule.
-///
-/// The estimate is by wire size and ignores name compression: the encoded name is
-/// at most its text length plus two, and the fixed part of a record is ten bytes.
-/// An estimate that can only be too large is the safe direction, since the real
-/// limit is the 64 KiB length prefix.
+/// The estimate ignores name compression — a name costs at most its text length
+/// plus two, a record's fixed part ten bytes — so it can only be too large,
+/// which is the safe direction against the 64 KiB length prefix.
 pub(crate) struct Envelopes<'a, I> {
     request: &'a DnsMessage,
     records: I,
-    /// The record that did not fit the envelope just yielded. Held rather than
-    /// re-read, because the source is an iterator with no way back.
+    /// The record that did not fit the envelope just yielded; the source is an
+    /// iterator with no way back.
     carried: Option<ResourceRecord>,
     first: bool,
 }
@@ -179,20 +155,13 @@ impl<I: Iterator<Item = ResourceRecord>> Iterator for Envelopes<'_, I> {
         }
 
         let mut message = transfer_message(self.request, current);
-        // RFC 6891 §6.1.1 — a response to a request that carried an OPT record
-        // carries one — applies to a transfer as much as to a lookup, and the
-        // transfer path was the one that never did it. On the *first* message
-        // only: a multi-message transfer is one response, BIND puts the OPT there
-        // and nowhere else, and repeating it would put a second OPT in what
-        // §6.1.1 treats as a single exchange.
-        //
-        // Before the TSIG, if one follows: RFC 8945 §5.1 requires the TSIG to be
-        // the last record in the additional section, and the signer appends after
-        // this.
+        // Mirror the client's OPT (RFC 6891 §6.1.1) on the first message only: a
+        // multi-message transfer is one exchange, as BIND treats it, so repeating
+        // it would be a second OPT. Before any TSIG, which must be last in the
+        // additional section (RFC 8945 §5.1) and is appended by the signer.
         if std::mem::take(&mut self.first) && self.request.has_edns() {
-            // `with_payload_size` carries no options, so this cannot fail. The
-            // size is the client's own, echoed: a transfer is framed by the TCP
-            // length prefix, so our UDP payload size says nothing useful here.
+            // The client's own size, echoed: a transfer is framed by the TCP
+            // length prefix, so ours says nothing useful here.
             message.set_edns(Edns::with_payload_size(self.request.udp_payload_size()));
         }
         Some(message)
@@ -209,9 +178,8 @@ pub(crate) fn pack_transfer_messages(
 /// One message of a transfer: the request's id and question, authoritative, with
 /// this slice of the zone in the answer section.
 ///
-/// Every message repeats the question. RFC 5936 §2.2.1 allows omitting it after
-/// the first and requires accepting either, so the simpler of the two is fine —
-/// and it means each message is a well-formed response on its own.
+/// Every message repeats the question, which RFC 5936 §2.2.1 permits, so each is
+/// a well-formed response on its own.
 pub(crate) fn transfer_message(request: &DnsMessage, answers: Vec<ResourceRecord>) -> DnsMessage {
     DnsMessage {
         id: request.id,
@@ -275,8 +243,7 @@ mod tests {
         .expect("zone should parse")
     }
 
-    /// RFC 5936 §2.2: the transfer opens and closes with the same SOA. A client
-    /// that does not see the closing SOA has to assume the stream was cut.
+    /// RFC 5936 §2.2: the transfer opens and closes with the same SOA.
     #[test]
     fn test_transfer_begins_and_ends_with_the_soa() {
         let zone = small_zone();
@@ -297,8 +264,8 @@ mod tests {
         );
     }
 
-    /// Everything in the zone goes across, under its absolute name, wildcard
-    /// records included — a secondary has to be able to answer for them too.
+    /// Everything goes across under its absolute name, wildcards included — a
+    /// secondary has to answer for those too.
     #[test]
     fn test_every_record_is_transferred_under_its_absolute_name() {
         let zone = small_zone();
@@ -345,15 +312,14 @@ mod tests {
         }
     }
 
-    /// A zone too big for one message becomes several, each still framed as a
-    /// complete answer — and the first and last of the *series* carry the SOA.
+    /// A zone too big for one message becomes several, each a complete answer,
+    /// with the SOA at each end of the series.
     #[test]
     fn test_a_large_zone_is_split_across_messages() {
         let mut text = String::from(
             "$TTL 3600\n@ IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400\n",
         );
-        // Long names, so the estimate crosses the target well before this
-        // becomes a slow test.
+        // Long names, so the estimate crosses the target without a slow test.
         for i in 0..2_000 {
             text.push_str(&format!(
                 "host-with-a-fairly-long-name-{i} IN TXT \"padding padding padding\"\n"
@@ -395,14 +361,13 @@ mod tests {
             2_002
         );
 
-        // And each message fits a TCP frame, which is the point of splitting.
+        // And each message fits a TCP frame.
         for message in &messages {
             assert!(message.to_bytes_within(u16::MAX as usize).unwrap().len() <= u16::MAX as usize);
         }
     }
 
-    /// No SOA, no transfer: there is nothing to bracket the stream with, so the
-    /// client could not tell a complete transfer from a cut one.
+    /// No SOA, no transfer: nothing brackets the stream.
     #[test]
     fn test_a_zone_without_an_soa_cannot_be_transferred() {
         let zone = parse_zone_file("www IN A 192.0.2.1\n", "example.com.").unwrap();

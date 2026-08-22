@@ -1,5 +1,4 @@
-//! What one denial-cache lookup costs when nothing in the cache bears on it —
-//! the measurement half of `TODO.md` #23.
+//! What one denial-cache lookup costs when nothing in the cache bears on it.
 //!
 //! The worst case for the scan this replaced, and the case a flood of random
 //! names produces: 256 cached NSEC3 records, every span one hash wide, so every
@@ -28,8 +27,8 @@
 //! copy, a `Vec<&str>` of the labels, a join and a `format!` per ancestor. The
 //! 150-iteration column adds ~7.6 µs per label on top, which is the 150 extra
 //! SHA-1 rounds over 22 bytes and is the part RFC 9276 §3.1 asks zones not to
-//! ask for. Removing the first would want a name that can yield a suffix without
-//! allocating (`TODO.md` #13e, #25).
+//! ask for. Removing the first wants a name type that can yield a suffix
+//! without allocating.
 
 use rdns::dnssec_denial::{base32hex_encode, build_type_bitmap, nsec3_hash};
 use rdns::nsec_cache::NsecCache;

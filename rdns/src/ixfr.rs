@@ -1,22 +1,12 @@
 //! Incremental zone transfer: sending only what changed (RFC 1995).
 //!
-//! An AXFR moves the whole zone every time any part of it moves. For a zone of
-//! any size that is almost all waste — a serial bump and one changed address
-//! costs the same as a fresh copy — and it is why a secondary with a short
-//! REFRESH is expensive to be.
+//! Deltas are computed when a new version arrives — BIND's
+//! `ixfr-from-differences` semantics — and persisted by `journal.rs`.
 //!
-//! Deltas are computed when a new version arrives and kept in memory — BIND's
-//! `ixfr-from-differences` semantics — because a zone here changes in discrete
-//! events (a reload, a transfer from a master) rather than being edited in
-//! place. `journal.rs` persists them, which dynamic UPDATE made necessary; before
-//! that a restart forgot them and every secondary asking for an increment got a
-//! full transfer, which RFC 1995 §4 permits unconditionally.
-//!
-//! The response format (RFC 1995 §4) is not "the changed records": it is the
-//! current SOA, then one difference sequence per version step — old SOA, records
-//! deleted, new SOA, records added — then the current SOA again. A client reads
-//! the second record of the stream to decide what it is holding: another SOA
-//! means an increment, anything else means a full zone.
+//! The response (RFC 1995 §4) is the current SOA, then one difference sequence
+//! per version step — old SOA, deletions, new SOA, additions — then the current
+//! SOA again. The stream's *second* record is what tells a client which it has:
+//! another SOA means an increment, anything else means a full zone.
 
 use crate::error::{TransferError, TransferResult};
 use crate::Class;
@@ -31,11 +21,8 @@ use crate::utils::{absolute_lowered, record_types as rt, NameKeyBuf};
 use crate::zone::{Zone, ZoneRecord};
 use crate::{DnsMessage, RecordData, ResourceRecord};
 
-/// How many version steps to remember per zone.
-///
-/// A secondary that has missed more than this many changes is one that has been
-/// away a long time, and a full transfer is both correct and probably cheaper
-/// than the chain would have been.
+/// How many version steps to remember per zone. Past this a full transfer is
+/// both correct and probably cheaper than the chain.
 pub const MAX_DELTAS_PER_ZONE: usize = 32;
 
 /// One version step: what it takes to get from `from_serial` to `to_serial`.
@@ -52,8 +39,8 @@ pub struct ZoneDelta {
 }
 
 impl ZoneDelta {
-    /// How many records this step moves, which is what decides whether sending
-    /// it is actually cheaper than sending the zone.
+    /// How many records this step moves — what decides whether sending it beats
+    /// sending the zone.
     pub fn len(&self) -> usize {
         self.deleted.len() + self.added.len()
     }
@@ -65,13 +52,10 @@ impl ZoneDelta {
 
 /// The version steps remembered for every zone.
 ///
-/// One of these beside the zone map, updated wherever a zone is replaced. It is
-/// derived state, so the two have to move together — the same hazard the zone
-/// index has, and the reason [`DeltaLog::note_change`] takes both versions
-/// rather than being something a caller can forget to call with the old one.
-/// [`plan_change`] and [`DeltaLog::record`] split that in two without giving the
-/// property up: the token only planning can mint is what the recording step
-/// consumes.
+/// Derived state living beside the zone map, so the two must move together:
+/// [`DeltaLog::note_change`] takes both versions, and the split into
+/// [`plan_change`] plus [`DeltaLog::record`] keeps that by making the token only
+/// planning can mint what recording consumes.
 #[derive(Debug, Default)]
 pub struct DeltaLog {
     by_zone: HashMap<NameKeyBuf, Vec<ZoneDelta>>,
@@ -79,15 +63,10 @@ pub struct DeltaLog {
 
 /// A version step that has been computed but not yet recorded.
 ///
-/// This exists because computing one is the expensive part — [`diff`] walks
-/// every record of both versions into a `BTreeMap` — and `rdnsd` needs that
-/// work to happen off the zone map's *write* lock, where it blocks every query
-/// for as long as it takes. So the daemon plans under the read lock and records
-/// under the write lock; see `Zones` in `rdnsd`, which carries the counter that
-/// says whether a plan made under one lock is still true under the other.
-///
-/// The zone key is baked in at planning time, so a plan cannot be recorded
-/// against the wrong zone.
+/// [`diff`] walks every record of both versions, so `rdnsd` plans under the zone
+/// map's read lock and records under the write lock rather than blocking every
+/// query for the length of a diff. The zone key is baked in at planning time, so
+/// a plan cannot be recorded against the wrong zone.
 #[derive(Debug, Clone)]
 pub struct PlannedDelta {
     zone: String,
@@ -95,9 +74,7 @@ pub struct PlannedDelta {
 }
 
 impl PlannedDelta {
-    /// Which zone this step belongs to, folded — so a caller persisting the log
-    /// after recording knows which history to write out without re-deriving the
-    /// key from the zone it no longer holds.
+    /// Which zone this step belongs to, folded.
     pub fn zone(&self) -> &str {
         &self.zone
     }
@@ -105,11 +82,8 @@ impl PlannedDelta {
 
 /// Work out the step from `old` to `new`, without recording it anywhere.
 ///
-/// `None` when there is no step worth keeping, which is the same three cases
-/// [`DeltaLog::note_change`] declines: no previous version (a zone loaded at
-/// startup has no history and never did), a serial that did not move forward,
-/// or two versions that are identical — a serial bump with no change is a
-/// legitimate thing to publish, but there is no increment in it to remember.
+/// `None` when there is no step to keep: no previous version, a serial that did
+/// not move forward, or two identical versions.
 pub fn plan_change(old: Option<&Zone>, new: &Zone) -> Option<PlannedDelta> {
     let (Some(old), Some(from), Some(to)) = (old, old.and_then(Zone::serial), new.serial()) else {
         return None;
@@ -132,13 +106,7 @@ impl DeltaLog {
         DeltaLog::default()
     }
 
-    /// Record the step from `old` to `new`, if there is one to record.
-    ///
-    /// Nothing is stored when there was no previous version (a zone loaded at
-    /// startup has no history and never did), when the serial did not move
-    /// forward, or when the two versions are identical — a serial bump with no
-    /// change is a legitimate thing to publish, but there is no increment in it
-    /// worth keeping.
+    /// Record the step from `old` to `new`, if [`plan_change`] finds one.
     pub fn note_change(&mut self, old: Option<&Zone>, new: &Zone) {
         if let Some(planned) = plan_change(old, new) {
             self.record(planned);
@@ -146,10 +114,6 @@ impl DeltaLog {
     }
 
     /// Record a step [`plan_change`] already worked out.
-    ///
-    /// The two-phase caller is `rdnsd`, which plans under the zone map's read
-    /// lock and records under its write lock so that a diff of every record in
-    /// the zone is not something every query waits behind.
     pub fn record(&mut self, planned: PlannedDelta) {
         let history = self
             .by_zone
@@ -162,9 +126,8 @@ impl DeltaLog {
         }
     }
 
-    /// A zone that is gone — expired, or removed from the configuration — takes
-    /// its history with it. Serving increments of a zone we no longer hold would
-    /// be answering for something we have withdrawn.
+    /// A zone that is gone — expired, or deconfigured — takes its history with
+    /// it: increments of a withdrawn zone are still answers for it.
     pub fn forget(&mut self, zone: &str) {
         self.by_zone.remove(key(zone).as_str());
     }
@@ -172,9 +135,8 @@ impl DeltaLog {
     /// The chain of steps from `serial` up to the newest one remembered, or
     /// `None` if there is no unbroken chain.
     ///
-    /// Unbroken is the whole requirement: a gap means some change would be
-    /// skipped, and a secondary that applied the rest would hold a zone that
-    /// never existed — which no serial comparison afterwards could detect.
+    /// A gap would skip a change, leaving the secondary holding a zone that
+    /// never existed — undetectable by any later serial comparison.
     pub fn chain_from(&self, zone: &str, serial: Serial) -> Option<Vec<&ZoneDelta>> {
         let history = self.by_zone.get(key(zone).as_str())?;
         let start = history.iter().position(|d| d.from_serial == serial)?;
@@ -193,10 +155,6 @@ impl DeltaLog {
 
     /// Every step remembered for a zone, oldest first — what
     /// [`crate::journal::Journal::save`] writes out.
-    ///
-    /// Borrowed rather than cloned: a caller persisting these is holding the
-    /// lock anyway, and the whole history of a busy zone is not a thing to copy
-    /// on the way to a file.
     pub fn all(&self, zone: &str) -> Vec<&ZoneDelta> {
         self.by_zone
             .get(key(zone).as_str())
@@ -206,15 +164,10 @@ impl DeltaLog {
 
     /// Put a history back, as read from a journal at startup.
     ///
-    /// Replaces rather than appends, and bounded on the way in like everything
-    /// else here: a journal an operator has grown by hand must not be able to
-    /// make this process hold more than [`MAX_DELTAS_PER_ZONE`] steps, which is
-    /// the same argument `CLAUDE.md` §5 makes about every other table keyed on
-    /// something outside this process's control.
-    ///
-    /// It does *not* check that the steps link, because
-    /// [`crate::journal::Journal::load`] already refused a chain with a gap and
-    /// doing it twice would make the second copy the one nobody maintains (§7).
+    /// Replaces rather than appends, and bounded on the way in: a hand-grown
+    /// journal must not make this process hold more than
+    /// [`MAX_DELTAS_PER_ZONE`] steps. It does not check that the steps link —
+    /// [`crate::journal::Journal::load`] already refuses a chain with a gap.
     pub fn restore(&mut self, zone: &str, mut deltas: Vec<ZoneDelta>) {
         if deltas.len() > MAX_DELTAS_PER_ZONE {
             deltas.drain(..deltas.len() - MAX_DELTAS_PER_ZONE);
@@ -237,23 +190,16 @@ impl DeltaLog {
 }
 
 /// The form a zone name is filed under here: absolute and ASCII-folded.
-///
-/// One line, because the rule lives in [`crate::utils::absolute_lowered`] — this
-/// was a seventh hand-written copy of it (`TODO.md` #13b), and the copies were
-/// worth removing not because any of them was wrong but because the next one
-/// would have been.
 fn key(zone: &str) -> String {
     absolute_lowered(zone).into_owned()
 }
 
-/// What changed between two versions of a zone.
+/// What changed between two versions of a zone. `None` if either has no apex
+/// SOA.
 ///
-/// `None` if either version has no apex SOA — there is no version step between
-/// zones that cannot say which version they are.
-///
-/// The apex SOA is excluded from both lists: it is carried by the framing, as
-/// the header of each half, and a copy of it among the records would read as a
-/// second difference sequence.
+/// The apex SOA is excluded from both lists: the framing carries it as the
+/// header of each half, and a copy among the records would read as a second
+/// difference sequence.
 pub fn diff(old: &Zone, new: &Zone) -> Option<ZoneDelta> {
     let from_soa = apex_soa(old)?;
     let to_soa = apex_soa(new)?;
@@ -277,9 +223,8 @@ pub fn diff(old: &Zone, new: &Zone) -> Option<ZoneDelta> {
     let mut deleted = Vec::new();
     let mut added = Vec::new();
     for (key, count) in counts {
-        // A record present in both cancels to zero and is not part of the step.
-        // The count, rather than a set, is what keeps a zone that holds the same
-        // record twice from reading as a change when one copy is removed.
+        // A record present in both cancels to zero. A count rather than a set,
+        // so removing one of two identical records still reads as a change.
         for _ in 0..count.max(0) {
             deleted.push(key.clone().into_record());
         }
@@ -300,32 +245,26 @@ pub fn diff(old: &Zone, new: &Zone) -> Option<ZoneDelta> {
 
 /// A record's identity for comparison: everything about it that can change.
 ///
-/// The TTL is part of it deliberately. Two records that differ only in TTL are
-/// not the same record to a secondary — it caches and re-serves that number — so
-/// a TTL change is a deletion and an addition, which is what BIND's
-/// `ixfr-from-differences` produces too. Names compare case-insensitively
+/// The TTL is part of it — a secondary caches and re-serves that number, so a
+/// TTL change is a deletion plus an addition, as BIND's
+/// `ixfr-from-differences` produces. Names compare case-insensitively
 /// (RFC 4343), so the key holds the down-cased form and the original beside it.
 ///
-/// **It carries the whole [`RecordData`] rather than its two fields**, so that
-/// [`RecordKey::into_record`] hands back the record it was given instead of
-/// rebuilding one. Once `RecordData`'s fields were sealed (`TODO.md` #14c) a
-/// rebuild would have had to go through the checked constructor — re-parsing
-/// every changed record to re-establish an invariant these bytes never left, on
-/// a path that already walks both versions of the zone.
+/// It carries the whole [`RecordData`] so [`RecordKey::into_record`] hands back
+/// the record it was given rather than re-parsing it through the checked
+/// constructor.
 ///
-/// `Ord` is written out rather than derived for the same reason: it has to keep
-/// comparing TYPE *before* class and TTL, which is the order the derive gave
-/// while those were separate fields, and which decides the order records come
-/// out of the diff in and therefore go onto the wire in.
+/// `Ord` is written out rather than derived because it must compare TYPE before
+/// class and TTL: that order decides how records come out of the diff and
+/// therefore how they go onto the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordKey {
     lowercase_name: String,
     class: Class,
     ttl: Ttl,
     rdata: RecordData,
-    /// Not part of the ordering in practice — it is a function of
-    /// `lowercase_name` — but carried so the record can be rebuilt with the case
-    /// it was published under.
+    /// A function of `lowercase_name`, carried so the record can be rebuilt with
+    /// the case it was published under.
     name: String,
 }
 
@@ -389,18 +328,13 @@ fn apex_soa(zone: &Zone) -> Option<ResourceRecord> {
 
 /// Apply one difference sequence to a zone, returning the result.
 ///
-/// **This is why `Zone` has no record-removal API and should never get one.** The
-/// index holds *positions* into the record vector, so removing a record in place
-/// shifts every later position and invalidates it. Rebuilding instead is
-/// O(zone size) per sequence rather than per record, which at any zone size this
-/// serves is nothing — and it means the zone that results is one built by the
-/// ordinary constructor, with an index that cannot disagree with its contents.
+/// The zone is rebuilt rather than edited, which is why `Zone` has no
+/// record-removal API: its index holds *positions* into the record vector, so an
+/// in-place removal invalidates every later one.
 ///
-/// A deletion naming a record the zone does not hold is not an error. RFC 1995
-/// says nothing about it, and the only sensible reading is that the master and we
-/// disagree about a record that is, either way, meant to be gone — refusing the
-/// whole transfer over it would strand a secondary on a version it can never
-/// leave. `removed` reports the count so a caller can say so.
+/// A deletion naming a record the zone does not hold is not an error — the
+/// record is meant to be gone either way, and refusing would strand a secondary
+/// on a version it can never leave. `removed` reports the count.
 pub fn apply_changes(
     base: &Zone,
     deleted: &[ResourceRecord],
@@ -415,9 +349,8 @@ pub fn apply_changes(
     let mut zone = Zone::new(base.origin().to_string());
     let mut removed = 0;
     for record in base.records() {
-        // The apex SOA is replaced wholesale by the sequence's own, so the old
-        // one is dropped here rather than being expected among the deletions —
-        // which is exactly where it is *not*, because the framing carries it.
+        // The sequence's own SOA replaces this one; the framing carries it, so
+        // it is never among the deletions.
         if is_apex_soa(base, record) {
             continue;
         }
@@ -469,8 +402,7 @@ fn resource_key(zone: &Zone, record: &ResourceRecord) -> RecordKey {
 /// What an IXFR request turned into.
 pub enum IxfrResponse {
     /// The client is already current: a single SOA and nothing else
-    /// (RFC 1995 §2). Not an error — it is the cheapest possible answer, and the
-    /// reason a secondary can afford a short REFRESH.
+    /// (RFC 1995 §2).
     UpToDate(Vec<DnsMessage>),
     /// The increments the client is missing.
     Incremental {
@@ -479,22 +411,19 @@ pub enum IxfrResponse {
         steps: usize,
         records: usize,
     },
-    /// No usable chain, so the whole zone — always permitted (RFC 1995 §4), and
-    /// what a client is required to cope with.
+    /// No usable chain, so the whole zone — always permitted (RFC 1995 §4).
     ///
-    /// **The messages are not in here**, which is `TODO.md` #24c: this is the
-    /// path a secondary that fell behind takes, so it is exactly the case where
-    /// materializing the zone twice over is worst. The decision is cheap and the
-    /// answer is a whole zone; the caller builds it, and can stream it.
+    /// The messages are not in here: the caller builds them, and can stream
+    /// them, rather than materializing the zone twice.
     FullTransfer { why: &'static str },
 }
 
 impl IxfrResponse {
     /// This response as messages, in hand.
     ///
-    /// A full transfer needs `zone` and `request` back, because it no longer
-    /// carries a copy of the zone. A caller writing to a socket should pull
-    /// [`crate::transfer::axfr_envelopes`] for that case instead of calling this.
+    /// A full transfer needs `zone` and `request` back, since it carries no copy
+    /// of the zone. A caller writing to a socket wants
+    /// [`crate::transfer::axfr_envelopes`] for that case instead.
     pub fn messages(self, request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<DnsMessage>> {
         match self {
             IxfrResponse::UpToDate(messages) | IxfrResponse::Incremental { messages, .. } => {
@@ -507,10 +436,8 @@ impl IxfrResponse {
 
 /// The serial an IXFR request is asking to be brought forward from.
 ///
-/// It rides in the *authority* section (RFC 1995 §3), which is the one thing
-/// about an IXFR request that differs from an AXFR one — and the reason a
-/// validator that forbids authority sections in requests makes IXFR unreceivable
-/// without ever saying so.
+/// It rides in the *authority* section (RFC 1995 §3), so a validator that
+/// forbids authority sections in requests makes IXFR unreceivable.
 pub fn requested_serial(request: &DnsMessage) -> Option<Serial> {
     request
         .authorities
@@ -538,17 +465,16 @@ pub fn ixfr_response(
         .serial()
         .ok_or_else(|| TransferError::malformed(format!("zone {apex} has no serial")))?;
 
-    // No SOA in the request is an IXFR that did not say what it holds. RFC 1995
-    // §3 requires one; without it the only answerable question is "give me
-    // everything".
+    // RFC 1995 §3 requires the request to carry an SOA; without one the only
+    // answerable question is "give me everything".
     let Some(client_serial) = requested_serial(request) else {
         return Ok(IxfrResponse::FullTransfer {
             why: "the request carried no SOA to compare against",
         });
     };
 
-    // Already current — or ahead of us, which happens to a secondary of a
-    // primary that was rolled back, and which more data would not fix.
+    // Already current, or ahead of us — a secondary of a primary that was rolled
+    // back, which more data would not fix.
     if !current.is_newer_than(client_serial) {
         return Ok(IxfrResponse::UpToDate(pack_transfer_messages(
             request,
@@ -562,8 +488,7 @@ pub fn ixfr_response(
         });
     };
     if chain.last().map(|d| d.to_serial) != Some(current) {
-        // The chain exists but does not reach the version we are serving, which
-        // means the zone moved by some route the log did not see. Sending it
+        // The zone moved by some route the log did not see; sending the chain
         // would leave the client short of where it thinks it got to.
         return Ok(IxfrResponse::FullTransfer {
             why: "the remembered changes do not reach the zone's current serial",
@@ -571,8 +496,6 @@ pub fn ixfr_response(
     }
 
     // RFC 1995 §4: if the increment is not smaller than the zone, send the zone.
-    // The condition is about what actually crosses the wire, and the point of an
-    // incremental transfer is that less of it does.
     let records: usize = chain.iter().map(|d| d.len()).sum();
     if records >= zone.records().len() {
         return Ok(IxfrResponse::FullTransfer {
@@ -650,10 +573,6 @@ mod tests {
         messages.iter().flat_map(|m| m.answers.iter()).collect()
     }
 
-    // -----------------------------------------------------------------
-    // Diffing
-    // -----------------------------------------------------------------
-
     #[test]
     fn test_diff_finds_what_moved() {
         let old = zone_at(1, "www IN A 192.0.2.1\nmail IN A 192.0.2.2\n");
@@ -673,7 +592,7 @@ mod tests {
         assert_eq!(delta.added.len(), 2);
     }
 
-    /// A record that did not move must not appear in either list — otherwise an
+    /// A record that did not move appears in neither list; otherwise an
     /// "incremental" transfer is the whole zone with extra steps.
     #[test]
     fn test_unchanged_records_are_not_in_the_delta() {
@@ -689,8 +608,8 @@ mod tests {
         assert_eq!(delta.added[0].name, "new.example.com.");
     }
 
-    /// The apex SOA is the framing, not a record of the difference: a copy of it
-    /// among the changes would read as the start of another sequence.
+    /// The apex SOA is framing: a copy among the changes reads as the start of
+    /// another sequence.
     #[test]
     fn test_the_apex_soa_is_never_in_the_delta() {
         let old = zone_at(1, "www IN A 192.0.2.1\n");
@@ -714,10 +633,6 @@ mod tests {
         assert_eq!(delta.deleted[0].ttl, Ttl::from_secs(3600));
         assert_eq!(delta.added[0].ttl, Ttl::from_secs(60));
     }
-
-    // -----------------------------------------------------------------
-    // The log
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_the_log_chains_steps_together() {
@@ -751,9 +666,8 @@ mod tests {
         assert!(log.chain_from("other.test.", Serial::new(1)).is_none());
     }
 
-    /// The history is bounded, and it is the oldest steps that go — a client far
-    /// enough behind falls back to a full transfer, which is what that fallback
-    /// is for.
+    /// The history is bounded and the oldest steps go first; a client far enough
+    /// behind falls back to a full transfer.
     #[test]
     fn test_the_history_is_bounded() {
         let mut log = DeltaLog::new();
@@ -778,9 +692,8 @@ mod tests {
         );
     }
 
-    /// A serial that did not move forward is not a version step. A zone edited
-    /// without bumping its serial is a mistake, and inventing a step for it would
-    /// hand secondaries a change they can never ask for again.
+    /// A serial that did not move forward is not a version step: inventing one
+    /// hands secondaries a change they can never ask for again.
     #[test]
     fn test_a_serial_that_did_not_advance_is_not_a_step() {
         let mut log = DeltaLog::new();
@@ -804,10 +717,6 @@ mod tests {
         log.forget("EXAMPLE.COM.");
         assert_eq!(log.len("example.com."), 0, "and case-insensitively");
     }
-
-    // -----------------------------------------------------------------
-    // The response
-    // -----------------------------------------------------------------
 
     /// RFC 1995 §4's shape, which a client reads positionally: current SOA, then
     /// (old SOA, deletions, new SOA, additions) per step, then the current SOA.
@@ -853,8 +762,8 @@ mod tests {
         assert_eq!(all[5].rdata.rtype(), rt::SOA, "closes with the current SOA");
         assert_eq!(all.len(), 6);
 
-        // The second record being an SOA is exactly how a client tells this from
-        // a full transfer, so pin the distinction.
+        // The second record being an SOA is how a client tells this from a full
+        // transfer, so pin the distinction.
         let full = axfr_messages(&request(Some(1)), &v2).unwrap();
         assert_ne!(answers(&full)[1].rdata.rtype(), rt::SOA);
     }
@@ -870,15 +779,13 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].rdata.rtype(), rt::SOA);
 
-        // A client *ahead* of us gets the same answer: more data would not fix a
-        // primary that was rolled back.
+        // A client ahead of us gets the same answer.
         let ahead = ixfr_response(&request(Some(9)), &zone, &DeltaLog::new()).expect("response");
         assert!(matches!(ahead, IxfrResponse::UpToDate(_)));
     }
 
-    /// Falling back to a full transfer is not a failure — RFC 1995 §4 permits it
-    /// unconditionally, and it is what makes forgetting the deltas on restart
-    /// survivable.
+    /// Falling back to a full transfer is not a failure: RFC 1995 §4 permits it
+    /// unconditionally.
     #[test]
     fn test_falls_back_to_a_full_transfer_when_it_cannot_do_better() {
         let v2 = zone_at(2, "www IN A 192.0.2.2\n");
@@ -900,8 +807,7 @@ mod tests {
         );
     }
 
-    /// If the increment is not smaller than the zone, the zone is the cheaper
-    /// answer and the RFC says to send it.
+    /// An increment no smaller than the zone is sent as the zone (RFC 1995 §4).
     #[test]
     fn test_a_change_bigger_than_the_zone_is_sent_as_a_full_transfer() {
         let mut log = DeltaLog::new();
@@ -920,8 +826,8 @@ mod tests {
         );
     }
 
-    /// A chain that stops short of what we are serving would leave the client
-    /// believing it had caught up when it had not.
+    /// A chain stopping short of what we serve leaves the client believing it
+    /// caught up when it did not.
     #[test]
     fn test_a_chain_that_does_not_reach_the_current_serial_is_not_used() {
         let mut log = DeltaLog::new();

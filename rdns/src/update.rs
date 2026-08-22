@@ -1,30 +1,12 @@
 //! Dynamic update (RFC 2136): reading an UPDATE, and applying what it asks for.
 //!
-//! Turns an UPDATE message into a checked list of prerequisites and changes,
-//! evaluates the prerequisites against a zone, and applies the changes to produce
-//! a new zone, carrying the serial forward as §3.6 requires. It never touches a
-//! file, looks at a TSIG key, or decides who may update what — that is the
-//! persistence-and-policy half, in `rdnsd`. What it produces is also the shape a
-//! journal entry and an IXFR delta both want.
+//! Sections are the ordinary four, renamed (§2.2): question = Zone, answer =
+//! Prerequisite, authority = Update. CLASS is the verb — the zone's own class
+//! adds, `ANY` deletes an RRset or a name, `NONE` deletes one record.
 //!
-//! The serial: an UPDATE moves the zone's own serial by one (§3.6), and signing
-//! serves `file_serial + hours-since-epoch`
-//! ([`crate::zone_signer::signed_serial`]). Because that term is added rather
-//! than `max`ed, an UPDATE's `+1` survives signing as a `+1` in the served
-//! number; under a `max` every UPDATE inside one hour would serve one serial and
-//! no secondary would fetch any of them.
-//!
-//! The bumped serial has to be persisted by the caller, or a reload re-reads the
-//! file's older number and the served serial goes backwards — which a secondary
-//! reads as older, declining to transfer while its signatures expire.
-//!
-//! The sections are the ordinary four, renamed (RFC 2136 §2.2): question = Zone,
-//! answer = Prerequisite, authority = Update, additional unchanged (where a TSIG
-//! goes). [`DnsMessage`] already carries all of it, so no new wire parsing.
-//!
-//! Class is the verb, which is why the parsing below is a table: the zone's own
-//! class means add, `ANY` (255) means delete a whole RRset or name, `NONE` (254)
-//! means delete one specific record.
+//! Policy, TSIG and persistence are the caller's. The §3.6 serial bump must be
+//! persisted, or a reload serves the file's older number and a secondary
+//! declines to transfer while its signatures expire.
 
 use crate::utils::{is_at_or_under, record_types as rt};
 use crate::zone::{Zone, ZoneRecord};
@@ -37,11 +19,8 @@ use crate::{DnsMessage, OpCode, QueryClass, RecordData, ResourceRecord, Response
 
 /// Why an UPDATE was refused, and the RCODE that says so on the wire.
 ///
-/// One type rather than a variant per RFC section, because every caller does the
-/// same two things with it: put `rcode` in the reply, and log `why`. The
-/// category *is* the rcode — RFC 2136 §3 assigns a specific one to each way an
-/// update can be rejected — and the string is the detail no rcode can carry
-/// (`CLAUDE.md` §3).
+/// One type rather than a variant per RFC section: the category *is* the rcode
+/// (RFC 2136 §3), and the string is the detail no rcode can carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejected {
     pub rcode: ResponseCode,
@@ -66,18 +45,16 @@ impl Rejected {
 }
 
 /// A condition the zone must satisfy before any change is applied (RFC 2136
-/// §2.4). Five forms, and the encoding of each is a combination of CLASS, TYPE
-/// and whether there is any RDATA.
+/// §2.4). Five forms, each encoded as a combination of CLASS, TYPE and whether
+/// there is any RDATA.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Prerequisite {
     /// §2.4.1 — some RRset of this type exists at this name, whatever it holds.
     /// CLASS=ANY, RDLENGTH=0.
     RrsetExists { name: String, rtype: Rtype },
     /// §2.4.2 — an RRset of this type exists at this name *and* holds exactly
-    /// these records. CLASS is the zone's, and there is RDATA.
-    ///
-    /// "Exactly" is the part worth stating: §3.2.3 compares the whole RRset for
-    /// equality as a set, so a prerequisite naming two of three records fails.
+    /// these records. CLASS is the zone's, and there is RDATA. §3.2.3 compares
+    /// the whole RRset as a set, so naming two of three records fails.
     RrsetExistsWithValue {
         name: String,
         rtype: Rtype,
@@ -91,20 +68,20 @@ pub enum Prerequisite {
     NameNotInUse { name: String },
 }
 
-/// One thing an UPDATE asks to change (RFC 2136 §2.5). Four forms, again keyed
-/// on CLASS.
+/// One thing an UPDATE asks to change (RFC 2136 §2.5). Four forms, keyed on
+/// CLASS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     /// §2.5.1 — add this record to its RRset, or create the RRset. CLASS is the
-    /// zone's. The only form that carries a TTL that matters.
+    /// zone's, and the only form whose TTL matters.
     Add(ResourceRecord),
     /// §2.5.2 — delete every record of this type at this name. CLASS=ANY.
     DeleteRrset { name: String, rtype: Rtype },
     /// §2.5.3 — delete every RRset at this name. CLASS=ANY, TYPE=ANY.
     DeleteName { name: String },
     /// §2.5.4 — delete the one record that matches this name, type and RDATA.
-    /// CLASS=NONE. The TTL is ignored in the comparison (§2.5.4), which is why
-    /// this carries rdata rather than a whole record.
+    /// CLASS=NONE. The TTL is not part of the comparison, hence rdata rather
+    /// than a whole record.
     DeleteRecord {
         name: String,
         rtype: Rtype,
@@ -124,11 +101,9 @@ pub struct UpdateRequest {
 
 /// Read an UPDATE message into an [`UpdateRequest`], or reject it.
 ///
-/// This is RFC 2136 §3.1 (the zone section), the form rules of §2.4 and §2.5,
-/// and §3.4.1's prescan — everything that can be decided from the message alone.
-/// Whether the *server* holds the named zone is the caller's question, because
-/// only the caller knows which zones it serves; §3.1's NOTZONE is raised here
-/// only for a record that falls outside the zone the message itself names.
+/// RFC 2136 §3.1, the form rules of §2.4 and §2.5, and §3.4.1's prescan —
+/// everything decidable from the message alone. Whether the server holds the
+/// named zone is the caller's question.
 pub fn parse(msg: &DnsMessage) -> Result<UpdateRequest, Rejected> {
     if msg.opcode != OpCode::Update {
         return Err(Rejected::new(
@@ -137,9 +112,7 @@ pub fn parse(msg: &DnsMessage) -> Result<UpdateRequest, Rejected> {
         ));
     }
 
-    // §3.1: exactly one zone, of type SOA. "If the zone section contains more
-    // than one RR, or an RR whose ZTYPE is not SOA, the server shall return
-    // FORMERR."
+    // §3.1: exactly one zone, of type SOA; anything else is FORMERR.
     let [zone_section] = msg.queries.as_slice() else {
         return Err(Rejected::new(
             ResponseCode::FormatError,
@@ -185,10 +158,7 @@ fn read_prerequisite(
     zone: &str,
     zone_class: QueryClass,
 ) -> Result<Prerequisite, Rejected> {
-    // §3.2: "For RRs in this section whose CLASS is not ANY [...] TTL must be
-    // zero", and §2.4 gives TTL=0 for every form including the value-dependent
-    // one. A non-zero TTL is FORMERR rather than something to round off: it
-    // means the sender built the section from a template it did not read.
+    // §2.4 gives TTL=0 for every prerequisite form; a non-zero TTL is FORMERR.
     if rr.ttl != Ttl::ZERO {
         return Err(Rejected::new(
             ResponseCode::FormatError,
@@ -203,8 +173,7 @@ fn read_prerequisite(
     let rtype = rr.rdata.rtype();
     let empty = rr.rdata.bytes().is_empty();
     match QueryClass::from(rr.class) {
-        // §2.4.4 / §2.4.1 — ANY: "is anything there?", either at the name or
-        // for one type at it.
+        // §2.4.4 / §2.4.1 — ANY: is anything there, at the name or for one type.
         QueryClass::Any if rtype == rt::ANY && empty => Ok(Prerequisite::NameInUse {
             name: rr.name.clone(),
         }),
@@ -212,7 +181,7 @@ fn read_prerequisite(
             name: rr.name.clone(),
             rtype,
         }),
-        // §2.4.5 / §2.4.3 — NONE: the same two questions, negated.
+        // §2.4.5 / §2.4.3 — NONE: the same two, negated.
         QueryClass::None if rtype == rt::ANY && empty => Ok(Prerequisite::NameNotInUse {
             name: rr.name.clone(),
         }),
@@ -220,8 +189,8 @@ fn read_prerequisite(
             name: rr.name.clone(),
             rtype,
         }),
-        // §2.4.2 — the zone's own class, with RDATA: the RRset must hold
-        // exactly this. Collected per name and type by the caller below.
+        // §2.4.2 — the zone's own class, with RDATA: the RRset must hold exactly
+        // this. Collected per name and type in `check_prerequisites`.
         class if class == zone_class && !empty => Ok(Prerequisite::RrsetExistsWithValue {
             name: rr.name.clone(),
             rtype,
@@ -246,16 +215,13 @@ fn read_change(
     zone: &str,
     zone_class: QueryClass,
 ) -> Result<Change, Rejected> {
-    // §3.4.1: "If any RR's NAME is not within the zone specified in the Zone
-    // Section, signal NOTZONE to the requestor." An update that reaches outside
-    // its own zone is the shape that would let one zone's key write another
-    // zone's data.
+    // §3.4.1: a name outside the Zone section's zone is NOTZONE — otherwise one
+    // zone's key writes another zone's data.
     in_zone_or_notzone(&rr.name, zone, "update")?;
 
     let rtype = rr.rdata.rtype();
     let empty = rr.rdata.bytes().is_empty();
-    // §3.4.1 again: a meta-type may never be added, and only ANY may be
-    // deleted. "ANY" as something to *add* is not data, it is a question.
+    // §3.4.1: a meta-type may never be added, and only ANY may be deleted.
     let deleting = matches!(
         QueryClass::from(rr.class),
         QueryClass::Any | QueryClass::None
@@ -272,8 +238,8 @@ fn read_change(
     }
 
     match QueryClass::from(rr.class) {
-        // §2.5.3 / §2.5.2 — ANY: delete everything at the name, or one RRset.
-        // Both require an empty RDATA and a zero TTL.
+        // §2.5.3 / §2.5.2 — ANY: delete everything at the name, or one RRset;
+        // both require empty RDATA and a zero TTL.
         QueryClass::Any if rtype == rt::ANY && empty && rr.ttl == Ttl::ZERO => {
             Ok(Change::DeleteName {
                 name: rr.name.clone(),
@@ -283,15 +249,14 @@ fn read_change(
             name: rr.name.clone(),
             rtype,
         }),
-        // §2.5.4 — NONE with RDATA: delete exactly this record. The TTL is
-        // "ignored" by the RFC, which means it must be zero on the wire and is
-        // not part of the comparison.
+        // §2.5.4 — NONE with RDATA: delete exactly this record. The TTL is zero
+        // on the wire and no part of the comparison.
         QueryClass::None if !empty && rr.ttl == Ttl::ZERO => Ok(Change::DeleteRecord {
             name: rr.name.clone(),
             rtype,
             rdata: rr.rdata.clone(),
         }),
-        // §2.5.1 — the zone's class: add it. The one form with a meaningful TTL.
+        // §2.5.1 — the zone's class: add it.
         class if class == zone_class && !empty => Ok(Change::Add(rr.clone())),
         _ => Err(Rejected::new(
             ResponseCode::FormatError,
@@ -307,8 +272,8 @@ fn read_change(
     }
 }
 
-/// RFC 2136 §3.1 and §3.4.1: a name outside the zone the message names is
-/// NOTZONE, not a refusal and not a format error.
+/// RFC 2136 §3.1, §3.4.1: a name outside the zone the message names is NOTZONE,
+/// not a refusal and not a format error.
 fn in_zone_or_notzone(name: &str, zone: &str, what: &str) -> Result<(), Rejected> {
     if is_at_or_under(name, zone) {
         Ok(())
@@ -322,20 +287,11 @@ fn in_zone_or_notzone(name: &str, zone: &str, what: &str) -> Result<(), Rejected
 
 /// Check every prerequisite against the zone (RFC 2136 §3.2).
 ///
-/// `Ok(())` when they all hold. The RCODE on failure is the specific one §3.2
-/// assigns to that form of prerequisite, and the four are not
-/// interchangeable — a client uses them to tell "the name is not there" from
-/// "the name is there but this type is not", which is the whole point of having
-/// four codes rather than one.
-///
-/// **Prerequisites are checked as a set, before any change is applied**, which
-/// is what makes an UPDATE a transaction: §3.2's checks all happen first, and
-/// §3.4 only runs if every one of them passed.
+/// The four failure RCODEs are not interchangeable: §3.2 assigns one per form.
+/// Separate from [`apply`] because all of §3.2 must pass before any of §3.4.
 pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Result<(), Rejected> {
     // §2.4.2's records are per-RR on the wire but per-RRset in meaning: several
-    // records with the same name and type are one prerequisite naming a whole
-    // RRset. Gathering them first is what makes the "exactly this set"
-    // comparison below possible at all.
+    // sharing a name and type are one prerequisite naming a whole RRset.
     let mut value_sets: Vec<(String, Rtype, Vec<RecordData>)> = Vec::new();
 
     for prerequisite in prerequisites {
@@ -356,12 +312,9 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
                     ));
                 }
             }
-            // §2.4.4: "at least one RR with a specified NAME [...] must exist".
-            // `holds_name` is the literal question — records *at* this name —
-            // rather than `name_exists`, which is true for a name a wildcard
-            // reaches and for an empty non-terminal. An update must not be
-            // allowed to believe a name is there because something could
-            // synthesize it.
+            // §2.4.4 asks whether records exist *at* the name, so `holds_name`
+            // and not `name_exists`, which is also true for a wildcard match and
+            // for an empty non-terminal.
             Prerequisite::NameInUse { name } => {
                 if !zone.holds_name(name) {
                     return Err(Rejected::new(
@@ -406,8 +359,7 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
                 format!("{name} has no {rtype} RRset to match against"),
             ));
         }
-        // §3.2.3: the RRsets must be equal *as sets* — same members, order
-        // irrelevant, and neither may hold anything the other does not.
+        // §3.2.3: equal *as sets* — same members, order irrelevant.
         if !same_set(&held, &wanted) {
             return Err(Rejected::new(
                 ResponseCode::NoSuchResourceRecordSet,
@@ -424,29 +376,18 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
     Ok(())
 }
 
-/// Set equality over RDATA, with no ordering assumption and no sort.
-///
-/// `RecordData` is not `Ord`, so this is the quadratic comparison — which is the
-/// right one here: an RRset is a handful of records, and a prerequisite naming
-/// enough of them for that to matter would not fit a datagram.
+/// Set equality over RDATA. Quadratic because `RecordData` is not `Ord`, and an
+/// RRset large enough for that to matter would not fit a datagram.
 fn same_set(held: &[RecordData], wanted: &[RecordData]) -> bool {
     held.len() == wanted.len()
         && held.iter().all(|h| wanted.contains(h))
         && wanted.iter().all(|w| held.contains(w))
 }
 
-// ---------------------------------------------------------------------------
-// Applying the changes (RFC 2136 §3.4.2)
-// ---------------------------------------------------------------------------
-
 /// A change RFC 2136 §3.4.2 required be dropped, and the rule that dropped it.
 ///
-/// **§3.4.2 does not reject these.** Every one of them is a change the RFC says
-/// to ignore while the UPDATE as a whole still succeeds — §3.4.2.5 signals
-/// NOERROR regardless — so without something like this they vanish: the client
-/// is told its write went through, the record is not there, and nothing
-/// anywhere says why. That is `CLAUDE.md` §4's silent degradation exactly, and
-/// it is why this is carried out rather than counted. `rdnsd` logs them.
+/// §3.4.2 does not reject these — the UPDATE still succeeds (§3.4.2.5) — so the
+/// client is told its write went through; hence a record of what vanished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ignored {
     pub name: String,
@@ -466,12 +407,8 @@ impl std::fmt::Display for Ignored {
 pub struct Applied {
     /// The zone as it now is. Rebuilt, never edited in place — see [`Working`].
     pub zone: Zone,
-    /// How many records the zone gained, lost, or had replaced by something
-    /// that differs from what was there.
-    ///
-    /// Zero means the UPDATE was well-formed, permitted, and changed nothing —
-    /// which is a real outcome (every deletion named a record that was already
-    /// gone) and the one case where the serial deliberately does not move.
+    /// Records gained, lost, or replaced by something that differs. Zero is a
+    /// real outcome, and then the serial does not move.
     pub changed: usize,
     /// Changes §3.4.2 required be dropped. Empty for the ordinary case.
     pub ignored: Vec<Ignored>,
@@ -479,33 +416,16 @@ pub struct Applied {
 
 /// Apply an UPDATE's changes to a zone (RFC 2136 §3.4.2), returning the result.
 ///
-/// The prerequisites are *not* checked here — [`check_prerequisites`] is a
-/// separate call because §3.2 requires all of them to pass before any of §3.4
-/// runs, and splitting the two is what makes that ordering something a caller
-/// cannot get wrong by interleaving.
+/// Prerequisites must pass first. Changes apply in order, each to the result of
+/// the last (§3.4.2.7); nothing here fails.
 ///
-/// **The changes are applied in order, each to the result of the last.** That is
-/// what §3.4.2.7's pseudocode describes — a loop over the update records
-/// mutating the zone — and it is observable: a delete-the-RRset followed by an
-/// add at the same name has to leave one record, not the old ones plus one.
-///
-/// **Nothing here fails.** §3.4.2 has exactly two outcomes for a change that has
-/// already passed the prescan: it happens, or it is ignored. The failures §3.4.2
-/// does describe are §3.4.2.1's "system failure ... out of memory, or a hardware
-/// error in persistent storage", which is not this function's problem, and they
-/// are why the caller must not install the result until it has stored it.
-///
-/// **This is meant for the unsigned source zone**, the one that came from the
-/// file and goes back to it. Applying an UPDATE to signer output and then
-/// re-signing would be doing the work twice; the signatures over anything this
-/// touched are stale by definition.
+/// For the unsigned source zone — signatures over anything this touches are
+/// stale by definition.
 pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
     let mut work = Working::new(zone);
     let mut ignored = Vec::new();
     let mut changed = 0usize;
-    // Whether the UPDATE itself moved the apex serial, which decides whether
-    // §3.6's automatic bump is owed. Set only for the *apex* SOA: an SOA
-    // somewhere else in the zone is not the zone's version number.
+    // Only the *apex* SOA counts: an SOA elsewhere is not the zone's version.
     let mut serial_moved_by_update = false;
 
     for change in changes {
@@ -514,11 +434,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 let name = work.absolute(&record.name);
                 let rtype = record.rdata.rtype();
 
-                // §3.4.2.7: a CNAME may not be added where other data lives,
-                // and other data may not be added where a CNAME lives. The
-                // underlying rule is RFC 1034 §3.6.2's — a CNAME is the only
-                // record at its name — and §3.4.2.7 is where RFC 2136 says an
-                // UPDATE must not be the thing that breaks it.
+                // §3.4.2.7: a CNAME may not be added where other data lives, nor
+                // other data where a CNAME lives (RFC 1034 §3.6.2).
                 if rtype == rt::CNAME {
                     if work.has_other_data_beside_a_cname(&name) {
                         ignored.push(Ignored {
@@ -539,25 +456,14 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                     continue;
                 }
 
-                // §3.4.2.2: "If the TYPE is SOA and there is no Zone SOA RR, or
-                // the new SOA.SERIAL is lower (according to [RFC1982]) than or
-                // equal to the current Zone SOA RR's SOA.SERIAL, the Update RR
-                // is ignored."
+                // §3.4.2.2: strictly newer, or ignored. §3.4.2.7's pseudocode
+                // says `zone.serial > rr.serial`, which accepts an equal serial
+                // and lets an UPDATE rewrite MNAME or the timers while leaving
+                // the version where it was; the prose is normative.
                 //
-                // **The prose and the pseudocode disagree here, and the prose
-                // wins.** §3.4.2.7 spells the test as `zone.serial > rr.serial`
-                // — which *accepts* an equal serial — while the paragraph above
-                // ignores "lower than or equal to". Following the pseudocode
-                // would let an UPDATE rewrite MNAME, RNAME or the timers while
-                // leaving the version number where it was, and §3.6 calls it
-                // "imperative that the zone's contents and the SOA's SERIAL be
-                // tightly synchronized". So: strictly newer, or ignored.
-                //
-                // `is_newer_than` is RFC 1982 §3.2 and not `>` (`CLAUDE.md`
-                // §17). It is also false for two serials exactly half the space
-                // apart, where §3.2 leaves the answer undefined — ignoring is
-                // the safe direction, since the alternative is installing a
-                // version nobody can order against the one it replaced.
+                // `is_newer_than` is RFC 1982 §3.2, not `>`, and is false for
+                // two serials half the space apart, where §3.2 leaves the
+                // answer undefined — ignoring is the safe direction.
                 if rtype == rt::SOA {
                     let current = work.soa_serial_at(&name);
                     let offered = serial_of(&record.rdata);
@@ -583,20 +489,13 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                     rdata: record.rdata.clone(),
                 };
 
-                // §3.4.2.7's inner loop: within the RRset, a CNAME or an SOA
-                // replaces whatever is there — both are singletons, so "add"
-                // can only mean "replace" — and anything else replaces only an
-                // exact RDATA match. That last case is how an UPDATE changes a
-                // TTL: same name, type and value, new number.
+                // §3.4.2.7's inner loop: a CNAME or an SOA replaces whatever is
+                // there — both are singletons — and anything else replaces only
+                // an exact RDATA match, which is how an UPDATE changes a TTL.
                 //
-                // WKS has a third rule in §3.4.2.2, matching on ADDRESS and
-                // PROTOCOL rather than on the whole RDATA. It is not
-                // implemented, and cannot be here: this library has no WKS
-                // decoder, so a WKS record is opaque RFC 3597 bytes and its
-                // address and protocol are not separable from its bitmap. The
-                // consequence is bounded and worth stating — two WKS records
-                // that share an address and protocol end up side by side
-                // instead of one replacing the other.
+                // §3.4.2.2's third rule, matching WKS on ADDRESS and PROTOCOL,
+                // is not implementable: WKS has no decoder, so its RDATA is
+                // opaque RFC 3597 bytes and two such records sit side by side.
                 match work.position_to_replace(&name, rtype, &record.rdata) {
                     Some(position) => {
                         if !same_record(&work.records[position], &replacement) {
@@ -614,10 +513,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 }
             }
 
-            // §3.4.2.3, second half: "For any Update RR whose CLASS is ANY and
-            // whose TYPE is not ANY all Zone RRs with the same NAME and TYPE
-            // are deleted, unless the NAME is the same as ZNAME in which case
-            // neither SOA or NS RRs will be deleted."
+            // §3.4.2.3, second half: every RR of that name and type goes, except
+            // the apex SOA and NS.
             Change::DeleteRrset { name, rtype } => {
                 let name = work.absolute(name);
                 if work.is_apex(&name) && (*rtype == rt::SOA || *rtype == rt::NS) {
@@ -634,9 +531,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 });
             }
 
-            // §3.4.2.3, first half: "all Zone RRs with the same NAME are
-            // deleted, unless the NAME is the same as ZNAME in which case only
-            // those RRs whose TYPE is other than SOA or NS are deleted."
+            // §3.4.2.3, first half: every RR of that name goes, except the apex
+            // SOA and NS.
             Change::DeleteName { name } => {
                 let name = work.absolute(name);
                 let apex = work.is_apex(&name);
@@ -646,8 +542,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                             && (record.rdata.rtype() == rt::SOA || record.rdata.rtype() == rt::NS))
                 });
                 if apex {
-                    // Not a refusal — the rest of the name was emptied — but
-                    // the operator asked for the whole name and did not get it.
+                    // Not a refusal: the rest of the name went, but not all of
+                    // what was asked for.
                     ignored.push(Ignored {
                         name,
                         rtype: rt::ANY,
@@ -657,15 +553,9 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 }
             }
 
-            // §3.4.2.4: "any Zone RR whose NAME, TYPE, RDATA and RDLENGTH are
-            // equal to the Update RR is deleted, unless the NAME is the same as
-            // ZNAME and either the TYPE is SOA or the TYPE is NS and the
-            // matching Zone RR is the only NS remaining in the RRset, in which
-            // case this Update RR is ignored."
-            //
-            // Comparing the whole [`RecordData`] is the "TYPE, RDATA and
-            // RDLENGTH" of that sentence in one test: the type is inside it and
-            // its bytes are its own length.
+            // §3.4.2.4: the RR matching on NAME, TYPE, RDATA and RDLENGTH is
+            // deleted, except the apex SOA and the last apex NS. One
+            // [`RecordData`] comparison covers type, bytes and length at once.
             Change::DeleteRecord { name, rtype, rdata } => {
                 let name = work.absolute(name);
                 if work.is_apex(&name) && *rtype == rt::SOA {
@@ -676,10 +566,9 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                     });
                     continue;
                 }
-                // "the only NS remaining in the RRset" — so the test is whether
-                // this deletion would empty the apex NS RRset, not whether the
-                // RRset is currently a singleton. A deletion naming a record
-                // the zone does not hold empties nothing and is not refused.
+                // "the only NS remaining": whether this deletion would empty the
+                // apex NS RRset, not whether the RRset is a singleton now. A
+                // deletion matching nothing empties nothing.
                 if work.is_apex(&name) && *rtype == rt::NS {
                     let held = work.count(&name, rt::NS);
                     let matching = work.count_matching(&name, rdata);
@@ -700,17 +589,10 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
         }
     }
 
-    // RFC 2136 §3.6. The serial has to move for the change to be visible: a
-    // secondary decides whether to transfer by comparing it, so contents that
-    // moved under an unchanged serial are contents no replica will ever fetch.
-    //
-    // **Only when something actually changed**, which is the reading §3.6's own
-    // wording gives — the bump is owed "prior to including the SOA or any
-    // modified resource records in responses or zone transfers", and an UPDATE
-    // that modified nothing has none. The alternative costs real work for
-    // nothing: a serial bump is a re-signing run and an IXFR to every
-    // secondary, and an UPDATE whose deletions all named records that were
-    // already gone is an ordinary thing for a DHCP client to send twice.
+    // RFC 2136 §3.6: the serial has to move for the change to be visible, since
+    // a secondary decides whether to transfer by comparing it. Only when
+    // something changed — bumping for a retried no-op costs a re-signing run
+    // and an IXFR to every secondary.
     if changed > 0 && !serial_moved_by_update {
         work.bump_serial();
     }
@@ -724,17 +606,9 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
 
 /// The zone as it is being rewritten.
 ///
-/// **A `Vec` rather than a [`Zone`], and the reason is the same one
-/// [`crate::ixfr::apply_changes`] gives**: `Zone`'s index holds *positions* into
-/// its record vector, so removing a record in place shifts every later position
-/// and invalidates it. That is why `Zone` has no removal API and should never
-/// get one. Rebuilding at the end costs O(zone) per UPDATE rather than per
-/// change, and hands back a zone built by the ordinary constructor — one whose
-/// index cannot disagree with its contents.
-///
-/// It borrows the zone it started from rather than copying the origin, so that
-/// [`Working::absolute`] is [`Zone::normalize_name`] and not a second
-/// hand-written copy of what an owner name means (`CLAUDE.md` §7).
+/// A `Vec` rather than a [`Zone`]: `Zone`'s index holds *positions* into its
+/// record vector, so removing in place invalidates every later one. Rebuilding
+/// at the end costs O(zone) per UPDATE rather than per change.
 struct Working<'a> {
     base: &'a Zone,
     records: Vec<ZoneRecord>,
@@ -743,10 +617,9 @@ struct Working<'a> {
 impl<'a> Working<'a> {
     fn new(base: &'a Zone) -> Working<'a> {
         Working {
-            // Names are normalized on the way in so that every comparison below
-            // is one `eq_ignore_ascii_case` and not a normalization per record
-            // per change. A zone loaded from a file already holds absolute
-            // names; one built by hand through `add_record` may not.
+            // Normalized on the way in, so every comparison below is one
+            // `eq_ignore_ascii_case` rather than a normalization per record per
+            // change. A zone built through `add_record` may hold relative names.
             records: base
                 .records()
                 .iter()
@@ -775,21 +648,12 @@ impl<'a> Working<'a> {
             .any(|r| r.name.eq_ignore_ascii_case(name) && r.rdata.rtype() == rtype)
     }
 
-    /// Whether the name holds anything that RFC 1034 §3.6.2 would call "other
-    /// data" beside a CNAME.
+    /// Whether the name holds anything RFC 1034 §3.6.2 would call "other data"
+    /// beside a CNAME.
     ///
-    /// RRSIG, NSEC and NSEC3 are excluded, because RFC 4035 §2.5 says outright
-    /// that a CNAME may carry them at the same owner name — they are the one
-    /// exception to §3.6.2. Without this, an UPDATE replacing a CNAME in a zone
-    /// that had been signed would be ignored on the strength of the signature
-    /// over the CNAME it was replacing.
-    ///
-    /// Deliberately *not* `zone_signer::is_signer_output`, which answers a
-    /// different question — "would signing regenerate this" — and includes
-    /// NSEC3PARAM and DNSKEY, neither of which has anything to do with §3.6.2.
-    /// Two predicates that happen to overlap are not one predicate (§7's
-    /// converse: move logic when the *reason* is shared, not when the answer
-    /// coincides).
+    /// RRSIG, NSEC and NSEC3 are excluded: RFC 4035 §2.5 lets a CNAME carry them
+    /// at the same owner name. Not `zone_signer::is_signer_output`, which asks
+    /// "would signing regenerate this" and includes NSEC3PARAM and DNSKEY.
     fn has_other_data_beside_a_cname(&self, name: &str) -> bool {
         self.records.iter().any(|r| {
             r.name.eq_ignore_ascii_case(name)
@@ -841,16 +705,10 @@ impl<'a> Working<'a> {
 
     /// RFC 2136 §3.6's automatic increment, applied to the apex SOA.
     ///
-    /// `wrapping_add`, because RFC 1982 §3.1 defines addition in the sequence
-    /// space that way — the serial after `u32::MAX` is 0, and a bare `+` would
-    /// panic in a debug build at the one moment it mattered.
-    ///
-    /// Re-encoding the SOA through [`ParsedRecord`] is exact for this type: its
-    /// two names are written uncompressed both times, so the bytes that come
-    /// back differ only in the four the serial occupies. That matters because
-    /// re-spelling RDATA is how a valid RRset silently becomes a bogus one
-    /// (`zone_writer`'s module docs), and it is the reason this rewrites the one
-    /// record it must rather than passing the whole zone through a re-encode.
+    /// `wrapping_add` per RFC 1982 §3.1: the serial after `u32::MAX` is 0.
+    /// Re-encoding through [`ParsedRecord`] is exact for an SOA — both names are
+    /// written uncompressed either way — but re-spelling RDATA is how a valid
+    /// RRset becomes bogus, hence one record rather than the whole zone.
     fn bump_serial(&mut self) {
         let origin = self.base.origin().to_string();
         for record in &mut self.records {
@@ -867,9 +725,8 @@ impl<'a> Working<'a> {
                 minimum,
             }) = record.rdata.parse()
             else {
-                // An apex SOA whose RDATA will not parse is a zone that could
-                // not have been loaded, served or transferred; there is nothing
-                // to bump and nothing this function can do about it.
+                // An apex SOA that will not parse is a zone that could not have
+                // been loaded at all; nothing to bump.
                 continue;
             };
             let bumped = ParsedRecord::SOA {
@@ -899,10 +756,9 @@ impl<'a> Working<'a> {
 
 /// Whether a replacement would leave the record it replaces unchanged.
 ///
-/// The TTL counts, which is the same identity [`crate::ixfr::diff`] compares by
-/// and for the same reason: two records differing only in TTL are not the same
-/// record to a secondary, because it caches and re-serves that number. The name
-/// is not compared — the caller found this record *by* name.
+/// The TTL counts, the same identity [`crate::ixfr::diff`] uses: a secondary
+/// caches and re-serves that number. The name is not compared — the caller
+/// found this record *by* name.
 fn same_record(held: &ZoneRecord, replacement: &ZoneRecord) -> bool {
     held.ttl == replacement.ttl
         && held.class == replacement.class
@@ -987,10 +843,6 @@ mail IN MX  10 mx.example.com.
 
     /// All five prerequisite forms of RFC 2136 §2.4, each identified by the
     /// CLASS/TYPE/RDLENGTH combination the RFC gives it.
-    ///
-    /// Written as a table because that is what §2.4 is: the same record
-    /// structure means five different questions depending on three fields, and
-    /// an `if` chain over them is where a reader loses track of which is which.
     #[test]
     fn the_five_prerequisite_forms_are_read_as_rfc_2136_defines_them() {
         let cases = vec![
@@ -1066,9 +918,7 @@ mail IN MX  10 mx.example.com.
         }
     }
 
-    /// And all four update forms of §2.5, which are keyed on CLASS in the same
-    /// way — the field that says what kind of data a record is, being used to
-    /// say what to do with it.
+    /// And all four update forms of §2.5, keyed on CLASS in the same way.
     #[test]
     fn the_four_update_forms_are_read_as_rfc_2136_defines_them() {
         let cases = vec![
@@ -1134,9 +984,8 @@ mail IN MX  10 mx.example.com.
         }
     }
 
-    /// §3.1: one zone, and it is an SOA. Both halves, because a message naming
-    /// two zones is a message whose changes cannot all be applied atomically
-    /// and whose second zone would otherwise be silently ignored.
+    /// §3.1: one zone, and it is an SOA. Two zones cannot be updated
+    /// atomically, so the second would otherwise be silently ignored.
     #[test]
     fn the_zone_section_names_exactly_one_zone_of_type_soa() {
         let mut two = update(Vec::new(), Vec::new());
@@ -1165,12 +1014,8 @@ mail IN MX  10 mx.example.com.
     }
 
     /// §3.4.1: a record outside the zone the message names is NOTZONE — its own
-    /// code, distinct from REFUSED.
-    ///
-    /// This is the check that stops one zone's update writing another zone's
-    /// data, which is the same shape as the transfer authorization bug
-    /// `CLAUDE.md` §16 records: a request that names something it was not
-    /// scoped to.
+    /// code, distinct from REFUSED. Stops one zone's update writing another
+    /// zone's data.
     #[test]
     fn a_record_outside_the_named_zone_is_notzone() {
         let outside = rr(
@@ -1202,8 +1047,7 @@ mail IN MX  10 mx.example.com.
         );
 
         // `notexample.com.` ends with the zone's name and is a different zone:
-        // the boundary has to land on a label separator (`CLAUDE.md` §7's
-        // shared `is_at_or_under`).
+        // the boundary has to land on a label separator.
         let lookalike = rr(
             "notexample.com.",
             Class::new(1),
@@ -1219,26 +1063,12 @@ mail IN MX  10 mx.example.com.
         );
     }
 
-    /// **The whole of §2.4 and §2.5, over an actual wire.**
+    /// §2.4 and §2.5 over an actual wire.
     ///
-    /// Every other test in this module hands [`parse`] a `DnsMessage` built in
-    /// memory, which is `CLAUDE.md` §1's failure mode written out: the message
-    /// never crossed the boundary a real one crosses, so the reading half was
-    /// checked against nothing but itself.
-    ///
-    /// It was hiding a defect that made this whole module unreachable. §2.4.1,
-    /// §2.4.3, §2.4.4, §2.4.5, §2.5.2 and §2.5.3 all spell their record with
-    /// **RDLENGTH=0** — it names a type and carries no value — and
-    /// `ParsedRecord::decode` rejected that for every type it had a decoder for,
-    /// because an A with no bytes is four bytes short. `RecordData::from_wire`
-    /// runs per record as the message is read, so the whole UPDATE was FORMERR
-    /// before a line of this file ran: every value-independent prerequisite and
-    /// every RRset deletion was unreadable.
-    ///
-    /// **Watched failing against the old decoder**, which is what makes this a
-    /// regression test rather than a restatement (§1): `try_from_bytes` returned
-    /// `Malformed { what: "RDATA", detail: "a fixed-width field has the wrong
-    /// length" }`, and the `expect` below fired.
+    /// §2.4.1, §2.4.3, §2.4.4, §2.4.5, §2.5.2 and §2.5.3 all spell their record
+    /// with RDLENGTH=0 — a type and no value — which a decoder that insists on
+    /// each type's fixed width rejects, making the whole UPDATE FORMERR before
+    /// this module runs. Every other test here builds its message in memory.
     #[test]
     fn an_update_survives_the_wire_including_its_empty_rdata() {
         // §2.4.1 RRset exists (value independent) and §2.4.3 RRset does not
@@ -1290,15 +1120,11 @@ mail IN MX  10 mx.example.com.
     }
 
     /// §3.4.1 forbids adding a meta-type, and §2.4 requires a zero TTL on every
-    /// prerequisite. Both are FORMERR, and both are the kind of thing a
-    /// hand-built message gets wrong.
+    /// prerequisite. Both are FORMERR.
     #[test]
     fn a_meta_type_may_not_be_added_and_a_prerequisite_may_not_carry_a_ttl() {
         // TYPE=ANY with CLASS=the zone's is §2.5.1's "add", and ANY is a
-        // meta-type, so §3.4.1's prescan must refuse it. Built through the
-        // checked constructor rather than by reaching into the record after the
-        // fact: ANY has no decoder, so the bytes are opaque and kept verbatim,
-        // which is what a meta-type in a TYPE field is.
+        // meta-type, so §3.4.1's prescan must refuse it.
         let add_any = rr(
             "www.example.com.",
             Class::new(1),
@@ -1326,12 +1152,9 @@ mail IN MX  10 mx.example.com.
         );
     }
 
-    /// §3.2's four rcodes, each from the prerequisite form that produces it.
-    ///
-    /// They are not interchangeable and that is the point of the test: a client
-    /// distinguishes "the name is not there" (NXDOMAIN) from "the name is there
-    /// and this type is not" (NXRRSET), and an implementation that collapsed
-    /// them would still pass a test that only checked for failure.
+    /// §3.2's four rcodes, each from the prerequisite form that produces it. A
+    /// client distinguishes "no such name" (NXDOMAIN) from "the name is there
+    /// and this type is not" (NXRRSET), so they are not interchangeable.
     #[test]
     fn each_prerequisite_failure_has_its_own_rcode() {
         let zone = zone();
@@ -1402,15 +1225,9 @@ mail IN MX  10 mx.example.com.
         .expect("every one of these holds against the test zone");
     }
 
-    /// §3.2.3 compares a value-dependent prerequisite against the **whole**
-    /// RRset, as a set.
-    ///
-    /// `www` has two A records. A prerequisite naming one of them must fail,
-    /// and naming both must pass whatever order they arrive in. An
-    /// implementation that checked "is this record present" rather than "is the
-    /// RRset exactly this" would pass the first case wrongly — and that is the
-    /// bug this test exists for, because "contains" is the obvious reading and
-    /// the RFC does not say it.
+    /// §3.2.3 compares a value-dependent prerequisite against the *whole*
+    /// RRset, as a set — not "is this record present", which is the obvious
+    /// reading and the wrong one.
     #[test]
     fn a_value_dependent_prerequisite_compares_the_whole_rrset() {
         let zone = zone();
@@ -1480,12 +1297,8 @@ mail IN MX  10 mx.example.com.
     }
 
     /// A name a wildcard would answer for is not a name that is *in use*.
-    ///
-    /// `Zone::name_exists` is true for a name a wildcard reaches and for an
-    /// empty non-terminal; `holds_name` is the literal "are there records here".
-    /// §2.4.4 asks the literal question, and getting this wrong would let an
-    /// update believe a name exists because something could synthesize it —
-    /// then delete or overwrite on the strength of it.
+    /// §2.4.4 asks the literal "are there records here", which is `holds_name`
+    /// and not `name_exists`.
     #[test]
     fn a_wildcard_does_not_make_a_name_in_use() {
         let zone = parse_zone_file(
@@ -1516,9 +1329,8 @@ mail IN MX  10 mx.example.com.
             "a wildcard answering for a name does not put records at it"
         );
 
-        // An empty non-terminal is the same story from the other side: `a.b`
-        // exists in the DNS sense because something is below it, and holds
-        // nothing itself.
+        // `a.b` exists in the DNS sense because something is below it, and
+        // holds nothing itself.
         assert_eq!(
             check_prerequisites(
                 &zone,
@@ -1533,9 +1345,8 @@ mail IN MX  10 mx.example.com.
         );
     }
 
-    /// An UPDATE with nothing in it is well-formed and asks for nothing. Worth
-    /// pinning: it is the degenerate case a prescan can easily reject by
-    /// accident, and RFC 2136 gives no reason to.
+    /// An UPDATE with nothing in it is well-formed and asks for nothing; RFC
+    /// 2136 gives a prescan no reason to reject it.
     #[test]
     fn an_empty_update_is_well_formed() {
         let parsed = parse(&update(Vec::new(), Vec::new())).expect("no prerequisites, no changes");
@@ -1552,20 +1363,12 @@ mail IN MX  10 mx.example.com.
         assert_eq!(parse(&query).unwrap_err().rcode, ResponseCode::FormatError);
     }
 
-    // -----------------------------------------------------------------
-    // Applying (RFC 2136 §3.4.2)
-    // -----------------------------------------------------------------
-
-    /// An SOA that is distinguishable from the test zone's by something other
-    /// than its serial.
+    /// An SOA distinguishable from the test zone's by something other than its
+    /// serial.
     ///
-    /// The different RNAME is load-bearing, not decoration. The zone's serial is
-    /// 1, so an offered SOA at serial 1 leaves the zone's serial at 1 whether it
-    /// was accepted or ignored — a test asserting on the serial alone cannot
-    /// tell the two apart, and would pass against an implementation with no
-    /// serial check in it at all. Asserting on the whole RDATA can, and the
-    /// equal-serial case is precisely "rewriting RNAME while leaving the version
-    /// where it was", which is what §3.4.2.2's prose forbids.
+    /// The differing RNAME is load-bearing: the zone's serial is 1, so an
+    /// offered SOA at serial 1 leaves it at 1 either way, and only the whole
+    /// RDATA tells "accepted" from "ignored".
     fn soa_with(serial: u32) -> RecordData {
         RecordData::from_parsed(&ParsedRecord::SOA {
             mname: "ns1.example.com.".to_string(),
@@ -1587,9 +1390,8 @@ mail IN MX  10 mx.example.com.
         RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).expect("a CNAME encodes")
     }
 
-    /// How many records of a type sit at a name, counted from the zone's own
-    /// index rather than by scanning — so the rebuilt zone is checked through
-    /// the API a query uses, not through the vector `apply` happened to build.
+    /// How many records of a type sit at a name, via the zone's own index — so
+    /// the rebuilt zone is checked through the API a query uses.
     fn held(zone: &Zone, name: &str, rtype: Rtype) -> usize {
         zone.query(name, Qtype::of(rtype)).len()
     }
@@ -1598,9 +1400,7 @@ mail IN MX  10 mx.example.com.
         Change::Add(rr(name, Class::new(1), Ttl::from_secs(ttl), rdata))
     }
 
-    /// All four update forms of §2.5, applied — the mirror of
-    /// [`the_four_update_forms_are_read_as_rfc_2136_defines_them`], which
-    /// checked only that they were *read*.
+    /// All four update forms of §2.5, applied rather than merely read.
     #[test]
     fn the_four_update_forms_change_the_zone_as_rfc_2136_describes() {
         let zone = zone();
@@ -1660,21 +1460,10 @@ mail IN MX  10 mx.example.com.
         assert_eq!(left[0].rdata, a("192.0.2.10"), "the other one survived");
     }
 
-    /// **§3.4.2.3 and §3.4.2.4's apex protections, all three of them.**
-    ///
-    /// > unless the NAME is the same as ZNAME in which case only those RRs
-    /// > whose TYPE is other than SOA or NS are deleted
-    ///
-    /// A zone that deleted its own SOA and apex NS would stop being a zone: it
-    /// could not be transferred (both `axfr_messages` and `ixfr_response` fail
-    /// without an apex SOA), could not report a serial, and would answer for a
-    /// delegation it no longer holds. This is the rule a straightforward
-    /// `retain` gets wrong, because the obvious implementation of "delete every
-    /// RRset at this name" deletes every RRset at that name.
-    ///
-    /// **Watched failing** against a `Change::DeleteName` arm written without
-    /// the `apex &&` guard: the SOA and the NS both went, `applied.zone.serial()`
-    /// came back `None`, and the first assertion below fired.
+    /// §3.4.2.3 and §3.4.2.4's apex protections, all three of them: at ZNAME,
+    /// only RRs whose TYPE is other than SOA or NS are deleted. A zone without
+    /// them cannot be transferred or report a serial, and a straightforward
+    /// `retain` gets it wrong.
     #[test]
     fn the_apex_soa_and_ns_survive_every_form_of_deletion() {
         let zone = zone();
@@ -1730,13 +1519,9 @@ mail IN MX  10 mx.example.com.
         assert_eq!(applied.changed, 0);
     }
 
-    /// §3.4.2.4 protects "the only NS remaining in the RRset" — which is a
-    /// question about what the deletion would *leave*, not about whether the
-    /// RRset is a singleton now.
-    ///
-    /// Both halves, because an implementation that refused whenever the apex had
-    /// one NS would pass the first and an implementation that never refused
-    /// would pass the second. The two-NS zone is the case that separates them.
+    /// §3.4.2.4 protects "the only NS remaining in the RRset" — a question
+    /// about what the deletion would *leave*, not about whether the RRset is a
+    /// singleton now. The two-NS zone separates the two readings.
     #[test]
     fn the_last_apex_ns_is_not_deleted_but_one_of_two_is() {
         let two_ns = parse_zone_file(
@@ -1772,9 +1557,8 @@ mail IN MX  10 mx.example.com.
         assert_eq!(last.changed, 0);
         assert_eq!(last.ignored.len(), 1);
 
-        // And a deletion naming an NS the zone does not hold is not refused —
-        // it simply matches nothing. Refusing here would report a protection
-        // that did not protect anything.
+        // A deletion naming an NS the zone does not hold matches nothing, so
+        // there is nothing to protect and nothing to report.
         let absent = delete_one(&applied.zone, "ns9.elsewhere.test.");
         assert_eq!(absent.changed, 0);
         assert!(
@@ -1784,16 +1568,9 @@ mail IN MX  10 mx.example.com.
         );
     }
 
-    /// §3.4.2.7: a CNAME may not be added where other data lives, and other
-    /// data may not be added where a CNAME lives.
-    ///
-    /// The underlying rule is RFC 1034 §3.6.2's — a CNAME is alone at its name —
-    /// and the reason it is restated in RFC 2136 is that an UPDATE is the one
-    /// thing that can create the situation after the zone file has been read.
-    ///
-    /// The third case is the exception RFC 4035 §2.5 carves out: RRSIG, NSEC and
-    /// NSEC3 *may* sit beside a CNAME, so a signed zone must not become one
-    /// whose CNAMEs can never be updated again.
+    /// §3.4.2.7: a CNAME may not be added where other data lives, nor other
+    /// data where a CNAME lives (RFC 1034 §3.6.2). The exception is RFC 4035
+    /// §2.5's — RRSIG, NSEC and NSEC3 may sit beside a CNAME.
     #[test]
     fn a_cname_and_other_data_never_join_at_one_name() {
         let zone = zone();
@@ -1820,7 +1597,6 @@ mail IN MX  10 mx.example.com.
         assert_eq!(applied.changed, 0);
         assert_eq!(held(&applied.zone, "alias.example.com.", rt::A), 0);
 
-        // A CNAME replacing a CNAME is the ordinary case and must still work —
         // §3.4.2.7 replaces rather than appends for this type.
         let applied = apply(
             &with_cname.zone,
@@ -1839,8 +1615,7 @@ mail IN MX  10 mx.example.com.
             cname("mail.example.com.")
         );
 
-        // RFC 4035 §2.5: an RRSIG beside the CNAME is not "other data", so the
-        // replacement above still goes through when the name has been signed.
+        // RFC 4035 §2.5: an RRSIG beside the CNAME is not "other data".
         let mut signed = with_cname.zone.clone();
         signed.add_record(ZoneRecord {
             name: "alias.example.com.".to_string(),
@@ -1862,20 +1637,10 @@ mail IN MX  10 mx.example.com.
     /// §3.4.2.2: an SOA in the Update section is ignored unless its serial is
     /// newer.
     ///
-    /// > If the TYPE is SOA and there is no Zone SOA RR, or the new SOA.SERIAL
-    /// > is lower (according to [RFC1982]) than or equal to the current Zone SOA
-    /// > RR's SOA.SERIAL, the Update RR is ignored.
-    ///
-    /// **The equal case is the one worth pinning**, because §3.4.2.7's
-    /// pseudocode spells the same test as `zone.serial > rr.serial` — which
-    /// accepts an equal serial and would let an UPDATE rewrite MNAME, RNAME or
-    /// the timers while leaving the version number where it was. The prose is
-    /// the normative text and §3.6 backs it: "imperative that the zone's
-    /// contents and the SOA's SERIAL be tightly synchronized".
-    ///
-    /// And the comparison is RFC 1982's, so a serial that has wrapped past the
-    /// 32-bit ceiling is newer than the large number it followed. A `>` reads
-    /// that as a rollback and refuses the update forever after.
+    /// The equal case is the one worth pinning: §3.4.2.7's pseudocode says
+    /// `zone.serial > rr.serial`, which accepts it, and the prose is normative.
+    /// The comparison is RFC 1982's, so a wrapped serial is newer than the
+    /// large number it followed — a `>` reads that as a rollback forever after.
     #[test]
     fn an_soa_is_ignored_unless_its_serial_is_newer() {
         let zone = zone();
@@ -1927,12 +1692,8 @@ mail IN MX  10 mx.example.com.
     }
 
     /// §3.4.2.2: "In case of duplicate RDATAs ... the Zone RR is replaced by
-    /// Update RR."
-    ///
-    /// So adding a record the zone already holds is how an UPDATE changes a
-    /// TTL — and it must not leave two copies of the record behind, which is
-    /// what an implementation that only ever appends would do. The count is the
-    /// assertion, because the TTL change alone would pass either way.
+    /// Update RR." So adding a record the zone already holds is how an UPDATE
+    /// changes a TTL, and it must not leave two copies behind.
     #[test]
     fn adding_a_record_that_is_already_there_replaces_it_rather_than_doubling_it() {
         let zone = zone();
@@ -1952,8 +1713,8 @@ mail IN MX  10 mx.example.com.
         assert_eq!(changed_one.ttl, Ttl::from_secs(60), "with the new TTL");
         assert_eq!(applied.changed, 1);
 
-        // The same record with the same TTL is not a change at all, which is
-        // what keeps a retried UPDATE from bumping the serial (see §3.6 below).
+        // The same record with the same TTL is not a change, which keeps a
+        // retried UPDATE from bumping the serial (§3.6).
         let again = apply(
             &applied.zone,
             &[add("www.example.com.", 60, a("192.0.2.10"))],
@@ -1962,22 +1723,10 @@ mail IN MX  10 mx.example.com.
         assert_eq!(again.zone.serial(), applied.zone.serial());
     }
 
-    /// **RFC 2136 §3.6: the serial moves when the contents move, and not
-    /// otherwise.**
-    ///
-    /// > It is imperative that the zone's contents and the SOA's SERIAL be
-    /// > tightly synchronized.
-    ///
-    /// Both directions matter and they fail in opposite ways. Without the bump,
-    /// a secondary compares serials, sees no change, and never fetches the
-    /// records that did change — the zone is edited on the primary and nowhere
-    /// else. With an unconditional bump, an UPDATE whose deletions all named
-    /// records that were already gone — an ordinary thing for a DHCP client to
-    /// send twice — costs a re-signing run and an IXFR to every secondary for
-    /// nothing.
-    ///
-    /// **Watched failing** against a `changed > 0 &&` that was not there: the
-    /// no-op case below came back at serial 2.
+    /// RFC 2136 §3.6: the serial moves when the contents move, and not
+    /// otherwise. Without the bump a secondary sees no change and never fetches
+    /// the records that did change; with an unconditional one, a retried
+    /// no-op UPDATE costs a re-signing run and an IXFR to every secondary.
     #[test]
     fn the_serial_moves_by_one_when_something_changed_and_not_when_nothing_did() {
         let zone = zone();
@@ -1987,8 +1736,7 @@ mail IN MX  10 mx.example.com.
         assert_eq!(applied.changed, 1);
         assert_eq!(applied.zone.serial(), Some(Serial::new(2)));
 
-        // A deletion that names a record the zone does not hold changes
-        // nothing, so there is nothing to make visible.
+        // A deletion naming a record the zone does not hold changes nothing.
         let no_op = apply(
             &zone,
             &[Change::DeleteRecord {
@@ -2004,12 +1752,10 @@ mail IN MX  10 mx.example.com.
             "nothing changed, so the version did not"
         );
 
-        // An empty UPDATE is the degenerate case of the same thing.
         assert_eq!(apply(&zone, &[]).zone.serial(), Some(Serial::new(1)));
 
-        // An UPDATE that sets the SOA itself owns the number: §3.6's automatic
-        // increment is owed only "when the SOA SERIAL is not changed", so this
-        // must land on 9 and not 10.
+        // §3.6's automatic increment is owed only "when the SOA SERIAL is not
+        // changed", so an UPDATE setting it lands on 9 and not 10.
         let explicit = apply(
             &zone,
             &[
@@ -2037,13 +1783,8 @@ mail IN MX  10 mx.example.com.
         assert_eq!(wrapped.zone.serial(), Some(Serial::new(0)));
     }
 
-    /// Only the serial moves: the rest of the SOA is the operator's and an
-    /// automatic bump must not re-spell it.
-    ///
-    /// The RDATA is compared byte for byte outside those four octets, because
-    /// re-encoding is how a valid RRset silently becomes a bogus one — a
-    /// signature covers RDATA exactly, and `zone_writer`'s module docs are about
-    /// this same hazard from the other end.
+    /// Only the serial moves: a signature covers RDATA exactly, so re-encoding
+    /// the rest of the SOA is how a valid RRset silently becomes bogus.
     #[test]
     fn the_automatic_bump_rewrites_four_octets_and_nothing_else() {
         let zone = zone();
@@ -2071,12 +1812,8 @@ mail IN MX  10 mx.example.com.
     }
 
     /// §3.4.2.7 is a loop over the update records, each applied to the zone the
-    /// last one left. So a delete-then-add at one name leaves exactly what the
-    /// add put there.
-    ///
-    /// An implementation that evaluated every change against the *original*
-    /// zone would leave three A records at `www` here instead of one, and would
-    /// pass every other test in this file.
+    /// last one left — not each against the original zone, which would leave
+    /// three A records at `www` here instead of one.
     #[test]
     fn changes_apply_in_order_each_to_the_result_of_the_last() {
         let zone = zone();
@@ -2095,8 +1832,7 @@ mail IN MX  10 mx.example.com.
         assert_eq!(left.len(), 1, "the delete ran first: {left:?}");
         assert_eq!(left[0].rdata, a("192.0.2.80"));
 
-        // And the other order is the other answer: adding into an RRset that is
-        // then deleted leaves nothing.
+        // The other order is the other answer.
         let reversed = apply(
             &zone,
             &[
@@ -2110,21 +1846,13 @@ mail IN MX  10 mx.example.com.
         assert_eq!(held(&reversed.zone, "www.example.com.", rt::A), 0);
     }
 
-    /// **The serial an UPDATE writes survives signing** — which is `TODO.md`
-    /// #10's "serial handling collides with #8", checked rather than asserted.
+    /// The serial an UPDATE writes survives signing.
     ///
-    /// A signed zone does not serve the file's serial: it serves
-    /// `file_serial + hours-since-epoch` ([`crate::zone_signer::signed_serial`]).
-    /// The question is whether an UPDATE's `+1` is still visible after that term
-    /// is applied, because if it is not then no secondary ever fetches an
-    /// update made within one hour of the last one.
-    ///
-    /// It is, and the reason is the correction #8 recorded from PowerDNS's
-    /// docs: the time term is **added**, not `max`ed. The `max` version — which
-    /// is the obvious design — is included below to show what it would have
-    /// cost, and it is not a hypothetical: for any date-style serial the `max`
-    /// keeps the file's number, so two updates in one hour would serve one
-    /// serial between them.
+    /// A signed zone serves `file_serial + hours-since-epoch`
+    /// ([`crate::zone_signer::signed_serial`]). The time term is *added*, not
+    /// `max`ed, so an UPDATE's `+1` stays visible within one signing hour; the
+    /// `max` alternative is checked below because for a date-style serial it
+    /// keeps the file's number and two updates share one serial.
     #[test]
     fn an_updates_serial_bump_survives_signing() {
         use crate::zone_signer::signed_serial;
@@ -2141,17 +1869,10 @@ mail IN MX  10 mx.example.com.
             "an UPDATE inside one signing hour must still look like a new version"
         );
 
-        // What a `max(file, now)` would have served instead: the same number
-        // twice, because a date-style serial is larger than any current Unix
-        // timestamp. Spelled out because "obviously right and silently does
-        // nothing" is exactly how this design error survives review.
-        //
-        // The ten-digit `YYYYMMDDnn` form, which is the one the claim is about:
-        // 2026080301 is 2.03e9 against an epoch of 1.75e9. The eight-digit
-        // `YYYYMMDD` form is *smaller* than a current timestamp and the `max`
-        // would swallow it whole rather than merely fail to move it — worse in
-        // the same direction, and it is what this test asserted on the first
-        // run, which is why the number is spelled with its `nn`.
+        // What a `max(file, now)` would serve: the same number twice, because
+        // the ten-digit `YYYYMMDDnn` form is larger than a current timestamp
+        // (2026080301 against 1.75e9). The eight-digit form is smaller and the
+        // `max` would swallow it whole, hence the `nn`.
         let date_style_before = Serial::new(2_026_080_301);
         let date_style_after = date_style_before.wrapping_add(1);
         let maxed = |file: Serial| Serial::new(file.to_u32().max(signed_at as u32));

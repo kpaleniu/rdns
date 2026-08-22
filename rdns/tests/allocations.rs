@@ -1,21 +1,12 @@
 //! Allocation counts for the paths that matter, as exact assertions.
 //!
-//! A separate test binary because `#[global_allocator]` applies to the whole
-//! binary: in `rdns`'s unit tests, DHAT would make all 593 of them record a
-//! backtrace per allocation.
+//! Its own test binary: `#[global_allocator]` applies to the whole binary.
 //!
-//! Counts rather than timings, because a count is exact and does not care what
-//! else is running (`CLAUDE.md` §10). A number here is a measurement, not a
-//! target: assertions are ranges where the thing measured has a degree of freedom
-//! (a `HashMap` growing differently) and exact where it does not. Update them
-//! with the reason, as a benchmark floor is updated.
-//!
-//! Do not add a second `#[test]` here — add a function and call it from
-//! [`allocation_counts`]. The profiler is global, and libtest's per-test
-//! bookkeeping runs on other threads around a body, outside anything a mutex in
-//! this file can hold. As separate tests, one measurement read 15 where it reads
-//! 7, on three runs out of five on Linux. The cost is that the first failing
-//! measurement hides the ones after it.
+//! One `#[test]` only — add a function and call it from [`allocation_counts`].
+//! The profiler is global and libtest's per-test bookkeeping runs on threads no
+//! mutex here can hold, so as separate tests one measurement read 15 where it
+//! reads 7. Assertions are ranges only where the thing measured has a degree of
+//! freedom; update one with the reason, as a benchmark floor is updated.
 
 use rdns::Class;
 use rdns::Rtype;
@@ -34,8 +25,7 @@ use rdns::{
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-/// Every measurement in this file, in one test — see the note at the top of it
-/// for why that is not an accident.
+/// Every measurement in this file, in one test; see the module header for why.
 #[test]
 fn allocation_counts() {
     let _serial = exclusive();
@@ -51,30 +41,18 @@ fn allocation_counts() {
     verifying_an_rrset_against_two_candidate_signatures();
 }
 
-/// Belt to the braces of there being one test: two bodies must not overlap.
+/// Two measured bodies must not overlap: the profiler is global, so an
+/// overlapping body's allocations land in whichever measurement is running —
+/// guarding only the measurement call gave 4 where the truth was 12.
 ///
-/// Only one `dhat::Profiler` may exist at a time — a second panics rather than
-/// mis-counting — and the profiler is *global*, so an overlapping body's
-/// allocations would land in whichever measurement was running. Guarding only
-/// the measurement call and not the whole body gave 4 where the truth was 12 and
-/// 208 where it was 1015, changing with `--test-threads`. An exact count that is
-/// not actually exact is worse than a timing, because it looks trustworthy.
-///
-/// This no longer has anything to serialize against, since the harness runs one
-/// test; it stays because it is what a second `#[test]` would collide with, and
-/// a deadlock or a panic is a better outcome there than a wrong number.
-///
-/// Poisoning is ignored on purpose: a panic in one measurement must not turn
-/// this into a second, confusing failure.
+/// Poisoning is ignored: a panic in one measurement must not become a second,
+/// confusing failure.
 static PROFILER: Mutex<()> = Mutex::new(());
 
 /// Take exclusive use of the profiler, and warm it up.
 ///
-/// The warm-up is not decoration. The **first** profiled block in the process
-/// picks up a one-off allocation from dhat's own lazily-initialized state, so
-/// without it the first measurement reads one higher than the same measurement
-/// anywhere else — a count that depends on ordering, which is precisely the kind
-/// of not-quite-exact number this file exists to avoid.
+/// The first profiled block in a process picks up a one-off from dhat's own lazy
+/// state, so without the warm-up the first measurement reads one high.
 fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     let guard = PROFILER.lock().unwrap_or_else(|e| e.into_inner());
     static WARMED: std::sync::Once = std::sync::Once::new();
@@ -94,35 +72,29 @@ fn allocations<T>(body: impl FnOnce() -> T) -> (T, u64) {
     let before = dhat::HeapStats::get().total_blocks;
     let out = body();
     let after = dhat::HeapStats::get().total_blocks;
-    // Stats have to be read while the profiler is alive; dropping it ends
-    // profiling, and `HeapStats::get` panics without one.
+    // `HeapStats::get` panics without a live profiler.
     drop(profiler);
     (out, after - before)
 }
 
 /// Run `body` under a profiler and report the most memory it held at once.
 ///
-/// The other half of the question [`allocations`] answers. A transfer that
-/// materializes the whole zone calls the allocator about as often as one that
-/// streams it; what it does differently is hold all of it at the same time, and
-/// that is the number `TODO.md` #24c is about. Peak rather than final, because
-/// the intermediate `Vec<ResourceRecord>` was dropped before the caller saw the
-/// messages it became.
+/// A streaming transfer calls the allocator about as often as a materializing
+/// one; what differs is how much is alive at the same time.
 ///
 /// Call only while holding [`exclusive`].
 fn peak_bytes<T>(body: impl FnOnce() -> T) -> (T, usize) {
     let profiler = dhat::Profiler::builder().testing().build();
     let out = body();
-    // Read while `out` is still alive: for the materializing case, what it holds
-    // *is* the measurement.
+    // Read while `out` is alive: for the materializing case, what it holds *is*
+    // the measurement.
     let peak = dhat::HeapStats::get().max_bytes;
     drop(profiler);
     (out, peak)
 }
 
-/// Assert a count is in `range`, printing the actual number either way so a
-/// failure says what to change the range to and a pass leaves the figure in the
-/// test log.
+/// Assert a count is in `range`, printing it either way so a failure says what
+/// to change the range to.
 #[track_caller]
 fn within(what: &str, count: u64, range: std::ops::RangeInclusive<u64>) {
     println!("{what}: {count} allocations");
@@ -150,10 +122,9 @@ fn query_bytes(qname: &str, qtype: Qtype) -> Vec<u8> {
         .expect("serialize the query")
 }
 
-/// The same query as a real resolver sends it: EDNS0, DO set, and a DNS cookie
-/// (RFC 7873), which BIND and Unbound both send by default. The cookie is the
-/// point — an OPT record with no options parses into an empty `Vec`, which does
-/// not allocate, so a query without one hides what reading the OPT costs.
+/// The same query as a real resolver sends it: EDNS0, DO set, a DNS cookie
+/// (RFC 7873). The cookie is the point — an OPT record with no options parses
+/// into an empty `Vec`, which does not allocate, hiding what reading it costs.
 fn query_bytes_with_edns(qname: &str, qtype: Qtype) -> Vec<u8> {
     let mut msg = query_message(qname, qtype);
     msg.set_edns(
@@ -195,21 +166,17 @@ fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
     }
 }
 
-/// The first thing #9e says to measure: one UDP query end to end, and how much
-/// of it is response serialization.
-///
-/// Split into three so the answer is a breakdown rather than one number — the
-/// point of measuring was never the total.
+/// One UDP query end to end, split into parse, look up and serialize so the
+/// answer is a breakdown rather than one number.
 fn one_query_end_to_end() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let wire = query_bytes("www.example.com.", Qtype::of(record_types::A));
 
     let (parsed, parse_count) =
         allocations(|| DnsMessage::try_from_bytes(&wire).expect("parse the query"));
-    // Three: the label vector the name is parsed into, the `String` it becomes,
-    // and the vector of questions. It measured 4 until `DNameUnpacker` stopped
-    // copying the labels of a name that has no compression pointer in it — and a
-    // QNAME cannot have one, there being nothing before it to point at.
+    // Three: the label vector, the `String` it becomes, the question vector. A
+    // QNAME cannot hold a compression pointer, so `DNameUnpacker` does not copy
+    // its labels.
     within("parse a one-question query", parse_count, 3..=3);
 
     let (answers, lookup_count) = allocations(|| {
@@ -224,16 +191,10 @@ fn one_query_end_to_end() {
             .collect::<Vec<_>>()
     });
     assert_eq!(answers.len(), 1);
-    // Four, and all four are the `ResourceRecord` this closure builds: the two
-    // `Vec`s (`of_type`'s and the `collect`), the owner name it clones and the
-    // rdata it clones. `Zone::query` itself contributes only the first of them.
-    //
-    // It measured 5 until `zone::absolutize` learned to borrow (#9e); the fifth
-    // was the lookup key, a copy of a name that had arrived absolute and lower
-    // case already. The range that used to be here was `1..=10`, which admitted
-    // both numbers and so would not have noticed the fix — or its loss
-    // (`CLAUDE.md` §10). Exact now, because nothing in the closure is
-    // input-dependent or hash-ordered.
+    // Four, all of them the `ResourceRecord` this closure builds: two `Vec`s,
+    // the cloned owner name, the cloned rdata. `Zone::query` contributes only
+    // the first. Exact, because nothing here is input-dependent or hash-ordered:
+    // a fifth would be the lookup key becoming an owned `String` again.
     within("look up one A record in the zone", lookup_count, 4..=4);
 
     let mut response = parsed.clone();
@@ -247,17 +208,12 @@ fn one_query_end_to_end() {
             .expect("serialize the response")
     });
     // Three: the output buffer, and the compressor's two — the arena of names
-    // seen and the table of suffixes into it. Was 6, which was those three plus
-    // a `Vec` of label offsets per name written (`compression::label_starts` is
-    // an iterator now) and a second copy of a name already in the table.
+    // seen and the table of suffixes into it.
     within("serialize a one-record response", serialize_count, 3..=3);
     assert!(bytes.len() < 100);
 
-    // And the reason `to_bytes_within_buf` exists: a send path that keeps one
-    // buffer pays nothing per response after the first. This is the assertion
-    // that would have caught the 64 KiB scratch as a *count* rather than as a
-    // capacity — and it is what a future "reuse the buffer in the UDP loop"
-    // change gets to point at.
+    // Why `to_bytes_within_buf` exists: a send path keeping one buffer pays
+    // nothing per response after the first.
     let mut scratch = Vec::new();
     response
         .to_bytes_within_buf(4096, &mut scratch)
@@ -267,8 +223,8 @@ fn one_query_end_to_end() {
             .to_bytes_within_buf(4096, &mut scratch)
             .expect("serialize into the warm buffer")
     });
-    // The two the compressor makes, and nothing else: it is per-message state,
-    // so unlike the buffer it cannot be carried across. Was 5.
+    // The compressor's two and nothing else: per-message state, so unlike the
+    // buffer it cannot be carried across.
     within("serialize into a reused buffer", reused_count, 2..=2);
     assert!(
         reused_count < serialize_count,
@@ -276,31 +232,18 @@ fn one_query_end_to_end() {
     );
 }
 
-/// The three lookups that stand between a question and an answer, measured
-/// together — because the finding was not about any one of them.
+/// The three zone lookups `rdnsd` makes per query (RFC 1034 §4.3.2) cost one
+/// allocation between them, and it is the answer: the `Vec` `Zone::query`
+/// returns.
 ///
-/// `rdnsd` walks RFC 1034 §4.3.2 by asking the zone three questions (is there a
-/// delegation above this name, does the name exist, what does it hold), and then
-/// `add_answer` asks the third one again to render it. Each began by making the
-/// lookup key with `zone::absolutize`, which returned an owned `String`
-/// unconditionally — so four copies per query of a name that arrived absolute and
-/// lower case and needed neither step. The DHAT profile put it at 4 allocations
-/// of 16 bytes, ~14% of everything an answer allocated, and it was the largest
-/// single item left on #9e.
-///
-/// One allocation now, and it is the answer itself: the `Vec` `Zone::query`
-/// returns. Both walks are pure comparisons against the index — which is what
-/// `Cow` plus `HashMap<String, _>::get` taking a `&str` buys, and what the number
-/// here is a guard against losing again.
-///
-/// Against the old code this reads 5.
+/// A guard against `zone::absolutize` going back to an owned `String`, which
+/// made a copy of the lookup key per lookup — four per query, ~14% of everything
+/// an answer allocated. Against that code this reads 5.
 fn the_lookups_behind_one_answer_allocate_only_the_answer() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
 
-    // Once through before measuring, for the same reason the TSIG test below
-    // does it: the first run of any path in a process pays for state that has
-    // nothing to do with what is being counted, and a target this small cannot
-    // absorb it.
+    // Warm first: the first run of any path pays for state unrelated to the
+    // count, and a target this small cannot absorb it.
     let warm = |zone: &rdns::zone::Zone| {
         let cut = zone.delegation_for("www.example.com.");
         let kind = zone.name_kind("www.example.com.");
@@ -318,25 +261,17 @@ fn the_lookups_behind_one_answer_allocate_only_the_answer() {
     within("the three lookups behind one answer", count, 1..=1);
 }
 
-/// What a server asks of a request's OPT record, and what asking used to cost.
+/// The three things a server asks of a request's OPT record — reply size, EDNS
+/// version, DO bit — read without building the option list.
 ///
-/// Both daemons ask the same three questions — how big a reply may be, is this a
-/// version we implement, does the client want DNSSEC — and `rdnsd` asked them
-/// through `edns()` twice in sixteen lines. `edns()` builds the option list to
-/// get at fields that are not in it: a `Vec` plus a `Vec<u8>` per option, built
-/// and dropped. A resolver sending a DNS cookie therefore paid four allocations
-/// per query for two flags, and that is what a resolver does — BIND and Unbound
-/// both cookie by default.
-///
-/// The second measurement is the old cost, taken live rather than quoted, so the
-/// comparison cannot go stale: `edns()` is still there for a caller that
-/// actually wants the options.
+/// `edns_header` against `options()` below is the ratio: asking through the
+/// option list costs a `Vec` plus a `Vec<u8>` per option, and a resolver sending
+/// a DNS cookie paid that per query for two flags.
 fn reading_a_requests_edns_parameters_allocates_nothing() {
     let wire = query_bytes_with_edns("www.example.com.", Qtype::of(record_types::A));
     let msg = DnsMessage::try_from_bytes(&wire).expect("parse the query");
 
-    // One call before the measured one, for the reason the TSIG test gives: a
-    // target of exactly zero cannot absorb somebody else's one-off.
+    // Warm first: a target of exactly zero cannot absorb another path's one-off.
     let _warm = msg.edns_header();
 
     let (header, count) = allocations(|| msg.edns_header());
@@ -347,20 +282,9 @@ fn reading_a_requests_edns_parameters_allocates_nothing() {
     assert_eq!(header.udp_payload_size, 1232);
     within("read a request's EDNS parameters", count, 0..=0);
 
-    // Reaching the OPT record is now free — it is a field, not something to be
-    // found in the additional section (`TODO.md` #13d).
-    // Parsing the query in the first place, which is what a server does before
-    // any of the above. **This measurement was added during review of #13**,
-    // because nothing covered parsing an EDNS-bearing query and the OPT record's
-    // move into its own field changed exactly that path — a gap the gate could
-    // not see through, and it hid a regression for two commits.
-    //
-    // Measured against `main` with the same probe: **7 before #13, 8 after the
-    // first version of `Additional::try_from_bytes` — which parsed the owner
-    // name twice to peek at the TYPE — and 6 once the fields are read once and
-    // branched on.** The extra one below `main` is the `RecordData` that an OPT
-    // record no longer needs building on the way past, since it never becomes a
-    // `ResourceRecord` at all.
+    // Six: an OPT record never becomes a `ResourceRecord`, so it costs one less
+    // than the same query with a real additional record. It read 8 while
+    // `Additional::try_from_bytes` parsed the owner name twice to peek at TYPE.
     let (parsed, parse_count) = allocations(|| DnsMessage::try_from_bytes(&wire));
     assert!(parsed.expect("parses").edns().is_some(), "the OPT is there");
     within("parse a query that carries EDNS", parse_count, 6..=6);
@@ -369,13 +293,8 @@ fn reading_a_requests_edns_parameters_allocates_nothing() {
     let found = found.expect("OPT");
     within("reach the OPT record", found_count, 0..=0);
 
-    // Building the option list is where the cost went, and it is only paid by a
-    // caller that asks for the options. **This measurement moved**: it used to
-    // call `edns()`, which parsed the list as part of reaching the record and so
-    // read 2 here; `edns()` now allocates nothing and `options()` is the parse.
-    // Same two allocations, charged to the call that actually wants them —
-    // which is the point of the split, and the reason the number is unchanged
-    // rather than lowered (`CLAUDE.md` §10).
+    // The same two allocations as before the split, now charged to the caller
+    // that asks for the options rather than to reaching the record.
     let (full, full_count) = allocations(|| found.options());
     assert_eq!(full.expect("well-formed").len(), 1, "one cookie");
     within(
@@ -385,9 +304,9 @@ fn reading_a_requests_edns_parameters_allocates_nothing() {
     );
 }
 
-/// A compressed name is the majority of response serialization by time, and #9e
-/// claimed ~8 allocations per name before the arena. This is that claim as a
-/// number, on a response holding several names that share suffixes.
+/// Name compression is most of response serialization by time. This is what it
+/// costs on a response whose names share suffixes, and what reading one back in
+/// costs.
 fn a_response_full_of_shared_suffixes() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let mut response =
@@ -408,32 +327,20 @@ fn a_response_full_of_shared_suffixes() {
     assert_eq!(response.answers.len(), 3);
 
     let (_, count) = allocations(|| response.to_bytes_within(4096).expect("serialize"));
-    // Three names sharing `example.com.`, plus the question. The old compressor
-    // allocated twice per suffix per name — a join and a lowercase — so this
-    // shape cost upwards of twenty on its own; the arena took it to 11, and
-    // dropping the per-name vector of label offsets takes it to 7. The range is
-    // narrow rather than exact because the two compressor vectors grow with the
-    // number of distinct names, and where they choose to reallocate is theirs.
+    // Three names sharing `example.com.`, plus the question. A range rather than
+    // exact: the two compressor vectors grow with the number of distinct names
+    // and choose their own reallocation points.
     within("serialize four names sharing a suffix", count, 5..=10);
 
-    // And the same message read back, which is what a resolver does to every
-    // reply it gets and a secondary to every AXFR message. Nothing else in this
-    // file parses a name that is actually *compressed* — the query path can't,
-    // a QNAME having nothing before it to point at — so this is the only
-    // measurement that covers `DNameUnpacker`'s pointer-following at all.
+    // The only measurement here that parses a name which is actually
+    // *compressed* — a QNAME has nothing before it to point at — so the only one
+    // covering `DNameUnpacker`'s pointer following.
     //
-    // **What it holds down is the visited-offsets set.** Cycle prevention used
-    // to be a `RefCell<HashSet<usize>>` on the unpacker, and a `HashSet`
-    // allocates its table on the first `insert` — so the first compressed name
-    // in a message bought one, and later names reused it, `unpack` having
-    // `clear`ed rather than dropped it. Requiring a pointer to point backwards
-    // (RFC 1035 §4.1.4) makes a cycle unreachable instead of detected, so the
-    // set is gone. Measured either side of that change, by stashing the source
-    // and re-running this probe: **20 with it, 19 without**. One allocation per
-    // message containing a compression pointer, which is per *message* and not
-    // per name — the smaller of the two claims, and the true one. The rest of
-    // the 19 is the message itself: four names, their label vectors and the
-    // section vectors, none of which this change touches.
+    // It holds down the visited-offsets set: cycle prevention was a
+    // `RefCell<HashSet<usize>>` costing one allocation per message with a
+    // pointer in it, and requiring a pointer to point backwards (RFC 1035
+    // §4.1.4) makes a cycle unreachable rather than detected. 20 with it, 19
+    // without; the rest is the message itself.
     let wire = response.to_bytes_within(4096).expect("serialize");
     let (reparsed, count) = allocations(|| DnsMessage::try_from_bytes(&wire).expect("parse back"));
     assert_eq!(
@@ -444,12 +351,12 @@ fn a_response_full_of_shared_suffixes() {
     within("parse a response with compressed names", count, 19..=19);
 }
 
-/// The second thing to measure: a full zone load and sign. Nobody had looked at
-/// this one, and it runs on a worker that is also serving queries.
+/// A full zone load and sign, which runs on a worker that is also serving
+/// queries.
 fn one_zone_load_and_sign() {
     let (zone, parse_count) = allocations(|| parse_zone_file(ZONE, "example.com.").expect("parse"));
-    // Eight records. A per-record cost is expected and correct here — this is a
-    // ceiling on how *much* per record, not a claim that it should be free.
+    // Eight records. A ceiling on how much per record, not a claim that a
+    // per-record cost is wrong.
     within("parse an eight-record zone", parse_count, 120..=320);
 
     let keys = vec![
@@ -470,21 +377,14 @@ fn one_zone_load_and_sign() {
 
     let (signed, sign_count) = allocations(|| sign_zone(&zone, &keys, &policy).expect("sign"));
     assert!(signed.records().len() > zone.records().len());
-    // **Moved 922 -> 924 on 2026-08-02, and the reason is written here rather
-    // than waved through** (`CLAUDE.md` §10, `TODO.md` §13's gate pointed the
-    // other way). Sealing `RecordData` (#14c) made `zone_signer::dnskey_rdata`
-    // go through the checked constructor, which parses what it was handed; a
-    // DNSKEY's decoder allocates one `Vec` for the public key. Two keys above,
-    // KSK and ZSK, so exactly two allocations — not an estimate: NSEC3 is off in
-    // this policy, so `nsec3param_rdata`, the only other new caller, does not
-    // run at all. Two allocations once per signing run, to make "the RDATA is
-    // what its TYPE says" true by construction.
+    // Moved 922 -> 924 when sealing `RecordData` put `zone_signer::dnskey_rdata`
+    // through the checked constructor: a DNSKEY decoder allocates one `Vec` for
+    // the public key, and there are two keys. NSEC3 is off in this policy, so
+    // `nsec3param_rdata` does not run.
     within("sign an eight-record zone", sign_count, 600..=1_400);
 }
 
-/// The third: an AXFR out. A transfer builds every record in the zone into
-/// messages, so this is the one where a per-record allocation multiplies by the
-/// zone size — and #9e says nobody had looked.
+/// An AXFR out, where a per-record allocation multiplies by the zone size.
 fn one_axfr_out() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let request =
@@ -507,28 +407,19 @@ fn one_axfr_out() {
             .to_bytes_within(u16::MAX as usize)
             .expect("serialize")
     });
-    // Nine records into one message: 41 before the compressor stopped allocating
-    // a vector of label offsets per name and a second copy of every name it had
-    // already seen, 19 after — the biggest proportional move of the four, because
-    // a transfer is nothing but names.
+    // Nine records into one message: 41 before the compressor stopped keeping a
+    // label-offset vector per name and a second copy of every name it had seen,
+    // 19 after — a transfer is nothing but names.
     within("serialize one AXFR message", serialize_count, 14..=26);
 
     the_first_envelope_costs_the_same_however_big_the_zone_is(&request);
 }
 
-/// **The cost of the first envelope must not grow with the zone**, which is the
-/// whole of `TODO.md` #24c and the one property a count can state exactly.
+/// The cost of the first envelope must not grow with the zone: `axfr_messages`
+/// built every frame before the first byte went out.
 ///
-/// `axfr_messages` clones every record of the zone into a `Vec`, moves that into
-/// a `Vec<DnsMessage>`, and (in `rdnsd`) had every frame built before the first
-/// byte went out — the zone three times over, per concurrent transfer. The
-/// envelope iterator materializes one envelope, so the first one costs the same
-/// whether the zone behind it holds 600 records or 1,200.
-///
-/// Equality rather than a bound: the two zones are built to differ only in how
-/// many records follow the envelope that is measured, so anything the iterator
-/// did eagerly would show up as a difference (§10 — a ratio does not care what
-/// else is running, and this does not even care what machine it is).
+/// Equality rather than a bound — the two zones differ only in how many records
+/// follow the measured envelope, so anything eager shows up as a difference.
 fn the_first_envelope_costs_the_same_however_big_the_zone_is(request: &DnsMessage) {
     let small = big_zone(600);
     let large = big_zone(1_200);
@@ -561,8 +452,8 @@ fn the_first_envelope_costs_the_same_however_big_the_zone_is(request: &DnsMessag
         1..=4_000,
     );
 
-    // And the whole thing, for the contrast the item was filed on: this is what
-    // the daemon used to pay before sending anything.
+    // The whole transfer, for contrast: what the daemon used to pay before
+    // sending anything.
     let (_, whole_count) =
         allocations(|| rdns::transfer::axfr_messages(request, &large).expect("axfr"));
     assert!(
@@ -575,10 +466,9 @@ fn the_first_envelope_costs_the_same_however_big_the_zone_is(request: &DnsMessag
         2_200..=2_700,
     );
 
-    // **The count is not the point; the peak is.** Streaming a zone calls the
-    // allocator about as often as materializing it — the difference is how much
-    // is alive at once, which is what a transfer of a large zone costs a server
-    // and what #24c was filed about.
+    // The count is not the point; the peak is. Streaming calls the allocator
+    // about as often as materializing — the difference is how much is alive at
+    // once, which is what a large transfer costs a server.
     let whole = big_zone(5_000);
     let (_envelope, envelope_peak) = peak_bytes(|| {
         rdns::transfer::axfr_envelopes(request, &whole)
@@ -610,23 +500,16 @@ fn big_zone(records: usize) -> rdns::zone::Zone {
     parse_zone_file(&text, "example.com.").expect("parse")
 }
 
-/// Every packet the server receives is scanned for a TSIG record, and that scan
-/// used to heap-allocate a four-element `Vec<usize>` for the section counts —
-/// **before** the "is there an additional section at all" check, so it happened
-/// for every query on every server, TSIG configured or not. One block per query
-/// for four numbers whose count is known at compile time.
-///
-/// Found by the DHAT profile rather than by reading, which is the whole point of
-/// #9e's first item: it was not on the hand-written list below it.
+/// Every packet is scanned for a TSIG record, and the scan used to heap-allocate
+/// a four-element `Vec<usize>` of section counts *before* checking whether there
+/// was an additional section at all — one block per query on every server, TSIG
+/// configured or not.
 fn scanning_a_plain_query_for_a_tsig_allocates_nothing() {
     let wire = query_bytes("www.example.com.", Qtype::of(record_types::A));
     let keyring = rdns::tsig::TsigKeyring::new(Vec::new());
 
-    // One call before the measured one. Whichever code path in the process runs
-    // first pays for lazily-initialized state that has nothing to do with this
-    // function, and a target of exactly zero cannot tolerate borrowing someone
-    // else's one-off — it made this read 1 or 0 depending on which test the
-    // scheduler happened to start first.
+    // Warm first: a target of exactly zero cannot absorb another path's
+    // lazily-initialized state. This read 1 or 0 depending on scheduling.
     let _warm = rdns::tsig::check_request(&wire, &keyring, 0);
 
     let (check, count) = allocations(|| rdns::tsig::check_request(&wire, &keyring, 0));
@@ -637,19 +520,12 @@ fn scanning_a_plain_query_for_a_tsig_allocates_nothing() {
     within("scan a TSIG-less query for a TSIG", count, 0..=0);
 }
 
-/// Comparing two names is a question about bytes, and should cost nothing.
+/// Comparing two names is a question about bytes and should cost nothing.
 ///
-/// `resolver::names_equal` was `normalize(a) == normalize(b)`, and `normalize`
-/// is `to_ascii_lowercase` — which allocates whether or not there is anything to
-/// fold — plus a `format!` when the trailing dot is missing. So every comparison
-/// built two `String`s and dropped them, inside `.any()` loops over an answer
-/// section. `utils::names_equal` strips at most one trailing dot from each side
-/// and calls `eq_ignore_ascii_case`, which is the same RFC 4343 fold done in
-/// place (`TODO.md` #13b).
-///
-/// The old shape is measured beside the new one on purpose: without it this is
-/// an assertion that zero is zero, and §10 asks for the ratio rather than the
-/// floor wherever one exists.
+/// `resolver::names_equal` was `normalize(a) == normalize(b)`: two `String`s per
+/// comparison, inside `.any()` loops over an answer section. The old shape is
+/// measured beside the new one so this is a ratio and not an assertion that zero
+/// is zero.
 fn comparing_two_names_allocates_nothing() {
     let a = "www.example.com.";
     let b = "WWW.Example.COM.";
@@ -678,14 +554,8 @@ fn comparing_two_names_allocates_nothing() {
     within("compare two names", after, 0..=0);
 }
 
-/// The fourth is "one recursive resolution with validation", which needs the
-/// mock hierarchy that lives in `resolver.rs`'s private test module and cannot
-/// be reached from an integration test. Measured here instead is the part of it
-/// #9e already suspects: `verify_rrset` rebuilds the canonical form of the whole
-/// RRset **per candidate RRSIG**, so an RRset signed by both a KSK and a ZSK
-/// does all of it twice for an identical result.
-///
-/// This is the number that item gets to be judged against.
+/// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate
+/// RRSIG, so an RRset signed by both a KSK and a ZSK can do all of it twice.
 fn verifying_an_rrset_against_two_candidate_signatures() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let keys = vec![

@@ -1,36 +1,25 @@
 //! The error types this library returns.
 //!
-//! Typed, not `anyhow`, because this is a library: a server has to turn a failure
-//! into a response code, and "truncated" and "not implemented" are FORMERR and
-//! NOTIMP. A string cannot be matched on. See `CLAUDE.md` §3.
-//!
-//! One module rather than one per caller, because the conversions are the
-//! interesting part — `DnssecError` wraps `WireError` (verifying a signature
-//! means re-encoding records) and `TransferError` wraps both.
-//!
-//! A `String` inside a variant is deliberate where the category is the typed
-//! part: the structural ways a message can be wrong are open-ended, and dropping
-//! the text would make a malformed packet undiagnosable.
+//! Typed, not `anyhow`: a server turns a failure into a response code, and
+//! "truncated" and "not implemented" are FORMERR and NOTIMP. A `String` inside a
+//! variant is deliberate where the category is the typed part — the structural
+//! ways a message can be wrong are open-ended.
 
 use std::io;
 
 /// A message, record, or name that does not decode.
 ///
-/// The four variants are the four things a server does about it. `Truncated` and
-/// `Malformed` are FORMERR; `Unsupported` is NOTIMP, because the encoding was
-/// legal and we are the ones who fall short; `TooLong` is a limit deliberately
-/// enforced, which is worth counting separately since it is what an attacker
-/// probing for a parser bug produces.
+/// The variants are the four things a server does about it: `Truncated` and
+/// `Malformed` are FORMERR, `Unsupported` is NOTIMP (the encoding was legal and
+/// we fall short), `TooLong` is a limit we enforce and count.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
-    /// The message ended before a field it had already declared.
     #[error("{what} needs {need} bytes, {have} remain")]
     Truncated {
         what: &'static str,
         need: usize,
         have: usize,
     },
-    /// A field is longer than the protocol permits.
     #[error("{what} is {actual}, over the limit of {limit}")]
     TooLong {
         what: &'static str,
@@ -38,16 +27,13 @@ pub enum WireError {
         actual: usize,
     },
     /// A legal encoding this codec does not implement — a binary label, say.
-    /// The sender is not at fault, which is why it is not FORMERR.
     #[error("{what} is not supported")]
     Unsupported { what: &'static str },
-    /// A structural rule of the encoding is broken.
     #[error("malformed {what}: {detail}")]
     Malformed { what: &'static str, detail: String },
 }
 
 impl WireError {
-    /// Shorthand for the common case, so a call site stays one line.
     pub fn malformed(what: &'static str, detail: impl Into<String>) -> Self {
         WireError::Malformed {
             what,
@@ -56,9 +42,8 @@ impl WireError {
     }
 }
 
-/// A label that is not UTF-8 is a malformed name, not a separate kind of
-/// failure — DNS labels are byte strings, and this library only calls for text
-/// where the protocol has already promised one (RFC 1035 §2.3.1).
+/// Labels are byte strings; text is only asked for where the protocol promises
+/// one (RFC 1035 §2.3.1), so a non-UTF-8 label is a malformed name.
 impl From<std::str::Utf8Error> for WireError {
     fn from(source: std::str::Utf8Error) -> Self {
         WireError::malformed("a label", format!("not valid UTF-8: {source}"))
@@ -67,23 +52,15 @@ impl From<std::str::Utf8Error> for WireError {
 
 /// A packet that arrived at a listening socket and is not a question.
 ///
-/// Two variants because a server does two different things about them, and both
-/// are *drop it and log which* — but which one is the operational signal.
-/// `Wire` is somebody's garbage, or somebody probing the parser. `NotAQuestion`
-/// is a reply arriving where a question should be, which means either two
-/// servers pointed at each other or a spoofed source address naming one, and an
-/// operator chasing a traffic loop needs to be able to tell those apart in a
-/// log.
-///
-/// The QR check is *not* a `WireError`: the packet decoded perfectly, and none
-/// of that type's four variants is the answer, because none of FORMERR, NOTIMP
-/// or a length limit is what a server does here (it says nothing at all — see
-/// [`crate::validation::Request`]).
+/// Both are dropped; the distinction is the operational signal. `NotAQuestion`
+/// means two servers pointed at each other, or a spoofed source naming one — an
+/// operator chasing a traffic loop has to tell that from ordinary garbage. It is
+/// not a `WireError` because the packet decoded perfectly and the server says
+/// nothing at all; see [`crate::validation::Request`].
 #[derive(Debug, thiserror::Error)]
 pub enum RequestError {
     #[error(transparent)]
     Wire(#[from] WireError),
-    /// QR=1: this is somebody's answer, and nobody asked us anything.
     #[error("a response arrived at a listening socket")]
     NotAQuestion,
 }
@@ -91,13 +68,10 @@ pub enum RequestError {
 /// A zone that will not load, or will not be written back out.
 #[derive(Debug, thiserror::Error)]
 pub enum ZoneError {
-    /// A zone file line that does not parse. The line number is the whole
-    /// value of this being typed: it is what an operator needs and what a
-    /// stringly-typed error kept losing on its way up.
     #[error("line {line}: {detail}")]
     Syntax { line: usize, detail: String },
-    /// The zone is syntactically fine and semantically impossible — a CNAME
-    /// sharing its owner, a record outside the origin, no SOA at the apex.
+    /// Syntactically fine and semantically impossible — a CNAME sharing its
+    /// owner, a record outside the origin, no SOA at the apex.
     #[error("{0}")]
     Invalid(String),
     /// `$INCLUDE` nested past the depth limit, or a file that could not be read.
@@ -107,7 +81,6 @@ pub enum ZoneError {
         #[source]
         source: io::Error,
     },
-    /// A record whose RDATA could not be encoded on the way out.
     #[error("writing {name}: {source}")]
     Encoding {
         name: String,
@@ -117,11 +90,8 @@ pub enum ZoneError {
 }
 
 impl ZoneError {
-    /// A parse failure at a known line.
-    ///
-    /// The line number is a *field* rather than the first eight characters of a
-    /// message, which is what lets `--check-config` (when it exists) group by
-    /// file and sort by line without parsing its own error strings back.
+    /// A parse failure at a known line. The line is a field rather than a prefix
+    /// on the message, so a caller can group and sort without re-parsing text.
     pub fn syntax(line: usize, detail: impl Into<String>) -> Self {
         ZoneError::Syntax {
             line,

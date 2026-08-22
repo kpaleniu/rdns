@@ -1,27 +1,23 @@
 //! Signing a zone: a DNSKEY RRset, an RRSIG over every authoritative RRset, and
 //! a chain that denies everything else.
 //!
-//! The validator in [`crate::dnssec`] and [`crate::dnssec_denial`] was written
-//! first and is the harder half; this is the half that produces what it reads.
-//! The two meet in the tests — a zone signed here is put through
-//! `verify_rrset`, `proves_nxdomain` and `proves_nodata` unmodified, so the
-//! output is checked against the same code that judges a real zone off the
-//! internet rather than against a second opinion written alongside it.
+//! What this produces is read back by [`crate::dnssec`] and
+//! [`crate::dnssec_denial`] in the tests — `verify_rrset`, `proves_nxdomain`
+//! and `proves_nodata` unmodified, so the output is judged by the same code that
+//! judges a real zone rather than by a second opinion written alongside it.
 //!
-//! Signing is done in memory, on load; the file on disk stays the unsigned thing
-//! an operator edits. Three reasons: a signer that rewrites its input inherits
-//! the "who owns this file" problem the transfer sidecar stepped around, an
-//! editor racing a re-signing timer for one file is a way to lose a zone, and
-//! what a client validates is what leaves the socket. [`crate::zone_writer`] can
-//! spell the signed form out as a debugging convenience.
+//! Signing happens in memory on load; the file on disk stays the unsigned thing
+//! an operator edits. A signer that rewrites its input inherits the "who owns
+//! this file" problem, an editor racing a re-signing timer is a way to lose a
+//! zone, and what a client validates is what leaves the socket.
+//! [`crate::zone_writer`] can spell the signed form out for debugging.
 //!
-//! What does not get signed matters as much as what does. A zone's authority
-//! stops at a delegation: the NS RRset pointing down is not authoritative data
-//! and carries no signature, the glue below it is not in the zone, and the only
-//! signed thing at a delegation point is the DS — plus the denial record that
-//! lets the absence of a DS be proved. Signing a delegation's NS RRset is the
-//! classic signer bug: validators ignore the signature, and the extra RRSIG turns
-//! up in the parent's NSEC bitmap as a type that is not there.
+//! A zone's authority stops at a delegation: the NS RRset pointing down is not
+//! authoritative data and carries no signature, the glue below it is not in the
+//! zone, and the only signed things at a delegation point are the DS and the
+//! denial record proving its absence. Signing a delegation's NS RRset is the
+//! classic signer bug — validators ignore the signature, and the extra RRSIG
+//! shows up in the parent's NSEC bitmap as a type that is not there.
 
 use crate::dnssec::{canonical_name, Dnskey, Rrset};
 use crate::dnssec_denial::{
@@ -44,25 +40,23 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenialChain {
     /// NSEC (RFC 4034 §4): each name points at the next in canonical order.
-    /// Simple, cheap to generate, and lets anyone walk the zone one query at a
-    /// time — which is a disclosure question, not a security one.
+    /// Cheap, and lets anyone walk the zone one query at a time — a disclosure
+    /// question, not a security one.
     Nsec,
     /// NSEC3 (RFC 5155): the same chain over hashed names.
     Nsec3 {
-        /// RFC 9276 §3.1 is blunt about this: use an empty salt. A salt is
-        /// re-hashed with the zone at every rollover and buys nothing against
-        /// an attacker who can simply hash the guesses they were going to make
-        /// anyway.
+        /// RFC 9276 §3.1: empty. A salt is re-hashed with the zone at every
+        /// rollover and buys nothing against an attacker who can hash the
+        /// guesses they were going to make anyway.
         salt: Vec<u8>,
         /// And zero iterations, for the same reason — the cost lands on the
         /// server and on every validator, not on the attacker.
         iterations: u16,
         /// Opt-out (RFC 5155 §6): leave insecure delegations out of the chain,
-        /// so a zone full of unsigned children does not pay for a record per
-        /// child. What it costs is that "this name does not exist" weakens to
-        /// "this name does not exist, or is an insecure delegation I did not
-        /// list" — which is why [`crate::dnssec_denial`] treats an opt-out span
-        /// as unjudgeable rather than as proof.
+        /// so a zone of unsigned children does not pay a record per child. The
+        /// cost is that "does not exist" weakens to "does not exist, or is an
+        /// insecure delegation I did not list", which is why
+        /// [`crate::dnssec_denial`] treats an opt-out span as unjudgeable.
         opt_out: bool,
     },
 }
@@ -91,10 +85,8 @@ impl DenialChain {
                 )));
             }
             if *iterations > MAX_NSEC3_ITERATIONS {
-                // Refusing to *sign* what we would refuse to *validate* is the
-                // point: this library caps verification at the RFC 9276 limit,
-                // so a zone signed above it here would be a zone we could not
-                // read ourselves.
+                // Verification is capped at the RFC 9276 limit, so signing
+                // above it produces a zone we could not read ourselves.
                 return Err(DnssecError::signing(format!(
                     "{iterations} NSEC3 iterations exceeds the {MAX_NSEC3_ITERATIONS} \
                      RFC 9276 permits",
@@ -107,25 +99,16 @@ impl DenialChain {
 
 /// How much of the validity window signature expiry is spread across.
 ///
-/// **Why spread it at all.** Every RRSIG in a zone used to be given the same
-/// expiration, so the whole zone expired in the same second — which is precisely
-/// why the failure this guards against is "*every* validating resolver SERVFAILs
-/// the *entire* zone at once". Jitter turns that cliff into a slope: the zone
-/// degrades over a fifth of its validity instead of vanishing, which is the
-/// difference between a page that says "one zone is losing signatures" and an
-/// outage. BIND jitters expiry for the same reason.
-///
-/// A fifth is a compromise. Wider spreads the risk further but shortens the
-/// effective life of the earliest signatures; narrower makes the slope steeper.
+/// One expiration for the whole zone means every validating resolver SERVFAILs
+/// the entire zone in the same second. Spreading turns that cliff into a slope,
+/// as BIND does. A fifth is the compromise: wider shortens the effective life of
+/// the earliest signatures, narrower steepens the slope.
 const EXPIRY_JITTER_FRACTION: u64 = 5;
 
 /// The fraction of the validity window after which a zone wants re-signing.
 ///
-/// A third, so there are two whole windows of slack: if a re-signing run fails,
-/// or a server is down over one, the signatures are still valid for the next two
-/// attempts. BIND's default is a quarter of the validity, and the reasoning is
-/// the same — the point is that a *missed* re-sign is survivable, because the one
-/// thing that must never happen is serving expired signatures.
+/// A third, so a failed run or a server down over one still has two attempts
+/// before anything expires. BIND uses a quarter for the same reason.
 const RESIGN_FRACTION: u64 = 3;
 
 /// The choices a signing run makes that are not in the zone or in the keys.
@@ -138,23 +121,20 @@ pub struct SigningPolicy {
     /// window; see [`SigningPolicy::expiry_for`].
     pub expiration: u32,
     pub chain: DenialChain,
-    /// The validity window in seconds, kept so the policy can say when the zone
-    /// should be signed again and how far to spread expiry.
+    /// Kept so the policy can say when to re-sign and how far to spread expiry.
     validity: u64,
-    /// The wall-clock second this signing run belongs to, which is what the
-    /// served SOA serial is derived from. Not the same as `inception`, which is
-    /// backdated for clock skew — a serial derived from a backdated time would
-    /// step backwards the moment the allowance changed.
+    /// The wall-clock second this run belongs to, which the served SOA serial is
+    /// derived from. Not `inception`, which is backdated for clock skew — a
+    /// serial from a backdated time steps backwards when the allowance changes.
     signed_at: u64,
 }
 
 impl SigningPolicy {
     /// Signatures good for `validity` seconds, starting an hour ago.
     ///
-    /// The backdating is not padding: a validator compares the inception
-    /// against *its own* clock, and clocks disagree. RFC 6781 §4.4.2 asks for
-    /// exactly this, and without it a zone re-signed and published in the same
-    /// second is invalid at every client running slightly slow.
+    /// The backdating is not padding: a validator compares the inception against
+    /// *its own* clock (RFC 6781 §4.4.2). Without it, a zone published in the
+    /// second it was signed is invalid at every client running slightly slow.
     pub fn valid_for(now: u64, validity: u64) -> Self {
         const CLOCK_SKEW_ALLOWANCE: u64 = 3600;
         SigningPolicy {
@@ -174,8 +154,7 @@ impl SigningPolicy {
     /// When the zone signed under this policy should be signed again.
     ///
     /// A third of the validity after inception, so a failed run has two more
-    /// chances before anything expires. Nothing calls this inside the signer —
-    /// it is for the daemon's re-signing timer, and it lives here because the
+    /// chances. For the daemon's re-signing timer; it lives here because the
     /// number has to agree with the validity it is a fraction *of*.
     pub fn resign_at(&self) -> u64 {
         let after = (self.validity / RESIGN_FRACTION).max(1);
@@ -185,24 +164,18 @@ impl SigningPolicy {
     /// The expiry for one RRset's signature: the window's end, pulled back by a
     /// deterministic amount derived from the owner name and type.
     ///
-    /// **Deterministic, not random**, and that matters twice. A reload re-signs,
-    /// and random jitter would reshuffle which names expire when on every reload
-    /// — so the slope would be a different slope each time and no two servers
-    /// holding the same zone would agree about it. Deterministic jitter means the
-    /// same RRset always sits at the same point on the slope.
+    /// Deterministic, not random: a reload re-signs, and random jitter would
+    /// reshuffle the slope every time, so no two servers holding the zone would
+    /// agree about it.
     ///
-    /// Never later than [`Self::expiration`]: an operator who asked for 30 days
-    /// gets at most 30 days, never 35.
+    /// Never later than [`Self::expiration`] — 30 days means at most 30.
     pub fn expiry_for(&self, name: &str, rtype: Rtype) -> u32 {
         let spread = self.validity / EXPIRY_JITTER_FRACTION;
         if spread == 0 {
             return self.expiration;
         }
-        // FNV-1a over the owner name and type. Not a security choice — nothing
-        // adversarial depends on it — just a cheap, stable spread that does not
-        // pull in a hasher whose output is randomized per process, which is
-        // exactly what `DefaultHasher` would do and would destroy the
-        // determinism above.
+        // FNV-1a over owner and type: a cheap, stable spread. `DefaultHasher`
+        // is randomized per process, which would destroy the determinism above.
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in name
             .as_bytes()
@@ -231,32 +204,27 @@ impl SigningPolicy {
 /// and a secondary decides whether to transfer by comparing serials. Without a
 /// bump the replica keeps signatures that then expire underneath it.
 ///
-/// BIND's inline-signing serves a serial of its own that diverges from the file's
-/// (one report: file at `2016090105`, served as `2016090133`); Knot takes the
-/// field from the operator entirely. Both persist the divergence in a journal,
-/// which this did not have when it was written — and without persistence a
-/// restart goes backwards, which a secondary reads as older and declines to
-/// transfer, keeping signatures that are about to expire.
+/// BIND's inline-signing serves a serial diverging from the file's; Knot takes
+/// the field from the operator. Both persist the divergence in a journal, and
+/// without persistence a restart goes backwards — which a secondary reads as
+/// older and declines to transfer, keeping signatures about to expire.
 ///
-/// So the time is the counter: hours since the Unix epoch, added to the file's
-/// serial. Monotone in wall time by construction, nothing to persist, and an
-/// operator's `+1` still shows up as `+1` served.
+/// So the time is the counter: hours since the epoch, added to the file's
+/// serial. Monotone by construction, nothing to persist, and an operator's `+1`
+/// still shows up as `+1`.
 ///
-/// Added rather than `max`ed: PowerDNS's `INCEPTION-EPOCH` documents itself as
-/// "requiring epoch-based backend serials" because a date-style serial like
-/// `2026073001` is larger than any current Unix timestamp, so a `max` never
-/// bumps.
+/// Added rather than `max`ed, because a date-style serial like `2026073001` is
+/// larger than any current Unix timestamp and a `max` would never bump — which
+/// is what PowerDNS's `INCEPTION-EPOCH` means by "requiring epoch-based backend
+/// serials".
 ///
-/// Hours, not seconds, so the term stays small (~495,000 today) and does not
-/// crowd a date-style serial towards the 32-bit ceiling. Hours since the *epoch*
-/// rather than a fraction of the validity, so changing `--signature-validity`
-/// cannot move the serial backwards.
+/// Hours, not seconds, so the term stays small and does not crowd a date-style
+/// serial toward the 32-bit ceiling. Since the *epoch* rather than a fraction of
+/// the validity, so changing `--signature-validity` cannot move it backwards.
 pub fn signed_serial(file_serial: Serial, signed_at: u64) -> Serial {
     const HOUR: u64 = 3600;
-    // Wrapping, and [`Serial::wrapping_add`] says so in its own name: RFC 1982
-    // §3.1 defines addition in the sequence space that way, so passing the
-    // ceiling is an increment rather than the overflow a bare `+` would panic on
-    // in a debug build.
+    // RFC 1982 §3.1 defines addition in the sequence space as wrapping, so
+    // passing the ceiling is an increment, not the panic a bare `+` would be.
     file_serial.wrapping_add((signed_at / HOUR) as u32)
 }
 
@@ -266,12 +234,10 @@ pub fn signed_serial(file_serial: Serial, signed_at: u64) -> Serial {
 /// TTLs normalized per RRset, see below — plus the DNSKEY RRset, an RRSIG over
 /// everything the zone is authoritative for, and an NSEC or NSEC3 chain.
 ///
-/// Re-signing is idempotent in the sense that matters: the signer's own previous
-/// output (RRSIG, NSEC, NSEC3, NSEC3PARAM) is dropped before anything is
-/// generated, so signing a signed zone produces a freshly signed zone rather
-/// than a zone with two chains in it. DNSKEY records are *not* dropped, because
-/// a key published without its private half is how every rollover starts and
-/// deleting it would undo the operator's preparation.
+/// The signer's own previous output (RRSIG, NSEC, NSEC3, NSEC3PARAM) is dropped
+/// first, so signing a signed zone gives a freshly signed zone and not one with
+/// two chains. DNSKEY records are *not* dropped: a key published without its
+/// private half is how every rollover starts.
 pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Result<Zone> {
     sign_zone_inner(zone, keys, policy, None)
 }
@@ -279,26 +245,20 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
 /// Sign `zone`, carrying forward any signature from `previous` that still
 /// covers exactly what it covered before.
 ///
-/// **For applying a dynamic UPDATE, where re-signing everything is not merely
-/// expensive but actively harmful.** Every RRSIG's inception and expiration
-/// derive from the run's `signed_at` ([`SigningPolicy::valid_for`]), so a full
-/// re-sign a minute after the last one produces different RDATA for *every*
-/// signature in the zone — and `ixfr::diff` compares whole records, so all of
-/// them land in the delta. Measured on the signer's own test zone before this
-/// existed: a one-record UPDATE to a 53-record zone produced a **52-record**
-/// delta, which is a full transfer wearing an incremental's framing, retained 32
-/// times over by `DeltaLog`. See `TODO.md` #10.
+/// For applying a dynamic UPDATE, where re-signing everything is harmful and not
+/// merely expensive. Every RRSIG's inception and expiration derive from the run's
+/// `signed_at`, so a full re-sign changes the RDATA of *every* signature, and
+/// `ixfr::diff` compares whole records — a one-record UPDATE to a 53-record zone
+/// produced a 52-record delta, a full transfer wearing an incremental's framing.
 ///
-/// **The chain is still built in full**, and that is the point rather than a
-/// shortcut not taken. An NSEC's bitmap lists every type at its name and its
-/// `next` names its successor (RFC 4034 §4.1.2, RFC 5155 §7.1), so adding one
-/// name changes the denial record at that name *and* at its predecessor.
-/// Computing "the changed names plus their chain neighbours" is a thing to get
-/// wrong — and getting it wrong yields a chain that validates against itself
-/// while denying a name that exists. Building the chain and then asking which
-/// records came out identical never computes a neighbour set at all, so it
-/// cannot compute one incorrectly. What is saved is the signing, which is the
-/// expensive half.
+/// The chain is still built in full, deliberately. An NSEC's bitmap lists every
+/// type at its name and its `next` names its successor (RFC 4034 §4.1.2,
+/// RFC 5155 §7.1), so adding one name changes the record at that name *and* at
+/// its predecessor. Computing "changed names plus chain neighbours" gets that
+/// wrong and yields a chain that validates against itself while denying a name
+/// that exists. Building the chain and then asking which records came out
+/// identical never computes a neighbour set at all. What is saved is the
+/// signing, which is the expensive half.
 pub fn sign_zone_incrementally(
     previous: &Zone,
     zone: &Zone,
@@ -329,17 +289,12 @@ fn sign_zone_inner(
     let (soa_ttl, minimum) = carry_over_records(zone, &origin, policy, &mut signed)?;
     let dnskey_ttl = publish_dnskeys(keys, &origin, soa_ttl, &mut signed);
 
-    // NSEC3PARAM goes in *before* the layout is taken, and the order is the
-    // whole of the bug this line fixes. `Layout::of` is a snapshot of which
-    // types are at which name, and every NSEC3's bitmap "MUST indicate the
-    // presence of all types present at the original owner name" (RFC 5155 §7.1)
-    // — so adding the record after the snapshot left the apex NSEC3 denying a
-    // type that is there, signed. `dnssec-verify`, `ldns-verify-zone` and
-    // `validns` all reject that zone, and worse: a validator asking for
-    // `<apex> NSEC3PARAM` with DO gets a signed NODATA proof for a record it is
-    // also being served, and an RFC 8198 aggressive-NSEC resolver — this
-    // repo's own `rdnsr` among them — then synthesizes that false NODATA for
-    // other clients out of its cache.
+    // Before `Layout::of`, which snapshots which types are at which name. Every
+    // NSEC3 bitmap "MUST indicate the presence of all types present at the
+    // original owner name" (RFC 5155 §7.1), so adding NSEC3PARAM after the
+    // snapshot leaves the apex NSEC3 signing a denial of a type that is there —
+    // and an RFC 8198 aggressive-NSEC resolver then synthesizes that false
+    // NODATA for other clients out of its cache.
     if let DenialChain::Nsec3 {
         salt, iterations, ..
     } = &policy.chain
@@ -378,11 +333,10 @@ fn sign_zone_inner(
 /// A previous signed version of a zone, indexed so that an RRset which has not
 /// moved can keep the signature it already had.
 ///
-/// Both halves are needed and neither is sufficient. The RRsets answer "is this
-/// exactly what was signed"; the signatures answer "and what was the answer".
-/// Keeping a signature because the *name* still exists, without checking the
-/// records under it, is how a zone comes to serve a signature over data it no
-/// longer holds.
+/// Both halves are needed: the RRsets answer "is this exactly what was signed",
+/// the signatures "and what was the answer". Keeping a signature because the
+/// *name* still exists is how a zone serves a signature over data it no longer
+/// holds.
 struct PreviousSignatures {
     /// (folded owner, type) -> the RRset as it was signed: its TTL, and its
     /// RDATA in the order the previous run saw them.
@@ -407,9 +361,7 @@ impl PreviousSignatures {
         for record in previous.records() {
             let name = record.name.to_ascii_lowercase();
             if record.rdata.rtype() == rt::RRSIG {
-                // An RRSIG that will not parse is one this run cannot reason
-                // about, so it is simply not offered for reuse and the RRset it
-                // covers gets a fresh signature.
+                // Not offered for reuse; the RRset gets a fresh signature.
                 if let Ok(ParsedRecord::RRSIG {
                     type_covered,
                     expiration,
@@ -442,21 +394,19 @@ impl PreviousSignatures {
     ///
     /// Four conditions, each a way the reuse would otherwise be wrong:
     ///
-    /// 1. The RRset is byte-identical as a *set* — same TTL, same RDATA, nothing
-    ///    added or removed. As a set because an RRset has no order
-    ///    (RFC 2181 §5) and the two runs walk a record vector an update rebuilds.
-    /// 2. There is at least one signature, so an unsigned RRset does not stay
-    ///    unsigned by being copied.
+    /// 1. The RRset is identical as a *set* — same TTL, same RDATA. As a set,
+    ///    because an RRset has no order (RFC 2181 §5) and an update rebuilds the
+    ///    record vector the two runs walk.
+    /// 2. At least one signature, so an unsigned RRset does not stay unsigned by
+    ///    being copied.
     /// 3. The signing keys are unchanged, by key tag as a set. A key added is a
     ///    rollover starting; a key removed must not leave its signature behind.
     /// 4. No carried signature has already expired.
     ///
-    /// Being close to expiry is deliberately not a condition. Refreshing here
-    /// would mean any single UPDATE re-signs every stale RRset in the zone — the
-    /// whole-zone delta this exists to avoid — and would let update traffic stand
-    /// in for the re-signing timer, so a zone with a dead timer would degrade
-    /// differently depending on whether anyone was writing to it. Expiry is
-    /// [`SigningPolicy::resign_interval`]'s business.
+    /// Nearness to expiry is deliberately not a condition: refreshing here would
+    /// re-sign every stale RRset on any single UPDATE — the whole-zone delta this
+    /// exists to avoid — and would let update traffic stand in for the re-signing
+    /// timer. Expiry is [`SigningPolicy::resign_at`]'s business.
     fn reuse(
         &self,
         name: &str,
@@ -496,10 +446,9 @@ impl PreviousSignatures {
     }
 }
 
-/// The keys must all belong to this zone, and at least one must be able to sign
-/// its data. Both are checked before anything is generated: a signing run that
-/// discovers halfway through that a key names another zone has already produced
-/// signatures nobody can use.
+/// The keys must all belong to this zone and at least one must be able to sign
+/// its data. Checked before anything is generated, so a run that discovers a key
+/// naming another zone has not already produced unusable signatures.
 fn check_keys(keys: &[SigningKey], origin: &str) -> Result<()> {
     if keys.is_empty() {
         return Err(DnssecError::signing(format!(
@@ -529,12 +478,10 @@ fn carry_over_records(
     signed: &mut Zone,
 ) -> Result<(Ttl, u32)> {
     let mut soa: Option<(Ttl, u32)> = None;
-    // The TTL an RRset is signed with has to be one number (RFC 4034 §3.1.3
-    // stores it in the RRSIG so a validator can restore it), and RFC 2181 §5.2
-    // requires the records to agree on it anyway. Where they do not, the
-    // smallest wins: a record cannot be made to live longer than its RRset was
-    // told to, and taking the largest would publish data past the point some
-    // record of it was meant to expire.
+    // An RRset signs with one TTL (RFC 4034 §3.1.3 stores it in the RRSIG), and
+    // RFC 2181 §5.2 requires the records to agree anyway. Where they do not, the
+    // smallest wins: the largest would publish data past the point some record
+    // of it was meant to expire.
     let mut ttls: BTreeMap<(String, Rtype), Ttl> = BTreeMap::new();
     let mut carried: Vec<ZoneRecord> = Vec::new();
 
@@ -572,14 +519,7 @@ fn carry_over_records(
                 ));
             };
             soa = Some((record.ttl, minimum));
-            // The served serial is not the file's. New RRSIGs are a new version
-            // of the zone as far as a secondary is concerned, and a secondary
-            // decides whether to transfer by comparing serials — so without a
-            // bump the replica keeps signatures that then expire underneath it.
-            // See `signed_serial`: this is BIND's inline-signing shape, where the
-            // number served diverges from the number in the file, with a
-            // time-derived counter instead of BIND's journal because we have no
-            // journal to persist one in.
+            // The served serial is not the file's — see `signed_serial`.
             record.rdata = RecordData::from_parsed(&ParsedRecord::SOA {
                 mname,
                 rname,
@@ -617,9 +557,9 @@ fn is_signer_output(rtype: Rtype) -> bool {
 
 /// Publish the DNSKEY for every key, returning the TTL the RRset ended up with.
 ///
-/// A key already in the zone with identical RDATA is left where it is rather
-/// than duplicated — that is the same key, and an RRset holding it twice is one
-/// a validator has to de-duplicate before it can verify anything.
+/// A key already in the zone with identical RDATA is left alone rather than
+/// duplicated: an RRset holding one twice is one a validator must de-duplicate
+/// before it can verify anything.
 fn publish_dnskeys(keys: &[SigningKey], origin: &str, soa_ttl: Ttl, signed: &mut Zone) -> Ttl {
     let existing: Vec<RecordData> = signed
         .query(origin, Qtype::of(rt::DNSKEY))
@@ -649,9 +589,7 @@ fn publish_dnskeys(keys: &[SigningKey], origin: &str, soa_ttl: Ttl, signed: &mut
     ttl
 }
 
-// ---------------------------------------------------------------------------
 // What is where: delegations, occlusion, and the names that need a denial
-// ---------------------------------------------------------------------------
 
 /// One owner name, as the signer sees it.
 #[derive(Debug, Default, Clone)]
@@ -672,10 +610,9 @@ impl NameEntry {
 
     /// The types a denial record at this name must list.
     ///
-    /// At a delegation this is not the same as "the types here": glue is not
-    /// authoritative data, so an A record at the delegation point is invisible
-    /// to the chain even though the zone file holds it and the server hands it
-    /// out as a hint.
+    /// At a delegation this is not "the types here": glue is not authoritative
+    /// data, so an A record at the delegation point is invisible to the chain
+    /// even though the server hands it out as a hint.
     fn published_types(&self) -> BTreeSet<Rtype> {
         if self.is_delegation {
             let mut types = BTreeSet::from([rt::NS]);
@@ -723,10 +660,9 @@ impl Layout {
             .map(|(n, _)| n.clone())
             .collect();
         for (name, entry) in names.iter_mut() {
-            // Glue, and anything else written below a delegation: present in
-            // the file, not part of this zone (RFC 4035 §2.2). It gets no
-            // signature and no place in the chain, and if it did, the chain
-            // would assert the existence of names this zone does not serve.
+            // Glue and anything else below a delegation: in the file, not in
+            // the zone (RFC 4035 §2.2). In the chain it would assert the
+            // existence of names this zone does not serve.
             entry.occluded = ancestors_of(name)
                 .iter()
                 .any(|ancestor| delegations.contains(ancestor));
@@ -740,13 +676,11 @@ impl Layout {
 
     /// The names a denial chain must cover, in canonical order.
     ///
-    /// Three things go in beyond the obvious. Delegation points, because the
-    /// proof that a child is *not* signed is an authenticated denial of its DS.
-    /// Empty non-terminals — a name with no records of its own that has
-    /// descendants — because such a name exists, and a query for it is NODATA
-    /// rather than NXDOMAIN; without a record at the name the only available
-    /// proof would be one denying it exists, which is the wrong answer signed.
-    /// And under opt-out, neither insecure delegations nor the empty
+    /// Beyond the obvious: delegation points, because the proof that a child is
+    /// *not* signed is an authenticated denial of its DS; and empty
+    /// non-terminals, because such a name exists and a query for it is NODATA,
+    /// so without a record there the only available proof would deny a name that
+    /// exists. Under opt-out, neither insecure delegations nor the empty
     /// non-terminals that exist only to hold them.
     fn chain_names(&self, opt_out: bool) -> Vec<String> {
         let mut included: BTreeSet<String> = self
@@ -796,33 +730,19 @@ fn ancestors_of(name: &str) -> Vec<String> {
 
 /// Whether `name` is strictly below `origin`.
 ///
-/// The containment test is [`crate::utils::is_at_or_under`]. This module used to
-/// carry a **private function of the same name shadowing the public one in the
-/// same crate**, which is why #13b's four-copy sweep did not find it: nothing
-/// greps as a second definition when the call sites read identically
-/// (`TODO.md` #19b).
-///
-/// The two disagreed. The shared version makes the trailing dot optional on
-/// either side, so `is_at_or_under("www.example.com", "example.com.")` is true
-/// there and was false here — unreachable in practice, because the one caller
-/// passes `canonical_name` output, but that is a property of the caller and not
-/// of the function. The copy also built two `String`s and a `format!` per call,
-/// which is word for word what `utils::is_at_or_under`'s doc comment says it was
-/// written to remove from `resolver::is_subdomain`.
+/// The containment test is [`crate::utils::is_at_or_under`], which makes the
+/// trailing dot optional on either side and allocates nothing.
 fn is_under(name: &str, origin: &str) -> bool {
     name != origin && crate::utils::is_at_or_under(name, origin)
 }
 
-// ---------------------------------------------------------------------------
 // The denial chains
-// ---------------------------------------------------------------------------
 
 fn build_nsec_chain(layout: &Layout, ttl: Ttl, signed: &mut Zone) -> Result<()> {
     let names = layout.chain_names(false);
     for (index, name) in names.iter().enumerate() {
-        // The last name points back at the apex, closing the loop — which is
-        // what makes the chain able to deny a name sorting after everything in
-        // the zone (RFC 4034 §4.1.1).
+        // The last name points back at the apex, closing the loop, so the chain
+        // can deny a name sorting after everything in it (RFC 4034 §4.1.1).
         let next = &names[(index + 1) % names.len()];
         let mut types = layout.entry(name).published_types();
         // Every NSEC lists itself and its own signature (RFC 4035 §2.3).
@@ -860,9 +780,8 @@ fn build_nsec3_chain(
     }
     hashed.sort();
 
-    // Two names hashing alike would make one of them undeniable and the other
-    // unprovable, and the chain would silently be a lie about one of them. It
-    // takes a SHA-1 collision to happen, but the check is one comparison.
+    // Two names hashing alike leaves one undeniable and the other unprovable.
+    // It takes a SHA-1 collision, but the check is one comparison.
     if let Some(window) = hashed.windows(2).find(|w| w[0].0 == w[1].0) {
         return Err(DnssecError::signing(format!(
             "{} and {} have the same NSEC3 hash — pick a different salt",
@@ -874,10 +793,10 @@ fn build_nsec3_chain(
         let next = &hashed[(index + 1) % hashed.len()].0;
         let entry = layout.entry(name);
         let mut types = entry.published_types();
-        // Unlike NSEC, the record does not sit at the name it describes, so it
-        // does not list itself — and RRSIG appears only if something at the
-        // original name is actually signed. An insecure delegation's NSEC3
-        // therefore says NS and nothing else.
+        // Unlike NSEC the record does not sit at the name it describes, so it
+        // does not list itself, and RRSIG appears only if something at the
+        // original name is signed — an insecure delegation's NSEC3 says NS
+        // alone.
         if entry.has_signed_data() {
             types.insert(rt::RRSIG);
         }
@@ -908,11 +827,9 @@ fn build_nsec3_chain(
 /// NSEC3PARAM's RDATA (RFC 5155 §4.2): the same first four fields as an NSEC3,
 /// and nothing else.
 ///
-/// The flags octet is zero even when the chain is opt-out. RFC 5155 §4.1.2 says
-/// so directly: the flags here describe the *parameters*, and a server matching
-/// this record against the chain compares the salt and iterations, so a bit set
-/// here that is also set in every NSEC3 would just be a second place to get it
-/// wrong.
+/// The flags octet is zero even for an opt-out chain (RFC 5155 §4.1.2): these
+/// flags describe the *parameters*, and a server matching this record against
+/// the chain compares only salt and iterations.
 fn nsec3param_rdata(salt: &[u8], iterations: u16) -> RecordData {
     let mut rdata = Vec::with_capacity(5 + salt.len());
     rdata.push(1); // SHA-1, the only NSEC3 hash there is
@@ -923,9 +840,7 @@ fn nsec3param_rdata(salt: &[u8], iterations: u16) -> RecordData {
     RecordData::new(rt::NSEC3PARAM, rdata).expect("an NSEC3PARAM we just built decodes")
 }
 
-// ---------------------------------------------------------------------------
 // The signatures
-// ---------------------------------------------------------------------------
 
 fn sign_everything(
     layout: &Layout,
@@ -934,11 +849,9 @@ fn sign_everything(
     previous: Option<&PreviousSignatures>,
     signed: &mut Zone,
 ) -> Result<()> {
-    // The convention every real zone follows: the key the parent's DS points at
-    // signs only the DNSKEY RRset, and a separate key signs the data. It is not
-    // required — a single key may do both, which is what happens here when only
-    // one is present — but it is what lets the data key roll without the parent
-    // being involved.
+    // The key the parent's DS points at signs only the DNSKEY RRset; a separate
+    // key signs the data. Not required — one key does both when only one is
+    // present — but it lets the data key roll without involving the parent.
     let sep: Vec<&SigningKey> = keys.iter().filter(|k| k.is_sep()).collect();
     let rest: Vec<&SigningKey> = keys.iter().filter(|k| !k.is_sep()).collect();
     let all: Vec<&SigningKey> = keys.iter().collect();
@@ -967,10 +880,8 @@ fn sign_everything(
             data_signers
         };
 
-        // Unchanged since the last run, and signed by exactly these keys: keep
-        // what is there. This is the whole of the incremental path — the RRset
-        // is not re-signed, so its RDATA does not move, so it does not appear in
-        // the next IXFR delta.
+        // The whole of the incremental path: not re-signed, so the RDATA does
+        // not move, so it does not appear in the next IXFR delta.
         if let Some(previous) = previous {
             let tags: Vec<u16> = signers.iter().map(|k| k.key_tag()).collect();
             if let Some(carried) =
@@ -990,9 +901,8 @@ fn sign_everything(
 
         let original_ttl = ttl.as_secs();
         let rrset = Rrset::new(&name, rtype, Class::new(1), &rdatas);
-        // Spread this RRset's expiry back from the window's end, so the zone
-        // degrades over a slope rather than expiring as one cliff. Deterministic
-        // per (owner, type) — see `SigningPolicy::expiry_for`.
+        // Spread back from the window's end so the zone degrades over a slope
+        // rather than one cliff — see `SigningPolicy::expiry_for`.
         let expiration = policy.expiry_for(&name, rtype);
         for key in signers.iter() {
             let sig = key
@@ -1029,22 +939,21 @@ fn sign_everything(
 /// Whether this RRset is one the zone is authoritative for, and so must sign.
 fn signable(entry: &NameEntry, name: &str, rtype: Rtype, origin: &str) -> bool {
     if rtype == rt::RRSIG {
-        // A signature over a signature says nothing: a validator checks an
-        // RRSIG against a key, never against another RRSIG.
+        // A validator checks an RRSIG against a key, never another RRSIG.
         return false;
     }
     if entry.occluded {
         return false;
     }
-    // NSEC3 records live at names invented by the hash, which are in no
-    // delegation and have no entry of their own — they are always ours to sign.
+    // NSEC3 owners are invented by the hash: in no delegation, no entry of
+    // their own, always ours to sign.
     if rtype == rt::NSEC3 {
         return true;
     }
     if entry.is_delegation && name != origin {
-        // The zone's authority ends here: the NS RRset belongs to the child and
-        // the glue is a hint. What is left is the DS, which is this zone's own
-        // statement about the child, and the NSEC that can deny it.
+        // Authority ends here: the NS RRset is the child's and the glue is a
+        // hint. What is left is the DS — this zone's statement about the child
+        // — and the NSEC that can deny it.
         return matches!(rtype, rt::DS | rt::NSEC);
     }
     true
@@ -1117,14 +1026,8 @@ ns.plain IN A  192.0.2.40
         sign_zone(&zone, &keys(), &policy(chain)).expect("signing succeeds")
     }
 
-    // -----------------------------------------------------------------
-    // Re-signing: the serial, the jitter, and when to do it again
-    // -----------------------------------------------------------------
-
-    /// Every RRSIG in a zone used to be given the same expiration, so the whole
-    /// zone expired in the same second — which is *why* the failure this guards
-    /// against is "every validating resolver SERVFAILs the entire zone at once".
-    /// Spread turns the cliff into a slope.
+    /// One expiration for the whole zone means every validating resolver
+    /// SERVFAILs it in the same second. Spread turns the cliff into a slope.
     #[test]
     fn signature_expiry_is_spread_across_the_zone() {
         let signed = sign_test_zone(DenialChain::Nsec);
@@ -1153,10 +1056,9 @@ ns.plain IN A  192.0.2.40
         }
     }
 
-    /// Deterministic, not random. A reload re-signs, and random jitter would put
-    /// every name at a different point on the slope each time — so the slope
-    /// would be a different slope on every reload, and two servers holding the
-    /// same zone would never agree about it.
+    /// Deterministic, not random: a reload re-signs, and random jitter would
+    /// reshuffle the slope each time, so two servers holding the same zone would
+    /// never agree about it.
     #[test]
     fn the_spread_is_deterministic_for_a_given_name_and_type() {
         let policy = policy(DenialChain::Nsec);
@@ -1191,11 +1093,9 @@ ns.plain IN A  192.0.2.40
         }
     }
 
-    /// New signatures are a new version of the zone as far as a secondary is
-    /// concerned, and a secondary decides whether to transfer by comparing
-    /// serials — so without a bump the replica keeps signatures that then expire
-    /// underneath it. The bump has to survive a restart without being persisted,
-    /// which is why it is derived from the clock.
+    /// New signatures are a new version of the zone to a secondary, which
+    /// decides whether to transfer by comparing serials. The bump must survive a
+    /// restart without being persisted, hence the clock.
     #[test]
     fn signing_moves_the_soa_serial_and_keeps_moving_it() {
         let unsigned = parse_zone_file(ZONE, ORIGIN).expect("parses");
@@ -1209,10 +1109,8 @@ ns.plain IN A  192.0.2.40
             "the served serial is not the file's — new signatures are a new version"
         );
 
-        // Signing the same file later gives a *higher* serial, and signing it
-        // again at the same moment gives the same one. Both matter: the first is
-        // what makes a secondary transfer, the second is what stops a restart
-        // from looking like a change.
+        // Later gives a higher serial, so a secondary transfers; the same moment
+        // gives the same one, so a restart is not a change.
         let later = SigningPolicy::valid_for(NOW + 7 * 86_400, 30 * 86_400);
         let later_serial = sign_zone(&unsigned, &keys(), &later)
             .expect("signs")
@@ -1229,10 +1127,9 @@ ns.plain IN A  192.0.2.40
         assert_eq!(again, first_serial, "same file, same moment, same serial");
     }
 
-    /// The correction that made this design work: `max(file, time)` would keep a
-    /// date-style serial forever, because `2024051300` is numerically far larger
-    /// than any current Unix timestamp. PowerDNS documents its `INCEPTION-EPOCH`
-    /// as "requiring epoch-based backend serials" for exactly this reason.
+    /// `max(file, time)` would keep a date-style serial forever, since
+    /// `2024051300` is far larger than any current Unix timestamp — which is why
+    /// PowerDNS's `INCEPTION-EPOCH` requires epoch-based backend serials.
     #[test]
     fn a_date_style_serial_still_moves() {
         let date_style = Serial::new(2_026_073_001);
@@ -1241,11 +1138,10 @@ ns.plain IN A  192.0.2.40
             signed.is_newer_than(date_style),
             "{signed} must be newer than {date_style}"
         );
-        // Deliberately the *plain* comparison, on the numbers rather than on the
-        // serials, and the only place in the tree that unwraps a `Serial` to make
-        // one. The claim is arithmetical — the result is larger than the input, so
-        // the time term was added and not `max`ed — and `is_newer_than` above
-        // cannot carry it, because a wrapped serial would satisfy that too.
+        // The plain comparison, on the numbers rather than the serials: the
+        // claim is arithmetical — the result is larger, so the time term was
+        // added and not `max`ed — and a wrapped serial satisfies
+        // `is_newer_than` too.
         assert!(
             signed.to_u32() > date_style.to_u32(),
             "and it is addition, not max — max would have returned the file's number"
@@ -1258,9 +1154,7 @@ ns.plain IN A  192.0.2.40
         );
     }
 
-    /// Re-signing at a third of the validity leaves two whole windows of slack:
-    /// a run that fails, or a server down over one, still has two more chances
-    /// before anything expires.
+    /// A third of the validity leaves two more chances before anything expires.
     #[test]
     fn re_signing_is_due_well_before_anything_expires() {
         let validity = 30 * 86_400;
@@ -1411,8 +1305,8 @@ ns.plain IN A  192.0.2.40
         let zone = sign_test_zone(DenialChain::Nsec);
         let (nsecs, _) = chain_records(&zone);
 
-        // A chain with a name missing, duplicated, or pointing somewhere it
-        // should not looks like a pile of plausible records until it is walked.
+        // A chain with a name missing, duplicated or pointing wrong looks like
+        // a pile of plausible records until it is walked.
         let apex = canonical_name(ORIGIN);
         let mut seen = vec![apex.clone()];
         let mut at = apex.clone();
@@ -1437,19 +1331,11 @@ ns.plain IN A  192.0.2.40
         assert!(!seen.contains(&"ns.secure.example.com.".to_string()));
     }
 
-    /// Every denial record's bitmap must list every type actually at the name it
-    /// describes (RFC 5155 §7.1, RFC 4034 §4.1.2) — checked over the whole zone,
-    /// because the class of bug is "a record was added after the layout was
-    /// taken" and it can happen at any name.
-    ///
-    /// It happened at the apex, with NSEC3PARAM. The type was inserted after
-    /// `Layout::of` snapshotted the zone, so the apex NSEC3 said NSEC3PARAM was
-    /// absent while an NSEC3PARAM record sat at the apex, signed. That is a zone
-    /// `dnssec-verify`, `ldns-verify-zone` and `validns` all reject — and worse
-    /// than a lint failure: a validator asking for the type gets a *signed*
-    /// NODATA proof for a record it is also being served, and an RFC 8198
-    /// aggressive-NSEC resolver then synthesizes that false NODATA for other
-    /// clients out of its cache.
+    /// Every denial record's bitmap must list every type at the name it
+    /// describes (RFC 5155 §7.1, RFC 4034 §4.1.2). Over the whole zone, because
+    /// the bug is "a record added after the layout snapshot" and it can happen
+    /// at any name — a signed NODATA proof for a record also being served, which
+    /// an RFC 8198 resolver then synthesizes for other clients from its cache.
     #[test]
     fn every_bitmap_lists_every_type_at_the_name_it_describes() {
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
@@ -1462,14 +1348,13 @@ ns.plain IN A  192.0.2.40
                     continue;
                 }
                 if entry.types.contains(&rt::NSEC3) {
-                    // An NSEC3's own owner name is invented by the hash. It is
-                    // not a name of the zone and nothing describes it.
+                    // An NSEC3's owner is invented by the hash: not a name of
+                    // the zone, and nothing describes it.
                     continue;
                 }
                 let mut expected = entry.published_types();
-                // The record that describes a name is not itself at it under
-                // NSEC3 — the chain lives at hashed names — so NSEC3 is never
-                // in the bitmap, while NSEC always is.
+                // Under NSEC3 the chain lives at hashed names, so NSEC3 is
+                // never in the bitmap, while NSEC always is.
                 expected.remove(&rt::NSEC3);
 
                 let lists: Box<dyn Fn(Rtype) -> bool> = match &chain {
@@ -1502,8 +1387,7 @@ ns.plain IN A  192.0.2.40
         }
     }
 
-    /// The apex specifically, spelled out, because the NSEC3PARAM case is the one
-    /// that was wrong and a reader should be able to see it named.
+    /// The apex specifically, because NSEC3PARAM is the type that goes missing.
     #[test]
     fn the_apex_nsec3_lists_nsec3param() {
         let zone = sign_test_zone(DenialChain::nsec3());
@@ -1537,12 +1421,10 @@ ns.plain IN A  192.0.2.40
 
     #[test]
     fn an_empty_non_terminal_reads_as_nodata_rather_than_nxdomain() {
-        // The reason empty non-terminals are in the chain at all.
-        // `b.example.com.` holds no records, but it exists — a query for it is
-        // NOERROR with nothing in it, and the proof of that has to be a record
-        // *at* the name. Left out, the only record available would be one
-        // denying the name exists, which is a different answer with a
-        // signature on it.
+        // Why empty non-terminals are in the chain: `b.example.com.` holds no
+        // records but exists, so a query for it is NOERROR and the proof has to
+        // be a record *at* the name. Left out, the only record available denies
+        // that the name exists — a different answer, signed.
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = sign_test_zone(chain.clone());
             let (nsecs, nsec3s) = chain_records(&zone);
@@ -1568,17 +1450,12 @@ ns.plain IN A  192.0.2.40
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = sign_test_zone(chain.clone());
             let (nsecs, nsec3s) = chain_records(&zone);
-            // Both are below a name that exists, so the closest encloser is
-            // not the apex — the case a chain built only from the names
-            // written in the file gets wrong. That is also what puts them out
-            // of the apex wildcard's reach, and the distinction matters:
-            // synthesis is not limited to one label (RFC 4592 §3.3.2), it is
-            // limited to the closest encloser (§3.3.1). `a.b.example.com.`
-            // exists as an empty non-terminal, so the source of synthesis for
-            // `x.a.b.example.com.` would have to be `*.a.b.example.com.`, and
-            // there is none. A name the wildcard *does* reach is not deniable
-            // at all, which is what the wildcard test checks from the other
-            // side.
+            // Both sit below a name that exists, so the closest encloser is not
+            // the apex — what a chain built only from the file's names gets
+            // wrong, and what puts these out of the apex wildcard's reach.
+            // Synthesis is bounded by the closest encloser (RFC 4592 §3.3.1),
+            // not by one label (§3.3.2), so `x.a.b.example.com.` could only
+            // come from `*.a.b.example.com.`, which does not exist.
             for absent in ["x.a.b.example.com.", "y.deep.a.b.example.com."] {
                 let denial = proves_nxdomain(absent, ORIGIN, &nsecs, &nsec3s);
                 assert!(
@@ -1627,10 +1504,9 @@ ns.plain IN A  192.0.2.40
             .collect();
         assert_eq!(sigs.len(), 1);
 
-        // Re-owned onto the name a server would answer with, exactly as the
-        // serving path does it, the signature still verifies — and comes back
-        // flagged as an expansion, which is what obliges the answer to carry a
-        // denial of the queried name.
+        // Re-owned onto the name a server would answer with, the signature
+        // still verifies and comes back flagged as an expansion — which is what
+        // obliges the answer to carry a denial of the queried name.
         let mut expanded = sigs[0].clone();
         expanded.owner = "anything.example.com.".to_string();
         let proof = verify_rrset(
@@ -1705,9 +1581,9 @@ ns.plain IN A  192.0.2.40
 
     #[test]
     fn without_opt_out_an_insecure_delegation_is_chained_so_its_ds_can_be_denied() {
-        // The whole point of chaining a delegation: "is there a DS here" has to
-        // be answerable with a proof, or a validator cannot tell an unsigned
-        // child from one whose DS was stripped in transit.
+        // Why a delegation is chained: without a proof for "is there a DS
+        // here", a validator cannot tell an unsigned child from one whose DS
+        // was stripped in transit.
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = sign_test_zone(chain.clone());
             let (nsecs, nsec3s) = chain_records(&zone);
@@ -1745,9 +1621,8 @@ ns.plain IN A  192.0.2.40
 
     #[test]
     fn one_key_signs_everything_when_that_is_all_there_is() {
-        // A combined key is what a small zone usually runs. A signer that
-        // reserved the entry-point key for the DNSKEY RRset would produce a
-        // zone with no signed data in it at all.
+        // A combined key is what a small zone runs. Reserving the entry-point
+        // key for the DNSKEY RRset would leave the data unsigned.
         let key = vec![SigningKey::generate(
             SigningAlgorithm::Ed25519,
             ORIGIN,
@@ -1770,27 +1645,13 @@ ns.plain IN A  192.0.2.40
         ));
     }
 
-    /// **A one-record UPDATE to a signed zone currently produces a whole-zone
-    /// IXFR delta**, and this measures it rather than describing it.
+    /// What a full re-sign costs an IXFR, measured rather than described: every
+    /// RRSIG's inception and expiration derive from the run's `signed_at`, so
+    /// two runs a minute apart give different RDATA for every signature, and
+    /// `ixfr::diff` correctly puts all of them in the delta.
     ///
-    /// Every RRSIG's inception and expiration derive from the signing run's
-    /// `signed_at` ([`SigningPolicy::valid_for`]), so two runs a minute apart
-    /// produce different RDATA for *every* signature in the zone. `ixfr::diff`
-    /// compares whole records, correctly, so all of them land in the delta —
-    /// and the one A record the client actually added is lost among them.
-    ///
-    /// Measured here: a 53-record zone with 23 RRSIGs, one record added, and a
-    /// delta of **52 records**. That is the whole zone, one short of the
-    /// threshold at which `ixfr_response` would give up and send an AXFR
-    /// instead — so a secondary receives an "incremental" transfer the size of a
-    /// full one, and `DeltaLog` keeps 32 of them per zone.
-    ///
-    /// **This is a characterization test, not a regression test** (`CLAUDE.md`
-    /// §10 — say what a test is and what it is not). It asserts what the code
-    /// does today so that the number moves visibly when incremental re-signing
-    /// lands (`TODO.md` #10); it is not asserting that this behaviour is
-    /// correct, and the assertion below is written to *fail* once the fix
-    /// arrives rather than to quietly keep passing.
+    /// A 53-record zone with 23 RRSIGs, one record added, 52 records out — one
+    /// short of the threshold where `ixfr_response` gives up and sends an AXFR.
     #[test]
     fn re_signing_after_an_update_currently_rewrites_every_signature() {
         use crate::ixfr::diff;
@@ -1839,9 +1700,8 @@ ns.plain IN A  192.0.2.40
             before.records().len()
         );
 
-        // And the fix, measured against the same case: signing incrementally
-        // carries every untouched signature forward, so the delta collapses to
-        // the records that actually moved plus the denial chain around them.
+        // Signing incrementally carries every untouched signature forward, so
+        // the delta collapses to what moved plus the chain around it.
         let incremental =
             sign_zone_incrementally(&before, &updated.zone, &keys, &later).expect("signs");
         let small = diff(&before, &incremental).expect("both have an SOA");
@@ -1879,13 +1739,9 @@ ns.plain IN A  192.0.2.40
         );
     }
 
-    /// The incremental path must still produce a zone that *verifies*, which is
-    /// the assertion that matters: carrying a signature forward is only sound if
-    /// it still covers what it says it covers.
-    ///
-    /// Judged with `proof_for` — the same code that judges a real zone off the
-    /// internet — rather than by comparing our output to our own expectations
-    /// (`CLAUDE.md` §1).
+    /// Carrying a signature forward is only sound if it still covers what it
+    /// says it covers, so the incremental path is judged with `proof_for` — the
+    /// same code that judges a real zone.
     #[test]
     fn an_incrementally_signed_zone_still_verifies() {
         let keys = keys();
@@ -1966,9 +1822,9 @@ ns.plain IN A  192.0.2.40
             "an RRset that gained a record is signed afresh"
         );
 
-        // A TTL change with the same RDATA. The RRSIG stores the original TTL
-        // (RFC 4034 §3.1.3), so keeping the old signature would publish one
-        // covering a TTL the RRset no longer has.
+        // A TTL change with the same RDATA: the RRSIG stores the original TTL
+        // (RFC 4034 §3.1.3), so the old signature would cover a TTL that is
+        // gone.
         let retimed = crate::update::apply(
             &zone,
             &[crate::update::Change::Add(ResourceRecord {
@@ -1987,9 +1843,9 @@ ns.plain IN A  192.0.2.40
             "a TTL change is a change: the RRSIG carries the original TTL"
         );
 
-        // A key added — the start of a rollover. Every RRset the new key must
-        // also sign has to be signed afresh, or the zone publishes a DNSKEY
-        // whose signatures are missing.
+        // A key added — a rollover starting. Everything the new key must also
+        // sign is signed afresh, or the zone publishes a DNSKEY with no
+        // signatures of its own.
         let mut rolling = keys;
         rolling.push(
             SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)

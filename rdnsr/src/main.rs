@@ -53,26 +53,20 @@ const MAX_INFLIGHT_PER_CONNECTION: usize = 16;
 /// UDP queries this resolver will have in flight at once, when nothing says
 /// otherwise.
 ///
-/// **Large on purpose, and it is not the same number as `rdnsd`'s workers.**
-/// There, answering is microseconds out of memory and a small fixed pool of
-/// tasks answers inline. Here one query is a *recursion*: several round trips to
-/// servers on the internet, seconds of it, almost all of it spent waiting. A
-/// resolver that could only have a few of those outstanding would be idle and
-/// slow at the same time, so this stays a task per datagram — and the bound is
-/// on how many of those may exist, which is what was missing.
+/// Not `rdnsd`'s worker count. There, answering is microseconds out of memory;
+/// here one query is a recursion — several round trips, seconds of it, almost
+/// all spent waiting. So it stays a task per datagram, and this bounds how many
+/// may exist.
 ///
-/// 1024 because a task waiting on the network is ~1.5 KB of state, so the
-/// ceiling costs about 1.5 MB fully occupied, and because a resolver with a
-/// thousand queries genuinely outstanding is either very busy or under attack —
-/// and shedding is the right answer to both.
+/// 1024 because a task waiting on the network is ~1.5 KB, so the ceiling costs
+/// ~1.5 MB fully occupied, and a resolver with a thousand queries outstanding is
+/// either very busy or under attack — shedding answers both.
 const MAX_INFLIGHT_UDP: usize = 1024;
 
 /// Zones whose validated denial proofs we keep for aggressive use (RFC 8198).
 ///
-/// Counted in zones rather than records because that is the unit that pays off:
-/// one zone's NSEC chain answers for every non-existent name in it, so a
-/// thousand zones covers the whole tail of a random-name flood. `NsecCache`
-/// bounds the records within each zone separately.
+/// Zones, not records: one zone's NSEC chain answers for every non-existent
+/// name in it. `NsecCache` bounds the records within each zone separately.
 const NSEC_CACHE_ZONES: usize = 1000;
 
 /// What `rdnsr` remembers between queries.
@@ -83,22 +77,19 @@ const NSEC_CACHE_ZONES: usize = 1000;
 /// - `negatives` maps a question to the *absence* of records (RFC 2308): a
 ///   different thing, because there are no records to key on and the TTL comes
 ///   from the SOA rather than from an answer.
-/// - `denials` maps a *range* of names to the signed statement that none of them
-///   exist — a lookup neither of the others can express, and the whole point of
-///   RFC 8198. It holds validated material only, so it is empty unless
-///   `--dnssec-validate` is on, which is why `negatives` is not redundant with it.
+/// - `denials` maps a *range* of names to the signed statement that none exist —
+///   a lookup neither of the others can express (RFC 8198). Validated material
+///   only, so it is empty without `--dnssec-validate`, which is why `negatives`
+///   is not redundant with it.
 struct Caches {
     answers: DnsCache,
     negatives: NegativeCache,
     denials: NsecCache,
 }
 
-/// Which transport a query arrived on.
-///
-/// This decides the size limit on the answer: a UDP reply must fit the
-/// requestor's advertised payload size, whereas a TCP reply is framed by a
-/// 2-byte length and so is bounded only by that field (RFC 6891 §6.2.2 — the
-/// EDNS payload size applies to UDP only).
+/// Which transport a query arrived on, which decides the answer's size limit: a
+/// UDP reply must fit the requestor's advertised payload size, a TCP reply only
+/// its 2-byte length prefix (RFC 6891 §6.2.2).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Transport {
     Udp,
@@ -153,24 +144,20 @@ struct Cli {
     /// A *managed* trust anchor file, followed and rewritten as keys roll
     /// (RFC 5011). Only used with --dnssec-validate.
     ///
-    /// The difference from `--trust-anchor` is who owns the file. That one is
-    /// read and never touched: the operator's decision, and a key roll means
-    /// editing it. This one is read *and written*: the resolver watches the
-    /// zone's own signed DNSKEY RRset, adopts a new key once it has been
-    /// published continuously for 30 days, and drops one the zone revokes with a
-    /// signature from that same key. It is the difference between a root KSK roll
-    /// being an outage and being something that already happened.
+    /// Who owns the file is the difference from `--trust-anchor`, which is read
+    /// and never touched. This one is read *and written*: the resolver watches
+    /// the zone's signed DNSKEY RRset, adopts a key published continuously for
+    /// 30 days, and drops one the zone revokes with a signature from that same
+    /// key.
     ///
-    /// Created from the anchors in force when it does not exist yet, so pointing
-    /// at a new path is enough to start.
+    /// Created from the anchors in force when it does not exist, so pointing at
+    /// a new path is enough to start.
     #[arg(long)]
     auto_trust_anchor: Option<std::path::PathBuf>,
     /// How much to say: error, warn, info, debug or trace.
     ///
-    /// `info` by default, and nothing per-query is above `debug` — the same
-    /// flag, levels and default as `rdnsd`. `RUST_LOG` overrides it when set, so
-    /// a resolver that is already misbehaving can be turned up without a restart
-    /// into new flags.
+    /// Nothing per-query is above `debug`. `RUST_LOG` overrides it, so a
+    /// misbehaving resolver can be turned up without a restart into new flags.
     #[arg(long, value_name = "LEVEL", default_value = "info")]
     log_level: LogLevel,
     /// Errors only. The same as `--log-level error`, and refused with it.
@@ -179,33 +166,20 @@ struct Cli {
     /// How many UDP queries may be in flight at once. Over the ceiling, further
     /// datagrams are dropped.
     ///
-    /// There was no ceiling at all: TCP had `MAX_TCP_CONNECTIONS` and
-    /// `MAX_INFLIGHT_PER_CONNECTION`, UDP had neither, and a recursion holds its
-    /// task for seconds — so a flood of one-datagram queries spawned tasks
-    /// faster than they could possibly retire.
+    /// No off switch, unlike `--query-rate 0`: a recursion holds its task for
+    /// seconds, so unbounded means a flood of one-datagram queries spawns tasks
+    /// faster than they retire. 0 is floored to 1, so a mistyped flag is wrong
+    /// and not fatal.
     ///
-    /// **There is no off switch**, unlike `--query-rate 0` on `rdnsd`: "off"
-    /// here is the defect this closes rather than a policy an operator might
-    /// want, and 0 is floored to 1 rather than refused so a mistyped flag is
-    /// wrong and not fatal.
-    ///
-    /// Dropping is silent, and deliberately — a reply to a spoofed source is
-    /// what an amplifier sends. The drop is a `debug!` for the same reason
-    /// nothing else per-packet is above `debug`.
+    /// Dropping is silent: a reply to a spoofed source is what an amplifier
+    /// sends.
     #[arg(long, value_name = "QUERIES", default_value_t = MAX_INFLIGHT_UDP)]
     max_inflight_udp: usize,
     /// Queries per second, per client address. 0 turns the limit off.
     ///
-    /// **The default is 200 where `rdnsd`'s is 1000**, and the difference is the
-    /// point rather than an oversight. `rdnsd` is authoritative: its clients are
-    /// resolvers, and one resolver behind one address legitimately asks orders of
-    /// magnitude more than one person does. A recursive resolver's clients are
-    /// end users and their devices, so the same number would be a limit that
-    /// never fires.
-    ///
-    /// Stated in queries per second because that is the unit an operator thinks
-    /// in — `CLAUDE.md` §14, which exists because this was once "100 tokens per
-    /// 10-second window" and therefore silently ten a second.
+    /// 200 where `rdnsd`'s is 1000: an authoritative server's clients are
+    /// resolvers, and one resolver behind one address legitimately asks orders
+    /// of magnitude more than one person does.
     #[arg(long, value_name = "QUERIES_PER_SEC", default_value = "200")]
     query_rate: u32,
     /// How many queries may arrive at once before `--query-rate` applies.
@@ -225,22 +199,18 @@ struct Cli {
     query_rate_exempt: Vec<String>,
     /// Response bytes per second, per client address. 0 turns the budget off.
     ///
-    /// **A resolver needs this more than an authoritative server does**, which
-    /// is why the asymmetry that left it out ran the wrong way round
-    /// (`TODO.md` #18). A 30-byte query here can produce a 4 KB validated
-    /// answer, and `--dnssec-validate` makes that the ordinary case rather than
-    /// the exception. Meters what leaves rather than what arrives, because that
-    /// is what an amplification attack is made of, and applies to UDP only: a
-    /// TCP query has completed a handshake, so there is nobody to reflect at.
+    /// A resolver needs this more than an authoritative server does: a 30-byte
+    /// query can produce a 4 KB validated answer, which `--dnssec-validate`
+    /// makes ordinary. Meters what leaves, since that is what an amplification
+    /// attack is made of, and UDP only — a TCP query completed a handshake, so
+    /// there is nobody to reflect at.
     #[arg(long, value_name = "BYTES_PER_SEC", default_value = "8192")]
     response_rate: u32,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///
-    /// **No `/readyz`, deliberately.** A resolver has nothing to wait for — no
-    /// zone has to arrive before it can answer — so a readiness probe would be a
-    /// liveness probe under another name. `/healthz` is the one that means
-    /// something here, and `metrics_server` serves `/readyz` too because it is
-    /// shared with `rdnsd`; it answers ready as soon as it is up.
+    /// No meaningful `/readyz`: a resolver has nothing to wait for, so it
+    /// answers ready as soon as it is up. `metrics_server` serves the route
+    /// because it is shared with `rdnsd`.
     #[arg(long, value_name = "ADDR:PORT")]
     metrics_listen: Option<String>,
 }
@@ -248,14 +218,10 @@ struct Cli {
 /// Everything the resolver needs that is not resolving.
 ///
 /// One struct rather than five more parameters on `udp_main`, `tcp_main` and
-/// `handle_query` — `CLAUDE.md` §14, and clippy objects at seven for the same
-/// reason. They are grouped because they are one thing: the operational shell
-/// `TODO.md` #18 was filed about, all of it already in `rdns` and already tested,
-/// and none of it wired into this binary until now.
+/// `handle_query`, all of which already take several.
 struct Shell {
-    /// Queries per second per source. The bound is `RateLimiter`'s own, which
-    /// **allows** an untracked source rather than refusing it: failing closed
-    /// would let one flood deny service to everybody (`CLAUDE.md` §5).
+    /// Queries per second per source. `RateLimiter`'s bound *allows* an
+    /// untracked source: failing closed would let one flood deny everybody.
     limiter: Arc<RateLimiter>,
     /// Response bytes per second per source, UDP only.
     responses: Arc<ResponseLimiter>,
@@ -264,25 +230,18 @@ struct Shell {
     /// Size and section-count checks on the raw datagram, before anything is
     /// parsed or admitted.
     ///
-    /// **Wired in rather than declined**, which `TODO.md` #18 asked to be
-    /// decided out loud. The argument for leaving it out was never written down;
-    /// the argument for it is that it is a handful of comparisons on bytes that
-    /// have not been trusted yet, on the path where the cheapest possible
-    /// rejection is worth the most. A resolver is the more amplifying of the two
-    /// daemons, so it wants the pre-admission check at least as much.
+    /// A handful of comparisons on bytes not yet trusted, where the cheapest
+    /// possible rejection is worth the most.
     validator: Arc<AdmissionCheck>,
 }
 
 impl Shell {
     /// Count one answer leaving, by rcode, and record how long it took.
     ///
-    /// **The rcodes counted are the ones an operator pages on for a resolver**,
-    /// which is not the same set as for an authoritative server: SERVFAIL
-    /// climbing here means upstream trouble or a validation failure, REFUSED
-    /// means something asked for what this resolver will not do, and NXDOMAIN is
-    /// ordinary traffic. `CLAUDE.md` §14 — a counter's name is a claim about
-    /// what it counts, so `queries_authoritative` is deliberately never touched:
-    /// this daemon is never authoritative for anything.
+    /// The rcodes an operator pages on for a *resolver*: SERVFAIL means
+    /// upstream trouble or a validation failure, REFUSED means something asked
+    /// for what this will not do, NXDOMAIN is ordinary. `queries_authoritative`
+    /// is never touched — this daemon is never authoritative.
     fn record_answer(&self, rcode: ResponseCode, timer: LatencyTimer) {
         let metrics = &self.metrics;
         metrics.count(&metrics.responses_sent);
@@ -301,17 +260,15 @@ impl Shell {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Before anything that might have something to say — and through the same
-    // initialiser `rdnsd` uses, so the two daemons cannot end up formatting or
-    // filtering differently (`CLAUDE.md` §7).
+    // Before anything with something to say, and through the same initialiser
+    // `rdnsd` uses so the two cannot format or filter differently.
     rdns::logging::init(if cli.quiet {
         LogLevel::Error
     } else {
         cli.log_level
     });
 
-    // Created before anything is spawned: the RFC 5011 anchor manager starts
-    // before the listeners do, and it owns the only durable state this process
+    // Before anything is spawned: it owns the only durable state this process
     // writes.
     let shutdown = Shutdown::new();
 
@@ -324,9 +281,8 @@ async fn main() -> anyhow::Result<()> {
         config.upstream_servers = cli.upstream.clone();
     }
 
-    // Custom root hints only make sense when recursing. Fail loudly on a hints
-    // file that yields no addresses — silently falling back to the built-ins
-    // would hide a misconfiguration.
+    // Fail loudly on a hints file that yields no addresses; falling back to
+    // the built-ins would hide the misconfiguration.
     let mut custom_hints = false;
     if let Some(path) = &cli.root_hints {
         if config.mode == ResolverMode::Recurse {
@@ -343,9 +299,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // DNSSEC. The built-in ICANN root key is the fallback so a plain
-    // --dnssec-validate works out of the box; --trust-anchor overrides it, and
-    // is what to reach for when the root KSK rolls.
+    // The built-in ICANN root key is the fallback so plain --dnssec-validate
+    // works; --trust-anchor overrides it when the root KSK rolls.
     let mut dnssec_source = String::new();
     let mut managed: Option<(std::path::PathBuf, ManagedAnchors)> = None;
     let mut shared_anchors: Option<SharedAnchors> = None;
@@ -360,19 +315,15 @@ async fn main() -> anyhow::Result<()> {
                 TrustAnchors::icann_root()
             }
         };
-        // A managed file, if there is one, supersedes what we just loaded: it is
-        // the record of what has been *learned* since, and starting from the
-        // configured anchors again would throw away a hold-down that may be 29
-        // days old.
+        // A managed file supersedes the configured anchors: it records what
+        // has been *learned* since, including a hold-down 29 days old.
         managed = match &cli.auto_trust_anchor {
             Some(path) => {
                 let anchors =
                     ManagedAnchors::load_or_seed(path, &anchors, current_unix_timestamp())?;
-                // Write it out now if it is not there yet, rather than at the
-                // first change. An operator who points at a new path should be
-                // able to look at the file and see what is trusted, and a
-                // resolver that only writes when something happens leaves them
-                // wondering for a month whether any of this is on.
+                // Now rather than at the first change, so an operator who
+                // points at a new path can see what is trusted without waiting
+                // a month for something to happen.
                 if !path.exists() {
                     anchors.save(path)?;
                     tracing::info!(
@@ -410,8 +361,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let resolver = Arc::new(Resolver::new(config));
 
-    // Following the anchors is a task of its own: it resolves, which means it
-    // needs the resolver, which means it cannot be part of building one.
+    // A task of its own: following the anchors resolves, so it needs the
+    // resolver and cannot be part of building one.
     if let (Some((path, anchors)), Some(shared)) = (managed, shared_anchors) {
         spawn_anchor_manager(
             resolver.clone(),
@@ -423,11 +374,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // A zero-capacity cache never stores (DnsCache::put is a no-op at 0), so
-    // --no-cache is just a cache sized to hold nothing. The denial cache is
-    // sized the same way, and additionally to zero when we are not validating:
-    // aggressive use rests entirely on the proofs having been checked, so
-    // without validation there is nothing legitimate to put in it.
+    // `DnsCache::put` is a no-op at 0, so --no-cache is a cache sized to hold
+    // nothing. The denial cache is zero without validation too: aggressive use
+    // rests on the proofs having been checked.
     let capacity = if cli.no_cache { 0 } else { cli.cache_size };
     let denial_zones = if cli.no_cache || !cli.dnssec_validate {
         0
@@ -436,22 +385,18 @@ async fn main() -> anyhow::Result<()> {
     };
     let caches = Arc::new(Caches {
         answers: DnsCache::new(capacity),
-        // Negative answers share the answer cache's bound: they are answers, and
-        // `--no-cache` means no cache.
+        // Negative answers are answers: `--no-cache` means no cache.
         negatives: NegativeCache::new(capacity),
         denials: NsecCache::new(denial_zones),
     });
 
     let addr = format!("{}:{}", cli.host, cli.port);
-    // Both transports are mandatory for a resolver: when an answer overflows the
-    // client's UDP payload size we reply TC=1, and RFC 1035 §4.2.1 has the client
-    // retry the same query over TCP. Without a TCP listener that retry is
-    // refused and the query simply fails.
+    // Both transports are mandatory: an answer over the client's UDP payload
+    // size gets TC=1, and RFC 1035 §4.2.1 has the client retry over TCP.
     let socket = Arc::new(UdpSocket::bind(&addr).await?);
     let listener = TcpListener::bind(&addr).await?;
-    // Bound before anything is announced, so a typo in `--metrics-listen` stops
-    // the start the same way a typo in `--port` does rather than leaving a
-    // resolver running without the observability the operator asked for.
+    // Bound before anything is announced, so a typo in `--metrics-listen`
+    // stops the start rather than losing the observability silently.
     let metrics_listener = match &cli.metrics_listen {
         Some(spec) => Some(
             TcpListener::bind(spec)
@@ -485,14 +430,11 @@ async fn main() -> anyhow::Result<()> {
             format!("{capacity} entries")
         },
         dnssec_source,
-        // Printed because the drops it causes are silent: `CLAUDE.md` §14, a
-        // control nobody can observe is a control nobody can debug.
+        // Printed because the drops it causes are silent.
         cli.max_inflight_udp.max(1),
     );
-    // And the two limits, for exactly the same reason: both drop in silence, so
-    // an operator who cannot see the effective policy concludes it is the
-    // network. This is the line that was missing from this daemon entirely
-    // (`TODO.md` #18).
+    // And the two limits, for the same reason: both drop in silence, so an
+    // operator who cannot see the policy blames the network.
     tracing::info!(
         "query rate: {}, response budget: {}, metrics: {}",
         if cli.query_rate == 0 {
@@ -520,9 +462,9 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
-    // A `JoinSet` rather than two `JoinHandle`s in a `select!`, which dropped
-    // the loser — and dropping a `JoinHandle` detaches the task rather than
-    // cancelling it, so `main` returned with the other transport still reading
+    // A `JoinSet` rather than two `JoinHandle`s in a `select!`: dropping the
+    // loser detaches the task rather than cancelling it, so `main` returns with
+    // the other transport still reading
     // and replies still queued in a per-connection `mpsc`. `join_next` is
     // cancel-safe, so first-one-wins keeps both tasks owned and joinable.
     let mut loops = JoinSet::new();
@@ -544,18 +486,15 @@ async fn main() -> anyhow::Result<()> {
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
-    // The scrape endpoint is a listener like the others: if it dies, the process
-    // does. A resolver whose metrics silently stopped is one nobody is watching,
-    // which is worse than one that is plainly down.
+    // A listener like the others: if it dies, the process does. Metrics that
+    // silently stopped are worse than a resolver that is plainly down.
     if let Some(metrics_listener) = metrics_listener {
         loops.spawn(async move {
             metrics_server::serve(
                 metrics_listener,
                 shell.metrics.clone(),
-                // A resolver has nothing to wait for — no zone has to arrive
-                // before it can answer — so it is ready as soon as it is up, and
-                // `/readyz` is a liveness probe under another name. `/healthz`
-                // is the one that means something here. See `TODO.md` #18.
+                // Nothing to wait for: a resolver is ready as soon as it is
+                // up.
                 Readiness::ready(),
                 shutdown_stop,
                 shutdown_busy,
@@ -565,7 +504,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Neither loop returns in normal operation; whichever ends first ends the
-    // process rather than leaving us serving one transport — cooperatively now.
+    // process rather than leaving one transport served.
     let mut failure: Option<anyhow::Error> = None;
     tokio::select! {
         joined = loops.join_next() => {
@@ -583,9 +522,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // What is left running is a resolution the client is still waiting on, or
-    // the RFC 5011 manager part-way through rewriting the anchor file — which
-    // is the one piece of durable state this process owns.
+    // What is left running is a resolution a client waits on, or the RFC 5011
+    // manager part-way through rewriting the anchor file.
     shutdown.drain_reporting().await;
 
     match failure {
@@ -611,8 +549,8 @@ fn listener_failure(
 /// Follow the managed zones' DNSKEY RRsets and keep the anchors in step
 /// (RFC 5011).
 ///
-/// One task, not one per zone: the zones share a file, and one writer per file
-/// is the rule everything else here obeys too.
+/// One task, not one per zone: the zones share a file, and one file wants one
+/// writer.
 fn spawn_anchor_manager(
     resolver: Arc<Resolver>,
     anchors: SharedAnchors,
@@ -622,12 +560,12 @@ fn spawn_anchor_manager(
     busy: Busy,
 ) {
     tokio::spawn(async move {
-        // A first probe soon after start rather than immediately: a resolver
-        // that cannot answer its own first query yet would just spend a retry.
+        // Soon after start, not immediately: a resolver that cannot answer
+        // its own first query would spend a retry.
         let mut wait = Duration::from_secs(60);
         loop {
-            // No `Busy` across the sleep, which is hours long — only across the
-            // probe-and-save below, where the file is actually rewritten.
+            // No `Busy` across the sleep, which is hours long — only across
+            // the probe-and-save, where the file is rewritten.
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
                 _ = stop.wait() => return,
@@ -660,10 +598,8 @@ fn spawn_anchor_manager(
             }
 
             if changed {
-                // The live anchor set moves with the file, in that order: a
-                // resolver validating against keys it has not recorded would
-                // forget them on restart, which is the failure this file exists
-                // to prevent.
+                // File first: validating against keys not yet recorded would
+                // forget them on restart.
                 match managed.save(&path) {
                     Ok(()) => anchors.replace(managed.trust_anchors()),
                     Err(e) => tracing::error!(
@@ -690,11 +626,10 @@ struct AnchorProbe {
 
 /// Resolve a zone's DNSKEY RRset, insisting it validated.
 ///
-/// **Secure or nothing.** An Insecure or Indeterminate answer for a zone we hold
-/// an anchor for is not a zone that went unsigned, it is an answer we could not
-/// tie to the anchor — and adopting keys from one would be adopting whatever
-/// answered. This is the precondition `ManagedAnchors::observe` documents and
-/// cannot check for itself.
+/// Secure or nothing. Insecure or Indeterminate for a zone we hold an anchor
+/// for is not a zone gone unsigned but an answer we could not tie to the anchor,
+/// and adopting keys from one adopts whatever answered. `ManagedAnchors::observe`
+/// requires this and cannot check it itself.
 async fn probe_zone(resolver: &Resolver, zone: &str) -> anyhow::Result<AnchorProbe> {
     let query = QuerySection {
         qname: zone.to_string(),
@@ -722,8 +657,8 @@ async fn probe_zone(resolver: &Resolver, zone: &str) -> anyhow::Result<AnchorPro
         return Err(anyhow!("a validated answer with no DNSKEY in it"));
     }
 
-    // The timers come from the RRSIG that covers the set: how long the zone said
-    // to cache it, and how long its signature has left.
+    // From the RRSIG covering the set: how long to cache it, and how long the
+    // signature has left.
     let (original_ttl, signature_remaining) = response
         .answers
         .iter()
@@ -746,12 +681,8 @@ async fn probe_zone(resolver: &Resolver, zone: &str) -> anyhow::Result<AnchorPro
     })
 }
 
-/// Say what happened. A trust anchor moving is the rarest event this resolver
-/// has and the one an operator most wants to find in a log afterwards.
-/// INFO throughout, and INFO deliberately: a trust anchor changing is rare, it
-/// is the thing an operator reconstructs a DNSSEC incident from afterwards, and
-/// there is no volume in it — a key rolls over months. `--quiet` still silences
-/// it, which is the operator saying they do not want it.
+/// INFO throughout: a key rolls over months, so there is no volume in it, and
+/// it is what an operator reconstructs a DNSSEC incident from.
 fn report(change: &AnchorChange) {
     match change {
         AnchorChange::Pending { zone, key_tag } => tracing::info!(
@@ -791,19 +722,14 @@ fn report(change: &AnchorChange) {
 /// The same answer with TC=1 and no records: what a client over its response
 /// budget gets instead of the answer.
 ///
-/// It is smaller than the query that asked for it, so it is useless for
-/// amplification, and RFC 1035 §4.2.1 has the client retry over TCP — where the
-/// handshake proves the source address and the budget no longer applies. Going
-/// silent instead would leave a legitimate client with a timeout and no idea
-/// that TCP would work.
+/// Smaller than the query that asked for it, so useless for amplification, and
+/// RFC 1035 §4.2.1 has the client retry over TCP where the handshake proves the
+/// source and the budget no longer applies. Silence would leave a legitimate
+/// client with a timeout and no idea TCP would work.
 ///
-/// Built by reading our own reply back rather than by editing its header in
-/// place. That costs a parse on a path taken only when a source is already over
-/// budget, and it buys the header flags, the echoed question and the OPT record
-/// being whatever `to_bytes_within` would have written — `CLAUDE.md` §7's
-/// "two functions that build the same kind of message are one function with a
-/// parameter", and `rdnsd`'s `truncated_reply` is the sibling that got AA and
-/// the payload size wrong by being written separately.
+/// Built by reading our own reply back rather than editing its header in place:
+/// one parse, on a path taken only when a source is over budget, and the flags,
+/// the echoed question and the OPT record are whatever `to_bytes_within` wrote.
 fn truncate_reply(reply: &[u8]) -> Option<Vec<u8>> {
     let mut msg = DnsMessage::try_from_bytes(reply).ok()?;
     msg.truncation = true;
@@ -818,12 +744,11 @@ fn truncate_reply(reply: &[u8]) -> Option<Vec<u8>> {
 
 /// Receive datagrams and resolve each in its own task, up to `max_inflight`.
 ///
-/// The spawn stays — see [`MAX_INFLIGHT_UDP`] for why a resolver is the case
-/// where it is right — but it is bounded now, and the permit is taken **before**
-/// the packet is copied and the task is created rather than after. `try_acquire`
-/// and not `acquire`: waiting for a permit would only move the queue from the
-/// kernel's receive buffer into a pile of tasks holding copies of datagrams,
-/// which is the shape being fixed. For UDP, shedding *is* the back-pressure.
+/// The permit is taken *before* the packet is copied and the task created — see
+/// [`MAX_INFLIGHT_UDP`] for why a resolver spawns per datagram at all.
+/// `try_acquire`, not `acquire`: waiting would move the queue from the kernel's
+/// receive buffer into a pile of tasks holding copies. For UDP, shedding is the
+/// back-pressure.
 async fn udp_main(
     socket: Arc<UdpSocket>,
     resolver: Arc<Resolver>,
@@ -833,12 +758,11 @@ async fn udp_main(
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
-    // Floored, not refused: a resolver that answers nothing is not a setting
-    // anybody means (`CLAUDE.md` §14).
+    // Floored, not refused: nobody means "answer nothing".
     let in_flight = Arc::new(Semaphore::new(max_inflight.max(1)));
-    // Sized for any datagram a client may send, not for the payload size we
-    // advertise: on Windows an oversized datagram fails the receive rather than
-    // truncating, and a failed receive ends this loop and the process with it.
+    // Sized for any datagram a client may send, not the payload size we
+    // advertise: on Windows an oversized one fails the receive rather than
+    // truncating, and a failed receive ends this loop.
     let mut buf = vec![0u8; UDP_RECEIVE_BUFFER];
     loop {
         // Stop receiving on shutdown. `recv_from` is cancel-safe, so a datagram
@@ -849,19 +773,16 @@ async fn udp_main(
         };
         let (n, peer) = match received {
             Ok(received) => received,
-            // An ICMP report about a datagram we already sent, or a datagram
-            // that did not fit — neither says anything about this socket, and
-            // both used to end the loop. See `recv_error_is_transient`, which
-            // this shares with `rdnsd` precisely because the two copies had
-            // already drifted.
+            // An ICMP report about a datagram already sent, or one that did
+            // not fit: neither says anything about this socket. Shared with
+            // `rdnsd` — see `recv_error_is_transient`.
             Err(e) if recv_error_is_transient(&e) => continue,
             Err(e) => return Err(e),
         };
-        // Rate limit first, because it is the cheapest rejection and the one
-        // that should fire on a flood: a hash lookup and a token, before the
-        // packet is even looked at. Dropping is silent — a reply to a spoofed
-        // source is what an amplifier sends — which is exactly why the effective
-        // policy is printed at startup and counted here (`CLAUDE.md` §14).
+        // First, because it is the cheapest rejection and the one a flood
+        // should hit: a hash lookup and a token, before the packet is looked
+        // at. Dropping is silent, which is why the policy is printed at startup
+        // and counted here.
         if !shell.limiter.should_allow(peer.ip()) {
             shell.logger.log_rate_limited(peer.ip());
             shell.metrics.count(&shell.metrics.rate_limited);
@@ -873,9 +794,9 @@ async fn udp_main(
             shell.metrics.count(&shell.metrics.validation_errors);
             continue;
         }
-        // Before the copy, before the clones, before the task: at the ceiling
-        // this datagram costs one comparison and nothing else. The semaphore is
-        // never closed, so the only failure is "full".
+        // Before the copy, the clones and the task: at the ceiling a datagram
+        // costs one comparison. The semaphore is never closed, so the only
+        // failure is "full".
         let Ok(permit) = in_flight.clone().try_acquire_owned() else {
             tracing::debug!(%peer, "dropped: {max_inflight} UDP queries already in flight");
             shell.metrics.count(&shell.metrics.queries_dropped);
@@ -885,8 +806,8 @@ async fn udp_main(
         let socket = socket.clone();
         let resolver = resolver.clone();
         let caches = caches.clone();
-        // A recursive answer can take seconds and the client is already waiting
-        // on it, so it is worth the drain rather than being dropped.
+        // A recursion takes seconds and the client is already waiting, so it
+        // is worth the drain.
         let busy = busy.clone();
         let shell = shell.clone();
         tokio::spawn(async move {
@@ -895,10 +816,9 @@ async fn udp_main(
             if let Some(reply) =
                 handle_query(data, &resolver, &caches, &shell, Transport::Udp).await
             {
-                // Charge the response, not the query. Over budget, a truncated
-                // reply is the useful refusal: it carries no records, so it
-                // cannot amplify, and a real client reads TC=1 and asks again
-                // over TCP where the handshake proves who it is.
+                // Charge the response, not the query. Over budget, TC=1 is
+                // the useful refusal: no records to amplify, and a real client
+                // retries over TCP where the handshake proves who it is.
                 match shell.responses.admit(peer.ip(), reply.len()) {
                     ResponseVerdict::Send => {
                         let _ = socket.send_to(&reply, peer).await;
@@ -931,17 +851,15 @@ async fn tcp_main(
 ) -> Result<(), std::io::Error> {
     let permits = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
     loop {
-        // Stop accepting on shutdown; connections already open drain in their
-        // own tasks below. `accept` is cancel-safe, so a connection lost to this
-        // race stays in the kernel backlog rather than being half-taken.
+        // Open connections drain in their own tasks. `accept` is cancel-safe,
+        // so a connection lost to this race stays in the kernel backlog.
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => accepted?,
             _ = stop.wait() => return Ok(()),
         };
-        // The rate limit applies to TCP too. The response *budget* does not —
-        // a peer that completed a handshake is not one anybody is reflecting
-        // at — but a flood of connections is still a flood, and the limiter is
-        // what bounds it per source.
+        // The rate limit applies to TCP; the response *budget* does not, since
+        // a peer that completed a handshake is not one being reflected at. A
+        // flood of connections is still a flood.
         if !shell.limiter.should_allow(peer.ip()) {
             shell.logger.log_rate_limited(peer.ip());
             shell.metrics.count(&shell.metrics.rate_limited);
@@ -968,9 +886,8 @@ async fn tcp_main(
 ///
 /// Each message is framed by a 2-byte big-endian length (RFC 1035 §4.2.2), and a
 /// connection may carry any number of queries (RFC 7766 §6.2.1), answered
-/// **concurrently** (§6.2.1.1). Concurrency earns its keep here: a cache miss
-/// costs an upstream round trip, so answering in lock-step would make every
-/// query on a connection wait out the slowest one ahead of it.
+/// concurrently (§6.2.1.1) — a cache miss costs an upstream round trip, so
+/// lock-step would make every query wait out the slowest one ahead of it.
 async fn serve_connection(
     stream: TcpStream,
     resolver: Arc<Resolver>,
@@ -981,10 +898,9 @@ async fn serve_connection(
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_INFLIGHT_PER_CONNECTION);
 
-    // One task owns the write half. Answers may complete out of order — RFC 7766
-    // §6.2.1.1 allows that, and clients match on the transaction id — but two
-    // framed messages must never interleave on the wire, so every reply funnels
-    // through here.
+    // One task owns the write half. Answers may complete out of order
+    // (RFC 7766 §6.2.1.1; clients match on the transaction id), but two framed
+    // messages must never interleave on the wire.
     let writer_task = tokio::spawn(async move {
         while let Some(framed) = rx.recv().await {
             if writer.write_all(&framed).await.is_err() {
@@ -996,10 +912,9 @@ async fn serve_connection(
     let in_flight = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_CONNECTION));
 
     loop {
-        // Between messages the peer may legitimately be idle, so a timeout here
-        // is a normal close rather than an error — and so is a shutdown, which
-        // ends the connection at the cheapest possible moment: the peer has
-        // committed to nothing, so it costs one reconnect and no answer.
+        // Between messages an idle peer is legitimate, so a timeout here is a
+        // normal close. So is a shutdown: the peer has committed to nothing, so
+        // it costs one reconnect and no answer.
         let mut len_buf = [0u8; 2];
         let read = tokio::select! {
             r = tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut len_buf)) => r,
@@ -1015,16 +930,16 @@ async fn serve_connection(
             break; // Can't even hold a header; treat as a broken peer.
         }
 
-        // Mid-message the peer has committed to sending `len` bytes, so a stall
-        // here gets a much shorter leash than an idle connection does.
+        // Mid-message the peer has committed to `len` bytes, so a stall gets a
+        // much shorter leash.
         let mut buf = vec![0u8; len];
         match tokio::time::timeout(TCP_READ_TIMEOUT, reader.read_exact(&mut buf)).await {
             Ok(Ok(_)) => {}
             _ => break,
         }
 
-        // Cap in-flight work per connection: this await is what stops a
-        // pipelining client from spawning tasks faster than we retire them.
+        // This await is what stops a pipelining client from spawning tasks
+        // faster than we retire them.
         let Ok(permit) = in_flight.clone().acquire_owned().await else {
             break;
         };
@@ -1035,10 +950,10 @@ async fn serve_connection(
         tokio::spawn(async move {
             if let Some(reply) = handle_query(buf, &resolver, &caches, &shell, Transport::Tcp).await
             {
-                // Length prefix and message in one buffer, so the writer emits
-                // them in a single call. A reply too long to frame is dropped
-                // with a line saying so rather than sent with a wrapped prefix,
-                // which the peer would read as a broken stream (`TODO.md` #17).
+                // Prefix and message in one buffer, so the writer emits them
+                // in a single call. A reply too long to frame is dropped rather
+                // than sent with a wrapped prefix, which the peer would read as
+                // a broken stream.
                 match rdns::framed(&reply) {
                     Ok(framed) => {
                         // A send error means the writer is gone (the peer hung
@@ -1070,17 +985,10 @@ async fn handle_query(
     shell: &Shell,
     transport: Transport,
 ) -> Option<Vec<u8>> {
-    // Parse, and refuse a *response*: answering one is how a resolver becomes a
-    // packet engine. This used to go straight to `queries.first()`, which a
-    // response also has — so two instances pointed at each other, or one spoofed
-    // datagram with a forged source, is a self-sustaining loop between them, each
-    // reply parsed as a question and answered with another reply. `None` is the
-    // whole reply, because the peer did not ask anything.
-    //
-    // Both failures are silence here, so unlike `rdnsd` there is nothing to
-    // branch on — this resolver says nothing per packet at the default log level
-    // either way. The type is what makes the check unskippable; see
-    // `rdns::validation::Request`.
+    // Refuse a *response*: a reply parsed as a question and answered with
+    // another reply is a packet loop between two servers pointed at each other.
+    // `None` is the whole reply, because the peer did not ask anything. The type
+    // is what makes the check unskippable — see `rdns::validation::Request`.
     let msg = Request::from_bytes(&data).ok()?;
     let timer = LatencyTimer::new();
     shell.metrics.count(&shell.metrics.queries_received);
@@ -1088,8 +996,7 @@ async fn handle_query(
         shell.metrics.track_query_type(q.qtype);
     }
 
-    // Every opcode but QUERY is something this resolver does not implement, and
-    // saying so is more useful than answering a NOTIFY or an UPDATE with a
+    // NOTIMP is more useful than answering a NOTIFY or an UPDATE with a
     // plausible QUERY-shaped reply the sender will misread (RFC 1035 §4.1.1).
     if msg.opcode != OpCode::Query {
         shell.record_answer(ResponseCode::NotImplemented, timer);
@@ -1099,22 +1006,20 @@ async fn handle_query(
     let query = msg.queries.first()?.clone();
     let id = msg.id;
     let recursion = msg.recursion;
-    // Over UDP: the classic 512, unless the client advertised more via EDNS0.
-    // Over TCP: the length prefix is the only limit, and truncating there would
-    // strand the client — TCP *is* the fallback it was sent to.
+    // UDP: 512 unless EDNS0 advertised more. TCP: the length prefix is the only
+    // limit, and truncating there strands a client already on the fallback.
     let client_max = match transport {
         Transport::Udp => msg.udp_payload_size() as usize,
         Transport::Tcp => u16::MAX as usize,
     };
 
-    // Reject bad EDNS before doing any work on the client's behalf: a malformed
-    // option list is a FORMERR, and an EDNS version we don't implement is
-    // BADVERS (RFC 6891 §6.1.3). Both replies carry a bare version-0 OPT.
+    // Before any work on the client's behalf: a malformed option list is
+    // FORMERR, an unimplemented EDNS version is BADVERS (RFC 6891 §6.1.3), and
+    // both replies carry a bare version-0 OPT.
     //
-    // Read once. `edns()` builds the option list, which is a `Vec` and a
-    // `Vec<u8>` per option, and none of the three things asked of it below is in
-    // that list (`TODO.md` #9e); `edns_header` checks the list is well formed
-    // without building it, so a FORMERR is still a FORMERR.
+    // `edns_header` rather than `edns()`: nothing below needs the option list,
+    // which costs a `Vec` per option, and it still checks the list is well
+    // formed.
     let client_edns = match msg.edns_header() {
         Ok(edns) => edns,
         Err(_) => {
@@ -1139,14 +1044,13 @@ async fn handle_query(
     let client_wants_dnssec = client_edns.is_some_and(|e| e.do_bit);
     let checking_disabled = msg.cd;
 
-    // Names that must not leave this machine (RFC 6761, 6762, 6303). First,
-    // before every cache and before any resolution: for these the table *is* the
-    // answer, and consulting anything else would mean a query going out.
+    // Names that must not leave this machine (RFC 6761, 6762, 6303). Before
+    // every cache: the table *is* the answer, and consulting anything else means
+    // a query going out.
     //
-    // Not skipped for a client with CD set, unlike the denial cache. CD says "do
-    // not withhold an answer on my behalf because it failed validation", which is
-    // a statement about DNSSEC; it is not a request to be told what a public
-    // server thinks `localhost` is.
+    // Not skipped for CD, unlike the denial cache: CD is a statement about
+    // DNSSEC, not a request to be told what a public server thinks `localhost`
+    // is.
     if let Some(local) = special_names::lookup(&query.qname, query.qtype) {
         let mut resp = build_response(
             id,
@@ -1157,15 +1061,12 @@ async fn handle_query(
             recursion,
         );
         resp.authorities = local.authority;
-        // Never AD: nothing here was validated, it was decided by specification.
-        // Claiming otherwise would be the one lie a validating client cannot
-        // check for itself.
+        // Never AD: this was decided by specification, not validated, and a
+        // validating client cannot check the claim for itself.
         resp.ad = false;
         resp.cd = checking_disabled;
-        // DEBUG: this is one line per query, with the name asked for on it.
-        // Unconditional query logging is a decision an operator makes, not one a
-        // default makes for them — see `TODO.md` #9d on what the deleted
-        // telemetry module used to do here.
+        // DEBUG: one line per query, with the name on it. Logging every query
+        // is the operator's decision, not the default's.
         tracing::debug!(qname = %query.qname, why = %local.why, "answered locally");
         return finish(
             resp,
@@ -1179,20 +1080,14 @@ async fn handle_query(
     }
 
     // Aggressive use of the validated denial cache (RFC 8198). A cached NSEC
-    // does not answer one question, it answers every question in its gap, so
-    // this is checked before the answer cache: a flood of random names under one
-    // zone costs a single upstream query rather than one per name.
+    // answers every question in its gap, so it goes before the answer cache: a
+    // flood of random names under one zone costs one upstream query, not one per
+    // name. Skipped for CD, which asks us not to filter on the client's behalf.
     //
-    // A client with CD set has asked us not to filter on its behalf, and an
-    // answer we invented from cached proofs is exactly that, so it goes
-    // upstream instead.
-    // The positive half of RFC 8198 (§5.3): a validated wildcard answer is a
-    // signed statement about every name that wildcard reaches, so a name nobody
-    // has asked about yet can be answered from it. Checked before the negative
-    // synthesis because the two are mutually exclusive by construction — a
-    // cached NXDOMAIN needs the wildcard *denied*, so it cannot fire for a name a
-    // wildcard governs — and this way the cheaper, more specific answer is tried
-    // first.
+    // The positive half (§5.3) first: a validated wildcard answer is a signed
+    // statement about every name the wildcard reaches. The two are mutually
+    // exclusive — a cached NXDOMAIN needs the wildcard *denied* — so trying the
+    // more specific one first costs nothing.
     if !checking_disabled {
         if let Some(wildcard) = caches
             .denials
@@ -1207,9 +1102,8 @@ async fn handle_query(
                 recursion,
             );
             resp.authorities = wildcard.authority;
-            // The wildcard's own signature verifies at this name unchanged —
-            // that is what a wildcard signature means — so this is as validated
-            // as the answer it came from, and the client can check it itself.
+            // A wildcard signature verifies at this name unchanged, so the
+            // client can check this for itself.
             resp.ad = client_wants_dnssec || msg.ad;
             return finish(
                 resp,
@@ -1235,8 +1129,8 @@ async fn handle_query(
                 recursion,
             );
             resp.authorities = denial.authority;
-            // The proofs were validated before they were stored, so the answer
-            // derived from them is authentic on the same terms as the original.
+            // The proofs were validated before storage, so what is derived
+            // from them is authentic on the same terms.
             resp.ad = client_wants_dnssec || msg.ad;
             return finish(
                 resp,
@@ -1250,11 +1144,9 @@ async fn handle_query(
         }
     }
 
-    // A cached "no" (RFC 2308). Checked alongside the answer cache because it
-    // answers the same question the same way — the only reason it is a separate
-    // cache is that there are no records to key on. Unlike the denial cache
-    // above, nothing here is synthesized: this is the answer this question got,
-    // so a CD client may have it too.
+    // A cached "no" (RFC 2308), separate from the answer cache only because
+    // there are no records to key on. Nothing is synthesized — this is the
+    // answer this question got — so a CD client may have it too.
     if let Some(negative) = caches.negatives.get(&query.qname, query.qtype) {
         shell.metrics.count(&shell.metrics.cache_hits);
         let mut resp = build_response(
@@ -1295,39 +1187,35 @@ async fn handle_query(
                 secure,
             )
         } else {
-            // Everything above answered from something already held; from here
-            // the query costs a recursion. That is the line a resolver's cache
-            // hit rate is drawn on, and it is why these two counters live here
-            // and not in `rdnsd`, which has no cache and never incremented them
-            // (`TODO.md` #19d).
+            // Everything above answered from something held; from here the
+            // query costs a recursion. This is the line a cache hit rate is
+            // drawn on.
             shell.metrics.count(&shell.metrics.cache_misses);
             shell.metrics.count(&shell.metrics.queries_recursive);
-            // Resolver::resolve_validated is async — each upstream round trip is an
-            // await, so this yields the task rather than holding a thread.
+            // Async: each upstream round trip is an await, so this yields the
+            // task rather than holding a thread.
             match resolver.resolve_validated(&query).await {
                 Ok((mut upstream, state)) => {
-                    // The resolver used its own random transaction id; the reply
-                    // must echo the client's id and advertise recursion.
+                    // The resolver used its own random id; the reply must echo
+                    // the client's and advertise recursion.
                     upstream.id = id;
                     upstream.response = true;
                     upstream.recursion = recursion;
                     upstream.recursion_ok = true;
 
                     if let ValidationState::Bogus(ref why) = state {
-                        // WARN, not DEBUG: an answer that does not validate is
-                        // either an attack or a broken zone, and both are worth
-                        // seeing without turning anything up.
+                        // WARN: an answer that does not validate is an attack
+                        // or a broken zone, and both are worth seeing.
                         tracing::warn!(
                             qname = %query.qname,
                             qtype = %query.qtype,
                             "DNSSEC validation failed: {why}"
                         );
-                        // Fail closed. Data we know we cannot authenticate is worse
-                        // than no data: the client has no way to tell it apart from
-                        // an answer that was checked, so serving it launders an
-                        // attack into an ordinary-looking reply. A client that sets
-                        // CD has said it will do its own checking, and RFC 4035
-                        // §3.2.2 requires we hand the data over unfiltered.
+                        // Fail closed: the client cannot tell unauthenticated
+                        // data from checked data, so serving it launders an
+                        // attack into an ordinary reply. CD says the client
+                        // checks for itself, and RFC 4035 §3.2.2 requires the
+                        // data unfiltered.
                         if !checking_disabled {
                             let resp = build_response(
                                 id,
@@ -1350,9 +1238,8 @@ async fn handle_query(
                     }
 
                     let secure = state.is_secure();
-                    // Never store an answer as validated that was not, and never
-                    // store one at all if it failed: a bogus answer in the cache is
-                    // an attack that outlives the query that carried it.
+                    // A bogus answer in the cache is an attack that outlives
+                    // the query that carried it.
                     if !upstream.answers.is_empty() && !state.is_bogus() {
                         caches.answers.put_validated(
                             &query.qname,
@@ -1361,43 +1248,34 @@ async fn handle_query(
                             secure,
                         );
                     }
-                    // A "no" is an answer, and re-resolving it every time is what
-                    // made a typo storm cost one upstream walk per repeat. RFC 2308:
-                    // the SOA in the authority section says how long it is good for.
+                    // A "no" is an answer; re-resolving it makes a typo storm
+                    // cost one upstream walk per repeat. The SOA in the
+                    // authority section says how long it is good for (RFC 2308).
                     if !state.is_bogus() {
                         caches
                             .negatives
                             .insert(&query.qname, query.qtype, &upstream, secure);
                     }
-                    // A *validated* "no" is worth more than the question that
-                    // produced it — the NSEC covers a whole range of names — so it
-                    // also goes into the denial cache. Only when Secure: aggressive
-                    // use rests entirely on the proof having been checked, and an
-                    // unvalidated NSEC is an attacker's claim about which names do
-                    // not exist.
+                    // A *validated* "no" covers a whole range of names, so it
+                    // also goes in the denial cache. Only when Secure: an
+                    // unvalidated NSEC is an attacker's claim about which names
+                    // do not exist.
                     if upstream.answers.is_empty() && secure {
                         caches.denials.insert_validated(&upstream);
                     }
-                    // And a validated *positive* answer that came from a wildcard is
-                    // the same kind of statement about a range of names (RFC 8198
-                    // §5.3), so it is kept too — under the wildcard rather than under
-                    // the name that happened to be asked for. Only when Secure, for
-                    // exactly the same reason.
+                    // A validated wildcard answer is the same kind of statement
+                    // about a range (RFC 8198 §5.3), so it is kept under the
+                    // wildcard rather than the name asked for.
                     if !upstream.answers.is_empty() && secure {
                         caches.denials.insert_validated_wildcard(&upstream);
                     }
                     (upstream, secure)
                 }
-                // Resolution failed: say why, then SERVFAIL. A resolver that turns
-                // every failure into a bare SERVFAIL is undiagnosable from the
-                // outside, and the reasons here are specific — lame delegation,
-                // budget exhausted, CNAME loop — precisely so they can be read.
+                // Say why, then SERVFAIL: lame delegation, budget exhausted
+                // and CNAME loop are distinct so they can be read.
                 Err(ref e) => {
-                    // DEBUG: a lookup that fails is ordinary — a typo, a dead
-                    // nameserver, a client asking for something that is not
-                    // there — and one line per failed query is the flood the
-                    // level exists to stop. The SERVFAIL counter is what an
-                    // operator alerts on.
+                    // DEBUG: a failed lookup is ordinary, and one line per
+                    // failure is a flood. The SERVFAIL counter is the alert.
                     tracing::debug!(
                         qname = %query.qname,
                         qtype = %query.qtype,
@@ -1419,10 +1297,8 @@ async fn handle_query(
             }
         };
 
-    // The AD bit goes on only for an answer we actually authenticated, and only
-    // for a client that asked about it (RFC 6840 §5.8) — to anyone else it is
-    // noise, and to a client behind an untrusted link it is not evidence of
-    // anything anyway.
+    // AD only for an answer actually authenticated, and only for a client that
+    // asked (RFC 6840 §5.8).
     resp.ad = secure && (client_wants_dnssec || msg.ad);
     resp.cd = checking_disabled;
 
@@ -1448,15 +1324,11 @@ fn finish(
     shell: &Shell,
     timer: LatencyTimer,
 ) -> Option<Vec<u8>> {
-    // Counted here because this is where every ordinary answer leaves, whatever
-    // produced it — cache, denial cache, negative cache or a full recursion. The
-    // rcode is what an operator pages on: SERVFAIL climbing on a resolver means
-    // upstream trouble or a validation failure, and NXDOMAIN is ordinary
-    // (`CLAUDE.md` §14).
+    // Here because this is where every ordinary answer leaves, whatever
+    // produced it: cache, denial cache, negative cache or a full recursion.
     shell.record_answer(resp.rcode, timer);
-    // A client that did not set DO gets no DNSSEC records (RFC 4035 §3.2.1) —
-    // it did not ask for them, they are large, and it has no use for them.
-    // Records it asked for by type are a different matter and stay.
+    // No DO, no DNSSEC records (RFC 4035 §3.2.1). Records asked for by type
+    // are a different matter and stay.
     if !client_wants_dnssec {
         let asked_for = |rtype: Rtype| query.qtype.is(rtype);
         let keep = |rr: &ResourceRecord| match rr.rdata.rtype() {
@@ -1475,8 +1347,7 @@ fn finish(
     // unsolicited EDNS.
     if client_uses_edns {
         let mut edns = Edns::with_payload_size(RDNSR_PAYLOAD_SIZE);
-        // Mirror DO back: it tells the client the signatures it sees were
-        // deliberate rather than leftovers.
+        // Mirror DO: the signatures the client sees were deliberate.
         edns.do_bit = client_wants_dnssec;
         resp.set_edns(edns);
     } else {
@@ -1506,16 +1377,13 @@ fn edns_error(
 
 /// NOTIMP for an opcode this resolver does not implement.
 ///
-/// The opcode is **echoed**, not replaced with QUERY: RFC 1035 §4.1.1 says it is
-/// "set by the originator of a query and copied into the response", and a NOTIFY
-/// answered with `opcode = QUERY` is a reply its sender cannot match to what it
-/// asked. That is the same reason [`build_response`] takes one rather than
-/// assuming.
+/// The opcode is echoed, not replaced with QUERY (RFC 1035 §4.1.1): a NOTIFY
+/// answered with `opcode = QUERY` is a reply its sender cannot match. Same
+/// reason [`build_response`] takes one rather than assuming.
 ///
-/// The question section is echoed if there was one, and the OPT record mirrored
-/// if the client used EDNS (RFC 6891 §6.1.1) — an EDNS client that gets a reply
-/// with no OPT may cache us as a server that does not do EDNS, which is a
-/// downgrade earned by an unrelated mistake.
+/// The question is echoed and the OPT record mirrored if the client used EDNS
+/// (RFC 6891 §6.1.1) — a reply with no OPT may get us cached as a server that
+/// does not do EDNS.
 fn unsupported_opcode(msg: &DnsMessage) -> Option<Vec<u8>> {
     let mut resp = DnsMessage {
         id: msg.id,
@@ -1543,9 +1411,8 @@ fn unsupported_opcode(msg: &DnsMessage) -> Option<Vec<u8>> {
 /// Build a minimal response message echoing the question section.
 ///
 /// `opcode` is a parameter because it is the client's, not ours (RFC 1035
-/// §4.1.1). Every caller here passes QUERY and is right to — `handle_query`
-/// refuses anything else before reaching them — but hardcoding it is what made
-/// the missing opcode check invisible.
+/// §4.1.1). Every caller here passes QUERY, since `handle_query` refuses
+/// anything else first, but hardcoding it hides a missing opcode check.
 fn build_response(
     id: u16,
     opcode: OpCode,
@@ -1577,23 +1444,20 @@ fn build_response(
 mod tests {
     use super::*;
 
-    /// A resolver that will never be reached: every test below is about a packet
-    /// rejected before any resolution is attempted.
-    /// **A source over its query rate is dropped, and the drop is counted.**
+    /// Never reached: every test below is about a packet rejected before any
+    /// resolution is attempted.
+    /// A source over its query rate is dropped, and the drop is counted. Both
+    /// halves: silence is right, because a reply to a spoofed source is what an
+    /// amplifier sends, which is exactly why the counter has to exist.
     ///
-    /// Both halves, because silence is the correct answer here and a control
-    /// nobody can observe is a control nobody can debug (`CLAUDE.md` §14): a
-    /// reply to a spoofed source is what an amplifier sends, so dropping is
-    /// right — and it is exactly why the counter has to exist.
-    ///
-    /// **Watched failing** against `udp_main` without the limiter check: all
-    /// four datagrams were answered and `rate_limited` stayed at 0.
+    /// Watched failing without the limiter check: all four datagrams answered,
+    /// `rate_limited` at 0.
     #[tokio::test]
     async fn a_source_over_its_query_rate_is_dropped_and_counted() {
         let (resolver, caches) = context();
 
-        // One query per second, burst of one: the second datagram in a burst is
-        // over the limit whatever the clock does.
+        // One per second, burst of one: the second datagram in a burst is over
+        // the limit whatever the clock does.
         let shell = Arc::new(Shell {
             limiter: Arc::new(RateLimiter::new(RateLimitConfig::per_second(1, 1))),
             responses: Arc::new(ResponseLimiter::disabled()),
@@ -1635,9 +1499,8 @@ mod tests {
         let _ = server.await;
     }
 
-    /// An exempt source is not limited, which is the escape hatch every knob
-    /// needs — for a monitoring probe whose whole job is to query more often
-    /// than a client would (`CLAUDE.md` §14).
+    /// The escape hatch, for a monitoring probe whose job is to query more
+    /// often than a client would.
     #[test]
     fn an_exempt_source_is_not_rate_limited() {
         let limiter = RateLimiter::new(
@@ -1712,8 +1575,7 @@ mod tests {
     fn context() -> (Arc<Resolver>, Arc<Caches>) {
         let config = ResolverConfig {
             mode: ResolverMode::Forward,
-            // Nothing here ever reaches an upstream: every test below is about a
-            // packet rejected before resolution is attempted.
+            // Nothing here reaches an upstream.
             upstream_servers: vec!["127.0.0.1:1".parse().unwrap()],
             ..Default::default()
         };
@@ -1755,13 +1617,9 @@ mod tests {
         buf
     }
 
-    /// The packet loop. `handle_query` went straight to `queries.first()`, which
-    /// a *response* also has — so two instances pointed at each other, or one
-    /// spoofed datagram with a forged source, kept answering each other's
-    /// answers for as long as both were up.
-    ///
-    /// There is nothing to reply with here, so the test is that nothing comes
-    /// back at all.
+    /// The packet loop: a *response* has a question section too, so two
+    /// instances pointed at each other keep answering each other's answers.
+    /// Nothing may come back at all.
     #[tokio::test]
     async fn a_response_is_dropped_rather_than_resolved() {
         let (resolver, caches) = context();
@@ -1779,10 +1637,8 @@ mod tests {
         );
     }
 
-    /// An opcode this resolver does not implement is NOTIMP, and the opcode
-    /// comes back unchanged — RFC 1035 §4.1.1 says it is "copied into the
-    /// response". A NOTIFY answered with `opcode = QUERY` is a reply its sender
-    /// cannot match to what it asked.
+    /// NOTIMP, with the opcode unchanged (RFC 1035 §4.1.1): a NOTIFY answered
+    /// with `opcode = QUERY` is a reply its sender cannot match.
     #[tokio::test]
     async fn an_unimplemented_opcode_is_notimp_with_the_opcode_echoed() {
         let (resolver, caches) = context();
@@ -1812,19 +1668,14 @@ mod tests {
     /// A datagram arriving with the in-flight ceiling already reached is
     /// dropped, and dropped *before* it is copied and given a task.
     ///
-    /// The setup is built so that neither half of it is a race. A resolver
-    /// forwarding to an upstream that never answers, with a thirty-second
-    /// timeout, holds its permit for the whole test; the black hole *receiving*
-    /// the forwarded query is the proof that it does, so the second datagram is
-    /// unambiguously sent while the only permit is taken. And the second
-    /// datagram is an UPDATE, which `handle_query` answers with NOTIMP out of
-    /// the message alone — no cache, no network, nothing that could be slow. So
-    /// "no reply arrived" means the packet was dropped at the door and not that
-    /// the answer was still being worked out.
+    /// Neither half is a race. Forwarding to an upstream that never answers
+    /// holds the only permit for the whole test, and the black hole *receiving*
+    /// that query is the proof it does. The second datagram is an UPDATE, which
+    /// `handle_query` answers with NOTIMP out of the message alone — no cache,
+    /// no network — so "no reply" means dropped at the door.
     ///
-    /// **Fails against the old code**, which spawned unconditionally: the
-    /// NOTIMP came straight back. Confirmed by deleting the `try_acquire_owned`
-    /// and watching it pass in the wrong direction.
+    /// Watched failing with the `try_acquire_owned` removed: the NOTIMP came
+    /// straight back.
     #[tokio::test]
     async fn a_datagram_over_the_in_flight_ceiling_is_dropped() {
         let black_hole = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
@@ -1832,8 +1683,8 @@ mod tests {
         let resolver = Arc::new(Resolver::new(ResolverConfig {
             mode: ResolverMode::Forward,
             upstream_servers: vec![upstream],
-            // Long enough that the first query is still outstanding at the end
-            // of the test whatever the machine is doing.
+            // Long enough that the first query is still outstanding at the
+            // end of the test.
             timeout_ms: 30_000,
             ..Default::default()
         }));
@@ -1857,8 +1708,8 @@ mod tests {
             .send_to(&message(OpCode::Query, false), addr)
             .await
             .expect("send the query that takes the permit");
-        // The forwarded query landing here is what makes the permit definitely
-        // held rather than probably held.
+        // The forwarded query landing here is what makes the permit
+        // definitely held rather than probably held.
         let mut buf = vec![0u8; 512];
         black_hole
             .recv_from(&mut buf)
@@ -1879,9 +1730,9 @@ mod tests {
         );
 
         shutdown.begin();
-        // The worker is parked in `recv_from`, which the stop cancels; the
-        // resolving task is what the drain is for and this test does not wait
-        // for its thirty seconds.
+        // The worker is parked in `recv_from`, which the stop cancels. The
+        // resolving task is what the drain is for; this test does not wait out
+        // its thirty seconds.
         let _ = server.await;
     }
 }

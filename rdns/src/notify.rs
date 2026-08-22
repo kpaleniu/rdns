@@ -1,21 +1,11 @@
 //! DNS NOTIFY: telling a secondary that a zone changed (RFC 1996).
 //!
-//! Without it a secondary finds out about a change when its refresh timer next
-//! goes off, which for a typical SOA is hours after the fact. NOTIFY makes the
-//! primary say so immediately: one small message per secondary, and the
-//! secondary decides what to do about it.
+//! Not a query: the opcode is NOTIFY (4), so a server dispatching on nothing but
+//! the question section answers it as a lookup for the zone's SOA.
 //!
-//! It is not a query, and that is the whole of what makes it different. The
-//! opcode is NOTIFY (4) rather than QUERY (0), so a server that dispatches on
-//! nothing but the question section will cheerfully answer it as a lookup for the
-//! zone's SOA — which is a plausible-looking reply to a message that was not
-//! asking anything.
-//!
-//! The shape (RFC 1996 §3.7): the question names the zone with QTYPE=SOA, AA is
-//! set because the sender is authoritative for what it is talking about, and the
-//! answer section carries the zone's SOA. That last part is optional in the RFC
-//! and worth including: it is how the secondary learns the new serial without
-//! having to ask a second question.
+//! The shape (RFC 1996 §3.7): question names the zone with QTYPE=SOA, AA set,
+//! and the zone's SOA in the answer section. That last is optional in the RFC and
+//! is how the secondary learns the new serial without asking again.
 
 use crate::utils::record_types as rt;
 use crate::zone::Zone;
@@ -26,9 +16,8 @@ use crate::{
 
 /// How many times a NOTIFY is sent before giving up on a secondary.
 ///
-/// RFC 1996 §3.6 wants retries until a response arrives, bounded. Losing one is
-/// not a catastrophe — the secondary's refresh timer is still there as the
-/// backstop, which is exactly what NOTIFY is an optimisation over.
+/// RFC 1996 §3.6 wants bounded retries. Losing one only costs the secondary its
+/// refresh timer, which NOTIFY is an optimisation over.
 pub const NOTIFY_ATTEMPTS: usize = 3;
 
 /// Seconds before the second attempt; it doubles after that.
@@ -43,11 +32,8 @@ pub fn notify_request(zone: &str, soa: Option<ResourceRecord>, id: u16) -> DnsMe
         id,
         response: false,
         opcode: OpCode::Notify,
-        // The sender is authoritative for the zone it is reporting on.
         authoritive: true,
         truncation: false,
-        // A NOTIFY is not a request for recursion, and no secondary should read
-        // it as one.
         recursion: false,
         recursion_ok: false,
         ad: false,
@@ -65,8 +51,7 @@ pub fn notify_request(zone: &str, soa: Option<ResourceRecord>, id: u16) -> DnsMe
     }
 }
 
-/// The reply to a NOTIFY: the same opcode, the question echoed, and nothing else
-/// (RFC 1996 §4.7 — a NOTIFY response carries no data, it is an acknowledgement).
+/// The reply to a NOTIFY: same opcode, question echoed, no data (RFC 1996 §4.7).
 pub fn notify_response(request: &DnsMessage, rcode: ResponseCode) -> DnsMessage {
     DnsMessage {
         id: request.id,
@@ -100,23 +85,16 @@ pub fn notified_zone(msg: &DnsMessage) -> Option<String> {
 
 /// Whether a reply is an acknowledgement of the NOTIFY we sent with `id`.
 ///
-/// Any rcode counts. A secondary answering NOTAUTH has still told us it received
-/// the message, which is all a retry loop needs to know — and repeating it would
-/// not change its mind.
+/// Any rcode counts: a secondary answering NOTAUTH still received it, and
+/// repeating would not change its mind.
 pub fn acknowledges(reply: &DnsMessage, id: u16) -> bool {
     reply.response && reply.id == id && reply.opcode == OpCode::Notify
 }
 
 /// Which zones changed between two loads, as (zone, new serial).
 ///
-/// A zone whose serial is unchanged is not news, and a zone that has gone
-/// backwards is not either — a secondary compares serials the same way and would
-/// ignore it, so sending is just noise. A zone that is new since the last load
-/// *is* news: nobody has heard about it yet.
-///
-/// The comparison used to be RFC 1982 §3.2 written out inline here, beside a
-/// second implementation of it in `secondary::is_newer`. Both are now
-/// [`Serial::is_newer_than`] (`TODO.md` #14a).
+/// A serial that is unchanged or has gone backwards is not news — a secondary
+/// compares the same way and would ignore it. A zone new since the last load is.
 pub fn changed_zones(
     before: &[(String, Serial)],
     after: &[(String, Serial)],
@@ -185,8 +163,8 @@ mod tests {
         .expect("zone should parse")
     }
 
-    /// The opcode is the point: a NOTIFY that goes out as a QUERY is a request
-    /// for the zone's SOA, which is a different message with a plausible reply.
+    /// A NOTIFY that goes out as a QUERY is a request for the zone's SOA — a
+    /// different message with a plausible reply.
     #[test]
     fn test_a_notify_is_a_notify_on_the_wire() {
         let zone = zone_with_serial(7);
@@ -230,15 +208,13 @@ mod tests {
         );
         assert_eq!(parsed.queries[0].qname, "example.com.");
 
-        // A different transaction, or an answer to something else, is not it.
         assert!(!acknowledges(&parsed, 0x9999));
         let mut wrong_opcode = parsed.clone();
         wrong_opcode.opcode = OpCode::Query;
         assert!(!acknowledges(&wrong_opcode, 0x4321));
     }
 
-    /// Even a refusal ends the retries: the secondary plainly received it, and
-    /// asking again would get the same answer.
+    /// Even a refusal ends the retries: the secondary received it.
     #[test]
     fn test_any_rcode_acknowledges() {
         let request = notify_request("example.com.", None, 5);
@@ -265,8 +241,7 @@ mod tests {
         assert_eq!(changed, vec![at("a.test.", 11), at("c.test.", 1)]);
     }
 
-    /// A serial that has gone *backwards* is not an update: a secondary comparing
-    /// serials would ignore it, so telling it would be noise.
+    /// A serial that has gone backwards is not an update.
     #[test]
     fn test_a_serial_that_went_backwards_is_not_news() {
         let before = vec![("a.test.".to_string(), Serial::new(10))];
@@ -274,10 +249,9 @@ mod tests {
         assert!(changed_zones(&before, &after).is_empty());
     }
 
-    /// RFC 1982 serial arithmetic reaches this far out: a wrapped serial is still
-    /// an increment, and a naive `>` would call it a rollback and stay silent for
-    /// the rest of the zone's life. The arithmetic itself is tested beside
-    /// [`Serial`]; this is that it is the arithmetic *this* function uses.
+    /// A wrapped serial is still an increment (RFC 1982); a naive `>` would call
+    /// it a rollback. The arithmetic itself is tested beside [`Serial`] — this is
+    /// that *this* function uses it.
     #[test]
     fn test_a_wrapped_serial_is_still_an_increment() {
         let before = vec![("a.test.".to_string(), Serial::new(u32::MAX - 1))];
@@ -297,7 +271,7 @@ mod tests {
             vec![("example.com.".to_string(), Serial::new(20260726))]
         );
 
-        // A zone with no SOA has no serial to compare, so it is never news.
+        // No SOA, no serial to compare, so never news.
         let no_soa = parse_zone_file("www IN A 192.0.2.1\n", "example.com.").unwrap();
         assert!(zone_serials(&[&no_soa]).is_empty());
     }
@@ -308,7 +282,7 @@ mod tests {
         msg.opcode = OpCode::Query;
         assert!(notified_zone(&msg).is_none());
 
-        // Nor is a NOTIFY *response* something to act on as a notification.
+        // Nor is a NOTIFY response.
         let reply = notify_response(&notify_request("example.com.", None, 1), ResponseCode::Ok);
         assert!(notified_zone(&reply).is_none());
     }

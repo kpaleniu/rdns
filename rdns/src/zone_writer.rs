@@ -1,24 +1,16 @@
-//! Writing a [`Zone`] back out as a zone file.
+//! Writing a [`Zone`] back out as a zone file, in the presentation format the
+//! parser already reads.
 //!
-//! The format is the presentation format the parser already reads, so the load
-//! path is the one already written and tested. A private serialization would be
-//! a second definition of what a zone is.
+//! What is written must read back as the same bytes: a signature covers RDATA
+//! octet for octet, so a re-spelling that re-encodes differently turns a valid
+//! RRset bogus. A record is rendered type-specifically only where that provably
+//! round-trips, otherwise in RFC 3597 §5's `\# <len> <hex>` form.
 //!
-//! Every line stands on its own: owner names absolute, TTL and class stated, so
-//! nothing depends on which directives precede it. `$ORIGIN` and `$TTL` are still
-//! emitted because other tools expect them.
+//! An owner name has no such fallback — it is the first field of the line, and
+//! this parser has no escape syntax — so an unspellable one is refused rather
+//! than written as a different name.
 //!
-//! The rule the module is built around: what is written must read back as the
-//! same bytes. A fetched zone may be signed, and a signature covers RDATA octet
-//! for octet, so a re-spelling that re-encodes differently turns a valid RRset
-//! bogus at a validating client. A record is therefore rendered
-//! type-specifically only where that provably round-trips, and otherwise in
-//! RFC 3597 §5's `\# <len> <hex>` form — which is also what lets a zone holding
-//! unparsed types be persisted at all.
-//!
-//! An owner name cannot fall back: it is the first field of the line, not RDATA,
-//! and this parser has no escape syntax for a label containing a dot or a space.
-//! Such a name is refused rather than written as a different name.
+//! Every line stands on its own: owner names absolute, TTL and class stated.
 
 use crate::error::ZoneError;
 use crate::Class;
@@ -45,10 +37,8 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
     out.push_str(&format!("$ORIGIN {}\n", zone.origin()));
     out.push_str(&format!("$TTL {}\n\n", default_ttl(zone)));
 
-    // The SOA goes first, as it does in every zone file anyone writes and as a
-    // transfer of this zone would send it. The rest keep the order they were
-    // loaded in, so rewriting an unchanged zone produces an unchanged file and a
-    // diff between two versions shows what actually moved.
+    // The SOA first, as a transfer sends it. The rest keep load order, so
+    // rewriting an unchanged zone produces an unchanged file.
     let apex_soa = |r: &ZoneRecord| {
         r.rdata.rtype() == record_types::SOA && r.name.eq_ignore_ascii_case(zone.origin())
     };
@@ -66,10 +56,9 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
 
 /// Serialize a zone and replace `path` with it, atomically.
 ///
-/// The rename is what makes a reload safe to run against a zone being rewritten:
-/// see [`crate::persist::write_atomically`]. Nothing here writes into the file
-/// the server is serving from until the whole zone has been rendered, so a
-/// record that cannot be expressed leaves the previous file untouched.
+/// The rename ([`crate::persist::write_atomically`]) makes a reload safe against
+/// a zone being rewritten, and a record that cannot be expressed leaves the
+/// previous file untouched.
 pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), ZoneError> {
     let text = zone_to_string(zone)?;
     crate::persist::write_atomically_str(path, &text).map_err(|source| ZoneError::Io {
@@ -103,13 +92,9 @@ pub fn record_to_string(record: &ZoneRecord) -> Result<String, ZoneError> {
 
 /// The type name and RDATA text for a stored record.
 ///
-/// Type-specific when that is faithful, generic when it is not — and the check
-/// for "faithful" is the same one every time: re-encode what we parsed and see
-/// whether the bytes come back identical. That catches a bitmap whose windows
-/// are laid out differently from how we would lay them out, RDATA carrying
-/// trailing bytes the type does not define, a name whose labels do not survive
-/// the round trip — without this module having to enumerate those cases or
-/// notice when a new one appears.
+/// Type-specific when that is faithful, generic when it is not. "Faithful" is
+/// decided by re-encoding what we parsed and comparing the bytes, so the cases
+/// need not be enumerated here.
 fn rdata_to_string(stored: &RecordData) -> (String, String) {
     let name = record_type_name(stored.rtype());
     let generic = (name.clone(), generic_rdata(stored));
@@ -162,11 +147,8 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
             expire,
             minimum,
         } => {
-            // The parenthesized, one-field-per-line form, which is how an SOA is
-            // written everywhere and the only record where the extra lines earn
-            // their keep: the five timers are indistinguishable as a row of bare
-            // numbers, and this is the file an operator reads to find out why a
-            // secondary is refreshing when it does.
+            // One field per line: the five timers are indistinguishable as a row
+            // of bare numbers.
             let pad = " ".repeat(45);
             format!(
                 "{mname} {rname} (\n\
@@ -252,24 +234,18 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
             out.push_str(&bitmap_to_string(type_bitmap)?);
             out
         }
-        // No typed payload to write: `RecordData` holds the bytes, and the
-        // caller has already fallen back to the generic form for them.
+        // No typed payload: the caller has already fallen back to generic.
         ParsedRecord::Unknown(_) => return None,
     })
 }
 
-/// A type bitmap as the list of type names an NSEC or NSEC3 line ends with,
-/// each preceded by a space — or `None` if writing it that way would not read
-/// back as the same bytes.
+/// A type bitmap as the list of type names an NSEC or NSEC3 line ends with, each
+/// preceded by a space — or `None` if that would not read back as the same
+/// bytes.
 ///
-/// This is the one place the re-encode check in [`rdata_to_string`] cannot see.
-/// A bitmap is stored and re-encoded verbatim, so a bitmap padded with trailing
-/// zero bytes, or with its windows laid out unusually, survives that check
-/// intact — and then the *text* form drops the padding, because a list of type
-/// names says which types are set and nothing about how they were spelled.
-/// Reading it back would build the canonical layout instead, and the signature
-/// over the original would no longer verify. So the layout is compared against
-/// the one the parser will rebuild, and anything else goes out generic.
+/// [`rdata_to_string`]'s re-encode check cannot see this: a bitmap is stored
+/// verbatim, so padding or an unusual window layout survives it, and only the
+/// text form drops them. Compare against the layout the parser will rebuild.
 fn bitmap_to_string(bitmap: &[u8]) -> Option<String> {
     let types = bitmap_types_exact(bitmap).ok()?;
     if crate::dnssec_denial::build_type_bitmap(&types) != bitmap {
@@ -285,10 +261,8 @@ fn bitmap_to_string(bitmap: &[u8]) -> Option<String> {
 
 /// A domain name if it can be written as a bare field, `None` otherwise.
 ///
-/// A field ends at whitespace, a `;` starts a comment, a `"` opens a string, a
-/// parenthesis groups lines, and `\`, `@` and `$` all mean something to the
-/// parser. A name containing any of them would read back as something else —
-/// which for a name is not a formatting problem but a different name.
+/// Whitespace ends a field; `;`, `"`, parentheses, `\`, `@` and `$` all mean
+/// something to the parser. A name carrying one reads back as a different name.
 fn writable_name(name: &str) -> Option<String> {
     let plain = name
         .chars()
@@ -299,9 +273,8 @@ fn writable_name(name: &str) -> Option<String> {
 /// A `<character-string>` as the text between quotes, or `None` when it holds
 /// bytes this format cannot carry.
 ///
-/// Only `"` and `\` need escaping inside quotes, and this parser resolves both.
-/// It has no `\DDD` decimal escape, though, so a string carrying a byte outside
-/// printable ASCII has no spelling here at all — the record goes out generic.
+/// This parser resolves `\"` and `\\` but has no `\DDD` decimal escape, so a
+/// byte outside printable ASCII has no spelling and the record goes out generic.
 fn quotable_string(bytes: &[u8]) -> Option<String> {
     let mut out = String::with_capacity(bytes.len());
     for &byte in bytes {
@@ -334,11 +307,9 @@ fn class_name(class: Class) -> Option<&'static str> {
     }
 }
 
-/// What to put in `$TTL`.
-///
-/// Every record carries its own TTL, so this is only ever a default for a record
-/// that does not — which this writer never emits — and a value other tools
-/// insist on seeing. The SOA's minimum is the conventional choice.
+/// What to put in `$TTL`. Every record written states its own, so this exists
+/// only because other tools insist on seeing the directive; the SOA's minimum is
+/// the conventional choice.
 fn default_ttl(zone: &Zone) -> Ttl {
     let soa = zone
         .query(zone.origin(), Qtype::of(record_types::SOA))
@@ -361,9 +332,8 @@ mod tests {
     use crate::Rtype;
     use crate::Serial;
 
-    /// Load, write, load again — and hold the two zones to being the same zone,
-    /// record for record, RDATA byte for byte. This is the property the module
-    /// exists to have; everything else here is a case that threatens it.
+    /// Load, write, load again: the two zones must match record for record and
+    /// RDATA byte for byte.
     fn round_trip(text: &str, origin: &str) -> (Zone, Zone, String) {
         let first = parse_zone_file(text, origin).expect("parse the input");
         let written = zone_to_string(&first).expect("write");
@@ -419,8 +389,8 @@ mod tests {
         assert_eq!(second.serial(), Some(Serial::new(2021010101)));
     }
 
-    /// A per-record TTL is what makes each line independent, so it has to
-    /// survive — including one that differs from the zone's default.
+    /// A per-record TTL makes each line independent, including one differing
+    /// from the zone's default.
     #[test]
     fn test_ttls_are_written_per_record() {
         let (_, second, _) = round_trip(
@@ -431,8 +401,7 @@ mod tests {
         assert_eq!(record.ttl, Ttl::from_secs(60));
     }
 
-    /// The SOA leads the file whatever order it was loaded in — that is where
-    /// every reader, ours included, expects to find it.
+    /// The SOA leads the file whatever order it was loaded in.
     #[test]
     fn test_soa_is_written_first() {
         let (_, _, written) = round_trip(
@@ -465,9 +434,8 @@ mod tests {
         );
     }
 
-    /// A TXT record is arbitrary octets, and this format has no decimal escape
-    /// to spell one that is not text. It must not be dropped or mangled: the
-    /// generic form carries it exactly.
+    /// A TXT record is arbitrary octets and this format has no decimal escape,
+    /// so the generic form carries it.
     #[test]
     fn test_binary_txt_falls_back_to_the_generic_form() {
         let mut zone = Zone::new("example.com.".to_string());
@@ -490,8 +458,8 @@ mod tests {
         );
     }
 
-    /// A type with no parser here still has to survive being persisted, or a
-    /// secondary would quietly drop records when it wrote a fetched zone down.
+    /// A type with no parser here must survive persistence, or a secondary drops
+    /// records when it writes a fetched zone down.
     #[test]
     fn test_unknown_types_survive_as_generic_records() {
         let mut zone = Zone::new("example.com.".to_string());
@@ -536,9 +504,8 @@ mod tests {
         );
     }
 
-    /// The DNSSEC records are the ones a rewrite must be byte-exact for: a
-    /// signature covers the RDATA it was made over, so anything that comes back
-    /// even slightly different is a record that no longer verifies.
+    /// A signature covers the RDATA it was made over, so anything that comes
+    /// back different no longer verifies.
     #[test]
     fn test_dnssec_records_round_trip_byte_for_byte() {
         let (first, second, written) = round_trip(
@@ -552,9 +519,8 @@ mod tests {
             "example.com.",
         );
 
-        // The round-trip assertion above is the real check; these pin the
-        // spellings a reader would expect to see, and that none of them took the
-        // generic escape hatch.
+        // The round trip is the real check; these pin the spellings, and that
+        // none of them took the generic escape hatch.
         assert!(
             written.contains("NSEC    www.example.com. A NS SOA MX RRSIG NSEC DNSKEY"),
             "{written}"
@@ -579,14 +545,13 @@ mod tests {
         );
     }
 
-    /// A bitmap laid out differently from how we would lay it out is still a
-    /// signed record: re-spelling it by type name would re-encode it canonically
-    /// and change the bytes, so it goes out generic instead.
+    /// Re-spelling a non-canonical bitmap by type name would re-encode it
+    /// canonically and change the bytes a signature covers.
     #[test]
     fn test_a_non_canonical_bitmap_is_written_generically() {
         let mut zone = Zone::new("example.com.".to_string());
-        // Window 0, four bytes of bits where one would do: legal to read, not
-        // what `build_type_bitmap` would produce.
+        // Four bytes of bits where one would do: legal to read, not what
+        // `build_type_bitmap` produces.
         let padded = RecordData::from_parsed(&ParsedRecord::NSEC {
             next_domain_name: "www.example.com.".to_string(),
             type_bitmap: vec![0x00, 0x04, 0x40, 0x00, 0x00, 0x00],
@@ -609,8 +574,8 @@ mod tests {
         );
     }
 
-    /// An owner name this format cannot spell must stop the write rather than
-    /// produce a file that reads back as a different zone.
+    /// An unspellable owner name stops the write; the alternative is a file that
+    /// reads back as a different zone.
     #[test]
     fn test_an_unwritable_owner_name_is_refused() {
         let mut zone = Zone::new("example.com.".to_string());

@@ -1,8 +1,6 @@
 mod answer;
 mod config;
-/// The control socket, which needs a Unix domain socket and so exists on Unix
-/// only — the same shape SIGHUP reloading has. See the module for why the
-/// alternative (control endpoints on the metrics listener) is not one.
+/// Control socket. Needs a Unix domain socket, so Unix only.
 #[cfg(unix)]
 mod control;
 mod replication;
@@ -53,43 +51,29 @@ use rdns::{
 /// UDP payload size rdnsd advertises to clients via EDNS0.
 const RDNSD_PAYLOAD_SIZE: u16 = 4096;
 
-/// How long a TCP connection may sit idle between queries before we close it.
-/// RFC 7766 §6.2.3 wants connections reused rather than reopened; an idle one
-/// still costs a socket, so this is the compromise.
+/// How long a TCP connection may sit idle between queries. RFC 7766 §6.2.3
+/// wants connections reused rather than reopened; an idle one still costs a
+/// socket.
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long we wait for the rest of a message once its length prefix arrived.
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Ceiling on concurrent TCP connections. Without one, an accept loop that
-/// spawns per connection is a free file-descriptor exhaustion vector.
+/// spawns per connection is a file-descriptor exhaustion vector.
 const MAX_TCP_CONNECTIONS: usize = 128;
 
 /// Queries a single connection may have in flight at once. Doubles as the reply
-/// channel's depth, so a client that pipelines faster than it reads eventually
-/// pushes back on our read loop instead of growing a queue in memory.
+/// channel's depth, so a client that pipelines faster than it reads pushes back
+/// on the read loop instead of growing a queue in memory.
 const MAX_INFLIGHT_PER_CONNECTION: usize = 16;
 
-/// How many UDP workers `--udp-workers` defaults to, and the reason it is not a
-/// round constant.
+/// Default for `--udp-workers`: the machine's parallelism, clamped to 2..=32.
 ///
-/// The work one worker does per datagram is microseconds of CPU between two
-/// await points, so the only parallelism that helps is the machine's — a fixed
-/// 64 would be 64 threads' worth of ambition on a two-core box and would cost
-/// 4 MB of receive buffers to say so, since each worker holds one
-/// [`UDP_RECEIVE_BUFFER`]. Hence the machine's own number.
-///
-/// Both ends are clamped rather than trusted. The floor is 2 so the default is
-/// never the degenerate single-worker case on a container reporting one CPU
-/// (**the flag itself is floored at 1** in `serve`, which is a different rule:
-/// §14's "a mistyped knob should be wrong, not fatal"). The ceiling is 32
-/// because past it this is buying receive buffers rather than throughput; an
-/// operator with a 128-core authoritative server and a reason can say so on the
-/// command line.
-///
-/// `available_parallelism` and not `num_cpus`: it is std, it respects cgroup
-/// quotas and affinity masks, and this crate does not need a dependency to ask
-/// one question.
+/// A worker spends microseconds of CPU per datagram, so useful parallelism is
+/// the machine's; past 32 this buys receive buffers ([`UDP_RECEIVE_BUFFER`]
+/// each) rather than throughput. `available_parallelism` and not `num_cpus`:
+/// std, and it respects cgroup quotas and affinity masks.
 pub(crate) fn default_udp_workers() -> usize {
     std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -108,15 +92,9 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 /// A peer sent something we could not use: a malformed packet, a truncated TCP
 /// message, a response arriving at a listening socket.
 ///
-/// **DEBUG is the whole point of this macro.** These are the paths a flood goes
-/// through, and every one of them used to be an unconditional unbuffered
-/// `write(2)` with the message built by `format!` first — 50k lines a second at
-/// 50k pps of garbage, with no way to turn it off. At DEBUG the message is not
-/// formatted at all unless somebody asked for it, and what an operator sees by
-/// default is the *counter*, which is what a graph should be built on anyway.
-///
-/// A malformed packet is not an operator-actionable event. Ten million of them
-/// are, and that is what `dns_errors_total` is for.
+/// DEBUG on purpose: these are the paths a flood goes through, so the message
+/// must not be formatted unless somebody asked for it. The default signal is
+/// the counter (`dns_errors_total`).
 macro_rules! bad_request {
     ($logger:expr, $ip:expr, $($arg:tt)*) => {{
         $logger.count_error($ip);
@@ -124,17 +102,11 @@ macro_rules! bad_request {
     }};
 }
 
-/// Something went wrong while serving a request that an operator may want to
-/// know about: a refusal we decided on, or a failure that is ours.
+/// A refusal we decided on, or a failure that is ours.
 ///
-/// WARN, because none of these is attacker-triggerable in volume the way
-/// [`bad_request`] is — a signing failure or a serialization error means
-/// something is actually wrong here, and a refused transfer is a policy decision
-/// somebody may be debugging at the other end.
-///
-/// Both macros count, so `total_errors` still means "requests that did not get a
-/// normal answer" whichever level is in force. Counting and logging in one place
-/// is what stops a call site doing one and forgetting the other.
+/// WARN, because unlike [`bad_request`] none of these is attacker-triggerable
+/// in volume. Both macros count, so `total_errors` means "requests that did not
+/// get a normal answer" whichever level is in force.
 macro_rules! serving_error {
     ($logger:expr, $ip:expr, $($arg:tt)*) => {{
         $logger.count_error($ip);
@@ -144,11 +116,8 @@ macro_rules! serving_error {
 
 /// Authoritative DNS server.
 ///
-/// Serves UDP *and* TCP from one process. It used to be one process per transport
-/// — `rdnsd udp` beside `rdnsd tcp` over the same zone files — which was harmless
-/// only while zones were read-only. Anything that writes state (a fetched zone, a
-/// refresh timestamp) needs a single owner, and two servers racing to write the
-/// same zone file is not a design to grow into.
+/// UDP and TCP from one process: anything that writes state (a fetched zone, a
+/// refresh timestamp) needs a single owner.
 #[derive(Parser)]
 #[command(version = rdns::VERSION, about, long_about = None)]
 struct Cli {
@@ -166,37 +135,29 @@ struct Cli {
     zone_dir: Option<String>,
     /// Who may request a zone transfer: an address or CIDR prefix, repeatable.
     ///
-    /// Nobody, unless this says otherwise. An AXFR is the whole zone in one
-    /// answer, so it is the one query that has to be allowed by list. Applies to
-    /// TCP, because AXFR is defined over TCP alone (RFC 5936 §4.2).
+    /// Nobody, unless this says otherwise. TCP only, because AXFR is defined
+    /// over TCP alone (RFC 5936 §4.2).
     #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     allow_transfer: Vec<String>,
     /// A TSIG key, `[algorithm:]name:base64secret`, repeatable.
     ///
-    /// Holding the key is an identity; coming from an address is not. A request
-    /// signed with a key named here may transfer a zone whatever its source
-    /// address, and any signed request gets a signed answer (RFC 8945). The
-    /// algorithm defaults to hmac-sha256.
+    /// A request signed with a key named here may transfer a zone whatever its
+    /// source address, and any signed request gets a signed answer (RFC 8945).
+    /// The algorithm defaults to hmac-sha256.
     #[arg(long, value_name = "[ALG:]NAME:SECRET", conflicts_with = "config")]
     tsig_key: Vec<String>,
     /// A secondary to notify when a zone changes: `addr[:port]`, repeatable.
     ///
-    /// Without this a secondary hears about a change when its refresh timer next
-    /// goes off, which for a typical SOA is hours later. A NOTIFY says so at once
-    /// (RFC 1996). Sent on zone load — at startup and on SIGHUP — for every zone
-    /// whose serial moved forward.
+    /// Sent on zone load — startup and SIGHUP — for every zone whose serial
+    /// moved forward (RFC 1996).
     #[arg(long, value_name = "ADDR[:PORT]", conflicts_with = "config")]
     also_notify: Vec<String>,
     /// A zone to replicate: `zone@master[:port][#tsig-key-name]`, repeatable.
     ///
-    /// Makes this server a *secondary* for that zone: it asks the master for the
-    /// SOA on the zone's own REFRESH timer, transfers when the serial has moved,
-    /// and stops serving the zone entirely once EXPIRE has passed without
-    /// contact. Repeat with the same zone to give it more than one master.
-    ///
-    /// Requires `--zone-dir`, because a fetched zone has to be written somewhere:
-    /// the file lands there under the zone's name and is loaded by the ordinary
-    /// path on the next start.
+    /// Makes this server a secondary for that zone: SOA on the zone's REFRESH
+    /// timer, transfer when the serial moved, stop serving once EXPIRE passes
+    /// without contact. Repeat with the same zone for more than one master.
+    /// Requires `--zone-dir`, where the fetched file lands.
     #[arg(
         long,
         value_name = "ZONE@MASTER[:PORT][#KEY]",
@@ -205,19 +166,15 @@ struct Cli {
     secondary: Vec<String>,
     /// A directory of `.rdnskey` signing keys.
     ///
-    /// Every zone this server loads from disk whose apex matches a key here is
-    /// signed in memory as it loads: the DNSKEY RRset published, every
-    /// authoritative RRset signed, and an NSEC chain generated. The zone file
-    /// itself is never rewritten — what a client validates is what leaves the
-    /// socket, and a resigning timer racing an editor for one file is a way to
-    /// lose a zone. Zones with no key here are served exactly as before.
+    /// A zone whose apex matches a key here is signed in memory as it loads.
+    /// The zone file is never rewritten: a resigning timer racing an editor for
+    /// one file is a way to lose a zone.
     #[arg(long, value_name = "DIR", conflicts_with = "config")]
     signing_key_dir: Option<PathBuf>,
     /// How long a generated signature is good for, in days.
     ///
-    /// Signatures are made at load — startup, and SIGHUP where signals exist —
-    /// so this also says how often the zone has to be reloaded. It is long by
-    /// default for that reason.
+    /// Signatures are made at load, so this also says how often the zone has to
+    /// be reloaded — hence the long default.
     #[arg(
         long,
         value_name = "DAYS",
@@ -227,26 +184,19 @@ struct Cli {
     signature_validity: u32,
     /// Deny names with NSEC3 (RFC 5155) rather than NSEC.
     ///
-    /// With no salt and no extra iterations, which is what RFC 9276 §3.1 asks
-    /// for: both were meant to cost an attacker something and only ever cost
-    /// the server and the validator. The reason left to choose NSEC3 is that
-    /// NSEC lets anyone walk the zone one query at a time.
+    /// No salt, no extra iterations (RFC 9276 §3.1).
     #[arg(long, conflicts_with = "config")]
     nsec3: bool,
     /// Leave insecure delegations out of the NSEC3 chain (RFC 5155 §6).
     ///
-    /// For a zone with many unsigned children, which would otherwise pay a
-    /// record and a signature each. The cost is that a denial covering an
-    /// opted-out span proves less: "not here, or an insecure delegation I did
-    /// not list".
+    /// For a zone with many unsigned children. The cost is that a denial
+    /// covering an opted-out span proves less.
     #[arg(long, requires = "nsec3", conflicts_with = "config")]
     nsec3_opt_out: bool,
     /// Generate a key-signing and a zone-signing key for ZONE, print the DS
     /// record to give the parent, and exit.
     ///
-    /// Writes both into `--signing-key-dir`, which must exist. Nothing is
-    /// served in this mode: it is the one thing that has to happen before a
-    /// zone can be signed, and it happens once.
+    /// Writes both into `--signing-key-dir`, which must exist. Serves nothing.
     #[arg(long, value_name = "ZONE", requires = "signing_key_dir")]
     generate_keys: Option<String>,
     /// The algorithm `--generate-keys` uses: a number or a mnemonic.
@@ -255,32 +205,21 @@ struct Cli {
     /// Refuse to serve a zone that is not signed, or whose signatures do not
     /// verify.
     ///
-    /// Off by default, which is the only sane default for a server that may
-    /// hold a mix: most zones are unsigned and serving them is the normal case.
-    /// Turning it on is an operator assertion that every zone here is meant to
-    /// be signed — worth making, because a zone that silently loses its
-    /// signatures otherwise keeps answering as though nothing happened.
+    /// Off by default: a server may hold a mix, and most zones are unsigned.
     #[arg(long, conflicts_with = "config")]
     require_signed: bool,
     /// Serve the zones that loaded even if others in --zone-dir failed to parse.
     ///
-    /// Off by default, and the default is the safe one. A zone file that fails to
-    /// parse used to be skipped with one line on stderr: the process stayed up,
-    /// exit code 0, and that zone answered REFUSED — indistinguishable from a
-    /// zone nobody configured. One typo in 1 of 40 zones plus a deploy SIGHUP is
-    /// a lame delegation for that zone, 39 green dashboards, and a log line that
-    /// scrolled past hours ago.
-    ///
-    /// The flag exists because the behaviour is defensible when the alternative
-    /// is worse — a secondary holding 40 zones would rather serve 39 than none —
-    /// but it should be a decision, not what happens when nobody looked.
+    /// Off by default: one typo plus a deploy SIGHUP is otherwise a lame
+    /// delegation nothing alerts on. The flag exists because a secondary
+    /// holding 40 zones would rather serve 39 than none — but as a decision.
     #[arg(long, conflicts_with = "config")]
     allow_partial_load: bool,
     /// Response bytes per second, per client address. 0 turns the budget off.
     ///
-    /// Meters what leaves rather than what arrives, because that is what an
-    /// amplification attack is made of. Applies to UDP: a TCP query has completed
-    /// a handshake, so there is nobody to reflect at.
+    /// Meters what leaves, which is what an amplification attack is made of.
+    /// UDP only: a TCP query completed a handshake, so there is nobody to
+    /// reflect at.
     #[arg(
         long,
         value_name = "BYTES_PER_SEC",
@@ -290,19 +229,9 @@ struct Cli {
     response_rate: u32,
     /// Queries per second, per client address. 0 turns the limit off.
     ///
-    /// This was hardcoded, unreachable from the command line, and set at
-    /// **~10 q/s** — the library default of 100 tokens per 10-second window
-    /// with a burst of 20. Measured live: a 60-query burst from one address got
-    /// 20 answers and 40 **silent** drops. Not REFUSED, not SERVFAIL: nothing on
-    /// the wire at all, so a client sees a timeout and blames the network. Put
-    /// that in front of an ISP or public resolver, which sends far more than
-    /// 10 q/s from one address, and you blackhole the bulk of its traffic while
-    /// `dig` from a laptop works perfectly.
-    ///
-    /// The default is 1000 because `rdnsd` is authoritative: its clients are
-    /// resolvers, not end users, and one resolver behind one address legitimately
-    /// asks orders of magnitude more than one person does. The limiter is a
-    /// backstop against a flood, not a quota.
+    /// Over the limit is dropped silently, so the number has to be generous:
+    /// `rdnsd`'s clients are resolvers, not end users. A backstop against a
+    /// flood, not a quota.
     #[arg(
         long,
         value_name = "QUERIES_PER_SEC",
@@ -312,9 +241,8 @@ struct Cli {
     query_rate: u32,
     /// How many queries may arrive at once before `--query-rate` applies.
     ///
-    /// A DNS client sends its queries in bursts by nature — one page load is
-    /// dozens of names at once — so a limiter with no burst allowance drops
-    /// traffic that is not a flood at all.
+    /// DNS traffic is bursty by nature; no burst allowance drops traffic that
+    /// is not a flood.
     #[arg(
         long,
         value_name = "QUERIES",
@@ -325,28 +253,18 @@ struct Cli {
     /// An address or CIDR prefix the query rate limit does not apply to,
     /// repeatable.
     ///
-    /// For the resolvers you run yourself, and for a monitoring probe whose
-    /// whole job is to query more often than a client would. Without it the
-    /// only way to exempt a known-good source is to raise the limit for
-    /// everybody.
+    /// For your own resolvers and monitoring probes; the alternative is raising
+    /// the limit for everybody.
     #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     query_rate_exempt: Vec<String>,
     /// How many UDP datagrams may be answered at once.
     ///
-    /// This is the ceiling on concurrent UDP work *and* the shape of it: that
-    /// many identical tasks share the socket and answer inline, rather than one
-    /// task being spawned per datagram. There was no ceiling at all before —
-    /// TCP had two (`MAX_TCP_CONNECTIONS`, `MAX_INFLIGHT_PER_CONNECTION`) and
-    /// UDP had none — so a flood spawned tasks until something gave out, at
-    /// 1,536 bytes of task per datagram before anything had decided to keep it.
-    ///
-    /// Raising it does not make a busy server faster. Answering from an
-    /// in-memory zone is microseconds of CPU with two await points in it, so the
-    /// useful parallelism is the machine's and no more; what this number really
-    /// guards is the memory (one 64 KB receive buffer per worker) and the number
-    /// of answers a stall can hold up. Beyond the workers, datagrams queue in
-    /// the socket receive buffer and the kernel drops the overflow — for UDP
-    /// that is the correct back-pressure, and `netstat -su` counts it.
+    /// That many identical tasks share the socket and answer inline, rather
+    /// than one task spawned per datagram (1,536 bytes each, before anything
+    /// decided to keep the packet). Raising it does not make a busy server
+    /// faster; it buys memory (a 64 KB receive buffer per worker). Beyond the
+    /// workers, datagrams queue in the socket buffer and the kernel drops the
+    /// overflow, which is the correct back-pressure for UDP.
     #[arg(
         long,
         value_name = "TASKS",
@@ -356,47 +274,25 @@ struct Cli {
     udp_workers: usize,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///
-    /// Off by default, because it is a second listening socket and an operator
-    /// should choose where it lives. `GET /metrics` is the scrape, `GET /healthz`
-    /// says the process is running.
-    ///
-    /// **Scraped, not pushed.** What was here before was an OpenTelemetry OTLP
-    /// exporter that `init_telemetry` never called — it dragged `tonic`, `prost`,
-    /// `hyper` and `h2`, a gRPC server, into a DNS daemon for an exporter that
-    /// built two objects into `let _` and dropped them. Meanwhile the module
-    /// with the counters worth paging on was referenced only by a benchmark.
-    /// DNS shops scrape; that is the whole argument.
-    ///
-    /// No TLS and no auth: bind it on loopback or a management address. The
-    /// counters are not secret, but they say how much traffic this server takes
-    /// and which zones are failing.
+    /// `GET /metrics` is the scrape, `GET /healthz` says the process is
+    /// running. No TLS and no auth: bind it on loopback or a management
+    /// address.
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     metrics_listen: Option<String>,
     /// Answer `rdnsctl` on this Unix socket: `status`, `reload`, `dump <zone>`.
     ///
-    /// Off by default, because it is a second thing to bind and an operator
-    /// should choose where it lives — `/run/rdns/rdnsd.sock` under a directory
-    /// the service unit makes is the shape to copy.
-    ///
-    /// **Filesystem permissions are the authentication.** The socket is created
-    /// mode 0600, so it is the server's user and root. That is what Knot,
-    /// PowerDNS and Unbound do; the two servers that put a control channel on
-    /// TCP (BIND's rndc, NSD's nsd-control) put an HMAC or a client certificate
-    /// in front of it, and nobody ships an unauthenticated control port. It is
-    /// also why these commands are not on `--metrics-listen`, where `reload`
-    /// would be a POST with no credential.
-    ///
-    /// **Unix only.** `tokio` has no `UnixListener` on Windows, so this is
-    /// refused there at startup rather than accepted and ignored.
+    /// Filesystem permissions are the authentication: the socket is mode 0600,
+    /// so the server's user and root. That is also why these commands are not
+    /// on `--metrics-listen`, where `reload` would be a POST with no
+    /// credential. Unix only — `tokio` has no `UnixListener` on Windows, so
+    /// this is refused there at startup rather than ignored.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     control_socket: Option<PathBuf>,
     /// Read the settings from a TOML file instead of from flags.
     ///
-    /// **Exclusive of the flags it would set**, deliberately: `--config` together
-    /// with `--port` is an error rather than a precedence rule. Every precedence
-    /// rule is one somebody has to remember at 3am to work out why the server is
-    /// not listening where the file says — and the failure is silent, because both
-    /// values are valid. Refusing costs one restart and no confusion.
+    /// Exclusive of the flags it would set: `--config` with `--port` is an
+    /// error, not a precedence rule. Both values are valid, so the failure
+    /// would be silent.
     ///
     /// The file can express two things a flag cannot: a TSIG secret in a file of
     /// its own (so it is in neither `argv` nor the config), and per-zone signing
@@ -405,23 +301,15 @@ struct Cli {
     config: Option<PathBuf>,
     /// Validate the configuration and exit without binding a socket.
     ///
-    /// A dry run for a deploy: it reads the config, the TSIG secrets and the
-    /// signing keys, and checks everything that can be known without touching the
-    /// network. Exit 0 means the server would start.
+    /// Reads the config, the TSIG secrets and the signing keys, and checks
+    /// everything knowable without the network. Exit 0 means it would start.
     #[arg(long, requires = "config")]
     check_config: bool,
     /// How much to say: error, warn, info, debug or trace.
     ///
-    /// `info` by default — the startup banner and the effective policy, every
-    /// zone load, transfer and NOTIFY, every refusal, every failure that is
-    /// ours. All of those are per-event and rare.
-    ///
-    /// **Nothing per-packet is above `debug`**, which is the point: a malformed
-    /// packet is not an operator-actionable event, and at 50k pps of garbage it
-    /// used to be 50k journald lines a second with no way to turn it off.
-    ///
-    /// `RUST_LOG` overrides this when set, so a running server can be turned up
-    /// without editing its unit file and restarting into new flags.
+    /// Nothing per-packet is above `debug`: a malformed packet is not an
+    /// operator-actionable event, and at 50k pps that is 50k lines a second.
+    /// `RUST_LOG` overrides this when set.
     #[arg(long, value_name = "LEVEL", default_value = "info")]
     log_level: LogLevel,
     /// Errors only. The same as `--log-level error`, and refused with it.
@@ -429,12 +317,11 @@ struct Cli {
     quiet: bool,
 }
 
-/// Everything both transports answer from. One of these per process, so a
-/// connection task or a datagram task clones a single `Arc`.
+/// Everything both transports answer from. One per process, so a connection or
+/// datagram task clones a single `Arc`.
 ///
-/// Shared deliberately. A client's rate limit should not reset because it switched
-/// transport, and the metrics are one server's, not one socket's — with a process
-/// per transport they were two sets that each saw half the traffic.
+/// Shared across transports on purpose: a client's rate limit must not reset
+/// because it switched transport, and the metrics are one server's.
 struct Server {
     zone_map: Arc<RwLock<Zones>>,
     rate_limiter: Arc<RateLimiter>,
@@ -443,73 +330,46 @@ struct Server {
     metrics: Arc<DnsMetrics>,
     /// Who may ask for a zone transfer. Empty by default, which refuses everyone.
     transfer_acl: Arc<TransferAcl>,
-    /// The TSIG keys we know. Holding one is an identity; an address is not.
     tsig_keys: Arc<TsigKeyring>,
     /// Bytes-per-second budget for UDP replies. Not applied to TCP: a query that
     /// completed a handshake has an address nobody can be reflecting at.
     response_limiter: Arc<ResponseLimiter>,
     /// The zones we replicate, so a NOTIFY can be told from a plausible one.
     secondaries: Secondaries,
-    /// What changed between the versions of each zone we have held, so an IXFR
-    /// can answer with the difference rather than the whole zone. Derived from
-    /// the zone map, so the two are only ever updated together.
+    /// Per-zone change history, so an IXFR can answer with the difference.
+    /// Derived from the zone map, so the two are only updated together.
     deltas: Arc<RwLock<DeltaLog>>,
-    /// What a dynamic UPDATE needs beyond what a query needs. `None` on a server
-    /// with no writable zone source, where every UPDATE is refused.
+    /// `None` on a server with no writable zone source: every UPDATE refused.
     updates: Arc<UpdateHandling>,
-    /// Where the delta log is persisted. Carried here so `Server::served` can
-    /// hand `install_zone` the whole group rather than three quarters of it.
     journal: Option<Arc<Journal>>,
 }
 
 /// What answering a dynamic UPDATE (RFC 2136) needs beyond what a query needs.
 ///
-/// **Persisting the result is a precondition for serving an UPDATE at all, not
-/// a later refinement**, and the reason is not the obvious one about restarts.
-/// The re-signing timer *reloads every zone from its file* — see
-/// [`ZoneSigning::resign_interval`], which explains why it must: the served
-/// serial is the file's plus a time term, so re-signing the in-memory copy would
-/// apply that derivation to its own output and compound the bump every cycle.
-/// A signed zone's in-memory edits are therefore discarded within one re-signing
-/// interval, with nothing logged and no error anywhere. An UPDATE that only
-/// changed the map would be a write the client was told had succeeded, which
-/// disappears on a timer.
-///
-/// So the flow is: apply to the zone *as the file has it*, write the file, sign
-/// what results, install that. The file stays the input to every derivation, and
-/// an UPDATE is the same shape as an operator editing the file and reloading —
-/// which is the shape everything else here is already built around.
+/// The update must reach the *file*, not just the map: the re-signing timer
+/// reloads every zone from its file (see [`ZoneSigning::resign_interval`]), so
+/// an in-memory-only edit is discarded within one re-signing interval with
+/// nothing logged. The flow is apply to the zone as the file has it, write the
+/// file, sign the result, install that.
 struct UpdateHandling {
-    /// Where the zone files are, for reading a zone back and writing it out.
-    /// `None` when the server was given no source it can write (a secondary's
-    /// replicated zones are the master's copy and are not ours to edit).
+    /// `None` when the server has no source it may write — a secondary's
+    /// replicated zones are the master's copy.
     source: Option<ZoneSource>,
-    /// The signing policy, so the installed version is signed the way a loaded
-    /// one would be.
+    /// So the installed version is signed the way a loaded one would be.
     signing: Option<Arc<ZoneSigning>>,
-    /// Serializes the read-modify-write, which RFC 2136 §3.7 requires: "the
-    /// server must ensure atomicity with respect to other (concurrent) UPDATE or
-    /// QUERY transactions", and concurrent updates touching the same names "must
-    /// be serialized".
+    /// Serializes the read-modify-write, which RFC 2136 §3.7 requires.
     ///
-    /// One lock for every zone rather than one per zone, because two UPDATEs at
-    /// once is not a workload this has — and a lock that is only ever contended
-    /// by a thing that does not happen is a lock whose granularity nobody should
-    /// be paying attention to. It is held across file I/O and a signing run, so
-    /// it is a `tokio::Mutex` and not a `std` one (`CLAUDE.md` §9).
+    /// One lock for all zones rather than one per zone: two concurrent UPDATEs
+    /// is not a workload this has. Held across file I/O and a signing run, so
+    /// `tokio::Mutex` and not a `std` one.
     applying: tokio::sync::Mutex<()>,
 }
 
 impl UpdateHandling {
     /// A server that refuses every UPDATE.
     ///
-    /// `#[cfg(test)]` because `serve` always has a zone source to hand and so
-    /// always builds the configured form. The `None` case is still worth
-    /// carrying rather than making the field non-optional: it is what the
-    /// refusal branch in `answer_update` is *for*, and a shape that made it
-    /// unrepresentable would delete a check that stops an UPDATE being applied
-    /// to memory alone. `an_update_is_refused_without_a_writable_source` is the
-    /// test that keeps it honest.
+    /// `#[cfg(test)]`: `serve` always has a zone source. The `None` case still
+    /// drives the refusal branch in `answer_update`.
     #[cfg(test)]
     fn disabled() -> Self {
         UpdateHandling {
@@ -520,12 +380,10 @@ impl UpdateHandling {
     }
 }
 
-/// The policy knobs `serve` applies, grouped because they all come from the
-/// command line and mean nothing to each other.
+/// The policy knobs `serve` applies.
 ///
-/// A struct rather than four more parameters: they are two `u32`s and two
-/// address-shaped things, so a positional call is one edit away from swapping
-/// the response budget for the query rate and nothing catching it.
+/// A struct rather than more positional parameters: two `u32`s and two
+/// address-shaped things are one edit away from being swapped silently.
 struct ServePolicy {
     transfer_acl: TransferAcl,
     tsig_keys: TsigKeyring,
@@ -542,33 +400,23 @@ struct ServePolicy {
     readiness: Readiness,
     /// What a dynamic UPDATE needs; refuses everything when unconfigured.
     updates: Arc<UpdateHandling>,
-    /// Where the delta log is persisted, if anywhere. Carried through here
-    /// rather than as a ninth argument to `serve` — clippy objects at seven and
-    /// is right for the reason `CLAUDE.md` §14 gives.
+    /// Where the delta log is persisted, if anywhere.
     journal: Option<Arc<Journal>>,
     /// The control socket, and what a `reload` on it pokes.
     control: ControlPolicy,
 }
 
 /// Where the control socket lives and how it asks for a reload.
-///
-/// The sender is here rather than beside `zone_map` because it exists only for
-/// this: it is the control channel's end of the maintenance task's queue, and a
-/// server with no control socket never uses it.
 #[cfg_attr(not(unix), allow(dead_code))]
 struct ControlPolicy {
     socket: Option<PathBuf>,
     reloads: mpsc::Sender<ReloadTrigger>,
-    /// Zones this server replicates, so `status` can say `secondary` from
-    /// configuration rather than guessing it from an absent timestamp — which
-    /// is also what a primary has.
+    /// Zones this server replicates, so `status` says `secondary` from
+    /// configuration rather than guessing from an absent timestamp, which a
+    /// primary also has.
     replicated: Vec<String>,
-    /// When the process started, for `status`'s uptime line.
-    ///
-    /// Taken in `main` rather than here: `serve` runs after every zone has been
-    /// loaded, signed and verified, which on a big set is the bulk of a start.
-    /// An uptime that began when the sockets bound would quietly under-report
-    /// exactly the servers whose starts are worth asking about.
+    /// For `status`'s uptime. Taken in `main`, not here: loading and signing
+    /// every zone happens before `serve` and is the bulk of a big start.
     started: Instant,
 }
 
@@ -594,17 +442,14 @@ async fn serve(
         journal,
         control,
     } = policy;
-    // Floored, not refused: `--udp-workers 0` is a server that binds the UDP
-    // socket and answers nothing on it, which is the same class of mistake as
-    // the zero burst that refused every query (`CLAUDE.md` §14).
+    // Floored, not refused: `--udp-workers 0` would bind the socket and answer
+    // nothing on it. A mistyped knob should be wrong, not fatal.
     let udp_workers = udp_workers.max(1);
     let transfers = if transfer_acl.is_empty() && tsig_keys.is_empty() {
         "refused (no --allow-transfer, no --tsig-key)".to_string()
     } else {
-        // The per-key scope is spelled out rather than counted. A key that may
-        // transfer every zone is a policy decision, and it used to be the *only*
-        // thing a key could mean — an operator upgrading needs to be able to see
-        // which of their keys are still that wide without reading a changelog.
+        // Per-key scope spelled out, not counted: an unscoped key transfers
+        // every zone, and that has to be visible without reading the config.
         format!(
             "allowed for {} address rule(s) and {} key(s){}",
             transfer_acl.len(),
@@ -621,12 +466,9 @@ async fn serve(
     } else {
         format!("{response_rate} bytes/s per client")
     };
-    // Printed at startup on purpose. The old limit was hardcoded at ~10 q/s and
-    // dropped over it *silently* — no REFUSED, no SERVFAIL, nothing on the wire —
-    // so an operator debugging the resulting blackhole had no way to learn the
-    // limit existed, let alone what it was. Silence remains the right answer to a
-    // flood (a reply to a spoofed source is what an amplifier sends), which is
-    // exactly why the number has to be visible somewhere else.
+    // Printed at startup: over-limit queries are dropped silently — replying to
+    // a spoofed source is what an amplifier does — so the number has to be
+    // visible somewhere else.
     let query_limit_note = if query_limit.tokens_per_window == 0 {
         "off".to_string()
     } else {
@@ -643,10 +485,8 @@ async fn serve(
     };
 
     // Bind everything before announcing anything, so a port conflict fails here
-    // rather than after one transport is already up — the metrics listener
-    // included, since a typo in `--metrics-listen` should stop the server the
-    // same way a typo in `--port` does rather than leave it running without the
-    // observability the operator asked for.
+    // rather than after one transport is up. The metrics listener included: a
+    // typo in `--metrics-listen` must stop the start, not silently disable it.
     let socket = Arc::new(UdpSocket::bind(addr).await?);
     let listener = TcpListener::bind(addr).await?;
     let metrics_listener = match &metrics_listen {
@@ -657,9 +497,8 @@ async fn serve(
         ),
         None => None,
     };
-    // Same rule for the control socket: a path that cannot be bound — a
-    // directory that does not exist, or another server already there — stops the
-    // start rather than leaving a server nobody can ask anything.
+    // Same rule for the control socket: a path that cannot be bound stops the
+    // start.
     #[cfg(unix)]
     let control_listener = match &control.socket {
         Some(path) => Some(control::bind(path)?),
@@ -684,10 +523,8 @@ async fn serve(
         updates,
         journal,
     });
-    // INFO, and the default level is INFO so it is seen: `CLAUDE.md` §14 —
-    // the effective policy is printed at startup because a control nobody can
-    // observe is a control nobody can debug. `--quiet` silences it, which is an
-    // operator saying they do not want it rather than a default hiding it.
+    // The effective policy, at the default level: a control nobody can observe
+    // is a control nobody can debug.
     tracing::info!(
         "rdnsd listening on {addr} (UDP+TCP), zone transfer: {transfers}, \
          response budget: {budget}, query rate: {query_limit_note}, \
@@ -702,12 +539,8 @@ async fn serve(
             None => "off (--control-socket)".to_string(),
         }
     );
-    // Listening is not the same as serving, and this is the one moment where the
-    // difference is invisible from outside: the sockets are up and some zones are
-    // not. Said out loud for `CLAUDE.md` §14's reason — a gate nobody can observe
-    // is a gate nobody can debug — including the case where the answer is
-    // nowhere, because `--metrics-listen` is off and `/readyz` is the only way to
-    // ask.
+    // Listening is not serving: the sockets are up and some zones are not, which
+    // is invisible from outside unless `/readyz` is reachable.
     let still_waiting = readiness.pending();
     if !still_waiting.is_empty() {
         tracing::info!(
@@ -721,18 +554,13 @@ async fn serve(
         );
     }
 
-    // A `JoinSet` rather than two `JoinHandle`s in a `select!`. The old shape
-    // selected over the handles and **dropped the loser**, and dropping a
-    // `JoinHandle` detaches the task rather than cancelling it — so `main`
-    // returned while the other transport was still reading, and every reply
-    // still queued in a per-connection `mpsc` went nowhere. `join_next` is
-    // cancel-safe, so the same first-one-wins shape now leaves both tasks
-    // owned and joinable.
+    // `JoinSet`, not two `JoinHandle`s in a `select!`: dropping a `JoinHandle`
+    // detaches the task rather than cancelling it. `join_next` is cancel-safe
+    // and leaves both tasks owned.
     let mut loops = JoinSet::new();
-    // The UDP workers are peers, not a supervisor and its children: each one
-    // receives from the shared socket and answers inline, so they belong in the
-    // same `JoinSet` as the accept loops and get the same treatment — the first
-    // one to stop for a reason other than the signal ends the process.
+    // Workers are peers: each receives from the shared socket and answers
+    // inline, so the first to stop for a reason other than the signal ends the
+    // process, as for the accept loops.
     for _ in 0..udp_workers {
         loops.spawn(udp_loop(
             socket.clone(),
@@ -747,9 +575,8 @@ async fn serve(
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
-    // The scrape endpoint is a listener like the others: if it dies, the process
-    // does. A server whose metrics silently stopped is a server nobody is
-    // watching, which is worse than one that is plainly down.
+    // A listener like the others: if it dies, the process does. A server whose
+    // metrics stopped is one nobody is watching.
     if let Some(metrics_listener) = metrics_listener {
         loops.spawn(metrics_server::serve(
             metrics_listener,
@@ -759,10 +586,7 @@ async fn serve(
             shutdown.busy(),
         ));
     }
-    // And so is the control socket, for the stronger version of the same
-    // reason: an operator who reaches for it is already having a bad day, and a
-    // control channel that died quietly is one they will reach for and find
-    // silent.
+    // And the control socket, for the same reason.
     #[cfg(unix)]
     if let Some(control_listener) = control_listener {
         let ControlPolicy {
@@ -792,8 +616,8 @@ async fn serve(
     }
 
     // Neither loop returns in normal operation. Whichever ends first ends the
-    // process — a server answering on one transport and not the other is worse
-    // than one that is plainly down — but it ends it *cooperatively* now.
+    // process: answering on one transport and not the other is worse than being
+    // plainly down.
     let mut failure: Option<anyhow::Error> = None;
     tokio::select! {
         joined = loops.join_next() => {
@@ -805,19 +629,17 @@ async fn serve(
     }
 
     shutdown.begin();
-    // Both loops observe the stop and return promptly. Awaiting them is what
-    // makes "stopped accepting" true before the drain starts counting.
+    // Awaiting them is what makes "stopped accepting" true before the drain
+    // starts counting.
     while let Some(joined) = loops.join_next().await {
         if failure.is_none() {
             failure = listener_failure(joined);
         }
     }
 
-    // Everything accepted before the stop is still running: a TCP connection
-    // mid-AXFR, a UDP answer being built, a NOTIFY waiting on a peer, a
-    // secondary part-way through writing a zone file. This is the wait for
-    // them, and a zone transfer cut mid-stream is exactly what it is for —
-    // a client cannot tell a truncated AXFR from a complete one.
+    // Wait for work accepted before the stop. A client cannot tell a truncated
+    // AXFR from a complete one, so cutting one mid-stream is the case this is
+    // for.
     shutdown.drain_reporting().await;
 
     match failure {
@@ -826,10 +648,7 @@ async fn serve(
     }
 }
 
-/// How a finished listener task is reported, in one place because `serve` reads
-/// it twice — once from the `select!` and once while joining the rest.
-///
-/// A cancelled task is not a failure: it is a task that was told to stop.
+/// How a finished listener task is reported. A cancelled task is not a failure.
 fn listener_failure(
     joined: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
 ) -> Option<anyhow::Error> {
@@ -850,25 +669,22 @@ async fn tcp_loop(
 ) -> Result<(), std::io::Error> {
     let permits = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
     loop {
-        // Stop *accepting* on shutdown; the connections already open are drained
-        // by their own tasks below. `accept` is cancel-safe, so losing this race
-        // drops nothing — the connection simply stays in the kernel's backlog and
-        // the peer retries against whatever replaces us.
+        // Stop accepting on shutdown; open connections drain in their own tasks.
+        // `accept` is cancel-safe, so a lost race leaves the connection in the
+        // kernel's backlog.
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => accepted?,
             _ = stop.wait() => return Ok(()),
         };
-        // Back-pressure on accept: at the ceiling we simply stop taking new
-        // connections until one finishes, rather than spawning unboundedly.
-        // The semaphore is never closed, so this only fails if we drop it.
+        // Back-pressure on accept rather than unbounded spawning. The semaphore
+        // is never closed, so this only fails if we drop it.
         let Ok(permit) = permits.clone().acquire_owned().await else {
             continue;
         };
         let server = server.clone();
         let stop = stop.clone();
-        // The connection claims the drain for as long as it runs, which is what
-        // keeps an in-flight AXFR from being cut mid-stream: a client cannot
-        // tell a truncated transfer from a complete one.
+        // Claim the drain for the connection's life: a client cannot tell a
+        // truncated AXFR from a complete one.
         let busy = busy.clone();
         tokio::spawn(async move {
             server.serve_connection(stream, peer, stop).await;
@@ -881,30 +697,21 @@ async fn tcp_loop(
 impl Server {
     /// Serve one connection until it goes idle, closes, or misbehaves.
     ///
-    /// A connection carries any number of queries (RFC 7766 §6.2.1), and they
-    /// are answered **concurrently**: reading, answering and writing are three
-    /// separate jobs, so one slow query cannot stall the queries behind it
-    /// (§6.2.1.1).
-    ///
-    /// On shutdown it stops reading *new* queries and lets the ones already
-    /// accepted finish and reach the wire. That asymmetry is the whole point:
-    /// cutting a connection between queries costs the client a retry, and
-    /// cutting it mid-answer costs an AXFR client a zone it believes is complete.
+    /// Queries on one connection are answered concurrently, so a slow one does
+    /// not stall those behind it (RFC 7766 §6.2.1.1). On shutdown, reading stops
+    /// but queries already accepted finish and reach the wire.
     async fn serve_connection(self: Arc<Self>, stream: TcpStream, peer: SocketAddr, stop: Stop) {
         let (mut reader, mut writer) = stream.into_split();
         let (tx, mut rx) = mpsc::channel::<Reply>(MAX_INFLIGHT_PER_CONNECTION);
 
-        // One task owns the write half. Answers may complete out of order —
-        // RFC 7766 §6.2.1.1 allows that, and clients match on the transaction
-        // id — but two framed messages must never interleave on the wire, so
-        // every reply funnels through here.
+        // One task owns the write half: replies may complete out of order
+        // (RFC 7766 §6.2.1.1), but two framed messages must never interleave.
         let writer_logger = self.logger.clone();
         let writer_task = tokio::spawn(async move {
             while let Some(reply) = rx.recv().await {
                 let Reply::Frame(framed) = reply else {
-                    // See `Reply::Abort`: dropping the write half is how a peer
-                    // is told that the transfer it is halfway through will not
-                    // be finished.
+                    // `Reply::Abort`: dropping the write half tells the peer its
+                    // half-finished transfer will not be completed.
                     break;
                 };
                 if let Err(e) = writer.write_all(&framed).await {
@@ -917,19 +724,12 @@ impl Server {
         let in_flight = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_CONNECTION));
 
         loop {
-            // DNS over TCP frames every message with a 2-byte big-endian length
-            // prefix (RFC 1035 §4.2.2). Read the prefix first, then exactly that
-            // many bytes — a single `read` can return a short or coalesced chunk.
-            //
-            // Between messages the peer may legitimately be idle, so a timeout
-            // here (like EOF) is an ordinary end to a connection, not an error.
-            //
-            // A shutdown between messages ends the connection here, which is the
-            // cheapest moment for it: the peer has committed to nothing, so it
-            // costs one reconnect and no answer. `read_exact` is not cancel-safe
-            // in general — it can consume bytes before being dropped — but the
-            // only thing we lose here is a length prefix on a connection we are
-            // closing anyway.
+            // A 2-byte big-endian length prefix frames each message
+            // (RFC 1035 §4.2.2); a single `read` can be short or coalesced. Idle
+            // between messages is ordinary, so a timeout here ends the connection
+            // like EOF. The shutdown check sits here because the peer has
+            // committed to nothing yet: `read_exact` is not cancel-safe, but a
+            // lost length prefix on a connection we are closing costs nothing.
             let mut len_buf = [0u8; 2];
             let read = tokio::select! {
                 r = tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut len_buf)) => r,
@@ -971,25 +771,19 @@ impl Server {
             let server = self.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
-                // A reply is a sequence, because a zone transfer is: several
-                // messages that must reach the wire in the order they were built.
-                // One sender keeps that order; another query's reply may land
-                // between them, which is legal — a client demultiplexes on the
-                // transaction id.
-                //
-                // `answer` sends rather than returning a `Vec` so that a transfer
-                // can hand over one envelope at a time (`TODO.md` #24c). The
-                // channel is bounded, so a slow client back-pressures the
-                // envelope after the one it is still reading instead of the whole
-                // zone being built ahead of it.
+                // `answer` sends rather than returning a `Vec`, so a transfer
+                // hands over one envelope at a time and a slow client
+                // back-pressures the next instead of the whole zone being built
+                // ahead of it. One sender per reply keeps a transfer's messages in
+                // order; another query's reply may land between them, which is
+                // legal.
                 server.answer(&packet, peer, &tx).await;
                 drop(permit);
             });
         }
 
-        // Dropping our sender lets the writer drain the replies still in flight
-        // — the clones held by running tasks keep the channel open — and then
-        // exit on its own.
+        // Dropping our sender lets the writer drain what is still in flight — the
+        // clones held by running tasks keep the channel open — and then exit.
         drop(tx);
         let _ = writer_task.await;
     }
@@ -997,10 +791,9 @@ impl Server {
     /// Answer one query, sending each length-prefixed message to the connection's
     /// writer as it is built.
     ///
-    /// A sequence rather than one message, because an AXFR response is one
-    /// (RFC 5936 §2.2) — and sent rather than returned, because a transfer of a
-    /// large zone must not exist all at once (`TODO.md` #24c). Sending nothing is
-    /// how a query earns no response at all.
+    /// A sequence, because an AXFR response is one (RFC 5936 §2.2), and sent
+    /// rather than returned so a large zone never exists all at once. Sending
+    /// nothing is how a query earns no response at all.
     async fn answer(&self, packet: &[u8], peer: SocketAddr, out: &mpsc::Sender<Reply>) {
         let ip = peer.ip();
 
@@ -1012,9 +805,8 @@ impl Server {
 
         let validation = self.validator.validate_packet(packet, true);
         if !validation.is_valid() {
-            // `map_or_else` builds a `String` for the "unknown error" case and
-            // `to_string()`s the error for the other, per packet — inside a
-            // macro that does not evaluate its arguments unless DEBUG is on.
+            // Allocates per packet, but the macro does not evaluate its arguments
+            // unless DEBUG is on.
             bad_request!(
                 self.logger,
                 ip,
@@ -1027,12 +819,9 @@ impl Server {
             return;
         }
 
-        // `Request` is the door: it parses, and it refuses QR=1. Both halves of
-        // that used to be written out here and only half of them was written out
-        // on the UDP path (`rdns::validation::Request`, `TODO.md` #14b).
-        // `AdmissionCheck` deliberately accepts QR=1 — it runs on both
-        // directions of the wire — so the check belongs *here*, where we know
-        // this packet arrived at a listening socket.
+        // `Request` is the door: it parses and it refuses QR=1. `AdmissionCheck`
+        // accepts QR=1 on purpose — it runs on both directions of the wire — so
+        // the check belongs here, where we know the packet reached a listener.
         let msg = match Request::from_bytes(packet) {
             Ok(msg) => msg,
             Err(RequestError::Wire(_)) => {
@@ -1041,8 +830,7 @@ impl Server {
             }
             Err(RequestError::NotAQuestion) => {
                 // Silence, not a reply: answering turns a pair of servers, or one
-                // spoofed datagram, into a packet loop, and there is nothing to
-                // answer because the sender did not ask anything.
+                // spoofed datagram, into a packet loop.
                 bad_request!(
                     self.logger,
                     ip,
@@ -1059,18 +847,15 @@ impl Server {
             self.metrics.track_query_type(qtype);
         }
 
-        // TSIG before anything else that could answer: a signed message is
-        // either authentic or it is not, and a server that answered the question
-        // first and checked the signature afterwards would be answering questions
-        // for whoever asked (RFC 8945 §5.2).
+        // TSIG before anything that could answer (RFC 8945 §5.2): checking the
+        // signature afterwards means answering whoever asked.
         let now = tsig::now();
         let mut session = match tsig::check_request(packet, &self.tsig_keys, now) {
             TsigCheck::Unsigned => None,
             TsigCheck::Verified(session) => Some(session),
             TsigCheck::Rejected(rejection) => {
                 // WARN, not DEBUG: a key that does not verify is either a
-                // misconfiguration somebody is debugging from the other end or
-                // somebody trying keys, and both are worth seeing.
+                // misconfiguration or somebody trying keys.
                 serving_error!(
                     self.logger,
                     ip,
@@ -1091,9 +876,8 @@ impl Server {
             }
         };
 
-        // A transfer is answered here rather than in `make_response`: it is a
-        // sequence of messages, it is gated on an ACL, and it is the only kind of
-        // query whose answer can be the entire zone.
+        // Answered here rather than in `make_response`: a sequence of messages,
+        // gated on an ACL, and the answer can be the whole zone.
         if matches!(
             msg.queries.first().map(|q| q.qtype),
             Some(Qtype::AXFR) | Some(Qtype::IXFR)
@@ -1103,10 +887,8 @@ impl Server {
             return;
         }
 
-        // An UPDATE is answered here for the same reasons a transfer is, and one
-        // more: it is the only request that changes what this server says next,
-        // so it must not go anywhere near `make_response`, which holds a read
-        // guard on the zone map that installing the result would deadlock
+        // Likewise, plus: an UPDATE installs a new zone, and `make_response`
+        // holds a read guard on the zone map that installing would deadlock
         // against.
         if msg.opcode == OpCode::Update {
             for framed in self.answer_update(&msg, peer, session.as_mut()).await {
@@ -1115,8 +897,7 @@ impl Server {
             return;
         }
 
-        // Hold the zone lock only as long as it takes to build and serialize the
-        // response — never across a socket write, or a SIGHUP zone reload would
+        // Never hold the zone lock across a socket write: a SIGHUP reload would
         // queue behind a slow client for the life of its connection.
         let bytes = {
             let zones = self.zone_map.read().await;
@@ -1136,9 +917,8 @@ impl Server {
             }
         };
 
-        // A signed question earns a signed answer, and it is the same session,
-        // so the reply's MAC covers the request's — which is what stops a reply
-        // to one question being replayed as the reply to another.
+        // Same session, so the reply's MAC covers the request's: that is what
+        // stops one question's reply being replayed as another's.
         match session.as_mut() {
             Some(session) => match session.sign(bytes, now) {
                 Ok(signed) => {
@@ -1154,15 +934,12 @@ impl Server {
 
     /// Answer an AXFR: the whole zone, or a refusal.
     ///
-    /// Every attempt is logged, allowed or not. This is the one request where
-    /// knowing it happened matters as much as whether it was permitted — a
-    /// refused one is a probe, and an allowed one is a copy of the zone leaving
-    /// the building.
+    /// Every attempt is logged, allowed or not: a refused one is a probe, an
+    /// allowed one is a copy of the zone leaving the building.
     ///
-    /// **Written to `out` one envelope at a time**, which is `TODO.md` #24c: the
-    /// zone used to be materialized as records, again as messages and again as
-    /// frames, all three before the first byte went out. What that costs in
-    /// failure handling is on [`Server::abandon_transfer`].
+    /// Written to `out` one envelope at a time, so the zone is never
+    /// materialized whole. What that costs in failure handling is on
+    /// [`Server::abandon_transfer`].
     async fn answer_transfer(
         &self,
         msg: &DnsMessage,
@@ -1180,35 +957,22 @@ impl Server {
         let incremental = msg.queries.first().map(|q| q.qtype) == Some(Qtype::IXFR);
         let kind = if incremental { "IXFR" } else { "AXFR" };
 
-        // Two ways to be allowed, and they are not equivalent. A verified TSIG is
-        // proof that the peer holds a secret we gave it; an address is a claim the
-        // network makes on its behalf. Either grants the transfer, and which one
-        // did is worth writing down.
+        // Either a verified TSIG or an address rule grants the transfer, and an
+        // IXFR is gated identically because it may answer with the whole zone
+        // (RFC 1995 §4).
         //
-        // An IXFR is gated identically, and for the identical reason: it may
-        // *answer* with the whole zone (RFC 1995 §4), so a policy that let it
-        // through would be no policy at all.
-        // A key is not a licence to transfer everything. This used to ask only
-        // whether a session existed, so holding any key in the keyring
-        // transferred any zone and bypassed `--allow-transfer` entirely.
+        // A verified key says who, not what: authorize it against the apex, and
+        // do so before the zone is looked up or any message built. A key with no
+        // zone list still authorizes everything (`TsigKey::zones`).
         //
-        // Checked before the zone is looked up and before any message is built.
-        // A key with no zone list still authorizes everything; see
-        // `TsigKey::zones` for why, and the startup banner for how an operator
-        // finds out.
-        //
-        // A refused authenticated request is REFUSED, not NOTAUTH: the peer
-        // proved who it is and the answer is no, which is a policy decision about
-        // this server rather than a statement about the zone's authority.
+        // REFUSED, not NOTAUTH: the peer proved who it is and the answer is no,
+        // which is policy rather than a claim about the zone's authority.
         let apex = absolute_name(&qname);
         let unauthorized = session
             .as_ref()
             .filter(|s| !s.may_transfer(&apex))
             .map(|s| s.key_name().to_string());
         if let Some(key_name) = unauthorized {
-            // One line, not two. This said the same thing through `log_error`
-            // and again through `println!`, so an operator grepping for a
-            // refused transfer found it twice on two different streams.
             serving_error!(
                 self.logger,
                 ip,
@@ -1232,22 +996,16 @@ impl Server {
             return;
         }
 
-        // A transfer names a zone apex, not any name within it: transferring
-        // example.com. because www.example.com. was asked for would hand over a
-        // zone nobody named. So this is an exact match on the origin, not the
-        // enclosing-zone lookup an ordinary query does.
+        // An exact match on the origin, not the enclosing-zone lookup an ordinary
+        // query does: transferring example.com. because www.example.com. was
+        // asked for would hand over a zone nobody named.
         //
-        // **A snapshot, not the guard.** What follows writes a whole zone to a
-        // socket, and the lock may not be held across that (`CLAUDE.md` §9) — but
-        // the transfer still has to be of one version throughout, since half of
-        // one and half of the next is a zone that never existed. `Zones::snapshot`
-        // is both: an `Arc` of the version current now, which reloads replace the
-        // map around rather than mutate (`TODO.md` #24c).
+        // A snapshot, not the guard: the lock may not be held across writing a
+        // whole zone to a socket, but the transfer must still be of one version
+        // throughout. `Zones::snapshot` is an `Arc` of the version current now,
+        // which reloads replace rather than mutate.
         let (zone, prepared) = {
             let zones = self.zone_map.read().await;
-            // `apex` is the one computed above, sixteen lines up: it was derived
-            // twice from the same `qname` before `absolute_name` borrowed
-            // (`TODO.md` #19c).
             let Some(zone) = zones.snapshot(&apex) else {
                 tracing::info!(peer = %ip, "{kind} of {qname}: NOTAUTH (not a zone served here)");
                 self.send_transfer_error(msg, ResponseCode::NotAuthorized, ip, session, out)
@@ -1257,10 +1015,8 @@ impl Server {
             if !incremental {
                 (zone, Vec::new())
             } else {
-                // The delta log is read under the zone lock, so the increments
-                // and the zone they are increments *of* are the same version.
-                // Taken separately, a reload between the two reads would produce
-                // a chain that does not match the SOA framing it is wrapped in.
+                // Read under the zone lock, so the increments and the zone they
+                // are increments of are the same version.
                 let deltas = self.deltas.read().await;
                 let built = ixfr_response(msg, &zone, &deltas).and_then(|response| {
                     match &response {
@@ -1276,9 +1032,9 @@ impl Server {
                             "IXFR of {qname}: sending the whole zone instead ({why})"
                         ),
                     }
-                    // A full transfer is left unbuilt on purpose: it is the whole
-                    // zone, which is what the envelope iterator below exists not
-                    // to materialize. Everything else is bounded by the delta log.
+                    // A full transfer is left unbuilt: the envelope iterator below
+                    // exists not to materialize the zone. The rest is bounded by
+                    // the delta log.
                     match response {
                         IxfrResponse::FullTransfer { .. } => Ok(Vec::new()),
                         other => other.messages(msg, &zone),
@@ -1303,19 +1059,14 @@ impl Server {
         };
 
         // One envelope at a time: built, serialized, signed, framed and handed to
-        // the writer before the next one exists. The whole point of #24c, and the
-        // reason the sequence is an iterator — a million-record zone used to be
-        // materialized as records, again as messages, and again as frames, all
-        // three of them before the first byte reached the socket.
-        // `+ Send`, because this runs in a spawned task: the iterator is alive
-        // across the `await` on every envelope handed to the writer.
+        // the writer before the next one exists — hence an iterator rather than a
+        // materialized zone. `+ Send` because it stays alive across the `await`
+        // on every envelope, in a spawned task.
         let envelopes: Box<dyn Iterator<Item = DnsMessage> + Send + '_> = if prepared.is_empty() {
             match axfr_envelopes(msg, &zone) {
                 Ok(envelopes) => Box::new(envelopes),
                 Err(e) => {
-                    // Nothing has been sent yet, so this is still an ordinary
-                    // error response: the zone has no apex SOA and there is
-                    // nothing to open a transfer with.
+                    // Nothing sent yet, so an ordinary error response still works.
                     serving_error!(self.logger, ip, "{kind} of {qname}: {e}");
                     self.send_transfer_error(msg, ResponseCode::ServerFailure, ip, session, out)
                         .await;
@@ -1362,14 +1113,9 @@ impl Server {
                 },
                 None => bytes,
             };
-            // Envelopes target 16 KiB (`AXFR_TARGET_MESSAGE_SIZE`), so an
-            // unframeable one is not the exposure #17 was filed for — but it is
-            // the same check, and a client reading envelopes until the closing
-            // SOA would otherwise wait for one that is never coming.
             if !send_framed(out, &bytes).await {
                 // Either the frame is impossible or the peer hung up. The first
-                // needs the connection closed; the second closed it already, and
-                // telling a writer that is gone to stop costs nothing.
+                // needs the connection closed; the second closed it already.
                 self.abandon_transfer(msg, ip, None, sent, out).await;
                 return;
             }
@@ -1391,14 +1137,10 @@ impl Server {
 
     /// Give up on a transfer, in whichever of the two ways is still available.
     ///
-    /// Nothing sent yet means the client can still be told why, as an error
-    /// response. Once an envelope has gone there is no way back — an error
-    /// response would be read as another envelope — so the connection is closed,
-    /// and the missing closing SOA is what tells the client that what it holds is
-    /// not a zone (RFC 5936 §2.2). That is the one behaviour `TODO.md` #24c
-    /// changed: the old code built every frame before sending any, so a failure
-    /// was always of the first kind — at the price of the zone existing three
-    /// times over before the first byte went out.
+    /// Nothing sent yet means an error response. Once an envelope has gone there
+    /// is no way back — an error response would be read as another envelope — so
+    /// the connection is closed, and the missing closing SOA tells the client
+    /// what it holds is not a zone (RFC 5936 §2.2).
     async fn abandon_transfer(
         &self,
         msg: &DnsMessage,
@@ -1436,22 +1178,11 @@ impl Server {
         }
     }
 
-    /// One framed error response to a transfer request, **signed if the request
-    /// was**.
+    /// One framed error response to a transfer request, signed if the request
+    /// was.
     ///
-    /// RFC 8945 §5.3: a response to a request whose TSIG verified is itself
-    /// signed, and that includes an error response. This did not sign, and the
-    /// consequence is the one this codebase keeps running into — the client
-    /// cannot tell the difference between two things: a server that refused it,
-    /// and a reply that was tampered with in flight. `dns.query.xfr` reports the
-    /// unsigned REFUSED as "the TSIG record is malformed", which sends whoever
-    /// is debugging it after a key mismatch that does not exist.
-    ///
-    /// Found by writing a test for the *authorization* fix below and being told
-    /// the wrong thing by the client — the refusal was working, the reply was
-    /// simply unreadable. It applies to every error on this path, not just that
-    /// one: NOTAUTH for a zone we do not serve, SERVFAIL for a transfer that
-    /// would not build, and a signing failure.
+    /// RFC 8945 §5.3: an error response to a verified request is signed too.
+    /// Unsigned, a client cannot tell a refusal from a tampered reply.
     fn transfer_error(
         &self,
         msg: &DnsMessage,
@@ -1467,9 +1198,8 @@ impl Server {
             Some(session) => match session.sign(bytes, current_unix_timestamp()) {
                 Ok(signed) => signed,
                 Err(e) => {
-                    // Nothing useful left to send: an unsigned error is what we
-                    // were trying not to produce, so say so here rather than
-                    // emitting one anyway.
+                    // Send nothing: an unsigned error is what signing exists to
+                    // avoid producing.
                     serving_error!(self.logger, ip, "signing an error response failed: {e}");
                     return Vec::new();
                 }
@@ -1481,16 +1211,13 @@ impl Server {
 
     /// Answer a dynamic UPDATE (RFC 2136).
     ///
-    /// Answered here rather than in `make_response` for the same reason a
-    /// transfer is: it is gated on a permission, it touches the disk, and it is
-    /// the only request that *changes* what this server will say next.
+    /// Answered here rather than in `make_response`: gated on a permission, it
+    /// touches the disk, and it changes what this server says next.
     ///
-    /// The order of the checks is the RFC's and it is not arbitrary — each one
-    /// exists to keep the next from running. §3.1 reads the message, §3.1.1 asks
-    /// whether the zone is ours, §3.3 asks whether the requestor may write it,
-    /// §3.2 checks the prerequisites, and only then does §3.4 change anything.
-    /// Authorization before the zone is even loaded is `CLAUDE.md` §16's "check
-    /// before doing the work, not before sending it".
+    /// The check order is the RFC's, each one keeping the next from running:
+    /// §3.1 reads the message, §3.1.1 asks whether the zone is ours, §3.3
+    /// whether the requestor may write it, §3.2 checks the prerequisites, and
+    /// only then does §3.4 change anything.
     async fn answer_update(
         &self,
         msg: &DnsMessage,
@@ -1509,16 +1236,10 @@ impl Server {
         };
         let zone_name = absolute_name(&request.zone).into_owned();
 
-        // §3.3: "If the requestor does not have permission to perform these
-        // updates, the server may ... signal REFUSED to the requestor."
-        //
-        // **An unsigned UPDATE is refused outright**, with no address-based
-        // alternative. `--allow-transfer` exists because a transfer is a read
-        // and an address is a weak but real answer to "who is this"; a write is
-        // not something to hand out on the strength of a source address that
-        // UDP does not make anyone prove. A key is the only credential here, and
-        // it must be scoped: see `rdns::tsig::UpdatePolicy` for why that scope
-        // denies by default where the transfer scope permits.
+        // §3.3: no permission, REFUSED. An unsigned UPDATE is refused outright,
+        // with no address-based alternative: a write is not handed out on a
+        // source address UDP makes nobody prove. A key is the only credential,
+        // and it must be scoped (`rdns::tsig::UpdatePolicy`).
         let Some(session) = session else {
             serving_error!(
                 self.logger,
@@ -1537,18 +1258,12 @@ impl Server {
             return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
         }
 
-        // §3.1.1: "the ZNAME and ZCLASS are checked to see if the zone so named
-        // is one of this server's authority zones, else signal NOTAUTH".
+        // §3.1.1: a zone we are not an authority for is NOTAUTH — not the query
+        // path's REFUSED, because an UPDATE names the zone and asks whether we
+        // are its authority.
         //
-        // NOTAUTH and not REFUSED, which is the opposite of the *query* path's
-        // rule (`CLAUDE.md` §8: REFUSED for a zone we do not serve). The two are
-        // answering different questions — a query asks us to speak about a name,
-        // an UPDATE names the zone it belongs to and asks whether we are its
-        // authority — and RFC 2136 gives that its own code.
-        // Cloned rather than merely tested for, because the version being served
-        // is also what the re-signing carries signatures forward from. Taken in
-        // the one read guard so the answer to "do we serve it" and the copy the
-        // signer works against cannot be two different versions.
+        // Cloned, not merely tested for, and in the one read guard: "do we serve
+        // it" and the copy the signer works against must be the same version.
         let previous = {
             let zones = self.zone_map.read().await;
             zones.matching(&zone_name).cloned()
@@ -1558,14 +1273,10 @@ impl Server {
             return self.update_reply(msg, ResponseCode::NotAuthorized, ip, Some(session));
         };
 
-        // **A zone we replicate is not ours to rewrite.** It is the master's
-        // copy: the next refresh would transfer over the change, so the client
-        // would be told a write succeeded that has a timer on it. RFC 2136 §3.1
-        // is about being an authority for the zone, and a secondary's authority
-        // is delegated — an update belongs at the primary, which is what a
-        // client that gets this refusal will go and find.
-        // Folded through the same helper the table is keyed with, so the two
-        // cannot disagree (`TODO.md` #19a).
+        // A zone we replicate is the master's copy: the next refresh transfers
+        // over the change, so accepting it tells the client a write succeeded
+        // that has a timer on it. Folded through the helper the table is keyed
+        // with, so the two cannot disagree.
         if self
             .secondaries
             .contains_key(rdns::utils::absolute_lowered(&zone_name).as_ref())
@@ -1579,10 +1290,9 @@ impl Server {
             return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
         }
 
-        // A zone we serve but cannot write back is one we must not update: the
-        // change would live only in memory and be discarded by the next reload
-        // or re-signing run, having told the client it succeeded. See
-        // [`UpdateHandling`].
+        // A zone we cannot write back must not be updated: the change would live
+        // in memory only and be discarded by the next reload, having told the
+        // client it succeeded. See [`UpdateHandling`].
         let Some(source) = self.updates.source.as_ref() else {
             serving_error!(
                 self.logger,
@@ -1641,11 +1351,9 @@ impl Server {
                 tracing::info!(peer = %ip, "UPDATE of {zone_name}: {rejected}");
                 return self.update_reply(msg, rejected.rcode, ip, Some(session));
             }
-            // §3.4.2.1: "If any system failure ... occurs during the processing
-            // of this section, signal SERVFAIL to the requestor and undo all
-            // updates applied to the zone during this transaction." Nothing is
-            // installed on this path, so there is nothing to undo — the write is
-            // atomic and the map is untouched until it has succeeded.
+            // §3.4.2.1: a system failure is SERVFAIL with every applied update
+            // undone. Nothing to undo here — the write is atomic and the map is
+            // untouched until it succeeds.
             Err(UpdateFailure::System(e)) => {
                 serving_error!(self.logger, ip, "UPDATE of {zone_name} failed: {e:#}");
                 return self.update_reply(msg, ResponseCode::ServerFailure, ip, Some(session));
@@ -1653,9 +1361,8 @@ impl Server {
         };
 
         for ignored in &report.ignored {
-            // INFO and not DEBUG: RFC 2136 requires these be dropped while the
-            // UPDATE still succeeds, so the client is told nothing. If the log
-            // does not say it, nothing does.
+            // INFO: RFC 2136 has these dropped while the UPDATE still succeeds,
+            // so the client is told nothing and only the log can say it.
             tracing::info!(peer = %ip, "UPDATE of {zone_name}: ignored {ignored}");
         }
 
@@ -1672,9 +1379,8 @@ impl Server {
                     serial.map_or_else(|| "unknown".to_string(), |s| s.to_string())
                 );
             }
-            // Nothing changed, so nothing was written and nothing is installed.
-            // Still NOERROR: the UPDATE was well-formed, permitted, and its
-            // prerequisites held, which is success (§3.4.2.5).
+            // Nothing written, nothing installed, and still NOERROR: a
+            // well-formed permitted UPDATE whose prerequisites held (§3.4.2.5).
             None => tracing::info!(
                 peer = %ip,
                 "UPDATE of {zone_name} by key {}: nothing changed",
@@ -1698,11 +1404,8 @@ impl Server {
 
     /// A reply to an UPDATE, signed when the request was.
     ///
-    /// **Signed even when it is a refusal** (RFC 8945 §5.3), which is the bug
-    /// `CLAUDE.md` §16 records on the transfer path: an unsigned REFUSED leaves
-    /// the client unable to tell a policy decision from a tampered reply, and
-    /// dnspython reports it as a malformed TSIG, which sends the reader after a
-    /// key mismatch that does not exist.
+    /// Signed even when it is a refusal (RFC 8945 §5.3): unsigned, a client
+    /// cannot tell a policy decision from a tampered reply.
     fn update_reply(
         &self,
         msg: &DnsMessage,
@@ -1741,12 +1444,9 @@ impl Server {
 
 /// Why an UPDATE could not be applied, split by what the client is owed.
 ///
-/// Two variants because the caller branches on them and they are not the same
-/// answer: a prerequisite that did not hold carries the specific RCODE RFC 2136
-/// §3.2 assigns to its form, and everything else is §3.4.2.1's SERVFAIL. A
-/// single error type would have made the four §3.2 codes — which a client uses
-/// to tell "the name is not there" from "the name is there and this type is
-/// not" — indistinguishable from a full disk.
+/// A prerequisite that did not hold carries the RCODE RFC 2136 §3.2 assigns to
+/// its form; everything else is §3.4.2.1's SERVFAIL. One type would make those
+/// four codes indistinguishable from a full disk.
 enum UpdateFailure {
     Prerequisite(update::Rejected),
     System(anyhow::Error),
@@ -1759,15 +1459,9 @@ enum UpdateFailure {
 /// the client still gets NOERROR. See [`UpdateHandling`] for why the file rather
 /// than the copy in memory is what gets read and written.
 ///
-/// **The order is write-then-install, and it is the safe way round.** A crash
-/// between them loses nothing: the file holds the new version and the next load
-/// picks it up. The other order would serve a change that no longer existed
-/// after a restart, which is the one failure a client cannot detect — it was
-/// told the write succeeded, and the record was there when it looked.
-///
-/// The write is atomic (`rdns::persist`, via `write_zone_file`), so a reader —
-/// which is this same server on its next reload — sees the old file or the new
-/// one and never a mixture.
+/// Write then install: a crash between the two loses nothing, where the other
+/// order serves a change that a restart makes disappear. The write is atomic
+/// (`rdns::persist`), so the next reload sees one version or the other.
 #[allow(clippy::type_complexity)]
 fn apply_update_to_file(
     path: &Path,
@@ -1777,19 +1471,15 @@ fn apply_update_to_file(
     changes: &[update::Change],
     signing: Option<&ZoneSigning>,
 ) -> Result<(Option<Zone>, update::Applied), UpdateFailure> {
-    // The zone as the file has it: unsigned, and carrying the serial the
-    // operator's number line is on. Re-read rather than kept beside the served
-    // copy, so that an operator's edit since the last load is not silently
-    // reverted by the next UPDATE — the file is the source of truth for
-    // everything else here and this does not make it a second one.
+    // The zone as the file has it: unsigned, on the operator's serial. Re-read
+    // rather than taken from the served copy, so an edit since the last load is
+    // not silently reverted.
     let source = parse_zone_file_at(path, origin)
         .with_context(|| format!("re-reading {} to update it", path.display()))
         .map_err(UpdateFailure::System)?;
 
-    // §3.2, against the zone as stored. Checked against the *unsigned* zone
-    // deliberately: a prerequisite naming RRSIG or NSEC would otherwise be
-    // asserting on this server's signing configuration rather than on the
-    // operator's data, and the answer would change when signing was turned on.
+    // §3.2, against the unsigned zone: a prerequisite naming RRSIG or NSEC would
+    // otherwise assert on this server's signing configuration.
     update::check_prerequisites(&source, prerequisites).map_err(UpdateFailure::Prerequisite)?;
 
     let applied = update::apply(&source, changes);
@@ -1801,14 +1491,10 @@ fn apply_update_to_file(
         .with_context(|| format!("writing {} back after an update", path.display()))
         .map_err(UpdateFailure::System)?;
 
-    // Signed the way a load would sign it, from the file's serial — which is
-    // now the bumped one, so the served number moves too. `signed_serial` adds
-    // its time term rather than `max`ing it, which is what carries the +1
-    // through (see `rdns::update`'s module docs).
-    //
-    // Incrementally, against the version already being served: a full re-sign
-    // would give every RRSIG a new inception and expiration and put the whole
-    // zone into the next IXFR delta. See `ZoneSigning::sign_one_incrementally`.
+    // Signed as a load would sign it, from the file's now-bumped serial, so the
+    // served number moves too. Incrementally against the version being served:
+    // a full re-sign would reinception every RRSIG and put the whole zone into
+    // the next IXFR delta.
     let installed = match signing {
         Some(signing) => signing
             .sign_one_incrementally(previous, &applied.zone)
@@ -1818,29 +1504,19 @@ fn apply_update_to_file(
     Ok((Some(installed), applied))
 }
 
-/// A message with its RFC 1035 §4.2.2 length prefix, or nothing plus a log line.
-///
-/// The framing itself is `rdns::framed`, which is where the length check lives
-/// (`TODO.md` #17). This wrapper exists because every caller here is on a path
-/// that returns `Vec<Vec<u8>>` — a list of framed messages — and has no channel
-/// for an error: a reply that cannot be framed is a reply that cannot be sent,
-/// and the useful thing is that the operator can see why rather than that the
-/// caller can branch on it.
 /// What a connection's writer task can be handed.
 ///
-/// A transfer is answered one envelope at a time (`TODO.md` #24c), so a failure
-/// can now happen with part of the answer already on the wire. There is no way
-/// back from that: the client is mid-stream and an error response would be read
-/// as another envelope.
+/// A transfer is answered one envelope at a time, so a failure can happen with
+/// part of the answer already on the wire, where an error response would be
+/// read as another envelope.
 enum Reply {
     /// One length-prefixed message, to be written.
     Frame(Vec<u8>),
     /// Stop writing and close the connection.
     ///
-    /// EOF is the only thing left to say. A transfer is complete when its closing
-    /// SOA arrives (RFC 5936 §2.2), so a stream that ends before one is an
-    /// incomplete transfer the client must discard — and closing says so at once,
-    /// where falling silent would leave it waiting out its timeout.
+    /// A transfer is complete at its closing SOA (RFC 5936 §2.2), so a stream
+    /// that ends first is one the client must discard. Closing says so at once;
+    /// falling silent leaves it waiting out a timeout.
     Abort,
 }
 
@@ -1856,9 +1532,7 @@ fn frame(bytes: &[u8]) -> Option<Vec<u8>> {
     match rdns::framed(bytes) {
         Ok(framed) => Some(framed),
         Err(e) => {
-            // ERROR, not DEBUG: this means a client got no answer at all, and
-            // before the check existed it got a dropped connection instead with
-            // nothing anywhere saying why.
+            // ERROR, not DEBUG: a client got no answer at all.
             tracing::error!("could not frame a {}-octet reply: {e}", bytes.len());
             None
         }
@@ -1867,23 +1541,13 @@ fn frame(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// An empty TC=1 answer to `request`: the question echoed, no records.
 ///
-/// This is what a client over its response budget gets instead of the answer.
-/// It is smaller than the query that asked for it, so it is useless for
-/// amplification, and RFC 1035 §4.2.1 has the client retry over TCP — where the
-/// handshake proves the source address and the budget no longer applies. Going
-/// silent instead would leave a legitimate client with a timeout and no idea that
-/// TCP would work.
+/// What a client over its response budget gets instead of the answer: smaller
+/// than the query, so useless for amplification, and RFC 1035 §4.2.1 has the
+/// client retry over TCP, where the handshake proves the source address. Silence
+/// would leave a legitimate client with a timeout and no hint that TCP works.
 ///
-/// Two things this got wrong that `error_bytes` twenty lines up gets right — the
-/// tell that they were written apart and drifted (`CLAUDE.md` §7):
-///
-/// - AA was set on a reply carrying no data at all, which is a claim about an
-///   answer that is not here.
-/// - The size was hardcoded at 512, ignoring `udp_payload_size()`. RFC 6891
-///   §6.2.4 bounds a response to an EDNS query by what the requestor advertised.
-///   It changes no bytes here, the message being empty either way — it is the
-///   wrong rule in a place where it happens not to bite, which is where the next
-///   reader copies it from.
+/// No AA — the reply carries no data — and bounded by `udp_payload_size()`
+/// rather than 512 (RFC 6891 §6.2.4).
 fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
     let mut resp = DnsMessage {
         id: request.id,
@@ -1911,26 +1575,17 @@ fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
 
 /// Answer a NOTIFY (RFC 1996).
 ///
-/// Three outcomes, and which one applies is a question about *this* zone:
+/// - A zone we replicate, from one of its masters: NOERROR, and the refresh task
+///   is woken. The serial in the message is unauthenticated, so it is not acted
+///   on — the refresh compares against what the master answers.
+/// - A zone we replicate, from anywhere else: REFUSED (§3.10). A NOTIFY is a
+///   spoofable datagram that costs its recipient a transfer, so who may send one
+///   is a list.
+/// - Anything else: NOTAUTH, "I am not a secondary for that zone" — true alike
+///   for a zone we are primary for and one we never heard of, distinguished in
+///   the log rather than the rcode.
 ///
-/// - **A zone we replicate, from one of its masters** — the message is what it
-///   claims to be. NOERROR, and the refresh task is woken so the check happens
-///   now instead of when the REFRESH timer next goes off. The serial in the
-///   message is not acted on: it is unauthenticated, and the refresh does its own
-///   comparison against what the master answers.
-/// - **A zone we replicate, from anywhere else** — REFUSED, a policy decision
-///   (§3.10 has a secondary log exactly this). A NOTIFY is a spoofable datagram
-///   that costs its recipient a transfer, so who may send one is a list, the same
-///   way an AXFR's is.
-/// - **Anything else** — NOTAUTH, meaning *I am not a secondary for that zone*,
-///   which is the truth for a zone we hold as a primary and for one we have never
-///   heard of alike. The two are distinguished in the log rather than in the
-///   rcode, because they are the same answer to the sender.
-///
-/// What matters as much is that it is answered *as a NOTIFY*: same opcode, the
-/// question echoed, no data (§4.7). Before the opcode decode was fixed this
-/// arrived as an `Unknown` opcode and was answered as though it were a lookup for
-/// the zone's SOA — a plausible-looking reply to a message that asked nothing.
+/// Answered as a NOTIFY: same opcode, question echoed, no data (§4.7).
 fn notify_reply(
     msg: &DnsMessage,
     zone_map: &ZoneMap,
@@ -1938,21 +1593,15 @@ fn notify_reply(
     peer: SocketAddr,
 ) -> DnsMessage {
     let zone = notify::notified_zone(msg).unwrap_or_default();
-    // `absolute_lowered`, not `absolute_name(..).to_lowercase()`: the fold is
-    // ASCII-only (RFC 4343, `CLAUDE.md` §8), and `str::to_lowercase` folds
-    // U+212A KELVIN SIGN onto `k` — so a NOTIFY naming a Kelvin-sign variant of
-    // a replicated zone folded onto that zone. The exposure was bounded, since
-    // the master-address check below still gated the refresh, but this is the
-    // rule this codebase wrote down, on a name a stranger chooses
-    // (`TODO.md` #19a). It also borrows in the common case, where the pair it
-    // replaced allocated twice.
+    // `absolute_lowered`, not `to_lowercase()`: the fold is ASCII-only
+    // (RFC 4343), and `str::to_lowercase` folds U+212A KELVIN SIGN onto `k`,
+    // merging two names that differ on the wire.
     let key = rdns::utils::absolute_lowered(&zone);
 
     if let Some(replicated) = secondaries.get(key.as_ref()) {
         if replicated.masters.contains(&peer.ip()) {
-            // `notify_one` rather than waking every waiter: it leaves a permit
-            // for a task that is mid-transfer right now, so a NOTIFY that
-            // arrives at a busy moment is not simply lost.
+            // `notify_one` leaves a permit for a task that is mid-transfer, so a
+            // NOTIFY arriving at a busy moment is not lost.
             for wake in &replicated.wake {
                 wake.notify_one();
             }
@@ -1967,8 +1616,8 @@ fn notify_reply(
         return notify::notify_response(msg, ResponseCode::Refused);
     }
 
-    // The same folded key the secondaries were asked with: the zone map is keyed
-    // in that form, so this is a lookup rather than a scan of every origin.
+    // The zone map is keyed in the same folded form, so this is a lookup rather
+    // than a scan of every origin.
     let ours = zone_map.contains_key(key.as_ref());
     let why = if ours {
         "this server is its primary, not a secondary"
@@ -1980,13 +1629,9 @@ fn notify_reply(
 }
 
 /// A name in absolute form, so it can be compared with a zone origin.
-/// [`rdns::utils::absolute`] under this module's name for it.
 ///
-/// Kept as a name rather than inlined at eleven call sites: `absolute_name`
-/// reads better here than a `utils::` path, and it is now three lines shorter
-/// than the copy it replaced (`TODO.md` #19c). It returns the `Cow` rather than
-/// an owned `String` so that the common case — a name off the wire, already
-/// absolute — borrows.
+/// [`rdns::utils::absolute`] under this module's name for it. Returns a `Cow` so
+/// the common case — a name off the wire, already absolute — borrows.
 fn absolute_name(name: &str) -> std::borrow::Cow<'_, str> {
     rdns::utils::absolute(name)
 }
@@ -1994,22 +1639,15 @@ fn absolute_name(name: &str) -> std::borrow::Cow<'_, str> {
 /// Receive datagrams and answer them, as one of `--udp-workers` identical tasks
 /// sharing the socket.
 ///
-/// No task per datagram. Answering from an in-memory zone has two await points
-/// (the zone-map read guard and `send_to`) and takes microseconds, so a fixed
-/// pool bounds concurrency *before* the packet is copied rather than after, and
-/// the overflow queues in the socket receive buffer where the kernel drops and
-/// counts it (`netstat -su`). The spawn it replaced cost 1,536 bytes per
-/// datagram, 46% of everything a query allocated.
+/// No task per datagram: a fixed pool bounds concurrency before the packet is
+/// copied, and the overflow queues in the socket receive buffer where the kernel
+/// drops and counts it. A spawn per datagram cost 1,536 bytes, 46% of everything
+/// a query allocated. Costs one 64 KB receive buffer per worker — see
+/// [`default_udp_workers`].
 ///
-/// Costs one 64 KB receive buffer per worker — see [`default_udp_workers`].
-///
-/// This loop must not block: a worker stuck here is a worker not receiving. TCP
-/// keeps a task per connection for that reason, and so does `rdnsr`, where one
-/// query is seconds of recursion.
+/// This loop must not block: a worker stuck here is a worker not receiving.
 ///
 /// A panic while answering ends the worker, and `serve` then ends the process.
-/// Deliberate: a panic here means a broken invariant, and a server answering
-/// every query with a panic is not a server that survived.
 async fn udp_loop(
     socket: Arc<UdpSocket>,
     server: Arc<Server>,
@@ -2017,16 +1655,13 @@ async fn udp_loop(
     busy: Busy,
 ) -> Result<(), std::io::Error> {
     let mut buf = vec![0; UDP_RECEIVE_BUFFER];
-    // The response, built here once per worker and reused for its lifetime.
-    // `to_bytes_within_buf` exists for exactly this, and until now nothing could
-    // use it: a task per datagram has nowhere to keep a buffer between
-    // datagrams. It settles at the largest EDNS payload size this worker has
-    // been asked for.
+    // Reused for the worker's lifetime, settling at the largest EDNS payload
+    // size it has been asked for. A task per datagram could not keep one.
     let mut scratch = Vec::new();
 
     loop {
-        // `recv_from` is cancel-safe, so a datagram is either fully received or
-        // not received at all — losing this race drops nothing that was ours.
+        // `recv_from` is cancel-safe: a datagram is either fully received or not
+        // received at all, so losing this race drops nothing.
         let received = tokio::select! {
             r = socket.recv_from(&mut buf) => r,
             _ = stop.wait() => return Ok(()),
@@ -2038,9 +1673,8 @@ async fn udp_loop(
         };
         let packet = &buf[..size];
 
-        // Both of these are decisions to do nothing, so they come before any
-        // work is done: on `&buf[..size]` with nothing copied and nothing
-        // spawned.
+        // Both are decisions to do nothing, so they run on `&buf[..size]` with
+        // nothing copied and nothing spawned.
         if !server.rate_limiter.should_allow(peer.ip()) {
             server.logger.log_rate_limited(peer.ip());
             server.metrics.count(&server.metrics.rate_limited);
@@ -2060,10 +1694,9 @@ async fn udp_loop(
             continue;
         }
 
-        // Claims the drain until this answer is on the wire, and only until
-        // then: held across the loop instead, it would be the accept-loop
-        // mistake `rdns::shutdown` splits `Stop` from `Busy` to prevent — a
-        // claim that never ends keeps the drain open for the whole budget.
+        // Claims the drain until this answer is on the wire and no longer: a
+        // claim held across the loop would keep the drain open for the whole
+        // budget.
         let _busy = busy.clone();
         server
             .answer_datagram(packet, peer, &socket, &mut scratch)
@@ -2071,9 +1704,7 @@ async fn udp_loop(
     }
 }
 
-/// A second `impl` block, next to [`udp_loop`] rather than beside
-/// `serve_connection` six hundred lines down, because it is the body of that
-/// loop and was only lifted out of it to keep the loop readable.
+/// Next to [`udp_loop`] because this is the body of that loop.
 impl Server {
     /// Answer one datagram that has already been admitted, into `scratch`.
     ///
@@ -2098,16 +1729,13 @@ impl Server {
 
         // The same door as the TCP path above, and now literally the same code.
         //
-        // **The QR check was missing here and only here**, which is the transport
+        // The QR check was missing here and only here, which is the transport
         // it matters on: `fn answer` has had it since the rule was written and
         // this one was never given it, so two servers pointed at each other — or
-        // one spoofed datagram naming another server as its source — was a packet
-        // loop neither end could see, with nothing about UDP making the peer
-        // prove its address first. `CLAUDE.md` §8 says "on both daemons";
-        // `rdnsr` has one `handle_query` for both of its transports and so could
-        // not drift, while `rdnsd` has two answering paths and did (§7 — the
-        // second copy is where the bug is). The fix was written out here once and
-        // is now a type that cannot be left out (`TODO.md` #14b).
+        // one spoofed datagram naming another server as its source — is a
+        // packet loop neither end can see, and nothing about UDP makes the peer
+        // prove its address first. This daemon has two answering paths, so the
+        // check is a type rather than a line either could omit.
         let msg = match Request::from_bytes(packet) {
             Ok(msg) => msg,
             Err(RequestError::Wire(_)) => {
@@ -2281,21 +1909,14 @@ impl Reloading {
     /// Read the zones again and put them through signing and checking, or say
     /// why not.
     ///
-    /// Nothing is installed unless the whole set comes through. A reload that
-    /// replaced half the zones and gave up would leave the server serving a
-    /// mixture of two versions, and the half that failed is the half that
-    /// needed attention.
-    /// **On a blocking thread, all of it.** Every step here blocks: `read_dir`,
-    /// a `read_to_string` and a full parse per zone, then `signing.apply`, which
-    /// is a ring ECDSA signing run over every RRset of every signed zone, then a
-    /// verification pass over what that produced. This is reached from the
-    /// SIGHUP task and from the re-signing timer, both of which run while the
-    /// listeners are live — so on the runtime it is a worker taken out of
-    /// service for the length of a full load, with queries queued behind it.
+    /// Nothing is installed unless the whole set comes through: a reload that
+    /// replaced half the zones and gave up would serve a mixture of two
+    /// versions, and the half that failed is the half needing attention.
     ///
-    /// The old signature was the trap rather than the cost: an `async fn`
-    /// containing *zero* await points reads as though it yields somewhere, and
-    /// nothing about calling it said otherwise (`CLAUDE.md` §9).
+    /// On a blocking thread, all of it. Every step blocks — `read_dir`, a parse
+    /// per zone, an ECDSA signing run over every RRset of every signed zone,
+    /// then verification — and both callers run while the listeners are live, so
+    /// on the runtime this is a worker out of service with queries behind it.
     async fn load(&self, source: &ZoneSource) -> Result<ZoneMap> {
         let reloading = self.clone();
         let source = source.clone();
@@ -2419,19 +2040,15 @@ async fn reload_once(
 /// Keep the zones current: reload on SIGHUP or on the control socket, and
 /// re-sign on a timer.
 ///
-/// **One task, deliberately.** The re-signing timer does its work by *reloading*
-/// — see [`ZoneSigning::resign_interval`] for why that is the right shape — so it
-/// and SIGHUP are the same operation on two triggers. Two tasks would mean two
-/// reloads able to run at once, each installing a different snapshot of the
-/// files, and two independent ideas of which serials have been announced. One
-/// loop selecting over both triggers has neither problem — which is exactly why
-/// `rdnsctl reload` became a *third* trigger on this loop rather than a fourth
-/// place that calls `Reloading::load`.
+/// One task. The re-signing timer works by *reloading* (see
+/// [`ZoneSigning::resign_interval`]), so it and SIGHUP are the same operation on
+/// two triggers, and `rdnsctl reload` is a third. Two tasks would mean two
+/// reloads running at once, each installing a different snapshot of the files
+/// and holding its own idea of which serials have been announced.
 ///
-/// It holds a [`Busy`] and exits on [`Stop`], in that order of importance: a
-/// reload part-way through installing zones is work the drain should wait for,
-/// and a task that never exits while holding a `Busy` would spend the whole
-/// drain budget every single shutdown.
+/// It holds a [`Busy`] and exits on [`Stop`]: a reload part-way through
+/// installing zones is work the drain should wait for, and a task that never
+/// exits while holding a `Busy` spends the whole budget every shutdown.
 fn spawn_zone_maintenance(
     served: Served,
     source: ZoneSource,
@@ -2526,11 +2143,9 @@ async fn sleep_for(every: Option<Duration>) {
 /// reason `rdns::shutdown` uses it: it is already here, it needs no dependency,
 /// and one mechanism for every signal this process handles beats two.
 ///
-/// **The two-crate version did not compile on Unix at all.** `signals.next()`
-/// needs a `StreamExt` in scope to resolve to `Stream::next`, nothing imported
-/// one, and so it resolved to `Iterator::next` and failed the trait bound —
-/// which no amount of building on Windows could show, because the whole module
-/// is `#[cfg(unix)]`. See `TODO.md` #9d.
+/// `signals.next()` needs a `StreamExt` in scope to resolve to `Stream::next`;
+/// without one it resolves to `Iterator::next` and fails the trait bound — which
+/// no amount of building on Windows shows, since the module is `#[cfg(unix)]`.
 #[cfg(unix)]
 fn signal_stream() -> Option<Signal> {
     match signal(SignalKind::hangup()) {
@@ -3137,10 +2752,9 @@ mod tests {
     use std::collections::BTreeMap;
     use tokio::sync::Notify;
 
-    /// `Server::answer` collected, for the tests that want the whole reply in
-    /// hand. It sends rather than returning so a transfer need not exist all at
-    /// once (`TODO.md` #24c); nothing in a test is large enough to fill the
-    /// channel before it is drained here.
+    /// `Server::answer` collected, for tests wanting the whole reply in hand.
+    /// It sends rather than returns so a transfer need not exist all at once;
+    /// nothing in a test fills the channel before it is drained here.
     async fn answered(server: &Server, packet: &[u8], peer: SocketAddr) -> Vec<Vec<u8>> {
         let (tx, mut rx) = mpsc::channel::<Reply>(1024);
         server.answer(packet, peer, &tx).await;
@@ -3319,9 +2933,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // The secondary role
-    // -----------------------------------------------------------------
 
     /// A transferred zone has to be written somewhere, and one file is not a
     /// place to put zones whose names we may not have seen yet.
@@ -3401,9 +3013,7 @@ mod tests {
         })
     }
 
-    // -----------------------------------------------------------------------
     // The UDP worker pool
-    // -----------------------------------------------------------------------
 
     mod udp {
         use super::*;
@@ -3466,17 +3076,14 @@ mod tests {
         /// A response sent to the UDP port must not be answered.
         ///
         /// `CLAUDE.md` §8: "A response is not a question. Test QR before doing
-        /// anything with a packet that arrived at a listening socket, **on both
-        /// daemons**. Two servers pointed at each other, or one spoofed
+        /// anything with a packet that arrived at a listening socket, on both
+        /// daemons. Two servers pointed at each other, or one spoofed
         /// datagram, is otherwise a packet loop neither end can see."
         ///
-        /// `fn answer` — the TCP path — made that test from the day the rule was
-        /// written, and this path never did; UDP is the transport where a spoofed
-        /// source and a packet loop actually matter. Both go through
-        /// `rdns::validation::Request` now, which is the only way to get a message
-        /// out of a packet here and refuses QR=1 itself (`TODO.md` #14b). This
-        /// test outlives that change on purpose: the type makes the omission
-        /// impossible, and this says what the behaviour is when it is not omitted.
+        /// UDP is the transport where a spoofed source and a packet loop
+        /// matter. Both paths go through `rdns::validation::Request`, the only
+        /// way to get a message out of a packet here, which refuses QR=1
+        /// itself; this test says what the behaviour is.
         #[tokio::test]
         async fn a_response_to_the_udp_port_is_not_answered() {
             let server = server_with(one_record_zone());
@@ -3502,7 +3109,7 @@ mod tests {
 
         /// The response buffer is the worker's, not the datagram's.
         ///
-        /// **What this is a regression for**, since it cannot fail against the
+        /// What this is a regression for, since it cannot fail against the
         /// old code — the old code had no buffer to reuse, because a task per
         /// datagram has nowhere to keep one between datagrams. It fails against
         /// anyone putting `to_bytes_within` back in `answer_datagram`: swapping
@@ -3566,9 +3173,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // Graceful shutdown
-    // -----------------------------------------------------------------------
 
     mod shutdown {
         use super::*;
@@ -3615,8 +3220,8 @@ mod tests {
         }
 
         /// The harm the whole item is about: `systemctl stop` used to cut an
-        /// in-flight AXFR mid-stream, and **the client cannot tell a truncated
-        /// transfer from a complete one** — it sees records, then silence, and a
+        /// in-flight AXFR mid-stream, and the client cannot tell a truncated
+        /// transfer from a complete one — it sees records, then silence, and a
         /// secondary that believes it holds a zone it holds half of.
         ///
         /// Drives the real `tcp_loop` and the real `serve_connection`, and stops
@@ -3759,9 +3364,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // Who a TSIG key authorizes
-    // -----------------------------------------------------------------------
 
     mod transfer_authorization {
         use super::*;
@@ -3776,7 +3379,7 @@ mod tests {
             .for_zones(zones.iter().copied())
         }
 
-        /// A primary holding both zones, with an **empty** ACL — so the key is the
+        /// A primary holding both zones, with an empty ACL — so the key is the
         /// only thing that can authorize a transfer, which is the situation the
         /// bug was about.
         async fn primary_with(key: TsigKey) -> SocketAddr {
@@ -3927,9 +3530,7 @@ mod tests {
         addr
     }
 
-    // -----------------------------------------------------------------
     // Dynamic UPDATE, end to end (RFC 2136)
-    // -----------------------------------------------------------------
 
     /// The zone every UPDATE test starts from.
     const UPDATE_ZONE: &str = "$ORIGIN example.com.\n\
@@ -4043,7 +3644,7 @@ mod tests {
         DnsMessage::try_from_bytes(&buf).expect("a reply")
     }
 
-    /// **An UPDATE reaches the zone file, not just the zone map.**
+    /// An UPDATE reaches the zone file, not just the zone map.
     ///
     /// This is the assertion the whole design turns on, and it is why write-back
     /// is a precondition rather than a follow-on: the re-signing timer reloads
@@ -4052,7 +3653,7 @@ mod tests {
     /// interval, silently, having told the client it succeeded. Asserting on the
     /// map alone would pass against exactly that bug.
     ///
-    /// **Watched failing** against a handler that installed the new zone without
+    /// Watched failing against a handler that installed the new zone without
     /// writing the file: the map assertion passed, the file assertion did not.
     #[tokio::test]
     async fn an_update_is_applied_persisted_and_served() {
@@ -4205,16 +3806,15 @@ mod tests {
         );
     }
 
-    /// **An UPDATE leaves a journal, and the journal answers an IXFR from
-    /// before it.**
+    /// An UPDATE leaves a journal, and the journal answers an IXFR from
+    /// before it.
     ///
-    /// This is `TODO.md` #7 step 6's whole point, and asserting on the file
-    /// alone would not show it: what matters is that a *fresh* `DeltaLog` — one
-    /// that has never seen the update, as after a restart — can chain from the
-    /// serial a secondary was holding beforehand. Anything less is a file that
-    /// exists rather than a history that works.
+    /// Asserting on the file alone would not show it: what matters is that a
+    /// *fresh* `DeltaLog`, as after a restart, can chain from the serial a
+    /// secondary held beforehand. Anything less is a file that exists rather
+    /// than a history that works.
     ///
-    /// **Watched failing** with the journal write removed from `install_zone`:
+    /// Watched failing with the journal write removed from `install_zone`:
     /// the update still applied and was still served, and `Journal::load` came
     /// back empty, so `chain_from` had nothing to answer with — which is
     /// precisely the pre-journal behaviour it is meant to replace.
@@ -4863,23 +4463,19 @@ mod tests {
     /// `ixfr::diff` runs under the read lock, and only the swap under the write
     /// lock.
     ///
-    /// The assertion calibrates against this machine (`CLAUDE.md` §10): time one
-    /// unlocked diff, then require a contiguous window at least half that long
-    /// inside the reload in which a reader could have been admitted. Such a
-    /// window can only exist if the diff ran under a shared lock, and a slower
-    /// box stretches baseline and window together. Measured pinned to two cores:
-    /// 90% of the reload with the split, 9% with the diff back under the write
-    /// lock.
+    /// Self-calibrating: time one unlocked diff, then require a contiguous
+    /// window at least half that long inside the reload in which a reader could
+    /// have been admitted. Such a window exists only if the diff ran under a
+    /// shared lock, and a slower box stretches baseline and window together. 90%
+    /// of the reload with the split, 9% with the diff under the write lock.
     ///
-    /// Not a ratio of `try_read` samples — that version failed CI on Windows at
-    /// 71% where this machine reads 0.3%, with nothing regressed.
-    /// `tokio::sync::RwLock` is fair, so `try_read` fails while a writer is
-    /// merely queued, which made the number measure wake latency; and the
-    /// denominator was the sampler's own spin rate, which is not a clock.
+    /// Not a ratio of `try_read` samples: `tokio::sync::RwLock` is fair, so
+    /// `try_read` fails while a writer is merely queued, which measures wake
+    /// latency against a denominator that is the sampler's spin rate.
     ///
-    /// Multi-threaded on purpose: the diff has no `.await`, so on the
-    /// single-threaded runtime the reload would finish before the reader was
-    /// polled and the test would pass against both versions (§1).
+    /// Multi-threaded, because the diff has no `.await`: on one thread the
+    /// reload finishes before the reader is polled and the test passes against
+    /// both versions.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reload_does_not_hold_the_write_lock_across_its_diffs() {
         // Every record differs between the two versions, so nothing cancels out
@@ -4901,7 +4497,7 @@ mod tests {
         let v1 = version(1, 1);
         let v2 = version(2, 2);
 
-        // **Observing this is a race, and losing it is not a failure.** If this
+        // Observing this is a race, and losing it is not a failure. If this
         // task is descheduled between spawning the reload and starting to
         // sample, the whole reload can be over before the first probe — there is
         // then nothing to measure and no verdict to give either way. On a
@@ -5058,9 +4654,7 @@ mod tests {
         assert!(reply.answers.is_empty(), "a refusal carries no zone");
     }
 
-    // -----------------------------------------------------------------------
     // Loading a directory of zones: three questions, three answers
-    // -----------------------------------------------------------------------
 
     mod loading {
         use super::*;
@@ -5079,7 +4673,7 @@ mod tests {
         }
 
         /// One bad file out of three used to be a line on stderr, exit code 0, and
-        /// that zone answering **REFUSED** — indistinguishable from a zone nobody
+        /// that zone answering REFUSED — indistinguishable from a zone nobody
         /// configured. It also defeated the all-or-nothing invariant
         /// `Reloading::load`'s own doc comment claims, because `install_all_zones`
         /// then installed the survivors wholesale: a broken file plus a deploy
@@ -5129,7 +4723,7 @@ mod tests {
         /// A secondary's first start has nothing on disk yet, and refusing to run
         /// until a zone arrives would mean it never could.
         ///
-        /// **This is a regression test for a fix, not for the original bug.**
+        /// This is a regression test for a fix, not for the original bug.
         /// Removing the `unwrap_or_default()` that turned an unreadable directory
         /// into `Ok(empty)` also removed the only thing making an *empty*
         /// directory work, because `enumerate_zone_files` returned
@@ -5202,7 +4796,7 @@ mod tests {
         /// `Reloading::load` re-reads every `.zone` file from disk without
         /// consulting the sidecar. A zone correctly withdrawn because its primary
         /// had been unreachable for a week came straight back on SIGHUP and was
-        /// served **with AA set** — which is precisely the "permanently wrong
+        /// served with AA set — which is precisely the "permanently wrong
         /// answers nobody can see are wrong" the withdrawal code's own comment
         /// says it exists to prevent.
         #[tokio::test]
@@ -5309,23 +4903,18 @@ mod tests {
 
         /// A reload must not take the runtime worker with it.
         ///
-        /// `Reloading::load` was an `async fn` containing no await point at all:
-        /// `read_dir`, a `read_to_string` and a full parse per zone, then an
-        /// ECDSA signing run, then verification — all of it inline on whichever
-        /// worker polled it, while both listeners were live. The signature was
-        /// the trap rather than the cost, because it read as though it yielded.
+        /// Every step of a load blocks — `read_dir`, a parse per zone, an ECDSA
+        /// signing run, verification — and it runs while both listeners are
+        /// live.
         ///
-        /// **One worker thread on purpose.** With a single worker the question
-        /// has a yes-or-no answer instead of a ratio: if the load blocks the
-        /// runtime, nothing else on it is polled even once while the load runs,
-        /// and the ticker below stays where it was.
+        /// One worker thread, so the question has a yes-or-no answer instead of
+        /// a ratio: if the load blocks the runtime, the ticker below is not
+        /// polled once while it runs.
         ///
-        /// **And the load has to be inside a spawned task.** The first version
-        /// of this test called `load` from the test body and passed against the
-        /// old code, proving nothing: `#[tokio::test(flavor = "multi_thread")]`
-        /// runs the body on the calling thread via `block_on`, so a blocking
-        /// call there never occupies the worker it was supposed to be starving.
-        /// The body is the *observer* here, which is why it can measure at all.
+        /// The load has to be inside a spawned task. `#[tokio::test]` runs the
+        /// body on the calling thread via `block_on`, so a blocking call there
+        /// never occupies the worker it is supposed to be starving — the body is
+        /// the observer.
         #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
         async fn a_reload_does_not_block_the_runtime_it_was_called_from() {
             // Enough parsing to take real time — the point is that whatever it
@@ -5493,12 +5082,9 @@ mod tests {
         );
     }
 
-    // (RFC 1034 §4.3.2's four cases moved to `answer.rs` with the code they
-    // test — `TODO.md` #20.)
+    // RFC 1034 §4.3.2's four cases live in `answer.rs`, with the code they test.
 
-    // -----------------------------------------------------------------------
     // Signing, and answering a client that can read the result
-    // -----------------------------------------------------------------------
 
     mod dnssec {
         use super::*;
@@ -5617,9 +5203,9 @@ ns.plain  IN A   192.0.2.30
             (zones, keys)
         }
 
-        /// The failure this is the regression test for: **a signed zone with a
+        /// The failure this is the regression test for: a signed zone with a
         /// wildcard SERVFAILed at every validator for every non-existent name two
-        /// or more labels deep.** The synthesis reached one label, so a deeper
+        /// or more labels deep. The synthesis reached one label, so a deeper
         /// name became an NXDOMAIN — and then the wildcard denial asked the chain
         /// to cover `*.example.com.`, a name that is *in* the chain, so nothing
         /// covered it and the proof came back unproved. Failing closed is worse
@@ -5677,7 +5263,7 @@ ns.plain  IN A   192.0.2.30
             }
         }
 
-        /// An ANY answer from a signed zone owes a signature over **every**
+        /// An ANY answer from a signed zone owes a signature over every
         /// RRset it returns, and the filter that finds them was
         /// `sig.type_covered != qtype` — which matches nothing for QTYPE 255,
         /// because no RRSIG covers a QTYPE. Left alone, making ANY return every
@@ -5777,7 +5363,7 @@ ns.plain  IN A   192.0.2.30
         }
 
         /// A secure delegation hands down the DS and its signature, and the NS
-        /// RRset goes out **unsigned** — it is the child's data (RFC 4035 §2.2).
+        /// RRset goes out unsigned — it is the child's data (RFC 4035 §2.2).
         #[test]
         fn a_secure_referral_carries_the_ds_and_leaves_the_ns_rrset_unsigned() {
             for nsec3 in [false, true] {

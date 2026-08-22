@@ -1,9 +1,4 @@
 //! A command-line DNS query client.
-//!
-//! Small on purpose, but it has to be *right* about the things a client is for:
-//! sending the bytes it built and no others, reading back the bytes it received
-//! and no others, and refusing to print an answer it cannot tell was an answer
-//! to its own question.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -13,37 +8,20 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use rdns::{DnsMessage, DnsMessageBuilder};
 
-/// How long to wait for a reply before giving up.
-///
-/// There was no timeout at all, so a query to an address that does not answer —
-/// a firewall dropping it, a port with nothing behind it — hung forever with no
-/// output and no way to tell that from a slow server.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How many times a lost datagram is re-sent before giving up.
-///
-/// UDP loses packets, and a client with no retry reports "no answer" for one
-/// dropped datagram. Two attempts is what `dig` does by default.
+/// Re-sends of a lost datagram before giving up. Two is `dig`'s default.
 const ATTEMPTS: usize = 2;
 
 #[derive(Parser)]
 #[command(version = rdns::VERSION, about, long_about = None)]
 struct Cli {
     /// The server to ask: an address, optionally with `:port` (default 53).
-    ///
-    /// This used to parse as a bare `Ipv4Addr`, so `rdnsc 127.0.0.1:15353 SOA
-    /// example.com` failed with "invalid IPv4 address syntax" — and this
-    /// project's own documentation tells you to develop against a non-53 port,
-    /// so our own client could not query our own server. That is why every
-    /// verification recipe in `TODO.md` reaches for dnspython or Node.
     pub dns_server: String,
     pub record: String,
     pub hostname: String,
     /// Ask for DNSSEC records: EDNS0 with the DO bit set (RFC 4035 §3.2.1).
-    ///
-    /// Without it a server is *required* not to send RRSIG, NSEC or NSEC3, so
-    /// this client could not see any of the signing `rdnsd` does — which is why
-    /// every DNSSEC recipe in `TODO.md` reaches for dnspython (`TODO.md` #19h).
+    /// Without it a server is required not to send RRSIG, NSEC or NSEC3.
     #[arg(long)]
     pub dnssec: bool,
 }
@@ -64,12 +42,8 @@ fn main() -> Result<()> {
         );
     }
 
-    // Serialize once and send exactly what was written. `to_bytes` returns the
-    // length and it used to be discarded — `sock.send_to(&buf, ..)` on a
-    // `[u8; 512]` sent a 31-byte query as 512 bytes with 481 trailing zeros.
-    // This project's own `AdmissionCheck` caps a UDP request at exactly 512,
-    // so the client was one EDNS option byte away from being rejected by the
-    // server it ships with.
+    // Send `len` bytes, not the whole buffer: trailing zeros are extra records
+    // as far as the receiver is concerned, and count against its request cap.
     let mut buf = [0u8; 512];
     let len = request
         .to_bytes(&mut buf)
@@ -78,10 +52,8 @@ fn main() -> Result<()> {
 
     let response = ask_over_udp(server, query, &request)?;
     let response = if response.truncation {
-        // TC means the answer did not fit and the rest is not coming over UDP
-        // (RFC 1035 §4.2.1). Printing what arrived would be printing a subset of
-        // the answer as if it were the answer — silently dropping records, which
-        // is the one failure a lookup tool must not have.
+        // TC: the rest is not coming over UDP (RFC 1035 §4.2.1), so printing
+        // what arrived would silently drop records.
         eprintln!("answer truncated over UDP, retrying over TCP");
         ask_over_tcp(server, query, &request)?
     } else {
@@ -94,9 +66,8 @@ fn main() -> Result<()> {
 
 /// `host`, `host:port`, or a bare IPv6 literal — resolved to one address.
 fn resolve_server(spec: &str) -> Result<SocketAddr> {
-    // A bare IPv6 literal has colons in it, so "does it contain a colon" cannot
-    // decide whether a port is present. Try it as a full socket address first
-    // and fall back to appending the default port.
+    // A bare IPv6 literal has colons, so a colon does not mean a port is
+    // present. Try the full socket address first, then append the default.
     if let Ok(mut addrs) = spec.to_socket_addrs() {
         if let Some(addr) = addrs.next() {
             return Ok(addr);
@@ -120,28 +91,23 @@ fn ask_over_udp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
     let sock = UdpSocket::bind(bind).context("binding a local UDP socket")?;
     sock.set_read_timeout(Some(READ_TIMEOUT))
         .context("setting the read timeout")?;
-    // `connect` makes the kernel drop datagrams from anywhere else, which is the
-    // cheapest half of off-path spoofing resistance and costs nothing here.
+    // `connect` makes the kernel drop datagrams from anywhere else — the cheap
+    // half of off-path spoofing resistance.
     sock.connect(server)
         .with_context(|| format!("connecting to {server}"))?;
 
-    // 4096 rather than 512: a request is not bound by the classic limit, and an
-    // EDNS server may answer larger than we would ever ask.
+    // 4096: an EDNS server may answer larger than we would ever ask.
     let mut buf = vec![0u8; 4096];
     for attempt in 1..=ATTEMPTS {
         sock.send(query)
             .with_context(|| format!("sending the query to {server}"))?;
 
         match sock.recv(&mut buf) {
-            // Parse only the bytes that arrived. This was
-            // `try_from_bytes(&buf)` over the whole 512-byte array, so every
-            // reply was parsed with the unused tail of the buffer appended —
-            // which the parser is entitled to read as more records.
+            // `&buf[..n]`: the unused tail would parse as further records.
             Ok(n) => match DnsMessage::try_from_bytes(&buf[..n]) {
                 Ok(message) => match matches_request(&message, request) {
-                    // A reply for someone else's question, or an off-path
-                    // forgery that lost the race, is not this answer. Keep
-                    // waiting rather than printing it (RFC 5452 §9.1).
+                    // Someone else's question, or a forgery that lost the
+                    // race. Keep waiting (RFC 5452 §9.1).
                     Err(why) => eprintln!("ignoring a reply that is not ours: {why}"),
                     Ok(()) => return Ok(message),
                 },
@@ -177,19 +143,16 @@ fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
         .context("reading the response body")?;
 
     let message = DnsMessage::try_from_bytes(&body).context("parsing the TCP response")?;
-    // Over TCP the connection identifies the peer, but the id and question are
-    // still the check that this is a reply to what was asked rather than a
-    // stale message left in the stream.
+    // The connection identifies the peer, but the id and question still catch
+    // a stale message left in the stream.
     matches_request(&message, request).map_err(|why| anyhow!("TCP reply is not ours: {why}"))?;
     Ok(message)
 }
 
 /// Whether `message` is a response to `request`.
 ///
-/// None of this was checked. The id, the QR bit and the echoed question are the
-/// only things tying a datagram to the query it claims to answer, and a client
-/// that prints whatever arrives will print an off-path forgery — or, more often
-/// in practice, a late reply to the *previous* query and blame the server.
+/// The id, the QR bit and the echoed question are all that tie a datagram to
+/// the query it claims to answer.
 fn matches_request(message: &DnsMessage, request: &DnsMessage) -> Result<(), String> {
     if !message.response {
         return Err("QR is clear, so it is a query and not an answer".to_string());

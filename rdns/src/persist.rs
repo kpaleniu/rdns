@@ -1,24 +1,10 @@
 //! Writing a file that a reader can never catch half-written.
 //!
-//! Every piece of state this server persists — a fetched zone, a transfer
-//! timestamp, a trust anchor as it rolls — is rewritten whole rather than
-//! edited in place, and each rewrite has to be all-or-nothing. A process that
-//! dies mid-`write` leaves a truncated file behind, and the reader of that file
-//! is the same server on its next start: a zone file cut off at half a record
-//! is not a zone that has lost a record, it is a zone that fails to load.
-//!
-//! So: write a temporary file in the same directory, flush it to disk, and
-//! rename it over the target. `std::fs::rename` replaces an existing file on
-//! both Unix and Windows, which is the whole reason this is portable — a reader
-//! opening the path either gets the old file or the new one, never a mixture.
-//! The same directory matters: a rename across filesystems is a copy, and a
-//! copy is exactly the non-atomic thing being avoided.
-//!
-//! Ordering is the point of the fsync. `sync_all` before the rename is what
-//! makes "the rename happened" imply "the contents are there"; without it a
-//! crash can leave the directory entry pointing at a file whose blocks were
-//! never written. Syncing the *directory* afterwards — so the rename itself
-//! survives — has no Windows equivalent and is done only where it exists.
+//! Write a temporary file in the same directory, `sync_all` it, rename it over
+//! the target. `std::fs::rename` replaces an existing file on both Unix and
+//! Windows. The same directory matters: a cross-filesystem rename is a copy,
+//! which is the non-atomic thing being avoided. The fsync before the rename is
+//! what makes "the rename happened" imply "the contents are there".
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -26,9 +12,8 @@ use std::path::{Path, PathBuf};
 
 /// Replace `path`'s contents with `contents`, atomically.
 ///
-/// The temporary file is removed on any failure, so a full disk or a permission
-/// error leaves the directory as it was found rather than littered with
-/// half-written attempts.
+/// The temporary is removed on any failure, so a full disk leaves the directory
+/// as it was found.
 pub fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     let temp = temp_path_for(path)?;
 
@@ -42,7 +27,7 @@ pub fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Same, for text — the form every state file here takes.
+/// Same, for text.
 pub fn write_atomically_str(path: &Path, contents: &str) -> io::Result<()> {
     write_atomically(path, contents.as_bytes())
 }
@@ -50,16 +35,10 @@ pub fn write_atomically_str(path: &Path, contents: &str) -> io::Result<()> {
 /// Same, for a file nobody but the owner may read: a private key, a shared
 /// secret.
 ///
-/// **The restriction goes on the temporary file, before the rename.** Setting
-/// the mode on the target afterwards leaves a window — however short — in which
-/// a freshly written private key is sitting there at whatever the umask allowed,
-/// usually 0644. Restricting the temporary first means the key is never
-/// reachable by anyone else at any point, because the name it is finally known
-/// by only ever refers to a file that was already 0600.
-///
-/// A failure to restrict is a failure to write. The alternative — carrying on
-/// and reporting success — hands back a path the caller believes is private and
-/// is not, which is the one outcome worth refusing (`CLAUDE.md` §4).
+/// The restriction goes on the temporary, before the rename: setting the mode
+/// on the target afterwards leaves a window at whatever the umask allowed. A
+/// failure to restrict is a failure to write — reporting success would hand back
+/// a path the caller believes is private and is not.
 pub fn write_atomically_private(path: &Path, contents: &str) -> io::Result<()> {
     let temp = temp_path_for(path)?;
 
@@ -77,18 +56,9 @@ pub fn write_atomically_private(path: &Path, contents: &str) -> io::Result<()> {
 
 /// Refuse a file holding a secret that anyone but its owner can read.
 ///
-/// `what` names the secret for the error message — "a TSIG secret", "a DNSSEC
-/// private key" — because the check is the same and only the noun differs.
-///
-/// **This is the check the feature exists for.** A secret in a file is only
-/// better than a secret in `argv` if the file is actually private, and a key
-/// directory restored from backup as 0644, or `chmod -R`'d by a deploy script,
-/// is the ordinary way that stops being true. Refusing to start is the right
-/// answer: an operator who believes a key is private and is wrong has no other
-/// way to find out.
-///
-/// One implementation, called from both the TSIG and the DNSSEC paths, because
-/// two copies of a security check are one copy and one bug waiting (§7).
+/// `what` names the secret for the error message. A secret in a file is only
+/// better than a secret in `argv` if the file is private; refusing to start is
+/// the only way an operator finds out it is not.
 pub fn ensure_private(path: &Path, what: &str) -> io::Result<()> {
     check_mode(path, what)
 }
@@ -112,10 +82,8 @@ fn check_mode(path: &Path, what: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Windows has no mode bits worth checking this way — an ACL check would need
-/// the security API and would not mean the same thing. Said out loud rather
-/// than silently skipped, because "the permissions were checked" is exactly the
-/// kind of claim that is only true on one platform.
+/// Windows has no mode bits worth checking this way; an ACL check would not mean
+/// the same thing. So "the permissions were checked" is a Unix-only claim.
 #[cfg(not(unix))]
 fn check_mode(path: &Path, _what: &str) -> io::Result<()> {
     if !path.is_file() {
@@ -147,9 +115,8 @@ fn write_and_sync(temp: &Path, contents: &[u8]) -> io::Result<()> {
 
 /// A sibling of `path` to write first.
 ///
-/// The process id is in the name because "one writer per file" is a rule about
-/// the *target*, and a temporary left behind by a process that crashed must not
-/// be something a later run collides with or, worse, renames into place.
+/// The process id is in the name so a temporary left behind by a crash is not
+/// something a later run collides with or renames into place.
 fn temp_path_for(path: &Path) -> io::Result<PathBuf> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let name = path.file_name().ok_or_else(|| {
@@ -171,10 +138,8 @@ fn temp_path_for(path: &Path) -> io::Result<PathBuf> {
 
 /// Flush the directory entry the rename created (POSIX only).
 ///
-/// Best-effort by design: it is a durability refinement, not a correctness one —
-/// the reader already cannot observe a partial file — and there is nothing
-/// useful to tell a caller whose data is written and renamed but whose directory
-/// might not survive a power cut.
+/// Best-effort: a durability refinement, not a correctness one — the reader
+/// already cannot observe a partial file.
 #[cfg(unix)]
 fn sync_dir(dir: Option<&Path>) {
     if let Some(dir) = dir.filter(|p| !p.as_os_str().is_empty()) {
@@ -239,8 +204,7 @@ mod tests {
         );
     }
 
-    /// The case the rename exists for: an existing file is replaced, which on
-    /// Windows is not what a plain `rename` syscall would do.
+    /// An existing file is replaced, which a plain Windows `rename` would not do.
     #[test]
     fn test_replaces_an_existing_file() {
         let dir = ScratchDir::new("replace");
@@ -252,8 +216,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).expect("read back"), "new");
     }
 
-    /// Nothing may be left beside the target: a stray `.zone.tmpNNN` is a file
-    /// an operator has to reason about, and one a directory scan would trip on.
+    /// A stray `.zone.tmpNNN` is something a zone-directory scan would trip on.
     #[test]
     fn test_leaves_no_temporary_behind() {
         let dir = ScratchDir::new("clean");
@@ -263,8 +226,7 @@ mod tests {
         assert_eq!(dir.entries(), vec!["example.com.zone".to_string()]);
     }
 
-    /// A failed write must not touch what is already there. The target is a
-    /// directory here, so the rename cannot succeed.
+    /// The target is a directory, so the rename cannot succeed.
     #[test]
     fn test_a_failed_write_leaves_the_target_alone() {
         let dir = ScratchDir::new("failure");
@@ -280,12 +242,7 @@ mod tests {
         );
     }
 
-    /// The mode check, which is the whole of what makes a secret in a file
-    /// better than a secret in `argv`.
-    ///
-    /// Unix only, and that is not a gap being papered over: there are no mode
-    /// bits to check on Windows, which is why [`ensure_private`] says so in a
-    /// comment rather than quietly returning `Ok`.
+    /// Unix only: there are no mode bits to check on Windows.
     #[cfg(unix)]
     #[test]
     fn test_a_secret_readable_by_anyone_else_is_refused() {
@@ -301,8 +258,7 @@ mod tests {
             (0o660, false),
             (0o644, false), // what a restore from backup leaves behind
         ] {
-            // Removed first: a previous iteration may have left it 0400, and
-            // `fs::write` opens for writing before anything else happens.
+            // Removed first: a previous iteration may have left it 0400.
             let _ = fs::remove_file(&path);
             fs::write(&path, "c3VwZXItc2VjcmV0\n").expect("write the secret");
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
@@ -316,8 +272,6 @@ mod tests {
             );
             if let Err(e) = verdict {
                 assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
-                // The mode is in the message: an operator has to be able to see
-                // what it is without going to look.
                 assert!(
                     e.to_string().contains(&format!("{mode:o}")),
                     "the error should name the mode it refused: {e}"
@@ -327,10 +281,6 @@ mod tests {
     }
 
     /// A private write is never briefly readable under its final name.
-    ///
-    /// The restriction goes on the temporary file, before the rename — setting
-    /// it afterwards would leave a window at whatever the umask allowed, which
-    /// for a private key is the whole thing.
     #[cfg(unix)]
     #[test]
     fn test_a_private_write_lands_already_restricted() {
@@ -342,14 +292,11 @@ mod tests {
 
         let mode = fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "got mode {:o}", mode & 0o777);
-        // And the file it wrote is the file it says it wrote.
         assert_eq!(
             fs::read_to_string(&path).expect("read back"),
             "PrivateKey: not-really\n"
         );
         assert_eq!(dir.entries(), vec!["key.rdnskey".to_string()]);
-        // The check and the write agree, which is the point of them being in
-        // one module.
         ensure_private(&path, "a DNSSEC private key").expect("what we just wrote passes");
     }
 

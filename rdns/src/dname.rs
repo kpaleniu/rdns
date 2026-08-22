@@ -5,31 +5,23 @@ use std::str::from_utf8;
 /// §4.1.4).
 pub(crate) const POINTER_TAG: u16 = 0xc000;
 
-/// The offset a pointer carries, once the tag bits are masked off. Being a
-/// 14-bit field, this doubles as the highest offset a pointer can address —
-/// which is why a name written past it can never become a compression target.
+/// The offset a pointer carries, once the tag bits are masked off. Being 14
+/// bits, it is also the highest offset a pointer can address, so a name written
+/// past it can never become a compression target.
 pub(crate) const POINTER_MASK: u16 = 0x3fff;
 
 /// The longest a single label may be (RFC 1035 §2.3.4).
 pub(crate) const MAX_LABEL_LEN: usize = 63;
 
 /// The longest a whole name may be, *encoded*: RFC 1035 §2.3.4's "names 255
-/// octets or less", which counts each label's length octet and the root's
+/// octets or less", counting each label's length octet and the root's
 /// terminating zero.
-///
-/// This limit went unenforced for the first two years of this repo while the
-/// 63-octet one above was checked on every label — a name of five 63-octet
-/// labels parsed to a 320-character `String` without complaint. Which is
-/// `CLAUDE.md` §2 exactly: the length that was checked was the one that looked
-/// like a length, and the aggregate nobody was looking at came off the same
-/// wire.
 pub(crate) const MAX_NAME_LEN: usize = 255;
 
 /// Copy `bytes` into `buf` at `pos`, returning the position just past them.
 ///
-/// This is the one bounds-checked write every wire serializer goes through.
-/// Unlike an `io::Cursor` over a slice, it refuses to write past the end rather
-/// than silently dropping the tail of a message.
+/// The one bounds-checked write every wire serializer goes through: unlike an
+/// `io::Cursor` over a slice, it errors rather than dropping the tail.
 pub(crate) fn write_bytes(buf: &mut [u8], pos: usize, bytes: &[u8]) -> Result<usize, WireError> {
     let end = pos + bytes.len();
     if end > buf.len() {
@@ -46,28 +38,13 @@ pub(crate) fn write_bytes(buf: &mut [u8], pos: usize, bytes: &[u8]) -> Result<us
 /// Why a label cannot be carried in this library's presentation-text form, if
 /// it cannot.
 ///
-/// A wire label may hold **any** octet (RFC 1035 §3.1), and a name here is a
-/// `String` in presentation form where `.` separates labels and `\` would be
-/// RFC 1035 §5.1's escape. Two octets therefore have no faithful spelling:
-///
-/// - **`.`** — the separator. A one-label name `a.b` and the two-label name
-///   `a` + `b` are different names that both read as the string `"a.b."`, so the
-///   representation stops being injective: every name-keyed map merges them, and
-///   `is_at_or_under("evil.com.", "com.")` answers *true* for a single label
-///   that is a sibling of `com.` rather than a child.
-/// - **`\`** — the escape. A name holding one is written into a zone file that
-///   no correct reader, this one included, reads back as the same name.
-///
-/// Refusing rather than resolving escapes: resolving needs a stored form that can
-/// hold a dot inside a label, which presentation text cannot — that is a
-/// different representation (labels or wire bytes, what PowerDNS, hickory-dns and
-/// dnspython store). `TODO.md` #13e records the options.
-///
-/// The `.` arm is live only at the decode boundary in [`UnpackedDName`]'s
-/// `TryInto<String>`, since both encoders split on `.` before calling
-/// [`write_label`]; it is checked at both ends anyway so a future encoder does
-/// not have to rediscover the rule. The `\` arm is live at both — splitting
-/// `a\.b` on `.` yields the label `a\`.
+/// A wire label may hold any octet (RFC 1035 §3.1), but a name here is a
+/// `String` in presentation form, so two have no faithful spelling: `.`, which
+/// would make the one-label name `a.b` and the two-label name `a`+`b` the same
+/// string and so break every name-keyed map and `is_at_or_under`; and `\`,
+/// RFC 1035 §5.1's escape, which no zone-file reader would read back as the
+/// same name. Refused rather than escaped — resolving escapes needs a stored
+/// form that can hold a dot inside a label, which presentation text cannot.
 fn unrepresentable_octet(label: &str) -> Option<&'static str> {
     if label.as_bytes().contains(&b'.') {
         return Some("a label containing the label separator");
@@ -80,9 +57,8 @@ fn unrepresentable_octet(label: &str) -> Option<&'static str> {
 
 /// Write one length-prefixed label, validating it first.
 ///
-/// The single place a label becomes bytes — shared by [`dname_to_bytes`] (which
-/// writes whole names uncompressed) and the message compressor (which writes the
-/// labels ahead of a pointer).
+/// The single place a label becomes bytes, shared by [`dname_to_bytes`] and the
+/// message compressor.
 pub(crate) fn write_label(buf: &mut [u8], pos: usize, label: &str) -> Result<usize, WireError> {
     if let Some(what) = unrepresentable_octet(label) {
         return Err(WireError::Unsupported { what });
@@ -110,13 +86,6 @@ pub(crate) trait TryFromBytes<'a> {
 
     fn try_from_bytes(data: &'a [u8]) -> Result<Self::Output, Self::Error>;
 }
-
-// The `TryToBytes`/`TryFromBytes` traits this once pointed at were not written,
-// and the reason is the one recorded at the bottom of this file for the other
-// bare `TODO` that was deleted rather than done: the two conversions a name
-// needs already exist as inherent methods with the error types the callers
-// branch on, and a trait would buy generic code nobody writes at the cost of
-// making the failure modes uniform when they are not (`TODO.md` #19h).
 
 #[derive(Debug, PartialEq, Clone)]
 enum Label<'a> {
@@ -148,22 +117,15 @@ impl<'a> TryInto<&'a str> for Label<'a> {
     }
 }
 
-/**
- * Labels are LV encoded strings (originally ASCII, effectively UTF8 nowadays) that
- * can be one of
- * * Normal label
- *   * Root, if len is 0 (see RFC 6895 section 3.3.2)
- *   * String, otherwise
- * * Pointer, if top 2 bits are 11
- * * Extended label, if top 2 bits are 01
- *   * Not supported until I read through RFC6891
- */
+/// A label is length-prefixed, and the top two bits of that length byte pick the
+/// kind: 00 a text label (length 0 is the root, RFC 6895 §3.3.2), 11 a
+/// compression pointer, 01 an extended label (RFC 2673, unsupported).
 impl<'a> TryFromBytes<'a> for Label<'a> {
     type Output = Label<'a>;
     type Error = WireError;
     fn try_from_bytes(data: &'a [u8]) -> Result<Label<'a>, WireError> {
-        // Every index below is on bytes a hostile peer chose the length of, so
-        // each one is checked: a truncated message must be an error, not a panic.
+        // Every index below is on a length a peer chose: truncation is an error,
+        // never a panic.
         let Some(&first) = data.first() else {
             return Err(WireError::Truncated {
                 what: "a label",
@@ -183,13 +145,9 @@ impl<'a> TryFromBytes<'a> for Label<'a> {
                         return Err(WireError::Truncated {
                             what: "a label",
                             need: len,
-                            // Cannot underflow: `data.first()` at the top of the
-                            // function returned early on an empty slice, so
-                            // there is at least the length byte being subtracted
-                            // here. The same note as `validation.rs`'s: a
-                            // subtraction of wire-derived lengths on the
-                            // pre-authentication path is worth a proof in place
-                            // (`TODO.md` #12).
+                            // Cannot underflow: `data.first()` above returned
+                            // early on an empty slice, so the length byte being
+                            // subtracted here is present.
                             have: data.len() - 1,
                         });
                     }
@@ -212,7 +170,7 @@ impl<'a> TryFromBytes<'a> for Label<'a> {
             /* extended label */
             0x1 => match data[0] {
                 // Legal encodings we do not implement (RFC 2673, RFC 6891
-                // §6.2.4), so the sender is not at fault: NOTIMP, not FORMERR.
+                // §6.2.4): NOTIMP, not FORMERR.
                 0x41 => Err(WireError::Unsupported {
                     what: "a binary label",
                 }),
@@ -233,21 +191,12 @@ pub(crate) struct DName<'a> {
     labels: Vec<Label<'a>>,
 }
 
-// RFC 1035 §2.3.1's `<label> ::= <letter> [ [ <ldh-str> ] <let-dig> ]` is
-// deliberately **not** enforced here, and this comment replaces the standing
-// `TODO: Implement validation to enforce this pattern` that asked for it —
-// deleted rather than done, because doing it would be a bug. §2.3.1 offers a
-// "preferred name syntax" that "will result in fewer problems with many
-// applications that use domain names (e.g., mail, TELNET)": advice to whoever
-// *chooses* a hostname, not a rule about what the protocol carries. RFC 2181
-// §11 settles it — "the DNS itself places only one restriction on the
-// particular labels that can be used to identify resource records", that one
-// being the length, and "any binary string whatever can be used as the label
-// of any resource record". Enforcing LDH at parse time would refuse `_dmarc`,
-// every `_tcp` SRV owner, DNS-SD's instance names and the wildcard `*` itself.
-//
-// What *is* enforced is what §2.3.4 limits: `MAX_LABEL_LEN` per label, and
-// `MAX_NAME_LEN` over the whole name in `UnpackedDName::new`.
+// RFC 1035 §2.3.1's LDH "preferred name syntax" is advice to whoever chooses a
+// hostname, not a rule about what the protocol carries: RFC 2181 §11 says "any
+// binary string whatever can be used as the label of any resource record", and
+// enforcing LDH would refuse `_dmarc`, every `_tcp` SRV owner and `*` itself.
+// Only §2.3.4's lengths are enforced — `MAX_LABEL_LEN` here, `MAX_NAME_LEN` in
+// `UnpackedDName::new`.
 impl<'a> TryFromBytes<'a> for DName<'a> {
     type Output = (DName<'a>, &'a [u8]);
     type Error = WireError;
@@ -268,17 +217,10 @@ impl<'a> TryFromBytes<'a> for DName<'a> {
     }
 }
 
-/**
- * Since dnames contain pointers, we must have a way to resolve them. Pointers are
- * offsets to bytes in the complete DNS message. While rest of the deserialization
- * works with
- *
- *   let (val, rest) = sometype::try_from_bytes(bytes)?;
- *
- * to simplify how the code reads, this loses the original byte context. We still
- * need a lookup mechanism to hop anywhere in the original set of bytes. Unpacker
- * gets contructed with the original bytes and thus is able to perform the lookup.
- */
+/// Resolves compression pointers, which are offsets into the whole message.
+///
+/// The rest of the parser works on suffix slices and so has lost that context;
+/// this holds the original bytes to hop about in.
 pub struct DNameUnpacker<'a> {
     data: &'a [u8],
 }
@@ -290,21 +232,17 @@ impl<'a> DNameUnpacker<'a> {
 
     /// Follow `name`'s compression pointers into the message.
     ///
-    /// `prev_target` is the offset the *previous* pointer in this chain jumped
-    /// to, and every later one must land strictly before it — see the check
-    /// below for why that is the whole of cycle prevention.
+    /// `prev_target` is the offset the previous pointer in this chain jumped to;
+    /// every later one must land strictly before it.
     fn unpack_internal(
         &self,
         name: DName<'a>,
         depth: usize,
         prev_target: usize,
     ) -> Result<UnpackedDName<'a>, WireError> {
-        // No longer what stops a cycle — nothing here can cycle any more — but
-        // still what bounds the *work*. Strictly decreasing targets terminate,
-        // and an offset is 14 bits, so "terminates" on its own permits ~16k
-        // hops for one name, each of them a recursive call and so a stack depth
-        // a hostile sender would get to choose. This is the cost bound; the
-        // check further down is the correctness one.
+        // Bounds the work, not the correctness: strictly decreasing targets
+        // already terminate, but a 14-bit offset leaves ~16k hops per name, each
+        // a recursive call and so a stack depth the sender would choose.
         const MAX_DEPTH: usize = 50;
 
         if depth > MAX_DEPTH {
@@ -315,16 +253,14 @@ impl<'a> DNameUnpacker<'a> {
             });
         }
 
-        // A name with no pointer in it is already unpacked, and copying its
-        // labels into a second `Vec` is the whole of what the loop below would
-        // do — one allocation per name parsed, on the path every query takes
-        // (`TODO.md` #9e). The common case is not a corner: a QNAME cannot
-        // contain a pointer, since there is nothing before it to point at.
+        // A name with no pointer is already unpacked, and the loop below would
+        // only copy its labels into a second `Vec` — one allocation per name on
+        // the path every query takes. Not a corner case: a QNAME cannot contain
+        // a pointer, having nothing before it to point at.
         //
-        // The trailing `Root` comes off, because an `UnpackedDName`'s labels are
-        // the name's *content* everywhere they are read: `try_into` stops at a
-        // `Root`, and the `extend` below would otherwise splice one into the
-        // middle of the name that pointed here.
+        // The trailing `Root` comes off because an `UnpackedDName`'s labels are
+        // the name's content: the `extend` below would otherwise splice one into
+        // the middle of the name that pointed here.
         if !name.labels.iter().any(|l| matches!(l, Label::Pointer(_))) {
             let mut labels = name.labels;
             if matches!(labels.last(), Some(Label::Root)) {
@@ -340,7 +276,6 @@ impl<'a> DNameUnpacker<'a> {
                     output.push(label.clone());
                 }
                 Label::Pointer(offset) => {
-                    // Bounds check: pointer offset must be within message
                     if *offset >= self.data.len() {
                         return Err(WireError::malformed(
                             "a compression pointer",
@@ -351,24 +286,19 @@ impl<'a> DNameUnpacker<'a> {
                         ));
                     }
 
-                    // A pointer must point backwards, and that comparison is
-                    // the whole of cycle prevention: a strictly decreasing
+                    // A pointer must point backwards (RFC 1035 §4.1.4: "to a
+                    // prior occurance of the same name"), and that comparison is
+                    // the whole of cycle prevention — a strictly decreasing
                     // sequence of `usize` cannot repeat, so a cycle is
-                    // unreachable rather than detected. RFC 1035 §4.1.4 defines
-                    // compression as a pointer "to a prior occurance of the
-                    // same name" (the RFC's spelling), so no real sender emits
-                    // a forward one. This replaced a `RefCell<HashSet<usize>>`
-                    // of visited offsets — a heap allocation per compressed
-                    // name, on the pre-authentication parse path.
+                    // unreachable rather than detected. Cheaper than the visited
+                    // set it replaces, which allocated per compressed name on
+                    // the pre-authentication parse path.
                     //
-                    // The first hop is unconstrained, deliberately: a name is
-                    // parsed from a suffix slice that does not know its own
-                    // offset, so there is nothing to compare the first target
-                    // against. Termination is the property being bought, and
-                    // one unconstrained step does not cost it. Recovering the
-                    // absolute offset would mean pointer arithmetic against
-                    // `self.data`, correct only if every caller passes a slice
-                    // derived from the message — an invariant no type states.
+                    // The first hop is unconstrained: a name is parsed from a
+                    // suffix slice that does not know its own offset, and
+                    // recovering it would mean pointer arithmetic valid only if
+                    // every caller passes a slice of the message — an invariant
+                    // no type states. One free step does not cost termination.
                     if *offset >= prev_target {
                         return Err(WireError::malformed(
                             "a compression pointer",
@@ -389,12 +319,8 @@ impl<'a> DNameUnpacker<'a> {
         UnpackedDName::new(output)
     }
 
-    /// `usize::MAX` as the starting `prev_target` is what leaves the first hop
+    /// `usize::MAX` as the starting `prev_target` leaves the first hop
     /// unconstrained: an offset is 14 bits, so no real target can equal it.
-    ///
-    /// The unpacker holds no mutable state any more, which is why there is
-    /// nothing to reset here. It used to carry a visited-offsets set shared
-    /// across every name in a message, so this function began by clearing it.
     fn unpack(&self, name: DName<'a>) -> Result<UnpackedDName<'a>, WireError> {
         self.unpack_internal(name, 0, usize::MAX)
     }
@@ -416,41 +342,28 @@ pub(crate) struct UnpackedDName<'a> {
 }
 
 impl<'a> UnpackedDName<'a> {
-    /// The only way to build one, which is what makes a name longer than
-    /// RFC 1035 §2.3.4 allows unrepresentable rather than merely unwelcome
-    /// (`CLAUDE.md` §17).
+    /// The only way to build one, so a name over RFC 1035 §2.3.4's limit is
+    /// unrepresentable rather than merely unwelcome.
     ///
-    /// The bound lives here rather than at the two places that assemble labels
-    /// — a name that arrived without a pointer, and one spliced together across
-    /// pointers — because a bound belongs at the boundary, once (`CLAUDE.md`
-    /// §2), and this type *is* the boundary: every name the parser resolves
-    /// becomes one before anything reads it. Putting it here also bounds the
-    /// recursive case for nothing extra, since every intermediate hop is built
-    /// through this function too, so a chain is cut off as it grows instead of
-    /// after the last hop returns.
+    /// Both label-assembling paths meet here, and every intermediate hop of a
+    /// pointer chain is built through it too, so a chain is cut off as it grows.
     ///
-    /// Measured on the **encoded** length, because that is what §2.3.4 limits:
-    /// `Label::len` already includes each label's length octet, and the root's
-    /// terminating zero is added back here — `unpack_internal` strips the
-    /// trailing `Root` before this is called, so there is no label standing in
-    /// for it.
+    /// Measured on the *encoded* length, which is what §2.3.4 limits:
+    /// `Label::len` includes each label's length octet, and the root's
+    /// terminating zero is added back here since `unpack_internal` has stripped
+    /// the trailing `Root`.
     fn new(labels: Vec<Label<'a>>) -> Result<UnpackedDName<'a>, WireError> {
         check_name_len(labels.iter().map(Label::len).sum::<usize>() + 1)?;
         Ok(UnpackedDName { labels })
     }
 }
 
-/// The one place RFC 1035 §2.3.4's 255-octet name limit is compared, so the two
-/// doors into this module cannot drift apart about what it counts
-/// (`CLAUDE.md` §7).
+/// The one place RFC 1035 §2.3.4's 255-octet name limit is compared.
 ///
-/// The doors are a name resolved off the wire (`UnpackedDName::new`) and a name
-/// encoded from presentation text (`dname_to_bytes`), and they arrive at
-/// `encoded` by different arithmetic — a sum over `Label::len` on one side and
-/// over `str::len() + 1` on the other. What they must agree on is that the
-/// number being compared is the *encoded* length including every length octet
-/// and the root's terminating zero, which is the part a second copy of this
-/// comparison would eventually get wrong.
+/// Its two callers — a name off the wire (`UnpackedDName::new`) and one encoded
+/// from presentation text (`dname_to_bytes`) — reach `encoded` by different
+/// arithmetic, and must agree that it is the encoded length including every
+/// length octet and the root's terminating zero.
 fn check_name_len(encoded: usize) -> Result<(), WireError> {
     if encoded > MAX_NAME_LEN {
         return Err(WireError::TooLong {
@@ -461,10 +374,6 @@ fn check_name_len(encoded: usize) -> Result<(), WireError> {
     }
     Ok(())
 }
-
-/***
- * Main API for converting to and from bytes to dnames
- */
 
 pub fn dname_from_bytes<'a>(
     bytes: &'a [u8],
@@ -489,21 +398,16 @@ pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, WireError> {
         return Ok(vec![0]); // the root, on its own
     }
 
-    // Size the buffer from the labels themselves, then let `write_label` do the
-    // validating as it writes. An over-long or empty label errors there rather
-    // than being checked twice.
+    // `write_label` validates each label as it writes, so nothing is checked
+    // twice here.
     let labels: Vec<&str> = name.split('.').collect();
     let size: usize = labels.iter().map(|l| l.len() + 1).sum::<usize>() + 1;
 
-    // `size` is already the encoded length RFC 1035 §2.3.4 limits, so the check
-    // is the same one the parse path makes and goes through the same function
-    // (`check_name_len`). One octet per byte of presentation text holds because
-    // a label containing `.` or `\` is refused outright rather than escaped
-    // (`TODO.md` #13e), so there is no escape sequence here that would encode
-    // shorter than it reads.
-    //
-    // Before the buffer, not after: a name we are about to refuse should not be
-    // allocated for (`CLAUDE.md` §13).
+    // `size` is the encoded length §2.3.4 limits: one octet per byte of
+    // presentation text holds because a label containing `.` or `\` is refused
+    // rather than escaped, so nothing here encodes shorter than it reads.
+    // Checked before the buffer, so a name about to be refused is not allocated
+    // for.
     check_name_len(size)?;
 
     let mut out = vec![0u8; size];
@@ -515,15 +419,8 @@ pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, WireError> {
     Ok(out)
 }
 
-/**
- * Implement TryInto for UnpackedDName so we can finally turn the name into
- * a string. The design is you can only go
- *
- *   bytes -> DName -> unpacker -> UnpackedDName -> String
- *
- * This way the type system makes sure you don't end up with dname fragments,
- * as you would with a more naive implementation.
- */
+/// The only route to a string is `bytes -> DName -> unpacker -> UnpackedDName`,
+/// so the type system rules out formatting a name fragment.
 impl<'a> TryInto<String> for UnpackedDName<'a> {
     fn try_into(self) -> Result<String, Self::Error> {
         // Phase 1: Calculate exact size needed
@@ -717,12 +614,11 @@ mod tests {
     /// two-label name `[01 'a' 01 'b']` both read as `"a.b."` — two distinct
     /// names collapsing onto one string, which every name-keyed map and every
     /// tree-shaped question in this codebase assumes cannot happen. The visible
-    /// consequence was `is_at_or_under("evil.com.", "com.")` answering **true**
+    /// consequence was `is_at_or_under("evil.com.", "com.")` answering true
     /// for a single label that is a *sibling* of `com.`, not a child of it.
     ///
-    /// NOTIMP rather than FORMERR: the sender is not at fault. This is a legal
-    /// encoding we decline to represent, the same judgement `Label` already
-    /// makes about binary labels (`TODO.md` #13e).
+    /// NOTIMP rather than FORMERR: the sender is not at fault. A legal encoding
+    /// we decline to represent, as `Label` already does for binary labels.
     #[test]
     fn a_label_containing_the_separator_is_refused() {
         // ONE label: 'a', '.', 'b'.
@@ -802,7 +698,7 @@ mod tests {
         );
     }
 
-    /// The depth limit is enforced on a chain that is otherwise **legal**.
+    /// The depth limit is enforced on a chain that is otherwise legal.
     ///
     /// This test used to build a chain running *forwards* — `0->2->4->…` — and
     /// so would now be refused by the backwards rule on its second hop, passing
@@ -841,7 +737,7 @@ mod tests {
     /// "with a pointer to a prior occurance of the same name"), and a chain that
     /// runs forwards is refused.
     ///
-    /// **Watched failing against the old code** (`CLAUDE.md` §1): with the
+    /// Watched failing against the old code (`CLAUDE.md` §1): with the
     /// visited-offsets set, this chain has no repeated offset, so it unpacked
     /// happily to `"a.b."`. Two hops are needed to demonstrate it because the
     /// first is unconstrained — see `unpack_internal`.

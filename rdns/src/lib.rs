@@ -5,17 +5,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use compression::NameCompressor;
 use dname::{dname_from_bytes, dname_to_bytes, write_bytes, DNameUnpacker, TryUnpackFromBytes};
 
-/// This build, as `<package version> (<git describe>)`.
-///
-/// Stamped by `build.rs`. Every binary passes it to clap's `version`, so
-/// `--version` names a commit rather than three crates all saying `0.1.0` —
-/// which is what an operator needs when asked which build is running.
+/// This build, as `<package version> (<git describe>)`. Stamped by `build.rs`
+/// and passed to clap's `version` by every binary, so `--version` names a
+/// commit.
 pub const VERSION: &str = env!("RDNS_VERSION");
 
-// The *file name* is kept on purpose — `TODO.md` §10 argues from
-// `bench_logger_throughput` by name — but the module is entirely
-// `#[cfg(test)]`, so a `pub mod` exported an empty public module from every
-// release build (`TODO.md` #19h).
 #[cfg(test)]
 mod bench;
 pub mod cache;
@@ -27,8 +21,7 @@ pub mod dnssec_answer;
 pub mod dnssec_chain;
 pub mod dnssec_denial;
 pub mod dnssec_key;
-/// Real DNSSEC signing for tests only — see the module docs for why an
-/// in-process signer is the only way to exercise this code here.
+/// Real DNSSEC signing, for tests only.
 #[cfg(test)]
 mod dnssec_test_util;
 pub mod dnssec_validation_mode;
@@ -60,11 +53,9 @@ pub mod zone;
 pub mod zone_signer;
 pub mod zone_writer;
 
-// Re-export cache module for public use
 pub use cache::{CacheStats, DnsCache};
 
-/// [`RecordData`] lives in its own module so its fields can be private to it —
-/// see that module's header for why a one-struct module is the point.
+/// [`RecordData`] lives in its own module so its fields are private to it.
 pub use record_data::RecordData;
 
 #[macro_use]
@@ -90,26 +81,9 @@ mod macros {
 /// The four-bit OPCODE of RFC 1035 §4.1.1 — "set by the originator of a query
 /// and copied into the response".
 ///
-/// `Other` carries the value, and that copying rule is why. This used to be an
-/// `Unknown = 15` sentinel parsed with
-/// `OpCode::from_u8((hi >> 3) & 0x0f).unwrap_or(OpCode::Unknown)`, and 15 is a
-/// real value in a four-bit field, so **eleven of the sixteen opcodes came back
-/// off the wire as 15** — 3 and 7-15, which IANA lists as Unassigned, and
-/// **6, which is DSO (RFC 8490) and assigned**. `rdnsd` answers an opcode it
-/// does not implement with NOTIMP and echoes this field, so a DSO client was
-/// handed a reply whose OPCODE was not the one it sent, which RFC 5452 §9.1 has
-/// it discard.
-///
-/// The third variant of the same mistake, after `QueryClass::None` (which was
-/// 254, a real class) and `ResponseCode::Unknown` (which serialized as
-/// NOERROR). All three had the same cause — `num_derive`'s `FromPrimitive`
-/// hands back an `Option` and invites the `unwrap_or` — and fixing this one
-/// removed the last user of that crate from the workspace. See `CLAUDE.md` §2
-/// and §17.
-///
-/// No explicit discriminants, because a variant with a payload forbids them;
-/// the numbering lives in [`OpCode::from_u8`] and [`OpCode::to_u8`], which are
-/// each other's inverse over the whole four-bit range.
+/// `Other` carries the value, because that copying rule leaves no room for a
+/// sentinel: every four-bit value is a real opcode. The numbering lives in
+/// [`OpCode::from_u8`] and [`OpCode::to_u8`], which are each other's inverse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpCode {
     Query,
@@ -118,18 +92,13 @@ pub enum OpCode {
     Notify,
     Update,
     /// An opcode this implementation has no name for, kept as it arrived.
-    ///
-    /// Always four bits: [`OpCode::from_u8`] masks, so the field cannot hold a
-    /// value the wire has no room for and [`OpCode::to_u8`] cannot lose one.
+    /// Always four bits: [`OpCode::from_u8`] masks.
     Other(u8),
 }
 
 impl OpCode {
-    /// Total, by construction: every four-bit value is some opcode.
-    ///
-    /// The mask is the boundary this type's invariant is established at
-    /// (`CLAUDE.md` §2) — OPCODE is four bits, so a larger `u8` is not an
-    /// opcode that got truncated later, it is not an opcode at all.
+    /// Total: every four-bit value is some opcode. The mask establishes that —
+    /// a larger `u8` is not an opcode at all.
     pub fn from_u8(value: u8) -> Self {
         match value & 0x0f {
             0 => OpCode::Query,
@@ -154,17 +123,13 @@ impl OpCode {
     }
 }
 
-// practically always IN (1), classes are supposed to be sort of
-// dimension to the DNS database (see RFC6895 section 3.2). Only CH (3)
-// and HS (4) are mentioned but practially never used outside of local tests
+/// The class a *question* asks for — QCLASS (RFC 6895 §3.2). Practically always
+/// IN; CH and HS exist and are near-unused.
 ///
-/// `Other` carries the value, which is the whole point of it. The parse used to
-/// be `QueryClass::from_u16(qclass).unwrap_or(QueryClass::None)`, and `None` is
-/// not a sentinel — it is 254, RFC 2136's real "no such class" used in UPDATE
-/// prerequisites. So QCLASS 99 arrived as `None`, was re-serialized as **254**,
-/// and the question echoed back in the response was not the question that was
-/// asked. A client matching the response to its query on the question section,
-/// as RFC 5452 §9.1 says to, sees a mismatch and discards a reply it waited for.
+/// `Other` carries the value: a class we cannot name must be echoed back as
+/// itself, since a client matches the response to its query on the question
+/// section (RFC 5452 §9.1). There is no free sentinel — 254 is RFC 2136's real
+/// NONE.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum QueryClass {
     IN,
@@ -189,11 +154,9 @@ impl QueryClass {
         }
     }
 
-    /// Whether this question selects a record in `class`.
-    ///
-    /// The only comparison of a question's class against stored data. ANY
-    /// matches every class (RFC 1035 §3.2.5), which is why matching it against
-    /// the IN zone is right when IN is the only class this server holds.
+    /// Whether this question selects a record in `class`. The only comparison
+    /// of a question's class against stored data; ANY matches every class
+    /// (RFC 1035 §3.2.5).
     pub fn matches(self, class: Class) -> bool {
         self == QueryClass::Any || self.to_u16() == class.to_u16()
     }
@@ -203,8 +166,7 @@ impl QueryClass {
         self.to_u16() == class.to_u16()
     }
 
-    /// Infallible, so round-tripping a question is total: what came off the wire
-    /// goes back onto it unchanged.
+    /// Infallible: what came off the wire goes back onto it unchanged.
     pub fn to_u16(self) -> u16 {
         match self {
             QueryClass::IN => 1,
@@ -219,25 +181,8 @@ impl QueryClass {
 
 /// The class a *record* is in — CLASS, not QCLASS (RFC 1035 §3.2.4).
 ///
-/// The third pair in this file, after [`Rtype`]/[`Qtype`] and beside
-/// [`QueryClass`]. QCLASS is a superset of CLASS (§3.2.5): `*` (255) matches any
-/// class and RFC 2136 §2.4 uses NONE (254) in an UPDATE, and no stored record is
-/// in either. The conversion runs one way, [`Class`] into [`QueryClass`], and
-/// there is no way back.
-///
-/// **This could not be a newtype until OPT stopped being parsed as a resource
-/// record** (`TODO.md` #13d). An OPT record's CLASS field is the requestor's UDP
-/// payload size, not a class at all — the same two-meanings-in-one-field problem
-/// [`Ttl`] had, in the field next door, and fixed by the same change.
-///
-/// §8 of `CLAUDE.md` records what the untyped version cost: the class was parsed,
-/// stored on every record, and then never compared, so a CH question was
-/// answered out of the IN zone and the reply carried `CLASS=CH` in the echoed
-/// question beside `CLASS=IN` records in the answer. That was fixed in `rdnsd`'s
-/// query loop and in the zone parser, which refuses a non-IN record outright —
-/// and it is the parser's refusal, not the type, that makes the class-blind zone
-/// index correct. The type is what stops the *next* pseudo-record quietly
-/// borrowing the field.
+/// QCLASS is a superset (§3.2.5), so the conversion runs one way only:
+/// [`Class`] into [`QueryClass`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Class(u16);
@@ -261,21 +206,16 @@ impl Class {
     }
 
     /// Whether this is a QCLASS-only value that no stored record can be in:
-    /// ANY (255) and RFC 2136's NONE (254).
-    ///
-    /// Both arrive in a record's CLASS field in an UPDATE message, where §2.4
-    /// and §2.5 repurpose it to say what to *do* with the record — which is why
-    /// `Class` can hold them and why [`QueryClass::from`] exists.
+    /// ANY (255) and RFC 2136's NONE (254). Both arrive in a record's CLASS
+    /// field in an UPDATE, where §2.4 and §2.5 repurpose it to say what to *do*
+    /// with the record.
     pub const fn is_meta(self) -> bool {
         matches!(self.0, 254 | 255)
     }
 }
 
 impl Default for Class {
-    /// IN. Every zone this server holds is IN — `zone::parse_zone_file` refuses
-    /// anything else — so a record built without saying its class is in the only
-    /// one there is. A `derive(Default)` would have given `CLASS0`, which is not
-    /// a class at all.
+    /// IN, not `derive(Default)`'s `CLASS0`, which is not a class at all.
     fn default() -> Class {
         Class::IN
     }
@@ -293,12 +233,8 @@ impl std::fmt::Display for Class {
 }
 
 impl From<Class> for QueryClass {
-    /// Every CLASS is a legal QCLASS (RFC 1035 §3.2.5). The reverse does not
-    /// exist, and that asymmetry is the point of the pair.
-    ///
-    /// This is also how RFC 2136's repurposed CLASS field is read: an UPDATE
-    /// carries ANY or NONE there to mean "any type at this name" or "delete",
-    /// and `update.rs` matches on the `QueryClass` this produces.
+    /// Every CLASS is a legal QCLASS (RFC 1035 §3.2.5); there is no reverse.
+    /// Also how `update.rs` reads RFC 2136's repurposed CLASS field.
     fn from(class: Class) -> QueryClass {
         QueryClass::from_u16(class.to_u16())
     }
@@ -306,17 +242,10 @@ impl From<Class> for QueryClass {
 
 /// The type a *record* has — TYPE, not QTYPE (RFC 1035 §3.2.1).
 ///
-/// The other half of the pair [`Qtype`] documents. There is no conversion from
-/// `Qtype` to `Rtype`, because most QTYPEs are not record types; the conversion
-/// that does exist runs the other way, since every TYPE is a legal QTYPE.
-///
-/// **A few values appear in a TYPE field and are still not record types.** ANY,
-/// AXFR and IXFR are meta-types (RFC 6895 §3.1): they are legal in a question,
-/// and RFC 2136 §2.4 and §2.5 also put TYPE=ANY in an UPDATE's prerequisite and
-/// update sections to mean "any type at this name". So `Rtype` can hold them —
-/// they arrive on the wire — and [`Rtype::is_meta`] is how code asks whether the
-/// value in hand could ever be a stored record. §3.4.1's prescan is exactly that
-/// question.
+/// There is no conversion from [`Qtype`]; most QTYPEs are not record types.
+/// `Rtype` can still hold the meta-types (RFC 6895 §3.1), because RFC 2136 §2.4
+/// and §2.5 put TYPE=ANY in an UPDATE's record sections — see
+/// [`Rtype::is_meta`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Rtype(u16);
@@ -333,11 +262,8 @@ impl Rtype {
     }
 
     /// Whether this is a meta-type — a value that may appear in a TYPE field but
-    /// that no stored resource record can have (RFC 6895 §3.1).
-    ///
-    /// RFC 2136 §3.4.1's prescan refuses an UPDATE that tries to *add* one, and
-    /// that is the question this answers: not "is this ANY" but "could this ever
-    /// be a record".
+    /// that no stored resource record can have (RFC 6895 §3.1). RFC 2136 §3.4.1's
+    /// prescan refuses an UPDATE that tries to add one.
     pub const fn is_meta(self) -> bool {
         matches!(
             self.0,
@@ -355,8 +281,7 @@ impl std::fmt::Display for Rtype {
 }
 
 impl From<Rtype> for Qtype {
-    /// Every TYPE is a legal QTYPE (RFC 1035 §3.2.3). The reverse does not
-    /// exist, and that asymmetry is the whole point of the pair.
+    /// Every TYPE is a legal QTYPE (RFC 1035 §3.2.3); there is no reverse.
     fn from(rtype: Rtype) -> Qtype {
         Qtype(rtype.0)
     }
@@ -364,27 +289,12 @@ impl From<Rtype> for Qtype {
 
 /// The type a *question* asks for — QTYPE, not TYPE (RFC 1035 §3.2.3).
 ///
-/// A newtype because the two are different spaces and `u16` let them be
-/// compared. QTYPE is "a superset of TYPE": it holds values **no resource
-/// record can ever have** — ANY (255), AXFR (252), IXFR (251), MAILB (253) and
-/// MAILA (254) — so `record.rtype == question.qtype` is false for every record
-/// in a perfectly good answer whenever the question is one of those.
-///
-/// That has cost this codebase twice. `zone::of_type` returned nothing for
-/// QTYPE=ANY, so an ANY query at a name with data came back as an empty NOERROR
-/// plus the SOA — a NODATA for a name that has data, and none of the shapes
-/// RFC 8482 §4 permits (`CLAUDE.md` §8). That was fixed at the call site, and
-/// the same comparison was still written twice in `resolver.rs`: once to decide
-/// whether a CNAME chase is finished, and once to decide whether an answer is
-/// *negative* — which sent the DNSSEC validator looking for a denial proof that
-/// a positive answer has no reason to carry, so an ANY answer that verified was
-/// reported `Bogus("... was denied without an NSEC or NSEC3 proof")` and
-/// `rdnsr --dnssec-validate` failed closed with SERVFAIL. Nothing on that path
-/// rejects ANY, so a client only had to ask.
-///
-/// The fix is that there is no way to compare the two spaces except
-/// [`Qtype::matches`], which knows what ANY means, and [`Qtype::is`], which asks
-/// the narrower question out loud. See `TODO.md` #13c and `CLAUDE.md` §17.
+/// A superset of TYPE: it holds values no resource record can ever have — ANY
+/// (255), AXFR (252), IXFR (251), MAILB (253), MAILA (254) — so
+/// `record.rtype == question.qtype` is false for every record in a perfectly
+/// good ANY answer. A newtype so that comparison does not compile: the two
+/// spaces meet only at [`Qtype::matches`], which knows what ANY means, and
+/// [`Qtype::is`], which asks the narrower question out loud.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Qtype(u16);
@@ -397,11 +307,8 @@ impl Qtype {
     /// An incremental transfer (RFC 1995).
     pub const IXFR: Qtype = Qtype(utils::record_types::IXFR_CODE);
 
-    /// The question that asks for exactly this record type.
-    ///
-    /// `const`, so it can name a `Qtype` wherever `utils::record_types` names a
-    /// TYPE — which is what keeps one registry of numbers rather than two that
-    /// can drift (`CLAUDE.md` §7).
+    /// The question that asks for exactly this record type. `const`, so
+    /// `utils::record_types` stays the one registry of numbers.
     pub const fn of(rtype: Rtype) -> Qtype {
         Qtype(rtype.to_u16())
     }
@@ -416,18 +323,14 @@ impl Qtype {
         self.0
     }
 
-    /// Whether this question selects a stored record of type `rtype`.
+    /// Whether this question selects a stored record of type `rtype` — the only
+    /// comparison of a question's type against stored data.
     ///
-    /// **The only comparison of a question's type against stored data**, and the
-    /// reason this type exists. ANY means every type at the name (RFC 1035
-    /// §3.2.3) — *except* the three DNSSEC meta types, which are not
-    /// answer-section data unless the DO bit asked for them (RFC 4035 §3.1.1)
-    /// and whose signatures are attached by `dnssec_answer::answer_signatures`,
-    /// which knows which ones an answer actually owes. Returning them here would
-    /// hand signatures to a client that cannot read them, duplicate them for one
-    /// that can, and — the correctness bug rather than the noise — make an empty
-    /// non-terminal in an NSEC-signed zone look like a name *with* data, because
-    /// the chain puts an NSEC at it.
+    /// ANY means every type at the name (RFC 1035 §3.2.3) *except* RRSIG, NSEC
+    /// and NSEC3, which are not answer-section data unless DO asked for them
+    /// (RFC 4035 §3.1.1); `dnssec_answer::answer_signatures` attaches those.
+    /// Including them would also make an empty non-terminal in an NSEC-signed
+    /// zone look like a name with data.
     pub fn matches(self, rtype: Rtype) -> bool {
         use utils::record_types as rt;
         if self == Qtype::ANY {
@@ -437,10 +340,8 @@ impl Qtype {
         }
     }
 
-    /// Whether the question is for exactly `rtype` — the narrow question, with
-    /// no ANY handling. Say this when "is the client asking for a DS?" is what
-    /// is meant, so that the site does not read like a [`Qtype::matches`] that
-    /// forgot about ANY.
+    /// Whether the question is for exactly `rtype`, with no ANY handling — so
+    /// the call site does not read like a [`Qtype::matches`] that forgot it.
     pub const fn is(self, rtype: Rtype) -> bool {
         self.0 == rtype.to_u16()
     }
@@ -454,20 +355,18 @@ impl std::fmt::Display for Qtype {
 
 #[derive(Debug, Clone)]
 pub struct QuerySection {
-    // Contains the domain name for the question
     pub qname: String,
     /// The type asked for. See [`Qtype`] — a QTYPE is not a TYPE.
     pub qtype: Qtype,
     pub qclass: QueryClass,
 }
 
-/// Typed, fully-parsed view of a record's data.
+/// Typed, fully-parsed view of a record's data: produced on demand by
+/// [`RecordData::parse`], consumed by [`RecordData::from_parsed`].
 ///
-/// This is produced on demand from [`RecordData`] via [`RecordData::parse`],
-/// and consumed when building records via [`RecordData::from_parsed`]. It is
-/// deliberately *not* what we store: keeping the parsed form (with its `String`s
-/// and `Vec`s) resident for every cached record is what the raw-bytes storage
-/// avoids. All domain names here are fully-qualified and uncompressed.
+/// Not what we store — the raw-bytes form avoids keeping these `String`s and
+/// `Vec`s resident per cached record. Domain names here are fully-qualified and
+/// uncompressed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedRecord {
     A(Ipv4Addr),
@@ -489,21 +388,12 @@ pub enum ParsedRecord {
         preference: u16,
         exchange: String,
     },
-    /// One TXT record's `<character-string>`s (RFC 1035 §3.3.14).
+    /// One TXT record's `<character-string>`s (RFC 1035 §3.3.14): a run of
+    /// length-prefixed strings of at most 255 octets each.
     ///
-    /// A sequence of byte strings, and both halves of that matter.
-    ///
-    /// **A sequence**, because the RDATA is a run of length-prefixed strings of
-    /// at most 255 bytes each, and a record holding two of them is a different
-    /// record from one holding the two joined together. Stored as a single
-    /// unframed blob — which is what this was — the RDATA is something no
-    /// correct client can read: the first byte of the text is taken for a length
-    /// that nothing wrote.
-    ///
-    /// **Bytes**, because a character-string is arbitrary octets. As `String` it
-    /// was worse than lossy: a TXT carrying non-UTF-8 data failed to decode, and
-    /// since decoding happens while reading the message, one such record made
-    /// the entire response unparseable.
+    /// A sequence, because two strings are a different record from the two
+    /// joined. Bytes, because a character-string is arbitrary octets, and a
+    /// `String` would fail the whole message on a TXT carrying non-UTF-8 data.
     TXT(Vec<Vec<u8>>),
     AAAA(Ipv6Addr),
     DNSKEY {
@@ -554,26 +444,14 @@ impl ParsedRecord {
         rdata: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<Self, WireError> {
-        // RDLENGTH=0 names a type and carries no value, and it is legal:
-        // RFC 2136 §2.4.1/§2.4.2 spell "an RRset of this type exists / does not
-        // exist" as TYPE=t, CLASS=ANY or NONE, RDLENGTH=0, and §2.5.2/§2.5.3
-        // spell "delete this RRset" the same way. The record is a specifier, not
-        // data.
+        // RDLENGTH=0 is legal and means the record is a specifier, not data:
+        // RFC 2136 §2.4.1/§2.4.2 and §2.5.2/§2.5.3 spell the RRset prerequisites
+        // and deletions that way. Without this the arms below reject it and a
+        // legal UPDATE is FORMERR before `update.rs` sees it.
         //
-        // Without this the arms below reject it — an A with no bytes is four
-        // bytes short — and since `RecordData::from_wire` runs per record while
-        // the message is read, the whole UPDATE became FORMERR before
-        // `update.rs` saw it. Nothing caught that because `update.rs`'s tests
-        // build `DnsMessage` structs directly and never cross the wire.
-        //
-        // `Unknown` rather than a per-type empty variant: "no value" is the same
-        // fact whatever the type, the bytes (none) are kept verbatim, and the
-        // TYPE is carried by the enclosing `RecordData`.
-        //
-        // The cost is that an answer holding an A with RDLENGTH 0 parses rather
-        // than making the message FORMERR — one useless record relayed as it
-        // arrived, against refusing a class of legal message. RFC 3597 §5 already
-        // requires carrying RDATA we cannot interpret.
+        // The cost is that an A with RDLENGTH 0 in an answer is relayed rather
+        // than refused; RFC 3597 §5 already requires carrying RDATA we cannot
+        // interpret.
         if rdata.is_empty() {
             return Ok(ParsedRecord::Unknown(record_type));
         }
@@ -623,8 +501,6 @@ impl ParsedRecord {
                 })
             }
             utils::record_types::TXT => {
-                // A run of `<character-string>`s: one length byte, then that
-                // many bytes, until the RDATA runs out.
                 let mut strings = Vec::new();
                 let mut rest = rdata;
                 while let Some((&len, after_len)) = rest.split_first() {
@@ -645,9 +521,7 @@ impl ParsedRecord {
                 let addr: [u8; 16] = rdata.try_into()?;
                 Ok(ParsedRecord::AAAA(Ipv6Addr::from(addr)))
             }
-            // DNSSEC types
             utils::record_types::DS => {
-                // DS: key_tag(2) + algorithm(1) + digest_type(1) + digest(variable)
                 let (key_tag, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
                     return Err(WireError::Truncated {
@@ -667,12 +541,9 @@ impl ParsedRecord {
                 })
             }
             utils::record_types::RRSIG => {
-                // RRSIG (RFC 4034 §3.1): type_covered(2) + algorithm(1) + labels(1)
-                // + original_ttl(4) + expiration(4) + inception(4) + key_tag(2) +
-                // signer_name + signature. Expiration precedes inception on the
-                // wire — reading them the other way round makes an expired
-                // signature look current, which is only invisible while both ends
-                // of the round trip are ours.
+                // RRSIG (RFC 4034 §3.1). Expiration precedes inception on the
+                // wire; the other order makes an expired signature look current
+                // and round-trips cleanly against ourselves.
                 let (type_covered, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
                     return Err(WireError::Truncated {
@@ -702,7 +573,6 @@ impl ParsedRecord {
                 })
             }
             utils::record_types::NSEC => {
-                // NSEC: next_domain_name + type_bitmap
                 let (next_domain_name, rest) = dname_from_bytes(rdata, unpacker)?;
                 let type_bitmap = rest.to_vec();
                 Ok(ParsedRecord::NSEC {
@@ -711,7 +581,6 @@ impl ParsedRecord {
                 })
             }
             utils::record_types::DNSKEY => {
-                // DNSKEY: flags(2) + protocol(1) + algorithm(1) + public_key(variable)
                 let (flags, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
                     return Err(WireError::Truncated {
@@ -731,7 +600,6 @@ impl ParsedRecord {
                 })
             }
             utils::record_types::NSEC3 => {
-                // NSEC3: hash_algorithm(1) + flags(1) + iterations(2) + salt_len(1) + salt(variable) + next_hashed_owner + type_bitmap
                 if rdata.len() < 5 {
                     return Err(WireError::Truncated {
                         what: "NSEC3 RDATA",
@@ -782,10 +650,8 @@ impl ParsedRecord {
         }
     }
 
-    /// Encode this record into `(rtype, uncompressed wire-format RDATA)`.
-    ///
-    /// The inverse of [`ParsedRecord::decode`] for the types we parse. Names
-    /// are written uncompressed via [`dname_to_bytes`].
+    /// Encode into `(rtype, uncompressed wire-format RDATA)` — the inverse of
+    /// [`ParsedRecord::decode`] for the types we parse.
     pub(crate) fn encode(&self) -> Result<(Rtype, Vec<u8>), WireError> {
         let out = match self {
             ParsedRecord::A(addr) => (utils::record_types::A, addr.octets().to_vec()),
@@ -810,9 +676,8 @@ impl ParsedRecord {
                 }
                 let mut v = Vec::new();
                 for s in strings {
-                    // The length is one byte, so 255 is the ceiling. Splitting a
-                    // longer string across two character-strings would change
-                    // what the record says, so this is the zone's mistake to fix.
+                    // One length byte, so 255 is the ceiling. Splitting a longer
+                    // string in two would change what the record says.
                     let len = u8::try_from(s.len()).map_err(|_| WireError::TooLong {
                         what: "a TXT character-string",
                         limit: 255,
@@ -917,20 +782,19 @@ impl ParsedRecord {
                 v.extend_from_slice(type_bitmap);
                 (utils::record_types::NSEC3, v)
             }
-            // Opaque types are stored verbatim by `RecordData::from_wire`; there
-            // is no typed payload to re-encode here.
+            // Stored verbatim by `RecordData::from_wire`; nothing to re-encode.
             ParsedRecord::Unknown(rtype) => (*rtype, Vec::new()),
         };
         Ok(out)
     }
 }
 
-/// `PartialEq` is structural and includes the TTL, which is the right default
-/// and not what every DNS comparison wants: RFC 2181 §5.2 says the TTLs within
-/// one RRset must agree, so two records differing only in TTL are a malformed
-/// RRset rather than two different records. Anywhere that distinction matters —
-/// `ixfr`'s delta keys, `update`'s §2.5.4 deletion — compares the fields it
-/// means rather than reaching for this.
+/// One resource record.
+///
+/// `PartialEq` is structural and so includes the TTL, which is not what every
+/// DNS comparison wants: two records differing only in TTL are a malformed
+/// RRset (RFC 2181 §5.2), not two records. `ixfr`'s delta keys and `update`'s
+/// §2.5.4 deletion compare the fields they mean instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRecord {
     pub name: String,
@@ -943,21 +807,10 @@ pub struct ResourceRecord {
 
 /// How long a record may be cached, in seconds.
 ///
-/// A `u32`, clamped at the parse boundary. RFC 1035 §4.1.3 calls the field "a 32
-/// bit signed integer"; RFC 2181 §8 corrects it — the TTL is unsigned, and a
-/// value with the top bit set is treated as zero. [`Ttl::from_wire`] does that
-/// `.max(0)` once, where the bytes come off the wire.
-///
-/// It was an `i32` on [`ResourceRecord`] with the clamp written out fourteen
-/// times, plus five `.min(i32::MAX as u32) as i32` going the other way. Every one
-/// was correct; the missing one is `CLAUDE.md` §2's bug — `ttl as u64` on a
-/// negative TTL is `u64::MAX`, which `min` picked as the smallest TTL in an RRset
-/// and pinned a cache entry for the life of the process.
-///
-/// This could not be done before OPT left the additional section (`TODO.md`
-/// #13d): an OPT record's TTL field packs the extended RCODE, the EDNS version
-/// and the DO bit, so clamping every `ResourceRecord` TTL would have corrupted
-/// it.
+/// A `u32` clamped once, at the parse boundary: RFC 1035 §4.1.3 calls the field
+/// signed, RFC 2181 §8 corrects it to unsigned with the top-bit-set case treated
+/// as zero. [`Ttl::from_wire`] is where that happens, so no call site has to
+/// widen a negative `i32` and get `u64::MAX` for the smallest TTL in an RRset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct Ttl(u32);
@@ -966,9 +819,8 @@ impl Ttl {
     /// Zero seconds: do not cache (RFC 1035 §3.2.1).
     pub const ZERO: Ttl = Ttl(0);
 
-    /// A TTL as it came off the wire, clamped per RFC 2181 §8.
-    ///
-    /// Total, and the only place the sign of the wire field is considered.
+    /// A TTL as it came off the wire, clamped per RFC 2181 §8 — the only place
+    /// the sign of the wire field is considered.
     pub const fn from_wire(seconds: i32) -> Ttl {
         Ttl(if seconds < 0 { 0 } else { seconds as u32 })
     }
@@ -983,11 +835,9 @@ impl Ttl {
         self.0
     }
 
-    /// The count of seconds, widened for arithmetic against a timestamp.
-    ///
-    /// A separate accessor rather than `as u64` at each site, because the
-    /// widening is where the original bug lived: it is safe here only because
-    /// the value is already non-negative by construction.
+    /// The count of seconds, widened for arithmetic against a timestamp. An
+    /// accessor rather than `as u64` per site: the widening is only safe because
+    /// the value is non-negative by construction.
     pub const fn as_u64(self) -> u64 {
         self.0 as u64
     }
@@ -997,8 +847,8 @@ impl Ttl {
         Ttl(if self.0 > ceiling { ceiling } else { self.0 })
     }
 
-    /// The wire encoding: RFC 2181 §8 makes the field unsigned, so this is the
-    /// same 32 bits, and a value with the top bit set can no longer be built.
+    /// The wire encoding — the same 32 bits, since RFC 2181 §8 makes the field
+    /// unsigned.
     pub const fn to_wire(self) -> u32 {
         self.0
     }
@@ -1012,22 +862,8 @@ impl std::fmt::Display for Ttl {
 
 /// A zone's version number: the SOA's SERIAL field (RFC 1035 §3.3.13).
 ///
-/// No `PartialOrd` and no `Ord`, so `a > b` does not compile and
-/// [`Serial::is_newer_than`] is the only way to ask which version is later.
-/// Serials are RFC 1982 sequence-space numbers: they wrap, and `signed_serial`
-/// adds hours-since-the-epoch to whatever the operator wrote, which brings the
-/// 32-bit ceiling closer than "136 years at one bump a second" suggests.
-///
-/// A plain `>` does not cost one wrong answer: a secondary that reads a wrapped
-/// increment as a rollback declines the transfer and goes on declining it, with
-/// nothing in a failed state to alert on.
-///
-/// The arithmetic used to be written out twice, in `secondary::is_newer` and
-/// `notify::changed_zones`. Both are gone; this is the copy.
-///
-/// No live defect prompted this (`TODO.md` #14a) — nothing compared two serials
-/// with an operator, so there is no regression test and the compile error is the
-/// test.
+/// No `PartialOrd` and no `Ord`: RFC 1982 sequence space wraps, so `a > b` is
+/// not "a is later". [`Serial::is_newer_than`] is the only comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(transparent)]
 pub struct Serial(u32);
@@ -1043,39 +879,27 @@ impl Serial {
         self.0
     }
 
-    /// Whether this version is later than `other` (RFC 1982 §3.2).
+    /// Whether this version is later than `other` (RFC 1982 §3.2): the forward
+    /// distance is in the first half of the space. Equal serials are not newer,
+    /// so a secondary does not re-transfer an unchanged zone.
     ///
-    /// > s1 < s2 ... if s1 < s2 and (s2 - s1) < 2^(SERIAL_BITS - 1)
-    ///
-    /// Which in wrapping arithmetic is the whole of it: the forward distance is
-    /// in the first half of the space. Equal serials are not newer — an
-    /// unchanged zone is not news, and a secondary must not re-transfer one.
-    ///
-    /// **Not `PartialOrd`.** It cannot be: RFC 1982 §3.2 says so out loud for
-    /// serials exactly half the space apart, where "the result ... is undefined"
-    /// and neither is later. An `Ord` that has to pick one would be lying, and
-    /// deriving one would give the plain `>` this type exists to forbid.
+    /// Not `PartialOrd`: §3.2 leaves the result undefined for serials exactly
+    /// half the space apart, and an `Ord` would have to invent one.
     pub const fn is_newer_than(self, other: Serial) -> bool {
         let forward = self.0.wrapping_sub(other.0);
         forward != 0 && forward < 0x8000_0000
     }
 
-    /// This serial advanced by `increment`, wrapping (RFC 1982 §3.1).
-    ///
-    /// Wrapping is the defined addition in the sequence space, not an overflow
-    /// to be avoided — which is why this is spelled out rather than left to
-    /// `+`, whose debug panic would be the wrong answer at the one moment it
-    /// mattered.
+    /// This serial advanced by `increment`, wrapping (RFC 1982 §3.1) — wrapping
+    /// is the defined addition in the sequence space, not an overflow.
     pub const fn wrapping_add(self, increment: u32) -> Serial {
         Serial(self.0.wrapping_add(increment))
     }
 }
 
 impl std::fmt::Display for Serial {
-    /// Forwards the whole formatter rather than `write!("{}", self.0)`, so that
-    /// width and alignment survive: `zone_writer` writes `{serial:<12}` into a
-    /// zone file's SOA block and `rdnsctl status` writes `{:>6}` into a column,
-    /// and a `write!` that ignores the flags silently unaligns both.
+    /// Forwards the whole formatter, so width and alignment survive: callers
+    /// write `{serial:<12}` into a zone file and `{:>6}` into a status column.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(&self.0, f)
     }
@@ -1084,8 +908,7 @@ impl std::fmt::Display for Serial {
 impl std::str::FromStr for Serial {
     type Err = std::num::ParseIntError;
 
-    /// The presentation form is a decimal number and nothing else — the zone
-    /// file's SOA field and the secondary state file's second column.
+    /// The presentation form is a decimal number and nothing else.
     fn from_str(text: &str) -> Result<Serial, Self::Err> {
         text.parse().map(Serial)
     }
@@ -1094,18 +917,10 @@ impl std::str::FromStr for Serial {
 /// A DNS response code: the 12-bit value of RFC 6891 §6.1.3, not the 4-bit
 /// header field.
 ///
-/// `Other` replaces what was an `Unknown = 65535` sentinel. The sentinel could
-/// not carry the code it stood for, so [`DnsMessage::to_bytes`] mapped it to
-/// **0** — and the resolver *does* relay upstream messages, so a response
-/// carrying an rcode we have no name for was handed to the client as NOERROR.
-/// An unrecognized failure became a successful empty answer, which is the one
-/// direction this must never fail in. RFC 6895 §2.3 keeps the space open for
-/// exactly this: codes get assigned after the code that relays them is written.
-///
-/// No explicit discriminants, because a variant with a payload forbids them.
-/// The numbering lives in [`ResponseCode::from_u16`] and
-/// [`ResponseCode::to_u16`] instead, which are each other's inverse over the
-/// whole 16-bit range.
+/// `Other` carries the value: an rcode we have no name for is relayed as
+/// itself, never as NOERROR, and RFC 6895 §2.3 keeps the space open. The
+/// numbering lives in [`ResponseCode::from_u16`] and [`ResponseCode::to_u16`],
+/// which are each other's inverse over the whole 16-bit range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseCode {
     // RFC 1035 - Basic codes
@@ -1212,20 +1027,14 @@ pub struct DnsMessage {
     pub queries: Vec<QuerySection>,
     pub answers: Vec<ResourceRecord>,
     pub authorities: Vec<ResourceRecord>,
-    /// The additional section **without** its OPT record — see [`DnsMessage::edns`].
+    /// The additional section without its OPT record — see [`DnsMessage::edns`].
     pub additionals: Vec<ResourceRecord>,
     /// The EDNS0 OPT pseudo-record, if the message carries one (RFC 6891).
     ///
     /// A field rather than a record in [`DnsMessage::additionals`], because OPT
-    /// is not a resource record: it has no owner name that means anything, its
-    /// CLASS is a payload size and its TTL is a flags word. Keeping it in the
-    /// section cost eight linear scans of that `Vec` per message in this file
-    /// alone, made every filter over the section responsible for remembering to
-    /// spare it (`rdnsr`'s was `retain(|rr| rr.rdata.rtype() == OPT_RECORD_TYPE ||
-    /// keep(rr))`), and left a malformed state representable: **two OPT records
-    /// in one message**, which RFC 6891 §6.1.1 says MUST be FORMERR and which
-    /// nothing here rejected — the first was read and both were re-serialized.
-    /// `Option` makes two of them unspellable.
+    /// is not a resource record: its CLASS is a payload size and its TTL a flags
+    /// word. `Option` also makes the two-OPT message RFC 6891 §6.1.1 forbids
+    /// unspellable.
     pub edns: Option<Edns>,
 }
 
@@ -1242,26 +1051,11 @@ pub const EDNS_VERSION: u8 = 0;
 /// A message with its RFC 1035 §4.2.2 two-octet length prefix, in one buffer so
 /// a writer emits both in a single call.
 ///
-/// **The check is the point.** This existed five times over as
-/// `bytes.len() as u16`, once per binary and twice in the library, and a message
-/// past 65,535 octets was therefore framed with a *wrapped* length. At exactly
-/// 65,536 the prefix is **0**, which every read loop here treats as a broken
-/// peer: the connection is dropped with no answer and nothing on either side
-/// saying why. Larger overshoots give a small non-zero prefix instead, which
-/// desynchronises the stream — the reader takes the next N octets of a message
-/// body for a whole message.
-///
-/// `CLAUDE.md` §2 is about `as` on a value coming *off* the wire; this is the
-/// same cast going the other way, and [`DnsMessage::to_bytes`] is the sibling
-/// that shows the shape it should have — RDLENGTH, ARCOUNT and the OPT RDLENGTH
-/// all go through `try_into` and a [`WireError::TooLong`], within twenty lines
-/// of each other in this same file.
-///
-/// **How a message gets here over the limit at all**, since `to_bytes_within`
-/// cannot return more than it was given: [`crate::tsig`] appends a TSIG record
-/// to the *finished* bytes. That is the one path that can grow a message past
-/// the size it was serialized to, and it now refuses rather than producing
-/// something no framing can express.
+/// The length is checked rather than cast: a wrapped prefix is 0 at exactly
+/// 65,536, which every read loop here treats as a broken peer, and above that
+/// desynchronises the stream. [`crate::tsig`] appends to the *finished* bytes
+/// and is the one path that can grow a message past the size it was serialized
+/// to.
 pub fn framed(bytes: &[u8]) -> Result<Vec<u8>, WireError> {
     let len: u16 = bytes.len().try_into().map_err(|_| WireError::TooLong {
         what: "a TCP message",
@@ -1274,9 +1068,8 @@ pub fn framed(bytes: &[u8]) -> Result<Vec<u8>, WireError> {
     Ok(out)
 }
 
-// EDNS option codes from the IANA "DNS EDNS0 Option Codes" registry. We don't
-// interpret any of these yet — options round-trip as opaque bytes — but naming
-// the common ones keeps call sites readable.
+// EDNS option codes (IANA "DNS EDNS0 Option Codes"). None is interpreted;
+// options round-trip as opaque bytes.
 /// Name Server Identifier (RFC 5001).
 pub const EDNS_OPTION_NSID: u16 = 3;
 /// Client Subnet (RFC 7871).
@@ -1298,25 +1091,16 @@ pub struct EdnsOption {
 
 /// EDNS0 OPT pseudo-record (RFC 6891).
 ///
-/// OPT is carried as a record in the additional section, but repurposes the
-/// usual RR fields: NAME is root, CLASS is the requestor's UDP payload size, and
-/// TTL packs the extended-RCODE / version / flags (including the DNSSEC-OK bit).
-/// We interpret it on top of the generic [`ResourceRecord`] storage rather than
-/// giving [`DnsMessage`] dedicated fields.
+/// OPT repurposes the usual RR fields: NAME is root, CLASS is the requestor's
+/// UDP payload size, TTL packs the extended-RCODE / version / flags (including
+/// DNSSEC-OK).
 ///
-/// The extended RCODE is deliberately *not* a field here: it is a property of
-/// the message, not of the OPT record, so it lives in [`DnsMessage::rcode`] as a
-/// single 12-bit value and is split across the header and the OPT TTL only at
-/// serialization time. See [`DnsMessage::to_bytes`].
-/// The option list is held unparsed, which is load-bearing rather than an
-/// optimization: it is the only fallible part, so parsing it with the message
-/// would make a bad list fail `DnsMessage::try_from_bytes` — and `error_bytes`
-/// needs a parsed message to answer from, turning a diagnosable FORMERR into a
-/// client timeout.
-///
-/// It also keeps the allocation profile: the answer path reads the payload size,
-/// the version and the DO bit and never looks at an option, so nothing builds a
-/// `Vec<EdnsOption>` unless something asks.
+/// The extended RCODE is not a field here — it belongs to the message, so it
+/// lives in [`DnsMessage::rcode`] and is split across the header and the OPT TTL
+/// only in [`DnsMessage::to_bytes`]. The option list is held unparsed because it
+/// is the only fallible part: parsing it with the message would make a bad list
+/// fail `DnsMessage::try_from_bytes`, leaving no parsed message for
+/// `error_bytes` to answer FORMERR from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edns {
     /// Requestor's/responder's advertised UDP payload size (OPT CLASS field).
@@ -1331,22 +1115,15 @@ pub struct Edns {
 
 /// The three EDNS parameters a server acts on, without the option list.
 ///
-/// Everything on the answer path asks the same three questions of a request's
-/// OPT record — how big a reply may be, is this a version we implement, does the
-/// client want DNSSEC records — and none of them asks what the options were.
-/// [`Edns`] carries those too, which means a `Vec` and a `Vec<u8>` per option
-/// allocated and dropped again at every call site that only wanted a flag; the
-/// two in `rdnsd`'s `make_response` are sixteen lines apart (`TODO.md` #9e).
-///
-/// `Copy`, so threading it through a function costs nothing and nobody is
-/// tempted to re-derive it. The option list is still there for a caller that
-/// wants it: [`DnsMessage::edns`].
+/// The answer path asks only how big a reply may be, whether the version is one
+/// we implement, and whether DO is set; building the options costs a `Vec` and a
+/// `Vec<u8>` per option at a call site that wanted a flag. `Copy`, so threading
+/// it through costs nothing. The options are still on [`DnsMessage::edns`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdnsHeader {
-    /// Requestor's advertised UDP payload size (OPT CLASS field), as sent —
-    /// **not** floored at 512. [`DnsMessage::udp_payload_size`] is the one that
-    /// applies RFC 6891 §6.2.3's floor, because that is a question about what we
-    /// may send rather than about what the client wrote.
+    /// Requestor's advertised UDP payload size (OPT CLASS field), as sent — not
+    /// floored at 512. [`DnsMessage::udp_payload_size`] applies RFC 6891
+    /// §6.2.3's floor, which is a question about what we may send.
     pub udp_payload_size: u16,
     /// EDNS version. Anything but 0 is BADVERS (RFC 6891 §6.1.3).
     pub version: u8,
@@ -1404,8 +1181,7 @@ impl Edns {
     }
 
     /// The option list, parsed. A malformed list is an error rather than a
-    /// partial read: a client that sends one deserves FORMERR, not a silently
-    /// truncated view of what it asked for.
+    /// partial read: it earns FORMERR, not a truncated view.
     pub fn options(&self) -> Result<Vec<EdnsOption>, WireError> {
         let mut options = Vec::new();
         Self::walk_options(&self.rdata, |code, data| {
@@ -1417,10 +1193,9 @@ impl Edns {
         Ok(options)
     }
 
-    /// Whether the option list is well formed, without building it.
-    ///
-    /// This is the FORMERR question, and it is separate from [`Edns::options`]
-    /// because the answer path asks it and never wants the options themselves.
+    /// Whether the option list is well formed, without building it — the
+    /// FORMERR question, which the answer path asks and [`Edns::options`] does
+    /// more work than it needs to answer.
     pub fn check_options(&self) -> Result<(), WireError> {
         Self::walk_options(&self.rdata, |_, _| {})
     }
@@ -1444,13 +1219,8 @@ impl Edns {
     /// Walk the option list, handing each option's code and data to `each`
     /// without copying either.
     ///
-    /// The walk is here once and has three callers because it answers two
-    /// different questions: [`Edns::options`] wants the options, and
-    /// [`Edns::check_options`] only wants to know that they are well formed
-    /// — the answer path reads the payload size, the version and the DO bit and
-    /// never looks at an option. A second copy of the TLV arithmetic for the
-    /// checking case is exactly the drift `CLAUDE.md` §7 is about, and this one
-    /// decides whether a packet is FORMERR.
+    /// Shared by [`Edns::options`] and [`Edns::check_options`] so the TLV
+    /// arithmetic that decides whether a packet is FORMERR exists once.
     fn walk_options(mut rdata: &[u8], mut each: impl FnMut(u16, &[u8])) -> Result<(), WireError> {
         while !rdata.is_empty() {
             if rdata.len() < 4 {
@@ -1507,19 +1277,14 @@ impl<'a> TryUnpackFromBytes<'a> for QuerySection {
 
 /// The fields of one resource record, read straight off the wire.
 ///
-/// Exists because the additional section has to know a record's TYPE *before* it
-/// can decide whether the record is a resource record at all — an OPT is not —
-/// and the first version answered that by parsing the owner name twice. That
-/// cost an extra `String` per OPT-bearing message, which is every modern query:
-/// `tests/allocations.rs` put it at **8 allocations to parse an EDNS query
-/// against 7 before**, found while reviewing #13 rather than by the gate, since
-/// nothing measured that path. Reading the fields once and branching afterwards
-/// is both the fix and the removal of a second copy of this field arithmetic
-/// (`CLAUDE.md` §7).
+/// Read once and branched on afterwards: the additional section has to know a
+/// record's TYPE before it knows whether the record is a resource record at all
+/// — an OPT is not — and parsing the owner name twice to find out costs an extra
+/// `String` per OPT-bearing message.
 ///
-/// `ttl_bits` is deliberately raw. An OPT record's TTL field is not a TTL — it
-/// packs the extended RCODE, the EDNS version and the DO bit — so the clamp of
-/// RFC 2181 §8 belongs to whichever branch knows it is holding a real record.
+/// `ttl_bits` is raw. An OPT record's TTL field is not a TTL — it packs the
+/// extended RCODE, the version and the DO bit — so RFC 2181 §8's clamp belongs
+/// to whichever branch knows it is holding a real record.
 struct RecordParts<'a> {
     name: String,
     rtype: Rtype,
@@ -1537,16 +1302,9 @@ fn read_record_parts<'a>(
     let (class, rest) = read_be!(u16, rest);
     let (ttl_bits, rest) = read_be!(i32, rest);
     let (rdatalen, rest) = read_be!(u16, rest);
-    // RDLENGTH is attacker-chosen and every other length in this file is
-    // checked before it is used — `read_be!` checks its own bytes,
-    // `Label::try_from_bytes` checks before slicing, `walk_options` checks each
-    // option. This one was not, and a record declaring more RDATA than the
-    // message carries panicked the parser on a bare slice. That is reachable
-    // before any authentication on both transports, in `rdnsr` where no
-    // validator runs at all, and from a primary during a transfer — where it
-    // kills a replication task that is never restarted, so the zone silently
-    // stops refreshing until EXPIRE. `split_at` cannot be used until the length
-    // is known good, which is the whole point.
+    // RDLENGTH is attacker-chosen: check before slicing, or a record declaring
+    // more RDATA than the message carries panics the parser. Reachable
+    // pre-authentication on both transports.
     let rdatalen = rdatalen as usize;
     if rest.len() < rdatalen {
         return Err(WireError::Truncated {
@@ -1606,15 +1364,11 @@ enum Additional {
 impl Additional {
     /// Read one additional-section record.
     ///
-    /// OPT is decoded from the wire fields directly rather than being built as a
-    /// [`ResourceRecord`] and taken apart afterwards, and that is a correctness
-    /// requirement rather than tidiness: an OPT record's TTL field is **not a
-    /// TTL**. It packs the extended RCODE, the EDNS version and the DO bit
-    /// (RFC 6891 §6.1.3), so putting it through [`Ttl::from_wire`] — which
-    /// clamps a negative value to zero per RFC 2181 §8 — would erase all three
-    /// whenever the extended RCODE's high byte has its top bit set. Nothing
-    /// sends that today, and "nothing sends that today" is not a reason to
-    /// build a parser that cannot represent it.
+    /// OPT is decoded from the wire fields directly rather than built as a
+    /// [`ResourceRecord`] and taken apart: its TTL field is not a TTL but the
+    /// extended RCODE, version and DO bit (RFC 6891 §6.1.3), and
+    /// [`Ttl::from_wire`]'s RFC 2181 §8 clamp would erase all three whenever the
+    /// extended RCODE's high byte has its top bit set.
     fn try_from_bytes<'a>(
         data: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
@@ -1668,17 +1422,9 @@ impl DnsMessage {
         let (auth_len, rest) = read_be!(u16, rest);
         let (add_len, mut rest) = read_be!(u16, rest);
 
-        // The opcode is bits 3..6 of the flags' high byte, so it has to be
-        // shifted down. Masking in place (`hi & 0x70`) read every opcode wrong:
-        // it dropped the low bit, so IQUERY (1) came out as QUERY and NOTIFY (4),
-        // UPDATE (5) and STATUS (2) all came out as `Unknown` — while the *write*
-        // side shifted correctly, so the two disagreed. Nothing noticed because
-        // every test used QUERY, whose value survives any mask.
-        //
-        // Total, and it has to be: an opcode we have no name for is echoed back
-        // unchanged (RFC 1035 §4.1.1), not folded onto one we do. The
-        // `.unwrap_or(OpCode::Unknown)` this replaced turned eleven of the
-        // sixteen into 15 on the way out — see [`OpCode`].
+        // The opcode is bits 3..6 of the flags' high byte, so it is shifted
+        // down, not masked in place. Total, and it has to be: an opcode we have
+        // no name for is echoed back unchanged (RFC 1035 §4.1.1).
         let opcode = OpCode::from_u8(hi >> 3);
 
         let mut queries: Vec<QuerySection> = Vec::new();
@@ -1712,10 +1458,7 @@ impl DnsMessage {
             match item {
                 Additional::Record(rr) => additionals.push(rr),
                 Additional::Opt(opt, flags) => {
-                    // RFC 6891 §6.1.1: "If a query message with more than one
-                    // OPT RR is received, a FORMERR (RCODE=1) MUST be returned."
-                    // Nothing checked this before OPT became a field — the first
-                    // was read and every one of them was written back out.
+                    // RFC 6891 §6.1.1: more than one OPT RR MUST be FORMERR.
                     if edns.is_some() {
                         return Err(WireError::malformed(
                             "the additional section",
@@ -1730,13 +1473,9 @@ impl DnsMessage {
         }
 
         // RCODE is 12 bits (RFC 6891 §6.1.3): the low 4 in the header, the high
-        // 8 in the OPT record's TTL when the message carries one. Reassemble
-        // them so `rcode` is the whole value; without OPT the high bits are 0
-        // and this is the classic 4-bit code.
-        // RCODE is 12 bits: the low 4 in the header, the high 8 in the OPT
-        // record's flags word. The option list is *not* read here — a malformed
-        // one must not fail the parse, or the FORMERR that answers it could not
-        // be built (see [`Edns`]).
+        // 8 in the OPT record's flags word. The option list is *not* read here —
+        // a malformed one must not fail the parse, or the FORMERR that answers
+        // it could not be built (see [`Edns`]).
         let rcode = ResponseCode::from_u16((ext_rcode << 4) | (lo & 0x0f) as u16);
 
         Ok(Self {
@@ -1769,13 +1508,9 @@ impl DnsMessage {
 
         let opcode = self.opcode.to_u8();
 
-        // RCODE is a 12-bit value split across the header (low 4 bits) and the
-        // OPT record's TTL (high 8). This used to read
-        // `match self.rcode.to_u16() { Some(v) if v <= 0xfff => v, _ => 0 }`,
-        // which turned the old `Unknown` sentinel — and any code above 0xfff —
-        // into **NOERROR**. `to_u16` is infallible now, so the only thing left
-        // to check is the 12-bit ceiling, and a value past it is a bug in the
-        // caller rather than something to paper over with a success code.
+        // RCODE is 12 bits, split across the header (low 4) and the OPT record's
+        // TTL (high 8). A value past the ceiling is a caller bug, not something
+        // to paper over with a success code.
         let rcode = self.rcode.to_u16();
         if rcode > 0xfff {
             return Err(WireError::malformed(
@@ -1808,8 +1543,7 @@ impl DnsMessage {
         pos = write_bytes(output, pos, &(self.answers.len() as u16).to_be_bytes())?;
         pos = write_bytes(output, pos, &(self.authorities.len() as u16).to_be_bytes())?;
         // ARCOUNT counts the OPT record, which is a field here rather than a
-        // member of `additionals`. Getting this wrong is the arithmetic most
-        // likely to break when OPT moved, so it is one expression and not two.
+        // member of `additionals`.
         let arcount = self.additionals.len() + usize::from(self.edns.is_some());
         let arcount: u16 = arcount.try_into().map_err(|_| WireError::TooLong {
             what: "the additional section",
@@ -1824,10 +1558,9 @@ impl DnsMessage {
             pos = write_bytes(output, pos, &q.qclass.to_u16().to_be_bytes())?;
         }
 
-        // Resource records. Owner names are compressed against everything
-        // written so far; RDATA is stored uncompressed and wire-ready, so it is
-        // a straight copy except for the record types whose embedded names may
-        // legally be compressed (see [`NameCompressor::write_rdata`]).
+        // Owner names are compressed against everything written so far; RDATA is
+        // stored uncompressed and wire-ready, so it is a straight copy except
+        // for the types whose embedded names may legally be compressed.
         for section in [&self.answers, &self.authorities, &self.additionals] {
             for rr in section {
                 pos = compressor.write_name(rr.name.as_str(), output, pos)?;
@@ -1852,13 +1585,8 @@ impl DnsMessage {
             }
         }
 
-        // The OPT record, last in the additional section.
-        //
-        // Last on purpose: `tsig::append_tsig` appends its record to the
-        // finished bytes and bumps ARCOUNT itself, so whatever this writes ends
-        // up before the TSIG — which RFC 8945 §5.1 requires to be final. Writing
-        // OPT before the other additionals would still satisfy that; writing it
-        // here keeps the wire order a client sees closest to what it sent.
+        // The OPT record, last in the additional section: `tsig::append_tsig`
+        // appends to the finished bytes, and RFC 8945 §5.1 requires TSIG final.
         if let Some(edns) = &self.edns {
             // NAME is root, TYPE is OPT, CLASS is the payload size and TTL packs
             // the extended RCODE, the version and the flags (RFC 6891 §6.1.3).
@@ -1881,13 +1609,8 @@ impl DnsMessage {
         Ok(pos)
     }
 
-    /// The message's EDNS parameters, if it carries an OPT record.
-    ///
-    /// Infallible now, and that is the change: the OPT record is a field rather
-    /// than something to be found in [`DnsMessage::additionals`], and its
-    /// option list is carried unparsed (see [`Edns`]). "Does this message do
-    /// EDNS" and "is its option list well formed" were one fallible question
-    /// and are now two.
+    /// The message's EDNS parameters, if it carries an OPT record. Infallible:
+    /// "is the option list well formed" is a separate question (see [`Edns`]).
     pub fn edns(&self) -> Option<&Edns> {
         self.edns.as_ref()
     }
@@ -1912,9 +1635,8 @@ impl DnsMessage {
     /// The requestor's advertised UDP payload size: the EDNS value (floored at
     /// the classic 512 per RFC 6891 §6.2.3) if present, else the classic 512.
     ///
-    /// The payload size lives in the OPT CLASS field, so it is readable even
-    /// when the option list is malformed; a bad option list just falls back to
-    /// the safe classic size.
+    /// Readable even when the option list is malformed: the size lives in the
+    /// OPT CLASS field.
     pub fn udp_payload_size(&self) -> u16 {
         self.edns
             .as_ref()
@@ -1922,11 +1644,8 @@ impl DnsMessage {
             .unwrap_or(CLASSIC_UDP_SIZE)
     }
 
-    /// Set the message's OPT record, replacing any it already had.
-    ///
-    /// Infallible: encoding the option list is [`Edns::with_options`]' job now,
-    /// so there is nothing left here that can fail. The `Result` it used to
-    /// return is kept off deliberately — every caller was writing `let _ =`.
+    /// Set the message's OPT record, replacing any it already had. Infallible:
+    /// encoding the option list is [`Edns::with_options`]' job.
     pub fn set_edns(&mut self, edns: Edns) {
         self.edns = Some(edns);
     }
@@ -1944,21 +1663,12 @@ impl DnsMessage {
     /// [`Self::to_bytes_within`] into a caller-owned buffer, which is left
     /// holding exactly the wire bytes.
     ///
-    /// This exists so a hot send path can keep one scratch buffer and allocate
-    /// nothing per response. `to_bytes_within` used to serialize into
-    /// `vec![0u8; u16::MAX as usize]` — 64 KB, zeroed, per response — and
-    /// `Vec::truncate` **does not release capacity**, so the `Vec` handed to
-    /// `send_to` and held until the send completed was 64 KB whatever the answer
-    /// was. Confirmed: a 60-byte response retained capacity 65535, and a DHAT
-    /// probe of the same shape reported 65,560,600 bytes live in 1,002 blocks
-    /// for a thousand of them. Measured cost on a 3-record response: 1043 ns vs
-    /// 718 ns with a reused buffer — a third of serialization was allocator
-    /// traffic, and not optimizer-erasable because the allocation escapes into
-    /// the socket call.
-    ///
-    /// The buffer is sized to what the caller will actually send rather than to
-    /// the protocol maximum. Only the TCP and transfer paths pass `u16::MAX`;
-    /// a UDP caller passes its EDNS payload size, and now pays for that.
+    /// Lets a hot send path keep one scratch buffer and allocate nothing per
+    /// response: `Vec::truncate` does not release capacity, so a buffer sized to
+    /// the protocol maximum travels into `send_to` whatever the answer was, and
+    /// the allocation escapes into the socket call rather than being optimized
+    /// away. The buffer is sized to `max_len` — only the TCP and transfer paths
+    /// pass `u16::MAX`; a UDP caller passes its EDNS payload size.
     pub fn to_bytes_within_buf(&self, max_len: usize, out: &mut Vec<u8>) -> Result<(), WireError> {
         out.clear();
         out.resize(max_len, 0);
@@ -1970,10 +1680,9 @@ impl DnsMessage {
             // Fits the buffer but not the limit — only reachable when a caller
             // passes a `max_len` above what it means to send, which none do.
             Ok(_) => {}
-            // The message did not fit, which is the ordinary reason to truncate.
-            // Sizing the scratch to `max_len` is what turns "too long" from a
-            // comparison into an error, so it has to be caught rather than
-            // propagated; every other `WireError` is a real failure to encode.
+            // Sizing the scratch to `max_len` turns "too long" from a comparison
+            // into this error, so it is caught rather than propagated; every
+            // other `WireError` is a real failure to encode.
             Err(WireError::Truncated {
                 what: "the output buffer",
                 ..
@@ -1985,15 +1694,12 @@ impl DnsMessage {
         truncated.truncation = true;
         truncated.answers.clear();
         truncated.authorities.clear();
-        // `truncated.edns` is carried over untouched: the DNS message size
-        // limit is itself signalled via EDNS, so the OPT record must survive
-        // truncation. It used to be a `retain` over the additional section that
-        // had to remember to spare it.
+        // `truncated.edns` is carried over untouched: the size limit is itself
+        // signalled via EDNS, so the OPT record must survive truncation.
         truncated.additionals.clear();
 
-        // The floor is the classic 512: a header, a question and an OPT record
-        // fit there, and a caller that asked for less than a minimal response
-        // can hold still gets a well-formed TC=1 answer to retry on.
+        // Floor at the classic 512: a header, a question and an OPT record fit
+        // there, so a too-small `max_len` still yields a TC=1 answer to retry on.
         out.clear();
         out.resize(max_len.max(CLASSIC_UDP_SIZE as usize), 0);
         let n = truncated.to_bytes(out)?;
@@ -2007,10 +1713,6 @@ pub struct DnsMessageBuilder {
     id: u16,
     queries: Vec<(String, Rtype)>,
     /// Whether to attach an OPT record, and with DO set.
-    ///
-    /// The shipped client could not ask for DNSSEC at all, which meant it could
-    /// not exercise this library's most complex feature — and *that* is why
-    /// every DNSSEC recipe in `TODO.md` reaches for dnspython (`TODO.md` #19h).
     dnssec: bool,
 }
 
@@ -2032,10 +1734,7 @@ impl DnsMessageBuilder {
     }
 
     /// Ask for DNSSEC records: an EDNS0 OPT with DO set (RFC 4035 §3.2.1).
-    ///
-    /// Without DO a server is *required* not to send RRSIG, NSEC or NSEC3, so a
-    /// client that cannot set it cannot see any of the signing this library
-    /// does.
+    /// Without DO a server must not send RRSIG, NSEC or NSEC3.
     pub fn with_dnssec(mut self, dnssec: bool) -> Self {
         self.dnssec = dnssec;
         self
@@ -2084,12 +1783,9 @@ impl DnsMessageBuilder {
 mod builder_dnssec_tests {
     use super::*;
 
-    /// `--dnssec` has to produce an OPT record with DO set, and survive the
-    /// wire — a client that cannot ask for DNSSEC cannot see any of the signing
-    /// this library does (`TODO.md` #19h).
-    ///
+    /// `--dnssec` has to produce an OPT record with DO set and survive the wire.
     /// Round-tripped rather than inspected, because the flag only matters if a
-    /// *server* reads it: `edns_header` is the same call `rdnsd` makes to decide
+    /// *server* reads it: `edns_header` is the call `rdnsd` makes to decide
     /// whether to attach signatures.
     #[test]
     fn the_dnssec_flag_sets_do_and_survives_the_wire() {
@@ -2122,12 +1818,6 @@ mod tests {
     use crate::utils::record_types as rt;
 
     /// RFC 1982 §3.2, which is the whole reason [`Serial`] exists.
-    ///
-    /// This was `secondary::is_newer`'s test and moved here with the function it
-    /// covered. It passed there and passes here — nothing in the tree compared
-    /// serials wrongly, so there is no failing-first regression to show
-    /// (`CLAUDE.md` §1). What the move buys is that the *second* copy of this
-    /// arithmetic, in `notify::changed_zones`, is gone.
     #[test]
     fn a_wrapped_serial_is_still_an_increment() {
         let s = Serial::new;
@@ -2142,8 +1832,7 @@ mod tests {
     }
 
     /// Half the space apart, RFC 1982 §3.2 leaves the result undefined — neither
-    /// is later than the other. An `Ord` would have to invent an answer, which
-    /// is one of the two reasons [`Serial`] does not have one.
+    /// is later, which is why [`Serial`] has no `Ord` to invent an answer.
     #[test]
     fn serials_half_the_space_apart_are_neither_newer() {
         let (a, b) = (Serial::new(0), Serial::new(0x8000_0000));
@@ -2152,23 +1841,17 @@ mod tests {
         assert_ne!(a, b, "and they are still different versions");
     }
 
-    /// `Display` forwards the formatter, so width and alignment survive.
-    ///
-    /// Not a hypothetical: `zone_writer` lays an SOA out as `{serial:<12}` and
-    /// `rdnsctl status` as `{:>6}`, and the obvious one-line impl —
-    /// `write!(f, "{}", self.0)`, which is what [`Ttl`] next door has — silently
-    /// ignores both. The zone file would still parse, so nothing would fail; the
-    /// column would just stop lining up. Checked here rather than asserted in
-    /// the doc comment (`CLAUDE.md` §4).
+    /// `Display` forwards the formatter, so width and alignment survive:
+    /// `zone_writer` lays an SOA out as `{serial:<12}` and `rdnsctl status` as
+    /// `{:>6}`, and `write!(f, "{}", self.0)` would silently ignore both.
     #[test]
     fn a_serial_keeps_the_padding_it_is_formatted_with() {
         assert_eq!(format!("{:<12}|", Serial::new(2026080201)), "2026080201  |");
         assert_eq!(format!("{:>6}|", Serial::new(42)), "    42|");
     }
 
-    /// The wire form is unchanged by the newtype, which is the claim `TODO.md`
-    /// #14a's gate is about: an SOA read off the wire and written back out is
-    /// byte-identical, including a serial past the signed ceiling.
+    /// An SOA read off the wire and written back out is byte-identical,
+    /// including a serial past the signed ceiling.
     #[test]
     fn a_serial_round_trips_through_the_wire_form() {
         for value in [0, 1, 2_026_080_201, 0x8000_0000, u32::MAX] {
@@ -2191,12 +1874,8 @@ mod tests {
         }
     }
 
-    /// A record may not declare more RDATA than the message actually carries.
-    ///
-    /// This is an error, not a panic. `ResourceRecord::try_from_bytes` used to
-    /// slice `&rest[..rdatalen]` on an attacker-chosen `u16`, which is reachable
-    /// before authentication on both of `rdnsd`'s transports, in `rdnsr` with no
-    /// validator in front of it, and from a primary mid-transfer.
+    /// A record may not declare more RDATA than the message carries — an error,
+    /// not a panic on a slice sized by an attacker-chosen `u16`.
     #[test]
     fn rdlength_past_end_of_message_is_an_error() {
         // Header: id, QR=1, qd=0, an=1, ns=0, ar=0.
@@ -2215,10 +1894,9 @@ mod tests {
         );
     }
 
-    /// The same shape in the additional section, which is the one that gets past
-    /// `AdmissionCheck::validate_packet` — OPT and TSIG legitimately live
-    /// there, so it is only count-capped, and this arrives as a well-formed
-    /// QUERY rather than as an obviously bogus response.
+    /// The same shape in the additional section, which
+    /// `AdmissionCheck::validate_packet` only count-caps — OPT and TSIG
+    /// legitimately live there.
     #[test]
     fn rdlength_past_end_in_additional_section_is_an_error() {
         // Header: id, QR=0 opcode=QUERY, qd=0, an=0, ns=0, ar=1.
@@ -2237,8 +1915,7 @@ mod tests {
     }
 
     /// A record whose RDLENGTH exactly consumes the rest of the message is
-    /// legal, and the boundary is where an off-by-one in the new check would
-    /// live — so pin it rather than only testing the failing side.
+    /// legal — the boundary where an off-by-one in the check would live.
     #[test]
     fn rdlength_reaching_exactly_the_end_of_the_message_parses() {
         let mut packet: Vec<u8> = vec![0x12, 0x34, 0x84, 0x00, 0, 0, 0, 1, 0, 0, 0, 0];
@@ -2290,11 +1967,9 @@ mod tests {
         assert_eq!(&buf[0..n], &expected);
     }
 
-    /// Every opcode has to survive the wire, and until this test none but QUERY
-    /// did: the decoder masked the field in place instead of shifting it down, so
-    /// IQUERY arrived as QUERY and NOTIFY, UPDATE and STATUS all arrived as
-    /// `Unknown`. The writer shifted correctly, which is why no round trip
-    /// noticed — every test used QUERY, and 0 survives any mask.
+    /// Every opcode has to survive the wire. A decoder that masks the field in
+    /// place instead of shifting it reads every opcode but QUERY wrong, and only
+    /// QUERY survives any mask — so a test that uses it alone sees nothing.
     #[test]
     fn test_every_opcode_survives_the_wire() {
         for opcode in [
@@ -2338,29 +2013,13 @@ mod tests {
         }
     }
 
-    /// The *other* direction, and a different bug from the one above.
+    /// An opcode with no name here is echoed unchanged. RFC 1035 §4.1.1 has
+    /// OPCODE set by the originator and copied into the response, so a sentinel
+    /// that cannot carry the value sends a DSO client (opcode 6, RFC 8490) a
+    /// NOTIMP naming a different opcode.
     ///
-    /// `test_every_opcode_survives_the_wire` is the regression test for the
-    /// decoder masking the opcode in place instead of shifting it, and it can
-    /// only cover opcodes this enum has names for — which is exactly why it did
-    /// not catch this. An opcode with no name arrived as an `Unknown = 15`
-    /// sentinel that could not carry the value it stood for, so **eleven of the
-    /// sixteen** went back onto the wire as 15: 3 and 7-15 are Unassigned, and
-    /// **6 is DSO (RFC 8490)**, which is assigned and which this library already
-    /// knows exists — it carries `ResponseCode::DsoTypeNotImplemented` for
-    /// RFC 8490's rcode 11.
-    ///
-    /// It reaches a client. `rdnsd` answers an opcode it does not implement with
-    /// NOTIMP and echoes `msg.opcode` into the reply, and RFC 1035 §4.1.1 says
-    /// that field "is set by the originator of a query and copied into the
-    /// response" — so a DSO client got a NOTIMP whose OPCODE said 15, which is
-    /// not the question it asked. Same shape as `QueryClass::None` and
-    /// `ResponseCode::Unknown` before it (`CLAUDE.md` §2, §17): a sentinel that
-    /// cannot hold what it replaces.
-    ///
-    /// Written from raw bytes rather than from the enum on purpose. A test that
-    /// starts by naming a variant can only reach the values that have names,
-    /// which is the whole of how this survived (`CLAUDE.md` §1).
+    /// Written from raw bytes: a test that starts by naming a variant can only
+    /// reach the values that have names.
     #[test]
     fn an_opcode_this_library_has_no_name_for_is_echoed_unchanged() {
         for raw in 0u8..16 {
@@ -2382,13 +2041,9 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
-    // TXT <character-string>s (RFC 1035 §3.3.14)
-    // -----------------------------------------------------------------
-
-    /// The framing itself: each string is preceded by its length. Stored as one
-    /// unframed blob — which is what this was — the first byte of the text is
-    /// read as a length by every correct client, and the record arrives short.
+    /// TXT framing (RFC 1035 §3.3.14): each string is preceded by its length.
+    /// Stored as one unframed blob, the first byte of the text is read as a
+    /// length and the record arrives short.
     #[test]
     fn test_txt_is_framed_as_character_strings() {
         let one = RecordData::from_parsed(&ParsedRecord::TXT(vec![b"hello".to_vec()])).unwrap();
@@ -2408,8 +2063,7 @@ mod tests {
             b"first string".to_vec(),
             Vec::new(),
             // Arbitrary octets: a character-string is not text. As a `String`
-            // this failed to decode at all — and decoding happens while reading
-            // the message, so one such record took the whole response with it.
+            // one such record fails to decode and takes the response with it.
             vec![0xff, 0x00, 0x80],
         ];
         let encoded = RecordData::from_parsed(&ParsedRecord::TXT(strings.clone())).unwrap();
@@ -2420,9 +2074,8 @@ mod tests {
         );
     }
 
-    /// A character-string's length is one byte, so 255 is the ceiling. Splitting
-    /// a longer string in two would change what the record says, so this is the
-    /// zone's error to fix rather than ours to paper over.
+    /// A character-string's length is one byte, so 255 is the ceiling; splitting
+    /// a longer string in two would change what the record says.
     #[test]
     fn test_txt_string_longer_than_255_is_refused() {
         let err = RecordData::from_parsed(&ParsedRecord::TXT(vec![vec![b'x'; 256]])).unwrap_err();
@@ -2687,11 +2340,8 @@ mod tests {
         }
     }
 
-    /// An unknown QCLASS used to be aliased onto `QueryClass::None`, which is
-    /// **254** — RFC 2136's real NONE class, not a sentinel — and re-serialized
-    /// as 254. The question echoed in the response was therefore not the
-    /// question asked, and a client matching them as RFC 5452 §9.1 requires
-    /// discards a reply it was waiting for.
+    /// An unknown QCLASS is echoed as itself. 254 is RFC 2136's real NONE, not a
+    /// free sentinel, and a client matches the echoed question (RFC 5452 §9.1).
     #[test]
     fn an_unknown_qclass_is_echoed_back_as_the_class_that_was_asked() {
         for qclass in [99u16, 2, 0, 253, 256, 0xffff] {
@@ -2725,7 +2375,7 @@ mod tests {
         }
     }
 
-    /// An rcode with no name here used to serialize as **0**. `rdnsr` relays
+    /// An rcode with no name here used to serialize as 0. `rdnsr` relays
     /// upstream messages, so an unrecognized *failure* reached the client as a
     /// successful empty answer — the one direction a response code must never
     /// fail in. RFC 6895 §2.3 keeps the space open on purpose; a relay that does
@@ -2793,7 +2443,7 @@ mod tests {
     /// RFC 6891 §6.1.1: "If a query message with more than one OPT RR is
     /// received, a FORMERR (RCODE=1) MUST be returned."
     ///
-    /// **Nothing checked this before OPT became a field.** The first OPT was
+    /// Nothing checked this before OPT became a field. The first OPT was
     /// read and every one of them was written back out, so a message with two
     /// went through as if it had one and came back malformed. `Option<Edns>`
     /// makes the state unrepresentable in the struct; this is the other half —
@@ -2920,11 +2570,9 @@ mod tests {
 
         // `set_edns` replaces rather than accumulates. This used to be checked
         // by counting the OPT records in the additional section and asserting
-        // there was exactly one — a real hazard when `set_edns` pushed onto a
-        // `Vec` and had to `retain` the old one away first. With OPT as an
-        // `Option` field there is no count to get wrong: a second OPT record in
-        // one message is unspellable, which is also what RFC 6891 §6.1.1 says
-        // about receiving one (`TODO.md` #13d).
+        // there was exactly one. With OPT as an `Option` field a second one is
+        // unspellable, which is also what RFC 6891 §6.1.1 says about receiving
+        // one.
         msg.set_edns(Edns::with_payload_size(1232));
         assert!(msg.additionals.is_empty(), "OPT is not a resource record");
         assert_eq!(msg.edns().expect("still present").udp_payload_size, 1232);
@@ -3035,14 +2683,13 @@ mod tests {
         assert_eq!(got.option(EDNS_OPTION_PADDING).unwrap(), None);
     }
 
-    /// A malformed option list is an error — but **not** an error that reaching
+    /// A malformed option list is an error — but not an error that reaching
     /// the OPT record produces.
     ///
-    /// This test used to call `msg.edns()` and expect `Err`. Once OPT became a
-    /// field carrying its RDATA unparsed (`TODO.md` #13d), "does this message
-    /// have EDNS" is infallible and "is its option list well formed" is the
-    /// separate, fallible question. The split is deliberate and is what keeps a
-    /// bad list answerable: if reading it were part of parsing the message,
+    /// OPT is a field carrying its RDATA unparsed, so "does this message have
+    /// EDNS" is infallible and "is its option list well formed" is a separate,
+    /// fallible question. The split is what keeps a bad list answerable: if
+    /// reading it were part of parsing the message,
     /// `try_from_bytes` would fail, `rdnsd` would return no bytes at all
     /// (`main.rs:1465`), and the FORMERR this deserves could not be built.
     #[test]

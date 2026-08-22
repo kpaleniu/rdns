@@ -1,21 +1,14 @@
 //! A scrape endpoint for [`crate::metrics::DnsMetrics`], hand-rolled over
 //! `tokio`'s `TcpListener`, plus the two probes an orchestrator asks for:
-//! `/healthz` (is the process alive) and `/readyz` (has it finished starting).
-//! The distinction between those two is [`crate::readiness`]'s doc comment.
+//! `/healthz` (alive) and `/readyz` (finished starting). [`crate::readiness`]
+//! has the distinction.
 //!
-//! **Why not a web framework.** This replaced an OpenTelemetry OTLP exporter
-//! that dragged `tonic`, `prost`, `hyper` and `h2` — a gRPC *server* — into a
-//! DNS daemon, and never initialised. Pulling a second HTTP stack back in to
-//! serve one endpoint that answers one method on one path would be the same
-//! mistake with better manners. What Prometheus actually needs is a `GET` that
-//! returns text; that is ninety lines, and they are all here where they can be
-//! read.
+//! Hand-rolled because Prometheus needs a `GET` returning text, and an HTTP
+//! stack for one method on one path costs `hyper` and everything under it.
 //!
-//! **What it deliberately does not do**: no TLS, no auth, no keep-alive, no
-//! chunked encoding, no compression. Bind it on a management address or on
-//! loopback behind whatever already terminates TLS — the counters say how much
-//! traffic a server is taking and which zones are failing, which is not secret
-//! but is not public either.
+//! No TLS, no auth, no keep-alive, no chunked encoding, no compression. Bind it
+//! on a management address or on loopback: the counters say how much traffic a
+//! server takes and which zones are failing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,27 +20,16 @@ use crate::metrics::DnsMetrics;
 use crate::readiness::Readiness;
 use crate::shutdown::{Busy, Stop};
 
-/// How long a scraper gets to send its request line before we give up on it.
-///
-/// Short on purpose: a connection that has connected and said nothing is either
-/// a stalled scraper or a port scanner, and neither is worth a socket.
+/// A connection that has said nothing is a stalled scraper or a port scanner.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Most bytes we will read from a request. We only ever look at the first line,
-/// and a `GET /metrics HTTP/1.1` with headers is well under this.
+/// Only the first line is read, and a request line with headers is well under
+/// this.
 const MAX_REQUEST: usize = 8 * 1024;
 
-/// Concurrent scrape connections.
-///
-/// This was the only accept loop in the workspace without a ceiling
-/// (`TODO.md` #19h), where `rdnsd` and `rdnsr` both bound theirs three times
-/// over. The risk is low — a management port with a five-second read timeout —
-/// but "low" is an argument about who reaches it, not about what the loop does,
-/// and the pattern is established.
-///
-/// Smaller than the DNS loops' 128 on purpose: a scrape is one request from a
-/// handful of collectors, so a number this size is already far past what a
-/// working deployment uses, and anything more is a queue nobody is waiting on.
+/// Concurrent scrape connections. Smaller than the DNS loops' 128: a scrape is
+/// one request from a handful of collectors, and more is a queue nobody waits
+/// on.
 const MAX_SCRAPES: usize = 16;
 
 /// Serve `GET /metrics`, `GET /healthz` and `GET /readyz` until told to stop.
@@ -67,11 +49,9 @@ pub async fn serve(
             accepted = listener.accept() => accepted?,
             _ = stop.wait() => return Ok(()),
         };
-        // `try_acquire` and not `acquire`: a scraper that has to wait is one
-        // whose sample is already stale by the time it is served, and holding
-        // the connection open would keep the queue growing. Dropping it closes
-        // the socket, which a collector reads as a failed scrape — the honest
-        // answer, and one its own alerting already knows what to do with.
+        // `try_acquire`, not `acquire`: a queued scrape is stale by the time it
+        // is served. Dropping closes the socket, which the collector reads as a
+        // failed scrape.
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             continue;
         };
@@ -81,9 +61,8 @@ pub async fn serve(
         tokio::spawn(async move {
             let _busy = busy;
             let _permit = permit;
-            // A scraper that misbehaves is not worth a log line on a DNS
-            // server's stderr — it cannot affect an answer, and the flood item
-            // in TODO.md #9d is about exactly this shape of noise.
+            // A misbehaving scraper cannot affect an answer, so it is not worth
+            // a log line on a DNS server's stderr.
             let _ = respond(stream, &metrics, &readiness).await;
         });
     }
@@ -97,9 +76,8 @@ async fn respond(
     let mut buf = vec![0u8; MAX_REQUEST];
     let mut filled = 0;
 
-    // Read until the end of the request line. We need nothing after it, and
-    // waiting for the blank line that ends the headers would hang on a client
-    // that pipelines badly.
+    // Only the request line. Waiting for the blank line ending the headers
+    // would hang on a client that pipelines badly.
     let line_end = loop {
         if let Some(at) = buf[..filled].iter().position(|b| *b == b'\n') {
             break at;
@@ -132,21 +110,12 @@ async fn respond(
             "text/plain; version=0.0.4",
             &metrics.to_prometheus_format(),
         ),
-        // A liveness probe that costs nothing to answer. It says the process is
-        // running and its runtime is scheduling tasks, which is all a `/healthz`
-        // can honestly claim — and all a supervisor deciding whether to *restart*
-        // should be asked to act on. Whether there is anything to serve yet is
-        // `/readyz`, below.
+        // The process is running and its runtime is scheduling tasks, which is
+        // all a liveness probe can honestly claim.
         ("GET", "/healthz") => response(200, "text/plain", "ok\n"),
-        // Readiness: is every zone this server is configured to answer for
-        // actually in the zone map? See [`Readiness`] for why this is a one-way
-        // latch and why a primary is ready the moment it is alive.
-        //
-        // 503 rather than 200-with-a-body, because the only consumer that
-        // matters reads the status code: every orchestrator's HTTP probe treats
-        // 2xx as pass and everything else as fail, and a probe that always
-        // passes is a probe that is not a gate. The names go in the body so an
-        // operator who curls it learns *what* is missing.
+        // 503 rather than 200-with-a-body: an orchestrator's probe reads the
+        // status code, and one that always passes is not a gate. The names go
+        // in the body for whoever curls it.
         ("GET", "/readyz") => match readiness.pending() {
             pending if pending.is_empty() => response(200, "text/plain", "ready\n"),
             pending => response(
@@ -185,9 +154,7 @@ fn response(status: u16, content_type: &str, body: &str) -> Vec<u8> {
         503 => "Service Unavailable",
         _ => "Error",
     };
-    // `Connection: close` because there is no keep-alive here: one request, one
-    // response, one socket. Prometheus is perfectly happy with that, and it
-    // means no state machine to get wrong.
+    // No keep-alive: one request, one response, one socket, no state machine.
     format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
@@ -251,8 +218,7 @@ mod tests {
         assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
         assert!(body.contains("dns_queries_received_total 1"), "{body}");
         assert!(body.contains("dns_responses_refused_total 1"), "{body}");
-        // The histogram, in the shape `histogram_quantile()` needs: a 0.2 ms
-        // answer is at or below the 0.25 ms bucket and above the 0.1 ms one.
+        // A 0.2 ms answer is at or below the 0.25 ms bucket, above the 0.1 ms.
         assert!(
             body.contains("dns_answer_latency_seconds_bucket{le=\"0.00025\"} 1"),
             "{body}"
@@ -267,8 +233,7 @@ mod tests {
         );
     }
 
-    /// A query string is part of ordinary scrape configuration and must not turn
-    /// the scrape into a 404.
+    /// A query string is ordinary scrape configuration, not a 404.
     #[tokio::test]
     async fn a_query_string_is_still_a_scrape() {
         let (addr, _shutdown, _metrics) = start().await;
@@ -290,10 +255,8 @@ mod tests {
             .starts_with("HTTP/1.1 405"));
     }
 
-    /// The whole point of the split: a secondary that has bound its sockets but
-    /// has not transferred anything is **alive and not ready**, and one endpoint
-    /// answering both questions cannot say so. `/healthz` passes throughout;
-    /// `/readyz` is 503 until the zone arrives, and names what it is waiting for.
+    /// The point of the split: a secondary that has bound its sockets but
+    /// transferred nothing is alive and not ready.
     #[tokio::test]
     async fn a_server_can_be_alive_and_not_ready() {
         let (addr, _shutdown, _metrics, readiness) =
@@ -310,7 +273,6 @@ mod tests {
             body.starts_with("HTTP/1.1 503 Service Unavailable"),
             "{body}"
         );
-        // "not ready" with no reason attached is a probe nobody can act on.
         assert!(body.contains("example.com."), "{body}");
         assert!(body.contains("example.net."), "{body}");
 
@@ -325,8 +287,7 @@ mod tests {
         assert!(body.ends_with("ready\n"), "{body}");
     }
 
-    /// A primary loads, signs and verifies every zone before anything binds, so
-    /// there is no window to report: it is ready as soon as it answers at all.
+    /// A primary loads every zone before anything binds: no window to report.
     #[tokio::test]
     async fn a_server_with_nothing_to_wait_for_is_ready_at_once() {
         let (addr, _shutdown, _metrics) = start().await;
@@ -335,12 +296,10 @@ mod tests {
             .starts_with("HTTP/1.1 200 OK"));
     }
 
-    /// The endpoint stops with everything else, and does not hold the drain open
-    /// (`CLAUDE.md` §9): it watches the stop, it does not claim it.
+    /// The endpoint watches the stop; it does not claim the drain.
     #[tokio::test]
     async fn the_endpoint_stops_with_the_server() {
         let (addr, shutdown, _metrics) = start().await;
-        // It is up.
         assert!(scrape(addr, "GET /healthz HTTP/1.1\r\n\r\n")
             .await
             .starts_with("HTTP/1.1 200 OK"));

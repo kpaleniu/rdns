@@ -7,19 +7,12 @@ use std::sync::{Arc, Mutex};
 
 /// How much a daemon says.
 ///
-/// A level exists because a malformed-packet flood used to be one unbuffered
-/// `write(2)` per bad packet with no way to turn it off — 50k lines a second at
-/// 50k pps, and the caller built the message with `format!` whether or not
-/// anything wanted it. `tracing`'s macros only evaluate their arguments when a
-/// subscriber is interested, so the level is what stops the work, not just the
-/// output.
+/// The level stops the work, not just the output: `tracing`'s macros only build
+/// their arguments when a subscriber is interested, which is what keeps a
+/// malformed-packet flood from costing a `format!` per packet.
 ///
-/// **Volume beyond that is the platform's job, not this process's.** journald
-/// rate-limits per service (`LogRateLimitIntervalSec`, `LogRateLimitBurst`) and
-/// says how many it dropped; a second limiter in here would be a second thing to
-/// reason about at 3am and would hide what the first one did. See the README's
-/// unit, where the knobs are set (`CLAUDE.md` §14 — prefer the shape the
-/// operator already runs).
+/// Volume beyond that is journald's job (`LogRateLimitIntervalSec`,
+/// `LogRateLimitBurst`); a second limiter here would hide what the first did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Error,
@@ -72,29 +65,23 @@ impl FromStr for LogLevel {
 
 /// Send this process's log lines to stderr at `level`, honouring `RUST_LOG`.
 ///
-/// Called **once, by a binary** — never from library code, which only emits.
-/// It lives here rather than in each daemon so that `rdnsd` and `rdnsr` cannot
-/// end up configured differently, which is the same reason the ICMP predicate
-/// was moved into this crate (`CLAUDE.md` §7).
+/// Called once, by a binary; library code only emits. Shared so that `rdnsd` and
+/// `rdnsr` cannot end up configured differently.
 ///
-/// `RUST_LOG` wins where it is set, because the reason to reach for it is a
-/// server already misbehaving under a level chosen weeks ago in a unit file, and
-/// editing the unit to look at one module is a restart nobody wants. `--quiet`
-/// and `--log-level` set the default it falls back to.
+/// `RUST_LOG` wins where it is set — reaching for it means a server misbehaving
+/// under a level chosen in a unit file, and editing the unit is a restart.
+/// `--quiet` and `--log-level` set the fallback.
 ///
-/// No timestamps and no ANSI: journald stamps every line it receives, and a
-/// second timestamp beside its own is one an operator has to reconcile when the
-/// two disagree. Running in a terminal loses the timestamp entirely, which is
-/// the deliberate trade — the deployed shape wins over the development one.
+/// No timestamps and no ANSI: journald stamps every line, and two stamps
+/// disagreeing is worse than losing one in a terminal.
 pub fn init(level: LogLevel) {
     use tracing_subscriber::EnvFilter;
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.as_str()));
 
-    // `try_init` rather than `init`: a second call is a bug in the caller, but
-    // it must not be a panic in a server that is otherwise fine, and the tests
-    // in this workspace share a process.
+    // `try_init`: a second call is a caller bug, not grounds for panicking a
+    // healthy server, and the tests here share a process.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -105,17 +92,9 @@ pub fn init(level: LogLevel) {
 
 /// How many source addresses are counted individually at once.
 ///
-/// The per-IP maps below are keyed on something an attacker chooses and can
-/// forge, one entry per address, and nothing used to remove an entry —
-/// `reset_stats` exists and is called from nothing but tests. With IPv6 source
-/// addresses that is unbounded in practice: a spoofed-source flood costs the
-/// attacker one 12-byte datagram per entry and the server a `HashMap` slot
-/// forever, so the *monitoring* is the memory-exhaustion vector.
-///
-/// [`crate::security::ResponseLimiter`] already solved this two hundred lines
-/// away, with a `max_tracked` and a `forget_idle`, and a comment explaining that
-/// the table would otherwise be the next amplification vector. That reasoning
-/// applies verbatim to the counters that run *first*; they simply never got it.
+/// The per-IP maps are keyed on a forgeable address, so without a bound one
+/// spoofed 12-byte datagram per entry makes the monitoring the memory-exhaustion
+/// vector. Same shape as [`crate::security::ResponseLimiter`]'s `max_tracked`.
 const MAX_TRACKED_SOURCES: usize = 10_000;
 
 /// Query statistics for monitoring and anomaly detection
@@ -135,23 +114,17 @@ pub struct QueryStats {
     pub queries_by_type: HashMap<Qtype, u64>,
     /// IPs with rate limiting triggered, bounded the same way.
     pub rate_limited_ips: HashMap<IpAddr, u64>,
-    /// Queries from sources there was no room to count individually.
-    ///
-    /// Nonzero means the per-IP numbers are a sample rather than a census, and
-    /// an operator reading a "top talkers" list needs to know that. It is also
-    /// the signal that a source flood is happening at all.
+    /// Queries from sources there was no room to count individually. Nonzero
+    /// means the per-IP numbers are a sample, not a census.
     pub untracked_sources: u64,
 }
 
 /// Count one hit against `ip`, keeping the map bounded.
 ///
-/// A source already being counted always is. A new one is admitted while there
-/// is room; at the bound, every count is **halved** and the entries that reach
-/// zero are forgotten. That keeps whoever is actually sending traffic — the
-/// anomaly signal these counters exist for — and drops the single-datagram
-/// sources a spoofed flood is made of. Halving is O(n) once per roughly n
-/// admissions, so it is amortized constant per query, unlike a scan for the
-/// smallest count on every insertion.
+/// At the bound every count is halved and the zeroes forgotten, which keeps the
+/// heavy talkers these counters exist to find and drops the single-datagram
+/// sources a spoofed flood is made of. Halving is O(n) per ~n admissions, so
+/// amortized constant; a scan for the smallest count per insertion is not.
 fn note_source(map: &mut HashMap<IpAddr, u64>, ip: IpAddr, untracked: &mut u64, max: usize) {
     if let Some(count) = map.get_mut(&ip) {
         *count = count.saturating_add(1);
@@ -164,7 +137,7 @@ fn note_source(map: &mut HashMap<IpAddr, u64>, ip: IpAddr, untracked: &mut u64, 
         map.retain(|_, count| *count > 0);
         if map.len() >= max {
             // Every entry survived the halving, so every tracked source is a
-            // real one. Say so and move on rather than growing.
+            // real one: report the shortfall rather than grow.
             *untracked = untracked.saturating_add(1);
             return;
         }
@@ -174,29 +147,16 @@ fn note_source(map: &mut HashMap<IpAddr, u64>, ip: IpAddr, untracked: &mut u64, 
 
 /// How long a QPS measurement runs before it is rolled over and published.
 ///
-/// The rate is a tumbling counter, not a sliding one: `count` queries arrived in
-/// the `elapsed` seconds since `start`, and at the end of the window that pair
-/// becomes `qps` and both are reset. It used to be a `Vec<u64>` of one timestamp
-/// per query, rescanned with `retain` on *every* query to drop the ones older
-/// than ten seconds — so the vector was `10 × qps` long and the cost of logging
-/// one query was linear in it. Measured before the change: 469 ns at 1k depth,
-/// 2,364 at 10k, 9,886 at 50k, 19,419 at 100k, dead linear at ~0.19 ns/element,
-/// which put a hard ceiling of ~23k qps on the whole server and did not improve
-/// with core count because the stats mutex was held across all of it. A count
-/// and a start answer the same question — "how many queries per second" — in two
-/// words of state.
+/// Tumbling, not sliding: `count` queries since `start`, published and reset at
+/// the end of the window. Two words of state, so logging a query is O(1); a
+/// window holding one timestamp per query is linear in the traffic already
+/// logged, under the stats mutex.
 const QPS_WINDOW_SECS: u64 = 5;
 
 /// Query logger with anomaly detection
 pub struct QueryLogger {
-    /// Stats and the QPS window under **one** lock, deliberately.
-    ///
-    /// There used to be three (`stats`, `query_window`, `last_qps_update`), and
-    /// `log_query` took four guards per call — including taking `query_window`
-    /// twice in six lines, the first time only to read a constant. Every one of
-    /// them was held on the same path with no ordering discipline, which is a
-    /// deadlock waiting for a second writer. One lock, one acquisition, O(1)
-    /// work under it.
+    /// Stats and the QPS window under one lock: several taken on one path with
+    /// no ordering discipline is a deadlock waiting for a second writer.
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -242,7 +202,6 @@ impl QueryLogger {
         let Inner { stats, window } = &mut *inner;
         stats.total_queries += 1;
 
-        // Track per-IP queries, bounded — see `note_source`.
         let QueryStats {
             queries_by_ip,
             untracked_sources,
@@ -250,16 +209,12 @@ impl QueryLogger {
         } = stats;
         note_source(queries_by_ip, ip, untracked_sources, MAX_TRACKED_SOURCES);
 
-        // Track per-type queries
         if let Some(qtype) = query_type {
             *stats.queries_by_type.entry(qtype).or_insert(0) += 1;
         }
 
-        // Roll the QPS window if it has run its course. Saturating, like every
-        // other subtraction of two wall-clock stamps in this workspace
-        // (`CLAUDE.md` §6): the clock can step backwards, and an underflow here
-        // is a debug panic *while holding this mutex*, which poisons it and
-        // takes every later query down with it. Same defect `RateLimiter` had.
+        // Saturating: a backwards clock step underflows, and a debug panic here
+        // poisons this mutex and takes every later query with it.
         window.count += 1;
         let elapsed = now.saturating_sub(window.start);
         if elapsed >= QPS_WINDOW_SECS {
@@ -267,21 +222,16 @@ impl QueryLogger {
             window.start = now;
             window.count = 0;
         } else if now < window.start {
-            // The clock stepped backwards past the window's start. The elapsed
-            // time is unknowable, so publishing a rate from it would be a
-            // fabricated number; reopen the window instead and lose one sample.
+            // The clock stepped back past the window's start, so the interval is
+            // unknowable: reopen and lose one sample rather than invent a rate.
             window.start = now;
             window.count = 0;
         }
     }
 
-    /// Count a query error. **The caller does the logging** — see below.
-    ///
-    /// This used to `eprintln!` the reason itself, which made it impossible for
-    /// the caller to say anything about *where* the error came from without
-    /// building a string first. `count_error` counts; the call site emits at
-    /// whatever level fits, with the peer as a field, and pays for the message
-    /// only if something is listening.
+    /// Count a query error. The caller does the logging: only it knows where the
+    /// error came from, and only it can leave the message unbuilt when nothing
+    /// is listening.
     pub fn count_error(&self, _ip: IpAddr) {
         if let Some(mut inner) = self.locked() {
             inner.stats.total_errors += 1;
@@ -298,19 +248,14 @@ impl QueryLogger {
             untracked_sources,
             ..
         } = &mut inner.stats;
-        // The map that most needs a bound: an entry here is created for a source
-        // that was *refused*, which is exactly the traffic an attacker sends in
-        // volume from addresses they do not own.
+        // The map that most needs a bound: an entry here comes from a *refused*
+        // source, which is what a spoofed flood is made of.
         note_source(rate_limited_ips, ip, untracked_sources, MAX_TRACKED_SOURCES);
     }
 
-    /// The one place this lock is taken, and the one place the failure decision
-    /// is made: a poisoned lock means some other thread panicked mid-update, and
-    /// the right answer for *monitoring* is to stop counting, not to stop
-    /// answering DNS. `.lock().unwrap()` here would turn one panic anywhere into
-    /// a permanently dead server, since every query path calls `log_query`.
-    /// Contrast `security::RateLimiter`, where the same decision is made for a
-    /// different reason — see `CLAUDE.md` §6.
+    /// The one place this lock is taken, and the one failure decision: a
+    /// poisoned lock stops the counting, not the answering. Every query path
+    /// calls `log_query`, so `.unwrap()` here makes one panic permanent.
     fn locked(&self) -> Option<std::sync::MutexGuard<'_, Inner>> {
         self.inner.lock().ok()
     }
@@ -556,7 +501,7 @@ mod tests {
     }
 
     /// The regression test for the quadratic. `log_query` used to push one
-    /// timestamp per query into a `Vec` and `retain` the whole thing on **every**
+    /// timestamp per query into a `Vec` and `retain` the whole thing on every
     /// call, so the cost of logging a query grew with the traffic already logged
     /// — 469 ns at 1k deep, 19,419 ns at 100k. That is a server-wide ~23k qps
     /// ceiling that no profile of the answer path would ever point at.

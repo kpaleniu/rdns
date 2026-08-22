@@ -1,26 +1,19 @@
-//! Ready is not the same question as alive: `/healthz` is for a supervisor
-//! deciding whether to restart, `/readyz` for a load balancer deciding whether to
-//! send traffic. A server can be alive and hold none of its zones.
+//! Ready is not alive: `/healthz` is for a supervisor deciding whether to
+//! restart, `/readyz` for a load balancer deciding whether to send traffic. A
+//! server can be alive and hold none of its zones.
 //!
-//! Ready here means every configured zone is in the zone map. A primary loads,
-//! signs and verifies before the sockets bind, so it is ready as soon as it is
-//! alive, with an empty waiting list rather than a special case.
+//! Ready means every configured zone is in the zone map. A primary loads, signs
+//! and verifies before the sockets bind, so its waiting list is empty. A
+//! secondary is the case this exists for: it binds and answers REFUSED until the
+//! first transfer lands, and nothing else reports that window — the zone gauges
+//! are *absent* for a zone we do not hold, and a probe cannot watch an absence.
 //!
-//! A secondary is the case this exists for: `withdraw_unvouched_zones` removes
-//! every replicated zone whose age cannot be vouched for — at a cold start with
-//! no state sidecar, all of them — and the server then binds and answers REFUSED
-//! until the first transfer lands. Nothing else reports that window; the zone
-//! gauges are *absent* for a zone we do not hold, and a probe cannot be pointed
-//! at an absence.
+//! A one-way latch. Replicas share the master's EXPIRE, so a signal that
+//! followed expiry would pull every server out of rotation at once, turning
+//! stale data into no server. Staleness is what
+//! `dns_zone_last_refresh_timestamp_seconds` and its alert are for.
 //!
-//! A one-way latch, on purpose. Every replica of a zone expires at the same
-//! moment — they share the master's EXPIRE — so a readiness signal following
-//! expiry would pull every server out of rotation at once, turning stale data
-//! into no server. Staleness is what `dns_zone_last_refresh_timestamp_seconds`
-//! and the alert on it are for.
-//!
-//! No lock: the set of things to wait for is fixed at construction and only ever
-//! shrinks, so an atomic per entry plus a counter says everything a mutex would.
+//! No lock: the waiting set is fixed at construction and only shrinks.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -29,46 +22,38 @@ use crate::utils::ascii_lowered;
 
 /// One thing that has to arrive before the server is ready.
 struct Pending {
-    /// ASCII-lowercased at construction, because the only names this holds are
-    /// DNS zone names and DNS matching is case-insensitive (RFC 4343). See
-    /// [`Readiness::arrived`].
+    /// ASCII-lowercased at construction: these are zone names (RFC 4343).
     name: String,
     arrived: AtomicBool,
 }
 
 /// Whether this server has finished starting, and what it is still waiting for.
 ///
-/// Cheap to clone (one `Arc`), and every clone reads and writes the same state —
-/// the refresh tasks hold one to report arrivals, the metrics endpoint holds one
-/// to answer `/readyz`.
+/// Clones share state: the refresh tasks report arrivals, the metrics endpoint
+/// answers `/readyz`.
 #[derive(Clone, Default)]
 pub struct Readiness(Arc<Inner>);
 
 #[derive(Default)]
 struct Inner {
     waiting: Box<[Pending]>,
-    /// How many of `waiting` have not arrived. The counter is the answer;
-    /// the names exist to say *what* is missing and to make a repeated arrival
-    /// idempotent.
+    /// How many of `waiting` have not arrived. The counter is the answer; the
+    /// names say *what* is missing and make a repeated arrival idempotent.
     outstanding: AtomicUsize,
 }
 
 impl Readiness {
-    /// Ready immediately: there is nothing to wait for.
-    ///
-    /// This is a primary, and it is not a degenerate case — it is the honest
-    /// answer for a server whose zones were all loaded before anything bound a
-    /// socket.
+    /// Ready immediately — a primary, whose zones all loaded before any socket
+    /// bound.
     pub fn ready() -> Self {
         Self::default()
     }
 
     /// Not ready until every one of `names` has [`Self::arrived`].
     ///
-    /// Duplicates collapse, because the caller's list does not have to be a set:
-    /// a zone replicated from two masters is two `--secondary` specs and one
-    /// zone, and counting it twice would leave a server that has the zone
-    /// permanently one arrival short of ready.
+    /// Duplicates collapse: a zone replicated from two masters is two
+    /// `--secondary` specs and one zone, and counting it twice would leave a
+    /// server holding it permanently one arrival short.
     pub fn waiting_for<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -92,13 +77,12 @@ impl Readiness {
         }))
     }
 
-    /// Record that `name` is now being served. Returns whether this call was the
-    /// one that changed anything.
+    /// Record that `name` is now being served. Returns whether this call
+    /// changed anything.
     ///
-    /// Idempotent by construction: only the false→true transition decrements the
-    /// counter, so a zone that transfers every hour for a year does not count
-    /// down past zero. A name that was never waited for is ignored — a primary's
-    /// zone reload calls this too, and it has nothing to report.
+    /// Only the false→true transition decrements, so a zone transferring hourly
+    /// does not count past zero. A name never waited for is ignored: a
+    /// primary's reload calls this too.
     pub fn arrived(&self, name: &str) -> bool {
         let name = ascii_lowered(name);
         let Some(entry) = self.0.waiting.iter().find(|p| p.name == name) else {
@@ -122,11 +106,8 @@ impl Readiness {
         self.0.outstanding.load(Ordering::Acquire) == 0
     }
 
-    /// What is still missing, in the order it was registered.
-    ///
-    /// Empty exactly when [`Self::is_ready`]. This is what `/readyz` puts in its
-    /// body: "not ready" with no reason attached is a probe an operator cannot
-    /// act on.
+    /// What is still missing, in registration order — `/readyz`'s body, since
+    /// "not ready" with no reason is a probe nobody can act on.
     pub fn pending(&self) -> Vec<&str> {
         self.0
             .waiting
@@ -136,11 +117,6 @@ impl Readiness {
             .collect()
     }
 }
-
-// There is deliberately no `expected()` returning the size of the original set.
-// Nothing needs it — the startup banner and `/readyz` both want *what is still
-// missing*, which is `pending()` — and a public method whose only caller is a
-// test is API surface bought with nothing.
 
 #[cfg(test)]
 mod tests {
@@ -168,9 +144,8 @@ mod tests {
         assert!(readiness.pending().is_empty());
     }
 
-    /// A zone name is matched the way DNS matches names (RFC 4343): the master
-    /// sends the origin in whatever case the zone file used, and it does not have
-    /// to be the case the `--secondary` flag was written in.
+    /// The master sends the origin in the zone file's case, which need not be
+    /// the case the `--secondary` flag used (RFC 4343).
     #[test]
     fn names_match_case_insensitively() {
         let readiness = Readiness::waiting_for(["Example.COM."]);
@@ -178,8 +153,8 @@ mod tests {
         assert!(readiness.is_ready());
     }
 
-    /// A zone with two masters is two specs and one zone. Counting it twice
-    /// would leave a server that holds everything permanently not-ready.
+    /// Counting a two-master zone twice leaves a server holding everything
+    /// permanently not-ready.
     #[test]
     fn a_zone_named_twice_is_waited_for_once() {
         let readiness = Readiness::waiting_for(["example.com.", "example.com."]);
@@ -188,24 +163,20 @@ mod tests {
         assert!(readiness.is_ready());
     }
 
-    /// The latch does not run backwards, and the counter does not run past zero:
-    /// a refresh loop calls this on every successful transfer, which for a zone
-    /// with a one-minute refresh is 1,440 calls a day.
+    /// The counter must not run past zero: a refresh loop calls this on every
+    /// successful transfer.
     #[test]
     fn arriving_twice_changes_nothing() {
         let readiness = Readiness::waiting_for(["example.com."]);
         assert!(readiness.arrived("example.com."));
         assert!(!readiness.arrived("example.com."), "already counted");
         assert!(readiness.is_ready());
-        // The second call must not have wrapped the counter, which would read as
-        // `usize::MAX` outstanding and never be ready again.
+        // A wrapped counter reads as `usize::MAX` outstanding: never ready.
         assert!(!readiness.arrived("example.com."));
         assert!(readiness.is_ready());
     }
 
-    /// A primary's zones go through the same install path as a secondary's, and
-    /// it has an empty waiting list. Reporting an arrival nobody asked about is
-    /// not an error.
+    /// A primary's zones take the same install path with an empty waiting list.
     #[test]
     fn an_unexpected_arrival_is_ignored() {
         let readiness = Readiness::waiting_for(["example.com."]);
@@ -217,8 +188,6 @@ mod tests {
         assert_eq!(readiness.pending(), vec!["example.com."]);
     }
 
-    /// Clones share state — the refresh tasks and the metrics endpoint each hold
-    /// one, and they are the same answer.
     #[test]
     fn clones_share_one_answer() {
         let readiness = Readiness::waiting_for(["example.com."]);

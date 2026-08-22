@@ -1,16 +1,9 @@
 //! Denial of existence: NSEC and NSEC3.
 //!
-//! A signed "no" is harder than a signed "yes". There is no record to sign when
-//! a name does not exist, so a zone instead signs statements about the *gaps*
-//! between the names that do — NSEC spells the neighbours out, NSEC3 publishes
-//! their hashes so the zone cannot be walked. Validating one means checking
-//! that the gap really does contain the name asked about, which needs the
-//! canonical name ordering of RFC 4034 §6.1 (not string order) and, for NSEC3,
-//! the salted iterated hash of RFC 5155 §5.
-//!
-//! Two of those were wrong here before anything called them: names were
-//! compared as plain lowercased strings, and the NSEC3 hash was a single bare
-//! SHA-1 pass with the salt and iteration count parsed and then ignored.
+//! A zone signs statements about the gaps between the names that exist. Checking
+//! that a gap contains the name asked about needs the canonical name ordering of
+//! RFC 4034 §6.1 — not string order — and, for NSEC3, the salted iterated hash
+//! of RFC 5155 §5.
 
 use crate::dname::dname_to_bytes;
 use crate::error::{DnssecError, DnssecResult};
@@ -22,28 +15,17 @@ use std::cmp::Ordering;
 
 /// The most NSEC3 iterations we will compute before refusing.
 ///
-/// Each iteration hashes the whole name, and the count is a `u16` chosen by
-/// whoever signed the zone, so 65535 iterations on every name in a response is
-/// a CPU amplification vector aimed at the validator. RFC 9276 §3.1 says treat
-/// anything above zero as suspect and gives 0 as the only recommended value;
-/// this ceiling is generous next to that and still bounds the work. Beyond it
-/// we return an error, which the chain validator turns into "insecure" rather
-/// than "bogus" — a zone that signs itself unreasonably is not proof of an
-/// attack on the answer.
+/// The count is a `u16` the zone's signer chooses, so 65535 iterations per name
+/// in a response is CPU amplification aimed at the validator. RFC 9276 §3.1
+/// recommends 0. Over the cap we error, which the chain validator turns into
+/// "insecure" rather than "bogus".
 pub const MAX_NSEC3_ITERATIONS: u16 = 150;
 
-// ---------------------------------------------------------------------------
-// Canonical name ordering (RFC 4034 §6.1)
-// ---------------------------------------------------------------------------
-
-/// Compare two names in DNSSEC canonical order.
+/// Compare two names in DNSSEC canonical order (RFC 4034 §6.1).
 ///
-/// Names sort by label from the *right*: `a.example.com.` and `z.example.com.`
-/// are neighbours, while `example.com.` sorts before both because a name is
-/// ordered ahead of everything beneath it. Comparing the whole strings instead
-/// gets this wrong in both directions — `z.example.com` would sort before
-/// `a.b.example.com` — and an NSEC range check built on string order will
-/// happily accept a name outside the gap it was given.
+/// Labels sort from the *right*, and a name sorts ahead of everything beneath
+/// it. String comparison gets both wrong, and an NSEC range check built on it
+/// accepts names outside the gap.
 pub fn canonical_name_cmp(a: &str, b: &str) -> Ordering {
     let a = reversed_labels(a);
     let b = reversed_labels(b);
@@ -62,18 +44,13 @@ pub fn canonical_name_cmp(a: &str, b: &str) -> Ordering {
     unreachable!("the loop returns on the first differing or missing label")
 }
 
-/// A byte string whose plain `Ord` is exactly [`canonical_name_cmp`].
+/// A byte string whose plain `Ord` is exactly [`canonical_name_cmp`], so a
+/// `BTreeMap` can answer "which NSEC's range contains this name?" by range query.
 ///
-/// Canonical order compares labels from the right, which a `BTreeMap` cannot do
-/// with a `String` key — and without an ordered key there is no way to ask "is
-/// there a cached NSEC whose range contains this name?" except to scan every
-/// one. Encoding the labels right-to-left, each terminated by a zero byte, moves
-/// that ordering into the bytes: a range query then finds the candidate.
-///
-/// The terminator is what makes an ancestor sort before its descendants
-/// (`com\0example\0` is a prefix of `com\0example\0a\0`) and what keeps a label
-/// from sorting after a longer label it is a prefix of (`ab\0` before `abc\0`,
-/// since `\0` < `c`). Zero cannot occur inside a label, so it is unambiguous.
+/// Labels are written right to left, each terminated by a zero byte. The
+/// terminator is what makes an ancestor sort before its descendants and keeps a
+/// label from sorting after a longer label it is a prefix of (`ab\0` before
+/// `abc\0`). Zero cannot occur inside a label.
 pub fn canonical_sort_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(name.len() + 1);
     for label in reversed_labels(name) {
@@ -96,16 +73,10 @@ fn reversed_labels(name: &str) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Type bitmaps (RFC 4034 §4.1.2)
-// ---------------------------------------------------------------------------
-
-/// Whether `rtype` is set in an NSEC/NSEC3 type bitmap.
+/// Whether `rtype` is set in an NSEC/NSEC3 type bitmap (RFC 4034 §4.1.2).
 ///
-/// The bitmap is a sequence of windows: a window number, a length, and that
-/// many bytes of bits for types `window * 256 ..`. A malformed bitmap reads as
-/// "type not present", which is the safe direction — a bitmap we cannot parse
-/// must never be taken as proof that something *is* there.
+/// A malformed bitmap reads as "type not present": a bitmap we cannot parse must
+/// never be taken as proof that something is there.
 pub fn bitmap_has_type(bitmap: &[u8], rtype: Rtype) -> bool {
     let want_window = (rtype.to_u16() >> 8) as u8;
     let want_bit = (rtype.to_u16() & 0xff) as usize;
@@ -127,8 +98,7 @@ pub fn bitmap_has_type(bitmap: &[u8], rtype: Rtype) -> bool {
     false
 }
 
-/// Build a type bitmap covering `types`. Used by tests and by anything that
-/// needs to synthesize a denial.
+/// Build a type bitmap covering `types`.
 pub fn build_type_bitmap(types: &[Rtype]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut windows: Vec<(u8, Vec<u8>)> = Vec::new();
@@ -158,22 +128,15 @@ pub fn build_type_bitmap(types: &[Rtype]) -> Vec<u8> {
     out
 }
 
-/// Every type set in a bitmap, ascending.
-///
-/// The inverse of [`build_type_bitmap`], and the reason the zone writer can put
-/// an NSEC back into presentation format. A malformed bitmap stops the walk
-/// rather than guessing, for the same reason [`bitmap_has_type`] reads it as
-/// "absent" — but here the caller is writing a record out rather than judging a
-/// proof, so a short read would silently drop types. [`bitmap_types_exact`] is
-/// the checked form.
+/// Every type set in a bitmap, ascending. A malformed bitmap silently truncates;
+/// [`bitmap_types_exact`] is the checked form.
 pub fn bitmap_types(bitmap: &[u8]) -> Vec<Rtype> {
     bitmap_types_exact(bitmap).unwrap_or_else(|partial| partial)
 }
 
 /// [`bitmap_types`], but `Err(what was read before the damage)` when the bitmap
-/// does not parse to its end. Anything rewriting a record needs to know the
-/// difference: re-encoding a bitmap we only partly understood would produce a
-/// record that is not the one we were given.
+/// does not parse to its end. Re-encoding a bitmap only partly understood would
+/// emit a record other than the one we were given.
 pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>> {
     let mut types = Vec::new();
     let mut rest = bitmap;
@@ -198,13 +161,10 @@ pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>> {
     Ok(types)
 }
 
-// ---------------------------------------------------------------------------
-// base32hex (RFC 4648 §7) — how NSEC3 owner names carry a hash
-// ---------------------------------------------------------------------------
-
+/// base32hex (RFC 4648 §7): how an NSEC3 owner label carries a hash.
 const BASE32HEX: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
 
-/// Encode bytes as unpadded base32hex, the form an NSEC3 owner label takes.
+/// Encode bytes as unpadded base32hex.
 pub fn base32hex_encode(data: &[u8]) -> String {
     let mut out = String::new();
     for chunk in data.chunks(5) {
@@ -249,22 +209,16 @@ pub fn base32hex_decode(text: &str) -> DnssecResult<Vec<u8>> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
-// The NSEC3 hash (RFC 5155 §5)
-// ---------------------------------------------------------------------------
-
-/// The NSEC3 hash of `name`: SHA-1 over the name's wire form, salted and
-/// iterated.
+/// The NSEC3 hash of `name` (RFC 5155 §5): SHA-1 over the name's wire form,
+/// salted and iterated.
 ///
 /// ```text
 /// IH(salt, x, 0) = H(x || salt)
 /// IH(salt, x, k) = H(IH(salt, x, k-1) || salt)
 /// ```
 ///
-/// The salt is appended at *every* round, not just the first, and the input to
-/// round zero is the down-cased wire-format name — not its text. Hashing the
-/// text with a single unsalted pass, as this used to, produces a value that
-/// matches no real zone, so every negative answer fails to prove anything.
+/// The salt is appended at every round, and round zero's input is the down-cased
+/// *wire-format* name, not its text.
 pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Vec<u8>> {
     if iterations > MAX_NSEC3_ITERATIONS {
         return Err(DnssecError::parse(format!(
@@ -286,10 +240,6 @@ pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Vec<
     }
     Ok(digest)
 }
-
-// ---------------------------------------------------------------------------
-// Typed views
-// ---------------------------------------------------------------------------
 
 /// An NSEC record and the name it sits at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,10 +274,9 @@ impl Nsec {
 
     /// Whether `name` falls strictly inside the gap this NSEC describes.
     ///
-    /// The endpoints are excluded: a name equal to either neighbour exists, so
-    /// the record proves the opposite of non-existence for it. The last NSEC in
-    /// a zone points back at the apex, so a `next` at or below `owner` means
-    /// the range wraps around the end of the zone.
+    /// Endpoints are excluded: a name equal to either neighbour exists. The last
+    /// NSEC in a zone points back at the apex, so a `next` at or below `owner`
+    /// means the range wraps.
     pub fn covers(&self, name: &str) -> bool {
         let after_owner = canonical_name_cmp(name, &self.owner) == Ordering::Greater;
         let before_next = canonical_name_cmp(name, &self.next) == Ordering::Less;
@@ -344,22 +293,16 @@ impl Nsec {
     }
 }
 
-/// The only NSEC3 hash algorithm IANA has assigned: 1, SHA-1.
-///
-/// The "DNSSEC NSEC3 Hash Algorithms" registry (RFC 5155 §11) reserves 0 and
-/// leaves 2-255 available, so anything but 1 is a type we cannot compute and —
-/// per §8.1 — must ignore rather than object to.
+/// The only NSEC3 hash algorithm IANA has assigned (RFC 5155 §11 registry);
+/// anything else must be ignored rather than objected to (§8.1).
 const SHA1_HASH_ALGORITHM: u8 = 1;
 
 /// The three fields an NSEC3 hash is a function of (RFC 5155 §5).
 ///
-/// Borrowed, and separate from [`Nsec3`], because the hash does not depend on
-/// anything else in the record: every record of one chain carries the same
-/// three, so a caller searching a chain hashes a name once for the whole of it
-/// rather than once per record. Doing the latter cost 1 156 ms of CPU on one
-/// query (`TODO.md` #23). A zone mid-NSEC3PARAM roll publishes two chains at
-/// once, so a *set* of records is not always one chain — hence a value to
-/// compare rather than an assumption.
+/// Separate from [`Nsec3`] so a caller searching a chain hashes a name once for
+/// the whole chain rather than once per record. A zone mid-NSEC3PARAM roll
+/// publishes two chains at once, so a set of records is not always one chain —
+/// hence a value to compare rather than an assumption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Nsec3Params<'a> {
     pub hash_algorithm: u8,
@@ -427,9 +370,9 @@ impl Nsec3 {
         }
     }
 
-    /// The Opt-Out flag (RFC 5155 §6): this NSEC3's span may contain
-    /// unsigned delegations it says nothing about. It weakens what a covering
-    /// record proves — enough for "no DS here", never enough for "no name here".
+    /// The Opt-Out flag (RFC 5155 §6): the span may contain unsigned delegations
+    /// it says nothing about. Enough for "no DS here", never enough for "no name
+    /// here".
     pub fn opt_out(&self) -> bool {
         self.flags & 0x01 != 0
     }
@@ -450,10 +393,8 @@ impl Nsec3 {
 
     /// Whether this NSEC3 is the record for the name whose hash is `hash`.
     ///
-    /// Split out of [`Nsec3::matches`] so a caller with the hash already in hand
-    /// — one per chain rather than one per record — can ask without recomputing
-    /// it. The caller owns the check that [`Nsec3::params`] agree; a hash under
-    /// other parameters answers a different question.
+    /// The caller owns the check that [`Nsec3::params`] agree; a hash under other
+    /// parameters answers a different question.
     pub fn matches_hash(&self, hash: &[u8]) -> bool {
         hash == self.owner_hash
     }
@@ -463,8 +404,8 @@ impl Nsec3 {
         Ok(self.matches_hash(&self.hash(name)?))
     }
 
-    /// Whether `hash` falls strictly inside this record's span. The hash half of
-    /// [`Nsec3::covers`], on the same terms as [`Nsec3::matches_hash`].
+    /// Whether `hash` falls strictly inside this record's span, on the same terms
+    /// as [`Nsec3::matches_hash`].
     pub fn covers_hash(&self, hash: &[u8]) -> bool {
         if hash.is_empty() || self.owner_hash.is_empty() || self.next_hashed_owner.is_empty() {
             return false;
@@ -491,18 +432,14 @@ impl Nsec3 {
 
 /// One name's NSEC3 hash, computed once per set of parameters it is asked for.
 ///
-/// A set of NSEC3 records is normally one chain and shares one set of
-/// parameters, so this holds a single entry and refills it only on the rare
-/// change — a zone published under two chains at once during an NSEC3PARAM roll.
-/// Ask it rather than the record when the same name is tested against several
+/// Use this rather than the record when a name is tested against several
 /// records: [`Nsec3::matches`] and [`Nsec3::covers`] each recompute the salted,
-/// iterated SHA-1 the previous record just computed, which is up to
-/// `MAX_NSEC3_ITERATIONS + 1` SHA-1 passes thrown away per record
-/// (`TODO.md` #23).
+/// iterated SHA-1 the previous record just computed — up to
+/// `MAX_NSEC3_ITERATIONS + 1` passes thrown away per record.
 struct NameHash<'a> {
     name: &'a str,
-    /// The parameters `hash` was computed under, and the hash. `None` until the
-    /// first record asks, and replaced whenever a record's parameters differ.
+    /// The parameters `hash` was computed under, and the hash. Replaced whenever
+    /// a record's parameters differ.
     computed: Option<(Nsec3Params<'a>, Vec<u8>)>,
 }
 
@@ -552,10 +489,6 @@ pub fn nsec3s_in(records: &[ResourceRecord]) -> Vec<Nsec3> {
     records.iter().filter_map(Nsec3::from_record).collect()
 }
 
-// ---------------------------------------------------------------------------
-// The proofs themselves
-// ---------------------------------------------------------------------------
-
 /// The outcome of asking a set of NSEC/NSEC3 records to prove something.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Denial {
@@ -572,13 +505,12 @@ impl Denial {
     }
 }
 
-/// Whether these records prove that `zone` has no DS record — that is, that the
-/// delegation is genuinely unsigned rather than having had its DS stripped.
+/// Whether these records prove `zone` has no DS — that the delegation is really
+/// unsigned rather than having had its DS stripped (RFC 4035 §5.2,
+/// RFC 5155 §8.9).
 ///
-/// This is the single most security-relevant proof in the whole chain. Without
-/// it, an attacker removes the DS from a referral and the validator concludes
-/// "unsigned zone, nothing to check", which turns every signed zone below into
-/// an unsigned one. RFC 4035 §5.2 and RFC 5155 §8.9.
+/// Without it, stripping the DS from a referral makes every signed zone below
+/// look unsigned.
 pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
     for nsec in nsecs {
         if !nsec.matches(zone) {
@@ -601,19 +533,10 @@ pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
         return Denial::Proved;
     }
 
-    // A record we cannot hash does not end the search. This loop used to
-    // `return` on the first `Err`, so one unusable NSEC3 anywhere in the set
-    // poisoned a proof that a later record would have completed — and the
-    // records come out of a *response*, so which ones are in the set is not
-    // ours to choose. RFC 5155 §8.1 says to ignore what we cannot hash and
-    // that "responses containing **only** such NSEC3 RRs will generally be
-    // considered bogus", which is a statement about the whole set and not about
-    // the first member of it.
-    //
-    // The reason is kept and reported below only if nothing matched, which is
-    // the case where it is genuinely the explanation. Dropping it entirely
-    // would be the quiet degradation §4 warns about: the RFC 9276 iteration cap
-    // is the likeliest cause and an operator needs to see it named.
+    // RFC 5155 §8.1: ignore records we cannot hash; only a set of *nothing but*
+    // those is bogus. So skip rather than return, and report the reason below
+    // only if nothing matched — the RFC 9276 iteration cap is the likeliest
+    // cause and an operator needs it named.
     let mut unusable: Option<String> = None;
     let mut hash = NameHash::new(zone);
     for nsec3 in nsec3s {
@@ -634,12 +557,10 @@ pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
         }
     }
 
-    // No NSEC3 names the delegation. Opt-out (RFC 5155 §6) is what lets a large
-    // TLD skip signing every unsigned delegation: a covering NSEC3 with the
-    // flag set means "there may be insecure delegations in this span I have not
-    // named", which is exactly the claim we need. Without the flag, a covering
-    // record proves the name does not exist at all — and it plainly does, since
-    // we were just referred to it — so it proves nothing here.
+    // No NSEC3 names the delegation. A covering record with Opt-Out set
+    // (RFC 5155 §6) claims there may be insecure delegations in the span, which
+    // is the claim needed here. Without the flag it claims the name does not
+    // exist at all, contradicting the referral we just followed.
     for nsec3 in nsec3s {
         if nsec3.opt_out() && hash.covers(nsec3).unwrap_or(false) {
             return Denial::Proved;
@@ -663,10 +584,9 @@ pub fn proves_nxdomain(qname: &str, zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]
         let Some(covering) = nsecs.iter().find(|n| n.covers(qname)) else {
             return Denial::NotProved(format!("no NSEC covers {qname}"));
         };
-        // The name is absent; now show that no wildcard would have answered
-        // for it either. The wildcard to disprove sits at the closest encloser,
-        // which for an NSEC proof is the longest suffix of qname that the
-        // covering record's owner and next name share with it.
+        // The wildcard to disprove sits at the closest encloser, which for an
+        // NSEC proof is the longest suffix of qname shared with either end of
+        // the covering record.
         let encloser = closest_encloser_nsec(qname, covering);
         let wildcard = format!("*.{encloser}");
         if nsecs.iter().any(|n| n.covers(&wildcard)) {
@@ -687,17 +607,11 @@ pub fn proves_nxdomain(qname: &str, zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]
 /// Whether these records prove `qname` exists but has no record of `qtype`
 /// (NODATA).
 ///
-/// Two shapes, and the second is easy to forget. Usually the zone has a record
-/// *at* the name and its NSEC lists the types present, so the absence of `qtype`
-/// from the bitmap is the whole proof. But the name may not exist at all and a
-/// **wildcard** may be what answered — and then have had no record of this type
-/// either. The zone's proof for that is a different pair of records: one showing
-/// the name itself is absent, and the NSEC/NSEC3 *at the wildcard* showing what
-/// a wildcard would have answered with (RFC 4035 §5.4, RFC 5155 §8.7).
-///
-/// Demanding only the first shape refuses a perfectly good answer, which is what
-/// this used to do: any zone with a wildcard got SERVFAIL for every type the
-/// wildcard does not carry.
+/// Two shapes. Usually a record sits *at* the name and its bitmap lacks `qtype`.
+/// But the name may not exist and a wildcard may be what answered, having no
+/// record of this type either: that proof is one record showing the name absent
+/// plus the one *at the wildcard* showing what a wildcard would have answered
+/// with (RFC 4035 §5.4, RFC 5155 §8.7).
 pub fn proves_nodata(
     qname: &str,
     zone: &str,
@@ -712,11 +626,9 @@ pub fn proves_nodata(
         return nodata_bitmap(qtype, qname, |t| nsec.has_type(t));
     }
 
-    // As in `proves_no_ds`: an unusable record is skipped rather than returned
-    // on, so it cannot poison a set a later record would have answered from.
-    // Here the fall-through is the wildcard-NODATA path below, which is a real
-    // answer — so this loop had the more damaging version of the bug, one bad
-    // NSEC3 short-circuiting past a proof that had not been attempted yet.
+    // As in `proves_no_ds`: skip an unusable record rather than return on it, so
+    // it cannot poison a set a later record — or the wildcard path below — would
+    // have answered from.
     let mut unusable: Option<String> = None;
     let mut hash = NameHash::new(qname);
     for nsec3 in nsec3s {
@@ -733,13 +645,11 @@ pub fn proves_nodata(
         return nsec_wildcard_nodata(qname, qtype, nsecs);
     }
     if !nsec3s.is_empty() {
-        // The reason a record was skipped is reported only if the wildcard
-        // proof *also* failed — putting the check above this branch would have
-        // reintroduced the very short-circuit being removed, one step later.
-        // `nsec3_closest_encloser` inside here swallows the same failure with
-        // `unwrap_or(false)`, so without this the RFC 9276 iteration cap — the
-        // likeliest cause — reaches the operator as "no closest encloser",
-        // which sends them after the wrong thing entirely.
+        // Report a skipped record's reason only if the wildcard proof also
+        // failed; checking above this branch would re-introduce the
+        // short-circuit. `nsec3_closest_encloser` swallows the same failure with
+        // `unwrap_or(false)`, so without this the RFC 9276 iteration cap reaches
+        // the operator as "no closest encloser".
         return match (nsec3_wildcard_nodata(qname, zone, qtype, nsec3s), unusable) {
             (Denial::NotProved(_), Some(why)) => {
                 Denial::NotProved(format!("NSEC3 for {qname} unusable: {why}"))
@@ -753,10 +663,8 @@ pub fn proves_nodata(
     ))
 }
 
-/// The bitmap half of a NODATA proof, shared by NSEC and NSEC3 and by both the
-/// plain and the wildcard case: the type asked for must be absent, and so must
-/// CNAME — a CNAME at the name would have been followed rather than answered
-/// NODATA, so its presence contradicts the proof.
+/// The bitmap half of a NODATA proof: the type asked for must be absent, and so
+/// must CNAME — a CNAME would have been followed rather than answered NODATA.
 fn nodata_bitmap(qtype: Rtype, at: &str, has_type: impl Fn(Rtype) -> bool) -> Denial {
     if has_type(qtype) {
         return Denial::NotProved(format!("the denial at {at} says type {qtype} exists"));
@@ -770,12 +678,9 @@ fn nodata_bitmap(qtype: Rtype, at: &str, has_type: impl Fn(Rtype) -> bool) -> De
 /// Wildcard NODATA with NSEC: the name is covered (so it does not exist), and
 /// the wildcard at its closest encloser has an NSEC whose bitmap lacks the type.
 ///
-/// The closest encloser is derived from the covering record rather than taken on
-/// the responder's word, which is what stops the answer from being a wildcard
-/// higher up the tree than the one that really governs the name — the same
-/// reasoning as [`proves_wildcard_expansion`], and the same machinery. Often one
-/// record does both jobs: `*.example.com.`'s own NSEC covers the ordinary names
-/// it answers for, because `*` sorts before every ordinary label.
+/// The closest encloser is derived from the covering record, not taken on the
+/// responder's word — otherwise a wildcard higher up the tree than the one
+/// governing the name would do, as in [`proves_wildcard_expansion`].
 fn nsec_wildcard_nodata(qname: &str, qtype: Rtype, nsecs: &[Nsec]) -> Denial {
     let Some(covering) = nsecs.iter().find(|n| n.covers(qname)) else {
         return Denial::NotProved(format!("no NSEC matches or covers {qname}"));
@@ -810,10 +715,9 @@ fn nsec3_wildcard_nodata(qname: &str, zone: &str, qtype: Rtype, nsec3s: &[Nsec3]
 
 /// The outcome of checking a wildcard-expanded answer.
 ///
-/// Three states rather than [`Denial`]'s two, because an Opt-Out NSEC3 span is
-/// neither a proof nor an attack: it declines to say whether a delegation sits
-/// in the gap, so the answer cannot be called authentic and cannot be called
-/// forged either.
+/// Three states rather than [`Denial`]'s two: an Opt-Out NSEC3 span declines to
+/// say whether a delegation sits in the gap, so the answer is neither authentic
+/// nor forged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WildcardVerdict {
     /// The name really had nothing of its own: expanding the wildcard was right.
@@ -826,26 +730,19 @@ pub enum WildcardVerdict {
 }
 
 /// Whether these records prove that `owner` — a name answered out of the
-/// wildcard `wildcard` — had nothing of its own to answer with, so expanding
-/// that wildcard was the correct thing to do (RFC 4035 §5.3.4, RFC 5155 §8.8).
+/// wildcard `wildcard` — had nothing of its own, so expanding that wildcard was
+/// correct (RFC 4035 §5.3.4, RFC 5155 §8.8).
 ///
-/// This is not a formality. A wildcard signature is made over the wildcard
-/// name, so it verifies at *every* name the wildcard could expand to: hold one
-/// genuine `*.example.com. A` RRset and its RRSIG, re-own them onto any name
-/// under `example.com.`, and the signature still checks out. Two things have to
-/// be shown before that is an answer rather than a substitution.
+/// A wildcard signature verifies at every name the wildcard could expand to, so
+/// a genuine RRset can be re-owned onto any name under the encloser. Two things
+/// rule that substitution out:
 ///
-/// - **The name asked about has no records of its own.** Otherwise a wildcard is
-///   not what should have answered for it, and the real records are being
-///   suppressed in favour of ones the attacker chose.
-/// - **The wildcard is the one that name's closest encloser publishes**, not one
-///   further up the tree. If some ancestor of `owner` below `wildcard`'s parent
-///   exists, RFC 4592 §3.3.1 says the wildcard at *that* name (or nothing at
-///   all) governs, and a `*.example.com.` answer for `a.b.example.com.` when
-///   `b.example.com.` exists is exactly the substitution above wearing a
-///   correct-looking signature. For NSEC that check is the closest encloser the
-///   covering record implies; NSEC3 gets it for free, because the name it has to
-///   cover — the "next closer" — is derived from where the wildcard sits.
+/// - The name asked about has no records of its own.
+/// - The wildcard is the one that name's closest encloser publishes, not one
+///   further up the tree: if an ancestor of `owner` below `wildcard`'s parent
+///   exists, RFC 4592 §3.3.1 says the wildcard at *that* name governs. NSEC gets
+///   this from the closest encloser the covering record implies; NSEC3 gets it
+///   from the "next closer" name, which is derived from where the wildcard sits.
 pub fn proves_wildcard_expansion(
     owner: &str,
     wildcard: &str,
@@ -868,10 +765,9 @@ pub fn proves_wildcard_expansion(
                 "no NSEC covers {owner}, so nothing rules out records of its own"
             ));
         };
-        // Both ends of a covering NSEC exist, so the longest suffix `owner`
-        // shares with either is the deepest ancestor of `owner` known to exist.
-        // It has to be the name the wildcard hangs off; deeper means a closer
-        // encloser exists and this wildcard never applied.
+        // Both ends of a covering NSEC exist, so the longest suffix shared with
+        // either is the deepest ancestor of `owner` known to exist. Deeper than
+        // the wildcard's own parent means this wildcard never applied.
         let found = closest_encloser_nsec(&owner, covering);
         if canonical_name_cmp(&found, &encloser) != Ordering::Equal {
             return WildcardVerdict::NotProved(format!(
@@ -884,8 +780,8 @@ pub fn proves_wildcard_expansion(
 
     if !nsec3s.is_empty() {
         // RFC 5155 §8.8: show the "next closer" name — one label below the
-        // encloser, on the way to `owner` — absent. Naming it from the
-        // wildcard's own position is what pins the expansion to the right depth.
+        // encloser, towards `owner` — absent. Naming it from the wildcard's own
+        // position pins the expansion to the right depth.
         let next_closer =
             crate::dnssec::suffix_labels(&owner, crate::dnssec::label_count(&encloser) + 1);
         let mut hash = NameHash::new(&next_closer);
@@ -895,10 +791,9 @@ pub fn proves_wildcard_expansion(
         {
             return WildcardVerdict::Proved;
         }
-        // Opt-out means the span may hold delegations the zone never named
-        // (RFC 5155 §6). If the next closer name were one of them, `owner` lives
-        // in a child zone and a referral was the honest answer — so this proves
-        // nothing, without being evidence of anything either.
+        // Opt-out (RFC 5155 §6): if the next closer name is one of the
+        // delegations the span never named, `owner` lives in a child zone and a
+        // referral was the honest answer. Proves nothing, accuses nothing.
         if hash.covered_by(nsec3s) {
             return WildcardVerdict::Unjudgeable(format!(
                 "the NSEC3 covering the next closer name {next_closer} has Opt-Out set"
@@ -914,9 +809,7 @@ pub fn proves_wildcard_expansion(
     ))
 }
 
-/// The name a wildcard hangs off: `*.example.com.` expands names below
-/// `example.com.`, which is therefore their closest encloser. `None` for a name
-/// that is not a wildcard.
+/// The name a wildcard hangs off. `None` for a name that is not a wildcard.
 fn wildcard_encloser(wildcard: &str) -> Option<String> {
     let name = crate::dnssec::canonical_name(wildcard);
     let rest = name.strip_prefix("*.")?;
@@ -927,9 +820,8 @@ fn wildcard_encloser(wildcard: &str) -> Option<String> {
     })
 }
 
-/// The longest suffix `qname` shares with either end of the NSEC that covers
-/// it. That name provably exists (an NSEC's owner and next name both do), so it
-/// is the closest ancestor of `qname` that does.
+/// The longest suffix `qname` shares with either end of the NSEC covering it.
+/// Both ends provably exist, so this is `qname`'s closest ancestor that does.
 fn closest_encloser_nsec(qname: &str, covering: &Nsec) -> String {
     let from_owner = common_suffix(qname, &covering.owner);
     let from_next = common_suffix(qname, &covering.next);
@@ -959,9 +851,9 @@ fn common_suffix(a: &str, b: &str) -> String {
     }
 }
 
-/// The RFC 5155 §8.4 closest-encloser proof: `qname` cannot exist because its
-/// closest encloser is proven and the name one label below that is absent — plus
-/// the wildcard at the encloser accounted for, or one could still have answered.
+/// The RFC 5155 §8.4 closest-encloser proof: the encloser is proven, the name one
+/// label below it is absent, and the wildcard at the encloser is accounted for —
+/// without which one could still have answered.
 fn nsec3_closest_encloser_proof(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Denial {
     let encloser = match nsec3_closest_encloser(qname, zone, nsec3s) {
         Ok(encloser) => encloser,
@@ -976,23 +868,20 @@ fn nsec3_closest_encloser_proof(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> De
     Denial::Proved
 }
 
-/// The closest encloser of `qname` that these NSEC3 records prove
-/// (RFC 5155 §8.3): the deepest ancestor one of them matches, provided the name
-/// one label below it — the "next closer" — is covered. That pair is what makes
-/// `qname` itself impossible while naming the only wildcard that could have
-/// applied to it, so both the NXDOMAIN proof and the wildcard proofs start here.
+/// The closest encloser of `qname` these NSEC3 records prove (RFC 5155 §8.3):
+/// the deepest ancestor one of them matches, provided the "next closer" name one
+/// label below it is covered. That pair makes `qname` impossible and names the
+/// only wildcard that could have applied.
 ///
-/// `Err` carries why the proof does not stand. A record matching `qname` itself
-/// is one of those reasons: the name exists, so nothing below this is the
-/// question being asked.
+/// `Err` carries why the proof does not stand — including a record matching
+/// `qname` itself, which says the name exists.
 fn nsec3_closest_encloser(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Result<String, String> {
     let qname = crate::dnssec::canonical_name(qname);
     let zone = crate::dnssec::canonical_name(zone);
     let qlabels = crate::dnssec::label_count(&qname);
     let zlabels = crate::dnssec::label_count(&zone);
 
-    // Walk up from the name towards the apex looking for a match. The apex
-    // always exists, so the search terminates there at the latest.
+    // Walk up towards the apex, which always exists, so the search terminates.
     for depth in (zlabels..=qlabels).rev() {
         let candidate = crate::dnssec::suffix_labels(&qname, depth);
         if !NameHash::new(&candidate).matched_by(nsec3s) {
@@ -1029,22 +918,16 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
-    // Canonical ordering
-    // -----------------------------------------------------------------
-
-    /// The case plain string comparison gets wrong: sorting is by label from
-    /// the right, so a deeper name under an earlier label comes first.
+    /// Sorting is by label from the right, so a deeper name under an earlier
+    /// label comes first.
     #[test]
     fn test_canonical_order_is_by_label_from_the_right() {
-        // The rightmost differing label decides, so `z` beats `b` even though
-        // the name starting with `a` looks smaller as a string.
+        // The rightmost differing label decides.
         assert_eq!(
             canonical_name_cmp("a.z.example.com.", "b.example.com."),
             Ordering::Greater
         );
-        // Plain string comparison gets exactly this backwards — which is what
-        // an NSEC range check used to be built on.
+        // Plain string comparison gets exactly this backwards.
         assert!("a.z.example.com." < "b.example.com.");
 
         // A name sorts before everything beneath it.
@@ -1078,9 +961,9 @@ mod tests {
         );
     }
 
-    /// The sort key exists so a BTreeMap can do what `canonical_name_cmp` does.
-    /// If the two ever disagree, a range query returns the wrong NSEC and the
-    /// covering check silently examines a record that cannot prove anything.
+    /// If the sort key and `canonical_name_cmp` disagree, a range query returns
+    /// the wrong NSEC and the covering check silently examines a record that
+    /// cannot prove anything.
     #[test]
     fn test_sort_key_ordering_matches_canonical_ordering() {
         let names = [
@@ -1128,10 +1011,6 @@ mod tests {
         assert!(n.covers("zz.example.com."), "after the last name");
         assert!(!n.covers("m.example.com."), "before it");
     }
-
-    // -----------------------------------------------------------------
-    // Type bitmaps
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_type_bitmap_roundtrip() {
@@ -1191,9 +1070,8 @@ mod tests {
         assert_eq!(bitmap_types(&[]), Vec::<Rtype>::new());
     }
 
-    /// A bitmap that does not parse to its end must be reported as such: a
-    /// rewrite that silently kept the types it managed to read would emit a
-    /// record other than the one it was handed.
+    /// A short read must be reported: re-encoding only the types understood
+    /// would emit a record other than the one handed in.
     #[test]
     fn test_bitmap_types_reports_a_short_read() {
         let mut damaged = build_type_bitmap(&[rt::A]);
@@ -1205,10 +1083,6 @@ mod tests {
         );
         assert_eq!(bitmap_types_exact(&[0x00, 0x09, 0x40]), Err(vec![]));
     }
-
-    // -----------------------------------------------------------------
-    // base32hex
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_base32hex_roundtrip() {
@@ -1236,13 +1110,8 @@ mod tests {
         assert!(base32hex_decode("not-base32!").is_err());
     }
 
-    // -----------------------------------------------------------------
-    // The NSEC3 hash
-    // -----------------------------------------------------------------
-
     /// RFC 5155 Appendix A: the zone `example.` with salt `aabbccdd` and 12
     /// iterations hashes `a.example.` to `35mthgpgcu1qg68fab165klnsnk3dpvl`.
-    /// This is the one test that would have caught the old single-pass hash.
     #[test]
     fn test_nsec3_hash_matches_rfc5155_appendix_a() {
         // NSEC3PARAM 1 0 12 aabbccdd, from the RFC's example zone.
@@ -1261,8 +1130,7 @@ mod tests {
         );
     }
 
-    /// The salt and iteration count both change the hash — the old code read
-    /// them off the wire and then ignored both.
+    /// The salt and the iteration count each change the hash.
     #[test]
     fn test_salt_and_iterations_change_the_hash() {
         let base = nsec3_hash("a.example.", &[], 0).unwrap();
@@ -1281,10 +1149,6 @@ mod tests {
             nsec3_hash("a.example.", &[], u16::MAX).expect_err("65535 rounds must be refused");
         assert!(err.to_string().contains("exceeds"), "got: {err}");
     }
-
-    // -----------------------------------------------------------------
-    // Proofs
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_nsec_proves_an_unsigned_delegation() {
@@ -1362,16 +1226,9 @@ mod tests {
         assert!(!denial.is_proved(), "{denial:?}");
     }
 
-    // -----------------------------------------------------------------
-    // Wildcard NODATA — the name does not exist and a wildcard answered,
-    // but the wildcard has no record of this type either
-    // -----------------------------------------------------------------
-
-    /// The ordinary shape, and the one that used to be refused: the zone holds
-    /// `*.example.com. A`, nothing at `a.example.com.`, and the query is for
-    /// AAAA. One NSEC does both jobs here — it sits at the wildcard (so its
-    /// bitmap says what a wildcard would answer) and covers `a.example.com.`
-    /// (so the name itself does not exist).
+    /// Wildcard NODATA: the name does not exist, a wildcard answered, and the
+    /// wildcard has no record of this type either. One NSEC does both jobs
+    /// here — it sits at the wildcard and covers `a.example.com.`.
     #[test]
     fn test_wildcard_nodata_is_proved() {
         let at_wildcard = nsec(
@@ -1400,9 +1257,8 @@ mod tests {
         assert!(!denial.is_proved(), "{denial:?}");
     }
 
-    /// Covering the name is not enough on its own: without the record at the
-    /// wildcard there is nothing saying which types a wildcard carries, and the
-    /// honest answer to the query may have been an address.
+    /// Covering the name is not enough: without the record at the wildcard,
+    /// nothing says which types a wildcard would have answered with.
     #[test]
     fn test_wildcard_nodata_needs_the_record_at_the_wildcard() {
         let covering = nsec("m.example.com.", "z.example.com.", &[rt::A, rt::RRSIG]);
@@ -1416,10 +1272,8 @@ mod tests {
         assert!(!denial.is_proved(), "{denial:?}");
     }
 
-    /// And the depth has to be right, for the same reason a wildcard *answer*
-    /// must come from the closest encloser: `b.example.com.` exists, so
-    /// `*.example.com.` never governed `a.b.example.com.`, and its bitmap says
-    /// nothing about that name.
+    /// `b.example.com.` exists, so `*.example.com.` never governed
+    /// `a.b.example.com.` and its bitmap says nothing about that name.
     #[test]
     fn test_wildcard_nodata_at_the_wrong_depth_is_refused() {
         let at_wildcard = nsec(
@@ -1476,10 +1330,8 @@ mod tests {
         );
         assert!(!denial.is_proved(), "{denial:?}");
 
-        // Nothing covering the next closer name, either: then `a.example.com.`
-        // may exist in its own right and the wildcard is not what answered. The
-        // closest-encloser proof is what rules that out, and it is also what
-        // pins the wildcard to the right depth.
+        // Without the next closer name covered, `a.example.com.` may exist in
+        // its own right and the wildcard is not what answered.
         let denial = proves_nodata(
             "a.example.com.",
             "example.com.",
@@ -1503,13 +1355,8 @@ mod tests {
         assert!(!denial.is_proved(), "{denial:?}");
     }
 
-    // -----------------------------------------------------------------
-    // Wildcard expansions
-    // -----------------------------------------------------------------
-
-    /// The ordinary case: `a.example.com.` answered from `*.example.com.`, with
-    /// the NSEC that shows `a.example.com.` has nothing of its own. In a real
-    /// zone the covering record is often the wildcard's own NSEC, since `*`
+    /// `a.example.com.` answered from `*.example.com.`, with the NSEC showing
+    /// it has nothing of its own — often the wildcard's own NSEC, since `*`
     /// sorts before every ordinary label.
     #[test]
     fn test_wildcard_expansion_proved_by_a_covering_nsec() {
@@ -1533,8 +1380,7 @@ mod tests {
         );
     }
 
-    /// An NSEC that puts the name *inside* the zone's namespace — one whose
-    /// range does not contain it — is not the proof being asked for.
+    /// An NSEC whose range does not contain the name is not the proof asked for.
     #[test]
     fn test_wildcard_expansion_needs_the_name_covered() {
         let elsewhere = nsec("m.example.com.", "n.example.com.", &[rt::A]);
@@ -1546,12 +1392,10 @@ mod tests {
         );
     }
 
-    /// The attack the closest-encloser check exists to stop. `b.example.com.`
-    /// exists, so `a.b.example.com.` is governed by `*.b.example.com.` (or by
-    /// nothing at all) — never by `*.example.com.`. But the NSEC at
-    /// `b.example.com.` does cover `a.b.example.com.`, because a name sorts
-    /// before everything beneath it, so "some NSEC covers the name" would accept
-    /// a re-owned `*.example.com.` RRset here.
+    /// The attack the closest-encloser check stops: `b.example.com.` exists, so
+    /// only `*.b.example.com.` governs `a.b.example.com.` — yet the NSEC at
+    /// `b.example.com.` covers it, since a name sorts before everything beneath
+    /// it. "Some NSEC covers the name" would accept a re-owned RRset here.
     #[test]
     fn test_wildcard_expansion_at_the_wrong_depth_is_refused() {
         let covering = nsec("b.example.com.", "c.example.com.", &[rt::A, rt::RRSIG]);
@@ -1589,9 +1433,8 @@ mod tests {
         );
     }
 
-    /// NSEC3 (RFC 5155 §8.8): what has to be covered is the "next closer" name,
-    /// one label below the wildcard's own position — which is what pins the
-    /// expansion to the right depth without a separate encloser check.
+    /// RFC 5155 §8.8: the "next closer" name is what has to be covered, one
+    /// label below the wildcard, which pins the expansion to the right depth.
     #[test]
     fn test_nsec3_wildcard_expansion_covers_the_next_closer_name() {
         let span = nsec3_span_around;
@@ -1627,9 +1470,8 @@ mod tests {
         assert_eq!(verdict, WildcardVerdict::Proved, "{verdict:?}");
     }
 
-    /// Opt-out declines to say whether a delegation sits in the span, so the
-    /// name may live in a child zone and a referral may have been the honest
-    /// answer. Neither a proof nor an accusation: insecure.
+    /// Opt-out says nothing about delegations in the span, so the name may live
+    /// in a child zone: neither a proof nor an accusation, so insecure.
     #[test]
     fn test_nsec3_wildcard_expansion_over_an_opt_out_span_is_unjudgeable() {
         let opt_out = nsec3_span_around("a.example.com.", 0x01);
@@ -1641,10 +1483,8 @@ mod tests {
         );
     }
 
-    /// An NSEC3 in `example.com.` that *matches* `name` and covers nothing: its
-    /// span is the empty interval just above its own hash, so it can only ever
-    /// prove what its bitmap says about that one name and cannot stand in for a
-    /// covering record by accident.
+    /// An NSEC3 matching `name` and covering nothing — its span is the empty
+    /// interval above its own hash, so it cannot stand in for a covering record.
     fn nsec3_matching(name: &str, types: &[Rtype]) -> Nsec3 {
         let salt = vec![0x01, 0x02];
         let hash = nsec3_hash(name, &salt, 5).expect("hash");
@@ -1661,10 +1501,9 @@ mod tests {
         }
     }
 
-    /// An NSEC3 in `example.com.` whose span contains exactly `name`'s hash and
-    /// nothing else: one step below it to one step above. Building the span from
-    /// the hash keeps the test deterministic — a span pinned to fixed bytes
-    /// covers or misses a freshly computed hash by luck.
+    /// An NSEC3 whose span contains exactly `name`'s hash: one step below to one
+    /// step above. Derived from the hash, since fixed bytes would cover or miss
+    /// it by luck.
     fn nsec3_span_around(name: &str, flags: u8) -> Nsec3 {
         let salt = vec![0x01, 0x02];
         let hash = nsec3_hash(name, &salt, 5).expect("hash");
@@ -1682,8 +1521,7 @@ mod tests {
         }
     }
 
-    /// A hash one step up or down, treated as the big-endian number it is
-    /// compared as, with the carry or borrow propagated.
+    /// A hash one step up or down as the big-endian number it is compared as.
     fn hash_step(hash: &[u8], up: bool) -> Vec<u8> {
         let mut out = hash.to_vec();
         for byte in out.iter_mut().rev() {
@@ -1701,10 +1539,6 @@ mod tests {
         }
         out
     }
-
-    // -----------------------------------------------------------------
-    // NSEC3 records off the wire
-    // -----------------------------------------------------------------
 
     fn nsec3_record(zone: &str, name: &str, next: &[u8], flags: u8, types: &[Rtype]) -> Nsec3 {
         let salt = vec![0x01, 0x02];
@@ -1805,8 +1639,7 @@ mod tests {
         assert!(!parsed.has_type(rt::DS));
     }
 
-    /// An NSEC3 whose iteration count is absurd must fail closed rather than
-    /// burn CPU on every name we check against it.
+    /// An absurd iteration count fails closed rather than burning CPU per name.
     #[test]
     fn test_hostile_nsec3_iterations_are_refused() {
         let n = Nsec3 {
@@ -1826,17 +1659,12 @@ mod tests {
     }
 
     /// One NSEC3 we cannot hash must not poison a set another record answers
-    /// from (RFC 5155 §8.1: a validator MUST *ignore* such records, and it is
-    /// "responses containing **only** such NSEC3 RRs" that are bogus).
-    ///
-    /// **Watched failing first** (`CLAUDE.md` §1): both loops used to `return`
-    /// on the first `Err`, so ordering decided the answer — the usable record
-    /// second in the list was never reached, and `proves_no_ds` came back
-    /// NotProved for a delegation it can prove. The records come out of a
-    /// *response*, so which ones are in the set is not ours to choose.
+    /// from: RFC 5155 §8.1 ignores such records, and only a set of nothing but
+    /// them is bogus. The set comes out of a response, so the order in it is
+    /// not ours to choose.
     #[test]
     fn one_unhashable_nsec3_does_not_poison_the_rest_of_the_set() {
-        // Over the RFC 9276 cap, so `matches` on it is an `Err` rather than a
+        // Over the RFC 9276 cap, so `matches` is an `Err` rather than a
         // mismatch. Everything else about it is well formed.
         let mut poison = nsec3_matching("other.example.com.", &[rt::A]);
         poison.iterations = MAX_NSEC3_ITERATIONS + 1;
@@ -1856,19 +1684,10 @@ mod tests {
         );
     }
 
-    /// And when *every* record is unusable, the reason still reaches the caller
-    /// rather than being flattened into "nothing covers this".
-    ///
-    /// **Not a regression test, and it must not be counted as one** — it passes
-    /// against the old code too, which returned the reason on the first `Err`
-    /// it met. It is here because that is exactly what the fix above was at risk
-    /// of throwing away: skipping unusable records is the correct change, and
-    /// the obvious way to write it drops the diagnostic with them. This pins the
-    /// half that had to survive (`CLAUDE.md` §1 and §10 — say what a test is a
-    /// regression for, and what it is not).
-    ///
-    /// The RFC 9276 iteration cap is the likeliest cause in practice, so it is
-    /// the one an operator has to be able to read off the failure.
+    /// When *every* record is unusable the reason still reaches the caller
+    /// rather than being flattened into "nothing covers this". Skipping
+    /// unusable records is what puts that diagnostic at risk. Not a regression
+    /// test: it passes against the returning-on-first-`Err` form too.
     #[test]
     fn a_set_of_only_unhashable_nsec3s_reports_why() {
         let mut poison = nsec3_matching("example.com.", &[rt::NS]);
@@ -1883,12 +1702,9 @@ mod tests {
         }
     }
 
-    /// An NSEC3 whose hash algorithm is not SHA-1 is dropped as it is read,
-    /// which is what RFC 5155 §8.1's MUST asks for and what makes the set the
-    /// parser hands on contain only records that can be used.
-    ///
-    /// IANA's "DNSSEC NSEC3 Hash Algorithms" registry (RFC 5155 §11) reserves 0
-    /// and leaves 2-255 unassigned, so 1 is the whole of what exists.
+    /// An NSEC3 whose hash algorithm is not SHA-1 is dropped as it is read
+    /// (RFC 5155 §8.1), so the set the parser hands on is all usable. The
+    /// §11 registry reserves 0 and leaves 2-255 unassigned.
     #[test]
     fn an_nsec3_with_an_unknown_hash_algorithm_is_not_read_at_all() {
         let usable = nsec3_matching("example.com.", &[rt::NS]);

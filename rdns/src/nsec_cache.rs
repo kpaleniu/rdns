@@ -1,30 +1,19 @@
 //! Aggressive use of DNSSEC-validated denial of existence (RFC 8198).
 //!
-//! A signed NSEC says "nothing exists between these two names", so a validator
-//! holding one already knows the answer for every name in that gap. Caching the
-//! gap rather than the question turns a random-name flood into one upstream query
-//! per zone.
+//! A signed NSEC answers for every name in its gap, so caching the gap rather
+//! than the question turns a random-name flood into one upstream query per zone.
+//! Gaps are searched by range, which [`crate::DnsCache`]'s `(name, type)` map
+//! cannot do — hence the `BTreeMap` over [`canonical_sort_key`].
 //!
-//! Not the ordinary cache with a different key: [`crate::DnsCache`] maps
-//! `(name, type)` to records and can only answer the question it was asked, where
-//! a gap has to be searched by range — hence the `BTreeMap` ordered by
-//! [`canonical_sort_key`].
+//! A mistake here denies a name that exists. The rules that prevent it:
 //!
-//! Every mistake here is invisible until it denies a name that exists. The rules
-//! that prevent that:
-//!
-//! - **Only Secure material.** An unvalidated NSEC is an attacker's assertion
-//!   about which names do not exist, which is a denial-of-service primitive.
-//! - **Never across an opt-out NSEC3 span** (RFC 8198 §5.2). Opt-out means the
-//!   span may contain delegations the zone never named, so it proves nothing
-//!   about what is inside it.
-//! - **Never below a delegation.** A gap says nothing exists *in this zone*
-//!   between two names; names beneath a delegation at the gap's lower edge live
-//!   in the child zone and exist perfectly well. This one is not in the RFC's
-//!   list and is the easiest to get wrong — see [`ZoneProofs::covering_nsec`].
-//! - **NXDOMAIN needs the wildcard denied too**, or a name the gap covers could
-//!   still have been answered by a wildcard.
-//! - **TTL is bounded by the proof**, not by the question.
+//! - Only material that validated as Secure.
+//! - Never across an opt-out NSEC3 span (RFC 8198 §5.2): it may hold delegations
+//!   the zone never named.
+//! - Never below a delegation — names in the child zone sort inside the gap and
+//!   exist perfectly well. See [`ZoneProofs::covering_nsec`].
+//! - NXDOMAIN needs the wildcard denied too.
+//! - TTL is bounded by the proof, not by the question.
 
 use crate::dnssec::{canonical_name, label_count, suffix_labels, Rrsig};
 use crate::dnssec_denial::{
@@ -41,10 +30,8 @@ use std::sync::Mutex;
 
 /// Query types we will not answer from a gap.
 ///
-/// ANY is not a type, so a bitmap saying "no ANY" means nothing; and RRSIG's
-/// presence in a bitmap describes the *other* types' signatures rather than an
-/// RRSIG RRset of its own. Neither can be reasoned about from a type bitmap, so
-/// both go upstream.
+/// ANY is not a type, and RRSIG in a bitmap describes the *other* types'
+/// signatures rather than an RRSIG RRset. Neither can be read off a bitmap.
 fn synthesizable_qtype(qtype: Qtype) -> bool {
     qtype != Qtype::ANY && !qtype.is(rt::RRSIG)
 }
@@ -60,13 +47,8 @@ struct ZoneProofs {
     /// The zone's SOA and its signatures. A negative answer must carry it
     /// (RFC 2308 §2.1), and its MINIMUM bounds how long the answer may live.
     soa: Option<CachedSoa>,
-    /// Validated RRsets that came from a wildcard, by (wildcard owner, type).
-    ///
-    /// The other half of RFC 8198: a validated wildcard answer is a signed
-    /// statement about every name the wildcard reaches, exactly as a validated
-    /// NSEC is one about every name in its gap. Keyed by the wildcard rather than
-    /// by the name that was asked for, because the name asked for is the one
-    /// thing about it that is not reusable.
+    /// Validated RRsets that came from a wildcard, keyed by (wildcard owner,
+    /// type) — the name asked for is the one part that is not reusable.
     wildcards: HashMap<(String, Qtype), CachedWildcard>,
 }
 
@@ -82,10 +64,10 @@ struct CachedProof<T> {
 /// An RRset that a wildcard answered with, ready to answer with again.
 #[derive(Debug, Clone)]
 struct CachedWildcard {
-    /// The RRset and its RRSIGs, owned at the name they arrived under. The owner
-    /// is rewritten on the way out — and the signature still verifies at the new
-    /// name, which is the property that makes this legal at all and also the
-    /// reason a wildcard answer needs its own denial proof (RFC 4035 §5.3.4).
+    /// The RRset and its RRSIGs, owned at the name they arrived under; the owner
+    /// is rewritten on the way out. A wildcard signature verifies at the new name
+    /// unchanged, which is also why the answer needs its own denial proof
+    /// (RFC 4035 §5.3.4).
     records: Vec<ResourceRecord>,
     expires_at: u64,
 }
@@ -128,12 +110,11 @@ pub struct WildcardSynthesis {
     pub ttl: u32,
 }
 
-/// The wildcard a signature was made at, given the expanded owner and the label
-/// count the RRSIG carried.
+/// The wildcard a signature was made at.
 ///
-/// `labels` counts the labels of the name that was really signed, excluding the
-/// leading `*` and the root (RFC 4034 §3.1.3). So the wildcard is `*.` plus that
-/// many trailing labels of the owner.
+/// `labels` counts the signed name's labels, excluding the leading `*` and the
+/// root (RFC 4034 §3.1.3), so the wildcard is `*.` plus that many trailing
+/// labels of the owner.
 fn wildcard_for_expansion(owner: &str, labels: u8) -> Option<String> {
     let owner = canonical_name(owner);
     let parts: Vec<&str> = owner.trim_end_matches('.').split('.').collect();
@@ -148,12 +129,9 @@ fn wildcard_for_expansion(owner: &str, labels: u8) -> Option<String> {
 
 /// `*.` plus the immediate parent of `name`.
 ///
-/// Deliberately the *immediate* parent and nothing shallower, which is narrower
-/// than the protocol allows and is the point — see `synthesize_wildcard` for why.
-/// Note that a wildcard is not limited to one label: the source of synthesis is
-/// the wildcard immediately below the closest encloser, which can be several
-/// labels above the queried name (RFC 4592 §3.3.1, and §3.3.2's worked example).
-/// This function is a deliberate under-approximation, not a reading of the rule.
+/// A deliberate under-approximation, not a reading of RFC 4592 §3.3.1: real
+/// synthesis reaches any depth. See `synthesize_wildcard` for why the narrow
+/// form is the safe one here.
 fn wildcard_for_parent_of(name: &str) -> Option<String> {
     let name = canonical_name(name);
     let (_first, rest) = name.trim_end_matches('.').split_once('.')?;
@@ -167,16 +145,13 @@ fn wildcard_for_parent_of(name: &str) -> Option<String> {
 #[derive(Debug)]
 pub struct NsecCache {
     zones: Mutex<HashMap<NameKeyBuf, ZoneProofs>>,
-    /// Zones to remember. Combined with [`MAX_PROOFS_PER_ZONE`] this bounds the
-    /// whole structure; a zone with a large NSEC chain cannot crowd out the
-    /// rest, and a flood of one-off zones cannot grow it without limit.
+    /// Zones to remember. With [`MAX_PROOFS_PER_ZONE`] this bounds the whole
+    /// structure against a flood of one-off zones or one enormous chain.
     max_zones: usize,
 }
 
-/// Proof records kept per zone. A zone's chain can be enormous — the point of
-/// NSEC3 was to stop people walking exactly this — so keeping all of it is
-/// neither possible nor useful; the gaps that get queried are the ones worth
-/// holding.
+/// Proof records kept per zone. A chain can be arbitrarily long; the gaps that
+/// get queried are the ones worth holding.
 const MAX_PROOFS_PER_ZONE: usize = 256;
 
 /// Never hold a proof longer than this, whatever its TTL claims.
@@ -195,10 +170,9 @@ impl NsecCache {
 
     /// Store the denial carried by `response`.
     ///
-    /// **Only call this for an answer that validated as Secure.** Nothing here
-    /// re-checks a signature; the caller's validation is the entire basis for
-    /// trusting these records later, and a resolver that stored unvalidated
-    /// NSECs would be caching an attacker's opinion about which names exist.
+    /// Only for an answer that validated as Secure. Nothing here re-checks a
+    /// signature, so the caller's validation is the whole basis for trusting
+    /// these records later.
     pub fn insert_validated(&self, response: &DnsMessage) {
         if self.max_zones == 0 {
             return;
@@ -268,9 +242,8 @@ impl NsecCache {
                         continue;
                     }
                     // RFC 8198 §5.2: an opt-out span may hold delegations the
-                    // zone never named, so it cannot be used to deny anything.
-                    // Refused at insert rather than at lookup, so there is no
-                    // path by which one is consulted at all.
+                    // zone never named, so it denies nothing. Refused at insert,
+                    // so no lookup path can reach one.
                     if nsec3.opt_out() {
                         continue;
                     }
@@ -296,30 +269,21 @@ impl NsecCache {
     /// Store the wildcard RRset that answered `response`, and the denial that
     /// came with it.
     ///
-    /// **Only call this for an answer that validated as Secure**, on the same
-    /// terms as [`NsecCache::insert_validated`] — nothing here re-checks a
-    /// signature.
+    /// Only for an answer that validated as Secure, on the same terms as
+    /// [`NsecCache::insert_validated`].
     ///
-    /// RFC 8198 §5.3's other half. A validated wildcard answer is a signed
-    /// statement about every name the wildcard reaches, in the same way a
-    /// validated NSEC is one about every name in its gap, so it can answer for
-    /// names nobody has asked about yet.
-    ///
-    /// The zone comes from the RRSIG's signer name rather than from an SOA,
-    /// because a positive answer has no SOA to read — the authority section of a
-    /// wildcard answer carries the NSEC proving the queried name absent, and that
-    /// is all. Those NSECs are stored too: they are validated denial material
-    /// that arrived on a positive answer, which is the one path
-    /// `insert_validated` cannot see.
+    /// RFC 8198 §5.3: a validated wildcard answer covers every name the wildcard
+    /// reaches. The zone comes from the RRSIG's signer name, since a positive
+    /// answer has no SOA. Its authority NSECs are stored too — validated denial
+    /// material on a path `insert_validated` never sees.
     pub fn insert_validated_wildcard(&self, response: &DnsMessage) {
         if self.max_zones == 0 {
             return;
         }
         let now = current_unix_timestamp();
 
-        // Which RRsets in the answer came from a wildcard, and which wildcard.
-        // The RRSIG's label count is what says so (RFC 4035 §5.3.4): fewer labels
-        // than the owner name has means the signature was made at a wildcard.
+        // Fewer labels in the RRSIG than in the owner name means the signature
+        // was made at a wildcard (RFC 4035 §5.3.4).
         let mut pending: Vec<(String, String, Rtype)> = Vec::new();
         for rr in &response.answers {
             let Some(rrsig) = Rrsig::from_record(rr) else {
@@ -333,9 +297,8 @@ impl NsecCache {
             };
             let zone = canonical_name(&rrsig.signer_name);
             // A signature made outside the zone it claims to sign is not this
-            // zone's to keep. The chain validator has already established the
-            // signer, so this is a consistency check rather than the security
-            // boundary.
+            // zone's to keep. A consistency check, not the security boundary:
+            // the chain validator already established the signer.
             if !is_at_or_below(&wildcard, &zone) {
                 continue;
             }
@@ -357,8 +320,8 @@ impl NsecCache {
             }
             let entry = zones.entry(NameKeyBuf::new(&zone)).or_default();
 
-            // The RRset as it arrived, plus its signatures. `records_at` keeps
-            // the owner name it came under; synthesis rewrites it.
+            // The RRset as it arrived, plus its signatures, under the owner name
+            // it came with; synthesis rewrites that.
             let owner = canonical_name(
                 &response
                     .answers
@@ -402,9 +365,8 @@ impl NsecCache {
                 now,
             );
 
-            // The NSEC that proved the queried name absent rides along on a
-            // wildcard answer, and it is what a later synthesis needs to show the
-            // *next* name absent too.
+            // The NSEC riding along proves the queried name absent, and is what
+            // a later synthesis needs to show the *next* name absent too.
             for rr in &response.authorities {
                 if rr.rdata.rtype() != rt::NSEC {
                     continue;
@@ -434,25 +396,15 @@ impl NsecCache {
 
     /// Answer `qname`/`qtype` positively from a cached wildcard (RFC 8198 §5.3).
     ///
-    /// Two things must hold, and the second is the one that is easy to get wrong.
-    ///
-    /// The name must be proved not to exist by a cached NSEC covering it —
-    /// otherwise a wildcard would answer for a name that has records of its own,
-    /// which shadow it entirely (RFC 1034 §4.3.3).
-    ///
-    /// The wildcard must be `*.<the name's immediate parent>` and nothing
-    /// shallower. Real synthesis is not limited to one label (RFC 4592 §3.3.1,
-    /// §3.3.2), and the restriction here is the safety property: choosing the
-    /// closest encloser needs to know which intermediate names exist, which a
-    /// resolver's cache does not. `*.example.com.` may answer for
-    /// `a.b.example.com.` only if `b.example.com.` does not exist, and a covering
-    /// NSEC cannot establish that — a name sorts before everything beneath it, so
-    /// `b.example.com.`'s own NSEC covers `a.b.example.com.` either way. Deriving
-    /// the wildcard from the queried name rather than searching for one that fits
-    /// makes the mistake unavailable.
-    ///
-    /// The cost is a missed synthesis: a cache miss and a real query. Widening it
-    /// needs a cached proof about the intermediate names (`TODO.md` #9a).
+    /// Two things must hold. A cached NSEC must cover the name, or a wildcard
+    /// would answer for a name with records of its own that shadow it
+    /// (RFC 1034 §4.3.3). And the wildcard must be `*.<immediate parent>` and
+    /// nothing shallower: `*.example.com.` may answer for `a.b.example.com.`
+    /// only if `b.example.com.` does not exist, which a covering NSEC cannot
+    /// establish — a name sorts before everything beneath it, so
+    /// `b.example.com.`'s own NSEC covers `a.b.example.com.` either way.
+    /// Deriving the wildcard from the queried name makes that unavailable, at
+    /// the cost of a missed synthesis.
     pub fn synthesize_wildcard(&self, qname: &str, qtype: Qtype) -> Option<WildcardSynthesis> {
         if !synthesizable_qtype(qtype) {
             return None;
@@ -472,8 +424,7 @@ impl NsecCache {
             .get(&(wildcard.clone(), qtype))
             .filter(|w| w.expires_at > now)?;
         // The queried name must not exist. `covering_nsec` also refuses a gap
-        // below a delegation, which matters here for the same reason it does for
-        // a denial: the names under a delegation sort inside the gap after it.
+        // below a delegation, whose names sort inside it.
         let denial = zone.covering_nsec(&qname, now)?;
 
         let ttl = cached
@@ -485,10 +436,8 @@ impl NsecCache {
             return None;
         }
 
-        // Re-owned onto the name that was asked for, which is what the zone
-        // itself would have sent. The signature verifies there unchanged — that
-        // is what a wildcard signature means — so a DO client can check this
-        // answer for itself rather than taking our word for it.
+        // Re-owned onto the name that was asked for. The wildcard signature
+        // verifies there unchanged, so a DO client can check this itself.
         let answers: Vec<ResourceRecord> = with_ttl(&cached.records, ttl)
             .into_iter()
             .map(|mut rr| {
@@ -514,9 +463,8 @@ impl NsecCache {
         let qname = canonical_name(qname);
         let now = current_unix_timestamp();
 
-        // Under the lock: find the zone, take what bears on the question, and
-        // get out. Whether it proves anything is decided below, with the guard
-        // dropped — see [`Gathered`].
+        // Under the lock: find the zone and take what bears on the question.
+        // Whether it proves anything is decided below, with the guard dropped.
         let (zone_name, soa_records, soa_ttl, gathered) = {
             let zones = self.zones.lock().ok()?;
 
@@ -547,11 +495,9 @@ impl NsecCache {
             return None;
         }
 
-        // The answer lives as long as the shortest-lived thing it rests on: the
-        // proof records, the SOA's negative TTL (RFC 2308 §5), and what is left
-        // of the SOA itself. Applied once, here, to every record going out —
-        // handing back a proof still carrying its original TTL would let a
-        // client re-cache it for longer than we may hold it ourselves.
+        // The shortest-lived thing the answer rests on: the proofs, the SOA's
+        // negative TTL (RFC 2308 §5), and what is left of the SOA. Applied to
+        // every record going out, or a client re-caches it past our own hold.
         let ttl = gathered.ttl.min(soa_ttl);
         if ttl == 0 {
             return None;
@@ -585,17 +531,13 @@ impl NsecCache {
 impl ZoneProofs {
     /// The cached NSEC whose range could contain `name`, if any.
     ///
-    /// The range query finds the greatest owner at or below `name`; if there is
-    /// none, the candidate is the last record in the chain, which is the one
-    /// that wraps around to the apex.
+    /// The greatest owner at or below `name`, or failing that the last record in
+    /// the chain, which is the one that wraps around to the apex.
     ///
-    /// **The delegation check is the subtle part.** A gap says nothing exists
-    /// *in this zone* between its endpoints. If the lower endpoint is a
-    /// delegation — NS set, SOA clear — then everything beneath it lives in the
-    /// child zone, and those names sort inside the gap: `sub.example.com.` and
-    /// `x.sub.example.com.` are adjacent in canonical order, so the gap after a
-    /// delegation swallows the entire subtree below it. Synthesizing NXDOMAIN
-    /// there denies every name in a zone we were never authoritative for.
+    /// A gap says nothing exists *in this zone*. If its lower endpoint is a
+    /// delegation — NS set, SOA clear — everything beneath it lives in the child
+    /// zone and sorts inside the gap, so the gap swallows the whole subtree.
+    /// Denying there denies a zone we were never authoritative for.
     fn covering_nsec(&self, name: &str, now: u64) -> Option<&CachedProof<Nsec>> {
         let key = canonical_sort_key(name);
         let candidate = self
@@ -622,10 +564,8 @@ impl ZoneProofs {
     }
 
     /// The distinct NSEC3 hash parameters among the live records — one, unless
-    /// the zone is mid-NSEC3PARAM roll and publishing two chains.
-    ///
-    /// A name is hashed once per set of these, which is the whole difference
-    /// between this and what it replaced (`TODO.md` #23).
+    /// the zone is mid-NSEC3PARAM roll and publishing two chains. A name is
+    /// hashed once per set, never once per record.
     fn nsec3_params(&self, now: u64) -> Vec<Nsec3Params<'_>> {
         let mut sets: Vec<Nsec3Params<'_>> = Vec::new();
         for cached in self.nsec3s.values().filter(|c| c.live(now)) {
@@ -651,11 +591,10 @@ impl ZoneProofs {
 
     /// The live NSEC3 whose span contains `hash`.
     ///
-    /// The map is keyed by owner hash, so this is the predecessor — and, when
-    /// nothing sorts below it, the last record, whose span wraps around the end
-    /// of the chain. Records under other parameters are skipped rather than
-    /// ending the walk: two interleaved chains share this map, and the
-    /// predecessor in one is not the predecessor in the other.
+    /// The map is keyed by owner hash, so this is the predecessor — or, with
+    /// nothing below it, the last record, whose span wraps. Records under other
+    /// parameters are skipped rather than ending the walk: two interleaved
+    /// chains share this map and have different predecessors.
     fn covering_nsec3(
         &self,
         hash: &[u8],
@@ -676,19 +615,15 @@ impl ZoneProofs {
     /// NODATA: the name exists, but not with this type.
     ///
     /// Only the record *at* the name is consulted, so `proves_nodata`'s wildcard
-    /// case never comes into play here. That is deliberate: answering NODATA for
-    /// a name that does not exist means synthesizing from a wildcard, which is
-    /// the RFC 8198 §5.3 step this cache does not take.
+    /// case never applies: that would mean synthesizing from a wildcard here.
     ///
-    /// `Some` says a record sits at the name, not that it proves anything — see
-    /// [`Gathered`]. That record also settles NXDOMAIN, since the name plainly
-    /// exists, which is why the caller does not fall through to
-    /// [`ZoneProofs::gather_nxdomain`] when this returns `Some`.
+    /// `Some` says a record sits at the name, not that it proves anything. It
+    /// also settles NXDOMAIN — the name exists — so the caller does not fall
+    /// through to [`ZoneProofs::gather_nxdomain`].
     fn gather_nodata(&self, qname: &str, qtype: Qtype, now: u64) -> Option<Gathered> {
         if let Some(cached) = self.matching_nsec(qname, now) {
-            // At a delegation the parent holds only the DS; everything else is
-            // the child's to answer, and the real reply is a referral rather
-            // than NODATA.
+            // At a delegation the parent holds only the DS; the real reply for
+            // anything else is a referral, not NODATA.
             if is_delegation(&cached.proof) && !qtype.is(rt::DS) {
                 return None;
             }
@@ -735,9 +670,8 @@ impl ZoneProofs {
         } else {
             return None;
         }
-        // The wildcard that could have answered sits at some ancestor, so every
-        // ancestor's wildcard needs a covering record too. `proves_nxdomain`
-        // picks the one that matters from what it is handed.
+        // The wildcard that could have answered sits at some ancestor, so gather
+        // every ancestor's; `proves_nxdomain` picks the one that matters.
         for depth in label_count(zone)..label_count(qname) {
             let wildcard = format!("*.{}", suffix_labels(qname, depth));
             if let Some(covering) = self.covering_nsec(&wildcard, now) {
@@ -765,26 +699,23 @@ impl ZoneProofs {
         })
     }
 
-    /// The NSEC3 form of the same thing: the closest-encloser proof of
-    /// RFC 5155 §8.4 needs the record matching the deepest ancestor that exists,
-    /// one covering the name a label below it, and one accounting for the
-    /// wildcard there.
+    /// The NSEC3 form: RFC 5155 §8.4 wants the record matching the deepest
+    /// ancestor that exists, one covering the name a label below it, and one
+    /// accounting for the wildcard there.
     fn gather_nxdomain_nsec3(&self, qname: &str, zone: &str, now: u64) -> Option<Gathered> {
         self.nsec3_params(now)
             .iter()
             .find_map(|params| self.gather_nxdomain_under(qname, zone, params, now))
     }
 
-    /// One chain's attempt at that proof: three names hashed, and a map lookup
-    /// for each.
+    /// One chain's attempt at that proof: three names hashed, one map lookup
+    /// each. The client picks both the label count and the number of cached
+    /// records, so the hash must not be re-derived per record.
     ///
-    /// What it replaced hashed two names per label of the QNAME against every
-    /// one of the 256 cached records, twice over — 1 156 ms of CPU on one query
-    /// (`TODO.md` #23). The walk still starts at the QNAME and stops at the
-    /// first ancestor with a record, as RFC 5155 §8.3 does: a responder includes
-    /// the encloser's own record and none of its ancestors', so a cache holding
-    /// a deep encloser need not hold anything above it, and a walk downwards
-    /// from the apex would stop at the first name nobody had asked about.
+    /// The walk starts at the QNAME and stops at the first ancestor with a
+    /// record (RFC 5155 §8.3): a responder sends the encloser's record and none
+    /// of its ancestors', so walking down from the apex would stop at the first
+    /// name nobody had asked about.
     fn gather_nxdomain_under(
         &self,
         qname: &str,
@@ -800,8 +731,7 @@ impl ZoneProofs {
             let Some(cached) = self.matching_nsec3(&hash, params, now) else {
                 continue;
             };
-            // A record at the name itself says it exists, so there is nothing
-            // here to deny.
+            // A record at the name itself says it exists: nothing to deny.
             if depth == qlabels {
                 return None;
             }
@@ -810,8 +740,8 @@ impl ZoneProofs {
         }
         let (depth, encloser_name, matching) = encloser?;
 
-        // The same delegation trap as NSEC: below a delegation the names are the
-        // child's, and this zone's chain says nothing about them.
+        // As with NSEC: below a delegation the names are the child's, and this
+        // zone's chain says nothing about them.
         if matching.proof.has_type(rt::NS) && !matching.proof.has_type(rt::SOA) {
             return None;
         }
@@ -850,16 +780,12 @@ impl ZoneProofs {
 
 /// What a lookup found, before the proof logic has been asked whether it stands.
 ///
-/// The two halves are split so the verdict is reached with the cache's lock
-/// already dropped: verifying re-derives the closest encloser, which hashes once
-/// per label of a name the *client* chose, and that is not work to hold every
-/// other zone's lookups behind (`TODO.md` #23).
+/// Split from the verdict so the verdict is reached with the lock dropped:
+/// verifying hashes once per label of a name the *client* chose.
 struct Gathered {
     rcode: ResponseCode,
-    /// What the proof rests on, in the form the `proves_*` functions take.
-    /// Asking them rather than deciding here is what keeps this from becoming a
-    /// second implementation of the rules that validated these records on the
-    /// way in — the two would drift.
+    /// What the proof rests on, in the form the `proves_*` functions take —
+    /// asking them rather than re-deciding here keeps one set of rules.
     nsecs: Vec<Nsec>,
     nsec3s: Vec<Nsec3>,
     /// The proof records as cached, and what is left of the shortest-lived of
@@ -1174,7 +1100,7 @@ mod tests {
 
     /// Filling the cache must not make a lookup in it slower. The NSEC3 half is
     /// keyed by owner hash and hashes a name once per chain, so what is cached
-    /// is not in the cost (`TODO.md` #23).
+    /// is not in the cost.
     ///
     /// A ratio rather than a floor (`CLAUDE.md` §10): the absolute numbers are
     /// the machine's, the complexity class is the code's. Watched failing
@@ -1504,9 +1430,7 @@ mod tests {
         assert!(cache.synthesize("m.evil.test.", Qtype::of(rt::A)).is_none());
     }
 
-    // -----------------------------------------------------------------
     // NSEC3
-    // -----------------------------------------------------------------
 
     /// Opt-out spans may hold delegations the zone never named, so RFC 8198
     /// §5.2 forbids aggressive use across them. Refused at insert, so no
@@ -1604,9 +1528,7 @@ mod tests {
     /// The closest-encloser proof of RFC 5155 §8.4, out of the cache: the apex
     /// matched, the queried name covered, and the wildcard covered.
     ///
-    /// This shape had no test before the lookup was rewritten (`TODO.md` #23),
-    /// which is how a scan and a map lookup could have disagreed about it in
-    /// silence.
+    /// The shape a scan and a map lookup could disagree about in silence.
     fn cache_with_an_nsec3_chain() -> NsecCache {
         let apex = nsec3_hash("example.com.", &[0xaa, 0xbb], 3).unwrap();
         let mut apex_next = apex.clone();
@@ -1682,9 +1604,7 @@ mod tests {
             .is_none());
     }
 
-    // -----------------------------------------------------------------
     // Bookkeeping
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_zone_capacity_is_bounded() {
@@ -1767,9 +1687,7 @@ mod tests {
             "NODATA, not the parent's NXDOMAIN"
         );
     }
-    // -----------------------------------------------------------------
     // Wildcard synthesis (RFC 8198 section 5.3)
-    // -----------------------------------------------------------------
 
     /// A positive answer as a zone sends one from a wildcard: the records owned at
     /// the *queried* name, an RRSIG whose label count says a wildcard signed it,

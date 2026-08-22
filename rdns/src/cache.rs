@@ -4,14 +4,9 @@ use crate::ResourceRecord;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// The longest anything is cached, whatever the record says.
+/// The longest anything is cached, whatever the record says (RFC 8767 §4).
 ///
-/// RFC 8767 §4 suggests a day as the ceiling, and the reason to have one at all
-/// is that a TTL is a promise about how long an answer stays *correct*, made by
-/// whoever wrote the zone — and a wrong one is how a stale answer outlives the
-/// fix. It is also the second line of defence behind the clamp below: a bug that
-/// lets a nonsense TTL through can then cost a day rather than the life of the
-/// process.
+/// A nonsense TTL then costs a day rather than the life of the process.
 const MAX_CACHE_TTL: u64 = 86_400;
 
 /// DNS cache entry with TTL expiration
@@ -19,13 +14,9 @@ const MAX_CACHE_TTL: u64 = 86_400;
 struct CacheEntry {
     records: Vec<ResourceRecord>,
     expires_at: u64, // Unix timestamp
-    /// Whether this answer was DNSSEC-validated when it was stored.
-    ///
-    /// Cached alongside the records because the AD bit has to survive the
-    /// cache: an answer served from here is the same answer, and dropping the
-    /// flag would make the first client see AD and every later one not. The
-    /// converse matters more — an unvalidated answer must never pick the bit up
-    /// on its way back out.
+    /// Whether this answer was DNSSEC-validated when stored. The AD bit has to
+    /// survive the cache, and must never be picked up here by an answer that
+    /// arrived without it.
     secure: bool,
 }
 
@@ -37,12 +28,9 @@ impl CacheEntry {
 
 /// DNS response cache with TTL support.
 ///
-/// Caches responses keyed by (domain_name, record_type) — *answers* only. A
-/// negative answer has no records to key on and takes its TTL from the SOA
-/// instead, so it lives in [`crate::negative_cache::NegativeCache`]. There used
-/// to be a `put_negative` here that stored an empty entry under type 0; it
-/// recorded neither the rcode nor the SOA, could not tell NXDOMAIN from NODATA,
-/// and nothing ever called it.
+/// Keyed by (domain_name, record_type), and *answers* only: a negative answer
+/// has no records to key on and takes its TTL from the SOA, so it lives in
+/// [`crate::negative_cache::NegativeCache`].
 pub struct DnsCache {
     cache: Arc<Mutex<HashMap<(String, Qtype), CacheEntry>>>,
     max_entries: usize,
@@ -71,33 +59,21 @@ impl DnsCache {
     /// DNSSEC-validated when it was stored.
     pub fn get_validated(&self, name: &str, qtype: Qtype) -> Option<(Vec<ResourceRecord>, bool)> {
         let now = current_unix_timestamp();
-        // A poisoned lock reads as a cache miss (`CLAUDE.md` §6, §4). This is on
-        // `rdnsr`'s query path, and `.lock().unwrap()` here meant that one panic
-        // anywhere under this mutex — ever — would make every later query panic
-        // too, because poisoning is permanent: a resolver taken off the air by a
-        // fault it had already survived. Degrading is the right failure for a
-        // cache and only a cache; the missing state costs a round trip and
-        // nothing else, which is exactly what §4 says a cache may do and a
-        // last-contact time may not.
+        // A poisoned lock reads as a cache miss. Poisoning is permanent, so
+        // `.lock().unwrap()` on `rdnsr`'s query path would take the resolver off
+        // the air for good after one panic; a miss costs a round trip.
         let Ok(mut cache) = self.cache.lock() else {
             return None;
         };
 
-        // ASCII case folding, not Unicode. DNS is case-insensitive over ASCII
-        // and nothing else (RFC 4343), and `str::to_lowercase` applies the full
-        // Unicode mapping — which folds codepoints *into* ASCII. U+212A KELVIN
-        // SIGN lowercases to `k`, so it and `k.example.com.` shared one entry:
-        // two different owner names, different bytes on the wire, one cache
-        // slot. `zone.rs` had the comment explaining this and the cache drifted
-        // from it, so the helper now lives in `utils` where both reach it.
+        // ASCII fold only (RFC 4343): `str::to_lowercase` folds U+212A KELVIN
+        // SIGN to `k`, merging two names that differ on the wire.
         let key = (ascii_lowered(name), qtype);
 
-        // Check if entry exists and is not expired
         if let Some(entry) = cache.get(&key) {
             if !entry.is_expired(now) {
                 return Some((entry.records.clone(), entry.secure));
             } else {
-                // Remove expired entry
                 cache.remove(&key);
             }
         }
@@ -112,10 +88,8 @@ impl DnsCache {
 
     /// Put records in cache, remembering whether they were DNSSEC-validated.
     ///
-    /// `secure` must be what validation actually concluded. Storing an answer
-    /// as validated that was not is the one mistake a cache can make that
-    /// outlives the query: every later client is told the data is authentic on
-    /// the strength of a check that never happened.
+    /// `secure` must be what validation concluded: storing an unvalidated answer
+    /// as validated tells every later client it is authentic.
     pub fn put_validated(
         &self,
         name: &str,
@@ -129,41 +103,24 @@ impl DnsCache {
 
         let now = current_unix_timestamp();
 
-        // An RRset is cached for the shortest TTL in it, and every step of
-        // getting there is a place this went wrong.
-        //
-        // `ResourceRecord::ttl` used to be an `i32` straight off the wire, so a
-        // TTL with the high bit set parsed *negative*. `-1 as u64` is
-        // `u64::MAX`, `min` then picked it as the smallest, and `is_expired` was
-        // false for the life of the process: an entry pinned forever, immune to
-        // the re-query that would otherwise correct it. Poison one answer and it
-        // stays poisoned until the daemon restarts.
-        //
-        // It is a [`Ttl`] now, clamped by `Ttl::from_wire` where the bytes are
-        // read (RFC 2181 §8), so this site no longer clamps and no longer can
-        // forget to. That is the point of the type: `negative_cache` and
-        // `nsec_cache` already clamped, this cache and the two `rr.ttl.max(0)`
-        // sites in `resolver` that write into it did not agree about whose job
-        // it was, and a check that existed three times over was still missing in
-        // one place (`TODO.md` #13d, `CLAUDE.md` §2).
+        // An RRset is cached for the shortest TTL in it. No clamp here: `Ttl`
+        // clamps at the parse boundary (RFC 2181 §8), so a negative wire TTL
+        // cannot widen to `u64::MAX` and win the `min`.
         let min_ttl = records
             .iter()
             .map(|r| r.ttl.capped_at(MAX_CACHE_TTL as u32).as_u64())
             .min()
             .unwrap_or(300); // Default 5 minutes if no TTL
 
-        // Saturating because `now + ttl` on a clock far in the future is a debug
-        // panic and a release wrap, and a wrapped expiry is an entry that has
-        // already expired — or never does.
+        // Saturating: a wrapped expiry is an entry that already expired, or one
+        // that never does.
         let expires_at = now.saturating_add(min_ttl);
 
-        // And the write side degrades the same way: nothing is stored, the next
-        // client asks upstream again. See [`DnsCache::get_validated`].
+        // Poisoned lock: store nothing, as [`DnsCache::get_validated`].
         let Ok(mut cache) = self.cache.lock() else {
             return;
         };
 
-        // Evict oldest entries if cache is full
         if cache.len() >= self.max_entries {
             self.evict_oldest(&mut cache);
         }
@@ -182,20 +139,11 @@ impl DnsCache {
     /// Evict expired entries, and then the soonest-to-expire until the cache is
     /// down to half its limit.
     ///
-    /// Three passes over the map and one `Vec<u64>`, all linear. It used to be a
-    /// `while` loop calling `min_by_key` over the *whole* map to find one victim
-    /// and `clone()` its `String` key to remove it — O(n²) with an allocation
-    /// per removal, under the global cache lock, with every reader blocked for
-    /// the duration. At the default `max_entries = 10_000` that is ~37 million
-    /// `HashMap` iterations and 5,000 `String` allocations in one uninterruptible
-    /// stall, repeated every time the cache refilled.
-    ///
-    /// The policy is unchanged — keep the entries with the most life left — so
-    /// this is a rewrite of how, not of what.
+    /// Three linear passes and one `Vec<u64>`. `min_by_key` per victim is O(n²)
+    /// plus a key clone per removal, under the global lock.
     fn evict_oldest(&self, cache: &mut HashMap<(String, Qtype), CacheEntry>) {
         let now = current_unix_timestamp();
 
-        // First remove all expired entries
         cache.retain(|_, entry| !entry.is_expired(now));
 
         let target = self.max_entries / 2;
@@ -203,21 +151,16 @@ impl DnsCache {
             return;
         }
 
-        // `select_nth_unstable` partitions in O(n) average without sorting: the
-        // element at `remove` lands where it would be in sorted order, and
-        // everything before it is no greater. That value is the eviction
-        // boundary, and it is a *value*, so no key is cloned to find it.
+        // Partitions in O(n) average without sorting, and yields a value rather
+        // than an entry, so no key is cloned to find the boundary.
         let mut expiries: Vec<u64> = cache.values().map(|entry| entry.expires_at).collect();
         let remove = expiries.len() - target;
         let (_, &mut cutoff, _) = expiries.select_nth_unstable(remove);
 
-        // Ties are the case that matters and the reason this is not a plain
-        // `retain(|e| e.expires_at > cutoff)`. Expiries are whole seconds, so a
-        // cache filled in one burst at one TTL has *every* entry on the same
-        // value — and a strict comparison would then evict the entire cache
-        // rather than half of it, turning a bounded cache into no cache. Keep
-        // entries strictly past the boundary, then admit ties until the target
-        // is met, which lands on exactly `target` entries however they tie.
+        // Not a plain `retain(|e| e.expires_at > cutoff)`: expiries are whole
+        // seconds, so a cache filled in one burst at one TTL has every entry on
+        // the same value and a strict comparison empties it. Admitting ties up
+        // to `target` lands on exactly `target` however they tie.
         let strictly_newer = expiries.iter().filter(|&&e| e > cutoff).count();
         let mut ties_to_keep = target.saturating_sub(strictly_newer);
         cache.retain(|_, entry| {
@@ -232,14 +175,10 @@ impl DnsCache {
         });
     }
 
-    /// Get cache statistics
+    /// Get cache statistics.
     ///
-    /// Zeros for a poisoned lock, and this is the one place in the file where
-    /// that could mislead — a cache reporting no entries looks like a cache that
-    /// is not being used. It is still better than the alternative: this is read
-    /// by the metrics endpoint, and panicking there turns a cache that failed
-    /// once into a server with no observability at all, at the exact moment an
-    /// operator needs some.
+    /// Zeros for a poisoned lock. Misleading — it reads as an unused cache — but
+    /// this feeds the metrics endpoint, where panicking costs all observability.
     pub fn get_stats(&self) -> CacheStats {
         let Ok(cache) = self.cache.lock() else {
             return CacheStats {
@@ -268,10 +207,9 @@ impl DnsCache {
         }
     }
 
-    /// Clear all cache entries
+    /// Clear all cache entries.
     ///
-    /// A poisoned lock is left alone: there is nothing to clear that a caller
-    /// could then rely on being clear, and the entries expire on their own.
+    /// A poisoned lock is left alone; the entries expire on their own.
     pub fn clear(&self) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear();
@@ -390,13 +328,8 @@ mod tests {
         assert!(retrieved.is_some()); // Still valid within 100 seconds
     }
 
-    /// A TTL with the high bit set parses negative off the wire, and the widening
-    /// to `u64` used to sign-extend it into `u64::MAX` — an entry that never
-    /// expires, in a cache that exists so answers *do*. RFC 2181 §8: treat it as
-    /// zero.
-    ///
-    /// Written as an expiry check rather than by reading the private field,
-    /// because "never expires" is the bug and the field is only how it happened.
+    /// A TTL with the high bit set parses negative; widened it is `u64::MAX` and
+    /// wins the `min`, pinning the entry forever. RFC 2181 §8: treat it as zero.
     #[test]
     fn a_negative_ttl_does_not_pin_an_entry_forever() {
         for ttl in [-1, i32::MIN, -3600] {
@@ -413,8 +346,7 @@ mod tests {
         }
     }
 
-    /// And a TTL nobody should be believed about is capped rather than honoured.
-    /// `i32::MAX` seconds is 68 years.
+    /// An absurd TTL is capped, not honoured: `i32::MAX` seconds is 68 years.
     #[test]
     fn an_absurd_ttl_is_capped() {
         let cache = DnsCache::with_defaults();
@@ -431,10 +363,8 @@ mod tests {
         );
     }
 
-    /// DNS folds case over ASCII and nothing else (RFC 4343). U+212A KELVIN SIGN
-    /// lowercases to `k` under Unicode rules, so a Unicode-folded key merged two
-    /// names that are different bytes on the wire into one cache entry — and the
-    /// second name's owner then answered for the first.
+    /// DNS folds case over ASCII only (RFC 4343). U+212A KELVIN SIGN lowercases
+    /// to `k` under Unicode, which would merge two owner names into one entry.
     #[test]
     fn distinct_names_that_unicode_would_fold_together_stay_distinct() {
         let cache = DnsCache::with_defaults();
@@ -459,7 +389,6 @@ mod tests {
     fn test_cache_capacity() {
         let cache = DnsCache::new(10);
 
-        // Fill cache beyond capacity
         for i in 0..20 {
             let name = format!("example{}.com.", i);
             let records = vec![create_test_record(&name, Ttl::from_secs(300))];
@@ -470,18 +399,12 @@ mod tests {
         assert!(stats.total_entries <= 10, "cache exceeded max capacity");
     }
 
-    /// The case the one-line version of this eviction gets wrong. Expiries are
-    /// whole seconds, so a cache filled in a burst at a single TTL — which is
-    /// what a resolver warming up actually looks like — has **every** entry on
-    /// the same `expires_at`. Evicting "everything not strictly newer than the
-    /// boundary" then empties the entire cache instead of halving it, and the
-    /// server does it again on the next fill: a bounded cache that is really no
-    /// cache, with nothing to see but a miss rate.
+    /// Expiries are whole seconds, so a cache filled in one burst at one TTL has
+    /// every entry on the same `expires_at` and a strict comparison empties it
+    /// instead of halving it.
     ///
-    /// Note what this test is and is not: it fails against the *naive* rewrite
-    /// (1 of 100 entries survives), not against the old quadratic, which got
-    /// ties right by removing one entry at a time. It guards the fix, not the
-    /// bug — the regression test for the bug is the one below.
+    /// Fails against the naive rewrite (1 of 100 survives), not against a
+    /// quadratic eviction, which gets ties right one entry at a time.
     #[test]
     fn evicting_a_cache_whose_entries_all_expire_together_halves_it() {
         let cache = DnsCache::new(100);
@@ -503,27 +426,9 @@ mod tests {
         );
     }
 
-    /// Eviction used to re-scan the whole map with `min_by_key` to find **one**
-    /// victim and clone its `String` key to remove it, looping until half the
-    /// entries were gone: O(n²) plus an allocation per removal, under the global
-    /// cache lock with every reader blocked, repeated each time the cache
-    /// refilled. At the default of 10,000 entries that is ~37 million `HashMap`
-    /// iterations per stall.
-    ///
-    /// A ceiling rather than a floor, and a very loose one: this measures ~0.2 s
-    /// in a debug build, so five seconds is more than the factor of ten of
-    /// headroom `CLAUDE.md` §10 asks for and still nowhere near the tens of
-    /// seconds the quadratic needs at this size. `bench_cache_throughput` cannot
-    /// see any of this — it only ever calls `get` on an empty cache.
-    /// A panic under the cache mutex must cost the cache, not the process.
-    ///
-    /// `.lock().unwrap()` was on all four of this type's lock sites, two on
-    /// `rdnsr`'s query path. Mutex poisoning is permanent, so one panic under
-    /// that lock would make every later query panic too.
-    ///
-    /// Degrading is what a cache may do: the answers are gone, the next client
-    /// pays a round trip, the process keeps serving. Against the old code every
-    /// assertion below panics instead of failing.
+    /// A panic under the cache mutex costs the cache, not the process: poisoning
+    /// is permanent, so `.lock().unwrap()` on the query path would make every
+    /// later query panic too.
     #[test]
     fn a_poisoned_lock_costs_the_cache_and_not_the_process() {
         let cache = DnsCache::with_defaults();
@@ -537,7 +442,6 @@ mod tests {
             "cached to begin with"
         );
 
-        // Poison it the only way a mutex is poisoned: panic while holding it.
         let guarded = Arc::clone(&cache.cache);
         let panicked = std::thread::spawn(move || {
             let _held = guarded.lock().expect("not poisoned yet");
@@ -567,6 +471,8 @@ mod tests {
         cache.clear();
     }
 
+    /// A ceiling, not a floor: this measures ~0.2 s in a debug build, where a
+    /// quadratic eviction takes tens of seconds at 20k entries.
     #[test]
     fn evicting_a_large_cache_is_linear_not_quadratic() {
         use std::time::Instant;

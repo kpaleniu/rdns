@@ -98,8 +98,8 @@ jobs:
   # The image is built and *run*, not merely built. A Dockerfile that is only
   # parsed is a deployment artifact nobody has checked — `CLAUDE.md` §4: prove an
   # operational fix by provoking it, not by reading the diff. The same sequence
-  # is runnable by hand on the Linux side (see TODO.md "Running the Linux half"); this is
-  # what makes it happen on every push instead of once.
+  # is runnable by hand on the Linux side (see TODO.md "Running the Linux half");
+  # this is what makes it happen on every push instead of once.
   image:
     name: container image
     runs-on: ubuntu-latest

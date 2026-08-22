@@ -1,25 +1,11 @@
-//! The zone map and everything that puts a zone into it.
+//! The zone map and everything that puts a zone into it: where a zone comes
+//! from ([`ZoneSource`], [`load_zones_from_source`]), what has to be true before
+//! it is served ([`ZoneSigning`], [`verify_zones`]), and how it is swapped into
+//! the map without the derived state falling out of step ([`Zones`], [`Served`],
+//! [`install_zone`]). The reload task is a caller of this, not a part of it.
 //!
-//! **One lifecycle, three questions.** Where a zone comes from ([`ZoneSource`],
-//! [`load_zones_from_source`]), what has to be true before it is served
-//! ([`ZoneSigning`], [`verify_zones`]), and how it is swapped into the map
-//! without the derived state falling out of step ([`Zones`], [`Served`],
-//! [`install_zone`]). `Reloading`'s doc comment already treated these as a unit;
-//! this is that unit with a file around it.
-//!
-//! **What is deliberately *not* here: the reload task.** `TODO.md` #20 listed
-//! `Reloading`, `ReloadTrigger`, `reload_once` and `spawn_zone_maintenance` as
-//! part of this seam, and moving them drags in the signal plumbing
-//! (`signal_stream`, `next_reload_signal`, `sleep_for`), NOTIFY
-//! (`announce_zones`) and the secondary role (`withdraw_unvouched_zones`) — nine
-//! things the module would have to reach back into `main` for, against two for
-//! the cut taken here. A reload is a *caller* of this module, not a part of it,
-//! and the difference shows up as exactly that import count.
-//!
-//! The `async` in here holds locks across await points on purpose — see
-//! [`install_zone`], which plans a diff under the read guard and applies it
-//! under the write guard. Nothing about that changed in the move, and it is the
-//! reason `CLAUDE.md` §9 is worth rereading before touching any of it.
+//! Locks are held across await points on purpose — see [`install_zone`], which
+//! plans a diff under the read guard and applies it under the write guard.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -47,27 +33,14 @@ use crate::{absolute_name, Cli};
 
 /// Every zone this server holds, keyed by its origin in [`NameKeyBuf`] form.
 ///
-/// The key type is the whole of `TODO.md` #24a. It was a `String` in whatever
-/// case the zone file wrote its origin in, so nothing could hash a QNAME against
-/// it and every lookup was a case-insensitive scan of every entry — 53.7 µs to
-/// choose the zone for one query at ten thousand zones, against ~4 µs for both
-/// of the query's syscalls. Folded keys are what let [`Zones::for_query`] walk the
-/// QNAME's ancestors instead, which is bounded by the name's label count and not
-/// by how many zones are served.
-///
-/// **The `Arc` is `TODO.md` #24c.** A zone transfer writes the whole zone to a
-/// socket, and `CLAUDE.md` §9 forbids holding the zone lock across a write — so
-/// before this the only way to answer one was to copy every record out from under
-/// the guard. [`Zones::snapshot`] hands out a version instead, which a transfer
-/// can hold for as long as it takes to write it while reloads replace the map
-/// around it.
+/// The key is folded so [`Zones::for_query`] can hash the QNAME's ancestors
+/// against it — bounded by the name's label count rather than by how many zones
+/// are served. The `Arc` lets [`Zones::snapshot`] hand a transfer a version it
+/// can write to a socket while reloads replace the map around it.
 pub(crate) type ZoneMap = HashMap<NameKeyBuf, Arc<Zone>>;
 
-/// The key a zone is held under: its own origin, folded.
-///
-/// One definition, because a call site keying a zone on `origin().to_string()` —
-/// the case its file happened to use — is what the scan above existed to paper
-/// over (`CLAUDE.md` §7).
+/// The key a zone is held under: its own origin, folded. One definition, so no
+/// call site keys on `origin().to_string()` in whatever case its file used.
 pub(crate) fn zone_key(zone: &Zone) -> NameKeyBuf {
     NameKeyBuf::new(zone.origin())
 }
@@ -79,12 +52,10 @@ pub(crate) enum ZoneSource {
     Directory(String),
     /// Zones that named their own files, from a config file's `[zones.*]`.
     ///
-    /// The origin comes from the *table key* rather than the file name, which
-    /// quietly removes the trap `SingleFile` still has: `--zone-file` derives the
-    /// origin from the path, so `example.com.zone` holding `other.test.` yields
-    /// NXDOMAIN for everything with nothing to indicate why. Only a config file
-    /// can express this, because only a config file has somewhere to say the
-    /// origin out loud.
+    /// The origin comes from the table key rather than the file name, which
+    /// removes the trap `SingleFile` has: `--zone-file` derives the origin from
+    /// the path, so `example.com.zone` holding `other.test.` yields NXDOMAIN for
+    /// everything with nothing to say why.
     Files(Vec<(String, String)>),
 }
 
@@ -92,18 +63,14 @@ impl ZoneSource {
     /// The file a zone's records live in, or `None` if this source has none for
     /// it.
     ///
-    /// **Derived by the same function the loader derives it with**, which is the
-    /// whole point of it being here rather than reconstructed at the call site
-    /// (`CLAUDE.md` §7). A write that landed anywhere but where the next load
-    /// reads from would be an update that vanished at the next reload, and the
-    /// server would go on answering from the version it still held in memory —
-    /// so the mistake would be invisible until a restart.
+    /// Derived by the same function the loader uses, not reconstructed at the
+    /// call site: a write landing anywhere but where the next load reads from is
+    /// an update that vanishes at the next reload, invisible until a restart
+    /// because the server keeps answering from memory.
     ///
-    /// The directory case scans rather than composing `<dir>/<origin>.zone`,
-    /// because that is not the rule: `enumerate_zone_files` derives each origin
-    /// *from its file name* and a zone's own `$ORIGIN` may say something else
-    /// entirely. Composing the path would write `other.test.` into
-    /// `example.com.zone` on exactly the deployment that trap already exists on.
+    /// The directory case scans rather than composing `<dir>/<origin>.zone`:
+    /// `enumerate_zone_files` derives each origin from its *file name*, and a
+    /// zone's own `$ORIGIN` may say something else.
     pub(crate) fn file_for(&self, origin: &str) -> Option<PathBuf> {
         let wanted = absolute_name(origin);
         let matches = |candidate: &str| absolute_name(candidate).eq_ignore_ascii_case(&wanted);
@@ -129,12 +96,11 @@ impl ZoneSource {
 
 /// Replace one zone, recording what changed.
 ///
-/// The only way a zone should ever enter the map once the server is running.
-/// Both halves happen under the same pair of locks and in the same call, because
-/// the delta log is *derived* from the zone map: a swap that skipped it would
-/// leave us offering an IXFR chain that does not describe the zone we serve — and
-/// a secondary applying that chain would end up with a zone that never existed,
-/// holding a serial saying it is current.
+/// The only way a zone should enter the map once the server is running. Both
+/// halves happen under the same pair of locks, because the delta log is derived
+/// from the zone map: skipping it offers an IXFR chain that does not describe
+/// the zone we serve, and a secondary applying it ends up with a zone that never
+/// existed holding a serial saying it is current.
 pub(crate) async fn install_zone(served: &Served, zone: Zone) {
     let Served {
         zone_map,
@@ -147,9 +113,8 @@ pub(crate) async fn install_zone(served: &Served, zone: Zone) {
         metrics.set_zone_serial(zone.origin(), serial);
     }
 
-    // The diff walks every record of both versions, and queries take this same
-    // lock — so it is planned under the read guard, where they run alongside it,
-    // rather than under the write guard, where they would all wait for it.
+    // The diff walks every record of both versions and queries take this same
+    // lock, so it is planned under the read guard rather than the write one.
     let (planned, generation) = {
         let zones = zone_map.read().await;
         (
@@ -171,16 +136,13 @@ pub(crate) async fn install_zone(served: &Served, zone: Zone) {
     if let Some(planned) = planned {
         log.record(planned);
     }
-    // Persisted under the same guard that recorded it, for the reason `Served`
-    // gives: the journal is the delta log on disk, and a window where they
-    // disagree is a window in which a restart serves a chain that does not
-    // describe the zone. The write is `write_atomically`, so what a reader can
-    // see is the old file or the new one and never a mixture.
+    // Under the same guard that recorded it: the journal is the delta log on
+    // disk, and a window where they disagree is one in which a restart serves a
+    // chain that does not describe the zone. `write_atomically`, so a reader
+    // sees the old file or the new one and never a mixture.
     //
-    // A failure to write is logged and nothing more. Losing a journal costs some
-    // secondaries a full transfer, which RFC 1995 §4 permits at any time and
-    // which is what happened on every restart before the journal existed — so
-    // refusing the update over it would trade a real change for a cosmetic one.
+    // A failed write is logged and nothing more: losing a journal costs some
+    // secondaries a full transfer, which RFC 1995 §4 permits at any time.
     if recorded {
         if let Some(journal) = journal {
             if let Err(e) = journal.save(&origin, &log.all(&origin)) {
@@ -210,9 +172,8 @@ pub(crate) async fn install_all_zones(served: &Served, new_zones: ZoneMap) {
         metrics,
         journal,
     } = served;
-    // A reload replaces the set, so a zone that has gone takes its gauges with
-    // it. Leaving them behind would show a zone nobody serves any more as
-    // perfectly healthy at whatever serial it last had.
+    // A zone that has gone takes its gauges with it; left behind they show a
+    // zone nobody serves as healthy at whatever serial it last had.
     metrics.retain_zones(
         &new_zones
             .values()
@@ -221,9 +182,8 @@ pub(crate) async fn install_all_zones(served: &Served, new_zones: ZoneMap) {
     );
     note_serials(metrics, &new_zones);
 
-    // A reload diffs *every* zone, so this is the call site the read/write split
-    // exists for: under one write guard it blocked every query for the sum of
-    // all of them. See `Zones`.
+    // A reload diffs *every* zone, so this is the call site the read/write
+    // split exists for. See `Zones`.
     let (mut plan, generation) = {
         let zones = zone_map.read().await;
         (plan_reload(&zones, &new_zones), zones.generation())
@@ -258,28 +218,22 @@ pub(crate) async fn install_all_zones(served: &Served, new_zones: ZoneMap) {
     let displaced = zones.replace_all(new_zones);
     drop(log);
     drop(zones);
-    // Outside the guards on purpose: freeing the set we just replaced is one
-    // deallocation per record of every zone, and no query needs to wait for it.
+    // Outside the guards: freeing the replaced set is one deallocation per
+    // record of every zone, and no query need wait for it.
     drop(displaced);
 }
 
 /// Prime the delta log from the journals on disk, so a restart does not drop
 /// every secondary to a full transfer.
 ///
-/// **Every failure here is a warning and nothing more, which is the opposite of
-/// how this file treats the secondary state file.** That one is fatal because
-/// forgetting a last-contact time is the difference between a withdrawn zone and
-/// a stale one served with AA set (`CLAUDE.md` §4). Nothing here has teeth: a
-/// journal that will not read means some secondaries take a full transfer, which
-/// RFC 1995 §4 permits at any time and which is exactly what happened on every
-/// restart before journals existed. Refusing to start over it would turn a
-/// cosmetic loss into an outage.
+/// Every failure here is a warning, unlike the secondary state file, which is
+/// fatal. Nothing here has teeth: an unreadable journal costs some secondaries a
+/// full transfer, which RFC 1995 §4 permits at any time.
 ///
-/// A journal whose last step does not reach the serial we actually loaded is
-/// dropped rather than kept. The zone moved past it by some route the journal
-/// never saw — an operator editing the file while the process was down is the
-/// ordinary one — and chaining onto it would offer a secondary a path to a
-/// version nobody is serving.
+/// A journal whose last step does not reach the serial actually loaded is
+/// dropped: the zone moved past it by a route the journal never saw — an
+/// operator editing the file while the process was down is the ordinary one —
+/// and chaining onto it offers a path to a version nobody serves.
 pub(crate) async fn restore_journals(
     journal: &Journal,
     zone_map: &Arc<RwLock<Zones>>,
@@ -323,8 +277,8 @@ pub(crate) struct ReloadPlan {
 }
 
 pub(crate) fn plan_reload(zones: &Zones, new_zones: &ZoneMap) -> ReloadPlan {
-    // Both sides are folded keys now, so "is this zone still configured" is a
-    // lookup rather than a scan of the new set per zone in the old one.
+    // Both sides are folded keys, so "is this zone still configured" is a
+    // lookup rather than a scan of the new set per zone in the old.
     let forgotten = zones
         .keys()
         .filter(|old_name| !new_zones.contains_key(old_name.as_str()))
@@ -353,19 +307,19 @@ pub(crate) fn note_serials(metrics: &DnsMetrics, zones: &ZoneMap) {
 /// set does.
 ///
 /// The counter is why this is not a bare `HashMap`. `ixfr::diff` walks every
-/// record of both versions, so it is planned under the read lock and only
-/// recorded under the write lock — under the write lock it would block every
-/// query for the length of the walk, and on a SIGHUP for the sum of all of them.
+/// record of both versions, so it is planned under the read lock and recorded
+/// under the write lock — under the write lock it blocks every query for the
+/// length of the walk, and on a SIGHUP for the sum of all of them.
 ///
-/// That split leaves a window between dropping the read guard and taking the
-/// write guard, in which another task can install, expire or withdraw a zone. A
-/// delta computed against the wrong old version hands a secondary a zone that
-/// never existed. `generation` closes it: equal means the plan still stands,
-/// different means re-plan under the write lock.
+/// That leaves a window between the two guards in which another task can
+/// install, expire or withdraw a zone, and a delta computed against the wrong
+/// old version hands a secondary a zone that never existed. `generation` closes
+/// it: equal means the plan stands, different means re-plan under the write
+/// lock.
 ///
-/// A serial comparison would not do, which is why this is a counter and not
-/// `Option<u32>`: an edited file reloaded without a bump carries the same serial
-/// over different records, so the check has to be about identity.
+/// A counter and not a serial, because an edited file reloaded without a bump
+/// carries the same serial over different records: the check is about
+/// identity.
 ///
 /// Mutation goes through the methods below and there is no `DerefMut`, so the
 /// counter cannot be forgotten at a call site.
@@ -378,16 +332,13 @@ pub(crate) struct Zones {
     /// origin, so hashing it is work with one outcome.
     ///
     /// Without it the walk costs one lookup per label of the *client's* name: a
-    /// 34-label reverse-IPv6 PTR read 598 ns against 40 for an ordinary name,
-    /// where a two-label zone can only be matched by the last two of those
-    /// lookups (`CLAUDE.md` §5 — count the multipliers, and one of them is
-    /// theirs). With it, 53 ns either way.
+    /// 34-label reverse-IPv6 PTR read 598 ns against 40 for an ordinary name.
+    /// With it, 53 ns either way.
     ///
-    /// **It only ever grows, and that is the direction that fails safely.** Too
-    /// large costs a few wasted lookups; too small skips the suffix a zone we
-    /// serve is at, and REFUSED for our own zone is the quiet degradation §4 is
-    /// about. So `insert` raises it and `remove` leaves it alone; only
-    /// `replace_all`, which is handed the whole new set, recomputes it.
+    /// It only grows, which is the direction that fails safely: too large costs
+    /// a few wasted lookups, too small skips the suffix one of our zones is at
+    /// and answers REFUSED for it. So `insert` raises it, `remove` leaves it
+    /// alone, and only `replace_all` recomputes.
     deepest: usize,
 }
 
@@ -408,15 +359,11 @@ impl Zones {
     /// Install one zone, replacing any version of it already held.
     ///
     /// The key is folded, so two spellings of one origin are one entry and a
-    /// plain `insert` replaces rather than duplicating — the remove-by-the-key-
-    /// already-there dance this used to do was the case-insensitive scan #24a is
-    /// about.
+    /// plain `insert` replaces rather than duplicates.
     ///
-    /// **The displaced version is handed back rather than dropped here**, so the
-    /// caller can let it go after releasing the lock. Freeing a zone is one
-    /// deallocation per record, and a query waiting on the lock is waiting on
-    /// every one of them for no reason — the same argument as planning the diff
-    /// outside the guard, applied to the other end of the swap.
+    /// The displaced version is handed back rather than dropped, so the caller
+    /// can let it go after releasing the lock: freeing a zone is one
+    /// deallocation per record, and no query should wait on those.
     #[must_use = "drop the displaced zone after releasing the lock, not under it"]
     pub(crate) fn insert(&mut self, zone: Zone) -> Option<Arc<Zone>> {
         self.deepest = self.deepest.max(label_count(zone.origin()));
@@ -440,9 +387,8 @@ impl Zones {
 
     /// Swap the whole set, as a reload does, handing back the set replaced.
     ///
-    /// Dropped by the caller once the lock is released, for the reason given on
-    /// [`Zones::insert`] — and it matters more here, because a reload displaces
-    /// every zone at once.
+    /// Dropped by the caller once the lock is released, as in [`Zones::insert`]
+    /// — more so here, since a reload displaces every zone at once.
     #[must_use = "drop the displaced zones after releasing the lock, not under it"]
     pub(crate) fn replace_all(&mut self, by_name: ZoneMap) -> ZoneMap {
         self.deepest = deepest_origin(&by_name);
@@ -464,11 +410,11 @@ impl Zones {
     /// The version held for `name`, as something that outlives the guard.
     ///
     /// For the one caller that cannot finish under the lock: an AXFR writes the
-    /// whole zone to a socket, and holding the read guard across those writes puts
-    /// every reload behind the slowest client on the server (`CLAUDE.md` §9). The
-    /// snapshot is the version that was current when it was taken and stays that
-    /// way — which is also what a transfer needs to be *correct*, since half of
-    /// one version and half of the next is a zone that never existed.
+    /// whole zone to a socket, and holding the read guard across those writes
+    /// puts every reload behind the slowest client. The snapshot stays the
+    /// version current when it was taken, which is also what makes a transfer
+    /// correct — half of one version and half of the next is a zone that never
+    /// existed.
     pub(crate) fn snapshot(&self, name: &str) -> Option<Arc<Zone>> {
         self.by_name.get(absolute_lowered(name).as_ref()).cloned()
     }
@@ -476,42 +422,32 @@ impl Zones {
     /// The zone that should answer `qname`: the most specific one the name is at
     /// or under, or `None` if this server holds none.
     ///
-    /// **A walk up the QNAME's ancestors, not a scan of the zones.** The first
-    /// hit is the longest suffix that is an origin, which is the most specific
-    /// zone — a server holding both `example.com` and `sub.example.com` answers
-    /// for the child from the child's zone. **30 ns at one zone and 32 at ten
-    /// thousand**, where the scan this replaced cost 4.1 µs at a thousand and
-    /// 55 µs at ten thousand — more, at a thousand, than the 522 ns of library
-    /// work and ~4 µs of syscalls the rest of the query costs (`TODO.md` #24a).
+    /// A walk up the QNAME's ancestors, not a scan of the zones. The first hit
+    /// is the longest suffix that is an origin, so a server holding both
+    /// `example.com` and `sub.example.com` answers for the child from the
+    /// child's zone. 30 ns at one zone and 32 at ten thousand, where a scan
+    /// costs 4.1 µs at a thousand and 55 µs at ten thousand.
     ///
-    /// The two things that made the scan look necessary were both the key type.
-    /// Nothing could hash a QNAME against a map keyed on the origin in whatever
-    /// case its zone file used, so every entry had to be compared with
-    /// `is_at_or_under` — which tolerates a missing trailing dot on either side
-    /// precisely because neither side was in a known form. A [`ZoneMap`] key is
-    /// absolute and ASCII-folded (RFC 4343), so the walk needs the QNAME in that
-    /// same form and nothing else. The fold is still ASCII-only on purpose:
-    /// `str::to_lowercase` maps U+212A KELVIN SIGN onto `k`, which would select a
-    /// zone for a name that differs from its origin on the wire (`CLAUDE.md` §8).
+    /// A [`ZoneMap`] key is absolute and ASCII-folded (RFC 4343), so the walk
+    /// needs the QNAME in that form and nothing else. ASCII-only:
+    /// `str::to_lowercase` maps U+212A KELVIN SIGN onto `k`, which would select
+    /// a zone for a name that differs from its origin on the wire.
     ///
-    /// **Nothing here scans the whole QNAME**, which is the other half of the
-    /// measurement: the walk starts at the deepest suffix that could be an origin
-    /// (see [`Zones::deepest`]) and the fold happens after that, so a 34-label
-    /// reverse-IPv6 PTR costs what a three-label name costs. Reaching that suffix
-    /// is `rmatch_indices`, one pass over the last `deepest` labels — counting
-    /// labels from the left and walking down instead read the name once per label
-    /// and cost 340 ns against 58, on a length the client picks (`CLAUDE.md` §5).
+    /// Nothing scans the whole QNAME. The walk starts at the deepest suffix that
+    /// could be an origin (see [`Zones::deepest`]) and folds after that, so a
+    /// 34-label reverse-IPv6 PTR costs what a three-label name costs. Reaching
+    /// that suffix is one `rmatch_indices` pass over the last `deepest` labels;
+    /// counting from the left reads the name once per label, 340 ns against 58
+    /// on a length the client picks.
     ///
-    /// It also allocates nothing, which is not free by default: both `Cow`s here
-    /// borrow for a name that arrived absolute and lower-case, which is every name
-    /// off the wire. This lookup was three `String`s per query before #9e.
+    /// Both `Cow`s borrow for a name that arrived absolute and lower-case, which
+    /// is every name off the wire, so the lookup allocates nothing.
     pub(crate) fn for_query(&self, qname: &str) -> Option<&Zone> {
         let absolute = absolute(qname);
         let mut candidate: &str = absolute.as_ref();
         match candidate.rmatch_indices('.').nth(self.deepest) {
-            // Every label skipped: the root is spelled `.` and not the empty
-            // string, and a server holding only the root zone has a `deepest` of
-            // 0.
+            // Every label skipped: the root is spelled `.`, not the empty
+            // string, and a root-only server has a `deepest` of 0.
             Some((dot, _)) if dot + 1 == candidate.len() => candidate = ".",
             Some((dot, _)) => candidate = &candidate[dot + 1..],
             // Fewer labels than the deepest origin held: nothing to skip.
@@ -551,11 +487,10 @@ impl std::ops::Deref for Zones {
 
 /// The three things that describe what this server is currently serving.
 ///
-/// They are grouped because they are only ever updated *together*: a zone
-/// installed is a new version in the delta log and a new serial on the gauge,
-/// and a zone withdrawn has to leave all three. Passing them as three
-/// parameters is how one of them gets forgotten at a fourth call site —
-/// `CLAUDE.md` §14, and clippy objects at seven arguments for the same reason.
+/// Grouped because they are only ever updated together: a zone installed is a
+/// new version in the delta log and a new serial on the gauge, and a zone
+/// withdrawn has to leave all three. Three parameters is how one gets forgotten
+/// at a fourth call site.
 #[derive(Clone)]
 pub(crate) struct Served {
     pub(crate) zone_map: Arc<RwLock<Zones>>,
@@ -565,19 +500,16 @@ pub(crate) struct Served {
     /// secondary to a full transfer. `None` when there is no directory to put it
     /// in, which is `--zone-file` and the tests.
     ///
-    /// Part of this group rather than beside it because it is the same fact
-    /// written down twice: the journal *is* the delta log, on disk. A swap that
-    /// updated one and not the other would offer an IXFR chain after a restart
-    /// that does not describe the zone being served — the exact hazard the
-    /// grouping exists to prevent.
+    /// In this group because the journal *is* the delta log, on disk: updating
+    /// one and not the other offers an IXFR chain after a restart that does not
+    /// describe the zone being served.
     pub(crate) journal: Option<Arc<Journal>>,
 }
 
-/// Validate that exactly one of zone_file or zone_dir is specified
+/// Exactly one of `zone_file` or `zone_dir`.
 ///
-/// `replicating` is whether any `--secondary` was given, which narrows this: a
-/// fetched zone has to be written somewhere, and a single `--zone-file` is not a
-/// place to put a zone whose name we may not have seen yet.
+/// `replicating` narrows it: a fetched zone has to be written somewhere, and a
+/// single `--zone-file` is no place for a zone whose name we have not seen.
 pub(crate) fn validate_zone_source(
     zone_file: Option<String>,
     zone_dir: Option<String>,
@@ -591,14 +523,12 @@ pub(crate) fn validate_zone_source(
     }
     match (zone_file, zone_dir) {
         (Some(file), None) => {
-            // Check if file exists
             if !Path::new(&file).exists() {
                 return Err(anyhow!("Zone file not found: {file}"));
             }
             Ok(ZoneSource::SingleFile(file))
         }
         (None, Some(dir)) => {
-            // Check if directory exists
             if !Path::new(&dir).is_dir() {
                 return Err(anyhow!(
                     "Zone directory not found or not a directory: {dir}"
@@ -613,10 +543,8 @@ pub(crate) fn validate_zone_source(
 
 /// Zone signing as configured: which keys, for how long, and which chain.
 ///
-/// Only zones loaded from disk are signed. A zone that arrived by transfer is
-/// the master's, signatures included — re-signing it here would replace a
-/// statement its owner made with one we made about data we do not own, and the
-/// parent's DS points at their key, not ours.
+/// Only zones loaded from disk are signed. A transferred zone is the master's,
+/// signatures included: the parent's DS points at their key, not ours.
 pub(crate) struct ZoneSigning {
     /// Keys by the zone they are published at, down-cased.
     keys: HashMap<String, Vec<SigningKey>>,
@@ -624,9 +552,8 @@ pub(crate) struct ZoneSigning {
     chain: DenialChain,
     /// Zones whose signing settings differ from the two above, by apex.
     ///
-    /// Only a config file can populate this — there is no flag shape for "NSEC3
-    /// for this zone and NSEC for the rest", which is the gap `TODO.md` #9d names
-    /// when it says every zone got the same signing policy.
+    /// Only a config file can populate this: there is no flag shape for "NSEC3
+    /// for this zone and NSEC for the rest".
     per_zone: BTreeMap<String, config::ZoneSigningOverride>,
 }
 
@@ -640,9 +567,8 @@ impl ZoneSigning {
         };
         let loaded = SigningKey::load_dir(dir).context("loading the signing keys")?;
         if loaded.is_empty() {
-            // Not an error — a key directory prepared before any key is in it
-            // is a reasonable state — but silence here would look exactly like
-            // signing that quietly did nothing.
+            // Not an error: a key directory prepared before any key is in it
+            // is reasonable. But silence looks like signing that did nothing.
             tracing::warn!(
                 "no .{} files in {}: no zone will be signed",
                 rdns::dnssec_key::KEY_FILE_EXTENSION,
@@ -674,10 +600,9 @@ impl ZoneSigning {
     /// The policy for one zone: the global one, with that zone's overrides
     /// applied.
     ///
-    /// `signed_at` is passed in rather than read here so that every zone in one
-    /// signing run shares a moment — otherwise two zones signed a second apart
-    /// would derive serials from different hours at an hour boundary, which is a
-    /// difference nobody could explain from the outside.
+    /// `signed_at` is passed in so every zone in one run shares a moment: two
+    /// zones signed a second apart across an hour boundary would otherwise
+    /// derive serials from different hours.
     pub(crate) fn policy_for(&self, origin: &str, signed_at: u64) -> SigningPolicy {
         let over = self
             .per_zone
@@ -710,9 +635,8 @@ impl ZoneSigning {
     /// The shortest validity any zone is signed with, which is what the
     /// re-signing interval has to follow.
     ///
-    /// The *minimum*, not the global setting: a zone configured with a seven-day
-    /// validity among thirty-day ones needs the timer to run on its schedule, or
-    /// it is the one zone that expires.
+    /// The minimum, not the global setting: a seven-day zone among thirty-day
+    /// ones is the one that expires if the timer runs on the global number.
     pub(crate) fn shortest_validity(&self) -> u64 {
         self.per_zone
             .values()
@@ -725,35 +649,29 @@ impl ZoneSigning {
 
     /// How often the zones should be re-signed.
     ///
-    /// A third of the validity, so a failed run has two more chances before
-    /// anything expires — see `zone_signer::RESIGN_FRACTION` for the reasoning,
-    /// which is BIND's.
+    /// A third of the validity — see `zone_signer::RESIGN_FRACTION`.
     ///
-    /// **The timer re-signs by reloading**, which is not an implementation
-    /// shortcut but the only correct shape here. The served SOA serial is derived
-    /// from the *file's* serial plus a time term (`zone_signer::signed_serial`),
-    /// and the zone in memory already carries the derived value — so re-signing
-    /// the in-memory copy would apply the derivation to its own output and
-    /// compound the bump on every cycle. Re-reading the file makes it idempotent:
-    /// the file's serial is the input every time. It also means an edit to a zone
-    /// file is picked up within one interval without a SIGHUP, which is a
-    /// behaviour change worth knowing about.
+    /// The timer re-signs by *reloading*, which is the only correct shape: the
+    /// served serial is the file's serial plus a time term
+    /// (`zone_signer::signed_serial`) and the in-memory zone already carries the
+    /// derived value, so re-signing that would compound the bump every cycle.
+    /// Re-reading the file makes it idempotent, and picks up an edit within one
+    /// interval without a SIGHUP.
     ///
-    /// Floored at a minute so that a tiny `--signature-validity`, which is only
-    /// ever a test setting, cannot turn this into a spin loop.
+    /// Floored at a minute so a tiny `--signature-validity` cannot make this a
+    /// spin loop.
     pub(crate) fn resign_interval(&self) -> Duration {
         Duration::from_secs((self.shortest_validity() / 3).max(60))
     }
 
     /// How many of `zones` this would actually sign, for `--check-config`.
     ///
-    /// Counted rather than assumed: "signing is configured" and "this zone gets
-    /// signed" are different claims, and a key directory that does not hold a key
-    /// for the zone an operator thought it did is exactly what a dry run is for.
+    /// Counted, not assumed: "signing is configured" and "this zone gets
+    /// signed" are different claims, and a key directory missing a key is what a
+    /// dry run is for.
     ///
-    /// `self.keys` is keyed by `dnssec::canonical_name`, which is absolute and
-    /// ASCII-folded — the same form a [`ZoneMap`] key is in, so this compares
-    /// without a `to_ascii_lowercase` per zone.
+    /// `self.keys` is keyed by `dnssec::canonical_name`, the same form a
+    /// [`ZoneMap`] key is in, so this needs no fold per zone.
     pub(crate) fn signed_zone_count(&self, zones: &ZoneMap) -> usize {
         zones
             .keys()
@@ -768,19 +686,17 @@ impl ZoneSigning {
 
     /// Sign every zone there are keys for, in place.
     ///
-    /// A zone we hold keys for and cannot sign is an error rather than a zone
-    /// served unsigned: its parent has a DS pointing at one of these keys, so
-    /// the unsigned answer would be bogus at every validating client rather
-    /// than merely unvalidated.
+    /// A zone we hold keys for and cannot sign is an error, not a zone served
+    /// unsigned: its parent's DS points at one of these keys, so the unsigned
+    /// answer is bogus at every validating client rather than unvalidated.
     /// Sign one zone against the version already being served, carrying forward
     /// every signature whose RRset did not move.
     ///
-    /// This is the dynamic-UPDATE path and not the load path. A full re-sign
-    /// gives every RRSIG in the zone a new inception and expiration, so the IXFR
-    /// delta for a one-record update is the whole zone — measured at 52 records
-    /// out of 53 before this existed, against 10 after (`TODO.md` #10). At load
-    /// there is no previous version to carry anything forward from and
-    /// [`ZoneSigning::apply`] is the right call; here there is.
+    /// The dynamic-UPDATE path, not the load path. A full re-sign gives every
+    /// RRSIG a new inception and expiration, so the IXFR delta for a one-record
+    /// update is the whole zone — 52 records out of 53, against 10 here. At load
+    /// there is no previous version to carry forward from and
+    /// [`ZoneSigning::apply`] is the right call.
     ///
     /// A zone with no key is returned unchanged, exactly as `apply` skips it.
     pub(crate) fn sign_one_incrementally(&self, previous: &Zone, zone: &Zone) -> Result<Zone> {
@@ -823,12 +739,10 @@ impl ZoneSigning {
 
 /// Check every signature in every zone before anything is served from it.
 ///
-/// The question asked is "does each signature in this zone cover an RRset that
-/// verifies", not "is every RRset signed" — a delegation's NS RRset and the
-/// glue below it carry no signature by design, and demanding one would fail
-/// every zone with a child. What this catches is the case worth catching: a
-/// zone whose signatures have expired, or were made over data that has since
-/// been edited, which otherwise keeps answering as though nothing happened.
+/// "Does each signature cover an RRset that verifies", not "is every RRset
+/// signed" — a delegation's NS RRset and its glue carry no signature by design,
+/// so the second question fails every zone with a child. This catches expired
+/// signatures, and signatures over data since edited.
 pub(crate) fn verify_zones(zones: &ZoneMap, validator: &DnssecValidator) -> Result<()> {
     if !validator.is_enabled() {
         return Ok(());
@@ -836,8 +750,8 @@ pub(crate) fn verify_zones(zones: &ZoneMap, validator: &DnssecValidator) -> Resu
     for (origin, zone) in zones {
         let signed = DnssecValidator::is_zone_signed(zone);
         if !signed {
-            // `validate_response` gives the same verdict; asking it with no
-            // records keeps the "is unsigned acceptable" decision in one place.
+            // Asking `validate_response` with no records keeps the "is
+            // unsigned acceptable" decision in one place.
             let (ok, _) = validator.validate_response(zone, &[], origin.as_str());
             if !ok {
                 return Err(anyhow!("{origin} is not signed"));
@@ -888,25 +802,25 @@ pub(crate) fn signed_rrsets(zone: &Zone) -> Vec<(String, Rtype)> {
     seen
 }
 
-/// Load zones from source (single file or directory)
+/// Load zones from a single file or a directory.
 ///
-/// Three questions that used to be one:
+/// Three questions, three answers:
 ///
-/// - Could the directory be read? Always fatal. An `Err` here used to become
-///   `Ok(empty)` on the `--secondary` path, so a permission change left the
-///   server up, listening, and answering REFUSED for every name it serves.
+/// - Could the directory be read? Always fatal. Reading an `Err` as an empty
+///   directory leaves the server up, listening, and answering REFUSED for every
+///   name it serves.
 /// - Did every zone file parse? Fatal unless `--allow-partial-load`. See
 ///   [`enumerate_zone_files`].
 /// - Is the directory empty? Fatal except when replicating: a secondary's first
 ///   start has nothing on disk yet, while for a primary an empty `--zone-dir` is
 ///   a typo in the path.
 ///
-/// The emptiness check lives here rather than in `enumerate_zone_files` because
+/// The emptiness check is here rather than in `enumerate_zone_files` because
 /// only this function knows which caller is a secondary.
 ///
 /// Blocking, and says so: `read_dir`, then a `read_to_string` and a full parse
-/// per zone. It was an `async fn` with no await point. Callers that run while the
-/// listeners are live put it on a blocking thread; see [`Reloading::load`].
+/// per zone. Callers running while the listeners are live put it on a blocking
+/// thread; see [`Reloading::load`].
 pub(crate) fn load_zones_from_source(
     source: &ZoneSource,
     replicating: bool,
@@ -931,10 +845,9 @@ pub(crate) fn load_zones_from_source(
             Ok(zones)
         }
         ZoneSource::Files(files) => {
-            // All-or-nothing, like the directory path and for the same reason
-            // (`CLAUDE.md` §4): one broken file out of forty must not leave the
-            // server up and answering REFUSED for that one zone, which is
-            // indistinguishable from a zone nobody configured. Every failure is
+            // All-or-nothing, as on the directory path: one broken file out of
+            // forty must not leave the server answering REFUSED for that zone,
+            // which looks the same as a zone nobody configured. Every failure is
             // collected so a deploy is fixed in one pass.
             let mut map = ZoneMap::new();
             let mut failures = Vec::new();
@@ -972,22 +885,19 @@ pub(crate) fn load_zones_from_source(
     }
 }
 
-/// Extract zone origin from zone file path
-/// Example: "example.com.zone" -> "example.com."
+/// `example.com.zone` -> `example.com.`
 pub(crate) fn extract_zone_origin_from_path(path: &str) -> String {
     let file_name = Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("zone");
 
-    // Remove .zone extension if present
     let origin = if let Some(stripped) = file_name.strip_suffix(".zone") {
         stripped
     } else {
         file_name
     };
 
-    // Ensure it ends with a dot
     if origin.ends_with('.') {
         origin.to_string()
     } else {
@@ -1018,17 +928,14 @@ pub(crate) fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<Zon
         }
     }
 
-    // Every file, then the verdict — rather than stopping at the first failure,
-    // because an operator fixing a deploy wants the whole list and not one typo
-    // per restart.
+    // Every file, then the verdict: an operator fixing a deploy wants the whole
+    // list, not one typo per restart.
     if !failures.is_empty() {
         if !allow_partial {
-            // The whole list goes *in* the error rather than only on stderr
-            // ahead of it. `main` prints its `Err` with `Debug`, and
-            // `anyhow::Error`'s `Debug` is built for exactly this — a
-            // `Box<dyn Error>` printed the message as a quoted Rust string with
-            // the newlines escaped, which is why this was one line with the
-            // detail somewhere else until the binaries moved to anyhow.
+            // The whole list goes *in* the error, not on stderr ahead of it:
+            // `main` prints its `Err` with `Debug`, which `anyhow::Error`
+            // renders for reading and `Box<dyn Error>` renders as an escaped
+            // Rust string literal.
             return Err(anyhow!(
                 "{} of {} zone files in {dir} failed to load:\n  {}\n\
                  Refusing to serve a partial set; pass --allow-partial-load to serve \
@@ -1059,35 +966,30 @@ mod tests {
 
     #[test]
     fn test_extract_zone_origin_with_extension() {
-        // Test zone origin extraction from filename with .zone extension
         let origin = extract_zone_origin_from_path("example.com.zone");
         assert_eq!(origin, "example.com.");
     }
 
     #[test]
     fn test_extract_zone_origin_with_path() {
-        // Test zone origin extraction from full path
         let origin = extract_zone_origin_from_path("/etc/dns/example.com.zone");
         assert_eq!(origin, "example.com.");
     }
 
     #[test]
     fn test_extract_zone_origin_already_dotted() {
-        // Test zone origin extraction when filename already has trailing dot
         let origin = extract_zone_origin_from_path("example.com..zone");
         assert_eq!(origin, "example.com.");
     }
 
     #[test]
     fn test_extract_zone_origin_no_extension() {
-        // Test zone origin extraction from filename without .zone extension
         let origin = extract_zone_origin_from_path("example.com");
         assert_eq!(origin, "example.com.");
     }
 
     #[test]
     fn test_extract_zone_origin_deep_path() {
-        // Test zone origin extraction from deep directory path
         let origin = extract_zone_origin_from_path("/var/lib/dns/zones/example.com.zone");
         assert_eq!(origin, "example.com.");
     }
@@ -1095,12 +997,9 @@ mod tests {
     /// Two spellings of one origin are one zone, and the second replaces the
     /// first.
     ///
-    /// The key type is what upholds this now (`TODO.md` #24a): `insert` used to
-    /// scan for the key already there and remove it, because a `String` key
-    /// carried whatever case the zone file used and a plain `insert` would have
-    /// left both entries — a server answering from whichever the iteration order
-    /// reached first. Preventative rather than a regression: the scan was
-    /// correct, only linear.
+    /// The key type is what upholds it: a `String` key carries whatever case
+    /// the zone file used, so a plain `insert` would leave both entries and the
+    /// server would answer from whichever the iteration order reached first.
     #[test]
     fn one_origin_in_two_cases_is_one_zone() {
         let mut zones = Zones::default();
@@ -1119,11 +1018,11 @@ mod tests {
 
     /// A snapshot is a version, not a view of the map.
     ///
-    /// What lets an AXFR write a whole zone to a socket without holding the lock
-    /// (`TODO.md` #24c) — and what makes that *correct* rather than merely
-    /// allowed: half of one version followed by half of the next is a zone that
-    /// never existed, and a secondary would store it, serve it with AA set, and
-    /// hand it on with a serial saying it is current.
+    /// What lets an AXFR write a whole zone to a socket without holding the
+    /// lock, and what makes that correct rather than merely allowed: half of one
+    /// version followed by half of the next is a zone that never existed, which
+    /// a secondary would store, serve with AA set, and hand on with a serial
+    /// saying it is current.
     #[test]
     fn a_snapshot_outlives_the_reload_that_replaces_it() {
         let at = |serial: u32| {
@@ -1161,20 +1060,16 @@ mod tests {
 
     /// Choosing a zone must cost the same however many zones are served.
     ///
-    /// **A ratio, not a floor** (`CLAUDE.md` §10): the same lookups timed against
-    /// one zone and against a thousand, on whatever machine is running it. The
-    /// scan this replaced read 10.3 ns at one zone and 4.1 µs at a thousand — a
-    /// factor of 400, against 522 ns of library work and ~4 µs of syscalls for
-    /// the whole answer (`TODO.md` #24a). Watched failing at 554×; the walk reads
-    /// 30 ns at one zone and 32 at ten thousand.
+    /// A ratio, not a floor: the same lookups timed against one zone and against
+    /// a thousand, on whatever machine runs it. A scan reads 10.3 ns at one zone
+    /// and 4.1 µs at a thousand; the walk reads 30 ns and 32. Watched failing at
+    /// 554×.
     ///
-    /// The two loops do identical work per query, so nothing has to be
-    /// subtracted: the only difference between them is the size of the map.
+    /// The two loops do identical work per query; only the map size differs.
     #[test]
     fn choosing_a_zone_costs_the_same_however_many_are_served() {
         const ZONES: usize = 1_000;
-        // Deep enough to have ancestors to walk, which is the direction the cost
-        // moved into.
+        // Deep enough to have ancestors to walk.
         const QNAME: &str = "host.deep.z500.test.";
 
         let mut one = Zones::default();
@@ -1196,17 +1091,15 @@ mod tests {
 
     /// And it must cost the same however long the *client's* name is.
     ///
-    /// The other multiplier, and the one a stranger picks (`CLAUDE.md` §5). A
-    /// 34-label reverse-IPv6 PTR has 34 suffixes, and on a server whose zones are
-    /// two labels deep only the last two can match. Walking down from the QNAME
-    /// hashed all of them and read the name once per label: 598 ns against 40 for
-    /// an ordinary name, and 340 once the hashing was skipped but the walking was
-    /// not. Starting at [`Zones::deepest`] instead reads 53 either way.
+    /// The other multiplier, and the one a stranger picks. A 34-label
+    /// reverse-IPv6 PTR has 34 suffixes, and on a server whose zones are two
+    /// labels deep only the last two can match. Walking down from the QNAME
+    /// hashes all of them: 598 ns against 40 for an ordinary name. Starting at
+    /// [`Zones::deepest`] reads 53 either way.
     ///
-    /// **A regression test for a defect the walk introduced**, not for the scan it
-    /// replaced — the scan got this case right by accident, at 3.6 ns, because its
-    /// cost was the zone count and never the name (§10: say what a test is a
-    /// regression for).
+    /// A regression for a defect the walk introduced, not for the scan it
+    /// replaced — a scan gets this right by accident, its cost being the zone
+    /// count and never the name.
     #[test]
     fn a_long_qname_does_not_cost_more_than_a_short_one() {
         let mut zones = Zones::default();

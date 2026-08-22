@@ -6,9 +6,9 @@ before planning.
 
 @CLAUDE.local.md
 
-That import is the *machine*: paths, the Linux image and its exact invocation, what
-is installed, the git remote and why nothing may be pushed, and why port 53 does
-not behave here. It is untracked, so a clone without it loses nothing but
+That import is the *machine*: paths, the Linux image and its exact invocation,
+what is installed, the git remote and why nothing may be pushed, and why port 53
+does not behave here. It is untracked, so a clone without it loses nothing but
 convenience — every tracked file states its own conclusions and none depends on
 it being present.
 

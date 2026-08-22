@@ -1,28 +1,12 @@
-//! What a signed answer carries beyond the records themselves.
+//! Which DNSSEC records a reply owes, given the zone and the question.
 //!
-//! A signed zone is not a signed answer: until the right signatures are in the
-//! right section of the right reply, a validating client sees an unsigned answer
-//! from a zone the parent says is secure — which is bogus, not insecure. Given
-//! the zone and the question, this says which DNSSEC records the reply needs.
+//! Only a plain positive answer is just signatures. A wildcard answer owes a
+//! denial of the name asked for (RFC 4035 §3.1.3), NODATA a record at the name
+//! whose bitmap lacks the type, NXDOMAIN a denial of the name and of the
+//! wildcard that could have answered it. [`crate::dnssec_denial`] reads the same
+//! rules from the other end and the tests here judge the output with it.
 //!
-//! Nothing here is optional to a validator. Three of the four shapes owe a proof
-//! rather than a signature:
-//!
-//! - a wildcard answer owes a denial of the name that was actually asked for,
-//!   because the same signature verifies at every name that wildcard reaches
-//!   (RFC 4035 §3.1.3) — without the denial, an attacker with one wildcard
-//!   answer holds a valid answer for every name under it;
-//! - NODATA owes a record *at* the name whose bitmap lacks the type;
-//! - NXDOMAIN owes both a denial of the name and a denial of the wildcard that
-//!   could otherwise have answered it.
-//!
-//! Only a plain positive answer is just signatures. [`crate::dnssec_denial`] is
-//! the same rules read from the other end, and the tests here check the output
-//! with it rather than by inspection.
-//!
-//! **Nothing is added to an unsigned zone**, whatever the client asked for. The
-//! DO bit is a statement about what the client can *understand*, not a demand,
-//! and most zones have nothing to send.
+//! An unsigned zone gets nothing, whatever DO says.
 
 use crate::dnssec::{canonical_name, rrsigs_in, Rrsig};
 use crate::dnssec_denial::{base32hex_encode, nsec3_hash, Nsec3};
@@ -47,22 +31,17 @@ pub struct AnswerSignatures {
 
 /// Whether this zone has signatures to serve at all.
 ///
-/// The apex DNSKEY RRset is the test rather than "are there any RRSIGs",
-/// because it is what a validator will come back and ask for. A zone with
-/// signatures but no published key cannot be validated by anyone, so serving
-/// its signatures only turns an insecure answer into a bogus one.
+/// The apex DNSKEY RRset, not "are there any RRSIGs": signatures with no
+/// published key make an insecure answer bogus rather than validatable.
 pub fn is_signed(zone: &Zone) -> bool {
     !zone.query(zone.origin(), Qtype::of(rt::DNSKEY)).is_empty()
 }
 
 /// The RRSIGs covering the answer to `qname`/`qtype`.
 ///
-/// A wildcard's signature is re-owned onto the queried name — which is not a
-/// forgery but the protocol: the RRSIG's label count still says the signature
-/// was made at the wildcard, and that is what lets a validator reconstruct the
-/// name that was really signed (RFC 4035 §5.3.2). Changing the owner and
-/// leaving the label count alone is exactly the shape of a genuine wildcard
-/// answer.
+/// A wildcard's signature is re-owned onto the queried name with its label count
+/// left alone: that is what lets a validator reconstruct the name really signed
+/// (RFC 4035 §5.3.2).
 pub fn answer_signatures(zone: &Zone, qname: &str, qtype: Qtype) -> AnswerSignatures {
     if !is_signed(zone) {
         return AnswerSignatures::default();
@@ -73,21 +52,9 @@ pub fn answer_signatures(zone: &Zone, qname: &str, qtype: Qtype) -> AnswerSignat
         let Some(sig) = rrsig_of(record) else {
             continue;
         };
-        // Which signatures the answer owes is the same question `Zone::of_type`
-        // asks of the records themselves — "does this question select this
-        // type" — so it is the same function. This used to be two hand-written
-        // branches: ANY asked for every type at the name and so owes the
-        // signature over every RRset that came back, and filtering on
-        // `type_covered == 255` matches nothing, since no RRSIG covers a QTYPE.
-        // That handed a client the whole of a signed name's data with no
-        // signatures on it, from a zone whose apex says it is signed — bogus to
-        // a validator rather than merely unsigned. The DNSSEC meta types are
-        // excluded by the same rule, for the same reason they are excluded from
-        // an ANY answer (RFC 4035 §3.1.1).
-        //
-        // It survived `TODO.md` #13c's first half because this function still
-        // took a `u16` and its callers passed `qtype.to_u16()`: a newtype stops
-        // paying the moment a signature is widened back to let it through.
+        // `Qtype::matches`, not `== qtype`: no RRSIG covers a QTYPE, so ANY
+        // (255) would match nothing and hand back a signed name's data unsigned.
+        // The same rule excludes the DNSSEC meta types (RFC 4035 §3.1.1).
         if !qtype.matches(sig.type_covered) {
             continue;
         }
@@ -106,11 +73,9 @@ pub fn answer_signatures(zone: &Zone, qname: &str, qtype: Qtype) -> AnswerSignat
 
 /// The proof that `qname` does not exist.
 ///
-/// Half of an NXDOMAIN, and the whole of what a wildcard answer owes. Under
-/// NSEC that is one record; under NSEC3 it is two, because a hash chain cannot
-/// point at a name directly — the proof is "this ancestor exists, and the name
-/// one label below it towards the query does not", which is what the closest
-/// encloser and the next closer name are (RFC 5155 §7.2.1).
+/// Half of an NXDOMAIN, and the whole of what a wildcard answer owes. One record
+/// under NSEC; under NSEC3 a hash chain cannot point at a name, so it is the
+/// closest encloser and the next closer name (RFC 5155 §7.2.1).
 pub fn proof_of_absence(zone: &Zone, qname: &str) -> Vec<ResourceRecord> {
     if !is_signed(zone) {
         return Vec::new();
@@ -136,18 +101,11 @@ pub fn proof_of_absence(zone: &Zone, qname: &str) -> Vec<ResourceRecord> {
 
 /// The authority records a negative answer needs beyond the SOA.
 ///
-/// `kind` is the same answer that decided NXDOMAIN against NODATA, and each of
-/// its cases owes something different: NODATA owes a record *at* the name saying
-/// the type is not among the ones it has, NODATA through a wildcard owes that
-/// record at the wildcard plus a denial of the name asked for, and NXDOMAIN owes
-/// a denial of the name *and* of the wildcard that could have covered it.
-/// Getting that last one wrong is how a validator ends up accepting an NXDOMAIN
-/// for a name a wildcard answers.
+/// Each case of `kind` owes something different; see the match below.
 ///
-/// It is a [`NameKind`] rather than a bool because the wildcard has to come from
-/// the zone. Recomputing it here as "the first label replaced by `*`" was wrong
-/// for anything a wildcard reaches more than one label down, and the proof it
-/// built was a statement about a name that does not exist.
+/// A [`NameKind`] rather than a bool because the wildcard has to come from the
+/// zone: "the first label replaced by `*`" is wrong for anything a wildcard
+/// reaches more than one label down, and denies a name that does not exist.
 pub fn negative_proof(zone: &Zone, qname: &str, kind: &NameKind) -> Vec<ResourceRecord> {
     if !is_signed(zone) {
         return Vec::new();
@@ -160,18 +118,12 @@ pub fn negative_proof(zone: &Zone, qname: &str, kind: &NameKind) -> Vec<Resource
             out.extend(proof_of_absence(zone, &qname));
             out.extend(wildcard_denial(zone, &qname));
         }
-        // The ordinary NODATA: the name is there, and the record at it lists
-        // the types that are. An empty non-terminal is the same shape — it
-        // exists, and the signer puts it in the chain for exactly this
-        // (`zone_signer::Layout::chain_names`), so there is a record to point
-        // at even though the name has no data of its own.
+        // NODATA: the record at the name lists the types it has. An empty
+        // non-terminal exists too, and the signer gives it a chain entry.
         NameKind::Exact | NameKind::EmptyNonTerminal => match_at_name(zone, &qname, &mut out),
-        // NODATA through a wildcard: the queried name does not exist, a
-        // wildcard matched it, and that wildcard has no records of this type.
-        // Both halves have to be said — the wildcard's own record for the
-        // missing type, and the proof that the queried name is not there in its
-        // own right, without which this is indistinguishable from a NODATA
-        // about the wildcard name itself.
+        // NODATA through a wildcard owes both halves: the wildcard's record for
+        // the missing type, and the denial of the queried name, without which
+        // this reads as a NODATA about the wildcard name itself.
         NameKind::Wildcard(wildcard) => {
             match_at_name(zone, &canonical_name(wildcard), &mut out);
             out.extend(proof_of_absence(zone, &qname));
@@ -183,13 +135,10 @@ pub fn negative_proof(zone: &Zone, qname: &str, kind: &NameKind) -> Vec<Resource
 /// What a referral owes a validating client: the DS RRset with its signature, or
 /// the authenticated denial that there is one (RFC 4035 §3.1.4).
 ///
-/// This is the step that keeps the chain of trust connected across a zone cut. A
-/// referral carrying no DS and no denial is indistinguishable from one an
-/// attacker stripped the DS out of, which is the downgrade attack DNSSEC exists
-/// to stop — the child looks unsigned and anything may then be forged in it.
+/// Neither present, and a referral is indistinguishable from one an attacker
+/// stripped the DS out of.
 ///
-/// The NS RRset itself gets **no** signature, and that is not an omission: it is
-/// the child's data, and this zone has no authority over it (RFC 4035 §2.2).
+/// The NS RRset gets no signature: it is the child's data (RFC 4035 §2.2).
 pub fn delegation_proof(zone: &Zone, cut: &str) -> Vec<ResourceRecord> {
     if !is_signed(zone) {
         return Vec::new();
@@ -203,16 +152,12 @@ pub fn delegation_proof(zone: &Zone, cut: &str) -> Vec<ResourceRecord> {
         return out;
     }
 
-    // No DS: the child is insecure, and a validator will only believe that if it
-    // is signed. The record at the cut says so by listing NS and not DS in its
-    // bitmap.
+    // No DS: the record at the cut says so by listing NS and not DS.
     let mut out = Vec::new();
     match_at_name(zone, &cut, &mut out);
     if out.is_empty() && zone.has_nsec3_chain() {
         // Under opt-out an insecure delegation has no NSEC3 of its own
-        // (RFC 5155 §7.2.9), so the proof is the closest-encloser pair instead:
-        // the covering record says the name falls in a span the chain does not
-        // enumerate, which is exactly what opt-out means.
+        // (RFC 5155 §7.2.9), so the closest-encloser pair is the proof.
         out.extend(proof_of_absence(zone, &cut));
     }
     out
@@ -221,12 +166,10 @@ pub fn delegation_proof(zone: &Zone, cut: &str) -> Vec<ResourceRecord> {
 /// The denial of the wildcard that could have answered `qname`, which an
 /// NXDOMAIN needs alongside the denial of the name itself (RFC 4035 §5.4).
 ///
-/// The wildcard denied here is `*.<closest encloser>`, and that name is
-/// guaranteed not to be in the zone — if it were, the answer would have been a
-/// wildcard match rather than an NXDOMAIN. That guarantee lives in
-/// [`Zone::name_kind`], and it is load-bearing: `nsec_covering` searches
-/// strictly below its argument, so asking it about a name that *is* in the chain
-/// returns the record before it, which covers nothing and proves nothing.
+/// `*.<closest encloser>` is guaranteed absent by [`Zone::name_kind`] — were it
+/// present the answer would be a wildcard match — and that is load-bearing:
+/// `nsec_covering` searches strictly below its argument, so a name in the chain
+/// yields the record before it, which proves nothing.
 fn wildcard_denial(zone: &Zone, qname: &str) -> Vec<ResourceRecord> {
     let mut out = Vec::new();
     if zone.has_nsec3_chain() {
@@ -256,8 +199,8 @@ fn match_at_name(zone: &Zone, name: &str, out: &mut Vec<ResourceRecord>) {
         }
         return;
     }
-    // `query` would fall back to a wildcard, and a wildcard's NSEC says nothing
-    // about the name asked for — the records here have to be the literal ones.
+    // `query` falls back to a wildcard, whose NSEC says nothing about the name
+    // asked for; only the literal records will do.
     if !zone.holds_name(name) {
         return;
     }
@@ -266,14 +209,9 @@ fn match_at_name(zone: &Zone, name: &str, out: &mut Vec<ResourceRecord>) {
     }
 }
 
-/// The apex SOA's signatures. The SOA itself is already in the authority
-/// section of any negative answer (RFC 2308); unsigned, it is one more record a
-/// validator has to reject the answer over.
-///
-/// The TTL is capped the same way the SOA's is — `min(MINIMUM, the record's own
-/// TTL)`, RFC 2308 §3. A signature outliving the record it covers is a cache
-/// holding an RRSIG with nothing to check, and the two disagreeing about how
-/// long the "no" is good for is what made this worth writing down.
+/// The apex SOA's signatures, capped as the SOA itself is —
+/// `min(MINIMUM, the record's own TTL)`, RFC 2308 §3. A signature outliving the
+/// record it covers leaves a cache holding an RRSIG with nothing to check.
 fn soa_signatures(zone: &Zone) -> Vec<ResourceRecord> {
     let origin = zone.origin().to_string();
     let cap = negative_ttl_cap(zone);
@@ -315,10 +253,8 @@ fn push_with_signatures(zone: &Zone, record: &ZoneRecord, out: &mut Vec<Resource
         .iter()
         .any(|r| r.name == resource.name && r.rdata == resource.rdata)
     {
-        // The same NSEC often denies two things at once — a name and the
-        // wildcard above it are frequently in the same gap. Sending it twice is
-        // legal and pointless; a validator de-duplicates, and the second copy is
-        // bytes on an amplification path.
+        // One NSEC often denies both a name and the wildcard above it; the
+        // second copy is bytes on an amplification path.
         return;
     }
     let signatures = signatures_at(zone, &record.name, record.rdata.rtype());
@@ -326,30 +262,21 @@ fn push_with_signatures(zone: &Zone, record: &ZoneRecord, out: &mut Vec<Resource
     out.extend(signatures);
 }
 
-// ---------------------------------------------------------------------------
-// NSEC3: the chain is over hashes, so every lookup goes through the parameters
-// ---------------------------------------------------------------------------
-
 /// The salt and iteration count this zone's NSEC3 chain was built with, and the
 /// lookups that go through them.
 ///
-/// Not [`crate::dnssec_denial::Nsec3Params`], which is the borrowed triple a
-/// *record* hashes under: this one is owned, is derived from a whole zone, and
-/// answers questions about the chain rather than about one record.
+/// Not [`crate::dnssec_denial::Nsec3Params`], the borrowed triple one *record*
+/// hashes under: this is owned, derived from a whole zone, and answers questions
+/// about the chain.
 struct Nsec3Chain {
     salt: Vec<u8>,
     iterations: u16,
 }
 
 impl Nsec3Chain {
-    /// Read them off the chain itself rather than off NSEC3PARAM.
-    ///
-    /// NSEC3PARAM is what tells a *server* which chain to use when a zone is
-    /// mid-rollover between two of them (RFC 5155 §4.1), and this server has no
-    /// such notion — it has the one chain it was given. Taking the parameters
-    /// from a record in that chain cannot disagree with the chain, whereas an
-    /// NSEC3PARAM left behind from a previous signing can, and the failure would
-    /// be every denial hashing to something no record matches.
+    /// Read off the chain itself, not NSEC3PARAM: this server holds one chain
+    /// rather than choosing between rollover chains (RFC 5155 §4.1), and an
+    /// NSEC3PARAM left from a previous signing hashes every denial to nothing.
     fn of(zone: &Zone) -> Option<Self> {
         zone.any_nsec3()
             .and_then(|r| Nsec3::from_record(&to_resource(r)))
@@ -374,10 +301,9 @@ impl Nsec3Chain {
 
     /// The deepest ancestor of `qname` that the chain has a record for.
     ///
-    /// Walking up rather than consulting the name index, because under NSEC3 an
-    /// empty non-terminal has an NSEC3 and no records of its own — it would be
-    /// invisible to a lookup by name, and stopping short of it produces a proof
-    /// about the wrong encloser.
+    /// Walked rather than looked up by name: under NSEC3 an empty non-terminal
+    /// has an NSEC3 and no records, so the index would miss it and the proof
+    /// would name the wrong encloser.
     fn closest_encloser(&self, zone: &Zone, qname: &str) -> Option<String> {
         let origin = canonical_name(zone.origin());
         let mut name = canonical_name(qname);
@@ -424,10 +350,6 @@ fn push_covering_nsec3(
     };
     push_with_signatures(zone, &record, out);
 }
-
-// ---------------------------------------------------------------------------
-// Names
-// ---------------------------------------------------------------------------
 
 /// The deepest ancestor of `qname` the zone holds a name for. Under NSEC every
 /// name in the chain has a record, empty non-terminals included, so the index
@@ -554,8 +476,8 @@ deep.a.b IN TXT "down here"
         (rdatas, answer_signatures(zone, qname, qtype))
     }
 
-    /// Judge the answer with the validator, exactly as a client would: the
-    /// records as they left, the signatures as they left, nothing from the zone.
+    /// Judge the answer with the validator as a client would: what left, not
+    /// what the zone holds.
     fn judge(zone: &Zone, qname: &str, qtype: Qtype) -> RrsetProof {
         let (rdatas, sigs) = answer(zone, qname, qtype);
         let rrsigs = crate::dnssec::rrsigs_in(&sigs.records);
@@ -579,9 +501,8 @@ deep.a.b IN TXT "down here"
                 ),
                 "{chain:?}"
             );
-            // And only the signature that covers it: an RRSIG over the AAAA at
-            // the same name is not evidence about the A, and sending it invites
-            // a validator to try the wrong one.
+            // Only the signature that covers it: the AAAA's RRSIG at the same
+            // name is not evidence about the A.
             let (_, sigs) = answer(&zone, "www.example.com.", Qtype::of(rt::A));
             assert_eq!(sigs.records.len(), 1, "{chain:?}");
             assert!(sigs.wildcard.is_none());
@@ -590,9 +511,8 @@ deep.a.b IN TXT "down here"
 
     #[test]
     fn a_wildcard_answer_carries_its_signature_and_a_denial_of_the_name_asked_for() {
-        // The attack this shape exists to stop: one wildcard answer verifies at
-        // every name the wildcard reaches, so without a denial of the queried
-        // name it is a valid answer for all of them.
+        // One wildcard answer verifies at every name the wildcard reaches, so
+        // without the denial it is a valid answer for all of them.
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = signed(chain.clone());
             let qname = "anything.example.com.";
@@ -608,7 +528,6 @@ deep.a.b IN TXT "down here"
 
             let (_, sigs) = answer(&zone, qname, Qtype::of(rt::A));
             assert_eq!(sigs.wildcard.as_deref(), Some("*.example.com."));
-            // The RRSIG goes out owned by the name the client asked about.
             assert!(sigs.records.iter().all(|r| r.name == qname));
 
             let proof_records = proof_of_absence(&zone, qname);
@@ -648,10 +567,9 @@ deep.a.b IN TXT "down here"
 
     #[test]
     fn nodata_through_a_wildcard_says_both_halves() {
-        // `anything.example.com.` has no MX. The wildcard is what matched it, so
-        // the record denying MX sits at `*.example.com.` — and on its own that
-        // is a statement about a name the client never asked about. The denial
-        // of the queried name is what ties the two together.
+        // `anything.example.com.` has no MX, so the record denying MX sits at
+        // `*.example.com.` — a statement about a name nobody asked about until
+        // the denial of the queried name ties the two together.
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = signed(chain.clone());
             let records = negative_proof(
@@ -674,8 +592,7 @@ deep.a.b IN TXT "down here"
     fn nxdomain_denies_the_name_and_the_wildcard_that_could_have_answered_it() {
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = signed(chain.clone());
-            // Two labels down, so the apex wildcard cannot reach it — which is
-            // what makes this NXDOMAIN rather than a wildcard answer.
+            // Two labels down, past the apex wildcard's reach, so NXDOMAIN.
             let qname = "gone.a.b.example.com.";
             let records = negative_proof(&zone, qname, &zone.name_kind(qname));
             let denial = proves_nxdomain(qname, ORIGIN, &nsecs_in(&records), &nsec3s_in(&records));
@@ -685,8 +602,7 @@ deep.a.b IN TXT "down here"
 
     #[test]
     fn every_denial_record_travels_with_its_own_signature() {
-        // A proof is only a proof if it is signed. An unsigned NSEC in the
-        // authority section is a record an attacker could have written.
+        // An unsigned NSEC is a record an attacker could have written.
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = signed(chain.clone());
             let records = negative_proof(
@@ -723,9 +639,8 @@ deep.a.b IN TXT "down here"
             }
             assert!(denials > 0, "{chain:?}: no denial records at all");
 
-            // The SOA's signature comes too — rdnsd puts the SOA itself in the
-            // authority section of every negative answer, and an unsigned one
-            // there is one more record for a validator to reject.
+            // The SOA is in the authority section of every negative answer, so
+            // its signature comes too.
             assert!(
                 sigs.iter().any(|s| s.type_covered == rt::SOA),
                 "{chain:?}: the SOA went out unsigned"
@@ -735,9 +650,8 @@ deep.a.b IN TXT "down here"
 
     #[test]
     fn an_unsigned_zone_gets_nothing_however_the_client_asked() {
-        // The DO bit says the client understands DNSSEC, not that the zone owes
-        // it anything. Most zones are unsigned and answering one is the normal
-        // case, not a failure.
+        // DO says the client understands DNSSEC, not that the zone owes it
+        // anything.
         let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
         assert!(!is_signed(&zone));
         assert!(
@@ -756,20 +670,16 @@ deep.a.b IN TXT "down here"
 
     #[test]
     fn the_nsec_chain_is_searched_rather_than_scanned() {
-        // The covering record is found by range, not by walking the zone. This
-        // checks the answer is the right one at both ends of the chain and at
-        // the wrap — the three places an ordered lookup gets it wrong.
+        // Found by range, not by walking the zone: both ends and the wrap are
+        // where an ordered lookup gets it wrong.
         let zone = signed(DenialChain::Nsec);
         let covering = |name: &str| {
             let record = zone.nsec_covering(name).expect("a chain to search");
             crate::dnssec_denial::Nsec::from_record(&to_resource(record)).unwrap()
         };
-        // Before everything in the zone, which is the wrap-around case: the
-        // last NSEC points back at the apex and so covers this.
+        // Before everything: the wrap, where the last NSEC points at the apex.
         assert!(covering("aaa.example.com.").covers("aaa.example.com."));
-        // In the middle.
         assert!(covering("nnn.example.com.").covers("nnn.example.com."));
-        // After everything.
         assert!(covering("zzz.example.com.").covers("zzz.example.com."));
     }
 }

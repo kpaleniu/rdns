@@ -1,17 +1,6 @@
 //! The resolver: obtains an answer for a query, either by walking the
-//! delegation chain from the root ourselves, or by asking a configured upstream
-//! resolver to do it for us.
-//!
-//! These are two modes of one resolver rather than two programs, which is how
-//! BIND, Unbound, Knot Resolver and PowerDNS Recursor all model it: the
-//! client-facing half is identical, only the means of obtaining an answer
-//! differs, and mixed deployments (forward one zone, recurse the rest) are
-//! ordinary. See [`ResolverMode`].
-//!
-//! Everything here is async `tokio::net`. Each hop is an `await` on a socket, so
-//! a resolution that takes several round trips yields its task at every round
-//! trip rather than pinning a thread for the sum of them. `rdnsr` awaits
-//! `resolve` directly. See the note on [`Resolver::recurse`].
+//! delegation chain from the root ourselves or by forwarding to a configured
+//! upstream. See [`ResolverMode`].
 
 use crate::dnssec::{Dnskey, Rrsig};
 use crate::dnssec_chain::{
@@ -39,41 +28,19 @@ use tokio::net::{TcpStream, UdpSocket};
 /// (RFC 1035 §4.2.2), so no message can exceed what that field can express.
 const TCP_MAX_MESSAGE: usize = u16::MAX as usize;
 
-/// The record type an intermediate QNAME-minimized probe asks for.
-///
-/// **A, not NS.** RFC 9156 §2.3 says to use "a QTYPE that is least likely to
-/// raise issues in DNS software and middleboxes", and names A as the one it
-/// recommends; NS is RFC 7816's superseded guidance, which 9156 replaced
-/// precisely because some authoritative servers and middleboxes answer an NS
-/// probe for a non-apex name badly. Either type distinguishes a zone cut from a
-/// plain name — a cut answers with a referral, an in-zone name with NODATA —
-/// and neither reveals the leaf being resolved, so there is nothing to trade
-/// off against interoperability here.
+/// The record type an intermediate QNAME-minimized probe asks for: A, the QTYPE
+/// least likely to trip middleboxes (RFC 9156 §2.3), not RFC 7816's NS.
 const MINIMIZED_PROBE_TYPE: Qtype = Qtype::of(rt::A);
 
-/// How many minimized probes are sent before the full QNAME goes out instead.
-///
-/// RFC 9156 §2.3 requires a MAX_MINIMISE_COUNT and recommends 10. There was no
-/// ceiling: the loop deepened one label at a time for as many labels as the name
-/// had, so a reverse-IPv6 PTR — 34 labels — cost about thirty round trips and
-/// usually exhausted `query_budget` first. That is the wrong failure: the point
-/// of a ceiling is to *degrade* to a full-name query, which still resolves,
-/// rather than to fail a name outright for being deep.
+/// MAX_MINIMISE_COUNT (RFC 9156 §2.3, recommended 10). Past it the full QNAME
+/// goes out, so a deep name degrades instead of exhausting `query_budget`.
 const MAX_MINIMISE_COUNT: usize = 10;
 
-/// The IPv4 and IPv6 addresses of the 13 root servers, used to prime recursion.
+/// IPv4 addresses of the 13 root servers, used to prime recursion.
 ///
-/// Hard-coded as a fallback the way every resolver ships one; these do change
-/// (b.root-servers.net moved to 170.247.170.2 in 2023), so a deployment that
-/// cares should load the published hints file instead — [`parse_root_hints`]
-/// reads that format, and `root_hints` in [`ResolverConfig`] is what to
-/// override with the result. A stale entry degrades rather than breaks: servers
-/// are tried until one answers, and RTT selection demotes the ones that don't.
-///
-/// Both families are shipped so a v6 deployment is not stuck behind v4; the two
-/// are interleaved into `root_hints` (a, a-v6, b, b-v6, …) so whichever family
-/// works is reached within a hop or two on the very first query, before any RTT
-/// is known.
+/// A fallback only; these change, so load the published hints file with
+/// [`parse_root_hints`] into `root_hints`. A stale entry degrades: servers are
+/// tried until one answers and RTT selection demotes the rest.
 const ROOT_HINTS: [Ipv4Addr; 13] = [
     Ipv4Addr::new(198, 41, 0, 4),     // a.root-servers.net
     Ipv4Addr::new(170, 247, 170, 2),  // b
@@ -108,23 +75,15 @@ const ROOT_HINTS_V6: [Ipv6Addr; 13] = [
 ];
 
 /// Parse root hints in the published `named.root` format, returning every A and
-/// AAAA address it lists (port 53, the only port a root speaks on).
-///
-/// The NS lines that name the servers are ignored — only the addresses prime
-/// recursion — as is anything after a `;` comment. A line whose address does not
-/// parse is skipped rather than failing the whole file, so one stray entry does
-/// not sink an otherwise good hints file; the caller decides what an empty
-/// result means.
+/// AAAA address it lists (port 53). An unparsable line is skipped rather than
+/// failing the file; the caller decides what an empty result means.
 pub fn parse_root_hints(text: &str) -> Vec<SocketAddr> {
     let mut hints = Vec::new();
     for line in text.lines() {
-        // named.root comments start with ';'.
         let line = line.split(';').next().unwrap_or("");
-        // Layout is NAME TTL [CLASS] TYPE RDATA. Scan for the A/AAAA type token
-        // and take the next token as the address; that tolerates the optional
-        // class and any spacing without hard-coding column positions. The owner
-        // name "A.ROOT-SERVERS.NET." is not equal to the bare type "A", so it
-        // does not trip the match.
+        // Layout is NAME TTL [CLASS] TYPE RDATA. Scanning for the type token
+        // tolerates the optional class and any spacing. The owner name
+        // "A.ROOT-SERVERS.NET." does not equal the bare type "A".
         let mut tokens = line.split_whitespace();
         while let Some(tok) = tokens.next() {
             if tok.eq_ignore_ascii_case("A") || tok.eq_ignore_ascii_case("AAAA") {
@@ -165,12 +124,8 @@ pub struct ResolverConfig {
     /// CNAME hops to follow before declaring a loop.
     pub max_cname_hops: usize,
     /// Total upstream queries one `resolve` may spend, across delegations,
-    /// CNAME hops and nameserver-address lookups.
-    ///
-    /// This is the NXNSAttack (2020) defence: a hostile zone can answer with a
-    /// referral naming dozens of nameservers that have no glue, each of which
-    /// costs us a full resolution to look up. Bounding the *total* work is what
-    /// stops one client query from becoming hundreds of upstream ones.
+    /// CNAME hops and nameserver-address lookups. The NXNSAttack defence: a
+    /// referral naming dozens of glueless nameservers costs a resolution each.
     pub query_budget: usize,
     /// EDNS0 UDP payload size to advertise upstream (RFC 6891).
     pub udp_payload_size: u16,
@@ -178,45 +133,29 @@ pub struct ResolverConfig {
     /// every query restart at the root — correct, but only acceptable in tests.
     pub delegation_cache_size: usize,
     /// Whether to minimize the query name sent up the delegation chain
-    /// (RFC 9156). With it on, each server is asked only for the label being
-    /// delegated rather than the full name, so the root learns the TLD and no
-    /// more; the leaf is revealed only to the server authoritative for it. On by
-    /// default, as the RFC asks; turn it off to send the full name at every hop.
+    /// (RFC 9156). On by default; off sends the full name at every hop.
     pub qname_minimization: bool,
-    /// Whether to randomize the case of letters in the outgoing query name
-    /// (draft-vixie-dnsext-dns0x20). A response must echo the question, so the
-    /// random casing is entropy an off-path spoofer has to guess on top of the
-    /// transaction id and source port. On by default; turn it off for the rare
-    /// authoritative server or middlebox that does not preserve case.
+    /// Whether to randomize the case of the outgoing query name
+    /// (draft-vixie-dnsext-dns0x20): entropy an off-path spoofer must guess on
+    /// top of the transaction id and source port. Off for peers that do not
+    /// preserve case.
     pub zero_x20: bool,
-    /// Port to contact a nameserver on once we have learned its address.
-    ///
-    /// Always 53 in practice — glue and address records carry an address but no
-    /// port, so there is nothing else to go on. Configurable only so a test can
-    /// stand up a fake root/TLD/authoritative hierarchy on an unprivileged one.
+    /// Port to contact a nameserver on. Always 53 in practice — glue carries no
+    /// port; configurable only so tests can run an unprivileged hierarchy.
     pub server_port: u16,
-    /// Trust anchors to validate against, or `None` to do no DNSSEC validation
-    /// at all.
+    /// Trust anchors to validate against, or `None` for no DNSSEC validation.
     ///
-    /// Turning this on changes what goes out as well as what comes back: every
-    /// query carries DO so servers include their signatures, and CD so a
-    /// forwarded query reaches us unfiltered — an upstream that validates on our
-    /// behalf and hands back SERVFAIL leaves us nothing to check, which is the
-    /// same as trusting it.
-    /// Held behind a lock because RFC 5011 replaces them while the resolver
-    /// runs — that is the whole point of following a key roll rather than
-    /// requiring a restart for it. Read once per validated resolve and cloned;
-    /// an anchor set is a handful of DS records, and cloning is what keeps the
-    /// lock from being held across an await.
+    /// On, every query carries DO and CD: an upstream that validates for us and
+    /// returns SERVFAIL leaves nothing to check, which is the same as trusting
+    /// it.
     pub dnssec: Option<SharedAnchors>,
 }
 
-/// Trust anchors the resolver validates against, which something else may
-/// replace while it runs.
+/// Trust anchors the resolver validates against, replaceable while it runs
+/// (RFC 5011 key rolls).
 ///
 /// A `std::sync::RwLock` rather than tokio's: every use is a clone-and-release
-/// with no await inside, so an async lock would buy nothing and cost the chance
-/// of holding a guard across a suspension point.
+/// with no await inside.
 #[derive(Clone, Debug)]
 pub struct SharedAnchors(Arc<std::sync::RwLock<TrustAnchors>>);
 
@@ -225,10 +164,9 @@ impl SharedAnchors {
         SharedAnchors(Arc::new(std::sync::RwLock::new(anchors)))
     }
 
-    /// The anchors as they stand. A poisoned lock means a panic while anchors
-    /// were being swapped, and validating against a set nobody finished writing
-    /// is worse than not validating: the recovered value is used, and the caller
-    /// sees whichever of the two versions was in place.
+    /// The anchors as they stand. A poisoned lock is recovered rather than
+    /// propagated: an anchor swap is a whole-value assignment, so the caller
+    /// sees one of the two versions either way.
     pub fn get(&self) -> TrustAnchors {
         match self.0.read() {
             Ok(anchors) => anchors.clone(),
@@ -236,7 +174,7 @@ impl SharedAnchors {
         }
     }
 
-    /// Put a new set in place. Every resolve after this uses it.
+    /// Put a new set in place.
     pub fn replace(&self, anchors: TrustAnchors) {
         match self.0.write() {
             Ok(mut held) => *held = anchors,
@@ -281,20 +219,15 @@ impl Default for ResolverConfig {
             qname_minimization: true,
             zero_x20: true,
             server_port: 53,
-            // Off by default: validation costs extra round trips and turns a
+            // Off by default: validation costs round trips and turns a
             // misconfigured zone into a failure, so it is the operator's call.
             dnssec: None,
         }
     }
 }
 
-/// Servers we have already learned for a zone, so a resolution can start
-/// partway down the tree instead of at the root every time.
-///
-/// This is the difference between a toy recursor and a usable one. Without it
-/// every client query costs a root round trip before it can even begin, which
-/// is slow for us and — at any volume — abusive enough that root operators
-/// rate-limit it. With it, the root is consulted roughly once per TLD per TTL.
+/// Servers already learned for a zone, so a resolution can start partway down
+/// the tree rather than paying a root round trip per client query.
 #[derive(Debug)]
 struct DelegationCache {
     entries: Mutex<HashMap<NameKeyBuf, CachedDelegation>>,
@@ -319,9 +252,7 @@ impl DelegationCache {
     }
 
     /// The deepest cached zone that encloses `qname` and has not expired.
-    ///
-    /// Deepest wins: knowing the servers for `example.com.` is worth more than
-    /// knowing the ones for `com.`, because it skips a round trip.
+    /// Deepest wins: it skips a round trip.
     fn best_match(&self, qname: &str) -> Option<(String, Vec<SocketAddr>)> {
         self.best_match_where(qname, |_| true)
     }
@@ -397,28 +328,21 @@ impl DelegationCache {
     }
 }
 
-/// A smoothed round-trip time per nameserver, so a zone's servers can be tried
-/// fastest-first instead of always in the order they were learned.
-///
-/// This is what stops every query for a zone from waiting on the same slow or
-/// dead server before falling through to a working one. Kept as an exponentially
-/// weighted moving average the way BIND and Unbound track SRTT: one bad sample
-/// nudges a server down the order rather than banishing it, and a run of good
-/// ones pulls it back.
+/// A smoothed round-trip time per nameserver, so a zone's servers are tried
+/// fastest-first. An EWMA, as BIND and Unbound track SRTT: one bad sample
+/// demotes a server rather than banishing it.
 #[derive(Debug)]
 struct RttStore {
     rtts: Mutex<HashMap<SocketAddr, f64>>,
     capacity: usize,
 }
 
-/// Weight given to the newest sample in the moving average. 0.25 is the classic
-/// SRTT smoothing factor (RFC 6298 for TCP): responsive but not twitchy.
+/// Weight of the newest sample in the moving average; the SRTT smoothing factor
+/// of RFC 6298.
 const RTT_ALPHA: f64 = 0.25;
 
-/// What an unmeasured server is assumed to cost, in milliseconds. Sorts between
-/// a fast known server and a known-bad one, so a fresh set of servers is tried
-/// in the order given while a measured-fast server still wins over an untried
-/// one, and an untried one still wins over a server that has been timing out.
+/// Assumed cost of an unmeasured server, in milliseconds. Sorts between a
+/// measured-fast server and one that has been timing out.
 const UNKNOWN_RTT_MS: f64 = 100.0;
 
 impl RttStore {
@@ -429,8 +353,7 @@ impl RttStore {
         }
     }
 
-    /// The stored SRTT for a server, or [`UNKNOWN_RTT_MS`] if we've never timed
-    /// it.
+    /// The stored SRTT, or [`UNKNOWN_RTT_MS`] if untimed.
     fn get(&self, server: &SocketAddr) -> f64 {
         self.rtts
             .lock()
@@ -451,8 +374,8 @@ impl RttStore {
         match m.get_mut(server) {
             Some(srtt) => *srtt = (1.0 - RTT_ALPHA) * *srtt + RTT_ALPHA * sample_ms,
             None => {
-                // At capacity, drop the slowest entry — the one we would
-                // deprioritize anyway, and lose least by re-learning as unknown.
+                // At capacity, drop the slowest entry: least lost by
+                // re-learning it as unknown.
                 if m.len() >= self.capacity {
                     if let Some(worst) = m.iter().max_by(|a, b| a.1.total_cmp(b.1)).map(|(k, _)| *k)
                     {
@@ -536,13 +459,9 @@ impl Budget {
 
 /// The mutable state of one client query, threaded through the whole walk.
 ///
-/// The budget was always here. `cuts` is the new part: every referral we follow
-/// is also the only moment we get to see the *parent's* side of that zone cut,
-/// which is where the DS records live. Asking the child for its own DS
-/// afterwards lets the child answer a question about itself, and asking the
-/// parent again costs a round trip we have already spent — so the referral is
-/// read for DS and NSEC evidence as it goes past, and validation consumes what
-/// the walk collected.
+/// A referral is the only sight of the *parent's* side of a zone cut, where the
+/// DS lives; asking the child for its own DS lets it answer about itself. So
+/// `cuts` collects DS and NSEC evidence in passing and validation consumes it.
 struct Resolution {
     budget: Budget,
     cuts: Vec<DelegationEvidence>,
@@ -558,14 +477,9 @@ impl Resolution {
         }
     }
 
-    /// Keep the NSEC/NSEC3 records — and the signatures over them — from an
-    /// answer's authority section.
-    ///
-    /// A CNAME chase spans several responses and only the last one's authority
-    /// section survives into the message we return, so a wildcard expansion at
-    /// an earlier hop would arrive with its denial already discarded and be
-    /// refused on our own bookkeeping. RRSIGs come along because a proof nobody
-    /// signed is not one.
+    /// Keep the NSEC/NSEC3 records, and their RRSIGs, from an authority
+    /// section. Only the last response of a CNAME chase survives into the
+    /// message returned, so an earlier hop's wildcard proof would be lost.
     fn record_denials(&mut self, authorities: &[ResourceRecord]) {
         self.denials.extend(
             authorities
@@ -578,10 +492,8 @@ impl Resolution {
     /// Remember what a referral to `zone` said about that zone's security.
     fn record_cut(&mut self, zone: &str, authorities: &[ResourceRecord]) {
         let evidence = DelegationEvidence::from_authority(zone, authorities);
-        // A zone can be crossed more than once in one resolution (a CNAME
-        // chase, or fetching a nameserver's address). Keep the first sighting
-        // that actually carried evidence — a later referral pulled from a cache
-        // or answered by a different server may be thinner.
+        // A zone can be crossed more than once in one resolution. Keep the
+        // first sighting that carried evidence; a later referral may be thinner.
         if let Some(existing) = self.cuts.iter_mut().find(|c| c.zone == evidence.zone) {
             if existing.ds.is_empty() && existing.nsecs.is_empty() && existing.nsec3s.is_empty() {
                 *existing = evidence;
@@ -591,10 +503,8 @@ impl Resolution {
         self.cuts.push(evidence);
     }
 
-    /// The next zone cut below `zone` on the way to `target`.
-    ///
-    /// Shallowest first: the chain has to be walked one cut at a time, because
-    /// each zone's keys are what authenticate the DS of the zone beneath it.
+    /// The next zone cut below `zone` on the way to `target`. Shallowest first:
+    /// each zone's keys authenticate the DS of the zone beneath it.
     fn next_cut_below(&self, zone: &str, target: &str) -> Option<&DelegationEvidence> {
         self.cuts
             .iter()
@@ -607,16 +517,10 @@ impl Resolution {
     }
 }
 
-/// DNSKEY sets that have already been validated up to a trust anchor.
-///
-/// Without this, every query into a signed zone re-walks the whole chain from
-/// the root and re-verifies every signature on the way down — several extra
-/// round trips and a few dozen public-key operations for an answer we could
-/// have had from cache. With it, that cost is paid once per zone per TTL.
-///
-/// What is stored is the *conclusion*, not the material: these keys have been
-/// checked against their DS, so nothing re-derives them. That makes the TTL
-/// load-bearing, hence the cap.
+/// DNSKEY sets already validated up to a trust anchor, so the chain walk is
+/// paid once per zone per TTL. What is stored is the *conclusion* — nothing
+/// re-checks these against their DS — which is what makes the TTL cap
+/// load-bearing.
 #[derive(Debug)]
 struct KeyCache {
     entries: Mutex<HashMap<NameKeyBuf, CachedKeys>>,
@@ -629,8 +533,8 @@ struct CachedKeys {
     expires_at: u64,
 }
 
-/// Never hold a validated key set longer than this, whatever the TTL says.
-/// A key that has been withdrawn should stop being trusted within the day.
+/// Never hold a validated key set longer than this, whatever the TTL says: a
+/// withdrawn key must stop being trusted within the day.
 const MAX_KEY_TTL: u64 = 86_400;
 
 impl KeyCache {
@@ -688,15 +592,13 @@ impl KeyCache {
     }
 }
 
-/// A DNS resolver. See [`ResolverMode`] for what it actually does.
+/// A DNS resolver. See [`ResolverMode`].
 pub struct Resolver {
     config: ResolverConfig,
-    /// Shared across concurrent resolutions — `rdnsr` holds one `Resolver` in an
-    /// `Arc` and resolves from many threads at once.
+    /// Shared across concurrent resolutions.
     delegations: DelegationCache,
-    /// Per-server round-trip times, so a zone's servers are tried fastest-first.
-    /// Shares its bound with the delegation cache (0 disables both the recording
-    /// and, harmlessly, the reordering — `order` then keeps the input order).
+    /// Per-server round-trip times. Shares its bound with the delegation cache;
+    /// 0 disables recording, and `order` then keeps the input order.
     rtt: RttStore,
     /// Zones whose DNSKEY set we have already validated.
     keys: KeyCache,
@@ -733,19 +635,16 @@ impl Resolver {
         self.config.mode
     }
 
-    /// Resolve a query.
-    ///
-    /// The answer only; use [`Resolver::resolve_validated`] to learn whether it
-    /// was authenticated.
+    /// Resolve a query. The answer only; [`Resolver::resolve_validated`] also
+    /// reports whether it was authenticated.
     pub async fn resolve(&self, query: &QuerySection) -> ResolveResult<DnsMessage> {
         self.resolve_validated(query).await.map(|(msg, _)| msg)
     }
 
     /// Resolve a query and say how much the answer can be trusted.
     ///
-    /// With no trust anchors configured the state is always
-    /// [`ValidationState::Indeterminate`] — not `Insecure`, because we did not
-    /// establish that anything is unsigned, we simply did not look.
+    /// With no trust anchors the state is [`ValidationState::Indeterminate`],
+    /// not `Insecure`: nothing established that anything is unsigned.
     pub async fn resolve_validated(
         &self,
         query: &QuerySection,
@@ -762,9 +661,8 @@ impl Resolver {
                 ValidationState::Indeterminate("DNSSEC validation is not enabled".into()),
             ));
         };
-        // Taken once, for the whole of this resolve. Anchors that changed
-        // half-way through a chain walk would let a key be trusted for one step
-        // and not the next, which is a verdict about nothing.
+        // Taken once for the whole resolve: anchors changing mid-walk would
+        // trust a key for one step and not the next.
         let anchors = anchors.get();
         let verdict = self.validate(query, &response, &mut state, &anchors).await;
         Ok((response, verdict))
@@ -776,8 +674,7 @@ impl Resolver {
         query: &QuerySection,
         state: &mut Resolution,
     ) -> ResolveResult<DnsMessage> {
-        // RD=1: we are asking the upstream to do the recursion for us. `ask_any`
-        // tries them fastest-first and records their RTTs, same as recursion.
+        // RD=1: the upstream does the recursion.
         let out = self.build_query(query, true)?;
         self.ask_any(&self.config.upstream_servers, &out, &mut state.budget)
             .await
@@ -789,23 +686,17 @@ impl Resolver {
             })
     }
 
-    /// Serialize a query message. `recursion_desired` is false when we are
-    /// walking the delegation chain ourselves — an authoritative server has no
-    /// business recursing on our behalf, and asking it to is how open resolvers
-    /// get abused.
-    ///
-    /// The returned [`OutgoingQuery`] carries the id and the exact question name
-    /// placed on the wire (its case randomized when 0x20 is on) so the reply can
-    /// be checked against them.
+    /// Serialize a query message. `recursion_desired` is false while walking the
+    /// delegation chain ourselves. The returned [`OutgoingQuery`] carries the id
+    /// and the exact wire question name, so a reply can be checked against them.
     fn build_query(
         &self,
         query: &QuerySection,
         recursion_desired: bool,
     ) -> ResolveResult<OutgoingQuery> {
         let id = rand::random::<u16>();
-        // The name as sent: same labels, but with the case of its letters
-        // scrambled when 0x20 is on. Resolution logic elsewhere still
-        // normalizes, so only the wire bytes and the reply check see this.
+        // Only the wire bytes and the reply check see the scrambled case;
+        // resolution logic elsewhere normalizes.
         let sent_qname = if self.config.zero_x20 {
             randomize_case(&query.qname)
         } else {
@@ -831,11 +722,9 @@ impl Resolver {
             additionals: Vec::new(),
             edns: None,
         };
-        // Advertise EDNS0 so the responder may exceed 512 bytes, and — when we
-        // validate — ask for the signatures with DO. CD goes with it: we are
-        // doing the checking, so an upstream must hand back what it has rather
-        // than withholding data it judged bogus, which would leave us with
-        // nothing to judge and no choice but to take its word for it.
+        // EDNS0 to exceed 512 bytes, DO to get signatures. CD goes with DO: we
+        // do the checking, so the upstream must not withhold what it judged
+        // bogus.
         let mut edns = Edns::with_payload_size(self.config.udp_payload_size);
         edns.do_bit = self.config.dnssec.is_some();
         msg.cd = self.config.dnssec.is_some();
@@ -851,13 +740,9 @@ impl Resolver {
         })
     }
 
-    /// Whether a reply actually answers the query we sent: same transaction id,
-    /// and the echoed question matches the name we asked. With 0x20 on the name
-    /// check is case-sensitive — that is what turns the random casing into an
-    /// anti-spoofing signal; off, it is the ordinary case-insensitive compare.
-    ///
-    /// A mismatch is treated as no answer (a spoof, or a confused middlebox),
-    /// so the caller moves on to the next server rather than trusting it.
+    /// Whether a reply answers the query sent: same id, echoed question matches.
+    /// With 0x20 on the name compare is case-sensitive, which is what makes the
+    /// random casing an anti-spoofing signal. A mismatch counts as no answer.
     fn response_matches(&self, response: &DnsMessage, sent: &OutgoingQuery) -> bool {
         if response.id != sent.id {
             return false;
@@ -874,11 +759,6 @@ impl Resolver {
 
     /// Resolve by walking the delegation chain, following any CNAME chain the
     /// answer leads through.
-    ///
-    /// Note on threading: each hop is an `await` on a socket, so a resolution
-    /// from cold yields its task at every round trip (root + TLD +
-    /// authoritative, more with glueless delegations) rather than holding a
-    /// thread for the sum of them. `rdnsr` awaits this directly.
     async fn recurse(
         &self,
         query: &QuerySection,
@@ -911,18 +791,15 @@ impl Resolver {
             };
             let response = self.resolve_from_root(&step, state, 0).await?;
 
-            // A hop's denial records outlive its response: only the last hop's
-            // authority section is returned, and a wildcard-expanded CNAME
-            // earlier in the chain still owes the NSEC that came with it.
+            // Only the last hop's authority section is returned, but a
+            // wildcard-expanded CNAME earlier in the chain still owes its NSEC.
             if self.config.dnssec.is_some() {
                 state.record_denials(&response.authorities);
             }
 
-            // Keep only records that belong to the chain we actually asked
-            // about — the name in hand, plus whatever a CNAME we have accepted
-            // points at. A server volunteering records for unrelated names is
-            // trying to get them into our cache, and `rdnsr` caches whatever we
-            // return here.
+            // Keep only records on the chain asked about. Records volunteered
+            // for unrelated names are cache-poisoning attempts, and `rdnsr`
+            // caches whatever is returned here.
             for rr in &response.answers {
                 if !chain.contains(&normalize(&rr.name)) {
                     continue;
@@ -930,7 +807,6 @@ impl Resolver {
                 answers.push(rr.clone());
                 if rr.rdata.rtype() == rt::CNAME {
                     if let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() {
-                        // Extends the chain within this same response.
                         chain.insert(normalize(&target));
                     }
                 }
@@ -970,9 +846,9 @@ impl Resolver {
     /// One name's worth of delegation walking: start at the root hints and
     /// follow referrals until a server answers authoritatively.
     ///
-    /// `depth` counts *nested* resolutions — looking up a nameserver's address
-    /// re-enters here — and is capped separately from the query budget so a
-    /// chain of glueless delegations cannot recurse without bound.
+    /// `depth` counts *nested* resolutions — a nameserver address lookup
+    /// re-enters here — capped separately so glueless chains cannot recurse
+    /// without bound.
     async fn resolve_from_root(
         &self,
         query: &QuerySection,
@@ -986,21 +862,15 @@ impl Resolver {
             )));
         }
 
-        // Start as far down the tree as we already know how to, rather than at
-        // the root every time.
-        //
-        // Validating narrows that: a shortcut past a zone cut is also a
-        // shortcut past the DS records at it, and the chain cannot be walked
-        // through a gap. So when DNSSEC is on we only skip ahead to a zone
-        // whose keys are already validated — from there every cut below is
-        // still crossed, and still recorded.
+        // Start as far down the tree as already known. Validating narrows that:
+        // a shortcut past a zone cut skips its DS records, so only zones whose
+        // keys are already validated may be jumped to.
         if let Some((zone, servers)) = self.best_start(&query.qname) {
             match self.walk(query, state, depth, zone.clone(), servers).await {
                 Ok(response) => return Ok(response),
                 Err(_) => {
-                    // A cached delegation goes stale: servers get renumbered,
-                    // zones move. Drop it and start over from the root rather
-                    // than failing a query on our own bookkeeping.
+                    // Cached delegations go stale; restart from the root rather
+                    // than fail a query on our own bookkeeping.
                     self.delegations.forget(&zone);
                 }
             }
@@ -1038,31 +908,25 @@ impl Resolver {
         let qname = normalize(&query.qname);
         let qname_labels = label_count(&qname);
 
-        // The zone whose servers we are currently talking to. Everything they
-        // tell us is judged against this: a server for `com.` may delegate
-        // `example.com.` but may not answer for `example.org.`.
+        // The zone whose servers we are talking to; bailiwick is judged against
+        // it. A server for `com.` may delegate `example.com.` but may not
+        // answer for `example.org.`.
         let mut zone = start_zone;
         let mut servers = start_servers;
 
-        // How many labels of `qname` the next minimized query reveals: begin one
-        // label below the zone we start from — asking `com.`'s servers for
-        // `example.com.`, not the whole name — and deepen a label at a time.
-        // Ignored when minimization is off (the loop uses the full name then).
+        // Labels of `qname` the next minimized query reveals: one below the
+        // starting zone, deepening a label at a time.
         let mut sent_labels = label_count(&zone) + 1;
 
-        // Each iteration is one upstream query, so the budget is the real limit;
-        // this cap only bounds a pathological spin. Minimization can add a probe
-        // per non-delegated (empty-non-terminal) label, hence the `+ qname_labels`.
+        // The budget is the real limit; this only bounds a pathological spin.
+        // Minimization can add a probe per empty-non-terminal label, hence
+        // `+ qname_labels`.
         let max_steps = self.config.max_delegations + qname_labels + 1;
-        // Minimized probes sent so far, against RFC 9156 §2.3's
-        // MAX_MINIMISE_COUNT. Counted rather than derived from `sent_labels`,
-        // because a referral can move `zone` several labels at once and it is
-        // the number of *round trips spent minimizing* that the ceiling bounds.
+        // Counted rather than derived from `sent_labels`: a referral can move
+        // `zone` several labels at once, and MAX_MINIMISE_COUNT bounds round
+        // trips spent minimizing.
         let mut minimized_probes = 0usize;
         for _ in 0..max_steps {
-            // With minimization off — or once the ceiling is reached — always
-            // the full name; otherwise the tracked depth, capped at the full
-            // name.
             let minimizing =
                 self.config.qname_minimization && minimized_probes < MAX_MINIMISE_COUNT;
             let labels = if minimizing {
@@ -1076,10 +940,9 @@ impl Resolver {
                 minimized_probes += 1;
             }
 
-            // Intermediate probes ask for A, which a zone cut answers with a
-            // referral and a plain in-zone name answers with NODATA — telling
-            // the two apart without disclosing the leaf. The final query uses
-            // the type actually wanted.
+            // A zone cut answers the A probe with a referral, a plain in-zone
+            // name with NODATA — telling the two apart without disclosing the
+            // leaf.
             let step = QuerySection {
                 qname: sname.clone(),
                 qtype: if is_final {
@@ -1097,9 +960,8 @@ impl Resolver {
                 )));
             };
 
-            // A referral advances us to the child zone, whether the probe was
-            // final or intermediate. Judged against the full `qname` for
-            // bailiwick even when we asked a shorter name.
+            // Bailiwick is judged against the full `qname` even when a shorter
+            // name was asked.
             if let Some(Referral {
                 zone: child_zone,
                 ns_names,
@@ -1107,16 +969,14 @@ impl Resolver {
                 ttl,
             }) = self.extract_referral(&response, &zone, &qname)?
             {
-                // Read the parent's side of the cut before moving below it.
-                // This is the only pass where the DS records — and the NSEC
-                // that would prove there are none — are in front of us.
+                // The only pass where the parent's DS — or the NSEC proving
+                // there is none — is in front of us.
                 if self.config.dnssec.is_some() {
                     state.record_cut(&child_zone, &response.authorities);
                 }
 
                 servers = if glue.is_empty() {
-                    // Glueless delegation: the referral named servers but gave no
-                    // usable addresses, so each one costs a resolution of its own.
+                    // Glueless: each named server costs a resolution of its own.
                     self.resolve_nameserver_addresses(&ns_names, state, depth + 1)
                         .await?
                 } else {
@@ -1128,22 +988,17 @@ impl Resolver {
                         "no reachable nameserver for {child_zone}"
                     )));
                 }
-                // Remember it so the next query for anything in this zone can
-                // start here instead of at the root.
                 self.delegations.insert(&child_zone, servers.clone(), ttl);
-                // A referral may jump more than one label at once; resume one
-                // below wherever it landed.
+                // A referral may jump more than one label at once.
                 sent_labels = label_count(&child_zone) + 1;
                 zone = child_zone;
                 continue;
             }
 
             if is_final {
-                // An answer, or an authoritative "no" (NXDOMAIN / NODATA), ends
-                // the walk. Anything else — no answer, not authoritative, no
-                // referral — is a lame delegation and must not be passed off as
-                // a definitive "no such record", which an empty NOERROR reads
-                // as. Failing here becomes SERVFAIL, the honest answer.
+                // No answer, not authoritative and no referral is a lame
+                // delegation: an empty NOERROR would read as a definitive "no
+                // such record", so fail into SERVFAIL instead.
                 if !response.answers.is_empty() || response.authoritive {
                     return Ok(response);
                 }
@@ -1152,15 +1007,13 @@ impl Resolver {
                 )));
             }
 
-            // No referral on an *intermediate* probe.
+            // No referral on an intermediate probe.
             if response.rcode == ResponseCode::NoSuchDomain {
                 // The ancestor does not exist, so neither does the full name
-                // (RFC 8020 — NXDOMAIN means the whole subtree is empty).
+                // (RFC 8020).
                 return Ok(response);
             }
-            // Otherwise this label exists inside the current zone but is not a
-            // cut (a plain name, or an empty non-terminal answered NODATA), so
-            // ask the same servers one label deeper.
+            // The label exists in this zone but is not a cut; go one deeper.
             sent_labels = labels + 1;
         }
 
@@ -1245,19 +1098,10 @@ impl Resolver {
             return Ok(None);
         };
 
-        // Glue: addresses for those nameservers, carried in the additional
-        // section. Trust it only where the responder has standing to speak —
-        // that is, for names inside the zone *it* is authoritative for, not the
-        // zone it is delegating to.
-        //
-        // The distinction matters at the root: the referral to `com.` carries
-        // glue for `a.gtld-servers.net.`, which is not under `com.` at all.
-        // Requiring glue to be under the child zone would reject it, and the
-        // whole system would fail to bootstrap — resolving `gtld-servers.net.`
-        // needs `net.`, whose glue is also `gtld-servers.net.`. Judged against
-        // the responder's own zone (`.`, here) it is properly in bailiwick.
-        // A `com.` server, by contrast, may not hand us an address for
-        // `ns.example.org.`; that has to be resolved independently.
+        // Glue is trusted only where the responder has standing: names under
+        // the zone *it* serves, not the zone it delegates to. The root's `com.`
+        // referral carries glue for `a.gtld-servers.net.`, which is under
+        // neither `com.` nor resolvable without it.
         let mut glue = Vec::new();
         for rr in &response.additionals {
             let owner = normalize(&rr.name);
@@ -1290,17 +1134,11 @@ impl Resolver {
     }
 
     /// Resolve nameserver names to addresses, for delegations that came without
-    /// usable glue. Stops at the first name that yields an address: one working
-    /// nameserver is enough, and each extra lookup is charged to the budget.
+    /// usable glue. Stops at the first name that yields an address; each lookup
+    /// is charged to the budget.
     ///
-    /// **Both address families.** This asked for A alone, so a delegation whose
-    /// nameservers are IPv6-only and carry no glue was simply unresolvable —
-    /// while `query_server` binds a v6 socket correctly and `extract_referral`
-    /// takes AAAA glue happily, so every other part of the resolver was ready
-    /// for a name the lookup could never produce. AAAA is asked second: on a
-    /// dual-stacked nameserver the A answer ends the search and costs one query,
-    /// which is the common case, and the second lookup is charged to the budget
-    /// only when the first found nothing.
+    /// A first, then AAAA only if A found nothing: a dual-stacked nameserver
+    /// costs one query, and an IPv6-only glueless delegation still resolves.
     async fn resolve_nameserver_addresses(
         &self,
         ns_names: &[String],
@@ -1317,10 +1155,8 @@ impl Resolver {
                     qtype,
                     qclass: crate::QueryClass::IN,
                 };
-                // Box the recursive call: this closes the resolution cycle
-                // (resolve_from_root → walk → here → resolve_from_root), and an
-                // `async fn` future may not contain itself by value. Boxing
-                // stores a pointer instead, so the future's size stays finite.
+                // Boxed: this closes the resolution cycle, and an `async fn`
+                // future may not contain itself by value.
                 let Ok(response) = Box::pin(self.resolve_from_root(&lookup, state, depth)).await
                 else {
                     continue;
@@ -1355,13 +1191,10 @@ impl Resolver {
         upstream: &SocketAddr,
         out: &OutgoingQuery,
     ) -> ResolveResult<DnsMessage> {
-        // tokio's UdpSocket has no read timeout of its own, so the deadline is
-        // applied with `tokio::time::timeout` around the recv.
+        // tokio's UdpSocket has no read timeout of its own.
         let read_timeout = Duration::from_millis(self.config.timeout_ms / 2);
-        // Bind a socket of the same family as the target: a v4-wildcard socket
-        // cannot connect to a v6 address, which is what made AAAA glue and the
-        // v6 root hints unreachable before. The source port stays random
-        // (0.0.0.0:0 / [::]:0) — that randomness is anti-spoofing, so keep it.
+        // Same family as the target: a v4-wildcard socket cannot connect to a v6
+        // address. Port 0 keeps the source port random — that is anti-spoofing.
         let bind_addr = if upstream.is_ipv6() {
             "[::]:0"
         } else {
@@ -1370,32 +1203,25 @@ impl Resolver {
         let socket = UdpSocket::bind(bind_addr).await?;
         socket.connect(upstream).await?;
 
-        // Send query
         socket.send(&out.buf).await?;
 
-        // Receive response, sized to the payload we advertised via EDNS.
+        // Sized to the payload advertised via EDNS.
         let mut response_buf = vec![0; self.config.udp_payload_size as usize];
         let n = tokio::time::timeout(read_timeout, socket.recv(&mut response_buf)).await??;
 
         response_buf.truncate(n);
         let response = DnsMessage::try_from_bytes(&response_buf)?;
 
-        // Reject anything that isn't a reply to *this* query — wrong id, or a
-        // question that doesn't echo the name we sent (case included, when 0x20
-        // is on). The connected socket already filters by source address; this
-        // is the entropy an off-path spoofer additionally has to match.
+        // The connected socket filters by source address; the id and the echoed
+        // (0x20-cased) name are the entropy an off-path spoofer must also match.
         if !self.response_matches(&response, out) {
             return Err(ResolveError::no_response(format!(
                 "reply from {upstream} did not match the query"
             )));
         }
 
-        // RFC 1035 §4.2.1: a truncated answer must be retried over TCP. The
-        // retry stays on the *same* upstream — TC says "this answer doesn't fit
-        // in a datagram", not "this server is unhealthy", so moving on would
-        // just collect the same TC=1 from the next one. If the TCP attempt
-        // fails, the error propagates and the caller tries the next upstream
-        // with a fresh UDP query.
+        // RFC 1035 §4.2.1: retry a truncated answer over TCP, on the *same*
+        // upstream — TC is about the datagram, not the server's health.
         if response.truncation {
             return self.query_upstream_tcp(upstream, out).await;
         }
@@ -1403,13 +1229,10 @@ impl Resolver {
         Ok(response)
     }
 
-    /// Re-issue a query over TCP, using the RFC 1035 §4.2.2 length-prefixed
-    /// framing.
+    /// Re-issue a query over TCP, length-prefixed (RFC 1035 §4.2.2).
     ///
-    /// A response that is *still* truncated is returned as-is rather than
-    /// treated as an error: TCP is the last resort, so a TC=1 here means the
-    /// upstream genuinely cannot express the full RRset and the partial answer
-    /// plus the flag is more useful to the caller than a hard failure.
+    /// A still-truncated response is returned as-is: TCP is the last resort, so
+    /// the partial answer plus TC beats a hard failure.
     async fn query_upstream_tcp(
         &self,
         upstream: &SocketAddr,
@@ -1422,15 +1245,12 @@ impl Resolver {
             )));
         }
 
-        // Same budget as the UDP half, applied to each of connect, write and
-        // read via `tokio::time::timeout`.
+        // Applied to each of connect, write and read.
         let timeout = Duration::from_millis(self.config.timeout_ms / 2);
         let mut stream = tokio::time::timeout(timeout, TcpStream::connect(upstream)).await??;
 
-        // Prefix and message go out in one write so they share a segment. The
-        // length is checked rather than cast: a query we could not frame would
-        // go out with a wrapped prefix and the upstream would read it as a
-        // broken stream (`TODO.md` #17).
+        // One write so prefix and message share a segment. The length is checked
+        // rather than cast: a wrapped prefix reads as a broken stream.
         let framed = crate::framed(&out.buf)?;
         tokio::time::timeout(timeout, stream.write_all(&framed)).await??;
 
@@ -1448,9 +1268,8 @@ impl Resolver {
         tokio::time::timeout(timeout, stream.read_exact(&mut response_buf)).await??;
         let response = DnsMessage::try_from_bytes(&response_buf)?;
 
-        // The same reply check as the UDP path. TCP is not off-path spoofable,
-        // but a mismatched id or question still means a confused peer, not an
-        // answer to trust.
+        // TCP is not off-path spoofable, but a mismatched id or question still
+        // means a confused peer, not an answer to trust.
         if !self.response_matches(&response, out) {
             return Err(ResolveError::no_response(format!(
                 "TCP reply from {upstream} did not match the query"
@@ -1459,17 +1278,11 @@ impl Resolver {
         Ok(response)
     }
 
-    // -----------------------------------------------------------------
-    // DNSSEC validation
-    // -----------------------------------------------------------------
-
     /// Decide how much of `response` is authentic.
     ///
-    /// The shape of this is: work out which zones claim to have signed the
-    /// records in hand, establish a chain of trust down to each of those zones,
-    /// and only then check the signatures. Doing it the other way round — check
-    /// signatures first, chase the chain if they pass — would let an attacker
-    /// choose the key that validates their own data.
+    /// Chain of trust first, signatures second. Checking signatures first and
+    /// chasing the chain only if they pass lets an attacker choose the key that
+    /// validates their own data.
     async fn validate(
         &self,
         query: &QuerySection,
@@ -1479,28 +1292,15 @@ impl Resolver {
     ) -> ValidationState {
         let now = current_unix_timestamp();
 
-        // Where the answer really ends, and whether the data asked for is there.
-        //
-        // `answers.is_empty()` was the old test and it is wrong for every answer
-        // reached through an alias: `recurse` returns the accumulated CNAME chain
-        // in `answers`, so for `www.example.com CNAME cdn.example.net` where the
-        // target has no AAAA, the answer section holds the alias and nothing else.
-        // Not empty, so the response was treated as positive: the authority
-        // section was never signature-verified, `check_denial` never ran, and
-        // validation fell through to Secure. Strip or forge the terminal
-        // NODATA/NXDOMAIN after any legitimate CNAME and `rdnsr` set AD on it and
-        // cached it as validated — a downgrade relative to the non-CNAME path,
-        // which handled this correctly.
-        //
-        // RFC 4035 §5: a validator MUST authenticate negative responses; §5.4
-        // keys the proof to the name actually denied, which after a chain is the
-        // end of the chain and not the name asked about.
+        // "Negative" is not `answers.is_empty()`: a CNAME chain ending without
+        // the queried type is a negative answer with a non-empty answer section.
+        // RFC 4035 §5.4 keys the proof to the name actually denied, which after a
+        // chain is the end of the chain, not the name asked about.
         let shape = cname_chain_shape(&query.qname, query.qtype, &response.answers);
         let denied_name = match &shape {
             ChainShape::Intact { final_name } => final_name.clone(),
-            // A broken chain is judged further down, after the signatures, so
-            // that an unsigned zone still reads Insecure rather than Bogus. Until
-            // then the question's own name is the only one worth speaking about.
+            // Judged after the signatures, so an unsigned zone still reads
+            // Insecure rather than Bogus.
             ChainShape::Broken(_) => normalize(&query.qname),
         };
         let holds_the_answer = response
@@ -1509,11 +1309,8 @@ impl Resolver {
             .any(|rr| query.qtype.matches(rr.rdata.rtype()) && names_equal(&rr.name, &denied_name));
         let negative = !holds_the_answer;
 
-        // A negative answer carries its proof in the authority section, so that
-        // has to be validated too — and the answer section still has to be
-        // validated with it, because a CNAME-terminated "no" hands the client a
-        // chain of real records alongside the denial. Validating only one of the
-        // two sections is how half an answer goes out authenticated.
+        // Both sections: the proof is in the authority section, but a
+        // CNAME-terminated "no" also hands the client real records.
         let mut records: Vec<ResourceRecord> = response.answers.clone();
         if negative {
             records.extend(response.authorities.iter().cloned());
@@ -1527,10 +1324,8 @@ impl Resolver {
             }
         }
 
-        // Nothing is signed. That is either a genuinely unsigned zone — fine,
-        // and the chain walk will prove it — or a signed zone whose signatures
-        // were stripped in flight, which is not fine at all. Walking towards
-        // the name is what tells the two apart.
+        // Nothing signed is either an unsigned zone or a signed one stripped in
+        // flight; only the chain walk tells the two apart.
         if signers.is_empty() {
             let mut keys = KeyStore::new();
             return match self
@@ -1552,8 +1347,8 @@ impl Resolver {
                 .await
             {
                 ValidationState::Secure => {}
-                // The chain to a signer ends in an unsigned zone, so its
-                // signature means nothing and cannot be held against it.
+                // The chain ends in an unsigned zone, so the signature means
+                // nothing and cannot be held against it either.
                 other => return other,
             }
         }
@@ -1564,41 +1359,29 @@ impl Resolver {
             return verdict.state;
         }
 
-        // A signature over a denial only says the records are authentic; it
-        // does not say they deny what we asked about. That check is separate,
-        // and skipping it lets a valid NSEC from elsewhere in the zone stand in
-        // for a proof it does not make.
+        // A signature over a denial says the records are authentic, not that
+        // they deny what was asked; without this check a valid NSEC from
+        // elsewhere in the zone stands in for a proof it does not make.
         if negative {
             // A chain that is not a chain must not be laundered into a denial:
-            // if the answer holds records that are not on the path from the
-            // question, the "final name" they lead to is not one we asked about.
+            // its "final name" is not one we asked about.
             if let ChainShape::Broken(why) = shape {
                 return ValidationState::Bogus(why);
             }
             return self.check_denial(query, &denied_name, response);
         }
 
-        // The same gap on the positive side: a wildcard's signature verifies at
-        // every name that wildcard could expand to, so a verified answer at one
-        // of them is not yet an answer *about* that name. The denial that makes
-        // it one may have arrived with an earlier hop of a CNAME chase, which is
-        // why `state.denials` is offered alongside this response's own authority
-        // section.
-        // And the shape of the answer, independently of its signatures. Every
-        // RRset here verifies under the keys of the zone that owns it, which says
-        // each record is authentic and nothing about whether together they are the
-        // chain from this question to its answer: a genuine CNAME beside a genuine
-        // A record for an unrelated name is two valid RRsets and no chain, and a
-        // client that reads "the A record in the answer" has been handed an
-        // address for a name nobody asked about.
-        //
-        // The resolver's own `chain` filter makes that unlikely while it is
-        // fetching, hop by hop. This check does not depend on having done the
-        // fetching: it holds for an answer that arrived whole from a forwarder too.
+        // Shape, independently of signatures: a genuine CNAME beside a genuine A
+        // for an unrelated name is two valid RRsets and no chain. Checked here
+        // rather than in `recurse`'s per-hop filter so it also covers an answer
+        // that arrived whole from a forwarder.
         if let ChainShape::Broken(why) = shape {
             return ValidationState::Bogus(why);
         }
 
+        // A wildcard's signature verifies at every name it could expand to, so a
+        // verified answer is not yet an answer *about* the name asked. The denial
+        // that makes it one may have arrived on an earlier hop of a CNAME chase.
         if !verdict.wildcards.is_empty() {
             let mut proofs = response.authorities.clone();
             proofs.extend(state.denials.iter().cloned());
@@ -1626,16 +1409,14 @@ impl Resolver {
             return ValidationState::Indeterminate(format!("no trust anchor covers {target}"));
         };
 
-        // Resume as deep as we already trust, rather than re-walking from the
-        // anchor every time. This has to use the same rule `best_start` used to
-        // pick where the *resolution* began, or the two disagree: the walk
-        // would skip a zone cut whose DS this loop then goes looking for, and
-        // an answer that validated a moment ago would come back bogus.
+        // Resume as deep as already trusted, by the same rule `best_start` used
+        // to pick where the resolution began. Disagreeing makes the walk skip a
+        // zone cut whose DS this loop then goes looking for.
         let (mut zone, mut ds_set) = (anchor_zone.clone(), anchor_ds);
         for candidate in ancestors(&normalize(target)) {
             if is_at_or_under(&candidate, &anchor_zone) && self.keys.holds(&candidate) {
-                // Its keys are cached, so they were validated to the anchor
-                // once already and the DS that got us there is not needed again.
+                // Cached keys were validated to the anchor already, so the DS
+                // that got us there is not needed again.
                 zone = candidate;
                 ds_set = Vec::new();
                 break;
@@ -1645,7 +1426,6 @@ impl Resolver {
         // A chain is at most one zone cut per label, plus the anchor.
         let max_steps = label_count(target) + 2;
         for _ in 0..max_steps {
-            // Establish this zone's keys, from cache if we have already done so.
             let zone_keys = match self.keys.get(&zone) {
                 Some(cached) => cached,
                 None => {
@@ -1672,10 +1452,9 @@ impl Resolver {
                 return ValidationState::Secure;
             }
 
-            // Step down to the next zone cut on the way to the target.
             let Some(evidence) = state.next_cut_below(&zone, target).cloned() else {
-                // No cut below this zone on the path: the target is served out
-                // of this very zone, so its keys are the ones that signed it.
+                // No cut below: the target is served out of this zone, so these
+                // keys are the ones that signed it.
                 return ValidationState::Secure;
             };
 
@@ -1718,11 +1497,9 @@ impl Resolver {
         Ok((response.answers, ttl))
     }
 
-    /// For a negative answer, check that the NSEC/NSEC3 records actually deny
-    /// what was asked — not merely that they are correctly signed.
-    /// `denied_name` is the name the proof has to be about, which after a CNAME
-    /// chain is the end of the chain rather than the name asked about
-    /// (RFC 4035 §5.4). For an answer with no aliases in it the two are the same.
+    /// Check that the NSEC/NSEC3 records deny what was asked, not merely that
+    /// they are correctly signed. `denied_name` is the end of the CNAME chain,
+    /// not the name asked about (RFC 4035 §5.4).
     fn check_denial(
         &self,
         query: &QuerySection,
@@ -1732,8 +1509,8 @@ impl Resolver {
         let nsecs = nsecs_in(&response.authorities);
         let nsec3s = nsec3s_in(&response.authorities);
         if nsecs.is_empty() && nsec3s.is_empty() {
-            // A signed zone that answers "no" without proof. Common enough from
-            // a middlebox; not something to hand on as authenticated.
+            // A signed zone answering "no" without proof; common from a
+            // middlebox, but not something to pass on as authenticated.
             return ValidationState::Bogus(format!(
                 "{denied_name} was denied without an NSEC or NSEC3 proof"
             ));
@@ -1771,19 +1548,16 @@ impl Resolver {
 
 /// Absolute, lowercased form — the shape every comparison here assumes.
 ///
-/// The rule lives in [`crate::utils::absolute_lowered`]; this is the owning
-/// spelling of it, for the call sites that keep the result as a map key or a
-/// set member. A site that only wants to *compare* two names wants
-/// [`crate::utils::names_equal`] instead, which does not allocate at all —
-/// telling those two apart is most of what `TODO.md` #13b was.
+/// The owning spelling of [`crate::utils::absolute_lowered`], for call sites
+/// that keep the result as a map key or set member. To merely *compare* two
+/// names use [`crate::utils::names_equal`], which does not allocate.
 fn normalize(name: &str) -> String {
     absolute_lowered(name).into_owned()
 }
 
-/// Scramble the case of each ASCII letter in `name`, leaving the labels
-/// themselves (and any non-letter bytes) untouched. DNS treats names
-/// case-insensitively (RFC 4343), so this changes nothing about what is asked —
-/// only the bit pattern on the wire, which a reply must echo back (0x20).
+/// Scramble the case of each ASCII letter in `name`. Names are compared
+/// case-insensitively (RFC 4343), so this changes only the bit pattern on the
+/// wire — which a reply must echo back (0x20).
 fn randomize_case(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -1798,10 +1572,8 @@ fn randomize_case(name: &str) -> String {
         .collect()
 }
 
-/// The `labels`-deep suffix of `qname`: the last `labels` labels of it, plus the
-/// root dot. Used to build a QNAME-minimized query — `example.com.` from
-/// `www.example.com.` at two labels. Zero labels is the root; asking for more
-/// than the name has yields the whole name.
+/// The last `labels` labels of `qname`, plus the root dot. Zero labels is the
+/// root; asking for more than the name has yields the whole name.
 fn suffix_with_labels(qname: &str, labels: usize) -> String {
     let n = normalize(qname);
     if labels == 0 {
@@ -1814,13 +1586,6 @@ fn suffix_with_labels(qname: &str, labels: usize) -> String {
     format!("{}.", parts[parts.len() - labels..].join("."))
 }
 
-// `is_subdomain` was here, and was the fifth implementation of "is this name at
-// or under that one" in this workspace. It normalized both sides into fresh
-// `String`s and then built a `format!(".{ancestor}")` — three allocations to
-// answer a question about bytes — where `utils::is_at_or_under` compares in
-// place and handles the trailing dot on either side. Same answers, including
-// the `notexample.com.` boundary case both got right (`TODO.md` #13b).
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1828,10 +1593,8 @@ mod tests {
     use crate::Serial;
     use crate::Ttl;
     use crate::{ParsedRecord, QueryClass, RecordData, ResourceRecord};
-    // The fake servers below are blocking `std::net`, run on their own OS
-    // threads; these explicit imports shadow the async tokio `UdpSocket` /
-    // `TcpStream` that `super::*` would otherwise bring in, and restore the
-    // blocking `Read`/`Write` traits the resolver no longer imports.
+    // The fake servers below are blocking `std::net` on their own OS threads;
+    // these shadow the async tokio `UdpSocket`/`TcpStream` from `super::*`.
     use std::io::{Read, Write};
     use std::net::{TcpListener, UdpSocket};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1856,8 +1619,8 @@ mod tests {
         }
     }
 
-    /// Recursing, but starting from a fake root instead of the real one. The
-    /// whole fake hierarchy shares `root.port()` — see [`bind_hierarchy`].
+    /// Recursing from a fake root. The whole fake hierarchy shares
+    /// `root.port()` — see [`bind_hierarchy`].
     fn recursing_config(root: SocketAddr) -> ResolverConfig {
         ResolverConfig {
             mode: ResolverMode::Recurse,
@@ -1899,13 +1662,11 @@ mod tests {
     }
 
     /// Bind a UDP socket and a TCP listener on the *same* 127.0.0.1 port, so one
-    /// `SocketAddr` can stand in for a real upstream on both transports.
+    /// `SocketAddr` stands in for an upstream on both transports.
     ///
-    /// Deliberately scans fixed ports below the ephemeral range rather than
-    /// asking for port 0: Windows hands out ephemeral ports sequentially from a
-    /// rotating cursor and carves exclusion blocks (hundreds of ports wide, and
-    /// different ones per protocol) out of that range, so "bind 0 on one
-    /// protocol, match it on the other" can fail for every attempt in a row.
+    /// Scans fixed ports rather than asking for port 0: Windows carves
+    /// per-protocol exclusion blocks out of the ephemeral range, so "bind 0 on
+    /// one protocol, match it on the other" can fail every attempt in a row.
     fn bind_fake_upstream() -> (UdpSocket, TcpListener, SocketAddr) {
         let start = 20_000 + (rand::random::<u16>() % 20_000);
         for offset in 0..500u16 {
@@ -2039,20 +1800,6 @@ this line has no record and is skipped
         assert!(result.is_err());
     }
 
-    // `test_bailiwick_helpers` was here, and once `is_subdomain` and
-    // `names_equal` became `utils`', it was asserting things about another
-    // module's functions that `utils::a_name_is_under_a_zone_only_at_a_label_boundary`
-    // and `names_are_equal_by_ascii_folding_and_an_optional_trailing_dot`
-    // already assert — including the `notexample.com.` case both were written
-    // for. A second copy of a test drifts exactly as a second copy of the code
-    // does (`CLAUDE.md` §7); what belongs here is a test of what this module
-    // *decides* with the answer, and `test_out_of_bailiwick_referral_is_not_followed`
-    // and `test_out_of_bailiwick_glue_is_ignored` further down are that.
-
-    // ---------------------------------------------------------------------
-    // Recursion: a fake root / TLD / authoritative hierarchy in-process.
-    // ---------------------------------------------------------------------
-
     /// A UDP server that answers with whatever the closure builds. Stops when
     /// the returned guard is dropped, so tests don't leak threads.
     struct FakeServer {
@@ -2073,9 +1820,8 @@ this line has no record and is skipped
     /// Bind `count` sockets on distinct loopback addresses that all share one
     /// port.
     ///
-    /// They have to share a port because glue records carry an address and no
-    /// port: a resolver always dials `server_port`, so a fake hierarchy can only
-    /// be distinguished by address. Windows does allow binding 127.0.0.2 and up.
+    /// One port because glue carries no port: the resolver always dials
+    /// `server_port`, so the fake servers differ only by address.
     fn bind_hierarchy(count: usize) -> Vec<UdpSocket> {
         assert!(count <= 8, "loopback aliases used here stop at 127.0.0.8");
         let start = 20_000 + (rand::random::<u16>() % 20_000);
@@ -2187,7 +1933,7 @@ this line has no record and is skipped
             .unwrap_or_default()
     }
 
-    /// The whole point: root → TLD → authoritative, following glue at each step.
+    /// Root → TLD → authoritative, following glue at each step.
     #[tokio::test]
     async fn test_recursion_follows_the_delegation_chain() {
         let mut socks = bind_hierarchy(3).into_iter();
@@ -2271,11 +2017,8 @@ this line has no record and is skipped
     }
 
     /// Glue is trusted only for names inside the responding server's own zone.
-    ///
-    /// Demonstrated below the root, because the root is authoritative for `.`
-    /// and so *everything* it offers is in bailiwick — that is exactly what lets
-    /// the root hand out `a.gtld-servers.net.` addresses for the `com.`
-    /// delegation. A TLD server has no such latitude.
+    /// Demonstrated below the root, which is authoritative for `.` and so has
+    /// everything in bailiwick.
     #[tokio::test]
     async fn test_out_of_bailiwick_glue_is_ignored() {
         let mut socks = bind_hierarchy(3).into_iter();
@@ -2429,10 +2172,9 @@ this line has no record and is skipped
         let tld_addr = tld_sock.local_addr().unwrap();
         let auth_addr = auth_sock.local_addr().unwrap();
 
-        // Authoritative for example.test. (the target), and also holds the
-        // address of the nameserver name (which lives in a different zone:
-        // ns.hoster.test.). The nameserver lookup has to answer with this
-        // server's *real* address — the resolver dials whatever the A says.
+        // Authoritative for example.test., and also holds the A for
+        // ns.hoster.test. — which must be this server's real address, since the
+        // resolver dials whatever the A says.
         let IpAddr::V4(auth_ip) = auth_addr.ip() else {
             unreachable!("bound on IPv4 loopback")
         };
@@ -2444,10 +2186,8 @@ this line has no record and is skipped
                 authoritative(q, vec![a_record(&name, [192, 0, 2, 7])])
             }
         });
-        // The TLD delegates both `example.test.` (glueless — its nameserver
-        // ns.hoster.test. is outside the example.test. zone, so no glue is
-        // offered) and `hoster.test.` (with glue), so looking up the
-        // nameserver's address can succeed.
+        // `example.test.` glueless (its nameserver is outside that zone) and
+        // `hoster.test.` with glue, so the nameserver lookup can succeed.
         let _tld = spawn_server(tld_sock, move |q| {
             let name = qname_of(q);
             if name.ends_with("hoster.test.") {
@@ -2517,17 +2257,12 @@ this line has no record and is skipped
         );
     }
 
-    // ---------------------------------------------------------------------
-    // QNAME minimization (RFC 9156)
-    // ---------------------------------------------------------------------
-
     /// A shared log of the QNAMEs a fake server was asked.
     type SeenLog = Arc<Mutex<Vec<String>>>;
 
     /// A root/TLD/auth hierarchy where each server records the QNAME it was
-    /// asked, so a test can assert what each learned. All three answer the same
-    /// way regardless of the QTYPE, which is what lets the intermediate NS
-    /// probes and the final query share one server.
+    /// asked. All three ignore the QTYPE, so the minimized probes and the final
+    /// query share one server.
     fn recording_hierarchy() -> (
         FakeServer,
         FakeServer,
@@ -2607,8 +2342,7 @@ this line has no record and is skipped
         );
     }
 
-    /// With minimization off, the full name goes to every server up the chain —
-    /// the behaviour the privacy fix replaces.
+    /// With minimization off, the full name goes to every server up the chain.
     #[tokio::test]
     async fn test_minimization_disabled_sends_the_full_name() {
         let (root, _tld, _auth, root_seen, tld_seen, _auth_seen) = recording_hierarchy();
@@ -2651,9 +2385,8 @@ this line has no record and is skipped
         let tld_addr = tld_sock.local_addr().unwrap();
         let auth_addr = auth_sock.local_addr().unwrap();
 
-        // Authoritative for example.test. The leaf www.sub.example.test. has an
-        // A; its parent sub.example.test. is an empty non-terminal, so an
-        // authoritative NODATA (no answers) comes back for anything else.
+        // The leaf www.sub.example.test. has an A; its parent is an empty
+        // non-terminal, so everything else gets an authoritative NODATA.
         let auth_seen = Arc::new(Mutex::new(Vec::new()));
         let a = auth_seen.clone();
         let _auth = spawn_server(auth_sock, move |q| {
@@ -2701,17 +2434,9 @@ this line has no record and is skipped
         );
     }
 
-    /// RFC 9156 §2.3 requires a MAX_MINIMISE_COUNT and recommends 10, and there
-    /// was none: the loop deepened a label at a time for as many labels as the
-    /// name had. A reverse-IPv6 PTR is 34 labels, so it cost about thirty round
-    /// trips and usually blew `query_budget` before reaching the leaf — failing
-    /// a name outright for being deep, when the whole point of the ceiling is to
-    /// fall back to the full QNAME, which still resolves.
-    ///
-    /// Also pins the probe QTYPE at **A**. RFC 9156 §2.3 recommends the type
-    /// "least likely to raise issues in DNS software and middleboxes" and names
-    /// A; NS is RFC 7816's superseded advice, which 9156 replaced for that
-    /// reason.
+    /// Past MAX_MINIMISE_COUNT (RFC 9156 §2.3, recommended 10) a deep name falls
+    /// back to the full QNAME rather than spending the budget one label at a
+    /// time. Also pins the probe QTYPE at A, not RFC 7816's superseded NS.
     #[tokio::test]
     async fn deep_names_stop_minimizing_at_the_rfc_9156_ceiling() {
         let mut socks = bind_hierarchy(3).into_iter();
@@ -2727,9 +2452,8 @@ this line has no record and is skipped
         // the ceiling, so the fallback has to happen for this to resolve.
         let leaf = "a.b.c.d.e.f.g.h.i.j.k.l.example.test.";
 
-        // Recorded at *every* server, because the ceiling bounds the minimized
-        // probes in the whole resolution and not per zone: the root is asked
-        // `test.` and the TLD `example.test.`, and those are two of the ten.
+        // Recorded at every server: the ceiling bounds minimized probes for the
+        // whole resolution, not per zone.
         let seen: Arc<Mutex<Vec<(String, Qtype)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let a = seen.clone();
@@ -2805,16 +2529,11 @@ this line has no record and is skipped
                 .all(|(_, qtype)| *qtype == MINIMIZED_PROBE_TYPE),
             "an intermediate probe asks for A, not NS (RFC 9156 §2.3): {minimized:?}"
         );
-        // The name is fourteen labels deep, so without the ceiling this would
-        // have been thirteen probes and then the leaf.
+        // Fourteen labels deep: without the ceiling, thirteen probes.
         assert!(minimized.len() < 13, "no fallback happened: {minimized:?}");
-        // And then the full name, once, with the type actually wanted.
+        // Then the full name, once, with the type actually wanted.
         assert_eq!(seen.iter().filter(|(name, _)| name == leaf).count(), 1);
     }
-
-    // ---------------------------------------------------------------------
-    // RTT-based server selection
-    // ---------------------------------------------------------------------
 
     #[test]
     fn test_rtt_store_orders_fastest_first() {
@@ -2896,9 +2615,8 @@ this line has no record and is skipped
             unreachable!("bound on IPv4 loopback")
         };
 
-        // The "bad" server answers instantly but always with the wrong
-        // transaction id, so its replies are rejected — an immediate failure
-        // rather than one that costs a timeout. It counts how often it is asked.
+        // Answers instantly with the wrong transaction id, so its replies are
+        // rejected without costing a timeout. Counts how often it is asked.
         let bad_hits = Arc::new(AtomicUsize::new(0));
         let bh = bad_hits.clone();
         let _bad = spawn_server(bad_sock, move |q| {
@@ -2910,8 +2628,8 @@ this line has no record and is skipped
         let _good = spawn_server(good_sock, move |q| {
             authoritative(q, vec![a_record(&qname_of(q), [192, 0, 2, 1])])
         });
-        // The root delegates example.test. to both, the bad server listed first
-        // so it is the one tried before any RTT is known.
+        // Bad server listed first, so it is the one tried before any RTT is
+        // known.
         let root = spawn_server(root_sock, move |q| {
             let mut resp = response_to(q);
             resp.authorities = vec![
@@ -2951,10 +2669,6 @@ this line has no record and is skipped
             "the failing server should be tried once, then skipped on later queries"
         );
     }
-
-    // ---------------------------------------------------------------------
-    // Delegation cache
-    // ---------------------------------------------------------------------
 
     #[test]
     fn test_ancestors_are_deepest_first() {
@@ -3038,8 +2752,7 @@ this line has no record and is skipped
         assert!(!entries.contains_key("a.test."));
     }
 
-    /// The point of the whole exercise: a second query for the same zone must
-    /// not go back to the root.
+    /// A second query for the same zone must not go back to the root.
     #[tokio::test]
     async fn test_second_query_does_not_revisit_the_root() {
         let mut socks = bind_hierarchy(2).into_iter();
@@ -3109,15 +2822,13 @@ this line has no record and is skipped
             )
         });
 
-        // Short timeout: this test deliberately talks to a black hole, and the
-        // point is the fallback, not how long we wait for the dead server.
+        // Short timeout: this deliberately talks to a black hole.
         let resolver = Resolver::new(ResolverConfig {
             timeout_ms: 300,
             ..recursing_config(root.addr)
         });
 
-        // Poison the cache with a server that will never answer: a discard
-        // address on the same port the fake hierarchy uses.
+        // Poison the cache with a server that will never answer.
         let dead: SocketAddr = format!("192.0.2.99:{}", root.addr.port()).parse().unwrap();
         resolver
             .delegations
@@ -3157,8 +2868,8 @@ this line has no record and is skipped
             udp.send_to(&out[..len], peer).unwrap();
         });
 
-        // TCP half: the real answer, length-prefixed. Returns the prefix the
-        // client sent and the length it claimed, so the test can check framing.
+        // TCP half: the real answer, length-prefixed. Returns the length the
+        // client claimed, so the test can check framing.
         let tcp_thread = thread::spawn(move || {
             let (mut stream, _) = tcp.accept().unwrap();
             let mut len_buf = [0u8; 2];
@@ -3188,9 +2899,7 @@ this line has no record and is skipped
         udp_thread.join().unwrap();
         let (claimed, tcp_qname) = tcp_thread.join().unwrap();
 
-        // The TCP retry carried the same question, correctly framed. Compared
-        // case-insensitively because 0x20 randomizes the casing on the wire
-        // (e.g. "ExAMPLe.coM."), which is the whole point of the feature.
+        // Compared case-insensitively: 0x20 randomizes the casing on the wire.
         assert!(
             claimed >= 12,
             "TCP length prefix {} is below a DNS header",
@@ -3201,7 +2910,6 @@ this line has no record and is skipped
             Some("example.com.".to_string())
         );
 
-        // And its answer, not the truncated one, is what came back.
         assert!(!answer.truncation);
         assert_eq!(answer.answers.len(), 1);
         assert_eq!(
@@ -3210,13 +2918,10 @@ this line has no record and is skipped
         );
     }
 
-    /// The inverse: a response that fits in a datagram must not touch TCP.
-    /// Nothing is listening on the TCP side of this port, so an attempted
-    /// fallback would fail the connect and turn into a resolve error.
+    /// A response that fits in a datagram must not touch TCP: nothing listens on
+    /// the TCP side here, so a stray fallback would fail the connect.
     #[tokio::test]
     async fn test_no_tcp_fallback_when_response_fits() {
-        // Take the pair and immediately release the TCP half, so we know for
-        // certain nothing is listening there to accept a stray fallback.
         let (udp, tcp, addr) = bind_fake_upstream();
         drop(tcp);
 
@@ -3323,12 +3028,8 @@ this line has no record and is skipped
         assert!(result.is_err());
     }
 
-    // ---------------------------------------------------------------------
-    // Reply validation: 0x20 case randomization and transaction id
-    // ---------------------------------------------------------------------
-
-    /// Flip the case of every ASCII letter, so the result is guaranteed to
-    /// differ from any input that has at least one letter.
+    /// Flip the case of every ASCII letter, so the result differs from any
+    /// input with at least one letter.
     fn flip_case(s: &str) -> String {
         s.chars()
             .map(|c| {
@@ -3375,9 +3076,8 @@ this line has no record and is skipped
         result
     }
 
-    /// With 0x20 on, a reply that does not echo the exact casing we sent — a
-    /// case-mangling middlebox, or an off-path spoofer that never saw it — is
-    /// rejected, so the resolve fails rather than trusting it.
+    /// With 0x20 on, a reply that does not echo the exact casing sent is
+    /// rejected — a case-mangling middlebox, or an off-path spoofer.
     #[tokio::test]
     async fn test_zero_x20_rejects_a_reply_with_mangled_case() {
         let result = resolve_against_mangling_upstream(test_config, flip_case, false).await;
@@ -3416,14 +3116,9 @@ this line has no record and is skipped
         );
     }
 
-    // ---------------------------------------------------------------------
-    // IPv6
-    // ---------------------------------------------------------------------
-
-    /// Reaching a server over IPv6: a v4-wildcard send socket cannot connect to
-    /// a v6 address, so this only works because `query_server` binds a socket of
-    /// the target's family — which is also what makes AAAA glue and the v6 root
-    /// hints usable.
+    /// Reaching a server over IPv6 works only because `query_server` binds a
+    /// socket of the target's family — the same thing that makes AAAA glue and
+    /// the v6 root hints usable.
     #[tokio::test]
     async fn test_forwarding_reaches_an_ipv6_upstream() {
         let udp = UdpSocket::bind("[::1]:0").expect("IPv6 loopback should be available");
@@ -3455,15 +3150,9 @@ this line has no record and is skipped
         );
     }
 
-    // ---------------------------------------------------------------------
-    // DNSSEC: a signed hierarchy, with real signatures, in-process
-    // ---------------------------------------------------------------------
-    //
-    // Port 53 is intercepted on this machine, so there is no live signed zone
-    // to point at and never was — which is exactly how the validator came to
-    // be written without a genuine signature ever reaching it. These tests
-    // sign with `ring` at run time and put the whole resolve path through it:
-    // root KSK/ZSK, a DS in each parent, and a signature over the answer.
+    // A signed hierarchy in-process: the tests below sign with `ring` at run
+    // time and put the whole resolve path through it — root KSK/ZSK, a DS in
+    // each parent, and a signature over the answer.
 
     use crate::dnssec_denial::build_type_bitmap;
     use crate::dnssec_test_util::{ds_record, TestZone};
@@ -3785,7 +3474,7 @@ this line has no record and is skipped
         vec![soa, soa_sig, nsec, nsec_sig]
     }
 
-    /// The authority section of a signed NXDOMAIN proved with **NSEC3**.
+    /// The authority section of a signed NXDOMAIN proved with NSEC3.
     ///
     /// Worth having end to end, because every NSEC3 test in this repo until now
     /// built its own records and handed them straight to the denial functions.
@@ -3797,9 +3486,9 @@ this line has no record and is skipped
     ///
     /// RFC 5155 §7.2.2 wants three things proved, and two records do it here:
     ///
-    /// - an NSEC3 **matching** the closest encloser, `example.test.`;
-    /// - an NSEC3 **covering** the next closer name, the queried name itself;
-    /// - an NSEC3 **covering** `*.example.test.`, since a wildcard could
+    /// - an NSEC3 matching the closest encloser, `example.test.`;
+    /// - an NSEC3 covering the next closer name, the queried name itself;
+    /// - an NSEC3 covering `*.example.test.`, since a wildcard could
     ///   otherwise have answered.
     ///
     /// The covering record spans everything between an all-zero and an all-ones
@@ -3940,15 +3629,10 @@ this line has no record and is skipped
     /// verifies is reported Bogus, and `rdnsr --dnssec-validate` fails closed
     /// and returns SERVFAIL.
     ///
-    /// Nothing on this path rejects or special-cases ANY: `rdnsr/src/main.rs`,
-    /// this module and `validation.rs` do not mention it at all, so a client
-    /// simply asking for it reaches the comparison. The answer here is the same
-    /// signed A RRset `test_signed_hierarchy_validates_as_secure` calls Secure —
-    /// the only thing that changed is the QTYPE on the question.
-    ///
-    /// This is the test `TODO.md` #13c asks for before the `Qtype`/`Rtype`
-    /// newtypes, because it is what decides whether the newtypes are fixing
-    /// something a client can provoke or merely tidying two `u16`s.
+    /// Nothing on this path rejects or special-cases ANY, so a client asking
+    /// for it reaches the comparison. The answer is the same signed A RRset
+    /// `test_signed_hierarchy_validates_as_secure` calls Secure; only the QTYPE
+    /// on the question changed.
     #[tokio::test]
     async fn an_any_query_is_a_positive_answer_and_must_not_be_read_as_a_denial() {
         let h = signed_hierarchy(signed_ds, signed_answer);
@@ -4386,8 +4070,8 @@ this line has no record and is skipped
         );
     }
 
-    /// **Strip the terminal denial after a legitimate CNAME and the answer used
-    /// to be handed to clients as authenticated.**
+    /// Strip the terminal denial after a legitimate CNAME and the answer used
+    /// to be handed to clients as authenticated.
     ///
     /// `let negative = response.answers.is_empty()` was the test, and a CNAME
     /// chain is not empty: `negative` was false, so the authority section was

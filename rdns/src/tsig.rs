@@ -1,14 +1,7 @@
 //! TSIG: authenticating a DNS message with a shared secret (RFC 8945).
 //!
-//! An address is not an identity. Where `--allow-transfer` trusts the network to
-//! say who is calling, TSIG proves it with a keyed MAC over the message, in both
-//! directions.
-//!
-//! The mechanism is a pseudo-record: a TSIG RR appended as the last record of the
-//! additional section, covering the message, so verifying means removing it again
-//! and hashing what is left. Almost everything here therefore works on bytes
-//! rather than on a parsed [`crate::DnsMessage`] — name compression is a choice,
-//! so a re-serialized message is not necessarily the bytes that were sent.
+//! Works on bytes, not a parsed [`crate::DnsMessage`]: name compression is a
+//! choice, so a re-serialized message is not the bytes that were sent.
 //!
 //! What the digest covers (RFC 8945 §4.3.3, §5.4.2):
 //!
@@ -18,18 +11,9 @@
 //! envelope:  2-byte length || previous MAC || message-without-TSIG || timers only
 //! ```
 //!
-//! where "TSIG variables" is the key name in canonical form, the class (ANY), the
-//! TTL (0), the algorithm name, the time signed, the fudge, the error, and the
-//! other data — and "timers only" is just the time signed and the fudge, which is
-//! what the messages after the first in a zone transfer are signed with (§5.3.1).
-//!
-//! The failure codes are not interchangeable and say different things to the peer:
-//! **BADKEY** — I do not know that key name; **BADSIG** — I know it and the MAC
-//! does not match; **BADTIME** — the MAC matched but your clock and mine disagree
-//! by more than the fudge, and here is my time so you can tell which of us is
-//! wrong. The first two go back unsigned (there is no key to sign with, or no
-//! reason to believe the sender holds it); BADTIME is signed, because the MAC did
-//! verify.
+//! "TSIG variables" is the key name, class (ANY), TTL (0), algorithm name, time
+//! signed, fudge, error and other data; "timers only" is the time signed and the
+//! fudge, used for every message after the first in a transfer (§5.3.1).
 
 use crate::dname::dname_to_bytes;
 use crate::error::{ConfigError, ConfigResult};
@@ -49,11 +33,8 @@ pub const DEFAULT_FUDGE: u16 = 300;
 /// NOTAUTH — the rcode every TSIG failure is reported with (RFC 8945 §5.3).
 pub const RCODE_NOTAUTH: u16 = 9;
 
-/// The MAC algorithms this implements.
-///
-/// HMAC-SHA256 is the one RFC 8945 §6 requires and the default here. HMAC-SHA1 is
-/// kept because a great deal of deployed configuration still names it; HMAC-MD5,
-/// which RFC 8945 deprecates, is deliberately absent.
+/// The MAC algorithms this implements. HMAC-MD5 is absent: deprecated by
+/// RFC 8945.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TsigAlgorithm {
     HmacSha1,
@@ -73,8 +54,8 @@ impl TsigAlgorithm {
         }
     }
 
-    /// Match a name from the wire or from configuration, with or without the
-    /// trailing dot and in any case — it is a domain name (RFC 4343).
+    /// Match a wire or configured name, with or without the trailing dot and in
+    /// any case (RFC 4343).
     pub fn from_name(name: &str) -> Option<Self> {
         let name = name.trim_end_matches('.').to_ascii_lowercase();
         match name.as_str() {
@@ -95,8 +76,8 @@ impl TsigAlgorithm {
         }
     }
 
-    /// The full MAC length in bytes. A shorter MAC than this is refused rather
-    /// than accepted as a truncation (see [`TsigError::BadTrunc`]).
+    /// The full MAC length in bytes. A shorter MAC is [`TsigError::BadTrunc`],
+    /// not an accepted truncation.
     pub fn mac_len(&self) -> usize {
         match self {
             TsigAlgorithm::HmacSha1 => 20,
@@ -109,43 +90,26 @@ impl TsigAlgorithm {
 
 /// What a TSIG key may rewrite through dynamic UPDATE (RFC 2136 §3.3).
 ///
-/// §3.3 fixes almost nothing — the mechanism is "implementation dependent" and
-/// only the REFUSED on failure is specified — so the shape below is this
-/// codebase's, following `CLAUDE.md` §16: the check hangs off the session that
-/// already knows which key verified.
-///
-/// Denied by default, the opposite of [`TsigKey::zones`], where an empty list
-/// means every zone. That default was left alone because narrowing it would stop
-/// every transfer on a working deployment at a binary upgrade. Neither half of
-/// that argument holds here: nothing had ever served an UPDATE, and an update
-/// rewrites the original where a transfer hands over a copy. Reusing the
-/// transfer scope would have given every existing (unscoped) key write access to
-/// every zone on the first release that dispatched an UPDATE.
-///
-/// Three states rather than a `Vec` with an overloaded empty case: "no zones" and
-/// "all zones" are the two answers furthest apart, and the compiler makes the
-/// caller name which one it meant.
+/// Denied by default, unlike the transfer scope: an update rewrites the
+/// original, so an unscoped key must not inherit write access. Three states
+/// rather than a `Vec` with an overloaded empty case.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum UpdatePolicy {
-    /// No zone, by any key holder. The default, and what every key configured
-    /// without an explicit update scope has.
+    /// No zone, by any key holder.
     #[default]
     Denied,
     /// These zone apexes, absolute and down-cased.
     Zones(Vec<String>),
     /// Every zone this server is authoritative for. Spelled `*` in a key spec,
-    /// so that granting it is something an operator typed.
+    /// so granting it is something an operator typed.
     Any,
 }
 
 impl UpdatePolicy {
     /// Whether this policy authorizes rewriting the zone at `apex`.
     ///
-    /// Against the *apex*, for the reason [`TsigKey::may_transfer`] gives: an
-    /// UPDATE names one zone in its Zone section (RFC 2136 §3.1) and every
-    /// change in it is confined to that zone by §3.4.1's prescan, so the apex is
-    /// the whole of what is being authorized. A rule matching anything less
-    /// specific would authorize more than it names.
+    /// Matched against the apex: an UPDATE names one zone (RFC 2136 §3.1), so a
+    /// rule matching anything less specific authorizes more than it names.
     pub fn allows(&self, apex: &str) -> bool {
         match self {
             UpdatePolicy::Denied => false,
@@ -156,8 +120,6 @@ impl UpdatePolicy {
 }
 
 impl std::fmt::Display for UpdatePolicy {
-    /// For the startup banner, where what a key may rewrite has to be readable
-    /// without cross-referencing the flag that set it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UpdatePolicy::Denied => write!(f, "no zones"),
@@ -170,30 +132,16 @@ impl std::fmt::Display for UpdatePolicy {
 /// A shared secret and the name it is known by.
 #[derive(Debug, Clone)]
 pub struct TsigKey {
-    /// The key name, absolute and down-cased — it is a domain name, and it is
-    /// hashed in canonical form, so the case it was configured in cannot matter.
+    /// The key name, absolute and down-cased: it is hashed in canonical form.
     pub name: String,
     pub algorithm: TsigAlgorithm,
     secret: Vec<u8>,
-    /// The zone apexes this key may transfer, absolute and down-cased.
-    ///
-    /// **Empty means every zone**, which is what every key used to mean whether
-    /// its holder was meant to have that or not: `answer_transfer` asked only
-    /// whether a session existed, so holding *any* key transferred *any* zone
-    /// and bypassed `--allow-transfer` entirely. Hand a per-customer key to one
-    /// partner and you handed them every zone on the server, including ones
-    /// whose ACL named nobody.
-    ///
-    /// Empty still means everything, deliberately: changing the default would
-    /// mean upgrading the binary silently stops every transfer on a working
-    /// deployment. What changes is that scoping is now *expressible* and an
-    /// unscoped key is *visible* — the startup banner names each key and what it
-    /// may transfer. Narrowing the default belongs with the config file, where an
-    /// operator is editing the whole policy at once rather than reading a
-    /// changelog. See `TODO.md` #9d.
+    /// The zone apexes this key may transfer, absolute and down-cased. Empty
+    /// means every zone, kept so a binary upgrade cannot stop every transfer
+    /// on a working deployment; the startup banner names each key's scope.
     zones: Vec<String>,
-    /// What this key may rewrite through dynamic UPDATE. See [`UpdatePolicy`]
-    /// for why this one denies by default where `zones` permits.
+    /// What this key may rewrite through dynamic UPDATE. Denies by default,
+    /// unlike `zones` — see [`UpdatePolicy`].
     update: UpdatePolicy,
 }
 
@@ -223,9 +171,8 @@ impl TsigKey {
 
     /// Whether this key authorizes a transfer of the zone at `apex`.
     ///
-    /// Checked against the *apex being transferred*, which is the only name that
-    /// matters: a transfer hands over a whole zone, so authorizing by anything
-    /// less specific than the zone itself authorizes more than it names.
+    /// Matched against the apex: a transfer hands over a whole zone, so anything
+    /// less specific authorizes more than it names.
     pub fn may_transfer(&self, apex: &str) -> bool {
         if self.zones.is_empty() {
             return true;
@@ -242,10 +189,8 @@ impl TsigKey {
 
     /// Whether this key authorizes a dynamic UPDATE of the zone at `apex`.
     ///
-    /// Separate from [`TsigKey::may_transfer`] and not derived from it: reading
-    /// a zone and rewriting it are two permissions, and a key granted one has
-    /// said nothing about the other. See [`UpdatePolicy`] for why the defaults
-    /// differ.
+    /// Not derived from [`TsigKey::may_transfer`]: reading a zone and rewriting
+    /// it are two permissions.
     pub fn may_update(&self, apex: &str) -> bool {
         self.update.allows(apex)
     }
@@ -256,10 +201,6 @@ impl TsigKey {
     }
 
     /// The zones this key is restricted to, or `None` if it is unrestricted.
-    ///
-    /// For the startup banner: an unscoped key is a policy decision and has to be
-    /// visible, because it is indistinguishable at run time from a scoped one
-    /// until the moment someone transfers a zone you did not mean to give them.
     pub fn zone_scope(&self) -> Option<&[String]> {
         if self.zones.is_empty() {
             None
@@ -268,35 +209,21 @@ impl TsigKey {
         }
     }
 
-    /// Parse `[algorithm:]name:base64secret[:transfer-zones[:update-zones]]`,
-    /// the first three fields being the shape `dig -y` uses.
+    /// Parse `[algorithm:]name:base64secret[:transfer-zones[:update-zones]]`;
+    /// the first three fields are the shape `dig -y` uses.
     ///
-    /// The algorithm defaults to HMAC-SHA256 when omitted, but a zone list
-    /// requires it spelled out: `name:secret:zones` and `alg:name:secret` are
-    /// both three fields, and the only alternative is guessing whether the first
-    /// field looks like an algorithm name.
-    ///
-    /// The fifth field is the update scope and needs no disambiguation, since
-    /// four fields already require the algorithm. Absent means
-    /// [`UpdatePolicy::Denied`], so a key that predates this keeps the
-    /// permissions it had.
-    ///
-    /// `*` in either list means every zone, which is what lets a key be
-    /// unrestricted for transfers and scoped for updates: the fourth field cannot
-    /// be left empty, because an empty *list* means every zone while an empty
-    /// field reads as a narrowing the operator typed.
-    ///
-    /// An unparsable spec is an error rather than a skip: a key the operator
-    /// believes is configured but is not would fail every transfer invisibly.
+    /// The algorithm defaults to HMAC-SHA256, but a zone list requires it spelled
+    /// out: `name:secret:zones` and `alg:name:secret` are both three fields. An
+    /// absent fifth field is [`UpdatePolicy::Denied`]; `*` in either list means
+    /// every zone. An unparsable spec is an error, not a skip.
     pub fn parse(spec: &str) -> ConfigResult<Self> {
         let parts: Vec<&str> = spec.split(':').collect();
         let named_algorithm = |alg: &str| {
             TsigAlgorithm::from_name(alg)
                 .ok_or_else(|| ConfigError::new(format!("unknown TSIG algorithm {alg:?}")))
         };
-        // `None` for "no field at all" rather than `""`, because an *empty*
-        // field has to be an error: it reads as a narrowing the operator typed,
-        // and an empty list means the opposite — every zone.
+        // `None` for "no field at all" rather than `""`: an empty field reads as
+        // a narrowing, and an empty list means the opposite.
         let (algorithm, name, secret, zones, updates) = match parts.as_slice() {
             [name, secret] => (TsigAlgorithm::HmacSha256, *name, *secret, None, None),
             [alg, name, secret] => (named_algorithm(alg)?, *name, *secret, None, None),
@@ -333,8 +260,7 @@ impl TsigKey {
             )));
         }
 
-        // An unrestricted transfer scope is the empty list, which is what `*`
-        // and an absent field both come back as.
+        // `*` and an absent field both give the empty list, i.e. unrestricted.
         let allowed = match zones {
             Some(list) => parse_key_zone_list(name, "transfer", list)?.unwrap_or_default(),
             None => Vec::new(),
@@ -354,20 +280,11 @@ impl TsigKey {
     }
 }
 
-/// One comma-separated zone list from a key spec: `None` for `*`, which means
-/// every zone, and the entries otherwise.
+/// One comma-separated zone list from a key spec: `None` for `*` (every zone),
+/// the entries otherwise. `field` names the list in the error.
 ///
-/// One function for both lists rather than the rule written twice, because the
-/// two differ only in what "every zone" is spelled as at the far end — and a
-/// second copy is where the empty-entry check would have gone missing
-/// (`CLAUDE.md` §7). `field` is in the message so the error says *which* list
-/// has the typo, which is the whole of what `TransferAcl::parse_named` cost and
-/// bought.
-///
-/// An empty entry — a trailing comma, or a bare trailing colon — means the
-/// operator wrote something they did not mean. Refusing beats silently narrowing
-/// the list, and beats silently *widening* it, which is what an empty list means
-/// for transfers.
+/// An empty entry is refused: silently it would narrow the list, or widen it to
+/// everything, which is what an empty transfer list means.
 fn parse_key_zone_list(name: &str, field: &str, list: &str) -> ConfigResult<Option<Vec<String>>> {
     if list.trim() == "*" {
         return Ok(None);
@@ -408,9 +325,8 @@ impl TsigKeyring {
 
     /// The key of that name, matched case-insensitively as a domain name.
     ///
-    /// The algorithm has to agree too: a key name is not a licence to use it with
-    /// whatever algorithm the sender prefers, and answering BADKEY for a mismatch
-    /// is what stops a peer from downgrading SHA-256 to SHA-1 by asking.
+    /// The algorithm has to agree too: BADKEY for a mismatch stops a peer
+    /// downgrading SHA-256 to SHA-1 by asking.
     pub fn get(&self, name: &str, algorithm: TsigAlgorithm) -> Option<&TsigKey> {
         let name = canonical_key_name(name);
         self.keys
@@ -431,17 +347,10 @@ impl TsigKeyring {
         self.keys.iter()
     }
 
-    /// One line per key: its name, what it may transfer, and what it may
-    /// rewrite.
+    /// One line per key: name, transfer scope, update scope. Printed at startup,
+    /// so that "this key can transfer everything" is a visible decision.
     ///
-    /// Printed at startup because "this key can transfer everything" is a
-    /// decision, and an undisplayed decision is one nobody reviews.
-    ///
-    /// The update scope is named only when it is not [`UpdatePolicy::Denied`],
-    /// which is every key until an operator grants one. The banner would
-    /// otherwise carry "updates no zones" for every key on every server that has
-    /// never used dynamic UPDATE — noise that trains the reader to skip the line
-    /// where the interesting case appears.
+    /// The update scope is named only when it is not [`UpdatePolicy::Denied`].
     pub fn describe(&self) -> String {
         self.keys
             .iter()
@@ -564,15 +473,14 @@ impl Tsig {
 /// puts in the record's error field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TsigError {
-    /// The MAC does not match: the sender does not hold this key, or something
-    /// changed the message on the way.
+    /// The MAC does not match: wrong key, or the message changed on the way.
     BadSig,
     /// No such key name (or not with that algorithm).
     BadKey,
     /// The MAC matched but the clocks disagree by more than the fudge.
     BadTime,
-    /// The MAC was shorter than the algorithm's output. Accepting a truncated MAC
-    /// is a policy this server does not have.
+    /// The MAC was shorter than the algorithm's output. Truncated MACs are not
+    /// accepted.
     BadTrunc,
     /// The record itself did not parse.
     FormErr,
@@ -585,8 +493,8 @@ impl TsigError {
             TsigError::BadKey => 17,
             TsigError::BadTime => 18,
             TsigError::BadTrunc => 22,
-            // Not a TSIG error code: a malformed record is a format error about
-            // the message, and the record's error field stays 0.
+            // Not a TSIG error code: a malformed record is FORMERR about the
+            // message, and the record's error field stays 0.
             TsigError::FormErr => 0,
         }
     }
@@ -604,7 +512,7 @@ impl TsigError {
 
 /// What checking an incoming message concluded.
 pub enum TsigCheck {
-    /// No TSIG at all. Ordinary, and for most servers most of the time.
+    /// No TSIG at all.
     Unsigned,
     /// It verified. The session is what a reply is signed with.
     Verified(TsigSession),
@@ -614,15 +522,14 @@ pub enum TsigCheck {
 
 /// A verified request, and the state a reply needs.
 ///
-/// Holds the request's MAC because a response is signed over it — that binding is
-/// what stops a reply to one question being replayed as the reply to another.
+/// Holds the request's MAC because a response is signed over it: that binding
+/// stops a reply to one question being replayed as the reply to another.
 pub struct TsigSession {
     key: TsigKey,
-    /// The MAC of the request, or of the previous envelope once a transfer has
-    /// started. RFC 8945 §5.3.1 chains them.
+    /// The request's MAC, or the previous envelope's once a transfer has started
+    /// (RFC 8945 §5.3.1 chains them).
     previous_mac: Vec<u8>,
-    /// Whether the first message of the exchange has been signed. Subsequent ones
-    /// hash only the timers.
+    /// Whether the first message has been signed. Later ones hash only timers.
     first_signed: bool,
     original_id: u16,
 }
@@ -635,32 +542,23 @@ impl TsigSession {
 
     /// Whether the key that authenticated this request may transfer `apex`.
     ///
-    /// On the session rather than reached through the keyring by name, because
-    /// the session *is* the answer to "which key was this" — looking the name up
-    /// again would be a second chance to get it wrong, and a key name is
-    /// attacker-supplied until the MAC verifies.
+    /// On the session, not looked up by name: a key name is attacker-supplied
+    /// until the MAC verifies.
     pub fn may_transfer(&self, apex: &str) -> bool {
         self.key.may_transfer(apex)
     }
 
     /// Whether the key that authenticated this request may rewrite `apex`
-    /// through dynamic UPDATE (RFC 2136 §3.3).
-    ///
-    /// On the session for the same reason as [`TsigSession::may_transfer`], and
-    /// it is worth restating because this is the more dangerous of the two: the
-    /// session *is* the answer to "which key was this", and a key name in a
-    /// request is attacker-supplied until the MAC verifies. Looking the name up
-    /// again to decide who may rewrite a zone would be a second chance to get
-    /// that wrong.
+    /// through dynamic UPDATE (RFC 2136 §3.3). On the session, per
+    /// [`TsigSession::may_transfer`].
     pub fn may_update(&self, apex: &str) -> bool {
         self.key.may_update(apex)
     }
 
     /// Sign one response message, returning the bytes with a TSIG appended.
     ///
-    /// Call it once per message of a zone transfer, in order: the MACs chain, so
-    /// a reordered or dropped envelope fails at the client rather than passing
-    /// unnoticed.
+    /// Call once per message of a transfer, in order: the MACs chain, so a
+    /// reordered or dropped envelope fails at the client.
     pub fn sign(&mut self, message: Vec<u8>, now: u64) -> ConfigResult<Vec<u8>> {
         if message.len() < 12 {
             return Err(ConfigError::new(
@@ -717,11 +615,9 @@ impl TsigRejection {
 
     /// Attach the TSIG that reports this failure to an already-built response.
     ///
-    /// BADKEY and BADSIG go back with an empty MAC — there is either no key to
-    /// sign with or no reason to believe the sender holds it, and RFC 8945 §5.3.2
-    /// asks for exactly that. BADTIME is signed, because the MAC did verify, and
-    /// carries this server's time in the other-data field so the peer can see
-    /// which of the two clocks is wrong (§5.2.3).
+    /// BADKEY and BADSIG go back with an empty MAC (RFC 8945 §5.3.2): no key to
+    /// sign with. BADTIME is signed — the MAC did verify — and carries this
+    /// server's time so the peer can see which clock is wrong (§5.2.3).
     pub fn attach(&self, response: Vec<u8>, now: u64) -> ConfigResult<Vec<u8>> {
         let mut tsig = Tsig {
             key_name: self.key_name.clone(),
@@ -748,9 +644,8 @@ impl TsigRejection {
 
 /// Check the TSIG on an incoming message, if it has one.
 ///
-/// `packet` must be the bytes exactly as received: the MAC covers them, and a
-/// message that has been parsed and re-serialized is not necessarily the same
-/// bytes.
+/// `packet` must be the bytes exactly as received: a parsed and re-serialized
+/// message is not necessarily the same bytes.
 pub fn check_request(packet: &[u8], keyring: &TsigKeyring, now: u64) -> TsigCheck {
     let Some((offset, rdata, owner)) = find_tsig(packet) else {
         return TsigCheck::Unsigned;
@@ -778,8 +673,8 @@ pub fn check_request(packet: &[u8], keyring: &TsigKeyring, now: u64) -> TsigChec
         })
     };
 
-    // An algorithm we do not implement is indistinguishable, from the peer's side,
-    // from a key we do not hold: either way we cannot check what it sent.
+    // An algorithm we do not implement is, from the peer's side, a key we do not
+    // hold.
     let Some(algorithm) = TsigAlgorithm::from_name(&tsig.algorithm_name) else {
         return reject(TsigError::BadKey, None);
     };
@@ -790,8 +685,8 @@ pub fn check_request(packet: &[u8], keyring: &TsigKeyring, now: u64) -> TsigChec
         return reject(TsigError::BadTrunc, None);
     }
 
-    // The digest is over the message without the TSIG, with the id the signer
-    // used restored — a forwarder may have rewritten the one on the wire.
+    // Digest the message without the TSIG, with the signer's id restored: a
+    // forwarder may have rewritten the one on the wire.
     let unsigned = strip_tsig(packet, offset, tsig.original_id);
     let mut digest = unsigned;
     match tsig.variables() {
@@ -803,9 +698,8 @@ pub fn check_request(packet: &[u8], keyring: &TsigKeyring, now: u64) -> TsigChec
         return reject(TsigError::BadSig, None);
     }
 
-    // Only now is the clock worth checking: a time outside the fudge from someone
-    // who does hold the key is a clock problem, and it is reported differently
-    // (signed, with our time) from someone who does not (§5.2.3).
+    // Clock last: BADTIME is reported signed and with our time (§5.2.3), which
+    // is only defensible once the MAC has verified.
     if now.abs_diff(tsig.time_signed) > tsig.fudge as u64 {
         return reject(TsigError::BadTime, Some(key.clone()));
     }
@@ -818,8 +712,7 @@ pub fn check_request(packet: &[u8], keyring: &TsigKeyring, now: u64) -> TsigChec
     })
 }
 
-/// Sign a request with `key` — the client half, and what the tests drive both
-/// sides through.
+/// Sign a request with `key`: the client half.
 pub fn sign_request(message: Vec<u8>, key: &TsigKey, now: u64) -> ConfigResult<Vec<u8>> {
     if message.len() < 12 {
         return Err(ConfigError::new(
@@ -842,23 +735,17 @@ pub fn sign_request(message: Vec<u8>, key: &TsigKey, now: u64) -> ConfigResult<V
     append_tsig(message, &tsig)
 }
 
-/// The MAC carried by a signed message.
-///
-/// A client needs its own request's MAC to check the reply against: a response's
-/// digest opens with it (RFC 8945 §4.3.3), which is the binding that stops a
-/// reply to one question being replayed as the reply to another. Reading it back
-/// off the signed bytes keeps [`sign_request`]'s signature as it is and means
-/// there is one definition of where a MAC lives.
+/// The MAC carried by a signed message. A client keeps its request's MAC: a
+/// response's digest opens with it (RFC 8945 §4.3.3).
 pub fn request_mac(packet: &[u8]) -> Option<Vec<u8>> {
     let (_, rdata, owner) = find_tsig(packet)?;
     Tsig::parse_rdata(&owner, rdata).ok().map(|tsig| tsig.mac)
 }
 
-/// Verify a response against the request's MAC — the client half of a reply, and
-/// of each envelope of a transfer.
+/// Verify a response, or one envelope of a transfer: the client half.
 ///
 /// `previous_mac` is the request's MAC for the first message and the previous
-/// envelope's for the rest; on success the new MAC is returned to carry forward.
+/// envelope's for the rest; the new MAC is returned to carry forward.
 pub fn check_response(
     packet: &[u8],
     key: &TsigKey,
@@ -871,8 +758,7 @@ pub fn check_response(
     };
     let tsig = Tsig::parse_rdata(&owner, rdata).map_err(|_| TsigError::FormErr)?;
     if tsig.error != 0 {
-        // The server is reporting a failure rather than signing an answer; its
-        // own error code is the useful one to surface.
+        // The server is reporting a failure rather than signing an answer.
         return Err(match tsig.error {
             16 => TsigError::BadSig,
             17 => TsigError::BadKey,
@@ -903,19 +789,14 @@ pub fn check_response(
     Ok(tsig.mac)
 }
 
-// ---------------------------------------------------------------------------
-// Bytes
-// ---------------------------------------------------------------------------
-
 /// The MAC of `data` under `key`.
 fn mac(key: &TsigKey, data: &[u8]) -> Vec<u8> {
     let hmac_key = hmac::Key::new(key.algorithm.ring_algorithm(), &key.secret);
     hmac::sign(&hmac_key, data).as_ref().to_vec()
 }
 
-/// Whether `expected` is the MAC of `data`. Uses `ring`'s constant-time compare:
-/// a MAC check that leaks how many leading bytes matched is a MAC check an
-/// attacker can walk through one byte at a time.
+/// Whether `expected` is the MAC of `data`. `ring`'s compare is constant-time:
+/// leaking how many leading bytes matched walks the MAC a byte at a time.
 fn verify_mac(key: &TsigKey, data: &[u8], expected: &[u8]) -> bool {
     let hmac_key = hmac::Key::new(key.algorithm.ring_algorithm(), &key.secret);
     hmac::verify(&hmac_key, data, expected).is_ok()
@@ -930,24 +811,17 @@ fn push_prior_mac(digest: &mut Vec<u8>, prior: &[u8]) {
     }
 }
 
-/// The TSIG record at the end of `packet`: where it starts, its RDATA, and its
-/// owner name.
+/// The TSIG at the end of `packet`: its offset, RDATA and owner name.
 ///
-/// `None` unless the **last** record of the additional section is a TSIG, which
-/// is where RFC 8945 §5.1 requires it: a TSIG anywhere else does not cover the
-/// records after it, so treating one as a signature would be a way to append
-/// whatever you like to a signed message.
+/// `None` unless the last record of the additional section is a TSIG
+/// (RFC 8945 §5.1): elsewhere it does not cover what follows it, so honouring
+/// one would let anything be appended to a signed message.
 fn find_tsig(packet: &[u8]) -> Option<(usize, &[u8], String)> {
     if packet.len() < 12 {
         return None;
     }
-    // An array, not a `Vec`. This was `(0..4).map(..).collect::<Vec<usize>>()`,
-    // which heap-allocates on **every packet the server receives** — before the
-    // `ar == 0` check below, so it happened even for the overwhelming majority
-    // of queries that carry no additional section and for every server with no
-    // TSIG keys configured at all. Found by the DHAT profile (#9e): one block
-    // per query, 32 bytes, for four `usize`s whose count is known at compile
-    // time.
+    // An array, not a `Vec`: collecting heap-allocates 32 bytes on every packet
+    // received, ahead of the `ar == 0` check below.
     let counts: [usize; 4] = std::array::from_fn(|i| {
         u16::from_be_bytes([packet[4 + i * 2], packet[5 + i * 2]]) as usize
     });
@@ -965,7 +839,6 @@ fn find_tsig(packet: &[u8]) -> Option<(usize, &[u8], String)> {
         pos = skip_record(packet, pos)?;
     }
 
-    // The last additional record: it starts here.
     let start = pos;
     let after_name = skip_name(packet, pos)?;
     let owner = read_name_at(packet, pos)?;
@@ -1002,9 +875,8 @@ fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> ConfigResult<Vec<u8>> {
     let owner = dname_to_bytes(&tsig.key_name)
         .map_err(|e| ConfigError::new(format!("TSIG key name {}: {e}", tsig.key_name)))?;
 
-    // The owner name goes in uncompressed. A pointer would still be legal, but
-    // the record has to be removable by truncating the message, and a pointer
-    // into it from anywhere else would break that.
+    // Uncompressed owner name: the record must be removable by truncating the
+    // message, which a pointer into it would break.
     message.extend_from_slice(&owner);
     message.extend_from_slice(&TSIG_TYPE.to_be_bytes());
     message.extend_from_slice(&TSIG_CLASS.to_be_bytes());
@@ -1017,23 +889,9 @@ fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> ConfigResult<Vec<u8>> {
         .ok_or_else(|| ConfigError::new("additional count would overflow"))?;
     message[10..12].copy_from_slice(&ar.to_be_bytes());
 
-    // **This is the only path that can grow a message past the size it was
-    // serialized to**, and until this check existed it did so silently.
-    // `to_bytes_within(u16::MAX)` cannot return more than 65,535 octets — the
-    // scratch buffer is exactly that big, so anything larger comes back as a
-    // TC=1 reply instead — and then these ~82 octets are appended to the
-    // finished bytes. The ARCOUNT overflow above was the only thing checked.
-    //
-    // The consequence was not a wrong length but a *wrapped* one: at exactly
-    // 65,536 octets the TCP framing prefix is 0, which every read loop here
-    // treats as a broken peer, so a signed answer in an 82-octet window below
-    // 64 KB dropped the client's connection with nothing said. Refusing here is
-    // the right place because it is the only place that knows both halves —
-    // `framed` sees a buffer that is already too long and cannot say why.
-    //
-    // A caller that hits this has a genuinely oversized answer and its options
-    // are the protocol's: send it over TCP in pieces, as a transfer does, or
-    // truncate. Neither is something this function can choose.
+    // The only path that grows a message past the size it was serialized to: ~82
+    // octets onto finished bytes. Past 65,535 the TCP framing prefix wraps, and
+    // at 65,536 it is 0, which every read loop treats as a broken peer.
     let tsig_octets = owner.len() + 10 + rdata.len();
     if message.len() > u16::MAX as usize {
         return Err(ConfigError::new(format!(
@@ -1073,8 +931,8 @@ fn skip_record(packet: &[u8], pos: usize) -> Option<usize> {
     Some(end)
 }
 
-/// A name read from `packet` at `pos`, following one level of pointer. Used for
-/// the TSIG owner name only, where the name is the key's.
+/// A name read from `packet` at `pos`, following pointers. Used for the TSIG
+/// owner name only, which is the key name.
 fn read_name_at(packet: &[u8], pos: usize) -> Option<String> {
     let mut labels = Vec::new();
     let mut pos = pos;
@@ -1105,7 +963,7 @@ fn read_name_at(packet: &[u8], pos: usize) -> Option<String> {
     })
 }
 
-/// A name at the start of `data`, and what follows it. No compression: this reads
+/// A name at the start of `data`, and what follows. No compression: this reads
 /// the algorithm name out of TSIG RDATA, where RFC 3597 §4 forbids pointers.
 fn read_name(data: &[u8]) -> Option<(String, &[u8])> {
     let mut labels = Vec::new();
@@ -1132,8 +990,8 @@ fn read_name(data: &[u8]) -> Option<(String, &[u8])> {
     Some((name, &data[pos..]))
 }
 
-/// A key name in the form it is compared and hashed in: absolute and down-cased,
-/// because it is a domain name (RFC 4343).
+/// A key name as compared and hashed: absolute and down-cased, because it is a
+/// domain name (RFC 4343).
 fn canonical_key_name(name: &str) -> String {
     let mut name = name.trim().to_ascii_lowercase();
     if !name.ends_with('.') {
@@ -1187,35 +1045,20 @@ mod tests {
     }
 
     /// A signed message that will not fit a length prefix is refused, not framed
-    /// with a wrapped one (`TODO.md` #17).
+    /// with a wrapped one.
     ///
-    /// `append_tsig` is the only path that can grow a message past the size it
-    /// was serialized to: it adds ~82 octets to the finished bytes and used to
-    /// check only ARCOUNT. A serialized length in 65,454..=65,535 produced 65,536
-    /// or more, and at exactly 65,536 the framing prefix is 0 — which every read
-    /// loop treats as a broken peer, so the connection was dropped with no answer.
-    ///
-    /// A sweep rather than one case, because the window is 82 octets wide out of
-    /// 65,536. Each step asserts that the prefix agrees with the body, or that
-    /// there is no message at all; asserting on the error type would pass against
-    /// an implementation that refused everything.
-    ///
-    /// Watched failing against the unchecked `append_tsig` at 65,536 octets. That
-    /// assertion fires one line before the framing, since `framed` now refuses
-    /// 65,536 outright and the prefix-of-0 is unreachable through it.
+    /// A sweep, because the window `append_tsig` adds is 82 octets out of
+    /// 65,536; asserting on the error type alone would pass against an
+    /// implementation that refused everything.
     #[test]
     fn a_signed_message_too_long_to_frame_is_refused_rather_than_wrapped() {
         let key = test_key();
         let mut refused = 0usize;
         let mut framed_ok = 0usize;
 
-        // 255 character-strings of 255 octets is 65,280 octets of RDATA, which
-        // with the header, question and record overhead lands the serialized
-        // message just below the ceiling; `pad` then walks it through the
-        // 82-octet window an octet at a time.
+        // 255 character-strings of 255 octets is 65,280 octets of RDATA, just
+        // below the ceiling; `pad` walks it through the window.
         for pad in 0..250usize {
-            // A TXT RRset sized to walk the serialized length through the
-            // boundary an octet at a time.
             let mut msg = DnsMessage::try_from_bytes(&query_bytes(
                 "big.example.com.",
                 Qtype::of(crate::utils::record_types::TXT),
@@ -1237,8 +1080,7 @@ mod tests {
             let Ok(bytes) = msg.to_bytes_within(u16::MAX as usize) else {
                 continue;
             };
-            // Only the sizes near the ceiling are interesting; below that the
-            // message is nowhere near the boundary and proves nothing.
+            // Only sizes near the ceiling prove anything.
             if bytes.len() < 65_300 {
                 continue;
             }
@@ -1262,8 +1104,6 @@ mod tests {
                     );
                     framed_ok += 1;
                 }
-                // Refused, which is the correct answer for a message that
-                // cannot be expressed on the wire at all.
                 Err(_) => refused += 1,
             }
         }
@@ -1279,26 +1119,10 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Keys
-    // -----------------------------------------------------------------
-
-    /// A message carrying **both** an OPT record and a TSIG must put the TSIG
-    /// last (RFC 8945 §5.1), and the OPT record's move out of `additionals`
-    /// (`TODO.md` #13d) is what makes that worth asserting.
-    ///
-    /// The invariant holds today for a reason that is not the serializer's
-    /// doing: `TSIG_TYPE` appears nowhere outside this module, `append_tsig`
-    /// works on finished bytes rather than on the struct, and `make_response`
-    /// and `error_bytes` both build `additionals: Vec::new()` — so no reply ever
-    /// carries a TSIG *through* `DnsMessage::to_bytes`. Nothing enforces it.
-    /// Since `to_bytes` now writes the OPT record after everything else in the
-    /// section, a future change that put a TSIG in the struct would silently put
-    /// OPT after it.
-    ///
-    /// This is a functional check rather than a byte-offset one: `strip_tsig`
-    /// and the scan in [`check_request`] both require the TSIG to be the last
-    /// record, so if OPT landed after it, verification fails.
+    /// A message carrying both an OPT record and a TSIG must put the TSIG last
+    /// (RFC 8945 §5.1). Nothing enforces it: `to_bytes` writes OPT after
+    /// everything else in the section, so a TSIG placed in the struct rather
+    /// than appended to finished bytes would end up before it.
     #[test]
     fn a_signed_message_with_edns_still_ends_in_its_tsig() {
         let key = test_key();
@@ -1327,7 +1151,6 @@ mod tests {
             ),
         }
 
-        // And the OPT record survived the signing, in its own field.
         let parsed = DnsMessage::try_from_bytes(&signed).expect("the signed message parses");
         assert!(parsed.edns().is_some(), "OPT survived");
         assert_eq!(parsed.additionals.len(), 1, "the TSIG, and only it");
@@ -1363,9 +1186,8 @@ mod tests {
         );
     }
 
-    /// A key used to be a licence to transfer **every** zone: `answer_transfer`
-    /// asked only whether a session existed, so holding any key transferred any
-    /// zone and bypassed `--allow-transfer` entirely.
+    /// Holding a key is not a licence to transfer every zone: a verified MAC
+    /// answers who, not what may be done.
     #[test]
     fn a_key_may_be_scoped_to_zones() {
         let scoped = TsigKey::parse(
@@ -1393,26 +1215,16 @@ mod tests {
              less specific than the apex authorizes more than it names"
         );
 
-        // The preserved default, so that changing it has to be deliberate.
+        // The default: unscoped transfers everything, by design.
         let unscoped = TsigKey::parse("hmac-sha256:any.key:AAECAwQFBgcICQoLDA0ODw==").unwrap();
         assert_eq!(unscoped.zone_scope(), None);
         assert!(unscoped.may_transfer("anything.test."));
     }
 
-    /// **A key that may transfer a zone may not thereby rewrite it.**
-    ///
-    /// RFC 2136 §3.3 leaves the mechanism to the implementation, so the shape is
-    /// this codebase's decision — but the *default* is the security-relevant
-    /// part, and it runs opposite to the transfer scope beside it. An unscoped
-    /// key transfers everything, which `CLAUDE.md` §16 kept deliberately because
-    /// narrowing it would stop every transfer on a working deployment. Reusing
-    /// that for updates would have handed write access to every zone to every
-    /// key already in every keyring, on the first release that dispatched an
-    /// UPDATE — §16's opening bug, arrived at from the other direction.
-    ///
-    /// **Watched failing** against `may_update` delegating to `may_transfer`:
-    /// the unscoped key rewrote `anything.test.` and the transfer-scoped key
-    /// rewrote `example.com.`, and the first two assertions below fired.
+    /// A key that may transfer a zone may not thereby rewrite it. The update
+    /// default runs opposite to the transfer scope beside it: inheriting the
+    /// unscoped-transfers-everything default would hand write access to every
+    /// zone to every key already in every keyring.
     #[test]
     fn a_key_that_may_transfer_a_zone_may_not_thereby_rewrite_it() {
         let unscoped = TsigKey::parse("hmac-sha256:any.key:AAECAwQFBgcICQoLDA0ODw==").unwrap();
@@ -1435,7 +1247,7 @@ mod tests {
         );
         assert_eq!(transfer_only.update_scope(), &UpdatePolicy::Denied);
 
-        // Granted, and scoped: the fifth field.
+        // Granted and scoped: the fifth field.
         let writer = TsigKey::parse(
             "hmac-sha256:dhcp.key:AAECAwQFBgcICQoLDA0ODw==:*:dyn.example.com.,other.test",
         )
@@ -1460,15 +1272,14 @@ mod tests {
              so anything less specific than the apex authorizes more than it names"
         );
 
-        // And the explicit grant of everything, which has to be typed.
+        // The explicit grant of everything, which has to be typed.
         let any = TsigKey::parse("hmac-sha256:root.key:AAECAwQFBgcICQoLDA0ODw==:*:*").unwrap();
         assert_eq!(any.update_scope(), &UpdatePolicy::Any);
         assert!(any.may_update("whatever.test."));
     }
 
-    /// The fifth field needs no disambiguation — four already require the
-    /// algorithm — but the empty-entry rule has to apply to it too, and the
-    /// error has to say *which* list is wrong.
+    /// The empty-entry rule applies to the fifth field too, and the error names
+    /// which list is wrong.
     #[test]
     fn an_update_scope_reports_its_own_typos() {
         let with_bad_update =
@@ -1488,11 +1299,8 @@ mod tests {
         assert!(TsigKey::parse("hmac-sha256:k:AAECAwQFBgcICQoLDA0ODw==:*:*:extra").is_err());
     }
 
-    /// The banner names an update grant, and stays quiet when there is none.
-    ///
-    /// Both halves matter: an ungranted key is the overwhelming majority, and a
-    /// banner carrying "updates no zones" for every one of them is what trains
-    /// the reader to skip the line where the granted key appears.
+    /// The banner names an update grant, and stays quiet when there is none: a
+    /// clause on every line trains the reader to skip the granted one.
     #[test]
     fn the_banner_names_an_update_grant_and_only_a_grant() {
         let ring = TsigKeyring::new(vec![
@@ -1512,17 +1320,13 @@ mod tests {
         );
     }
 
-    /// A zone list needs the algorithm spelled out, because `name:secret:zones`
-    /// and `alg:name:secret` are both three colon-separated fields. Failing at
-    /// startup with a message beats reading a zone list as a base64 secret.
+    /// A zone list needs the algorithm spelled out: `name:secret:zones` and
+    /// `alg:name:secret` are both three fields.
     #[test]
     fn a_zone_list_without_an_algorithm_is_an_error_rather_than_a_guess() {
-        // Three fields where the first is not an algorithm: refused, and *not*
-        // read as name:secret:zones.
+        // Three fields whose first is not an algorithm: refused, not read as
+        // name:secret:zones.
         assert!(TsigKey::parse("my.key:AAECAwQFBgcICQoLDA0ODw==:example.com.").is_err());
-        // An empty entry means the operator wrote something they did not mean.
-        // Refusing beats silently narrowing the list — or widening it to
-        // everything, which is what an empty list means.
         assert!(
             TsigKey::parse("hmac-sha256:k:AAECAwQFBgcICQoLDA0ODw==:example.com.,").is_err(),
             "a trailing comma"
@@ -1533,9 +1337,8 @@ mod tests {
         );
     }
 
-    /// The startup banner has to name each key's scope: "this key can transfer
-    /// everything" is indistinguishable at run time from a scoped key until the
-    /// moment someone transfers a zone you did not mean to give them.
+    /// The banner names each key's scope: an unscoped key is indistinguishable
+    /// at run time from a scoped one until someone transfers a zone.
     #[test]
     fn the_keyring_describes_what_each_key_may_transfer() {
         let ring = TsigKeyring::new(vec![
@@ -1551,8 +1354,8 @@ mod tests {
         );
     }
 
-    /// A key name is not a licence to pick the algorithm: answering BADKEY for a
-    /// mismatch is what stops a peer downgrading SHA-256 to SHA-1 by asking.
+    /// BADKEY for an algorithm mismatch stops a peer downgrading SHA-256 to
+    /// SHA-1 by asking.
     #[test]
     fn test_the_keyring_matches_name_and_algorithm() {
         let ring = TsigKeyring::new(vec![test_key()]);
@@ -1565,10 +1368,6 @@ mod tests {
         assert!(ring.get("transfer.key.", TsigAlgorithm::HmacSha1).is_none());
         assert!(ring.get("other.key.", TsigAlgorithm::HmacSha256).is_none());
     }
-
-    // -----------------------------------------------------------------
-    // Signing and verifying
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_a_signed_request_verifies() {
@@ -1604,8 +1403,8 @@ mod tests {
         ));
     }
 
-    /// The whole point: a message altered after signing does not verify. The bit
-    /// flipped here is in the question, which is what a TSIG is protecting.
+    /// A message altered after signing does not verify. The bit flipped is in
+    /// the question.
     #[test]
     fn test_a_tampered_message_is_badsig() {
         let key = test_key();
@@ -1683,9 +1482,8 @@ mod tests {
         }
     }
 
-    /// A TSIG that is not the last record covers nothing after it, so it is not a
-    /// signature at all — accepting one would let anything be appended to a
-    /// signed message.
+    /// A TSIG that is not the last record covers nothing after it: accepting one
+    /// would let anything be appended to a signed message.
     #[test]
     fn test_a_tsig_that_is_not_last_is_not_a_signature() {
         let key = test_key();
@@ -1724,13 +1522,8 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
-    // Responses
-    // -----------------------------------------------------------------
-
-    /// A response is signed over the *request's* MAC, which is what binds the two
-    /// together: a reply to one question cannot be replayed as the reply to
-    /// another.
+    /// A response is signed over the request's MAC: a reply to one question
+    /// cannot be replayed as the reply to another.
     #[test]
     fn test_a_response_verifies_against_the_request() {
         let key = test_key();
@@ -1760,8 +1553,8 @@ mod tests {
         );
     }
 
-    /// A transfer's envelopes chain: each MAC covers the previous one, so a
-    /// dropped or reordered message fails instead of passing unnoticed.
+    /// Envelopes chain: each MAC covers the previous, so a dropped or reordered
+    /// message fails rather than passing unnoticed.
     #[test]
     fn test_transfer_envelopes_chain() {
         let key = test_key();
@@ -1785,14 +1578,13 @@ mod tests {
             })
             .collect();
 
-        // In order: each verifies against the previous MAC.
         let mut previous = request_mac.clone();
         for (i, envelope) in envelopes.iter().enumerate() {
             previous = check_response(envelope, &key, &previous, i == 0, now)
                 .unwrap_or_else(|e| panic!("envelope {i} should verify: {}", e.reason()));
         }
 
-        // Out of order: the second envelope does not verify against the request.
+        // Out of order.
         assert_eq!(
             check_response(&envelopes[1], &key, &request_mac, false, now).unwrap_err(),
             TsigError::BadSig,
@@ -1850,10 +1642,6 @@ mod tests {
             "so the peer can see whose clock is wrong"
         );
     }
-
-    // -----------------------------------------------------------------
-    // The record itself
-    // -----------------------------------------------------------------
 
     #[test]
     fn test_tsig_rdata_round_trips() {

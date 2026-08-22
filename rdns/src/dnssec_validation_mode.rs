@@ -1,50 +1,27 @@
-//! DNSSEC Validation for Query-Response Mode
+//! Validate an RRset before it goes out, and set AD when it verifies
+//! (RFC 4035 §3.2.3).
 //!
-//! This module provides query-response level DNSSEC validation integration,
-//! allowing authoritative-only DNS servers to validate RRsets before responding
-//! and set the Authenticated Data (AD) bit when validation succeeds.
-//!
-//! Architecture:
-//! - Authoritative-only (not recursive validation)
-//! - When enabled, validates RRsets before responding
-//! - Sets AD bit in DNS message header if validation succeeds
-//! - Follows RFC 4035 § 3.2.3 guidance for recursive servers
-//!
-//! This is the *serving* side and is deliberately narrower than
-//! [`crate::dnssec_chain`], which is what a resolver uses: there is no chain to
-//! walk when the zone is loaded from disk, only the question of whether the
-//! records about to go out match the signatures sitting beside them in the same
-//! file.
+//! The serving side, narrower than [`crate::dnssec_chain`]: a zone loaded from
+//! disk has no chain to walk, only the question of whether the records match the
+//! signatures beside them in the same file.
 
 use crate::dnssec::{verify_rrset, Dnskey, Rrset, RrsetProof, Rrsig};
 use crate::utils::{current_unix_timestamp, record_types};
 use crate::zone::Zone;
 use crate::{RecordData, ResourceRecord};
 
-/// DNSSEC validator for query-response mode
-///
-/// Validates RRsets in responses before sending, setting the AD bit
-/// when validation succeeds.
 pub struct DnssecValidator {
-    /// Whether DNSSEC validation is enabled
     enabled: bool,
     /// Whether an *unsigned* zone counts as a failure.
     ///
-    /// Off by default, which is the only sane default for a server that may
-    /// hold a mix of signed and unsigned zones: most zones are unsigned and
-    /// serving them is the normal case, so "not signed" must not read as "not
-    /// valid". Turning it on means "every zone I serve is meant to be signed" —
-    /// an operator assertion, and a useful one, because a zone that silently
-    /// loses its signatures (an expired resigning cron, a bad reload) otherwise
-    /// keeps answering as though nothing happened.
+    /// Off by default: a server may hold a mix, so "not signed" must not read as
+    /// "not valid". On, it is the operator asserting every zone here is meant to
+    /// be signed — a zone that loses its signatures otherwise keeps answering as
+    /// though nothing happened.
     require_signed: bool,
 }
 
 impl DnssecValidator {
-    /// Create a new DNSSEC validator
-    ///
-    /// # Arguments
-    /// * `enabled` - Whether to enable DNSSEC validation
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
@@ -57,28 +34,19 @@ impl DnssecValidator {
         self.require_signed = require;
     }
 
-    /// Check if DNSSEC validation is enabled
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
-    /// Check if a zone is signed (has DNSKEY records)
+    /// Whether the zone has DNSKEY records.
     pub fn is_zone_signed(zone: &Zone) -> bool {
         zone.records()
             .iter()
             .any(|r| r.rdata.rtype() == record_types::DNSKEY)
     }
 
-    /// Validate records in a response before sending
-    ///
-    /// This checks if the zone has valid DNSSEC signatures for the records
-    /// being returned.
-    ///
-    /// # Returns
-    /// A tuple (is_valid, is_signed):
-    /// - If validation disabled: (true, false)
-    /// - If the zone is unsigned: (!require_signed, false)
-    /// - If the zone is signed: (validation_result, true)
+    /// Returns `(is_valid, is_signed)`: disabled is `(true, false)`, an unsigned
+    /// zone `(!require_signed, false)`, a signed one `(verified, true)`.
     pub fn validate_response(
         &self,
         zone: &Zone,
@@ -90,14 +58,10 @@ impl DnssecValidator {
         }
 
         if !Self::is_zone_signed(zone) {
-            // Unsigned. Normal unless the operator has said every zone here is
-            // meant to be signed, in which case the absence of signatures is
-            // itself the finding.
             return (!self.require_signed, false);
         }
 
-        // Nothing to check — an empty answer carries no RRset. The zone is
-        // still signed, so say so.
+        // An empty answer carries no RRset, but the zone is still signed.
         let Some(first) = records.first() else {
             return (true, true);
         };
@@ -119,8 +83,8 @@ impl DnssecValidator {
             return (false, true); // A signed zone must have DNSKEYs.
         }
 
-        // Every RRSIG in the zone; `verify_rrset` picks the ones that cover
-        // this RRset by owner and type, and rejects a signer outside the zone.
+        // `verify_rrset` picks the ones covering this RRset by owner and type,
+        // and rejects a signer outside the zone.
         let rrsigs: Vec<Rrsig> = zone
             .records()
             .iter()
@@ -146,20 +110,14 @@ impl DnssecValidator {
 
         match proof {
             RrsetProof::Verified { .. } => (true, true),
-            // A signed zone with an unsigned RRset in it is a broken zone, and
-            // the AD bit would be a lie either way.
+            // An unsigned RRset in a signed zone is a broken zone; AD would be
+            // a lie either way.
             RrsetProof::Unsigned | RrsetProof::Bogus(_) | RrsetProof::Unsupported(_) => {
                 (false, true)
             }
         }
     }
 
-    /// Check if response should have AD bit set
-    ///
-    /// The AD bit should be set if:
-    /// 1. Validation is enabled
-    /// 2. The records are signed (is_signed = true)
-    /// 3. Validation succeeded (is_valid = true)
     pub fn should_set_ad_bit(&self, is_valid: bool, is_signed: bool) -> bool {
         is_valid && is_signed && self.enabled
     }

@@ -1,17 +1,7 @@
 //! Turning a question into an answer: RFC 1034 §4.3.2, and the four cases.
 //!
-//! **Everything here is a synchronous function of the message, the zone map and
-//! the metrics.** No sockets, no lock guards, nothing `async` — which is what
-//! makes this the seam `TODO.md` #20 says to lift first and alone: a move that
-//! cannot change what is held across an `.await` cannot change behaviour by
-//! accident. `notify_reply` stays in `main`, because it needs `&Secondaries` and
-//! the peer address; the transfer and UPDATE paths stay for the stronger version
-//! of the same reason.
-//!
-//! The reason this is worth its own file is not length. It is that the four
-//! cases of §4.3.2 — referral, data, alias, no-such-data — are a closed piece of
-//! protocol reasoning whose test module names each wire shape it used to get
-//! wrong, and reading the two together is how the next person checks them.
+//! Everything here is a synchronous function of the message, the zone map and
+//! the metrics — no sockets, no lock guards, nothing `async`.
 
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::utils::record_types;
@@ -25,9 +15,7 @@ use rdns::{
 use crate::zones::Zones;
 use crate::RDNSD_PAYLOAD_SIZE;
 
-/// Build a DNS response for the given query message
-///
-/// Looks up the zone based on the query name and returns appropriate response
+/// Build a DNS response for the given query message.
 pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetrics) -> DnsMessage {
     let timer = LatencyTimer::new();
     let mut response = DnsMessage {
@@ -48,15 +36,11 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
         edns: None,
     };
 
-    // The client's EDNS parameters, read once for the whole function. This used
-    // to be two `msg.edns()` calls sixteen lines apart plus two `has_edns()`
-    // scans, and `edns()` builds the option list — a `Vec` and a `Vec<u8>` per
-    // option — only for three fields that are not in it (`TODO.md` #9e). A
-    // client sending a DNS cookie, which is what BIND and Unbound do by default,
-    // paid four allocations per query for a bit.
+    // Read once: `edns()` builds the option list, which costs a `Vec` and a
+    // `Vec<u8>` per option for three fields that are not in it.
     //
     // EDNS-level rejections take precedence over any zone lookup: a malformed
-    // option list is FORMERR, and an EDNS version we don't implement is BADVERS
+    // option list is FORMERR, an EDNS version we don't implement is BADVERS
     // (RFC 6891 §6.1.3). Both replies carry a bare version-0 OPT — BADVERS is an
     // extended RCODE, so the OPT record is what carries its high bits.
     let client_edns = match msg.edns_header() {
@@ -75,31 +59,22 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
     }
 
     // DO says the client can make sense of DNSSEC records, so send them
-    // (RFC 4035 §3.1.1). It is not a request for validation and not a demand
-    // that the zone be signed — an unsigned zone answers a DO query exactly as
-    // it answers any other, and [`dnssec_answer`] returns nothing for it.
+    // (RFC 4035 §3.1.1). Not a demand that the zone be signed.
     let dnssec_ok = client_edns.is_some_and(|edns| edns.do_bit);
 
     // Only QUERY reaches the zone lookup. NOTIFY is answered by the caller,
-    // which knows the peer's address; anything else — UPDATE, STATUS, the
-    // obsolete IQUERY — is something this server does not implement, and saying
-    // so is more useful than treating it as a lookup (RFC 1035 §4.1.1).
+    // which knows the peer's address; anything else is NOTIMP rather than
+    // treated as a lookup (RFC 1035 §4.1.1).
     if msg.opcode != OpCode::Query {
         response.rcode = ResponseCode::NotImplemented;
         response.authoritive = false;
-        // Mirror the OPT record on the way out. This `return` jumps over the
-        // EDNS mirroring at the end of the function, so a NOTIMP used to be the
-        // one reply that dropped the client's OPT — and RFC 6891 §6.1.1 says a
-        // response to a request that had one includes one. An EDNS client
-        // asking with an unsupported opcode got an answer indistinguishable from
-        // a server that does not do EDNS at all, which some clients remember as
-        // a downgrade and then never offer EDNS to again. `error_bytes` already
-        // does this correctly; this path was written separately and drifted
-        // (`CLAUDE.md` §7).
+        // This `return` jumps over the EDNS mirroring at the end of the
+        // function, and RFC 6891 §6.1.1 says a response to a request that had an
+        // OPT includes one. Some clients remember a missing OPT as a downgrade
+        // and never offer EDNS again.
         //
-        // `client_edns.is_some()` rather than `msg.has_edns()`, and they agree
-        // here: the two differ only for an OPT record whose option list is
-        // malformed, and that answered FORMERR above without reaching this.
+        // `client_edns.is_some()` and `msg.has_edns()` agree here: they differ
+        // only for a malformed option list, which answered FORMERR above.
         if client_edns.is_some() {
             let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
             edns.do_bit = dnssec_ok;
@@ -108,47 +83,31 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
         return response;
     }
 
-    // Process each query
     for query in &msg.queries {
-        // The class is part of the question and was never looked at. Every zone
-        // this server holds is IN — `zone::parse` refuses any other class in a
-        // zone file — so a CH or HS question was answered from the IN zone, and
-        // the reply carried `CLASS=CH` in the echoed question beside `CLASS=IN`
-        // records in the answer. That pairing is malformed; RFC 1034 §4.3.2's
-        // step 1 searches the zones *of the question's class*, and finding none
-        // is the same situation as a zone we do not serve.
-        //
-        // REFUSED rather than NXDOMAIN, for the reason spelled out at the bottom
-        // of this loop: NXDOMAIN is an assertion about the DNS that a server
-        // holding nothing in that class has no standing to make, and resolvers
-        // cache it. QCLASS=ANY (255) is *not* refused — RFC 1035 §3.2.5 makes it
-        // match any class, and matching it against the IN zone is exactly right
-        // when IN is the only class there is here.
+        // Every zone here is IN, and RFC 1034 §4.3.2 step 1 searches the zones
+        // *of the question's class* — so a CH or HS question is the same
+        // situation as a zone we do not serve, and REFUSED for the reason at the
+        // bottom of this loop. QCLASS=ANY (255) matches any class
+        // (RFC 1035 §3.2.5), so it is not refused.
         if !matches!(query.qclass, QueryClass::IN | QueryClass::Any) {
             response.rcode = ResponseCode::Refused;
             response.authoritive = false;
             continue;
         }
 
-        // A transfer over UDP is not a transfer. AXFR is defined over TCP alone
-        // (RFC 5936 §4.2) — a whole zone does not fit a datagram and the protocol
-        // has no way to say "there is more" — so a UDP request for it is
-        // malformed rather than merely refused. The TCP server answers AXFR
-        // itself, before ever reaching here, so this is the UDP path speaking.
+        // AXFR is defined over TCP alone (RFC 5936 §4.2), so a UDP request for
+        // it is malformed rather than merely refused. The TCP server answers
+        // AXFR before reaching here, so this is the UDP path speaking.
         if query.qtype == Qtype::AXFR {
             response.rcode = ResponseCode::FormatError;
             continue;
         }
 
-        // An IXFR over UDP is different: it is *expected*, and RFC 1995 §2 gives
-        // the answer for one that will not fit in a datagram — a single SOA of
-        // the server's current version, which tells the client to come back over
-        // TCP. Answering that way always is a deliberate choice rather than a
-        // limitation: the ACL, the TSIG session and the multi-message packing all
-        // live on the TCP path, and duplicating them here to serve the small
-        // subset of increments that fit a datagram would be a second
-        // implementation of the interesting parts. The SOA discloses nothing an
-        // ordinary SOA query does not, so it needs no ACL of its own.
+        // An IXFR over UDP is expected. RFC 1995 §2: answer a single SOA of the
+        // current version, telling the client to come back over TCP. Done
+        // always, rather than only when the increment will not fit — the ACL,
+        // TSIG session and message packing all live on the TCP path. The SOA
+        // discloses nothing an ordinary SOA query does not.
         if query.qtype == Qtype::IXFR {
             if let Some(zone) = zones.for_query(&query.qname) {
                 for soa in zone.query(zone.origin(), Qtype::of(record_types::SOA)) {
@@ -166,7 +125,6 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
             continue;
         }
 
-        // Find the matching zone for this query
         let zone = zones.for_query(&query.qname);
 
         if let Some(zone) = zone {
@@ -187,43 +145,26 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
                 }
             }
         } else {
-            // A zone we do not serve is REFUSED, not NXDOMAIN, and the two are
-            // not interchangeable. NXDOMAIN is an assertion *about the DNS* —
-            // this name does not exist anywhere — which we have no standing to
-            // make about a zone we hold nothing for; a resolver believes it and
-            // caches it (RFC 2308), so the lie propagates. REFUSED says the
-            // truth, that this server will not answer, and sends the resolver to
-            // the other nameservers in the delegation. It is what BIND, NSD and
-            // Knot all answer here.
-            //
-            // This matters more now that a zone can be *withdrawn*: an expired
-            // secondary that answered NXDOMAIN would take its zone off the
-            // internet for as long as anything cached the answer, which is the
-            // opposite of what stopping serving it is for.
+            // A zone we do not serve is REFUSED, not NXDOMAIN. NXDOMAIN asserts
+            // the name exists nowhere, which we have no standing to say, and a
+            // resolver caches it (RFC 2308). BIND, NSD and Knot all answer
+            // REFUSED here. It matters most for a *withdrawn* zone: an expired
+            // secondary answering NXDOMAIN takes its zone off the internet.
             response.rcode = ResponseCode::Refused;
             response.authoritive = false;
         }
     }
 
-    // Count the *answer*, once, by what it actually says.
-    //
-    // These used to be `increment_cache_hits`/`increment_cache_misses`, on an
-    // authoritative server that has no cache — the names were standing in for
-    // "found something" and "did not", which is not a question anyone asks of a
-    // primary. A rate of SERVFAIL, NXDOMAIN and REFUSED is what an operator
-    // pages on, and it is what tells a zone that went missing (REFUSED climbs)
-    // from a zone that went wrong (SERVFAIL climbs) from ordinary traffic for
-    // names that are not there (NXDOMAIN, which is normal and noisy).
+    // Count the answer by what it says. REFUSED climbing means a zone went
+    // missing, SERVFAIL that one went wrong, NXDOMAIN is ordinary.
     metrics.count_response(response.rcode);
     if response.authoritive {
         metrics.count(&metrics.queries_authoritative);
     }
     metrics.observe_latency_ms(timer.elapsed_ms());
 
-    // Mirror EDNS0: only include an OPT record when the client used EDNS
-    // (RFC 6891 §6.1.1), advertising our own UDP payload size. DO is echoed
-    // when it was asked for, which is how the client knows the DNSSEC records
-    // it did or did not get were a deliberate answer (RFC 3225 §3).
+    // Mirror EDNS0: an OPT record only when the client used EDNS
+    // (RFC 6891 §6.1.1), and DO echoed when it was asked for (RFC 3225 §3).
     if client_edns.is_some() {
         let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
         edns.do_bit = dnssec_ok;
@@ -233,15 +174,11 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
     response
 }
 
-/// What RFC 1034 §4.3.2 decided about one question against one zone.
-///
-/// The algorithm there is a loop with four exits, and only two of them were ever
-/// implemented here: records, or a negative answer. The two that were missing are
-/// the ones an ordinary zone cannot be served without — a referral at a
-/// delegation, and following an alias.
+/// What RFC 1034 §4.3.2 decided about one question against one zone: a loop with
+/// four exits.
 enum Outcome {
     /// The zone's authority stops at `cut`: the answer is a referral to the
-    /// child, with AA **clear** (RFC 1035 §4.1.1).
+    /// child, with AA clear (RFC 1035 §4.1.1).
     Referral { cut: String },
     /// There are records for the question at `name`, reached through the
     /// aliases at `chain` (empty in the ordinary case).
@@ -253,47 +190,40 @@ enum Outcome {
         name: String,
         kind: NameKind,
     },
-    /// The chain walked out of this zone: NOERROR with the aliases we do hold
-    /// and nothing else. **Not** NXDOMAIN — we know nothing about the target,
-    /// and saying it does not exist would take it off the internet for as long
-    /// as anything cached the answer (RFC 1034 §4.3.2 step 3a).
+    /// The chain walked out of this zone: NOERROR with the aliases we hold and
+    /// nothing else. Not NXDOMAIN — we know nothing about the target
+    /// (RFC 1034 §4.3.2 step 3a).
     ChainLeftZone { chain: Vec<String> },
 }
 
-/// How many aliases we will follow inside one zone before giving up.
-///
-/// A zone with `a CNAME b` and `b CNAME a` is a broken zone, not an attack, but
-/// the loop is real and the visited set below is what actually stops it. This is
-/// the second bound, for the chain that grows without repeating.
+/// How many aliases we follow inside one zone. The second bound: the visited set
+/// below stops a cycle, this stops a chain that grows without repeating.
 pub(crate) const MAX_CNAME_HOPS: usize = 16;
 
 /// Walk RFC 1034 §4.3.2 for one question.
 ///
-/// The four cases are tried in this order at every name, which is the order the
-/// RFC gives and the order that matters: the zone's authority ends here, the
-/// name has the data, the name is an alias, the name has no such data. Getting
-/// the first one last is how a parent ends up answering NXDOMAIN for a child's
-/// names.
+/// The four cases are tried at every name in the RFC's order, and the order
+/// matters: authority ends here, the name has the data, the name is an alias,
+/// the name has no such data. Getting the first one last is how a parent answers
+/// NXDOMAIN for a child's names.
 fn resolve_in_zone(zone: &Zone, qname: &str, qtype: Qtype) -> Outcome {
     let mut chain: Vec<String> = Vec::new();
     let mut visited: Vec<String> = Vec::new();
     let mut name = qname.to_string();
 
     for _ in 0..MAX_CNAME_HOPS {
-        // A delegation is a referral whatever the type asked for, with one
-        // exception: the DS *at* the cut is the parent's own statement about the
-        // child, so it is answered here rather than sent downwards — the child
-        // does not hold its own DS and could not be asked (RFC 4035 §3.1.4.1).
+        // A delegation is a referral whatever the type, except the DS *at* the
+        // cut: that is the parent's own statement about the child, which the
+        // child does not hold and could not be asked (RFC 4035 §3.1.4.1).
         if let Some(cut) = zone.delegation_for(&name) {
             let at_the_cut = cut.eq_ignore_ascii_case(&zone.normalize_name(&name));
             if !(qtype.is(record_types::DS) && at_the_cut) {
                 return if chain.is_empty() {
                     Outcome::Referral { cut }
                 } else {
-                    // Mid-chain, the target is the child's name to answer for.
-                    // Stopping with what we hold costs the resolver one round
-                    // trip and cannot be wrong; answering from the glue below
-                    // the cut would serve occluded data as authoritative.
+                    // Mid-chain the target is the child's name to answer for.
+                    // Answering from the glue below the cut would serve occluded
+                    // data as authoritative.
                     Outcome::ChainLeftZone { chain }
                 };
             }
@@ -303,8 +233,7 @@ fn resolve_in_zone(zone: &Zone, qname: &str, qtype: Qtype) -> Outcome {
         if !zone.query(&name, qtype).is_empty() {
             return Outcome::Answer { chain, name };
         }
-        // A CNAME query is answered by the CNAME, not followed by it — the
-        // alias is the data when the alias is what was asked for.
+        // A CNAME query is answered by the CNAME, not followed by it.
         if qtype.is(record_types::CNAME) {
             return Outcome::Negative { chain, name, kind };
         }
@@ -315,8 +244,8 @@ fn resolve_in_zone(zone: &Zone, qname: &str, qtype: Qtype) -> Outcome {
         chain.push(name.clone());
         visited.push(zone.normalize_name(&name).to_ascii_lowercase());
 
-        // Still folded for `visited`, which is an equality test against a list
-        // of folded names; `in_zone` no longer needs it to be.
+        // Folded for `visited`, an equality test against folded names; `in_zone`
+        // does not need it to be.
         let target_key = zone.normalize_name(&target).to_ascii_lowercase();
         if !in_zone(zone, &target_key) || visited.contains(&target_key) {
             return Outcome::ChainLeftZone { chain };
@@ -328,11 +257,9 @@ fn resolve_in_zone(zone: &Zone, qname: &str, qtype: Qtype) -> Outcome {
 
 /// The target of the CNAME at `name`, if there is one.
 ///
-/// Only the first is read. RFC 1034 §3.6.2 allows exactly one CNAME at an owner
-/// name — a second is a broken zone, and picking one arbitrarily is better than
-/// answering with a two-record RRset no client can use. The parser refuses to
-/// load the shape at all (see `zone::parse_zone_file`), so this is the belt to
-/// that braces.
+/// Only the first is read: RFC 1034 §3.6.2 allows exactly one CNAME at an owner
+/// name, and the parser refuses to load a second, so this is belt to that
+/// braces.
 fn cname_target(zone: &Zone, name: &str) -> Option<String> {
     zone.query(name, Qtype::of(record_types::CNAME))
         .first()
@@ -342,15 +269,8 @@ fn cname_target(zone: &Zone, name: &str) -> Option<String> {
         })
 }
 
-/// Whether a name is at or below this zone's apex.
-///
-/// [`rdns::utils::is_at_or_under`], which is a fourth copy of the same rule this
-/// used to be — the same family as the one `zone_signer` was shadowing
-/// (`TODO.md` #19b, #19h). The copy allocated `zone.origin().to_ascii_lowercase()`
-/// **per call**, on the CNAME-chase and referral-glue paths, and both call sites
-/// additionally allocated on the name to feed it something already folded. The
-/// shared version compares case-insensitively itself, so neither allocation is
-/// needed and the callers hand it the name they already have.
+/// Whether a name is at or below this zone's apex. [`rdns::utils::is_at_or_under`]
+/// compares case-insensitively itself, so callers need not fold first.
 fn in_zone(zone: &Zone, name: &str) -> bool {
     rdns::utils::is_at_or_under(name, zone.origin())
 }
@@ -358,9 +278,8 @@ fn in_zone(zone: &Zone, name: &str) -> bool {
 /// Put the records of `qtype` at `name` into the answer section, with their
 /// signatures.
 ///
-/// The answer echoes the name asked about rather than the stored owner, which
-/// may be `@`, relative, or a wildcard — and for a wildcard match the queried
-/// name is what the client must see (RFC 1034 §4.3.3).
+/// Echoes the name asked about, not the stored owner, which may be `@`, relative
+/// or a wildcard — the client must see the queried name (RFC 1034 §4.3.3).
 fn add_answer(zone: &Zone, name: &str, qtype: Qtype, dnssec_ok: bool, response: &mut DnsMessage) {
     for record in zone.query(name, qtype) {
         response.answers.push(ResourceRecord {
@@ -373,11 +292,9 @@ fn add_answer(zone: &Zone, name: &str, qtype: Qtype, dnssec_ok: bool, response: 
 
     if dnssec_ok {
         let signatures = dnssec_answer::answer_signatures(zone, name, qtype);
-        // A wildcard answer is not finished when its signature is attached. The
-        // same signature verifies at every name that wildcard reaches, so the
-        // answer also has to say that the name actually asked for is not in the
-        // zone (RFC 4035 §3.1.3) — otherwise one captured answer is a valid
-        // answer for all of them.
+        // The same signature verifies at every name the wildcard reaches, so a
+        // wildcard answer also owes a denial of the name asked for
+        // (RFC 4035 §3.1.3) — otherwise one captured answer serves for all.
         if signatures.wildcard.is_some() {
             response
                 .authorities
@@ -465,7 +382,7 @@ fn negative_ttl(soa: &rdns::zone::ZoneRecord) -> Ttl {
 /// A referral to the child zone: the delegation's NS RRset, its glue, and — for
 /// a client that can check it — the DS or the proof there is none.
 ///
-/// AA is **clear**, which is the whole point. This server hardcoded it true and
+/// AA is clear, which is the whole point. This server hardcoded it true and
 /// answered NXDOMAIN for names below a delegation, so per RFC 8020 every
 /// resolver cached "the entire subtree does not exist" and the child zone went
 /// off the internet for the negative TTL.
@@ -491,9 +408,7 @@ fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMes
     // anything discards the latter, and sending it is how cache-poisoning
     // attempts look (RFC 1034 §4.2.1).
     for target in targets {
-        // No fold: `is_at_or_under` compares case-insensitively, so the
-        // `to_ascii_lowercase` this used to do per glue target was paying for a
-        // guarantee the callee already gives (`TODO.md` #19h).
+        // No fold: `is_at_or_under` compares case-insensitively already.
         if !in_zone(zone, &zone.normalize_name(&target)) {
             continue;
         }
@@ -516,7 +431,7 @@ fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMes
     }
 }
 
-/// **RFC 1034 §4.3.2: the four cases an authoritative answer can be.**
+/// RFC 1034 §4.3.2: the four cases an authoritative answer can be.
 ///
 /// Three of the four were missing here, and the suite was green the whole time
 /// because it asserted what the code did — `CLAUDE.md` §1's opening example.
@@ -621,7 +536,7 @@ ns.sub   IN A   192.0.2.20
     }
 
     /// The referral, and the header bit that makes it one. This used to be an
-    /// NXDOMAIN with **AA=1**, so per RFC 8020 every resolver cached "the
+    /// NXDOMAIN with AA=1, so per RFC 8020 every resolver cached "the
     /// whole subtree does not exist" and the child zone was off the internet
     /// for the negative TTL.
     #[test]
@@ -793,7 +708,7 @@ ns.sub   IN A   192.0.2.20
     /// query for `\u{212A}.example.com.` therefore *selected* the zone
     /// `k.example.com.`, two names that are different bytes on the wire. The
     /// lookup inside then folded ASCII, found nothing, and the answer went
-    /// out as NXDOMAIN **with AA set** — an assertion that a name does not
+    /// out as NXDOMAIN with AA set — an assertion that a name does not
     /// exist anywhere, made by a server with no standing to make it, and
     /// cached by every resolver that hears it (`CLAUDE.md` §8). REFUSED is
     /// the answer for a name we hold no zone for.

@@ -1,29 +1,22 @@
 //! Negative caching, the plain kind (RFC 2308).
 //!
 //! A "no" costs the same to obtain as a "yes", so without this every repeat of a
-//! failing lookup is a fresh walk from the root — a typo, a stale link, a
-//! random-name flood.
+//! failing lookup is a fresh walk from the root.
 //!
 //! [`crate::nsec_cache`] caches denials too, but only validated ones, and
-//! validation is opt-in, so for most deployments it is switched off entirely.
-//! This is the other half: no signatures required, no synthesis — the same
-//! question asked again gets the same answer back, and nothing else does.
+//! validation is opt-in. This is the other half: no signatures, no synthesis.
 //!
-//! What keeps it honest:
+//! The rules:
 //!
-//! - **An SOA is required.** RFC 2308 §5 takes the negative TTL from the SOA in
-//!   the authority section, so a "no" that arrives without one has not told us
-//!   how long it is good for and is not cached at all.
-//! - **The TTL is the SOA's, bounded.** `min(SOA MINIMUM, the SOA record's own
-//!   TTL)`, then capped at [`MAX_NEGATIVE_TTL`] — RFC 2308 §5 and §7 both want a
-//!   ceiling, because a zone that publishes a week-long negative TTL should not
-//!   be able to make us deny a name it fixed an hour ago.
-//! - **NXDOMAIN is about the name, NODATA about one type.** "No such name" denies
-//!   every type at it, and everything below it (RFC 8020) — the resolver's walk
-//!   already takes that position, and it would be strange for the cache not to.
-//!   "No such type" denies exactly that type, and says nothing about any other.
-//! - **Nothing bogus is stored**, and whether an answer validated is stored with
-//!   it, so the AD bit a second client sees is the one the first client saw.
+//! - An SOA is required — RFC 2308 §5 takes the negative TTL from it, so a "no"
+//!   without one has not said how long it is good for.
+//! - The TTL is `min(SOA MINIMUM, the SOA record's own TTL)`, capped at
+//!   [`MAX_NEGATIVE_TTL`] so a week-long negative TTL cannot make us deny a name
+//!   the zone fixed an hour ago (RFC 2308 §5, §7).
+//! - NXDOMAIN denies every type at the name and everything below it (RFC 8020);
+//!   NODATA denies exactly one type.
+//! - Nothing bogus is stored, and whether an answer validated is stored with it,
+//!   so the AD bit a second client sees is the one the first client saw.
 
 use crate::dnssec::{canonical_name, label_count, suffix_labels};
 use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf};
@@ -33,11 +26,9 @@ use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// The longest a negative answer is held, whatever the zone's SOA claims.
-///
-/// RFC 2308 §5 asks for a configurable ceiling and §7 recommends one in the
-/// range of one to three hours; this is the low end of that, which is also what
-/// the validated denial cache uses.
+/// The longest a negative answer is held, whatever the SOA claims. RFC 2308 §7
+/// recommends one to three hours; this is the low end, matching the validated
+/// denial cache.
 pub const MAX_NEGATIVE_TTL: u32 = 3600;
 
 /// A cached "no", ready to be turned back into a response.
@@ -75,9 +66,8 @@ impl Entry {
 
 /// The two kinds of "no", each keyed the way it applies.
 ///
-/// Under one lock rather than two, because the capacity bound is on the cache as
-/// a whole: with a mutex per map, checking one while holding the other is a
-/// deadlock waiting for the first caller who does it.
+/// One lock, not two: the capacity bound is on the cache as a whole, and a mutex
+/// per map means checking one while holding the other.
 #[derive(Debug, Default)]
 struct Entries {
     /// By name: this name does not exist, so no type at it does either.
@@ -111,13 +101,12 @@ impl NegativeCache {
 
     /// Store the "no" in `response`, if that is what it is and it may be cached.
     ///
-    /// `secure` must be what validation actually concluded, and a bogus answer
-    /// must not be offered here at all: a cache is the one place a mistake
-    /// outlives the query that carried it.
+    /// `secure` must be what validation concluded, and a bogus answer must not
+    /// be offered here at all: a cache is where a mistake outlives its query.
     ///
-    /// Does nothing for a response that carries answer records — a CNAME chain
-    /// ending in NODATA is a negative answer in RFC 2308's terms, but the chain
-    /// is data the client needs and this cache has nowhere to put it.
+    /// A response with answer records is skipped: a CNAME chain ending in NODATA
+    /// is negative in RFC 2308's terms, but the chain is data with nowhere to go
+    /// here.
     pub fn insert(&self, qname: &str, qtype: Qtype, response: &DnsMessage, secure: bool) {
         if self.max_entries == 0 || !response.answers.is_empty() {
             return;
@@ -125,15 +114,13 @@ impl NegativeCache {
         let nxdomain = match response.rcode {
             ResponseCode::NoSuchDomain => true,
             ResponseCode::Ok => false,
-            // Anything else is a failure rather than an answer. RFC 2308 §7
-            // allows caching those briefly; a SERVFAIL we cached would be a
-            // transient upstream problem turned into a lasting one.
+            // A failure, not an answer. Caching SERVFAIL turns a transient
+            // upstream problem into a lasting one.
             _ => return,
         };
 
-        // The SOA is what says how long this answer is good for (RFC 2308 §5).
-        // Without one there is no negative TTL to honour, so there is nothing to
-        // store — this is also what keeps a referral out of the cache.
+        // The SOA says how long the answer is good for (RFC 2308 §5). Requiring
+        // one is also what keeps a referral out of the cache.
         let Some(soa_rr) = response
             .authorities
             .iter()
@@ -184,11 +171,8 @@ impl NegativeCache {
         let name = canonical_name(qname);
         let entries = self.entries.lock().ok()?;
 
-        // A cached NXDOMAIN denies every type at the name, and every name
-        // beneath it: nothing can exist under a name that does not exist, since
-        // a name with descendants is an empty non-terminal and answers NODATA
-        // (RFC 8020). So the walk up the ancestors *is* the lookup, deepest
-        // first, bounded by the label count.
+        // A cached NXDOMAIN denies every name beneath it too (RFC 8020), so the
+        // walk up the ancestors *is* the lookup, deepest first.
         for depth in (0..=label_count(&name)).rev() {
             let ancestor = suffix_labels(&name, depth);
             if let Some(entry) = entries
@@ -225,12 +209,8 @@ impl NegativeCache {
 }
 
 impl Entry {
-    /// This entry as an answer, with the TTLs counted down.
-    ///
-    /// Counting down matters as much here as in any cache: handing back the
-    /// original TTL lets the client hold the answer for its full life starting
-    /// now, which is how a five-minute negative answer becomes an hour-long one
-    /// passed from cache to cache.
+    /// This entry as an answer, TTLs counted down. Handing back the original
+    /// would let each cache in a chain restart the clock.
     fn answer(&self, now: u64) -> NegativeAnswer {
         let ttl = self.remaining(now);
         NegativeAnswer {
@@ -361,8 +341,7 @@ mod tests {
         assert!(cache.get("other.example.com.", Qtype::of(rt::A)).is_none());
     }
 
-    /// RFC 8020: nothing exists below a name that does not exist. The resolver's
-    /// walk already stops on an ancestor's NXDOMAIN; the cache agrees with it.
+    /// RFC 8020: nothing exists below a name that does not exist.
     #[test]
     fn test_nxdomain_denies_names_below_it() {
         let cache = NegativeCache::new(16);
@@ -382,8 +361,7 @@ mod tests {
         assert!(cache.get("gone2.example.com.", Qtype::of(rt::A)).is_none());
     }
 
-    /// NODATA is about one type. Denying the others would deny records that
-    /// exist — the name is there, after all.
+    /// NODATA is about one type: the name is there, so other types may be too.
     #[test]
     fn test_nodata_is_cached_for_that_type_only() {
         let cache = NegativeCache::new(16);
@@ -440,8 +418,8 @@ mod tests {
         assert!(answer.ttl <= MAX_NEGATIVE_TTL, "got {}", answer.ttl);
     }
 
-    /// The records handed back must count down too, or a client re-caching them
-    /// holds the answer for longer than we may.
+    /// The records handed back count down too, or a client re-caching them
+    /// holds the answer longer than we may.
     #[test]
     fn test_the_authority_records_count_down() {
         let cache = NegativeCache::new(16);
@@ -469,8 +447,7 @@ mod tests {
         );
     }
 
-    /// Without an SOA there is no negative TTL, so there is nothing to store.
-    /// This is also what keeps a referral — NS records, no SOA — out of here.
+    /// No SOA, no negative TTL — which also keeps referrals out.
     #[test]
     fn test_a_negative_answer_without_an_soa_is_not_cached() {
         let cache = NegativeCache::new(16);
@@ -503,8 +480,6 @@ mod tests {
         );
     }
 
-    /// A failure is not an answer. Caching SERVFAIL would turn a transient
-    /// upstream problem into a lasting one.
     #[test]
     fn test_servfail_is_not_cached() {
         let cache = NegativeCache::new(16);
@@ -521,8 +496,7 @@ mod tests {
         assert!(cache.is_empty());
     }
 
-    /// A response with records in the answer section is not this cache's to
-    /// hold: a CNAME chain ending in NODATA is data the client needs.
+    /// A CNAME chain ending in NODATA is data the client needs.
     #[test]
     fn test_a_response_with_answers_is_not_cached() {
         let cache = NegativeCache::new(16);

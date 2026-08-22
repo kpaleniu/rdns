@@ -1,21 +1,9 @@
 //! Domain-name compression for message output (RFC 1035 §4.1.4).
 //!
-//! A name can be written as a sequence of labels ending in a pointer to a name
-//! (or the tail of a name) that appeared earlier in the same message. Since
-//! most records in a response share a suffix with the question — often the
-//! whole owner name — this is where nearly all the size saving in a DNS
-//! response comes from.
-//!
-//! [`NameCompressor`] tracks, for one message being written, the offset at
-//! which every name suffix was first emitted. It is deliberately scoped to a
-//! single serialization pass: offsets are meaningless across messages.
-//!
-//! **Where compression is applied.** Owner names (question and RR name fields)
-//! always. Names *inside* RDATA only for the record types RFC 1035 defines,
-//! because a receiver that does not know a type cannot find the names in it to
-//! decompress — RFC 3597 §4 makes this a MUST NOT for newer types. That rules
-//! out SRV (RFC 2782), DNAME, and the DNSSEC types, whose embedded names RFC
-//! 4034 requires to stay uncompressed.
+//! [`NameCompressor`] is scoped to one serialization pass; offsets are
+//! meaningless across messages. Owner names are always compressed; names inside
+//! RDATA only for the types RFC 1035 defines, since a receiver cannot find names
+//! in a type it does not know (RFC 3597 §4, RFC 4034).
 
 use crate::dname::{
     dname_from_bytes, write_bytes, write_label, DNameUnpacker, POINTER_MASK, POINTER_TAG,
@@ -26,81 +14,32 @@ use crate::Rtype;
 use std::collections::HashMap;
 
 /// Per-message table of name suffixes already written, and where.
-///
-/// **Suffixes are ranges into one arena, not owned `String`s.** This used to be
-/// a `HashMap<String, u16>` filled by `labels[i..].join(".").to_ascii_lowercase()`
-/// — which allocates once to join and *again* to lowercase, since
-/// `to_ascii_lowercase` on a `str` returns a new `String` rather than mutating.
-/// Writing `www.example.com.` cold cost about eight allocations and a total byte
-/// count quadratic in the label count, because every suffix carried its own copy
-/// of the tail it shares with the others. Measured at 339 ns per name, which made
-/// compression the *majority* of response serialization: the whole rest of
-/// `to_bytes` for a three-record answer was under 400 ns.
-///
-/// A linear scan beats a hash here rather than merely tying it — **for the
-/// message shape that reasoning was measured on**, which is a query response. One
-/// of those holds a handful of distinct names, so the table is a handful of
-/// entries long; hashing a string costs a pass over it either way, and the
-/// `HashMap` had to be built and dropped per message on top of that.
-///
-/// It is false of every other caller of `to_bytes`, and that is `TODO.md` #24b:
-/// an AXFR envelope targets 16 KiB, which is 300-500 records, and the scan is one
-/// pass over the table per name written. Measured at 51 ns per name for 25 names
-/// and 663 for 800 — quadratic, and worsening in exactly the direction anyone
-/// tuning envelope size would push. See [`NameCompressor::index`].
 #[derive(Debug, Default)]
 pub struct NameCompressor {
-    /// Every name that contributed a suffix to the table, concatenated, in the
-    /// case it was written in.
+    /// Every name that contributed a suffix, concatenated, in the case written.
     ///
-    /// Not lowercased: [`NameCompressor::lookup`] compares case-insensitively,
-    /// so folding a stored copy would buy nothing and the fold would have to be
-    /// paid on the needle as well — which is an allocation per name looked up,
-    /// and looking a name up is what this type does. A name written *without*
-    /// contributing anything — one already in the table in full — is never
-    /// copied here at all.
+    /// Ranges into one arena: an owned `String` per suffix is quadratic in the
+    /// shared tail. Not lowercased — [`NameCompressor::lookup`] compares
+    /// case-insensitively, so folding here would only add a fold on the needle.
     arena: String,
     /// Suffixes of those names, as ranges into `arena` with the offset each was
     /// first written at. Never holds two entries for the same suffix.
     seen: Vec<Suffix>,
-    /// Folded hash of a suffix to its entry in `seen`, **built only once `seen`
-    /// outgrows [`SCAN_LIMIT`]** and empty before that.
+    /// Folded hash of a suffix to its entry in `seen`, built only once `seen`
+    /// outgrows [`SCAN_LIMIT`] and empty before that: a `HashMap` allocates on
+    /// its first insert, and a one-record response is held to three allocations.
     ///
-    /// Lazily, because the two message shapes want opposite answers and one of
-    /// them is the query path: a `HashMap` allocates on its first insert, and
-    /// `rdns/tests/allocations.rs` holds a one-record response at exactly three
-    /// allocations. A transfer envelope pays that one allocation and gets its
-    /// name lookups back in constant time; a response never reaches the
-    /// threshold and is byte-for-byte the code it was.
-    ///
-    /// **A hash collision drops the newer suffix rather than chaining it**, which
-    /// is why the value is one index and not a list. Compression is optional —
-    /// RFC 1035 §4.1.4 permits any name to be written in full — so a collision
-    /// costs a few bytes on the wire and nothing else, where a bucket per entry
-    /// would be an allocation per distinct name. The older entry is the one kept
-    /// on purpose: it has the lower offset, which is the better pointer target
-    /// anyway.
+    /// A hash collision drops the newer suffix rather than chaining it, so the
+    /// value is one index. Compression is optional (RFC 1035 §4.1.4), so a
+    /// collision costs a few bytes; the older entry kept has the lower offset.
     index: HashMap<u64, u32>,
 }
 
 /// How many suffixes the linear scan stays cheaper than an index for.
 ///
-/// **Measured on whole messages, which is the second answer this got.** Timing
-/// the compressor alone puts the crossover in the thirties, and a threshold of 32
-/// made `serialize a full-size response` — 60 names, an existing bench — **26%
-/// slower** (5.55 → 7.00 µs): building the map and hashing every lookup cost more
-/// at that size than the scan they replaced. Through `to_bytes_within_buf`:
-///
-/// | | scan | index at 128 |
-/// |---|---|---|
-/// | one record | 134.0 ns | 134.5 ns |
-/// | 60 names | 5.55 µs | 5.56 µs |
-/// | 400-record envelope | 130.7 µs | 42.8 µs |
-///
-/// So it sits where a response cannot reach it and a transfer envelope still
-/// does. `cargo bench -p rdns -- "serialize a"` is the measurement, and the
-/// number this replaced is `CLAUDE.md` §10's rule about measuring the thing
-/// rather than a proxy for it.
+/// Measured through `to_bytes_within_buf`, not on the compressor alone: at 60
+/// names scan and index tie at 5.55 µs, at a 400-record envelope the scan is
+/// 130.7 µs against 42.8. A threshold of 32 made the 60-name bench 26% slower.
 const SCAN_LIMIT: usize = 128;
 
 #[derive(Debug, Clone, Copy)]
@@ -131,11 +70,8 @@ impl NameCompressor {
             return write_bytes(buf, pos, &[0]);
         }
 
-        // Walk this name's suffixes longest-first, looking for one already in
-        // the message. Each needle is a slice of the caller's own name, so
-        // finding out whether a name is already here costs nothing at all —
-        // which matters because a response repeats one owner name across every
-        // record in it.
+        // Longest-first. Each needle is a slice of the caller's own name, so a
+        // lookup allocates nothing.
         let mut matched = None;
         for (i, start) in label_starts(trimmed).enumerate() {
             if let Some(target) = self.lookup(&trimmed[start..]) {
@@ -144,12 +80,9 @@ impl NameCompressor {
             }
         }
 
-        // Everything before the match is a suffix that will be written literally
-        // here, so note where it lands: a later name can point at it, and its
-        // tail continues correctly into whatever we emit after it (labels or a
-        // pointer). Everything from the match on is already recorded, and a name
-        // matched at its first label — `fresh == 0` — is recorded in full
-        // already and contributes nothing, not even a copy.
+        // The labels before the match are written literally here, so record
+        // where each lands as a target for a later name. From the match on is
+        // already recorded; `fresh == 0` contributes nothing, not even a copy.
         let fresh = matched.map_or_else(|| label_starts(trimmed).count(), |(i, _)| i);
         if fresh > 0 {
             let first_new = self.seen.len();
@@ -157,14 +90,11 @@ impl NameCompressor {
             self.arena.push_str(trimmed);
             let end = self.arena.len();
             for start in label_starts(trimmed).take(fresh) {
-                // Where this suffix lands in the message. A label costs its own
-                // bytes plus a one-byte length prefix on the wire, and its own
-                // bytes plus a separating `.` in the text — the same number
-                // either way, so the distance from the start of the name is the
-                // same on both sides and needs no running total.
+                // A label costs its bytes plus a length prefix on the wire and
+                // its bytes plus a `.` in the text, so the text offset is the
+                // wire offset.
                 let suffix_pos = pos + start;
-                // A pointer field is 14 bits, so a suffix past that is a target
-                // nothing can reach. Recording it would only slow the scan.
+                // A pointer field is 14 bits; a suffix past that is unreachable.
                 if suffix_pos <= POINTER_MASK as usize {
                     self.seen.push(Suffix {
                         start: (base + start) as u32,
@@ -176,11 +106,8 @@ impl NameCompressor {
             self.index_from(first_new);
         }
 
-        // The labels ahead of the match go out literally; `fresh` is exactly how
-        // many those are, whether or not anything matched. Split `trimmed`
-        // rather than the arena so the name keeps the case it was given — RFC
-        // 4343 folds case for *comparison*, and the arena copy exists for that
-        // and nothing else.
+        // Split `trimmed` rather than the arena so the name goes out in the case
+        // it was given: RFC 4343 folds case for comparison only.
         let mut out = pos;
         for label in trimmed.split('.').take(fresh) {
             out = write_label(buf, out, label)?;
@@ -193,28 +120,16 @@ impl NameCompressor {
 
     /// The offset a suffix was first written at, if it has been.
     ///
-    /// Case-insensitively, and **ASCII-only** (RFC 4343), which is the same rule
-    /// `utils::ascii_lowered` exists for: `str::to_lowercase` folds U+212A KELVIN
-    /// SIGN to `k`, and two names that differ on the wire must not compress
-    /// against each other. `eq_ignore_ascii_case` folds exactly the 26 letters
-    /// and nothing else.
-    /// The offset a suffix was first written at, if it has been.
+    /// Case-insensitive over ASCII only (RFC 4343): `str::to_lowercase` folds
+    /// U+212A KELVIN SIGN to `k`, and two names that differ on the wire must not
+    /// compress against each other. [`folded_hash`] folds identically or the
+    /// index would file a suffix where nothing looks for it.
     ///
-    /// Case-insensitively, and **ASCII-only** (RFC 4343), which is the same rule
-    /// `utils::ascii_lowered` exists for: `str::to_lowercase` folds U+212A KELVIN
-    /// SIGN to `k`, and two names that differ on the wire must not compress
-    /// against each other. `eq_ignore_ascii_case` folds exactly the 26 letters and
-    /// nothing else — and so does [`folded_hash`], which has to fold the same way
-    /// or the index would file a suffix where nothing looks for it.
+    /// Both arms compare against the arena, so the index is only an accelerator
+    /// and a collision cannot become a pointer to the wrong name.
     ///
-    /// **Both arms compare against the arena**, so the index is only ever an
-    /// accelerator. A hash that collided with a different suffix's would otherwise
-    /// be a pointer to the wrong name.
-    ///
-    /// That comparison is written out twice rather than shared, which is measured
-    /// rather than sloppy: as a method on `&self`, and again as one closure both
-    /// arms call, the scan below cost 51 -> 75 ns per name written — half again as
-    /// much, on the message shape the scan is the whole reason for.
+    /// The comparison is written out twice rather than shared: factoring it into
+    /// a method or a closure cost the scan 51 -> 75 ns per name.
     fn lookup(&self, needle: &str) -> Option<u16> {
         if self.index.is_empty() {
             let arena = self.arena.as_str();
@@ -237,8 +152,8 @@ impl NameCompressor {
             if self.seen.len() <= SCAN_LIMIT {
                 return;
             }
-            // The whole table, not just the new entries: everything before the
-            // threshold has only ever been reachable by the scan.
+            // The whole table: entries from before the threshold were only ever
+            // reachable by the scan.
             for i in 0..self.seen.len() {
                 self.note(i);
             }
@@ -306,14 +221,10 @@ impl NameCompressor {
 
 /// Where each label of `name` begins: byte 0, then one past every `.`.
 ///
-/// An iterator rather than the `Vec<usize>` this used to collect. A name has at
-/// most 127 labels and in practice four, so the vector was 64 bytes of heap per
-/// name written — two allocations on every query, which the DHAT profile
-/// (`TODO.md` #9e) ranked beside the whole rest of serialization. The two passes
-/// it is walked in are over at most 255 bytes and cost nothing measurable.
-///
-/// Splits on every `.`, exactly as `str::split` does, so an empty label is still
-/// produced here and still rejected by `write_label`.
+/// An iterator, not a `Vec`: collecting is an allocation per name written, and
+/// the two passes are over at most 255 bytes. Splits on every `.` as
+/// `str::split` does, so an empty label reaches `write_label` and is rejected
+/// there.
 fn label_starts(name: &str) -> impl Iterator<Item = usize> + '_ {
     std::iter::once(0).chain(
         name.bytes()
@@ -323,14 +234,11 @@ fn label_starts(name: &str) -> impl Iterator<Item = usize> + '_ {
     )
 }
 
-/// FNV-1a over the ASCII-folded bytes (RFC 4343), which is what [`lookup`]
-/// compares on — a hash that folded differently from the comparison would file a
-/// suffix where nothing looks for it.
+/// FNV-1a over the ASCII-folded bytes (RFC 4343), folding exactly as [`lookup`]
+/// compares.
 ///
-/// **Deliberately not a DoS-resistant hash.** A collision here drops a
-/// compression target, so the most a chosen name can buy is a few extra bytes in
-/// one message; SipHash's guarantee has nothing to protect and costs several
-/// times FNV on the short strings this hashes.
+/// Not DoS-resistant on purpose: a collision drops a compression target, so a
+/// chosen name buys a few extra bytes in one message and nothing else.
 ///
 /// [`lookup`]: NameCompressor::lookup
 fn folded_hash(name: &str) -> u64 {
@@ -355,18 +263,11 @@ fn read_name(data: &[u8]) -> Result<(String, &[u8]), WireError> {
 mod tests {
     use super::*;
 
-    /// Writing a name must not cost more because the message already holds many.
+    /// Cost per name written does not grow with the size of the message: a
+    /// ratio between 25 names and 800, so it is machine-independent.
     ///
-    /// **A ratio, not a floor** (`CLAUDE.md` §10): the same work per name, timed
-    /// on a message of 25 distinct names and one of 800, on whatever machine is
-    /// running it. The scan read 51 ns per name at 25 and 663 at 800 — a factor of
-    /// 13, which is `TODO.md` #24b — and the index reads 53 and 112.
-    ///
-    /// The threshold is 5 rather than §10's usual factor of ten because the true
-    /// ratio is about 2 and the defect's was 13, so anything between the two
-    /// discriminates. What is left is cache rather than the table: at 800 names
-    /// the arena, `seen` and the index have all outgrown L1, and no lookup scheme
-    /// avoids that.
+    /// The true ratio is ~2 (53 ns to 112, the residue being cache, not the
+    /// table) and an unindexed scan's is 13, so 5 discriminates.
     #[test]
     fn writing_a_name_costs_the_same_however_many_the_message_holds() {
         let per_name = |count: usize| {
@@ -382,8 +283,8 @@ mod tests {
                         for name in &names {
                             pos = c.write_name(name, &mut buf, pos).expect("fits");
                         }
-                        // Every name here is meant to be a compression target, so
-                        // none may have landed past the 14-bit pointer range.
+                        // Every name here must be a compression target, so none
+                        // may land past the 14-bit pointer range.
                         assert!(pos < POINTER_MASK as usize);
                     }
                     start.elapsed() / (20 * count) as u32
@@ -403,18 +304,14 @@ mod tests {
 
     /// A suffix recorded before the table outgrew the scan is still found after.
     ///
-    /// The index is built from the whole of `seen` at the crossover for exactly
-    /// this. An entry only the scan had ever reached would quietly stop matching,
-    /// and every later name carrying that suffix would go out in full — a message
-    /// that is still correct and merely bigger, which is the kind of defect
-    /// nothing notices (`CLAUDE.md` §4).
+    /// Missing one costs bytes and not correctness, so nothing else would catch
+    /// it.
     #[test]
     fn a_suffix_from_before_the_index_is_still_found_after_it() {
         let mut c = NameCompressor::new();
         let mut buf = vec![0u8; 0x4000];
 
-        // `example.com.` is recorded here, while the table is still scanned, at
-        // 12 for the header plus the six bytes of `5first`.
+        // `example.com.` lands at 18: 12 for the header plus `5first`.
         let mut pos = c.write_name("first.example.com.", &mut buf, 12).unwrap();
         for i in 0..SCAN_LIMIT + 8 {
             pos = c
@@ -430,12 +327,8 @@ mod tests {
         );
     }
 
-    /// The index folds case exactly as the comparison does, and no further.
-    ///
-    /// Two spellings of one name must hash together, or the index files a suffix
-    /// where nothing looks for it. `k` and U+212A KELVIN SIGN must *not*, which is
-    /// the fold `str::to_lowercase` gets wrong and this codebase has been bitten
-    /// by twice (`CLAUDE.md` §8).
+    /// The index folds case exactly as the comparison does, and no further:
+    /// `k` and U+212A KELVIN SIGN are different names (RFC 4343).
     #[test]
     fn the_index_folds_the_same_ascii_the_comparison_does() {
         assert_eq!(folded_hash("Example.COM"), folded_hash("example.com"));
@@ -512,14 +405,8 @@ mod tests {
         assert_eq!(&buf[pos..end], &[0]);
     }
 
-    /// The suffix table used to hold an owned, separately-allocated `String` per
-    /// suffix, so `a.b.c.d.example.com.` stored six keys totalling 84 bytes for
-    /// a 20-byte name — a copy of the shared tail per label, quadratic in label
-    /// count, on top of one discarded intermediate `String` per suffix from the
-    /// `join` that built it. Suffixes are ranges into one copy now.
-    ///
-    /// Asserted on bytes held rather than on a timing, because it is exact and
-    /// does not care what else is running (`CLAUDE.md` §10).
+    /// A name's suffixes share one arena copy: an owned `String` per suffix is
+    /// quadratic in the label count. Asserted on bytes held, which is exact.
     #[test]
     fn a_names_suffixes_are_stored_once_between_them_not_once_each() {
         let mut c = NameCompressor::new();
@@ -545,10 +432,8 @@ mod tests {
         );
     }
 
-    /// A name already known in full adds nothing at all — and, since the lookup
-    /// compares against the caller's own bytes, nothing is copied in order to
-    /// find that out either. A response repeating one owner name across twenty
-    /// records touches the arena once, for the first.
+    /// A name already known in full adds nothing, and finding that out copies
+    /// nothing: the lookup compares against the caller's own bytes.
     #[test]
     fn a_fully_matched_name_leaves_the_table_and_the_arena_untouched() {
         let mut c = NameCompressor::new();
@@ -577,8 +462,7 @@ mod tests {
         let pos = c.write_name("example.com.", &mut buf, far).unwrap();
         assert_eq!(pos - far, 13);
 
-        // The second copy has nothing reachable to point at, so it is written
-        // out in full as well.
+        // Nothing reachable to point at, so the second copy is written in full.
         let end = c.write_name("example.com.", &mut buf, pos).unwrap();
         assert_eq!(end - pos, 13);
     }
