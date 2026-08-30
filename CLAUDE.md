@@ -402,7 +402,11 @@ Cheap to re-check, expensive to rediscover.
   trustworthy. `rdns/tests/allocations.rs` got two numbers wrong first: the DHAT
   profiler is *global*, so guarding only the measurement let other test threads'
   allocations land in the total (4 read as 12, 208 as 1015, varying with
-  `--test-threads`) — every test now holds the mutex for its whole body. And the
+  `--test-threads`) — every test now holds the mutex for its whole body. That was
+  not enough, because the threads that allocate are libtest's and no mutex here
+  can hold them: CI read 10 for a parse that reads 6 on four machines and passed
+  on a re-run of the same commit, so the count is now tallied per thread in front
+  of dhat (`Counting`), and dhat supplies only the peak-bytes figures. And the
   first profiled block in a process picks up a one-off, which for a target of zero
   flips on scheduling order; call the function once before measuring. Check counts
   are stable across runs.
@@ -692,8 +696,9 @@ Three limits, so this does not become its own kind of damage:
 - Measure it, do not assume it. Most of these are `#[repr(transparent)]` newtypes
   that compile to the same code — but "zero-cost" is a claim about a compiler, not
   a fact about a diff. `cargo test -p rdns --test allocations -- --nocapture`
-  holds eighteen counts, twelve exact, and reads the same on Windows and Linux;
-  `cargo bench -p rdns --baseline` is the backstop. Identical counts or lower; a
+  holds twenty-two counts, fourteen exact, and reads the same on Windows and
+  Linux; `cargo bench -p rdns --baseline` is the backstop. Identical counts or
+  lower; a
   count that moves up is accepted only with the reason written next to the
   assertion (§10's rule about never lowering a floor).
 - Not everything wants a type. A typestate marker to catch one bug that now has a

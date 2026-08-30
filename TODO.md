@@ -200,9 +200,10 @@ the note there. `cargo clippy --workspace --all-targets` is clean there too,
 which is the half Windows cannot check at all.
 
 **Two of those single tests are worth more than their count suggests.**
-`allocations` reports **nineteen** measurements, **thirteen** of them exact
-(`n..=n`) — the earlier claim of "fourteen exact" on this page was never counted
-and was wrong both ways; five are deliberate ranges and one
+`allocations` reports **twenty-two** measurements, **fourteen** of them exact
+(`n..=n`) — nineteen and thirteen when this was written, and the claim of
+"fourteen exact" before that was never counted and was wrong both ways; seven
+are deliberate ranges and one
 (`verify a DNSKEY RRset with two candidate signatures`) is `0..=u64::MAX`, a
 figure printed on purpose and asserted on purpose not at all, because §10 found
 it is a time problem and not a count problem. `no_input_panics` runs 1,506
@@ -215,10 +216,19 @@ loader (there are no mode bits on Windows), and thirteen for the control socket,
 which needs a Unix domain socket and so is `#[cfg(unix)]` in its entirety.
 
 **The allocation counts are the same on both platforms**, which is worth a line
-because it is not obvious: `dhat` counts calls into the global allocator, so what
-it measures does not depend on whether glibc's malloc or Windows' heap is
-underneath. Every exact assertion in `rdns/tests/allocations.rs` (0, 1, 2, 2, 3,
-3 and 4) reads the same on Linux.
+because it is not obvious: what is counted is calls into the global allocator, so
+it does not depend on whether glibc's malloc or Windows' heap is underneath.
+Every exact assertion in `rdns/tests/allocations.rs` (0, 1, 2, 2, 3, 3 and 4)
+reads the same on Linux.
+
+The counting moved out of `dhat` on 2026-08-30, having been read from its
+`total_blocks` since the file was written: those counters are global, so another
+thread allocating inside a window of a few microseconds lands in the total. CI
+read 10 for the EDNS parse that reads 6 on Windows (rustc 1.95 and 1.98) and
+Linux (1.97.1, and stable 1.98 in a fresh clone run in CI's step order),
+and the same commit passed on a re-run. The file counts its own thread's calls
+now; what holds that is a probe of a hundred parses beside a thread allocating in
+a loop — 300, against 687 for the version that asked dhat.
 
 `cargo clippy --workspace --all-targets` and `cargo fmt --all --check` are clean
 **on Windows**; ~~the image used for the Linux runs has no clippy package,

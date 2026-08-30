@@ -7,9 +7,15 @@
 //! mutex here can hold, so as separate tests one measurement read 15 where it
 //! reads 7. Assertions are ranges only where the thing measured has a degree of
 //! freedom; update one with the reason, as a benchmark floor is updated.
+//!
+//! Counts come from [`Counting`], which tallies per thread, because a mutex
+//! cannot make a global counter exact: see [`allocations`]. dhat still supplies
+//! the peak-bytes figures, which are about the whole heap by definition.
 
 use rdns::Class;
 use rdns::Rtype;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Rrset, RrsetProof};
@@ -23,7 +29,76 @@ use rdns::{
 };
 
 #[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
+static ALLOC: Counting = Counting;
+
+/// dhat, with a per-thread tally of the allocator calls in front of it.
+///
+/// Everything is passed through to [`dhat::Alloc`], so the peak-bytes
+/// measurements are unchanged. What is added is the count: dhat's own is a
+/// global, and this is the file that cannot use one (see [`allocations`]).
+struct Counting;
+
+thread_local! {
+    /// Allocator calls made by this thread: `alloc`, `alloc_zeroed` and
+    /// `realloc`, which is what dhat's `total_blocks` counts, so no expected
+    /// number in this file moves.
+    static BLOCKS: Cell<u64> = const { Cell::new(0) };
+    /// True while this thread is inside an allocator call.
+    static INSIDE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// This thread's allocator calls so far.
+fn blocks() -> u64 {
+    BLOCKS.with(Cell::get)
+}
+
+/// Enter one allocator call, counting it if `count` and this is the outermost
+/// one on this thread. Nested calls are dhat's own bookkeeping, not the
+/// caller's cost — which is why every entry point takes this guard, including
+/// the one that counts nothing.
+///
+/// `try_with`: a thread allocating while its own TLS is being destroyed must
+/// not resurrect the key. Both cells are `const`-initialized and have no
+/// destructor, so the access itself never allocates and cannot recurse.
+fn enter(count: bool) -> impl Drop {
+    struct Guard(bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.0 {
+                let _ = INSIDE.try_with(|c| c.set(false));
+            }
+        }
+    }
+    let outermost = INSIDE.try_with(|c| !c.replace(true)).unwrap_or(false);
+    if outermost && count {
+        let _ = BLOCKS.try_with(|b| b.set(b.get() + 1));
+    }
+    Guard(outermost)
+}
+
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _entered = enter(true);
+        unsafe { dhat::Alloc.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _entered = enter(true);
+        unsafe { dhat::Alloc.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let _entered = enter(true);
+        unsafe { dhat::Alloc.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // `total_blocks` is allocations, so nothing is counted here — the guard
+        // is for what dhat may allocate while recording the free.
+        let _entered = enter(false);
+        unsafe { dhat::Alloc.dealloc(ptr, layout) }
+    }
+}
 
 /// Every measurement in this file, in one test; see the module header for why.
 #[test]
@@ -39,6 +114,7 @@ fn allocation_counts() {
     scanning_a_plain_query_for_a_tsig_allocates_nothing();
     comparing_two_names_allocates_nothing();
     verifying_an_rrset_against_two_candidate_signatures();
+    a_busy_neighbour_stays_out_of_the_count();
 }
 
 /// Two measured bodies must not overlap: the profiler is global, so an
@@ -64,17 +140,19 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
-/// Run `body` under a profiler and report how many allocations it made.
+/// Report how many allocations `body` made on this thread.
 ///
-/// Call only while holding [`exclusive`].
+/// Counted here rather than read from dhat because dhat's counters are global:
+/// any other thread allocating inside the window lands in the total, and the
+/// windows are microseconds, so the failure is rare and remote. A CI run read
+/// 10 for a parse that reads 6 on four machines, and passed on re-run.
+/// [`exclusive`] cannot fix that — the threads that allocate are libtest's, not
+/// this file's. Measurements are still taken under it, because [`peak_bytes`]
+/// needs the profiler to itself.
 fn allocations<T>(body: impl FnOnce() -> T) -> (T, u64) {
-    let profiler = dhat::Profiler::builder().testing().build();
-    let before = dhat::HeapStats::get().total_blocks;
+    let before = blocks();
     let out = body();
-    let after = dhat::HeapStats::get().total_blocks;
-    // `HeapStats::get` panics without a live profiler.
-    drop(profiler);
-    (out, after - before)
+    (out, blocks() - before)
 }
 
 /// Run `body` under a profiler and report the most memory it held at once.
@@ -302,6 +380,41 @@ fn reading_a_requests_edns_parameters_allocates_nothing() {
         full_count,
         2..=2,
     );
+}
+
+/// A neighbouring thread's allocations are not this thread's.
+///
+/// Against dhat's global `total_blocks` this reads high, by however much the
+/// neighbour got through — which is the shape of the CI failure that prompted
+/// the change: 10 for a parse that reads 6 on four machines, green on a re-run
+/// of the same commit.
+fn a_busy_neighbour_stays_out_of_the_count() {
+    let wire = query_bytes("www.example.com.", Qtype::of(record_types::A));
+    let _warm = DnsMessage::try_from_bytes(&wire);
+
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    static STOP: AtomicBool = AtomicBool::new(false);
+    let neighbour = std::thread::spawn(|| {
+        RUNNING.store(true, Ordering::Release);
+        while !STOP.load(Ordering::Relaxed) {
+            std::hint::black_box(vec![0u8; 64]);
+        }
+    });
+    while !RUNNING.load(Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+
+    // A hundred parses, not one: a window of a few microseconds is one a
+    // neighbour can miss, and a proof that holds by luck is not one.
+    let (_, count) = allocations(|| {
+        for _ in 0..100 {
+            std::hint::black_box(DnsMessage::try_from_bytes(&wire).expect("parse"));
+        }
+    });
+    STOP.store(true, Ordering::Relaxed);
+    neighbour.join().expect("the neighbour thread");
+
+    within("a hundred parses beside a busy thread", count, 300..=300);
 }
 
 /// Name compression is most of response serialization by time. This is what it
