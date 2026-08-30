@@ -1,7 +1,7 @@
 # rdns — behavioural specification
 
-What the code does today, derived by reading it on 2026-08-03 at commit `6882b1e`
-and revised the same day at `e2ebaef`. Nine commits landed between those two and
+What the code does today, derived by reading it on 2026-08-03 at commit `5506612`
+and revised the same day at `262b5f3`. Nine commits landed between those two and
 closed most of what the first reading recorded as a gap; those entries are struck
 through and kept. Where the code and an RFC disagree, the disagreement is
 recorded as a deviation.

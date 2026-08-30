@@ -1,7 +1,7 @@
 # 7. RFC conformance, deviations and gaps
 
-Compiled by reading the code on 2026-08-03 at commit `6882b1e`, revised the same
-day at `e2ebaef`, by which point nine commits had closed most of what it
+Compiled by reading the code on 2026-08-03 at commit `5506612`, revised the same
+day at `262b5f3`, by which point nine commits had closed most of what it
 recorded. Closed entries are struck through and kept: what a gap *was* is the
 useful half, and a table showing only the present state would lose the reason
 each row exists (`CLAUDE.md` §11).
@@ -109,7 +109,7 @@ so a message longer than 65,535 octets is framed with a wrapped length. At
 exactly 65,536 the prefix is **0**, which both daemons' read loops treat as a
 broken peer.~~
 
-Fixed in `c9cc5c9` (`TODO.md` #17). `rdns::framed` is the one writer and returns
+Fixed in `ad5ed65` (`TODO.md` #17). `rdns::framed` is the one writer and returns
 `WireError::TooLong` rather than casting; `tsig::append_tsig` — the only path
 that can grow a message past the size it was serialized to — refuses rather than
 producing something no framing can express. The regression test is the sweep that
@@ -139,7 +139,7 @@ rather than a reason to make it predictable.
 U+212A KELVIN SIGN onto `k`, so a NOTIFY naming a Kelvin-sign variant of a
 replicated zone folded onto that zone.~~
 
-Fixed in `85c864c` (`TODO.md` #19a). Both sites, and the replicated-zone check
+Fixed in `262b5f3` (`TODO.md` #19a). Both sites, and the replicated-zone check
 the dynamic-UPDATE path added the same day, now go through
 `utils::absolute_lowered`, so all three agree by construction rather than by
 having been written to match.
@@ -179,7 +179,7 @@ suggest should not be.
 `validation::RequestValidator` and `readiness::Readiness`. `rdnsr` uses none of
 them, and is the more amplifying of the two daemons.~~
 
-Fixed in `b523861` (`TODO.md` #18). `rdnsr` gained `--query-rate`,
+Fixed in `ad5ed65` (`TODO.md` #18). `rdnsr` gained `--query-rate`,
 `--query-burst`, `--query-rate-exempt`, `--response-rate` and
 `--metrics-listen`, all through the same library types and the same
 `RateLimitConfig::per_second` units. The query-rate default is 200 against
@@ -191,10 +191,10 @@ server's are resolvers.
 ~~A request over the UDP size cap, or with absurd section counts, reaches the
 parser rather than being refused before it.~~
 
-Fixed in `b523861`, and the decision was made out loud as `TODO.md` #18 asked.
+Fixed in `ad5ed65`, and the decision was made out loud as `TODO.md` #18 asked.
 The check is wired in on the pre-admission path, after the rate limit and before
 the in-flight semaphore. The type is now called `AdmissionCheck`, because after
-`85c864c` (#19e) that is what it is: size and section-count caps, and no longer a
+`262b5f3` (#19e) that is what it is: size and section-count caps, and no longer a
 second, weaker copy of the parser's name rules.
 
 ### G-3 — three metrics are exported and never incremented — **fixed 2026-08-03**
@@ -203,7 +203,7 @@ second, weaker copy of the parser's name rules.
 `dns_queries_recursive_total`. `DnsMetrics` is used only by `rdnsd`, which has no
 cache and never recurses, so a dashboard computing a hit rate gets 0/0.~~
 
-Fixed in `b523861` (`TODO.md` #19d), by the second of the two routes that item
+Fixed in `ad5ed65` (`TODO.md` #19d), by the second of the two routes that item
 offered: they moved rather than being deleted, because nothing about them was
 wrong — they were in a binary with no cache. `rdnsr` counts `cache_hits` on each
 of its three cache paths and `cache_misses` with `queries_recursive` where a
@@ -216,8 +216,8 @@ counter with no home there, and is deliberately never touched.
 prerequisites against a zone and stops. **No binary references it**; `rdnsd`
 answers NOTIMP for opcode UPDATE.~~
 
-The gap was real when it was written and was closed the same day by `dcfe861`,
-`9051d4e` and `8169f0d`: `rdnsd` now answers opcode UPDATE on both transports,
+The gap was real when it was written and was closed the same day by `fedf8d9`,
+`fedf8d9` and `fedf8d9`: `rdnsd` now answers opcode UPDATE on both transports,
 authorized per key, applied, persisted to the zone file and served. See
 `TODO.md` #10.
 
@@ -225,7 +225,7 @@ The observation that produced this row is worth keeping even though the row is
 closed, because it generalizes past this feature: a library that carries a
 tested, unreachable feature has a test suite that cannot tell it from a working
 one. That is `CLAUDE.md` §1 at module scale, and it is exactly how the
-RDLENGTH=0 defect (`1461036`) survived — every test in `update.rs` built its
+RDLENGTH=0 defect (`eff4fcb`) survived — every test in `update.rs` built its
 message in memory, so the one boundary a real UPDATE crosses was the one nothing
 exercised. The end-to-end tests added with the dispatch cross it deliberately.
 
@@ -235,7 +235,7 @@ exercised. The end-to-end tests added with the dispatch cross it deliberately.
 semaphore, unlike `rdnsd`'s and `rdnsr`'s DNS TCP loops. The only accept loop in
 the workspace without a bound.~~
 
-Fixed in `85c864c` (`TODO.md` #19h). Bounded at 16, and `try_acquire` rather than
+Fixed in `262b5f3` (`TODO.md` #19h). Bounded at 16, and `try_acquire` rather than
 `acquire`: a scrape that has to queue is one whose sample is stale by the time it
 is served, so closing the socket — which a collector reads as a failed scrape — is
 the honest answer.

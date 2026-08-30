@@ -11,6 +11,7 @@
 # cargo fmt --all: the first run, 36 files. The repo predates the formatter.
 #
 # This hash changed on 2026-08-01, when the session-URL trailers were stripped
-# from every commit message and the history was rewritten. A stale entry here is
-# not cosmetic: `git blame` fails outright on a revision it cannot resolve.
-32fb31d76f416d72db73bf4a4a8a4e9792c1f74b
+# from every commit message, and again on 2026-08-30, when the history was
+# squashed into a 54-patch series. A stale entry here is not cosmetic: `git
+# blame` fails outright on a revision it cannot resolve.
+dc5b9ca8be5ffd52d16f32f86b0304ac233ca739

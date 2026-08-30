@@ -118,7 +118,7 @@ fair, so `try_read` fails while a writer is merely *queued*: the metric was
 measuring scheduler wake latency, and its denominator was the sampler's own spin
 rate, which is not a clock. The test measures a window of *time* against a
 baseline diff it times on the machine it is running on now. Fixed and verified
-both ways under starvation (`59cc900`).
+both ways under starvation (`8758476`).
 
 The warning was `actions/checkout@v4` targeting Node 20, bumped to `@v5` in the
 same commit. It showed up in several jobs' logs, one of which is named `licences
@@ -145,6 +145,27 @@ inside it, the commit references in "Done so far" and the entry in
 `.git-blame-ignore-revs` were remapped by matching subjects, and every one
 resolves. The blame file is the one that would have failed loudly rather than
 quietly — `git blame` refuses a revision it cannot resolve.
+
+**The history was rewritten again on 2026-08-30, into a series of 54
+patches.** 218 commits became 54. The machine this is developed on was
+removed from every blob and every message, not only from the tracked files at
+the tip; the OpenTelemetry exporter was removed from the code and from every
+lock file it appeared in; nine add-then-delete planning documents and a
+checked-in `dnssec.rs.backup` were dropped; and what remained was squashed to
+one patch per logical change, each with a message written to the convention in
+`CLAUDE.md` §11. The tree at the old head and the tree at the new one are
+byte-identical, and every patch in the series compiles on its own.
+
+Three consequences worth knowing. A hash written down outside this repository
+is dangling for the second time. `git log -S` for the OpenTelemetry exporter
+finds nothing, so `CLAUDE.md` §14 keeps the finding while the diff that
+produced its numbers is gone: `git show` on the commit that deleted it reports
+`Cargo.lock` going from 109 packages to 104, where §14 says 187 to 104 — the
+83 crates the exporter dragged in were scrubbed from the history one commit at
+a time rather than at that commit. And the commit references in this file, in
+`docs/` and in `.git-blame-ignore-revs` were remapped again by matching
+subjects; several now point at one patch, because the commits they named were
+squashed together.
 
 **Green as of the last commit**, on both platforms and checked on both:
 
@@ -610,7 +631,7 @@ than cache-bound.~~ — **stale within the day, for the sixth time. #23-#26 were
 filed later on 2026-08-04** from a second architecture review, this one aimed at
 algorithmic shape rather than structure. ~~**#23 is the one with teeth**: a query
 that costs a second of CPU on `rdnsr --dnssec-validate`, provoked and timed.~~
-**#23 is fixed** (`71126f1`, 2026-08-04) — seventh time, same day again. ~~#22 and
+**#23 is fixed** (`9715c3c`, 2026-08-04) — seventh time, same day again. ~~#22 and
 #24-#26 are open.~~ — **all of #24 fixed 2026-08-05**, so read the table: #22,
 #25 and #26 are open.
 
@@ -656,8 +677,8 @@ it, and the rule it became in `CLAUDE.md`:
 | **7** | the secondary role, in six steps | **all six done 2026-08-03.** Step 6, persisted deltas, waited on #10 and landed with it: `rdns/src/journal.rs` |
 | **8** | what signing turned up — the re-signing timer and its serial | done |
 | **9** | what a five-way review found: 48 defects in six groups (9a-9f) | **all done, 2026-07-27 → 2026-08-01.** The patterns became `CLAUDE.md`, which is the useful artefact; the 2,435 lines of finding text are in `git log -p TODO.md` |
-| **10** | dynamic UPDATE (RFC 2136) | **done 2026-08-03**, seven commits. Reading (`2f94124`, `1461036`), applying and the serial (`dcfe861`), authorization (`9051d4e`), dispatch and persistence (`8169f0d`). Incremental re-signing (`3b2886a`) and the journal (#7 step 6) closed it |
-| **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`71126f1`), the day after it was filed. 1 124 ms → 1.28 ms on the same probe. The fix is a type — `Nsec3Params`, the triple a hash is a function of — plus the map lookup the key was already there for, and the proof moved out from under the lock. One of the four filed boxes did not survive being checked against the code: NSEC3 hides how deep a cached name is, so the depth bound it asked for is not available to take |
+| **10** | dynamic UPDATE (RFC 2136) | **done 2026-08-03**, seven commits. Reading (`8ff74db`, `eff4fcb`), applying and the serial (`fedf8d9`), authorization (`fedf8d9`), dispatch and persistence (`fedf8d9`). Incremental re-signing (`fedf8d9`) and the journal (#7 step 6) closed it |
+| **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`9715c3c`), the day after it was filed. 1 124 ms → 1.28 ms on the same probe. The fix is a type — `Nsec3Params`, the triple a hash is a function of — plus the map lookup the key was already there for, and the proof moved out from under the lock. One of the four filed boxes did not survive being checked against the code: NSEC3 hides how deep a cached name is, so the depth bound it asked for is not available to take |
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection was O(zones per query) — 55 µs at ten thousand zones, now 32 ns and flat, keyed on `NameKeyBuf` with a walk up the QNAME, and the walk brought a second multiplier with it that the client picks. Name compression was O(n²) in the records of one message, so a 400-record transfer envelope cost 130.7 µs to serialize and now costs 42.8; the index that fixes it is built lazily, because the threshold that helps a transfer hurt a 60-name response by 26%. And an AXFR held the zone three times over before the first byte went out; the envelopes are an iterator now, at 10.5× less peak memory, which needed `Arc<Zone>` in the map because the lock cannot be held across a socket write |
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
@@ -743,7 +764,7 @@ choice again; the numbered order below is age, not priority.
 > the whole of it, because the NSEC3 lookup re-hashes the name once per cached
 > record instead of once. The map it should be asking is already keyed by the
 > hash. Timed, not argued — the numbers and the shape of the regression test are
-> in §23.~~ — **fixed the day after it was filed** (`71126f1`), 1 124 ms → 1.28
+> in §23.~~ — **fixed the day after it was filed** (`9715c3c`), 1 124 ms → 1.28
 > ms. Everything below is a choice again.
 
 > **1. Push, and read the second CI run.** Everything the first one reported is
@@ -751,7 +772,7 @@ choice again; the numbered order below is age, not priority.
 >
 > - **The Windows `build and test` job failed**
 >   `a_reload_does_not_hold_the_write_lock_across_its_diffs`, and the test was
->   wrong rather than the code. Fixed in `59cc900`; the reasoning is in "Current
+>   wrong rather than the code. Fixed in `8758476`; the reasoning is in "Current
 >   state" and in the test's own doc comment.
 > - **`actions/checkout@v4` targets Node 20**, which the runner now forces onto
 >   Node 24. Bumped to `@v5` across all six jobs in the same commit. This warning
@@ -888,11 +909,11 @@ is served — in that order, with the write before the install. Five commits:
 
 | | |
 |---|---|
-| `2f94124` | read an UPDATE and check its prerequisites |
-| `1461036` | RDLENGTH=0 is a record, so a legal UPDATE could be parsed at all |
-| `dcfe861` | apply the changes, and settle the serial |
-| `9051d4e` | a key that may transfer a zone may not thereby rewrite it |
-| `8169f0d` | serve it, and persist it before answering |
+| `8ff74db` | read an UPDATE and check its prerequisites |
+| `eff4fcb` | RDLENGTH=0 is a record, so a legal UPDATE could be parsed at all |
+| `fedf8d9` | apply the changes, and settle the serial |
+| `fedf8d9` | a key that may transfer a zone may not thereby rewrite it |
+| `fedf8d9` | serve it, and persist it before answering |
 
 **The finding, which set the shape of the last commit and was not in the plan.**
 Persisting an update looks like a step *after* dispatch — the reason to do it is
@@ -1084,11 +1105,11 @@ what happened is the only way the next estimate gets better.
 
 | the item, as filed | outcome |
 |---|---|
-| the prerequisite section (§2.4), a small query language checked before any change | done in `2f94124`, and it was the largest of the six |
-| authorization per zone on top of TSIG, inheriting #9d's shape | done in `9051d4e`. The shape was inherited; the *default* was not, and that turned out to be the whole decision |
-| serial handling, which **collides with #8** | done in `dcfe861`, and the collision was not one: #8's `add`-rather-than-`max` had already settled it. Worth noting as an estimate that was pessimistic for a good reason — the earlier decision was right for reasons that also covered this |
+| the prerequisite section (§2.4), a small query language checked before any change | done in `8ff74db`, and it was the largest of the six |
+| authorization per zone on top of TSIG, inheriting #9d's shape | done in `fedf8d9`. The shape was inherited; the *default* was not, and that turned out to be the whole decision |
+| serial handling, which **collides with #8** | done in `fedf8d9`, and the collision was not one: #8's `add`-rather-than-`max` had already settled it. Worth noting as an estimate that was pessimistic for a good reason — the earlier decision was right for reasons that also covered this |
 | re-signing the changed names only | **still open**, and now the only performance item here |
-| writing the zone back out, which `zone_writer` already does | done in `8169f0d`. Filed as the small one; it was the one that set the design, for the reason under "the finding" above |
+| writing the zone back out, which `zone_writer` already does | done in `fedf8d9`. Filed as the small one; it was the one that set the design, for the reason under "the finding" above |
 | then #7.6, the journal | **still open**, and unblocked rather than done |
 
 Estimate at filing: **1.5-2 weeks**, and after the reading half landed, "the bulk
@@ -1261,7 +1282,7 @@ Two directions, and the first is much safer than the second.
 Re-measure with `rdns/examples/zone_lookup_probe.rs`, which is what produced the
 numbers above and prints nothing that would need re-deriving.
 
-### 23. `NsecCache::synthesize` hashes once per cached record, under one mutex — **fixed 2026-08-04** (`71126f1`)
+### 23. `NsecCache::synthesize` hashes once per cached record, under one mutex — **fixed 2026-08-04** (`9715c3c`)
 
 **A remote CPU-exhaustion vector in `rdnsr --dnssec-validate`, provoked rather
 than argued.** One query measured at **1 156 ms** of CPU, with the cache's global
@@ -1696,13 +1717,13 @@ is why #13b's sweep did not turn them up.
 
 **A correction to this page, in place (`CLAUDE.md` §11).** #19h's table records
 "a wrecked `\` continuation in an operator-facing error" as **done**, and
-`85c864c`'s message says so too. It is not done. The commit moved the twenty-two
+`262b5f3`'s message says so too. It is not done. The commit moved the twenty-two
 spaces from one side of a word to the other:
 
 ```
-85c864c^:  ...to carry its high                      bits (RFC 6891 §6.1.3)
-85c864c :  ...to carry                      its high bits (RFC 6891 §6.1.3)
-bb4b812 :  ...to carry                      its high bits (RFC 6891 §6.1.3)
+262b5f3^:  ...to carry its high                      bits (RFC 6891 §6.1.3)
+262b5f3 :  ...to carry                      its high bits (RFC 6891 §6.1.3)
+a137ed4 :  ...to carry                      its high bits (RFC 6891 §6.1.3)
 ```
 
 `rdns/src/lib.rs:1790`. The defect is cosmetic; **the reason it is filed here
@@ -2885,7 +2906,7 @@ Three things the plan did not say:
 
 **No failing-first regression test, for the second time in this section.** The
 defect — `rdnsd` answering a response on its UDP port — was fixed at the call
-site in `6c66816`, before this was filed, so there is nothing left to watch fail
+site in `2e920d0`, before this was filed, so there is nothing left to watch fail
 (`CLAUDE.md` §1). The three behavioural tests that cover it
 (`a_response_to_the_udp_port_is_not_answered`,
 `a_response_sent_to_the_server_port_is_dropped`,
@@ -3546,7 +3567,7 @@ both of which assume you know what it does.
 
 | item | where | note |
 |---|---|---|
-| a wrecked `\` continuation in an operator-facing error — **this row was wrong; really fixed 2026-08-04, see 26j** | `lib.rs:1787`, now `:1790` | 22 literal spaces mid-sentence, in the extended-RCODE message. Exactly what `CLAUDE.md` §12 predicts: rustfmt does not touch string literals, so a careless search-and-replace wrecks a continuation and nothing notices. **This row said "done" and was wrong.** `85c864c` moved the spaces from before `bits` to before `its` and left the literal broken; the claim then reached the commit message, this table and `docs/ARCHITECTURE_REVIEW.md`'s status table, each copying the one before (`CLAUDE.md` §4) |
+| a wrecked `\` continuation in an operator-facing error — **this row was wrong; really fixed 2026-08-04, see 26j** | `lib.rs:1787`, now `:1790` | 22 literal spaces mid-sentence, in the extended-RCODE message. Exactly what `CLAUDE.md` §12 predicts: rustfmt does not touch string literals, so a careless search-and-replace wrecks a continuation and nothing notices. **This row said "done" and was wrong.** `262b5f3` moved the spaces from before `bits` to before `its` and left the literal broken; the claim then reached the commit message, this table and `docs/ARCHITECTURE_REVIEW.md`'s status table, each copying the one before (`CLAUDE.md` §4) |
 | `pub mod bench` is empty in a non-test build | `lib.rs:15`, `bench.rs` | the file is entirely `#[cfg(test)] mod benches`, so the library exports an empty public module. Should be `#[cfg(test)] mod bench;`. The *filename* is kept on purpose (§10 argues from `bench_logger_throughput`); the `pub` is not |
 | `impl EdnsHeader {}` | `lib.rs:1352` | an empty impl block |
 | `// TODO: TryToBytes and others` | `dname.rs:118` | the only bare `TODO` left in the tree. `dname.rs:237` records that the *other* one was deleted-rather-than-done, with the reasoning; this one deserves the same treatment either way |
@@ -3658,8 +3679,8 @@ led with the line count and that turned out to be the weakest part of its case.
 
 ---
 
-**Done 2026-08-03**, one commit per seam: `0748111` (`answer.rs`), `e51659b`
-(`zones.rs`), `e756a6a` (`replication.rs`). `main.rs` 8,328 → 5,956 lines.
+**Done 2026-08-03**, one commit per seam: `a1b353a` (`answer.rs`), `a1b353a`
+(`zones.rs`), `a1b353a` (`replication.rs`). `main.rs` 8,328 → 5,956 lines.
 
 **Every seam was verified content-preserving rather than assumed to be.** Each
 move was diffed against `git show HEAD:` with visibility markers stripped, and in
@@ -5343,41 +5364,41 @@ commit message.
   happened — exit 1 and the parse error, with the previous zones still being
   served — where `kill -HUP` reported nothing. No per-zone reload: a reload is
   the whole set or nothing. Unix only, refused rather than ignored elsewhere.
-  (`a5ce3ce`)
+  (`652e4d5`)
 - **No task per UDP datagram on `rdnsd`, and a bound on `rdnsr`'s** — closes
   9d's admission-control item and 9e's 1,536-bytes-per-datagram one, which were
   the same call site. `rdnsd` answers inline from `--udp-workers` tasks sharing
   the socket; `rdnsr` keeps its spawn, because a recursion is seconds of waiting,
   and bounds it with `--max-inflight-udp`. Measured over 1,000 queries against a
   rebuilt `HEAD` on the same box: 7.45 MB in 34,487 blocks → 2.88 MB in 31,574,
-  the task site gone and 996 responses built in 16 buffers. (`68e819d`)
+  the task site gone and 996 responses built in 16 buffers. (`652e4d5`)
 - **Both daemons have log levels** — closes 9d's log-volume half. `--log-level`
   and `--quiet` on `rdnsd` and `rdnsr` through one `rdns::logging::init`, with
   `RUST_LOG` on top. Nothing per-packet is above `debug`, so 50 malformed
   datagrams cost **0 log lines** at the default level where they used to cost 50,
   and `format!` no longer runs for a line nobody wants. No in-process rate
   limiter: journald's per-unit one is in the README's unit instead. 11 crates,
-  measured. (`4fb5cee`)
+  measured. (`3777192`)
 - **`rdnsd` compiles on Unix** — it had not since SIGHUP reloading was written,
   because `signals.next()` needed a `StreamExt` nothing imported and the module
   is `#[cfg(unix)]`. Found by running the suite on Linux for the first time.
   Fixed by using `tokio::signal::unix`, which `rdns::shutdown` already used, and
-  deleting `signal-hook` and `signal-hook-tokio`. (`01f2b70`)
+  deleting `signal-hook` and `signal-hook-tokio`. (`3777192`)
 - **A secret file's mode is checked when it is read** — one
   `persist::ensure_private` for the TSIG and DNSSEC paths both, and
   `write_atomically_private` restricts the temporary file *before* the rename so
-  a new private key is never briefly world-readable. (`c1c73d8`)
+  a new private key is never briefly world-readable. (`3777192`)
 - **The zone load and the state fsync are off the runtime** — `spawn_blocking`
   for the reload, and the state write happens after the mutex guard is dropped
   rather than across the fsync. `load_zones_from_source` is honestly sync now; it
-  was an `async fn` with no await in it. (`5ed8351`)
+  was an `async fn` with no await in it. (`3777192`)
 - **A reload no longer blocks every query for the length of its diffs** — planned
   under the read lock and recorded under the write lock, with a generation
   counter deciding whether the plan survived the gap. 99.5% of sampled queries
-  were locked out during a reload before; ~0.3% after. (`0daf0c4`)
+  were locked out during a reload before; ~0.3% after. (`3777192`)
 - **`--user`/`--group` closed as won't-fix** — privilege separation belongs to
   the service manager, and `User=` with an ambient capability is stronger than a
-  setuid drop rather than equivalent to it. (`4f97660`)
+  setuid drop rather than equivalent to it. (`3777192`)
 
 - **`rdnsd` signs zones, and answers a DO-bit query from one** — closes #2, the
   last feature on this list. `dnssec_key` generates and stores private keys and

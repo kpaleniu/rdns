@@ -7,7 +7,7 @@ in place (`CLAUDE.md` §11).
 
 ## Review 1 — 2026-08-03: structure
 
-Read at commit `6882b1e`, clean tree, `cargo clippy --workspace --all-targets`
+Read at commit `5506612`, clean tree, `cargo clippy --workspace --all-targets`
 clean, `cargo test --workspace` 757 passed / 0 failed / 4 ignored on Windows.
 
 Findings below are new. Things that looked like findings but are already in
@@ -18,7 +18,7 @@ are in `docs/spec/07-rfc-conformance.md` §7.4; this file carries structural one
 
 Sections are in descending order of what they would cost if left.
 
-**A second review is appended below, 2026-08-04**, read at `bb4b812` and aimed at
+**A second review is appended below, 2026-08-04**, read at `a137ed4` and aimed at
 algorithmic shape rather than structure: what costs more than it should, what
 grows with a number nobody is watching, and what the compiler is being stopped
 from doing. It is filed as `TODO.md` #23-#26, and it falsifies one line of the
@@ -26,7 +26,7 @@ status table immediately below — A4 was recorded as fixed and is not.
 
 ---
 
-## Status, 2026-08-03 (revised at `e2ebaef`)
+## Status, 2026-08-03 (revised at `262b5f3`)
 
 Filed as `TODO.md` #17, #18 and #19. All closed except B2, which was never filed
 — see the note under it. Findings are left as written rather than rewritten in
@@ -35,18 +35,18 @@ worth keeping (`CLAUDE.md` §11).
 
 | finding | outcome |
 |---|---|
-| A1 TCP length prefix | fixed, `c9cc5c9` — `TODO.md` #17 |
-| A2 two live `str::to_lowercase` | fixed, `85c864c` — #19a |
-| A3 `zone_signer` shadows `is_at_or_under` | fixed, `85c864c` — #19b |
-| A4 broken string literal | ~~fixed, `85c864c` — #19h~~ **that was wrong** — `85c864c` moved the spaces one word to the left and left the literal broken. Really fixed 2026-08-04, with the test that would have caught it (`TODO.md` #26j) — see the note below |
-| B1 the operational shell | fixed, `b523861` — #18 |
-| B2 `main.rs` is eleven subsystems | fixed, `0748111`+`e51659b`+`e756a6a` — #20, with two plan corrections on the way |
-| B3 six copies of `fn absolute` | fixed, `85c864c` — #19c |
-| B4 three metrics nothing increments | fixed, `b523861` — #19d, by moving them to `rdnsr` |
-| B5 `RequestValidator` duplicates the parser | fixed, `85c864c` — #19e, renamed `AdmissionCheck` |
+| A1 TCP length prefix | fixed, `ad5ed65` — `TODO.md` #17 |
+| A2 two live `str::to_lowercase` | fixed, `262b5f3` — #19a |
+| A3 `zone_signer` shadows `is_at_or_under` | fixed, `262b5f3` — #19b |
+| A4 broken string literal | ~~fixed, `262b5f3` — #19h~~ **that was wrong** — `262b5f3` moved the spaces one word to the left and left the literal broken. Really fixed 2026-08-04, with the test that would have caught it (`TODO.md` #26j) — see the note below |
+| B1 the operational shell | fixed, `ad5ed65` — #18 |
+| B2 `main.rs` is eleven subsystems | fixed, `a1b353a`+`a1b353a`+`a1b353a` — #20, with two plan corrections on the way |
+| B3 six copies of `fn absolute` | fixed, `262b5f3` — #19c |
+| B4 three metrics nothing increments | fixed, `ad5ed65` — #19d, by moving them to `rdnsr` |
+| B5 `RequestValidator` duplicates the parser | fixed, `262b5f3` — #19e, renamed `AdmissionCheck` |
 | B6 two `serve_connection`s | declined, #19f, with the reason recorded |
-| B7 `CLI_USAGE.md` covers half the flags | fixed, `e2ebaef` — #19g |
-| C the eight small ones | seven fixed in `85c864c`; `rand_id` left, as D-3 |
+| B7 `CLI_USAGE.md` covers half the flags | fixed, `262b5f3` — #19g |
+| C the eight small ones | seven fixed in `262b5f3`; `rand_id` left, as D-3 |
 
 One finding turned up a defect in the review itself, worth stating because it is
 the same shape as the things it was looking for. B5 listed four ways the
@@ -59,14 +59,14 @@ the wire. The deleted check was rejecting an impossible case for the wrong
 reason, and the test agreed because both came from the same misreading.
 
 **A second defect in this review, found the day after by re-reading the code
-instead of the table.** A4's row said *fixed*, and so did `85c864c`'s commit
+instead of the table.** A4's row said *fixed*, and so did `262b5f3`'s commit
 message. The commit moved the twenty-two spaces from one side of a word to the
 other:
 
 ```
-85c864c^:  ...to carry its high                      bits (RFC 6891 §6.1.3)
-85c864c :  ...to carry                      its high bits (RFC 6891 §6.1.3)
-bb4b812 :  ...to carry                      its high bits (RFC 6891 §6.1.3)
+262b5f3^:  ...to carry its high                      bits (RFC 6891 §6.1.3)
+262b5f3 :  ...to carry                      its high bits (RFC 6891 §6.1.3)
+a137ed4 :  ...to carry                      its high bits (RFC 6891 §6.1.3)
 ```
 
 The defect is cosmetic and the mistake is not: three documents — the commit
@@ -425,7 +425,7 @@ no such control.
 | ~~`rdnsc` cannot set DO or send an OPT~~ fixed | `rdnsc/src/main.rs` | the shipped client could not exercise the server's most complex feature, which is why every DNSSEC recipe in `TODO.md` reaches for dnspython. A `--dnssec` flag and an `Edns` on the builder, small change, disproportionate payoff |
 | ~~`metrics_server::serve` has no connection ceiling~~ fixed | `metrics_server.rs:44` | the only accept loop in the workspace without one. A management port with a 5 s read timeout, so low severity — but the pattern is established three times elsewhere |
 | ~~`update.rs` is 1 070 unreachable lines~~ fixed — served end to end | — | already `TODO.md` #10; noted here only because a shipped library carrying a feature nothing can reach belongs in the conformance doc, which it now is (G-4) |
-| `TODO.md` #13e carries a claim the head commit falsified | `TODO.md:1466` | "≤255 octets … and *not* checked by `dname_to_bytes`, which validates label length and total length never". Commit `6882b1e` closed that: both now go through one `check_name_len` (`dname.rs:466`), and §15 records the fix at `TODO.md:2033`. The stale sentence is in §13e's live body, not a preserved "as filed" block, so `CLAUDE.md` §11 applies — correct in place with a pointer to §15, keeping the reasoning |
+| `TODO.md` #13e carries a claim the head commit falsified | `TODO.md:1466` | "≤255 octets … and *not* checked by `dname_to_bytes`, which validates label length and total length never". Commit `5506612` closed that: both now go through one `check_name_len` (`dname.rs:466`), and §15 records the fix at `TODO.md:2033`. The stale sentence is in §13e's live body, not a preserved "as filed" block, so `CLAUDE.md` §11 applies — correct in place with a pointer to §15, keeping the reasoning |
 
 ---
 
@@ -469,7 +469,7 @@ is the precedent, and the more useful half of that section).
 
 # Second review — 2026-08-04: algorithmic shape
 
-Read at `bb4b812`, clean tree. The first review asked whether the code is
+Read at `a137ed4`, clean tree. The first review asked whether the code is
 *arranged* well; this one asks what it *costs* — where the work is superlinear in
 something an operator or a client chooses, where a standard-library spelling
 exists for a hand-roll, and where the compiler is being stopped from vectorizing
