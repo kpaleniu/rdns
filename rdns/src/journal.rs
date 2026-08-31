@@ -17,7 +17,7 @@ use crate::ixfr::ZoneDelta;
 use crate::utils::{absolute_lowered, record_types as rt};
 use crate::zone::{parse_zone_file, Zone, ZoneRecord};
 use crate::zone_writer::record_to_string;
-use crate::{ParsedRecord, ResourceRecord, Serial};
+use crate::{ResourceRecord, Serial};
 
 /// The line that separates one difference sequence from the next.
 ///
@@ -196,10 +196,9 @@ fn read_delta(block: &str, origin: &str) -> Result<ZoneDelta, ZoneError> {
 }
 
 fn serial_of(soa: &ResourceRecord) -> Result<Serial, ZoneError> {
-    match soa.rdata.parse() {
-        Ok(ParsedRecord::SOA { serial, .. }) => Ok(serial),
-        _ => Err(ZoneError::invalid("an SOA framing it does not parse")),
-    }
+    soa.rdata
+        .soa_serial()
+        .ok_or_else(|| ZoneError::invalid("an SOA framing it does not parse"))
 }
 
 /// Every zone with a journal in this directory, for priming the log at startup.

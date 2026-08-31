@@ -228,11 +228,8 @@ fn soa_signatures(zone: &Zone) -> Vec<ResourceRecord> {
 fn negative_ttl_cap(zone: &Zone) -> Ttl {
     zone.query(zone.origin(), Qtype::of(rt::SOA))
         .first()
-        .and_then(|soa| match soa.rdata.parse() {
-            Ok(crate::ParsedRecord::SOA { minimum, .. }) => Some(Ttl::from_secs(minimum)),
-            _ => None,
-        })
-        .unwrap_or(Ttl::ZERO)
+        .and_then(|soa| soa.rdata.soa_minimum())
+        .map_or(Ttl::ZERO, Ttl::from_secs)
 }
 
 fn signatures_at(zone: &Zone, name: &str, rtype: Rtype) -> Vec<ResourceRecord> {

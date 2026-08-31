@@ -4,9 +4,9 @@
 //! root means visible to the whole library — so a type whose fields must be
 //! sealed against its own crate needs a file of its own.
 
-use crate::dname::DNameUnpacker;
+use crate::dname::{skip_uncompressed_name, DNameUnpacker};
 use crate::error::WireError;
-use crate::{ParsedRecord, Rtype};
+use crate::{ParsedRecord, Rtype, Serial};
 
 /// A record's data, stored as uncompressed wire-format bytes.
 ///
@@ -97,6 +97,34 @@ impl RecordData {
         let unpacker = DNameUnpacker::new(&self.rdata);
         ParsedRecord::decode(self.rtype, &self.rdata, &unpacker)
     }
+
+    /// The SOA's SERIAL (RFC 1035 §3.3.13), or `None` if this is not an SOA.
+    pub fn soa_serial(&self) -> Option<Serial> {
+        let s = self.soa_scalars()?;
+        Some(Serial::new(u32::from_be_bytes([s[0], s[1], s[2], s[3]])))
+    }
+
+    /// The SOA's MINIMUM: the ceiling on how long a negative answer about this
+    /// zone may be cached (RFC 2308 §3).
+    pub fn soa_minimum(&self) -> Option<u32> {
+        let s = self.soa_scalars()?;
+        Some(u32::from_be_bytes([s[16], s[17], s[18], s[19]]))
+    }
+
+    /// The five 32-bit fields an SOA carries after MNAME and RNAME.
+    ///
+    /// [`RecordData::parse`] answers the same questions and allocates four times
+    /// on the way: a label `Vec` and a `String` for each of the two names, both
+    /// discarded by every caller that wanted a number. Every negative answer
+    /// reads MINIMUM, which is the shape a random-subdomain flood generates.
+    fn soa_scalars(&self) -> Option<&[u8; 20]> {
+        if self.rtype != crate::utils::record_types::SOA {
+            return None;
+        }
+        let after_mname = skip_uncompressed_name(&self.rdata)?;
+        let after_rname = skip_uncompressed_name(after_mname)?;
+        after_rname.get(..20)?.try_into().ok()
+    }
 }
 
 #[cfg(test)]
@@ -129,6 +157,48 @@ mod tests {
             .expect("RFC 2136 §2.5.2 spells 'delete this RRset' exactly so");
         assert_eq!(empty.rtype(), rt::A, "the TYPE is the whole content");
         assert!(empty.bytes().is_empty());
+    }
+
+    /// The offset walk must answer what the decoder answers, for names of
+    /// differing label counts — an arithmetic slip reads a neighbouring field
+    /// and still returns a plausible number. `parse` is the reference here
+    /// because it is the code these two replaced at four call sites.
+    #[test]
+    fn the_soa_accessors_agree_with_the_full_parse() {
+        for (mname, rname) in [
+            ("ns1.example.com.", "admin.example.com."),
+            (".", "."),
+            ("a.b.c.d.e.f.example.com.", "hostmaster.example.com."),
+        ] {
+            let soa = RecordData::from_parsed(&ParsedRecord::SOA {
+                mname: mname.to_string(),
+                rname: rname.to_string(),
+                serial: Serial::new(0x0102_0304),
+                refresh: 3600,
+                retry: 600,
+                expire: 604_800,
+                minimum: 300,
+            })
+            .expect("encode");
+
+            let Ok(ParsedRecord::SOA {
+                serial, minimum, ..
+            }) = soa.parse()
+            else {
+                panic!("an SOA parses as an SOA");
+            };
+            assert_eq!(soa.soa_serial(), Some(serial), "{mname} {rname}");
+            assert_eq!(soa.soa_minimum(), Some(minimum), "{mname} {rname}");
+        }
+    }
+
+    /// Neither accessor answers for a record that is not an SOA, however much
+    /// its bytes might look like one.
+    #[test]
+    fn the_soa_accessors_refuse_another_type() {
+        let a = RecordData::new(rt::A, vec![192, 0, 2, 1]).expect("an A record");
+        assert_eq!(a.soa_serial(), None);
+        assert_eq!(a.soa_minimum(), None);
     }
 
     /// Anything that exists parses, so `parse`'s `Result` means "should not

@@ -370,12 +370,12 @@ fn add_negative(
 /// proof beside it in the same section disagreed about how long the "no" was
 /// good for.
 fn negative_ttl(soa: &rdns::zone::ZoneRecord) -> Ttl {
-    match soa.rdata.parse() {
-        Ok(rdns::ParsedRecord::SOA { minimum, .. }) => soa.ttl.min(Ttl::from_secs(minimum)),
+    match soa.rdata.soa_minimum() {
+        Some(minimum) => soa.ttl.min(Ttl::from_secs(minimum)),
         // An apex SOA that will not parse is a zone that should not have loaded.
         // Capping at nothing is the conservative direction: the client asks
         // again rather than caching a "no" we cannot bound.
-        _ => Ttl::ZERO,
+        None => Ttl::ZERO,
     }
 }
 

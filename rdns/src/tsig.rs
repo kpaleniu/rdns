@@ -841,7 +841,6 @@ fn find_tsig(packet: &[u8]) -> Option<(usize, &[u8], String)> {
 
     let start = pos;
     let after_name = skip_name(packet, pos)?;
-    let owner = read_name_at(packet, pos)?;
     if after_name + 10 > packet.len() {
         return None;
     }
@@ -849,6 +848,11 @@ fn find_tsig(packet: &[u8]) -> Option<(usize, &[u8], String)> {
     if rtype != TSIG_TYPE {
         return None;
     }
+    // After the TYPE check, not before it. `read_name_at` allocates a `String`
+    // per label plus a `join`, so reading first charged every EDNS query for the
+    // OPT record's owner name and then threw it away — and the label count is
+    // the sender's, on a path reached before anything is authenticated.
+    let owner = read_name_at(packet, pos)?;
     let rdlen = u16::from_be_bytes([packet[after_name + 8], packet[after_name + 9]]) as usize;
     let rdata_start = after_name + 10;
     let rdata_end = rdata_start.checked_add(rdlen)?;

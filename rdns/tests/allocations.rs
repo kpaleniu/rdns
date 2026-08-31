@@ -374,13 +374,14 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
 }
 
 /// Reading the SOA's MINIMUM — the ceiling on how long a negative answer may be
-/// cached (RFC 2308 §3) — costs four allocations for one `u32`.
+/// cached (RFC 2308 §3) — costs nothing, and cost four allocations for one `u32`
+/// when it went through `RecordData::parse`.
 ///
-/// `RecordData::parse` decodes the whole RDATA, and an SOA's RDATA opens with
-/// MNAME and RNAME: a label `Vec` and a `String` each, both discarded. Every
-/// NXDOMAIN and every NODATA pays it, which is the shape a random-subdomain
-/// flood generates. Three more call sites read SERIAL the same way
-/// (`ixfr.rs`, `journal.rs`) or MINIMUM (`dnssec_answer.rs`).
+/// `parse` decodes the whole RDATA, and an SOA's opens with MNAME and RNAME: a
+/// label `Vec` and a `String` each, both discarded. Every NXDOMAIN and every
+/// NODATA paid it, which is the shape a random-subdomain flood generates. The
+/// old cost is measured beside the new one so this is a ratio rather than an
+/// assertion that zero is zero.
 fn reading_one_integer_out_of_an_soa() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let soa = *zone
@@ -388,15 +389,20 @@ fn reading_one_integer_out_of_an_soa() {
         .first()
         .expect("the apex SOA");
 
-    let minimum = |soa: &rdns::zone::ZoneRecord| match soa.rdata.parse() {
+    // The shape this replaced, kept as a measurement rather than as code.
+    let old = |soa: &rdns::zone::ZoneRecord| match soa.rdata.parse() {
         Ok(rdns::ParsedRecord::SOA { minimum, .. }) => minimum,
         _ => panic!("the apex SOA parses"),
     };
-    let _ = minimum(soa);
+    let _warm = (old(soa), soa.rdata.soa_minimum());
 
-    let (value, count) = allocations(|| minimum(soa));
+    let (value, before) = allocations(|| old(soa));
     assert_eq!(value, 300, "the MINIMUM this zone file sets");
-    within("read the MINIMUM out of an SOA", count, 4..=4);
+    within("read the MINIMUM out of an SOA, the old way", before, 4..=4);
+
+    let (value, after) = allocations(|| soa.rdata.soa_minimum());
+    assert_eq!(value, Some(300), "the same answer");
+    within("read the MINIMUM out of an SOA", after, 0..=0);
 }
 
 /// The three things a server asks of a request's OPT record — reply size, EDNS
@@ -704,13 +710,12 @@ fn scanning_a_query_for_a_tsig() {
         matches!(check, rdns::tsig::TsigCheck::Unsigned),
         "an OPT record is not a TSIG"
     );
-    // One, and it should be none: `find_tsig` reads the last additional
-    // record's owner name into a `String` before checking whether the record is
-    // a TSIG at all, so every EDNS query pays for a name that is discarded.
+    // Zero since `find_tsig` checks the record's TYPE before reading its owner
+    // name; it read 1 while the name came first, on every EDNS query.
     within(
         "scan a TSIG-less query that carries an OPT record",
         count,
-        1..=1,
+        0..=0,
     );
 }
 

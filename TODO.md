@@ -200,8 +200,8 @@ the note there. `cargo clippy --workspace --all-targets` is clean there too,
 which is the half Windows cannot check at all.
 
 **Two of those single tests are worth more than their count suggests.**
-`allocations` reports **twenty-five** measurements, **seventeen** of them exact
-(`n..=n`) — twenty-two and fourteen before the three shapes added on 2026-08-31,
+`allocations` reports **twenty-six** measurements, **eighteen** of them exact
+(`n..=n`) — twenty-two and fourteen before the shapes added on 2026-08-31,
 nineteen and thirteen when this was written, and the claim of
 "fourteen exact" before that was never counted and was wrong both ways; seven
 are deliberate ranges and one
@@ -262,9 +262,27 @@ the code — two of them asserted the wrong behaviour and cited an RFC section t
 says nothing about the subject. That is now the first rule in `CLAUDE.md`.
 
 **What the answer path costs now**, because it took three changes to find out and
-the numbers are the input to any future attempt: **13.7 allocations per query**
-for a plain query (down from 25.7), **20.7** for the query a real resolver sends
-(EDNS0, DO, a cookie). One whole answer — parse, look up, build, serialize — is
+the numbers are the input to any future attempt. Measured on `rdnsd` itself with
+`--features dhat-heap` on 2026-08-31 — 2 000 queries against a 716-block startup
+baseline, linear to three decimals, and every program point dhat attributes is a
+site `rdns/tests/allocations.rs` now measures:
+
+| | plain | EDNS0+DO+cookie |
+|---|---|---|
+| lower-case QNAME | 13.0 | 16.0 |
+| case randomized (DNS-0x20) | 18.0 | 21.0 |
+| NXDOMAIN, unsigned zone | 19.0 | 22.0 |
+
+**The 21 is the realistic figure**: a resolver sends EDNS0 and most randomize
+case. ~~13.7 for a plain query (down from 25.7), 20.7 for the query a real
+resolver sends.~~ **Superseded 2026-08-31**, and the correction is kept rather
+than overwritten (§11) because the pair was quoted for a year as *the* cost of an
+answer while the shape it under-counted — a case-randomized EDNS query — costs
+60% more. What produced the older readings was not bisected; they were taken
+under #9e, before #13d moved OPT out of the additional section and before the
+two fixes in that same 2026-08-31 commit.
+
+One whole answer — parse, look up, build, serialize — is
 **522 ns**, and the `sendto`+`recvfrom` pair around it is **3.6-4.1 µs**. So
 everything the benchmark suite measures is about 6% of what a query costs a
 server, and a 20% win anywhere in it is worth about 1% end to end. Read
@@ -1864,7 +1882,7 @@ a stage lands. Each stage is measured **before and after, on the same machine,
 in the same session**:
 
 ```sh
-cargo test -p rdns --test allocations -- --nocapture   # 25 counts, 17 exact
+cargo test -p rdns --test allocations -- --nocapture   # 26 counts, 18 exact
 cargo bench -p rdns -- --save-baseline before          # then do the stage
 cargo bench -p rdns -- --baseline before
 ```

@@ -385,6 +385,32 @@ pub fn dname_from_bytes<'a>(
     Ok((s, rest))
 }
 
+/// Past the name at the start of `data`, returning what follows it.
+///
+/// For stored RDATA, which [`crate::RecordData`] keeps uncompressed: a pointer
+/// here is a malformed record rather than something to follow, since there is no
+/// message to resolve it against. [`dname_from_bytes`] is the reading form; this
+/// exists for a caller that wants a field *after* a name and would otherwise
+/// allocate the name to get past it.
+///
+/// Not [`crate::tsig`]'s `skip_name`, which walks a whole message and so stops
+/// at a pointer instead of refusing one.
+pub(crate) fn skip_uncompressed_name(data: &[u8]) -> Option<&[u8]> {
+    let mut pos = 0;
+    loop {
+        let len = *data.get(pos)? as usize;
+        // A pointer, or one of RFC 6891 §6.1's reserved label types.
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        pos += 1;
+        if len == 0 {
+            return data.get(pos..);
+        }
+        pos = pos.checked_add(len)?;
+    }
+}
+
 /// Encode a name in full, without compression.
 ///
 /// This is the form stored in RDATA and the one DNSSEC canonical serialization

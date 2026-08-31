@@ -443,10 +443,7 @@ pub fn requested_serial(request: &DnsMessage) -> Option<Serial> {
         .authorities
         .iter()
         .filter(|rr| rr.rdata.rtype() == rt::SOA)
-        .find_map(|rr| match rr.rdata.parse() {
-            Ok(crate::ParsedRecord::SOA { serial, .. }) => Some(serial),
-            _ => None,
-        })
+        .find_map(|rr| rr.rdata.soa_serial())
 }
 
 /// Answer an IXFR.
