@@ -107,11 +107,13 @@ fn allocation_counts() {
 
     one_query_end_to_end();
     the_lookups_behind_one_answer_allocate_only_the_answer();
+    a_case_randomized_qname_costs_a_fold_per_lookup();
+    reading_one_integer_out_of_an_soa();
     reading_a_requests_edns_parameters_allocates_nothing();
     a_response_full_of_shared_suffixes();
     one_zone_load_and_sign();
     one_axfr_out();
-    scanning_a_plain_query_for_a_tsig_allocates_nothing();
+    scanning_a_query_for_a_tsig();
     comparing_two_names_allocates_nothing();
     verifying_an_rrset_against_two_candidate_signatures();
     a_busy_neighbour_stays_out_of_the_count();
@@ -337,6 +339,64 @@ fn the_lookups_behind_one_answer_allocate_only_the_answer() {
     assert_eq!(kind, NameKind::Exact, "www.example.com. is in the zone");
     assert_eq!(records, 1, "and holds exactly one A record");
     within("the three lookups behind one answer", count, 1..=1);
+}
+
+/// The same three lookups against the name a DNS-0x20 resolver actually sends.
+///
+/// Case randomization is a resolver's spoofing defence (Google Public DNS and
+/// Unbound's `use-caps-for-id` both do it), so mixed case is ordinary traffic
+/// and not an attack. Every `Zone` entry point folds the name itself
+/// (`Zone::lookup_key`), and `ascii_lowered_cow` can only borrow when there is
+/// nothing to fold — so the count above is the count for a name that happened
+/// to arrive lower-case, and this is the count for the rest.
+///
+/// Measured on `rdnsd` under dhat, a whole query goes 13 to 18 with the case
+/// randomized and 17 to 22 with EDNS0 as well: four folds in `Zone` — the walks
+/// here plus `add_answer`'s own — and a fifth in `Zones::for_query`.
+fn a_case_randomized_qname_costs_a_fold_per_lookup() {
+    let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
+    let walks = |zone: &rdns::zone::Zone, name: &str| {
+        let cut = zone.delegation_for(name);
+        let kind = zone.name_kind(name);
+        let records = zone.query(name, Qtype::of(record_types::A)).len();
+        (cut, kind, records)
+    };
+
+    let mixed = "WwW.eXaMpLe.CoM.";
+    let _ = walks(&zone, mixed);
+
+    let ((cut, kind, records), count) = allocations(|| walks(&zone, mixed));
+    assert_eq!(cut, None, "the same answers as the lower-case name");
+    assert_eq!(kind, NameKind::Exact);
+    assert_eq!(records, 1);
+    // The answer `Vec` as above, plus one fold per lookup.
+    within("the same three lookups, case randomized", count, 4..=4);
+}
+
+/// Reading the SOA's MINIMUM — the ceiling on how long a negative answer may be
+/// cached (RFC 2308 §3) — costs four allocations for one `u32`.
+///
+/// `RecordData::parse` decodes the whole RDATA, and an SOA's RDATA opens with
+/// MNAME and RNAME: a label `Vec` and a `String` each, both discarded. Every
+/// NXDOMAIN and every NODATA pays it, which is the shape a random-subdomain
+/// flood generates. Three more call sites read SERIAL the same way
+/// (`ixfr.rs`, `journal.rs`) or MINIMUM (`dnssec_answer.rs`).
+fn reading_one_integer_out_of_an_soa() {
+    let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
+    let soa = *zone
+        .query("example.com.", Qtype::of(record_types::SOA))
+        .first()
+        .expect("the apex SOA");
+
+    let minimum = |soa: &rdns::zone::ZoneRecord| match soa.rdata.parse() {
+        Ok(rdns::ParsedRecord::SOA { minimum, .. }) => minimum,
+        _ => panic!("the apex SOA parses"),
+    };
+    let _ = minimum(soa);
+
+    let (value, count) = allocations(|| minimum(soa));
+    assert_eq!(value, 300, "the MINIMUM this zone file sets");
+    within("read the MINIMUM out of an SOA", count, 4..=4);
 }
 
 /// The three things a server asks of a request's OPT record — reply size, EDNS
@@ -617,20 +677,41 @@ fn big_zone(records: usize) -> rdns::zone::Zone {
 /// a four-element `Vec<usize>` of section counts *before* checking whether there
 /// was an additional section at all — one block per query on every server, TSIG
 /// configured or not.
-fn scanning_a_plain_query_for_a_tsig_allocates_nothing() {
-    let wire = query_bytes("www.example.com.", Qtype::of(record_types::A));
+///
+/// Both shapes, because the plain one alone is not evidence: `find_tsig` returns
+/// at `ar == 0` before reaching its body, so a query with no additional section
+/// measures the early exit and nothing else. Everything a resolver sends has an
+/// OPT record.
+fn scanning_a_query_for_a_tsig() {
     let keyring = rdns::tsig::TsigKeyring::new(Vec::new());
+    let plain = query_bytes("www.example.com.", Qtype::of(record_types::A));
+    let with_opt = query_bytes_with_edns("www.example.com.", Qtype::of(record_types::A));
 
     // Warm first: a target of exactly zero cannot absorb another path's
     // lazily-initialized state. This read 1 or 0 depending on scheduling.
-    let _warm = rdns::tsig::check_request(&wire, &keyring, 0);
+    let _warm = rdns::tsig::check_request(&plain, &keyring, 0);
+    let _warm = rdns::tsig::check_request(&with_opt, &keyring, 0);
 
-    let (check, count) = allocations(|| rdns::tsig::check_request(&wire, &keyring, 0));
+    let (check, count) = allocations(|| rdns::tsig::check_request(&plain, &keyring, 0));
     assert!(
         matches!(check, rdns::tsig::TsigCheck::Unsigned),
         "a plain query carries no TSIG"
     );
     within("scan a TSIG-less query for a TSIG", count, 0..=0);
+
+    let (check, count) = allocations(|| rdns::tsig::check_request(&with_opt, &keyring, 0));
+    assert!(
+        matches!(check, rdns::tsig::TsigCheck::Unsigned),
+        "an OPT record is not a TSIG"
+    );
+    // One, and it should be none: `find_tsig` reads the last additional
+    // record's owner name into a `String` before checking whether the record is
+    // a TSIG at all, so every EDNS query pays for a name that is discarded.
+    within(
+        "scan a TSIG-less query that carries an OPT record",
+        count,
+        1..=1,
+    );
 }
 
 /// Comparing two names is a question about bytes and should cost nothing.

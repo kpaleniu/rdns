@@ -200,8 +200,9 @@ the note there. `cargo clippy --workspace --all-targets` is clean there too,
 which is the half Windows cannot check at all.
 
 **Two of those single tests are worth more than their count suggests.**
-`allocations` reports **twenty-two** measurements, **fourteen** of them exact
-(`n..=n`) — nineteen and thirteen when this was written, and the claim of
+`allocations` reports **twenty-five** measurements, **seventeen** of them exact
+(`n..=n`) — twenty-two and fourteen before the three shapes added on 2026-08-31,
+nineteen and thirteen when this was written, and the claim of
 "fourteen exact" before that was never counted and was wrong both ways; seven
 are deliberate ranges and one
 (`verify a DNSKEY RRset with two candidate signatures`) is `0..=u64::MAX`, a
@@ -1863,7 +1864,7 @@ a stage lands. Each stage is measured **before and after, on the same machine,
 in the same session**:
 
 ```sh
-cargo test -p rdns --test allocations -- --nocapture   # 18 counts, 12 exact
+cargo test -p rdns --test allocations -- --nocapture   # 25 counts, 17 exact
 cargo bench -p rdns -- --save-baseline before          # then do the stage
 cargo bench -p rdns -- --baseline before
 ```
