@@ -192,10 +192,12 @@ impl QueryLogger {
         }
     }
 
-    /// Log a successful query
-    pub fn log_query(&self, ip: IpAddr, query_type: Option<Qtype>) {
-        let now = current_unix_timestamp();
-
+    /// Log a successful query.
+    ///
+    /// `now` is the caller's, in seconds; see
+    /// [`crate::security::RateLimiter::should_allow`] for why it is not read
+    /// here.
+    pub fn log_query(&self, ip: IpAddr, query_type: Option<Qtype>, now: u64) {
         let Some(mut inner) = self.locked() else {
             return;
         };
@@ -363,9 +365,9 @@ mod tests {
         let logger = QueryLogger::new();
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
-        logger.log_query(ip, Some(Qtype::of(rt::A)));
-        logger.log_query(ip, Some(Qtype::of(rt::A)));
-        logger.log_query(ip, Some(Qtype::of(rt::AAAA)));
+        logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
+        logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
+        logger.log_query(ip, Some(Qtype::of(rt::AAAA)), current_unix_timestamp());
 
         let stats = logger.get_stats();
         assert_eq!(stats.total_queries, 3);
@@ -404,7 +406,7 @@ mod tests {
         let logger = QueryLogger::new();
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
-        logger.log_query(ip, Some(Qtype::of(rt::A)));
+        logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
         logger.count_error(ip);
 
         logger.reset_stats();
@@ -427,6 +429,7 @@ mod tests {
             logger.log_query(
                 IpAddr::V4(std::net::Ipv4Addr::from(i.wrapping_mul(2_654_435_761))),
                 Some(Qtype::of(rt::A)),
+                current_unix_timestamp(),
             );
             logger.log_rate_limited(IpAddr::V4(std::net::Ipv4Addr::from(i ^ 0xDEAD_BEEF)));
         }
@@ -455,12 +458,13 @@ mod tests {
         let logger = QueryLogger::new();
         let heavy = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         for _ in 0..1_000 {
-            logger.log_query(heavy, Some(Qtype::of(rt::A)));
+            logger.log_query(heavy, Some(Qtype::of(rt::A)), current_unix_timestamp());
         }
         for i in 0..(MAX_TRACKED_SOURCES as u32 * 2) {
             logger.log_query(
                 IpAddr::V4(std::net::Ipv4Addr::from(i.wrapping_mul(2_654_435_761) | 1)),
                 Some(Qtype::of(rt::A)),
+                current_unix_timestamp(),
             );
         }
 
@@ -523,17 +527,17 @@ mod tests {
 
         let start = Instant::now();
         for _ in 0..batch {
-            logger.log_query(ip, Some(Qtype::of(rt::A)));
+            logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
         }
         let shallow = start.elapsed();
 
         for _ in 0..depth {
-            logger.log_query(ip, Some(Qtype::of(rt::A)));
+            logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
         }
 
         let start = Instant::now();
         for _ in 0..batch {
-            logger.log_query(ip, Some(Qtype::of(rt::A)));
+            logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
         }
         let deep = start.elapsed();
 
@@ -574,9 +578,9 @@ mod tests {
         let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
-        logger.log_query(ip1, Some(Qtype::of(rt::A)));
-        logger.log_query(ip2, Some(Qtype::of(rt::A)));
-        logger.log_query(ip2, Some(Qtype::of(rt::A)));
+        logger.log_query(ip1, Some(Qtype::of(rt::A)), current_unix_timestamp());
+        logger.log_query(ip2, Some(Qtype::of(rt::A)), current_unix_timestamp());
+        logger.log_query(ip2, Some(Qtype::of(rt::A)), current_unix_timestamp());
 
         let stats = logger.get_stats();
         assert_eq!(*stats.queries_by_ip.get(&ip1).unwrap(), 1);

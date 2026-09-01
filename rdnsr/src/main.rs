@@ -783,7 +783,10 @@ async fn udp_main(
         // should hit: a hash lookup and a token, before the packet is looked
         // at. Dropping is silent, which is why the policy is printed at startup
         // and counted here.
-        if !shell.limiter.should_allow(peer.ip()) {
+        if !shell
+            .limiter
+            .should_allow(peer.ip(), current_unix_timestamp())
+        {
             shell.logger.log_rate_limited(peer.ip());
             shell.metrics.count(&shell.metrics.rate_limited);
             continue;
@@ -819,7 +822,14 @@ async fn udp_main(
                 // Charge the response, not the query. Over budget, TC=1 is
                 // the useful refusal: no records to amplify, and a real client
                 // retries over TCP where the handshake proves who it is.
-                match shell.responses.admit(peer.ip(), reply.len()) {
+                // Its own clock read, not the one the limiter used above: a
+                // recursive resolution sits in between and can take seconds, so
+                // sharing that instant would deny the bucket the refill the wait
+                // earned it.
+                match shell
+                    .responses
+                    .admit(peer.ip(), reply.len(), current_unix_timestamp())
+                {
                     ResponseVerdict::Send => {
                         let _ = socket.send_to(&reply, peer).await;
                     }
@@ -860,7 +870,10 @@ async fn tcp_main(
         // The rate limit applies to TCP; the response *budget* does not, since
         // a peer that completed a handshake is not one being reflected at. A
         // flood of connections is still a flood.
-        if !shell.limiter.should_allow(peer.ip()) {
+        if !shell
+            .limiter
+            .should_allow(peer.ip(), current_unix_timestamp())
+        {
             shell.logger.log_rate_limited(peer.ip());
             shell.metrics.count(&shell.metrics.rate_limited);
             continue;
@@ -1510,11 +1523,14 @@ mod tests {
         let exempt: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         let other: std::net::IpAddr = "192.0.2.1".parse().unwrap();
         for _ in 0..10 {
-            assert!(limiter.should_allow(exempt), "an exempt source never trips");
+            assert!(
+                limiter.should_allow(exempt, current_unix_timestamp()),
+                "an exempt source never trips"
+            );
         }
-        assert!(limiter.should_allow(other));
+        assert!(limiter.should_allow(other, current_unix_timestamp()));
         assert!(
-            !limiter.should_allow(other),
+            !limiter.should_allow(other, current_unix_timestamp()),
             "and a source that is not exempt still does"
         );
     }

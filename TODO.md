@@ -710,7 +710,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`9715c3c`), the day after it was filed. 1 124 ms → 1.28 ms on the same probe. The fix is a type — `Nsec3Params`, the triple a hash is a function of — plus the map lookup the key was already there for, and the proof moved out from under the lock. One of the four filed boxes did not survive being checked against the code: NSEC3 hides how deep a cached name is, so the depth bound it asked for is not available to take |
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection was O(zones per query) — 55 µs at ten thousand zones, now 32 ns and flat, keyed on `NameKeyBuf` with a walk up the QNAME, and the walk brought a second multiplier with it that the client picks. Name compression was O(n²) in the records of one message, so a 400-record transfer envelope cost 130.7 µs to serialize and now costs 42.8; the index that fixes it is built lazily, because the threshold that helps a transfer hurt a 60-name response by 26%. And an AXFR held the zone three times over before the first byte went out; the envelopes are an iterator now, at 10.5× less peak memory, which needed `Arc<Zone>` in the map because the lock cannot be held across a socket write |
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
-| **28** | work the answer path does and need not | **filed 2026-09-01, not started.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
+| **28** | work the answer path does and need not | **filed 2026-09-01; 28a's four wall-clock reads done the same day.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
 | **27** | what a zero-allocation answer path would take | **filed 2026-09-01, not started.** Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
@@ -2007,7 +2007,7 @@ question directly, and the first item is larger than anything in #27.
 Everything below is measured or read, and the candidates that died are at the
 bottom — two of the five did not survive being checked (§17).
 
-#### 28a. Six clock reads per query, and four of them want the same value
+#### 28a. Six clock reads per query, and four of them want the same value — **the four are done 2026-09-01**
 
 | | Windows | Linux |
 |---|---|---|
@@ -2034,6 +2034,30 @@ RMWs per query to fill buckets that report every healthy server as identical.
 
 **~100-130 ns per query, for no behaviour change.** For comparison, every
 allocation on this path put together is ~460 ns.
+
+**The four wall-clock reads are done, 2026-09-01.** `should_allow`, `admit` and
+`log_query` take `now` like `check_request` already did, and each daemon reads it
+once per message. Six reads to three on `rdnsd`'s UDP path, verified by reading
+the path rather than by timing it: the only clock read left between `recv_from`
+and `send_to` is the one at the top of the loop, plus `LatencyTimer`'s pair.
+About 75 ns at the per-read cost above. Allocation counts unchanged.
+
+Two things the change turned up:
+
+- **`rdnsr` must not share one instant across its UDP handler.** A recursive
+  resolution sits between the rate limiter and the response budget and can take
+  seconds, so `admit` reads its own clock there and the call site says why.
+  `rdnsd` shares one because nothing between them blocks on the network — the
+  worst case is a zone-map read waiting out a reload, and a stale `now` there
+  refills the bucket *less*, which is the safe direction.
+- **The backwards-clock test got honest.** It used to reach into `buckets` and
+  stamp one entry an hour in the future, because it had no way to hand the
+  limiter a clock. It steps the clock now, which is what an NTP correction
+  actually does. Still watched failing against a non-saturating subtraction:
+  `attempt to subtract with overflow` at `security.rs:127`.
+
+Left: `LatencyTimer`'s two reads. They belong with #25c, which already wants the
+histogram's buckets fixed — it is the same function and the same commit.
 
 #### 28b. `name_kind` is computed before it is known to be needed
 

@@ -250,7 +250,7 @@ fn admission(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("admission");
     group.bench_function("rate limiter", |b| {
-        b.iter(|| limiter.should_allow(black_box(ip)))
+        b.iter(|| limiter.should_allow(black_box(ip), current_unix_timestamp()))
     });
     group.bench_function("request validator", |b| {
         b.iter(|| validator.validate_packet(black_box(&packet), false))
@@ -301,10 +301,19 @@ fn shared_state(c: &mut Criterion) {
         logger.log_query(
             IpAddr::V4(Ipv4Addr::from(i.to_be_bytes())),
             Some(Qtype::of(record_types::A)),
+            current_unix_timestamp(),
         );
     }
     group.bench_function("log a query with 1k sources tracked", |b| {
-        b.iter(|| logger.log_query(black_box(ip_of(12_345)), Some(Qtype::of(record_types::A))))
+        // The clock read stays inside the closure: a caller makes one per
+        // datagram, so this is still what answering one query pays (#28a).
+        b.iter(|| {
+            logger.log_query(
+                black_box(ip_of(12_345)),
+                Some(Qtype::of(record_types::A)),
+                current_unix_timestamp(),
+            )
+        })
     });
 
     group.finish();

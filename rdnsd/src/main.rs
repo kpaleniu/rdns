@@ -796,8 +796,12 @@ impl Server {
     /// nothing is how a query earns no response at all.
     async fn answer(&self, packet: &[u8], peer: SocketAddr, out: &mpsc::Sender<Reply>) {
         let ip = peer.ip();
+        // One clock read for the whole message: the limiter, the logger and the
+        // TSIG check all want this instant, and each used to fetch its own
+        // (`TODO.md` #28a).
+        let now = tsig::now();
 
-        if !self.rate_limiter.should_allow(ip) {
+        if !self.rate_limiter.should_allow(ip, now) {
             self.logger.log_rate_limited(ip);
             self.metrics.count(&self.metrics.rate_limited);
             return;
@@ -841,7 +845,7 @@ impl Server {
         };
 
         let qtype = msg.queries.first().map(|q| q.qtype);
-        self.logger.log_query(ip, qtype);
+        self.logger.log_query(ip, qtype, now);
         self.metrics.count(&self.metrics.queries_received);
         if let Some(qtype) = qtype {
             self.metrics.track_query_type(qtype);
@@ -849,7 +853,6 @@ impl Server {
 
         // TSIG before anything that could answer (RFC 8945 §5.2): checking the
         // signature afterwards means answering whoever asked.
-        let now = tsig::now();
         let mut session = match tsig::check_request(packet, &self.tsig_keys, now) {
             TsigCheck::Unsigned => None,
             TsigCheck::Verified(session) => Some(session),
@@ -1673,9 +1676,14 @@ async fn udp_loop(
         };
         let packet = &buf[..size];
 
+        // One clock read per datagram, shared by the limiter, the logger, the
+        // TSIG check and the response budget — each used to fetch its own, at
+        // 24-26 ns a call (`TODO.md` #28a).
+        let now = tsig::now();
+
         // Both are decisions to do nothing, so they run on `&buf[..size]` with
         // nothing copied and nothing spawned.
-        if !server.rate_limiter.should_allow(peer.ip()) {
+        if !server.rate_limiter.should_allow(peer.ip(), now) {
             server.logger.log_rate_limited(peer.ip());
             server.metrics.count(&server.metrics.rate_limited);
             continue;
@@ -1699,7 +1707,7 @@ async fn udp_loop(
         // budget.
         let _busy = busy.clone();
         server
-            .answer_datagram(packet, peer, &socket, &mut scratch)
+            .answer_datagram(packet, peer, &socket, &mut scratch, now)
             .await;
     }
 }
@@ -1716,6 +1724,7 @@ impl Server {
         peer: SocketAddr,
         socket: &UdpSocket,
         scratch: &mut Vec<u8>,
+        now: u64,
     ) {
         let Server {
             zone_map,
@@ -1754,12 +1763,11 @@ impl Server {
 
         // Log successful query parsing
         let qtype = msg.queries.first().map(|q| q.qtype);
-        logger.log_query(peer.ip(), qtype);
+        logger.log_query(peer.ip(), qtype, now);
 
         // A signed query is checked before it is answered, and its answer
         // is signed back (RFC 8945). A rejected one gets NOTAUTH and a
         // TSIG saying which of BADKEY/BADSIG/BADTIME it was.
-        let now = tsig::now();
         let mut session = match tsig::check_request(packet, tsig_keys, now) {
             TsigCheck::Unsigned => None,
             TsigCheck::Verified(session) => Some(session),
@@ -1849,19 +1857,20 @@ impl Server {
         // `Cow` so the ordinary answer — no budget trouble, no TSIG — is sent
         // straight out of the worker's scratch buffer with nothing allocated.
         // The two exceptions build a message of their own and own it.
-        let reply: Option<Cow<'_, [u8]>> = match response_limiter.admit(peer.ip(), scratch.len()) {
-            ResponseVerdict::Send => Some(Cow::Borrowed(scratch.as_slice())),
-            ResponseVerdict::Truncate => {
-                logger.log_rate_limited(peer.ip());
-                metrics.count(&metrics.rate_limited);
-                truncated_reply(&msg).map(Cow::Owned)
-            }
-            ResponseVerdict::Drop => {
-                logger.log_rate_limited(peer.ip());
-                metrics.count(&metrics.queries_dropped);
-                None
-            }
-        };
+        let reply: Option<Cow<'_, [u8]>> =
+            match response_limiter.admit(peer.ip(), scratch.len(), now) {
+                ResponseVerdict::Send => Some(Cow::Borrowed(scratch.as_slice())),
+                ResponseVerdict::Truncate => {
+                    logger.log_rate_limited(peer.ip());
+                    metrics.count(&metrics.rate_limited);
+                    truncated_reply(&msg).map(Cow::Owned)
+                }
+                ResponseVerdict::Drop => {
+                    logger.log_rate_limited(peer.ip());
+                    metrics.count(&metrics.queries_dropped);
+                    None
+                }
+            };
         // Sign whatever we ended up sending — including a truncated one, since
         // that is still our answer to a question someone authenticated. This is
         // where the borrow above becomes a copy, and it is the right place for
@@ -3097,7 +3106,7 @@ mod tests {
 
             let mut scratch = Vec::new();
             server
-                .answer_datagram(&packet, peer, &socket, &mut scratch)
+                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
                 .await;
 
             assert!(
@@ -3130,13 +3139,13 @@ mod tests {
             let mut scratch = Vec::new();
 
             server
-                .answer_datagram(&packet, peer, &socket, &mut scratch)
+                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
                 .await;
             let (address, capacity) = (scratch.as_ptr(), scratch.capacity());
             assert!(!scratch.is_empty(), "the first answer was serialized");
 
             server
-                .answer_datagram(&packet, peer, &socket, &mut scratch)
+                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
                 .await;
             assert_eq!(
                 scratch.as_ptr(),

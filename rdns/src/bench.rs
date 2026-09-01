@@ -8,7 +8,7 @@
 #[cfg(test)]
 mod benches {
     use crate::logging::QueryLogger;
-    use crate::utils::record_types as rt;
+    use crate::utils::{current_unix_timestamp, record_types as rt};
     use crate::Qtype;
     use crate::{Class, Ttl};
     use std::net::{IpAddr, Ipv4Addr};
@@ -22,7 +22,7 @@ mod benches {
 
         let start = Instant::now();
         for _ in 0..iterations {
-            logger.log_query(ip, Some(Qtype::of(rt::A)));
+            logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
         }
         let elapsed = start.elapsed();
 

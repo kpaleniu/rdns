@@ -93,15 +93,19 @@ impl RateLimiter {
         Self::new(RateLimitConfig::default())
     }
 
-    /// Check if a request from the given IP should be allowed
-    pub fn should_allow(&self, ip: IpAddr) -> bool {
+    /// Check if a request from the given IP should be allowed.
+    ///
+    /// `now` is the caller's, in seconds: one datagram passes through this, the
+    /// logger and the response budget, and each read its own clock — four
+    /// `SystemTime::now` calls for one instant, 24-26 ns each. See `TODO.md`
+    /// #28a. The value is seconds old at worst and every bucket here is
+    /// second-granularity.
+    pub fn should_allow(&self, ip: IpAddr, now: u64) -> bool {
         // Before the lock and before a bucket is created: a disabled limiter must
         // not be a mutex on every query.
         if self.config.tokens_per_window == 0 || self.config.exempt.allows(ip) {
             return true;
         }
-
-        let now = current_unix_timestamp();
 
         // Cleanup old entries periodically
         self.cleanup_if_needed(now);
@@ -262,11 +266,12 @@ impl ResponseLimiter {
     }
 
     /// Charge `response_bytes` to `ip` and say what to do with the response.
-    pub fn admit(&self, ip: IpAddr, response_bytes: usize) -> ResponseVerdict {
+    ///
+    /// `now` is the caller's; see [`RateLimiter::should_allow`].
+    pub fn admit(&self, ip: IpAddr, response_bytes: usize, now: u64) -> ResponseVerdict {
         if !self.is_enabled() {
             return ResponseVerdict::Send;
         }
-        let now = current_unix_timestamp();
         let Ok(mut clients) = self.clients.lock() else {
             // A poisoned lock is a bug elsewhere, not a licence to amplify.
             return ResponseVerdict::Truncate;
@@ -439,7 +444,10 @@ mod tests {
 
         // Should allow up to burst size
         for _ in 0..20 {
-            assert!(limiter.should_allow(ip), "should allow within burst size");
+            assert!(
+                limiter.should_allow(ip, current_unix_timestamp()),
+                "should allow within burst size"
+            );
         }
     }
 
@@ -450,11 +458,14 @@ mod tests {
 
         // Use up burst
         for _ in 0..20 {
-            limiter.should_allow(ip);
+            limiter.should_allow(ip, current_unix_timestamp());
         }
 
         // Next one should be denied (no tokens available)
-        assert!(!limiter.should_allow(ip), "should deny when over limit");
+        assert!(
+            !limiter.should_allow(ip, current_unix_timestamp()),
+            "should deny when over limit"
+        );
     }
 
     #[test]
@@ -465,12 +476,12 @@ mod tests {
 
         // Use up burst for ip1
         for _ in 0..20 {
-            limiter.should_allow(ip1);
+            limiter.should_allow(ip1, current_unix_timestamp());
         }
 
         // ip2 should still have tokens
         assert!(
-            limiter.should_allow(ip2),
+            limiter.should_allow(ip2, current_unix_timestamp()),
             "different IPs should have separate buckets"
         );
     }
@@ -487,7 +498,10 @@ mod tests {
 
         for i in 0..5_000u32 {
             // Spread across the whole v4 space, as a spoofing source would.
-            limiter.should_allow(IpAddr::V4(Ipv4Addr::from(i.wrapping_mul(2_654_435_761))));
+            limiter.should_allow(
+                IpAddr::V4(Ipv4Addr::from(i.wrapping_mul(2_654_435_761))),
+                current_unix_timestamp(),
+            );
         }
 
         assert!(
@@ -509,48 +523,48 @@ mod tests {
         let tracked = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let untracked = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
 
-        assert!(limiter.should_allow(tracked));
+        assert!(limiter.should_allow(tracked, current_unix_timestamp()));
         for _ in 0..100 {
             assert!(
-                limiter.should_allow(untracked),
+                limiter.should_allow(untracked, current_unix_timestamp()),
                 "an untracked source is not a refused source"
             );
         }
         // The one address that did get a bucket is still limited normally.
         for _ in 0..19 {
-            limiter.should_allow(tracked);
+            limiter.should_allow(tracked, current_unix_timestamp());
         }
         assert!(
-            !limiter.should_allow(tracked),
+            !limiter.should_allow(tracked, current_unix_timestamp()),
             "the tracked bucket still empties"
         );
     }
 
     /// A clock step backwards must not panic, and must not silently refill every
-    /// bucket either. A `last_refill` in the future is what it looks like here.
+    /// bucket either.
+    ///
+    /// It steps the clock, rather than reaching into `buckets` to stamp one
+    /// entry in the future as it did before `now` became the caller's: an NTP
+    /// step back is what this is about, and now it can be the input.
     #[test]
     fn a_clock_step_backwards_neither_panics_nor_refills_the_bucket() {
         let limiter = RateLimiter::with_defaults();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let now = current_unix_timestamp();
 
-        assert!(limiter.should_allow(ip));
-        limiter
-            .buckets
-            .lock()
-            .unwrap()
-            .get_mut(&ip)
-            .expect("a bucket")
-            .last_refill = current_unix_timestamp() + 3600;
+        assert!(limiter.should_allow(ip, now));
 
-        // Without saturation the first call refills to burst on an underflowed
-        // elapsed time, so the bucket never empties.
+        // The clock jumps an hour backwards. Without saturation the first call
+        // refills to burst on an underflowed elapsed time, so the bucket never
+        // empties.
+        let stepped_back = now - 3600;
         for _ in 0..19 {
-            limiter.should_allow(ip);
+            limiter.should_allow(ip, stepped_back);
         }
         assert!(
-            !limiter.should_allow(ip),
-            "a bucket stamped in the future must not refill — that is the limiter \
-             silently switching itself off"
+            !limiter.should_allow(ip, stepped_back),
+            "a bucket last refilled in the future must not refill again — that is \
+             the limiter silently switching itself off"
         );
     }
 
@@ -560,8 +574,8 @@ mod tests {
         let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
-        limiter.should_allow(ip1);
-        limiter.should_allow(ip2);
+        limiter.should_allow(ip1, current_unix_timestamp());
+        limiter.should_allow(ip2, current_unix_timestamp());
 
         let stats = limiter.get_stats();
         assert_eq!(stats.tracked_ips, 2);
@@ -577,7 +591,7 @@ mod tests {
         assert_eq!(initial as u32, 20);
 
         // After using one, should have one less
-        limiter.should_allow(ip);
+        limiter.should_allow(ip, current_unix_timestamp());
         let after_one = limiter.get_tokens(ip);
         assert!(after_one < initial);
     }
@@ -596,11 +610,11 @@ mod tests {
 
         // Allow up to burst
         for _ in 0..5 {
-            assert!(limiter.should_allow(ip));
+            assert!(limiter.should_allow(ip, current_unix_timestamp()));
         }
 
         // Next should fail
-        assert!(!limiter.should_allow(ip));
+        assert!(!limiter.should_allow(ip, current_unix_timestamp()));
     }
 
     #[test]
@@ -616,7 +630,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
         // Should deny immediately
-        assert!(!limiter.should_allow(ip));
+        assert!(!limiter.should_allow(ip, current_unix_timestamp()));
     }
 
     /// The limit is a *rate*: 100 tokens per 10-second window reads as "100
@@ -628,10 +642,13 @@ mod tests {
         // The burst is what may arrive at once, before the rate applies.
         let limiter = RateLimiter::new(RateLimitConfig::per_second(1000, 200));
         for i in 0..200 {
-            assert!(limiter.should_allow(ip), "query {i} of the burst");
+            assert!(
+                limiter.should_allow(ip, current_unix_timestamp()),
+                "query {i} of the burst"
+            );
         }
         assert!(
-            !limiter.should_allow(ip),
+            !limiter.should_allow(ip, current_unix_timestamp()),
             "and the burst is a bound, not a suggestion"
         );
 
@@ -649,7 +666,10 @@ mod tests {
         let limiter = RateLimiter::new(RateLimitConfig::per_second(0, 1));
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         for i in 0..10_000 {
-            assert!(limiter.should_allow(ip), "query {i}");
+            assert!(
+                limiter.should_allow(ip, current_unix_timestamp()),
+                "query {i}"
+            );
         }
         // And nothing was tracked, so "off" is not "a bucket per source".
         assert_eq!(limiter.get_stats().tracked_ips, 0);
@@ -665,12 +685,15 @@ mod tests {
         let ordinary = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
 
         for i in 0..1_000 {
-            assert!(limiter.should_allow(exempt), "exempt query {i}");
+            assert!(
+                limiter.should_allow(exempt, current_unix_timestamp()),
+                "exempt query {i}"
+            );
         }
-        assert!(limiter.should_allow(ordinary));
-        assert!(limiter.should_allow(ordinary));
+        assert!(limiter.should_allow(ordinary, current_unix_timestamp()));
+        assert!(limiter.should_allow(ordinary, current_unix_timestamp()));
         assert!(
-            !limiter.should_allow(ordinary),
+            !limiter.should_allow(ordinary, current_unix_timestamp()),
             "an address outside the exemption keeps its own bucket"
         );
     }
@@ -681,7 +704,10 @@ mod tests {
     fn a_burst_of_zero_does_not_become_a_total_outage() {
         let limiter = RateLimiter::new(RateLimitConfig::per_second(10, 0));
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        assert!(limiter.should_allow(ip), "one query must still get through");
+        assert!(
+            limiter.should_allow(ip, current_unix_timestamp()),
+            "one query must still get through"
+        );
     }
 
     #[test]
@@ -696,7 +722,7 @@ mod tests {
                 let ip = IpAddr::V4(Ipv4Addr::new(127, 0, i, 0));
                 let mut count = 0;
                 for _ in 0..30 {
-                    if limiter.should_allow(ip) {
+                    if limiter.should_allow(ip, current_unix_timestamp()) {
                         count += 1;
                     }
                 }
@@ -788,22 +814,25 @@ mod tests {
         // Eight 512-byte answers fit exactly.
         for i in 0..8 {
             assert_eq!(
-                limiter.admit(ip, 512),
+                limiter.admit(ip, 512, current_unix_timestamp()),
                 ResponseVerdict::Send,
                 "response {i} should fit"
             );
         }
         assert_ne!(
-            limiter.admit(ip, 512),
+            limiter.admit(ip, 512, current_unix_timestamp()),
             ResponseVerdict::Send,
             "budget spent"
         );
 
         // The same budget is one large answer, not eight.
         let big = ResponseLimiter::new(1, 4096, 2);
-        assert_eq!(big.admit(ip, 4000), ResponseVerdict::Send);
+        assert_eq!(
+            big.admit(ip, 4000, current_unix_timestamp()),
+            ResponseVerdict::Send
+        );
         assert_ne!(
-            big.admit(ip, 512),
+            big.admit(ip, 512, current_unix_timestamp()),
             ResponseVerdict::Send,
             "4000 bytes ate it"
         );
@@ -815,9 +844,14 @@ mod tests {
     fn test_slip_truncates_every_second_over_budget_response() {
         let ip: IpAddr = "192.0.2.2".parse().unwrap();
         let limiter = ResponseLimiter::new(1, 100, 2);
-        assert_eq!(limiter.admit(ip, 100), ResponseVerdict::Send);
+        assert_eq!(
+            limiter.admit(ip, 100, current_unix_timestamp()),
+            ResponseVerdict::Send
+        );
 
-        let verdicts: Vec<ResponseVerdict> = (0..6).map(|_| limiter.admit(ip, 100)).collect();
+        let verdicts: Vec<ResponseVerdict> = (0..6)
+            .map(|_| limiter.admit(ip, 100, current_unix_timestamp()))
+            .collect();
         assert_eq!(
             verdicts,
             vec![
@@ -837,12 +871,24 @@ mod tests {
         let ip: IpAddr = "192.0.2.3".parse().unwrap();
 
         let always = ResponseLimiter::new(1, 10, 1);
-        assert_eq!(always.admit(ip, 100), ResponseVerdict::Truncate);
-        assert_eq!(always.admit(ip, 100), ResponseVerdict::Truncate);
+        assert_eq!(
+            always.admit(ip, 100, current_unix_timestamp()),
+            ResponseVerdict::Truncate
+        );
+        assert_eq!(
+            always.admit(ip, 100, current_unix_timestamp()),
+            ResponseVerdict::Truncate
+        );
 
         let never = ResponseLimiter::new(1, 10, 0);
-        assert_eq!(never.admit(ip, 100), ResponseVerdict::Drop);
-        assert_eq!(never.admit(ip, 100), ResponseVerdict::Drop);
+        assert_eq!(
+            never.admit(ip, 100, current_unix_timestamp()),
+            ResponseVerdict::Drop
+        );
+        assert_eq!(
+            never.admit(ip, 100, current_unix_timestamp()),
+            ResponseVerdict::Drop
+        );
     }
 
     /// One client's flood must not spend another client's budget.
@@ -852,10 +898,16 @@ mod tests {
         let quiet: IpAddr = "192.0.2.5".parse().unwrap();
         let limiter = ResponseLimiter::new(1, 512, 2);
 
-        assert_eq!(limiter.admit(noisy, 512), ResponseVerdict::Send);
-        assert_ne!(limiter.admit(noisy, 512), ResponseVerdict::Send);
         assert_eq!(
-            limiter.admit(quiet, 512),
+            limiter.admit(noisy, 512, current_unix_timestamp()),
+            ResponseVerdict::Send
+        );
+        assert_ne!(
+            limiter.admit(noisy, 512, current_unix_timestamp()),
+            ResponseVerdict::Send
+        );
+        assert_eq!(
+            limiter.admit(quiet, 512, current_unix_timestamp()),
             ResponseVerdict::Send,
             "the quiet client still has its own budget"
         );
@@ -876,7 +928,7 @@ mod tests {
             } else {
                 format!("203.0.113.{}", i % 256).parse().unwrap()
             };
-            if limiter.admit(ip, 100) == ResponseVerdict::Truncate {
+            if limiter.admit(ip, 100, current_unix_timestamp()) == ResponseVerdict::Truncate {
                 truncated += 1;
             }
         }
@@ -893,7 +945,10 @@ mod tests {
         let limiter = ResponseLimiter::disabled();
         assert!(!limiter.is_enabled());
         for _ in 0..1000 {
-            assert_eq!(limiter.admit(ip, 65535), ResponseVerdict::Send);
+            assert_eq!(
+                limiter.admit(ip, 65535, current_unix_timestamp()),
+                ResponseVerdict::Send
+            );
         }
     }
 
@@ -904,7 +959,7 @@ mod tests {
         let limiter = ResponseLimiter::with_defaults();
         for i in 0..40 {
             assert_eq!(
-                limiter.admit(ip, 300),
+                limiter.admit(ip, 300, current_unix_timestamp()),
                 ResponseVerdict::Send,
                 "answer {i} of an ordinary burst"
             );
