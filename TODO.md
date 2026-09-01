@@ -710,6 +710,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`9715c3c`), the day after it was filed. 1 124 ms → 1.28 ms on the same probe. The fix is a type — `Nsec3Params`, the triple a hash is a function of — plus the map lookup the key was already there for, and the proof moved out from under the lock. One of the four filed boxes did not survive being checked against the code: NSEC3 hides how deep a cached name is, so the depth bound it asked for is not available to take |
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection was O(zones per query) — 55 µs at ten thousand zones, now 32 ns and flat, keyed on `NameKeyBuf` with a walk up the QNAME, and the walk brought a second multiplier with it that the client picks. Name compression was O(n²) in the records of one message, so a 400-record transfer envelope cost 130.7 µs to serialize and now costs 42.8; the index that fixes it is built lazily, because the threshold that helps a transfer hurt a 60-name response by 26%. And an AXFR held the zone three times over before the first byte went out; the envelopes are an iterator now, at 10.5× less peak memory, which needed `Arc<Zone>` in the map because the lock cannot be held across a socket write |
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
+| **27** | what a zero-allocation answer path would take | **filed 2026-09-01, not started.** Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
 | **11** | data layout and CPU cache friendliness | **answered no 2026-08-04.** Measured with cachegrind: a miss costs 2,786 instructions and under 0.08 D1 misses, a hit 1,052 and 6.4 — all L2-resident, zero LL misses either way. There is no pointer chase to remove. The `perf` blocker it carried for months was checked and did not exist; the probe is `rdns/examples/zone_lookup_probe.rs` |
@@ -1814,6 +1815,163 @@ reaching an operator.
   direction of failure written down.
 - **`shutdown`, `readiness`, `journal`.** Not re-read in depth; nothing in the
   paths that touch them contradicted #7 or #9d.
+
+### 27. What a zero-allocation answer path would take — filed 2026-09-01
+
+**Read the payoff first.** A whole answer is ~522 ns against 3.6-4.1 µs of
+syscall (#9e), so removing every allocation on this path is worth about 1% end to
+end. The reason to file it is not throughput: it is that an allocation count is
+the deterministic gate this repo already prefers (§10), and a path asserted at
+**zero** is a far sharper tripwire than one asserted at twenty-one. Anyone
+starting this expecting a faster server has misread the numbers.
+
+**Nothing here is #15.** That was withdrawn because a borrowed, pointer-following
+`DName` needs a name's absolute offset in the message, and twelve parse sites
+hold suffix slices that cannot know theirs. None of the below needs one.
+
+#### Where the allocations are
+
+Measured on `rdnsd` with `--features dhat-heap`, 2 000 queries against a
+716-block startup baseline, linear to three decimals, on Linux. Every program
+point dhat attributes is one of the sites below.
+
+| shape | per query |
+|---|---|
+| plain A, lower-case QNAME | 13.0 |
+| EDNS0+DO+cookie | 16.0 |
+| plain, DNS-0x20 case | 18.0 |
+| **EDNS0 + 0x20 — what a resolver actually sends** | **21.0** |
+| NXDOMAIN, unsigned zone | 19.0 |
+| DO NXDOMAIN, signed zone | 153.0 |
+
+The 21 breaks down as:
+
+| site | count | removed by |
+|---|---|---|
+| `ascii_lowered` in `Zone::lookup_key` and `Zones::for_query` | 5 | 27a |
+| `resolve_in_zone`'s `qname.to_string()` (`answer.rs:212`) | 1 | 27a or 27d |
+| `add_answer`: owner `String`, `RecordData::clone`, `answers` push | 3 | 27b |
+| the compressor's arena and `seen` (`lib.rs:1504`) | 2 | 27b |
+| `Zone::of_type`'s `Vec` (`zone.rs:221`), twice | 2 | 27c |
+| parse: two label `Vec`s, two `String`s, `queries`, `additionals` | 6 | 27d |
+| `queries.clone()` — the spine and the QNAME `String` | 2 | 27d |
+
+**27a + 27b + 27c is thirteen of twenty-one and introduces no lifetime.** 27d
+takes the remaining eight and is the only one that changes a type's shape, so it
+is the one to leave until last — or never.
+
+Everything *around* the answer already allocates nothing, which was checked
+rather than assumed: the rate limiter, `validate_packet`, `log_query`,
+`tsig::check_request`, `ResponseLimiter::admit`, and tokio itself — a UDP round
+trip including the `select!` over `recv_from` and `stop.wait()` measures 0. A
+thousand *first-time* peers cost 27 allocations between the three bounded tables,
+0.03 per datagram.
+
+#### 27a. One folded lookup key, computed at the door
+
+Every `Zone` entry point takes a `&str` and re-derives `Zone::lookup_key`
+itself, so one query folds the same name five times: `delegation_for`,
+`name_kind`, the `is_empty()` probe, `add_answer`'s own `query`, and
+`Zones::for_query`. `ascii_lowered_cow` borrows only when there is nothing to
+fold, so this is free for a lower-case QNAME and five allocations for a
+case-randomized one — and case randomization is a resolver's spoofing defence,
+not an attack.
+
+The key-taking variants already exist privately: `name_kind_of_key`
+(`zone.rs:263`) and `delegation_for_key` (`zone.rs:316`). The change is promoting
+them, and folding once into a per-worker buffer. §2's "bounds and clamps belong
+at the boundary, once", applied to normalization.
+
+**Trap: echo the client's case, not the key.** RFC 1034 §4.3.3 aside, DNS-0x20
+*is* the client comparing the echoed QNAME byte for byte. Echoing the folded
+form breaks every 0x20 resolver silently and looks like nothing from here — §4's
+quiet degradation, with a spoofing defence as the casualty.
+
+#### 27b. Write the response; do not build it
+
+Today an answer is a `DnsMessage` of owned `String`s and cloned RDATA, then
+serialized. A `ResponseWriter` owning the output buffer and the compressor, with
+records appended as they are found, removes both: RDATA stops being cloned
+because `RecordData` already holds **uncompressed wire-format bytes**
+(`record_data.rs:31`) and the writer copies them, and the compressor stops being
+per-message state because it lives in the writer.
+
+That storage decision is what makes this reachable at all. Had records been kept
+as decoded `ParsedRecord` fields, every answer would have to re-encode.
+
+**Trap: the compressor must rewind with the buffer.** Overflow means setting TC=1
+and dropping back to a record boundary — and a *whole RRset* boundary, since a
+partial RRset must not go out (RFC 2181 §9). Today's `to_bytes_within_buf` gets
+that for free by clearing whole sections and rebuilding; a writer that rewinds is
+the thing that could emit half an RRset, so the rewind point is per-RRset, not
+per-record. Worse, any suffix `seen` recorded past that offset points at bytes
+about to be overwritten: silent wire corruption, on the least-tested path.
+
+The upside is that this *replaces* the build-it-twice retry (`lib.rs:1675`, then
+`:1705`) — where the same trap already waits for anyone who hoists the compressor
+out of `to_bytes` without clearing it between the two passes.
+
+This is also where the negative shapes concentrate, and it is worth more than its
+thirteen suggests: a signed NXDOMAIN is 153, and after #25d the remainder is
+almost entirely the five records' owner `String`s and cloned RDATA plus what
+reading each NSEC costs. Nothing smaller than a writer removes those.
+
+#### 27c. `Zone::query` hands out an iterator
+
+`Vec<&ZoneRecord>` (`zone.rs:221`) — the records are already borrowed, so only
+the spine allocates. An iterator form removes both calls' spines, and with 27b
+the records are consumed as they are produced. This is #25a from the other side:
+that item is about the zone being walked three times, and the same change fuses
+the `is_empty()` probe with the lookup that follows it.
+
+#### 27d. The request as a view over the packet
+
+A `Request<'a>` holding `&'a [u8]` and offsets. `validation::Request` is already
+the only door on the server path (#14b), so this changes its insides rather than
+adding a door.
+
+Cheap for the *query* path because the QNAME is the first name in a message and
+so structurally cannot carry a compression pointer — nothing precedes it to point
+at — and an OPT record's owner is the root (RFC 6891 §6.1.2). The second of those
+is what a *well-formed* packet holds, not what a hostile one must, so the view
+needs a fallback to the unpacker for any name that is not a plain in-place one.
+Assuming the property rather than checking it is §2.
+
+**It is not cheap for UPDATE.** RFC 2136's update section carries records whose
+RDATA holds names, which do need the unpacker — so `answer_update` keeps the
+owned parse, and the view must be able to produce a `DnsMessage` for it. That is
+the constraint to design against, and it is why this is filed as a stage of its
+own rather than folded into 27b.
+
+**Trap: a borrowed request pins the receive buffer for the life of the answer.**
+Sound because `udp_loop` answers inline on a fixed worker pool rather than
+spawning per datagram — a decision made for other reasons (#9e) that this
+depends on. Reversing it would break this silently.
+
+#### The cost this pays, said out loud
+
+Two message shapes, which is §7's own warning. The mitigation is direction: the
+owned `DnsMessage` is built *from* the view where something needs it, never the
+reverse, and the server path holds only the view. `DnsMessage` keeps its shape
+for the cache, the resolver, transfers, the signer and the tools — all of which
+need ownership, and one of which (wildcard synthesis, RRSIG and NSEC3 generation)
+has nothing to borrow from.
+
+#### What still allocates afterwards
+
+So "zero" is not overclaimed: TSIG signing, DO=1 against a signed zone
+(`answer_signatures` 22, `negative_proof` 114 after #25d), a new peer entering
+the bounded tables, reloads and transfers.
+
+#### The gate
+
+`rdns/tests/allocations.rs` cannot see `rdnsd`, so the daemon figure needs the
+dhat harness above — start it, send a fixed count, `SIGTERM`, subtract a
+zero-query baseline. Each stage measured before and after in the same session,
+as #13's were. The library counts stay the first gate, and they now cover the
+shapes that hid a site: the suite read the TSIG scan as free because it only ever
+measured a query with no additional section, where `find_tsig` returns before its
+body.
 
 ### 12. Pre-authentication panics — audited 2026-08-01
 
