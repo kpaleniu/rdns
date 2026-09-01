@@ -1886,9 +1886,20 @@ start this for speed, and the gate argument below is unchanged — but the numbe
 that was here was wrong by an order of magnitude, and a wrong number in a
 "read this first" paragraph is how the 13.7 above survived a year.
 
-The reason to file it remains that an allocation count is the deterministic gate
-this repo prefers (§10), and a path asserted at **zero** is a far sharper
-tripwire than one asserted at twenty-one.
+**And a second correction, from #28d, in the same direction.** The table above
+divides allocations into a *library answer* of 844 ns. Measured against the
+server instead: `rdnsd` spends **33-55 µs of CPU per query** (release, Linux,
+`/proc/<pid>/stat`), so the whole answer path — allocations, lookups, encoding,
+everything #27 touches — is **~2-3% of what a query costs this server**. Half of
+that is these allocations. The throughput case for #27 is therefore about 1%
+after all, which is where the wrong number started; the arithmetic was wrong and
+the conclusion happened to be close. Both are recorded because guessing right for
+the wrong reason is not a result.
+
+The reason to file it is the gate, not the speed: an allocation count is the
+deterministic assertion this repo prefers (§10), and a path asserted at **zero**
+is a far sharper tripwire than one asserted at nineteen. Anyone who picks this up
+for throughput has misread two measurements, not one.
 
 **And it is not the largest thing on this path.** See #28: six clock reads per
 query cost 144-155 ns, measured on both platforms, and four of the six want the
@@ -1908,16 +1919,19 @@ point dhat attributes is one of the sites below.
 |---|---|
 | plain A, lower-case QNAME | 13.0 |
 | EDNS0+DO+cookie | 16.0 |
-| plain, DNS-0x20 case | 18.0 |
-| **EDNS0 + 0x20 — what a resolver actually sends** | **21.0** |
+| plain, DNS-0x20 case | 16.0 |
+| **EDNS0 + 0x20 — what a resolver actually sends** | **19.0** |
 | NXDOMAIN, unsigned zone | 19.0 |
 | DO NXDOMAIN, signed zone | 153.0 |
 
 The 21 breaks down as:
 
+Twenty-one when this was filed; **nineteen after #28b and #28c took two folds
+out**, and the table is the nineteen:
+
 | site | count | removed by |
 |---|---|---|
-| `ascii_lowered` in `Zone::lookup_key` and `Zones::for_query` | 5 | 27a |
+| `ascii_lowered` in `Zone::lookup_key` (twice) and `Zones::for_query` | 3 | 27a |
 | `resolve_in_zone`'s `qname.to_string()` (`answer.rs:212`) | 1 | 27a or 27d |
 | `add_answer`: owner `String`, `RecordData::clone`, `answers` push | 3 | 27b |
 | the compressor's arena and `seen` (`lib.rs:1504`) | 2 | 27b |
@@ -1925,9 +1939,9 @@ The 21 breaks down as:
 | parse: two label `Vec`s, two `String`s, `queries`, `additionals` | 6 | 27d |
 | `queries.clone()` — the spine and the QNAME `String` | 2 | 27d |
 
-**27a + 27b + 27c is thirteen of twenty-one and introduces no lifetime.** 27d
-takes the remaining eight and is the only one that changes a type's shape, so it
-is the one to leave until last — or never.
+**27a + 27b + 27c is eleven of nineteen and introduces no lifetime.** 27d takes
+the remaining eight and is the only one that changes a type's shape, so it is the
+one to leave until last — or never.
 
 Everything *around* the answer already allocates nothing, which was checked
 rather than assumed: the rate limiter, `validate_packet`, `log_query`,
@@ -1936,7 +1950,7 @@ trip including the `select!` over `recv_from` and `stop.wait()` measures 0. A
 thousand *first-time* peers cost 27 allocations between the three bounded tables,
 0.03 per datagram.
 
-#### 27a. One folded lookup key, computed at the door
+#### 27a. One folded lookup key, computed at the door — **done 2026-09-01**
 
 Every `Zone` entry point takes a `&str` and re-derives `Zone::lookup_key`
 itself, so one query folds the same name five times: `delegation_for`,
@@ -1955,6 +1969,37 @@ at the boundary, once", applied to normalization.
 *is* the client comparing the echoed QNAME byte for byte. Echoing the folded
 form breaks every 0x20 resolver silently and looks like nothing from here — §4's
 quiet degradation, with a spoofing defence as the casualty.
+
+**Done, and it needed no new API at all.** `Zone`'s entry points fold their
+argument and `ascii_lowered_cow` borrows when there is nothing left to fold, so
+handing them an already-folded name makes every one of them free. The whole
+change is in `rdnsd/src/answer.rs`: `make_response` folds once per question,
+`Outcome` gained a lifetime and carries the presentation name and the key as
+`Cow`s, and `add_answer` takes both — echoing the first, looking up with the
+second. `add_chain` folds per hop, which pays only where an alias was followed.
+
+    daemon, per query      before   after
+    plain A                  13.0    12.0
+    EDNS0+DO+cookie          16.0    15.0
+    plain, DNS-0x20          16.0    13.0
+    EDNS + DNS-0x20          19.0    16.0
+    NXDOMAIN, unsigned       19.0    18.0
+
+Three for a case-randomized query, one for a lower-case one — the table above
+predicted four and three, and the difference is worth keeping: **the fold at the
+door is itself an allocation**. Three folds became one, not none. Removing the
+last one needs somewhere to put the folded bytes that outlives the question,
+which is a per-worker buffer, which is 27d. The `qname.to_string()` in
+`resolve_in_zone` went with it, and that one helps every query rather than only
+the randomized ones.
+
+**The trap above was real and nothing in the tree would have caught it.** Every
+answer-path test asks in lower case, where the folded key and the echoed name are
+the same bytes, so the two had never been distinguishable. Forcing `add_answer`
+to echo the key instead of the name fails exactly one test out of 107 —
+`a_case_randomized_qname_is_echoed_exactly_as_asked`, written for this — and it
+covers the wildcard case too, since synthesis must echo the name asked for and
+never `*.example.com.` (RFC 4592 §3.3.1).
 
 #### 27b. Write the response; do not build it
 

@@ -3,8 +3,10 @@
 //! Everything here is a synchronous function of the message, the zone map and
 //! the metrics — no sockets, no lock guards, nothing `async`.
 
+use std::borrow::Cow;
+
 use rdns::metrics::{DnsMetrics, LatencyTimer};
-use rdns::utils::record_types;
+use rdns::utils::{absolute_lowered, record_types};
 use rdns::zone::{NameKind, Zone};
 use rdns::Qtype;
 use rdns::Ttl;
@@ -125,16 +127,21 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
             continue;
         }
 
-        let zone = zones.for_query(&query.qname);
+        // One fold for the whole question. `Zones::for_query`, the delegation
+        // walk and every `Zone` lookup fold their argument themselves and borrow
+        // when there is nothing left to fold, so folding once here makes all of
+        // them free — a case-randomized query paid for three (`TODO.md` #27a).
+        let key = absolute_lowered(&query.qname);
+        let zone = zones.for_query(&key);
 
         if let Some(zone) = zone {
-            match resolve_in_zone(zone, &query.qname, query.qtype) {
+            match resolve_in_zone(zone, &query.qname, &key, query.qtype) {
                 Outcome::Referral { cut } => {
                     refer_to_child(zone, &cut, dnssec_ok, &mut response);
                 }
-                Outcome::Answer { chain, name } => {
+                Outcome::Answer { chain, name, key } => {
                     add_chain(zone, &chain, dnssec_ok, &mut response);
-                    add_answer(zone, &name, query.qtype, dnssec_ok, &mut response);
+                    add_answer(zone, &name, &key, query.qtype, dnssec_ok, &mut response);
                 }
                 Outcome::Negative { chain, name, kind } => {
                     add_chain(zone, &chain, dnssec_ok, &mut response);
@@ -176,18 +183,26 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
 
 /// What RFC 1034 §4.3.2 decided about one question against one zone: a loop with
 /// four exits.
-enum Outcome {
+/// `name` is what the client asked, in the case it asked in, because that is
+/// what an answer echoes (RFC 1034 §4.3.3) and what a DNS-0x20 resolver compares
+/// byte for byte. `key` is the same name folded, which is what every lookup
+/// wants. Both borrow the question until a CNAME hop makes one of them new.
+enum Outcome<'a> {
     /// The zone's authority stops at `cut`: the answer is a referral to the
     /// child, with AA clear (RFC 1035 §4.1.1).
     Referral { cut: String },
     /// There are records for the question at `name`, reached through the
     /// aliases at `chain` (empty in the ordinary case).
-    Answer { chain: Vec<String>, name: String },
+    Answer {
+        chain: Vec<String>,
+        name: Cow<'a, str>,
+        key: Cow<'a, str>,
+    },
     /// No records. `name` is the name the "no" is about — the end of the chain
     /// when one was followed — and `kind` decides NXDOMAIN against NODATA.
     Negative {
         chain: Vec<String>,
-        name: String,
+        name: Cow<'a, str>,
         kind: NameKind,
     },
     /// The chain walked out of this zone: NOERROR with the aliases we hold and
@@ -206,17 +221,23 @@ pub(crate) const MAX_CNAME_HOPS: usize = 16;
 /// matters: authority ends here, the name has the data, the name is an alias,
 /// the name has no such data. Getting the first one last is how a parent answers
 /// NXDOMAIN for a child's names.
-fn resolve_in_zone(zone: &Zone, qname: &str, qtype: Qtype) -> Outcome {
+/// `qkey` is `qname` folded, which the caller has already paid for: `Zone`'s
+/// entry points fold their argument and `ascii_lowered_cow` borrows when there
+/// is nothing left to fold, so passing the folded form makes every lookup below
+/// free. A case-randomized query folded its name three times before this
+/// (`TODO.md` #27a).
+fn resolve_in_zone<'a>(zone: &Zone, qname: &'a str, qkey: &'a str, qtype: Qtype) -> Outcome<'a> {
     let mut chain: Vec<String> = Vec::new();
     let mut visited: Vec<String> = Vec::new();
-    let mut name = qname.to_string();
+    let mut name: Cow<'a, str> = Cow::Borrowed(qname);
+    let mut key: Cow<'a, str> = Cow::Borrowed(qkey);
 
     for _ in 0..MAX_CNAME_HOPS {
         // A delegation is a referral whatever the type, except the DS *at* the
         // cut: that is the parent's own statement about the child, which the
         // child does not hold and could not be asked (RFC 4035 §3.1.4.1).
-        if let Some(cut) = zone.delegation_for(&name) {
-            let at_the_cut = cut.eq_ignore_ascii_case(&zone.normalize_name(&name));
+        if let Some(cut) = zone.delegation_for(&key) {
+            let at_the_cut = cut == *key;
             if !(qtype.is(record_types::DS) && at_the_cut) {
                 return if chain.is_empty() {
                     Outcome::Referral { cut }
@@ -232,28 +253,29 @@ fn resolve_in_zone(zone: &Zone, qname: &str, qtype: Qtype) -> Outcome {
         // Both from one walk: `query` works the kind out to decide whether a
         // wildcard may answer, and asking for it separately walked the ancestors
         // and folded the name a second time (`TODO.md` #28b).
-        let (kind, records) = zone.query_with_kind(&name, qtype);
+        let (kind, records) = zone.query_with_kind(&key, qtype);
         if !records.is_empty() {
-            return Outcome::Answer { chain, name };
+            return Outcome::Answer { chain, name, key };
         }
         // A CNAME query is answered by the CNAME, not followed by it.
         if qtype.is(record_types::CNAME) {
             return Outcome::Negative { chain, name, kind };
         }
 
-        let Some(target) = cname_target(zone, &name) else {
+        let Some(target) = cname_target(zone, &key) else {
             return Outcome::Negative { chain, name, kind };
         };
-        chain.push(name.clone());
-        visited.push(zone.normalize_name(&name).to_ascii_lowercase());
+        chain.push(name.into_owned());
+        visited.push(key.into_owned());
 
         // Folded for `visited`, an equality test against folded names; `in_zone`
         // does not need it to be.
-        let target_key = zone.normalize_name(&target).to_ascii_lowercase();
+        let target_key = absolute_lowered(&target).into_owned();
         if !in_zone(zone, &target_key) || visited.contains(&target_key) {
             return Outcome::ChainLeftZone { chain };
         }
-        name = target;
+        name = Cow::Owned(target);
+        key = Cow::Owned(target_key);
     }
     Outcome::ChainLeftZone { chain }
 }
@@ -283,8 +305,18 @@ fn in_zone(zone: &Zone, name: &str) -> bool {
 ///
 /// Echoes the name asked about, not the stored owner, which may be `@`, relative
 /// or a wildcard — the client must see the queried name (RFC 1034 §4.3.3).
-fn add_answer(zone: &Zone, name: &str, qtype: Qtype, dnssec_ok: bool, response: &mut DnsMessage) {
-    for record in zone.query(name, qtype) {
+/// `name` is echoed and `key` is looked up with: they are the same name, and a
+/// DNS-0x20 client compares the echo byte for byte, so the folded form must not
+/// reach the wire.
+fn add_answer(
+    zone: &Zone,
+    name: &str,
+    key: &str,
+    qtype: Qtype,
+    dnssec_ok: bool,
+    response: &mut DnsMessage,
+) {
+    for record in zone.query(key, qtype) {
         response.answers.push(ResourceRecord {
             name: name.to_string(),
             class: record.class,
@@ -294,14 +326,14 @@ fn add_answer(zone: &Zone, name: &str, qtype: Qtype, dnssec_ok: bool, response: 
     }
 
     if dnssec_ok {
-        let signatures = dnssec_answer::answer_signatures(zone, name, qtype);
+        let signatures = dnssec_answer::answer_signatures(zone, key, qtype);
         // The same signature verifies at every name the wildcard reaches, so a
         // wildcard answer also owes a denial of the name asked for
         // (RFC 4035 §3.1.3) — otherwise one captured answer serves for all.
         if signatures.wildcard.is_some() {
             response
                 .authorities
-                .extend(dnssec_answer::proof_of_absence(zone, name));
+                .extend(dnssec_answer::proof_of_absence(zone, key));
         }
         response.answers.extend(signatures.records);
     }
@@ -313,9 +345,12 @@ fn add_answer(zone: &Zone, name: &str, qtype: Qtype, dnssec_ok: bool, response: 
 /// — and its own wildcard denial when the alias was synthesized.
 fn add_chain(zone: &Zone, chain: &[String], dnssec_ok: bool, response: &mut DnsMessage) {
     for at in chain {
+        // Folded here rather than carried: a chain is empty on the ordinary
+        // answer, so this pays only where an alias was actually followed.
         add_answer(
             zone,
             at,
+            &absolute_lowered(at),
             Qtype::of(record_types::CNAME),
             dnssec_ok,
             response,
@@ -482,6 +517,42 @@ ns.sub   IN A   192.0.2.20
             .iter()
             .filter(|r| r.rdata.rtype() == rtype)
             .collect()
+    }
+
+    /// A resolver randomizes the case of the QNAME and compares the echo byte
+    /// for byte; a mismatch is a spoofed answer as far as it is concerned
+    /// (DNS-0x20). The answer therefore echoes the name *as asked*, not as the
+    /// zone or the lookup key spells it (RFC 1034 §4.3.3, RFC 4343 on why the
+    /// lookup may fold and the echo may not).
+    ///
+    /// Nothing tested this until #27a made the folded key a separate value from
+    /// the echoed name — the two had been one string, so no test could tell them
+    /// apart. Every other test here asks in lower case, where a regression is
+    /// invisible.
+    #[test]
+    fn a_case_randomized_qname_is_echoed_exactly_as_asked() {
+        // `host` is a plain A: `www` in this zone is a CNAME, whose answer
+        // section ends at the target's own name and would hide the property.
+        // The wildcard case is the second one — synthesis must echo the name
+        // asked for, never `*.example.com.` (RFC 4592 §3.3.1).
+        for asked in [
+            "HoSt.eXaMpLe.CoM.",
+            "AnYtHiNg.ExAmPlE.cOm.",
+            "HOST.EXAMPLE.COM.",
+        ] {
+            let response = ask(asked, Qtype::of(record_types::A));
+            assert_eq!(response.rcode, ResponseCode::Ok, "{asked}");
+            assert_eq!(
+                response.queries[0].qname, asked,
+                "the question is echoed as asked"
+            );
+            let answers = rdatas(&response.answers, record_types::A);
+            assert_eq!(answers.len(), 1, "{asked}: the same record is found");
+            assert_eq!(
+                answers[0].name, asked,
+                "the owner name is echoed as asked, not folded"
+            );
+        }
     }
 
     /// The wire shape that used to go out for every CNAME in every zone this
