@@ -710,7 +710,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`9715c3c`), the day after it was filed. 1 124 ms → 1.28 ms on the same probe. The fix is a type — `Nsec3Params`, the triple a hash is a function of — plus the map lookup the key was already there for, and the proof moved out from under the lock. One of the four filed boxes did not survive being checked against the code: NSEC3 hides how deep a cached name is, so the depth bound it asked for is not available to take |
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection was O(zones per query) — 55 µs at ten thousand zones, now 32 ns and flat, keyed on `NameKeyBuf` with a walk up the QNAME, and the walk brought a second multiplier with it that the client picks. Name compression was O(n²) in the records of one message, so a 400-record transfer envelope cost 130.7 µs to serialize and now costs 42.8; the index that fixes it is built lazily, because the threshold that helps a transfer hurt a 60-name response by 26%. And an AXFR held the zone three times over before the first byte went out; the envelopes are an iterator now, at 10.5× less peak memory, which needed `Arc<Zone>` in the map because the lock cannot be held across a socket write |
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
-| **28** | work the answer path does and need not | **filed 2026-09-01; 28a's four wall-clock reads and 28b done the same day.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
+| **28** | work the answer path does and need not | **filed 2026-09-01; 28a-28c done and 28d answered *no* the same day.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
 | **27** | what a zero-allocation answer path would take | **filed 2026-09-01, not started.** Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
@@ -2184,19 +2184,60 @@ it; the filed guess about the reset does not fail at all.
 The reload case the item asked for is covered too, by the incremental path —
 and two existing tests catch that one already.
 
-#### 28d. Four global mutexes per datagram — a ceiling, not a measured cost
+#### 28d. Four global mutexes per datagram — **measured 2026-09-01, and they are not a ceiling**
 
 `should_allow` takes two (`last_cleanup`, then `buckets` — this is #25f),
 `log_query` one, `admit` one. Both limiters already short-circuit before locking
 when they are *disabled*, but the defaults enable both, so a default server takes
 all four on every datagram with 16 UDP workers sharing them.
 
-**Not measured, and so not ranked.** #25f already says the honest version: at
-~4 µs of syscall per query this is not the bottleneck, it is the ceiling. What
-would settle it is a run with `--udp-workers 1` against `--udp-workers 16` at
-saturation, which nothing here has done. Per-worker sharding with periodic
-rollup is the shape that removes it, and it is the same shape as 28a's
-"read the clock once in the loop".
+~~Not measured, and so not ranked.~~ **Measured, and the premise is wrong.**
+Release build, Linux, 16 cores shared by client and server;
+`rdns/examples/udp_flood.rs` is the generator and the server's own `utime +
+stime` from `/proc/<pid>/stat` is the cost, because on one box throughput alone
+cannot say whose ceiling was hit.
+
+Both limiters given limits far above the offered load, so what is compared is
+their *cost* and not their policy — the first attempt got this wrong and measured
+`--query-rate 1000` capping the whole run at 243 answers/s, because every client
+thread shared one source address. Each thread binds `127.0.0.<n>` now.
+
+    16 clients, 4 s, three runs        answers/s      server CPU per query
+    --udp-workers 1,  limiters on     20.7-21.0k          54.0-54.9 us
+    --udp-workers 1,  limiters off    20.9-21.4k          53.0-54.3 us
+    --udp-workers 16, limiters on      165-171k           33.6-34.2 us
+    --udp-workers 16, limiters off     165-169k           33.5-33.8 us
+
+**Three things follow, and none of them is the item as filed.**
+
+- **The limiters' two mutexes cost nothing measurable**: on and off differ by
+  under 2% and the sign changes between runs.
+- **Contention does not appear at all.** One worker to sixteen at the same
+  offered load takes CPU per query *down*, 54 µs to 34. Contention would take it
+  up. That comparison covers all four mutexes, including the logger's, which has
+  no off switch and so cannot be A/B'd.
+- **The plateau that looked like a ceiling was the client.** Throughput stops
+  rising at ~103k with 8 client threads and keeps going with more — 130k at 12,
+  150k at 16, 182k at 24 — while CPU per query falls the whole way, which is
+  per-wakeup overhead being amortized rather than a server limit.
+
+**Why the microbenchmark said otherwise, which is the part worth keeping.**
+Hammering the gauntlet with nothing in between, it collapses: 20.4M calls/s on
+one thread to 6.1M on sixteen, and the *logger alone* accounts for it — the
+limiters' contribution is second order. But the ceiling that establishes is
+~5-6M gauntlet calls/s, and the server offers ~170k queries/s, ~30x under it.
+A contention benchmark with no work between acquisitions measures a worst case
+the workload never reaches; it says where the wall is, not that you are near it.
+
+**Not to be done.** Per-worker sharding would be real work for something with 30x
+of headroom. If this is ever reopened, the number to beat is ~5-6M gauntlet
+calls/s and the way to check is above.
+
+**One figure worth carrying away.** Server CPU is **33-55 µs per query** here
+against ~1 µs of library answer work, so the answer path is ~2-3% of what a query
+costs this server — a stronger version of #9e's "about 6%". The VM inflates syscall
+and scheduling costs and the box is shared with the load generator, so treat the
+absolute as this environment's and the ratio as the point.
 
 #### Checked and rejected
 
