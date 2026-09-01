@@ -2139,7 +2139,7 @@ Two notes on verifying it:
   own walk across exact, wildcard, empty-non-terminal, not-found, apex,
   below-a-delegation and out-of-zone names.
 
-#### 28c. The delegation walk runs in zones that have no delegations
+#### 28c. The delegation walk runs in zones that have no delegations — **done 2026-09-01**
 
 `resolve_in_zone` opens with `zone.delegation_for(&name)`, and it must — RFC 1034
 §4.3.2's first case, and getting it last is how a parent answers NXDOMAIN for a
@@ -2157,6 +2157,32 @@ that is wrong in the false direction is a *missed referral* — the parent
 answering authoritatively for a child's names, which is the bug §8 opens with. It
 has to be recomputed everywhere `has_wildcards` is, and the test that matters is
 a zone that gains its first delegation on reload.
+
+**Done.** `has_delegations` is set on the incremental path and recomputed by
+`reindex`, and `delegation_for` checks it *before* `lookup_key` — with no cut to
+find, the folded key is a copy of the name made for nothing, so the fold goes
+too.
+
+    daemon, per query      before   after
+    plain, DNS-0x20          17.0    16.0
+    EDNS + DNS-0x20          20.0    19.0
+
+Lower-case shapes are unchanged in allocations for the same reason as #28b: the
+walk is skipped for every query, but only a folded name allocates.
+
+**The dangerous mistake was not the one filed here, and finding that out took
+running it.** "A flag carried across the reindex" is safe: dropping the `= false`
+reset leaves it stale only in the direction that costs a wasted walk. The
+mistake that bites is a `reindex` that rebuilds the index without re-deciding
+which NS records are *cuts* — because `set_origin` moves the apex, and raising it
+turns the old apex's own NS RRset into a delegation. The flag then keeps the
+answer the old apex gave, stays false, and the server answers authoritatively for
+a child. `test_moving_the_apex_turns_the_old_apex_ns_into_a_delegation` is
+watched failing exactly that way and is the only test in the tree that catches
+it; the filed guess about the reset does not fail at all.
+
+The reload case the item asked for is covered too, by the incremental path —
+and two existing tests catch that one already.
 
 #### 28d. Four global mutexes per datagram — a ceiling, not a measured cost
 

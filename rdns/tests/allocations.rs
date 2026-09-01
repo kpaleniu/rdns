@@ -371,8 +371,10 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     assert_eq!(cut, None, "the same answers as the lower-case name");
     assert_eq!(kind, NameKind::Exact);
     assert_eq!(records, 1);
-    // The answer `Vec` as above, plus one fold per lookup.
-    within("the same three lookups, case randomized", count, 4..=4);
+    // The answer `Vec` as above, plus one fold per lookup that folds. `ZONE`
+    // delegates nothing, so `delegation_for` answers without folding at all
+    // (`TODO.md` #28c); it read 4 while every zone paid for that walk.
+    within("the same three lookups, case randomized", count, 3..=3);
 
     // What the answer path asks now: the delegation walk, then one call that
     // returns the kind and the records together. `name_kind` beside `query`
@@ -391,7 +393,31 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
         (None, NameKind::Exact, 1),
         "unchanged"
     );
-    within("the same walk, asking once for both", count, 3..=3);
+    within("the same walk, asking once for both", count, 2..=2);
+
+    // And the shape that still pays: a zone with a child. Measured too, because
+    // a count taken only against a leaf zone is a count of the path #28c skips
+    // — the cheap half of the thing being measured.
+    let delegating = parse_zone_file(
+        concat!(
+            "@   IN SOA ns1 admin ( 1 3600 600 604800 300 )\n",
+            "@   IN NS  ns1\n",
+            "ns1 IN A   192.0.2.1\n",
+            "www IN A   192.0.2.10\n",
+            "sub IN NS  ns1.sub.example.com.\n",
+        ),
+        "example.com.",
+    )
+    .expect("parse");
+    let _ = pair(&delegating, mixed);
+
+    let ((cut, kind, records), count) = allocations(|| pair(&delegating, mixed));
+    assert_eq!(
+        (cut, kind, records),
+        (None, NameKind::Exact, 1),
+        "unchanged"
+    );
+    within("the same walk, in a zone with a child", count, 3..=3);
 }
 
 /// Reading the SOA's MINIMUM — the ceiling on how long a negative answer may be

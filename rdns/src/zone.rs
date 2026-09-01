@@ -50,6 +50,18 @@ pub struct Zone {
     /// rest of the closest-encloser tail, which has that one outcome anyway.
     /// 23% of a miss in a 10k-record zone with no wildcards.
     has_wildcards: bool,
+    /// Whether any record below the apex is an NS RRset, which is what a zone
+    /// cut is (RFC 1034 §4.2.1). False lets [`Zone::delegation_for`] answer
+    /// `None` without walking the ancestors and without folding the name to do
+    /// it — a zone with no delegated children is the ordinary shape, and the
+    /// walk costs one hash lookup per label of a name the client chose.
+    ///
+    /// Recomputed by [`Zone::reindex`], not carried, because [`Zone::set_origin`]
+    /// decides which NS records are *below* the apex: moving the origin up turns
+    /// the old apex's own NS RRset into a delegation. Stale in the false
+    /// direction, this answers authoritatively for a child's names, which is the
+    /// defect `CLAUDE.md` §8 opens with.
+    has_delegations: bool,
     /// Every ancestor, up to the apex, of a name in `index` — the names that
     /// exist because something below them does (RFC 4592 §2.2.2), which is
     /// NODATA rather than NXDOMAIN. Kept apart from `index` because
@@ -92,6 +104,7 @@ impl Zone {
             nsec_chain: BTreeMap::new(),
             nsec3_chain: BTreeMap::new(),
             has_wildcards: false,
+            has_delegations: false,
             non_terminals: HashSet::new(),
         }
     }
@@ -123,6 +136,8 @@ impl Zone {
         let key = self.lookup_key(&record.name).into_owned();
         let position = self.records.len();
         self.has_wildcards |= key.starts_with("*.");
+        self.has_delegations |=
+            record_type_code(&record.rdata) == rt::NS && key != *self.origin_key();
         self.note_non_terminals(&key);
         self.index
             .entry(NameKeyBuf::from_folded(key))
@@ -321,10 +336,18 @@ impl Zone {
     /// `Some` means the answer owes a referral — NS RRset, glue, and AA
     /// clear. The apex is excluded: its NS RRset is this zone's own.
     pub fn delegation_for(&self, name: &str) -> Option<String> {
+        // Before `lookup_key`, not only inside `delegation_for_key`: with no cut
+        // to find, the folded key is a copy of the name made for nothing.
+        if !self.has_delegations {
+            return None;
+        }
         self.delegation_for_key(&self.lookup_key(name))
     }
 
     fn delegation_for_key(&self, key: &str) -> Option<String> {
+        if !self.has_delegations {
+            return None;
+        }
         let origin = self.origin_key();
         let mut candidate = key;
         loop {
@@ -392,18 +415,28 @@ impl Zone {
 
     /// Rebuild the index from `records`.
     fn reindex(&mut self) {
-        let keys: Vec<String> = self
+        let origin_key = self.origin_key().into_owned();
+        let keys: Vec<(String, bool)> = self
             .records
             .iter()
-            .map(|r| self.lookup_key(&r.name).into_owned())
+            .map(|r| {
+                let key = self.lookup_key(&r.name).into_owned();
+                // Whether this record is a zone cut is a fact about the *new*
+                // origin: moving the apex up turns the old apex's NS RRset into
+                // a delegation.
+                let cut = record_type_code(&r.rdata) == rt::NS && key != origin_key;
+                (key, cut)
+            })
             .collect();
         self.index.clear();
         self.non_terminals.clear();
         // Recomputed, not carried: `set_origin` can turn a relative `*` into an
         // absolute wildcard name.
         self.has_wildcards = false;
-        for (position, key) in keys.into_iter().enumerate() {
+        self.has_delegations = false;
+        for (position, (key, cut)) in keys.into_iter().enumerate() {
             self.has_wildcards |= key.starts_with("*.");
+            self.has_delegations |= cut;
             self.note_non_terminals(&key);
             self.index
                 .entry(NameKeyBuf::from_folded(key))
@@ -1434,6 +1467,66 @@ mod tests {
     fn test_zone_creation() {
         let zone = Zone::new("example.com".to_string());
         assert_eq!(zone.origin, "example.com.");
+    }
+
+    /// `has_delegations` skips the ancestor walk, so it decides whether a
+    /// referral is found at all. Which NS records count is a fact about the
+    /// *apex*, and `set_origin` moves the apex: raising it turns the old apex's
+    /// own NS RRset into a zone cut (RFC 1034 §4.2.1).
+    ///
+    /// The mistake it catches is a `reindex` that rebuilds the index without
+    /// re-deciding which NS records are cuts: the flag then keeps the answer the
+    /// *old* apex gave, stays `false`, and the server answers authoritatively
+    /// for a child's names — `CLAUDE.md` §8's opening defect, reached through an
+    /// optimization rather than through the resolution logic. Watched failing
+    /// that way, and it is the only test in the tree that catches it.
+    ///
+    /// Dropping the `= false` reset alone does *not* fail, which is worth
+    /// knowing: that leaves the flag stale only in the direction that costs a
+    /// wasted walk.
+    #[test]
+    fn test_moving_the_apex_turns_the_old_apex_ns_into_a_delegation() {
+        let mut zone = parse_zone_file(
+            concat!(
+                "@   IN SOA ns1 admin ( 1 3600 600 604800 300 )\n",
+                "@   IN NS  ns1.example.com.\n",
+                "www IN A   192.0.2.10\n",
+            ),
+            "example.com.",
+        )
+        .unwrap();
+        assert_eq!(
+            zone.delegation_for("www.example.com."),
+            None,
+            "at its own apex an NS RRset is the zone's own, not a cut"
+        );
+
+        zone.set_origin("com.");
+        assert_eq!(
+            zone.delegation_for("www.example.com."),
+            Some("example.com.".to_string()),
+            "example.com. is a child now, and it has an NS RRset"
+        );
+    }
+
+    /// The other way the flag is maintained: a zone gaining its first cut after
+    /// it was built, which is the incremental path rather than the reindex.
+    #[test]
+    fn test_a_delegation_added_after_load_is_still_found() {
+        let mut zone = parse_zone_file("www IN A 192.0.2.10\n", "example.com.").unwrap();
+        assert_eq!(zone.delegation_for("host.sub.example.com."), None);
+
+        zone.add_record(ZoneRecord {
+            name: "sub.example.com.".to_string(),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+            rdata: RecordData::from_parsed(&ParsedRecord::NS("ns1.sub.example.com.".to_string()))
+                .unwrap(),
+        });
+        assert_eq!(
+            zone.delegation_for("host.sub.example.com."),
+            Some("sub.example.com.".to_string())
+        );
     }
 
     #[test]
