@@ -1917,29 +1917,38 @@ point dhat attributes is one of the sites below.
 
 | shape | per query |
 |---|---|
-| plain A, lower-case QNAME | 8.0 |
-| EDNS0+DO+cookie | 11.0 |
-| plain, DNS-0x20 case | 9.0 |
-| **EDNS0 + 0x20 — what a resolver actually sends** | **12.0** |
-| NXDOMAIN, unsigned zone | 13.0 |
-| DO NXDOMAIN, signed zone | 153.0 |
+| plain A, lower-case QNAME | 3.0 |
+| EDNS0+DO+cookie | 6.0 |
+| plain, DNS-0x20 case | 4.0 |
+| **EDNS0 + 0x20 — what a resolver actually sends** | **7.0** |
+| NXDOMAIN, unsigned zone | 8.0 |
+| DO NXDOMAIN, signed zone | see below |
 
-The 21 breaks down as:
+The first five rows were re-measured on *Windows* for 27b's second half and read
+the same to three decimals as the figures they replaced, which is a fact about
+the count worth having: it is the allocator being called, not the platform.
 
-Twenty-one when this was filed. **Twelve now**: #28b and #28c took two folds
-out, 27a took the rest of the folds and the `to_string`, 27c took the two `Vec`
-spines, and 27b's compressor half took serialization to zero. What is left:
+The signed row is not comparable across the two runs and so is not overwritten.
+153.0 is an NSEC3 zone on Linux; the Windows re-measurement used a small
+NSEC-signed zone, where the same shape reads **147.0 before 27b's second half and
+141.0 after**. Six, against five on every unsigned shape: a signed negative
+answer carries one more record. The bulk of it is `dnssec_answer` building owned
+`ResourceRecord`s for the proofs, which the writer takes but does not yet remove
+— see #27e.
+
+Twenty-one when this was filed. **Seven now**: #28b and #28c took two folds out,
+27a took the rest of the folds and the `to_string`, 27c took the two `Vec`
+spines, and 27b took serialization to zero and then the answer itself. What is
+left:
 
 | site | count | removed by |
 |---|---|---|
-| `add_answer`: owner `String`, `RecordData::clone`, `answers` push | 3 | 27b, the half still open |
 | parse: two label `Vec`s, two `String`s, `queries`, `additionals` | 6 | 27d |
-| `queries.clone()` — the spine and the QNAME `String` | 2 | 27d |
 | the fold at the door, which needs a buffer outliving the question | 1 | 27d |
 
-**Twelve.** Three want the writer; the other nine want the request view, which is
-the only stage that changes a type's shape and the one to leave until last — or
-never.
+**Seven, all of them the request.** Nothing on the *answering* side allocates any
+more; what is left is the stage that changes a type's shape, and the one to leave
+until last — or never.
 
 Everything *around* the answer already allocates nothing, which was checked
 rather than assumed: the rate limiter, `validate_packet`, `log_query`,
@@ -1999,7 +2008,7 @@ to echo the key instead of the name fails exactly one test out of 107 —
 covers the wildcard case too, since synthesis must echo the name asked for and
 never `*.example.com.` (RFC 4592 §3.3.1).
 
-#### 27b. Write the response; do not build it — **half done 2026-09-01**
+#### 27b. Write the response; do not build it — **done 2026-09-01**
 
 Today an answer is a `DnsMessage` of owned `String`s and cloned RDATA, then
 serialized. A `ResponseWriter` owning the output buffer and the compressor, with
@@ -2058,10 +2067,79 @@ been wrong on the path least likely to be exercised. Two new tests hold it, and
 against a compressor not cleared per message two *existing* tests fail as well,
 both on the truncation path.
 
-**What is left of 27b is the three per-record allocations** — the owner
-`String`, the cloned RDATA and the `answers` spine — and those still need the
-writer, with the whole-RRset rewind above. The compressor half was separable;
-that half is not.
+**And the record half is done too.** `rdns::response::ResponseWriter` owns the
+buffer, the compressor and the counts; `rdnsd`'s `make_response` became
+`write_response`, and every `answers.push(ResourceRecord { name: name.to_string(),
+rdata: record.rdata.clone(), .. })` became a `push` straight to the wire.
+
+    daemon, per query      before   after
+    plain A                   8.0      3.0
+    EDNS0+DO+cookie          11.0      6.0
+    plain, DNS-0x20           9.0      4.0
+    EDNS + DNS-0x20          12.0      7.0
+    NXDOMAIN, unsigned       13.0      8.0
+    NXDOMAIN + EDNS          16.0     11.0
+    DO NXDOMAIN, signed     147.0    141.0
+
+**Five off every unsigned shape, where three were predicted.** The other two are
+`queries.clone()` — the `Vec` and the QNAME `String` — which the table above had
+filed under 27d. They fell out here because a writer has no message to put a
+question in: `ResponseWriter::start` writes the echoed question out of the
+*request*, so it is copied to the wire and never to the heap. The six on the
+signed shape is one more record, not a different mechanism.
+
+**Three things the plan did not have, found by writing it.**
+
+*Sections go out in order, and three helpers did not.* A compression pointer can
+only point backwards, so the writer takes records in section order and says so
+with a `debug_assert`. Three call sites wrote an authority record before an
+answer that followed it: `add_answer` extended `authorities` with a wildcard
+denial *before* pushing the RRSIGs into `answers`, `add_chain` did the same per
+hop, and `refer_to_child` wrote glue before the delegation proof. All three now
+return what they owe — `add_chain` as a bit per hop, since `MAX_CNAME_HOPS` is
+16 — and the caller writes it once the section is closed. The sections' contents
+are unchanged, which 434 byte-for-byte wire comparisons against the previous
+build confirm.
+
+*QDCOUNT > 1 has no answer, and RFC 9619 says so.* The loop over `msg.queries`
+piled every question's records into one message with one RCODE, one AA bit and
+one set of sections — the last question's outcome simply won, and a NOERROR
+beside an NXDOMAIN is indistinguishable from an answer beside a NODATA. RFC 9619
+§4 (August 2024) updates RFC 1035: "A DNS message with OPCODE = 0 MUST NOT
+include a QDCOUNT parameter whose value is greater than 1", and one that does
+"MUST be treated as an incorrectly formatted message" — FORMERR, which is what
+BIND, NSD, Knot and Unbound already do. QDCOUNT = 0 is untouched; the same
+section forbids treating it as malformed. This is the one behaviour change in
+the commit, and it is what makes a single-pass writer correct rather than
+approximately correct.
+
+*The rewind is real but not observable.* `NameCompressor::rewind` drops every
+suffix at or past the mark, because `write_name` records a name's suffixes
+*before* writing them and so even the record that overflowed leaves entries
+behind. Nothing after the rewind compresses a name today — the OPT's owner is
+the root — so no test can distinguish it from doing nothing, and the doc comment
+says that rather than claiming a corruption it prevents. It is unit-tested
+directly instead.
+
+**The truncation shape is unchanged, deliberately.** This section proposed a
+per-RRset rewind; the writer rewinds all the way to the question instead, which
+is exactly what `to_bytes_within_buf` produced by rebuilding the message with its
+sections cleared. A partial answer section is a behaviour change with its own
+RFC 2181 §9 argument to make, and it is not one this item needed. What it does
+replace is the build-it-twice retry: an answer over the limit is now written
+once and cut back, not serialized twice.
+
+**Two encoders for one wire format would be the §7 defect.** The header,
+question, record and OPT encoders moved into `rdns::response` and
+`DnsMessage::to_bytes_with` calls them, so the writer and the message serializer
+cannot disagree about a field. That move also made three of the four section
+counts checked rather than `as`-cast, which they were not.
+
+Verified: 434 wire shapes byte-identical to the previous build over an unsigned
+zone (including a truncated one), 220 shapes structurally identical over a signed
+one with the RRSIG clock fields masked, and dnspython validating the DNSKEY, an
+ordinary A, a wildcard answer with its denial, an NXDOMAIN and a delegation whose
+NS RRset carries no RRSIG. `allocations.rs` holds the writer at 0.
 
 #### 27c. `Zone::query` hands out an iterator — **done 2026-09-01**
 
@@ -2116,6 +2194,28 @@ own rather than folded into 27b.
 Sound because `udp_loop` answers inline on a fixed worker pool rather than
 spawning per datagram — a decision made for other reasons (#9e) that this
 depends on. Reversing it would break this silently.
+
+#### 27e. The DNSSEC proofs, written rather than collected
+
+`dnssec_answer`'s four public entry points each hand back a `Vec<ResourceRecord>`
+— `answer_signatures` inside its `AnswerSignatures`, then `proof_of_absence`,
+`negative_proof` and `delegation_proof` — and three private builders below them
+(`wildcard_denial`, `soa_signatures`, `signatures_at`) each build another. 27b's
+writer takes the outermost `Vec` and copies it to the wire.
+
+The records are owned because some are *synthesized* (a wildcard's RRSIG, an
+NSEC3 owner name), so this is not the same change as 27b: what is borrowable is
+already borrowed, and the rest has to be built somewhere.
+
+The measurement that says whether it is worth doing is in the table above: a
+signed DO NXDOMAIN is 141 allocations against an unsigned one's 11. #25d took the
+NSEC3 hashing out; what is left is the records and the `Vec`s holding them.
+Handing these functions the writer and having them push as they go removes the
+spines and the owner `String`s; the synthesized RDATA stays.
+
+Do not start this before measuring which of the seven dominates. Two of them
+(`negative_proof` at 114, `answer_signatures` at 22) are already counted in
+`allocations.rs`, so the split is one run away.
 
 #### The cost this pays, said out loud
 
@@ -3500,6 +3600,11 @@ Three things the plan did not say:
   its siblings taking `&Request`, which is a bigger change than this scopes and
   would push every unit test of them through a serialize-and-reparse round trip.
   Overclaiming it in the doc comment would have been §4's mistake exactly.
+
+  The round trip arrived anyway, from the other direction: #27b made
+  `make_response` into `write_response`, which returns wire bytes, so
+  `testutil::make_response` now serializes and reparses for every test. The cost
+  the paragraph above priced turned out to be about twenty lines.
 - **It needed a seventh error type**, `error::RequestError`, with two variants —
   and the second is why: a caller branches on them. `Wire` is garbage or a parser
   probe; `NotAQuestion` is a traffic loop or a spoofed source, and `rdnsd` logs

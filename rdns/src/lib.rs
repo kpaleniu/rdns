@@ -3,7 +3,7 @@ use rand::Rng;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use compression::NameCompressor;
-use dname::{dname_from_bytes, dname_to_bytes, write_bytes, DNameUnpacker, TryUnpackFromBytes};
+use dname::{dname_from_bytes, dname_to_bytes, DNameUnpacker, TryUnpackFromBytes};
 
 /// This build, as `<package version> (<git describe>)`. Stamped by `build.rs`
 /// and passed to clap's `version` by every binary, so `--version` names a
@@ -38,6 +38,7 @@ pub mod persist;
 pub mod readiness;
 mod record_data;
 pub mod resolver;
+pub mod response;
 pub mod rfc5011;
 pub mod secondary;
 pub mod security;
@@ -1048,6 +1049,19 @@ pub const CLASSIC_UDP_SIZE: u16 = 512;
 /// (RFC 6891 §6.1.3).
 pub const EDNS_VERSION: u8 = 0;
 
+/// A section's record count as the header's `u16`.
+///
+/// Checked, not cast: `as` would wrap a section past 65,535 records to a count
+/// the reader then trusts, and every count here is derived from a `Vec` a caller
+/// filled.
+fn section_count(len: usize, what: &'static str) -> Result<u16, WireError> {
+    len.try_into().map_err(|_| WireError::TooLong {
+        what,
+        limit: u16::MAX as usize,
+        actual: len,
+    })
+}
+
 /// A message with its RFC 1035 §4.2.2 two-octet length prefix, in one buffer so
 /// a writer emits both in a single call.
 ///
@@ -1212,7 +1226,7 @@ impl Edns {
     }
 
     /// The OPT RDATA as it will go on the wire.
-    fn rdata(&self) -> &[u8] {
+    pub(crate) fn rdata(&self) -> &[u8] {
         &self.rdata
     }
 
@@ -1516,109 +1530,51 @@ impl DnsMessage {
         compressor: &mut NameCompressor,
     ) -> Result<usize, WireError> {
         compressor.clear();
-        let mut pos = 0;
-
-        pos = write_bytes(output, pos, &self.id.to_be_bytes())?;
-
-        let opcode = self.opcode.to_u8();
 
         // RCODE is 12 bits, split across the header (low 4) and the OPT record's
         // TTL (high 8). A value past the ceiling is a caller bug, not something
         // to paper over with a success code.
-        let rcode = self.rcode.to_u16();
-        if rcode > 0xfff {
-            return Err(WireError::malformed(
-                "the header",
-                format!("RCODE {rcode} does not fit the 12 bits RFC 6891 §6.1.3 gives it"),
-            ));
-        }
-        if rcode > 0xf && self.edns.is_none() {
-            return Err(WireError::malformed(
-                "the header",
-                format!(
-                    "extended RCODE {rcode} needs an EDNS0 OPT record to carry \
-                     its high bits (RFC 6891 §6.1.3)"
-                ),
-            ));
-        }
+        let rcode = response::wire_rcode(self.rcode, self.edns.is_some())?;
 
-        let hi: u8 = (self.response as u8) << 7
-            | (opcode & 0xf_u8) << 3
-            | (self.authoritive as u8) << 2
-            | (self.truncation as u8) << 1
-            | self.recursion as u8;
-        let lo: u8 = (self.recursion_ok as u8) << 7
-            | (self.ad as u8) << 5
-            | (self.cd as u8) << 4
-            | (rcode & 0xf) as u8;
-
-        pos = write_bytes(output, pos, &[hi, lo])?;
-        pos = write_bytes(output, pos, &(self.queries.len() as u16).to_be_bytes())?;
-        pos = write_bytes(output, pos, &(self.answers.len() as u16).to_be_bytes())?;
-        pos = write_bytes(output, pos, &(self.authorities.len() as u16).to_be_bytes())?;
         // ARCOUNT counts the OPT record, which is a field here rather than a
         // member of `additionals`.
         let arcount = self.additionals.len() + usize::from(self.edns.is_some());
-        let arcount: u16 = arcount.try_into().map_err(|_| WireError::TooLong {
-            what: "the additional section",
-            limit: u16::MAX as usize,
-            actual: arcount,
-        })?;
-        pos = write_bytes(output, pos, &arcount.to_be_bytes())?;
+        let counts = [
+            section_count(self.queries.len(), "the question section")?,
+            section_count(self.answers.len(), "the answer section")?,
+            section_count(self.authorities.len(), "the authority section")?,
+            section_count(arcount, "the additional section")?,
+        ];
+        let mut pos = response::write_header(
+            output,
+            response::Header {
+                id: self.id,
+                response: self.response,
+                opcode: self.opcode,
+                authoritive: self.authoritive,
+                truncation: self.truncation,
+                recursion: self.recursion,
+                recursion_ok: self.recursion_ok,
+                ad: self.ad,
+                cd: self.cd,
+                rcode: self.rcode,
+            },
+            rcode,
+            counts,
+        )?;
 
         for q in &self.queries {
-            pos = compressor.write_name(q.qname.as_str(), output, pos)?;
-            pos = write_bytes(output, pos, &q.qtype.to_u16().to_be_bytes())?;
-            pos = write_bytes(output, pos, &q.qclass.to_u16().to_be_bytes())?;
+            pos = response::write_query(compressor, output, pos, q)?;
         }
-
-        // Owner names are compressed against everything written so far; RDATA is
-        // stored uncompressed and wire-ready, so it is a straight copy except
-        // for the types whose embedded names may legally be compressed.
         for section in [&self.answers, &self.authorities, &self.additionals] {
             for rr in section {
-                pos = compressor.write_name(rr.name.as_str(), output, pos)?;
-                pos = write_bytes(output, pos, &rr.rdata.rtype().to_u16().to_be_bytes())?;
-                pos = write_bytes(output, pos, &rr.class.to_u16().to_be_bytes())?;
-                pos = write_bytes(output, pos, &rr.ttl.to_wire().to_be_bytes())?;
-
-                // RDLEN can only be known once the RDATA is written, since
-                // compression changes its length. Leave a hole and fill it in.
-                let rdlen_at = pos;
-                pos = write_bytes(output, pos, &[0u8, 0u8])?;
-                let rdata_at = pos;
-                pos = compressor.write_rdata(rr.rdata.rtype(), rr.rdata.bytes(), output, pos)?;
-                let rdlen: u16 = (pos - rdata_at)
-                    .try_into()
-                    .map_err(|_| WireError::TooLong {
-                        what: "RDATA",
-                        limit: u16::MAX as usize,
-                        actual: pos - rdata_at,
-                    })?;
-                write_bytes(output, rdlen_at, &rdlen.to_be_bytes())?;
+                pos = response::write_rr(
+                    compressor, output, pos, &rr.name, rr.class, rr.ttl, &rr.rdata,
+                )?;
             }
         }
-
-        // The OPT record, last in the additional section: `tsig::append_tsig`
-        // appends to the finished bytes, and RFC 8945 §5.1 requires TSIG final.
         if let Some(edns) = &self.edns {
-            // NAME is root, TYPE is OPT, CLASS is the payload size and TTL packs
-            // the extended RCODE, the version and the flags (RFC 6891 §6.1.3).
-            pos = write_bytes(output, pos, &[0])?;
-            pos = write_bytes(output, pos, &OPT_RECORD_TYPE.to_u16().to_be_bytes())?;
-            pos = write_bytes(output, pos, &edns.udp_payload_size.to_be_bytes())?;
-            let ttl = ((rcode as u32 >> 4) << 24)
-                | ((edns.version as u32) << 16)
-                | if edns.do_bit { 0x8000 } else { 0 };
-            pos = write_bytes(output, pos, &ttl.to_be_bytes())?;
-            let rdata = edns.rdata();
-            let rdlen: u16 = rdata.len().try_into().map_err(|_| WireError::TooLong {
-                what: "OPT RDATA",
-                limit: u16::MAX as usize,
-                actual: rdata.len(),
-            })?;
-            pos = write_bytes(output, pos, &rdlen.to_be_bytes())?;
-            pos = write_bytes(output, pos, rdata)?;
+            pos = response::write_opt(output, pos, edns, rcode)?;
         }
         Ok(pos)
     }

@@ -8,7 +8,7 @@ mod replication;
 mod testutil;
 mod zones;
 
-use answer::make_response;
+use answer::write_response;
 use replication::{
     parse_secondary_specs, spawn_secondaries, withdraw_unvouched_zones, Replication, Secondaries,
 };
@@ -903,23 +903,33 @@ impl Server {
 
         // Never hold the zone lock across a socket write: a SIGHUP reload would
         // queue behind a slow client for the life of its connection.
-        let bytes = {
+        let mut bytes = Vec::new();
+        let mut compressor = NameCompressor::new();
+        {
             let zones = self.zone_map.read().await;
-            let resp = if msg.opcode == OpCode::Notify {
-                notify_reply(&msg, &zones, &self.secondaries, peer)
-            } else {
-                make_response(&msg, &zones, &self.metrics)
-            };
             // Over TCP the 2-byte length prefix is the only size limit, so the
             // EDNS UDP payload size does not apply (RFC 6891 §6.2.2).
-            match resp.to_bytes_within(u16::MAX as usize) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    serving_error!(self.logger, ip, "serialization error: {e}");
-                    return;
-                }
+            let written = if msg.opcode == OpCode::Notify {
+                notify_reply(&msg, &zones, &self.secondaries, peer).to_bytes_within_buf_with(
+                    u16::MAX as usize,
+                    &mut bytes,
+                    &mut compressor,
+                )
+            } else {
+                write_response(
+                    &msg,
+                    &zones,
+                    &self.metrics,
+                    u16::MAX as usize,
+                    &mut bytes,
+                    &mut compressor,
+                )
+            };
+            if let Err(e) = written {
+                serving_error!(self.logger, ip, "serialization error: {e}");
+                return;
             }
-        };
+        }
 
         // Same session, so the reply's MAC covers the request's: that is what
         // stops one question's reply being replayed as another's.
@@ -1841,14 +1851,15 @@ impl Server {
         // stall a SIGHUP zone reload behind the network.
         let serialized = {
             let zones = zone_map.read().await;
-            let resp = if msg.opcode == OpCode::Notify {
-                notify_reply(&msg, &zones, secondaries, peer)
-            } else {
-                make_response(&msg, &zones, metrics)
-            };
             // Honor the client's EDNS0 UDP payload size (512 if no EDNS);
             // truncates with TC=1 if the response is larger.
-            resp.to_bytes_within_buf_with(msg.udp_payload_size() as usize, scratch, compressor)
+            let max_len = msg.udp_payload_size() as usize;
+            if msg.opcode == OpCode::Notify {
+                notify_reply(&msg, &zones, secondaries, peer)
+                    .to_bytes_within_buf_with(max_len, scratch, compressor)
+            } else {
+                write_response(&msg, &zones, metrics, max_len, scratch, compressor)
+            }
         };
         if let Err(e) = serialized {
             serving_error!(logger, peer.ip(), "serialization error: {e}");
@@ -2755,7 +2766,7 @@ fn generate_keys(zone: &str, dir: &Path, algorithm: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::replication::{expire_if_out_of_contact, refresh_once, ReplicatedZone};
-    use crate::testutil::query;
+    use crate::testutil::{make_response, query};
     use crate::zones::{enumerate_zone_files, plan_reload, zone_key};
     use rdns::secondary::{zone_file_path, RefreshTimers, TransferState};
     use rdns::tsig::{TsigAlgorithm, TsigKey};

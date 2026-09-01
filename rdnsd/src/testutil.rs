@@ -4,7 +4,34 @@
 //! looks like, belongs beside the tests that care — that knowledge is what a
 //! reader is checking.
 
+use rdns::compression::NameCompressor;
+use rdns::metrics::DnsMetrics;
 use rdns::{DnsMessage, OpCode, Qtype, QueryClass, QuerySection, ResponseCode};
+
+use crate::answer::write_response;
+use crate::zones::Zones;
+
+/// The answer to `msg`, read back off the wire.
+///
+/// `write_response` writes bytes, so a test that wants to look at sections has
+/// to parse them — which is the right way round: our serializer agreeing with
+/// our own record structs proves nothing, and this puts the reader between the
+/// two (`CLAUDE.md` §1). `u16::MAX` because nothing here is about truncation;
+/// the tests that are pass their own limit.
+pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetrics) -> DnsMessage {
+    let mut out = Vec::new();
+    let mut compressor = NameCompressor::new();
+    write_response(
+        msg,
+        zones,
+        metrics,
+        u16::MAX as usize,
+        &mut out,
+        &mut compressor,
+    )
+    .expect("the response serializes");
+    DnsMessage::try_from_bytes(&out).expect("and parses back")
+}
 
 /// A query for `qname`/`qtype`, with DO set when `dnssec_ok`.
 ///

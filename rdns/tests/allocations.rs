@@ -106,6 +106,7 @@ fn allocation_counts() {
     let _serial = exclusive();
 
     one_query_end_to_end();
+    writing_a_response_costs_nothing_per_record();
     the_lookups_behind_one_answer_allocate_only_the_answer();
     a_case_randomized_qname_costs_a_fold_per_lookup();
     reading_one_integer_out_of_an_soa();
@@ -331,6 +332,47 @@ fn one_query_end_to_end() {
         carried_count,
         0..=0,
     );
+}
+
+/// Writing an answer straight to the wire costs nothing: not per record, and
+/// not for the echoed question either (`TODO.md` #27b).
+///
+/// The build-then-serialize path this replaced paid an owner `String`, a cloned
+/// `RecordData` and a `Vec` push per record, plus a `queries.clone()` for the
+/// echo — five for the one-record answer below, which is what `rdnsd`'s dhat
+/// numbers moved by.
+fn writing_a_response_costs_nothing_per_record() {
+    use rdns::compression::NameCompressor;
+    use rdns::response::{ResponseWriter, Section};
+
+    let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
+    let wire = query_bytes("www.example.com.", Qtype::of(record_types::A));
+    let request = DnsMessage::try_from_bytes(&wire).expect("parse the query");
+    let records = zone.query("www.example.com.", Qtype::of(record_types::A));
+    assert_eq!(records.len(), 1);
+
+    let mut out = Vec::new();
+    let mut compressor = NameCompressor::new();
+    let write = |out: &mut Vec<u8>, compressor: &mut NameCompressor| {
+        let mut w = ResponseWriter::start(out, compressor, 4096, &request).expect("start");
+        w.set_authoritative(true);
+        for r in &records {
+            w.push(
+                Section::Answer,
+                "www.example.com.",
+                r.class,
+                r.ttl,
+                &r.rdata,
+            )
+            .expect("push");
+        }
+        w.set_edns(Edns::with_payload_size(1232));
+        w.finish().expect("finish");
+    };
+    write(&mut out, &mut compressor);
+    let ((), count) = allocations(|| write(&mut out, &mut compressor));
+    within("write a one-record response", count, 0..=0);
+    assert!(!out.is_empty());
 }
 
 /// The three zone lookups `rdnsd` makes per query (RFC 1034 §4.3.2) cost one

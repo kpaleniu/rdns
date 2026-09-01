@@ -2,41 +2,45 @@
 //!
 //! Everything here is a synchronous function of the message, the zone map and
 //! the metrics — no sockets, no lock guards, nothing `async`.
+//!
+//! The answer is written to the wire as it is found, through a
+//! [`ResponseWriter`], rather than built as a `DnsMessage` and serialized
+//! afterwards: an owner `String`, a cloned RDATA and a `Vec` push per record
+//! were three of the twelve allocations a query cost (`TODO.md` #27b). The price
+//! is that sections go out in order, so a helper that owes both an answer and an
+//! authority record hands the second back to its caller instead of writing it.
 
 use std::borrow::Cow;
 
+use rdns::compression::NameCompressor;
+use rdns::error::WireError;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
+use rdns::response::{ResponseWriter, Section};
 use rdns::utils::{absolute_lowered, record_types};
 use rdns::zone::{NameKind, Zone};
 use rdns::Qtype;
 use rdns::Ttl;
-use rdns::{
-    dnssec_answer, DnsMessage, Edns, OpCode, QueryClass, ResourceRecord, ResponseCode, EDNS_VERSION,
-};
+use rdns::{dnssec_answer, DnsMessage, Edns, OpCode, QueryClass, ResponseCode, EDNS_VERSION};
 
 use crate::zones::Zones;
 use crate::RDNSD_PAYLOAD_SIZE;
 
-/// Build a DNS response for the given query message.
-pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetrics) -> DnsMessage {
+/// Write a DNS response to `msg` into `out`, at most `max_len` octets.
+///
+/// `out` and `compressor` are the caller's to keep: a worker answering one
+/// datagram after another reuses both and the answer costs the allocator
+/// nothing. Over `max_len` the reply is an empty TC=1 one (RFC 1035 §4.2.1).
+pub(crate) fn write_response(
+    msg: &DnsMessage,
+    zones: &Zones,
+    metrics: &DnsMetrics,
+    max_len: usize,
+    out: &mut Vec<u8>,
+    compressor: &mut NameCompressor,
+) -> Result<(), WireError> {
     let timer = LatencyTimer::new();
-    let mut response = DnsMessage {
-        id: msg.id,
-        response: true,
-        opcode: msg.opcode,
-        authoritive: true,
-        truncation: false,
-        recursion: msg.recursion,
-        recursion_ok: false,
-        ad: false,
-        cd: msg.cd,
-        rcode: ResponseCode::Ok,
-        queries: msg.queries.clone(),
-        answers: Vec::new(),
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-        edns: None,
-    };
+    let mut w = ResponseWriter::start(out, compressor, max_len, msg)?;
+    w.set_authoritative(true);
 
     // Read once: `edns()` builds the option list, which costs a `Vec` and a
     // `Vec<u8>` per option for three fields that are not in it.
@@ -48,16 +52,16 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
     let client_edns = match msg.edns_header() {
         Ok(edns) => edns,
         Err(_) => {
-            response.rcode = ResponseCode::FormatError;
+            w.set_rcode(ResponseCode::FormatError);
             // `with_payload_size` carries no options, so encoding it cannot fail.
-            response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
-            return response;
+            w.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+            return w.finish();
         }
     };
     if client_edns.is_some_and(|edns| edns.version > EDNS_VERSION) {
-        response.rcode = ResponseCode::BadOptVersion;
-        response.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
-        return response;
+        w.set_rcode(ResponseCode::BadOptVersion);
+        w.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+        return w.finish();
     }
 
     // DO says the client can make sense of DNSSEC records, so send them
@@ -68,8 +72,8 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
     // which knows the peer's address; anything else is NOTIMP rather than
     // treated as a lookup (RFC 1035 §4.1.1).
     if msg.opcode != OpCode::Query {
-        response.rcode = ResponseCode::NotImplemented;
-        response.authoritive = false;
+        w.set_rcode(ResponseCode::NotImplemented);
+        w.set_authoritative(false);
         // This `return` jumps over the EDNS mirroring at the end of the
         // function, and RFC 6891 §6.1.1 says a response to a request that had an
         // OPT includes one. Some clients remember a missing OPT as a downgrade
@@ -80,92 +84,30 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
         if client_edns.is_some() {
             let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
             edns.do_bit = dnssec_ok;
-            response.set_edns(edns);
+            w.set_edns(edns);
         }
-        return response;
+        return w.finish();
     }
 
-    for query in &msg.queries {
-        // Every zone here is IN, and RFC 1034 §4.3.2 step 1 searches the zones
-        // *of the question's class* — so a CH or HS question is the same
-        // situation as a zone we do not serve, and REFUSED for the reason at the
-        // bottom of this loop. QCLASS=ANY (255) matches any class
-        // (RFC 1035 §3.2.5), so it is not refused.
-        if !matches!(query.qclass, QueryClass::IN | QueryClass::Any) {
-            response.rcode = ResponseCode::Refused;
-            response.authoritive = false;
-            continue;
-        }
-
-        // AXFR is defined over TCP alone (RFC 5936 §4.2), so a UDP request for
-        // it is malformed rather than merely refused. The TCP server answers
-        // AXFR before reaching here, so this is the UDP path speaking.
-        if query.qtype == Qtype::AXFR {
-            response.rcode = ResponseCode::FormatError;
-            continue;
-        }
-
-        // An IXFR over UDP is expected. RFC 1995 §2: answer a single SOA of the
-        // current version, telling the client to come back over TCP. Done
-        // always, rather than only when the increment will not fit — the ACL,
-        // TSIG session and message packing all live on the TCP path. The SOA
-        // discloses nothing an ordinary SOA query does not.
-        if query.qtype == Qtype::IXFR {
-            if let Some(zone) = zones.for_query(&query.qname) {
-                for soa in zone.query(zone.origin(), Qtype::of(record_types::SOA)) {
-                    response.answers.push(ResourceRecord {
-                        name: zone.origin().to_string(),
-                        class: soa.class,
-                        ttl: soa.ttl,
-                        rdata: soa.rdata.clone(),
-                    });
-                }
-            } else {
-                response.rcode = ResponseCode::Refused;
-                response.authoritive = false;
-            }
-            continue;
-        }
-
-        // One fold for the whole question. `Zones::for_query`, the delegation
-        // walk and every `Zone` lookup fold their argument themselves and borrow
-        // when there is nothing left to fold, so folding once here makes all of
-        // them free — a case-randomized query paid for three (`TODO.md` #27a).
-        let key = absolute_lowered(&query.qname);
-        let zone = zones.for_query(&key);
-
-        if let Some(zone) = zone {
-            match resolve_in_zone(zone, &query.qname, &key, query.qtype) {
-                Outcome::Referral { cut } => {
-                    refer_to_child(zone, &cut, dnssec_ok, &mut response);
-                }
-                Outcome::Answer { chain, name, key } => {
-                    add_chain(zone, &chain, dnssec_ok, &mut response);
-                    add_answer(zone, &name, &key, query.qtype, dnssec_ok, &mut response);
-                }
-                Outcome::Negative { chain, name, kind } => {
-                    add_chain(zone, &chain, dnssec_ok, &mut response);
-                    add_negative(zone, &name, &kind, dnssec_ok, &mut response);
-                }
-                Outcome::ChainLeftZone { chain } => {
-                    add_chain(zone, &chain, dnssec_ok, &mut response);
-                }
-            }
-        } else {
-            // A zone we do not serve is REFUSED, not NXDOMAIN. NXDOMAIN asserts
-            // the name exists nowhere, which we have no standing to say, and a
-            // resolver caches it (RFC 2308). BIND, NSD and Knot all answer
-            // REFUSED here. It matters most for a *withdrawn* zone: an expired
-            // secondary answering NXDOMAIN takes its zone off the internet.
-            response.rcode = ResponseCode::Refused;
-            response.authoritive = false;
-        }
+    // RFC 9619 §4: "A DNS message with OPCODE = 0 MUST NOT include a QDCOUNT
+    // parameter whose value is greater than 1", and one that does "MUST be
+    // treated as an incorrectly formatted message" — FORMERR. There is no answer
+    // to give two questions: one RCODE, one AA bit and one set of sections
+    // cannot describe two lookups. BIND, NSD, Knot and Unbound all refuse it.
+    //
+    // QDCOUNT = 0 is left alone; §4 says a firewall "MUST NOT treat messages
+    // with OPCODE = 0 and QDCOUNT = 0 as malformed".
+    if msg.queries.len() > 1 {
+        w.set_rcode(ResponseCode::FormatError);
+        w.set_authoritative(false);
+    } else if let Some(query) = msg.queries.first() {
+        answer_question(query, zones, dnssec_ok, &mut w)?;
     }
 
     // Count the answer by what it says. REFUSED climbing means a zone went
     // missing, SERVFAIL that one went wrong, NXDOMAIN is ordinary.
-    metrics.count_response(response.rcode);
-    if response.authoritive {
+    metrics.count_response(w.rcode());
+    if w.is_authoritative() {
         metrics.count(&metrics.queries_authoritative);
     }
     metrics.observe_latency_us(timer.elapsed_us());
@@ -175,10 +117,104 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
     if client_edns.is_some() {
         let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
         edns.do_bit = dnssec_ok;
-        response.set_edns(edns);
+        w.set_edns(edns);
     }
 
-    response
+    w.finish()
+}
+
+/// The one question, once the message-level answers are out of the way.
+fn answer_question(
+    query: &rdns::QuerySection,
+    zones: &Zones,
+    dnssec_ok: bool,
+    w: &mut ResponseWriter,
+) -> Result<(), WireError> {
+    // Every zone here is IN, and RFC 1034 §4.3.2 step 1 searches the zones
+    // *of the question's class* — so a CH or HS question is the same
+    // situation as a zone we do not serve, and REFUSED for the reason at the
+    // bottom of this function. QCLASS=ANY (255) matches any class
+    // (RFC 1035 §3.2.5), so it is not refused.
+    if !matches!(query.qclass, QueryClass::IN | QueryClass::Any) {
+        w.set_rcode(ResponseCode::Refused);
+        w.set_authoritative(false);
+        return Ok(());
+    }
+
+    // AXFR is defined over TCP alone (RFC 5936 §4.2), so a UDP request for
+    // it is malformed rather than merely refused. The TCP server answers
+    // AXFR before reaching here, so this is the UDP path speaking.
+    if query.qtype == Qtype::AXFR {
+        w.set_rcode(ResponseCode::FormatError);
+        return Ok(());
+    }
+
+    // An IXFR over UDP is expected. RFC 1995 §2: answer a single SOA of the
+    // current version, telling the client to come back over TCP. Done
+    // always, rather than only when the increment will not fit — the ACL,
+    // TSIG session and message packing all live on the TCP path. The SOA
+    // discloses nothing an ordinary SOA query does not.
+    if query.qtype == Qtype::IXFR {
+        match zones.for_query(&query.qname) {
+            Some(zone) => {
+                for soa in zone.query(zone.origin(), Qtype::of(record_types::SOA)) {
+                    w.push(
+                        Section::Answer,
+                        zone.origin(),
+                        soa.class,
+                        soa.ttl,
+                        &soa.rdata,
+                    )?;
+                }
+            }
+            None => {
+                w.set_rcode(ResponseCode::Refused);
+                w.set_authoritative(false);
+            }
+        }
+        return Ok(());
+    }
+
+    // One fold for the whole question. `Zones::for_query`, the delegation
+    // walk and every `Zone` lookup fold their argument themselves and borrow
+    // when there is nothing left to fold, so folding once here makes all of
+    // them free — a case-randomized query paid for three (`TODO.md` #27a).
+    let key = absolute_lowered(&query.qname);
+    let Some(zone) = zones.for_query(&key) else {
+        // A zone we do not serve is REFUSED, not NXDOMAIN. NXDOMAIN asserts
+        // the name exists nowhere, which we have no standing to say, and a
+        // resolver caches it (RFC 2308). BIND, NSD and Knot all answer
+        // REFUSED here. It matters most for a *withdrawn* zone: an expired
+        // secondary answering NXDOMAIN takes its zone off the internet.
+        w.set_rcode(ResponseCode::Refused);
+        w.set_authoritative(false);
+        return Ok(());
+    };
+
+    match resolve_in_zone(zone, &query.qname, &key, query.qtype) {
+        Outcome::Referral { cut } => refer_to_child(zone, &cut, dnssec_ok, w),
+        Outcome::Answer { chain, name, key } => {
+            let owed = add_chain(zone, &chain, dnssec_ok, w)?;
+            let target_owed = add_answer(zone, &name, &key, query.qtype, dnssec_ok, w)?;
+            add_chain_denials(zone, &chain, owed, w)?;
+            if target_owed {
+                w.push_all(
+                    Section::Authority,
+                    &dnssec_answer::proof_of_absence(zone, &key),
+                )?;
+            }
+            Ok(())
+        }
+        Outcome::Negative { chain, name, kind } => {
+            let owed = add_chain(zone, &chain, dnssec_ok, w)?;
+            add_chain_denials(zone, &chain, owed, w)?;
+            add_negative(zone, &name, &kind, dnssec_ok, w)
+        }
+        Outcome::ChainLeftZone { chain } => {
+            let owed = add_chain(zone, &chain, dnssec_ok, w)?;
+            add_chain_denials(zone, &chain, owed, w)
+        }
+    }
 }
 
 /// What RFC 1034 §4.3.2 decided about one question against one zone: a loop with
@@ -311,54 +347,85 @@ fn in_zone(zone: &Zone, name: &str) -> bool {
 /// `name` is echoed and `key` is looked up with: they are the same name, and a
 /// DNS-0x20 client compares the echo byte for byte, so the folded form must not
 /// reach the wire.
+/// Returns whether the answer came through a wildcard and so still owes a
+/// denial of the name asked for — an authority record, which the caller writes
+/// once every answer record is out (RFC 4035 §3.1.3: the same signature verifies
+/// at every name the wildcard reaches, so without the denial one captured answer
+/// serves for all).
 fn add_answer(
     zone: &Zone,
     name: &str,
     key: &str,
     qtype: Qtype,
     dnssec_ok: bool,
-    response: &mut DnsMessage,
-) {
+    w: &mut ResponseWriter,
+) -> Result<bool, WireError> {
     for record in zone.locate(key).of_type(qtype) {
-        response.answers.push(ResourceRecord {
-            name: name.to_string(),
-            class: record.class,
-            ttl: record.ttl,
-            rdata: record.rdata.clone(),
-        });
+        w.push(
+            Section::Answer,
+            name,
+            record.class,
+            record.ttl,
+            &record.rdata,
+        )?;
     }
 
-    if dnssec_ok {
-        let signatures = dnssec_answer::answer_signatures(zone, key, qtype);
-        // The same signature verifies at every name the wildcard reaches, so a
-        // wildcard answer also owes a denial of the name asked for
-        // (RFC 4035 §3.1.3) — otherwise one captured answer serves for all.
-        if signatures.wildcard.is_some() {
-            response
-                .authorities
-                .extend(dnssec_answer::proof_of_absence(zone, key));
-        }
-        response.answers.extend(signatures.records);
+    if !dnssec_ok {
+        return Ok(false);
     }
+    let signatures = dnssec_answer::answer_signatures(zone, key, qtype);
+    w.push_all(Section::Answer, &signatures.records)?;
+    Ok(signatures.wildcard.is_some())
 }
 
 /// The aliases walked to reach the answer, in the order they were followed.
 ///
 /// Each is a CNAME RRset at its own owner name, so it carries its own signature
-/// — and its own wildcard denial when the alias was synthesized.
-fn add_chain(zone: &Zone, chain: &[String], dnssec_ok: bool, response: &mut DnsMessage) {
-    for at in chain {
+/// — and its own wildcard denial when the alias was synthesized. Returns the
+/// hops that owe one, as a bit per index into `chain`.
+fn add_chain(
+    zone: &Zone,
+    chain: &[String],
+    dnssec_ok: bool,
+    w: &mut ResponseWriter,
+) -> Result<u32, WireError> {
+    const _: () = assert!(MAX_CNAME_HOPS <= u32::BITS as usize, "one bit per hop");
+    let mut owed = 0u32;
+    for (i, at) in chain.iter().enumerate() {
         // Folded here rather than carried: a chain is empty on the ordinary
         // answer, so this pays only where an alias was actually followed.
-        add_answer(
+        if add_answer(
             zone,
             at,
             &absolute_lowered(at),
             Qtype::of(record_types::CNAME),
             dnssec_ok,
-            response,
-        );
+            w,
+        )? {
+            owed |= 1 << i;
+        }
     }
+    Ok(owed)
+}
+
+/// The wildcard denials [`add_chain`] found owing, written once the answer
+/// section is closed.
+fn add_chain_denials(
+    zone: &Zone,
+    chain: &[String],
+    owed: u32,
+    w: &mut ResponseWriter,
+) -> Result<(), WireError> {
+    if owed == 0 {
+        return Ok(());
+    }
+    for (i, at) in chain.iter().enumerate() {
+        if owed & (1 << i) != 0 {
+            let proof = dnssec_answer::proof_of_absence(zone, &absolute_lowered(at));
+            w.push_all(Section::Authority, &proof)?;
+        }
+    }
+    Ok(())
 }
 
 /// A negative answer: the rcode, the SOA that says how long it may be cached,
@@ -368,10 +435,10 @@ fn add_negative(
     name: &str,
     kind: &NameKind,
     dnssec_ok: bool,
-    response: &mut DnsMessage,
-) {
+    w: &mut ResponseWriter,
+) -> Result<(), WireError> {
     if matches!(kind, NameKind::NotFound) {
-        response.rcode = ResponseCode::NoSuchDomain;
+        w.set_rcode(ResponseCode::NoSuchDomain);
     }
 
     // Both kinds of "no" carry the zone's SOA in the authority section
@@ -380,12 +447,13 @@ fn add_negative(
     // Without it a negative answer is uncacheable, so each repeat of a failing
     // lookup comes back to us.
     for soa in zone.query(zone.origin(), Qtype::of(record_types::SOA)) {
-        response.authorities.push(ResourceRecord {
-            name: zone.origin().to_string(),
-            class: soa.class,
-            ttl: negative_ttl(soa),
-            rdata: soa.rdata.clone(),
-        });
+        w.push(
+            Section::Authority,
+            zone.origin(),
+            soa.class,
+            negative_ttl(soa),
+            &soa.rdata,
+        )?;
     }
 
     // An unsigned "no" is a "no" a resolver has to take on trust, which for a
@@ -393,10 +461,12 @@ fn add_negative(
     // stops a forged NXDOMAIN taking a name off the internet for as long as it
     // stays cached.
     if dnssec_ok {
-        response
-            .authorities
-            .extend(dnssec_answer::negative_proof(zone, name, kind));
+        w.push_all(
+            Section::Authority,
+            &dnssec_answer::negative_proof(zone, name, kind),
+        )?;
     }
+    Ok(())
 }
 
 /// How long a negative answer may be cached: `min(SOA MINIMUM, the SOA record's
@@ -427,20 +497,30 @@ fn negative_ttl(soa: &rdns::zone::ZoneRecord) -> Ttl {
 /// answered NXDOMAIN for names below a delegation, so per RFC 8020 every
 /// resolver cached "the entire subtree does not exist" and the child zone went
 /// off the internet for the negative TTL.
-fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMessage) {
-    response.authoritive = false;
+fn refer_to_child(
+    zone: &Zone,
+    cut: &str,
+    dnssec_ok: bool,
+    w: &mut ResponseWriter,
+) -> Result<(), WireError> {
+    w.set_authoritative(false);
 
     let mut targets: Vec<String> = Vec::new();
     for ns in zone.query(cut, Qtype::of(record_types::NS)) {
         if let Ok(rdns::ParsedRecord::NS(target)) = ns.rdata.parse() {
             targets.push(target);
         }
-        response.authorities.push(ResourceRecord {
-            name: cut.to_string(),
-            class: ns.class,
-            ttl: ns.ttl,
-            rdata: ns.rdata.clone(),
-        });
+        w.push(Section::Authority, cut, ns.class, ns.ttl, &ns.rdata)?;
+    }
+
+    // Written here rather than after the glue: both are the same section
+    // contents as before, but the additional section cannot be reopened once a
+    // record has gone into it.
+    if dnssec_ok {
+        w.push_all(
+            Section::Authority,
+            &dnssec_answer::delegation_proof(zone, cut),
+        )?;
     }
 
     // Glue, and only in-bailiwick glue: an address we hold for a nameserver
@@ -455,21 +535,17 @@ fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMes
         }
         for rtype in [record_types::A, record_types::AAAA] {
             for glue in zone.query(&target, Qtype::of(rtype)) {
-                response.additionals.push(ResourceRecord {
-                    name: target.clone(),
-                    class: glue.class,
-                    ttl: glue.ttl,
-                    rdata: glue.rdata.clone(),
-                });
+                w.push(
+                    Section::Additional,
+                    &target,
+                    glue.class,
+                    glue.ttl,
+                    &glue.rdata,
+                )?;
             }
         }
     }
-
-    if dnssec_ok {
-        response
-            .authorities
-            .extend(dnssec_answer::delegation_proof(zone, cut));
-    }
+    Ok(())
 }
 
 /// RFC 1034 §4.3.2: the four cases an authoritative answer can be.
@@ -480,9 +556,9 @@ fn refer_to_child(zone: &Zone, cut: &str, dnssec_ok: bool, response: &mut DnsMes
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::query;
+    use crate::testutil::{make_response, query};
     use rdns::zone::parse_zone_file;
-    use rdns::Rtype;
+    use rdns::{ResourceRecord, Rtype};
 
     /// A zone with everything the algorithm has to branch on: an alias, an
     /// alias out of the zone, a two-deep wildcard, a delegation with glue,
@@ -775,6 +851,44 @@ ns.sub   IN A   192.0.2.20
                 "{class:?}: the question is echoed as it was asked"
             );
         }
+    }
+
+    /// Two questions is FORMERR (RFC 9619 §4), not two answers.
+    ///
+    /// This server used to loop over the question section and pile every
+    /// answer into one message, which has no meaning: there is one RCODE, one
+    /// AA bit and one set of sections, so a NOERROR answer and an NXDOMAIN in
+    /// the same reply are indistinguishable from an answer and a NODATA. The
+    /// last question's outcome simply won. §4 makes it explicit — "A DNS
+    /// message with OPCODE = 0 MUST NOT include a QDCOUNT parameter whose
+    /// value is greater than 1", to "be treated as an incorrectly formatted
+    /// message" — and BIND, NSD, Knot and Unbound all did this already.
+    ///
+    /// QDCOUNT = 0 stays a plain empty NOERROR: the same section says a
+    /// firewall "MUST NOT treat messages with OPCODE = 0 and QDCOUNT = 0 as
+    /// malformed".
+    #[test]
+    fn two_questions_in_one_query_are_a_format_error() {
+        let mut msg = query("www.example.com.", Qtype::of(record_types::A), false);
+        msg.queries.push(rdns::QuerySection {
+            qname: "host.example.com.".to_string(),
+            qtype: Qtype::of(record_types::A),
+            qclass: QueryClass::IN,
+        });
+        let response = make_response(&msg, &server(), &DnsMetrics::new());
+
+        assert_eq!(response.rcode, ResponseCode::FormatError);
+        assert!(!response.authoritive);
+        assert!(response.answers.is_empty(), "neither question is answered");
+        assert_eq!(response.queries.len(), 2, "both are echoed back");
+
+        let none = {
+            let mut msg = query("www.example.com.", Qtype::of(record_types::A), false);
+            msg.queries.clear();
+            make_response(&msg, &server(), &DnsMetrics::new())
+        };
+        assert_eq!(none.rcode, ResponseCode::Ok, "no question is not malformed");
+        assert!(none.answers.is_empty());
     }
 
     /// Choosing a zone folds ASCII case and nothing else (RFC 4343), which

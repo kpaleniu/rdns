@@ -71,6 +71,27 @@ impl NameCompressor {
         self.index.clear();
     }
 
+    /// Forget every suffix at or past `at`, keeping the rest.
+    ///
+    /// For a writer that rewinds the output buffer — an answer that overflowed
+    /// the size limit drops back to the question and sets TC. Whatever was
+    /// recorded past the rewind point now points at bytes that are about to be
+    /// overwritten, which is silent wire corruption on the least-tested path.
+    ///
+    /// `seen` is ordered by offset: a name's suffixes are recorded left to
+    /// right, and `pos` only ever moves forward.
+    pub fn rewind(&mut self, at: usize) {
+        let keep = self.seen.partition_point(|s| (s.offset as usize) < at);
+        if keep == self.seen.len() {
+            return;
+        }
+        self.seen.truncate(keep);
+        // The index holds positions in `seen`, so the entries pointing past its
+        // new end go with them. The arena is left alone: it is bytes, and the
+        // surviving entries' ranges are still theirs.
+        self.index.retain(|_, i| (*i as usize) < keep);
+    }
+
     /// Write `name` at `pos`, using a pointer to the longest suffix already
     /// present in the message. Returns the new position.
     pub fn write_name(
@@ -315,6 +336,36 @@ mod tests {
             "800 names cost {many:?} each against {few:?} for 25: \
              the cost is growing with the size of the message"
         );
+    }
+
+    /// A rewind forgets exactly the suffixes past the mark, and the ones before
+    /// it still compress — including through the index, which holds positions in
+    /// the table that has just been cut.
+    #[test]
+    fn a_rewind_forgets_what_was_written_past_it() {
+        let mut c = NameCompressor::new();
+        let mut buf = vec![0u8; 0x4000];
+
+        // `example.com.` lands at 18: 12 for the header plus `5first`.
+        let mark = c.write_name("first.example.com.", &mut buf, 12).unwrap();
+        let mut pos = mark;
+        for i in 0..SCAN_LIMIT + 8 {
+            pos = c
+                .write_name(&format!("h{i}.other.test."), &mut buf, pos)
+                .unwrap();
+        }
+        assert!(!c.index.is_empty(), "the table outgrew the scan");
+
+        c.rewind(mark);
+        // Written again at the rewind point: the suffix from before it is still a
+        // target, and `other.test.` is not one any more.
+        let end = c.write_name("second.example.com.", &mut buf, mark).unwrap();
+        assert_eq!(
+            &buf[mark..end],
+            &[6, b's', b'e', b'c', b'o', b'n', b'd', 0xc0, 18]
+        );
+        let after = c.write_name("h0.other.test.", &mut buf, end).unwrap();
+        assert_eq!(after - end, 15, "written in full, not pointed at");
     }
 
     /// A suffix recorded before the table outgrew the scan is still found after.
