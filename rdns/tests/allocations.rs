@@ -306,12 +306,30 @@ fn one_query_end_to_end() {
             .to_bytes_within_buf(4096, &mut scratch)
             .expect("serialize into the warm buffer")
     });
-    // The compressor's two and nothing else: per-message state, so unlike the
-    // buffer it cannot be carried across.
+    // The compressor's two and nothing else, when it is built per message.
     within("serialize into a reused buffer", reused_count, 2..=2);
     assert!(
         reused_count < serialize_count,
         "reusing the buffer must cost less than allocating one"
+    );
+
+    // And nothing at all when the compressor is carried too, which is what a
+    // send loop does (`TODO.md` #27b). Its state is per message, so it is
+    // cleared by `to_bytes_with` rather than by the caller — see the tests in
+    // `lib.rs` for what a stale one writes.
+    let mut compressor = rdns::compression::NameCompressor::new();
+    response
+        .to_bytes_within_buf_with(4096, &mut scratch, &mut compressor)
+        .expect("warm the compressor");
+    let ((), carried_count) = allocations(|| {
+        response
+            .to_bytes_within_buf_with(4096, &mut scratch, &mut compressor)
+            .expect("serialize with both carried")
+    });
+    within(
+        "serialize with the buffer and the compressor carried",
+        carried_count,
+        0..=0,
     );
 }
 

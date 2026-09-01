@@ -1917,30 +1917,29 @@ point dhat attributes is one of the sites below.
 
 | shape | per query |
 |---|---|
-| plain A, lower-case QNAME | 10.0 |
-| EDNS0+DO+cookie | 13.0 |
-| plain, DNS-0x20 case | 11.0 |
-| **EDNS0 + 0x20 — what a resolver actually sends** | **14.0** |
-| NXDOMAIN, unsigned zone | 18.0 |
+| plain A, lower-case QNAME | 8.0 |
+| EDNS0+DO+cookie | 11.0 |
+| plain, DNS-0x20 case | 9.0 |
+| **EDNS0 + 0x20 — what a resolver actually sends** | **12.0** |
+| NXDOMAIN, unsigned zone | 13.0 |
 | DO NXDOMAIN, signed zone | 153.0 |
 
 The 21 breaks down as:
 
-Twenty-one when this was filed. **Fourteen now**: #28b and #28c took two folds
-out, 27a took the rest of the folds and the `to_string`, and 27c took the two
-`Vec` spines. What is left:
+Twenty-one when this was filed. **Twelve now**: #28b and #28c took two folds
+out, 27a took the rest of the folds and the `to_string`, 27c took the two `Vec`
+spines, and 27b's compressor half took serialization to zero. What is left:
 
 | site | count | removed by |
 |---|---|---|
-| `add_answer`: owner `String`, `RecordData::clone`, `answers` push | 3 | 27b |
-| the compressor's arena and `seen` (`lib.rs:1504`) | 2 | 27b |
+| `add_answer`: owner `String`, `RecordData::clone`, `answers` push | 3 | 27b, the half still open |
 | parse: two label `Vec`s, two `String`s, `queries`, `additionals` | 6 | 27d |
 | `queries.clone()` — the spine and the QNAME `String` | 2 | 27d |
 | the fold at the door, which needs a buffer outliving the question | 1 | 27d |
 
-**27b is five of the fourteen and introduces no lifetime.** 27d takes the other
-nine and is the only one that changes a type's shape, so it is the one to leave
-until last — or never.
+**Twelve.** Three want the writer; the other nine want the request view, which is
+the only stage that changes a type's shape and the one to leave until last — or
+never.
 
 Everything *around* the answer already allocates nothing, which was checked
 rather than assumed: the rate limiter, `validate_packet`, `log_query`,
@@ -2000,7 +1999,7 @@ to echo the key instead of the name fails exactly one test out of 107 —
 covers the wildcard case too, since synthesis must echo the name asked for and
 never `*.example.com.` (RFC 4592 §3.3.1).
 
-#### 27b. Write the response; do not build it
+#### 27b. Write the response; do not build it — **half done 2026-09-01**
 
 Today an answer is a `DnsMessage` of owned `String`s and cloned RDATA, then
 serialized. A `ResponseWriter` owning the output buffer and the compressor, with
@@ -2028,6 +2027,41 @@ This is also where the negative shapes concentrate, and it is worth more than it
 thirteen suggests: a signed NXDOMAIN is 153, and after #25d the remainder is
 almost entirely the five records' owner `String`s and cloned RDATA plus what
 reading each NSEC costs. Nothing smaller than a writer removes those.
+
+**The compressor half is done; the record half is not.** They are separable and
+only the first is cheap: `DnsMessage::to_bytes_with` and
+`to_bytes_within_buf_with` take a `NameCompressor` the caller keeps, and the UDP
+worker keeps one beside its scratch buffer. **Serializing an answer now allocates
+nothing at all** — `allocations.rs` holds it at 0, against 2 for a reused buffer
+alone and 3 for neither.
+
+    daemon, per query      before   after
+    plain A                  10.0     8.0
+    EDNS0+DO+cookie          13.0    11.0
+    plain, DNS-0x20          11.0     9.0
+    EDNS + DNS-0x20          14.0    12.0
+    NXDOMAIN, unsigned       18.0    13.0
+    NXDOMAIN + EDNS          21.0    16.0
+
+**Five on the negative shapes against two on the positive**, which was not
+predicted: a negative answer carries the SOA and its two RDATA names on top of
+the question, so the compressor's `seen` outgrows its first allocation and
+reallocates. A carried compressor pays that growth once and keeps the capacity.
+The more names a message holds the more this is worth, which is the same reason
+it is worth most on a transfer envelope.
+
+**The trap this section describes is real, and the fix was to move it out of the
+caller's reach.** `to_bytes_with` clears the compressor at the *start* of a
+serialization rather than trusting the caller to, because the truncation retry
+serializes twice through one call — a rule the caller had to remember would have
+been wrong on the path least likely to be exercised. Two new tests hold it, and
+against a compressor not cleared per message two *existing* tests fail as well,
+both on the truncation path.
+
+**What is left of 27b is the three per-record allocations** — the owner
+`String`, the cloned RDATA and the `answers` spine — and those still need the
+writer, with the whole-RRset rewind above. The compressor half was separable;
+that half is not.
 
 #### 27c. `Zone::query` hands out an iterator — **done 2026-09-01**
 

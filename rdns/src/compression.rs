@@ -56,6 +56,21 @@ impl NameCompressor {
         Self::default()
     }
 
+    /// Forget everything, keeping the room it was kept in.
+    ///
+    /// Offsets are meaningless across messages, so a compressor carried from one
+    /// serialization to the next must be emptied between them or it writes
+    /// pointers into a message that is no longer there. That is why
+    /// [`crate::DnsMessage::to_bytes_with`] clears at the *start* of a
+    /// serialization rather than leaving it to the caller: the truncation retry
+    /// serializes twice through one call, and a rule the caller has to remember
+    /// would be wrong on the path least likely to be exercised.
+    pub fn clear(&mut self) {
+        self.arena.clear();
+        self.seen.clear();
+        self.index.clear();
+    }
+
     /// Write `name` at `pos`, using a pointer to the longest suffix already
     /// present in the message. Returns the new position.
     pub fn write_name(

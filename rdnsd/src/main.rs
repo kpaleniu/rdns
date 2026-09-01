@@ -25,6 +25,7 @@ use zones::{
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use rdns::compression::NameCompressor;
 use rdns::{
     dnssec::{DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE},
     dnssec_key::{SigningAlgorithm, SigningKey},
@@ -1661,6 +1662,10 @@ async fn udp_loop(
     // Reused for the worker's lifetime, settling at the largest EDNS payload
     // size it has been asked for. A task per datagram could not keep one.
     let mut scratch = Vec::new();
+    // Beside the buffer and for the same reason: the compressor's two
+    // allocations are per-message state, so an answer paid them per datagram
+    // (`TODO.md` #27b). `to_bytes_with` clears it, so nothing here has to.
+    let mut compressor = NameCompressor::new();
 
     loop {
         // `recv_from` is cancel-safe: a datagram is either fully received or not
@@ -1707,7 +1712,7 @@ async fn udp_loop(
         // budget.
         let _busy = busy.clone();
         server
-            .answer_datagram(packet, peer, &socket, &mut scratch, now)
+            .answer_datagram(packet, peer, &socket, &mut scratch, &mut compressor, now)
             .await;
     }
 }
@@ -1724,6 +1729,7 @@ impl Server {
         peer: SocketAddr,
         socket: &UdpSocket,
         scratch: &mut Vec<u8>,
+        compressor: &mut NameCompressor,
         now: u64,
     ) {
         let Server {
@@ -1842,7 +1848,7 @@ impl Server {
             };
             // Honor the client's EDNS0 UDP payload size (512 if no EDNS);
             // truncates with TC=1 if the response is larger.
-            resp.to_bytes_within_buf(msg.udp_payload_size() as usize, scratch)
+            resp.to_bytes_within_buf_with(msg.udp_payload_size() as usize, scratch, compressor)
         };
         if let Err(e) = serialized {
             serving_error!(logger, peer.ip(), "serialization error: {e}");
@@ -3106,7 +3112,14 @@ mod tests {
 
             let mut scratch = Vec::new();
             server
-                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
+                .answer_datagram(
+                    &packet,
+                    peer,
+                    &socket,
+                    &mut scratch,
+                    &mut NameCompressor::new(),
+                    tsig::now(),
+                )
                 .await;
 
             assert!(
@@ -3139,13 +3152,27 @@ mod tests {
             let mut scratch = Vec::new();
 
             server
-                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
+                .answer_datagram(
+                    &packet,
+                    peer,
+                    &socket,
+                    &mut scratch,
+                    &mut NameCompressor::new(),
+                    tsig::now(),
+                )
                 .await;
             let (address, capacity) = (scratch.as_ptr(), scratch.capacity());
             assert!(!scratch.is_empty(), "the first answer was serialized");
 
             server
-                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
+                .answer_datagram(
+                    &packet,
+                    peer,
+                    &socket,
+                    &mut scratch,
+                    &mut NameCompressor::new(),
+                    tsig::now(),
+                )
                 .await;
             assert_eq!(
                 scratch.as_ptr(),

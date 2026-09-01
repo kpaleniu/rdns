@@ -1501,7 +1501,21 @@ impl DnsMessage {
     /// (RFC 1035 §4.1.4). Returns the number of bytes written; errors if the
     /// message does not fit rather than writing a silently truncated one.
     pub fn to_bytes(&self, output: &mut [u8]) -> Result<usize, WireError> {
-        let mut compressor = NameCompressor::new();
+        self.to_bytes_with(output, &mut NameCompressor::new())
+    }
+
+    /// [`DnsMessage::to_bytes`] with a compressor the caller keeps.
+    ///
+    /// Its two allocations are per-message state, so a send loop answering one
+    /// datagram after another paid them per answer. `compressor` is cleared
+    /// here, not by the caller: offsets do not survive a message, and this is
+    /// the only place that knows a message is starting.
+    pub fn to_bytes_with(
+        &self,
+        output: &mut [u8],
+        compressor: &mut NameCompressor,
+    ) -> Result<usize, WireError> {
+        compressor.clear();
         let mut pos = 0;
 
         pos = write_bytes(output, pos, &self.id.to_be_bytes())?;
@@ -1670,9 +1684,23 @@ impl DnsMessage {
     /// away. The buffer is sized to `max_len` — only the TCP and transfer paths
     /// pass `u16::MAX`; a UDP caller passes its EDNS payload size.
     pub fn to_bytes_within_buf(&self, max_len: usize, out: &mut Vec<u8>) -> Result<(), WireError> {
+        self.to_bytes_within_buf_with(max_len, out, &mut NameCompressor::new())
+    }
+
+    /// [`DnsMessage::to_bytes_within_buf`] with a compressor the caller keeps
+    /// alongside the buffer, so an answer costs the allocator nothing at all.
+    ///
+    /// Both passes below go through [`DnsMessage::to_bytes_with`], which clears
+    /// it: the retry must not see the offsets of the message it is replacing.
+    pub fn to_bytes_within_buf_with(
+        &self,
+        max_len: usize,
+        out: &mut Vec<u8>,
+        compressor: &mut NameCompressor,
+    ) -> Result<(), WireError> {
         out.clear();
         out.resize(max_len, 0);
-        match self.to_bytes(out) {
+        match self.to_bytes_with(out, compressor) {
             Ok(n) if n <= max_len => {
                 out.truncate(n);
                 return Ok(());
@@ -1702,7 +1730,7 @@ impl DnsMessage {
         // there, so a too-small `max_len` still yields a TC=1 answer to retry on.
         out.clear();
         out.resize(max_len.max(CLASSIC_UDP_SIZE as usize), 0);
-        let n = truncated.to_bytes(out)?;
+        let n = truncated.to_bytes_with(out, compressor)?;
         out.truncate(n);
         Ok(())
     }
@@ -2303,6 +2331,127 @@ mod tests {
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0,
         ];
         assert!(DnsMessage::try_from_bytes(&half_pointer).is_err());
+    }
+
+    /// A compressor carried from one message to the next must produce exactly
+    /// what a fresh one produces.
+    ///
+    /// Compression offsets are positions *in the message being written*, so a
+    /// compressor that remembers the last message emits pointers into bytes that
+    /// are no longer there — a reply that parses as something else, or does not
+    /// parse. Two different messages, alternating, because a leak only shows
+    /// when the names differ.
+    #[test]
+    fn a_carried_compressor_writes_what_a_fresh_one_writes() {
+        let messages: Vec<DnsMessage> = ["www.example.com.", "a.very.different.name.test."]
+            .iter()
+            .map(|name| DnsMessage {
+                id: 0x1234,
+                response: true,
+                opcode: OpCode::Query,
+                authoritive: true,
+                truncation: false,
+                recursion: false,
+                recursion_ok: false,
+                ad: false,
+                cd: false,
+                rcode: ResponseCode::Ok,
+                queries: vec![QuerySection {
+                    qname: (*name).to_string(),
+                    qtype: Qtype::of(utils::record_types::A),
+                    qclass: QueryClass::IN,
+                }],
+                answers: vec![ResourceRecord {
+                    name: (*name).to_string(),
+                    class: Class::IN,
+                    ttl: Ttl::from_secs(60),
+                    rdata: RecordData::from_parsed(&ParsedRecord::A(std::net::Ipv4Addr::new(
+                        192, 0, 2, 1,
+                    )))
+                    .expect("encode"),
+                }],
+                authorities: Vec::new(),
+                additionals: Vec::new(),
+                edns: None,
+            })
+            .collect();
+
+        let fresh: Vec<Vec<u8>> = messages
+            .iter()
+            .map(|m| m.to_bytes_within(512).expect("serialize"))
+            .collect();
+
+        let mut carried = compression::NameCompressor::new();
+        let mut buf = Vec::new();
+        for round in 0..3 {
+            for (i, message) in messages.iter().enumerate() {
+                message
+                    .to_bytes_within_buf_with(512, &mut buf, &mut carried)
+                    .expect("serialize");
+                assert_eq!(
+                    buf, fresh[i],
+                    "round {round}, message {i}: a carried compressor changed the bytes"
+                );
+                // And it still decodes to the same message, which is what a
+                // stale pointer would break.
+                let back = DnsMessage::try_from_bytes(&buf).expect("re-parse");
+                assert_eq!(back.queries[0].qname, message.queries[0].qname);
+                assert_eq!(back.answers[0].name, message.answers[0].name);
+            }
+        }
+    }
+
+    /// The truncation retry serializes twice through one call, so it is the path
+    /// where a compressor cleared by the *caller* rather than per message would
+    /// carry the abandoned attempt's offsets into the reply that goes out.
+    #[test]
+    fn the_truncated_retry_does_not_inherit_the_abandoned_attempt() {
+        let big = DnsMessage {
+            id: 0x4321,
+            response: true,
+            opcode: OpCode::Query,
+            authoritive: true,
+            truncation: false,
+            recursion: false,
+            recursion_ok: false,
+            ad: false,
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![QuerySection {
+                qname: "www.example.com.".to_string(),
+                qtype: Qtype::of(utils::record_types::A),
+                qclass: QueryClass::IN,
+            }],
+            answers: (0..40)
+                .map(|i| ResourceRecord {
+                    name: format!("host{i}.example.com."),
+                    class: Class::IN,
+                    ttl: Ttl::from_secs(60),
+                    rdata: RecordData::from_parsed(&ParsedRecord::A(std::net::Ipv4Addr::new(
+                        192, 0, 2, i as u8,
+                    )))
+                    .expect("encode"),
+                })
+                .collect(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+            edns: None,
+        };
+
+        let fresh = big.to_bytes_within(512).expect("truncate");
+        let mut carried = compression::NameCompressor::new();
+        let mut buf = Vec::new();
+        big.to_bytes_within_buf_with(512, &mut buf, &mut carried)
+            .expect("truncate");
+
+        assert_eq!(
+            buf, fresh,
+            "the retry must not depend on a carried compressor"
+        );
+        let back = DnsMessage::try_from_bytes(&buf).expect("the truncated reply parses");
+        assert!(back.truncation, "TC is set");
+        assert!(back.answers.is_empty(), "and it carries no records");
+        assert_eq!(back.queries[0].qname, "www.example.com.");
     }
 
     /// Serializing into a buffer that cannot hold the message is an error, not
