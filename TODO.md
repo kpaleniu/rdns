@@ -710,7 +710,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`9715c3c`), the day after it was filed. 1 124 ms → 1.28 ms on the same probe. The fix is a type — `Nsec3Params`, the triple a hash is a function of — plus the map lookup the key was already there for, and the proof moved out from under the lock. One of the four filed boxes did not survive being checked against the code: NSEC3 hides how deep a cached name is, so the depth bound it asked for is not available to take |
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection was O(zones per query) — 55 µs at ten thousand zones, now 32 ns and flat, keyed on `NameKeyBuf` with a walk up the QNAME, and the walk brought a second multiplier with it that the client picks. Name compression was O(n²) in the records of one message, so a 400-record transfer envelope cost 130.7 µs to serialize and now costs 42.8; the index that fixes it is built lazily, because the threshold that helps a transfer hurt a 60-name response by 26%. And an AXFR held the zone three times over before the first byte went out; the envelopes are an iterator now, at 10.5× less peak memory, which needed `Arc<Zone>` in the map because the lock cannot be held across a socket write |
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
-| **28** | work the answer path does and need not | **filed 2026-09-01; 28a's four wall-clock reads done the same day.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
+| **28** | work the answer path does and need not | **filed 2026-09-01; 28a's four wall-clock reads and 28b done the same day.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
 | **27** | what a zero-allocation answer path would take | **filed 2026-09-01, not started.** Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
@@ -2095,7 +2095,7 @@ Two things the change turned up:
 Left: `LatencyTimer`'s two reads. They belong with #25c, which already wants the
 histogram's buckets fixed — it is the same function and the same commit.
 
-#### 28b. `name_kind` is computed before it is known to be needed
+#### 28b. `name_kind` is computed before it is known to be needed — **done 2026-09-01**
 
 `answer.rs:232` binds `let kind = zone.name_kind(&name)` and then checks
 `!zone.query(&name, qtype).is_empty()`. On a positive answer — the common case —
@@ -2108,6 +2108,36 @@ ancestor walk **twice**, and folds the name twice to do it.
 Computing it where it is used costs nothing and removes a walk. This is #25a
 stated more precisely: that item says the zone is walked three times per answer;
 this says one of those walks is thrown away on the path that matters most.
+
+**Done, and the fix is better than the one filed here.** Moving `let kind` down
+to its uses would still have walked twice on the negative path, because the
+second walk is *inside* `Zone::query`. `query_with_kind` returns both from one
+walk instead, and `query` delegates to it, so there is one implementation and no
+call site can ask for half of it twice. The positive path stops discarding a
+kind; the negative path stops computing one twice.
+
+    daemon, per query      before   after
+    plain, DNS-0x20          18.0    17.0
+    EDNS + DNS-0x20          21.0    20.0
+
+The lower-case and NXDOMAIN figures do not move, and that is not the change
+failing: the saved walk only *allocates* when the name needs folding, so an
+allocation count sees it under case randomization and nowhere else. On a
+negative answer the walk removed is a full ancestor walk rather than one hash
+hit, which is the more expensive half and the one no counter here shows.
+
+Two notes on verifying it:
+
+- **`cargo test --workspace` stops at the first failing target.** Breaking the
+  returned kind on purpose showed one failure and it looked as though nothing in
+  `rdnsd` covered a NODATA turning into NXDOMAIN. `cargo test -p rdnsd` alone
+  showed `an_empty_non_terminal_is_nodata_not_nxdomain` catching it. A count of
+  failures across the workspace is not a coverage measurement — the same shape as
+  §1's "a green suite on one platform is not a green suite".
+- The new differential test's *records* half is a tautology, since `query` now
+  delegates. The kind is the live half, and it is checked against `name_kind`'s
+  own walk across exact, wildcard, empty-non-terminal, not-found, apex,
+  below-a-delegation and out-of-zone names.
 
 #### 28c. The delegation walk runs in zones that have no delegations
 

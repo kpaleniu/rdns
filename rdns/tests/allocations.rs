@@ -373,6 +373,25 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     assert_eq!(records, 1);
     // The answer `Vec` as above, plus one fold per lookup.
     within("the same three lookups, case randomized", count, 4..=4);
+
+    // What the answer path asks now: the delegation walk, then one call that
+    // returns the kind and the records together. `name_kind` beside `query`
+    // walked the ancestors twice and folded the name twice to do it
+    // (`TODO.md` #28b), and under case randomization each fold is visible here.
+    let pair = |zone: &rdns::zone::Zone, name: &str| {
+        let cut = zone.delegation_for(name);
+        let (kind, records) = zone.query_with_kind(name, Qtype::of(record_types::A));
+        (cut, kind, records.len())
+    };
+    let _ = pair(&zone, mixed);
+
+    let ((cut, kind, records), count) = allocations(|| pair(&zone, mixed));
+    assert_eq!(
+        (cut, kind, records),
+        (None, NameKind::Exact, 1),
+        "unchanged"
+    );
+    within("the same walk, asking once for both", count, 3..=3);
 }
 
 /// Reading the SOA's MINIMUM — the ceiling on how long a negative answer may be

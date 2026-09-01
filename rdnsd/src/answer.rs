@@ -229,8 +229,11 @@ fn resolve_in_zone(zone: &Zone, qname: &str, qtype: Qtype) -> Outcome {
             }
         }
 
-        let kind = zone.name_kind(&name);
-        if !zone.query(&name, qtype).is_empty() {
+        // Both from one walk: `query` works the kind out to decide whether a
+        // wildcard may answer, and asking for it separately walked the ancestors
+        // and folded the name a second time (`TODO.md` #28b).
+        let (kind, records) = zone.query_with_kind(&name, qtype);
+        if !records.is_empty() {
             return Outcome::Answer { chain, name };
         }
         // A CNAME query is answered by the CNAME, not followed by it.

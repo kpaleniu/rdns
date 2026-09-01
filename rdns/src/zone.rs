@@ -219,16 +219,27 @@ impl Zone {
     /// included, and so does an empty non-terminal (RFC 1034 §4.3.3,
     /// RFC 4592 §2.2.1 and §4.4).
     pub fn query(&self, name: &str, qtype: Qtype) -> Vec<&ZoneRecord> {
+        self.query_with_kind(name, qtype).1
+    }
+
+    /// [`Zone::query`], and the [`NameKind`] it had to work out anyway.
+    ///
+    /// For the caller that needs both, which is the answer path: what kind of
+    /// name this is decides NXDOMAIN against NODATA (RFC 4592 §2.2.2) when the
+    /// records come back empty. Asking `name_kind` separately walks the
+    /// ancestors a second time and folds the name a second time to do it —
+    /// twice per negative answer, which is the shape a random-subdomain flood
+    /// sends.
+    pub fn query_with_kind(&self, name: &str, qtype: Qtype) -> (NameKind, Vec<&ZoneRecord>) {
         let key = self.lookup_key(name);
-        let positions = match self.name_kind_of_key(&key) {
+        let kind = self.name_kind_of_key(&key);
+        let positions = match kind {
             NameKind::Exact => self.index.get(key.as_ref()),
             NameKind::Wildcard(ref wildcard) => self.index.get(wildcard.as_str()),
             NameKind::EmptyNonTerminal | NameKind::NotFound => None,
         };
-        match positions {
-            Some(positions) => self.of_type(positions, qtype),
-            None => Vec::new(),
-        }
+        let records = positions.map_or_else(Vec::new, |positions| self.of_type(positions, qtype));
+        (kind, records)
     }
 
     /// The serial from the apex SOA, if the zone has one.
@@ -1624,6 +1635,55 @@ timed 60 IN A 192.0.2.3
             zone.name_kind("a.b.example."),
             NameKind::Wildcard("*.example.".to_string())
         );
+    }
+
+    /// `query_with_kind` must answer exactly what the two calls it replaced
+    /// answered, for every kind of name — the kind is what decides NXDOMAIN
+    /// against NODATA, so a disagreement is a wrong rcode, not a slow one.
+    ///
+    /// The kind is the live half: `query` delegates here now, so comparing the
+    /// records to `query`'s is a tautology, while the kind is still checked
+    /// against `name_kind`'s own walk. Watched failing with the kind forced to
+    /// `NotFound` — which `an_empty_non_terminal_is_nodata_not_nxdomain` in
+    /// `rdnsd` also catches, since that is a NODATA turning into NXDOMAIN.
+    #[test]
+    fn test_query_with_kind_answers_what_the_two_calls_did() {
+        let zone = parse_zone_file(
+            "@       IN SOA ns1 admin ( 1 3600 600 604800 300 )\n\
+             @       IN NS  ns1\n\
+             ns1     IN A   192.0.2.1\n\
+             www     IN A   192.0.2.10\n\
+             www     IN AAAA 2001:db8::10\n\
+             *.wild  IN A   192.0.2.20\n\
+             deep.a.b IN TXT \"x\"\n\
+             sub     IN NS  ns1.sub.example.com.\n",
+            "example.com.",
+        )
+        .unwrap();
+
+        for name in [
+            "www.example.com.",           // exact, has the type
+            "WwW.eXaMpLe.CoM.",           // the same, case randomized
+            "ns1.example.com.",           // exact, lacks the type
+            "anything.wild.example.com.", // answered by a wildcard
+            "a.b.example.com.",           // an empty non-terminal
+            "b.example.com.",             // another one, one label up
+            "nope.example.com.",          // not found
+            "example.com.",               // the apex
+            "host.sub.example.com.",      // below a delegation
+            "elsewhere.test.",            // outside the zone
+        ] {
+            for qtype in [rt::A, rt::TXT, rt::SOA] {
+                let qtype = Qtype::of(qtype);
+                let (kind, records) = zone.query_with_kind(name, qtype);
+                assert_eq!(kind, zone.name_kind(name), "kind for {name} {qtype:?}");
+                assert_eq!(
+                    records.len(),
+                    zone.query(name, qtype).len(),
+                    "records for {name} {qtype:?}"
+                );
+            }
+        }
     }
 
     /// An existing name ends the search, empty non-terminals included
