@@ -252,7 +252,7 @@ impl Shell {
             ResponseCode::Refused => metrics.count(&metrics.responses_refused),
             _ => {}
         }
-        metrics.observe_latency_ms(timer.elapsed_ms());
+        metrics.observe_latency_us(timer.elapsed_us());
     }
 }
 

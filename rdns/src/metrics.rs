@@ -14,11 +14,19 @@ use std::time::Instant;
 
 use crate::ResponseCode;
 
-/// Upper bounds, in milliseconds, of the latency histogram's buckets.
+/// Upper bounds, in whole microseconds, of the latency histogram's buckets.
 ///
-/// An in-memory zone lookup is tens of microseconds, so the resolution has to be
-/// below a millisecond or every healthy server reports as identical.
-const LATENCY_BUCKETS_MS: [f64; 8] = [0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 25.0, 100.0];
+/// Integers, because the write path compares against them on every answer and a
+/// float comparison buys nothing: the sum is already stored in integer
+/// microseconds, and the `le` labels are divided into seconds once, at scrape.
+///
+/// The bottom of the range is measured, not guessed. One whole answer — parse,
+/// look up, build, serialize — is 0.84 µs for a lower-case QNAME and 0.94 µs
+/// with the case randomized (`TODO.md` #27), so a healthy server lives between
+/// 1 and 10 µs. These bounds ran 50 µs to 100 ms before, which put every
+/// answer a healthy server gives into the first bucket — the same defect §14
+/// records at one decimal higher, where the floor was 5 ms.
+const LATENCY_BUCKETS_US: [u64; 8] = [1, 2, 5, 10, 50, 500, 5_000, 50_000];
 
 /// Escape a label value for the Prometheus text format: backslash, double quote
 /// and newline.
@@ -167,16 +175,22 @@ impl DnsMetrics {
     }
 
     /// Record one answer's latency into the histogram.
-    pub fn observe_latency_ms(&self, ms: f64) {
-        for (bound, bucket) in LATENCY_BUCKETS_MS.iter().zip(self.latency_buckets.iter()) {
-            if ms <= *bound {
-                bucket.fetch_add(1, Ordering::Relaxed);
-            }
+    ///
+    /// One bucket, not every bucket at or above the sample. Prometheus buckets
+    /// are cumulative, and this used to make them cumulative *here* — eight
+    /// read-modify-writes on shared cache lines per answer, plus the count and
+    /// the sum. [`DnsMetrics::render`] adds them up instead, which is what every
+    /// Prometheus client library does and renders byte-for-byte the same.
+    pub fn observe_latency_us(&self, us: u64) {
+        // The first bound at or above the sample: `le` is inclusive, so a sample
+        // exactly on a bound belongs to that bound's bucket. Past the last bound
+        // there is no bucket to touch — `+Inf` is `latency_count`.
+        let index = LATENCY_BUCKETS_US.partition_point(|&bound| bound < us);
+        if let Some(bucket) = self.latency_buckets.get(index) {
+            bucket.fetch_add(1, Ordering::Relaxed);
         }
         self.latency_count.fetch_add(1, Ordering::Relaxed);
-        // Integer microseconds so the sum needs no float atomic.
-        self.latency_sum_us
-            .fetch_add((ms * 1000.0) as u64, Ordering::Relaxed);
+        self.latency_sum_us.fetch_add(us, Ordering::Relaxed);
     }
 
     /// Record the serial currently served for `zone`. Call it wherever a zone is
@@ -405,11 +419,16 @@ impl DnsMetrics {
         // Seconds: Prometheus convention is base units.
         output.push_str("# HELP dns_answer_latency_seconds Time to build one answer\n");
         output.push_str("# TYPE dns_answer_latency_seconds histogram\n");
-        for (bound, bucket) in LATENCY_BUCKETS_MS.iter().zip(self.latency_buckets.iter()) {
+        // Cumulated here rather than on the write path. Buckets are read one at
+        // a time, so a scrape racing an answer can see a total an instant old —
+        // true of every counter in this file, and what Prometheus expects.
+        let mut cumulative = 0u64;
+        for (bound, bucket) in LATENCY_BUCKETS_US.iter().zip(self.latency_buckets.iter()) {
+            cumulative += bucket.load(Ordering::Relaxed);
             output.push_str(&format!(
                 "dns_answer_latency_seconds_bucket{{le=\"{}\"}} {}\n",
-                bound / 1000.0,
-                bucket.load(Ordering::Relaxed)
+                *bound as f64 / 1_000_000.0,
+                cumulative
             ));
         }
         let count = self.latency_count.load(Ordering::Relaxed);
@@ -496,12 +515,13 @@ impl LatencyTimer {
         }
     }
 
-    pub fn elapsed_ms(&self) -> f64 {
-        self.start.elapsed().as_secs_f64() * 1000.0
-    }
-
-    pub fn elapsed_us(&self) -> f64 {
-        self.start.elapsed().as_secs_f64() * 1_000_000.0
+    /// Whole microseconds since the timer started.
+    ///
+    /// Integer: this feeds [`DnsMetrics::observe_latency_us`], whose bounds and
+    /// whose sum are both integer microseconds. `as u64` saturates at zero for
+    /// the sub-microsecond case, which is the right floor for a duration.
+    pub fn elapsed_us(&self) -> u64 {
+        self.start.elapsed().as_micros() as u64
     }
 }
 
@@ -607,6 +627,57 @@ mod zone_gauge_tests {
         assert_eq!(rendered, ["dns_zone_serial{zone=\"od\\\"d\\\\.test.\"} 1"]);
         assert_eq!(escape_label("plain.test."), "plain.test.");
         assert_eq!(escape_label("a\nb"), "a\\nb");
+    }
+
+    /// Buckets are cumulative in the *output* and one-per-sample on the write
+    /// path, so the sum has to be rebuilt at scrape. Get that wrong and the
+    /// histogram reads as a distribution nobody observed.
+    ///
+    /// `le` is inclusive, which is the boundary the write path can get off by
+    /// one: a sample of exactly 5 µs belongs to `le="0.000005"`, not the one
+    /// above it.
+    #[test]
+    fn the_latency_histogram_renders_cumulative_buckets() {
+        let metrics = DnsMetrics::new();
+        // One in the first bucket, one exactly on a bound, one past every bound.
+        for us in [1, 5, 1_000_000] {
+            metrics.observe_latency_us(us);
+        }
+
+        let rendered = lines(&metrics, "dns_answer_latency_seconds");
+        assert_eq!(
+            rendered,
+            [
+                "dns_answer_latency_seconds_bucket{le=\"0.000001\"} 1",
+                "dns_answer_latency_seconds_bucket{le=\"0.000002\"} 1",
+                "dns_answer_latency_seconds_bucket{le=\"0.000005\"} 2",
+                "dns_answer_latency_seconds_bucket{le=\"0.00001\"} 2",
+                "dns_answer_latency_seconds_bucket{le=\"0.00005\"} 2",
+                "dns_answer_latency_seconds_bucket{le=\"0.0005\"} 2",
+                "dns_answer_latency_seconds_bucket{le=\"0.005\"} 2",
+                "dns_answer_latency_seconds_bucket{le=\"0.05\"} 2",
+                "dns_answer_latency_seconds_bucket{le=\"+Inf\"} 3",
+                "dns_answer_latency_seconds_sum 1.000006",
+                "dns_answer_latency_seconds_count 3",
+            ]
+        );
+    }
+
+    /// A sample past the last bound has no bucket of its own — `+Inf` is the
+    /// count — and must still reach the count and the sum. An `unwrap` on the
+    /// bucket index would panic here, and a `min` would put it in the last
+    /// bucket and claim a 1-second answer took under 50 ms.
+    #[test]
+    fn a_latency_past_every_bound_lands_only_in_inf() {
+        let metrics = DnsMetrics::new();
+        metrics.observe_latency_us(60_000);
+        let rendered = lines(&metrics, "dns_answer_latency_seconds");
+        assert!(
+            rendered.iter().all(|line| !line.contains("le=\"0.05\"} 1")),
+            "60 ms must not be counted under the 50 ms bound: {rendered:?}"
+        );
+        assert!(rendered.contains(&"dns_answer_latency_seconds_bucket{le=\"+Inf\"} 1".to_string()));
+        assert!(rendered.contains(&"dns_answer_latency_seconds_count 1".to_string()));
     }
 }
 

@@ -212,19 +212,21 @@ mod tests {
         let (addr, _shutdown, metrics) = start().await;
         metrics.count(&metrics.queries_received);
         metrics.count(&metrics.responses_refused);
-        metrics.observe_latency_ms(0.2);
+        metrics.observe_latency_us(200);
 
         let body = scrape(addr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
         assert!(body.contains("dns_queries_received_total 1"), "{body}");
         assert!(body.contains("dns_responses_refused_total 1"), "{body}");
-        // A 0.2 ms answer is at or below the 0.25 ms bucket, above the 0.1 ms.
+        // A 200 µs answer is at or below the 500 µs bucket, above the 50 µs one.
+        // Both bounds moved when the buckets were rescaled to where an answer
+        // actually lands (`TODO.md` #25c); the shape asserted here did not.
         assert!(
-            body.contains("dns_answer_latency_seconds_bucket{le=\"0.00025\"} 1"),
+            body.contains("dns_answer_latency_seconds_bucket{le=\"0.0005\"} 1"),
             "{body}"
         );
         assert!(
-            body.contains("dns_answer_latency_seconds_bucket{le=\"0.0001\"} 0"),
+            body.contains("dns_answer_latency_seconds_bucket{le=\"0.00005\"} 0"),
             "{body}"
         );
         assert!(

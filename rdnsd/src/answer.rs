@@ -161,7 +161,7 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
     if response.authoritive {
         metrics.count(&metrics.queries_authoritative);
     }
-    metrics.observe_latency_ms(timer.elapsed_ms());
+    metrics.observe_latency_us(timer.elapsed_us());
 
     // Mirror EDNS0: an OPT record only when the client used EDNS
     // (RFC 6891 §6.1.1), and DO echoed when it was asked for (RFC 3225 §3).

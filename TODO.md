@@ -1663,7 +1663,7 @@ anything re-measured should be too.
       into a live `[u8]`. The zeroing buys nothing, since the caller reads only
       `..n`. The UDP path already keeps a per-worker scratch buffer
       (`main.rs:2070`); the TCP path is the caller §13 stopped one short of.
-- [ ] **25c. The latency histogram costs eight atomic RMWs per answer.**
+- [x] **25c. The latency histogram costs eight atomic RMWs per answer.**
       `metrics.rs:213` increments every cumulative bucket at or above the sample,
       so a healthy 50 µs answer touches all eight, plus count and sum, on shared
       cache lines. `observe_latency_ms` + `count_response` is 46.7 ns; bucketing
@@ -1672,6 +1672,38 @@ anything re-measured should be too.
       `DnsMetrics` is **26 `Arc` fields, 24 of them `Arc<AtomicU64>`** (counted,
       not estimated), so it is 26 allocations and 26 refcount operations per
       clone where one `Arc<Inner>` with plain fields is the same public API.
+
+      **The histogram half is done 2026-09-01.** One bucket per sample,
+      cumulated in `render`, byte-for-byte the same output. The API is
+      `observe_latency_us(u64)` and the bounds are integer microseconds, so
+      nothing on the write path is a float any more — the sum was already stored
+      in integer µs and the `le` labels were already divided into seconds once,
+      at scrape.
+
+      **Two claims here needed correcting first, and one of them says the
+      opposite of what it should.** The buckets were *not* the problem this item
+      implies and §14 describes: they were already 50 µs-100 ms with a doc
+      comment explaining why, so §14's "a histogram starting at 5 ms" had been
+      fixed and both this item and #28a repeated the old version. But the defect
+      is real one decimal further down — **a whole answer measures 0.84-0.94 µs**
+      (#27), so *every* answer a healthy server gives landed in the first bucket
+      of a range starting at 50 µs. The bounds are 1, 2, 5, 10, 50, 500, 5 000
+      and 50 000 µs now, which is where the measurement says answers are.
+
+      **The two `Instant::now` calls stay, deliberately.** Two reads is the floor
+      for measuring an interval, and the obvious way to make them worth more —
+      widening the span from `make_response` to the whole request — would fold
+      AXFR into the query-latency histogram on the TCP path, since `Server::answer`
+      handles transfers too. Sampling would break `_count` against
+      `dns_queries_received`. 48 ns on Windows and 35 on Linux, for the one
+      metric an operator pages on, is the right trade.
+
+- [ ] **25c-bis. `DnsMetrics` is 26 `Arc` fields.** Split out of 25c on
+      2026-09-01 after checking where it is cloned: `main.rs:583` and `:605`, at
+      startup, and once per test. **It is not on the answer path**, so it does not
+      belong in a list of per-answer waste — 26 allocations per `DnsMetrics::new`
+      is a real cost and a different one. One `Arc<Inner>` with plain fields is
+      still the same public API.
 - [x] **25d. Canonical ordering allocates a `String` per label, per comparison.**
       `dnssec_denial.rs:47` and `:77` both go through `reversed_labels`, which
       builds a `Vec<String>`. `canonical_name_cmp` is 302-324 ns and
@@ -2028,9 +2060,13 @@ per datagram, which is the granularity every one of them already has.
 
 That leaves the latency pair, which genuinely measures the answer's own duration.
 Sampling it — one query in N — takes the six to one. And #25c is the reason to
-look at that anyway: the histogram starts at 5 ms while an in-memory answer is
-tens of microseconds, so today the server pays two clock reads and eight atomic
-RMWs per query to fill buckets that report every healthy server as identical.
+look at that anyway: ~~the histogram starts at 5 ms~~ — **wrong, corrected
+2026-09-01**; the bounds were 50 µs-100 ms, and this repeated §14's description
+of a defect already fixed rather than opening `metrics.rs`. The real version is
+one decimal down and #25c now carries it: an answer is 0.84-0.94 µs, so every
+one landed in the first bucket. Both halves are fixed — the eight RMWs are one,
+and the bounds start at 1 µs. The two clock reads stay, with the reason recorded
+in #25c.
 
 **~100-130 ns per query, for no behaviour change.** For comparison, every
 allocation on this path put together is ~460 ns.
