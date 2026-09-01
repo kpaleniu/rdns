@@ -377,48 +377,49 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     // (`TODO.md` #28c); it read 4 while every zone paid for that walk.
     within("the same three lookups, case randomized", count, 3..=3);
 
-    // What the answer path asks now: the delegation walk, then one call that
-    // returns the kind and the records together. `name_kind` beside `query`
-    // walked the ancestors twice and folded the name twice to do it
-    // (`TODO.md` #28b), and under case randomization each fold is visible here.
-    let pair = |zone: &rdns::zone::Zone, name: &str| {
-        let cut = zone.delegation_for(name);
-        let (kind, records) = zone.query_with_kind(name, Qtype::of(record_types::A));
-        (cut, kind, records.len())
+    // What the answer path asks now, in the order it asks: fold once at the
+    // door (`TODO.md` #27a), then the delegation walk and one `locate` that
+    // serves both the existence test and the records (#28b, #27c). Nothing is
+    // collected — `query` built a `Vec` for a question that was `is_empty()`.
+    let answer_path = |zone: &rdns::zone::Zone, name: &str| {
+        let key = rdns::utils::absolute_lowered(name);
+        let cut = zone.delegation_for(&key);
+        let located = zone.locate(&key);
+        let has = located.has_type(Qtype::of(record_types::A));
+        let records = located.of_type(Qtype::of(record_types::A)).count();
+        (cut, located.kind().clone(), has, records)
     };
-    let _ = pair(&zone, mixed);
+    let _ = answer_path(&zone, mixed);
 
-    let ((cut, kind, records), count) = allocations(|| pair(&zone, mixed));
-    assert_eq!(
-        (cut, kind, records),
-        (None, NameKind::Exact, 1),
-        "unchanged"
-    );
-    within("the same walk, asking once for both", count, 2..=2);
+    let ((cut, kind, has, records), count) = allocations(|| answer_path(&zone, mixed));
+    assert_eq!((cut, kind, has, records), (None, NameKind::Exact, true, 1));
+    // The fold at the door and nothing else. It read 4 before #28b, #28c, #27a
+    // and #27c; the one left is the fold itself, and it needs somewhere to put
+    // the bytes that outlives the question (#27d).
+    within("the answer path's lookups, case randomized", count, 1..=1);
 
-    // And the shape that still pays: a zone with a child. Measured too, because
-    // a count taken only against a leaf zone is a count of the path #28c skips
-    // — the cheap half of the thing being measured.
+    // The same against a zone with a child, where the delegation walk runs.
     let delegating = parse_zone_file(
         concat!(
-            "@   IN SOA ns1 admin ( 1 3600 600 604800 300 )\n",
-            "@   IN NS  ns1\n",
-            "ns1 IN A   192.0.2.1\n",
-            "www IN A   192.0.2.10\n",
-            "sub IN NS  ns1.sub.example.com.\n",
+            "@   IN SOA ns1 admin ( 1 3600 600 604800 300 )
+",
+            "@   IN NS  ns1
+",
+            "ns1 IN A   192.0.2.1
+",
+            "www IN A   192.0.2.10
+",
+            "sub IN NS  ns1.sub.example.com.
+",
         ),
         "example.com.",
     )
     .expect("parse");
-    let _ = pair(&delegating, mixed);
+    let _ = answer_path(&delegating, mixed);
 
-    let ((cut, kind, records), count) = allocations(|| pair(&delegating, mixed));
-    assert_eq!(
-        (cut, kind, records),
-        (None, NameKind::Exact, 1),
-        "unchanged"
-    );
-    within("the same walk, in a zone with a child", count, 3..=3);
+    let ((cut, kind, has, records), count) = allocations(|| answer_path(&delegating, mixed));
+    assert_eq!((cut, kind, has, records), (None, NameKind::Exact, true, 1));
+    within("the same, in a zone with a child", count, 1..=1);
 }
 
 /// Reading the SOA's MINIMUM — the ceiling on how long a negative answer may be

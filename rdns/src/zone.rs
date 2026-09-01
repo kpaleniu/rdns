@@ -69,6 +69,45 @@ pub struct Zone {
     non_terminals: HashSet<NameKeyBuf>,
 }
 
+/// A name resolved against a zone: what kind of name it is, and where its
+/// records are. From [`Zone::locate`].
+///
+/// Holds positions rather than records so that asking for a second type costs
+/// nothing, and so that a caller testing for existence allocates nothing at all.
+pub struct Located<'a> {
+    zone: &'a Zone,
+    kind: NameKind,
+    positions: &'a [usize],
+}
+
+impl<'a> Located<'a> {
+    /// What kind of name this is, which is what tells NXDOMAIN from NODATA when
+    /// [`Located::of_type`] comes back empty (RFC 4592 §2.2.2).
+    pub fn kind(&self) -> &NameKind {
+        &self.kind
+    }
+
+    pub fn into_kind(self) -> NameKind {
+        self.kind
+    }
+
+    /// The records here that `qtype` selects. What ANY means, and why the DNSSEC
+    /// meta types are excluded, is [`Qtype::matches`]'s to say.
+    pub fn of_type(&self, qtype: Qtype) -> impl Iterator<Item = &'a ZoneRecord> + '_ {
+        let zone = self.zone;
+        self.positions
+            .iter()
+            .map(move |&i| &zone.records[i])
+            .filter(move |r| qtype.matches(record_type_code(&r.rdata)))
+    }
+
+    /// Whether anything here is of `qtype`. The question `query(..).is_empty()`
+    /// was asking, without building the `Vec` it threw away.
+    pub fn has_type(&self, qtype: Qtype) -> bool {
+        self.of_type(qtype).next().is_some()
+    }
+}
+
 /// Why a name has an answer in this zone, or has none (RFC 1034 §4.3.2).
 ///
 /// Not a bool: three of the four are "the name exists", and an empty
@@ -246,15 +285,29 @@ impl Zone {
     /// twice per negative answer, which is the shape a random-subdomain flood
     /// sends.
     pub fn query_with_kind(&self, name: &str, qtype: Qtype) -> (NameKind, Vec<&ZoneRecord>) {
+        let located = self.locate(name);
+        let records: Vec<&ZoneRecord> = located.of_type(qtype).collect();
+        (located.kind, records)
+    }
+
+    /// Where `name` lands in this zone, without deciding a type yet.
+    ///
+    /// One closest-encloser walk, then as many type filters as the caller wants
+    /// — and the caller that wants only "is there anything here" pays no `Vec`
+    /// for the answer. [`Zone::query`] is this plus a `collect`.
+    pub fn locate(&self, name: &str) -> Located<'_> {
         let key = self.lookup_key(name);
         let kind = self.name_kind_of_key(&key);
-        let positions = match kind {
+        let at = match kind {
             NameKind::Exact => self.index.get(key.as_ref()),
             NameKind::Wildcard(ref wildcard) => self.index.get(wildcard.as_str()),
             NameKind::EmptyNonTerminal | NameKind::NotFound => None,
         };
-        let records = positions.map_or_else(Vec::new, |positions| self.of_type(positions, qtype));
-        (kind, records)
+        Located {
+            zone: self,
+            kind,
+            positions: at.map_or(&[][..], Vec::as_slice),
+        }
     }
 
     /// The serial from the apex SOA, if the zone has one.
@@ -401,16 +454,6 @@ impl Zone {
     /// lower-case origin: two walks ask for this per query.
     fn origin_key(&self) -> Cow<'_, str> {
         ascii_lowered_cow(&self.origin)
-    }
-
-    /// The records at these positions that `qtype` selects. What ANY means, and
-    /// why the DNSSEC meta types are excluded, is [`Qtype::matches`]'s to say.
-    fn of_type(&self, positions: &[usize], qtype: Qtype) -> Vec<&ZoneRecord> {
-        positions
-            .iter()
-            .map(|&i| &self.records[i])
-            .filter(|r| qtype.matches(record_type_code(&r.rdata)))
-            .collect()
     }
 
     /// Rebuild the index from `records`.

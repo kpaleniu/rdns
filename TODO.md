@@ -1917,31 +1917,30 @@ point dhat attributes is one of the sites below.
 
 | shape | per query |
 |---|---|
-| plain A, lower-case QNAME | 13.0 |
-| EDNS0+DO+cookie | 16.0 |
-| plain, DNS-0x20 case | 16.0 |
-| **EDNS0 + 0x20 — what a resolver actually sends** | **19.0** |
-| NXDOMAIN, unsigned zone | 19.0 |
+| plain A, lower-case QNAME | 10.0 |
+| EDNS0+DO+cookie | 13.0 |
+| plain, DNS-0x20 case | 11.0 |
+| **EDNS0 + 0x20 — what a resolver actually sends** | **14.0** |
+| NXDOMAIN, unsigned zone | 18.0 |
 | DO NXDOMAIN, signed zone | 153.0 |
 
 The 21 breaks down as:
 
-Twenty-one when this was filed; **nineteen after #28b and #28c took two folds
-out**, and the table is the nineteen:
+Twenty-one when this was filed. **Fourteen now**: #28b and #28c took two folds
+out, 27a took the rest of the folds and the `to_string`, and 27c took the two
+`Vec` spines. What is left:
 
 | site | count | removed by |
 |---|---|---|
-| `ascii_lowered` in `Zone::lookup_key` (twice) and `Zones::for_query` | 3 | 27a |
-| `resolve_in_zone`'s `qname.to_string()` (`answer.rs:212`) | 1 | 27a or 27d |
 | `add_answer`: owner `String`, `RecordData::clone`, `answers` push | 3 | 27b |
 | the compressor's arena and `seen` (`lib.rs:1504`) | 2 | 27b |
-| `Zone::of_type`'s `Vec` (`zone.rs:221`), twice | 2 | 27c |
 | parse: two label `Vec`s, two `String`s, `queries`, `additionals` | 6 | 27d |
 | `queries.clone()` — the spine and the QNAME `String` | 2 | 27d |
+| the fold at the door, which needs a buffer outliving the question | 1 | 27d |
 
-**27a + 27b + 27c is eleven of nineteen and introduces no lifetime.** 27d takes
-the remaining eight and is the only one that changes a type's shape, so it is the
-one to leave until last — or never.
+**27b is five of the fourteen and introduces no lifetime.** 27d takes the other
+nine and is the only one that changes a type's shape, so it is the one to leave
+until last — or never.
 
 Everything *around* the answer already allocates nothing, which was checked
 rather than assumed: the rate limiter, `validate_packet`, `log_query`,
@@ -2030,13 +2029,35 @@ thirteen suggests: a signed NXDOMAIN is 153, and after #25d the remainder is
 almost entirely the five records' owner `String`s and cloned RDATA plus what
 reading each NSEC costs. Nothing smaller than a writer removes those.
 
-#### 27c. `Zone::query` hands out an iterator
+#### 27c. `Zone::query` hands out an iterator — **done 2026-09-01**
 
 `Vec<&ZoneRecord>` (`zone.rs:221`) — the records are already borrowed, so only
 the spine allocates. An iterator form removes both calls' spines, and with 27b
 the records are consumed as they are produced. This is #25a from the other side:
 that item is about the zone being walked three times, and the same change fuses
 the `is_empty()` probe with the lookup that follows it.
+
+**Done, as `Zone::locate` returning a `Located`** — positions and the kind, with
+`of_type` and `has_type` on it — because `impl Trait` cannot be a tuple element
+and the caller needs the kind beside the records. `query` is `locate` plus a
+`collect` and keeps every existing caller.
+
+    daemon, per query      before   after
+    plain A                  12.0    10.0
+    EDNS0+DO+cookie          15.0    13.0
+    plain, DNS-0x20          13.0    11.0
+    EDNS + DNS-0x20          16.0    14.0
+
+**The negative shapes do not move, and the reason is worth writing down:** for a
+name that is not found there are no positions, so the old code built
+`Vec::new()`, and an empty `Vec` never allocated. Both discarded `Vec`s on that
+path were already free. What #27c actually removes is the spine of a `Vec` that
+had something in it — the positive answer.
+
+It took a third walk with it that was not in the plan. `cname_target` called
+`zone.query` again to follow an alias; the target comes out of the `Located`
+already in hand, so the CNAME path walks the zone once instead of twice. That is
+the remaining half of #25a for this path.
 
 #### 27d. The request as a view over the packet
 

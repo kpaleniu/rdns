@@ -250,19 +250,36 @@ fn resolve_in_zone<'a>(zone: &Zone, qname: &'a str, qkey: &'a str, qtype: Qtype)
             }
         }
 
-        // Both from one walk: `query` works the kind out to decide whether a
-        // wildcard may answer, and asking for it separately walked the ancestors
-        // and folded the name a second time (`TODO.md` #28b).
-        let (kind, records) = zone.query_with_kind(&key, qtype);
-        if !records.is_empty() {
+        // One walk for both questions: `locate` works the kind out to decide
+        // whether a wildcard may answer, and asking `name_kind` separately
+        // walked the ancestors and folded the name again (`TODO.md` #28b). The
+        // records are not collected — this asks only whether there are any
+        // (#27c).
+        let located = zone.locate(&key);
+        if located.has_type(qtype) {
             return Outcome::Answer { chain, name, key };
         }
         // A CNAME query is answered by the CNAME, not followed by it.
         if qtype.is(record_types::CNAME) {
+            let kind = located.into_kind();
             return Outcome::Negative { chain, name, kind };
         }
 
-        let Some(target) = cname_target(zone, &key) else {
+        // From the same `located`: following the alias is a question about the
+        // records already found here, not a reason to walk the zone again.
+        //
+        // Only the first is read: RFC 1034 §3.6.2 allows exactly one CNAME at an
+        // owner name, and the parser refuses to load a second, so this is belt
+        // to that braces.
+        let target = located
+            .of_type(Qtype::of(record_types::CNAME))
+            .next()
+            .and_then(|record| match record.rdata.parse() {
+                Ok(rdns::ParsedRecord::CNAME(target)) => Some(target),
+                _ => None,
+            });
+        let Some(target) = target else {
+            let kind = located.into_kind();
             return Outcome::Negative { chain, name, kind };
         };
         chain.push(name.into_owned());
@@ -278,20 +295,6 @@ fn resolve_in_zone<'a>(zone: &Zone, qname: &'a str, qkey: &'a str, qtype: Qtype)
         key = Cow::Owned(target_key);
     }
     Outcome::ChainLeftZone { chain }
-}
-
-/// The target of the CNAME at `name`, if there is one.
-///
-/// Only the first is read: RFC 1034 §3.6.2 allows exactly one CNAME at an owner
-/// name, and the parser refuses to load a second, so this is belt to that
-/// braces.
-fn cname_target(zone: &Zone, name: &str) -> Option<String> {
-    zone.query(name, Qtype::of(record_types::CNAME))
-        .first()
-        .and_then(|record| match record.rdata.parse() {
-            Ok(rdns::ParsedRecord::CNAME(target)) => Some(target),
-            _ => None,
-        })
 }
 
 /// Whether a name is at or below this zone's apex. [`rdns::utils::is_at_or_under`]
@@ -316,7 +319,7 @@ fn add_answer(
     dnssec_ok: bool,
     response: &mut DnsMessage,
 ) {
-    for record in zone.query(key, qtype) {
+    for record in zone.locate(key).of_type(qtype) {
         response.answers.push(ResourceRecord {
             name: name.to_string(),
             class: record.class,
