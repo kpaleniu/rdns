@@ -71,35 +71,54 @@ struct ZoneGauge {
     last_transfer: Option<u64>,
 }
 
-/// Prometheus-compatible metrics for DNS server
+/// Prometheus-compatible metrics for DNS server.
+///
+/// A handle: every task that reports anything holds a clone, so cloning is one
+/// refcount operation. It was an `Arc` *per counter* — 26 allocations to build
+/// and 26 refcount operations to clone, for something whose fields are only ever
+/// read and written together (`TODO.md` #25c-bis).
+///
+/// `Deref` rather than 24 accessors, so `metrics.count(&metrics.rate_limited)`
+/// still reads the same at all 31 call sites.
 #[derive(Clone)]
-pub struct DnsMetrics {
+pub struct DnsMetrics(Arc<Counters>);
+
+impl std::ops::Deref for DnsMetrics {
+    type Target = Counters;
+
+    fn deref(&self) -> &Counters {
+        &self.0
+    }
+}
+
+/// The counters themselves, reached through [`DnsMetrics`].
+pub struct Counters {
     // Query counters
-    pub queries_received: Arc<AtomicU64>,
-    pub queries_authoritative: Arc<AtomicU64>,
-    pub queries_recursive: Arc<AtomicU64>,
+    pub queries_received: AtomicU64,
+    pub queries_authoritative: AtomicU64,
+    pub queries_recursive: AtomicU64,
 
     // Response counters
-    pub responses_sent: Arc<AtomicU64>,
-    pub responses_nxdomain: Arc<AtomicU64>,
-    pub responses_servfail: Arc<AtomicU64>,
-    pub responses_refused: Arc<AtomicU64>,
-    pub responses_noerror: Arc<AtomicU64>,
+    pub responses_sent: AtomicU64,
+    pub responses_nxdomain: AtomicU64,
+    pub responses_servfail: AtomicU64,
+    pub responses_refused: AtomicU64,
+    pub responses_noerror: AtomicU64,
 
     // Cache metrics
-    pub cache_hits: Arc<AtomicU64>,
-    pub cache_misses: Arc<AtomicU64>,
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
 
     // Security metrics
-    pub rate_limited: Arc<AtomicU64>,
-    pub validation_errors: Arc<AtomicU64>,
-    pub queries_dropped: Arc<AtomicU64>,
+    pub rate_limited: AtomicU64,
+    pub validation_errors: AtomicU64,
+    pub queries_dropped: AtomicU64,
 
     // Cumulative buckets plus count and sum: what `histogram_quantile()` needs.
-    latency_buckets: Arc<[AtomicU64; 8]>,
-    latency_count: Arc<AtomicU64>,
+    latency_buckets: [AtomicU64; 8],
+    latency_count: AtomicU64,
     /// Microseconds, integer, so the sum needs no float atomic.
-    latency_sum_us: Arc<AtomicU64>,
+    latency_sum_us: AtomicU64,
 
     /// Per-zone facts, written where the fact changes rather than sampled at
     /// scrape time: sampling would put the scrape behind the zone-map lock and
@@ -107,50 +126,50 @@ pub struct DnsMetrics {
     ///
     /// Unbounded is safe here — the keys are configured zone names, not
     /// anything a client puts on the wire.
-    zones: Arc<RwLock<BTreeMap<NameKeyBuf, ZoneGauge>>>,
+    zones: RwLock<BTreeMap<NameKeyBuf, ZoneGauge>>,
 
     // Record type counters
-    pub queries_type_a: Arc<AtomicU64>,
-    pub queries_type_aaaa: Arc<AtomicU64>,
-    pub queries_type_mx: Arc<AtomicU64>,
-    pub queries_type_ns: Arc<AtomicU64>,
-    pub queries_type_cname: Arc<AtomicU64>,
-    pub queries_type_txt: Arc<AtomicU64>,
-    pub queries_type_soa: Arc<AtomicU64>,
-    pub queries_type_ptr: Arc<AtomicU64>,
-    pub queries_type_other: Arc<AtomicU64>,
+    pub queries_type_a: AtomicU64,
+    pub queries_type_aaaa: AtomicU64,
+    pub queries_type_mx: AtomicU64,
+    pub queries_type_ns: AtomicU64,
+    pub queries_type_cname: AtomicU64,
+    pub queries_type_txt: AtomicU64,
+    pub queries_type_soa: AtomicU64,
+    pub queries_type_ptr: AtomicU64,
+    pub queries_type_other: AtomicU64,
 }
 
 impl DnsMetrics {
     pub fn new() -> Self {
-        DnsMetrics {
-            queries_received: Arc::new(AtomicU64::new(0)),
-            queries_authoritative: Arc::new(AtomicU64::new(0)),
-            queries_recursive: Arc::new(AtomicU64::new(0)),
-            responses_sent: Arc::new(AtomicU64::new(0)),
-            responses_nxdomain: Arc::new(AtomicU64::new(0)),
-            responses_servfail: Arc::new(AtomicU64::new(0)),
-            responses_refused: Arc::new(AtomicU64::new(0)),
-            responses_noerror: Arc::new(AtomicU64::new(0)),
-            cache_hits: Arc::new(AtomicU64::new(0)),
-            cache_misses: Arc::new(AtomicU64::new(0)),
-            rate_limited: Arc::new(AtomicU64::new(0)),
-            validation_errors: Arc::new(AtomicU64::new(0)),
-            queries_dropped: Arc::new(AtomicU64::new(0)),
-            zones: Arc::new(RwLock::new(BTreeMap::new())),
-            latency_buckets: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
-            latency_count: Arc::new(AtomicU64::new(0)),
-            latency_sum_us: Arc::new(AtomicU64::new(0)),
-            queries_type_a: Arc::new(AtomicU64::new(0)),
-            queries_type_aaaa: Arc::new(AtomicU64::new(0)),
-            queries_type_mx: Arc::new(AtomicU64::new(0)),
-            queries_type_ns: Arc::new(AtomicU64::new(0)),
-            queries_type_cname: Arc::new(AtomicU64::new(0)),
-            queries_type_txt: Arc::new(AtomicU64::new(0)),
-            queries_type_soa: Arc::new(AtomicU64::new(0)),
-            queries_type_ptr: Arc::new(AtomicU64::new(0)),
-            queries_type_other: Arc::new(AtomicU64::new(0)),
-        }
+        DnsMetrics(Arc::new(Counters {
+            queries_received: AtomicU64::new(0),
+            queries_authoritative: AtomicU64::new(0),
+            queries_recursive: AtomicU64::new(0),
+            responses_sent: AtomicU64::new(0),
+            responses_nxdomain: AtomicU64::new(0),
+            responses_servfail: AtomicU64::new(0),
+            responses_refused: AtomicU64::new(0),
+            responses_noerror: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+            validation_errors: AtomicU64::new(0),
+            queries_dropped: AtomicU64::new(0),
+            zones: RwLock::new(BTreeMap::new()),
+            latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            latency_count: AtomicU64::new(0),
+            latency_sum_us: AtomicU64::new(0),
+            queries_type_a: AtomicU64::new(0),
+            queries_type_aaaa: AtomicU64::new(0),
+            queries_type_mx: AtomicU64::new(0),
+            queries_type_ns: AtomicU64::new(0),
+            queries_type_cname: AtomicU64::new(0),
+            queries_type_txt: AtomicU64::new(0),
+            queries_type_soa: AtomicU64::new(0),
+            queries_type_ptr: AtomicU64::new(0),
+            queries_type_other: AtomicU64::new(0),
+        }))
     }
 
     /// Add one to a counter: `metrics.count(&metrics.rate_limited)`.

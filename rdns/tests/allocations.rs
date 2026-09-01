@@ -116,6 +116,7 @@ fn allocation_counts() {
     scanning_a_query_for_a_tsig();
     comparing_two_names_allocates_nothing();
     ordering_two_names_canonically();
+    building_the_metrics_registry();
     proving_a_signed_nxdomain();
     verifying_an_rrset_against_two_candidate_signatures();
     a_busy_neighbour_stays_out_of_the_count();
@@ -824,6 +825,24 @@ fn signed_zone() -> rdns::zone::Zone {
         &SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400),
     )
     .expect("sign")
+}
+
+/// One metrics registry, which every task that reports anything holds a clone
+/// of.
+///
+/// Not on the answer path — it is built at startup and cloned per task, not per
+/// query — so this is here as the shape rather than as a cost: a counter per
+/// `Arc` is one allocation per counter and one refcount operation per counter on
+/// every clone, where one `Arc` around all of them is one of each.
+fn building_the_metrics_registry() {
+    let _warm = rdns::metrics::DnsMetrics::new();
+
+    let (metrics, count) = allocations(rdns::metrics::DnsMetrics::new);
+    within("build a metrics registry", count, 1..=1);
+
+    let (clone, clone_count) = allocations(|| metrics.clone());
+    within("clone one", clone_count, 0..=0);
+    drop((metrics, clone));
 }
 
 /// DNSSEC canonical ordering (RFC 4034 §6.1) is a question about bytes.

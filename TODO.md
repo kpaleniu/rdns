@@ -1698,12 +1698,24 @@ anything re-measured should be too.
       `dns_queries_received`. 48 ns on Windows and 35 on Linux, for the one
       metric an operator pages on, is the right trade.
 
-- [ ] **25c-bis. `DnsMetrics` is 26 `Arc` fields.** Split out of 25c on
+- [x] **25c-bis. `DnsMetrics` is 26 `Arc` fields.** Split out of 25c on
       2026-09-01 after checking where it is cloned: `main.rs:583` and `:605`, at
       startup, and once per test. **It is not on the answer path**, so it does not
       belong in a list of per-answer waste — 26 allocations per `DnsMetrics::new`
       is a real cost and a different one. One `Arc<Inner>` with plain fields is
       still the same public API.
+
+      **Done 2026-09-01.** `DnsMetrics(Arc<Counters>)` with `Deref`, so
+      `metrics.count(&metrics.rate_limited)` reads the same at all 31 call sites
+      and not one of them changed. Building the registry went **26 allocations to
+      1**, and cloning it — which every task that reports anything does — went 26
+      refcount operations to 0 allocations and 1. Both are held by
+      `allocations.rs`.
+
+      The compiler settled the one question worth asking before doing it: with
+      the counters no longer individually `Arc`'d, any call site that had cloned
+      a single counter's handle would stop compiling, because `AtomicU64` is not
+      `Clone`. None did.
 - [x] **25d. Canonical ordering allocates a `String` per label, per comparison.**
       `dnssec_denial.rs:47` and `:77` both go through `reversed_labels`, which
       builds a `Vec<String>`. `canonical_name_cmp` is 302-324 ns and
