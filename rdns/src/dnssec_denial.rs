@@ -26,22 +26,11 @@ pub const MAX_NSEC3_ITERATIONS: u16 = 150;
 /// Labels sort from the *right*, and a name sorts ahead of everything beneath
 /// it. String comparison gets both wrong, and an NSEC range check built on it
 /// accepts names outside the gap.
+/// `Iterator::cmp` gives both remaining rules for free: the first differing
+/// label decides, and a name that runs out of labels first is an ancestor and
+/// sorts before its descendants.
 pub fn canonical_name_cmp(a: &str, b: &str) -> Ordering {
-    let a = reversed_labels(a);
-    let b = reversed_labels(b);
-    for i in 0.. {
-        match (a.get(i), b.get(i)) {
-            (None, None) => return Ordering::Equal,
-            // Fewer labels means an ancestor, which sorts first.
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) => match x.as_bytes().cmp(y.as_bytes()) {
-                Ordering::Equal => continue,
-                other => return other,
-            },
-        }
-    }
-    unreachable!("the loop returns on the first differing or missing label")
+    reversed_labels(a).cmp(reversed_labels(b))
 }
 
 /// A byte string whose plain `Ord` is exactly [`canonical_name_cmp`], so a
@@ -54,24 +43,61 @@ pub fn canonical_name_cmp(a: &str, b: &str) -> Ordering {
 pub fn canonical_sort_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(name.len() + 1);
     for label in reversed_labels(name) {
-        key.extend_from_slice(label.as_bytes());
+        key.extend(label.folded());
         key.push(0);
     }
     key
 }
 
-/// A name's labels, down-cased and right to left. The root has none.
-fn reversed_labels(name: &str) -> Vec<String> {
+/// A name's labels, right to left. The root has none.
+///
+/// Borrowed, and folded only where they are compared: this returned a
+/// `Vec<String>`, so a name comparison cost a `Vec` and a `String` per label at
+/// each side — eight allocations for two three-label names, and `Nsec::covers`
+/// makes three comparisons. A signed NXDOMAIN spent 142 allocations, most of
+/// them here.
+fn reversed_labels(name: &str) -> impl Iterator<Item = Folded<'_>> {
     let trimmed = name.trim_end_matches('.');
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    trimmed
-        .split('.')
-        .map(|l| l.to_ascii_lowercase())
-        .rev()
-        .collect()
+    // `rsplit` on an empty string yields one empty label, where the root has
+    // none at all.
+    let labels = (!trimmed.is_empty()).then_some(trimmed);
+    labels.into_iter().flat_map(|t| t.rsplit('.')).map(Folded)
 }
+
+/// One label, ordered as RFC 4034 §6.1 requires: octet by octet, with ASCII
+/// case folded (RFC 4343).
+///
+/// A newtype because `Iterator::cmp` needs `Ord` and `Iterator::cmp_by` is
+/// unstable. `Eq` is written in terms of `Ord` rather than derived, since a
+/// derived one would compare the bytes without folding and disagree with it.
+#[derive(Clone, Copy)]
+struct Folded<'a>(&'a str);
+
+impl<'a> Folded<'a> {
+    fn folded(self) -> impl Iterator<Item = u8> + 'a {
+        self.0.bytes().map(|b| b.to_ascii_lowercase())
+    }
+}
+
+impl Ord for Folded<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.folded().cmp(other.folded())
+    }
+}
+
+impl PartialOrd for Folded<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Folded<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Folded<'_> {}
 
 /// Whether `rtype` is set in an NSEC/NSEC3 type bitmap (RFC 4034 §4.1.2).
 ///
@@ -834,21 +860,23 @@ fn closest_encloser_nsec(qname: &str, covering: &Nsec) -> String {
 
 /// The longest suffix of whole labels that two names share.
 fn common_suffix(a: &str, b: &str) -> String {
-    let a = reversed_labels(a);
-    let b = reversed_labels(b);
-    let shared: Vec<String> = a
-        .iter()
-        .zip(b.iter())
+    let shared = reversed_labels(a)
+        .zip(reversed_labels(b))
         .take_while(|(x, y)| x == y)
-        .map(|(x, _)| x.clone())
-        .collect();
-    if shared.is_empty() {
-        ".".to_string()
-    } else {
-        let mut labels = shared;
-        labels.reverse();
-        format!("{}.", labels.join("."))
+        .count();
+    if shared == 0 {
+        return ".".to_string();
     }
+    // A suffix of whole labels is a slice of `a`, so the answer is one copy
+    // rather than a `String` per label plus a `join` and a `format!`.
+    let trimmed = a.trim_end_matches('.');
+    let start = trimmed
+        .rmatch_indices('.')
+        .nth(shared - 1)
+        .map_or(0, |(dot, _)| dot + 1);
+    let mut out = trimmed[start..].to_ascii_lowercase();
+    out.push('.');
+    out
 }
 
 /// The RFC 5155 §8.4 closest-encloser proof: the encloser is proven, the name one
@@ -940,13 +968,24 @@ mod tests {
             canonical_name_cmp("EXAMPLE.com", "example.com."),
             Ordering::Equal
         );
-        // RFC 4034 §6.1's own example ordering.
+        // RFC 4034 §6.1's own example ordering, less the two names it spells
+        // with escapes (`\001.z.example` and `\200.z.example`): a label holding
+        // `\` is refused outright here (`dname::unrepresentable_octet`), so
+        // those are not names this library can hold, and comparing them as
+        // presentation text would order them by the backslash rather than by
+        // the octet they stand for.
+        //
+        // `Z.a.example` and `zABC.a.EXAMPLE` are the case-folding half of the
+        // example, and they are load-bearing: unfolded, `EXAMPLE` sorts before
+        // `example` and the last three lines come out in the wrong order.
         let mut names = vec![
             "z.example.",
             "yljkjljk.a.example.",
             "*.z.example.",
             "example.",
+            "zABC.a.EXAMPLE.",
             "a.example.",
+            "Z.a.example.",
         ];
         names.sort_by(|a, b| canonical_name_cmp(a, b));
         assert_eq!(
@@ -955,10 +994,29 @@ mod tests {
                 "example.",
                 "a.example.",
                 "yljkjljk.a.example.",
+                "Z.a.example.",
+                "zABC.a.EXAMPLE.",
                 "z.example.",
                 "*.z.example.",
             ]
         );
+    }
+
+    /// The longest shared suffix is a slice of the first name, folded. It was
+    /// rebuilt label by label, which is why this exists: the arithmetic that
+    /// finds where the shared part starts is new and the joining was not.
+    #[test]
+    fn test_common_suffix_is_the_shared_labels_folded() {
+        for (a, b, want) in [
+            ("www.Example.COM.", "mail.example.com.", "example.com."),
+            ("a.b.example.", "example.", "example."),
+            ("example.com.", "example.net.", "."),
+            ("com.", "com.", "com."),
+            ("a.example.", "a.example.", "a.example."),
+            (".", "example.", "."),
+        ] {
+            assert_eq!(common_suffix(a, b), want, "{a} against {b}");
+        }
     }
 
     /// If the sort key and `canonical_name_cmp` disagree, a range query returns

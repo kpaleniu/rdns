@@ -200,7 +200,7 @@ the note there. `cargo clippy --workspace --all-targets` is clean there too,
 which is the half Windows cannot check at all.
 
 **Two of those single tests are worth more than their count suggests.**
-`allocations` reports **twenty-six** measurements, **eighteen** of them exact
+`allocations` reports **twenty-nine** measurements, **twenty** of them exact
 (`n..=n`) — twenty-two and fourteen before the shapes added on 2026-08-31,
 nineteen and thirteen when this was written, and the claim of
 "fourteen exact" before that was never counted and was wrong both ways; seven
@@ -1670,13 +1670,33 @@ anything re-measured should be too.
       `DnsMetrics` is **26 `Arc` fields, 24 of them `Arc<AtomicU64>`** (counted,
       not estimated), so it is 26 allocations and 26 refcount operations per
       clone where one `Arc<Inner>` with plain fields is the same public API.
-- [ ] **25d. Canonical ordering allocates a `String` per label, per comparison.**
+- [x] **25d. Canonical ordering allocates a `String` per label, per comparison.**
       `dnssec_denial.rs:47` and `:77` both go through `reversed_labels`, which
       builds a `Vec<String>`. `canonical_name_cmp` is 302-324 ns and
       `canonical_sort_key` 176-185 ns, against 52-56 ns for the same answer from
       `rsplit('.')` and `Iterator::cmp` over folded bytes. `Nsec::covers` calls
       the first three times, so a validating resolver pays ~1 µs and twelve
       allocations per candidate NSEC; `Zone::reindex` pays the second per record.
+
+      **Done 2026-09-01.** `reversed_labels` yields borrowed labels and a
+      `Folded` newtype carries RFC 4343's fold into `Ord`, so `Iterator::cmp`
+      supplies the rest of §6.1 — which closes **26g** as well. `common_suffix`
+      returns a slice of its first argument rather than rebuilding it label by
+      label. Comparison 8 allocations to 0, sort key 5 to 1.
+
+      **The item's own claim was wrong about the payoff, and the correction is
+      the useful part.** It implied the ordering was the bulk of a signed
+      denial's cost. It is not: `negative_proof` went 142 to 114 on the
+      eight-record test zone, and a DO NXDOMAIN measured on `rdnsd` against a
+      signed zone went **161.0 to 153.0** per query — a twentieth. What remains
+      is the five records themselves, each an owner `String` and a cloned RDATA,
+      plus a `Zone::query` `Vec` per lookup and what reading each NSEC costs.
+      Only a response written straight to the wire removes those (#27).
+
+      The larger win is off the query path entirely: `canonical_sort_key` runs
+      **per record** in `Zone::reindex`, at every load and every re-signing, so
+      "sign an eight-record zone" went 900 to 850 — about six allocations per
+      record, which is six million on a zone with a million of them.
 - [ ] **25e. A cache lookup allocates its key.** `cache.rs:93` —
       `HashMap<(String, Qtype), _>` has no `Borrow` for a tuple, so
       `get_validated` calls `ascii_lowered` (unconditional `String`) on every
@@ -1738,7 +1758,7 @@ is why #13b's sweep did not turn them up.
 | **26d** | two `fn base64` | `rfc5011.rs:781`, `zone_writer.rs:320`, identical one-line wrappers |
 | **26e** | `ancestors_of` / `ancestors` allocate a `String` per ancestor | `zone_signer.rs:785` (a `Vec<&str>`, then a `join` **and** a `format!` per ancestor) and `resolver.rs:482`. Ancestors are suffix slices of the input. `Layout::of` runs it once per name and `chain_names` runs it again per name, at every load and every re-signing. Flagged as "the next function to look at" by the 2026-08-03 review and still there |
 | **26f** | `resolver::normalize` allocates unconditionally | `resolver.rs:1779`; `utils::absolute_lowered` returns a `Cow` and borrows the common case. A straggler of #13b |
-| **26g** | `canonical_name_cmp` hand-rolls `Iterator::cmp` | `dnssec_denial.rs:50` — `for i in 0.. { match (a.get(i), b.get(i)) … }` with an `unreachable!()` to close it |
+| **26g** | ~~`canonical_name_cmp` hand-rolls `Iterator::cmp`~~ **done 2026-09-01** | `dnssec_denial.rs:50` — `for i in 0.. { match (a.get(i), b.get(i)) … }` with an `unreachable!()` to close it. Fixed with #25d: the loop *was* the `Vec<String>`'s reason for existing |
 | **26h** | `utils::record_type_name` returns `String` for a constant | thirteen known mnemonics, each `"A".to_string()`. `&'static str` with a `Cow` for the `TYPEnnn` arm costs nothing and removes an allocation per record written |
 | **26i** | `dnssec_denial.rs:189` walks a bitmap byte bit by bit | `trailing_zeros` is the idiom. Writer-side only, so smallest here |
 
@@ -1882,7 +1902,7 @@ a stage lands. Each stage is measured **before and after, on the same machine,
 in the same session**:
 
 ```sh
-cargo test -p rdns --test allocations -- --nocapture   # 26 counts, 18 exact
+cargo test -p rdns --test allocations -- --nocapture   # 29 counts, 20 exact
 cargo bench -p rdns -- --save-baseline before          # then do the stage
 cargo bench -p rdns -- --baseline before
 ```

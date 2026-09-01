@@ -115,6 +115,8 @@ fn allocation_counts() {
     one_axfr_out();
     scanning_a_query_for_a_tsig();
     comparing_two_names_allocates_nothing();
+    ordering_two_names_canonically();
+    proving_a_signed_nxdomain();
     verifying_an_rrset_against_two_candidate_signatures();
     a_busy_neighbour_stays_out_of_the_count();
 }
@@ -753,9 +755,9 @@ fn comparing_two_names_allocates_nothing() {
     within("compare two names", after, 0..=0);
 }
 
-/// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate
-/// RRSIG, so an RRset signed by both a KSK and a ZSK can do all of it twice.
-fn verifying_an_rrset_against_two_candidate_signatures() {
+/// [`ZONE`] signed by a KSK and a ZSK, which is the ordinary shape: an RRset
+/// carries one RRSIG and the DNSKEY RRset carries two.
+fn signed_zone() -> rdns::zone::Zone {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let keys = vec![
         SigningKey::generate(
@@ -771,12 +773,75 @@ fn verifying_an_rrset_against_two_candidate_signatures() {
         )
         .expect("zsk"),
     ];
-    let signed = sign_zone(
+    sign_zone(
         &zone,
         &keys,
         &SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400),
     )
-    .expect("sign");
+    .expect("sign")
+}
+
+/// DNSSEC canonical ordering (RFC 4034 §6.1) is a question about bytes.
+///
+/// It went through a `Vec<String>` of down-cased labels, so one comparison cost
+/// a `Vec` and a `String` per label at each side — and `Nsec::covers` makes
+/// three comparisons, so a validator paid twelve per candidate NSEC. The sort
+/// key keeps one allocation, which is the key it returns.
+fn ordering_two_names_canonically() {
+    let a = "a.z.example.com.";
+    let b = "B.example.COM.";
+    let _warm = (
+        rdns::dnssec_denial::canonical_name_cmp(a, b),
+        rdns::dnssec_denial::canonical_sort_key(a),
+    );
+
+    let (order, count) = allocations(|| rdns::dnssec_denial::canonical_name_cmp(a, b));
+    assert_eq!(
+        order,
+        std::cmp::Ordering::Greater,
+        "the rightmost differing label decides, and case does not"
+    );
+    within("order two names canonically", count, 0..=0);
+
+    let (key, count) = allocations(|| rdns::dnssec_denial::canonical_sort_key(a));
+    assert!(!key.is_empty());
+    within("build a canonical sort key", count, 1..=1);
+}
+
+/// The whole authority section of a signed NXDOMAIN: the SOA and its signature,
+/// the NSEC denying the name, and the NSEC denying the wildcard that could have
+/// answered it (RFC 4035 §3.1.3.2).
+///
+/// A range, because it is proportional to the records the proof needs rather
+/// than to anything fixed. It is here because it is the shape a random-subdomain
+/// flood generates: **142** before the canonical ordering above stopped
+/// allocating, 114 after.
+///
+/// So the ordering was 28 of the 142 and not, as `TODO.md` #25d implied, most of
+/// it. What is left is the records themselves — each of the five is an owner
+/// `String` and a cloned RDATA — plus a `Zone::query` `Vec` per lookup and the
+/// `String` and bitmap `Vec` that reading each NSEC costs. Those are what a
+/// response written straight to the wire would remove, and nothing smaller.
+fn proving_a_signed_nxdomain() {
+    let signed = signed_zone();
+    let _warm =
+        rdns::dnssec_answer::negative_proof(&signed, "nope.example.com.", &NameKind::NotFound);
+
+    let (proof, count) = allocations(|| {
+        rdns::dnssec_answer::negative_proof(&signed, "nope.example.com.", &NameKind::NotFound)
+    });
+    assert_eq!(
+        proof.len(),
+        5,
+        "SOA, its RRSIG, and two denials with theirs"
+    );
+    within("prove a signed NXDOMAIN", count, 100..=130);
+}
+
+/// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate
+/// RRSIG, so an RRset signed by both a KSK and a ZSK can do all of it twice.
+fn verifying_an_rrset_against_two_candidate_signatures() {
+    let signed = signed_zone();
 
     let owned = |name: &str, rtype: Rtype| -> Vec<ResourceRecord> {
         signed
