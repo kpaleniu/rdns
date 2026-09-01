@@ -710,6 +710,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`9715c3c`), the day after it was filed. 1 124 ms → 1.28 ms on the same probe. The fix is a type — `Nsec3Params`, the triple a hash is a function of — plus the map lookup the key was already there for, and the proof moved out from under the lock. One of the four filed boxes did not survive being checked against the code: NSEC3 hides how deep a cached name is, so the depth bound it asked for is not available to take |
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection was O(zones per query) — 55 µs at ten thousand zones, now 32 ns and flat, keyed on `NameKeyBuf` with a walk up the QNAME, and the walk brought a second multiplier with it that the client picks. Name compression was O(n²) in the records of one message, so a 400-record transfer envelope cost 130.7 µs to serialize and now costs 42.8; the index that fixes it is built lazily, because the threshold that helps a transfer hurt a 60-name response by 26%. And an AXFR held the zone three times over before the first byte went out; the envelopes are an iterator now, at 10.5× less peak memory, which needed `Arc<Zone>` in the map because the lock cannot be held across a socket write |
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
+| **28** | work the answer path does and need not | **filed 2026-09-01, not started.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
 | **27** | what a zero-allocation answer path would take | **filed 2026-09-01, not started.** Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
@@ -1818,12 +1819,36 @@ reaching an operator.
 
 ### 27. What a zero-allocation answer path would take — filed 2026-09-01
 
-**Read the payoff first.** A whole answer is ~522 ns against 3.6-4.1 µs of
+**Read the payoff first.** ~~A whole answer is ~522 ns against 3.6-4.1 µs of
 syscall (#9e), so removing every allocation on this path is worth about 1% end to
-end. The reason to file it is not throughput: it is that an allocation count is
-the deterministic gate this repo already prefers (§10), and a path asserted at
-**zero** is a far sharper tripwire than one asserted at twenty-one. Anyone
-starting this expecting a faster server has misread the numbers.
+end.~~ **Wrong, corrected 2026-09-01, the same day it was filed** (§11 — the
+reasoning is why the mistake happened). The 1-2% came from #15's withdrawal note,
+which was about *name* allocation at a lower count, and it was carried over here
+as though it covered all twenty-one. Measured instead of inherited:
+
+| | ns |
+|---|---|
+| one alloc + free, small `Vec` or `String` | 22 |
+| the same twenty-one, in a loop | 460 |
+| a whole EDNS answer, lower-case QNAME | 844 |
+| the same answer, DNS-0x20 | 939 |
+
+Windows, release, and absolute nanoseconds move between runs (#25's header), so
+the load-bearing figure is the **differential**: 0x20 adds exactly five
+allocations and five folds, and costs 95 ns — 19 ns each, which corroborates the
+22 by a second method. **Allocations are of the order of half the answer, and
+~9-10% of a query including its syscalls**, not 1%. That is still not a reason to
+start this for speed, and the gate argument below is unchanged — but the number
+that was here was wrong by an order of magnitude, and a wrong number in a
+"read this first" paragraph is how the 13.7 above survived a year.
+
+The reason to file it remains that an allocation count is the deterministic gate
+this repo prefers (§10), and a path asserted at **zero** is a far sharper
+tripwire than one asserted at twenty-one.
+
+**And it is not the largest thing on this path.** See #28: six clock reads per
+query cost 144-155 ns, measured on both platforms, and four of the six want the
+same value.
 
 **Nothing here is #15.** That was withdrawn because a borrowed, pointer-following
 `DName` needs a name's absolute offset in the message, and twelve parse sites
@@ -1972,6 +1997,112 @@ as #13's were. The library counts stay the first gate, and they now cover the
 shapes that hid a site: the suite read the TSIG scan as free because it only ever
 measured a query with no additional section, where `find_tsig` returns before its
 body.
+
+### 28. Work the answer path does and need not — filed 2026-09-01
+
+#27 is about *how* the answer is represented. This is about work that does not
+have to happen at all, or not now, or not per query. It came out of asking that
+question directly, and the first item is larger than anything in #27.
+
+Everything below is measured or read, and the candidates that died are at the
+bottom — two of the five did not survive being checked (§17).
+
+#### 28a. Six clock reads per query, and four of them want the same value
+
+| | Windows | Linux |
+|---|---|---|
+| `current_unix_timestamp` (`SystemTime::now`) | 26.2 ns | 24.1 ns |
+| `Instant::now` | 24.1 ns | 17.3 ns |
+| **all six, as one query does them** | **155 ns** | **144 ns** |
+
+The six: `RateLimiter::should_allow` (`security.rs:104`), `ResponseLimiter::admit`
+(`:269`), `QueryLogger::log_query` (`logging.rs:197`), `tsig::now` at the top of
+`answer_datagram`, and `LatencyTimer`'s pair — `Instant::now` at
+`metrics.rs:495` and a second read in `elapsed_ms`.
+
+The four wall-clock reads want *the same instant*. Reading it once in
+`udp_loop` and passing it down is not a semantic change — it is still one read
+per datagram, which is the granularity every one of them already has.
+`check_request` already takes `now` as a parameter, so the shape is established;
+`should_allow`, `admit` and `log_query` are the three that do not.
+
+That leaves the latency pair, which genuinely measures the answer's own duration.
+Sampling it — one query in N — takes the six to one. And #25c is the reason to
+look at that anyway: the histogram starts at 5 ms while an in-memory answer is
+tens of microseconds, so today the server pays two clock reads and eight atomic
+RMWs per query to fill buckets that report every healthy server as identical.
+
+**~100-130 ns per query, for no behaviour change.** For comparison, every
+allocation on this path put together is ~460 ns.
+
+#### 28b. `name_kind` is computed before it is known to be needed
+
+`answer.rs:232` binds `let kind = zone.name_kind(&name)` and then checks
+`!zone.query(&name, qtype).is_empty()`. On a positive answer — the common case —
+`kind` is discarded. It is used only in the two `Outcome::Negative` arms.
+
+Worse on the negative path, which is the flood shape: `Zone::query` calls
+`name_kind_of_key` itself (`zone.rs:223`), so an NXDOMAIN runs the closest-encloser
+ancestor walk **twice**, and folds the name twice to do it.
+
+Computing it where it is used costs nothing and removes a walk. This is #25a
+stated more precisely: that item says the zone is walked three times per answer;
+this says one of those walks is thrown away on the path that matters most.
+
+#### 28c. The delegation walk runs in zones that have no delegations
+
+`resolve_in_zone` opens with `zone.delegation_for(&name)`, and it must — RFC 1034
+§4.3.2's first case, and getting it last is how a parent answers NXDOMAIN for a
+child's names (§8). But `delegation_for_key` (`zone.rs:316`) walks from the name
+to the apex asking `has_type(candidate, NS)` at every level, and a zone with no
+NS record below its apex can never answer anything but `None`.
+
+`has_wildcards` (`zone.rs:52`, set at `:125`, recomputed at `:393`) is the
+precedent, and skipping the wildcard walk on that flag is already committed
+(`41021eb`). The same flag for delegations makes the whole walk skippable for a
+leaf zone, which is most zones.
+
+**This one is correctness-critical in a way the wildcard flag is not.** A flag
+that is wrong in the false direction is a *missed referral* — the parent
+answering authoritatively for a child's names, which is the bug §8 opens with. It
+has to be recomputed everywhere `has_wildcards` is, and the test that matters is
+a zone that gains its first delegation on reload.
+
+#### 28d. Four global mutexes per datagram — a ceiling, not a measured cost
+
+`should_allow` takes two (`last_cleanup`, then `buckets` — this is #25f),
+`log_query` one, `admit` one. Both limiters already short-circuit before locking
+when they are *disabled*, but the defaults enable both, so a default server takes
+all four on every datagram with 16 UDP workers sharing them.
+
+**Not measured, and so not ranked.** #25f already says the honest version: at
+~4 µs of syscall per query this is not the bottleneck, it is the ceiling. What
+would settle it is a run with `--udp-workers 1` against `--udp-workers 16` at
+saturation, which nothing here has done. Per-worker sharding with periodic
+rollup is the shape that removes it, and it is the same shape as 28a's
+"read the clock once in the loop".
+
+#### Checked and rejected
+
+Recorded so the next pass does not re-derive them (§10's rule about negative
+results).
+
+- **Refusing QDCOUNT > 1 to make the question a fixed-size field.** The work
+  multiplier is already bounded: `AdmissionCheck::validate_header` caps the
+  question count at 10 (`validation.rs:159`), with a comment explaining why the
+  section counts are capped rather than forbidden. So the ceiling is 10 lookups
+  per datagram, not one per five bytes of packet. Tightening it to 1 for QUERY is
+  a *conformance* question — recent guidance is that a query carrying more than
+  one question should be FORMERR — and it should be taken up as one, against the
+  actual document, not as an optimization. It was not verified here.
+- **Skipping the TSIG scan when the keyring is empty.** Tempting: `find_tsig`
+  walks to the last additional record on every packet, and a server with no keys
+  can verify nothing. But `check_request` answers `Rejected(BadKey)` for a signed
+  request whose key is unknown (`tsig.rs:681`), and the caller turns that into
+  NOTAUTH with a signed TSIG error (RFC 8945 §5.2). Skipping would silently
+  answer such a request as though it were unsigned — §4's quiet degradation, with
+  authentication as the casualty. The scan stays. What *was* removable from it is
+  done: the owner name is no longer read before the TYPE check.
 
 ### 12. Pre-authentication panics — audited 2026-08-01
 
