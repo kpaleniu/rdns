@@ -111,6 +111,22 @@ impl RecordData {
         Some(u32::from_be_bytes([s[16], s[17], s[18], s[19]]))
     }
 
+    /// The RRSIG's TYPE COVERED, the first two octets of its RDATA
+    /// (RFC 4034 §3.1.1), or `None` if this is not an RRSIG.
+    ///
+    /// Every signature lookup on the answer path filters a name's RRSIGs by
+    /// this field alone, and [`RecordData::parse`] answers it by decoding the
+    /// signer's name and copying the signature out. A signed negative answer
+    /// paid that once per RRSIG at the apex — five of them for the zone the
+    /// tests use, and the field is at a fixed offset.
+    pub fn rrsig_type_covered(&self) -> Option<Rtype> {
+        if self.rtype != crate::utils::record_types::RRSIG {
+            return None;
+        }
+        let covered: [u8; 2] = self.rdata.get(..2)?.try_into().ok()?;
+        Some(Rtype::new(u16::from_be_bytes(covered)))
+    }
+
     /// The five 32-bit fields an SOA carries after MNAME and RNAME.
     ///
     /// [`RecordData::parse`] answers the same questions and allocates four times
@@ -190,6 +206,51 @@ mod tests {
             assert_eq!(soa.soa_serial(), Some(serial), "{mname} {rname}");
             assert_eq!(soa.soa_minimum(), Some(minimum), "{mname} {rname}");
         }
+    }
+
+    /// TYPE COVERED is at a fixed offset, but so is every other RRSIG field,
+    /// so reading the wrong one still returns a plausible `Rtype`. `parse` is
+    /// the reference, over types whose codes cannot be confused with the
+    /// algorithm or label bytes beside them.
+    #[test]
+    fn rrsig_type_covered_agrees_with_the_full_parse() {
+        for covered in [rt::A, rt::SOA, rt::NSEC3, Rtype::new(64_999)] {
+            let rrsig = RecordData::from_parsed(&ParsedRecord::RRSIG {
+                type_covered: covered,
+                algorithm: 13,
+                labels: 2,
+                original_ttl: 3600,
+                inception: 1_700_000_000,
+                expiration: 1_702_592_000,
+                key_tag: 0x1234,
+                signer_name: "example.com.".to_string(),
+                signature: vec![0xab; 64],
+            })
+            .expect("encode");
+
+            let Ok(ParsedRecord::RRSIG { type_covered, .. }) = rrsig.parse() else {
+                panic!("an RRSIG parses as an RRSIG");
+            };
+            assert_eq!(
+                rrsig.rrsig_type_covered(),
+                Some(type_covered),
+                "{covered:?}"
+            );
+        }
+    }
+
+    /// Not an RRSIG, and the empty RRSIG that RFC 2136 §2.5.2 spells to delete
+    /// an RRset: neither may answer with a type read out of whatever is there.
+    /// A *truncated* one cannot be built — [`RecordData::new`] parses — so the
+    /// bounds check covers only the empty case and stays because the field
+    /// offset is not the constructor's invariant.
+    #[test]
+    fn rrsig_type_covered_refuses_anything_it_cannot_read() {
+        let a = RecordData::new(rt::A, vec![192, 0, 2, 1]).expect("an A record");
+        assert_eq!(a.rrsig_type_covered(), None);
+
+        let empty = RecordData::new(rt::RRSIG, Vec::new()).expect("delete this RRset");
+        assert_eq!(empty.rrsig_type_covered(), None, "no octets are not a TYPE");
     }
 
     /// Neither accessor answers for a record that is not an SOA, however much

@@ -1932,9 +1932,15 @@ The signed row is not comparable across the two runs and so is not overwritten.
 153.0 is an NSEC3 zone on Linux; the Windows re-measurement used a small
 NSEC-signed zone, where the same shape reads **147.0 before 27b's second half and
 141.0 after**. Six, against five on every unsigned shape: a signed negative
-answer carries one more record. The bulk of it is `dnssec_answer` building owned
-`ResourceRecord`s for the proofs, which the writer takes but does not yet remove
-— see #27e.
+answer carries one more record. The bulk of it was *not* `dnssec_answer` building
+owned `ResourceRecord`s, which is what this said and what #27e was filed to
+remove — it was the RRSIG filter in front of them, and #27e's first half took it
+out. That leaves the records, and the writer still wants them.
+
+A third run, for #27e, reads **124.0 before that half and 44.0 after** on the
+same zone. It is a third number rather than a correction of the 141 because the
+141's query shape is not written down and this one's is: a fresh QNAME per
+datagram, EDNS with DO, which is what a random-subdomain flood sends.
 
 Twenty-one when this was filed. **Seven now**: #28b and #28c took two folds out,
 27a took the rest of the folds and the `to_string`, 27c took the two `Vec`
@@ -2217,6 +2223,68 @@ Do not start this before measuring which of the seven dominates. Two of them
 (`negative_proof` at 114, `answer_signatures` at 22) are already counted in
 `allocations.rs`, so the split is one run away.
 
+**The split was run, and the answer was none of the seven — done 2026-09-02.**
+Per call, on the eight-record zone `allocations.rs` signs:
+
+| | NSEC | NSEC3 | after |
+|---|---:|---:|---:|
+| `negative_proof`, NXDOMAIN | 114 | 189 | 34 / 129 |
+| — `proof_of_absence` | 26 | 89 | 10 / 71 |
+| — `wildcard_denial` | 47 | 59 | 15 / 49 |
+| — `soa_signatures` | 38 | 38 | 6 / 6 |
+| — of which `signatures_at` | 36 | 36 | 4 / 4 |
+| `negative_proof`, NODATA | 71 | 75 | 15 / 35 |
+| `answer_signatures`, A at a signed name | 30 | 22 | 6 / 6 |
+| `delegation_proof` | 34 | 38 | 10 / 30 |
+
+`signatures_at` returned **one** record for 36 allocations, and it is inside
+every other row: `push_with_signatures` calls it once per denial record. The
+cause was `rrsig_of`, which built an owned `ResourceRecord` and called
+`RecordData::parse` — decoding the signer's name and copying the signature out —
+to read TYPE COVERED, the first two octets of the RDATA (RFC 4034 §3.1.1). The
+apex carries an RRSIG per RRset and the filter parsed every one of them to keep
+the one it wanted — about nine allocations each.
+
+Fixed as `RecordData::rrsig_type_covered`, beside `soa_minimum`, which is the
+same shape for the same reason: an accessor that reads the field at its offset
+rather than a parse that allocates for the fields nobody asked for. The owner
+comparison in `answer_signatures` went with it — `Rrsig::owner` *is*
+`canonical_name(&rr.name)`, so it is `names_equal`, which allocates nothing.
+`push_covering_nsec3` also cloned the `ZoneRecord` it had just borrowed, for
+nothing.
+
+    daemon, per query        before   after
+    plain A                     3.0      3.0
+    NXDOMAIN, no DO             8.0      8.0
+    DO A, signed               35.0     11.0
+    DO NODATA, signed          81.0     25.0
+    DO NXDOMAIN, signed       124.0     44.0
+
+The library gate moves with it: `prove a signed NXDOMAIN` 114 to 34.
+
+**So the item as filed had the cost in the wrong place**, and would have moved
+seven functions to the writer for the fraction of a signed answer that is
+actually records. The instruction to measure first is the only reason that did
+not happen; it is worth more than the plan it guarded.
+
+And the after column says where to look next, which is not the writer either.
+Under NSEC the records are now most of what is left, so #27e as written applies.
+Under NSEC3 they are not: 129 against 34 for the same answer, concentrated in
+`proof_of_absence` and `wildcard_denial`, which is the closest-encloser walk —
+`Nsec3Chain::of` re-derived per call, and an owner name per candidate built with
+`format!` around a fresh base32 `String` and a `to_lowercase` of it. #25d bounded
+the *hashing*; the naming around it was not measured then. Measure that before
+the writer, the same way this was.
+
+Whichever comes first, the DNSKEY probe `is_signed` still runs at the top of each
+of the four entry points, and each run is a `Zone::query` `Vec`.
+
+Verified: 440 reply shapes (220 each over an NSEC- and an NSEC3-signed zone,
+every combination of ten names, eleven QTYPEs and DO) structurally identical to
+the previous build, with the RRSIG fields a fresh signing run changes masked;
+dnspython validating the DNSKEY RRset, an A answer, and every denial record in
+an NXDOMAIN and a NODATA against it.
+
 #### The cost this pays, said out loud
 
 Two message shapes, which is §7's own warning. The mitigation is direction: the
@@ -2229,15 +2297,24 @@ has nothing to borrow from.
 #### What still allocates afterwards
 
 So "zero" is not overclaimed: TSIG signing, DO=1 against a signed zone
-(`answer_signatures` 22, `negative_proof` 114 after #25d), a new peer entering
-the bounded tables, reloads and transfers.
+(`answer_signatures` 6, `negative_proof` 34 under NSEC and 129 under NSEC3 after
+#27e's first half), a new peer
+entering the bounded tables, reloads and transfers.
 
 #### The gate
 
 `rdns/tests/allocations.rs` cannot see `rdnsd`, so the daemon figure needs the
-dhat harness above — start it, send a fixed count, `SIGTERM`, subtract a
-zero-query baseline. Each stage measured before and after in the same session,
-as #13's were. The library counts stay the first gate, and they now cover the
+dhat harness above — start it, send a fixed count, stop it *gracefully*, and take
+the **slope** of two runs at different counts rather than subtracting a
+zero-query baseline: startup is not the same in a run that then serves, and a
+baseline subtraction read 3.0 as 3.0 only by luck. Two things #27e's run had to
+find out. dhat's per-program-point `tb` is bytes and `tbk` is blocks, so a total
+summed from the wrong field reads eighty times high and is still linear in the
+query count, which is the check that was supposed to catch a bad number. And on
+Windows the stop has to be a `CTRL_BREAK_EVENT` to a process group of its own:
+`TerminateProcess`, which is what every kill utility and `Popen.terminate` do,
+runs no destructor and writes no `dhat-heap.json`. Each stage measured before and
+after in the same session, as #13's were. The library counts stay the first gate, and they now cover the
 shapes that hid a site: the suite read the TSIG scan as free because it only ever
 measured a query with no additional section, where `find_tsig` returns before its
 body.

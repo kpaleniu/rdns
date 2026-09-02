@@ -8,8 +8,9 @@
 //!
 //! An unsigned zone gets nothing, whatever DO says.
 
-use crate::dnssec::{canonical_name, rrsigs_in, Rrsig};
+use crate::dnssec::canonical_name;
 use crate::dnssec_denial::{base32hex_encode, nsec3_hash, Nsec3};
+use crate::utils::names_equal;
 use crate::utils::record_types as rt;
 use crate::zone::{NameKind, Zone, ZoneRecord};
 use crate::Qtype;
@@ -49,17 +50,19 @@ pub fn answer_signatures(zone: &Zone, qname: &str, qtype: Qtype) -> AnswerSignat
     let qname = canonical_name(qname);
     let mut out = AnswerSignatures::default();
     for record in zone.query(&qname, Qtype::of(rt::RRSIG)) {
-        let Some(sig) = rrsig_of(record) else {
+        let Some(type_covered) = record.rdata.rrsig_type_covered() else {
             continue;
         };
         // `Qtype::matches`, not `== qtype`: no RRSIG covers a QTYPE, so ANY
         // (255) would match nothing and hand back a signed name's data unsigned.
         // The same rule excludes the DNSSEC meta types (RFC 4035 §3.1.1).
-        if !qtype.matches(sig.type_covered) {
+        if !qtype.matches(type_covered) {
             continue;
         }
-        if sig.owner != qname {
-            out.wildcard = Some(sig.owner.clone());
+        // An RRSIG's owner is the record's own name, so this is the wildcard
+        // test without the parse: `query` fell back to `*.<encloser>`.
+        if !names_equal(&record.name, &qname) {
+            out.wildcard = Some(canonical_name(&record.name));
         }
         out.records.push(ResourceRecord {
             name: qname.clone(),
@@ -238,7 +241,7 @@ fn signatures_at(zone: &Zone, name: &str, rtype: Rtype) -> Vec<ResourceRecord> {
     }
     zone.query(name, Qtype::of(rt::RRSIG))
         .into_iter()
-        .filter(|r| rrsig_of(r).is_some_and(|s| s.type_covered == rtype))
+        .filter(|r| r.rdata.rrsig_type_covered() == Some(rtype))
         .map(to_resource)
         .collect()
 }
@@ -342,10 +345,10 @@ fn push_covering_nsec3(
     let Some(hash) = params.hash(name) else {
         return;
     };
-    let Some(record) = zone.nsec3_covering(&hash).cloned() else {
+    let Some(record) = zone.nsec3_covering(&hash) else {
         return;
     };
-    push_with_signatures(zone, &record, out);
+    push_with_signatures(zone, record, out);
 }
 
 /// The deepest ancestor of `qname` the zone holds a name for. Under NSEC every
@@ -387,10 +390,6 @@ fn parent(name: &str) -> Option<String> {
     let trimmed = name.trim_end_matches('.');
     let (_, rest) = trimmed.split_once('.')?;
     Some(canonical_name(rest))
-}
-
-fn rrsig_of(record: &ZoneRecord) -> Option<Rrsig> {
-    rrsigs_in(&[to_resource(record)]).into_iter().next()
 }
 
 fn to_resource(record: &ZoneRecord) -> ResourceRecord {

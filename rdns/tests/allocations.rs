@@ -940,13 +940,15 @@ fn ordering_two_names_canonically() {
 /// A range, because it is proportional to the records the proof needs rather
 /// than to anything fixed. It is here because it is the shape a random-subdomain
 /// flood generates: **142** before the canonical ordering above stopped
-/// allocating, 114 after.
+/// allocating, 114 after, and **34** since the RRSIG filter stopped parsing.
 ///
 /// So the ordering was 28 of the 142 and not, as `TODO.md` #25d implied, most of
-/// it. What is left is the records themselves — each of the five is an owner
-/// `String` and a cloned RDATA — plus a `Zone::query` `Vec` per lookup and the
-/// `String` and bitmap `Vec` that reading each NSEC costs. Those are what a
-/// response written straight to the wire would remove, and nothing smaller.
+/// it. Most of it was `signatures_at`, which read TYPE COVERED by decoding each
+/// candidate RRSIG whole — 36 allocations for the one signature over the apex
+/// SOA. What is left is the records themselves, each an owner `String` and a
+/// cloned RDATA, plus a `Zone::query` `Vec` per lookup: those are what a
+/// response written straight to the wire would remove (`TODO.md` #27e), and
+/// nothing smaller.
 fn proving_a_signed_nxdomain() {
     let signed = signed_zone();
     let _warm =
@@ -960,7 +962,7 @@ fn proving_a_signed_nxdomain() {
         5,
         "SOA, its RRSIG, and two denials with theirs"
     );
-    within("prove a signed NXDOMAIN", count, 100..=130);
+    within("prove a signed NXDOMAIN", count, 30..=40);
 }
 
 /// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate
