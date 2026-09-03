@@ -949,8 +949,10 @@ fn ordering_two_names_canonically() {
 /// A range, because it is proportional to the records the proof needs rather
 /// than to anything fixed. It is here because it is the shape a random-subdomain
 /// flood generates: **142** before the canonical ordering above stopped
-/// allocating, 114 after, **34** since the RRSIG filter stopped parsing, and 29
-/// since an NXDOMAIN stopped asking whether the zone is signed twice.
+/// allocating, 114 after, **34** since the RRSIG filter stopped parsing, 29
+/// since an NXDOMAIN stopped asking whether the zone is signed twice, and 24
+/// since the walk to the closest encloser stopped building a `String` per
+/// ancestor.
 ///
 /// So the ordering was 28 of the 142 and not, as `TODO.md` #25d implied, most of
 /// it. Most of it was `signatures_at`, which read TYPE COVERED by decoding each
@@ -972,7 +974,7 @@ fn proving_a_signed_nxdomain() {
         5,
         "SOA, its RRSIG, and two denials with theirs"
     );
-    within("prove a signed NXDOMAIN", count, 25..=35);
+    within("prove a signed NXDOMAIN", count, 20..=30);
 }
 
 /// The same NXDOMAIN over an NSEC3-signed zone, where the proof is a walk and
@@ -981,7 +983,9 @@ fn proving_a_signed_nxdomain() {
 /// encloser is a hash per label of the QNAME.
 ///
 /// **129** when it was first split out of the NSEC figure above, 76 once the
-/// naming stopped allocating, 48 once the walk ran once.
+/// naming stopped allocating, 48 once the walk ran once, 38 once the chain's
+/// salt and iteration count were read at their offset instead of parsed out of
+/// a record per answer, and 28 once the walk itself stopped allocating.
 ///
 /// The naming around the hashing was the cost, not the hashing: an owner name
 /// was `format!("{}.{origin}", base32hex_encode(h).to_lowercase())`, three
@@ -1001,7 +1005,7 @@ fn proving_a_signed_nxdomain_under_nsec3() {
     // wildcard, and `push_with_signatures` drops the identical second copy —
     // which it could not while the two halves each built their own `Vec`.
     assert_eq!(proof.len(), 5, "the SOA's RRSIG and two NSEC3s with theirs");
-    within("prove a signed NXDOMAIN under NSEC3", count, 40..=50);
+    within("prove a signed NXDOMAIN under NSEC3", count, 24..=34);
 }
 
 /// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate

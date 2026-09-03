@@ -2342,6 +2342,38 @@ NSEC3s and their signatures where NSEC sends one, plus `Nsec3Chain::of` parsing
 a record out of the chain per answer to read a salt and an iteration count the
 zone has known since it loaded.
 
+**Both of those went next — 2026-09-03**, and the split above was again the only
+reason the right one was picked: `proof_of_absence` was 38 of the NXDOMAIN's 48,
+and the NODATA path, which has no walk at all, was 25.
+
+- **`RecordData::nsec3_parameters`**, beside `soa_minimum` and
+  `rrsig_type_covered` and for the same reason (RFC 5155 §3.2: both fields sit
+  ahead of the two variable-length ones). `Nsec3Chain::of` was cloning the
+  record, decoding it, and keeping two of six fields; it now borrows the salt out
+  of the zone. NXDOMAIN 48 → 38, NODATA 25 → 15, `delegation_proof` 20 → 10.
+- **The ancestor walk by suffix.** `closest_encloser`, `nsec_closest_encloser`
+  and `child_towards` returned `String` and re-normalized their arguments, so
+  each ancestor was a fresh allocation and the local `parent` was a third copy of
+  `utils::parent_name` (§7). An absolute name's parent *is* a suffix of it, and
+  every caller has already made the name absolute, so all three return `&str`
+  now. NXDOMAIN 38 → 28 under NSEC3 and 29 → 24 under NSEC.
+
+The library gate over the two passes, which is what was measured — no daemon run
+was taken for either, so there is no per-query figure to quote:
+
+    negative_proof, NXDOMAIN   as filed   now
+    NSEC                             34    24
+    NSEC3                           129    28
+
+Verified: the same 660 reply shapes against the previous commit's binary, 0
+differ — this pass changes no output, unlike the one before it. dnspython
+validated 38 RRsets over two zones × two chains, denial records included.
+
+What is left now is #27e as filed: the records themselves. `proof_of_absence`
+under NSEC3 is 18 and under NSEC 9, and the difference is one extra denial record
+with its signature — an owner `String` and a cloned RDATA each, a `Vec` spine per
+lookup. That is the writer's to remove, and nothing smaller.
+
 Verified: 440 reply shapes (220 each over an NSEC- and an NSEC3-signed zone,
 every combination of ten names, eleven QTYPEs and DO) structurally identical to
 the previous build, with the RRSIG fields a fresh signing run changes masked;
@@ -2360,7 +2392,7 @@ has nothing to borrow from.
 #### What still allocates afterwards
 
 So "zero" is not overclaimed: TSIG signing, DO=1 against a signed zone
-(`answer_signatures` 6, `negative_proof` 29 under NSEC and 48 under NSEC3 after
+(`answer_signatures` 5, `negative_proof` 24 under NSEC and 28 under NSEC3 after
 #27e's first half), a new peer
 entering the bounded tables, reloads and transfers.
 

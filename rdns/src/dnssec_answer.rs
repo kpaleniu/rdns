@@ -9,9 +9,9 @@
 //! An unsigned zone gets nothing, whatever DO says.
 
 use crate::dnssec::canonical_name;
-use crate::dnssec_denial::{nsec3_hash_in, nsec3_owner_name, Nsec3, NSEC3_HASH_LEN};
-use crate::utils::names_equal;
+use crate::dnssec_denial::{nsec3_hash_in, nsec3_owner_name, NSEC3_HASH_LEN};
 use crate::utils::record_types as rt;
+use crate::utils::{names_equal, parent_name};
 use crate::zone::{NameKind, Zone, ZoneRecord};
 use crate::Qtype;
 use crate::ResourceRecord;
@@ -87,7 +87,7 @@ pub fn proof_of_absence(zone: &Zone, qname: &str) -> Vec<ResourceRecord> {
     let mut out = Vec::new();
     if zone.has_nsec3_chain() {
         if let Some((chain, encloser)) = Nsec3Chain::and_encloser(zone, &qname) {
-            chain.push_absence(zone, &qname, &encloser, &mut out);
+            chain.push_absence(zone, &qname, encloser, &mut out);
         }
     } else if let Some(nsec) = zone.nsec_covering(&qname) {
         push_with_signatures(zone, nsec, &mut out);
@@ -170,8 +170,8 @@ pub fn delegation_proof(zone: &Zone, cut: &str) -> Vec<ResourceRecord> {
 fn deny_the_name_and_its_wildcard(zone: &Zone, qname: &str, out: &mut Vec<ResourceRecord>) {
     if zone.has_nsec3_chain() {
         if let Some((chain, encloser)) = Nsec3Chain::and_encloser(zone, qname) {
-            chain.push_absence(zone, qname, &encloser, out);
-            chain.push_wildcard_denial(zone, &encloser, out);
+            chain.push_absence(zone, qname, encloser, out);
+            chain.push_wildcard_denial(zone, encloser, out);
         }
         return;
     }
@@ -257,28 +257,28 @@ fn push_with_signatures(zone: &Zone, record: &ZoneRecord, out: &mut Vec<Resource
 /// lookups that go through them.
 ///
 /// Not [`crate::dnssec_denial::Nsec3Params`], the borrowed triple one *record*
-/// hashes under: this is owned, derived from a whole zone, and answers questions
-/// about the chain.
-struct Nsec3Chain {
-    salt: Vec<u8>,
+/// hashes under: this is derived from a whole zone and answers questions about
+/// the chain.
+struct Nsec3Chain<'a> {
+    salt: &'a [u8],
     iterations: u16,
 }
 
-impl Nsec3Chain {
+impl<'a> Nsec3Chain<'a> {
     /// Read off the chain itself, not NSEC3PARAM: this server holds one chain
     /// rather than choosing between rollover chains (RFC 5155 §4.1), and an
     /// NSEC3PARAM left from a previous signing hashes every denial to nothing.
-    fn of(zone: &Zone) -> Option<Self> {
-        zone.any_nsec3()
-            .and_then(|r| Nsec3::from_record(&to_resource(r)))
-            .map(|n| Nsec3Chain {
-                salt: n.salt,
-                iterations: n.iterations,
-            })
+    ///
+    /// Read at its offset rather than parsed: the record is the zone's, so the
+    /// salt is borrowed, and a full decode copies the next hashed owner and the
+    /// type bitmap that nothing here looks at.
+    fn of(zone: &'a Zone) -> Option<Self> {
+        let (iterations, salt) = zone.any_nsec3()?.rdata.nsec3_parameters()?;
+        Some(Nsec3Chain { salt, iterations })
     }
 
     fn hash(&self, name: &str) -> Option<[u8; NSEC3_HASH_LEN]> {
-        nsec3_hash_in(name, &self.salt, self.iterations).ok()
+        nsec3_hash_in(name, self.salt, self.iterations).ok()
     }
 
     fn owner(&self, zone: &Zone, name: &str) -> Option<String> {
@@ -287,7 +287,7 @@ impl Nsec3Chain {
 
     /// The chain and the closest encloser of `qname` — what every NSEC3 proof
     /// about that name starts from, derived once.
-    fn and_encloser(zone: &Zone, qname: &str) -> Option<(Self, String)> {
+    fn and_encloser<'n>(zone: &'a Zone, qname: &'n str) -> Option<(Self, &'n str)> {
         let chain = Self::of(zone)?;
         let encloser = chain.closest_encloser(zone, qname)?;
         Some((chain, encloser))
@@ -304,7 +304,7 @@ impl Nsec3Chain {
     ) {
         push_matching_nsec3(zone, self, encloser, out);
         if let Some(next_closer) = child_towards(qname, encloser) {
-            push_covering_nsec3(zone, self, &next_closer, out);
+            push_covering_nsec3(zone, self, next_closer, out);
         }
     }
 
@@ -318,20 +318,22 @@ impl Nsec3Chain {
     /// Walked rather than looked up by name: under NSEC3 an empty non-terminal
     /// has an NSEC3 and no records, so the index would miss it and the proof
     /// would name the wrong encloser.
-    fn closest_encloser(&self, zone: &Zone, qname: &str) -> Option<String> {
-        let origin = canonical_name(zone.origin());
-        let mut name = canonical_name(qname);
+    ///
+    /// `qname` must be absolute, which every caller here has already made it —
+    /// each ancestor is then a suffix of it rather than a new `String`.
+    fn closest_encloser<'n>(&self, zone: &Zone, qname: &'n str) -> Option<&'n str> {
+        let mut name = qname;
         loop {
             if self
-                .owner(zone, &name)
+                .owner(zone, name)
                 .is_some_and(|owner| zone.holds_name(&owner))
             {
                 return Some(name);
             }
-            if name == origin {
+            if names_equal(name, zone.origin()) {
                 return None;
             }
-            name = parent(&name)?;
+            name = parent_name(name)?;
         }
     }
 }
@@ -368,42 +370,33 @@ fn push_covering_nsec3(
 /// The deepest ancestor of `qname` the zone holds a name for. Under NSEC every
 /// name in the chain has a record, empty non-terminals included, so the index
 /// answers this directly.
-fn nsec_closest_encloser(zone: &Zone, qname: &str) -> Option<String> {
-    let origin = canonical_name(zone.origin());
-    let mut name = canonical_name(qname);
+fn nsec_closest_encloser<'n>(zone: &Zone, qname: &'n str) -> Option<&'n str> {
+    let mut name = qname;
     loop {
-        if zone.holds_name(&name) {
+        if zone.holds_name(name) {
             return Some(name);
         }
-        if name == origin {
+        if names_equal(name, zone.origin()) {
             return None;
         }
-        name = parent(&name)?;
+        name = parent_name(name)?;
     }
 }
 
 /// The name one label below `encloser` on the way to `qname` — the "next
 /// closer" name of RFC 5155 §1.3.
-fn child_towards(qname: &str, encloser: &str) -> Option<String> {
-    let qname = canonical_name(qname);
-    let encloser = canonical_name(encloser);
-    if qname == encloser {
+fn child_towards<'n>(qname: &'n str, encloser: &str) -> Option<&'n str> {
+    if names_equal(qname, encloser) {
         return None;
     }
     let mut name = qname;
     loop {
-        let up = parent(&name)?;
-        if up == encloser {
+        let up = parent_name(name)?;
+        if names_equal(up, encloser) {
             return Some(name);
         }
         name = up;
     }
-}
-
-fn parent(name: &str) -> Option<String> {
-    let trimmed = name.trim_end_matches('.');
-    let (_, rest) = trimmed.split_once('.')?;
-    Some(canonical_name(rest))
 }
 
 fn to_resource(record: &ZoneRecord) -> ResourceRecord {

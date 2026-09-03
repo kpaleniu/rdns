@@ -127,6 +127,22 @@ impl RecordData {
         Some(Rtype::new(u16::from_be_bytes(covered)))
     }
 
+    /// The NSEC3's iteration count and salt (RFC 5155 §3.2), or `None` if this
+    /// is not an NSEC3.
+    ///
+    /// Both fields sit at a fixed offset ahead of the two variable-length ones,
+    /// so reading them is arithmetic. Every negative answer over an NSEC3 zone
+    /// asks the chain what it was built with, and [`RecordData::parse`] answers
+    /// by copying out the salt, the next hashed owner and the type bitmap.
+    pub fn nsec3_parameters(&self) -> Option<(u16, &[u8])> {
+        if self.rtype != crate::utils::record_types::NSEC3 {
+            return None;
+        }
+        let iterations = u16::from_be_bytes(self.rdata.get(2..4)?.try_into().ok()?);
+        let salt_len = *self.rdata.get(4)? as usize;
+        Some((iterations, self.rdata.get(5..5 + salt_len)?))
+    }
+
     /// The five 32-bit fields an SOA carries after MNAME and RNAME.
     ///
     /// [`RecordData::parse`] answers the same questions and allocates four times
