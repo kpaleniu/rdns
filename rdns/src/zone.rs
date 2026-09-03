@@ -11,6 +11,7 @@ use crate::{ParsedRecord, Qtype, RecordData};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 /// A single DNS resource record stored in a zone
@@ -238,9 +239,11 @@ impl Zone {
 
     /// The NSEC3 whose span contains `hash`. Same rule, in hash order.
     pub fn nsec3_covering(&self, hash: &[u8]) -> Option<&ZoneRecord> {
+        // `..hash`, not `..hash.to_vec()`: the bound only has to compare, and
+        // the copy was an allocation per covering lookup.
         let position = self
             .nsec3_chain
-            .range(..hash.to_vec())
+            .range::<[u8], (Bound<&[u8]>, Bound<&[u8]>)>((Bound::Unbounded, Bound::Excluded(hash)))
             .next_back()
             .or_else(|| self.nsec3_chain.iter().next_back())?;
         Some(&self.records[*position.1])

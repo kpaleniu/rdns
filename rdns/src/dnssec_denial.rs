@@ -5,7 +5,7 @@
 //! RFC 4034 §6.1 — not string order — and, for NSEC3, the salted iterated hash
 //! of RFC 5155 §5.
 
-use crate::dname::dname_to_bytes;
+use crate::dname::{dname_to_bytes_in, MAX_NAME_LEN};
 use crate::error::{DnssecError, DnssecResult};
 use crate::utils::record_types as rt;
 use crate::Rtype;
@@ -20,6 +20,10 @@ use std::cmp::Ordering;
 /// recommends 0. Over the cap we error, which the chain validator turns into
 /// "insecure" rather than "bogus".
 pub const MAX_NSEC3_ITERATIONS: u16 = 150;
+
+/// The length of an NSEC3 hash. SHA-1 is the only algorithm RFC 5155 §5
+/// defines, and the registry it points at has had no second entry since.
+pub const NSEC3_HASH_LEN: usize = 20;
 
 /// Compare two names in DNSSEC canonical order (RFC 4034 §6.1).
 ///
@@ -190,9 +194,38 @@ pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>> {
 /// base32hex (RFC 4648 §7): how an NSEC3 owner label carries a hash.
 const BASE32HEX: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
 
+/// The same alphabet down-cased, for [`nsec3_owner_name`]. A second table
+/// rather than a fold of the first: the fold was the allocation.
+const BASE32HEX_LOWER: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+
+/// The number of base32hex characters `len` octets encode to, unpadded.
+fn base32hex_len(len: usize) -> usize {
+    (len * 8).div_ceil(5)
+}
+
+/// The owner name of the NSEC3 record for `hash` in `origin`: the hash as a
+/// base32hex label (RFC 5155 §3.3), prepended to the zone.
+///
+/// Down-cased, because that is the form this server's signer writes and the
+/// zone index folds to. It was spelled out per module as
+/// `format!("{}.{origin}", base32hex_encode(h).to_lowercase())` — three
+/// allocations where one does, and a Unicode fold over ASCII (CLAUDE.md §8).
+pub fn nsec3_owner_name(hash: &[u8], origin: &str) -> String {
+    let mut out = String::with_capacity(base32hex_len(hash.len()) + 1 + origin.len());
+    encode_base32hex(hash, BASE32HEX_LOWER, &mut out);
+    out.push('.');
+    out.push_str(origin);
+    out
+}
+
 /// Encode bytes as unpadded base32hex.
 pub fn base32hex_encode(data: &[u8]) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(base32hex_len(data.len()));
+    encode_base32hex(data, BASE32HEX, &mut out);
+    out
+}
+
+fn encode_base32hex(data: &[u8], alphabet: &[u8; 32], out: &mut String) {
     for chunk in data.chunks(5) {
         let mut buf = [0u8; 5];
         buf[..chunk.len()].copy_from_slice(chunk);
@@ -202,10 +235,9 @@ pub fn base32hex_encode(data: &[u8]) -> String {
         let chars = (chunk.len() * 8).div_ceil(5);
         for i in 0..chars {
             let shift = 35 - i * 5;
-            out.push(BASE32HEX[((bits >> shift) & 0x1f) as usize] as char);
+            out.push(alphabet[((bits >> shift) & 0x1f) as usize] as char);
         }
     }
-    out
 }
 
 /// Decode unpadded base32hex. Case-insensitive, as DNS labels are.
@@ -246,23 +278,43 @@ pub fn base32hex_decode(text: &str) -> DnssecResult<Vec<u8>> {
 /// The salt is appended at every round, and round zero's input is the down-cased
 /// *wire-format* name, not its text.
 pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Vec<u8>> {
+    Ok(nsec3_hash_in(name, salt, iterations)?.to_vec())
+}
+
+/// [`nsec3_hash`] without allocating.
+///
+/// SHA-1 is the only algorithm RFC 5155 §5 defines, so the digest is twenty
+/// octets and neither it nor the wire name it starts from needs the heap. The
+/// closest-encloser walk hashes a name per label of the QNAME and each
+/// iteration used to rebuild the digest as a fresh `Vec`.
+pub fn nsec3_hash_in(
+    name: &str,
+    salt: &[u8],
+    iterations: u16,
+) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
     if iterations > MAX_NSEC3_ITERATIONS {
         return Err(DnssecError::parse(format!(
             "NSEC3 iteration count {iterations} exceeds the {MAX_NSEC3_ITERATIONS} we will compute (RFC 9276)",
         )));
     }
-    let wire = dname_to_bytes(&name.to_ascii_lowercase())?;
+    let mut buf = [0u8; MAX_NAME_LEN];
+    let len = dname_to_bytes_in(name, &mut buf)?;
+    let wire = &mut buf[..len];
+    // Down-cased in the encoded form rather than in the text: a length octet is
+    // at most 63 (RFC 1035 §2.3.4) and `A` is 65, so no length is touched.
+    wire.make_ascii_lowercase();
 
+    let mut digest = [0u8; NSEC3_HASH_LEN];
     let mut hasher = Sha1::new();
     hasher.update(&wire);
     hasher.update(salt);
-    let mut digest = hasher.finalize().to_vec();
+    digest.copy_from_slice(&hasher.finalize());
 
     for _ in 0..iterations {
         let mut hasher = Sha1::new();
-        hasher.update(&digest);
+        hasher.update(digest);
         hasher.update(salt);
-        digest = hasher.finalize().to_vec();
+        digest.copy_from_slice(&hasher.finalize());
     }
     Ok(digest)
 }
@@ -1547,7 +1599,7 @@ mod tests {
         let salt = vec![0x01, 0x02];
         let hash = nsec3_hash(name, &salt, 5).expect("hash");
         Nsec3 {
-            owner: format!("{}.example.com.", base32hex_encode(&hash).to_lowercase()),
+            owner: nsec3_owner_name(&hash, "example.com."),
             next_hashed_owner: hash_step(&hash, true),
             owner_hash: hash,
             zone: "example.com.".into(),
@@ -1567,7 +1619,7 @@ mod tests {
         let hash = nsec3_hash(name, &salt, 5).expect("hash");
         let low = hash_step(&hash, false);
         Nsec3 {
-            owner: format!("{}.example.com.", base32hex_encode(&low).to_lowercase()),
+            owner: nsec3_owner_name(&low, "example.com."),
             owner_hash: low,
             zone: "example.com.".into(),
             hash_algorithm: 1,
@@ -1602,7 +1654,7 @@ mod tests {
         let salt = vec![0x01, 0x02];
         let hash = nsec3_hash(name, &salt, 5).unwrap();
         Nsec3 {
-            owner: format!("{}.{}", base32hex_encode(&hash).to_lowercase(), zone),
+            owner: nsec3_owner_name(&hash, zone),
             owner_hash: hash,
             zone: zone.to_string(),
             hash_algorithm: 1,

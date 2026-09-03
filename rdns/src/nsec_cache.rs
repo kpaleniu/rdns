@@ -937,7 +937,7 @@ fn evict_zone(zones: &mut HashMap<NameKeyBuf, ZoneProofs>, now: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dnssec_denial::{base32hex_encode, build_type_bitmap, nsec3_hash};
+    use crate::dnssec_denial::{build_type_bitmap, nsec3_hash, nsec3_owner_name};
     use crate::Class;
     use crate::Serial;
     use crate::{OpCode, QueryClass, QuerySection, RecordData};
@@ -984,7 +984,7 @@ mod tests {
         let salt = vec![0xaa, 0xbb];
         let hash = nsec3_hash(name, &salt, 3).unwrap();
         ResourceRecord {
-            name: format!("{}.{}", base32hex_encode(&hash).to_lowercase(), zone),
+            name: nsec3_owner_name(&hash, zone),
             class: Class::new(1),
             ttl,
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
@@ -1069,7 +1069,7 @@ mod tests {
             let mut next = hash.clone();
             *next.last_mut().unwrap() = 0xff;
             authority.push(ResourceRecord {
-                name: format!("{}.example.com.", base32hex_encode(&hash).to_lowercase()),
+                name: nsec3_owner_name(&hash, "example.com."),
                 class: Class::new(1),
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
@@ -1494,7 +1494,7 @@ mod tests {
     /// rather than by finding names that hash where they are wanted.
     fn nsec3_span(owner: &[u8], next: &[u8], types: &[Rtype]) -> ResourceRecord {
         ResourceRecord {
-            name: format!("{}.example.com.", base32hex_encode(owner).to_lowercase()),
+            name: nsec3_owner_name(owner, "example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {

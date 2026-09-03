@@ -22,7 +22,7 @@ use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Rrset, RrsetProof};
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::utils::{current_unix_timestamp, record_types};
 use rdns::zone::{parse_zone_file, NameKind};
-use rdns::zone_signer::{sign_zone, SigningPolicy};
+use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
 use rdns::{
     DnsMessage, Edns, EdnsOption, OpCode, Qtype, QueryClass, QuerySection, ResourceRecord,
     ResponseCode,
@@ -119,6 +119,7 @@ fn allocation_counts() {
     ordering_two_names_canonically();
     building_the_metrics_registry();
     proving_a_signed_nxdomain();
+    proving_a_signed_nxdomain_under_nsec3();
     verifying_an_rrset_against_two_candidate_signatures();
     a_busy_neighbour_stays_out_of_the_count();
 }
@@ -865,6 +866,14 @@ fn comparing_two_names_allocates_nothing() {
 /// [`ZONE`] signed by a KSK and a ZSK, which is the ordinary shape: an RRset
 /// carries one RRSIG and the DNSKEY RRset carries two.
 fn signed_zone() -> rdns::zone::Zone {
+    signed_zone_with(DenialChain::Nsec)
+}
+
+fn signed_zone_nsec3() -> rdns::zone::Zone {
+    signed_zone_with(DenialChain::nsec3())
+}
+
+fn signed_zone_with(chain: DenialChain) -> rdns::zone::Zone {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let keys = vec![
         SigningKey::generate(
@@ -883,7 +892,7 @@ fn signed_zone() -> rdns::zone::Zone {
     sign_zone(
         &zone,
         &keys,
-        &SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400),
+        &SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400).with_chain(chain),
     )
     .expect("sign")
 }
@@ -940,7 +949,8 @@ fn ordering_two_names_canonically() {
 /// A range, because it is proportional to the records the proof needs rather
 /// than to anything fixed. It is here because it is the shape a random-subdomain
 /// flood generates: **142** before the canonical ordering above stopped
-/// allocating, 114 after, and **34** since the RRSIG filter stopped parsing.
+/// allocating, 114 after, **34** since the RRSIG filter stopped parsing, and 29
+/// since an NXDOMAIN stopped asking whether the zone is signed twice.
 ///
 /// So the ordering was 28 of the 142 and not, as `TODO.md` #25d implied, most of
 /// it. Most of it was `signatures_at`, which read TYPE COVERED by decoding each
@@ -962,7 +972,36 @@ fn proving_a_signed_nxdomain() {
         5,
         "SOA, its RRSIG, and two denials with theirs"
     );
-    within("prove a signed NXDOMAIN", count, 30..=40);
+    within("prove a signed NXDOMAIN", count, 25..=35);
+}
+
+/// The same NXDOMAIN over an NSEC3-signed zone, where the proof is a walk and
+/// not a lookup: a hash chain cannot point at a name, so the answer names the
+/// closest encloser and the next closer name (RFC 5155 §7.2.1), and finding the
+/// encloser is a hash per label of the QNAME.
+///
+/// **129** when it was first split out of the NSEC figure above, 76 once the
+/// naming stopped allocating, 48 once the walk ran once.
+///
+/// The naming around the hashing was the cost, not the hashing: an owner name
+/// was `format!("{}.{origin}", base32hex_encode(h).to_lowercase())`, three
+/// allocations, and `nsec3_hash` rebuilt the digest as a `Vec` per iteration
+/// over a `Vec` of the wire name over a down-cased copy of the text — four more.
+/// Both are per *candidate* name, and the two halves of an NXDOMAIN each walked
+/// the QNAME to the same closest encloser.
+fn proving_a_signed_nxdomain_under_nsec3() {
+    let signed = signed_zone_nsec3();
+    let _warm =
+        rdns::dnssec_answer::negative_proof(&signed, "nope.example.com.", &NameKind::NotFound);
+
+    let (proof, count) = allocations(|| {
+        rdns::dnssec_answer::negative_proof(&signed, "nope.example.com.", &NameKind::NotFound)
+    });
+    // Five, not seven: one NSEC3 covers the next closer name *and* the
+    // wildcard, and `push_with_signatures` drops the identical second copy —
+    // which it could not while the two halves each built their own `Vec`.
+    assert_eq!(proof.len(), 5, "the SOA's RRSIG and two NSEC3s with theirs");
+    within("prove a signed NXDOMAIN under NSEC3", count, 40..=50);
 }
 
 /// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate

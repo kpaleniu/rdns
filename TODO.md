@@ -2279,6 +2279,69 @@ the writer, the same way this was.
 Whichever comes first, the DNSKEY probe `is_signed` still runs at the top of each
 of the four entry points, and each run is a `Zone::query` `Vec`.
 
+**The NSEC3 measurement was run, and the paragraph above had it right — done
+2026-09-03.** Per call, on the same eight-record zone:
+
+| | before | after |
+|---|---:|---:|
+| `negative_proof`, NXDOMAIN, NSEC3 | 129 | 48 |
+| `negative_proof`, NXDOMAIN, NSEC | 34 | 29 |
+| `proof_of_absence`, NSEC3 | 71 | — |
+| `negative_proof`, NODATA, NSEC3 | 35 | — |
+
+Split into the primitives it is made of, one NSEC3 owner name cost **ten**
+allocations: `nsec3_hash` four (a down-cased copy of the text, a `Vec` of labels
+and a `Vec` of wire bytes inside `dname_to_bytes`, and a fresh `Vec` per
+iteration for the digest), `base32hex_encode` three, `to_lowercase` one and
+`format!` two. The closest-encloser walk pays that per label of the QNAME, and an
+NXDOMAIN walked to the *same* encloser twice — once for the name, once for the
+wildcard.
+
+Three changes, in that order:
+
+- **`nsec3_hash_in`**, returning `[u8; 20]` — SHA-1 is the only algorithm
+  RFC 5155 §5 defines, so nothing about the length is a decision — over
+  `dname_to_bytes_in`, which writes into a caller's buffer, here a 255-octet
+  stack array. The down-casing moved onto the encoded form: a length octet is at
+  most 63 (RFC 1035 §2.3.4) and `A` is 65, so no length can be touched. Zero
+  allocations, and the per-iteration `Vec` goes with it, which is the validator's
+  cost as much as the server's (`nsec_cache` hashes at up to
+  `MAX_NSEC3_ITERATIONS`).
+- **`nsec3_owner_name(hash, origin)`** in `dnssec_denial`, one allocation with
+  the capacity computed. The `format!("{}.{origin}", base32hex_encode(h)
+  .to_lowercase())` it replaces was written out at ten sites across four modules
+  — §7, and the Unicode fold §8 forbids, harmless here only because base32hex is
+  ASCII by construction.
+- **The walk once per answer.** `negative_proof`'s NXDOMAIN arm is now
+  `deny_the_name_and_its_wildcard`, which derives the chain and the closest
+  encloser once and pushes both proofs into one `Vec`. That also dropped the
+  second `is_signed` — the entry point called the other entry point — which is
+  the 34 → 29 on the NSEC side, where there is no walk to save.
+
+**And it fixed a defect nobody had filed.** `push_with_signatures` refuses to
+push a record already in its `out`, under a comment saying one NSEC often denies
+both a name and the wildcard above it and the second copy is bytes on an
+amplification path. It could not fire across an NXDOMAIN's two halves under
+either chain, because each built its own `Vec` and the caller concatenated them.
+Wherever one denial record covers both the next closer name and the wildcard —
+which is what the comment describes — the answer carried it, and its RRSIG,
+twice.
+
+Verified: 660 reply shapes (fifteen names across two zones × eleven QTYPEs × DO,
+over an NSEC- and an NSEC3-signed build of both) against the previous commit's
+binary, decoded with `one_rr_per_rrset=True` — dnspython folds a repeated record
+into one RRset, which is precisely what was being looked for. 33 differ, all of
+them an NSEC3 NXDOMAIN with DO set, and a check on each says the two replies
+hold the same *set* of records with the new one holding no more copies of any.
+dnspython validated the DNSKEY RRset and every answer and denial record over
+both chains. Windows and Linux read the same counts, and clippy is clean on
+both.
+
+What is left under NSEC3 is the records: 48 against the NSEC side's 29 for two
+NSEC3s and their signatures where NSEC sends one, plus `Nsec3Chain::of` parsing
+a record out of the chain per answer to read a salt and an iteration count the
+zone has known since it loaded.
+
 Verified: 440 reply shapes (220 each over an NSEC- and an NSEC3-signed zone,
 every combination of ten names, eleven QTYPEs and DO) structurally identical to
 the previous build, with the RRSIG fields a fresh signing run changes masked;
@@ -2297,7 +2360,7 @@ has nothing to borrow from.
 #### What still allocates afterwards
 
 So "zero" is not overclaimed: TSIG signing, DO=1 against a signed zone
-(`answer_signatures` 6, `negative_proof` 34 under NSEC and 129 under NSEC3 after
+(`answer_signatures` 6, `negative_proof` 29 under NSEC and 48 under NSEC3 after
 #27e's first half), a new peer
 entering the bounded tables, reloads and transfers.
 

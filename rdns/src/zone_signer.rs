@@ -21,7 +21,7 @@
 
 use crate::dnssec::{canonical_name, Dnskey, Rrset};
 use crate::dnssec_denial::{
-    base32hex_encode, build_type_bitmap, canonical_sort_key, nsec3_hash, MAX_NSEC3_ITERATIONS,
+    build_type_bitmap, canonical_sort_key, nsec3_hash, nsec3_owner_name, MAX_NSEC3_ITERATIONS,
 };
 use crate::dnssec_key::SigningKey;
 use crate::error::DnssecError;
@@ -811,11 +811,7 @@ fn build_nsec3_chain(
         })
         .map_err(|e| DnssecError::key(format!("encoding an NSEC3: {e}")))?;
         signed.add_record(ZoneRecord {
-            name: format!(
-                "{}.{}",
-                base32hex_encode(hash).to_lowercase(),
-                layout.origin
-            ),
+            name: nsec3_owner_name(hash, &layout.origin),
             ttl,
             class: Class::new(1),
             rdata,
@@ -1368,7 +1364,7 @@ ns.plain IN A  192.0.2.40
                         salt, iterations, ..
                     } => {
                         let hash = nsec3_hash(name, salt, *iterations).unwrap();
-                        let owner = format!("{}.{ORIGIN}", base32hex_encode(&hash).to_lowercase());
+                        let owner = nsec3_owner_name(&hash, ORIGIN);
                         let Some(nsec3) = nsec3s.iter().find(|n| n.owner == owner) else {
                             panic!("{chain:?}: no NSEC3 for {name}");
                         };
@@ -1405,7 +1401,7 @@ ns.plain IN A  192.0.2.40
             unreachable!()
         };
         let hash = nsec3_hash(ORIGIN, &salt, iterations).unwrap();
-        let owner = format!("{}.{ORIGIN}", base32hex_encode(&hash).to_lowercase());
+        let owner = nsec3_owner_name(&hash, ORIGIN);
         let apex = nsec3s
             .iter()
             .find(|n| n.owner == owner)

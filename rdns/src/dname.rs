@@ -416,33 +416,40 @@ pub(crate) fn skip_uncompressed_name(data: &[u8]) -> Option<&[u8]> {
 /// This is the form stored in RDATA and the one DNSSEC canonical serialization
 /// requires; the message serializer uses the compressor instead.
 pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, WireError> {
+    let mut buf = [0u8; MAX_NAME_LEN];
+    let len = dname_to_bytes_in(name, &mut buf)?;
+    Ok(buf[..len].to_vec())
+}
+
+/// [`dname_to_bytes`] into a caller's buffer, returning the encoded length.
+///
+/// A name never exceeds [`MAX_NAME_LEN`] encoded, so a caller that throws the
+/// bytes away can put the buffer on the stack: the NSEC3 closest-encloser walk
+/// encodes a name per label of the QNAME (RFC 5155 §8.3) and keeps none of them.
+pub(crate) fn dname_to_bytes_in(name: &str, buf: &mut [u8]) -> Result<usize, WireError> {
     // A fully-qualified name carries a trailing '.' denoting the root; splitting
     // on '.' would otherwise yield a spurious empty final label (and a second
     // zero byte), which corrupts any record that stores data after the name.
     let name = name.strip_suffix('.').unwrap_or(name);
     if name.is_empty() {
-        return Ok(vec![0]); // the root, on its own
+        return write_bytes(buf, 0, &[0]); // the root, on its own
     }
-
-    // `write_label` validates each label as it writes, so nothing is checked
-    // twice here.
-    let labels: Vec<&str> = name.split('.').collect();
-    let size: usize = labels.iter().map(|l| l.len() + 1).sum::<usize>() + 1;
 
     // `size` is the encoded length §2.3.4 limits: one octet per byte of
     // presentation text holds because a label containing `.` or `\` is refused
     // rather than escaped, so nothing here encodes shorter than it reads.
-    // Checked before the buffer, so a name about to be refused is not allocated
-    // for.
+    // Checked before anything is written, so a name about to be refused costs
+    // only the sum.
+    let size: usize = name.split('.').map(|l| l.len() + 1).sum::<usize>() + 1;
     check_name_len(size)?;
 
-    let mut out = vec![0u8; size];
+    // `write_label` validates each label as it writes, so nothing is checked
+    // twice here.
     let mut pos = 0;
-    for label in &labels {
-        pos = write_label(&mut out, pos, label)?;
+    for label in name.split('.') {
+        pos = write_label(buf, pos, label)?;
     }
-    write_bytes(&mut out, pos, &[0])?; // terminate with the root label
-    Ok(out)
+    write_bytes(buf, pos, &[0]) // terminate with the root label
 }
 
 /// The only route to a string is `bytes -> DName -> unpacker -> UnpackedDName`,

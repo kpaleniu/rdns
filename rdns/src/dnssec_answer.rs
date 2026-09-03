@@ -9,7 +9,7 @@
 //! An unsigned zone gets nothing, whatever DO says.
 
 use crate::dnssec::canonical_name;
-use crate::dnssec_denial::{base32hex_encode, nsec3_hash, Nsec3};
+use crate::dnssec_denial::{nsec3_hash_in, nsec3_owner_name, Nsec3, NSEC3_HASH_LEN};
 use crate::utils::names_equal;
 use crate::utils::record_types as rt;
 use crate::zone::{NameKind, Zone, ZoneRecord};
@@ -35,7 +35,7 @@ pub struct AnswerSignatures {
 /// The apex DNSKEY RRset, not "are there any RRSIGs": signatures with no
 /// published key make an insecure answer bogus rather than validatable.
 pub fn is_signed(zone: &Zone) -> bool {
-    !zone.query(zone.origin(), Qtype::of(rt::DNSKEY)).is_empty()
+    zone.locate(zone.origin()).has_type(Qtype::of(rt::DNSKEY))
 }
 
 /// The RRSIGs covering the answer to `qname`/`qtype`.
@@ -86,15 +86,8 @@ pub fn proof_of_absence(zone: &Zone, qname: &str) -> Vec<ResourceRecord> {
     let qname = canonical_name(qname);
     let mut out = Vec::new();
     if zone.has_nsec3_chain() {
-        let Some(params) = Nsec3Chain::of(zone) else {
-            return out;
-        };
-        let Some(encloser) = params.closest_encloser(zone, &qname) else {
-            return out;
-        };
-        push_matching_nsec3(zone, &params, &encloser, &mut out);
-        if let Some(next_closer) = child_towards(&qname, &encloser) {
-            push_covering_nsec3(zone, &params, &next_closer, &mut out);
+        if let Some((chain, encloser)) = Nsec3Chain::and_encloser(zone, &qname) {
+            chain.push_absence(zone, &qname, &encloser, &mut out);
         }
     } else if let Some(nsec) = zone.nsec_covering(&qname) {
         push_with_signatures(zone, nsec, &mut out);
@@ -117,10 +110,7 @@ pub fn negative_proof(zone: &Zone, qname: &str, kind: &NameKind) -> Vec<Resource
     let mut out = soa_signatures(zone);
 
     match kind {
-        NameKind::NotFound => {
-            out.extend(proof_of_absence(zone, &qname));
-            out.extend(wildcard_denial(zone, &qname));
-        }
+        NameKind::NotFound => deny_the_name_and_its_wildcard(zone, &qname, &mut out),
         // NODATA: the record at the name lists the types it has. An empty
         // non-terminal exists too, and the signer gives it a chain entry.
         NameKind::Exact | NameKind::EmptyNonTerminal => match_at_name(zone, &qname, &mut out),
@@ -166,32 +156,33 @@ pub fn delegation_proof(zone: &Zone, cut: &str) -> Vec<ResourceRecord> {
     out
 }
 
-/// The denial of the wildcard that could have answered `qname`, which an
-/// NXDOMAIN needs alongside the denial of the name itself (RFC 4035 §5.4).
+/// An NXDOMAIN's two halves: `qname` does not exist, and neither does the
+/// wildcard that could have answered it (RFC 4035 §5.4).
+///
+/// One function rather than two calls, because under NSEC3 both proofs hang off
+/// the closest encloser and finding it is a hash per label of the QNAME
+/// (RFC 5155 §7.2.1) — asked per proof, the walk runs twice for one answer.
 ///
 /// `*.<closest encloser>` is guaranteed absent by [`Zone::name_kind`] — were it
 /// present the answer would be a wildcard match — and that is load-bearing:
 /// `nsec_covering` searches strictly below its argument, so a name in the chain
 /// yields the record before it, which proves nothing.
-fn wildcard_denial(zone: &Zone, qname: &str) -> Vec<ResourceRecord> {
-    let mut out = Vec::new();
+fn deny_the_name_and_its_wildcard(zone: &Zone, qname: &str, out: &mut Vec<ResourceRecord>) {
     if zone.has_nsec3_chain() {
-        let Some(params) = Nsec3Chain::of(zone) else {
-            return out;
-        };
-        let Some(encloser) = params.closest_encloser(zone, qname) else {
-            return out;
-        };
-        push_covering_nsec3(zone, &params, &format!("*.{encloser}"), &mut out);
-    } else {
-        let Some(encloser) = nsec_closest_encloser(zone, qname) else {
-            return out;
-        };
+        if let Some((chain, encloser)) = Nsec3Chain::and_encloser(zone, qname) {
+            chain.push_absence(zone, qname, &encloser, out);
+            chain.push_wildcard_denial(zone, &encloser, out);
+        }
+        return;
+    }
+    if let Some(nsec) = zone.nsec_covering(qname) {
+        push_with_signatures(zone, nsec, out);
+    }
+    if let Some(encloser) = nsec_closest_encloser(zone, qname) {
         if let Some(nsec) = zone.nsec_covering(&format!("*.{encloser}")) {
-            push_with_signatures(zone, nsec, &mut out);
+            push_with_signatures(zone, nsec, out);
         }
     }
-    out
 }
 
 /// The denial record sitting *at* `name`, with its signatures.
@@ -286,17 +277,40 @@ impl Nsec3Chain {
             })
     }
 
-    fn hash(&self, name: &str) -> Option<Vec<u8>> {
-        nsec3_hash(name, &self.salt, self.iterations).ok()
+    fn hash(&self, name: &str) -> Option<[u8; NSEC3_HASH_LEN]> {
+        nsec3_hash_in(name, &self.salt, self.iterations).ok()
     }
 
     fn owner(&self, zone: &Zone, name: &str) -> Option<String> {
-        let hash = self.hash(name)?;
-        Some(format!(
-            "{}.{}",
-            base32hex_encode(&hash).to_lowercase(),
-            zone.origin()
-        ))
+        Some(nsec3_owner_name(&self.hash(name)?, zone.origin()))
+    }
+
+    /// The chain and the closest encloser of `qname` — what every NSEC3 proof
+    /// about that name starts from, derived once.
+    fn and_encloser(zone: &Zone, qname: &str) -> Option<(Self, String)> {
+        let chain = Self::of(zone)?;
+        let encloser = chain.closest_encloser(zone, qname)?;
+        Some((chain, encloser))
+    }
+
+    /// RFC 5155 §7.2.1: the record matching the closest encloser, and the one
+    /// covering the next closer name.
+    fn push_absence(
+        &self,
+        zone: &Zone,
+        qname: &str,
+        encloser: &str,
+        out: &mut Vec<ResourceRecord>,
+    ) {
+        push_matching_nsec3(zone, self, encloser, out);
+        if let Some(next_closer) = child_towards(qname, encloser) {
+            push_covering_nsec3(zone, self, &next_closer, out);
+        }
+    }
+
+    /// The denial of the wildcard at `encloser`.
+    fn push_wildcard_denial(&self, zone: &Zone, encloser: &str, out: &mut Vec<ResourceRecord>) {
+        push_covering_nsec3(zone, self, &format!("*.{encloser}"), out);
     }
 
     /// The deepest ancestor of `qname` that the chain has a record for.
