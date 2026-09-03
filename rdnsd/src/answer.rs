@@ -198,10 +198,7 @@ fn answer_question(
             let target_owed = add_answer(zone, &name, &key, query.qtype, dnssec_ok, w)?;
             add_chain_denials(zone, &chain, owed, w)?;
             if target_owed {
-                w.push_all(
-                    Section::Authority,
-                    &dnssec_answer::proof_of_absence(zone, &key),
-                )?;
+                dnssec_answer::push_proof_of_absence(zone, &key, w)?;
             }
             Ok(())
         }
@@ -373,9 +370,7 @@ fn add_answer(
     if !dnssec_ok {
         return Ok(false);
     }
-    let signatures = dnssec_answer::answer_signatures(zone, key, qtype);
-    w.push_all(Section::Answer, &signatures.records)?;
-    Ok(signatures.wildcard.is_some())
+    dnssec_answer::push_answer_signatures(zone, key, qtype, w)
 }
 
 /// The aliases walked to reach the answer, in the order they were followed.
@@ -421,8 +416,7 @@ fn add_chain_denials(
     }
     for (i, at) in chain.iter().enumerate() {
         if owed & (1 << i) != 0 {
-            let proof = dnssec_answer::proof_of_absence(zone, &absolute_lowered(at));
-            w.push_all(Section::Authority, &proof)?;
+            dnssec_answer::push_proof_of_absence(zone, &absolute_lowered(at), w)?;
         }
     }
     Ok(())
@@ -461,10 +455,7 @@ fn add_negative(
     // stops a forged NXDOMAIN taking a name off the internet for as long as it
     // stays cached.
     if dnssec_ok {
-        w.push_all(
-            Section::Authority,
-            &dnssec_answer::negative_proof(zone, name, kind),
-        )?;
+        dnssec_answer::push_negative_proof(zone, name, kind, w)?;
     }
     Ok(())
 }
@@ -517,10 +508,7 @@ fn refer_to_child(
     // contents as before, but the additional section cannot be reopened once a
     // record has gone into it.
     if dnssec_ok {
-        w.push_all(
-            Section::Authority,
-            &dnssec_answer::delegation_proof(zone, cut),
-        )?;
+        dnssec_answer::push_delegation_proof(zone, cut, w)?;
     }
 
     // Glue, and only in-bailiwick glue: an address we hold for a nameserver

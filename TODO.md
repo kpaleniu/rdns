@@ -2201,7 +2201,7 @@ Sound because `udp_loop` answers inline on a fixed worker pool rather than
 spawning per datagram — a decision made for other reasons (#9e) that this
 depends on. Reversing it would break this silently.
 
-#### 27e. The DNSSEC proofs, written rather than collected
+#### 27e. The DNSSEC proofs, written rather than collected — **done 2026-09-03**
 
 `dnssec_answer`'s four public entry points each hand back a `Vec<ResourceRecord>`
 — `answer_signatures` inside its `AnswerSignatures`, then `proof_of_absence`,
@@ -2374,6 +2374,60 @@ under NSEC3 is 18 and under NSEC 9, and the difference is one extra denial recor
 with its signature — an owner `String` and a cloned RDATA each, a `Vec` spine per
 lookup. That is the writer's to remove, and nothing smaller.
 
+**And that is done — 2026-09-03**, which closes #27e. The four entry points take
+a `ResponseWriter` and push as they go:
+
+    per call                         at the split   after the naming   written
+    negative_proof, NXDOMAIN, NSEC             34                 24         5
+    negative_proof, NXDOMAIN, NSEC3           129                 28         6
+    negative_proof, NODATA, NSEC               15                 14         1
+    negative_proof, NODATA, NSEC3              35                 15         2
+    answer_signatures, A at a signed name       6                  5         1
+    delegation_proof, NSEC                     10                  9         1
+    delegation_proof, NSEC3                    30                 10         2
+
+The first column is the "after" column of the split table above (2026-09-02),
+the second is after the two naming passes on this page, the third is now.
+
+**The premise the item was filed on was wrong**, and finding that out was the
+whole change. "The records are owned because some are *synthesized* (a wildcard's
+RRSIG, an NSEC3 owner name) … what is borrowable is already borrowed, and the
+rest has to be built somewhere." Nothing is synthesized. A wildcard's RRSIG is
+re-owned onto the queried name by *passing that name to `push`*, and a negative
+answer's TTL cap by passing a capped TTL; the NSEC3 owner name is the record's
+own `name`, built only to look the record up by. Every record written now comes
+out of the zone by reference. Five and six are the names looked up *with* — the
+folded QNAME, an owner per candidate, `*.<encloser>` — and the lookups' own keys.
+
+Three things fell out that were not the point:
+
+- **`AnswerSignatures` is gone.** Its `wildcard: Option<String>` was allocated on
+  every wildcard answer and every caller asked `is_some()`; the entry point
+  returns `bool` — "this answer still owes a denial" — and the one test that
+  asserted the name gets it from the validator, which was already saying so two
+  lines above.
+- **`ResponseWriter::push_all` is gone.** Its doc comment named exactly one
+  caller — "the DNSSEC proofs, which are synthesized rather than read out of a
+  zone" — and that caller was this module. Both halves of the sentence stopped
+  being true at once.
+- **A second duplicate-record defect, same shape as the first.** The tracker that
+  stops one denial record going out twice is now shared across a whole proof, so
+  it also covers NODATA-through-a-wildcard: `match_at_name` at the wildcard and
+  the denial of the queried name are one NSEC when nothing sorts between them,
+  and the answer carried it twice. Nine of the 660 shapes, all
+  `anything.example.com.` with DO — the wildcard NODATA. It is by record identity
+  now rather than by comparing name and RDATA, which is both cheaper and the
+  question actually being asked.
+
+The module's tests read their records back off the wire (`written`), the way
+`rdnsd`'s do since 27b: our serializer agreeing with our own structs proves
+nothing, and this puts the parser between the two (§1).
+
+Verified: 660 reply shapes against the previous commit's binary. Nine differ,
+each holding the same set of records with no repeated copy — the defect above.
+dnspython validated 70 RRsets over two zones × two chains, the wildcard NODATA
+included. Windows and Linux read 5 and 6; clippy clean on both.
+
 Verified: 440 reply shapes (220 each over an NSEC- and an NSEC3-signed zone,
 every combination of ten names, eleven QTYPEs and DO) structurally identical to
 the previous build, with the RRSIG fields a fresh signing run changes masked;
@@ -2392,9 +2446,9 @@ has nothing to borrow from.
 #### What still allocates afterwards
 
 So "zero" is not overclaimed: TSIG signing, DO=1 against a signed zone
-(`answer_signatures` 5, `negative_proof` 24 under NSEC and 28 under NSEC3 after
-#27e's first half), a new peer
-entering the bounded tables, reloads and transfers.
+(`answer_signatures` 1, `negative_proof` 5 under NSEC and 6 under NSEC3 — the
+names a lookup is made *with*, not records), a new peer entering the bounded
+tables, reloads and transfers.
 
 #### The gate
 

@@ -17,8 +17,8 @@ use crate::compression::NameCompressor;
 use crate::dname::write_bytes;
 use crate::error::WireError;
 use crate::{
-    Class, DnsMessage, Edns, OpCode, QuerySection, RecordData, ResourceRecord, ResponseCode, Ttl,
-    CLASSIC_UDP_SIZE, OPT_RECORD_TYPE,
+    Class, DnsMessage, Edns, OpCode, QuerySection, RecordData, ResponseCode, Ttl, CLASSIC_UDP_SIZE,
+    OPT_RECORD_TYPE,
 };
 
 /// The twelve-octet header, minus the counts.
@@ -187,19 +187,6 @@ impl<'a> ResponseWriter<'a> {
                 ..
             }) => self.truncate(),
             Err(e) => return Err(e),
-        }
-        Ok(())
-    }
-
-    /// [`ResponseWriter::push`] for records something else already built — the
-    /// DNSSEC proofs, which are synthesized rather than read out of a zone.
-    pub fn push_all(
-        &mut self,
-        section: Section,
-        records: &[ResourceRecord],
-    ) -> Result<(), WireError> {
-        for rr in records {
-            self.push(section, &rr.name, rr.class, rr.ttl, &rr.rdata)?;
         }
         Ok(())
     }
@@ -389,6 +376,7 @@ pub(crate) fn write_opt(
 mod tests {
     use super::*;
     use crate::utils::record_types;
+    use crate::ResourceRecord;
     use crate::{ParsedRecord, Qtype, QueryClass, Rtype};
 
     fn request(qname: &str, edns: bool) -> DnsMessage {
@@ -462,8 +450,11 @@ mod tests {
         let mut compressor = NameCompressor::new();
         let mut w = ResponseWriter::start(&mut out, &mut compressor, 4096, &request).unwrap();
         w.set_authoritative(true);
-        w.push_all(Section::Answer, &records).unwrap();
-        w.push_all(Section::Authority, std::slice::from_ref(&ns))
+        for rr in &records {
+            w.push(Section::Answer, &rr.name, rr.class, rr.ttl, &rr.rdata)
+                .unwrap();
+        }
+        w.push(Section::Authority, &ns.name, ns.class, ns.ttl, &ns.rdata)
             .unwrap();
         w.set_edns(Edns::with_payload_size(1232));
         w.finish().unwrap();

@@ -314,12 +314,37 @@ fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring
             let _ = z.normalize_name(&query.qname);
             let _ = z.matches_query("www.example.com.", &query.qname);
 
-            // The DO-bit path: signatures, and the three denials.
-            let _ = dnssec_answer::answer_signatures(z, &query.qname, query.qtype);
-            let _ = dnssec_answer::negative_proof(z, &query.qname, &kind);
-            let _ = dnssec_answer::negative_proof(z, &query.qname, &NameKind::NotFound);
-            let _ = dnssec_answer::proof_of_absence(z, &query.qname);
-            let _ = dnssec_answer::delegation_proof(z, &query.qname);
+            // The DO-bit path: signatures, and the three denials. Each into
+            // its own reply, because the writer takes sections in order.
+            let mut out = Vec::new();
+            let mut compressor = rdns::compression::NameCompressor::new();
+            let mut into = |f: &mut dyn FnMut(&mut rdns::response::ResponseWriter)| {
+                let Ok(mut w) = rdns::response::ResponseWriter::start(
+                    &mut out,
+                    &mut compressor,
+                    u16::MAX as usize,
+                    &msg,
+                ) else {
+                    return;
+                };
+                f(&mut w);
+                let _ = w.finish();
+            };
+            into(&mut |w| {
+                let _ = dnssec_answer::push_answer_signatures(z, &query.qname, query.qtype, w);
+            });
+            into(&mut |w| {
+                let _ = dnssec_answer::push_negative_proof(z, &query.qname, &kind, w);
+            });
+            into(&mut |w| {
+                let _ = dnssec_answer::push_negative_proof(z, &query.qname, &NameKind::NotFound, w);
+            });
+            into(&mut |w| {
+                let _ = dnssec_answer::push_proof_of_absence(z, &query.qname, w);
+            });
+            into(&mut |w| {
+                let _ = dnssec_answer::push_delegation_proof(z, &query.qname, w);
+            });
         }
     }
 

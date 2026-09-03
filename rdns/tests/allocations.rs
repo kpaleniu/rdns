@@ -353,7 +353,7 @@ fn writing_a_response_costs_nothing_per_record() {
     assert_eq!(records.len(), 1);
 
     let mut out = Vec::new();
-    let mut compressor = NameCompressor::new();
+    let mut compressor = rdns::compression::NameCompressor::new();
     let write = |out: &mut Vec<u8>, compressor: &mut NameCompressor| {
         let mut w = ResponseWriter::start(out, compressor, 4096, &request).expect("start");
         w.set_authoritative(true);
@@ -962,19 +962,9 @@ fn ordering_two_names_canonically() {
 /// response written straight to the wire would remove (`TODO.md` #27e), and
 /// nothing smaller.
 fn proving_a_signed_nxdomain() {
-    let signed = signed_zone();
-    let _warm =
-        rdns::dnssec_answer::negative_proof(&signed, "nope.example.com.", &NameKind::NotFound);
-
-    let (proof, count) = allocations(|| {
-        rdns::dnssec_answer::negative_proof(&signed, "nope.example.com.", &NameKind::NotFound)
-    });
-    assert_eq!(
-        proof.len(),
-        5,
-        "SOA, its RRSIG, and two denials with theirs"
-    );
-    within("prove a signed NXDOMAIN", count, 20..=30);
+    let (records, count) = nxdomain_proof(&signed_zone());
+    assert_eq!(records, 5, "the SOA's RRSIG and two NSECs with theirs");
+    within("prove a signed NXDOMAIN", count, 5..=15);
 }
 
 /// The same NXDOMAIN over an NSEC3-signed zone, where the proof is a walk and
@@ -994,18 +984,59 @@ fn proving_a_signed_nxdomain() {
 /// Both are per *candidate* name, and the two halves of an NXDOMAIN each walked
 /// the QNAME to the same closest encloser.
 fn proving_a_signed_nxdomain_under_nsec3() {
-    let signed = signed_zone_nsec3();
-    let _warm =
-        rdns::dnssec_answer::negative_proof(&signed, "nope.example.com.", &NameKind::NotFound);
-
-    let (proof, count) = allocations(|| {
-        rdns::dnssec_answer::negative_proof(&signed, "nope.example.com.", &NameKind::NotFound)
-    });
+    let (records, count) = nxdomain_proof(&signed_zone_nsec3());
     // Five, not seven: one NSEC3 covers the next closer name *and* the
-    // wildcard, and `push_with_signatures` drops the identical second copy —
-    // which it could not while the two halves each built their own `Vec`.
-    assert_eq!(proof.len(), 5, "the SOA's RRSIG and two NSEC3s with theirs");
-    within("prove a signed NXDOMAIN under NSEC3", count, 24..=34);
+    // wildcard, and the writer is told the identical second copy has gone out
+    // already — which it could not be while the two halves each built a `Vec`.
+    assert_eq!(records, 5, "the SOA's RRSIG and two NSEC3s with theirs");
+    within("prove a signed NXDOMAIN under NSEC3", count, 5..=15);
+}
+
+/// The authority records `push_negative_proof` writes for an NXDOMAIN, and what
+/// writing them costs.
+///
+/// The buffer and the reply are started outside the measurement: what is being
+/// counted is the proof, not the 64 KB scratch every response path already owns.
+fn nxdomain_proof(signed: &rdns::zone::Zone) -> (usize, u64) {
+    let request = rdns::DnsMessageBuilder::new()
+        .with_url("nope.example.com.", "A")
+        .with_id(1)
+        .with_dnssec(true)
+        .build();
+    let mut out = Vec::new();
+    let mut compressor = rdns::compression::NameCompressor::new();
+    let prove = |w: &mut rdns::response::ResponseWriter| {
+        rdns::dnssec_answer::push_negative_proof(
+            signed,
+            "nope.example.com.",
+            &NameKind::NotFound,
+            w,
+        )
+        .expect("the proof writes")
+    };
+
+    let mut w = rdns::response::ResponseWriter::start(
+        &mut out,
+        &mut compressor,
+        u16::MAX as usize,
+        &request,
+    )
+    .expect("start a reply");
+    prove(&mut w);
+    w.finish().expect("the reply serializes");
+
+    let mut w = rdns::response::ResponseWriter::start(
+        &mut out,
+        &mut compressor,
+        u16::MAX as usize,
+        &request,
+    )
+    .expect("start a reply");
+    let ((), count) = allocations(|| prove(&mut w));
+    w.finish().expect("the reply serializes");
+
+    let reply = rdns::DnsMessage::try_from_bytes(&out).expect("and parses back");
+    (reply.authorities.len(), count)
 }
 
 /// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate
