@@ -259,10 +259,11 @@ fn one_query_end_to_end() {
 
     let (parsed, parse_count) =
         allocations(|| DnsMessage::try_from_bytes(&wire).expect("parse the query"));
-    // Three: the label vector, the `String` it becomes, the question vector. A
-    // QNAME cannot hold a compression pointer, so `DNameUnpacker` does not copy
-    // its labels.
-    within("parse a one-question query", parse_count, 3..=3);
+    // Two: the QNAME `String` and the question vector. A QNAME cannot hold a
+    // compression pointer, having nothing before it to point at, so it is
+    // assembled straight out of its own bytes — no `Vec<Label>`, and nothing for
+    // `DNameUnpacker` to copy.
+    within("parse a one-question query", parse_count, 2..=2);
 
     let (answers, lookup_count) = allocations(|| {
         zone.query("www.example.com.", Qtype::of(record_types::A))
@@ -508,7 +509,7 @@ fn reading_one_integer_out_of_an_soa() {
 
     let (value, before) = allocations(|| old(soa));
     assert_eq!(value, 300, "the MINIMUM this zone file sets");
-    within("read the MINIMUM out of an SOA, the old way", before, 4..=4);
+    within("read the MINIMUM out of an SOA, the old way", before, 2..=2);
 
     let (value, after) = allocations(|| soa.rdata.soa_minimum());
     assert_eq!(value, Some(300), "the same answer");
@@ -536,12 +537,14 @@ fn reading_a_requests_edns_parameters_allocates_nothing() {
     assert_eq!(header.udp_payload_size, 1232);
     within("read a request's EDNS parameters", count, 0..=0);
 
-    // Six: an OPT record never becomes a `ResourceRecord`, so it costs one less
-    // than the same query with a real additional record. It read 8 while
-    // `Additional::try_from_bytes` parsed the owner name twice to peek at TYPE.
+    // Three: the question `Vec`, the QNAME, and the OPT's RDATA — the option
+    // list, kept in wire form. The OPT's *owner* costs nothing: it is read past
+    // and never decoded, RFC 6891 §6.1.2 making it the root and nothing keeping
+    // it. It read 8 while `Additional::try_from_bytes` parsed the owner name
+    // twice to peek at TYPE, and 6 while it decoded it once.
     let (parsed, parse_count) = allocations(|| DnsMessage::try_from_bytes(&wire));
     assert!(parsed.expect("parses").edns().is_some(), "the OPT is there");
-    within("parse a query that carries EDNS", parse_count, 6..=6);
+    within("parse a query that carries EDNS", parse_count, 3..=3);
 
     let (found, found_count) = allocations(|| msg.edns());
     let found = found.expect("OPT");
@@ -590,7 +593,7 @@ fn a_busy_neighbour_stays_out_of_the_count() {
     STOP.store(true, Ordering::Relaxed);
     neighbour.join().expect("the neighbour thread");
 
-    within("a hundred parses beside a busy thread", count, 300..=300);
+    within("a hundred parses beside a busy thread", count, 200..=200);
 }
 
 /// Name compression is most of response serialization by time. This is what it
@@ -629,7 +632,9 @@ fn a_response_full_of_shared_suffixes() {
     // `RefCell<HashSet<usize>>` costing one allocation per message with a
     // pointer in it, and requiring a pointer to point backwards (RFC 1035
     // §4.1.4) makes a cycle unreachable rather than detected. 20 with it, 19
-    // without; the rest is the message itself.
+    // without; 15 since a name stopped being read into a `Vec<Label>` first,
+    // which is what an uncompressed name costs even here — the three A records
+    // and the question. The rest is the message itself.
     let wire = response.to_bytes_within(4096).expect("serialize");
     let (reparsed, count) = allocations(|| DnsMessage::try_from_bytes(&wire).expect("parse back"));
     assert_eq!(
@@ -637,7 +642,7 @@ fn a_response_full_of_shared_suffixes() {
         3,
         "the measurement is only meaningful if it parsed"
     );
-    within("parse a response with compressed names", count, 19..=19);
+    within("parse a response with compressed names", count, 15..=15);
 }
 
 /// A full zone load and sign, which runs on a worker that is also serving
@@ -698,8 +703,9 @@ fn one_axfr_out() {
     });
     // Nine records into one message: 41 before the compressor stopped keeping a
     // label-offset vector per name and a second copy of every name it had seen,
-    // 19 after — a transfer is nothing but names.
-    within("serialize one AXFR message", serialize_count, 14..=26);
+    // 19 after, 13 since a name stopped being read into a `Vec<Label>` — a
+    // transfer is nothing but names.
+    within("serialize one AXFR message", serialize_count, 9..=20);
 
     the_first_envelope_costs_the_same_however_big_the_zone_is(&request);
 }

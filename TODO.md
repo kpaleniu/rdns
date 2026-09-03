@@ -2177,7 +2177,7 @@ It took a third walk with it that was not in the plan. `cname_target` called
 already in hand, so the CNAME path walks the zone once instead of twice. That is
 the remaining half of #25a for this path.
 
-#### 27d. The request as a view over the packet
+#### 27d. The request as a view over the packet — **withdrawn 2026-09-03**
 
 A `Request<'a>` holding `&'a [u8]` and offsets. `validation::Request` is already
 the only door on the server path (#14b), so this changes its insides rather than
@@ -2200,6 +2200,49 @@ own rather than folded into 27b.
 Sound because `udp_loop` answers inline on a fixed worker pool rather than
 spawning per datagram — a decision made for other reasons (#9e) that this
 depends on. Reversing it would break this silently.
+
+**Measured before starting, and most of it was not the view — 2026-09-03.** What
+a parse costs, split by what the packet holds:
+
+    parse                       before   after
+    header alone, no question        0       0
+    one question                     3       2
+    question + a bare OPT            5       2
+    question + OPT with a cookie     6       3
+
+Six is what a real resolver's query cost, and **three of the six were a name
+nothing reads**. Two of those were the OPT record's owner: `read_record_parts`
+decoded the owner of every additional record so the caller could branch on TYPE,
+and the OPT branch threw it away — RFC 6891 §6.1.2 makes it the root and nothing
+keeps it. It now carries the name unread and decodes it in the branch that wants
+one. The third was in every name: `DName::try_from_bytes` collected a
+`Vec<Label>`, walked it once to size a `String`, walked it again to fill it, and
+dropped it. `DName` is now the name's own bytes plus "does it end in a pointer",
+its labels walked on demand, and an uncompressed name is assembled straight into
+its `String` — a QNAME is always that case, having nothing before it to point at.
+
+That is `DnsMessage::try_from_bytes` for every caller, not just the daemon: a
+compressed nine-record response reads 15 where it read 19, and
+`RecordData::parse` on an SOA halves because two names cost half what they did.
+Serialization moves
+too, one AXFR message going from 19 to 13: the compressor reads the names out of
+an NS or MX RDATA to find their suffixes, and that read is the same one.
+
+**So the view would now buy one allocation of the remaining three** — the
+question `Vec`, since the QNAME `String` is the zone lookup's key either way and
+the OPT's RDATA is kept in wire form on purpose. That is not worth two message
+shapes across two daemons, `rdnsd`'s four other consumers of the parsed request
+(`answer_transfer`, `answer_update`, `notify_reply`, `error_bytes`), `rdnsr`'s
+own, and the receive-buffer trap above. **27d is withdrawn as filed**; what is
+left of it is the `queries` `Vec`, and the cheap form of that is a message that
+holds its one question inline rather than a view over the packet.
+
+Verified: 660 reply shapes against the previous commit's binary, 0 differ. The
+parser's own third party is dnspython on the *writing* side for once — a
+dnspython server chooses its own compression pointers, so answering `rdnsc` from
+one exercises pointer following on names our serializer would have written
+differently; every owner name and the NS RDATA's target came back whole. Windows
+and Linux read every count in `allocations.rs` the same; clippy clean on both.
 
 #### 27e. The DNSSEC proofs, written rather than collected — **done 2026-09-03**
 

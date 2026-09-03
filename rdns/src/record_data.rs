@@ -145,10 +145,10 @@ impl RecordData {
 
     /// The five 32-bit fields an SOA carries after MNAME and RNAME.
     ///
-    /// [`RecordData::parse`] answers the same questions and allocates four times
-    /// on the way: a label `Vec` and a `String` for each of the two names, both
-    /// discarded by every caller that wanted a number. Every negative answer
-    /// reads MINIMUM, which is the shape a random-subdomain flood generates.
+    /// [`RecordData::parse`] answers the same questions and allocates a `String`
+    /// for each of the two names on the way, both discarded by every caller that
+    /// wanted a number. Every negative answer reads MINIMUM, which is the shape
+    /// a random-subdomain flood generates.
     fn soa_scalars(&self) -> Option<&[u8; 20]> {
         if self.rtype != crate::utils::record_types::SOA {
             return None;

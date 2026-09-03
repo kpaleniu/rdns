@@ -3,7 +3,9 @@ use rand::Rng;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use compression::NameCompressor;
-use dname::{dname_from_bytes, dname_to_bytes, DNameUnpacker, TryUnpackFromBytes};
+use dname::{
+    dname_from_bytes, dname_to_bytes, DName, DNameUnpacker, TryFromBytes, TryUnpackFromBytes,
+};
 
 /// This build, as `<package version> (<git describe>)`. Stamped by `build.rs`
 /// and passed to clap's `version` by every binary, so `--version` names a
@@ -1293,25 +1295,26 @@ impl<'a> TryUnpackFromBytes<'a> for QuerySection {
 ///
 /// Read once and branched on afterwards: the additional section has to know a
 /// record's TYPE before it knows whether the record is a resource record at all
-/// — an OPT is not — and parsing the owner name twice to find out costs an extra
-/// `String` per OPT-bearing message.
+/// — an OPT is not — and reading the owner name twice to find out means walking
+/// its labels again.
 ///
 /// `ttl_bits` is raw. An OPT record's TTL field is not a TTL — it packs the
 /// extended RCODE, the version and the DO bit — so RFC 2181 §8's clamp belongs
 /// to whichever branch knows it is holding a real record.
+///
+/// `name` is the name as it sits on the wire, not its text: the OPT branch
+/// throws the owner away (RFC 6891 §6.1.2 makes it the root), and decoding it
+/// was a `Vec` and a `String` on every EDNS query.
 struct RecordParts<'a> {
-    name: String,
+    name: DName<'a>,
     rtype: Rtype,
     class: u16,
     ttl_bits: i32,
     rdata: &'a [u8],
 }
 
-fn read_record_parts<'a>(
-    data: &'a [u8],
-    unpacker: &DNameUnpacker<'a>,
-) -> Result<(RecordParts<'a>, &'a [u8]), WireError> {
-    let (name, rest) = dname_from_bytes(data, unpacker)?;
+fn read_record_parts(data: &[u8]) -> Result<(RecordParts<'_>, &[u8]), WireError> {
+    let (name, rest) = DName::try_from_bytes(data)?;
     let (rtype, rest) = read_be!(u16, rest);
     let (class, rest) = read_be!(u16, rest);
     let (ttl_bits, rest) = read_be!(i32, rest);
@@ -1347,7 +1350,7 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
         data: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<<Self as TryUnpackFromBytes<'a>>::Output, Self::Error> {
-        let (parts, rest) = read_record_parts(data, unpacker)?;
+        let (parts, rest) = read_record_parts(data)?;
         Ok((ResourceRecord::from_parts(parts, unpacker)?, rest))
     }
 }
@@ -1355,9 +1358,12 @@ impl<'a> TryUnpackFromBytes<'a> for ResourceRecord {
 impl ResourceRecord {
     /// Assemble a record from its wire fields. This is where a real record's
     /// TTL is clamped (RFC 2181 §8) — see [`RecordParts::ttl_bits`].
-    fn from_parts(parts: RecordParts<'_>, unpacker: &DNameUnpacker<'_>) -> Result<Self, WireError> {
+    fn from_parts<'a>(
+        parts: RecordParts<'a>,
+        unpacker: &DNameUnpacker<'a>,
+    ) -> Result<Self, WireError> {
         Ok(ResourceRecord {
-            name: parts.name,
+            name: unpacker.decode(parts.name)?,
             class: Class::new(parts.class),
             ttl: Ttl::from_wire(parts.ttl_bits),
             rdata: RecordData::from_wire(parts.rtype, parts.rdata, unpacker)?,
@@ -1387,7 +1393,7 @@ impl Additional {
         data: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<(Additional, &'a [u8]), WireError> {
-        let (parts, rest) = read_record_parts(data, unpacker)?;
+        let (parts, rest) = read_record_parts(data)?;
         if parts.rtype != OPT_RECORD_TYPE {
             return Ok((
                 Additional::Record(ResourceRecord::from_parts(parts, unpacker)?),

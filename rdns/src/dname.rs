@@ -187,8 +187,100 @@ impl<'a> TryFromBytes<'a> for Label<'a> {
     }
 }
 
+/// A name as it sits in a message: its own encoded bytes, nothing copied.
+///
+/// Was a `Vec<Label>`, collected by the parser and dropped as soon as the name
+/// became a `String` — one allocation per name of every message parsed. The
+/// labels are walked again on demand, which costs nothing and cannot disagree
+/// with the first walk because it is the same function over the same bytes.
 pub(crate) struct DName<'a> {
-    labels: Vec<Label<'a>>,
+    /// Exactly the name: every label, and the root octet or pointer that ended
+    /// it.
+    encoded: &'a [u8],
+    /// Whether the name ends in a compression pointer, which is the only thing
+    /// that needs the message to resolve.
+    compressed: bool,
+}
+
+impl<'a> DName<'a> {
+    /// The labels, in wire order, ending with [`Label::Root`] or the pointer.
+    ///
+    /// Fallible rather than trusting [`DName::try_from_bytes`]'s walk: an
+    /// invariant nobody checks is a claim, not a guarantee (`CLAUDE.md` §17),
+    /// and the check is a comparison the caller was making anyway.
+    fn labels(&self) -> impl Iterator<Item = Result<Label<'a>, WireError>> + '_ {
+        let mut rest = self.encoded;
+        std::iter::from_fn(move || {
+            if rest.is_empty() {
+                return None;
+            }
+            Some(match Label::try_from_bytes(rest) {
+                Ok(label) => {
+                    rest = &rest[label.len()..];
+                    Ok(label)
+                }
+                Err(e) => {
+                    rest = &[];
+                    Err(e)
+                }
+            })
+        })
+    }
+
+    /// The presentation form of a name that carries no pointer.
+    ///
+    /// The common case, and the one worth not routing through
+    /// [`UnpackedDName`]: a QNAME structurally cannot be compressed — nothing
+    /// precedes it to point at — and stored RDATA holds its names uncompressed.
+    fn to_presentation(&self) -> Result<String, WireError> {
+        debug_assert!(!self.compressed, "a pointer needs the message to resolve");
+        check_name_len(self.encoded.len())?;
+        // One octet per label becomes the separator that follows it, so the text
+        // is the encoded length less the root's terminator.
+        let mut out = String::with_capacity(self.encoded.len().saturating_sub(1));
+        for label in self.labels() {
+            match label? {
+                Label::String(s) => push_label(&mut out, s)?,
+                Label::Root => break,
+                Label::Pointer(_) => {
+                    return Err(WireError::malformed(
+                        "a domain name",
+                        "an unpacked name may not contain a compression pointer",
+                    ))
+                }
+            }
+        }
+        Ok(root_if_empty(out))
+    }
+}
+
+/// One label's text, appended with its separator.
+///
+/// Shared by the two assemblers so neither can drop a rule the other keeps.
+fn push_label(out: &mut String, label: &[u8]) -> Result<(), WireError> {
+    let text = std::str::from_utf8(label)?;
+    // The other end of `unrepresentable_octet`: a name that cannot be spelled
+    // is refused as it is read, so no such `String` ever exists to be compared,
+    // keyed on or written.
+    if let Some(what) = unrepresentable_octet(text) {
+        return Err(WireError::Unsupported { what });
+    }
+    out.push_str(text);
+    out.push('.');
+    Ok(())
+}
+
+/// Every other name ends up with a trailing dot because each label contributes
+/// one. The root has no labels, so it would come back as the empty string —
+/// which is not what the rest of the codebase calls the root, and not what we
+/// put on the wire when we ask for it. A query for `.` (which is exactly what
+/// fetching the root's DNSKEY RRset is) would then fail the reply check, its
+/// question having apparently changed from "." to "" in transit.
+fn root_if_empty(mut name: String) -> String {
+    if name.is_empty() {
+        name.push('.');
+    }
+    name
 }
 
 // RFC 1035 §2.3.1's LDH "preferred name syntax" is advice to whoever chooses a
@@ -201,19 +293,24 @@ impl<'a> TryFromBytes<'a> for DName<'a> {
     type Output = (DName<'a>, &'a [u8]);
     type Error = WireError;
     fn try_from_bytes(data: &'a [u8]) -> Result<(DName<'a>, &'a [u8]), WireError> {
-        let mut labels = Vec::new();
-        let mut off = data;
-        loop {
-            let lbl = Label::try_from_bytes(off)?;
-            off = &off[lbl.len()..];
-
-            let end = !matches!(lbl, Label::String(_));
-            labels.push(lbl);
-            if end {
-                break;
+        let mut len = 0;
+        let compressed = loop {
+            let lbl = Label::try_from_bytes(&data[len..])?;
+            len += lbl.len();
+            match lbl {
+                Label::String(_) => {}
+                Label::Pointer(_) => break true,
+                Label::Root => break false,
             }
-        }
-        Ok((DName { labels }, off))
+        };
+        let (encoded, rest) = data.split_at(len);
+        Ok((
+            DName {
+                encoded,
+                compressed,
+            },
+            rest,
+        ))
     }
 }
 
@@ -253,16 +350,15 @@ impl<'a> DNameUnpacker<'a> {
             });
         }
 
-        // A name with no pointer is already unpacked, and the loop below would
-        // only copy its labels into a second `Vec` — one allocation per name on
-        // the path every query takes. Not a corner case: a QNAME cannot contain
-        // a pointer, having nothing before it to point at.
+        // A name with no pointer is already unpacked; only a pointer target
+        // reaches here that way, since [`DNameUnpacker::decode`] assembles the
+        // uncompressed case straight into its `String`.
         //
         // The trailing `Root` comes off because an `UnpackedDName`'s labels are
         // the name's content: the `extend` below would otherwise splice one into
         // the middle of the name that pointed here.
-        if !name.labels.iter().any(|l| matches!(l, Label::Pointer(_))) {
-            let mut labels = name.labels;
+        if !name.compressed {
+            let mut labels = name.labels().collect::<Result<Vec<_>, _>>()?;
             if matches!(labels.last(), Some(Label::Root)) {
                 labels.pop();
             }
@@ -270,13 +366,13 @@ impl<'a> DNameUnpacker<'a> {
         }
 
         let mut output = Vec::new();
-        for label in &name.labels {
-            match label {
-                Label::String(_) => {
-                    output.push(label.clone());
+        for label in name.labels() {
+            match label? {
+                label @ Label::String(_) => {
+                    output.push(label);
                 }
                 Label::Pointer(offset) => {
-                    if *offset >= self.data.len() {
+                    if offset >= self.data.len() {
                         return Err(WireError::malformed(
                             "a compression pointer",
                             format!(
@@ -299,7 +395,7 @@ impl<'a> DNameUnpacker<'a> {
                     // recovering it would mean pointer arithmetic valid only if
                     // every caller passes a slice of the message — an invariant
                     // no type states. One free step does not cost termination.
-                    if *offset >= prev_target {
+                    if offset >= prev_target {
                         return Err(WireError::malformed(
                             "a compression pointer",
                             format!(
@@ -308,8 +404,8 @@ impl<'a> DNameUnpacker<'a> {
                         ));
                     }
 
-                    let (name, _) = DName::try_from_bytes(&self.data[*offset..])?;
-                    let unpacked = self.unpack_internal(name, depth + 1, *offset)?;
+                    let (name, _) = DName::try_from_bytes(&self.data[offset..])?;
+                    let unpacked = self.unpack_internal(name, depth + 1, offset)?;
 
                     output.extend(unpacked.labels);
                 }
@@ -323,6 +419,19 @@ impl<'a> DNameUnpacker<'a> {
     /// unconstrained: an offset is 14 bits, so no real target can equal it.
     fn unpack(&self, name: DName<'a>) -> Result<UnpackedDName<'a>, WireError> {
         self.unpack_internal(name, 0, usize::MAX)
+    }
+
+    /// The presentation form of a name already read off the wire.
+    ///
+    /// Split out of [`dname_from_bytes`] so a caller can read *past* a name and
+    /// decode it only if it turns out to want it: an OPT record's owner is the
+    /// root and is discarded (RFC 6891 §6.1.2), and building it cost a `Vec` and
+    /// a `String` on every EDNS query.
+    pub(crate) fn decode(&self, name: DName<'a>) -> Result<String, WireError> {
+        if name.compressed {
+            return self.unpack(name)?.try_into();
+        }
+        name.to_presentation()
     }
 }
 
@@ -380,9 +489,7 @@ pub fn dname_from_bytes<'a>(
     unpacker: &DNameUnpacker<'a>,
 ) -> Result<(String, &'a [u8]), WireError> {
     let (name, rest) = DName::try_from_bytes(bytes)?;
-    let name = unpacker.unpack(name)?;
-    let s = name.try_into()?;
-    Ok((s, rest))
+    Ok((unpacker.decode(name)?, rest))
 }
 
 /// Past the name at the start of `data`, returning what follows it.
@@ -469,17 +576,7 @@ impl<'a> TryInto<String> for UnpackedDName<'a> {
 
         for l in &self.labels {
             match l {
-                Label::String(s) => {
-                    let label_str = std::str::from_utf8(s)?;
-                    // The other end of `unrepresentable_octet`: a name that
-                    // cannot be spelled is refused as it is read, so no such
-                    // `String` ever exists to be compared, keyed on or written.
-                    if let Some(what) = unrepresentable_octet(label_str) {
-                        return Err(WireError::Unsupported { what });
-                    }
-                    result.push_str(label_str);
-                    result.push('.');
-                }
+                Label::String(s) => push_label(&mut result, s)?,
                 Label::Pointer(_) => {
                     return Err(WireError::malformed(
                         "a domain name",
@@ -490,18 +587,7 @@ impl<'a> TryInto<String> for UnpackedDName<'a> {
             }
         }
 
-        // Every other name ends up with a trailing dot because each label
-        // contributes one. The root has no labels, so it would come back as the
-        // empty string — which is not what the rest of the codebase calls the
-        // root, and not what we put on the wire when we ask for it. A query for
-        // `.` (which is exactly what fetching the root's DNSKEY RRset is) would
-        // then fail the reply check, its question having apparently changed
-        // from "." to "" in transit.
-        if result.is_empty() {
-            result.push('.');
-        }
-
-        Ok(result)
+        Ok(root_if_empty(result))
     }
 
     type Error = WireError;
