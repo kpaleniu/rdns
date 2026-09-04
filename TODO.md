@@ -70,6 +70,25 @@ another crop of §7 duplicates — one of which, 26j, is a correction to this pa
 the wrecked string literal #19h records as fixed had never been fixed, and now
 is, with the assertion that would have caught it.
 
+**A third pass, 2026-09-04, asked whether the three binaries reimplement each
+other**, and filed **#30** and **#31**. The library answers no: everything deep
+has one implementation and every binary calls it. What is written twice is the
+transport layer — `rdnsd` and `rdnsr` hold a TCP accept-and-frame loop, a
+shutdown epilogue and an admission pipeline that are the same code with the
+comments reworded, and `rdnsc` holds a second copy of the resolver's client
+exchange.
+**The one thing to read is 30q**, which the duplication led to rather than being
+one: `rdnsr` calls the admission check on its UDP path and not on its TCP path,
+so the 16 KiB ceiling, the QDCOUNT cap and the pre-parse section caps do not
+apply to a TCP peer. **#31 is the boundary question that follows**, answered with
+dependency counts rather than taste — not a `platform` crate and not a `net` one;
+yes to one for the transport, **`rdns-transport`**, because §3 forbids `anyhow`
+in `rdns` and it needs it; and the cut that would actually pay is `rdns` itself,
+which two synchronous CLIs currently compile tokio and ring through. **Both sections were
+reviewed against the code the day they were filed** and four claims did not
+survive it; they are struck through in place, and what the review moved is at the
+end of #30.
+
 Build and test with the four commands at the top of `CLAUDE.md`;
 `cargo bench -p rdns` is the fifth. **Do not push** — commit locally and leave
 it; the reason is in `CLAUDE.local.md` and it is about the account, not the code.
@@ -712,6 +731,9 @@ it, and the rule it became in `CLAUDE.md`:
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
 | **28** | work the answer path does and need not | **filed 2026-09-01; 28a-28c done and 28d answered *no* the same day.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
 | **29** | the resolver half never got #27's pass | **filed and closed 2026-09-04**, five commits; #25b, #25e and #26e closed with it. #27 and #28 gated `rdnsd`'s answer path at three allocations a query; `rdnsr` was never in that series and `rdns/tests/allocations.rs` cannot see it. The same walks, the same hashing, the same reply buffer, with the fixed copy sitting beside them |
+| **30** | the two daemons' transports are one transport written twice | **open, filed 2026-09-04 and reviewed the same day.** Seventeen items: fifteen duplicated between `rdnsd` and `rdnsr` — the TCP transport whole, the five transport constants, the shutdown epilogue, the admission pipeline, five hand-written reply skeletons, the EDNS mirroring — two between `rdnsc` and the library, and **30q, the one defect: `rdnsr` never applies the admission check to TCP**, so on that transport the 16 KiB ceiling, the QDCOUNT cap and the pre-parse section caps do not run. The library itself came out clean. Reviewing the filing against the code struck four of its claims, including two that had the direction backwards; what the review moved is recorded at the end of the section |
+| **31** | where a crate boundary would pay | **an answer with a measurement, filed 2026-09-04 and corrected the same day.** Not `platform` and not `net`: both would move code that already has a home. Yes to a crate for #30's transport, **`rdns-transport`**, and the argument is `anyhow` rather than tidiness — §3 forbids it in `rdns` and the transport needs it; the name is checked against `domain`, hickory, Knot and BIND rather than chosen, and "shell" was already taken by #9d. The cut that pays is `rdns` itself: `rdnsc` is a synchronous CLI compiling 78 packages, tokio's 18 and ring's among them, floored at clap's 21. ~~32 of 41 modules touch neither~~ — an import count is not a partition; walking the edges found exactly two blocking ones, both `zone`/`zone_writer` reaching into `dnssec_denial` for wire helpers with no crypto in them, which is #26b from the other side |
+| **32** | `Shell`, `Served` and the other unnamed bags | **open, filed 2026-09-04.** Four field-only structs that are "what a task needs that is not the answer" and say so in no name — three renamed, `Control` kept as its module's principal type — one of them in a word #9d already spends on something else. The finding under the rename is that `rdnsr::Shell`'s five fields *are* five of `rdnsd::Server`'s twelve, so 30e's shared pipeline already has its parameter list written twice; naming it `ServeContext` in `rdns-transport` is the extraction rather than a step towards it. Carries the rule for what earns the suffix, since a policy struct and a request handler both must not |
 | **27** | what a zero-allocation answer path would take | **filed 2026-09-01, not started.** Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
@@ -2922,6 +2944,257 @@ chain, denial records included. Windows and Linux read every count in
   path (a `String` per output byte in two `fn hex`, two base32hex decoders that
   disagree, `normalize` where a `Cow` would do, a `String` for a constant type
   name).
+
+### 30. The two daemons' transports are one transport written twice — filed 2026-09-04
+
+The §7 family one level above the helpers #26 collects: not two copies of a
+function but two copies of the loop *around* one. Found by reading `rdnsd` and
+`rdnsr` side by side, then confirmed mechanically — a scan for identical runs of
+four or more non-comment lines across the binary crates, which found 21
+consecutive lines in the shutdown epilogue and 9 in the TCP read loop, and
+nothing in `rdnsc`, whose copy is sync where the library's is async so no line
+matches.
+
+**The library came out clean.** Wire codec, zone handling, DNSSEC, TSIG,
+transfers, journal, caches, limiters, metrics, readiness, shutdown and the
+control protocol have one implementation each and every binary calls it.
+`rdnsctl` and `rdnsd` sharing `rdns::control` is the shape the rest of this
+section wants.
+
+**Reviewed against the code the day it was filed** (`CLAUDE.md` §17 — a plan is a
+claim about the code, and the first draft of #13 had five that did not survive).
+Four here did not either; they are struck through in place below, and what the
+review moved is at the end. It also turned up **30q, which is a defect rather
+than a duplicate** and is the one item in this section that is not a tidy-up.
+
+| | what | note |
+|---|---|---|
+| **30a** | the TCP transport, whole | `rdnsd/src/main.rs:665-786` ↔ `rdnsr/src/main.rs:854-990`. Accept loop (semaphore, cancel-safe `accept` under `Stop`, spawn with permit and `Busy`) and connection loop (split, writer task owning the write half, `mpsc` of `MAX_INFLIGHT_PER_CONNECTION`, prefix read under `TCP_IDLE_TIMEOUT` with the stop check between messages, body under `TCP_READ_TIMEOUT`, drop-tx-then-join). 21 identical lines at `rdnsd:725-745` ↔ `rdnsr:925-942`; RFC 7766 §6.2.1.1, §6.2.3 and RFC 1035 §4.2.2 quoted in both. What is *not* shared is where each applies its admission policy — see 30e and 30q |
+| **30b** | five transport constants | `rdnsd:53-70` ↔ `rdnsr:34-51`. 10 s, 5 s, 128 and 16 identical, 4096 under two names, each reason reworded rather than shared. **Not a shared `const`, though**: one constant forces an authoritative server and a resolver to hold the same connection ceiling forever, and they have no reason to. Defaults on a policy struct, which is where 30k lands too |
+| **30c** | `listener_failure` | `rdnsd:653` ↔ `rdnsr:537`, identical but for `anyhow!` against `anyhow::anyhow!`. **It cannot move into `rdns`**: it returns `anyhow::Error`, the library has no `anyhow` dependency and §3 says it must not grow one. It wants `rdns-transport` — which may use `anyhow`, its only consumers being the two daemons — so 30c is an argument for #31's shape rather than a thing to do before it |
+| **30d** | the shutdown epilogue | `rdnsd:622-659` ↔ `rdnsr:508-543`. `JoinSet` + `select!{join_next, stop_signal}` + `begin()` + drain the set + `drain_reporting()` + `match failure`, including the comment saying why it is not two `JoinHandle`s. Same `anyhow` problem as 30c, same conclusion |
+| **30e** | ~~the UDP admission pipeline, twice~~ **the admission pipeline, four times and no two alike** | ~~`rdnsd:1665-1730` ↔ `rdnsr:752-850`, the same sequence with one drift.~~ **Wrong, corrected on review.** The UDP halves do match (limiter → `validate_packet` → answer → `ResponseVerdict`), but the four paths differ in three ways that a shared pipeline has to be told about rather than smooth over: `rdnsd` splits the sequence across `udp_loop` and `answer_datagram` for UDP and writes it whole in `answer` for TCP, so it is already twice inside one binary; `rdnsd` rate-limits per TCP **message** (`:805`) while `rdnsr` rate-limits per TCP **accept** (`:872`) and neither does both; and `rdnsr` logs no validation failure where `rdnsd` does. The clock read differs too, on purpose — see "what must not be unified" |
+| **30f** | the response budget derived by hand, twice | `rdnsd:516-520` ↔ `rdnsr:415-419`, both `ResponseLimiter::new(rate, rate.saturating_mul(4), 2)`. The `×4` ("four seconds' worth") and the `2` ("BIND's own slip default") are written on `security.rs:255`'s `with_defaults()` — **which no binary calls**; it is reached only by its own test. And the `if rate == 0 { disabled() }` arm both binaries write is **provably dead**: `disabled()` *is* `new(0, 0, 0)`, `is_enabled` is `bytes_per_sec > 0`, and `admit` returns `Send` when it is false — so `new(0, …)` already disables. One `per_second(rate)` replaces the branch and the arithmetic |
+| **30g** | five hand-written reply skeletons | `rdnsd:1435` (`error_bytes`), `rdnsd:1799` (the TSIG rejection — a copy of `error_bytes` from 360 lines up the same file, differing only in the length ceiling), `rdnsd:1566` (`truncated_reply`), `rdnsr:1401` (`unsupported_opcode`), `rdnsr:1429` (`build_response`), plus two in `notify.rs`. **Two items, not one.** `rdnsd:1799` is an in-file copy and a straight fix. The library half is a design question: `DnsMessageBuilder` builds *queries* only, so what is missing is a constructor that copies the echo fields — id, opcode, question, CD — and leaves the policy fields (AA, RA, AD) to the caller, since those are exactly where the five disagree. A function returning a finished message would fit none of them |
+| **30h** | the EDNS pre-checks and the mirroring, twice | `answer.rs:52-67` + `:115-121` ↔ `rdnsr:1036-1053` + `:1358-1370`. `edns_header()` → FORMERR, a version past `EDNS_VERSION` → BADVERS, then an OPT only if the client used EDNS with DO mirrored. Same rules, same RFC 6891 §6.1.1 and §6.1.3 citations. **What is shared is a decision, not a writer**: `rdnsd` sets it on a `ResponseWriter` and `rdnsr` on a `DnsMessage`, so the moveable part is a pure function of `&DnsMessage` returning reject-with-this-rcode or accept-with-this-DO. `rdnsr`'s `finish` also *strips* DNSSEC records without DO — that is resolver-only, filtering what an upstream sent, and is not part of this |
+| **30i** | two NOTIMP implementations | `answer.rs:72-88` inside `write_response`, `rdnsr:1400` as `unsupported_opcode`. **Falls out of 30g and 30h** — echo the opcode, echo the question, mirror the OPT — and is not independent work |
+| **30j** | two truncate-on-budget answers | `rdnsd:1565` rebuilds from the *request* and bounds by `request.udp_payload_size()`; `rdnsr:733` re-parses its own *reply* and bounds by `CLASSIC_UDP_SIZE`. Both are safe — an empty TC=1 reply cannot exceed 512 even with a maximal question — so this is a consolidation, not a defect, and it **falls out of 30g** rather than being worth its own change |
+| **30k** | ~~nine flags declared twice~~ **a duplication that mostly has to stay** | `rdnsd:124-320` ↔ `rdnsr:110-215`. ~~`#[command(flatten)]` on a shared struct.~~ **Checked, and it does not work.** Two obstacles: three of the nine defaults differ on purpose (`--host`, `--query-rate`, `--query-burst`), and a flattened struct has one set of `default_value`s — moving them out to `Option` + a per-binary default takes the "[default: 1000]" out of `--help`, which is where an operator reads the policy. Worse, **every one of `rdnsd`'s policy flags carries `conflicts_with = "config"`** (§15: two sources for one setting is an error) and `rdnsr` has no `--config` for the id to refer to. Only `--log-level` and `--quiet` flatten cleanly, which is ten lines. Recorded as not-to-fix, in #16c's shape |
+| **30l** | `restrict_to_owner` twice | `rdnsd/src/control.rs:98` ↔ `rdns/src/persist.rs:99`, identical `set_permissions(0o600)`. Export `persist`'s. **Only the one-liner**: `control::bind` is bind-temp → chmod → rename and `persist::write_atomically` is create-temp → write → fsync → chmod → rename, deliberately the same shape for the same reason — the mode is in place before the published path exists — but the middles are a socket and a file. There is no chmod-after-publish race in either |
+| **30m** | ~~`rdnsr` holds the logger and does not call it~~ **nothing reads the logger's aggregation, in either binary** | ~~A straggler of #18: wire `log_query` and `count_error` into `rdnsr`.~~ **Backwards, corrected on review.** `QueryLogger::get_stats` and `check_anomalies` have **no production caller anywhere** — the only non-test reference in the workspace is an `rdnsd` test. So `QueryStats` (total_queries, total_errors, qps, `queries_by_ip`, `queries_by_type`, `rate_limited_ips`) is write-only: `rdnsd` pays a mutex and two hash inserts per query for it, on the path #28 counts mutexes on, and `queries_by_type` duplicates the per-QTYPE atomics `DnsMetrics` already exports. `rdnsr` not calling it is evidence for deleting the aggregation, not for wiring it in. `log_rate_limited` stays: its map is the one §5 bounds |
+| **30n** | one unused dependency, one misplaced | `rdnsr/Cargo.toml` declares `tracing-subscriber` and never names it; `rdnsd`'s only use is in a test (`main.rs:2826`, `:2850`), so it belongs under `[dev-dependencies]` |
+| **30o** | `rdnsc` reimplements the resolver's exchange | `rdnsc/src/main.rs:84-179` against `resolver.rs:746-760` and `:1191-1281`: family-matched bind, `connect` for the cheap half of off-path resistance, retry, TC→TCP fallback, id-and-question match, RFC 5452 §9.1 spelled out in both. **What can move is the predicate, and only it.** `matches_request` / `response_matches` is a pure function of two messages; the socket dance cannot be shared without making `rdnsc` async, which is the opposite of #31. `rdnsc`'s copy also has no DNS-0x20, which is a gap in the client rather than in the sharing |
+| **30p** | the family-matched bind, three times | `rdnsc:86-90`, `resolver.rs:1199-1204`, `rdnsd:2334-2338`. Pure, no I/O, no `tokio`: a `fn bind_addr_for(target) -> SocketAddr` in `utils` serves all three, sync and async alike |
+| **30q** | **`rdnsr` never applies the admission check to TCP** | `validate_packet` is called once in `rdnsr`, at `:795`, with `is_tcp = false`. The TCP path goes `serve_connection` → `handle_query` → `Request::from_bytes` with nothing in between, so on that transport none of `AdmissionCheck`'s pre-parse caps apply: the 16 KiB TCP ceiling (`validation.rs:62`, chosen deliberately and commented "not a protocol limit"), the 12-byte floor, QDCOUNT ≤ 10, "a QUERY carries no answer records", the per-section caps. `rdnsd` calls it on both transports (`:811` with `true`, `:1706` with `false`). Bounded — 128 connections × 16 in flight × 64 KiB, and the peer completed a handshake — so it is a resource and conformance gap, not a remote kill switch. **The shape is the one §7 exists for**: the facility is built, tested, configured into `rdnsr`'s `Shell` and applied on one of two paths. #18's own note said the risk was that a resolver's *operational* shell would be `rdnsd`-shaped; this is that, one transport down |
+
+#### What must not be unified
+
+**The two UDP loops differ for a reason and should stay two.** `rdnsd` is a fixed
+worker pool answering inline on a reused scratch buffer and compressor — #27b
+measured the alternative at 1 536 bytes and 46% of everything a query allocates —
+and `rdnsr` is a task per datagram because a recursion is seconds long and almost
+all of it waiting. Unify the admission *pipeline* (30e) and leave two loop
+policies on top of it. Unifying the loop loses both reasons at once.
+
+**The clock read is not shareable either.** #28a gave `rdnsd` one instant for the
+limiter, the logger, the TSIG check and the budget, because they happen within
+microseconds of each other. `rdnsr` reads it twice on purpose (`:790`, `:833`):
+a recursion sits in between and can take seconds, so charging the response
+against the query's instant would deny the bucket the refill the wait earned it.
+A pipeline that takes `now` as a parameter allows both; one that reads the clock
+itself silently picks `rdnsd`'s answer.
+
+**The handler has to be sink-shaped.** `rdnsd`'s `answer` sends a *sequence* into
+an `mpsc`, because an AXFR is one (RFC 5936 §2.2) and a slow client must
+back-pressure the next envelope rather than have the whole zone built ahead of
+it; `rdnsr`'s produces one `Option<Vec<u8>>`. A trait shaped like the second fits
+`rdnsr`, forces `rdnsd` to keep its copy, and looks finished from the outside.
+`domain` shipped both rather than choosing: a `Service` that may emit several
+responses per request, and a `SingleService` for one. This note with an API
+attached.
+
+#### Order
+
+**30q first** — it is the only defect here, and it is one call plus the test that
+watches it fail. Then 30f, 30l, 30n and the `rdnsd:1799` half of 30g: a few lines
+each, independent, no design question in any of them. 30h and the library half of
+30g belong in `rdns` beside `response.rs`; they are protocol, not transport.
+**30a-30e wait on #31**, which asks where the boundary they would move across
+belongs — and 30c and 30d make that concrete, since neither can live in `rdns` at
+all. 30k is recorded and not to be done. 30i and 30j are consequences, not work. The naming
+this section's own rename exposed is **#32**, whose first box is 30e's shared
+parameter list under a name.
+
+#### What the review moved
+
+Four claims did not survive contact with the code, and the shape is worth more
+than the four:
+
+- **30e said "the same pipeline with one drift".** It is four paths with three
+  differences, one of which (30q) is a hole. *Reading two functions side by side
+  shows what they share; it takes reading all four call sites to see what they
+  do not.*
+- **30k said "flatten the shared flags".** `conflicts_with = "config"` has no
+  referent in the other binary, so the mechanism does not exist. *The plan named
+  a tool without checking the tool's constraint.*
+- **30m said "a straggler of #18: wire the calls in".** Nothing reads the data at
+  either end, so the direction was backwards. *"One binary calls this and the
+  other does not" is a question about the callers; the missing question was who
+  reads the result.*
+- **30c and 30d were filed as movable into `rdns`.** They return `anyhow::Error`
+  and §3 forbids that dependency. *A rule already written down, in the file the
+  section cites.*
+
+### 31. Where a crate boundary would pay — filed 2026-09-04
+
+#30 asks to be answered with a `platform` or a `net` crate. Measured rather than
+argued, it is no to both and yes to a different cut.
+
+**`platform`, no.** Its contents already have homes —
+`utils::recv_error_is_transient`, `persist::ensure_private`,
+`shutdown::stop_signal` — and the one duplicate, 30l, is fixed by a `pub`. The
+benefit such a crate would buy, every `#[cfg]`-gated body in one place so §1's
+"run it on the other platform" has a single target, does not land: the largest
+cfg-gated body is `rdnsd/src/control.rs`, 630 lines of the daemon's command
+table, and it cannot move.
+
+**`net`, no.** What is shared and net-shaped is `framed` (already in `rdns`), the
+length-prefix read (five sites, three of them already inside `rdns`) and 30p's
+bind. Functions, not a crate: `read_framed` and `bind_addr_for` beside `framed`.
+
+**But a crate for #30's transport, yes — `rdns-transport`** — and 30c and 30d
+are why. It returns
+`anyhow::Error`, which `rdns` may not depend on (§3) and a crate whose only
+consumers are the two daemons may. That is the boundary argument doing real work
+rather than aesthetics: it is not "where would this look tidy", it is "which of
+these two things is allowed to know about `anyhow`".
+
+**The name was checked, not chosen.** Every implementation that has this layer
+separates it from the answering logic, and none of them calls it a shell — which
+this page had, in a word #9d and #18 already spend on something else (flags,
+metrics, control socket, readiness). NLnet Labs' `domain` is the closest
+precedent, down to the language: the layer is `domain::net::server`, behind a
+feature named **`unstable-server-transport`**, with `DgramServer` and
+`StreamServer` driving a `Service`. `hickory-server` has `Server` — "owns the
+sockets and listeners" — behind a `RequestHandler`. Knot splits
+`src/knot/server/` (`udp-handler.c`, `tcp-handler.c`) from
+`src/knot/nameserver/`. BIND 9.16 moved its sockets into `lib/isc/netmgr/`, the
+network manager, away from `lib/ns/`. `rdns-server` is the conventional spelling
+and is wrong here — `rdnsd` is the server, and this crate holds no answering
+logic; `rdns-net` is spoken for by the paragraph above. `transport` is also the
+word the code already uses: `rdnsr`'s `enum Transport`, `rdnsd`'s "both
+transports", §2's "on both transports".
+
+**The cut that pays is `rdns` itself.** `rdnsc` and `rdnsctl` are synchronous
+CLIs that compile all of tokio, ring, sha1/sha2 and the DNSSEC stack today,
+because `rdns` is one crate with no features and no way to ask for less.
+
+| | packages, `cargo tree -e normal` |
+|---|---|
+| `rdnsc` today | 78 |
+| `rdnsd` today | 90 |
+| `rdns` alone | 61 |
+| tokio subtree | 18 |
+| ring / sha1 / sha2 | 4 / 8 / 8 |
+| **clap subtree** | **21** |
+
+~~**Four modules touch ring or sha and five touch tokio — 32 of 41 touch
+neither.**~~ **An import count is not a partition, corrected on review.** The
+question is whether the module *graph* cuts, and it was answered by walking the
+edges rather than the imports:
+
+- **`error` is core, not net.** It is referenced by nearly everything and lands
+  in the tokio set only for two `From<tokio::time::error::Elapsed>` impls. Those
+  move with the net crate; the rest of `error` does not. A precondition, not a
+  blocker.
+- **`utils -> dnssec` and `dname -> tsig` do not exist.** Both are doc-links, one
+  of them in a test. The scan found them; opening the lines removed them.
+- **The DNSSEC crate is about eleven modules, not four.** The crypto is in four,
+  but `dnssec_answer`, `dnssec_chain`, `dnssec_validation_mode`, `nsec_cache`,
+  `rfc5011`, `zone_signer` and `dnssec_test_util` follow them, and `secondary`
+  follows `xfr` into net.
+- **Two edges actually block the cut**, and they are one problem: `zone` and
+  `zone_writer` reach into `dnssec_denial` for `base32hex_encode`/`_decode`,
+  `canonical_sort_key`, `build_type_bitmap` and `bitmap_types_exact` — **wire
+  helpers with no cryptography in them**, living in the NSEC3 module because that
+  is where NSEC3 lives. Move them to core and the partition is clean. **This is
+  also #26b**: the reason a second base32hex decoder grew inside `zone` is that
+  the first one is in a module `zone` should not have had to depend on. One move
+  closes both.
+
+A three-way cut — core (wire, names, zone files, presentation, caches, limiters,
+the denial *wire* helpers) / DNSSEC / net, with `rdns-transport` above them —
+takes `rdnsc` from 78 packages to about 40. It drops ring and sha entirely from a
+client that does no crypto (`rdnsc --dnssec` only sets the DO bit), and the
+modules `rdnsc` actually reaches use no `tracing` either. **The floor is clap**:
+21 of those 78 packages are the argument parser's and no split touches them.
+
+**Features are the cheap version and the weaker one.** Under resolver 2 a
+`cargo build --workspace` still builds one `rdns` carrying the union of every
+member's features, so a feature gate pays only on a `-p` build. A split pays
+always.
+
+**Filed as an answer, not a plan.** It is a boundary question with a measurement
+attached, and the measurement is the part that would otherwise be redone. Nothing
+in #30 is blocked on *doing* this, only on deciding it — which is why 30a-30e say
+they wait on #31 and not on the split.
+
+### 32. `Shell`, `Served`, and the other unnamed bags — filed 2026-09-04
+
+Both daemons have grown a struct that is "what a task needs that is not the
+answer", and none of them says so in its name: `rdnsr`'s `Shell`, `rdnsd`'s
+`Served`, `Replication` and `Control`. One of them says something else — "shell"
+is #9d's word for the operational furniture (flags, log levels, config, metrics,
+control socket, readiness), and #30's rename took it out of the transport's
+title for the same reason it should come out of a type's.
+
+**The finding under the rename.** `rdnsr::Shell` is not merely shaped like
+`rdnsd::Server`. Its five fields *are* five of `Server`'s twelve — same types,
+same purpose, two spellings:
+
+| `rdnsr::Shell` (`main.rs:222`) | `rdnsd::Server` (`main.rs:321`) |
+|---|---|
+| `limiter: Arc<RateLimiter>` | `rate_limiter: Arc<RateLimiter>` |
+| `responses: Arc<ResponseLimiter>` | `response_limiter: Arc<ResponseLimiter>` |
+| `validator: Arc<AdmissionCheck>` | `validator: Arc<AdmissionCheck>` |
+| `logger: Arc<QueryLogger>` | `logger: Arc<QueryLogger>` |
+| `metrics: Arc<DnsMetrics>` | `metrics: Arc<DnsMetrics>` |
+
+So **30e's shared admission pipeline already has its parameter list**, written
+twice under two names, and the name belongs in `rdns-transport` beside the
+pipeline that reads it. Naming it once is the extraction, not a step towards it.
+
+- [ ] `ServeContext` in `rdns-transport`: those five and nothing else.
+- [ ] `rdnsr`'s `Shell` becomes it, `record_answer` included.
+- [ ] `rdnsd`'s `Server` holds one in place of the five loose fields — and keeps
+      its own name. `answer`, `answer_transfer`, `answer_update`,
+      `answer_datagram` and `serve_connection` hang off it, so it is the request
+      handler (`hickory`'s `RequestHandler`, `domain`'s `Service`), not a bag. A
+      handler renamed `…Context` is a worse name, not a better one.
+- [ ] `Served` → `ZoneContext`, `Replication` → `ReplicationContext`. Both are
+      field-only — no `impl` block on either — and `Served` is a past participle
+      naming no noun, which is why it reads as a verb at all fifteen of its uses.
+- [x] **`Control` keeps its name**, decided 2026-09-04. It qualifies by the rule
+      below and is kept anyway: it is `control.rs`'s principal type, and those are
+      named for the module (`resolver::Resolver`) rather than for their category.
+      `control::ControlContext` was the tell.
+
+**What earns the suffix**, so the next one is not decided by coin flip:
+
+- A bag of shared handles, `Arc`-cloned into tasks, with no behaviour beyond a
+  trivial helper. All four above qualify; `Shell::record_answer` is two lines.
+- **Not a policy.** `ServePolicy` and `ControlPolicy` are decided at startup and
+  consumed once by `serve`. §14 asked for exactly that grouping and their names
+  are already right.
+- **Not a handler.** `Server` and `Reloading` carry the work, not the wiring.
+- **And not when the contents have a real collective noun.** `rdnsr`'s `Caches`
+  holds three caches and says so, which beats any suffix. `…Context` is for the
+  bag whose only honest summary is "the ambient stuff" — which is what the four
+  are and what `Caches` is not.
+
+Cheap, mechanical, and better done with #30's rename than after it: they are
+`Arc`ed through every task in both binaries, so the compiler finds every site,
+and these names are what the next reader navigates by.
 
 ### 12. Pre-authentication panics — audited 2026-08-01
 
