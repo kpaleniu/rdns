@@ -933,11 +933,11 @@ fn ordering_two_names_canonically() {
     let a = "a.z.example.com.";
     let b = "B.example.COM.";
     let _warm = (
-        rdns::dnssec_denial::canonical_name_cmp(a, b),
-        rdns::dnssec_denial::canonical_sort_key(a),
+        rdns::denial_wire::canonical_name_cmp(a, b),
+        rdns::denial_wire::canonical_sort_key(a),
     );
 
-    let (order, count) = allocations(|| rdns::dnssec_denial::canonical_name_cmp(a, b));
+    let (order, count) = allocations(|| rdns::denial_wire::canonical_name_cmp(a, b));
     assert_eq!(
         order,
         std::cmp::Ordering::Greater,
@@ -945,7 +945,7 @@ fn ordering_two_names_canonically() {
     );
     within("order two names canonically", count, 0..=0);
 
-    let (key, count) = allocations(|| rdns::dnssec_denial::canonical_sort_key(a));
+    let (key, count) = allocations(|| rdns::denial_wire::canonical_sort_key(a));
     assert!(!key.is_empty());
     within("build a canonical sort key", count, 1..=1);
 }

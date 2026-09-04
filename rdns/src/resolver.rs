@@ -3190,7 +3190,7 @@ this line has no record and is skipped
     // time and put the whole resolve path through it — root KSK/ZSK, a DS in
     // each parent, and a signature over the answer.
 
-    use crate::dnssec_denial::build_type_bitmap;
+    use crate::denial_wire::build_type_bitmap;
     use crate::dnssec_test_util::{ds_record, TestZone};
 
     /// Root → `test.` → `example.test.`, every zone signed and every
@@ -3531,7 +3531,8 @@ this line has no record and is skipped
     /// hash, so it covers the last two at once. Opt-out is deliberately clear: set,
     /// it would make this Insecure rather than Secure, which is a different test.
     fn signed_nsec3_nxdomain_authority(auth: &TestZone) -> Vec<ResourceRecord> {
-        use crate::dnssec_denial::{base32hex_encode, nsec3_hash};
+        use crate::denial_wire::base32hex_encode;
+        use crate::dnssec_denial::nsec3_hash;
 
         let salt = vec![0xaa, 0xbb, 0xcc, 0xdd];
         let iterations = 10u16;

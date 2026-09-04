@@ -18,7 +18,7 @@ use crate::Qtype;
 use crate::Ttl;
 use std::path::Path;
 
-use crate::dnssec_denial::{base32hex_encode, bitmap_types_exact};
+use crate::denial_wire::{base32hex_encode, bitmap_types_exact};
 use crate::utils::{record_type_name, record_types};
 use crate::zone::{format_dnssec_time, Zone, ZoneRecord};
 use crate::{ParsedRecord, RecordData};
@@ -248,7 +248,7 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
 /// text form drops them. Compare against the layout the parser will rebuild.
 fn bitmap_to_string(bitmap: &[u8]) -> Option<String> {
     let types = bitmap_types_exact(bitmap).ok()?;
-    if crate::dnssec_denial::build_type_bitmap(&types) != bitmap {
+    if crate::denial_wire::build_type_bitmap(&types) != bitmap {
         return None;
     }
     Some(

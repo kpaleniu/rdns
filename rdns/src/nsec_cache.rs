@@ -15,10 +15,9 @@
 //! - NXDOMAIN needs the wildcard denied too.
 //! - TTL is bounded by the proof, not by the question.
 
+use crate::denial_wire::canonical_sort_key;
 use crate::dnssec::{canonical_name, label_count, Rrsig};
-use crate::dnssec_denial::{
-    canonical_sort_key, proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Params,
-};
+use crate::dnssec_denial::{proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Params};
 use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf};
 use crate::Qtype;
 use crate::Rtype;
@@ -951,7 +950,8 @@ fn evict_zone(zones: &mut HashMap<NameKeyBuf, ZoneProofs>, now: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dnssec_denial::{build_type_bitmap, nsec3_hash, nsec3_owner_name};
+    use crate::denial_wire::build_type_bitmap;
+    use crate::dnssec_denial::{nsec3_hash, nsec3_owner_name};
     use crate::Class;
     use crate::Serial;
     use crate::{OpCode, QueryClass, QuerySection, RecordData};

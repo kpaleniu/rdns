@@ -1,4 +1,4 @@
-use crate::dnssec_denial::{base32hex_decode, canonical_sort_key};
+use crate::denial_wire::{base32hex_decode, canonical_sort_key};
 use crate::error::ZoneError;
 use crate::utils::record_type_code;
 use crate::utils::record_types as rt;
@@ -588,32 +588,6 @@ fn parse_hex(hex_str: &str) -> Result<Vec<u8>, String> {
     Ok(res)
 }
 
-fn parse_base32_hex(input: &str) -> Result<Vec<u8>, String> {
-    let input = input.trim().to_uppercase();
-    let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
-    let char_to_val =
-        |c: u8| -> Option<u8> { alphabet.iter().position(|&x| x == c).map(|p| p as u8) };
-
-    let mut bits = 0u64;
-    let mut count = 0;
-    let mut res = Vec::new();
-
-    for &c in input.as_bytes() {
-        if c == b'=' {
-            break; // Skip padding
-        }
-        let val =
-            char_to_val(c).ok_or_else(|| format!("Invalid Base32 hex character: {}", c as char))?;
-        bits = (bits << 5) | (val as u64);
-        count += 5;
-        if count >= 8 {
-            res.push((bits >> (count - 8)) as u8);
-            count -= 8;
-        }
-    }
-    Ok(res)
-}
-
 fn is_leap(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
@@ -749,7 +723,7 @@ fn construct_type_bitmap(types: &[String]) -> Result<Vec<u8>, String> {
     }
     codes.sort_unstable();
     codes.dedup();
-    Ok(crate::dnssec_denial::build_type_bitmap(&codes))
+    Ok(crate::denial_wire::build_type_bitmap(&codes))
 }
 
 /// Read `\# <length> <hex>` (RFC 3597 §5) into stored form.
@@ -1299,7 +1273,10 @@ fn rdata_from_fields(
                     ZoneError::syntax(ln, format!("invalid NSEC3 salt {:?}: {e}", salt_str))
                 })?
             };
-            let next_hashed_owner = parse_base32_hex(nsec3_parts[4]).map_err(|e| {
+            // `denial_wire`'s decoder, not a second one: the copy that used to
+            // live here folded case with `str::to_uppercase`, which is the
+            // Unicode fold RFC 4343 forbids (`TODO.md` #26b).
+            let next_hashed_owner = base32hex_decode(nsec3_parts[4]).map_err(|e| {
                 ZoneError::syntax(
                     ln,
                     format!("invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4]),
@@ -2377,11 +2354,11 @@ $TTL 3600
         let ParsedRecord::NSEC { type_bitmap, .. } = record.rdata.parse().unwrap() else {
             panic!("not an NSEC");
         };
-        assert!(crate::dnssec_denial::bitmap_has_type(
+        assert!(crate::denial_wire::bitmap_has_type(
             &type_bitmap,
             record_types::A
         ));
-        assert!(crate::dnssec_denial::bitmap_has_type(
+        assert!(crate::denial_wire::bitmap_has_type(
             &type_bitmap,
             Rtype::new(1234)
         ));

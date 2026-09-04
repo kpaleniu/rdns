@@ -1865,7 +1865,7 @@ is why #13b's sweep did not turn them up.
 | | what | note |
 |---|---|---|
 | **26a** | two `fn hex`, byte-identical | `rfc5011.rs:778`, `zone_writer.rs:324`, both `bytes.iter().map(\|b\| format!("{b:02X}")).collect()` — **one heap allocation per output byte**. `rdnsctl dump` of a signed zone runs it over every DS digest and NSEC3 salt |
-| **26b** | two base32hex decoders that disagree | `zone::parse_base32_hex` (`:619`) against `dnssec_denial::base32hex_decode` (`:226`). The first does `to_uppercase()` — the Unicode fold §8 forbids, plus an allocation — and a linear `position()` over the 32-byte alphabet per character; the second is a range match. They also disagree about `=` padding |
+| **26b** | ~~two base32hex decoders that disagree~~ **fixed 2026-09-04** | `zone::parse_base32_hex` (`:619`) against `dnssec_denial::base32hex_decode` (`:226`). The first does `to_uppercase()` — the Unicode fold §8 forbids, plus an allocation — and a linear `position()` over the 32-byte alphabet per character; the second is a range match. They also disagree about `=` padding. **Done, and it took the module split #31 asked for**: the shared decoder is `denial_wire::base32hex_decode` and `zone::parse_base32_hex` is gone. Both differences have tests — U+017F LONG S upper-cases to `S`, which *is* in the base32hex alphabet, so the deleted copy read a character no DNS name can hold as a valid digit; and padding is refused rather than skipped, since RFC 5155 §3.3 calls the Next Hashed Owner Name "an unpadded sequence of case-insensitive base32 digits" and skipping `=` loaded a shorter hash |
 | **26c** | two `parse_hex` | `rfc5011.rs:764`, `zone.rs:604`. The second collects a `Vec<char>` (four bytes per input character) to index pairs, where `as_bytes().chunks_exact(2)` does it in place |
 | **26d** | two `fn base64` | `rfc5011.rs:781`, `zone_writer.rs:320`, identical one-line wrappers |
 | **26e** | ~~`ancestors_of` / `ancestors` allocate a `String` per ancestor~~ **done 2026-09-04** | `zone_signer.rs:785` (a `Vec<&str>`, then a `join` **and** a `format!` per ancestor) and `resolver.rs:482`. Ancestors are suffix slices of the input. `Layout::of` runs it once per name and `chain_names` runs it again per name, at every load and every re-signing. Flagged as "the next function to look at" by the 2026-08-03 review and still there. **Both are iterators of slices now.** Signing 200 records went 26 313 → 22 103 allocations and the slope 130 → 109 per record; the eight-record gate 784 → 710. The resolver's is per delegation-cache lookup, so per query |
@@ -3132,7 +3132,11 @@ edges rather than the imports:
   is where NSEC3 lives. Move them to core and the partition is clean. **This is
   also #26b**: the reason a second base32hex decoder grew inside `zone` is that
   the first one is in a module `zone` should not have had to depend on. One move
-  closes both.
+  closes both. **Moved 2026-09-04** into `denial_wire` — canonical name order,
+  the type-bitmap codec and base32hex, the three encodings a denial record is
+  written in and none of them cryptographic. `zone` and `zone_writer` name that
+  module now and `dnssec_denial` not at all, so the DNSSEC modules are a
+  partition and the remaining work of this section is the cut itself.
 
 A three-way cut — core (wire, names, zone files, presentation, caches, limiters,
 the denial *wire* helpers) / DNSSEC / net, with `rdns-transport` above them —
@@ -6581,6 +6585,12 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **The wire encodings left the crypto module** (#26b, and #31's one
+  prerequisite) — canonical name order, type bitmaps and base32hex are
+  `rdns::denial_wire`, and `zone`/`zone_writer` no longer reach into
+  `dnssec_denial` for them, which were the two edges blocking #31's cut. The
+  second base32hex decoder went with the move; it folded case with
+  `str::to_uppercase`, so it read U+017F as `S`.
 - **The anomaly warnings have a caller, and their thresholds have flags**
   (#30m) — `QueryLogger::check_anomalies` had been write-only since the day it
   was written: no binary ever called it, in any commit. `logging::watch_anomalies`

@@ -36,7 +36,8 @@
 //! reading: they are ~7.6 µs per label of SHA-1 over 22 bytes, the part
 //! RFC 9276 §3.1 asks zones not to ask for.
 
-use rdns::dnssec_denial::{base32hex_encode, build_type_bitmap, nsec3_hash};
+use rdns::denial_wire::{base32hex_encode, build_type_bitmap};
+use rdns::dnssec_denial::nsec3_hash;
 use rdns::nsec_cache::NsecCache;
 use rdns::utils::record_types as rt;
 use rdns::{

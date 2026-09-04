@@ -5,6 +5,9 @@
 //! RFC 4034 §6.1 — not string order — and, for NSEC3, the salted iterated hash
 //! of RFC 5155 §5.
 
+use crate::denial_wire::{
+    base32hex_decode, bitmap_has_type, canonical_name_cmp, encode_base32hex, BASE32HEX_LOWER,
+};
 use crate::dname::{dname_to_bytes_in, MAX_NAME_LEN};
 use crate::error::{DnssecError, DnssecResult};
 use crate::utils::record_types as rt;
@@ -25,184 +28,6 @@ pub const MAX_NSEC3_ITERATIONS: u16 = 150;
 /// defines, and the registry it points at has had no second entry since.
 pub const NSEC3_HASH_LEN: usize = 20;
 
-/// Compare two names in DNSSEC canonical order (RFC 4034 §6.1).
-///
-/// Labels sort from the *right*, and a name sorts ahead of everything beneath
-/// it. String comparison gets both wrong, and an NSEC range check built on it
-/// accepts names outside the gap.
-/// `Iterator::cmp` gives both remaining rules for free: the first differing
-/// label decides, and a name that runs out of labels first is an ancestor and
-/// sorts before its descendants.
-pub fn canonical_name_cmp(a: &str, b: &str) -> Ordering {
-    reversed_labels(a).cmp(reversed_labels(b))
-}
-
-/// A byte string whose plain `Ord` is exactly [`canonical_name_cmp`], so a
-/// `BTreeMap` can answer "which NSEC's range contains this name?" by range query.
-///
-/// Labels are written right to left, each terminated by a zero byte. The
-/// terminator is what makes an ancestor sort before its descendants and keeps a
-/// label from sorting after a longer label it is a prefix of (`ab\0` before
-/// `abc\0`). Zero cannot occur inside a label.
-pub fn canonical_sort_key(name: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(name.len() + 1);
-    for label in reversed_labels(name) {
-        key.extend(label.folded());
-        key.push(0);
-    }
-    key
-}
-
-/// A name's labels, right to left. The root has none.
-///
-/// Borrowed, and folded only where they are compared: this returned a
-/// `Vec<String>`, so a name comparison cost a `Vec` and a `String` per label at
-/// each side — eight allocations for two three-label names, and `Nsec::covers`
-/// makes three comparisons. A signed NXDOMAIN spent 142 allocations, most of
-/// them here.
-fn reversed_labels(name: &str) -> impl Iterator<Item = Folded<'_>> {
-    let trimmed = name.trim_end_matches('.');
-    // `rsplit` on an empty string yields one empty label, where the root has
-    // none at all.
-    let labels = (!trimmed.is_empty()).then_some(trimmed);
-    labels.into_iter().flat_map(|t| t.rsplit('.')).map(Folded)
-}
-
-/// One label, ordered as RFC 4034 §6.1 requires: octet by octet, with ASCII
-/// case folded (RFC 4343).
-///
-/// A newtype because `Iterator::cmp` needs `Ord` and `Iterator::cmp_by` is
-/// unstable. `Eq` is written in terms of `Ord` rather than derived, since a
-/// derived one would compare the bytes without folding and disagree with it.
-#[derive(Clone, Copy)]
-struct Folded<'a>(&'a str);
-
-impl<'a> Folded<'a> {
-    fn folded(self) -> impl Iterator<Item = u8> + 'a {
-        self.0.bytes().map(|b| b.to_ascii_lowercase())
-    }
-}
-
-impl Ord for Folded<'_> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.folded().cmp(other.folded())
-    }
-}
-
-impl PartialOrd for Folded<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for Folded<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for Folded<'_> {}
-
-/// Whether `rtype` is set in an NSEC/NSEC3 type bitmap (RFC 4034 §4.1.2).
-///
-/// A malformed bitmap reads as "type not present": a bitmap we cannot parse must
-/// never be taken as proof that something is there.
-pub fn bitmap_has_type(bitmap: &[u8], rtype: Rtype) -> bool {
-    let want_window = (rtype.to_u16() >> 8) as u8;
-    let want_bit = (rtype.to_u16() & 0xff) as usize;
-
-    let mut rest = bitmap;
-    while rest.len() >= 2 {
-        let window = rest[0];
-        let len = rest[1] as usize;
-        if len == 0 || len > 32 || rest.len() < 2 + len {
-            return false; // malformed: stop rather than guess
-        }
-        let bits = &rest[2..2 + len];
-        if window == want_window {
-            let byte = want_bit / 8;
-            return byte < bits.len() && bits[byte] & (0x80 >> (want_bit % 8)) != 0;
-        }
-        rest = &rest[2 + len..];
-    }
-    false
-}
-
-/// Build a type bitmap covering `types`.
-pub fn build_type_bitmap(types: &[Rtype]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut windows: Vec<(u8, Vec<u8>)> = Vec::new();
-    for &t in types {
-        let t = t.to_u16();
-        let window = (t >> 8) as u8;
-        let bit = (t & 0xff) as usize;
-        let entry = match windows.iter_mut().find(|(w, _)| *w == window) {
-            Some(e) => e,
-            None => {
-                windows.push((window, Vec::new()));
-                windows.last_mut().expect("just pushed")
-            }
-        };
-        let byte = bit / 8;
-        if entry.1.len() <= byte {
-            entry.1.resize(byte + 1, 0);
-        }
-        entry.1[byte] |= 0x80 >> (bit % 8);
-    }
-    windows.sort_by_key(|(w, _)| *w);
-    for (window, bits) in windows {
-        out.push(window);
-        out.push(bits.len() as u8);
-        out.extend_from_slice(&bits);
-    }
-    out
-}
-
-/// Every type set in a bitmap, ascending. A malformed bitmap silently truncates;
-/// [`bitmap_types_exact`] is the checked form.
-pub fn bitmap_types(bitmap: &[u8]) -> Vec<Rtype> {
-    bitmap_types_exact(bitmap).unwrap_or_else(|partial| partial)
-}
-
-/// [`bitmap_types`], but `Err(what was read before the damage)` when the bitmap
-/// does not parse to its end. Re-encoding a bitmap only partly understood would
-/// emit a record other than the one we were given.
-pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>> {
-    let mut types = Vec::new();
-    let mut rest = bitmap;
-    while !rest.is_empty() {
-        if rest.len() < 2 {
-            return Err(types);
-        }
-        let window = rest[0] as u16;
-        let len = rest[1] as usize;
-        if len == 0 || len > 32 || rest.len() < 2 + len {
-            return Err(types);
-        }
-        for (byte, bits) in rest[2..2 + len].iter().enumerate() {
-            for bit in 0..8 {
-                if bits & (0x80 >> bit) != 0 {
-                    types.push(Rtype::new((window << 8) | (byte as u16 * 8 + bit)));
-                }
-            }
-        }
-        rest = &rest[2 + len..];
-    }
-    Ok(types)
-}
-
-/// base32hex (RFC 4648 §7): how an NSEC3 owner label carries a hash.
-const BASE32HEX: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
-
-/// The same alphabet down-cased, for [`nsec3_owner_name`]. A second table
-/// rather than a fold of the first: the fold was the allocation.
-const BASE32HEX_LOWER: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
-
-/// The number of base32hex characters `len` octets encode to, unpadded.
-fn base32hex_len(len: usize) -> usize {
-    (len * 8).div_ceil(5)
-}
-
 /// The owner name of the NSEC3 record for `hash` in `origin`: the hash as a
 /// base32hex label (RFC 5155 §3.3), prepended to the zone.
 ///
@@ -211,60 +36,12 @@ fn base32hex_len(len: usize) -> usize {
 /// `format!("{}.{origin}", base32hex_encode(h).to_lowercase())` — three
 /// allocations where one does, and a Unicode fold over ASCII (CLAUDE.md §8).
 pub fn nsec3_owner_name(hash: &[u8], origin: &str) -> String {
-    let mut out = String::with_capacity(base32hex_len(hash.len()) + 1 + origin.len());
+    let mut out =
+        String::with_capacity(crate::denial_wire::base32hex_len(hash.len()) + 1 + origin.len());
     encode_base32hex(hash, BASE32HEX_LOWER, &mut out);
     out.push('.');
     out.push_str(origin);
     out
-}
-
-/// Encode bytes as unpadded base32hex.
-pub fn base32hex_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(base32hex_len(data.len()));
-    encode_base32hex(data, BASE32HEX, &mut out);
-    out
-}
-
-fn encode_base32hex(data: &[u8], alphabet: &[u8; 32], out: &mut String) {
-    for chunk in data.chunks(5) {
-        let mut buf = [0u8; 5];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        let bits = u64::from_be_bytes([0, 0, 0, buf[0], buf[1], buf[2], buf[3], buf[4]]);
-        // 5 input bytes make 8 output characters; a short final chunk makes
-        // ceil(len * 8 / 5) of them.
-        let chars = (chunk.len() * 8).div_ceil(5);
-        for i in 0..chars {
-            let shift = 35 - i * 5;
-            out.push(alphabet[((bits >> shift) & 0x1f) as usize] as char);
-        }
-    }
-}
-
-/// Decode unpadded base32hex. Case-insensitive, as DNS labels are.
-pub fn base32hex_decode(text: &str) -> DnssecResult<Vec<u8>> {
-    let mut acc: u64 = 0;
-    let mut bits = 0u32;
-    let mut out = Vec::new();
-    for c in text.bytes() {
-        let value = match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'v' => c - b'a' + 10,
-            b'A'..=b'V' => c - b'A' + 10,
-            _ => {
-                return Err(DnssecError::parse(format!(
-                    "invalid base32hex character {:?}",
-                    c as char,
-                )))
-            }
-        };
-        acc = (acc << 5) | value as u64;
-        bits += 5;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Ok(out)
 }
 
 /// The NSEC3 hash of `name` (RFC 5155 §5): SHA-1 over the name's wire form,
@@ -915,8 +692,8 @@ fn closest_encloser_nsec(qname: &str, covering: &Nsec) -> String {
 
 /// The longest suffix of whole labels that two names share.
 fn common_suffix(a: &str, b: &str) -> String {
-    let shared = reversed_labels(a)
-        .zip(reversed_labels(b))
+    let shared = crate::denial_wire::reversed_labels(a)
+        .zip(crate::denial_wire::reversed_labels(b))
         .take_while(|(x, y)| x == y)
         .count();
     if shared == 0 {
@@ -1010,6 +787,7 @@ fn nsec3_closest_encloser<'n>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::denial_wire::{base32hex_encode, build_type_bitmap};
     use crate::Class;
     use crate::RecordData;
     use crate::Ttl;
@@ -1020,62 +798,6 @@ mod tests {
             next: next.to_string(),
             type_bitmap: build_type_bitmap(types),
         }
-    }
-
-    /// Sorting is by label from the right, so a deeper name under an earlier
-    /// label comes first.
-    #[test]
-    fn test_canonical_order_is_by_label_from_the_right() {
-        // The rightmost differing label decides.
-        assert_eq!(
-            canonical_name_cmp("a.z.example.com.", "b.example.com."),
-            Ordering::Greater
-        );
-        // Plain string comparison gets exactly this backwards.
-        assert!("a.z.example.com." < "b.example.com.");
-
-        // A name sorts before everything beneath it.
-        assert_eq!(
-            canonical_name_cmp("example.com.", "www.example.com."),
-            Ordering::Less
-        );
-        // Case and trailing dots do not matter.
-        assert_eq!(
-            canonical_name_cmp("EXAMPLE.com", "example.com."),
-            Ordering::Equal
-        );
-        // RFC 4034 §6.1's own example ordering, less the two names it spells
-        // with escapes (`\001.z.example` and `\200.z.example`): a label holding
-        // `\` is refused outright here (`dname::unrepresentable_octet`), so
-        // those are not names this library can hold, and comparing them as
-        // presentation text would order them by the backslash rather than by
-        // the octet they stand for.
-        //
-        // `Z.a.example` and `zABC.a.EXAMPLE` are the case-folding half of the
-        // example, and they are load-bearing: unfolded, `EXAMPLE` sorts before
-        // `example` and the last three lines come out in the wrong order.
-        let mut names = vec![
-            "z.example.",
-            "yljkjljk.a.example.",
-            "*.z.example.",
-            "example.",
-            "zABC.a.EXAMPLE.",
-            "a.example.",
-            "Z.a.example.",
-        ];
-        names.sort_by(|a, b| canonical_name_cmp(a, b));
-        assert_eq!(
-            names,
-            vec![
-                "example.",
-                "a.example.",
-                "yljkjljk.a.example.",
-                "Z.a.example.",
-                "zABC.a.EXAMPLE.",
-                "z.example.",
-                "*.z.example.",
-            ]
-        );
     }
 
     /// The longest shared suffix is a slice of the first name, folded. It was
@@ -1095,40 +817,6 @@ mod tests {
         }
     }
 
-    /// If the sort key and `canonical_name_cmp` disagree, a range query returns
-    /// the wrong NSEC and the covering check silently examines a record that
-    /// cannot prove anything.
-    #[test]
-    fn test_sort_key_ordering_matches_canonical_ordering() {
-        let names = [
-            ".",
-            "example.",
-            "a.example.",
-            "yljkjljk.a.example.",
-            "Z.a.example.",
-            "zABC.a.EXAMPLE.",
-            "z.example.",
-            "*.z.example.",
-            "\\200.z.example.",
-            "b.example.",
-            "a.z.example.",
-            "ab.example.",
-            "abc.example.",
-        ];
-        for a in names {
-            for b in names {
-                assert_eq!(
-                    canonical_sort_key(a).cmp(&canonical_sort_key(b)),
-                    canonical_name_cmp(a, b),
-                    "sort key disagrees with canonical order for {a:?} vs {b:?}"
-                );
-            }
-        }
-        // The two properties the zero terminator buys, spelled out.
-        assert!(canonical_sort_key("example.") < canonical_sort_key("a.example."));
-        assert!(canonical_sort_key("ab.example.") < canonical_sort_key("abc.example."));
-    }
-
     #[test]
     fn test_nsec_covers_excludes_its_endpoints() {
         let n = nsec("a.example.com.", "z.example.com.", &[rt::A]);
@@ -1144,104 +832,6 @@ mod tests {
         let n = nsec("z.example.com.", "example.com.", &[rt::A]);
         assert!(n.covers("zz.example.com."), "after the last name");
         assert!(!n.covers("m.example.com."), "before it");
-    }
-
-    #[test]
-    fn test_type_bitmap_roundtrip() {
-        let bitmap = build_type_bitmap(&[rt::A, rt::NS, rt::SOA, rt::RRSIG, rt::NSEC, rt::DNSKEY]);
-        for present in [rt::A, rt::NS, rt::SOA, rt::RRSIG, rt::NSEC, rt::DNSKEY] {
-            assert!(
-                bitmap_has_type(&bitmap, present),
-                "type {present} should be set"
-            );
-        }
-        for absent in [rt::AAAA, rt::MX, rt::DS, rt::CNAME] {
-            assert!(
-                !bitmap_has_type(&bitmap, absent),
-                "type {absent} should not be set"
-            );
-        }
-    }
-
-    #[test]
-    fn test_type_bitmap_spans_windows() {
-        // TYPE1234 lives in window 4; A lives in window 0.
-        let bitmap = build_type_bitmap(&[rt::A, Rtype::new(1234)]);
-        assert!(bitmap_has_type(&bitmap, rt::A));
-        assert!(bitmap_has_type(&bitmap, Rtype::new(1234)));
-        assert!(!bitmap_has_type(&bitmap, Rtype::new(1235)));
-    }
-
-    /// A bitmap we cannot parse must read as "absent", never as "present".
-    #[test]
-    fn test_malformed_bitmap_denies_nothing() {
-        assert!(!bitmap_has_type(&[0x00], rt::A), "truncated window header");
-        assert!(
-            !bitmap_has_type(&[0x00, 0x09, 0x40], rt::A),
-            "length overruns"
-        );
-        assert!(!bitmap_has_type(&[], rt::A));
-    }
-
-    /// Listing the types back out is what turns an NSEC into a zone-file line.
-    #[test]
-    fn test_bitmap_types_lists_what_was_built() {
-        let types = [
-            rt::A,
-            rt::NS,
-            rt::SOA,
-            rt::RRSIG,
-            rt::NSEC,
-            rt::DNSKEY,
-            Rtype::new(1234),
-        ];
-        let bitmap = build_type_bitmap(&types);
-
-        let mut expected = types.to_vec();
-        expected.sort_unstable();
-        assert_eq!(bitmap_types(&bitmap), expected, "ascending, across windows");
-        assert_eq!(bitmap_types_exact(&bitmap), Ok(expected));
-        assert_eq!(bitmap_types(&[]), Vec::<Rtype>::new());
-    }
-
-    /// A short read must be reported: re-encoding only the types understood
-    /// would emit a record other than the one handed in.
-    #[test]
-    fn test_bitmap_types_reports_a_short_read() {
-        let mut damaged = build_type_bitmap(&[rt::A]);
-        damaged.push(0x01); // a window header with nothing behind it
-        assert_eq!(
-            bitmap_types_exact(&damaged),
-            Err(vec![rt::A]),
-            "what was read, and that there was more"
-        );
-        assert_eq!(bitmap_types_exact(&[0x00, 0x09, 0x40]), Err(vec![]));
-    }
-
-    #[test]
-    fn test_base32hex_roundtrip() {
-        // RFC 4648 §10 test vectors, in base32hex.
-        assert_eq!(base32hex_encode(b"f"), "CO");
-        assert_eq!(base32hex_encode(b"fo"), "CPNG");
-        assert_eq!(base32hex_encode(b"foo"), "CPNMU");
-        assert_eq!(base32hex_encode(b"foob"), "CPNMUOG");
-        assert_eq!(base32hex_encode(b"fooba"), "CPNMUOJ1");
-        assert_eq!(base32hex_encode(b"foobar"), "CPNMUOJ1E8");
-
-        for input in [b"".as_slice(), b"f", b"fo", b"foo", b"foobar", &[0u8; 20]] {
-            let encoded = base32hex_encode(input);
-            assert_eq!(
-                base32hex_decode(&encoded).unwrap(),
-                input,
-                "roundtrip of {encoded}"
-            );
-        }
-        // Lowercase decodes the same, since DNS labels are case-insensitive.
-        assert_eq!(
-            base32hex_decode("cpnmuoj1e8").unwrap(),
-            base32hex_decode("CPNMUOJ1E8").unwrap()
-        );
-        assert!(base32hex_decode("not-base32!").is_err());
     }
 
     /// RFC 5155 Appendix A: the zone `example.` with salt `aabbccdd` and 12

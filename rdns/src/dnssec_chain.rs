@@ -856,8 +856,8 @@ pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::denial_wire::build_type_bitmap;
     use crate::dnssec::ds_digest;
-    use crate::dnssec_denial::build_type_bitmap;
     use crate::dnssec_test_util::{ds_record, TestZone};
     use crate::utils::current_unix_timestamp;
     use crate::Ttl;

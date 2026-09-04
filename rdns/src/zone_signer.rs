@@ -19,10 +19,9 @@
 //! classic signer bug — validators ignore the signature, and the extra RRSIG
 //! shows up in the parent's NSEC bitmap as a type that is not there.
 
+use crate::denial_wire::{build_type_bitmap, canonical_sort_key};
 use crate::dnssec::{canonical_name, Dnskey, Rrset};
-use crate::dnssec_denial::{
-    build_type_bitmap, canonical_sort_key, nsec3_hash, nsec3_owner_name, MAX_NSEC3_ITERATIONS,
-};
+use crate::dnssec_denial::{nsec3_hash, nsec3_owner_name, MAX_NSEC3_ITERATIONS};
 use crate::dnssec_key::SigningKey;
 use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
