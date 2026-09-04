@@ -164,10 +164,26 @@ pub fn ascii_lowered(name: &str) -> String {
     owned
 }
 
+/// Whether `name` holds an ASCII capital, and so needs folding at all.
+///
+/// A fold, not a search. `bytes().any(..)` exits on the first hit, and LLVM will
+/// not vectorize a loop whose exit depends on the data — so it ran one byte per
+/// iteration while the `make_ascii_lowercase` it exists to avoid ran thirty-two
+/// (`TODO.md` #25g). Reducing with OR has no early exit and vectorizes, and the
+/// name's length is the client's to choose.
+///
+/// `wrapping_sub(b'A') < 26` is `is_ascii_uppercase` without the second
+/// comparison and a branch.
+fn has_ascii_uppercase(name: &str) -> bool {
+    name.bytes()
+        .fold(0u8, |seen, b| seen | u8::from(b.wrapping_sub(b'A') < 26))
+        != 0
+}
+
 /// [`ascii_lowered`] without the copy when there is nothing to fold — which is
 /// most names, and this sits on the query path.
 pub fn ascii_lowered_cow(name: &str) -> std::borrow::Cow<'_, str> {
-    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+    if has_ascii_uppercase(name) {
         std::borrow::Cow::Owned(ascii_lowered(name))
     } else {
         std::borrow::Cow::Borrowed(name)
@@ -212,7 +228,7 @@ pub fn absolute(name: &str) -> std::borrow::Cow<'_, str> {
 /// Not [`crate::zone::absolutize`]; see [`absolute`].
 pub fn absolute_lowered(name: &str) -> std::borrow::Cow<'_, str> {
     let needs_dot = !name.ends_with('.');
-    let needs_fold = name.bytes().any(|b| b.is_ascii_uppercase());
+    let needs_fold = has_ascii_uppercase(name);
     if !needs_dot && !needs_fold {
         return std::borrow::Cow::Borrowed(name);
     }
@@ -247,7 +263,7 @@ impl NameKeyBuf {
     /// check does not allocate: the allocation tests run in debug.
     pub fn from_folded(name: String) -> NameKeyBuf {
         debug_assert!(
-            name.ends_with('.') && !name.bytes().any(|b| b.is_ascii_uppercase()),
+            name.ends_with('.') && !has_ascii_uppercase(&name),
             "from_folded was handed {name:?}, which is not in key form"
         );
         NameKeyBuf(name)
@@ -822,6 +838,24 @@ mod tests {
         assert_eq!(record_type_name_to_code("TYPE65536"), None);
         assert_eq!(record_type_name_to_code("TYPE"), None);
         assert_eq!(record_type_name_to_code("TYPEA"), None);
+    }
+
+    /// The fold has no early exit, so the classic mistakes are the ends: a
+    /// capital in the last octet must still be seen, and `@` and `[` sit either
+    /// side of `A`-`Z` in ASCII (`TODO.md` #25g).
+    #[test]
+    fn the_uppercase_scan_sees_both_ends_and_nothing_beside_them() {
+        assert!(has_ascii_uppercase("example.coM"), "the last octet counts");
+        assert!(has_ascii_uppercase("Example.com"), "and the first");
+        assert!(!has_ascii_uppercase("example.com."));
+        assert!(!has_ascii_uppercase(""));
+        // 0x40 and 0x5b bracket the capitals; a `<= b'Z'` off by one takes them.
+        assert!(!has_ascii_uppercase("@[`{-_0129"));
+        assert!(has_ascii_uppercase("@A["), "and the range itself is right");
+        assert!(has_ascii_uppercase("@Z["));
+        // Non-ASCII is not folded at all (RFC 4343): U+212A KELVIN SIGN is not
+        // a capital K here, and its bytes must not read as one either.
+        assert!(!has_ascii_uppercase("\u{212a}.example.com."));
     }
 
     /// The thirteen mnemonics are in the binary already; only `TYPEnnn` has to

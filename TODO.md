@@ -1824,7 +1824,7 @@ anything re-measured should be too.
       compare-and-swap on the rare path. The second is one lock for every UDP
       worker — not the bottleneck at 4 µs/query of syscall, but it is the ceiling,
       and it should be said out loud somewhere rather than discovered.
-- [ ] **25g. The one loop in this tree with a SIMD shape the code prevents.**
+- [x] **25g. The one loop in this tree with a SIMD shape the code prevents.**
       `utils::ascii_lowered_cow` and `absolute_lowered` decide whether to copy
       with `name.bytes().any(|b| b.is_ascii_uppercase())`. LLVM will not vectorize
       a loop with a data-dependent exit, so that test runs **one byte per
@@ -1837,9 +1837,33 @@ anything re-measured should be too.
       ns at 16 octets and **61.1 → 7.9 ns at 200** — and the name length is the
       client's choice, which is the half worth caring about. Three lines, no
       `unsafe`, no intrinsics.
-- [ ] **25h. `zone::nsec3_covering` allocates its range bound.**
+
+      **Done 2026-09-04**, as one `utils::has_ascii_uppercase` behind the three
+      sites that wrote the scan out, with `wrapping_sub(b'A') < 26` in place of
+      `is_ascii_uppercase`'s two comparisons. Re-measured rather than taken from
+      the filing, on both platforms, over a name of all lowercase letters —
+      which is the case that matters, since a name needing no fold is the one
+      that reads every byte:
+
+          octets        Windows search → fold        Linux search → fold
+          16                4.05 → 1.56 ns              3.27 → 1.48 ns
+          64               13.56 → 2.00 ns             12.85 → 2.12 ns
+          200              58.51 → 4.91 ns             56.59 → 4.98 ns
+
+      The search is linear in the length and the fold is nearly flat, which is
+      the half worth caring about: the length is the client's. The probe is
+      `rdns/examples/fold_scan_probe.rs`, kept because the measurement is the
+      whole argument. `write_name`'s `.` scan is left alone — the same shape
+      observed, not a second defect.
+- [x] **25h. `zone::nsec3_covering` allocates its range bound.**
       `zone.rs:232` — `range(..hash.to_vec())` where `range::<[u8], _>(..hash)`
       is the same call without the `Vec`.
+
+      **Already done, in `032debf`, and this box was never ticked.** Found while
+      working through the rest of the section: the code has the
+      `Bound::Excluded(hash)` form with a comment giving this item's own reason.
+      Ticked rather than deleted — an unticked box that is done misleads the
+      same way a ticked one that is not does (§11).
 
 **Checked and not worth doing**, recorded so the next pass does not re-derive it
 (§10's rule about negative results):
