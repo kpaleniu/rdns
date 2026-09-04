@@ -663,9 +663,7 @@ impl Layout {
             // Glue and anything else below a delegation: in the file, not in
             // the zone (RFC 4035 §2.2). In the chain it would assert the
             // existence of names this zone does not serve.
-            entry.occluded = ancestors_of(name)
-                .iter()
-                .any(|ancestor| delegations.contains(ancestor));
+            entry.occluded = ancestors_of(name).any(|ancestor| delegations.contains(ancestor));
         }
 
         Layout {
@@ -694,11 +692,11 @@ impl Layout {
         let mut empty_non_terminals = BTreeSet::new();
         for name in &included {
             for ancestor in ancestors_of(name) {
-                if !is_under(&ancestor, &self.origin) {
+                if !is_under(ancestor, &self.origin) {
                     break;
                 }
-                if !included.contains(&ancestor) {
-                    empty_non_terminals.insert(ancestor);
+                if !included.contains(ancestor) {
+                    empty_non_terminals.insert(ancestor.to_string());
                 }
             }
         }
@@ -716,16 +714,22 @@ impl Layout {
 
 /// Every strict ancestor of `name`, nearest first. `a.b.example.com.` gives
 /// `b.example.com.`, `example.com.`, `com.`, `.`.
-fn ancestors_of(name: &str) -> Vec<String> {
-    let trimmed = name.trim_end_matches('.');
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    let labels: Vec<&str> = trimmed.split('.').collect();
-    (1..labels.len())
-        .map(|i| format!("{}.", labels[i..].join(".")))
-        .chain(std::iter::once(".".to_string()))
-        .collect()
+///
+/// Slices of `name`, which is a zone name and so absolute: an ancestor is a
+/// suffix (`crate::utils::parent_name`). It built a `Vec<&str>`, a `join` and a
+/// `format!` per ancestor, and `Layout::of` runs it once per name in the zone
+/// and `chain_names` runs it again — at every load and every re-signing.
+fn ancestors_of(name: &str) -> impl Iterator<Item = &str> {
+    debug_assert!(
+        name.ends_with('.'),
+        "ancestors_of walks by suffix and was handed the relative name {name:?}"
+    );
+    let mut next = crate::utils::parent_name(name);
+    std::iter::from_fn(move || {
+        let current = next?;
+        next = crate::utils::parent_name(current);
+        Some(current)
+    })
 }
 
 /// Whether `name` is strictly below `origin`.

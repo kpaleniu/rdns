@@ -270,14 +270,14 @@ impl DelegationCache {
         let mut entries = self.entries.lock().ok()?;
 
         for candidate in ancestors(&name) {
-            match entries.get(candidate.as_str()) {
-                Some(entry) if entry.expires_at > now && accept(&candidate) => {
-                    return Some((candidate, entry.servers.clone()));
+            match entries.get(candidate) {
+                Some(entry) if entry.expires_at > now && accept(candidate) => {
+                    return Some((candidate.to_string(), entry.servers.clone()));
                 }
                 // Live, but the caller does not want to start here.
                 Some(entry) if entry.expires_at > now => {}
                 Some(_) => {
-                    entries.remove(candidate.as_str());
+                    entries.remove(candidate);
                 }
                 None => {}
             }
@@ -402,21 +402,21 @@ impl RttStore {
 
 /// A name and every zone above it, deepest first: `www.example.com.` yields
 /// `www.example.com.`, `example.com.`, `com.`, `.`.
-fn ancestors(name: &str) -> Vec<String> {
-    let name = normalize(name);
-    let mut out = vec![name.clone()];
-    let mut rest = name.as_str();
-    while let Some(dot) = rest.find('.') {
-        rest = &rest[dot + 1..];
-        if rest.is_empty() {
-            break;
-        }
-        out.push(rest.to_string());
-    }
-    if out.last().map(|s| s != ".").unwrap_or(true) {
-        out.push(".".to_string());
-    }
-    out
+///
+/// Slices of `name`, which both callers have normalized: an ancestor is a
+/// suffix. It allocated one `String` per ancestor plus the spine, per
+/// delegation-cache lookup and per chain resumption.
+fn ancestors(name: &str) -> impl Iterator<Item = &str> {
+    debug_assert!(
+        name.ends_with('.'),
+        "ancestors walks by suffix and was handed the relative name {name:?}"
+    );
+    let mut next = Some(name);
+    std::iter::from_fn(move || {
+        let current = next?;
+        next = crate::utils::parent_name(current);
+        Some(current)
+    })
 }
 
 /// What a referral told us.
@@ -1415,11 +1415,12 @@ impl Resolver {
         // to pick where the resolution began. Disagreeing makes the walk skip a
         // zone cut whose DS this loop then goes looking for.
         let (mut zone, mut ds_set) = (anchor_zone.clone(), anchor_ds);
-        for candidate in ancestors(&normalize(target)) {
-            if is_at_or_under(&candidate, &anchor_zone) && self.keys.holds(&candidate) {
+        let target_key = normalize(target);
+        for candidate in ancestors(&target_key) {
+            if is_at_or_under(candidate, &anchor_zone) && self.keys.holds(candidate) {
                 // Cached keys were validated to the anchor already, so the DS
                 // that got us there is not needed again.
-                zone = candidate;
+                zone = candidate.to_string();
                 ds_set = Vec::new();
                 break;
             }
@@ -2666,11 +2667,11 @@ this line has no record and is skipped
     #[test]
     fn test_ancestors_are_deepest_first() {
         assert_eq!(
-            ancestors("www.example.com."),
+            ancestors("www.example.com.").collect::<Vec<_>>(),
             vec!["www.example.com.", "example.com.", "com.", "."]
         );
-        assert_eq!(ancestors("com."), vec!["com.", "."]);
-        assert_eq!(ancestors("."), vec!["."]);
+        assert_eq!(ancestors("com.").collect::<Vec<_>>(), vec!["com.", "."]);
+        assert_eq!(ancestors(".").collect::<Vec<_>>(), vec!["."]);
     }
 
     /// The deepest cached zone wins, because it skips the most round trips.
