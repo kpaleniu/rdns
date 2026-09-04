@@ -119,6 +119,7 @@ fn allocation_counts() {
     ordering_two_names_canonically();
     building_the_metrics_registry();
     proving_a_signed_nxdomain();
+    answering_a_signed_query();
     proving_a_signed_nxdomain_under_nsec3();
     checking_a_signed_nxdomain();
     what_the_resolvers_caches_cost();
@@ -977,6 +978,61 @@ fn proving_a_signed_nxdomain() {
         "the SOA's RRSIG and two NSECs with theirs"
     );
     within("prove a signed NXDOMAIN", count, 5..=15);
+}
+
+/// A positive answer from a signed zone: the records and the RRSIGs over them,
+/// written the way `rdnsd`'s answer path writes them.
+///
+/// The gate is on the *sequence*, not on `push_answer_signatures` alone, because
+/// what #25a removed is a repetition between the two halves:
+/// `push_answer_signatures` located the name a second time and canonicalized a
+/// name the caller had already folded. The lookup is time rather than
+/// allocations, so what this holds is the fold — one per signed answer.
+fn answering_a_signed_query() {
+    let zone = signed_zone();
+    let request = rdns::DnsMessageBuilder::new()
+        .with_url("www.example.com.", "A")
+        .with_id(1)
+        .with_dnssec(true)
+        .build();
+    let qtype = Qtype::of(record_types::A);
+    let mut out = Vec::new();
+    let mut compressor = rdns::compression::NameCompressor::new();
+
+    let answer = |w: &mut rdns::response::ResponseWriter| {
+        // As `answer.rs` does it: fold once, locate once, and hand that lookup
+        // to the signatures.
+        let key = rdns::utils::absolute_lowered("www.example.com.");
+        let at = zone.locate(&key);
+        for record in at.of_type(qtype) {
+            w.push(
+                rdns::response::Section::Answer,
+                "www.example.com.",
+                record.class,
+                record.ttl,
+                &record.rdata,
+            )
+            .expect("the record writes");
+        }
+        rdns::dnssec_answer::push_answer_signatures(&at, &key, qtype, w)
+            .expect("the signatures write")
+    };
+
+    // The first call in a process picks up a one-off; measure the second.
+    let mut w = rdns::response::ResponseWriter::start(&mut out, &mut compressor, 4096, &request)
+        .expect("start a reply");
+    let _ = answer(&mut w);
+    w.finish().expect("the reply serializes");
+
+    let mut w = rdns::response::ResponseWriter::start(&mut out, &mut compressor, 4096, &request)
+        .expect("start a reply");
+    let (wildcard, count) = allocations(|| answer(&mut w));
+    w.finish().expect("the reply serializes");
+    assert!(!wildcard, "an exact name, not a wildcard");
+
+    let reply = rdns::DnsMessage::try_from_bytes(&out).expect("and parses back");
+    assert_eq!(reply.answers.len(), 2, "the A record and its RRSIG");
+    within("answer a signed query", count, 0..=0);
 }
 
 /// The same NXDOMAIN over an NSEC3-signed zone, where the proof is a walk and

@@ -88,6 +88,13 @@ impl<'a> Located<'a> {
         &self.kind
     }
 
+    /// The zone this was located in, so a caller that already has a `Located`
+    /// need not carry the zone beside it — one argument that can disagree with
+    /// another is one too many (`CLAUDE.md` §17).
+    pub fn zone(&self) -> &'a Zone {
+        self.zone
+    }
+
     pub fn into_kind(self) -> NameKind {
         self.kind
     }

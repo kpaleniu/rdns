@@ -21,7 +21,7 @@ use crate::error::WireError;
 use crate::response::{ResponseWriter, Section};
 use crate::utils::record_types as rt;
 use crate::utils::{names_equal, parent_name};
-use crate::zone::{NameKind, Zone, ZoneRecord};
+use crate::zone::{Located, NameKind, Zone, ZoneRecord};
 use crate::Qtype;
 use crate::Rtype;
 use crate::Ttl;
@@ -42,18 +42,20 @@ pub fn is_signed(zone: &Zone) -> bool {
 /// A wildcard's signature is re-owned onto the queried name with its label count
 /// left alone: that is what lets a validator reconstruct the name really signed
 /// (RFC 4035 §5.3.2).
+///
+/// `at` is the answer's own lookup, handed in rather than repeated: the caller
+/// has just read the records out of it (`TODO.md` #25a). `qname` is the name it
+/// was located with, canonical, and is what the signatures are echoed under.
 pub fn push_answer_signatures(
-    zone: &Zone,
+    at: &Located,
     qname: &str,
     qtype: Qtype,
     w: &mut ResponseWriter,
 ) -> Result<bool, WireError> {
-    if !is_signed(zone) {
+    if !is_signed(at.zone()) {
         return Ok(false);
     }
-    let qname = canonical_name(qname);
     let mut wildcard = false;
-    let at = zone.locate(&qname);
     for record in at.of_type(Qtype::of(rt::RRSIG)) {
         let Some(type_covered) = record.rdata.rrsig_type_covered() else {
             continue;
@@ -66,10 +68,10 @@ pub fn push_answer_signatures(
         }
         // An RRSIG's owner is the record's own name, so this is the wildcard
         // test without the parse: `locate` fell back to `*.<encloser>`.
-        wildcard |= !names_equal(&record.name, &qname);
+        wildcard |= !names_equal(&record.name, qname);
         w.push(
             Section::Answer,
-            &qname,
+            qname,
             record.class,
             record.ttl,
             &record.rdata,
@@ -574,7 +576,8 @@ mod tests {
     fn signatures_for(zone: &Zone, qname: &str, qtype: Qtype) -> (Vec<ResourceRecord>, bool) {
         let mut wildcard = false;
         let records = written(|w| {
-            wildcard = push_answer_signatures(zone, qname, qtype, w)?;
+            let qname = canonical_name(qname);
+            wildcard = push_answer_signatures(&zone.locate(&qname), &qname, qtype, w)?;
             Ok(())
         });
         (records, wildcard)

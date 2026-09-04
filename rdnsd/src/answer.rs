@@ -17,7 +17,7 @@ use rdns::error::WireError;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::response::{ResponseWriter, Section};
 use rdns::utils::{absolute_lowered, record_types};
-use rdns::zone::{NameKind, Zone};
+use rdns::zone::{Located, NameKind, Zone};
 use rdns::Qtype;
 use rdns::Ttl;
 use rdns::{dnssec_answer, DnsMessage, Edns, OpCode, QueryClass, ResponseCode};
@@ -182,9 +182,14 @@ fn answer_question(
 
     match resolve_in_zone(zone, &query.qname, &key, query.qtype) {
         Outcome::Referral { cut } => refer_to_child(zone, &cut, dnssec_ok, w),
-        Outcome::Answer { chain, name, key } => {
+        Outcome::Answer {
+            chain,
+            name,
+            key,
+            at,
+        } => {
             let owed = add_chain(zone, &chain, dnssec_ok, w)?;
-            let target_owed = add_answer(zone, &name, &key, query.qtype, dnssec_ok, w)?;
+            let target_owed = add_answer(&at, &name, &key, query.qtype, dnssec_ok, w)?;
             add_chain_denials(zone, &chain, owed, w)?;
             if target_owed {
                 dnssec_answer::push_proof_of_absence(zone, &key, w)?;
@@ -219,6 +224,10 @@ enum Outcome<'a> {
         chain: Vec<String>,
         name: Cow<'a, str>,
         key: Cow<'a, str>,
+        /// The lookup that found them, carried rather than repeated: writing
+        /// the records and their signatures used to locate the same name twice
+        /// more (`TODO.md` #25a).
+        at: Located<'a>,
     },
     /// No records. `name` is the name the "no" is about — the end of the chain
     /// when one was followed — and `kind` decides NXDOMAIN against NODATA.
@@ -248,7 +257,7 @@ pub(crate) const MAX_CNAME_HOPS: usize = 16;
 /// is nothing left to fold, so passing the folded form makes every lookup below
 /// free. A case-randomized query folded its name three times before this
 /// (`TODO.md` #27a).
-fn resolve_in_zone<'a>(zone: &Zone, qname: &'a str, qkey: &'a str, qtype: Qtype) -> Outcome<'a> {
+fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a str, qkey: &'a str, qtype: Qtype) -> Outcome<'a> {
     let mut chain: Vec<String> = Vec::new();
     let mut visited: Vec<String> = Vec::new();
     let mut name: Cow<'a, str> = Cow::Borrowed(qname);
@@ -279,7 +288,12 @@ fn resolve_in_zone<'a>(zone: &Zone, qname: &'a str, qkey: &'a str, qtype: Qtype)
         // (#27c).
         let located = zone.locate(&key);
         if located.has_type(qtype) {
-            return Outcome::Answer { chain, name, key };
+            return Outcome::Answer {
+                chain,
+                name,
+                key,
+                at: located,
+            };
         }
         // A CNAME query is answered by the CNAME, not followed by it.
         if qtype.is(record_types::CNAME) {
@@ -339,14 +353,14 @@ fn in_zone(zone: &Zone, name: &str) -> bool {
 /// at every name the wildcard reaches, so without the denial one captured answer
 /// serves for all).
 fn add_answer(
-    zone: &Zone,
+    at: &Located,
     name: &str,
     key: &str,
     qtype: Qtype,
     dnssec_ok: bool,
     w: &mut ResponseWriter,
 ) -> Result<bool, WireError> {
-    for record in zone.locate(key).of_type(qtype) {
+    for record in at.of_type(qtype) {
         w.push(
             Section::Answer,
             name,
@@ -359,7 +373,7 @@ fn add_answer(
     if !dnssec_ok {
         return Ok(false);
     }
-    dnssec_answer::push_answer_signatures(zone, key, qtype, w)
+    dnssec_answer::push_answer_signatures(at, key, qtype, w)
 }
 
 /// The aliases walked to reach the answer, in the order they were followed.
@@ -378,10 +392,11 @@ fn add_chain(
     for (i, at) in chain.iter().enumerate() {
         // Folded here rather than carried: a chain is empty on the ordinary
         // answer, so this pays only where an alias was actually followed.
+        let key = absolute_lowered(at);
         if add_answer(
-            zone,
+            &zone.locate(&key),
             at,
-            &absolute_lowered(at),
+            &key,
             Qtype::of(record_types::CNAME),
             dnssec_ok,
             w,

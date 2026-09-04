@@ -331,7 +331,13 @@ fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring
                 let _ = w.finish();
             };
             into(&mut |w| {
-                let _ = dnssec_answer::push_answer_signatures(z, &query.qname, query.qtype, w);
+                let canonical = rdns::dnssec::canonical_name(&query.qname);
+                let _ = dnssec_answer::push_answer_signatures(
+                    &z.locate(&canonical),
+                    &canonical,
+                    query.qtype,
+                    w,
+                );
             });
             into(&mut |w| {
                 let _ = dnssec_answer::push_negative_proof(z, &query.qname, &kind, w);

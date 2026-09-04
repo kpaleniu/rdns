@@ -681,9 +681,10 @@ algorithmic shape rather than structure. ~~**#23 is the one with teeth**: a quer
 that costs a second of CPU on `rdnsr --dnssec-validate`, provoked and timed.~~
 **#23 is fixed** (`9715c3c`, 2026-08-04) — seventh time, same day again. ~~#22 and
 #24-#26 are open.~~ — **all of #24 fixed 2026-08-05**, so read the table: #22,
-#25 and #26 are open. ~~#26 too~~ — **#26 closed 2026-09-04**, in three commits;
-which is the eighth time a sentence here has gone stale and is left corrected
-rather than reworded, for the reason the next paragraph gives.
+#25 and #26 are open. ~~#26 too~~ — **#25 and #26 both closed 2026-09-04**, in
+six commits; which is the eighth time a sentence here has gone stale and is left
+corrected rather than reworded, for the reason the next paragraph gives. Of the
+numbered sections, **#22 is the only one of #22-#26 still open**.
 
 ~~#11, a stretch goal blocked on hardware counters the development machine cannot read~~ —
 **answered no on 2026-08-04**, and the blocker did not exist: the Linux side has
@@ -730,7 +731,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **10** | dynamic UPDATE (RFC 2136) | **done 2026-08-03**, seven commits. Reading (`8ff74db`, `eff4fcb`), applying and the serial (`fedf8d9`), authorization (`fedf8d9`), dispatch and persistence (`fedf8d9`). Incremental re-signing (`fedf8d9`) and the journal (#7 step 6) closed it |
 | **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`9715c3c`), the day after it was filed. 1 124 ms → 1.28 ms on the same probe. The fix is a type — `Nsec3Params`, the triple a hash is a function of — plus the map lookup the key was already there for, and the proof moved out from under the lock. One of the four filed boxes did not survive being checked against the code: NSEC3 hides how deep a cached name is, so the depth bound it asked for is not available to take |
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection was O(zones per query) — 55 µs at ten thousand zones, now 32 ns and flat, keyed on `NameKeyBuf` with a walk up the QNAME, and the walk brought a second multiplier with it that the client picks. Name compression was O(n²) in the records of one message, so a 400-record transfer envelope cost 130.7 µs to serialize and now costs 42.8; the index that fixes it is built lazily, because the threshold that helps a transfer hurt a 60-name response by 26%. And an AXFR held the zone three times over before the first byte went out; the envelopes are an iterator now, at 10.5× less peak memory, which needed `Arc<Zone>` in the map because the lock cannot be held across a socket write |
-| **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
+| **25** | per-answer waste on paths #9e already measured | **closed 2026-09-04**, filed 2026-08-04. Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it. **Two of the eight corrected themselves on the way**: 25a's three walks were down to two before it was started, because #28b and #27c had removed the others, and 25h was already fixed and never ticked. 25g's win is the one worth remembering — an uppercase *search* is linear in the name's length and a fold is flat, and the length is the client's |
 | **28** | work the answer path does and need not | **filed 2026-09-01; 28a-28c done and 28d answered *no* the same day.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
 | **29** | the resolver half never got #27's pass | **filed and closed 2026-09-04**, five commits; #25b, #25e and #26e closed with it. #27 and #28 gated `rdnsd`'s answer path at three allocations a query; `rdnsr` was never in that series and `rdns/tests/allocations.rs` cannot see it. The same walks, the same hashing, the same reply buffer, with the fixed copy sitting beside them |
 | **30** | the two daemons' transports are one transport written twice | **open, filed 2026-09-04 and reviewed the same day.** Seventeen items: fifteen duplicated between `rdnsd` and `rdnsr` — the TCP transport whole, the five transport constants, the shutdown epilogue, the admission pipeline, five hand-written reply skeletons, the EDNS mirroring — two between `rdnsc` and the library, and ~~**30q, the one defect: `rdnsr` never applies the admission check to TCP**, so on that transport the 16 KiB ceiling, the QDCOUNT cap and the pre-parse section caps do not run~~ — **30q fixed 2026-09-04**, the only defect in the section and the first thing done from it, followed the same day by 30f, 30l, 30n and both halves of 30g — which was not a tidy-up after all: the skeleton it removed was hiding `rdnsr` clearing the CD bit RFC 4035 §3.2.2 says to copy, and 30r beside it — then 30h, which closed 30i and 30j behind it. Then 30p and 30o, which is where the *library* turned out to hold the weaker copy of a check `rdnsc` had right, and 30m — answered by reading what the facility was *for* rather than by deleting it. What is left is 30a-30e, on #31. The library itself came out clean. Reviewing the filing against the code struck four of its claims, including two that had the direction backwards; what the review moved is recorded at the end of the section |
@@ -1672,7 +1673,7 @@ machine moved between runs — the same `to_bytes` read 106 ns in one run and
 250 ns in three later ones — so **every number below is a delta or a ratio**, and
 anything re-measured should be too.
 
-- [ ] **25a. The answer path walks the zone three times to answer once.**
+- [x] **25a. The answer path walks the zone three times to answer once.**
       `answer.rs:282-330`: `delegation_for` (an ancestor walk), then `name_kind`
       (another), then `zone.query(...).is_empty()` — which recomputes
       `name_kind_of_key` internally and allocates a `Vec` to answer a boolean —
@@ -1680,6 +1681,28 @@ anything re-measured should be too.
       along. `Zone::query` alone is 61-69 ns; what `resolve_in_zone` +
       `add_answer` do is 190-215 ns. Have `name_kind` hand back the positions it
       found, or give `of_type` an iterator form.
+
+      **Both of those landed before this box did** — `Zone::locate` returns a
+      `Located` holding positions rather than records (#28b, #27c), so by
+      2026-09-04 the three walks were: `delegation_for`, one `locate` in
+      `resolve_in_zone`, and **a second `locate` in `add_answer` for the records
+      the first had already found**. On the DO path a third, inside
+      `push_answer_signatures`, plus a `canonical_name` of a name the caller had
+      already folded.
+
+      **Closed 2026-09-04** by carrying the lookup instead of repeating it:
+      `Outcome::Answer` holds the `Located`, `add_answer` takes it, and
+      `push_answer_signatures` takes it too — with `Located::zone()` so the
+      caller need not pass the zone beside it, which is one argument that can
+      disagree with another (§17).
+
+      A positive signed answer is **1 allocation → 0**, held by a new gate in
+      `allocations.rs` and watched failing against the old call. The lookups
+      themselves are time rather than allocations: `zone/hit` is 67 ns in the
+      criterion suite, and the answer path makes one fewer of them per answer
+      and two fewer with DO. End to end that is under 2% of a query — the
+      bench's own header says a whole answer is ~6% of what a query costs — so
+      it is not claimed as a query-rate win.
 - [x] **25b. Every TCP reply allocates and zeroes 64 KiB.** `main.rs:1119`,
       `:1267`, `:1625` call `to_bytes_within(u16::MAX)`, and
       `to_bytes_within_buf` does `clear()` then `resize(max_len, 0)` — a full
