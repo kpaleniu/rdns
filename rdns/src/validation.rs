@@ -1,5 +1,6 @@
-use crate::error::{RequestError, RequestResult, WireError};
-use crate::{DnsMessage, OpCode};
+use crate::error::{AnswerMismatch, RequestError, RequestResult, WireError};
+use crate::utils::names_equal;
+use crate::{DnsMessage, OpCode, Qtype, QueryClass};
 
 /// A message that arrived at a listening socket and is a question.
 ///
@@ -39,6 +40,59 @@ impl std::ops::Deref for Request {
     fn deref(&self) -> &DnsMessage {
         &self.0
     }
+}
+
+/// The query a reply has to answer, as it went on the wire.
+///
+/// The mirror of [`Request`]: that one is the door for what arrives at a
+/// listening socket, this is the check on what comes back to a client one.
+/// Borrowed, because the caller still holds the message it built.
+#[derive(Debug, Clone, Copy)]
+pub struct SentQuery<'a> {
+    pub id: u16,
+    /// The QNAME as it was sent — scrambled case included.
+    pub qname: &'a str,
+    pub qtype: Qtype,
+    pub qclass: QueryClass,
+    /// Compare the name byte for byte rather than folding ASCII case. DNS-0x20
+    /// puts entropy in the casing, and entropy nobody compares is none; without
+    /// it the compare must fold, because a server may echo the question in any
+    /// case (RFC 4343).
+    pub case_sensitive: bool,
+}
+
+/// Whether `reply` answers `sent` (RFC 5452 §9.1).
+///
+/// §9.1 lists five attributes a resolver MUST match: both addresses, the source
+/// port, the id, the name, and the class and type. A `connect`ed socket leaves
+/// the kernel to enforce the first three, so this is the rest of the list — and
+/// the type and class half of it is what the resolver's own copy of this check
+/// did not have (`TODO.md` #30o).
+pub fn answers_query(reply: &DnsMessage, sent: &SentQuery) -> Result<(), AnswerMismatch> {
+    if !reply.response {
+        return Err(AnswerMismatch::NotAResponse);
+    }
+    if reply.id != sent.id {
+        return Err(AnswerMismatch::Id {
+            got: reply.id,
+            want: sent.id,
+        });
+    }
+    let Some(echoed) = reply.queries.first() else {
+        return Err(AnswerMismatch::NoQuestion);
+    };
+    let name_matches = if sent.case_sensitive {
+        echoed.qname == sent.qname
+    } else {
+        names_equal(&echoed.qname, sent.qname)
+    };
+    if !name_matches || echoed.qtype != sent.qtype || echoed.qclass != sent.qclass {
+        return Err(AnswerMismatch::Question {
+            got: format!("{} {} {:?}", echoed.qname, echoed.qtype, echoed.qclass),
+            want: format!("{} {} {:?}", sent.qname, sent.qtype, sent.qclass),
+        });
+    }
+    Ok(())
 }
 
 /// Upper bound on additional records in a request. A legitimate request carries
@@ -222,6 +276,74 @@ mod tests {
             packet[2] |= 0x80;
         }
         packet
+    }
+
+    /// RFC 5452 §9.1's list, minus what the socket enforces: the id, the name,
+    /// and "Query class and type" — which the resolver's own copy of this check
+    /// did not have, so an upstream (or a spoofer past the id) could answer an A
+    /// query with an MX question echoed and be believed (`TODO.md` #30o).
+    #[test]
+    fn an_answer_matches_the_question_type_and_class_too() {
+        let asked = DnsMessage::try_from_bytes(&query_packet(false)).expect("a question");
+        let sent = SentQuery {
+            id: asked.id,
+            qname: &asked.queries[0].qname,
+            qtype: asked.queries[0].qtype,
+            qclass: asked.queries[0].qclass,
+            case_sensitive: false,
+        };
+
+        let mut reply = DnsMessage::reply_to(&asked);
+        assert_eq!(answers_query(&reply, &sent), Ok(()));
+
+        reply.queries[0].qtype = Qtype::of(crate::utils::record_types::MX);
+        assert!(matches!(
+            answers_query(&reply, &sent),
+            Err(AnswerMismatch::Question { .. })
+        ));
+
+        let mut reply = DnsMessage::reply_to(&asked);
+        reply.queries[0].qclass = QueryClass::CH;
+        assert!(matches!(
+            answers_query(&reply, &sent),
+            Err(AnswerMismatch::Question { .. })
+        ));
+
+        // The name folds ASCII case without DNS-0x20 (RFC 4343) and is compared
+        // byte for byte with it, since that is where the entropy is.
+        let mut reply = DnsMessage::reply_to(&asked);
+        reply.queries[0].qname = reply.queries[0].qname.to_uppercase();
+        assert_eq!(answers_query(&reply, &sent), Ok(()));
+        let strict = SentQuery {
+            case_sensitive: true,
+            ..sent
+        };
+        assert!(matches!(
+            answers_query(&reply, &strict),
+            Err(AnswerMismatch::Question { .. })
+        ));
+
+        // And the two that are not about the question at all.
+        let mut wrong_id = DnsMessage::reply_to(&asked);
+        wrong_id.id = asked.id.wrapping_add(1);
+        assert!(matches!(
+            answers_query(&wrong_id, &sent),
+            Err(AnswerMismatch::Id { .. })
+        ));
+
+        let mut query = DnsMessage::reply_to(&asked);
+        query.response = false;
+        assert_eq!(
+            answers_query(&query, &sent),
+            Err(AnswerMismatch::NotAResponse)
+        );
+
+        let mut silent = DnsMessage::reply_to(&asked);
+        silent.queries.clear();
+        assert_eq!(
+            answers_query(&silent, &sent),
+            Err(AnswerMismatch::NoQuestion)
+        );
     }
 
     /// A response arriving at a listening socket is not a question, and the

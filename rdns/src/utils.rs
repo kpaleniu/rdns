@@ -2,6 +2,7 @@
 
 use crate::error::{DnssecError, DnssecResult};
 use crate::{ParsedRecord, RecordData, Rtype};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// DNS record type constants
@@ -41,6 +42,24 @@ pub mod record_types {
 /// no [`std::io::ErrorKind`] for it — it arrives as `Uncategorized` — so the raw
 /// code is the only way to recognize it.
 const WSAEMSGSIZE: i32 = 10040;
+
+/// The wildcard address to bind before talking to `target`.
+///
+/// The family has to match: a v4 socket cannot reach a v6 peer, and binding
+/// `0.0.0.0` then connecting to a v6 address fails outright. Port 0, because a
+/// random source port is half of RFC 5452 §9.2's off-path resistance — the
+/// other half is the id.
+///
+/// Pure and free of I/O, so `rdnsc`'s blocking socket and the resolver's and
+/// `rdnsd`'s async ones share it; it was written out three times
+/// (`TODO.md` #30p).
+pub fn bind_addr_for(target: SocketAddr) -> SocketAddr {
+    if target.is_ipv6() {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    }
+}
 
 /// Whether a UDP receive error is about a datagram rather than about the health
 /// of the socket.
@@ -735,6 +754,19 @@ mod tests {
         assert_eq!(record_type_name_to_code("TYPE65536"), None);
         assert_eq!(record_type_name_to_code("TYPE"), None);
         assert_eq!(record_type_name_to_code("TYPEA"), None);
+    }
+
+    /// A socket has to be in the peer's family, and a v4-mapped v6 address is a
+    /// v6 peer: binding `0.0.0.0` and connecting to `::ffff:192.0.2.1` fails.
+    #[test]
+    fn a_socket_binds_the_family_it_will_talk_to() {
+        let v4: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:192.0.2.1]:53".parse().unwrap();
+
+        assert_eq!(bind_addr_for(v4), "0.0.0.0:0".parse().unwrap());
+        assert_eq!(bind_addr_for(v6), "[::]:0".parse().unwrap());
+        assert_eq!(bind_addr_for(mapped), "[::]:0".parse().unwrap());
     }
 
     /// The oversized-datagram case, tested through the raw code because

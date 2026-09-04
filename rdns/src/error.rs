@@ -65,6 +65,31 @@ pub enum RequestError {
     NotAQuestion,
 }
 
+/// Why a reply is not an answer to the query that was sent.
+///
+/// RFC 5452 §9.1's list, minus the parts the socket already enforces: with a
+/// `connect`ed socket the kernel checks both addresses and both ports, so what
+/// is left for a caller is "Query ID", "Query name" and "Query class and type".
+///
+/// Every caller drops the packet, so the variants are for the operator, not for
+/// branching: `rdnsc` prints the reason and the resolver counts a non-answer.
+/// They stay separate anyway because a test asserts on the variant rather than
+/// on a message (`CLAUDE.md` §3), and because "the id was wrong" and "the
+/// question was somebody else's" are different things to see in a log.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AnswerMismatch {
+    /// QR is clear. Not on RFC 5452's list, which assumes a response; a query
+    /// echoed back is not an answer to it (RFC 1035 §4.1.1).
+    #[error("QR is clear, so it is a query and not an answer")]
+    NotAResponse,
+    #[error("id {got:#06x} does not match the {want:#06x} we asked with")]
+    Id { got: u16, want: u16 },
+    #[error("no question section to compare")]
+    NoQuestion,
+    #[error("answers {got}, not the {want} we asked")]
+    Question { got: String, want: String },
+}
+
 /// A zone that will not load, or will not be written back out.
 #[derive(Debug, thiserror::Error)]
 pub enum ZoneError {

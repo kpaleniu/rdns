@@ -10,12 +10,15 @@ use crate::dnssec_chain::{
 use crate::dnssec_denial::{nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, Denial};
 use crate::error::{ResolveError, ResolveResult};
 use crate::utils::{
-    absolute_lowered, current_unix_timestamp, is_at_or_under, label_count, names_equal,
-    record_types as rt, NameKeyBuf,
+    absolute_lowered, bind_addr_for, current_unix_timestamp, is_at_or_under, label_count,
+    names_equal, record_types as rt, NameKeyBuf,
 };
+use crate::validation::{answers_query, SentQuery};
 use crate::Qtype;
 use crate::Rtype;
-use crate::{DnsMessage, Edns, ParsedRecord, QuerySection, ResourceRecord, ResponseCode};
+use crate::{
+    DnsMessage, Edns, ParsedRecord, QueryClass, QuerySection, ResourceRecord, ResponseCode,
+};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -435,6 +438,22 @@ struct OutgoingQuery {
     buf: Vec<u8>,
     id: u16,
     qname: String,
+    qtype: Qtype,
+    qclass: QueryClass,
+}
+
+impl OutgoingQuery {
+    /// What a reply has to match to be an answer to this
+    /// (RFC 5452 §9.1) — see [`crate::validation::answers_query`].
+    fn sent(&self, case_sensitive: bool) -> SentQuery<'_> {
+        SentQuery {
+            id: self.id,
+            qname: &self.qname,
+            qtype: self.qtype,
+            qclass: self.qclass,
+            case_sensitive,
+        }
+    }
 }
 
 /// Tracks how much work one client query has cost us.
@@ -737,24 +756,19 @@ impl Resolver {
             buf,
             id,
             qname: sent_qname,
+            qtype: query.qtype,
+            qclass: query.qclass,
         })
     }
 
-    /// Whether a reply answers the query sent: same id, echoed question matches.
-    /// With 0x20 on the name compare is case-sensitive, which is what makes the
-    /// random casing an anti-spoofing signal. A mismatch counts as no answer.
+    /// Whether a reply answers the query sent (RFC 5452 §9.1). With 0x20 on, the
+    /// name compare is case-sensitive, which is what makes the random casing an
+    /// anti-spoofing signal. A mismatch counts as no answer.
+    ///
+    /// Shared with `rdnsc`, whose copy had the type and class compare this one
+    /// was missing (`TODO.md` #30o).
     fn response_matches(&self, response: &DnsMessage, sent: &OutgoingQuery) -> bool {
-        if response.id != sent.id {
-            return false;
-        }
-        let Some(question) = response.queries.first() else {
-            return false;
-        };
-        if self.config.zero_x20 {
-            question.qname == sent.qname
-        } else {
-            names_equal(&question.qname, &sent.qname)
-        }
+        answers_query(response, &sent.sent(self.config.zero_x20)).is_ok()
     }
 
     /// Resolve by walking the delegation chain, following any CNAME chain the
@@ -1195,14 +1209,7 @@ impl Resolver {
     ) -> ResolveResult<DnsMessage> {
         // tokio's UdpSocket has no read timeout of its own.
         let read_timeout = Duration::from_millis(self.config.timeout_ms / 2);
-        // Same family as the target: a v4-wildcard socket cannot connect to a v6
-        // address. Port 0 keeps the source port random — that is anti-spoofing.
-        let bind_addr = if upstream.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let socket = UdpSocket::bind(bind_addr).await?;
+        let socket = UdpSocket::bind(bind_addr_for(*upstream)).await?;
         socket.connect(upstream).await?;
 
         socket.send(&out.buf).await?;
@@ -1792,6 +1799,41 @@ this line has no record and is skipped
 
         let result = resolver.resolve(&test_query()).await;
         assert!(result.is_err());
+    }
+
+    /// RFC 5452 §9.1 makes "Query class and type" part of what a reply must
+    /// match, and this check had only the id and the name — `rdnsc`'s copy of it
+    /// had all three (`TODO.md` #30o). A reply echoing the right name under
+    /// another type is somebody else's answer.
+    ///
+    /// Watched failing before the shared predicate: the MX-questioned reply was
+    /// taken as the answer to an A query, address record and all.
+    #[tokio::test]
+    async fn a_reply_that_echoes_another_type_is_not_this_answer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind a fake upstream");
+        let addr = socket.local_addr().unwrap();
+        let _server = spawn_server(socket, |query| {
+            let mut resp = response_to(query);
+            if let Some(q) = resp.queries.first_mut() {
+                q.qtype = Qtype::of(rt::MX);
+            }
+            resp.answers.push(a_record("example.com.", [192, 0, 2, 1]));
+            resp
+        });
+
+        let mut config = test_config(addr);
+        // The upstream answers at once; this only bounds the retries.
+        config.timeout_ms = 500;
+        let resolver = Resolver::new(config);
+
+        let err = resolver
+            .resolve(&test_query())
+            .await
+            .expect_err("an MX question is not an answer to an A query");
+        assert!(
+            matches!(err, ResolveError::NoResponse(_)),
+            "and it counts as no answer, not as a lookup failure: {err:?}"
+        );
     }
 
     /// A UDP server that answers with whatever the closure builds. Stops when

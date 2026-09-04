@@ -43,7 +43,7 @@ use rdns::{
     transfer::axfr_envelopes,
     tsig::{self, TsigCheck, TsigKeyring, TsigSession},
     update,
-    utils::{current_unix_timestamp, recv_error_is_transient, UDP_RECEIVE_BUFFER},
+    utils::{bind_addr_for, current_unix_timestamp, recv_error_is_transient, UDP_RECEIVE_BUFFER},
     validation::{AdmissionCheck, Request},
     zone::{parse_zone_file_at, Zone},
     DnsMessage, Edns, OpCode, Qtype, ResourceRecord, ResponseCode, Serial,
@@ -2293,12 +2293,7 @@ async fn send_notify(
     soa: Option<rdns::ResourceRecord>,
     target: SocketAddr,
 ) {
-    let bind: SocketAddr = if target.is_ipv4() {
-        "0.0.0.0:0".parse().expect("valid bind address")
-    } else {
-        "[::]:0".parse().expect("valid bind address")
-    };
-    let Ok(socket) = UdpSocket::bind(bind).await else {
+    let Ok(socket) = UdpSocket::bind(bind_addr_for(target)).await else {
         tracing::warn!("NOTIFY {zone} to {target}: could not open a socket");
         return;
     };

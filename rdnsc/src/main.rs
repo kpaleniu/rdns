@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
+use rdns::error::AnswerMismatch;
+use rdns::utils::bind_addr_for;
+use rdns::validation::{answers_query, SentQuery};
 use rdns::{DnsMessage, DnsMessageBuilder};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -82,13 +85,7 @@ fn resolve_server(spec: &str) -> Result<SocketAddr> {
 
 /// Send `query` and return the first reply that answers *this* request.
 fn ask_over_udp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Result<DnsMessage> {
-    // Bind the family the server is in: a v4 socket cannot reach a v6 server.
-    let bind: SocketAddr = if server.is_ipv6() {
-        "[::]:0".parse().expect("a literal")
-    } else {
-        "0.0.0.0:0".parse().expect("a literal")
-    };
-    let sock = UdpSocket::bind(bind).context("binding a local UDP socket")?;
+    let sock = UdpSocket::bind(bind_addr_for(server)).context("binding a local UDP socket")?;
     sock.set_read_timeout(Some(READ_TIMEOUT))
         .context("setting the read timeout")?;
     // `connect` makes the kernel drop datagrams from anywhere else — the cheap
@@ -152,30 +149,23 @@ fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
 /// Whether `message` is a response to `request`.
 ///
 /// The id, the QR bit and the echoed question are all that tie a datagram to
-/// the query it claims to answer.
-fn matches_request(message: &DnsMessage, request: &DnsMessage) -> Result<(), String> {
-    if !message.response {
-        return Err("QR is clear, so it is a query and not an answer".to_string());
-    }
-    if message.id != request.id {
-        return Err(format!(
-            "id {:#06x} does not match the {:#06x} we asked with",
-            message.id, request.id
-        ));
-    }
-    let (Some(asked), Some(echoed)) = (request.queries.first(), message.queries.first()) else {
-        return Err("no question section to compare".to_string());
+/// the query it claims to answer. `rdns::validation::answers_query` is the
+/// check; the resolver makes the same one (`TODO.md` #30o). No DNS-0x20 here,
+/// so the name compare folds ASCII case.
+fn matches_request(message: &DnsMessage, request: &DnsMessage) -> Result<(), AnswerMismatch> {
+    let Some(asked) = request.queries.first() else {
+        return Err(AnswerMismatch::NoQuestion);
     };
-    if !echoed.qname.eq_ignore_ascii_case(&asked.qname)
-        || echoed.qtype != asked.qtype
-        || echoed.qclass != asked.qclass
-    {
-        return Err(format!(
-            "answers {} {} {:?}, not the {} {} {:?} we asked",
-            echoed.qname, echoed.qtype, echoed.qclass, asked.qname, asked.qtype, asked.qclass
-        ));
-    }
-    Ok(())
+    answers_query(
+        message,
+        &SentQuery {
+            id: request.id,
+            qname: &asked.qname,
+            qtype: asked.qtype,
+            qclass: asked.qclass,
+            case_sensitive: false,
+        },
+    )
 }
 
 fn print_message(msg: &DnsMessage) {
