@@ -2,6 +2,7 @@
 
 use crate::error::{DnssecError, DnssecResult, WireError, WireResult};
 use crate::{ParsedRecord, RecordData, Rtype};
+use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -523,23 +524,28 @@ pub fn record_type_name_to_code(kind: &str) -> Option<Rtype> {
 
 /// The mnemonic for a type code, or its `TYPEnnn` form (RFC 3597 §5) when this
 /// library has none. Always a name [`record_type_name_to_code`] reads back.
-pub fn record_type_name(code: Rtype) -> String {
-    match code {
-        record_types::A => "A".to_string(),
-        record_types::NS => "NS".to_string(),
-        record_types::CNAME => "CNAME".to_string(),
-        record_types::SOA => "SOA".to_string(),
-        record_types::PTR => "PTR".to_string(),
-        record_types::MX => "MX".to_string(),
-        record_types::TXT => "TXT".to_string(),
-        record_types::AAAA => "AAAA".to_string(),
-        record_types::DS => "DS".to_string(),
-        record_types::DNSKEY => "DNSKEY".to_string(),
-        record_types::RRSIG => "RRSIG".to_string(),
-        record_types::NSEC => "NSEC".to_string(),
-        record_types::NSEC3 => "NSEC3".to_string(),
-        other => format!("TYPE{}", other.to_u16()),
-    }
+///
+/// `Cow`, because thirteen of the answers are constants and only the last one
+/// has to be built: writing a zone allocated a `String` per record to print a
+/// name that was in the binary already (`TODO.md` #26h).
+pub fn record_type_name(code: Rtype) -> Cow<'static, str> {
+    let known = match code {
+        record_types::A => "A",
+        record_types::NS => "NS",
+        record_types::CNAME => "CNAME",
+        record_types::SOA => "SOA",
+        record_types::PTR => "PTR",
+        record_types::MX => "MX",
+        record_types::TXT => "TXT",
+        record_types::AAAA => "AAAA",
+        record_types::DS => "DS",
+        record_types::DNSKEY => "DNSKEY",
+        record_types::RRSIG => "RRSIG",
+        record_types::NSEC => "NSEC",
+        record_types::NSEC3 => "NSEC3",
+        other => return Cow::Owned(format!("TYPE{}", other.to_u16())),
+    };
+    Cow::Borrowed(known)
 }
 
 #[cfg(test)]
@@ -816,6 +822,28 @@ mod tests {
         assert_eq!(record_type_name_to_code("TYPE65536"), None);
         assert_eq!(record_type_name_to_code("TYPE"), None);
         assert_eq!(record_type_name_to_code("TYPEA"), None);
+    }
+
+    /// The thirteen mnemonics are in the binary already; only `TYPEnnn` has to
+    /// be built. Asserted on the `Cow` rather than on the text, because the
+    /// text was right before and the allocation is what changed
+    /// (`TODO.md` #26h).
+    #[test]
+    fn a_known_type_name_is_not_built() {
+        for known in [
+            record_types::A,
+            record_types::NS,
+            record_types::SOA,
+            record_types::RRSIG,
+            record_types::NSEC3,
+        ] {
+            assert!(
+                matches!(record_type_name(known), Cow::Borrowed(_)),
+                "{known} is a constant"
+            );
+        }
+        assert!(matches!(record_type_name(Rtype::new(1234)), Cow::Owned(_)));
+        assert_eq!(record_type_name(Rtype::new(1234)), "TYPE1234");
     }
 
     /// Both directions, and the two things the three deleted copies disagreed

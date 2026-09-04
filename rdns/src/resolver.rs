@@ -268,7 +268,10 @@ impl DelegationCache {
         qname: &str,
         accept: impl Fn(&str) -> bool,
     ) -> Option<(String, Vec<SocketAddr>)> {
-        let name = normalize(qname);
+        // Borrowed when the name is already absolute and lowercased, which is
+        // every query the answer path hands down (`TODO.md` #26f): this is a
+        // lookup, and nothing here keeps the name.
+        let name = absolute_lowered(qname);
         let now = current_unix_timestamp();
         let mut entries = self.entries.lock().ok()?;
 
@@ -326,7 +329,7 @@ impl DelegationCache {
     /// Drop a zone's entry, for when the servers in it turn out not to work.
     fn forget(&self, zone: &str) {
         if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(normalize(zone).as_str());
+            entries.remove(absolute_lowered(zone).as_ref());
         }
     }
 }
@@ -815,7 +818,9 @@ impl Resolver {
             // for unrelated names are cache-poisoning attempts, and `rdnsr`
             // caches whatever is returned here.
             for rr in &response.answers {
-                if !chain.contains(&normalize(&rr.name)) {
+                // Once per record of every response, so the allocation this
+                // used to make was per record rather than per query.
+                if !chain.contains(absolute_lowered(&rr.name).as_ref()) {
                     continue;
                 }
                 answers.push(rr.clone());
@@ -1422,7 +1427,7 @@ impl Resolver {
         // to pick where the resolution began. Disagreeing makes the walk skip a
         // zone cut whose DS this loop then goes looking for.
         let (mut zone, mut ds_set) = (anchor_zone.clone(), anchor_ds);
-        let target_key = normalize(target);
+        let target_key = absolute_lowered(target);
         for candidate in ancestors(&target_key) {
             if is_at_or_under(candidate, &anchor_zone) && self.keys.holds(candidate) {
                 // Cached keys were validated to the anchor already, so the DS

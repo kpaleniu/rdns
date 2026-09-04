@@ -16,6 +16,7 @@ use crate::error::ZoneError;
 use crate::Class;
 use crate::Qtype;
 use crate::Ttl;
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::denial_wire::{base32hex_encode, bitmap_types_exact};
@@ -95,7 +96,7 @@ pub fn record_to_string(record: &ZoneRecord) -> Result<String, ZoneError> {
 /// Type-specific when that is faithful, generic when it is not. "Faithful" is
 /// decided by re-encoding what we parsed and comparing the bytes, so the cases
 /// need not be enumerated here.
-fn rdata_to_string(stored: &RecordData) -> (String, String) {
+fn rdata_to_string(stored: &RecordData) -> (Cow<'static, str>, String) {
     let name = record_type_name(stored.rtype());
     let generic = (name.clone(), generic_rdata(stored));
 

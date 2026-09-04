@@ -171,10 +171,16 @@ pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>> {
             return Err(types);
         }
         for (byte, bits) in rest[2..2 + len].iter().enumerate() {
-            for bit in 0..8 {
-                if bits & (0x80 >> bit) != 0 {
-                    types.push(Rtype::new((window << 8) | (byte as u16 * 8 + bit)));
-                }
+            // Bit 0 is the *high* bit (RFC 4034 §4.1.2), so it is
+            // `leading_zeros` that names the next set type and taking them from
+            // the top keeps the output ascending — `TODO.md` #26i said
+            // `trailing_zeros`, which is the idiom for the other bit order and
+            // would list each byte's types backwards.
+            let mut remaining = *bits;
+            while remaining != 0 {
+                let bit = remaining.leading_zeros() as u16;
+                types.push(Rtype::new((window << 8) | (byte as u16 * 8 + bit)));
+                remaining &= !(0x80u8 >> bit);
             }
         }
         rest = &rest[2 + len..];
