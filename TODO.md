@@ -1818,12 +1818,31 @@ anything re-measured should be too.
       in this crate that does not absolutize, so `example.com` and `example.com.`
       were two cache entries. They are one now, which is what every other map
       here already did, with a test.
-- [ ] **25f. The rate limiter takes two global mutexes per datagram.**
+- [x] **25f. The rate limiter takes two global mutexes per datagram.**
       `security.rs:125` locks `last_cleanup` to compare a timestamp before
       `should_allow` locks `buckets` at all. The first wants an `AtomicU64` with a
       compare-and-swap on the rare path. The second is one lock for every UDP
       worker — not the bottleneck at 4 µs/query of syscall, but it is the ceiling,
       and it should be said out loud somewhere rather than discovered.
+
+      **Done 2026-09-04, both halves.** `last_cleanup` is an `AtomicU64`: a
+      relaxed load answers "not yet" on every datagram, and only the caller that
+      wins the compare-exchange sweeps, so the losers never reach the bucket
+      lock. `Relaxed` on both, because the value is a coarse timer rather than a
+      happens-before edge and the sweep it guards takes the bucket lock anyway.
+
+          threads    Windows before   Windows after   Linux after
+          1               38.0 ns        29.8 ns        33.6 ns
+          16             180.2 ns       160.0 ns       143.2 ns
+
+      The 16-thread figure is the ceiling being said out loud: it is five times
+      the one-thread cost and that gap is the remaining lock, which is now
+      written on `RateLimiter` itself along with what would change it. The probe
+      is `rdns/examples/limiter_probe.rs`.
+
+      The test that came with it found the thing to know about this timer:
+      `last_cleanup` is seeded from the real clock at construction, so a caller
+      passing a synthetic `now` in the past never sweeps at all.
 - [x] **25g. The one loop in this tree with a SIMD shape the code prevents.**
       `utils::ascii_lowered_cow` and `absolute_lowered` decide whether to copy
       with `name.bytes().any(|b| b.is_ascii_uppercase())`. LLVM will not vectorize

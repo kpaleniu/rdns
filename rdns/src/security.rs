@@ -2,6 +2,7 @@ use crate::error::{ConfigError, ConfigResult};
 use crate::utils::current_unix_timestamp;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Configuration for rate limiting
@@ -74,10 +75,20 @@ struct TokenBucket {
 ///
 /// `current_unix_timestamp` is wall-clock, so all time arithmetic here saturates:
 /// a backwards NTP step would otherwise underflow and refill every bucket.
+///
+/// **One mutex, and it is the ceiling.** Every UDP worker takes `buckets` for
+/// every datagram, so the limiter serializes what the pool parallelizes. At
+/// ~4 µs of syscall per query it is nowhere near the bottleneck and sharding it
+/// would be premature — but it is the first thing to shard if a query ever gets
+/// cheap enough to notice, and that is worth saying here rather than leaving to
+/// be rediscovered under load (`TODO.md` #25f).
 pub struct RateLimiter {
     config: RateLimitConfig,
     buckets: Arc<Mutex<HashMap<IpAddr, TokenBucket>>>,
-    last_cleanup: Arc<Mutex<u64>>,
+    /// When the sweep last ran. An `AtomicU64` and not a `Mutex`: this is read
+    /// on every datagram to decide *not* to sweep, and a lock for that made the
+    /// common path two mutexes deep for one comparison.
+    last_cleanup: AtomicU64,
 }
 
 impl RateLimiter {
@@ -85,7 +96,7 @@ impl RateLimiter {
         RateLimiter {
             config,
             buckets: Arc::new(Mutex::new(HashMap::new())),
-            last_cleanup: Arc::new(Mutex::new(current_unix_timestamp())),
+            last_cleanup: AtomicU64::new(current_unix_timestamp()),
         }
     }
 
@@ -154,17 +165,27 @@ impl RateLimiter {
             .unwrap_or(self.config.burst_size as f64)
     }
 
-    /// Clean up inactive IPs from the bucket map
+    /// Clean up inactive IPs from the bucket map.
+    ///
+    /// The common answer is "not yet", and it costs one relaxed load. `Relaxed`
+    /// is enough for both: the value is a coarse timer rather than a
+    /// happens-before edge, and the sweep it guards takes the bucket lock, which
+    /// is where the ordering that matters comes from.
     fn cleanup_if_needed(&self, now: u64) {
-        let Ok(mut last_cleanup) = self.last_cleanup.lock() else {
-            return;
-        };
-
-        if now.saturating_sub(*last_cleanup) < self.config.cleanup_interval_secs {
+        let last = self.last_cleanup.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < self.config.cleanup_interval_secs {
             return;
         }
-
-        *last_cleanup = now;
+        // Exactly one caller sweeps: whoever wins the swap. The losers return
+        // without touching the bucket lock, where a `Mutex` here made every
+        // worker that arrived in the same second queue behind the sweep.
+        if self
+            .last_cleanup
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
         let Ok(mut buckets) = self.buckets.lock() else {
             return;
         };
@@ -606,6 +627,42 @@ mod tests {
         limiter.should_allow(ip, current_unix_timestamp());
         let after_one = limiter.get_tokens(ip);
         assert!(after_one < initial);
+    }
+
+    /// The sweep still runs, and an idle source is forgotten by it — the
+    /// property the timestamp guards, now that the timestamp is an atomic and
+    /// only the caller that wins the swap sweeps (`TODO.md` #25f).
+    #[test]
+    fn an_idle_source_is_swept_once_the_interval_has_passed() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            cleanup_interval_secs: 60,
+            ..RateLimitConfig::per_second(10, 10)
+        });
+        let idle = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        let busy = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+        // The real clock, because `last_cleanup` is seeded from it at
+        // construction: a synthetic `now` in the past never reaches the
+        // interval, and the sweep would silently never run.
+        let start = current_unix_timestamp();
+
+        assert!(limiter.should_allow(idle, start));
+        assert_eq!(limiter.get_stats().tracked_ips, 1);
+
+        // Past the interval, and the first caller through does the sweep. The
+        // busy source is admitted after it, so it survives.
+        assert!(limiter.should_allow(busy, start + 61));
+        assert_eq!(
+            limiter.get_stats().tracked_ips,
+            1,
+            "the idle source went, the one doing the asking stayed"
+        );
+        assert_eq!(limiter.get_tokens(idle), limiter.get_tokens(busy) + 1.0);
+
+        // And the next caller in the same interval does not sweep again: `busy`
+        // is one second old and would survive either way, so what this holds is
+        // that the timestamp advanced rather than that nothing was dropped.
+        assert!(limiter.should_allow(busy, start + 62));
+        assert_eq!(limiter.get_stats().tracked_ips, 1);
     }
 
     #[test]
