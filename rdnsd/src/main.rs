@@ -33,7 +33,7 @@ use rdns::{
     error::RequestError,
     ixfr::{ixfr_response, DeltaLog, IxfrResponse},
     journal::Journal,
-    logging::{LogLevel, QueryLogger},
+    logging::{watch_anomalies, AnomalyThresholds, LogLevel, QueryLogger},
     metrics::DnsMetrics,
     metrics_server, notify,
     readiness::Readiness,
@@ -258,6 +258,58 @@ struct Cli {
     /// the limit for everybody.
     #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     query_rate_exempt: Vec<String>,
+    /// How often to report what the last interval's traffic looked like, in
+    /// seconds. 0 turns the anomaly warnings off.
+    ///
+    /// Every threshold below is per interval, so this is also the unit they are
+    /// read in: `--anomaly-source-queries 100` at the default is a hundred
+    /// queries a minute from one address.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value = "60",
+        conflicts_with = "config"
+    )]
+    anomaly_interval: u64,
+    /// Warn above this query rate, averaged over `--anomaly-interval`. 0 is off.
+    #[arg(
+        long,
+        value_name = "QUERIES_PER_SEC",
+        default_value = "50",
+        conflicts_with = "config"
+    )]
+    anomaly_query_rate: f64,
+    /// Warn when more than this percentage of an interval's queries failed.
+    /// 0 is off.
+    #[arg(
+        long,
+        value_name = "PERCENT",
+        default_value = "10",
+        conflicts_with = "config"
+    )]
+    anomaly_error_percent: f64,
+    /// Warn about a source that sent more than this many queries in one
+    /// interval. 0 is off.
+    ///
+    /// A log line, not a metric: naming the address is the point, and an
+    /// address is exactly what a Prometheus label must not be — the cardinality
+    /// is the client's to choose.
+    #[arg(
+        long,
+        value_name = "QUERIES",
+        default_value = "100",
+        conflicts_with = "config"
+    )]
+    anomaly_source_queries: u64,
+    /// Warn about a source the rate limiter refused more than this many times
+    /// in one interval. 0 is off.
+    #[arg(
+        long,
+        value_name = "REFUSALS",
+        default_value = "5",
+        conflicts_with = "config"
+    )]
+    anomaly_source_refusals: u64,
     /// How many UDP datagrams may be answered at once.
     ///
     /// That many identical tasks share the socket and answer inline, rather
@@ -392,6 +444,9 @@ struct ServePolicy {
     response_rate: u32,
     /// Queries per second per client, with its burst and exemptions.
     query_limit: RateLimitConfig,
+    /// How often the anomaly warnings run, and what they warn about. Zero
+    /// interval is off.
+    anomalies: (Duration, AnomalyThresholds),
     /// How many UDP datagrams may be answered at once. Floored at 1 in `serve`.
     udp_workers: usize,
     /// Where to serve Prometheus metrics, if anywhere.
@@ -436,6 +491,7 @@ async fn serve(
         tsig_keys,
         response_rate,
         query_limit,
+        anomalies: (anomaly_interval, anomaly_thresholds),
         udp_workers,
         metrics_listen,
         readiness,
@@ -485,6 +541,21 @@ async fn serve(
         )
     };
 
+    // The same reason the two above are printed: these thresholds decide what an
+    // operator is told about a flood, and a check that is off has to say so.
+    let anomaly_note = if anomaly_interval.is_zero() {
+        "off".to_string()
+    } else {
+        format!(
+            "every {}s (>{} q/s, >{}% errors, >{} q/source, >{} refusals/source)",
+            anomaly_interval.as_secs(),
+            anomaly_thresholds.queries_per_second,
+            anomaly_thresholds.error_percent,
+            anomaly_thresholds.queries_per_source,
+            anomaly_thresholds.refusals_per_source
+        )
+    };
+
     // Bind everything before announcing anything, so a port conflict fails here
     // rather than after one transport is up. The metrics listener included: a
     // typo in `--metrics-listen` must stop the start, not silently disable it.
@@ -525,7 +596,8 @@ async fn serve(
     tracing::info!(
         "rdnsd listening on {addr} (UDP+TCP), zone transfer: {transfers}, \
          response budget: {budget}, query rate: {query_limit_note}, \
-         UDP workers: {udp_workers}, TSIG keys: {}, metrics: {}, control: {}",
+         UDP workers: {udp_workers}, anomaly warnings: {anomaly_note}, \
+         TSIG keys: {}, metrics: {}, control: {}",
         server.tsig_keys.len(),
         match &metrics_listen {
             Some(spec) => format!("{spec}/metrics"),
@@ -550,6 +622,16 @@ async fn serve(
             }
         );
     }
+
+    // Not in the `JoinSet` below: that set's rule is "the first task to end ends
+    // the process", and this one ends on the stop signal by design. Joined after
+    // the drain instead, so it is not a detached task (`CLAUDE.md` §9).
+    let anomalies = tokio::spawn(watch_anomalies(
+        server.logger.clone(),
+        anomaly_thresholds,
+        anomaly_interval,
+        shutdown.stop_handle(),
+    ));
 
     // `JoinSet`, not two `JoinHandle`s in a `select!`: dropping a `JoinHandle`
     // detaches the task rather than cancelling it. `join_next` is cancel-safe
@@ -633,6 +715,8 @@ async fn serve(
             failure = listener_failure(joined);
         }
     }
+
+    let _ = anomalies.await;
 
     // Wait for work accepted before the stop. A client cannot tell a truncated
     // AXFR from a complete one, so cutting one mid-stream is the case this is
@@ -2628,6 +2712,15 @@ async fn main() -> Result<()> {
             tsig_keys,
             response_rate: cli.response_rate,
             query_limit,
+            anomalies: (
+                Duration::from_secs(cli.anomaly_interval),
+                AnomalyThresholds {
+                    queries_per_second: cli.anomaly_query_rate,
+                    error_percent: cli.anomaly_error_percent,
+                    queries_per_source: cli.anomaly_source_queries,
+                    refusals_per_source: cli.anomaly_source_refusals,
+                },
+            ),
             udp_workers: cli.udp_workers,
             metrics_listen: cli.metrics_listen,
             readiness,

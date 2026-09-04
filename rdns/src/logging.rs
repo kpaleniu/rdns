@@ -1,9 +1,11 @@
+use crate::shutdown::Stop;
 use crate::utils::current_unix_timestamp;
 use crate::Qtype;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// How much a daemon says.
 ///
@@ -119,6 +121,154 @@ pub struct QueryStats {
     pub untracked_sources: u64,
 }
 
+impl QueryStats {
+    fn empty() -> QueryStats {
+        QueryStats {
+            total_queries: 0,
+            total_errors: 0,
+            qps: 0.0,
+            queries_by_ip: HashMap::new(),
+            queries_by_type: HashMap::new(),
+            rate_limited_ips: HashMap::new(),
+            untracked_sources: 0,
+        }
+    }
+}
+
+/// What the periodic check warns about, and the numbers an operator sets.
+///
+/// Every threshold is per interval, because that is what
+/// [`QueryLogger::take_stats`] hands it. **Zero disables that one warning** —
+/// each has its own off switch, since "tell me about heavy sources but not
+/// about the error rate" is an ordinary thing to want, and a threshold nobody
+/// can turn off gets silenced by turning the whole check off instead.
+///
+/// The defaults are what the check warned on when it was hardcoded and
+/// uncalled: 50 q/s, a tenth of queries failing, a hundred queries from one
+/// source, five refusals of one source (`TODO.md` #30m).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnomalyThresholds {
+    /// Queries per second, averaged over the interval.
+    pub queries_per_second: f64,
+    /// Percentage of queries that ended in an error.
+    pub error_percent: f64,
+    /// Queries from one source address.
+    pub queries_per_source: u64,
+    /// Times one source was refused by the rate limiter.
+    pub refusals_per_source: u64,
+}
+
+impl Default for AnomalyThresholds {
+    fn default() -> Self {
+        AnomalyThresholds {
+            queries_per_second: 50.0,
+            error_percent: 10.0,
+            queries_per_source: 100,
+            refusals_per_source: 5,
+        }
+    }
+}
+
+/// One thing worth a warning line.
+///
+/// Separated from the logging so a test can assert on what was found rather
+/// than on what was printed; nothing branches on the variants
+/// (`CLAUDE.md` §3 — the category is what a reader of the log needs).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Anomaly {
+    HighQueryRate {
+        qps: f64,
+    },
+    HighErrorRate {
+        percent: f64,
+    },
+    HeavySource {
+        peer: IpAddr,
+        queries: u64,
+    },
+    RepeatedlyLimited {
+        peer: IpAddr,
+        refusals: u64,
+    },
+    /// The per-source figures are a sample, not a census: the map was full.
+    UntrackedSources {
+        queries: u64,
+    },
+}
+
+/// What in one interval's counts crosses `limits`.
+///
+/// A threshold of zero is off rather than "warn about everything": the
+/// alternative makes a zero mean two things, and one of them fires a line per
+/// source per interval.
+pub fn anomalies(stats: &QueryStats, limits: &AnomalyThresholds) -> Vec<Anomaly> {
+    let mut found = Vec::new();
+    if limits.queries_per_second > 0.0 && stats.qps > limits.queries_per_second {
+        found.push(Anomaly::HighQueryRate { qps: stats.qps });
+    }
+    if limits.error_percent > 0.0 && stats.total_queries > 0 {
+        let percent = 100.0 * stats.total_errors as f64 / stats.total_queries as f64;
+        if percent > limits.error_percent {
+            found.push(Anomaly::HighErrorRate { percent });
+        }
+    }
+    if limits.queries_per_source > 0 {
+        for (peer, queries) in &stats.queries_by_ip {
+            if *queries > limits.queries_per_source {
+                found.push(Anomaly::HeavySource {
+                    peer: *peer,
+                    queries: *queries,
+                });
+            }
+        }
+    }
+    if limits.refusals_per_source > 0 {
+        for (peer, refusals) in &stats.rate_limited_ips {
+            if *refusals > limits.refusals_per_source {
+                found.push(Anomaly::RepeatedlyLimited {
+                    peer: *peer,
+                    refusals: *refusals,
+                });
+            }
+        }
+    }
+    if stats.untracked_sources > 0 {
+        found.push(Anomaly::UntrackedSources {
+            queries: stats.untracked_sources,
+        });
+    }
+    found
+}
+
+/// Warn every `interval` until told to stop.
+///
+/// The caller that owns the counters never reads them, which is how this
+/// facility spent a year write-only (`TODO.md` #30m). No [`Busy`] claim: the
+/// task sleeps almost all of the time, and holding the drain open across a
+/// sleep waits out the shutdown budget every time (`CLAUDE.md` §9). The work
+/// between sleeps is a lock and a walk of two bounded maps.
+///
+/// `interval` of zero is the caller's off switch and this returns at once, so
+/// the flag that disables the check does not also have to skip the spawn.
+pub async fn watch_anomalies(
+    logger: Arc<QueryLogger>,
+    limits: AnomalyThresholds,
+    interval: Duration,
+    stop: Stop,
+) {
+    if interval.is_zero() {
+        return;
+    }
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {
+                logger.check_anomalies(&limits, current_unix_timestamp());
+            }
+            _ = stop.wait() => return,
+        }
+    }
+}
+
 /// Count one hit against `ip`, keeping the map bounded.
 ///
 /// At the bound every count is halved and the zeroes forgotten, which keeps the
@@ -163,6 +313,9 @@ pub struct QueryLogger {
 struct Inner {
     stats: QueryStats,
     window: QpsWindow,
+    /// When [`QueryLogger::take_stats`] last emptied the counts, so the rate it
+    /// reports is over the interval it actually covers.
+    taken_at: u64,
 }
 
 /// Queries counted since the current window opened.
@@ -173,21 +326,15 @@ struct QpsWindow {
 
 impl QueryLogger {
     pub fn new() -> Self {
+        let now = current_unix_timestamp();
         QueryLogger {
             inner: Arc::new(Mutex::new(Inner {
-                stats: QueryStats {
-                    total_queries: 0,
-                    total_errors: 0,
-                    qps: 0.0,
-                    queries_by_ip: HashMap::new(),
-                    queries_by_type: HashMap::new(),
-                    rate_limited_ips: HashMap::new(),
-                    untracked_sources: 0,
-                },
+                stats: QueryStats::empty(),
                 window: QpsWindow {
-                    start: current_unix_timestamp(),
+                    start: now,
                     count: 0,
                 },
+                taken_at: now,
             })),
         }
     }
@@ -201,7 +348,7 @@ impl QueryLogger {
         let Some(mut inner) = self.locked() else {
             return;
         };
-        let Inner { stats, window } = &mut *inner;
+        let Inner { stats, window, .. } = &mut *inner;
         stats.total_queries += 1;
 
         let QueryStats {
@@ -262,48 +409,55 @@ impl QueryLogger {
         self.inner.lock().ok()
     }
 
-    /// Check for anomalies and print warnings
-    pub fn check_anomalies(&self) {
-        let Some(inner) = self.locked() else {
-            return;
+    /// The counts since the last take, and the interval they cover.
+    ///
+    /// Reading *and* resetting, under one lock: the per-source counts are
+    /// cumulative, so a threshold on them read without a reset fires once and
+    /// then every interval afterwards, for a client that has done nothing
+    /// since. A count per interval is also the number an operator can put a
+    /// threshold on — "a hundred queries a minute from one address" — where "a
+    /// hundred since the process started" is not.
+    ///
+    /// `qps` is recomputed here for the same reason: [`Self::log_query`]'s
+    /// tumbling window only advances when a query arrives, so a server that
+    /// went quiet keeps publishing the rate it had when it stopped. The elapsed
+    /// time is floored at one second, so a take within the same second reports
+    /// the count rather than a multiple of it.
+    pub fn take_stats(&self, now: u64) -> QueryStats {
+        let Some(mut inner) = self.locked() else {
+            return QueryStats::empty();
         };
-        let stats = &inner.stats;
-
-        // Check for high QPS
-        if stats.qps > 50.0 {
-            tracing::warn!(qps = stats.qps, "high query rate");
-        }
-
-        // Check for high error rate
-        let error_rate = if stats.total_queries > 0 {
-            (stats.total_errors as f64) / (stats.total_queries as f64)
-        } else {
-            0.0
+        let elapsed = now.saturating_sub(inner.taken_at).max(1);
+        inner.taken_at = now;
+        let mut stats = std::mem::replace(&mut inner.stats, QueryStats::empty());
+        stats.qps = stats.total_queries as f64 / elapsed as f64;
+        inner.window = QpsWindow {
+            start: now,
+            count: 0,
         };
+        stats
+    }
 
-        if error_rate > 0.1 {
-            tracing::warn!(percent = error_rate * 100.0, "high error rate");
-        }
-
-        // Check for IPs with many queries
-        for (ip, count) in &stats.queries_by_ip {
-            if *count > 100 {
-                tracing::warn!(peer = %ip, count, "high query count from one source");
-            }
-        }
-
-        if stats.untracked_sources > 0 {
-            tracing::warn!(
-                untracked = stats.untracked_sources,
-                "queries from sources there was no room to count individually — the \
-                 per-IP figures are a sample, not a census"
-            );
-        }
-
-        // Check for IPs that have been rate limited multiple times
-        for (ip, count) in &stats.rate_limited_ips {
-            if *count > 5 {
-                tracing::warn!(peer = %ip, count, "repeatedly rate limited");
+    /// Warn about whatever `limits` says is worth waking someone for, and roll
+    /// the window over. Called on a timer — see [`watch_anomalies`].
+    pub fn check_anomalies(&self, limits: &AnomalyThresholds, now: u64) {
+        for anomaly in anomalies(&self.take_stats(now), limits) {
+            match anomaly {
+                Anomaly::HighQueryRate { qps } => tracing::warn!(qps, "high query rate"),
+                Anomaly::HighErrorRate { percent } => {
+                    tracing::warn!(percent, "high error rate")
+                }
+                Anomaly::HeavySource { peer, queries } => {
+                    tracing::warn!(%peer, queries, "high query count from one source")
+                }
+                Anomaly::RepeatedlyLimited { peer, refusals } => {
+                    tracing::warn!(%peer, refusals, "repeatedly rate limited")
+                }
+                Anomaly::UntrackedSources { queries } => tracing::warn!(
+                    untracked = queries,
+                    "queries from sources there was no room to count individually — the \
+                     per-IP figures are a sample, not a census"
+                ),
             }
         }
     }
@@ -316,15 +470,7 @@ impl QueryLogger {
     pub fn get_stats(&self) -> QueryStats {
         match self.locked() {
             Some(inner) => inner.stats.clone(),
-            None => QueryStats {
-                total_queries: 0,
-                total_errors: 0,
-                qps: 0.0,
-                queries_by_ip: HashMap::new(),
-                queries_by_type: HashMap::new(),
-                rate_limited_ips: HashMap::new(),
-                untracked_sources: 0,
-            },
+            None => QueryStats::empty(),
         }
     }
 
@@ -333,18 +479,13 @@ impl QueryLogger {
         let Some(mut inner) = self.locked() else {
             return;
         };
-        let stats = &mut inner.stats;
-        stats.total_queries = 0;
-        stats.total_errors = 0;
-        stats.qps = 0.0;
-        stats.queries_by_ip.clear();
-        stats.queries_by_type.clear();
-        stats.rate_limited_ips.clear();
-        stats.untracked_sources = 0;
+        let now = current_unix_timestamp();
+        inner.stats = QueryStats::empty();
         inner.window = QpsWindow {
-            start: current_unix_timestamp(),
+            start: now,
             count: 0,
         };
+        inner.taken_at = now;
     }
 }
 
@@ -585,5 +726,136 @@ mod tests {
         let stats = logger.get_stats();
         assert_eq!(*stats.queries_by_ip.get(&ip1).unwrap(), 1);
         assert_eq!(*stats.queries_by_ip.get(&ip2).unwrap(), 2);
+    }
+
+    /// The counts a warning is judged on are per interval, and taking them
+    /// empties them.
+    ///
+    /// Cumulative counts are why this check could not simply be called on a
+    /// timer as it stood: one busy minute would have warned about that client
+    /// every minute afterwards, however quiet it went (`TODO.md` #30m).
+    #[test]
+    fn each_interval_is_judged_on_its_own_traffic() {
+        let logger = QueryLogger::new();
+        let heavy = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let limits = AnomalyThresholds {
+            queries_per_source: 2,
+            ..AnomalyThresholds::default()
+        };
+        let start = current_unix_timestamp();
+
+        for _ in 0..3 {
+            logger.log_query(heavy, Some(Qtype::of(rt::A)), start);
+        }
+        let first = logger.take_stats(start + 60);
+        assert_eq!(
+            anomalies(&first, &limits),
+            vec![Anomaly::HeavySource {
+                peer: heavy,
+                queries: 3
+            }]
+        );
+
+        // The next interval saw nothing from anybody.
+        let second = logger.take_stats(start + 120);
+        assert_eq!(second.total_queries, 0, "the counts went with the interval");
+        assert!(
+            anomalies(&second, &limits).is_empty(),
+            "a quiet interval is quiet, whatever the one before it did"
+        );
+    }
+
+    /// The rate is over the interval that was taken, not over the last window
+    /// [`QueryLogger::log_query`] happened to close — a server that goes quiet
+    /// must stop reporting the rate it had when it stopped.
+    #[test]
+    fn the_rate_is_over_the_interval_it_covers() {
+        let logger = QueryLogger::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let start = current_unix_timestamp();
+
+        for _ in 0..120 {
+            logger.log_query(ip, Some(Qtype::of(rt::A)), start);
+        }
+        let busy = logger.take_stats(start + 60);
+        assert_eq!(busy.qps, 2.0, "120 queries in a minute is two a second");
+
+        let quiet = logger.take_stats(start + 120);
+        assert_eq!(quiet.qps, 0.0, "and nothing in the next minute is none");
+    }
+
+    /// Every threshold is its own off switch, so silencing one warning does not
+    /// mean silencing the check (`CLAUDE.md` §14).
+    #[test]
+    fn a_threshold_of_zero_is_off_rather_than_always() {
+        let logger = QueryLogger::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let start = current_unix_timestamp();
+        logger.log_query(ip, Some(Qtype::of(rt::A)), start);
+        logger.count_error(ip);
+        logger.log_rate_limited(ip);
+        let stats = logger.take_stats(start + 1);
+
+        let off = AnomalyThresholds {
+            queries_per_second: 0.0,
+            error_percent: 0.0,
+            queries_per_source: 0,
+            refusals_per_source: 0,
+        };
+        assert!(
+            anomalies(&stats, &off).is_empty(),
+            "one query at 1 q/s, 100% errors and one refusal, and all four are off"
+        );
+
+        // The same counts against thresholds that are on.
+        let on = AnomalyThresholds {
+            queries_per_second: 0.5,
+            error_percent: 10.0,
+            queries_per_source: 0,
+            refusals_per_source: 0,
+        };
+        assert_eq!(
+            anomalies(&stats, &on),
+            vec![
+                Anomaly::HighQueryRate { qps: 1.0 },
+                Anomaly::HighErrorRate { percent: 100.0 }
+            ]
+        );
+    }
+
+    /// The watcher stops when told, rather than on its next tick: an interval
+    /// is a minute by default and a shutdown does not wait one out.
+    #[tokio::test]
+    async fn the_watcher_stops_when_the_server_does() {
+        let shutdown = crate::shutdown::Shutdown::new();
+        let watcher = tokio::spawn(watch_anomalies(
+            Arc::new(QueryLogger::new()),
+            AnomalyThresholds::default(),
+            Duration::from_secs(3600),
+            shutdown.stop_handle(),
+        ));
+        shutdown.begin();
+        tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("the stop is what ends it, not the hour")
+            .expect("and it does not panic on the way out");
+    }
+
+    /// Zero disables the whole check, so a binary need not decide whether to
+    /// spawn it.
+    #[tokio::test]
+    async fn an_interval_of_zero_never_watches() {
+        let shutdown = crate::shutdown::Shutdown::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            watch_anomalies(
+                Arc::new(QueryLogger::new()),
+                AnomalyThresholds::default(),
+                Duration::ZERO,
+                shutdown.stop_handle(),
+            ),
+        )
+        .await
+        .expect("returns without waiting for anything");
     }
 }

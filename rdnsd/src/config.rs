@@ -62,6 +62,18 @@ pub struct Server {
     pub query_burst: u32,
     #[serde(default)]
     pub query_rate_exempt: Vec<String>,
+    /// How often the anomaly warnings run, in seconds; 0 is off. The four
+    /// thresholds below are per interval.
+    #[serde(default = "default_anomaly_interval")]
+    pub anomaly_interval: u64,
+    #[serde(default = "default_anomaly_query_rate")]
+    pub anomaly_query_rate: f64,
+    #[serde(default = "default_anomaly_error_percent")]
+    pub anomaly_error_percent: f64,
+    #[serde(default = "default_anomaly_source_queries")]
+    pub anomaly_source_queries: u64,
+    #[serde(default = "default_anomaly_source_refusals")]
+    pub anomaly_source_refusals: u64,
     /// Concurrent UDP answers, which is also the number of tasks sharing the
     /// socket. Defaults to the machine's parallelism — see
     /// `crate::default_udp_workers`, which is the same function the flag's
@@ -90,6 +102,11 @@ impl Default for Server {
             query_rate: default_query_rate(),
             query_burst: default_query_burst(),
             query_rate_exempt: Vec::new(),
+            anomaly_interval: default_anomaly_interval(),
+            anomaly_query_rate: default_anomaly_query_rate(),
+            anomaly_error_percent: default_anomaly_error_percent(),
+            anomaly_source_queries: default_anomaly_source_queries(),
+            anomaly_source_refusals: default_anomaly_source_refusals(),
             udp_workers: crate::default_udp_workers(),
             metrics_listen: None,
             control_socket: None,
@@ -112,6 +129,23 @@ fn default_query_rate() -> u32 {
 }
 fn default_query_burst() -> u32 {
     200
+}
+// The same numbers as the flags' defaults, which is the only place they may
+// disagree — `--help` prints one and the file falls back to the other.
+fn default_anomaly_interval() -> u64 {
+    60
+}
+fn default_anomaly_query_rate() -> f64 {
+    50.0
+}
+fn default_anomaly_error_percent() -> f64 {
+    10.0
+}
+fn default_anomaly_source_queries() -> u64 {
+    100
+}
+fn default_anomaly_source_refusals() -> u64 {
+    5
 }
 
 /// Signing defaults, which a `[zones.*]` table may override per zone.
@@ -378,6 +412,11 @@ impl Config {
         cli.query_rate = self.server.query_rate;
         cli.query_burst = self.server.query_burst;
         cli.query_rate_exempt = self.server.query_rate_exempt.clone();
+        cli.anomaly_interval = self.server.anomaly_interval;
+        cli.anomaly_query_rate = self.server.anomaly_query_rate;
+        cli.anomaly_error_percent = self.server.anomaly_error_percent;
+        cli.anomaly_source_queries = self.server.anomaly_source_queries;
+        cli.anomaly_source_refusals = self.server.anomaly_source_refusals;
         cli.udp_workers = self.server.udp_workers;
         cli.metrics_listen = self.server.metrics_listen.clone();
         cli.control_socket = self.server.control_socket.clone();
@@ -488,7 +527,37 @@ zone-dir = "./zones"
         assert_eq!(config.server.query_rate, 1000);
         assert_eq!(config.server.query_burst, 200);
         assert_eq!(config.server.response_rate, 8192);
+        assert_eq!(config.server.anomaly_interval, 60);
+        assert_eq!(config.server.anomaly_query_rate, 50.0);
+        assert_eq!(config.server.anomaly_error_percent, 10.0);
+        assert_eq!(config.server.anomaly_source_queries, 100);
+        assert_eq!(config.server.anomaly_source_refusals, 5);
         assert!(config.signing.is_none());
+    }
+
+    /// The anomaly knobs come out of the file as well as the flags, which is
+    /// what `deny_unknown_fields` makes an all-or-nothing question: a key the
+    /// struct does not have fails the load, so one that is *missing* is a knob
+    /// only settable one way (`CLAUDE.md` §15).
+    #[test]
+    fn the_anomaly_thresholds_are_settable_from_the_file() {
+        let config = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+anomaly-interval = 300
+anomaly-query-rate = 0
+anomaly-error-percent = 25.5
+anomaly-source-queries = 5000
+anomaly-source-refusals = 0
+"#,
+        )
+        .expect("parses");
+        assert_eq!(config.server.anomaly_interval, 300);
+        assert_eq!(config.server.anomaly_query_rate, 0.0, "off");
+        assert_eq!(config.server.anomaly_error_percent, 25.5);
+        assert_eq!(config.server.anomaly_source_queries, 5000);
+        assert_eq!(config.server.anomaly_source_refusals, 0, "off");
     }
 
     /// The most important line in the file. A mistyped key that is silently

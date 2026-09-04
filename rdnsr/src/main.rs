@@ -1,12 +1,12 @@
 use rdns::Rtype;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use rdns::dnssec_chain::{TrustAnchors, ValidationState};
-use rdns::logging::{LogLevel, QueryLogger};
+use rdns::logging::{watch_anomalies, AnomalyThresholds, LogLevel, QueryLogger};
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::metrics_server;
 use rdns::negative_cache::NegativeCache;
@@ -198,6 +198,33 @@ struct Cli {
     /// only way to spare a known-good source is to raise the limit for everybody.
     #[arg(long, value_name = "ADDR|CIDR")]
     query_rate_exempt: Vec<String>,
+    /// How often to report what the last interval's traffic looked like, in
+    /// seconds. 0 turns the anomaly warnings off.
+    ///
+    /// Every threshold below is per interval, so this is also the unit they are
+    /// read in: `--anomaly-source-queries 100` at the default is a hundred
+    /// queries a minute from one address.
+    #[arg(long, value_name = "SECONDS", default_value = "60")]
+    anomaly_interval: u64,
+    /// Warn above this query rate, averaged over `--anomaly-interval`. 0 is off.
+    #[arg(long, value_name = "QUERIES_PER_SEC", default_value = "50")]
+    anomaly_query_rate: f64,
+    /// Warn when more than this percentage of an interval's queries failed.
+    /// 0 is off.
+    #[arg(long, value_name = "PERCENT", default_value = "10")]
+    anomaly_error_percent: f64,
+    /// Warn about a source that sent more than this many queries in one
+    /// interval. 0 is off.
+    ///
+    /// A log line, not a metric: naming the address is the point, and an
+    /// address is exactly what a Prometheus label must not be — the cardinality
+    /// is the client's to choose.
+    #[arg(long, value_name = "QUERIES", default_value = "100")]
+    anomaly_source_queries: u64,
+    /// Warn about a source the rate limiter refused more than this many times
+    /// in one interval. 0 is off.
+    #[arg(long, value_name = "REFUSALS", default_value = "5")]
+    anomaly_source_refusals: u64,
     /// Response bytes per second, per client address. 0 turns the budget off.
     ///
     /// A resolver needs this more than an authoritative server does: a 30-byte
@@ -432,8 +459,15 @@ async fn main() -> anyhow::Result<()> {
     );
     // And the two limits, for the same reason: both drop in silence, so an
     // operator who cannot see the policy blames the network.
+    let anomaly_interval = Duration::from_secs(cli.anomaly_interval);
+    let anomaly_thresholds = AnomalyThresholds {
+        queries_per_second: cli.anomaly_query_rate,
+        error_percent: cli.anomaly_error_percent,
+        queries_per_source: cli.anomaly_source_queries,
+        refusals_per_source: cli.anomaly_source_refusals,
+    };
     tracing::info!(
-        "query rate: {}, response budget: {}, metrics: {}",
+        "query rate: {}, response budget: {}, metrics: {}, anomaly warnings: {}",
         if cli.query_rate == 0 {
             "unlimited (--query-rate 0)".to_string()
         } else {
@@ -457,6 +491,18 @@ async fn main() -> anyhow::Result<()> {
             Some(spec) => format!("{spec}/metrics"),
             None => "off (--metrics-listen)".to_string(),
         },
+        if anomaly_interval.is_zero() {
+            "off (--anomaly-interval 0)".to_string()
+        } else {
+            format!(
+                "every {}s (>{} q/s, >{}% errors, >{} q/source, >{} refusals/source)",
+                anomaly_interval.as_secs(),
+                anomaly_thresholds.queries_per_second,
+                anomaly_thresholds.error_percent,
+                anomaly_thresholds.queries_per_source,
+                anomaly_thresholds.refusals_per_source
+            )
+        },
     );
 
     // A `JoinSet` rather than two `JoinHandle`s in a `select!`: dropping the
@@ -464,6 +510,16 @@ async fn main() -> anyhow::Result<()> {
     // the other transport still reading
     // and replies still queued in a per-connection `mpsc`. `join_next` is
     // cancel-safe, so first-one-wins keeps both tasks owned and joinable.
+    // Outside the `JoinSet`: that set ends the process when its first task ends,
+    // and this one ends on the stop signal by design. Joined after the drain, so
+    // it is not a detached task (`CLAUDE.md` §9).
+    let anomalies = tokio::spawn(watch_anomalies(
+        shell.logger.clone(),
+        anomaly_thresholds,
+        anomaly_interval,
+        shutdown.stop_handle(),
+    ));
+
     let mut loops = JoinSet::new();
     let (shutdown_stop, shutdown_busy) = (shutdown.stop_handle(), shutdown.busy());
     loops.spawn(udp_main(
@@ -518,6 +574,8 @@ async fn main() -> anyhow::Result<()> {
             failure = listener_failure(joined);
         }
     }
+
+    let _ = anomalies.await;
 
     // What is left running is a resolution a client waits on, or the RFC 5011
     // manager part-way through rewriting the anchor file.
@@ -780,10 +838,12 @@ async fn udp_main(
         // should hit: a hash lookup and a token, before the packet is looked
         // at. Dropping is silent, which is why the policy is printed at startup
         // and counted here.
-        if !shell
-            .limiter
-            .should_allow(peer.ip(), current_unix_timestamp())
-        {
+        //
+        // One read for the limiter and the query log, which happen within
+        // microseconds of each other; the response budget reads its own, since a
+        // recursion sits in between (`TODO.md` #28a).
+        let now = current_unix_timestamp();
+        if !shell.limiter.should_allow(peer.ip(), now) {
             shell.logger.log_rate_limited(peer.ip());
             shell.metrics.count(&shell.metrics.rate_limited);
             continue;
@@ -813,8 +873,16 @@ async fn udp_main(
         tokio::spawn(async move {
             let _busy = busy;
             let _permit = permit;
-            if let Some(reply) =
-                handle_query(data, &resolver, &caches, &shell, Transport::Udp).await
+            if let Some(reply) = handle_query(
+                data,
+                peer.ip(),
+                now,
+                &resolver,
+                &caches,
+                &shell,
+                Transport::Udp,
+            )
+            .await
             {
                 // Charge the response, not the query. Over budget, TC=1 is
                 // the useful refusal: no records to amplify, and a real client
@@ -885,7 +953,7 @@ async fn tcp_main(
         let busy = busy.clone();
         let shell = shell.clone();
         tokio::spawn(async move {
-            serve_connection(stream, resolver, caches, shell, stop).await;
+            serve_connection(stream, peer.ip(), resolver, caches, shell, stop).await;
             drop(permit);
             drop(busy);
         });
@@ -900,6 +968,7 @@ async fn tcp_main(
 /// lock-step would make every query wait out the slowest one ahead of it.
 async fn serve_connection(
     stream: TcpStream,
+    peer: IpAddr,
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
     shell: Arc<Shell>,
@@ -968,8 +1037,12 @@ async fn serve_connection(
         let caches = caches.clone();
         let tx = tx.clone();
         let shell = shell.clone();
+        // Per message, not per connection: a connection may carry queries
+        // minutes apart (RFC 7766 §6.2.3).
+        let now = current_unix_timestamp();
         tokio::spawn(async move {
-            if let Some(reply) = handle_query(buf, &resolver, &caches, &shell, Transport::Tcp).await
+            if let Some(reply) =
+                handle_query(buf, peer, now, &resolver, &caches, &shell, Transport::Tcp).await
             {
                 // Prefix and message in one buffer, so the writer emits them
                 // in a single call. A reply too long to frame is dropped rather
@@ -1001,6 +1074,8 @@ async fn serve_connection(
 /// (in which case we simply drop it, as a resolver should).
 async fn handle_query(
     data: Vec<u8>,
+    peer: IpAddr,
+    now: u64,
     resolver: &Arc<Resolver>,
     caches: &Arc<Caches>,
     shell: &Shell,
@@ -1010,9 +1085,22 @@ async fn handle_query(
     // another reply is a packet loop between two servers pointed at each other.
     // `None` is the whole reply, because the peer did not ask anything. The type
     // is what makes the check unskippable — see `rdns::validation::Request`.
-    let msg = Request::from_bytes(&data).ok()?;
+    let msg = match Request::from_bytes(&data) {
+        Ok(msg) => msg,
+        Err(_) => {
+            shell.logger.count_error(peer);
+            return None;
+        }
+    };
     let timer = LatencyTimer::new();
     shell.metrics.count(&shell.metrics.queries_received);
+    // Per source and per type, for the periodic anomaly warnings — the counters
+    // `rdnsd` has kept since #9d and this daemon held and never filled
+    // (`TODO.md` #30m). `now` is the caller's: on UDP it is the instant the rate
+    // limiter already used.
+    shell
+        .logger
+        .log_query(peer, msg.queries.first().map(|q| q.qtype), now);
     if let Some(q) = msg.queries.first() {
         shell.metrics.track_query_type(q.qtype);
     }
@@ -1439,6 +1527,9 @@ mod tests {
         assert_eq!(parsed.queries.len(), 1, "with its question echoed");
     }
 
+    /// Whose queries these are, where the test does not care.
+    const TEST_PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
+
     /// A shell with every limit off, so a test measures the thing it names and
     /// not the rate limiter.
     fn test_shell() -> Arc<Shell> {
@@ -1504,6 +1595,8 @@ mod tests {
         let (resolver, caches) = context();
         let reply = handle_query(
             message(OpCode::Query, true),
+            TEST_PEER,
+            current_unix_timestamp(),
             &resolver,
             &caches,
             &test_shell(),
@@ -1524,6 +1617,8 @@ mod tests {
         for opcode in [OpCode::Notify, OpCode::Update, OpCode::Status] {
             let bytes = handle_query(
                 message(opcode, false),
+                TEST_PEER,
+                current_unix_timestamp(),
                 &resolver,
                 &caches,
                 &test_shell(),
@@ -1665,6 +1760,8 @@ mod tests {
         for cd in [false, true] {
             let bytes = handle_query(
                 query_for("localhost.", 1, cd),
+                TEST_PEER,
+                current_unix_timestamp(),
                 &resolver,
                 &caches,
                 &test_shell(),
@@ -1690,6 +1787,8 @@ mod tests {
         let (resolver, caches) = context();
         let bytes = handle_query(
             query_for("localhost.", 2, false),
+            TEST_PEER,
+            current_unix_timestamp(),
             &resolver,
             &caches,
             &test_shell(),
@@ -1702,6 +1801,56 @@ mod tests {
         assert!(
             reply.answers.is_empty(),
             "there is no answer to two questions"
+        );
+    }
+
+    /// The resolver fills the counters the periodic warnings read. It held a
+    /// `QueryLogger` and only ever called `log_rate_limited` on it, so
+    /// `--anomaly-query-rate` and `--anomaly-source-queries` would have watched
+    /// a number that was always zero (`TODO.md` #30m).
+    ///
+    /// `localhost` so the answer comes from the table and no upstream is
+    /// involved (RFC 6761 §6.3).
+    #[tokio::test]
+    async fn a_query_is_counted_against_the_source_that_sent_it() {
+        let (resolver, caches) = context();
+        let shell = test_shell();
+        let now = current_unix_timestamp();
+
+        for _ in 0..3 {
+            handle_query(
+                query_for("localhost.", 1, false),
+                TEST_PEER,
+                now,
+                &resolver,
+                &caches,
+                &shell,
+                Transport::Udp,
+            )
+            .await
+            .expect("answered from the table");
+        }
+        // Not a question at all: dropped, and counted as an error rather than
+        // as nothing.
+        assert!(handle_query(
+            vec![0x00, 0x01, 0x00],
+            TEST_PEER,
+            now,
+            &resolver,
+            &caches,
+            &shell,
+            Transport::Udp,
+        )
+        .await
+        .is_none());
+
+        let stats = shell.logger.take_stats(now + 60);
+        assert_eq!(stats.total_queries, 3);
+        assert_eq!(stats.queries_by_ip.get(&TEST_PEER), Some(&3));
+        assert_eq!(stats.total_errors, 1);
+        assert_eq!(
+            stats.queries_by_type.get(&Qtype::of(record_types::A)),
+            Some(&3)
         );
     }
 
