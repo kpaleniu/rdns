@@ -711,6 +711,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection was O(zones per query) — 55 µs at ten thousand zones, now 32 ns and flat, keyed on `NameKeyBuf` with a walk up the QNAME, and the walk brought a second multiplier with it that the client picks. Name compression was O(n²) in the records of one message, so a 400-record transfer envelope cost 130.7 µs to serialize and now costs 42.8; the index that fixes it is built lazily, because the threshold that helps a transfer hurt a 60-name response by 26%. And an AXFR held the zone three times over before the first byte went out; the envelopes are an iterator now, at 10.5× less peak memory, which needed `Arc<Zone>` in the map because the lock cannot be held across a socket write |
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
 | **28** | work the answer path does and need not | **filed 2026-09-01; 28a-28c done and 28d answered *no* the same day.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
+| **29** | the resolver half never got #27's pass | **filed 2026-09-04.** #27 and #28 gated `rdnsd`'s answer path at three allocations a query; `rdnsr` was never in that series and `rdns/tests/allocations.rs` cannot see it. The same walks, the same hashing, the same reply buffer, with the fixed copy sitting beside them |
 | **27** | what a zero-allocation answer path would take | **filed 2026-09-01, not started.** Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
@@ -2741,6 +2742,54 @@ results).
   answer such a request as though it were unsigned — §4's quiet degradation, with
   authentication as the casualty. The scan stays. What *was* removable from it is
   done: the owner name is no longer read before the TYPE check.
+
+### 29. The resolver half never got #27's pass — filed 2026-09-04
+
+#27 and #28 took `rdnsd`'s answer path to three allocations a query and gated it
+at zero for everything after the parse. Nothing in that series touched `rdnsr`,
+and **`rdns/tests/allocations.rs` cannot see it**: every count in that file is a
+library or `rdnsd` shape. So the resolver kept the defects the authoritative
+side spent twelve commits removing — the same functions, in some cases the same
+lines, with the fixed copy sitting beside them (`CLAUDE.md` §7, §17).
+
+Measured 2026-09-04 on the development machine, debug, in a throwaway probe of
+the shape `allocations.rs` uses, before anything below was done:
+
+| | allocations |
+|---|---:|
+| `DnsCache::get`, a 3-record RRset, hit | 8 |
+| `DnsCache::get`, miss | 1 |
+| `NegativeCache::get`, miss | 14 |
+| `dnssec::suffix_labels`, per candidate ancestor | 5 |
+| `dnssec::canonical_name`, on a name already canonical | 1 |
+| `nsec3_hash` against `nsec3_hash_in`, per name | 1 against 0 |
+| `proves_nxdomain`, NSEC / NSEC3, as a validator | 6 / 17 |
+| a 43-byte TCP reply's scratch buffer | 3, and 65 594 bytes |
+| `parse_zone_file`, per record (slope, 200 → 400) | 23 |
+| `sign_zone`, per record | ~122 |
+
+The three that are already filed elsewhere are done under their own numbers, not
+renumbered here: **#25b** (the TCP memset), **#25e** (the cache key), **#26e**
+(`ancestors_of` at every load and re-sign).
+
+- [x] **29a. The validator hashes into a `Vec` where the zone side does not.**
+      `Nsec3Params::hash` (`dnssec_denial.rs:393`) called `nsec3_hash`, which is
+      `nsec3_hash_in(..)?.to_vec()` — and `nsec3_hash_in`, returning the
+      `[u8; 20]` RFC 5155 §5 fixes the length of, was added three commits earlier
+      for the zone side and sits eleven lines above it. One allocation per
+      candidate name, on the path a random-subdomain flood drives.
+
+      **Done 2026-09-04.** `Nsec3Params::hash` and `Nsec3::hash` return the
+      array; `NameHash` caches it by value. Every caller passes `&hash` and
+      coerces. `proves_nxdomain` under NSEC3 **17 → 13** on the new gate, and the
+      multiplier is per label of the QNAME — the gate's zone is two labels and
+      the client picks its own. `nsec3_hash` stays for the callers that want an
+      owned digest.
+
+      The gate came first, because there was none: `check a signed NXDOMAIN
+      under NSEC / NSEC3, as a validator` is the resolver-side row beside the
+      server-side `prove a signed NXDOMAIN`, built out of the reply the server
+      just wrote.
 
 ### 12. Pre-authentication panics — audited 2026-08-01
 

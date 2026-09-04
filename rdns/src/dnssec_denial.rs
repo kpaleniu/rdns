@@ -390,14 +390,14 @@ pub struct Nsec3Params<'a> {
 
 impl Nsec3Params<'_> {
     /// The hash of `name` under these parameters.
-    pub fn hash(&self, name: &str) -> DnssecResult<Vec<u8>> {
+    pub fn hash(&self, name: &str) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
         if self.hash_algorithm != SHA1_HASH_ALGORITHM {
             return Err(DnssecError::parse(format!(
                 "unsupported NSEC3 hash algorithm {}",
                 self.hash_algorithm,
             )));
         }
-        nsec3_hash(name, self.salt, self.iterations)
+        nsec3_hash_in(name, self.salt, self.iterations)
     }
 }
 
@@ -465,7 +465,7 @@ impl Nsec3 {
     }
 
     /// The hash of `name` under this record's parameters.
-    pub fn hash(&self, name: &str) -> DnssecResult<Vec<u8>> {
+    pub fn hash(&self, name: &str) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
         self.params().hash(name)
     }
 
@@ -518,7 +518,7 @@ struct NameHash<'a> {
     name: &'a str,
     /// The parameters `hash` was computed under, and the hash. Replaced whenever
     /// a record's parameters differ.
-    computed: Option<(Nsec3Params<'a>, Vec<u8>)>,
+    computed: Option<(Nsec3Params<'a>, [u8; NSEC3_HASH_LEN])>,
 }
 
 impl<'a> NameHash<'a> {

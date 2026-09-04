@@ -120,6 +120,7 @@ fn allocation_counts() {
     building_the_metrics_registry();
     proving_a_signed_nxdomain();
     proving_a_signed_nxdomain_under_nsec3();
+    checking_a_signed_nxdomain();
     verifying_an_rrset_against_two_candidate_signatures();
     a_busy_neighbour_stays_out_of_the_count();
 }
@@ -968,8 +969,12 @@ fn ordering_two_names_canonically() {
 /// response written straight to the wire would remove (`TODO.md` #27e), and
 /// nothing smaller.
 fn proving_a_signed_nxdomain() {
-    let (records, count) = nxdomain_proof(&signed_zone());
-    assert_eq!(records, 5, "the SOA's RRSIG and two NSECs with theirs");
+    let (reply, count) = nxdomain_proof(&signed_zone());
+    assert_eq!(
+        reply.authorities.len(),
+        5,
+        "the SOA's RRSIG and two NSECs with theirs"
+    );
     within("prove a signed NXDOMAIN", count, 5..=15);
 }
 
@@ -990,11 +995,15 @@ fn proving_a_signed_nxdomain() {
 /// Both are per *candidate* name, and the two halves of an NXDOMAIN each walked
 /// the QNAME to the same closest encloser.
 fn proving_a_signed_nxdomain_under_nsec3() {
-    let (records, count) = nxdomain_proof(&signed_zone_nsec3());
+    let (reply, count) = nxdomain_proof(&signed_zone_nsec3());
     // Five, not seven: one NSEC3 covers the next closer name *and* the
     // wildcard, and the writer is told the identical second copy has gone out
     // already — which it could not be while the two halves each built a `Vec`.
-    assert_eq!(records, 5, "the SOA's RRSIG and two NSEC3s with theirs");
+    assert_eq!(
+        reply.authorities.len(),
+        5,
+        "the SOA's RRSIG and two NSEC3s with theirs"
+    );
     within("prove a signed NXDOMAIN under NSEC3", count, 5..=15);
 }
 
@@ -1003,7 +1012,7 @@ fn proving_a_signed_nxdomain_under_nsec3() {
 ///
 /// The buffer and the reply are started outside the measurement: what is being
 /// counted is the proof, not the 64 KB scratch every response path already owns.
-fn nxdomain_proof(signed: &rdns::zone::Zone) -> (usize, u64) {
+fn nxdomain_proof(signed: &rdns::zone::Zone) -> (rdns::DnsMessage, u64) {
     let request = rdns::DnsMessageBuilder::new()
         .with_url("nope.example.com.", "A")
         .with_id(1)
@@ -1042,7 +1051,49 @@ fn nxdomain_proof(signed: &rdns::zone::Zone) -> (usize, u64) {
     w.finish().expect("the reply serializes");
 
     let reply = rdns::DnsMessage::try_from_bytes(&out).expect("and parses back");
-    (reply.authorities.len(), count)
+    (reply, count)
+}
+
+/// The other end of the two answers above: what the *validator* pays to check
+/// the proof the server just wrote, which is the resolver-side path and has no
+/// zone to read records out of.
+///
+/// It walks to the closest encloser the same way and had none of the fixes:
+/// **6 under NSEC and 17 under NSEC3**, against the server's 5 and 6, because
+/// `Nsec3Params::hash` returned a `Vec` per candidate name where `nsec3_hash_in`
+/// was already sitting beside it (`CLAUDE.md` §7). 13 with that one line
+/// changed, and the multiplier is per label of the QNAME: this zone is two
+/// labels and a client picks its own.
+fn checking_a_signed_nxdomain() {
+    for (what, zone) in [("NSEC", signed_zone()), ("NSEC3", signed_zone_nsec3())] {
+        let (reply, _) = nxdomain_proof(&zone);
+        let nsecs = rdns::dnssec_denial::nsecs_in(&reply.authorities);
+        let nsec3s = rdns::dnssec_denial::nsec3s_in(&reply.authorities);
+        // The first call in a process picks up a one-off; measure the second.
+        let denial = rdns::dnssec_denial::proves_nxdomain(
+            "nope.example.com.",
+            "example.com.",
+            &nsecs,
+            &nsec3s,
+        );
+        assert!(
+            matches!(denial, rdns::dnssec_denial::Denial::Proved),
+            "the measurement is only meaningful if the proof stands: {denial:?}"
+        );
+        let (_, count) = allocations(|| {
+            rdns::dnssec_denial::proves_nxdomain(
+                "nope.example.com.",
+                "example.com.",
+                &nsecs,
+                &nsec3s,
+            )
+        });
+        within(
+            &format!("check a signed NXDOMAIN under {what}, as a validator"),
+            count,
+            0..=u64::MAX,
+        );
+    }
 }
 
 /// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate
