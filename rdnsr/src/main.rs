@@ -951,6 +951,17 @@ async fn serve_connection(
             _ => break,
         }
 
+        // The structural caps, on bytes nothing has trusted yet — the same
+        // door the UDP loop above uses, with the TCP ceiling rather than the
+        // 512-octet one. This transport had none of it (`TODO.md` #30q). The
+        // message is skipped, not the connection: a peer that framed it
+        // correctly is still speaking the protocol.
+        let validation = shell.validator.validate_packet(&buf, true);
+        if !validation.is_valid() {
+            shell.metrics.count(&shell.metrics.validation_errors);
+            continue;
+        }
+
         // This await is what stops a pipelining client from spawning tasks
         // faster than we retire them.
         let Ok(permit) = in_flight.clone().acquire_owned().await else {
@@ -1679,6 +1690,93 @@ mod tests {
                 "{opcode:?}: a plausible QUERY-shaped answer is worse than a refusal"
             );
         }
+    }
+
+    /// An UPDATE carrying `additionals` additional records, which
+    /// `handle_query` answers NOTIMP out of the message alone. Five is one over
+    /// `AdmissionCheck`'s cap for a request.
+    fn update_with_additionals(id: u16, additionals: usize) -> Vec<u8> {
+        let mut msg = DnsMessage::try_from_bytes(&message(OpCode::Update, false)).expect("parses");
+        msg.id = id;
+        msg.additionals = vec![
+            ResourceRecord {
+                name: "example.com.".to_string(),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(60),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    "192.0.2.1".parse().unwrap(),
+                ))
+                .unwrap(),
+            };
+            additionals
+        ];
+        let mut buf = vec![0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("serialize");
+        buf.truncate(n);
+        buf
+    }
+
+    /// The admission check runs on TCP as well. It ran on one of the two
+    /// transports (`TODO.md` #30q), so the 16 KiB ceiling, the QDCOUNT cap and
+    /// the per-section counts all stopped at the UDP loop.
+    ///
+    /// Provoked with the additional-count cap because it is the cheapest of
+    /// those rules to build; the check is one call, so any rule of it firing is
+    /// the whole check running. Both messages are UPDATEs, answered from the
+    /// message alone — no cache, no upstream — so a missing reply is a drop
+    /// rather than a timeout somewhere else, and the second one is what says
+    /// the connection survived the first.
+    ///
+    /// Watched failing with the check removed: the reply carried 0xBAD1.
+    #[tokio::test]
+    async fn a_tcp_message_over_the_admission_caps_is_dropped_and_the_connection_kept() {
+        let (resolver, caches) = context();
+        let shell = test_shell();
+        let metrics = shell.metrics.clone();
+
+        let shutdown = Shutdown::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(tcp_main(
+            listener,
+            resolver,
+            caches,
+            shell,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        for message in [
+            update_with_additionals(0xBAD1, 5),
+            update_with_additionals(0x600D, 1),
+        ] {
+            client
+                .write_all(&rdns::framed(&message).expect("frames"))
+                .await
+                .expect("send");
+        }
+
+        let mut prefix = [0u8; 2];
+        client.read_exact(&mut prefix).await.expect("one reply");
+        let mut reply = vec![0u8; u16::from_be_bytes(prefix) as usize];
+        client.read_exact(&mut reply).await.expect("its body");
+        let reply = DnsMessage::try_from_bytes(&reply).expect("a well-formed reply");
+        assert_eq!(
+            reply.id, 0x600D,
+            "0xBAD1 is over the cap and must not be answered"
+        );
+        assert_eq!(reply.rcode, ResponseCode::NotImplemented);
+        assert_eq!(
+            metrics
+                .validation_errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "and the drop is counted, since it is silent on the wire"
+        );
+
+        shutdown.begin();
+        let _ = server.await;
     }
 
     /// A datagram arriving with the in-flight ceiling already reached is
