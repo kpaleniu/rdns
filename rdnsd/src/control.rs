@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 
-use crate::{ReloadTrigger, Served};
+use crate::{ReloadTrigger, ZoneContext};
 
 /// How long a client gets to send its command before we give up on it.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,7 +34,7 @@ const RELOAD_REPORT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Everything a command needs to answer, so the handlers take one argument.
 pub struct Control {
-    pub served: Served,
+    pub served: ZoneContext,
     /// Zones this server replicates, so `status` can say which are secondary
     /// without inferring it from a timestamp that is also absent on a primary.
     pub replicated: Vec<String>,
@@ -398,7 +398,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         (
             Arc::new(Control {
-                served: Served {
+                served: ZoneContext {
                     zone_map: Arc::new(RwLock::new(zones)),
                     deltas: Arc::new(RwLock::new(rdns::ixfr::DeltaLog::new())),
                     metrics,

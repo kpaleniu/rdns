@@ -10,7 +10,8 @@ mod zones;
 
 use answer::write_response;
 use replication::{
-    parse_secondary_specs, spawn_secondaries, withdraw_unvouched_zones, Replication, Secondaries,
+    parse_secondary_specs, spawn_secondaries, withdraw_unvouched_zones, ReplicationContext,
+    Secondaries,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -20,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zones::{
     install_all_zones, install_zone, load_zones_from_source, note_serials, restore_journals,
-    validate_zone_source, verify_zones, Served, ZoneMap, ZoneSigning, ZoneSource, Zones,
+    validate_zone_source, verify_zones, ZoneContext, ZoneMap, ZoneSigning, ZoneSource, Zones,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -678,7 +679,7 @@ async fn serve(
             control_listener,
             socket.expect("a listener implies a path"),
             Arc::new(control::Control {
-                served: Served {
+                served: ZoneContext {
                     zone_map: server.zone_map.clone(),
                     deltas: server.deltas.clone(),
                     metrics: server.metrics.clone(),
@@ -1465,7 +1466,7 @@ impl Server {
         match installed {
             Some(zone) => {
                 let serial = zone.serial();
-                install_zone(&self.served(), zone).await;
+                install_zone(&self.zone_context(), zone).await;
                 tracing::info!(
                     peer = %ip,
                     "UPDATE of {zone_name} by key {}: {} record{} changed, serial now {}",
@@ -1488,9 +1489,9 @@ impl Server {
         self.update_reply(msg, ResponseCode::Ok, ip, Some(session))
     }
 
-    /// The four things `install_zone` moves together.
-    fn served(&self) -> Served {
-        Served {
+    /// The four things `install_zone` moves together — [`ZoneContext`].
+    fn zone_context(&self) -> ZoneContext {
+        ZoneContext {
             zone_map: Arc::clone(&self.zone_map),
             deltas: Arc::clone(&self.deltas),
             metrics: Arc::clone(&self.metrics),
@@ -2012,7 +2013,7 @@ impl Reloading {
     /// Separate from [`Reloading::load`] because it has to run *after*
     /// `install_all_zones`: the question is about the zones now being served, and
     /// until they are installed there is nothing to withdraw.
-    async fn withdraw_unvouched(&self, served: &Served) {
+    async fn withdraw_unvouched(&self, served: &ZoneContext) {
         let Some(zone_dir) = &self.zone_dir else {
             return;
         };
@@ -2060,7 +2061,7 @@ impl ReloadTrigger {
 async fn reload_once(
     reloading: &Reloading,
     source: &ZoneSource,
-    served: &Served,
+    served: &ZoneContext,
     notify_targets: &[SocketAddr],
     announced: Vec<(String, Serial)>,
     busy: &Busy,
@@ -2122,7 +2123,7 @@ async fn reload_once(
 /// installing zones is work the drain should wait for, and a task that never
 /// exits while holding a `Busy` spends the whole budget every shutdown.
 fn spawn_zone_maintenance(
-    served: Served,
+    served: ZoneContext,
     source: ZoneSource,
     notify_targets: Vec<SocketAddr>,
     announced: Vec<(String, Serial)>,
@@ -2597,8 +2598,8 @@ async fn main() -> Result<()> {
         ZoneSource::Directory(dir) => Some(Arc::new(Journal::new(PathBuf::from(dir)))),
         ZoneSource::SingleFile(_) | ZoneSource::Files(_) => None,
     };
-    // The four that are only ever updated together. See [`Served`].
-    let served = Served {
+    // The four that are only ever updated together. See [`ZoneContext`].
+    let served = ZoneContext {
         zone_map: zone_map.clone(),
         deltas: deltas.clone(),
         metrics: metrics.clone(),
@@ -2647,7 +2648,7 @@ async fn main() -> Result<()> {
             )
         };
 
-        let replication = Replication {
+        let replication = ReplicationContext {
             served: served.clone(),
             state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&zone_dir)))),
             zone_dir,
@@ -3040,10 +3041,10 @@ mod tests {
         );
     }
 
-    /// A [`Served`] over the given map and log, with throwaway gauges — for
+    /// A [`ZoneContext`] over the given map and log, with throwaway gauges — for
     /// tests about installing and withdrawing zones rather than about metrics.
-    fn served(zone_map: &Arc<RwLock<Zones>>, deltas: &Arc<RwLock<DeltaLog>>) -> Served {
-        Served {
+    fn served(zone_map: &Arc<RwLock<Zones>>, deltas: &Arc<RwLock<DeltaLog>>) -> ZoneContext {
+        ZoneContext {
             zone_map: zone_map.clone(),
             deltas: deltas.clone(),
             metrics: Arc::new(DnsMetrics::new()),
@@ -4016,9 +4017,9 @@ mod tests {
     }
 
     /// The replication context a refresh runs in, over a scratch directory.
-    fn replication(dir: &ScratchDir, notify_targets: Vec<SocketAddr>) -> Replication {
-        Replication {
-            served: Served {
+    fn replication(dir: &ScratchDir, notify_targets: Vec<SocketAddr>) -> ReplicationContext {
+        ReplicationContext {
+            served: ZoneContext {
                 zone_map: Arc::new(RwLock::new(Zones::default())),
                 deltas: Arc::new(RwLock::new(DeltaLog::new())),
                 metrics: Arc::new(DnsMetrics::new()),
@@ -4224,8 +4225,8 @@ mod tests {
             .expect("record");
         let state = Arc::new(Mutex::new(state_file));
 
-        let r = Replication {
-            served: Served {
+        let r = ReplicationContext {
+            served: ZoneContext {
                 zone_map: zone_map.clone(),
                 deltas: Arc::new(RwLock::new(DeltaLog::new())),
                 metrics: Arc::new(DnsMetrics::new()),
@@ -4276,8 +4277,8 @@ mod tests {
             .expect("record");
         let state = Arc::new(Mutex::new(state_file));
 
-        let r = Replication {
-            served: Served {
+        let r = ReplicationContext {
+            served: ZoneContext {
                 zone_map: zone_map.clone(),
                 deltas: Arc::new(RwLock::new(DeltaLog::new())),
                 metrics: Arc::new(DnsMetrics::new()),

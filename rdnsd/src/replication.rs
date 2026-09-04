@@ -1,8 +1,8 @@
 //! The secondary role: fetching a zone from a master and keeping it.
 //!
 //! Everything here belongs to a refresh task — one per zone-and-master pair —
-//! and shares state with the rest of the process only through [`Replication`]
-//! and `Served`.
+//! and shares state with the rest of the process only through [`ReplicationContext`]
+//! and `ZoneContext`.
 //!
 //! The three timers are the whole protocol (RFC 1035 §3.3.13): REFRESH when to
 //! ask again, RETRY when to ask again after a failure, EXPIRE when to stop
@@ -41,7 +41,7 @@ use rdns::zone::Zone;
 use rdns::zone_writer::write_zone_file;
 use rdns::Serial;
 
-use crate::zones::{install_zone, Served, Zones};
+use crate::zones::{install_zone, ZoneContext, Zones};
 use crate::{absolute_name, announce_transfer};
 
 /// One replicated zone, as a NOTIFY needs to see it.
@@ -61,8 +61,8 @@ pub(crate) type Secondaries = Arc<HashMap<String, ReplicatedZone>>;
 /// Bundled because the pieces are not independently choosable: the delta log is
 /// derived from the zone map, and the sidecar lives in the zone directory.
 #[derive(Clone)]
-pub(crate) struct Replication {
-    pub(crate) served: Served,
+pub(crate) struct ReplicationContext {
+    pub(crate) served: ZoneContext,
     /// One file, so one mutex: one writer.
     pub(crate) state: Arc<Mutex<StateFile>>,
     pub(crate) zone_dir: PathBuf,
@@ -78,7 +78,7 @@ pub(crate) struct Replication {
 pub(crate) fn spawn_secondaries(
     specs: Vec<MasterSpec>,
     keys: &TsigKeyring,
-    replication: Replication,
+    replication: ReplicationContext,
     lifecycle: Lifecycle,
 ) -> Result<Secondaries> {
     let Lifecycle { stop, busy } = lifecycle;
@@ -158,7 +158,7 @@ pub(crate) fn spawn_secondaries(
 async fn secondary_loop(
     spec: MasterSpec,
     key: Option<TsigKey>,
-    replication: Replication,
+    replication: ReplicationContext,
     wake: Arc<Notify>,
     lifecycle: Lifecycle,
 ) {
@@ -218,17 +218,17 @@ async fn zone_timers(zone_map: &Arc<RwLock<Zones>>, zone: &str) -> RefreshTimers
 pub(crate) async fn refresh_once(
     spec: &MasterSpec,
     key: Option<&TsigKey>,
-    replication: &Replication,
+    replication: &ReplicationContext,
     busy: &Busy,
 ) -> Result<String> {
-    let Replication {
+    let ReplicationContext {
         served,
         state,
         zone_dir,
         notify_targets,
         readiness,
     } = replication;
-    let Served {
+    let ZoneContext {
         zone_map, metrics, ..
     } = served;
     // A clone, not a borrow: holding the read lock across a network round trip
@@ -370,12 +370,12 @@ pub(crate) async fn record_state(
 /// as "fetch and serve".
 pub(crate) async fn expire_if_out_of_contact(
     spec: &MasterSpec,
-    replication: &Replication,
+    replication: &ReplicationContext,
     started_at: u64,
     timers: RefreshTimers,
 ) {
-    let Replication { served, state, .. } = replication;
-    let Served {
+    let ReplicationContext { served, state, .. } = replication;
+    let ZoneContext {
         zone_map,
         deltas,
         metrics,
@@ -426,10 +426,10 @@ pub(crate) async fn expire_if_out_of_contact(
 /// `--secondary` specs.
 pub(crate) async fn withdraw_unvouched_zones(
     specs: &[MasterSpec],
-    served: &Served,
+    served: &ZoneContext,
     zone_dir: &Path,
 ) {
-    let Served {
+    let ZoneContext {
         zone_map,
         deltas,
         metrics,

@@ -1,7 +1,7 @@
 //! The zone map and everything that puts a zone into it: where a zone comes
 //! from ([`ZoneSource`], [`load_zones_from_source`]), what has to be true before
 //! it is served ([`ZoneSigning`], [`verify_zones`]), and how it is swapped into
-//! the map without the derived state falling out of step ([`Zones`], [`Served`],
+//! the map without the derived state falling out of step ([`Zones`], [`ZoneContext`],
 //! [`install_zone`]). The reload task is a caller of this, not a part of it.
 //!
 //! Locks are held across await points on purpose — see [`install_zone`], which
@@ -101,8 +101,8 @@ impl ZoneSource {
 /// from the zone map: skipping it offers an IXFR chain that does not describe
 /// the zone we serve, and a secondary applying it ends up with a zone that never
 /// existed holding a serial saying it is current.
-pub(crate) async fn install_zone(served: &Served, zone: Zone) {
-    let Served {
+pub(crate) async fn install_zone(served: &ZoneContext, zone: Zone) {
+    let ZoneContext {
         zone_map,
         deltas,
         metrics,
@@ -165,8 +165,8 @@ pub(crate) async fn install_zone(served: &Served, zone: Zone) {
 // serves has no trigger on Windows, so there it is genuinely unreachable rather
 // than merely unused.
 #[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) async fn install_all_zones(served: &Served, new_zones: ZoneMap) {
-    let Served {
+pub(crate) async fn install_all_zones(served: &ZoneContext, new_zones: ZoneMap) {
+    let ZoneContext {
         zone_map,
         deltas,
         metrics,
@@ -492,7 +492,7 @@ impl std::ops::Deref for Zones {
 /// withdrawn has to leave all three. Three parameters is how one gets forgotten
 /// at a fourth call site.
 #[derive(Clone)]
-pub(crate) struct Served {
+pub(crate) struct ZoneContext {
     pub(crate) zone_map: Arc<RwLock<Zones>>,
     pub(crate) deltas: Arc<RwLock<DeltaLog>>,
     pub(crate) metrics: Arc<DnsMetrics>,
