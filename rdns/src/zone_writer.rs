@@ -19,7 +19,7 @@ use crate::Ttl;
 use std::path::Path;
 
 use crate::denial_wire::{base32hex_encode, bitmap_types_exact};
-use crate::utils::{record_type_name, record_types};
+use crate::utils::{base64_encode, hex_encode, record_type_name, record_types};
 use crate::zone::{format_dnssec_time, Zone, ZoneRecord};
 use crate::{ParsedRecord, RecordData};
 
@@ -179,13 +179,16 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
             protocol,
             algorithm,
             public_key,
-        } => format!("{flags} {protocol} {algorithm} {}", base64(public_key)),
+        } => format!(
+            "{flags} {protocol} {algorithm} {}",
+            base64_encode(public_key)
+        ),
         ParsedRecord::DS {
             key_tag,
             algorithm,
             digest_type,
             digest,
-        } => format!("{key_tag} {algorithm} {digest_type} {}", hex(digest)),
+        } => format!("{key_tag} {algorithm} {digest_type} {}", hex_encode(digest)),
         ParsedRecord::RRSIG {
             type_covered,
             algorithm,
@@ -202,7 +205,7 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
             format_dnssec_time(*expiration),
             format_dnssec_time(*inception),
             writable_name(signer_name)?,
-            base64(signature),
+            base64_encode(signature),
         ),
         ParsedRecord::NSEC {
             next_domain_name,
@@ -225,7 +228,7 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
             let salt = if salt.is_empty() {
                 "-".to_string()
             } else {
-                hex(salt)
+                hex_encode(salt)
             };
             let mut out = format!(
                 "{hash_algorithm} {flags} {iterations} {salt} {}",
@@ -288,14 +291,6 @@ fn quotable_string(bytes: &[u8]) -> Option<String> {
         }
     }
     Some(out)
-}
-
-fn base64(bytes: &[u8]) -> String {
-    base64::Engine::encode(&base64::prelude::BASE64_STANDARD, bytes)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 fn class_name(class: Class) -> Option<&'static str> {

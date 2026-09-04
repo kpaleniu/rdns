@@ -2,7 +2,7 @@ use crate::denial_wire::{base32hex_decode, canonical_sort_key};
 use crate::error::ZoneError;
 use crate::utils::record_type_code;
 use crate::utils::record_types as rt;
-use crate::utils::{ascii_lowered_cow, is_at_or_under, parent_name, NameKeyBuf};
+use crate::utils::{ascii_lowered_cow, hex_decode, is_at_or_under, parent_name, NameKeyBuf};
 use crate::Class;
 use crate::Rtype;
 use crate::Serial;
@@ -573,21 +573,6 @@ fn absolute(name: &str) -> String {
 /// The small parse helpers below return `Result<_, String>` on purpose: they
 /// produce a *detail*, and only their caller — the zone parser — knows the line
 /// number to attach it to. A `ZoneError` here would have to invent one.
-fn parse_hex(hex_str: &str) -> Result<Vec<u8>, String> {
-    let hex_str = hex_str.trim();
-    if !hex_str.len().is_multiple_of(2) {
-        return Err("Odd number of hexadecimal digits".to_string());
-    }
-    let mut res = Vec::with_capacity(hex_str.len() / 2);
-    let chars: Vec<char> = hex_str.chars().collect();
-    for i in (0..chars.len()).step_by(2) {
-        let high = chars[i].to_digit(16).ok_or("Invalid hex digit")? as u8;
-        let low = chars[i + 1].to_digit(16).ok_or("Invalid hex digit")? as u8;
-        res.push((high << 4) | low);
-    }
-    Ok(res)
-}
-
 fn is_leap(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
@@ -742,7 +727,7 @@ fn parse_generic_rdata(record_type: &str, fields: &[&str]) -> Result<RecordData,
         .parse()
         .map_err(|e| format!("invalid generic rdata length {length:?}: {e}"))?;
 
-    let bytes = parse_hex(&hex.concat()).map_err(|e| format!("invalid generic rdata: {e}"))?;
+    let bytes = hex_decode(&hex.concat()).map_err(|e| format!("invalid generic rdata: {e}"))?;
     if bytes.len() != length {
         return Err(format!(
             "generic rdata says {length} bytes but carries {}",
@@ -1138,7 +1123,7 @@ fn rdata_from_fields(
                 ZoneError::syntax(ln, format!("invalid DS digest type {:?}: {e}", ds_parts[2]))
             })?;
             let hex_digest = ds_parts[3..].join("");
-            let digest = parse_hex(&hex_digest)
+            let digest = hex_decode(&hex_digest)
                 .map_err(|e| ZoneError::syntax(ln, format!("invalid DS digest: {e}")))?;
             RecordData::from_parsed(&ParsedRecord::DS {
                 key_tag,
@@ -1269,7 +1254,7 @@ fn rdata_from_fields(
             let salt = if salt_str == "-" {
                 Vec::new()
             } else {
-                parse_hex(salt_str).map_err(|e| {
+                hex_decode(salt_str).map_err(|e| {
                     ZoneError::syntax(ln, format!("invalid NSEC3 salt {:?}: {e}", salt_str))
                 })?
             };

@@ -20,6 +20,7 @@ use std::path::Path;
 
 use crate::dnssec::{ds_digest, Dnskey, Ds, Rrset};
 use crate::utils::record_types as rt;
+use crate::utils::{base64_encode, hex_decode, hex_encode};
 use crate::{ParsedRecord, RecordData, ResourceRecord};
 
 /// The REVOKE bit (RFC 5011 §3), flags bit 8.
@@ -439,7 +440,7 @@ impl ManagedAnchors {
                 ds.key_tag,
                 ds.algorithm,
                 ds.digest_type,
-                hex(&ds.digest)
+                hex_encode(&ds.digest)
             ));
         }
         for tracked in &self.keys {
@@ -449,7 +450,7 @@ impl ManagedAnchors {
                 tracked.key.flags,
                 tracked.key.protocol,
                 tracked.key.algorithm,
-                base64(&tracked.key.public_key),
+                base64_encode(&tracked.key.public_key),
                 tracked.state.as_str(),
                 tracked.since,
                 tracked.key.key_tag(),
@@ -617,7 +618,7 @@ fn parse_anchor_line(fields: &[&str]) -> DnssecResult<AnchorLine> {
                 digest_type: rest[2]
                     .parse()
                     .map_err(|e| DnssecError::parse(format!("digest type: {e}")))?,
-                digest: parse_hex(&rest[3..].concat())?,
+                digest: hex_decode(&rest[3..].concat())?,
             }))
         }
         "DNSKEY" => {
@@ -667,28 +668,6 @@ fn parse_annotations(text: &str) -> (Option<KeyState>, Option<u64>) {
         }
     }
     (state, since)
-}
-
-fn parse_hex(text: &str) -> DnssecResult<Vec<u8>> {
-    let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    if !text.len().is_multiple_of(2) {
-        return Err(DnssecError::parse("digest has an odd number of hex digits"));
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&text[i..i + 2], 16)
-                .map_err(|e| DnssecError::parse(format!("digest: {e}")))
-        })
-        .collect()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02X}")).collect()
-}
-
-fn base64(bytes: &[u8]) -> String {
-    base64::Engine::encode(&base64::prelude::BASE64_STANDARD, bytes)
 }
 
 /// [`crate::utils::absolute`], owned — this module's callers all keep the result.
@@ -1140,7 +1119,7 @@ mod tests {
     fn test_a_hand_written_key_is_trusted_as_written() {
         let text = format!(
             ". 172800 IN DNSKEY 257 3 8 {}\n",
-            base64(&zone_key(3).public_key)
+            base64_encode(&zone_key(3).public_key)
         );
         let anchors = ManagedAnchors::parse(&text, 4_242).expect("parse");
         assert_eq!(anchors.keys().len(), 1);

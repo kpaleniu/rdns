@@ -1,6 +1,6 @@
 //! Name folding, timestamps, and record-type constants shared across the crate.
 
-use crate::error::{DnssecError, DnssecResult};
+use crate::error::{DnssecError, DnssecResult, WireError, WireResult};
 use crate::{ParsedRecord, RecordData, Rtype};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,6 +42,68 @@ pub mod record_types {
 /// no [`std::io::ErrorKind`] for it — it arrives as `Uncategorized` — so the raw
 /// code is the only way to recognize it.
 const WSAEMSGSIZE: i32 = 10040;
+
+/// Hex, upper case, as a zone file and an anchor file write a digest or a salt.
+///
+/// Existed twice as `bytes.iter().map(|b| format!("{b:02X}")).collect()`, which
+/// is **a heap allocation per output byte** — `rdnsctl dump` of a signed zone
+/// runs it over every DS digest and NSEC3 salt (`TODO.md` #26a).
+pub fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// The inverse, tolerating whitespace anywhere.
+///
+/// A DS digest is written across lines in IANA's own root-anchors file and
+/// inside parentheses in a zone file, so "skip whitespace" is the rule at every
+/// call site rather than a kindness. One pass and no intermediate `String`:
+/// there were three of these, one of them inline and so invisible to a grep for
+/// the name (`TODO.md` #26c).
+pub fn hex_decode(text: &str) -> WireResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let mut high: Option<u8> = None;
+    for c in text.bytes() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        let nibble = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => {
+                return Err(WireError::malformed(
+                    "hex text",
+                    format!("invalid character {:?}", c as char),
+                ))
+            }
+        };
+        match high.take() {
+            None => high = Some(nibble),
+            Some(h) => out.push((h << 4) | nibble),
+        }
+    }
+    if high.is_some() {
+        return Err(WireError::malformed("hex text", "an odd number of digits"));
+    }
+    Ok(out)
+}
+
+/// base64, standard alphabet with padding (RFC 4648 §4) — how a DNSKEY, an
+/// RRSIG and a TSIG secret are written.
+///
+/// A one-line wrapper that existed three times. The *decoder* deliberately does
+/// not move: it is one call to the crate at each site and every site wraps the
+/// failure in its own error type, so a shared one would add an indirection and
+/// nothing else.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    base64::Engine::encode(&base64::prelude::BASE64_STANDARD, bytes)
+}
 
 /// The wildcard address to bind before talking to `target`.
 ///
@@ -754,6 +816,52 @@ mod tests {
         assert_eq!(record_type_name_to_code("TYPE65536"), None);
         assert_eq!(record_type_name_to_code("TYPE"), None);
         assert_eq!(record_type_name_to_code("TYPEA"), None);
+    }
+
+    /// Both directions, and the two things the three deleted copies disagreed
+    /// about: whitespace, and how many allocations an encode costs.
+    #[test]
+    fn hex_round_trips_and_is_written_into_one_string() {
+        assert_eq!(hex_encode(&[0x00, 0x0f, 0xa5, 0xff]), "000FA5FF");
+        assert_eq!(
+            hex_encode(&[0u8; 20]).capacity(),
+            40,
+            "sized once for the whole digest, not grown a byte at a time"
+        );
+
+        // A DS digest wraps across lines in IANA's root-anchors file and inside
+        // parentheses in a zone file.
+        assert_eq!(
+            hex_decode(
+                "A5 FF
+	00"
+            )
+            .unwrap(),
+            vec![0xa5, 0xff, 0x00]
+        );
+        assert_eq!(hex_decode("a5ff").unwrap(), hex_decode("A5FF").unwrap());
+        assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
+
+        assert!(hex_decode("abc").is_err(), "an odd number of digits");
+        assert!(hex_decode("a5 f").is_err(), "odd once the spaces are gone");
+        assert!(hex_decode("zz").is_err(), "not a hex digit");
+
+        for bytes in [
+            [].as_slice(),
+            &[0x00],
+            &[0xde, 0xad, 0xbe, 0xef],
+            &[0xff; 32],
+        ] {
+            assert_eq!(hex_decode(&hex_encode(bytes)).unwrap(), bytes);
+        }
+    }
+
+    /// RFC 4648 §10's vector, so the wrapper is pinned to the alphabet a DNSKEY
+    /// is written in rather than to whatever the crate defaults to next.
+    #[test]
+    fn base64_is_the_padded_standard_alphabet() {
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(b"fo"), "Zm8=", "padded");
     }
 
     /// A socket has to be in the peer's family, and a v4-mapped v6 address is a

@@ -1864,10 +1864,10 @@ is why #13b's sweep did not turn them up.
 
 | | what | note |
 |---|---|---|
-| **26a** | two `fn hex`, byte-identical | `rfc5011.rs:778`, `zone_writer.rs:324`, both `bytes.iter().map(\|b\| format!("{b:02X}")).collect()` — **one heap allocation per output byte**. `rdnsctl dump` of a signed zone runs it over every DS digest and NSEC3 salt |
+| **26a** | ~~two `fn hex`, byte-identical~~ **fixed 2026-09-04** | `rfc5011.rs:778`, `zone_writer.rs:324`, both `bytes.iter().map(\|b\| format!("{b:02X}")).collect()` — **one heap allocation per output byte**. `rdnsctl dump` of a signed zone runs it over every DS digest and NSEC3 salt. **`utils::hex_encode`**, one `String` sized for the whole output — asserted on `capacity()`, which is exact |
 | **26b** | ~~two base32hex decoders that disagree~~ **fixed 2026-09-04** | `zone::parse_base32_hex` (`:619`) against `dnssec_denial::base32hex_decode` (`:226`). The first does `to_uppercase()` — the Unicode fold §8 forbids, plus an allocation — and a linear `position()` over the 32-byte alphabet per character; the second is a range match. They also disagree about `=` padding. **Done, and it took the module split #31 asked for**: the shared decoder is `denial_wire::base32hex_decode` and `zone::parse_base32_hex` is gone. Both differences have tests — U+017F LONG S upper-cases to `S`, which *is* in the base32hex alphabet, so the deleted copy read a character no DNS name can hold as a valid digit; and padding is refused rather than skipped, since RFC 5155 §3.3 calls the Next Hashed Owner Name "an unpadded sequence of case-insensitive base32 digits" and skipping `=` loaded a shorter hash |
-| **26c** | two `parse_hex` | `rfc5011.rs:764`, `zone.rs:604`. The second collects a `Vec<char>` (four bytes per input character) to index pairs, where `as_bytes().chunks_exact(2)` does it in place |
-| **26d** | two `fn base64` | `rfc5011.rs:781`, `zone_writer.rs:320`, identical one-line wrappers |
+| **26c** | ~~two `parse_hex`~~ **three, and fixed 2026-09-04** | `rfc5011.rs:764`, `zone.rs:604`. The second collects a `Vec<char>` (four bytes per input character) to index pairs, where `as_bytes().chunks_exact(2)` does it in place. **There were three**: `dnssec_chain::parse_ds` has the same loop written inline, which a grep for `parse_hex` cannot see and which is the argument for reading rather than grepping that this section opens with. All three are `utils::hex_decode` now — one pass, no intermediate `String`, and whitespace skipped anywhere, which the anchor-file copy needed and the zone copy only trimmed at the ends |
+| **26d** | ~~two `fn base64`~~ **three, and fixed 2026-09-04** | `rfc5011.rs:781`, `zone_writer.rs:320`, identical one-line wrappers — and a third in `dnssec_key.rs`. `utils::base64_encode`. The *decoder* deliberately stays put at its four sites: it is one call to the crate at each, and each wraps the failure in its own error type, so a shared one would add an indirection and nothing else |
 | **26e** | ~~`ancestors_of` / `ancestors` allocate a `String` per ancestor~~ **done 2026-09-04** | `zone_signer.rs:785` (a `Vec<&str>`, then a `join` **and** a `format!` per ancestor) and `resolver.rs:482`. Ancestors are suffix slices of the input. `Layout::of` runs it once per name and `chain_names` runs it again per name, at every load and every re-signing. Flagged as "the next function to look at" by the 2026-08-03 review and still there. **Both are iterators of slices now.** Signing 200 records went 26 313 → 22 103 allocations and the slope 130 → 109 per record; the eight-record gate 784 → 710. The resolver's is per delegation-cache lookup, so per query |
 | **26f** | `resolver::normalize` allocates unconditionally | `resolver.rs:1779`; `utils::absolute_lowered` returns a `Cow` and borrows the common case. A straggler of #13b |
 | **26g** | ~~`canonical_name_cmp` hand-rolls `Iterator::cmp`~~ **done 2026-09-01** | `dnssec_denial.rs:50` — `for i in 0.. { match (a.get(i), b.get(i)) … }` with an `unreachable!()` to close it. Fixed with #25d: the loop *was* the `Vec<String>`'s reason for existing |
@@ -6585,6 +6585,11 @@ cache carries the same AD bit the first client saw and no other.
 Newest first. The reasoning, RFC citations and verification for each are in the
 commit message.
 
+- **Hex and base64, written once** (#26a, #26c, #26d) — `utils::hex_encode`,
+  `hex_decode` and `base64_encode` replace eight copies across five modules. The
+  survey counted six: a third hex decoder was inline in `dnssec_chain::parse_ds`
+  and a third base64 wrapper in `dnssec_key`, neither findable by the names the
+  other copies used. The encoder was a heap allocation per output byte.
 - **The wire encodings left the crypto module** (#26b, and #31's one
   prerequisite) — canonical name order, type bitmaps and base32hex are
   `rdns::denial_wire`, and `zone`/`zone_writer` no longer reach into

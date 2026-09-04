@@ -20,6 +20,7 @@ use crate::dnssec::{
 };
 use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
+use crate::utils::base64_encode;
 use ring::rand::SystemRandom;
 use ring::signature::{
     EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING,
@@ -396,7 +397,7 @@ impl SigningKey {
             tag = self.key_tag(),
             flags = self.flags,
             alg = self.algorithm.code(),
-            key = base64(&self.pkcs8),
+            key = base64_encode(&self.pkcs8),
         )
     }
 
@@ -597,10 +598,6 @@ fn strip_leading_zeros(bytes: &[u8]) -> &[u8] {
     &bytes[first..]
 }
 
-fn base64(bytes: &[u8]) -> String {
-    base64::Engine::encode(&base64::prelude::BASE64_STANDARD, bytes)
-}
-
 fn base64_decode(text: &str) -> Result<Vec<u8>> {
     base64::Engine::decode(&base64::prelude::BASE64_STANDARD, text.trim())
         .map_err(|e| DnssecError::parse(format!("not valid base64: {e}")))
@@ -739,7 +736,7 @@ mod tests {
         )
         .unwrap();
         let rendered = format!("{key:?}");
-        assert!(!rendered.contains(&base64(&key.pkcs8)));
+        assert!(!rendered.contains(&base64_encode(&key.pkcs8)));
         assert!(rendered.contains("example.com."));
     }
 

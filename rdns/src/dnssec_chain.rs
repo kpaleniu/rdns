@@ -24,6 +24,7 @@ use crate::dnssec_denial::{
     proves_no_ds, proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
 };
 use crate::error::DnssecError;
+use crate::utils::hex_decode;
 use crate::utils::record_types as rt;
 use crate::Class;
 use crate::Rtype;
@@ -210,18 +211,11 @@ fn parse_ds_line(line: &str) -> Result<Ds, DnssecError> {
     let digest_type: u8 = tokens[2]
         .parse()
         .map_err(|_| DnssecError::parse(format!("bad digest type {:?}", tokens[2],)))?;
-    // The digest may be split across whitespace, as it is in IANA's own file.
-    let hex: String = tokens[3..].concat();
-    if !hex.len().is_multiple_of(2) {
-        return Err(DnssecError::parse(
-            "digest has an odd number of hex characters",
-        ));
-    }
-    let digest = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-        .collect::<Result<Vec<u8>, _>>()
-        .map_err(|_| DnssecError::parse("digest is not hexadecimal"))?;
+    // The digest may be split across whitespace, as it is in IANA's own file,
+    // which `hex_decode` skips — this was a third copy of that loop, inline and
+    // so invisible to a grep for `parse_hex` (`TODO.md` #26c).
+    let digest = hex_decode(&tokens[3..].concat())
+        .map_err(|e| DnssecError::parse(format!("digest: {e}")))?;
 
     Ok(Ds {
         owner,
