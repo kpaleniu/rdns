@@ -372,12 +372,123 @@ pub(crate) fn write_opt(
     write_bytes(buf, pos, rdata)
 }
 
+/// What a request's OPT record says, once the two refusals RFC 6891 requires
+/// are out of the way.
+///
+/// Carries only what a reply needs: whether to attach an OPT at all
+/// (RFC 6891 §6.1.1) and what to set DO to (RFC 3225 §3). The advertised
+/// payload size is not here — that is [`DnsMessage::udp_payload_size`], which
+/// applies §6.2.3's floor, and is a question about the transport rather than
+/// about the reply's OPT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientEdns {
+    /// No OPT record: the reply carries none either.
+    Absent,
+    /// An OPT we can answer, with DO as the client set it.
+    Present { do_bit: bool },
+}
+
+impl ClientEdns {
+    pub fn is_present(self) -> bool {
+        matches!(self, ClientEdns::Present { .. })
+    }
+
+    /// DNSSEC records are the client's to ask for (RFC 4035 §3.1.1); no OPT is
+    /// no DO.
+    pub fn do_bit(self) -> bool {
+        matches!(self, ClientEdns::Present { do_bit: true })
+    }
+
+    /// The OPT to mirror back at `payload_size`, or `None` when the client used
+    /// no EDNS — replying with an unsolicited OPT is not mirroring.
+    pub fn mirror(self, payload_size: u16) -> Option<Edns> {
+        self.is_present().then(|| {
+            let mut edns = Edns::with_payload_size(payload_size);
+            edns.do_bit = self.do_bit();
+            edns
+        })
+    }
+}
+
+/// Read `request`'s EDNS, or the RCODE that refuses it.
+///
+/// `Err` is FORMERR for an option list that does not parse and BADVERS for a
+/// version past [`EDNS_VERSION`] (RFC 6891 §6.1.3). Both refusals still owe the
+/// client a bare version-0 OPT, since BADVERS is an extended RCODE and its high
+/// bits live in that record — the caller attaches it, because a refusal is
+/// answered differently on each daemon.
+///
+/// `edns_header` rather than `edns()`: nothing here wants the option list, which
+/// costs a `Vec` per option, and it still checks the list is well formed. Both
+/// daemons wrote this sequence out (`TODO.md` #30h).
+pub fn client_edns(request: &DnsMessage) -> Result<ClientEdns, ResponseCode> {
+    let header = request
+        .edns_header()
+        .map_err(|_| ResponseCode::FormatError)?;
+    match header {
+        None => Ok(ClientEdns::Absent),
+        Some(edns) if edns.version > crate::EDNS_VERSION => Err(ResponseCode::BadOptVersion),
+        Some(edns) => Ok(ClientEdns::Present {
+            do_bit: edns.do_bit,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::utils::record_types;
     use crate::ResourceRecord;
     use crate::{ParsedRecord, Qtype, QueryClass, Rtype};
+
+    /// Both daemons ask this one function what a request's OPT says, so it owes
+    /// both of them the same four answers (`TODO.md` #30h).
+    #[test]
+    fn the_edns_decision_is_one_function() {
+        assert_eq!(
+            client_edns(&request("example.com.", false)),
+            Ok(ClientEdns::Absent)
+        );
+        assert!(
+            ClientEdns::Absent.mirror(4096).is_none(),
+            "no OPT asked for, no OPT sent (RFC 6891 §6.1.1)"
+        );
+
+        assert_eq!(
+            client_edns(&request("example.com.", true)),
+            Ok(ClientEdns::Present { do_bit: false })
+        );
+
+        let mut dnssec = request("example.com.", false);
+        let mut opt = Edns::with_payload_size(4096);
+        opt.do_bit = true;
+        dnssec.set_edns(opt);
+        let asked = client_edns(&dnssec).expect("a version we implement");
+        assert_eq!(asked, ClientEdns::Present { do_bit: true });
+        let mirrored = asked.mirror(1232).expect("an OPT to mirror");
+        assert!(mirrored.do_bit, "DO is echoed (RFC 3225 §3)");
+        assert_eq!(
+            mirrored.udp_payload_size, 1232,
+            "at the size we advertise, not the client's"
+        );
+
+        // A version past ours is BADVERS, and never a lookup (RFC 6891 §6.1.3).
+        let mut future = request("example.com.", false);
+        future.set_edns(
+            Edns::with_options(4096, crate::EDNS_VERSION + 1, false, &[]).expect("encodes"),
+        );
+        assert_eq!(client_edns(&future), Err(ResponseCode::BadOptVersion));
+
+        // An option claiming eight bytes of data and supplying two is FORMERR.
+        let mut malformed = request("example.com.", false);
+        malformed.set_edns(Edns {
+            udp_payload_size: 1232,
+            version: crate::EDNS_VERSION,
+            do_bit: false,
+            rdata: vec![0x00, 0x0a, 0x00, 0x08, 0xde, 0xad].into_boxed_slice(),
+        });
+        assert_eq!(client_edns(&malformed), Err(ResponseCode::FormatError));
+    }
 
     fn request(qname: &str, edns: bool) -> DnsMessage {
         let mut msg = DnsMessage {

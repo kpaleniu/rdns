@@ -13,6 +13,7 @@ use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
 use rdns::readiness::Readiness;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
+use rdns::response::ClientEdns;
 use rdns::rfc5011::{self, AnchorChange, ManagedAnchors};
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl};
 use rdns::shutdown::{stop_signal, Busy, Shutdown, Stop};
@@ -23,7 +24,7 @@ use rdns::utils::{recv_error_is_transient, UDP_RECEIVE_BUFFER};
 use rdns::validation::{AdmissionCheck, Request};
 use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, Qtype, QuerySection, ResourceRecord, ResponseCode,
-    EDNS_VERSION, OPT_RECORD_TYPE,
+    OPT_RECORD_TYPE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -1035,27 +1036,18 @@ async fn handle_query(
 
     // Before any work on the client's behalf: a malformed option list is
     // FORMERR, an unimplemented EDNS version is BADVERS (RFC 6891 §6.1.3), and
-    // both replies carry a bare version-0 OPT.
-    //
-    // `edns_header` rather than `edns()`: nothing below needs the option list,
-    // which costs a `Vec` per option, and it still checks the list is well
-    // formed.
-    let client_edns = match msg.edns_header() {
+    // both replies carry a bare version-0 OPT. `rdnsd` reads the same decision
+    // out of the same function (`TODO.md` #30h).
+    let client_edns = match rdns::response::client_edns(&msg) {
         Ok(edns) => edns,
-        Err(_) => {
-            shell.record_answer(ResponseCode::FormatError, timer);
-            return edns_error(&msg, ResponseCode::FormatError, client_max);
+        Err(rcode) => {
+            shell.record_answer(rcode, timer);
+            return edns_error(&msg, rcode, client_max);
         }
     };
-    if client_edns.is_some_and(|edns| edns.version > EDNS_VERSION) {
-        return edns_error(&msg, ResponseCode::BadOptVersion, client_max);
-    }
-    // `is_some()` rather than `has_edns()`: they differ only for an option list
-    // that does not parse, which returned FORMERR above.
-    let client_uses_edns = client_edns.is_some();
-    // What the client asked for, DNSSEC-wise. DO means "send me the signatures";
-    // CD means "don't withhold anything on my behalf, I validate myself".
-    let client_wants_dnssec = client_edns.is_some_and(|e| e.do_bit);
+    // DO means "send me the signatures"; CD means "don't withhold anything on
+    // my behalf, I validate myself", which is the message's own bit.
+    let client_wants_dnssec = client_edns.do_bit();
     let checking_disabled = msg.cd;
 
     // RFC 9619 §4: "A DNS message with OPCODE = 0 MUST NOT include a QDCOUNT
@@ -1066,15 +1058,7 @@ async fn handle_query(
     // match the request either (`TODO.md` #30r).
     if msg.queries.len() > 1 {
         let resp = build_response(&msg, Vec::new(), ResponseCode::FormatError);
-        return finish(
-            resp,
-            client_uses_edns,
-            client_wants_dnssec,
-            &query,
-            client_max,
-            shell,
-            timer,
-        );
+        return finish(resp, client_edns, &query, client_max, shell, timer);
     }
 
     // Names that must not leave this machine (RFC 6761, 6762, 6303). Before
@@ -1093,15 +1077,7 @@ async fn handle_query(
         // DEBUG: one line per query, with the name on it. Logging every query
         // is the operator's decision, not the default's.
         tracing::debug!(qname = %query.qname, why = %local.why, "answered locally");
-        return finish(
-            resp,
-            client_uses_edns,
-            client_wants_dnssec,
-            &query,
-            client_max,
-            shell,
-            timer,
-        );
+        return finish(resp, client_edns, &query, client_max, shell, timer);
     }
 
     // Aggressive use of the validated denial cache (RFC 8198). A cached NSEC
@@ -1123,15 +1099,7 @@ async fn handle_query(
             // A wildcard signature verifies at this name unchanged, so the
             // client can check this for itself.
             resp.ad = client_wants_dnssec || msg.ad;
-            return finish(
-                resp,
-                client_uses_edns,
-                client_wants_dnssec,
-                &query,
-                client_max,
-                shell,
-                timer,
-            );
+            return finish(resp, client_edns, &query, client_max, shell, timer);
         }
     }
 
@@ -1143,15 +1111,7 @@ async fn handle_query(
             // The proofs were validated before storage, so what is derived
             // from them is authentic on the same terms.
             resp.ad = client_wants_dnssec || msg.ad;
-            return finish(
-                resp,
-                client_uses_edns,
-                client_wants_dnssec,
-                &query,
-                client_max,
-                shell,
-                timer,
-            );
+            return finish(resp, client_edns, &query, client_max, shell, timer);
         }
     }
 
@@ -1163,15 +1123,7 @@ async fn handle_query(
         let mut resp = build_response(&msg, Vec::new(), negative.rcode);
         resp.authorities = negative.authority;
         resp.ad = negative.secure && (client_wants_dnssec || msg.ad);
-        return finish(
-            resp,
-            client_uses_edns,
-            client_wants_dnssec,
-            &query,
-            client_max,
-            shell,
-            timer,
-        );
+        return finish(resp, client_edns, &query, client_max, shell, timer);
     }
 
     // Build the response: from cache if we have it, else by resolving.
@@ -1212,15 +1164,7 @@ async fn handle_query(
                     // data unfiltered.
                     if !checking_disabled {
                         let resp = build_response(&msg, Vec::new(), ResponseCode::ServerFailure);
-                        return finish(
-                            resp,
-                            client_uses_edns,
-                            client_wants_dnssec,
-                            &query,
-                            client_max,
-                            shell,
-                            timer,
-                        );
+                        return finish(resp, client_edns, &query, client_max, shell, timer);
                     }
                 }
 
@@ -1282,23 +1226,14 @@ async fn handle_query(
     resp.ad = secure && (client_wants_dnssec || msg.ad);
     resp.cd = checking_disabled;
 
-    finish(
-        resp,
-        client_uses_edns,
-        client_wants_dnssec,
-        &query,
-        client_max,
-        shell,
-        timer,
-    )
+    finish(resp, client_edns, &query, client_max, shell, timer)
 }
 
 /// Final shaping common to every reply: OPT mirroring, stripping DNSSEC records
 /// a client did not ask for, and the size limit.
 fn finish(
     mut resp: DnsMessage,
-    client_uses_edns: bool,
-    client_wants_dnssec: bool,
+    client_edns: ClientEdns,
     query: &QuerySection,
     client_max: usize,
     shell: &Shell,
@@ -1309,7 +1244,7 @@ fn finish(
     shell.record_answer(resp.rcode, timer);
     // No DO, no DNSSEC records (RFC 4035 §3.2.1). Records asked for by type
     // are a different matter and stay.
-    if !client_wants_dnssec {
+    if !client_edns.do_bit() {
         let asked_for = |rtype: Rtype| query.qtype.is(rtype);
         let keep = |rr: &ResourceRecord| match rr.rdata.rtype() {
             record_types::RRSIG | record_types::NSEC | record_types::NSEC3 => false,
@@ -1324,11 +1259,9 @@ fn finish(
 
     // Only include an OPT record when the client used EDNS (RFC 6891 §6.1.1);
     // otherwise strip any OPT the upstream added so we don't reply with
-    // unsolicited EDNS.
-    if client_uses_edns {
-        let mut edns = Edns::with_payload_size(RDNSR_PAYLOAD_SIZE);
-        // Mirror DO: the signatures the client sees were deliberate.
-        edns.do_bit = client_wants_dnssec;
+    // unsolicited EDNS. DO is mirrored, since the signatures the client sees
+    // were deliberate.
+    if let Some(edns) = client_edns.mirror(RDNSR_PAYLOAD_SIZE) {
         resp.set_edns(edns);
     } else {
         resp.additionals

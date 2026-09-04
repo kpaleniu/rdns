@@ -20,7 +20,7 @@ use rdns::utils::{absolute_lowered, record_types};
 use rdns::zone::{NameKind, Zone};
 use rdns::Qtype;
 use rdns::Ttl;
-use rdns::{dnssec_answer, DnsMessage, Edns, OpCode, QueryClass, ResponseCode, EDNS_VERSION};
+use rdns::{dnssec_answer, DnsMessage, Edns, OpCode, QueryClass, ResponseCode};
 
 use crate::zones::Zones;
 use crate::RDNSD_PAYLOAD_SIZE;
@@ -42,31 +42,24 @@ pub(crate) fn write_response(
     let mut w = ResponseWriter::start(out, compressor, max_len, msg)?;
     w.set_authoritative(true);
 
-    // Read once: `edns()` builds the option list, which costs a `Vec` and a
-    // `Vec<u8>` per option for three fields that are not in it.
-    //
     // EDNS-level rejections take precedence over any zone lookup: a malformed
-    // option list is FORMERR, an EDNS version we don't implement is BADVERS
-    // (RFC 6891 §6.1.3). Both replies carry a bare version-0 OPT — BADVERS is an
-    // extended RCODE, so the OPT record is what carries its high bits.
-    let client_edns = match msg.edns_header() {
+    // option list is FORMERR, an EDNS version we don't implement is BADVERS.
+    // Both replies carry a bare version-0 OPT — BADVERS is an extended RCODE, so
+    // the OPT record is what carries its high bits. `rdnsr` reads the same
+    // decision out of `client_edns` (`TODO.md` #30h).
+    let client_edns = match rdns::response::client_edns(msg) {
         Ok(edns) => edns,
-        Err(_) => {
-            w.set_rcode(ResponseCode::FormatError);
+        Err(rcode) => {
+            w.set_rcode(rcode);
             // `with_payload_size` carries no options, so encoding it cannot fail.
             w.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
             return w.finish();
         }
     };
-    if client_edns.is_some_and(|edns| edns.version > EDNS_VERSION) {
-        w.set_rcode(ResponseCode::BadOptVersion);
-        w.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
-        return w.finish();
-    }
 
     // DO says the client can make sense of DNSSEC records, so send them
     // (RFC 4035 §3.1.1). Not a demand that the zone be signed.
-    let dnssec_ok = client_edns.is_some_and(|edns| edns.do_bit);
+    let dnssec_ok = client_edns.do_bit();
 
     // Only QUERY reaches the zone lookup. NOTIFY is answered by the caller,
     // which knows the peer's address; anything else is NOTIMP rather than
@@ -79,11 +72,9 @@ pub(crate) fn write_response(
         // OPT includes one. Some clients remember a missing OPT as a downgrade
         // and never offer EDNS again.
         //
-        // `client_edns.is_some()` and `msg.has_edns()` agree here: they differ
+        // `ClientEdns::Present` and `msg.has_edns()` agree here: they differ
         // only for a malformed option list, which answered FORMERR above.
-        if client_edns.is_some() {
-            let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
-            edns.do_bit = dnssec_ok;
+        if let Some(edns) = client_edns.mirror(RDNSD_PAYLOAD_SIZE) {
             w.set_edns(edns);
         }
         return w.finish();
@@ -114,9 +105,7 @@ pub(crate) fn write_response(
 
     // Mirror EDNS0: an OPT record only when the client used EDNS
     // (RFC 6891 §6.1.1), and DO echoed when it was asked for (RFC 3225 §3).
-    if client_edns.is_some() {
-        let mut edns = Edns::with_payload_size(RDNSD_PAYLOAD_SIZE);
-        edns.do_bit = dnssec_ok;
+    if let Some(edns) = client_edns.mirror(RDNSD_PAYLOAD_SIZE) {
         w.set_edns(edns);
     }
 
