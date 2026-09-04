@@ -2791,6 +2791,40 @@ renumbered here: **#25b** (the TCP memset), **#25e** (the cache key), **#26e**
       server-side `prove a signed NXDOMAIN`, built out of the reply the server
       just wrote.
 
+- [x] **29b. Four ancestor walks build a `String` per candidate.**
+      `dnssec::suffix_labels` is a `canonical_name` copy, a `Vec<&str>` of the
+      labels, a `join` and a `format!` — **five allocations per candidate**, and
+      the number of candidates is the QNAME's label count, which the client
+      picks. It ran in `negative_cache::get` (`:177`), `dnssec_denial`'s
+      `nsec3_closest_encloser` (`:966`, `:974`) and `proves_wildcard_expansion`
+      (`:864`), and `nsec_cache`'s `gather_nxdomain` (`:676`) and
+      `gather_nxdomain_under` (`:729`, `:751`) — every one of them on the
+      resolver's side of the same walk `dnssec_answer` stopped allocating for in
+      `8dced41`. `resolver::suffix_with_labels` (`:1577`) was a fourth copy of
+      the function itself, differing only in which of the two identical
+      `label_count`s it called.
+
+      **Done 2026-09-04.** `utils::suffix_labels` returns a slice of an absolute
+      name; `dnssec::suffix_labels` is that plus the copy, for the callers that
+      want one; `dnssec::label_count` is a re-export of `utils`'s rather than a
+      second body. The two NSEC3 walks take the next closer name from the
+      candidate they visited one step earlier instead of deriving it again.
+
+          gate                                        before   after
+          check a signed NXDOMAIN under NSEC3             13        2
+          check a signed NXDOMAIN under NSEC                6        6
+          miss in the negative cache                      14        1
+
+      Of the 13 → 2, three came from the owning `suffix_labels` being
+      reimplemented on the borrowed one, which every remaining caller gets.
+
+      **And it closes the note `nsec3_cache_probe` has carried since #23**, which
+      said what was left was not the hash and wanted "a name type that can yield
+      a suffix without allocating". It is a slice, not a type. Per `synthesize`,
+      256 cached records, 117-label QNAME, release: **240 → 102 µs** at zero
+      iterations, 287 → 151 at ten, 867 → 743 at 150. Over half of the
+      RFC 9276-shaped case was the naming.
+
 ### 12. Pre-authentication panics — audited 2026-08-01
 
 **No reachable panic.** `rdns/tests/no_input_panics.rs` puts mutated wire data

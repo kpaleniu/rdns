@@ -777,7 +777,10 @@ fn nsec_wildcard_nodata(qname: &str, qtype: Rtype, nsecs: &[Nsec]) -> Denial {
 /// `qname`, and an NSEC3 matching the wildcard at that encloser whose bitmap
 /// lacks the type.
 fn nsec3_wildcard_nodata(qname: &str, zone: &str, qtype: Rtype, nsec3s: &[Nsec3]) -> Denial {
-    let encloser = match nsec3_closest_encloser(qname, zone, nsec3s) {
+    // Absolute before the walk slices it, as in `nsec3_closest_encloser_proof`:
+    // `parent_name` takes the *last* label off a relative name.
+    let qname = crate::utils::absolute_lowered(qname);
+    let encloser = match nsec3_closest_encloser(&qname, zone, nsec3s) {
         Ok(encloser) => encloser,
         Err(why) => return Denial::NotProved(why),
     };
@@ -861,8 +864,8 @@ pub fn proves_wildcard_expansion(
         // encloser, towards `owner` — absent. Naming it from the wildcard's own
         // position pins the expansion to the right depth.
         let next_closer =
-            crate::dnssec::suffix_labels(&owner, crate::dnssec::label_count(&encloser) + 1);
-        let mut hash = NameHash::new(&next_closer);
+            crate::utils::suffix_labels(&owner, crate::dnssec::label_count(&encloser) + 1);
+        let mut hash = NameHash::new(next_closer);
         if nsec3s
             .iter()
             .any(|n| !n.opt_out() && hash.covers(n).unwrap_or(false))
@@ -935,7 +938,10 @@ fn common_suffix(a: &str, b: &str) -> String {
 /// label below it is absent, and the wildcard at the encloser is accounted for —
 /// without which one could still have answered.
 fn nsec3_closest_encloser_proof(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Denial {
-    let encloser = match nsec3_closest_encloser(qname, zone, nsec3s) {
+    // Absolute, because the walk slices it; the hash down-cases the wire form
+    // itself (RFC 5155 §5), so the case this leaves alone changes nothing.
+    let qname = crate::utils::absolute_lowered(qname);
+    let encloser = match nsec3_closest_encloser(&qname, zone, nsec3s) {
         Ok(encloser) => encloser,
         Err(why) => return Denial::NotProved(why),
     };
@@ -955,29 +961,47 @@ fn nsec3_closest_encloser_proof(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> De
 ///
 /// `Err` carries why the proof does not stand — including a record matching
 /// `qname` itself, which says the name exists.
-fn nsec3_closest_encloser(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Result<String, String> {
-    let qname = crate::dnssec::canonical_name(qname);
-    let zone = crate::dnssec::canonical_name(zone);
-    let qlabels = crate::dnssec::label_count(&qname);
-    let zlabels = crate::dnssec::label_count(&zone);
+/// `qname` must be absolute, which its caller has already made it: each
+/// ancestor is then a suffix of it rather than a `String` of its own, and the
+/// next closer name is the candidate visited one step before.
+fn nsec3_closest_encloser<'n>(
+    qname: &'n str,
+    zone: &str,
+    nsec3s: &[Nsec3],
+) -> Result<&'n str, String> {
+    let qlabels = crate::utils::label_count(qname);
+    let zlabels = crate::utils::label_count(zone);
 
     // Walk up towards the apex, which always exists, so the search terminates.
-    for depth in (zlabels..=qlabels).rev() {
-        let candidate = crate::dnssec::suffix_labels(&qname, depth);
-        if !NameHash::new(&candidate).matched_by(nsec3s) {
-            continue;
+    let mut candidate = qname;
+    let mut depth = qlabels;
+    let mut below: Option<&str> = None;
+    loop {
+        if NameHash::new(candidate).matched_by(nsec3s) {
+            if depth == qlabels {
+                return Err(format!("an NSEC3 matches {qname}, so it exists"));
+            }
+            // The "next closer" name: one label longer than the encloser, which
+            // is the candidate this walk rejected on its way here.
+            let next_closer = below.expect("below the top of the walk, one was visited");
+            if !NameHash::new(next_closer).covered_by(nsec3s) {
+                return Err(format!(
+                    "no NSEC3 covers the next closer name {next_closer}"
+                ));
+            }
+            return Ok(candidate);
         }
-        if depth == qlabels {
-            return Err(format!("an NSEC3 matches {qname}, so it exists"));
+        // The apex ends the walk. Stopping on the label count rather than on the
+        // name keeps the old bound for a QNAME that is not under `zone` at all.
+        if depth == zlabels {
+            break;
         }
-        // The "next closer" name: one label longer than the encloser.
-        let next_closer = crate::dnssec::suffix_labels(&qname, depth + 1);
-        if !NameHash::new(&next_closer).covered_by(nsec3s) {
-            return Err(format!(
-                "no NSEC3 covers the next closer name {next_closer}"
-            ));
-        }
-        return Ok(candidate);
+        below = Some(candidate);
+        let Some(up) = crate::utils::parent_name(candidate) else {
+            break;
+        };
+        candidate = up;
+        depth -= 1;
     }
 
     Err(format!("no NSEC3 matches any ancestor of {qname}"))

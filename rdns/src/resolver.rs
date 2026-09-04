@@ -934,8 +934,10 @@ impl Resolver {
             } else {
                 qname_labels
             };
-            let sname = suffix_with_labels(&qname, labels);
-            let is_final = names_equal(&sname, &qname);
+            // `qname` is normalized above, so the minimized name is a slice of
+            // it and only the copy the question carries is paid for.
+            let sname = crate::utils::suffix_labels(&qname, labels);
+            let is_final = names_equal(sname, &qname);
             if !is_final {
                 minimized_probes += 1;
             }
@@ -944,7 +946,7 @@ impl Resolver {
             // name with NODATA — telling the two apart without disclosing the
             // leaf.
             let step = QuerySection {
-                qname: sname.clone(),
+                qname: sname.to_string(),
                 qtype: if is_final {
                     query.qtype
                 } else {
@@ -1572,20 +1574,6 @@ fn randomize_case(name: &str) -> String {
         .collect()
 }
 
-/// The last `labels` labels of `qname`, plus the root dot. Zero labels is the
-/// root; asking for more than the name has yields the whole name.
-fn suffix_with_labels(qname: &str, labels: usize) -> String {
-    let n = normalize(qname);
-    if labels == 0 {
-        return ".".to_string();
-    }
-    let parts: Vec<&str> = n.trim_end_matches('.').split('.').collect();
-    if labels >= parts.len() {
-        return n;
-    }
-    format!("{}.", parts[parts.len() - labels..].join("."))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1711,16 +1699,21 @@ mod tests {
         assert_eq!(label_count("example.com"), 2);
         assert_eq!(label_count("www.example.com."), 3);
 
-        assert_eq!(suffix_with_labels("www.example.com.", 0), ".");
-        assert_eq!(suffix_with_labels("www.example.com.", 1), "com.");
-        assert_eq!(suffix_with_labels("www.example.com.", 2), "example.com.");
+        // The minimized name is [`crate::utils::suffix_labels`] now, which is
+        // tested there; this holds the shape this walk asks it for.
+        assert_eq!(crate::utils::suffix_labels("www.example.com.", 0), ".");
+        assert_eq!(crate::utils::suffix_labels("www.example.com.", 1), "com.");
         assert_eq!(
-            suffix_with_labels("www.example.com.", 3),
+            crate::utils::suffix_labels("www.example.com.", 2),
+            "example.com."
+        );
+        assert_eq!(
+            crate::utils::suffix_labels("www.example.com.", 3),
             "www.example.com."
         );
         // Asking for more labels than the name has yields the whole name.
         assert_eq!(
-            suffix_with_labels("www.example.com.", 9),
+            crate::utils::suffix_labels("www.example.com.", 9),
             "www.example.com."
         );
     }

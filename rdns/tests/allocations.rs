@@ -121,6 +121,7 @@ fn allocation_counts() {
     proving_a_signed_nxdomain();
     proving_a_signed_nxdomain_under_nsec3();
     checking_a_signed_nxdomain();
+    what_the_resolvers_caches_cost();
     verifying_an_rrset_against_two_candidate_signatures();
     a_busy_neighbour_stays_out_of_the_count();
 }
@@ -1059,13 +1060,17 @@ fn nxdomain_proof(signed: &rdns::zone::Zone) -> (rdns::DnsMessage, u64) {
 /// zone to read records out of.
 ///
 /// It walks to the closest encloser the same way and had none of the fixes:
-/// **6 under NSEC and 17 under NSEC3**, against the server's 5 and 6, because
-/// `Nsec3Params::hash` returned a `Vec` per candidate name where `nsec3_hash_in`
-/// was already sitting beside it (`CLAUDE.md` §7). 13 with that one line
-/// changed, and the multiplier is per label of the QNAME: this zone is two
-/// labels and a client picks its own.
+/// **6 under NSEC and 17 under NSEC3**, against the server's 5 and 6. Both
+/// causes were sitting next to their fix (`CLAUDE.md` §7) — `Nsec3Params::hash`
+/// returned a `Vec` where `nsec3_hash_in` returns the array, 17 to 13, and the
+/// walk built a `String` per candidate where the name's own suffix is a slice,
+/// 13 to 2. Both multipliers are per label of the QNAME: this zone is two labels
+/// and a client picks its own.
 fn checking_a_signed_nxdomain() {
-    for (what, zone) in [("NSEC", signed_zone()), ("NSEC3", signed_zone_nsec3())] {
+    for (what, zone, expected) in [
+        ("NSEC", signed_zone(), 6),
+        ("NSEC3", signed_zone_nsec3(), 2),
+    ] {
         let (reply, _) = nxdomain_proof(&zone);
         let nsecs = rdns::dnssec_denial::nsecs_in(&reply.authorities);
         let nsec3s = rdns::dnssec_denial::nsec3s_in(&reply.authorities);
@@ -1091,9 +1096,48 @@ fn checking_a_signed_nxdomain() {
         within(
             &format!("check a signed NXDOMAIN under {what}, as a validator"),
             count,
-            0..=u64::MAX,
+            expected..=expected,
         );
     }
+}
+
+/// The two caches every `rdnsr` query goes through before anything else, which
+/// nothing in this file could see: every other count here is a library or
+/// `rdnsd` shape (`TODO.md` #29).
+///
+/// A miss is the flood shape and the one that must stay cheap. The negative
+/// cache's was **14**: `canonical_name`, then five allocations per ancestor from
+/// the owning `suffix_labels`, for a walk that answers "no" at every step. It is
+/// 1 now — the key, which the NODATA map needs owned anyway (`TODO.md` #25e).
+fn what_the_resolvers_caches_cost() {
+    let cache = rdns::cache::DnsCache::new(1_000);
+    let qtype = Qtype::of(record_types::A);
+    let rrset: Vec<ResourceRecord> = (0..3)
+        .map(|_| ResourceRecord {
+            name: "www.example.com.".to_string(),
+            class: Class::new(1),
+            ttl: rdns::Ttl::from_wire(3600),
+            rdata: rdns::RecordData::new(record_types::A, vec![192u8, 0, 2, 1]).expect("A"),
+        })
+        .collect();
+    cache.put("www.example.com.", qtype, rrset);
+    // The first call in a process picks up a one-off.
+    let _ = cache.get("www.example.com.", qtype);
+    let (hit, count) = allocations(|| cache.get("www.example.com.", qtype));
+    assert_eq!(hit.expect("a hit").len(), 3);
+    // One per record's owner and RDATA, the `Vec` spine, and the folded key the
+    // map has no `Borrow` for (`TODO.md` #25e).
+    within("look one RRset up in the answer cache", count, 8..=8);
+
+    let (miss, count) = allocations(|| cache.get("nothing.example.com.", qtype));
+    assert!(miss.is_none());
+    within("miss in the answer cache", count, 1..=1);
+
+    let negative = rdns::negative_cache::NegativeCache::new(1_000);
+    let _ = negative.get("nothing.example.com.", qtype);
+    let (miss, count) = allocations(|| negative.get("nothing.example.com.", qtype));
+    assert!(miss.is_none());
+    within("miss in the negative cache", count, 1..=1);
 }
 
 /// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate

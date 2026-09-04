@@ -279,27 +279,16 @@ pub fn canonical_name(name: &str) -> String {
 }
 
 /// How many labels a name has, the root being zero. `example.com.` is 2.
-pub fn label_count(name: &str) -> usize {
-    let trimmed = name.trim_end_matches('.');
-    if trimmed.is_empty() {
-        0
-    } else {
-        trimmed.split('.').count()
-    }
-}
+pub use crate::utils::label_count;
 
-/// The last `labels` labels of `name`, plus the root dot. Asking for more than
+/// The last `labels` labels of `name`, canonical and owned. Asking for more than
 /// the name has yields the whole name.
+///
+/// [`crate::utils::suffix_labels`] is the same rule without the copy, for a name
+/// the caller has already made absolute — which is every walk up the tree.
 pub fn suffix_labels(name: &str, labels: usize) -> String {
     let n = canonical_name(name);
-    if labels == 0 {
-        return ".".to_string();
-    }
-    let parts: Vec<&str> = n.trim_end_matches('.').split('.').collect();
-    if labels >= parts.len() {
-        return n;
-    }
-    format!("{}.", parts[parts.len() - labels..].join("."))
+    crate::utils::suffix_labels(&n, labels).to_string()
 }
 
 /// The owner name a signature was actually computed over (RFC 4035 §5.3.2).

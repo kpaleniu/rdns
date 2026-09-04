@@ -10,25 +10,31 @@
 //! cargo run --release -p rdns --example nsec3_cache_probe -- 150 115
 //! ```
 //!
-//! # Measured 2026-08-04
+//! # Measured 2026-08-04, and again 2026-09-04
 //!
-//! Release, per `synthesize`, on the development machine. Both columns run from
-//! this file, the "before" one against the commit before the fix.
+//! Release, per `synthesize`, on the development machine. Every column runs from
+//! this file; "before" is the commit before #23's fix, "walk" the one before
+//! #29b's.
 //!
-//! | iterations | QNAME | before | after |
-//! |---|---|---|---|
-//! | 0 (RFC 9276's recommendation) | 117 labels, 243 octets | 102 ms | 237 µs |
-//! | 10 | 117 labels | 171 ms | 307 µs |
-//! | 150 (`MAX_NSEC3_ITERATIONS`) | 10 labels, 29 octets | 84 ms | 95 µs |
-//! | 150 | 117 labels | 1 124 ms | 1.28 ms |
+//! | iterations | QNAME | before | after | walk | now |
+//! |---|---|---|---|---|---|
+//! | 0 (RFC 9276's recommendation) | 117 labels, 243 octets | 102 ms | 237 µs | 240 µs | 102 µs |
+//! | 10 | 117 labels | 171 ms | 307 µs | 287 µs | 151 µs |
+//! | 150 (`MAX_NSEC3_ITERATIONS`) | 10 labels, 29 octets | 84 ms | 95 µs | 61 µs | 60 µs |
+//! | 150 | 117 labels | 1 124 ms | 1.28 ms | 867 µs | 743 µs |
 //!
-//! What is left is not the hash: at iterations 0 the walk still costs 2.1 µs per
-//! label, which is `suffix_labels` rebuilding the name — a `canonical_name`
-//! copy, a `Vec<&str>` of the labels, a join and a `format!` per ancestor. The
-//! 150-iteration column adds ~7.6 µs per label on top, which is the 150 extra
-//! SHA-1 rounds over 22 bytes and is the part RFC 9276 §3.1 asks zones not to
-//! ask for. Removing the first wants a name type that can yield a suffix
-//! without allocating.
+//! The 2026-08-04 note said what was left was not the hash: at iterations 0 the
+//! walk cost ~2.1 µs per label, `suffix_labels` rebuilding the name — a
+//! `canonical_name` copy, a `Vec<&str>` of the labels, a join and a `format!`
+//! per ancestor — and removing it wanted a name that can yield a suffix without
+//! allocating. An absolute name's ancestor *is* a suffix of it, so that turned
+//! out to be a slice rather than a type: `utils::suffix_labels`, and the "now"
+//! column is what it bought. **Over half of the zero-iteration case was the
+//! naming, not the hashing.**
+//!
+//! The 150-iteration rows barely move, which is the other half of the same
+//! reading: they are ~7.6 µs per label of SHA-1 over 22 bytes, the part
+//! RFC 9276 §3.1 asks zones not to ask for.
 
 use rdns::dnssec_denial::{base32hex_encode, build_type_bitmap, nsec3_hash};
 use rdns::nsec_cache::NsecCache;

@@ -15,7 +15,7 @@
 //! - NXDOMAIN needs the wildcard denied too.
 //! - TTL is bounded by the proof, not by the question.
 
-use crate::dnssec::{canonical_name, label_count, suffix_labels, Rrsig};
+use crate::dnssec::{canonical_name, label_count, Rrsig};
 use crate::dnssec_denial::{
     canonical_sort_key, proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Params,
 };
@@ -672,8 +672,9 @@ impl ZoneProofs {
         }
         // The wildcard that could have answered sits at some ancestor, so gather
         // every ancestor's; `proves_nxdomain` picks the one that matters.
+        // `qname` is canonical here, so each ancestor is a slice of it.
         for depth in label_count(zone)..label_count(qname) {
-            let wildcard = format!("*.{}", suffix_labels(qname, depth));
+            let wildcard = format!("*.{}", crate::utils::suffix_labels(qname, depth));
             if let Some(covering) = self.covering_nsec(&wildcard, now) {
                 if !candidates
                     .iter()
@@ -715,7 +716,8 @@ impl ZoneProofs {
     /// The walk starts at the QNAME and stops at the first ancestor with a
     /// record (RFC 5155 §8.3): a responder sends the encloser's record and none
     /// of its ancestors', so walking down from the apex would stop at the first
-    /// name nobody had asked about.
+    /// name nobody had asked about. `qname` is canonical — [`NsecCache`]'s entry
+    /// points make it so — hence each ancestor is a slice of it.
     fn gather_nxdomain_under(
         &self,
         qname: &str,
@@ -724,21 +726,31 @@ impl ZoneProofs {
         now: u64,
     ) -> Option<Gathered> {
         let qlabels = label_count(qname);
+        let zlabels = label_count(zone);
+        let mut candidate = qname;
+        let mut depth = qlabels;
+        // The next closer name is the candidate this walk rejected one step
+        // earlier, so it is never derived a second time.
+        let mut below: Option<&str> = None;
         let mut encloser = None;
-        for depth in (label_count(zone)..=qlabels).rev() {
-            let candidate = suffix_labels(qname, depth);
-            let hash = params.hash(&candidate).ok()?;
-            let Some(cached) = self.matching_nsec3(&hash, params, now) else {
-                continue;
-            };
-            // A record at the name itself says it exists: nothing to deny.
-            if depth == qlabels {
-                return None;
+        loop {
+            let hash = params.hash(candidate).ok()?;
+            if let Some(cached) = self.matching_nsec3(&hash, params, now) {
+                // A record at the name itself says it exists: nothing to deny.
+                if depth == qlabels {
+                    return None;
+                }
+                encloser = Some((below?, candidate, cached));
+                break;
             }
-            encloser = Some((depth, candidate, cached));
-            break;
+            if depth == zlabels {
+                break;
+            }
+            below = Some(candidate);
+            candidate = crate::utils::parent_name(candidate)?;
+            depth -= 1;
         }
-        let (depth, encloser_name, matching) = encloser?;
+        let (next_closer, encloser_name, matching) = encloser?;
 
         // As with NSEC: below a delegation the names are the child's, and this
         // zone's chain says nothing about them.
@@ -748,8 +760,7 @@ impl ZoneProofs {
         let mut candidates = vec![matching];
 
         // The next closer name must be absent...
-        let next_closer = suffix_labels(qname, depth + 1);
-        let hash = params.hash(&next_closer).ok()?;
+        let hash = params.hash(next_closer).ok()?;
         push_unique(&mut candidates, self.covering_nsec3(&hash, params, now)?);
 
         // ...and the wildcard at the encloser must be accounted for, whether by

@@ -18,7 +18,7 @@
 //! - Nothing bogus is stored, and whether an answer validated is stored with it,
 //!   so the AD bit a second client sees is the one the first client saw.
 
-use crate::dnssec::{canonical_name, label_count, suffix_labels};
+use crate::dnssec::canonical_name;
 use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf};
 use crate::Qtype;
 use crate::Ttl;
@@ -172,15 +172,16 @@ impl NegativeCache {
         let entries = self.entries.lock().ok()?;
 
         // A cached NXDOMAIN denies every name beneath it too (RFC 8020), so the
-        // walk up the ancestors *is* the lookup, deepest first.
-        for depth in (0..=label_count(&name)).rev() {
-            let ancestor = suffix_labels(&name, depth);
-            if let Some(entry) = entries
-                .nxdomain
-                .get(ancestor.as_str())
-                .filter(|e| e.live(now))
-            {
+        // walk up the ancestors *is* the lookup, deepest first. `name` is
+        // absolute and folded, so each ancestor is a slice of it.
+        let mut ancestor = name.as_str();
+        loop {
+            if let Some(entry) = entries.nxdomain.get(ancestor).filter(|e| e.live(now)) {
                 return Some(entry.answer(now));
+            }
+            match crate::utils::parent_name(ancestor) {
+                Some(up) => ancestor = up,
+                None => break,
             }
         }
 

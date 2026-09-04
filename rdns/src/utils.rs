@@ -221,6 +221,31 @@ pub fn parent_name(name: &str) -> Option<&str> {
     Some(if rest.is_empty() { "." } else { rest })
 }
 
+/// The last `labels` labels of an absolute name, as a slice of it.
+///
+/// A suffix of whole labels *is* a slice, so walking up the tree costs nothing.
+/// The owning spelling ([`crate::dnssec::suffix_labels`]) builds a `Vec` of the
+/// labels, a `join` and a `format!` per candidate, and four walks paid that per
+/// label of a name the client chose.
+///
+/// `name` must be absolute, and folded if it is compared against folded keys:
+/// slicing can fix neither. Zero labels is the root; asking for more labels than
+/// the name has yields the whole name.
+pub fn suffix_labels(name: &str, labels: usize) -> &str {
+    if labels == 0 {
+        return ".";
+    }
+    let trimmed = name.trim_end_matches('.');
+    if trimmed.is_empty() {
+        return ".";
+    }
+    let start = trimmed
+        .rmatch_indices('.')
+        .nth(labels - 1)
+        .map_or(0, |(dot, _)| dot + 1);
+    &name[start..]
+}
+
 /// Whether `name` is `origin` or sits below it — "is this name in that zone".
 ///
 /// A suffix match is not enough: `notexample.com.` ends with `example.com.` and
@@ -415,6 +440,32 @@ mod tests {
         assert_eq!(label_count("example.com"), 2);
         assert_eq!(label_count("www.example.com."), 3);
         assert_eq!(label_count("WWW.Example.COM."), 3);
+    }
+
+    /// The same answers [`crate::dnssec::suffix_labels`] gives, and the same
+    /// bytes: a suffix of whole labels is a slice, so this must be a *slice* of
+    /// the input and not merely equal to one.
+    #[test]
+    fn a_suffix_of_whole_labels_is_a_slice_of_the_name() {
+        let name = "www.example.com.";
+        assert_eq!(suffix_labels(name, 0), ".");
+        assert_eq!(suffix_labels(name, 1), "com.");
+        assert_eq!(suffix_labels(name, 2), "example.com.");
+        assert_eq!(suffix_labels(name, 3), name);
+        // More labels than the name has: the whole name.
+        assert_eq!(suffix_labels(name, 9), name);
+        assert_eq!(suffix_labels(".", 3), ".");
+
+        // Borrowed, not built: the two agree on the answer and this one does not
+        // allocate to give it.
+        let inside = suffix_labels(name, 2);
+        assert!(std::ptr::eq(inside.as_ptr(), name[4..].as_ptr()));
+        for labels in 0..5 {
+            assert_eq!(
+                crate::dnssec::suffix_labels(name, labels),
+                suffix_labels(name, labels)
+            );
+        }
     }
 
     #[test]
