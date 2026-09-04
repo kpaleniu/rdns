@@ -686,7 +686,6 @@ dependencies = [
  "rdns",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

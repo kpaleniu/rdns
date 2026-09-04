@@ -411,11 +411,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let shell = Arc::new(Shell {
         limiter: Arc::new(RateLimiter::new(query_limit)),
-        responses: Arc::new(if cli.response_rate == 0 {
-            ResponseLimiter::disabled()
-        } else {
-            ResponseLimiter::new(cli.response_rate, cli.response_rate.saturating_mul(4), 2)
-        }),
+        responses: Arc::new(ResponseLimiter::per_second(cli.response_rate)),
         metrics: Arc::new(DnsMetrics::new()),
         logger: Arc::new(QueryLogger::new()),
         validator: Arc::new(AdmissionCheck::with_defaults()),

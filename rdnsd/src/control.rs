@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use rdns::control::{err, ok, Request, MAX_REQUEST};
 use rdns::metrics::ZoneFacts;
+use rdns::persist;
 use rdns::shutdown::{Busy, Stop};
 use rdns::utils::current_unix_timestamp;
 use rdns::zone_writer::zone_to_string;
@@ -79,7 +80,7 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
     let _ = std::fs::remove_file(&temp);
     let listener = UnixListener::bind(&temp)
         .with_context(|| format!("--control-socket {}", path.display()))?;
-    let restricted = restrict_to_owner(&temp).and_then(|()| std::fs::rename(&temp, path));
+    let restricted = persist::restrict_to_owner(&temp).and_then(|()| std::fs::rename(&temp, path));
     if let Err(e) = restricted {
         let _ = std::fs::remove_file(&temp);
         return Err(anyhow::Error::from(e).context(format!("--control-socket {}", path.display())));
@@ -93,11 +94,6 @@ fn temp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".{}.tmp", std::process::id()));
     path.with_file_name(name)
-}
-
-fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 /// Accept control connections until told to stop.

@@ -95,15 +95,20 @@ fn check_mode(path: &Path, _what: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Mode 0600 on a path that is not published yet — a temporary about to be
+/// renamed into place, a socket about to be. Chmod after the rename leaves a
+/// window at whatever the umask allowed, so the caller creates, restricts, then
+/// publishes; `rdnsd`'s control socket had its own copy of this line
+/// (`TODO.md` #30l).
 #[cfg(unix)]
-fn restrict_to_owner(path: &Path) -> io::Result<()> {
+pub fn restrict_to_owner(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
 /// Nothing to do, and nothing to claim. See [`ensure_private`].
 #[cfg(not(unix))]
-fn restrict_to_owner(_path: &Path) -> io::Result<()> {
+pub fn restrict_to_owner(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

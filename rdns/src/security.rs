@@ -249,11 +249,23 @@ impl ResponseLimiter {
         }
     }
 
-    /// 8 KiB/s sustained per client with a 32 KiB burst (four seconds' worth, so
-    /// a page load's dozen names is never touched), truncating every second
-    /// response over budget — BIND's own slip default.
+    /// A budget from the one number an operator sets: `bytes_per_sec`
+    /// sustained, four seconds' worth of it as burst — so a page load's dozen
+    /// names is never touched — and BIND's own slip default of 2, truncating
+    /// every second response over budget.
+    ///
+    /// Zero disables, because `new(0, ..)` *is* [`disabled`](Self::disabled):
+    /// `is_enabled` is `bytes_per_sec > 0` and `admit` sends when it is false.
+    /// Both binaries wrote the branch and the arithmetic out by hand
+    /// (`TODO.md` #30f).
+    pub fn per_second(bytes_per_sec: u32) -> Self {
+        Self::new(bytes_per_sec, bytes_per_sec.saturating_mul(4), 2)
+    }
+
+    /// 8 KiB/s per client — the same number both daemons default
+    /// `--response-rate` to.
     pub fn with_defaults() -> Self {
-        Self::new(8192, 32768, 2)
+        Self::per_second(8192)
     }
 
     /// A limiter that permits everything, for `--no-response-limit`.
@@ -950,6 +962,24 @@ mod tests {
                 ResponseVerdict::Send
             );
         }
+    }
+
+    /// A rate of 0 permits everything, so the `if rate == 0 { disabled() }`
+    /// both binaries wrote around this constructor was dead code
+    /// (`TODO.md` #30f): `disabled()` *is* `new(0, 0, 0)`.
+    #[test]
+    fn a_budget_of_zero_is_no_budget() {
+        let limiter = ResponseLimiter::per_second(0);
+        assert!(!limiter.is_enabled());
+        assert_eq!(
+            limiter.admit(
+                "192.0.2.9".parse().unwrap(),
+                60_000,
+                current_unix_timestamp()
+            ),
+            ResponseVerdict::Send,
+            "and a maximal response still goes out whole"
+        );
     }
 
     /// The default must be generous enough that a page load never sees it.

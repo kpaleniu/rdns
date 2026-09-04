@@ -514,11 +514,7 @@ async fn serve(
         metrics,
         transfer_acl: Arc::new(transfer_acl),
         tsig_keys: Arc::new(tsig_keys),
-        response_limiter: Arc::new(if response_rate == 0 {
-            ResponseLimiter::disabled()
-        } else {
-            ResponseLimiter::new(response_rate, response_rate.saturating_mul(4), 2)
-        }),
+        response_limiter: Arc::new(ResponseLimiter::per_second(response_rate)),
         secondaries,
         deltas,
         updates,
@@ -867,7 +863,9 @@ impl Server {
                     rejection.key_name(),
                     rejection.error.reason()
                 );
-                let Some(response) = self.error_bytes(&msg, ResponseCode::NotAuthorized) else {
+                let Some(response) =
+                    self.error_bytes(&msg, ResponseCode::NotAuthorized, u16::MAX as usize)
+                else {
                     return;
                 };
                 match rejection.attach(response, now) {
@@ -1204,7 +1202,7 @@ impl Server {
         ip: IpAddr,
         session: Option<&mut TsigSession>,
     ) -> Vec<Vec<u8>> {
-        let Some(bytes) = self.error_bytes(msg, rcode) else {
+        let Some(bytes) = self.error_bytes(msg, rcode, u16::MAX as usize) else {
             serving_error!(self.logger, ip, "could not serialize an error response");
             return Vec::new();
         };
@@ -1430,8 +1428,17 @@ impl Server {
         self.transfer_error(msg, rcode, ip, session)
     }
 
-    /// An empty response to `msg` carrying `rcode`, serialized.
-    fn error_bytes(&self, msg: &DnsMessage, rcode: ResponseCode) -> Option<Vec<u8>> {
+    /// An empty response to `msg` carrying `rcode`, serialized within `max_len`.
+    ///
+    /// The ceiling is the transport's — `u16::MAX` on TCP, the client's EDNS
+    /// payload size on UDP — and is the only thing the UDP TSIG rejection's own
+    /// copy of this differed in (`TODO.md` #30g).
+    fn error_bytes(
+        &self,
+        msg: &DnsMessage,
+        rcode: ResponseCode,
+        max_len: usize,
+    ) -> Option<Vec<u8>> {
         let mut resp = DnsMessage {
             id: msg.id,
             response: true,
@@ -1452,7 +1459,7 @@ impl Server {
         if msg.has_edns() {
             resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
         }
-        resp.to_bytes_within(u16::MAX as usize).ok()
+        resp.to_bytes_within(max_len).ok()
     }
 }
 
@@ -1795,27 +1802,12 @@ impl Server {
                     rejection.key_name(),
                     rejection.error.reason()
                 );
-                let mut resp = DnsMessage {
-                    id: msg.id,
-                    response: true,
-                    opcode: msg.opcode,
-                    authoritive: false,
-                    truncation: false,
-                    recursion: msg.recursion,
-                    recursion_ok: false,
-                    ad: false,
-                    cd: msg.cd,
-                    rcode: ResponseCode::NotAuthorized,
-                    queries: msg.queries.clone(),
-                    answers: Vec::new(),
-                    authorities: Vec::new(),
-                    additionals: Vec::new(),
-                    edns: None,
-                };
-                if msg.has_edns() {
-                    resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
-                }
-                if let Ok(bytes) = resp.to_bytes_within(msg.udp_payload_size() as usize) {
+                let response = self.error_bytes(
+                    &msg,
+                    ResponseCode::NotAuthorized,
+                    msg.udp_payload_size() as usize,
+                );
+                if let Some(bytes) = response {
                     if let Ok(bytes) = rejection.attach(bytes, now) {
                         let _ = socket.send_to(&bytes, peer).await;
                     }

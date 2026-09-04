@@ -12,7 +12,6 @@ rdns.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 # Heap profiling, off unless asked for: `cargo run --release --features dhat-heap`.
 dhat = { version = "0.3", optional = true }
 toml = "1.1.4"
@@ -21,6 +20,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 # `signal-hook` and `signal-hook-tokio` were here for that and are gone. They
 # also never worked: the call needed a `StreamExt` nothing imported, so `rdnsd`
 # did not compile on Unix.
+
+[dev-dependencies]
+# Two tests build a subscriber to assert what each log level emits; nothing in
+# the binary does (`TODO.md` #30n).
+tracing-subscriber.workspace = true
 
 [features]
 # Swap in DHAT's allocator shim and write `dhat-heap.json` on exit. Never on by
