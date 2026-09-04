@@ -1626,6 +1626,38 @@ impl DnsMessage {
         self.edns = Some(edns);
     }
 
+    /// An upper bound on what [`DnsMessage::to_bytes_with`] writes, for sizing a
+    /// scratch buffer.
+    ///
+    /// Sound in one direction, which is the one that matters: name compression
+    /// makes the wire form shorter than this and never longer, RDATA is stored
+    /// uncompressed so writing it can only shrink it, and a name's presentation
+    /// text is at least its wire length — an escape like `\.` is two characters
+    /// for one octet.
+    fn wire_size_bound(&self) -> usize {
+        // A name's wire form is its text plus a leading length octet and the
+        // root label, and shorter than that whenever it is compressed.
+        let name = |name: &str| name.len() + 2;
+        let mut bound = response::HEADER_LEN;
+        for q in &self.queries {
+            bound += name(&q.qname) + 4;
+        }
+        for rr in self
+            .answers
+            .iter()
+            .chain(&self.authorities)
+            .chain(&self.additionals)
+        {
+            // TYPE, CLASS, TTL and RDLENGTH, then the RDATA.
+            bound += name(&rr.name) + 10 + rr.rdata.bytes().len();
+        }
+        if let Some(edns) = &self.edns {
+            // The owner is the root, so one octet rather than a name.
+            bound += 11 + edns.rdata().len();
+        }
+        bound
+    }
+
     /// Serialize, truncating to `max_len` bytes (RFC 1035 §4.2.1). If the full
     /// message doesn't fit, the answer/authority records are dropped (the OPT
     /// record and question are kept) and TC=1 is set so the client retries over
@@ -1660,9 +1692,35 @@ impl DnsMessage {
         out: &mut Vec<u8>,
         compressor: &mut NameCompressor,
     ) -> Result<(), WireError> {
+        // Sized to what this message can need, not to the ceiling: the TCP and
+        // transfer paths pass `u16::MAX`, so a 43-byte reply was a 64 KiB
+        // allocation and a 64 KiB memset (`TODO.md` #25b).
+        let scratch = self.wire_size_bound().min(max_len);
         out.clear();
-        out.resize(max_len, 0);
-        match self.to_bytes_with(out, compressor) {
+        out.resize(scratch, 0);
+        let mut wrote = self.to_bytes_with(out, compressor);
+        // The bound is an upper bound (see it), so this cannot fire — but a
+        // wrong bound would truncate a message that fits, silently and only on
+        // the shapes nobody tests. Growing to the limit and writing again makes
+        // it a hint rather than an invariant (§4).
+        if scratch < max_len
+            && matches!(
+                wrote,
+                Err(WireError::Truncated {
+                    what: "the output buffer",
+                    ..
+                })
+            )
+        {
+            debug_assert!(
+                false,
+                "wire_size_bound said {scratch} and it was not enough"
+            );
+            out.clear();
+            out.resize(max_len, 0);
+            wrote = self.to_bytes_with(out, compressor);
+        }
+        match wrote {
             Ok(n) if n <= max_len => {
                 out.truncate(n);
                 return Ok(());
@@ -1691,7 +1749,12 @@ impl DnsMessage {
         // Floor at the classic 512: a header, a question and an OPT record fit
         // there, so a too-small `max_len` still yields a TC=1 answer to retry on.
         out.clear();
-        out.resize(max_len.max(CLASSIC_UDP_SIZE as usize), 0);
+        out.resize(
+            truncated
+                .wire_size_bound()
+                .max(max_len.min(CLASSIC_UDP_SIZE as usize)),
+            0,
+        );
         let n = truncated.to_bytes_with(out, compressor)?;
         out.truncate(n);
         Ok(())
@@ -3007,6 +3070,19 @@ mod tests {
             "a UDP response asked to fit in 4096 bytes must not hold {} of \
              capacity — that is the buffer travelling into send_to",
             bytes.capacity()
+        );
+
+        // And the TCP path, which passes the protocol ceiling because the length
+        // prefix is its only limit. This is what `TODO.md` #25b measured: 65 535
+        // bytes allocated and zeroed for the same 60 bytes of answer, because
+        // the scratch was sized to the limit rather than to the message.
+        let framed = msg.to_bytes_within(u16::MAX as usize).expect("TCP");
+        assert_eq!(framed, bytes, "the limit does not change the bytes");
+        assert!(
+            framed.capacity() < 1024,
+            "a TCP response must not hold {} of capacity for {} bytes of answer",
+            framed.capacity(),
+            framed.len()
         );
     }
 

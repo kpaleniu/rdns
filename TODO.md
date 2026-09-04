@@ -1656,7 +1656,7 @@ anything re-measured should be too.
       along. `Zone::query` alone is 61-69 ns; what `resolve_in_zone` +
       `add_answer` do is 190-215 ns. Have `name_kind` hand back the positions it
       found, or give `of_type` an iterator form.
-- [ ] **25b. Every TCP reply allocates and zeroes 64 KiB.** `main.rs:1119`,
+- [x] **25b. Every TCP reply allocates and zeroes 64 KiB.** `main.rs:1119`,
       `:1267`, `:1625` call `to_bytes_within(u16::MAX)`, and
       `to_bytes_within_buf` does `clear()` then `resize(max_len, 0)` — a full
       memset of the ceiling, plus a fresh 64 KiB allocation in the non-`buf`
@@ -1664,6 +1664,24 @@ anything re-measured should be too.
       into a live `[u8]`. The zeroing buys nothing, since the caller reads only
       `..n`. The UDP path already keeps a per-worker scratch buffer
       (`main.rs:2070`); the TCP path is the caller §13 stopped one short of.
+
+      **Done 2026-09-04, and not by giving the TCP path a buffer.** The scratch
+      is sized to `wire_size_bound()` — what this message can possibly need —
+      rather than to `max_len`, so every caller stops paying for the ceiling and
+      no call site changes. The bound is sound in one direction only, which is
+      the one that matters: compression and RDATA writing can only shrink a
+      message, and an escaped `\.` is two characters of text for one octet of
+      wire.
+
+      A bound that is ever too small would truncate a message that fits —
+      silently, on the shapes nobody tests (§4) — so a buffer overflow below
+      `max_len` grows to the limit and writes again. That makes the bound a hint
+      rather than an invariant, with a `debug_assert` to catch it in a test run.
+
+      Held by `a_small_response_does_not_carry_a_64k_buffer_into_the_send`,
+      which now covers the TCP limit too and reads **65 535 bytes of capacity
+      for 45 bytes of answer** against the old sizing — watched failing, then
+      passing.
 - [x] **25c. The latency histogram costs eight atomic RMWs per answer.**
       `metrics.rs:213` increments every cumulative bucket at or above the sample,
       so a healthy 50 µs answer touches all eight, plus count and sum, on shared
