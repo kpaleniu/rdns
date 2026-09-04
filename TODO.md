@@ -711,7 +711,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection was O(zones per query) — 55 µs at ten thousand zones, now 32 ns and flat, keyed on `NameKeyBuf` with a walk up the QNAME, and the walk brought a second multiplier with it that the client picks. Name compression was O(n²) in the records of one message, so a 400-record transfer envelope cost 130.7 µs to serialize and now costs 42.8; the index that fixes it is built lazily, because the threshold that helps a transfer hurt a 60-name response by 26%. And an AXFR held the zone three times over before the first byte went out; the envelopes are an iterator now, at 10.5× less peak memory, which needed `Arc<Zone>` in the map because the lock cannot be held across a socket write |
 | **25** | per-answer waste on paths #9e already measured | **open, filed 2026-08-04.** Eight items, each small: the zone walked three times per answer, 64 KiB zeroed per TCP reply, eight atomics per latency sample, a `String` per label per canonical comparison. Includes the negative results — LTO, and the SIMD shapes that are not worth it |
 | **28** | work the answer path does and need not | **filed 2026-09-01; 28a-28c done and 28d answered *no* the same day.** The companion to #27, and its first item is larger: six clock reads per query cost 144-155 ns on both platforms, and four of them want the same instant. Also a closest-encloser walk computed and discarded on every positive answer and run twice on every NXDOMAIN, a delegation walk that cannot find anything in a leaf zone, and four global mutexes per datagram recorded as an unmeasured ceiling rather than a cost. Two of five candidates died on inspection and are kept |
-| **29** | the resolver half never got #27's pass | **filed 2026-09-04.** #27 and #28 gated `rdnsd`'s answer path at three allocations a query; `rdnsr` was never in that series and `rdns/tests/allocations.rs` cannot see it. The same walks, the same hashing, the same reply buffer, with the fixed copy sitting beside them |
+| **29** | the resolver half never got #27's pass | **filed and closed 2026-09-04**, five commits; #25b, #25e and #26e closed with it. #27 and #28 gated `rdnsd`'s answer path at three allocations a query; `rdnsr` was never in that series and `rdns/tests/allocations.rs` cannot see it. The same walks, the same hashing, the same reply buffer, with the fixed copy sitting beside them |
 | **27** | what a zero-allocation answer path would take | **filed 2026-09-01, not started.** Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **open, filed 2026-08-04; 26j done the same day.** Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
@@ -2875,6 +2875,53 @@ renumbered here: **#25b** (the TCP memset), **#25e** (the cache key), **#26e**
       256 cached records, 117-label QNAME, release: **240 → 102 µs** at zero
       iterations, 287 → 151 at ten, 867 → 743 at 150. Over half of the
       RFC 9276-shaped case was the naming.
+
+#### Where the resolver's paths stand now, 2026-09-04
+
+Five commits, in the order the cost was measured rather than the order the items
+were filed:
+
+| gate | before | after |
+|---|---:|---:|
+| `proves_nxdomain` as a validator, NSEC3 | 17 | 2 |
+| `proves_nxdomain` as a validator, NSEC | 6 | 6 |
+| miss in the denial cache | 1 | 0 |
+| miss in the negative cache | 14 | 0 |
+| miss in the answer cache | 1 | 0 |
+| one RRset out of the answer cache | 8 | 7 |
+| a 43-byte TCP reply's scratch | 65 594 bytes | 61 |
+| `sign_zone`, per record | 130 | 109 |
+| `synthesize`, 256 records, 117-label QNAME, 0 iterations | 240 µs | 102 µs |
+
+**Every miss is free now**, which is the number that matters: a miss is what a
+random-subdomain flood produces, and all three caches sit in front of every
+query. What a *hit* costs is the copy the caller is handed — a resolver's answer
+comes out of the cache under a lock, so unlike `rdnsd` it has nothing to write
+to the wire in place.
+
+**Verified across the whole series**, since none of it is meant to change an
+answer: 2 304 reply shapes — twelve names × twelve QTYPEs × {no EDNS, EDNS,
+EDNS+DO} × {UDP, TCP} over an unsigned, an NSEC-signed and an NSEC3-signed build
+of one zone — against the binary from before the first commit. **0 differ**: the
+unsigned run byte for byte, the signed runs by record set with the RRSIG fields a
+fresh signing run changes masked. dnspython validated 13 RRsets under each
+chain, denial records included. Windows and Linux read every count in
+`allocations.rs` the same, and clippy is clean on both — 711 tests here against
+714 there, which is the platform gap §1 describes and not a failure.
+
+**What is left on this side**, in the order a next pass should take it:
+
+- **A hit still copies the RRset** — 7 for three records, all of them the answer
+  itself. Removing them means writing the reply under the cache lock, which is
+  the trade `rdnsd`'s writer does not have to make.
+- **`sign_zone` is ~109 allocations per record.** Now that the naming is gone,
+  what is left is the signatures and the chain records. A million-record zone is
+  109 million allocator calls per signing run, and re-signing is periodic.
+- **`parse_zone_file` is ~23 per record**, untouched by any of this.
+- **#26a, #26b, #26f, #26h** — the remaining §7 stragglers, all off the query
+  path (a `String` per output byte in two `fn hex`, two base32hex decoders that
+  disagree, `normalize` where a `Cow` would do, a `String` for a constant type
+  name).
 
 ### 12. Pre-authentication panics — audited 2026-08-01
 
