@@ -195,6 +195,90 @@ impl std::fmt::Display for NameKeyBuf {
     }
 }
 
+/// A cache key of a folded name and a query type, which can be looked up
+/// without building one.
+///
+/// A `HashMap` reaches its key only through `Borrow`, and `Borrow<(str, Qtype)>`
+/// cannot exist: a tuple with an unsized field is not a type. The borrowed form
+/// is therefore a trait object over "a name and a type", which both this and a
+/// plain `(&str, Qtype)` are. One virtual call per lookup, against the `String`
+/// per lookup that a `(String, Qtype)` key costs on the resolver's hottest path
+/// (`TODO.md` #25e).
+///
+/// Folding is [`NameKeyBuf`]'s, so a name and the same name without its trailing
+/// dot are one key, as they are in every other map in this crate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameTypeKey {
+    name: NameKeyBuf,
+    qtype: crate::Qtype,
+}
+
+/// A name and a query type: [`NameTypeKey`] owned, `(&str, Qtype)` borrowed.
+///
+/// The `&str` must already be folded — [`absolute_lowered`] — because a lookup
+/// compares bytes.
+pub trait NameType {
+    fn name(&self) -> &str;
+    fn qtype(&self) -> crate::Qtype;
+}
+
+impl NameTypeKey {
+    pub fn new(name: &str, qtype: crate::Qtype) -> NameTypeKey {
+        NameTypeKey {
+            name: NameKeyBuf::new(name),
+            qtype,
+        }
+    }
+}
+
+impl NameType for NameTypeKey {
+    fn name(&self) -> &str {
+        self.name.as_str()
+    }
+    fn qtype(&self) -> crate::Qtype {
+        self.qtype
+    }
+}
+
+impl NameType for (&str, crate::Qtype) {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn qtype(&self) -> crate::Qtype {
+        self.1
+    }
+}
+
+/// Hashed field by field, and identically for the owned and borrowed forms:
+/// `HashMap` requires that a key and what it is looked up by hash alike.
+impl std::hash::Hash for NameTypeKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
+        self.qtype().hash(state);
+    }
+}
+
+impl std::hash::Hash for dyn NameType + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
+        self.qtype().hash(state);
+    }
+}
+
+impl PartialEq for dyn NameType + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name() && self.qtype() == other.qtype()
+    }
+}
+
+impl Eq for dyn NameType + '_ {}
+
+impl<'a> std::borrow::Borrow<dyn NameType + 'a> for NameTypeKey {
+    fn borrow(&self) -> &(dyn NameType + 'a) {
+        self
+    }
+}
+
 /// How many labels a name has, the root (`.`) being zero. `example.com.` is 2.
 ///
 /// Neither case folding nor the trailing dot changes the answer, so this does
@@ -466,6 +550,32 @@ mod tests {
                 suffix_labels(name, labels)
             );
         }
+    }
+
+    /// The whole point of the type: a key put in owned is found borrowed. If the
+    /// two forms hashed differently every lookup would miss and a cache would
+    /// silently never hit — the failure this test exists for.
+    #[test]
+    fn a_name_type_key_is_found_by_its_borrowed_form() {
+        use crate::Qtype;
+        use std::collections::HashMap;
+
+        let a = Qtype::of(record_types::A);
+        let aaaa = Qtype::of(record_types::AAAA);
+        let mut map: HashMap<NameTypeKey, u8> = HashMap::new();
+        map.insert(NameTypeKey::new("WWW.Example.COM", a), 1);
+
+        let probe: &dyn NameType = &("www.example.com.", a);
+        assert_eq!(map.get(probe), Some(&1), "the folded name, borrowed");
+        let other_type: &dyn NameType = &("www.example.com.", aaaa);
+        assert_eq!(map.get(other_type), None, "the type is part of the key");
+        let other_name: &dyn NameType = &("ww.example.com.", a);
+        assert_eq!(map.get(other_name), None);
+
+        // Unfolded: the borrowed form compares bytes, so this is the caller's
+        // job and the doc comment says so.
+        let unfolded: &dyn NameType = &("WWW.Example.COM.", a);
+        assert_eq!(map.get(unfolded), None);
     }
 
     #[test]

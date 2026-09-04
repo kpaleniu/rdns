@@ -1107,8 +1107,10 @@ fn checking_a_signed_nxdomain() {
 ///
 /// A miss is the flood shape and the one that must stay cheap. The negative
 /// cache's was **14**: `canonical_name`, then five allocations per ancestor from
-/// the owning `suffix_labels`, for a walk that answers "no" at every step. It is
-/// 1 now — the key, which the NODATA map needs owned anyway (`TODO.md` #25e).
+/// the owning `suffix_labels`, for a walk that answers "no" at every step, and
+/// then 1 for the key the NODATA map had no borrowed form of. **Zero now**: a
+/// question that arrives in key form, which is what comes off the wire, is
+/// looked up as it stands.
 fn what_the_resolvers_caches_cost() {
     let cache = rdns::cache::DnsCache::new(1_000);
     let qtype = Qtype::of(record_types::A);
@@ -1125,19 +1127,28 @@ fn what_the_resolvers_caches_cost() {
     let _ = cache.get("www.example.com.", qtype);
     let (hit, count) = allocations(|| cache.get("www.example.com.", qtype));
     assert_eq!(hit.expect("a hit").len(), 3);
-    // One per record's owner and RDATA, the `Vec` spine, and the folded key the
-    // map has no `Borrow` for (`TODO.md` #25e).
-    within("look one RRset up in the answer cache", count, 8..=8);
+    // One per record's owner and RDATA, and the `Vec` spine. The eighth was the
+    // folded key the `(String, Qtype)` map had no `Borrow` for (`TODO.md` #25e);
+    // what is left is the copy the caller is handed.
+    within("look one RRset up in the answer cache", count, 7..=7);
 
     let (miss, count) = allocations(|| cache.get("nothing.example.com.", qtype));
     assert!(miss.is_none());
-    within("miss in the answer cache", count, 1..=1);
+    within("miss in the answer cache", count, 0..=0);
+
+    // The denial cache is consulted before either of the others, so its miss is
+    // the first thing a flood of random names reaches.
+    let denials = rdns::nsec_cache::NsecCache::new(16);
+    let _ = denials.synthesize("nothing.example.com.", qtype);
+    let (miss, count) = allocations(|| denials.synthesize("nothing.example.com.", qtype));
+    assert!(miss.is_none());
+    within("miss in the denial cache", count, 0..=0);
 
     let negative = rdns::negative_cache::NegativeCache::new(1_000);
     let _ = negative.get("nothing.example.com.", qtype);
     let (miss, count) = allocations(|| negative.get("nothing.example.com.", qtype));
     assert!(miss.is_none());
-    within("miss in the negative cache", count, 1..=1);
+    within("miss in the negative cache", count, 0..=0);
 }
 
 /// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate

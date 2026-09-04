@@ -18,8 +18,7 @@
 //! - Nothing bogus is stored, and whether an answer validated is stored with it,
 //!   so the AD bit a second client sees is the one the first client saw.
 
-use crate::dnssec::canonical_name;
-use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf};
+use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf, NameType, NameTypeKey};
 use crate::Qtype;
 use crate::Ttl;
 use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};
@@ -73,7 +72,7 @@ struct Entries {
     /// By name: this name does not exist, so no type at it does either.
     nxdomain: HashMap<NameKeyBuf, Entry>,
     /// By (name, type): the name exists, this type at it does not.
-    nodata: HashMap<(String, Qtype), Entry>,
+    nodata: HashMap<NameTypeKey, Entry>,
 }
 
 impl Entries {
@@ -143,18 +142,18 @@ impl NegativeCache {
             secure,
             expires_at: now + ttl as u64,
         };
-        let name = canonical_name(qname);
         let Ok(mut entries) = self.entries.lock() else {
             return;
         };
 
         if nxdomain {
+            let name = NameKeyBuf::new(qname);
             if !entries.nxdomain.contains_key(name.as_str()) && entries.len() >= self.max_entries {
                 make_room(&mut entries, now);
             }
-            entries.nxdomain.insert(NameKeyBuf::new(&name), entry);
+            entries.nxdomain.insert(name, entry);
         } else {
-            let key = (name, qtype);
+            let key = NameTypeKey::new(qname, qtype);
             if !entries.nodata.contains_key(&key) && entries.len() >= self.max_entries {
                 make_room(&mut entries, now);
             }
@@ -168,13 +167,15 @@ impl NegativeCache {
             return None;
         }
         let now = current_unix_timestamp();
-        let name = canonical_name(qname);
+        // Borrowed: a question already in key form — which is what comes off the
+        // wire — costs this lookup nothing at all.
+        let name = crate::utils::absolute_lowered(qname);
         let entries = self.entries.lock().ok()?;
 
         // A cached NXDOMAIN denies every name beneath it too (RFC 8020), so the
         // walk up the ancestors *is* the lookup, deepest first. `name` is
         // absolute and folded, so each ancestor is a slice of it.
-        let mut ancestor = name.as_str();
+        let mut ancestor: &str = name.as_ref();
         loop {
             if let Some(entry) = entries.nxdomain.get(ancestor).filter(|e| e.live(now)) {
                 return Some(entry.answer(now));
@@ -185,9 +186,10 @@ impl NegativeCache {
             }
         }
 
+        let key: &dyn NameType = &(name.as_ref(), qtype);
         entries
             .nodata
-            .get(&(name, qtype))
+            .get(key)
             .filter(|e| e.live(now))
             .map(|entry| entry.answer(now))
     }

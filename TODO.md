@@ -1744,13 +1744,38 @@ anything re-measured should be too.
       **per record** in `Zone::reindex`, at every load and every re-signing, so
       "sign an eight-record zone" went 900 to 850 — about six allocations per
       record, which is six million on a zone with a million of them.
-- [ ] **25e. A cache lookup allocates its key.** `cache.rs:93` —
+- [x] **25e. A cache lookup allocates its key.** `cache.rs:93` —
       `HashMap<(String, Qtype), _>` has no `Borrow` for a tuple, so
       `get_validated` calls `ascii_lowered` (unconditional `String`) on every
       lookup. `NameKeyBuf`'s own doc comment describes the fix and the map does
       not use it; a two-level map, or `HashMap<NameKeyBuf, …>` with the type
       beside the entry, makes the read path allocation-free. Same shape in
       `negative_cache.rs:86` and `nsec_cache.rs:69`.
+
+      **Done 2026-09-04**, as neither of the two shapes above: `utils::NameTypeKey`,
+      with the borrowed form a `dyn NameType` trait object over "a name and a
+      type". A two-level map was the first plan and would have rewritten
+      `evict_oldest` — three linear passes and a `select_nth_unstable` that #13
+      measured and this has no business touching — so the key changed and every
+      other line of both caches stayed. One virtual call per lookup buys back the
+      `String`.
+
+          gate                             before   after
+          miss in the answer cache              1        0
+          miss in the negative cache            1        0
+          miss in the denial cache              1        0
+          look one RRset up in the cache        8        7
+
+      The three misses are the flood shape and all three are now free; what is
+      left of a hit is the copy the caller is handed. The denial cache is the
+      third because it had the same defect in a third spelling —
+      `canonical_name` at both entry points, which always allocates where
+      `absolute_lowered` borrows.
+
+      **One behaviour change, deliberately.** `ascii_lowered` was the only fold
+      in this crate that does not absolutize, so `example.com` and `example.com.`
+      were two cache entries. They are one now, which is what every other map
+      here already did, with a test.
 - [ ] **25f. The rate limiter takes two global mutexes per datagram.**
       `security.rs:125` locks `last_cleanup` to compare a timestamp before
       `should_allow` locks `buckets` at all. The first wants an `AtomicU64` with a
@@ -2790,6 +2815,14 @@ renumbered here: **#25b** (the TCP memset), **#25e** (the cache key), **#26e**
       under NSEC / NSEC3, as a validator` is the resolver-side row beside the
       server-side `prove a signed NXDOMAIN`, built out of the reply the server
       just wrote.
+
+- [x] **29c. Every cache on the query path folds the question again.**
+      Four folds of one name per `rdnsr` query — `synthesize_wildcard`,
+      `synthesize`, `NegativeCache::get`, `DnsCache::get_validated` — each an
+      unconditional `String`, which is 27a's finding on the other daemon
+      (`CLAUDE.md` §17: the same normalization written per module). Done with
+      #25e, 2026-09-04: all four borrow now, and a question that arrives in key
+      form — which is what comes off the wire — is looked up as it stands.
 
 - [x] **29b. Four ancestor walks build a `String` per candidate.**
       `dnssec::suffix_labels` is a `canonical_name` copy, a `Vec<&str>` of the

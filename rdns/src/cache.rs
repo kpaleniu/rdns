@@ -1,4 +1,4 @@
-use crate::utils::{ascii_lowered, current_unix_timestamp};
+use crate::utils::{absolute_lowered, current_unix_timestamp, NameType, NameTypeKey};
 use crate::Qtype;
 use crate::ResourceRecord;
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ impl CacheEntry {
 /// has no records to key on and takes its TTL from the SOA, so it lives in
 /// [`crate::negative_cache::NegativeCache`].
 pub struct DnsCache {
-    cache: Arc<Mutex<HashMap<(String, Qtype), CacheEntry>>>,
+    cache: Arc<Mutex<HashMap<NameTypeKey, CacheEntry>>>,
     max_entries: usize,
 }
 
@@ -67,14 +67,16 @@ impl DnsCache {
         };
 
         // ASCII fold only (RFC 4343): `str::to_lowercase` folds U+212A KELVIN
-        // SIGN to `k`, merging two names that differ on the wire.
-        let key = (ascii_lowered(name), qtype);
+        // SIGN to `k`, merging two names that differ on the wire. Borrowed, so
+        // a lookup allocates only when the name was not already in key form.
+        let folded = absolute_lowered(name);
+        let key: &dyn NameType = &(folded.as_ref(), qtype);
 
-        if let Some(entry) = cache.get(&key) {
+        if let Some(entry) = cache.get(key) {
             if !entry.is_expired(now) {
                 return Some((entry.records.clone(), entry.secure));
             } else {
-                cache.remove(&key);
+                cache.remove(key);
             }
         }
 
@@ -125,9 +127,8 @@ impl DnsCache {
             self.evict_oldest(&mut cache);
         }
 
-        let key = (ascii_lowered(name), qtype);
         cache.insert(
-            key,
+            NameTypeKey::new(name, qtype),
             CacheEntry {
                 records,
                 expires_at,
@@ -141,7 +142,7 @@ impl DnsCache {
     ///
     /// Three linear passes and one `Vec<u64>`. `min_by_key` per victim is O(n²)
     /// plus a key clone per removal, under the global lock.
-    fn evict_oldest(&self, cache: &mut HashMap<(String, Qtype), CacheEntry>) {
+    fn evict_oldest(&self, cache: &mut HashMap<NameTypeKey, CacheEntry>) {
         let now = current_unix_timestamp();
 
         cache.retain(|_, entry| !entry.is_expired(now));
@@ -355,12 +356,31 @@ mod tests {
             Qtype::of(rt::A),
             vec![create_test_record("example.com.", Ttl::from_wire(i32::MAX))],
         );
-        let expires_at =
-            cache.cache.lock().unwrap()[&("example.com.".to_string(), Qtype::of(rt::A))].expires_at;
+        let expires_at = cache.cache.lock().unwrap()
+            [&NameTypeKey::new("example.com.", Qtype::of(rt::A))]
+            .expires_at;
         assert!(
             expires_at <= current_unix_timestamp() + MAX_CACHE_TTL,
             "an entry may not outlive the ceiling"
         );
+    }
+
+    /// A name and the same name without its trailing dot are one name, so they
+    /// are one entry — which they were not while the key was `ascii_lowered`,
+    /// the one fold in this crate that does not absolutize (`TODO.md` #25e).
+    #[test]
+    fn the_trailing_dot_does_not_make_a_second_entry() {
+        let cache = DnsCache::with_defaults();
+        cache.put(
+            "example.com.",
+            Qtype::of(rt::A),
+            vec![create_test_record("example.com.", Ttl::from_secs(3600))],
+        );
+        assert!(
+            cache.get("example.com", Qtype::of(rt::A)).is_some(),
+            "the relative spelling of a name we hold must hit"
+        );
+        assert_eq!(cache.get_stats().total_entries, 1);
     }
 
     /// DNS folds case over ASCII only (RFC 4343). U+212A KELVIN SIGN lowercases

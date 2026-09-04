@@ -409,7 +409,9 @@ impl NsecCache {
         if !synthesizable_qtype(qtype) {
             return None;
         }
-        let qname = canonical_name(qname);
+        // Borrowed: a question that arrives in key form costs nothing to fold,
+        // and the walks below slice it rather than rebuilding it.
+        let qname = crate::utils::absolute_lowered(qname);
         let wildcard = wildcard_for_parent_of(&qname)?;
         let now = current_unix_timestamp();
         let zones = self.zones.lock().ok()?;
@@ -441,7 +443,7 @@ impl NsecCache {
         let answers: Vec<ResourceRecord> = with_ttl(&cached.records, ttl)
             .into_iter()
             .map(|mut rr| {
-                rr.name = qname.clone();
+                rr.name = qname.to_string();
                 rr
             })
             .collect();
@@ -460,7 +462,8 @@ impl NsecCache {
         if !synthesizable_qtype(qtype) {
             return None;
         }
-        let qname = canonical_name(qname);
+        // Borrowed, as in `synthesize_wildcard`.
+        let qname = crate::utils::absolute_lowered(qname);
         let now = current_unix_timestamp();
 
         // Under the lock: find the zone and take what bears on the question.
