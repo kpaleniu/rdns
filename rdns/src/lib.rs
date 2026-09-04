@@ -1520,6 +1520,41 @@ impl DnsMessage {
     /// Serialize the message into `output`, with domain-name compression
     /// (RFC 1035 §4.1.4). Returns the number of bytes written; errors if the
     /// message does not fit rather than writing a silently truncated one.
+    /// An empty reply to `request`, carrying only what a reply must echo.
+    ///
+    /// The id, the opcode and RD are the client's and are copied back
+    /// (RFC 1035 §4.1.1), and so is the question. CD is copied because
+    /// RFC 4035 §3.2.2 says so in one line — "The name server side MUST copy
+    /// the setting of the CD bit from a query to the corresponding response".
+    ///
+    /// AA, RA, AD, the RCODE and the OPT record are *policy*: they are exactly
+    /// what five hand-written copies of this skeleton disagreed about
+    /// (`TODO.md` #30g), so they are left neutral for the caller to set. This
+    /// is deliberately not a finished message; a function that returned one
+    /// would fit none of the callers.
+    ///
+    /// [`response::ResponseWriter::start`] is the same constructor for the path
+    /// that writes straight into the send buffer.
+    pub fn reply_to(request: &DnsMessage) -> DnsMessage {
+        DnsMessage {
+            id: request.id,
+            response: true,
+            opcode: request.opcode,
+            authoritive: false,
+            truncation: false,
+            recursion: request.recursion,
+            recursion_ok: false,
+            ad: false,
+            cd: request.cd,
+            rcode: ResponseCode::Ok,
+            queries: request.queries.clone(),
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+            edns: None,
+        }
+    }
+
     pub fn to_bytes(&self, output: &mut [u8]) -> Result<usize, WireError> {
         self.to_bytes_with(output, &mut NameCompressor::new())
     }

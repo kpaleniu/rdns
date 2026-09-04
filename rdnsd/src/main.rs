@@ -1439,23 +1439,8 @@ impl Server {
         rcode: ResponseCode,
         max_len: usize,
     ) -> Option<Vec<u8>> {
-        let mut resp = DnsMessage {
-            id: msg.id,
-            response: true,
-            opcode: msg.opcode,
-            authoritive: false,
-            truncation: false,
-            recursion: msg.recursion,
-            recursion_ok: false,
-            ad: false,
-            cd: msg.cd,
-            rcode,
-            queries: msg.queries.clone(),
-            answers: Vec::new(),
-            authorities: Vec::new(),
-            additionals: Vec::new(),
-            edns: None,
-        };
+        let mut resp = DnsMessage::reply_to(msg);
+        resp.rcode = rcode;
         if msg.has_edns() {
             resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
         }
@@ -1570,23 +1555,8 @@ fn frame(bytes: &[u8]) -> Option<Vec<u8>> {
 /// No AA — the reply carries no data — and bounded by `udp_payload_size()`
 /// rather than 512 (RFC 6891 §6.2.4).
 fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
-    let mut resp = DnsMessage {
-        id: request.id,
-        response: true,
-        opcode: request.opcode,
-        authoritive: false,
-        truncation: true,
-        recursion: request.recursion,
-        recursion_ok: false,
-        ad: false,
-        cd: request.cd,
-        rcode: ResponseCode::Ok,
-        queries: request.queries.clone(),
-        answers: Vec::new(),
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-        edns: None,
-    };
+    let mut resp = DnsMessage::reply_to(request);
+    resp.truncation = true;
     if request.has_edns() {
         resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
     }

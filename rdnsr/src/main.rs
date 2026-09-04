@@ -1044,17 +1044,11 @@ async fn handle_query(
         Ok(edns) => edns,
         Err(_) => {
             shell.record_answer(ResponseCode::FormatError, timer);
-            return edns_error(id, &query, ResponseCode::FormatError, recursion, client_max);
+            return edns_error(&msg, ResponseCode::FormatError, client_max);
         }
     };
     if client_edns.is_some_and(|edns| edns.version > EDNS_VERSION) {
-        return edns_error(
-            id,
-            &query,
-            ResponseCode::BadOptVersion,
-            recursion,
-            client_max,
-        );
+        return edns_error(&msg, ResponseCode::BadOptVersion, client_max);
     }
     // `is_some()` rather than `has_edns()`: they differ only for an option list
     // that does not parse, which returned FORMERR above.
@@ -1064,6 +1058,25 @@ async fn handle_query(
     let client_wants_dnssec = client_edns.is_some_and(|e| e.do_bit);
     let checking_disabled = msg.cd;
 
+    // RFC 9619 §4: "A DNS message with OPCODE = 0 MUST NOT include a QDCOUNT
+    // parameter whose value is greater than 1", and one that does "MUST be
+    // treated as an incorrectly formatted message" — one RCODE and one set of
+    // sections cannot describe two lookups. `rdnsd` has refused it since #9f;
+    // this answered the first question and echoed one, so the reply did not
+    // match the request either (`TODO.md` #30r).
+    if msg.queries.len() > 1 {
+        let resp = build_response(&msg, Vec::new(), ResponseCode::FormatError);
+        return finish(
+            resp,
+            client_uses_edns,
+            client_wants_dnssec,
+            &query,
+            client_max,
+            shell,
+            timer,
+        );
+    }
+
     // Names that must not leave this machine (RFC 6761, 6762, 6303). Before
     // every cache: the table *is* the answer, and consulting anything else means
     // a query going out.
@@ -1072,19 +1085,11 @@ async fn handle_query(
     // DNSSEC, not a request to be told what a public server thinks `localhost`
     // is.
     if let Some(local) = special_names::lookup(&query.qname, query.qtype) {
-        let mut resp = build_response(
-            id,
-            OpCode::Query,
-            &query,
-            local.answers,
-            local.rcode,
-            recursion,
-        );
+        let mut resp = build_response(&msg, local.answers, local.rcode);
         resp.authorities = local.authority;
         // Never AD: this was decided by specification, not validated, and a
         // validating client cannot check the claim for itself.
         resp.ad = false;
-        resp.cd = checking_disabled;
         // DEBUG: one line per query, with the name on it. Logging every query
         // is the operator's decision, not the default's.
         tracing::debug!(qname = %query.qname, why = %local.why, "answered locally");
@@ -1113,14 +1118,7 @@ async fn handle_query(
             .denials
             .synthesize_wildcard(&query.qname, query.qtype)
         {
-            let mut resp = build_response(
-                id,
-                OpCode::Query,
-                &query,
-                wildcard.answers,
-                ResponseCode::Ok,
-                recursion,
-            );
+            let mut resp = build_response(&msg, wildcard.answers, ResponseCode::Ok);
             resp.authorities = wildcard.authority;
             // A wildcard signature verifies at this name unchanged, so the
             // client can check this for itself.
@@ -1140,14 +1138,7 @@ async fn handle_query(
     if !checking_disabled {
         if let Some(denial) = caches.denials.synthesize(&query.qname, query.qtype) {
             shell.metrics.count(&shell.metrics.cache_hits);
-            let mut resp = build_response(
-                id,
-                OpCode::Query,
-                &query,
-                Vec::new(),
-                denial.rcode,
-                recursion,
-            );
+            let mut resp = build_response(&msg, Vec::new(), denial.rcode);
             resp.authorities = denial.authority;
             // The proofs were validated before storage, so what is derived
             // from them is authentic on the same terms.
@@ -1169,17 +1160,9 @@ async fn handle_query(
     // answer this question got — so a CD client may have it too.
     if let Some(negative) = caches.negatives.get(&query.qname, query.qtype) {
         shell.metrics.count(&shell.metrics.cache_hits);
-        let mut resp = build_response(
-            id,
-            OpCode::Query,
-            &query,
-            Vec::new(),
-            negative.rcode,
-            recursion,
-        );
+        let mut resp = build_response(&msg, Vec::new(), negative.rcode);
         resp.authorities = negative.authority;
         resp.ad = negative.secure && (client_wants_dnssec || msg.ad);
-        resp.cd = checking_disabled;
         return finish(
             resp,
             client_uses_edns,
@@ -1192,130 +1175,107 @@ async fn handle_query(
     }
 
     // Build the response: from cache if we have it, else by resolving.
-    let (mut resp, secure) =
-        if let Some((records, secure)) = caches.answers.get_validated(&query.qname, query.qtype) {
-            shell.metrics.count(&shell.metrics.cache_hits);
-            (
-                build_response(
-                    id,
-                    OpCode::Query,
-                    &query,
-                    records,
-                    ResponseCode::Ok,
-                    recursion,
-                ),
-                secure,
-            )
-        } else {
-            // Everything above answered from something held; from here the
-            // query costs a recursion. This is the line a cache hit rate is
-            // drawn on.
-            shell.metrics.count(&shell.metrics.cache_misses);
-            shell.metrics.count(&shell.metrics.queries_recursive);
-            // Async: each upstream round trip is an await, so this yields the
-            // task rather than holding a thread.
-            match resolver.resolve_validated(&query).await {
-                Ok((mut upstream, state)) => {
-                    // The resolver used its own random id; the reply must echo
-                    // the client's and advertise recursion.
-                    upstream.id = id;
-                    upstream.response = true;
-                    upstream.recursion = recursion;
-                    upstream.recursion_ok = true;
+    let (mut resp, secure) = if let Some((records, secure)) =
+        caches.answers.get_validated(&query.qname, query.qtype)
+    {
+        shell.metrics.count(&shell.metrics.cache_hits);
+        (build_response(&msg, records, ResponseCode::Ok), secure)
+    } else {
+        // Everything above answered from something held; from here the
+        // query costs a recursion. This is the line a cache hit rate is
+        // drawn on.
+        shell.metrics.count(&shell.metrics.cache_misses);
+        shell.metrics.count(&shell.metrics.queries_recursive);
+        // Async: each upstream round trip is an await, so this yields the
+        // task rather than holding a thread.
+        match resolver.resolve_validated(&query).await {
+            Ok((mut upstream, state)) => {
+                // The resolver used its own random id; the reply must echo
+                // the client's and advertise recursion.
+                upstream.id = id;
+                upstream.response = true;
+                upstream.recursion = recursion;
+                upstream.recursion_ok = true;
 
-                    if let ValidationState::Bogus(ref why) = state {
-                        // WARN: an answer that does not validate is an attack
-                        // or a broken zone, and both are worth seeing.
-                        tracing::warn!(
-                            qname = %query.qname,
-                            qtype = %query.qtype,
-                            "DNSSEC validation failed: {why}"
-                        );
-                        // Fail closed: the client cannot tell unauthenticated
-                        // data from checked data, so serving it launders an
-                        // attack into an ordinary reply. CD says the client
-                        // checks for itself, and RFC 4035 §3.2.2 requires the
-                        // data unfiltered.
-                        if !checking_disabled {
-                            let resp = build_response(
-                                id,
-                                OpCode::Query,
-                                &query,
-                                Vec::new(),
-                                ResponseCode::ServerFailure,
-                                recursion,
-                            );
-                            return finish(
-                                resp,
-                                client_uses_edns,
-                                client_wants_dnssec,
-                                &query,
-                                client_max,
-                                shell,
-                                timer,
-                            );
-                        }
-                    }
-
-                    let secure = state.is_secure();
-                    // A bogus answer in the cache is an attack that outlives
-                    // the query that carried it.
-                    if !upstream.answers.is_empty() && !state.is_bogus() {
-                        caches.answers.put_validated(
-                            &query.qname,
-                            query.qtype,
-                            upstream.answers.clone(),
-                            secure,
-                        );
-                    }
-                    // A "no" is an answer; re-resolving it makes a typo storm
-                    // cost one upstream walk per repeat. The SOA in the
-                    // authority section says how long it is good for (RFC 2308).
-                    if !state.is_bogus() {
-                        caches
-                            .negatives
-                            .insert(&query.qname, query.qtype, &upstream, secure);
-                    }
-                    // A *validated* "no" covers a whole range of names, so it
-                    // also goes in the denial cache. Only when Secure: an
-                    // unvalidated NSEC is an attacker's claim about which names
-                    // do not exist.
-                    if upstream.answers.is_empty() && secure {
-                        caches.denials.insert_validated(&upstream);
-                    }
-                    // A validated wildcard answer is the same kind of statement
-                    // about a range (RFC 8198 §5.3), so it is kept under the
-                    // wildcard rather than the name asked for.
-                    if !upstream.answers.is_empty() && secure {
-                        caches.denials.insert_validated_wildcard(&upstream);
-                    }
-                    (upstream, secure)
-                }
-                // Say why, then SERVFAIL: lame delegation, budget exhausted
-                // and CNAME loop are distinct so they can be read.
-                Err(ref e) => {
-                    // DEBUG: a failed lookup is ordinary, and one line per
-                    // failure is a flood. The SERVFAIL counter is the alert.
-                    tracing::debug!(
+                if let ValidationState::Bogus(ref why) = state {
+                    // WARN: an answer that does not validate is an attack
+                    // or a broken zone, and both are worth seeing.
+                    tracing::warn!(
                         qname = %query.qname,
                         qtype = %query.qtype,
-                        "resolve failed: {:#}",
-                        e
+                        "DNSSEC validation failed: {why}"
                     );
-                    (
-                        build_response(
-                            id,
-                            OpCode::Query,
+                    // Fail closed: the client cannot tell unauthenticated
+                    // data from checked data, so serving it launders an
+                    // attack into an ordinary reply. CD says the client
+                    // checks for itself, and RFC 4035 §3.2.2 requires the
+                    // data unfiltered.
+                    if !checking_disabled {
+                        let resp = build_response(&msg, Vec::new(), ResponseCode::ServerFailure);
+                        return finish(
+                            resp,
+                            client_uses_edns,
+                            client_wants_dnssec,
                             &query,
-                            Vec::new(),
-                            ResponseCode::ServerFailure,
-                            recursion,
-                        ),
-                        false,
-                    )
+                            client_max,
+                            shell,
+                            timer,
+                        );
+                    }
                 }
+
+                let secure = state.is_secure();
+                // A bogus answer in the cache is an attack that outlives
+                // the query that carried it.
+                if !upstream.answers.is_empty() && !state.is_bogus() {
+                    caches.answers.put_validated(
+                        &query.qname,
+                        query.qtype,
+                        upstream.answers.clone(),
+                        secure,
+                    );
+                }
+                // A "no" is an answer; re-resolving it makes a typo storm
+                // cost one upstream walk per repeat. The SOA in the
+                // authority section says how long it is good for (RFC 2308).
+                if !state.is_bogus() {
+                    caches
+                        .negatives
+                        .insert(&query.qname, query.qtype, &upstream, secure);
+                }
+                // A *validated* "no" covers a whole range of names, so it
+                // also goes in the denial cache. Only when Secure: an
+                // unvalidated NSEC is an attacker's claim about which names
+                // do not exist.
+                if upstream.answers.is_empty() && secure {
+                    caches.denials.insert_validated(&upstream);
+                }
+                // A validated wildcard answer is the same kind of statement
+                // about a range (RFC 8198 §5.3), so it is kept under the
+                // wildcard rather than the name asked for.
+                if !upstream.answers.is_empty() && secure {
+                    caches.denials.insert_validated_wildcard(&upstream);
+                }
+                (upstream, secure)
             }
-        };
+            // Say why, then SERVFAIL: lame delegation, budget exhausted
+            // and CNAME loop are distinct so they can be read.
+            Err(ref e) => {
+                // DEBUG: a failed lookup is ordinary, and one line per
+                // failure is a flood. The SERVFAIL counter is the alert.
+                tracing::debug!(
+                    qname = %query.qname,
+                    qtype = %query.qtype,
+                    "resolve failed: {:#}",
+                    e
+                );
+                (
+                    build_response(&msg, Vec::new(), ResponseCode::ServerFailure),
+                    false,
+                )
+            }
+        }
+    };
 
     // AD only for an answer actually authenticated, and only for a client that
     // asked (RFC 6840 §5.8).
@@ -1381,14 +1341,8 @@ fn finish(
 
 /// An empty error response carrying a version-0 OPT record, for the EDNS-level
 /// rejections (FORMERR / BADVERS) that must be signalled before resolving.
-fn edns_error(
-    id: u16,
-    query: &QuerySection,
-    rcode: ResponseCode,
-    recursion: bool,
-    client_max: usize,
-) -> Option<Vec<u8>> {
-    let mut resp = build_response(id, OpCode::Query, query, Vec::new(), rcode, recursion);
+fn edns_error(request: &DnsMessage, rcode: ResponseCode, client_max: usize) -> Option<Vec<u8>> {
+    let mut resp = build_response(request, Vec::new(), rcode);
     // BADVERS is an extended RCODE, so the OPT record isn't optional here — it
     // carries the code's high bits.
     resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE));
@@ -1405,59 +1359,33 @@ fn edns_error(
 /// (RFC 6891 §6.1.1) — a reply with no OPT may get us cached as a server that
 /// does not do EDNS.
 fn unsupported_opcode(msg: &DnsMessage) -> Option<Vec<u8>> {
-    let mut resp = DnsMessage {
-        id: msg.id,
-        response: true,
-        opcode: msg.opcode,
-        authoritive: false,
-        truncation: false,
-        recursion: msg.recursion,
-        recursion_ok: true,
-        ad: false,
-        cd: msg.cd,
-        rcode: ResponseCode::NotImplemented,
-        queries: msg.queries.clone(),
-        answers: Vec::new(),
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-        edns: None,
-    };
+    let mut resp = build_response(msg, Vec::new(), ResponseCode::NotImplemented);
     if msg.has_edns() {
         resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE));
     }
     resp.to_bytes_within(RDNSR_PAYLOAD_SIZE as usize).ok()
 }
 
-/// Build a minimal response message echoing the question section.
+/// A reply to `request` carrying `answers`, from whatever produced them.
 ///
-/// `opcode` is a parameter because it is the client's, not ours (RFC 1035
-/// §4.1.1). Every caller here passes QUERY, since `handle_query` refuses
-/// anything else first, but hardcoding it hides a missing opcode check.
+/// The echoed fields are [`DnsMessage::reply_to`]'s, which is where the id, the
+/// opcode and the question come from — the opcode because it is the client's,
+/// not ours (RFC 1035 §4.1.1). RA is set here because this is a recursive
+/// resolver; that is the one policy field every caller agrees on.
+///
+/// This used to clear CD, against RFC 4035 §3.2.2's "the name server side MUST
+/// copy the setting of the CD bit from a query to the corresponding response",
+/// and two of the eight call sites set it back by hand (`TODO.md` #30g).
 fn build_response(
-    id: u16,
-    opcode: OpCode,
-    query: &QuerySection,
+    request: &DnsMessage,
     answers: Vec<ResourceRecord>,
     rcode: ResponseCode,
-    recursion: bool,
 ) -> DnsMessage {
-    DnsMessage {
-        id,
-        response: true,
-        opcode,
-        authoritive: false,
-        truncation: false,
-        recursion,
-        recursion_ok: true,
-        ad: false,
-        cd: false,
-        rcode,
-        queries: vec![query.clone()],
-        answers,
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-        edns: None,
-    }
+    let mut resp = DnsMessage::reply_to(request);
+    resp.recursion_ok = true;
+    resp.rcode = rcode;
+    resp.answers = answers;
+    resp
 }
 
 #[cfg(test)]
@@ -1547,15 +1475,12 @@ mod tests {
     /// the client retry over TCP where the handshake proves the address.
     #[test]
     fn a_truncated_reply_carries_no_records_and_keeps_its_question() {
-        let query = QuerySection {
-            qname: "www.example.com.".to_string(),
-            qtype: Qtype::of(record_types::A),
-            qclass: rdns::QueryClass::IN,
-        };
-        let mut resp = build_response(
-            0x4242,
-            OpCode::Query,
-            &query,
+        let request = rdns::DnsMessageBuilder::new()
+            .with_id(0x4242)
+            .with_url("www.example.com.", "A")
+            .build();
+        let resp = build_response(
+            &request,
             vec![ResourceRecord {
                 name: "www.example.com.".to_string(),
                 class: rdns::Class::new(1),
@@ -1566,9 +1491,7 @@ mod tests {
                 .unwrap(),
             }],
             ResponseCode::Ok,
-            true,
         );
-        resp.response = true;
         let full = resp.to_bytes_within(4096).expect("serializes");
 
         let short = truncate_reply(&full).expect("truncates");
@@ -1773,6 +1696,80 @@ mod tests {
 
         shutdown.begin();
         let _ = server.await;
+    }
+
+    /// A query for `name` with `queries` questions in it, CD as given.
+    fn query_for(name: &str, questions: usize, cd: bool) -> Vec<u8> {
+        let mut msg = DnsMessage::try_from_bytes(&message(OpCode::Query, false)).expect("parses");
+        msg.cd = cd;
+        msg.queries = vec![
+            QuerySection {
+                qname: name.to_string(),
+                qtype: Qtype::of(record_types::A),
+                qclass: rdns::QueryClass::IN,
+            };
+            questions
+        ];
+        let mut buf = vec![0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("serialize");
+        buf.truncate(n);
+        buf
+    }
+
+    /// CD comes back as the client set it: RFC 4035 §3.2.2, "The name server
+    /// side MUST copy the setting of the CD bit from a query to the
+    /// corresponding response". `build_response` cleared it, and two of its
+    /// eight call sites set it back by hand — the other six, this one included,
+    /// answered a CD client with CD off (`TODO.md` #30g).
+    ///
+    /// `localhost` because `special_names` answers it from the table
+    /// (RFC 6761 §6.3), so the ordinary answer path runs with no upstream.
+    ///
+    /// Watched failing against the old builder: CD came back clear.
+    #[tokio::test]
+    async fn the_checking_disabled_bit_is_the_clients() {
+        let (resolver, caches) = context();
+        for cd in [false, true] {
+            let bytes = handle_query(
+                query_for("localhost.", 1, cd),
+                &resolver,
+                &caches,
+                &test_shell(),
+                Transport::Udp,
+            )
+            .await
+            .expect("localhost is answered from the table");
+            let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+            assert!(!reply.answers.is_empty(), "the ordinary answer path");
+            assert_eq!(reply.cd, cd, "CD is copied, not decided");
+        }
+    }
+
+    /// RFC 9619 §4: a QUERY carrying more than one question "MUST be treated as
+    /// an incorrectly formatted message". `rdnsd` has refused it since #9f;
+    /// `rdnsr` answered the first question and echoed one, so the reply did not
+    /// even match the request (`TODO.md` #30r).
+    ///
+    /// Watched failing without the check: NOERROR, one question, `localhost`
+    /// answered.
+    #[tokio::test]
+    async fn two_questions_in_one_query_are_a_format_error() {
+        let (resolver, caches) = context();
+        let bytes = handle_query(
+            query_for("localhost.", 2, false),
+            &resolver,
+            &caches,
+            &test_shell(),
+            Transport::Udp,
+        )
+        .await
+        .expect("answered, not dropped");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::FormatError);
+        assert!(
+            reply.answers.is_empty(),
+            "there is no answer to two questions"
+        );
     }
 
     /// A datagram arriving with the in-flight ceiling already reached is

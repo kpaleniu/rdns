@@ -10,7 +10,7 @@ use crate::error::{TransferError, TransferResult};
 use crate::utils::record_types as rt;
 use crate::zone::Zone;
 use crate::Qtype;
-use crate::{DnsMessage, Edns, ResourceRecord, ResponseCode};
+use crate::{DnsMessage, Edns, ResourceRecord};
 
 /// How much of a message to fill before starting the next one.
 ///
@@ -181,30 +181,17 @@ pub(crate) fn pack_transfer_messages(
 /// Every message repeats the question, which RFC 5936 §2.2.1 permits, so each is
 /// a well-formed response on its own.
 pub(crate) fn transfer_message(request: &DnsMessage, answers: Vec<ResourceRecord>) -> DnsMessage {
-    DnsMessage {
-        id: request.id,
-        response: true,
-        opcode: request.opcode,
-        authoritive: true,
-        truncation: false,
-        recursion: request.recursion,
-        recursion_ok: false,
-        ad: false,
-        cd: request.cd,
-        rcode: ResponseCode::Ok,
-        queries: request.queries.clone(),
-        answers,
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-        edns: None,
-    }
+    let mut msg = DnsMessage::reply_to(request);
+    msg.authoritive = true;
+    msg.answers = answers;
+    msg
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::zone::parse_zone_file;
-    use crate::{OpCode, QueryClass, QuerySection};
+    use crate::{OpCode, QueryClass, QuerySection, ResponseCode};
 
     fn request_for(qname: &str) -> DnsMessage {
         DnsMessage {

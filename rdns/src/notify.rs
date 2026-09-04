@@ -53,23 +53,10 @@ pub fn notify_request(zone: &str, soa: Option<ResourceRecord>, id: u16) -> DnsMe
 
 /// The reply to a NOTIFY: same opcode, question echoed, no data (RFC 1996 §4.7).
 pub fn notify_response(request: &DnsMessage, rcode: ResponseCode) -> DnsMessage {
-    DnsMessage {
-        id: request.id,
-        response: true,
-        opcode: OpCode::Notify,
-        authoritive: true,
-        truncation: false,
-        recursion: request.recursion,
-        recursion_ok: false,
-        ad: false,
-        cd: request.cd,
-        rcode,
-        queries: request.queries.clone(),
-        answers: Vec::new(),
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-        edns: None,
-    }
+    let mut msg = DnsMessage::reply_to(request);
+    msg.authoritive = true;
+    msg.rcode = rcode;
+    msg
 }
 
 /// The zone a NOTIFY is about, if the message is one and names a zone.
