@@ -29,7 +29,20 @@ rdns-core = { path = "rdns-core", version = "0.1.0" }
 rdns-transport = { path = "rdns-transport", version = "0.1.0" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1.41.1", features = ["full"] }
+# Not `full`: its `parking_lot` feature costs five packages — `parking_lot`,
+# `parking_lot_core`, `lock_api`, `scopeguard`, `smallvec` — for a mutex nothing
+# here asks for, and `fs`, `process` and `io-std` compile code with no caller
+# (there is no `tokio::fs` or `tokio::process` in the tree). These seven are what
+# the code names; `tokio::task` and `tokio::spawn` come with `rt-multi-thread`.
+tokio = { version = "1.41.1", features = [
+    "time",
+    "sync",
+    "net",
+    "io-util",
+    "signal",
+    "macros",
+    "rt-multi-thread",
+] }
 # Levels, so a malformed-packet flood is not 50k journald lines a second and so
 # the message is not built at all when nothing wants it. The library only emits;
 # the binaries choose where it goes.
