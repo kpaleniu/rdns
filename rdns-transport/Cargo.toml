@@ -1,0 +1,17 @@
+[package]
+name = "rdns-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The socket layer both rdns daemons run: admission, framing, accept loops and the shutdown epilogue. Not a DNS implementation — that is rdns."
+
+[dependencies]
+rdns.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# The reason this crate exists rather than a module in `rdns`: the pieces below
+# report to a human reading a log line, and `CLAUDE.md` §3 says the library
+# returns typed errors and only a binary may use `anyhow`. A crate whose only
+# consumers are the two daemons may (`TODO.md` #30c, #30d, #31).
+anyhow.workspace = true

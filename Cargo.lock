@@ -645,6 +645,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdns-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rdns",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rdnsc"
 version = "0.1.0"
 dependencies = [
@@ -670,6 +680,7 @@ dependencies = [
  "clap",
  "dhat",
  "rdns",
+ "rdns-transport",
  "serde",
  "tokio",
  "toml",
@@ -684,6 +695,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rdns",
+ "rdns-transport",
  "tokio",
  "tracing",
 ]

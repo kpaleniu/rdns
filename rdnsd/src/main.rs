@@ -49,26 +49,10 @@ use rdns::{
     zone::{parse_zone_file_at, Zone},
     DnsMessage, Edns, OpCode, Qtype, ResourceRecord, ResponseCode, Serial,
 };
+use rdns_transport::{listener_failure, ServeContext, Transport, TransportLimits};
 
 /// UDP payload size rdnsd advertises to clients via EDNS0.
 const RDNSD_PAYLOAD_SIZE: u16 = 4096;
-
-/// How long a TCP connection may sit idle between queries. RFC 7766 §6.2.3
-/// wants connections reused rather than reopened; an idle one still costs a
-/// socket.
-const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long we wait for the rest of a message once its length prefix arrived.
-const TCP_READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Ceiling on concurrent TCP connections. Without one, an accept loop that
-/// spawns per connection is a file-descriptor exhaustion vector.
-const MAX_TCP_CONNECTIONS: usize = 128;
-
-/// Queries a single connection may have in flight at once. Doubles as the reply
-/// channel's depth, so a client that pipelines faster than it reads pushes back
-/// on the read loop instead of growing a queue in memory.
-const MAX_INFLIGHT_PER_CONNECTION: usize = 16;
 
 /// Default for `--udp-workers`: the machine's parallelism, clamped to 2..=32.
 ///
@@ -378,16 +362,14 @@ struct Cli {
 /// because it switched transport, and the metrics are one server's.
 struct Server {
     zone_map: Arc<RwLock<Zones>>,
-    rate_limiter: Arc<RateLimiter>,
-    validator: Arc<AdmissionCheck>,
-    logger: Arc<QueryLogger>,
-    metrics: Arc<DnsMetrics>,
+    /// The limiter, the response budget, the validator, the logger and the
+    /// metrics — the five handles serving a request needs that are not the
+    /// answer. `rdnsr` held the same five as its `Shell`, which is how the
+    /// admission sequence came to be written twice (`TODO.md` #30e, #32).
+    ctx: ServeContext,
     /// Who may ask for a zone transfer. Empty by default, which refuses everyone.
     transfer_acl: Arc<TransferAcl>,
     tsig_keys: Arc<TsigKeyring>,
-    /// Bytes-per-second budget for UDP replies. Not applied to TCP: a query that
-    /// completed a handshake has an address nobody can be reflecting at.
-    response_limiter: Arc<ResponseLimiter>,
     /// The zones we replicate, so a NOTIFY can be told from a plausible one.
     secondaries: Secondaries,
     /// Per-zone change history, so an IXFR can answer with the difference.
@@ -580,13 +562,15 @@ async fn serve(
 
     let server = Arc::new(Server {
         zone_map,
-        rate_limiter: Arc::new(RateLimiter::new(query_limit)),
-        validator: Arc::new(AdmissionCheck::with_defaults()),
-        logger: Arc::new(QueryLogger::new()),
-        metrics,
+        ctx: ServeContext {
+            limiter: Arc::new(RateLimiter::new(query_limit)),
+            responses: Arc::new(ResponseLimiter::per_second(response_rate)),
+            validator: Arc::new(AdmissionCheck::with_defaults()),
+            logger: Arc::new(QueryLogger::new()),
+            metrics,
+        },
         transfer_acl: Arc::new(transfer_acl),
         tsig_keys: Arc::new(tsig_keys),
-        response_limiter: Arc::new(ResponseLimiter::per_second(response_rate)),
         secondaries,
         deltas,
         updates,
@@ -628,7 +612,7 @@ async fn serve(
     // the process", and this one ends on the stop signal by design. Joined after
     // the drain instead, so it is not a detached task (`CLAUDE.md` §9).
     let anomalies = tokio::spawn(watch_anomalies(
-        server.logger.clone(),
+        server.ctx.logger.clone(),
         anomaly_thresholds,
         anomaly_interval,
         shutdown.stop_handle(),
@@ -652,6 +636,7 @@ async fn serve(
     loops.spawn(tcp_loop(
         listener,
         server.clone(),
+        TransportLimits::default(),
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
@@ -660,7 +645,7 @@ async fn serve(
     if let Some(metrics_listener) = metrics_listener {
         loops.spawn(metrics_server::serve(
             metrics_listener,
-            server.metrics.clone(),
+            server.ctx.metrics.clone(),
             readiness,
             shutdown.stop_handle(),
             shutdown.busy(),
@@ -682,7 +667,7 @@ async fn serve(
                 served: ZoneContext {
                     zone_map: server.zone_map.clone(),
                     deltas: server.deltas.clone(),
-                    metrics: server.metrics.clone(),
+                    metrics: server.ctx.metrics.clone(),
                     journal: server.journal.clone(),
                 },
                 replicated,
@@ -730,26 +715,15 @@ async fn serve(
     }
 }
 
-/// How a finished listener task is reported. A cancelled task is not a failure.
-fn listener_failure(
-    joined: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
-) -> Option<anyhow::Error> {
-    match joined {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(anyhow::Error::from(e).context("a listener stopped")),
-        Err(e) if e.is_cancelled() => None,
-        Err(e) => Some(anyhow!("a listener task panicked: {e}")),
-    }
-}
-
 /// Accept connections and serve each in its own task.
 async fn tcp_loop(
     listener: TcpListener,
     server: Arc<Server>,
+    limits: TransportLimits,
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
-    let permits = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
     loop {
         // Stop accepting on shutdown; open connections drain in their own tasks.
         // `accept` is cancel-safe, so a lost race leaves the connection in the
@@ -769,7 +743,7 @@ async fn tcp_loop(
         // truncated AXFR from a complete one.
         let busy = busy.clone();
         tokio::spawn(async move {
-            server.serve_connection(stream, peer, stop).await;
+            server.serve_connection(stream, peer, limits, stop).await;
             drop(permit);
             drop(busy);
         });
@@ -782,13 +756,19 @@ impl Server {
     /// Queries on one connection are answered concurrently, so a slow one does
     /// not stall those behind it (RFC 7766 §6.2.1.1). On shutdown, reading stops
     /// but queries already accepted finish and reach the wire.
-    async fn serve_connection(self: Arc<Self>, stream: TcpStream, peer: SocketAddr, stop: Stop) {
+    async fn serve_connection(
+        self: Arc<Self>,
+        stream: TcpStream,
+        peer: SocketAddr,
+        limits: TransportLimits,
+        stop: Stop,
+    ) {
         let (mut reader, mut writer) = stream.into_split();
-        let (tx, mut rx) = mpsc::channel::<Reply>(MAX_INFLIGHT_PER_CONNECTION);
+        let (tx, mut rx) = mpsc::channel::<Reply>(limits.max_inflight_per_connection);
 
         // One task owns the write half: replies may complete out of order
         // (RFC 7766 §6.2.1.1), but two framed messages must never interleave.
-        let writer_logger = self.logger.clone();
+        let writer_logger = self.ctx.logger.clone();
         let writer_task = tokio::spawn(async move {
             while let Some(reply) = rx.recv().await {
                 let Reply::Frame(framed) = reply else {
@@ -803,7 +783,7 @@ impl Server {
             }
         });
 
-        let in_flight = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_CONNECTION));
+        let in_flight = Arc::new(Semaphore::new(limits.max_inflight_per_connection));
 
         loop {
             // A 2-byte big-endian length prefix frames each message
@@ -814,7 +794,7 @@ impl Server {
             // lost length prefix on a connection we are closing costs nothing.
             let mut len_buf = [0u8; 2];
             let read = tokio::select! {
-                r = tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut len_buf)) => r,
+                r = tokio::time::timeout(limits.idle_timeout, reader.read_exact(&mut len_buf)) => r,
                 _ = stop.wait() => break,
             };
             match read {
@@ -824,22 +804,22 @@ impl Server {
 
             let len = u16::from_be_bytes(len_buf) as usize;
             if len == 0 {
-                bad_request!(self.logger, peer.ip(), "zero-length TCP message");
+                bad_request!(self.ctx.logger, peer.ip(), "zero-length TCP message");
                 break;
             }
 
             // Mid-message the peer has committed to sending `len` bytes, so a
             // stall here gets a much shorter leash than an idle connection.
             let mut packet = vec![0u8; len];
-            match tokio::time::timeout(TCP_READ_TIMEOUT, reader.read_exact(&mut packet)).await {
+            match tokio::time::timeout(limits.read_timeout, reader.read_exact(&mut packet)).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    self.logger.count_error(peer.ip());
+                    self.ctx.logger.count_error(peer.ip());
                     tracing::debug!(peer = %peer.ip(), "socket read error: {e}");
                     break;
                 }
                 Err(_) => {
-                    self.logger.count_error(peer.ip());
+                    self.ctx.logger.count_error(peer.ip());
                     tracing::debug!(peer = %peer.ip(), "timed out mid-message on TCP");
                     break;
                 }
@@ -883,25 +863,10 @@ impl Server {
         // (`TODO.md` #28a).
         let now = tsig::now();
 
-        if !self.rate_limiter.should_allow(ip, now) {
-            self.logger.log_rate_limited(ip);
-            self.metrics.count(&self.metrics.rate_limited);
+        if !self.ctx.allow_source(ip, now) {
             return;
         }
-
-        let validation = self.validator.validate_packet(packet, true);
-        if !validation.is_valid() {
-            // Allocates per packet, but the macro does not evaluate its arguments
-            // unless DEBUG is on.
-            bad_request!(
-                self.logger,
-                ip,
-                "invalid query: {}",
-                validation
-                    .error()
-                    .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
-            );
-            self.metrics.count(&self.metrics.validation_errors);
+        if !self.ctx.accept_packet(ip, packet, Transport::Tcp) {
             return;
         }
 
@@ -911,14 +876,14 @@ impl Server {
         let msg = match Request::from_bytes(packet) {
             Ok(msg) => msg,
             Err(RequestError::Wire(_)) => {
-                bad_request!(self.logger, ip, "failed to parse DNS message");
+                bad_request!(self.ctx.logger, ip, "failed to parse DNS message");
                 return;
             }
             Err(RequestError::NotAQuestion) => {
                 // Silence, not a reply: answering turns a pair of servers, or one
                 // spoofed datagram, into a packet loop.
                 bad_request!(
-                    self.logger,
+                    self.ctx.logger,
                     ip,
                     "a response was sent to a server port; dropped"
                 );
@@ -927,10 +892,10 @@ impl Server {
         };
 
         let qtype = msg.queries.first().map(|q| q.qtype);
-        self.logger.log_query(ip, qtype, now);
-        self.metrics.count(&self.metrics.queries_received);
+        self.ctx.logger.log_query(ip, qtype, now);
+        self.ctx.metrics.count(&self.ctx.metrics.queries_received);
         if let Some(qtype) = qtype {
-            self.metrics.track_query_type(qtype);
+            self.ctx.metrics.track_query_type(qtype);
         }
 
         // TSIG before anything that could answer (RFC 8945 §5.2): checking the
@@ -942,7 +907,7 @@ impl Server {
                 // WARN, not DEBUG: a key that does not verify is either a
                 // misconfiguration or somebody trying keys.
                 serving_error!(
-                    self.logger,
+                    self.ctx.logger,
                     ip,
                     "TSIG rejected (key {}): {}",
                     rejection.key_name(),
@@ -957,7 +922,7 @@ impl Server {
                     Ok(bytes) => {
                         send_framed(out, &bytes).await;
                     }
-                    Err(e) => serving_error!(self.logger, ip, "TSIG error reply: {e}"),
+                    Err(e) => serving_error!(self.ctx.logger, ip, "TSIG error reply: {e}"),
                 }
                 return;
             }
@@ -1002,14 +967,14 @@ impl Server {
                 write_response(
                     &msg,
                     &zones,
-                    &self.metrics,
+                    &self.ctx.metrics,
                     u16::MAX as usize,
                     &mut bytes,
                     &mut compressor,
                 )
             };
             if let Err(e) = written {
-                serving_error!(self.logger, ip, "serialization error: {e}");
+                serving_error!(self.ctx.logger, ip, "serialization error: {e}");
                 return;
             }
         }
@@ -1021,7 +986,7 @@ impl Server {
                 Ok(signed) => {
                     send_framed(out, &signed).await;
                 }
-                Err(e) => serving_error!(self.logger, ip, "TSIG signing failed: {e}"),
+                Err(e) => serving_error!(self.ctx.logger, ip, "TSIG signing failed: {e}"),
             },
             None => {
                 send_framed(out, &bytes).await;
@@ -1071,7 +1036,7 @@ impl Server {
             .map(|s| s.key_name().to_string());
         if let Some(key_name) = unauthorized {
             serving_error!(
-                self.logger,
+                self.ctx.logger,
                 ip,
                 "{kind} of {qname} REFUSED: key {key_name} is scoped to other zones"
             );
@@ -1083,7 +1048,7 @@ impl Server {
         let authenticated_by = session.as_ref().map(|s| s.key_name().to_string());
         if authenticated_by.is_none() && !self.transfer_acl.allows(ip) {
             serving_error!(
-                self.logger,
+                self.ctx.logger,
                 ip,
                 "{kind} of {qname} REFUSED: no TSIG key, and not in --allow-transfer"
             );
@@ -1140,7 +1105,7 @@ impl Server {
                 match built {
                     Ok(messages) => (zone, messages),
                     Err(e) => {
-                        serving_error!(self.logger, ip, "{kind} of {qname}: {e}");
+                        serving_error!(self.ctx.logger, ip, "{kind} of {qname}: {e}");
                         self.send_transfer_error(
                             msg,
                             ResponseCode::ServerFailure,
@@ -1164,7 +1129,7 @@ impl Server {
                 Ok(envelopes) => Box::new(envelopes),
                 Err(e) => {
                     // Nothing sent yet, so an ordinary error response still works.
-                    serving_error!(self.logger, ip, "{kind} of {qname}: {e}");
+                    serving_error!(self.ctx.logger, ip, "{kind} of {qname}: {e}");
                     self.send_transfer_error(msg, ResponseCode::ServerFailure, ip, session, out)
                         .await;
                     return;
@@ -1182,7 +1147,7 @@ impl Server {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     serving_error!(
-                        self.logger,
+                        self.ctx.logger,
                         ip,
                         "{kind} of {qname}: serialization error: {e}"
                     );
@@ -1198,7 +1163,7 @@ impl Server {
                     Ok(signed) => signed,
                     Err(e) => {
                         serving_error!(
-                            self.logger,
+                            self.ctx.logger,
                             ip,
                             "{kind} of {qname}: TSIG signing failed: {e}"
                         );
@@ -1221,7 +1186,7 @@ impl Server {
 
         // A transfer is an answer too, and this is the only path that does not
         // go through `make_response`.
-        self.metrics.count(&self.metrics.responses_sent);
+        self.ctx.metrics.count(&self.ctx.metrics.responses_sent);
         let how = match &authenticated_by {
             Some(key) => format!("key {key}"),
             None => format!("address {ip}"),
@@ -1288,7 +1253,7 @@ impl Server {
         session: Option<&mut TsigSession>,
     ) -> Vec<Vec<u8>> {
         let Some(bytes) = self.error_bytes(msg, rcode, u16::MAX as usize) else {
-            serving_error!(self.logger, ip, "could not serialize an error response");
+            serving_error!(self.ctx.logger, ip, "could not serialize an error response");
             return Vec::new();
         };
         let bytes = match session {
@@ -1297,7 +1262,7 @@ impl Server {
                 Err(e) => {
                     // Send nothing: an unsigned error is what signing exists to
                     // avoid producing.
-                    serving_error!(self.logger, ip, "signing an error response failed: {e}");
+                    serving_error!(self.ctx.logger, ip, "signing an error response failed: {e}");
                     return Vec::new();
                 }
             },
@@ -1327,7 +1292,7 @@ impl Server {
         let request = match update::parse(msg) {
             Ok(request) => request,
             Err(rejected) => {
-                serving_error!(self.logger, ip, "UPDATE rejected: {rejected}");
+                serving_error!(self.ctx.logger, ip, "UPDATE rejected: {rejected}");
                 return self.update_reply(msg, rejected.rcode, ip, session);
             }
         };
@@ -1339,7 +1304,7 @@ impl Server {
         // and it must be scoped (`rdns::tsig::UpdatePolicy`).
         let Some(session) = session else {
             serving_error!(
-                self.logger,
+                self.ctx.logger,
                 ip,
                 "UPDATE of {zone_name} REFUSED: unsigned, and an UPDATE needs a TSIG key"
             );
@@ -1347,7 +1312,7 @@ impl Server {
         };
         if !session.may_update(&zone_name) {
             serving_error!(
-                self.logger,
+                self.ctx.logger,
                 ip,
                 "UPDATE of {zone_name} REFUSED: key {} may not rewrite it",
                 session.key_name()
@@ -1379,7 +1344,7 @@ impl Server {
             .contains_key(rdns::utils::absolute_lowered(&zone_name).as_ref())
         {
             serving_error!(
-                self.logger,
+                self.ctx.logger,
                 ip,
                 "UPDATE of {zone_name} REFUSED: this server replicates that zone, \
                  so its master owns it"
@@ -1392,7 +1357,7 @@ impl Server {
         // client it succeeded. See [`UpdateHandling`].
         let Some(source) = self.updates.source.as_ref() else {
             serving_error!(
-                self.logger,
+                self.ctx.logger,
                 ip,
                 "UPDATE of {zone_name} REFUSED: this server has no writable zone source"
             );
@@ -1400,7 +1365,7 @@ impl Server {
         };
         let Some(path) = source.file_for(&zone_name) else {
             serving_error!(
-                self.logger,
+                self.ctx.logger,
                 ip,
                 "UPDATE of {zone_name} REFUSED: no zone file to write it back to"
             );
@@ -1434,7 +1399,7 @@ impl Server {
             Ok(outcome) => outcome,
             Err(e) => {
                 serving_error!(
-                    self.logger,
+                    self.ctx.logger,
                     ip,
                     "UPDATE of {zone_name}: the task failed: {e}"
                 );
@@ -1452,7 +1417,7 @@ impl Server {
             // undone. Nothing to undo here — the write is atomic and the map is
             // untouched until it succeeds.
             Err(UpdateFailure::System(e)) => {
-                serving_error!(self.logger, ip, "UPDATE of {zone_name} failed: {e:#}");
+                serving_error!(self.ctx.logger, ip, "UPDATE of {zone_name} failed: {e:#}");
                 return self.update_reply(msg, ResponseCode::ServerFailure, ip, Some(session));
             }
         };
@@ -1494,7 +1459,7 @@ impl Server {
         ZoneContext {
             zone_map: Arc::clone(&self.zone_map),
             deltas: Arc::clone(&self.deltas),
-            metrics: Arc::clone(&self.metrics),
+            metrics: Arc::clone(&self.ctx.metrics),
             journal: self.journal.clone(),
         }
     }
@@ -1760,22 +1725,10 @@ async fn udp_loop(
 
         // Both are decisions to do nothing, so they run on `&buf[..size]` with
         // nothing copied and nothing spawned.
-        if !server.rate_limiter.should_allow(peer.ip(), now) {
-            server.logger.log_rate_limited(peer.ip());
-            server.metrics.count(&server.metrics.rate_limited);
+        if !server.ctx.allow_source(peer.ip(), now) {
             continue;
         }
-        let validation = server.validator.validate_packet(packet, false);
-        if !validation.is_valid() {
-            bad_request!(
-                server.logger,
-                peer.ip(),
-                "invalid query: {}",
-                validation
-                    .error()
-                    .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
-            );
-            server.metrics.count(&server.metrics.validation_errors);
+        if !server.ctx.accept_packet(peer.ip(), packet, Transport::Udp) {
             continue;
         }
 
@@ -1806,13 +1759,17 @@ impl Server {
     ) {
         let Server {
             zone_map,
-            logger,
-            metrics,
+            ctx,
             tsig_keys,
-            response_limiter,
             secondaries,
             ..
         } = self;
+        let ServeContext {
+            logger,
+            metrics,
+            responses: response_limiter,
+            ..
+        } = ctx;
 
         // The same door as the TCP path above, and now literally the same code.
         //
@@ -3071,19 +3028,27 @@ mod tests {
     /// Up here rather than in `mod shutdown`, where it started, because the UDP
     /// tests want the same thing and a second copy is how two of them come to
     /// disagree about what a default server is (`CLAUDE.md` §7).
+    /// Every limit off and throwaway counters: a test about answering must not
+    /// also be a test of the rate limiter.
+    fn test_context() -> ServeContext {
+        ServeContext {
+            limiter: Arc::new(RateLimiter::with_defaults()),
+            responses: Arc::new(ResponseLimiter::disabled()),
+            validator: Arc::new(AdmissionCheck::with_defaults()),
+            logger: Arc::new(QueryLogger::new()),
+            metrics: Arc::new(DnsMetrics::new()),
+        }
+    }
+
     fn server_with(zone: Zone) -> Arc<Server> {
         let mut zones = HashMap::new();
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
         Arc::new(Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-            rate_limiter: Arc::new(RateLimiter::with_defaults()),
-            validator: Arc::new(AdmissionCheck::with_defaults()),
-            logger: Arc::new(QueryLogger::new()),
-            metrics: Arc::new(DnsMetrics::new()),
+            ctx: test_context(),
             journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl")),
             tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
-            response_limiter: Arc::new(ResponseLimiter::disabled()),
             secondaries: Arc::new(HashMap::new()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
             updates: Arc::new(UpdateHandling::disabled()),
@@ -3333,6 +3298,7 @@ mod tests {
             let loop_handle = tokio::spawn(tcp_loop(
                 listener,
                 server_with(big_zone()),
+                TransportLimits::default(),
                 shutdown.stop_handle(),
                 shutdown.busy(),
             ));
@@ -3394,6 +3360,7 @@ mod tests {
             let loop_handle = tokio::spawn(tcp_loop(
                 listener,
                 server_with(big_zone()),
+                TransportLimits::default(),
                 shutdown.stop_handle(),
                 shutdown.busy(),
             ));
@@ -3434,6 +3401,7 @@ mod tests {
             tokio::spawn(tcp_loop(
                 listener,
                 server_with(big_zone()),
+                TransportLimits::default(),
                 shutdown.stop_handle(),
                 shutdown.busy(),
             ));
@@ -3601,13 +3569,9 @@ mod tests {
 
         let server = Arc::new(Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-            rate_limiter: Arc::new(RateLimiter::with_defaults()),
-            validator: Arc::new(AdmissionCheck::with_defaults()),
-            logger: Arc::new(QueryLogger::new()),
-            metrics: Arc::new(DnsMetrics::new()),
+            ctx: test_context(),
             transfer_acl: Arc::new(TransferAcl::parse(acl).expect("acl")),
             tsig_keys: Arc::new(keys),
-            response_limiter: Arc::new(ResponseLimiter::disabled()),
             secondaries: Arc::new(HashMap::new()),
             deltas: Arc::new(RwLock::new(log)),
             updates: Arc::new(UpdateHandling::disabled()),
@@ -3621,6 +3585,7 @@ mod tests {
                 tokio::spawn(server.clone().serve_connection(
                     stream,
                     peer,
+                    TransportLimits::default(),
                     test_shutdown().stop_handle(),
                 ));
             }
@@ -3658,13 +3623,9 @@ mod tests {
 
         let server = Arc::new(Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-            rate_limiter: Arc::new(RateLimiter::with_defaults()),
-            validator: Arc::new(AdmissionCheck::with_defaults()),
-            logger: Arc::new(QueryLogger::new()),
-            metrics: Arc::new(DnsMetrics::new()),
+            ctx: test_context(),
             transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
             tsig_keys: Arc::new(TsigKeyring::new(vec![key])),
-            response_limiter: Arc::new(ResponseLimiter::disabled()),
             secondaries: Arc::new(HashMap::new()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
             updates: Arc::new(UpdateHandling {
@@ -3682,6 +3643,7 @@ mod tests {
                 tokio::spawn(server.clone().serve_connection(
                     stream,
                     peer,
+                    TransportLimits::default(),
                     test_shutdown().stop_handle(),
                 ));
             }
@@ -5096,14 +5058,10 @@ mod tests {
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
         let server = Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-            rate_limiter: Arc::new(RateLimiter::with_defaults()),
-            validator: Arc::new(AdmissionCheck::with_defaults()),
-            logger: Arc::new(QueryLogger::new()),
-            metrics: Arc::new(DnsMetrics::new()),
+            ctx: test_context(),
             journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
             tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
-            response_limiter: Arc::new(ResponseLimiter::disabled()),
             secondaries: Arc::new(HashMap::new()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
             updates: Arc::new(UpdateHandling::disabled()),

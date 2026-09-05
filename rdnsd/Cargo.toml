@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 clap.workspace = true
 rdns.workspace = true
+rdns-transport.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

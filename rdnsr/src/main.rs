@@ -26,6 +26,7 @@ use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, Qtype, QuerySection, ResourceRecord, ResponseCode,
     OPT_RECORD_TYPE,
 };
+use rdns_transport::{listener_failure, ServeContext, Transport, TransportLimits};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
@@ -33,23 +34,6 @@ use tokio::task::JoinSet;
 
 /// UDP payload size rdnsr advertises to clients via EDNS0.
 const RDNSR_PAYLOAD_SIZE: u16 = 4096;
-
-/// How long a TCP connection may sit idle between queries before we close it.
-/// RFC 7766 §6.2.3 wants connections reused rather than reopened, but an idle
-/// one still costs a socket, so this is the compromise the RFC asks for.
-const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long we wait for the rest of a message once its length prefix arrived.
-const TCP_READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Ceiling on concurrent TCP connections. Without one, an accept loop that
-/// spawns per connection is a free file-descriptor exhaustion vector.
-const MAX_TCP_CONNECTIONS: usize = 128;
-
-/// Queries a single connection may have in flight at once. Doubles as the reply
-/// channel's depth, so a client that pipelines faster than it reads eventually
-/// pushes back on our read loop instead of growing a queue in memory.
-const MAX_INFLIGHT_PER_CONNECTION: usize = 16;
 
 /// UDP queries this resolver will have in flight at once, when nothing says
 /// otherwise.
@@ -86,15 +70,6 @@ struct Caches {
     answers: DnsCache,
     negatives: NegativeCache,
     denials: NsecCache,
-}
-
-/// Which transport a query arrived on, which decides the answer's size limit: a
-/// UDP reply must fit the requestor's advertised payload size, a TCP reply only
-/// its 2-byte length prefix (RFC 6891 §6.2.2).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Transport {
-    Udp,
-    Tcp,
 }
 
 /// Recursive DNS resolver with caching.
@@ -241,47 +216,6 @@ struct Cli {
     /// because it is shared with `rdnsd`.
     #[arg(long, value_name = "ADDR:PORT")]
     metrics_listen: Option<String>,
-}
-
-/// Everything the resolver needs that is not resolving.
-///
-/// One struct rather than five more parameters on `udp_main`, `tcp_main` and
-/// `handle_query`, all of which already take several.
-struct Shell {
-    /// Queries per second per source. `RateLimiter`'s bound *allows* an
-    /// untracked source: failing closed would let one flood deny everybody.
-    limiter: Arc<RateLimiter>,
-    /// Response bytes per second per source, UDP only.
-    responses: Arc<ResponseLimiter>,
-    metrics: Arc<DnsMetrics>,
-    logger: Arc<QueryLogger>,
-    /// Size and section-count checks on the raw datagram, before anything is
-    /// parsed or admitted.
-    ///
-    /// A handful of comparisons on bytes not yet trusted, where the cheapest
-    /// possible rejection is worth the most.
-    validator: Arc<AdmissionCheck>,
-}
-
-impl Shell {
-    /// Count one answer leaving, by rcode, and record how long it took.
-    ///
-    /// The rcodes an operator pages on for a *resolver*: SERVFAIL means
-    /// upstream trouble or a validation failure, REFUSED means something asked
-    /// for what this will not do, NXDOMAIN is ordinary. `queries_authoritative`
-    /// is never touched — this daemon is never authoritative.
-    fn record_answer(&self, rcode: ResponseCode, timer: LatencyTimer) {
-        let metrics = &self.metrics;
-        metrics.count(&metrics.responses_sent);
-        match rcode {
-            ResponseCode::Ok => metrics.count(&metrics.responses_noerror),
-            ResponseCode::NoSuchDomain => metrics.count(&metrics.responses_nxdomain),
-            ResponseCode::ServerFailure => metrics.count(&metrics.responses_servfail),
-            ResponseCode::Refused => metrics.count(&metrics.responses_refused),
-            _ => {}
-        }
-        metrics.observe_latency_us(timer.elapsed_us());
-    }
 }
 
 #[tokio::main]
@@ -437,7 +371,7 @@ async fn main() -> anyhow::Result<()> {
     let query_limit = RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(
         TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
     );
-    let shell = Arc::new(Shell {
+    let ctx = Arc::new(ServeContext {
         limiter: Arc::new(RateLimiter::new(query_limit)),
         responses: Arc::new(ResponseLimiter::per_second(cli.response_rate)),
         metrics: Arc::new(DnsMetrics::new()),
@@ -514,7 +448,7 @@ async fn main() -> anyhow::Result<()> {
     // and this one ends on the stop signal by design. Joined after the drain, so
     // it is not a detached task (`CLAUDE.md` §9).
     let anomalies = tokio::spawn(watch_anomalies(
-        shell.logger.clone(),
+        ctx.logger.clone(),
         anomaly_thresholds,
         anomaly_interval,
         shutdown.stop_handle(),
@@ -526,7 +460,7 @@ async fn main() -> anyhow::Result<()> {
         socket,
         resolver.clone(),
         caches.clone(),
-        shell.clone(),
+        ctx.clone(),
         cli.max_inflight_udp,
         shutdown.stop_handle(),
         shutdown.busy(),
@@ -535,7 +469,8 @@ async fn main() -> anyhow::Result<()> {
         listener,
         resolver,
         caches,
-        shell.clone(),
+        ctx.clone(),
+        TransportLimits::default(),
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
@@ -545,7 +480,7 @@ async fn main() -> anyhow::Result<()> {
         loops.spawn(async move {
             metrics_server::serve(
                 metrics_listener,
-                shell.metrics.clone(),
+                ctx.metrics.clone(),
                 // Nothing to wait for: a resolver is ready as soon as it is
                 // up.
                 Readiness::ready(),
@@ -587,20 +522,6 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// How a finished listener task is reported. A cancelled task is not a failure:
-/// it is a task that was told to stop.
-fn listener_failure(
-    joined: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
-) -> Option<anyhow::Error> {
-    match joined {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(anyhow::Error::from(e).context("a listener stopped")),
-        Err(e) if e.is_cancelled() => None,
-        Err(e) => Some(anyhow::anyhow!("a listener task panicked: {e}")),
-    }
-}
-
-/// Accept datagrams and answer each in its own task.
 /// Follow the managed zones' DNSKEY RRsets and keep the anchors in step
 /// (RFC 5011).
 ///
@@ -808,7 +729,7 @@ async fn udp_main(
     socket: Arc<UdpSocket>,
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
-    shell: Arc<Shell>,
+    ctx: Arc<ServeContext>,
     max_inflight: usize,
     stop: Stop,
     busy: Busy,
@@ -843,15 +764,11 @@ async fn udp_main(
         // microseconds of each other; the response budget reads its own, since a
         // recursion sits in between (`TODO.md` #28a).
         let now = current_unix_timestamp();
-        if !shell.limiter.should_allow(peer.ip(), now) {
-            shell.logger.log_rate_limited(peer.ip());
-            shell.metrics.count(&shell.metrics.rate_limited);
+        if !ctx.allow_source(peer.ip(), now) {
             continue;
         }
         // Then the structural checks, on bytes nothing has trusted yet.
-        let validation = shell.validator.validate_packet(&buf[..n], false);
-        if !validation.is_valid() {
-            shell.metrics.count(&shell.metrics.validation_errors);
+        if !ctx.accept_packet(peer.ip(), &buf[..n], Transport::Udp) {
             continue;
         }
         // Before the copy, the clones and the task: at the ceiling a datagram
@@ -859,7 +776,7 @@ async fn udp_main(
         // failure is "full".
         let Ok(permit) = in_flight.clone().try_acquire_owned() else {
             tracing::debug!(%peer, "dropped: {max_inflight} UDP queries already in flight");
-            shell.metrics.count(&shell.metrics.queries_dropped);
+            ctx.metrics.count(&ctx.metrics.queries_dropped);
             continue;
         };
         let data = buf[..n].to_vec();
@@ -869,7 +786,7 @@ async fn udp_main(
         // A recursion takes seconds and the client is already waiting, so it
         // is worth the drain.
         let busy = busy.clone();
-        let shell = shell.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
             let _busy = busy;
             let _permit = permit;
@@ -879,7 +796,7 @@ async fn udp_main(
                 now,
                 &resolver,
                 &caches,
-                &shell,
+                &ctx,
                 Transport::Udp,
             )
             .await
@@ -891,7 +808,7 @@ async fn udp_main(
                 // recursive resolution sits in between and can take seconds, so
                 // sharing that instant would deny the bucket the refill the wait
                 // earned it.
-                match shell
+                match ctx
                     .responses
                     .admit(peer.ip(), reply.len(), current_unix_timestamp())
                 {
@@ -899,15 +816,15 @@ async fn udp_main(
                         let _ = socket.send_to(&reply, peer).await;
                     }
                     ResponseVerdict::Truncate => {
-                        shell.logger.log_rate_limited(peer.ip());
-                        shell.metrics.count(&shell.metrics.rate_limited);
+                        ctx.logger.log_rate_limited(peer.ip());
+                        ctx.metrics.count(&ctx.metrics.rate_limited);
                         if let Some(short) = truncate_reply(&reply) {
                             let _ = socket.send_to(&short, peer).await;
                         }
                     }
                     ResponseVerdict::Drop => {
-                        shell.logger.log_rate_limited(peer.ip());
-                        shell.metrics.count(&shell.metrics.queries_dropped);
+                        ctx.logger.log_rate_limited(peer.ip());
+                        ctx.metrics.count(&ctx.metrics.queries_dropped);
                     }
                 }
             }
@@ -915,16 +832,17 @@ async fn udp_main(
     }
 }
 
-/// Accept TCP connections, bounded by [`MAX_TCP_CONNECTIONS`].
+/// Accept TCP connections, bounded by [`TransportLimits::max_connections`].
 async fn tcp_main(
     listener: TcpListener,
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
-    shell: Arc<Shell>,
+    ctx: Arc<ServeContext>,
+    limits: TransportLimits,
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
-    let permits = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
     loop {
         // Open connections drain in their own tasks. `accept` is cancel-safe,
         // so a connection lost to this race stays in the kernel backlog.
@@ -935,12 +853,7 @@ async fn tcp_main(
         // The rate limit applies to TCP; the response *budget* does not, since
         // a peer that completed a handshake is not one being reflected at. A
         // flood of connections is still a flood.
-        if !shell
-            .limiter
-            .should_allow(peer.ip(), current_unix_timestamp())
-        {
-            shell.logger.log_rate_limited(peer.ip());
-            shell.metrics.count(&shell.metrics.rate_limited);
+        if !ctx.allow_source(peer.ip(), current_unix_timestamp()) {
             continue;
         }
         // The semaphore is never closed, so acquiring only fails if we drop it.
@@ -951,9 +864,9 @@ async fn tcp_main(
         let caches = caches.clone();
         let stop = stop.clone();
         let busy = busy.clone();
-        let shell = shell.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
-            serve_connection(stream, peer.ip(), resolver, caches, shell, stop).await;
+            serve_connection(stream, peer.ip(), resolver, caches, ctx, limits, stop).await;
             drop(permit);
             drop(busy);
         });
@@ -971,11 +884,12 @@ async fn serve_connection(
     peer: IpAddr,
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
-    shell: Arc<Shell>,
+    ctx: Arc<ServeContext>,
+    limits: TransportLimits,
     stop: Stop,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_INFLIGHT_PER_CONNECTION);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(limits.max_inflight_per_connection);
 
     // One task owns the write half. Answers may complete out of order
     // (RFC 7766 §6.2.1.1; clients match on the transaction id), but two framed
@@ -988,7 +902,7 @@ async fn serve_connection(
         }
     });
 
-    let in_flight = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_CONNECTION));
+    let in_flight = Arc::new(Semaphore::new(limits.max_inflight_per_connection));
 
     loop {
         // Between messages an idle peer is legitimate, so a timeout here is a
@@ -996,7 +910,7 @@ async fn serve_connection(
         // it costs one reconnect and no answer.
         let mut len_buf = [0u8; 2];
         let read = tokio::select! {
-            r = tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut len_buf)) => r,
+            r = tokio::time::timeout(limits.idle_timeout, reader.read_exact(&mut len_buf)) => r,
             _ = stop.wait() => break,
         };
         match read {
@@ -1012,7 +926,7 @@ async fn serve_connection(
         // Mid-message the peer has committed to `len` bytes, so a stall gets a
         // much shorter leash.
         let mut buf = vec![0u8; len];
-        match tokio::time::timeout(TCP_READ_TIMEOUT, reader.read_exact(&mut buf)).await {
+        match tokio::time::timeout(limits.read_timeout, reader.read_exact(&mut buf)).await {
             Ok(Ok(_)) => {}
             _ => break,
         }
@@ -1022,9 +936,7 @@ async fn serve_connection(
         // 512-octet one. This transport had none of it (`TODO.md` #30q). The
         // message is skipped, not the connection: a peer that framed it
         // correctly is still speaking the protocol.
-        let validation = shell.validator.validate_packet(&buf, true);
-        if !validation.is_valid() {
-            shell.metrics.count(&shell.metrics.validation_errors);
+        if !ctx.accept_packet(peer, &buf, Transport::Tcp) {
             continue;
         }
 
@@ -1036,13 +948,13 @@ async fn serve_connection(
         let resolver = resolver.clone();
         let caches = caches.clone();
         let tx = tx.clone();
-        let shell = shell.clone();
+        let ctx = ctx.clone();
         // Per message, not per connection: a connection may carry queries
         // minutes apart (RFC 7766 §6.2.3).
         let now = current_unix_timestamp();
         tokio::spawn(async move {
             if let Some(reply) =
-                handle_query(buf, peer, now, &resolver, &caches, &shell, Transport::Tcp).await
+                handle_query(buf, peer, now, &resolver, &caches, &ctx, Transport::Tcp).await
             {
                 // Prefix and message in one buffer, so the writer emits them
                 // in a single call. A reply too long to frame is dropped rather
@@ -1078,7 +990,7 @@ async fn handle_query(
     now: u64,
     resolver: &Arc<Resolver>,
     caches: &Arc<Caches>,
-    shell: &Shell,
+    ctx: &ServeContext,
     transport: Transport,
 ) -> Option<Vec<u8>> {
     // Refuse a *response*: a reply parsed as a question and answered with
@@ -1088,27 +1000,26 @@ async fn handle_query(
     let msg = match Request::from_bytes(&data) {
         Ok(msg) => msg,
         Err(_) => {
-            shell.logger.count_error(peer);
+            ctx.logger.count_error(peer);
             return None;
         }
     };
     let timer = LatencyTimer::new();
-    shell.metrics.count(&shell.metrics.queries_received);
+    ctx.metrics.count(&ctx.metrics.queries_received);
     // Per source and per type, for the periodic anomaly warnings — the counters
     // `rdnsd` has kept since #9d and this daemon held and never filled
     // (`TODO.md` #30m). `now` is the caller's: on UDP it is the instant the rate
     // limiter already used.
-    shell
-        .logger
+    ctx.logger
         .log_query(peer, msg.queries.first().map(|q| q.qtype), now);
     if let Some(q) = msg.queries.first() {
-        shell.metrics.track_query_type(q.qtype);
+        ctx.metrics.track_query_type(q.qtype);
     }
 
     // NOTIMP is more useful than answering a NOTIFY or an UPDATE with a
     // plausible QUERY-shaped reply the sender will misread (RFC 1035 §4.1.1).
     if msg.opcode != OpCode::Query {
-        shell.record_answer(ResponseCode::NotImplemented, timer);
+        ctx.record_answer(ResponseCode::NotImplemented, timer);
         return unsupported_opcode(&msg);
     }
 
@@ -1129,7 +1040,7 @@ async fn handle_query(
     let client_edns = match rdns::response::client_edns(&msg) {
         Ok(edns) => edns,
         Err(rcode) => {
-            shell.record_answer(rcode, timer);
+            ctx.record_answer(rcode, timer);
             return edns_error(&msg, rcode, client_max);
         }
     };
@@ -1146,7 +1057,7 @@ async fn handle_query(
     // match the request either (`TODO.md` #30r).
     if msg.queries.len() > 1 {
         let resp = build_response(&msg, Vec::new(), ResponseCode::FormatError);
-        return finish(resp, client_edns, &query, client_max, shell, timer);
+        return finish(resp, client_edns, &query, client_max, ctx, timer);
     }
 
     // Names that must not leave this machine (RFC 6761, 6762, 6303). Before
@@ -1165,7 +1076,7 @@ async fn handle_query(
         // DEBUG: one line per query, with the name on it. Logging every query
         // is the operator's decision, not the default's.
         tracing::debug!(qname = %query.qname, why = %local.why, "answered locally");
-        return finish(resp, client_edns, &query, client_max, shell, timer);
+        return finish(resp, client_edns, &query, client_max, ctx, timer);
     }
 
     // Aggressive use of the validated denial cache (RFC 8198). A cached NSEC
@@ -1187,19 +1098,19 @@ async fn handle_query(
             // A wildcard signature verifies at this name unchanged, so the
             // client can check this for itself.
             resp.ad = client_wants_dnssec || msg.ad;
-            return finish(resp, client_edns, &query, client_max, shell, timer);
+            return finish(resp, client_edns, &query, client_max, ctx, timer);
         }
     }
 
     if !checking_disabled {
         if let Some(denial) = caches.denials.synthesize(&query.qname, query.qtype) {
-            shell.metrics.count(&shell.metrics.cache_hits);
+            ctx.metrics.count(&ctx.metrics.cache_hits);
             let mut resp = build_response(&msg, Vec::new(), denial.rcode);
             resp.authorities = denial.authority;
             // The proofs were validated before storage, so what is derived
             // from them is authentic on the same terms.
             resp.ad = client_wants_dnssec || msg.ad;
-            return finish(resp, client_edns, &query, client_max, shell, timer);
+            return finish(resp, client_edns, &query, client_max, ctx, timer);
         }
     }
 
@@ -1207,25 +1118,25 @@ async fn handle_query(
     // there are no records to key on. Nothing is synthesized — this is the
     // answer this question got — so a CD client may have it too.
     if let Some(negative) = caches.negatives.get(&query.qname, query.qtype) {
-        shell.metrics.count(&shell.metrics.cache_hits);
+        ctx.metrics.count(&ctx.metrics.cache_hits);
         let mut resp = build_response(&msg, Vec::new(), negative.rcode);
         resp.authorities = negative.authority;
         resp.ad = negative.secure && (client_wants_dnssec || msg.ad);
-        return finish(resp, client_edns, &query, client_max, shell, timer);
+        return finish(resp, client_edns, &query, client_max, ctx, timer);
     }
 
     // Build the response: from cache if we have it, else by resolving.
     let (mut resp, secure) = if let Some((records, secure)) =
         caches.answers.get_validated(&query.qname, query.qtype)
     {
-        shell.metrics.count(&shell.metrics.cache_hits);
+        ctx.metrics.count(&ctx.metrics.cache_hits);
         (build_response(&msg, records, ResponseCode::Ok), secure)
     } else {
         // Everything above answered from something held; from here the
         // query costs a recursion. This is the line a cache hit rate is
         // drawn on.
-        shell.metrics.count(&shell.metrics.cache_misses);
-        shell.metrics.count(&shell.metrics.queries_recursive);
+        ctx.metrics.count(&ctx.metrics.cache_misses);
+        ctx.metrics.count(&ctx.metrics.queries_recursive);
         // Async: each upstream round trip is an await, so this yields the
         // task rather than holding a thread.
         match resolver.resolve_validated(&query).await {
@@ -1252,7 +1163,7 @@ async fn handle_query(
                     // data unfiltered.
                     if !checking_disabled {
                         let resp = build_response(&msg, Vec::new(), ResponseCode::ServerFailure);
-                        return finish(resp, client_edns, &query, client_max, shell, timer);
+                        return finish(resp, client_edns, &query, client_max, ctx, timer);
                     }
                 }
 
@@ -1314,7 +1225,7 @@ async fn handle_query(
     resp.ad = secure && (client_wants_dnssec || msg.ad);
     resp.cd = checking_disabled;
 
-    finish(resp, client_edns, &query, client_max, shell, timer)
+    finish(resp, client_edns, &query, client_max, ctx, timer)
 }
 
 /// Final shaping common to every reply: OPT mirroring, stripping DNSSEC records
@@ -1324,12 +1235,12 @@ fn finish(
     client_edns: ClientEdns,
     query: &QuerySection,
     client_max: usize,
-    shell: &Shell,
+    ctx: &ServeContext,
     timer: LatencyTimer,
 ) -> Option<Vec<u8>> {
     // Here because this is where every ordinary answer leaves, whatever
     // produced it: cache, denial cache, negative cache or a full recursion.
-    shell.record_answer(resp.rcode, timer);
+    ctx.record_answer(resp.rcode, timer);
     // No DO, no DNSSEC records (RFC 4035 §3.2.1). Records asked for by type
     // are a different matter and stay.
     if !client_edns.do_bit() {
@@ -1427,14 +1338,14 @@ mod tests {
 
         // One per second, burst of one: the second datagram in a burst is over
         // the limit whatever the clock does.
-        let shell = Arc::new(Shell {
+        let ctx = Arc::new(ServeContext {
             limiter: Arc::new(RateLimiter::new(RateLimitConfig::per_second(1, 1))),
             responses: Arc::new(ResponseLimiter::disabled()),
             metrics: Arc::new(DnsMetrics::new()),
             logger: Arc::new(QueryLogger::new()),
             validator: Arc::new(AdmissionCheck::with_defaults()),
         });
-        let metrics = shell.metrics.clone();
+        let metrics = ctx.metrics.clone();
 
         let shutdown = Shutdown::new();
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
@@ -1443,7 +1354,7 @@ mod tests {
             socket,
             resolver,
             caches,
-            shell,
+            ctx,
             16,
             shutdown.stop_handle(),
             shutdown.busy(),
@@ -1530,10 +1441,10 @@ mod tests {
     /// Whose queries these are, where the test does not care.
     const TEST_PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
 
-    /// A shell with every limit off, so a test measures the thing it names and
+    /// A ctx with every limit off, so a test measures the thing it names and
     /// not the rate limiter.
-    fn test_shell() -> Arc<Shell> {
-        Arc::new(Shell {
+    fn test_shell() -> Arc<ServeContext> {
+        Arc::new(ServeContext {
             limiter: Arc::new(RateLimiter::new(RateLimitConfig::per_second(0, 0))),
             responses: Arc::new(ResponseLimiter::disabled()),
             metrics: Arc::new(DnsMetrics::new()),
@@ -1678,8 +1589,8 @@ mod tests {
     #[tokio::test]
     async fn a_tcp_message_over_the_admission_caps_is_dropped_and_the_connection_kept() {
         let (resolver, caches) = context();
-        let shell = test_shell();
-        let metrics = shell.metrics.clone();
+        let ctx = test_shell();
+        let metrics = ctx.metrics.clone();
 
         let shutdown = Shutdown::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1688,7 +1599,8 @@ mod tests {
             listener,
             resolver,
             caches,
-            shell,
+            ctx,
+            TransportLimits::default(),
             shutdown.stop_handle(),
             shutdown.busy(),
         ));
@@ -1814,7 +1726,7 @@ mod tests {
     #[tokio::test]
     async fn a_query_is_counted_against_the_source_that_sent_it() {
         let (resolver, caches) = context();
-        let shell = test_shell();
+        let ctx = test_shell();
         let now = current_unix_timestamp();
 
         for _ in 0..3 {
@@ -1824,7 +1736,7 @@ mod tests {
                 now,
                 &resolver,
                 &caches,
-                &shell,
+                &ctx,
                 Transport::Udp,
             )
             .await
@@ -1838,13 +1750,13 @@ mod tests {
             now,
             &resolver,
             &caches,
-            &shell,
+            &ctx,
             Transport::Udp,
         )
         .await
         .is_none());
 
-        let stats = shell.logger.take_stats(now + 60);
+        let stats = ctx.logger.take_stats(now + 60);
         assert_eq!(stats.total_queries, 3);
         assert_eq!(stats.queries_by_ip.get(&TEST_PEER), Some(&3));
         assert_eq!(stats.total_errors, 1);
