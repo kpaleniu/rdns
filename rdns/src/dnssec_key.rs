@@ -607,13 +607,9 @@ fn base64_decode(text: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::dnssec::{verify, verify_rrset, RrsetProof};
+    use crate::test_records::a_rdata;
     use crate::utils::record_types as rt;
     use crate::Class;
-    use crate::{ParsedRecord, RecordData};
-
-    fn a_record(addr: &str) -> RecordData {
-        RecordData::from_parsed(&ParsedRecord::A(addr.parse().unwrap())).unwrap()
-    }
 
     #[test]
     fn a_generated_key_signs_something_the_validator_accepts() {
@@ -623,7 +619,7 @@ mod tests {
             SigningAlgorithm::Ed25519,
         ] {
             let key = SigningKey::generate(algorithm, "example.com.", DNSKEY_FLAG_ZONE).unwrap();
-            let rdatas = vec![a_record("192.0.2.1")];
+            let rdatas = vec![a_rdata([192, 0, 2, 1])];
             let rrset = Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas);
             let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
 
@@ -650,7 +646,7 @@ mod tests {
             DNSKEY_FLAG_ZONE,
         )
         .unwrap();
-        let rdatas = vec![a_record("192.0.2.1")];
+        let rdatas = vec![a_rdata([192, 0, 2, 1])];
         let rrset = Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas);
         let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
 
@@ -674,7 +670,7 @@ mod tests {
             DNSKEY_FLAG_ZONE,
         )
         .unwrap();
-        let rdatas = vec![a_record("192.0.2.1")];
+        let rdatas = vec![a_rdata([192, 0, 2, 1])];
         let rrset = Rrset::new("*.example.com.", rt::A, Class::new(1), &rdatas);
         let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
         assert_eq!(sig.labels, 2);
@@ -718,7 +714,7 @@ mod tests {
 
         // The same *private* key, not one that merely describes itself the
         // same: a signature from the loaded copy verifies under the original.
-        let rdatas = vec![a_record("192.0.2.1")];
+        let rdatas = vec![a_rdata([192, 0, 2, 1])];
         let rrset = Rrset::new("example.com.", rt::A, Class::new(1), &rdatas);
         let sig = back.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
         assert!(matches!(

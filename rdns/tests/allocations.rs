@@ -23,10 +23,7 @@ use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::utils::{current_unix_timestamp, record_types};
 use rdns::zone::{parse_zone_file, NameKind};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
-use rdns::{
-    DnsMessage, Edns, EdnsOption, OpCode, Qtype, QueryClass, QuerySection, ResourceRecord,
-    ResponseCode,
-};
+use rdns::{DnsMessage, DnsMessageBuilder, Edns, EdnsOption, Qtype, ResourceRecord};
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
@@ -231,27 +228,11 @@ fn query_bytes_with_edns(qname: &str, qtype: Qtype) -> Vec<u8> {
 }
 
 fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
-    DnsMessage {
-        id: 0x1234,
-        response: false,
-        opcode: OpCode::Query,
-        authoritive: false,
-        truncation: false,
-        recursion: false,
-        recursion_ok: false,
-        ad: false,
-        cd: false,
-        rcode: ResponseCode::Ok,
-        queries: vec![QuerySection {
-            qname: qname.to_string(),
-            qtype,
-            qclass: QueryClass::IN,
-        }],
-        answers: Vec::new(),
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-        edns: None,
-    }
+    DnsMessageBuilder::new()
+        .with_id(0x1234)
+        .with_query(qname, qtype)
+        .with_recursion(false)
+        .build()
 }
 
 /// One UDP query end to end, split into parse, look up and serialize so the

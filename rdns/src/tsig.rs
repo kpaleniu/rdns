@@ -1013,7 +1013,7 @@ pub fn now() -> u64 {
 mod tests {
     use super::*;
     use crate::utils::record_types as rt;
-    use crate::{DnsMessage, OpCode, Qtype, QueryClass, QuerySection, ResponseCode, Rtype};
+    use crate::{DnsMessage, DnsMessageBuilder, Qtype, Rtype};
 
     fn test_key() -> TsigKey {
         // 32 bytes, the natural length for HMAC-SHA256.
@@ -1021,27 +1021,11 @@ mod tests {
     }
 
     fn query_bytes(qname: &str, qtype: Qtype) -> Vec<u8> {
-        let msg = DnsMessage {
-            id: 0x4d2,
-            response: false,
-            opcode: OpCode::Query,
-            authoritive: false,
-            truncation: false,
-            recursion: false,
-            recursion_ok: false,
-            ad: false,
-            cd: false,
-            rcode: ResponseCode::Ok,
-            queries: vec![QuerySection {
-                qname: qname.to_string(),
-                qtype,
-                qclass: QueryClass::IN,
-            }],
-            answers: Vec::new(),
-            authorities: Vec::new(),
-            additionals: Vec::new(),
-            edns: None,
-        };
+        let msg = DnsMessageBuilder::new()
+            .with_id(0x4d2)
+            .with_query(qname, qtype)
+            .with_recursion(false)
+            .build();
         let mut buf = vec![0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("serialize");
         buf.truncate(n);

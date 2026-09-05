@@ -439,7 +439,7 @@ mod tests {
     use super::*;
     use crate::utils::record_types;
     use crate::ResourceRecord;
-    use crate::{ParsedRecord, Qtype, QueryClass, Rtype};
+    use crate::{DnsMessageBuilder, ParsedRecord, Qtype, Rtype};
 
     /// Both daemons ask this one function what a request's OPT says, so it owes
     /// both of them the same four answers (`TODO.md` #30h).
@@ -491,31 +491,13 @@ mod tests {
     }
 
     fn request(qname: &str, edns: bool) -> DnsMessage {
-        let mut msg = DnsMessage {
-            id: 0x1234,
-            response: false,
-            opcode: OpCode::Query,
-            authoritive: false,
-            truncation: false,
-            recursion: true,
-            recursion_ok: false,
-            ad: false,
-            cd: false,
-            rcode: ResponseCode::Ok,
-            queries: vec![QuerySection {
-                qname: qname.to_string(),
-                qtype: Qtype::of(record_types::A),
-                qclass: QueryClass::IN,
-            }],
-            answers: Vec::new(),
-            authorities: Vec::new(),
-            additionals: Vec::new(),
-            edns: None,
-        };
+        let mut builder = DnsMessageBuilder::new()
+            .with_id(0x1234)
+            .with_query(qname, Qtype::of(record_types::A));
         if edns {
-            msg.set_edns(Edns::with_payload_size(4096));
+            builder = builder.with_edns(4096, false);
         }
-        msg
+        builder.build()
     }
 
     fn a_record(address: [u8; 4]) -> RecordData {

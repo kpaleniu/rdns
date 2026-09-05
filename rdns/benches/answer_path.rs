@@ -29,10 +29,7 @@ use rdns::utils::{current_unix_timestamp, record_types};
 use rdns::validation::AdmissionCheck;
 use rdns::zone::{parse_zone_file, Zone, ZoneRecord};
 use rdns::zone_signer::{sign_zone, SigningPolicy};
-use rdns::{
-    DnsMessage, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, RecordData, ResourceRecord,
-    ResponseCode,
-};
+use rdns::{DnsMessage, DnsMessageBuilder, ParsedRecord, Qtype, RecordData, ResourceRecord};
 
 const ZONE: &str = "$ORIGIN example.com.
 $TTL 3600
@@ -46,27 +43,11 @@ mx   IN A   192.0.2.20
 ";
 
 fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
-    DnsMessage {
-        id: 0x1234,
-        response: false,
-        opcode: OpCode::Query,
-        authoritive: false,
-        truncation: false,
-        recursion: false,
-        recursion_ok: false,
-        ad: false,
-        cd: false,
-        rcode: ResponseCode::Ok,
-        queries: vec![QuerySection {
-            qname: qname.to_string(),
-            qtype,
-            qclass: QueryClass::IN,
-        }],
-        answers: Vec::new(),
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-        edns: None,
-    }
+    DnsMessageBuilder::new()
+        .with_id(0x1234)
+        .with_query(qname, qtype)
+        .with_recursion(false)
+        .build()
 }
 
 fn owned(zone: &Zone, name: &str, qtype: Qtype) -> Vec<ResourceRecord> {

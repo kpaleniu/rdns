@@ -22,8 +22,7 @@ use rdns::validation::AdmissionCheck;
 use rdns::zone::{parse_zone_file, NameKind, Zone};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
 use rdns::{
-    dnssec_answer, tsig, DnsMessage, Edns, EdnsOption, OpCode, Qtype, QueryClass, QuerySection,
-    ResourceRecord, ResponseCode,
+    dnssec_answer, tsig, DnsMessage, DnsMessageBuilder, Edns, EdnsOption, Qtype, ResourceRecord,
 };
 
 /// Cases per corpus entry. Small enough to stay under a second in CI.
@@ -72,27 +71,11 @@ fn zone_text() -> String {
 }
 
 fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
-    DnsMessage {
-        id: 0x1234,
-        response: false,
-        opcode: OpCode::Query,
-        authoritive: false,
-        truncation: false,
-        recursion: false,
-        recursion_ok: false,
-        ad: false,
-        cd: false,
-        rcode: ResponseCode::Ok,
-        queries: vec![QuerySection {
-            qname: qname.to_string(),
-            qtype,
-            qclass: QueryClass::IN,
-        }],
-        answers: Vec::new(),
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-        edns: None,
-    }
+    DnsMessageBuilder::new()
+        .with_id(0x1234)
+        .with_query(qname, qtype)
+        .with_recursion(false)
+        .build()
 }
 
 /// Valid messages to mutate, covering the shapes whose parsers have length

@@ -42,6 +42,9 @@ pub mod secondary;
 pub mod security;
 pub mod shutdown;
 pub mod special_names;
+/// Plain record fixtures, for tests only.
+#[cfg(test)]
+mod test_records;
 pub mod transfer;
 pub mod tsig;
 pub mod update;

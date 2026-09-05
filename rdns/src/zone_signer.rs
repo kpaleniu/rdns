@@ -973,6 +973,7 @@ mod tests {
         proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
     };
     use crate::dnssec_key::{SigningAlgorithm, SigningKey};
+    use crate::dnssec_test_util::{signing_keys, signing_policy};
     use crate::zone::parse_zone_file;
     use crate::ResourceRecord;
 
@@ -1003,26 +1004,13 @@ plain   IN NS  ns.plain.example.com.
 ns.plain IN A  192.0.2.40
 "#;
 
-    fn keys() -> Vec<SigningKey> {
-        vec![
-            SigningKey::generate(
-                SigningAlgorithm::EcdsaP256Sha256,
-                ORIGIN,
-                DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
-            )
-            .unwrap(),
-            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
-                .unwrap(),
-        ]
-    }
-
     fn policy(chain: DenialChain) -> SigningPolicy {
-        SigningPolicy::valid_for(NOW, 30 * 86_400).with_chain(chain)
+        signing_policy(NOW, chain)
     }
 
     fn sign_test_zone(chain: DenialChain) -> Zone {
         let zone = parse_zone_file(ZONE, ORIGIN).expect("the test zone parses");
-        sign_zone(&zone, &keys(), &policy(chain)).expect("signing succeeds")
+        sign_zone(&zone, &signing_keys(ORIGIN), &policy(chain)).expect("signing succeeds")
     }
 
     /// One expiration for the whole zone means every validating resolver
@@ -1086,7 +1074,7 @@ ns.plain IN A  192.0.2.40
             policy.expiration
         );
         let zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
-        let signed = sign_zone(&zone, &keys(), &policy).expect("signs");
+        let signed = sign_zone(&zone, &signing_keys(ORIGIN), &policy).expect("signs");
         for sig in rrsigs_in(&resources(&signed)) {
             assert!(sig.expiration > sig.inception);
         }
@@ -1101,7 +1089,8 @@ ns.plain IN A  192.0.2.40
         let file_serial = unsigned.serial().expect("the file has a serial");
         assert_eq!(file_serial, Serial::new(2024051300));
 
-        let first = sign_zone(&unsigned, &keys(), &policy(DenialChain::Nsec)).expect("signs");
+        let first =
+            sign_zone(&unsigned, &signing_keys(ORIGIN), &policy(DenialChain::Nsec)).expect("signs");
         let first_serial = first.serial().expect("still has one");
         assert_ne!(
             first_serial, file_serial,
@@ -1111,7 +1100,7 @@ ns.plain IN A  192.0.2.40
         // Later gives a higher serial, so a secondary transfers; the same moment
         // gives the same one, so a restart is not a change.
         let later = SigningPolicy::valid_for(NOW + 7 * 86_400, 30 * 86_400);
-        let later_serial = sign_zone(&unsigned, &keys(), &later)
+        let later_serial = sign_zone(&unsigned, &signing_keys(ORIGIN), &later)
             .expect("signs")
             .serial()
             .expect("has a serial");
@@ -1119,7 +1108,7 @@ ns.plain IN A  192.0.2.40
             later_serial.is_newer_than(first_serial),
             "{later_serial} must be newer than {first_serial} by RFC 1982"
         );
-        let again = sign_zone(&unsigned, &keys(), &policy(DenialChain::Nsec))
+        let again = sign_zone(&unsigned, &signing_keys(ORIGIN), &policy(DenialChain::Nsec))
             .expect("signs")
             .serial()
             .expect("has a serial");
@@ -1593,7 +1582,7 @@ ns.plain IN A  192.0.2.40
 
     #[test]
     fn the_ksk_signs_the_keys_and_the_zsk_signs_the_data() {
-        let keys = keys();
+        let keys = signing_keys(ORIGIN);
         let ksk = keys[0].key_tag();
         let zsk = keys[1].key_tag();
         let zone = sign_zone(
@@ -1655,7 +1644,7 @@ ns.plain IN A  192.0.2.40
     fn re_signing_after_an_update_currently_rewrites_every_signature() {
         use crate::ixfr::diff;
 
-        let keys = keys();
+        let keys = signing_keys(ORIGIN);
         let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
         let before = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).unwrap();
 
@@ -1743,7 +1732,7 @@ ns.plain IN A  192.0.2.40
     /// same code that judges a real zone.
     #[test]
     fn an_incrementally_signed_zone_still_verifies() {
-        let keys = keys();
+        let keys = signing_keys(ORIGIN);
         let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
         let before = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).unwrap();
 
@@ -1785,7 +1774,7 @@ ns.plain IN A  192.0.2.40
     /// three ways it could are each refused.
     #[test]
     fn a_signature_is_not_carried_forward_when_anything_it_covers_changed() {
-        let keys = keys();
+        let keys = signing_keys(ORIGIN);
         let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
         let before = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).unwrap();
         let later = SigningPolicy::valid_for(NOW + 60, 30 * 86_400).with_chain(DenialChain::Nsec);
@@ -1862,7 +1851,7 @@ ns.plain IN A  192.0.2.40
     fn re_signing_replaces_the_previous_run_rather_than_stacking_on_it() {
         // The same keys both times. Signing again with *different* keys keeps
         // the old DNSKEYs on purpose — that is a rollover, not a mistake.
-        let keys = keys();
+        let keys = signing_keys(ORIGIN);
         let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
         let once = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).unwrap();
         let twice = sign_zone(&once, &keys, &policy(DenialChain::Nsec)).unwrap();
@@ -1909,7 +1898,7 @@ ns.plain IN A  192.0.2.40
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.1".parse().unwrap())).unwrap(),
         });
-        let err = sign_zone(&zone, &keys(), &policy(DenialChain::Nsec)).unwrap_err();
+        let err = sign_zone(&zone, &signing_keys(ORIGIN), &policy(DenialChain::Nsec)).unwrap_err();
         assert!(err.to_string().contains("SOA"), "{err}");
     }
 
@@ -1926,7 +1915,7 @@ ns.plain IN A  192.0.2.40
                     www 300 IN A 192.0.2.11\n";
         let zone = sign_zone(
             &parse_zone_file(text, ORIGIN).unwrap(),
-            &keys(),
+            &signing_keys(ORIGIN),
             &policy(DenialChain::Nsec),
         )
         .unwrap();
@@ -1950,7 +1939,7 @@ ns.plain IN A  192.0.2.40
         // The one output that leaves this zone entirely. If it does not digest
         // the DNSKEY as published, the delegation is insecure at best and
         // bogus at worst.
-        let keys = keys();
+        let keys = signing_keys(ORIGIN);
         let zone = sign_zone(
             &parse_zone_file(ZONE, ORIGIN).unwrap(),
             &keys,
@@ -1969,7 +1958,7 @@ ns.plain IN A  192.0.2.40
     fn nsec3_iterations_above_the_cap_are_refused_at_signing_time() {
         let err = sign_zone(
             &parse_zone_file(ZONE, ORIGIN).unwrap(),
-            &keys(),
+            &signing_keys(ORIGIN),
             &policy(DenialChain::Nsec3 {
                 salt: Vec::new(),
                 iterations: MAX_NSEC3_ITERATIONS + 1,

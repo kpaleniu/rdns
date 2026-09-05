@@ -193,30 +193,14 @@ pub(crate) fn transfer_message(request: &DnsMessage, answers: Vec<ResourceRecord
 mod tests {
     use super::*;
     use crate::zone::parse_zone_file;
-    use crate::{OpCode, QueryClass, QuerySection, ResponseCode};
+    use crate::{DnsMessageBuilder, ResponseCode};
 
     fn request_for(qname: &str) -> DnsMessage {
-        DnsMessage {
-            id: 0x1234,
-            response: false,
-            opcode: OpCode::Query,
-            authoritive: false,
-            truncation: false,
-            recursion: false,
-            recursion_ok: false,
-            ad: false,
-            cd: false,
-            rcode: ResponseCode::Ok,
-            queries: vec![QuerySection {
-                qname: qname.to_string(),
-                qtype: Qtype::of(rt::AXFR),
-                qclass: QueryClass::IN,
-            }],
-            answers: Vec::new(),
-            authorities: Vec::new(),
-            additionals: Vec::new(),
-            edns: None,
-        }
+        DnsMessageBuilder::new()
+            .with_id(0x1234)
+            .with_query(qname, Qtype::of(rt::AXFR))
+            .with_recursion(false)
+            .build()
     }
 
     fn small_zone() -> Zone {

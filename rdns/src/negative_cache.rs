@@ -265,27 +265,8 @@ fn make_room(entries: &mut Entries, max_entries: usize, now: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Class;
-    use crate::Serial;
-    use crate::{OpCode, QueryClass, QuerySection, RecordData};
-
-    fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
-        ResourceRecord {
-            name: zone.to_string(),
-            class: Class::new(1),
-            ttl,
-            rdata: RecordData::from_parsed(&ParsedRecord::SOA {
-                mname: format!("ns1.{zone}"),
-                rname: format!("admin.{zone}"),
-                serial: Serial::new(1),
-                refresh: 10800,
-                retry: 3600,
-                expire: 604800,
-                minimum,
-            })
-            .unwrap(),
-        }
-    }
+    use crate::test_records::soa_record;
+    use crate::{Class, OpCode, QueryClass, QuerySection, RecordData};
 
     /// A negative response as a server would send it.
     fn negative(qname: &str, rcode: ResponseCode, authority: Vec<ResourceRecord>) -> DnsMessage {

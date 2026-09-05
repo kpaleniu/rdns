@@ -6,7 +6,7 @@
 
 use rdns::compression::NameCompressor;
 use rdns::metrics::DnsMetrics;
-use rdns::{DnsMessage, OpCode, Qtype, QueryClass, QuerySection, ResponseCode};
+use rdns::{DnsMessage, DnsMessageBuilder, Qtype};
 
 use crate::answer::write_response;
 use crate::zones::Zones;
@@ -40,29 +40,10 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
 /// for DO would look neater and would stop every caller from exercising
 /// `make_response`'s OPT mirroring (RFC 6891 §6.1.1).
 pub(crate) fn query(qname: &str, qtype: Qtype, dnssec_ok: bool) -> DnsMessage {
-    let mut msg = DnsMessage {
-        id: 1,
-        response: false,
-        opcode: OpCode::Query,
-        authoritive: false,
-        truncation: false,
-        recursion: false,
-        recursion_ok: false,
-        ad: false,
-        cd: false,
-        rcode: ResponseCode::Ok,
-        queries: vec![QuerySection {
-            qname: qname.to_string(),
-            qtype,
-            qclass: QueryClass::IN,
-        }],
-        answers: Vec::new(),
-        authorities: Vec::new(),
-        additionals: Vec::new(),
-        edns: None,
-    };
-    let mut edns = rdns::Edns::with_payload_size(4096);
-    edns.do_bit = dnssec_ok;
-    msg.set_edns(edns);
-    msg
+    DnsMessageBuilder::new()
+        .with_id(1)
+        .with_query(qname, qtype)
+        .with_recursion(false)
+        .with_edns(4096, dnssec_ok)
+        .build()
 }

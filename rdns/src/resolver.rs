@@ -1590,6 +1590,7 @@ fn randomize_case(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_records::a_record;
     use crate::Class;
     use crate::Serial;
     use crate::Ttl;
@@ -1650,15 +1651,6 @@ mod tests {
             authorities: Vec::new(),
             additionals: Vec::new(),
             edns: None,
-        }
-    }
-
-    fn a_record(name: &str, addr: [u8; 4]) -> ResourceRecord {
-        ResourceRecord {
-            name: name.to_string(),
-            class: Class::new(1),
-            ttl: Ttl::from_secs(300),
-            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::from(addr))).unwrap(),
         }
     }
 

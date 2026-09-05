@@ -969,67 +969,12 @@ fn zone_expiry(zone: &ZoneProofs) -> u64 {
 mod tests {
     use super::*;
     use crate::denial_wire::build_type_bitmap;
-    use crate::dnssec_denial::{nsec3_hash, nsec3_owner_name};
+    use crate::dnssec_denial::nsec3_hash;
+    use crate::test_records::{
+        nsec3_record, nsec3_span, nsec_record, soa_record, NSEC3_ITERATIONS, NSEC3_SALT,
+    };
     use crate::Class;
-    use crate::Serial;
     use crate::{OpCode, QueryClass, QuerySection, RecordData};
-
-    fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
-        ResourceRecord {
-            name: zone.to_string(),
-            class: Class::new(1),
-            ttl,
-            rdata: RecordData::from_parsed(&ParsedRecord::SOA {
-                mname: format!("ns1.{zone}"),
-                rname: format!("admin.{zone}"),
-                serial: Serial::new(1),
-                refresh: 10800,
-                retry: 3600,
-                expire: 604800,
-                minimum,
-            })
-            .unwrap(),
-        }
-    }
-
-    fn nsec_record(owner: &str, next: &str, types: &[Rtype], ttl: Ttl) -> ResourceRecord {
-        ResourceRecord {
-            name: owner.to_string(),
-            class: Class::new(1),
-            ttl,
-            rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
-                next_domain_name: next.to_string(),
-                type_bitmap: build_type_bitmap(types),
-            })
-            .unwrap(),
-        }
-    }
-
-    fn nsec3_record(
-        zone: &str,
-        name: &str,
-        next: &[u8],
-        flags: u8,
-        types: &[Rtype],
-        ttl: Ttl,
-    ) -> ResourceRecord {
-        let salt = vec![0xaa, 0xbb];
-        let hash = nsec3_hash(name, &salt, 3).unwrap();
-        ResourceRecord {
-            name: nsec3_owner_name(&hash, zone),
-            class: Class::new(1),
-            ttl,
-            rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
-                hash_algorithm: 1,
-                flags,
-                iterations: 3,
-                salt,
-                next_hashed_owner: next.to_vec(),
-                type_bitmap: build_type_bitmap(types),
-            })
-            .unwrap(),
-        }
-    }
 
     /// A negative response as a zone would send it.
     fn negative(qname: &str, rcode: ResponseCode, authority: Vec<ResourceRecord>) -> DnsMessage {
@@ -1085,11 +1030,15 @@ mod tests {
     /// The worst case for a scan, and what a flood of random names produces —
     /// the cache fills with real proofs about names nobody asks for twice.
     fn cache_of_n_nsec3s(n: usize) -> NsecCache {
-        let salt = vec![0xaa, 0xbb];
         let mut authority = vec![soa_record("example.com.", 3600, Ttl::from_secs(3600))];
         let mut i = 0;
         while authority.len() <= n {
-            let hash = nsec3_hash(&format!("fill{i}.example.com."), &salt, 3).unwrap();
+            let hash = nsec3_hash(
+                &format!("fill{i}.example.com."),
+                &NSEC3_SALT,
+                NSEC3_ITERATIONS,
+            )
+            .unwrap();
             i += 1;
             // The span runs from the owner to the same hash with its last octet
             // at 0xff, so it wraps around nothing and contains nothing. A hash
@@ -1100,20 +1049,13 @@ mod tests {
             }
             let mut next = hash.clone();
             *next.last_mut().unwrap() = 0xff;
-            authority.push(ResourceRecord {
-                name: nsec3_owner_name(&hash, "example.com."),
-                class: Class::new(1),
-                ttl: Ttl::from_secs(3600),
-                rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
-                    hash_algorithm: 1,
-                    flags: 0,
-                    iterations: 3,
-                    salt: salt.clone(),
-                    next_hashed_owner: next,
-                    type_bitmap: build_type_bitmap(&[rt::A]),
-                })
-                .unwrap(),
-            });
+            authority.push(nsec3_span(
+                "example.com.",
+                &hash,
+                &next,
+                &[rt::A],
+                Ttl::from_secs(3600),
+            ));
         }
         let cache = NsecCache::new(4);
         cache.insert_validated(&negative(
@@ -1521,30 +1463,10 @@ mod tests {
             .is_none());
     }
 
-    /// An NSEC3 with the owner and next hashes given outright. The cache reads
-    /// the owner hash out of the first label, so a chain can be laid out by hand
-    /// rather than by finding names that hash where they are wanted.
-    fn nsec3_span(owner: &[u8], next: &[u8], types: &[Rtype]) -> ResourceRecord {
-        ResourceRecord {
-            name: nsec3_owner_name(owner, "example.com."),
-            class: Class::new(1),
-            ttl: Ttl::from_secs(3600),
-            rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
-                hash_algorithm: 1,
-                flags: 0,
-                iterations: 3,
-                salt: vec![0xaa, 0xbb],
-                next_hashed_owner: next.to_vec(),
-                type_bitmap: build_type_bitmap(types),
-            })
-            .unwrap(),
-        }
-    }
-
     /// A span containing `name`'s hash and, for these purposes, nothing else:
     /// the same hash with its last octet at 0x00 and at 0xff.
     fn span_around(name: &str) -> (Vec<u8>, Vec<u8>) {
-        let hash = nsec3_hash(name, &[0xaa, 0xbb], 3).unwrap();
+        let hash = nsec3_hash(name, &NSEC3_SALT, NSEC3_ITERATIONS).unwrap();
         let last = *hash.last().unwrap();
         assert!(
             last != 0x00 && last != 0xff,
@@ -1574,9 +1496,27 @@ mod tests {
             ResponseCode::NoSuchDomain,
             vec![
                 soa_record("example.com.", 3600, Ttl::from_secs(3600)),
-                nsec3_span(&apex, &apex_next, &[rt::SOA, rt::NS, rt::DNSKEY]),
-                nsec3_span(&nope_owner, &nope_next, &[rt::A]),
-                nsec3_span(&star_owner, &star_next, &[rt::A]),
+                nsec3_span(
+                    "example.com.",
+                    &apex,
+                    &apex_next,
+                    &[rt::SOA, rt::NS, rt::DNSKEY],
+                    Ttl::from_secs(3600),
+                ),
+                nsec3_span(
+                    "example.com.",
+                    &nope_owner,
+                    &nope_next,
+                    &[rt::A],
+                    Ttl::from_secs(3600),
+                ),
+                nsec3_span(
+                    "example.com.",
+                    &star_owner,
+                    &star_next,
+                    &[rt::A],
+                    Ttl::from_secs(3600),
+                ),
             ],
         ));
         cache
@@ -1627,8 +1567,20 @@ mod tests {
             ResponseCode::NoSuchDomain,
             vec![
                 soa_record("example.com.", 3600, Ttl::from_secs(3600)),
-                nsec3_span(&apex, &apex_next, &[rt::SOA, rt::NS, rt::DNSKEY]),
-                nsec3_span(&nope_owner, &nope_next, &[rt::A]),
+                nsec3_span(
+                    "example.com.",
+                    &apex,
+                    &apex_next,
+                    &[rt::SOA, rt::NS, rt::DNSKEY],
+                    Ttl::from_secs(3600),
+                ),
+                nsec3_span(
+                    "example.com.",
+                    &nope_owner,
+                    &nope_next,
+                    &[rt::A],
+                    Ttl::from_secs(3600),
+                ),
             ],
         ));
         assert!(cache

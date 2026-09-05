@@ -533,16 +533,14 @@ fn to_resource(record: &ZoneRecord) -> crate::ResourceRecord {
 mod tests {
     use super::*;
     use crate::compression::NameCompressor;
-    use crate::dnssec::{
-        dnskeys_in, verify_rrset, Dnskey, Rrset, RrsetProof, DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE,
-    };
+    use crate::dnssec::{dnskeys_in, verify_rrset, Dnskey, Rrset, RrsetProof};
     use crate::dnssec_denial::{
         nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, proves_wildcard_expansion, Denial,
         WildcardVerdict,
     };
-    use crate::dnssec_key::{SigningAlgorithm, SigningKey};
+    use crate::dnssec_test_util::{signing_keys, signing_policy};
     use crate::zone::parse_zone_file;
-    use crate::zone_signer::{sign_zone, DenialChain, SigningPolicy};
+    use crate::zone_signer::{sign_zone, DenialChain};
     use crate::Class;
     use crate::DnsMessageBuilder;
     use crate::RecordData;
@@ -607,23 +605,8 @@ deep.a.b IN TXT "down here"
 "#;
 
     fn signed(chain: DenialChain) -> Zone {
-        let keys = vec![
-            SigningKey::generate(
-                SigningAlgorithm::EcdsaP256Sha256,
-                ORIGIN,
-                DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
-            )
-            .unwrap(),
-            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
-                .unwrap(),
-        ];
         let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
-        sign_zone(
-            &zone,
-            &keys,
-            &SigningPolicy::valid_for(NOW, 30 * 86_400).with_chain(chain),
-        )
-        .unwrap()
+        sign_zone(&zone, &signing_keys(ORIGIN), &signing_policy(NOW, chain)).unwrap()
     }
 
     fn keys_of(zone: &Zone) -> Vec<Dnskey> {

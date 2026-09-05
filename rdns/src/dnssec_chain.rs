@@ -853,20 +853,10 @@ mod tests {
     use crate::denial_wire::build_type_bitmap;
     use crate::dnssec::ds_digest;
     use crate::dnssec_test_util::{ds_record, TestZone};
+    use crate::test_records::{a_record, nsec_record};
     use crate::utils::current_unix_timestamp;
     use crate::Ttl;
     use crate::{ParsedRecord, ResourceRecord};
-    use std::net::Ipv4Addr;
-
-    fn a_record(name: &str, last: u8) -> ResourceRecord {
-        ResourceRecord {
-            name: name.to_string(),
-            class: Class::new(1),
-            ttl: Ttl::from_secs(300),
-            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, last)))
-                .unwrap(),
-        }
-    }
 
     #[test]
     fn test_builtin_root_anchor_parses() {
@@ -1140,7 +1130,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let answer = a_record("www.example.test.", 1);
+        let answer = a_record("www.example.test.", [192, 0, 2, 1]);
         let sig = zone.sign_records(std::slice::from_ref(&answer));
 
         let mut keys = KeyStore::new();
@@ -1157,7 +1147,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let answer = a_record("www.example.test.", 1);
+        let answer = a_record("www.example.test.", [192, 0, 2, 1]);
         let sig = zone.sign_records(std::slice::from_ref(&answer));
 
         let state = v.validate_records(&[answer, sig], &KeyStore::new()).state;
@@ -1171,7 +1161,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let answer = a_record("www.bank.test.", 6);
+        let answer = a_record("www.bank.test.", [192, 0, 2, 6]);
         let sig = evil.sign_records(std::slice::from_ref(&answer));
 
         let mut keys = KeyStore::new();
@@ -1192,7 +1182,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 
         // A record with no RRSIG beside it, in a zone we know is signed.
         let state = v
-            .validate_records(&[a_record("www.example.test.", 1)], &keys)
+            .validate_records(&[a_record("www.example.test.", [192, 0, 2, 1])], &keys)
             .state;
         assert!(state.is_bogus(), "{state:?}");
     }
@@ -1204,34 +1194,15 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let signed = a_record("www.example.test.", 1);
+        let signed = a_record("www.example.test.", [192, 0, 2, 1]);
         let sig = zone.sign_records(std::slice::from_ref(&signed));
-        let smuggled = ResourceRecord {
-            name: "other.example.test.".into(),
-            class: Class::new(1),
-            ttl: Ttl::from_secs(300),
-            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(6, 6, 6, 6))).unwrap(),
-        };
+        let smuggled = a_record("other.example.test.", [6, 6, 6, 6]);
 
         let mut keys = KeyStore::new();
         keys.insert("example.test.".into(), zone.dnskeys());
 
         let state = v.validate_records(&[signed, sig, smuggled], &keys).state;
         assert!(state.is_bogus(), "{state:?}");
-    }
-
-    /// An NSEC resource record, ready to be signed.
-    fn nsec_record(owner: &str, next: &str, types: &[Rtype]) -> ResourceRecord {
-        ResourceRecord {
-            name: owner.to_string(),
-            class: Class::new(1),
-            ttl: Ttl::from_secs(300),
-            rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
-                next_domain_name: next.to_string(),
-                type_bitmap: build_type_bitmap(types),
-            })
-            .unwrap(),
-        }
     }
 
     /// A wildcard-expanded answer verifies, and is reported as owing a proof.
@@ -1241,7 +1212,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let answer = a_record("a.example.test.", 1);
+        let answer = a_record("a.example.test.", [192, 0, 2, 1]);
         let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
 
         let mut keys = KeyStore::new();
@@ -1271,7 +1242,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let answer = a_record("a.example.test.", 1);
+        let answer = a_record("a.example.test.", [192, 0, 2, 1]);
         let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
         let mut keys = KeyStore::new();
         keys.insert("example.test.".into(), zone.dnskeys());
@@ -1283,6 +1254,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             "*.example.test.",
             "www.example.test.",
             &[rt::A, rt::RRSIG, rt::NSEC],
+            Ttl::from_secs(300),
         );
         let nsec_sig = zone.sign_records(std::slice::from_ref(&nsec));
 
@@ -1308,7 +1280,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let answer = a_record("a.example.test.", 1);
+        let answer = a_record("a.example.test.", [192, 0, 2, 1]);
         let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
         let mut keys = KeyStore::new();
         keys.insert("example.test.".into(), zone.dnskeys());
@@ -1319,6 +1291,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             "*.example.test.",
             "www.example.test.",
             &[rt::A, rt::RRSIG, rt::NSEC],
+            Ttl::from_secs(300),
         );
         let forged = stranger.sign_records(std::slice::from_ref(&nsec));
 
@@ -1335,7 +1308,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let answer = a_record("stolen.b.example.test.", 6);
+        let answer = a_record("stolen.b.example.test.", [192, 0, 2, 6]);
         let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
         let mut keys = KeyStore::new();
         keys.insert("example.test.".into(), zone.dnskeys());
@@ -1353,6 +1326,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             "b.example.test.",
             "c.example.test.",
             &[rt::A, rt::RRSIG, rt::NSEC],
+            Ttl::from_secs(300),
         );
         let nsec_sig = zone.sign_records(std::slice::from_ref(&nsec));
 
@@ -1372,7 +1346,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let at_wildcard = a_record("*.example.test.", 1);
+        let at_wildcard = a_record("*.example.test.", [192, 0, 2, 1]);
         let sig = zone.sign_records(std::slice::from_ref(&at_wildcard));
         let mut keys = KeyStore::new();
         keys.insert("example.test.".into(), zone.dnskeys());
@@ -1398,13 +1372,13 @@ example.test. DS 12345 13 2 ABCDEF0123456789
     fn test_group_rrsets_splits_by_name_and_type_and_skips_signatures() {
         let zone = TestZone::new("example.test.");
         let addresses = vec![
-            a_record("a.example.test.", 1),
-            a_record("a.example.test.", 2),
+            a_record("a.example.test.", [192, 0, 2, 1]),
+            a_record("a.example.test.", [192, 0, 2, 2]),
         ];
         let sig = zone.sign_records(&addresses);
 
         let mut records = addresses;
-        records.push(a_record("b.example.test.", 3));
+        records.push(a_record("b.example.test.", [192, 0, 2, 3]));
         records.push(sig);
 
         let sets = group_rrsets(&records);

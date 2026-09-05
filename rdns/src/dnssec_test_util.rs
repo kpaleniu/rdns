@@ -4,9 +4,12 @@
 //! stand up a signed zone — KSK, ZSK, DS in the parent, signed answers — and put
 //! the real verification path through it rather than a mock.
 
-use crate::dnssec::{key_tag, rrsig_labels, signed_data, Dnskey, Ds, Rrset, Rrsig};
+use crate::dnssec::{
+    key_tag, rrsig_labels, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE,
+};
 use crate::dnssec_key::{SigningAlgorithm, SigningKey};
 use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::zone_signer::{DenialChain, SigningPolicy};
 use crate::Class;
 use crate::Rtype;
 use crate::Ttl;
@@ -284,4 +287,29 @@ pub fn ds_record(ds: &Ds, ttl: Ttl) -> ResourceRecord {
         })
         .expect("encode DS"),
     }
+}
+
+/// The key set a zone-signing test signs with: a P-256 KSK and a P-256 ZSK,
+/// both at `origin`.
+///
+/// This is [`SigningKey`] rather than [`TestKey`] on purpose — a `sign_zone`
+/// test is exercising the signer, so its keys have to be the ones the signer
+/// would be handed.
+pub fn signing_keys(origin: &str) -> Vec<SigningKey> {
+    vec![
+        SigningKey::generate(
+            SigningAlgorithm::EcdsaP256Sha256,
+            origin,
+            DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+        )
+        .expect("generate KSK"),
+        SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, origin, DNSKEY_FLAG_ZONE)
+            .expect("generate ZSK"),
+    ]
+}
+
+/// Thirty days' validity from `now`, which is the default the daemon runs and
+/// the only value either signing test has wanted.
+pub fn signing_policy(now: u64, chain: DenialChain) -> SigningPolicy {
+    SigningPolicy::valid_for(now, 30 * 86_400).with_chain(chain)
 }

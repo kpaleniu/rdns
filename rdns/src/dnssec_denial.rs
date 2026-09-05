@@ -788,6 +788,7 @@ fn nsec3_closest_encloser<'n>(
 mod tests {
     use super::*;
     use crate::denial_wire::{base32hex_encode, build_type_bitmap};
+    use crate::test_records::{nsec3, NSEC3_ITERATIONS, NSEC3_SALT};
     use crate::Class;
     use crate::RecordData;
     use crate::Ttl;
@@ -1210,27 +1211,16 @@ mod tests {
     /// An NSEC3 matching `name` and covering nothing — its span is the empty
     /// interval above its own hash, so it cannot stand in for a covering record.
     fn nsec3_matching(name: &str, types: &[Rtype]) -> Nsec3 {
-        let salt = vec![0x01, 0x02];
-        let hash = nsec3_hash(name, &salt, 5).expect("hash");
-        Nsec3 {
-            owner: nsec3_owner_name(&hash, "example.com."),
-            next_hashed_owner: hash_step(&hash, true),
-            owner_hash: hash,
-            zone: "example.com.".into(),
-            hash_algorithm: 1,
-            flags: 0,
-            iterations: 5,
-            salt,
-            type_bitmap: build_type_bitmap(types),
-        }
+        let mut n = nsec3("example.com.", name, &[], 0, types);
+        n.next_hashed_owner = hash_step(&n.owner_hash, true);
+        n
     }
 
     /// An NSEC3 whose span contains exactly `name`'s hash: one step below to one
     /// step above. Derived from the hash, since fixed bytes would cover or miss
     /// it by luck.
     fn nsec3_span_around(name: &str, flags: u8) -> Nsec3 {
-        let salt = vec![0x01, 0x02];
-        let hash = nsec3_hash(name, &salt, 5).expect("hash");
+        let hash = nsec3_hash(name, &NSEC3_SALT, NSEC3_ITERATIONS).expect("hash");
         let low = hash_step(&hash, false);
         Nsec3 {
             owner: nsec3_owner_name(&low, "example.com."),
@@ -1238,8 +1228,8 @@ mod tests {
             zone: "example.com.".into(),
             hash_algorithm: 1,
             flags,
-            iterations: 5,
-            salt,
+            iterations: NSEC3_ITERATIONS,
+            salt: NSEC3_SALT.to_vec(),
             next_hashed_owner: hash_step(&hash, true),
             type_bitmap: build_type_bitmap(&[rt::A]),
         }
@@ -1264,25 +1254,9 @@ mod tests {
         out
     }
 
-    fn nsec3_record(zone: &str, name: &str, next: &[u8], flags: u8, types: &[Rtype]) -> Nsec3 {
-        let salt = vec![0x01, 0x02];
-        let hash = nsec3_hash(name, &salt, 5).unwrap();
-        Nsec3 {
-            owner: nsec3_owner_name(&hash, zone),
-            owner_hash: hash,
-            zone: zone.to_string(),
-            hash_algorithm: 1,
-            flags,
-            iterations: 5,
-            salt,
-            next_hashed_owner: next.to_vec(),
-            type_bitmap: build_type_bitmap(types),
-        }
-    }
-
     #[test]
     fn test_nsec3_matching_record_proves_no_ds() {
-        let n = nsec3_record(
+        let n = nsec3(
             "example.com.",
             "child.example.com.",
             &[0xff; 20],
@@ -1295,7 +1269,7 @@ mod tests {
 
     #[test]
     fn test_nsec3_with_ds_in_the_bitmap_proves_nothing() {
-        let n = nsec3_record(
+        let n = nsec3(
             "example.com.",
             "child.example.com.",
             &[0xff; 20],
@@ -1310,15 +1284,14 @@ mod tests {
     #[test]
     fn test_nsec3_opt_out_covering_proves_no_ds_but_only_with_the_flag() {
         // A span covering everything: owner hash all zeros, next all ones.
-        let salt = vec![0x01, 0x02];
         let covering = |flags: u8| Nsec3 {
             owner: "00000000000000000000000000000000.example.com.".into(),
             owner_hash: vec![0x00; 20],
             zone: "example.com.".into(),
             hash_algorithm: 1,
             flags,
-            iterations: 5,
-            salt: salt.clone(),
+            iterations: NSEC3_ITERATIONS,
+            salt: NSEC3_SALT.to_vec(),
             next_hashed_owner: vec![0xff; 20],
             type_bitmap: build_type_bitmap(&[rt::NS]),
         };
