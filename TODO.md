@@ -739,7 +739,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **32** | `Shell`, `Served` and the other unnamed bags | **closed 2026-09-05**, filed 2026-09-04: the two renames that needed no crate went that day, and the other three boxes went with `rdns-transport` the next — `ServeContext` was not a step towards 30e's shared pipeline, it *was* the pipeline's parameter list, which is why it landed in the same commit. Four field-only structs that are "what a task needs that is not the answer" and say so in no name — three renamed, `Control` kept as its module's principal type — one of them in a word #9d already spends on something else. The finding under the rename is that `rdnsr::Shell`'s five fields *are* five of `rdnsd::Server`'s twelve, so 30e's shared pipeline already has its parameter list written twice; naming it `ServeContext` in `rdns-transport` is the extraction rather than a step towards it. Carries the rule for what earns the suffix, since a policy struct and a request handler both must not |
 | **27** | what a zero-allocation answer path would take | **five of six stages done, 2026-09-01 → 2026-09-05; 27d withdrawn.** A query cost 21 allocations when it was filed and costs **2** now, both of them in the parse — the question `Vec` and the QNAME `String`, which need the message shape 27d declined. Nothing on the answering side allocates at all. Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **closed 2026-09-04**, filed 2026-08-04; 26j done the same day. Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal. **The rest went on 2026-09-04**: 26b took the module split #31 needed and 26a/26c/26d turned out to be eight copies rather than six — two of them, an inline hex decoder and a third base64 wrapper, carried none of the names the others did, which is this section's own thesis about reading over grepping. 26i's filed fix was wrong (`trailing_zeros` for a bitmap whose bit 0 is the high bit) and is corrected in place |
-| **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
+| **22** | the zone lookup is hash-bound | **closed 2026-09-05**, filed 2026-08-04 from #11's measurement. The first direction is done — one map instead of two takes a miss from 1,875 to 1,402 instructions, 25%, where the estimate said 200. The second is a decision and the answer is **no**: the threat model is written down in the section, and it says the prize (~2% of a query) and the risk (a constant factor on a lookup, not a complexity class) are both small, which argues for leaving a DoS-resistant hasher where it is |
 | **11** | data layout and CPU cache friendliness | **answered no 2026-08-04.** Measured with cachegrind: a miss costs 2,786 instructions and under 0.08 D1 misses, a hit 1,052 and 6.4 — all L2-resident, zero LL misses either way. There is no pointer chase to remove. The `perf` blocker it carried for months was checked and did not exist; the probe is `rdns/examples/zone_lookup_probe.rs` |
 | **14** | three candidates #13 left on the table: `Serial`, QR as a type, sealing `RecordData` | **all three done 2026-08-02**, one commit each. 14a removed the second copy of RFC 1982 §3.2 and made `a > b` on two serials a compile error; 14b put all three socket entry points behind one `Request` door; 14c sealed `RecordData` into its own module — and, by asking what invariant it actually holds, found that a legal RFC 2136 UPDATE could not be parsed at all. 14a and 14b are preventative and say so; 14c's finding is under #10, with a regression test watched failing |
 | **16** | simplifications: `Nsec3`'s fallibility, splitting `parse_into`, and a duplication that must stay | **16b done, 16a corrected-and-withdrawn, 16c recorded as not-to-fix, 2026-08-02.** 16a is the interesting one: the filed plan did not survive being checked against `nsec3_hash` and is kept struck through with the reasoning, but the pass it came from found a live defect in `proves_no_ds`. Three more defects in `parse_dnssec_time` fell out of the same sweep |
@@ -1316,7 +1316,7 @@ off the miss path, measured. See #11. What is below is what is left.
 
 Two directions, and the first is much safer than the second.
 
-- [ ] **Fewer hashes per miss — the half that is left.** `node_exists` asks
+- [x] **Fewer hashes per miss — the half that is left.** `node_exists` asks
       `index` and `non_terminals` separately at every level, and the two could be
       one lookup into a map whose value says which kind of node it is. That is
       the remaining redundant hash. The `format!` half is done (see #11), so what
@@ -1324,6 +1324,24 @@ Two directions, and the first is much safer than the second.
       wildcards the walk is now 1,900 Ir and this would take perhaps a further
       200. **No security dimension**, and it keeps the hash function's guarantees
       while doing less work.
+
+      **Done 2026-09-05, and the estimate was low by more than double.** An empty
+      non-terminal is a key in `index` with no positions, so `node_exists` is one
+      `contains_key` and `name_kind_of_key`'s first question is one `get` whose
+      answer distinguishes `Exact` from `EmptyNonTerminal`. Measured with
+      `zone_lookup_probe` under cachegrind, same session, before and after:
+
+          lookup    before    after
+          miss       1,875    1,402
+          hit        1,023    1,028
+
+      **473 instructions off a miss, 25%.** The estimate said 200 because it
+      counted one redundant hash; the walk asked two maps *per label*, so a
+      three-label miss pays it three times over. The hit does not move, and the
+      five instructions are noise: that path was one `get` before and after.
+
+      The `HashSet` is gone with it, which is one map's worth of memory per zone
+      and one fewer thing `reindex` has to clear.
 - [ ] **A faster hasher — and this one is a decision, not an optimization.**
       SipHash is chosen for HashDoS resistance and the seed is random per
       process. Swapping in FxHash or aHash would take a large bite out of that
@@ -1335,6 +1353,54 @@ Two directions, and the first is much safer than the second.
       about which way a bound fails (`CLAUDE.md` §5). **Do not take this one
       without writing down the threat model**, and measure it against the first
       item rather than instead of it.
+
+      **The threat model, written 2026-09-05 so the decision is takeable.**
+
+      *What a fast hasher would be for.* SipHash is 19.8% of a miss's
+      instructions. The first item took the miss to 1,402 Ir; a non-cryptographic
+      hasher would take perhaps 200-250 more off it, which is ~2% of the 33-55 µs
+      of CPU `rdnsd` spends per query (#28d). **That is the whole prize**, and it
+      should be measured rather than assumed before anything is swapped.
+
+      *Who chooses the keys.* Not only the operator, which is what this section
+      said and is no longer true of every deployment:
+
+      - a zone file the operator wrote — the ordinary case, no exposure;
+      - a zone **transferred from a master** (#7), whose names are the master's;
+      - a **dynamic UPDATE** (#10), whose names are the client's — authenticated
+        by TSIG and authorized per zone, so not anonymous, but chosen by somebody
+        who is not the operator and need not be trusted with a *table*;
+      - the caches (`cache`, `negative_cache`, `nsec_cache`) and the per-source
+        tables in `security` and `logging`, all keyed on what a stranger sends.
+
+      *So the scope of any swap is the zone index and nothing else.* The last
+      bullet must keep SipHash whatever happens: those keys are anonymous input,
+      which is the strong exposure and the one §5 is about. That means changing a
+      type — the index's `HashMap`'s `S` parameter — and never a crate-wide
+      default, because a default is how the caches would be swapped by accident.
+
+      *What an attacker gains against the index itself.* With a predictable
+      hasher and knowledge of the zone, an attacker computes QNAMEs that land in
+      a chosen bucket group. They cannot insert keys (the two exceptions above
+      are authenticated), so the group's occupancy is the zone's own and bounded
+      by the load factor: a probe walks a group of at most 16 slots in
+      hashbrown's SwissTable, not an unbounded chain. **The attack is a constant
+      factor on a lookup, not a complexity class**, which is a materially smaller
+      exposure than the classic HashDoS the seed exists to stop.
+
+      *What it costs if the model is wrong.* A miss that costs 16 comparisons
+      instead of 1 is ~15 × 40 Ir on a path that is 1,402 — measurable, not
+      fatal, and it needs the attacker to know the zone. Against that: the
+      accepted saving is ~2% of a query. **The honest reading is that the prize
+      is small and the risk is small**, which is an argument for leaving it
+      alone rather than for taking it: a change that neither helps much nor
+      hurts much is one nobody will re-derive the reasoning for in a year.
+
+      **Recommendation: do not swap, and record why.** Revisit only with a
+      profile that says hashing is the bottleneck on a real workload — and if it
+      is ever taken, take it as a typed parameter on the zone index, with the
+      UPDATE and transfer paths named in the comment as the reason the caches
+      keep SipHash.
 
 Re-measure with `rdns/examples/zone_lookup_probe.rs`, which is what produced the
 numbers above and prints nothing that would need re-deriving.

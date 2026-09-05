@@ -9,7 +9,8 @@ use crate::Serial;
 use crate::Ttl;
 use crate::{ParsedRecord, Qtype, RecordData};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,12 @@ pub struct Zone {
     origin: String,
     records: Vec<ZoneRecord>,
     /// Positions in `records`, by [`Zone::lookup_key`] of the owner name.
+    ///
+    /// A name that exists only because something below it does — an empty
+    /// non-terminal (RFC 4592 §2.2.2) — is a key with **no positions**. It was
+    /// a second `HashSet` until 2026-09-05, which made every level of a miss
+    /// walk hash the name twice to ask two halves of one question
+    /// (`TODO.md` #22): "is this a node of the zone, and does it have records".
     index: HashMap<NameKeyBuf, Vec<usize>>,
     /// The NSEC chain, keyed by canonical sort order, and the NSEC3 chain,
     /// keyed by hash — both empty for an unsigned zone.
@@ -63,11 +70,6 @@ pub struct Zone {
     /// direction, this answers authoritatively for a child's names, which is the
     /// defect `CLAUDE.md` §8 opens with.
     has_delegations: bool,
-    /// Every ancestor, up to the apex, of a name in `index` — the names that
-    /// exist because something below them does (RFC 4592 §2.2.2), which is
-    /// NODATA rather than NXDOMAIN. Kept apart from `index` because
-    /// [`Zone::holds_name`] needs the literal question too.
-    non_terminals: HashSet<NameKeyBuf>,
 }
 
 /// A name resolved against a zone: what kind of name it is, and where its
@@ -152,7 +154,6 @@ impl Zone {
             nsec3_chain: BTreeMap::new(),
             has_wildcards: false,
             has_delegations: false,
-            non_terminals: HashSet::new(),
         }
     }
 
@@ -209,7 +210,12 @@ impl Zone {
     /// does *not* exist (RFC 4035 §3.1.3). [`Zone::name_exists`] is the other
     /// question.
     pub fn holds_name(&self, name: &str) -> bool {
-        self.index.contains_key(self.lookup_key(name).as_ref())
+        // Records, not merely a node: an empty non-terminal is in `index` with
+        // no positions, and it is exactly the name a wildcard answer has to
+        // prove does not exist.
+        self.index
+            .get(self.lookup_key(name).as_ref())
+            .is_some_and(|positions| !positions.is_empty())
     }
 
     pub fn has_nsec_chain(&self) -> bool {
@@ -350,11 +356,12 @@ impl Zone {
     /// the wildcard directly below it may answer (§3.3.1) — an existing name,
     /// empty non-terminal included, ends the search (§4.4).
     fn name_kind_of_key(&self, key: &str) -> NameKind {
-        if self.index.contains_key(key) {
-            return NameKind::Exact;
-        }
-        if self.non_terminals.contains(key) {
-            return NameKind::EmptyNonTerminal;
+        // One hash for both questions: present with records is `Exact`, present
+        // without is an empty non-terminal (`TODO.md` #22).
+        match self.index.get(key) {
+            Some(positions) if !positions.is_empty() => return NameKind::Exact,
+            Some(_) => return NameKind::EmptyNonTerminal,
+            None => {}
         }
 
         let origin = self.origin_key();
@@ -389,8 +396,12 @@ impl Zone {
 
     /// Whether this name is a node of the zone: it has records, or it has
     /// descendants (RFC 4592 §2.2.2). Takes a lookup key.
+    ///
+    /// One lookup, because both kinds of node are in `index`. This is the walk's
+    /// inner loop — once per label of a name the client chose — and it asked
+    /// two maps until #22.
     fn node_exists(&self, key: &str) -> bool {
-        self.index.contains_key(key) || self.non_terminals.contains(key)
+        self.index.contains_key(key)
     }
 
     /// The delegation point at or above `name`: the deepest ancestor-or-self
@@ -427,7 +438,9 @@ impl Zone {
         }
     }
 
-    /// Whether there is an RRset of `rtype` at exactly this key.
+    /// Whether there is an RRset of `rtype` at exactly this key. An empty
+    /// non-terminal has no positions, so it answers false without a special
+    /// case.
     fn has_type(&self, key: &str, rtype: Rtype) -> bool {
         self.index.get(key).is_some_and(|positions| {
             positions
@@ -441,6 +454,10 @@ impl Zone {
     /// Stops at the first ancestor already known: ancestors are always noted
     /// all the way to the apex, so one present means the rest are. Keeps index
     /// construction linear in the zone rather than in names × labels.
+    ///
+    /// "Known" now includes an ancestor that has records of its own, which is
+    /// the same guarantee for the same reason — a record's own insertion noted
+    /// *its* ancestors.
     fn note_non_terminals(&mut self, key: &str) {
         // Owned: the loop below takes `&mut self`.
         let origin = self.origin_key().into_owned();
@@ -453,7 +470,11 @@ impl Zone {
             }
             let parent = parent.to_string();
             let reached_apex = parent == origin;
-            if !self.non_terminals.insert(NameKeyBuf::new(&parent)) || reached_apex {
+            match self.index.entry(NameKeyBuf::new(&parent)) {
+                Entry::Occupied(_) => return,
+                Entry::Vacant(slot) => slot.insert(Vec::new()),
+            };
+            if reached_apex {
                 return;
             }
             name = parent;
@@ -482,7 +503,6 @@ impl Zone {
             })
             .collect();
         self.index.clear();
-        self.non_terminals.clear();
         // Recomputed, not carried: `set_origin` can turn a relative `*` into an
         // absolute wildcard name.
         self.has_wildcards = false;
@@ -1854,6 +1874,50 @@ timed 60 IN A 192.0.2.3
     /// A name with descendants exists (RFC 4592 §2.2.2): NODATA, not NXDOMAIN,
     /// which an RFC 8020 resolver would extend downwards over the zone's own
     /// data.
+    /// A node's kind is what it holds, not the order the zone file arrived in.
+    ///
+    /// The two maps became one in #22, so "is this a node" and "does it have
+    /// records" are one lookup — which makes insertion *order* the thing that
+    /// could go wrong. A name noted as an ancestor and then given records must
+    /// read `Exact`, and a record added below a name that already has records
+    /// must not stop the ancestor walk early.
+    #[test]
+    fn a_non_terminal_that_gains_records_is_an_ordinary_name() {
+        for (order, text) in [
+            (
+                "ancestor first",
+                "deep.a.b IN TXT \"x\"
+a.b IN A 192.0.2.1
+",
+            ),
+            (
+                "records first",
+                "a.b IN A 192.0.2.1
+deep.a.b IN TXT \"x\"
+",
+            ),
+        ] {
+            let zone = parse_zone_file(text, "example.com.").unwrap();
+            assert_eq!(
+                zone.name_kind("a.b.example.com."),
+                NameKind::Exact,
+                "{order}"
+            );
+            assert!(zone.holds_name("a.b.example.com."), "{order}");
+            assert_eq!(
+                zone.name_kind("b.example.com."),
+                NameKind::EmptyNonTerminal,
+                "{order}: still only an ancestor"
+            );
+            assert!(!zone.holds_name("b.example.com."), "{order}");
+            assert_eq!(
+                zone.name_kind("nope.b.example.com."),
+                NameKind::NotFound,
+                "{order}: and the walk still says no to what is not there"
+            );
+        }
+    }
+
     #[test]
     fn test_empty_non_terminals_exist() {
         let zone = parse_zone_file("deep.a.b IN TXT \"down here\"\n", "example.com.").unwrap();
