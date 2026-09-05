@@ -819,6 +819,7 @@ impl Server {
                     u16::MAX as usize,
                     &mut bytes,
                     &mut compressor,
+                    &mut String::new(),
                 )
             };
             if let Err(e) = written {
@@ -1515,13 +1516,7 @@ async fn udp_loop(
     busy: Busy,
 ) -> Result<(), std::io::Error> {
     let mut buf = vec![0; UDP_RECEIVE_BUFFER];
-    // Reused for the worker's lifetime, settling at the largest EDNS payload
-    // size it has been asked for. A task per datagram could not keep one.
-    let mut scratch = Vec::new();
-    // Beside the buffer and for the same reason: the compressor's two
-    // allocations are per-message state, so an answer paid them per datagram
-    // (`TODO.md` #27b). `to_bytes_with` clears it, so nothing here has to.
-    let mut compressor = NameCompressor::new();
+    let mut scratch = Scratch::default();
 
     loop {
         // `recv_from` is cancel-safe: a datagram is either fully received or not
@@ -1556,9 +1551,28 @@ async fn udp_loop(
         // budget.
         let _busy = busy.clone();
         server
-            .answer_datagram(packet, peer, &socket, &mut scratch, &mut compressor, now)
+            .answer_datagram(packet, peer, &socket, &mut scratch, now)
             .await;
     }
+}
+
+/// What one UDP worker reuses from datagram to datagram.
+///
+/// Three pieces of per-message state that a task-per-datagram server pays for
+/// every time and a fixed pool pays for once: the reply buffer, which settles at
+/// the largest EDNS payload size this worker has been asked for; the name
+/// compressor, whose two allocations are per message (`TODO.md` #27b); and the
+/// folded lookup key, which a case-randomized QNAME needs somewhere that
+/// outlives the question (#27a).
+///
+/// One struct because they are one thing — the scratch space — and because
+/// three more parameters on `answer_datagram` is what clippy's argument limit is
+/// for (`CLAUDE.md` §14).
+#[derive(Default)]
+struct Scratch {
+    out: Vec<u8>,
+    compressor: NameCompressor,
+    key: String,
 }
 
 /// Next to [`udp_loop`] because this is the body of that loop.
@@ -1572,8 +1586,7 @@ impl Server {
         packet: &[u8],
         peer: SocketAddr,
         socket: &UdpSocket,
-        scratch: &mut Vec<u8>,
-        compressor: &mut NameCompressor,
+        scratch: &mut Scratch,
         now: u64,
     ) {
         let Server {
@@ -1678,10 +1691,21 @@ impl Server {
             // truncates with TC=1 if the response is larger.
             let max_len = msg.udp_payload_size() as usize;
             if msg.opcode == OpCode::Notify {
-                notify_reply(&msg, &zones, secondaries, peer)
-                    .to_bytes_within_buf_with(max_len, scratch, compressor)
+                notify_reply(&msg, &zones, secondaries, peer).to_bytes_within_buf_with(
+                    max_len,
+                    &mut scratch.out,
+                    &mut scratch.compressor,
+                )
             } else {
-                write_response(&msg, &zones, metrics, max_len, scratch, compressor)
+                write_response(
+                    &msg,
+                    &zones,
+                    metrics,
+                    max_len,
+                    &mut scratch.out,
+                    &mut scratch.compressor,
+                    &mut scratch.key,
+                )
             }
         };
         if let Err(e) = serialized {
@@ -1698,8 +1722,8 @@ impl Server {
         // straight out of the worker's scratch buffer with nothing allocated.
         // The two exceptions build a message of their own and own it.
         let reply: Option<Cow<'_, [u8]>> =
-            match response_limiter.admit(peer.ip(), scratch.len(), now) {
-                ResponseVerdict::Send => Some(Cow::Borrowed(scratch.as_slice())),
+            match response_limiter.admit(peer.ip(), scratch.out.len(), now) {
+                ResponseVerdict::Send => Some(Cow::Borrowed(scratch.out.as_slice())),
                 ResponseVerdict::Truncate => {
                     logger.log_rate_limited(peer.ip());
                     metrics.count(&metrics.rate_limited);
@@ -2958,20 +2982,13 @@ mod tests {
             msg.response = true; // QR=1: this is somebody's answer, not a question.
             let packet = msg.to_bytes_within(4096).expect("serialize");
 
-            let mut scratch = Vec::new();
+            let mut scratch = Scratch::default();
             server
-                .answer_datagram(
-                    &packet,
-                    peer,
-                    &socket,
-                    &mut scratch,
-                    &mut NameCompressor::new(),
-                    tsig::now(),
-                )
+                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
                 .await;
 
             assert!(
-                scratch.is_empty(),
+                scratch.out.is_empty(),
                 "a QR=1 datagram was answered; two such servers pointed at each \
                  other are a packet loop"
             );
@@ -2997,37 +3014,23 @@ mod tests {
             let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
             let peer = client.local_addr().expect("addr");
             let packet = a_query();
-            let mut scratch = Vec::new();
+            let mut scratch = Scratch::default();
 
             server
-                .answer_datagram(
-                    &packet,
-                    peer,
-                    &socket,
-                    &mut scratch,
-                    &mut NameCompressor::new(),
-                    tsig::now(),
-                )
+                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
                 .await;
-            let (address, capacity) = (scratch.as_ptr(), scratch.capacity());
-            assert!(!scratch.is_empty(), "the first answer was serialized");
+            let (address, capacity) = (scratch.out.as_ptr(), scratch.out.capacity());
+            assert!(!scratch.out.is_empty(), "the first answer was serialized");
 
             server
-                .answer_datagram(
-                    &packet,
-                    peer,
-                    &socket,
-                    &mut scratch,
-                    &mut NameCompressor::new(),
-                    tsig::now(),
-                )
+                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
                 .await;
             assert_eq!(
-                scratch.as_ptr(),
+                scratch.out.as_ptr(),
                 address,
                 "the second answer reallocated: it is not reusing the buffer"
             );
-            assert_eq!(scratch.capacity(), capacity);
+            assert_eq!(scratch.out.capacity(), capacity);
 
             // Both were sent, so the reuse is of a buffer that really carried an
             // answer to the wire and not of one left over from a failure.

@@ -463,6 +463,34 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     // the bytes that outlives the question (#27d).
     within("the answer path's lookups, case randomized", count, 1..=1);
 
+    // And with somewhere to put them — which is what `rdnsd`'s UDP worker now
+    // holds beside its scratch buffer and its compressor — the same sequence
+    // costs nothing at all. The buffer is warmed first: the interesting number
+    // is the *steady state* of a worker answering datagram after datagram, not
+    // its first one.
+    let buffered = |zone: &rdns::zone::Zone, name: &str, buf: &mut String| {
+        let key = rdns::utils::absolute_lowered_in(name, buf);
+        let cut = zone.delegation_for(key);
+        let located = zone.locate(key);
+        let has = located.has_type(Qtype::of(record_types::A));
+        let records = located.of_type(Qtype::of(record_types::A)).count();
+        (cut, located.kind().clone(), has, records)
+    };
+    let mut key_buf = String::new();
+    let _ = buffered(&zone, mixed, &mut key_buf);
+
+    let (answers, count) = allocations(|| buffered(&zone, mixed, &mut key_buf));
+    assert_eq!(
+        answers,
+        (None, NameKind::Exact, true, 1),
+        "the same answers"
+    );
+    within(
+        "the answer path's lookups, into a worker's buffer",
+        count,
+        0..=0,
+    );
+
     // The same against a zone with a child, where the delegation walk runs.
     let delegating = parse_zone_file(
         concat!(

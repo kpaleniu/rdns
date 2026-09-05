@@ -737,7 +737,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **30** | the two daemons' transports are one transport written twice | **open, filed 2026-09-04 and reviewed the same day.** Seventeen items: fifteen duplicated between `rdnsd` and `rdnsr` — the TCP transport whole, the five transport constants, the shutdown epilogue, the admission pipeline, five hand-written reply skeletons, the EDNS mirroring — two between `rdnsc` and the library, and ~~**30q, the one defect: `rdnsr` never applies the admission check to TCP**, so on that transport the 16 KiB ceiling, the QDCOUNT cap and the pre-parse section caps do not run~~ — **30q fixed 2026-09-04**, the only defect in the section and the first thing done from it, followed the same day by 30f, 30l, 30n and both halves of 30g — which was not a tidy-up after all: the skeleton it removed was hiding `rdnsr` clearing the CD bit RFC 4035 §3.2.2 says to copy, and 30r beside it — then 30h, which closed 30i and 30j behind it. Then 30p and 30o, which is where the *library* turned out to hold the weaker copy of a check `rdnsc` had right, and 30m — answered by reading what the facility was *for* rather than by deleting it. What is left is 30a-30e, on #31. The library itself came out clean. Reviewing the filing against the code struck four of its claims, including two that had the direction backwards; what the review moved is recorded at the end of the section |
 | **31** | where a crate boundary would pay | **done 2026-09-05**, filed 2026-09-04 and corrected the same day. `rdns-transport` holds #30's transport; `rdns-core` holds the wire format, which takes a client from 67 packages to 35 — two crates and not the three the plan drew, because splitting DNSSEC from net saves a client nothing and a split without a measurement is motion. Not `platform` and not `net`: both would move code that already has a home. Yes to a crate for #30's transport, **`rdns-transport`**, and the argument is `anyhow` rather than tidiness — §3 forbids it in `rdns` and the transport needs it; the name is checked against `domain`, hickory, Knot and BIND rather than chosen, and "shell" was already taken by #9d. The cut that pays is `rdns` itself: `rdnsc` is a synchronous CLI compiling 78 packages, tokio's 18 and ring's among them, floored at clap's 21. ~~32 of 41 modules touch neither~~ — an import count is not a partition; walking the edges found exactly two blocking ones, both `zone`/`zone_writer` reaching into `dnssec_denial` for wire helpers with no crypto in them, which is #26b from the other side |
 | **32** | `Shell`, `Served` and the other unnamed bags | **closed 2026-09-05**, filed 2026-09-04: the two renames that needed no crate went that day, and the other three boxes went with `rdns-transport` the next — `ServeContext` was not a step towards 30e's shared pipeline, it *was* the pipeline's parameter list, which is why it landed in the same commit. Four field-only structs that are "what a task needs that is not the answer" and say so in no name — three renamed, `Control` kept as its module's principal type — one of them in a word #9d already spends on something else. The finding under the rename is that `rdnsr::Shell`'s five fields *are* five of `rdnsd::Server`'s twelve, so 30e's shared pipeline already has its parameter list written twice; naming it `ServeContext` in `rdns-transport` is the extraction rather than a step towards it. Carries the rule for what earns the suffix, since a policy struct and a request handler both must not |
-| **27** | what a zero-allocation answer path would take | **filed 2026-09-01, not started.** Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
+| **27** | what a zero-allocation answer path would take | **five of six stages done, 2026-09-01 → 2026-09-05; 27d withdrawn.** A query cost 21 allocations when it was filed and costs **2** now, both of them in the parse — the question `Vec` and the QNAME `String`, which need the message shape 27d declined. Nothing on the answering side allocates at all. Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **closed 2026-09-04**, filed 2026-08-04; 26j done the same day. Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal. **The rest went on 2026-09-04**: 26b took the module split #31 needed and 26a/26c/26d turned out to be eight copies rather than six — two of them, an inline hex decoder and a third base64 wrapper, carried none of the names the others did, which is this section's own thesis about reading over grepping. 26i's filed fix was wrong (`trailing_zeros` for a bitmap whose bit 0 is the high bit) and is corrected in place |
 | **22** | the zone lookup is hash-bound | **open, filed 2026-08-04** from #11's measurement. SipHash is 19.8% of instructions and 23.2% of branch mispredicts on a miss. Two directions, and the faster-hasher one is a HashDoS decision rather than an optimization |
 | **11** | data layout and CPU cache friendliness | **answered no 2026-08-04.** Measured with cachegrind: a miss costs 2,786 instructions and under 0.08 D1 misses, a hit 1,052 and 6.4 — all L2-resident, zero LL misses either way. There is no pointer chase to remove. The `perf` blocker it carried for months was checked and did not exist; the probe is `rdns/examples/zone_lookup_probe.rs` |
@@ -2076,17 +2076,27 @@ same zone. It is a third number rather than a correction of the 141 because the
 141's query shape is not written down and this one's is: a fresh QNAME per
 datagram, EDNS with DO, which is what a random-subdomain flood sends.
 
-Twenty-one when this was filed. **Seven now**: #28b and #28c took two folds out,
-27a took the rest of the folds and the `to_string`, 27c took the two `Vec`
-spines, and 27b took serialization to zero and then the answer itself. What is
-left:
+Twenty-one when this was filed. ~~**Seven now**~~ **Two, re-measured
+2026-09-05** by the slope method below, on the same Linux box:
 
-| site | count | removed by |
-|---|---|---|
-| parse: two label `Vec`s, two `String`s, `queries`, `additionals` | 6 | 27d |
-| the fold at the door, which needs a buffer outliving the question | 1 | 27d |
+| shape | filed | after 27a-27e | now |
+|---|---|---|---|
+| plain A, lower-case QNAME | 3.0 | 3.0 | **2.004** |
+| EDNS0 + DO + DNS-0x20 — what a resolver sends | 7.0 | 7.0 | **2.004** |
+| NXDOMAIN, unsigned, fresh QNAME per datagram | 8.0 | 8.0 | **5.004** |
 
-**Seven, all of them the request.** Nothing on the *answering* side allocates any
+The seven became three when 27d's *parser* half landed (`DName` stopped
+collecting a `Vec<Label>`, and an OPT's owner stopped being decoded to be thrown
+away), and three became two on 2026-09-05 when the fold at the door moved into a
+buffer the worker owns — see below. The two that are left are named by dhat:
+
+| site | count |
+|---|---|
+| `DnsMessage::try_from_bytes`: the `Vec<QuerySection>` spine | 1 |
+| `DName::to_presentation`: the QNAME `String` | 1 |
+
+**Both are the request**, and both need the message shape 27d withdrew rather
+than anything on the answering side. Nothing the *answer* does allocates. Nothing on the *answering* side allocates any
 more; what is left is the stage that changes a type's shape, and the one to leave
 until last — or never.
 
@@ -2610,6 +2620,37 @@ every combination of ten names, eleven QTYPEs and DO) structurally identical to
 the previous build, with the RRSIG fields a fresh signing run changes masked;
 dnspython validating the DNSKEY RRset, an A answer, and every denial record in
 an NXDOMAIN and a NODATA against it.
+
+#### 27f. The fold at the door, into the worker's buffer — **done 2026-09-05**
+
+27a left one allocation behind and said what it needed: "somewhere to put the
+folded bytes that outlives the question, which is a per-worker buffer, which is
+27d". 27d was withdrawn as filed, but this piece of it is separable and cheap —
+it needs no borrowed request, only a `String` the caller keeps.
+
+`utils::absolute_lowered_in(name, buf)` is `absolute_lowered` writing into that
+buffer, still borrowing when the name is already absolute and lower-case.
+`rdnsd`'s UDP worker holds one beside its scratch buffer and its compressor.
+
+    shape                                   before   after
+    plain A, lower-case QNAME                2.004    2.003
+    EDNS0 + DO + DNS-0x20                    3.004    2.005
+    NXDOMAIN, unsigned, fresh QNAME          6.005    5.005
+
+One off every case-randomized query, which is what a resolver sends, and one off
+the random-subdomain flood shape. The lower-case shape does not move, because it
+was already borrowing — which is the same asymmetry 27a measured.
+
+**The three buffers became a `Scratch`,** because adding the third took
+`answer_datagram` to eight arguments and clippy's limit is seven — §14's own
+rule, arriving on schedule. They are one thing: what a fixed worker pool reuses
+between datagrams and a task-per-datagram server pays for every time.
+
+Held by `allocations.rs` at **0** for the whole lookup sequence with a warm
+buffer, against the 1 the `Cow` spelling still reads beside it, and the
+0x20 echo checked against a running server: a randomized QNAME comes back byte
+for byte, which is the trap 27a describes and the one thing a folded key could
+have broken silently.
 
 #### The cost this pays, said out loud
 

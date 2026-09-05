@@ -28,6 +28,7 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
         u16::MAX as usize,
         &mut out,
         &mut compressor,
+        &mut String::new(),
     )
     .expect("the response serializes");
     DnsMessage::try_from_bytes(&out).expect("and parses back")

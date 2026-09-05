@@ -16,7 +16,7 @@ use rdns::compression::NameCompressor;
 use rdns::error::WireError;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::response::{ResponseWriter, Section};
-use rdns::utils::{absolute_lowered, record_types};
+use rdns::utils::{absolute_lowered, absolute_lowered_in, record_types};
 use rdns::zone::{Located, NameKind, Zone};
 use rdns::Qtype;
 use rdns::Ttl;
@@ -37,6 +37,7 @@ pub(crate) fn write_response(
     max_len: usize,
     out: &mut Vec<u8>,
     compressor: &mut NameCompressor,
+    key_buf: &mut String,
 ) -> Result<(), WireError> {
     let timer = LatencyTimer::new();
     let mut w = ResponseWriter::start(out, compressor, max_len, msg)?;
@@ -92,7 +93,7 @@ pub(crate) fn write_response(
         w.set_rcode(ResponseCode::FormatError);
         w.set_authoritative(false);
     } else if let Some(query) = msg.queries.first() {
-        answer_question(query, zones, dnssec_ok, &mut w)?;
+        answer_question(query, zones, dnssec_ok, key_buf, &mut w)?;
     }
 
     // Count the answer by what it says. REFUSED climbing means a zone went
@@ -117,6 +118,7 @@ fn answer_question(
     query: &rdns::QuerySection,
     zones: &Zones,
     dnssec_ok: bool,
+    key_buf: &mut String,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
     // Every zone here is IN, and RFC 1034 §4.3.2 step 1 searches the zones
@@ -168,8 +170,13 @@ fn answer_question(
     // walk and every `Zone` lookup fold their argument themselves and borrow
     // when there is nothing left to fold, so folding once here makes all of
     // them free — a case-randomized query paid for three (`TODO.md` #27a).
-    let key = absolute_lowered(&query.qname);
-    let Some(zone) = zones.for_query(&key) else {
+    //
+    // Into the caller's buffer, because a `Cow` here was the last allocation on
+    // this path for a DNS-0x20 query: the folded name has to outlive the
+    // question and a UDP worker can hold the bytes for the life of the process
+    // (#27d's remainder).
+    let key = absolute_lowered_in(&query.qname, key_buf);
+    let Some(zone) = zones.for_query(key) else {
         // A zone we do not serve is REFUSED, not NXDOMAIN. NXDOMAIN asserts
         // the name exists nowhere, which we have no standing to say, and a
         // resolver caches it (RFC 2308). BIND, NSD and Knot all answer
@@ -180,7 +187,7 @@ fn answer_question(
         return Ok(());
     };
 
-    match resolve_in_zone(zone, &query.qname, &key, query.qtype) {
+    match resolve_in_zone(zone, &query.qname, key, query.qtype) {
         Outcome::Referral { cut } => refer_to_child(zone, &cut, dnssec_ok, w),
         Outcome::Answer {
             chain,

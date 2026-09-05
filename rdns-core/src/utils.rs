@@ -241,6 +241,30 @@ pub fn absolute_lowered(name: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(owned)
 }
 
+/// [`absolute_lowered`] into a buffer the caller keeps, so a name that *does*
+/// need folding costs no allocation either.
+///
+/// The last allocation on `rdnsd`'s answer path for a case-randomized query
+/// (`TODO.md` #27a, #27d): the fold at the door has to outlive the question, and
+/// a `Cow` cannot borrow from a temporary. A UDP worker owns one of these beside
+/// its scratch buffer and its compressor, so a flood of DNS-0x20 queries reuses
+/// one allocation for the life of the process.
+///
+/// `buf` is cleared first: what it held was the previous question's key.
+pub fn absolute_lowered_in<'a>(name: &'a str, buf: &'a mut String) -> &'a str {
+    let needs_dot = !name.ends_with('.');
+    if !needs_dot && !has_ascii_uppercase(name) {
+        return name;
+    }
+    buf.clear();
+    buf.push_str(name);
+    buf.make_ascii_lowercase();
+    if needs_dot {
+        buf.push('.');
+    }
+    buf
+}
+
 /// The only form a name may be a map key in: absolute and ASCII case-folded
 /// (RFC 4343). One constructor, and it folds, so an insertion cannot skip it.
 ///
@@ -834,6 +858,47 @@ mod tests {
         assert_eq!(record_type_name_to_code("TYPE65536"), None);
         assert_eq!(record_type_name_to_code("TYPE"), None);
         assert_eq!(record_type_name_to_code("TYPEA"), None);
+    }
+
+    /// Folding into a caller's buffer gives the same answer as folding into a
+    /// fresh `String`, and reuses the buffer rather than growing a new one —
+    /// which is the whole point (`TODO.md` #27a).
+    #[test]
+    fn a_fold_into_a_buffer_answers_as_the_owning_one_does() {
+        let mut buf = String::new();
+        for name in [
+            "www.example.com.",
+            "WwW.eXaMpLe.CoM.",
+            "www.example.com",
+            "WWW.EXAMPLE.COM",
+            ".",
+            "",
+        ] {
+            assert_eq!(
+                absolute_lowered_in(name, &mut buf),
+                absolute_lowered(name).as_ref(),
+                "{name:?}"
+            );
+        }
+
+        // The buffer is reused, not appended to: the second name must not find
+        // the first one still in it.
+        let mut buf = String::new();
+        assert_eq!(
+            absolute_lowered_in("A.example.com", &mut buf),
+            "a.example.com."
+        );
+        assert_eq!(
+            absolute_lowered_in("B.example.com", &mut buf),
+            "b.example.com."
+        );
+
+        // And a name that needs no folding borrows, leaving the buffer alone.
+        let mut buf = String::from("stale.example.com.");
+        assert_eq!(
+            absolute_lowered_in("www.example.com.", &mut buf),
+            "www.example.com."
+        );
     }
 
     /// The fold has no early exit, so the classic mistakes are the ends: a
