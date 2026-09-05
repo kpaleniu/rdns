@@ -1,6 +1,6 @@
 //! `rdnsctl` — ask a running `rdnsd` what it is doing, and tell it to reload.
 //!
-//! One connect, one command, one reply, then close ([`rdns::control`]). Nothing
+//! One connect, one command, one reply, then close ([`rdns_core::control`]). Nothing
 //! to overlap, so `std` rather than `tokio`.
 //!
 //! Unix only, because the socket is. On Windows it says so and exits 2 rather
@@ -14,7 +14,7 @@ use clap::Parser;
 const DEFAULT_SOCKET: &str = "/run/rdns/rdnsd.sock";
 
 #[derive(Parser)]
-#[command(version = rdns::VERSION, about, long_about = None)]
+#[command(version = rdns_core::VERSION, about, long_about = None)]
 struct Cli {
     /// The control socket `rdnsd` was started with (`--control-socket`).
     #[arg(short, long, value_name = "PATH", default_value = DEFAULT_SOCKET)]
@@ -56,7 +56,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(unix)]
 fn run(cli: &Cli) -> anyhow::Result<std::process::ExitCode> {
     use anyhow::Context;
-    use rdns::control::{parse_reply, Reply, Request};
+    use rdns_core::control::{parse_reply, Reply, Request};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;

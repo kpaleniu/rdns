@@ -413,7 +413,7 @@ impl ClientEdns {
 /// Read `request`'s EDNS, or the RCODE that refuses it.
 ///
 /// `Err` is FORMERR for an option list that does not parse and BADVERS for a
-/// version past [`EDNS_VERSION`] (RFC 6891 §6.1.3). Both refusals still owe the
+/// version past [`crate::EDNS_VERSION`] (RFC 6891 §6.1.3). Both refusals still owe the
 /// client a bare version-0 OPT, since BADVERS is an extended RCODE and its high
 /// bits live in that record — the caller attaches it, because a refusal is
 /// answered differently on each daemon.

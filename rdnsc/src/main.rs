@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use rdns::error::AnswerMismatch;
-use rdns::utils::bind_addr_for;
-use rdns::validation::{answers_query, SentQuery};
-use rdns::{DnsMessage, DnsMessageBuilder};
+use rdns_core::error::AnswerMismatch;
+use rdns_core::utils::bind_addr_for;
+use rdns_core::validation::{answers_query, SentQuery};
+use rdns_core::{DnsMessage, DnsMessageBuilder};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -17,7 +17,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTEMPTS: usize = 2;
 
 #[derive(Parser)]
-#[command(version = rdns::VERSION, about, long_about = None)]
+#[command(version = rdns_core::VERSION, about, long_about = None)]
 struct Cli {
     /// The server to ask: an address, optionally with `:port` (default 53).
     pub dns_server: String,
@@ -127,7 +127,7 @@ fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
         .set_read_timeout(Some(READ_TIMEOUT))
         .context("setting the read timeout")?;
 
-    let framed = rdns::framed(query).context("framing the query")?;
+    let framed = rdns_core::framed(query).context("framing the query")?;
     stream.write_all(&framed).context("sending over TCP")?;
 
     let mut prefix = [0u8; 2];
@@ -149,7 +149,7 @@ fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
 /// Whether `message` is a response to `request`.
 ///
 /// The id, the QR bit and the echoed question are all that tie a datagram to
-/// the query it claims to answer. `rdns::validation::answers_query` is the
+/// the query it claims to answer. `rdns_core::validation::answers_query` is the
 /// check; the resolver makes the same one (`TODO.md` #30o). No DNS-0x20 here,
 /// so the name compare folds ASCII case.
 fn matches_request(message: &DnsMessage, request: &DnsMessage) -> Result<(), AnswerMismatch> {

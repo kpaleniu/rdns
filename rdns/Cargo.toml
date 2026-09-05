@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "DNS library: wire codec, zone files, caching, resolver and DNSSEC. Shared by rdnsc, rdnsd and rdnsr."
+description = "DNS above the wire: zone files, DNSSEC, transfers, the resolver and a daemon's operational furniture. The codec is rdns-core."
 
 [dependencies]
+rdns-core.workspace = true
 thiserror = "2.0"
 rand = "0.8"
 

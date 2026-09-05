@@ -132,6 +132,24 @@ mod tests {
     use crate::Ttl;
     use std::net::Ipv4Addr;
 
+    /// An unsigned zone is valid and unsigned, and the AD bit says so.
+    ///
+    /// Lived in `lib.rs`'s tests until the crate split, where it was the one
+    /// case in the codec's own suite that needed a zone and a validator
+    /// (`TODO.md` #31).
+    #[test]
+    fn test_dnssec_validator_integration() {
+        let validator = DnssecValidator::new(true);
+        let zone = crate::zone::Zone::new("example.com.".to_string());
+        let records = vec![];
+
+        let (is_valid, is_signed) = validator.validate_response(&zone, &records, "example.com.");
+
+        assert!(is_valid);
+        assert!(!is_signed);
+        assert!(!validator.should_set_ad_bit(is_valid, is_signed));
+    }
+
     #[test]
     fn test_validator_new() {
         let validator = DnssecValidator::new(true);

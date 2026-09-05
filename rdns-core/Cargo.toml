@@ -1,0 +1,15 @@
+[package]
+name = "rdns-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The DNS wire format and the names in it: messages, records, compression, presentation names, admission and the control protocol. No crypto, no async."
+build = "build.rs"
+
+[dependencies]
+thiserror = "2.0"
+# A transaction id must not be predictable, and `utils::hex_encode`'s sibling
+# writes the base64 a DNSKEY is spelled in. Neither pulls a runtime in.
+rand = "0.8"
+base64 = "0.22"

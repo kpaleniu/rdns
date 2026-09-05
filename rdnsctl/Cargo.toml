@@ -9,4 +9,4 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-rdns.workspace = true
+rdns-core.workspace = true

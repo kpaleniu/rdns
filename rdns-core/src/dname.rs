@@ -16,7 +16,7 @@ pub(crate) const MAX_LABEL_LEN: usize = 63;
 /// The longest a whole name may be, *encoded*: RFC 1035 §2.3.4's "names 255
 /// octets or less", counting each label's length octet and the root's
 /// terminating zero.
-pub(crate) const MAX_NAME_LEN: usize = 255;
+pub const MAX_NAME_LEN: usize = 255;
 
 /// Copy `bytes` into `buf` at `pos`, returning the position just past them.
 ///
@@ -500,7 +500,7 @@ pub fn dname_from_bytes<'a>(
 /// exists for a caller that wants a field *after* a name and would otherwise
 /// allocate the name to get past it.
 ///
-/// Not [`crate::tsig`]'s `skip_name`, which walks a whole message and so stops
+/// Not `rdns::tsig`'s `skip_name`, which walks a whole message and so stops
 /// at a pointer instead of refusing one.
 pub(crate) fn skip_uncompressed_name(data: &[u8]) -> Option<&[u8]> {
     let mut pos = 0;
@@ -533,7 +533,7 @@ pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, WireError> {
 /// A name never exceeds [`MAX_NAME_LEN`] encoded, so a caller that throws the
 /// bytes away can put the buffer on the stack: the NSEC3 closest-encloser walk
 /// encodes a name per label of the QNAME (RFC 5155 §8.3) and keeps none of them.
-pub(crate) fn dname_to_bytes_in(name: &str, buf: &mut [u8]) -> Result<usize, WireError> {
+pub fn dname_to_bytes_in(name: &str, buf: &mut [u8]) -> Result<usize, WireError> {
     // A fully-qualified name carries a trailing '.' denoting the root; splitting
     // on '.' would otherwise yield a spurious empty final label (and a second
     // zero byte), which corrupts any record that stores data after the name.

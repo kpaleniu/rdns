@@ -243,7 +243,8 @@ pub fn anomalies(stats: &QueryStats, limits: &AnomalyThresholds) -> Vec<Anomaly>
 /// Warn every `interval` until told to stop.
 ///
 /// The caller that owns the counters never reads them, which is how this
-/// facility spent a year write-only (`TODO.md` #30m). No [`Busy`] claim: the
+/// facility spent a year write-only (`TODO.md` #30m). No [`crate::shutdown::Busy`]
+/// claim: the
 /// task sleeps almost all of the time, and holding the drain open across a
 /// sleep waits out the shutdown budget every time (`CLAUDE.md` §9). The work
 /// between sleeps is a lock and a walk of two bounded maps.

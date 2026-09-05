@@ -635,6 +635,7 @@ dependencies = [
  "criterion",
  "dhat",
  "rand",
+ "rdns-core",
  "ring",
  "sha1",
  "sha2",
@@ -642,6 +643,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rdns-core"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rand",
+ "thiserror",
 ]
 
 [[package]]
@@ -660,7 +670,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "rdns",
+ "rdns-core",
 ]
 
 [[package]]
@@ -669,7 +679,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "rdns",
+ "rdns-core",
 ]
 
 [[package]]

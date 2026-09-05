@@ -211,7 +211,7 @@ pub fn rand_id() -> u16 {
 /// A name in absolute form — the trailing root dot added if it is not there.
 /// Borrows when the name already has one.
 ///
-/// Not [`crate::zone::absolutize`], which resolves a *relative* zone-file name
+/// Not `rdns::zone::absolutize`, which resolves a *relative* zone-file name
 /// against an origin. This one has no origin: it appends the root dot and
 /// nothing more.
 pub fn absolute(name: &str) -> std::borrow::Cow<'_, str> {
@@ -225,7 +225,7 @@ pub fn absolute(name: &str) -> std::borrow::Cow<'_, str> {
 /// A name in absolute, ASCII-lowercased form — the shape comparisons and map
 /// keys in this crate assume. Borrows when the name is already both.
 ///
-/// Not [`crate::zone::absolutize`]; see [`absolute`].
+/// Not `rdns::zone::absolutize`; see [`absolute`].
 pub fn absolute_lowered(name: &str) -> std::borrow::Cow<'_, str> {
     let needs_dot = !name.ends_with('.');
     let needs_fold = has_ascii_uppercase(name);
@@ -406,7 +406,7 @@ pub fn parent_name(name: &str) -> Option<&str> {
 /// The last `labels` labels of an absolute name, as a slice of it.
 ///
 /// A suffix of whole labels *is* a slice, so walking up the tree costs nothing.
-/// The owning spelling ([`crate::dnssec::suffix_labels`]) builds a `Vec` of the
+/// The owning spelling (`rdns::dnssec::suffix_labels`) builds a `Vec` of the
 /// labels, a `join` and a `format!` per candidate, and four walks paid that per
 /// label of a name the client chose.
 ///
@@ -629,9 +629,11 @@ mod tests {
         assert_eq!(label_count("WWW.Example.COM."), 3);
     }
 
-    /// The same answers [`crate::dnssec::suffix_labels`] gives, and the same
-    /// bytes: a suffix of whole labels is a slice, so this must be a *slice* of
-    /// the input and not merely equal to one.
+    /// A suffix of whole labels is a slice, so this must be a *slice* of the
+    /// input and not merely equal to one.
+    ///
+    /// That it agrees with the owning spelling is `dnssec`'s test to make, since
+    /// that spelling lives in the other crate now (`TODO.md` #31).
     #[test]
     fn a_suffix_of_whole_labels_is_a_slice_of_the_name() {
         let name = "www.example.com.";
@@ -647,12 +649,6 @@ mod tests {
         // allocate to give it.
         let inside = suffix_labels(name, 2);
         assert!(std::ptr::eq(inside.as_ptr(), name[4..].as_ptr()));
-        for labels in 0..5 {
-            assert_eq!(
-                crate::dnssec::suffix_labels(name, labels),
-                suffix_labels(name, labels)
-            );
-        }
     }
 
     /// The whole point of the type: a key put in owned is found borrowed. If the

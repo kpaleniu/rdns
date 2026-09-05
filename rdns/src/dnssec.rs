@@ -817,6 +817,24 @@ pub fn verify_records(
 mod tests {
     use super::*;
     use crate::dnssec_test_util::{TestKey, TestZone};
+
+    /// The owning spelling and `utils`'s borrowing one give the same answers.
+    ///
+    /// Held here because the two live in different crates now: `utils` is
+    /// `rdns-core`'s and cannot name this one (`TODO.md` #31). Losing the
+    /// assertion with the move would have been the quiet half of a split.
+    #[test]
+    fn the_two_spellings_of_a_name_suffix_agree() {
+        let name = "www.example.com.";
+        for labels in 0..5 {
+            assert_eq!(
+                suffix_labels(name, labels),
+                crate::utils::suffix_labels(name, labels),
+                "{labels} labels of {name}"
+            );
+        }
+    }
+
     use crate::Ttl;
     use crate::{ParsedRecord, RecordData};
     use std::net::Ipv4Addr;
