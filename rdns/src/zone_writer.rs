@@ -40,14 +40,17 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
 
     // The SOA first, as a transfer sends it. The rest keep load order, so
     // rewriting an unchanged zone produces an unchanged file.
-    let apex_soa = |r: &ZoneRecord| {
-        r.rdata.rtype() == record_types::SOA && r.name.eq_ignore_ascii_case(zone.origin())
-    };
-    for record in zone.records().iter().filter(|r| apex_soa(r)) {
+    //
+    // Through `Zone::is_apex_soa` rather than comparing `record.name`, which is
+    // the same question five other places ask (`TODO.md` #33f). The two answers
+    // differ only for an apex stored as `@`, and `writable_name` refuses `@`
+    // outright — so the old comparison was unreachable rather than wrong, twice
+    // over, which is why there is no regression test here.
+    for record in zone.records().iter().filter(|r| zone.is_apex_soa(r)) {
         out.push_str(&record_to_string(record)?);
         out.push('\n');
     }
-    for record in zone.records().iter().filter(|r| !apex_soa(r)) {
+    for record in zone.records().iter().filter(|r| !zone.is_apex_soa(r)) {
         out.push_str(&record_to_string(record)?);
         out.push('\n');
     }

@@ -10,7 +10,6 @@
 
 use crate::error::{TransferError, TransferResult};
 use crate::Class;
-use crate::Qtype;
 use crate::Serial;
 use crate::Ttl;
 use std::collections::BTreeMap;
@@ -201,20 +200,20 @@ fn key(zone: &str) -> String {
 /// header of each half, and a copy among the records would read as a second
 /// difference sequence.
 pub fn diff(old: &Zone, new: &Zone) -> Option<ZoneDelta> {
-    let from_soa = apex_soa(old)?;
-    let to_soa = apex_soa(new)?;
+    let from_soa = old.apex_soa_record()?;
+    let to_soa = new.apex_soa_record()?;
     let from_serial = old.serial()?;
     let to_serial = new.serial()?;
 
     let mut counts: BTreeMap<RecordKey, i64> = BTreeMap::new();
     for record in old.records() {
-        if is_apex_soa(old, record) {
+        if old.is_apex_soa(record) {
             continue;
         }
         *counts.entry(record_key(old, record)).or_insert(0) += 1;
     }
     for record in new.records() {
-        if is_apex_soa(new, record) {
+        if new.is_apex_soa(record) {
             continue;
         }
         *counts.entry(record_key(new, record)).or_insert(0) -= 1;
@@ -308,24 +307,6 @@ fn record_key(zone: &Zone, record: &ZoneRecord) -> RecordKey {
     }
 }
 
-fn is_apex_soa(zone: &Zone, record: &ZoneRecord) -> bool {
-    record.rdata.rtype() == rt::SOA
-        && zone
-            .normalize_name(&record.name)
-            .eq_ignore_ascii_case(zone.origin())
-}
-
-fn apex_soa(zone: &Zone) -> Option<ResourceRecord> {
-    zone.query(zone.origin(), Qtype::of(rt::SOA))
-        .first()
-        .map(|soa| ResourceRecord {
-            name: zone.origin().to_string(),
-            class: soa.class,
-            ttl: soa.ttl,
-            rdata: soa.rdata.clone(),
-        })
-}
-
 /// Apply one difference sequence to a zone, returning the result.
 ///
 /// The zone is rebuilt rather than edited, which is why `Zone` has no
@@ -351,7 +332,7 @@ pub fn apply_changes(
     for record in base.records() {
         // The sequence's own SOA replaces this one; the framing carries it, so
         // it is never among the deletions.
-        if is_apex_soa(base, record) {
+        if base.is_apex_soa(record) {
             continue;
         }
         let key = record_key(base, record);
@@ -456,7 +437,8 @@ pub fn ixfr_response(
     deltas: &DeltaLog,
 ) -> TransferResult<IxfrResponse> {
     let apex = zone.origin();
-    let soa = apex_soa(zone)
+    let soa = zone
+        .apex_soa_record()
         .ok_or_else(|| TransferError::malformed(format!("zone {apex} has no SOA at its apex")))?;
     let current = zone
         .serial()
@@ -523,6 +505,7 @@ pub fn ixfr_response(
 mod tests {
     use super::*;
     use crate::zone::parse_zone_file;
+    use crate::Qtype;
     use crate::{OpCode, QueryClass, QuerySection, ResponseCode};
 
     fn zone_at(serial: u32, body: &str) -> Zone {
@@ -561,7 +544,7 @@ mod tests {
             edns: None,
         };
         if let Some(serial) = client_serial {
-            msg.authorities = vec![apex_soa(&zone_at(serial, "")).unwrap()];
+            msg.authorities = vec![zone_at(serial, "").apex_soa_record().unwrap()];
         }
         msg
     }

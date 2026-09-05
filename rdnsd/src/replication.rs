@@ -28,7 +28,6 @@ use anyhow::{anyhow, Context, Result};
 use tokio::sync::{Notify, RwLock};
 
 use rdns::metrics::DnsMetrics;
-use rdns::notify;
 use rdns::readiness::Readiness;
 use rdns::secondary::{
     state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile, TransferState,
@@ -296,7 +295,7 @@ pub(crate) async fn refresh_once(
     // or the new one, never a half-applied transfer. The delta is computed here
     // because this is the only moment both versions exist, and it is what lets
     // us answer an IXFR for this step to our own downstream secondaries.
-    let soa = notify::soa_record(&fetched);
+    let soa = fetched.apex_soa_record();
     install_zone(served, fetched).await;
     record_state(state, spec, serial, now, metrics).await?;
 

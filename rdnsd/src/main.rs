@@ -2107,7 +2107,7 @@ async fn announce_zones(
             .filter_map(|(name, serial)| {
                 zones
                     .get(name.as_str())
-                    .map(|zone| (name.clone(), *serial, notify::soa_record(zone)))
+                    .map(|zone| (name.clone(), *serial, zone.apex_soa_record()))
             })
             .collect();
         (current, pending)

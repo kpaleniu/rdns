@@ -554,7 +554,8 @@ pub async fn fetch_changes(
     key: Option<&TsigKey>,
 ) -> TransferResult<IxfrOutcome> {
     let zone = base.origin().to_string();
-    let soa = apex_soa(base)
+    let soa = base
+        .apex_soa_record()
         .ok_or_else(|| TransferError::malformed(format!("zone {zone} has no SOA to ask from")))?;
 
     let transfer = tokio::time::timeout(TRANSFER_TIMEOUT, async {
@@ -583,18 +584,6 @@ pub async fn fetch_changes(
             "incremental transfer of {zone} from {master} timed out"
         ))
     })?
-}
-
-/// The apex SOA of a zone as a resource record.
-fn apex_soa(zone: &Zone) -> Option<ResourceRecord> {
-    zone.query(zone.origin(), Qtype::of(rt::SOA))
-        .first()
-        .map(|soa| ResourceRecord {
-            name: zone.origin().to_string(),
-            class: soa.class,
-            ttl: soa.ttl,
-            rdata: soa.rdata.clone(),
-        })
 }
 
 async fn connect(master: std::net::SocketAddr) -> TransferResult<TcpStream> {
@@ -895,12 +884,12 @@ mod tests {
         let zone = source_zone();
         let mut reply = soa_query("example.com.", 1);
         reply.response = true;
-        reply.answers = vec![crate::notify::soa_record(&zone).unwrap()];
+        reply.answers = vec![zone.apex_soa_record().unwrap()];
         assert_eq!(soa_serial(&reply), Some(Serial::new(42)));
 
         let mut in_authority = soa_query("example.com.", 1);
         in_authority.response = true;
-        in_authority.authorities = vec![crate::notify::soa_record(&zone).unwrap()];
+        in_authority.authorities = vec![zone.apex_soa_record().unwrap()];
         assert_eq!(soa_serial(&in_authority), Some(Serial::new(42)));
 
         assert_eq!(soa_serial(&soa_query("example.com.", 1)), None);
@@ -954,7 +943,7 @@ mod tests {
     }
 
     fn ixfr_from(zone: &Zone) -> DnsMessage {
-        ixfr_request("example.com.", apex_soa(zone).unwrap(), 0x77)
+        ixfr_request("example.com.", zone.apex_soa_record().unwrap(), 0x77)
     }
 
     #[test]
@@ -1272,7 +1261,7 @@ mod tests {
                             let mut reply = request.clone();
                             reply.response = true;
                             reply.authoritive = true;
-                            reply.answers = vec![crate::notify::soa_record(&zone).unwrap()];
+                            reply.answers = vec![zone.apex_soa_record().unwrap()];
                             vec![reply]
                         };
 

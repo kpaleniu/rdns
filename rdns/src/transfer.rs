@@ -85,10 +85,12 @@ impl Iterator for AxfrRecords<'_> {
         }
         while let Some(zr) = self.zone.records().get(self.next) {
             self.next += 1;
-            let name = self.zone.normalize_name(&zr.name);
-            if zr.rdata.rtype() == rt::SOA && name.eq_ignore_ascii_case(self.zone.origin()) {
+            // The apex SOA is sent first and last by this iterator, never from
+            // the middle of the zone (RFC 5936 §2.2).
+            if self.zone.is_apex_soa(zr) {
                 continue;
             }
+            let name = self.zone.normalize_name(&zr.name);
             return Some(ResourceRecord {
                 name: name.into_owned(),
                 class: zr.class,

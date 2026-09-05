@@ -7,7 +7,7 @@ use crate::Class;
 use crate::Rtype;
 use crate::Serial;
 use crate::Ttl;
-use crate::{ParsedRecord, Qtype, RecordData};
+use crate::{ParsedRecord, Qtype, RecordData, ResourceRecord};
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
@@ -326,14 +326,51 @@ impl Zone {
         }
     }
 
+    /// The apex SOA, borrowed.
+    ///
+    /// `Option` because a `Zone` can be built record by record; one that came
+    /// from a file has an SOA or it did not load.
+    pub fn apex_soa(&self) -> Option<&ZoneRecord> {
+        self.query(&self.origin, Qtype::of(rt::SOA))
+            .first()
+            .copied()
+    }
+
+    /// The apex SOA as a standalone record, owner name absolute — the form that
+    /// goes into a message.
+    ///
+    /// Lived in three places at once (`TODO.md` #33d): `notify::soa_record`,
+    /// public and in a module about a different protocol, plus byte-identical
+    /// private copies in `xfr` and `ixfr`. It belongs where the data is.
+    pub fn apex_soa_record(&self) -> Option<ResourceRecord> {
+        self.apex_soa().map(|soa| ResourceRecord {
+            name: self.origin.clone(),
+            class: soa.class,
+            ttl: soa.ttl,
+            rdata: soa.rdata.clone(),
+        })
+    }
+
     /// The serial from the apex SOA, if the zone has one.
     pub fn serial(&self) -> Option<Serial> {
-        self.query(&self.origin, Qtype::of(crate::utils::record_types::SOA))
-            .first()
-            .and_then(|soa| match soa.rdata.parse() {
-                Ok(crate::ParsedRecord::SOA { serial, .. }) => Some(serial),
-                _ => None,
-            })
+        self.apex_soa().and_then(|soa| match soa.rdata.parse() {
+            Ok(crate::ParsedRecord::SOA { serial, .. }) => Some(serial),
+            _ => None,
+        })
+    }
+
+    /// Whether `record` is this zone's apex SOA.
+    ///
+    /// The normalization is the point: an owner name in a `Zone` may be `@` or
+    /// relative, and two of the five places that asked this question compared
+    /// [`ZoneRecord::name`] raw (`TODO.md` #33f). Callers holding a
+    /// [`ResourceRecord`] off the wire and a zone *name* — `xfr`, `journal` —
+    /// have no `Zone` to ask and still write it out.
+    pub fn is_apex_soa(&self, record: &ZoneRecord) -> bool {
+        record.rdata.rtype() == rt::SOA
+            && self
+                .normalize_name(&record.name)
+                .eq_ignore_ascii_case(&self.origin)
     }
 
     /// Whether the zone holds anything at `name` — by that name, because
@@ -1502,6 +1539,39 @@ mod tests {
     fn test_zone_creation() {
         let zone = Zone::new("example.com".to_string());
         assert_eq!(zone.origin, "example.com.");
+    }
+
+    /// A `Zone` built record by record can hold the apex SOA under `@`, which
+    /// is what the zone file said. Every question about "is this the apex SOA"
+    /// therefore has to normalize first, and two of the five places that asked
+    /// it compared the stored name raw (`TODO.md` #33f).
+    #[test]
+    fn the_apex_soa_is_found_under_an_unabsolutized_owner_name() {
+        let mut zone = Zone::new("example.com.".to_string());
+        zone.add_record(ZoneRecord {
+            name: "@".to_string(),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+            rdata: RecordData::from_parsed(&ParsedRecord::SOA {
+                mname: "ns1.example.com.".to_string(),
+                rname: "admin.example.com.".to_string(),
+                serial: Serial::new(7),
+                refresh: 3600,
+                retry: 600,
+                expire: 604800,
+                minimum: 300,
+            })
+            .unwrap(),
+        });
+
+        let soa = zone.apex_soa().expect("the apex SOA, stored as `@`");
+        assert!(zone.is_apex_soa(soa));
+        assert_eq!(zone.serial(), Some(Serial::new(7)));
+        assert_eq!(
+            zone.apex_soa_record().expect("as a record").name,
+            "example.com.",
+            "the record that goes on the wire carries the absolute owner name"
+        );
     }
 
     /// `has_delegations` skips the ancestor walk, so it decides whether a

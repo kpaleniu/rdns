@@ -109,19 +109,6 @@ pub fn zone_serials(zones: &[&Zone]) -> Vec<(String, Serial)> {
         .collect()
 }
 
-/// The apex SOA of `zone` as a resource record, ready for a NOTIFY's answer
-/// section.
-pub fn soa_record(zone: &Zone) -> Option<ResourceRecord> {
-    zone.query(zone.origin(), Qtype::of(rt::SOA))
-        .first()
-        .map(|soa| ResourceRecord {
-            name: zone.origin().to_string(),
-            class: soa.class,
-            ttl: soa.ttl,
-            rdata: soa.rdata.clone(),
-        })
-}
-
 /// The serial in a NOTIFY's answer section, if it carried its SOA.
 pub fn notified_serial(msg: &DnsMessage) -> Option<Serial> {
     msg.answers
@@ -155,7 +142,7 @@ mod tests {
     #[test]
     fn test_a_notify_is_a_notify_on_the_wire() {
         let zone = zone_with_serial(7);
-        let msg = notify_request("example.com.", soa_record(&zone), 0x1234);
+        let msg = notify_request("example.com.", zone.apex_soa_record(), 0x1234);
 
         let mut buf = vec![0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("serialize");
