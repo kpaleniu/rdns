@@ -16,7 +16,7 @@ use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::response::ClientEdns;
 use rdns::rfc5011::{self, AnchorChange, ManagedAnchors};
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl};
-use rdns::shutdown::{stop_signal, Busy, Shutdown, Stop};
+use rdns::shutdown::{Busy, Shutdown, Stop};
 use rdns::special_names;
 use rdns::utils::current_unix_timestamp;
 use rdns::utils::record_types;
@@ -26,9 +26,8 @@ use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, Qtype, QuerySection, ResourceRecord, ResponseCode,
     OPT_RECORD_TYPE,
 };
-use rdns_transport::{listener_failure, ServeContext, Transport, TransportLimits};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use rdns_transport::{tcp, ServeContext, Transport, TransportLimits};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
@@ -455,7 +454,6 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let mut loops = JoinSet::new();
-    let (shutdown_stop, shutdown_busy) = (shutdown.stop_handle(), shutdown.busy());
     loops.spawn(udp_main(
         socket,
         resolver.clone(),
@@ -465,18 +463,29 @@ async fn main() -> anyhow::Result<()> {
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
-    loops.spawn(tcp_main(
+    // Per connection, not per message: a resolver's clients open a connection
+    // and ask a few things (`TODO.md` #30e).
+    loops.spawn(tcp::serve(
         listener,
-        resolver,
-        caches,
-        ctx.clone(),
+        Arc::new(Resolving {
+            resolver,
+            caches,
+            ctx: ctx.clone(),
+        }),
         TransportLimits::default(),
+        tcp::RateLimit::PerConnection,
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
     // A listener like the others: if it dies, the process does. Metrics that
     // silently stopped are worse than a resolver that is plainly down.
     if let Some(metrics_listener) = metrics_listener {
+        // Both handles taken *here*, not before the `if`: a `Busy` clone that
+        // nothing moves into a task is one `main` holds for the life of the
+        // process, so the drain never reaches zero and every shutdown waits out
+        // its whole budget before exiting — which is what this daemon did with
+        // no `--metrics-listen`, which is the default.
+        let (stop, busy) = (shutdown.stop_handle(), shutdown.busy());
         loops.spawn(async move {
             metrics_server::serve(
                 metrics_listener,
@@ -484,42 +493,18 @@ async fn main() -> anyhow::Result<()> {
                 // Nothing to wait for: a resolver is ready as soon as it is
                 // up.
                 Readiness::ready(),
-                shutdown_stop,
-                shutdown_busy,
+                stop,
+                busy,
             )
             .await
         });
     }
 
-    // Neither loop returns in normal operation; whichever ends first ends the
-    // process rather than leaving one transport served.
-    let mut failure: Option<anyhow::Error> = None;
-    tokio::select! {
-        joined = loops.join_next() => {
-            failure = joined.and_then(listener_failure);
-        }
-        signal = stop_signal() => {
-            tracing::info!("{signal} received, shutting down");
-        }
-    }
-
-    shutdown.begin();
-    while let Some(joined) = loops.join_next().await {
-        if failure.is_none() {
-            failure = listener_failure(joined);
-        }
-    }
-
-    let _ = anomalies.await;
-
-    // What is left running is a resolution a client waits on, or the RFC 5011
-    // manager part-way through rewriting the anchor file.
-    shutdown.drain_reporting().await;
-
-    match failure {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    // Whichever listener ends first ends the process rather than leaving one
+    // transport served; what the drain then waits for here is a resolution a
+    // client is waiting on, or the RFC 5011 manager part-way through rewriting
+    // the anchor file.
+    rdns_transport::serve_until_stopped(loops, anomalies, shutdown).await
 }
 
 /// Follow the managed zones' DNSKEY RRsets and keep the anchors in step
@@ -832,153 +817,44 @@ async fn udp_main(
     }
 }
 
-/// Accept TCP connections, bounded by [`TransportLimits::max_connections`].
-async fn tcp_main(
-    listener: TcpListener,
+/// What answers a query on this resolver, for the shared TCP transport.
+///
+/// The three handles `handle_query` needs, in one place so the transport can
+/// hold them: it is generic over the handler and knows nothing about resolving.
+struct Resolving {
     resolver: Arc<Resolver>,
     caches: Arc<Caches>,
     ctx: Arc<ServeContext>,
-    limits: TransportLimits,
-    stop: Stop,
-    busy: Busy,
-) -> Result<(), std::io::Error> {
-    let permits = Arc::new(Semaphore::new(limits.max_connections));
-    loop {
-        // Open connections drain in their own tasks. `accept` is cancel-safe,
-        // so a connection lost to this race stays in the kernel backlog.
-        let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => accepted?,
-            _ = stop.wait() => return Ok(()),
-        };
-        // The rate limit applies to TCP; the response *budget* does not, since
-        // a peer that completed a handshake is not one being reflected at. A
-        // flood of connections is still a flood.
-        if !ctx.allow_source(peer.ip(), current_unix_timestamp()) {
-            continue;
-        }
-        // The semaphore is never closed, so acquiring only fails if we drop it.
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            continue;
-        };
-        let resolver = resolver.clone();
-        let caches = caches.clone();
-        let stop = stop.clone();
-        let busy = busy.clone();
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            serve_connection(stream, peer.ip(), resolver, caches, ctx, limits, stop).await;
-            drop(permit);
-            drop(busy);
-        });
-    }
 }
 
-/// Serve one TCP connection until it goes idle, closes, or misbehaves.
-///
-/// Each message is framed by a 2-byte big-endian length (RFC 1035 §4.2.2), and a
-/// connection may carry any number of queries (RFC 7766 §6.2.1), answered
-/// concurrently (§6.2.1.1) — a cache miss costs an upstream round trip, so
-/// lock-step would make every query wait out the slowest one ahead of it.
-async fn serve_connection(
-    stream: TcpStream,
-    peer: IpAddr,
-    resolver: Arc<Resolver>,
-    caches: Arc<Caches>,
-    ctx: Arc<ServeContext>,
-    limits: TransportLimits,
-    stop: Stop,
-) {
-    let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(limits.max_inflight_per_connection);
-
-    // One task owns the write half. Answers may complete out of order
-    // (RFC 7766 §6.2.1.1; clients match on the transaction id), but two framed
-    // messages must never interleave on the wire.
-    let writer_task = tokio::spawn(async move {
-        while let Some(framed) = rx.recv().await {
-            if writer.write_all(&framed).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let in_flight = Arc::new(Semaphore::new(limits.max_inflight_per_connection));
-
-    loop {
-        // Between messages an idle peer is legitimate, so a timeout here is a
-        // normal close. So is a shutdown: the peer has committed to nothing, so
-        // it costs one reconnect and no answer.
-        let mut len_buf = [0u8; 2];
-        let read = tokio::select! {
-            r = tokio::time::timeout(limits.idle_timeout, reader.read_exact(&mut len_buf)) => r,
-            _ = stop.wait() => break,
-        };
-        match read {
-            Ok(Ok(_)) => {}
-            _ => break,
-        }
-
-        let len = u16::from_be_bytes(len_buf) as usize;
-        if len == 0 {
-            break; // Can't even hold a header; treat as a broken peer.
-        }
-
-        // Mid-message the peer has committed to `len` bytes, so a stall gets a
-        // much shorter leash.
-        let mut buf = vec![0u8; len];
-        match tokio::time::timeout(limits.read_timeout, reader.read_exact(&mut buf)).await {
-            Ok(Ok(_)) => {}
-            _ => break,
-        }
-
-        // The structural caps, on bytes nothing has trusted yet — the same
-        // door the UDP loop above uses, with the TCP ceiling rather than the
-        // 512-octet one. This transport had none of it (`TODO.md` #30q). The
-        // message is skipped, not the connection: a peer that framed it
-        // correctly is still speaking the protocol.
-        if !ctx.accept_packet(peer, &buf, Transport::Tcp) {
-            continue;
-        }
-
-        // This await is what stops a pipelining client from spawning tasks
-        // faster than we retire them.
-        let Ok(permit) = in_flight.clone().acquire_owned().await else {
-            break;
-        };
-        let resolver = resolver.clone();
-        let caches = caches.clone();
-        let tx = tx.clone();
-        let ctx = ctx.clone();
-        // Per message, not per connection: a connection may carry queries
-        // minutes apart (RFC 7766 §6.2.3).
-        let now = current_unix_timestamp();
-        tokio::spawn(async move {
-            if let Some(reply) =
-                handle_query(buf, peer, now, &resolver, &caches, &ctx, Transport::Tcp).await
-            {
-                // Prefix and message in one buffer, so the writer emits them
-                // in a single call. A reply too long to frame is dropped rather
-                // than sent with a wrapped prefix, which the peer would read as
-                // a broken stream.
-                match rdns::framed(&reply) {
-                    Ok(framed) => {
-                        // A send error means the writer is gone (the peer hung
-                        // up); there is nowhere left to put the reply.
-                        let _ = tx.send(framed).await;
-                    }
-                    Err(e) => {
-                        tracing::error!("could not frame a {}-octet reply: {e}", reply.len());
-                    }
-                }
-            }
-            drop(permit);
-        });
+impl tcp::Handler for Resolving {
+    fn context(&self) -> &ServeContext {
+        &self.ctx
     }
 
-    // Dropping our sender lets the writer drain the replies still in flight —
-    // the clones held by running tasks keep the channel open — and then exit.
-    drop(tx);
-    let _ = writer_task.await;
+    /// One reply or none, into a sink that can carry several — a resolver never
+    /// sends more than one, and the shape is `rdnsd`'s AXFR's (`TODO.md` #30a).
+    async fn handle(
+        &self,
+        packet: Vec<u8>,
+        peer: SocketAddr,
+        now: u64,
+        out: mpsc::Sender<tcp::Reply>,
+    ) {
+        if let Some(reply) = handle_query(
+            packet,
+            peer.ip(),
+            now,
+            &self.resolver,
+            &self.caches,
+            &self.ctx,
+            Transport::Tcp,
+        )
+        .await
+        {
+            tcp::send_framed(&out, &reply).await;
+        }
+    }
 }
 
 /// Resolve one datagram: cache lookup, else forward upstream and cache-store.
@@ -1323,6 +1199,8 @@ fn build_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     /// Never reached: every test below is about a packet rejected before any
     /// resolution is attempted.
@@ -1595,12 +1473,15 @@ mod tests {
         let shutdown = Shutdown::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let server = tokio::spawn(tcp_main(
+        let server = tokio::spawn(tcp::serve(
             listener,
-            resolver,
-            caches,
-            ctx,
+            Arc::new(Resolving {
+                resolver,
+                caches,
+                ctx,
+            }),
             TransportLimits::default(),
+            tcp::RateLimit::PerConnection,
             shutdown.stop_handle(),
             shutdown.busy(),
         ));

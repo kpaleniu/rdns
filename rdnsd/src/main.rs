@@ -40,7 +40,7 @@ use rdns::{
     readiness::Readiness,
     secondary::{state_file_path, MasterSpec, StateFile},
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
-    shutdown::{stop_signal, Busy, Lifecycle, Shutdown, Stop},
+    shutdown::{Busy, Lifecycle, Shutdown, Stop},
     transfer::axfr_envelopes,
     tsig::{self, TsigCheck, TsigKeyring, TsigSession},
     update,
@@ -49,7 +49,8 @@ use rdns::{
     zone::{parse_zone_file_at, Zone},
     DnsMessage, Edns, OpCode, Qtype, ResourceRecord, ResponseCode, Serial,
 };
-use rdns_transport::{listener_failure, ServeContext, Transport, TransportLimits};
+use rdns_transport::tcp::{self, send_framed, Reply};
+use rdns_transport::{ServeContext, Transport, TransportLimits};
 
 /// UDP payload size rdnsd advertises to clients via EDNS0.
 const RDNSD_PAYLOAD_SIZE: u16 = 4096;
@@ -67,9 +68,8 @@ pub(crate) fn default_udp_workers() -> usize {
         .clamp(2, 32)
 }
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 
 #[cfg(unix)]
@@ -633,10 +633,13 @@ async fn serve(
             shutdown.busy(),
         ));
     }
-    loops.spawn(tcp_loop(
+    // Per message, not per connection: this server's clients are resolvers, and
+    // they pipeline (`TODO.md` #30e).
+    loops.spawn(tcp::serve(
         listener,
         server.clone(),
         TransportLimits::default(),
+        tcp::RateLimit::PerMessage,
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
@@ -680,196 +683,41 @@ async fn serve(
         ));
     }
 
-    // Neither loop returns in normal operation. Whichever ends first ends the
-    // process: answering on one transport and not the other is worse than being
-    // plainly down.
-    let mut failure: Option<anyhow::Error> = None;
-    tokio::select! {
-        joined = loops.join_next() => {
-            failure = joined.and_then(listener_failure);
-        }
-        signal = stop_signal() => {
-            tracing::info!("{signal} received, shutting down");
-        }
-    }
-
-    shutdown.begin();
-    // Awaiting them is what makes "stopped accepting" true before the drain
-    // starts counting.
-    while let Some(joined) = loops.join_next().await {
-        if failure.is_none() {
-            failure = listener_failure(joined);
-        }
-    }
-
-    let _ = anomalies.await;
-
-    // Wait for work accepted before the stop. A client cannot tell a truncated
-    // AXFR from a complete one, so cutting one mid-stream is the case this is
-    // for.
-    shutdown.drain_reporting().await;
-
-    match failure {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    // Whichever listener ends first ends the process: answering on one transport
+    // and not the other is worse than being plainly down. The drain then waits
+    // for an AXFR already on the wire, which a client cannot tell from a
+    // complete one if it is cut.
+    rdns_transport::serve_until_stopped(loops, anomalies, shutdown).await
 }
 
-/// Accept connections and serve each in its own task.
-async fn tcp_loop(
-    listener: TcpListener,
-    server: Arc<Server>,
-    limits: TransportLimits,
-    stop: Stop,
-    busy: Busy,
-) -> Result<(), std::io::Error> {
-    let permits = Arc::new(Semaphore::new(limits.max_connections));
-    loop {
-        // Stop accepting on shutdown; open connections drain in their own tasks.
-        // `accept` is cancel-safe, so a lost race leaves the connection in the
-        // kernel's backlog.
-        let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => accepted?,
-            _ = stop.wait() => return Ok(()),
-        };
-        // Back-pressure on accept rather than unbounded spawning. The semaphore
-        // is never closed, so this only fails if we drop it.
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            continue;
-        };
-        let server = server.clone();
-        let stop = stop.clone();
-        // Claim the drain for the connection's life: a client cannot tell a
-        // truncated AXFR from a complete one.
-        let busy = busy.clone();
-        tokio::spawn(async move {
-            server.serve_connection(stream, peer, limits, stop).await;
-            drop(permit);
-            drop(busy);
-        });
+/// What answers a query on this server, for the shared TCP transport.
+///
+/// The sink shape is this daemon's requirement: an AXFR is a *sequence* of
+/// messages (RFC 5936 §2.2), so a slow client back-pressures the next envelope
+/// rather than having the whole zone built ahead of it (`TODO.md` #30a).
+impl tcp::Handler for Server {
+    fn context(&self) -> &ServeContext {
+        &self.ctx
+    }
+
+    async fn handle(&self, packet: Vec<u8>, peer: SocketAddr, now: u64, out: mpsc::Sender<Reply>) {
+        self.answer(&packet, peer, now, &out).await;
     }
 }
 
 impl Server {
-    /// Serve one connection until it goes idle, closes, or misbehaves.
-    ///
-    /// Queries on one connection are answered concurrently, so a slow one does
-    /// not stall those behind it (RFC 7766 §6.2.1.1). On shutdown, reading stops
-    /// but queries already accepted finish and reach the wire.
-    async fn serve_connection(
-        self: Arc<Self>,
-        stream: TcpStream,
-        peer: SocketAddr,
-        limits: TransportLimits,
-        stop: Stop,
-    ) {
-        let (mut reader, mut writer) = stream.into_split();
-        let (tx, mut rx) = mpsc::channel::<Reply>(limits.max_inflight_per_connection);
-
-        // One task owns the write half: replies may complete out of order
-        // (RFC 7766 §6.2.1.1), but two framed messages must never interleave.
-        let writer_logger = self.ctx.logger.clone();
-        let writer_task = tokio::spawn(async move {
-            while let Some(reply) = rx.recv().await {
-                let Reply::Frame(framed) = reply else {
-                    // `Reply::Abort`: dropping the write half tells the peer its
-                    // half-finished transfer will not be completed.
-                    break;
-                };
-                if let Err(e) = writer.write_all(&framed).await {
-                    bad_request!(writer_logger, peer.ip(), "socket write error: {e}");
-                    break;
-                }
-            }
-        });
-
-        let in_flight = Arc::new(Semaphore::new(limits.max_inflight_per_connection));
-
-        loop {
-            // A 2-byte big-endian length prefix frames each message
-            // (RFC 1035 §4.2.2); a single `read` can be short or coalesced. Idle
-            // between messages is ordinary, so a timeout here ends the connection
-            // like EOF. The shutdown check sits here because the peer has
-            // committed to nothing yet: `read_exact` is not cancel-safe, but a
-            // lost length prefix on a connection we are closing costs nothing.
-            let mut len_buf = [0u8; 2];
-            let read = tokio::select! {
-                r = tokio::time::timeout(limits.idle_timeout, reader.read_exact(&mut len_buf)) => r,
-                _ = stop.wait() => break,
-            };
-            match read {
-                Ok(Ok(_)) => {}
-                _ => break,
-            }
-
-            let len = u16::from_be_bytes(len_buf) as usize;
-            if len == 0 {
-                bad_request!(self.ctx.logger, peer.ip(), "zero-length TCP message");
-                break;
-            }
-
-            // Mid-message the peer has committed to sending `len` bytes, so a
-            // stall here gets a much shorter leash than an idle connection.
-            let mut packet = vec![0u8; len];
-            match tokio::time::timeout(limits.read_timeout, reader.read_exact(&mut packet)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    self.ctx.logger.count_error(peer.ip());
-                    tracing::debug!(peer = %peer.ip(), "socket read error: {e}");
-                    break;
-                }
-                Err(_) => {
-                    self.ctx.logger.count_error(peer.ip());
-                    tracing::debug!(peer = %peer.ip(), "timed out mid-message on TCP");
-                    break;
-                }
-            }
-
-            // Cap in-flight work per connection: this await is what stops a
-            // pipelining client from spawning tasks faster than we retire them.
-            let Ok(permit) = in_flight.clone().acquire_owned().await else {
-                break;
-            };
-            let server = self.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                // `answer` sends rather than returning a `Vec`, so a transfer
-                // hands over one envelope at a time and a slow client
-                // back-pressures the next instead of the whole zone being built
-                // ahead of it. One sender per reply keeps a transfer's messages in
-                // order; another query's reply may land between them, which is
-                // legal.
-                server.answer(&packet, peer, &tx).await;
-                drop(permit);
-            });
-        }
-
-        // Dropping our sender lets the writer drain what is still in flight — the
-        // clones held by running tasks keep the channel open — and then exit.
-        drop(tx);
-        let _ = writer_task.await;
-    }
-
     /// Answer one query, sending each length-prefixed message to the connection's
     /// writer as it is built.
     ///
     /// A sequence, because an AXFR response is one (RFC 5936 §2.2), and sent
     /// rather than returned so a large zone never exists all at once. Sending
     /// nothing is how a query earns no response at all.
-    async fn answer(&self, packet: &[u8], peer: SocketAddr, out: &mpsc::Sender<Reply>) {
+    /// `now` is the transport's single clock read for this message: the
+    /// limiter has already used it, and the logger and the TSIG check want the
+    /// same instant (`TODO.md` #28a). Admission ran before the spawn, which is
+    /// where it belongs (`CLAUDE.md` §9).
+    async fn answer(&self, packet: &[u8], peer: SocketAddr, now: u64, out: &mpsc::Sender<Reply>) {
         let ip = peer.ip();
-        // One clock read for the whole message: the limiter, the logger and the
-        // TSIG check all want this instant, and each used to fetch its own
-        // (`TODO.md` #28a).
-        let now = tsig::now();
-
-        if !self.ctx.allow_source(ip, now) {
-            return;
-        }
-        if !self.ctx.accept_packet(ip, packet, Transport::Tcp) {
-            return;
-        }
-
         // `Request` is the door: it parses and it refuses QR=1. `AdmissionCheck`
         // accepts QR=1 on purpose — it runs on both directions of the wire — so
         // the check belongs here, where we know the packet reached a listener.
@@ -1268,7 +1116,13 @@ impl Server {
             },
             None => bytes,
         };
-        frame(&bytes).into_iter().collect()
+        rdns::framed(&bytes)
+            .map_err(|e| {
+                // ERROR, not DEBUG: a client got no answer at all.
+                tracing::error!("could not frame a {}-octet reply: {e}", bytes.len())
+            })
+            .into_iter()
+            .collect()
     }
 
     /// Answer a dynamic UPDATE (RFC 2136).
@@ -1558,41 +1412,6 @@ fn apply_update_to_file(
         None => applied.zone.clone(),
     };
     Ok((Some(installed), applied))
-}
-
-/// What a connection's writer task can be handed.
-///
-/// A transfer is answered one envelope at a time, so a failure can happen with
-/// part of the answer already on the wire, where an error response would be
-/// read as another envelope.
-enum Reply {
-    /// One length-prefixed message, to be written.
-    Frame(Vec<u8>),
-    /// Stop writing and close the connection.
-    ///
-    /// A transfer is complete at its closing SOA (RFC 5936 §2.2), so a stream
-    /// that ends first is one the client must discard. Closing says so at once;
-    /// falling silent leaves it waiting out a timeout.
-    Abort,
-}
-
-/// Frame `bytes` and hand them to the writer. `false` if the connection is gone.
-async fn send_framed(out: &mpsc::Sender<Reply>, bytes: &[u8]) -> bool {
-    let Some(framed) = frame(bytes) else {
-        return false;
-    };
-    out.send(Reply::Frame(framed)).await.is_ok()
-}
-
-fn frame(bytes: &[u8]) -> Option<Vec<u8>> {
-    match rdns::framed(bytes) {
-        Ok(framed) => Some(framed),
-        Err(e) => {
-            // ERROR, not DEBUG: a client got no answer at all.
-            tracing::error!("could not frame a {}-octet reply: {e}", bytes.len());
-            None
-        }
-    }
 }
 
 /// An empty TC=1 answer to `request`: the question echoed, no records.
@@ -2784,6 +2603,8 @@ mod tests {
     use rdns::QueryClass;
     use rdns::Ttl;
     use std::collections::BTreeMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
     use tokio::sync::Notify;
 
     /// `Server::answer` collected, for tests wanting the whole reply in hand.
@@ -2791,7 +2612,7 @@ mod tests {
     /// nothing in a test fills the channel before it is drained here.
     async fn answered(server: &Server, packet: &[u8], peer: SocketAddr) -> Vec<Vec<u8>> {
         let (tx, mut rx) = mpsc::channel::<Reply>(1024);
-        server.answer(packet, peer, &tx).await;
+        server.answer(packet, peer, tsig::now(), &tx).await;
         drop(tx);
         let mut replies = Vec::new();
         while let Some(Reply::Frame(framed)) = rx.recv().await {
@@ -3295,10 +3116,11 @@ mod tests {
             let shutdown = Shutdown::new();
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
-            let loop_handle = tokio::spawn(tcp_loop(
+            let loop_handle = tokio::spawn(tcp::serve(
                 listener,
                 server_with(big_zone()),
                 TransportLimits::default(),
+                tcp::RateLimit::PerMessage,
                 shutdown.stop_handle(),
                 shutdown.busy(),
             ));
@@ -3357,10 +3179,11 @@ mod tests {
             let shutdown = Shutdown::new();
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
-            let loop_handle = tokio::spawn(tcp_loop(
+            let loop_handle = tokio::spawn(tcp::serve(
                 listener,
                 server_with(big_zone()),
                 TransportLimits::default(),
+                tcp::RateLimit::PerMessage,
                 shutdown.stop_handle(),
                 shutdown.busy(),
             ));
@@ -3398,10 +3221,11 @@ mod tests {
             let shutdown = Shutdown::new();
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
-            tokio::spawn(tcp_loop(
+            tokio::spawn(tcp::serve(
                 listener,
                 server_with(big_zone()),
                 TransportLimits::default(),
+                tcp::RateLimit::PerMessage,
                 shutdown.stop_handle(),
                 shutdown.busy(),
             ));
@@ -3582,10 +3406,12 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             while let Ok((stream, peer)) = listener.accept().await {
-                tokio::spawn(server.clone().serve_connection(
+                tokio::spawn(tcp::serve_one(
                     stream,
                     peer,
+                    server.clone(),
                     TransportLimits::default(),
+                    tcp::RateLimit::PerMessage,
                     test_shutdown().stop_handle(),
                 ));
             }
@@ -3640,10 +3466,12 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             while let Ok((stream, peer)) = listener.accept().await {
-                tokio::spawn(server.clone().serve_connection(
+                tokio::spawn(tcp::serve_one(
                     stream,
                     peer,
+                    server.clone(),
                     TransportLimits::default(),
+                    tcp::RateLimit::PerMessage,
                     test_shutdown().stop_handle(),
                 ));
             }
@@ -3694,7 +3522,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         stream
-            .write_all(&frame(&bytes).expect("the test message frames"))
+            .write_all(&rdns::framed(&bytes).expect("the test message frames"))
             .await
             .expect("write");
         let mut len = [0u8; 2];

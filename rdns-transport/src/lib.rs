@@ -17,6 +17,8 @@
 //! It holds no DNS logic. Deciding what a question deserves is `rdns`'s, and
 //! answering it is each daemon's.
 
+pub mod tcp;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +26,7 @@ use std::time::Duration;
 use rdns::logging::QueryLogger;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::security::{RateLimiter, ResponseLimiter};
+use rdns::shutdown::{stop_signal, Shutdown};
 use rdns::validation::AdmissionCheck;
 use rdns::ResponseCode;
 
@@ -161,6 +164,53 @@ impl Default for TransportLimits {
             max_connections: 128,
             max_inflight_per_connection: 16,
         }
+    }
+}
+
+/// Serve until a listener stops or the operator does, then drain.
+///
+/// The epilogue both daemons had written out (`TODO.md` #30d): whichever
+/// listener ends first ends the process, because answering on one transport and
+/// not the other is worse than being plainly down; a signal is an orderly stop.
+///
+/// `background` is the task that is *not* a listener — the periodic anomaly
+/// warnings — and is awaited rather than dropped, because dropping a
+/// `JoinHandle` detaches the task instead of cancelling it (`CLAUDE.md` §9). It
+/// is not in the `JoinSet` for a sharper reason: that set's rule is "the first
+/// task to end ends the process", and `--anomaly-interval 0` returns at once.
+pub async fn serve_until_stopped(
+    mut loops: tokio::task::JoinSet<Result<(), std::io::Error>>,
+    background: tokio::task::JoinHandle<()>,
+    shutdown: Shutdown,
+) -> anyhow::Result<()> {
+    let mut failure: Option<anyhow::Error> = None;
+    tokio::select! {
+        joined = loops.join_next() => {
+            failure = joined.and_then(listener_failure);
+        }
+        signal = stop_signal() => {
+            tracing::info!("{signal} received, shutting down");
+        }
+    }
+
+    shutdown.begin();
+    // Awaiting them is what makes "stopped accepting" true before the drain
+    // starts counting.
+    while let Some(joined) = loops.join_next().await {
+        if failure.is_none() {
+            failure = listener_failure(joined);
+        }
+    }
+    let _ = background.await;
+
+    // Wait for work accepted before the stop. A client cannot tell a truncated
+    // AXFR from a complete one, so cutting one mid-stream is the case this is
+    // for.
+    shutdown.drain_reporting().await;
+
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
