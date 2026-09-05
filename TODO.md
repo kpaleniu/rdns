@@ -45,11 +45,11 @@ every *measurement* and every caveat needed to trust one; those say
 **Everything else numbered is closed, withdrawn, or answered no**, and the table
 under "Closed work" says which, when, and where the reasoning is.
 
-**Outside the numbered sections, one thing is genuinely pending: the tree is 47
-commits ahead of `origin/main` and has never been pushed.** Five CI jobs have
-still never been read — msrv, deny, the container image, the `dhat-heap` feature
-build, and clippy on Linux. That is the operator's call, not a session's: see
-"Do not push" below.
+**Outside the numbered sections, one thing is genuinely pending: nothing here
+has ever been pushed.** `git rev-list --count origin/main..HEAD` says how far
+ahead — it was 49 on 2026-09-05 — and five CI jobs have still never been read:
+msrv, deny, the container image, the `dhat-heap` feature build, and clippy on
+Linux. That is the operator's call, not a session's: see "Do not push" below.
 
 **A count in a preamble goes stale whenever the list under it changes**, which
 happened to this page's summary paragraphs at least eight times between
@@ -101,9 +101,10 @@ first run rather than running both.
 **Do not push from a session.** Commit locally and stop. Which remote, and why a
 push costs something, are in `CLAUDE.local.md`.
 
-**The tree is 47 commits ahead of `origin/main` as of 2026-09-05**, and every
-one of them is unpushed, so CI has seen none of it. Five of the seven jobs have
-still never been read at all — see "Where to pick up next".
+**The tree is a long way ahead of `origin/main` and CI has seen none of it** —
+`git rev-list --count origin/main..HEAD` is the number, and it was 49 on
+2026-09-05. Five of the seven jobs have still never been read at all; see
+"Where to pick up next".
 
 **The first CI run failed, and the failure was the test's fault rather than the
 code's.** One job failed and one warning appeared across several; both are fixed
@@ -679,8 +680,9 @@ rather than a queue. Everything else numbered is under "Closed work" below.
 Everything here is a choice, not a queue. Three things, in the order their cost
 argues for.
 
-> **1. Push, and read the five CI jobs nobody has ever read.** The tree is 47
-> commits ahead of `origin/main`. Of the seven job-runs a push costs, five have
+> **1. Push, and read the five CI jobs nobody has ever read.** Ask
+> `git rev-list --count origin/main..HEAD` how much is waiting; it was 49 on
+> 2026-09-05. Of the seven job-runs a push costs, five have
 > never been looked at: msrv (1.95), deny, the container image, the `dhat-heap`
 > feature build, and clippy on *Linux* — though that last one is checked by hand
 > here and is clean as of 2026-09-05, on the half of the tree Windows cannot
