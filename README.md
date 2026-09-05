@@ -20,7 +20,8 @@ resolver, and the library both are built on.
 | this file | how to run and deploy it |
 | `docs/spec/` | what it does: wire codec, zone model, both daemons, DNSSEC, operations, RFC conformance |
 | `docs/CLI_USAGE.md` | `rdnsd` flags in detail |
-| `TODO.md` | open work, verification recipes |
+| `TODO.md` | open work, current state, verification recipes |
+| `docs/CLOSED_WORK.md` | every finished item, and the reasoning that produced it |
 | `CLAUDE.md` | coding rules for this repo |
 
 ## Features
@@ -365,19 +366,23 @@ rdnsr --port 5354 --upstream 1.1.1.1:53
 
 ## Status
 
-757 tests passing on 2026-08-03, plus 4 doc-tests marked `ignore`.
-`cargo test --workspace` is the source of truth.
+854 tests passing on Windows and 870 on Linux, measured 2026-09-05 on the same
+tree; the gap is the sixteen `#[cfg(unix)]` tests. Plus 4 doc-tests marked
+`ignore`. `cargo test --workspace` is the source of truth.
 
 | suite | tests |
 |---|---|
-| `rdns` library | 658 |
-| `rdns` allocation gate (`tests/allocations.rs`) | 1, holding 19 measurements, 13 exact |
+| `rdns-core` | 157 |
+| `rdns` library | 574 (577 on Linux) |
+| `rdns` allocation gate (`tests/allocations.rs`) | 1, holding 42 measurements, 32 exact |
 | `rdns` fuzz guard (`tests/no_input_panics.rs`) | 1, running 1,506 mutated messages through the pre-authentication path |
-| `rdnsd` | 94 |
-| `rdnsr` | 3 |
+| `rdns-transport` | 2 |
+| `rdnsd` | 109 (122 on Linux) |
+| `rdnsr` | 10 |
 
-Open work is `TODO.md`'s table — six items, of which #17 is the one confirmed bug
-(a TCP length prefix that wraps on a TSIG-signed answer near 64 KB).
+Open work is `TODO.md` — one review section (#33, filed 2026-09-05) and one
+inventory of deliberate RFC deviations (#21). Everything else numbered is
+closed; `docs/CLOSED_WORK.md` holds it.
 
 Not implemented: DNS over TLS/HTTPS/QUIC, DNAME, SIG(0), SVCB/HTTPS parsing, any
 class but IN. `docs/spec/07-rfc-conformance.md` is the full matrix.
