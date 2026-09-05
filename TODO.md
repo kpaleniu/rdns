@@ -89,6 +89,24 @@ reviewed against the code the day they were filed** and four claims did not
 survive it; they are struck through in place, and what the review moved is at the
 end of #30.
 
+**A fourth pass, 2026-09-05, asked #30's question of the whole tree** rather
+than of the transports, and filed **#33**: is anything written twice, would a
+generic or a trait collapse it, and are the modules and crates cut in the right
+places. The last of those three is the one that produced almost nothing, and
+**five candidates were dropped — four by rules already on this page**, which is
+the half worth reading; a `dnssec/` module directory died on #31's own rule that
+a split without a measurement is motion. The one defect is **33b**, and it is in
+a shipped binary: `DnsMessageBuilder` resolves its question type through an
+**RTYPE** table, so ANY, AXFR and IXFR find nothing there and the question is
+dropped in silence — `rdnsc` cannot ask an ANY query at all, which is why
+nothing here exercises the RFC 8482 path #9f fixed in `rdnsd`. **33a is the one
+with teeth**: `NegativeCache` kept the per-insert `min_by_key` scan that
+`DnsCache` was fixed away from, measured at 14.6 µs against 0.26 at the same
+bound, on the mutex every query takes. Two of this filing's own claims died on
+review — a `zone_writer` bug that is not reachable, and a trait that is the
+wrong shape for what is actually duplicated — and both are struck through in
+place.
+
 Build and test with the four commands at the top of `CLAUDE.md`;
 `cargo bench -p rdns` is the fifth. **Do not push** — commit locally and leave
 it; the reason is in `CLAUDE.local.md` and it is about the account, not the code.
@@ -737,6 +755,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **30** | the two daemons' transports are one transport written twice | **open, filed 2026-09-04 and reviewed the same day.** Seventeen items: fifteen duplicated between `rdnsd` and `rdnsr` — the TCP transport whole, the five transport constants, the shutdown epilogue, the admission pipeline, five hand-written reply skeletons, the EDNS mirroring — two between `rdnsc` and the library, and ~~**30q, the one defect: `rdnsr` never applies the admission check to TCP**, so on that transport the 16 KiB ceiling, the QDCOUNT cap and the pre-parse section caps do not run~~ — **30q fixed 2026-09-04**, the only defect in the section and the first thing done from it, followed the same day by 30f, 30l, 30n and both halves of 30g — which was not a tidy-up after all: the skeleton it removed was hiding `rdnsr` clearing the CD bit RFC 4035 §3.2.2 says to copy, and 30r beside it — then 30h, which closed 30i and 30j behind it. Then 30p and 30o, which is where the *library* turned out to hold the weaker copy of a check `rdnsc` had right, and 30m — answered by reading what the facility was *for* rather than by deleting it. What is left is 30a-30e, on #31. The library itself came out clean. Reviewing the filing against the code struck four of its claims, including two that had the direction backwards; what the review moved is recorded at the end of the section |
 | **31** | where a crate boundary would pay | **done 2026-09-05**, filed 2026-09-04 and corrected the same day. `rdns-transport` holds #30's transport; `rdns-core` holds the wire format, which takes a client from 67 packages to 35 — two crates and not the three the plan drew, because splitting DNSSEC from net saves a client nothing and a split without a measurement is motion. Not `platform` and not `net`: both would move code that already has a home. Yes to a crate for #30's transport, **`rdns-transport`**, and the argument is `anyhow` rather than tidiness — §3 forbids it in `rdns` and the transport needs it; the name is checked against `domain`, hickory, Knot and BIND rather than chosen, and "shell" was already taken by #9d. The cut that pays is `rdns` itself: `rdnsc` is a synchronous CLI compiling 78 packages, tokio's 18 and ring's among them, floored at clap's 21. ~~32 of 41 modules touch neither~~ — an import count is not a partition; walking the edges found exactly two blocking ones, both `zone`/`zone_writer` reaching into `dnssec_denial` for wire helpers with no crypto in them, which is #26b from the other side |
 | **32** | `Shell`, `Served` and the other unnamed bags | **closed 2026-09-05**, filed 2026-09-04: the two renames that needed no crate went that day, and the other three boxes went with `rdns-transport` the next — `ServeContext` was not a step towards 30e's shared pipeline, it *was* the pipeline's parameter list, which is why it landed in the same commit. Four field-only structs that are "what a task needs that is not the answer" and say so in no name — three renamed, `Control` kept as its module's principal type — one of them in a word #9d already spends on something else. The finding under the rename is that `rdnsr::Shell`'s five fields *are* five of `rdnsd::Server`'s twelve, so 30e's shared pipeline already has its parameter list written twice; naming it `ServeContext` in `rdns-transport` is the extraction rather than a step towards it. Carries the rule for what earns the suffix, since a policy struct and a request handler both must not |
+| **33** | a fourth pass: duplication, generics, and where the modules are cut | **open, filed 2026-09-05.** #30's question asked of the whole tree rather than of the transports. Eight items, and **five candidates dropped** — four of them by rules already on this page, which is the half worth reading. The one defect is **33b**: `DnsMessageBuilder` resolves its question type through an *RTYPE* table, so ANY, AXFR and IXFR find nothing there and the question is dropped in silence with no `else`; `rdnsc` cannot ask an ANY query at all, provoked at the command line, so nothing in this tree exercises the RFC 8482 path #9f fixed in `rdnsd`. **33a is the one with teeth**: `NegativeCache` and `NsecCache` kept the per-insert `min_by_key` scan `DnsCache` was fixed away from — 14.6 µs against 0.26 at the same bound, linear in it, and on the mutex every query takes. 33c is one line of workspace manifest for five packages, verified compiling on Windows and Linux. The rest are consolidations: an `apex_soa` with one public copy in the wrong module and two private re-implementations of it, and the RFC 8945 §5.3.1 envelope chain written three times. Two of the filing's own claims died on review and are struck through in place — a `zone_writer` bug that is not reachable, and a trait that is the wrong shape for what is actually duplicated |
 | **27** | what a zero-allocation answer path would take | **five of six stages done, 2026-09-01 → 2026-09-05; 27d withdrawn.** A query cost 21 allocations when it was filed and costs **2** now, both of them in the parse — the question `Vec` and the QNAME `String`, which need the message shape 27d declined. Nothing on the answering side allocates at all. Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **closed 2026-09-04**, filed 2026-08-04; 26j done the same day. Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal. **The rest went on 2026-09-04**: 26b took the module split #31 needed and 26a/26c/26d turned out to be eight copies rather than six — two of them, an inline hex decoder and a third base64 wrapper, carried none of the names the others did, which is this section's own thesis about reading over grepping. 26i's filed fix was wrong (`trailing_zeros` for a bitmap whose bit 0 is the high bit) and is corrected in place |
 | **22** | the zone lookup is hash-bound | **closed 2026-09-05**, filed 2026-08-04 from #11's measurement. The first direction is done — one map instead of two takes a miss from 1,875 to 1,402 instructions, 25%, where the estimate said 200. The second is a decision and the answer is **no**: the threat model is written down in the section, and it says the prize (~2% of a query) and the risk (a constant factor on a lookup, not a complexity class) are both small, which argues for leaving a DoS-resistant hasher where it is |
@@ -3461,6 +3480,128 @@ extraction. `ServeContext` went into `rdns-transport` as 30e's parameter list
 in the same commit that moved the admission pipeline, because there was nothing
 else it could be — a bag named for what it is, holding what two daemons had
 spelled two ways.
+
+### 33. A fourth pass: duplication, generics, and where the modules are cut — filed 2026-09-05
+
+Three questions at once — is anything written twice, would a generic or a trait
+collapse it, are the modules and crates cut in the right places — asked the day
+after #30 and #31 answered the first of them for the *transports*. The library
+came out of #30 clean and stays mostly clean here. What this pass found is one
+defect in a shipped binary, one cost that grows with a number a stranger
+chooses, and a handful of consolidations.
+
+**The module and crate questions produced almost nothing, and that is the useful
+half.** Five of thirteen candidates were dropped, four of them by rules already
+written down on this page. They are below under "what this pass dropped",
+because a survey that only adds is not a survey (#14's words).
+
+**Reviewed against the code before filing** (`CLAUDE.md` §17). Two of the first
+draft's claims did not survive it — one named a bug that is not reachable, one
+named the wrong extraction — and they are struck through in place. What the
+review moved is at the end.
+
+| | what | note |
+|---|---|---|
+| **33a** | `NegativeCache` and `NsecCache` kept the eviction `DnsCache` was fixed away from | `negative_cache.rs:237` (`make_room`) takes two `min_by_key` scans plus a key clone per insert at capacity; `nsec_cache.rs:939` (`evict_zone`) takes one. `cache.rs:145` halves with `select_nth_unstable`, and its own doc comment says why: *"`min_by_key` per victim is O(n²) plus a key clone per removal, under the global lock"*. `logging.rs:279` says the same of its halving: *"a scan for the smallest count per insertion is not [amortized constant]"*. Three of five bounded maps got it right; two did not. **Measured** rather than argued — see below |
+| **33b** | `DnsMessageBuilder` asks for an RTYPE, so `rdnsc` cannot ask ANY or AXFR — **the one defect here** | `with_url` (`rdns-core/src/lib.rs:1776`) resolves its type through `record_type_name_to_code` (`utils.rs:542`), which returns `Option<Rtype>`. ANY, AXFR and IXFR are QTYPE-only values and are not in that table, so the lookup returns `None` and the question is **dropped with no `else`** — §4's "never turn an error into an empty value", and #13c's distinction met from the wrong side of the door. `rdnsc/src/main.rs:41` re-derives the failure from `request.queries.is_empty()`, which is the caller doing the check the builder should have. Provoked, not read: `rdnsc 192.0.2.1 ANY example.com` exits 1 with *"ANY is not a record type this client knows how to ask for"*, and so does `AXFR`. So nothing in this tree can ask the RFC 8482 path #9f fixed in `rdnsd`. The fix is in the type — take a `Qtype`, which already exists — plus `with_recursion`, `with_edns(payload, do_bit)` and a **fallible** `with_type_name`; and it unblocks 33g |
+| **33c** | `tokio`'s `full` carries five packages nothing uses | The workspace gives every crate `features = ["full"]`. The code names `time`, `sync`, `net`, `io-util`, `task`, `signal`, `macros` and `rt-multi-thread`, and there is no `tokio::fs` or `tokio::process` anywhere. Narrowed to exactly those: `rdnsd` 94 → 89 packages, `rdnsr` 84 → 79, `rdns` 64 → 59. The five are `parking_lot`, `parking_lot_core`, `lock_api`, `scopeguard` and `smallvec`. §14's rule about a dependency that does not do anything, on the smallest diff available. **Verified compiling on both platforms** — `cargo check --workspace --all-targets` clean on Windows and on Linux, so `control.rs`'s `#[cfg(unix)]` half is included (§1) |
+| **33d** | `apex_soa`: one public copy in the wrong module, and two private re-implementations of it | `notify::soa_record` (`notify.rs:114`) is already public and called from `xfr.rs:898`, `:903`, `:1275`, `rdnsd/main.rs:2110` and `rdnsd/replication.rs:299`. `xfr.rs:589` and `ixfr.rs:318` then define **byte-identical private duplicates of that same function**, in the same crate. Three more sites ask the same question for one field — `Zone::serial` (`zone.rs:330`), `RefreshTimers::from_zone` (`secondary.rs:73`) — and two write it into a section (`answer.rs:151`, `:454`). It belongs on `Zone`, where the data is: a borrowed `apex_soa()` with an owned wrapper, `serial()` built on it, `notify::soa_record` gone. #19c's shape one level up. Worth one line when it lands: `soa_record` also names an unrelated *test fixture*, with a different signature, in `negative_cache.rs:277` and `nsec_cache.rs:959` |
+| **33e** | the MAC-chained transfer read loop, three copies | `fetch_zone` (`xfr.rs:513`) and `fetch_changes` (`:551`) are 27-line bodies differing in exactly four lines — request builder, assembler constructor, finish call, timeout message; the diff was taken mechanically, not eyeballed. The eighteen identical lines are the RFC 8945 §5.3.1 envelope chain (`previous_mac`, `first`), and the copy in `fetch_changes` **lost the comment explaining it**, which is 30g's "the copy is the absence of one". `fetch_soa` (`:486`) holds the same connect/send/read prologue. ~~An `Assembler` trait over `AxfrAssembler` and `IxfrAssembler`.~~ **Wrong shape, corrected on review — see the end of this section.** What is duplicated is the *session*, not the assembler: `TransferSession { stream, id, key, previous_mac, first }` with a `next()`, and each of the three keeps its own short loop, because they genuinely differ. The two `accept` prologues are duplicated as well (`:117-134` ↔ `:290-306`) — the closed-transfer, RCODE and AA checks — and that one is a function, not a trait |
+| **33f** | "is this the apex SOA" written six ways, three of them without normalizing | `ixfr.rs:311`, `journal.rs:167`, `transfer.rs:89`, `zone_writer.rs:43`, `zone_signer.rs:505`, `xfr.rs:149` + `:335`. `transfer` and `ixfr` call `zone.normalize_name` first; `journal` and `zone_writer` compare `record.name` raw. ~~`zone_writer.rs:43` therefore writes the SOA into the middle of a zone whose apex record is stored as `@`.~~ **Not reachable — see the end of this section.** A latent invariant, not a defect. Rides along with 33d rather than earning its own change |
+| **33g** | the record fixtures, and the module that already exists for them | `dnssec_test_util` has four users; `zone_signer.rs:1006` and `dnssec_answer.rs:609` re-roll its two-key ECDSA generation and its `SigningPolicy` beside it. `soa_record` is identical in `negative_cache.rs:277` and `nsec_cache.rs:959`, `nsec3_record` in two more, `a_record` in three. About thirty hand-rolled `DnsMessage` literals of 17-27 lines each, ~700 lines, spread across `src/`, `tests/`, `benches/` and `examples/`. ~~A `pub mod testing` behind a non-default feature.~~ **Cut down on review**: 33b takes the ~14 *query* literals for free through a type that is already `pub` and already visible from every kind of target, which leaves the record fixtures — all `#[cfg(test)]` inside `rdns`, so a plain `#[cfg(test)] mod test_records` covers them with no feature gate and no crate depending on itself |
+| **33h** | the response-budget epilogue, twice | `rdnsd/main.rs:1724-1737` ↔ `rdnsr/main.rs:798-812`: the same three arms with the same two counter increments each — `log_rate_limited` + `rate_limited` on `Truncate`, `log_rate_limited` + `queries_dropped` on `Drop`. Checked, and nothing has drifted: both increment the same counters. It is the third refusal path, and the other two are already `ServeContext::allow_source` and `accept_packet`, under a doc comment saying why they are not two `if`s at four call sites. `admit_response(peer, len, now) -> ResponseVerdict` beside them, each daemon keeping its own truncation (30j settled that those stay two). Eight lines, preventative — worth doing when that code is next opened, not on its own |
+
+#### 33a, measured
+
+Release build. A probe fills the cache to its bound and then inserts past it,
+against the same inserts into a cache with room to spare, which prices the
+insert itself. Not kept in the tree — the numbers are what it was for, and the
+regression test the fix wants is the last column staying flat.
+
+| bound | `NegativeCache`, full | with room | `DnsCache`, full |
+|---|---|---|---|
+| 2 500 | 4.34 µs | 0.91 | 0.24 |
+| 5 000 | 8.22 µs | 0.90 | 0.25 |
+| **10 000** — `rdnsr`'s default `--cache-size` | **14.57 µs** | 0.99 | **0.26** |
+| 20 000 | 35.40 µs | 0.92 | 0.26 |
+
+Linear in the bound. At the default, eviction is 93% of the insert and 56× its
+fixed sibling, and `DnsCache` is flat across an 8× range — which is the
+assertion §10 asks for, a ratio rather than a floor.
+
+**The microseconds are not the argument.** `NegativeCache::get` takes the same
+`Mutex` (`negative_cache.rs:170`) and is on the fast path of *every* query
+(`rdnsr/main.rs:996`), before anything is resolved; `insert` runs on every
+upstream answer (`:1062`). A random-subdomain flood is one distinct NXDOMAIN
+name per query, so it fills the bound in ten thousand queries, after which every
+insert holds that lock for 14.6 µs while every lookup queues behind it. §5's
+shape, and #23's failure mode three orders of magnitude smaller. Said plainly: a
+recursion is milliseconds to seconds, so this is contention and scale rather
+than latency — but the fix is the halving already written twice in this tree,
+and `NsecCache` (1 000 zones, ~1.5 µs, and much harder to provoke) comes along
+with the shared helper for nothing.
+
+#### What this pass dropped, and why
+
+- **A `dnssec/` module directory.** Ten flat modules at the crate root with a
+  filename prefix doing a namespace's job, 12 582 lines between them. #31
+  settled the *crate* version of this by measuring, and its rule kills the
+  module version too: **a split without a measurement is motion.** No
+  measurement is available for a rename, ten files move, every
+  `crate::dnssec_chain::` path in the tree is edited, and nothing is prevented.
+- **Moving the IXFR client into `ixfr.rs`.** The observation is real and worth
+  knowing: `xfr.rs` is cut by *role* — the client half of both protocols —
+  while `transfer.rs` and `ixfr.rs` are cut by *protocol*, the server half of
+  one each. So a reader looking for IXFR finds half of it in each file, and
+  that is how 33d's duplicate came to exist. But 33d removes the duplicate
+  wherever the modules sit, so the move buys navigation alone.
+- **Splitting `rdnsd/src/main.rs` again.** 2 610 lines of code, against the
+  8 328 #20 started from. The three remaining seams — the NOTIFY sender
+  (`:2062-2235`), the reload machinery (`:1767-2060`), startup (`:2545-2616`) —
+  come to ~520 lines, a 20% cut of pure motion, and #20's discipline is one
+  commit per seam, each diffed against `HEAD` to prove it changed nothing. The
+  NOTIFY sender is the only one with an argument at all: the protocol is in
+  `rdns::notify` and the secondary side in `replication.rs`, so the sending half
+  is homeless between them. Weak.
+- **A `pub mod testing` for the fixtures.** Feature-gated, in two crates, each a
+  dev-dependency on itself — for a win 33b takes most of for free. Cut to the
+  `#[cfg(test)]` subset in 33g.
+- **`rdnsctl` depending on `rdns-core` for `control.rs` alone.** The line
+  protocol is not the wire format, which is why the crate's own description has
+  to say "and the control protocol" to cover it. Costs nothing at run time.
+  Noted, not filed.
+
+#### What the review moved
+
+Two claims did not survive being checked, and they are the same mistake in
+different clothes — reasoning about what the code *should* look like instead of
+opening it (§17's closing rule):
+
+- **33f said `zone_writer` writes the SOA into the middle of the file.** It does
+  not. Every production path into `Zone::add_record` absolutizes first — the
+  parser (`zone.rs:1419`), `xfr.rs:197`, `ixfr.rs:365`, `update.rs:751`, and
+  `zone_signer.rs:539` via `canonical_name` — and `Zone::new` and `set_origin`
+  absolutize the origin, whose doc comment shows the relative case was thought
+  about. *An unenforced invariant is not a defect; it is a defect the callers
+  are currently paying attention for you.* The item demotes to a consolidation.
+- **33e said "a trait over the two assemblers".** The trait cannot cover the
+  part that matters: `into_zone()` takes nothing and `into_outcome(base)` takes
+  the base zone, so `finish` would need an associated type and a context
+  parameter for two implementors — and the shape misses the third copy,
+  `fetch_soa`, which shares the prologue and has no assembler at all. *Naming a
+  mechanism is not checking that the mechanism fits*, which is 30k's lesson
+  arriving from a different direction.
+
+#### Order
+
+**33c first** — one line in the workspace manifest, already checked on both
+platforms, and the only item here with no design question in it. Then **33a**
+and **33b**, the two with a measurement or a provocation behind them: 33a wants
+the flat column above as its regression test, and 33b wants
+`rdnsc 192.0.2.1 ANY example.com` watched failing first. Then **33d**, which
+33f rides on, and **33e**. **33g** follows 33b or it does the same work twice.
+**33h** is worth doing when that code is next opened and not before.
+
 
 ### 12. Pre-authentication panics — audited 2026-08-01
 
