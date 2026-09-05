@@ -116,23 +116,7 @@ impl AxfrAssembler {
 
     /// Take one message of the transfer.
     pub fn accept(&mut self, msg: &DnsMessage) -> TransferResult<Progress> {
-        if self.complete {
-            return Err(TransferError::malformed(
-                "a record arrived after the transfer closed",
-            ));
-        }
-        if msg.rcode != ResponseCode::Ok {
-            return Err(TransferError::malformed(format!(
-                "master answered {:?}",
-                msg.rcode
-            )));
-        }
-        if !msg.authoritive {
-            // AA is how the master says the zone is its to hand out.
-            return Err(TransferError::malformed(
-                "transfer message is not authoritative",
-            ));
-        }
+        check_envelope(msg, self.complete)?;
 
         for rr in &msg.answers {
             match self.accept_record(rr)? {
@@ -288,22 +272,7 @@ impl IxfrAssembler {
 
     /// Take one message of the answer.
     pub fn accept(&mut self, msg: &DnsMessage) -> TransferResult<Progress> {
-        if self.state == IxfrState::Complete {
-            return Err(TransferError::malformed(
-                "a record arrived after the transfer closed",
-            ));
-        }
-        if msg.rcode != ResponseCode::Ok {
-            return Err(TransferError::malformed(format!(
-                "master answered {:?}",
-                msg.rcode
-            )));
-        }
-        if !msg.authoritive {
-            return Err(TransferError::malformed(
-                "transfer message is not authoritative",
-            ));
-        }
+        check_envelope(msg, self.state == IxfrState::Complete)?;
 
         for rr in &msg.answers {
             if self.state == IxfrState::FullTransfer {
@@ -446,6 +415,31 @@ impl IxfrAssembler {
     }
 }
 
+/// What every envelope of a transfer has to be before its records are read:
+/// arriving before the closing SOA, carrying NOERROR, and authoritative — AA is
+/// how the master says the zone is its to hand out.
+///
+/// Both assemblers opened with these three (`TODO.md` #33e).
+fn check_envelope(msg: &DnsMessage, closed: bool) -> TransferResult<()> {
+    if closed {
+        return Err(TransferError::malformed(
+            "a record arrived after the transfer closed",
+        ));
+    }
+    if msg.rcode != ResponseCode::Ok {
+        return Err(TransferError::malformed(format!(
+            "master answered {:?}",
+            msg.rcode
+        )));
+    }
+    if !msg.authoritive {
+        return Err(TransferError::malformed(
+            "transfer message is not authoritative",
+        ));
+    }
+    Ok(())
+}
+
 /// The two things a record has to be before a transfer keeps it: in this zone,
 /// and in a class this server can hold. Returns the absolute owner name.
 ///
@@ -478,6 +472,64 @@ fn absolute(name: &str) -> String {
     crate::utils::absolute(name).into_owned()
 }
 
+/// One transfer's connection: the socket, the id every reply is checked
+/// against, and the MAC chain.
+///
+/// The chain is why this is a type. RFC 8945 §5.3.1 signs the first envelope
+/// over the *request's* MAC and each later one over its predecessor, so three
+/// pieces of state have to move together on every read — and that loop was
+/// written out twice, the second copy having lost the comment saying why
+/// (`TODO.md` #33e). Not a trait over the two assemblers: they differ in what
+/// finishing means, and `fetch_soa` shares this and has no assembler at all.
+struct TransferSession<'a> {
+    stream: TcpStream,
+    id: u16,
+    key: Option<&'a TsigKey>,
+    /// The MAC the next envelope's signature must be taken over.
+    previous_mac: Vec<u8>,
+    first: bool,
+}
+
+impl<'a> TransferSession<'a> {
+    /// Connect to `master` and send `request`, signing it with `key`.
+    ///
+    /// The id to check replies against is the request's own, so the two cannot
+    /// be handed in separately and disagree.
+    async fn open(
+        master: std::net::SocketAddr,
+        request: &DnsMessage,
+        key: Option<&'a TsigKey>,
+    ) -> TransferResult<TransferSession<'a>> {
+        let mut stream = connect(master).await?;
+        let signed = send_request(&mut stream, request, key).await?;
+        Ok(TransferSession {
+            stream,
+            id: request.id,
+            key,
+            previous_mac: signed,
+            first: true,
+        })
+    }
+
+    /// The next envelope, its signature checked and the chain advanced. A
+    /// dropped or reordered envelope fails here.
+    async fn next(&mut self) -> TransferResult<DnsMessage> {
+        let (msg, mac) = read_reply(
+            &mut self.stream,
+            self.id,
+            self.key,
+            &self.previous_mac,
+            self.first,
+        )
+        .await?;
+        if let Some(mac) = mac {
+            self.previous_mac = mac;
+        }
+        self.first = false;
+        Ok(msg)
+    }
+}
+
 /// Ask `master` for the zone's SOA serial, over TCP.
 ///
 /// TCP rather than UDP: it is the connection a due transfer needs anyway, there
@@ -489,12 +541,10 @@ pub async fn fetch_soa(
     key: Option<&TsigKey>,
 ) -> TransferResult<Serial> {
     let deadline = tokio::time::timeout(SOA_TIMEOUT, async {
-        let mut stream = connect(master).await?;
         let id = rand_id();
-        let request = soa_query(zone, id);
-        let signed = send_request(&mut stream, &request, key, id).await?;
+        let mut session = TransferSession::open(master, &soa_query(zone, id), key).await?;
 
-        let (reply, _mac) = read_reply(&mut stream, id, key, &signed, true).await?;
+        let reply = session.next().await?;
         if reply.rcode != ResponseCode::Ok {
             return Err(TransferError::malformed(format!(
                 "master answered {:?} to the SOA probe",
@@ -516,24 +566,12 @@ pub async fn fetch_zone(
     key: Option<&TsigKey>,
 ) -> TransferResult<Zone> {
     let transfer = tokio::time::timeout(TRANSFER_TIMEOUT, async {
-        let mut stream = connect(master).await?;
         let id = rand_id();
-        let request = axfr_request(zone, id);
-        let signed = send_request(&mut stream, &request, key, id).await?;
+        let mut session = TransferSession::open(master, &axfr_request(zone, id), key).await?;
 
         let mut assembler = AxfrAssembler::new(zone);
-        // The first envelope's MAC is over the request's, each later one over
-        // its predecessor (RFC 8945 §5.3.1), so a dropped or reordered envelope
-        // fails here.
-        let mut previous_mac = signed.clone();
-        let mut first = true;
         loop {
-            let (msg, mac) = read_reply(&mut stream, id, key, &previous_mac, first).await?;
-            if let Some(mac) = mac {
-                previous_mac = mac;
-            }
-            first = false;
-            if assembler.accept(&msg)? == Progress::Complete {
+            if assembler.accept(&session.next().await?)? == Progress::Complete {
                 return assembler.into_zone();
             }
         }
@@ -559,21 +597,13 @@ pub async fn fetch_changes(
         .ok_or_else(|| TransferError::malformed(format!("zone {zone} has no SOA to ask from")))?;
 
     let transfer = tokio::time::timeout(TRANSFER_TIMEOUT, async {
-        let mut stream = connect(master).await?;
         let id = rand_id();
         let request = ixfr_request(&zone, soa, id);
-        let signed = send_request(&mut stream, &request, key, id).await?;
+        let mut session = TransferSession::open(master, &request, key).await?;
 
         let mut assembler = IxfrAssembler::new(&zone);
-        let mut previous_mac = signed.clone();
-        let mut first = true;
         loop {
-            let (msg, mac) = read_reply(&mut stream, id, key, &previous_mac, first).await?;
-            if let Some(mac) = mac {
-                previous_mac = mac;
-            }
-            first = false;
-            if assembler.accept(&msg)? == Progress::Complete {
+            if assembler.accept(&session.next().await?)? == Progress::Complete {
                 return assembler.into_outcome(base);
             }
         }
@@ -598,7 +628,6 @@ async fn send_request(
     stream: &mut TcpStream,
     request: &DnsMessage,
     key: Option<&TsigKey>,
-    _id: u16,
 ) -> TransferResult<Vec<u8>> {
     let mut buf = vec![0u8; 512];
     let n = request
@@ -1326,6 +1355,46 @@ mod tests {
             .await
             .expect("signed transfer");
         assert_eq!(received.serial(), Some(Serial::new(42)));
+    }
+
+    /// The MAC chain across *several* envelopes, which is what
+    /// [`TransferSession`] carries. The signed test above sends one envelope,
+    /// so it verifies a request-MAC signature and nothing about the chain: RFC
+    /// 8945 §5.3.1 takes the first envelope's digest over the request's MAC and
+    /// each later one over its predecessor, and getting that wrong fails
+    /// silently — an unverified stream still parses into a good-looking zone.
+    #[tokio::test]
+    async fn test_a_signed_transfer_chains_macs_across_envelopes() {
+        let mut text = String::from(
+            "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. 42 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n",
+        );
+        // Past AXFR_TARGET_MESSAGE_SIZE several times over.
+        for i in 0..1500 {
+            text.push_str(&format!("host{i:04}  IN A 192.0.2.1\n"));
+        }
+        let source = parse_zone_file(&text, "example.com.").expect("zone parses");
+        let envelopes = crate::transfer::axfr_messages(&axfr_request("example.com.", 1), &source)
+            .expect("build the transfer")
+            .len();
+        assert!(
+            envelopes > 2,
+            "this test is about the chain, and the zone fits in {envelopes} envelope(s)"
+        );
+
+        let key = TsigKey::new(
+            "transfer.key.",
+            TsigAlgorithm::HmacSha256,
+            b"0123456789012345678901234567890123456789".to_vec(),
+        );
+        let master = spawn_master(source.clone(), Some(key.clone())).await;
+
+        let received = fetch_zone(master, "example.com.", Some(&key))
+            .await
+            .expect("signed multi-envelope transfer");
+        assert_eq!(received.serial(), Some(Serial::new(42)));
+        assert_eq!(received.records().len(), source.records().len());
     }
 
     /// A client holding the wrong key must not end up with a zone.
