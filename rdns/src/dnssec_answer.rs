@@ -559,7 +559,7 @@ mod tests {
         f: impl FnOnce(&mut ResponseWriter) -> Result<(), WireError>,
     ) -> Vec<ResourceRecord> {
         let request = DnsMessageBuilder::new()
-            .with_url("example.com.", "SOA")
+            .with_query("example.com.", Qtype::of(rt::SOA))
             .with_id(1)
             .build();
         let mut out = Vec::new();

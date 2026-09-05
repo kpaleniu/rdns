@@ -33,10 +33,10 @@ every *measurement* and every caveat needed to trust one; those say
 **One numbered section, and one inventory.**
 
 - **#33** — a fourth review pass, filed 2026-09-05: duplication, generics, and
-  where the modules are cut. Eight items, of which **33a and 33c are done** and
-  six are open — one of the six a defect in a shipped binary (`rdnsc` cannot ask
-  an ANY query). Five further candidates were dropped and the section says why,
-  which is the half of it worth reading.
+  where the modules are cut. Eight items, of which **33a, 33b and 33c are done**
+  — 33b was the one defect in a shipped binary, `rdnsc` unable to ask an ANY
+  query — and five are open, all consolidations. Five further candidates were
+  dropped and the section says why, which is the half of it worth reading.
 - **#21** — the four deliberate RFC deviations and the not-implemented list.
   **Not a queue.** It exists so the next person to notice one finds the decision
   instead of re-deriving it. If one is ever taken up it gets its own number.
@@ -677,8 +677,8 @@ rather than a queue. Everything else numbered is under "Closed work" below.
 ### Where to pick up next
 
 Everything here is a choice, not a queue. Two things, in the order their cost
-argues for. (The third was 33c, and 33a has gone the same way — both done
-2026-09-05.)
+argues for. (The third was 33c; 33a and 33b have gone the same way — all three
+done 2026-09-05.)
 
 > **1. Push, and read the five CI jobs nobody has ever read.** Ask
 > `git rev-list --count origin/main..HEAD` how much is waiting; it was 49 on
@@ -694,9 +694,9 @@ argues for. (The third was 33c, and 33a has gone the same way — both done
 > `actions/checkout@v4` on a runner that had moved to Node 24. Both fixed in
 > `8758476` and unpushed since.
 >
-> **2. The rest of #33**, in the order its own "Order" section gives: **33b**,
-> the defect, which wants its failure provoked first, then 33d, 33e, and 33g
-> behind 33b.
+> **2. The rest of #33**, in the order its own "Order" section gives: **33d**,
+> which 33f rides on, then **33e** and **33g**. All consolidations now; the
+> defect (33b) and the measured item (33a) are done.
 
 **Read `benches/answer_path.rs`'s header before quoting anything from it.** One
 whole answer is 522 ns and one `sendto`+`recvfrom` pair is 3.6-4.1 µs, so the
@@ -728,7 +728,7 @@ review moved is at the end.
 | | what | note |
 |---|---|---|
 | **33a** | **Done 2026-09-05.** `NegativeCache` and `NsecCache` kept the eviction `DnsCache` was fixed away from | `negative_cache.rs:237` (`make_room`) takes two `min_by_key` scans plus a key clone per insert at capacity; `nsec_cache.rs:939` (`evict_zone`) takes one. `cache.rs:145` halves with `select_nth_unstable`, and its own doc comment says why: *"`min_by_key` per victim is O(n²) plus a key clone per removal, under the global lock"*. `logging.rs:279` says the same of its halving: *"a scan for the smallest count per insertion is not [amortized constant]"*. Three of five bounded maps got it right; two did not. **Measured** rather than argued — see below. **Landed** as `rdns::eviction::Halving`, a two-phase plan (`plan` then `keep` per entry) so one bound can span several maps — `NegativeCache` holds NXDOMAIN and NODATA in two. The other two bounded maps keep one-victim eviction on purpose, and the doc comment says why: `MAX_PROOFS_PER_ZONE` is a constant, so that scan grows with nothing anyone chooses. **The extraction found a defect neither review had:** `DnsCache::new(1)` panicked on the second insert — `select_nth_unstable(len)` for a target of zero — *holding the cache lock*, which poisons it, after which every `get` and `put` is a silent no-op for the life of the process (§6). Reachable as `rdnsr --cache-size 1`. §17's "going to seal something is the cheapest way to find out it is not true", again |
-| **33b** | `DnsMessageBuilder` asks for an RTYPE, so `rdnsc` cannot ask ANY or AXFR — **the one defect here** | `with_url` (`rdns-core/src/lib.rs:1776`) resolves its type through `record_type_name_to_code` (`utils.rs:542`), which returns `Option<Rtype>`. ANY, AXFR and IXFR are QTYPE-only values and are not in that table, so the lookup returns `None` and the question is **dropped with no `else`** — §4's "never turn an error into an empty value", and #13c's distinction met from the wrong side of the door. `rdnsc/src/main.rs:41` re-derives the failure from `request.queries.is_empty()`, which is the caller doing the check the builder should have. Provoked, not read: `rdnsc 192.0.2.1 ANY example.com` exits 1 with *"ANY is not a record type this client knows how to ask for"*, and so does `AXFR`. So nothing in this tree can ask the RFC 8482 path #9f fixed in `rdnsd`. The fix is in the type — take a `Qtype`, which already exists — plus `with_recursion`, `with_edns(payload, do_bit)` and a **fallible** `with_type_name`; and it unblocks 33g |
+| **33b** | **Done 2026-09-05.** `DnsMessageBuilder` asked for an RTYPE, so `rdnsc` could not ask ANY or AXFR — **the one defect here** | `with_url` (`rdns-core/src/lib.rs:1776`) resolves its type through `record_type_name_to_code` (`utils.rs:542`), which returns `Option<Rtype>`. ANY, AXFR and IXFR are QTYPE-only values and are not in that table, so the lookup returns `None` and the question is **dropped with no `else`** — §4's "never turn an error into an empty value", and #13c's distinction met from the wrong side of the door. `rdnsc/src/main.rs:41` re-derives the failure from `request.queries.is_empty()`, which is the caller doing the check the builder should have. Provoked, not read: `rdnsc 192.0.2.1 ANY example.com` exits 1 with *"ANY is not a record type this client knows how to ask for"*, and so does `AXFR`. So nothing in this tree can ask the RFC 8482 path #9f fixed in `rdnsd`. The fix is in the type — take a `Qtype`, which already exists — plus `with_recursion`, `with_edns(payload, do_bit)` and a **fallible** `with_type_name`; and it unblocks 33g. **Landed with two changes to that plan.** *No `with_type_name`*: `rdnsc` has to know the QTYPE before it builds anything — AXFR picks the transport — so it reads the name through `utils::qtype_name_to_code` (new, `Option<Qtype>`, the sibling of `record_type_name_to_code` and the only place `*`, ANY, AXFR and IXFR are spelled) and reports the failure itself. A builder method nobody could call is §14's dependency that does not do anything. *And AXFR is a stream*: having made it askable, sending it over UDP would have been a new defect (RFC 5936 §4.2), so `rdnsc` takes AXFR straight to TCP with RD clear (§4.1.1) and reads messages until the second SOA, which is the only end marker there is (§2.2). IXFR is refused with the reason — RFC 1995 §3 wants the client's serial and this client holds no zone. One thing found on the way: `Display for Qtype` went through `record_type_name`, which takes an `Rtype`, so the question everyone writes `ANY` printed as `TYPE255` |
 | **33c** | **Done 2026-09-05.** `tokio`'s `full` carried five packages nothing uses | The workspace gives every crate `features = ["full"]`. The code names `time`, `sync`, `net`, `io-util`, `task`, `signal`, `macros` and `rt-multi-thread`, and there is no `tokio::fs` or `tokio::process` anywhere. Narrowed to exactly those, less `task`, which is a *module* and not a feature — `tokio::task` comes with `rt`, so the list in the manifest is seven names: `rdnsd` 94 → 89 packages, `rdnsr` 84 → 79, `rdns` 64 → 59. The five are `parking_lot`, `parking_lot_core`, `lock_api`, `scopeguard` and `smallvec`. §14's rule about a dependency that does not do anything, on the smallest diff available. **Verified compiling on both platforms** — `cargo check --workspace --all-targets` clean on Windows and on Linux, so `control.rs`'s `#[cfg(unix)]` half is included (§1). On landing, the counts above reproduced exactly, and the method is worth writing down because two plausible ones differ: they are `cargo tree -p X -e normal --prefix none \| sort -u \| wc -l`, which counts a package once per version *plus* once per `(*)` back-reference. Counting distinct packages instead gives 78 → 73, 69 → 64 and 51 → 46 — the same five gone either way |
 | **33d** | `apex_soa`: one public copy in the wrong module, and two private re-implementations of it | `notify::soa_record` (`notify.rs:114`) is already public and called from `xfr.rs:898`, `:903`, `:1275`, `rdnsd/main.rs:2110` and `rdnsd/replication.rs:299`. `xfr.rs:589` and `ixfr.rs:318` then define **byte-identical private duplicates of that same function**, in the same crate. Three more sites ask the same question for one field — `Zone::serial` (`zone.rs:330`), `RefreshTimers::from_zone` (`secondary.rs:73`) — and two write it into a section (`answer.rs:151`, `:454`). It belongs on `Zone`, where the data is: a borrowed `apex_soa()` with an owned wrapper, `serial()` built on it, `notify::soa_record` gone. #19c's shape one level up. Worth one line when it lands: `soa_record` also names an unrelated *test fixture*, with a different signature, in `negative_cache.rs:277` and `nsec_cache.rs:959` |
 | **33e** | the MAC-chained transfer read loop, three copies | `fetch_zone` (`xfr.rs:513`) and `fetch_changes` (`:551`) are 27-line bodies differing in exactly four lines — request builder, assembler constructor, finish call, timeout message; the diff was taken mechanically, not eyeballed. The eighteen identical lines are the RFC 8945 §5.3.1 envelope chain (`previous_mac`, `first`), and the copy in `fetch_changes` **lost the comment explaining it**, which is 30g's "the copy is the absence of one". `fetch_soa` (`:486`) holds the same connect/send/read prologue. ~~An `Assembler` trait over `AxfrAssembler` and `IxfrAssembler`.~~ **Wrong shape, corrected on review — see the end of this section.** What is duplicated is the *session*, not the assembler: `TransferSession { stream, id, key, previous_mac, first }` with a `next()`, and each of the three keeps its own short loop, because they genuinely differ. The two `accept` prologues are duplicated as well (`:117-134` ↔ `:290-306`) — the closed-transfer, RCODE and AA checks — and that one is a function, not a trait |
@@ -824,13 +824,15 @@ opening it (§17's closing rule):
 
 #### Order
 
-~~**33c first**~~ — **done 2026-09-05**, one line in the workspace manifest and
-the only item here with no design question in it. ~~Then **33a**~~ — **also done
-2026-09-05**, and the flat column above is now the regression test, watched
-failing against the old eviction at 66× in a debug build. Then **33b**, which
-wants `rdnsc 192.0.2.1 ANY example.com` watched failing first. Then **33d**,
-which 33f rides on, and **33e**. **33g** follows 33b or it does the same work
-twice. **33h** is worth doing when that code is next opened and not before.
+**33c, 33a and 33b are done, in that order, all on 2026-09-05** — the manifest
+line, then the eviction with the flat column above as its regression test
+(watched failing at 66× in a debug build), then the defect (watched failing
+first: `rdnsc ... ANY` and `... AXFR` both exited 1 against the old builder).
+
+What is left is **33d**, which 33f rides on, then **33e** and **33g**. 33g is
+unblocked by 33b, and what it inherits is `with_query` taking a `Qtype` rather
+than the `pub mod testing` the first draft wanted. **33h** is worth doing when
+that code is next opened and not before.
 
 ---
 

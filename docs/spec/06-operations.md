@@ -235,7 +235,7 @@ Both transports are owned by a `JoinSet`, not raced as two dropped
 ## 6.6 `rdnsc` — the query client
 
 ```
-rdnsc [--dnssec] <server[:port]> <TYPE> <name>
+rdnsc [--dnssec] <server[:port]> <QTYPE> <name>
 ```
 
 - Sends exactly the bytes it built.
@@ -243,6 +243,13 @@ rdnsc [--dnssec] <server[:port]> <TYPE> <name>
 - TC=1 over UDP retries over TCP.
 - Refuses to print an answer it cannot tell was an answer to its own question.
 - `--dnssec` attaches an EDNS0 OPT with DO set (RFC 4035 §3.2.1).
+- The type is a QTYPE: `ANY` (or `*`), `AXFR` and `TYPEnnn` as well as the
+  mnemonics. An unreadable name exits 1 and says so.
+- `AXFR` goes straight to TCP with RD clear (RFC 5936 §4.2, §4.1.1) and prints
+  records until the closing SOA, which is the transfer's only end marker
+  (§2.2). It prints rather than assembles: this client holds no zone.
+- `IXFR` is refused. RFC 1995 §3 has the request carry the client's SOA, saying
+  which version it holds, and this client holds none.
 
 The DNSSEC recipes in `TODO.md` use dnspython: an independent implementation
 checking our signatures is worth more than our own client checking them.

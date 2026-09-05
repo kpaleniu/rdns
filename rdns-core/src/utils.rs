@@ -1,7 +1,7 @@
 //! Name folding, timestamps, and record-type constants shared across the crate.
 
 use crate::error::{DnssecError, DnssecResult, WireError, WireResult};
-use crate::{ParsedRecord, RecordData, Rtype};
+use crate::{ParsedRecord, Qtype, RecordData, Rtype};
 use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -562,6 +562,37 @@ pub fn record_type_name_to_code(kind: &str) -> Option<Rtype> {
     }
 }
 
+/// The QTYPE a presentation name asks for — the *question* space, which holds
+/// values no record can have: ANY (`*` is the same question, RFC 1035 §3.2.3),
+/// AXFR (RFC 5936) and IXFR (RFC 1995).
+///
+/// Separate from [`record_type_name_to_code`] rather than folded into it,
+/// because that one answers with an `Rtype` and these three are not types any
+/// record is. MAILB and MAILA are absent for the opposite reason to obscurity —
+/// they are obsolete (RFC 1035 §3.2.3) — and `TYPE253` still reaches them.
+pub fn qtype_name_to_code(name: &str) -> Option<Qtype> {
+    match name {
+        "ANY" | "*" => Some(Qtype::ANY),
+        "AXFR" => Some(Qtype::AXFR),
+        "IXFR" => Some(Qtype::IXFR),
+        other => record_type_name_to_code(other).map(Qtype::of),
+    }
+}
+
+/// The mnemonic for a QTYPE, or its `TYPEnnn` form. Always a name
+/// [`qtype_name_to_code`] reads back.
+///
+/// [`record_type_name`] cannot answer this: it takes an `Rtype`, and printing
+/// QTYPE 255 through it gives `TYPE255` for the question everyone writes `ANY`.
+pub fn qtype_name(qtype: Qtype) -> Cow<'static, str> {
+    match qtype {
+        Qtype::ANY => Cow::Borrowed("ANY"),
+        Qtype::AXFR => Cow::Borrowed("AXFR"),
+        Qtype::IXFR => Cow::Borrowed("IXFR"),
+        other => record_type_name(Rtype::new(other.to_u16())),
+    }
+}
+
 /// The mnemonic for a type code, or its `TYPEnnn` form (RFC 3597 §5) when this
 /// library has none. Always a name [`record_type_name_to_code`] reads back.
 ///
@@ -591,6 +622,32 @@ pub fn record_type_name(code: Rtype) -> Cow<'static, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A QTYPE is not an RTYPE: these three are questions no record answers to,
+    /// so the record-type table says `None` for all of them (#33b).
+    #[test]
+    fn the_question_only_types_have_names_both_ways() {
+        for (name, qtype) in [
+            ("ANY", Qtype::ANY),
+            ("AXFR", Qtype::AXFR),
+            ("IXFR", Qtype::IXFR),
+        ] {
+            assert_eq!(qtype_name_to_code(name), Some(qtype));
+            assert_eq!(qtype_name(qtype), name, "and prints back as it was asked");
+            assert_eq!(
+                record_type_name_to_code(name),
+                None,
+                "no record is of type {name}"
+            );
+        }
+        assert_eq!(qtype_name_to_code("*"), Some(Qtype::ANY), "RFC 1035 §3.2.3");
+
+        // Everything else is the record-type table, TYPEnnn included.
+        assert_eq!(qtype_name_to_code("MX"), Some(Qtype::of(record_types::MX)));
+        assert_eq!(qtype_name_to_code("TYPE1234"), Some(Qtype::from_u16(1234)));
+        assert_eq!(qtype_name(Qtype::from_u16(1234)), "TYPE1234");
+        assert_eq!(qtype_name_to_code("NOPE"), None);
+    }
 
     #[test]
     fn names_are_equal_by_ascii_folding_and_an_optional_trailing_dot() {

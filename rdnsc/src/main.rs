@@ -7,9 +7,9 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use rdns_core::error::AnswerMismatch;
-use rdns_core::utils::bind_addr_for;
+use rdns_core::utils::{bind_addr_for, qtype_name_to_code, record_types as rt};
 use rdns_core::validation::{answers_query, SentQuery};
-use rdns_core::{DnsMessage, DnsMessageBuilder};
+use rdns_core::{DnsMessage, DnsMessageBuilder, Qtype, ResponseCode};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -34,16 +34,27 @@ fn main() -> Result<()> {
     let server = resolve_server(&args.dns_server)
         .with_context(|| format!("server address {:?}", args.dns_server))?;
 
+    // A QTYPE, not an RTYPE: ANY, AXFR and IXFR are questions no record is the
+    // answer to, and asking for a record type made them unaskable (#33b).
+    let qtype = qtype_name_to_code(&args.record).ok_or_else(|| {
+        anyhow!(
+            "{:?} is not a type this client can ask for; TYPEnnn asks for a number",
+            args.record
+        )
+    })?;
+    if qtype == Qtype::IXFR {
+        // RFC 1995 §3: the request carries the client's SOA, saying which
+        // version it holds. This client holds no zone, so it has nothing to say.
+        bail!("IXFR asks for the changes since a serial this client does not have; use AXFR");
+    }
+    let transfer = qtype == Qtype::AXFR;
+
     let request = DnsMessageBuilder::new()
-        .with_url(&args.hostname, &args.record)
+        .with_query(&args.hostname, qtype)
+        // RFC 5936 §4.1.1: RD SHOULD be clear in an AXFR request.
+        .with_recursion(!transfer)
         .with_dnssec(args.dnssec)
         .build();
-    if request.queries.is_empty() {
-        bail!(
-            "{:?} is not a record type this client knows how to ask for",
-            args.record
-        );
-    }
 
     // Send `len` bytes, not the whole buffer: trailing zeros are extra records
     // as far as the receiver is concerned, and count against its request cap.
@@ -52,6 +63,11 @@ fn main() -> Result<()> {
         .to_bytes(&mut buf)
         .context("serializing the query")?;
     let query = &buf[..len];
+
+    if transfer {
+        // RFC 5936 §4.2: AXFR is TCP only, and a zone is not one message.
+        return read_transfer(server, query, &request);
+    }
 
     let response = ask_over_udp(server, query, &request)?;
     let response = if response.truncation {
@@ -121,6 +137,61 @@ fn ask_over_udp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
 
 /// The same exchange over TCP, with the RFC 1035 §4.2.2 length prefix.
 fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Result<DnsMessage> {
+    let mut stream = send_over_tcp(server, query)?;
+    let message = read_framed(&mut stream)?
+        .ok_or_else(|| anyhow!("{server} closed the connection without answering"))?;
+    // The connection identifies the peer, but the id and question still catch
+    // a stale message left in the stream.
+    matches_request(&message, request).map_err(|why| anyhow!("TCP reply is not ours: {why}"))?;
+    Ok(message)
+}
+
+/// A whole zone, printed as it arrives.
+///
+/// AXFR is TCP only and a zone is not one message (RFC 5936 §2.2): the answer
+/// section starts with the zone's SOA and ends with the same SOA again, and
+/// that second copy is the only end marker there is. Records are printed rather
+/// than assembled — a client that held the zone would be `rdns::xfr`, which
+/// `rdnsc` does not link (it takes `rdns-core` alone).
+fn read_transfer(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Result<()> {
+    let mut stream = send_over_tcp(server, query)?;
+    let mut soas = 0;
+    let mut records = 0;
+    let mut first = true;
+
+    while soas < 2 {
+        let Some(message) = read_framed(&mut stream)? else {
+            bail!("the transfer stopped after {records} records, with no closing SOA");
+        };
+        // A refusal is one message with an rcode and no records, and looking for
+        // the SOA first would wait out the read timeout instead of saying so.
+        if message.rcode != ResponseCode::Ok {
+            bail!("the server refused the transfer: {:?}", message.rcode);
+        }
+        if first {
+            matches_request(&message, request)
+                .map_err(|why| anyhow!("the first reply is not ours: {why}"))?;
+            first = false;
+        } else if message.id != request.id {
+            // Later messages need not repeat the question (RFC 5936 §2.2), so
+            // the id is all there is to tie them to this transfer.
+            bail!("a message in the stream carries id {:#06x}", message.id);
+        }
+
+        for rr in &message.answers {
+            if rr.rdata.rtype() == rt::SOA {
+                soas += 1;
+            }
+            records += 1;
+            println!("{rr:?}");
+        }
+    }
+    eprintln!("transfer complete: {records} records");
+    Ok(())
+}
+
+/// Connect and send one framed message.
+fn send_over_tcp(server: SocketAddr, query: &[u8]) -> Result<TcpStream> {
     let mut stream = TcpStream::connect_timeout(&server, READ_TIMEOUT)
         .with_context(|| format!("connecting to {server} over TCP"))?;
     stream
@@ -129,21 +200,25 @@ fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
 
     let framed = rdns_core::framed(query).context("framing the query")?;
     stream.write_all(&framed).context("sending over TCP")?;
+    Ok(stream)
+}
 
+/// One length-prefixed message, or `None` when the peer closed cleanly between
+/// messages — which is the end of a stream and not a failure to report.
+fn read_framed(stream: &mut TcpStream) -> Result<Option<DnsMessage>> {
     let mut prefix = [0u8; 2];
-    stream
-        .read_exact(&mut prefix)
-        .context("reading the length prefix")?;
+    match stream.read_exact(&mut prefix) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e).context("reading the length prefix"),
+    }
     let mut body = vec![0u8; u16::from_be_bytes(prefix) as usize];
     stream
         .read_exact(&mut body)
         .context("reading the response body")?;
-
-    let message = DnsMessage::try_from_bytes(&body).context("parsing the TCP response")?;
-    // The connection identifies the peer, but the id and question still catch
-    // a stale message left in the stream.
-    matches_request(&message, request).map_err(|why| anyhow!("TCP reply is not ours: {why}"))?;
-    Ok(message)
+    Ok(Some(
+        DnsMessage::try_from_bytes(&body).context("parsing the TCP response")?,
+    ))
 }
 
 /// Whether `message` is a response to `request`.

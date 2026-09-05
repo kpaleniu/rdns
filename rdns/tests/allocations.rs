@@ -1019,7 +1019,7 @@ fn proving_a_signed_nxdomain() {
 fn answering_a_signed_query() {
     let zone = signed_zone();
     let request = rdns::DnsMessageBuilder::new()
-        .with_url("www.example.com.", "A")
+        .with_query("www.example.com.", Qtype::of(record_types::A))
         .with_id(1)
         .with_dnssec(true)
         .build();
@@ -1099,7 +1099,7 @@ fn proving_a_signed_nxdomain_under_nsec3() {
 /// counted is the proof, not the 64 KB scratch every response path already owns.
 fn nxdomain_proof(signed: &rdns::zone::Zone) -> (rdns::DnsMessage, u64) {
     let request = rdns::DnsMessageBuilder::new()
-        .with_url("nope.example.com.", "A")
+        .with_query("nope.example.com.", Qtype::of(record_types::A))
         .with_id(1)
         .with_dnssec(true)
         .build();

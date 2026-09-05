@@ -314,8 +314,10 @@ impl Qtype {
 }
 
 impl std::fmt::Display for Qtype {
+    /// Through [`utils::qtype_name`], not `record_type_name`: the latter takes
+    /// an `Rtype` and prints the question everyone writes `ANY` as `TYPE255`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", utils::record_type_name(Rtype::new(self.0)))
+        write!(f, "{}", utils::qtype_name(*self))
     }
 }
 
@@ -1759,12 +1761,39 @@ impl DnsMessage {
     }
 }
 
-#[derive(Default)]
+/// The payload size [`DnsMessageBuilder::with_dnssec`] advertises. A signed
+/// answer does not fit in the classic 512 bytes; 4096 is what `dig +dnssec`
+/// asks with.
+const DNSSEC_PAYLOAD_SIZE: u16 = 4096;
+
+/// A query, built field by field.
+///
+/// The question's type is a [`Qtype`] and not an `Rtype`. It was an `Rtype`, and
+/// the presentation-name door resolved through `record_type_name_to_code`, which
+/// answers `None` for ANY, AXFR and IXFR because no *record* is one of those
+/// types — and the question was then dropped with no `else`, so `rdnsc`, this
+/// tree's only query client, could not ask an ANY query at all (`TODO.md` #33b).
+/// The name door is [`utils::qtype_name_to_code`], which answers `Option` and
+/// leaves the reporting to the caller that has a person to report to.
 pub struct DnsMessageBuilder {
     id: u16,
-    queries: Vec<(String, Rtype)>,
-    /// Whether to attach an OPT record, and with DO set.
-    dnssec: bool,
+    queries: Vec<(String, Qtype)>,
+    recursion: bool,
+    /// The OPT record to attach, if any.
+    edns: Option<Edns>,
+}
+
+impl Default for DnsMessageBuilder {
+    /// RD set, because the caller of a query builder is asking a resolver. AXFR
+    /// wants it clear (RFC 5936 §4.1.1): [`DnsMessageBuilder::with_recursion`].
+    fn default() -> Self {
+        DnsMessageBuilder {
+            id: 0,
+            queries: Vec::new(),
+            recursion: true,
+            edns: None,
+        }
+    }
 }
 
 impl DnsMessageBuilder {
@@ -1772,10 +1801,9 @@ impl DnsMessageBuilder {
         Self::default()
     }
 
-    pub fn with_url(mut self, url: &str, query_type: &str) -> Self {
-        if let Some(q) = utils::record_type_name_to_code(query_type) {
-            self.queries.push((url.to_owned(), q));
-        }
+    /// Ask `name` for `qtype`.
+    pub fn with_query(mut self, name: &str, qtype: Qtype) -> Self {
+        self.queries.push((name.to_owned(), qtype));
         self
     }
 
@@ -1784,11 +1812,32 @@ impl DnsMessageBuilder {
         self
     }
 
+    /// Set or clear RD. A transfer asks with it clear (RFC 5936 §4.1.1).
+    pub fn with_recursion(mut self, recursion: bool) -> Self {
+        self.recursion = recursion;
+        self
+    }
+
+    /// Attach an EDNS0 OPT record advertising `udp_payload_size`, with DO as
+    /// given (RFC 6891 §6.1.2, RFC 4035 §3.2.1).
+    pub fn with_edns(mut self, udp_payload_size: u16, do_bit: bool) -> Self {
+        let mut edns = Edns::with_payload_size(udp_payload_size);
+        edns.do_bit = do_bit;
+        self.edns = Some(edns);
+        self
+    }
+
     /// Ask for DNSSEC records: an EDNS0 OPT with DO set (RFC 4035 §3.2.1).
     /// Without DO a server must not send RRSIG, NSEC or NSEC3.
-    pub fn with_dnssec(mut self, dnssec: bool) -> Self {
-        self.dnssec = dnssec;
-        self
+    ///
+    /// [`DnsMessageBuilder::with_edns`] with the payload size that goes with
+    /// asking for signatures — they do not fit in 512 bytes.
+    pub fn with_dnssec(self, dnssec: bool) -> Self {
+        if dnssec {
+            self.with_edns(DNSSEC_PAYLOAD_SIZE, true)
+        } else {
+            self
+        }
     }
 
     pub fn build(&self) -> DnsMessage {
@@ -1804,7 +1853,7 @@ impl DnsMessageBuilder {
             opcode: OpCode::Query,
             authoritive: false,
             truncation: false,
-            recursion: true,
+            recursion: self.recursion,
             recursion_ok: false,
             ad: false,
             cd: false,
@@ -1812,20 +1861,16 @@ impl DnsMessageBuilder {
             queries: self
                 .queries
                 .iter()
-                .map(|(url, qt)| QuerySection {
-                    qname: url.to_owned(),
-                    qtype: Qtype::of(*qt),
+                .map(|(name, qtype)| QuerySection {
+                    qname: name.to_owned(),
+                    qtype: *qtype,
                     qclass: QueryClass::IN,
                 })
                 .collect(),
             answers: Vec::new(),
             authorities: Vec::new(),
             additionals: Vec::new(),
-            edns: self.dnssec.then(|| {
-                let mut edns = Edns::with_payload_size(4096);
-                edns.do_bit = true;
-                edns
-            }),
+            edns: self.edns.clone(),
         }
     }
 }
@@ -1841,12 +1886,12 @@ mod builder_dnssec_tests {
     #[test]
     fn the_dnssec_flag_sets_do_and_survives_the_wire() {
         let plain = DnsMessageBuilder::new()
-            .with_url("example.com", "A")
+            .with_query("example.com", Qtype::of(utils::record_types::A))
             .build();
         assert!(plain.edns.is_none(), "no OPT unless asked for");
 
         let asked = DnsMessageBuilder::new()
-            .with_url("example.com", "A")
+            .with_query("example.com", Qtype::of(utils::record_types::A))
             .with_dnssec(true)
             .build();
         let mut buf = vec![0u8; 512];
@@ -1860,6 +1905,53 @@ mod builder_dnssec_tests {
             edns.do_bit,
             "DO is what asks for RRSIG/NSEC (RFC 4035 §3.2.1)"
         );
+    }
+
+    /// #33b: the builder took an `Rtype`, so ANY, AXFR and IXFR resolved to
+    /// `None` through the record-type table and the question was dropped with no
+    /// `else` — a message with an empty question section went on the wire, and
+    /// `rdnsc` re-derived the failure from `queries.is_empty()`. Round-tripped,
+    /// because the QTYPE only matters if it survives serialization.
+    #[test]
+    fn the_question_only_types_can_be_asked_for() {
+        for (name, qtype) in [
+            ("ANY", Qtype::ANY),
+            ("*", Qtype::ANY),
+            ("AXFR", Qtype::AXFR),
+            ("IXFR", Qtype::IXFR),
+        ] {
+            let asked = utils::qtype_name_to_code(name).expect("a name this client can ask for");
+            assert_eq!(asked, qtype);
+
+            let request = DnsMessageBuilder::new()
+                .with_query("example.com.", asked)
+                .build();
+            let mut buf = vec![0u8; 512];
+            let n = request.to_bytes(&mut buf).expect("serializes");
+            let back = DnsMessage::try_from_bytes(&buf[..n]).expect("and reads back");
+            let question = back.queries.first().expect("a question, not an empty one");
+            assert_eq!(question.qtype, qtype, "{name} survives the wire");
+        }
+    }
+
+    /// RD is set by default because the caller is usually asking a resolver; a
+    /// transfer asks with it clear (RFC 5936 §4.1.1).
+    #[test]
+    fn recursion_and_edns_are_the_callers_to_choose() {
+        let plain = DnsMessageBuilder::new()
+            .with_query("example.com.", Qtype::of(utils::record_types::A))
+            .build();
+        assert!(plain.recursion, "RD by default");
+
+        let transfer = DnsMessageBuilder::new()
+            .with_query("example.com.", Qtype::AXFR)
+            .with_recursion(false)
+            .with_edns(1232, false)
+            .build();
+        assert!(!transfer.recursion);
+        let edns = transfer.edns.as_ref().expect("an OPT record");
+        assert_eq!(edns.udp_payload_size, 1232);
+        assert!(!edns.do_bit, "EDNS without DO asks for no signatures");
     }
 }
 
@@ -2003,7 +2095,7 @@ mod tests {
     fn test_query_builder() {
         let req = DnsMessageBuilder::new()
             .with_id(u16::from_be_bytes([0xf5, 0x6f]))
-            .with_url("www.google.fi", "A")
+            .with_query("www.google.fi", Qtype::of(utils::record_types::A))
             .build();
 
         let mut buf = [0u8; 512];
@@ -3365,7 +3457,8 @@ mod tests {
 
     #[test]
     fn test_message_builder_initializes_ad_cd_false() {
-        let builder = DnsMessageBuilder::new().with_url("example.com", "A");
+        let builder =
+            DnsMessageBuilder::new().with_query("example.com", Qtype::of(utils::record_types::A));
         let msg = builder.build();
 
         assert!(!msg.ad, "AD bit should be false by default");

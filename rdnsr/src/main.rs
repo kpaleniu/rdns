@@ -1287,7 +1287,7 @@ mod tests {
     fn a_truncated_reply_carries_no_records_and_keeps_its_question() {
         let request = rdns::DnsMessageBuilder::new()
             .with_id(0x4242)
-            .with_url("www.example.com.", "A")
+            .with_query("www.example.com.", Qtype::of(rdns::utils::record_types::A))
             .build();
         let resp = build_response(
             &request,
