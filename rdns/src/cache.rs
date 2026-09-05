@@ -1,3 +1,4 @@
+use crate::eviction::Halving;
 use crate::utils::{absolute_lowered, current_unix_timestamp, NameType, NameTypeKey};
 use crate::Qtype;
 use crate::ResourceRecord;
@@ -140,40 +141,18 @@ impl DnsCache {
     /// Evict expired entries, and then the soonest-to-expire until the cache is
     /// down to half its limit.
     ///
-    /// Three linear passes and one `Vec<u64>`. `min_by_key` per victim is O(n²)
-    /// plus a key clone per removal, under the global lock.
+    /// Three linear passes and one `Vec<u64>`; the halving and the reason for it
+    /// are in [`crate::eviction`].
     fn evict_oldest(&self, cache: &mut HashMap<NameTypeKey, CacheEntry>) {
         let now = current_unix_timestamp();
 
         cache.retain(|_, entry| !entry.is_expired(now));
 
-        let target = self.max_entries / 2;
-        if cache.len() <= target {
+        let expiries = cache.values().map(|entry| entry.expires_at).collect();
+        let Some(mut plan) = Halving::plan(expiries, self.max_entries / 2) else {
             return;
-        }
-
-        // Partitions in O(n) average without sorting, and yields a value rather
-        // than an entry, so no key is cloned to find the boundary.
-        let mut expiries: Vec<u64> = cache.values().map(|entry| entry.expires_at).collect();
-        let remove = expiries.len() - target;
-        let (_, &mut cutoff, _) = expiries.select_nth_unstable(remove);
-
-        // Not a plain `retain(|e| e.expires_at > cutoff)`: expiries are whole
-        // seconds, so a cache filled in one burst at one TTL has every entry on
-        // the same value and a strict comparison empties it. Admitting ties up
-        // to `target` lands on exactly `target` however they tie.
-        let strictly_newer = expiries.iter().filter(|&&e| e > cutoff).count();
-        let mut ties_to_keep = target.saturating_sub(strictly_newer);
-        cache.retain(|_, entry| {
-            if entry.expires_at > cutoff {
-                true
-            } else if entry.expires_at == cutoff && ties_to_keep > 0 {
-                ties_to_keep -= 1;
-                true
-            } else {
-                false
-            }
-        });
+        };
+        cache.retain(|_, entry| plan.keep(entry.expires_at));
     }
 
     /// Get cache statistics.
@@ -489,6 +468,25 @@ mod tests {
             "and reports nothing rather than panicking in the metrics endpoint"
         );
         cache.clear();
+    }
+
+    /// `--cache-size 1` halves to a target of zero, and the arithmetic asked
+    /// `select_nth_unstable` for an index one past the end: a panic on the
+    /// second answer cached, holding the lock, which poisons it — after which
+    /// every `get` and `put` is a silent no-op for the life of the process
+    /// (`CLAUDE.md` §6). Found by moving the halving into [`crate::eviction`].
+    #[test]
+    fn a_cache_of_one_evicts_rather_than_panicking() {
+        let cache = DnsCache::new(1);
+        for name in ["a.example.com.", "b.example.com."] {
+            cache.put(
+                name,
+                Qtype::of(rt::A),
+                vec![create_test_record(name, Ttl::from_secs(300))],
+            );
+        }
+        assert_eq!(cache.get_stats().total_entries, 1);
+        assert!(cache.get("b.example.com.", Qtype::of(rt::A)).is_some());
     }
 
     /// A ceiling, not a floor: this measures ~0.2 s in a debug build, where a

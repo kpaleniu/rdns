@@ -18,6 +18,7 @@
 use crate::denial_wire::canonical_sort_key;
 use crate::dnssec::{canonical_name, label_count, Rrsig};
 use crate::dnssec_denial::{proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Params};
+use crate::eviction::Halving;
 use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf};
 use crate::Qtype;
 use crate::Rtype;
@@ -203,7 +204,7 @@ impl NsecCache {
             return;
         };
         if !zones.contains_key(zone.as_str()) && zones.len() >= self.max_zones {
-            evict_zone(&mut zones, now);
+            evict_zone(&mut zones, self.max_zones, now);
         }
         let entry = zones.entry(NameKeyBuf::new(&zone)).or_default();
         entry.soa = Some(soa);
@@ -315,7 +316,7 @@ impl NsecCache {
                 continue;
             }
             if !zones.contains_key(zone.as_str()) && zones.len() >= self.max_zones {
-                evict_zone(&mut zones, now);
+                evict_zone(&mut zones, self.max_zones, now);
             }
             let entry = zones.entry(NameKeyBuf::new(&zone)).or_default();
 
@@ -888,9 +889,7 @@ fn with_ttl(records: &[ResourceRecord], ttl: u32) -> Vec<ResourceRecord> {
         .collect()
 }
 
-/// Insert into a bounded map, making room by dropping expired entries first and
-/// then the one that expires soonest.
-/// The same bound for the wildcard store: drop what has expired first, and
+/// The bound for the wildcard store: drop what has expired first, and
 /// otherwise the entry closest to expiring. A zone can hold a wildcard per type
 /// at every level, and this is bounded for the same reason everything else here
 /// is — the alternative is unbounded.
@@ -915,6 +914,12 @@ fn insert_bounded_map(
     map.insert(key, value);
 }
 
+/// Insert into a bounded map, dropping expired entries first and then the one
+/// that expires soonest.
+///
+/// One victim, not [`crate::eviction`]'s halving: this bound is per zone and a
+/// constant, so the scan cannot grow with anything an operator or a stranger
+/// sets, and halving would throw away 128 validated proofs to save it.
 fn insert_bounded<T>(
     map: &mut BTreeMap<Vec<u8>, CachedProof<T>>,
     key: Vec<u8>,
@@ -936,15 +941,28 @@ fn insert_bounded<T>(
     map.insert(key, value);
 }
 
-fn evict_zone(zones: &mut HashMap<NameKeyBuf, ZoneProofs>, now: u64) {
+/// Drop the zones whose SOA has expired, and halve what is left if that freed
+/// nothing. See [`crate::eviction`]: a scan plus a key clone for one victim is a
+/// scan per insert, because a full table stays full.
+fn evict_zone(zones: &mut HashMap<NameKeyBuf, ZoneProofs>, max_zones: usize, now: u64) {
+    let before = zones.len();
+    // A zone whose SOA has gone proves nothing: the negative TTL comes from it.
     zones.retain(|_, z| z.soa.as_ref().is_some_and(|s| s.expires_at > now));
-    if let Some(soonest) = zones
-        .iter()
-        .min_by_key(|(_, z)| z.soa.as_ref().map(|s| s.expires_at).unwrap_or(0))
-        .map(|(k, _)| k.clone())
-    {
-        zones.remove(&soonest);
+    if zones.len() < before {
+        return;
     }
+
+    let expiries = zones.values().map(zone_expiry).collect();
+    let Some(mut plan) = Halving::plan(expiries, max_zones / 2) else {
+        return;
+    };
+    zones.retain(|_, z| plan.keep(zone_expiry(z)));
+}
+
+/// A zone with no SOA is not held by [`evict_zone`], so 0 is the value that
+/// sorts such a zone out first rather than a claim about its lifetime.
+fn zone_expiry(zone: &ZoneProofs) -> u64 {
+    zone.soa.as_ref().map(|s| s.expires_at).unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -24,6 +24,8 @@ pub mod dnssec_key;
 mod dnssec_test_util;
 pub mod dnssec_validation_mode;
 pub mod error;
+/// Shared eviction, `pub(crate)` because it is a mechanism and not a policy.
+mod eviction;
 pub mod ixfr;
 pub mod journal;
 pub mod logging;

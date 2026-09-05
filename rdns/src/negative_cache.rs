@@ -18,6 +18,7 @@
 //! - Nothing bogus is stored, and whether an answer validated is stored with it,
 //!   so the AD bit a second client sees is the one the first client saw.
 
+use crate::eviction::Halving;
 use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf, NameType, NameTypeKey};
 use crate::Qtype;
 use crate::Ttl;
@@ -149,13 +150,13 @@ impl NegativeCache {
         if nxdomain {
             let name = NameKeyBuf::new(qname);
             if !entries.nxdomain.contains_key(name.as_str()) && entries.len() >= self.max_entries {
-                make_room(&mut entries, now);
+                make_room(&mut entries, self.max_entries, now);
             }
             entries.nxdomain.insert(name, entry);
         } else {
             let key = NameTypeKey::new(qname, qtype);
             if !entries.nodata.contains_key(&key) && entries.len() >= self.max_entries {
-                make_room(&mut entries, now);
+                make_room(&mut entries, self.max_entries, now);
             }
             entries.nodata.insert(key, entry);
         }
@@ -233,8 +234,14 @@ impl Entry {
 }
 
 /// Make room: drop what has expired across both kinds, and if that freed
-/// nothing, the entry that expires soonest — the one whose loss costs least.
-fn make_room(entries: &mut Entries, now: u64) {
+/// nothing, halve what is left, soonest to expire going first.
+///
+/// One victim per insert was the old policy, and a full cache is full forever,
+/// so it was a two-map `min_by_key` scan plus a key clone on *every* insert —
+/// 14.6 µs at `max_entries` 10 000, with the lock every lookup needs held for
+/// it. See [`crate::eviction`]; the bound spans both maps, so one plan drives
+/// both `retain`s.
+fn make_room(entries: &mut Entries, max_entries: usize, now: u64) {
     let before = entries.len();
     entries.nxdomain.retain(|_, e| e.live(now));
     entries.nodata.retain(|_, e| e.live(now));
@@ -242,29 +249,17 @@ fn make_room(entries: &mut Entries, now: u64) {
         return;
     }
 
-    let soonest_nx = entries
+    let expiries = entries
         .nxdomain
-        .iter()
-        .min_by_key(|(_, e)| e.expires_at)
-        .map(|(k, e)| (k.clone(), e.expires_at));
-    let soonest_nd = entries
-        .nodata
-        .iter()
-        .min_by_key(|(_, e)| e.expires_at)
-        .map(|(k, e)| (k.clone(), e.expires_at));
-
-    match (soonest_nx, soonest_nd) {
-        (Some((key, nx_at)), Some((_, nd_at))) if nx_at <= nd_at => {
-            entries.nxdomain.remove(&key);
-        }
-        (_, Some((key, _))) => {
-            entries.nodata.remove(&key);
-        }
-        (Some((key, _)), None) => {
-            entries.nxdomain.remove(&key);
-        }
-        (None, None) => {}
-    }
+        .values()
+        .chain(entries.nodata.values())
+        .map(|e| e.expires_at)
+        .collect();
+    let Some(mut plan) = Halving::plan(expiries, max_entries / 2) else {
+        return;
+    };
+    entries.nxdomain.retain(|_, e| plan.keep(e.expires_at));
+    entries.nodata.retain(|_, e| plan.keep(e.expires_at));
 }
 
 #[cfg(test)]
@@ -588,5 +583,48 @@ mod tests {
             cache.insert(&name, Qtype::of(rt::AAAA), &nodata, false);
         }
         assert!(cache.len() <= 4, "held {} entries", cache.len());
+    }
+
+    /// #33a's measurement as an assertion: what an insert costs must not depend
+    /// on the bound. A ratio and not a floor (`CLAUDE.md` §10) — both halves run
+    /// on the machine running the test.
+    ///
+    /// Watched failing against the `min_by_key`-per-victim eviction this
+    /// replaced: 66x in a debug build (47 ms against 3.11 s for 10 000 inserts),
+    /// and 14.6 µs per insert against 0.99 in a release one at this bound, which
+    /// is `rdnsr`'s default `--cache-size`.
+    #[test]
+    fn inserting_into_a_full_cache_costs_what_inserting_with_room_does() {
+        use std::time::Instant;
+
+        const BOUND: usize = 10_000;
+
+        let fill = |cache: &NegativeCache, names: std::ops::Range<usize>| {
+            for i in names {
+                let name = format!("nope{i}.example.com.");
+                cache.insert(&name, Qtype::of(rt::A), &nxdomain_for(&name), false);
+            }
+        };
+        let full = NegativeCache::new(BOUND);
+        let roomy = NegativeCache::new(BOUND * 4);
+        fill(&full, 0..BOUND);
+        fill(&roomy, 0..BOUND);
+        assert_eq!(full.len(), BOUND, "the bound is reached, not passed");
+
+        let time = |cache: &NegativeCache, from: usize| {
+            let start = Instant::now();
+            fill(cache, from..from + BOUND);
+            start.elapsed()
+        };
+        let with_room = time(&roomy, BOUND);
+        let at_the_bound = time(&full, BOUND);
+
+        let ratio = at_the_bound.as_secs_f64() / with_room.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 3.0,
+            "an insert at the bound cost {ratio:.1}x one with room to spare \
+             ({with_room:?} -> {at_the_bound:?}); eviction is scanning for one \
+             victim per insert again"
+        );
     }
 }
