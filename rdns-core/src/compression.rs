@@ -250,6 +250,9 @@ impl NameCompressor {
             }
             // Everything else — including SRV, DNAME and the DNSSEC types —
             // goes out byte-for-byte (RFC 3597 §4, RFC 4034 §3.1.7/§4.1.1).
+            // DNAME says so itself: its <target> "MUST NOT be sent out in
+            // compressed form" (RFC 6672 §2.5), which is why it is not in the
+            // arm above with the other single-name RDATAs.
             _ => write_bytes(buf, pos, rdata),
         }
     }

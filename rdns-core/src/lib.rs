@@ -352,6 +352,9 @@ pub enum ParsedRecord {
         minimum: u32,
     },
     PTR(String),
+    /// The `<target>` a whole subtree is redirected to (RFC 6672 §2.1). One
+    /// domain name, and the substitution applies to names *below* the owner.
+    DNAME(String),
     MX {
         preference: u16,
         exchange: String,
@@ -459,6 +462,14 @@ impl ParsedRecord {
             utils::record_types::PTR => {
                 let (ptrdname, _) = dname_from_bytes(rdata, unpacker)?;
                 Ok(ParsedRecord::PTR(ptrdname))
+            }
+            // Read through the unpacker like any other name even though
+            // RFC 6672 §2.5 forbids sending <target> compressed: refusing a
+            // pointer here would make us unable to read what a
+            // non-conforming server sent, and the rule is on the writer.
+            utils::record_types::DNAME => {
+                let (target, _) = dname_from_bytes(rdata, unpacker)?;
+                Ok(ParsedRecord::DNAME(target))
             }
             utils::record_types::MX => {
                 let (preference, rest) = read_be!(u16, rdata);
@@ -627,6 +638,7 @@ impl ParsedRecord {
             ParsedRecord::NS(name) => (utils::record_types::NS, dname_to_bytes(name)?),
             ParsedRecord::CNAME(name) => (utils::record_types::CNAME, dname_to_bytes(name)?),
             ParsedRecord::PTR(name) => (utils::record_types::PTR, dname_to_bytes(name)?),
+            ParsedRecord::DNAME(name) => (utils::record_types::DNAME, dname_to_bytes(name)?),
             ParsedRecord::MX {
                 preference,
                 exchange,
@@ -2384,6 +2396,43 @@ mod tests {
             1,
             "the zone name should appear exactly once in the message"
         );
+    }
+
+    /// RFC 6672 §2.5: "The DNAME RDATA target name MUST NOT be sent out in
+    /// compressed form." The owner name is compressed like any other, which is
+    /// why DNAME is not in `write_rdata`'s single-name arm beside NS and CNAME.
+    #[test]
+    fn a_dname_target_goes_out_uncompressed() {
+        let dname = |owner: &str| ResourceRecord {
+            name: owner.to_string(),
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
+            rdata: RecordData::from_parsed(&ParsedRecord::DNAME("to.example.net.".to_string()))
+                .unwrap(),
+        };
+        let mut msg = query_msg(0x6672);
+        msg.response = true;
+        msg.queries[0].qname = "a.example.com.".to_string();
+        msg.answers = vec![dname("example.com."), dname("other.example.com.")];
+
+        let mut buf = [0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("to_bytes");
+
+        // The length-prefixed label, so this counts targets and not substrings
+        // of some other name. Twice: the second record pointing at the first
+        // would be exactly the compression the section forbids.
+        assert_eq!(
+            buf[..n].windows(3).filter(|w| *w == b"to").count(),
+            2,
+            "each DNAME spells its own target out"
+        );
+
+        let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
+        assert_eq!(parsed.answers.len(), 2);
+        for (got, want) in parsed.answers.iter().zip(&msg.answers) {
+            assert_eq!(got.name, want.name);
+            assert_eq!(got.rdata, want.rdata);
+        }
     }
 
     /// RFC 3597 §4 / RFC 4034: names in types the receiver may not know must

@@ -17,6 +17,9 @@ pub mod record_types {
     pub const MX: Rtype = Rtype::new(15);
     pub const TXT: Rtype = Rtype::new(16);
     pub const AAAA: Rtype = Rtype::new(28);
+    /// Redirection for a whole subtree (RFC 6672 §2.1). Unlike a CNAME it
+    /// redirects names *below* its owner and not the owner itself.
+    pub const DNAME: Rtype = Rtype::new(39);
     pub const DS: Rtype = Rtype::new(43);
     pub const RRSIG: Rtype = Rtype::new(46);
     pub const NSEC: Rtype = Rtype::new(47);
@@ -549,6 +552,7 @@ pub fn record_type_name_to_code(kind: &str) -> Option<Rtype> {
         "MX" => Some(record_types::MX),
         "TXT" => Some(record_types::TXT),
         "AAAA" => Some(record_types::AAAA),
+        "DNAME" => Some(record_types::DNAME),
         "DS" => Some(record_types::DS),
         "DNSKEY" => Some(record_types::DNSKEY),
         "RRSIG" => Some(record_types::RRSIG),
@@ -596,7 +600,7 @@ pub fn qtype_name(qtype: Qtype) -> Cow<'static, str> {
 /// The mnemonic for a type code, or its `TYPEnnn` form (RFC 3597 §5) when this
 /// library has none. Always a name [`record_type_name_to_code`] reads back.
 ///
-/// `Cow`, because thirteen of the answers are constants and only the last one
+/// `Cow`, because fourteen of the answers are constants and only the last one
 /// has to be built: writing a zone allocated a `String` per record to print a
 /// name that was in the binary already (`TODO.md` #26h).
 pub fn record_type_name(code: Rtype) -> Cow<'static, str> {
@@ -609,6 +613,7 @@ pub fn record_type_name(code: Rtype) -> Cow<'static, str> {
         record_types::MX => "MX",
         record_types::TXT => "TXT",
         record_types::AAAA => "AAAA",
+        record_types::DNAME => "DNAME",
         record_types::DS => "DS",
         record_types::DNSKEY => "DNSKEY",
         record_types::RRSIG => "RRSIG",
@@ -899,7 +904,7 @@ mod tests {
         assert_eq!(record_type_name(Rtype::new(1234)), "TYPE1234");
         assert_eq!(record_type_name(record_types::A), "A");
 
-        for code in [1u16, 15, 50, 99, 257, 65535] {
+        for code in [1u16, 15, 39, 50, 99, 257, 65535] {
             let name = record_type_name(Rtype::new(code));
             assert_eq!(
                 record_type_name_to_code(&name),
