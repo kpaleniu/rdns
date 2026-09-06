@@ -1597,10 +1597,7 @@ impl Server {
             ..
         } = self;
         let ServeContext {
-            logger,
-            metrics,
-            responses: response_limiter,
-            ..
+            logger, metrics, ..
         } = ctx;
 
         // The same door as the TCP path above, and now literally the same code.
@@ -1722,18 +1719,10 @@ impl Server {
         // straight out of the worker's scratch buffer with nothing allocated.
         // The two exceptions build a message of their own and own it.
         let reply: Option<Cow<'_, [u8]>> =
-            match response_limiter.admit(peer.ip(), scratch.out.len(), now) {
+            match ctx.admit_response(peer.ip(), scratch.out.len(), now) {
                 ResponseVerdict::Send => Some(Cow::Borrowed(scratch.out.as_slice())),
-                ResponseVerdict::Truncate => {
-                    logger.log_rate_limited(peer.ip());
-                    metrics.count(&metrics.rate_limited);
-                    truncated_reply(&msg).map(Cow::Owned)
-                }
-                ResponseVerdict::Drop => {
-                    logger.log_rate_limited(peer.ip());
-                    metrics.count(&metrics.queries_dropped);
-                    None
-                }
+                ResponseVerdict::Truncate => truncated_reply(&msg).map(Cow::Owned),
+                ResponseVerdict::Drop => None,
             };
         // Sign whatever we ended up sending — including a truncated one, since
         // that is still our answer to a question someone authenticated. This is

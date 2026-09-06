@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use rdns::logging::QueryLogger;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
-use rdns::security::{RateLimiter, ResponseLimiter};
+use rdns::security::{RateLimiter, ResponseLimiter, ResponseVerdict};
 use rdns::shutdown::{stop_signal, Shutdown};
 use rdns::validation::AdmissionCheck;
 use rdns::ResponseCode;
@@ -118,6 +118,35 @@ impl ServeContext {
         );
         self.metrics.count(&self.metrics.validation_errors);
         false
+    }
+
+    /// Whether the answer already built may be sent, and the counting either
+    /// refusal owes.
+    ///
+    /// The third refusal path, beside [`ServeContext::allow_source`] and
+    /// [`ServeContext::accept_packet`], and it was the one written twice
+    /// (`TODO.md` #33h). The verdict comes back rather than the reply: what a
+    /// truncated answer looks like is each daemon's — `rdnsd` rebuilds one from
+    /// the question it parsed, `rdnsr` shortens the bytes it already has — and
+    /// #30j settled that those stay two.
+    ///
+    /// `now` is the caller's, for the reason [`ServeContext::allow_source`]
+    /// gives: `rdnsr` reads the clock again here because a recursion sat
+    /// between the two reads.
+    pub fn admit_response(&self, peer: IpAddr, len: usize, now: u64) -> ResponseVerdict {
+        let verdict = self.responses.admit(peer, len, now);
+        match verdict {
+            ResponseVerdict::Send => {}
+            ResponseVerdict::Truncate => {
+                self.logger.log_rate_limited(peer);
+                self.metrics.count(&self.metrics.rate_limited);
+            }
+            ResponseVerdict::Drop => {
+                self.logger.log_rate_limited(peer);
+                self.metrics.count(&self.metrics.queries_dropped);
+            }
+        }
+        verdict
     }
 
     /// Record an answer by the code it carries and how long it took.
@@ -287,6 +316,37 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+
+    /// And so is the third refusal, which is the one that was written twice —
+    /// once per daemon, with the two counter increments spelled out in each
+    /// (`TODO.md` #33h). The verdict is the daemons'; the counting is not.
+    ///
+    /// Slip of two so both refusals appear: the first response over budget is
+    /// dropped and the second truncated, which is what RRL's slip means.
+    #[test]
+    fn the_response_budget_is_a_refusal_too() {
+        let ctx = ServeContext {
+            responses: Arc::new(ResponseLimiter::new(100, 100, 2)),
+            ..context(1)
+        };
+        let peer: IpAddr = "192.0.2.11".parse().unwrap();
+        let now = current_unix_timestamp();
+        let counter =
+            |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            ctx.admit_response(peer, 100, now),
+            ResponseVerdict::Send,
+            "a burst of 100 bytes covers the first answer"
+        );
+        assert_eq!(ctx.admit_response(peer, 100, now), ResponseVerdict::Drop);
+        assert_eq!(counter(&ctx.metrics.queries_dropped), 1);
+        assert_eq!(
+            ctx.admit_response(peer, 100, now),
+            ResponseVerdict::Truncate
+        );
+        assert_eq!(counter(&ctx.metrics.rate_limited), 1);
     }
 
     /// The size cap is the transport's, which is the reason [`Transport`] is

@@ -793,24 +793,16 @@ async fn udp_main(
                 // recursive resolution sits in between and can take seconds, so
                 // sharing that instant would deny the bucket the refill the wait
                 // earned it.
-                match ctx
-                    .responses
-                    .admit(peer.ip(), reply.len(), current_unix_timestamp())
-                {
+                match ctx.admit_response(peer.ip(), reply.len(), current_unix_timestamp()) {
                     ResponseVerdict::Send => {
                         let _ = socket.send_to(&reply, peer).await;
                     }
                     ResponseVerdict::Truncate => {
-                        ctx.logger.log_rate_limited(peer.ip());
-                        ctx.metrics.count(&ctx.metrics.rate_limited);
                         if let Some(short) = truncate_reply(&reply) {
                             let _ = socket.send_to(&short, peer).await;
                         }
                     }
-                    ResponseVerdict::Drop => {
-                        ctx.logger.log_rate_limited(peer.ip());
-                        ctx.metrics.count(&ctx.metrics.queries_dropped);
-                    }
+                    ResponseVerdict::Drop => {}
                 }
             }
         });
