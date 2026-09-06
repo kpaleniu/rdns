@@ -653,16 +653,28 @@ impl Layout {
             entry.is_delegation = name != origin && entry.types.contains(&rt::NS);
         }
 
-        let delegations: BTreeSet<String> = names
+        // The two ways a name can be in the file and not in the zone, which
+        // RFC 2136 §7.18 calls occlusion and names together: below a delegation
+        // (glue and the rest, RFC 4035 §2.2) and below a DNAME owner
+        // ("resource records MUST NOT exist at any subdomain of the owner of a
+        // DNAME RR... those names below the DNAME RR will be occluded",
+        // RFC 6672 §2.4).
+        //
+        // A DNAME's own owner is not occluded: it is not redirected by its own
+        // DNAME (§2.3), and its NSEC has to list DNAME or a validator cannot
+        // tell a real NXDOMAIN below it from one that skipped the redirection
+        // (§5.3.2).
+        //
+        // `check_dname_rules` refuses a zone file with anything below a DNAME,
+        // so this covers a zone that arrived by transfer or was built by UPDATE
+        // — which §5.2 has adding a DNAME over existing names on purpose.
+        let occluders: BTreeSet<String> = names
             .iter()
-            .filter(|(_, e)| e.is_delegation)
+            .filter(|(_, e)| e.is_delegation || e.types.contains(&rt::DNAME))
             .map(|(n, _)| n.clone())
             .collect();
         for (name, entry) in names.iter_mut() {
-            // Glue and anything else below a delegation: in the file, not in
-            // the zone (RFC 4035 §2.2). In the chain it would assert the
-            // existence of names this zone does not serve.
-            entry.occluded = ancestors_of(name).any(|ancestor| delegations.contains(ancestor));
+            entry.occluded = ancestors_of(name).any(|ancestor| occluders.contains(ancestor));
         }
 
         Layout {
@@ -1002,6 +1014,7 @@ secure  IN DS  12345 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF012345
 ns.secure IN A 192.0.2.30
 plain   IN NS  ns.plain.example.com.
 ns.plain IN A  192.0.2.40
+redir   IN DNAME target.example.net.
 "#;
 
     fn policy(chain: DenialChain) -> SigningPolicy {
@@ -1266,6 +1279,47 @@ ns.plain IN A  192.0.2.40
             proof_for(&zone, ORIGIN, rt::NS),
             RrsetProof::Verified { .. }
         ));
+    }
+
+    /// RFC 6672 §2.4: a name below a DNAME owner is occluded, exactly as glue
+    /// below a delegation is (RFC 2136 §7.18 names both). Chaining it would
+    /// sign an assertion that a name exists which the answer path redirects
+    /// past and never serves.
+    ///
+    /// Built by hand rather than parsed, because `check_dname_rules` refuses
+    /// such a zone from a file — this is the shape a transfer or an UPDATE
+    /// produces (§5.2 adds a DNAME over existing names on purpose).
+    #[test]
+    fn a_name_below_a_dname_is_occluded_from_the_chain() {
+        let mut zone = parse_zone_file(ZONE, ORIGIN).expect("the test zone parses");
+        zone.add_record(ZoneRecord {
+            name: "occluded.redir.example.com.".to_string(),
+            ttl: Ttl::from_secs(3600),
+            class: crate::Class::new(1),
+            rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.66".parse().unwrap()))
+                .unwrap(),
+        });
+        let signed = sign_zone(&zone, &signing_keys(ORIGIN), &policy(DenialChain::Nsec))
+            .expect("signing succeeds");
+
+        assert!(
+            signed
+                .query("occluded.redir.example.com.", Qtype::of(rt::NSEC))
+                .is_empty(),
+            "an occluded name has no place in the chain"
+        );
+        // The DNAME's own owner is not occluded by its own DNAME (§2.3), and
+        // its bitmap has to say DNAME or a validator cannot tell a genuine
+        // NXDOMAIN below it from one that skipped the redirection (§5.3.2).
+        let nsecs = signed.query("redir.example.com.", Qtype::of(rt::NSEC));
+        assert_eq!(nsecs.len(), 1, "the DNAME owner is still chained");
+        let Ok(ParsedRecord::NSEC { type_bitmap, .. }) = nsecs[0].rdata.parse() else {
+            panic!("the NSEC parses");
+        };
+        assert!(
+            crate::denial_wire::bitmap_has_type(&type_bitmap, rt::DNAME),
+            "§5.3.2: the DNAME bit belongs in the bitmap"
+        );
     }
 
     #[test]

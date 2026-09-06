@@ -436,6 +436,15 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
 
                 // §3.4.2.7: a CNAME may not be added where other data lives, nor
                 // other data where a CNAME lives (RFC 1034 §3.6.2).
+                //
+                // Both halves cover DNAME without a case of their own, and
+                // RFC 6672 §5.2 asks for exactly that: "if a dynamic update
+                // message attempts to add a DNAME... but a CNAME is associated
+                // with that name, then the server MUST ignore the DNAME", and
+                // "if a CNAME is added... but a DNAME is associated with that
+                // name, then the CNAME MUST be ignored" — a DNAME is other
+                // data beside a CNAME, and a CNAME is what the second branch
+                // looks for.
                 if rtype == rt::CNAME {
                     if work.has_other_data_beside_a_cname(&name) {
                         ignored.push(Ignored {
@@ -489,9 +498,10 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                     rdata: record.rdata.clone(),
                 };
 
-                // §3.4.2.7's inner loop: a CNAME or an SOA replaces whatever is
-                // there — both are singletons — and anything else replaces only
-                // an exact RDATA match, which is how an UPDATE changes a TTL.
+                // §3.4.2.7's inner loop: a CNAME, an SOA or a DNAME replaces
+                // whatever is there — all three are singletons — and anything
+                // else replaces only an exact RDATA match, which is how an
+                // UPDATE changes a TTL.
                 //
                 // §3.4.2.2's third rule, matching WKS on ADDRESS and PROTOCOL,
                 // is not implementable: WKS has no decoder, so its RDATA is
@@ -680,11 +690,17 @@ impl<'a> Working<'a> {
 
     /// Which record this add replaces, per §3.4.2.7's inner loop, or `None` if
     /// it joins the RRset instead.
+    ///
+    /// DNAME is a singleton beside CNAME and SOA: RFC 6672 §2.4 allows one per
+    /// name, and §5.2 says so for this path in as many words — "if a DNAME is
+    /// already associated with that name, then it is replaced with the new
+    /// DNAME". Without it an UPDATE grows a second DNAME at one name, which is
+    /// the zone shape `zone::check_dname_rules` refuses to load.
     fn position_to_replace(&self, name: &str, rtype: Rtype, rdata: &RecordData) -> Option<usize> {
         self.records.iter().position(|r| {
             r.name.eq_ignore_ascii_case(name)
                 && r.rdata.rtype() == rtype
-                && (rtype == rt::CNAME || rtype == rt::SOA || r.rdata == *rdata)
+                && (matches!(rtype, rt::CNAME | rt::SOA | rt::DNAME) || r.rdata == *rdata)
         })
     }
 
@@ -1390,6 +1406,10 @@ mail IN MX  10 mx.example.com.
         RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).expect("a CNAME encodes")
     }
 
+    fn dname(target: &str) -> RecordData {
+        RecordData::from_parsed(&ParsedRecord::DNAME(target.to_string())).expect("a DNAME encodes")
+    }
+
     /// How many records of a type sit at a name, via the zone's own index — so
     /// the rebuilt zone is checked through the API a query uses.
     fn held(zone: &Zone, name: &str, rtype: Rtype) -> usize {
@@ -1566,6 +1586,54 @@ mail IN MX  10 mx.example.com.
             "nothing matched, so nothing was protected: {:?}",
             absent.ignored
         );
+    }
+
+    /// RFC 6672 §5.2, all three of its sentences: a DNAME added where a CNAME
+    /// lives is ignored, a CNAME added where a DNAME lives is ignored, and a
+    /// DNAME added where a DNAME lives *replaces* it rather than joining it.
+    #[test]
+    fn a_dname_is_a_singleton_and_never_shares_a_name_with_a_cname() {
+        let zone = zone();
+
+        let with_dname = apply(&zone, &[add("r.example.com.", 3600, dname("a.test."))]);
+        assert_eq!(with_dname.changed, 1);
+        assert_eq!(held(&with_dname.zone, "r.example.com.", rt::DNAME), 1);
+
+        // "If a DNAME is already associated with that name, then it is replaced
+        // with the new DNAME." Two would be the shape `check_dname_rules`
+        // refuses to load.
+        let replaced = apply(
+            &with_dname.zone,
+            &[add("r.example.com.", 3600, dname("b.test."))],
+        );
+        assert_eq!(replaced.changed, 1);
+        assert_eq!(
+            held(&replaced.zone, "r.example.com.", rt::DNAME),
+            1,
+            "one DNAME, not two"
+        );
+
+        // "If a CNAME is added with a given owner name, but a DNAME is
+        // associated with that name, then the CNAME MUST be ignored."
+        let refused = apply(
+            &with_dname.zone,
+            &[add("r.example.com.", 3600, cname("c.test."))],
+        );
+        assert_eq!(refused.changed, 0);
+        assert_eq!(held(&refused.zone, "r.example.com.", rt::CNAME), 0);
+        assert_eq!(refused.ignored.len(), 1);
+
+        // "...but a CNAME is associated with that name, then the server MUST
+        // ignore the DNAME."
+        let with_cname = apply(&zone, &[add("c.example.com.", 3600, cname("x.test."))]);
+        assert_eq!(with_cname.changed, 1);
+        let refused = apply(
+            &with_cname.zone,
+            &[add("c.example.com.", 3600, dname("y.test."))],
+        );
+        assert_eq!(refused.changed, 0);
+        assert_eq!(held(&refused.zone, "c.example.com.", rt::DNAME), 0);
+        assert_eq!(refused.ignored.len(), 1);
     }
 
     /// §3.4.2.7: a CNAME may not be added where other data lives, nor other
