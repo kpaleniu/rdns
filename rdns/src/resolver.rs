@@ -10,14 +10,15 @@ use crate::dnssec_chain::{
 use crate::dnssec_denial::{nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, Denial};
 use crate::error::{ResolveError, ResolveResult};
 use crate::utils::{
-    absolute_lowered, bind_addr_for, current_unix_timestamp, is_at_or_under, label_count,
-    names_equal, record_types as rt, NameKeyBuf,
+    absolute_lowered, bind_addr_for, current_unix_timestamp, dname_redirect, is_at_or_under,
+    label_count, names_equal, record_types as rt, NameKeyBuf, Redirect,
 };
 use crate::validation::{answers_query, SentQuery};
 use crate::Qtype;
 use crate::Rtype;
 use crate::{
-    DnsMessage, Edns, ParsedRecord, QueryClass, QuerySection, ResourceRecord, ResponseCode,
+    DnsMessage, Edns, ParsedRecord, QueryClass, QuerySection, RecordData, ResourceRecord,
+    ResponseCode,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -806,7 +807,7 @@ impl Resolver {
                 qtype: query.qtype,
                 qclass: query.qclass,
             };
-            let response = self.resolve_from_root(&step, state, 0).await?;
+            let Answered { response, zone } = self.resolve_from_root(&step, state, 0).await?;
 
             // Only the last hop's authority section is returned, but a
             // wildcard-expanded CNAME earlier in the chain still owes its NSEC.
@@ -820,14 +821,33 @@ impl Resolver {
             for rr in &response.answers {
                 // Once per record of every response, so the allocation this
                 // used to make was per record rather than per query.
-                if !chain.contains(absolute_lowered(&rr.name).as_ref()) {
+                let owner = absolute_lowered(&rr.name);
+                if chain.contains(owner.as_ref()) {
+                    answers.push(rr.clone());
+                    if rr.rdata.rtype() == rt::CNAME {
+                        if let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() {
+                            chain.insert(normalize(&target));
+                        }
+                    }
                     continue;
                 }
-                answers.push(rr.clone());
-                if rr.rdata.rtype() == rt::CNAME {
-                    if let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() {
-                        chain.insert(normalize(&target));
-                    }
+                // A DNAME never owns the name asked about — it owns an
+                // *ancestor* of it (RFC 6672 §2.2) — so the test above cannot
+                // ever accept one, and dropping it loses the only signed half
+                // of the redirection: "the CNAME will never be signed" (§5.3.1),
+                // so a validating client that gets the CNAME without the DNAME
+                // has nothing to check.
+                //
+                // Bailiwick is the whole of the guard. Without it a server for
+                // `example.com.` answers with `com. DNAME evil.test.` and
+                // redirects every name under `com.` in this cache.
+                if rr.rdata.rtype() == rt::DNAME
+                    && is_at_or_under(&owner, &zone)
+                    && chain
+                        .iter()
+                        .any(|name| name != owner.as_ref() && is_at_or_under(name, &owner))
+                {
+                    answers.push(rr.clone());
                 }
             }
 
@@ -846,11 +866,25 @@ impl Resolver {
                     _ => None,
                 });
 
+            // RFC 6672 §3.4: "Recursive caching name servers MUST perform
+            // CNAME synthesis on behalf of clients." A conforming authoritative
+            // server sends the CNAME itself (§3.1), but it is not obliged to be
+            // conforming and a cache may hold the DNAME alone, so when no CNAME
+            // arrived the substitution is ours to make.
+            let next = match cname {
+                Some(target) => Some(target),
+                None if got_type || query.qtype.is(rt::CNAME) => None,
+                None => synthesize_from_dname(&response, &zone, &qname, &mut answers)?,
+            };
+            if let Some(target) = &next {
+                chain.insert(target.clone());
+            }
+
             last = Some(response);
-            if got_type || cname.is_none() || query.qtype.is(rt::CNAME) {
+            if got_type || next.is_none() || query.qtype.is(rt::CNAME) {
                 break;
             }
-            qname = cname.expect("checked is_none above");
+            qname = next.expect("checked is_none above");
         }
 
         let mut response = last
@@ -873,7 +907,7 @@ impl Resolver {
         query: &QuerySection,
         state: &mut Resolution,
         depth: usize,
-    ) -> ResolveResult<DnsMessage> {
+    ) -> ResolveResult<Answered> {
         const MAX_NESTED: usize = 4;
         if depth > MAX_NESTED {
             return Err(ResolveError::no_response(format!(
@@ -923,7 +957,7 @@ impl Resolver {
         depth: usize,
         start_zone: String,
         start_servers: Vec<SocketAddr>,
-    ) -> ResolveResult<DnsMessage> {
+    ) -> ResolveResult<Answered> {
         let qname = normalize(&query.qname);
         let qname_labels = label_count(&qname);
 
@@ -1021,7 +1055,7 @@ impl Resolver {
                 // delegation: an empty NOERROR would read as a definitive "no
                 // such record", so fail into SERVFAIL instead.
                 if !response.answers.is_empty() || response.authoritive {
-                    return Ok(response);
+                    return Ok(Answered { response, zone });
                 }
                 return Err(ResolveError::no_response(format!(
                     "lame delegation: {zone} gave no answer and no usable referral for {qname}"
@@ -1032,7 +1066,7 @@ impl Resolver {
             if response.rcode == ResponseCode::NoSuchDomain {
                 // The ancestor does not exist, so neither does the full name
                 // (RFC 8020).
-                return Ok(response);
+                return Ok(Answered { response, zone });
             }
             // The label exists in this zone but is not a cut; go one deeper.
             sent_labels = labels + 1;
@@ -1178,10 +1212,11 @@ impl Resolver {
                 };
                 // Boxed: this closes the resolution cycle, and an `async fn`
                 // future may not contain itself by value.
-                let Ok(response) = Box::pin(self.resolve_from_root(&lookup, state, depth)).await
+                let Ok(answered) = Box::pin(self.resolve_from_root(&lookup, state, depth)).await
                 else {
                     continue;
                 };
+                let response = answered.response;
                 addrs.extend(
                     response
                         .answers
@@ -1500,7 +1535,11 @@ impl Resolver {
         };
         let response = match self.config.mode {
             ResolverMode::Forward => Box::pin(self.forward(&query, state)).await?,
-            ResolverMode::Recurse => Box::pin(self.resolve_from_root(&query, state, 0)).await?,
+            ResolverMode::Recurse => {
+                Box::pin(self.resolve_from_root(&query, state, 0))
+                    .await?
+                    .response
+            }
         };
         let ttl = response
             .answers
@@ -1559,6 +1598,76 @@ impl Resolver {
             )),
         }
     }
+}
+
+/// One response, and the zone whose servers gave it.
+///
+/// The zone is what bailiwick is judged against. It was `walk`'s local until
+/// DNAME needed it: a DNAME redirects from an *ancestor* of the name asked
+/// about (RFC 6672 §2.2), so "the owner is a name we asked for" cannot be the
+/// acceptance rule for one, and without the zone there is no rule left.
+struct Answered {
+    response: DnsMessage,
+    zone: String,
+}
+
+/// RFC 6672 §3.4.1 step 4D: apply a DNAME in the response to the name being
+/// sought, and synthesize the CNAME the server did not send.
+///
+/// Called only when no CNAME arrived for `qname`. A conforming authoritative
+/// server sends one (§3.1) and this does nothing; §3.4 makes the synthesis a
+/// recursive server's obligation anyway, because a cache may hold the DNAME
+/// alone.
+///
+/// The first applicable DNAME is the only one: "there will be at most one
+/// ancestor with a DNAME as described in step 4 unless some zone's data is in
+/// violation of the no-descendants limitation" (§3.2).
+///
+/// `Err` for an overflow, which is step 4D's "return an implementation-
+/// dependent error to the application" — the authoritative server's YXDOMAIN
+/// (§2.2) has no resolver-side spelling, and answering NOERROR with a partial
+/// chain would say the name resolved to nothing rather than that it could not
+/// be built.
+fn synthesize_from_dname(
+    response: &DnsMessage,
+    zone: &str,
+    qname: &str,
+    answers: &mut Vec<ResourceRecord>,
+) -> ResolveResult<Option<String>> {
+    for rr in &response.answers {
+        if rr.rdata.rtype() != rt::DNAME || !is_at_or_under(&rr.name, zone) {
+            continue;
+        }
+        let Ok(ParsedRecord::DNAME(target)) = rr.rdata.parse() else {
+            continue;
+        };
+        match dname_redirect(qname, &rr.name, &target) {
+            Redirect::NoMatch => continue,
+            Redirect::TooLong => {
+                return Err(ResolveError::no_response(format!(
+                    "substituting {target} for {} in {qname} overflows 255 octets \
+                     (RFC 6672 §3.4.1 step 4D)",
+                    rr.name
+                )))
+            }
+            Redirect::To(next) => {
+                // "A CNAME RR with Time to Live (TTL) equal to the
+                // corresponding DNAME RR is synthesized" (§3.1) — and for a
+                // cache, "equal to the decremented TTL of the cached DNAME",
+                // which is what arrived on the wire.
+                let rdata = RecordData::from_parsed(&ParsedRecord::CNAME(next.clone()))
+                    .map_err(|e| ResolveError::no_response(format!("synthesizing a CNAME: {e}")))?;
+                answers.push(ResourceRecord {
+                    name: qname.to_string(),
+                    class: rr.class,
+                    ttl: rr.ttl,
+                    rdata,
+                });
+                return Ok(Some(normalize(&next)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Absolute, lowercased form — the shape every comparison here assumes.
@@ -1932,6 +2041,15 @@ this line has no record and is skipped
         }
     }
 
+    fn dname_record(owner: &str, target: &str) -> ResourceRecord {
+        ResourceRecord {
+            name: owner.to_string(),
+            class: Class::new(1),
+            ttl: Ttl::from_secs(1800),
+            rdata: RecordData::from_parsed(&ParsedRecord::DNAME(target.to_string())).unwrap(),
+        }
+    }
+
     /// A referral: no answer, NS in authority, optional glue in additional.
     fn referral(
         query: &DnsMessage,
@@ -2007,6 +2125,144 @@ this line has no record and is skipped
         assert_eq!(
             answer.answers[0].rdata.parse().unwrap(),
             ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))
+        );
+    }
+
+    /// RFC 6672 §3.4.1 step 4D and §3.4: a DNAME in the answer is followed,
+    /// and the CNAME the server did not send is synthesized here — "recursive
+    /// caching name servers MUST perform CNAME synthesis on behalf of clients".
+    ///
+    /// The upstream deliberately sends the DNAME *alone*, which §3.1 says a
+    /// conforming authoritative server would not do. That is the case worth
+    /// testing: with a CNAME in the response the chase is the ordinary CNAME
+    /// path and proves nothing about DNAME.
+    #[tokio::test]
+    async fn a_dname_alone_is_followed_and_its_cname_synthesized() {
+        let mut socks = bind_hierarchy(2).into_iter();
+        let (root_sock, tld_sock) = (socks.next().unwrap(), socks.next().unwrap());
+        let tld_addr = tld_sock.local_addr().unwrap();
+
+        let _tld = spawn_server(tld_sock, |q| {
+            let name = normalize(&qname_of(q));
+            if name == "www.example2.test." {
+                return authoritative(q, vec![a_record(&name, [192, 0, 2, 7])]);
+            }
+            if name != "example.test." && is_at_or_under(&name, "example.test.") {
+                return authoritative(q, vec![dname_record("example.test.", "example2.test.")]);
+            }
+            authoritative(q, vec![])
+        });
+        let root = spawn_server(root_sock, move |q| {
+            referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
+        });
+
+        let resolver = Resolver::new(recursing_config(root.addr));
+        let answer = resolver
+            .resolve(&QuerySection {
+                qname: "www.example.test.".to_string(),
+                qtype: Qtype::of(rt::A),
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the DNAME should be followed to the address");
+
+        let dnames: Vec<_> = answer
+            .answers
+            .iter()
+            .filter(|rr| rr.rdata.rtype() == rt::DNAME)
+            .collect();
+        assert_eq!(
+            dnames.len(),
+            1,
+            "the DNAME is kept: it is the only signed half of the redirection \
+             (§5.3.1), and it owns an ancestor rather than the name asked about, \
+             so the chain filter used to drop it: {:?}",
+            answer.answers
+        );
+        // Compared case-insensitively: the owner is a suffix of the question,
+        // so it goes out as a compression pointer into a 0x20-randomized name
+        // and comes back in that case (RFC 4343).
+        assert!(
+            names_equal(&dnames[0].name, "example.test."),
+            "{:?}",
+            dnames[0].name
+        );
+
+        let cnames: Vec<_> = answer
+            .answers
+            .iter()
+            .filter(|rr| rr.rdata.rtype() == rt::CNAME)
+            .collect();
+        assert_eq!(cnames.len(), 1);
+        assert_eq!(cnames[0].name, "www.example.test.");
+        assert_eq!(
+            cnames[0].rdata.parse().unwrap(),
+            ParsedRecord::CNAME("www.example2.test.".to_string())
+        );
+        assert_eq!(
+            cnames[0].ttl, dnames[0].ttl,
+            "§3.1: a CNAME with TTL equal to the corresponding DNAME"
+        );
+
+        assert!(
+            answer
+                .answers
+                .iter()
+                .any(|rr| rr.rdata.parse() == Ok(ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 7)))),
+            "and the chase reached the target: {:?}",
+            answer.answers
+        );
+    }
+
+    /// A DNAME above the zone that answered is a hijack: `test.`'s server may
+    /// not redirect the root. Dropped, and not followed.
+    ///
+    /// The hijack is set up to *work* if the bailiwick test is removed — the
+    /// root here delegates `evil.` as readily as `test.`, and the attacker's
+    /// server answers for every name under it. Without the guard this test
+    /// returns 6.6.6.6; with it, nothing. An earlier version of it delegated
+    /// only `test.`, so the substituted name failed to resolve for an unrelated
+    /// reason and the test passed with the guard deleted (`CLAUDE.md` §1).
+    #[tokio::test]
+    async fn an_out_of_bailiwick_dname_is_neither_kept_nor_followed() {
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, tld_sock, evil_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let tld_addr = tld_sock.local_addr().unwrap();
+        let evil_addr = evil_sock.local_addr().unwrap();
+
+        let _evil = spawn_server(evil_sock, |q| {
+            authoritative(q, vec![a_record(&qname_of(q), [6, 6, 6, 6])])
+        });
+        // Authoritative for `test.` and redirecting the root from there.
+        let _tld = spawn_server(tld_sock, |q| {
+            authoritative(q, vec![dname_record(".", "evil.")])
+        });
+        let root = spawn_server(root_sock, move |q| {
+            if is_at_or_under(&qname_of(q), "evil.") {
+                referral(q, "evil.", "ns.evil.", Some(("ns.evil.", evil_addr)))
+            } else {
+                referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
+            }
+        });
+
+        let resolver = Resolver::new(recursing_config(root.addr));
+        let answers = resolver
+            .resolve(&QuerySection {
+                qname: "www.example.test.".to_string(),
+                qtype: Qtype::of(rt::A),
+                qclass: QueryClass::IN,
+            })
+            .await
+            .map(|r| r.answers)
+            .unwrap_or_default();
+
+        assert!(
+            answers.is_empty(),
+            "a DNAME at the root from a server for `test.` must be ignored: {answers:?}"
         );
     }
 
