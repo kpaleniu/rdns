@@ -41,9 +41,10 @@ UPDATE (RFC 2136) — TSIG-only, scoped per key, writing each accepted update ba
 to the zone file before answering. Class IN only.
 
 Not implemented: DNS over TLS/HTTPS/QUIC, DNS Cookies as anything but opaque
-bytes, SIG(0), DNAME, SVCB/HTTPS, and any record type outside the thirteen listed
+bytes, SIG(0), SVCB/HTTPS, and any record type outside the fourteen listed
 in `02-zone-model.md` — unknown types round-trip as opaque RDATA per RFC 3597 but
-cannot be written in a zone file except in `\#` form.
+cannot be written in a zone file except in `\#` form. DNAME (RFC 6672) joined
+that list on 2026-09-06 and is now served, signed, followed and resolved.
 
 ## Overlap with `docs/CLI_USAGE.md`
 

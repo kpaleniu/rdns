@@ -13,8 +13,15 @@ by reading intent, with every known RFC deviation and gap collected in one
 table.
 
 **A fourth file as of 2026-09-05: `docs/CLOSED_WORK.md`.** Everything finished
-lives there — twenty-eight numbered sections covering thirty-one numbers, and
+lives there — ~~twenty-eight numbered sections covering thirty-one numbers~~, and
 the log of what landed, verbatim, strike-throughs and wrong claims included.
+`grep -c '^### [0-9]' docs/CLOSED_WORK.md` is the count, rather than a number
+written here: the struck one was already wrong when it was written on 2026-09-05
+(there were twenty-nine sections, not twenty-eight), and what the "thirty-one
+numbers" counted is not recoverable — #5, #8 and #9 are closed with no section
+of their own, and #21 has a section in *this* file. That is the ninth time a
+count in a preamble here has gone stale, and the first fixed by deleting the
+count.
 This page had reached 7,989 lines of which about six thousand described work
 that was already done, so the queue was three screens and the archive was
 seventy. Closed items are one row each in
@@ -40,6 +47,13 @@ every *measurement* and every caveat needed to trust one; those say
 section is in `docs/CLOSED_WORK.md` under its own number, where the five
 candidates it *dropped* are the half worth reading.
 
+**#34, DNAME (RFC 6672), filed and closed 2026-09-06.** Taken because #21's
+not-implemented list named it the only entry there that made this server answer
+*wrong* rather than incomplete. Five commits: the record type, the zone, the
+server algorithm, the resolver, then signing and UPDATE. RFC 6672's Table 1 is a
+test verbatim, and dnspython validates the DNAME's RRSIG against a running
+`rdnsd`. The section is in `docs/CLOSED_WORK.md`.
+
 **Everything else numbered is closed, withdrawn, or answered no**, and the table
 under "Closed work" says which, when, and where the reasoning is.
 
@@ -50,9 +64,10 @@ msrv, deny, the container image, the `dhat-heap` feature build, and clippy on
 Linux. That is the operator's call, not a session's: see "Do not push" below.
 
 **A count in a preamble goes stale whenever the list under it changes**, which
-happened to this page's summary paragraphs at least eight times between
-2026-07-30 and 2026-09-05 — eight is the page's own count of itself — each
-corrected in place rather than reworded. The record is kept
+happened to this page's summary paragraphs at least ~~eight~~ **nine** times
+between 2026-07-30 and 2026-09-06 — the ninth is the `docs/CLOSED_WORK.md`
+section count above, found wrong on 2026-09-06 and already wrong on the day it
+was written — each corrected in place rather than reworded. The record is kept
 under "How the queue kept going stale" in `docs/CLOSED_WORK.md`, because the
 shape is the lesson. What this rewrite did about it is not a better paragraph
 but a shorter list: two items cannot drift from a summary of two items. It is
@@ -61,7 +76,7 @@ commit that closed #33 rather than a later one — which is the only way this ha
 ever stayed true. Whether it holds is a question for the next reader who finds
 this page wrong.
 
-**The three claims on this page that were wrong**, kept because the reasoning is
+**The four claims on this page that were wrong**, kept because the reasoning is
 the useful part (`CLAUDE.md` §11 — correct in place, never quietly):
 
 - *"CI runs all of this now"* (2026-07-30), while `git remote -v` was empty. The
@@ -70,6 +85,10 @@ the useful part (`CLAUDE.md` §11 — correct in place, never quietly):
   which went into a commit message, a doc comment and this file without anyone
   reading the twenty lines that would have settled it. It returned `Err`, and a
   secondary pointed at an empty directory then refused to start.
+- *"twenty-eight numbered sections covering thirty-one numbers"* — written the
+  day `docs/CLOSED_WORK.md` was split out and wrong that day: there were
+  twenty-nine sections. Replaced above with the `grep` that answers it, which is
+  the same move as `git rev-list --count` two paragraphs up.
 - *"the profiler is global, so every test now holds the mutex for its whole
   body"* — true and insufficient. A mutex in a test file cannot serialize
   libtest's own bookkeeping on its other threads, which is why
@@ -684,9 +703,14 @@ numbered is under "Closed work" below.
 
 ### Where to pick up next
 
-Everything here is a choice, not a queue. One thing, now that #33 is closed —
-which is the state this page has never been in before, so the next session picks
-its own work rather than taking the top of a list.
+Everything here is a choice, not a queue. One thing, with #33 and #34 both
+closed — which is the state this page has never been in before, so the next
+session picks its own work rather than taking the top of a list.
+
+Two candidates named elsewhere on this page, for a session that wants one:
+**#13e's `Name` half**, which D-1 below argues for in its last clause, and
+**SVCB/HTTPS presentation form**, which is the largest remaining entry in #21's
+not-implemented list. Neither is a queue either.
 
 > **1. Push, and read the five CI jobs nobody has ever read.** Ask
 > `git rev-list --count origin/main..HEAD` how much is waiting; it was 49 on
@@ -740,7 +764,6 @@ Scope, not defects. Listed so "is this missing on purpose?" has an answer.
 
 | | note |
 |---|---|
-| DNAME (RFC 6672) | the only one of these that changes *answers* rather than adding a transport or a type. A resolver that meets one today gets the records without following the redirection |
 | DoT / DoH / DoQ (7858 / 8484 / 9250) | each is a transport, and each drags in a TLS stack — the dependency argument §14 makes about the OTLP exporter applies with more force here |
 | SIG(0) (RFC 2931) | TSIG covers the transaction-authentication case this server actually has. SIG(0) matters for a client that cannot share a secret in advance, which is not a deployment this serves |
 | SVCB / HTTPS (RFC 9460) | round-trips as opaque RDATA per RFC 3597, so it can be *stored and served*; what is missing is parsing and presentation-format writing |
@@ -749,12 +772,19 @@ Scope, not defects. Listed so "is this missing on purpose?" has an answer.
 | white lies / minimally-covering NSEC (RFC 4470) | the denial chain is precomputed at signing time, so a lie would have to be signed online. That is a different signing model, not a feature |
 | key-rollover *automation* (RFC 6781) | rollover is manual and the signer will not delete a published DNSKEY, which is the half that matters: a key published without its private half is how every rollover starts, and deleting it would undo the operator's preparation |
 
-**One of these is a stronger candidate than the rest**, and saying which is the
+~~**One of these is a stronger candidate than the rest**, and saying which is the
 point of writing the list down: **DNAME**, because it is the only entry that
 makes this server give a *wrong* answer rather than an incomplete one — a name
 under a DNAME gets NXDOMAIN or NODATA where an implementation that followed it
-would synthesize a CNAME. Everything else on the list is something absent that
-announces its own absence.
+would synthesize a CNAME.~~ **Taken 2026-09-06 and done — #34.** The paragraph is
+kept because it is why the work happened, and because it is the only time this
+list has been used for what it was written for: a session with no queue read it,
+found the argument already made, and did that.
+
+Everything else on the list is something absent that announces its own absence,
+which is why none of the rest is marked. The next strongest, on the same
+reasoning, is **SVCB/HTTPS**: an operator who writes one in a zone file has to
+hand-encode it in `\#` form, and a mistake there is silent.
 
 ---
 
@@ -805,6 +835,7 @@ the week; the record is under "How the queue kept going stale" in
 | **31** | where a crate boundary would pay | **done 2026-09-05.** `rdns-transport` holds #30's transport; `rdns-core` holds the wire format, which takes a client from 67 packages to 35. Two crates, not the three the plan drew |
 | **32** | `Shell`, `Served` and the other unnamed bags | **closed 2026-09-05.** The prediction held: naming the five was the extraction, and `ServeContext` landed in the same commit as the pipeline it parameterizes |
 | **33** | a fourth pass: duplication, generics, and where the modules are cut | **closed 2026-09-06**, eight items over two days. 33b was the one defect in a shipped binary — `rdnsc` could not ask an ANY or AXFR query, because the builder took an RTYPE. Five further candidates were dropped and the section says why |
+| **34** | DNAME (RFC 6672) | **filed and closed 2026-09-06**, five commits — the record type, the zone, the server algorithm, the resolver, then signing and UPDATE. Taken off #21's not-implemented list, which had named it the only entry there that answered *wrong* rather than incomplete. Two bugs found by the new tests: a `Zone` flag maintained in one of the two places that maintain its siblings (now one `Shortcuts` value), and DNAME missing from UPDATE's singleton list. One test had to be rewritten because it passed with the guard it was named for deleted |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

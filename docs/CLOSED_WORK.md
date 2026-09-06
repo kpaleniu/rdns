@@ -4847,6 +4847,118 @@ say nothing on the wire now count themselves in one place.
 
 ---
 
+### 34. DNAME (RFC 6672) — **filed and closed 2026-09-06**
+
+Taken because `#21`'s own not-implemented list named it: **the only entry on
+that list that made this server give a *wrong* answer rather than an incomplete
+one.** A name under a DNAME got NXDOMAIN or NODATA where an implementation that
+followed the redirection would synthesize a CNAME. Everything else on the list
+is something absent that announces its own absence.
+
+Five commits, one per layer, in the order each could be verified:
+
+| | what | where |
+|---|---|---|
+| **34a** | the record type: Rtype 39, `ParsedRecord::DNAME`, the name↔code tables, and the note that the fall-through in `write_rdata` is §2.5's rule and not a default | `rdns-core` |
+| **34b** | presentation parse and write, `Zone::dname_above`, `check_dname_rules` | `zone.rs`, `zone_writer.rs` |
+| **34c** | `utils::dname_redirect` and the server algorithm: §3.2 step 3C, the synthesized CNAME, YXDOMAIN on overflow | `utils.rs`, `rdnsd/src/answer.rs` |
+| **34d** | the resolver half: §3.4.1 step 4D and §3.4's obligatory synthesis | `resolver.rs` |
+| **34e** | occlusion in the signer (§2.4, §5.3.2) and the UPDATE rules (§5.2) | `zone_signer.rs`, `update.rs` |
+
+#### The decisions worth keeping
+
+- **The redirection is applied before the name is looked up, not after.** RFC
+  6672 §3.2 step 3C reaches the DNAME only when "at some label, a match is
+  impossible", which assumes §2.4's no-descendants rule holds. It need not: a
+  zone arriving by transfer, or built by UPDATE — which §5.2 has adding a DNAME
+  over existing names *on purpose* — can hold records below a DNAME owner, and
+  those names are occluded (RFC 2136 §7.18). Asking first makes the answer
+  independent of whether occluded data happens to be there. The load check is
+  then a convenience, not the thing correctness rests on.
+- **`dname_above` returns the shallowest strict ancestor.** Strict, because "the
+  owner name of a DNAME is not redirected itself" (§2.3). Shallowest, because
+  that is the order RFC 1034 §4.3.2's "start matching down, label by label" meets
+  them in — it can differ from deepest only in a zone `check_dname_rules`
+  refuses, and occluding from the top does not depend on how deep the violation
+  goes.
+- **All four load refusals, though the RFC only says "ought to" and "MAY".** A
+  name below a DNAME is occluded whatever the file says, so loading such a zone
+  means holding records that can never be answered with. The fifth rule of §2.4
+  — no CNAME at a DNAME's owner — is *not* checked here: `check_cname_exclusivity`
+  already refuses it citing RFC 1034 §3.6.2, the older statement of the same
+  rule, and a second check would be a second message for one condition
+  (`CLAUDE.md` §7). The test says so, and asserts on the older citation.
+- **The denial types are exempt from "nothing below the owner".** A DNAME at the
+  apex is legal (§2.3, SOA and NS beside it) and puts every NSEC3 record in the
+  zone below a DNAME owner. Counting them would refuse a zone the RFC spells out.
+- **The synthesized CNAME is unsigned and that is the design.** "The CNAME will
+  never be signed" (§5.3.1): a server signing offline cannot sign a record it
+  invents per query, and a validator verifies the DNAME's RRSIG and checks the
+  CNAME against it.
+- **`MAX_CNAME_HOPS` became `MAX_REDIRECTS`.** §2.2: "DNAMEs and CNAMEs can chain
+  together to form loops", so one ceiling covers both.
+- **The resolver keeps the DNAME rather than stripping it**, which is the half
+  that mattered more than following it. `recurse`'s acceptance rule is "the owner
+  is a name on the chain", and a DNAME never owns the name asked about — so the
+  filter could never keep one, and a validating client downstream got the
+  unsigned CNAME with nothing to check it against.
+
+#### Two bugs the tests found on the way, both in `CLAUDE.md`'s named patterns
+
+- **`has_dnames` was maintained in one of the two places that maintain the
+  others.** `has_wildcards` and `has_delegations` were set in both
+  `Zone::add_record` and `Zone::reindex`; a fourth field went to `reindex` alone,
+  so a zone built a record at a time held a DNAME `dname_above` could not find.
+  §7, and it lived for exactly one commit. The three bools are now one
+  `Shortcuts` value with one `note` method — §17's "fix it in the type", forced
+  by the experiment rather than chosen.
+- **DNAME was missing from `position_to_replace`'s singleton list** beside CNAME
+  and SOA, so an UPDATE grew a *second* DNAME at one name — the zone shape the
+  loader refuses. §5.2 says it in as many words: "if a DNAME is already
+  associated with that name, then it is replaced with the new DNAME".
+
+#### A test that was not evidence until it was rewritten
+
+`an_out_of_bailiwick_dname_is_neither_kept_nor_followed` passed with the
+bailiwick guard deleted. The root in it delegated only `test.`, so the
+substituted name failed to resolve for a reason that had nothing to do with the
+guard, and the assertion on an empty answer held either way — `CLAUDE.md` §1
+exactly. Rewritten to delegate the attacker's zone as readily as the victim's:
+without the guard the query now comes back **6.6.6.6**, which is the hijack the
+test is named for.
+
+#### Verification
+
+- RFC 6672 **Table 1 is a test, verbatim** — all twelve rows, `<no match>`
+  corner cases and both loop rows. It is the one input the spec has already
+  committed to an answer for (`CLAUDE.md` §1).
+- The overflow test uses the RFC's own arithmetic: a 250-octet target and a
+  first label over five octets (§2.2).
+- Every new test was watched failing against the old behaviour first.
+- **dnspython 2.8.0 against a running `rdnsd`**, which is the third party that
+  gets to disagree with us. Unsigned: the DNAME and its synthesized CNAME, a
+  redirection followed to an A in the same zone, a DNAME query at the owner, and
+  NODATA at the owner for another type. Signed: `dns.dnssec.validate` accepts the
+  DNAME's RRSIG, the synthesized CNAME carries **no** RRSIG (§5.3.1), and the
+  NSEC at the owner reads `DNAME RRSIG NSEC` (§5.3.2).
+- Windows: 589 in `rdns`, 116 in `rdnsd`, 165 in `rdns-core`. Linux:
+  592 and 129 — the difference is `rdnsd/src/control.rs`, which
+  Windows does not compile. Clippy and fmt clean on both.
+
+#### What DNAME did *not* get, and why
+
+- **No `--refuse-dname` or any flag.** There is no policy question here: the
+  four load refusals are shapes with no correct answer, not preferences.
+- **No wildcard-DNAME support.** §3.3 says the interaction "is
+  non-deterministic" and a server "MAY refuse it, refuse to load the zone".
+  Non-determinism is not something to serve.
+- **The occluded records are still stored.** They are dropped from the denial
+  chain and never answered with, but they stay in `Zone::records` — which is what
+  makes an UPDATE that *removes* the DNAME put them back, and what RFC 2136
+  §7.18's model of occlusion describes.
+
+---
+
 ## Done so far
 
 Newest first. The reasoning, RFC citations and verification for each are in the
@@ -5788,7 +5900,7 @@ it, and the rule it became in `CLAUDE.md`:
 | **30** | the two daemons' transports are one transport written twice | **open, filed 2026-09-04 and reviewed the same day.** Seventeen items: fifteen duplicated between `rdnsd` and `rdnsr` — the TCP transport whole, the five transport constants, the shutdown epilogue, the admission pipeline, five hand-written reply skeletons, the EDNS mirroring — two between `rdnsc` and the library, and ~~**30q, the one defect: `rdnsr` never applies the admission check to TCP**, so on that transport the 16 KiB ceiling, the QDCOUNT cap and the pre-parse section caps do not run~~ — **30q fixed 2026-09-04**, the only defect in the section and the first thing done from it, followed the same day by 30f, 30l, 30n and both halves of 30g — which was not a tidy-up after all: the skeleton it removed was hiding `rdnsr` clearing the CD bit RFC 4035 §3.2.2 says to copy, and 30r beside it — then 30h, which closed 30i and 30j behind it. Then 30p and 30o, which is where the *library* turned out to hold the weaker copy of a check `rdnsc` had right, and 30m — answered by reading what the facility was *for* rather than by deleting it. What is left is 30a-30e, on #31. The library itself came out clean. Reviewing the filing against the code struck four of its claims, including two that had the direction backwards; what the review moved is recorded at the end of the section |
 | **31** | where a crate boundary would pay | **done 2026-09-05**, filed 2026-09-04 and corrected the same day. `rdns-transport` holds #30's transport; `rdns-core` holds the wire format, which takes a client from 67 packages to 35 — two crates and not the three the plan drew, because splitting DNSSEC from net saves a client nothing and a split without a measurement is motion. Not `platform` and not `net`: both would move code that already has a home. Yes to a crate for #30's transport, **`rdns-transport`**, and the argument is `anyhow` rather than tidiness — §3 forbids it in `rdns` and the transport needs it; the name is checked against `domain`, hickory, Knot and BIND rather than chosen, and "shell" was already taken by #9d. The cut that pays is `rdns` itself: `rdnsc` is a synchronous CLI compiling 78 packages, tokio's 18 and ring's among them, floored at clap's 21. ~~32 of 41 modules touch neither~~ — an import count is not a partition; walking the edges found exactly two blocking ones, both `zone`/`zone_writer` reaching into `dnssec_denial` for wire helpers with no crypto in them, which is #26b from the other side |
 | **32** | `Shell`, `Served` and the other unnamed bags | **closed 2026-09-05**, filed 2026-09-04: the two renames that needed no crate went that day, and the other three boxes went with `rdns-transport` the next — `ServeContext` was not a step towards 30e's shared pipeline, it *was* the pipeline's parameter list, which is why it landed in the same commit. Four field-only structs that are "what a task needs that is not the answer" and say so in no name — three renamed, `Control` kept as its module's principal type — one of them in a word #9d already spends on something else. The finding under the rename is that `rdnsr::Shell`'s five fields *are* five of `rdnsd::Server`'s twelve, so 30e's shared pipeline already has its parameter list written twice; naming it `ServeContext` in `rdns-transport` is the extraction rather than a step towards it. Carries the rule for what earns the suffix, since a policy struct and a request handler both must not |
-| **33** | a fourth pass: duplication, generics, and where the modules are cut | **open, filed 2026-09-05.** #30's question asked of the whole tree rather than of the transports. Eight items, and **five candidates dropped** — four of them by rules already on this page, which is the half worth reading. The one defect is **33b**: `DnsMessageBuilder` resolves its question type through an *RTYPE* table, so ANY, AXFR and IXFR find nothing there and the question is dropped in silence with no `else`; `rdnsc` cannot ask an ANY query at all, provoked at the command line, so nothing in this tree exercises the RFC 8482 path #9f fixed in `rdnsd`. **33a is the one with teeth**: `NegativeCache` and `NsecCache` kept the per-insert `min_by_key` scan `DnsCache` was fixed away from — 14.6 µs against 0.26 at the same bound, linear in it, and on the mutex every query takes. 33c is one line of workspace manifest for five packages, verified compiling on Windows and Linux. The rest are consolidations: an `apex_soa` with one public copy in the wrong module and two private re-implementations of it, and the RFC 8945 §5.3.1 envelope chain written three times. Two of the filing's own claims died on review and are struck through in place — a `zone_writer` bug that is not reachable, and a trait that is the wrong shape for what is actually duplicated |
+| **33** | a fourth pass: duplication, generics, and where the modules are cut | ~~**open, filed 2026-09-05**~~ — **closed 2026-09-06**, corrected here on 2026-09-06 while adding #34's row. This table said `open` while §33 four thousand lines above said `closed`, which is the drift the paragraph above it describes, one page later and about itself. Filed 2026-09-05. #30's question asked of the whole tree rather than of the transports. Eight items, and **five candidates dropped** — four of them by rules already on this page, which is the half worth reading. The one defect is **33b**: `DnsMessageBuilder` resolves its question type through an *RTYPE* table, so ANY, AXFR and IXFR find nothing there and the question is dropped in silence with no `else`; `rdnsc` cannot ask an ANY query at all, provoked at the command line, so nothing in this tree exercises the RFC 8482 path #9f fixed in `rdnsd`. **33a is the one with teeth**: `NegativeCache` and `NsecCache` kept the per-insert `min_by_key` scan `DnsCache` was fixed away from — 14.6 µs against 0.26 at the same bound, linear in it, and on the mutex every query takes. 33c is one line of workspace manifest for five packages, verified compiling on Windows and Linux. The rest are consolidations: an `apex_soa` with one public copy in the wrong module and two private re-implementations of it, and the RFC 8945 §5.3.1 envelope chain written three times. Two of the filing's own claims died on review and are struck through in place — a `zone_writer` bug that is not reachable, and a trait that is the wrong shape for what is actually duplicated |
 | **27** | what a zero-allocation answer path would take | **five of six stages done, 2026-09-01 → 2026-09-05; 27d withdrawn.** A query cost 21 allocations when it was filed and costs **2** now, both of them in the parse — the question `Vec` and the QNAME `String`, which need the message shape 27d declined. Nothing on the answering side allocates at all. Four stages, measured on `rdnsd` under dhat rather than argued: a resolver's actual query (EDNS0 + DNS-0x20) costs 21 allocations, and 13 of them come out with no new lifetime anywhere. Filed with the payoff stated first — ~1% end to end — because the reason to do it is a gate asserted at zero, not speed. Carries three traps that would each be silent: the compressor rewinding with the buffer, echoing the folded QNAME to a 0x20 resolver, and UPDATE needing the unpacker the query path does not |
 | **26** | helpers written twice, and hand-rolls with a standard spelling | **closed 2026-09-04**, filed 2026-08-04; 26j done the same day. Ten items, nine of them duplicates. 26j is the correction to this page: the wrecked string literal 19h records as fixed had never been fixed, and the wrong claim reached three documents. Fixed with a test that holds the whole message rather than a substring — the old assertion was true of the broken literal. **The rest went on 2026-09-04**: 26b took the module split #31 needed and 26a/26c/26d turned out to be eight copies rather than six — two of them, an inline hex decoder and a third base64 wrapper, carried none of the names the others did, which is this section's own thesis about reading over grepping. 26i's filed fix was wrong (`trailing_zeros` for a bitmap whose bit 0 is the high bit) and is corrected in place |
 | **22** | the zone lookup is hash-bound | **closed 2026-09-05**, filed 2026-08-04 from #11's measurement. The first direction is done — one map instead of two takes a miss from 1,875 to 1,402 instructions, 25%, where the estimate said 200. The second is a decision and the answer is **no**: the threat model is written down in the section, and it says the prize (~2% of a query) and the risk (a constant factor on a lookup, not a complexity class) are both small, which argues for leaving a DoS-resistant hasher where it is |

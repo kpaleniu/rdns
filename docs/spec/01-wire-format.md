@@ -51,7 +51,14 @@ Decoding (`DNameUnpacker::unpack_internal`, `dname.rs:295`):
 Encoding (`compression.rs`): owner names are compressed against everything
 already written. RDATA is stored uncompressed and wire-ready and copied verbatim,
 except for the record types whose embedded names may legally be compressed, which
-`NameCompressor::write_rdata` handles.
+`NameCompressor::write_rdata` handles: NS, CNAME, PTR, SOA and MX.
+
+DNAME is deliberately not among them. Its owner "can be compressed like any other
+owner name", but its `<target>` "MUST NOT be sent out in compressed form"
+(RFC 6672 §2.5) — so it falls through to the verbatim copy, which is what
+RFC 3597 §4 asks for anyway. A *received* target is read through the unpacker
+like any other name: the rule is on the writer, and refusing a pointer would make
+a non-conforming peer unreadable.
 
 ### Case folding
 
@@ -139,8 +146,9 @@ RDLENGTH = 0 is legal and parses to `ParsedRecord::Unknown(rtype)`
 (`lib.rs:581`) — RFC 2136 §2.4.1/§2.4.2/§2.5.2/§2.5.3 spell prerequisites and
 RRset deletions that way.
 
-Typed record types: A, NS, CNAME, SOA, PTR, MX, TXT, AAAA, DNSKEY, RRSIG, DS,
-NSEC, NSEC3. Everything else is `Unknown(Rtype)` with bytes preserved verbatim.
+Typed record types: A, NS, CNAME, SOA, PTR, MX, TXT, AAAA, DNAME, DNSKEY, RRSIG,
+DS, NSEC, NSEC3. Everything else is `Unknown(Rtype)` with bytes preserved
+verbatim.
 
 TXT is `Vec<Vec<u8>>` — a sequence of `<character-string>`s (RFC 1035 §3.3.14),
 each at most 255 octets, stored as bytes. A TXT record holding two strings is a

@@ -31,7 +31,7 @@
 `[owner] [ttl] [class] TYPE rdata...`, with TTL and class each optional and
 order-independent between them. Types readable in presentation form:
 
-A, AAAA, NS, CNAME, MX, TXT, PTR, SOA, DNSKEY, DS, RRSIG, NSEC, NSEC3.
+A, AAAA, NS, CNAME, DNAME, MX, TXT, PTR, SOA, DNSKEY, DS, RRSIG, NSEC, NSEC3.
 
 Anything else MUST be written in RFC 3597 `\#` generic form
 (`parse_generic_rdata`, `zone.rs:789`), or the line is an error. Type mnemonics
@@ -47,8 +47,16 @@ Refusals at load, not warnings:
 
 1. A record in a class other than IN.
 2. A CNAME sharing its owner name with any other type
-   (`check_cname_exclusivity`, `zone.rs:1033`), per RFC 1034 §3.6.2.
-3. Malformed RDATA for a known type, an unsupported type name in non-generic
+   (`check_cname_exclusivity`), per RFC 1034 §3.6.2.
+3. The four DNAME shapes RFC 6672 says a server should not load
+   (`check_dname_rules`): two DNAMEs at one name and any record below a DNAME
+   owner (§2.4), an NS RRset beside a DNAME below the apex (§2.3), and a
+   wildcard DNAME (§3.3). The RFC hedges on all four — "ought to refuse" and
+   "MAY refuse" — and each is refused here, because a name below a DNAME is
+   occluded (RFC 2136 §7.18) whatever the file says. §2.4's fifth rule, a CNAME
+   at a DNAME's owner, is rule 2 above. A DNAME at the *apex*, beside the
+   customary SOA and NS, is legal (§2.3) and loads.
+4. Malformed RDATA for a known type, an unsupported type name in non-generic
    form, an out-of-range field, an unparseable `$TTL`.
 
 A file that fails any of these produces a `ZoneError` carrying the line number.
@@ -158,4 +166,4 @@ transferred zone) and by `rdnsctl dump`.
 | `$GENERATE` | unsupported | |
 | escaped labels | unsupported | see `01-wire-format.md` §1.1 |
 | zone size | memory-bound | the whole zone is resident; there is no on-disk format |
-| CNAME hops within a zone | 16 | `MAX_CNAME_HOPS`, `rdnsd/src/main.rs:689` |
+| redirections within a zone | 16 | CNAME and DNAME share the ceiling, because RFC 6672 §2.2 says they chain together: `MAX_REDIRECTS`, `rdnsd/src/answer.rs` |

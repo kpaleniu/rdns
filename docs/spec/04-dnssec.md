@@ -48,6 +48,18 @@ Not signed: a delegation's NS RRset (it is the child's data, RFC 4035 §2.2), an
 glue below a cut. The only signed thing at a delegation point is the DS, plus the
 denial record that lets the absence of a DS be proved.
 
+A DNAME *is* signed, and its owner is chained like any other name: its bitmap
+carries the DNAME bit, which RFC 6672 §5.3.2 makes load-bearing — a validator
+checks it to tell a genuine NXDOMAIN below the owner from one that skipped the
+redirection. The CNAME the answer path synthesizes from it is never signed
+(§5.3.1); see §4.3.
+
+Names *below* a DNAME owner are occluded and left out of the chain, exactly as
+glue below a delegation is — RFC 2136 §7.18 names both, and RFC 6672 §2.4 points
+at it. `zone.rs`'s loader refuses such a zone outright, so this covers one that
+arrived by transfer or was built by UPDATE, which §5.2 has adding a DNAME over
+existing names on purpose.
+
 ### Idempotence
 
 `sign_zone` drops the signer's own previous output (RRSIG, NSEC, NSEC3,
@@ -163,8 +175,16 @@ serial-number arithmetic, not a plain comparison.
 | NODATA through a wildcard | that record at the wildcard, plus a denial of the name actually asked for |
 | NXDOMAIN | a denial of the name and of the wildcard that could have answered it (RFC 4035 §5.4) |
 | referral | the DS with its signature, or the authenticated denial that there is one (RFC 4035 §3.1.4) |
+| DNAME redirection | the DNAME's own RRSIG — and **nothing** for the synthesized CNAME (RFC 6672 §5.3.1) |
 
 Every denial record travels with its own signature.
+
+The unsigned synthesized CNAME is the design and not an omission: "the CNAME will
+never be signed", because a server that signs offline cannot sign a record it
+invents per query. "For a DNSSEC validator, verification of the DNAME RR and then
+that the CNAME was properly synthesized is sufficient proof" (§5.3.1). A chain
+mixing DNAME, CNAME and a final answer is as strong as its weakest link — AD only
+if every step is secure (§5.3.3).
 
 Nothing is added to an unsigned zone, whatever the client asked for. "Is this
 zone signed" is tested as "does the apex publish a DNSKEY RRset", not "are there

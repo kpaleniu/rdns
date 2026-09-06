@@ -98,21 +98,31 @@ No zone: REFUSED with AA clear, not NXDOMAIN.
 
 ### 3.2.6 RFC 1034 §4.3.2, in order — `resolve_in_zone`
 
-The four cases are tried in this order at every name:
+The cases are tried in this order at every name — RFC 1034's four, with
+RFC 6672 §3.2's revision of step 3 inserted where that document puts it:
 
 1. The zone's authority ends here. `Zone::delegation_for(name)` is `Some` →
    `Outcome::Referral { cut }`, unless the question is `DS` *at* the cut, which
-   is answered here (RFC 4035 §3.1.4.1). Mid-CNAME-chain a delegation yields
-   `Outcome::ChainLeftZone` instead.
-2. The name has the data. `Zone::query(name, qtype)` is non-empty →
+   is answered here (RFC 4035 §3.1.4.1), or a DNAME at or above the cut occludes
+   it. Mid-chain a delegation yields `Outcome::ChainLeftZone` instead.
+2. A DNAME redirects the name. `Zone::dname_above_key(key)` is `Some` — the
+   shallowest *strict* ancestor owning one, since a DNAME does not redirect its
+   own owner (RFC 6672 §2.3). Substitute per §2.2, push a `Hop::Dname`, restart
+   at the result. Asked *before* the name is looked up, not after: a name below
+   a DNAME owner is occluded (RFC 2136 §7.18), so records there cannot change
+   the answer. An overflow past 255 octets is `Outcome::Stopped` with YXDOMAIN
+   (§2.2).
+3. The name has the data. `Zone::query(name, qtype)` is non-empty →
    `Outcome::Answer`.
-3. The name is an alias. A CNAME at the name, and the question is not for CNAME
+4. The name is an alias. A CNAME at the name, and the question is not for CNAME
    itself. Push the alias onto the chain and restart at the target. If the target
    leaves the zone, or repeats a name already visited, → `Outcome::ChainLeftZone`.
-4. No such data → `Outcome::Negative { name, kind }` with the `NameKind` that
+5. No such data → `Outcome::Negative { name, kind }` with the `NameKind` that
    decides NXDOMAIN against NODATA.
 
-Bounded at `MAX_CNAME_HOPS = 16`, plus a visited-set that stops a two-record loop.
+Bounded at `MAX_REDIRECTS = 16` — one ceiling for CNAME and DNAME hops alike,
+because RFC 6672 §2.2 says they chain together — plus a visited-set that stops a
+two-record loop.
 
 ### 3.2.7 Building each outcome
 
@@ -122,6 +132,15 @@ Bounded at `MAX_CNAME_HOPS = 16`, plus a visited-set that stops a two-record loo
 | `Answer` | the chain's CNAMEs, then the records at the end, echoed under the *queried* name (RFC 1034 §4.3.3) + RRSIGs when DO | wildcard denial when the answer was synthesized (RFC 4035 §3.1.3) | — | set |
 | `Negative` | the chain's CNAMEs | the apex SOA + the proof when DO | — | set |
 | `ChainLeftZone` | the chain's CNAMEs, nothing else | — | — | set |
+| `Stopped` | the chain so far, the overflowing DNAME included — RFC 6672 §2.2 sends it "as proof for the YXDOMAIN" — and no CNAME synthesized from it | — | — | set |
+
+A `Hop::Dname` contributes two records where a `Hop::Cname` contributes one: the
+DNAME RRset at its own owner, with its RRSIG when DO, and then a CNAME
+synthesized at the *queried* name with the DNAME's TTL (RFC 6672 §3.1). The
+synthesized CNAME carries no signature, which §5.3.1 makes the design rather than
+an omission — "the CNAME will never be signed", because signing it would mean
+signing online once per query. A validator verifies the DNAME's RRSIG and checks
+that the CNAME follows from it.
 
 Glue is in-bailiwick only (RFC 1034 §4.2.1). `ChainLeftZone` is NOERROR, not
 NXDOMAIN.

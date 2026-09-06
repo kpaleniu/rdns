@@ -56,10 +56,14 @@ start = the deepest cached delegation covering the qname, else the root hints
 loop, bounded by max_delegations and by the query budget:
     ask the servers for that zone, in RTT order
     classify the response:
-        answer          -> done (or follow a CNAME, bounded by max_cname_hops)
+        answer          -> done (or follow a CNAME or a DNAME, bounded by
+                                    max_cname_hops)
         referral        -> descend, if in bailiwick
         negative        -> done
 ```
+
+`walk` and `resolve_from_root` return an `Answered` — the response *and* the zone
+whose servers gave it, which is what bailiwick is judged against.
 
 ### Bailiwick rules
 
@@ -67,6 +71,33 @@ loop, bounded by max_delegations and by the query budget:
   beside is ignored.
 - Glue is used only when in bailiwick. A nameserver with no usable glue is
   resolved separately, spending from the same budget.
+- An answer record is kept only if its owner is on the chain: the name asked
+  about, or a target of a CNAME already followed.
+- A DNAME is the exception, because it never owns the name asked about — it owns
+  an *ancestor* of it (RFC 6672 §2.2). It is kept when its owner is at or below
+  the answering zone and strictly above a name on the chain. Bailiwick is the
+  whole of the guard here: without it a server for `example.com.` answers with
+  `com. DNAME evil.test.` and redirects every name under `com.` in this cache.
+
+### DNAME (RFC 6672 §3.4, §3.4.1 step 4D)
+
+The DNAME is kept in the answer rather than stripped, because it is the only
+signed half of the redirection — "the CNAME will never be signed" (§5.3.1), so a
+validating client handed the CNAME alone has nothing to check.
+
+When the response carries a DNAME but no CNAME for the name being sought, the
+substitution is done here and the CNAME synthesized with the DNAME's arrived
+(already decremented) TTL: §3.4 makes that a recursive server's obligation —
+"recursive caching name servers MUST perform CNAME synthesis on behalf of
+clients" — because a conforming authoritative server sends one (§3.1) but a cache
+holding the DNAME alone does not. The first applicable DNAME is the only one:
+"there will be at most one ancestor with a DNAME" (§3.2).
+
+A substitution past 255 octets is `ResolveError::NoResponse`, which is step 4D's
+"return an implementation-dependent error to the application". The authoritative
+side's YXDOMAIN (§2.2) has no resolver-side spelling, and a NOERROR carrying the
+partial chain would say the name resolved to nothing rather than that it could
+not be built.
 
 ### The budget
 
