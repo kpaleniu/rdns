@@ -53,23 +53,49 @@ pub struct Zone {
     /// question: which record's span contains this name.
     nsec_chain: BTreeMap<Vec<u8>, usize>,
     nsec3_chain: BTreeMap<Vec<u8>, usize>,
-    /// Whether any record is owned by a wildcard name: false lets
-    /// [`Zone::name_kind_of_key`] answer [`NameKind::NotFound`] without the
-    /// rest of the closest-encloser tail, which has that one outcome anyway.
-    /// 23% of a miss in a 10k-record zone with no wildcards.
-    has_wildcards: bool,
-    /// Whether any record below the apex is an NS RRset, which is what a zone
-    /// cut is (RFC 1034 §4.2.1). False lets [`Zone::delegation_for`] answer
-    /// `None` without walking the ancestors and without folding the name to do
-    /// it — a zone with no delegated children is the ordinary shape, and the
-    /// walk costs one hash lookup per label of a name the client chose.
+    /// The per-query ancestor walks this zone can skip. See [`Shortcuts`].
+    shortcuts: Shortcuts,
+}
+
+/// Which of the per-query ancestor walks a zone never needs, because it holds
+/// nothing that could answer one.
+///
+/// Each is false for the ordinary zone and saves a hash lookup per label of a
+/// name the client chose — and, for two of them, the fold that builds the key.
+///
+/// One value rather than three `bool` fields, because two places maintain them:
+/// [`Zone::add_record`] as records arrive and [`Zone::reindex`] when the origin
+/// moves. Adding `dnames` as a fourth field went to `reindex` alone, so a zone
+/// built a record at a time held a DNAME that [`Zone::dname_above`] could not
+/// find — caught by its own test, and the reason this is one value
+/// (`CLAUDE.md` §7).
+///
+/// Stale in the false direction each one serves a wrong answer: no wildcard
+/// synthesis, no referral — which answers authoritatively for a child's names,
+/// the defect `CLAUDE.md` §8 opens with — and no redirection.
+#[derive(Debug, Clone, Copy, Default)]
+struct Shortcuts {
+    /// Any record owned by a wildcard name. 23% of a miss in a 10k-record zone
+    /// with no wildcards.
+    wildcards: bool,
+    /// Any NS RRset below the apex, which is what a zone cut is
+    /// (RFC 1034 §4.2.1).
+    delegations: bool,
+    /// Any DNAME, which redirects every name below its owner (RFC 6672 §2.2).
+    dnames: bool,
+}
+
+impl Shortcuts {
+    /// Turn on whatever one record makes possible.
     ///
-    /// Recomputed by [`Zone::reindex`], not carried, because [`Zone::set_origin`]
-    /// decides which NS records are *below* the apex: moving the origin up turns
-    /// the old apex's own NS RRset into a delegation. Stale in the false
-    /// direction, this answers authoritatively for a child's names, which is the
-    /// defect `CLAUDE.md` §8 opens with.
-    has_delegations: bool,
+    /// `at_apex` is the caller's to say, because [`Zone::reindex`] decides it
+    /// against a *new* origin: moving the apex up turns the old apex's own NS
+    /// RRset into a delegation.
+    fn note(&mut self, key: &str, rtype: Rtype, at_apex: bool) {
+        self.wildcards |= key.starts_with("*.");
+        self.delegations |= rtype == rt::NS && !at_apex;
+        self.dnames |= rtype == rt::DNAME;
+    }
 }
 
 /// A name resolved against a zone: what kind of name it is, and where its
@@ -152,8 +178,7 @@ impl Zone {
             index: HashMap::new(),
             nsec_chain: BTreeMap::new(),
             nsec3_chain: BTreeMap::new(),
-            has_wildcards: false,
-            has_delegations: false,
+            shortcuts: Shortcuts::default(),
         }
     }
 
@@ -183,9 +208,9 @@ impl Zone {
         // `&mut self`.
         let key = self.lookup_key(&record.name).into_owned();
         let position = self.records.len();
-        self.has_wildcards |= key.starts_with("*.");
-        self.has_delegations |=
-            record_type_code(&record.rdata) == rt::NS && key != *self.origin_key();
+        let at_apex = key == *self.origin_key();
+        self.shortcuts
+            .note(&key, record_type_code(&record.rdata), at_apex);
         self.note_non_terminals(&key);
         self.index
             .entry(NameKeyBuf::from_folded(key))
@@ -415,7 +440,7 @@ impl Zone {
             // The closest encloser. A wildcard below a zone cut is the child's
             // data, not ours (RFC 4592 §2.2.1), so a delegation between here
             // and the apex means a referral rather than synthesis.
-            if !self.has_wildcards {
+            if !self.shortcuts.wildcards {
                 return NameKind::NotFound;
             }
             if self.delegation_for_key(encloser).is_some() {
@@ -449,14 +474,14 @@ impl Zone {
     pub fn delegation_for(&self, name: &str) -> Option<String> {
         // Before `lookup_key`, not only inside `delegation_for_key`: with no cut
         // to find, the folded key is a copy of the name made for nothing.
-        if !self.has_delegations {
+        if !self.shortcuts.delegations {
             return None;
         }
         self.delegation_for_key(&self.lookup_key(name))
     }
 
     fn delegation_for_key(&self, key: &str) -> Option<String> {
-        if !self.has_delegations {
+        if !self.shortcuts.delegations {
             return None;
         }
         let origin = self.origin_key();
@@ -475,15 +500,77 @@ impl Zone {
         }
     }
 
+    /// The DNAME that redirects `name`: the shallowest **strict** ancestor
+    /// owning one (RFC 6672 §2.2).
+    ///
+    /// Strict, because "a DNAME RR redirects DNS names subordinate to its owner
+    /// name; the owner name of a DNAME is not redirected itself" (§2.3). Table
+    /// 1's second row is the case: QNAME `example.com.` against owner
+    /// `example.com.` is `<no match>` unless QTYPE is DNAME, and then the DNAME
+    /// is an ordinary record at the name rather than a redirection.
+    ///
+    /// Shallowest rather than deepest, which is the order RFC 1034 §4.3.2's
+    /// "start matching down, label by label" meets them in. It can only differ
+    /// in a zone [`check_dname_rules`] refuses, since a second DNAME below the
+    /// first is a record at a subdomain of a DNAME owner (§2.4) — but a zone
+    /// that arrived by transfer never met that check, and occluding from the
+    /// top is the answer that does not depend on how deep the violation goes.
+    ///
+    /// Returns the record, not the name: the caller needs its owner to echo,
+    /// its target to substitute and its TTL for the synthesized CNAME (§3.1),
+    /// and looking any of them up again is the repeat `TODO.md` #25a removed.
+    pub fn dname_above(&self, name: &str) -> Option<&ZoneRecord> {
+        // Before `lookup_key`, as `delegation_for` does it: with no DNAME in
+        // the zone the folded key is a copy made for nothing.
+        if !self.shortcuts.dnames {
+            return None;
+        }
+        self.dname_above_key(&self.lookup_key(name))
+    }
+
+    /// [`Zone::dname_above`] for a name already in [`Zone::lookup_key`] form.
+    pub fn dname_above_key(&self, key: &str) -> Option<&ZoneRecord> {
+        if !self.shortcuts.dnames {
+            return None;
+        }
+        let origin = self.origin_key();
+        let mut found = None;
+        // From the parent, so the owner is not redirected by its own DNAME, and
+        // on to the apex without stopping: the last one seen is the shallowest.
+        let mut candidate = parent_name(key)?;
+        loop {
+            if !is_at_or_under(candidate, &origin) {
+                break;
+            }
+            if let Some(record) = self.first_of_type(candidate, rt::DNAME) {
+                found = Some(record);
+            }
+            if candidate == origin {
+                break;
+            }
+            candidate = parent_name(candidate)?;
+        }
+        found
+    }
+
     /// Whether there is an RRset of `rtype` at exactly this key. An empty
     /// non-terminal has no positions, so it answers false without a special
     /// case.
     fn has_type(&self, key: &str, rtype: Rtype) -> bool {
-        self.index.get(key).is_some_and(|positions| {
-            positions
-                .iter()
-                .any(|&i| record_type_code(&self.records[i].rdata) == rtype)
-        })
+        self.first_of_type(key, rtype).is_some()
+    }
+
+    /// The first record of `rtype` at exactly this key, or `None`.
+    ///
+    /// [`Zone::has_type`] is this question with the answer thrown away. DNAME
+    /// is a singleton type (RFC 6672 §2.4), so for that one "the first" is
+    /// "the one".
+    fn first_of_type(&self, key: &str, rtype: Rtype) -> Option<&ZoneRecord> {
+        self.index
+            .get(key)?
+            .iter()
+            .map(|&i| &self.records[i])
+            .find(|r| record_type_code(&r.rdata) == rtype)
     }
 
     /// Record every ancestor of `key`, up to the apex, as a name that exists.
@@ -527,26 +614,21 @@ impl Zone {
     /// Rebuild the index from `records`.
     fn reindex(&mut self) {
         let origin_key = self.origin_key().into_owned();
-        let keys: Vec<(String, bool)> = self
+        let keys: Vec<(String, Rtype, bool)> = self
             .records
             .iter()
             .map(|r| {
                 let key = self.lookup_key(&r.name).into_owned();
-                // Whether this record is a zone cut is a fact about the *new*
-                // origin: moving the apex up turns the old apex's NS RRset into
-                // a delegation.
-                let cut = record_type_code(&r.rdata) == rt::NS && key != origin_key;
-                (key, cut)
+                let at_apex = key == origin_key;
+                (key, record_type_code(&r.rdata), at_apex)
             })
             .collect();
         self.index.clear();
         // Recomputed, not carried: `set_origin` can turn a relative `*` into an
-        // absolute wildcard name.
-        self.has_wildcards = false;
-        self.has_delegations = false;
-        for (position, (key, cut)) in keys.into_iter().enumerate() {
-            self.has_wildcards |= key.starts_with("*.");
-            self.has_delegations |= cut;
+        // absolute wildcard name, and an apex NS RRset into a zone cut.
+        self.shortcuts = Shortcuts::default();
+        for (position, (key, rtype, at_apex)) in keys.into_iter().enumerate() {
+            self.shortcuts.note(&key, rtype, at_apex);
             self.note_non_terminals(&key);
             self.index
                 .entry(NameKeyBuf::from_folded(key))
@@ -993,6 +1075,7 @@ fn parse_zone_file_with_base(
     };
     parse_into(&mut zone, content, &mut state, base_dir, 0)?;
     check_cname_exclusivity(&zone)?;
+    check_dname_rules(&zone)?;
     Ok(zone)
 }
 
@@ -1032,6 +1115,104 @@ fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
                  answer it was meant to get",
                 others.join(", ")
             )));
+        }
+    }
+    Ok(())
+}
+
+/// What RFC 6672 says a zone holding a DNAME may not do. Refused at load, for
+/// the reason [`check_cname_exclusivity`] is: each of these is a name with two
+/// answers and no rule for choosing between them.
+///
+/// The RFC hedges — "ought to refuse" for the singleton rule (§2.4), "MAY
+/// refuse" for data below a DNAME (§2.4) and for a wildcard DNAME (§3.3). All
+/// three are refused here, because the alternative is a zone that loads and
+/// then cannot serve what it holds: a name below a DNAME is occluded
+/// (RFC 2136 §7.18) whatever the file says.
+///
+/// This is the *loader's* check, so a zone that arrives by transfer or is built
+/// by dynamic update never meets it — §5.2 has dynamic update adding a DNAME
+/// over existing names on purpose. That is why the answer path occludes rather
+/// than trusting this: [`Zone::dname_above`] decides the answer for any zone,
+/// however it got here.
+fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
+    let apex = zone.lookup_key(zone.origin()).into_owned();
+    let mut owners: Vec<String> = Vec::new();
+
+    for record in zone.records() {
+        if record_type_code(&record.rdata) != rt::DNAME {
+            continue;
+        }
+        let key = zone.lookup_key(&record.name).into_owned();
+
+        // §3.3: "records of the form `*.example.com DNAME example.net` SHOULD
+        // NOT be used", because "the interaction between the expansion of the
+        // wildcard and the redirection of the DNAME is non-deterministic".
+        // Non-deterministic is not a thing a server can be asked to serve.
+        if key.starts_with("*.") {
+            return Err(ZoneError::invalid(format!(
+                "{key} is a wildcard DNAME — RFC 6672 §3.3 says the interaction between \
+                 wildcard expansion and DNAME redirection is non-deterministic, so there is \
+                 no one answer for a server to give"
+            )));
+        }
+
+        // §2.4: "The owner name of a DNAME can only have one DNAME RR, and no
+        // CNAME RRs can exist at that name." Only the first half is here: a
+        // CNAME sharing its owner with anything at all is already refused by
+        // `check_cname_exclusivity` citing RFC 1034 §3.6.2, the older statement
+        // of the same rule. A second check would be a second message for one
+        // condition, and the two would drift (`CLAUDE.md` §7).
+        if owners.contains(&key) {
+            return Err(ZoneError::invalid(format!(
+                "{key} has two DNAME records — RFC 6672 §2.4 makes DNAME a singleton type, \
+                 so that one name has one redirection and nothing has to choose between them"
+            )));
+        }
+
+        // §2.3: "DNAME RRs MUST NOT appear at the same owner name as an NS RR
+        // unless the owner name is the zone apex; if it is not the zone apex,
+        // then the NS RR signifies a delegation point, and the DNAME RR must in
+        // that case appear below the zone cut at the zone apex of the child
+        // zone."
+        if key != apex && zone.has_type(&key, rt::NS) {
+            return Err(ZoneError::invalid(format!(
+                "{key} has both a DNAME and an NS RRset below the apex — RFC 6672 §2.3 \
+                 forbids it, because the NS makes this a zone cut and the DNAME then belongs \
+                 in the child zone"
+            )));
+        }
+
+        owners.push(key);
+    }
+
+    if owners.is_empty() {
+        return Ok(());
+    }
+
+    // §2.4: "Resource records MUST NOT exist at any subdomain of the owner of a
+    // DNAME RR."
+    //
+    // The denial types are exempt. They describe the zone's shape rather than
+    // being names it answers for, and a DNAME at the apex — which §2.3 allows
+    // outright, SOA and NS beside it — puts every NSEC3 record in the zone
+    // below a DNAME owner, so counting them would refuse a zone the RFC spells
+    // out as legal.
+    for record in zone.records() {
+        let rtype = record_type_code(&record.rdata);
+        if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3 | rt::NSEC3PARAM) {
+            continue;
+        }
+        let key = zone.lookup_key(&record.name);
+        for owner in &owners {
+            if key.as_ref() != owner && is_at_or_under(&key, owner) {
+                return Err(ZoneError::invalid(format!(
+                    "{key} is below the DNAME at {owner} — RFC 6672 §2.4 says resource \
+                     records must not exist at any subdomain of a DNAME owner, and this one \
+                     could never be answered with: the redirection is applied before the name \
+                     is looked up"
+                )));
+            }
         }
     }
     Ok(())
@@ -1101,6 +1282,8 @@ fn rdata_from_fields(
         }
         "PTR" => RecordData::from_parsed(&ParsedRecord::PTR(rdata))
             .map_err(|e| ZoneError::syntax(ln, format!("PTR record: {e}")))?,
+        "DNAME" => RecordData::from_parsed(&ParsedRecord::DNAME(rdata))
+            .map_err(|e| ZoneError::syntax(ln, format!("DNAME record: {e}")))?,
         "SOA" => {
             let soa_parts: Vec<&str> = rdata.split_whitespace().collect();
             if soa_parts.len() < 7 {
@@ -2037,6 +2220,99 @@ deep.a.b IN TXT \"x\"
             "example.com.",
         )
         .expect("a signed CNAME is not a conflict");
+    }
+
+    /// The zone shapes RFC 6672 says a server should not load, and the three it
+    /// says are fine.
+    #[test]
+    fn a_zone_breaking_a_dname_rule_is_refused() {
+        for (what, text) in [
+            (
+                "two DNAMEs at one name (§2.4)",
+                "sub IN DNAME a.example.net.\nsub IN DNAME b.example.net.\n",
+            ),
+            (
+                "a DNAME on a zone cut (§2.3)",
+                "sub IN DNAME a.example.net.\nsub IN NS ns1.example.net.\n",
+            ),
+            (
+                "data below the owner (§2.4)",
+                "sub IN DNAME a.example.net.\nx.sub IN A 192.0.2.1\n",
+            ),
+            ("a wildcard DNAME (§3.3)", "*.sub IN DNAME a.example.net.\n"),
+        ] {
+            let err = parse_zone_file(text, "example.com.")
+                .expect_err(&format!("{what} should not load"));
+            assert!(
+                err.to_string().contains("6672"),
+                "{what}: the error should cite the section: {err}"
+            );
+        }
+
+        // §2.4 forbids a CNAME at a DNAME's owner name too. That one is refused
+        // by `check_cname_exclusivity`, citing RFC 1034 §3.6.2 — the older
+        // statement of the same rule — so it is not in the loop above.
+        let err = parse_zone_file(
+            "sub IN DNAME a.example.net.\nsub IN CNAME b.example.net.\n",
+            "example.com.",
+        )
+        .expect_err("a DNAME and a CNAME at one name should not load");
+        assert!(err.to_string().contains("3.6.2"), "{err}");
+
+        // §2.3: the apex may hold a DNAME beside the customary SOA and NS, and
+        // the owner name of a DNAME may hold other types.
+        parse_zone_file(
+            "@ IN SOA ns1.example.com. root.example.com. 1 3600 600 86400 300\n\
+             @ IN NS ns1.example.com.\n\
+             @ IN DNAME example.net.\n",
+            "example.com.",
+        )
+        .expect("§2.3 allows a DNAME at the zone apex");
+        parse_zone_file(
+            "sub IN DNAME a.example.net.\nsub IN A 192.0.2.1\n",
+            "example.com.",
+        )
+        .expect("§2.3 allows other types at the DNAME's own owner name");
+        // Whole labels: `sub2` is a sibling of `sub`, not a child of it.
+        parse_zone_file(
+            "sub IN DNAME a.example.net.\nsub2 IN A 192.0.2.1\n",
+            "example.com.",
+        )
+        .expect("a sibling of the DNAME owner is not below it");
+    }
+
+    /// RFC 6672 §2.2 and §2.3: a DNAME redirects the names *below* its owner,
+    /// and not the owner itself.
+    #[test]
+    fn a_dname_is_found_above_a_name_and_not_at_it() {
+        let zone = parse_zone_file("sub IN DNAME target.example.net.\n", "example.com.").unwrap();
+
+        let found = zone
+            .dname_above("a.b.sub.example.com.")
+            .expect("a DNAME two labels up redirects");
+        assert_eq!(found.name, "sub.example.com.");
+
+        assert!(
+            zone.dname_above("sub.example.com.").is_none(),
+            "§2.3: the owner name of a DNAME is not redirected itself"
+        );
+        assert!(
+            zone.dname_above("other.example.com.").is_none(),
+            "a name that is not below the owner is not redirected"
+        );
+        // Table 1: QNAME `ab.example.com.` against owner `b.example.com.` is
+        // `<no match>`. Whole labels only, never a string suffix.
+        assert!(
+            zone.dname_above("absub.example.com.").is_none(),
+            "the match is on whole labels"
+        );
+    }
+
+    /// A zone with no DNAME never walks a name's ancestors looking for one.
+    #[test]
+    fn a_zone_with_no_dname_answers_without_walking() {
+        let zone = parse_zone_file("www IN A 192.0.2.1\n", "example.com.").unwrap();
+        assert!(zone.dname_above("deep.down.www.example.com.").is_none());
     }
 
     /// An existing name shadows the wildcard completely, types it does not carry

@@ -135,9 +135,10 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
     Some(match parsed {
         ParsedRecord::A(addr) => addr.to_string(),
         ParsedRecord::AAAA(addr) => addr.to_string(),
-        ParsedRecord::NS(name) | ParsedRecord::CNAME(name) | ParsedRecord::PTR(name) => {
-            writable_name(name)?
-        }
+        ParsedRecord::NS(name)
+        | ParsedRecord::CNAME(name)
+        | ParsedRecord::PTR(name)
+        | ParsedRecord::DNAME(name) => writable_name(name)?,
         ParsedRecord::MX {
             preference,
             exchange,
