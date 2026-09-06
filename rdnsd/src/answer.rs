@@ -16,11 +16,16 @@ use rdns::compression::NameCompressor;
 use rdns::error::WireError;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::response::{ResponseWriter, Section};
-use rdns::utils::{absolute_lowered, absolute_lowered_in, record_types};
-use rdns::zone::{Located, NameKind, Zone};
+use rdns::utils::{
+    absolute_lowered, absolute_lowered_in, dname_redirect, is_at_or_under, record_types, Redirect,
+};
+use rdns::zone::{Located, NameKind, Zone, ZoneRecord};
+use rdns::Class;
 use rdns::Qtype;
 use rdns::Ttl;
-use rdns::{dnssec_answer, DnsMessage, Edns, OpCode, QueryClass, ResponseCode};
+use rdns::{
+    dnssec_answer, DnsMessage, Edns, OpCode, ParsedRecord, QueryClass, RecordData, ResponseCode,
+};
 
 use crate::zones::Zones;
 use crate::RDNSD_PAYLOAD_SIZE;
@@ -212,6 +217,53 @@ fn answer_question(
             let owed = add_chain(zone, &chain, dnssec_ok, w)?;
             add_chain_denials(zone, &chain, owed, w)
         }
+        Outcome::Stopped { chain, rcode } => {
+            let owed = add_chain(zone, &chain, dnssec_ok, w)?;
+            add_chain_denials(zone, &chain, owed, w)?;
+            w.set_rcode(rcode);
+            Ok(())
+        }
+    }
+}
+
+/// One redirection followed on the way to an answer.
+///
+/// Two shapes, because the two carry different things out. A CNAME is a record
+/// the zone holds at its own owner name. A DNAME is a record at an *ancestor*
+/// of the name asked for, plus a CNAME the server makes up on the spot
+/// (RFC 6672 §3.1) — which is why the owner and the name asked about are two
+/// fields here and one field for a CNAME.
+enum Hop {
+    /// A CNAME RRset at `owner`, with its own signature and its own wildcard
+    /// denial.
+    Cname(String),
+    /// A DNAME redirection. `owner` is where the DNAME is, which is what the
+    /// answer carries with its signature; `from` is the name the client asked,
+    /// which owns the synthesized CNAME; `to` is the substituted name, or
+    /// `None` when the substitution overflowed — RFC 6672 §3.2 step 3C exits
+    /// with YXDOMAIN *before* synthesizing a CNAME, and §2.2 still sends the
+    /// DNAME "as proof for the YXDOMAIN (value 6) RCODE".
+    Dname {
+        owner: String,
+        from: String,
+        to: Option<String>,
+        /// The DNAME's own TTL and class, for the CNAME synthesized from it:
+        /// "A CNAME RR with Time to Live (TTL) equal to the corresponding
+        /// DNAME RR is synthesized" (§3.1). Carried rather than looked up
+        /// again — the record was in hand when the redirection was decided
+        /// (`TODO.md` #25a).
+        ttl: Ttl,
+        class: Class,
+    },
+}
+
+impl Hop {
+    /// The name whose RRset goes into the answer section for this hop.
+    fn owner(&self) -> &str {
+        match self {
+            Hop::Cname(owner) => owner,
+            Hop::Dname { owner, .. } => owner,
+        }
     }
 }
 
@@ -226,9 +278,9 @@ enum Outcome<'a> {
     /// child, with AA clear (RFC 1035 §4.1.1).
     Referral { cut: String },
     /// There are records for the question at `name`, reached through the
-    /// aliases at `chain` (empty in the ordinary case).
+    /// redirections at `chain` (empty in the ordinary case).
     Answer {
-        chain: Vec<String>,
+        chain: Vec<Hop>,
         name: Cow<'a, str>,
         key: Cow<'a, str>,
         /// The lookup that found them, carried rather than repeated: writing
@@ -239,19 +291,32 @@ enum Outcome<'a> {
     /// No records. `name` is the name the "no" is about — the end of the chain
     /// when one was followed — and `kind` decides NXDOMAIN against NODATA.
     Negative {
-        chain: Vec<String>,
+        chain: Vec<Hop>,
         name: Cow<'a, str>,
         kind: NameKind,
     },
     /// The chain walked out of this zone: NOERROR with the aliases we hold and
     /// nothing else. Not NXDOMAIN — we know nothing about the target
     /// (RFC 1034 §4.3.2 step 3a).
-    ChainLeftZone { chain: Vec<String> },
+    ChainLeftZone { chain: Vec<Hop> },
+    /// The chain cannot go on. The hops so far still go out — a DNAME that
+    /// overflowed is itself the proof for the YXDOMAIN (RFC 6672 §2.2) — and
+    /// `rcode` says why it stopped.
+    Stopped {
+        chain: Vec<Hop>,
+        rcode: ResponseCode,
+    },
 }
 
-/// How many aliases we follow inside one zone. The second bound: the visited set
-/// below stops a cycle, this stops a chain that grows without repeating.
-pub(crate) const MAX_CNAME_HOPS: usize = 16;
+/// How many redirections — CNAME and DNAME alike — we follow inside one zone.
+/// The second bound: the visited set below stops a cycle, this stops a chain
+/// that grows without repeating.
+///
+/// RFC 6672 §2.2 warns both ways: "fairly long chains of DNAMEs may be valid",
+/// and "resolvers and servers should be cautious in devoting resources to a
+/// query". One ceiling for both kinds, because they chain together — "DNAMEs
+/// and CNAMEs can chain together to form loops".
+pub(crate) const MAX_REDIRECTS: usize = 16;
 
 /// Walk RFC 1034 §4.3.2 for one question.
 ///
@@ -265,18 +330,33 @@ pub(crate) const MAX_CNAME_HOPS: usize = 16;
 /// free. A case-randomized query folded its name three times before this
 /// (`TODO.md` #27a).
 fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a str, qkey: &'a str, qtype: Qtype) -> Outcome<'a> {
-    let mut chain: Vec<String> = Vec::new();
+    let mut chain: Vec<Hop> = Vec::new();
     let mut visited: Vec<String> = Vec::new();
     let mut name: Cow<'a, str> = Cow::Borrowed(qname);
     let mut key: Cow<'a, str> = Cow::Borrowed(qkey);
 
-    for _ in 0..MAX_CNAME_HOPS {
-        // A delegation is a referral whatever the type, except the DS *at* the
-        // cut: that is the parent's own statement about the child, which the
-        // child does not hold and could not be asked (RFC 4035 §3.1.4.1).
+    for _ in 0..MAX_REDIRECTS {
+        // The DNAME that redirects this name, if any: RFC 6672 §2.2, and
+        // strictly above it, because a DNAME does not redirect its own owner
+        // (§2.3). Asked before the name is looked up, not after: a name below a
+        // DNAME owner is occluded (RFC 2136 §7.18), so whether the zone happens
+        // to hold records there cannot change the answer.
+        let redirect = zone.dname_above_key(&key);
+
+        // A delegation is a referral whatever the type, with two exceptions.
         if let Some(cut) = zone.delegation_for(&key) {
-            let at_the_cut = cut == *key;
-            if !(qtype.is(record_types::DS) && at_the_cut) {
+            // A DNAME above the cut occludes it. Whichever of the two is
+            // shallower is the one RFC 1034 §4.3.2's "start matching down,
+            // label by label" reaches first. `check_dname_rules` refuses a zone
+            // with both on one path — an NS below a DNAME owner is a record at
+            // a subdomain of it (RFC 6672 §2.4) — so this decides only for a
+            // zone that arrived by transfer or was built by UPDATE (§5.2).
+            let occluded = redirect.is_some_and(|dname| is_at_or_under(&cut, &dname.name));
+            // The DS *at* the cut is the parent's own statement about the
+            // child, which the child does not hold and could not be asked
+            // (RFC 4035 §3.1.4.1).
+            let ds_at_the_cut = qtype.is(record_types::DS) && cut == *key;
+            if !(occluded || ds_at_the_cut) {
                 return if chain.is_empty() {
                     Outcome::Referral { cut }
                 } else {
@@ -285,6 +365,22 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a str, qkey: &'a str, qtype: Qty
                     // data as authoritative.
                     Outcome::ChainLeftZone { chain }
                 };
+            }
+        }
+
+        if let Some(dname) = redirect {
+            match redirect_through(dname, name, &mut chain) {
+                Ok(next) => {
+                    visited.push(key.into_owned());
+                    let next_key = absolute_lowered(&next).into_owned();
+                    if !in_zone(zone, &next_key) || visited.contains(&next_key) {
+                        return Outcome::ChainLeftZone { chain };
+                    }
+                    name = Cow::Owned(next);
+                    key = Cow::Owned(next_key);
+                    continue;
+                }
+                Err(rcode) => return Outcome::Stopped { chain, rcode },
             }
         }
 
@@ -325,7 +421,7 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a str, qkey: &'a str, qtype: Qty
             let kind = located.into_kind();
             return Outcome::Negative { chain, name, kind };
         };
-        chain.push(name.into_owned());
+        chain.push(Hop::Cname(name.into_owned()));
         visited.push(key.into_owned());
 
         // Folded for `visited`, an equality test against folded names; `in_zone`
@@ -338,6 +434,48 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a str, qkey: &'a str, qtype: Qty
         key = Cow::Owned(target_key);
     }
     Outcome::ChainLeftZone { chain }
+}
+
+/// Apply one DNAME to the name being sought, recording the hop.
+///
+/// `Ok` is the substituted name and the chain has grown by one; `Err` is the
+/// RCODE to answer with, and the chain still carries the DNAME, which is what
+/// RFC 6672 §2.2 sends "as proof for the YXDOMAIN (value 6) RCODE".
+fn redirect_through(
+    dname: &ZoneRecord,
+    from: Cow<'_, str>,
+    chain: &mut Vec<Hop>,
+) -> Result<String, ResponseCode> {
+    let Ok(ParsedRecord::DNAME(target)) = dname.rdata.parse() else {
+        // A DNAME whose RDATA will not read still occludes everything below it,
+        // so falling through to the name underneath would serve data this zone
+        // does not hold. SERVFAIL says the zone is wrong, which it is — and a
+        // zone that loaded here cannot be in this state, because
+        // `RecordData::parse` is what built it.
+        return Err(ResponseCode::ServerFailure);
+    };
+    let from = from.into_owned();
+    let to = match dname_redirect(&from, &dname.name, &target) {
+        Redirect::To(next) => Some(next),
+        Redirect::TooLong => None,
+        // `Zone::dname_above` found this DNAME strictly above the name, so the
+        // two disagree about the shape of the tree. Not reachable, and not
+        // silently ignorable either: falling through would answer from a name
+        // the DNAME occludes.
+        Redirect::NoMatch => return Err(ResponseCode::ServerFailure),
+    };
+    chain.push(Hop::Dname {
+        owner: dname.name.clone(),
+        from,
+        to: to.clone(),
+        ttl: dname.ttl,
+        class: dname.class,
+    });
+    // "The domain name can get too long during substitution... If this occurs,
+    // the server returns an RCODE of YXDOMAIN" (§2.2) — with the DNAME, now in
+    // the chain, as the proof for it. RFC 2136's YXDOMAIN is 6, which this enum
+    // spells `DomainExistsForSomeReason`.
+    to.ok_or(ResponseCode::DomainExistsForSomeReason)
 }
 
 /// Whether a name is at or below this zone's apex. [`rdns::utils::is_at_or_under`]
@@ -383,32 +521,53 @@ fn add_answer(
     dnssec_answer::push_answer_signatures(at, key, qtype, w)
 }
 
-/// The aliases walked to reach the answer, in the order they were followed.
+/// The redirections walked to reach the answer, in the order they were
+/// followed.
 ///
-/// Each is a CNAME RRset at its own owner name, so it carries its own signature
-/// — and its own wildcard denial when the alias was synthesized. Returns the
-/// hops that owe one, as a bit per index into `chain`.
+/// A CNAME hop is one RRset at its own owner name, with its own signature — and
+/// its own wildcard denial when the alias was synthesized. A DNAME hop is the
+/// DNAME RRset at an ancestor, with its signature, followed by the CNAME this
+/// server synthesizes from it (RFC 6672 §3.1). Returns the hops that owe a
+/// wildcard denial, as a bit per index into `chain`.
 fn add_chain(
     zone: &Zone,
-    chain: &[String],
+    chain: &[Hop],
     dnssec_ok: bool,
     w: &mut ResponseWriter,
 ) -> Result<u32, WireError> {
-    const _: () = assert!(MAX_CNAME_HOPS <= u32::BITS as usize, "one bit per hop");
+    const _: () = assert!(MAX_REDIRECTS <= u32::BITS as usize, "one bit per hop");
     let mut owed = 0u32;
-    for (i, at) in chain.iter().enumerate() {
+    for (i, hop) in chain.iter().enumerate() {
         // Folded here rather than carried: a chain is empty on the ordinary
-        // answer, so this pays only where an alias was actually followed.
-        let key = absolute_lowered(at);
-        if add_answer(
-            &zone.locate(&key),
-            at,
-            &key,
-            Qtype::of(record_types::CNAME),
-            dnssec_ok,
-            w,
-        )? {
+        // answer, so this pays only where a redirection was actually followed.
+        let key = absolute_lowered(hop.owner());
+        let qtype = match hop {
+            Hop::Cname(_) => Qtype::of(record_types::CNAME),
+            Hop::Dname { .. } => Qtype::of(record_types::DNAME),
+        };
+        if add_answer(&zone.locate(&key), hop.owner(), &key, qtype, dnssec_ok, w)? {
             owed |= 1 << i;
+        }
+
+        // "A CNAME RR with Time to Live (TTL) equal to the corresponding DNAME
+        // RR is synthesized and included in the answer section when the DNAME
+        // is employed as a substitution instruction. The owner name of the
+        // CNAME is the QNAME of the query" (RFC 6672 §3.1).
+        //
+        // It carries no signature, and that is the design rather than an
+        // omission: "the CNAME will never be signed" (§5.3.1). A validator
+        // verifies the DNAME's RRSIG and checks that the CNAME follows from it,
+        // so signing this would mean signing online, once per query.
+        if let Hop::Dname {
+            from,
+            to: Some(to),
+            ttl,
+            class,
+            ..
+        } = hop
+        {
+            let rdata = RecordData::from_parsed(&ParsedRecord::CNAME(to.clone()))?;
+            w.push(Section::Answer, from, *class, *ttl, &rdata)?;
         }
     }
     Ok(owed)
@@ -418,16 +577,16 @@ fn add_chain(
 /// section is closed.
 fn add_chain_denials(
     zone: &Zone,
-    chain: &[String],
+    chain: &[Hop],
     owed: u32,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
     if owed == 0 {
         return Ok(());
     }
-    for (i, at) in chain.iter().enumerate() {
+    for (i, hop) in chain.iter().enumerate() {
         if owed & (1 << i) != 0 {
-            dnssec_answer::push_proof_of_absence(zone, &absolute_lowered(at), w)?;
+            dnssec_answer::push_proof_of_absence(zone, &absolute_lowered(hop.owner()), w)?;
         }
     }
     Ok(())
@@ -577,6 +736,9 @@ deep.a.b IN TXT "down here"
 sub      IN NS  ns.sub.example.com.
 sub      IN NS  ns.other.test.
 ns.sub   IN A   192.0.2.20
+redir    IN DNAME target.example.net.
+inzone   IN DNAME sub2.example.com.
+x.sub2   IN A   192.0.2.30
 "#;
 
     fn server() -> Zones {
@@ -595,6 +757,206 @@ ns.sub   IN A   192.0.2.20
             .iter()
             .filter(|r| r.rdata.rtype() == rtype)
             .collect()
+    }
+
+    /// RFC 6672 §3.1 and §3.2 step 3C: a name below a DNAME gets the DNAME and
+    /// a CNAME the server synthesizes from it, and the chain then continues at
+    /// the substituted name.
+    ///
+    /// The wire shape that used to go out for every such name: NXDOMAIN, from
+    /// a zone that holds the redirection and never applied it.
+    #[test]
+    fn a_name_below_a_dname_is_redirected_through_a_synthesized_cname() {
+        let response = ask("a.redir.example.com.", Qtype::of(record_types::A));
+        assert_eq!(response.rcode, ResponseCode::Ok);
+
+        let dnames = rdatas(&response.answers, record_types::DNAME);
+        assert_eq!(dnames.len(), 1, "the DNAME itself is in the answer (§3.1)");
+        assert_eq!(dnames[0].name, "redir.example.com.");
+
+        let cnames = rdatas(&response.answers, record_types::CNAME);
+        assert_eq!(cnames.len(), 1);
+        assert_eq!(
+            cnames[0].name, "a.redir.example.com.",
+            "§3.1: the owner name of the CNAME is the QNAME of the query"
+        );
+        assert_eq!(
+            cnames[0].rdata.parse().unwrap(),
+            ParsedRecord::CNAME("a.target.example.net.".to_string())
+        );
+        assert_eq!(
+            cnames[0].ttl, dnames[0].ttl,
+            "§3.1: a CNAME with TTL equal to the corresponding DNAME RR"
+        );
+
+        // The target is out of the zone, so the chain stops there: NOERROR with
+        // what we hold, never NXDOMAIN about somebody else's name.
+        assert_eq!(response.answers.len(), 2);
+    }
+
+    /// RFC 6672 §2.3: "the owner name of a DNAME is not redirected itself".
+    /// Table 1's second row, both halves of its `[0]`.
+    #[test]
+    fn the_owner_of_a_dname_is_not_redirected() {
+        // QTYPE that the owner does not hold: NODATA, and §3.1 keeps the DNAME
+        // out of the answer, since it is not being employed as a substitution.
+        let response = ask("redir.example.com.", Qtype::of(record_types::A));
+        assert_eq!(response.rcode, ResponseCode::Ok);
+        assert!(response.answers.is_empty(), "{:?}", response.answers);
+        assert_eq!(rdatas(&response.authorities, record_types::SOA).len(), 1);
+
+        // QTYPE = DNAME: the result is the owner name, answered from it.
+        let response = ask("redir.example.com.", Qtype::of(record_types::DNAME));
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0].name, "redir.example.com.");
+        assert_eq!(response.answers[0].rdata.rtype(), record_types::DNAME);
+    }
+
+    /// A redirection whose target is inside the same zone is followed, exactly
+    /// as a CNAME's is — §3.2 step 3C ends "Go back to step 1".
+    #[test]
+    fn a_redirection_landing_in_the_zone_is_followed_to_an_answer() {
+        let response = ask("x.inzone.example.com.", Qtype::of(record_types::A));
+        assert_eq!(response.rcode, ResponseCode::Ok);
+        assert_eq!(rdatas(&response.answers, record_types::DNAME).len(), 1);
+        assert_eq!(rdatas(&response.answers, record_types::CNAME).len(), 1);
+
+        let a = rdatas(&response.answers, record_types::A);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].name, "x.sub2.example.com.");
+        assert_eq!(
+            a[0].rdata.parse().unwrap(),
+            ParsedRecord::A("192.0.2.30".parse().unwrap())
+        );
+    }
+
+    /// The synthesized CNAME's owner is the QNAME *as asked*, because that is
+    /// what a DNS-0x20 resolver compares byte for byte (RFC 1034 §4.3.3).
+    #[test]
+    fn a_synthesized_cname_echoes_the_case_the_client_asked_in() {
+        let response = ask("A.ReDiR.example.com.", Qtype::of(record_types::A));
+        let cnames = rdatas(&response.answers, record_types::CNAME);
+        assert_eq!(cnames.len(), 1);
+        assert_eq!(cnames[0].name, "A.ReDiR.example.com.");
+    }
+
+    /// RFC 6672 §2.2: "The domain name can get too long during substitution...
+    /// If this occurs, the server returns an RCODE of YXDOMAIN. The DNAME
+    /// record and its signature (if the zone is signed) are included in the
+    /// answer as proof for the YXDOMAIN (value 6) RCODE."
+    ///
+    /// The RFC's own arithmetic: a target of 250 octets and a first label over
+    /// five octets.
+    #[test]
+    fn a_substitution_over_255_octets_is_yxdomain_with_the_dname_as_proof() {
+        let label = "a".repeat(49);
+        let last = "a".repeat(48);
+        let zone_text = format!(
+            "$ORIGIN example.com.\n$TTL 3600\n\
+             @ IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+             @ IN NS ns1.example.com.\n\
+             redir IN DNAME {label}.{label}.{label}.{label}.{last}.\n"
+        );
+        let zone = parse_zone_file(&zone_text, "example.com.").expect("the long zone parses");
+        let mut zones = Zones::default();
+        drop(zones.insert(zone));
+
+        let response = make_response(
+            &query(
+                "abcdef.redir.example.com.",
+                Qtype::of(record_types::A),
+                false,
+            ),
+            &zones,
+            &DnsMetrics::new(),
+        );
+        // RFC 2136's YXDOMAIN is 6.
+        assert_eq!(response.rcode, ResponseCode::from_u16(6));
+        assert_eq!(
+            rdatas(&response.answers, record_types::DNAME).len(),
+            1,
+            "the DNAME goes out as the proof"
+        );
+        assert!(
+            rdatas(&response.answers, record_types::CNAME).is_empty(),
+            "§3.2 step 3C exits before synthesizing a CNAME"
+        );
+
+        // One label shorter and it fits, so the same zone still redirects.
+        let response = make_response(
+            &query("a.redir.example.com.", Qtype::of(record_types::A), false),
+            &zones,
+            &DnsMetrics::new(),
+        );
+        assert_eq!(response.rcode, ResponseCode::Ok);
+        assert_eq!(rdatas(&response.answers, record_types::CNAME).len(), 1);
+    }
+
+    /// RFC 6672 §2.4: "Resource records MUST NOT exist at any subdomain of the
+    /// owner of a DNAME RR... If the server does load the zone, those names
+    /// below the DNAME RR will be occluded as described in RFC 2136,
+    /// Section 7.18."
+    ///
+    /// `check_dname_rules` refuses such a zone from a file, so this one is
+    /// built the way a transfer or an UPDATE builds one — which is the case
+    /// that check cannot reach, and the reason the redirection is applied
+    /// before the name is looked up rather than after.
+    #[test]
+    fn a_record_below_a_dname_owner_is_occluded_not_answered() {
+        let mut zone = parse_zone_file(ZONE, "example.com.").expect("the test zone parses");
+        zone.add_record(rdns::zone::ZoneRecord {
+            name: "occluded.redir.example.com.".to_string(),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+            rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.66".parse().unwrap()))
+                .unwrap(),
+        });
+        let mut zones = Zones::default();
+        drop(zones.insert(zone));
+
+        let response = make_response(
+            &query(
+                "occluded.redir.example.com.",
+                Qtype::of(record_types::A),
+                false,
+            ),
+            &zones,
+            &DnsMetrics::new(),
+        );
+        assert!(
+            rdatas(&response.answers, record_types::A).is_empty(),
+            "the occluded record must not be served: {:?}",
+            response.answers
+        );
+        assert_eq!(rdatas(&response.answers, record_types::DNAME).len(), 1);
+        assert_eq!(rdatas(&response.answers, record_types::CNAME).len(), 1);
+    }
+
+    /// A DNAME pointing at its own owner's ancestor maps a name to itself —
+    /// RFC 6672 Table 1's `cyc` row. The visited set ends it, as it ends a
+    /// CNAME loop.
+    #[test]
+    fn a_dname_loop_terminates() {
+        let zone_text = "$ORIGIN example.com.\n$TTL 3600\n\
+                         @ IN SOA ns1.example.com. admin.example.com. \
+                         ( 1 3600 600 604800 300 )\n\
+                         @ IN NS ns1.example.com.\n\
+                         @ IN DNAME example.com.\n";
+        let zone = parse_zone_file(zone_text, "example.com.").expect("the apex DNAME parses");
+        let mut zones = Zones::default();
+        drop(zones.insert(zone));
+
+        let response = make_response(
+            &query("cyc.example.com.", Qtype::of(record_types::A), false),
+            &zones,
+            &DnsMetrics::new(),
+        );
+        assert_eq!(response.rcode, ResponseCode::Ok);
+        assert!(
+            rdatas(&response.answers, record_types::CNAME).len() <= MAX_REDIRECTS,
+            "the chain is bounded: {:?}",
+            response.answers
+        );
     }
 
     /// A resolver randomizes the case of the QNAME and compares the echo byte
@@ -682,7 +1044,7 @@ ns.sub   IN A   192.0.2.20
         let response = ask("loop1.example.com.", Qtype::of(record_types::A));
         assert_eq!(response.rcode, ResponseCode::Ok);
         assert!(
-            rdatas(&response.answers, record_types::CNAME).len() <= MAX_CNAME_HOPS,
+            rdatas(&response.answers, record_types::CNAME).len() <= MAX_REDIRECTS,
             "the chain is bounded"
         );
     }
