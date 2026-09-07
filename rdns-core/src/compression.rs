@@ -248,11 +248,13 @@ impl NameCompressor {
                 let pos = self.write_name(&exchange, buf, pos)?;
                 write_bytes(buf, pos, rest)
             }
-            // Everything else — including SRV, DNAME and the DNSSEC types —
-            // goes out byte-for-byte (RFC 3597 §4, RFC 4034 §3.1.7/§4.1.1).
-            // DNAME says so itself: its <target> "MUST NOT be sent out in
-            // compressed form" (RFC 6672 §2.5), which is why it is not in the
-            // arm above with the other single-name RDATAs.
+            // Everything else — including SRV, DNAME, SVCB/HTTPS and the
+            // DNSSEC types — goes out byte-for-byte (RFC 3597 §4,
+            // RFC 4034 §3.1.7/§4.1.1). Two of them say so themselves: a DNAME's
+            // <target> "MUST NOT be sent out in compressed form"
+            // (RFC 6672 §2.5), and SVCB's is "the uncompressed, fully qualified
+            // TargetName" (RFC 9460 §2.2). That is why neither is in the arm
+            // above with the other single-name RDATAs.
             _ => write_bytes(buf, pos, rdata),
         }
     }

@@ -174,10 +174,23 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
                     out.push(' ');
                 }
                 out.push('"');
-                out.push_str(&quotable_string(string)?);
+                out.push_str(&rdns_core::utils::char_string_escaped(string));
                 out.push('"');
             }
             out
+        }
+        ParsedRecord::SVCB {
+            priority,
+            target,
+            params,
+            ..
+        } => {
+            let head = format!("{priority} {}", writable_name(target)?);
+            if params.is_empty() {
+                head
+            } else {
+                format!("{head} {}", crate::svcb::present_params(params))
+            }
         }
         ParsedRecord::DNSKEY {
             flags,
@@ -276,26 +289,6 @@ fn writable_name(name: &str) -> Option<String> {
         .chars()
         .all(|c| c.is_ascii_graphic() && !matches!(c, ';' | '"' | '(' | ')' | '\\' | '@' | '$'));
     (plain && !name.is_empty()).then(|| name.to_string())
-}
-
-/// A `<character-string>` as the text between quotes, or `None` when it holds
-/// bytes this format cannot carry.
-///
-/// This parser resolves `\"` and `\\` but has no `\DDD` decimal escape, so a
-/// byte outside printable ASCII has no spelling and the record goes out generic.
-fn quotable_string(bytes: &[u8]) -> Option<String> {
-    let mut out = String::with_capacity(bytes.len());
-    for &byte in bytes {
-        match byte {
-            b'"' | b'\\' => {
-                out.push('\\');
-                out.push(byte as char);
-            }
-            0x20..=0x7e => out.push(byte as char),
-            _ => return None,
-        }
-    }
-    Some(out)
 }
 
 fn class_name(class: Class) -> Option<&'static str> {
@@ -434,10 +427,17 @@ mod tests {
         );
     }
 
-    /// A TXT record is arbitrary octets and this format has no decimal escape,
-    /// so the generic form carries it.
+    /// A TXT record is arbitrary octets, and every one of them now has a
+    /// spelling: RFC 1035 §5.1's `\DDD`.
+    ///
+    /// ~~"this format has no decimal escape, so the generic form carries
+    /// it"~~ — true until `utils::char_string_decode` was written for
+    /// RFC 9460's SvcParamValues, which needed the same escape. This test
+    /// asserted the limitation, so it had to change when the limitation went
+    /// (`CLAUDE.md` §1). What it asserts now is the round trip, which is what
+    /// it was for.
     #[test]
-    fn test_binary_txt_falls_back_to_the_generic_form() {
+    fn test_binary_txt_round_trips_through_decimal_escapes() {
         let mut zone = Zone::new("example.com.".to_string());
         let rdata = RecordData::from_parsed(&ParsedRecord::TXT(vec![vec![0x00, 0xff, 0x1f]]))
             .expect("encode");
@@ -449,7 +449,10 @@ mod tests {
         });
 
         let written = zone_to_string(&zone).expect("write");
-        assert!(written.contains("TXT     \\# 4 0300FF1F"), "{written}");
+        assert!(
+            written.contains(r#"TXT     "\000\255\031""#),
+            "every octet has a spelling now: {written}"
+        );
 
         let reread = parse_zone_file(&written, "example.com.").expect("re-parse");
         assert_eq!(

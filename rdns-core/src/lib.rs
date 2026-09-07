@@ -355,6 +355,36 @@ pub enum ParsedRecord {
     /// The `<target>` a whole subtree is redirected to (RFC 6672 §2.1). One
     /// domain name, and the substitution applies to names *below* the owner.
     DNAME(String),
+    /// A service binding: how to reach a service rather than only where its
+    /// name points (RFC 9460 §2).
+    ///
+    /// One arm for two type codes. The HTTPS RR "shares the same encoding,
+    /// format, and high-level semantics" (§6) and differs only in how its owner
+    /// name is built (§9.1), which is not this layer's business — so `rtype`
+    /// says which of the two it is. It cannot disagree with the enclosing
+    /// [`RecordData`]: [`ParsedRecord::decode`] is handed that rtype and
+    /// [`RecordData::from_parsed`] takes this one back.
+    SVCB {
+        rtype: Rtype,
+        /// 0 is AliasMode, anything else ServiceMode; lower is preferred
+        /// (§2.4.1).
+        priority: u16,
+        /// The alias target, or the alternative endpoint. `"."` is special
+        /// both ways (§2.5): in ServiceMode it means the owner name, and in
+        /// AliasMode that the service does not exist.
+        target: String,
+        /// The SvcParams, as `(key, wire value)` in strictly increasing key
+        /// order (§2.2).
+        ///
+        /// Values stay as wire octets rather than becoming a typed enum per
+        /// key. Three reasons: an unregistered key has to round-trip, which is
+        /// the same argument RFC 3597 makes for whole records; the registered
+        /// values are already length-prefixed lists or fixed-width fields, so
+        /// there is nothing a decode would simplify here; and the presentation
+        /// layer is the only place that has to know a key's shape, so knowing
+        /// it twice is the duplication `CLAUDE.md` §7 is about.
+        params: Vec<(u16, Vec<u8>)>,
+    },
     MX {
         preference: u16,
         exchange: String,
@@ -405,6 +435,74 @@ pub enum ParsedRecord {
     /// A record type we don't parse. `rtype` is carried by the enclosing
     /// [`RecordData`]; the raw bytes are preserved there too.
     Unknown(Rtype),
+}
+
+/// Read the SvcParams that fill the rest of an SVCB RDATA (RFC 9460 §2.2).
+///
+/// Each is a 2-octet key, a 2-octet length and that many octets of value.
+/// §2.2 lists what makes the record malformed, and two of the three are here:
+/// "the end of the RDATA occurs within a SvcParam", and "SvcParamKeys are not
+/// in strictly increasing numeric order" — which, as the section notes, also
+/// rules out duplicate keys. The third, a value whose format is wrong for its
+/// key, belongs to whoever interprets that key.
+fn decode_svc_params(mut rest: &[u8]) -> Result<Vec<(u16, Vec<u8>)>, WireError> {
+    let mut params: Vec<(u16, Vec<u8>)> = Vec::new();
+    while !rest.is_empty() {
+        let (key, tail) = read_be!(u16, rest);
+        let (len, tail) = read_be!(u16, tail);
+        let len = len as usize;
+        if tail.len() < len {
+            return Err(WireError::Truncated {
+                what: "an SVCB parameter value",
+                need: len,
+                have: tail.len(),
+            });
+        }
+        if let Some((previous, _)) = params.last() {
+            if key <= *previous {
+                return Err(WireError::malformed(
+                    "SVCB RDATA",
+                    format!(
+                        "SvcParamKeys must be in strictly increasing order \
+                         (RFC 9460 §2.2); {key} follows {previous}"
+                    ),
+                ));
+            }
+        }
+        params.push((key, tail[..len].to_vec()));
+        rest = &tail[len..];
+    }
+    Ok(params)
+}
+
+/// The inverse, canonicalizing the order.
+///
+/// Sorting here rather than asking every caller to: the wire order is a
+/// canonical form and carries no information, so an operator writing
+/// `port=53 alpn=h2` must get a valid record out. A *duplicate* key is
+/// information — two values, and no rule for choosing — so it is an error
+/// rather than something to quietly drop (`CLAUDE.md` §4).
+fn encode_svc_params(params: &[(u16, Vec<u8>)]) -> Result<Vec<u8>, WireError> {
+    let mut sorted: Vec<&(u16, Vec<u8>)> = params.iter().collect();
+    sorted.sort_by_key(|(key, _)| *key);
+    let mut out = Vec::new();
+    for (index, (key, value)) in sorted.iter().enumerate() {
+        if index > 0 && *key == sorted[index - 1].0 {
+            return Err(WireError::malformed(
+                "SVCB RDATA",
+                format!("SvcParamKey {key} appears twice, and only one value can be sent"),
+            ));
+        }
+        let len = u16::try_from(value.len()).map_err(|_| WireError::TooLong {
+            what: "an SVCB parameter value",
+            limit: u16::MAX as usize,
+            actual: value.len(),
+        })?;
+        out.extend_from_slice(&key.to_be_bytes());
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(value);
+    }
+    Ok(out)
 }
 
 impl ParsedRecord {
@@ -470,6 +568,18 @@ impl ParsedRecord {
             utils::record_types::DNAME => {
                 let (target, _) = dname_from_bytes(rdata, unpacker)?;
                 Ok(ParsedRecord::DNAME(target))
+            }
+            // Same forgiveness as DNAME about the uncompressed TargetName
+            // (RFC 9460 §2.2): the rule binds the writer.
+            utils::record_types::SVCB | utils::record_types::HTTPS => {
+                let (priority, rest) = read_be!(u16, rdata);
+                let (target, rest) = dname_from_bytes(rest, unpacker)?;
+                Ok(ParsedRecord::SVCB {
+                    rtype: record_type,
+                    priority,
+                    target,
+                    params: decode_svc_params(rest)?,
+                })
             }
             utils::record_types::MX => {
                 let (preference, rest) = read_be!(u16, rdata);
@@ -639,6 +749,17 @@ impl ParsedRecord {
             ParsedRecord::CNAME(name) => (utils::record_types::CNAME, dname_to_bytes(name)?),
             ParsedRecord::PTR(name) => (utils::record_types::PTR, dname_to_bytes(name)?),
             ParsedRecord::DNAME(name) => (utils::record_types::DNAME, dname_to_bytes(name)?),
+            ParsedRecord::SVCB {
+                rtype,
+                priority,
+                target,
+                params,
+            } => {
+                let mut v = priority.to_be_bytes().to_vec();
+                v.extend_from_slice(&dname_to_bytes(target)?);
+                v.extend_from_slice(&encode_svc_params(params)?);
+                (*rtype, v)
+            }
             ParsedRecord::MX {
                 preference,
                 exchange,
@@ -2396,6 +2517,104 @@ mod tests {
             1,
             "the zone name should appear exactly once in the message"
         );
+    }
+
+    /// RFC 9460 §2.2 lists what makes an SVCB record malformed, and two of the
+    /// three are structural: "the end of the RDATA occurs within a SvcParam",
+    /// and "SvcParamKeys are not in strictly increasing numeric order" — which,
+    /// as the section notes, also rules out duplicates.
+    #[test]
+    fn svcb_params_must_be_in_strictly_increasing_key_order() {
+        // priority 1, target ".", then key 3 (port) and key 1 (alpn).
+        let backwards = [
+            0x00, 0x01, 0x00, // priority, root target
+            0x00, 0x03, 0x00, 0x02, 0x01, 0xbb, // port=443
+            0x00, 0x01, 0x00, 0x02, 0x01, b'h', // alpn
+        ];
+        let err = RecordData::new(utils::record_types::SVCB, &backwards[..])
+            .expect_err("out-of-order keys do not make a record");
+        assert!(
+            err.to_string().contains("increasing"),
+            "the error should say which rule: {err}"
+        );
+
+        // The same two keys the right way round do read back.
+        let forwards = [
+            0x00, 0x01, 0x00, //
+            0x00, 0x01, 0x00, 0x02, 0x01, b'h', //
+            0x00, 0x03, 0x00, 0x02, 0x01, 0xbb,
+        ];
+        let rdata = RecordData::new(utils::record_types::SVCB, &forwards[..])
+            .expect("the right way round is a record");
+        let Ok(ParsedRecord::SVCB { params, .. }) = rdata.parse() else {
+            panic!("it parses");
+        };
+        assert_eq!(params.len(), 2);
+
+        // And a value that runs off the end is truncated, not a panic: this is
+        // pre-authentication input on both transports (`TODO.md` #12).
+        let short = [0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x09, b'h'];
+        assert!(RecordData::new(utils::record_types::SVCB, &short[..]).is_err());
+    }
+
+    /// The two type codes are one format (RFC 9460 §6), and `rtype` is what
+    /// carries which — so a record built as HTTPS comes back as HTTPS.
+    #[test]
+    fn svcb_and_https_are_one_format_under_two_numbers() {
+        for rtype in [utils::record_types::SVCB, utils::record_types::HTTPS] {
+            let built = RecordData::from_parsed(&ParsedRecord::SVCB {
+                rtype,
+                priority: 1,
+                target: "foo.example.com.".to_string(),
+                params: vec![(3, vec![0x01, 0xbb])],
+            })
+            .expect("it encodes");
+            assert_eq!(built.rtype(), rtype);
+            let Ok(ParsedRecord::SVCB {
+                rtype: back,
+                priority,
+                target,
+                params,
+            }) = built.parse()
+            else {
+                panic!("it parses")
+            };
+            assert_eq!(back, rtype, "the rtype survives the round trip");
+            assert_eq!(priority, 1);
+            assert_eq!(target, "foo.example.com.");
+            assert_eq!(params, vec![(3, vec![0x01, 0xbb])]);
+        }
+    }
+
+    /// The encoder sorts, because the wire order carries no information — but a
+    /// duplicate key is two values with no rule for choosing, so it is an error
+    /// rather than something to quietly drop.
+    #[test]
+    fn svcb_encoding_sorts_keys_and_refuses_a_duplicate() {
+        let sorted = RecordData::from_parsed(&ParsedRecord::SVCB {
+            rtype: utils::record_types::SVCB,
+            priority: 1,
+            target: ".".to_string(),
+            params: vec![(3, vec![0x01, 0xbb]), (1, vec![0x01, b'h'])],
+        })
+        .expect("it encodes");
+        // priority, root target, then key 1 before key 3.
+        assert_eq!(
+            sorted.bytes(),
+            [
+                0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x02, 0x01, b'h', 0x00, 0x03, 0x00, 0x02, 0x01,
+                0xbb
+            ]
+        );
+
+        let err = RecordData::from_parsed(&ParsedRecord::SVCB {
+            rtype: utils::record_types::SVCB,
+            priority: 1,
+            target: ".".to_string(),
+            params: vec![(3, vec![0x00, 0x35]), (3, vec![0x01, 0xbb])],
+        })
+        .expect_err("two values for one key");
+        assert!(err.to_string().contains("twice"), "{err}");
     }
 
     /// RFC 6672 §2.5: "The DNAME RDATA target name MUST NOT be sent out in

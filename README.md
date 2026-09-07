@@ -85,6 +85,7 @@ dig @127.0.0.1 -p 5353 example.com MX
 Standard BIND format. Supported:
 
 - A, AAAA, NS, CNAME, SOA, PTR, MX, TXT
+- DNAME (RFC 6672) and SVCB/HTTPS (RFC 9460)
 - DNSSEC records (DNSKEY, RRSIG, DS, NSEC, NSEC3)
 - `$ORIGIN`, `$TTL`, `$INCLUDE`; comments, quoted strings, `( )` continuation
 - Any other type in RFC 3597 `\#` generic form, or by `TYPEnnn` mnemonic
@@ -380,12 +381,12 @@ tree; the gap is the sixteen `#[cfg(unix)]` tests. Plus 4 doc-tests marked
 | `rdnsd` | 109 (122 on Linux) |
 | `rdnsr` | 10 |
 
-Open work is `TODO.md` — one review section (#33, filed 2026-09-05) and one
-inventory of deliberate RFC deviations (#21). Everything else numbered is
-closed; `docs/CLOSED_WORK.md` holds it.
+Open work is `TODO.md` — nothing numbered, and one inventory of deliberate RFC
+deviations (#21). Everything numbered is closed; `docs/CLOSED_WORK.md` holds it.
 
-Not implemented: DNS over TLS/HTTPS/QUIC, DNAME, SIG(0), SVCB/HTTPS parsing, any
-class but IN. `docs/spec/07-rfc-conformance.md` is the full matrix.
+Not implemented: DNS over TLS/HTTPS/QUIC, SIG(0), DNS Cookies as anything but
+opaque bytes, `$GENERATE`, any class but IN.
+`docs/spec/07-rfc-conformance.md` is the full matrix.
 
 ## Licence
 

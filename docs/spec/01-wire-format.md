@@ -146,9 +146,19 @@ RDLENGTH = 0 is legal and parses to `ParsedRecord::Unknown(rtype)`
 (`lib.rs:581`) — RFC 2136 §2.4.1/§2.4.2/§2.5.2/§2.5.3 spell prerequisites and
 RRset deletions that way.
 
-Typed record types: A, NS, CNAME, SOA, PTR, MX, TXT, AAAA, DNAME, DNSKEY, RRSIG,
-DS, NSEC, NSEC3. Everything else is `Unknown(Rtype)` with bytes preserved
-verbatim.
+Typed record types: A, NS, CNAME, SOA, PTR, MX, TXT, AAAA, DNAME, DS, SVCB,
+HTTPS, DNSKEY, RRSIG, NSEC, NSEC3. Everything else is `Unknown(Rtype)` with
+bytes preserved verbatim.
+
+SVCB (64) and HTTPS (65) are one `ParsedRecord::SVCB` arm carrying its own
+`rtype`, because they are "the same encoding, format, and high-level semantics"
+(RFC 9460 §6) and differ only in how the owner name is built (§9.1). Its
+`params` are `(key, wire octets)` pairs: an unregistered key has to round-trip,
+and only the presentation layer needs a key's shape. Two of §2.2's three
+malformed conditions are checked on the way in — a parameter running past the
+end of the RDATA, and keys not in strictly increasing order, which also rules
+out duplicates. The third, a value in the wrong format for its key, belongs to
+whoever reads that key.
 
 TXT is `Vec<Vec<u8>>` — a sequence of `<character-string>`s (RFC 1035 §3.3.14),
 each at most 255 octets, stored as bytes. A TXT record holding two strings is a

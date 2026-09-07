@@ -42,6 +42,7 @@ pub mod secondary;
 pub mod security;
 pub mod shutdown;
 pub mod special_names;
+pub mod svcb;
 /// Plain record fixtures, for tests only.
 #[cfg(test)]
 mod test_records;

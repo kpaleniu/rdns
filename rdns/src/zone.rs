@@ -1007,7 +1007,16 @@ fn tokenize(text: &str) -> Vec<String> {
             continue;
         }
         match c {
-            '\\' if in_quotes => escaped = true,
+            // Kept, not consumed: RFC 1035 §5.1's escapes are resolved by the
+            // value that needs them (`utils::char_string_decode`), because only
+            // that value knows whether `\\120` is three characters or one
+            // octet. Eating it here made `\\DDD` unspellable and silently
+            // turned a quoted `"a\\.b"` into two labels.
+            '\\' => {
+                current.push(c);
+                escaped = true;
+                started = true;
+            }
             '"' => {
                 in_quotes = !in_quotes;
                 started = true;
@@ -1218,6 +1227,28 @@ fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
     Ok(())
 }
 
+/// The `SvcPriority` and `TargetName` an SVCB or HTTPS record opens with, and
+/// the `key=value` fields that follow them (RFC 9460 §2.1).
+fn split_svcb_head<'a>(
+    record_type: &str,
+    fields: &'a [&'a str],
+    ln: usize,
+) -> Result<(u16, String, &'a [&'a str]), ZoneError> {
+    let [priority, target, rest @ ..] = fields else {
+        return Err(ZoneError::syntax(
+            ln,
+            format!("a {record_type} record needs a priority and a target name"),
+        ));
+    };
+    let priority = priority.parse::<u16>().map_err(|e| {
+        ZoneError::syntax(
+            ln,
+            format!("the {record_type} priority {priority:?} is not a number 0-65535: {e}"),
+        )
+    })?;
+    Ok((priority, (*target).to_string(), rest))
+}
+
 /// The RDATA half of a zone-file line: everything after the owner name, TTL,
 /// class and type have been read off it. Pure, unlike [`parse_into`], which
 /// mutates parser state.
@@ -1273,7 +1304,11 @@ fn rdata_from_fields(
             // Every field after the type is one `<character-string>`
             // (RFC 1035 §3.3.14): `"a b" c` is two, `a b c` is three. The
             // 255-byte ceiling is the encoder's, for every caller.
-            let strings: Vec<Vec<u8>> = text_fields.iter().map(|t| t.as_bytes().to_vec()).collect();
+            let strings: Vec<Vec<u8>> = text_fields
+                .iter()
+                .map(|t| crate::utils::char_string_decode(t))
+                .collect::<Result<_, _>>()
+                .map_err(|e| ZoneError::syntax(ln, format!("TXT record: {e}")))?;
             if strings.is_empty() {
                 return Err(ZoneError::syntax(ln, "TXT record has no text"));
             }
@@ -1284,6 +1319,39 @@ fn rdata_from_fields(
             .map_err(|e| ZoneError::syntax(ln, format!("PTR record: {e}")))?,
         "DNAME" => RecordData::from_parsed(&ParsedRecord::DNAME(rdata))
             .map_err(|e| ZoneError::syntax(ln, format!("DNAME record: {e}")))?,
+        // One arm for two type codes: "the same encoding, format, and
+        // high-level semantics" (RFC 9460 §6). Only the owner name differs
+        // between them, and that is the caller's (§9.1).
+        "SVCB" | "HTTPS" => {
+            let (priority, target, rest) = split_svcb_head(record_type, fields, ln)?;
+            let params = crate::svcb::parse_params(rest, ln)?;
+            // "In AliasMode, recipients MUST ignore any SvcParams that are
+            // present. Zone-file parsers MAY emit a warning" (§2.4.2). Refused
+            // rather than warned: a parameter that is ignored is a setting the
+            // operator believes is in force and is not (`CLAUDE.md` §15).
+            if priority == 0 && !params.is_empty() {
+                return Err(ZoneError::syntax(
+                    ln,
+                    format!(
+                        "an AliasMode {record_type} (priority 0) may not carry SvcParams — \
+                         RFC 9460 §2.4.2 says recipients must ignore them, so writing one \
+                         here means it does nothing"
+                    ),
+                ));
+            }
+            let rtype = if record_type == "SVCB" {
+                rt::SVCB
+            } else {
+                rt::HTTPS
+            };
+            RecordData::from_parsed(&ParsedRecord::SVCB {
+                rtype,
+                priority,
+                target,
+                params,
+            })
+            .map_err(|e| ZoneError::syntax(ln, format!("{record_type} record: {e}")))?
+        }
         "SOA" => {
             let soa_parts: Vec<&str> = rdata.split_whitespace().collect();
             if soa_parts.len() < 7 {
@@ -2877,6 +2945,30 @@ $TTL 3600
         let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
         assert!(err.to_string().contains("$TTL"), "got: {err}");
     }
+    /// A *quoted* escape in a name was eaten by the tokenizer, so `"a\.b"`
+    /// reached the parser as `a.b` and became two labels with nothing to say
+    /// so — the unquoted form was refused and the quoted one silently
+    /// mis-encoded. The tokenizer keeps the backslash now, so both take the
+    /// same path.
+    ///
+    /// Found while writing RFC 9460's SvcParamValue decoding, which needed the
+    /// backslash to survive tokenizing for `\DDD` to mean anything.
+    #[test]
+    fn a_quoted_escape_in_a_name_is_refused_like_an_unquoted_one() {
+        for line in [
+            r#"www IN CNAME a\.b.example.com."#,
+            r#"www IN CNAME "a\.b.example.com.""#,
+        ] {
+            let err = parse_zone_file(line, "example.com.")
+                .err()
+                .unwrap_or_else(|| panic!("{line:?} should not load"));
+            assert!(
+                err.to_string().contains("escape"),
+                "{line:?}: the error should say why: {err}"
+            );
+        }
+    }
+
     /// An escape in a name is refused rather than mis-encoded. RFC 1035 §5.1
     /// makes `a\.b` one label of three octets, which presentation text with `.`
     /// as the separator cannot hold.

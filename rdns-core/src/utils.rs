@@ -21,6 +21,13 @@ pub mod record_types {
     /// redirects names *below* its owner and not the owner itself.
     pub const DNAME: Rtype = Rtype::new(39);
     pub const DS: Rtype = Rtype::new(43);
+    /// Service binding: how to reach a service, not just where the name points
+    /// (RFC 9460 §2). [`HTTPS`] is the same format under another number.
+    pub const SVCB: Rtype = Rtype::new(64);
+    /// SVCB with HTTP semantics and no underscore-prefixed owner name
+    /// (RFC 9460 §9.1). "The same encoding, format, and high-level
+    /// semantics" (§6), so one parser serves both.
+    pub const HTTPS: Rtype = Rtype::new(65);
     pub const RRSIG: Rtype = Rtype::new(46);
     pub const NSEC: Rtype = Rtype::new(47);
     pub const DNSKEY: Rtype = Rtype::new(48);
@@ -532,6 +539,146 @@ pub fn record_type_code(rdata: &RecordData) -> Rtype {
     rdata.rtype()
 }
 
+/// SvcParamKeys that have a name (RFC 9460 §14.3.2). Everything else is
+/// `keyNNNNN`, which is why this is a handful of constants and not an enum.
+pub mod svc_param_keys {
+    /// Keys a client must understand to use the record at all (§8).
+    pub const MANDATORY: u16 = 0;
+    /// Application-Layer Protocol Negotiation ids — how `h3` is advertised.
+    pub const ALPN: u16 = 1;
+    /// Present and empty; the scheme's default ALPN is not supported (§7.1).
+    pub const NO_DEFAULT_ALPN: u16 = 2;
+    pub const PORT: u16 = 3;
+    pub const IPV4HINT: u16 = 4;
+    /// Reserved in RFC 9460 for Encrypted ClientHello, which is why this
+    /// library carries the name but no value format for it.
+    pub const ECH: u16 = 5;
+    pub const IPV6HINT: u16 = 6;
+}
+
+/// The name of a SvcParamKey, or its `keyNNNNN` form (RFC 9460 §2.1).
+///
+/// Always a name [`svc_param_key_from_name`] reads back, which is the same
+/// contract [`record_type_name`] has with its inverse.
+pub fn svc_param_key_name(key: u16) -> Cow<'static, str> {
+    let known = match key {
+        svc_param_keys::MANDATORY => "mandatory",
+        svc_param_keys::ALPN => "alpn",
+        svc_param_keys::NO_DEFAULT_ALPN => "no-default-alpn",
+        svc_param_keys::PORT => "port",
+        svc_param_keys::IPV4HINT => "ipv4hint",
+        svc_param_keys::ECH => "ech",
+        svc_param_keys::IPV6HINT => "ipv6hint",
+        other => return Cow::Owned(format!("key{other}")),
+    };
+    Cow::Borrowed(known)
+}
+
+/// The inverse. `keyNNNNN` is accepted for any key at all.
+///
+/// RFC 9460 §2.1 spells the generic form `key65535` with no leading zeros and
+/// requires the value to fit a `u16`, so `key65536` and `key0001` are not keys.
+pub fn svc_param_key_from_name(name: &str) -> Option<u16> {
+    match name {
+        "mandatory" => Some(svc_param_keys::MANDATORY),
+        "alpn" => Some(svc_param_keys::ALPN),
+        "no-default-alpn" => Some(svc_param_keys::NO_DEFAULT_ALPN),
+        "port" => Some(svc_param_keys::PORT),
+        "ipv4hint" => Some(svc_param_keys::IPV4HINT),
+        "ech" => Some(svc_param_keys::ECH),
+        "ipv6hint" => Some(svc_param_keys::IPV6HINT),
+        other => {
+            let digits = other.strip_prefix("key")?;
+            // "0" is `key0`, but `key0001` is not a spelling of it: the writer
+            // never emits a leading zero, so accepting one would break the
+            // round trip this pair promises.
+            if digits.len() > 1 && digits.starts_with('0') {
+                return None;
+            }
+            digits.parse::<u16>().ok()
+        }
+    }
+}
+
+/// Decode RFC 1035 §5.1's escapes: `\X` is a literal `X`, and `\DDD` is the
+/// octet with that three-digit decimal value.
+///
+/// RFC 9460 Appendix A calls this "character-string decoding" and defers to
+/// §5.1 for it; `escaped = "\" ( non-digit / dec-octet )`, so the digit form is
+/// exactly three digits and nothing else counts as one.
+///
+/// Bytes out, not a `String`: §5.1 can spell any octet and most of them are not
+/// UTF-8. The zone tokenizer keeps backslashes rather than resolving them, so
+/// this is the one place they are resolved — which is why `\DDD` had no
+/// spelling anywhere in this tree until SVCB needed one.
+pub fn char_string_decode(text: &str) -> WireResult<Vec<u8>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let rest = &bytes[i + 1..];
+        let Some(&next) = rest.first() else {
+            return Err(WireError::malformed(
+                "a character-string",
+                "it ends with a backslash, which escapes nothing",
+            ));
+        };
+        if !next.is_ascii_digit() {
+            out.push(next);
+            i += 2;
+            continue;
+        }
+        // A digit starts the three-digit form, and only the three-digit form:
+        // `\1` and `\12` are not escapes of anything.
+        if rest.len() < 3 || !rest[..3].iter().all(u8::is_ascii_digit) {
+            return Err(WireError::malformed(
+                "a character-string",
+                "a backslash before a digit begins a three-digit decimal escape",
+            ));
+        }
+        let value =
+            (rest[0] - b'0') as u16 * 100 + (rest[1] - b'0') as u16 * 10 + (rest[2] - b'0') as u16;
+        let byte = u8::try_from(value).map_err(|_| {
+            WireError::malformed(
+                "a character-string",
+                format!("the decimal escape \\{value:03} is over 255"),
+            )
+        })?;
+        out.push(byte);
+        i += 4;
+    }
+    Ok(out)
+}
+
+/// The inverse: the text that goes *between quotes* in a zone file.
+///
+/// Escapes the two characters that would end the string or start an escape,
+/// and spells every non-printable octet as `\DDD`. Total — there is no byte
+/// §5.1 cannot say — which is why callers of this do not have a "cannot write
+/// it" case to handle.
+///
+/// The quotes are the caller's to add: a value inside a comma-separated list
+/// is escaped the same way but not quoted individually.
+pub fn char_string_escaped(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        match byte {
+            b'"' | b'\\' => {
+                out.push('\\');
+                out.push(byte as char);
+            }
+            0x20..=0x7e => out.push(byte as char),
+            other => out.push_str(&format!("\\{other:03}")),
+        }
+    }
+    out
+}
+
 /// What a DNAME does to one query name (RFC 6672 §2.2).
 ///
 /// Three answers rather than an `Option<Result<..>>`, because the caller
@@ -638,6 +785,8 @@ pub fn record_type_name_to_code(kind: &str) -> Option<Rtype> {
         "AAAA" => Some(record_types::AAAA),
         "DNAME" => Some(record_types::DNAME),
         "DS" => Some(record_types::DS),
+        "SVCB" => Some(record_types::SVCB),
+        "HTTPS" => Some(record_types::HTTPS),
         "DNSKEY" => Some(record_types::DNSKEY),
         "RRSIG" => Some(record_types::RRSIG),
         "NSEC" => Some(record_types::NSEC),
@@ -684,7 +833,7 @@ pub fn qtype_name(qtype: Qtype) -> Cow<'static, str> {
 /// The mnemonic for a type code, or its `TYPEnnn` form (RFC 3597 §5) when this
 /// library has none. Always a name [`record_type_name_to_code`] reads back.
 ///
-/// `Cow`, because fourteen of the answers are constants and only the last one
+/// `Cow`, because sixteen of the answers are constants and only the last one
 /// has to be built: writing a zone allocated a `String` per record to print a
 /// name that was in the binary already (`TODO.md` #26h).
 pub fn record_type_name(code: Rtype) -> Cow<'static, str> {
@@ -699,6 +848,8 @@ pub fn record_type_name(code: Rtype) -> Cow<'static, str> {
         record_types::AAAA => "AAAA",
         record_types::DNAME => "DNAME",
         record_types::DS => "DS",
+        record_types::SVCB => "SVCB",
+        record_types::HTTPS => "HTTPS",
         record_types::DNSKEY => "DNSKEY",
         record_types::RRSIG => "RRSIG",
         record_types::NSEC => "NSEC",
@@ -988,7 +1139,7 @@ mod tests {
         assert_eq!(record_type_name(Rtype::new(1234)), "TYPE1234");
         assert_eq!(record_type_name(record_types::A), "A");
 
-        for code in [1u16, 15, 39, 50, 99, 257, 65535] {
+        for code in [1u16, 15, 39, 50, 64, 65, 99, 257, 65535] {
             let name = record_type_name(Rtype::new(code));
             assert_eq!(
                 record_type_name_to_code(&name),
@@ -999,6 +1150,55 @@ mod tests {
     }
 
     /// A number that does not fit a TYPE code is not a type name.
+    /// RFC 1035 §5.1's escapes, both directions.
+    ///
+    /// `\X` is a literal `X` and `\DDD` is one octet, and the digit form is
+    /// exactly three digits — `escaped = "\" ( non-digit / dec-octet )` in
+    /// RFC 9460 Appendix A's ABNF, where `dec-octet` is three digits and
+    /// nothing shorter.
+    #[test]
+    fn character_string_escapes_decode_and_come_back() {
+        for (text, want) in [
+            ("plain", b"plain".to_vec()),
+            (r#"say \"hi\""#, b"say \"hi\"".to_vec()),
+            (r"a\\b", b"a\\b".to_vec()),
+            (r"a\.b", b"a.b".to_vec()),
+            // RFC 9460 Appendix D Figure 6's value.
+            (r"hello\210qoo", b"hello\xd2qoo".to_vec()),
+            (r"\000\255", vec![0x00, 0xff]),
+            ("", Vec::new()),
+        ] {
+            assert_eq!(char_string_decode(text).unwrap(), want, "{text}");
+        }
+
+        // Every octet has a spelling, and it reads back as itself.
+        let every: Vec<u8> = (0u8..=255).collect();
+        let spelled = char_string_escaped(&every);
+        assert_eq!(char_string_decode(&spelled).unwrap(), every);
+    }
+
+    /// The three ways an escape can be malformed. Refused rather than guessed
+    /// at, because each guess is a different octet string.
+    #[test]
+    fn a_malformed_escape_is_refused() {
+        for text in [
+            // Nothing to escape.
+            "ends with a backslash\\",
+            // A digit starts the three-digit form and there are not three.
+            r"\1",
+            r"\12",
+            r"\12x",
+            // Three digits, over 255.
+            r"\256",
+            r"\999",
+        ] {
+            assert!(
+                char_string_decode(text).is_err(),
+                "{text:?} should not decode"
+            );
+        }
+    }
+
     /// RFC 6672 §2.2's Table 1, verbatim — the twelve inputs the spec has
     /// already committed to an answer for, corner cases and loops included.
     ///

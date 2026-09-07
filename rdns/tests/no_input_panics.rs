@@ -66,6 +66,9 @@ fn zone_text() -> String {
      alias  IN CNAME www.example.com.\n\
      sub    IN NS  ns.sub.example.com.\n\
      ns.sub IN A   192.0.2.30\n\
+     redir  IN DNAME target.example.net.\n\
+     svc    IN HTTPS 1 . alpn=\"h2,h3\" port=8002 ipv4hint=192.0.2.1\n\
+     svc    IN SVCB  16 foo.example.org. mandatory=alpn key667=\"x\\\\210y\"\n\
      *      IN A   192.0.2.99\n"
         .to_string()
 }
@@ -130,6 +133,12 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
         ("alias.example.com.", record_types::CNAME),
         ("example.com.", record_types::SOA),
         ("example.com.", record_types::NS),
+        // Every RDATA with a length field an attacker picks. DNAME's is the
+        // name; SVCB and HTTPS carry a 16-bit length *per parameter*, read in
+        // a loop, which is the shape `CLAUDE.md` §2 opens with.
+        ("redir.example.com.", record_types::DNAME),
+        ("svc.example.com.", record_types::HTTPS),
+        ("svc.example.com.", record_types::SVCB),
     ] {
         for record in zone.query(name, Qtype::of(qtype)) {
             answer.answers.push(ResourceRecord {

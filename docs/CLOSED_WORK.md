@@ -4959,6 +4959,124 @@ test is named for.
 
 ---
 
+### 35. SVCB and HTTPS (RFC 9460) — **filed and closed 2026-09-07**
+
+Taken straight after #34, and for the reason #34's closing note left behind:
+with DNAME done, SVCB/HTTPS was the largest remaining entry on #21's
+not-implemented list. It answered nothing *wrong* — the records stored and
+served as opaque RFC 3597 RDATA already — but an operator who wanted one had to
+hand-encode `\#` form, and a mistake there is silent.
+
+One commit, because the wire format and the presentation format are joined at
+the hip: `ParsedRecord` is an exhaustive match, so the type cannot exist without
+the writer knowing how to spell it, and the writer may not emit a form the
+parser cannot read back.
+
+| | what |
+|---|---|
+| **wire** | Rtype 64 and 65, one `ParsedRecord::SVCB` arm carrying its own `rtype`, and the SvcParams codec with §2.2's ordering rule |
+| **presentation** | `rdns/src/svcb.rs`: the six registered parameter shapes, `keyNNNNN` for everything else, both directions in one module |
+| **escapes** | `utils::char_string_decode` / `char_string_escaped` — RFC 1035 §5.1, which this tree had never implemented |
+
+#### The escape decoder, which is the half that was not obvious
+
+RFC 9460 Appendix A does not define its own escaping; it defers to RFC 1035
+§5.1's character-string decoding, `\DDD` decimal octets included. This codebase
+had no such decoder. The tokenizer was escape-*aware* — a `\` stopped `.`, `;`,
+`"` and whitespace being delimiters — but never resolved anything:
+`logical_lines` pushed the backslash through and `tokenize` *ate* it inside
+quotes.
+
+Writing the decoder meant the tokenizer had to stop eating backslashes, and that
+turned up **a latent defect in a path with nothing to do with SVCB**: a quoted
+escape in a name. `www IN CNAME a\.b.example.com.` was refused, correctly, since
+#13e; `www IN CNAME "a\.b.example.com."` had its backslash eaten in the
+tokenizer and reached the parser as `a.b.example.com.` — a different name, four
+labels instead of the three the operator wrote, loaded without complaint. The
+quoted and unquoted spellings of one name disagreed. Both are refused now, and
+the test names the case.
+
+It also retired a limitation the tree had documented: `quotable_string`'s doc
+comment read "this parser resolves `\"` and `\\` but has no `\DDD` decimal
+escape, so a byte outside printable ASCII has no spelling and the record goes
+out generic". With `\DDD` every octet has a spelling, so binary TXT round-trips
+in the friendly form and the function is gone, replaced by the shared escaper.
+**A test had to change**, which is `CLAUDE.md` §1 working as intended:
+`test_binary_txt_falls_back_to_the_generic_form` asserted the limitation, so it
+became `test_binary_txt_round_trips_through_decimal_escapes` and asserts the
+round trip, which is what it was for.
+
+#### Decisions
+
+- **Values stay as wire octets**, not a typed enum per key. An unregistered key
+  has to round-trip — RFC 3597's argument, one layer down — the registered
+  values are already length-prefixed lists or fixed-width fields, and only the
+  presentation layer needs a key's shape, so knowing it twice is §7's
+  duplication.
+- **The spelling picks the value format, not the number.** `alpn=h2,h3` is a
+  comma list; `key1="\002h2"` is the same key written opaquely, value as raw
+  octets. This is not decoration: §7.1.1 offers the opaque form as the way to
+  write an ALPN id containing `,` or `\`, which only works if the two spellings
+  parse differently. **The RFC's own example caught this** — Appendix D
+  Figure 10's escape-hatch line failed against the first implementation, which
+  dispatched on the key number and sent `key1=` into the comma-list parser.
+- **The encoder sorts and refuses duplicates.** §2.2's increasing-key order is a
+  canonical form carrying no information, so an operator writing
+  `port=53 alpn=h2` must get a valid record; a *duplicate* key is two values
+  with no rule for choosing, so it is an error rather than something to quietly
+  drop (§4).
+- **The writer never fails.** A value that does not fit its key's shape — an
+  `ipv4hint` off the wire whose length is not a multiple of four — is written
+  `keyNNNNN`, which says the same octets and reads back the same. Sinking the
+  whole record to `\#` would also be correct but loses the parameters that were
+  fine, and a `None` return would put a "cannot write this" case into every
+  caller for a record we can always write.
+- **AliasMode with SvcParams is refused, not warned about.** §2.4.2 says
+  recipients "MUST ignore any SvcParams that are present" and a zone parser
+  "MAY emit a warning". A parameter that is ignored is a setting the operator
+  believes is in force and is not, which is §15's rule about
+  `deny_unknown_fields`.
+- **`alpn` with an escaped comma is refused**, with the way out in the error
+  text. Appendix A.1 blesses it — "a value-list parser that splits on `,` and
+  prohibits items containing `\` is sufficient to comply with all requirements
+  in this document" — and §7.1.1 blesses it again, pointing at `key1=\002h2`.
+  The test asserts both halves: that it is refused, and that the way out works.
+
+#### What was *not* done, and why it is not a gap
+
+**§4.1 and §4.2's additional-section prefetching.** An authoritative server
+"SHOULD return A, AAAA, and SVCB records in the Additional section for any
+TargetNames that are in the zone", and a recursive resolver SHOULD chase
+AliasMode itself. Both are latency optimizations, and §4.2 says so outright:
+"whether the recursive resolver is aware of SVCB or not, the normal response
+construction process used for unknown RR types [RFC3597] generates the Answer
+section". Nothing answers wrong without them. Filed here rather than left for
+someone to rediscover; if either is taken up it gets its own number.
+
+#### Verification
+
+- **RFC 9460 Appendix D is a test**, every figure with a wire form — eight
+  vectors, hex compared against the RFC's own bytes.
+- Round-trip through the writer for nine shapes, and Figure 9 from the other
+  side: the same parameters in any presentation order give the same record.
+- Eight refusals, each citing the section that makes it one.
+- **dnspython 2.8.0** parses every record we serve, including
+  `key667="hello\210qoo"` with its decimal escape, and reconstructs the same
+  presentation text. Signed: `dns.dnssec.validate` accepts the apex HTTPS
+  RRSIG, and the NSEC bitmap reads `RRSIG NSEC HTTPS`.
+- **The soak was seeded**, which it had not been for DNAME either: the corpus
+  now carries DNAME, SVCB and HTTPS records, so mutation reaches a 16-bit
+  length field read in a loop — the shape `CLAUDE.md` §2 opens with.
+  1,800,006 mutated cases, debug, no panics.
+- Windows: 597 in `rdns`, 116 in `rdnsd`, 170 in `rdns-core`. Linux
+  (600 and 129 there — `rdnsd/src/control.rs` is Unix-only).
+  Its clippy is newer and caught three
+  `chunks_exact_to_as_chunks` the Windows one did not — fixed with `as_chunks`,
+  which also deleted an `expect` in the IPv6 arm. Clean on both after that,
+  which is why the two columns are worth running.
+
+---
+
 ## Done so far
 
 Newest first. The reasoning, RFC citations and verification for each are in the

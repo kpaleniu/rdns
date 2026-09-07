@@ -28,6 +28,7 @@ each row exists (`CLAUDE.md` §11).
 | 1035 §4.2.1 | 512-octet UDP, TC=1, TCP retry | yes | `to_bytes_within` |
 | 1035 §4.2.2 | 2-octet TCP length prefix | yes, checked — **D-2** fixed 2026-08-03 | `rdns::framed`, one site |
 | 1035 §5 | master file format | partial — no `$GENERATE` | `zone.rs` |
+| 1035 §5.1 | `\X` and `\DDD` escapes | yes, since 2026-09-07 — in TXT and SVCB values. A name still refuses `\` (**D-1**) | `utils::char_string_decode` |
 | 1996 | NOTIFY, both directions | yes — **D-3** and **D-4** both fixed 2026-08-03 | `notify.rs`, `rdnsd` |
 | 1982 | serial arithmetic | yes — `Serial` has no `Ord` | `lib.rs` |
 | 2181 §8 | TTL is unsigned; top bit set reads as 0 | yes, clamped at the boundary once | `Ttl::from_wire` |
@@ -54,7 +55,7 @@ each row exists (`CLAUDE.md` §11).
 | 7858 / 8484 / 9250 | DoT / DoH / DoQ | no | — |
 | 7873 | DNS Cookies | opaque round-trip only | `EDNS_OPTION_COOKIE` |
 | 2931 | SIG(0) | no | — |
-| 9460 | SVCB / HTTPS | opaque only (RFC 3597 path) | — |
+| 9460 | SVCB / HTTPS | **stored, served and readable in a zone file** (2026-09-07): §2.1's presentation format, §2.2's wire format and its ordering rule, §2.4's two modes, §7's six parameter shapes, §8's mandatory list. Appendix D's test vectors are a test. **Not** §4.1/§4.2's additional-section prefetching, which are `SHOULD`s — see the note below | `svcb.rs`, `utils::char_string_decode` |
 
 ## 7.2 DNSSEC
 

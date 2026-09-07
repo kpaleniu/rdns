@@ -31,7 +31,8 @@
 `[owner] [ttl] [class] TYPE rdata...`, with TTL and class each optional and
 order-independent between them. Types readable in presentation form:
 
-A, AAAA, NS, CNAME, DNAME, MX, TXT, PTR, SOA, DNSKEY, DS, RRSIG, NSEC, NSEC3.
+A, AAAA, NS, CNAME, DNAME, MX, TXT, PTR, SOA, SVCB, HTTPS, DNSKEY, DS, RRSIG,
+NSEC, NSEC3.
 
 Anything else MUST be written in RFC 3597 `\#` generic form
 (`parse_generic_rdata`, `zone.rs:789`), or the line is an error. Type mnemonics
@@ -40,6 +41,36 @@ emits that form for types it has no mnemonic for.
 
 TXT `<character-string>`s are split on quotes, not on whitespace, so `"a b" "c"`
 is two strings and not three.
+
+### Escapes
+
+RFC 1035 §5.1's escapes are resolved by the value that needs them
+(`utils::char_string_decode`), not by the tokenizer, which keeps the backslash
+so that `\DDD` still means something by the time a value sees it. `\X` is a
+literal `X`; `\DDD` is one octet and the digit form is exactly three digits.
+
+This reaches TXT and SVCB parameter values. It does **not** reach owner names or
+name-valued RDATA: those refuse a `\` outright (`TODO.md` #13e), so the two
+octets with no faithful spelling in a stored name — `.` and `\` — cannot get in.
+Before the decoder existed the tokenizer ate a backslash inside quotes, so
+`"a\.b"` silently became two labels while the unquoted `a\.b` was refused.
+
+### SVCB and HTTPS
+
+`SvcPriority TargetName [key=value ...]` (RFC 9460 §2.1), with the parameter
+shapes of §7. Written in any order; the wire form is sorted, because §2.2's
+increasing-key rule is a canonical form and carries no information. A repeated
+key is refused — two values with no rule for choosing between them.
+
+The *spelling* picks the value format, not the number: `alpn=h2,h3` is a
+comma-separated list, and `key1="\002h2"` is the same key written opaquely with
+its value as raw octets. §7.1.1 depends on that distinction, since it offers the
+opaque form as the way to write an ALPN id containing `,` or `\` — which this
+parser refuses in the list form, as Appendix A.1 explicitly allows.
+
+The writer never fails: a value that does not fit its key's shape — an
+`ipv4hint` off the wire whose length is not a multiple of four — is written in
+the `keyNNNNN` opaque form, which says the same octets and reads back the same.
 
 ### What the parser refuses
 
@@ -56,7 +87,11 @@ Refusals at load, not warnings:
    occluded (RFC 2136 §7.18) whatever the file says. §2.4's fifth rule, a CNAME
    at a DNAME's owner, is rule 2 above. A DNAME at the *apex*, beside the
    customary SOA and NS, is legal (§2.3) and loads.
-4. Malformed RDATA for a known type, an unsupported type name in non-generic
+4. An AliasMode SVCB or HTTPS record (priority 0) carrying SvcParams.
+   RFC 9460 §2.4.2 says recipients "MUST ignore any SvcParams that are present"
+   and a parser "MAY emit a warning"; refused instead, because a parameter that
+   is ignored is a setting the operator believes is in force and is not.
+5. Malformed RDATA for a known type, an unsupported type name in non-generic
    form, an out-of-range field, an unparseable `$TTL`.
 
 A file that fails any of these produces a `ZoneError` carrying the line number.

@@ -47,6 +47,14 @@ every *measurement* and every caveat needed to trust one; those say
 section is in `docs/CLOSED_WORK.md` under its own number, where the five
 candidates it *dropped* are the half worth reading.
 
+**#35, SVCB and HTTPS (RFC 9460), filed and closed 2026-09-07.** The largest
+remaining entry on #21's not-implemented list, and the one #34's closing note
+named next. Stored and served as opaque RDATA before; readable and writable in a
+zone file now, with RFC 9460 Appendix D's test vectors as a test. It also made
+this tree implement RFC 1035 §5.1's escapes for the first time, which turned up
+a latent defect in name parsing that had nothing to do with SVCB. §4.1/§4.2's
+additional-section prefetching is deliberately not done and the section says why.
+
 **#34, DNAME (RFC 6672), filed and closed 2026-09-06.** Taken because #21's
 not-implemented list named it the only entry there that made this server answer
 *wrong* rather than incomplete. Five commits: the record type, the zone, the
@@ -766,7 +774,6 @@ Scope, not defects. Listed so "is this missing on purpose?" has an answer.
 |---|---|
 | DoT / DoH / DoQ (7858 / 8484 / 9250) | each is a transport, and each drags in a TLS stack — the dependency argument §14 makes about the OTLP exporter applies with more force here |
 | SIG(0) (RFC 2931) | TSIG covers the transaction-authentication case this server actually has. SIG(0) matters for a client that cannot share a secret in advance, which is not a deployment this serves |
-| SVCB / HTTPS (RFC 9460) | round-trips as opaque RDATA per RFC 3597, so it can be *stored and served*; what is missing is parsing and presentation-format writing |
 | DNS Cookies (RFC 7873) | round-trips as an opaque EDNS option. Implementing it properly is a second anti-spoofing mechanism beside the response budget, and the budget is the one that is there |
 | `$GENERATE` | a BIND zone-file extension, not an RFC. Absent because nothing here needed it |
 | white lies / minimally-covering NSEC (RFC 4470) | the denial chain is precomputed at signing time, so a lie would have to be signed online. That is a different signing model, not a feature |
@@ -782,9 +789,12 @@ list has been used for what it was written for: a session with no queue read it,
 found the argument already made, and did that.
 
 Everything else on the list is something absent that announces its own absence,
-which is why none of the rest is marked. The next strongest, on the same
+which is why none of the rest is marked. ~~The next strongest, on the same
 reasoning, is **SVCB/HTTPS**: an operator who writes one in a zone file has to
-hand-encode it in `\#` form, and a mistake there is silent.
+hand-encode it in `\#` form, and a mistake there is silent.~~ **Taken 2026-09-07
+and done — #35.** Twice now this list has been read by a session with no queue
+and used to pick the work, which is what it is for; nothing on it is marked any
+more.
 
 ---
 
@@ -835,6 +845,7 @@ the week; the record is under "How the queue kept going stale" in
 | **31** | where a crate boundary would pay | **done 2026-09-05.** `rdns-transport` holds #30's transport; `rdns-core` holds the wire format, which takes a client from 67 packages to 35. Two crates, not the three the plan drew |
 | **32** | `Shell`, `Served` and the other unnamed bags | **closed 2026-09-05.** The prediction held: naming the five was the extraction, and `ServeContext` landed in the same commit as the pipeline it parameterizes |
 | **33** | a fourth pass: duplication, generics, and where the modules are cut | **closed 2026-09-06**, eight items over two days. 33b was the one defect in a shipped binary — `rdnsc` could not ask an ANY or AXFR query, because the builder took an RTYPE. Five further candidates were dropped and the section says why |
+| **35** | SVCB and HTTPS (RFC 9460) | **filed and closed 2026-09-07**, one commit — the wire format and the presentation format are joined by an exhaustive match, so they could not be split. RFC 9460 Appendix D's eight wire vectors are a test, and Figure 10 caught a real design error: the value format is picked by how the key is *spelled*, not by its number. Brought RFC 1035 §5.1's escapes into the tree for the first time, which found a quoted escape in a name being silently mis-parsed — a defect with nothing to do with SVCB — and retired the `\DDD` limitation that made binary TXT go out in generic form |
 | **34** | DNAME (RFC 6672) | **filed and closed 2026-09-06**, five commits — the record type, the zone, the server algorithm, the resolver, then signing and UPDATE. Taken off #21's not-implemented list, which had named it the only entry there that answered *wrong* rather than incomplete. Two bugs found by the new tests: a `Zone` flag maintained in one of the two places that maintain its siblings (now one `Shortcuts` value), and DNAME missing from UPDATE's singleton list. One test had to be rewritten because it passed with the guard it was named for deleted |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
