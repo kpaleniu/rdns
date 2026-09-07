@@ -16,6 +16,7 @@ pub mod compression;
 pub mod control;
 pub mod dname;
 pub mod error;
+pub mod name;
 mod record_data;
 pub mod response;
 pub mod utils;

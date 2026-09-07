@@ -254,6 +254,50 @@ impl<'a> DName<'a> {
     }
 }
 
+/// The wire octets of a name that carries no pointer.
+///
+/// The uncompressed case is a copy: `encoded` already *is* the wire form, and
+/// [`DName::try_from_bytes`] has walked its labels. Only the length is left to
+/// check, and it is checked here rather than trusted because §2.3.4's limit is
+/// on the assembled name (`CLAUDE.md` §17).
+impl DName<'_> {
+    fn to_wire(&self) -> Result<Vec<u8>, WireError> {
+        debug_assert!(!self.compressed, "a pointer needs the message to resolve");
+        check_name_len(self.encoded.len())?;
+        Ok(self.encoded.to_vec())
+    }
+}
+
+impl UnpackedDName<'_> {
+    /// The resolved labels as wire octets, root terminator included.
+    ///
+    /// [`UnpackedDName::new`] has already held the assembled length to
+    /// §2.3.4's limit, and `unpack_internal` strips the trailing `Root`, which
+    /// is why the terminator is added back here.
+    fn to_wire(&self) -> Result<Vec<u8>, WireError> {
+        let mut out = Vec::with_capacity(MAX_NAME_LEN);
+        for label in &self.labels {
+            match label {
+                Label::String(bytes) => {
+                    // `Label::try_from_bytes` held it to `MAX_LABEL_LEN`, so
+                    // this cast cannot truncate.
+                    out.push(bytes.len() as u8);
+                    out.extend_from_slice(bytes);
+                }
+                Label::Root => break,
+                Label::Pointer(_) => {
+                    return Err(WireError::malformed(
+                        "a domain name",
+                        "an unpacked name may not contain a compression pointer",
+                    ))
+                }
+            }
+        }
+        out.push(0);
+        Ok(out)
+    }
+}
+
 /// One label's text, appended with its separator.
 ///
 /// Shared by the two assemblers so neither can drop a rule the other keeps.
@@ -433,6 +477,19 @@ impl<'a> DNameUnpacker<'a> {
         }
         name.to_presentation()
     }
+
+    /// The same name as uncompressed wire octets, for [`crate::Name`].
+    ///
+    /// The sibling of [`DNameUnpacker::decode`]: same walk, same pointer
+    /// resolution, and it keeps the octets instead of spelling them. Here
+    /// rather than in `name.rs` because resolving a pointer needs the message
+    /// and the depth cap, both of which are this type's.
+    pub(crate) fn decode_wire(&self, name: DName<'a>) -> Result<Vec<u8>, WireError> {
+        if name.compressed {
+            return self.unpack(name)?.to_wire();
+        }
+        name.to_wire()
+    }
 }
 
 pub(crate) trait TryUnpackFromBytes<'a> {
@@ -473,7 +530,7 @@ impl<'a> UnpackedDName<'a> {
 /// from presentation text (`dname_to_bytes`) — reach `encoded` by different
 /// arithmetic, and must agree that it is the encoded length including every
 /// length octet and the root's terminating zero.
-fn check_name_len(encoded: usize) -> Result<(), WireError> {
+pub(crate) fn check_name_len(encoded: usize) -> Result<(), WireError> {
     if encoded > MAX_NAME_LEN {
         return Err(WireError::TooLong {
             what: "a domain name",
@@ -482,6 +539,30 @@ fn check_name_len(encoded: usize) -> Result<(), WireError> {
         });
     }
     Ok(())
+}
+
+/// Read an uncompressed name from the front of `bytes` as wire octets.
+///
+/// The [`crate::Name`] door for stored RDATA and anything else with no message
+/// behind it: a pointer here is malformed rather than something to follow.
+pub(crate) fn name_wire_from_bytes(bytes: &[u8]) -> Result<(Vec<u8>, &[u8]), WireError> {
+    let (name, rest) = DName::try_from_bytes(bytes)?;
+    if name.compressed {
+        return Err(WireError::malformed(
+            "a domain name",
+            "a compression pointer needs the message it points into",
+        ));
+    }
+    Ok((name.to_wire()?, rest))
+}
+
+/// The same, following pointers against the message `unpacker` was built over.
+pub(crate) fn name_wire_from_bytes_in<'a>(
+    bytes: &'a [u8],
+    unpacker: &DNameUnpacker<'a>,
+) -> Result<(Vec<u8>, &'a [u8]), WireError> {
+    let (name, rest) = DName::try_from_bytes(bytes)?;
+    Ok((unpacker.decode_wire(name)?, rest))
 }
 
 pub fn dname_from_bytes<'a>(
