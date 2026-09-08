@@ -13,6 +13,7 @@
 //! ```
 
 use rdns::Class;
+use rdns::Name;
 use rdns::Ttl;
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr};
@@ -42,19 +43,27 @@ mail IN MX  10 mx.example.com.
 mx   IN A   192.0.2.20
 ";
 
+/// A name from a literal, for benchmarks only: `Name` is fallible to build and
+/// a benchmark that writes a bad one should fail loudly at that line. Never
+/// called inside `b.iter` — building a name from text is not what is measured.
+fn nm(text: &str) -> Name {
+    text.parse().expect("a benchmark name parses")
+}
+
 fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
     DnsMessageBuilder::new()
         .with_id(0x1234)
-        .with_query(qname, qtype)
+        .with_query(nm(qname), qtype)
         .with_recursion(false)
         .build()
 }
 
 fn owned(zone: &Zone, name: &str, qtype: Qtype) -> Vec<ResourceRecord> {
-    zone.query(name, qtype)
+    let name = nm(name);
+    zone.query(name.as_ref(), qtype)
         .into_iter()
         .map(|r| ResourceRecord {
-            name: name.to_string(),
+            name: name.clone(),
             class: r.class,
             ttl: r.ttl,
             rdata: r.rdata.clone(),
@@ -77,8 +86,9 @@ fn answer(c: &mut Criterion) {
         b.iter(|| DnsMessage::try_from_bytes(black_box(&wire)).expect("parse"))
     });
 
+    let www = nm("www.example.com.");
     group.bench_function("look up one A record", |b| {
-        b.iter(|| zone.query(black_box("www.example.com."), Qtype::of(record_types::A)))
+        b.iter(|| zone.query(black_box(www.as_ref()), Qtype::of(record_types::A)))
     });
 
     // Into a warm buffer: the UDP workers keep one scratch buffer each for the
@@ -106,7 +116,7 @@ fn answer(c: &mut Criterion) {
     big.authoritive = true;
     for i in 0..60 {
         big.answers.push(ResourceRecord {
-            name: format!("host{i}.example.com."),
+            name: nm(&format!("host{i}.example.com.")),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
@@ -137,7 +147,7 @@ fn answer(c: &mut Criterion) {
     envelope.authoritive = true;
     for i in 0..400 {
         envelope.answers.push(ResourceRecord {
-            name: format!("h{i}.e.com."),
+            name: nm(&format!("h{i}.e.com.")),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
@@ -165,7 +175,11 @@ fn answer(c: &mut Criterion) {
     group.bench_function("one whole answer", |b| {
         b.iter(|| {
             let parsed = DnsMessage::try_from_bytes(black_box(&wire)).expect("parse");
-            let answers = owned(&zone, &parsed.queries[0].qname, Qtype::of(record_types::A));
+            let answers = owned(
+                &zone,
+                &parsed.queries[0].qname.to_string(),
+                Qtype::of(record_types::A),
+            );
             let mut out = parsed.clone();
             out.response = true;
             out.authoritive = true;
@@ -183,10 +197,10 @@ fn answer(c: &mut Criterion) {
 /// The miss is the one to watch: what a random-name flood produces, and what the
 /// linear scan this replaced paid the most for.
 fn zone_index(c: &mut Criterion) {
-    let mut zone = Zone::new("example.com.".to_string());
+    let mut zone = Zone::new(nm("example.com."));
     for i in 0..10_000u32 {
         zone.add_record(ZoneRecord {
-            name: format!("host{i}"),
+            name: nm(&format!("host{i}.example.com.")),
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
@@ -200,21 +214,12 @@ fn zone_index(c: &mut Criterion) {
     }
 
     let mut group = c.benchmark_group("zone");
+    let (hit, miss) = (nm("host9000.example.com."), nm("nothing-here.example.com."));
     group.bench_function("hit in a 10k-record zone", |b| {
-        b.iter(|| {
-            zone.query(
-                black_box("host9000.example.com."),
-                Qtype::of(record_types::A),
-            )
-        })
+        b.iter(|| zone.query(black_box(hit.as_ref()), Qtype::of(record_types::A)))
     });
     group.bench_function("miss in a 10k-record zone", |b| {
-        b.iter(|| {
-            zone.query(
-                black_box("nothing-here.example.com."),
-                Qtype::of(record_types::A),
-            )
-        })
+        b.iter(|| zone.query(black_box(miss.as_ref()), Qtype::of(record_types::A)))
     });
     group.finish();
 }
@@ -250,7 +255,7 @@ fn shared_state(c: &mut Criterion) {
     // report the median instead of the cost.
     let cache = DnsCache::new(20_000);
     let record = |name: &str| ResourceRecord {
-        name: name.to_string(),
+        name: nm(name),
         class: Class::new(1),
         ttl: Ttl::from_secs(300),
         rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1)))
@@ -349,7 +354,8 @@ fn dnssec(c: &mut Criterion) {
         .into_iter()
         .map(|r| r.rdata)
         .collect();
-    let rrset = Rrset::new("example.com.", record_types::DNSKEY, Class::new(1), &rdatas);
+    let apex = nm("example.com.");
+    let rrset = Rrset::new(apex.as_ref(), record_types::DNSKEY, Class::new(1), &rdatas);
     let now = current_unix_timestamp();
 
     let mut group = c.benchmark_group("dnssec");
@@ -359,7 +365,7 @@ fn dnssec(c: &mut Criterion) {
                 black_box(&rrset),
                 &rrsigs,
                 &dnskeys,
-                "example.com.",
+                apex.as_ref(),
                 black_box(now),
             )
         })
@@ -384,7 +390,8 @@ fn dnssec(c: &mut Criterion) {
             Qtype::of(record_types::RRSIG),
         ));
         let rdatas: Vec<_> = records.into_iter().map(|r| r.rdata).collect();
-        let rrset = Rrset::new("many.example.com.", record_types::A, Class::new(1), &rdatas);
+        let owner = nm("many.example.com.");
+        let rrset = Rrset::new(owner.as_ref(), record_types::A, Class::new(1), &rdatas);
 
         let plural = if count == 1 { "record" } else { "records" };
         group.bench_function(format!("verify an RRset of {count} {plural}"), |b| {
@@ -393,7 +400,7 @@ fn dnssec(c: &mut Criterion) {
                     black_box(&rrset),
                     &rrsigs,
                     &dnskeys,
-                    "example.com.",
+                    apex.as_ref(),
                     black_box(now),
                 )
             })

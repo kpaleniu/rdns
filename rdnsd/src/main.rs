@@ -49,6 +49,7 @@ use rdns::{
     zone::{parse_zone_file_at, Zone},
     DnsMessage, Edns, OpCode, Qtype, ResourceRecord, ResponseCode, Serial,
 };
+use rdns::{Name, NameRef};
 use rdns_transport::tcp::{self, send_framed, Reply};
 use rdns_transport::{ServeContext, Transport, TransportLimits};
 
@@ -878,10 +879,10 @@ impl Server {
         //
         // REFUSED, not NOTAUTH: the peer proved who it is and the answer is no,
         // which is policy rather than a claim about the zone's authority.
-        let apex = absolute_name(&qname);
+        let apex = &qname;
         let unauthorized = session
             .as_ref()
-            .filter(|s| !s.may_transfer(&apex))
+            .filter(|s| !s.may_transfer(&apex.as_ref().to_presentation()))
             .map(|s| s.key_name().to_string());
         if let Some(key_name) = unauthorized {
             serving_error!(
@@ -917,7 +918,7 @@ impl Server {
         // which reloads replace rather than mutate.
         let (zone, prepared) = {
             let zones = self.zone_map.read().await;
-            let Some(zone) = zones.snapshot(&apex) else {
+            let Some(zone) = zones.snapshot(apex.as_ref()) else {
                 tracing::info!(peer = %ip, "{kind} of {qname}: NOTAUTH (not a zone served here)");
                 self.send_transfer_error(msg, ResponseCode::NotAuthorized, ip, session, out)
                     .await;
@@ -1151,7 +1152,7 @@ impl Server {
                 return self.update_reply(msg, rejected.rcode, ip, session);
             }
         };
-        let zone_name = absolute_name(&request.zone).into_owned();
+        let zone_name = request.zone.clone();
 
         // §3.3: no permission, REFUSED. An unsigned UPDATE is refused outright,
         // with no address-based alternative: a write is not handed out on a
@@ -1165,7 +1166,7 @@ impl Server {
             );
             return self.update_reply(msg, ResponseCode::Refused, ip, None);
         };
-        if !session.may_update(&zone_name) {
+        if !session.may_update(&zone_name.as_ref().to_presentation()) {
             serving_error!(
                 self.ctx.logger,
                 ip,
@@ -1183,7 +1184,7 @@ impl Server {
         // it" and the copy the signer works against must be the same version.
         let previous = {
             let zones = self.zone_map.read().await;
-            zones.matching(&zone_name).cloned()
+            zones.matching(zone_name.as_ref()).cloned()
         };
         let Some(previous) = previous else {
             tracing::info!(peer = %ip, "UPDATE of {zone_name}: NOTAUTH (not a zone served here)");
@@ -1196,7 +1197,7 @@ impl Server {
         // with, so the two cannot disagree.
         if self
             .secondaries
-            .contains_key(rdns::utils::absolute_lowered(&zone_name).as_ref())
+            .contains_key(zone_name.as_ref().folded().as_ref() as &[u8])
         {
             serving_error!(
                 self.ctx.logger,
@@ -1218,7 +1219,7 @@ impl Server {
             );
             return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
         };
-        let Some(path) = source.file_for(&zone_name) else {
+        let Some(path) = source.file_for(&zone_name.as_ref().to_presentation()) else {
             serving_error!(
                 self.ctx.logger,
                 ip,
@@ -1241,7 +1242,7 @@ impl Server {
         let applied = tokio::task::spawn_blocking(move || {
             apply_update_to_file(
                 &path,
-                &origin,
+                &origin.as_ref().to_presentation(),
                 &previous,
                 &prerequisites,
                 &changes,
@@ -1454,12 +1455,12 @@ fn notify_reply(
     peer: SocketAddr,
 ) -> DnsMessage {
     let zone = notify::notified_zone(msg).unwrap_or_default();
-    // `absolute_lowered`, not `to_lowercase()`: the fold is ASCII-only
-    // (RFC 4343), and `str::to_lowercase` folds U+212A KELVIN SIGN onto `k`,
-    // merging two names that differ on the wire.
-    let key = rdns::utils::absolute_lowered(&zone);
+    // Folded octets, which is what the registry is keyed on. The fold is
+    // ASCII-only (RFC 4343) and `Name` does it; `str::to_lowercase` would fold
+    // U+212A KELVIN SIGN onto `k` and merge two names that differ on the wire.
+    let key = zone.as_ref().folded();
 
-    if let Some(replicated) = secondaries.get(key.as_ref()) {
+    if let Some(replicated) = secondaries.get(key.as_ref() as &[u8]) {
         if replicated.masters.contains(&peer.ip()) {
             // `notify_one` leaves a permit for a task that is mid-transfer, so a
             // NOTIFY arriving at a busy moment is not lost.
@@ -1852,10 +1853,10 @@ async fn reload_once(
     source: &ZoneSource,
     served: &ZoneContext,
     notify_targets: &[SocketAddr],
-    announced: Vec<(String, Serial)>,
+    announced: Vec<(Name, Serial)>,
     busy: &Busy,
     trigger: ReloadTrigger,
-) -> Vec<(String, Serial)> {
+) -> Vec<(Name, Serial)> {
     let why = trigger.why();
     let (announced, outcome) = match reloading.load(source).await {
         Ok(new_zones) => {
@@ -1915,7 +1916,7 @@ fn spawn_zone_maintenance(
     served: ZoneContext,
     source: ZoneSource,
     notify_targets: Vec<SocketAddr>,
-    announced: Vec<(String, Serial)>,
+    announced: Vec<(Name, Serial)>,
     reloading: Reloading,
     lifecycle: Lifecycle,
 ) -> mpsc::Sender<ReloadTrigger> {
@@ -2079,10 +2080,10 @@ fn parse_notify_targets(specs: &[String]) -> Result<Vec<SocketAddr>> {
 /// ignore it, so sending would be noise.
 async fn announce_zones(
     zone_map: &Arc<RwLock<Zones>>,
-    announced: &[(String, Serial)],
+    announced: &[(Name, Serial)],
     targets: &[SocketAddr],
     busy: &Busy,
-) -> Vec<(String, Serial)> {
+) -> Vec<(Name, Serial)> {
     let (current, pending) = {
         let zones = zone_map.read().await;
         let all: Vec<&Zone> = zones.values().map(Arc::as_ref).collect();
@@ -2091,11 +2092,11 @@ async fn announce_zones(
         // Build the messages under the lock, send them outside it: a NOTIFY that
         // goes unanswered takes seconds to retry, and holding the zone map that
         // long would block a reload behind the network.
-        let pending: Vec<(String, Serial, Option<rdns::ResourceRecord>)> = changed
+        let pending: Vec<(Name, Serial, Option<rdns::ResourceRecord>)> = changed
             .iter()
             .filter_map(|(name, serial)| {
                 zones
-                    .get(name.as_str())
+                    .get(name.as_ref().folded().as_ref() as &[u8])
                     .map(|zone| (name.clone(), *serial, zone.apex_soa_record()))
             })
             .collect();
@@ -2116,7 +2117,7 @@ async fn announce_zones(
             let busy = busy.clone();
             tokio::spawn(async move {
                 let _busy = busy;
-                send_notify(&zone, serial, soa, target).await;
+                send_notify(zone.as_ref(), serial, soa, target).await;
             });
         }
     }
@@ -2136,21 +2137,21 @@ async fn announce_zones(
 /// are: an unanswered NOTIFY takes seconds to give up on, and a refresh should
 /// not be held behind the network to tell somebody about work it has finished.
 fn announce_transfer(
-    zone: &str,
+    zone: NameRef<'_>,
     serial: Serial,
     soa: Option<ResourceRecord>,
     targets: &[SocketAddr],
     busy: &Busy,
 ) {
     for target in targets {
-        let (zone, soa, target) = (zone.to_string(), soa.clone(), *target);
+        let (zone, soa, target) = (zone.to_owned(), soa.clone(), *target);
         // Accounted for by the drain, like the primary's announcements: a NOTIFY
         // dropped at shutdown costs the level below us a whole REFRESH before it
         // learns of a change that has already reached us.
         let busy = busy.clone();
         tokio::spawn(async move {
             let _busy = busy;
-            send_notify(&zone, serial, soa, target).await;
+            send_notify(zone.as_ref(), serial, soa, target).await;
         });
     }
 }
@@ -2162,7 +2163,7 @@ fn announce_transfer(
 /// after [`notify::NOTIFY_ATTEMPTS`] is safe because the secondary's refresh timer
 /// is the backstop this is an optimisation over.
 async fn send_notify(
-    zone: &str,
+    zone: NameRef<'_>,
     serial: Serial,
     soa: Option<rdns::ResourceRecord>,
     target: SocketAddr,
@@ -2432,8 +2433,8 @@ async fn main() -> Result<()> {
             Readiness::waiting_for(
                 secondary_specs
                     .iter()
-                    .filter(|spec| zones.matching(&spec.zone).is_none())
-                    .map(|spec| spec.zone.as_str()),
+                    .filter(|spec| zones.matching(spec.zone.as_ref()).is_none())
+                    .map(|spec| spec.zone.as_ref().to_presentation()),
             )
         };
 
@@ -2461,7 +2462,7 @@ async fn main() -> Result<()> {
     // inferring it from an absent last-contact time, which a primary also has.
     let replicated: Vec<String> = reload_secondaries
         .iter()
-        .map(|spec| spec.zone.clone())
+        .map(|spec| spec.zone.as_ref().to_presentation())
         .collect();
 
     // What a dynamic UPDATE needs, taken before `source` and `signing` are moved
@@ -2606,7 +2607,7 @@ fn generate_keys(zone: &str, dir: &Path, algorithm: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::replication::{expire_if_out_of_contact, refresh_once, ReplicatedZone};
-    use crate::testutil::{make_response, query};
+    use crate::testutil::{make_response, nm, query, zkey};
     use crate::zones::{enumerate_zone_files, plan_reload, zone_key};
     use rdns::secondary::{zone_file_path, RefreshTimers, TransferState};
     use rdns::tsig::{TsigAlgorithm, TsigKey};
@@ -2821,7 +2822,7 @@ mod tests {
         ])
         .expect("parse");
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].zone, "example.com.");
+        assert_eq!(specs[0].zone, nm("example.com."));
 
         let err = parse_secondary_specs(&["nonsense".to_string()])
             .unwrap_err()
@@ -3286,7 +3287,7 @@ mod tests {
             let scoped = key(&["other.test."]);
             let master = primary_with(scoped.clone()).await;
 
-            let err = rdns::xfr::fetch_zone(master, "example.com.", Some(&scoped))
+            let err = rdns::xfr::fetch_zone(master, nm("example.com.").as_ref(), Some(&scoped))
                 .await
                 .expect_err("a key scoped to other.test. must not transfer example.com.");
             // REFUSED, and reported as a refusal rather than as a bad signature:
@@ -3303,7 +3304,7 @@ mod tests {
             let scoped = key(&["example.com."]);
             let master = primary_with(scoped.clone()).await;
 
-            let zone = rdns::xfr::fetch_zone(master, "example.com.", Some(&scoped))
+            let zone = rdns::xfr::fetch_zone(master, nm("example.com.").as_ref(), Some(&scoped))
                 .await
                 .expect("a key naming this zone must transfer it");
             assert_eq!(zone.serial(), Some(Serial::new(1)));
@@ -3318,7 +3319,7 @@ mod tests {
             let scoped = key(&["EXAMPLE.com"]);
             let master = primary_with(scoped.clone()).await;
 
-            let zone = rdns::xfr::fetch_zone(master, "example.com.", Some(&scoped))
+            let zone = rdns::xfr::fetch_zone(master, nm("example.com.").as_ref(), Some(&scoped))
                 .await
                 .expect("case and the trailing dot must not decide authorization");
             assert_eq!(zone.serial(), Some(Serial::new(1)));
@@ -3333,7 +3334,7 @@ mod tests {
             let unscoped = key(&[]);
             let master = primary_with(unscoped.clone()).await;
 
-            let zone = rdns::xfr::fetch_zone(master, "example.com.", Some(&unscoped))
+            let zone = rdns::xfr::fetch_zone(master, nm("example.com.").as_ref(), Some(&unscoped))
                 .await
                 .expect("an unscoped key is unrestricted, as it always was");
             assert_eq!(zone.serial(), Some(Serial::new(1)));
@@ -3486,7 +3487,7 @@ mod tests {
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![rdns::QuerySection {
-                qname: zone.to_string(),
+                qname: nm(zone),
                 qtype: Qtype::of(record_types::SOA),
                 qclass: QueryClass::IN,
             }],
@@ -3499,7 +3500,7 @@ mod tests {
 
     fn a_record(name: &str, addr: &str) -> ResourceRecord {
         ResourceRecord {
-            name: name.to_string(),
+            name: nm(name),
             class: rdns::Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
@@ -3581,7 +3582,7 @@ mod tests {
         let reloaded = rdns::zone::parse_zone_file(&written, "example.com.").expect("reparses");
         assert_eq!(
             reloaded
-                .query("new.example.com.", Qtype::of(record_types::A))
+                .query(nm("new.example.com.").as_ref(), Qtype::of(record_types::A))
                 .len(),
             1
         );
@@ -3718,23 +3719,23 @@ mod tests {
 
         // A new process would see exactly this: the file, and nothing in memory.
         let restored = journal
-            .load("example.com.")
+            .load(nm("example.com.").as_ref())
             .expect("the journal reads back");
         assert_eq!(restored.len(), 2, "one step per update");
         assert_eq!(restored[0].from_serial, Serial::new(1), "the zone's serial");
         assert_eq!(restored[1].to_serial, Serial::new(3), "after two bumps");
 
         let mut log = DeltaLog::new();
-        log.restore("example.com.", restored);
+        log.restore(nm("example.com.").as_ref(), restored);
         let chain = log
-            .chain_from("example.com.", Serial::new(1))
+            .chain_from(nm("example.com.").as_ref(), Serial::new(1))
             .expect("a secondary at the pre-update serial can still be caught up");
         assert_eq!(chain.len(), 2);
         assert!(
             chain
                 .iter()
                 .flat_map(|d| d.added.iter())
-                .any(|r| r.name == "host1.example.com."),
+                .any(|r| r.name == nm("host1.example.com.")),
             "and the records it was missing are in it"
         );
     }
@@ -3755,7 +3756,7 @@ mod tests {
         // §2.4.3 CLASS=NONE: "no RRset of this type exists at this name" — and
         // `www` has an A, so it does not hold.
         message.answers = vec![ResourceRecord {
-            name: "www.example.com.".to_string(),
+            name: nm("www.example.com."),
             class: rdns::Class::new(254),
             ttl: Ttl::ZERO,
             rdata: rdns::RecordData::new(record_types::A, Vec::new()).expect("bare"),
@@ -3833,7 +3834,7 @@ mod tests {
         let dir = ScratchDir::new("fetch");
         let master = spawn_primary(&zone_text(7)).await;
         let spec = MasterSpec {
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             master,
             key_name: None,
         };
@@ -3846,10 +3847,12 @@ mod tests {
 
         // Served from memory...
         let zones = r.served.zone_map.read().await;
-        let held = zones.get("example.com.").expect("the zone is now served");
+        let held = zones
+            .get(nm("example.com.").as_ref().folded().as_ref())
+            .expect("the zone is now served");
         assert_eq!(held.serial(), Some(Serial::new(7)));
         assert_eq!(
-            held.query("www.example.com.", Qtype::of(record_types::A))
+            held.query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A))
                 .len(),
             1
         );
@@ -3894,7 +3897,7 @@ mod tests {
         let dir = ScratchDir::new("unchanged");
         let master = spawn_primary(&zone_text(7)).await;
         let spec = MasterSpec {
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             master,
             key_name: None,
         };
@@ -3913,7 +3916,7 @@ mod tests {
                 .zone_map
                 .read()
                 .await
-                .get("example.com.")
+                .get(zkey("example.com.").as_slice())
                 .unwrap()
                 .serial(),
             Some(Serial::new(7))
@@ -3931,7 +3934,7 @@ mod tests {
         let old = spawn_primary(&zone_text(7)).await;
         refresh_once(
             &MasterSpec {
-                zone: spec_zone.clone(),
+                zone: nm(&spec_zone.clone()),
                 master: old,
                 key_name: None,
             },
@@ -3953,7 +3956,7 @@ mod tests {
         .await;
         let outcome = refresh_once(
             &MasterSpec {
-                zone: spec_zone,
+                zone: nm(&spec_zone),
                 master: new,
                 key_name: None,
             },
@@ -3966,10 +3969,10 @@ mod tests {
 
         assert!(outcome.contains("serial 7 -> 8"), "got: {outcome}");
         let zones = r.served.zone_map.read().await;
-        let held = zones.get("example.com.").unwrap();
+        let held = zones.get(zkey("example.com.").as_slice()).unwrap();
         assert_eq!(held.serial(), Some(Serial::new(8)));
         assert!(
-            held.query("www.example.com.", Qtype::of(record_types::A))
+            held.query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A))
                 .is_empty(),
             "a record the new zone does not have must be gone, not merged"
         );
@@ -3984,7 +3987,7 @@ mod tests {
             .parse()
             .expect("an address nothing answers on");
         let spec = MasterSpec {
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             master,
             key_name: None,
         };
@@ -4037,7 +4040,7 @@ mod tests {
         let dir = ScratchDir::new("still-good");
         let master = "127.0.0.1:1".parse().unwrap();
         let spec = MasterSpec {
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             master,
             key_name: None,
         };
@@ -4097,7 +4100,7 @@ mod tests {
         // Start from version 7, fetched in full because we hold nothing yet.
         let first = spawn_primary(&old_text).await;
         let spec = |master| MasterSpec {
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             master,
             key_name: None,
         };
@@ -4116,15 +4119,20 @@ mod tests {
         );
 
         let zones = r.served.zone_map.read().await;
-        let held = zones.get("example.com.").expect("still served");
+        let held = zones
+            .get(zkey("example.com.").as_slice())
+            .expect("still served");
         assert_eq!(held.serial(), Some(Serial::new(8)));
         assert_eq!(
-            held.query("extra.example.com.", Qtype::of(record_types::TXT))
-                .len(),
+            held.query(
+                nm("extra.example.com.").as_ref(),
+                Qtype::of(record_types::TXT)
+            )
+            .len(),
             1
         );
         assert!(
-            held.query("www.example.com.", Qtype::of(record_types::A))
+            held.query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A))
                 .iter()
                 .all(|r| r
                     .rdata
@@ -4144,7 +4152,7 @@ mod tests {
                 .iter()
                 .map(|r| {
                     (
-                        z.normalize_name(&r.name).to_lowercase(),
+                        r.name.as_ref().to_folded().to_string(),
                         r.ttl,
                         r.rdata.clone(),
                     )
@@ -4178,7 +4186,7 @@ mod tests {
 
         let r = replication(&dir, vec![target]);
         let spec = MasterSpec {
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             master,
             key_name: None,
         };
@@ -4198,8 +4206,8 @@ mod tests {
         assert_eq!(msg.opcode, OpCode::Notify, "a NOTIFY, not a query");
         assert!(!msg.response);
         assert_eq!(
-            notify::notified_zone(&msg).as_deref(),
-            Some("example.com."),
+            notify::notified_zone(&msg),
+            Some(nm("example.com.")),
             "for the zone that moved"
         );
         assert_eq!(
@@ -4222,7 +4230,7 @@ mod tests {
 
         let r = replication(&dir, vec![target]);
         let spec = MasterSpec {
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             master,
             key_name: None,
         };
@@ -4258,7 +4266,7 @@ mod tests {
         let dir = ScratchDir::new("ixfr-out");
         let r = replication(&dir, Vec::new());
         let spec = |master| MasterSpec {
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             master,
             key_name: None,
         };
@@ -4268,7 +4276,11 @@ mod tests {
             .await
             .expect("first transfer");
         assert_eq!(
-            r.served.deltas.read().await.len("example.com."),
+            r.served
+                .deltas
+                .read()
+                .await
+                .len(nm("example.com.").as_ref()),
             0,
             "a first fetch has no previous version to differ from"
         );
@@ -4286,9 +4298,13 @@ mod tests {
             .expect("second transfer");
 
         let log = r.served.deltas.read().await;
-        assert_eq!(log.len("example.com."), 1, "the change was recorded");
+        assert_eq!(
+            log.len(nm("example.com.").as_ref()),
+            1,
+            "the change was recorded"
+        );
         let chain = log
-            .chain_from("example.com.", Serial::new(7))
+            .chain_from(nm("example.com.").as_ref(), Serial::new(7))
             .expect("a chain from 7");
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].to_serial, Serial::new(8));
@@ -4334,8 +4350,16 @@ mod tests {
         install_all_zones(&served(&zone_map, &deltas), reloaded).await;
 
         let log = deltas.read().await;
-        assert_eq!(log.len("example.com."), 1, "the reload is a version step");
-        assert_eq!(log.len("other.test."), 0, "a zone we no longer serve");
+        assert_eq!(
+            log.len(nm("example.com.").as_ref()),
+            1,
+            "the reload is a version step"
+        );
+        assert_eq!(
+            log.len(nm("other.test.").as_ref()),
+            0,
+            "a zone we no longer serve"
+        );
         assert_eq!(zone_map.read().await.len(), 1);
     }
 
@@ -4457,7 +4481,7 @@ mod tests {
             reload.await.expect("the reload finished");
 
             assert_eq!(
-                deltas.read().await.len("example.com."),
+                deltas.read().await.len(nm("example.com.").as_ref()),
                 1,
                 "the version step is recorded whether or not this attempt saw \
                  anything"
@@ -4498,7 +4522,7 @@ mod tests {
     async fn test_an_ixfr_is_refused_by_the_same_default_that_refuses_an_axfr() {
         let master = spawn_primary_with_acl(&zone_text(7), &[]).await;
         let spec = MasterSpec {
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             master,
             key_name: None,
         };
@@ -4513,7 +4537,7 @@ mod tests {
 
         // And so is an IXFR, over the same connection path.
         let request = {
-            let mut msg = rdns::xfr::axfr_request("example.com.", 0x33);
+            let mut msg = rdns::xfr::axfr_request(nm("example.com.").as_ref(), 0x33);
             msg.queries[0].qtype = Qtype::of(record_types::IXFR);
             msg
         };
@@ -4597,7 +4621,7 @@ mod tests {
             let zones = load_zones_from_source(&source, false, true)
                 .expect("the flag is an explicit choice to serve a partial set");
             assert_eq!(zones.len(), 1);
-            assert!(zones.contains_key("example.com."));
+            assert!(zones.contains_key(zkey("example.com.").as_slice()));
         }
 
         /// A secondary's first start has nothing on disk yet, and refusing to run
@@ -4646,7 +4670,7 @@ mod tests {
             let mut zones = HashMap::new();
             zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
             let specs = vec![MasterSpec {
-                zone: "example.com.".to_string(),
+                zone: nm("example.com."),
                 master: "192.0.2.1:53".parse().unwrap(),
                 key_name: None,
             }];
@@ -4918,7 +4942,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let mut registry = HashMap::new();
         registry.insert(
-            "replicated.test.".to_string(),
+            nm("replicated.test.").as_ref().folded().into_owned(),
             ReplicatedZone {
                 masters: vec!["192.0.2.1".parse().unwrap()],
                 wake: vec![wake.clone()],
@@ -4932,7 +4956,7 @@ mod tests {
         zones.insert(zone_key(&primary_zone), std::sync::Arc::new(primary_zone));
 
         let from = |zone: &str, ip: &str| {
-            let msg = notify::notify_request(zone, None, 1);
+            let msg = notify::notify_request(nm(zone).as_ref(), None, 1);
             let peer: SocketAddr = format!("{ip}:5353").parse().unwrap();
             notify_reply(&msg, &zones, &secondaries, peer).rcode
         };
@@ -5015,10 +5039,10 @@ deep.a.b IN TXT "down here"
         }
 
         fn keys_of(zones: &Zones) -> Vec<Dnskey> {
-            let zone = &zones["example.com."];
+            let zone = &zones[zkey("example.com.").as_slice()];
             dnskeys_in(
                 &zone
-                    .query("example.com.", Qtype::of(record_types::DNSKEY))
+                    .query(nm("example.com.").as_ref(), Qtype::of(record_types::DNSKEY))
                     .into_iter()
                     .map(|r| ResourceRecord {
                         name: r.name.clone(),
@@ -5108,10 +5132,10 @@ ns.plain  IN A   192.0.2.30
                 assert_eq!(rdatas.len(), 1, "nsec3={nsec3}: no wildcard answer");
 
                 let proof = verify_rrset(
-                    &Rrset::new(qname, record_types::A, Class::new(1), &rdatas),
+                    &Rrset::new(nm(qname).as_ref(), record_types::A, Class::new(1), &rdatas),
                     &rrsigs_in(&response.answers),
                     &keys_of(&zones),
-                    "example.com.",
+                    nm("example.com.").as_ref(),
                     current_unix_timestamp(),
                 );
                 let RrsetProof::Verified {
@@ -5193,10 +5217,10 @@ ns.plain  IN A   192.0.2.30
                         .map(|r| r.rdata.clone())
                         .collect();
                     let proof = verify_rrset(
-                        &Rrset::new("example.com.", rtype, Class::new(1), &rdatas),
+                        &Rrset::new(nm("example.com.").as_ref(), rtype, Class::new(1), &rdatas),
                         &signatures,
                         &keys,
-                        "example.com.",
+                        nm("example.com.").as_ref(),
                         current_unix_timestamp(),
                     );
                     assert!(
@@ -5265,10 +5289,15 @@ ns.plain  IN A   192.0.2.30
 
                 let sigs = rrsigs_in(&response.authorities);
                 let proof = verify_rrset(
-                    &Rrset::new("secure.example.com.", record_types::DS, Class::new(1), &ds),
+                    &Rrset::new(
+                        nm("secure.example.com.").as_ref(),
+                        record_types::DS,
+                        Class::new(1),
+                        &ds,
+                    ),
                     &sigs,
                     &keys_of(&zones),
-                    "example.com.",
+                    nm("example.com.").as_ref(),
                     current_unix_timestamp(),
                 );
                 assert!(
@@ -5335,10 +5364,15 @@ ns.plain  IN A   192.0.2.30
                 .map(|r| r.rdata.clone())
                 .collect();
             let proof = verify_rrset(
-                &Rrset::new("www.example.com.", record_types::A, Class::new(1), &rdatas),
+                &Rrset::new(
+                    nm("www.example.com.").as_ref(),
+                    record_types::A,
+                    Class::new(1),
+                    &rdatas,
+                ),
                 &rrsigs_in(&response.answers),
                 &keys_of(&zones),
-                "example.com.",
+                nm("example.com.").as_ref(),
                 current_unix_timestamp(),
             );
             assert!(matches!(proof, RrsetProof::Verified { .. }), "{proof:?}");
@@ -5494,11 +5528,14 @@ ns.plain  IN A   192.0.2.30
             // that no longer says what the signature says it says.
             let (mut zones, _keys) = signed_server(false);
             let edited = {
-                let zone = zones.matching("example.com.").expect("the signed zone");
-                let mut edited = Zone::new(zone.origin().to_string());
+                let zone = zones
+                    .matching(nm("example.com.").as_ref())
+                    .expect("the signed zone");
+                let mut edited = Zone::new(nm(&zone.origin().to_string()));
                 for record in zone.records() {
                     let mut record = record.clone();
-                    if record.name == "www.example.com." && record.rdata.rtype() == record_types::A
+                    if record.name == nm("www.example.com.")
+                        && record.rdata.rtype() == record_types::A
                     {
                         record.rdata = RecordData::from_parsed(&rdns::ParsedRecord::A(
                             "198.51.100.9".parse().unwrap(),

@@ -161,7 +161,9 @@ impl RecordData {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::name::nm;
     use crate::utils::record_types as rt;
 
     /// A TYPE that says A, and bytes that are not an address. Cannot be a
@@ -203,8 +205,8 @@ mod tests {
             ("a.b.c.d.e.f.example.com.", "hostmaster.example.com."),
         ] {
             let soa = RecordData::from_parsed(&ParsedRecord::SOA {
-                mname: mname.to_string(),
-                rname: rname.to_string(),
+                mname: nm(mname),
+                rname: nm(rname),
                 serial: Serial::new(0x0102_0304),
                 refresh: 3600,
                 retry: 600,
@@ -239,7 +241,7 @@ mod tests {
                 inception: 1_700_000_000,
                 expiration: 1_702_592_000,
                 key_tag: 0x1234,
-                signer_name: "example.com.".to_string(),
+                signer_name: nm("example.com."),
                 signature: vec![0xab; 64],
             })
             .expect("encode");

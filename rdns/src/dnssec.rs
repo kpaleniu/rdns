@@ -11,13 +11,12 @@
 //! original TTL rather than the received one, embedded names down-cased for the
 //! RFC 4034 §6.2 types, RRs sorted by canonical RDATA, duplicates dropped.
 
-use crate::dname::dname_to_bytes;
 use crate::error::WireError;
 use crate::error::{DnssecError, DnssecResult};
 use crate::utils::{current_unix_timestamp, record_types as rt};
 use crate::Class;
 use crate::Rtype;
-use crate::{ParsedRecord, RecordData, ResourceRecord};
+use crate::{Name, NameRef, ParsedRecord, RecordData, ResourceRecord};
 use ring::signature;
 
 /// DNSKEY flags bit 7 (0x0100): a zone key, which may sign RRsets in its own
@@ -96,7 +95,7 @@ impl Dnskey {
                 algorithm,
                 public_key,
             } => Some(Dnskey {
-                owner: canonical_name(&rr.name),
+                owner: canonical_name_of(rr.name.as_ref()),
                 flags,
                 protocol,
                 algorithm,
@@ -166,7 +165,7 @@ impl Rrsig {
                 signer_name,
                 signature,
             } => Some(Rrsig {
-                owner: canonical_name(&rr.name),
+                owner: canonical_name_of(rr.name.as_ref()),
                 type_covered,
                 algorithm,
                 labels,
@@ -174,7 +173,7 @@ impl Rrsig {
                 inception,
                 expiration,
                 key_tag,
-                signer_name: canonical_name(&signer_name),
+                signer_name: canonical_name_of(signer_name.as_ref()),
                 signature,
             }),
             _ => None,
@@ -227,7 +226,7 @@ impl Ds {
                 digest_type,
                 digest,
             } => Some(Ds {
-                owner: canonical_name(&rr.name),
+                owner: canonical_name_of(rr.name.as_ref()),
                 key_tag,
                 algorithm,
                 digest_type,
@@ -267,6 +266,29 @@ pub fn ds_in(records: &[ResourceRecord]) -> Vec<Ds> {
 
 // Canonical form (RFC 4034 §6)
 
+/// A [`Name`]'s canonical form, as the text the rest of this module keeps.
+///
+/// The boundary between a record's name and DNSSEC's own bookkeeping. This
+/// module canonicalizes to *presentation text* and derives wire form from it
+/// when signing; that is what produces the octets a signature is computed over,
+/// so it is left exactly as it was when names became wire form. Converting here
+/// keeps the signed bytes identical — which is the property a name refactor
+/// must not quietly change (`TODO.md` #13e).
+pub fn canonical_name_of(name: NameRef<'_>) -> String {
+    canonical_name(&name.to_presentation())
+}
+
+/// A name held here as canonical text, back as the octets a digest covers.
+///
+/// Through [`Name`], not `dname_to_bytes`: RFC 1035 §5.1 lets a label contain a
+/// `.` and `dname_to_bytes` refuses the escape that spells one, so a zone whose
+/// apex needed one could not be signed and its DS could not be digested. The
+/// three structs here keep text owners on purpose — that text is what
+/// [`canonical_name_of`] produces — and this is the one door back.
+fn canonical_wire(name: &str) -> DnssecResult<Name> {
+    Ok(Name::from_presentation(name)?.as_ref().to_folded())
+}
+
 /// Absolute, lowercased form. DNS names compare case-insensitively (RFC 4343)
 /// and canonical DNSSEC form is down-cased (RFC 4034 §6.2).
 pub fn canonical_name(name: &str) -> String {
@@ -296,6 +318,11 @@ pub fn suffix_labels(name: &str, labels: usize) -> String {
 /// Normally the RRset's own name. When the RRSIG's label count is smaller, the
 /// records were synthesized from a wildcard, and what was signed is that
 /// wildcard — `*.example.com.` — not the expanded name the client asked for.
+///
+/// [`signed_owner_name`] is this rule over a [`Name`], and is the one the digest
+/// uses. This spelling stays because [`Rrsig`] keeps its owner as canonical
+/// text — see [`canonical_wire`] for why — and reporting *which* wildcard
+/// answered is a text answer.
 pub fn signed_owner(owner: &str, rrsig_labels: u8) -> String {
     let owner = canonical_name(owner);
     let have = label_count(&owner);
@@ -307,21 +334,29 @@ pub fn signed_owner(owner: &str, rrsig_labels: u8) -> String {
     }
 }
 
-/// The label count an RRSIG over `owner` must carry (RFC 4034 §3.1.3).
+/// [`signed_owner`] as wire octets, which is what actually goes into the digest.
 ///
-/// The root and a leading `*` are not counted. Not counting the `*` is the whole
-/// of wildcard signing: a validator reconstructs the signed owner from this
-/// number, so one signature verifies at every name the wildcard expands to.
-/// [`signed_owner`] is the same rule read backwards.
-pub fn rrsig_labels(owner: &str) -> u8 {
-    let labels = label_count(owner);
-    let counted = if owner.starts_with("*.") {
+/// Not the text form re-encoded: RFC 1035 §5.1 lets a label contain a `.`, and
+/// counting dots miscounts such a name's labels — so a zone holding one loaded
+/// and answered but could not be signed.
+pub fn signed_owner_name(owner: NameRef<'_>, rrsig_labels: u8) -> DnssecResult<Name> {
+    let folded = owner.to_folded();
+    let have = folded.as_ref().label_count();
+    let want = rrsig_labels as usize;
+    if want >= have {
+        return Ok(folded);
+    }
+    Ok(Name::prefixed(b"*", folded.as_ref().suffix(want))?)
+}
+
+/// [`rrsig_labels`] for a name, counting labels rather than dots.
+pub fn rrsig_labels_of(owner: NameRef<'_>) -> u8 {
+    let labels = owner.label_count();
+    let counted = if owner.labels().next() == Some(b"*") {
         labels.saturating_sub(1)
     } else {
         labels
     };
-    // 127 labels is the most that fits in 255 octets, so the cast is total;
-    // saturating keeps a monster name from claiming *fewer* labels than it has.
     counted.min(u8::MAX as usize) as u8
 }
 
@@ -336,15 +371,15 @@ pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
     let lowered = match record.rtype() {
         rt::NS | rt::CNAME | rt::PTR | rt::SOA | rt::MX | rt::RRSIG | rt::NSEC => {
             match record.parse()? {
-                ParsedRecord::NS(n) => Some(ParsedRecord::NS(canonical_name(&n))),
-                ParsedRecord::CNAME(n) => Some(ParsedRecord::CNAME(canonical_name(&n))),
-                ParsedRecord::PTR(n) => Some(ParsedRecord::PTR(canonical_name(&n))),
+                ParsedRecord::NS(n) => Some(ParsedRecord::NS(n.as_ref().to_folded())),
+                ParsedRecord::CNAME(n) => Some(ParsedRecord::CNAME(n.as_ref().to_folded())),
+                ParsedRecord::PTR(n) => Some(ParsedRecord::PTR(n.as_ref().to_folded())),
                 ParsedRecord::MX {
                     preference,
                     exchange,
                 } => Some(ParsedRecord::MX {
                     preference,
-                    exchange: canonical_name(&exchange),
+                    exchange: exchange.as_ref().to_folded(),
                 }),
                 ParsedRecord::SOA {
                     mname,
@@ -355,8 +390,8 @@ pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
                     expire,
                     minimum,
                 } => Some(ParsedRecord::SOA {
-                    mname: canonical_name(&mname),
-                    rname: canonical_name(&rname),
+                    mname: mname.as_ref().to_folded(),
+                    rname: rname.as_ref().to_folded(),
                     serial,
                     refresh,
                     retry,
@@ -381,14 +416,14 @@ pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
                     inception,
                     expiration,
                     key_tag,
-                    signer_name: canonical_name(&signer_name),
+                    signer_name: signer_name.as_ref().to_folded(),
                     signature,
                 }),
                 ParsedRecord::NSEC {
                     next_domain_name,
                     type_bitmap,
                 } => Some(ParsedRecord::NSEC {
-                    next_domain_name: canonical_name(&next_domain_name),
+                    next_domain_name: next_domain_name.as_ref().to_folded(),
                     type_bitmap,
                 }),
                 _ => None,
@@ -417,7 +452,7 @@ pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
 /// the records are sorted by canonical RDATA with duplicates removed.
 pub fn signed_data(
     rrsig: &Rrsig,
-    owner: &str,
+    owner: NameRef<'_>,
     class: Class,
     rdatas: &[RecordData],
 ) -> DnssecResult<Vec<u8>> {
@@ -436,9 +471,10 @@ pub fn signed_data(
     data.extend_from_slice(&rrsig.expiration.to_be_bytes());
     data.extend_from_slice(&rrsig.inception.to_be_bytes());
     data.extend_from_slice(&rrsig.key_tag.to_be_bytes());
-    data.extend_from_slice(&dname_to_bytes(&canonical_name(&rrsig.signer_name))?);
+    data.extend_from_slice(canonical_wire(&rrsig.signer_name)?.as_ref().as_wire());
 
-    let name_wire = dname_to_bytes(&signed_owner(owner, rrsig.labels))?;
+    let signed_at = signed_owner_name(owner, rrsig.labels)?;
+    let name_wire = signed_at.as_ref().as_wire();
 
     // By canonical RDATA alone, not the whole encoded RR: RDLEN sits before the
     // RDATA, so sorting encoded RRs orders by length first.
@@ -455,7 +491,7 @@ pub fn signed_data(
             limit: u16::MAX as usize,
             actual: rdata.len(),
         })?;
-        data.extend_from_slice(&name_wire);
+        data.extend_from_slice(name_wire);
         data.extend_from_slice(&rrsig.type_covered.to_u16().to_be_bytes());
         data.extend_from_slice(&class.to_u16().to_be_bytes());
         data.extend_from_slice(&rrsig.original_ttl.to_be_bytes());
@@ -498,7 +534,7 @@ pub fn key_tag(flags: u16, protocol: u8, algorithm: u8, public_key: &[u8]) -> u1
 /// reads as "this key is not the one the parent vouched for" — turns every
 /// secure delegation into a failure.
 pub fn ds_digest(key: &Dnskey, digest_type: u8) -> DnssecResult<Vec<u8>> {
-    let mut input = dname_to_bytes(&canonical_name(&key.owner))?;
+    let mut input = canonical_wire(&key.owner)?.as_ref().as_wire().to_vec();
     input.extend_from_slice(&key.rdata());
 
     Ok(match digest_type {
@@ -660,14 +696,14 @@ pub enum RrsetProof {
 /// which are mostly about adding a record to a set or removing one from it.
 #[derive(Debug, Clone, Copy)]
 pub struct Rrset<'a> {
-    pub owner: &'a str,
+    pub owner: NameRef<'a>,
     pub rtype: Rtype,
     pub class: Class,
     pub rdatas: &'a [RecordData],
 }
 
 impl<'a> Rrset<'a> {
-    pub fn new(owner: &'a str, rtype: Rtype, class: Class, rdatas: &'a [RecordData]) -> Self {
+    pub fn new(owner: NameRef<'a>, rtype: Rtype, class: Class, rdatas: &'a [RecordData]) -> Self {
         Rrset {
             owner,
             rtype,
@@ -691,7 +727,7 @@ pub fn verify_rrset(
     rrset: &Rrset<'_>,
     rrsigs: &[Rrsig],
     keys: &[Dnskey],
-    zone: &str,
+    zone: NameRef<'_>,
     now: u64,
 ) -> RrsetProof {
     let Rrset {
@@ -700,8 +736,10 @@ pub fn verify_rrset(
         rdatas,
         ..
     } = *rrset;
-    let owner = canonical_name(rrset.owner);
-    let zone = canonical_name(zone);
+    let owner = canonical_name_of(rrset.owner);
+    // The signer name and the key owners are canonical text (RFC 4034 §6.2),
+    // which is the form `canonical_name_of` draws the boundary at.
+    let zone = canonical_name_of(zone);
 
     let covering: Vec<&Rrsig> = rrsigs
         .iter()
@@ -728,7 +766,7 @@ pub fn verify_rrset(
         // A label count larger than the name has is nonsense, and one smaller
         // is a wildcard — legitimate, but it must not claim to have been signed
         // at a name above the zone apex.
-        let owner_labels = label_count(&owner);
+        let owner_labels = rrset.owner.label_count();
         if rrsig.labels as usize > owner_labels || (rrsig.labels as usize) < label_count(&zone) {
             last_failure = format!(
                 "RRSIG on {owner} claims {} labels, which its owner and zone do not allow",
@@ -744,7 +782,7 @@ pub fn verify_rrset(
             continue;
         }
 
-        let data = match signed_data(rrsig, &owner, class, rdatas) {
+        let data = match signed_data(rrsig, rrset.owner, class, rdatas) {
             Ok(data) => data,
             Err(e) => {
                 last_failure = format!("could not build signed data for {owner}: {e}");
@@ -798,14 +836,19 @@ pub fn verify_records(
     records: &[ResourceRecord],
     rrsigs: &[Rrsig],
     keys: &[Dnskey],
-    zone: &str,
+    zone: NameRef<'_>,
 ) -> RrsetProof {
     let Some(first) = records.first() else {
         return RrsetProof::Unsigned;
     };
     let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
     verify_rrset(
-        &Rrset::new(&first.name, first.rdata.rtype(), first.class, &rdatas),
+        &Rrset::new(
+            first.name.as_ref(),
+            first.rdata.rtype(),
+            first.class,
+            &rdatas,
+        ),
         rrsigs,
         keys,
         zone,
@@ -815,8 +858,10 @@ pub fn verify_records(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::dnssec_test_util::{TestKey, TestZone};
+    use crate::test_records::nm;
 
     /// The owning spelling and `utils`'s borrowing one give the same answers.
     ///
@@ -859,9 +904,9 @@ mod tests {
 
     #[test]
     fn test_canonical_rdata_downcases_only_the_listed_types() {
-        let ns = RecordData::from_parsed(&ParsedRecord::NS("NS1.Example.COM.".into())).unwrap();
+        let ns = RecordData::from_parsed(&ParsedRecord::NS(nm("NS1.Example.COM."))).unwrap();
         let lowered = canonical_rdata(&ns).unwrap();
-        let want = RecordData::from_parsed(&ParsedRecord::NS("ns1.example.com.".into())).unwrap();
+        let want = RecordData::from_parsed(&ParsedRecord::NS(nm("ns1.example.com."))).unwrap();
         assert_eq!(
             lowered,
             want.bytes().to_vec(),
@@ -884,7 +929,7 @@ mod tests {
     fn test_signed_txt_rrset_with_several_strings_verifies() {
         let zone = TestZone::new("example.test.");
         let txt = ResourceRecord {
-            name: "txt.example.test.".into(),
+            name: nm("txt.example.test."),
             class: Class::new(1),
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::TXT(vec![
@@ -899,7 +944,7 @@ mod tests {
             &[txt],
             &[Rrsig::from_record(&sig).unwrap()],
             &zone.dnskeys(),
-            "example.test.",
+            nm("example.test.").as_ref(),
         );
         assert!(
             matches!(proof, RrsetProof::Verified { .. }),
@@ -913,18 +958,18 @@ mod tests {
     #[test]
     fn test_rrset_is_sorted_by_rdata_and_deduplicated() {
         let key = TestKey::generate_p256();
-        let rrsig = key.rrsig_template("example.com.", rt::A, 3600, "example.com.", 2);
-
+        let apex = nm("example.com.");
+        let rrsig = key.rrsig_template(apex.as_ref(), rt::A, 3600, "example.com.", 2);
         let ordered = signed_data(
             &rrsig,
-            "example.com.",
+            apex.as_ref(),
             Class::new(1),
             &[a_rdata(1), a_rdata(2), a_rdata(3)],
         )
         .unwrap();
         let shuffled = signed_data(
             &rrsig,
-            "example.com.",
+            apex.as_ref(),
             Class::new(1),
             // Same RRset, different order, with one record repeated.
             &[a_rdata(3), a_rdata(1), a_rdata(2), a_rdata(1)],
@@ -940,10 +985,11 @@ mod tests {
     #[test]
     fn test_signed_data_uses_the_rrsigs_original_ttl() {
         let key = TestKey::generate_p256();
-        let mut rrsig = key.rrsig_template("example.com.", rt::A, 3600, "example.com.", 2);
-        let with_3600 = signed_data(&rrsig, "example.com.", Class::new(1), &[a_rdata(1)]).unwrap();
+        let apex = nm("example.com.");
+        let mut rrsig = key.rrsig_template(apex.as_ref(), rt::A, 3600, "example.com.", 2);
+        let with_3600 = signed_data(&rrsig, apex.as_ref(), Class::new(1), &[a_rdata(1)]).unwrap();
         rrsig.original_ttl = 60;
-        let with_60 = signed_data(&rrsig, "example.com.", Class::new(1), &[a_rdata(1)]).unwrap();
+        let with_60 = signed_data(&rrsig, apex.as_ref(), Class::new(1), &[a_rdata(1)]).unwrap();
         assert_ne!(
             with_3600, with_60,
             "the TTL in the signed bytes comes from the RRSIG"
@@ -968,10 +1014,15 @@ mod tests {
         );
 
         let proof = verify_rrset(
-            &Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas),
+            &Rrset::new(
+                nm("www.example.com.").as_ref(),
+                rt::A,
+                Class::new(1),
+                &rdatas,
+            ),
             &[rrsig],
             &[key.dnskey("example.com.")],
-            "example.com.",
+            nm("example.com.").as_ref(),
             current_unix_timestamp(),
         );
         assert!(
@@ -994,10 +1045,10 @@ mod tests {
         );
 
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::A, Class::new(1), &rdatas),
+            &Rrset::new(nm("example.com.").as_ref(), rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[key.dnskey("example.com.")],
-            "example.com.",
+            nm("example.com.").as_ref(),
             current_unix_timestamp(),
         );
         assert!(matches!(proof, RrsetProof::Verified { .. }), "{proof:?}");
@@ -1017,10 +1068,10 @@ mod tests {
         );
 
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::A, Class::new(1), &rdatas),
+            &Rrset::new(nm("example.com.").as_ref(), rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[key.dnskey("example.com.")],
-            "example.com.",
+            nm("example.com.").as_ref(),
             current_unix_timestamp(),
         );
         assert!(matches!(proof, RrsetProof::Verified { .. }), "{proof:?}");
@@ -1043,10 +1094,15 @@ mod tests {
 
         let tampered = vec![a_rdata(66)];
         let proof = verify_rrset(
-            &Rrset::new("www.example.com.", rt::A, Class::new(1), &tampered),
+            &Rrset::new(
+                nm("www.example.com.").as_ref(),
+                rt::A,
+                Class::new(1),
+                &tampered,
+            ),
             &[rrsig],
             &[key.dnskey("example.com.")],
-            "example.com.",
+            nm("example.com.").as_ref(),
             current_unix_timestamp(),
         );
         assert!(
@@ -1072,14 +1128,14 @@ mod tests {
 
         let proof = verify_rrset(
             &Rrset::new(
-                "www.example.com.",
+                nm("www.example.com.").as_ref(),
                 rt::A,
                 Class::new(1),
                 &[a_rdata(1), a_rdata(99)],
             ),
             &[rrsig],
             &[key.dnskey("example.com.")],
-            "example.com.",
+            nm("example.com.").as_ref(),
             current_unix_timestamp(),
         );
         assert!(matches!(proof, RrsetProof::Bogus(_)), "{proof:?}");
@@ -1102,10 +1158,15 @@ mod tests {
         );
 
         let proof = verify_rrset(
-            &Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas),
+            &Rrset::new(
+                nm("www.example.com.").as_ref(),
+                rt::A,
+                Class::new(1),
+                &rdatas,
+            ),
             &[rrsig],
             &[attacker.dnskey("evil.test.")],
-            "example.com.",
+            nm("example.com.").as_ref(),
             current_unix_timestamp(),
         );
         assert!(
@@ -1131,10 +1192,10 @@ mod tests {
         rrsig.expiration = (now - 3600) as u32;
 
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::A, Class::new(1), &rdatas),
+            &Rrset::new(nm("example.com.").as_ref(), rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[key.dnskey("example.com.")],
-            "example.com.",
+            nm("example.com.").as_ref(),
             now,
         );
         assert!(matches!(proof, RrsetProof::Bogus(_)), "{proof:?}");
@@ -1143,10 +1204,15 @@ mod tests {
     #[test]
     fn test_unsigned_rrset_is_not_bogus() {
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::A, Class::new(1), &[a_rdata(1)]),
+            &Rrset::new(
+                nm("example.com.").as_ref(),
+                rt::A,
+                Class::new(1),
+                &[a_rdata(1)],
+            ),
             &[],
             &[],
-            "example.com.",
+            nm("example.com.").as_ref(),
             current_unix_timestamp(),
         );
         assert_eq!(
@@ -1178,10 +1244,10 @@ mod tests {
         rrsig.key_tag = dnskey.key_tag();
 
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::A, Class::new(1), &rdatas),
+            &Rrset::new(nm("example.com.").as_ref(), rt::A, Class::new(1), &rdatas),
             &[rrsig],
             &[dnskey],
-            "example.com.",
+            nm("example.com.").as_ref(),
             current_unix_timestamp(),
         );
         assert!(matches!(proof, RrsetProof::Bogus(_)), "{proof:?}");
@@ -1206,10 +1272,15 @@ mod tests {
         rrsig.labels = 2;
 
         let proof = verify_rrset(
-            &Rrset::new("anything.example.com.", rt::A, Class::new(1), &rdatas),
+            &Rrset::new(
+                nm("anything.example.com.").as_ref(),
+                rt::A,
+                Class::new(1),
+                &rdatas,
+            ),
             &[rrsig],
             &[key.dnskey("example.com.")],
-            "example.com.",
+            nm("example.com.").as_ref(),
             current_unix_timestamp(),
         );
         match proof {
@@ -1243,7 +1314,7 @@ mod tests {
         let dnskey = key.dnskey("example.com.");
         for digest_type in [1u8, 2, 4] {
             let ds = Ds {
-                owner: "example.com.".into(),
+                owner: "example.com.".to_string(),
                 key_tag: dnskey.key_tag(),
                 algorithm: dnskey.algorithm,
                 digest_type,
@@ -1261,7 +1332,7 @@ mod tests {
         let real = TestKey::generate_p256().dnskey("example.com.");
         let impostor = TestKey::generate_p256().dnskey("example.com.");
         let ds = Ds {
-            owner: "example.com.".into(),
+            owner: "example.com.".to_string(),
             key_tag: real.key_tag(),
             algorithm: real.algorithm,
             digest_type: 2,
@@ -1361,10 +1432,15 @@ mod tests {
         // 2. The KSK signs the DNSKEY RRset, so the DS reaches both keys.
         let (dnskey_rdatas, dnskey_sig) = zone.signed_dnskey_rrset();
         let proof = verify_rrset(
-            &Rrset::new("example.com.", rt::DNSKEY, Class::new(1), &dnskey_rdatas),
+            &Rrset::new(
+                nm("example.com.").as_ref(),
+                rt::DNSKEY,
+                Class::new(1),
+                &dnskey_rdatas,
+            ),
             &[dnskey_sig],
             &zone.dnskeys(),
-            "example.com.",
+            nm("example.com.").as_ref(),
             now,
         );
         assert!(
@@ -1383,10 +1459,15 @@ mod tests {
             &rdatas,
         );
         let proof = verify_rrset(
-            &Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas),
+            &Rrset::new(
+                nm("www.example.com.").as_ref(),
+                rt::A,
+                Class::new(1),
+                &rdatas,
+            ),
             &[sig],
             &zone.dnskeys(),
-            "example.com.",
+            nm("example.com.").as_ref(),
             now,
         );
         assert!(matches!(proof, RrsetProof::Verified { .. }), "{proof:?}");

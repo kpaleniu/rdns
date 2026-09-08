@@ -2,7 +2,7 @@
 //! delegation chain from the root ourselves or by forwarding to a configured
 //! upstream. See [`ResolverMode`].
 
-use crate::dnssec::{Dnskey, Rrsig};
+use crate::dnssec::{canonical_name_of, Dnskey, Rrsig};
 use crate::dnssec_chain::{
     cname_chain_shape, ChainShape, ChainValidator, DelegationEvidence, DelegationVerdict, KeyStore,
     TrustAnchors, ValidationState,
@@ -10,15 +10,16 @@ use crate::dnssec_chain::{
 use crate::dnssec_denial::{nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, Denial};
 use crate::error::{ResolveError, ResolveResult};
 use crate::utils::{
-    absolute_lowered, bind_addr_for, current_unix_timestamp, dname_redirect, is_at_or_under,
-    label_count, names_equal, record_types as rt, NameKeyBuf, Redirect,
+    bind_addr_for, current_unix_timestamp, dname_redirect, record_types as rt, Redirect,
 };
+#[cfg(test)]
+use crate::utils::{is_at_or_under, label_count};
 use crate::validation::{answers_query, SentQuery};
 use crate::Qtype;
 use crate::Rtype;
 use crate::{
-    DnsMessage, Edns, ParsedRecord, QueryClass, QuerySection, RecordData, ResourceRecord,
-    ResponseCode,
+    DnsMessage, Edns, Name, NameRef, ParsedRecord, QueryClass, QuerySection, RecordData,
+    ResourceRecord, ResponseCode,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -234,7 +235,7 @@ impl Default for ResolverConfig {
 /// the tree rather than paying a root round trip per client query.
 #[derive(Debug)]
 struct DelegationCache {
-    entries: Mutex<HashMap<NameKeyBuf, CachedDelegation>>,
+    entries: Mutex<HashMap<Box<[u8]>, CachedDelegation>>,
     capacity: usize,
 }
 
@@ -257,7 +258,7 @@ impl DelegationCache {
 
     /// The deepest cached zone that encloses `qname` and has not expired.
     /// Deepest wins: it skips a round trip.
-    fn best_match(&self, qname: &str) -> Option<(String, Vec<SocketAddr>)> {
+    fn best_match(&self, qname: NameRef<'_>) -> Option<(Name, Vec<SocketAddr>)> {
         self.best_match_where(qname, |_| true)
     }
 
@@ -266,25 +267,27 @@ impl DelegationCache {
     /// shortcut that would skip past a zone cut it has not authenticated.
     fn best_match_where(
         &self,
-        qname: &str,
-        accept: impl Fn(&str) -> bool,
-    ) -> Option<(String, Vec<SocketAddr>)> {
-        // Borrowed when the name is already absolute and lowercased, which is
-        // every query the answer path hands down (`TODO.md` #26f): this is a
-        // lookup, and nothing here keeps the name.
-        let name = absolute_lowered(qname);
+        qname: NameRef<'_>,
+        accept: impl Fn(NameRef<'_>) -> bool,
+    ) -> Option<(Name, Vec<SocketAddr>)> {
         let now = current_unix_timestamp();
         let mut entries = self.entries.lock().ok()?;
 
-        for candidate in ancestors(&name) {
-            match entries.get(candidate) {
+        // Keys are folded, so the *walk* is over the folded name; folding once
+        // costs at most one copy for the whole walk, where the lowercased
+        // per-label copy it replaces cost one each (`TODO.md` #26f).
+        // Case folding moves no length octet, so the two walks step together.
+        let mut buf = Vec::new();
+        let folded = qname.folded_in(&mut buf);
+        for (candidate, key) in qname.ancestors().zip(folded.ancestors()) {
+            match entries.get(key.as_wire()) {
                 Some(entry) if entry.expires_at > now && accept(candidate) => {
-                    return Some((candidate.to_string(), entry.servers.clone()));
+                    return Some((candidate.to_owned(), entry.servers.clone()));
                 }
                 // Live, but the caller does not want to start here.
                 Some(entry) if entry.expires_at > now => {}
                 Some(_) => {
-                    entries.remove(candidate);
+                    entries.remove(key.as_wire());
                 }
                 None => {}
             }
@@ -292,7 +295,7 @@ impl DelegationCache {
         None
     }
 
-    fn insert(&self, zone: &str, servers: Vec<SocketAddr>, ttl: u64) {
+    fn insert(&self, zone: NameRef<'_>, servers: Vec<SocketAddr>, ttl: u64) {
         // A zero TTL means "do not cache this", and a zero-capacity cache is
         // how callers turn the whole thing off.
         if servers.is_empty() || ttl == 0 || self.capacity == 0 {
@@ -319,7 +322,7 @@ impl DelegationCache {
         }
 
         entries.insert(
-            NameKeyBuf::new(zone),
+            zone.folded().into_owned().into_boxed_slice(),
             CachedDelegation {
                 servers,
                 expires_at: current_unix_timestamp() + ttl.min(MAX_DELEGATION_TTL),
@@ -328,9 +331,9 @@ impl DelegationCache {
     }
 
     /// Drop a zone's entry, for when the servers in it turn out not to work.
-    fn forget(&self, zone: &str) {
+    fn forget(&self, zone: NameRef<'_>) {
         if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(absolute_lowered(zone).as_ref());
+            entries.remove(zone.folded().as_ref());
         }
     }
 }
@@ -410,14 +413,11 @@ impl RttStore {
 /// A name and every zone above it, deepest first: `www.example.com.` yields
 /// `www.example.com.`, `example.com.`, `com.`, `.`.
 ///
-/// Slices of `name`, which both callers have normalized: an ancestor is a
-/// suffix. It allocated one `String` per ancestor plus the spine, per
-/// delegation-cache lookup and per chain resumption.
+/// ~~Slices of `name`, which both callers have normalized~~ — replaced by
+/// [`NameRef::ancestors`], which is the same walk over a name that cannot be
+/// relative, so the `debug_assert` that guarded that is gone too.
+#[allow(dead_code)]
 fn ancestors(name: &str) -> impl Iterator<Item = &str> {
-    debug_assert!(
-        name.ends_with('.'),
-        "ancestors walks by suffix and was handed the relative name {name:?}"
-    );
     let mut next = Some(name);
     std::iter::from_fn(move || {
         let current = next?;
@@ -428,8 +428,8 @@ fn ancestors(name: &str) -> impl Iterator<Item = &str> {
 
 /// What a referral told us.
 struct Referral {
-    zone: String,
-    ns_names: Vec<String>,
+    zone: Name,
+    ns_names: Vec<Name>,
     glue: Vec<SocketAddr>,
     /// Shortest TTL among the records the delegation rests on.
     ttl: u64,
@@ -441,7 +441,7 @@ struct Referral {
 struct OutgoingQuery {
     buf: Vec<u8>,
     id: u16,
-    qname: String,
+    qname: Name,
     qtype: Qtype,
     qclass: QueryClass,
 }
@@ -452,7 +452,7 @@ impl OutgoingQuery {
     fn sent(&self, case_sensitive: bool) -> SentQuery<'_> {
         SentQuery {
             id: self.id,
-            qname: &self.qname,
+            qname: self.qname.as_ref(),
             qtype: self.qtype,
             qclass: self.qclass,
             case_sensitive,
@@ -513,7 +513,7 @@ impl Resolution {
     }
 
     /// Remember what a referral to `zone` said about that zone's security.
-    fn record_cut(&mut self, zone: &str, authorities: &[ResourceRecord]) {
+    fn record_cut(&mut self, zone: NameRef<'_>, authorities: &[ResourceRecord]) {
         let evidence = DelegationEvidence::from_authority(zone, authorities);
         // A zone can be crossed more than once in one resolution. Keep the
         // first sighting that carried evidence; a later referral may be thinner.
@@ -528,15 +528,19 @@ impl Resolution {
 
     /// The next zone cut below `zone` on the way to `target`. Shallowest first:
     /// each zone's keys authenticate the DS of the zone beneath it.
-    fn next_cut_below(&self, zone: &str, target: &str) -> Option<&DelegationEvidence> {
+    fn next_cut_below(
+        &self,
+        zone: NameRef<'_>,
+        target: NameRef<'_>,
+    ) -> Option<&DelegationEvidence> {
         self.cuts
             .iter()
             .filter(|c| {
-                !names_equal(&c.zone, zone)
-                    && is_at_or_under(&c.zone, zone)
-                    && is_at_or_under(target, &c.zone)
+                c.zone.as_ref() != zone
+                    && c.zone.as_ref().is_at_or_under(zone)
+                    && target.is_at_or_under(c.zone.as_ref())
             })
-            .min_by_key(|c| label_count(&c.zone))
+            .min_by_key(|c| c.zone.as_ref().label_count())
     }
 }
 
@@ -546,7 +550,7 @@ impl Resolution {
 /// load-bearing.
 #[derive(Debug)]
 struct KeyCache {
-    entries: Mutex<HashMap<NameKeyBuf, CachedKeys>>,
+    entries: Mutex<HashMap<Box<[u8]>, CachedKeys>>,
     capacity: usize,
 }
 
@@ -568,20 +572,23 @@ impl KeyCache {
         }
     }
 
-    fn get(&self, zone: &str) -> Option<Vec<Dnskey>> {
+    fn get(&self, zone: NameRef<'_>) -> Option<Vec<Dnskey>> {
         let now = current_unix_timestamp();
         let mut entries = self.entries.lock().ok()?;
-        match entries.get(zone) {
+        // Folded, because `insert` folds: RFC 4343 names differing only in case
+        // are one entry, and looking one up unfolded would miss its own write.
+        let key = zone.folded();
+        match entries.get(key.as_ref()) {
             Some(entry) if entry.expires_at > now => Some(entry.keys.clone()),
             Some(_) => {
-                entries.remove(zone);
+                entries.remove(key.as_ref());
                 None
             }
             None => None,
         }
     }
 
-    fn insert(&self, zone: &str, keys: Vec<Dnskey>, ttl: u64) {
+    fn insert(&self, zone: NameRef<'_>, keys: Vec<Dnskey>, ttl: u64) {
         if self.capacity == 0 || keys.is_empty() || ttl == 0 {
             return;
         }
@@ -602,7 +609,7 @@ impl KeyCache {
             }
         }
         entries.insert(
-            NameKeyBuf::new(zone),
+            zone.folded().into_owned().into_boxed_slice(),
             CachedKeys {
                 keys,
                 expires_at: current_unix_timestamp() + ttl.min(MAX_KEY_TTL),
@@ -610,7 +617,7 @@ impl KeyCache {
         );
     }
 
-    fn holds(&self, zone: &str) -> bool {
+    fn holds(&self, zone: NameRef<'_>) -> bool {
         self.get(zone).is_some()
     }
 }
@@ -721,7 +728,7 @@ impl Resolver {
         // Only the wire bytes and the reply check see the scrambled case;
         // resolution logic elsewhere normalizes.
         let sent_qname = if self.config.zero_x20 {
-            randomize_case(&query.qname)
+            randomize_case(query.qname.as_ref())
         } else {
             query.qname.clone()
         };
@@ -782,13 +789,13 @@ impl Resolver {
         query: &QuerySection,
         state: &mut Resolution,
     ) -> ResolveResult<DnsMessage> {
-        let mut qname = normalize(&query.qname);
+        let mut qname = query.qname.clone();
         let mut answers = Vec::new();
         // Names we have already asked about — asking twice means a CNAME loop.
-        let mut queried: HashSet<String> = HashSet::new();
+        let mut queried: HashSet<Name> = HashSet::new();
         // Names whose records we are willing to accept: the original question
         // plus every CNAME target we have followed to get here.
-        let mut chain: HashSet<String> = HashSet::from([qname.clone()]);
+        let mut chain: HashSet<Name> = HashSet::from([qname.clone()]);
         let mut last = None;
 
         for hop in 0..=self.config.max_cname_hops {
@@ -819,14 +826,14 @@ impl Resolver {
             // for unrelated names are cache-poisoning attempts, and `rdnsr`
             // caches whatever is returned here.
             for rr in &response.answers {
-                // Once per record of every response, so the allocation this
-                // used to make was per record rather than per query.
-                let owner = absolute_lowered(&rr.name);
-                if chain.contains(owner.as_ref()) {
+                // No copy per record any more: the set is keyed on the name
+                // itself, whose `Hash` folds ASCII.
+                let owner = rr.name.as_ref();
+                if chain.contains(&rr.name) {
                     answers.push(rr.clone());
                     if rr.rdata.rtype() == rt::CNAME {
                         if let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() {
-                            chain.insert(normalize(&target));
+                            chain.insert(target);
                         }
                     }
                     continue;
@@ -842,10 +849,10 @@ impl Resolver {
                 // `example.com.` answers with `com. DNAME evil.test.` and
                 // redirects every name under `com.` in this cache.
                 if rr.rdata.rtype() == rt::DNAME
-                    && is_at_or_under(&owner, &zone)
+                    && owner.is_at_or_under(zone.as_ref())
                     && chain
                         .iter()
-                        .any(|name| name != owner.as_ref() && is_at_or_under(name, &owner))
+                        .any(|n| n.as_ref() != owner && n.as_ref().is_at_or_under(owner))
                 {
                     answers.push(rr.clone());
                 }
@@ -856,13 +863,13 @@ impl Resolver {
             let got_type = response
                 .answers
                 .iter()
-                .any(|rr| query.qtype.matches(rr.rdata.rtype()) && names_equal(&rr.name, &qname));
+                .any(|rr| query.qtype.matches(rr.rdata.rtype()) && rr.name == qname);
             let cname = response
                 .answers
                 .iter()
-                .filter(|rr| rr.rdata.rtype() == rt::CNAME && names_equal(&rr.name, &qname))
+                .filter(|rr| rr.rdata.rtype() == rt::CNAME && rr.name == qname)
                 .find_map(|rr| match rr.rdata.parse() {
-                    Ok(ParsedRecord::CNAME(target)) => Some(normalize(&target)),
+                    Ok(ParsedRecord::CNAME(target)) => Some(target),
                     _ => None,
                 });
 
@@ -874,7 +881,9 @@ impl Resolver {
             let next = match cname {
                 Some(target) => Some(target),
                 None if got_type || query.qtype.is(rt::CNAME) => None,
-                None => synthesize_from_dname(&response, &zone, &qname, &mut answers)?,
+                None => {
+                    synthesize_from_dname(&response, zone.as_ref(), qname.as_ref(), &mut answers)?
+                }
             };
             if let Some(target) = &next {
                 chain.insert(target.clone());
@@ -918,13 +927,13 @@ impl Resolver {
         // Start as far down the tree as already known. Validating narrows that:
         // a shortcut past a zone cut skips its DS records, so only zones whose
         // keys are already validated may be jumped to.
-        if let Some((zone, servers)) = self.best_start(&query.qname) {
+        if let Some((zone, servers)) = self.best_start(query.qname.as_ref()) {
             match self.walk(query, state, depth, zone.clone(), servers).await {
                 Ok(response) => return Ok(response),
                 Err(_) => {
                     // Cached delegations go stale; restart from the root rather
                     // than fail a query on our own bookkeeping.
-                    self.delegations.forget(&zone);
+                    self.delegations.forget(zone.as_ref());
                 }
             }
         }
@@ -933,14 +942,14 @@ impl Resolver {
             query,
             state,
             depth,
-            ".".to_string(),
+            Name::root(),
             self.config.root_hints.clone(),
         )
         .await
     }
 
     /// The deepest cached delegation we are willing to start from.
-    fn best_start(&self, qname: &str) -> Option<(String, Vec<SocketAddr>)> {
+    fn best_start(&self, qname: NameRef<'_>) -> Option<(Name, Vec<SocketAddr>)> {
         if self.config.dnssec.is_some() {
             self.delegations
                 .best_match_where(qname, |zone| self.keys.holds(zone))
@@ -955,11 +964,11 @@ impl Resolver {
         query: &QuerySection,
         state: &mut Resolution,
         depth: usize,
-        start_zone: String,
+        start_zone: Name,
         start_servers: Vec<SocketAddr>,
     ) -> ResolveResult<Answered> {
-        let qname = normalize(&query.qname);
-        let qname_labels = label_count(&qname);
+        let qname = query.qname.clone();
+        let qname_labels = qname.as_ref().label_count();
 
         // The zone whose servers we are talking to; bailiwick is judged against
         // it. A server for `com.` may delegate `example.com.` but may not
@@ -969,7 +978,7 @@ impl Resolver {
 
         // Labels of `qname` the next minimized query reveals: one below the
         // starting zone, deepening a label at a time.
-        let mut sent_labels = label_count(&zone) + 1;
+        let mut sent_labels = zone.as_ref().label_count() + 1;
 
         // The budget is the real limit; this only bounds a pathological spin.
         // Minimization can add a probe per empty-non-terminal label, hence
@@ -987,10 +996,10 @@ impl Resolver {
             } else {
                 qname_labels
             };
-            // `qname` is normalized above, so the minimized name is a slice of
-            // it and only the copy the question carries is paid for.
-            let sname = crate::utils::suffix_labels(&qname, labels);
-            let is_final = names_equal(sname, &qname);
+            // A suffix of the wire form, so the minimized name borrows and
+            // only the copy the question carries is paid for.
+            let sname = qname.as_ref().suffix(labels);
+            let is_final = sname == qname.as_ref();
             if !is_final {
                 minimized_probes += 1;
             }
@@ -999,7 +1008,7 @@ impl Resolver {
             // name with NODATA — telling the two apart without disclosing the
             // leaf.
             let step = QuerySection {
-                qname: sname.to_string(),
+                qname: sname.to_owned(),
                 qtype: if is_final {
                     query.qtype
                 } else {
@@ -1022,12 +1031,12 @@ impl Resolver {
                 ns_names,
                 glue,
                 ttl,
-            }) = self.extract_referral(&response, &zone, &qname)?
+            }) = self.extract_referral(&response, zone.as_ref(), qname.as_ref())?
             {
                 // The only pass where the parent's DS — or the NSEC proving
                 // there is none — is in front of us.
                 if self.config.dnssec.is_some() {
-                    state.record_cut(&child_zone, &response.authorities);
+                    state.record_cut(child_zone.as_ref(), &response.authorities);
                 }
 
                 servers = if glue.is_empty() {
@@ -1043,9 +1052,10 @@ impl Resolver {
                         "no reachable nameserver for {child_zone}"
                     )));
                 }
-                self.delegations.insert(&child_zone, servers.clone(), ttl);
+                self.delegations
+                    .insert(child_zone.as_ref(), servers.clone(), ttl);
                 // A referral may jump more than one label at once.
-                sent_labels = label_count(&child_zone) + 1;
+                sent_labels = child_zone.as_ref().label_count() + 1;
                 zone = child_zone;
                 continue;
             }
@@ -1111,11 +1121,11 @@ impl Resolver {
     fn extract_referral(
         &self,
         response: &DnsMessage,
-        zone: &str,
-        qname: &str,
+        zone: NameRef<'_>,
+        qname: NameRef<'_>,
     ) -> ResolveResult<Option<Referral>> {
         // The NS records in the authority section name the child zone.
-        let mut child_zone: Option<String> = None;
+        let mut child_zone: Option<Name> = None;
         let mut ns_names = Vec::new();
         // How long the delegation may be cached: the shortest TTL among the
         // records it rests on.
@@ -1125,26 +1135,26 @@ impl Resolver {
             if rr.rdata.rtype() != rt::NS {
                 continue; // only NS records delegate
             }
-            let owner = normalize(&rr.name);
+            let owner = rr.name.as_ref();
 
             // Bailiwick, the rule that keeps a hostile server in its lane: a
             // referral must be *below* the zone we asked (otherwise `com.` could
             // hand us the servers for `bank.example.`) and must be *at or above*
             // the name we are chasing (otherwise it is not progress toward it).
-            if !is_at_or_under(&owner, zone) || owner == *zone {
+            if !owner.is_at_or_under(zone) || owner == zone {
                 continue;
             }
-            if !is_at_or_under(qname, &owner) {
+            if !qname.is_at_or_under(owner) {
                 continue;
             }
             match &child_zone {
-                None => child_zone = Some(owner.clone()),
+                None => child_zone = Some(owner.to_owned()),
                 // A single referral names one zone; ignore any others.
-                Some(z) if !names_equal(z, &owner) => continue,
+                Some(z) if z.as_ref() != owner => continue,
                 _ => {}
             }
             if let Ok(ParsedRecord::NS(target)) = rr.rdata.parse() {
-                ns_names.push(normalize(&target));
+                ns_names.push(target);
                 ttl = ttl.min(rr.ttl.as_u64());
             }
         }
@@ -1159,11 +1169,11 @@ impl Resolver {
         // neither `com.` nor resolvable without it.
         let mut glue = Vec::new();
         for rr in &response.additionals {
-            let owner = normalize(&rr.name);
-            if !ns_names.iter().any(|ns| names_equal(ns, &owner)) {
+            let owner = rr.name.as_ref();
+            if !ns_names.iter().any(|ns| ns.as_ref() == owner) {
                 continue;
             }
-            if !is_at_or_under(&owner, zone) {
+            if !owner.is_at_or_under(zone) {
                 continue;
             }
             let port = self.config.server_port;
@@ -1196,7 +1206,7 @@ impl Resolver {
     /// costs one query, and an IPv6-only glueless delegation still resolves.
     async fn resolve_nameserver_addresses(
         &self,
-        ns_names: &[String],
+        ns_names: &[Name],
         state: &mut Resolution,
         depth: usize,
     ) -> ResolveResult<Vec<SocketAddr>> {
@@ -1345,17 +1355,17 @@ impl Resolver {
         // the queried type is a negative answer with a non-empty answer section.
         // RFC 4035 §5.4 keys the proof to the name actually denied, which after a
         // chain is the end of the chain, not the name asked about.
-        let shape = cname_chain_shape(&query.qname, query.qtype, &response.answers);
+        let shape = cname_chain_shape(query.qname.as_ref(), query.qtype, &response.answers);
         let denied_name = match &shape {
             ChainShape::Intact { final_name } => final_name.clone(),
             // Judged after the signatures, so an unsigned zone still reads
             // Insecure rather than Bogus.
-            ChainShape::Broken(_) => normalize(&query.qname),
+            ChainShape::Broken(_) => query.qname.clone(),
         };
         let holds_the_answer = response
             .answers
             .iter()
-            .any(|rr| query.qtype.matches(rr.rdata.rtype()) && names_equal(&rr.name, &denied_name));
+            .any(|rr| query.qtype.matches(rr.rdata.rtype()) && rr.name == denied_name);
         let negative = !holds_the_answer;
 
         // Both sections: the proof is in the authority section, but a
@@ -1366,10 +1376,15 @@ impl Resolver {
         }
 
         // Every zone that put its name to something here.
-        let mut signers: Vec<String> = Vec::new();
+        let mut signers: Vec<Name> = Vec::new();
         for sig in records.iter().filter_map(Rrsig::from_record) {
-            if !signers.contains(&sig.signer_name) {
-                signers.push(sig.signer_name);
+            // The signer name is canonical text on an `Rrsig`; the chain walk
+            // works in names, so the boundary is here.
+            let Ok(signer) = Name::from_presentation(&sig.signer_name) else {
+                continue;
+            };
+            if !signers.contains(&signer) {
+                signers.push(signer);
             }
         }
 
@@ -1378,7 +1393,7 @@ impl Resolver {
         if signers.is_empty() {
             let mut keys = KeyStore::new();
             return match self
-                .establish_chain(&query.qname, state, anchors, now, &mut keys)
+                .establish_chain(query.qname.as_ref(), state, anchors, now, &mut keys)
                 .await
             {
                 ValidationState::Secure => ValidationState::Bogus(format!(
@@ -1392,7 +1407,7 @@ impl Resolver {
         let mut keys = KeyStore::new();
         for signer in &signers {
             match self
-                .establish_chain(signer, state, anchors, now, &mut keys)
+                .establish_chain(signer.as_ref(), state, anchors, now, &mut keys)
                 .await
             {
                 ValidationState::Secure => {}
@@ -1417,7 +1432,7 @@ impl Resolver {
             if let ChainShape::Broken(why) = shape {
                 return ValidationState::Bogus(why);
             }
-            return self.check_denial(query, &denied_name, response);
+            return self.check_denial(query, denied_name.as_ref(), response);
         }
 
         // Shape, independently of signatures: a genuine CNAME beside a genuine A
@@ -1447,7 +1462,7 @@ impl Resolver {
     /// and `Bogus` when it breaks.
     async fn establish_chain(
         &self,
-        target: &str,
+        target: NameRef<'_>,
         state: &mut Resolution,
         anchors: &TrustAnchors,
         now: u64,
@@ -1462,24 +1477,23 @@ impl Resolver {
         // to pick where the resolution began. Disagreeing makes the walk skip a
         // zone cut whose DS this loop then goes looking for.
         let (mut zone, mut ds_set) = (anchor_zone.clone(), anchor_ds);
-        let target_key = absolute_lowered(target);
-        for candidate in ancestors(&target_key) {
-            if is_at_or_under(candidate, &anchor_zone) && self.keys.holds(candidate) {
+        for candidate in target.ancestors() {
+            if candidate.is_at_or_under(anchor_zone.as_ref()) && self.keys.holds(candidate) {
                 // Cached keys were validated to the anchor already, so the DS
                 // that got us there is not needed again.
-                zone = candidate.to_string();
+                zone = candidate.to_owned();
                 ds_set = Vec::new();
                 break;
             }
         }
 
         // A chain is at most one zone cut per label, plus the anchor.
-        let max_steps = label_count(target) + 2;
+        let max_steps = target.label_count() + 2;
         for _ in 0..max_steps {
-            let zone_keys = match self.keys.get(&zone) {
+            let zone_keys = match self.keys.get(zone.as_ref()) {
                 Some(cached) => cached,
                 None => {
-                    let (records, ttl) = match self.fetch_dnskeys(&zone, state).await {
+                    let (records, ttl) = match self.fetch_dnskeys(zone.as_ref(), state).await {
                         Ok(found) => found,
                         Err(e) => {
                             return ValidationState::Bogus(format!(
@@ -1487,28 +1501,30 @@ impl Resolver {
                             ))
                         }
                     };
-                    match validator.validate_dnskeys(&zone, &records, &ds_set) {
+                    match validator.validate_dnskeys(zone.as_ref(), &records, &ds_set) {
                         Ok(validated) => {
-                            self.keys.insert(&zone, validated.clone(), ttl);
+                            self.keys.insert(zone.as_ref(), validated.clone(), ttl);
                             validated
                         }
                         Err(other) => return other,
                     }
                 }
             };
-            keys.insert(zone.clone(), zone_keys.clone());
+            // Canonical: `KeyStore` is looked up by an RRSIG's signer name,
+            // which is down-cased (RFC 4034 §6.2).
+            keys.insert(canonical_name_of(zone.as_ref()), zone_keys.clone());
 
-            if names_equal(&zone, target) {
+            if zone.as_ref() == target {
                 return ValidationState::Secure;
             }
 
-            let Some(evidence) = state.next_cut_below(&zone, target).cloned() else {
+            let Some(evidence) = state.next_cut_below(zone.as_ref(), target).cloned() else {
                 // No cut below: the target is served out of this zone, so these
                 // keys are the ones that signed it.
                 return ValidationState::Secure;
             };
 
-            match validator.validate_delegation(&evidence, &zone, &zone_keys) {
+            match validator.validate_delegation(&evidence, zone.as_ref(), &zone_keys) {
                 DelegationVerdict::Secure(ds) => {
                     ds_set = ds;
                     zone = evidence.zone.clone();
@@ -1525,11 +1541,11 @@ impl Resolver {
     /// the conclusion for.
     async fn fetch_dnskeys(
         &self,
-        zone: &str,
+        zone: NameRef<'_>,
         state: &mut Resolution,
     ) -> Result<(Vec<ResourceRecord>, u64), ResolveError> {
         let query = QuerySection {
-            qname: zone.to_string(),
+            qname: zone.to_owned(),
             qtype: Qtype::of(rt::DNSKEY),
             qclass: crate::QueryClass::IN,
         };
@@ -1557,7 +1573,7 @@ impl Resolver {
     fn check_denial(
         &self,
         query: &QuerySection,
-        denied_name: &str,
+        denied_name: NameRef<'_>,
         response: &DnsMessage,
     ) -> ValidationState {
         let nsecs = nsecs_in(&response.authorities);
@@ -1576,14 +1592,14 @@ impl Resolver {
             .authorities
             .iter()
             .find(|rr| rr.rdata.rtype() == rt::SOA)
-            .map(|rr| normalize(&rr.name))
-            .unwrap_or_else(|| denied_name.to_string());
+            .map(|rr| rr.name.as_ref().to_presentation())
+            .unwrap_or_else(|| denied_name.to_presentation());
 
         let denial = if response.rcode == ResponseCode::NoSuchDomain {
-            proves_nxdomain(denied_name, &zone, &nsecs, &nsec3s)
+            proves_nxdomain(&denied_name.to_presentation(), &zone, &nsecs, &nsec3s)
         } else {
             proves_nodata(
-                denied_name,
+                &denied_name.to_presentation(),
                 &zone,
                 Rtype::new(query.qtype.to_u16()),
                 &nsecs,
@@ -1608,7 +1624,7 @@ impl Resolver {
 /// acceptance rule for one, and without the zone there is no rule left.
 struct Answered {
     response: DnsMessage,
-    zone: String,
+    zone: Name,
 }
 
 /// RFC 6672 §3.4.1 step 4D: apply a DNAME in the response to the name being
@@ -1630,18 +1646,18 @@ struct Answered {
 /// be built.
 fn synthesize_from_dname(
     response: &DnsMessage,
-    zone: &str,
-    qname: &str,
+    zone: NameRef<'_>,
+    qname: NameRef<'_>,
     answers: &mut Vec<ResourceRecord>,
-) -> ResolveResult<Option<String>> {
+) -> ResolveResult<Option<Name>> {
     for rr in &response.answers {
-        if rr.rdata.rtype() != rt::DNAME || !is_at_or_under(&rr.name, zone) {
+        if rr.rdata.rtype() != rt::DNAME || !rr.name.as_ref().is_at_or_under(zone) {
             continue;
         }
         let Ok(ParsedRecord::DNAME(target)) = rr.rdata.parse() else {
             continue;
         };
-        match dname_redirect(qname, &rr.name, &target) {
+        match dname_redirect(qname, rr.name.as_ref(), target.as_ref()) {
             Redirect::NoMatch => continue,
             Redirect::TooLong => {
                 return Err(ResolveError::no_response(format!(
@@ -1658,48 +1674,52 @@ fn synthesize_from_dname(
                 let rdata = RecordData::from_parsed(&ParsedRecord::CNAME(next.clone()))
                     .map_err(|e| ResolveError::no_response(format!("synthesizing a CNAME: {e}")))?;
                 answers.push(ResourceRecord {
-                    name: qname.to_string(),
+                    name: qname.to_owned(),
                     class: rr.class,
                     ttl: rr.ttl,
                     rdata,
                 });
-                return Ok(Some(normalize(&next)));
+                return Ok(Some(next));
             }
         }
     }
     Ok(None)
 }
 
-/// Absolute, lowercased form — the shape every comparison here assumes.
-///
-/// The owning spelling of [`crate::utils::absolute_lowered`], for call sites
-/// that keep the result as a map key or set member. To merely *compare* two
-/// names use [`crate::utils::names_equal`], which does not allocate.
-fn normalize(name: &str) -> String {
-    absolute_lowered(name).into_owned()
-}
-
 /// Scramble the case of each ASCII letter in `name`. Names are compared
 /// case-insensitively (RFC 4343), so this changes only the bit pattern on the
 /// wire — which a reply must echo back (0x20).
-fn randomize_case(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphabetic() && rand::random::<bool>() {
-                c.to_ascii_uppercase()
-            } else if c.is_ascii_alphabetic() {
-                c.to_ascii_lowercase()
-            } else {
-                c
+fn randomize_case(name: NameRef<'_>) -> Name {
+    let mut wire = name.as_wire().to_vec();
+    let mut pos = 0;
+    // Label octets only — a length octet is not text, and flipping one would
+    // be a different name rather than the same one in another case.
+    while pos < wire.len() {
+        let len = wire[pos] as usize;
+        if len == 0 {
+            break;
+        }
+        for byte in &mut wire[pos + 1..pos + 1 + len] {
+            if byte.is_ascii_alphabetic() && rand::random::<bool>() {
+                // The bit the technique is named for.
+                *byte ^= 0x20;
             }
-        })
-        .collect()
+        }
+        pos += 1 + len;
+    }
+    NameRef::from_wire_slice(&wire)
+        .map(|n| n.to_owned())
+        // Folding case changes no length octet, so this cannot fail; taking
+        // the name unscrambled if it somehow did costs entropy, not an answer.
+        .unwrap_or_else(|_| name.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::test_records::a_record;
+    use crate::test_records::nm;
     use crate::Class;
     use crate::Serial;
     use crate::Ttl;
@@ -1714,7 +1734,7 @@ mod tests {
 
     fn test_query() -> QuerySection {
         QuerySection {
-            qname: "example.com.".to_string(),
+            qname: nm("example.com."),
             qtype: Qtype::of(rt::A),
             qclass: QueryClass::IN,
         }
@@ -1834,22 +1854,24 @@ mod tests {
 
     #[test]
     fn test_randomize_case_changes_only_case() {
-        let name = "www.Example.com.";
-        for _ in 0..64 {
-            let scrambled = randomize_case(name);
-            // Same name, just different casing: structure and letters preserved.
-            assert_eq!(scrambled.to_ascii_lowercase(), name.to_ascii_lowercase());
-            assert_eq!(scrambled.len(), name.len());
-            assert!(names_equal(&scrambled, name));
-        }
-        // Digits, hyphens and dots are untouched.
-        let mixed = "9-a.b.";
-        assert_eq!(randomize_case(mixed).to_ascii_lowercase(), mixed);
-        for c in randomize_case(mixed)
-            .chars()
-            .filter(|c| !c.is_ascii_alphabetic())
-        {
-            assert!("9-.".contains(c));
+        // Length octets, digits and hyphens included: only an ASCII letter may
+        // move, and then only in bit 0x20. Flipping a length octet would be a
+        // different name rather than the same one in another case.
+        for text in ["www.Example.com.", "9-a.b."] {
+            let name = nm(text);
+            for _ in 0..64 {
+                let scrambled = randomize_case(name.as_ref());
+                assert_eq!(scrambled, name, "still the same name (RFC 4343)");
+                let (got, want) = (scrambled.as_ref().as_wire(), name.as_ref().as_wire());
+                assert_eq!(got.len(), want.len());
+                for (g, w) in got.iter().zip(want) {
+                    if w.is_ascii_alphabetic() {
+                        assert_eq!(g | 0x20, w | 0x20, "a letter changed to another letter");
+                    } else {
+                        assert_eq!(g, w, "a non-letter octet must not move");
+                    }
+                }
+            }
         }
     }
 
@@ -2025,28 +2047,28 @@ this line has no record and is skipped
 
     fn ns_record(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
-            name: owner.to_string(),
+            name: nm(owner),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
-            rdata: RecordData::from_parsed(&ParsedRecord::NS(target.to_string())).unwrap(),
+            rdata: RecordData::from_parsed(&ParsedRecord::NS(nm(target))).unwrap(),
         }
     }
 
     fn cname_record(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
-            name: owner.to_string(),
+            name: nm(owner),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
-            rdata: RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).unwrap(),
+            rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm(target))).unwrap(),
         }
     }
 
     fn dname_record(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
-            name: owner.to_string(),
+            name: nm(owner),
             class: Class::new(1),
             ttl: Ttl::from_secs(1800),
-            rdata: RecordData::from_parsed(&ParsedRecord::DNAME(target.to_string())).unwrap(),
+            rdata: RecordData::from_parsed(&ParsedRecord::DNAME(nm(target))).unwrap(),
         }
     }
 
@@ -2076,11 +2098,17 @@ this line has no record and is skipped
         resp
     }
 
+    /// A cache key as the caches build one: the folded wire form.
+    fn key_of(text: &str) -> Box<[u8]> {
+        nm(text).as_ref().folded().into_owned().into_boxed_slice()
+    }
+
+    /// The question, as the presentation text the mock servers here match on.
     fn qname_of(query: &DnsMessage) -> String {
         query
             .queries
             .first()
-            .map(|q| normalize(&q.qname))
+            .map(|q| q.qname.as_ref().to_folded().to_string())
             .unwrap_or_default()
     }
 
@@ -2114,7 +2142,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let answer = resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2143,7 +2171,7 @@ this line has no record and is skipped
         let tld_addr = tld_sock.local_addr().unwrap();
 
         let _tld = spawn_server(tld_sock, |q| {
-            let name = normalize(&qname_of(q));
+            let name = qname_of(q);
             if name == "www.example2.test." {
                 return authoritative(q, vec![a_record(&name, [192, 0, 2, 7])]);
             }
@@ -2159,7 +2187,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let answer = resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2182,11 +2210,7 @@ this line has no record and is skipped
         // Compared case-insensitively: the owner is a suffix of the question,
         // so it goes out as a compression pointer into a 0x20-randomized name
         // and comes back in that case (RFC 4343).
-        assert!(
-            names_equal(&dnames[0].name, "example.test."),
-            "{:?}",
-            dnames[0].name
-        );
+        assert_eq!(dnames[0].name, nm("example.test."));
 
         let cnames: Vec<_> = answer
             .answers
@@ -2194,10 +2218,10 @@ this line has no record and is skipped
             .filter(|rr| rr.rdata.rtype() == rt::CNAME)
             .collect();
         assert_eq!(cnames.len(), 1);
-        assert_eq!(cnames[0].name, "www.example.test.");
+        assert_eq!(cnames[0].name, nm("www.example.test."));
         assert_eq!(
             cnames[0].rdata.parse().unwrap(),
-            ParsedRecord::CNAME("www.example2.test.".to_string())
+            ParsedRecord::CNAME(nm("www.example2.test."))
         );
         assert_eq!(
             cnames[0].ttl, dnames[0].ttl,
@@ -2252,7 +2276,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let answers = resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2290,7 +2314,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let result = resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2340,7 +2364,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let result = resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2388,7 +2412,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let answer = resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2431,7 +2455,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let result = resolver
             .resolve(&QuerySection {
-                qname: "a.example.test.".to_string(),
+                qname: nm("a.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2497,7 +2521,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let answer = resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2534,7 +2558,7 @@ this line has no record and is skipped
         });
         let result = resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2609,7 +2633,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let answer = resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2642,7 +2666,7 @@ this line has no record and is skipped
         });
         resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2702,7 +2726,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let answer = resolver
             .resolve(&QuerySection {
-                qname: "www.sub.example.test.".to_string(),
+                qname: nm("www.sub.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2791,7 +2815,7 @@ this line has no record and is skipped
         let resolver = Resolver::new(recursing_config(root.addr));
         let answer = resolver
             .resolve(&QuerySection {
-                qname: leaf.to_string(),
+                qname: nm(leaf),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -2940,7 +2964,7 @@ this line has no record and is skipped
         ] {
             let answer = resolver
                 .resolve(&QuerySection {
-                    qname: name.to_string(),
+                    qname: nm(name),
                     qtype: Qtype::of(rt::A),
                     qclass: QueryClass::IN,
                 })
@@ -2976,20 +3000,20 @@ this line has no record and is skipped
         let com: SocketAddr = "192.0.2.1:53".parse().unwrap();
         let example: SocketAddr = "192.0.2.2:53".parse().unwrap();
 
-        cache.insert("com.", vec![com], 3600);
+        cache.insert(nm("com.").as_ref(), vec![com], 3600);
         assert_eq!(
-            cache.best_match("www.example.com.").unwrap(),
-            ("com.".to_string(), vec![com])
+            cache.best_match(nm("www.example.com.").as_ref()).unwrap(),
+            (nm("com."), vec![com])
         );
 
-        cache.insert("example.com.", vec![example], 3600);
+        cache.insert(nm("example.com.").as_ref(), vec![example], 3600);
         assert_eq!(
-            cache.best_match("www.example.com.").unwrap(),
-            ("example.com.".to_string(), vec![example])
+            cache.best_match(nm("www.example.com.").as_ref()).unwrap(),
+            (nm("example.com."), vec![example])
         );
 
         // An unrelated name still falls back to nothing.
-        assert!(cache.best_match("example.org.").is_none());
+        assert!(cache.best_match(nm("example.org.").as_ref()).is_none());
     }
 
     #[test]
@@ -2998,32 +3022,32 @@ this line has no record and is skipped
         let server: SocketAddr = "192.0.2.1:53".parse().unwrap();
 
         // A zero TTL means "don't cache".
-        cache.insert("zero.test.", vec![server], 0);
-        assert!(cache.best_match("zero.test.").is_none());
+        cache.insert(nm("zero.test.").as_ref(), vec![server], 0);
+        assert!(cache.best_match(nm("zero.test.").as_ref()).is_none());
 
         // An entry already expired is not returned.
         {
             let mut entries = cache.entries.lock().unwrap();
             entries.insert(
-                NameKeyBuf::new("stale.test."),
+                key_of("stale.test."),
                 CachedDelegation {
                     servers: vec![server],
                     expires_at: current_unix_timestamp().saturating_sub(1),
                 },
             );
         }
-        assert!(cache.best_match("stale.test.").is_none());
+        assert!(cache.best_match(nm("stale.test.").as_ref()).is_none());
 
         // forget() drops a live entry.
-        cache.insert("live.test.", vec![server], 3600);
-        assert!(cache.best_match("live.test.").is_some());
-        cache.forget("live.test.");
-        assert!(cache.best_match("live.test.").is_none());
+        cache.insert(nm("live.test.").as_ref(), vec![server], 3600);
+        assert!(cache.best_match(nm("live.test.").as_ref()).is_some());
+        cache.forget(nm("live.test.").as_ref());
+        assert!(cache.best_match(nm("live.test.").as_ref()).is_none());
 
         // A zero-capacity cache stores nothing.
         let off = DelegationCache::new(0);
-        off.insert("any.test.", vec![server], 3600);
-        assert!(off.best_match("any.test.").is_none());
+        off.insert(nm("any.test.").as_ref(), vec![server], 3600);
+        assert!(off.best_match(nm("any.test.").as_ref()).is_none());
     }
 
     #[test]
@@ -3031,14 +3055,14 @@ this line has no record and is skipped
         let cache = DelegationCache::new(2);
         let server: SocketAddr = "192.0.2.1:53".parse().unwrap();
 
-        cache.insert("a.test.", vec![server], 3600);
-        cache.insert("b.test.", vec![server], 7200);
-        cache.insert("c.test.", vec![server], 7200);
+        cache.insert(nm("a.test.").as_ref(), vec![server], 3600);
+        cache.insert(nm("b.test.").as_ref(), vec![server], 7200);
+        cache.insert(nm("c.test.").as_ref(), vec![server], 7200);
 
         let entries = cache.entries.lock().unwrap();
         assert!(entries.len() <= 2, "cache must stay within capacity");
         // The soonest-to-expire entry is the one dropped.
-        assert!(!entries.contains_key("a.test."));
+        assert!(!entries.contains_key(&key_of("a.test.")));
     }
 
     /// A second query for the same zone must not go back to the root.
@@ -3072,7 +3096,7 @@ this line has no record and is skipped
         ] {
             let answer = resolver
                 .resolve(&QuerySection {
-                    qname: name.to_string(),
+                    qname: nm(name),
                     qtype: Qtype::of(rt::A),
                     qclass: QueryClass::IN,
                 })
@@ -3121,11 +3145,11 @@ this line has no record and is skipped
         let dead: SocketAddr = format!("192.0.2.99:{}", root.addr.port()).parse().unwrap();
         resolver
             .delegations
-            .insert("example.test.", vec![dead], 3600);
+            .insert(nm("example.test.").as_ref(), vec![dead], 3600);
 
         let answer = resolver
             .resolve(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -3194,10 +3218,7 @@ this line has no record and is skipped
             "TCP length prefix {} is below a DNS header",
             claimed
         );
-        assert_eq!(
-            tcp_qname.as_deref().map(|n| n.to_ascii_lowercase()),
-            Some("example.com.".to_string())
-        );
+        assert_eq!(tcp_qname, Some(nm("example.com.")));
 
         assert!(!answer.truncation);
         assert_eq!(answer.answers.len(), 1);
@@ -3351,7 +3372,7 @@ this line has no record and is skipped
                 resp.id = query.id.wrapping_add(1);
             }
             if let Some(q) = resp.queries.first_mut() {
-                q.qname = mangle(&q.qname);
+                q.qname = nm(&mangle(&q.qname.to_string()));
             }
             resp.answers.push(a_record("example.com.", [10, 0, 0, 5]));
             let mut out = vec![0u8; 512];
@@ -3481,11 +3502,11 @@ this line has no record and is skipped
     /// is genuinely to an unsigned zone.
     fn signed_no_ds_proof(parent: &TestZone, name: &str) -> Vec<ResourceRecord> {
         let nsec = ResourceRecord {
-            name: name.to_string(),
+            name: nm(name),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
-                next_domain_name: "zz.test.".to_string(),
+                next_domain_name: nm("zz.test."),
                 type_bitmap: build_type_bitmap(&[rt::NS, rt::RRSIG, rt::NSEC]),
             })
             .unwrap(),
@@ -3685,10 +3706,10 @@ this line has no record and is skipped
     /// A signed CNAME RRset at `owner` pointing at `target`.
     fn cname_records(auth: &TestZone, owner: &str, target: &str) -> Vec<ResourceRecord> {
         let cname = ResourceRecord {
-            name: owner.to_string(),
+            name: nm(owner),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
-            rdata: RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).unwrap(),
+            rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm(target))).unwrap(),
         };
         let sig = auth.sign_records(std::slice::from_ref(&cname));
         vec![cname, sig]
@@ -3699,12 +3720,12 @@ this line has no record and is skipped
     /// exists and has no AAAA, which is what a NODATA owes (RFC 4035 §5.4).
     fn signed_nodata_authority(auth: &TestZone, name: &str) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
-            name: "example.test.".to_string(),
+            name: nm("example.test."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
-                mname: "ns.example.test.".to_string(),
-                rname: "admin.example.test.".to_string(),
+                mname: nm("ns.example.test."),
+                rname: nm("admin.example.test."),
                 serial: Serial::new(1),
                 refresh: 10800,
                 retry: 3600,
@@ -3714,11 +3735,11 @@ this line has no record and is skipped
             .unwrap(),
         };
         let nsec = ResourceRecord {
-            name: name.to_string(),
+            name: nm(name),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
-                next_domain_name: "zz.example.test.".to_string(),
+                next_domain_name: nm("zz.example.test."),
                 type_bitmap: build_type_bitmap(&[rt::A, rt::RRSIG, rt::NSEC]),
             })
             .unwrap(),
@@ -3734,12 +3755,12 @@ this line has no record and is skipped
     /// makes the whole proof.
     fn signed_nxdomain_authority(auth: &TestZone) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
-            name: "example.test.".to_string(),
+            name: nm("example.test."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
-                mname: "ns.example.test.".to_string(),
-                rname: "admin.example.test.".to_string(),
+                mname: nm("ns.example.test."),
+                rname: nm("admin.example.test."),
                 serial: Serial::new(1),
                 refresh: 10800,
                 retry: 3600,
@@ -3749,11 +3770,11 @@ this line has no record and is skipped
             .unwrap(),
         };
         let nsec = ResourceRecord {
-            name: "example.test.".to_string(),
+            name: nm("example.test."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
-                next_domain_name: "www.example.test.".to_string(),
+                next_domain_name: nm("www.example.test."),
                 type_bitmap: build_type_bitmap(&[rt::SOA, rt::NS, rt::RRSIG, rt::NSEC]),
             })
             .unwrap(),
@@ -3792,12 +3813,12 @@ this line has no record and is skipped
         let zone = "example.test.";
 
         let soa = ResourceRecord {
-            name: zone.to_string(),
+            name: nm(zone),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
-                mname: "ns.example.test.".to_string(),
-                rname: "admin.example.test.".to_string(),
+                mname: nm("ns.example.test."),
+                rname: nm("admin.example.test."),
                 serial: Serial::new(1),
                 refresh: 10800,
                 retry: 3600,
@@ -3811,7 +3832,7 @@ this line has no record and is skipped
             // An NSEC3's owner name is the base32hex of the hash, under the zone
             // — which is why nothing about this shape can be checked without
             // hashing for real.
-            name: format!("{}.{zone}", base32hex_encode(owner_hash)),
+            name: nm(&format!("{}.{zone}", base32hex_encode(owner_hash))),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
@@ -3846,12 +3867,12 @@ this line has no record and is skipped
     /// about what a wildcard would have answered.
     fn signed_wildcard_nodata_authority(auth: &TestZone, at_wildcard: bool) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
-            name: "example.test.".to_string(),
+            name: nm("example.test."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
-                mname: "ns.example.test.".to_string(),
-                rname: "admin.example.test.".to_string(),
+                mname: nm("ns.example.test."),
+                rname: nm("admin.example.test."),
                 serial: Serial::new(1),
                 refresh: 10800,
                 retry: 3600,
@@ -3862,14 +3883,14 @@ this line has no record and is skipped
         };
         let nsec = ResourceRecord {
             name: if at_wildcard {
-                "*.example.test.".to_string()
+                nm(&nm("*.example.test.").to_string())
             } else {
-                "m.example.test.".to_string()
+                nm(&nm("m.example.test.").to_string())
             },
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
-                next_domain_name: "zzz.example.test.".to_string(),
+                next_domain_name: nm("zzz.example.test."),
                 type_bitmap: build_type_bitmap(&[rt::A, rt::RRSIG, rt::NSEC]),
             })
             .unwrap(),
@@ -3903,7 +3924,7 @@ this line has no record and is skipped
     ) -> (DnsMessage, ValidationState) {
         Resolver::new(config)
             .resolve_validated(&QuerySection {
-                qname: "www.example.test.".to_string(),
+                qname: nm("www.example.test."),
                 qtype,
                 qclass: QueryClass::IN,
             })
@@ -4091,7 +4112,7 @@ this line has no record and is skipped
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (answer, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
-                qname: "gone.example.test.".to_string(),
+                qname: nm("gone.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -4116,7 +4137,7 @@ this line has no record and is skipped
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (answer, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
-                qname: "nsec3-gone.example.test.".to_string(),
+                qname: nm("nsec3-gone.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -4154,7 +4175,7 @@ this line has no record and is skipped
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (_, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
-                qname: "nsec3-incomplete.example.test.".to_string(),
+                qname: nm("nsec3-incomplete.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -4181,7 +4202,7 @@ this line has no record and is skipped
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (denial, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
-                qname: "gone.example.test.".to_string(),
+                qname: nm("gone.example.test."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             })
@@ -4225,7 +4246,7 @@ this line has no record and is skipped
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (answer, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
-                qname: "wild-nodata.example.test.".to_string(),
+                qname: nm("wild-nodata.example.test."),
                 qtype: Qtype::of(rt::AAAA),
                 qclass: QueryClass::IN,
             })
@@ -4250,7 +4271,7 @@ this line has no record and is skipped
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (_, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
-                qname: "stripped-wildcard.example.test.".to_string(),
+                qname: nm("stripped-wildcard.example.test."),
                 qtype: Qtype::of(rt::AAAA),
                 qclass: QueryClass::IN,
             })
@@ -4314,11 +4335,11 @@ this line has no record and is skipped
         let mut authority = Vec::new();
         if with_proof {
             let nsec = ResourceRecord {
-                name: "*.example.test.".to_string(),
+                name: nm("*.example.test."),
                 class: Class::new(1),
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
-                    next_domain_name: "zzz.example.test.".to_string(),
+                    next_domain_name: nm("zzz.example.test."),
                     type_bitmap: build_type_bitmap(&[rt::A, rt::RRSIG, rt::NSEC]),
                 })
                 .unwrap(),
@@ -4339,7 +4360,7 @@ this line has no record and is skipped
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (answer, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
-                qname: "chase.example.test.".to_string(),
+                qname: nm("chase.example.test."),
                 qtype: Qtype::of(rt::AAAA),
                 qclass: QueryClass::IN,
             })
@@ -4378,7 +4399,7 @@ this line has no record and is skipped
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (_, state) = Resolver::new(validating_config(&h))
             .resolve_validated(&QuerySection {
-                qname: "stripped-chase.example.test.".to_string(),
+                qname: nm("stripped-chase.example.test."),
                 qtype: Qtype::of(rt::AAAA),
                 qclass: QueryClass::IN,
             })
@@ -4402,12 +4423,13 @@ this line has no record and is skipped
     async fn test_a_signed_cname_chain_validates_as_secure() {
         let h = signed_hierarchy_with(signed_ds, |auth| {
             let cname = ResourceRecord {
-                name: "www.example.test.".to_string(),
+                name: nm("www.example.test."),
                 class: Class::new(1),
                 ttl: Ttl::from_secs(3600),
-                rdata: RecordData::from_parsed(&ParsedRecord::CNAME(
-                    "alias.example.test.".to_string(),
-                ))
+                rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm(&nm(
+                    "alias.example.test.",
+                )
+                .to_string())))
                 .unwrap(),
             };
             let cname_sig = auth.sign_records(std::slice::from_ref(&cname));
@@ -4470,7 +4492,8 @@ this line has no record and is skipped
         );
         for rr in &synthesized.answers {
             assert_eq!(
-                rr.name, "never-asked.example.test.",
+                rr.name,
+                nm("never-asked.example.test."),
                 "owned at the name asked for, as the zone would have sent it"
             );
         }
@@ -4499,7 +4522,7 @@ this line has no record and is skipped
         let h = signed_hierarchy(signed_ds, signed_answer);
         let resolver = Resolver::new(validating_config(&h));
         let query = QuerySection {
-            qname: "www.example.test.".to_string(),
+            qname: nm("www.example.test."),
             qtype: Qtype::of(rt::A),
             qclass: QueryClass::IN,
         };
@@ -4507,10 +4530,10 @@ this line has no record and is skipped
         let (_, first) = resolver.resolve_validated(&query).await.unwrap();
         assert_eq!(first, ValidationState::Secure, "{first}");
         assert!(
-            resolver.keys.holds("example.test."),
+            resolver.keys.holds(nm("example.test.").as_ref()),
             "the leaf zone's keys should be cached after one validated query"
         );
-        assert!(resolver.keys.holds("."), "and the root's");
+        assert!(resolver.keys.holds(nm(".").as_ref()), "and the root's");
 
         let (_, second) = resolver.resolve_validated(&query).await.unwrap();
         assert_eq!(second, ValidationState::Secure, "{second}");

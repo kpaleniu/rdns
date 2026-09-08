@@ -5,15 +5,17 @@
 //! the real verification path through it rather than a mock.
 
 use crate::dnssec::{
-    key_tag, rrsig_labels, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE,
+    key_tag, rrsig_labels_of, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP,
+    DNSKEY_FLAG_ZONE,
 };
 use crate::dnssec_key::{SigningAlgorithm, SigningKey};
+use crate::test_records::nm;
 use crate::utils::{current_unix_timestamp, record_types as rt};
 use crate::zone_signer::{DenialChain, SigningPolicy};
 use crate::Class;
 use crate::Rtype;
 use crate::Ttl;
-use crate::{ParsedRecord, RecordData, ResourceRecord};
+use crate::{NameRef, ParsedRecord, RecordData, ResourceRecord};
 
 /// DNSKEY flags for a zone-signing key, and for a key-signing key (which adds
 /// the Secure Entry Point bit).
@@ -89,7 +91,7 @@ impl TestKey {
     /// [`signed_data`] hashes.
     pub fn rrsig_template(
         &self,
-        owner: &str,
+        owner: NameRef<'_>,
         type_covered: Rtype,
         original_ttl: u32,
         signer: &str,
@@ -97,10 +99,10 @@ impl TestKey {
     ) -> Rrsig {
         let now = current_unix_timestamp();
         Rrsig {
-            owner: owner.to_string(),
+            owner: owner.to_presentation(),
             type_covered,
             algorithm: self.algorithm(),
-            labels: rrsig_labels(owner),
+            labels: rrsig_labels_of(owner),
             original_ttl,
             inception: (now - 3600) as u32,
             expiration: (now + 86_400) as u32,
@@ -121,7 +123,7 @@ impl TestKey {
         rdatas: &[RecordData],
     ) -> Rrsig {
         self.sign_rrset_as(
-            &Rrset::new(owner, rtype, class, rdatas),
+            &Rrset::new(nm(owner).as_ref(), rtype, class, rdatas),
             ttl,
             signer,
             ZSK_FLAGS,
@@ -166,7 +168,7 @@ impl TestZone {
     pub fn signed_dnskey_rrset(&self) -> (Vec<RecordData>, Rrsig) {
         let rdatas: Vec<RecordData> = self.dnskeys().iter().map(dnskey_rdata).collect();
         let sig = self.ksk.sign_rrset_as(
-            &Rrset::new(&self.name, rt::DNSKEY, Class::new(1), &rdatas),
+            &Rrset::new(nm(&self.name).as_ref(), rt::DNSKEY, Class::new(1), &rdatas),
             3600,
             &self.name,
             KSK_FLAGS,
@@ -193,7 +195,7 @@ impl TestZone {
         let mut out: Vec<ResourceRecord> = rdatas
             .into_iter()
             .map(|rdata| ResourceRecord {
-                name: self.name.clone(),
+                name: nm(&self.name.clone()),
                 class: Class::new(1),
                 ttl: Ttl::from_secs(3600),
                 rdata,
@@ -220,7 +222,7 @@ impl TestZone {
             &self.name,
             &rdatas,
         );
-        sig.owner = first.name.clone();
+        sig.owner = first.name.to_string();
         rrsig_record(&sig, first.ttl)
     }
 
@@ -230,7 +232,7 @@ impl TestZone {
         let first = records.first().expect("an RRset has at least one record");
         let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
         let sig = self.zsk.sign_rrset(
-            &first.name,
+            &first.name.to_string(),
             first.rdata.rtype(),
             first.class,
             first.ttl.as_secs(),
@@ -255,7 +257,7 @@ pub fn dnskey_rdata(key: &Dnskey) -> RecordData {
 /// An RRSIG as a resource record.
 pub fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
-        name: sig.owner.clone(),
+        name: nm(&sig.owner.clone()),
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
@@ -266,7 +268,7 @@ pub fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
             inception: sig.inception,
             expiration: sig.expiration,
             key_tag: sig.key_tag,
-            signer_name: sig.signer_name.clone(),
+            signer_name: nm(&sig.signer_name.clone()),
             signature: sig.signature.clone(),
         })
         .expect("encode RRSIG"),
@@ -276,7 +278,7 @@ pub fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
 /// A DS as a resource record.
 pub fn ds_record(ds: &Ds, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
-        name: ds.owner.clone(),
+        name: nm(&ds.owner.clone()),
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::DS {

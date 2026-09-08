@@ -8,8 +8,20 @@
 
 use crate::denial_wire::build_type_bitmap;
 use crate::dnssec_denial::{nsec3_hash, nsec3_owner_name, Nsec3};
-use crate::{Class, ParsedRecord, RecordData, ResourceRecord, Rtype, Serial, Ttl};
+use crate::{Class, Name, ParsedRecord, RecordData, ResourceRecord, Rtype, Serial, Ttl};
 use std::net::Ipv4Addr;
+
+/// A name from a literal, for tests only: `Name` is fallible to build and a test
+/// that writes a bad one should fail loudly at that line, rather than threading
+/// a `Result` through a fixture.
+///
+/// One per crate, not one per module — and `rdns-core` has the same three lines
+/// in `name.rs`. The copies left are in the standalone binaries, `tests/`,
+/// `benches/` and `examples/`, which cannot see a `#[cfg(test)]` item in the
+/// library; making it public API to spare them would be the worse trade.
+pub fn nm(text: &str) -> Name {
+    text.parse().expect("a test name parses")
+}
 
 /// The NSEC3 parameters every fixture here hashes under. One salt and one
 /// iteration count, because two records in one proof that disagree about
@@ -20,7 +32,7 @@ pub const NSEC3_ITERATIONS: u16 = 3;
 /// An A record at 300s, the TTL every caller was already using.
 pub fn a_record(name: &str, addr: impl Into<Ipv4Addr>) -> ResourceRecord {
     ResourceRecord {
-        name: name.to_string(),
+        name: nm(name),
         class: Class::new(1),
         ttl: Ttl::from_secs(300),
         rdata: a_rdata(addr),
@@ -35,12 +47,12 @@ pub fn a_rdata(addr: impl Into<Ipv4Addr>) -> RecordData {
 /// names two zones cannot accidentally give them the same SOA.
 pub fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
-        name: zone.to_string(),
+        name: nm(zone),
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::SOA {
-            mname: format!("ns1.{zone}"),
-            rname: format!("admin.{zone}"),
+            mname: nm(&format!("ns1.{zone}")),
+            rname: nm(&format!("admin.{zone}")),
             serial: Serial::new(1),
             refresh: 10800,
             retry: 3600,
@@ -53,11 +65,11 @@ pub fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
 
 pub fn nsec_record(owner: &str, next: &str, types: &[Rtype], ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
-        name: owner.to_string(),
+        name: nm(owner),
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
-            next_domain_name: next.to_string(),
+            next_domain_name: nm(next),
             type_bitmap: build_type_bitmap(types),
         })
         .expect("encode NSEC"),
@@ -104,7 +116,7 @@ pub fn nsec3_span(
     ttl: Ttl,
 ) -> ResourceRecord {
     ResourceRecord {
-        name: nsec3_owner_name(owner_hash, zone),
+        name: nm(&nsec3_owner_name(owner_hash, zone)),
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
@@ -121,7 +133,7 @@ pub fn nsec3_span(
 
 fn nsec3_as_record(n: &Nsec3, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
-        name: n.owner.clone(),
+        name: nm(&n.owner.clone()),
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {

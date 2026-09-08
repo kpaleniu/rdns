@@ -4959,6 +4959,155 @@ test is named for.
 
 ---
 
+---
+
+### 36. #13e's `Name` half: names as wire octets — **filed and closed 2026-09-07**
+
+`TODO.md` D-1 argued for this in its last clause and had done for a month: a
+label is "any binary string whatever" (RFC 2181 §11), names were `String`s in
+presentation form, and the consequence was not only that such a zone could not
+be *served* — a response carrying such a name was unparseable, so `rdnsr` could
+not relay somebody else's zone that had one. That is the claim
+`rdns-core/src/lib.rs`'s `a_response_carrying_a_binary_label_relays_byte_for_byte`
+now holds, with the old refusal asserted beside it rather than described.
+
+```rust
+pub struct Name(Box<[u8]>);          // wire octets, always absolute
+pub struct NameRef<'a>(&'a [u8]);    // Copy, borrowed, the argument type
+```
+
+Wire form rather than `Vec<Label>`: one allocation per name, not one per label,
+which is what let #27's two-allocation query survive the change. And rather than
+presentation text, which is what D-1 was about — `.` inside a label has no
+spelling that is also injective, so `a\.b` and `a`,`b` were one string.
+
+#### Two commits, because there was one green intermediate and no more
+
+`75ee073` added the type with nothing using it, so the representation could be
+judged on its own. After that, staging was tried and abandoned:
+`ResourceRecord::name` and `QuerySection::qname` are read by all seven crates,
+so the field type cannot change in one crate and not the others, and every stage
+that compiles is the whole change. The migration happened in a worktree and
+landed as one diff.
+
+#### Five defects, none in the mechanical part
+
+The rename was mechanical and the compiler drove it. What it did not drive is
+where the bugs were — `CLAUDE.md`'s "suspicion belongs where confidence is
+highest", again:
+
+- **Two caches inserted a folded key and looked up an unfolded one.**
+  `DelegationCache` and `KeyCache` in `resolver.rs` key on `Box<[u8]>`, whose
+  `Hash` does not fold — but the lookup passed `name.as_wire()` while `insert`
+  passed `name.folded()`. A `Box<[u8]>` looked like a name, and a comment
+  asserting "the map is keyed on the name itself, whose `Hash` folds ASCII" made
+  it look checked. A 0x20-randomized query missed its own write. Both now fold
+  the walk once, which is also one copy instead of one per candidate.
+- **The NSEC3 closest-encloser walk went through presentation text.** RFC 5155
+  §5 hashes the *wire* form; `Nsec3Chain::hash` had a `Name`, turned it into a
+  `String`, and `nsec3_hash_in` turned that back into octets — a `String` per
+  candidate name, and the walk hashes one per label of the QNAME. The wire
+  spelling (`nsec3_hash_name`) is the direct one. Same for the owner name it
+  derives: `Name::prefixed(base32hex, origin)` instead of `format!` and a
+  re-parse. An NSEC3 NXDOMAIN read 21 allocations and is back to 16, inside the
+  range it had.
+- **`UnpackedDName::to_wire` sized every name at `MAX_NAME_LEN`.** `Name` keeps
+  a boxed slice, and shrinking a 255-octet `Vec` to twenty reallocates: one copy
+  per *compressed* name in every message parsed. `rdns/tests/allocations.rs` read
+  18 where it holds 15, which is how it was found.
+
+A fourth is older than any of them and was found by the type refusing to
+compile: **a name inside RDATA was never resolved against the origin.**
+RFC 1035 §5.1 says "domain names in the RDATA section of RRs ... are also
+relative", and `rdata_from_fields` took the raw text — so `www IN CNAME host`
+stored the target as the one-label name `host.` and the chain went nowhere.
+Owner names were resolved and RDATA names were not, in the same loop. Nothing
+found it because presentation text does not object to a relative name; a `Name`
+does, so the parser has to say what each name is relative *to* before it can
+build one. That is `a_name_inside_rdata_is_relative_to_the_origin_too`, and it
+is the clearest thing in this section about why a type beats a check.
+
+A fifth was found by running the thing rather than reading it: a zone holding
+`a\.b IN A` loaded and answered but would not **sign**, because `signed_data`
+built the owner's octets by re-encoding canonical *text* and `dname_to_bytes`
+refuses the escape. `signed_owner_name` and `rrsig_labels_of` work on the name.
+Counting dots also miscounted the labels of such a name, which is the same bug
+one line up.
+
+#### What changed shape, and what deliberately did not
+
+| | |
+|---|---|
+| `Zone` | `index: HashMap<Box<[u8]>, Vec<usize>>` on the folded wire; every public entry point folds once and the private ones take a key. `normalize_name` is gone — a `Name` is absolute, so the question it answered cannot be asked |
+| `Zone::set_origin` | no longer re-keys anything. Its doc comment said it did; that was true of relative text and false of a `Name` |
+| `zone_writer` | `writable_name` is total. There is no name this cannot spell, which is D-1 closing from the other end |
+| DNSSEC | `Rrsig`, `Ds`, `Dnskey` and the denial records keep **canonical text** owners. That text is what signatures are computed over, and `canonical_name_of` is the one door between the two forms. Changing it inside a mechanical rename would have hidden a signature change |
+
+**Three tests had to change**, and each had encoded something the type removed
+(`CLAUDE.md` §1):
+
+- `normalizing_a_name_copies_only_when_it_changes` asserted on a `Cow` arm that
+  no longer exists. It is now `a_relative_name_is_completed_against_the_origin`,
+  about `absolutize`'s three cases.
+- `test_set_origin_rekeys_relative_records` and
+  `the_apex_soa_is_found_under_an_unabsolutized_owner_name` were both about an
+  owner name that might be relative. Relativity is gone; case is not, so the
+  second is now about `ExAmPlE.CoM.` — the surviving half of the same bug.
+- The two `zone_writer` "unwritable name" tests asserted a refusal that would
+  now be wrong. They are round trips instead, through `has space`, `a.b`,
+  `semi;colon` and `quo"te`.
+
+#### What went with it
+
+The point of a representation change is that the code the old one needed stops
+existing. `dname.rs` was a wire reader *and* a presentation reader *and* a
+presentation writer; it is a wire reader now.
+
+| deleted | why it was there |
+|---|---|
+| `dname_from_bytes`, `DNameUnpacker::decode`, `DName::to_presentation`, `TryInto<String> for UnpackedDName`, `push_label`, `root_if_empty`, `TryInto<&str> for Label` | the wire-to-text half. Every name off the wire went through it; `Name::from_wire_in` is the door now, and text is something [`NameRef::to_presentation`] produces on request |
+| `dname_to_bytes`, `dname_to_bytes_in`, `write_label`, `unrepresentable_octet` | the text-to-wire half, and a *second* decoder: it refused RFC 1035 §5.1's escapes where `Name::from_presentation` resolves them, so the two disagreed about what `a\.b` meant. That divergence was live — a TSIG key name and an RRSIG signer name went through it |
+| `utils::names_equal`, `utils::ascii_lowered_cow`, `utils::absolute_lowered_in` | comparing and folding names as text. `NameRef`'s `Eq`/`Hash` fold as they go, so there is nothing to normalize first |
+| `dnssec::rrsig_labels` | counted labels by counting dots, which is wrong for a label containing one. `rrsig_labels_of` counts labels |
+| `Zone::normalize_name`, `Zone::lookup_key`, `xfr::absolute` | questions a `Name` answers by construction: is this absolute, and what is its key |
+
+Two of those deletions were the fix rather than the cleanup. `signed_data` built
+the RRSIG's *signer* name and `ds_digest` its key owner by re-encoding canonical
+text through `dname_to_bytes`, so a zone whose apex needed an escape could
+neither sign nor be digested — the same defect as the owner one above, two more
+places. Both go through `Name` now, and `dnssec::canonical_wire` is the one door
+back from the text those structs keep.
+
+Where a hot path lost its stack buffer, it got it back rather than an
+allocation: `Name::from_presentation` is now a thin wrapper over
+`name::presentation_wire_in`, which writes into a caller's `[u8; 255]`, and the
+NSEC3 walk calls that directly. Rewriting it that way also stopped
+`from_presentation` growing a `Vec` and then shrinking it — two allocations for
+one name — which is why "prove a signed NXDOMAIN" reads 7 where it read 8 and the
+NSEC3 proof reads 6 where it read 16.
+
+#### Measured
+
+`rdns/tests/allocations.rs`, forty-four measurements, and **not one assertion
+range moved** — the diff over that file touches no `within` call. A query parses
+in 2, one zone lookup costs 4, a response writes in 0, the three lookups behind
+one answer cost 1 (3 case-randomized), and the answer path's lookups cost 1, or 0
+into a worker's buffer. Holding the last one needed `resolve_in_zone` to fold
+once per name rather than once per lookup, which is #27a's rule and had been lost
+in the rename — the delegating-zone case read 2 and named it.
+
+Verified live against **dnspython** on a signed zone: twenty-one checks, DNSKEY
+self-signature, an A, an MX, a 0x20-randomized question echoed verbatim, a
+wildcard with its denial and its lower label count, an NXDOMAIN's two denials, an
+unsigned delegation NS RRset, DNAME, HTTPS — and `a\.b.example.com.`, which
+dnspython reads as one label of three octets and whose RRSIG verifies. That last
+one is the deviation, checked by a third party.
+
+The suite is 908 on Windows and 924 on Linux — *fewer* than before, because the
+tests for the deleted halves went with them; clippy is clean on both, and the
+gap between the two platforms is the `#[cfg(unix)]` modules — `rdnsd/src/control.rs` needed four fixes that
+Windows cannot see, which is `CLAUDE.md` §1's trap firing exactly as documented.
+
 ### 35. SVCB and HTTPS (RFC 9460) — **filed and closed 2026-09-07**
 
 Taken straight after #34, and for the reason #34's closing note left behind:

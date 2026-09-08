@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use crate::utils::record_types as rt;
 use crate::zone::Zone;
-use crate::{ParsedRecord, Serial};
+use crate::{Name, ParsedRecord, Serial};
 
 /// The floor under REFRESH and RETRY. A SOA saying "refresh every 0 seconds" is
 /// otherwise a loop asking the master as fast as the network allows; the RFCs
@@ -104,8 +104,10 @@ impl RefreshTimers {
 /// One zone to replicate, and where from: `zone@master[:port][#keyname]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterSpec {
-    /// The zone's apex, absolute.
-    pub zone: String,
+    /// The zone's apex. Parsed here, at the one place the flag's text
+    /// becomes a name, so a bad `--secondary` is a startup error rather than a
+    /// zone that silently never matches.
+    pub zone: Name,
     pub master: SocketAddr,
     /// By name, looked up in the keys `--tsig-key` defines, so a secret is
     /// written down in one place.
@@ -137,7 +139,9 @@ impl MasterSpec {
         }
 
         Ok(MasterSpec {
-            zone: absolute(zone),
+            zone: Name::from_presentation(zone).map_err(|e| {
+                ConfigError::new(format!("{spec:?}: {zone:?} is not a domain name: {e}"))
+            })?,
             master: parse_address(master, spec)?,
             key_name,
         })
@@ -319,7 +323,9 @@ pub fn state_file_path(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_records::nm;
     use crate::zone::parse_zone_file;
 
     fn addr(text: &str) -> SocketAddr {
@@ -331,7 +337,7 @@ mod tests {
         assert_eq!(
             MasterSpec::parse("example.com@192.0.2.1").unwrap(),
             MasterSpec {
-                zone: "example.com.".to_string(),
+                zone: nm("example.com."),
                 master: addr("192.0.2.1:53"),
                 key_name: None,
             },
@@ -340,7 +346,7 @@ mod tests {
         assert_eq!(
             MasterSpec::parse("example.com.@192.0.2.1:5353#transfer.key.").unwrap(),
             MasterSpec {
-                zone: "example.com.".to_string(),
+                zone: nm("example.com."),
                 master: addr("192.0.2.1:5353"),
                 key_name: Some("transfer.key.".to_string()),
             }

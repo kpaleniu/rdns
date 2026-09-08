@@ -28,11 +28,11 @@ each row exists (`CLAUDE.md` §11).
 | 1035 §4.2.1 | 512-octet UDP, TC=1, TCP retry | yes | `to_bytes_within` |
 | 1035 §4.2.2 | 2-octet TCP length prefix | yes, checked — **D-2** fixed 2026-08-03 | `rdns::framed`, one site |
 | 1035 §5 | master file format | partial — no `$GENERATE` | `zone.rs` |
-| 1035 §5.1 | `\X` and `\DDD` escapes | yes, since 2026-09-07 — in TXT and SVCB values. A name still refuses `\` (**D-1**) | `utils::char_string_decode` |
+| 1035 §5.1 | `\X` and `\DDD` escapes | yes, since 2026-09-07 — in TXT and SVCB values, and in names since **D-1** closed the same day | `utils::char_string_decode`, `Name::from_presentation` |
 | 1996 | NOTIFY, both directions | yes — **D-3** and **D-4** both fixed 2026-08-03 | `notify.rs`, `rdnsd` |
 | 1982 | serial arithmetic | yes — `Serial` has no `Ord` | `lib.rs` |
 | 2181 §8 | TTL is unsigned; top bit set reads as 0 | yes, clamped at the boundary once | `Ttl::from_wire` |
-| 2181 §11 | any binary string may be a label | **no** — see **D-1** | `dname.rs:143` |
+| 2181 §11 | any binary string may be a label | yes — **D-1** fixed 2026-09-07 | `name.rs`, `Name(Box<[u8]>)` |
 | 2308 §2 | negative answers carry the SOA | yes | `add_negative` |
 | 2308 §3 | negative TTL = min(MINIMUM, SOA TTL) | yes, and the RRSIG beside it | `negative_ttl`, `soa_signatures` |
 | 3597 | unknown RR types round-trip | yes, incl. `\#` and `TYPEnnn` | `RecordData`, `zone_writer` |
@@ -90,18 +90,25 @@ each row exists (`CLAUDE.md` §11).
 Behaviour a reading of the cited RFC would not predict. Each is deliberate unless
 marked otherwise.
 
-### D-1 — a label that is not valid UTF-8 is refused
+### D-1 — a label that is not valid UTF-8 is refused — **fixed 2026-09-07**
 
-`dname.rs:143`. RFC 2181 §11: "any binary string whatever can be used as the
+~~`dname.rs:143`. RFC 2181 §11: "any binary string whatever can be used as the
 label of any resource record". This implementation rejects such a label with
-`WireError::Malformed`, which a daemon answers FORMERR.
+`WireError::Malformed`, which a daemon answers FORMERR.~~
 
-Deliberate, and the trade is stated in `dname.rs`: names are `String`s in
+~~Deliberate, and the trade is stated in `dname.rs`: names are `String`s in
 presentation form throughout, and the alternative is a different representation
 (labels or wire bytes) — a change `TODO.md` #13e scopes and defers, and which
 `TODO.md` #21 records as the one deviation with a cost worth reopening for.
 Consequence: a zone containing such a name cannot be served, and a response
-containing one is unparseable, so a resolver cannot relay it.
+containing one is unparseable, so a resolver cannot relay it.~~
+
+The representation the trade named is what landed: `Name` holds wire octets
+(`docs/CLOSED_WORK.md` #36), a label is any binary string, and the consequence
+the last sentence describes is the regression test —
+`a_response_carrying_a_binary_label_relays_byte_for_byte`, which asserts the old
+refusal beside the new behaviour so the contrast is checked rather than
+remembered.
 
 ### D-2 — the TCP length prefix is an unchecked cast — **fixed 2026-08-03**
 

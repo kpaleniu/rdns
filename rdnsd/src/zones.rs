@@ -20,13 +20,12 @@ use rdns::dnssec_validation_mode::DnssecValidator;
 use rdns::ixfr::{plan_change, DeltaLog, PlannedDelta};
 use rdns::journal::Journal;
 use rdns::metrics::DnsMetrics;
-use rdns::utils::{
-    absolute, absolute_lowered, ascii_lowered_cow, current_unix_timestamp, label_count,
-    parent_name, record_types, NameKeyBuf,
-};
+#[cfg(test)]
+use rdns::utils::label_count;
+use rdns::utils::{current_unix_timestamp, record_types};
 use rdns::zone::{parse_zone_file_at, Zone};
 use rdns::zone_signer::{sign_zone, sign_zone_incrementally, DenialChain, SigningPolicy};
-use rdns::{Qtype, ResourceRecord, Rtype};
+use rdns::{Name, NameRef, Qtype, ResourceRecord, Rtype};
 
 use crate::config;
 use crate::{absolute_name, Cli};
@@ -37,12 +36,12 @@ use crate::{absolute_name, Cli};
 /// against it — bounded by the name's label count rather than by how many zones
 /// are served. The `Arc` lets [`Zones::snapshot`] hand a transfer a version it
 /// can write to a socket while reloads replace the map around it.
-pub(crate) type ZoneMap = HashMap<NameKeyBuf, Arc<Zone>>;
+pub(crate) type ZoneMap = HashMap<Box<[u8]>, Arc<Zone>>;
 
 /// The key a zone is held under: its own origin, folded. One definition, so no
 /// call site keys on `origin().to_string()` in whatever case its file used.
-pub(crate) fn zone_key(zone: &Zone) -> NameKeyBuf {
-    NameKeyBuf::new(zone.origin())
+pub(crate) fn zone_key(zone: &Zone) -> Box<[u8]> {
+    zone.origin().folded().into_owned().into_boxed_slice()
 }
 
 /// Zone source: either a single file or a directory of zone files
@@ -108,9 +107,9 @@ pub(crate) async fn install_zone(served: &ZoneContext, zone: Zone) {
         metrics,
         journal,
     } = served;
-    let origin = zone.origin().to_string();
+    let origin = zone.origin().to_owned();
     if let Some(serial) = zone.serial() {
-        metrics.set_zone_serial(zone.origin(), serial);
+        metrics.set_zone_serial(&zone.origin().to_presentation(), serial);
     }
 
     // The diff walks every record of both versions and queries take this same
@@ -145,7 +144,7 @@ pub(crate) async fn install_zone(served: &ZoneContext, zone: Zone) {
     // secondaries a full transfer, which RFC 1995 §4 permits at any time.
     if recorded {
         if let Some(journal) = journal {
-            if let Err(e) = journal.save(&origin, &log.all(&origin)) {
+            if let Err(e) = journal.save(origin.as_ref(), &log.all(origin.as_ref())) {
                 tracing::warn!("could not persist the delta log for {origin}: {e}");
             }
         }
@@ -194,22 +193,24 @@ pub(crate) async fn install_all_zones(served: &ZoneContext, new_zones: ZoneMap) 
     if zones.generation() != generation {
         plan = plan_reload(&zones, &new_zones);
     }
-    let mut touched: Vec<String> = Vec::new();
+    let mut touched: Vec<Name> = Vec::new();
     for gone in plan.forgotten {
-        log.forget(gone.as_str());
+        log.forget(gone.as_ref());
         // On disk too: a zone withdrawn from the configuration must not come
         // back after a restart offering increments of something nobody serves.
         if let Some(journal) = journal {
-            journal.forget(gone.as_str());
+            journal.forget(gone.as_ref());
         }
     }
     for planned in plan.recorded {
-        touched.push(planned.zone().to_string());
+        if let Ok(zone) = NameRef::from_wire_slice(planned.zone()) {
+            touched.push(zone.to_owned());
+        }
         log.record(planned);
     }
     if let Some(journal) = journal {
         for zone in &touched {
-            if let Err(e) = journal.save(zone, &log.all(zone)) {
+            if let Err(e) = journal.save(zone.as_ref(), &log.all(zone.as_ref())) {
                 tracing::warn!("could not persist the delta log for {zone}: {e}");
             }
         }
@@ -242,7 +243,10 @@ pub(crate) async fn restore_journals(
     let zones = zone_map.read().await;
     let mut log = deltas.write().await;
     for (name, zone) in zones.iter() {
-        let loaded = match journal.load(name.as_str()) {
+        let Ok(name) = NameRef::from_wire_slice(name) else {
+            continue;
+        };
+        let loaded = match journal.load(name) {
             Ok(loaded) => loaded,
             Err(e) => {
                 tracing::warn!("ignoring the journal for {name}: {e}");
@@ -257,7 +261,7 @@ pub(crate) async fn restore_journals(
                 "the journal for {name} stops short of the serial loaded from disk; \
                  discarding it, so a secondary asking for an increment gets a full transfer"
             );
-            journal.forget(name.as_str());
+            journal.forget(name);
             continue;
         }
         tracing::info!(
@@ -265,14 +269,14 @@ pub(crate) async fn restore_journals(
             loaded.len(),
             if loaded.len() == 1 { "" } else { "s" }
         );
-        log.restore(name.as_str(), loaded);
+        log.restore(name, loaded);
     }
 }
 
 /// What a reload does to the delta log: which zones leave it, and which gain a
 /// version step. Computed away from the write lock — see `Zones`.
 pub(crate) struct ReloadPlan {
-    forgotten: Vec<NameKeyBuf>,
+    forgotten: Vec<Name>,
     recorded: Vec<PlannedDelta>,
 }
 
@@ -281,8 +285,11 @@ pub(crate) fn plan_reload(zones: &Zones, new_zones: &ZoneMap) -> ReloadPlan {
     // lookup rather than a scan of the new set per zone in the old.
     let forgotten = zones
         .keys()
-        .filter(|old_name| !new_zones.contains_key(old_name.as_str()))
-        .cloned()
+        .filter(|old_name| !new_zones.contains_key(old_name.as_ref() as &[u8]))
+        // The map's keys are folded wire octets, which is a name — so this
+        // reads one back rather than keeping a second spelling beside it.
+        .filter_map(|old_name| NameRef::from_wire_slice(old_name).ok())
+        .map(|name| name.to_owned())
         .collect();
     let recorded = new_zones
         .values()
@@ -298,7 +305,7 @@ pub(crate) fn plan_reload(zones: &Zones, new_zones: &ZoneMap) -> ReloadPlan {
 pub(crate) fn note_serials(metrics: &DnsMetrics, zones: &ZoneMap) {
     for zone in zones.values() {
         if let Some(serial) = zone.serial() {
-            metrics.set_zone_serial(zone.origin(), serial);
+            metrics.set_zone_serial(&zone.origin().to_presentation(), serial);
         }
     }
 }
@@ -366,17 +373,17 @@ impl Zones {
     /// deallocation per record, and no query should wait on those.
     #[must_use = "drop the displaced zone after releasing the lock, not under it"]
     pub(crate) fn insert(&mut self, zone: Zone) -> Option<Arc<Zone>> {
-        self.deepest = self.deepest.max(label_count(zone.origin()));
+        self.deepest = self.deepest.max(zone.origin().label_count());
         let displaced = self.by_name.insert(zone_key(&zone), Arc::new(zone));
         self.generation += 1;
         displaced
     }
 
     /// Withdraw a zone. `true` if one was actually held.
-    pub(crate) fn remove(&mut self, name: &str) -> bool {
+    pub(crate) fn remove(&mut self, name: NameRef<'_>) -> bool {
         if self
             .by_name
-            .remove(absolute_lowered(name).as_ref())
+            .remove(name.folded().as_ref() as &[u8])
             .is_none()
         {
             return false;
@@ -401,10 +408,8 @@ impl Zones {
     /// `absolute_lowered` borrows when there is nothing to fold, so a name that
     /// arrived absolute and lower-case — every name off the wire that matches a
     /// zone — looks itself up without allocating.
-    pub(crate) fn matching(&self, name: &str) -> Option<&Zone> {
-        self.by_name
-            .get(absolute_lowered(name).as_ref())
-            .map(Arc::as_ref)
+    pub(crate) fn matching(&self, name: NameRef<'_>) -> Option<&Zone> {
+        self.by_name.get(name.folded().as_ref()).map(Arc::as_ref)
     }
 
     /// The version held for `name`, as something that outlives the guard.
@@ -415,8 +420,8 @@ impl Zones {
     /// version current when it was taken, which is also what makes a transfer
     /// correct — half of one version and half of the next is a zone that never
     /// existed.
-    pub(crate) fn snapshot(&self, name: &str) -> Option<Arc<Zone>> {
-        self.by_name.get(absolute_lowered(name).as_ref()).cloned()
+    pub(crate) fn snapshot(&self, name: NameRef<'_>) -> Option<Arc<Zone>> {
+        self.by_name.get(name.folded().as_ref()).cloned()
     }
 
     /// The zone that should answer `qname`: the most specific one the name is at
@@ -442,27 +447,19 @@ impl Zones {
     ///
     /// Both `Cow`s borrow for a name that arrived absolute and lower-case, which
     /// is every name off the wire, so the lookup allocates nothing.
-    pub(crate) fn for_query(&self, qname: &str) -> Option<&Zone> {
-        let absolute = absolute(qname);
-        let mut candidate: &str = absolute.as_ref();
-        match candidate.rmatch_indices('.').nth(self.deepest) {
-            // Every label skipped: the root is spelled `.`, not the empty
-            // string, and a root-only server has a `deepest` of 0.
-            Some((dot, _)) if dot + 1 == candidate.len() => candidate = ".",
-            Some((dot, _)) => candidate = &candidate[dot + 1..],
-            // Fewer labels than the deepest origin held: nothing to skip.
-            None => {}
-        }
-        let key = ascii_lowered_cow(candidate);
-        let mut name: &str = key.as_ref();
-        loop {
-            if let Some(zone) = self.by_name.get(name) {
+    pub(crate) fn for_query(&self, qname: NameRef<'_>) -> Option<&Zone> {
+        // Every ancestor from `deepest` labels down, which is where the
+        // deepest zone this server holds could start.
+        for candidate in qname.ancestors().skip(
+            qname
+                .label_count()
+                .saturating_sub(self.deepest.min(qname.label_count())),
+        ) {
+            if let Some(zone) = self.by_name.get(candidate.folded().as_ref()) {
                 return Some(zone);
             }
-            // `parent_name` is `None` only at the root, so a root zone is the
-            // last candidate tried rather than one that is skipped.
-            name = parent_name(name)?;
         }
+        None
     }
 }
 
@@ -470,7 +467,8 @@ impl Zones {
 fn deepest_origin(zones: &ZoneMap) -> usize {
     zones
         .keys()
-        .map(|origin| label_count(origin.as_str()))
+        .filter_map(|origin| NameRef::from_wire_slice(origin).ok())
+        .map(|origin| origin.label_count())
         .max()
         .unwrap_or(0)
 }
@@ -670,12 +668,14 @@ impl ZoneSigning {
     /// signed" are different claims, and a key directory missing a key is what a
     /// dry run is for.
     ///
-    /// `self.keys` is keyed by `dnssec::canonical_name`, the same form a
-    /// [`ZoneMap`] key is in, so this needs no fold per zone.
+    /// `self.keys` is keyed by `dnssec::canonical_name` — down-cased text — and
+    /// a [`ZoneMap`] key is the *folded* wire form, so spelling one out is
+    /// already canonical and no fold is needed per zone.
     pub(crate) fn signed_zone_count(&self, zones: &ZoneMap) -> usize {
         zones
             .keys()
-            .filter(|origin| self.keys.contains_key(origin.as_str()))
+            .filter_map(|origin| NameRef::from_wire_slice(origin).ok())
+            .filter(|origin| self.keys.contains_key(&origin.to_presentation()))
             .count()
     }
 
@@ -712,11 +712,15 @@ impl ZoneSigning {
     pub(crate) fn apply(&self, zones: &mut ZoneMap) -> Result<()> {
         // One moment for the whole run — see `policy_for`.
         let signed_at = current_unix_timestamp();
-        for (origin, zone) in zones.iter_mut() {
-            let Some(keys) = self.keys.get(origin.as_str()) else {
+        for (key, zone) in zones.iter_mut() {
+            let Ok(origin) = NameRef::from_wire_slice(key) else {
                 continue;
             };
-            let policy = self.policy_for(origin.as_str(), signed_at);
+            let origin = origin.to_presentation();
+            let Some(keys) = self.keys.get(&origin) else {
+                continue;
+            };
+            let policy = self.policy_for(&origin, signed_at);
             *zone = Arc::new(
                 sign_zone(zone, keys, &policy).with_context(|| format!("signing {origin}"))?,
             );
@@ -747,12 +751,16 @@ pub(crate) fn verify_zones(zones: &ZoneMap, validator: &DnssecValidator) -> Resu
     if !validator.is_enabled() {
         return Ok(());
     }
-    for (origin, zone) in zones {
+    for (key, zone) in zones {
+        let Ok(origin) = NameRef::from_wire_slice(key) else {
+            continue;
+        };
+        let origin = origin.to_presentation();
         let signed = DnssecValidator::is_zone_signed(zone);
         if !signed {
             // Asking `validate_response` with no records keeps the "is
             // unsigned acceptable" decision in one place.
-            let (ok, _) = validator.validate_response(zone, &[], origin.as_str());
+            let (ok, _) = validator.validate_response(zone, &[], &origin);
             if !ok {
                 return Err(anyhow!("{origin} is not signed"));
             }
@@ -761,13 +769,14 @@ pub(crate) fn verify_zones(zones: &ZoneMap, validator: &DnssecValidator) -> Resu
 
         let mut checked = 0usize;
         for (name, rtype) in signed_rrsets(zone) {
-            let records = zone.query(&name, Qtype::of(rtype));
+            let records = zone.query(name.as_ref(), Qtype::of(rtype));
             if records.is_empty() {
                 return Err(anyhow!(
                     "{origin}: a signature covers the {rtype} RRset at {name}, which is not there"
                 ));
             }
-            let (ok, _) = validator.validate_response(zone, &records, &name);
+            let (ok, _) =
+                validator.validate_response(zone, &records, &name.as_ref().to_presentation());
             if !ok {
                 return Err(anyhow!(
                     "{origin}: the {rtype} RRset at {name} does not verify against the zone's \
@@ -782,8 +791,8 @@ pub(crate) fn verify_zones(zones: &ZoneMap, validator: &DnssecValidator) -> Resu
 }
 
 /// Every `(owner, type)` in the zone that some RRSIG claims to cover.
-pub(crate) fn signed_rrsets(zone: &Zone) -> Vec<(String, Rtype)> {
-    let mut seen: Vec<(String, Rtype)> = zone
+pub(crate) fn signed_rrsets(zone: &Zone) -> Vec<(Name, Rtype)> {
+    let mut seen: Vec<(Name, Rtype)> = zone
         .records()
         .iter()
         .filter(|r| r.rdata.rtype() == record_types::RRSIG)
@@ -795,9 +804,22 @@ pub(crate) fn signed_rrsets(zone: &Zone) -> Vec<(String, Rtype)> {
                 rdata: r.rdata.clone(),
             })
         })
-        .map(|sig| (sig.owner, sig.type_covered))
+        // `Rrsig::owner` is canonical text; the caller wants a name.
+        .filter_map(|sig| {
+            Name::from_presentation(&sig.owner)
+                .ok()
+                .map(|n| (n, sig.type_covered))
+        })
         .collect();
-    seen.sort();
+    // Sorted by the folded octets: `Name` has no `Ord`, because DNS's own
+    // ordering is RFC 4034 §6.1's and not the octets' — and this only wants a
+    // stable order to dedupe against.
+    seen.sort_by(|a, b| {
+        a.0.as_ref()
+            .folded()
+            .cmp(&b.0.as_ref().folded())
+            .then(a.1.to_u16().cmp(&b.1.to_u16()))
+    });
     seen.dedup();
     seen
 }
@@ -963,6 +985,7 @@ pub(crate) fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<Zon
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::nm;
 
     #[test]
     fn test_extract_zone_origin_with_extension() {
@@ -1003,14 +1026,14 @@ mod tests {
     #[test]
     fn one_origin_in_two_cases_is_one_zone() {
         let mut zones = Zones::default();
-        drop(zones.insert(Zone::new("Example.COM.".to_string())));
-        let displaced = zones.insert(Zone::new("example.com.".to_string()));
+        drop(zones.insert(Zone::new(nm("Example.COM."))));
+        let displaced = zones.insert(Zone::new(nm("example.com.")));
 
         assert!(displaced.is_some(), "the first version was replaced");
         assert_eq!(zones.len(), 1);
-        assert!(zones.matching("EXAMPLE.com.").is_some());
+        assert!(zones.matching(nm("EXAMPLE.com.").as_ref()).is_some());
         assert!(
-            zones.remove("example.COM."),
+            zones.remove(nm("example.COM.").as_ref()),
             "and it is withdrawn by either"
         );
         assert!(zones.is_empty());
@@ -1040,7 +1063,9 @@ mod tests {
 
         let mut zones = Zones::default();
         drop(zones.insert(at(1)));
-        let held = zones.snapshot("example.com.").expect("it is served");
+        let held = zones
+            .snapshot(nm("example.com.").as_ref())
+            .expect("it is served");
 
         let mut reloaded = ZoneMap::new();
         let next = at(2);
@@ -1050,7 +1075,7 @@ mod tests {
         assert_eq!(held.serial().map(|s| s.to_u32()), Some(1), "the transfer's");
         assert_eq!(
             zones
-                .matching("example.com.")
+                .matching(nm("example.com.").as_ref())
                 .and_then(Zone::serial)
                 .map(|s| s.to_u32()),
             Some(2),
@@ -1073,10 +1098,10 @@ mod tests {
         const QNAME: &str = "host.deep.z500.test.";
 
         let mut one = Zones::default();
-        drop(one.insert(Zone::new("z500.test.".to_string())));
+        drop(one.insert(Zone::new(nm("z500.test."))));
         let mut many = Zones::default();
         for i in 0..ZONES {
-            drop(many.insert(Zone::new(format!("z{i}.test."))));
+            drop(many.insert(Zone::new(nm(&format!("z{i}.test.")))));
         }
         assert_eq!(many.len(), ZONES, "z500 is one of the thousand");
 
@@ -1103,7 +1128,7 @@ mod tests {
     #[test]
     fn a_long_qname_does_not_cost_more_than_a_short_one() {
         let mut zones = Zones::default();
-        drop(zones.insert(Zone::new("example.test.".to_string())));
+        drop(zones.insert(Zone::new(nm("example.test."))));
 
         let long: String =
             (0..32).map(|i| format!("{}.", i % 10)).collect::<String>() + "ip6.arpa.";
@@ -1122,12 +1147,15 @@ mod tests {
     /// truth.
     fn time_lookups(zones: &Zones, qname: &str, expect_hit: bool) -> Duration {
         const QUERIES: usize = 20_000;
+        let qname = nm(qname);
         (0..3)
             .map(|_| {
                 let start = std::time::Instant::now();
                 for _ in 0..QUERIES {
                     assert_eq!(
-                        zones.for_query(std::hint::black_box(qname)).is_some(),
+                        zones
+                            .for_query(std::hint::black_box(qname.as_ref()))
+                            .is_some(),
                         expect_hit
                     );
                 }

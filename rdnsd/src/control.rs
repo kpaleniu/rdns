@@ -16,6 +16,7 @@ use rdns::persist;
 use rdns::shutdown::{Busy, Stop};
 use rdns::utils::current_unix_timestamp;
 use rdns::zone_writer::zone_to_string;
+use rdns::Name;
 use rdns::Serial;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -215,11 +216,13 @@ async fn status(control: &Control) -> String {
         let mut rows: Vec<Row> = zones
             .values()
             .map(|zone| {
-                let gauge = facts
-                    .iter()
-                    .find(|f| f.zone.eq_ignore_ascii_case(zone.origin()));
+                // Both lists are presentation text — a metrics label and a
+                // config string — so the comparison happens there rather than
+                // as names.
+                let origin = zone.origin().to_presentation();
+                let gauge = facts.iter().find(|f| f.zone.eq_ignore_ascii_case(&origin));
                 Row {
-                    zone: zone.origin().to_string(),
+                    zone: origin.clone(),
                     // The gauge is the number being served, which is not the
                     // file's once signing is on. The fallback covers the moment
                     // between a zone being installed and its gauge being set.
@@ -238,7 +241,7 @@ async fn status(control: &Control) -> String {
                     replicated: control
                         .replicated
                         .iter()
-                        .any(|z| z.eq_ignore_ascii_case(zone.origin())),
+                        .any(|z| z.eq_ignore_ascii_case(&origin)),
                     last_transfer: gauge.and_then(|g: &ZoneFacts| g.last_transfer),
                 }
             })
@@ -348,7 +351,8 @@ async fn dump(args: &[String], control: &Control) -> String {
         return err("dump takes exactly one zone name");
     };
     let zones = control.served.zone_map.read().await;
-    let Some(zone) = zones.matching(name) else {
+    let asked: Option<Name> = name.parse().ok();
+    let Some(zone) = asked.as_ref().and_then(|n| zones.matching(n.as_ref())) else {
         // The commonest cause is a missing trailing dot, the next is asking the
         // wrong server, so name what is held.
         return err(&format!(
@@ -356,7 +360,10 @@ async fn dump(args: &[String], control: &Control) -> String {
             if zones.is_empty() {
                 "nothing".to_string()
             } else {
-                let mut held: Vec<&str> = zones.values().map(|z| z.origin()).collect();
+                let mut held: Vec<String> = zones
+                    .values()
+                    .map(|z| z.origin().to_presentation())
+                    .collect();
                 held.sort_unstable();
                 held.join(", ")
             }

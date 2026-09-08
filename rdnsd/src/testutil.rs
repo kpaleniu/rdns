@@ -39,10 +39,22 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
 /// The OPT record is always attached; only the DO bit moves. Attaching it only
 /// for DO would look neater and would stop every caller from exercising
 /// `make_response`'s OPT mirroring (RFC 6891 §6.1.1).
+/// A name from a literal, for tests only: `Name` is fallible to build and a
+/// test that writes a bad one should fail loudly at that line.
+pub(crate) fn nm(text: &str) -> rdns::Name {
+    text.parse().expect("a test name parses")
+}
+
+/// The key the served-zone maps use: the folded wire form of the origin, which
+/// is what `zones::zone_key` builds.
+pub(crate) fn zkey(text: &str) -> Vec<u8> {
+    nm(text).as_ref().folded().into_owned()
+}
+
 pub(crate) fn query(qname: &str, qtype: Qtype, dnssec_ok: bool) -> DnsMessage {
     DnsMessageBuilder::new()
         .with_id(1)
-        .with_query(qname, qtype)
+        .with_query(nm(qname), qtype)
         .with_recursion(false)
         .with_edns(4096, dnssec_ok)
         .build()

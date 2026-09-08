@@ -15,16 +15,14 @@
 //! wire. What is left allocating is the names looked up *by* — the folded QNAME,
 //! an NSEC3 owner per candidate, `*.<encloser>` — and the lookups' own keys.
 
-use crate::dnssec::canonical_name;
-use crate::dnssec_denial::{nsec3_hash_in, nsec3_owner_name, NSEC3_HASH_LEN};
+use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, NSEC3_HASH_LEN};
 use crate::error::WireError;
 use crate::response::{ResponseWriter, Section};
 use crate::utils::record_types as rt;
-use crate::utils::{names_equal, parent_name};
 use crate::zone::{Located, NameKind, Zone, ZoneRecord};
-use crate::Qtype;
 use crate::Rtype;
 use crate::Ttl;
+use crate::{Name, NameRef, Qtype};
 
 /// Whether this zone has signatures to serve at all.
 ///
@@ -48,7 +46,7 @@ pub fn is_signed(zone: &Zone) -> bool {
 /// was located with, canonical, and is what the signatures are echoed under.
 pub fn push_answer_signatures(
     at: &Located,
-    qname: &str,
+    qname: NameRef<'_>,
     qtype: Qtype,
     w: &mut ResponseWriter,
 ) -> Result<bool, WireError> {
@@ -68,7 +66,7 @@ pub fn push_answer_signatures(
         }
         // An RRSIG's owner is the record's own name, so this is the wildcard
         // test without the parse: `locate` fell back to `*.<encloser>`.
-        wildcard |= !names_equal(&record.name, qname);
+        wildcard |= record.name.as_ref() != qname;
         w.push(
             Section::Answer,
             qname,
@@ -87,14 +85,14 @@ pub fn push_answer_signatures(
 /// closest encloser and the next closer name (RFC 5155 §7.2.1).
 pub fn push_proof_of_absence(
     zone: &Zone,
-    qname: &str,
+    qname: NameRef<'_>,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
     if !is_signed(zone) {
         return Ok(());
     }
-    let qname = canonical_name(qname);
-    absence(zone, &qname, &mut Written::default(), w)
+    let qname = qname.to_folded();
+    absence(zone, qname.as_ref(), &mut Written::default(), w)
 }
 
 /// Write the authority records a negative answer needs beyond the SOA.
@@ -106,23 +104,23 @@ pub fn push_proof_of_absence(
 /// reaches more than one label down, and denies a name that does not exist.
 pub fn push_negative_proof(
     zone: &Zone,
-    qname: &str,
+    qname: NameRef<'_>,
     kind: &NameKind,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
     if !is_signed(zone) {
         return Ok(());
     }
-    let qname = canonical_name(qname);
+    let qname = qname.to_folded();
     let written = &mut Written::default();
     push_soa_signatures(zone, w)?;
 
     match kind {
-        NameKind::NotFound => deny_the_name_and_its_wildcard(zone, &qname, written, w),
+        NameKind::NotFound => deny_the_name_and_its_wildcard(zone, qname.as_ref(), written, w),
         // NODATA: the record at the name lists the types it has. An empty
         // non-terminal exists too, and the signer gives it a chain entry.
         NameKind::Exact | NameKind::EmptyNonTerminal => {
-            match_at_name(zone, &qname, written, w).map(drop)
+            match_at_name(zone, qname.as_ref(), written, w).map(drop)
         }
         // NODATA through a wildcard owes both halves: the wildcard's record for
         // the missing type, and the denial of the queried name, without which
@@ -131,8 +129,8 @@ pub fn push_negative_proof(
         // `NameKind::Wildcard` carries the name absolute and down-cased, so it
         // needs no folding of its own.
         NameKind::Wildcard(wildcard) => {
-            match_at_name(zone, wildcard, written, w)?;
-            absence(zone, &qname, written, w)
+            match_at_name(zone, wildcard.as_ref(), written, w)?;
+            absence(zone, qname.as_ref(), written, w)
         }
     }
 }
@@ -146,30 +144,36 @@ pub fn push_negative_proof(
 /// The NS RRset gets no signature: it is the child's data (RFC 4035 §2.2).
 pub fn push_delegation_proof(
     zone: &Zone,
-    cut: &str,
+    cut: NameRef<'_>,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
     if !is_signed(zone) {
         return Ok(());
     }
-    let cut = canonical_name(cut);
+    let cut = cut.to_folded();
 
-    let at = zone.locate(&cut);
+    let at = zone.locate(cut.as_ref());
     let mut delegated = false;
     for ds in at.of_type(Qtype::of(rt::DS)) {
         delegated = true;
-        w.push(Section::Authority, &ds.name, ds.class, ds.ttl, &ds.rdata)?;
+        w.push(
+            Section::Authority,
+            ds.name.as_ref(),
+            ds.class,
+            ds.ttl,
+            &ds.rdata,
+        )?;
     }
     if delegated {
-        return push_signatures_at(zone, &cut, rt::DS, None, w);
+        return push_signatures_at(zone, cut.as_ref(), rt::DS, None, w);
     }
 
     // No DS: the record at the cut says so by listing NS and not DS.
     let written = &mut Written::default();
-    if !match_at_name(zone, &cut, written, w)? && zone.has_nsec3_chain() {
+    if !match_at_name(zone, cut.as_ref(), written, w)? && zone.has_nsec3_chain() {
         // Under opt-out an insecure delegation has no NSEC3 of its own
         // (RFC 5155 §7.2.9), so the closest-encloser pair is the proof.
-        absence(zone, &cut, written, w)?;
+        absence(zone, cut.as_ref(), written, w)?;
     }
     Ok(())
 }
@@ -178,7 +182,7 @@ pub fn push_delegation_proof(
 /// a caller writing two proofs about one name shares both.
 fn absence<'z>(
     zone: &'z Zone,
-    qname: &str,
+    qname: NameRef<'_>,
     written: &mut Written<'z>,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
@@ -205,7 +209,7 @@ fn absence<'z>(
 /// yields the record before it, which proves nothing.
 fn deny_the_name_and_its_wildcard<'z>(
     zone: &'z Zone,
-    qname: &str,
+    qname: NameRef<'_>,
     written: &mut Written<'z>,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
@@ -220,7 +224,10 @@ fn deny_the_name_and_its_wildcard<'z>(
         push_with_signatures(zone, nsec, written, w)?;
     }
     if let Some(encloser) = nsec_closest_encloser(zone, qname) {
-        if let Some(nsec) = zone.nsec_covering(&format!("*.{encloser}")) {
+        let Ok(wildcard) = Name::prefixed(b"*", encloser) else {
+            return Ok(());
+        };
+        if let Some(nsec) = zone.nsec_covering(wildcard.as_ref()) {
             push_with_signatures(zone, nsec, written, w)?;
         }
     }
@@ -231,7 +238,7 @@ fn deny_the_name_and_its_wildcard<'z>(
 /// one.
 fn match_at_name<'z>(
     zone: &'z Zone,
-    name: &str,
+    name: NameRef<'_>,
     written: &mut Written<'z>,
     w: &mut ResponseWriter,
 ) -> Result<bool, WireError> {
@@ -274,7 +281,7 @@ fn negative_ttl_cap(zone: &Zone) -> Ttl {
 /// The RRSIGs at `name` covering `rtype`, each capped at `cap` if there is one.
 fn push_signatures_at(
     zone: &Zone,
-    name: &str,
+    name: NameRef<'_>,
     rtype: Rtype,
     cap: Option<Ttl>,
     w: &mut ResponseWriter,
@@ -291,7 +298,7 @@ fn push_signatures_at(
         let ttl = cap.map_or(record.ttl, |cap| record.ttl.min(cap));
         w.push(
             Section::Authority,
-            &record.name,
+            record.name.as_ref(),
             record.class,
             ttl,
             &record.rdata,
@@ -312,12 +319,12 @@ fn push_with_signatures<'z>(
     }
     w.push(
         Section::Authority,
-        &record.name,
+        record.name.as_ref(),
         record.class,
         record.ttl,
         &record.rdata,
     )?;
-    push_signatures_at(zone, &record.name, record.rdata.rtype(), None, w)?;
+    push_signatures_at(zone, record.name.as_ref(), record.rdata.rtype(), None, w)?;
     Ok(true)
 }
 
@@ -382,17 +389,17 @@ impl<'a> Nsec3Chain<'a> {
         Some(Nsec3Chain { salt, iterations })
     }
 
-    fn hash(&self, name: &str) -> Option<[u8; NSEC3_HASH_LEN]> {
-        nsec3_hash_in(name, self.salt, self.iterations).ok()
+    fn hash(&self, name: NameRef<'_>) -> Option<[u8; NSEC3_HASH_LEN]> {
+        nsec3_hash_name(name, self.salt, self.iterations).ok()
     }
 
-    fn owner(&self, zone: &Zone, name: &str) -> Option<String> {
-        Some(nsec3_owner_name(&self.hash(name)?, zone.origin()))
+    fn owner(&self, zone: &Zone, name: NameRef<'_>) -> Option<Name> {
+        nsec3_owner_name_at(&self.hash(name)?, zone.origin()).ok()
     }
 
     /// The chain and the closest encloser of `qname` — what every NSEC3 proof
     /// about that name starts from, derived once.
-    fn and_encloser<'n>(zone: &'a Zone, qname: &'n str) -> Option<(Self, &'n str)> {
+    fn and_encloser<'n>(zone: &'a Zone, qname: NameRef<'n>) -> Option<(Self, NameRef<'n>)> {
         let chain = Self::of(zone)?;
         let encloser = chain.closest_encloser(zone, qname)?;
         Some((chain, encloser))
@@ -403,8 +410,8 @@ impl<'a> Nsec3Chain<'a> {
     fn push_absence<'z>(
         &self,
         zone: &'z Zone,
-        qname: &str,
-        encloser: &str,
+        qname: NameRef<'_>,
+        encloser: NameRef<'_>,
         written: &mut Written<'z>,
         w: &mut ResponseWriter,
     ) -> Result<(), WireError> {
@@ -419,18 +426,21 @@ impl<'a> Nsec3Chain<'a> {
     fn push_wildcard_denial<'z>(
         &self,
         zone: &'z Zone,
-        encloser: &str,
+        encloser: NameRef<'_>,
         written: &mut Written<'z>,
         w: &mut ResponseWriter,
     ) -> Result<(), WireError> {
-        self.push_covering(zone, &format!("*.{encloser}"), written, w)
+        let Ok(wildcard) = Name::prefixed(b"*", encloser) else {
+            return Ok(());
+        };
+        self.push_covering(zone, wildcard.as_ref(), written, w)
     }
 
     /// The chain's record *at* `name`, if it has one.
     fn push_matching<'z>(
         &self,
         zone: &'z Zone,
-        name: &str,
+        name: NameRef<'_>,
         written: &mut Written<'z>,
         w: &mut ResponseWriter,
     ) -> Result<bool, WireError> {
@@ -438,7 +448,7 @@ impl<'a> Nsec3Chain<'a> {
             return Ok(false);
         };
         let mut found = false;
-        let at = zone.locate(&owner);
+        let at = zone.locate(owner.as_ref());
         for record in at.of_type(Qtype::of(rt::NSEC3)) {
             found |= push_with_signatures(zone, record, written, w)?;
         }
@@ -449,7 +459,7 @@ impl<'a> Nsec3Chain<'a> {
     fn push_covering<'z>(
         &self,
         zone: &'z Zone,
-        name: &str,
+        name: NameRef<'_>,
         written: &mut Written<'z>,
         w: &mut ResponseWriter,
     ) -> Result<(), WireError> {
@@ -470,53 +480,48 @@ impl<'a> Nsec3Chain<'a> {
     ///
     /// `qname` must be absolute, which every caller here has already made it —
     /// each ancestor is then a suffix of it rather than a new `String`.
-    fn closest_encloser<'n>(&self, zone: &Zone, qname: &'n str) -> Option<&'n str> {
-        let mut name = qname;
-        loop {
+    fn closest_encloser<'n>(&self, zone: &Zone, qname: NameRef<'n>) -> Option<NameRef<'n>> {
+        for name in qname.ancestors() {
             if self
                 .owner(zone, name)
-                .is_some_and(|owner| zone.holds_name(&owner))
+                .is_some_and(|owner| zone.holds_name(owner.as_ref()))
             {
                 return Some(name);
             }
-            if names_equal(name, zone.origin()) {
+            if name == zone.origin() {
                 return None;
             }
-            name = parent_name(name)?;
         }
+        None
     }
 }
 
 /// The deepest ancestor of `qname` the zone holds a name for. Under NSEC every
 /// name in the chain has a record, empty non-terminals included, so the index
 /// answers this directly.
-fn nsec_closest_encloser<'n>(zone: &Zone, qname: &'n str) -> Option<&'n str> {
-    let mut name = qname;
-    loop {
+fn nsec_closest_encloser<'n>(zone: &Zone, qname: NameRef<'n>) -> Option<NameRef<'n>> {
+    for name in qname.ancestors() {
         if zone.holds_name(name) {
             return Some(name);
         }
-        if names_equal(name, zone.origin()) {
+        if name == zone.origin() {
             return None;
         }
-        name = parent_name(name)?;
     }
+    None
 }
 
 /// The name one label below `encloser` on the way to `qname` — the "next
 /// closer" name of RFC 5155 §1.3.
-fn child_towards<'n>(qname: &'n str, encloser: &str) -> Option<&'n str> {
-    if names_equal(qname, encloser) {
+fn child_towards<'n>(qname: NameRef<'n>, encloser: NameRef<'_>) -> Option<NameRef<'n>> {
+    if qname == encloser {
         return None;
     }
-    let mut name = qname;
-    loop {
-        let up = parent_name(name)?;
-        if names_equal(up, encloser) {
-            return Some(name);
-        }
-        name = up;
-    }
+    // The ancestor one step below the encloser: walk up until the *parent* is
+    // the encloser, which is the same rule the text form walked.
+    qname
+        .ancestors()
+        .find(|name| name.parent().is_some_and(|up| up == encloser))
 }
 
 #[cfg(test)]
@@ -531,6 +536,7 @@ fn to_resource(record: &ZoneRecord) -> crate::ResourceRecord {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::compression::NameCompressor;
     use crate::dnssec::{dnskeys_in, verify_rrset, Dnskey, Rrset, RrsetProof};
@@ -539,6 +545,7 @@ mod tests {
         WildcardVerdict,
     };
     use crate::dnssec_test_util::{signing_keys, signing_policy};
+    use crate::test_records::nm;
     use crate::zone::parse_zone_file;
     use crate::zone_signer::{sign_zone, DenialChain};
     use crate::Class;
@@ -557,7 +564,7 @@ mod tests {
         f: impl FnOnce(&mut ResponseWriter) -> Result<(), WireError>,
     ) -> Vec<ResourceRecord> {
         let request = DnsMessageBuilder::new()
-            .with_query("example.com.", Qtype::of(rt::SOA))
+            .with_query(nm("example.com."), Qtype::of(rt::SOA))
             .with_id(1)
             .build();
         let mut out = Vec::new();
@@ -573,20 +580,21 @@ mod tests {
 
     fn signatures_for(zone: &Zone, qname: &str, qtype: Qtype) -> (Vec<ResourceRecord>, bool) {
         let mut wildcard = false;
+        let qname = nm(qname);
         let records = written(|w| {
-            let qname = canonical_name(qname);
-            wildcard = push_answer_signatures(&zone.locate(&qname), &qname, qtype, w)?;
+            wildcard =
+                push_answer_signatures(&zone.locate(qname.as_ref()), qname.as_ref(), qtype, w)?;
             Ok(())
         });
         (records, wildcard)
     }
 
     fn absence_of(zone: &Zone, qname: &str) -> Vec<ResourceRecord> {
-        written(|w| push_proof_of_absence(zone, qname, w))
+        written(|w| push_proof_of_absence(zone, nm(qname).as_ref(), w))
     }
 
     fn negative(zone: &Zone, qname: &str, kind: &NameKind) -> Vec<ResourceRecord> {
-        written(|w| push_negative_proof(zone, qname, kind, w))
+        written(|w| push_negative_proof(zone, nm(qname).as_ref(), kind, w))
     }
 
     const NOW: u64 = 1_700_000_000;
@@ -622,7 +630,7 @@ deep.a.b IN TXT "down here"
     /// The answer section rdnsd would build, plus what this module adds.
     fn answer(zone: &Zone, qname: &str, qtype: Qtype) -> (Vec<RecordData>, Vec<ResourceRecord>) {
         let rdatas = zone
-            .query(qname, qtype)
+            .query(nm(qname).as_ref(), qtype)
             .into_iter()
             .map(|r| r.rdata.clone())
             .collect();
@@ -635,10 +643,15 @@ deep.a.b IN TXT "down here"
         let (rdatas, sigs) = answer(zone, qname, qtype);
         let rrsigs = crate::dnssec::rrsigs_in(&sigs);
         verify_rrset(
-            &Rrset::new(qname, Rtype::new(qtype.to_u16()), Class::new(1), &rdatas),
+            &Rrset::new(
+                nm(qname).as_ref(),
+                Rtype::new(qtype.to_u16()),
+                Class::new(1),
+                &rdatas,
+            ),
             &rrsigs,
             &keys_of(zone),
-            ORIGIN,
+            nm(ORIGIN).as_ref(),
             NOW,
         )
     }
@@ -683,7 +696,7 @@ deep.a.b IN TXT "down here"
             // module reports is only that the answer still owes a denial.
             let (sigs, owes_denial) = signatures_for(&zone, qname, Qtype::of(rt::A));
             assert!(owes_denial, "{chain:?}");
-            assert!(sigs.iter().all(|r| r.name == qname));
+            assert!(sigs.iter().all(|r| r.name == nm(qname)));
 
             let proof_records = absence_of(&zone, qname);
             assert!(!proof_records.is_empty(), "{chain:?}");
@@ -707,7 +720,7 @@ deep.a.b IN TXT "down here"
             let records = negative(
                 &zone,
                 "www.example.com.",
-                &zone.name_kind("www.example.com."),
+                &zone.name_kind(nm("www.example.com.").as_ref()),
             );
             let denial = proves_nodata(
                 "www.example.com.",
@@ -730,7 +743,7 @@ deep.a.b IN TXT "down here"
             let records = negative(
                 &zone,
                 "anything.example.com.",
-                &zone.name_kind("anything.example.com."),
+                &zone.name_kind(nm("anything.example.com.").as_ref()),
             );
             let denial = proves_nodata(
                 "anything.example.com.",
@@ -749,7 +762,7 @@ deep.a.b IN TXT "down here"
             let zone = signed(chain.clone());
             // Two labels down, past the apex wildcard's reach, so NXDOMAIN.
             let qname = "gone.a.b.example.com.";
-            let records = negative(&zone, qname, &zone.name_kind(qname));
+            let records = negative(&zone, qname, &zone.name_kind(nm(qname).as_ref()));
             let denial = proves_nxdomain(qname, ORIGIN, &nsecs_in(&records), &nsec3s_in(&records));
             assert!(matches!(denial, Denial::Proved), "{chain:?}: {denial:?}");
         }
@@ -763,7 +776,7 @@ deep.a.b IN TXT "down here"
             let records = negative(
                 &zone,
                 "gone.a.b.example.com.",
-                &zone.name_kind("gone.a.b.example.com."),
+                &zone.name_kind(nm("gone.a.b.example.com.").as_ref()),
             );
             let keys = keys_of(&zone);
             let sigs = crate::dnssec::rrsigs_in(&records);
@@ -780,10 +793,15 @@ deep.a.b IN TXT "down here"
                     .map(|r| r.rdata.clone())
                     .collect();
                 let proof = verify_rrset(
-                    &Rrset::new(&record.name, record.rdata.rtype(), Class::new(1), &rdatas),
+                    &Rrset::new(
+                        record.name.as_ref(),
+                        record.rdata.rtype(),
+                        Class::new(1),
+                        &rdatas,
+                    ),
                     &sigs,
                     &keys,
-                    ORIGIN,
+                    nm(ORIGIN).as_ref(),
                     NOW,
                 );
                 assert!(
@@ -815,7 +833,7 @@ deep.a.b IN TXT "down here"
         assert!(negative(
             &zone,
             "nope.example.com.",
-            &zone.name_kind("nope.example.com.")
+            &zone.name_kind(nm("nope.example.com.").as_ref())
         )
         .is_empty());
         assert!(absence_of(&zone, "nope.example.com.").is_empty());
@@ -827,7 +845,9 @@ deep.a.b IN TXT "down here"
         // where an ordered lookup gets it wrong.
         let zone = signed(DenialChain::Nsec);
         let covering = |name: &str| {
-            let record = zone.nsec_covering(name).expect("a chain to search");
+            let record = zone
+                .nsec_covering(nm(name).as_ref())
+                .expect("a chain to search");
             crate::dnssec_denial::Nsec::from_record(&to_resource(record)).unwrap()
         };
         // Before everything: the wrap, where the last NSEC points at the apex.

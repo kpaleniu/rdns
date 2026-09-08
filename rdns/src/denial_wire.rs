@@ -207,6 +207,27 @@ pub fn base32hex_encode(data: &[u8]) -> String {
     out
 }
 
+/// The same into a caller's byte buffer, which must hold
+/// [`base32hex_len`] octets.
+///
+/// Returns how many were written. For an owner name the encoding is a *label*,
+/// so the bytes are what is wanted and a `String` is the conversion.
+pub(crate) fn encode_base32hex_in(data: &[u8], alphabet: &[u8; 32], out: &mut [u8]) -> usize {
+    let mut at = 0;
+    for chunk in data.chunks(5) {
+        let mut buf = [0u8; 5];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        let bits = u64::from_be_bytes([0, 0, 0, buf[0], buf[1], buf[2], buf[3], buf[4]]);
+        let chars = (chunk.len() * 8).div_ceil(5);
+        for i in 0..chars {
+            let shift = 35 - i * 5;
+            out[at] = alphabet[((bits >> shift) & 0x1f) as usize];
+            at += 1;
+        }
+    }
+    at
+}
+
 pub(crate) fn encode_base32hex(data: &[u8], alphabet: &[u8; 32], out: &mut String) {
     for chunk in data.chunks(5) {
         let mut buf = [0u8; 5];

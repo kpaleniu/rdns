@@ -23,15 +23,21 @@ use std::net::Ipv4Addr;
 
 use rdns::utils::record_types;
 use rdns::zone::{Zone, ZoneRecord};
-use rdns::{Class, ParsedRecord, Qtype, RecordData, Ttl};
+use rdns::{Class, Name, ParsedRecord, Qtype, RecordData, Ttl};
+
+/// A name from a literal, for a probe only: `Name` is fallible to build and a
+/// probe that writes a bad one should fail loudly at that line.
+fn nm(text: &str) -> Name {
+    text.parse().expect("a probe name parses")
+}
 
 /// The same zone `benches/answer_path.rs` builds, so the two measurements are
 /// about one thing. Ten thousand names, one A record each.
 fn ten_thousand_records() -> Zone {
-    let mut zone = Zone::new("example.com.".to_string());
+    let mut zone = Zone::new(nm("example.com."));
     for i in 0..10_000u32 {
         zone.add_record(ZoneRecord {
-            name: format!("host{i}"),
+            name: nm(&format!("host{i}.example.com.")),
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
@@ -90,7 +96,7 @@ fn probe_loop(zone: &Zone, names: &[String], qtype: Qtype, n: usize) -> usize {
         // Cycling through 256 names rather than repeating one: a single name
         // would sit in L1 and answer a question nobody asked.
         let name = &names[i % names.len()];
-        found += black_box(zone.query(black_box(name), qtype)).len();
+        found += black_box(zone.query(black_box(nm(name).as_ref()), qtype)).len();
     }
     found
 }

@@ -6,11 +6,15 @@
 //! of RFC 5155 §5.
 
 use crate::denial_wire::{
-    base32hex_decode, bitmap_has_type, canonical_name_cmp, encode_base32hex, BASE32HEX_LOWER,
+    base32hex_decode, bitmap_has_type, canonical_name_cmp, encode_base32hex, encode_base32hex_in,
+    BASE32HEX_LOWER,
 };
-use crate::dname::{dname_to_bytes_in, MAX_NAME_LEN};
+use crate::dname::MAX_NAME_LEN;
+use crate::error::WireResult;
 use crate::error::{DnssecError, DnssecResult};
 use crate::utils::record_types as rt;
+use crate::Name;
+use crate::NameRef;
 use crate::Rtype;
 use crate::{ParsedRecord, ResourceRecord};
 use sha1::{Digest, Sha1};
@@ -35,6 +39,15 @@ pub const NSEC3_HASH_LEN: usize = 20;
 /// zone index folds to. It was spelled out per module as
 /// `format!("{}.{origin}", base32hex_encode(h).to_lowercase())` — three
 /// allocations where one does, and a Unicode fold over ASCII (CLAUDE.md §8).
+pub fn nsec3_owner_name_at(hash: &[u8], origin: NameRef<'_>) -> WireResult<Name> {
+    // The label is base32hex of a 20-octet SHA-1 digest — 32 characters, so it
+    // fits a label and needs no heap of its own. Building the name directly
+    // skips a `String` and a re-parse of text this already knows the shape of.
+    let mut label = [0u8; 32];
+    let len = encode_base32hex_in(hash, BASE32HEX_LOWER, &mut label);
+    Name::prefixed(&label[..len], origin)
+}
+
 pub fn nsec3_owner_name(hash: &[u8], origin: &str) -> String {
     let mut out =
         String::with_capacity(crate::denial_wire::base32hex_len(hash.len()) + 1 + origin.len());
@@ -69,14 +82,39 @@ pub fn nsec3_hash_in(
     salt: &[u8],
     iterations: u16,
 ) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
+    // Into the stack: §8.3's walk hashes a name per label of the QNAME and
+    // keeps none of them, so this is the one place presentation text is read
+    // without building a `Name`.
+    let mut buf = [0u8; MAX_NAME_LEN];
+    let len = crate::name::presentation_wire_in(name, &mut buf)?;
+    hash_wire(&mut buf[..len], salt, iterations)
+}
+
+/// The same for a name that is already wire octets — which is what §5 hashes,
+/// so this is the direct spelling and the text forms are the conversions.
+///
+/// The closest-encloser walk hashes one name per label of the QNAME, and going
+/// through presentation text cost a `String` per candidate for a round trip
+/// back to the octets already at hand.
+pub fn nsec3_hash_name(
+    name: NameRef<'_>,
+    salt: &[u8],
+    iterations: u16,
+) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
+    let wire = name.as_wire();
+    let mut buf = [0u8; MAX_NAME_LEN];
+    // `NameRef` cannot exceed RFC 1035 §2.3.4's limit, so this cannot overrun.
+    buf[..wire.len()].copy_from_slice(wire);
+    hash_wire(&mut buf[..wire.len()], salt, iterations)
+}
+
+/// `wire` is down-cased in place, so it is taken by value rather than shared.
+fn hash_wire(wire: &mut [u8], salt: &[u8], iterations: u16) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
     if iterations > MAX_NSEC3_ITERATIONS {
         return Err(DnssecError::parse(format!(
             "NSEC3 iteration count {iterations} exceeds the {MAX_NSEC3_ITERATIONS} we will compute (RFC 9276)",
         )));
     }
-    let mut buf = [0u8; MAX_NAME_LEN];
-    let len = dname_to_bytes_in(name, &mut buf)?;
-    let wire = &mut buf[..len];
     // Down-cased in the encoded form rather than in the text: a length octet is
     // at most 63 (RFC 1035 §2.3.4) and `A` is 65, so no length is touched.
     wire.make_ascii_lowercase();
@@ -114,8 +152,11 @@ impl Nsec {
                 next_domain_name,
                 type_bitmap,
             } => Some(Nsec {
-                owner: rr.name.to_ascii_lowercase(),
-                next: next_domain_name.to_ascii_lowercase(),
+                owner: rr.name.as_ref().to_presentation().to_ascii_lowercase(),
+                next: next_domain_name
+                    .as_ref()
+                    .to_presentation()
+                    .to_ascii_lowercase(),
                 type_bitmap,
             }),
             _ => None,
@@ -199,7 +240,7 @@ impl Nsec3 {
         if rr.rdata.rtype() != rt::NSEC3 {
             return None;
         }
-        let owner = rr.name.to_ascii_lowercase();
+        let owner = rr.name.as_ref().to_presentation().to_ascii_lowercase();
         let (first, zone) = owner.split_once('.')?;
         let owner_hash = base32hex_decode(first).ok()?;
         match rr.rdata.parse().ok()? {
@@ -786,8 +827,10 @@ fn nsec3_closest_encloser<'n>(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::denial_wire::{base32hex_encode, build_type_bitmap};
+    use crate::test_records::nm;
     use crate::test_records::{nsec3, NSEC3_ITERATIONS, NSEC3_SALT};
     use crate::Class;
     use crate::RecordData;
@@ -1225,7 +1268,7 @@ mod tests {
         Nsec3 {
             owner: nsec3_owner_name(&low, "example.com."),
             owner_hash: low,
-            zone: "example.com.".into(),
+            zone: "example.com.".to_string(),
             hash_algorithm: 1,
             flags,
             iterations: NSEC3_ITERATIONS,
@@ -1285,9 +1328,9 @@ mod tests {
     fn test_nsec3_opt_out_covering_proves_no_ds_but_only_with_the_flag() {
         // A span covering everything: owner hash all zeros, next all ones.
         let covering = |flags: u8| Nsec3 {
-            owner: "00000000000000000000000000000000.example.com.".into(),
+            owner: "00000000000000000000000000000000.example.com.".to_string(),
             owner_hash: vec![0x00; 20],
-            zone: "example.com.".into(),
+            zone: "example.com.".to_string(),
             hash_algorithm: 1,
             flags,
             iterations: NSEC3_ITERATIONS,
@@ -1313,7 +1356,7 @@ mod tests {
         let salt = vec![0xde, 0xad];
         let hash = nsec3_hash("child.example.com.", &salt, 3).unwrap();
         let rr = crate::ResourceRecord {
-            name: format!("{}.example.com.", base32hex_encode(&hash)),
+            name: nm(&format!("{}.example.com.", base32hex_encode(&hash))),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
@@ -1340,9 +1383,9 @@ mod tests {
     #[test]
     fn test_hostile_nsec3_iterations_are_refused() {
         let n = Nsec3 {
-            owner: "aaaa.example.com.".into(),
+            owner: "aaaa.example.com.".to_string(),
             owner_hash: vec![0x00; 20],
-            zone: "example.com.".into(),
+            zone: "example.com.".to_string(),
             hash_algorithm: 1,
             flags: 0,
             iterations: u16::MAX,
@@ -1416,7 +1459,7 @@ mod tests {
         rdata.extend_from_slice(&usable.type_bitmap);
 
         let rr = ResourceRecord {
-            name: usable.owner.clone(),
+            name: nm(&usable.owner.clone()),
             class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::new(rt::NSEC3, rdata).expect("well-formed NSEC3 rdata"),

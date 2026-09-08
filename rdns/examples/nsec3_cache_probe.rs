@@ -41,11 +41,17 @@ use rdns::dnssec_denial::nsec3_hash;
 use rdns::nsec_cache::NsecCache;
 use rdns::utils::record_types as rt;
 use rdns::{
-    Class, DnsMessage, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, RecordData,
+    Class, DnsMessage, Name, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, RecordData,
     ResourceRecord, ResponseCode, Serial, Ttl,
 };
 use std::hint::black_box;
 use std::time::Instant;
+
+/// A name from a literal, for a probe only: `Name` is fallible to build and a
+/// probe that writes a bad one should fail loudly at that line.
+fn nm(text: &str) -> Name {
+    text.parse().expect("a probe name parses")
+}
 
 const RECORDS: usize = 256; // nsec_cache::MAX_PROOFS_PER_ZONE
 
@@ -90,12 +96,12 @@ fn main() {
 fn filled(iterations: u16) -> DnsMessage {
     let salt = vec![0xaa, 0xbb];
     let mut authorities = vec![ResourceRecord {
-        name: "example.com.".to_string(),
+        name: nm("example.com."),
         class: Class::new(1),
         ttl: Ttl::from_secs(3600),
         rdata: RecordData::from_parsed(&ParsedRecord::SOA {
-            mname: "ns1.example.com.".into(),
-            rname: "admin.example.com.".into(),
+            mname: nm("ns1.example.com."),
+            rname: nm("admin.example.com."),
             serial: Serial::new(1),
             refresh: 10800,
             retry: 3600,
@@ -116,7 +122,10 @@ fn filled(iterations: u16) -> DnsMessage {
         let mut next = hash.clone();
         *next.last_mut().unwrap() = 0xff;
         authorities.push(ResourceRecord {
-            name: format!("{}.example.com.", base32hex_encode(&hash).to_lowercase()),
+            name: nm(&format!(
+                "{}.example.com.",
+                base32hex_encode(&hash).to_lowercase()
+            )),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
@@ -143,7 +152,7 @@ fn filled(iterations: u16) -> DnsMessage {
         cd: false,
         rcode: ResponseCode::NoSuchDomain,
         queries: vec![QuerySection {
-            qname: "nope.example.com.".into(),
+            qname: nm("nope.example.com."),
             qtype: Qtype::of(rt::A),
             qclass: QueryClass::IN,
         }],

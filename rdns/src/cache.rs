@@ -206,7 +206,9 @@ pub struct CacheStats {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_records::nm;
     use crate::utils::record_types as rt;
     use crate::Class;
     use crate::Ttl;
@@ -215,7 +217,7 @@ mod tests {
 
     fn create_test_record(name: &str, ttl: Ttl) -> ResourceRecord {
         ResourceRecord {
-            name: name.to_string(),
+            name: nm(name),
             class: Class::new(1),
             ttl,
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),

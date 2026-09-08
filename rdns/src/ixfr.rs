@@ -16,9 +16,9 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use crate::transfer::{axfr_messages, pack_transfer_messages};
-use crate::utils::{absolute_lowered, record_types as rt, NameKeyBuf};
+use crate::utils::record_types as rt;
 use crate::zone::{Zone, ZoneRecord};
-use crate::{DnsMessage, RecordData, ResourceRecord};
+use crate::{DnsMessage, Name, NameRef, RecordData, ResourceRecord};
 
 /// How many version steps to remember per zone. Past this a full transfer is
 /// both correct and probably cheaper than the chain.
@@ -57,7 +57,7 @@ impl ZoneDelta {
 /// planning can mint what recording consumes.
 #[derive(Debug, Default)]
 pub struct DeltaLog {
-    by_zone: HashMap<NameKeyBuf, Vec<ZoneDelta>>,
+    by_zone: HashMap<Vec<u8>, Vec<ZoneDelta>>,
 }
 
 /// A version step that has been computed but not yet recorded.
@@ -68,13 +68,13 @@ pub struct DeltaLog {
 /// a plan cannot be recorded against the wrong zone.
 #[derive(Debug, Clone)]
 pub struct PlannedDelta {
-    zone: String,
+    zone: Vec<u8>,
     delta: ZoneDelta,
 }
 
 impl PlannedDelta {
     /// Which zone this step belongs to, folded.
-    pub fn zone(&self) -> &str {
+    pub fn zone(&self) -> &[u8] {
         &self.zone
     }
 }
@@ -114,10 +114,7 @@ impl DeltaLog {
 
     /// Record a step [`plan_change`] already worked out.
     pub fn record(&mut self, planned: PlannedDelta) {
-        let history = self
-            .by_zone
-            .entry(NameKeyBuf::new(&planned.zone))
-            .or_default();
+        let history = self.by_zone.entry(planned.zone.clone()).or_default();
         history.push(planned.delta);
         // Oldest first, so the oldest steps are the ones dropped.
         if history.len() > MAX_DELTAS_PER_ZONE {
@@ -127,8 +124,8 @@ impl DeltaLog {
 
     /// A zone that is gone — expired, or deconfigured — takes its history with
     /// it: increments of a withdrawn zone are still answers for it.
-    pub fn forget(&mut self, zone: &str) {
-        self.by_zone.remove(key(zone).as_str());
+    pub fn forget(&mut self, zone: NameRef<'_>) {
+        self.by_zone.remove(key(zone).as_slice());
     }
 
     /// The chain of steps from `serial` up to the newest one remembered, or
@@ -136,8 +133,8 @@ impl DeltaLog {
     ///
     /// A gap would skip a change, leaving the secondary holding a zone that
     /// never existed — undetectable by any later serial comparison.
-    pub fn chain_from(&self, zone: &str, serial: Serial) -> Option<Vec<&ZoneDelta>> {
-        let history = self.by_zone.get(key(zone).as_str())?;
+    pub fn chain_from(&self, zone: NameRef<'_>, serial: Serial) -> Option<Vec<&ZoneDelta>> {
+        let history = self.by_zone.get(key(zone).as_slice())?;
         let start = history.iter().position(|d| d.from_serial == serial)?;
 
         let mut chain = Vec::new();
@@ -154,9 +151,9 @@ impl DeltaLog {
 
     /// Every step remembered for a zone, oldest first — what
     /// [`crate::journal::Journal::save`] writes out.
-    pub fn all(&self, zone: &str) -> Vec<&ZoneDelta> {
+    pub fn all(&self, zone: NameRef<'_>) -> Vec<&ZoneDelta> {
         self.by_zone
-            .get(key(zone).as_str())
+            .get(key(zone).as_slice())
             .map(|history| history.iter().collect())
             .unwrap_or_default()
     }
@@ -167,20 +164,20 @@ impl DeltaLog {
     /// journal must not make this process hold more than
     /// [`MAX_DELTAS_PER_ZONE`] steps. It does not check that the steps link —
     /// [`crate::journal::Journal::load`] already refuses a chain with a gap.
-    pub fn restore(&mut self, zone: &str, mut deltas: Vec<ZoneDelta>) {
+    pub fn restore(&mut self, zone: NameRef<'_>, mut deltas: Vec<ZoneDelta>) {
         if deltas.len() > MAX_DELTAS_PER_ZONE {
             deltas.drain(..deltas.len() - MAX_DELTAS_PER_ZONE);
         }
         if deltas.is_empty() {
-            self.by_zone.remove(key(zone).as_str());
+            self.by_zone.remove(key(zone).as_slice());
             return;
         }
-        self.by_zone.insert(NameKeyBuf::new(&key(zone)), deltas);
+        self.by_zone.insert(key(zone), deltas);
     }
 
     /// How many steps are remembered for a zone, for logging and tests.
-    pub fn len(&self, zone: &str) -> usize {
-        self.by_zone.get(key(zone).as_str()).map_or(0, Vec::len)
+    pub fn len(&self, zone: NameRef<'_>) -> usize {
+        self.by_zone.get(key(zone).as_slice()).map_or(0, Vec::len)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -189,8 +186,8 @@ impl DeltaLog {
 }
 
 /// The form a zone name is filed under here: absolute and ASCII-folded.
-fn key(zone: &str) -> String {
-    absolute_lowered(zone).into_owned()
+fn key(zone: NameRef<'_>) -> Vec<u8> {
+    zone.folded().into_owned()
 }
 
 /// What changed between two versions of a zone. `None` if either has no apex
@@ -258,13 +255,13 @@ pub fn diff(old: &Zone, new: &Zone) -> Option<ZoneDelta> {
 /// therefore how they go onto the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordKey {
-    lowercase_name: String,
+    lowercase_name: Vec<u8>,
     class: Class,
     ttl: Ttl,
     rdata: RecordData,
     /// A function of `lowercase_name`, carried so the record can be rebuilt with
     /// the case it was published under.
-    name: String,
+    name: Name,
 }
 
 impl Ord for RecordKey {
@@ -275,7 +272,7 @@ impl Ord for RecordKey {
             .then_with(|| self.class.cmp(&other.class))
             .then_with(|| self.ttl.cmp(&other.ttl))
             .then_with(|| self.rdata.bytes().cmp(other.rdata.bytes()))
-            .then_with(|| self.name.cmp(&other.name))
+            .then_with(|| self.lowercase_name.cmp(&other.lowercase_name))
     }
 }
 
@@ -296,14 +293,16 @@ impl RecordKey {
     }
 }
 
-fn record_key(zone: &Zone, record: &ZoneRecord) -> RecordKey {
-    let name = zone.normalize_name(&record.name);
+fn record_key(_zone: &Zone, record: &ZoneRecord) -> RecordKey {
+    // No normalizing: a `Name` is absolute, and the folded copy is what the
+    // key is for.
+    let name = record.name.clone();
     RecordKey {
-        lowercase_name: name.to_ascii_lowercase(),
+        lowercase_name: name.as_ref().folded().into_owned(),
         class: record.class,
         ttl: record.ttl,
         rdata: record.rdata.clone(),
-        name: name.into_owned(),
+        name,
     }
 }
 
@@ -327,7 +326,7 @@ pub fn apply_changes(
         *to_remove.entry(resource_key(base, record)).or_insert(0) += 1;
     }
 
-    let mut zone = Zone::new(base.origin().to_string());
+    let mut zone = Zone::new(base.origin().to_owned());
     let mut removed = 0;
     for record in base.records() {
         // The sequence's own SOA replaces this one; the framing carries it, so
@@ -344,7 +343,7 @@ pub fn apply_changes(
             }
         }
         zone.add_record(ZoneRecord {
-            name: base.normalize_name(&record.name).into_owned(),
+            name: record.name.clone(),
             ttl: record.ttl,
             class: record.class,
             rdata: record.rdata.clone(),
@@ -369,14 +368,14 @@ pub fn apply_changes(
     (zone, removed)
 }
 
-fn resource_key(zone: &Zone, record: &ResourceRecord) -> RecordKey {
-    let name = zone.normalize_name(&record.name);
+fn resource_key(_zone: &Zone, record: &ResourceRecord) -> RecordKey {
+    let name = record.name.clone();
     RecordKey {
-        lowercase_name: name.to_ascii_lowercase(),
+        lowercase_name: name.as_ref().folded().into_owned(),
         class: record.class,
         ttl: record.ttl,
         rdata: record.rdata.clone(),
-        name: name.into_owned(),
+        name,
     }
 }
 
@@ -503,7 +502,9 @@ pub fn ixfr_response(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_records::nm;
     use crate::zone::parse_zone_file;
     use crate::Qtype;
     use crate::{OpCode, QueryClass, QuerySection, ResponseCode};
@@ -534,7 +535,7 @@ mod tests {
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
-                qname: "example.com.".to_string(),
+                qname: nm("example.com."),
                 qtype: Qtype::of(rt::IXFR),
                 qclass: QueryClass::IN,
             }],
@@ -562,12 +563,12 @@ mod tests {
         assert_eq!(delta.from_serial, Serial::new(1));
         assert_eq!(delta.to_serial, Serial::new(2));
 
-        let deleted: Vec<&str> = delta.deleted.iter().map(|r| r.name.as_str()).collect();
-        let added: Vec<&str> = delta.added.iter().map(|r| r.name.as_str()).collect();
-        assert!(deleted.contains(&"www.example.com."), "{deleted:?}");
-        assert!(deleted.contains(&"mail.example.com."), "{deleted:?}");
-        assert!(added.contains(&"www.example.com."), "{added:?}");
-        assert!(added.contains(&"ftp.example.com."), "{added:?}");
+        let deleted: Vec<Name> = delta.deleted.iter().map(|r| r.name.clone()).collect();
+        let added: Vec<Name> = delta.added.iter().map(|r| r.name.clone()).collect();
+        assert!(deleted.contains(&nm("www.example.com.")), "{deleted:?}");
+        assert!(deleted.contains(&nm("mail.example.com.")), "{deleted:?}");
+        assert!(added.contains(&nm("www.example.com.")), "{added:?}");
+        assert!(added.contains(&nm("ftp.example.com.")), "{added:?}");
         assert_eq!(delta.deleted.len(), 2);
         assert_eq!(delta.added.len(), 2);
     }
@@ -585,7 +586,7 @@ mod tests {
         let delta = diff(&old, &new).unwrap();
         assert!(delta.deleted.is_empty(), "{:?}", delta.deleted);
         assert_eq!(delta.added.len(), 1);
-        assert_eq!(delta.added[0].name, "new.example.com.");
+        assert_eq!(delta.added[0].name, nm("new.example.com."));
     }
 
     /// The apex SOA is framing: a copy among the changes reads as the start of
@@ -624,26 +625,33 @@ mod tests {
         log.note_change(None, &v1);
         log.note_change(Some(&v1), &v2);
         log.note_change(Some(&v2), &v3);
-        assert_eq!(log.len("example.com."), 2, "the first load is not a step");
+        assert_eq!(
+            log.len(nm("example.com.").as_ref()),
+            2,
+            "the first load is not a step"
+        );
 
         let chain = log
-            .chain_from("example.com.", Serial::new(1))
+            .chain_from(nm("example.com.").as_ref(), Serial::new(1))
             .expect("a chain from 1");
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].from_serial, Serial::new(1));
         assert_eq!(chain[1].to_serial, Serial::new(3));
 
         assert_eq!(
-            log.chain_from("example.com.", Serial::new(2))
+            log.chain_from(nm("example.com.").as_ref(), Serial::new(2))
                 .map(|c| c.len()),
             Some(1),
             "a client one step behind gets one step"
         );
         assert!(
-            log.chain_from("example.com.", Serial::new(99)).is_none(),
+            log.chain_from(nm("example.com.").as_ref(), Serial::new(99))
+                .is_none(),
             "a serial we never held has no chain"
         );
-        assert!(log.chain_from("other.test.", Serial::new(1)).is_none());
+        assert!(log
+            .chain_from(nm("other.test.").as_ref(), Serial::new(1))
+            .is_none());
     }
 
     /// The history is bounded and the oldest steps go first; a client far enough
@@ -660,14 +668,16 @@ mod tests {
             previous = next;
         }
 
-        assert_eq!(log.len("example.com."), MAX_DELTAS_PER_ZONE);
+        assert_eq!(log.len(nm("example.com.").as_ref()), MAX_DELTAS_PER_ZONE);
         assert!(
-            log.chain_from("example.com.", Serial::new(1)).is_none(),
+            log.chain_from(nm("example.com.").as_ref(), Serial::new(1))
+                .is_none(),
             "aged out"
         );
         let newest = Serial::new(MAX_DELTAS_PER_ZONE as u32 + 9);
         assert_eq!(
-            log.chain_from("example.com.", newest).map(|c| c.len()),
+            log.chain_from(nm("example.com.").as_ref(), newest)
+                .map(|c| c.len()),
             Some(1)
         );
     }
@@ -683,7 +693,7 @@ mod tests {
 
         log.note_change(Some(&v1), &same_serial);
         log.note_change(Some(&v1), &backwards);
-        assert_eq!(log.len("example.com."), 0);
+        assert_eq!(log.len(nm("example.com.").as_ref()), 0);
     }
 
     #[test]
@@ -692,10 +702,14 @@ mod tests {
         let v1 = zone_at(1, "www IN A 192.0.2.1\n");
         let v2 = zone_at(2, "www IN A 192.0.2.2\n");
         log.note_change(Some(&v1), &v2);
-        assert_eq!(log.len("example.com."), 1);
+        assert_eq!(log.len(nm("example.com.").as_ref()), 1);
 
-        log.forget("EXAMPLE.COM.");
-        assert_eq!(log.len("example.com."), 0, "and case-insensitively");
+        log.forget(nm("EXAMPLE.COM.").as_ref());
+        assert_eq!(
+            log.len(nm("example.com.").as_ref()),
+            0,
+            "and case-insensitively"
+        );
     }
 
     /// RFC 1995 §4's shape, which a client reads positionally: current SOA, then
@@ -732,13 +746,13 @@ mod tests {
             rt::SOA,
             "then the old SOA: deletions follow"
         );
-        assert_eq!(all[2].name, "www.example.com.");
+        assert_eq!(all[2].name, nm("www.example.com."));
         assert_eq!(
             all[3].rdata.rtype(),
             rt::SOA,
             "then the new SOA: additions follow"
         );
-        assert_eq!(all[4].name, "www.example.com.");
+        assert_eq!(all[4].name, nm("www.example.com."));
         assert_eq!(all[5].rdata.rtype(), rt::SOA, "closes with the current SOA");
         assert_eq!(all.len(), 6);
 

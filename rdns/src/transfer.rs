@@ -9,6 +9,8 @@
 use crate::error::{TransferError, TransferResult};
 use crate::utils::record_types as rt;
 use crate::zone::Zone;
+#[cfg(test)]
+use crate::Name;
 use crate::Qtype;
 use crate::{DnsMessage, Edns, ResourceRecord};
 
@@ -34,7 +36,7 @@ pub fn axfr_envelopes<'a>(
         .query(apex, Qtype::of(rt::SOA))
         .first()
         .map(|zr| ResourceRecord {
-            name: apex.to_string(),
+            name: apex.to_owned(),
             class: zr.class,
             ttl: zr.ttl,
             rdata: zr.rdata.clone(),
@@ -90,9 +92,8 @@ impl Iterator for AxfrRecords<'_> {
             if self.zone.is_apex_soa(zr) {
                 continue;
             }
-            let name = self.zone.normalize_name(&zr.name);
             return Some(ResourceRecord {
-                name: name.into_owned(),
+                name: zr.name.clone(),
                 class: zr.class,
                 ttl: zr.ttl,
                 rdata: zr.rdata.clone(),
@@ -136,7 +137,9 @@ impl<I: Iterator<Item = ResourceRecord>> Iterator for Envelopes<'_, I> {
     type Item = DnsMessage;
 
     fn next(&mut self) -> Option<DnsMessage> {
-        let cost = |rr: &ResourceRecord| rr.name.len() + 2 + 10 + rr.rdata.bytes().len();
+        // The name's wire length exactly, now that a name is its wire form.
+        let cost =
+            |rr: &ResourceRecord| rr.name.as_ref().as_wire().len() + 10 + rr.rdata.bytes().len();
         let mut current: Vec<ResourceRecord> = Vec::new();
         let mut estimated = 0usize;
         if let Some(rr) = self.carried.take() {
@@ -191,14 +194,16 @@ pub(crate) fn transfer_message(request: &DnsMessage, answers: Vec<ResourceRecord
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_records::nm;
     use crate::zone::parse_zone_file;
     use crate::{DnsMessageBuilder, ResponseCode};
 
     fn request_for(qname: &str) -> DnsMessage {
         DnsMessageBuilder::new()
             .with_id(0x1234)
-            .with_query(qname, Qtype::of(rt::AXFR))
+            .with_query(nm(qname), Qtype::of(rt::AXFR))
             .with_recursion(false)
             .build()
     }
@@ -243,7 +248,7 @@ mod tests {
     fn test_every_record_is_transferred_under_its_absolute_name() {
         let zone = small_zone();
         let messages = axfr_messages(&request_for("example.com."), &zone).unwrap();
-        let names: Vec<String> = messages
+        let names: Vec<Name> = messages
             .iter()
             .flat_map(|m| m.answers.iter())
             .map(|rr| rr.name.clone())
@@ -256,7 +261,7 @@ mod tests {
             "*.example.com.",
         ] {
             assert!(
-                names.iter().any(|n| n == expected),
+                names.iter().any(|n| *n == nm(expected)),
                 "missing {expected}: {names:?}"
             );
         }

@@ -5,12 +5,10 @@
 //! RDATA only for the types RFC 1035 defines, since a receiver cannot find names
 //! in a type it does not know (RFC 3597 §4, RFC 4034).
 
-use crate::dname::{
-    dname_from_bytes, write_bytes, write_label, DNameUnpacker, POINTER_MASK, POINTER_TAG,
-};
+use crate::dname::{write_bytes, POINTER_MASK, POINTER_TAG};
 use crate::error::WireError;
 use crate::utils::record_types as rt;
-use crate::Rtype;
+use crate::{Name, NameRef, Rtype};
 use std::collections::HashMap;
 
 /// Per-message table of name suffixes already written, and where.
@@ -21,7 +19,7 @@ pub struct NameCompressor {
     /// Ranges into one arena: an owned `String` per suffix is quadratic in the
     /// shared tail. Not lowercased — [`NameCompressor::lookup`] compares
     /// case-insensitively, so folding here would only add a fold on the needle.
-    arena: String,
+    arena: Vec<u8>,
     /// Suffixes of those names, as ranges into `arena` with the offset each was
     /// first written at. Never holds two entries for the same suffix.
     seen: Vec<Suffix>,
@@ -94,41 +92,54 @@ impl NameCompressor {
 
     /// Write `name` at `pos`, using a pointer to the longest suffix already
     /// present in the message. Returns the new position.
+    ///
+    /// A suffix of a wire-form name at a label boundary *is* a name, so the
+    /// candidates are exactly [`NameRef::ancestors`] and the offset of each is
+    /// the difference in length. That is what the text form had to reconstruct
+    /// by splitting on `.` and counting, and why the two offsets — text and
+    /// wire — needed a comment explaining that they happened to coincide.
     pub fn write_name(
         &mut self,
-        name: &str,
+        name: NameRef<'_>,
         buf: &mut [u8],
         pos: usize,
     ) -> Result<usize, WireError> {
-        let trimmed = name.strip_suffix('.').unwrap_or(name);
-        if trimmed.is_empty() {
-            // The root is one zero octet; a pointer to it would cost two.
+        let wire = name.as_wire();
+        if name.is_root() {
+            // One zero octet; a pointer to it would cost two.
             return write_bytes(buf, pos, &[0]);
         }
 
         // Longest-first. Each needle is a slice of the caller's own name, so a
         // lookup allocates nothing.
         let mut matched = None;
-        for (i, start) in label_starts(trimmed).enumerate() {
-            if let Some(target) = self.lookup(&trimmed[start..]) {
-                matched = Some((i, target));
+        for ancestor in name.ancestors() {
+            if ancestor.is_root() {
+                break;
+            }
+            let start = wire.len() - ancestor.as_wire().len();
+            if let Some(target) = self.lookup(ancestor.as_wire()) {
+                matched = Some((start, target));
                 break;
             }
         }
 
-        // The labels before the match are written literally here, so record
-        // where each lands as a target for a later name. From the match on is
-        // already recorded; `fresh == 0` contributes nothing, not even a copy.
-        let fresh = matched.map_or_else(|| label_starts(trimmed).count(), |(i, _)| i);
-        if fresh > 0 {
+        // Everything before the match is written literally here, so record
+        // where each of those suffixes lands as a target for a later name. From
+        // the match on is already recorded; a match at 0 contributes nothing,
+        // not even a copy. With no match the whole name goes out except its
+        // root octet, which is written below as the terminator.
+        let fresh_end = matched.map_or(wire.len() - 1, |(start, _)| start);
+        if fresh_end > 0 {
             let first_new = self.seen.len();
             let base = self.arena.len();
-            self.arena.push_str(trimmed);
+            self.arena.extend_from_slice(wire);
             let end = self.arena.len();
-            for start in label_starts(trimmed).take(fresh) {
-                // A label costs its bytes plus a length prefix on the wire and
-                // its bytes plus a `.` in the text, so the text offset is the
-                // wire offset.
+            for ancestor in name.ancestors() {
+                let start = wire.len() - ancestor.as_wire().len();
+                if start >= fresh_end {
+                    break;
+                }
                 let suffix_pos = pos + start;
                 // A pointer field is 14 bits; a suffix past that is unreachable.
                 if suffix_pos <= POINTER_MASK as usize {
@@ -142,12 +153,9 @@ impl NameCompressor {
             self.index_from(first_new);
         }
 
-        // Split `trimmed` rather than the arena so the name goes out in the case
-        // it was given: RFC 4343 folds case for comparison only.
-        let mut out = pos;
-        for label in trimmed.split('.').take(fresh) {
-            out = write_label(buf, out, label)?;
-        }
+        // The caller's own octets, so the name goes out in the case it was
+        // given: RFC 4343 folds case for comparison only.
+        let out = write_bytes(buf, pos, &wire[..fresh_end])?;
         match matched {
             Some((_, target)) => write_bytes(buf, out, &(POINTER_TAG | target).to_be_bytes()),
             None => write_bytes(buf, out, &[0]),
@@ -166,9 +174,9 @@ impl NameCompressor {
     ///
     /// The comparison is written out twice rather than shared: factoring it into
     /// a method or a closure cost the scan 51 -> 75 ns per name.
-    fn lookup(&self, needle: &str) -> Option<u16> {
+    fn lookup(&self, needle: &[u8]) -> Option<u16> {
         if self.index.is_empty() {
-            let arena = self.arena.as_str();
+            let arena = self.arena.as_slice();
             return self
                 .seen
                 .iter()
@@ -222,16 +230,16 @@ impl NameCompressor {
         match rtype {
             // NS, CNAME, PTR: the RDATA is exactly one domain name.
             rt::NS | rt::CNAME | rt::PTR => {
-                let (name, rest) = read_name(rdata)?;
-                let pos = self.write_name(&name, buf, pos)?;
+                let (name, rest) = Name::from_wire(rdata)?;
+                let pos = self.write_name(name.as_ref(), buf, pos)?;
                 write_bytes(buf, pos, rest)
             }
             // SOA: MNAME, RNAME, then five 32-bit fields.
             rt::SOA => {
-                let (mname, rest) = read_name(rdata)?;
-                let (rname, rest) = read_name(rest)?;
-                let pos = self.write_name(&mname, buf, pos)?;
-                let pos = self.write_name(&rname, buf, pos)?;
+                let (mname, rest) = Name::from_wire(rdata)?;
+                let (rname, rest) = Name::from_wire(rest)?;
+                let pos = self.write_name(mname.as_ref(), buf, pos)?;
+                let pos = self.write_name(rname.as_ref(), buf, pos)?;
                 write_bytes(buf, pos, rest)
             }
             // MX: 16-bit preference, then EXCHANGE.
@@ -244,8 +252,8 @@ impl NameCompressor {
                     });
                 }
                 let pos = write_bytes(buf, pos, &rdata[..2])?;
-                let (exchange, rest) = read_name(&rdata[2..])?;
-                let pos = self.write_name(&exchange, buf, pos)?;
+                let (exchange, rest) = Name::from_wire(&rdata[2..])?;
+                let pos = self.write_name(exchange.as_ref(), buf, pos)?;
                 write_bytes(buf, pos, rest)
             }
             // Everything else — including SRV, DNAME, SVCB/HTTPS and the
@@ -260,21 +268,6 @@ impl NameCompressor {
     }
 }
 
-/// Where each label of `name` begins: byte 0, then one past every `.`.
-///
-/// An iterator, not a `Vec`: collecting is an allocation per name written, and
-/// the two passes are over at most 255 bytes. Splits on every `.` as
-/// `str::split` does, so an empty label reaches `write_label` and is rejected
-/// there.
-fn label_starts(name: &str) -> impl Iterator<Item = usize> + '_ {
-    std::iter::once(0).chain(
-        name.bytes()
-            .enumerate()
-            .filter(|(_, byte)| *byte == b'.')
-            .map(|(i, _)| i + 1),
-    )
-}
-
 /// FNV-1a over the ASCII-folded bytes (RFC 4343), folding exactly as [`lookup`]
 /// compares.
 ///
@@ -282,27 +275,20 @@ fn label_starts(name: &str) -> impl Iterator<Item = usize> + '_ {
 /// chosen name buys a few extra bytes in one message and nothing else.
 ///
 /// [`lookup`]: NameCompressor::lookup
-fn folded_hash(name: &str) -> u64 {
+fn folded_hash(name: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
-    for byte in name.bytes() {
+    for &byte in name {
         hash ^= u64::from(byte.to_ascii_lowercase());
         hash = u64::wrapping_mul(hash, 0x0000_0100_0000_01b3);
     }
     hash
 }
 
-/// Read one uncompressed name from the head of `data`, returning it with the
-/// bytes that follow.
-fn read_name(data: &[u8]) -> Result<(String, &[u8]), WireError> {
-    // Stored RDATA contains no pointers by construction, so the unpacker only
-    // ever walks the bytes it is given.
-    let unpacker = DNameUnpacker::new(data);
-    dname_from_bytes(data, &unpacker)
-}
-
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::name::nm;
 
     /// Cost per name written does not grow with the size of the message: a
     /// ratio between 25 names and 800, so it is machine-independent.
@@ -312,7 +298,7 @@ mod tests {
     #[test]
     fn writing_a_name_costs_the_same_however_many_the_message_holds() {
         let per_name = |count: usize| {
-            let names: Vec<String> = (0..count).map(|i| format!("h{i}.e.com.")).collect();
+            let names: Vec<Name> = (0..count).map(|i| nm(&format!("h{i}.e.com."))).collect();
             let mut buf = vec![0u8; 0x4000];
             // Best of three: a lost timeslice can only make a run look slower.
             (0..3)
@@ -322,7 +308,7 @@ mod tests {
                         let mut c = NameCompressor::new();
                         let mut pos = 12;
                         for name in &names {
-                            pos = c.write_name(name, &mut buf, pos).expect("fits");
+                            pos = c.write_name(name.as_ref(), &mut buf, pos).expect("fits");
                         }
                         // Every name here must be a compression target, so none
                         // may land past the 14-bit pointer range.
@@ -352,11 +338,13 @@ mod tests {
         let mut buf = vec![0u8; 0x4000];
 
         // `example.com.` lands at 18: 12 for the header plus `5first`.
-        let mark = c.write_name("first.example.com.", &mut buf, 12).unwrap();
+        let mark = c
+            .write_name(nm("first.example.com.").as_ref(), &mut buf, 12)
+            .unwrap();
         let mut pos = mark;
         for i in 0..SCAN_LIMIT + 8 {
             pos = c
-                .write_name(&format!("h{i}.other.test."), &mut buf, pos)
+                .write_name(nm(&format!("h{i}.other.test.")).as_ref(), &mut buf, pos)
                 .unwrap();
         }
         assert!(!c.index.is_empty(), "the table outgrew the scan");
@@ -364,12 +352,16 @@ mod tests {
         c.rewind(mark);
         // Written again at the rewind point: the suffix from before it is still a
         // target, and `other.test.` is not one any more.
-        let end = c.write_name("second.example.com.", &mut buf, mark).unwrap();
+        let end = c
+            .write_name(nm("second.example.com.").as_ref(), &mut buf, mark)
+            .unwrap();
         assert_eq!(
             &buf[mark..end],
             &[6, b's', b'e', b'c', b'o', b'n', b'd', 0xc0, 18]
         );
-        let after = c.write_name("h0.other.test.", &mut buf, end).unwrap();
+        let after = c
+            .write_name(nm("h0.other.test.").as_ref(), &mut buf, end)
+            .unwrap();
         assert_eq!(after - end, 15, "written in full, not pointed at");
     }
 
@@ -383,15 +375,19 @@ mod tests {
         let mut buf = vec![0u8; 0x4000];
 
         // `example.com.` lands at 18: 12 for the header plus `5first`.
-        let mut pos = c.write_name("first.example.com.", &mut buf, 12).unwrap();
+        let mut pos = c
+            .write_name(nm("first.example.com.").as_ref(), &mut buf, 12)
+            .unwrap();
         for i in 0..SCAN_LIMIT + 8 {
             pos = c
-                .write_name(&format!("h{i}.other.test."), &mut buf, pos)
+                .write_name(nm(&format!("h{i}.other.test.")).as_ref(), &mut buf, pos)
                 .unwrap();
         }
         assert!(!c.index.is_empty(), "the table outgrew the scan");
 
-        let end = c.write_name("second.example.com.", &mut buf, pos).unwrap();
+        let end = c
+            .write_name(nm("second.example.com.").as_ref(), &mut buf, pos)
+            .unwrap();
         assert_eq!(
             &buf[pos..end],
             &[6, b's', b'e', b'c', b'o', b'n', b'd', 0xc0, 18]
@@ -402,10 +398,15 @@ mod tests {
     /// `k` and U+212A KELVIN SIGN are different names (RFC 4343).
     #[test]
     fn the_index_folds_the_same_ascii_the_comparison_does() {
-        assert_eq!(folded_hash("Example.COM"), folded_hash("example.com"));
+        // The hash takes wire octets now, so the comparison is over names.
+        let wire = |text: &str| nm(text).as_ref().as_wire().to_vec();
+        assert_eq!(
+            folded_hash(&wire("Example.COM.")),
+            folded_hash(&wire("example.com."))
+        );
         assert_ne!(
-            folded_hash("\u{212A}.example.com"),
-            folded_hash("k.example.com")
+            folded_hash(&wire("\u{212A}.example.com.")),
+            folded_hash(&wire("k.example.com."))
         );
     }
 
@@ -415,10 +416,14 @@ mod tests {
         let mut c = NameCompressor::new();
         let mut buf = [0u8; 128];
 
-        let pos = c.write_name("example.com.", &mut buf, 12).unwrap();
+        let pos = c
+            .write_name(nm("example.com.").as_ref(), &mut buf, 12)
+            .unwrap();
         assert_eq!(pos, 12 + 13, "13 bytes: 7example3com0");
 
-        let end = c.write_name("example.com.", &mut buf, pos).unwrap();
+        let end = c
+            .write_name(nm("example.com.").as_ref(), &mut buf, pos)
+            .unwrap();
         assert_eq!(end - pos, 2, "the repeat is a bare pointer");
         assert_eq!(&buf[pos..end], &[0xc0, 12]);
     }
@@ -429,8 +434,12 @@ mod tests {
         let mut c = NameCompressor::new();
         let mut buf = [0u8; 128];
 
-        let pos = c.write_name("example.com.", &mut buf, 12).unwrap();
-        let end = c.write_name("www.example.com.", &mut buf, pos).unwrap();
+        let pos = c
+            .write_name(nm("example.com.").as_ref(), &mut buf, 12)
+            .unwrap();
+        let end = c
+            .write_name(nm("www.example.com.").as_ref(), &mut buf, pos)
+            .unwrap();
 
         // "3www" written literally, then a pointer to example.com at 12.
         assert_eq!(&buf[pos..end], &[3, b'w', b'w', b'w', 0xc0, 12]);
@@ -443,8 +452,10 @@ mod tests {
         let mut buf = [0u8; 128];
 
         // www.example.com. at 12 => "com." starts at 12 + 4 + 8 = 24.
-        let pos = c.write_name("www.example.com.", &mut buf, 12).unwrap();
-        let end = c.write_name("com.", &mut buf, pos).unwrap();
+        let pos = c
+            .write_name(nm("www.example.com.").as_ref(), &mut buf, 12)
+            .unwrap();
+        let end = c.write_name(nm("com.").as_ref(), &mut buf, pos).unwrap();
 
         assert_eq!(&buf[pos..end], &[0xc0, 24]);
     }
@@ -456,10 +467,14 @@ mod tests {
         let mut c = NameCompressor::new();
         let mut buf = [0u8; 128];
 
-        let pos = c.write_name("Example.COM.", &mut buf, 12).unwrap();
+        let pos = c
+            .write_name(nm("Example.COM.").as_ref(), &mut buf, 12)
+            .unwrap();
         assert_eq!(&buf[12..20], b"\x07Example");
 
-        let end = c.write_name("example.com.", &mut buf, pos).unwrap();
+        let end = c
+            .write_name(nm("example.com.").as_ref(), &mut buf, pos)
+            .unwrap();
         assert_eq!(&buf[pos..end], &[0xc0, 12]);
     }
 
@@ -469,10 +484,10 @@ mod tests {
         let mut c = NameCompressor::new();
         let mut buf = [0u8; 16];
 
-        let pos = c.write_name(".", &mut buf, 0).unwrap();
+        let pos = c.write_name(nm(".").as_ref(), &mut buf, 0).unwrap();
         assert_eq!(&buf[..pos], &[0]);
 
-        let end = c.write_name(".", &mut buf, pos).unwrap();
+        let end = c.write_name(nm(".").as_ref(), &mut buf, pos).unwrap();
         assert_eq!(&buf[pos..end], &[0]);
     }
 
@@ -483,22 +498,24 @@ mod tests {
         let mut c = NameCompressor::new();
         let mut buf = [0u8; 256];
 
-        let name = "a.b.c.d.example.com.";
-        c.write_name(name, &mut buf, 12).unwrap();
+        let name = nm("a.b.c.d.example.com.");
+        c.write_name(name.as_ref(), &mut buf, 12).unwrap();
 
         assert_eq!(c.seen.len(), 6, "six suffixes, one per label");
+        // The arena holds the name's wire octets, root terminator included.
         assert_eq!(
             c.arena.len(),
-            name.len() - 1,
+            name.as_ref().as_wire().len(),
             "and one copy of the name between them, not one per suffix"
         );
 
         // A second name sharing five of those labels adds only its own label.
-        c.write_name("z.b.c.d.example.com.", &mut buf, 40).unwrap();
+        c.write_name(nm("z.b.c.d.example.com.").as_ref(), &mut buf, 40)
+            .unwrap();
         assert_eq!(c.seen.len(), 7);
         assert_eq!(
             c.arena.len(),
-            (name.len() - 1) * 2,
+            name.as_ref().as_wire().len() * 2,
             "the shared tail is not copied per suffix, only per name"
         );
     }
@@ -510,12 +527,16 @@ mod tests {
         let mut c = NameCompressor::new();
         let mut buf = [0u8; 256];
 
-        let pos = c.write_name("www.example.com.", &mut buf, 12).unwrap();
+        let pos = c
+            .write_name(nm("www.example.com.").as_ref(), &mut buf, 12)
+            .unwrap();
         let (suffixes, bytes) = (c.seen.len(), c.arena.len());
 
         let mut at = pos;
         for _ in 0..20 {
-            at = c.write_name("WWW.Example.Com.", &mut buf, at).unwrap();
+            at = c
+                .write_name(nm("WWW.Example.Com.").as_ref(), &mut buf, at)
+                .unwrap();
         }
         assert_eq!(c.seen.len(), suffixes, "no new suffixes");
         assert_eq!(c.arena.len(), bytes, "and no new bytes");
@@ -530,11 +551,15 @@ mod tests {
         let mut buf = vec![0u8; 0x5000];
 
         let far = 0x4000;
-        let pos = c.write_name("example.com.", &mut buf, far).unwrap();
+        let pos = c
+            .write_name(nm("example.com.").as_ref(), &mut buf, far)
+            .unwrap();
         assert_eq!(pos - far, 13);
 
         // Nothing reachable to point at, so the second copy is written in full.
-        let end = c.write_name("example.com.", &mut buf, pos).unwrap();
+        let end = c
+            .write_name(nm("example.com.").as_ref(), &mut buf, pos)
+            .unwrap();
         assert_eq!(end - pos, 13);
     }
 
@@ -544,17 +569,20 @@ mod tests {
         let mut c = NameCompressor::new();
         let mut buf = [0u8; 256];
 
-        let pos = c.write_name("example.com.", &mut buf, 12).unwrap();
+        let pos = c
+            .write_name(nm("example.com.").as_ref(), &mut buf, 12)
+            .unwrap();
 
         // NS RDATA: one name, sharing the whole suffix -> "2ns" + pointer.
-        let ns = crate::dname::dname_to_bytes("ns.example.com.").unwrap();
-        let end = c.write_rdata(rt::NS, &ns, &mut buf, pos).unwrap();
+        let ns = nm("ns.example.com.");
+        let ns = ns.as_ref().as_wire();
+        let end = c.write_rdata(rt::NS, ns, &mut buf, pos).unwrap();
         assert_eq!(&buf[pos..end], &[2, b'n', b's', 0xc0, 12]);
 
         // SRV (33) is not on the list: byte-for-byte, pointers or not.
         let srv_start = end;
         let mut srv = vec![0, 10, 0, 20, 0, 80];
-        srv.extend_from_slice(&crate::dname::dname_to_bytes("ns.example.com.").unwrap());
+        srv.extend_from_slice(nm("ns.example.com.").as_ref().as_wire());
         let end = c
             .write_rdata(Rtype::new(33), &srv, &mut buf, srv_start)
             .unwrap();
@@ -567,10 +595,12 @@ mod tests {
         let mut c = NameCompressor::new();
         let mut buf = [0u8; 256];
 
-        let pos = c.write_name("example.com.", &mut buf, 12).unwrap();
+        let pos = c
+            .write_name(nm("example.com.").as_ref(), &mut buf, 12)
+            .unwrap();
 
         let mut mx = vec![0, 10];
-        mx.extend_from_slice(&crate::dname::dname_to_bytes("mail.example.com.").unwrap());
+        mx.extend_from_slice(nm("mail.example.com.").as_ref().as_wire());
         let end = c.write_rdata(rt::MX, &mx, &mut buf, pos).unwrap();
 
         assert_eq!(
@@ -585,10 +615,12 @@ mod tests {
         let mut c = NameCompressor::new();
         let mut buf = [0u8; 256];
 
-        let pos = c.write_name("example.com.", &mut buf, 12).unwrap();
+        let pos = c
+            .write_name(nm("example.com.").as_ref(), &mut buf, 12)
+            .unwrap();
 
-        let mut soa = crate::dname::dname_to_bytes("ns.example.com.").unwrap();
-        soa.extend_from_slice(&crate::dname::dname_to_bytes("admin.example.com.").unwrap());
+        let mut soa = nm("ns.example.com.").as_ref().as_wire().to_vec();
+        soa.extend_from_slice(nm("admin.example.com.").as_ref().as_wire());
         soa.extend_from_slice(&[9u8; 20]);
         let end = c.write_rdata(rt::SOA, &soa, &mut buf, pos).unwrap();
 
@@ -607,7 +639,7 @@ mod tests {
         let mut c = NameCompressor::new();
         let mut buf = [0u8; 8];
 
-        let result = c.write_name("example.com.", &mut buf, 0);
+        let result = c.write_name(nm("example.com.").as_ref(), &mut buf, 0);
         assert!(result.is_err());
     }
 }

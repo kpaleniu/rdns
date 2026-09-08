@@ -8,14 +8,16 @@
 //! persisted, or a reload serves the file's older number and a secondary
 //! declines to transfer while its signatures expire.
 
-use crate::utils::{is_at_or_under, record_types as rt};
+use crate::utils::record_types as rt;
 use crate::zone::{Zone, ZoneRecord};
 use crate::ParsedRecord;
 use crate::Qtype;
 use crate::Rtype;
 use crate::Serial;
 use crate::Ttl;
-use crate::{DnsMessage, OpCode, QueryClass, RecordData, ResourceRecord, ResponseCode};
+use crate::{
+    DnsMessage, Name, NameRef, OpCode, QueryClass, RecordData, ResourceRecord, ResponseCode,
+};
 
 /// Why an UPDATE was refused, and the RCODE that says so on the wire.
 ///
@@ -51,21 +53,21 @@ impl Rejected {
 pub enum Prerequisite {
     /// §2.4.1 — some RRset of this type exists at this name, whatever it holds.
     /// CLASS=ANY, RDLENGTH=0.
-    RrsetExists { name: String, rtype: Rtype },
+    RrsetExists { name: Name, rtype: Rtype },
     /// §2.4.2 — an RRset of this type exists at this name *and* holds exactly
     /// these records. CLASS is the zone's, and there is RDATA. §3.2.3 compares
     /// the whole RRset as a set, so naming two of three records fails.
     RrsetExistsWithValue {
-        name: String,
+        name: Name,
         rtype: Rtype,
         rdatas: Vec<RecordData>,
     },
     /// §2.4.3 — no RRset of this type exists at this name. CLASS=NONE.
-    RrsetDoesNotExist { name: String, rtype: Rtype },
+    RrsetDoesNotExist { name: Name, rtype: Rtype },
     /// §2.4.4 — at least one RR exists at this name. CLASS=ANY, TYPE=ANY.
-    NameInUse { name: String },
+    NameInUse { name: Name },
     /// §2.4.5 — no RR exists at this name. CLASS=NONE, TYPE=ANY.
-    NameNotInUse { name: String },
+    NameNotInUse { name: Name },
 }
 
 /// One thing an UPDATE asks to change (RFC 2136 §2.5). Four forms, keyed on
@@ -76,14 +78,14 @@ pub enum Change {
     /// zone's, and the only form whose TTL matters.
     Add(ResourceRecord),
     /// §2.5.2 — delete every record of this type at this name. CLASS=ANY.
-    DeleteRrset { name: String, rtype: Rtype },
+    DeleteRrset { name: Name, rtype: Rtype },
     /// §2.5.3 — delete every RRset at this name. CLASS=ANY, TYPE=ANY.
-    DeleteName { name: String },
+    DeleteName { name: Name },
     /// §2.5.4 — delete the one record that matches this name, type and RDATA.
     /// CLASS=NONE. The TTL is not part of the comparison, hence rdata rather
     /// than a whole record.
     DeleteRecord {
-        name: String,
+        name: Name,
         rtype: Rtype,
         rdata: RecordData,
     },
@@ -94,7 +96,7 @@ pub enum Change {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateRequest {
     /// The zone this update is for, from the Zone section (§2.3).
-    pub zone: String,
+    pub zone: Name,
     pub prerequisites: Vec<Prerequisite>,
     pub changes: Vec<Change>,
 }
@@ -137,12 +139,12 @@ pub fn parse(msg: &DnsMessage) -> Result<UpdateRequest, Rejected> {
     let prerequisites = msg
         .answers
         .iter()
-        .map(|rr| read_prerequisite(rr, &zone, zone_class))
+        .map(|rr| read_prerequisite(rr, zone.as_ref(), zone_class))
         .collect::<Result<Vec<_>, _>>()?;
     let changes = msg
         .authorities
         .iter()
-        .map(|rr| read_change(rr, &zone, zone_class))
+        .map(|rr| read_change(rr, zone.as_ref(), zone_class))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(UpdateRequest {
@@ -155,7 +157,7 @@ pub fn parse(msg: &DnsMessage) -> Result<UpdateRequest, Rejected> {
 /// One record of the Prerequisite section (RFC 2136 §2.4, checked per §3.2).
 fn read_prerequisite(
     rr: &ResourceRecord,
-    zone: &str,
+    zone: NameRef<'_>,
     zone_class: QueryClass,
 ) -> Result<Prerequisite, Rejected> {
     // §2.4 gives TTL=0 for every prerequisite form; a non-zero TTL is FORMERR.
@@ -168,7 +170,7 @@ fn read_prerequisite(
             ),
         ));
     }
-    in_zone_or_notzone(&rr.name, zone, "prerequisite")?;
+    in_zone_or_notzone(rr.name.as_ref(), zone, "prerequisite")?;
 
     let rtype = rr.rdata.rtype();
     let empty = rr.rdata.bytes().is_empty();
@@ -212,12 +214,12 @@ fn read_prerequisite(
 /// One record of the Update section (RFC 2136 §2.5, prescanned per §3.4.1).
 fn read_change(
     rr: &ResourceRecord,
-    zone: &str,
+    zone: NameRef<'_>,
     zone_class: QueryClass,
 ) -> Result<Change, Rejected> {
     // §3.4.1: a name outside the Zone section's zone is NOTZONE — otherwise one
     // zone's key writes another zone's data.
-    in_zone_or_notzone(&rr.name, zone, "update")?;
+    in_zone_or_notzone(rr.name.as_ref(), zone, "update")?;
 
     let rtype = rr.rdata.rtype();
     let empty = rr.rdata.bytes().is_empty();
@@ -274,8 +276,8 @@ fn read_change(
 
 /// RFC 2136 §3.1, §3.4.1: a name outside the zone the message names is NOTZONE,
 /// not a refusal and not a format error.
-fn in_zone_or_notzone(name: &str, zone: &str, what: &str) -> Result<(), Rejected> {
-    if is_at_or_under(name, zone) {
+fn in_zone_or_notzone(name: NameRef<'_>, zone: NameRef<'_>, what: &str) -> Result<(), Rejected> {
+    if name.is_at_or_under(zone) {
         Ok(())
     } else {
         Err(Rejected::new(
@@ -292,12 +294,12 @@ fn in_zone_or_notzone(name: &str, zone: &str, what: &str) -> Result<(), Rejected
 pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Result<(), Rejected> {
     // §2.4.2's records are per-RR on the wire but per-RRset in meaning: several
     // sharing a name and type are one prerequisite naming a whole RRset.
-    let mut value_sets: Vec<(String, Rtype, Vec<RecordData>)> = Vec::new();
+    let mut value_sets: Vec<(Name, Rtype, Vec<RecordData>)> = Vec::new();
 
     for prerequisite in prerequisites {
         match prerequisite {
             Prerequisite::RrsetExists { name, rtype } => {
-                if zone.query(name, Qtype::of(*rtype)).is_empty() {
+                if zone.query(name.as_ref(), Qtype::of(*rtype)).is_empty() {
                     return Err(Rejected::new(
                         ResponseCode::NoSuchResourceRecordSet,
                         format!("{name} has no {rtype} RRset"),
@@ -305,7 +307,7 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
                 }
             }
             Prerequisite::RrsetDoesNotExist { name, rtype } => {
-                if !zone.query(name, Qtype::of(*rtype)).is_empty() {
+                if !zone.query(name.as_ref(), Qtype::of(*rtype)).is_empty() {
                     return Err(Rejected::new(
                         ResponseCode::ResourceRecordSetExistsForSomeReason,
                         format!("{name} already has a {rtype} RRset"),
@@ -316,7 +318,7 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
             // and not `name_exists`, which is also true for a wildcard match and
             // for an empty non-terminal.
             Prerequisite::NameInUse { name } => {
-                if !zone.holds_name(name) {
+                if !zone.holds_name(name.as_ref()) {
                     return Err(Rejected::new(
                         ResponseCode::NoSuchDomain,
                         format!("{name} is not in use"),
@@ -324,7 +326,7 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
                 }
             }
             Prerequisite::NameNotInUse { name } => {
-                if zone.holds_name(name) {
+                if zone.holds_name(name.as_ref()) {
                     return Err(Rejected::new(
                         ResponseCode::DomainExistsForSomeReason,
                         format!("{name} is already in use"),
@@ -338,7 +340,7 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
             } => {
                 match value_sets
                     .iter_mut()
-                    .find(|(n, t, _)| n == name && t == rtype)
+                    .find(|(n, t, _)| n == name && *t == *rtype)
                 {
                     Some((_, _, collected)) => collected.extend(rdatas.iter().cloned()),
                     None => value_sets.push((name.clone(), *rtype, rdatas.clone())),
@@ -349,7 +351,7 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
 
     for (name, rtype, wanted) in value_sets {
         let held: Vec<RecordData> = zone
-            .query(&name, Qtype::of(rtype))
+            .query(name.as_ref(), Qtype::of(rtype))
             .into_iter()
             .map(|r| r.rdata.clone())
             .collect();
@@ -390,7 +392,7 @@ fn same_set(held: &[RecordData], wanted: &[RecordData]) -> bool {
 /// client is told its write went through; hence a record of what vanished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ignored {
-    pub name: String,
+    pub name: Name,
     pub rtype: Rtype,
     /// The rule, naming the section it comes from, for the log line.
     pub why: &'static str,
@@ -431,7 +433,7 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
     for change in changes {
         match change {
             Change::Add(record) => {
-                let name = work.absolute(&record.name);
+                let name = record.name.clone();
                 let rtype = record.rdata.rtype();
 
                 // §3.4.2.7: a CNAME may not be added where other data lives, nor
@@ -446,7 +448,7 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 // data beside a CNAME, and a CNAME is what the second branch
                 // looks for.
                 if rtype == rt::CNAME {
-                    if work.has_other_data_beside_a_cname(&name) {
+                    if work.has_other_data_beside_a_cname(name.as_ref()) {
                         ignored.push(Ignored {
                             name,
                             rtype,
@@ -455,7 +457,7 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                         });
                         continue;
                     }
-                } else if work.has_type(&name, rt::CNAME) {
+                } else if work.has_type(name.as_ref(), rt::CNAME) {
                     ignored.push(Ignored {
                         name,
                         rtype,
@@ -474,7 +476,7 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 // two serials half the space apart, where §3.2 leaves the
                 // answer undefined — ignoring is the safe direction.
                 if rtype == rt::SOA {
-                    let current = work.soa_serial_at(&name);
+                    let current = work.soa_serial_at(name.as_ref());
                     let offered = serial_of(&record.rdata);
                     let acceptable = matches!(
                         (current, offered),
@@ -506,13 +508,13 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 // §3.4.2.2's third rule, matching WKS on ADDRESS and PROTOCOL,
                 // is not implementable: WKS has no decoder, so its RDATA is
                 // opaque RFC 3597 bytes and two such records sit side by side.
-                match work.position_to_replace(&name, rtype, &record.rdata) {
+                match work.position_to_replace(name.as_ref(), rtype, &record.rdata) {
                     Some(position) => {
                         if !same_record(&work.records[position], &replacement) {
                             changed += 1;
                         }
                         work.records[position] = replacement;
-                        if rtype == rt::SOA && work.is_apex(&name) {
+                        if rtype == rt::SOA && work.is_apex(name.as_ref()) {
                             serial_moved_by_update = true;
                         }
                     }
@@ -526,8 +528,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
             // §3.4.2.3, second half: every RR of that name and type goes, except
             // the apex SOA and NS.
             Change::DeleteRrset { name, rtype } => {
-                let name = work.absolute(name);
-                if work.is_apex(&name) && (*rtype == rt::SOA || *rtype == rt::NS) {
+                let name = name.clone();
+                if work.is_apex(name.as_ref()) && (*rtype == rt::SOA || *rtype == rt::NS) {
                     ignored.push(Ignored {
                         name,
                         rtype: *rtype,
@@ -537,17 +539,17 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                     continue;
                 }
                 changed += work.remove(|record| {
-                    record.name.eq_ignore_ascii_case(&name) && record.rdata.rtype() == *rtype
+                    record.name.as_ref() == name && record.rdata.rtype() == *rtype
                 });
             }
 
             // §3.4.2.3, first half: every RR of that name goes, except the apex
             // SOA and NS.
             Change::DeleteName { name } => {
-                let name = work.absolute(name);
-                let apex = work.is_apex(&name);
+                let name = name.clone();
+                let apex = work.is_apex(name.as_ref());
                 changed += work.remove(|record| {
-                    record.name.eq_ignore_ascii_case(&name)
+                    record.name.as_ref() == name
                         && !(apex
                             && (record.rdata.rtype() == rt::SOA || record.rdata.rtype() == rt::NS))
                 });
@@ -567,8 +569,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
             // deleted, except the apex SOA and the last apex NS. One
             // [`RecordData`] comparison covers type, bytes and length at once.
             Change::DeleteRecord { name, rtype, rdata } => {
-                let name = work.absolute(name);
-                if work.is_apex(&name) && *rtype == rt::SOA {
+                let name = name.clone();
+                if work.is_apex(name.as_ref()) && *rtype == rt::SOA {
                     ignored.push(Ignored {
                         name,
                         rtype: *rtype,
@@ -579,9 +581,9 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 // "the only NS remaining": whether this deletion would empty the
                 // apex NS RRset, not whether the RRset is a singleton now. A
                 // deletion matching nothing empties nothing.
-                if work.is_apex(&name) && *rtype == rt::NS {
-                    let held = work.count(&name, rt::NS);
-                    let matching = work.count_matching(&name, rdata);
+                if work.is_apex(name.as_ref()) && *rtype == rt::NS {
+                    let held = work.count(name.as_ref(), rt::NS);
+                    let matching = work.count_matching(name.as_ref(), rdata);
                     if matching > 0 && held == matching {
                         ignored.push(Ignored {
                             name,
@@ -592,9 +594,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                         continue;
                     }
                 }
-                changed += work.remove(|record| {
-                    record.name.eq_ignore_ascii_case(&name) && record.rdata == *rdata
-                });
+                changed +=
+                    work.remove(|record| record.name.as_ref() == name && record.rdata == *rdata);
             }
         }
     }
@@ -627,35 +628,24 @@ struct Working<'a> {
 impl<'a> Working<'a> {
     fn new(base: &'a Zone) -> Working<'a> {
         Working {
-            // Normalized on the way in, so every comparison below is one
-            // `eq_ignore_ascii_case` rather than a normalization per record per
-            // change. A zone built through `add_record` may hold relative names.
-            records: base
-                .records()
-                .iter()
-                .map(|record| ZoneRecord {
-                    name: base.normalize_name(&record.name).into_owned(),
-                    ttl: record.ttl,
-                    class: record.class,
-                    rdata: record.rdata.clone(),
-                })
-                .collect(),
+            // A straight copy. This used to normalize every name on the way
+            // in, because a zone built through `add_record` could hold relative
+            // ones and every comparison below had to be against a settled form.
+            // A `Name` is absolute by construction, so there is nothing to
+            // settle.
+            records: base.records().to_vec(),
             base,
         }
     }
 
-    fn absolute(&self, name: &str) -> String {
-        self.base.normalize_name(name).into_owned()
+    fn is_apex(&self, name: NameRef<'_>) -> bool {
+        name == self.base.origin()
     }
 
-    fn is_apex(&self, name: &str) -> bool {
-        name.eq_ignore_ascii_case(self.base.origin())
-    }
-
-    fn has_type(&self, name: &str, rtype: Rtype) -> bool {
+    fn has_type(&self, name: NameRef<'_>, rtype: Rtype) -> bool {
         self.records
             .iter()
-            .any(|r| r.name.eq_ignore_ascii_case(name) && r.rdata.rtype() == rtype)
+            .any(|r| r.name.as_ref() == name && r.rdata.rtype() == rtype)
     }
 
     /// Whether the name holds anything RFC 1034 §3.6.2 would call "other data"
@@ -664,9 +654,9 @@ impl<'a> Working<'a> {
     /// RRSIG, NSEC and NSEC3 are excluded: RFC 4035 §2.5 lets a CNAME carry them
     /// at the same owner name. Not `zone_signer::is_signer_output`, which asks
     /// "would signing regenerate this" and includes NSEC3PARAM and DNSKEY.
-    fn has_other_data_beside_a_cname(&self, name: &str) -> bool {
+    fn has_other_data_beside_a_cname(&self, name: NameRef<'_>) -> bool {
         self.records.iter().any(|r| {
-            r.name.eq_ignore_ascii_case(name)
+            r.name.as_ref() == name
                 && !matches!(
                     r.rdata.rtype(),
                     rt::CNAME | rt::RRSIG | rt::NSEC | rt::NSEC3
@@ -674,17 +664,17 @@ impl<'a> Working<'a> {
         })
     }
 
-    fn count(&self, name: &str, rtype: Rtype) -> usize {
+    fn count(&self, name: NameRef<'_>, rtype: Rtype) -> usize {
         self.records
             .iter()
-            .filter(|r| r.name.eq_ignore_ascii_case(name) && r.rdata.rtype() == rtype)
+            .filter(|r| r.name.as_ref() == name && r.rdata.rtype() == rtype)
             .count()
     }
 
-    fn count_matching(&self, name: &str, rdata: &RecordData) -> usize {
+    fn count_matching(&self, name: NameRef<'_>, rdata: &RecordData) -> usize {
         self.records
             .iter()
-            .filter(|r| r.name.eq_ignore_ascii_case(name) && r.rdata == *rdata)
+            .filter(|r| r.name.as_ref() == name && r.rdata == *rdata)
             .count()
     }
 
@@ -696,9 +686,14 @@ impl<'a> Working<'a> {
     /// already associated with that name, then it is replaced with the new
     /// DNAME". Without it an UPDATE grows a second DNAME at one name, which is
     /// the zone shape `zone::check_dname_rules` refuses to load.
-    fn position_to_replace(&self, name: &str, rtype: Rtype, rdata: &RecordData) -> Option<usize> {
+    fn position_to_replace(
+        &self,
+        name: NameRef<'_>,
+        rtype: Rtype,
+        rdata: &RecordData,
+    ) -> Option<usize> {
         self.records.iter().position(|r| {
-            r.name.eq_ignore_ascii_case(name)
+            r.name.as_ref() == name
                 && r.rdata.rtype() == rtype
                 && (matches!(rtype, rt::CNAME | rt::SOA | rt::DNAME) || r.rdata == *rdata)
         })
@@ -712,10 +707,10 @@ impl<'a> Working<'a> {
     }
 
     /// The serial of the SOA at `name`, if there is one that can be read.
-    fn soa_serial_at(&self, name: &str) -> Option<Serial> {
+    fn soa_serial_at(&self, name: NameRef<'_>) -> Option<Serial> {
         self.records
             .iter()
-            .find(|r| r.name.eq_ignore_ascii_case(name) && r.rdata.rtype() == rt::SOA)
+            .find(|r| r.name.as_ref() == name && r.rdata.rtype() == rt::SOA)
             .and_then(|r| serial_of(&r.rdata))
     }
 
@@ -726,9 +721,9 @@ impl<'a> Working<'a> {
     /// written uncompressed either way — but re-spelling RDATA is how a valid
     /// RRset becomes bogus, hence one record rather than the whole zone.
     fn bump_serial(&mut self) {
-        let origin = self.base.origin().to_string();
+        let origin = self.base.origin().to_owned();
         for record in &mut self.records {
-            if record.rdata.rtype() != rt::SOA || !record.name.eq_ignore_ascii_case(&origin) {
+            if record.rdata.rtype() != rt::SOA || record.name != origin {
                 continue;
             }
             let Ok(ParsedRecord::SOA {
@@ -762,7 +757,7 @@ impl<'a> Working<'a> {
     }
 
     fn into_zone(self) -> Zone {
-        let mut zone = Zone::new(self.base.origin().to_string());
+        let mut zone = Zone::new(self.base.origin().to_owned());
         for record in self.records {
             zone.add_record(record);
         }
@@ -791,7 +786,9 @@ fn serial_of(rdata: &RecordData) -> Option<Serial> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_records::nm;
     use crate::zone::parse_zone_file;
     use crate::Class;
     use crate::{ParsedRecord, QuerySection};
@@ -831,7 +828,7 @@ mail IN MX  10 mx.example.com.
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
-                qname: "example.com.".to_string(),
+                qname: nm("example.com."),
                 qtype: Qtype::of(rt::SOA),
                 qclass: QueryClass::IN,
             }],
@@ -844,7 +841,7 @@ mail IN MX  10 mx.example.com.
 
     fn rr(name: &str, class: Class, ttl: Ttl, rdata: RecordData) -> ResourceRecord {
         ResourceRecord {
-            name: name.to_string(),
+            name: nm(name),
             class,
             ttl,
             rdata,
@@ -870,7 +867,7 @@ mail IN MX  10 mx.example.com.
                     bare(rt::A),
                 ),
                 Prerequisite::RrsetExists {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::A,
                 },
                 "§2.4.1 CLASS=ANY, an RRset of this type exists",
@@ -883,7 +880,7 @@ mail IN MX  10 mx.example.com.
                     a("192.0.2.10"),
                 ),
                 Prerequisite::RrsetExistsWithValue {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::A,
                     rdatas: vec![a("192.0.2.10")],
                 },
@@ -897,7 +894,7 @@ mail IN MX  10 mx.example.com.
                     bare(rt::A),
                 ),
                 Prerequisite::RrsetDoesNotExist {
-                    name: "nope.example.com.".to_string(),
+                    name: nm("nope.example.com."),
                     rtype: rt::A,
                 },
                 "§2.4.3 CLASS=NONE, no such RRset",
@@ -910,7 +907,7 @@ mail IN MX  10 mx.example.com.
                     bare(rt::ANY),
                 ),
                 Prerequisite::NameInUse {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                 },
                 "§2.4.4 CLASS=ANY TYPE=ANY, the name is in use",
             ),
@@ -922,7 +919,7 @@ mail IN MX  10 mx.example.com.
                     bare(rt::ANY),
                 ),
                 Prerequisite::NameNotInUse {
-                    name: "nope.example.com.".to_string(),
+                    name: nm("nope.example.com."),
                 },
                 "§2.4.5 CLASS=NONE TYPE=ANY, the name is not in use",
             ),
@@ -961,7 +958,7 @@ mail IN MX  10 mx.example.com.
                     bare(rt::A),
                 ),
                 Change::DeleteRrset {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::A,
                 },
                 "§2.5.2 CLASS=ANY, delete the RRset",
@@ -974,7 +971,7 @@ mail IN MX  10 mx.example.com.
                     bare(rt::ANY),
                 ),
                 Change::DeleteName {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                 },
                 "§2.5.3 CLASS=ANY TYPE=ANY, delete every RRset at the name",
             ),
@@ -986,7 +983,7 @@ mail IN MX  10 mx.example.com.
                     a("192.0.2.11"),
                 ),
                 Change::DeleteRecord {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::A,
                     rdata: a("192.0.2.11"),
                 },
@@ -1006,7 +1003,7 @@ mail IN MX  10 mx.example.com.
     fn the_zone_section_names_exactly_one_zone_of_type_soa() {
         let mut two = update(Vec::new(), Vec::new());
         two.queries.push(QuerySection {
-            qname: "other.test.".to_string(),
+            qname: nm("other.test."),
             qtype: Qtype::of(rt::SOA),
             qclass: QueryClass::IN,
         });
@@ -1115,11 +1112,11 @@ mail IN MX  10 mx.example.com.
             request.prerequisites,
             vec![
                 Prerequisite::RrsetExists {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::A,
                 },
                 Prerequisite::RrsetDoesNotExist {
-                    name: "new.example.com.".to_string(),
+                    name: nm("new.example.com."),
                     rtype: rt::A,
                 },
             ],
@@ -1128,7 +1125,7 @@ mail IN MX  10 mx.example.com.
         assert_eq!(
             request.changes[0],
             Change::DeleteRrset {
-                name: "old.example.com.".to_string(),
+                name: nm("old.example.com."),
                 rtype: rt::A,
             }
         );
@@ -1178,7 +1175,7 @@ mail IN MX  10 mx.example.com.
         let cases = vec![
             (
                 Prerequisite::RrsetExists {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::TXT,
                 },
                 ResponseCode::NoSuchResourceRecordSet,
@@ -1186,7 +1183,7 @@ mail IN MX  10 mx.example.com.
             ),
             (
                 Prerequisite::RrsetDoesNotExist {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::A,
                 },
                 ResponseCode::ResourceRecordSetExistsForSomeReason,
@@ -1194,14 +1191,14 @@ mail IN MX  10 mx.example.com.
             ),
             (
                 Prerequisite::NameInUse {
-                    name: "nope.example.com.".to_string(),
+                    name: nm("nope.example.com."),
                 },
                 ResponseCode::NoSuchDomain,
                 "§3.2.4 NXDOMAIN: no such name",
             ),
             (
                 Prerequisite::NameNotInUse {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                 },
                 ResponseCode::DomainExistsForSomeReason,
                 "§3.2.5 YXDOMAIN: the name is in use",
@@ -1223,18 +1220,18 @@ mail IN MX  10 mx.example.com.
             &zone,
             &[
                 Prerequisite::RrsetExists {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::A,
                 },
                 Prerequisite::RrsetDoesNotExist {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::TXT,
                 },
                 Prerequisite::NameInUse {
-                    name: "ns1.example.com.".to_string(),
+                    name: nm("ns1.example.com."),
                 },
                 Prerequisite::NameNotInUse {
-                    name: "nope.example.com.".to_string(),
+                    name: nm("nope.example.com."),
                 },
             ],
         )
@@ -1247,7 +1244,7 @@ mail IN MX  10 mx.example.com.
     #[test]
     fn a_value_dependent_prerequisite_compares_the_whole_rrset() {
         let zone = zone();
-        let name = "www.example.com.".to_string();
+        let name = nm("www.example.com.");
 
         let one_of_two = Prerequisite::RrsetExistsWithValue {
             name: name.clone(),
@@ -1271,7 +1268,7 @@ mail IN MX  10 mx.example.com.
 
         // A record the RRset does not hold at all, alongside one it does.
         let wrong_member = Prerequisite::RrsetExistsWithValue {
-            name,
+            name: name.clone(),
             rtype: rt::A,
             rdatas: vec![a("192.0.2.10"), a("192.0.2.99")],
         };
@@ -1330,13 +1327,13 @@ mail IN MX  10 mx.example.com.
 
         // The wildcard answers for it, but nothing is *at* it.
         assert!(!zone
-            .query("anything.example.com.", Qtype::of(rt::A))
+            .query(nm("anything.example.com.").as_ref(), Qtype::of(rt::A))
             .is_empty());
         assert_eq!(
             check_prerequisites(
                 &zone,
                 &[Prerequisite::NameInUse {
-                    name: "anything.example.com.".to_string(),
+                    name: nm("anything.example.com."),
                 }]
             )
             .unwrap_err()
@@ -1351,7 +1348,7 @@ mail IN MX  10 mx.example.com.
             check_prerequisites(
                 &zone,
                 &[Prerequisite::NameInUse {
-                    name: "a.b.example.com.".to_string(),
+                    name: nm("a.b.example.com."),
                 }]
             )
             .unwrap_err()
@@ -1366,7 +1363,7 @@ mail IN MX  10 mx.example.com.
     #[test]
     fn an_empty_update_is_well_formed() {
         let parsed = parse(&update(Vec::new(), Vec::new())).expect("no prerequisites, no changes");
-        assert_eq!(parsed.zone, "example.com.");
+        assert_eq!(parsed.zone, nm("example.com."));
         assert!(parsed.prerequisites.is_empty() && parsed.changes.is_empty());
         check_prerequisites(&zone(), &parsed.prerequisites).expect("nothing to check");
     }
@@ -1387,8 +1384,8 @@ mail IN MX  10 mx.example.com.
     /// RDATA tells "accepted" from "ignored".
     fn soa_with(serial: u32) -> RecordData {
         RecordData::from_parsed(&ParsedRecord::SOA {
-            mname: "ns1.example.com.".to_string(),
-            rname: "hostmaster.example.com.".to_string(),
+            mname: nm("ns1.example.com."),
+            rname: nm("hostmaster.example.com."),
             serial: Serial::new(serial),
             refresh: 3600,
             retry: 600,
@@ -1399,21 +1396,21 @@ mail IN MX  10 mx.example.com.
     }
 
     fn ns(target: &str) -> RecordData {
-        RecordData::from_parsed(&ParsedRecord::NS(target.to_string())).expect("an NS encodes")
+        RecordData::from_parsed(&ParsedRecord::NS(nm(target))).expect("an NS encodes")
     }
 
     fn cname(target: &str) -> RecordData {
-        RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).expect("a CNAME encodes")
+        RecordData::from_parsed(&ParsedRecord::CNAME(nm(target))).expect("a CNAME encodes")
     }
 
     fn dname(target: &str) -> RecordData {
-        RecordData::from_parsed(&ParsedRecord::DNAME(target.to_string())).expect("a DNAME encodes")
+        RecordData::from_parsed(&ParsedRecord::DNAME(nm(target))).expect("a DNAME encodes")
     }
 
     /// How many records of a type sit at a name, via the zone's own index — so
     /// the rebuilt zone is checked through the API a query uses.
     fn held(zone: &Zone, name: &str, rtype: Rtype) -> usize {
-        zone.query(name, Qtype::of(rtype)).len()
+        zone.query(nm(name).as_ref(), Qtype::of(rtype)).len()
     }
 
     fn add(name: &str, ttl: u32, rdata: RecordData) -> Change {
@@ -1447,7 +1444,7 @@ mail IN MX  10 mx.example.com.
         let applied = apply(
             &zone,
             &[Change::DeleteRrset {
-                name: "www.example.com.".to_string(),
+                name: nm("www.example.com."),
                 rtype: rt::A,
             }],
         );
@@ -1459,23 +1456,25 @@ mail IN MX  10 mx.example.com.
         let applied = apply(
             &zone,
             &[Change::DeleteName {
-                name: "mail.example.com.".to_string(),
+                name: nm("mail.example.com."),
             }],
         );
-        assert!(!applied.zone.holds_name("mail.example.com."));
+        assert!(!applied.zone.holds_name(nm("mail.example.com.").as_ref()));
         assert!(applied.ignored.is_empty(), "not the apex");
 
         // §2.5.4 delete one record, leaving its RRset-mate behind.
         let applied = apply(
             &zone,
             &[Change::DeleteRecord {
-                name: "www.example.com.".to_string(),
+                name: nm("www.example.com."),
                 rtype: rt::A,
                 rdata: a("192.0.2.11"),
             }],
         );
         assert_eq!(applied.changed, 1);
-        let left = applied.zone.query("www.example.com.", Qtype::of(rt::A));
+        let left = applied
+            .zone
+            .query(nm("www.example.com.").as_ref(), Qtype::of(rt::A));
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].rdata, a("192.0.2.10"), "the other one survived");
     }
@@ -1490,12 +1489,7 @@ mail IN MX  10 mx.example.com.
         let apex = "example.com.";
 
         // §3.4.2.3 first half — delete the whole apex name.
-        let applied = apply(
-            &zone,
-            &[Change::DeleteName {
-                name: apex.to_string(),
-            }],
-        );
+        let applied = apply(&zone, &[Change::DeleteName { name: nm(apex) }]);
         assert_eq!(
             applied.zone.serial(),
             Some(Serial::new(1)),
@@ -1517,7 +1511,7 @@ mail IN MX  10 mx.example.com.
             let applied = apply(
                 &zone,
                 &[Change::DeleteRrset {
-                    name: apex.to_string(),
+                    name: nm(apex),
                     rtype,
                 }],
             );
@@ -1530,9 +1524,11 @@ mail IN MX  10 mx.example.com.
         let applied = apply(
             &zone,
             &[Change::DeleteRecord {
-                name: apex.to_string(),
+                name: nm(apex),
                 rtype: rt::SOA,
-                rdata: zone.query(apex, Qtype::of(rt::SOA))[0].rdata.clone(),
+                rdata: zone.query(nm(apex).as_ref(), Qtype::of(rt::SOA))[0]
+                    .rdata
+                    .clone(),
             }],
         );
         assert_eq!(applied.zone.serial(), Some(Serial::new(1)));
@@ -1558,7 +1554,7 @@ mail IN MX  10 mx.example.com.
             apply(
                 zone,
                 &[Change::DeleteRecord {
-                    name: "example.com.".to_string(),
+                    name: nm("example.com."),
                     rtype: rt::NS,
                     rdata: ns(target),
                 }],
@@ -1678,7 +1674,7 @@ mail IN MX  10 mx.example.com.
         assert_eq!(
             applied
                 .zone
-                .query("alias.example.com.", Qtype::of(rt::CNAME))[0]
+                .query(nm("alias.example.com.").as_ref(), Qtype::of(rt::CNAME))[0]
                 .rdata,
             cname("mail.example.com.")
         );
@@ -1686,7 +1682,7 @@ mail IN MX  10 mx.example.com.
         // RFC 4035 §2.5: an RRSIG beside the CNAME is not "other data".
         let mut signed = with_cname.zone.clone();
         signed.add_record(ZoneRecord {
-            name: "alias.example.com.".to_string(),
+            name: nm("alias.example.com."),
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
             rdata: RecordData::new(rt::RRSIG, vec![0u8; 20]).expect("opaque rdata"),
@@ -1713,7 +1709,7 @@ mail IN MX  10 mx.example.com.
     fn an_soa_is_ignored_unless_its_serial_is_newer() {
         let zone = zone();
 
-        let original = zone.query("example.com.", Qtype::of(rt::SOA))[0]
+        let original = zone.query(nm("example.com.").as_ref(), Qtype::of(rt::SOA))[0]
             .rdata
             .clone();
 
@@ -1723,7 +1719,9 @@ mail IN MX  10 mx.example.com.
             (2, true, "newer"),
         ] {
             let applied = apply(&zone, &[add("example.com.", 3600, soa_with(offered))]);
-            let installed = applied.zone.query("example.com.", Qtype::of(rt::SOA))[0]
+            let installed = applied
+                .zone
+                .query(nm("example.com.").as_ref(), Qtype::of(rt::SOA))[0]
                 .rdata
                 .clone();
             if accepted {
@@ -1774,7 +1772,7 @@ mail IN MX  10 mx.example.com.
         );
         let changed_one = applied
             .zone
-            .query("www.example.com.", Qtype::of(rt::A))
+            .query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
             .into_iter()
             .find(|r| r.rdata == a("192.0.2.10"))
             .expect("the record is still there");
@@ -1808,7 +1806,7 @@ mail IN MX  10 mx.example.com.
         let no_op = apply(
             &zone,
             &[Change::DeleteRecord {
-                name: "www.example.com.".to_string(),
+                name: nm("www.example.com."),
                 rtype: rt::A,
                 rdata: a("192.0.2.99"),
             }],
@@ -1856,11 +1854,13 @@ mail IN MX  10 mx.example.com.
     #[test]
     fn the_automatic_bump_rewrites_four_octets_and_nothing_else() {
         let zone = zone();
-        let before = zone.query("example.com.", Qtype::of(rt::SOA))[0]
+        let before = zone.query(nm("example.com.").as_ref(), Qtype::of(rt::SOA))[0]
             .rdata
             .clone();
         let applied = apply(&zone, &[add("new.example.com.", 3600, a("192.0.2.50"))]);
-        let after = applied.zone.query("example.com.", Qtype::of(rt::SOA))[0]
+        let after = applied
+            .zone
+            .query(nm("example.com.").as_ref(), Qtype::of(rt::SOA))[0]
             .rdata
             .clone();
 
@@ -1889,14 +1889,16 @@ mail IN MX  10 mx.example.com.
             &zone,
             &[
                 Change::DeleteRrset {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::A,
                 },
                 add("www.example.com.", 300, a("192.0.2.80")),
             ],
         );
 
-        let left = applied.zone.query("www.example.com.", Qtype::of(rt::A));
+        let left = applied
+            .zone
+            .query(nm("www.example.com.").as_ref(), Qtype::of(rt::A));
         assert_eq!(left.len(), 1, "the delete ran first: {left:?}");
         assert_eq!(left[0].rdata, a("192.0.2.80"));
 
@@ -1906,7 +1908,7 @@ mail IN MX  10 mx.example.com.
             &[
                 add("www.example.com.", 300, a("192.0.2.80")),
                 Change::DeleteRrset {
-                    name: "www.example.com.".to_string(),
+                    name: nm("www.example.com."),
                     rtype: rt::A,
                 },
             ],

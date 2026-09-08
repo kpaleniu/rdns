@@ -17,8 +17,8 @@
 //! not, and must not be.
 
 use crate::dnssec::{
-    algorithm_supported, canonical_name, digest_type_supported, label_count, verify_rrset, Dnskey,
-    Ds, Rrset, RrsetProof, Rrsig,
+    algorithm_supported, canonical_name, canonical_name_of, digest_type_supported, label_count,
+    verify_rrset, Dnskey, Ds, Rrset, RrsetProof, Rrsig,
 };
 use crate::dnssec_denial::{
     proves_no_ds, proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
@@ -28,7 +28,7 @@ use crate::utils::hex_decode;
 use crate::utils::record_types as rt;
 use crate::Class;
 use crate::Rtype;
-use crate::{ParsedRecord, Qtype, RecordData, ResourceRecord};
+use crate::{Name, NameRef, ParsedRecord, Qtype, RecordData, ResourceRecord};
 use std::collections::HashMap;
 
 /// How much authentication an answer carries (RFC 4035 §4.3).
@@ -151,8 +151,8 @@ impl TrustAnchors {
     }
 
     /// The anchors published exactly at `zone`.
-    pub fn for_zone(&self, zone: &str) -> Vec<Ds> {
-        let zone = canonical_name(zone);
+    pub fn for_zone(&self, zone: NameRef<'_>) -> Vec<Ds> {
+        let zone = canonical_name_of(zone);
         self.anchors
             .iter()
             .filter(|ds| ds.owner == zone)
@@ -162,8 +162,8 @@ impl TrustAnchors {
 
     /// The deepest anchored zone at or above `name` — where a chain walk starts.
     /// `None` is [`ValidationState::Indeterminate`].
-    pub fn deepest_enclosing(&self, name: &str) -> Option<String> {
-        let name = canonical_name(name);
+    pub fn deepest_enclosing(&self, name: NameRef<'_>) -> Option<String> {
+        let name = canonical_name_of(name);
         self.anchors
             .iter()
             .filter(|ds| is_at_or_below(&name, &ds.owner))
@@ -241,7 +241,7 @@ fn is_at_or_below(name: &str, ancestor: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct DelegationEvidence {
     /// The child zone being delegated to.
-    pub zone: String,
+    pub zone: Name,
     /// The DS RRset from the parent's authority section, if any.
     pub ds: Vec<Ds>,
     /// The signatures over that DS RRset.
@@ -257,11 +257,10 @@ pub struct DelegationEvidence {
 impl DelegationEvidence {
     /// Read a referral's authority section for everything bearing on the
     /// child's security.
-    pub fn from_authority(zone: &str, authorities: &[ResourceRecord]) -> Self {
-        let zone = canonical_name(zone);
+    pub fn from_authority(zone: NameRef<'_>, authorities: &[ResourceRecord]) -> Self {
         let relevant: Vec<&ResourceRecord> = authorities
             .iter()
-            .filter(|rr| canonical_name(&rr.name) == zone)
+            .filter(|rr| rr.name.as_ref() == zone)
             .collect();
         DelegationEvidence {
             class: relevant.first().map(|rr| rr.class).unwrap_or(Class::new(1)),
@@ -272,7 +271,7 @@ impl DelegationEvidence {
             rrsigs: authorities.iter().filter_map(Rrsig::from_record).collect(),
             nsecs: authorities.iter().filter_map(Nsec::from_record).collect(),
             nsec3s: authorities.iter().filter_map(Nsec3::from_record).collect(),
-            zone,
+            zone: zone.to_owned(),
         }
     }
 }
@@ -339,9 +338,12 @@ impl<'a> ChainValidator<'a> {
     }
 
     /// Where a walk for `name` starts, and with what DS records.
-    pub fn start(&self, name: &str) -> Option<(String, Vec<Ds>)> {
+    pub fn start(&self, name: NameRef<'_>) -> Option<(Name, Vec<Ds>)> {
+        // The anchors file is text — an owner name as an operator wrote it —
+        // so the boundary between it and a record's name is here.
         let zone = self.anchors.deepest_enclosing(name)?;
-        let ds = self.anchors.for_zone(&zone);
+        let zone = Name::from_presentation(&zone).ok()?;
+        let ds = self.anchors.for_zone(zone.as_ref());
         Some((zone, ds))
     }
 
@@ -353,16 +355,18 @@ impl<'a> ChainValidator<'a> {
     /// also trust an injected ZSK.
     pub fn validate_dnskeys(
         &self,
-        zone: &str,
+        zone: NameRef<'_>,
         records: &[ResourceRecord],
         ds_set: &[Ds],
     ) -> Result<Vec<Dnskey>, ValidationState> {
-        let zone = canonical_name(zone);
-
+        // Canonical, not merely presentation: `Dnskey::from_record` stores a
+        // down-cased owner (RFC 4034 §6.2) and a 0x20-randomized query brings
+        // the reply back in mixed case (RFC 4343).
+        let canonical = canonical_name_of(zone);
         let keys: Vec<Dnskey> = records
             .iter()
             .filter_map(Dnskey::from_record)
-            .filter(|k| k.owner == zone)
+            .filter(|k| k.owner == canonical)
             .collect();
         if keys.is_empty() {
             return Err(ValidationState::Bogus(format!(
@@ -399,17 +403,17 @@ impl<'a> ChainValidator<'a> {
 
         let rdatas: Vec<RecordData> = records
             .iter()
-            .filter(|rr| rr.rdata.rtype() == rt::DNSKEY && canonical_name(&rr.name) == zone)
+            .filter(|rr| rr.rdata.rtype() == rt::DNSKEY && rr.name.as_ref() == zone)
             .map(|rr| rr.rdata.clone())
             .collect();
         let class = records.first().map(|rr| rr.class).unwrap_or(Class::new(1));
         let rrsigs: Vec<Rrsig> = records.iter().filter_map(Rrsig::from_record).collect();
 
         match verify_rrset(
-            &Rrset::new(&zone, rt::DNSKEY, class, &rdatas),
+            &Rrset::new(zone, rt::DNSKEY, class, &rdatas),
             &rrsigs,
             &vouched,
-            &zone,
+            zone,
             self.now,
         ) {
             RrsetProof::Verified { .. } => Ok(keys),
@@ -429,17 +433,17 @@ impl<'a> ChainValidator<'a> {
     pub fn validate_delegation(
         &self,
         evidence: &DelegationEvidence,
-        parent_zone: &str,
+        parent_zone: NameRef<'_>,
         parent_keys: &[Dnskey],
     ) -> DelegationVerdict {
-        let parent_zone = canonical_name(parent_zone);
-
         if evidence.ds.is_empty() {
             // No DS: the parent must *prove* it, or deleting the DS from a
             // referral downgrades a signed zone to an unsigned one.
-            if let Denial::NotProved(why) =
-                proves_no_ds(&evidence.zone, &evidence.nsecs, &evidence.nsec3s)
-            {
+            if let Denial::NotProved(why) = proves_no_ds(
+                &canonical_name_of(evidence.zone.as_ref()),
+                &evidence.nsecs,
+                &evidence.nsec3s,
+            ) {
                 return DelegationVerdict::Bogus(format!(
                     "{} has no DS and its parent did not prove it: {why}",
                     evidence.zone
@@ -447,7 +451,7 @@ impl<'a> ChainValidator<'a> {
             }
             // The proof is itself a signed RRset; unverified it is just bytes an
             // attacker supplied.
-            return match self.verify_denial_records(evidence, &parent_zone, parent_keys) {
+            return match self.verify_denial_records(evidence, parent_zone, parent_keys) {
                 Ok(()) => {
                     DelegationVerdict::Insecure(format!("{} is provably unsigned", evidence.zone))
                 }
@@ -475,10 +479,10 @@ impl<'a> ChainValidator<'a> {
             .collect();
 
         match verify_rrset(
-            &Rrset::new(&evidence.zone, rt::DS, evidence.class, &rdatas),
+            &Rrset::new(evidence.zone.as_ref(), rt::DS, evidence.class, &rdatas),
             &evidence.rrsigs,
             parent_keys,
-            &parent_zone,
+            parent_zone,
             self.now,
         ) {
             RrsetProof::Verified { .. } => DelegationVerdict::Secure(evidence.ds.clone()),
@@ -498,14 +502,17 @@ impl<'a> ChainValidator<'a> {
     fn verify_denial_records(
         &self,
         evidence: &DelegationEvidence,
-        parent_zone: &str,
+        parent_zone: NameRef<'_>,
         parent_keys: &[Dnskey],
     ) -> Result<(), ValidationState> {
         // A proof nobody signed proves nothing.
         let mut checked_any = false;
         for (owner, rtype, rdatas) in denial_rrsets(evidence) {
+            let Ok(owner) = Name::from_presentation(&owner) else {
+                continue;
+            };
             match verify_rrset(
-                &Rrset::new(&owner, rtype, evidence.class, &rdatas),
+                &Rrset::new(owner.as_ref(), rtype, evidence.class, &rdatas),
                 &evidence.rrsigs,
                 parent_keys,
                 parent_zone,
@@ -572,11 +579,17 @@ impl<'a> ChainValidator<'a> {
                 )));
             };
 
+            let Ok(owner_name) = Name::from_presentation(&owner) else {
+                continue;
+            };
+            let Ok(signer_name) = Name::from_presentation(&signer) else {
+                continue;
+            };
             match verify_rrset(
-                &Rrset::new(&owner, rtype, class, &rdatas),
+                &Rrset::new(owner_name.as_ref(), rtype, class, &rdatas),
                 &rrsigs,
                 zone_keys,
-                &signer,
+                signer_name.as_ref(),
                 self.now,
             ) {
                 RrsetProof::Verified { wildcard, .. } => {
@@ -632,7 +645,10 @@ impl<'a> ChainValidator<'a> {
                     expansion.owner, expansion.wildcard, expansion.signer
                 ));
             };
-            let (nsecs, nsec3s) = self.verified_denials(proofs, &expansion.signer, zone_keys);
+            let Ok(signer) = Name::from_presentation(&expansion.signer) else {
+                continue;
+            };
+            let (nsecs, nsec3s) = self.verified_denials(proofs, signer.as_ref(), zone_keys);
             match proves_wildcard_expansion(&expansion.owner, &expansion.wildcard, &nsecs, &nsec3s)
             {
                 WildcardVerdict::Proved => {}
@@ -660,7 +676,7 @@ impl<'a> ChainValidator<'a> {
     fn verified_denials(
         &self,
         records: &[ResourceRecord],
-        zone: &str,
+        zone: NameRef<'_>,
         keys: &[Dnskey],
     ) -> (Vec<Nsec>, Vec<Nsec3>) {
         let rrsigs: Vec<Rrsig> = records.iter().filter_map(Rrsig::from_record).collect();
@@ -674,7 +690,7 @@ impl<'a> ChainValidator<'a> {
             let rdatas = [rr.rdata.clone()];
             if !matches!(
                 verify_rrset(
-                    &Rrset::new(&rr.name, rtype, rr.class, &rdatas),
+                    &Rrset::new(rr.name.as_ref(), rtype, rr.class, &rdatas),
                     &rrsigs,
                     keys,
                     zone,
@@ -703,7 +719,7 @@ pub fn group_rrsets(records: &[ResourceRecord]) -> Vec<(String, Rtype, Class, Ve
         if rr.rdata.rtype() == rt::RRSIG || rr.rdata.rtype() == crate::OPT_RECORD_TYPE {
             continue;
         }
-        let owner = canonical_name(&rr.name);
+        let owner = canonical_name_of(rr.name.as_ref());
         match sets
             .iter_mut()
             .find(|(n, t, c, _)| *n == owner && *t == rr.rdata.rtype() && *c == rr.class)
@@ -721,7 +737,10 @@ fn denial_rrsets(evidence: &DelegationEvidence) -> Vec<(String, Rtype, Vec<Recor
     let mut out: Vec<(String, Rtype, Vec<RecordData>)> = Vec::new();
     for nsec in &evidence.nsecs {
         let rdata = RecordData::from_parsed(&crate::ParsedRecord::NSEC {
-            next_domain_name: nsec.next.clone(),
+            next_domain_name: match Name::from_presentation(&nsec.next) {
+                Ok(next) => next,
+                Err(_) => continue,
+            },
             type_bitmap: nsec.type_bitmap.clone(),
         })
         .expect("an NSEC we parsed must re-encode");
@@ -763,7 +782,7 @@ pub const MAX_CNAME_CHAIN: usize = 16;
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChainShape {
     /// The records form the chain the question asked for, ending at `final_name`.
-    Intact { final_name: String },
+    Intact { final_name: Name },
     /// They do not, and this says how.
     Broken(String),
 }
@@ -781,23 +800,31 @@ pub enum ChainShape {
 /// Not the resolver's hop-by-hop `chain` filter, which decides what to *accept*
 /// while fetching. This decides whether what arrived is coherent, wherever it
 /// came from.
-pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) -> ChainShape {
-    let queried = canonical_name(qname);
+pub fn cname_chain_shape(
+    qname: NameRef<'_>,
+    qtype: Qtype,
+    answers: &[ResourceRecord],
+) -> ChainShape {
+    let queried = qname.to_owned();
 
     // A CNAME is the only record at its owner (RFC 1034 §3.6.2), so two of them
     // cannot both be followed.
-    let mut cnames: Vec<(String, String)> = Vec::new();
+    //
+    // No canonicalizing pass: `Name` compares case-insensitively, so the copies
+    // this used to make of every owner and every target — one per record, to
+    // make `==` mean what DNS means — are gone.
+    let mut cnames: Vec<(Name, Name)> = Vec::new();
     for rr in answers.iter().filter(|rr| rr.rdata.rtype() == rt::CNAME) {
         let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() else {
             return ChainShape::Broken(format!("a CNAME at {} does not parse", rr.name));
         };
-        let owner = canonical_name(&rr.name);
+        let owner = rr.name.clone();
         if cnames.iter().any(|(o, _)| *o == owner) {
             return ChainShape::Broken(format!(
                 "{owner} has more than one CNAME, which cannot be a chain"
             ));
         }
-        cnames.push((owner, canonical_name(&target)));
+        cnames.push((owner, target));
     }
 
     // A query *for* a CNAME is answered by the CNAME itself rather than by
@@ -805,7 +832,7 @@ pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) 
     let follow = !qtype.is(rt::CNAME);
 
     let mut current = queried.clone();
-    let mut followed: Vec<String> = Vec::new();
+    let mut followed: Vec<Name> = Vec::new();
     if follow {
         while let Some((_, target)) = cnames.iter().find(|(owner, _)| *owner == current) {
             if followed.len() >= MAX_CNAME_CHAIN {
@@ -827,12 +854,12 @@ pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) 
         if rr.rdata.rtype() == rt::RRSIG {
             continue;
         }
-        let owner = canonical_name(&rr.name);
+        let owner = &rr.name;
         let on_the_path = if rr.rdata.rtype() == rt::CNAME {
             // A link the walk followed, or — for a CNAME query — the answer.
-            followed.contains(&owner) || (!follow && owner == current)
+            followed.contains(owner) || (!follow && *owner == current)
         } else {
-            owner == current
+            *owner == current
         };
         if !on_the_path {
             return ChainShape::Broken(format!(
@@ -849,10 +876,12 @@ pub fn cname_chain_shape(qname: &str, qtype: Qtype, answers: &[ResourceRecord]) 
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::denial_wire::build_type_bitmap;
     use crate::dnssec::ds_digest;
     use crate::dnssec_test_util::{ds_record, TestZone};
+    use crate::test_records::nm;
     use crate::test_records::{a_record, nsec_record};
     use crate::utils::current_unix_timestamp;
     use crate::Ttl;
@@ -861,7 +890,7 @@ mod tests {
     #[test]
     fn test_builtin_root_anchor_parses() {
         let anchors = TrustAnchors::icann_root();
-        let root = anchors.for_zone(".");
+        let root = anchors.for_zone(nm(".").as_ref());
         assert_eq!(root.len(), 1);
         assert_eq!(root[0].key_tag, 20326, "ICANN KSK-2017");
         assert_eq!(root[0].algorithm, 8, "RSASHA256");
@@ -880,9 +909,15 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 ";
         let anchors = TrustAnchors::parse(text).expect("should parse");
         assert_eq!(anchors.all().len(), 2);
-        assert_eq!(anchors.for_zone("example.test.")[0].key_tag, 12345);
+        assert_eq!(
+            anchors.for_zone(nm("example.test.").as_ref())[0].key_tag,
+            12345
+        );
         // A trailing dot is not required in the file.
-        assert_eq!(anchors.for_zone("EXAMPLE.TEST")[0].algorithm, 13);
+        assert_eq!(
+            anchors.for_zone(nm("EXAMPLE.TEST").as_ref())[0].algorithm,
+            13
+        );
     }
 
     /// A digest split across lines the way IANA publishes it still parses.
@@ -892,8 +927,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             TrustAnchors::parse(". IN DS 20326 8 2 E06D44B8 0B8F1D39 A95C0B0D 7C65D084 58E88040 9BBC6834 57104237 C7F8EC8D")
                 .expect("should parse");
         assert_eq!(
-            anchors.for_zone(".")[0].digest,
-            TrustAnchors::icann_root().for_zone(".")[0].digest
+            anchors.for_zone(nm(".").as_ref())[0].digest,
+            TrustAnchors::icann_root().for_zone(nm(".").as_ref())[0].digest
         );
     }
 
@@ -921,19 +956,25 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         )
         .unwrap();
         assert_eq!(
-            anchors.deepest_enclosing("www.example.test.").as_deref(),
+            anchors
+                .deepest_enclosing(nm("www.example.test.").as_ref())
+                .as_deref(),
             Some("example.test."),
             "a closer anchor beats the root"
         );
         assert_eq!(
-            anchors.deepest_enclosing("other.com.").as_deref(),
+            anchors
+                .deepest_enclosing(nm("other.com.").as_ref())
+                .as_deref(),
             Some(".")
         );
 
         // With no root anchor, a name outside the island has no start point.
         let island = TrustAnchors::parse("example.test. IN DS 2 13 2 CCDD").unwrap();
-        assert_eq!(island.deepest_enclosing("other.com."), None);
-        assert!(island.deepest_enclosing("a.example.test.").is_some());
+        assert_eq!(island.deepest_enclosing(nm("other.com.").as_ref()), None);
+        assert!(island
+            .deepest_enclosing(nm("a.example.test.").as_ref())
+            .is_some());
     }
 
     #[test]
@@ -943,7 +984,11 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
         let keys = v
-            .validate_dnskeys("example.test.", &zone.dnskey_records(), &[zone.ds(2)])
+            .validate_dnskeys(
+                nm("example.test.").as_ref(),
+                &zone.dnskey_records(),
+                &[zone.ds(2)],
+            )
             .expect("the DNSKEY RRset should validate under its own DS");
         assert_eq!(keys.len(), 2, "trust extends to the ZSK as well as the KSK");
     }
@@ -957,7 +1002,11 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
         let err = v
-            .validate_dnskeys("example.test.", &zone.dnskey_records(), &[stranger.ds(2)])
+            .validate_dnskeys(
+                nm("example.test.").as_ref(),
+                &zone.dnskey_records(),
+                &[stranger.ds(2)],
+            )
             .expect_err("a DS for someone else's key must not validate");
         assert!(err.is_bogus(), "{err:?}");
     }
@@ -974,7 +1023,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         records.insert(
             0,
             ResourceRecord {
-                name: "example.test.".into(),
+                name: nm("example.test."),
                 class: Class::new(1),
                 ttl: Ttl::from_secs(3600),
                 rdata: crate::dnssec_test_util::dnskey_rdata(&attacker.zsk.dnskey("example.test.")),
@@ -982,7 +1031,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
 
         let err = v
-            .validate_dnskeys("example.test.", &records, &[zone.ds(2)])
+            .validate_dnskeys(nm("example.test.").as_ref(), &records, &[zone.ds(2)])
             .expect_err("an added key must invalidate the RRset signature");
         assert!(err.is_bogus(), "{err:?}");
     }
@@ -997,7 +1046,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let mut ds = zone.ds(2);
         ds.algorithm = 3;
         let state = v
-            .validate_dnskeys("example.test.", &zone.dnskey_records(), &[ds])
+            .validate_dnskeys(nm("example.test.").as_ref(), &zone.dnskey_records(), &[ds])
             .expect_err("should not return keys");
         assert_eq!(
             state,
@@ -1012,7 +1061,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
         let err = v
-            .validate_dnskeys("example.test.", &[], &[zone.ds(2)])
+            .validate_dnskeys(nm("example.test.").as_ref(), &[], &[zone.ds(2)])
             .expect_err("a DS with no DNSKEY behind it is a broken chain");
         assert!(err.is_bogus(), "{err:?}");
     }
@@ -1027,9 +1076,10 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 
         let ds_rr = ds_record(&child.ds(2), Ttl::from_secs(3600));
         let sig = parent.sign_records(std::slice::from_ref(&ds_rr));
-        let evidence = DelegationEvidence::from_authority("example.test.", &[ds_rr, sig]);
+        let evidence =
+            DelegationEvidence::from_authority(nm("example.test.").as_ref(), &[ds_rr, sig]);
 
-        let verdict = v.validate_delegation(&evidence, "test.", &parent.dnskeys());
+        let verdict = v.validate_delegation(&evidence, nm("test.").as_ref(), &parent.dnskeys());
         match verdict {
             DelegationVerdict::Secure(ds) => assert_eq!(ds.len(), 1),
             other => panic!("expected a secure delegation, got {other:?}"),
@@ -1046,10 +1096,10 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
         let evidence = DelegationEvidence::from_authority(
-            "example.test.",
+            nm("example.test.").as_ref(),
             &[ds_record(&child.ds(2), Ttl::from_secs(3600))],
         );
-        let verdict = v.validate_delegation(&evidence, "test.", &parent.dnskeys());
+        let verdict = v.validate_delegation(&evidence, nm("test.").as_ref(), &parent.dnskeys());
         assert!(
             matches!(verdict, DelegationVerdict::Bogus(_)),
             "{verdict:?}"
@@ -1064,19 +1114,20 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
         let nsec = ResourceRecord {
-            name: "example.test.".into(),
+            name: nm("example.test."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
-                next_domain_name: "zz.test.".into(),
+                next_domain_name: nm("zz.test."),
                 type_bitmap: build_type_bitmap(&[rt::NS, rt::RRSIG, rt::NSEC]),
             })
             .unwrap(),
         };
         let sig = parent.sign_records(std::slice::from_ref(&nsec));
-        let evidence = DelegationEvidence::from_authority("example.test.", &[nsec, sig]);
+        let evidence =
+            DelegationEvidence::from_authority(nm("example.test.").as_ref(), &[nsec, sig]);
 
-        let verdict = v.validate_delegation(&evidence, "test.", &parent.dnskeys());
+        let verdict = v.validate_delegation(&evidence, nm("test.").as_ref(), &parent.dnskeys());
         assert!(
             matches!(verdict, DelegationVerdict::Insecure(_)),
             "{verdict:?}"
@@ -1091,8 +1142,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let anchors = TrustAnchors::default();
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
-        let evidence = DelegationEvidence::from_authority("example.test.", &[]);
-        let verdict = v.validate_delegation(&evidence, "test.", &parent.dnskeys());
+        let evidence = DelegationEvidence::from_authority(nm("example.test.").as_ref(), &[]);
+        let verdict = v.validate_delegation(&evidence, nm("test.").as_ref(), &parent.dnskeys());
         assert!(
             matches!(verdict, DelegationVerdict::Bogus(_)),
             "a missing DS with no denial must not read as unsigned: {verdict:?}"
@@ -1107,17 +1158,17 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
         let nsec = ResourceRecord {
-            name: "example.test.".into(),
+            name: nm("example.test."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
-                next_domain_name: "zz.test.".into(),
+                next_domain_name: nm("zz.test."),
                 type_bitmap: build_type_bitmap(&[rt::NS]),
             })
             .unwrap(),
         };
-        let evidence = DelegationEvidence::from_authority("example.test.", &[nsec]);
-        let verdict = v.validate_delegation(&evidence, "test.", &parent.dnskeys());
+        let evidence = DelegationEvidence::from_authority(nm("example.test.").as_ref(), &[nsec]);
+        let verdict = v.validate_delegation(&evidence, nm("test.").as_ref(), &parent.dnskeys());
         assert!(
             matches!(verdict, DelegationVerdict::Bogus(_)),
             "{verdict:?}"
@@ -1393,16 +1444,16 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 
     fn cname(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
-            name: owner.to_string(),
+            name: nm(owner),
             class: Class::new(1),
             ttl: Ttl::from_secs(300),
-            rdata: RecordData::from_parsed(&ParsedRecord::CNAME(target.to_string())).unwrap(),
+            rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm(target))).unwrap(),
         }
     }
 
     fn a(owner: &str, addr: &str) -> ResourceRecord {
         ResourceRecord {
-            name: owner.to_string(),
+            name: nm(owner),
             class: Class::new(1),
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A(addr.parse().unwrap())).unwrap(),
@@ -1411,7 +1462,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 
     fn rrsig_over(owner: &str, covered: Rtype) -> ResourceRecord {
         ResourceRecord {
-            name: owner.to_string(),
+            name: nm(owner),
             class: Class::new(1),
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
@@ -1422,7 +1473,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
                 inception: 1,
                 expiration: u32::MAX,
                 key_tag: 1,
-                signer_name: "example.com.".to_string(),
+                signer_name: nm("example.com."),
                 signature: vec![7; 64],
             })
             .unwrap(),
@@ -1440,21 +1491,21 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             rrsig_over("c.example.org.", rt::A),
         ];
         assert_eq!(
-            cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers),
+            cname_chain_shape(nm("a.example.com.").as_ref(), Qtype::of(rt::A), &answers),
             ChainShape::Intact {
-                final_name: "c.example.org.".to_string()
+                final_name: nm(&nm("c.example.org.").to_string())
             }
         );
 
         // An answer with no CNAME at all is a chain of length zero.
         assert_eq!(
             cname_chain_shape(
-                "www.example.com.",
+                nm("www.example.com.").as_ref(),
                 Qtype::of(rt::A),
                 &[a("www.example.com.", "192.0.2.2")]
             ),
             ChainShape::Intact {
-                final_name: "www.example.com.".to_string()
+                final_name: nm(&nm("www.example.com.").to_string())
             }
         );
     }
@@ -1468,7 +1519,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             // The A is for something else entirely.
             a("attacker.example.net.", "6.6.6.6"),
         ];
-        let shape = cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers);
+        let shape = cname_chain_shape(nm("a.example.com.").as_ref(), Qtype::of(rt::A), &answers);
         assert!(
             matches!(&shape, ChainShape::Broken(why) if why.contains("not on the path")),
             "got {shape:?}"
@@ -1482,7 +1533,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             cname("other.example.com.", "b.example.net."),
             a("b.example.net.", "192.0.2.1"),
         ];
-        let shape = cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers);
+        let shape = cname_chain_shape(nm("a.example.com.").as_ref(), Qtype::of(rt::A), &answers);
         assert!(matches!(shape, ChainShape::Broken(_)), "got {shape:?}");
     }
 
@@ -1495,7 +1546,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             // The CNAME from b to c is absent, so c is unreachable.
             a("c.example.org.", "192.0.2.1"),
         ];
-        let shape = cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers);
+        let shape = cname_chain_shape(nm("a.example.com.").as_ref(), Qtype::of(rt::A), &answers);
         assert!(matches!(shape, ChainShape::Broken(_)), "got {shape:?}");
     }
 
@@ -1505,7 +1556,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             cname("a.example.com.", "b.example.com."),
             cname("b.example.com.", "a.example.com."),
         ];
-        let shape = cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers);
+        let shape = cname_chain_shape(nm("a.example.com.").as_ref(), Qtype::of(rt::A), &answers);
         assert!(
             matches!(&shape, ChainShape::Broken(why) if why.contains("loops")),
             "got {shape:?}"
@@ -1520,7 +1571,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             cname("a.example.com.", "b.example.net."),
             cname("a.example.com.", "evil.example.net."),
         ];
-        let shape = cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers);
+        let shape = cname_chain_shape(nm("a.example.com.").as_ref(), Qtype::of(rt::A), &answers);
         assert!(
             matches!(&shape, ChainShape::Broken(why) if why.contains("more than one CNAME")),
             "got {shape:?}"
@@ -1536,9 +1587,13 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             rrsig_over("a.example.com.", rt::CNAME),
         ];
         assert_eq!(
-            cname_chain_shape("a.example.com.", Qtype::of(rt::CNAME), &answers),
+            cname_chain_shape(
+                nm("a.example.com.").as_ref(),
+                Qtype::of(rt::CNAME),
+                &answers
+            ),
             ChainShape::Intact {
-                final_name: "a.example.com.".to_string()
+                final_name: nm(&nm("a.example.com.").to_string())
             }
         );
     }
@@ -1552,7 +1607,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             a("b.EXAMPLE.net.", "192.0.2.1"),
         ];
         assert!(matches!(
-            cname_chain_shape("a.example.com.", Qtype::of(rt::A), &answers),
+            cname_chain_shape(nm("a.example.com.").as_ref(), Qtype::of(rt::A), &answers),
             ChainShape::Intact { .. }
         ));
     }
@@ -1568,7 +1623,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
                 &format!("n{}.example.com.", i + 1),
             ));
         }
-        let shape = cname_chain_shape("n0.example.com.", Qtype::of(rt::A), &answers);
+        let shape = cname_chain_shape(nm("n0.example.com.").as_ref(), Qtype::of(rt::A), &answers);
         assert!(
             matches!(&shape, ChainShape::Broken(why) if why.contains("longer than")),
             "got {shape:?}"

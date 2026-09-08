@@ -1,13 +1,13 @@
 use crate::denial_wire::{base32hex_decode, canonical_sort_key};
-use crate::error::ZoneError;
+use crate::error::{WireError, ZoneError};
+use crate::utils::hex_decode;
 use crate::utils::record_type_code;
 use crate::utils::record_types as rt;
-use crate::utils::{ascii_lowered_cow, hex_decode, is_at_or_under, parent_name, NameKeyBuf};
 use crate::Class;
 use crate::Rtype;
 use crate::Serial;
 use crate::Ttl;
-use crate::{ParsedRecord, Qtype, RecordData, ResourceRecord};
+use crate::{Name, NameRef, ParsedRecord, Qtype, RecordData, ResourceRecord};
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 /// A single DNS resource record stored in a zone
 #[derive(Debug, Clone)]
 pub struct ZoneRecord {
-    pub name: String,
+    pub name: Name,
     pub ttl: Ttl,
     pub class: Class,
     pub rdata: RecordData,
@@ -36,16 +36,21 @@ pub struct ZoneRecord {
 /// data it holds.
 #[derive(Debug, Clone)]
 pub struct Zone {
-    origin: String,
+    origin: Name,
     records: Vec<ZoneRecord>,
-    /// Positions in `records`, by [`Zone::lookup_key`] of the owner name.
+    /// Positions in `records`, by the folded wire form of the owner name.
     ///
     /// A name that exists only because something below it does — an empty
     /// non-terminal (RFC 4592 §2.2.2) — is a key with **no positions**. It was
     /// a second `HashSet` until 2026-09-05, which made every level of a miss
     /// walk hash the name twice to ask two halves of one question
     /// (`TODO.md` #22): "is this a node of the zone, and does it have records".
-    index: HashMap<NameKeyBuf, Vec<usize>>,
+    /// Keyed on the *folded* wire form, because a `HashMap` probe needs a
+    /// borrowed key and `Name`'s own case-insensitive `Hash` cannot be reached
+    /// through `Borrow` without the `unsafe` cast `str` uses. `Box<[u8]>`
+    /// borrows as `[u8]`, so a lookup costs a fold only when the name arrived
+    /// in mixed case.
+    index: HashMap<Box<[u8]>, Vec<usize>>,
     /// The NSEC chain, keyed by canonical sort order, and the NSEC3 chain,
     /// keyed by hash — both empty for an unsigned zone.
     ///
@@ -91,8 +96,9 @@ impl Shortcuts {
     /// `at_apex` is the caller's to say, because [`Zone::reindex`] decides it
     /// against a *new* origin: moving the apex up turns the old apex's own NS
     /// RRset into a delegation.
-    fn note(&mut self, key: &str, rtype: Rtype, at_apex: bool) {
-        self.wildcards |= key.starts_with("*.");
+    fn note(&mut self, key: &[u8], rtype: Rtype, at_apex: bool) {
+        // The wildcard label, in wire form: one octet of length, then `*`.
+        self.wildcards |= key.starts_with(b"\x01*");
         self.delegations |= rtype == rt::NS && !at_apex;
         self.dnames |= rtype == rt::DNAME;
     }
@@ -158,7 +164,7 @@ pub enum NameKind {
     EmptyNonTerminal,
     /// The name is not in the zone, and this wildcard is its source of
     /// synthesis (RFC 4592 §3.3.1). Absolute and down-cased.
-    Wildcard(String),
+    Wildcard(Name),
     /// Not in the zone at all: NXDOMAIN.
     NotFound,
 }
@@ -170,10 +176,10 @@ enum Chain {
 }
 
 impl Zone {
-    /// Create a new zone with the given origin (e.g., "example.com.")
-    pub fn new(origin: String) -> Self {
+    /// Create a new zone with the given origin (e.g., `example.com.`)
+    pub fn new(origin: Name) -> Self {
         Zone {
-            origin: absolute(&origin),
+            origin,
             records: Vec::new(),
             index: HashMap::new(),
             nsec_chain: BTreeMap::new(),
@@ -182,9 +188,9 @@ impl Zone {
         }
     }
 
-    /// The zone's apex name, absolute.
-    pub fn origin(&self) -> &str {
-        &self.origin
+    /// The zone's apex name, absolute — as every [`Name`] is.
+    pub fn origin(&self) -> NameRef<'_> {
+        self.origin.as_ref()
     }
 
     /// Every record in the zone, in load order.
@@ -194,11 +200,12 @@ impl Zone {
 
     /// Move the zone's apex, as a top-level `$ORIGIN` does.
     ///
-    /// Index keys are absolute, so a record held under a *relative* name has to
-    /// be re-keyed; the parser's records are already absolute, so only names
-    /// added relative through [`Zone::add_record`] move.
-    pub fn set_origin(&mut self, origin: &str) {
-        self.origin = absolute(origin);
+    /// No record moves: a [`Name`] is absolute, so an owner name means the same
+    /// thing before and after. What the reindex rebuilds is the bookkeeping that
+    /// is *about* the apex — an NS RRset at the old apex becomes a zone cut
+    /// under the new one.
+    pub fn set_origin(&mut self, origin: Name) {
+        self.origin = origin;
         self.reindex();
     }
 
@@ -206,14 +213,14 @@ impl Zone {
     pub fn add_record(&mut self, record: ZoneRecord) {
         // Owned: the key becomes an index entry, and the statements below need
         // `&mut self`.
-        let key = self.lookup_key(&record.name).into_owned();
+        let key = record.name.as_ref().folded().into_owned();
         let position = self.records.len();
         let at_apex = key == *self.origin_key();
         self.shortcuts
             .note(&key, record_type_code(&record.rdata), at_apex);
         self.note_non_terminals(&key);
         self.index
-            .entry(NameKeyBuf::from_folded(key))
+            .entry(key.into_boxed_slice())
             .or_default()
             .push(position);
         match self.chain_key(&record) {
@@ -234,12 +241,13 @@ impl Zone {
     /// only through a wildcard is exactly the name a wildcard answer must prove
     /// does *not* exist (RFC 4035 §3.1.3). [`Zone::name_exists`] is the other
     /// question.
-    pub fn holds_name(&self, name: &str) -> bool {
+    pub fn holds_name(&self, name: NameRef<'_>) -> bool {
         // Records, not merely a node: an empty non-terminal is in `index` with
         // no positions, and it is exactly the name a wildcard answer has to
         // prove does not exist.
+        let mut buf = Vec::new();
         self.index
-            .get(self.lookup_key(name).as_ref())
+            .get(name.folded_in(&mut buf).as_wire())
             .is_some_and(|positions| !positions.is_empty())
     }
 
@@ -265,8 +273,8 @@ impl Zone {
     /// Exclusive at the low end: an NSEC *at* `name` proves the opposite. When
     /// nothing sorts before `name` the answer is the last record, because the
     /// chain is a loop back to the apex (RFC 4034 §4.1.1).
-    pub fn nsec_covering(&self, name: &str) -> Option<&ZoneRecord> {
-        let key = canonical_sort_key(name);
+    pub fn nsec_covering(&self, name: NameRef<'_>) -> Option<&ZoneRecord> {
+        let key = canonical_sort_key(&name.to_presentation());
         let position = self
             .nsec_chain
             .range(..key)
@@ -296,12 +304,17 @@ impl Zone {
         match record.rdata.rtype() {
             crate::utils::record_types::NSEC => Some((
                 Chain::Nsec,
-                canonical_sort_key(&self.normalize_name(&record.name)),
+                canonical_sort_key(&record.name.as_ref().to_presentation()),
             )),
             crate::utils::record_types::NSEC3 => {
-                let owner = self.normalize_name(&record.name);
-                let label = owner.split('.').next()?;
-                Some((Chain::Nsec3, base32hex_decode(label).ok()?))
+                // The hash is the first label, and a label is octets — so it is
+                // taken as octets rather than by splitting text on a `.` that
+                // may be inside one.
+                let label = record.name.as_ref().labels().next()?;
+                Some((
+                    Chain::Nsec3,
+                    base32hex_decode(std::str::from_utf8(label).ok()?).ok()?,
+                ))
             }
             _ => None,
         }
@@ -313,7 +326,7 @@ impl Zone {
     /// all: an existing name shadows it entirely, types it does not carry
     /// included, and so does an empty non-terminal (RFC 1034 §4.3.3,
     /// RFC 4592 §2.2.1 and §4.4).
-    pub fn query(&self, name: &str, qtype: Qtype) -> Vec<&ZoneRecord> {
+    pub fn query(&self, name: NameRef<'_>, qtype: Qtype) -> Vec<&ZoneRecord> {
         self.query_with_kind(name, qtype).1
     }
 
@@ -325,7 +338,7 @@ impl Zone {
     /// ancestors a second time and folds the name a second time to do it —
     /// twice per negative answer, which is the shape a random-subdomain flood
     /// sends.
-    pub fn query_with_kind(&self, name: &str, qtype: Qtype) -> (NameKind, Vec<&ZoneRecord>) {
+    pub fn query_with_kind(&self, name: NameRef<'_>, qtype: Qtype) -> (NameKind, Vec<&ZoneRecord>) {
         let located = self.locate(name);
         let records: Vec<&ZoneRecord> = located.of_type(qtype).collect();
         (located.kind, records)
@@ -336,12 +349,13 @@ impl Zone {
     /// One closest-encloser walk, then as many type filters as the caller wants
     /// — and the caller that wants only "is there anything here" pays no `Vec`
     /// for the answer. [`Zone::query`] is this plus a `collect`.
-    pub fn locate(&self, name: &str) -> Located<'_> {
-        let key = self.lookup_key(name);
-        let kind = self.name_kind_of_key(&key);
+    pub fn locate(&self, name: NameRef<'_>) -> Located<'_> {
+        let mut buf = Vec::new();
+        let key = name.folded_in(&mut buf);
+        let kind = self.name_kind_of_key(key);
         let at = match kind {
-            NameKind::Exact => self.index.get(key.as_ref()),
-            NameKind::Wildcard(ref wildcard) => self.index.get(wildcard.as_str()),
+            NameKind::Exact => self.index.get(key.as_wire()),
+            NameKind::Wildcard(ref wildcard) => self.index.get(wildcard.as_ref().as_wire()),
             NameKind::EmptyNonTerminal | NameKind::NotFound => None,
         };
         Located {
@@ -356,7 +370,7 @@ impl Zone {
     /// `Option` because a `Zone` can be built record by record; one that came
     /// from a file has an SOA or it did not load.
     pub fn apex_soa(&self) -> Option<&ZoneRecord> {
-        self.query(&self.origin, Qtype::of(rt::SOA))
+        self.query(self.origin(), Qtype::of(rt::SOA))
             .first()
             .copied()
     }
@@ -392,49 +406,47 @@ impl Zone {
     /// [`ResourceRecord`] off the wire and a zone *name* — `xfr`, `journal` —
     /// have no `Zone` to ask and still write it out.
     pub fn is_apex_soa(&self, record: &ZoneRecord) -> bool {
-        record.rdata.rtype() == rt::SOA
-            && self
-                .normalize_name(&record.name)
-                .eq_ignore_ascii_case(&self.origin)
+        record.rdata.rtype() == rt::SOA && record.name == self.origin
     }
 
     /// Whether the zone holds anything at `name` — by that name, because
     /// something below it exists, or through a wildcard. The NXDOMAIN question;
     /// an existing name with no record of the queried type is NODATA.
-    pub fn name_exists(&self, name: &str) -> bool {
+    pub fn name_exists(&self, name: NameRef<'_>) -> bool {
         !matches!(self.name_kind(name), NameKind::NotFound)
     }
 
     /// Why `name` has an answer here, or has none. See [`NameKind`].
-    pub fn name_kind(&self, name: &str) -> NameKind {
-        self.name_kind_of_key(&self.lookup_key(name))
+    pub fn name_kind(&self, name: NameRef<'_>) -> NameKind {
+        let mut buf = Vec::new();
+        self.name_kind_of_key(name.folded_in(&mut buf))
     }
 
-    /// [`Zone::name_kind`] for a name already in [`Zone::lookup_key`] form.
+    /// [`Zone::name_kind`] for a name already folded.
     ///
     /// A closest-encloser walk, not a single lookup: synthesis reaches any
     /// depth (RFC 4592 §3.3.2 answers `_telnet._tcp.host1.example.` from
     /// `*.example.`). The walk stops at the first ancestor that exists and only
     /// the wildcard directly below it may answer (§3.3.1) — an existing name,
     /// empty non-terminal included, ends the search (§4.4).
-    fn name_kind_of_key(&self, key: &str) -> NameKind {
+    fn name_kind_of_key(&self, key: NameRef<'_>) -> NameKind {
         // One hash for both questions: present with records is `Exact`, present
         // without is an empty non-terminal (`TODO.md` #22).
-        match self.index.get(key) {
+        match self.index.get(key.as_wire()) {
             Some(positions) if !positions.is_empty() => return NameKind::Exact,
             Some(_) => return NameKind::EmptyNonTerminal,
             None => {}
         }
 
         let origin = self.origin_key();
-        let mut name = key;
-        while let Some(encloser) = parent_name(name) {
-            if !is_at_or_under(encloser, &origin) {
+        // `ancestors` yields this name first, which the lookup above has
+        // already answered for, so the walk starts at the parent.
+        for encloser in key.ancestors().skip(1) {
+            if encloser.as_wire().len() < origin.len() {
                 // Out of the zone: the query was never in it.
                 return NameKind::NotFound;
             }
             if !self.node_exists(encloser) {
-                name = encloser;
                 continue;
             }
             // The closest encloser. A wildcard below a zone cut is the child's
@@ -446,8 +458,12 @@ impl Zone {
             if self.delegation_for_key(encloser).is_some() {
                 return NameKind::NotFound;
             }
-            let wildcard = format!("*.{encloser}");
-            return if self.index.contains_key(wildcard.as_str()) {
+            let Ok(wildcard) = Name::prefixed(b"*", encloser) else {
+                // Only if the wildcard would break the 255-octet limit, which
+                // means nothing could be stored at it either.
+                return NameKind::NotFound;
+            };
+            return if self.index.contains_key(wildcard.as_ref().as_wire()) {
                 NameKind::Wildcard(wildcard)
             } else {
                 NameKind::NotFound
@@ -462,8 +478,8 @@ impl Zone {
     /// One lookup, because both kinds of node are in `index`. This is the walk's
     /// inner loop — once per label of a name the client chose — and it asked
     /// two maps until #22.
-    fn node_exists(&self, key: &str) -> bool {
-        self.index.contains_key(key)
+    fn node_exists(&self, key: NameRef<'_>) -> bool {
+        self.index.contains_key(key.as_wire())
     }
 
     /// The delegation point at or above `name`: the deepest ancestor-or-self
@@ -471,33 +487,31 @@ impl Zone {
     ///
     /// `Some` means the answer owes a referral — NS RRset, glue, and AA
     /// clear. The apex is excluded: its NS RRset is this zone's own.
-    pub fn delegation_for(&self, name: &str) -> Option<String> {
-        // Before `lookup_key`, not only inside `delegation_for_key`: with no cut
-        // to find, the folded key is a copy of the name made for nothing.
+    pub fn delegation_for(&self, name: NameRef<'_>) -> Option<Name> {
+        // Before the fold, not only inside `delegation_for_key`: with no cut to
+        // find, folding the name is a copy made for nothing.
         if !self.shortcuts.delegations {
             return None;
         }
-        self.delegation_for_key(&self.lookup_key(name))
+        let mut buf = Vec::new();
+        self.delegation_for_key(name.folded_in(&mut buf))
     }
 
-    fn delegation_for_key(&self, key: &str) -> Option<String> {
+    fn delegation_for_key(&self, key: NameRef<'_>) -> Option<Name> {
         if !self.shortcuts.delegations {
             return None;
         }
         let origin = self.origin_key();
-        let mut candidate = key;
-        loop {
-            if candidate != origin && self.has_type(candidate, rt::NS) {
-                return Some(candidate.to_string());
+        for candidate in key.ancestors() {
+            let at_apex = candidate.as_wire() == origin.as_ref();
+            if !at_apex && self.has_type(candidate, rt::NS) {
+                return Some(candidate.to_owned());
             }
-            if candidate == origin {
-                return None;
-            }
-            candidate = parent_name(candidate)?;
-            if !is_at_or_under(candidate, &origin) {
+            if at_apex || candidate.as_wire().len() < origin.len() {
                 return None;
             }
         }
+        None
     }
 
     /// The DNAME that redirects `name`: the shallowest **strict** ancestor
@@ -519,17 +533,18 @@ impl Zone {
     /// Returns the record, not the name: the caller needs its owner to echo,
     /// its target to substitute and its TTL for the synthesized CNAME (§3.1),
     /// and looking any of them up again is the repeat `TODO.md` #25a removed.
-    pub fn dname_above(&self, name: &str) -> Option<&ZoneRecord> {
-        // Before `lookup_key`, as `delegation_for` does it: with no DNAME in
-        // the zone the folded key is a copy made for nothing.
+    pub fn dname_above(&self, name: NameRef<'_>) -> Option<&ZoneRecord> {
+        // Before the fold, as `delegation_for` does it: with no DNAME in the
+        // zone the folded copy is made for nothing.
         if !self.shortcuts.dnames {
             return None;
         }
-        self.dname_above_key(&self.lookup_key(name))
+        let mut buf = Vec::new();
+        self.dname_above_key(name.folded_in(&mut buf))
     }
 
-    /// [`Zone::dname_above`] for a name already in [`Zone::lookup_key`] form.
-    pub fn dname_above_key(&self, key: &str) -> Option<&ZoneRecord> {
+    /// [`Zone::dname_above`] for a name already folded.
+    pub fn dname_above_key(&self, key: NameRef<'_>) -> Option<&ZoneRecord> {
         if !self.shortcuts.dnames {
             return None;
         }
@@ -537,18 +552,16 @@ impl Zone {
         let mut found = None;
         // From the parent, so the owner is not redirected by its own DNAME, and
         // on to the apex without stopping: the last one seen is the shallowest.
-        let mut candidate = parent_name(key)?;
-        loop {
-            if !is_at_or_under(candidate, &origin) {
+        for candidate in key.ancestors().skip(1) {
+            if candidate.as_wire().len() < origin.len() {
                 break;
             }
             if let Some(record) = self.first_of_type(candidate, rt::DNAME) {
                 found = Some(record);
             }
-            if candidate == origin {
+            if candidate.as_wire() == origin.as_ref() {
                 break;
             }
-            candidate = parent_name(candidate)?;
         }
         found
     }
@@ -556,7 +569,7 @@ impl Zone {
     /// Whether there is an RRset of `rtype` at exactly this key. An empty
     /// non-terminal has no positions, so it answers false without a special
     /// case.
-    fn has_type(&self, key: &str, rtype: Rtype) -> bool {
+    fn has_type(&self, key: NameRef<'_>, rtype: Rtype) -> bool {
         self.first_of_type(key, rtype).is_some()
     }
 
@@ -565,9 +578,9 @@ impl Zone {
     /// [`Zone::has_type`] is this question with the answer thrown away. DNAME
     /// is a singleton type (RFC 6672 §2.4), so for that one "the first" is
     /// "the one".
-    fn first_of_type(&self, key: &str, rtype: Rtype) -> Option<&ZoneRecord> {
+    fn first_of_type(&self, key: NameRef<'_>, rtype: Rtype) -> Option<&ZoneRecord> {
         self.index
-            .get(key)?
+            .get(key.as_wire())?
             .iter()
             .map(|&i| &self.records[i])
             .find(|r| record_type_code(&r.rdata) == rtype)
@@ -582,19 +595,19 @@ impl Zone {
     /// "Known" now includes an ancestor that has records of its own, which is
     /// the same guarantee for the same reason — a record's own insertion noted
     /// *its* ancestors.
-    fn note_non_terminals(&mut self, key: &str) {
+    fn note_non_terminals(&mut self, key: &[u8]) {
         // Owned: the loop below takes `&mut self`.
         let origin = self.origin_key().into_owned();
-        let mut name = key.to_string();
-        while let Some(parent) = parent_name(&name) {
-            if !is_at_or_under(parent, &origin) {
+        let mut name = key.to_vec();
+        while let Some(parent) = parent_key(&name) {
+            if parent.len() < origin.len() {
                 // An owner outside the zone — foreign glue, say. Its ancestors
                 // are somebody else's names and do not exist here.
                 return;
             }
-            let parent = parent.to_string();
+            let parent = parent.to_vec();
             let reached_apex = parent == origin;
-            match self.index.entry(NameKeyBuf::new(&parent)) {
+            match self.index.entry(parent.clone().into_boxed_slice()) {
                 Entry::Occupied(_) => return,
                 Entry::Vacant(slot) => slot.insert(Vec::new()),
             };
@@ -605,33 +618,33 @@ impl Zone {
         }
     }
 
-    /// The apex in [`Zone::lookup_key`] form. Borrowed for an already
+    /// The apex, folded. Borrowed for an already
     /// lower-case origin: two walks ask for this per query.
-    fn origin_key(&self) -> Cow<'_, str> {
-        ascii_lowered_cow(&self.origin)
+    fn origin_key(&self) -> Cow<'_, [u8]> {
+        self.origin.as_ref().folded()
     }
 
     /// Rebuild the index from `records`.
     fn reindex(&mut self) {
         let origin_key = self.origin_key().into_owned();
-        let keys: Vec<(String, Rtype, bool)> = self
+        let keys: Vec<(Vec<u8>, Rtype, bool)> = self
             .records
             .iter()
             .map(|r| {
-                let key = self.lookup_key(&r.name).into_owned();
+                let key = r.name.as_ref().folded().into_owned();
                 let at_apex = key == origin_key;
                 (key, record_type_code(&r.rdata), at_apex)
             })
             .collect();
         self.index.clear();
-        // Recomputed, not carried: `set_origin` can turn a relative `*` into an
-        // absolute wildcard name, and an apex NS RRset into a zone cut.
+        // Recomputed, not carried: `set_origin` turns an apex NS RRset into a
+        // zone cut, and a wildcard at the old apex into one below the new.
         self.shortcuts = Shortcuts::default();
         for (position, (key, rtype, at_apex)) in keys.into_iter().enumerate() {
             self.shortcuts.note(&key, rtype, at_apex);
             self.note_non_terminals(&key);
             self.index
-                .entry(NameKeyBuf::from_folded(key))
+                .entry(key.into_boxed_slice())
                 .or_default()
                 .push(position);
         }
@@ -655,43 +668,35 @@ impl Zone {
         }
     }
 
-    /// The form a name is indexed and looked up under: absolute, and down-cased
-    /// because DNS names compare case-insensitively (RFC 4343 — ASCII only,
-    /// hence `make_ascii_lowercase` rather than `to_lowercase`).
-    ///
-    /// A key needing neither step is handed back borrowed, so the ordinary
-    /// query reaches the index without allocating.
-    fn lookup_key<'a>(&'a self, name: &'a str) -> Cow<'a, str> {
-        match self.normalize_name(name) {
-            Cow::Borrowed(key) => ascii_lowered_cow(key),
-            Cow::Owned(mut key) => {
-                key.make_ascii_lowercase();
-                Cow::Owned(key)
-            }
-        }
-    }
-
-    /// Whether `record_name` answers `query_name`, wildcards and relative names
-    /// included. The definition of matching the index encodes; a test holds the
-    /// two to the same answers.
-    pub fn matches_query(&self, record_name: &str, query_name: &str) -> bool {
-        let record_name = self.lookup_key(record_name);
-        let query_name = self.lookup_key(query_name);
-
+    /// Whether `record_name` answers `query_name`, wildcards included. The
+    /// definition of matching the index encodes; a test holds the two to the
+    /// same answers.
+    pub fn matches_query(&self, record_name: NameRef<'_>, query_name: NameRef<'_>) -> bool {
         if record_name == query_name {
             return true;
         }
         // Which wildcard reaches a name is a question about the whole zone —
         // the closest encloser decides it — so ask `name_kind` rather than
         // re-deriving it here.
-        matches!(self.name_kind_of_key(&query_name), NameKind::Wildcard(w) if w == record_name)
+        let mut buf = Vec::new();
+        matches!(
+            self.name_kind_of_key(query_name.folded_in(&mut buf)),
+            NameKind::Wildcard(w) if w.as_ref() == record_name
+        )
     }
+}
 
-    /// Normalize a domain name to absolute form with a trailing dot. Borrows
-    /// back a name that is already absolute. See [`absolutize`].
-    pub fn normalize_name<'a>(&'a self, name: &'a str) -> Cow<'a, str> {
-        absolutize(name, &self.origin)
+/// The parent of a name in wire form, as octets.
+///
+/// [`NameRef::parent`] is the same step over a validated name; this one is for
+/// the index's keys, which are octets because a `HashMap` probe has to borrow.
+fn parent_key(key: &[u8]) -> Option<&[u8]> {
+    let (&len, tail) = key.split_first()?;
+    let len = len as usize;
+    if len == 0 || tail.len() < len {
+        return None;
     }
+    Some(&tail[len..])
 }
 
 /// A zone-file owner name in absolute form, resolved against `origin`: `@` and
@@ -700,20 +705,25 @@ impl Zone {
 ///
 /// Only the relative case allocates, and it is the zone parser's; a name off
 /// the wire is absolute, and a query takes four of these.
-fn absolutize<'a>(name: &'a str, origin: &'a str) -> Cow<'a, str> {
+fn absolutize(name: &str, origin: NameRef<'_>) -> Result<Name, WireError> {
     let name = name.trim();
     if name.is_empty() || name == "@" {
-        Cow::Borrowed(origin)
+        Ok(origin.to_owned())
     } else if name.ends_with('.') {
-        Cow::Borrowed(name)
+        Name::from_presentation(name)
     } else {
-        Cow::Owned(format!("{name}.{origin}"))
+        Name::relative_to(name, origin)
     }
 }
 
-/// [`crate::utils::absolute`], owned — this module's callers all keep it.
-fn absolute(name: &str) -> String {
-    crate::utils::absolute(name).into_owned()
+/// The same, as a zone error that names the line.
+///
+/// Every name in a zone file goes through here — owner names *and* the names
+/// inside RDATA, which RFC 1035 §5.1 makes relative to the origin in exactly
+/// the same way ("domain names in the RDATA section... are also relative").
+fn name_at(name: &str, origin: NameRef<'_>, ln: usize) -> Result<Name, ZoneError> {
+    absolutize(name, origin)
+        .map_err(|e| ZoneError::syntax(ln, format!("the name {name:?} is not a name: {e}")))
 }
 
 /// The small parse helpers below return `Result<_, String>` on purpose: they
@@ -1047,11 +1057,11 @@ const MAX_INCLUDE_DEPTH: usize = 8;
 struct ParseState {
     /// The origin relative owner names are resolved against — `$ORIGIN`, or the
     /// origin an `$INCLUDE` named for the file being read.
-    origin: String,
+    origin: Name,
     /// The default TTL for records that do not state one (`$TTL`).
     ttl: Ttl,
-    /// The last owner name seen, absolute, for lines that omit theirs.
-    owner: Option<String>,
+    /// The last owner name seen, for lines that omit theirs.
+    owner: Option<Name>,
 }
 
 /// Parse a BIND-format zone file.
@@ -1076,9 +1086,11 @@ fn parse_zone_file_with_base(
     origin: &str,
     base_dir: Option<&Path>,
 ) -> Result<Zone, ZoneError> {
-    let mut zone = Zone::new(origin.to_string());
+    let apex = Name::from_presentation(origin)
+        .map_err(|e| ZoneError::invalid(format!("the origin {origin:?} is not a name: {e}")))?;
+    let mut zone = Zone::new(apex.clone());
     let mut state = ParseState {
-        origin: absolute(origin),
+        origin: apex,
         ttl: Ttl::from_secs(3600),
         owner: None,
     };
@@ -1094,14 +1106,14 @@ fn parse_zone_file_with_base(
 /// RRSIG, NSEC and NSEC3 are excepted — they describe the name rather than name
 /// it (RFC 4035 §2.5).
 fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
-    let mut by_name: HashMap<String, (bool, Vec<Rtype>)> = HashMap::new();
+    let mut by_name: HashMap<Name, (bool, Vec<Rtype>)> = HashMap::new();
     for record in zone.records() {
         let rtype = record_type_code(&record.rdata);
         if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3) {
             continue;
         }
         let entry = by_name
-            .entry(zone.lookup_key(&record.name).into_owned())
+            .entry(record.name.clone())
             .or_insert((false, Vec::new()));
         if rtype == rt::CNAME {
             entry.0 = true;
@@ -1145,22 +1157,24 @@ fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
 /// than trusting this: [`Zone::dname_above`] decides the answer for any zone,
 /// however it got here.
 fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
-    let apex = zone.lookup_key(zone.origin()).into_owned();
-    let mut owners: Vec<String> = Vec::new();
+    let apex = zone.origin();
+    let mut owners: Vec<&Name> = Vec::new();
 
     for record in zone.records() {
         if record_type_code(&record.rdata) != rt::DNAME {
             continue;
         }
-        let key = zone.lookup_key(&record.name).into_owned();
+        let key = &record.name;
+        // Only for the message: comparisons below are the name's own.
+        let shown = key.as_ref().to_presentation();
 
         // §3.3: "records of the form `*.example.com DNAME example.net` SHOULD
         // NOT be used", because "the interaction between the expansion of the
         // wildcard and the redirection of the DNAME is non-deterministic".
         // Non-deterministic is not a thing a server can be asked to serve.
-        if key.starts_with("*.") {
+        if key.as_ref().labels().next() == Some(b"*") {
             return Err(ZoneError::invalid(format!(
-                "{key} is a wildcard DNAME — RFC 6672 §3.3 says the interaction between \
+                "{shown} is a wildcard DNAME — RFC 6672 §3.3 says the interaction between \
                  wildcard expansion and DNAME redirection is non-deterministic, so there is \
                  no one answer for a server to give"
             )));
@@ -1174,7 +1188,7 @@ fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
         // condition, and the two would drift (`CLAUDE.md` §7).
         if owners.contains(&key) {
             return Err(ZoneError::invalid(format!(
-                "{key} has two DNAME records — RFC 6672 §2.4 makes DNAME a singleton type, \
+                "{shown} has two DNAME records — RFC 6672 §2.4 makes DNAME a singleton type, \
                  so that one name has one redirection and nothing has to choose between them"
             )));
         }
@@ -1184,9 +1198,9 @@ fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
         // then the NS RR signifies a delegation point, and the DNAME RR must in
         // that case appear below the zone cut at the zone apex of the child
         // zone."
-        if key != apex && zone.has_type(&key, rt::NS) {
+        if key.as_ref() != apex && zone.has_type(key.as_ref(), rt::NS) {
             return Err(ZoneError::invalid(format!(
-                "{key} has both a DNAME and an NS RRset below the apex — RFC 6672 §2.3 \
+                "{shown} has both a DNAME and an NS RRset below the apex — RFC 6672 §2.3 \
                  forbids it, because the NS makes this a zone cut and the DNAME then belongs \
                  in the child zone"
             )));
@@ -1212,9 +1226,10 @@ fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
         if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3 | rt::NSEC3PARAM) {
             continue;
         }
-        let key = zone.lookup_key(&record.name);
+        let key = record.name.as_ref();
         for owner in &owners {
-            if key.as_ref() != owner && is_at_or_under(&key, owner) {
+            if key != owner.as_ref() && key.is_at_or_under(owner.as_ref()) {
+                let (key, owner) = (key.to_presentation(), owner.as_ref().to_presentation());
                 return Err(ZoneError::invalid(format!(
                     "{key} is below the DNAME at {owner} — RFC 6672 §2.4 says resource \
                      records must not exist at any subdomain of a DNAME owner, and this one \
@@ -1262,6 +1277,7 @@ fn rdata_from_fields(
     rdata: String,
     fields: &[&str],
     text_fields: &[String],
+    origin: NameRef<'_>,
     ln: usize,
 ) -> Result<RecordData, ZoneError> {
     Ok(match record_type {
@@ -1279,9 +1295,9 @@ fn rdata_from_fields(
             RecordData::from_parsed(&ParsedRecord::AAAA(addr))
                 .map_err(|e| ZoneError::syntax(ln, format!("AAAA record: {e}")))?
         }
-        "NS" => RecordData::from_parsed(&ParsedRecord::NS(rdata))
+        "NS" => RecordData::from_parsed(&ParsedRecord::NS(name_at(&rdata, origin, ln)?))
             .map_err(|e| ZoneError::syntax(ln, format!("NS record: {e}")))?,
-        "CNAME" => RecordData::from_parsed(&ParsedRecord::CNAME(rdata))
+        "CNAME" => RecordData::from_parsed(&ParsedRecord::CNAME(name_at(&rdata, origin, ln)?))
             .map_err(|e| ZoneError::syntax(ln, format!("CNAME record: {e}")))?,
         "MX" => {
             let mx_parts: Vec<&str> = rdata.split_whitespace().collect();
@@ -1296,7 +1312,7 @@ fn rdata_from_fields(
             })?;
             RecordData::from_parsed(&ParsedRecord::MX {
                 preference,
-                exchange: mx_parts[1..].join(" "),
+                exchange: name_at(&mx_parts[1..].join(" "), origin, ln)?,
             })
             .map_err(|e| ZoneError::syntax(ln, format!("MX record: {e}")))?
         }
@@ -1315,15 +1331,16 @@ fn rdata_from_fields(
             RecordData::from_parsed(&ParsedRecord::TXT(strings))
                 .map_err(|e| ZoneError::syntax(ln, format!("TXT record: {e}")))?
         }
-        "PTR" => RecordData::from_parsed(&ParsedRecord::PTR(rdata))
+        "PTR" => RecordData::from_parsed(&ParsedRecord::PTR(name_at(&rdata, origin, ln)?))
             .map_err(|e| ZoneError::syntax(ln, format!("PTR record: {e}")))?,
-        "DNAME" => RecordData::from_parsed(&ParsedRecord::DNAME(rdata))
+        "DNAME" => RecordData::from_parsed(&ParsedRecord::DNAME(name_at(&rdata, origin, ln)?))
             .map_err(|e| ZoneError::syntax(ln, format!("DNAME record: {e}")))?,
         // One arm for two type codes: "the same encoding, format, and
         // high-level semantics" (RFC 9460 §6). Only the owner name differs
         // between them, and that is the caller's (§9.1).
         "SVCB" | "HTTPS" => {
             let (priority, target, rest) = split_svcb_head(record_type, fields, ln)?;
+            let target = name_at(&target, origin, ln)?;
             let params = crate::svcb::parse_params(rest, ln)?;
             // "In AliasMode, recipients MUST ignore any SvcParams that are
             // present. Zone-file parsers MAY emit a warning" (§2.4.2). Refused
@@ -1376,8 +1393,8 @@ fn rdata_from_fields(
                 ZoneError::syntax(ln, format!("invalid SOA minimum {:?}: {e}", soa_parts[6]))
             })?;
             RecordData::from_parsed(&ParsedRecord::SOA {
-                mname: soa_parts[0].to_string(),
-                rname: soa_parts[1].to_string(),
+                mname: name_at(soa_parts[0], origin, ln)?,
+                rname: name_at(soa_parts[1], origin, ln)?,
                 serial,
                 refresh,
                 retry,
@@ -1499,7 +1516,7 @@ fn rdata_from_fields(
                     format!("invalid RRSIG key tag {:?}: {e}", rrsig_parts[6]),
                 )
             })?;
-            let signer_name = rrsig_parts[7].to_string();
+            let signer_name = name_at(rrsig_parts[7], origin, ln)?;
             let b64_sig = rrsig_parts[8..].join("");
             let signature = base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_sig)
                 .map_err(|e| {
@@ -1529,7 +1546,7 @@ fn rdata_from_fields(
                     ),
                 ));
             }
-            let next_domain_name = nsec_parts[0].to_string();
+            let next_domain_name = name_at(nsec_parts[0], origin, ln)?;
             let type_names: Vec<String> = nsec_parts[1..].iter().map(|s| s.to_string()).collect();
             let type_bitmap = construct_type_bitmap(&type_names)
                 .map_err(|e| ZoneError::syntax(ln, format!("NSEC record: {e}")))?;
@@ -1623,11 +1640,11 @@ fn parse_into(
 
         if first.eq_ignore_ascii_case("$ORIGIN") {
             if let Some(new_origin) = parts.get(1) {
-                state.origin = absolutize(new_origin, &state.origin).into_owned();
+                state.origin = name_at(new_origin, state.origin.as_ref(), ln)?;
                 // Only the top-level file may move the apex: RFC 1035 §5.1 keeps
                 // an include's origin to the included file.
                 if depth == 0 {
-                    zone.set_origin(&state.origin.clone());
+                    zone.set_origin(state.origin.clone());
                 }
             }
             continue;
@@ -1665,10 +1682,10 @@ fn parse_into(
             // state goes in as a copy and none of it comes back. The owner name
             // does not carry across either.
             let mut inner = ParseState {
-                origin: parts
-                    .get(2)
-                    .map(|o| absolutize(o, &state.origin).into_owned())
-                    .unwrap_or_else(|| state.origin.clone()),
+                origin: match parts.get(2) {
+                    Some(o) => name_at(o, state.origin.as_ref(), ln)?,
+                    None => state.origin.clone(),
+                },
                 ttl: state.ttl,
                 owner: None,
             };
@@ -1691,20 +1708,11 @@ fn parse_into(
                 )
             })?
         } else {
-            // RFC 1035 §5.1 makes `a\.b` one label of three octets, which a
-            // name stored as presentation text with `.` as the separator cannot
-            // represent. Refused at load rather than mis-encoded into two
-            // labels; resolving would need a different stored form.
-            if first.contains('\\') {
-                return Err(ZoneError::syntax(
-                    ln,
-                    format!(
-                        "owner name {first:?} contains an escape, which this parser does not \
-                         resolve and cannot represent; see RFC 1035 §5.1"
-                    ),
-                ));
-            }
-            let name = absolutize(first, &state.origin).into_owned();
+            // RFC 1035 §5.1's escapes are resolved here, `a\.b` included —
+            // one label of three octets. This was refused at load until names
+            // became wire form, because presentation storage with `.` as the
+            // separator could not tell that name from two labels (D-1).
+            let name = name_at(first, state.origin.as_ref(), ln)?;
             state.owner = Some(name.clone());
             idx += 1;
             name
@@ -1767,8 +1775,14 @@ fn parse_into(
             continue;
         }
 
-        let rdata: RecordData =
-            rdata_from_fields(&record_type, rdata, &parts[idx..], &tokens[idx..], ln)?;
+        let rdata: RecordData = rdata_from_fields(
+            &record_type,
+            rdata,
+            &parts[idx..],
+            &tokens[idx..],
+            state.origin.as_ref(),
+            ln,
+        )?;
 
         zone.add_record(ZoneRecord {
             name: record_name,
@@ -1783,29 +1797,31 @@ fn parse_into(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_records::nm;
     use crate::utils::record_types;
 
     #[test]
     fn test_zone_creation() {
-        let zone = Zone::new("example.com".to_string());
-        assert_eq!(zone.origin, "example.com.");
+        let zone = Zone::new(nm("example.com"));
+        assert_eq!(zone.origin, nm("example.com."));
     }
 
-    /// A `Zone` built record by record can hold the apex SOA under `@`, which
-    /// is what the zone file said. Every question about "is this the apex SOA"
-    /// therefore has to normalize first, and two of the five places that asked
-    /// it compared the stored name raw (`TODO.md` #33f).
+    /// Every question about "is this the apex SOA" compares owner names, and
+    /// two of the five places that asked it compared the stored name raw
+    /// (`TODO.md` #33f). Relativity is gone with the type — a `Name` is
+    /// absolute — but case is not: RFC 4343 makes `EXAMPLE.com.` the same apex.
     #[test]
-    fn the_apex_soa_is_found_under_an_unabsolutized_owner_name() {
-        let mut zone = Zone::new("example.com.".to_string());
+    fn the_apex_soa_is_found_under_a_differently_cased_owner_name() {
+        let mut zone = Zone::new(nm("example.com."));
         zone.add_record(ZoneRecord {
-            name: "@".to_string(),
+            name: nm("ExAmPlE.CoM."),
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
-                mname: "ns1.example.com.".to_string(),
-                rname: "admin.example.com.".to_string(),
+                mname: nm("ns1.example.com."),
+                rname: nm("admin.example.com."),
                 serial: Serial::new(7),
                 refresh: 3600,
                 retry: 600,
@@ -1815,13 +1831,13 @@ mod tests {
             .unwrap(),
         });
 
-        let soa = zone.apex_soa().expect("the apex SOA, stored as `@`");
+        let soa = zone.apex_soa().expect("the apex SOA, however it is cased");
         assert!(zone.is_apex_soa(soa));
         assert_eq!(zone.serial(), Some(Serial::new(7)));
         assert_eq!(
             zone.apex_soa_record().expect("as a record").name,
-            "example.com.",
-            "the record that goes on the wire carries the absolute owner name"
+            nm("example.com."),
+            "the owner name compares case-insensitively (RFC 4343)"
         );
     }
 
@@ -1852,15 +1868,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            zone.delegation_for("www.example.com."),
+            zone.delegation_for(nm("www.example.com.").as_ref()),
             None,
             "at its own apex an NS RRset is the zone's own, not a cut"
         );
 
-        zone.set_origin("com.");
+        zone.set_origin(nm("com."));
         assert_eq!(
-            zone.delegation_for("www.example.com."),
-            Some("example.com.".to_string()),
+            zone.delegation_for(nm("www.example.com.").as_ref()),
+            Some(nm("example.com.")),
             "example.com. is a child now, and it has an NS RRset"
         );
     }
@@ -1870,18 +1886,20 @@ mod tests {
     #[test]
     fn test_a_delegation_added_after_load_is_still_found() {
         let mut zone = parse_zone_file("www IN A 192.0.2.10\n", "example.com.").unwrap();
-        assert_eq!(zone.delegation_for("host.sub.example.com."), None);
+        assert_eq!(
+            zone.delegation_for(nm("host.sub.example.com.").as_ref()),
+            None
+        );
 
         zone.add_record(ZoneRecord {
-            name: "sub.example.com.".to_string(),
+            name: nm("sub.example.com."),
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
-            rdata: RecordData::from_parsed(&ParsedRecord::NS("ns1.sub.example.com.".to_string()))
-                .unwrap(),
+            rdata: RecordData::from_parsed(&ParsedRecord::NS(nm("ns1.sub.example.com."))).unwrap(),
         });
         assert_eq!(
-            zone.delegation_for("host.sub.example.com."),
-            Some("sub.example.com.".to_string())
+            zone.delegation_for(nm("host.sub.example.com.").as_ref()),
+            Some(nm("sub.example.com."))
         );
     }
 
@@ -1898,7 +1916,7 @@ mail IN A   192.0.2.3
         "#;
 
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
-        assert_eq!(zone.origin, "example.com.");
+        assert_eq!(zone.origin, nm("example.com."));
         assert!(zone.records.len() >= 4);
     }
 
@@ -1941,7 +1959,8 @@ timed 60 IN A 192.0.2.3
             "timed.example.com.",
         ] {
             assert_eq!(
-                zone.query(name, Qtype::of(record_types::A)).len(),
+                zone.query(nm(name).as_ref(), Qtype::of(record_types::A))
+                    .len(),
                 1,
                 "{name} should have loaded"
             );
@@ -1977,24 +1996,37 @@ timed 60 IN A 192.0.2.3
     fn test_fully_qualified_owner_name_parses() {
         let zone = parse_zone_file("www.example.com. IN A 192.0.2.5\n", "example.com.").unwrap();
         assert_eq!(zone.records.len(), 1);
-        assert_eq!(zone.records[0].name, "www.example.com.");
-        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
+        assert_eq!(zone.records[0].name, nm("www.example.com."));
+        assert_eq!(
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn test_owner_name_may_contain_digits() {
         let zone = parse_zone_file("www2 IN A 192.0.2.6\n", "example.com.").unwrap();
-        assert_eq!(zone.records[0].name, "www2.example.com.", "stored absolute");
-        assert_eq!(zone.query("www2.example.com.", Qtype::of(rt::A)).len(), 1);
+        assert_eq!(
+            zone.records[0].name,
+            nm("www2.example.com."),
+            "stored absolute"
+        );
+        assert_eq!(
+            zone.query(nm("www2.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn test_owner_name_may_look_like_a_record_type() {
         // Position, not the token's spelling, decides what the first field is.
         let zone = parse_zone_file("ns IN A 192.0.2.7\n", "example.com.").unwrap();
-        assert_eq!(zone.records[0].name, "ns.example.com.");
+        assert_eq!(zone.records[0].name, nm("ns.example.com."));
         assert_eq!(
-            zone.query("ns.example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("ns.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1,
             "should be an A record"
         );
@@ -2006,8 +2038,12 @@ timed 60 IN A 192.0.2.3
         let zone_content = "www IN A 192.0.2.1\n    IN A 192.0.2.2\n";
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         assert_eq!(zone.records.len(), 2);
-        assert_eq!(zone.records[1].name, "www.example.com.");
-        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 2);
+        assert_eq!(zone.records[1].name, nm("www.example.com."));
+        assert_eq!(
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -2024,46 +2060,114 @@ timed 60 IN A 192.0.2.3
         let zone_content = "@ IN A 192.0.2.1\nwww IN A 192.0.2.2\n";
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         assert_eq!(
-            zone.query("example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1,
             "@ should match the apex"
         );
-        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
+        assert_eq!(
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
         // DNS names are case-insensitive (RFC 4343).
-        assert_eq!(zone.query("WWW.Example.COM.", Qtype::of(rt::A)).len(), 1);
+        assert_eq!(
+            zone.query(nm("WWW.Example.COM.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
     }
 
-    /// Which of `normalize_name`'s three cases copies. Asserted on the `Cow` arm,
-    /// not the value, which is the same either way.
+    /// A name *inside* RDATA is relative to the origin too — RFC 1035 §5.1,
+    /// "domain names in the RDATA section of RRs ... are also relative".
+    ///
+    /// This did not hold. `rdata_from_fields` took the raw text and made a
+    /// record out of it, so `www IN CNAME host` stored the target as the
+    /// six-octet name `host.` and the chain went nowhere. Owner names were
+    /// resolved and RDATA names were not, in the same loop. The type is what
+    /// fixed it rather than a check: a `Name` cannot be relative, so the parser
+    /// has to say what every name is relative *to* before it can build one.
     #[test]
-    fn normalizing_a_name_copies_only_when_it_changes() {
-        let zone = parse_zone_file("@ IN A 192.0.2.1\n", "example.com.").unwrap();
+    fn a_name_inside_rdata_is_relative_to_the_origin_too() {
+        let zone = parse_zone_file(
+            "@     IN SOA ns1 admin ( 1 3600 600 604800 300 )\n\
+             @     IN NS  ns1\n\
+             ns1   IN A   192.0.2.1\n\
+             host  IN A   192.0.2.10\n\
+             www   IN CNAME host\n\
+             mail  IN MX  10 host\n\
+             10    IN PTR host\n",
+            "example.com.",
+        )
+        .expect("parse");
 
-        assert!(matches!(
-            zone.normalize_name("www.example.com."),
-            Cow::Borrowed("www.example.com.")
-        ));
-        // `@` and the empty name are the origin, which the zone already holds.
-        assert!(matches!(
-            zone.normalize_name("@"),
-            Cow::Borrowed("example.com.")
-        ));
-        // A relative name is the one case where the result exists nowhere yet.
-        assert!(matches!(
-            zone.normalize_name("www"),
-            Cow::Owned(ref name) if name == "www.example.com."
-        ));
+        let host = nm("host.example.com.");
+        let of = |name: &str, qtype: Rtype| {
+            zone.query(nm(name).as_ref(), Qtype::of(qtype))[0]
+                .rdata
+                .parse()
+                .expect("parses")
+        };
+
+        assert_eq!(
+            of("www.example.com.", rt::CNAME),
+            ParsedRecord::CNAME(host.clone())
+        );
+        assert_eq!(
+            of("10.example.com.", rt::PTR),
+            ParsedRecord::PTR(host.clone())
+        );
+        assert_eq!(
+            of("mail.example.com.", rt::MX),
+            ParsedRecord::MX {
+                preference: 10,
+                exchange: host.clone(),
+            }
+        );
+        // The SOA's two names, from the same line as the origin itself.
+        let ParsedRecord::SOA { mname, rname, .. } = of("example.com.", rt::SOA) else {
+            panic!("not an SOA");
+        };
+        assert_eq!(mname, nm("ns1.example.com."));
+        assert_eq!(rname, nm("admin.example.com."));
+
+        // And the chain actually resolves, which is what the bug cost.
+        assert_eq!(zone.query(host.as_ref(), Qtype::of(rt::A)).len(), 1);
+    }
+
+    /// `absolutize`'s three cases: already absolute, the origin itself, and
+    /// relative. RFC 1035 §5.1 gives `@` and the empty name the origin.
+    #[test]
+    fn a_relative_name_is_completed_against_the_origin() {
+        let origin = nm("example.com.");
+
+        for (text, want) in [
+            ("www.example.com.", "www.example.com."),
+            ("@", "example.com."),
+            ("", "example.com."),
+            ("www", "www.example.com."),
+            ("a.b", "a.b.example.com."),
+        ] {
+            assert_eq!(
+                absolutize(text, origin.as_ref()).expect("a well-formed name"),
+                nm(want),
+                "{text} under {origin}"
+            );
+        }
     }
 
     #[test]
     fn test_wildcard_answers_a_name_that_does_not_exist() {
         let zone = parse_zone_file("* IN A 192.0.2.9\n", "example.com.").unwrap();
         assert_eq!(
-            zone.query("anything.example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("anything.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1
         );
         // And it does not answer for the name it hangs off.
-        assert!(zone.query("example.com.", Qtype::of(rt::A)).is_empty());
+        assert!(zone
+            .query(nm("example.com.").as_ref(), Qtype::of(rt::A))
+            .is_empty());
     }
 
     /// RFC 4592 §3.3.2's worked example: `*.example.` answers
@@ -2073,16 +2177,20 @@ timed 60 IN A 192.0.2.3
     fn test_a_wildcard_synthesizes_at_any_depth() {
         let zone = parse_zone_file("* IN A 192.0.2.9\n", "example.").unwrap();
         assert_eq!(
-            zone.query("_telnet._tcp.host1.example.", Qtype::of(rt::A))
+            zone.query(nm("_telnet._tcp.host1.example.").as_ref(), Qtype::of(rt::A))
                 .len(),
             1,
             "RFC 4592 §3.3.2 synthesizes this from *.example."
         );
-        assert_eq!(zone.query("a.b.example.", Qtype::of(rt::A)).len(), 1);
-        assert!(zone.name_exists("a.b.c.d.e.f.example."));
         assert_eq!(
-            zone.name_kind("a.b.example."),
-            NameKind::Wildcard("*.example.".to_string())
+            zone.query(nm("a.b.example.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
+        assert!(zone.name_exists(nm("a.b.c.d.e.f.example.").as_ref()));
+        assert_eq!(
+            zone.name_kind(nm("a.b.example.").as_ref()),
+            NameKind::Wildcard(nm(&nm("*.example.").to_string()))
         );
     }
 
@@ -2124,11 +2232,15 @@ timed 60 IN A 192.0.2.3
         ] {
             for qtype in [rt::A, rt::TXT, rt::SOA] {
                 let qtype = Qtype::of(qtype);
-                let (kind, records) = zone.query_with_kind(name, qtype);
-                assert_eq!(kind, zone.name_kind(name), "kind for {name} {qtype:?}");
+                let (kind, records) = zone.query_with_kind(nm(name).as_ref(), qtype);
+                assert_eq!(
+                    kind,
+                    zone.name_kind(nm(name).as_ref()),
+                    "kind for {name} {qtype:?}"
+                );
                 assert_eq!(
                     records.len(),
-                    zone.query(name, qtype).len(),
+                    zone.query(nm(name).as_ref(), qtype).len(),
                     "records for {name} {qtype:?}"
                 );
             }
@@ -2143,17 +2255,18 @@ timed 60 IN A 192.0.2.3
             parse_zone_file("* IN A 192.0.2.9\ndeep.a.b IN TXT \"x\"\n", "example.com.").unwrap();
 
         assert_eq!(
-            zone.query("other.example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("other.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1,
             "nothing above it"
         );
         assert!(
-            zone.query("x.a.b.example.com.", Qtype::of(rt::A))
+            zone.query(nm("x.a.b.example.com.").as_ref(), Qtype::of(rt::A))
                 .is_empty(),
             "a.b exists, so *.example.com. is not this name's source of synthesis"
         );
         assert_eq!(
-            zone.name_kind("x.a.b.example.com."),
+            zone.name_kind(nm("x.a.b.example.com.").as_ref()),
             NameKind::NotFound,
             "NXDOMAIN: the closest encloser is a.b, and *.a.b does not exist"
         );
@@ -2175,20 +2288,20 @@ timed 60 IN A 192.0.2.3
         .unwrap();
 
         assert_eq!(
-            zone.delegation_for("anything.sub.example.com.").as_deref(),
-            Some("sub.example.com."),
+            zone.delegation_for(nm("anything.sub.example.com.").as_ref()),
+            Some(nm("sub.example.com.")),
         );
         assert_eq!(
-            zone.name_kind("anything.sub.example.com."),
+            zone.name_kind(nm("anything.sub.example.com.").as_ref()),
             NameKind::NotFound,
             "occluded: the wildcard is below the cut, so it is not ours to expand"
         );
         // The apex NS RRset is not a cut.
-        assert_eq!(zone.delegation_for("www.example.com."), None);
+        assert_eq!(zone.delegation_for(nm("www.example.com.").as_ref()), None);
         // A query at the cut itself is still a referral.
         assert_eq!(
-            zone.delegation_for("sub.example.com.").as_deref(),
-            Some("sub.example.com.")
+            zone.delegation_for(nm("sub.example.com.").as_ref()),
+            Some(nm("sub.example.com."))
         );
     }
 
@@ -2220,19 +2333,19 @@ deep.a.b IN TXT \"x\"
         ] {
             let zone = parse_zone_file(text, "example.com.").unwrap();
             assert_eq!(
-                zone.name_kind("a.b.example.com."),
+                zone.name_kind(nm("a.b.example.com.").as_ref()),
                 NameKind::Exact,
                 "{order}"
             );
-            assert!(zone.holds_name("a.b.example.com."), "{order}");
+            assert!(zone.holds_name(nm("a.b.example.com.").as_ref()), "{order}");
             assert_eq!(
-                zone.name_kind("b.example.com."),
+                zone.name_kind(nm("b.example.com.").as_ref()),
                 NameKind::EmptyNonTerminal,
                 "{order}: still only an ancestor"
             );
-            assert!(!zone.holds_name("b.example.com."), "{order}");
+            assert!(!zone.holds_name(nm("b.example.com.").as_ref()), "{order}");
             assert_eq!(
-                zone.name_kind("nope.b.example.com."),
+                zone.name_kind(nm("nope.b.example.com.").as_ref()),
                 NameKind::NotFound,
                 "{order}: and the walk still says no to what is not there"
             );
@@ -2245,26 +2358,35 @@ deep.a.b IN TXT \"x\"
 
         for ent in ["a.b.example.com.", "b.example.com.", "example.com."] {
             assert_eq!(
-                zone.name_kind(ent),
+                zone.name_kind(nm(ent).as_ref()),
                 NameKind::EmptyNonTerminal,
                 "{ent} has descendants, so it exists"
             );
-            assert!(zone.name_exists(ent), "{ent}");
+            assert!(zone.name_exists(nm(ent).as_ref()), "{ent}");
             assert!(
-                !zone.holds_name(ent),
+                !zone.holds_name(nm(ent).as_ref()),
                 "{ent} still holds no records of its own — the denial path needs that answer"
             );
             assert!(
-                zone.query(ent, Qtype::of(rt::TXT)).is_empty(),
+                zone.query(nm(ent).as_ref(), Qtype::of(rt::TXT)).is_empty(),
                 "{ent}: NODATA, no records"
             );
         }
 
-        assert_eq!(zone.name_kind("deep.a.b.example.com."), NameKind::Exact);
-        assert_eq!(zone.name_kind("gone.a.b.example.com."), NameKind::NotFound);
+        assert_eq!(
+            zone.name_kind(nm("deep.a.b.example.com.").as_ref()),
+            NameKind::Exact
+        );
+        assert_eq!(
+            zone.name_kind(nm("gone.a.b.example.com.").as_ref()),
+            NameKind::NotFound
+        );
         // The walk does not conjure names outside the zone into existence.
-        assert_eq!(zone.name_kind("com."), NameKind::NotFound);
-        assert_eq!(zone.name_kind("elsewhere.test."), NameKind::NotFound);
+        assert_eq!(zone.name_kind(nm("com.").as_ref()), NameKind::NotFound);
+        assert_eq!(
+            zone.name_kind(nm("elsewhere.test.").as_ref()),
+            NameKind::NotFound
+        );
     }
 
     /// RFC 1034 §3.6.2: a CNAME is the only type at its owner.
@@ -2356,22 +2478,24 @@ deep.a.b IN TXT \"x\"
         let zone = parse_zone_file("sub IN DNAME target.example.net.\n", "example.com.").unwrap();
 
         let found = zone
-            .dname_above("a.b.sub.example.com.")
+            .dname_above(nm("a.b.sub.example.com.").as_ref())
             .expect("a DNAME two labels up redirects");
-        assert_eq!(found.name, "sub.example.com.");
+        assert_eq!(found.name, nm("sub.example.com."));
 
         assert!(
-            zone.dname_above("sub.example.com.").is_none(),
+            zone.dname_above(nm("sub.example.com.").as_ref()).is_none(),
             "§2.3: the owner name of a DNAME is not redirected itself"
         );
         assert!(
-            zone.dname_above("other.example.com.").is_none(),
+            zone.dname_above(nm("other.example.com.").as_ref())
+                .is_none(),
             "a name that is not below the owner is not redirected"
         );
         // Table 1: QNAME `ab.example.com.` against owner `b.example.com.` is
         // `<no match>`. Whole labels only, never a string suffix.
         assert!(
-            zone.dname_above("absub.example.com.").is_none(),
+            zone.dname_above(nm("absub.example.com.").as_ref())
+                .is_none(),
             "the match is on whole labels"
         );
     }
@@ -2380,7 +2504,9 @@ deep.a.b IN TXT \"x\"
     #[test]
     fn a_zone_with_no_dname_answers_without_walking() {
         let zone = parse_zone_file("www IN A 192.0.2.1\n", "example.com.").unwrap();
-        assert!(zone.dname_above("deep.down.www.example.com.").is_none());
+        assert!(zone
+            .dname_above(nm("deep.down.www.example.com.").as_ref())
+            .is_none());
     }
 
     /// An existing name shadows the wildcard completely, types it does not carry
@@ -2393,18 +2519,23 @@ deep.a.b IN TXT \"x\"
         )
         .unwrap();
 
-        let a = zone.query("www.example.com.", Qtype::of(rt::A));
+        let a = zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A));
         assert!(
             a.is_empty(),
             "www exists, so the wildcard must not answer for it: {a:?}"
         );
         assert_eq!(
-            zone.query("www.example.com.", Qtype::of(rt::AAAA)).len(),
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::AAAA))
+                .len(),
             1,
             "its own AAAA"
         );
         // Any other name still gets the wildcard.
-        assert_eq!(zone.query("other.example.com.", Qtype::of(rt::A)).len(), 1);
+        assert_eq!(
+            zone.query(nm("other.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2415,16 +2546,19 @@ deep.a.b IN TXT \"x\"
         )
         .unwrap();
 
-        assert!(zone.name_exists("www.example.com."), "by its own records");
         assert!(
-            zone.name_exists("other.example.com."),
+            zone.name_exists(nm("www.example.com.").as_ref()),
+            "by its own records"
+        );
+        assert!(
+            zone.name_exists(nm("other.example.com.").as_ref()),
             "through the wildcard — NODATA, not NXDOMAIN"
         );
         assert!(
-            zone.name_exists("a.b.example.com."),
+            zone.name_exists(nm("a.b.example.com.").as_ref()),
             "the wildcard reaches any depth (RFC 4592 §3.3.2) — NODATA, not NXDOMAIN"
         );
-        assert!(!zone.name_exists("elsewhere.test."));
+        assert!(!zone.name_exists(nm("elsewhere.test.").as_ref()));
     }
 
     /// The index encodes what `matches_query` defines; separate code, so hold
@@ -2450,9 +2584,9 @@ deep.a.b IN TXT \"x\"
             let by_scan = zone
                 .records()
                 .iter()
-                .any(|r| zone.matches_query(&r.name, name));
+                .any(|r| zone.matches_query(r.name.as_ref(), nm(name).as_ref()));
             assert_eq!(
-                zone.name_exists(name),
+                zone.name_exists(nm(name).as_ref()),
                 by_scan,
                 "the index and matches_query disagree about {name}"
             );
@@ -2467,50 +2601,69 @@ deep.a.b IN TXT \"x\"
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
 
         assert_eq!(
-            zone.query("www.example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1,
             "www was read before the $ORIGIN and stays where it was"
         );
-        assert_eq!(zone.query("mail.other.test.", Qtype::of(rt::A)).len(), 1);
-        assert!(zone.query("www.other.test.", Qtype::of(rt::A)).is_empty());
+        assert_eq!(
+            zone.query(nm("mail.other.test.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
+        assert!(zone
+            .query(nm("www.other.test.").as_ref(), Qtype::of(rt::A))
+            .is_empty());
     }
 
-    /// The `set_origin` re-key. Only names added relative through the API need
-    /// it; the parser resolves as it goes.
+    /// `set_origin` moves the apex and nothing else. It re-keyed records while
+    /// an owner name was text that might be relative; a `Name` is absolute, so
+    /// the question no longer arises and a record stays where it was put.
     #[test]
-    fn test_set_origin_rekeys_relative_records() {
-        let mut zone = Zone::new("example.com.".to_string());
+    fn test_set_origin_moves_the_apex_and_not_the_records() {
+        let mut zone = Zone::new(nm("example.com."));
         zone.add_record(ZoneRecord {
-            name: "www".to_string(),
+            name: nm("www.example.com."),
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         });
-        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
-
-        zone.set_origin("other.test.");
         assert_eq!(
-            zone.query("www.other.test.", Qtype::of(rt::A)).len(),
-            1,
-            "a relative name follows the origin it is relative to"
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
         );
-        assert!(zone.query("www.example.com.", Qtype::of(rt::A)).is_empty());
+
+        zone.set_origin(nm("com."));
+        assert_eq!(zone.origin(), nm("com.").as_ref());
+        assert_eq!(
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1,
+            "the record is at the name it was given, whatever the apex is"
+        );
     }
 
     /// A record added after the zone is built has to be reachable.
     #[test]
     fn test_records_added_later_are_indexed() {
-        let mut zone = Zone::new("example.com.".to_string());
-        assert!(zone.query("www.example.com.", Qtype::of(rt::A)).is_empty());
+        let mut zone = Zone::new(nm("example.com."));
+        assert!(zone
+            .query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+            .is_empty());
 
         zone.add_record(ZoneRecord {
-            name: "www".to_string(),
+            name: nm("www.example.com."),
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         });
-        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
-        assert!(zone.name_exists("www.example.com."));
+        assert_eq!(
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
+        assert!(zone.name_exists(nm("www.example.com.").as_ref()));
     }
 
     /// A parenthesized SOA, which is how every zone file writes one.
@@ -2527,7 +2680,10 @@ $TTL 3600
 @   IN  A   192.0.2.1
 "#;
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
-        let soa = zone.query("example.com.", Qtype::of(crate::utils::record_types::SOA));
+        let soa = zone.query(
+            nm("example.com.").as_ref(),
+            Qtype::of(crate::utils::record_types::SOA),
+        );
         assert_eq!(soa.len(), 1, "the SOA should have loaded");
         match soa[0].rdata.parse().unwrap() {
             ParsedRecord::SOA {
@@ -2536,7 +2692,7 @@ $TTL 3600
                 minimum,
                 ..
             } => {
-                assert_eq!(mname, "ns1.example.com.");
+                assert_eq!(mname, nm("ns1.example.com."));
                 assert_eq!(
                     serial,
                     Serial::new(2021010101),
@@ -2547,7 +2703,11 @@ $TTL 3600
             other => panic!("expected an SOA, got {other:?}"),
         }
         // The record after the group is still read as its own line.
-        assert_eq!(zone.query("example.com.", Qtype::of(rt::A)).len(), 1);
+        assert_eq!(
+            zone.query(nm("example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
     }
 
     /// A `;` inside a quoted string is data, not a comment — SPF and DKIM
@@ -2557,7 +2717,7 @@ $TTL 3600
         let zone_content = "txt IN TXT \"v=spf1 include:example.net; -all\"\n";
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         let txt = zone.query(
-            "txt.example.com.",
+            nm("txt.example.com.").as_ref(),
             Qtype::of(crate::utils::record_types::TXT),
         );
         assert_eq!(txt.len(), 1);
@@ -2581,7 +2741,7 @@ $TTL 3600
         let strings_of = |line: &str| -> Vec<Vec<u8>> {
             let zone = parse_zone_file(line, "example.com.").unwrap();
             match zone.query(
-                "txt.example.com.",
+                nm("txt.example.com.").as_ref(),
                 Qtype::of(crate::utils::record_types::TXT),
             )[0]
             .rdata
@@ -2691,17 +2851,27 @@ $TTL 3600
 
         let zone = parse_zone_file_at(&main, "example.com.").unwrap();
         assert_eq!(
-            zone.query("mail.example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("mail.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1,
             "from the include"
         );
-        assert_eq!(zone.query("www.example.com.", Qtype::of(rt::A)).len(), 1);
         assert_eq!(
-            zone.query("ftp.example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
+        assert_eq!(
+            zone.query(nm("ftp.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1,
             "parsing continues after the include"
         );
-        assert_eq!(zone.query("example.com.", Qtype::of(rt::A)).len(), 1);
+        assert_eq!(
+            zone.query(nm("example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
+            1
+        );
     }
 
     /// `$INCLUDE file origin` reads the file under that origin and does not
@@ -2720,16 +2890,22 @@ $TTL 3600
 
         let zone = parse_zone_file_at(&main, "example.com.").unwrap();
         assert_eq!(
-            zone.query("ns.deeper.example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("ns.deeper.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1,
             "the included file's own $ORIGIN applies inside it"
         );
         assert_eq!(
-            zone.query("after.example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("after.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1,
             "and neither origin leaks back out to the including file"
         );
-        assert_eq!(zone.origin(), "example.com.", "the apex is untouched");
+        assert_eq!(
+            zone.origin(),
+            nm("example.com.").as_ref(),
+            "the apex is untouched"
+        );
     }
 
     #[test]
@@ -2765,7 +2941,7 @@ $TTL 3600
     #[test]
     fn test_generic_rdata_carries_a_type_we_do_not_parse() {
         let zone = parse_zone_file("odd IN TYPE1234 \\# 4 DEADBEEF\n", "example.com.").unwrap();
-        let record = zone.query("odd.example.com.", Qtype::of(Rtype::new(1234)));
+        let record = zone.query(nm("odd.example.com.").as_ref(), Qtype::of(Rtype::new(1234)));
         assert_eq!(record.len(), 1);
         assert_eq!(record[0].rdata.bytes(), [0xde, 0xad, 0xbe, 0xef]);
     }
@@ -2775,7 +2951,7 @@ $TTL 3600
     fn test_generic_rdata_is_accepted_for_a_known_type() {
         let zone = parse_zone_file("www IN A \\# 4 C0000201\n", "example.com.").unwrap();
         assert!(matches!(
-            zone.query("www.example.com.", Qtype::of(record_types::A))[0].rdata.parse(),
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A))[0].rdata.parse(),
             Ok(ParsedRecord::A(addr)) if addr == Ipv4Addr::new(192, 0, 2, 1)
         ));
     }
@@ -2783,12 +2959,13 @@ $TTL 3600
     #[test]
     fn test_generic_rdata_of_zero_length() {
         let zone = parse_zone_file("empty IN TYPE4321 \\# 0\n", "example.com.").unwrap();
-        assert!(
-            zone.query("empty.example.com.", Qtype::of(Rtype::new(4321)))[0]
-                .rdata
-                .bytes()
-                .is_empty()
-        );
+        assert!(zone.query(
+            nm("empty.example.com.").as_ref(),
+            Qtype::of(Rtype::new(4321))
+        )[0]
+        .rdata
+        .bytes()
+        .is_empty());
     }
 
     /// The stated length is checked against the digits, not trusted.
@@ -2820,7 +2997,7 @@ $TTL 3600
     fn test_nsec_bitmap_accepts_a_generic_type_name() {
         let zone =
             parse_zone_file("@ IN NSEC www.example.com. A TYPE1234\n", "example.com.").unwrap();
-        let record = zone.query("example.com.", Qtype::of(record_types::NSEC))[0];
+        let record = zone.query(nm("example.com.").as_ref(), Qtype::of(record_types::NSEC))[0];
         let ParsedRecord::NSEC { type_bitmap, .. } = record.rdata.parse().unwrap() else {
             panic!("not an NSEC");
         };
@@ -2920,13 +3097,21 @@ $TTL 3600
     fn the_rdata_half_can_be_tested_without_a_zone_file() {
         let fields = ["10", "mx.example.com."];
         let text: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-        let mx = rdata_from_fields("MX", "10 mx.example.com.".into(), &fields, &text, 1)
-            .expect("a well-formed MX");
+        let origin = nm("example.com.");
+        let mx = rdata_from_fields(
+            "MX",
+            "10 mx.example.com.".into(),
+            &fields,
+            &text,
+            origin.as_ref(),
+            1,
+        )
+        .expect("a well-formed MX");
         assert_eq!(
             mx.parse().unwrap(),
             ParsedRecord::MX {
                 preference: 10,
-                exchange: "mx.example.com.".into(),
+                exchange: nm("mx.example.com."),
             }
         );
 
@@ -2934,8 +3119,15 @@ $TTL 3600
         // and this function attaches the position.
         let bad = ["notanumber", "mx.example.com."];
         let text: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
-        let err = rdata_from_fields("MX", "notanumber mx.example.com.".into(), &bad, &text, 42)
-            .expect_err("preference is not a number");
+        let err = rdata_from_fields(
+            "MX",
+            "notanumber mx.example.com.".into(),
+            &bad,
+            &text,
+            origin.as_ref(),
+            42,
+        )
+        .expect_err("preference is not a number");
         assert!(err.to_string().contains("42"), "got {err}");
     }
 
@@ -2946,48 +3138,60 @@ $TTL 3600
         assert!(err.to_string().contains("$TTL"), "got: {err}");
     }
     /// A *quoted* escape in a name was eaten by the tokenizer, so `"a\.b"`
-    /// reached the parser as `a.b` and became two labels with nothing to say
-    /// so — the unquoted form was refused and the quoted one silently
-    /// mis-encoded. The tokenizer keeps the backslash now, so both take the
-    /// same path.
+    /// reached the parser as `a.b` and became two labels — while the unquoted
+    /// form was refused outright. The tokenizer keeps the backslash now, so
+    /// both spellings take the same path and mean the same one label.
     ///
     /// Found while writing RFC 9460's SvcParamValue decoding, which needed the
     /// backslash to survive tokenizing for `\DDD` to mean anything.
     #[test]
-    fn a_quoted_escape_in_a_name_is_refused_like_an_unquoted_one() {
+    fn a_quoted_escape_in_a_name_means_the_same_as_an_unquoted_one() {
         for line in [
             r#"www IN CNAME a\.b.example.com."#,
             r#"www IN CNAME "a\.b.example.com.""#,
         ] {
-            let err = parse_zone_file(line, "example.com.")
-                .err()
-                .unwrap_or_else(|| panic!("{line:?} should not load"));
-            assert!(
-                err.to_string().contains("escape"),
-                "{line:?}: the error should say why: {err}"
+            let zone = parse_zone_file(line, "example.com.")
+                .unwrap_or_else(|e| panic!("{line:?} should load: {e}"));
+            let ParsedRecord::CNAME(target) = zone.records()[0].rdata.parse().expect("a CNAME")
+            else {
+                panic!("not a CNAME");
+            };
+            assert_eq!(
+                target.as_ref().labels().next().expect("a first label"),
+                b"a.b",
+                "{line:?}: one label of three octets, dot included"
             );
         }
     }
 
-    /// An escape in a name is refused rather than mis-encoded. RFC 1035 §5.1
-    /// makes `a\.b` one label of three octets, which presentation text with `.`
-    /// as the separator cannot hold.
+    /// RFC 1035 §5.1 makes `a\.b` one label of three octets. Storing a name as
+    /// presentation text could not hold that — `.` was the separator — so it
+    /// was refused; wire storage has no such problem (`TODO.md` D-1).
     #[test]
-    fn an_escape_in_a_name_is_refused_rather_than_mis_encoded() {
-        let err = parse_zone_file("a\\.b IN A 192.0.2.1\n", "example.com.")
-            .expect_err("an escaped dot in an owner name");
-        assert!(
-            err.to_string().contains("escape"),
-            "the error should say what it refused: {err}"
+    fn an_escaped_dot_is_one_label_not_two() {
+        let zone = parse_zone_file("a\\.b IN A 192.0.2.1\n", "example.com.")
+            .expect("an escaped dot in an owner name");
+        let name = &zone.records()[0].name;
+        assert_eq!(
+            name.as_ref().label_count(),
+            3,
+            "`a.b`, `example`, `com` — not four"
         );
-
-        // The same in a name-valued RDATA field.
-        assert!(
-            parse_zone_file("www IN CNAME a\\.b.example.com.\n", "example.com.").is_err(),
-            "an escaped dot in a CNAME target"
+        assert_eq!(
+            name.as_ref().labels().next().expect("a first label"),
+            b"a.b"
         );
+        // It goes back out as it came in, so a zone file round trips.
+        assert_eq!(name.to_string(), "a\\.b.example.com.");
 
-        // And an ordinary name with no escape still parses.
-        parse_zone_file("www IN A 192.0.2.1\n", "example.com.").expect("no escape, no problem");
+        // And it is reachable under the name it really has, not under `a.b...`.
+        assert_eq!(
+            zone.query(name.as_ref(), Qtype::of(rt::A)).len(),
+            1,
+            "reachable under the name it was stored as"
+        );
+        assert!(zone
+            .query(nm("a.b.example.com.").as_ref(), Qtype::of(rt::A))
+            .is_empty());
     }
 }

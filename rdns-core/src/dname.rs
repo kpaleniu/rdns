@@ -1,5 +1,4 @@
 use crate::error::WireError;
-use std::str::from_utf8;
 
 /// The two high bits that mark a label as a compression pointer (RFC 1035
 /// §4.1.4).
@@ -35,51 +34,6 @@ pub(crate) fn write_bytes(buf: &mut [u8], pos: usize, bytes: &[u8]) -> Result<us
     Ok(end)
 }
 
-/// Why a label cannot be carried in this library's presentation-text form, if
-/// it cannot.
-///
-/// A wire label may hold any octet (RFC 1035 §3.1), but a name here is a
-/// `String` in presentation form, so two have no faithful spelling: `.`, which
-/// would make the one-label name `a.b` and the two-label name `a`+`b` the same
-/// string and so break every name-keyed map and `is_at_or_under`; and `\`,
-/// RFC 1035 §5.1's escape, which no zone-file reader would read back as the
-/// same name. Refused rather than escaped — resolving escapes needs a stored
-/// form that can hold a dot inside a label, which presentation text cannot.
-fn unrepresentable_octet(label: &str) -> Option<&'static str> {
-    if label.as_bytes().contains(&b'.') {
-        return Some("a label containing the label separator");
-    }
-    if label.as_bytes().contains(&b'\\') {
-        return Some("a label containing an escape character");
-    }
-    None
-}
-
-/// Write one length-prefixed label, validating it first.
-///
-/// The single place a label becomes bytes, shared by [`dname_to_bytes`] and the
-/// message compressor.
-pub(crate) fn write_label(buf: &mut [u8], pos: usize, label: &str) -> Result<usize, WireError> {
-    if let Some(what) = unrepresentable_octet(label) {
-        return Err(WireError::Unsupported { what });
-    }
-    if label.is_empty() {
-        return Err(WireError::malformed(
-            "domain name",
-            "a label may not be empty",
-        ));
-    }
-    if label.len() > MAX_LABEL_LEN {
-        return Err(WireError::TooLong {
-            what: "a label",
-            limit: MAX_LABEL_LEN,
-            actual: label.len(),
-        });
-    }
-    let pos = write_bytes(buf, pos, &[label.len() as u8])?;
-    write_bytes(buf, pos, label.as_bytes())
-}
-
 pub(crate) trait TryFromBytes<'a> {
     type Output;
     type Error;
@@ -100,19 +54,6 @@ impl<'a> Label<'a> {
             Label::String(s) => s.len() + 1,
             Label::Pointer(_) => 2,
             Label::Root => 1,
-        }
-    }
-}
-
-impl<'a> TryInto<&'a str> for Label<'a> {
-    type Error = WireError;
-
-    fn try_into(self) -> Result<&'a str, WireError> {
-        match self {
-            Label::String(s) => {
-                from_utf8(s).map_err(|_| WireError::malformed("a label", "not valid UTF-8"))
-            }
-            _ => Err(WireError::malformed("a label", "not a text label")),
         }
     }
 }
@@ -227,40 +168,12 @@ impl<'a> DName<'a> {
         })
     }
 
-    /// The presentation form of a name that carries no pointer.
+    /// The wire octets of a name that carries no pointer.
     ///
-    /// The common case, and the one worth not routing through
-    /// [`UnpackedDName`]: a QNAME structurally cannot be compressed — nothing
-    /// precedes it to point at — and stored RDATA holds its names uncompressed.
-    fn to_presentation(&self) -> Result<String, WireError> {
-        debug_assert!(!self.compressed, "a pointer needs the message to resolve");
-        check_name_len(self.encoded.len())?;
-        // One octet per label becomes the separator that follows it, so the text
-        // is the encoded length less the root's terminator.
-        let mut out = String::with_capacity(self.encoded.len().saturating_sub(1));
-        for label in self.labels() {
-            match label? {
-                Label::String(s) => push_label(&mut out, s)?,
-                Label::Root => break,
-                Label::Pointer(_) => {
-                    return Err(WireError::malformed(
-                        "a domain name",
-                        "an unpacked name may not contain a compression pointer",
-                    ))
-                }
-            }
-        }
-        Ok(root_if_empty(out))
-    }
-}
-
-/// The wire octets of a name that carries no pointer.
-///
-/// The uncompressed case is a copy: `encoded` already *is* the wire form, and
-/// [`DName::try_from_bytes`] has walked its labels. Only the length is left to
-/// check, and it is checked here rather than trusted because §2.3.4's limit is
-/// on the assembled name (`CLAUDE.md` §17).
-impl DName<'_> {
+    /// The uncompressed case is a copy: `encoded` already *is* the wire form,
+    /// and [`DName::try_from_bytes`] has walked its labels. Only the length is
+    /// left to check, and it is checked here rather than trusted because
+    /// §2.3.4's limit is on the assembled name (`CLAUDE.md` §17).
     fn to_wire(&self) -> Result<Vec<u8>, WireError> {
         debug_assert!(!self.compressed, "a pointer needs the message to resolve");
         check_name_len(self.encoded.len())?;
@@ -275,7 +188,12 @@ impl UnpackedDName<'_> {
     /// §2.3.4's limit, and `unpack_internal` strips the trailing `Root`, which
     /// is why the terminator is added back here.
     fn to_wire(&self) -> Result<Vec<u8>, WireError> {
-        let mut out = Vec::with_capacity(MAX_NAME_LEN);
+        // Exact, not `MAX_NAME_LEN`: `Name` keeps a boxed slice, and shrinking
+        // an over-sized `Vec` reallocates — one copy per compressed name in
+        // every message parsed (`rdns/tests/allocations.rs` read 18 for 15).
+        // `new` has already held this sum to §2.3.4's limit.
+        let len = self.labels.iter().map(Label::len).sum::<usize>() + 1;
+        let mut out = Vec::with_capacity(len);
         for label in &self.labels {
             match label {
                 Label::String(bytes) => {
@@ -296,35 +214,6 @@ impl UnpackedDName<'_> {
         out.push(0);
         Ok(out)
     }
-}
-
-/// One label's text, appended with its separator.
-///
-/// Shared by the two assemblers so neither can drop a rule the other keeps.
-fn push_label(out: &mut String, label: &[u8]) -> Result<(), WireError> {
-    let text = std::str::from_utf8(label)?;
-    // The other end of `unrepresentable_octet`: a name that cannot be spelled
-    // is refused as it is read, so no such `String` ever exists to be compared,
-    // keyed on or written.
-    if let Some(what) = unrepresentable_octet(text) {
-        return Err(WireError::Unsupported { what });
-    }
-    out.push_str(text);
-    out.push('.');
-    Ok(())
-}
-
-/// Every other name ends up with a trailing dot because each label contributes
-/// one. The root has no labels, so it would come back as the empty string —
-/// which is not what the rest of the codebase calls the root, and not what we
-/// put on the wire when we ask for it. A query for `.` (which is exactly what
-/// fetching the root's DNSKEY RRset is) would then fail the reply check, its
-/// question having apparently changed from "." to "" in transit.
-fn root_if_empty(mut name: String) -> String {
-    if name.is_empty() {
-        name.push('.');
-    }
-    name
 }
 
 // RFC 1035 §2.3.1's LDH "preferred name syntax" is advice to whoever chooses a
@@ -465,19 +354,6 @@ impl<'a> DNameUnpacker<'a> {
         self.unpack_internal(name, 0, usize::MAX)
     }
 
-    /// The presentation form of a name already read off the wire.
-    ///
-    /// Split out of [`dname_from_bytes`] so a caller can read *past* a name and
-    /// decode it only if it turns out to want it: an OPT record's owner is the
-    /// root and is discarded (RFC 6891 §6.1.2), and building it cost a `Vec` and
-    /// a `String` on every EDNS query.
-    pub(crate) fn decode(&self, name: DName<'a>) -> Result<String, WireError> {
-        if name.compressed {
-            return self.unpack(name)?.try_into();
-        }
-        name.to_presentation()
-    }
-
     /// The same name as uncompressed wire octets, for [`crate::Name`].
     ///
     /// The sibling of [`DNameUnpacker::decode`]: same walk, same pointer
@@ -526,8 +402,8 @@ impl<'a> UnpackedDName<'a> {
 
 /// The one place RFC 1035 §2.3.4's 255-octet name limit is compared.
 ///
-/// Its two callers — a name off the wire (`UnpackedDName::new`) and one encoded
-/// from presentation text (`dname_to_bytes`) — reach `encoded` by different
+/// Its callers — a name off the wire (`UnpackedDName::new`) and one built from
+/// presentation text ([`crate::Name`]) — reach `encoded` by different
 /// arithmetic, and must agree that it is the encoded length including every
 /// length octet and the root's terminating zero.
 pub(crate) fn check_name_len(encoded: usize) -> Result<(), WireError> {
@@ -565,14 +441,6 @@ pub(crate) fn name_wire_from_bytes_in<'a>(
     Ok((unpacker.decode_wire(name)?, rest))
 }
 
-pub fn dname_from_bytes<'a>(
-    bytes: &'a [u8],
-    unpacker: &DNameUnpacker<'a>,
-) -> Result<(String, &'a [u8]), WireError> {
-    let (name, rest) = DName::try_from_bytes(bytes)?;
-    Ok((unpacker.decode(name)?, rest))
-}
-
 /// Past the name at the start of `data`, returning what follows it.
 ///
 /// For stored RDATA, which [`crate::RecordData`] keeps uncompressed: a pointer
@@ -599,81 +467,6 @@ pub(crate) fn skip_uncompressed_name(data: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// Encode a name in full, without compression.
-///
-/// This is the form stored in RDATA and the one DNSSEC canonical serialization
-/// requires; the message serializer uses the compressor instead.
-pub fn dname_to_bytes(name: &str) -> Result<Vec<u8>, WireError> {
-    let mut buf = [0u8; MAX_NAME_LEN];
-    let len = dname_to_bytes_in(name, &mut buf)?;
-    Ok(buf[..len].to_vec())
-}
-
-/// [`dname_to_bytes`] into a caller's buffer, returning the encoded length.
-///
-/// A name never exceeds [`MAX_NAME_LEN`] encoded, so a caller that throws the
-/// bytes away can put the buffer on the stack: the NSEC3 closest-encloser walk
-/// encodes a name per label of the QNAME (RFC 5155 §8.3) and keeps none of them.
-pub fn dname_to_bytes_in(name: &str, buf: &mut [u8]) -> Result<usize, WireError> {
-    // A fully-qualified name carries a trailing '.' denoting the root; splitting
-    // on '.' would otherwise yield a spurious empty final label (and a second
-    // zero byte), which corrupts any record that stores data after the name.
-    let name = name.strip_suffix('.').unwrap_or(name);
-    if name.is_empty() {
-        return write_bytes(buf, 0, &[0]); // the root, on its own
-    }
-
-    // `size` is the encoded length §2.3.4 limits: one octet per byte of
-    // presentation text holds because a label containing `.` or `\` is refused
-    // rather than escaped, so nothing here encodes shorter than it reads.
-    // Checked before anything is written, so a name about to be refused costs
-    // only the sum.
-    let size: usize = name.split('.').map(|l| l.len() + 1).sum::<usize>() + 1;
-    check_name_len(size)?;
-
-    // `write_label` validates each label as it writes, so nothing is checked
-    // twice here.
-    let mut pos = 0;
-    for label in name.split('.') {
-        pos = write_label(buf, pos, label)?;
-    }
-    write_bytes(buf, pos, &[0]) // terminate with the root label
-}
-
-/// The only route to a string is `bytes -> DName -> unpacker -> UnpackedDName`,
-/// so the type system rules out formatting a name fragment.
-impl<'a> TryInto<String> for UnpackedDName<'a> {
-    fn try_into(self) -> Result<String, Self::Error> {
-        // Phase 1: Calculate exact size needed
-        let mut total_len = 1; // For trailing dot
-        for l in &self.labels {
-            if let Label::String(s) = l {
-                total_len += s.len() + 1; // label + dot
-            }
-        }
-
-        // Phase 2: Single allocation with exact capacity
-        let mut result = String::with_capacity(total_len);
-
-        for l in &self.labels {
-            match l {
-                Label::String(s) => push_label(&mut result, s)?,
-                Label::Pointer(_) => {
-                    return Err(WireError::malformed(
-                        "a domain name",
-                        "an unpacked name may not contain a compression pointer",
-                    ));
-                }
-                Label::Root => break,
-            }
-        }
-
-        Ok(root_if_empty(result))
-    }
-
-    type Error = WireError;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,17 +478,18 @@ mod tests {
             0x00,
         ];
 
-        let lbl = Label::try_from_bytes(&data).expect("www");
-        let lbl: &str = lbl.try_into().unwrap();
-        assert_eq!(lbl, "www");
-
-        let lbl = Label::try_from_bytes(&data[4..]).expect("google");
-        let lbl: &str = lbl.try_into().unwrap();
-        assert_eq!(lbl, "google");
-
-        let lbl = Label::try_from_bytes(&data[11..]).expect("fi");
-        let lbl: &str = lbl.try_into().unwrap();
-        assert_eq!(lbl, "fi");
+        assert_eq!(
+            Label::try_from_bytes(&data).expect("www"),
+            Label::String(b"www")
+        );
+        assert_eq!(
+            Label::try_from_bytes(&data[4..]).expect("google"),
+            Label::String(b"google")
+        );
+        assert_eq!(
+            Label::try_from_bytes(&data[11..]).expect("fi"),
+            Label::String(b"fi")
+        );
 
         assert_eq!(Label::try_from_bytes(&data[14..]).unwrap(), Label::Root);
     }
@@ -708,8 +502,8 @@ mod tests {
         ];
         let unpacker = DNameUnpacker::new(&data);
 
-        let (s, _) = dname_from_bytes(&data, &unpacker).expect("www.google.fi");
-        assert_eq!(s, "www.google.fi.");
+        let (s, _) = crate::Name::from_wire_in(&data, &unpacker).expect("www.google.fi");
+        assert_eq!(s.as_ref().to_presentation(), "www.google.fi.");
     }
 
     #[test]
@@ -720,11 +514,11 @@ mod tests {
         ];
         let unpacker = DNameUnpacker::new(&data);
 
-        let (s, _) = dname_from_bytes(&data, &unpacker).expect("www.google.fi");
-        assert_eq!(s, "www.google.fi.");
+        let (s, _) = crate::Name::from_wire_in(&data, &unpacker).expect("www.google.fi");
+        assert_eq!(s.as_ref().to_presentation(), "www.google.fi.");
 
-        let res = dname_to_bytes("www.google.fi.").expect("www.google.fi");
-        assert!(res.iter().zip(&data).all(|(l, r)| l == r));
+        let back = crate::Name::from_presentation("www.google.fi.").expect("www.google.fi");
+        assert_eq!(back.as_ref().as_wire(), &data);
     }
 
     /// A label header is attacker-controlled, so every read past it must be
@@ -749,11 +543,10 @@ mod tests {
     /// off the wire cannot be written over-long either.
     ///
     /// This was left open by the commit that closed the parse side and is the
-    /// other half of it: `dname_to_bytes` is what a zone file's names go
-    /// through, and it sized its buffer from the name without ever asking
-    /// whether the total was legal. Watched failing against that behaviour —
-    /// without `check_name_len` the over-long cases return `Ok` with a 256- and
-    /// a 321-octet buffer.
+    /// other half of it: the encoder sized its buffer from the name without ever
+    /// asking whether the total was legal. Watched failing against that
+    /// behaviour — without `check_name_len` the over-long cases return `Ok` with
+    /// a 256- and a 321-octet buffer.
     ///
     /// The boundary is tested either side, in presentation lengths: four labels
     /// encoding to exactly 255 octets is fine, and one octet more is not.
@@ -764,12 +557,12 @@ mod tests {
         // 3 x 63 = 192 encoded octets, plus a 61-octet label (62) plus the
         // root's zero is exactly 255.
         let exact = format!("{label}.{label}.{label}.{}.", "x".repeat(61));
-        let bytes = dname_to_bytes(&exact).expect("exactly 255 octets");
-        assert_eq!(bytes.len(), MAX_NAME_LEN);
+        let name = crate::Name::from_presentation(&exact).expect("exactly 255 octets");
+        assert_eq!(name.as_ref().as_wire().len(), MAX_NAME_LEN);
 
         // The same name with one more octet in the last label is 256.
         let over = format!("{label}.{label}.{label}.{}.", "x".repeat(62));
-        let err = dname_to_bytes(&over).expect_err("256 octets");
+        let err = crate::Name::from_presentation(&over).expect_err("256 octets");
         assert!(
             matches!(
                 err,
@@ -782,70 +575,91 @@ mod tests {
             "got {err:?}"
         );
 
-        // And the case that found the parse-side hole, from this direction.
+        // And the case that found the parse-side hole, from this direction. It
+        // reports 256 rather than 321: the encoder stops at the first octet
+        // that does not fit and does not decode the rest to total it up.
         let five = format!("{label}.{label}.{label}.{label}.{label}.");
-        assert!(dname_to_bytes(&five).is_err(), "321 octets");
+        let err = crate::Name::from_presentation(&five).expect_err("321 octets");
+        assert!(
+            matches!(err, WireError::TooLong { actual: 256, .. }),
+            "got {err:?}"
+        );
     }
 
     /// Encoding rejects what it cannot represent, rather than truncating.
     #[test]
-    fn test_dname_to_bytes_rejects_bad_labels() {
-        assert!(dname_to_bytes("a..b.").is_err(), "empty label");
+    fn a_bad_label_is_not_encoded() {
+        let encode = crate::Name::from_presentation;
+        assert!(encode("a..b.").is_err(), "empty label");
         let too_long = "x".repeat(MAX_LABEL_LEN + 1);
-        assert!(dname_to_bytes(&format!("{too_long}.com.")).is_err());
+        assert!(encode(&format!("{too_long}.com.")).is_err());
         // The longest legal label is still fine.
         let max = "x".repeat(MAX_LABEL_LEN);
-        assert!(dname_to_bytes(&format!("{max}.com.")).is_ok());
+        assert!(encode(&format!("{max}.com.")).is_ok());
     }
 
     /// The root encodes to a single zero octet, with or without the dot.
     #[test]
-    fn test_dname_to_bytes_root() {
-        assert_eq!(dname_to_bytes(".").unwrap(), vec![0]);
-        assert_eq!(dname_to_bytes("").unwrap(), vec![0]);
+    fn the_root_encodes_to_one_zero_octet() {
+        assert_eq!(
+            crate::Name::from_presentation(".")
+                .unwrap()
+                .as_ref()
+                .as_wire(),
+            &[0]
+        );
+        assert_eq!(
+            crate::Name::from_presentation("")
+                .unwrap()
+                .as_ref()
+                .as_wire(),
+            &[0]
+        );
     }
 
-    /// A label may hold any octet (RFC 1035 §3.1), `.` included — and this
-    /// library stores a name as presentation text in which `.` is the label
-    /// separator. Both cannot be true, so the name is refused rather than
-    /// silently flattened.
+    /// The one-label name `[03 'a' '.' 'b']` and the two-label `[01 'a' 01 'b']`
+    /// are different names, and both are legal (RFC 2181 §11).
     ///
-    /// Before this check, the one-label name `[03 'a' '.' 'b']` and the
-    /// two-label name `[01 'a' 01 'b']` both read as `"a.b."` — two distinct
-    /// names collapsing onto one string, which every name-keyed map and every
-    /// tree-shaped question in this codebase assumes cannot happen. The visible
-    /// consequence was `is_at_or_under("evil.com.", "com.")` answering true
-    /// for a single label that is a *sibling* of `com.`, not a child of it.
-    ///
-    /// NOTIMP rather than FORMERR: the sender is not at fault. A legal encoding
-    /// we decline to represent, as `Label` already does for binary labels.
+    /// Presentation storage read both as `"a.b."` — two names collapsing onto
+    /// one string, which every name-keyed map and every tree-shaped question
+    /// here assumes cannot happen. `is_at_or_under("evil.com.", "com.")`
+    /// answered true for a single label that is a *sibling* of `com.`. #13e
+    /// closed that by refusing the first, at the price D-1 named; wire storage
+    /// keeps both, and this asserts they stay apart.
     #[test]
-    fn a_label_containing_the_separator_is_refused() {
+    fn a_label_containing_the_separator_is_its_own_name() {
         // ONE label: 'a', '.', 'b'.
         let one_label: &[u8] = &[0x03, b'a', b'.', b'b', 0x00];
         let unpacker = DNameUnpacker::new(one_label);
-        let err = dname_from_bytes(one_label, &unpacker)
-            .expect_err("a dot inside a label cannot be represented");
-        assert!(matches!(err, WireError::Unsupported { .. }), "got {err:?}");
+        let (one, _) = crate::Name::from_wire_in(one_label, &unpacker).expect("one label");
+        assert_eq!(one.as_ref().label_count(), 1);
+        assert_eq!(one.as_ref().labels().next(), Some(&b"a.b"[..]));
 
-        // TWO labels spelling the same string are the ordinary name, and fine.
+        // TWO labels, which the text form could not tell from the first.
         let two_labels: &[u8] = &[0x01, b'a', 0x01, b'b', 0x00];
         let unpacker = DNameUnpacker::new(two_labels);
-        let (name, _) = dname_from_bytes(two_labels, &unpacker).expect("an ordinary name");
-        assert_eq!(name, "a.b.");
+        let (two, _) = crate::Name::from_wire_in(two_labels, &unpacker).expect("two labels");
+        assert_eq!(two.as_ref().label_count(), 2);
+        assert_ne!(one, two, "the collapse D-1 was about");
+
+        // And the tree question they used to answer the same way.
+        assert!(!one
+            .as_ref()
+            .is_at_or_under(two.as_ref().parent().expect("`b.`")));
     }
 
-    /// The same judgement for a backslash, and for the same reason one step
-    /// removed: a stored name is presentation text, and presentation text reads
-    /// `\` as an escape (RFC 1035 §5.1). A label holding one would be written
-    /// into a zone file that no correct reader — including this one — reads back
-    /// as the same name.
+    /// The same for a backslash: RFC 1035 §5.1's escape is a spelling, not a
+    /// restriction on what a label may hold, and `to_presentation` writes it
+    /// back as `\\` so a zone file reads the same octets.
     #[test]
-    fn a_label_containing_a_backslash_is_refused() {
+    fn a_label_containing_a_backslash_survives() {
         let wire: &[u8] = &[0x03, b'a', 0x5c, b'b', 0x00];
         let unpacker = DNameUnpacker::new(wire);
-        let err = dname_from_bytes(wire, &unpacker).expect_err("an escape character");
-        assert!(matches!(err, WireError::Unsupported { .. }), "got {err:?}");
+        let (name, _) =
+            crate::Name::from_wire_in(wire, &unpacker).expect("a backslash is an octet");
+        assert_eq!(name.as_ref().labels().next(), Some(&b"a\\b"[..]));
+        assert_eq!(name.as_ref().to_presentation(), r"a\\b.");
+        assert_eq!(name.as_ref().as_wire(), wire);
     }
 
     #[test]
@@ -984,11 +798,11 @@ mod tests {
         ];
         let unpacker = DNameUnpacker::new(&data);
 
-        let (name, _) = dname_from_bytes(&data[4..], &unpacker).expect("one hop");
-        assert_eq!(name, "a.b.");
+        let (name, _) = crate::Name::from_wire_in(&data[4..], &unpacker).expect("one hop");
+        assert_eq!(name.as_ref().to_presentation(), "a.b.");
 
-        let (name, _) = dname_from_bytes(&data[8..], &unpacker).expect("two hops");
-        assert_eq!(name, "w.a.b.");
+        let (name, _) = crate::Name::from_wire_in(&data[8..], &unpacker).expect("two hops");
+        assert_eq!(name.as_ref().to_presentation(), "w.a.b.");
     }
 
     /// Build an uncompressed name of `labels` labels of `len` octets each,
@@ -1020,7 +834,7 @@ mod tests {
         // 5 x 63 = 321 encoded octets. The case from the probe that found this.
         let data = wire_name(5, MAX_LABEL_LEN);
         let unpacker = DNameUnpacker::new(&data);
-        let err = dname_from_bytes(&data, &unpacker).expect_err("321 octets");
+        let err = crate::Name::from_wire_in(&data, &unpacker).expect_err("321 octets");
         assert!(
             matches!(
                 err,
@@ -1043,8 +857,12 @@ mod tests {
         exact.push(0);
         assert_eq!(exact.len(), MAX_NAME_LEN);
         let unpacker = DNameUnpacker::new(&exact);
-        let (name, _) = dname_from_bytes(&exact, &unpacker).expect("exactly 255 octets");
-        assert_eq!(name.len(), 63 * 3 + 61 + 4, "three dots and one more");
+        let (name, _) = crate::Name::from_wire_in(&exact, &unpacker).expect("exactly 255 octets");
+        assert_eq!(
+            name.as_ref().as_wire().len(),
+            MAX_NAME_LEN,
+            "the encoded length is what §2.3.4 limits"
+        );
 
         let mut over = wire_name(3, MAX_LABEL_LEN);
         over.pop();
@@ -1054,7 +872,7 @@ mod tests {
         assert_eq!(over.len(), MAX_NAME_LEN + 1);
         let unpacker = DNameUnpacker::new(&over);
         assert!(
-            dname_from_bytes(&over, &unpacker).is_err(),
+            crate::Name::from_wire_in(&over, &unpacker).is_err(),
             "256 octets is one too many"
         );
     }
@@ -1084,10 +902,12 @@ mod tests {
         let unpacker = DNameUnpacker::new(&data);
 
         // The prefix alone resolves: this is not a message that is broken.
-        let (name, _) = dname_from_bytes(&data[..tail], &unpacker).expect("the 128-octet half");
-        assert_eq!(name.len(), 63 * 2 + 2);
+        let (name, _) =
+            crate::Name::from_wire_in(&data[..tail], &unpacker).expect("the 128-octet half");
+        assert_eq!(name.as_ref().as_wire().len(), 63 * 2 + 2 + 1);
 
-        let err = dname_from_bytes(&data[tail..], &unpacker).expect_err("257 octets resolved");
+        let err =
+            crate::Name::from_wire_in(&data[tail..], &unpacker).expect_err("257 octets resolved");
         assert!(
             matches!(
                 err,

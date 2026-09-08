@@ -16,15 +16,14 @@ use rdns::compression::NameCompressor;
 use rdns::error::WireError;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::response::{ResponseWriter, Section};
-use rdns::utils::{
-    absolute_lowered, absolute_lowered_in, dname_redirect, is_at_or_under, record_types, Redirect,
-};
+use rdns::utils::{dname_redirect, record_types, Redirect};
 use rdns::zone::{Located, NameKind, Zone, ZoneRecord};
 use rdns::Class;
 use rdns::Qtype;
 use rdns::Ttl;
 use rdns::{
-    dnssec_answer, DnsMessage, Edns, OpCode, ParsedRecord, QueryClass, RecordData, ResponseCode,
+    dnssec_answer, DnsMessage, Edns, Name, NameRef, OpCode, ParsedRecord, QueryClass, RecordData,
+    ResponseCode,
 };
 
 use crate::zones::Zones;
@@ -123,7 +122,7 @@ fn answer_question(
     query: &rdns::QuerySection,
     zones: &Zones,
     dnssec_ok: bool,
-    key_buf: &mut String,
+    _key_buf: &mut String,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
     // Every zone here is IN, and RFC 1034 §4.3.2 step 1 searches the zones
@@ -151,7 +150,7 @@ fn answer_question(
     // TSIG session and message packing all live on the TCP path. The SOA
     // discloses nothing an ordinary SOA query does not.
     if query.qtype == Qtype::IXFR {
-        match zones.for_query(&query.qname) {
+        match zones.for_query(query.qname.as_ref()) {
             Some(zone) => {
                 for soa in zone.query(zone.origin(), Qtype::of(record_types::SOA)) {
                     w.push(
@@ -180,8 +179,7 @@ fn answer_question(
     // this path for a DNS-0x20 query: the folded name has to outlive the
     // question and a UDP worker can hold the bytes for the life of the process
     // (#27d's remainder).
-    let key = absolute_lowered_in(&query.qname, key_buf);
-    let Some(zone) = zones.for_query(key) else {
+    let Some(zone) = zones.for_query(query.qname.as_ref()) else {
         // A zone we do not serve is REFUSED, not NXDOMAIN. NXDOMAIN asserts
         // the name exists nowhere, which we have no standing to say, and a
         // resolver caches it (RFC 2308). BIND, NSD and Knot all answer
@@ -192,26 +190,21 @@ fn answer_question(
         return Ok(());
     };
 
-    match resolve_in_zone(zone, &query.qname, key, query.qtype) {
-        Outcome::Referral { cut } => refer_to_child(zone, &cut, dnssec_ok, w),
-        Outcome::Answer {
-            chain,
-            name,
-            key,
-            at,
-        } => {
+    match resolve_in_zone(zone, &query.qname, query.qtype) {
+        Outcome::Referral { cut } => refer_to_child(zone, cut.as_ref(), dnssec_ok, w),
+        Outcome::Answer { chain, name, at } => {
             let owed = add_chain(zone, &chain, dnssec_ok, w)?;
-            let target_owed = add_answer(&at, &name, &key, query.qtype, dnssec_ok, w)?;
+            let target_owed = add_answer(&at, name.as_ref().as_ref(), query.qtype, dnssec_ok, w)?;
             add_chain_denials(zone, &chain, owed, w)?;
             if target_owed {
-                dnssec_answer::push_proof_of_absence(zone, &key, w)?;
+                dnssec_answer::push_proof_of_absence(zone, name.as_ref().as_ref(), w)?;
             }
             Ok(())
         }
         Outcome::Negative { chain, name, kind } => {
             let owed = add_chain(zone, &chain, dnssec_ok, w)?;
             add_chain_denials(zone, &chain, owed, w)?;
-            add_negative(zone, &name, &kind, dnssec_ok, w)
+            add_negative(zone, name.as_ref().as_ref(), &kind, dnssec_ok, w)
         }
         Outcome::ChainLeftZone { chain } => {
             let owed = add_chain(zone, &chain, dnssec_ok, w)?;
@@ -236,7 +229,7 @@ fn answer_question(
 enum Hop {
     /// A CNAME RRset at `owner`, with its own signature and its own wildcard
     /// denial.
-    Cname(String),
+    Cname(Name),
     /// A DNAME redirection. `owner` is where the DNAME is, which is what the
     /// answer carries with its signature; `from` is the name the client asked,
     /// which owns the synthesized CNAME; `to` is the substituted name, or
@@ -244,9 +237,9 @@ enum Hop {
     /// with YXDOMAIN *before* synthesizing a CNAME, and §2.2 still sends the
     /// DNAME "as proof for the YXDOMAIN (value 6) RCODE".
     Dname {
-        owner: String,
-        from: String,
-        to: Option<String>,
+        owner: Name,
+        from: Name,
+        to: Option<Name>,
         /// The DNAME's own TTL and class, for the CNAME synthesized from it:
         /// "A CNAME RR with Time to Live (TTL) equal to the corresponding
         /// DNAME RR is synthesized" (§3.1). Carried rather than looked up
@@ -259,10 +252,10 @@ enum Hop {
 
 impl Hop {
     /// The name whose RRset goes into the answer section for this hop.
-    fn owner(&self) -> &str {
+    fn owner(&self) -> NameRef<'_> {
         match self {
-            Hop::Cname(owner) => owner,
-            Hop::Dname { owner, .. } => owner,
+            Hop::Cname(owner) => owner.as_ref(),
+            Hop::Dname { owner, .. } => owner.as_ref(),
         }
     }
 }
@@ -276,13 +269,12 @@ impl Hop {
 enum Outcome<'a> {
     /// The zone's authority stops at `cut`: the answer is a referral to the
     /// child, with AA clear (RFC 1035 §4.1.1).
-    Referral { cut: String },
+    Referral { cut: Name },
     /// There are records for the question at `name`, reached through the
     /// redirections at `chain` (empty in the ordinary case).
     Answer {
         chain: Vec<Hop>,
-        name: Cow<'a, str>,
-        key: Cow<'a, str>,
+        name: Cow<'a, Name>,
         /// The lookup that found them, carried rather than repeated: writing
         /// the records and their signatures used to locate the same name twice
         /// more (`TODO.md` #25a).
@@ -292,7 +284,7 @@ enum Outcome<'a> {
     /// when one was followed — and `kind` decides NXDOMAIN against NODATA.
     Negative {
         chain: Vec<Hop>,
-        name: Cow<'a, str>,
+        name: Cow<'a, Name>,
         kind: NameKind,
     },
     /// The chain walked out of this zone: NOERROR with the aliases we hold and
@@ -324,38 +316,43 @@ pub(crate) const MAX_REDIRECTS: usize = 16;
 /// matters: authority ends here, the name has the data, the name is an alias,
 /// the name has no such data. Getting the first one last is how a parent answers
 /// NXDOMAIN for a child's names.
-/// `qkey` is `qname` folded, which the caller has already paid for: `Zone`'s
-/// entry points fold their argument and `ascii_lowered_cow` borrows when there
-/// is nothing left to fold, so passing the folded form makes every lookup below
-/// free. A case-randomized query folded its name three times before this
-/// (`TODO.md` #27a).
-fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a str, qkey: &'a str, qtype: Qtype) -> Outcome<'a> {
+fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome<'a> {
     let mut chain: Vec<Hop> = Vec::new();
-    let mut visited: Vec<String> = Vec::new();
-    let mut name: Cow<'a, str> = Cow::Borrowed(qname);
-    let mut key: Cow<'a, str> = Cow::Borrowed(qkey);
+    let mut visited: Vec<Name> = Vec::new();
+    let mut name: Cow<'a, Name> = Cow::Borrowed(qname);
+    let mut key_buf = Vec::new();
 
     for _ in 0..MAX_REDIRECTS {
+        // Folded once per name, not once per lookup. Every `Zone` entry point
+        // folds its argument and `NameRef::folded_in` borrows when there is
+        // nothing left to fold, so the three lookups below see a name already
+        // lower-case and copy nothing. A case-randomized query — ordinary
+        // traffic, not an attack — folded its name three times without this
+        // (`TODO.md` #27a). `name` keeps the case it was asked in, which is
+        // what goes back out.
+        let key = name.as_ref().as_ref().folded_in(&mut key_buf);
+
         // The DNAME that redirects this name, if any: RFC 6672 §2.2, and
         // strictly above it, because a DNAME does not redirect its own owner
         // (§2.3). Asked before the name is looked up, not after: a name below a
         // DNAME owner is occluded (RFC 2136 §7.18), so whether the zone happens
         // to hold records there cannot change the answer.
-        let redirect = zone.dname_above_key(&key);
+        let redirect = zone.dname_above(key);
 
         // A delegation is a referral whatever the type, with two exceptions.
-        if let Some(cut) = zone.delegation_for(&key) {
+        if let Some(cut) = zone.delegation_for(key) {
             // A DNAME above the cut occludes it. Whichever of the two is
             // shallower is the one RFC 1034 §4.3.2's "start matching down,
             // label by label" reaches first. `check_dname_rules` refuses a zone
             // with both on one path — an NS below a DNAME owner is a record at
             // a subdomain of it (RFC 6672 §2.4) — so this decides only for a
             // zone that arrived by transfer or was built by UPDATE (§5.2).
-            let occluded = redirect.is_some_and(|dname| is_at_or_under(&cut, &dname.name));
+            let occluded =
+                redirect.is_some_and(|dname| cut.as_ref().is_at_or_under(dname.name.as_ref()));
             // The DS *at* the cut is the parent's own statement about the
             // child, which the child does not hold and could not be asked
             // (RFC 4035 §3.1.4.1).
-            let ds_at_the_cut = qtype.is(record_types::DS) && cut == *key;
+            let ds_at_the_cut = qtype.is(record_types::DS) && cut == *name;
             if !(occluded || ds_at_the_cut) {
                 return if chain.is_empty() {
                     Outcome::Referral { cut }
@@ -369,15 +366,14 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a str, qkey: &'a str, qtype: Qty
         }
 
         if let Some(dname) = redirect {
-            match redirect_through(dname, name, &mut chain) {
+            match redirect_through(dname, name.into_owned(), &mut chain) {
                 Ok(next) => {
-                    visited.push(key.into_owned());
-                    let next_key = absolute_lowered(&next).into_owned();
-                    if !in_zone(zone, &next_key) || visited.contains(&next_key) {
+                    visited.push(next.clone());
+                    if !in_zone(zone, next.as_ref()) || visited[..visited.len() - 1].contains(&next)
+                    {
                         return Outcome::ChainLeftZone { chain };
                     }
                     name = Cow::Owned(next);
-                    key = Cow::Owned(next_key);
                     continue;
                 }
                 Err(rcode) => return Outcome::Stopped { chain, rcode },
@@ -389,12 +385,11 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a str, qkey: &'a str, qtype: Qty
         // walked the ancestors and folded the name again (`TODO.md` #28b). The
         // records are not collected — this asks only whether there are any
         // (#27c).
-        let located = zone.locate(&key);
+        let located = zone.locate(key);
         if located.has_type(qtype) {
             return Outcome::Answer {
                 chain,
                 name,
-                key,
                 at: located,
             };
         }
@@ -422,16 +417,13 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a str, qkey: &'a str, qtype: Qty
             return Outcome::Negative { chain, name, kind };
         };
         chain.push(Hop::Cname(name.into_owned()));
-        visited.push(key.into_owned());
-
-        // Folded for `visited`, an equality test against folded names; `in_zone`
-        // does not need it to be.
-        let target_key = absolute_lowered(&target).into_owned();
-        if !in_zone(zone, &target_key) || visited.contains(&target_key) {
+        // `visited` compares as names, which fold as they go — so there is no
+        // folded copy of each hop to keep any more.
+        visited.push(target.clone());
+        if !in_zone(zone, target.as_ref()) || visited[..visited.len() - 1].contains(&target) {
             return Outcome::ChainLeftZone { chain };
         }
         name = Cow::Owned(target);
-        key = Cow::Owned(target_key);
     }
     Outcome::ChainLeftZone { chain }
 }
@@ -443,9 +435,9 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a str, qkey: &'a str, qtype: Qty
 /// RFC 6672 §2.2 sends "as proof for the YXDOMAIN (value 6) RCODE".
 fn redirect_through(
     dname: &ZoneRecord,
-    from: Cow<'_, str>,
+    from: Name,
     chain: &mut Vec<Hop>,
-) -> Result<String, ResponseCode> {
+) -> Result<Name, ResponseCode> {
     let Ok(ParsedRecord::DNAME(target)) = dname.rdata.parse() else {
         // A DNAME whose RDATA will not read still occludes everything below it,
         // so falling through to the name underneath would serve data this zone
@@ -454,8 +446,7 @@ fn redirect_through(
         // `RecordData::parse` is what built it.
         return Err(ResponseCode::ServerFailure);
     };
-    let from = from.into_owned();
-    let to = match dname_redirect(&from, &dname.name, &target) {
+    let to = match dname_redirect(from.as_ref(), dname.name.as_ref(), target.as_ref()) {
         Redirect::To(next) => Some(next),
         Redirect::TooLong => None,
         // `Zone::dname_above` found this DNAME strictly above the name, so the
@@ -480,8 +471,8 @@ fn redirect_through(
 
 /// Whether a name is at or below this zone's apex. [`rdns::utils::is_at_or_under`]
 /// compares case-insensitively itself, so callers need not fold first.
-fn in_zone(zone: &Zone, name: &str) -> bool {
-    rdns::utils::is_at_or_under(name, zone.origin())
+fn in_zone(zone: &Zone, name: NameRef<'_>) -> bool {
+    name.is_at_or_under(zone.origin())
 }
 
 /// Put the records of `qtype` at `name` into the answer section, with their
@@ -499,8 +490,7 @@ fn in_zone(zone: &Zone, name: &str) -> bool {
 /// serves for all).
 fn add_answer(
     at: &Located,
-    name: &str,
-    key: &str,
+    name: NameRef<'_>,
     qtype: Qtype,
     dnssec_ok: bool,
     w: &mut ResponseWriter,
@@ -518,7 +508,7 @@ fn add_answer(
     if !dnssec_ok {
         return Ok(false);
     }
-    dnssec_answer::push_answer_signatures(at, key, qtype, w)
+    dnssec_answer::push_answer_signatures(at, name, qtype, w)
 }
 
 /// The redirections walked to reach the answer, in the order they were
@@ -538,14 +528,13 @@ fn add_chain(
     const _: () = assert!(MAX_REDIRECTS <= u32::BITS as usize, "one bit per hop");
     let mut owed = 0u32;
     for (i, hop) in chain.iter().enumerate() {
-        // Folded here rather than carried: a chain is empty on the ordinary
-        // answer, so this pays only where a redirection was actually followed.
-        let key = absolute_lowered(hop.owner());
+        // No fold here any more: `Zone::locate` folds what its index needs,
+        // and the hop's own name is what the answer echoes.
         let qtype = match hop {
             Hop::Cname(_) => Qtype::of(record_types::CNAME),
             Hop::Dname { .. } => Qtype::of(record_types::DNAME),
         };
-        if add_answer(&zone.locate(&key), hop.owner(), &key, qtype, dnssec_ok, w)? {
+        if add_answer(&zone.locate(hop.owner()), hop.owner(), qtype, dnssec_ok, w)? {
             owed |= 1 << i;
         }
 
@@ -567,7 +556,7 @@ fn add_chain(
         } = hop
         {
             let rdata = RecordData::from_parsed(&ParsedRecord::CNAME(to.clone()))?;
-            w.push(Section::Answer, from, *class, *ttl, &rdata)?;
+            w.push(Section::Answer, from.as_ref(), *class, *ttl, &rdata)?;
         }
     }
     Ok(owed)
@@ -586,7 +575,7 @@ fn add_chain_denials(
     }
     for (i, hop) in chain.iter().enumerate() {
         if owed & (1 << i) != 0 {
-            dnssec_answer::push_proof_of_absence(zone, &absolute_lowered(hop.owner()), w)?;
+            dnssec_answer::push_proof_of_absence(zone, hop.owner(), w)?;
         }
     }
     Ok(())
@@ -596,7 +585,7 @@ fn add_chain_denials(
 /// and the proof of it when the client can check one.
 fn add_negative(
     zone: &Zone,
-    name: &str,
+    name: NameRef<'_>,
     kind: &NameKind,
     dnssec_ok: bool,
     w: &mut ResponseWriter,
@@ -660,13 +649,13 @@ fn negative_ttl(soa: &rdns::zone::ZoneRecord) -> Ttl {
 /// off the internet for the negative TTL.
 fn refer_to_child(
     zone: &Zone,
-    cut: &str,
+    cut: NameRef<'_>,
     dnssec_ok: bool,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
     w.set_authoritative(false);
 
-    let mut targets: Vec<String> = Vec::new();
+    let mut targets: Vec<Name> = Vec::new();
     for ns in zone.query(cut, Qtype::of(record_types::NS)) {
         if let Ok(rdns::ParsedRecord::NS(target)) = ns.rdata.parse() {
             targets.push(target);
@@ -687,15 +676,14 @@ fn refer_to_child(
     // anything discards the latter, and sending it is how cache-poisoning
     // attempts look (RFC 1034 §4.2.1).
     for target in targets {
-        // No fold: `is_at_or_under` compares case-insensitively already.
-        if !in_zone(zone, &zone.normalize_name(&target)) {
+        if !in_zone(zone, target.as_ref()) {
             continue;
         }
         for rtype in [record_types::A, record_types::AAAA] {
-            for glue in zone.query(&target, Qtype::of(rtype)) {
+            for glue in zone.query(target.as_ref(), Qtype::of(rtype)) {
                 w.push(
                     Section::Additional,
-                    &target,
+                    target.as_ref(),
                     glue.class,
                     glue.ttl,
                     &glue.rdata,
@@ -714,7 +702,7 @@ fn refer_to_child(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{make_response, query};
+    use crate::testutil::{make_response, nm, query};
     use rdns::zone::parse_zone_file;
     use rdns::{ResourceRecord, Rtype};
 
@@ -772,17 +760,18 @@ x.sub2   IN A   192.0.2.30
 
         let dnames = rdatas(&response.answers, record_types::DNAME);
         assert_eq!(dnames.len(), 1, "the DNAME itself is in the answer (§3.1)");
-        assert_eq!(dnames[0].name, "redir.example.com.");
+        assert_eq!(dnames[0].name, nm("redir.example.com."));
 
         let cnames = rdatas(&response.answers, record_types::CNAME);
         assert_eq!(cnames.len(), 1);
         assert_eq!(
-            cnames[0].name, "a.redir.example.com.",
+            cnames[0].name,
+            nm("a.redir.example.com."),
             "§3.1: the owner name of the CNAME is the QNAME of the query"
         );
         assert_eq!(
             cnames[0].rdata.parse().unwrap(),
-            ParsedRecord::CNAME("a.target.example.net.".to_string())
+            ParsedRecord::CNAME(nm("a.target.example.net."))
         );
         assert_eq!(
             cnames[0].ttl, dnames[0].ttl,
@@ -808,7 +797,7 @@ x.sub2   IN A   192.0.2.30
         // QTYPE = DNAME: the result is the owner name, answered from it.
         let response = ask("redir.example.com.", Qtype::of(record_types::DNAME));
         assert_eq!(response.answers.len(), 1);
-        assert_eq!(response.answers[0].name, "redir.example.com.");
+        assert_eq!(response.answers[0].name, nm("redir.example.com."));
         assert_eq!(response.answers[0].rdata.rtype(), record_types::DNAME);
     }
 
@@ -823,7 +812,7 @@ x.sub2   IN A   192.0.2.30
 
         let a = rdatas(&response.answers, record_types::A);
         assert_eq!(a.len(), 1);
-        assert_eq!(a[0].name, "x.sub2.example.com.");
+        assert_eq!(a[0].name, nm("x.sub2.example.com."));
         assert_eq!(
             a[0].rdata.parse().unwrap(),
             ParsedRecord::A("192.0.2.30".parse().unwrap())
@@ -837,7 +826,7 @@ x.sub2   IN A   192.0.2.30
         let response = ask("A.ReDiR.example.com.", Qtype::of(record_types::A));
         let cnames = rdatas(&response.answers, record_types::CNAME);
         assert_eq!(cnames.len(), 1);
-        assert_eq!(cnames[0].name, "A.ReDiR.example.com.");
+        assert_eq!(cnames[0].name, nm("A.ReDiR.example.com."));
     }
 
     /// RFC 6672 §2.2: "The domain name can get too long during substitution...
@@ -905,7 +894,7 @@ x.sub2   IN A   192.0.2.30
     fn a_record_below_a_dname_owner_is_occluded_not_answered() {
         let mut zone = parse_zone_file(ZONE, "example.com.").expect("the test zone parses");
         zone.add_record(rdns::zone::ZoneRecord {
-            name: "occluded.redir.example.com.".to_string(),
+            name: nm("occluded.redir.example.com."),
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.66".parse().unwrap()))
@@ -983,13 +972,15 @@ x.sub2   IN A   192.0.2.30
             let response = ask(asked, Qtype::of(record_types::A));
             assert_eq!(response.rcode, ResponseCode::Ok, "{asked}");
             assert_eq!(
-                response.queries[0].qname, asked,
+                response.queries[0].qname,
+                nm(asked),
                 "the question is echoed as asked"
             );
             let answers = rdatas(&response.answers, record_types::A);
             assert_eq!(answers.len(), 1, "{asked}: the same record is found");
             assert_eq!(
-                answers[0].name, asked,
+                answers[0].name,
+                nm(asked),
                 "the owner name is echoed as asked, not folded"
             );
         }
@@ -1007,11 +998,11 @@ x.sub2   IN A   192.0.2.30
         assert!(response.authoritive);
         let cnames = rdatas(&response.answers, record_types::CNAME);
         assert_eq!(cnames.len(), 1, "the alias itself comes first");
-        assert_eq!(cnames[0].name, "www.example.com.");
+        assert_eq!(cnames[0].name, nm("www.example.com."));
 
         let addresses = rdatas(&response.answers, record_types::A);
         assert_eq!(addresses.len(), 1, "and the data it points at");
-        assert_eq!(addresses[0].name, "host.example.com.");
+        assert_eq!(addresses[0].name, nm("host.example.com."));
         assert!(
             response.authorities.is_empty(),
             "an answer is not a negative answer and owes no SOA"
@@ -1075,7 +1066,7 @@ x.sub2   IN A   192.0.2.30
             2,
             "the child's NS RRset, in the authority section"
         );
-        assert!(ns.iter().all(|r| r.name == "sub.example.com."));
+        assert!(ns.iter().all(|r| r.name == nm("sub.example.com.")));
         assert!(
             rdatas(&response.authorities, record_types::SOA).is_empty(),
             "a referral carries no SOA — it is not a negative answer"
@@ -1085,7 +1076,7 @@ x.sub2   IN A   192.0.2.30
         // assertion about a zone we do not serve.
         let glue = rdatas(&response.additionals, record_types::A);
         assert_eq!(glue.len(), 1, "{:?}", response.additionals);
-        assert_eq!(glue[0].name, "ns.sub.example.com.");
+        assert_eq!(glue[0].name, nm("ns.sub.example.com."));
     }
 
     /// The wildcard at the apex must not answer for a name below the cut
@@ -1138,7 +1129,11 @@ x.sub2   IN A   192.0.2.30
         assert_eq!(response.rcode, ResponseCode::Ok);
         let addresses = rdatas(&response.answers, record_types::A);
         assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].name, "a.b.c.example.com.", "echoed as asked");
+        assert_eq!(
+            addresses[0].name,
+            nm("a.b.c.example.com."),
+            "echoed as asked"
+        );
     }
 
     /// RFC 4592 §2.2.2: a name with descendants exists. NXDOMAIN here is the
@@ -1232,7 +1227,7 @@ x.sub2   IN A   192.0.2.30
     fn two_questions_in_one_query_are_a_format_error() {
         let mut msg = query("www.example.com.", Qtype::of(record_types::A), false);
         msg.queries.push(rdns::QuerySection {
-            qname: "host.example.com.".to_string(),
+            qname: nm("host.example.com."),
             qtype: Qtype::of(record_types::A),
             qclass: QueryClass::IN,
         });
@@ -1392,7 +1387,7 @@ x.sub2   IN A   192.0.2.30
         assert_eq!(response.rcode, ResponseCode::Ok);
         assert_eq!(response.answers.len(), 1);
         assert_eq!(response.answers[0].rdata.rtype(), record_types::CNAME);
-        assert_eq!(response.answers[0].name, "www.example.com.");
+        assert_eq!(response.answers[0].name, nm("www.example.com."));
     }
 
     /// And a name that does not exist is still NXDOMAIN under ANY: matching

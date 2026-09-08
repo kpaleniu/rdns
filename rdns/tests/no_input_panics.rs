@@ -22,8 +22,16 @@ use rdns::validation::AdmissionCheck;
 use rdns::zone::{parse_zone_file, NameKind, Zone};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
 use rdns::{
-    dnssec_answer, tsig, DnsMessage, DnsMessageBuilder, Edns, EdnsOption, Qtype, ResourceRecord,
+    dnssec_answer, tsig, DnsMessage, DnsMessageBuilder, Edns, EdnsOption, Name, Qtype,
+    ResourceRecord,
 };
+
+/// A name from a literal, for tests only: `Name` is fallible to build and a test
+/// that writes a bad one should fail loudly at that line.
+#[allow(dead_code)]
+fn nm(text: &str) -> Name {
+    text.parse().expect("a test name parses")
+}
 
 /// Cases per corpus entry. Small enough to stay under a second in CI.
 const ITERATIONS: usize = 250;
@@ -76,7 +84,7 @@ fn zone_text() -> String {
 fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
     DnsMessageBuilder::new()
         .with_id(0x1234)
-        .with_query(qname, qtype)
+        .with_query(nm(qname), qtype)
         .with_recursion(false)
         .build()
 }
@@ -140,9 +148,9 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
         ("svc.example.com.", record_types::HTTPS),
         ("svc.example.com.", record_types::SVCB),
     ] {
-        for record in zone.query(name, Qtype::of(qtype)) {
+        for record in zone.query(nm(name).as_ref(), Qtype::of(qtype)) {
             answer.answers.push(ResourceRecord {
-                name: name.to_string(),
+                name: nm(name),
                 class: record.class,
                 ttl: record.ttl,
                 rdata: record.rdata.clone(),
@@ -166,9 +174,9 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
         ("example.com.", record_types::NSEC3),
         ("example.com.", record_types::NSEC3PARAM),
     ] {
-        for record in signed.query(name, Qtype::of(qtype)) {
+        for record in signed.query(nm(name).as_ref(), Qtype::of(qtype)) {
             secure.answers.push(ResourceRecord {
-                name: name.to_string(),
+                name: nm(name),
                 class: record.class,
                 ttl: record.ttl,
                 rdata: record.rdata.clone(),
@@ -182,9 +190,9 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
 
     // The one query that carries a record of its own, in the authority section.
     let mut ixfr = query_message("example.com.", Qtype::of(record_types::IXFR));
-    for soa in zone.query("example.com.", Qtype::of(record_types::SOA)) {
+    for soa in zone.query(nm("example.com.").as_ref(), Qtype::of(record_types::SOA)) {
         ixfr.authorities.push(ResourceRecord {
-            name: "example.com.".to_string(),
+            name: nm(&nm("example.com.").to_string()),
             class: soa.class,
             ttl: soa.ttl,
             rdata: soa.rdata.clone(),
@@ -298,13 +306,12 @@ fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring
     // What `make_response` does with the question it was given.
     for query in &msg.queries {
         for z in [zone, signed] {
-            let _ = z.query(&query.qname, query.qtype);
-            let kind = z.name_kind(&query.qname);
-            let _ = z.name_exists(&query.qname);
-            let _ = z.holds_name(&query.qname);
-            let _ = z.delegation_for(&query.qname);
-            let _ = z.normalize_name(&query.qname);
-            let _ = z.matches_query("www.example.com.", &query.qname);
+            let _ = z.query(query.qname.as_ref(), query.qtype);
+            let kind = z.name_kind(query.qname.as_ref());
+            let _ = z.name_exists(query.qname.as_ref());
+            let _ = z.holds_name(query.qname.as_ref());
+            let _ = z.delegation_for(query.qname.as_ref());
+            let _ = z.matches_query(nm("www.example.com.").as_ref(), query.qname.as_ref());
 
             // The DO-bit path: signatures, and the three denials. Each into
             // its own reply, because the writer takes sections in order.
@@ -323,25 +330,30 @@ fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring
                 let _ = w.finish();
             };
             into(&mut |w| {
-                let canonical = rdns::dnssec::canonical_name(&query.qname);
+                let canonical = query.qname.as_ref().to_folded();
                 let _ = dnssec_answer::push_answer_signatures(
-                    &z.locate(&canonical),
-                    &canonical,
+                    &z.locate(canonical.as_ref()),
+                    canonical.as_ref(),
                     query.qtype,
                     w,
                 );
             });
             into(&mut |w| {
-                let _ = dnssec_answer::push_negative_proof(z, &query.qname, &kind, w);
+                let _ = dnssec_answer::push_negative_proof(z, query.qname.as_ref(), &kind, w);
             });
             into(&mut |w| {
-                let _ = dnssec_answer::push_negative_proof(z, &query.qname, &NameKind::NotFound, w);
+                let _ = dnssec_answer::push_negative_proof(
+                    z,
+                    query.qname.as_ref(),
+                    &NameKind::NotFound,
+                    w,
+                );
             });
             into(&mut |w| {
-                let _ = dnssec_answer::push_proof_of_absence(z, &query.qname, w);
+                let _ = dnssec_answer::push_proof_of_absence(z, query.qname.as_ref(), w);
             });
             into(&mut |w| {
-                let _ = dnssec_answer::push_delegation_proof(z, &query.qname, w);
+                let _ = dnssec_answer::push_delegation_proof(z, query.qname.as_ref(), w);
             });
         }
     }

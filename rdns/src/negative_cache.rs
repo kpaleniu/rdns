@@ -264,7 +264,9 @@ fn make_room(entries: &mut Entries, max_entries: usize, now: u64) {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_records::nm;
     use crate::test_records::soa_record;
     use crate::{Class, OpCode, QueryClass, QuerySection, RecordData};
 
@@ -282,7 +284,7 @@ mod tests {
             cd: false,
             rcode,
             queries: vec![QuerySection {
-                qname: qname.to_string(),
+                qname: nm(qname),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             }],
@@ -485,10 +487,10 @@ mod tests {
             vec![soa_record("example.com.", 300, Ttl::from_secs(3600))],
         );
         response.answers.push(ResourceRecord {
-            name: "www.example.com.".into(),
+            name: nm("www.example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(300),
-            rdata: RecordData::from_parsed(&ParsedRecord::CNAME("elsewhere.test.".into())).unwrap(),
+            rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm("elsewhere.test."))).unwrap(),
         });
         cache.insert("www.example.com.", Qtype::of(rt::AAAA), &response, false);
         assert!(cache.is_empty());

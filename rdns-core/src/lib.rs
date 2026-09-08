@@ -3,9 +3,7 @@ use rand::Rng;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use compression::NameCompressor;
-use dname::{
-    dname_from_bytes, dname_to_bytes, DName, DNameUnpacker, TryFromBytes, TryUnpackFromBytes,
-};
+use dname::{DName, DNameUnpacker, TryFromBytes, TryUnpackFromBytes};
 
 /// This build, as `<package version> (<git describe>)`. Stamped by `build.rs`
 /// and passed to clap's `version` by every binary, so `--version` names a
@@ -24,6 +22,9 @@ pub mod validation;
 
 /// [`RecordData`] lives in its own module so its fields are private to it.
 pub use record_data::RecordData;
+
+/// A domain name is the wire's, not presentation text — see [`name`].
+pub use name::{Name, NameRef};
 
 #[macro_use]
 mod macros {
@@ -324,7 +325,7 @@ impl std::fmt::Display for Qtype {
 
 #[derive(Debug, Clone)]
 pub struct QuerySection {
-    pub qname: String,
+    pub qname: Name,
     /// The type asked for. See [`Qtype`] — a QTYPE is not a TYPE.
     pub qtype: Qtype,
     pub qclass: QueryClass,
@@ -339,11 +340,11 @@ pub struct QuerySection {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedRecord {
     A(Ipv4Addr),
-    NS(String),
-    CNAME(String),
+    NS(Name),
+    CNAME(Name),
     SOA {
-        mname: String,
-        rname: String,
+        mname: Name,
+        rname: Name,
         /// The zone's version. See [`Serial`] — the comparison is RFC 1982's,
         /// not `>`.
         serial: Serial,
@@ -352,10 +353,10 @@ pub enum ParsedRecord {
         expire: i32,
         minimum: u32,
     },
-    PTR(String),
+    PTR(Name),
     /// The `<target>` a whole subtree is redirected to (RFC 6672 §2.1). One
     /// domain name, and the substitution applies to names *below* the owner.
-    DNAME(String),
+    DNAME(Name),
     /// A service binding: how to reach a service rather than only where its
     /// name points (RFC 9460 §2).
     ///
@@ -373,7 +374,7 @@ pub enum ParsedRecord {
         /// The alias target, or the alternative endpoint. `"."` is special
         /// both ways (§2.5): in ServiceMode it means the owner name, and in
         /// AliasMode that the service does not exist.
-        target: String,
+        target: Name,
         /// The SvcParams, as `(key, wire value)` in strictly increasing key
         /// order (§2.2).
         ///
@@ -388,7 +389,7 @@ pub enum ParsedRecord {
     },
     MX {
         preference: u16,
-        exchange: String,
+        exchange: Name,
     },
     /// One TXT record's `<character-string>`s (RFC 1035 §3.3.14): a run of
     /// length-prefixed strings of at most 255 octets each.
@@ -412,7 +413,7 @@ pub enum ParsedRecord {
         inception: u32,
         expiration: u32,
         key_tag: u16,
-        signer_name: String,
+        signer_name: Name,
         signature: Vec<u8>,
     },
     DS {
@@ -422,7 +423,7 @@ pub enum ParsedRecord {
         digest: Vec<u8>,
     },
     NSEC {
-        next_domain_name: String,
+        next_domain_name: Name,
         type_bitmap: Vec<u8>,
     },
     NSEC3 {
@@ -531,16 +532,16 @@ impl ParsedRecord {
                 Ok(ParsedRecord::A(Ipv4Addr::from(addr)))
             }
             utils::record_types::NS => {
-                let (nsname, _) = dname_from_bytes(rdata, unpacker)?;
+                let (nsname, _) = Name::from_wire_in(rdata, unpacker)?;
                 Ok(ParsedRecord::NS(nsname))
             }
             utils::record_types::CNAME => {
-                let (cname, _) = dname_from_bytes(rdata, unpacker)?;
+                let (cname, _) = Name::from_wire_in(rdata, unpacker)?;
                 Ok(ParsedRecord::CNAME(cname))
             }
             utils::record_types::SOA => {
-                let (mname, rest) = dname_from_bytes(rdata, unpacker)?;
-                let (rname, rest) = dname_from_bytes(rest, unpacker)?;
+                let (mname, rest) = Name::from_wire_in(rdata, unpacker)?;
+                let (rname, rest) = Name::from_wire_in(rest, unpacker)?;
                 let (serial, rest) = read_be!(u32, rest);
                 let serial = Serial::new(serial);
                 let (refresh, rest) = read_be!(i32, rest);
@@ -559,7 +560,7 @@ impl ParsedRecord {
                 })
             }
             utils::record_types::PTR => {
-                let (ptrdname, _) = dname_from_bytes(rdata, unpacker)?;
+                let (ptrdname, _) = Name::from_wire_in(rdata, unpacker)?;
                 Ok(ParsedRecord::PTR(ptrdname))
             }
             // Read through the unpacker like any other name even though
@@ -567,14 +568,14 @@ impl ParsedRecord {
             // pointer here would make us unable to read what a
             // non-conforming server sent, and the rule is on the writer.
             utils::record_types::DNAME => {
-                let (target, _) = dname_from_bytes(rdata, unpacker)?;
+                let (target, _) = Name::from_wire_in(rdata, unpacker)?;
                 Ok(ParsedRecord::DNAME(target))
             }
             // Same forgiveness as DNAME about the uncompressed TargetName
             // (RFC 9460 §2.2): the rule binds the writer.
             utils::record_types::SVCB | utils::record_types::HTTPS => {
                 let (priority, rest) = read_be!(u16, rdata);
-                let (target, rest) = dname_from_bytes(rest, unpacker)?;
+                let (target, rest) = Name::from_wire_in(rest, unpacker)?;
                 Ok(ParsedRecord::SVCB {
                     rtype: record_type,
                     priority,
@@ -584,7 +585,7 @@ impl ParsedRecord {
             }
             utils::record_types::MX => {
                 let (preference, rest) = read_be!(u16, rdata);
-                let (exchange, _) = dname_from_bytes(rest, unpacker)?;
+                let (exchange, _) = Name::from_wire_in(rest, unpacker)?;
                 Ok(ParsedRecord::MX {
                     preference,
                     exchange,
@@ -648,7 +649,7 @@ impl ParsedRecord {
                 let (expiration, rest) = read_be!(u32, rest);
                 let (inception, rest) = read_be!(u32, rest);
                 let (key_tag, rest) = read_be!(u16, rest);
-                let (signer_name, rest) = dname_from_bytes(rest, unpacker)?;
+                let (signer_name, rest) = Name::from_wire_in(rest, unpacker)?;
                 let signature = rest.to_vec();
                 Ok(ParsedRecord::RRSIG {
                     type_covered: Rtype::new(type_covered),
@@ -663,7 +664,7 @@ impl ParsedRecord {
                 })
             }
             utils::record_types::NSEC => {
-                let (next_domain_name, rest) = dname_from_bytes(rdata, unpacker)?;
+                let (next_domain_name, rest) = Name::from_wire_in(rdata, unpacker)?;
                 let type_bitmap = rest.to_vec();
                 Ok(ParsedRecord::NSEC {
                     next_domain_name,
@@ -746,10 +747,14 @@ impl ParsedRecord {
         let out = match self {
             ParsedRecord::A(addr) => (utils::record_types::A, addr.octets().to_vec()),
             ParsedRecord::AAAA(addr) => (utils::record_types::AAAA, addr.octets().to_vec()),
-            ParsedRecord::NS(name) => (utils::record_types::NS, dname_to_bytes(name)?),
-            ParsedRecord::CNAME(name) => (utils::record_types::CNAME, dname_to_bytes(name)?),
-            ParsedRecord::PTR(name) => (utils::record_types::PTR, dname_to_bytes(name)?),
-            ParsedRecord::DNAME(name) => (utils::record_types::DNAME, dname_to_bytes(name)?),
+            ParsedRecord::NS(name) => (utils::record_types::NS, name.as_ref().as_wire().to_vec()),
+            ParsedRecord::CNAME(name) => {
+                (utils::record_types::CNAME, name.as_ref().as_wire().to_vec())
+            }
+            ParsedRecord::PTR(name) => (utils::record_types::PTR, name.as_ref().as_wire().to_vec()),
+            ParsedRecord::DNAME(name) => {
+                (utils::record_types::DNAME, name.as_ref().as_wire().to_vec())
+            }
             ParsedRecord::SVCB {
                 rtype,
                 priority,
@@ -757,7 +762,7 @@ impl ParsedRecord {
                 params,
             } => {
                 let mut v = priority.to_be_bytes().to_vec();
-                v.extend_from_slice(&dname_to_bytes(target)?);
+                v.extend_from_slice(target.as_ref().as_wire());
                 v.extend_from_slice(&encode_svc_params(params)?);
                 (*rtype, v)
             }
@@ -766,7 +771,7 @@ impl ParsedRecord {
                 exchange,
             } => {
                 let mut v = preference.to_be_bytes().to_vec();
-                v.extend_from_slice(&dname_to_bytes(exchange)?);
+                v.extend_from_slice(exchange.as_ref().as_wire());
                 (utils::record_types::MX, v)
             }
             ParsedRecord::TXT(strings) => {
@@ -799,8 +804,8 @@ impl ParsedRecord {
                 expire,
                 minimum,
             } => {
-                let mut v = dname_to_bytes(mname)?;
-                v.extend_from_slice(&dname_to_bytes(rname)?);
+                let mut v = mname.as_ref().as_wire().to_vec();
+                v.extend_from_slice(rname.as_ref().as_wire());
                 v.extend_from_slice(&serial.to_u32().to_be_bytes());
                 v.extend_from_slice(&refresh.to_be_bytes());
                 v.extend_from_slice(&retry.to_be_bytes());
@@ -839,7 +844,7 @@ impl ParsedRecord {
                 v.extend_from_slice(&expiration.to_be_bytes());
                 v.extend_from_slice(&inception.to_be_bytes());
                 v.extend_from_slice(&key_tag.to_be_bytes());
-                v.extend_from_slice(&dname_to_bytes(signer_name)?);
+                v.extend_from_slice(signer_name.as_ref().as_wire());
                 v.extend_from_slice(signature);
                 (utils::record_types::RRSIG, v)
             }
@@ -859,7 +864,7 @@ impl ParsedRecord {
                 next_domain_name,
                 type_bitmap,
             } => {
-                let mut v = dname_to_bytes(next_domain_name)?;
+                let mut v = next_domain_name.as_ref().as_wire().to_vec();
                 v.extend_from_slice(type_bitmap);
                 (utils::record_types::NSEC, v)
             }
@@ -899,7 +904,7 @@ impl ParsedRecord {
 /// §2.5.4 deletion compare the fields they mean instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRecord {
-    pub name: String,
+    pub name: Name,
     /// The class this record is in. See [`Class`].
     pub class: Class,
     /// How long this record may be cached. See [`Ttl`].
@@ -1372,7 +1377,7 @@ impl<'a> TryUnpackFromBytes<'a> for QuerySection {
         <QuerySection as TryUnpackFromBytes<'a>>::Output,
         <QuerySection as TryUnpackFromBytes<'a>>::Error,
     > {
-        let (qname, rest) = dname_from_bytes(data, unpacker)?;
+        let (qname, rest) = Name::from_wire_in(data, unpacker)?;
         let (qtype, rest) = read_be!(u16, rest);
         let (qclass, rest) = read_be!(u16, rest);
         Ok((
@@ -1462,7 +1467,7 @@ impl ResourceRecord {
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<Self, WireError> {
         Ok(ResourceRecord {
-            name: unpacker.decode(parts.name)?,
+            name: Name::from_dname(parts.name, unpacker)?,
             class: Class::new(parts.class),
             ttl: Ttl::from_wire(parts.ttl_bits),
             rdata: RecordData::from_wire(parts.rtype, parts.rdata, unpacker)?,
@@ -1709,7 +1714,13 @@ impl DnsMessage {
         for section in [&self.answers, &self.authorities, &self.additionals] {
             for rr in section {
                 pos = response::write_rr(
-                    compressor, output, pos, &rr.name, rr.class, rr.ttl, &rr.rdata,
+                    compressor,
+                    output,
+                    pos,
+                    rr.name.as_ref(),
+                    rr.class,
+                    rr.ttl,
+                    &rr.rdata,
                 )?;
             }
         }
@@ -1771,10 +1782,13 @@ impl DnsMessage {
     fn wire_size_bound(&self) -> usize {
         // A name's wire form is its text plus a leading length octet and the
         // root label, and shorter than that whenever it is compressed.
-        let name = |name: &str| name.len() + 2;
+        // A name's wire length exactly, now that a name is its wire form —
+        // where the text form had to add two for the length octet and the root
+        // and explain why that was right.
+        let name = |name: NameRef<'_>| name.as_wire().len();
         let mut bound = response::HEADER_LEN;
         for q in &self.queries {
-            bound += name(&q.qname) + 4;
+            bound += name(q.qname.as_ref()) + 4;
         }
         for rr in self
             .answers
@@ -1783,7 +1797,7 @@ impl DnsMessage {
             .chain(&self.additionals)
         {
             // TYPE, CLASS, TTL and RDLENGTH, then the RDATA.
-            bound += name(&rr.name) + 10 + rr.rdata.bytes().len();
+            bound += name(rr.name.as_ref()) + 10 + rr.rdata.bytes().len();
         }
         if let Some(edns) = &self.edns {
             // The owner is the root, so one octet rather than a name.
@@ -1911,7 +1925,7 @@ const DNSSEC_PAYLOAD_SIZE: u16 = 4096;
 /// leaves the reporting to the caller that has a person to report to.
 pub struct DnsMessageBuilder {
     id: u16,
-    queries: Vec<(String, Qtype)>,
+    queries: Vec<(Name, Qtype)>,
     recursion: bool,
     /// The OPT record to attach, if any.
     edns: Option<Edns>,
@@ -1936,8 +1950,12 @@ impl DnsMessageBuilder {
     }
 
     /// Ask `name` for `qtype`.
-    pub fn with_query(mut self, name: &str, qtype: Qtype) -> Self {
-        self.queries.push((name.to_owned(), qtype));
+    /// Takes a [`Name`] rather than text, because presentation text can fail
+    /// to be a name — a bad escape, a label over 63 octets — and a builder
+    /// method that cannot fail would have to guess at one of those. The caller
+    /// parses, and sees the error where the text is.
+    pub fn with_query(mut self, name: Name, qtype: Qtype) -> Self {
+        self.queries.push((name, qtype));
         self
     }
 
@@ -1996,7 +2014,7 @@ impl DnsMessageBuilder {
                 .queries
                 .iter()
                 .map(|(name, qtype)| QuerySection {
-                    qname: name.to_owned(),
+                    qname: name.clone(),
                     qtype: *qtype,
                     qclass: QueryClass::IN,
                 })
@@ -2012,6 +2030,7 @@ impl DnsMessageBuilder {
 #[cfg(test)]
 mod builder_dnssec_tests {
     use super::*;
+    use crate::name::nm;
 
     /// `--dnssec` has to produce an OPT record with DO set and survive the wire.
     /// Round-tripped rather than inspected, because the flag only matters if a
@@ -2020,12 +2039,12 @@ mod builder_dnssec_tests {
     #[test]
     fn the_dnssec_flag_sets_do_and_survives_the_wire() {
         let plain = DnsMessageBuilder::new()
-            .with_query("example.com", Qtype::of(utils::record_types::A))
+            .with_query(nm("example.com"), Qtype::of(utils::record_types::A))
             .build();
         assert!(plain.edns.is_none(), "no OPT unless asked for");
 
         let asked = DnsMessageBuilder::new()
-            .with_query("example.com", Qtype::of(utils::record_types::A))
+            .with_query(nm("example.com"), Qtype::of(utils::record_types::A))
             .with_dnssec(true)
             .build();
         let mut buf = vec![0u8; 512];
@@ -2058,7 +2077,7 @@ mod builder_dnssec_tests {
             assert_eq!(asked, qtype);
 
             let request = DnsMessageBuilder::new()
-                .with_query("example.com.", asked)
+                .with_query(nm("example.com."), asked)
                 .build();
             let mut buf = vec![0u8; 512];
             let n = request.to_bytes(&mut buf).expect("serializes");
@@ -2073,12 +2092,12 @@ mod builder_dnssec_tests {
     #[test]
     fn recursion_and_edns_are_the_callers_to_choose() {
         let plain = DnsMessageBuilder::new()
-            .with_query("example.com.", Qtype::of(utils::record_types::A))
+            .with_query(nm("example.com."), Qtype::of(utils::record_types::A))
             .build();
         assert!(plain.recursion, "RD by default");
 
         let transfer = DnsMessageBuilder::new()
-            .with_query("example.com.", Qtype::AXFR)
+            .with_query(nm("example.com."), Qtype::AXFR)
             .with_recursion(false)
             .with_edns(1232, false)
             .build();
@@ -2091,7 +2110,9 @@ mod builder_dnssec_tests {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::name::nm;
     use crate::utils::record_types as rt;
 
     /// RFC 1982 §3.2, which is the whole reason [`Serial`] exists.
@@ -2133,8 +2154,8 @@ mod tests {
     fn a_serial_round_trips_through_the_wire_form() {
         for value in [0, 1, 2_026_080_201, 0x8000_0000, u32::MAX] {
             let soa = ParsedRecord::SOA {
-                mname: "ns1.example.com.".to_string(),
-                rname: "admin.example.com.".to_string(),
+                mname: nm("ns1.example.com."),
+                rname: nm("admin.example.com."),
                 serial: Serial::new(value),
                 refresh: 3600,
                 retry: 1800,
@@ -2220,7 +2241,7 @@ mod tests {
         assert!(msg.recursion);
 
         let query = &msg.queries[0];
-        assert_eq!(query.qname, "www.google.fi.");
+        assert_eq!(query.qname, nm("www.google.fi."));
         assert_eq!(query.qtype, Qtype::of(rt::A));
         assert_eq!(query.qclass, QueryClass::IN);
     }
@@ -2229,7 +2250,7 @@ mod tests {
     fn test_query_builder() {
         let req = DnsMessageBuilder::new()
             .with_id(u16::from_be_bytes([0xf5, 0x6f]))
-            .with_query("www.google.fi", Qtype::of(utils::record_types::A))
+            .with_query(nm("www.google.fi"), Qtype::of(utils::record_types::A))
             .build();
 
         let mut buf = [0u8; 512];
@@ -2268,7 +2289,7 @@ mod tests {
                 cd: false,
                 rcode: ResponseCode::Ok,
                 queries: vec![QuerySection {
-                    qname: "example.com.".to_string(),
+                    qname: nm("example.com."),
                     qtype: Qtype::of(rt::SOA),
                     qclass: QueryClass::IN,
                 }],
@@ -2382,7 +2403,7 @@ mod tests {
         use std::net::Ipv4Addr;
 
         let answer = ResourceRecord {
-            name: "www.example.com.".to_string(),
+            name: nm("www.example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
@@ -2399,7 +2420,7 @@ mod tests {
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
-                qname: "www.example.com.".to_string(),
+                qname: nm("www.example.com."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             }],
@@ -2419,7 +2440,7 @@ mod tests {
             "answer record must survive round-trip"
         );
         let a = &parsed.answers[0];
-        assert_eq!(a.name, "www.example.com.");
+        assert_eq!(a.name, nm("www.example.com."));
         assert_eq!(a.class, Class::new(1));
         assert_eq!(a.ttl, Ttl::from_secs(3600));
         assert_eq!(a.rdata.rtype(), rt::A);
@@ -2434,7 +2455,7 @@ mod tests {
 
         let answers: Vec<ResourceRecord> = (1..=10)
             .map(|i| ResourceRecord {
-                name: "www.example.com.".to_string(),
+                name: nm("www.example.com."),
                 class: Class::new(1),
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, i)))
@@ -2444,7 +2465,7 @@ mod tests {
 
         let mut msg = query_msg(0x4242);
         msg.response = true;
-        msg.queries[0].qname = "www.example.com.".to_string();
+        msg.queries[0].qname = nm("www.example.com.");
         msg.answers = answers;
 
         let mut buf = [0u8; 512];
@@ -2459,7 +2480,7 @@ mod tests {
         let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
         assert_eq!(parsed.answers.len(), 10);
         for (i, a) in parsed.answers.iter().enumerate() {
-            assert_eq!(a.name, "www.example.com.");
+            assert_eq!(a.name, nm("www.example.com."));
             assert_eq!(a.rdata.bytes(), [192, 0, 2, (i + 1) as u8]);
         }
     }
@@ -2469,28 +2490,26 @@ mod tests {
     #[test]
     fn test_output_compresses_names_inside_rdata() {
         let ns = ResourceRecord {
-            name: "example.com.".to_string(),
+            name: nm("example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
-            rdata: RecordData::from_parsed(&ParsedRecord::NS("ns1.example.com.".to_string()))
-                .unwrap(),
+            rdata: RecordData::from_parsed(&ParsedRecord::NS(nm("ns1.example.com."))).unwrap(),
         };
         let mx = ResourceRecord {
-            name: "example.com.".to_string(),
+            name: nm("example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::MX {
                 preference: 10,
-                exchange: "mail.example.com.".to_string(),
+                exchange: nm("mail.example.com."),
             })
             .unwrap(),
         };
         let cname = ResourceRecord {
-            name: "alias.example.com.".to_string(),
+            name: nm("alias.example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
-            rdata: RecordData::from_parsed(&ParsedRecord::CNAME("www.example.com.".to_string()))
-                .unwrap(),
+            rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm("www.example.com."))).unwrap(),
         };
 
         let mut msg = query_msg(0x5150);
@@ -2566,7 +2585,7 @@ mod tests {
             let built = RecordData::from_parsed(&ParsedRecord::SVCB {
                 rtype,
                 priority: 1,
-                target: "foo.example.com.".to_string(),
+                target: nm("foo.example.com."),
                 params: vec![(3, vec![0x01, 0xbb])],
             })
             .expect("it encodes");
@@ -2582,7 +2601,7 @@ mod tests {
             };
             assert_eq!(back, rtype, "the rtype survives the round trip");
             assert_eq!(priority, 1);
-            assert_eq!(target, "foo.example.com.");
+            assert_eq!(target, nm("foo.example.com."));
             assert_eq!(params, vec![(3, vec![0x01, 0xbb])]);
         }
     }
@@ -2595,7 +2614,7 @@ mod tests {
         let sorted = RecordData::from_parsed(&ParsedRecord::SVCB {
             rtype: utils::record_types::SVCB,
             priority: 1,
-            target: ".".to_string(),
+            target: nm("."),
             params: vec![(3, vec![0x01, 0xbb]), (1, vec![0x01, b'h'])],
         })
         .expect("it encodes");
@@ -2611,7 +2630,7 @@ mod tests {
         let err = RecordData::from_parsed(&ParsedRecord::SVCB {
             rtype: utils::record_types::SVCB,
             priority: 1,
-            target: ".".to_string(),
+            target: nm("."),
             params: vec![(3, vec![0x00, 0x35]), (3, vec![0x01, 0xbb])],
         })
         .expect_err("two values for one key");
@@ -2624,15 +2643,14 @@ mod tests {
     #[test]
     fn a_dname_target_goes_out_uncompressed() {
         let dname = |owner: &str| ResourceRecord {
-            name: owner.to_string(),
+            name: nm(owner),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
-            rdata: RecordData::from_parsed(&ParsedRecord::DNAME("to.example.net.".to_string()))
-                .unwrap(),
+            rdata: RecordData::from_parsed(&ParsedRecord::DNAME(nm("to.example.net."))).unwrap(),
         };
         let mut msg = query_msg(0x6672);
         msg.response = true;
-        msg.queries[0].qname = "a.example.com.".to_string();
+        msg.queries[0].qname = nm("a.example.com.");
         msg.answers = vec![dname("example.com."), dname("other.example.com.")];
 
         let mut buf = [0u8; 512];
@@ -2661,9 +2679,9 @@ mod tests {
     fn test_unknown_and_dnssec_rdata_is_not_compressed() {
         // SRV: priority, weight, port, then a target name we must leave alone.
         let mut srv_rdata = vec![0, 10, 0, 20, 0, 80];
-        srv_rdata.extend_from_slice(&dname_to_bytes("www.example.com.").unwrap());
+        srv_rdata.extend_from_slice(nm("www.example.com.").as_ref().as_wire());
         let srv = ResourceRecord {
-            name: "_sip._tcp.example.com.".to_string(),
+            name: nm("_sip._tcp.example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::new(Rtype::new(33), srv_rdata.clone())
@@ -2672,7 +2690,7 @@ mod tests {
 
         let mut msg = query_msg(0x1111);
         msg.response = true;
-        msg.queries[0].qname = "_sip._tcp.example.com.".to_string();
+        msg.queries[0].qname = nm("_sip._tcp.example.com.");
         msg.answers = vec![srv];
 
         let mut buf = [0u8; 512];
@@ -2741,12 +2759,12 @@ mod tests {
                 cd: false,
                 rcode: ResponseCode::Ok,
                 queries: vec![QuerySection {
-                    qname: (*name).to_string(),
+                    qname: nm(name),
                     qtype: Qtype::of(utils::record_types::A),
                     qclass: QueryClass::IN,
                 }],
                 answers: vec![ResourceRecord {
-                    name: (*name).to_string(),
+                    name: nm(name),
                     class: Class::IN,
                     ttl: Ttl::from_secs(60),
                     rdata: RecordData::from_parsed(&ParsedRecord::A(std::net::Ipv4Addr::new(
@@ -2802,13 +2820,13 @@ mod tests {
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
-                qname: "www.example.com.".to_string(),
+                qname: nm("www.example.com."),
                 qtype: Qtype::of(utils::record_types::A),
                 qclass: QueryClass::IN,
             }],
             answers: (0..40)
                 .map(|i| ResourceRecord {
-                    name: format!("host{i}.example.com."),
+                    name: nm(&format!("host{i}.example.com.")),
                     class: Class::IN,
                     ttl: Ttl::from_secs(60),
                     rdata: RecordData::from_parsed(&ParsedRecord::A(std::net::Ipv4Addr::new(
@@ -2835,7 +2853,7 @@ mod tests {
         let back = DnsMessage::try_from_bytes(&buf).expect("the truncated reply parses");
         assert!(back.truncation, "TC is set");
         assert!(back.answers.is_empty(), "and it carries no records");
-        assert_eq!(back.queries[0].qname, "www.example.com.");
+        assert_eq!(back.queries[0].qname, nm("www.example.com."));
     }
 
     /// Serializing into a buffer that cannot hold the message is an error, not
@@ -2843,7 +2861,7 @@ mod tests {
     #[test]
     fn test_to_bytes_rejects_undersized_buffer() {
         let mut msg = query_msg(7);
-        msg.queries[0].qname = "a-rather-long-name.example.com.".to_string();
+        msg.queries[0].qname = nm("a-rather-long-name.example.com.");
 
         let mut buf = [0u8; 20];
         assert!(msg.to_bytes(&mut buf).is_err());
@@ -2862,7 +2880,7 @@ mod tests {
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
-                qname: "example.com.".to_string(),
+                qname: nm("example.com."),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             }],
@@ -3021,7 +3039,7 @@ mod tests {
     fn arcount_counts_the_opt_record_that_is_not_in_the_section() {
         let mut msg = query_msg(7);
         msg.additionals.push(ResourceRecord {
-            name: "ns1.example.com.".to_string(),
+            name: nm("ns1.example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1)))
@@ -3150,7 +3168,7 @@ mod tests {
         rdata.extend_from_slice(&0x5000_0000u32.to_be_bytes()); // expiration
         rdata.extend_from_slice(&0x4000_0000u32.to_be_bytes()); // inception
         rdata.extend_from_slice(&12345u16.to_be_bytes()); // key tag
-        rdata.extend_from_slice(&dname_to_bytes("example.com.").unwrap());
+        rdata.extend_from_slice(nm("example.com.").as_ref().as_wire());
         rdata.extend_from_slice(&[0xAB; 64]); // signature
 
         let record = RecordData::from_wire(rt::RRSIG, &rdata, &DNameUnpacker::new(&rdata))
@@ -3170,7 +3188,7 @@ mod tests {
         assert_eq!(inception, 0x4000_0000, "the later field is inception");
         assert!(inception < expiration, "a signature is valid over a range");
         assert_eq!(key_tag, 12345);
-        assert_eq!(signer_name, "example.com.");
+        assert_eq!(signer_name, nm("example.com."));
         assert_eq!(signature.len(), 64);
 
         // And the encoder puts them back in the same order it found them.
@@ -3380,7 +3398,7 @@ mod tests {
         // Pack in enough answers to blow past 512 bytes.
         for i in 0..60u8 {
             msg.answers.push(ResourceRecord {
-                name: format!("host{i}.example.com."),
+                name: nm(&format!("host{i}.example.com.")),
                 class: Class::new(1),
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(10, 0, 0, i)))
@@ -3416,7 +3434,7 @@ mod tests {
         let mut msg = query_msg(1);
         msg.response = true;
         msg.answers.push(ResourceRecord {
-            name: "example.com.".to_string(),
+            name: nm("example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
@@ -3455,7 +3473,7 @@ mod tests {
         let mut msg = query_msg(1);
         msg.response = true;
         msg.answers.push(ResourceRecord {
-            name: "example.com.".to_string(),
+            name: nm("example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
@@ -3485,7 +3503,7 @@ mod tests {
         let mut msg = query_msg(1);
         msg.response = true;
         msg.answers.push(ResourceRecord {
-            name: "example.com.".to_string(),
+            name: nm("example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
@@ -3511,7 +3529,7 @@ mod tests {
         let mut msg = query_msg(1);
         msg.response = true;
         msg.answers.push(ResourceRecord {
-            name: "example.com.".to_string(),
+            name: nm("example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
@@ -3726,11 +3744,56 @@ mod tests {
 
     #[test]
     fn test_message_builder_initializes_ad_cd_false() {
-        let builder =
-            DnsMessageBuilder::new().with_query("example.com", Qtype::of(utils::record_types::A));
+        let builder = DnsMessageBuilder::new()
+            .with_query(nm("example.com"), Qtype::of(utils::record_types::A));
         let msg = builder.build();
 
         assert!(!msg.ad, "AD bit should be false by default");
         assert!(!msg.cd, "CD bit should be false by default");
+    }
+
+    /// **D-1's actual claim, at the message level.** A response carrying a label
+    /// that is not valid UTF-8 used to be unparseable, so `rdnsr` could not
+    /// relay somebody else's zone that had one (RFC 2181 §11: "any binary string
+    /// whatever can be used as the label").
+    ///
+    /// `rdns-core` no longer has a presentation reader to contrast with — that
+    /// half of `dname.rs` went with the change — so what is asserted is the
+    /// relay itself: in, out, and the same octets.
+    #[test]
+    fn a_response_carrying_a_binary_label_relays_byte_for_byte() {
+        // Header, one question, one answer. The owner's first label is a single
+        // 0xff octet, which no UTF-8 sequence begins with.
+        let mut wire: Vec<u8> = vec![
+            0x12, 0x34, // id
+            0x81, 0x80, // QR, RD, RA
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let name: &[u8] = &[
+            1, 0xff, 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ];
+        wire.extend_from_slice(name);
+        wire.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE A, QCLASS IN
+        wire.extend_from_slice(name);
+        wire.extend_from_slice(&[
+            0x00, 0x01, 0x00, 0x01, // TYPE A, CLASS IN
+            0x00, 0x00, 0x01, 0x2c, // TTL 300
+            0x00, 0x04, 192, 0, 2, 1,
+        ]);
+
+        let msg = DnsMessage::try_from_bytes(&wire).expect("a binary label is a label");
+        assert_eq!(
+            msg.queries[0].qname.as_ref().labels().next(),
+            Some(&[0xffu8][..])
+        );
+        assert_eq!(msg.answers[0].name, msg.queries[0].qname);
+
+        // Relayed: what goes back out is the name that came in, octet for octet.
+        // Serialized without compression to compare against the input directly.
+        let mut out = vec![0u8; 512];
+        let len = msg.to_bytes(&mut out).expect("serialize");
+        let back = DnsMessage::try_from_bytes(&out[..len]).expect("and parses again");
+        assert_eq!(back.answers[0].name.as_ref().as_wire(), name);
+        assert_eq!(back.answers[0].name, msg.answers[0].name);
     }
 }

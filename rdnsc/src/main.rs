@@ -9,6 +9,7 @@ use clap::Parser;
 use rdns_core::error::AnswerMismatch;
 use rdns_core::utils::{bind_addr_for, qtype_name_to_code, record_types as rt};
 use rdns_core::validation::{answers_query, SentQuery};
+use rdns_core::Name;
 use rdns_core::{DnsMessage, DnsMessageBuilder, Qtype, ResponseCode};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,7 +51,11 @@ fn main() -> Result<()> {
     let transfer = qtype == Qtype::AXFR;
 
     let request = DnsMessageBuilder::new()
-        .with_query(&args.hostname, qtype)
+        .with_query(
+            Name::from_presentation(&args.hostname)
+                .with_context(|| format!("{:?} is not a domain name", args.hostname))?,
+            qtype,
+        )
         // RFC 5936 §4.1.1: RD SHOULD be clear in an AXFR request.
         .with_recursion(!transfer)
         .with_dnssec(args.dnssec)
@@ -235,7 +240,7 @@ fn matches_request(message: &DnsMessage, request: &DnsMessage) -> Result<(), Ans
         message,
         &SentQuery {
             id: request.id,
-            qname: &asked.qname,
+            qname: asked.qname.as_ref(),
             qtype: asked.qtype,
             qclass: asked.qclass,
             case_sensitive: false,

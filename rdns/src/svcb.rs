@@ -379,6 +379,7 @@ fn present_value(code: u16, value: &[u8]) -> Option<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+
     use crate::utils::{hex_encode, record_types as rt};
     use crate::zone::{parse_zone_file, Zone};
     use crate::zone_writer::zone_to_string;

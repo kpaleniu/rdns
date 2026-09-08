@@ -101,7 +101,12 @@ impl DnssecValidator {
 
         let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
         let proof = verify_rrset(
-            &Rrset::new(&first.name, first.rdata.rtype(), first.class, &rdatas),
+            &Rrset::new(
+                first.name.as_ref(),
+                first.rdata.rtype(),
+                first.class,
+                &rdatas,
+            ),
             &rrsigs,
             &keys,
             zone.origin(),
@@ -126,6 +131,7 @@ impl DnssecValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_records::nm;
     use crate::zone::ZoneRecord;
     use crate::Class;
     use crate::ParsedRecord;
@@ -140,7 +146,7 @@ mod tests {
     #[test]
     fn test_dnssec_validator_integration() {
         let validator = DnssecValidator::new(true);
-        let zone = crate::zone::Zone::new("example.com.".to_string());
+        let zone = crate::zone::Zone::new(nm(&nm("example.com.").to_string()));
         let records = vec![];
 
         let (is_valid, is_signed) = validator.validate_response(&zone, &records, "example.com.");
@@ -162,7 +168,7 @@ mod tests {
     #[test]
     fn test_validator_disabled_returns_not_signed() {
         let validator = DnssecValidator::new(false);
-        let zone = Zone::new("example.com.".to_string());
+        let zone = Zone::new(nm(&nm("example.com.").to_string()));
         let records = vec![];
 
         let (is_valid, is_signed) = validator.validate_response(&zone, &records, "example.com.");
@@ -174,7 +180,7 @@ mod tests {
     #[test]
     fn test_validator_unsigned_zone() {
         let validator = DnssecValidator::new(true);
-        let zone = Zone::new("example.com.".to_string());
+        let zone = Zone::new(nm(&nm("example.com.").to_string()));
         let records = vec![];
 
         let (is_valid, is_signed) = validator.validate_response(&zone, &records, "example.com.");
@@ -185,9 +191,9 @@ mod tests {
 
     #[test]
     fn test_is_zone_signed_false() {
-        let mut zone = Zone::new("example.com.".to_string());
+        let mut zone = Zone::new(nm(&nm("example.com.").to_string()));
         zone.add_record(ZoneRecord {
-            name: "example.com.".to_string(),
+            name: nm(&nm("example.com.").to_string()),
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
@@ -198,9 +204,9 @@ mod tests {
 
     #[test]
     fn test_is_zone_signed_true() {
-        let mut zone = Zone::new("example.com.".to_string());
+        let mut zone = Zone::new(nm(&nm("example.com.").to_string()));
         zone.add_record(ZoneRecord {
-            name: "example.com.".to_string(),
+            name: nm(&nm("example.com.").to_string()),
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::DNSKEY {

@@ -21,7 +21,7 @@ use std::path::Path;
 use crate::dnssec::{ds_digest, Dnskey, Ds, Rrset};
 use crate::utils::record_types as rt;
 use crate::utils::{base64_encode, hex_decode, hex_encode};
-use crate::{ParsedRecord, RecordData, ResourceRecord};
+use crate::{Name, NameRef, ParsedRecord, RecordData, ResourceRecord};
 
 /// The REVOKE bit (RFC 5011 §3), flags bit 8.
 pub const DNSKEY_FLAG_REVOKE: u16 = 0x0080;
@@ -204,8 +204,8 @@ impl ManagedAnchors {
     ///
     /// RFC 5011 §5: with the last anchor gone, a new one is never bootstrapped
     /// from the zone's own data — it must be configured out of band.
-    pub fn has_anchor_for(&self, zone: &str) -> bool {
-        let zone = zone.to_ascii_lowercase();
+    pub fn has_anchor_for(&self, zone: NameRef<'_>) -> bool {
+        let zone = zone.to_presentation().to_ascii_lowercase();
         self.ds
             .iter()
             .any(|ds| ds.owner.eq_ignore_ascii_case(&zone))
@@ -223,7 +223,7 @@ impl ManagedAnchors {
     /// it. Does nothing if we hold no anchor for the zone.
     pub fn observe(
         &mut self,
-        zone: &str,
+        zone: NameRef<'_>,
         seen: &[Dnskey],
         self_signers: &[Dnskey],
         now: u64,
@@ -232,7 +232,7 @@ impl ManagedAnchors {
         if !self.has_anchor_for(zone) {
             return changes;
         }
-        let zone_lc = zone.to_ascii_lowercase();
+        let zone_lc = zone.to_presentation().to_ascii_lowercase();
         let in_zone = |owner: &str| owner.eq_ignore_ascii_case(&zone_lc);
 
         // Revocations first: a revoked key must not also be read as "present and
@@ -508,7 +508,7 @@ pub fn same_key(a: &Dnskey, b: &Dnskey) -> bool {
 ///
 /// Each candidate is verified *alone*, so "some key signed it" cannot be
 /// mistaken for "this key signed it" — what RFC 5011 §2.1 rests a revocation on.
-pub fn self_signers(zone: &str, records: &[ResourceRecord], now: u64) -> Vec<Dnskey> {
+pub fn self_signers(zone: NameRef<'_>, records: &[ResourceRecord], now: u64) -> Vec<Dnskey> {
     let keys: Vec<Dnskey> = records.iter().filter_map(Dnskey::from_record).collect();
     let rrsigs: Vec<crate::dnssec::Rrsig> = records
         .iter()
@@ -685,7 +685,7 @@ pub fn key_record(key: &Dnskey, ttl: Ttl) -> Option<ResourceRecord> {
     })
     .ok()?;
     Some(ResourceRecord {
-        name: key.owner.clone(),
+        name: Name::from_presentation(&key.owner).ok()?,
         class: Class::new(1),
         ttl,
         rdata,
@@ -694,8 +694,10 @@ pub fn key_record(key: &Dnskey, ttl: Ttl) -> Option<ResourceRecord> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::dnssec_chain::TrustAnchors;
+    use crate::test_records::nm;
 
     const DAY: u64 = 86_400;
 
@@ -738,7 +740,12 @@ mod tests {
 
         // The existing key is anchored by DS and trusted at once; the new one
         // starts its hold-down.
-        let changes = anchors.observe(".", &[existing.clone(), fresh.clone()], &[], t0);
+        let changes = anchors.observe(
+            nm(".").as_ref(),
+            &[existing.clone(), fresh.clone()],
+            &[],
+            t0,
+        );
         assert!(changes.contains(&AnchorChange::Trusted {
             zone: ".".to_string(),
             key_tag: existing.key_tag()
@@ -759,7 +766,7 @@ mod tests {
 
         // A day short of the hold-down, still not trusted.
         anchors.observe(
-            ".",
+            nm(".").as_ref(),
             &[existing.clone(), fresh.clone()],
             &[],
             t0 + ADD_HOLD_DOWN - DAY,
@@ -768,7 +775,7 @@ mod tests {
 
         // And past it, trusted.
         let changes = anchors.observe(
-            ".",
+            nm(".").as_ref(),
             &[existing.clone(), fresh.clone()],
             &[],
             t0 + ADD_HOLD_DOWN,
@@ -794,17 +801,32 @@ mod tests {
         let mut anchors = anchored_on(&existing);
         let t0 = 1_700_000_000;
 
-        anchors.observe(".", &[existing.clone(), fresh.clone()], &[], t0);
+        anchors.observe(
+            nm(".").as_ref(),
+            &[existing.clone(), fresh.clone()],
+            &[],
+            t0,
+        );
         // Day 30 is the first observation at or past the hold-down.
         for day in 1..30 {
-            anchors.observe(".", &[existing.clone(), fresh.clone()], &[], t0 + day * DAY);
+            anchors.observe(
+                nm(".").as_ref(),
+                &[existing.clone(), fresh.clone()],
+                &[],
+                t0 + day * DAY,
+            );
             assert_eq!(
                 state_of(&anchors, &fresh),
                 Some(KeyState::AddPend),
                 "day {day} is still inside the hold-down"
             );
         }
-        anchors.observe(".", &[existing.clone(), fresh.clone()], &[], t0 + 30 * DAY);
+        anchors.observe(
+            nm(".").as_ref(),
+            &[existing.clone(), fresh.clone()],
+            &[],
+            t0 + 30 * DAY,
+        );
         assert_eq!(state_of(&anchors, &fresh), Some(KeyState::Valid));
     }
 
@@ -817,8 +839,18 @@ mod tests {
         let mut anchors = anchored_on(&existing);
         let t0 = 1_700_000_000;
 
-        anchors.observe(".", &[existing.clone(), fresh.clone()], &[], t0);
-        let changes = anchors.observe(".", std::slice::from_ref(&existing), &[], t0 + DAY);
+        anchors.observe(
+            nm(".").as_ref(),
+            &[existing.clone(), fresh.clone()],
+            &[],
+            t0,
+        );
+        let changes = anchors.observe(
+            nm(".").as_ref(),
+            std::slice::from_ref(&existing),
+            &[],
+            t0 + DAY,
+        );
         assert!(changes.contains(&AnchorChange::Withdrawn {
             zone: ".".to_string(),
             key_tag: fresh.key_tag()
@@ -826,10 +858,15 @@ mod tests {
         assert_eq!(state_of(&anchors, &fresh), None);
 
         // Back again: the hold-down starts over rather than resuming.
-        anchors.observe(".", &[existing.clone(), fresh.clone()], &[], t0 + 2 * DAY);
+        anchors.observe(
+            nm(".").as_ref(),
+            &[existing.clone(), fresh.clone()],
+            &[],
+            t0 + 2 * DAY,
+        );
         assert_eq!(state_of(&anchors, &fresh), Some(KeyState::AddPend));
         anchors.observe(
-            ".",
+            nm(".").as_ref(),
             &[existing.clone(), fresh.clone()],
             &[],
             t0 + 2 * DAY + ADD_HOLD_DOWN - 1,
@@ -850,15 +887,20 @@ mod tests {
         let t0 = 1_700_000_000;
 
         // Both trusted: `old` by DS, `new` after its hold-down.
-        anchors.observe(".", &[old.clone(), new.clone()], &[], t0);
-        anchors.observe(".", &[old.clone(), new.clone()], &[], t0 + ADD_HOLD_DOWN);
+        anchors.observe(nm(".").as_ref(), &[old.clone(), new.clone()], &[], t0);
+        anchors.observe(
+            nm(".").as_ref(),
+            &[old.clone(), new.clone()],
+            &[],
+            t0 + ADD_HOLD_DOWN,
+        );
         assert_eq!(state_of(&anchors, &new), Some(KeyState::Valid));
 
         // The old key is republished with REVOKE set, signed by itself.
         let mut revoked = old.clone();
         revoked.flags |= DNSKEY_FLAG_REVOKE;
         let changes = anchors.observe(
-            ".",
+            nm(".").as_ref(),
             &[revoked.clone(), new.clone()],
             std::slice::from_ref(&revoked),
             t0 + ADD_HOLD_DOWN + DAY,
@@ -895,13 +937,13 @@ mod tests {
         let other = zone_key(2);
         let mut anchors = anchored_on(&old);
         let t0 = 1_700_000_000;
-        anchors.observe(".", std::slice::from_ref(&old), &[], t0);
+        anchors.observe(nm(".").as_ref(), std::slice::from_ref(&old), &[], t0);
 
         let mut revoked = old.clone();
         revoked.flags |= DNSKEY_FLAG_REVOKE;
         // Signed by a different key, not by the one being revoked.
         let changes = anchors.observe(
-            ".",
+            nm(".").as_ref(),
             std::slice::from_ref(&revoked),
             std::slice::from_ref(&other),
             t0 + DAY,
@@ -913,7 +955,12 @@ mod tests {
         assert_eq!(state_of(&anchors, &old), Some(KeyState::Valid));
 
         // Nobody signing it at all is the same answer.
-        anchors.observe(".", std::slice::from_ref(&revoked), &[], t0 + 2 * DAY);
+        anchors.observe(
+            nm(".").as_ref(),
+            std::slice::from_ref(&revoked),
+            &[],
+            t0 + 2 * DAY,
+        );
         assert_eq!(state_of(&anchors, &old), Some(KeyState::Valid));
     }
 
@@ -925,9 +972,9 @@ mod tests {
         let successor = zone_key(2);
         let mut anchors = anchored_on(&old);
         let t0 = 1_700_000_000;
-        anchors.observe(".", &[old.clone(), successor.clone()], &[], t0);
+        anchors.observe(nm(".").as_ref(), &[old.clone(), successor.clone()], &[], t0);
         anchors.observe(
-            ".",
+            nm(".").as_ref(),
             &[old.clone(), successor.clone()],
             &[],
             t0 + ADD_HOLD_DOWN,
@@ -937,7 +984,7 @@ mod tests {
         revoked.flags |= DNSKEY_FLAG_REVOKE;
         let revoked_at = t0 + ADD_HOLD_DOWN + DAY;
         anchors.observe(
-            ".",
+            nm(".").as_ref(),
             &[revoked.clone(), successor.clone()],
             std::slice::from_ref(&revoked),
             revoked_at,
@@ -945,7 +992,7 @@ mod tests {
 
         // Republished without the REVOKE bit: it stays revoked.
         anchors.observe(
-            ".",
+            nm(".").as_ref(),
             &[old.clone(), successor.clone()],
             &[],
             revoked_at + DAY,
@@ -958,14 +1005,14 @@ mod tests {
 
         // Dropped from the zone; forgotten once the remove hold-down elapses.
         anchors.observe(
-            ".",
+            nm(".").as_ref(),
             std::slice::from_ref(&successor),
             &[],
             revoked_at + DAY + 1,
         );
         assert_eq!(state_of(&anchors, &old), Some(KeyState::Revoked));
         let changes = anchors.observe(
-            ".",
+            nm(".").as_ref(),
             std::slice::from_ref(&successor),
             &[],
             revoked_at + REMOVE_HOLD_DOWN,
@@ -997,11 +1044,16 @@ mod tests {
         let new = zone_key(2);
         let mut anchors = anchored_on(&old);
         let t0 = 1_700_000_000;
-        anchors.observe(".", &[old.clone(), new.clone()], &[], t0);
-        anchors.observe(".", &[old.clone(), new.clone()], &[], t0 + ADD_HOLD_DOWN);
+        anchors.observe(nm(".").as_ref(), &[old.clone(), new.clone()], &[], t0);
+        anchors.observe(
+            nm(".").as_ref(),
+            &[old.clone(), new.clone()],
+            &[],
+            t0 + ADD_HOLD_DOWN,
+        );
 
         let changes = anchors.observe(
-            ".",
+            nm(".").as_ref(),
             std::slice::from_ref(&old),
             &[],
             t0 + ADD_HOLD_DOWN + DAY,
@@ -1021,7 +1073,7 @@ mod tests {
         );
 
         let changes = anchors.observe(
-            ".",
+            nm(".").as_ref(),
             &[old.clone(), new.clone()],
             &[],
             t0 + ADD_HOLD_DOWN + 2 * DAY,
@@ -1038,10 +1090,10 @@ mod tests {
     #[test]
     fn test_nothing_is_learned_about_a_zone_we_have_no_anchor_for() {
         let mut anchors = ManagedAnchors::default();
-        let changes = anchors.observe(".", &[zone_key(1)], &[], 1_700_000_000);
+        let changes = anchors.observe(nm(".").as_ref(), &[zone_key(1)], &[], 1_700_000_000);
         assert!(changes.is_empty());
         assert!(anchors.keys().is_empty());
-        assert!(!anchors.has_anchor_for("."));
+        assert!(!anchors.has_anchor_for(nm(".").as_ref()));
     }
 
     /// Only a zone key that is also a secure entry point is a candidate.
@@ -1053,7 +1105,7 @@ mod tests {
         let not_a_zone_key = key(8, crate::dnssec::DNSKEY_FLAG_SEP);
 
         anchors.observe(
-            ".",
+            nm(".").as_ref(),
             &[anchor.clone(), zsk.clone(), not_a_zone_key.clone()],
             &[],
             1,
@@ -1084,7 +1136,12 @@ mod tests {
         let mut elsewhere = zone_key(5);
         elsewhere.owner = "example.test.".to_string();
 
-        anchors.observe(".", &[anchor.clone(), elsewhere.clone()], &[], 1);
+        anchors.observe(
+            nm(".").as_ref(),
+            &[anchor.clone(), elsewhere.clone()],
+            &[],
+            1,
+        );
         assert_eq!(state_of(&anchors, &elsewhere), None);
     }
 
@@ -1094,7 +1151,7 @@ mod tests {
         let new = zone_key(2);
         let mut anchors = anchored_on(&old);
         let t0 = 1_700_000_000;
-        anchors.observe(".", &[old.clone(), new.clone()], &[], t0);
+        anchors.observe(nm(".").as_ref(), &[old.clone(), new.clone()], &[], t0);
 
         let text = anchors.format();
         let reread = ManagedAnchors::parse(&text, t0 + 999).expect("re-parse");
@@ -1138,14 +1195,14 @@ mod tests {
         let mut revoked = anchor.clone();
         revoked.flags |= DNSKEY_FLAG_REVOKE;
         anchors.observe(
-            ".",
+            nm(".").as_ref(),
             std::slice::from_ref(&revoked),
             std::slice::from_ref(&revoked),
             2,
         );
 
         assert_eq!(anchors.ds().len(), 1, "the DS anchor is untouched");
-        assert!(anchors.has_anchor_for("."));
+        assert!(anchors.has_anchor_for(nm(".").as_ref()));
     }
 
     /// Fatal, not shrugged off: losing anchor state means validating nothing, or
@@ -1166,7 +1223,7 @@ mod tests {
             .expect("seed from the built-in anchor");
         assert_eq!(seeded.ds().len(), TrustAnchors::icann_root().all().len());
         assert!(seeded.keys().is_empty());
-        assert!(seeded.has_anchor_for("."));
+        assert!(seeded.has_anchor_for(nm(".").as_ref()));
     }
 
     #[test]
@@ -1183,7 +1240,7 @@ mod tests {
         let fresh = zone_key(2);
         let mut anchors = anchored_on(&old);
         let t0 = 1_700_000_000;
-        anchors.observe(".", &[old.clone(), fresh.clone()], &[], t0);
+        anchors.observe(nm(".").as_ref(), &[old.clone(), fresh.clone()], &[], t0);
         anchors.save(&path).expect("save");
 
         // A restart the next day must find the hold-down where it left it,
@@ -1233,7 +1290,7 @@ mod tests {
 
     /// A DNSKEY RRset and a real signature over it, as an answer section.
     fn signed_dnskey_rrset(
-        zone: &str,
+        zone: NameRef<'_>,
         published: &[Dnskey],
         signer: &TestKey,
         signer_flags: u16,
@@ -1253,7 +1310,7 @@ mod tests {
         let sig = signer.sign_rrset_as(
             &Rrset::new(zone, rt::DNSKEY, Class::new(1), &rdatas),
             3600,
-            zone,
+            &zone.to_presentation(),
             signer_flags,
         );
 
@@ -1279,39 +1336,59 @@ mod tests {
         let mut anchors = anchored_on(&old_key);
 
         // Only the original is published, and it signs the RRset.
-        let records = signed_dnskey_rrset(".", std::slice::from_ref(&old_key), &old, KSK_FLAGS);
-        let signers = self_signers(".", &records, t0);
+        let records = signed_dnskey_rrset(
+            nm(".").as_ref(),
+            std::slice::from_ref(&old_key),
+            &old,
+            KSK_FLAGS,
+        );
+        let signers = self_signers(nm(".").as_ref(), &records, t0);
         assert!(
             signers.iter().any(|k| same_key(k, &old_key)),
             "the key that signed the RRset is recognised as having signed it"
         );
-        anchors.observe(".", std::slice::from_ref(&old_key), &signers, t0);
+        anchors.observe(
+            nm(".").as_ref(),
+            std::slice::from_ref(&old_key),
+            &signers,
+            t0,
+        );
         assert_eq!(state_of(&anchors, &old_key), Some(KeyState::Valid));
 
         // The successor appears, still signed by the original.
         let published = vec![old_key.clone(), new_key.clone()];
-        let records = signed_dnskey_rrset(".", &published, &old, KSK_FLAGS);
-        let signers = self_signers(".", &records, t0);
+        let records = signed_dnskey_rrset(nm(".").as_ref(), &published, &old, KSK_FLAGS);
+        let signers = self_signers(nm(".").as_ref(), &records, t0);
         assert_eq!(signers.len(), 1, "only the original signed it");
-        anchors.observe(".", &published, &signers, t0);
+        anchors.observe(nm(".").as_ref(), &published, &signers, t0);
         assert_eq!(state_of(&anchors, &new_key), Some(KeyState::AddPend));
 
         // Thirty days later it is adopted.
-        anchors.observe(".", &published, &signers, t0 + ADD_HOLD_DOWN);
+        anchors.observe(nm(".").as_ref(), &published, &signers, t0 + ADD_HOLD_DOWN);
         assert_eq!(state_of(&anchors, &new_key), Some(KeyState::Valid));
 
         // The original revokes itself: republished with REVOKE set, and the
         // RRset signed by that same key in its revoked form.
         let revoked_key = old.dnskey_with(".", KSK_FLAGS | DNSKEY_FLAG_REVOKE);
         let published = vec![revoked_key.clone(), new_key.clone()];
-        let records = signed_dnskey_rrset(".", &published, &old, KSK_FLAGS | DNSKEY_FLAG_REVOKE);
-        let signers = self_signers(".", &records, t0);
+        let records = signed_dnskey_rrset(
+            nm(".").as_ref(),
+            &published,
+            &old,
+            KSK_FLAGS | DNSKEY_FLAG_REVOKE,
+        );
+        let signers = self_signers(nm(".").as_ref(), &records, t0);
         assert!(
             signers.iter().any(|k| same_key(k, &old_key)),
             "the revoked key really did sign the set it revokes itself in"
         );
 
-        let changes = anchors.observe(".", &published, &signers, t0 + ADD_HOLD_DOWN + DAY);
+        let changes = anchors.observe(
+            nm(".").as_ref(),
+            &published,
+            &signers,
+            t0 + ADD_HOLD_DOWN + DAY,
+        );
         assert!(
             changes
                 .iter()
@@ -1351,11 +1428,16 @@ mod tests {
         let t0 = crate::utils::current_unix_timestamp();
 
         let mut anchors = anchored_on(&old_key);
-        let records = signed_dnskey_rrset(".", std::slice::from_ref(&old_key), &old, KSK_FLAGS);
-        anchors.observe(
-            ".",
+        let records = signed_dnskey_rrset(
+            nm(".").as_ref(),
             std::slice::from_ref(&old_key),
-            &self_signers(".", &records, t0),
+            &old,
+            KSK_FLAGS,
+        );
+        anchors.observe(
+            nm(".").as_ref(),
+            std::slice::from_ref(&old_key),
+            &self_signers(nm(".").as_ref(), &records, t0),
             t0,
         );
         assert_eq!(state_of(&anchors, &old_key), Some(KeyState::Valid));
@@ -1364,14 +1446,14 @@ mod tests {
         let revoked_key = old.dnskey_with(".", KSK_FLAGS | DNSKEY_FLAG_REVOKE);
         let other_key = other.ksk(".");
         let published = vec![revoked_key.clone(), other_key.clone()];
-        let records = signed_dnskey_rrset(".", &published, &other, KSK_FLAGS);
+        let records = signed_dnskey_rrset(nm(".").as_ref(), &published, &other, KSK_FLAGS);
 
-        let signers = self_signers(".", &records, t0);
+        let signers = self_signers(nm(".").as_ref(), &records, t0);
         assert!(
             !signers.iter().any(|k| same_key(k, &old_key)),
             "the anchor did not sign this, and the check must see that"
         );
-        anchors.observe(".", &published, &signers, t0 + DAY);
+        anchors.observe(nm(".").as_ref(), &published, &signers, t0 + DAY);
 
         assert_eq!(
             state_of(&anchors, &old_key),
@@ -1394,9 +1476,9 @@ mod tests {
         let t0 = crate::utils::current_unix_timestamp();
 
         let published = vec![signer.ksk("."), bystander.ksk(".")];
-        let records = signed_dnskey_rrset(".", &published, &signer, KSK_FLAGS);
+        let records = signed_dnskey_rrset(nm(".").as_ref(), &published, &signer, KSK_FLAGS);
 
-        let signers = self_signers(".", &records, t0);
+        let signers = self_signers(nm(".").as_ref(), &records, t0);
         assert_eq!(signers.len(), 1);
         assert!(same_key(&signers[0], &signer.ksk(".")));
 
@@ -1406,7 +1488,7 @@ mod tests {
             .filter(|rr| rr.rdata.rtype() != rt::RRSIG)
             .cloned()
             .collect();
-        assert!(self_signers(".", &unsigned, t0).is_empty());
+        assert!(self_signers(nm(".").as_ref(), &unsigned, t0).is_empty());
     }
 
     fn state_of(anchors: &ManagedAnchors, key: &Dnskey) -> Option<KeyState> {

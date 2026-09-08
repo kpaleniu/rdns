@@ -13,11 +13,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::tsig::{self, TsigError, TsigKey};
-use crate::utils::{is_at_or_under, record_types as rt};
+use crate::utils::record_types as rt;
 use crate::zone::{Zone, ZoneRecord};
 use crate::{
-    DnsMessage, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, ResourceRecord,
-    ResponseCode, Serial,
+    DnsMessage, Name, NameRef, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection,
+    ResourceRecord, ResponseCode, Serial,
 };
 
 /// How long a transfer may take from connect to closing SOA.
@@ -33,16 +33,16 @@ pub const SOA_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_TRANSFER_RECORDS: usize = 5_000_000;
 
 /// A request for the zone's SOA — the refresh check (RFC 1035 §4.3.5).
-pub fn soa_query(zone: &str, id: u16) -> DnsMessage {
+pub fn soa_query(zone: NameRef<'_>, id: u16) -> DnsMessage {
     question(zone, Qtype::of(rt::SOA), id)
 }
 
 /// A request for the whole zone.
-pub fn axfr_request(zone: &str, id: u16) -> DnsMessage {
+pub fn axfr_request(zone: NameRef<'_>, id: u16) -> DnsMessage {
     question(zone, Qtype::AXFR, id)
 }
 
-fn question(zone: &str, qtype: Qtype, id: u16) -> DnsMessage {
+fn question(zone: NameRef<'_>, qtype: Qtype, id: u16) -> DnsMessage {
     DnsMessage {
         id,
         response: false,
@@ -56,7 +56,7 @@ fn question(zone: &str, qtype: Qtype, id: u16) -> DnsMessage {
         cd: false,
         rcode: ResponseCode::Ok,
         queries: vec![QuerySection {
-            qname: zone.to_string(),
+            qname: zone.to_owned(),
             qtype,
             qclass: QueryClass::IN,
         }],
@@ -92,7 +92,7 @@ pub enum Progress {
 ///
 /// Fed one message at a time, so the caller can stop reading at the closing SOA.
 pub struct AxfrAssembler {
-    zone: String,
+    zone: Name,
     records: Vec<ResourceRecord>,
     /// The apex SOA that opened the transfer, and the serial it carried.
     opening_soa: Option<(ResourceRecord, Serial)>,
@@ -100,9 +100,9 @@ pub struct AxfrAssembler {
 }
 
 impl AxfrAssembler {
-    pub fn new(zone: &str) -> Self {
+    pub fn new(zone: Name) -> Self {
         AxfrAssembler {
-            zone: absolute(zone),
+            zone,
             records: Vec::new(),
             opening_soa: None,
             complete: false,
@@ -128,9 +128,9 @@ impl AxfrAssembler {
     }
 
     fn accept_record(&mut self, rr: &ResourceRecord) -> TransferResult<Progress> {
-        let name = belongs_here(rr, &self.zone)?;
+        let name = belongs_here(rr, self.zone.as_ref())?;
 
-        let is_apex_soa = rr.rdata.rtype() == rt::SOA && name.eq_ignore_ascii_case(&self.zone);
+        let is_apex_soa = rr.rdata.rtype() == rt::SOA && name.eq(&self.zone);
 
         match &self.opening_soa {
             // The first record is the zone's SOA (RFC 5936 §2.2).
@@ -179,7 +179,7 @@ impl AxfrAssembler {
         let mut zone = Zone::new(self.zone.clone());
         for rr in self.records {
             zone.add_record(ZoneRecord {
-                name: absolute(&rr.name),
+                name: rr.name,
                 ttl: rr.ttl,
                 class: rr.class,
                 rdata: rr.rdata,
@@ -193,7 +193,7 @@ impl AxfrAssembler {
 ///
 /// `current_soa` rides in the *authority* section; that is the only thing
 /// distinguishing an IXFR request from an AXFR one.
-pub fn ixfr_request(zone: &str, current_soa: ResourceRecord, id: u16) -> DnsMessage {
+pub fn ixfr_request(zone: NameRef<'_>, current_soa: ResourceRecord, id: u16) -> DnsMessage {
     let mut msg = question(zone, Qtype::IXFR, id);
     msg.authorities = vec![current_soa];
     msg
@@ -249,7 +249,7 @@ enum IxfrState {
 /// signal is positional: the *second* record. Another SOA means difference
 /// sequences follow, anything else means a full transfer.
 pub struct IxfrAssembler {
-    zone: String,
+    zone: Name,
     current_serial: Option<Serial>,
     state: IxfrState,
     records_seen: usize,
@@ -259,9 +259,9 @@ pub struct IxfrAssembler {
 }
 
 impl IxfrAssembler {
-    pub fn new(zone: &str) -> Self {
+    pub fn new(zone: Name) -> Self {
         IxfrAssembler {
-            zone: absolute(zone),
+            zone: zone.clone(),
             current_serial: None,
             state: IxfrState::AwaitingFirstSoa,
             records_seen: 0,
@@ -298,10 +298,10 @@ impl IxfrAssembler {
     }
 
     fn accept_record(&mut self, rr: &ResourceRecord) -> TransferResult<Progress> {
-        let name = belongs_here(rr, &self.zone)?;
+        let name = belongs_here(rr, self.zone.as_ref())?;
         self.records_seen += 1;
 
-        let soa_serial = if rr.rdata.rtype() == rt::SOA && name.eq_ignore_ascii_case(&self.zone) {
+        let soa_serial = if rr.rdata.rtype() == rt::SOA && name.eq(&self.zone) {
             match rr.rdata.parse() {
                 Ok(ParsedRecord::SOA { serial, .. }) => Some(serial),
                 _ => {
@@ -449,9 +449,9 @@ fn check_envelope(msg: &DnsMessage, closed: bool) -> TransferResult<()> {
 ///
 /// Malformed rather than a timeout: a secondary retries a timeout and gives up
 /// on a malformed transfer, and neither fault clears by waiting.
-fn belongs_here(rr: &ResourceRecord, zone: &str) -> TransferResult<String> {
-    let name = absolute(&rr.name);
-    if !is_at_or_under(&name, zone) {
+fn belongs_here(rr: &ResourceRecord, zone: NameRef<'_>) -> TransferResult<Name> {
+    let name = rr.name.clone();
+    if !name.as_ref().is_at_or_under(zone) {
         return Err(TransferError::malformed(format!(
             "master sent {name}, which is not in {zone}: a transfer may only carry \
              the zone it is a transfer of"
@@ -464,12 +464,6 @@ fn belongs_here(rr: &ResourceRecord, zone: &str) -> TransferResult<String> {
         )));
     }
     Ok(name)
-}
-
-/// [`crate::utils::absolute`], owned — this module's callers all keep the
-/// result.
-fn absolute(name: &str) -> String {
-    crate::utils::absolute(name).into_owned()
 }
 
 /// One transfer's connection: the socket, the id every reply is checked
@@ -537,7 +531,7 @@ impl<'a> TransferSession<'a> {
 /// address we asked.
 pub async fn fetch_soa(
     master: std::net::SocketAddr,
-    zone: &str,
+    zone: NameRef<'_>,
     key: Option<&TsigKey>,
 ) -> TransferResult<Serial> {
     let deadline = tokio::time::timeout(SOA_TIMEOUT, async {
@@ -562,14 +556,14 @@ pub async fn fetch_soa(
 /// Transfer the zone from `master`, verifying it as it arrives.
 pub async fn fetch_zone(
     master: std::net::SocketAddr,
-    zone: &str,
+    zone: NameRef<'_>,
     key: Option<&TsigKey>,
 ) -> TransferResult<Zone> {
     let transfer = tokio::time::timeout(TRANSFER_TIMEOUT, async {
         let id = rand_id();
         let mut session = TransferSession::open(master, &axfr_request(zone, id), key).await?;
 
-        let mut assembler = AxfrAssembler::new(zone);
+        let mut assembler = AxfrAssembler::new(zone.to_owned());
         loop {
             if assembler.accept(&session.next().await?)? == Progress::Complete {
                 return assembler.into_zone();
@@ -591,17 +585,17 @@ pub async fn fetch_changes(
     base: &Zone,
     key: Option<&TsigKey>,
 ) -> TransferResult<IxfrOutcome> {
-    let zone = base.origin().to_string();
+    let zone = base.origin().to_owned();
     let soa = base
         .apex_soa_record()
         .ok_or_else(|| TransferError::malformed(format!("zone {zone} has no SOA to ask from")))?;
 
     let transfer = tokio::time::timeout(TRANSFER_TIMEOUT, async {
         let id = rand_id();
-        let request = ixfr_request(&zone, soa, id);
+        let request = ixfr_request(zone.as_ref(), soa, id);
         let mut session = TransferSession::open(master, &request, key).await?;
 
-        let mut assembler = IxfrAssembler::new(&zone);
+        let mut assembler = IxfrAssembler::new(zone.clone());
         loop {
             if assembler.accept(&session.next().await?)? == Progress::Complete {
                 return assembler.into_outcome(base);
@@ -719,7 +713,9 @@ use crate::utils::rand_id;
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_records::nm;
     use crate::transfer::axfr_messages;
     use crate::tsig::TsigAlgorithm;
     use crate::zone::parse_zone_file;
@@ -740,7 +736,7 @@ mod tests {
     }
 
     fn transfer_of(zone: &Zone) -> Vec<DnsMessage> {
-        axfr_messages(&axfr_request("example.com.", 1).clone(), zone)
+        axfr_messages(&axfr_request(nm("example.com.").as_ref(), 1).clone(), zone)
             .expect("build the transfer")
             .into_iter()
             .map(|mut m| {
@@ -754,7 +750,7 @@ mod tests {
     #[test]
     fn test_a_transfer_reassembles_into_the_zone_it_came_from() {
         let source = source_zone();
-        let mut assembler = AxfrAssembler::new("example.com.");
+        let mut assembler = AxfrAssembler::new(nm("example.com."));
         let mut progress = Progress::More;
         for msg in transfer_of(&source) {
             progress = assembler.accept(&msg).expect("accept");
@@ -767,18 +763,20 @@ mod tests {
         assert_eq!(received.serial(), Some(Serial::new(42)));
         assert_eq!(received.records().len(), source.records().len());
         assert_eq!(
-            received.query("www.example.com.", Qtype::of(rt::A)).len(),
-            1
-        );
-        assert_eq!(
             received
-                .query("www.example.com.", Qtype::of(rt::AAAA))
+                .query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
                 .len(),
             1
         );
         assert_eq!(
             received
-                .query("anything.example.com.", Qtype::of(rt::A))
+                .query(nm("www.example.com.").as_ref(), Qtype::of(rt::AAAA))
+                .len(),
+            1
+        );
+        assert_eq!(
+            received
+                .query(nm("anything.example.com.").as_ref(), Qtype::of(rt::A))
                 .len(),
             1,
             "the wildcard transferred too"
@@ -795,7 +793,7 @@ mod tests {
         messages[0].answers.insert(
             1,
             ResourceRecord {
-                name: "ch.example.com.".to_string(),
+                name: nm("ch.example.com."),
                 class: Class::new(3),
                 ttl: Ttl::from_secs(300),
                 rdata: crate::RecordData::from_parsed(&ParsedRecord::TXT(vec![b"chaos".to_vec()]))
@@ -803,7 +801,7 @@ mod tests {
             },
         );
 
-        let mut assembler = AxfrAssembler::new("example.com.");
+        let mut assembler = AxfrAssembler::new(nm("example.com."));
         let err = messages
             .iter()
             .find_map(|msg| assembler.accept(msg).err())
@@ -820,7 +818,7 @@ mod tests {
     fn test_a_transfer_without_its_closing_soa_is_refused() {
         let source = source_zone();
         let messages = transfer_of(&source);
-        let mut assembler = AxfrAssembler::new("example.com.");
+        let mut assembler = AxfrAssembler::new(nm("example.com."));
 
         // Everything but the closing SOA.
         let mut truncated = messages[0].clone();
@@ -836,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_a_transfer_must_open_with_the_apex_soa() {
-        let mut assembler = AxfrAssembler::new("example.com.");
+        let mut assembler = AxfrAssembler::new(nm("example.com."));
         let mut msg = transfer_of(&source_zone())[0].clone();
         msg.answers.remove(0); // drop the opening SOA
 
@@ -850,12 +848,12 @@ mod tests {
     /// A master for one zone must not be able to write into another.
     #[test]
     fn test_out_of_bailiwick_records_are_refused() {
-        let mut assembler = AxfrAssembler::new("example.com.");
+        let mut assembler = AxfrAssembler::new(nm("example.com."));
         let mut msg = transfer_of(&source_zone())[0].clone();
         msg.answers.insert(
             1,
             ResourceRecord {
-                name: "www.other-zone.test.".to_string(),
+                name: nm("www.other-zone.test."),
                 class: Class::new(1),
                 ttl: Ttl::from_secs(300),
                 rdata: crate::RecordData::from_parsed(&ParsedRecord::A(
@@ -875,7 +873,7 @@ mod tests {
     #[test]
     fn test_records_after_the_closing_soa_are_refused() {
         let source = source_zone();
-        let mut assembler = AxfrAssembler::new("example.com.");
+        let mut assembler = AxfrAssembler::new(nm("example.com."));
         for msg in transfer_of(&source) {
             let _ = assembler.accept(&msg);
         }
@@ -888,7 +886,7 @@ mod tests {
 
     #[test]
     fn test_an_error_rcode_is_not_a_transfer() {
-        let mut assembler = AxfrAssembler::new("example.com.");
+        let mut assembler = AxfrAssembler::new(nm("example.com."));
         let mut msg = transfer_of(&source_zone())[0].clone();
         msg.rcode = ResponseCode::Refused;
         assert!(assembler
@@ -900,7 +898,7 @@ mod tests {
         // Nor is a non-authoritative one.
         let mut not_auth = transfer_of(&source_zone())[0].clone();
         not_auth.authoritive = false;
-        let mut assembler = AxfrAssembler::new("example.com.");
+        let mut assembler = AxfrAssembler::new(nm("example.com."));
         assert!(assembler
             .accept(&not_auth)
             .unwrap_err()
@@ -911,17 +909,17 @@ mod tests {
     #[test]
     fn test_soa_serial_reads_the_answer_or_the_authority() {
         let zone = source_zone();
-        let mut reply = soa_query("example.com.", 1);
+        let mut reply = soa_query(nm("example.com.").as_ref(), 1);
         reply.response = true;
         reply.answers = vec![zone.apex_soa_record().unwrap()];
         assert_eq!(soa_serial(&reply), Some(Serial::new(42)));
 
-        let mut in_authority = soa_query("example.com.", 1);
+        let mut in_authority = soa_query(nm("example.com.").as_ref(), 1);
         in_authority.response = true;
         in_authority.authorities = vec![zone.apex_soa_record().unwrap()];
         assert_eq!(soa_serial(&in_authority), Some(Serial::new(42)));
 
-        assert_eq!(soa_serial(&soa_query("example.com.", 1)), None);
+        assert_eq!(soa_serial(&soa_query(nm("example.com.").as_ref(), 1)), None);
     }
 
     /// The two versions the incremental tests move between, and the server-side
@@ -962,7 +960,7 @@ mod tests {
         log: &crate::ixfr::DeltaLog,
     ) -> IxfrAssembler {
         let response = crate::ixfr::ixfr_response(request, serving, log).expect("build a response");
-        let mut assembler = IxfrAssembler::new("example.com.");
+        let mut assembler = IxfrAssembler::new(nm("example.com."));
         for msg in response.messages(request, serving).expect("materialize") {
             if assembler.accept(&msg).expect("accept") == Progress::Complete {
                 break;
@@ -972,7 +970,11 @@ mod tests {
     }
 
     fn ixfr_from(zone: &Zone) -> DnsMessage {
-        ixfr_request("example.com.", zone.apex_soa_record().unwrap(), 0x77)
+        ixfr_request(
+            nm("example.com.").as_ref(),
+            zone.apex_soa_record().unwrap(),
+            0x77,
+        )
     }
 
     #[test]
@@ -996,20 +998,23 @@ mod tests {
 
         // What changed, changed; what did not, did not.
         assert_eq!(
-            zone.query("www.example.com.", Qtype::of(rt::A))[0].rdata,
-            v2.query("www.example.com.", Qtype::of(rt::A))[0].rdata
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))[0].rdata,
+            v2.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))[0].rdata
         );
         assert_eq!(
-            zone.query("fresh.example.com.", Qtype::of(rt::TXT)).len(),
+            zone.query(nm("fresh.example.com.").as_ref(), Qtype::of(rt::TXT))
+                .len(),
             1,
             "added"
         );
         assert!(
-            zone.query("gone.example.com.", Qtype::of(rt::A)).is_empty(),
+            zone.query(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+                .is_empty(),
             "deleted"
         );
         assert_eq!(
-            zone.query("keep.example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("keep.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1,
             "untouched"
         );
@@ -1018,12 +1023,12 @@ mod tests {
         let mut got: Vec<_> = zone
             .records()
             .iter()
-            .map(|r| (r.name.to_lowercase(), r.rdata.clone()))
+            .map(|r| (r.name.as_ref().to_folded().to_string(), r.rdata.clone()))
             .collect();
         let mut want: Vec<_> = v2
             .records()
             .iter()
-            .map(|r| (r.name.to_lowercase(), r.rdata.clone()))
+            .map(|r| (r.name.as_ref().to_folded().to_string(), r.rdata.clone()))
             .collect();
         got.sort_by_key(|r| (r.0.clone(), r.1.rtype()));
         want.sort_by_key(|r| (r.0.clone(), r.1.rtype()));
@@ -1074,12 +1079,13 @@ mod tests {
         assert_eq!(steps, 2);
         assert_eq!(zone.serial(), Some(Serial::new(3)));
         assert_eq!(
-            zone.query("www.example.com.", Qtype::of(rt::A))[0].rdata,
-            v3.query("www.example.com.", Qtype::of(rt::A))[0].rdata,
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))[0].rdata,
+            v3.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))[0].rdata,
             "the last step's value, not the first's"
         );
         assert_eq!(
-            zone.query("www.example.com.", Qtype::of(rt::A)).len(),
+            zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1,
             "not accumulated"
         );
@@ -1101,7 +1107,9 @@ mod tests {
         };
         assert_eq!(zone.serial(), Some(Serial::new(2)));
         assert_eq!(zone.records().len(), v2.records().len());
-        assert!(zone.query("gone.example.com.", Qtype::of(rt::A)).is_empty());
+        assert!(zone
+            .query(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+            .is_empty());
     }
 
     #[test]
@@ -1151,7 +1159,8 @@ mod tests {
             "and the update still applied"
         );
         assert_eq!(
-            zone.query("fresh.example.com.", Qtype::of(rt::TXT)).len(),
+            zone.query(nm("fresh.example.com.").as_ref(), Qtype::of(rt::TXT))
+                .len(),
             1
         );
     }
@@ -1166,7 +1175,7 @@ mod tests {
         let response = crate::ixfr::ixfr_response(&ixfr_from(&v1), &v2, &log).unwrap();
         let mut messages = response.messages(&ixfr_from(&v1), &v2).unwrap();
         messages[0].answers.pop();
-        let mut assembler = IxfrAssembler::new("example.com.");
+        let mut assembler = IxfrAssembler::new(nm("example.com."));
         for msg in &messages {
             let _ = assembler.accept(msg);
         }
@@ -1186,7 +1195,7 @@ mod tests {
         out_of_bailiwick[0].answers.insert(
             2,
             ResourceRecord {
-                name: "www.elsewhere.test.".to_string(),
+                name: nm("www.elsewhere.test."),
                 class: Class::new(1),
                 ttl: Ttl::from_secs(300),
                 rdata: crate::RecordData::from_parsed(&ParsedRecord::A(
@@ -1195,7 +1204,7 @@ mod tests {
                 .unwrap(),
             },
         );
-        let mut assembler = IxfrAssembler::new("example.com.");
+        let mut assembler = IxfrAssembler::new(nm("example.com."));
         let err = out_of_bailiwick
             .iter()
             .find_map(|msg| assembler.accept(msg).err())
@@ -1208,13 +1217,13 @@ mod tests {
         // And an answer that does not open with the zone's SOA. Dropping the
         // first record would *not* be caught — the second record is an SOA too —
         // which is safe only because the serial names the base we apply against.
-        let mut assembler = IxfrAssembler::new("example.com.");
+        let mut assembler = IxfrAssembler::new(nm("example.com."));
         let mut headless = crate::ixfr::ixfr_response(&ixfr_from(&v1), &v2, &log)
             .unwrap()
             .messages(&ixfr_from(&v1), &v2)
             .unwrap();
         headless[0].answers[0] = ResourceRecord {
-            name: "www.example.com.".to_string(),
+            name: nm("www.example.com."),
             class: Class::new(1),
             ttl: Ttl::from_secs(300),
             rdata: crate::RecordData::from_parsed(&ParsedRecord::A("192.0.2.77".parse().unwrap()))
@@ -1319,13 +1328,15 @@ mod tests {
         let source = source_zone();
         let master = spawn_master(source.clone(), None).await;
 
-        let received = fetch_zone(master, "example.com.", None)
+        let received = fetch_zone(master, nm("example.com.").as_ref(), None)
             .await
             .expect("transfer");
         assert_eq!(received.serial(), Some(Serial::new(42)));
         assert_eq!(received.records().len(), source.records().len());
         assert_eq!(
-            received.query("www.example.com.", Qtype::of(rt::A)).len(),
+            received
+                .query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .len(),
             1
         );
     }
@@ -1334,7 +1345,9 @@ mod tests {
     async fn test_fetches_the_soa_serial_over_tcp() {
         let master = spawn_master(source_zone(), None).await;
         assert_eq!(
-            fetch_soa(master, "example.com.", None).await.unwrap(),
+            fetch_soa(master, nm("example.com.").as_ref(), None)
+                .await
+                .unwrap(),
             Serial::new(42),
             "the master's apex SOA carries serial 42"
         );
@@ -1351,7 +1364,7 @@ mod tests {
         );
         let master = spawn_master(source_zone(), Some(key.clone())).await;
 
-        let received = fetch_zone(master, "example.com.", Some(&key))
+        let received = fetch_zone(master, nm("example.com.").as_ref(), Some(&key))
             .await
             .expect("signed transfer");
         assert_eq!(received.serial(), Some(Serial::new(42)));
@@ -1375,9 +1388,10 @@ mod tests {
             text.push_str(&format!("host{i:04}  IN A 192.0.2.1\n"));
         }
         let source = parse_zone_file(&text, "example.com.").expect("zone parses");
-        let envelopes = crate::transfer::axfr_messages(&axfr_request("example.com.", 1), &source)
-            .expect("build the transfer")
-            .len();
+        let envelopes =
+            crate::transfer::axfr_messages(&axfr_request(nm("example.com.").as_ref(), 1), &source)
+                .expect("build the transfer")
+                .len();
         assert!(
             envelopes > 2,
             "this test is about the chain, and the zone fits in {envelopes} envelope(s)"
@@ -1390,7 +1404,7 @@ mod tests {
         );
         let master = spawn_master(source.clone(), Some(key.clone())).await;
 
-        let received = fetch_zone(master, "example.com.", Some(&key))
+        let received = fetch_zone(master, nm("example.com.").as_ref(), Some(&key))
             .await
             .expect("signed multi-envelope transfer");
         assert_eq!(received.serial(), Some(Serial::new(42)));
@@ -1412,7 +1426,7 @@ mod tests {
         );
         let master = spawn_master(source_zone(), Some(master_key)).await;
 
-        let err = fetch_zone(master, "example.com.", Some(&ours))
+        let err = fetch_zone(master, nm("example.com.").as_ref(), Some(&ours))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("signature failed"), "got: {err}");
@@ -1425,6 +1439,8 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             listener.local_addr().unwrap()
         };
-        assert!(fetch_zone(addr, "example.com.", None).await.is_err());
+        assert!(fetch_zone(addr, nm("example.com.").as_ref(), None)
+            .await
+            .is_err());
     }
 }

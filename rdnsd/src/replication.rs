@@ -38,6 +38,7 @@ use rdns::utils::current_unix_timestamp;
 use rdns::xfr;
 use rdns::zone::Zone;
 use rdns::zone_writer::write_zone_file;
+use rdns::NameRef;
 use rdns::Serial;
 
 use crate::zones::{install_zone, ZoneContext, Zones};
@@ -53,7 +54,7 @@ pub(crate) struct ReplicatedZone {
 }
 
 /// Replicated zones by lowercased origin.
-pub(crate) type Secondaries = Arc<HashMap<String, ReplicatedZone>>;
+pub(crate) type Secondaries = Arc<HashMap<Vec<u8>, ReplicatedZone>>;
 
 /// What every refresh task shares with the server and with each other.
 ///
@@ -81,7 +82,7 @@ pub(crate) fn spawn_secondaries(
     lifecycle: Lifecycle,
 ) -> Result<Secondaries> {
     let Lifecycle { stop, busy } = lifecycle;
-    let mut registry: HashMap<String, ReplicatedZone> = HashMap::new();
+    let mut registry: HashMap<Vec<u8>, ReplicatedZone> = HashMap::new();
 
     for spec in specs {
         // A key named but not defined is a configuration error, not a reason to
@@ -110,7 +111,7 @@ pub(crate) fn spawn_secondaries(
         let wake = Arc::new(Notify::new());
         let entry = registry
             // Folded the same way as the lookup in `notify_reply`.
-            .entry(rdns::utils::absolute_lowered(&spec.zone).into_owned())
+            .entry(spec.zone.as_ref().folded().into_owned())
             .or_insert_with(|| ReplicatedZone {
                 masters: Vec::new(),
                 wake: Vec::new(),
@@ -179,7 +180,7 @@ async fn secondary_loop(
         // After the refresh, not before: the refresh may have just installed
         // the zone that defines them. Read first, a zone's first transfer is
         // followed by the default hour instead of its own REFRESH.
-        let timers = zone_timers(&replication.served.zone_map, &spec.zone).await;
+        let timers = zone_timers(&replication.served.zone_map, spec.zone.as_ref()).await;
 
         let wait = match result {
             Ok(outcome) => {
@@ -204,7 +205,7 @@ async fn secondary_loop(
 
 /// The timers the zone we currently hold asks for, or the defaults if we hold
 /// none — a zone we have never fetched has no SOA to obey.
-async fn zone_timers(zone_map: &Arc<RwLock<Zones>>, zone: &str) -> RefreshTimers {
+async fn zone_timers(zone_map: &Arc<RwLock<Zones>>, zone: NameRef<'_>) -> RefreshTimers {
     zone_map
         .read()
         .await
@@ -232,10 +233,10 @@ pub(crate) async fn refresh_once(
     } = served;
     // A clone, not a borrow: holding the read lock across a network round trip
     // blocks every reload and swap for the length of the transfer.
-    let base = zone_map.read().await.matching(&spec.zone).cloned();
+    let base = zone_map.read().await.matching(spec.zone.as_ref()).cloned();
     let held = base.as_ref().and_then(Zone::serial);
 
-    let remote = xfr::fetch_soa(spec.master, &spec.zone, key).await?;
+    let remote = xfr::fetch_soa(spec.master, spec.zone.as_ref(), key).await?;
     let now = current_unix_timestamp();
 
     // EXPIRE resets on contact, not on a transfer: a zone confirmed current is
@@ -278,7 +279,7 @@ pub(crate) async fn refresh_once(
                 zone
             }
         },
-        None => xfr::fetch_zone(spec.master, &spec.zone, key).await?,
+        None => xfr::fetch_zone(spec.master, spec.zone.as_ref(), key).await?,
     };
 
     let serial = fetched
@@ -287,7 +288,7 @@ pub(crate) async fn refresh_once(
 
     // Persist before serving, so the state line written last is only true once
     // the file and memory agree. Either order costs at most a refetch.
-    let path = zone_file_path(zone_dir, &spec.zone);
+    let path = zone_file_path(zone_dir, &spec.zone.as_ref().to_presentation());
     write_zone_file(&fetched, &path)?;
 
     let count = fetched.records().len();
@@ -301,7 +302,7 @@ pub(crate) async fn refresh_once(
 
     // Idempotent, and a no-op for a zone already there at startup, so the
     // ordinary hourly refresh reports nothing.
-    if readiness.arrived(&spec.zone) {
+    if readiness.arrived(&spec.zone.as_ref().to_presentation()) {
         tracing::info!(
             "{}: first transfer since startup{}",
             spec.zone,
@@ -314,7 +315,7 @@ pub(crate) async fn refresh_once(
     }
 
     // We are this zone's master to whoever replicates it from us.
-    announce_transfer(&spec.zone, serial, soa, notify_targets, busy);
+    announce_transfer(spec.zone.as_ref(), serial, soa, notify_targets, busy);
 
     Ok(match held {
         Some(held) => format!("transferred serial {held} -> {serial}, {count} records{note}"),
@@ -332,7 +333,7 @@ pub(crate) async fn record_state(
     // Contact, not transfer: all three callers mean "reached the master", and
     // contact is what EXPIRE counts from. A replica in contact with nothing new
     // to fetch is healthy, and a gauge moving only on a transfer calls it stale.
-    metrics.note_zone_transfer(&spec.zone, now);
+    metrics.note_zone_transfer(&spec.zone.as_ref().to_presentation(), now);
 
     // Update in memory under the guard, write outside it. `StateFile::record`
     // does both, and its write ends in an fsync of the file and its directory —
@@ -341,7 +342,7 @@ pub(crate) async fn record_state(
     let (path, text) = {
         let mut file = state.lock().expect("state mutex");
         file.set(TransferState {
-            zone: spec.zone.clone(),
+            zone: spec.zone.as_ref().to_presentation(),
             serial,
             refreshed_at: now,
             master: spec.master,
@@ -383,7 +384,7 @@ pub(crate) async fn expire_if_out_of_contact(
     let last_contact = state
         .lock()
         .expect("state mutex")
-        .get(&spec.zone, spec.master)
+        .get(&spec.zone.as_ref().to_presentation(), spec.master)
         .map(|s| s.refreshed_at)
         .unwrap_or(started_at);
 
@@ -392,12 +393,12 @@ pub(crate) async fn expire_if_out_of_contact(
     }
 
     let mut zones = zone_map.write().await;
-    if zones.remove(&spec.zone) {
+    if zones.remove(spec.zone.as_ref()) {
         // The increments go with it: offering a chain for a withdrawn zone is
         // answering for something we stopped serving.
-        deltas.write().await.forget(&spec.zone);
+        deltas.write().await.forget(spec.zone.as_ref());
         // And the gauges: a frozen serial shows a withdrawn zone as healthy.
-        metrics.forget_zone(&spec.zone);
+        metrics.forget_zone(&spec.zone.as_ref().to_presentation());
         // WARN, not INFO: this is what the alert is built on.
         tracing::warn!(
             "secondary {}: EXPIRE ({}s) passed with no contact — no longer serving this zone",
@@ -438,8 +439,8 @@ pub(crate) async fn withdraw_unvouched_zones(
     let now = current_unix_timestamp();
 
     for spec in specs {
-        let timers = zone_timers(zone_map, &spec.zone).await;
-        let why = match state.get(&spec.zone, spec.master) {
+        let timers = zone_timers(zone_map, spec.zone.as_ref()).await;
+        let why = match state.get(&spec.zone.as_ref().to_presentation(), spec.master) {
             Some(entry) if timers.has_expired(entry.refreshed_at, now) => format!(
                 "the copy on disk expired {}s ago",
                 now.saturating_sub(entry.refreshed_at + timers.expire)
@@ -451,11 +452,11 @@ pub(crate) async fn withdraw_unvouched_zones(
         };
 
         let mut zones = zone_map.write().await;
-        if zones.remove(&spec.zone) {
+        if zones.remove(spec.zone.as_ref()) {
             // As in `expire_if_out_of_contact`: the increments and the gauges
             // go with the zone.
-            deltas.write().await.forget(&spec.zone);
-            metrics.forget_zone(&spec.zone);
+            deltas.write().await.forget(spec.zone.as_ref());
+            metrics.forget_zone(&spec.zone.as_ref().to_presentation());
             tracing::warn!(
                 "secondary {}: {why} — not serving it until {} answers",
                 spec.zone,

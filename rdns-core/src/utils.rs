@@ -1,7 +1,7 @@
 //! Name folding, timestamps, and record-type constants shared across the crate.
 
 use crate::error::{DnssecError, DnssecResult, WireError, WireResult};
-use crate::{ParsedRecord, Qtype, RecordData, Rtype};
+use crate::{Name, NameRef, ParsedRecord, Qtype, RecordData, Rtype};
 use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -190,27 +190,6 @@ fn has_ascii_uppercase(name: &str) -> bool {
         != 0
 }
 
-/// [`ascii_lowered`] without the copy when there is nothing to fold — which is
-/// most names, and this sits on the query path.
-pub fn ascii_lowered_cow(name: &str) -> std::borrow::Cow<'_, str> {
-    if has_ascii_uppercase(name) {
-        std::borrow::Cow::Owned(ascii_lowered(name))
-    } else {
-        std::borrow::Cow::Borrowed(name)
-    }
-}
-
-/// Whether two names are the same name: ASCII case folding (RFC 4343) and a
-/// trailing dot that is optional on either side.
-///
-/// Allocation-free — comparing is not the same operation as producing a
-/// normalized name, and only the latter needs to allocate.
-pub fn names_equal(a: &str, b: &str) -> bool {
-    let a = a.strip_suffix('.').unwrap_or(a);
-    let b = b.strip_suffix('.').unwrap_or(b);
-    a.eq_ignore_ascii_case(b)
-}
-
 /// A random DNS transaction id. The one implementation: an id is not a security
 /// boundary here, but that is no reason to make it predictable.
 pub fn rand_id() -> u16 {
@@ -254,27 +233,6 @@ pub fn absolute_lowered(name: &str) -> std::borrow::Cow<'_, str> {
 /// [`absolute_lowered`] into a buffer the caller keeps, so a name that *does*
 /// need folding costs no allocation either.
 ///
-/// The last allocation on `rdnsd`'s answer path for a case-randomized query
-/// (`TODO.md` #27a, #27d): the fold at the door has to outlive the question, and
-/// a `Cow` cannot borrow from a temporary. A UDP worker owns one of these beside
-/// its scratch buffer and its compressor, so a flood of DNS-0x20 queries reuses
-/// one allocation for the life of the process.
-///
-/// `buf` is cleared first: what it held was the previous question's key.
-pub fn absolute_lowered_in<'a>(name: &'a str, buf: &'a mut String) -> &'a str {
-    let needs_dot = !name.ends_with('.');
-    if !needs_dot && !has_ascii_uppercase(name) {
-        return name;
-    }
-    buf.clear();
-    buf.push_str(name);
-    buf.make_ascii_lowercase();
-    if needs_dot {
-        buf.push('.');
-    }
-    buf
-}
-
 /// The only form a name may be a map key in: absolute and ASCII case-folded
 /// (RFC 4343). One constructor, and it folds, so an insertion cannot skip it.
 ///
@@ -687,7 +645,7 @@ pub fn char_string_escaped(bytes: &[u8]) -> String {
 pub enum Redirect {
     /// The substituted name: the labels of the query name above the DNAME's
     /// owner, followed by its target.
-    To(String),
+    To(Name),
     /// The query name is not strictly below the owner, so the DNAME says
     /// nothing about it — Table 1's `<no match>`, which the first and fifth
     /// rows share with the second.
@@ -703,63 +661,31 @@ pub enum Redirect {
 /// "A DNAME substitution is performed by replacing the suffix labels of the
 /// name being sought matching the owner name of the DNAME resource record with
 /// the string of labels in the RDATA field. The matching labels end with the
-/// root label in all cases. Only whole labels are replaced." Whole labels is
-/// the trap: `ab.example.com.` against owner `b.example.com.` is `<no match>`,
-/// not `a.example.net.`.
+/// root label in all cases. Only whole labels are replaced."
+///
+/// **Whole labels is structural here.** Over wire form a suffix at a label
+/// boundary is the only kind of suffix there is, so `ab.example.com.` simply is
+/// not under `b.example.com.` — where the presentation form needed the rule
+/// spelled out and a `str::ends_with` got it wrong. The root as owner or as
+/// target needed a case of its own for the same reason, and does not now.
 ///
 /// Strictly below, so the owner is not redirected by its own DNAME (§2.3) —
-/// that is Table 1's second row, whose answer depends on the QTYPE and so is
-/// not a substitution at all.
-///
-/// Here rather than in either daemon because both apply it and to different
-/// inputs: `rdnsd` to a DNAME in a zone it serves, `rdnsr` to one in someone
-/// else's answer (§3.4.1 step 4D). Two copies of a rule about whole labels is
-/// one copy that splits on `.` (`CLAUDE.md` §7).
-pub fn dname_redirect(qname: &str, owner: &str, target: &str) -> Redirect {
-    // Both are compared as whole labels, case-insensitively, by the one
-    // function that already knows how (RFC 4343).
-    if !is_at_or_under(qname, owner) {
+/// Table 1's second row, whose answer depends on the QTYPE and so is not a
+/// substitution at all.
+pub fn dname_redirect(qname: NameRef<'_>, owner: NameRef<'_>, target: NameRef<'_>) -> Redirect {
+    if !qname.is_at_or_under(owner) || qname == owner {
         return Redirect::NoMatch;
     }
-    let owner = absolute(owner);
-    let qname = absolute(qname);
-    if qname.len() <= owner.len() {
-        // The owner itself, not a name below it.
-        return Redirect::NoMatch;
-    }
-    // `is_at_or_under` has already established that the owner is a whole-label
-    // suffix, so this cut lands just after a separator and the prefix keeps it.
-    // The root is the exception both ways: its text *is* the separator, so a
-    // DNAME at the root leaves the whole query name as the prefix.
-    let prefix = if owner.as_ref() == "." {
-        qname.as_ref()
-    } else {
-        &qname[..qname.len() - owner.len()]
-    };
-    let mut out = String::with_capacity(prefix.len() + target.len() + 1);
-    out.push_str(prefix);
-    // The target may be the root, whose text is a lone `.` and which must not
-    // add a second separator: `shortloop.x. / x. / .` is `shortloop.` in
-    // Table 1, not `shortloop..`.
-    let target = absolute(target);
-    out.push_str(if target == "." { "" } else { &target });
-    if out.is_empty() {
-        out.push('.');
-    }
-
-    // The one place the 255-octet limit is compared is the encoder
-    // (`dname::check_name_len`), so ask it rather than counting here: a name
-    // this accepts and serialization then refuses is the same defect from the
-    // other side. Only reached on a redirection, so the encode is not on any
-    // ordinary answer path.
-    match crate::dname_to_bytes(&out) {
-        Ok(_) => Redirect::To(out),
-        Err(WireError::TooLong { .. }) => Redirect::TooLong,
-        // Any other failure is a name one of the two inputs already carried,
-        // and neither is a name this process invented. Declining is the
-        // conservative answer: the caller gives no answer rather than a
-        // redirection to something it cannot spell.
-        Err(_) => Redirect::NoMatch,
+    let qwire = qname.as_wire();
+    let prefix = &qwire[..qwire.len() - owner.as_wire().len()];
+    let mut out = Vec::with_capacity(prefix.len() + target.as_wire().len());
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(target.as_wire());
+    match NameRef::from_wire_slice(&out) {
+        Ok(name) => Redirect::To(name.to_owned()),
+        // The only way octets that were two names can fail to be one is
+        // §2.3.4's limit, which §2.2 answers with YXDOMAIN.
+        Err(_) => Redirect::TooLong,
     }
 }
 
@@ -861,7 +787,9 @@ pub fn record_type_name(code: Rtype) -> Cow<'static, str> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::name::nm;
 
     /// A QTYPE is not an RTYPE: these three are questions no record answers to,
     /// so the record-type table says `None` for all of them (#33b).
@@ -887,25 +815,6 @@ mod tests {
         assert_eq!(qtype_name_to_code("TYPE1234"), Some(Qtype::from_u16(1234)));
         assert_eq!(qtype_name(Qtype::from_u16(1234)), "TYPE1234");
         assert_eq!(qtype_name_to_code("NOPE"), None);
-    }
-
-    #[test]
-    fn names_are_equal_by_ascii_folding_and_an_optional_trailing_dot() {
-        assert!(names_equal("EXAMPLE.COM.", "example.com"));
-        assert!(names_equal("Example.Com", "EXAMPLE.COM."));
-        assert!(names_equal("example.com.", "example.com."));
-        assert!(!names_equal("example.com.", "other.com."));
-
-        // The root, written either way.
-        assert!(names_equal(".", "."));
-        assert!(names_equal(".", ""));
-
-        // A suffix is not a name.
-        assert!(!names_equal("notexample.com.", "example.com."));
-
-        // The fold is ASCII only (RFC 4343): U+212A KELVIN SIGN lowercases to
-        // `k` under Unicode, and they are different bytes on the wire.
-        assert!(!names_equal("\u{212A}.example.com.", "k.example.com."));
     }
 
     /// Absolute and folded, borrowing when it is already both.
@@ -1210,7 +1119,7 @@ mod tests {
     #[test]
     fn the_rfc_6672_substitution_table() {
         let no_match = Redirect::NoMatch;
-        let to = |n: &str| Redirect::To(n.to_string());
+        let to = |n: &str| Redirect::To(nm(n));
         for (qname, owner, target, want) in [
             ("com.", "example.com.", "example.net.", no_match.clone()),
             (
@@ -1271,7 +1180,7 @@ mod tests {
             ("shortloop.x.", "x.", ".", to("shortloop.")),
         ] {
             assert_eq!(
-                dname_redirect(qname, owner, target),
+                dname_redirect(nm(qname).as_ref(), nm(owner).as_ref(), nm(target).as_ref()),
                 want,
                 "QNAME {qname} against {owner} DNAME {target}"
             );
@@ -1285,10 +1194,21 @@ mod tests {
     #[test]
     fn a_dname_at_the_root_keeps_the_whole_prefix() {
         assert_eq!(
-            dname_redirect("a.", ".", "example.net."),
-            Redirect::To("a.example.net.".to_string())
+            dname_redirect(
+                nm("a.").as_ref(),
+                nm(".").as_ref(),
+                nm("example.net.").as_ref()
+            ),
+            Redirect::To(nm("a.example.net."))
         );
-        assert_eq!(dname_redirect(".", ".", "example.net."), Redirect::NoMatch);
+        assert_eq!(
+            dname_redirect(
+                nm(".").as_ref(),
+                nm(".").as_ref(),
+                nm("example.net.").as_ref()
+            ),
+            Redirect::NoMatch
+        );
     }
 
     /// RFC 6672 §2.2: "suppose the target name of the DNAME RR is 250 octets in
@@ -1304,16 +1224,24 @@ mod tests {
         let label = "a".repeat(49);
         let last = "a".repeat(48);
         let target = format!("{label}.{label}.{label}.{label}.{last}.");
-        assert_eq!(crate::dname_to_bytes(&target).unwrap().len(), 250);
+        assert_eq!(nm(&target).as_ref().as_wire().len(), 250);
 
         // One label of six octets over a 250-octet target: 250 + 7 = 257.
         assert_eq!(
-            dname_redirect("abcdef.example.com.", "example.com.", &target),
+            dname_redirect(
+                nm("abcdef.example.com.").as_ref(),
+                nm("example.com.").as_ref(),
+                nm(&target).as_ref()
+            ),
             Redirect::TooLong
         );
         // And one that fits: 250 + 2 = 252.
         assert!(matches!(
-            dname_redirect("a.example.com.", "example.com.", &target),
+            dname_redirect(
+                nm("a.example.com.").as_ref(),
+                nm("example.com.").as_ref(),
+                nm(&target).as_ref()
+            ),
             Redirect::To(_)
         ));
     }
@@ -1324,8 +1252,12 @@ mod tests {
     #[test]
     fn a_substitution_keeps_the_case_it_was_given() {
         assert_eq!(
-            dname_redirect("WwW.ExAmPlE.CoM.", "example.com.", "Example.Net."),
-            Redirect::To("WwW.Example.Net.".to_string())
+            dname_redirect(
+                nm("WwW.ExAmPlE.CoM.").as_ref(),
+                nm("example.com.").as_ref(),
+                nm("Example.Net.").as_ref()
+            ),
+            Redirect::To(nm("WwW.Example.Net."))
         );
     }
 
@@ -1334,47 +1266,6 @@ mod tests {
         assert_eq!(record_type_name_to_code("TYPE65536"), None);
         assert_eq!(record_type_name_to_code("TYPE"), None);
         assert_eq!(record_type_name_to_code("TYPEA"), None);
-    }
-
-    /// Folding into a caller's buffer gives the same answer as folding into a
-    /// fresh `String`, and reuses the buffer rather than growing a new one —
-    /// which is the whole point (`TODO.md` #27a).
-    #[test]
-    fn a_fold_into_a_buffer_answers_as_the_owning_one_does() {
-        let mut buf = String::new();
-        for name in [
-            "www.example.com.",
-            "WwW.eXaMpLe.CoM.",
-            "www.example.com",
-            "WWW.EXAMPLE.COM",
-            ".",
-            "",
-        ] {
-            assert_eq!(
-                absolute_lowered_in(name, &mut buf),
-                absolute_lowered(name).as_ref(),
-                "{name:?}"
-            );
-        }
-
-        // The buffer is reused, not appended to: the second name must not find
-        // the first one still in it.
-        let mut buf = String::new();
-        assert_eq!(
-            absolute_lowered_in("A.example.com", &mut buf),
-            "a.example.com."
-        );
-        assert_eq!(
-            absolute_lowered_in("B.example.com", &mut buf),
-            "b.example.com."
-        );
-
-        // And a name that needs no folding borrows, leaving the buffer alone.
-        let mut buf = String::from("stale.example.com.");
-        assert_eq!(
-            absolute_lowered_in("www.example.com.", &mut buf),
-            "www.example.com."
-        );
     }
 
     /// The fold has no early exit, so the classic mistakes are the ends: a
@@ -1555,26 +1446,6 @@ mod tests {
         // ASCII case folds; U+212A KELVIN SIGN does not become `k`.
         assert!(is_at_or_under("WWW.Example.COM.", "example.com."));
         assert!(!is_at_or_under("\u{212A}.example.com.", "k.example.com."));
-    }
-
-    /// The borrowing form folds the same octets and no others. U+212A is upper
-    /// case to `char::is_uppercase` and not to `u8::is_ascii_uppercase`, so
-    /// scanning with the former would take the copying arm and still not fold it.
-    #[test]
-    fn borrowing_ascii_lowering_copies_only_when_it_folds_something() {
-        use std::borrow::Cow;
-        assert!(matches!(
-            ascii_lowered_cow("www.example.com."),
-            Cow::Borrowed("www.example.com.")
-        ));
-        assert!(matches!(
-            ascii_lowered_cow("WWW.Example.COM."),
-            Cow::Owned(ref name) if name == "www.example.com."
-        ));
-        assert!(matches!(
-            ascii_lowered_cow("\u{212A}.example.com."),
-            Cow::Borrowed("\u{212A}.example.com.")
-        ));
     }
 
     #[test]

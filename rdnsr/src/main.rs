@@ -539,8 +539,11 @@ fn spawn_anchor_manager(
             for zone in managed.zones() {
                 match probe_zone(&resolver, &zone).await {
                     Ok(probe) => {
+                        let Ok(zone_name) = rdns::Name::from_presentation(&zone) else {
+                            continue;
+                        };
                         let changes = managed.observe(
-                            &zone,
+                            zone_name.as_ref(),
                             &probe.keys,
                             &probe.self_signers,
                             current_unix_timestamp(),
@@ -593,7 +596,8 @@ struct AnchorProbe {
 /// requires this and cannot check it itself.
 async fn probe_zone(resolver: &Resolver, zone: &str) -> anyhow::Result<AnchorProbe> {
     let query = QuerySection {
-        qname: zone.to_string(),
+        qname: rdns::Name::from_presentation(zone)
+            .with_context(|| format!("{zone:?} is not a domain name"))?,
         qtype: Qtype::of(record_types::DNSKEY),
         qclass: rdns::QueryClass::IN,
     };
@@ -635,7 +639,7 @@ async fn probe_zone(resolver: &Resolver, zone: &str) -> anyhow::Result<AnchorPro
         .unwrap_or((0, 0));
 
     Ok(AnchorProbe {
-        self_signers: rfc5011::self_signers(zone, &response.answers, now),
+        self_signers: rfc5011::self_signers(query.qname.as_ref(), &response.answers, now),
         keys,
         original_ttl,
         signature_remaining,
@@ -935,7 +939,7 @@ async fn handle_query(
     // Not skipped for CD, unlike the denial cache: CD is a statement about
     // DNSSEC, not a request to be told what a public server thinks `localhost`
     // is.
-    if let Some(local) = special_names::lookup(&query.qname, query.qtype) {
+    if let Some(local) = special_names::lookup(query.qname.as_ref(), query.qtype) {
         let mut resp = build_response(&msg, local.answers, local.rcode);
         resp.authorities = local.authority;
         // Never AD: this was decided by specification, not validated, and a
@@ -959,7 +963,7 @@ async fn handle_query(
     if !checking_disabled {
         if let Some(wildcard) = caches
             .denials
-            .synthesize_wildcard(&query.qname, query.qtype)
+            .synthesize_wildcard(&query.qname.as_ref().to_presentation(), query.qtype)
         {
             let mut resp = build_response(&msg, wildcard.answers, ResponseCode::Ok);
             resp.authorities = wildcard.authority;
@@ -971,7 +975,10 @@ async fn handle_query(
     }
 
     if !checking_disabled {
-        if let Some(denial) = caches.denials.synthesize(&query.qname, query.qtype) {
+        if let Some(denial) = caches
+            .denials
+            .synthesize(&query.qname.as_ref().to_presentation(), query.qtype)
+        {
             ctx.metrics.count(&ctx.metrics.cache_hits);
             let mut resp = build_response(&msg, Vec::new(), denial.rcode);
             resp.authorities = denial.authority;
@@ -985,7 +992,10 @@ async fn handle_query(
     // A cached "no" (RFC 2308), separate from the answer cache only because
     // there are no records to key on. Nothing is synthesized — this is the
     // answer this question got — so a CD client may have it too.
-    if let Some(negative) = caches.negatives.get(&query.qname, query.qtype) {
+    if let Some(negative) = caches
+        .negatives
+        .get(&query.qname.as_ref().to_presentation(), query.qtype)
+    {
         ctx.metrics.count(&ctx.metrics.cache_hits);
         let mut resp = build_response(&msg, Vec::new(), negative.rcode);
         resp.authorities = negative.authority;
@@ -994,8 +1004,9 @@ async fn handle_query(
     }
 
     // Build the response: from cache if we have it, else by resolving.
-    let (mut resp, secure) = if let Some((records, secure)) =
-        caches.answers.get_validated(&query.qname, query.qtype)
+    let (mut resp, secure) = if let Some((records, secure)) = caches
+        .answers
+        .get_validated(&query.qname.as_ref().to_presentation(), query.qtype)
     {
         ctx.metrics.count(&ctx.metrics.cache_hits);
         (build_response(&msg, records, ResponseCode::Ok), secure)
@@ -1040,7 +1051,7 @@ async fn handle_query(
                 // the query that carried it.
                 if !upstream.answers.is_empty() && !state.is_bogus() {
                     caches.answers.put_validated(
-                        &query.qname,
+                        &query.qname.as_ref().to_presentation(),
                         query.qtype,
                         upstream.answers.clone(),
                         secure,
@@ -1050,9 +1061,12 @@ async fn handle_query(
                 // cost one upstream walk per repeat. The SOA in the
                 // authority section says how long it is good for (RFC 2308).
                 if !state.is_bogus() {
-                    caches
-                        .negatives
-                        .insert(&query.qname, query.qtype, &upstream, secure);
+                    caches.negatives.insert(
+                        &query.qname.as_ref().to_presentation(),
+                        query.qtype,
+                        &upstream,
+                        secure,
+                    );
                 }
                 // A *validated* "no" covers a whole range of names, so it
                 // also goes in the denial cache. Only when Secure: an
@@ -1191,6 +1205,14 @@ fn build_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name from a literal, for tests only: `Name` is fallible to build and a
+    /// test that writes a bad one should fail loudly at that line.
+    #[allow(dead_code)]
+    fn nm(text: &str) -> rdns::Name {
+        text.parse().expect("a test name parses")
+    }
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -1279,12 +1301,15 @@ mod tests {
     fn a_truncated_reply_carries_no_records_and_keeps_its_question() {
         let request = rdns::DnsMessageBuilder::new()
             .with_id(0x4242)
-            .with_query("www.example.com.", Qtype::of(rdns::utils::record_types::A))
+            .with_query(
+                nm("www.example.com."),
+                Qtype::of(rdns::utils::record_types::A),
+            )
             .build();
         let resp = build_response(
             &request,
             vec![ResourceRecord {
-                name: "www.example.com.".to_string(),
+                name: nm("www.example.com."),
                 class: rdns::Class::new(1),
                 ttl: rdns::Ttl::from_secs(60),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
@@ -1353,7 +1378,7 @@ mod tests {
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
-                qname: "example.com.".to_string(),
+                qname: nm("example.com."),
                 qtype: Qtype::of(record_types::A),
                 qclass: rdns::QueryClass::IN,
             }],
@@ -1428,7 +1453,7 @@ mod tests {
         msg.id = id;
         msg.additionals = vec![
             ResourceRecord {
-                name: "example.com.".to_string(),
+                name: nm("example.com."),
                 class: rdns::Class::new(1),
                 ttl: rdns::Ttl::from_secs(60),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
@@ -1517,7 +1542,7 @@ mod tests {
         msg.cd = cd;
         msg.queries = vec![
             QuerySection {
-                qname: name.to_string(),
+                qname: nm(name),
                 qtype: Qtype::of(record_types::A),
                 qclass: rdns::QueryClass::IN,
             };

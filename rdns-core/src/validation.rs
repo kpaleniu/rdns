@@ -1,6 +1,5 @@
 use crate::error::{AnswerMismatch, RequestError, RequestResult, WireError};
-use crate::utils::names_equal;
-use crate::{DnsMessage, OpCode, Qtype, QueryClass};
+use crate::{DnsMessage, NameRef, OpCode, Qtype, QueryClass};
 
 /// A message that arrived at a listening socket and is a question.
 ///
@@ -51,7 +50,7 @@ impl std::ops::Deref for Request {
 pub struct SentQuery<'a> {
     pub id: u16,
     /// The QNAME as it was sent — scrambled case included.
-    pub qname: &'a str,
+    pub qname: NameRef<'a>,
     pub qtype: Qtype,
     pub qclass: QueryClass,
     /// Compare the name byte for byte rather than folding ASCII case. DNS-0x20
@@ -81,10 +80,12 @@ pub fn answers_query(reply: &DnsMessage, sent: &SentQuery) -> Result<(), AnswerM
     let Some(echoed) = reply.queries.first() else {
         return Err(AnswerMismatch::NoQuestion);
     };
+    // 0x20 compares the echo octet for octet; otherwise `Name`'s own `Eq`,
+    // which folds ASCII and nothing else (RFC 4343).
     let name_matches = if sent.case_sensitive {
-        echoed.qname == sent.qname
+        echoed.qname.as_ref().as_wire() == sent.qname.as_wire()
     } else {
-        names_equal(&echoed.qname, sent.qname)
+        echoed.qname == sent.qname
     };
     if !name_matches || echoed.qtype != sent.qtype || echoed.qclass != sent.qclass {
         return Err(AnswerMismatch::Question {
@@ -258,7 +259,9 @@ impl AdmissionCheck {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::name::nm;
 
     fn query_packet(response: bool) -> Vec<u8> {
         let mut packet = vec![
@@ -287,7 +290,7 @@ mod tests {
         let asked = DnsMessage::try_from_bytes(&query_packet(false)).expect("a question");
         let sent = SentQuery {
             id: asked.id,
-            qname: &asked.queries[0].qname,
+            qname: asked.queries[0].qname.as_ref(),
             qtype: asked.queries[0].qtype,
             qclass: asked.queries[0].qclass,
             case_sensitive: false,
@@ -312,7 +315,11 @@ mod tests {
         // The name folds ASCII case without DNS-0x20 (RFC 4343) and is compared
         // byte for byte with it, since that is where the entropy is.
         let mut reply = DnsMessage::reply_to(&asked);
-        reply.queries[0].qname = reply.queries[0].qname.to_uppercase();
+        reply.queries[0].qname = nm(&reply.queries[0]
+            .qname
+            .as_ref()
+            .to_presentation()
+            .to_uppercase());
         assert_eq!(answers_query(&reply, &sent), Ok(()));
         let strict = SentQuery {
             case_sensitive: true,
@@ -360,7 +367,7 @@ mod tests {
 
         let request = Request::from_bytes(&query_packet(false)).expect("a question parses");
         assert!(!request.response, "and it is still a question afterwards");
-        assert_eq!(request.queries[0].qname, "www.com.");
+        assert_eq!(request.queries[0].qname, nm("www.com."));
     }
 
     /// Garbage and a traffic loop are different operational signals.

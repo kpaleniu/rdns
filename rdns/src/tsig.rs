@@ -15,8 +15,20 @@
 //! signed, fudge, error and other data; "timers only" is the time signed and the
 //! fudge, used for every message after the first in a transfer (§5.3.1).
 
-use crate::dname::dname_to_bytes;
 use crate::error::{ConfigError, ConfigResult};
+
+/// A name from config, as uncompressed wire octets.
+///
+/// Through [`crate::Name`], which is the one text-to-wire door: RFC 8945's key
+/// and algorithm names are domain names, and the digest covers their encoded
+/// form. `dname_to_bytes` was a second decoder that refused RFC 1035 §5.1's
+/// escapes, so the two disagreed about what a key name meant.
+fn name_wire(name: &str) -> crate::error::WireResult<Vec<u8>> {
+    Ok(crate::Name::from_presentation(name)?
+        .as_ref()
+        .as_wire()
+        .to_vec())
+}
 use crate::utils::current_unix_timestamp;
 use base64::Engine;
 use ring::hmac;
@@ -427,7 +439,7 @@ impl Tsig {
 
     /// The RDATA bytes of this record.
     fn rdata_bytes(&self) -> ConfigResult<Vec<u8>> {
-        let mut out = dname_to_bytes(&self.algorithm_name).map_err(|e| {
+        let mut out = name_wire(&self.algorithm_name).map_err(|e| {
             ConfigError::new(format!("TSIG algorithm name {}: {e}", self.algorithm_name))
         })?;
         out.extend_from_slice(&self.time_signed.to_be_bytes()[2..]); // 48 bits
@@ -444,12 +456,12 @@ impl Tsig {
     /// The "TSIG variables" half of the digest (RFC 8945 §4.3.3): everything
     /// about the record except the MAC itself.
     fn variables(&self) -> ConfigResult<Vec<u8>> {
-        let mut out = dname_to_bytes(&self.key_name)
+        let mut out = name_wire(&self.key_name)
             .map_err(|e| ConfigError::new(format!("TSIG key name {}: {e}", self.key_name)))?;
         out.extend_from_slice(&TSIG_CLASS.to_be_bytes());
         out.extend_from_slice(&0u32.to_be_bytes()); // TTL, always 0
         out.extend_from_slice(
-            &dname_to_bytes(&self.algorithm_name)
+            &name_wire(&self.algorithm_name)
                 .map_err(|e| ConfigError::new(format!("TSIG algorithm name: {e}")))?,
         );
         out.extend_from_slice(&self.time_signed.to_be_bytes()[2..]);
@@ -876,7 +888,7 @@ fn strip_tsig(packet: &[u8], tsig_offset: usize, original_id: u16) -> Vec<u8> {
 /// raised to match.
 fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> ConfigResult<Vec<u8>> {
     let rdata = tsig.rdata_bytes()?;
-    let owner = dname_to_bytes(&tsig.key_name)
+    let owner = name_wire(&tsig.key_name)
         .map_err(|e| ConfigError::new(format!("TSIG key name {}: {e}", tsig.key_name)))?;
 
     // Uncompressed owner name: the record must be removable by truncating the
@@ -1012,6 +1024,7 @@ pub fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_records::nm;
     use crate::utils::record_types as rt;
     use crate::{DnsMessage, DnsMessageBuilder, Qtype, Rtype};
 
@@ -1023,7 +1036,7 @@ mod tests {
     fn query_bytes(qname: &str, qtype: Qtype) -> Vec<u8> {
         let msg = DnsMessageBuilder::new()
             .with_id(0x4d2)
-            .with_query(qname, qtype)
+            .with_query(nm(qname), qtype)
             .with_recursion(false)
             .build();
         let mut buf = vec![0u8; 512];
@@ -1058,7 +1071,7 @@ mod tests {
             let mut strings: Vec<Vec<u8>> = (0..chunks).map(|_| filler.clone()).collect();
             strings.push(vec![b'y'; pad]);
             msg.answers.push(crate::ResourceRecord {
-                name: "big.example.com.".to_string(),
+                name: nm(&nm("big.example.com.").to_string()),
                 class: crate::Class::new(1),
                 ttl: crate::Ttl::from_secs(60),
                 rdata: crate::RecordData::from_parsed(&crate::ParsedRecord::TXT(strings))
@@ -1367,7 +1380,7 @@ mod tests {
 
         // It is still a parseable DNS message, with the TSIG in its additionals.
         let parsed = DnsMessage::try_from_bytes(&signed).expect("still a DNS message");
-        assert_eq!(parsed.queries[0].qname, "example.com.");
+        assert_eq!(parsed.queries[0].qname, nm("example.com."));
         assert_eq!(parsed.additionals.len(), 1);
         assert_eq!(parsed.additionals[0].rdata.rtype(), Rtype::new(TSIG_TYPE));
 

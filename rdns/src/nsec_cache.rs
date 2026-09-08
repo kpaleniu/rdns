@@ -23,7 +23,7 @@ use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf};
 use crate::Qtype;
 use crate::Rtype;
 use crate::Ttl;
-use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};
+use crate::{DnsMessage, Name, ParsedRecord, ResourceRecord, ResponseCode};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Mutex;
@@ -189,7 +189,7 @@ impl NsecCache {
         let Ok(ParsedRecord::SOA { minimum, .. }) = soa_rr.rdata.parse() else {
             return;
         };
-        let zone = canonical_name(&soa_rr.name);
+        let zone = soa_rr.name.as_ref().to_presentation();
         let now = current_unix_timestamp();
 
         let soa_ttl = soa_rr.ttl.as_secs();
@@ -327,7 +327,7 @@ impl NsecCache {
                     .answers
                     .iter()
                     .find(|rr| rr.rdata.rtype() == rtype)
-                    .map(|rr| rr.name.clone())
+                    .map(|rr| rr.name.as_ref().to_presentation())
                     .unwrap_or_default(),
             );
             let mut records = records_at(&response.answers, &owner, rtype);
@@ -443,7 +443,7 @@ impl NsecCache {
         let answers: Vec<ResourceRecord> = with_ttl(&cached.records, ttl)
             .into_iter()
             .map(|mut rr| {
-                rr.name = qname.to_string();
+                rr.name = Name::from_presentation(&qname).unwrap_or_default();
                 rr
             })
             .collect();
@@ -861,7 +861,7 @@ fn records_covering(records: &[ResourceRecord], owner: &str, rtype: Rtype) -> Ve
     let owner = canonical_name(owner);
     records
         .iter()
-        .filter(|rr| canonical_name(&rr.name) == owner)
+        .filter(|rr| rr.name.as_ref().to_presentation().to_ascii_lowercase() == owner)
         .filter(|rr| {
             rr.rdata.rtype() == rtype
                 || matches!(
@@ -967,9 +967,11 @@ fn zone_expiry(zone: &ZoneProofs) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::denial_wire::build_type_bitmap;
     use crate::dnssec_denial::nsec3_hash;
+    use crate::test_records::nm;
     use crate::test_records::{
         nsec3_record, nsec3_span, nsec_record, soa_record, NSEC3_ITERATIONS, NSEC3_SALT,
     };
@@ -990,7 +992,7 @@ mod tests {
             cd: false,
             rcode,
             queries: vec![QuerySection {
-                qname: qname.to_string(),
+                qname: nm(qname),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             }],
@@ -1184,8 +1186,8 @@ mod tests {
         // Sanity: the name really does fall in the gap, so this test is testing
         // the guard and not an accident of ordering.
         let nsec = Nsec {
-            owner: "sub.example.com.".into(),
-            next: "www.example.com.".into(),
+            owner: "sub.example.com.".to_string(),
+            next: "www.example.com.".to_string(),
             type_bitmap: build_type_bitmap(&[rt::NS]),
         };
         assert!(
@@ -1678,13 +1680,13 @@ mod tests {
     /// and in the authority section the NSEC proving the queried name absent.
     fn wildcard_answer(qname: &str, wildcard_labels: u8, nsec: ResourceRecord) -> DnsMessage {
         let a = ResourceRecord {
-            name: qname.to_string(),
+            name: nm(qname),
             class: Class::new(1),
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.7".parse().unwrap())).unwrap(),
         };
         let sig = ResourceRecord {
-            name: qname.to_string(),
+            name: nm(qname),
             class: Class::new(1),
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
@@ -1695,7 +1697,7 @@ mod tests {
                 inception: 1,
                 expiration: u32::MAX,
                 key_tag: 1234,
-                signer_name: "example.com.".to_string(),
+                signer_name: nm("example.com."),
                 signature: vec![9; 64],
             })
             .unwrap(),
@@ -1712,7 +1714,7 @@ mod tests {
                 inception: 1,
                 expiration: u32::MAX,
                 key_tag: 1234,
-                signer_name: "example.com.".to_string(),
+                signer_name: nm("example.com."),
                 signature: vec![8; 64],
             })
             .unwrap(),
@@ -1729,7 +1731,7 @@ mod tests {
             cd: false,
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
-                qname: qname.to_string(),
+                qname: nm(qname),
                 qtype: Qtype::of(rt::A),
                 qclass: QueryClass::IN,
             }],
@@ -1770,7 +1772,8 @@ mod tests {
         );
         for rr in &s.answers {
             assert_eq!(
-                rr.name, "b.example.com.",
+                rr.name,
+                nm("b.example.com."),
                 "re-owned onto the name asked for"
             );
             assert!(rr.ttl.as_secs() <= 300);

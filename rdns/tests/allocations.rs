@@ -13,6 +13,8 @@
 //! the peak-bytes figures, which are about the whole heap by definition.
 
 use rdns::Class;
+use rdns::Name;
+use rdns::NameRef;
 use rdns::Rtype;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +26,13 @@ use rdns::utils::{current_unix_timestamp, record_types};
 use rdns::zone::{parse_zone_file, NameKind};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
 use rdns::{DnsMessage, DnsMessageBuilder, Edns, EdnsOption, Qtype, ResourceRecord};
+
+/// A name from a literal, for tests only: `Name` is fallible to build and a test
+/// that writes a bad one should fail loudly at that line.
+#[allow(dead_code)]
+fn nm(text: &str) -> Name {
+    text.parse().expect("a test name parses")
+}
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
@@ -230,7 +239,7 @@ fn query_bytes_with_edns(qname: &str, qtype: Qtype) -> Vec<u8> {
 fn query_message(qname: &str, qtype: Qtype) -> DnsMessage {
     DnsMessageBuilder::new()
         .with_id(0x1234)
-        .with_query(qname, qtype)
+        .with_query(nm(qname), qtype)
         .with_recursion(false)
         .build()
 }
@@ -249,8 +258,11 @@ fn one_query_end_to_end() {
     // `DNameUnpacker` to copy.
     within("parse a one-question query", parse_count, 2..=2);
 
+    // Built outside: off the wire the name is already a `Name`, and parsing
+    // presentation text is the zone file's cost rather than a query's.
+    let qname = nm("www.example.com.");
     let (answers, lookup_count) = allocations(|| {
-        zone.query("www.example.com.", Qtype::of(record_types::A))
+        zone.query(qname.as_ref(), Qtype::of(record_types::A))
             .into_iter()
             .map(|r| ResourceRecord {
                 name: r.name.clone(),
@@ -334,7 +346,8 @@ fn writing_a_response_costs_nothing_per_record() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let wire = query_bytes("www.example.com.", Qtype::of(record_types::A));
     let request = DnsMessage::try_from_bytes(&wire).expect("parse the query");
-    let records = zone.query("www.example.com.", Qtype::of(record_types::A));
+    let qname = nm("www.example.com.");
+    let records = zone.query(qname.as_ref(), Qtype::of(record_types::A));
     assert_eq!(records.len(), 1);
 
     let mut out = Vec::new();
@@ -343,14 +356,8 @@ fn writing_a_response_costs_nothing_per_record() {
         let mut w = ResponseWriter::start(out, compressor, 4096, &request).expect("start");
         w.set_authoritative(true);
         for r in &records {
-            w.push(
-                Section::Answer,
-                "www.example.com.",
-                r.class,
-                r.ttl,
-                &r.rdata,
-            )
-            .expect("push");
+            w.push(Section::Answer, qname.as_ref(), r.class, r.ttl, &r.rdata)
+                .expect("push");
         }
         w.set_edns(Edns::with_payload_size(1232));
         w.finish().expect("finish");
@@ -365,20 +372,19 @@ fn writing_a_response_costs_nothing_per_record() {
 /// allocation between them, and it is the answer: the `Vec` `Zone::query`
 /// returns.
 ///
-/// A guard against `zone::absolutize` going back to an owned `String`, which
-/// made a copy of the lookup key per lookup — four per query, ~14% of everything
-/// an answer allocated. Against that code this reads 5.
+/// A guard against the lookup key going back to an owned copy per lookup — four
+/// per query, ~14% of everything an answer allocated. Against that code this
+/// reads 5. A `Name` is absolute, so only the case fold is left to avoid.
 fn the_lookups_behind_one_answer_allocate_only_the_answer() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
 
     // Warm first: the first run of any path pays for state unrelated to the
     // count, and a target this small cannot absorb it.
+    let qname = nm("www.example.com.");
     let warm = |zone: &rdns::zone::Zone| {
-        let cut = zone.delegation_for("www.example.com.");
-        let kind = zone.name_kind("www.example.com.");
-        let records = zone
-            .query("www.example.com.", Qtype::of(record_types::A))
-            .len();
+        let cut = zone.delegation_for(qname.as_ref());
+        let kind = zone.name_kind(qname.as_ref());
+        let records = zone.query(qname.as_ref(), Qtype::of(record_types::A)).len();
         (cut, kind, records)
     };
     let _ = warm(&zone);
@@ -394,24 +400,27 @@ fn the_lookups_behind_one_answer_allocate_only_the_answer() {
 ///
 /// Case randomization is a resolver's spoofing defence (Google Public DNS and
 /// Unbound's `use-caps-for-id` both do it), so mixed case is ordinary traffic
-/// and not an attack. Every `Zone` entry point folds the name itself
-/// (`Zone::lookup_key`), and `ascii_lowered_cow` can only borrow when there is
-/// nothing to fold — so the count above is the count for a name that happened
-/// to arrive lower-case, and this is the count for the rest.
+/// and not an attack. Every `Zone` entry point folds the name itself, and
+/// `NameRef::folded_in` can only borrow when there is nothing to fold — so the
+/// count above is the count for a name that happened to arrive lower-case, and
+/// this is the count for the rest.
 ///
 /// Measured on `rdnsd` under dhat, a whole query goes 13 to 18 with the case
 /// randomized and 17 to 22 with EDNS0 as well: four folds in `Zone` — the walks
 /// here plus `add_answer`'s own — and a fifth in `Zones::for_query`.
 fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
-    let walks = |zone: &rdns::zone::Zone, name: &str| {
+    let walks = |zone: &rdns::zone::Zone, name: NameRef<'_>| {
         let cut = zone.delegation_for(name);
         let kind = zone.name_kind(name);
         let records = zone.query(name, Qtype::of(record_types::A)).len();
         (cut, kind, records)
     };
 
-    let mixed = "WwW.eXaMpLe.CoM.";
+    // Built outside the measurement: parsing presentation text is the zone
+    // file's cost, not a query's — off the wire a name arrives already built.
+    let mixed = nm("WwW.eXaMpLe.CoM.");
+    let mixed = mixed.as_ref();
     let _ = walks(&zone, mixed);
 
     let ((cut, kind, records), count) = allocations(|| walks(&zone, mixed));
@@ -427,10 +436,11 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     // door (`TODO.md` #27a), then the delegation walk and one `locate` that
     // serves both the existence test and the records (#28b, #27c). Nothing is
     // collected — `query` built a `Vec` for a question that was `is_empty()`.
-    let answer_path = |zone: &rdns::zone::Zone, name: &str| {
-        let key = rdns::utils::absolute_lowered(name);
-        let cut = zone.delegation_for(&key);
-        let located = zone.locate(&key);
+    let answer_path = |zone: &rdns::zone::Zone, name: NameRef<'_>| {
+        let mut buf = Vec::new();
+        let key = name.folded_in(&mut buf);
+        let cut = zone.delegation_for(key);
+        let located = zone.locate(key);
         let has = located.has_type(Qtype::of(record_types::A));
         let records = located.of_type(Qtype::of(record_types::A)).count();
         (cut, located.kind().clone(), has, records)
@@ -449,15 +459,15 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     // costs nothing at all. The buffer is warmed first: the interesting number
     // is the *steady state* of a worker answering datagram after datagram, not
     // its first one.
-    let buffered = |zone: &rdns::zone::Zone, name: &str, buf: &mut String| {
-        let key = rdns::utils::absolute_lowered_in(name, buf);
+    let buffered = |zone: &rdns::zone::Zone, name: NameRef<'_>, buf: &mut Vec<u8>| {
+        let key = name.folded_in(buf);
         let cut = zone.delegation_for(key);
         let located = zone.locate(key);
         let has = located.has_type(Qtype::of(record_types::A));
         let records = located.of_type(Qtype::of(record_types::A)).count();
         (cut, located.kind().clone(), has, records)
     };
-    let mut key_buf = String::new();
+    let mut key_buf = Vec::new();
     let _ = buffered(&zone, mixed, &mut key_buf);
 
     let (answers, count) = allocations(|| buffered(&zone, mixed, &mut key_buf));
@@ -508,7 +518,7 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
 fn reading_one_integer_out_of_an_soa() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let soa = *zone
-        .query("example.com.", Qtype::of(record_types::SOA))
+        .query(nm("example.com.").as_ref(), Qtype::of(record_types::SOA))
         .first()
         .expect("the apex SOA");
 
@@ -619,9 +629,9 @@ fn a_response_full_of_shared_suffixes() {
     response.response = true;
     response.authoritive = true;
     for name in ["www.example.com.", "mx.example.com.", "ns1.example.com."] {
-        for record in zone.query(name, Qtype::of(record_types::A)) {
+        for record in zone.query(nm(name).as_ref(), Qtype::of(record_types::A)) {
             response.answers.push(ResourceRecord {
-                name: name.to_string(),
+                name: nm(name),
                 class: record.class,
                 ttl: record.ttl,
                 rdata: record.rdata.clone(),
@@ -854,10 +864,10 @@ fn scanning_a_query_for_a_tsig() {
 /// measured beside the new one so this is a ratio and not an assertion that zero
 /// is zero.
 fn comparing_two_names_allocates_nothing() {
-    let a = "www.example.com.";
-    let b = "WWW.Example.COM.";
+    let (a, b) = (nm("www.example.com."), nm("WWW.Example.COM."));
 
-    // The shape this replaced, kept as a measurement rather than as code.
+    // The shape this replaced, kept as a measurement rather than as code: two
+    // names were `String`s, so folding them to compare meant a copy each.
     let old = |x: &str, y: &str| {
         let n = |s: &str| {
             let lowered = s.to_ascii_lowercase();
@@ -870,13 +880,16 @@ fn comparing_two_names_allocates_nothing() {
         n(x) == n(y)
     };
 
-    let _warm = (old(a, b), rdns::utils::names_equal(a, b));
+    let (text_a, text_b) = (a.to_string(), b.to_string());
+    let _warm = (old(&text_a, &text_b), a == b);
 
-    let (was_equal, before) = allocations(|| old(a, b));
+    let (was_equal, before) = allocations(|| old(&text_a, &text_b));
     assert!(was_equal);
     within("compare two names, the old way", before, 2..=2);
 
-    let (is_equal, after) = allocations(|| rdns::utils::names_equal(a, b));
+    // `Name`'s `Eq` folds ASCII as it goes (RFC 4343), so there is nothing to
+    // copy — the comparison walks the wire octets of both.
+    let (is_equal, after) = allocations(|| a == b);
     assert!(is_equal, "the same answer");
     within("compare two names", after, 0..=0);
 }
@@ -1000,30 +1013,31 @@ fn proving_a_signed_nxdomain() {
 fn answering_a_signed_query() {
     let zone = signed_zone();
     let request = rdns::DnsMessageBuilder::new()
-        .with_query("www.example.com.", Qtype::of(record_types::A))
+        .with_query(nm("www.example.com."), Qtype::of(record_types::A))
         .with_id(1)
         .with_dnssec(true)
         .build();
     let qtype = Qtype::of(record_types::A);
     let mut out = Vec::new();
     let mut compressor = rdns::compression::NameCompressor::new();
+    let qname = nm("www.example.com.");
+    let qname = qname.as_ref();
 
     let answer = |w: &mut rdns::response::ResponseWriter| {
-        // As `answer.rs` does it: fold once, locate once, and hand that lookup
-        // to the signatures.
-        let key = rdns::utils::absolute_lowered("www.example.com.");
-        let at = zone.locate(&key);
+        // As `answer.rs` does it: locate once, and hand that lookup to the
+        // signatures.
+        let at = zone.locate(qname);
         for record in at.of_type(qtype) {
             w.push(
                 rdns::response::Section::Answer,
-                "www.example.com.",
+                qname,
                 record.class,
                 record.ttl,
                 &record.rdata,
             )
             .expect("the record writes");
         }
-        rdns::dnssec_answer::push_answer_signatures(&at, &key, qtype, w)
+        rdns::dnssec_answer::push_answer_signatures(&at, qname, qtype, w)
             .expect("the signatures write")
     };
 
@@ -1080,7 +1094,7 @@ fn proving_a_signed_nxdomain_under_nsec3() {
 /// counted is the proof, not the 64 KB scratch every response path already owns.
 fn nxdomain_proof(signed: &rdns::zone::Zone) -> (rdns::DnsMessage, u64) {
     let request = rdns::DnsMessageBuilder::new()
-        .with_query("nope.example.com.", Qtype::of(record_types::A))
+        .with_query(nm("nope.example.com."), Qtype::of(record_types::A))
         .with_id(1)
         .with_dnssec(true)
         .build();
@@ -1089,7 +1103,7 @@ fn nxdomain_proof(signed: &rdns::zone::Zone) -> (rdns::DnsMessage, u64) {
     let prove = |w: &mut rdns::response::ResponseWriter| {
         rdns::dnssec_answer::push_negative_proof(
             signed,
-            "nope.example.com.",
+            nm("nope.example.com.").as_ref(),
             &NameKind::NotFound,
             w,
         )
@@ -1181,7 +1195,7 @@ fn what_the_resolvers_caches_cost() {
     let qtype = Qtype::of(record_types::A);
     let rrset: Vec<ResourceRecord> = (0..3)
         .map(|_| ResourceRecord {
-            name: "www.example.com.".to_string(),
+            name: nm(&nm("www.example.com.").to_string()),
             class: Class::new(1),
             ttl: rdns::Ttl::from_wire(3600),
             rdata: rdns::RecordData::new(record_types::A, vec![192u8, 0, 2, 1]).expect("A"),
@@ -1223,7 +1237,7 @@ fn verifying_an_rrset_against_two_candidate_signatures() {
 
     let owned = |name: &str, rtype: Rtype| -> Vec<ResourceRecord> {
         signed
-            .query(name, Qtype::of(rtype))
+            .query(nm(name).as_ref(), Qtype::of(rtype))
             .into_iter()
             .map(|r| ResourceRecord {
                 name: r.name.clone(),
@@ -1242,11 +1256,12 @@ fn verifying_an_rrset_against_two_candidate_signatures() {
         .into_iter()
         .map(|r| r.rdata)
         .collect();
-    let rrset = Rrset::new("example.com.", record_types::DNSKEY, Class::new(1), &rdatas);
+    let apex = nm("example.com.");
+    let rrset = Rrset::new(apex.as_ref(), record_types::DNSKEY, Class::new(1), &rdatas);
     let now = current_unix_timestamp();
 
     let (proof, count) =
-        allocations(|| verify_rrset(&rrset, &rrsigs, &dnskeys, "example.com.", now));
+        allocations(|| verify_rrset(&rrset, &rrsigs, &dnskeys, nm("example.com.").as_ref(), now));
     assert!(
         matches!(proof, RrsetProof::Verified { .. }),
         "the measurement is only meaningful if it verified: {proof:?}"

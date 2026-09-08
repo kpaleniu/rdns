@@ -1,7 +1,7 @@
 # 1. Wire format
 
-Implemented in `rdns/src/lib.rs`, `dname.rs`, `compression.rs`, `record_data.rs`
-and `tsig.rs`.
+Implemented in `rdns-core/src/lib.rs`, `name.rs`, `dname.rs`, `compression.rs`,
+`record_data.rs` and `rdns/src/tsig.rs`.
 
 ---
 
@@ -9,31 +9,34 @@ and `tsig.rs`.
 
 ### Representation
 
-A name is a Rust `String` in presentation form: labels separated by `.`, absolute
-names carrying a trailing `.`. There is no label-vector or wire-byte
-representation anywhere in the library.
+A name is `Name` (`rdns-core/src/name.rs`): the **wire octets**, length-prefixed
+labels and a root terminator, in one `Box<[u8]>`. It is always absolute, and
+`NameRef<'a>` is the borrowed, `Copy` form every function takes.
 
-- A label containing `.` or `\` is refused, not escaped — `dname.rs:75`
-  (`unrepresentable_octet`), at the decode boundary and at `write_label`. The
-  decode arm returns `WireError::Unsupported`. Escaping `.` would make the
-  presentation form non-injective; a `\` cannot be written into a zone file this
-  reader reads back as the same name.
-- A label that is not valid UTF-8 is refused (`dname.rs:143`) with
-  `WireError::Malformed`. RFC 2181 §11 permits any binary string, so this is
-  deviation D-1.
+- Equality and `Hash` fold ASCII case (RFC 4343), so two spellings of one name
+  are one key and no caller has to remember to fold. Ordering is deliberately
+  **absent**: canonical DNS order is not byte order (RFC 4034 §6.1), and a
+  derived `Ord` would be neither that nor presentation order.
+- A label is any binary string (RFC 2181 §11) — `.`, `\`, an octet that is not
+  UTF-8, all of them. `to_presentation` spells every one with RFC 1035 §5.1's
+  escapes and `Name::from_presentation` reads them back, so the text form is
+  injective again. This closed deviation **D-1** on 2026-09-07
+  (`docs/CLOSED_WORK.md` #36).
+- Presentation text survives at one boundary on purpose: DNSSEC's canonical
+  form, through `dnssec::canonical_name_of`. That text is what signatures are
+  computed over, so it is converted at the edge and nowhere else.
 
 ### Limits enforced
 
 | limit | value | where | RFC |
 |---|---|---|---|
-| label length | 63 octets | `write_label`, `Label::try_from_bytes` | 1035 §2.3.4 |
-| name length, encoded | 255 octets | `UnpackedDName::new` (parse) and the encode path | 1035 §2.3.4 |
-| empty label | refused | `write_label` | 1035 §3.1 |
-| label syntax (LDH) | not enforced | `dname.rs:235` | 2181 §11 — see D-5 |
+| label length | 63 octets | `name::finish_label`, `Label::try_from_bytes` | 1035 §2.3.4 |
+| name length, encoded | 255 octets | `UnpackedDName::new` (parse) and `name::presentation_wire_in` | 1035 §2.3.4 |
+| empty label | refused | `name::presentation_wire_in` | 1035 §3.1 |
+| label syntax (LDH) | not enforced | anywhere | 2181 §11 — see D-5 |
 
 The 255-octet limit counts each label's length octet and the terminating zero,
-and is checked in both directions through one helper, `dname::check_name_len`
-(`dname.rs:466`).
+and is checked in both directions through one helper, `dname::check_name_len`.
 
 ### Compression (RFC 1035 §4.1.4)
 
@@ -62,13 +65,16 @@ a non-conforming peer unreadable.
 
 ### Case folding
 
-ASCII only (RFC 4343), everywhere: `utils::ascii_lowered`,
-`utils::ascii_lowered_cow`, `utils::names_equal`, `utils::absolute_lowered`.
-`str::to_lowercase` MUST NOT be used on a name — it folds U+212A KELVIN SIGN onto
-`k`.
+ASCII only (RFC 4343). For a `Name` it is not a call at all: `Eq` and `Hash`
+fold as they walk, so two spellings of one name are one key and no caller has to
+remember. `NameRef::folded` produces the octets for a `HashMap` key and
+`NameRef::to_folded` the canonical form DNSSEC signs (RFC 4034 §6.2); both borrow
+or copy as needed and neither is optional at a call site.
 
-`utils::NameKeyBuf` is the only type a name may be a map key as; its single
-constructor folds.
+`str::to_lowercase` MUST NOT be used on a name — it folds U+212A KELVIN SIGN onto
+`k`. The text helpers that are left (`utils::ascii_lowered`,
+`utils::absolute_lowered`, `utils::NameKeyBuf`) serve the caches, which key on
+presentation text.
 
 ---
 

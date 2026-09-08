@@ -17,8 +17,8 @@ use crate::compression::NameCompressor;
 use crate::dname::write_bytes;
 use crate::error::WireError;
 use crate::{
-    Class, DnsMessage, Edns, OpCode, QuerySection, RecordData, ResponseCode, Ttl, CLASSIC_UDP_SIZE,
-    OPT_RECORD_TYPE,
+    Class, DnsMessage, Edns, NameRef, OpCode, QuerySection, RecordData, ResponseCode, Ttl,
+    CLASSIC_UDP_SIZE, OPT_RECORD_TYPE,
 };
 
 /// The twelve-octet header, minus the counts.
@@ -157,7 +157,7 @@ impl<'a> ResponseWriter<'a> {
     pub fn push(
         &mut self,
         section: Section,
-        name: &str,
+        name: NameRef<'_>,
         class: Class,
         ttl: Ttl,
         rdata: &RecordData,
@@ -302,7 +302,7 @@ pub(crate) fn write_query(
     pos: usize,
     q: &QuerySection,
 ) -> Result<usize, WireError> {
-    let pos = compressor.write_name(q.qname.as_str(), buf, pos)?;
+    let pos = compressor.write_name(q.qname.as_ref(), buf, pos)?;
     let pos = write_bytes(buf, pos, &q.qtype.to_u16().to_be_bytes())?;
     write_bytes(buf, pos, &q.qclass.to_u16().to_be_bytes())
 }
@@ -317,7 +317,7 @@ pub(crate) fn write_rr(
     compressor: &mut NameCompressor,
     buf: &mut [u8],
     pos: usize,
-    name: &str,
+    name: NameRef<'_>,
     class: Class,
     ttl: Ttl,
     rdata: &RecordData,
@@ -436,7 +436,9 @@ pub fn client_edns(request: &DnsMessage) -> Result<ClientEdns, ResponseCode> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::name::nm;
     use crate::utils::record_types;
     use crate::ResourceRecord;
     use crate::{DnsMessageBuilder, ParsedRecord, Qtype, Rtype};
@@ -493,7 +495,7 @@ mod tests {
     fn request(qname: &str, edns: bool) -> DnsMessage {
         let mut builder = DnsMessageBuilder::new()
             .with_id(0x1234)
-            .with_query(qname, Qtype::of(record_types::A));
+            .with_query(nm(qname), Qtype::of(record_types::A));
         if edns {
             builder = builder.with_edns(4096, false);
         }
@@ -511,23 +513,23 @@ mod tests {
         let request = request("www.example.com.", true);
         let records = [
             ResourceRecord {
-                name: "www.example.com.".to_string(),
+                name: nm("www.example.com."),
                 class: Class::IN,
                 ttl: Ttl::from_secs(300),
                 rdata: a_record([192, 0, 2, 1]),
             },
             ResourceRecord {
-                name: "www.example.com.".to_string(),
+                name: nm("www.example.com."),
                 class: Class::IN,
                 ttl: Ttl::from_secs(300),
                 rdata: a_record([192, 0, 2, 2]),
             },
         ];
         let ns = ResourceRecord {
-            name: "example.com.".to_string(),
+            name: nm("example.com."),
             class: Class::IN,
             ttl: Ttl::from_secs(3600),
-            rdata: RecordData::from_parsed(&ParsedRecord::NS("ns1.example.com.".to_string()))
+            rdata: RecordData::from_parsed(&ParsedRecord::NS(nm("ns1.example.com.")))
                 .expect("an NS record"),
         };
 
@@ -544,11 +546,23 @@ mod tests {
         let mut w = ResponseWriter::start(&mut out, &mut compressor, 4096, &request).unwrap();
         w.set_authoritative(true);
         for rr in &records {
-            w.push(Section::Answer, &rr.name, rr.class, rr.ttl, &rr.rdata)
-                .unwrap();
-        }
-        w.push(Section::Authority, &ns.name, ns.class, ns.ttl, &ns.rdata)
+            w.push(
+                Section::Answer,
+                rr.name.as_ref(),
+                rr.class,
+                rr.ttl,
+                &rr.rdata,
+            )
             .unwrap();
+        }
+        w.push(
+            Section::Authority,
+            ns.name.as_ref(),
+            ns.class,
+            ns.ttl,
+            &ns.rdata,
+        )
+        .unwrap();
         w.set_edns(Edns::with_payload_size(1232));
         w.finish().unwrap();
 
@@ -566,10 +580,10 @@ mod tests {
         let mut w = ResponseWriter::start(&mut out, &mut compressor, 512, &request).unwrap();
         w.set_authoritative(true);
         for i in 0..64u8 {
-            let name = format!("h{i}.www.example.com.");
+            let name = nm(&format!("h{i}.www.example.com."));
             w.push(
                 Section::Answer,
-                &name,
+                name.as_ref(),
                 Class::IN,
                 Ttl::from_secs(300),
                 &a_record([192, 0, 2, i]),
@@ -584,7 +598,7 @@ mod tests {
         assert!(parsed.truncation, "TC is what makes the client retry");
         assert!(parsed.answers.is_empty(), "and no partial RRset goes out");
         assert!(parsed.authorities.is_empty());
-        assert_eq!(parsed.queries[0].qname, "www.example.com.");
+        assert_eq!(parsed.queries[0].qname, nm("www.example.com."));
         assert!(parsed.has_edns(), "the OPT survives truncation");
     }
 
@@ -601,7 +615,7 @@ mod tests {
             w.set_authoritative(true);
             w.push(
                 Section::Answer,
-                "one.example.org.",
+                nm("one.example.org.").as_ref(),
                 Class::IN,
                 Ttl::from_secs(300),
                 &a_record([192, 0, 2, 9]),
@@ -616,10 +630,10 @@ mod tests {
         for _ in 0..2 {
             let mut w = ResponseWriter::start(&mut carried, &mut compressor, 512, &big).unwrap();
             for i in 0..64u8 {
-                let name = format!("h{i}.many.example.com.");
+                let name = nm(&format!("h{i}.many.example.com."));
                 w.push(
                     Section::Answer,
-                    &name,
+                    name.as_ref(),
                     Class::IN,
                     Ttl::from_secs(300),
                     &a_record([192, 0, 2, i]),
@@ -649,12 +663,12 @@ mod tests {
         w.set_authoritative(true);
         let mx = RecordData::from_parsed(&ParsedRecord::MX {
             preference: 10,
-            exchange: "mail.example.com.".to_string(),
+            exchange: nm("mail.example.com."),
         })
         .expect("an MX record");
         w.push(
             Section::Answer,
-            "example.com.",
+            nm("example.com.").as_ref(),
             Class::IN,
             Ttl::from_secs(300),
             &mx,

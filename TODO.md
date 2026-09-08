@@ -715,10 +715,10 @@ Everything here is a choice, not a queue. One thing, with #33 and #34 both
 closed — which is the state this page has never been in before, so the next
 session picks its own work rather than taking the top of a list.
 
-Two candidates named elsewhere on this page, for a session that wants one:
-**#13e's `Name` half**, which D-1 below argues for in its last clause, and
-**SVCB/HTTPS presentation form**, which is the largest remaining entry in #21's
-not-implemented list. Neither is a queue either.
+One candidate named elsewhere on this page, for a session that wants it:
+**SVCB/HTTPS presentation form** was the largest remaining entry in #21's
+not-implemented list and closed as #35; ~~**#13e's `Name` half**~~ closed as #36
+on 2026-09-07, so both of the two named here are gone. Not a queue either.
 
 > **1. Push, and read the five CI jobs nobody has ever read.** Ask
 > `git rev-list --count origin/main..HEAD` how much is waiting; it was 49 on
@@ -761,7 +761,7 @@ one of these is ever taken up it gets its own number.
 
 | | what | decided |
 |---|---|---|
-| **D-1** | a label that is not valid UTF-8 is refused, where RFC 2181 §11 allows any binary string | **Deliberate, and the one with a real cost.** Names are `String`s in presentation form throughout; the alternative is a different representation (labels, or wire bytes), which is what **#13e** scopes — its map-key half is done and its `Name` half is *deferred*, not declined, and #11 owns the storage question. The consequence is easy to under-read: a zone containing such a name cannot be served, *and* a response containing one is unparseable, so `rdnsr` cannot relay someone else's zone that has one. **That last clause is the strongest argument anywhere on this page for taking #13e's `Name` half**, and it is not among the reasons #13e was deferred — those were about allocation counts and churn. (Not #15, which is a different question: that was the `DName`/`UnpackedDName` typestate collapse, withdrawn on its own merits, and it would not have changed what a label may contain.) |
+| ~~**D-1**~~ | ~~a label that is not valid UTF-8 is refused, where RFC 2181 §11 allows any binary string~~ | **Fixed 2026-09-07 by #36**, which took the argument in the last clause below. The reasoning that produced the deviation is left standing, because it is why the deviation existed: ~~**Deliberate, and the one with a real cost.** Names are `String`s in presentation form throughout; the alternative is a different representation (labels, or wire bytes), which is what **#13e** scopes — its map-key half is done and its `Name` half is *deferred*, not declined, and #11 owns the storage question. The consequence is easy to under-read: a zone containing such a name cannot be served, *and* a response containing one is unparseable, so `rdnsr` cannot relay someone else's zone that has one. **That last clause is the strongest argument anywhere on this page for taking #13e's `Name` half**, and it is not among the reasons #13e was deferred — those were about allocation counts and churn.~~ (Not #15, which is a different question: that was the `DName`/`UnpackedDName` typestate collapse, withdrawn on its own merits, and it would not have changed what a label may contain.) |
 | **D-5** | RFC 1035 §2.3.1's LDH "preferred name syntax" is not enforced | **Deliberate, and enforcing it would be a bug.** RFC 2181 §11 settles it; enforcing LDH would refuse `_dmarc`, every `_tcp` SRV owner, DNS-SD instance names and the wildcard `*`. #15 records that a `TODO` asking for this was deleted rather than done, because doing it was the defect |
 | **D-6** | the first compression pointer in a chain may point forward | **Deliberate.** Every *subsequent* pointer must strictly decrease, which is what makes cycles unreachable without a visited-set; the first is unconstrained because a name is parsed from a suffix slice that does not know its own offset. Termination is unaffected, and the reasoning and the cost of the alternative are written at `dname.rs` |
 | **D-7** | class CH and HS are refused rather than served | **Deliberate.** RFC 1034 §4.3.2 step 1 searches the zones *of the question's class*, and holding none in a class is the same situation as holding no zone. The visible cost is that `version.bind CH TXT` — which BIND, NSD and Knot all answer — is not answered here. Serving it would mean a second class in the zone index, which #13d's class-blind index deliberately made unrepresentable |
@@ -846,6 +846,7 @@ the week; the record is under "How the queue kept going stale" in
 | **32** | `Shell`, `Served` and the other unnamed bags | **closed 2026-09-05.** The prediction held: naming the five was the extraction, and `ServeContext` landed in the same commit as the pipeline it parameterizes |
 | **33** | a fourth pass: duplication, generics, and where the modules are cut | **closed 2026-09-06**, eight items over two days. 33b was the one defect in a shipped binary — `rdnsc` could not ask an ANY or AXFR query, because the builder took an RTYPE. Five further candidates were dropped and the section says why |
 | **35** | SVCB and HTTPS (RFC 9460) | **filed and closed 2026-09-07**, one commit — the wire format and the presentation format are joined by an exhaustive match, so they could not be split. RFC 9460 Appendix D's eight wire vectors are a test, and Figure 10 caught a real design error: the value format is picked by how the key is *spelled*, not by its number. Brought RFC 1035 §5.1's escapes into the tree for the first time, which found a quoted escape in a name being silently mis-parsed — a defect with nothing to do with SVCB — and retired the `\DDD` limitation that made binary TXT go out in generic form |
+| **36** | #13e's `Name` half: names as wire octets | **filed and closed 2026-09-07**, two commits — the type on its own, then the whole tree onto it, because `ResourceRecord::name` and `QuerySection::qname` are used by every crate and the field type could not change in stages. Closes **D-1**: a label is any binary string now, and a response carrying one relays byte for byte. Five defects found on the way, none of them in the mechanical part, and the oldest is that a name inside RDATA was never resolved against the origin (RFC 1035 §5.1) — `www IN CNAME host` stored `host.`. Of the rest: the delegation and DNSKEY caches inserted a folded key and looked one up unfolded, the NSEC3 closest-encloser walk went through presentation text once per candidate name, and `to_wire` sized every unpacked name at 255 octets and then shrank it. `dname.rs` lost its presentation half in the same commit — both directions, and a second text-to-wire decoder that disagreed with `Name` about RFC 1035 §5.1's escapes. Not one of `allocations.rs`'s forty-four assertion ranges moved; dnspython validates twenty-one answers off a signed zone, including a name with a `.` inside a label |
 | **34** | DNAME (RFC 6672) | **filed and closed 2026-09-06**, five commits — the record type, the zone, the server algorithm, the resolver, then signing and UPDATE. Taken off #21's not-implemented list, which had named it the only entry there that answered *wrong* rather than incomplete. Two bugs found by the new tests: a `Zone` flag maintained in one of the two places that maintain its siblings (now one `Shortcuts` value), and DNAME missing from UPDATE's singleton list. One test had to be rewritten because it passed with the guard it was named for deleted |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
@@ -2154,18 +2155,21 @@ record.rtype                                    // type code, direct field read
 
 ## Quick reference: names on the wire
 
-`dname` owns the primitives — the bounds-checked write, the label encoder, and
-the pointer constants. `compression` holds only the per-message offset table and
-the policy for which RR types may have compressed names in their RDATA.
+`name` owns the type and both text doors; `dname` is the wire *reader* — the
+label walk, the pointer resolution and the length limits — and nothing else since
+#36. `compression` holds only the per-message offset table and the policy for
+which RR types may have compressed names in their RDATA.
 
 ```rust
-dname_to_bytes("www.example.com.")?     // full, uncompressed — RDATA and DNSSEC
+let name: Name = "www.example.com.".parse()?;   // presentation text in
+name.as_ref().as_wire()                         // uncompressed octets out
+Name::from_wire_in(bytes, &unpacker)?           // off a message, pointers followed
 
 // One compressor per message being serialized; offsets are meaningless across
 // messages. DnsMessage::to_bytes drives this for you — you only touch it
 // directly if you write a new serializer.
 let mut c = NameCompressor::new();
-pos = c.write_name("www.example.com.", buf, pos)?;   // literal, or a pointer
+pos = c.write_name(name.as_ref(), buf, pos)?;        // literal, or a pointer
 pos = c.write_rdata(rtype, &rdata, buf, pos)?;       // NS/CNAME/PTR/SOA/MX only
 ```
 

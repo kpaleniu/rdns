@@ -21,13 +21,15 @@
 //! instead of copying, which is what the ancestor walks in `zone` and
 //! `resolver` do once per label of a name the client chose.
 //!
-//! **Comparison no longer folds.** [`NameRef`]'s `Eq` and `Hash` fold ASCII as
-//! they go (RFC 4343), so the nine lowercased copies the string form needed to
-//! compare two names are gone. A copy survives in one place and one only: a
+//! **Comparing two names no longer copies either.** [`NameRef`]'s `Eq` and
+//! `Hash` fold ASCII as they go (RFC 4343), so the lowercased copy a comparison
+//! used to make is gone. Two things still need the folded octets themselves: a
 //! `HashMap` key, because `Borrow` cannot hand out a borrowed view of a type
-//! with a lifetime without the `unsafe` pointer cast `str` uses, and this
-//! library has none. [`NameRef::folded`] is that one place, and it borrows when
-//! the name is already lower case, which is the ordinary query.
+//! carrying a lifetime without the `unsafe` pointer cast `str` uses and this
+//! library has none; and DNSSEC's canonical form, which is down-cased by
+//! definition (RFC 4034 §6.2). [`NameRef::folded`] serves the first and borrows
+//! when the name is already lower case, which is the ordinary query;
+//! [`NameRef::to_folded`] serves the second.
 //!
 //! A `Name` is always **absolute**. A relative name exists only in zone-file
 //! text and is resolved against the origin before it becomes one, so nothing
@@ -35,6 +37,7 @@
 
 use crate::dname::{
     check_name_len, name_wire_from_bytes, name_wire_from_bytes_in, DNameUnpacker, MAX_LABEL_LEN,
+    MAX_NAME_LEN,
 };
 use crate::error::{WireError, WireResult};
 use std::borrow::Cow;
@@ -87,6 +90,56 @@ impl Name {
         Ok((Name(wire.into_boxed_slice()), rest))
     }
 
+    /// The name a message parser has already located, pointers resolved.
+    ///
+    /// The one door for a *record's owner*, which `RecordParts` carries as a
+    /// parsed `DName` so that reading past it costs nothing.
+    pub(crate) fn from_dname<'a>(
+        name: crate::dname::DName<'a>,
+        unpacker: &DNameUnpacker<'a>,
+    ) -> WireResult<Name> {
+        Ok(Name(unpacker.decode_wire(name)?.into_boxed_slice()))
+    }
+
+    /// Zone-file text that is relative to an origin (RFC 1035 §5.1): the labels
+    /// of `text`, then `origin`.
+    ///
+    /// The caller has already decided the text *is* relative — `@`, the empty
+    /// name and a trailing dot are the zone parser's to interpret, not this
+    /// type's.
+    pub fn relative_to(text: &str, origin: NameRef<'_>) -> WireResult<Name> {
+        let head = Name::from_presentation(text)?;
+        // Everything but the root terminator, which `origin` supplies.
+        let head = &head.0[..head.0.len() - 1];
+        let mut out = Vec::with_capacity(head.len() + origin.0.len());
+        out.extend_from_slice(head);
+        out.extend_from_slice(origin.0);
+        check_name_len(out.len())?;
+        Ok(Name(out.into_boxed_slice()))
+    }
+
+    /// `label` prepended to `parent` — how a wildcard name is built from the
+    /// closest encloser (RFC 4592 §3.3.1).
+    ///
+    /// Octets, not text, so the label is taken as it is: a `*` here is the
+    /// wildcard label and a label that happens to contain a `.` is one label.
+    pub fn prefixed(label: &[u8], parent: NameRef<'_>) -> WireResult<Name> {
+        if label.is_empty() || label.len() > MAX_LABEL_LEN {
+            return Err(WireError::TooLong {
+                what: "a label",
+                limit: MAX_LABEL_LEN,
+                actual: label.len(),
+            });
+        }
+        let parent = parent.as_wire();
+        let mut out = Vec::with_capacity(1 + label.len() + parent.len());
+        out.push(label.len() as u8);
+        out.extend_from_slice(label);
+        out.extend_from_slice(parent);
+        check_name_len(out.len())?;
+        Ok(Name(out.into_boxed_slice()))
+    }
+
     /// Read presentation text, resolving RFC 1035 §5.1's escapes.
     ///
     /// The text is taken as **absolute**: a trailing `.` is optional and adds
@@ -97,55 +150,89 @@ impl Name {
     /// #13e had to refuse, because presentation storage could not tell either
     /// of them from the separator.
     pub fn from_presentation(text: &str) -> WireResult<Name> {
-        if text.is_empty() || text == "." {
-            return Ok(Name::root());
-        }
-        let bytes = text.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len() + 2);
-        // Where the current label's length octet is reserved, or `None` between
-        // labels. Reserved on the first octet of a label rather than after each
-        // separator, so a trailing dot leaves nothing half-written.
-        let mut label_start: Option<usize> = None;
-        let mut i = 0;
-        while i < bytes.len() {
-            let byte = match bytes[i] {
-                b'\\' => {
-                    let (decoded, used) = decode_escape(&bytes[i..])?;
-                    i += used;
-                    decoded
-                }
-                b'.' => {
-                    i += 1;
-                    let Some(start) = label_start.take() else {
-                        return Err(WireError::malformed(
-                            "a domain name",
-                            "a label may not be empty",
-                        ));
-                    };
-                    let len = out.len() - start - 1;
-                    finish_label(&mut out, start, len)?;
-                    continue;
-                }
-                other => {
-                    i += 1;
-                    other
-                }
-            };
-            if label_start.is_none() {
-                label_start = Some(out.len());
-                out.push(0);
-            }
-            out.push(byte);
-        }
-        // A name that did not end on a separator still owes its last length.
-        if let Some(start) = label_start {
-            let len = out.len() - start - 1;
-            finish_label(&mut out, start, len)?;
-        }
-        out.push(0);
-        check_name_len(out.len())?;
-        Ok(Name(out.into_boxed_slice()))
+        // Exactly one allocation, sized after the escapes have been resolved:
+        // `Name` keeps a boxed slice, so a `Vec` grown and then shrunk would
+        // copy twice.
+        let mut buf = [0u8; MAX_NAME_LEN];
+        let len = presentation_wire_in(text, &mut buf)?;
+        Ok(Name(buf[..len].into()))
     }
+}
+
+/// Read presentation text into `buf` as wire octets, returning the length.
+///
+/// The spelling [`Name::from_presentation`] is built on, and the one a caller
+/// that throws the bytes away should use: RFC 5155 §5 hashes a name per label
+/// of the QNAME (§8.3) and keeps none of them, so the NSEC3 walk puts its
+/// buffer on the stack. `buf` must hold [`MAX_NAME_LEN`] octets; a name that
+/// does not fit is over §2.3.4's limit and is refused.
+pub fn presentation_wire_in(text: &str, buf: &mut [u8]) -> WireResult<usize> {
+    debug_assert!(buf.len() >= MAX_NAME_LEN, "a name needs 255 octets");
+    if text.is_empty() || text == "." {
+        buf[0] = 0;
+        return Ok(1);
+    }
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    // Where the current label's length octet is reserved, or `None` between
+    // labels. Reserved on the first octet of a label rather than after each
+    // separator, so a trailing dot leaves nothing half-written.
+    let mut label_start: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = match bytes[i] {
+            b'\\' => {
+                let (decoded, used) = decode_escape(&bytes[i..])?;
+                i += used;
+                decoded
+            }
+            b'.' => {
+                i += 1;
+                let Some(start) = label_start.take() else {
+                    return Err(WireError::malformed(
+                        "a domain name",
+                        "a label may not be empty",
+                    ));
+                };
+                finish_label(buf, start, at - start - 1)?;
+                continue;
+            }
+            other => {
+                i += 1;
+                other
+            }
+        };
+        if label_start.is_none() {
+            label_start = Some(at);
+            at = push(buf, at, 0)?;
+        }
+        at = push(buf, at, byte)?;
+    }
+    // A name that did not end on a separator still owes its last length.
+    if let Some(start) = label_start {
+        finish_label(buf, start, at - start - 1)?;
+    }
+    at = push(buf, at, 0)?;
+    check_name_len(at)?;
+    Ok(at)
+}
+
+/// One octet into `buf`, returning the position after it.
+///
+/// Running off the end is a name over RFC 1035 §2.3.4's limit, reported as such
+/// rather than as a buffer failure. `actual` is 256 — the first length that does
+/// not fit — not the name's full encoded length, which is not known without
+/// decoding the rest of it; the limit is what an operator has to act on.
+fn push(buf: &mut [u8], at: usize, byte: u8) -> WireResult<usize> {
+    if at >= buf.len() {
+        return Err(WireError::TooLong {
+            what: "a domain name",
+            limit: MAX_NAME_LEN,
+            actual: at + 1,
+        });
+    }
+    buf[at] = byte;
+    Ok(at + 1)
 }
 
 /// Write a label's length into the octet reserved for it.
@@ -196,6 +283,45 @@ fn decode_escape(bytes: &[u8]) -> WireResult<(u8, usize)> {
 }
 
 impl<'a> NameRef<'a> {
+    /// Borrow a name from octets that already hold one.
+    ///
+    /// Validating, and cheap — one walk of the labels — so there is no
+    /// constructor here that trusts its caller. The case it exists for is a
+    /// name folded into a scratch buffer for use as a map key: the fold
+    /// preserves every length octet and label boundary, so what comes back is
+    /// the same name in lower case.
+    pub fn from_wire_slice(wire: &[u8]) -> WireResult<NameRef<'_>> {
+        let mut pos = 0;
+        loop {
+            let Some(&len) = wire.get(pos) else {
+                return Err(WireError::malformed(
+                    "a domain name",
+                    "the octets end before the root label",
+                ));
+            };
+            let len = len as usize;
+            if len > MAX_LABEL_LEN {
+                return Err(WireError::TooLong {
+                    what: "a label",
+                    limit: MAX_LABEL_LEN,
+                    actual: len,
+                });
+            }
+            pos += 1 + len;
+            if len == 0 {
+                break;
+            }
+        }
+        if pos != wire.len() {
+            return Err(WireError::malformed(
+                "a domain name",
+                "octets follow the root label",
+            ));
+        }
+        check_name_len(wire.len())?;
+        Ok(NameRef(wire))
+    }
+
     /// The wire octets, root terminator included.
     pub fn as_wire(&self) -> &'a [u8] {
         self.0
@@ -239,6 +365,18 @@ impl<'a> NameRef<'a> {
         Some(NameRef(&tail[len..]))
     }
 
+    /// The last `labels` labels of this name. Asking for more than it has
+    /// yields the whole name.
+    ///
+    /// An ancestor counted from the other end — which is how QNAME
+    /// minimisation asks for it (RFC 9156 §2.3), one label deeper each round.
+    pub fn suffix(&self, labels: usize) -> NameRef<'a> {
+        let skip = self.label_count().saturating_sub(labels);
+        self.ancestors()
+            .nth(skip)
+            .unwrap_or(NameRef(&self.0[self.0.len() - 1..]))
+    }
+
     /// This name, then every ancestor, ending at the root.
     pub fn ancestors(&self) -> impl Iterator<Item = NameRef<'a>> {
         let mut next = Some(*self);
@@ -265,12 +403,41 @@ impl<'a> NameRef<'a> {
             .is_some_and(|ancestor| ancestor == other)
     }
 
+    /// This name folded to lower case, as a name.
+    ///
+    /// The buffer is the caller's, so a name already in lower case — the
+    /// ordinary query — borrows and costs nothing, and a DNS-0x20 one costs one
+    /// copy into a buffer a server reuses. Returns a `NameRef` rather than
+    /// octets so that no constructor here has to trust unvalidated bytes:
+    /// folding changes no length octet and no label boundary, so the result is
+    /// the same name and is known to be one.
+    pub fn folded_in<'b>(self, buf: &'b mut Vec<u8>) -> NameRef<'b>
+    where
+        'a: 'b,
+    {
+        if self.0.iter().any(u8::is_ascii_uppercase) {
+            buf.clear();
+            buf.extend(self.0.iter().map(u8::to_ascii_lowercase));
+            NameRef(buf)
+        } else {
+            NameRef(self.0)
+        }
+    }
+
+    /// This name folded to lower case, owned.
+    ///
+    /// DNSSEC's canonical form for a name is exactly this — "the DNS names ...
+    /// are replaced by their lower-case equivalents" (RFC 4034 §6.2) — which
+    /// over wire form is one pass and no re-encoding.
+    pub fn to_folded(&self) -> Name {
+        Name(self.0.to_ascii_lowercase().into_boxed_slice())
+    }
+
     /// The name folded to lower case, for use as a `HashMap` key.
     ///
     /// Borrowed when there is nothing to fold, which is every name that arrived
     /// in lower case — so the ordinary query pays nothing and a DNS-0x20 one
-    /// pays a copy. The single place a fold survives; see this module's header
-    /// for why `Borrow` cannot remove it.
+    /// pays a copy. See this module's header for why `Borrow` cannot remove it.
     pub fn folded(&self) -> Cow<'a, [u8]> {
         if self.0.iter().any(u8::is_ascii_uppercase) {
             Cow::Owned(self.0.to_ascii_lowercase())
@@ -299,17 +466,29 @@ impl<'a> NameRef<'a> {
     }
 }
 
-/// One label as presentation text.
+/// One label as presentation text, escaped so a zone file reads it back as
+/// the same octets.
 ///
-/// Not `utils::char_string_escaped`: a label must escape `.`, which separates
-/// labels and is ordinary data inside one, and need not escape `"`, which means
-/// nothing outside a quoted character-string. Two rules that overlap without
-/// either containing the other, so two functions — `CLAUDE.md` §7 is about one
-/// rule written twice, not about two rules that resemble each other.
+/// Three groups, and the third is the one that is easy to miss:
+///
+/// - `.` and `\`, which are the separator and the escape.
+/// - Anything outside printable ASCII, as `\DDD` — space included, since a
+///   bare space ends a field.
+/// - **The characters a zone file gives its own meaning**: `;` starts a
+///   comment, `"` opens a quoted string, `(` and `)` group a line, `@` is the
+///   origin and `$` begins a directive. A label may hold any of them
+///   (RFC 2181 §11), and one written raw would be read back as syntax rather
+///   than as data. RFC 1035 §5.1's `\X` covers every one of them.
+///
+/// Not `utils::char_string_escaped`: that one escapes `"` and not `.`, because
+/// a character-string's separator is the quote and a dot inside one is
+/// ordinary. Two rules that overlap without either containing the other, so
+/// two functions — `CLAUDE.md` §7 is about one rule written twice, not about
+/// two rules that resemble each other.
 fn escape_label(label: &[u8], out: &mut String) {
     for &byte in label {
         match byte {
-            b'.' | b'\\' => {
+            b'.' | b'\\' | b';' | b'"' | b'(' | b')' | b'@' | b'$' => {
                 out.push('\\');
                 out.push(byte as char);
             }
@@ -337,6 +516,28 @@ impl Hash for NameRef<'_> {
         for &byte in self.0 {
             state.write_u8(byte.to_ascii_lowercase());
         }
+    }
+}
+
+/// Presentation text, parsed — [`Name::from_presentation`] under the spelling
+/// a caller reaches for first.
+///
+/// Fallible, because text can fail to be a name: an escape that goes nowhere,
+/// a label over 63 octets, a name over 255. That is the whole reason there is
+/// no `From<&str>`.
+impl std::str::FromStr for Name {
+    type Err = WireError;
+
+    fn from_str(text: &str) -> WireResult<Name> {
+        Name::from_presentation(text)
+    }
+}
+
+/// The root: the empty name, and what a `#[derive(Default)]` struct holding a
+/// name means by "none yet".
+impl Default for Name {
+    fn default() -> Self {
+        Name::root()
     }
 }
 
@@ -390,8 +591,18 @@ impl std::fmt::Debug for Name {
     }
 }
 
+/// A name from a literal, for tests only: `Name` is fallible to build and a test
+/// that writes a bad one should fail loudly at that line rather than threading a
+/// `Result` through a fixture. `rdns::test_records::nm` is the same helper for
+/// the crate above.
+#[cfg(test)]
+pub(crate) fn nm(text: &str) -> Name {
+    text.parse().expect("a test name parses")
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::collections::hash_map::DefaultHasher;
     use std::collections::HashMap;
@@ -480,11 +691,11 @@ mod tests {
     /// D-1 from the other side: the same name through the *wire*, which is the
     /// path `rdnsr` uses to relay somebody else's zone.
     ///
-    /// `dname_from_bytes` — the presentation door — refuses this name, and that
-    /// refusal is the deviation. The two are asserted together so the contrast
-    /// is the test rather than a claim in a comment.
+    /// There is no presentation door left to contrast with — reading a name as
+    /// text is what this replaced, and `dname.rs` lost that half — so what is
+    /// asserted is that the octets arrive and leave unchanged.
     #[test]
-    fn a_non_utf8_label_survives_the_wire_where_the_string_form_refused_it() {
+    fn a_non_utf8_label_survives_the_wire() {
         // One label of a single 0xff octet, then `example`, then the root.
         let wire = [1u8, 0xff, 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0];
 
@@ -494,13 +705,11 @@ mod tests {
         // And it goes back out as the octets it arrived as.
         assert_eq!(name.as_ref().as_wire(), &wire);
 
-        // The presentation pipeline cannot hold it, which is D-1: `String` is
-        // UTF-8 and 0xff begins no UTF-8 sequence.
-        let unpacker = DNameUnpacker::new(&wire);
-        assert!(
-            crate::dname::dname_from_bytes(&wire, &unpacker).is_err(),
-            "the string form refuses it, and that refusal is the deviation"
-        );
+        // And it has a spelling, which is what a zone file needs: `String` is
+        // UTF-8 and 0xff begins no UTF-8 sequence, so the octet has to be
+        // escaped rather than carried (RFC 1035 §5.1).
+        assert_eq!(name.as_ref().to_presentation(), r"\255.example.");
+        assert_eq!(Name::from_presentation(r"\255.example.").unwrap(), name);
     }
 
     /// Every octet has a spelling and reads back as itself, so no name that

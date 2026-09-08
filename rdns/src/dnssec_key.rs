@@ -15,7 +15,7 @@
 //! key nobody can find.
 
 use crate::dnssec::{
-    ds_digest, key_tag, rrsig_labels, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP,
+    ds_digest, key_tag, rrsig_labels_of, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP,
     DNSKEY_FLAG_ZONE,
 };
 use crate::error::DnssecError;
@@ -350,10 +350,10 @@ impl SigningKey {
         expiration: u32,
     ) -> Result<Rrsig> {
         let mut rrsig = Rrsig {
-            owner: crate::dnssec::canonical_name(rrset.owner),
+            owner: crate::dnssec::canonical_name_of(rrset.owner),
             type_covered: rrset.rtype,
             algorithm: self.algorithm.code(),
-            labels: rrsig_labels(rrset.owner),
+            labels: rrsig_labels_of(rrset.owner),
             original_ttl,
             inception,
             expiration,
@@ -605,9 +605,11 @@ fn base64_decode(text: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::dnssec::{verify, verify_rrset, RrsetProof};
     use crate::test_records::a_rdata;
+    use crate::test_records::nm;
     use crate::utils::record_types as rt;
     use crate::Class;
 
@@ -620,10 +622,17 @@ mod tests {
         ] {
             let key = SigningKey::generate(algorithm, "example.com.", DNSKEY_FLAG_ZONE).unwrap();
             let rdatas = vec![a_rdata([192, 0, 2, 1])];
-            let rrset = Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas);
+            let owner = nm("www.example.com.");
+            let rrset = Rrset::new(owner.as_ref(), rt::A, Class::new(1), &rdatas);
             let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
 
-            let proof = verify_rrset(&rrset, &[sig], &[key.dnskey()], "example.com.", 1_500);
+            let proof = verify_rrset(
+                &rrset,
+                &[sig],
+                &[key.dnskey()],
+                nm("example.com.").as_ref(),
+                1_500,
+            );
             assert!(
                 matches!(proof, RrsetProof::Verified { .. }),
                 "{}: {proof:?}",
@@ -647,7 +656,8 @@ mod tests {
         )
         .unwrap();
         let rdatas = vec![a_rdata([192, 0, 2, 1])];
-        let rrset = Rrset::new("www.example.com.", rt::A, Class::new(1), &rdatas);
+        let owner = nm("www.example.com.");
+        let rrset = Rrset::new(owner.as_ref(), rt::A, Class::new(1), &rdatas);
         let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
 
         let data = signed_data(&sig, rrset.owner, rrset.class, rrset.rdatas).unwrap();
@@ -671,20 +681,22 @@ mod tests {
         )
         .unwrap();
         let rdatas = vec![a_rdata([192, 0, 2, 1])];
-        let rrset = Rrset::new("*.example.com.", rt::A, Class::new(1), &rdatas);
+        let owner = nm("*.example.com.");
+        let rrset = Rrset::new(owner.as_ref(), rt::A, Class::new(1), &rdatas);
         let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
         assert_eq!(sig.labels, 2);
 
         // Re-owned onto a name the wildcard expands to, it still verifies.
         let mut expanded = sig.clone();
         expanded.owner = "anything.example.com.".to_string();
-        let expanded_rrset = Rrset::new("anything.example.com.", rt::A, Class::new(1), &rdatas);
+        let expanded_owner = nm("anything.example.com.");
+        let expanded_rrset = Rrset::new(expanded_owner.as_ref(), rt::A, Class::new(1), &rdatas);
         assert!(matches!(
             verify_rrset(
                 &expanded_rrset,
                 &[expanded],
                 &[key.dnskey()],
-                "example.com.",
+                nm("example.com.").as_ref(),
                 1_500
             ),
             RrsetProof::Verified {
@@ -715,10 +727,17 @@ mod tests {
         // The same *private* key, not one that merely describes itself the
         // same: a signature from the loaded copy verifies under the original.
         let rdatas = vec![a_rdata([192, 0, 2, 1])];
-        let rrset = Rrset::new("example.com.", rt::A, Class::new(1), &rdatas);
+        let owner = nm("example.com.");
+        let rrset = Rrset::new(owner.as_ref(), rt::A, Class::new(1), &rdatas);
         let sig = back.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
         assert!(matches!(
-            verify_rrset(&rrset, &[sig], &[key.dnskey()], "example.com.", 1_500),
+            verify_rrset(
+                &rrset,
+                &[sig],
+                &[key.dnskey()],
+                nm("example.com.").as_ref(),
+                1_500
+            ),
             RrsetProof::Verified { .. }
         ));
     }

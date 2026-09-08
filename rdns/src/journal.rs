@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::ZoneError;
 use crate::ixfr::ZoneDelta;
-use crate::utils::{absolute_lowered, record_types as rt};
+use crate::utils::record_types as rt;
 use crate::zone::{parse_zone_file, Zone, ZoneRecord};
 use crate::zone_writer::record_to_string;
-use crate::{ResourceRecord, Serial};
+use crate::{NameRef, ResourceRecord, Serial};
 
 /// The line that separates one difference sequence from the next.
 ///
@@ -40,15 +40,18 @@ impl Journal {
     ///
     /// Keyed on the folded origin, not the file the zone was loaded from, so the
     /// journal follows the zone rather than the path.
-    pub fn path_for(&self, zone: &str) -> PathBuf {
-        self.dir.join(format!("{}journal", absolute_lowered(zone)))
+    pub fn path_for(&self, zone: NameRef<'_>) -> PathBuf {
+        self.dir.join(format!(
+            "{}journal",
+            zone.to_presentation().to_ascii_lowercase()
+        ))
     }
 
     /// Write a zone's history, replacing whatever was there.
     ///
     /// An empty history removes the file: a zone we no longer hold increments
     /// for must not appear to offer them after a restart.
-    pub fn save(&self, zone: &str, deltas: &[&ZoneDelta]) -> Result<(), ZoneError> {
+    pub fn save(&self, zone: NameRef<'_>, deltas: &[&ZoneDelta]) -> Result<(), ZoneError> {
         let path = self.path_for(zone);
         if deltas.is_empty() {
             // A missing file and an empty one mean the same thing to `load`.
@@ -82,7 +85,7 @@ impl Journal {
     ///
     /// `Ok(vec![])` when there is no journal. An unreadable or malformed journal
     /// is an `Err` the caller logs and otherwise ignores.
-    pub fn load(&self, zone: &str) -> Result<Vec<ZoneDelta>, ZoneError> {
+    pub fn load(&self, zone: NameRef<'_>) -> Result<Vec<ZoneDelta>, ZoneError> {
         let path = self.path_for(zone);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -95,10 +98,10 @@ impl Journal {
             }
         };
 
-        let origin = absolute_lowered(zone).into_owned();
+        let origin = zone.to_owned();
         let mut deltas = Vec::new();
         for (index, block) in text.split(SEPARATOR).skip(1).enumerate() {
-            let delta = read_delta(block, &origin).map_err(|e| {
+            let delta = read_delta(block, origin.as_ref()).map_err(|e| {
                 ZoneError::invalid(format!(
                     "{}: difference sequence {} is unreadable: {e}",
                     path.display(),
@@ -129,7 +132,7 @@ impl Journal {
     ///
     /// A withdrawn zone must not come back after a restart offering increments
     /// of something nobody serves.
-    pub fn forget(&self, zone: &str) {
+    pub fn forget(&self, zone: NameRef<'_>) {
         let _ = std::fs::remove_file(self.path_for(zone));
     }
 }
@@ -149,24 +152,23 @@ fn write_record(out: &mut String, record: &ResourceRecord) -> Result<(), ZoneErr
 }
 
 /// One difference sequence, read positionally in RFC 1995 §4's order.
-fn read_delta(block: &str, origin: &str) -> Result<ZoneDelta, ZoneError> {
+fn read_delta(block: &str, origin: NameRef<'_>) -> Result<ZoneDelta, ZoneError> {
     // The zone parser, not a second reader for the same syntax. `records()`
     // preserves insertion order and duplicates; a sequence is a list, not a set.
-    let parsed = parse_zone_file(block, origin)?;
+    let parsed = parse_zone_file(block, &origin.to_presentation())?;
     let records: Vec<ResourceRecord> = parsed
         .records()
         .iter()
         .map(|r| ResourceRecord {
-            name: parsed.normalize_name(&r.name).into_owned(),
+            name: r.name.clone(),
             class: r.class,
             ttl: r.ttl,
             rdata: r.rdata.clone(),
         })
         .collect();
 
-    let is_apex_soa = |record: &ResourceRecord| {
-        record.rdata.rtype() == rt::SOA && record.name.eq_ignore_ascii_case(origin)
-    };
+    let is_apex_soa =
+        |record: &ResourceRecord| record.rdata.rtype() == rt::SOA && record.name.as_ref() == origin;
 
     let [from_soa, rest @ ..] = records.as_slice() else {
         return Err(ZoneError::invalid("it is empty"));
@@ -235,8 +237,10 @@ pub fn usable_against(deltas: &[ZoneDelta], zone: &Zone) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::ixfr::{diff, DeltaLog};
+    use crate::test_records::nm;
 
     struct Scratch(PathBuf);
 
@@ -282,9 +286,11 @@ mod tests {
         let v2 = zone_at(2, "www IN A 192.0.2.9\nftp IN AAAA 2001:db8::1\n");
         let delta = diff(&v1, &v2).expect("a step");
 
-        journal.save("example.com.", &[&delta]).expect("saves");
+        journal
+            .save(nm("example.com.").as_ref(), &[&delta])
+            .expect("saves");
         let back = journal
-            .load("EXAMPLE.COM.")
+            .load(nm("EXAMPLE.COM.").as_ref())
             .expect("and loads, case-folded");
 
         assert_eq!(back.len(), 1);
@@ -319,20 +325,23 @@ mod tests {
         for pair in versions.windows(2) {
             log.note_change(Some(&pair[0]), &pair[1]);
         }
-        assert_eq!(log.len("example.com."), 3);
+        assert_eq!(log.len(nm("example.com.").as_ref()), 3);
 
         journal
-            .save("example.com.", &log.all("example.com."))
+            .save(
+                nm("example.com.").as_ref(),
+                &log.all(nm("example.com.").as_ref()),
+            )
             .expect("saves");
 
         // A fresh process: nothing in memory, everything on disk.
         let mut restored = DeltaLog::new();
-        let loaded = journal.load("example.com.").expect("loads");
+        let loaded = journal.load(nm("example.com.").as_ref()).expect("loads");
         assert!(usable_against(&loaded, versions.last().unwrap()));
-        restored.restore("example.com.", loaded);
+        restored.restore(nm("example.com.").as_ref(), loaded);
 
         let chain = restored
-            .chain_from("example.com.", Serial::new(1))
+            .chain_from(nm("example.com.").as_ref(), Serial::new(1))
             .expect("a chain from before the restart");
         assert_eq!(chain.len(), 3);
         assert_eq!(chain[2].to_serial, Serial::new(4));
@@ -354,9 +363,11 @@ mod tests {
         let skipped = diff(&v3, &v4).unwrap();
 
         journal
-            .save("example.com.", &[&first, &skipped])
+            .save(nm("example.com.").as_ref(), &[&first, &skipped])
             .expect("saves");
-        let err = journal.load("example.com.").expect_err("a gap is refused");
+        let err = journal
+            .load(nm("example.com.").as_ref())
+            .expect_err("a gap is refused");
         assert!(err.to_string().contains("do not link"), "got: {err}");
     }
 
@@ -366,7 +377,7 @@ mod tests {
         let scratch = Scratch::new("missing");
         let journal = Journal::new(&scratch.0);
         assert!(journal
-            .load("example.com.")
+            .load(nm("example.com.").as_ref())
             .expect("no journal is not a failure")
             .is_empty());
     }
@@ -381,14 +392,18 @@ mod tests {
         let v2 = zone_at(2, "www IN A 192.0.2.2\n");
         let delta = diff(&v1, &v2).unwrap();
 
-        journal.save("example.com.", &[&delta]).unwrap();
-        assert!(journal.path_for("example.com.").exists());
-        journal.save("example.com.", &[]).unwrap();
-        assert!(!journal.path_for("example.com.").exists());
+        journal
+            .save(nm("example.com.").as_ref(), &[&delta])
+            .unwrap();
+        assert!(journal.path_for(nm("example.com.").as_ref()).exists());
+        journal.save(nm("example.com.").as_ref(), &[]).unwrap();
+        assert!(!journal.path_for(nm("example.com.").as_ref()).exists());
 
-        journal.save("example.com.", &[&delta]).unwrap();
-        journal.forget("example.com.");
-        assert!(!journal.path_for("example.com.").exists());
+        journal
+            .save(nm("example.com.").as_ref(), &[&delta])
+            .unwrap();
+        journal.forget(nm("example.com.").as_ref());
+        assert!(!journal.path_for(nm("example.com.").as_ref()).exists());
     }
 
     /// A journal that does not reach the zone's current serial is not used.
@@ -410,13 +425,13 @@ mod tests {
         let scratch = Scratch::new("corrupt");
         let journal = Journal::new(&scratch.0);
         std::fs::write(
-            journal.path_for("example.com."),
+            journal.path_for(nm("example.com.").as_ref()),
             format!("{SEPARATOR}\nthis is not a record at all\n"),
         )
         .expect("write");
 
         let err = journal
-            .load("example.com.")
+            .load(nm("example.com.").as_ref())
             .expect_err("garbage does not read as an empty history");
         assert!(err.to_string().contains("unreadable"), "got: {err}");
     }
@@ -428,12 +443,14 @@ mod tests {
         let scratch = Scratch::new("framing");
         let journal = Journal::new(&scratch.0);
         std::fs::write(
-            journal.path_for("example.com."),
+            journal.path_for(nm("example.com.").as_ref()),
             format!("{SEPARATOR}\nwww.example.com. 3600 IN A 192.0.2.1\n"),
         )
         .expect("write");
 
-        let err = journal.load("example.com.").expect_err("no framing");
+        let err = journal
+            .load(nm("example.com.").as_ref())
+            .expect_err("no framing");
         assert!(err.to_string().contains("apex SOA"), "got: {err}");
     }
 }
