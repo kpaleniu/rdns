@@ -733,8 +733,9 @@ Everything here is a choice, not a queue. ~~One thing, with #33 and #34 both
 closed~~ — that was the state on 2026-09-07; **#37 was filed on 2026-09-08** and
 is the only numbered work open. ~~It is still a choice: 37a is worth taking on
 its own~~ — 37a was taken the day it was filed, because checking its own open
-question turned it into a defect report. **37b-37d are what is left**, and they
-are explicitly "when that code is next opened".
+question turned it into a defect report. ~~**37b-37d are what is left**~~ —
+37b was taken on 2026-09-08 too, the day `zone.rs` was next opened. **37c and
+37d are what is left**, and they are explicitly "when that code is next opened".
 
 One candidate named elsewhere on this page, for a session that wants it:
 **SVCB/HTTPS presentation form** was the largest remaining entry in #21's
@@ -790,7 +791,7 @@ and worth doing when that code is next opened.
 | | | |
 |---|---|---|
 | ~~**37a**~~ **done 2026-09-08** | five name helpers that #35 and #36 left behind | Verified by opening each, because the first pass of this list claimed two that are not real — see below. **`resolver::ancestors` (`resolver.rs:420`) is dead**: `#[allow(dead_code)]` under a struck-through doc comment saying `NameRef::ancestors` replaced it, one day old, from #36. **`nsec_cache::is_at_or_below` (`:853`)** is an independent reimplementation of `utils::is_at_or_under` that allocates two `canonical_name` strings and a `format!` per call — in the module #23 fixed for doing per-record work under one mutex. **`dnssec::suffix_labels` (`:311`)** returns `String` where `utils::suffix_labels` returns `&str`; both live. **`dnssec.rs` mixes both spellings of `label_count` in one file** — `utils`'s at `:201`, `:328`, `:770` (through its own `pub use` at `:304`) and `NameRef`'s at `:344`, `:354`, `:769`. And the open question under all four: the `&str` helpers split on `.` and `Name` does not, so **#35 brought RFC 1035 §5.1 escapes into a tree whose name arithmetic predates them**. Whether an escaped label reaches any of these is the thing to check first; it decides whether this is a consolidation or a defect |
-| **37b** | `zone/`, for the 19 items a flat split would widen | `zone.rs` is a data structure (`Zone`, `Shortcuts`, `Located`, `impl Zone`, `:20-707`) and a zone-file parser (`:708-1798`) that share nothing but the type they build. The parser has **19 private top-level items** — `tokenize`, `logical_lines`, `rdata_from_fields`, `check_dname_rules`, `absolutize`, the date helpers. Flat siblings widen all 19 to `pub(crate)`; `zone/parse.rs` + `zone/rdata.rs` + `zone/checks.rs` hold them at `pub(super)`. 1 798 code lines to ~690 / 570 / 380 / 140 |
+| ~~**37b**~~ **done 2026-09-08** | `zone/`, for the 19 items a flat split would widen — the count is wrong, see below | `zone.rs` is a data structure (`Zone`, `Shortcuts`, `Located`, `impl Zone`, `:20-707`) and a zone-file parser (`:708-1798`) that share nothing but the type they build. The parser has **19 private top-level items** — `tokenize`, `logical_lines`, `rdata_from_fields`, `check_dname_rules`, `absolutize`, the date helpers. Flat siblings widen all 19 to `pub(crate)`; `zone/parse.rs` + `zone/rdata.rs` + `zone/checks.rs` hold them at `pub(super)`. 1 798 code lines to ~690 / 570 / 380 / 140 |
 | **37c** | `resolver/`, for 29 | Same shape, one level worse: splitting `impl Resolver` across files means every private method the other half calls must widen. **13 private top-level items + 16 private methods.** `resolver/recurse.rs` (`recurse`, `walk`, `ask_any`, `extract_referral`, `query_server`), `resolver/validate.rs` (`validate`, `establish_chain`, `fetch_dnskeys`, `check_denial`), `resolver/caches.rs` (`DelegationCache`, `RttStore`, `KeyCache`). 1 717 code lines to ~320 / 560 / 280 / 260. Note the file is 62% tests — 4 541 lines, 2 824 of them — so the raw count overstates it |
 | **37d** | `rdns-core/src/lib.rs` into modules, which seals five newtypes | Not about size. `Class`, `Rtype`, `Qtype`, `Ttl` and `Serial` have private inner fields, so they are sealed against other *crates* and open to all nine modules of `rdns-core` — §17's "private in the crate root is not private", the rule `record_data.rs` already exists to obey. **Nothing bypasses them today** (checked: no construction and no `.0` outside `lib.rs`), so this converts a discipline into a compiler check rather than fixing a bug. 2 111 code lines to `codes.rs` ~465, `record.rs` ~680, `edns.rs` ~350, `message.rs` ~570, `svcb.rs` ~110 (the loose `decode/encode_svc_params` at `:450`/`:487` plus the key table from `utils.rs:502`), `lib.rs` ~90 of re-exports. No folder: these are siblings, not internals |
 
@@ -844,6 +845,47 @@ root, so one of them re-owned a cached RRset onto `.`.
 Measured: `cargo test -p rdns --test allocations` unchanged except the NSEC
 validator path, **6 to 4**, because `common_suffix` takes a slice now instead of
 rebuilding its answer.
+
+#### 37b: seven items held, not nineteen — **done 2026-09-08**
+
+`zone.rs` 1 798 code lines to **704 / 410 / 560 / 148** — `zone.rs`,
+`zone/parse.rs`, `zone/rdata.rs`, `zone/checks.rs`. Estimated 690 / 570 / 380 /
+140; `parse.rs` and `rdata.rs` swapped places because the RRSIG date helpers
+went with the RDATA that spells them, not with the parser.
+
+**The row's "flat siblings widen all 19" is wrong, and the correction is the
+measurement.** A flat split widens only what crosses a file boundary. Counted
+after the fact: **7 items cross** — `absolutize`, `name_at`,
+`parse_generic_rdata`, `rdata_from_fields`, `parse_dnssec_time`,
+`check_cname_exclusivity`, `check_dname_rules` — and **11 do not**
+(`logical_lines`, `tokenize`, `LogicalLine`, `ParseState`, `MAX_INCLUDE_DEPTH`,
+`parse_zone_file_with_base`, `parse_into`, `is_leap`, `days_in_month`,
+`construct_type_bitmap`, `split_svcb_head`). So the folder buys `pub(super)` on
+7 items instead of `pub(crate)`, which is 2 100 lines of visibility instead of
+35 000 — the same direction, a third of the size. The claim came from reading
+the row's own "19 private top-level items" as if a split made all of them
+public, which is §17's closing rule again: reasoning about what the code should
+look like instead of opening it. Left standing rather than edited, because that
+is where the number came from.
+
+The crate's public surface is unchanged: `parse_zone_file` and
+`parse_zone_file_at` are re-exported from `zone.rs`, so
+`rdns::zone::parse_zone_file` is still the path, and `format_dnssec_time` stays
+`pub(crate)` for `zone_writer`. `parse_dnssec_time` was `pub(crate)` for no
+reason and is now `pub(super)`.
+
+Verified as a move: the four files reassembled in the original order diff
+against `HEAD:rdns/src/zone.rs` as exactly the import trim, the three `mod`
+lines, the seven visibility widenings and the blank lines at the seams —
+nothing else. 597 lib tests before and after on Windows, and clippy and the
+workspace suite clean on Linux under WSL (`CLAUDE.md` §1: a test count that
+differs by platform is the tell).
+
+`zone.rs` keeps its name rather than becoming `zone/mod.rs`, so the 1 798-line
+move does not also register as a rename and the blame lineage survives. The
+1 398 lines of tests stay in `zone.rs`: five of them reach into the moved
+helpers and reach them through `pub(super)`, which is the visibility the split
+exists to buy.
 
 #### What this does not take
 
