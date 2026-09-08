@@ -14,4 +14,8 @@
 # from every commit message, and again on 2026-08-30, when the history was
 # squashed into a 54-patch series. A stale entry here is not cosmetic: `git
 # blame` fails outright on a revision it cannot resolve.
+#
+# The 2026-09-08 rewrite, which took the development machine out of the commit
+# messages and out of two documents, left this hash alone. It did move three
+# commits cited in `docs/CLOSED_WORK.md`.
 dc5b9ca8be5ffd52d16f32f86b0304ac233ca739

@@ -3202,7 +3202,7 @@ anything re-measured should be too.
       `zone.rs:232` — `range(..hash.to_vec())` where `range::<[u8], _>(..hash)`
       is the same call without the `Vec`.
 
-      **Already done, in `032debf`, and this box was never ticked.** Found while
+      **Already done, in `3ba0661`, and this box was never ticked.** Found while
       working through the rest of the section: the code has the
       `Bound::Excluded(hash)` form with a comment giving this item's own reason.
       Ticked rather than deleted — an unticked box that is done misleads the
@@ -4291,7 +4291,7 @@ renumbered here: **#25b** (the TCP memset), **#25e** (the cache key), **#26e**
       (`:864`), and `nsec_cache`'s `gather_nxdomain` (`:676`) and
       `gather_nxdomain_under` (`:729`, `:751`) — every one of them on the
       resolver's side of the same walk `dnssec_answer` stopped allocating for in
-      `8dced41`. `resolver::suffix_with_labels` (`:1577`) was a fourth copy of
+      `23f3c96`. `resolver::suffix_with_labels` (`:1577`) was a fourth copy of
       the function itself, differing only in which of the two identical
       `label_count`s it called.
 
@@ -4983,7 +4983,7 @@ spelling that is also injective, so `a\.b` and `a`,`b` were one string.
 
 #### Two commits, because there was one green intermediate and no more
 
-`75ee073` added the type with nothing using it, so the representation could be
+`2457cb8` added the type with nothing using it, so the representation could be
 judged on its own. After that, staging was tried and abandoned:
 `ResourceRecord::name` and `QuerySection::qname` are read by all seven crates,
 so the field type cannot change in one crate and not the others, and every stage
