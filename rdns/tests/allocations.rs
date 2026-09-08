@@ -29,7 +29,6 @@ use rdns::{DnsMessage, DnsMessageBuilder, Edns, EdnsOption, Qtype, ResourceRecor
 
 /// A name from a literal, for tests only: `Name` is fallible to build and a test
 /// that writes a bad one should fail loudly at that line.
-#[allow(dead_code)]
 fn nm(text: &str) -> Name {
     text.parse().expect("a test name parses")
 }
@@ -1146,8 +1145,11 @@ fn nxdomain_proof(signed: &rdns::zone::Zone) -> (rdns::DnsMessage, u64) {
 /// 13 to 2. Both multipliers are per label of the QNAME: this zone is two labels
 /// and a client picks its own.
 fn checking_a_signed_nxdomain() {
+    // NSEC was 6 until `common_suffix` stopped rebuilding its answer with
+    // `rmatch_indices` and took `utils::suffix_labels`'s slice instead
+    // (`TODO.md` #37a). Two fewer `String`s, same proof.
     for (what, zone, expected) in [
-        ("NSEC", signed_zone(), 6),
+        ("NSEC", signed_zone(), 4),
         ("NSEC3", signed_zone_nsec3(), 2),
     ] {
         let (reply, _) = nxdomain_proof(&zone);

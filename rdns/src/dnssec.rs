@@ -13,7 +13,7 @@
 
 use crate::error::WireError;
 use crate::error::{DnssecError, DnssecResult};
-use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::utils::record_types as rt;
 use crate::Class;
 use crate::Rtype;
 use crate::{Name, NameRef, ParsedRecord, RecordData, ResourceRecord};
@@ -187,20 +187,6 @@ impl Rrsig {
     pub fn is_current(&self, now: u64) -> bool {
         now >= self.inception as u64 && now <= self.expiration as u64
     }
-
-    /// Whether this signature was made over a wildcard that was then expanded
-    /// to reach `owner` (RFC 4035 §5.3.4): the label count in the RRSIG is
-    /// fewer than the owner name actually has.
-    ///
-    /// The label arithmetic alone is not enough: the labels field never counts a
-    /// leading `*` (RFC 4034 §3.1.3), so the RRset sitting *at* the wildcard has
-    /// one label more than its RRSIG claims and would read as an expansion.
-    /// Comparing against the signed name separates them — an expansion is
-    /// exactly where the signed name is not the owner.
-    pub fn is_wildcard_expansion(&self) -> bool {
-        (self.labels as usize) < label_count(&self.owner)
-            && signed_owner(&self.owner, self.labels) != canonical_name(&self.owner)
-    }
 }
 
 /// A DS record together with the delegated name it appears at.
@@ -293,52 +279,27 @@ fn canonical_wire(name: &str) -> DnssecResult<Name> {
 /// and canonical DNSSEC form is down-cased (RFC 4034 §6.2).
 pub fn canonical_name(name: &str) -> String {
     let lowered = name.to_ascii_lowercase();
-    if lowered.ends_with('.') {
+    if crate::utils::ends_with_root(&lowered) {
         lowered
     } else {
         format!("{lowered}.")
     }
 }
 
-/// How many labels a name has, the root being zero. `example.com.` is 2.
-pub use crate::utils::label_count;
-
-/// The last `labels` labels of `name`, canonical and owned. Asking for more than
-/// the name has yields the whole name.
-///
-/// [`crate::utils::suffix_labels`] is the same rule without the copy, for a name
-/// the caller has already made absolute — which is every walk up the tree.
-pub fn suffix_labels(name: &str, labels: usize) -> String {
-    let n = canonical_name(name);
-    crate::utils::suffix_labels(&n, labels).to_string()
-}
-
-/// The owner name a signature was actually computed over (RFC 4035 §5.3.2).
+/// The owner name a signature was actually computed over (RFC 4035 §5.3.2), as
+/// wire octets — which is what goes into the digest.
 ///
 /// Normally the RRset's own name. When the RRSIG's label count is smaller, the
 /// records were synthesized from a wildcard, and what was signed is that
 /// wildcard — `*.example.com.` — not the expanded name the client asked for.
 ///
-/// [`signed_owner_name`] is this rule over a [`Name`], and is the one the digest
-/// uses. This spelling stays because [`Rrsig`] keeps its owner as canonical
-/// text — see [`canonical_wire`] for why — and reporting *which* wildcard
-/// answered is a text answer.
-pub fn signed_owner(owner: &str, rrsig_labels: u8) -> String {
-    let owner = canonical_name(owner);
-    let have = label_count(&owner);
-    let want = rrsig_labels as usize;
-    if want >= have {
-        owner
-    } else {
-        format!("*.{}", suffix_labels(&owner, want))
-    }
-}
-
-/// [`signed_owner`] as wire octets, which is what actually goes into the digest.
-///
-/// Not the text form re-encoded: RFC 1035 §5.1 lets a label contain a `.`, and
-/// counting dots miscounts such a name's labels — so a zone holding one loaded
-/// and answered but could not be signed.
+/// Not the text form re-encoded, and the only spelling: RFC 1035 §5.1 lets a
+/// label contain a `.`, so counting dots made `a\.b.example.com.` four labels
+/// against the three its RRSIG correctly claims. A zone holding such a name
+/// loaded and answered but could not be signed, and once it could, a plain
+/// answer at it came back reported as expanded from `*.b.example.com.` — a
+/// wildcard that does not exist, owing a denial no signer writes
+/// (`TODO.md` #37a).
 pub fn signed_owner_name(owner: NameRef<'_>, rrsig_labels: u8) -> DnssecResult<Name> {
     let folded = owner.to_folded();
     let have = folded.as_ref().label_count();
@@ -737,6 +698,11 @@ pub fn verify_rrset(
         ..
     } = *rrset;
     let owner = canonical_name_of(rrset.owner);
+    // Both counted on the wire. Presentation text spells a dot inside a label
+    // `\.` (RFC 1035 §5.1), so counting dots overstates such a name and the two
+    // sides of this comparison disagreed about the same name (`TODO.md` #37a).
+    let owner_labels = rrset.owner.label_count();
+    let zone_labels = zone.label_count();
     // The signer name and the key owners are canonical text (RFC 4034 §6.2),
     // which is the form `canonical_name_of` draws the boundary at.
     let zone = canonical_name_of(zone);
@@ -766,8 +732,7 @@ pub fn verify_rrset(
         // A label count larger than the name has is nonsense, and one smaller
         // is a wildcard — legitimate, but it must not claim to have been signed
         // at a name above the zone apex.
-        let owner_labels = rrset.owner.label_count();
-        if rrsig.labels as usize > owner_labels || (rrsig.labels as usize) < label_count(&zone) {
+        if rrsig.labels as usize > owner_labels || (rrsig.labels as usize) < zone_labels {
             last_failure = format!(
                 "RRSIG on {owner} claims {} labels, which its owner and zone do not allow",
                 rrsig.labels
@@ -781,6 +746,24 @@ pub fn verify_rrset(
             );
             continue;
         }
+
+        let wildcard = if (rrsig.labels as usize) < owner_labels {
+            match signed_owner_name(rrset.owner, rrsig.labels) {
+                // The labels field never counts a leading `*` (RFC 4034
+                // §3.1.3), so an RRset sitting *at* a wildcard has one label
+                // more than its RRSIG claims. It is an expansion only where the
+                // signed name is not the name served.
+                Ok(signed) => {
+                    (signed.as_ref() != rrset.owner).then(|| canonical_name_of(signed.as_ref()))
+                }
+                Err(e) => {
+                    last_failure = format!("could not name the signer of {owner}: {e}");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
 
         let data = match signed_data(rrsig, rrset.owner, class, rdatas) {
             Ok(data) => data,
@@ -799,9 +782,7 @@ pub fn verify_rrset(
             match verify(key.algorithm, &key.public_key, &data, &rrsig.signature) {
                 Ok(true) => {
                     return RrsetProof::Verified {
-                        wildcard: rrsig
-                            .is_wildcard_expansion()
-                            .then(|| signed_owner(&owner, rrsig.labels)),
+                        wildcard,
                         expires: rrsig.expiration,
                     }
                 }
@@ -830,55 +811,15 @@ pub fn verify_rrset(
     }
 }
 
-/// Convenience wrapper for the common case of "verify these resource records,
-/// which are all one RRset, against these signatures and keys".
-pub fn verify_records(
-    records: &[ResourceRecord],
-    rrsigs: &[Rrsig],
-    keys: &[Dnskey],
-    zone: NameRef<'_>,
-) -> RrsetProof {
-    let Some(first) = records.first() else {
-        return RrsetProof::Unsigned;
-    };
-    let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
-    verify_rrset(
-        &Rrset::new(
-            first.name.as_ref(),
-            first.rdata.rtype(),
-            first.class,
-            &rdatas,
-        ),
-        rrsigs,
-        keys,
-        zone,
-        current_unix_timestamp(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
 
     use super::*;
     use crate::dnssec_test_util::{TestKey, TestZone};
     use crate::test_records::nm;
-
-    /// The owning spelling and `utils`'s borrowing one give the same answers.
-    ///
-    /// Held here because the two live in different crates now: `utils` is
-    /// `rdns-core`'s and cannot name this one (`TODO.md` #31). Losing the
-    /// assertion with the move would have been the quiet half of a split.
-    #[test]
-    fn the_two_spellings_of_a_name_suffix_agree() {
-        let name = "www.example.com.";
-        for labels in 0..5 {
-            assert_eq!(
-                suffix_labels(name, labels),
-                crate::utils::suffix_labels(name, labels),
-                "{labels} labels of {name}"
-            );
-        }
-    }
+    // Only the tests read the clock; the library takes `now` as an argument so
+    // that a test can name an instant.
+    use crate::utils::current_unix_timestamp;
 
     use crate::Ttl;
     use crate::{ParsedRecord, RecordData};
@@ -892,14 +833,68 @@ mod tests {
     fn test_signed_owner_rebuilds_the_wildcard() {
         // A 3-label name signed with labels=2 was expanded from *.example.com.
         assert_eq!(
-            signed_owner("WWW.Example.com.", 2),
-            "*.example.com.",
+            signed_owner_name(nm("WWW.Example.com.").as_ref(), 2).unwrap(),
+            nm("*.example.com."),
             "a wildcard-expanded answer was signed at the wildcard, not the name"
         );
         // Label count equal to the name's: not a wildcard, just down-cased.
-        assert_eq!(signed_owner("WWW.Example.com.", 3), "www.example.com.");
+        assert_eq!(
+            signed_owner_name(nm("WWW.Example.com.").as_ref(), 3).unwrap(),
+            nm("www.example.com.")
+        );
         // More labels than the name has cannot happen; take the name as-is.
-        assert_eq!(signed_owner("example.com.", 9), "example.com.");
+        assert_eq!(
+            signed_owner_name(nm("example.com.").as_ref(), 9).unwrap(),
+            nm("example.com.")
+        );
+        // A dot *inside* a label is not a separator (RFC 1035 §5.1). Counting
+        // dots made this four labels against the three its RRSIG claims, so a
+        // plain answer was reported as expanded from `*.b.example.com.`
+        // (`TODO.md` #37a).
+        let escaped = nm(r"a\.b.example.com.");
+        assert_eq!(escaped.as_ref().label_count(), 3);
+        assert_eq!(
+            signed_owner_name(escaped.as_ref(), 3).unwrap(),
+            escaped,
+            "signed at the name itself"
+        );
+    }
+
+    /// The whole of the above through the signer and the verifier: a correctly
+    /// signed RRset at a name holding an escaped dot must verify *and* come back
+    /// owing no wildcard proof.
+    ///
+    /// Watched failing against the dot-counting spelling, which returned
+    /// `Verified { wildcard: Some("*.b.example.test.") }` — a wildcard that does
+    /// not exist, which `ChainValidator::validate_wildcard_proofs` then grades
+    /// bogus for want of a denial no signer writes.
+    #[test]
+    fn an_escaped_dot_in_an_owner_is_not_a_wildcard_expansion() {
+        let zone = TestZone::new("example.test.");
+        let owner = nm(r"a\.b.example.test.");
+        let rdata = a_rdata(1);
+        let rr = ResourceRecord {
+            name: owner.clone(),
+            rdata: rdata.clone(),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+        };
+        let sig = Rrsig::from_record(&zone.sign_records(std::slice::from_ref(&rr)))
+            .expect("an RRSIG record");
+        assert_eq!(sig.labels, 3, "rrsig_labels_of counts wire labels");
+
+        let rdatas = [rdata];
+        let proof = verify_rrset(
+            &Rrset::new(owner.as_ref(), rt::A, Class::new(1), &rdatas),
+            &[sig],
+            &zone.dnskeys(),
+            nm("example.test.").as_ref(),
+            current_unix_timestamp(),
+        );
+        assert!(
+            matches!(proof, RrsetProof::Verified { wildcard: None, .. }),
+            "{proof:?}"
+        );
     }
 
     #[test]
@@ -940,11 +935,13 @@ mod tests {
         };
         let sig = zone.sign_records(std::slice::from_ref(&txt));
 
-        let proof = verify_records(
-            &[txt],
+        let rdatas = [txt.rdata.clone()];
+        let proof = verify_rrset(
+            &Rrset::new(txt.name.as_ref(), rt::TXT, txt.class, &rdatas),
             &[Rrsig::from_record(&sig).unwrap()],
             &zone.dnskeys(),
             nm("example.test.").as_ref(),
+            current_unix_timestamp(),
         );
         assert!(
             matches!(proof, RrsetProof::Verified { .. }),

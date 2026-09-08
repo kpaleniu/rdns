@@ -652,7 +652,7 @@ pub fn proves_wildcard_expansion(
     let Some(encloser) = wildcard_encloser(wildcard) else {
         return WildcardVerdict::NotProved(format!("{wildcard} is not a wildcard name"));
     };
-    if crate::dnssec::label_count(&owner) <= crate::dnssec::label_count(&encloser) {
+    if crate::utils::label_count(&owner) <= crate::utils::label_count(&encloser) {
         return WildcardVerdict::NotProved(format!(
             "{owner} is not below {encloser}, so {wildcard} cannot have expanded to it"
         ));
@@ -682,7 +682,7 @@ pub fn proves_wildcard_expansion(
         // encloser, towards `owner` — absent. Naming it from the wildcard's own
         // position pins the expansion to the right depth.
         let next_closer =
-            crate::utils::suffix_labels(&owner, crate::dnssec::label_count(&encloser) + 1);
+            crate::utils::suffix_labels(&owner, crate::utils::label_count(&encloser) + 1);
         let mut hash = NameHash::new(next_closer);
         if nsec3s
             .iter()
@@ -724,7 +724,7 @@ fn wildcard_encloser(wildcard: &str) -> Option<String> {
 fn closest_encloser_nsec(qname: &str, covering: &Nsec) -> String {
     let from_owner = common_suffix(qname, &covering.owner);
     let from_next = common_suffix(qname, &covering.next);
-    if crate::dnssec::label_count(&from_owner) >= crate::dnssec::label_count(&from_next) {
+    if crate::utils::label_count(&from_owner) >= crate::utils::label_count(&from_next) {
         from_owner
     } else {
         from_next
@@ -742,13 +742,10 @@ fn common_suffix(a: &str, b: &str) -> String {
     }
     // A suffix of whole labels is a slice of `a`, so the answer is one copy
     // rather than a `String` per label plus a `join` and a `format!`.
-    let trimmed = a.trim_end_matches('.');
-    let start = trimmed
-        .rmatch_indices('.')
-        .nth(shared - 1)
-        .map_or(0, |(dot, _)| dot + 1);
-    let mut out = trimmed[start..].to_ascii_lowercase();
-    out.push('.');
+    let mut out = crate::utils::suffix_labels(a, shared).to_ascii_lowercase();
+    if !crate::utils::ends_with_root(&out) {
+        out.push('.');
+    }
     out
 }
 

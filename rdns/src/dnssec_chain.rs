@@ -17,14 +17,15 @@
 //! not, and must not be.
 
 use crate::dnssec::{
-    algorithm_supported, canonical_name, canonical_name_of, digest_type_supported, label_count,
-    verify_rrset, Dnskey, Ds, Rrset, RrsetProof, Rrsig,
+    algorithm_supported, canonical_name, canonical_name_of, digest_type_supported, verify_rrset,
+    Dnskey, Ds, Rrset, RrsetProof, Rrsig,
 };
 use crate::dnssec_denial::{
     proves_no_ds, proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
 };
 use crate::error::DnssecError;
 use crate::utils::hex_decode;
+use crate::utils::label_count;
 use crate::utils::record_types as rt;
 use crate::Class;
 use crate::Rtype;

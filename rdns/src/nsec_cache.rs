@@ -16,10 +16,13 @@
 //! - TTL is bounded by the proof, not by the question.
 
 use crate::denial_wire::canonical_sort_key;
-use crate::dnssec::{canonical_name, label_count, Rrsig};
+use crate::dnssec::{canonical_name, canonical_name_of, signed_owner_name, Rrsig};
 use crate::dnssec_denial::{proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Params};
 use crate::eviction::Halving;
-use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf};
+use crate::utils::{
+    current_unix_timestamp, is_at_or_under, label_count, record_types as rt, NameKeyBuf,
+};
+use crate::NameRef;
 use crate::Qtype;
 use crate::Rtype;
 use crate::Ttl;
@@ -110,21 +113,17 @@ pub struct WildcardSynthesis {
     pub ttl: u32,
 }
 
-/// The wildcard a signature was made at.
+/// The wildcard a signature was made at, or `None` if it was made at the name
+/// itself.
 ///
 /// `labels` counts the signed name's labels, excluding the leading `*` and the
 /// root (RFC 4034 §3.1.3), so the wildcard is `*.` plus that many trailing
-/// labels of the owner.
-fn wildcard_for_expansion(owner: &str, labels: u8) -> Option<String> {
-    let owner = canonical_name(owner);
-    let parts: Vec<&str> = owner.trim_end_matches('.').split('.').collect();
-    let labels = labels as usize;
-    if labels >= parts.len() {
-        // Not an expansion after all: nothing was stripped.
-        return None;
-    }
-    let suffix = parts[parts.len() - labels..].join(".");
-    Some(format!("*.{suffix}."))
+/// labels of the owner — which is [`signed_owner_name`], over the wire name.
+/// This split the owner's *text* on `.`, counting `a\.b.example.com.` as four
+/// labels where its RRSIG correctly claims three (`TODO.md` #37a).
+fn wildcard_for_expansion(owner: NameRef<'_>, labels: u8) -> Option<String> {
+    let signed = signed_owner_name(owner, labels).ok()?;
+    (signed.as_ref() != owner).then(|| canonical_name_of(signed.as_ref()))
 }
 
 /// `*.` plus the immediate parent of `name`.
@@ -134,11 +133,11 @@ fn wildcard_for_expansion(owner: &str, labels: u8) -> Option<String> {
 /// form is the safe one here.
 fn wildcard_for_parent_of(name: &str) -> Option<String> {
     let name = canonical_name(name);
-    let (_first, rest) = name.trim_end_matches('.').split_once('.')?;
-    if rest.is_empty() {
+    let rest = crate::utils::parent_name(&name)?;
+    if rest == "." {
         return None;
     }
-    Some(format!("*.{rest}."))
+    Some(format!("*.{rest}"))
 }
 
 /// Validated NSEC/NSEC3 proofs, searchable by range.
@@ -217,7 +216,7 @@ impl NsecCache {
                     };
                     // A proof from outside the zone that signed the SOA is not
                     // this zone's to make.
-                    if !is_at_or_below(&nsec.owner, &zone) {
+                    if !is_at_or_under(&nsec.owner, &zone) {
                         continue;
                     }
                     let ttl = rr.ttl.capped_at(MAX_PROOF_TTL as u32).as_u64();
@@ -238,7 +237,7 @@ impl NsecCache {
                     let Some(nsec3) = Nsec3::from_record(rr) else {
                         continue;
                     };
-                    if !is_at_or_below(&nsec3.zone, &zone) {
+                    if !is_at_or_under(&nsec3.zone, &zone) {
                         continue;
                     }
                     // RFC 8198 §5.2: an opt-out span may hold delegations the
@@ -289,17 +288,17 @@ impl NsecCache {
             let Some(rrsig) = Rrsig::from_record(rr) else {
                 continue;
             };
-            if !rrsig.is_wildcard_expansion() {
-                continue;
-            }
-            let Some(wildcard) = wildcard_for_expansion(&rrsig.owner, rrsig.labels) else {
+            // `None` covers both "signed at the name itself" and a name that
+            // cannot be built, and skipping is the safe direction for a cache:
+            // nothing is stored and the next query asks upstream.
+            let Some(wildcard) = wildcard_for_expansion(rr.name.as_ref(), rrsig.labels) else {
                 continue;
             };
             let zone = canonical_name(&rrsig.signer_name);
             // A signature made outside the zone it claims to sign is not this
             // zone's to keep. A consistency check, not the security boundary:
             // the chain validator already established the signer.
-            if !is_at_or_below(&wildcard, &zone) {
+            if !is_at_or_under(&wildcard, &zone) {
                 continue;
             }
             pending.push((zone, wildcard, rrsig.type_covered));
@@ -374,7 +373,7 @@ impl NsecCache {
                 let Some(nsec) = Nsec::from_record(rr) else {
                     continue;
                 };
-                if !is_at_or_below(&nsec.owner, &zone) {
+                if !is_at_or_under(&nsec.owner, &zone) {
                     continue;
                 }
                 let ttl = rr.ttl.capped_at(MAX_PROOF_TTL as u32).as_u64();
@@ -418,7 +417,7 @@ impl NsecCache {
 
         let (_, zone) = zones
             .iter()
-            .filter(|(z, _)| is_at_or_below(&qname, z.as_str()))
+            .filter(|(z, _)| is_at_or_under(&qname, z.as_str()))
             .max_by_key(|(z, _)| label_count(z.as_str()))?;
 
         let cached = zone
@@ -440,10 +439,15 @@ impl NsecCache {
 
         // Re-owned onto the name that was asked for. The wildcard signature
         // verifies there unchanged, so a DO client can check this itself.
+        //
+        // Parsed once, and a failure declines to synthesize: `unwrap_or_default`
+        // here re-owned the whole RRset onto the root, which is a wrong positive
+        // answer rather than a missing one (`CLAUDE.md` §4).
+        let owner = Name::from_presentation(&qname).ok()?;
         let answers: Vec<ResourceRecord> = with_ttl(&cached.records, ttl)
             .into_iter()
             .map(|mut rr| {
-                rr.name = Name::from_presentation(&qname).unwrap_or_default();
+                rr.name = owner.clone();
                 rr
             })
             .collect();
@@ -475,7 +479,7 @@ impl NsecCache {
             // chain covers it; a shallower zone's chain stops at the delegation.
             let (zone_name, zone) = zones
                 .iter()
-                .filter(|(z, _)| is_at_or_below(&qname, z.as_str()))
+                .filter(|(z, _)| is_at_or_under(&qname, z.as_str()))
                 .max_by_key(|(z, _)| label_count(z.as_str()))?;
 
             let soa = zone.soa.as_ref().filter(|s| s.expires_at > now)?;
@@ -847,21 +851,22 @@ fn is_delegation(nsec: &Nsec) -> bool {
 /// Whether `name` lies beneath a delegation at the NSEC's owner — in which case
 /// the gap says nothing about it, however neatly it falls inside.
 fn is_below_delegation(nsec: &Nsec, name: &str) -> bool {
-    is_delegation(nsec) && is_at_or_below(name, &nsec.owner) && canonical_name(name) != nsec.owner
-}
-
-fn is_at_or_below(name: &str, ancestor: &str) -> bool {
-    let name = canonical_name(name);
-    let ancestor = canonical_name(ancestor);
-    ancestor == "." || name == ancestor || name.ends_with(&format!(".{ancestor}"))
+    is_delegation(nsec) && is_at_or_under(name, &nsec.owner) && canonical_name(name) != nsec.owner
 }
 
 /// Records of `rtype` at `owner`, plus the RRSIGs that cover them.
 fn records_covering(records: &[ResourceRecord], owner: &str, rtype: Rtype) -> Vec<ResourceRecord> {
-    let owner = canonical_name(owner);
+    // A name that will not parse matches nothing, which is what the caller does
+    // with an empty set anyway: no proof, so go and ask.
+    let Ok(owner) = Name::from_presentation(owner) else {
+        return Vec::new();
+    };
+    let owner = owner.as_ref();
     records
         .iter()
-        .filter(|rr| rr.name.as_ref().to_presentation().to_ascii_lowercase() == owner)
+        // `NameRef` compares ASCII case-insensitively (RFC 4343), so neither
+        // side needs folding and neither needs a copy.
+        .filter(|rr| rr.name.as_ref() == owner)
         .filter(|rr| {
             rr.rdata.rtype() == rtype
                 || matches!(
@@ -1901,18 +1906,31 @@ mod tests {
     #[test]
     fn test_the_wildcard_derivations() {
         assert_eq!(
-            wildcard_for_expansion("a.example.com.", 2).as_deref(),
+            wildcard_for_expansion(nm("a.example.com.").as_ref(), 2).as_deref(),
             Some("*.example.com.")
         );
         assert_eq!(
-            wildcard_for_expansion("x.y.example.com.", 2).as_deref(),
+            wildcard_for_expansion(nm("x.y.example.com.").as_ref(), 2).as_deref(),
             Some("*.example.com."),
             "two labels stripped is still the same wildcard name"
         );
         assert_eq!(
-            wildcard_for_expansion("a.example.com.", 3),
+            wildcard_for_expansion(nm("a.example.com.").as_ref(), 3),
             None,
             "nothing stripped is not an expansion"
+        );
+        // Three wire labels, four dots' worth of text: counting dots reported
+        // this as expanded from `*.b.example.com.` (`TODO.md` #37a).
+        assert_eq!(
+            wildcard_for_expansion(nm(r"a\.b.example.com.").as_ref(), 3),
+            None,
+            "an escaped dot is inside a label, not a separator"
+        );
+        // An escaped dot in the part that *is* stripped: the wildcard is still
+        // `*.` plus whole labels of the name.
+        assert_eq!(
+            wildcard_for_expansion(nm(r"x.a\.b.example.com.").as_ref(), 3).as_deref(),
+            Some(r"*.a\.b.example.com.")
         );
 
         assert_eq!(

@@ -927,7 +927,7 @@ fn sign_everything(
             {
                 for signature in carried {
                     signatures.push(ZoneRecord {
-                        name: Name::from_presentation(&name).unwrap_or_default(),
+                        name: owner.clone(),
                         ttl,
                         class: Class::new(1),
                         rdata: signature.rdata.clone(),
@@ -1049,6 +1049,11 @@ ns.secure IN A 192.0.2.30
 plain   IN NS  ns.plain.example.com.
 ns.plain IN A  192.0.2.40
 redir   IN DNAME target.example.net.
+; One label holding a dot (RFC 1035 §5.1), which the whole module then signs,
+; chains and verifies alongside everything else. Not a regression test for the
+; ordering — signer and checker share `canonical_sort_key`, so a wrong order is
+; a self-consistent one here; that one is in `denial_wire`.
+a\.b    IN A   192.0.2.50
 "#;
 
     fn policy(chain: DenialChain) -> SigningPolicy {
@@ -1280,8 +1285,13 @@ redir   IN DNAME target.example.net.
                 NOW,
             );
             if signable(&layout.entry(&name), &name, rtype, ORIGIN) {
+                // `wildcard: None` for all of them, the zone's own `*` RRset
+                // included: a signer signs at names that exist, so nothing here
+                // was expanded from a wildcard. Counting dots in the owner made
+                // `a\.b.example.com.` four labels against the three its RRSIG
+                // claims and reported it as expanded (`TODO.md` #37a).
                 assert!(
-                    matches!(proof, RrsetProof::Verified { .. }),
+                    matches!(proof, RrsetProof::Verified { wildcard: None, .. }),
                     "{name} type {rtype}: {proof:?}"
                 );
                 checked += 1;
