@@ -1,7 +1,9 @@
 # 1. Wire format
 
-Implemented in `rdns-core/src/lib.rs`, `name.rs`, `dname.rs`, `compression.rs`,
-`record_data.rs` and `rdns/src/tsig.rs`.
+Implemented in `rdns-core/src/codes.rs`, `record.rs`, `edns.rs`, `message.rs`,
+`name.rs`, `dname.rs`, `compression.rs`, `record_data.rs` and `rdns/src/tsig.rs`.
+The first four were one `lib.rs` until 2026-09-08 (`TODO.md` #37d); `lib.rs` is
+now the re-exports that keep every type at the crate-root path it had.
 
 ---
 
@@ -94,7 +96,7 @@ edns: Option<Edns>           // NOT a member of `additionals`
 
 The OPT record is a field, not an additional record, so two OPT records in one
 message are unspellable (RFC 6891 §6.1.1). The parser rejects a second OPT with
-`WireError::Malformed` (`lib.rs:1716`). ARCOUNT is computed as
+`WireError::Malformed` (`message.rs:168`). ARCOUNT is computed as
 `additionals.len() + edns.is_some()`.
 
 ### Header parsing
@@ -149,7 +151,7 @@ a one-struct module, so a value can only be built through a checking constructor
 is never stored.
 
 RDLENGTH = 0 is legal and parses to `ParsedRecord::Unknown(rtype)`
-(`lib.rs:581`) — RFC 2136 §2.4.1/§2.4.2/§2.5.2/§2.5.3 spell prerequisites and
+(`record.rs:197`) — RFC 2136 §2.4.1/§2.4.2/§2.5.2/§2.5.3 spell prerequisites and
 RRset deletions that way.
 
 Typed record types: A, NS, CNAME, SOA, PTR, MX, TXT, AAAA, DNAME, DS, SVCB,
@@ -178,7 +180,7 @@ RRSIG field order on the wire is expiration then inception (RFC 4034 §3.1).
 Every length off the wire is checked before use: `read_be!` checks its own bytes,
 `Label::try_from_bytes` checks before slicing, `Edns::walk_options` checks each
 TLV, and `read_record_parts` checks RDLENGTH against the remaining message before
-`split_at` (`lib.rs:1548`).
+`split_at` (`record.rs:633`).
 
 ---
 

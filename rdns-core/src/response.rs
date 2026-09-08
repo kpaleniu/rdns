@@ -483,12 +483,13 @@ mod tests {
 
         // An option claiming eight bytes of data and supplying two is FORMERR.
         let mut malformed = request("example.com.", false);
-        malformed.set_edns(Edns {
-            udp_payload_size: 1232,
-            version: crate::EDNS_VERSION,
-            do_bit: false,
-            rdata: vec![0x00, 0x0a, 0x00, 0x08, 0xde, 0xad].into_boxed_slice(),
-        });
+        // Through the wire-side constructor, because `Edns::rdata` is private
+        // to its module: flags 0 is version 0 with DO clear.
+        malformed.set_edns(Edns::from_opt(
+            1232,
+            0,
+            &[0x00, 0x0a, 0x00, 0x08, 0xde, 0xad],
+        ));
         assert_eq!(client_edns(&malformed), Err(ResponseCode::FormatError));
     }
 

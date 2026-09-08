@@ -21,7 +21,7 @@ each row exists (`CLAUDE.md` §11).
 | 1034 §4.3.3 | wildcard answer echoes the queried name | yes | `add_answer` |
 | 1035 §2.3.4 | 63-octet label, 255-octet name | yes, both directions | `dname.rs` |
 | 1035 §2.3.1 | preferred name syntax (LDH) | **deliberately not enforced** | see D-5 |
-| 1035 §3.2.3 / §3.2.5 | QTYPE ⊃ TYPE, QCLASS ⊃ CLASS | yes — separate newtypes | `lib.rs` |
+| 1035 §3.2.3 / §3.2.5 | QTYPE ⊃ TYPE, QCLASS ⊃ CLASS | yes — separate newtypes | `codes.rs` |
 | 1035 §3.3.14 | TXT is a sequence of character-strings | yes | `ParsedRecord::TXT` |
 | 1035 §4.1.1 | opcode echoed, AA clear on referral | yes | `make_response`, `refer_to_child` |
 | 1035 §4.1.4 | name compression, both directions | yes | `compression.rs`, `dname.rs` |
@@ -30,7 +30,7 @@ each row exists (`CLAUDE.md` §11).
 | 1035 §5 | master file format | partial — no `$GENERATE` | `zone.rs` |
 | 1035 §5.1 | `\X` and `\DDD` escapes | yes, since 2026-09-07 — in TXT and SVCB values, and in names since **D-1** closed the same day | `utils::char_string_decode`, `Name::from_presentation` |
 | 1996 | NOTIFY, both directions | yes — **D-3** and **D-4** both fixed 2026-08-03 | `notify.rs`, `rdnsd` |
-| 1982 | serial arithmetic | yes — `Serial` has no `Ord` | `lib.rs` |
+| 1982 | serial arithmetic | yes — `Serial` has no `Ord` | `codes.rs` |
 | 2181 §8 | TTL is unsigned; top bit set reads as 0 | yes, clamped at the boundary once | `Ttl::from_wire` |
 | 2181 §11 | any binary string may be a label | yes — **D-1** fixed 2026-09-07 | `name.rs`, `Name(Box<[u8]>)` |
 | 2308 §2 | negative answers carry the SOA | yes | `add_negative` |
@@ -43,12 +43,12 @@ each row exists (`CLAUDE.md` §11).
 | 4592 §4.4 | an existing name ends the search | yes | `name_kind_of_key` |
 | 5936 | AXFR: TCP only, SOA-framed, multi-message | yes | `transfer.rs` |
 | 1995 | IXFR, both directions, UDP single-SOA form | yes, and the deltas survive a restart since 2026-08-03 | `ixfr.rs`, `journal.rs` |
-| 6891 | EDNS0 | yes — one OPT enforced, BADVERS, mirroring | `lib.rs`, `make_response` |
-| 6895 §2.3 | the RCODE space stays open | yes — `ResponseCode::Other` | `lib.rs` |
+| 6891 | EDNS0 | yes — one OPT enforced, BADVERS, mirroring | `edns.rs`, `message.rs`, `make_response` |
+| 6895 §2.3 | the RCODE space stays open | yes — `ResponseCode::Other` | `codes.rs` |
 | 6761 / 6762 / 6303 | special-use names | yes (`rdnsr` only) | `special_names.rs` |
 | 7766 §6.2.1 | many queries per TCP connection, concurrent | yes | both daemons |
 | 8020 | NXDOMAIN cuts the subtree — so AA must be right | yes, and it is why REFUSED is used for zones we do not hold | `make_response` |
-| 8482 §4 | ANY answers | yes — `Qtype::matches` | `lib.rs` |
+| 8482 §4 | ANY answers | yes — `Qtype::matches` | `codes.rs` |
 | 8945 | TSIG, incl. signed errors and chained MACs | yes | `tsig.rs` |
 | 2136 | dynamic UPDATE | **served end to end** (2026-08-03): §2.4/§2.5 forms, §3.1/§3.1.1, §3.2, §3.3 per-key scoping, §3.4.2, §3.6, §3.7. TSIG-only, scoped per key, persisted before the client is told it succeeded. A signed zone is re-signed incrementally and the version steps are journalled — see **G-4** and `TODO.md` #10 | `update.rs`, `journal.rs`, `rdnsd` |
 | 6672 | DNAME | **yes** (2026-09-06): §2.2's substitution incl. Table 1, §2.3's owner-not-redirected, §2.4/§3.3's load refusals, §2.5's uncompressed target, §3.1's synthesized CNAME, §3.2's server algorithm with YXDOMAIN on overflow, §3.4/§3.4.1's resolver half, §5.2's UPDATE rules and §5.3's DNSSEC. Obsoletes 2672 | `utils::dname_redirect`, `Zone::dname_above`, `rdnsd/src/answer.rs`, `resolver.rs` |
