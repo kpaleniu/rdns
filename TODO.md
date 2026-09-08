@@ -734,8 +734,8 @@ closed~~ — that was the state on 2026-09-07; **#37 was filed on 2026-09-08** a
 is the only numbered work open. ~~It is still a choice: 37a is worth taking on
 its own~~ — 37a was taken the day it was filed, because checking its own open
 question turned it into a defect report. ~~**37b-37d are what is left**~~ —
-37b was taken on 2026-09-08 too, the day `zone.rs` was next opened. **37c and
-37d are what is left**, and they are explicitly "when that code is next opened".
+37b and 37c were taken on 2026-09-08 too. **37d is what is left**, and it is
+explicitly "when that code is next opened".
 
 One candidate named elsewhere on this page, for a session that wants it:
 **SVCB/HTTPS presentation form** was the largest remaining entry in #21's
@@ -792,7 +792,7 @@ and worth doing when that code is next opened.
 |---|---|---|
 | ~~**37a**~~ **done 2026-09-08** | five name helpers that #35 and #36 left behind | Verified by opening each, because the first pass of this list claimed two that are not real — see below. **`resolver::ancestors` (`resolver.rs:420`) is dead**: `#[allow(dead_code)]` under a struck-through doc comment saying `NameRef::ancestors` replaced it, one day old, from #36. **`nsec_cache::is_at_or_below` (`:853`)** is an independent reimplementation of `utils::is_at_or_under` that allocates two `canonical_name` strings and a `format!` per call — in the module #23 fixed for doing per-record work under one mutex. **`dnssec::suffix_labels` (`:311`)** returns `String` where `utils::suffix_labels` returns `&str`; both live. **`dnssec.rs` mixes both spellings of `label_count` in one file** — `utils`'s at `:201`, `:328`, `:770` (through its own `pub use` at `:304`) and `NameRef`'s at `:344`, `:354`, `:769`. And the open question under all four: the `&str` helpers split on `.` and `Name` does not, so **#35 brought RFC 1035 §5.1 escapes into a tree whose name arithmetic predates them**. Whether an escaped label reaches any of these is the thing to check first; it decides whether this is a consolidation or a defect |
 | ~~**37b**~~ **done 2026-09-08** | `zone/`, for the 19 items a flat split would widen — the count is wrong, see below | `zone.rs` is a data structure (`Zone`, `Shortcuts`, `Located`, `impl Zone`, `:20-707`) and a zone-file parser (`:708-1798`) that share nothing but the type they build. The parser has **19 private top-level items** — `tokenize`, `logical_lines`, `rdata_from_fields`, `check_dname_rules`, `absolutize`, the date helpers. Flat siblings widen all 19 to `pub(crate)`; `zone/parse.rs` + `zone/rdata.rs` + `zone/checks.rs` hold them at `pub(super)`. 1 798 code lines to ~690 / 570 / 380 / 140 |
-| **37c** | `resolver/`, for 29 | Same shape, one level worse: splitting `impl Resolver` across files means every private method the other half calls must widen. **13 private top-level items + 16 private methods.** `resolver/recurse.rs` (`recurse`, `walk`, `ask_any`, `extract_referral`, `query_server`), `resolver/validate.rs` (`validate`, `establish_chain`, `fetch_dnskeys`, `check_denial`), `resolver/caches.rs` (`DelegationCache`, `RttStore`, `KeyCache`). 1 717 code lines to ~320 / 560 / 280 / 260. Note the file is 62% tests — 4 541 lines, 2 824 of them — so the raw count overstates it |
+| ~~**37c**~~ **done 2026-09-08** | `resolver/`, for 29 — 19, and the premise is wrong in a useful way, see below | Same shape, one level worse: splitting `impl Resolver` across files means every private method the other half calls must widen. **13 private top-level items + 16 private methods.** `resolver/recurse.rs` (`recurse`, `walk`, `ask_any`, `extract_referral`, `query_server`), `resolver/validate.rs` (`validate`, `establish_chain`, `fetch_dnskeys`, `check_denial`), `resolver/caches.rs` (`DelegationCache`, `RttStore`, `KeyCache`). 1 717 code lines to ~320 / 560 / 280 / 260. Note the file is 62% tests — 4 541 lines, 2 824 of them — so the raw count overstates it |
 | **37d** | `rdns-core/src/lib.rs` into modules, which seals five newtypes | Not about size. `Class`, `Rtype`, `Qtype`, `Ttl` and `Serial` have private inner fields, so they are sealed against other *crates* and open to all nine modules of `rdns-core` — §17's "private in the crate root is not private", the rule `record_data.rs` already exists to obey. **Nothing bypasses them today** (checked: no construction and no `.0` outside `lib.rs`), so this converts a discipline into a compiler check rather than fixing a bug. 2 111 code lines to `codes.rs` ~465, `record.rs` ~680, `edns.rs` ~350, `message.rs` ~570, `svcb.rs` ~110 (the loose `decode/encode_svc_params` at `:450`/`:487` plus the key table from `utils.rs:502`), `lib.rs` ~90 of re-exports. No folder: these are siblings, not internals |
 
 #### 37a: the open question was the answer — **a defect**
@@ -886,6 +886,60 @@ move does not also register as a rename and the blame lineage survives. The
 1 398 lines of tests stay in `zone.rs`: five of them reach into the moved
 helpers and reach them through `pub(super)`, which is the visibility the split
 exists to buy.
+
+#### 37c: privacy runs downward, so most of the widening never happened — **done 2026-09-08**
+
+`resolver.rs` 1 699 code lines to **548 / 629 / 284 / 261** — `resolver.rs`,
+`resolver/recurse.rs`, `resolver/validate.rs`, `resolver/caches.rs`. Estimated
+320 / 560 / 280 / 260: recurse, validate and caches landed where the row said,
+and the root is 548 rather than 320 because `ResolverConfig`, `SharedAnchors`,
+`parse_root_hints`, `OutgoingQuery`, `Budget`, `Resolution` and `Answered` all
+stay in it.
+
+**The row's premise — "every private method the other half calls must widen" —
+is only half true, and the other half is the rule worth keeping.** Rust privacy
+runs *downward*: a parent module's private items are visible to its
+descendants. So `resolver/recurse.rs` and `resolver/validate.rs` read
+`self.config`, `self.delegations`, `self.rtt` and `self.keys`, construct
+`OutgoingQuery`, `Budget`, `Resolution` and `Answered`, and call `build_query`,
+`forward` and `response_matches` — all still private, none widened. Only
+child→parent and child→sibling references cost anything.
+
+Counted after the fact: **19 items widen to `pub(super)`, 40 stay private.**
+The 19 are the three cache types and the twelve cache methods the resolver
+calls (`caches.rs` is the sibling everything uses), plus `recurse`,
+`resolve_from_root`, `ask_any` and `validate` — the four methods the parent or
+the other child calls. `RttStore::get`, `CachedDelegation`, `CachedKeys` and
+the four cache tunables stay private, as do all six of `recurse.rs`'s other
+methods and all three of `validate.rs`'s.
+
+Two consequences that decided where things went:
+
+- **An item used by one child belongs in that child; an item used by the parent
+  or by two children belongs in the parent.** `Referral` and
+  `synthesize_from_dname` went to `recurse.rs` and stayed private. `Answered`
+  went there first and had to come back, because `validate.rs` reads
+  `.response` off one. The three tunables — `TCP_MAX_MESSAGE`,
+  `MINIMIZED_PROBE_TYPE`, `MAX_MINIMISE_COUNT` — were moved into `recurse.rs`
+  on the same wrong instinct and moved back: in the parent they cost nothing,
+  in the child they cost two `pub(super)` and the parent's tests could not see
+  them.
+- **The seven cache tests moved into `caches.rs` with them**, plus the `key_of`
+  helper only they use. That is what keeps `entries`, `rtts`,
+  `CachedDelegation`, `UNKNOWN_RTT_MS` and `RttStore::get` private: left in the
+  parent's test module they would have widened five more items for tests alone,
+  which is the tail wagging the dog.
+
+The three submodules take `use super::*;` rather than an import list each. The
+lists would be 20-30 names apiece, mostly the same names, and they are three
+continuations of one `impl Resolver` — a second import list is a second thing
+to drift (§7). The comment above each says so.
+
+Verified as a move: every code line in the four files exists in
+`HEAD:rdns/src/resolver.rs` and vice versa, except the 19 visibility changes
+and the scaffolding (three `mod` lines, three glob imports, two `impl Resolver`
+wrappers, the new `mod tests` header). 597 lib tests before and after on
+Windows; clippy and the workspace suite clean on Linux under WSL.
 
 #### What this does not take
 
