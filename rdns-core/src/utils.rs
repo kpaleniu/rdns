@@ -204,7 +204,7 @@ pub fn rand_id() -> u16 {
 /// against an origin. This one has no origin: it appends the root dot and
 /// nothing more.
 pub fn absolute(name: &str) -> std::borrow::Cow<'_, str> {
-    if name.ends_with('.') {
+    if ends_with_root(name) {
         std::borrow::Cow::Borrowed(name)
     } else {
         std::borrow::Cow::Owned(format!("{name}."))
@@ -216,7 +216,7 @@ pub fn absolute(name: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// Not `rdns::zone::absolutize`; see [`absolute`].
 pub fn absolute_lowered(name: &str) -> std::borrow::Cow<'_, str> {
-    let needs_dot = !name.ends_with('.');
+    let needs_dot = !ends_with_root(name);
     let needs_fold = has_ascii_uppercase(name);
     if !needs_dot && !needs_fold {
         return std::borrow::Cow::Borrowed(name);
@@ -255,7 +255,7 @@ impl NameKeyBuf {
     /// check does not allocate: the allocation tests run in debug.
     pub fn from_folded(name: String) -> NameKeyBuf {
         debug_assert!(
-            name.ends_with('.') && !has_ascii_uppercase(&name),
+            ends_with_root(&name) && !has_ascii_uppercase(&name),
             "from_folded was handed {name:?}, which is not in key form"
         );
         NameKeyBuf(name)
@@ -369,16 +369,117 @@ impl<'a> std::borrow::Borrow<dyn NameType + 'a> for NameTypeKey {
     }
 }
 
-/// How many labels a name has, the root (`.`) being zero. `example.com.` is 2.
+/// Whether the `.` at byte `at` separates two labels, or is one *inside* a
+/// label.
+///
+/// RFC 1035 §5.1 spells a literal dot `\.` and a literal backslash `\\`, so a
+/// dot is a separator exactly when an even number of backslashes precedes it.
+/// Only presentation text has this ambiguity — [`crate::Name`] holds wire
+/// octets, where a label carries its own length — so every helper below asks
+/// this one function instead of splitting on `.` for itself (`CLAUDE.md` §7).
+///
+/// It began to matter when RFC 9460's presentation form (`TODO.md` #35) and
+/// `Name` (#36) between them made such a name loadable, signable and servable.
+/// Before that a `\` in an owner was refused at the door and counting dots was
+/// right by accident.
+fn separates_labels(bytes: &[u8], at: usize) -> bool {
+    let mut back = at;
+    while back > 0 && bytes[back - 1] == b'\\' {
+        back -= 1;
+    }
+    (at - back).is_multiple_of(2)
+}
+
+/// Whether `name` ends in the root separator, as opposed to a label that ends
+/// in an escaped dot — `foo\.` is one relative label, not `foo` at the root.
+pub fn ends_with_root(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty() && bytes[bytes.len() - 1] == b'.' && separates_labels(bytes, bytes.len() - 1)
+}
+
+/// `name` without its root separator: `example.com.` yields `example.com`, and
+/// the root yields the empty string.
+///
+/// Not `trim_end_matches('.')`, which ate the escaped dot underneath the
+/// separator too and left `foo\..` as a dangling `foo\`.
+fn without_root(name: &str) -> &str {
+    if ends_with_root(name) {
+        &name[..name.len() - 1]
+    } else {
+        name
+    }
+}
+
+/// The byte offsets of `name`'s label separators, left to right.
+fn separators(name: &str) -> impl DoubleEndedIterator<Item = usize> + '_ {
+    let bytes = name.as_bytes();
+    (0..bytes.len()).filter(move |&i| bytes[i] == b'.' && separates_labels(bytes, i))
+}
+
+/// A name's labels, left to right and still in presentation form. The root has
+/// none.
+///
+/// The one place that knows where a name's labels begin and end, so that no
+/// caller writes `split('.')` and gets `a\.b.com.` wrong. Double-ended, and
+/// linear in either direction: each step scans one label, not the whole name.
+pub fn presentation_labels(name: &str) -> Labels<'_> {
+    let trimmed = without_root(name);
+    Labels {
+        rest: (!trimmed.is_empty()).then_some(trimmed),
+    }
+}
+
+/// [`presentation_labels`]'s iterator. `rest` is what has not been yielded from
+/// either end, and `None` once nothing has.
+pub struct Labels<'a> {
+    rest: Option<&'a str>,
+}
+
+impl<'a> Iterator for Labels<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        let rest = self.rest?;
+        match separators(rest).next() {
+            Some(cut) => {
+                self.rest = Some(&rest[cut + 1..]);
+                Some(&rest[..cut])
+            }
+            None => {
+                self.rest = None;
+                Some(rest)
+            }
+        }
+    }
+}
+
+impl<'a> DoubleEndedIterator for Labels<'a> {
+    fn next_back(&mut self) -> Option<&'a str> {
+        let rest = self.rest?;
+        match separators(rest).next_back() {
+            Some(cut) => {
+                self.rest = Some(&rest[..cut]);
+                Some(&rest[cut + 1..])
+            }
+            None => {
+                self.rest = None;
+                Some(rest)
+            }
+        }
+    }
+}
+
+/// How many labels a name has, the root (`.`) being zero. `example.com.` is 2,
+/// and so is `a\.b.com.` — one label holding a dot, one holding `com`.
 ///
 /// Neither case folding nor the trailing dot changes the answer, so this does
 /// neither and allocates nothing.
 pub fn label_count(name: &str) -> usize {
-    let trimmed = name.trim_end_matches('.');
+    let trimmed = without_root(name);
     if trimmed.is_empty() {
         0
     } else {
-        trimmed.split('.').count()
+        1 + separators(trimmed).count()
     }
 }
 
@@ -391,16 +492,14 @@ pub fn parent_name(name: &str) -> Option<&str> {
     if name == "." {
         return None;
     }
-    let (_first_label, rest) = name.split_once('.')?;
+    let cut = separators(name).next()?;
+    let rest = &name[cut + 1..];
     Some(if rest.is_empty() { "." } else { rest })
 }
 
 /// The last `labels` labels of an absolute name, as a slice of it.
 ///
 /// A suffix of whole labels *is* a slice, so walking up the tree costs nothing.
-/// The owning spelling (`rdns::dnssec::suffix_labels`) builds a `Vec` of the
-/// labels, a `join` and a `format!` per candidate, and four walks paid that per
-/// label of a name the client chose.
 ///
 /// `name` must be absolute, and folded if it is compared against folded keys:
 /// slicing can fix neither. Zero labels is the root; asking for more labels than
@@ -409,35 +508,38 @@ pub fn suffix_labels(name: &str, labels: usize) -> &str {
     if labels == 0 {
         return ".";
     }
-    let trimmed = name.trim_end_matches('.');
+    let trimmed = without_root(name);
     if trimmed.is_empty() {
         return ".";
     }
-    let start = trimmed
-        .rmatch_indices('.')
+    let start = separators(trimmed)
+        .rev()
         .nth(labels - 1)
-        .map_or(0, |(dot, _)| dot + 1);
+        .map_or(0, |dot| dot + 1);
     &name[start..]
 }
 
 /// Whether `name` is `origin` or sits below it — "is this name in that zone".
 ///
 /// A suffix match is not enough: `notexample.com.` ends with `example.com.` and
-/// is a different name, so the boundary must land on a label separator. The
+/// is a different name, so the boundary must land on a label separator — and on
+/// a real one, or `x.a\.b.com.` would read as sitting under `b.com.`. The
 /// trailing dot is optional on either side; an empty origin is the root.
 ///
 /// Compares bytes, ASCII case-insensitively (RFC 4343), so neither side has to
-/// be folded first and no slice can land inside a multi-byte character.
+/// be folded first and no slice can land inside a multi-byte character. Both
+/// sides must be presentation text, escaped the way [`crate::Name`] escapes it.
 pub fn is_at_or_under(name: &str, origin: &str) -> bool {
-    let name = name.strip_suffix('.').unwrap_or(name).as_bytes();
-    let origin = origin.strip_suffix('.').unwrap_or(origin).as_bytes();
+    let name = without_root(name).as_bytes();
+    let origin = without_root(origin).as_bytes();
     if origin.is_empty() {
         return true;
     }
     let Some(prefix) = name.len().checked_sub(origin.len()) else {
         return false;
     };
-    name[prefix..].eq_ignore_ascii_case(origin) && (prefix == 0 || name[prefix - 1] == b'.')
+    name[prefix..].eq_ignore_ascii_case(origin)
+        && (prefix == 0 || (name[prefix - 1] == b'.' && separates_labels(name, prefix - 1)))
 }
 
 /// The current Unix timestamp in seconds, or 0 if the clock is before the epoch.
@@ -857,6 +959,15 @@ mod tests {
         assert_eq!(label_count("example.com"), 2);
         assert_eq!(label_count("www.example.com."), 3);
         assert_eq!(label_count("WWW.Example.COM."), 3);
+
+        // RFC 1035 §5.1: the dot inside the first label is not a separator, and
+        // `a\\` is a label ending in a backslash followed by one that is.
+        assert_eq!(label_count(r"a\.b.com."), 2);
+        assert_eq!(label_count(r"a\\.com."), 2);
+        // A relative name whose last label ends in an escaped dot: one label,
+        // and no root separator to strip.
+        assert_eq!(label_count(r"foo\."), 1);
+        assert_eq!(label_count(r"foo\.."), 1);
     }
 
     /// A suffix of whole labels is a slice, so this must be a *slice* of the
@@ -879,6 +990,14 @@ mod tests {
         // allocate to give it.
         let inside = suffix_labels(name, 2);
         assert!(std::ptr::eq(inside.as_ptr(), name[4..].as_ptr()));
+
+        // An escaped dot is inside a label, so the walk steps over it whole.
+        let escaped = r"x.a\.b.com.";
+        assert_eq!(suffix_labels(escaped, 1), "com.");
+        assert_eq!(suffix_labels(escaped, 2), r"a\.b.com.");
+        assert_eq!(suffix_labels(escaped, 3), escaped);
+        assert_eq!(parent_name(escaped), Some(r"a\.b.com."));
+        assert_eq!(parent_name(r"a\.b.com."), Some("com."));
     }
 
     /// The whole point of the type: a key put in owned is found borrowed. If the
@@ -1446,6 +1565,12 @@ mod tests {
         // ASCII case folds; U+212A KELVIN SIGN does not become `k`.
         assert!(is_at_or_under("WWW.Example.COM.", "example.com."));
         assert!(!is_at_or_under("\u{212A}.example.com.", "k.example.com."));
+
+        // The boundary has to be a real separator. `a\.b.com.` is two labels,
+        // so nothing is under `b.com.` by way of the dot inside the first one.
+        assert!(!is_at_or_under(r"x.a\.b.com.", "b.com."));
+        assert!(is_at_or_under(r"x.a\.b.com.", r"a\.b.com."));
+        assert!(is_at_or_under(r"a\.b.com.", "com."));
     }
 
     #[test]
