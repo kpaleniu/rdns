@@ -28,7 +28,6 @@ use rdns::{
 
 /// A name from a literal, for tests only: `Name` is fallible to build and a test
 /// that writes a bad one should fail loudly at that line.
-#[allow(dead_code)]
 fn nm(text: &str) -> Name {
     text.parse().expect("a test name parses")
 }

@@ -410,22 +410,6 @@ impl RttStore {
     }
 }
 
-/// A name and every zone above it, deepest first: `www.example.com.` yields
-/// `www.example.com.`, `example.com.`, `com.`, `.`.
-///
-/// ~~Slices of `name`, which both callers have normalized~~ — replaced by
-/// [`NameRef::ancestors`], which is the same walk over a name that cannot be
-/// relative, so the `debug_assert` that guarded that is gone too.
-#[allow(dead_code)]
-fn ancestors(name: &str) -> impl Iterator<Item = &str> {
-    let mut next = Some(name);
-    std::iter::from_fn(move || {
-        let current = next?;
-        next = crate::utils::parent_name(current);
-        Some(current)
-    })
-}
-
 /// What a referral told us.
 struct Referral {
     zone: Name,
@@ -2981,16 +2965,6 @@ this line has no record and is skipped
             1,
             "the failing server should be tried once, then skipped on later queries"
         );
-    }
-
-    #[test]
-    fn test_ancestors_are_deepest_first() {
-        assert_eq!(
-            ancestors("www.example.com.").collect::<Vec<_>>(),
-            vec!["www.example.com.", "example.com.", "com.", "."]
-        );
-        assert_eq!(ancestors("com.").collect::<Vec<_>>(), vec!["com.", "."]);
-        assert_eq!(ancestors(".").collect::<Vec<_>>(), vec!["."]);
     }
 
     /// The deepest cached zone wins, because it skips the most round trips.
