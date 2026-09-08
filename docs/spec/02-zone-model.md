@@ -49,11 +49,22 @@ RFC 1035 §5.1's escapes are resolved by the value that needs them
 so that `\DDD` still means something by the time a value sees it. `\X` is a
 literal `X`; `\DDD` is one octet and the digit form is exactly three digits.
 
-This reaches TXT and SVCB parameter values. It does **not** reach owner names or
-name-valued RDATA: those refuse a `\` outright (`TODO.md` #13e), so the two
-octets with no faithful spelling in a stored name — `.` and `\` — cannot get in.
+This reaches TXT and SVCB parameter values, and — since #36 — owner names and
+name-valued RDATA as well, through `Name::from_presentation`. `a\.b IN A ...` is
+one label holding a dot, and a CNAME target may spell one the same way.
+
+~~It does **not** reach owner names or name-valued RDATA: those refuse a `\`
+outright (`TODO.md` #13e), so the two octets with no faithful spelling in a
+stored name — `.` and `\` — cannot get in.~~ True until #35 and #36, and left
+standing because it is what the arithmetic below still assumed afterwards.
 Before the decoder existed the tokenizer ate a backslash inside quotes, so
 `"a\.b"` silently became two labels while the unquoted `a\.b` was refused.
+
+The consequence is that presentation text no longer splits on `.`: a name's
+labels are `utils::presentation_labels`, and `label_count`, `suffix_labels`,
+`parent_name` and `is_at_or_under` are built on it. Four places had counted dots
+instead, and the validator read a plain signed answer at such a name as expanded
+from a wildcard that does not exist — `TODO.md` #37a.
 
 ### SVCB and HTTPS
 

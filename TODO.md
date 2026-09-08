@@ -37,8 +37,14 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**One inventory, and nothing numbered.**
+**One inventory and one numbered section**, as of 2026-09-08.
 
+- **#37** — where a module folder pays, and where it is motion. Four items, of
+  which one (37a, five name helpers #35 and #36 left behind) is the only one
+  with teeth; the rest are preventative. Filed with the measurement #33's rule
+  demands, which for a split is *visibility* and not line count. **37a is done
+  (2026-09-08)** and was a defect, not a cleanup — see the section. 37b-37d
+  remain, and remain preventative.
 - **#21** — the four deliberate RFC deviations and the not-implemented list.
   **Not a queue.** It exists so the next person to notice one finds the decision
   instead of re-deriving it. If one is ever taken up it gets its own number.
@@ -65,26 +71,34 @@ test verbatim, and dnspython validates the DNAME's RRSIG against a running
 **Everything else numbered is closed, withdrawn, or answered no**, and the table
 under "Closed work" says which, when, and where the reasoning is.
 
-**Outside the numbered sections, one thing is genuinely pending: nothing here
-has ever been pushed.** `git rev-list --count origin/main..HEAD` says how far
-ahead — it was 49 on 2026-09-05 — and five CI jobs have still never been read:
+~~**Outside the numbered sections, one thing is genuinely pending: nothing here
+has ever been pushed.**~~ **Wrong as of 2026-09-08**, and the tenth time a
+sentence on this page outlived the thing it described: `origin/main` and `HEAD`
+are both `c2f5900` in this clone, so the count below is **0** and the work has
+in fact gone up. Kept rather than rewritten because the count is the lesson —
+`git rev-list --count origin/main..HEAD` says how far ahead, and a sentence
+saying it for you goes stale. What is still true is that the CI jobs may not
+have been *read*. It was 49 on 2026-09-05, and five CI jobs had never been read:
 msrv, deny, the container image, the `dhat-heap` feature build, and clippy on
 Linux. That is the operator's call, not a session's: see "Do not push" below.
 
 **A count in a preamble goes stale whenever the list under it changes**, which
-happened to this page's summary paragraphs at least ~~eight~~ **nine** times
+happened to this page's summary paragraphs at least ~~eight~~ ~~nine~~ **ten**
+times
 between 2026-07-30 and 2026-09-06 — the ninth is the `docs/CLOSED_WORK.md`
 section count above, found wrong on 2026-09-06 and already wrong on the day it
 was written — each corrected in place rather than reworded. The record is kept
 under "How the queue kept going stale" in `docs/CLOSED_WORK.md`, because the
 shape is the lesson. What this rewrite did about it is not a better paragraph
-but a shorter list: two items cannot drift from a summary of two items. It is
-one item as of 2026-09-06, and the summary above was corrected in the same
-commit that closed #33 rather than a later one — which is the only way this has
-ever stayed true. Whether it holds is a question for the next reader who finds
-this page wrong.
+but a shorter list: two items cannot drift from a summary of two items. ~~It is
+one item as of 2026-09-06~~ — **two as of 2026-09-08**, #37 having been filed,
+and the summary above was corrected in the same commit both times rather than a
+later one, which is the only way this has ever stayed true. Not a tenth
+staleness: a count updated with the list it counts is the behaviour, not the
+failure. Whether it holds is a question for the next reader who finds this page
+wrong.
 
-**The four claims on this page that were wrong**, kept because the reasoning is
+**The five claims on this page that were wrong**, kept because the reasoning is
 the useful part (`CLAUDE.md` §11 — correct in place, never quietly):
 
 - *"CI runs all of this now"* (2026-07-30), while `git remote -v` was empty. The
@@ -97,6 +111,10 @@ the useful part (`CLAUDE.md` §11 — correct in place, never quietly):
   day `docs/CLOSED_WORK.md` was split out and wrong that day: there were
   twenty-nine sections. Replaced above with the `grep` that answers it, which is
   the same move as `git rev-list --count` two paragraphs up.
+- *"nothing here has ever been pushed"* (2026-09-05 onward), while
+  `origin/main` had caught up with `HEAD`. Found on 2026-09-08 by running the
+  command the same paragraph names. A sentence that restates a command's output
+  is a cache with no invalidation.
 - *"the profiler is global, so every test now holds the mutex for its whole
   body"* — true and insufficient. A mutex in a test file cannot serialize
   libtest's own bookkeeping on its other threads, which is why
@@ -706,14 +724,17 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-One section: **#21**, which is an inventory rather than a queue. Everything else
-numbered is under "Closed work" below.
+Two sections: **#37**, which is open work, and **#21**, which is an inventory
+rather than a queue. Everything else numbered is under "Closed work" below.
 
 ### Where to pick up next
 
-Everything here is a choice, not a queue. One thing, with #33 and #34 both
-closed — which is the state this page has never been in before, so the next
-session picks its own work rather than taking the top of a list.
+Everything here is a choice, not a queue. ~~One thing, with #33 and #34 both
+closed~~ — that was the state on 2026-09-07; **#37 was filed on 2026-09-08** and
+is the only numbered work open. ~~It is still a choice: 37a is worth taking on
+its own~~ — 37a was taken the day it was filed, because checking its own open
+question turned it into a defect report. **37b-37d are what is left**, and they
+are explicitly "when that code is next opened".
 
 One candidate named elsewhere on this page, for a session that wants it:
 **SVCB/HTTPS presentation form** was the largest remaining entry in #21's
@@ -742,6 +763,133 @@ stops a 20% win in it being reported as a 20% win.
 
 
 ---
+
+### 37. Where a module folder pays, and where it is motion — **filed 2026-09-08**
+
+**The bar this has to clear is #33's**, which dropped a `dnssec/` directory with
+the rule that killed it: *a split without a measurement is motion*. Line counts
+are not that measurement — moving 500 lines from one file to another changes no
+number anyone can check. **Visibility is.** `rdns/src` today:
+
+```
+571  pub items
+ 18  pub(crate)
+  0  pub(super)
+```
+
+Thirty-three public modules and one private, all flat, with no scope between "private to this file" and
+"public API of the crate", which is why two binaries consume a 571-item surface.
+A flat split makes that strictly worse: every private helper the split separates
+has to widen to `pub(crate)`, visible to all 35k lines. A folder holds it at
+`pub(super)`. That is the whole argument for a directory here, and where it does
+not apply the directory is the rename #33 already refused.
+
+**Not a queue, and 37a is the only item with teeth.** The rest are preventative
+and worth doing when that code is next opened.
+
+| | | |
+|---|---|---|
+| ~~**37a**~~ **done 2026-09-08** | five name helpers that #35 and #36 left behind | Verified by opening each, because the first pass of this list claimed two that are not real — see below. **`resolver::ancestors` (`resolver.rs:420`) is dead**: `#[allow(dead_code)]` under a struck-through doc comment saying `NameRef::ancestors` replaced it, one day old, from #36. **`nsec_cache::is_at_or_below` (`:853`)** is an independent reimplementation of `utils::is_at_or_under` that allocates two `canonical_name` strings and a `format!` per call — in the module #23 fixed for doing per-record work under one mutex. **`dnssec::suffix_labels` (`:311`)** returns `String` where `utils::suffix_labels` returns `&str`; both live. **`dnssec.rs` mixes both spellings of `label_count` in one file** — `utils`'s at `:201`, `:328`, `:770` (through its own `pub use` at `:304`) and `NameRef`'s at `:344`, `:354`, `:769`. And the open question under all four: the `&str` helpers split on `.` and `Name` does not, so **#35 brought RFC 1035 §5.1 escapes into a tree whose name arithmetic predates them**. Whether an escaped label reaches any of these is the thing to check first; it decides whether this is a consolidation or a defect |
+| **37b** | `zone/`, for the 19 items a flat split would widen | `zone.rs` is a data structure (`Zone`, `Shortcuts`, `Located`, `impl Zone`, `:20-707`) and a zone-file parser (`:708-1798`) that share nothing but the type they build. The parser has **19 private top-level items** — `tokenize`, `logical_lines`, `rdata_from_fields`, `check_dname_rules`, `absolutize`, the date helpers. Flat siblings widen all 19 to `pub(crate)`; `zone/parse.rs` + `zone/rdata.rs` + `zone/checks.rs` hold them at `pub(super)`. 1 798 code lines to ~690 / 570 / 380 / 140 |
+| **37c** | `resolver/`, for 29 | Same shape, one level worse: splitting `impl Resolver` across files means every private method the other half calls must widen. **13 private top-level items + 16 private methods.** `resolver/recurse.rs` (`recurse`, `walk`, `ask_any`, `extract_referral`, `query_server`), `resolver/validate.rs` (`validate`, `establish_chain`, `fetch_dnskeys`, `check_denial`), `resolver/caches.rs` (`DelegationCache`, `RttStore`, `KeyCache`). 1 717 code lines to ~320 / 560 / 280 / 260. Note the file is 62% tests — 4 541 lines, 2 824 of them — so the raw count overstates it |
+| **37d** | `rdns-core/src/lib.rs` into modules, which seals five newtypes | Not about size. `Class`, `Rtype`, `Qtype`, `Ttl` and `Serial` have private inner fields, so they are sealed against other *crates* and open to all nine modules of `rdns-core` — §17's "private in the crate root is not private", the rule `record_data.rs` already exists to obey. **Nothing bypasses them today** (checked: no construction and no `.0` outside `lib.rs`), so this converts a discipline into a compiler check rather than fixing a bug. 2 111 code lines to `codes.rs` ~465, `record.rs` ~680, `edns.rs` ~350, `message.rs` ~570, `svcb.rs` ~110 (the loose `decode/encode_svc_params` at `:450`/`:487` plus the key table from `utils.rs:502`), `lib.rs` ~90 of re-exports. No folder: these are siblings, not internals |
+
+#### 37a: the open question was the answer — **a defect**
+
+The row above ends "whether an escaped label reaches any of these is the thing
+to check first; it decides whether this is a consolidation or a defect". It is a
+defect, in the validator, provoked before it was fixed:
+
+```
+RRSIG labels = 3                                    # what the signer wrote, on the wire
+Verified { wildcard: Some("*.b.example.test.") }    # for a plain RRset at a\.b.example.test.
+```
+
+`utils::label_count` split on `.`; `NameRef::label_count` counts wire labels. An
+owner holding RFC 1035 §5.1's `\.` — loadable, signable and servable since #35
+and #36, and accepted by the zone parser both as an owner and as a CNAME target
+— reads as one label more in text than on the wire. So:
+
+- `Rrsig::is_wildcard_expansion` called a plain answer a wildcard expansion, and
+  `ChainValidator::validate_wildcard_proofs` then owed it a denial of a wildcard
+  that does not exist. `rdnsr --dnssec` SERVFAILs a name `rdnsd` signs and serves
+  correctly. Fails closed, so the cost is availability.
+- `verify_rrset` compared the two spellings against each other in one expression
+  (`rrset.owner.label_count()` against `label_count(&zone)`), so a zone whose
+  apex held one rejected every RRSIG in it.
+- `denial_wire::reversed_labels` built the RFC 4034 §6.1 canonical sort key by
+  splitting text, so `a\.b.example.` came apart into `b` and `a\` and sorted
+  where no other implementation puts it. Signer and validator share the function,
+  so the suite could not see it: the regression test asserts the key's octets,
+  and dnspython agrees the name is three labels whose first is `a.b`
+  (`03 61 2e 62`), ordered between `a.example.com.` and `b.example.com.`
+
+**Fixed at the primitive, not per site.** `utils::presentation_labels` is the one
+place that knows where a label begins, `separates_labels` the one rule it knows
+(a dot is a separator when an even number of backslashes precedes it), and
+`label_count`, `suffix_labels`, `parent_name`, `is_at_or_under`, `absolute`,
+`absolute_lowered` and `reversed_labels` are built on it. That is §17's
+"make it unrepresentable" as far as text goes; the type answer is to hold these
+names as `Name`, which is what the `dnssec` structs still do not do.
+
+What went with it, from the row above: `resolver::ancestors` deleted (dead since
+#36), `nsec_cache::is_at_or_below` replaced by `utils::is_at_or_under`,
+`dnssec::suffix_labels` and `dnssec::signed_owner` deleted — `signed_owner_name`
+is the same rule over wire octets — and `dnssec.rs`'s two spellings of
+`label_count` reduced to one. Three `#[allow(dead_code)]` that outlived #36 are
+gone, so is `dnssec::verify_records` (no caller), and two
+`Name::from_presentation(..).unwrap_or_default()` — `Name::default()` is the
+root, so one of them re-owned a cached RRset onto `.`.
+
+Measured: `cargo test -p rdns --test allocations` unchanged except the NSEC
+validator path, **6 to 4**, because `common_suffix` takes a slice now instead of
+rebuilding its answer.
+
+#### What this does not take
+
+- **A `dnssec/` directory. #33 dropped it and the drop is confirmed, with new
+  evidence rather than the same reasoning.** The cluster is not a cluster:
+  `denial_wire` is used by `zone`, `zone_writer`, `zone_signer` and `resolver`
+  as well as by three `dnssec_*` modules, and `dnssec_denial` by `zone_signer`,
+  `resolver` and `rdnsd`. More than half the users of both sit outside any
+  plausible folder, so everything would stay `pub` and the directory would buy
+  the one thing #33 said it buys: a path segment. The `dnssec_` prefix is
+  already doing a namespace's job.
+- **Splitting `rdnsd/src/main.rs` again.** #33 dropped it at 2 610 code lines as
+  "a 20% cut of pure motion". It is **2 606 today**, so nothing has changed and
+  re-filing it would be the queue going in a circle. The visibility argument
+  does not rescue it either: `rdnsd` is a binary crate, so `pub(crate)` means
+  2 606 lines rather than 35 000, and a folder inside it separates nothing.
+- **`tsig/`, `zone_signer/`, `nsec_cache/`.** 1 024, 1 009 and 968 code lines —
+  under the ceiling 37b and 37c aim at, and each would widen fewer than ten
+  items. Worth a folder only if one is being opened anyway.
+
+#### Two claims the first draft got wrong
+
+Both are §17's closing rule arriving again — reasoning about what the code
+should look like instead of opening it — and both were in a list of "the same
+helper written three or four times":
+
+- **`zone_signer::is_under` (`:769`) is not a copy.** It is two lines, and the
+  second calls `crate::utils::is_at_or_under`; its doc comment names the
+  function and says why the wrapper exists. Counted as a duplicate from its
+  signature.
+- **`zone::parent_key` (`:693`) is not a copy of `NameRef::parent`.** It walks
+  wire octets because the index's keys are octets — a `HashMap` probe has to
+  borrow — and its doc comment already says so, naming `NameRef::parent` as the
+  same step over a validated name.
+
+The list went from five duplicated operations to four helpers and one dead
+function. A survey that only adds is not a survey (#14, #33).
+
+#### How to do it, if it is done
+
+#20's discipline, unchanged: **one commit per seam, each diffed against `HEAD`
+to prove it changed nothing.** Two things on top of it. Take 37a first — it
+deletes rather than moves, and doing it after the splits means moving the same
+code twice. And keep `zone.rs` beside `zone/parse.rs` rather than renaming it to
+`zone/mod.rs`: the file keeps its blame lineage instead of registering as a
+rename on top of a 1 798-line move, and it stays the file a reader opens first.
 
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
