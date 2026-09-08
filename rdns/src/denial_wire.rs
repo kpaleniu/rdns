@@ -51,26 +51,42 @@ pub fn canonical_sort_key(name: &str) -> Vec<u8> {
 /// each side — eight allocations for two three-label names, and `Nsec::covers`
 /// makes three comparisons. A signed NXDOMAIN spent 142 allocations, most of
 /// them here.
+///
+/// It also split on `.`, which RFC 4034 §6.1 ordering cannot survive for a name
+/// holding RFC 1035 §5.1's `\.`: `a\.b.example.com.` came apart into four
+/// labels, one of them ending in a backslash, so it sorted somewhere no other
+/// implementation puts it (`TODO.md` #37a).
 pub(crate) fn reversed_labels(name: &str) -> impl Iterator<Item = Folded<'_>> {
-    let trimmed = name.trim_end_matches('.');
-    // `rsplit` on an empty string yields one empty label, where the root has
-    // none at all.
-    let labels = (!trimmed.is_empty()).then_some(trimmed);
-    labels.into_iter().flat_map(|t| t.rsplit('.')).map(Folded)
+    crate::utils::presentation_labels(name)
+        .rev()
+        .map(Folded::new)
 }
 
-/// One label, ordered as RFC 4034 §6.1 requires: octet by octet, with ASCII
-/// case folded (RFC 4343).
+/// One label as the octets it stands for, ordered as RFC 4034 §6.1 requires:
+/// octet by octet, with ASCII case folded (RFC 4343).
 ///
 /// A newtype because `Iterator::cmp` needs `Ord` and `Iterator::cmp_by` is
 /// unstable. `Eq` is written in terms of `Ord` rather than derived, since a
 /// derived one would compare the bytes without folding and disagree with it.
-#[derive(Clone, Copy)]
-pub(crate) struct Folded<'a>(&'a str);
+pub(crate) struct Folded<'a>(std::borrow::Cow<'a, [u8]>);
 
 impl<'a> Folded<'a> {
-    fn folded(self) -> impl Iterator<Item = u8> + 'a {
-        self.0.bytes().map(|b| b.to_ascii_lowercase())
+    /// Borrows unless the label holds an escape, which is nearly every label.
+    fn new(label: &'a str) -> Folded<'a> {
+        if !label.as_bytes().contains(&b'\\') {
+            return Folded(std::borrow::Cow::Borrowed(label.as_bytes()));
+        }
+        // A label that will not decode did not come from `Name`, whose escaping
+        // this reverses. Ordering it by its raw text is wrong in the same way
+        // the old code was wrong for every escaped name; dropping it would be
+        // worse, because a shorter name sorts somewhere else entirely.
+        let decoded =
+            crate::utils::char_string_decode(label).unwrap_or_else(|_| label.as_bytes().to_vec());
+        Folded(std::borrow::Cow::Owned(decoded))
+    }
+
+    fn folded(&self) -> impl Iterator<Item = u8> + '_ {
+        self.0.iter().map(|b| b.to_ascii_lowercase())
     }
 }
 
@@ -363,6 +379,17 @@ mod tests {
         // The two properties the zero terminator buys, spelled out.
         assert!(canonical_sort_key("example.") < canonical_sort_key("a.example."));
         assert!(canonical_sort_key("ab.example.") < canonical_sort_key("abc.example."));
+
+        // `a\.b` is one label of three octets (RFC 1035 §5.1), so the key holds
+        // the dot it stands for and not the backslash that spells it. Splitting
+        // on `.` made three labels of it and wrote `example\0b\0a\\0`, which is
+        // where no other implementation puts the name (`TODO.md` #37a).
+        assert_eq!(
+            canonical_sort_key(r"a\.b.example."),
+            b"example\0a.b\0".to_vec()
+        );
+        assert!(canonical_sort_key("a.example.") < canonical_sort_key(r"a\.b.example."));
+        assert!(canonical_sort_key(r"a\.b.example.") < canonical_sort_key("b.example."));
     }
 
     #[test]
