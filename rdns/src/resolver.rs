@@ -125,7 +125,7 @@ pub struct ResolverConfig {
     pub mode: ResolverMode,
     /// Upstream resolvers for [`ResolverMode::Forward`] (e.g. "8.8.8.8:53").
     pub upstream_servers: Vec<SocketAddr>,
-    /// Where recursion starts. Defaults to the built-in [`ROOT_HINTS`].
+    /// Where recursion starts. Defaults to the built-in `ROOT_HINTS`.
     pub root_hints: Vec<SocketAddr>,
     /// Per-query timeout in milliseconds.
     pub timeout_ms: u64,

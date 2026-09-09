@@ -108,8 +108,8 @@ pub struct QueryStats {
     pub total_errors: u64,
     /// Queries per second (last measurement)
     pub qps: f64,
-    /// Per-IP query counts, bounded by [`MAX_TRACKED_SOURCES`] — see
-    /// [`note_source`] for what happens at the bound.
+    /// Per-IP query counts, bounded by `MAX_TRACKED_SOURCES` — see
+    /// `note_source` for what happens at the bound.
     pub queries_by_ip: HashMap<IpAddr, u64>,
     /// Per-record-type query counts. Bounded by the key space: there are only
     /// 65536 possible types, and no map of them is a DoS.
@@ -466,7 +466,7 @@ impl QueryLogger {
     /// Get current statistics
     ///
     /// Returns the zero value if the lock is poisoned, for the reason in
-    /// [`Self::locked`]: a caller reading counters must not be able to take the
+    /// `Self::locked`: a caller reading counters must not be able to take the
     /// process down.
     pub fn get_stats(&self) -> QueryStats {
         match self.locked() {

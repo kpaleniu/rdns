@@ -29,7 +29,7 @@ impl DnssecValidator {
         }
     }
 
-    /// Treat an unsigned zone as a validation failure. See [`Self::require_signed`].
+    /// Treat an unsigned zone as a validation failure. See `Self::require_signed`.
     pub fn set_require_signed(&mut self, require: bool) {
         self.require_signed = require;
     }

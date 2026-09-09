@@ -30,7 +30,8 @@ use rdns::{Name, NameRef, Qtype, ResourceRecord, Rtype};
 use crate::config;
 use crate::{absolute_name, Cli};
 
-/// Every zone this server holds, keyed by its origin in [`NameKeyBuf`] form.
+/// Every zone this server holds, keyed by its origin in
+/// [`rdns::utils::NameKeyBuf`] form.
 ///
 /// The key is folded so [`Zones::for_query`] can hash the QNAME's ancestors
 /// against it — bounded by the name's label count rather than by how many zones
@@ -842,7 +843,7 @@ pub(crate) fn signed_rrsets(zone: &Zone) -> Vec<(Name, Rtype)> {
 ///
 /// Blocking, and says so: `read_dir`, then a `read_to_string` and a full parse
 /// per zone. Callers running while the listeners are live put it on a blocking
-/// thread; see [`Reloading::load`].
+/// thread; see [`crate::Reloading::load`].
 pub(crate) fn load_zones_from_source(
     source: &ZoneSource,
     replicating: bool,

@@ -310,7 +310,8 @@ pub fn signed_owner_name(owner: NameRef<'_>, rrsig_labels: u8) -> DnssecResult<N
     Ok(Name::prefixed(b"*", folded.as_ref().suffix(want))?)
 }
 
-/// [`rrsig_labels`] for a name, counting labels rather than dots.
+/// [`signed_owner_name`]'s `rrsig_labels` for a name, counting labels rather
+/// than dots.
 pub fn rrsig_labels_of(owner: NameRef<'_>) -> u8 {
     let labels = owner.label_count();
     let counted = if owner.labels().next() == Some(b"*") {

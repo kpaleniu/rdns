@@ -43,8 +43,10 @@ pub enum ParsedRecord {
     /// format, and high-level semantics" (§6) and differs only in how its owner
     /// name is built (§9.1), which is not this layer's business — so `rtype`
     /// says which of the two it is. It cannot disagree with the enclosing
-    /// [`RecordData`]: [`ParsedRecord::decode`] is handed that rtype and
-    /// [`RecordData::from_parsed`] takes this one back.
+    /// [`RecordData`]: `ParsedRecord::decode` is handed that rtype and
+    /// [`RecordData::from_parsed`] takes this one back. Not a link: `decode` is
+    /// `pub(crate)`, and rustdoc refuses one from a public page to a private
+    /// item.
     SVCB {
         rtype: Rtype,
         /// 0 is AliasMode, anything else ServiceMode; lower is preferred

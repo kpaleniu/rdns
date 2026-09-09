@@ -198,8 +198,9 @@ impl DnsMetrics {
     /// One bucket, not every bucket at or above the sample. Prometheus buckets
     /// are cumulative, and this used to make them cumulative *here* — eight
     /// read-modify-writes on shared cache lines per answer, plus the count and
-    /// the sum. [`DnsMetrics::render`] adds them up instead, which is what every
-    /// Prometheus client library does and renders byte-for-byte the same.
+    /// the sum. [`DnsMetrics::to_prometheus_format`] adds them up instead, which
+    /// is what every Prometheus client library does and renders byte-for-byte the
+    /// same.
     pub fn observe_latency_us(&self, us: u64) {
         // The first bound at or above the sample: `le` is inclusive, so a sample
         // exactly on a bound belongs to that bound's bucket. Past the last bound

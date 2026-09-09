@@ -26,8 +26,19 @@ confidence is highest.
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets   # must be clean, no exceptions
+cargo doc --workspace --no-deps          # clean since 2026-09-09; keep it that way
 cargo fmt --all                          # before every commit — see §12
 ```
+
+`cargo doc` is here because a doc comment naming a function that does not exist
+is §4's "a claim to verify", and this is the one such claim a compiler checks
+for free. Unrun, it had accumulated sixteen: seven links that resolved to
+nothing — two near-misses for a real name (`DnsMetrics::render` for
+`to_prometheus_format`), one function #37b had moved, two items in another
+module, one *parameter* name, and one RFC quotation whose `return[s]` was read
+as a link — and nine from a public page to a private item, which is the shape
+§37 makes more of. `--no-deps`, because the dependencies' warnings are not ours
+to fix and would bury ours.
 
 ---
 

@@ -157,7 +157,7 @@ impl<'a> Located<'a> {
 ///
 /// Not a bool: three of the four are "the name exists", and an empty
 /// non-terminal and a wildcard match each owe a *different* DNSSEC proof (see
-/// [`crate::dnssec_answer::negative_proof`]).
+/// [`crate::dnssec_answer::push_negative_proof`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameKind {
     /// The zone holds records at this exact name.
@@ -528,8 +528,8 @@ impl Zone {
     ///
     /// Shallowest rather than deepest, which is the order RFC 1034 §4.3.2's
     /// "start matching down, label by label" meets them in. It can only differ
-    /// in a zone [`check_dname_rules`] refuses, since a second DNAME below the
-    /// first is a record at a subdomain of a DNAME owner (§2.4) — but a zone
+    /// in a zone `checks::check_dname_rules` refuses, since a second DNAME below
+    /// the first is a record at a subdomain of a DNAME owner (§2.4) — but a zone
     /// that arrived by transfer never met that check, and occluding from the
     /// top is the answer that does not depend on how deep the violation goes.
     ///

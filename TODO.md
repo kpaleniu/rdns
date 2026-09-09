@@ -85,6 +85,10 @@ saying it for you goes stale. What is still true is that the CI jobs may not
 have been *read*. It was 49 on 2026-09-05, and five CI jobs had never been read:
 msrv, deny, the container image, the `dhat-heap` feature build, and clippy on
 Linux. That is the operator's call, not a session's: see "Do not push" below.
+**Pushed on 2026-09-09**, so `origin/main` and `HEAD` are both `acd229e` and the
+count is 0 again. The eight commits it carried are all of #37. The *reading*
+half stays open and stays the owner's: there is no `gh` on this machine, so a
+session cannot open a run from here at all.
 
 **A count in a preamble goes stale whenever the list under it changes**, which
 happened to this page's summary paragraphs at least ~~eight~~ ~~nine~~ **ten**
@@ -152,10 +156,15 @@ first run rather than running both.
 **Do not push from a session.** Commit locally and stop. Which remote, and why a
 push costs something, are in `CLAUDE.local.md`.
 
-**The tree is a long way ahead of `origin/main` and CI has seen none of it** —
+~~**The tree is a long way ahead of `origin/main` and CI has seen none of it** —
 `git rev-list --count origin/main..HEAD` is the number, and it was 49 on
-2026-09-05. Five of the seven jobs have still never been read at all; see
-"Where to pick up next".
+2026-09-05.~~ **0 as of 2026-09-09**, pushed at `acd229e`. Five of the seven
+jobs have still never been read at all; see "Where to pick up next".
+
+This sentence and the two in the preamble and under "Where to pick up next" are
+the same fact written three times, which is #30's lesson arriving on this page
+rather than in the code: a status held in three places disagrees eventually, and
+all three did. The command beside each is the only part that cannot go stale.
 
 **The first CI run failed, and the failure was the test's fault rather than the
 code's.** One job failed and one warning appeared across several; both are fixed
@@ -695,11 +704,23 @@ commit; the first four are `CLAUDE.md`'s and the fifth is new with CI:
 
 ```sh
 cargo build --workspace --all-targets
-cargo test --workspace                          # 603 + 6 + 85 + 2
+cargo test --workspace                          # 907 Windows, 923 Linux
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo deny check                                # needs cargo-deny 0.17+
 ```
+
+~~`cargo test --workspace # 603 + 6 + 85 + 2`~~ — that partition was from before
+#31 split the workspace and matched nothing by 2026-09-09. The two numbers are
+the whole-workspace totals, and the gap between them is §1's tell: Linux
+compiles `rdnsd/src/control.rs` and the rest of the `#[cfg(unix)]` half, which
+is 13 tests in `rdnsd` and 3 in `rdns`.
+
+**`CLAUDE.md` has a sixth check that CI does not run**: `cargo doc --workspace
+--no-deps`, clean since 2026-09-09 and held there by nothing but somebody typing
+it. Adding it to `ci.yml` is a step in an existing job rather than a new
+job-run, so it costs no extra minutes — the owner's call, like every other
+change to what a push does.
 
 `cargo deny` on an older version dies with "unknown variant `2024`" — eleven
 crates in the graph are edition 2024 and 0.16's manifest parser predates it.
@@ -753,19 +774,21 @@ One candidate named elsewhere on this page, for a session that wants it:
 not-implemented list and closed as #35; ~~**#13e's `Name` half**~~ closed as #36
 on 2026-09-07, so both of the two named here are gone. Not a queue either.
 
-> **1. Push, and read the five CI jobs nobody has ever read.** Ask
+> **1. ~~Push, and~~ read the five CI jobs nobody has ever read.** ~~Ask
 > `git rev-list --count origin/main..HEAD` how much is waiting; it was 49 on
-> 2026-09-05. Of the seven job-runs a push costs, five have
+> 2026-09-05.~~ **Pushed 2026-09-09 at `acd229e`**, so the count is 0. Reading
+> the runs is what is left, and a session cannot do it from here: there is no
+> `gh` on this machine. Of the seven job-runs a push costs, five have
 > never been looked at: msrv (1.95), deny, the container image, the `dhat-heap`
 > feature build, and clippy on *Linux* — though that last one is checked by hand
-> here and is clean as of 2026-09-06, on the half of the tree Windows cannot
-> compile. **This is the owner's call and not a session's**:
+> here and is clean as of ~~2026-09-06~~ **2026-09-08**, on the half of the tree
+> Windows cannot compile. **This is the owner's call and not a session's**:
 > `CLAUDE.local.md` says why a push costs something and who makes it.
 >
 > The last run that was read was the first one, on 2026-08-01, and it found two
 > things — a Windows test that was wrong rather than code that was, and
 > `actions/checkout@v4` on a runner that had moved to Node 24. Both fixed in
-> `8758476` and unpushed since.
+> `8758476` and ~~unpushed since~~ **pushed 2026-09-09**, five weeks later.
 >
 
 **Read `benches/answer_path.rs`'s header before quoting anything from it.** One
@@ -858,7 +881,7 @@ the week; the record is under "How the queue kept going stale" in
 | **10** | dynamic UPDATE (RFC 2136) | **done 2026-08-03**, seven commits. Incremental re-signing and the journal closed it |
 | **11** | data layout and CPU cache friendliness | **answered no, 2026-08-04.** Measured with cachegrind: all L2-resident, zero LL misses either way. There is no pointer chase to remove, and the `perf` blocker it carried for months did not exist |
 | **12** | pre-authentication panics | **audited 2026-08-01.** No reachable panic in 1.4M mutated inputs; two mutex-poisoning fixes; `rdns/tests/no_input_panics.rs` left behind as the guard |
-| **13** | making illegal states unrepresentable | **done 2026-08-02**, twelve commits, seven live defects fixed on the way. 13e's `Name` half deferred with a reason |
+| **13** | making illegal states unrepresentable | **done 2026-08-02**, twelve commits, seven live defects fixed on the way. ~~13e's `Name` half deferred with a reason~~ — **closed as #36 on 2026-09-07**, and the row stayed wrong for two days. The deferral's reasons were allocation counts and churn; neither survived contact with it, since not one of `allocations.rs`'s forty-four assertion ranges moved |
 | **14** | `Serial`, QR as a type, sealing `RecordData` | **all three done 2026-08-02**, one commit each. 14c found that a legal RFC 2136 UPDATE could not be parsed at all |
 | **15** | collapsing `DName`/`UnpackedDName` | **withdrawn 2026-08-03**, reviewed against the code rather than the plan. Keeps the three findings and two fixes the review did produce |
 | **16** | simplifications: `Nsec3`'s fallibility, splitting `parse_into`, a duplication that must stay | **16b done, 16a corrected-and-withdrawn, 16c recorded as not-to-fix, 2026-08-02.** 16a's filed plan did not survive contact with `nsec3_hash`; the pass it came from found a live defect in `proves_no_ds` |

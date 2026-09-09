@@ -11,7 +11,7 @@
 //! - Never across an opt-out NSEC3 span (RFC 8198 §5.2): it may hold delegations
 //!   the zone never named.
 //! - Never below a delegation — names in the child zone sort inside the gap and
-//!   exist perfectly well. See [`ZoneProofs::covering_nsec`].
+//!   exist perfectly well. See `ZoneProofs::covering_nsec`.
 //! - NXDOMAIN needs the wildcard denied too.
 //! - TTL is bounded by the proof, not by the question.
 

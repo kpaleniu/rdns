@@ -407,7 +407,7 @@ impl std::fmt::Display for Ignored {
 /// What [`apply`] did.
 #[derive(Debug, Clone)]
 pub struct Applied {
-    /// The zone as it now is. Rebuilt, never edited in place — see [`Working`].
+    /// The zone as it now is. Rebuilt, never edited in place — see `Working`.
     pub zone: Zone,
     /// Records gained, lost, or replaced by something that differs. Zero is a
     /// real outcome, and then the serial does not move.

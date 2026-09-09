@@ -754,7 +754,7 @@ pub enum Redirect {
     NoMatch,
     /// The substitution overflows RFC 1035 §2.3.4's 255 octets. "If this
     /// occurs, the server returns an RCODE of YXDOMAIN" (§2.2), and the
-    /// resolver "return[s] an implementation-dependent error" (§3.4.1 step 4D).
+    /// resolver "return\[s\] an implementation-dependent error" (§3.4.1 step 4D).
     TooLong,
 }
 

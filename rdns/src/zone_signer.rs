@@ -118,7 +118,7 @@ pub struct SigningPolicy {
     /// When the signatures start being valid.
     pub inception: u32,
     /// When they stop — the *latest* expiry in the zone. Individual RRsets
-    /// expire earlier, spread back over [`EXPIRY_JITTER_FRACTION`] of the
+    /// expire earlier, spread back over `EXPIRY_JITTER_FRACTION` of the
     /// window; see [`SigningPolicy::expiry_for`].
     pub expiration: u32,
     pub chain: DenialChain,
