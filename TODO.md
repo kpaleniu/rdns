@@ -37,8 +37,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-~~**One inventory and one numbered section**, as of 2026-09-08.~~ **One
-inventory**, later the same day: #37 closed on the day it was filed.
+~~**One inventory and one numbered section**, as of 2026-09-08.~~ ~~**One
+inventory**, later the same day: #37 closed on the day it was filed.~~
+**One inventory and one numbered section again, 2026-09-09**: **#38**, from a
+structural review asked for that day. Its three fixes are committed and five
+sub-items are open, none of them a defect.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -704,7 +707,7 @@ commit; the first four are `CLAUDE.md`'s and the fifth is new with CI:
 
 ```sh
 cargo build --workspace --all-targets
-cargo test --workspace                          # 907 Windows, 923 Linux
+cargo test --workspace                          # 894 Windows, 910 Linux
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo deny check                                # needs cargo-deny 0.17+
@@ -714,7 +717,8 @@ cargo deny check                                # needs cargo-deny 0.17+
 #31 split the workspace and matched nothing by 2026-09-09. The two numbers are
 the whole-workspace totals, and the gap between them is §1's tell: Linux
 compiles `rdnsd/src/control.rs` and the rest of the `#[cfg(unix)]` half, which
-is 13 tests in `rdnsd` and 3 in `rdns`.
+is 13 tests in `rdnsd` and 3 in `rdns`. They were 907 and 923 until #38, which
+deleted 15 tests of code nothing called and added two for the DO bit.
 
 **`CLAUDE.md` has a sixth check that CI does not run**: `cargo doc --workspace
 --no-deps`, clean since 2026-09-09 and held there by nothing but somebody typing
@@ -751,9 +755,11 @@ Four environment traps that have each cost an hour:
 ## Open work
 
 ~~Two sections: **#37**, which is open work, and **#21**, which is an inventory
-rather than a queue.~~ **One section as of 2026-09-08**, #37 having closed the
-day it was filed: **#21**, which is an inventory rather than a queue.
-Everything else numbered is under "Closed work" below.
+rather than a queue.~~ ~~**One section as of 2026-09-08**, #37 having closed the
+day it was filed: **#21**, which is an inventory rather than a queue.~~
+**Two again as of 2026-09-09**: **#38**, whose five open sub-items are cleanups,
+and **#21**, which is an inventory rather than a queue. Everything else numbered
+is under "Closed work" below.
 
 ### Where to pick up next
 
@@ -763,11 +769,19 @@ is the only numbered work open.~~ ~~It is still a choice: 37a is worth taking on
 its own~~ — 37a was taken the day it was filed, because checking its own open
 question turned it into a defect report. ~~**37b-37d are what is left**~~ —
 ~~37b and 37c were taken on 2026-09-08 too. **37d is what is left**, and it is
-explicitly "when that code is next opened".~~ **All four were taken on
-2026-09-08**, so nothing numbered is open and this heading has nothing under it.
+explicitly "when that code is next opened".~~ ~~**All four were taken on
+2026-09-08**, so nothing numbered is open and this heading has nothing under
+it.~~ **#38 was filed on 2026-09-09** and five of its sub-items are open, so
+this heading has something under it again — for a day, at least.
 The four strike-throughs above are one day's worth, which is the argument for
 this heading being short: a paragraph naming what is next is wrong as soon as
 somebody does it.
+
+**Of #38's five, take 38d's `rdnsr` half first.** It is the only one that has
+never had the judgement made about it: `rdnsd` was split in #20 and the decision
+not to split it further was taken deliberately, while `rdnsr` simply never got a
+first split. 38a and 38c are moves with no behaviour in them, 38b is a small
+operational gap, and 38e is half an hour.
 
 One candidate named elsewhere on this page, for a session that wants it:
 **SVCB/HTTPS presentation form** was the largest remaining entry in #21's
@@ -796,6 +810,59 @@ whole answer is 522 ns and one `sendto`+`recvfrom` pair is 3.6-4.1 µs, so the
 entire benchmark suite covers about 6% of what a query costs — the context that
 stops a 20% win in it being reported as a 20% win.
 
+
+---
+
+### 38. A structural review, and what it left — **filed 2026-09-09**
+
+Asked for as "inspect the codebase for organization, best practices,
+duplication and structure", so this is the review's own record: what it found,
+what was fixed the same day, and what is filed. **Nothing here is a defect
+report** — the one defect it turned up (a dropped DO bit) is in the fixed half.
+
+**Fixed, three commits:**
+
+- **`pub` was the default rather than a decision.** `rdns/src` held 571 `pub`
+  items against 18 `pub(crate)` and 26 `pub(super)`. Measured the way #37 says
+  to measure a split — visibility, not line count — 87 of them were named
+  nowhere else in the workspace, tests, benches and examples included. Narrowing
+  all 87 and letting the compiler sort them: 16 stay `pub` because a public
+  signature reaches them, 6 became `#[cfg(test)]` because only their own tests
+  called them, and the rest are private. `dead_code` then found what nothing
+  called at all — 14 items and the 12 tests that were their only callers, which
+  is §1 from the other direction: a test for a function no caller has proves the
+  function, not the system.
+- **The reply epilogue was written three ways in one binary.**
+  `ClientEdns::mirror` decides whether a reply carries an OPT and with which DO
+  bit (RFC 6891 §6.1.1, RFC 3225 §3); `rdnsd/src/answer.rs` used it, while
+  `truncated_reply`, `error_bytes` and `rdnsr`'s `unsupported_opcode` wrote
+  `has_edns()` plus a fresh `Edns` and dropped the bit. A validating client over
+  budget got TC=1 with DO clear, and the two daemons' NOTIMP replies disagreed.
+  `ClientEdns::of` is the total constructor those paths need; both regression
+  tests were watched failing against the old behaviour.
+- **#5 of the review, and the line #37a closed with**: the DNSSEC structs still
+  held names as canonical text. Eight `String` fields became `Name`, the
+  `proves_*` family and the denial cache took `NameRef`, and
+  `utils::{label_count, suffix_labels, is_at_or_under}` were deleted for want of
+  a caller. A validator's signed NXDOMAIN went from 4 allocations to 1 under
+  NSEC and 2 to 1 under NSEC3; dnspython validated both chains off a live
+  `rdnsd`, including `a\.b.example.com.` — one label with a dot in it.
+
+**Open, and each is a cleanup rather than a queue:**
+
+| | | |
+|---|---|---|
+| **38a** | three things still key on folded text | `negative_cache` (`NameKeyBuf` + `NameTypeKey`), `cache` (`(String, Qtype)` with the `Borrow` trick) and `metrics`'s zone gauges. All three are allocation-free on the lookup path today — `allocations.rs` asserts 0 for a miss in either cache — so the win is uniformity, not speed, and the cost is that `HashMap<Name, _>` cannot be probed by a `NameRef` without the same `dyn` trick these use for `&str`. `utils::parent_name` survives for `negative_cache`'s ancestor walk and is the last text-name helper in the tree |
+| **38b** | a removed zone's journal is never deleted | `journal::journalled_zones` read the directory "so a journal left by a removed zone is found and cleaned up instead of resurfacing if that zone is ever re-added". Nothing called it: `zones::restore_journals` walks the *zone list* instead, so an orphan journal stays on disk until somebody notices. Deleted with the rest of the dead code rather than left as a function nobody calls; the gap is here because deleting it would otherwise have deleted the finding |
+| **38c** | `rdns-core::utils` is the crate's miscellany | 783 code lines and seven unrelated things: the RR-type and QTYPE tables, the SVCB parameter keys, hex/base64/character-string codecs, the presentation-name helpers, `bind_addr_for` and `recv_error_is_transient`, the clock, and `dname_redirect` — which is RFC 6672's substitution rule and not a utility at all. #37d's argument applies (a name that says what is in it, and private helpers held at `pub(super)`), but the visibility measurement is small: four private items (`separators`, `without_root`, `separates_labels`, `has_ascii_uppercase`) and they all belong to the name half. The stronger argument is the one #33 refused to make about line count: `utils` is where a thing goes when nobody decided where it belongs, so it grows by default. A move, its own commit, no behaviour |
+| **38d** | the two daemons are cut on different principles | `rdnsd/src/answer.rs` holds the *query* path (391 SLOC) and 559 SLOC of AXFR/IXFR/UPDATE/NOTIFY answering stayed in `main.rs` as `impl Server` — a fourth seam of the kind #20 lifted three of, and #20 said explicitly it was not worth going further. That judgement was never made for **`rdnsr`, which has no modules at all**: 773 SLOC of CLI, the RFC 5011 anchor manager (~180), the answer path, the UDP loop and `main` in one file, and its AD-bit policy spelled out at five call sites. Take `rdnsr` first: it has never had the split `rdnsd` had, and the anchor manager is the seam with an owner and a lifetime |
+| **38e** | the fixtures cannot be shared, so they are written three times | `test_records` is `#[cfg(test)]`, so `tests/` and `benches/` — separate crates — cannot see it: `query_message` is identical in `benches/answer_path.rs:53`, `tests/allocations.rs` and `tests/no_input_panics.rs`, and `zone_at` in `ixfr.rs` and `journal.rs` in a module that already imports `test_records::nm`. A `testkit` feature gating those modules, or a dev-dependency crate, is the usual answer. Beside it: `rdns-transport`, the admission path both daemons' packets pass through, has **3 tests** for 627 lines |
+
+**What the review checked and found nothing wrong with**, so the next one need
+not: a whole-tree scan for repeated function bodies (≥6 lines, normalised) found
+**two** in 61k lines, both test fixtures; every `.lock().unwrap()` (21) is in a
+test; non-test `#[allow]` attributes number 2; `Cargo.toml`'s dependency
+comments still match what the code imports.
 
 ---
 

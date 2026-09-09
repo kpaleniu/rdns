@@ -729,3 +729,50 @@ grep, a key type that could not be a map key, and a missed prerequisite that cou
 invalidate a whole stage. Every one reasoned about what the code *should* look
 like instead of opening it. §4's rule applies to a plan too, because a plan is a
 claim about the code.
+
+---
+
+## 18. Finish the sweep, or give the remainder a number
+
+Every unfinished change here ended the same way, and not the way it looks.
+Nobody stopped halfway and said so. What was left over was *named in prose* — a
+closing note, a doc comment, a plan's own "not worth doing on its own account" —
+and prose is not a queue. The review that became #20 put it exactly: **a review
+finding with no number is a review finding nobody schedules.** It sat unfiled
+because it was "not a defect and had no natural sub-item". #37a's closing
+sentence named the next step — "the type answer is to hold these names as
+`Name`, which is what the `dnssec` structs still do not do" — and that step
+waited for somebody to ask a general question about the codebase before it was
+taken, as #38.
+
+- **Count the instances before fixing one.** A change is almost always one case
+  of a shape. `grep` for the shape first, put the count in the commit message,
+  and fix all of them or say in the same sentence which are left and under which
+  number. A fix that silently leaves N-1 reads as complete to the next person
+  and to the next `grep`. #38's DO bit was three sites; its `pub` sweep was 87
+  items measured before a single one was edited.
+- **A sentence naming remaining work is a `TODO.md` item, or it is deleted.**
+  Not a doc comment, not a `// for now`, not "when this code is next opened".
+  Three got away: `journal::journalled_zones`, a doc comment describing a
+  cleanup nothing performed; and `should_set_ad_bit` and `resign_at`, two
+  policies written and never wired up, each with a second copy of its rule live
+  somewhere else.
+- **Dead code is a finding, not litter.** Deleting it is right and deleting it
+  silently is not: what it documented was somebody's intent, and the intent
+  outlives the function. File it (#38b), then delete.
+- **Never write a number you did not just read.** Test counts, allocation
+  counts, package counts, "clippy is clean". #38's first commit message said
+  "913 on Linux" from a run taken before the change it was describing; the
+  correct number was 911 and the only way to know was to check out the commit
+  and run it. §1 and §4 say this about the code; it is just as true of the
+  message.
+- **"Done" is the whole request, not its interesting half.** When part of a task
+  turns out to be bigger than the rest, finish everything that does not depend
+  on it, then file the part that does with the measurement that would let
+  somebody else start. Scaling the work down is the owner's call, and the owner
+  cannot make it if the smaller shape is presented as the finished one.
+
+The check that catches all of this before a commit: read the request back as a
+list of sentences and answer each one with either a diff or a number. That is
+also the shape a session should report in — what was done, what was measured,
+what was filed and under which number.
