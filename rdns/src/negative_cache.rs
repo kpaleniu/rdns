@@ -11,7 +11,7 @@
 //! - An SOA is required — RFC 2308 §5 takes the negative TTL from it, so a "no"
 //!   without one has not said how long it is good for.
 //! - The TTL is `min(SOA MINIMUM, the SOA record's own TTL)`, capped at
-//!   [`MAX_NEGATIVE_TTL`] so a week-long negative TTL cannot make us deny a name
+//!   `MAX_NEGATIVE_TTL` so a week-long negative TTL cannot make us deny a name
 //!   the zone fixed an hour ago (RFC 2308 §5, §7).
 //! - NXDOMAIN denies every type at the name and everything below it (RFC 8020);
 //!   NODATA denies exactly one type.
@@ -29,7 +29,7 @@ use std::sync::Mutex;
 /// The longest a negative answer is held, whatever the SOA claims. RFC 2308 §7
 /// recommends one to three hours; this is the low end, matching the validated
 /// denial cache.
-pub const MAX_NEGATIVE_TTL: u32 = 3600;
+const MAX_NEGATIVE_TTL: u32 = 3600;
 
 /// A cached "no", ready to be turned back into a response.
 #[derive(Debug, Clone)]

@@ -22,7 +22,7 @@ use crate::{DnsMessage, Name, NameRef, RecordData, ResourceRecord};
 
 /// How many version steps to remember per zone. Past this a full transfer is
 /// both correct and probably cheaper than the chain.
-pub const MAX_DELTAS_PER_ZONE: usize = 32;
+const MAX_DELTAS_PER_ZONE: usize = 32;
 
 /// One version step: what it takes to get from `from_serial` to `to_serial`.
 #[derive(Debug, Clone)]
@@ -162,7 +162,7 @@ impl DeltaLog {
     ///
     /// Replaces rather than appends, and bounded on the way in: a hand-grown
     /// journal must not make this process hold more than
-    /// [`MAX_DELTAS_PER_ZONE`] steps. It does not check that the steps link —
+    /// `MAX_DELTAS_PER_ZONE` steps. It does not check that the steps link —
     /// [`crate::journal::Journal::load`] already refuses a chain with a gap.
     pub fn restore(&mut self, zone: NameRef<'_>, mut deltas: Vec<ZoneDelta>) {
         if deltas.len() > MAX_DELTAS_PER_ZONE {
@@ -418,7 +418,7 @@ impl IxfrResponse {
 ///
 /// It rides in the *authority* section (RFC 1995 §3), so a validator that
 /// forbids authority sections in requests makes IXFR unreceivable.
-pub fn requested_serial(request: &DnsMessage) -> Option<Serial> {
+fn requested_serial(request: &DnsMessage) -> Option<Serial> {
     request
         .authorities
         .iter()

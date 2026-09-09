@@ -167,13 +167,14 @@ pub fn build_type_bitmap(types: &[Rtype]) -> Vec<u8> {
 
 /// Every type set in a bitmap, ascending. A malformed bitmap silently truncates;
 /// [`bitmap_types_exact`] is the checked form.
-pub fn bitmap_types(bitmap: &[u8]) -> Vec<Rtype> {
+#[cfg(test)]
+fn bitmap_types(bitmap: &[u8]) -> Vec<Rtype> {
     bitmap_types_exact(bitmap).unwrap_or_else(|partial| partial)
 }
 
-/// [`bitmap_types`], but `Err(what was read before the damage)` when the bitmap
-/// does not parse to its end. Re-encoding a bitmap only partly understood would
-/// emit a record other than the one we were given.
+/// Every type set in a bitmap, ascending — or `Err(what was read before the
+/// damage)` when the bitmap does not parse to its end. Re-encoding a bitmap only
+/// partly understood would emit a record other than the one we were given.
 pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>> {
     let mut types = Vec::new();
     let mut rest = bitmap;

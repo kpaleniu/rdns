@@ -152,7 +152,7 @@ impl TrustAnchors {
     }
 
     /// The anchors published exactly at `zone`.
-    pub fn for_zone(&self, zone: NameRef<'_>) -> Vec<Ds> {
+    fn for_zone(&self, zone: NameRef<'_>) -> Vec<Ds> {
         let zone = canonical_name_of(zone);
         self.anchors
             .iter()
@@ -163,7 +163,7 @@ impl TrustAnchors {
 
     /// The deepest anchored zone at or above `name` — where a chain walk starts.
     /// `None` is [`ValidationState::Indeterminate`].
-    pub fn deepest_enclosing(&self, name: NameRef<'_>) -> Option<String> {
+    fn deepest_enclosing(&self, name: NameRef<'_>) -> Option<String> {
         let name = canonical_name_of(name);
         self.anchors
             .iter()
@@ -714,7 +714,7 @@ impl<'a> ChainValidator<'a> {
 
 /// Split records into RRsets by (owner, type, class), skipping RRSIGs — a
 /// signature is not an RRset to validate, it is what validates one.
-pub fn group_rrsets(records: &[ResourceRecord]) -> Vec<(String, Rtype, Class, Vec<RecordData>)> {
+fn group_rrsets(records: &[ResourceRecord]) -> Vec<(String, Rtype, Class, Vec<RecordData>)> {
     let mut sets: Vec<(String, Rtype, Class, Vec<RecordData>)> = Vec::new();
     for rr in records {
         if rr.rdata.rtype() == rt::RRSIG || rr.rdata.rtype() == crate::OPT_RECORD_TYPE {
@@ -777,7 +777,7 @@ fn push_rrset(
 
 /// How many CNAMEs an answer may chain through. RFC 1034 sets no limit; the
 /// alternative to picking one is following a deliberate loop.
-pub const MAX_CNAME_CHAIN: usize = 16;
+const MAX_CNAME_CHAIN: usize = 16;
 
 /// What the shape of an answer's CNAME chain turned out to be.
 #[derive(Debug, PartialEq, Eq)]

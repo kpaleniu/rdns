@@ -73,7 +73,7 @@ impl SigningAlgorithm {
         }
     }
 
-    pub fn from_code(code: u8) -> Result<Self> {
+    fn from_code(code: u8) -> Result<Self> {
         Ok(match code {
             8 => SigningAlgorithm::RsaSha256,
             10 => SigningAlgorithm::RsaSha512,
@@ -115,15 +115,6 @@ impl SigningAlgorithm {
                 "{text:?} is not a signing algorithm this build knows"
             ))
         })
-    }
-
-    /// Whether a key of this algorithm can be created here rather than only
-    /// loaded. `ring` has no RSA key generation.
-    pub fn can_generate(self) -> bool {
-        !matches!(
-            self,
-            SigningAlgorithm::RsaSha256 | SigningAlgorithm::RsaSha512
-        )
     }
 }
 
@@ -197,7 +188,7 @@ impl SigningKey {
     }
 
     /// Adopt an existing PKCS#8 private key.
-    pub fn from_pkcs8(
+    fn from_pkcs8(
         algorithm: SigningAlgorithm,
         owner: &str,
         flags: u16,
@@ -383,7 +374,7 @@ impl SigningKey {
     /// The key tag is a comment, not a field: it is derived from the flags and
     /// the public key, so a field would be a second copy — and the first thing
     /// to disagree after a hand-edited `Flags` during a rollover.
-    pub fn to_key_file(&self) -> String {
+    fn to_key_file(&self) -> String {
         format!(
             "; rdns DNSSEC signing key. Anyone who can read this file can sign {owner}\n\
              ; Algorithm: {alg_name}\n\
@@ -402,7 +393,7 @@ impl SigningKey {
     }
 
     /// Read a key file back.
-    pub fn from_key_file(text: &str) -> Result<Self> {
+    fn from_key_file(text: &str) -> Result<Self> {
         let mut owner = None;
         let mut flags = None;
         let mut algorithm = None;

@@ -377,7 +377,8 @@ impl Resolver {
     }
 
     /// A resolver that forwards to `upstreams` instead of recursing.
-    pub fn forwarding_to(upstreams: Vec<SocketAddr>) -> Self {
+    #[cfg(test)]
+    fn forwarding_to(upstreams: Vec<SocketAddr>) -> Self {
         Self::new(ResolverConfig {
             mode: ResolverMode::Forward,
             upstream_servers: upstreams,

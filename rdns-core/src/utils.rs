@@ -1,7 +1,7 @@
 //! Name folding, timestamps, and record-type constants shared across the crate.
 
-use crate::error::{DnssecError, DnssecResult, WireError, WireResult};
-use crate::{Name, NameRef, ParsedRecord, Qtype, RecordData, Rtype};
+use crate::error::{WireError, WireResult};
+use crate::{Name, NameRef, Qtype, RecordData, Rtype};
 use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -248,26 +248,9 @@ impl NameKeyBuf {
         NameKeyBuf(absolute_lowered(name).into_owned())
     }
 
-    /// Take ownership of a string that is already in key form.
-    ///
-    /// For `Zone`, whose key is `absolutize`-against-the-origin then fold, which
-    /// [`NameKeyBuf::new`] cannot express because it has no origin. The debug
-    /// check does not allocate: the allocation tests run in debug.
-    pub fn from_folded(name: String) -> NameKeyBuf {
-        debug_assert!(
-            ends_with_root(&name) && !has_ascii_uppercase(&name),
-            "from_folded was handed {name:?}, which is not in key form"
-        );
-        NameKeyBuf(name)
-    }
-
     /// The key as text, for the callers that still hold names as `String`.
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-
-    pub fn into_string(self) -> String {
-        self.0
     }
 }
 
@@ -554,44 +537,6 @@ pub fn current_unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Whether now is outside the inception..expiration range, either side of it.
-///
-/// # Examples
-/// ```ignore
-/// let now = current_unix_timestamp() as u32;
-/// assert!(is_time_expired(now + 3600, now)); // Future inception
-/// assert!(is_time_expired(now - 7200, now - 3600)); // Expired
-/// ```
-pub fn is_time_expired(inception: u32, expiration: u32) -> bool {
-    let now = current_unix_timestamp();
-    now < (inception as u64) || now > (expiration as u64)
-}
-
-/// Whether a cache entry has expired.
-///
-/// # Examples
-/// ```ignore
-/// let now = current_unix_timestamp();
-/// assert!(!is_cache_expired(now + 3600)); // Valid for 1 hour
-/// assert!(is_cache_expired(now - 1)); // Already expired
-/// ```
-pub fn is_cache_expired(expires_at: u64) -> bool {
-    current_unix_timestamp() >= expires_at
-}
-
-/// A DNSKEY's (algorithm, public_key, flags, protocol). Errors on any other type.
-pub fn extract_dnskey_fields(key: &ParsedRecord) -> DnssecResult<(u8, Vec<u8>, u16, u8)> {
-    match key {
-        ParsedRecord::DNSKEY {
-            algorithm,
-            public_key,
-            flags,
-            protocol,
-        } => Ok((*algorithm, public_key.clone(), *flags, *protocol)),
-        _ => Err(DnssecError::parse("not a DNSKEY record")),
-    }
 }
 
 /// The record type code of a stored record.
@@ -892,6 +837,7 @@ mod tests {
 
     use super::*;
     use crate::name::nm;
+    use crate::ParsedRecord;
 
     /// A QTYPE is not an RTYPE: these three are questions no record answers to,
     /// so the record-type table says `None` for all of them (#33b).
@@ -1033,78 +979,6 @@ mod tests {
 
         let ts2 = current_unix_timestamp();
         assert!(ts2 >= ts);
-    }
-
-    #[test]
-    fn test_is_time_expired_not_yet_valid() {
-        let now = current_unix_timestamp() as u32;
-        let inception = now + 3600; // 1 hour in future
-        let expiration = now + 7200; // 2 hours in future
-
-        assert!(is_time_expired(inception, expiration));
-    }
-
-    #[test]
-    fn test_is_time_expired_already_expired() {
-        let now = current_unix_timestamp() as u32;
-        let inception = now - 7200; // 2 hours ago
-        let expiration = now - 3600; // 1 hour ago
-
-        assert!(is_time_expired(inception, expiration));
-    }
-
-    #[test]
-    fn test_is_time_not_expired() {
-        let now = current_unix_timestamp() as u32;
-        let inception = now - 3600; // 1 hour ago
-        let expiration = now + 3600; // 1 hour in future
-
-        assert!(!is_time_expired(inception, expiration));
-    }
-
-    #[test]
-    fn test_is_cache_expired_valid() {
-        let now = current_unix_timestamp();
-        let expires_at = now + 3600; // 1 hour from now
-
-        assert!(!is_cache_expired(expires_at));
-    }
-
-    #[test]
-    fn test_is_cache_expired_expired() {
-        let now = current_unix_timestamp();
-        let expires_at = now - 1; // Already expired
-
-        assert!(is_cache_expired(expires_at));
-    }
-
-    #[test]
-    fn test_extract_dnskey_fields() {
-        let key = ParsedRecord::DNSKEY {
-            flags: 0x0100,
-            protocol: 3,
-            algorithm: 8,
-            public_key: vec![1, 2, 3, 4],
-        };
-
-        let result = extract_dnskey_fields(&key).expect("extract failed");
-        assert_eq!(result.0, 8); // algorithm
-        assert_eq!(result.1, vec![1, 2, 3, 4]); // public_key
-        assert_eq!(result.2, 0x0100); // flags
-        assert_eq!(result.3, 3); // protocol
-    }
-
-    #[test]
-    fn test_extract_dnskey_fields_not_dnskey() {
-        let record = ParsedRecord::DS {
-            key_tag: 12345,
-            algorithm: 8,
-            digest_type: 2,
-            digest: vec![1, 2, 3],
-        };
-
-        let result = extract_dnskey_fields(&record);
-        assert!(result.is_err());
     }
 
     #[test]

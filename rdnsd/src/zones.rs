@@ -24,7 +24,9 @@ use rdns::metrics::DnsMetrics;
 use rdns::utils::label_count;
 use rdns::utils::{current_unix_timestamp, record_types};
 use rdns::zone::{parse_zone_file_at, Zone};
-use rdns::zone_signer::{sign_zone, sign_zone_incrementally, DenialChain, SigningPolicy};
+use rdns::zone_signer::{
+    resign_after, sign_zone, sign_zone_incrementally, DenialChain, SigningPolicy,
+};
 use rdns::{Name, NameRef, Qtype, ResourceRecord, Rtype};
 
 use crate::config;
@@ -648,7 +650,7 @@ impl ZoneSigning {
 
     /// How often the zones should be re-signed.
     ///
-    /// A third of the validity — see `zone_signer::RESIGN_FRACTION`.
+    /// A third of the validity, which is [`resign_after`]'s to decide.
     ///
     /// The timer re-signs by *reloading*, which is the only correct shape: the
     /// served serial is the file's serial plus a time term
@@ -660,7 +662,7 @@ impl ZoneSigning {
     /// Floored at a minute so a tiny `--signature-validity` cannot make this a
     /// spin loop.
     pub(crate) fn resign_interval(&self) -> Duration {
-        Duration::from_secs((self.shortest_validity() / 3).max(60))
+        Duration::from_secs(resign_after(self.shortest_validity()).max(60))
     }
 
     /// How many of `zones` this would actually sign, for `--check-config`.

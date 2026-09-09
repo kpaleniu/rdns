@@ -184,7 +184,7 @@ impl Rrsig {
     ///
     /// The RFC makes both bounds serial-number arithmetic (§3.1.5), but the wrap
     /// only bites in 2106; a plain comparison is what implementations do.
-    pub fn is_current(&self, now: u64) -> bool {
+    fn is_current(&self, now: u64) -> bool {
         now >= self.inception as u64 && now <= self.expiration as u64
     }
 }
@@ -243,11 +243,6 @@ pub fn dnskeys_in(records: &[ResourceRecord]) -> Vec<Dnskey> {
 /// Every RRSIG in `records`.
 pub fn rrsigs_in(records: &[ResourceRecord]) -> Vec<Rrsig> {
     records.iter().filter_map(Rrsig::from_record).collect()
-}
-
-/// Every DS record in `records`.
-pub fn ds_in(records: &[ResourceRecord]) -> Vec<Ds> {
-    records.iter().filter_map(Ds::from_record).collect()
 }
 
 // Canonical form (RFC 4034 §6)
@@ -329,7 +324,7 @@ pub fn rrsig_labels_of(owner: NameRef<'_>) -> u8 {
 /// received. Of the listed types we parse NS, CNAME, SOA, PTR, MX, RRSIG and
 /// NSEC; the rest are obsolete or unparsed and pass through unchanged — a
 /// signature failure rather than a false accept, should one arrive mixed-case.
-pub fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
+fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
     let lowered = match record.rtype() {
         rt::NS | rt::CNAME | rt::PTR | rt::SOA | rt::MX | rt::RRSIG | rt::NSEC => {
             match record.parse()? {

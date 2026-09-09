@@ -122,10 +122,6 @@ impl DnssecValidator {
             }
         }
     }
-
-    pub fn should_set_ad_bit(&self, is_valid: bool, is_signed: bool) -> bool {
-        is_valid && is_signed && self.enabled
-    }
 }
 
 #[cfg(test)]
@@ -153,7 +149,6 @@ mod tests {
 
         assert!(is_valid);
         assert!(!is_signed);
-        assert!(!validator.should_set_ad_bit(is_valid, is_signed));
     }
 
     #[test]
@@ -219,29 +214,5 @@ mod tests {
         });
 
         assert!(DnssecValidator::is_zone_signed(&zone));
-    }
-
-    #[test]
-    fn test_should_set_ad_bit_all_conditions_met() {
-        let validator = DnssecValidator::new(true);
-        assert!(validator.should_set_ad_bit(true, true));
-    }
-
-    #[test]
-    fn test_should_set_ad_bit_validation_failed() {
-        let validator = DnssecValidator::new(true);
-        assert!(!validator.should_set_ad_bit(false, true));
-    }
-
-    #[test]
-    fn test_should_set_ad_bit_not_signed() {
-        let validator = DnssecValidator::new(true);
-        assert!(!validator.should_set_ad_bit(true, false));
-    }
-
-    #[test]
-    fn test_should_set_ad_bit_validation_disabled() {
-        let validator = DnssecValidator::new(false);
-        assert!(!validator.should_set_ad_bit(true, true));
     }
 }

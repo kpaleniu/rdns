@@ -26,10 +26,10 @@ use crate::{Name, ParsedRecord, Serial};
 /// The floor under REFRESH and RETRY. A SOA saying "refresh every 0 seconds" is
 /// otherwise a loop asking the master as fast as the network allows; the RFCs
 /// set no floor, every implementation does.
-pub const MIN_TIMER_SECS: u64 = 60;
+const MIN_TIMER_SECS: u64 = 60;
 
 /// Before the zone's SOA has been seen, there are no timers of its own to obey.
-pub const DEFAULT_REFRESH_SECS: u64 = 3600;
+const DEFAULT_REFRESH_SECS: u64 = 3600;
 
 /// The three timers a secondary lives by, from the zone's apex SOA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

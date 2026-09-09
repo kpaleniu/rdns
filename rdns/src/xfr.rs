@@ -2,7 +2,7 @@
 //!
 //! A stream from somebody else is not a zone until it opens and closes with the
 //! apex SOA (RFC 5936 §2.2), carries only in-bailiwick records, and stays under
-//! [`MAX_TRANSFER_RECORDS`]. Only [`fetch_zone`] and [`fetch_soa`] touch a
+//! `MAX_TRANSFER_RECORDS`. Only [`fetch_zone`] and [`fetch_soa`] touch a
 //! socket; assembling is a state machine so it can be tested without one.
 
 use crate::error::{TransferError, TransferResult};
@@ -21,19 +21,19 @@ use crate::{
 };
 
 /// How long a transfer may take from connect to closing SOA.
-pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long to wait for a single SOA probe.
-pub const SOA_TIMEOUT: Duration = Duration::from_secs(5);
+const SOA_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most records a transfer may carry before we stop believing it is one.
 ///
 /// Bounds the memory a master can make us allocate before it has closed the
 /// stream.
-pub const MAX_TRANSFER_RECORDS: usize = 5_000_000;
+const MAX_TRANSFER_RECORDS: usize = 5_000_000;
 
 /// A request for the zone's SOA — the refresh check (RFC 1035 §4.3.5).
-pub fn soa_query(zone: NameRef<'_>, id: u16) -> DnsMessage {
+fn soa_query(zone: NameRef<'_>, id: u16) -> DnsMessage {
     question(zone, Qtype::of(rt::SOA), id)
 }
 
@@ -81,7 +81,7 @@ pub fn soa_serial(msg: &DnsMessage) -> Option<Serial> {
 
 /// Where a transfer has got to.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Progress {
+enum Progress {
     /// The closing SOA has not arrived; keep reading.
     More,
     /// The transfer is complete. [`AxfrAssembler::into_zone`] has the zone.
@@ -91,7 +91,7 @@ pub enum Progress {
 /// Assembles the messages of an AXFR into a zone, refusing what is not one.
 ///
 /// Fed one message at a time, so the caller can stop reading at the closing SOA.
-pub struct AxfrAssembler {
+struct AxfrAssembler {
     zone: Name,
     records: Vec<ResourceRecord>,
     /// The apex SOA that opened the transfer, and the serial it carried.
@@ -110,7 +110,11 @@ impl AxfrAssembler {
     }
 
     /// The serial the transfer opened with, once the first record has arrived.
-    pub fn serial(&self) -> Option<Serial> {
+    ///
+    /// `#[cfg(test)]`: the assembler's own tests read it; the daemon takes the
+    /// serial from the zone it builds.
+    #[cfg(test)]
+    fn serial(&self) -> Option<Serial> {
         self.opening_soa.as_ref().map(|(_, serial)| *serial)
     }
 
@@ -193,7 +197,7 @@ impl AxfrAssembler {
 ///
 /// `current_soa` rides in the *authority* section; that is the only thing
 /// distinguishing an IXFR request from an AXFR one.
-pub fn ixfr_request(zone: NameRef<'_>, current_soa: ResourceRecord, id: u16) -> DnsMessage {
+fn ixfr_request(zone: NameRef<'_>, current_soa: ResourceRecord, id: u16) -> DnsMessage {
     let mut msg = question(zone, Qtype::IXFR, id);
     msg.authorities = vec![current_soa];
     msg
@@ -248,7 +252,7 @@ enum IxfrState {
 /// A server may answer with the whole zone at any time (RFC 1995 §4), and the
 /// signal is positional: the *second* record. Another SOA means difference
 /// sequences follow, anything else means a full transfer.
-pub struct IxfrAssembler {
+struct IxfrAssembler {
     zone: Name,
     current_serial: Option<Serial>,
     state: IxfrState,
@@ -378,7 +382,7 @@ impl IxfrAssembler {
     ///
     /// `base` must be the version whose serial was sent in the request;
     /// applying the sequences to anything else produces a zone that never was.
-    pub fn into_outcome(self, base: &Zone) -> TransferResult<IxfrOutcome> {
+    fn into_outcome(self, base: &Zone) -> TransferResult<IxfrOutcome> {
         if self.state != IxfrState::Complete {
             return Err(TransferError::malformed(format!(
                 "the answer for {} ended without its closing SOA — the stream was cut",

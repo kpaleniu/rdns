@@ -27,7 +27,7 @@
 pub const OK: &str = "+OK";
 
 /// The first line of a reply that did not, followed by why.
-pub const ERR: &str = "-ERR";
+const ERR: &str = "-ERR";
 
 /// Longest request read before giving up on the sender. A command and a zone
 /// name need far less; this bounds what one connection can make us buffer.

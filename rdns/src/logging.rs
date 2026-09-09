@@ -25,18 +25,6 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    /// The `tracing` filter this level means.
-    pub fn as_filter(self) -> tracing::level_filters::LevelFilter {
-        use tracing::level_filters::LevelFilter;
-        match self {
-            LogLevel::Error => LevelFilter::ERROR,
-            LogLevel::Warn => LevelFilter::WARN,
-            LogLevel::Info => LevelFilter::INFO,
-            LogLevel::Debug => LevelFilter::DEBUG,
-            LogLevel::Trace => LevelFilter::TRACE,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             LogLevel::Error => "error",
@@ -441,7 +429,7 @@ impl QueryLogger {
 
     /// Warn about whatever `limits` says is worth waking someone for, and roll
     /// the window over. Called on a timer — see [`watch_anomalies`].
-    pub fn check_anomalies(&self, limits: &AnomalyThresholds, now: u64) {
+    fn check_anomalies(&self, limits: &AnomalyThresholds, now: u64) {
         for anomaly in anomalies(&self.take_stats(now), limits) {
             match anomaly {
                 Anomaly::HighQueryRate { qps } => tracing::warn!(qps, "high query rate"),
@@ -476,7 +464,8 @@ impl QueryLogger {
     }
 
     /// Reset statistics
-    pub fn reset_stats(&self) {
+    #[cfg(test)]
+    fn reset_stats(&self) {
         let Some(mut inner) = self.locked() else {
             return;
         };

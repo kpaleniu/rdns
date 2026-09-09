@@ -110,7 +110,7 @@ impl Shutdown {
         matches!(tokio::time::timeout(budget, done.recv()).await, Ok(None))
     }
 
-    /// [`Self::drain`] with [`DEFAULT_DRAIN`], reporting what happened. Here so
+    /// [`Self::drain`] with `DEFAULT_DRAIN`, reporting what happened. Here so
     /// both daemons log a restart identically.
     pub async fn drain_reporting(self) {
         if self.drain(DEFAULT_DRAIN).await {
@@ -130,7 +130,7 @@ impl Shutdown {
 /// returns before systemd's 90-second SIGKILL. Five seconds is more than a
 /// transfer needs once no new work arrives, and roughly the grace Windows gives
 /// on `CTRL_CLOSE_EVENT`.
-pub const DEFAULT_DRAIN: Duration = Duration::from_secs(5);
+const DEFAULT_DRAIN: Duration = Duration::from_secs(5);
 
 impl Default for Shutdown {
     fn default() -> Self {

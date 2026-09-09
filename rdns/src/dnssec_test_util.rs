@@ -19,7 +19,7 @@ use crate::{NameRef, ParsedRecord, RecordData, ResourceRecord};
 
 /// DNSKEY flags for a zone-signing key, and for a key-signing key (which adds
 /// the Secure Entry Point bit).
-pub const ZSK_FLAGS: u16 = 0x0100;
+const ZSK_FLAGS: u16 = 0x0100;
 pub const KSK_FLAGS: u16 = 0x0101;
 
 /// A keypair that can actually sign.

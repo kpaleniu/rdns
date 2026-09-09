@@ -494,25 +494,6 @@ impl DnsMetrics {
 
         output
     }
-
-    /// Get current metrics snapshot
-    pub fn get_snapshot(&self) -> MetricsSnapshot {
-        MetricsSnapshot {
-            queries_received: self.queries_received.load(Ordering::Relaxed),
-            queries_authoritative: self.queries_authoritative.load(Ordering::Relaxed),
-            queries_recursive: self.queries_recursive.load(Ordering::Relaxed),
-            responses_sent: self.responses_sent.load(Ordering::Relaxed),
-            responses_nxdomain: self.responses_nxdomain.load(Ordering::Relaxed),
-            responses_servfail: self.responses_servfail.load(Ordering::Relaxed),
-            responses_refused: self.responses_refused.load(Ordering::Relaxed),
-            responses_noerror: self.responses_noerror.load(Ordering::Relaxed),
-            cache_hits: self.cache_hits.load(Ordering::Relaxed),
-            cache_misses: self.cache_misses.load(Ordering::Relaxed),
-            rate_limited: self.rate_limited.load(Ordering::Relaxed),
-            validation_errors: self.validation_errors.load(Ordering::Relaxed),
-            queries_dropped: self.queries_dropped.load(Ordering::Relaxed),
-        }
-    }
 }
 
 impl Default for DnsMetrics {
@@ -549,23 +530,6 @@ impl Default for LatencyTimer {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct MetricsSnapshot {
-    pub queries_received: u64,
-    pub queries_authoritative: u64,
-    pub queries_recursive: u64,
-    pub responses_sent: u64,
-    pub responses_nxdomain: u64,
-    pub responses_servfail: u64,
-    pub responses_refused: u64,
-    pub responses_noerror: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub rate_limited: u64,
-    pub validation_errors: u64,
-    pub queries_dropped: u64,
 }
 
 #[cfg(test)]
@@ -747,16 +711,5 @@ mod tests {
         assert!(prometheus.contains("dns_responses_sent_total 90"));
         assert!(prometheus.contains("# HELP"));
         assert!(prometheus.contains("# TYPE"));
-    }
-
-    #[test]
-    fn test_metrics_snapshot() {
-        let metrics = DnsMetrics::new();
-        metrics.queries_received.fetch_add(50, Ordering::Relaxed);
-        metrics.cache_hits.fetch_add(25, Ordering::Relaxed);
-
-        let snapshot = metrics.get_snapshot();
-        assert_eq!(snapshot.queries_received, 50);
-        assert_eq!(snapshot.cache_hits, 25);
     }
 }

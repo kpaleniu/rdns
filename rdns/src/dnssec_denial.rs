@@ -291,7 +291,7 @@ impl Nsec3 {
     ///
     /// The caller owns the check that [`Nsec3::params`] agree; a hash under other
     /// parameters answers a different question.
-    pub fn matches_hash(&self, hash: &[u8]) -> bool {
+    fn matches_hash(&self, hash: &[u8]) -> bool {
         hash == self.owner_hash
     }
 
@@ -301,7 +301,7 @@ impl Nsec3 {
     }
 
     /// Whether `hash` falls strictly inside this record's span, on the same terms
-    /// as [`Nsec3::matches_hash`].
+    /// as `Nsec3::matches_hash`.
     pub fn covers_hash(&self, hash: &[u8]) -> bool {
         if hash.is_empty() || self.owner_hash.is_empty() || self.next_hashed_owner.is_empty() {
             return false;

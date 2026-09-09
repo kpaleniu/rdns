@@ -155,7 +155,8 @@ impl RateLimiter {
     ///
     /// A poisoned lock reads as a full bucket, matching the direction
     /// [`RateLimiter::should_allow`] fails in.
-    pub fn get_tokens(&self, ip: IpAddr) -> f64 {
+    #[cfg(test)]
+    fn get_tokens(&self, ip: IpAddr) -> f64 {
         let Ok(buckets) = self.buckets.lock() else {
             return self.config.burst_size as f64;
         };

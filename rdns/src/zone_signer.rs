@@ -112,6 +112,16 @@ const EXPIRY_JITTER_FRACTION: u64 = 5;
 /// before anything expires. BIND uses a quarter for the same reason.
 const RESIGN_FRACTION: u64 = 3;
 
+/// How long after signing a zone wants signing again, in seconds.
+///
+/// The daemon's re-signing timer calls this rather than dividing by three
+/// itself: the fraction has to agree with the validity it is a fraction *of*,
+/// and a second copy of the number is where that stops being true
+/// (`CLAUDE.md` §7).
+pub fn resign_after(validity_secs: u64) -> u64 {
+    (validity_secs / RESIGN_FRACTION).max(1)
+}
+
 /// The choices a signing run makes that are not in the zone or in the keys.
 #[derive(Debug, Clone)]
 pub struct SigningPolicy {
@@ -119,7 +129,7 @@ pub struct SigningPolicy {
     pub inception: u32,
     /// When they stop — the *latest* expiry in the zone. Individual RRsets
     /// expire earlier, spread back over `EXPIRY_JITTER_FRACTION` of the
-    /// window; see [`SigningPolicy::expiry_for`].
+    /// window; see `SigningPolicy::expiry_for`.
     pub expiration: u32,
     pub chain: DenialChain,
     /// Kept so the policy can say when to re-sign and how far to spread expiry.
@@ -152,16 +162,6 @@ impl SigningPolicy {
         self
     }
 
-    /// When the zone signed under this policy should be signed again.
-    ///
-    /// A third of the validity after inception, so a failed run has two more
-    /// chances. For the daemon's re-signing timer; it lives here because the
-    /// number has to agree with the validity it is a fraction *of*.
-    pub fn resign_at(&self) -> u64 {
-        let after = (self.validity / RESIGN_FRACTION).max(1);
-        u64::from(self.inception).saturating_add(after)
-    }
-
     /// The expiry for one RRset's signature: the window's end, pulled back by a
     /// deterministic amount derived from the owner name and type.
     ///
@@ -170,7 +170,7 @@ impl SigningPolicy {
     /// agree about it.
     ///
     /// Never later than [`Self::expiration`] — 30 days means at most 30.
-    pub fn expiry_for(&self, name: &str, rtype: Rtype) -> u32 {
+    fn expiry_for(&self, name: &str, rtype: Rtype) -> u32 {
         let spread = self.validity / EXPIRY_JITTER_FRACTION;
         if spread == 0 {
             return self.expiration;
@@ -194,7 +194,7 @@ impl SigningPolicy {
 
     /// The SOA serial to serve for the zone this policy signs.
     /// See [`signed_serial`] for why it is what it is.
-    pub fn serial_for(&self, file_serial: Serial) -> Serial {
+    fn serial_for(&self, file_serial: Serial) -> Serial {
         signed_serial(file_serial, self.signed_at)
     }
 }
@@ -407,7 +407,7 @@ impl PreviousSignatures {
     /// Nearness to expiry is deliberately not a condition: refreshing here would
     /// re-sign every stale RRset on any single UPDATE — the whole-zone delta this
     /// exists to avoid — and would let update traffic stand in for the re-signing
-    /// timer. Expiry is [`SigningPolicy::resign_at`]'s business.
+    /// timer. Expiry is [`resign_after`]'s business.
     fn reuse(
         &self,
         name: NameRef<'_>,
@@ -1199,7 +1199,7 @@ a\.b    IN A   192.0.2.50
     fn re_signing_is_due_well_before_anything_expires() {
         let validity = 30 * 86_400;
         let policy = SigningPolicy::valid_for(NOW, validity);
-        let due = policy.resign_at();
+        let due = u64::from(policy.inception).saturating_add(resign_after(validity));
         assert!(
             due < u64::from(policy.expiration),
             "due at {due}, expires at {}",

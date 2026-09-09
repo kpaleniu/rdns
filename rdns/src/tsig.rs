@@ -34,16 +34,13 @@ use base64::Engine;
 use ring::hmac;
 
 /// The TSIG pseudo-record type. A meta-type: no zone ever holds one.
-pub const TSIG_TYPE: u16 = 250;
+const TSIG_TYPE: u16 = 250;
 
 /// A TSIG RR is always class ANY with TTL 0 (RFC 8945 §4.2).
-pub const TSIG_CLASS: u16 = 255;
+const TSIG_CLASS: u16 = 255;
 
 /// The clock skew a signature tolerates, in seconds (RFC 8945 §4.2 suggests 300).
-pub const DEFAULT_FUDGE: u16 = 300;
-
-/// NOTAUTH — the rcode every TSIG failure is reported with (RFC 8945 §5.3).
-pub const RCODE_NOTAUTH: u16 = 9;
+const DEFAULT_FUDGE: u16 = 300;
 
 /// The MAC algorithms this implements. HMAC-MD5 is absent: deprecated by
 /// RFC 8945.
@@ -90,7 +87,7 @@ impl TsigAlgorithm {
 
     /// The full MAC length in bytes. A shorter MAC is [`TsigError::BadTrunc`],
     /// not an accepted truncation.
-    pub fn mac_len(&self) -> usize {
+    fn mac_len(&self) -> usize {
         match self {
             TsigAlgorithm::HmacSha1 => 20,
             TsigAlgorithm::HmacSha256 => 32,
@@ -213,7 +210,7 @@ impl TsigKey {
     }
 
     /// The zones this key is restricted to, or `None` if it is unrestricted.
-    pub fn zone_scope(&self) -> Option<&[String]> {
+    fn zone_scope(&self) -> Option<&[String]> {
         if self.zones.is_empty() {
             None
         } else {
@@ -543,7 +540,6 @@ pub struct TsigSession {
     previous_mac: Vec<u8>,
     /// Whether the first message has been signed. Later ones hash only timers.
     first_signed: bool,
-    original_id: u16,
 }
 
 impl TsigSession {
@@ -602,11 +598,6 @@ impl TsigSession {
         self.previous_mac = tsig.mac.clone();
         self.first_signed = true;
         append_tsig(message, &tsig)
-    }
-
-    /// The id the signer used, which is what the digest of a reply must restore.
-    pub fn original_id(&self) -> u16 {
-        self.original_id
     }
 }
 
@@ -720,7 +711,6 @@ pub fn check_request(packet: &[u8], keyring: &TsigKeyring, now: u64) -> TsigChec
         key: key.clone(),
         previous_mac: tsig.mac.clone(),
         first_signed: false,
-        original_id: tsig.original_id,
     })
 }
 

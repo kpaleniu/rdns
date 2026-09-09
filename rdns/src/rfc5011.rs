@@ -15,16 +15,18 @@
 
 use crate::error::{DnssecError, DnssecResult};
 use crate::Class;
-use crate::Ttl;
 use std::path::Path;
 
 use crate::dnssec::{ds_digest, Dnskey, Ds, Rrset};
 use crate::utils::record_types as rt;
 use crate::utils::{base64_encode, hex_decode, hex_encode};
-use crate::{Name, NameRef, ParsedRecord, RecordData, ResourceRecord};
+use crate::{NameRef, RecordData, ResourceRecord};
+// `key_record` alone: it builds the DNSKEY records the tests feed back in.
+#[cfg(test)]
+use crate::{Name, ParsedRecord, Ttl};
 
 /// The REVOKE bit (RFC 5011 §3), flags bit 8.
-pub const DNSKEY_FLAG_REVOKE: u16 = 0x0080;
+const DNSKEY_FLAG_REVOKE: u16 = 0x0080;
 
 /// How long a new key must be continuously present before it is trusted
 /// (RFC 5011 §2.4.1: 30 days).
@@ -33,7 +35,7 @@ pub const ADD_HOLD_DOWN: u64 = 30 * 86_400;
 /// How long a revoked key is remembered before it is forgotten (§2.4.2).
 /// Untrusted from the moment the revocation is seen; the wait is so a validator
 /// that was offline learns it was revoked rather than merely finding it gone.
-pub const REMOVE_HOLD_DOWN: u64 = 30 * 86_400;
+const REMOVE_HOLD_DOWN: u64 = 30 * 86_400;
 
 /// Digest algorithm for turning a tracked key back into a DS: SHA-256 (RFC 4509).
 const DS_DIGEST_SHA256: u8 = 2;
@@ -55,7 +57,7 @@ pub enum KeyState {
 
 impl KeyState {
     /// Whether a key in this state may be used to validate.
-    pub fn is_anchor(&self) -> bool {
+    fn is_anchor(&self) -> bool {
         matches!(self, KeyState::Valid | KeyState::Missing)
     }
 
@@ -91,7 +93,7 @@ pub struct TrackedKey {
 
 impl TrackedKey {
     /// Whether the hold-down that would make this key trusted has elapsed.
-    pub fn hold_down_elapsed(&self, now: u64) -> bool {
+    fn hold_down_elapsed(&self, now: u64) -> bool {
         now.saturating_sub(self.since) >= ADD_HOLD_DOWN
     }
 }
@@ -132,7 +134,7 @@ impl ManagedAnchors {
     }
 
     /// Start from a set of configured DS anchors, tracking nothing yet.
-    pub fn from_ds(anchors: &crate::dnssec_chain::TrustAnchors) -> Self {
+    fn from_ds(anchors: &crate::dnssec_chain::TrustAnchors) -> Self {
         ManagedAnchors {
             ds: anchors.all().to_vec(),
             keys: Vec::new(),
@@ -204,7 +206,7 @@ impl ManagedAnchors {
     ///
     /// RFC 5011 §5: with the last anchor gone, a new one is never bootstrapped
     /// from the zone's own data — it must be configured out of band.
-    pub fn has_anchor_for(&self, zone: NameRef<'_>) -> bool {
+    fn has_anchor_for(&self, zone: NameRef<'_>) -> bool {
         let zone = zone.to_presentation().to_ascii_lowercase();
         self.ds
             .iter()
@@ -490,14 +492,14 @@ impl ManagedAnchors {
 /// A narrowing of RFC 5011 §4's literal "track every key": a vanished key stays
 /// trusted, so tracking ZSKs accumulates a stale anchor per roll. SEP is only a
 /// hint (RFC 4034 §2.1.1), so a KSK without it needs `--trust-anchor`.
-pub fn is_candidate_anchor(key: &Dnskey) -> bool {
+fn is_candidate_anchor(key: &Dnskey) -> bool {
     key.is_zone_key() && key.is_sep()
 }
 
 /// Whether two DNSKEYs are the same key. Flags are not compared: revoking sets a
 /// flag bit and changes the key tag (RFC 5011 §2.1), so comparing whole records
 /// would read a revocation as the arrival of an unrelated key.
-pub fn same_key(a: &Dnskey, b: &Dnskey) -> bool {
+fn same_key(a: &Dnskey, b: &Dnskey) -> bool {
     a.algorithm == b.algorithm
         && a.protocol == b.protocol
         && a.public_key == b.public_key
@@ -676,7 +678,8 @@ fn absolute(name: &str) -> String {
 }
 
 /// A DNSKEY as a resource record.
-pub fn key_record(key: &Dnskey, ttl: Ttl) -> Option<ResourceRecord> {
+#[cfg(test)]
+fn key_record(key: &Dnskey, ttl: Ttl) -> Option<ResourceRecord> {
     let rdata = RecordData::from_parsed(&ParsedRecord::DNSKEY {
         flags: key.flags,
         protocol: key.protocol,

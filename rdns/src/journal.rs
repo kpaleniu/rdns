@@ -10,7 +10,7 @@
 //! A journal that will not read is not fatal — it costs some secondaries a full
 //! transfer, which RFC 1995 §4 permits at any time.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::error::ZoneError;
 use crate::ixfr::ZoneDelta;
@@ -40,7 +40,7 @@ impl Journal {
     ///
     /// Keyed on the folded origin, not the file the zone was loaded from, so the
     /// journal follows the zone rather than the path.
-    pub fn path_for(&self, zone: NameRef<'_>) -> PathBuf {
+    fn path_for(&self, zone: NameRef<'_>) -> PathBuf {
         self.dir.join(format!(
             "{}journal",
             zone.to_presentation().to_ascii_lowercase()
@@ -201,25 +201,6 @@ fn serial_of(soa: &ResourceRecord) -> Result<Serial, ZoneError> {
     soa.rdata
         .soa_serial()
         .ok_or_else(|| ZoneError::invalid("an SOA framing it does not parse"))
-}
-
-/// Every zone with a journal in this directory, for priming the log at startup.
-///
-/// Read from the directory rather than from the zone list, so a journal left by
-/// a removed zone is found and cleaned up instead of resurfacing if that zone is
-/// ever re-added.
-pub fn journalled_zones(dir: &Path) -> std::io::Result<Vec<String>> {
-    let mut zones = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("journal") {
-            continue;
-        }
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            zones.push(format!("{stem}."));
-        }
-    }
-    Ok(zones)
 }
 
 /// Whether a journal still describes this zone.

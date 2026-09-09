@@ -341,7 +341,7 @@ impl Zone {
     /// ancestors a second time and folds the name a second time to do it —
     /// twice per negative answer, which is the shape a random-subdomain flood
     /// sends.
-    pub fn query_with_kind(&self, name: NameRef<'_>, qtype: Qtype) -> (NameKind, Vec<&ZoneRecord>) {
+    fn query_with_kind(&self, name: NameRef<'_>, qtype: Qtype) -> (NameKind, Vec<&ZoneRecord>) {
         let located = self.locate(name);
         let records: Vec<&ZoneRecord> = located.of_type(qtype).collect();
         (located.kind, records)
@@ -372,7 +372,7 @@ impl Zone {
     ///
     /// `Option` because a `Zone` can be built record by record; one that came
     /// from a file has an SOA or it did not load.
-    pub fn apex_soa(&self) -> Option<&ZoneRecord> {
+    fn apex_soa(&self) -> Option<&ZoneRecord> {
         self.query(self.origin(), Qtype::of(rt::SOA))
             .first()
             .copied()
@@ -547,7 +547,7 @@ impl Zone {
     }
 
     /// [`Zone::dname_above`] for a name already folded.
-    pub fn dname_above_key(&self, key: NameRef<'_>) -> Option<&ZoneRecord> {
+    fn dname_above_key(&self, key: NameRef<'_>) -> Option<&ZoneRecord> {
         if !self.shortcuts.dnames {
             return None;
         }

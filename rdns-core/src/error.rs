@@ -215,6 +215,5 @@ impl From<std::array::TryFromSliceError> for WireError {
 /// `anyhow::Result` gave, without the erasure.
 pub type WireResult<T> = std::result::Result<T, WireError>;
 pub type RequestResult<T> = std::result::Result<T, RequestError>;
-pub type ZoneResult<T> = std::result::Result<T, ZoneError>;
 pub type DnssecResult<T> = std::result::Result<T, DnssecError>;
 pub type ConfigResult<T> = std::result::Result<T, ConfigError>;

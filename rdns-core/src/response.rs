@@ -389,7 +389,7 @@ pub enum ClientEdns {
 }
 
 impl ClientEdns {
-    pub fn is_present(self) -> bool {
+    fn is_present(self) -> bool {
         matches!(self, ClientEdns::Present { .. })
     }
 
