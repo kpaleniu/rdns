@@ -15,10 +15,12 @@
 !Cargo.lock
 !LICENSE
 
-# All five workspace members. `rdnsr` is not built into the image, but cargo
+# All seven workspace members. `rdnsr` is not built into the image, but cargo
 # parses every member's manifest to resolve the workspace and refuses one whose
 # `src/main.rs` is missing, so it has to be here.
 !rdns
+!rdns-core
+!rdns-transport
 !rdnsc
 !rdnsctl
 !rdnsd

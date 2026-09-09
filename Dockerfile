@@ -26,6 +26,8 @@ WORKDIR /src
 # missing, so it comes along.
 COPY Cargo.toml Cargo.lock ./
 COPY rdns rdns
+COPY rdns-core rdns-core
+COPY rdns-transport rdns-transport
 COPY rdnsc rdnsc
 COPY rdnsctl rdnsctl
 COPY rdnsd rdnsd
@@ -50,9 +52,9 @@ ARG RDNS_GIT_DESCRIBE=""
 ENV RDNS_GIT_DESCRIBE=$RDNS_GIT_DESCRIBE
 
 # Cache mounts rather than the usual "copy the manifests, build dummy crates,
-# copy the real sources" dance: with five crates in the workspace that dance is
-# five stub `main.rs`es to keep in step with five manifests, and it goes stale
-# silently. BuildKit's cache does the same job with nothing to maintain.
+# copy the real sources" dance: with seven crates in the workspace that dance is
+# a stub crate root per member to keep in step with seven manifests, and it goes
+# stale silently. BuildKit's cache does the same job with nothing to maintain.
 #
 # The binaries have to be copied out inside this same `RUN`, because a cache
 # mount is not part of the resulting layer — `/src/target` does not exist any
