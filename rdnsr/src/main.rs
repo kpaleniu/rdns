@@ -1174,8 +1174,8 @@ fn edns_error(request: &DnsMessage, rcode: ResponseCode, client_max: usize) -> O
 /// does not do EDNS.
 fn unsupported_opcode(msg: &DnsMessage) -> Option<Vec<u8>> {
     let mut resp = build_response(msg, Vec::new(), ResponseCode::NotImplemented);
-    if msg.has_edns() {
-        resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE));
+    if let Some(edns) = ClientEdns::of(msg).mirror(RDNSR_PAYLOAD_SIZE) {
+        resp.set_edns(edns);
     }
     resp.to_bytes_within(RDNSR_PAYLOAD_SIZE as usize).ok()
 }
@@ -1330,6 +1330,30 @@ mod tests {
         assert!(parsed.answers.is_empty(), "carrying no records");
         assert_eq!(parsed.id, 0x4242, "the client can still match it");
         assert_eq!(parsed.queries.len(), 1, "with its question echoed");
+    }
+
+    /// NOTIMP is built away from `finish`, so it mirrors the OPT by hand and
+    /// used to drop DO with it (RFC 6891 §6.1.1, RFC 3225 §3; `CLAUDE.md` §7).
+    #[test]
+    fn an_unimplemented_opcode_keeps_the_clients_do_bit() {
+        let mut request = rdns::DnsMessageBuilder::new()
+            .with_id(0x1234)
+            .with_query(nm("example.com."), Qtype::of(rdns::utils::record_types::A))
+            .build();
+        request.opcode = OpCode::Status;
+        let mut edns = rdns::Edns::with_payload_size(1232);
+        edns.do_bit = true;
+        request.set_edns(edns);
+
+        let bytes = unsupported_opcode(&request).expect("a NOTIMP reply");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
+        assert_eq!(reply.rcode, ResponseCode::NotImplemented);
+        assert!(
+            reply
+                .edns()
+                .expect("an OPT, since the query had one")
+                .do_bit
+        );
     }
 
     /// Whose queries these are, where the test does not care.

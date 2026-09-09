@@ -389,6 +389,23 @@ pub enum ClientEdns {
 }
 
 impl ClientEdns {
+    /// The client's EDNS as far as a *reply* needs it. Total: it has no refusal
+    /// to report.
+    ///
+    /// [`client_edns`] is the answering path's version, and refuses a malformed
+    /// option list with the RCODE that refuses it. A reply that has already
+    /// chosen its RCODE — a refusal, a TC=1, a NOTIMP — has nothing left to
+    /// refuse, still owes the OPT (RFC 6891 §6.1.1), and cannot read DO out of
+    /// a list that did not parse, so that case mirrors DO clear.
+    ///
+    /// Every such reply goes through here rather than through `has_edns()` and
+    /// a fresh `Edns`: three sites did that and all three dropped the client's
+    /// DO bit, which RFC 3225 §3 says "MUST be copied in the response"
+    /// (`CLAUDE.md` §7).
+    pub fn of(request: &DnsMessage) -> ClientEdns {
+        client_edns(request).unwrap_or(ClientEdns::Present { do_bit: false })
+    }
+
     fn is_present(self) -> bool {
         matches!(self, ClientEdns::Present { .. })
     }

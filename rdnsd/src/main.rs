@@ -38,6 +38,7 @@ use rdns::{
     metrics::DnsMetrics,
     metrics_server, notify,
     readiness::Readiness,
+    response::ClientEdns,
     secondary::{state_file_path, MasterSpec, StateFile},
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
     shutdown::{Busy, Lifecycle, Shutdown, Stop},
@@ -47,7 +48,7 @@ use rdns::{
     utils::{bind_addr_for, current_unix_timestamp, recv_error_is_transient, UDP_RECEIVE_BUFFER},
     validation::{AdmissionCheck, Request},
     zone::{parse_zone_file_at, Zone},
-    DnsMessage, Edns, OpCode, Qtype, ResourceRecord, ResponseCode, Serial,
+    DnsMessage, OpCode, Qtype, ResourceRecord, ResponseCode, Serial,
 };
 use rdns::{Name, NameRef};
 use rdns_transport::tcp::{self, send_framed, Reply};
@@ -1347,8 +1348,8 @@ impl Server {
     ) -> Option<Vec<u8>> {
         let mut resp = DnsMessage::reply_to(msg);
         resp.rcode = rcode;
-        if msg.has_edns() {
-            resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+        if let Some(edns) = ClientEdns::of(msg).mirror(RDNSD_PAYLOAD_SIZE) {
+            resp.set_edns(edns);
         }
         resp.to_bytes_within(max_len).ok()
     }
@@ -1428,8 +1429,8 @@ fn apply_update_to_file(
 fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
     let mut resp = DnsMessage::reply_to(request);
     resp.truncation = true;
-    if request.has_edns() {
-        resp.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+    if let Some(edns) = ClientEdns::of(request).mirror(RDNSD_PAYLOAD_SIZE) {
+        resp.set_edns(edns);
     }
     resp.to_bytes_within(request.udp_payload_size() as usize)
         .ok()
@@ -2620,6 +2621,32 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::sync::Notify;
+
+    /// Every reply built away from `answer.rs` mirrors the client's OPT the
+    /// same way that file does — RFC 6891 §6.1.1 for the record, RFC 3225 §3
+    /// for the DO bit inside it.
+    ///
+    /// `truncated_reply` and `error_bytes` each set an OPT of their own with DO
+    /// clear, so a validating client asking over UDP and getting TC=1 read the
+    /// answer as coming from a server that had dropped DNSSEC (`CLAUDE.md` §7).
+    #[test]
+    fn a_reply_built_outside_the_answer_path_mirrors_the_clients_opt() {
+        let asked = query("www.example.com.", Qtype::of(record_types::A), true);
+        let bytes = truncated_reply(&asked).expect("a truncated reply");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
+        assert!(reply.truncation, "TC=1");
+        assert!(
+            reply
+                .edns()
+                .expect("an OPT, since the query had one")
+                .do_bit
+        );
+
+        let plain = query("www.example.com.", Qtype::of(record_types::A), false);
+        let bytes = truncated_reply(&plain).expect("a truncated reply");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
+        assert!(!reply.edns().expect("an OPT").do_bit, "and only when asked");
+    }
 
     /// `Server::answer` collected, for tests wanting the whole reply in hand.
     /// It sends rather than returns so a transfer need not exist all at once;
