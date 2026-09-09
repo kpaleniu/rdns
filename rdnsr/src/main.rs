@@ -963,7 +963,7 @@ async fn handle_query(
     if !checking_disabled {
         if let Some(wildcard) = caches
             .denials
-            .synthesize_wildcard(&query.qname.as_ref().to_presentation(), query.qtype)
+            .synthesize_wildcard(query.qname.as_ref(), query.qtype)
         {
             let mut resp = build_response(&msg, wildcard.answers, ResponseCode::Ok);
             resp.authorities = wildcard.authority;
@@ -975,10 +975,7 @@ async fn handle_query(
     }
 
     if !checking_disabled {
-        if let Some(denial) = caches
-            .denials
-            .synthesize(&query.qname.as_ref().to_presentation(), query.qtype)
-        {
+        if let Some(denial) = caches.denials.synthesize(query.qname.as_ref(), query.qtype) {
             ctx.metrics.count(&ctx.metrics.cache_hits);
             let mut resp = build_response(&msg, Vec::new(), denial.rcode);
             resp.authorities = denial.authority;

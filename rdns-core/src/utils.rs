@@ -452,25 +452,17 @@ impl<'a> DoubleEndedIterator for Labels<'a> {
     }
 }
 
-/// How many labels a name has, the root (`.`) being zero. `example.com.` is 2,
-/// and so is `a\.b.com.` — one label holding a dot, one holding `com`.
-///
-/// Neither case folding nor the trailing dot changes the answer, so this does
-/// neither and allocates nothing.
-pub fn label_count(name: &str) -> usize {
-    let trimmed = without_root(name);
-    if trimmed.is_empty() {
-        0
-    } else {
-        1 + separators(trimmed).count()
-    }
-}
-
 /// The parent of an absolute name: its first label removed. `None` at the root,
 /// which terminates every walk up the tree.
 ///
 /// A *relative* name loses its last label instead of terminating, so callers
 /// pass a key form: absolute, and folded if the map they walk is.
+///
+/// The last of the presentation-text name helpers, and it has one caller:
+/// `rdns::negative_cache` walks the ancestors of its own text keys
+/// (`TODO.md` #38a). Ask a tree question about a *name* with
+/// [`crate::NameRef`]'s `parent`, `ancestors` or `is_at_or_under` — the wire
+/// form is what a label is, so there is nothing to get wrong about escapes.
 pub fn parent_name(name: &str) -> Option<&str> {
     if name == "." {
         return None;
@@ -478,51 +470,6 @@ pub fn parent_name(name: &str) -> Option<&str> {
     let cut = separators(name).next()?;
     let rest = &name[cut + 1..];
     Some(if rest.is_empty() { "." } else { rest })
-}
-
-/// The last `labels` labels of an absolute name, as a slice of it.
-///
-/// A suffix of whole labels *is* a slice, so walking up the tree costs nothing.
-///
-/// `name` must be absolute, and folded if it is compared against folded keys:
-/// slicing can fix neither. Zero labels is the root; asking for more labels than
-/// the name has yields the whole name.
-pub fn suffix_labels(name: &str, labels: usize) -> &str {
-    if labels == 0 {
-        return ".";
-    }
-    let trimmed = without_root(name);
-    if trimmed.is_empty() {
-        return ".";
-    }
-    let start = separators(trimmed)
-        .rev()
-        .nth(labels - 1)
-        .map_or(0, |dot| dot + 1);
-    &name[start..]
-}
-
-/// Whether `name` is `origin` or sits below it — "is this name in that zone".
-///
-/// A suffix match is not enough: `notexample.com.` ends with `example.com.` and
-/// is a different name, so the boundary must land on a label separator — and on
-/// a real one, or `x.a\.b.com.` would read as sitting under `b.com.`. The
-/// trailing dot is optional on either side; an empty origin is the root.
-///
-/// Compares bytes, ASCII case-insensitively (RFC 4343), so neither side has to
-/// be folded first and no slice can land inside a multi-byte character. Both
-/// sides must be presentation text, escaped the way [`crate::Name`] escapes it.
-pub fn is_at_or_under(name: &str, origin: &str) -> bool {
-    let name = without_root(name).as_bytes();
-    let origin = without_root(origin).as_bytes();
-    if origin.is_empty() {
-        return true;
-    }
-    let Some(prefix) = name.len().checked_sub(origin.len()) else {
-        return false;
-    };
-    name[prefix..].eq_ignore_ascii_case(origin)
-        && (prefix == 0 || (name[prefix - 1] == b'.' && separates_labels(name, prefix - 1)))
 }
 
 /// The current Unix timestamp in seconds, or 0 if the clock is before the epoch.
@@ -897,52 +844,19 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn label_count_ignores_case_and_the_trailing_dot() {
-        assert_eq!(label_count("."), 0);
-        assert_eq!(label_count(""), 0);
-        assert_eq!(label_count("com."), 1);
-        assert_eq!(label_count("example.com"), 2);
-        assert_eq!(label_count("www.example.com."), 3);
-        assert_eq!(label_count("WWW.Example.COM."), 3);
-
-        // RFC 1035 §5.1: the dot inside the first label is not a separator, and
-        // `a\\` is a label ending in a backslash followed by one that is.
-        assert_eq!(label_count(r"a\.b.com."), 2);
-        assert_eq!(label_count(r"a\\.com."), 2);
-        // A relative name whose last label ends in an escaped dot: one label,
-        // and no root separator to strip.
-        assert_eq!(label_count(r"foo\."), 1);
-        assert_eq!(label_count(r"foo\.."), 1);
-    }
-
-    /// A suffix of whole labels is a slice, so this must be a *slice* of the
-    /// input and not merely equal to one.
+    /// The one text walk left: [`crate::negative_cache`]'s ancestors. The rule
+    /// it must not get wrong is RFC 1035 §5.1's escape — `a\.b.com.` is two
+    /// labels, so the parent of `x.a\.b.com.` steps over the whole first one.
     ///
-    /// That it agrees with the owning spelling is `dnssec`'s test to make, since
-    /// that spelling lives in the other crate now (`TODO.md` #31).
+    /// Its wire-form counterparts are tested in `name.rs`; what those cannot get
+    /// wrong is exactly this, because a wire label is what its length octet
+    /// says.
     #[test]
-    fn a_suffix_of_whole_labels_is_a_slice_of_the_name() {
-        let name = "www.example.com.";
-        assert_eq!(suffix_labels(name, 0), ".");
-        assert_eq!(suffix_labels(name, 1), "com.");
-        assert_eq!(suffix_labels(name, 2), "example.com.");
-        assert_eq!(suffix_labels(name, 3), name);
-        // More labels than the name has: the whole name.
-        assert_eq!(suffix_labels(name, 9), name);
-        assert_eq!(suffix_labels(".", 3), ".");
-
-        // Borrowed, not built: the two agree on the answer and this one does not
-        // allocate to give it.
-        let inside = suffix_labels(name, 2);
-        assert!(std::ptr::eq(inside.as_ptr(), name[4..].as_ptr()));
-
-        // An escaped dot is inside a label, so the walk steps over it whole.
-        let escaped = r"x.a\.b.com.";
-        assert_eq!(suffix_labels(escaped, 1), "com.");
-        assert_eq!(suffix_labels(escaped, 2), r"a\.b.com.");
-        assert_eq!(suffix_labels(escaped, 3), escaped);
-        assert_eq!(parent_name(escaped), Some(r"a\.b.com."));
+    fn a_parent_is_the_name_with_its_first_whole_label_removed() {
+        assert_eq!(parent_name("www.example.com."), Some("example.com."));
+        assert_eq!(parent_name("com."), Some("."));
+        assert_eq!(parent_name("."), None);
+        assert_eq!(parent_name(r"x.a\.b.com."), Some(r"a\.b.com."));
         assert_eq!(parent_name(r"a\.b.com."), Some("com."));
     }
 
@@ -1415,36 +1329,6 @@ mod tests {
             "k",
             "which is what to_lowercase does"
         );
-    }
-
-    /// `notexample.com.` is the case worth naming: it ends with `example.com.`
-    /// and belongs to somebody else, so a suffix match answers authoritatively
-    /// for a zone we do not hold.
-    #[test]
-    fn a_name_is_under_a_zone_only_at_a_label_boundary() {
-        assert!(is_at_or_under("www.example.com.", "example.com."));
-        assert!(is_at_or_under("example.com.", "example.com."), "the apex");
-        assert!(!is_at_or_under("notexample.com.", "example.com."));
-        assert!(!is_at_or_under("example.com.", "www.example.com."), "above");
-        assert!(!is_at_or_under("example.org.", "example.com."));
-
-        // The trailing dot is optional on either side.
-        assert!(is_at_or_under("www.example.com", "example.com."));
-        assert!(is_at_or_under("www.example.com.", "example.com"));
-
-        // The root contains everything, itself included.
-        assert!(is_at_or_under("www.example.com.", "."));
-        assert!(is_at_or_under(".", "."));
-
-        // ASCII case folds; U+212A KELVIN SIGN does not become `k`.
-        assert!(is_at_or_under("WWW.Example.COM.", "example.com."));
-        assert!(!is_at_or_under("\u{212A}.example.com.", "k.example.com."));
-
-        // The boundary has to be a real separator. `a\.b.com.` is two labels,
-        // so nothing is under `b.com.` by way of the dot inside the first one.
-        assert!(!is_at_or_under(r"x.a\.b.com.", "b.com."));
-        assert!(is_at_or_under(r"x.a\.b.com.", r"a\.b.com."));
-        assert!(is_at_or_under(r"a\.b.com.", "com."));
     }
 
     #[test]

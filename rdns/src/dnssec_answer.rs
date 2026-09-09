@@ -690,7 +690,7 @@ deep.a.b IN TXT "down here"
             else {
                 panic!("{chain:?}: expected a wildcard expansion, got {proof:?}");
             };
-            assert_eq!(wildcard, "*.example.com.");
+            assert_eq!(wildcard, nm("*.example.com."));
 
             // Which wildcard it was is the validator's answer above; what this
             // module reports is only that the answer still owes a denial.
@@ -701,8 +701,8 @@ deep.a.b IN TXT "down here"
             let proof_records = absence_of(&zone, qname);
             assert!(!proof_records.is_empty(), "{chain:?}");
             let verdict = proves_wildcard_expansion(
-                qname,
-                &wildcard,
+                nm(qname).as_ref(),
+                wildcard.as_ref(),
                 &nsecs_in(&proof_records),
                 &nsec3s_in(&proof_records),
             );
@@ -723,8 +723,8 @@ deep.a.b IN TXT "down here"
                 &zone.name_kind(nm("www.example.com.").as_ref()),
             );
             let denial = proves_nodata(
-                "www.example.com.",
-                ORIGIN,
+                nm("www.example.com.").as_ref(),
+                nm(ORIGIN).as_ref(),
                 rt::MX,
                 &nsecs_in(&records),
                 &nsec3s_in(&records),
@@ -746,8 +746,8 @@ deep.a.b IN TXT "down here"
                 &zone.name_kind(nm("anything.example.com.").as_ref()),
             );
             let denial = proves_nodata(
-                "anything.example.com.",
-                ORIGIN,
+                nm("anything.example.com.").as_ref(),
+                nm(ORIGIN).as_ref(),
                 rt::MX,
                 &nsecs_in(&records),
                 &nsec3s_in(&records),
@@ -763,7 +763,12 @@ deep.a.b IN TXT "down here"
             // Two labels down, past the apex wildcard's reach, so NXDOMAIN.
             let qname = "gone.a.b.example.com.";
             let records = negative(&zone, qname, &zone.name_kind(nm(qname).as_ref()));
-            let denial = proves_nxdomain(qname, ORIGIN, &nsecs_in(&records), &nsec3s_in(&records));
+            let denial = proves_nxdomain(
+                nm(qname).as_ref(),
+                nm(ORIGIN).as_ref(),
+                &nsecs_in(&records),
+                &nsec3s_in(&records),
+            );
             assert!(matches!(denial, Denial::Proved), "{chain:?}: {denial:?}");
         }
     }
@@ -851,8 +856,8 @@ deep.a.b IN TXT "down here"
             crate::dnssec_denial::Nsec::from_record(&to_resource(record)).unwrap()
         };
         // Before everything: the wrap, where the last NSEC points at the apex.
-        assert!(covering("aaa.example.com.").covers("aaa.example.com."));
-        assert!(covering("nnn.example.com.").covers("nnn.example.com."));
-        assert!(covering("zzz.example.com.").covers("zzz.example.com."));
+        assert!(covering("aaa.example.com.").covers(nm("aaa.example.com.").as_ref()));
+        assert!(covering("nnn.example.com.").covers(nm("nnn.example.com.").as_ref()));
+        assert!(covering("zzz.example.com.").covers(nm("zzz.example.com.").as_ref()));
     }
 }

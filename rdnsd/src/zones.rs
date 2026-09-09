@@ -20,8 +20,6 @@ use rdns::dnssec_validation_mode::DnssecValidator;
 use rdns::ixfr::{plan_change, DeltaLog, PlannedDelta};
 use rdns::journal::Journal;
 use rdns::metrics::DnsMetrics;
-#[cfg(test)]
-use rdns::utils::label_count;
 use rdns::utils::{current_unix_timestamp, record_types};
 use rdns::zone::{parse_zone_file_at, Zone};
 use rdns::zone_signer::{
@@ -548,7 +546,7 @@ pub(crate) fn validate_zone_source(
 /// signatures included: the parent's DS points at their key, not ours.
 pub(crate) struct ZoneSigning {
     /// Keys by the zone they are published at, down-cased.
-    keys: HashMap<String, Vec<SigningKey>>,
+    keys: HashMap<Name, Vec<SigningKey>>,
     validity: u64,
     chain: DenialChain,
     /// Zones whose signing settings differ from the two above, by apex.
@@ -576,11 +574,9 @@ impl ZoneSigning {
                 dir.display()
             );
         }
-        let mut keys: HashMap<String, Vec<SigningKey>> = HashMap::new();
+        let mut keys: HashMap<Name, Vec<SigningKey>> = HashMap::new();
         for key in loaded {
-            keys.entry(key.owner().to_ascii_lowercase())
-                .or_default()
-                .push(key);
+            keys.entry(key.owner().to_owned()).or_default().push(key);
         }
         Ok(Some(ZoneSigning {
             keys,
@@ -671,14 +667,14 @@ impl ZoneSigning {
     /// signed" are different claims, and a key directory missing a key is what a
     /// dry run is for.
     ///
-    /// `self.keys` is keyed by `dnssec::canonical_name` — down-cased text — and
-    /// a [`ZoneMap`] key is the *folded* wire form, so spelling one out is
-    /// already canonical and no fold is needed per zone.
+    /// `self.keys` is keyed by the key's owner as a [`Name`], whose `Hash` and
+    /// `Eq` fold ASCII case (RFC 4343), so a zone spelled with a capital finds
+    /// its keys and nothing is down-cased per zone.
     pub(crate) fn signed_zone_count(&self, zones: &ZoneMap) -> usize {
         zones
             .keys()
             .filter_map(|origin| NameRef::from_wire_slice(origin).ok())
-            .filter(|origin| self.keys.contains_key(&origin.to_presentation()))
+            .filter(|origin| self.keys.contains_key(&origin.to_owned()))
             .count()
     }
 
@@ -703,10 +699,10 @@ impl ZoneSigning {
     ///
     /// A zone with no key is returned unchanged, exactly as `apply` skips it.
     pub(crate) fn sign_one_incrementally(&self, previous: &Zone, zone: &Zone) -> Result<Zone> {
-        let origin = zone.origin().to_string();
-        let Some(keys) = self.keys.get(&origin.to_ascii_lowercase()) else {
+        let Some(keys) = self.keys.get(&zone.origin().to_owned()) else {
             return Ok(zone.clone());
         };
+        let origin = zone.origin().to_string();
         let policy = self.policy_for(&origin, current_unix_timestamp());
         sign_zone_incrementally(previous, zone, keys, &policy)
             .with_context(|| format!("re-signing {origin} after an update"))
@@ -719,10 +715,10 @@ impl ZoneSigning {
             let Ok(origin) = NameRef::from_wire_slice(key) else {
                 continue;
             };
-            let origin = origin.to_presentation();
-            let Some(keys) = self.keys.get(&origin) else {
+            let Some(keys) = self.keys.get(&origin.to_owned()) else {
                 continue;
             };
+            let origin = origin.to_presentation();
             let policy = self.policy_for(&origin, signed_at);
             *zone = Arc::new(
                 sign_zone(zone, keys, &policy).with_context(|| format!("signing {origin}"))?,
@@ -807,12 +803,7 @@ pub(crate) fn signed_rrsets(zone: &Zone) -> Vec<(Name, Rtype)> {
                 rdata: r.rdata.clone(),
             })
         })
-        // `Rrsig::owner` is canonical text; the caller wants a name.
-        .filter_map(|sig| {
-            Name::from_presentation(&sig.owner)
-                .ok()
-                .map(|n| (n, sig.type_covered))
-        })
+        .map(|sig| (sig.owner, sig.type_covered))
         .collect();
     // Sorted by the folded octets: `Name` has no `Ord`, because DNS's own
     // ordering is RFC 4034 §6.1's and not the octets' — and this only wants a
@@ -1141,7 +1132,7 @@ mod tests {
             deep < short * 10,
             "a {}-label name cost {deep:?} against {short:?} for a 3-label one: \
              the cost is growing with a length the client chooses",
-            label_count(&long)
+            nm(&long).as_ref().label_count()
         );
     }
 

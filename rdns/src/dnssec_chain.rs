@@ -17,15 +17,13 @@
 //! not, and must not be.
 
 use crate::dnssec::{
-    algorithm_supported, canonical_name, canonical_name_of, digest_type_supported, verify_rrset,
-    Dnskey, Ds, Rrset, RrsetProof, Rrsig,
+    algorithm_supported, digest_type_supported, verify_rrset, Dnskey, Ds, Rrset, RrsetProof, Rrsig,
 };
 use crate::dnssec_denial::{
     proves_no_ds, proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
 };
 use crate::error::DnssecError;
 use crate::utils::hex_decode;
-use crate::utils::label_count;
 use crate::utils::record_types as rt;
 use crate::Class;
 use crate::Rtype;
@@ -153,7 +151,6 @@ impl TrustAnchors {
 
     /// The anchors published exactly at `zone`.
     fn for_zone(&self, zone: NameRef<'_>) -> Vec<Ds> {
-        let zone = canonical_name_of(zone);
         self.anchors
             .iter()
             .filter(|ds| ds.owner == zone)
@@ -163,12 +160,11 @@ impl TrustAnchors {
 
     /// The deepest anchored zone at or above `name` — where a chain walk starts.
     /// `None` is [`ValidationState::Indeterminate`].
-    fn deepest_enclosing(&self, name: NameRef<'_>) -> Option<String> {
-        let name = canonical_name_of(name);
+    fn deepest_enclosing(&self, name: NameRef<'_>) -> Option<Name> {
         self.anchors
             .iter()
-            .filter(|ds| is_at_or_below(&name, &ds.owner))
-            .max_by_key(|ds| label_count(&ds.owner))
+            .filter(|ds| name.is_at_or_under(ds.owner.as_ref()))
+            .max_by_key(|ds| ds.owner.as_ref().label_count())
             .map(|ds| ds.owner.clone())
     }
 }
@@ -182,7 +178,10 @@ fn parse_ds_line(line: &str) -> Result<Ds, DnssecError> {
             tokens.len(),
         )));
     }
-    let owner = canonical_name(tokens.remove(0));
+    let owner = Name::from_presentation(tokens.remove(0))
+        .map_err(|e| DnssecError::parse(format!("owner name: {e}")))?
+        .as_ref()
+        .to_folded();
     // A TTL and a class may sit between owner and type, in either order and
     // either optional — the same latitude a zone file gives.
     let mut skipped = 0;
@@ -225,13 +224,6 @@ fn parse_ds_line(line: &str) -> Result<Ds, DnssecError> {
         digest_type,
         digest,
     })
-}
-
-/// Whether `name` is at or below `ancestor`.
-fn is_at_or_below(name: &str, ancestor: &str) -> bool {
-    let name = canonical_name(name);
-    let ancestor = canonical_name(ancestor);
-    ancestor == "." || name == ancestor || name.ends_with(&format!(".{ancestor}"))
 }
 
 /// Everything a referral said about whether the child zone is signed.
@@ -291,7 +283,7 @@ pub enum DelegationVerdict {
 }
 
 /// The keys established for each zone so far, keyed by canonical zone name.
-pub type KeyStore = HashMap<String, Vec<Dnskey>>;
+pub type KeyStore = HashMap<Name, Vec<Dnskey>>;
 
 /// An RRset that turned out to have been synthesized from a wildcard.
 ///
@@ -300,12 +292,12 @@ pub type KeyStore = HashMap<String, Vec<Dnskey>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WildcardExpansion {
     /// The name the records were served at.
-    pub owner: String,
+    pub owner: Name,
     /// The wildcard they were really signed at — `*.example.com.`.
-    pub wildcard: String,
+    pub wildcard: Name,
     /// The zone that signed them, and therefore the only zone whose denial of
     /// `owner` counts.
-    pub signer: String,
+    pub signer: Name,
 }
 
 /// What validating a set of records established.
@@ -340,10 +332,7 @@ impl<'a> ChainValidator<'a> {
 
     /// Where a walk for `name` starts, and with what DS records.
     pub fn start(&self, name: NameRef<'_>) -> Option<(Name, Vec<Ds>)> {
-        // The anchors file is text — an owner name as an operator wrote it —
-        // so the boundary between it and a record's name is here.
         let zone = self.anchors.deepest_enclosing(name)?;
-        let zone = Name::from_presentation(&zone).ok()?;
         let ds = self.anchors.for_zone(zone.as_ref());
         Some((zone, ds))
     }
@@ -360,14 +349,12 @@ impl<'a> ChainValidator<'a> {
         records: &[ResourceRecord],
         ds_set: &[Ds],
     ) -> Result<Vec<Dnskey>, ValidationState> {
-        // Canonical, not merely presentation: `Dnskey::from_record` stores a
-        // down-cased owner (RFC 4034 §6.2) and a 0x20-randomized query brings
-        // the reply back in mixed case (RFC 4343).
-        let canonical = canonical_name_of(zone);
+        // `Name`'s equality folds ASCII case (RFC 4343), which is what a
+        // 0x20-randomized query needs: the reply comes back in mixed case.
         let keys: Vec<Dnskey> = records
             .iter()
             .filter_map(Dnskey::from_record)
-            .filter(|k| k.owner == canonical)
+            .filter(|k| k.owner.as_ref() == zone)
             .collect();
         if keys.is_empty() {
             return Err(ValidationState::Bogus(format!(
@@ -440,11 +427,9 @@ impl<'a> ChainValidator<'a> {
         if evidence.ds.is_empty() {
             // No DS: the parent must *prove* it, or deleting the DS from a
             // referral downgrades a signed zone to an unsigned one.
-            if let Denial::NotProved(why) = proves_no_ds(
-                &canonical_name_of(evidence.zone.as_ref()),
-                &evidence.nsecs,
-                &evidence.nsec3s,
-            ) {
+            if let Denial::NotProved(why) =
+                proves_no_ds(evidence.zone.as_ref(), &evidence.nsecs, &evidence.nsec3s)
+            {
                 return DelegationVerdict::Bogus(format!(
                     "{} has no DS and its parent did not prove it: {why}",
                     evidence.zone
@@ -509,9 +494,6 @@ impl<'a> ChainValidator<'a> {
         // A proof nobody signed proves nothing.
         let mut checked_any = false;
         for (owner, rtype, rdatas) in denial_rrsets(evidence) {
-            let Ok(owner) = Name::from_presentation(&owner) else {
-                continue;
-            };
             match verify_rrset(
                 &Rrset::new(owner.as_ref(), rtype, evidence.class, &rdatas),
                 &evidence.rrsigs,
@@ -569,7 +551,7 @@ impl<'a> ChainValidator<'a> {
                 )));
             };
             // A zone may only sign at or below itself.
-            if !is_at_or_below(&owner, &signer) {
+            if !owner.as_ref().is_at_or_under(signer.as_ref()) {
                 return RecordsVerdict::state(ValidationState::Bogus(format!(
                     "{owner} is signed by {signer}, which is not above it"
                 )));
@@ -580,17 +562,11 @@ impl<'a> ChainValidator<'a> {
                 )));
             };
 
-            let Ok(owner_name) = Name::from_presentation(&owner) else {
-                continue;
-            };
-            let Ok(signer_name) = Name::from_presentation(&signer) else {
-                continue;
-            };
             match verify_rrset(
-                &Rrset::new(owner_name.as_ref(), rtype, class, &rdatas),
+                &Rrset::new(owner.as_ref(), rtype, class, &rdatas),
                 &rrsigs,
                 zone_keys,
-                signer_name.as_ref(),
+                signer.as_ref(),
                 self.now,
             ) {
                 RrsetProof::Verified { wildcard, .. } => {
@@ -646,12 +622,14 @@ impl<'a> ChainValidator<'a> {
                     expansion.owner, expansion.wildcard, expansion.signer
                 ));
             };
-            let Ok(signer) = Name::from_presentation(&expansion.signer) else {
-                continue;
-            };
-            let (nsecs, nsec3s) = self.verified_denials(proofs, signer.as_ref(), zone_keys);
-            match proves_wildcard_expansion(&expansion.owner, &expansion.wildcard, &nsecs, &nsec3s)
-            {
+            let (nsecs, nsec3s) =
+                self.verified_denials(proofs, expansion.signer.as_ref(), zone_keys);
+            match proves_wildcard_expansion(
+                expansion.owner.as_ref(),
+                expansion.wildcard.as_ref(),
+                &nsecs,
+                &nsec3s,
+            ) {
                 WildcardVerdict::Proved => {}
                 // Not a proof, but not an accusation either: serve it without AD.
                 WildcardVerdict::Unjudgeable(_) => return ValidationState::Insecure,
@@ -714,13 +692,13 @@ impl<'a> ChainValidator<'a> {
 
 /// Split records into RRsets by (owner, type, class), skipping RRSIGs — a
 /// signature is not an RRset to validate, it is what validates one.
-fn group_rrsets(records: &[ResourceRecord]) -> Vec<(String, Rtype, Class, Vec<RecordData>)> {
-    let mut sets: Vec<(String, Rtype, Class, Vec<RecordData>)> = Vec::new();
+fn group_rrsets(records: &[ResourceRecord]) -> Vec<(Name, Rtype, Class, Vec<RecordData>)> {
+    let mut sets: Vec<(Name, Rtype, Class, Vec<RecordData>)> = Vec::new();
     for rr in records {
         if rr.rdata.rtype() == rt::RRSIG || rr.rdata.rtype() == crate::OPT_RECORD_TYPE {
             continue;
         }
-        let owner = canonical_name_of(rr.name.as_ref());
+        let owner = rr.name.as_ref().to_folded();
         match sets
             .iter_mut()
             .find(|(n, t, c, _)| *n == owner && *t == rr.rdata.rtype() && *c == rr.class)
@@ -734,18 +712,15 @@ fn group_rrsets(records: &[ResourceRecord]) -> Vec<(String, Rtype, Class, Vec<Re
 
 /// The NSEC/NSEC3 RRsets in a delegation's evidence, in the form
 /// [`verify_rrset`] wants.
-fn denial_rrsets(evidence: &DelegationEvidence) -> Vec<(String, Rtype, Vec<RecordData>)> {
-    let mut out: Vec<(String, Rtype, Vec<RecordData>)> = Vec::new();
+fn denial_rrsets(evidence: &DelegationEvidence) -> Vec<(Name, Rtype, Vec<RecordData>)> {
+    let mut out: Vec<(Name, Rtype, Vec<RecordData>)> = Vec::new();
     for nsec in &evidence.nsecs {
         let rdata = RecordData::from_parsed(&crate::ParsedRecord::NSEC {
-            next_domain_name: match Name::from_presentation(&nsec.next) {
-                Ok(next) => next,
-                Err(_) => continue,
-            },
+            next_domain_name: nsec.next.clone(),
             type_bitmap: nsec.type_bitmap.clone(),
         })
         .expect("an NSEC we parsed must re-encode");
-        push_rrset(&mut out, &nsec.owner, rt::NSEC, rdata);
+        push_rrset(&mut out, nsec.owner.as_ref(), rt::NSEC, rdata);
     }
     for nsec3 in &evidence.nsec3s {
         let rdata = RecordData::from_parsed(&crate::ParsedRecord::NSEC3 {
@@ -757,18 +732,18 @@ fn denial_rrsets(evidence: &DelegationEvidence) -> Vec<(String, Rtype, Vec<Recor
             type_bitmap: nsec3.type_bitmap.clone(),
         })
         .expect("an NSEC3 we parsed must re-encode");
-        push_rrset(&mut out, &nsec3.owner, rt::NSEC3, rdata);
+        push_rrset(&mut out, nsec3.owner.as_ref(), rt::NSEC3, rdata);
     }
     out
 }
 
 fn push_rrset(
-    out: &mut Vec<(String, Rtype, Vec<RecordData>)>,
-    owner: &str,
+    out: &mut Vec<(Name, Rtype, Vec<RecordData>)>,
+    owner: NameRef<'_>,
     rtype: Rtype,
     rdata: RecordData,
 ) {
-    let owner = canonical_name(owner);
+    let owner = owner.to_folded();
     match out.iter_mut().find(|(n, t, _)| *n == owner && *t == rtype) {
         Some((_, _, rdatas)) => rdatas.push(rdata),
         None => out.push((owner, rtype, vec![rdata])),
@@ -957,17 +932,13 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         )
         .unwrap();
         assert_eq!(
-            anchors
-                .deepest_enclosing(nm("www.example.test.").as_ref())
-                .as_deref(),
-            Some("example.test."),
+            anchors.deepest_enclosing(nm("www.example.test.").as_ref()),
+            Some(nm("example.test.")),
             "a closer anchor beats the root"
         );
         assert_eq!(
-            anchors
-                .deepest_enclosing(nm("other.com.").as_ref())
-                .as_deref(),
-            Some(".")
+            anchors.deepest_enclosing(nm("other.com.").as_ref()),
+            Some(nm("."))
         );
 
         // With no root anchor, a name outside the island has no start point.
@@ -1186,7 +1157,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let sig = zone.sign_records(std::slice::from_ref(&answer));
 
         let mut keys = KeyStore::new();
-        keys.insert("example.test.".into(), zone.dnskeys());
+        keys.insert(nm("example.test."), zone.dnskeys());
 
         let verdict = v.validate_records(&[answer, sig], &keys);
         assert_eq!(verdict.state, ValidationState::Secure);
@@ -1217,7 +1188,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let sig = evil.sign_records(std::slice::from_ref(&answer));
 
         let mut keys = KeyStore::new();
-        keys.insert("evil.test.".into(), evil.dnskeys());
+        keys.insert(nm("evil.test."), evil.dnskeys());
 
         let state = v.validate_records(&[answer, sig], &keys).state;
         assert!(state.is_bogus(), "{state:?}");
@@ -1230,7 +1201,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let v = ChainValidator::new(&anchors, current_unix_timestamp());
 
         let mut keys = KeyStore::new();
-        keys.insert("example.test.".into(), zone.dnskeys());
+        keys.insert(nm("example.test."), zone.dnskeys());
 
         // A record with no RRSIG beside it, in a zone we know is signed.
         let state = v
@@ -1251,7 +1222,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let smuggled = a_record("other.example.test.", [6, 6, 6, 6]);
 
         let mut keys = KeyStore::new();
-        keys.insert("example.test.".into(), zone.dnskeys());
+        keys.insert(nm("example.test."), zone.dnskeys());
 
         let state = v.validate_records(&[signed, sig, smuggled], &keys).state;
         assert!(state.is_bogus(), "{state:?}");
@@ -1268,7 +1239,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
 
         let mut keys = KeyStore::new();
-        keys.insert("example.test.".into(), zone.dnskeys());
+        keys.insert(nm("example.test."), zone.dnskeys());
 
         let verdict = v.validate_records(&[answer, sig], &keys);
         assert_eq!(
@@ -1281,9 +1252,9 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             1,
             "a verified signature is only half of a wildcard answer"
         );
-        assert_eq!(verdict.wildcards[0].owner, "a.example.test.");
-        assert_eq!(verdict.wildcards[0].wildcard, "*.example.test.");
-        assert_eq!(verdict.wildcards[0].signer, "example.test.");
+        assert_eq!(verdict.wildcards[0].owner, nm("a.example.test."));
+        assert_eq!(verdict.wildcards[0].wildcard, nm("*.example.test."));
+        assert_eq!(verdict.wildcards[0].signer, nm("example.test."));
     }
 
     /// With the signed NSEC the answer is secure; without it the same signature
@@ -1297,7 +1268,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let answer = a_record("a.example.test.", [192, 0, 2, 1]);
         let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
         let mut keys = KeyStore::new();
-        keys.insert("example.test.".into(), zone.dnskeys());
+        keys.insert(nm("example.test."), zone.dnskeys());
         let expansions = v.validate_records(&[answer, sig], &keys).wildcards;
 
         // The zone's own NSEC at the wildcard covers `a.example.test.`: `*`
@@ -1335,8 +1306,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let answer = a_record("a.example.test.", [192, 0, 2, 1]);
         let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
         let mut keys = KeyStore::new();
-        keys.insert("example.test.".into(), zone.dnskeys());
-        keys.insert("evil.test.".into(), stranger.dnskeys());
+        keys.insert(nm("example.test."), zone.dnskeys());
+        keys.insert(nm("evil.test."), stranger.dnskeys());
         let expansions = v.validate_records(&[answer, sig], &keys).wildcards;
 
         let nsec = nsec_record(
@@ -1363,7 +1334,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let answer = a_record("stolen.b.example.test.", [192, 0, 2, 6]);
         let sig = zone.sign_as_wildcard(std::slice::from_ref(&answer), "*.example.test.");
         let mut keys = KeyStore::new();
-        keys.insert("example.test.".into(), zone.dnskeys());
+        keys.insert(nm("example.test."), zone.dnskeys());
 
         let verdict = v.validate_records(&[answer, sig], &keys);
         assert_eq!(
@@ -1401,7 +1372,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         let at_wildcard = a_record("*.example.test.", [192, 0, 2, 1]);
         let sig = zone.sign_records(std::slice::from_ref(&at_wildcard));
         let mut keys = KeyStore::new();
-        keys.insert("example.test.".into(), zone.dnskeys());
+        keys.insert(nm("example.test."), zone.dnskeys());
 
         let verdict = v.validate_records(&[at_wildcard, sig], &keys);
         assert_eq!(verdict.state, ValidationState::Secure);

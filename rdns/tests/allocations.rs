@@ -952,8 +952,9 @@ fn building_the_metrics_registry() {
 /// three comparisons, so a validator paid twelve per candidate NSEC. The sort
 /// key keeps one allocation, which is the key it returns.
 fn ordering_two_names_canonically() {
-    let a = "a.z.example.com.";
-    let b = "B.example.COM.";
+    let a: rdns::Name = "a.z.example.com.".parse().expect("a name");
+    let b: rdns::Name = "B.example.COM.".parse().expect("a name");
+    let (a, b) = (a.as_ref(), b.as_ref());
     let _warm = (
         rdns::denial_wire::canonical_name_cmp(a, b),
         rdns::denial_wire::canonical_sort_key(a),
@@ -1148,17 +1149,22 @@ fn checking_a_signed_nxdomain() {
     // NSEC was 6 until `common_suffix` stopped rebuilding its answer with
     // `rmatch_indices` and took `utils::suffix_labels`'s slice instead
     // (`TODO.md` #37a). Two fewer `String`s, same proof.
+    //
+    // **Both are 1 since #38**, down from 4 and 2: `Nsec` and `Nsec3` hold
+    // their names as `Name`, so the covering test compares wire octets with
+    // nothing to fold or decode, the closest encloser is a borrowed suffix, and
+    // the one allocation left is the wildcard the proof has to name.
     for (what, zone, expected) in [
-        ("NSEC", signed_zone(), 4),
-        ("NSEC3", signed_zone_nsec3(), 2),
+        ("NSEC", signed_zone(), 1),
+        ("NSEC3", signed_zone_nsec3(), 1),
     ] {
         let (reply, _) = nxdomain_proof(&zone);
         let nsecs = rdns::dnssec_denial::nsecs_in(&reply.authorities);
         let nsec3s = rdns::dnssec_denial::nsec3s_in(&reply.authorities);
         // The first call in a process picks up a one-off; measure the second.
         let denial = rdns::dnssec_denial::proves_nxdomain(
-            "nope.example.com.",
-            "example.com.",
+            nm("nope.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
             &nsecs,
             &nsec3s,
         );
@@ -1166,10 +1172,14 @@ fn checking_a_signed_nxdomain() {
             matches!(denial, rdns::dnssec_denial::Denial::Proved),
             "the measurement is only meaningful if the proof stands: {denial:?}"
         );
+        // The names are made outside the closure: this measures the proof, not
+        // `Name::from_presentation`, and the caller has a `Name` in hand
+        // already — it came off the wire.
+        let (qname, zone_name) = (nm("nope.example.com."), nm("example.com."));
         let (_, count) = allocations(|| {
             rdns::dnssec_denial::proves_nxdomain(
-                "nope.example.com.",
-                "example.com.",
+                qname.as_ref(),
+                zone_name.as_ref(),
                 &nsecs,
                 &nsec3s,
             )
@@ -1220,8 +1230,9 @@ fn what_the_resolvers_caches_cost() {
     // The denial cache is consulted before either of the others, so its miss is
     // the first thing a flood of random names reaches.
     let denials = rdns::nsec_cache::NsecCache::new(16);
-    let _ = denials.synthesize("nothing.example.com.", qtype);
-    let (miss, count) = allocations(|| denials.synthesize("nothing.example.com.", qtype));
+    let absent = nm("nothing.example.com.");
+    let _ = denials.synthesize(absent.as_ref(), qtype);
+    let (miss, count) = allocations(|| denials.synthesize(absent.as_ref(), qtype));
     assert!(miss.is_none());
     within("miss in the denial cache", count, 0..=0);
 

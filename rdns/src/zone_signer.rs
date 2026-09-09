@@ -20,10 +20,8 @@
 //! shows up in the parent's NSEC bitmap as a type that is not there.
 
 use crate::denial_wire::{build_type_bitmap, canonical_sort_key};
-#[cfg(test)]
-use crate::dnssec::canonical_name;
-use crate::dnssec::{canonical_name_of, Dnskey, Rrset};
-use crate::dnssec_denial::{nsec3_hash, nsec3_owner_name, MAX_NSEC3_ITERATIONS};
+use crate::dnssec::{Dnskey, Rrset};
+use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, MAX_NSEC3_ITERATIONS};
 use crate::dnssec_key::SigningKey;
 use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
@@ -170,16 +168,22 @@ impl SigningPolicy {
     /// agree about it.
     ///
     /// Never later than [`Self::expiration`] — 30 days means at most 30.
-    fn expiry_for(&self, name: &str, rtype: Rtype) -> u32 {
+    fn expiry_for(&self, name: NameRef<'_>, rtype: Rtype) -> u32 {
         let spread = self.validity / EXPIRY_JITTER_FRACTION;
         if spread == 0 {
             return self.expiration;
         }
         // FNV-1a over owner and type: a cheap, stable spread. `DefaultHasher`
         // is randomized per process, which would destroy the determinism above.
+        //
+        // Over the *wire* octets since #38: a length octet is at most 63
+        // (RFC 1035 §2.3.4) so the fold below still cannot touch one, and the
+        // spread stays a function of (owner, type) alone. The numbers it picks
+        // differ from the presentation-text version's, so the first re-signing
+        // after that change moves every expiry once.
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in name
-            .as_bytes()
+            .as_wire()
             .iter()
             .copied()
             .chain(rtype.to_u16().to_be_bytes().iter().copied())
@@ -457,10 +461,9 @@ fn check_keys(keys: &[SigningKey], origin: NameRef<'_>) -> Result<()> {
         )));
     }
     for key in keys {
-        // Canonical on both sides: `SigningKey` down-cases its owner
-        // (RFC 4034 §6.2), so presentation text would refuse a zone whose
-        // origin was spelled with a capital.
-        if key.owner() != canonical_name_of(origin) {
+        // `Name` compares with ASCII case folded (RFC 4343), so a zone whose
+        // origin is spelled with a capital still matches its key.
+        if key.owner() != origin {
             return Err(DnssecError::signing(format!(
                 "the key with tag {} is published at {}, not at {origin} — a signature from it \
                  names the wrong signer and verifies against nothing",
@@ -650,26 +653,29 @@ impl NameEntry {
 }
 
 /// Every name in the zone, and what the signer has to know about each.
+///
+/// Keyed by [`canonical_sort_key`], so the map is already in the RFC 4034 §6.1
+/// order the chain needs and `chain_names` does not sort again. The name itself
+/// rides in the value: a `Name` has no `Ord`, on purpose — wire order is not
+/// canonical order, and a type that sorted would be an invitation to use the
+/// wrong one.
 struct Layout {
-    origin: String,
-    names: BTreeMap<String, NameEntry>,
+    origin: Name,
+    names: BTreeMap<Vec<u8>, (Name, NameEntry)>,
 }
 
 impl Layout {
     fn of(zone: &Zone, origin: NameRef<'_>) -> Self {
-        // Keyed on canonical *text*: the chain this feeds is ordered by
-        // RFC 4034 §6.1, which `canonical_sort_key` reads from text. That
-        // ordering is the crypto path, so it stays where it was.
-        let origin = origin.to_presentation();
-        let origin = origin.as_str();
-        let mut names: BTreeMap<String, NameEntry> = BTreeMap::new();
+        let mut names: BTreeMap<Vec<u8>, (Name, NameEntry)> = BTreeMap::new();
         for record in zone.records() {
-            let key = record.name.as_ref().to_presentation().to_ascii_lowercase();
-            let entry = names.entry(key).or_default();
-            entry.types.insert(record.rdata.rtype());
+            let key = canonical_sort_key(record.name.as_ref());
+            let entry = names
+                .entry(key)
+                .or_insert_with(|| (record.name.as_ref().to_folded(), NameEntry::default()));
+            entry.1.types.insert(record.rdata.rtype());
         }
-        for (name, entry) in names.iter_mut() {
-            entry.is_delegation = name != origin && entry.types.contains(&rt::NS);
+        for (name, entry) in names.values_mut() {
+            entry.is_delegation = name.as_ref() != origin && entry.types.contains(&rt::NS);
         }
 
         // The two ways a name can be in the file and not in the zone, which
@@ -687,17 +693,21 @@ impl Layout {
         // `check_dname_rules` refuses a zone file with anything below a DNAME,
         // so this covers a zone that arrived by transfer or was built by UPDATE
         // — which §5.2 has adding a DNAME over existing names on purpose.
-        let occluders: BTreeSet<String> = names
-            .iter()
+        let occluders: BTreeSet<Vec<u8>> = names
+            .values()
             .filter(|(_, e)| e.is_delegation || e.types.contains(&rt::DNAME))
-            .map(|(n, _)| n.clone())
+            .map(|(n, _)| canonical_sort_key(n.as_ref()))
             .collect();
-        for (name, entry) in names.iter_mut() {
-            entry.occluded = ancestors_of(name).any(|ancestor| occluders.contains(ancestor));
+        for (name, entry) in names.values_mut() {
+            entry.occluded = name
+                .as_ref()
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| occluders.contains(&canonical_sort_key(ancestor)));
         }
 
         Layout {
-            origin: origin.to_string(),
+            origin: origin.to_folded(),
             names,
         }
     }
@@ -710,64 +720,43 @@ impl Layout {
     /// so without a record there the only available proof would deny a name that
     /// exists. Under opt-out, neither insecure delegations nor the empty
     /// non-terminals that exist only to hold them.
-    fn chain_names(&self, opt_out: bool) -> Vec<String> {
-        let mut included: BTreeSet<String> = self
+    fn chain_names(&self, opt_out: bool) -> Vec<Name> {
+        let mut included: BTreeMap<Vec<u8>, Name> = self
             .names
             .iter()
-            .filter(|(_, e)| !e.occluded)
-            .filter(|(_, e)| !(opt_out && e.is_delegation && !e.is_secure_delegation()))
-            .map(|(n, _)| n.clone())
+            .filter(|(_, (_, e))| !e.occluded)
+            .filter(|(_, (_, e))| !(opt_out && e.is_delegation && !e.is_secure_delegation()))
+            .map(|(k, (n, _))| (k.clone(), n.clone()))
             .collect();
 
-        let mut empty_non_terminals = BTreeSet::new();
-        for name in &included {
-            for ancestor in ancestors_of(name) {
-                if !is_under(ancestor, &self.origin) {
+        let mut empty_non_terminals: BTreeMap<Vec<u8>, Name> = BTreeMap::new();
+        for name in included.values() {
+            // `skip(1)`: strict ancestors. The walk stops at the origin, which
+            // is in the chain already.
+            for ancestor in name.as_ref().ancestors().skip(1) {
+                if ancestor == self.origin.as_ref()
+                    || !ancestor.is_at_or_under(self.origin.as_ref())
+                {
                     break;
                 }
-                if !included.contains(ancestor) {
-                    empty_non_terminals.insert(ancestor.to_string());
+                let key = canonical_sort_key(ancestor);
+                if !included.contains_key(&key) {
+                    empty_non_terminals.insert(key, ancestor.to_owned());
                 }
             }
         }
         included.extend(empty_non_terminals);
 
-        let mut names: Vec<String> = included.into_iter().collect();
-        names.sort_by_key(|name| canonical_sort_key(name));
-        names
+        // Already in canonical order: that is what the map is keyed by.
+        included.into_values().collect()
     }
 
-    fn entry(&self, name: &str) -> NameEntry {
-        self.names.get(name).cloned().unwrap_or_default()
+    fn entry(&self, name: NameRef<'_>) -> NameEntry {
+        self.names
+            .get(&canonical_sort_key(name))
+            .map(|(_, e)| e.clone())
+            .unwrap_or_default()
     }
-}
-
-/// Every strict ancestor of `name`, nearest first. `a.b.example.com.` gives
-/// `b.example.com.`, `example.com.`, `com.`, `.`.
-///
-/// Slices of `name`, which is a zone name and so absolute: an ancestor is a
-/// suffix (`crate::utils::parent_name`). It built a `Vec<&str>`, a `join` and a
-/// `format!` per ancestor, and `Layout::of` runs it once per name in the zone
-/// and `chain_names` runs it again — at every load and every re-signing.
-fn ancestors_of(name: &str) -> impl Iterator<Item = &str> {
-    debug_assert!(
-        name.ends_with('.'),
-        "ancestors_of walks by suffix and was handed the relative name {name:?}"
-    );
-    let mut next = crate::utils::parent_name(name);
-    std::iter::from_fn(move || {
-        let current = next?;
-        next = crate::utils::parent_name(current);
-        Some(current)
-    })
-}
-
-/// Whether `name` is strictly below `origin`.
-///
-/// The containment test is [`crate::utils::is_at_or_under`], which makes the
-/// trailing dot optional on either side and allocates nothing.
-fn is_under(name: &str, origin: &str) -> bool {
-    name != origin && crate::utils::is_at_or_under(name, origin)
 }
 
 // The denial chains
@@ -778,22 +767,18 @@ fn build_nsec_chain(layout: &Layout, ttl: Ttl, signed: &mut Zone) -> Result<()> 
         // The last name points back at the apex, closing the loop, so the chain
         // can deny a name sorting after everything in it (RFC 4034 §4.1.1).
         let next = &names[(index + 1) % names.len()];
-        let mut types = layout.entry(name).published_types();
+        let mut types = layout.entry(name.as_ref()).published_types();
         // Every NSEC lists itself and its own signature (RFC 4035 §2.3).
         types.insert(rt::RRSIG);
         types.insert(rt::NSEC);
 
         let rdata = RecordData::from_parsed(&ParsedRecord::NSEC {
-            next_domain_name: Name::from_presentation(next)
-                .map_err(|e| DnssecError::key(format!("an NSEC next name: {e}")))?,
+            next_domain_name: next.clone(),
             type_bitmap: build_type_bitmap(&types.into_iter().collect::<Vec<_>>()),
         })
         .map_err(|e| DnssecError::key(format!("encoding an NSEC: {e}")))?;
-        let Ok(owner) = Name::from_presentation(name) else {
-            continue;
-        };
         signed.add_record(ZoneRecord {
-            name: owner,
+            name: name.clone(),
             ttl,
             class: Class::new(1),
             rdata,
@@ -810,13 +795,13 @@ fn build_nsec3_chain(
     ttl: Ttl,
     signed: &mut Zone,
 ) -> Result<()> {
-    let mut hashed: Vec<(Vec<u8>, String)> = Vec::new();
+    let mut hashed: Vec<(Vec<u8>, Name)> = Vec::new();
     for name in layout.chain_names(opt_out) {
-        let hash = nsec3_hash(&name, salt, iterations)
+        let hash = nsec3_hash_name(name.as_ref(), salt, iterations)
             .map_err(|e| DnssecError::key(format!("hashing {name} for the NSEC3 chain: {e}")))?;
-        hashed.push((hash, name));
+        hashed.push((hash.to_vec(), name));
     }
-    hashed.sort();
+    hashed.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Two names hashing alike leaves one undeniable and the other unprovable.
     // It takes a SHA-1 collision, but the check is one comparison.
@@ -829,7 +814,7 @@ fn build_nsec3_chain(
 
     for (index, (hash, name)) in hashed.iter().enumerate() {
         let next = &hashed[(index + 1) % hashed.len()].0;
-        let entry = layout.entry(name);
+        let entry = layout.entry(name.as_ref());
         let mut types = entry.published_types();
         // Unlike NSEC the record does not sit at the name it describes, so it
         // does not list itself, and RRSIG appears only if something at the
@@ -849,7 +834,7 @@ fn build_nsec3_chain(
         })
         .map_err(|e| DnssecError::key(format!("encoding an NSEC3: {e}")))?;
         signed.add_record(ZoneRecord {
-            name: Name::from_presentation(&nsec3_owner_name(hash, &layout.origin))
+            name: nsec3_owner_name_at(hash, layout.origin.as_ref())
                 .map_err(|e| DnssecError::key(format!("an NSEC3 owner name: {e}")))?,
             ttl,
             class: Class::new(1),
@@ -877,6 +862,11 @@ fn nsec3param_rdata(salt: &[u8], iterations: u16) -> RecordData {
 
 // The signatures
 
+/// One signing run's RRsets: keyed in canonical order (RFC 4034 §6.1), so the
+/// signatures come out in a deterministic order, with the owner carried in the
+/// value because a `Name` has no `Ord`.
+type Rrsets = BTreeMap<(Vec<u8>, Rtype), (Name, Ttl, Vec<RecordData>)>;
+
 fn sign_everything(
     layout: &Layout,
     keys: &[SigningKey],
@@ -894,19 +884,19 @@ fn sign_everything(
     let data_signers = if rest.is_empty() { &all } else { &rest };
 
     // (owner, type) -> the RDATA of that RRset, in the order they were added.
-    let mut rrsets: BTreeMap<(String, Rtype), (Ttl, Vec<RecordData>)> = BTreeMap::new();
+    let mut rrsets: Rrsets = BTreeMap::new();
     for record in signed.records() {
-        let name = record.name.as_ref().to_presentation().to_ascii_lowercase();
+        let key = canonical_sort_key(record.name.as_ref());
         let entry = rrsets
-            .entry((name, record.rdata.rtype()))
-            .or_insert((record.ttl, Vec::new()));
-        entry.1.push(record.rdata.clone());
+            .entry((key, record.rdata.rtype()))
+            .or_insert_with(|| (record.name.clone(), record.ttl, Vec::new()));
+        entry.2.push(record.rdata.clone());
     }
 
     let mut signatures = Vec::new();
-    for ((name, rtype), (ttl, rdatas)) in rrsets {
-        let entry = layout.entry(&name);
-        if !signable(&entry, &name, rtype, &layout.origin) {
+    for ((_, rtype), (name, ttl, rdatas)) in rrsets {
+        let entry = layout.entry(name.as_ref());
+        if !signable(&entry, name.as_ref(), rtype, layout.origin.as_ref()) {
             continue;
         }
         let signers = if rtype == rt::DNSKEY {
@@ -919,15 +909,12 @@ fn sign_everything(
         // not move, so it does not appear in the next IXFR delta.
         if let Some(previous) = previous {
             let tags: Vec<u16> = signers.iter().map(|k| k.key_tag()).collect();
-            let Ok(owner) = Name::from_presentation(&name) else {
-                continue;
-            };
             if let Some(carried) =
-                previous.reuse(owner.as_ref(), rtype, ttl, &rdatas, &tags, policy.signed_at)
+                previous.reuse(name.as_ref(), rtype, ttl, &rdatas, &tags, policy.signed_at)
             {
                 for signature in carried {
                     signatures.push(ZoneRecord {
-                        name: owner.clone(),
+                        name: name.clone(),
                         ttl,
                         class: Class::new(1),
                         rdata: signature.rdata.clone(),
@@ -938,14 +925,10 @@ fn sign_everything(
         }
 
         let original_ttl = ttl.as_secs();
-        // The signing loop's names are canonical text; a signature is computed
-        // over the encoded owner, so the name is made once here and reused.
-        let owner = Name::from_presentation(&name)
-            .map_err(|e| DnssecError::key(format!("the owner name {name}: {e}")))?;
-        let rrset = Rrset::new(owner.as_ref(), rtype, Class::new(1), &rdatas);
+        let rrset = Rrset::new(name.as_ref(), rtype, Class::new(1), &rdatas);
         // Spread back from the window's end so the zone degrades over a slope
         // rather than one cliff — see `SigningPolicy::expiry_for`.
-        let expiration = policy.expiry_for(&name, rtype);
+        let expiration = policy.expiry_for(name.as_ref(), rtype);
         for key in signers.iter() {
             let sig = key
                 .sign_rrset(&rrset, original_ttl, policy.inception, expiration)
@@ -953,7 +936,7 @@ fn sign_everything(
                     DnssecError::key(format!("signing the {rtype} RRset at {name}: {e}"))
                 })?;
             signatures.push(ZoneRecord {
-                name: owner.clone(),
+                name: name.clone(),
                 ttl,
                 class: Class::new(1),
                 rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
@@ -964,8 +947,7 @@ fn sign_everything(
                     inception: sig.inception,
                     expiration: sig.expiration,
                     key_tag: sig.key_tag,
-                    signer_name: Name::from_presentation(&sig.signer_name)
-                        .map_err(|e| DnssecError::key(format!("an RRSIG signer name: {e}")))?,
+                    signer_name: sig.signer_name,
                     signature: sig.signature,
                 })
                 .map_err(|e| DnssecError::key(format!("encoding an RRSIG: {e}")))?,
@@ -980,7 +962,7 @@ fn sign_everything(
 }
 
 /// Whether this RRset is one the zone is authoritative for, and so must sign.
-fn signable(entry: &NameEntry, name: &str, rtype: Rtype, origin: &str) -> bool {
+fn signable(entry: &NameEntry, name: NameRef<'_>, rtype: Rtype, origin: NameRef<'_>) -> bool {
     if rtype == rt::RRSIG {
         // A validator checks an RRSIG against a key, never another RRSIG.
         return false;
@@ -1101,17 +1083,23 @@ a\.b    IN A   192.0.2.50
     #[test]
     fn the_spread_is_deterministic_for_a_given_name_and_type() {
         let policy = policy(DenialChain::Nsec);
-        let first = policy.expiry_for("www.example.com.", rt::A);
-        assert_eq!(first, policy.expiry_for("www.example.com.", rt::A));
-        assert_ne!(
-            first,
-            policy.expiry_for("www.example.com.", rt::AAAA),
-            "a different type at the same name sits elsewhere on the slope"
-        );
-        assert_ne!(first, policy.expiry_for("mail.example.com.", rt::A));
+        let first = policy.expiry_for(nm("www.example.com.").as_ref(), rt::A);
         assert_eq!(
             first,
-            policy.expiry_for("WWW.EXAMPLE.COM.", rt::A),
+            policy.expiry_for(nm("www.example.com.").as_ref(), rt::A)
+        );
+        assert_ne!(
+            first,
+            policy.expiry_for(nm("www.example.com.").as_ref(), rt::AAAA),
+            "a different type at the same name sits elsewhere on the slope"
+        );
+        assert_ne!(
+            first,
+            policy.expiry_for(nm("mail.example.com.").as_ref(), rt::A)
+        );
+        assert_eq!(
+            first,
+            policy.expiry_for(nm("WWW.EXAMPLE.COM.").as_ref(), rt::A),
             "case folds, like every other name comparison here (RFC 4343)"
         );
     }
@@ -1122,7 +1110,7 @@ a\.b    IN A   192.0.2.50
     fn a_validity_too_short_to_spread_still_signs() {
         let policy = SigningPolicy::valid_for(NOW, 2);
         assert_eq!(
-            policy.expiry_for("www.example.com.", rt::A),
+            policy.expiry_for(nm("www.example.com.").as_ref(), rt::A),
             policy.expiration
         );
         let zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
@@ -1253,7 +1241,7 @@ a\.b    IN A   192.0.2.50
         assert!(!rdatas.is_empty(), "no records of type {rtype} at {name}");
         let sigs: Vec<_> = rrsigs_in(&resources(zone))
             .into_iter()
-            .filter(|s| s.owner == canonical_name(name))
+            .filter(|s| s.owner == nm(name))
             .collect();
         verify_rrset(
             &Rrset::new(nm(name).as_ref(), rtype, Class::new(1), &rdatas),
@@ -1276,7 +1264,11 @@ a\.b    IN A   192.0.2.50
             if rtype == rt::RRSIG {
                 continue;
             }
-            let at_name: Vec<_> = sigs.iter().filter(|s| s.owner == name).cloned().collect();
+            let at_name: Vec<_> = sigs
+                .iter()
+                .filter(|s| s.owner == nm(&name))
+                .cloned()
+                .collect();
             let proof = verify_rrset(
                 &Rrset::new(nm(&name).as_ref(), rtype, Class::new(1), &rdatas),
                 &at_name,
@@ -1284,7 +1276,12 @@ a\.b    IN A   192.0.2.50
                 nm(ORIGIN).as_ref(),
                 NOW,
             );
-            if signable(&layout.entry(&name), &name, rtype, ORIGIN) {
+            if signable(
+                &layout.entry(nm(&name).as_ref()),
+                nm(&name).as_ref(),
+                rtype,
+                nm(ORIGIN).as_ref(),
+            ) {
                 // `wildcard: None` for all of them, the zone's own `*` RRset
                 // included: a signer signs at names that exist, so nothing here
                 // was expanded from a wildcard. Counting dots in the owner made
@@ -1396,7 +1393,7 @@ a\.b    IN A   192.0.2.50
 
         // A chain with a name missing, duplicated or pointing wrong looks like
         // a pile of plausible records until it is walked.
-        let apex = canonical_name(ORIGIN);
+        let apex = nm(ORIGIN);
         let mut seen = vec![apex.clone()];
         let mut at = apex.clone();
         for _ in 0..nsecs.len() {
@@ -1414,10 +1411,10 @@ a\.b    IN A   192.0.2.50
         assert_eq!(at, apex, "the chain does not close");
         assert_eq!(seen.len(), nsecs.len());
 
-        assert!(seen.contains(&"a.b.example.com.".to_string()));
-        assert!(seen.contains(&"b.example.com.".to_string()));
-        assert!(seen.contains(&"*.example.com.".to_string()));
-        assert!(!seen.contains(&"ns.secure.example.com.".to_string()));
+        assert!(seen.contains(&nm("a.b.example.com.")));
+        assert!(seen.contains(&nm("b.example.com.")));
+        assert!(seen.contains(&nm("*.example.com.")));
+        assert!(!seen.contains(&nm("ns.secure.example.com.")));
     }
 
     /// Every denial record's bitmap must list every type at the name it
@@ -1432,7 +1429,7 @@ a\.b    IN A   192.0.2.50
             let layout = Layout::of(&zone, nm(ORIGIN).as_ref());
             let (nsecs, nsec3s) = chain_records(&zone);
 
-            for (name, entry) in &layout.names {
+            for (name, entry) in layout.names.values() {
                 if entry.occluded {
                     continue;
                 }
@@ -1448,7 +1445,7 @@ a\.b    IN A   192.0.2.50
 
                 let lists: Box<dyn Fn(Rtype) -> bool> = match &chain {
                     DenialChain::Nsec => {
-                        let Some(nsec) = nsecs.iter().find(|n| &n.owner == name) else {
+                        let Some(nsec) = nsecs.iter().find(|n| n.owner == *name) else {
                             panic!("{chain:?}: no NSEC at {name}");
                         };
                         Box::new(move |rtype| nsec.has_type(rtype))
@@ -1456,8 +1453,8 @@ a\.b    IN A   192.0.2.50
                     DenialChain::Nsec3 {
                         salt, iterations, ..
                     } => {
-                        let hash = nsec3_hash(name, salt, *iterations).unwrap();
-                        let owner = nsec3_owner_name(&hash, ORIGIN);
+                        let hash = nsec3_hash_name(name.as_ref(), salt, *iterations).unwrap();
+                        let owner = nsec3_owner_name_at(&hash, nm(ORIGIN).as_ref()).unwrap();
                         let Some(nsec3) = nsec3s.iter().find(|n| n.owner == owner) else {
                             panic!("{chain:?}: no NSEC3 for {name}");
                         };
@@ -1494,8 +1491,8 @@ a\.b    IN A   192.0.2.50
         else {
             unreachable!()
         };
-        let hash = nsec3_hash(ORIGIN, &salt, iterations).unwrap();
-        let owner = nsec3_owner_name(&hash, ORIGIN);
+        let hash = nsec3_hash_name(nm(ORIGIN).as_ref(), &salt, iterations).unwrap();
+        let owner = nsec3_owner_name_at(&hash, nm(ORIGIN).as_ref()).unwrap();
         let apex = nsec3s
             .iter()
             .find(|n| n.owner == owner)
@@ -1520,14 +1517,25 @@ a\.b    IN A   192.0.2.50
             let (nsecs, nsec3s) = chain_records(&zone);
             assert!(
                 matches!(
-                    proves_nodata("b.example.com.", ORIGIN, rt::A, &nsecs, &nsec3s),
+                    proves_nodata(
+                        nm("b.example.com.").as_ref(),
+                        nm(ORIGIN).as_ref(),
+                        rt::A,
+                        &nsecs,
+                        &nsec3s
+                    ),
                     Denial::Proved
                 ),
                 "{chain:?}"
             );
             assert!(
                 !matches!(
-                    proves_nxdomain("b.example.com.", ORIGIN, &nsecs, &nsec3s),
+                    proves_nxdomain(
+                        nm("b.example.com.").as_ref(),
+                        nm(ORIGIN).as_ref(),
+                        &nsecs,
+                        &nsec3s
+                    ),
                     Denial::Proved
                 ),
                 "{chain:?}: a name that exists must not be deniable"
@@ -1547,7 +1555,8 @@ a\.b    IN A   192.0.2.50
             // not by one label (§3.3.2), so `x.a.b.example.com.` could only
             // come from `*.a.b.example.com.`, which does not exist.
             for absent in ["x.a.b.example.com.", "y.deep.a.b.example.com."] {
-                let denial = proves_nxdomain(absent, ORIGIN, &nsecs, &nsec3s);
+                let denial =
+                    proves_nxdomain(nm(absent).as_ref(), nm(ORIGIN).as_ref(), &nsecs, &nsec3s);
                 assert!(
                     matches!(denial, Denial::Proved),
                     "{chain:?} could not deny {absent}: {denial:?}"
@@ -1563,7 +1572,13 @@ a\.b    IN A   192.0.2.50
             let (nsecs, nsec3s) = chain_records(&zone);
             assert!(
                 matches!(
-                    proves_nodata("www.example.com.", ORIGIN, rt::MX, &nsecs, &nsec3s),
+                    proves_nodata(
+                        nm("www.example.com.").as_ref(),
+                        nm(ORIGIN).as_ref(),
+                        rt::MX,
+                        &nsecs,
+                        &nsec3s
+                    ),
                     Denial::Proved
                 ),
                 "{chain:?}"
@@ -1572,7 +1587,13 @@ a\.b    IN A   192.0.2.50
             // bitmap read the other way.
             assert!(
                 !matches!(
-                    proves_nodata("www.example.com.", ORIGIN, rt::AAAA, &nsecs, &nsec3s),
+                    proves_nodata(
+                        nm("www.example.com.").as_ref(),
+                        nm(ORIGIN).as_ref(),
+                        rt::AAAA,
+                        &nsecs,
+                        &nsec3s
+                    ),
                     Denial::Proved
                 ),
                 "{chain:?}"
@@ -1590,7 +1611,7 @@ a\.b    IN A   192.0.2.50
             .collect();
         let sigs: Vec<_> = rrsigs_in(&resources(&zone))
             .into_iter()
-            .filter(|s| s.owner == "*.example.com." && s.type_covered == rt::A)
+            .filter(|s| s.owner == nm("*.example.com.") && s.type_covered == rt::A)
             .collect();
         assert_eq!(sigs.len(), 1);
 
@@ -1598,7 +1619,7 @@ a\.b    IN A   192.0.2.50
         // still verifies and comes back flagged as an expansion — which is what
         // obliges the answer to carry a denial of the queried name.
         let mut expanded = sigs[0].clone();
-        expanded.owner = "anything.example.com.".to_string();
+        expanded.owner = nm("anything.example.com.");
         let proof = verify_rrset(
             &Rrset::new(
                 nm("anything.example.com.").as_ref(),
@@ -1618,13 +1639,18 @@ a\.b    IN A   192.0.2.50
         else {
             panic!("expected a wildcard expansion: {proof:?}");
         };
-        assert_eq!(wildcard, "*.example.com.");
+        assert_eq!(wildcard, nm("*.example.com."));
 
         // The other half: the chain has to show the queried name has nothing of
         // its own and that this is the wildcard covering it.
         let (nsecs, nsec3s) = chain_records(&zone);
         assert!(matches!(
-            proves_wildcard_expansion("anything.example.com.", &wildcard, &nsecs, &nsec3s),
+            proves_wildcard_expansion(
+                nm("anything.example.com.").as_ref(),
+                wildcard.as_ref(),
+                &nsecs,
+                &nsec3s
+            ),
             WildcardVerdict::Proved
         ));
     }
@@ -1661,7 +1687,11 @@ a\.b    IN A   192.0.2.50
         let (_, nsec3s) = chain_records(&zone);
         assert!(nsec3s.iter().all(|n| n.opt_out()));
 
-        let matched = |name: &str| nsec3s.iter().any(|n| n.matches(name).unwrap_or(false));
+        let matched = |name: &str| {
+            nsec3s
+                .iter()
+                .any(|n| n.matches(nm(name).as_ref()).unwrap_or(false))
+        };
         // No DS, so opt-out leaves it out: nothing matches its hash.
         assert!(
             !matched("plain.example.com."),
@@ -1682,7 +1712,7 @@ a\.b    IN A   192.0.2.50
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = sign_test_zone(chain.clone());
             let (nsecs, nsec3s) = chain_records(&zone);
-            let denial = proves_no_ds("plain.example.com.", &nsecs, &nsec3s);
+            let denial = proves_no_ds(nm("plain.example.com.").as_ref(), &nsecs, &nsec3s);
             assert!(matches!(denial, Denial::Proved), "{chain:?}: {denial:?}");
         }
     }
@@ -1703,7 +1733,7 @@ a\.b    IN A   192.0.2.50
         let tags = |name: &str, rtype: Rtype| -> Vec<u16> {
             let mut tags: Vec<u16> = sigs
                 .iter()
-                .filter(|s| s.owner == name && s.type_covered == rtype)
+                .filter(|s| s.owner == nm(name) && s.type_covered == rtype)
                 .map(|s| s.key_tag)
                 .collect();
             tags.sort_unstable();
@@ -2032,7 +2062,7 @@ a\.b    IN A   192.0.2.50
         }
         let sig = rrsigs_in(&resources(&zone))
             .into_iter()
-            .find(|s| s.owner == "www.example.com." && s.type_covered == rt::A)
+            .find(|s| s.owner == nm("www.example.com.") && s.type_covered == rt::A)
             .expect("the RRset is signed");
         assert_eq!(sig.original_ttl, 60);
         assert!(matches!(

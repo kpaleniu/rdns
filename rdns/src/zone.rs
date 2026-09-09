@@ -277,7 +277,7 @@ impl Zone {
     /// nothing sorts before `name` the answer is the last record, because the
     /// chain is a loop back to the apex (RFC 4034 §4.1.1).
     pub fn nsec_covering(&self, name: NameRef<'_>) -> Option<&ZoneRecord> {
-        let key = canonical_sort_key(&name.to_presentation());
+        let key = canonical_sort_key(name);
         let position = self
             .nsec_chain
             .range(..key)
@@ -305,10 +305,9 @@ impl Zone {
     /// will not decode is left out rather than filed under something wrong.
     fn chain_key(&self, record: &ZoneRecord) -> Option<(Chain, Vec<u8>)> {
         match record.rdata.rtype() {
-            crate::utils::record_types::NSEC => Some((
-                Chain::Nsec,
-                canonical_sort_key(&record.name.as_ref().to_presentation()),
-            )),
+            crate::utils::record_types::NSEC => {
+                Some((Chain::Nsec, canonical_sort_key(record.name.as_ref())))
+            }
             crate::utils::record_types::NSEC3 => {
                 // The hash is the first label, and a label is octets — so it is
                 // taken as octets rather than by splitting text on a `.` that

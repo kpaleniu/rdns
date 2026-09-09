@@ -7,7 +7,7 @@
 //! next bug goes (`CLAUDE.md` §7).
 
 use crate::denial_wire::build_type_bitmap;
-use crate::dnssec_denial::{nsec3_hash, nsec3_owner_name, Nsec3};
+use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, Nsec3};
 use crate::{Class, Name, ParsedRecord, RecordData, ResourceRecord, Rtype, Serial, Ttl};
 use std::net::Ipv4Addr;
 
@@ -80,11 +80,12 @@ pub fn nsec_record(owner: &str, next: &str, types: &[Rtype], ttl: Ttl) -> Resour
 /// [`NSEC3_SALT`], and `next` is given outright because a fixture wants to
 /// choose what the span contains.
 pub fn nsec3(zone: &str, name: &str, next: &[u8], flags: u8, types: &[Rtype]) -> Nsec3 {
-    let hash = nsec3_hash(name, &NSEC3_SALT, NSEC3_ITERATIONS).expect("hash the owner name");
+    let hash = nsec3_hash_name(nm(name).as_ref(), &NSEC3_SALT, NSEC3_ITERATIONS)
+        .expect("hash the owner name");
     Nsec3 {
-        owner: nsec3_owner_name(&hash, zone),
-        owner_hash: hash,
-        zone: zone.to_string(),
+        owner: nsec3_owner_name_at(&hash, nm(zone).as_ref()).expect("an NSEC3 owner name"),
+        owner_hash: hash.to_vec(),
+        zone: nm(zone),
         hash_algorithm: 1,
         flags,
         iterations: NSEC3_ITERATIONS,
@@ -116,7 +117,7 @@ pub fn nsec3_span(
     ttl: Ttl,
 ) -> ResourceRecord {
     ResourceRecord {
-        name: nm(&nsec3_owner_name(owner_hash, zone)),
+        name: nsec3_owner_name_at(owner_hash, nm(zone).as_ref()).expect("an NSEC3 owner name"),
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
@@ -133,7 +134,7 @@ pub fn nsec3_span(
 
 fn nsec3_as_record(n: &Nsec3, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
-        name: nm(&n.owner.clone()),
+        name: n.owner.clone(),
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {

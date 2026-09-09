@@ -16,12 +16,10 @@
 //! - TTL is bounded by the proof, not by the question.
 
 use crate::denial_wire::canonical_sort_key;
-use crate::dnssec::{canonical_name, canonical_name_of, signed_owner_name, Rrsig};
+use crate::dnssec::{signed_owner_name, Rrsig};
 use crate::dnssec_denial::{proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Params};
 use crate::eviction::Halving;
-use crate::utils::{
-    current_unix_timestamp, is_at_or_under, label_count, record_types as rt, NameKeyBuf,
-};
+use crate::utils::{current_unix_timestamp, record_types as rt};
 use crate::NameRef;
 use crate::Qtype;
 use crate::Rtype;
@@ -52,7 +50,7 @@ struct ZoneProofs {
     soa: Option<CachedSoa>,
     /// Validated RRsets that came from a wildcard, keyed by (wildcard owner,
     /// type) — the name asked for is the one part that is not reusable.
-    wildcards: HashMap<(String, Qtype), CachedWildcard>,
+    wildcards: HashMap<(Name, Qtype), CachedWildcard>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,9 +119,9 @@ pub struct WildcardSynthesis {
 /// labels of the owner — which is [`signed_owner_name`], over the wire name.
 /// This split the owner's *text* on `.`, counting `a\.b.example.com.` as four
 /// labels where its RRSIG correctly claims three (`TODO.md` #37a).
-fn wildcard_for_expansion(owner: NameRef<'_>, labels: u8) -> Option<String> {
+fn wildcard_for_expansion(owner: NameRef<'_>, labels: u8) -> Option<Name> {
     let signed = signed_owner_name(owner, labels).ok()?;
-    (signed.as_ref() != owner).then(|| canonical_name_of(signed.as_ref()))
+    (signed.as_ref() != owner).then_some(signed)
 }
 
 /// `*.` plus the immediate parent of `name`.
@@ -131,19 +129,18 @@ fn wildcard_for_expansion(owner: NameRef<'_>, labels: u8) -> Option<String> {
 /// A deliberate under-approximation, not a reading of RFC 4592 §3.3.1: real
 /// synthesis reaches any depth. See `synthesize_wildcard` for why the narrow
 /// form is the safe one here.
-fn wildcard_for_parent_of(name: &str) -> Option<String> {
-    let name = canonical_name(name);
-    let rest = crate::utils::parent_name(&name)?;
-    if rest == "." {
+fn wildcard_for_parent_of(name: NameRef<'_>) -> Option<Name> {
+    let rest = name.parent()?;
+    if rest.is_root() {
         return None;
     }
-    Some(format!("*.{rest}"))
+    Name::prefixed(b"*", rest).ok()
 }
 
 /// Validated NSEC/NSEC3 proofs, searchable by range.
 #[derive(Debug)]
 pub struct NsecCache {
-    zones: Mutex<HashMap<NameKeyBuf, ZoneProofs>>,
+    zones: Mutex<HashMap<Name, ZoneProofs>>,
     /// Zones to remember. With [`MAX_PROOFS_PER_ZONE`] this bounds the whole
     /// structure against a flood of one-off zones or one enormous chain.
     max_zones: usize,
@@ -188,13 +185,13 @@ impl NsecCache {
         let Ok(ParsedRecord::SOA { minimum, .. }) = soa_rr.rdata.parse() else {
             return;
         };
-        let zone = soa_rr.name.as_ref().to_presentation();
+        let zone = soa_rr.name.as_ref().to_folded();
         let now = current_unix_timestamp();
 
         let soa_ttl = soa_rr.ttl.as_secs();
         let negative_ttl = soa_ttl.min(minimum);
         let soa = CachedSoa {
-            records: records_at(&response.authorities, &zone, rt::SOA),
+            records: records_at(&response.authorities, zone.as_ref(), rt::SOA),
             negative_ttl,
             expires_at: now + (negative_ttl as u64).min(MAX_PROOF_TTL),
         };
@@ -202,10 +199,10 @@ impl NsecCache {
         let Ok(mut zones) = self.zones.lock() else {
             return;
         };
-        if !zones.contains_key(zone.as_str()) && zones.len() >= self.max_zones {
+        if !zones.contains_key(&zone) && zones.len() >= self.max_zones {
             evict_zone(&mut zones, self.max_zones, now);
         }
-        let entry = zones.entry(NameKeyBuf::new(&zone)).or_default();
+        let entry = zones.entry(zone.clone()).or_default();
         entry.soa = Some(soa);
 
         for rr in &response.authorities {
@@ -216,12 +213,13 @@ impl NsecCache {
                     };
                     // A proof from outside the zone that signed the SOA is not
                     // this zone's to make.
-                    if !is_at_or_under(&nsec.owner, &zone) {
+                    if !nsec.owner.as_ref().is_at_or_under(zone.as_ref()) {
                         continue;
                     }
                     let ttl = rr.ttl.capped_at(MAX_PROOF_TTL as u32).as_u64();
-                    let key = canonical_sort_key(&nsec.owner);
-                    let records = records_covering(&response.authorities, &nsec.owner, rt::NSEC);
+                    let key = canonical_sort_key(nsec.owner.as_ref());
+                    let records =
+                        records_covering(&response.authorities, nsec.owner.as_ref(), rt::NSEC);
                     insert_bounded(
                         &mut entry.nsecs,
                         key,
@@ -237,7 +235,7 @@ impl NsecCache {
                     let Some(nsec3) = Nsec3::from_record(rr) else {
                         continue;
                     };
-                    if !is_at_or_under(&nsec3.zone, &zone) {
+                    if !nsec3.zone.as_ref().is_at_or_under(zone.as_ref()) {
                         continue;
                     }
                     // RFC 8198 §5.2: an opt-out span may hold delegations the
@@ -248,7 +246,8 @@ impl NsecCache {
                     }
                     let ttl = rr.ttl.capped_at(MAX_PROOF_TTL as u32).as_u64();
                     let key = nsec3.owner_hash.clone();
-                    let records = records_covering(&response.authorities, &nsec3.owner, rt::NSEC3);
+                    let records =
+                        records_covering(&response.authorities, nsec3.owner.as_ref(), rt::NSEC3);
                     insert_bounded(
                         &mut entry.nsec3s,
                         key,
@@ -283,7 +282,7 @@ impl NsecCache {
 
         // Fewer labels in the RRSIG than in the owner name means the signature
         // was made at a wildcard (RFC 4035 §5.3.4).
-        let mut pending: Vec<(String, String, Rtype)> = Vec::new();
+        let mut pending: Vec<(Name, Name, Rtype)> = Vec::new();
         for rr in &response.answers {
             let Some(rrsig) = Rrsig::from_record(rr) else {
                 continue;
@@ -294,11 +293,11 @@ impl NsecCache {
             let Some(wildcard) = wildcard_for_expansion(rr.name.as_ref(), rrsig.labels) else {
                 continue;
             };
-            let zone = canonical_name(&rrsig.signer_name);
+            let zone = rrsig.signer_name;
             // A signature made outside the zone it claims to sign is not this
             // zone's to keep. A consistency check, not the security boundary:
             // the chain validator already established the signer.
-            if !is_at_or_under(&wildcard, &zone) {
+            if !wildcard.as_ref().is_at_or_under(zone.as_ref()) {
                 continue;
             }
             pending.push((zone, wildcard, rrsig.type_covered));
@@ -314,31 +313,28 @@ impl NsecCache {
             if !synthesizable_qtype(Qtype::of(rtype)) {
                 continue;
             }
-            if !zones.contains_key(zone.as_str()) && zones.len() >= self.max_zones {
+            if !zones.contains_key(&zone) && zones.len() >= self.max_zones {
                 evict_zone(&mut zones, self.max_zones, now);
             }
-            let entry = zones.entry(NameKeyBuf::new(&zone)).or_default();
+            let entry = zones.entry(zone.clone()).or_default();
 
             // The RRset as it arrived, plus its signatures, under the owner name
             // it came with; synthesis rewrites that.
-            let owner = canonical_name(
-                &response
-                    .answers
-                    .iter()
-                    .find(|rr| rr.rdata.rtype() == rtype)
-                    .map(|rr| rr.name.as_ref().to_presentation())
-                    .unwrap_or_default(),
-            );
-            let mut records = records_at(&response.answers, &owner, rtype);
+            let owner = response
+                .answers
+                .iter()
+                .find(|rr| rr.rdata.rtype() == rtype)
+                .map(|rr| rr.name.as_ref().to_folded())
+                .unwrap_or_default();
+            let mut records = records_at(&response.answers, owner.as_ref(), rtype);
             records.extend(
                 response
                     .answers
                     .iter()
                     .filter(|rr| rr.rdata.rtype() == rt::RRSIG)
                     .filter(|rr| {
-                        Rrsig::from_record(rr).is_some_and(|s| {
-                            s.type_covered == rtype && canonical_name(&s.owner) == owner
-                        })
+                        Rrsig::from_record(rr)
+                            .is_some_and(|s| s.type_covered == rtype && s.owner == owner)
                     })
                     .cloned(),
             );
@@ -373,12 +369,13 @@ impl NsecCache {
                 let Some(nsec) = Nsec::from_record(rr) else {
                     continue;
                 };
-                if !is_at_or_under(&nsec.owner, &zone) {
+                if !nsec.owner.as_ref().is_at_or_under(zone.as_ref()) {
                     continue;
                 }
                 let ttl = rr.ttl.capped_at(MAX_PROOF_TTL as u32).as_u64();
-                let key = canonical_sort_key(&nsec.owner);
-                let records = records_covering(&response.authorities, &nsec.owner, rt::NSEC);
+                let key = canonical_sort_key(nsec.owner.as_ref());
+                let records =
+                    records_covering(&response.authorities, nsec.owner.as_ref(), rt::NSEC);
                 insert_bounded(
                     &mut entry.nsecs,
                     key,
@@ -404,29 +401,30 @@ impl NsecCache {
     /// `b.example.com.`'s own NSEC covers `a.b.example.com.` either way.
     /// Deriving the wildcard from the queried name makes that unavailable, at
     /// the cost of a missed synthesis.
-    pub fn synthesize_wildcard(&self, qname: &str, qtype: Qtype) -> Option<WildcardSynthesis> {
+    pub fn synthesize_wildcard(
+        &self,
+        qname: NameRef<'_>,
+        qtype: Qtype,
+    ) -> Option<WildcardSynthesis> {
         if !synthesizable_qtype(qtype) {
             return None;
         }
-        // Borrowed: a question that arrives in key form costs nothing to fold,
-        // and the walks below slice it rather than rebuilding it.
-        let qname = crate::utils::absolute_lowered(qname);
-        let wildcard = wildcard_for_parent_of(&qname)?;
+        let wildcard = wildcard_for_parent_of(qname)?;
         let now = current_unix_timestamp();
         let zones = self.zones.lock().ok()?;
 
         let (_, zone) = zones
             .iter()
-            .filter(|(z, _)| is_at_or_under(&qname, z.as_str()))
-            .max_by_key(|(z, _)| label_count(z.as_str()))?;
+            .filter(|(z, _)| qname.is_at_or_under(z.as_ref()))
+            .max_by_key(|(z, _)| z.as_ref().label_count())?;
 
         let cached = zone
             .wildcards
-            .get(&(wildcard.clone(), qtype))
+            .get(&(wildcard, qtype))
             .filter(|w| w.expires_at > now)?;
         // The queried name must not exist. `covering_nsec` also refuses a gap
         // below a delegation, whose names sort inside it.
-        let denial = zone.covering_nsec(&qname, now)?;
+        let denial = zone.covering_nsec(qname, now)?;
 
         let ttl = cached
             .expires_at
@@ -439,11 +437,7 @@ impl NsecCache {
 
         // Re-owned onto the name that was asked for. The wildcard signature
         // verifies there unchanged, so a DO client can check this itself.
-        //
-        // Parsed once, and a failure declines to synthesize: `unwrap_or_default`
-        // here re-owned the whole RRset onto the root, which is a wrong positive
-        // answer rather than a missing one (`CLAUDE.md` §4).
-        let owner = Name::from_presentation(&qname).ok()?;
+        let owner = qname.to_owned();
         let answers: Vec<ResourceRecord> = with_ttl(&cached.records, ttl)
             .into_iter()
             .map(|mut rr| {
@@ -462,12 +456,10 @@ impl NsecCache {
     /// Answer `qname`/`qtype` from cached proofs, or `None` to go and ask.
     ///
     /// `None` is always safe and is the answer whenever anything is in doubt.
-    pub fn synthesize(&self, qname: &str, qtype: Qtype) -> Option<Synthesis> {
+    pub fn synthesize(&self, qname: NameRef<'_>, qtype: Qtype) -> Option<Synthesis> {
         if !synthesizable_qtype(qtype) {
             return None;
         }
-        // Borrowed, as in `synthesize_wildcard`.
-        let qname = crate::utils::absolute_lowered(qname);
         let now = current_unix_timestamp();
 
         // Under the lock: find the zone and take what bears on the question.
@@ -479,26 +471,21 @@ impl NsecCache {
             // chain covers it; a shallower zone's chain stops at the delegation.
             let (zone_name, zone) = zones
                 .iter()
-                .filter(|(z, _)| is_at_or_under(&qname, z.as_str()))
-                .max_by_key(|(z, _)| label_count(z.as_str()))?;
+                .filter(|(z, _)| qname.is_at_or_under(z.as_ref()))
+                .max_by_key(|(z, _)| z.as_ref().label_count())?;
 
             let soa = zone.soa.as_ref().filter(|s| s.expires_at > now)?;
             let gathered = zone
-                .gather_nodata(&qname, qtype, now)
-                .or_else(|| zone.gather_nxdomain(&qname, zone_name.as_str(), now))?;
+                .gather_nodata(qname, qtype, now)
+                .or_else(|| zone.gather_nxdomain(qname, zone_name.as_ref(), now))?;
 
             let soa_ttl = soa
                 .negative_ttl
                 .min(soa.expires_at.saturating_sub(now).min(u32::MAX as u64) as u32);
-            (
-                zone_name.as_str().to_string(),
-                soa.records.clone(),
-                soa_ttl,
-                gathered,
-            )
+            (zone_name.clone(), soa.records.clone(), soa_ttl, gathered)
         };
 
-        if !gathered.proved(&qname, &zone_name, qtype) {
+        if !gathered.proved(qname, zone_name.as_ref(), qtype) {
             return None;
         }
 
@@ -545,7 +532,7 @@ impl ZoneProofs {
     /// delegation — NS set, SOA clear — everything beneath it lives in the child
     /// zone and sorts inside the gap, so the gap swallows the whole subtree.
     /// Denying there denies a zone we were never authoritative for.
-    fn covering_nsec(&self, name: &str, now: u64) -> Option<&CachedProof<Nsec>> {
+    fn covering_nsec(&self, name: NameRef<'_>, now: u64) -> Option<&CachedProof<Nsec>> {
         let key = canonical_sort_key(name);
         let candidate = self
             .nsecs
@@ -564,7 +551,7 @@ impl ZoneProofs {
     }
 
     /// The cached NSEC whose owner *is* `name`.
-    fn matching_nsec(&self, name: &str, now: u64) -> Option<&CachedProof<Nsec>> {
+    fn matching_nsec(&self, name: NameRef<'_>, now: u64) -> Option<&CachedProof<Nsec>> {
         self.nsecs
             .get(&canonical_sort_key(name))
             .filter(|c| c.live(now))
@@ -627,7 +614,7 @@ impl ZoneProofs {
     /// `Some` says a record sits at the name, not that it proves anything. It
     /// also settles NXDOMAIN — the name exists — so the caller does not fall
     /// through to [`ZoneProofs::gather_nxdomain`].
-    fn gather_nodata(&self, qname: &str, qtype: Qtype, now: u64) -> Option<Gathered> {
+    fn gather_nodata(&self, qname: NameRef<'_>, qtype: Qtype, now: u64) -> Option<Gathered> {
         if let Some(cached) = self.matching_nsec(qname, now) {
             // At a delegation the parent holds only the DS; the real reply for
             // anything else is a referral, not NODATA.
@@ -668,7 +655,7 @@ impl ZoneProofs {
     }
 
     /// NXDOMAIN: the name does not exist, and no wildcard would have answered.
-    fn gather_nxdomain(&self, qname: &str, zone: &str, now: u64) -> Option<Gathered> {
+    fn gather_nxdomain(&self, qname: NameRef<'_>, zone: NameRef<'_>, now: u64) -> Option<Gathered> {
         let mut candidates: Vec<&CachedProof<Nsec>> = Vec::new();
         if let Some(covering) = self.covering_nsec(qname, now) {
             candidates.push(covering);
@@ -678,11 +665,13 @@ impl ZoneProofs {
             return None;
         }
         // The wildcard that could have answered sits at some ancestor, so gather
-        // every ancestor's; `proves_nxdomain` picks the one that matters.
-        // `qname` is canonical here, so each ancestor is a slice of it.
-        for depth in label_count(zone)..label_count(qname) {
-            let wildcard = format!("*.{}", crate::utils::suffix_labels(qname, depth));
-            if let Some(covering) = self.covering_nsec(&wildcard, now) {
+        // every ancestor's; `proves_nxdomain` picks the one that matters. Each
+        // ancestor is a suffix of `qname` rather than a name of its own.
+        for depth in zone.label_count()..qname.label_count() {
+            let Ok(wildcard) = Name::prefixed(b"*", qname.suffix(depth)) else {
+                continue;
+            };
+            if let Some(covering) = self.covering_nsec(wildcard.as_ref(), now) {
                 if !candidates
                     .iter()
                     .any(|c| c.proof.owner == covering.proof.owner)
@@ -710,7 +699,12 @@ impl ZoneProofs {
     /// The NSEC3 form: RFC 5155 §8.4 wants the record matching the deepest
     /// ancestor that exists, one covering the name a label below it, and one
     /// accounting for the wildcard there.
-    fn gather_nxdomain_nsec3(&self, qname: &str, zone: &str, now: u64) -> Option<Gathered> {
+    fn gather_nxdomain_nsec3(
+        &self,
+        qname: NameRef<'_>,
+        zone: NameRef<'_>,
+        now: u64,
+    ) -> Option<Gathered> {
         self.nsec3_params(now)
             .iter()
             .find_map(|params| self.gather_nxdomain_under(qname, zone, params, now))
@@ -727,18 +721,18 @@ impl ZoneProofs {
     /// points make it so — hence each ancestor is a slice of it.
     fn gather_nxdomain_under(
         &self,
-        qname: &str,
-        zone: &str,
+        qname: NameRef<'_>,
+        zone: NameRef<'_>,
         params: &Nsec3Params,
         now: u64,
     ) -> Option<Gathered> {
-        let qlabels = label_count(qname);
-        let zlabels = label_count(zone);
+        let qlabels = qname.label_count();
+        let zlabels = zone.label_count();
         let mut candidate = qname;
         let mut depth = qlabels;
         // The next closer name is the candidate this walk rejected one step
         // earlier, so it is never derived a second time.
-        let mut below: Option<&str> = None;
+        let mut below: Option<NameRef<'_>> = None;
         let mut encloser = None;
         loop {
             let hash = params.hash(candidate).ok()?;
@@ -754,7 +748,7 @@ impl ZoneProofs {
                 break;
             }
             below = Some(candidate);
-            candidate = crate::utils::parent_name(candidate)?;
+            candidate = candidate.parent()?;
             depth -= 1;
         }
         let (next_closer, encloser_name, matching) = encloser?;
@@ -772,8 +766,8 @@ impl ZoneProofs {
 
         // ...and the wildcard at the encloser must be accounted for, whether by
         // being absent or by existing and not having been expanded.
-        let wildcard = format!("*.{encloser_name}");
-        let hash = params.hash(&wildcard).ok()?;
+        let wildcard = Name::prefixed(b"*", encloser_name).ok()?;
+        let hash = params.hash(wildcard.as_ref()).ok()?;
         let accounted = self
             .matching_nsec3(&hash, params, now)
             .or_else(|| self.covering_nsec3(&hash, params, now))?;
@@ -813,7 +807,7 @@ struct Gathered {
 }
 
 impl Gathered {
-    fn proved(&self, qname: &str, zone: &str, qtype: Qtype) -> bool {
+    fn proved(&self, qname: NameRef<'_>, zone: NameRef<'_>, qtype: Qtype) -> bool {
         match self.rcode {
             ResponseCode::NoSuchDomain => {
                 matches!(
@@ -850,18 +844,16 @@ fn is_delegation(nsec: &Nsec) -> bool {
 
 /// Whether `name` lies beneath a delegation at the NSEC's owner — in which case
 /// the gap says nothing about it, however neatly it falls inside.
-fn is_below_delegation(nsec: &Nsec, name: &str) -> bool {
-    is_delegation(nsec) && is_at_or_under(name, &nsec.owner) && canonical_name(name) != nsec.owner
+fn is_below_delegation(nsec: &Nsec, name: NameRef<'_>) -> bool {
+    is_delegation(nsec) && name.is_at_or_under(nsec.owner.as_ref()) && name != nsec.owner.as_ref()
 }
 
 /// Records of `rtype` at `owner`, plus the RRSIGs that cover them.
-fn records_covering(records: &[ResourceRecord], owner: &str, rtype: Rtype) -> Vec<ResourceRecord> {
-    // A name that will not parse matches nothing, which is what the caller does
-    // with an empty set anyway: no proof, so go and ask.
-    let Ok(owner) = Name::from_presentation(owner) else {
-        return Vec::new();
-    };
-    let owner = owner.as_ref();
+fn records_covering(
+    records: &[ResourceRecord],
+    owner: NameRef<'_>,
+    rtype: Rtype,
+) -> Vec<ResourceRecord> {
     records
         .iter()
         // `NameRef` compares ASCII case-insensitively (RFC 4343), so neither
@@ -878,7 +870,7 @@ fn records_covering(records: &[ResourceRecord], owner: &str, rtype: Rtype) -> Ve
         .collect()
 }
 
-fn records_at(records: &[ResourceRecord], owner: &str, rtype: Rtype) -> Vec<ResourceRecord> {
+fn records_at(records: &[ResourceRecord], owner: NameRef<'_>, rtype: Rtype) -> Vec<ResourceRecord> {
     records_covering(records, owner, rtype)
 }
 
@@ -899,8 +891,8 @@ fn with_ttl(records: &[ResourceRecord], ttl: u32) -> Vec<ResourceRecord> {
 /// at every level, and this is bounded for the same reason everything else here
 /// is — the alternative is unbounded.
 fn insert_bounded_map(
-    map: &mut HashMap<(String, Qtype), CachedWildcard>,
-    key: (String, Qtype),
+    map: &mut HashMap<(Name, Qtype), CachedWildcard>,
+    key: (Name, Qtype),
     value: CachedWildcard,
     now: u64,
 ) {
@@ -949,7 +941,7 @@ fn insert_bounded<T>(
 /// Drop the zones whose SOA has expired, and halve what is left if that freed
 /// nothing. See [`crate::eviction`]: a scan plus a key clone for one victim is a
 /// scan per insert, because a full table stays full.
-fn evict_zone(zones: &mut HashMap<NameKeyBuf, ZoneProofs>, max_zones: usize, now: u64) {
+fn evict_zone(zones: &mut HashMap<Name, ZoneProofs>, max_zones: usize, now: u64) {
     let before = zones.len();
     // A zone whose SOA has gone proves nothing: the negative TTL comes from it.
     zones.retain(|_, z| z.soa.as_ref().is_some_and(|s| s.expires_at > now));
@@ -1092,19 +1084,19 @@ mod tests {
     fn a_lookup_costs_the_same_however_many_proofs_are_cached() {
         use std::time::Instant;
 
-        let qname = deepest_name();
+        let qname = nm(&deepest_name());
         let few = cache_of_n_nsec3s(8);
         let many = cache_of_n_nsec3s(MAX_PROOFS_PER_ZONE);
         // Nothing in either cache bears on the name, which is the case a flood
         // produces and the one the scan was worst at.
-        assert!(few.synthesize(&qname, Qtype::of(rt::A)).is_none());
-        assert!(many.synthesize(&qname, Qtype::of(rt::A)).is_none());
+        assert!(few.synthesize(qname.as_ref(), Qtype::of(rt::A)).is_none());
+        assert!(many.synthesize(qname.as_ref(), Qtype::of(rt::A)).is_none());
 
         let batch = 20;
         let time = |cache: &NsecCache| {
             let start = Instant::now();
             for _ in 0..batch {
-                cache.synthesize(&qname, Qtype::of(rt::A));
+                cache.synthesize(qname.as_ref(), Qtype::of(rt::A));
             }
             start.elapsed()
         };
@@ -1133,7 +1125,7 @@ mod tests {
             "b.example.com.",
         ] {
             let s = cache
-                .synthesize(name, Qtype::of(rt::A))
+                .synthesize(nm(name).as_ref(), Qtype::of(rt::A))
                 .unwrap_or_else(|| panic!("{name} is inside the cached gap"));
             assert_eq!(s.rcode, ResponseCode::NoSuchDomain);
             assert!(
@@ -1151,18 +1143,20 @@ mod tests {
         let cache = cache_with_a_gap();
         // Past the end of the gap.
         assert!(cache
-            .synthesize("zzz.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("zzz.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
         // The gap's own endpoints exist.
         assert!(cache
-            .synthesize("www.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
         // A different zone entirely.
         assert!(cache
-            .synthesize("nope.example.org.", Qtype::of(rt::A))
+            .synthesize(nm("nope.example.org.").as_ref(), Qtype::of(rt::A))
             .is_none());
         // And a name above the zone.
-        assert!(cache.synthesize("com.", Qtype::of(rt::A)).is_none());
+        assert!(cache
+            .synthesize(nm("com.").as_ref(), Qtype::of(rt::A))
+            .is_none());
     }
 
     /// The trap this cache is most likely to fall into. `sub.example.com.` and
@@ -1191,23 +1185,23 @@ mod tests {
         // Sanity: the name really does fall in the gap, so this test is testing
         // the guard and not an accident of ordering.
         let nsec = Nsec {
-            owner: "sub.example.com.".to_string(),
-            next: "www.example.com.".to_string(),
+            owner: nm("sub.example.com."),
+            next: nm("www.example.com."),
             type_bitmap: build_type_bitmap(&[rt::NS]),
         };
         assert!(
-            nsec.covers("x.sub.example.com."),
+            nsec.covers(nm("x.sub.example.com.").as_ref()),
             "the gap does span the child zone's names"
         );
 
         assert!(
             cache
-                .synthesize("x.sub.example.com.", Qtype::of(rt::A))
+                .synthesize(nm("x.sub.example.com.").as_ref(), Qtype::of(rt::A))
                 .is_none(),
             "names in a delegated child zone must never be denied from the parent's gap"
         );
         assert!(cache
-            .synthesize("deep.x.sub.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("deep.x.sub.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
     }
 
@@ -1230,13 +1224,13 @@ mod tests {
             ],
         ));
 
-        let ds = cache.synthesize("sub.example.com.", Qtype::of(rt::DS));
+        let ds = cache.synthesize(nm("sub.example.com.").as_ref(), Qtype::of(rt::DS));
         assert!(ds.is_some(), "no DS at the delegation is a real NODATA");
         assert_eq!(ds.unwrap().rcode, ResponseCode::Ok);
 
         assert!(
             cache
-                .synthesize("sub.example.com.", Qtype::of(rt::A))
+                .synthesize(nm("sub.example.com.").as_ref(), Qtype::of(rt::A))
                 .is_none(),
             "an A query at a delegation is a referral, not NODATA"
         );
@@ -1260,13 +1254,13 @@ mod tests {
         ));
 
         let s = cache
-            .synthesize("www.example.com.", Qtype::of(rt::AAAA))
+            .synthesize(nm("www.example.com.").as_ref(), Qtype::of(rt::AAAA))
             .expect("NODATA");
         assert_eq!(s.rcode, ResponseCode::Ok);
         assert!(s.authority.iter().all(|rr| rr.rdata.rtype() != rt::A));
         // A is in the bitmap, so that one has to go upstream.
         assert!(cache
-            .synthesize("www.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
     }
 
@@ -1292,7 +1286,7 @@ mod tests {
         ));
         assert!(
             cache
-                .synthesize("nope.example.com.", Qtype::of(rt::A))
+                .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
                 .is_none(),
             "without a wildcard denial a wildcard could still have answered"
         );
@@ -1302,11 +1296,13 @@ mod tests {
     fn test_any_and_rrsig_are_never_synthesized() {
         let cache = cache_with_a_gap();
         assert!(
-            cache.synthesize("nope.example.com.", Qtype::ANY).is_none(),
+            cache
+                .synthesize(nm("nope.example.com.").as_ref(), Qtype::ANY)
+                .is_none(),
             "ANY"
         );
         assert!(cache
-            .synthesize("nope.example.com.", Qtype::of(rt::RRSIG))
+            .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::RRSIG))
             .is_none());
     }
 
@@ -1329,7 +1325,7 @@ mod tests {
         ));
         assert!(
             cache
-                .synthesize("nope.example.com.", Qtype::of(rt::A))
+                .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
                 .is_none(),
             "a zero TTL means do not reuse this"
         );
@@ -1357,7 +1353,7 @@ mod tests {
         ));
 
         let s = cache
-            .synthesize("nope.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
             .expect("denied");
         assert!(
             s.ttl <= 60,
@@ -1386,7 +1382,7 @@ mod tests {
         ));
         assert!(cache.is_empty());
         assert!(cache
-            .synthesize("nope.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
     }
 
@@ -1408,7 +1404,9 @@ mod tests {
                 ),
             ],
         ));
-        assert!(cache.synthesize("m.evil.test.", Qtype::of(rt::A)).is_none());
+        assert!(cache
+            .synthesize(nm("m.evil.test.").as_ref(), Qtype::of(rt::A))
+            .is_none());
     }
 
     // NSEC3
@@ -1436,7 +1434,7 @@ mod tests {
         ));
         assert!(
             cache
-                .synthesize("nope.example.com.", Qtype::of(rt::A))
+                .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
                 .is_none(),
             "an opt-out span proves nothing about what is inside it"
         );
@@ -1462,11 +1460,11 @@ mod tests {
         ));
 
         let s = cache
-            .synthesize("www.example.com.", Qtype::of(rt::AAAA))
+            .synthesize(nm("www.example.com.").as_ref(), Qtype::of(rt::AAAA))
             .expect("the matching NSEC3 denies AAAA");
         assert_eq!(s.rcode, ResponseCode::Ok);
         assert!(cache
-            .synthesize("www.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
     }
 
@@ -1533,7 +1531,7 @@ mod tests {
     fn test_nsec3_nxdomain_is_synthesized() {
         let cache = cache_with_an_nsec3_chain();
         let s = cache
-            .synthesize("nope.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
             .expect("apex matched, name covered, wildcard covered");
         assert_eq!(s.rcode, ResponseCode::NoSuchDomain);
         assert!(s.authority.iter().any(|rr| rr.rdata.rtype() == rt::SOA));
@@ -1554,7 +1552,7 @@ mod tests {
     fn test_nsec3_nxdomain_needs_the_name_covered() {
         let cache = cache_with_an_nsec3_chain();
         assert!(cache
-            .synthesize("elsewhere.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("elsewhere.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
     }
 
@@ -1591,7 +1589,7 @@ mod tests {
             ],
         ));
         assert!(cache
-            .synthesize("nope.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
     }
 
@@ -1637,7 +1635,7 @@ mod tests {
         ));
         assert!(cache.is_empty());
         assert!(cache
-            .synthesize("nope.example.com.", Qtype::of(rt::A))
+            .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
     }
 
@@ -1670,7 +1668,7 @@ mod tests {
 
         // Answered from example.com.'s NODATA proof, not com.'s gap.
         let s = cache
-            .synthesize("nope.example.com.", Qtype::of(rt::AAAA))
+            .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::AAAA))
             .expect("the child zone's proof applies");
         assert_eq!(
             s.rcode,
@@ -1766,7 +1764,7 @@ mod tests {
         cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
 
         let s = cache
-            .synthesize_wildcard("b.example.com.", Qtype::of(rt::A))
+            .synthesize_wildcard(nm("b.example.com.").as_ref(), Qtype::of(rt::A))
             .expect("the same wildcard reaches this name too");
         assert_eq!(
             s.answers
@@ -1811,13 +1809,13 @@ mod tests {
 
         assert!(
             cache
-                .synthesize_wildcard("x.b.example.com.", Qtype::of(rt::A))
+                .synthesize_wildcard(nm("x.b.example.com.").as_ref(), Qtype::of(rt::A))
                 .is_none(),
             "*.example.com. does not reach a name two labels down"
         );
         assert!(
             cache
-                .synthesize_wildcard("x.y.z.example.com.", Qtype::of(rt::A))
+                .synthesize_wildcard(nm("x.y.z.example.com.").as_ref(), Qtype::of(rt::A))
                 .is_none(),
             "nor any deeper"
         );
@@ -1842,7 +1840,7 @@ mod tests {
         ));
 
         assert!(cache
-            .synthesize_wildcard("b.example.com.", Qtype::of(rt::A))
+            .synthesize_wildcard(nm("b.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
     }
 
@@ -1853,13 +1851,13 @@ mod tests {
         cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
 
         assert!(cache
-            .synthesize_wildcard("b.example.com.", Qtype::of(rt::A))
+            .synthesize_wildcard(nm("b.example.com.").as_ref(), Qtype::of(rt::A))
             .is_some());
         assert!(cache
-            .synthesize_wildcard("b.example.com.", Qtype::of(rt::AAAA))
+            .synthesize_wildcard(nm("b.example.com.").as_ref(), Qtype::of(rt::AAAA))
             .is_none());
         assert!(cache
-            .synthesize_wildcard("b.example.com.", Qtype::of(rt::MX))
+            .synthesize_wildcard(nm("b.example.com.").as_ref(), Qtype::of(rt::MX))
             .is_none());
     }
 
@@ -1872,7 +1870,7 @@ mod tests {
         cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 3, apex_gap()));
 
         assert!(cache
-            .synthesize_wildcard("b.example.com.", Qtype::of(rt::A))
+            .synthesize_wildcard(nm("b.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
         assert!(cache.is_empty(), "nothing was stored at all");
     }
@@ -1897,7 +1895,7 @@ mod tests {
 
         assert!(
             cache
-                .synthesize_wildcard("x.sub.example.com.", Qtype::of(rt::A))
+                .synthesize_wildcard(nm("x.sub.example.com.").as_ref(), Qtype::of(rt::A))
                 .is_none(),
             "the child zone's names are not ours to answer for"
         );
@@ -1906,12 +1904,12 @@ mod tests {
     #[test]
     fn test_the_wildcard_derivations() {
         assert_eq!(
-            wildcard_for_expansion(nm("a.example.com.").as_ref(), 2).as_deref(),
-            Some("*.example.com.")
+            wildcard_for_expansion(nm("a.example.com.").as_ref(), 2),
+            Some(nm("*.example.com."))
         );
         assert_eq!(
-            wildcard_for_expansion(nm("x.y.example.com.").as_ref(), 2).as_deref(),
-            Some("*.example.com."),
+            wildcard_for_expansion(nm("x.y.example.com.").as_ref(), 2),
+            Some(nm("*.example.com.")),
             "two labels stripped is still the same wildcard name"
         );
         assert_eq!(
@@ -1929,24 +1927,24 @@ mod tests {
         // An escaped dot in the part that *is* stripped: the wildcard is still
         // `*.` plus whole labels of the name.
         assert_eq!(
-            wildcard_for_expansion(nm(r"x.a\.b.example.com.").as_ref(), 3).as_deref(),
-            Some(r"*.a\.b.example.com.")
+            wildcard_for_expansion(nm(r"x.a\.b.example.com.").as_ref(), 3),
+            Some(nm(r"*.a\.b.example.com."))
         );
 
         assert_eq!(
-            wildcard_for_parent_of("b.example.com.").as_deref(),
-            Some("*.example.com.")
+            wildcard_for_parent_of(nm("b.example.com.").as_ref()),
+            Some(nm("*.example.com."))
         );
         assert_eq!(
-            wildcard_for_parent_of("x.b.example.com.").as_deref(),
-            Some("*.b.example.com."),
+            wildcard_for_parent_of(nm("x.b.example.com.").as_ref()),
+            Some(nm("*.b.example.com.")),
             "the immediate parent, which is what makes the depth check work"
         );
         // A top-level name's parent is the root, so the wildcard that would
         // govern it is `*.` — refused rather than derived. The root publishes no
         // wildcard, and a rule about synthesizing TLDs is not one to have.
-        assert_eq!(wildcard_for_parent_of("com."), None);
-        assert_eq!(wildcard_for_parent_of("."), None);
+        assert_eq!(wildcard_for_parent_of(nm("com.").as_ref()), None);
+        assert_eq!(wildcard_for_parent_of(nm(".").as_ref()), None);
     }
 
     /// A disabled cache stores nothing, the same as for denials.
@@ -1955,7 +1953,7 @@ mod tests {
         let cache = NsecCache::new(0);
         cache.insert_validated_wildcard(&wildcard_answer("a.example.com.", 2, apex_gap()));
         assert!(cache
-            .synthesize_wildcard("b.example.com.", Qtype::of(rt::A))
+            .synthesize_wildcard(nm("b.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
         assert!(cache.is_empty());
     }

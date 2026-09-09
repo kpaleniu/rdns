@@ -9,7 +9,7 @@
 //! `example.org.`. RFC 6761 reserves them as *ordinary* names, delegated and
 //! resolvable, which is the one thing they exist for.
 
-use crate::utils::{is_at_or_under, record_types as rt};
+use crate::utils::record_types as rt;
 use crate::Class;
 use crate::Serial;
 use crate::Ttl;
@@ -36,12 +36,11 @@ const LOCAL_TTL: Ttl = Ttl::from_secs(3600);
 ///
 /// `None` means "an ordinary name": resolve it as usual.
 pub fn lookup(qname: NameRef<'_>, qtype: Qtype) -> Option<LocalAnswer> {
-    // These are matched as text: the list is written as text, in this file.
-    let name = qname.to_presentation().to_ascii_lowercase();
+    let table = table();
 
     // RFC 6761 §6.3: `localhost.` and the whole subtree under it is the loopback
     // interface, and must never be sent to a DNS server.
-    if name == "localhost." || name.ends_with(".localhost.") {
+    if qname.is_at_or_under(table.localhost.as_ref()) {
         return Some(match Rtype::new(qtype.to_u16()) {
             rt::A => positive(
                 qname,
@@ -63,17 +62,14 @@ pub fn lookup(qname: NameRef<'_>, qtype: Qtype) -> Option<LocalAnswer> {
 
     // RFC 6303 §4.2: 127.0.0.1 is `localhost.`; the rest of 127/8 is ours to
     // answer for, and the answer is that nothing is there.
-    if name == "1.0.0.127.in-addr.arpa." && qtype.is(rt::PTR) {
+    if qname == table.loopback_ptr.as_ref() && qtype.is(rt::PTR) {
         return Some(positive(
             qname,
-            RecordData::from_parsed(&ParsedRecord::PTR(
-                Name::from_presentation("localhost.").ok()?,
-            ))
-            .ok()?,
+            RecordData::from_parsed(&ParsedRecord::PTR(table.localhost.clone())).ok()?,
             "127.0.0.1 is localhost (RFC 6303 §4.2)",
         ));
     }
-    if is_at_or_under(&name, "127.in-addr.arpa.") {
+    if qname.is_at_or_under(table.loopback_reverse.as_ref()) {
         return Some(nxdomain(
             "127.in-addr.arpa.",
             "the loopback reverse zone is answered locally (RFC 6303 §4.2)",
@@ -82,7 +78,7 @@ pub fn lookup(qname: NameRef<'_>, qtype: Qtype) -> Option<LocalAnswer> {
 
     // RFC 6762 §3: `.local` is mDNS, not a DNS namespace, so NXDOMAIN is the
     // literal truth rather than a policy.
-    if is_at_or_under(&name, "local.") {
+    if qname.is_at_or_under(table.mdns.as_ref()) {
         return Some(nxdomain(
             "local.",
             "`.local` is mDNS, not DNS (RFC 6762 §3)",
@@ -90,7 +86,7 @@ pub fn lookup(qname: NameRef<'_>, qtype: Qtype) -> Option<LocalAnswer> {
     }
 
     // RFC 6761 §6.4: `invalid.` is reserved to be unresolvable.
-    if is_at_or_under(&name, "invalid.") {
+    if qname.is_at_or_under(table.invalid.as_ref()) {
         return Some(nxdomain(
             "invalid.",
             "`invalid.` is reserved to not exist (RFC 6761 §6.4)",
@@ -99,16 +95,51 @@ pub fn lookup(qname: NameRef<'_>, qtype: Qtype) -> Option<LocalAnswer> {
 
     // RFC 6303 §4: a PTR for non-globally-unique space describes part of
     // somebody's internal network.
-    for zone in PRIVATE_REVERSE_ZONES {
-        if is_at_or_under(&name, zone) {
+    for (zone, text) in table.private_reverse.iter().zip(PRIVATE_REVERSE_ZONES) {
+        if qname.is_at_or_under(zone.as_ref()) {
             return Some(nxdomain(
-                zone,
+                text,
                 "a private-address reverse lookup is answered locally (RFC 6303 §4)",
             ));
         }
     }
 
     None
+}
+
+/// The table's names, parsed once.
+///
+/// A query used to pay `to_presentation()` and a down-casing `String` to be
+/// compared against text — on every name a resolver is asked for, since this is
+/// consulted before the caches. The names are the same on every call, so they
+/// are built once and the comparison is [`NameRef::is_at_or_under`]'s, which
+/// folds case as it walks (RFC 4343) and allocates nothing.
+struct Table {
+    localhost: Name,
+    loopback_ptr: Name,
+    loopback_reverse: Name,
+    mdns: Name,
+    invalid: Name,
+    /// In the order of [`PRIVATE_REVERSE_ZONES`], whose text is what the log
+    /// line names.
+    private_reverse: Vec<Name>,
+}
+
+fn table() -> &'static Table {
+    static TABLE: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let parse = |text: &str| {
+            Name::from_presentation(text).expect("a name written out in this file parses")
+        };
+        Table {
+            localhost: parse("localhost."),
+            loopback_ptr: parse("1.0.0.127.in-addr.arpa."),
+            loopback_reverse: parse("127.in-addr.arpa."),
+            mdns: parse("local."),
+            invalid: parse("invalid."),
+            private_reverse: PRIVATE_REVERSE_ZONES.iter().copied().map(parse).collect(),
+        }
+    })
 }
 
 /// Reverse zones for address space that is not globally unique, so a name in one

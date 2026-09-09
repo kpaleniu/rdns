@@ -2,7 +2,7 @@
 //! delegation chain from the root ourselves or by forwarding to a configured
 //! upstream. See [`ResolverMode`].
 
-use crate::dnssec::{canonical_name_of, Dnskey, Rrsig};
+use crate::dnssec::{Dnskey, Rrsig};
 use crate::dnssec_chain::{
     cname_chain_shape, ChainShape, ChainValidator, DelegationEvidence, DelegationVerdict, KeyStore,
     TrustAnchors, ValidationState,
@@ -12,8 +12,6 @@ use crate::error::{ResolveError, ResolveResult};
 use crate::utils::{
     bind_addr_for, current_unix_timestamp, dname_redirect, record_types as rt, Redirect,
 };
-#[cfg(test)]
-use crate::utils::{is_at_or_under, label_count};
 use crate::validation::{answers_query, SentQuery};
 use crate::Qtype;
 use crate::Rtype;
@@ -660,32 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn test_label_count_and_suffix() {
-        assert_eq!(label_count("."), 0);
-        assert_eq!(label_count("com."), 1);
-        assert_eq!(label_count("example.com"), 2);
-        assert_eq!(label_count("www.example.com."), 3);
-
-        // The minimized name is [`crate::utils::suffix_labels`] now, which is
-        // tested there; this holds the shape this walk asks it for.
-        assert_eq!(crate::utils::suffix_labels("www.example.com.", 0), ".");
-        assert_eq!(crate::utils::suffix_labels("www.example.com.", 1), "com.");
-        assert_eq!(
-            crate::utils::suffix_labels("www.example.com.", 2),
-            "example.com."
-        );
-        assert_eq!(
-            crate::utils::suffix_labels("www.example.com.", 3),
-            "www.example.com."
-        );
-        // Asking for more labels than the name has yields the whole name.
-        assert_eq!(
-            crate::utils::suffix_labels("www.example.com.", 9),
-            "www.example.com."
-        );
-    }
-
-    #[test]
     fn test_randomize_case_changes_only_case() {
         // Length octets, digits and hyphens included: only an ASCII letter may
         // move, and then only in bit 0x20. Flipping a length octet would be a
@@ -1003,7 +975,11 @@ this line has no record and is skipped
             if name == "www.example2.test." {
                 return authoritative(q, vec![a_record(&name, [192, 0, 2, 7])]);
             }
-            if name != "example.test." && is_at_or_under(&name, "example.test.") {
+            if name != "example.test."
+                && nm(&name)
+                    .as_ref()
+                    .is_at_or_under(nm("example.test.").as_ref())
+            {
                 return authoritative(q, vec![dname_record("example.test.", "example2.test.")]);
             }
             authoritative(q, vec![])
@@ -1094,7 +1070,10 @@ this line has no record and is skipped
             authoritative(q, vec![dname_record(".", "evil.")])
         });
         let root = spawn_server(root_sock, move |q| {
-            if is_at_or_under(&qname_of(q), "evil.") {
+            if nm(&qname_of(q))
+                .as_ref()
+                .is_at_or_under(nm("evil.").as_ref())
+            {
                 referral(q, "evil.", "ns.evil.", Some(("ns.evil.", evil_addr)))
             } else {
                 referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
@@ -2902,7 +2881,7 @@ this line has no record and is skipped
 
         // A name nobody has ever asked about, answered from the cached gap.
         let synthesized = cache
-            .synthesize("never-queried.example.test.", Qtype::of(rt::A))
+            .synthesize(nm("never-queried.example.test.").as_ref(), Qtype::of(rt::A))
             .expect("the cached gap covers this name too");
         assert_eq!(synthesized.rcode, ResponseCode::NoSuchDomain);
         assert!(
@@ -2917,7 +2896,7 @@ this line has no record and is skipped
         // But a name outside the gap still has to be resolved.
         assert!(
             cache
-                .synthesize("zzz.example.test.", Qtype::of(rt::A))
+                .synthesize(nm("zzz.example.test.").as_ref(), Qtype::of(rt::A))
                 .is_none(),
             "the gap ends at www.example.test."
         );
@@ -3167,7 +3146,7 @@ this line has no record and is skipped
         // gap in the proof runs from `*.example.test.` to `zzz.example.test.`, so
         // this name is inside it and provably absent.
         let synthesized = cache
-            .synthesize_wildcard("never-asked.example.test.", Qtype::of(rt::A))
+            .synthesize_wildcard(nm("never-asked.example.test.").as_ref(), Qtype::of(rt::A))
             .expect("the cached wildcard reaches this name too");
         assert!(
             synthesized.answers.iter().any(|rr| matches!(
@@ -3195,7 +3174,10 @@ this line has no record and is skipped
         // the covering NSEC looks: a wildcard reaches exactly one label.
         assert!(
             cache
-                .synthesize_wildcard("deeper.never-asked.example.test.", Qtype::of(rt::A))
+                .synthesize_wildcard(
+                    nm("deeper.never-asked.example.test.").as_ref(),
+                    Qtype::of(rt::A)
+                )
                 .is_none(),
             "*.example.test. does not reach two labels down"
         );

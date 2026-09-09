@@ -44,11 +44,7 @@ impl Resolver {
         // Every zone that put its name to something here.
         let mut signers: Vec<Name> = Vec::new();
         for sig in records.iter().filter_map(Rrsig::from_record) {
-            // The signer name is canonical text on an `Rrsig`; the chain walk
-            // works in names, so the boundary is here.
-            let Ok(signer) = Name::from_presentation(&sig.signer_name) else {
-                continue;
-            };
+            let signer = sig.signer_name;
             if !signers.contains(&signer) {
                 signers.push(signer);
             }
@@ -176,9 +172,7 @@ impl Resolver {
                     }
                 }
             };
-            // Canonical: `KeyStore` is looked up by an RRSIG's signer name,
-            // which is down-cased (RFC 4034 §6.2).
-            keys.insert(canonical_name_of(zone.as_ref()), zone_keys.clone());
+            keys.insert(zone.as_ref().to_folded(), zone_keys.clone());
 
             if zone.as_ref() == target {
                 return ValidationState::Secure;
@@ -258,15 +252,15 @@ impl Resolver {
             .authorities
             .iter()
             .find(|rr| rr.rdata.rtype() == rt::SOA)
-            .map(|rr| rr.name.as_ref().to_presentation())
-            .unwrap_or_else(|| denied_name.to_presentation());
+            .map(|rr| rr.name.clone())
+            .unwrap_or_else(|| denied_name.to_owned());
 
         let denial = if response.rcode == ResponseCode::NoSuchDomain {
-            proves_nxdomain(&denied_name.to_presentation(), &zone, &nsecs, &nsec3s)
+            proves_nxdomain(denied_name, zone.as_ref(), &nsecs, &nsec3s)
         } else {
             proves_nodata(
-                &denied_name.to_presentation(),
-                &zone,
+                denied_name,
+                zone.as_ref(),
                 Rtype::new(query.qtype.to_u16()),
                 &nsecs,
                 &nsec3s,

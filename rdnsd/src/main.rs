@@ -5172,14 +5172,14 @@ ns.plain  IN A   192.0.2.30
                 else {
                     panic!("nsec3={nsec3}: expected a wildcard expansion, got {proof:?}");
                 };
-                assert_eq!(wildcard, "*.example.com.");
+                assert_eq!(wildcard, nm("*.example.com."));
 
                 // And the denial it owes: without it one captured answer is a
                 // valid answer for every name the wildcard reaches
                 // (RFC 4035 §3.1.3).
                 let verdict = proves_wildcard_expansion(
-                    qname,
-                    &wildcard,
+                    nm(qname).as_ref(),
+                    wildcard.as_ref(),
                     &nsecs_in(&response.authorities),
                     &nsec3s_in(&response.authorities),
                 );
@@ -5362,7 +5362,7 @@ ns.plain  IN A   192.0.2.30
                     "nsec3={nsec3}: this child is not signed"
                 );
                 let denial = proves_no_ds(
-                    "plain.example.com.",
+                    nm("plain.example.com.").as_ref(),
                     &nsecs_in(&response.authorities),
                     &nsec3s_in(&response.authorities),
                 );
@@ -5418,8 +5418,8 @@ ns.plain  IN A   192.0.2.30
                 assert_eq!(response.rcode, ResponseCode::NoSuchDomain);
 
                 let denial = proves_nxdomain(
-                    "gone.a.b.example.com.",
-                    "example.com.",
+                    nm("gone.a.b.example.com.").as_ref(),
+                    nm("example.com.").as_ref(),
                     &nsecs_in(&response.authorities),
                     &nsec3s_in(&response.authorities),
                 );

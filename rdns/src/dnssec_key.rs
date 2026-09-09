@@ -21,6 +21,7 @@ use crate::dnssec::{
 use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
 use crate::utils::base64_encode;
+use crate::{Name, NameRef};
 use ring::rand::SystemRandom;
 use ring::signature::{
     EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING,
@@ -128,7 +129,7 @@ enum Pair {
 
 /// A private key that can sign an RRset for one zone.
 pub struct SigningKey {
-    owner: String,
+    owner: Name,
     flags: u16,
     algorithm: SigningAlgorithm,
     /// The public half in DNSKEY form, which is not `ring`'s form for ECDSA or
@@ -235,7 +236,10 @@ impl SigningKey {
         }
 
         Ok(SigningKey {
-            owner: crate::dnssec::canonical_name(owner),
+            owner: Name::from_presentation(owner)
+                .map_err(|e| DnssecError::key(format!("key owner {owner:?}: {e}")))?
+                .as_ref()
+                .to_folded(),
             flags,
             algorithm,
             public_key,
@@ -244,8 +248,8 @@ impl SigningKey {
         })
     }
 
-    pub fn owner(&self) -> &str {
-        &self.owner
+    pub fn owner(&self) -> NameRef<'_> {
+        self.owner.as_ref()
     }
 
     pub fn flags(&self) -> u16 {
@@ -341,7 +345,7 @@ impl SigningKey {
         expiration: u32,
     ) -> Result<Rrsig> {
         let mut rrsig = Rrsig {
-            owner: crate::dnssec::canonical_name_of(rrset.owner),
+            owner: rrset.owner.to_folded(),
             type_covered: rrset.rtype,
             algorithm: self.algorithm.code(),
             labels: rrsig_labels_of(rrset.owner),
@@ -492,7 +496,7 @@ impl SigningKey {
         // irrelevant to a signature, but the order signatures are *generated*
         // in shows up in the written zone file, and a zone that reshuffles on
         // every reload makes a diff useless.
-        keys.sort_by_key(|k| (k.owner.clone(), k.algorithm.code(), k.key_tag()));
+        keys.sort_by_key(|k| (k.owner.to_string(), k.algorithm.code(), k.key_tag()));
         Ok(keys)
     }
 }
@@ -679,7 +683,7 @@ mod tests {
 
         // Re-owned onto a name the wildcard expands to, it still verifies.
         let mut expanded = sig.clone();
-        expanded.owner = "anything.example.com.".to_string();
+        expanded.owner = nm("anything.example.com.");
         let expanded_owner = nm("anything.example.com.");
         let expanded_rrset = Rrset::new(expanded_owner.as_ref(), rt::A, Class::new(1), &rdatas);
         assert!(matches!(

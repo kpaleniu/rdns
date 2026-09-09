@@ -13,6 +13,7 @@
 //! forbids (`CLAUDE.md` §8), and disagreed with this one about `=` padding.
 
 use crate::error::{WireError, WireResult};
+use crate::NameRef;
 use crate::Rtype;
 use std::cmp::Ordering;
 
@@ -24,7 +25,7 @@ use std::cmp::Ordering;
 /// `Iterator::cmp` gives both remaining rules for free: the first differing
 /// label decides, and a name that runs out of labels first is an ancestor and
 /// sorts before its descendants.
-pub fn canonical_name_cmp(a: &str, b: &str) -> Ordering {
+pub fn canonical_name_cmp(a: NameRef<'_>, b: NameRef<'_>) -> Ordering {
     reversed_labels(a).cmp(reversed_labels(b))
 }
 
@@ -35,8 +36,8 @@ pub fn canonical_name_cmp(a: &str, b: &str) -> Ordering {
 /// terminator is what makes an ancestor sort before its descendants and keeps a
 /// label from sorting after a longer label it is a prefix of (`ab\0` before
 /// `abc\0`). Zero cannot occur inside a label.
-pub fn canonical_sort_key(name: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(name.len() + 1);
+pub fn canonical_sort_key(name: NameRef<'_>) -> Vec<u8> {
+    let mut key = Vec::with_capacity(name.as_wire().len());
     for label in reversed_labels(name) {
         key.extend(label.folded());
         key.push(0);
@@ -52,14 +53,19 @@ pub fn canonical_sort_key(name: &str) -> Vec<u8> {
 /// makes three comparisons. A signed NXDOMAIN spent 142 allocations, most of
 /// them here.
 ///
-/// It also split on `.`, which RFC 4034 §6.1 ordering cannot survive for a name
-/// holding RFC 1035 §5.1's `\.`: `a\.b.example.com.` came apart into four
-/// labels, one of them ending in a backslash, so it sorted somewhere no other
-/// implementation puts it (`TODO.md` #37a).
-pub(crate) fn reversed_labels(name: &str) -> impl Iterator<Item = Folded<'_>> {
-    crate::utils::presentation_labels(name)
-        .rev()
-        .map(Folded::new)
+/// It also read presentation text, and split it on `.`, which RFC 4034 §6.1
+/// ordering cannot survive for a name holding RFC 1035 §5.1's `\.`:
+/// `a\.b.example.com.` came apart into four labels, one of them ending in a
+/// backslash, so it sorted somewhere no other implementation puts it
+/// (`TODO.md` #37a). Reading the wire form is the same rule with nothing to get
+/// wrong — a label is what the length octet says it is.
+///
+/// `suffix(n)` per label rather than a reversed iterator: [`NameRef::labels`]
+/// walks forwards, since the wire form is a chain of length octets, and the
+/// alternative to re-walking it is an offset table on the stack for a name that
+/// has three labels.
+pub(crate) fn reversed_labels(name: NameRef<'_>) -> impl Iterator<Item = Folded<'_>> {
+    (1..=name.label_count()).map(move |n| Folded(name.suffix(n).labels().next().unwrap_or(&[])))
 }
 
 /// One label as the octets it stands for, ordered as RFC 4034 §6.1 requires:
@@ -68,23 +74,9 @@ pub(crate) fn reversed_labels(name: &str) -> impl Iterator<Item = Folded<'_>> {
 /// A newtype because `Iterator::cmp` needs `Ord` and `Iterator::cmp_by` is
 /// unstable. `Eq` is written in terms of `Ord` rather than derived, since a
 /// derived one would compare the bytes without folding and disagree with it.
-pub(crate) struct Folded<'a>(std::borrow::Cow<'a, [u8]>);
+pub(crate) struct Folded<'a>(&'a [u8]);
 
-impl<'a> Folded<'a> {
-    /// Borrows unless the label holds an escape, which is nearly every label.
-    fn new(label: &'a str) -> Folded<'a> {
-        if !label.as_bytes().contains(&b'\\') {
-            return Folded(std::borrow::Cow::Borrowed(label.as_bytes()));
-        }
-        // A label that will not decode did not come from `Name`, whose escaping
-        // this reverses. Ordering it by its raw text is wrong in the same way
-        // the old code was wrong for every escaped name; dropping it would be
-        // worse, because a shorter name sorts somewhere else entirely.
-        let decoded =
-            crate::utils::char_string_decode(label).unwrap_or_else(|_| label.as_bytes().to_vec());
-        Folded(std::borrow::Cow::Owned(decoded))
-    }
-
+impl Folded<'_> {
     fn folded(&self) -> impl Iterator<Item = u8> + '_ {
         self.0.iter().map(|b| b.to_ascii_lowercase())
     }
@@ -290,30 +282,33 @@ pub fn base32hex_decode(text: &str) -> WireResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_records::nm;
     use crate::utils::record_types as rt;
+
+    /// The two orderings under test, over names written as text. Both take a
+    /// `NameRef` now, and a test that spelled the conversion at every call site
+    /// would be reading about `Name` rather than about the ordering.
+    fn cmp(a: &str, b: &str) -> Ordering {
+        canonical_name_cmp(nm(a).as_ref(), nm(b).as_ref())
+    }
+
+    fn key(name: &str) -> Vec<u8> {
+        canonical_sort_key(nm(name).as_ref())
+    }
 
     /// Sorting is by label from the right, so a deeper name under an earlier
     /// label comes first.
     #[test]
     fn test_canonical_order_is_by_label_from_the_right() {
         // The rightmost differing label decides.
-        assert_eq!(
-            canonical_name_cmp("a.z.example.com.", "b.example.com."),
-            Ordering::Greater
-        );
+        assert_eq!(cmp("a.z.example.com.", "b.example.com."), Ordering::Greater);
         // Plain string comparison gets exactly this backwards.
         assert!("a.z.example.com." < "b.example.com.");
 
         // A name sorts before everything beneath it.
-        assert_eq!(
-            canonical_name_cmp("example.com.", "www.example.com."),
-            Ordering::Less
-        );
+        assert_eq!(cmp("example.com.", "www.example.com."), Ordering::Less);
         // Case and trailing dots do not matter.
-        assert_eq!(
-            canonical_name_cmp("EXAMPLE.com", "example.com."),
-            Ordering::Equal
-        );
+        assert_eq!(cmp("EXAMPLE.com", "example.com."), Ordering::Equal);
         // RFC 4034 §6.1's own example ordering, less the two names it spells
         // with escapes (`\001.z.example` and `\200.z.example`): a label holding
         // `\` is refused outright here (`dname::unrepresentable_octet`), so
@@ -333,7 +328,7 @@ mod tests {
             "a.example.",
             "Z.a.example.",
         ];
-        names.sort_by(|a, b| canonical_name_cmp(a, b));
+        names.sort_by(|a, b| cmp(a, b));
         assert_eq!(
             names,
             vec![
@@ -371,26 +366,23 @@ mod tests {
         for a in names {
             for b in names {
                 assert_eq!(
-                    canonical_sort_key(a).cmp(&canonical_sort_key(b)),
-                    canonical_name_cmp(a, b),
+                    key(a).cmp(&key(b)),
+                    cmp(a, b),
                     "sort key disagrees with canonical order for {a:?} vs {b:?}"
                 );
             }
         }
         // The two properties the zero terminator buys, spelled out.
-        assert!(canonical_sort_key("example.") < canonical_sort_key("a.example."));
-        assert!(canonical_sort_key("ab.example.") < canonical_sort_key("abc.example."));
+        assert!(key("example.") < key("a.example."));
+        assert!(key("ab.example.") < key("abc.example."));
 
         // `a\.b` is one label of three octets (RFC 1035 §5.1), so the key holds
         // the dot it stands for and not the backslash that spells it. Splitting
         // on `.` made three labels of it and wrote `example\0b\0a\\0`, which is
         // where no other implementation puts the name (`TODO.md` #37a).
-        assert_eq!(
-            canonical_sort_key(r"a\.b.example."),
-            b"example\0a.b\0".to_vec()
-        );
-        assert!(canonical_sort_key("a.example.") < canonical_sort_key(r"a\.b.example."));
-        assert!(canonical_sort_key(r"a\.b.example.") < canonical_sort_key("b.example."));
+        assert_eq!(key(r"a\.b.example."), b"example\0a.b\0".to_vec());
+        assert!(key("a.example.") < key(r"a\.b.example."));
+        assert!(key(r"a\.b.example.") < key("b.example."));
     }
 
     #[test]

@@ -79,7 +79,7 @@ impl TestKey {
 
     pub fn dnskey_with(&self, owner: &str, flags: u16) -> Dnskey {
         Dnskey {
-            owner: owner.to_string(),
+            owner: nm(owner),
             flags,
             protocol: 3,
             algorithm: self.algorithm(),
@@ -99,7 +99,7 @@ impl TestKey {
     ) -> Rrsig {
         let now = current_unix_timestamp();
         Rrsig {
-            owner: owner.to_presentation(),
+            owner: owner.to_owned(),
             type_covered,
             algorithm: self.algorithm(),
             labels: rrsig_labels_of(owner),
@@ -107,7 +107,7 @@ impl TestKey {
             inception: (now - 3600) as u32,
             expiration: (now + 86_400) as u32,
             key_tag: key_tag(flags, 3, self.algorithm(), self.public_key()),
-            signer_name: signer.to_string(),
+            signer_name: nm(signer),
             signature: Vec::new(),
         }
     }
@@ -180,7 +180,7 @@ impl TestZone {
     pub fn ds(&self, digest_type: u8) -> Ds {
         let ksk = self.ksk.ksk(&self.name);
         Ds {
-            owner: self.name.clone(),
+            owner: nm(&self.name),
             key_tag: ksk.key_tag(),
             algorithm: ksk.algorithm,
             digest_type,
@@ -222,7 +222,7 @@ impl TestZone {
             &self.name,
             &rdatas,
         );
-        sig.owner = first.name.to_string();
+        sig.owner = first.name.clone();
         rrsig_record(&sig, first.ttl)
     }
 
@@ -257,7 +257,7 @@ pub fn dnskey_rdata(key: &Dnskey) -> RecordData {
 /// An RRSIG as a resource record.
 pub fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
-        name: nm(&sig.owner.clone()),
+        name: sig.owner.clone(),
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
@@ -268,7 +268,7 @@ pub fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
             inception: sig.inception,
             expiration: sig.expiration,
             key_tag: sig.key_tag,
-            signer_name: nm(&sig.signer_name.clone()),
+            signer_name: sig.signer_name.clone(),
             signature: sig.signature.clone(),
         })
         .expect("encode RRSIG"),
@@ -278,7 +278,7 @@ pub fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
 /// A DS as a resource record.
 pub fn ds_record(ds: &Ds, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
-        name: nm(&ds.owner.clone()),
+        name: ds.owner.clone(),
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::DS {

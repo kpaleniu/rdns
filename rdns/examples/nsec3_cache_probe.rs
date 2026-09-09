@@ -68,19 +68,21 @@ fn main() {
     let cache = NsecCache::new(4);
     cache.insert_validated(&filled(iterations));
 
-    let qname = format!("{}example.com.", "a.".repeat(labels));
+    let qname: rdns::Name = format!("{}example.com.", "a.".repeat(labels))
+        .parse()
+        .expect("the probe's own name parses");
     // A name in presentation form with a trailing dot is one octet shorter than
     // its wire form, which ends in a zero-length root label.
-    let octets = qname.len() + 1;
+    let octets = qname.as_ref().as_wire().len();
     assert!(
-        cache.synthesize(&qname, Qtype::of(rt::A)).is_none(),
+        cache.synthesize(qname.as_ref(), Qtype::of(rt::A)).is_none(),
         "the probe measures the miss; something in the cache answered"
     );
 
     let n = 100;
     let start = Instant::now();
     for _ in 0..n {
-        black_box(cache.synthesize(&qname, Qtype::of(rt::A)));
+        black_box(cache.synthesize(qname.as_ref(), Qtype::of(rt::A)));
     }
     let each = start.elapsed() / n;
     println!(

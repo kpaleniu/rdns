@@ -75,7 +75,7 @@ impl std::error::Error for CryptoError {}
 /// to the wrong zone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dnskey {
-    pub owner: String,
+    pub owner: Name,
     pub flags: u16,
     pub protocol: u8,
     pub algorithm: u8,
@@ -95,7 +95,7 @@ impl Dnskey {
                 algorithm,
                 public_key,
             } => Some(Dnskey {
-                owner: canonical_name_of(rr.name.as_ref()),
+                owner: rr.name.as_ref().to_folded(),
                 flags,
                 protocol,
                 algorithm,
@@ -136,7 +136,7 @@ impl Dnskey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rrsig {
     /// Owner of the RRSIG record, i.e. the name of the RRset it covers.
-    pub owner: String,
+    pub owner: Name,
     pub type_covered: Rtype,
     pub algorithm: u8,
     pub labels: u8,
@@ -144,7 +144,7 @@ pub struct Rrsig {
     pub inception: u32,
     pub expiration: u32,
     pub key_tag: u16,
-    pub signer_name: String,
+    pub signer_name: Name,
     pub signature: Vec<u8>,
 }
 
@@ -165,7 +165,7 @@ impl Rrsig {
                 signer_name,
                 signature,
             } => Some(Rrsig {
-                owner: canonical_name_of(rr.name.as_ref()),
+                owner: rr.name.as_ref().to_folded(),
                 type_covered,
                 algorithm,
                 labels,
@@ -173,7 +173,7 @@ impl Rrsig {
                 inception,
                 expiration,
                 key_tag,
-                signer_name: canonical_name_of(signer_name.as_ref()),
+                signer_name: signer_name.as_ref().to_folded(),
                 signature,
             }),
             _ => None,
@@ -193,7 +193,7 @@ impl Rrsig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ds {
     /// The delegated (child) zone name — the DS's owner.
-    pub owner: String,
+    pub owner: Name,
     pub key_tag: u16,
     pub algorithm: u8,
     pub digest_type: u8,
@@ -212,7 +212,7 @@ impl Ds {
                 digest_type,
                 digest,
             } => Some(Ds {
-                owner: canonical_name_of(rr.name.as_ref()),
+                owner: rr.name.as_ref().to_folded(),
                 key_tag,
                 algorithm,
                 digest_type,
@@ -257,17 +257,6 @@ pub fn rrsigs_in(records: &[ResourceRecord]) -> Vec<Rrsig> {
 /// must not quietly change (`TODO.md` #13e).
 pub fn canonical_name_of(name: NameRef<'_>) -> String {
     canonical_name(&name.to_presentation())
-}
-
-/// A name held here as canonical text, back as the octets a digest covers.
-///
-/// Through [`Name`], not `dname_to_bytes`: RFC 1035 §5.1 lets a label contain a
-/// `.` and `dname_to_bytes` refuses the escape that spells one, so a zone whose
-/// apex needed one could not be signed and its DS could not be digested. The
-/// three structs here keep text owners on purpose — that text is what
-/// [`canonical_name_of`] produces — and this is the one door back.
-fn canonical_wire(name: &str) -> DnssecResult<Name> {
-    Ok(Name::from_presentation(name)?.as_ref().to_folded())
 }
 
 /// Absolute, lowercased form. DNS names compare case-insensitively (RFC 4343)
@@ -428,7 +417,11 @@ pub fn signed_data(
     data.extend_from_slice(&rrsig.expiration.to_be_bytes());
     data.extend_from_slice(&rrsig.inception.to_be_bytes());
     data.extend_from_slice(&rrsig.key_tag.to_be_bytes());
-    data.extend_from_slice(canonical_wire(&rrsig.signer_name)?.as_ref().as_wire());
+    // Folded here rather than trusted: canonical form is down-cased
+    // (RFC 4034 §6.2) and `Rrsig` is a public struct anyone can fill in. The
+    // `Cow` borrows for a name that is already lower case, which every one that
+    // came off the wire through `from_record` is.
+    data.extend_from_slice(&rrsig.signer_name.as_ref().folded());
 
     let signed_at = signed_owner_name(owner, rrsig.labels)?;
     let name_wire = signed_at.as_ref().as_wire();
@@ -491,7 +484,9 @@ pub fn key_tag(flags: u16, protocol: u8, algorithm: u8, public_key: &[u8]) -> u1
 /// reads as "this key is not the one the parent vouched for" — turns every
 /// secure delegation into a failure.
 pub fn ds_digest(key: &Dnskey, digest_type: u8) -> DnssecResult<Vec<u8>> {
-    let mut input = canonical_wire(&key.owner)?.as_ref().as_wire().to_vec();
+    // Down-cased, as the signer's own owner name is (RFC 4034 §6.2): the digest
+    // must not depend on how the key's publisher spelled it.
+    let mut input = key.owner.as_ref().folded().into_owned();
     input.extend_from_slice(&key.rdata());
 
     Ok(match digest_type {
@@ -631,7 +626,7 @@ pub enum RrsetProof {
         /// caller that cares about denial of existence needs this: an expanded
         /// wildcard answer is only complete with an NSEC proving the queried
         /// name itself does not exist (RFC 4035 §5.3.4).
-        wildcard: Option<String>,
+        wildcard: Option<Name>,
         /// When the signature stops being valid, so a cache can be capped by it.
         expires: u32,
     },
@@ -693,15 +688,9 @@ pub fn verify_rrset(
         rdatas,
         ..
     } = *rrset;
-    let owner = canonical_name_of(rrset.owner);
-    // Both counted on the wire. Presentation text spells a dot inside a label
-    // `\.` (RFC 1035 §5.1), so counting dots overstates such a name and the two
-    // sides of this comparison disagreed about the same name (`TODO.md` #37a).
-    let owner_labels = rrset.owner.label_count();
+    let owner = rrset.owner;
+    let owner_labels = owner.label_count();
     let zone_labels = zone.label_count();
-    // The signer name and the key owners are canonical text (RFC 4034 §6.2),
-    // which is the form `canonical_name_of` draws the boundary at.
-    let zone = canonical_name_of(zone);
 
     let covering: Vec<&Rrsig> = rrsigs
         .iter()
@@ -749,9 +738,7 @@ pub fn verify_rrset(
                 // §3.1.3), so an RRset sitting *at* a wildcard has one label
                 // more than its RRSIG claims. It is an expansion only where the
                 // signed name is not the name served.
-                Ok(signed) => {
-                    (signed.as_ref() != rrset.owner).then(|| canonical_name_of(signed.as_ref()))
-                }
+                Ok(signed) => (signed.as_ref() != rrset.owner).then_some(signed),
                 Err(e) => {
                     last_failure = format!("could not name the signer of {owner}: {e}");
                     continue;
@@ -1261,7 +1248,7 @@ mod tests {
             "example.com.",
             &rdatas,
         );
-        rrsig.owner = "anything.example.com.".to_string();
+        rrsig.owner = nm("anything.example.com.");
         rrsig.labels = 2;
 
         let proof = verify_rrset(
@@ -1278,7 +1265,7 @@ mod tests {
         );
         match proof {
             RrsetProof::Verified { wildcard, .. } => {
-                assert_eq!(wildcard.as_deref(), Some("*.example.com."))
+                assert_eq!(wildcard, Some(nm("*.example.com.")))
             }
             other => panic!("wildcard answer should verify: {other:?}"),
         }
@@ -1307,7 +1294,7 @@ mod tests {
         let dnskey = key.dnskey("example.com.");
         for digest_type in [1u8, 2, 4] {
             let ds = Ds {
-                owner: "example.com.".to_string(),
+                owner: nm("example.com."),
                 key_tag: dnskey.key_tag(),
                 algorithm: dnskey.algorithm,
                 digest_type,
@@ -1325,7 +1312,7 @@ mod tests {
         let real = TestKey::generate_p256().dnskey("example.com.");
         let impostor = TestKey::generate_p256().dnskey("example.com.");
         let ds = Ds {
-            owner: "example.com.".to_string(),
+            owner: nm("example.com."),
             key_tag: real.key_tag(),
             algorithm: real.algorithm,
             digest_type: 2,

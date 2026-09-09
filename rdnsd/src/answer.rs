@@ -469,8 +469,8 @@ fn redirect_through(
     to.ok_or(ResponseCode::DomainExistsForSomeReason)
 }
 
-/// Whether a name is at or below this zone's apex. [`rdns::utils::is_at_or_under`]
-/// compares case-insensitively itself, so callers need not fold first.
+/// Whether a name is at or below this zone's apex. [`NameRef::is_at_or_under`]
+/// folds ASCII case as it walks (RFC 4343), so callers need not fold first.
 fn in_zone(zone: &Zone, name: NameRef<'_>) -> bool {
     name.is_at_or_under(zone.origin())
 }

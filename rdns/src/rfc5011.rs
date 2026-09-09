@@ -20,10 +20,10 @@ use std::path::Path;
 use crate::dnssec::{ds_digest, Dnskey, Ds, Rrset};
 use crate::utils::record_types as rt;
 use crate::utils::{base64_encode, hex_decode, hex_encode};
-use crate::{NameRef, RecordData, ResourceRecord};
+use crate::{Name, NameRef, RecordData, ResourceRecord};
 // `key_record` alone: it builds the DNSKEY records the tests feed back in.
 #[cfg(test)]
-use crate::{Name, ParsedRecord, Ttl};
+use crate::{ParsedRecord, Ttl};
 
 /// The REVOKE bit (RFC 5011 §3), flags bit 8.
 const DNSKEY_FLAG_REVOKE: u16 = 0x0080;
@@ -154,8 +154,8 @@ impl ManagedAnchors {
         let mut zones: Vec<String> = self
             .ds
             .iter()
-            .map(|ds| ds.owner.clone())
-            .chain(self.keys.iter().map(|k| k.key.owner.clone()))
+            .map(|ds| ds.owner.to_string())
+            .chain(self.keys.iter().map(|k| k.key.owner.to_string()))
             .collect();
         zones.sort();
         zones.dedup();
@@ -207,14 +207,13 @@ impl ManagedAnchors {
     /// RFC 5011 §5: with the last anchor gone, a new one is never bootstrapped
     /// from the zone's own data — it must be configured out of band.
     fn has_anchor_for(&self, zone: NameRef<'_>) -> bool {
-        let zone = zone.to_presentation().to_ascii_lowercase();
-        self.ds
-            .iter()
-            .any(|ds| ds.owner.eq_ignore_ascii_case(&zone))
+        // `Name`'s equality folds ASCII case (RFC 4343), so neither side is
+        // down-cased here.
+        self.ds.iter().any(|ds| ds.owner == zone)
             || self
                 .keys
                 .iter()
-                .any(|k| k.state.is_anchor() && k.key.owner.eq_ignore_ascii_case(&zone))
+                .any(|k| k.state.is_anchor() && k.key.owner == zone)
     }
 
     /// Take in a validated DNSKEY RRset for `zone` and move the state machine
@@ -234,8 +233,10 @@ impl ManagedAnchors {
         if !self.has_anchor_for(zone) {
             return changes;
         }
-        let zone_lc = zone.to_presentation().to_ascii_lowercase();
-        let in_zone = |owner: &str| owner.eq_ignore_ascii_case(&zone_lc);
+        let in_zone = |owner: &Name| owner.as_ref() == zone;
+        // The reported changes are read by a human, so they carry the name as
+        // text; everything that *compares* names above works on the wire form.
+        let zone_lc = zone.to_string();
 
         // Revocations first: a revoked key must not also be read as "present and
         // healthy" by the pass below.
@@ -275,10 +276,10 @@ impl ManagedAnchors {
                 None => {
                     // A key matching a configured DS anchor is already trusted;
                     // a hold-down has nothing to establish.
-                    let anchored = self.ds.iter().any(|ds| {
-                        ds.owner.eq_ignore_ascii_case(&key.owner)
-                            && ds.matches_key(key).unwrap_or(false)
-                    });
+                    let anchored = self
+                        .ds
+                        .iter()
+                        .any(|ds| ds.owner == key.owner && ds.matches_key(key).unwrap_or(false));
                     let state = if anchored {
                         KeyState::Valid
                     } else {
@@ -503,7 +504,7 @@ fn same_key(a: &Dnskey, b: &Dnskey) -> bool {
     a.algorithm == b.algorithm
         && a.protocol == b.protocol
         && a.public_key == b.public_key
-        && a.owner.eq_ignore_ascii_case(&b.owner)
+        && a.owner == b.owner
 }
 
 /// Which of `keys` actually signed this DNSKEY RRset.
@@ -599,7 +600,10 @@ fn parse_anchor_line(fields: &[&str]) -> DnssecResult<AnchorLine> {
         .to_ascii_uppercase();
     index += 1;
     let rest = &fields[index..];
-    let owner = absolute(&owner);
+    let owner = Name::from_presentation(&absolute(&owner))
+        .map_err(|e| DnssecError::parse(format!("anchor owner name: {e}")))?
+        .as_ref()
+        .to_folded();
 
     match rtype.as_str() {
         "DS" => {
@@ -688,7 +692,7 @@ fn key_record(key: &Dnskey, ttl: Ttl) -> Option<ResourceRecord> {
     })
     .ok()?;
     Some(ResourceRecord {
-        name: Name::from_presentation(&key.owner).ok()?,
+        name: key.owner.clone(),
         class: Class::new(1),
         ttl,
         rdata,
@@ -706,7 +710,7 @@ mod tests {
 
     fn key(tagseed: u8, flags: u16) -> Dnskey {
         Dnskey {
-            owner: ".".to_string(),
+            owner: nm("."),
             flags,
             protocol: 3,
             algorithm: 8,
@@ -1137,7 +1141,7 @@ mod tests {
         let anchor = zone_key(1);
         let mut anchors = anchored_on(&anchor);
         let mut elsewhere = zone_key(5);
-        elsewhere.owner = "example.test.".to_string();
+        elsewhere.owner = nm("example.test.");
 
         anchors.observe(
             nm(".").as_ref(),

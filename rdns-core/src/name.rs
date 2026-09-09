@@ -791,6 +791,11 @@ mod tests {
         assert!(!under("ab.example.com.", "b.example.com."));
         // Case-insensitively, like everything else.
         assert!(under("A.ExAmPlE.CoM.", "example.com."));
+        // RFC 1035 §5.1's escape is a dot *inside* a label, and on the wire it
+        // is not a boundary at all — which is the half the text version of this
+        // had to be taught (`TODO.md` #37a) and this one cannot get wrong.
+        assert!(!under(r"x.a\.b.com.", "b.com."));
+        assert!(under(r"x.a\.b.com.", r"a\.b.com."));
     }
 
     /// A name off the wire, uncompressed and compressed, is the same name.

@@ -137,8 +137,8 @@ fn hash_wire(wire: &mut [u8], salt: &[u8], iterations: u16) -> DnssecResult<[u8;
 /// An NSEC record and the name it sits at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nsec {
-    pub owner: String,
-    pub next: String,
+    pub owner: Name,
+    pub next: Name,
     pub type_bitmap: Vec<u8>,
 }
 
@@ -152,11 +152,8 @@ impl Nsec {
                 next_domain_name,
                 type_bitmap,
             } => Some(Nsec {
-                owner: rr.name.as_ref().to_presentation().to_ascii_lowercase(),
-                next: next_domain_name
-                    .as_ref()
-                    .to_presentation()
-                    .to_ascii_lowercase(),
+                owner: rr.name.as_ref().to_folded(),
+                next: next_domain_name.as_ref().to_folded(),
                 type_bitmap,
             }),
             _ => None,
@@ -164,8 +161,8 @@ impl Nsec {
     }
 
     /// Whether this NSEC's owner *is* `name`.
-    pub fn matches(&self, name: &str) -> bool {
-        canonical_name_cmp(&self.owner, name) == Ordering::Equal
+    pub fn matches(&self, name: NameRef<'_>) -> bool {
+        self.owner.as_ref() == name
     }
 
     /// Whether `name` falls strictly inside the gap this NSEC describes.
@@ -173,10 +170,10 @@ impl Nsec {
     /// Endpoints are excluded: a name equal to either neighbour exists. The last
     /// NSEC in a zone points back at the apex, so a `next` at or below `owner`
     /// means the range wraps.
-    pub fn covers(&self, name: &str) -> bool {
-        let after_owner = canonical_name_cmp(name, &self.owner) == Ordering::Greater;
-        let before_next = canonical_name_cmp(name, &self.next) == Ordering::Less;
-        if canonical_name_cmp(&self.next, &self.owner) == Ordering::Greater {
+    pub fn covers(&self, name: NameRef<'_>) -> bool {
+        let after_owner = canonical_name_cmp(name, self.owner.as_ref()) == Ordering::Greater;
+        let before_next = canonical_name_cmp(name, self.next.as_ref()) == Ordering::Less;
+        if canonical_name_cmp(self.next.as_ref(), self.owner.as_ref()) == Ordering::Greater {
             after_owner && before_next
         } else {
             // Wrapped: everything after the owner, or before the next.
@@ -208,25 +205,25 @@ pub struct Nsec3Params<'a> {
 
 impl Nsec3Params<'_> {
     /// The hash of `name` under these parameters.
-    pub fn hash(&self, name: &str) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
+    pub fn hash(&self, name: NameRef<'_>) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
         if self.hash_algorithm != SHA1_HASH_ALGORITHM {
             return Err(DnssecError::parse(format!(
                 "unsupported NSEC3 hash algorithm {}",
                 self.hash_algorithm,
             )));
         }
-        nsec3_hash_in(name, self.salt, self.iterations)
+        nsec3_hash_name(name, self.salt, self.iterations)
     }
 }
 
 /// An NSEC3 record, with its owner hash decoded out of the first label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nsec3 {
-    pub owner: String,
+    pub owner: Name,
     /// The hash in the owner's first label, decoded from base32hex.
     pub owner_hash: Vec<u8>,
     /// Everything after that label — the zone the NSEC3 belongs to.
-    pub zone: String,
+    pub zone: Name,
     pub hash_algorithm: u8,
     pub flags: u8,
     pub iterations: u16,
@@ -240,9 +237,13 @@ impl Nsec3 {
         if rr.rdata.rtype() != rt::NSEC3 {
             return None;
         }
-        let owner = rr.name.as_ref().to_presentation().to_ascii_lowercase();
-        let (first, zone) = owner.split_once('.')?;
-        let owner_hash = base32hex_decode(first).ok()?;
+        // The first label and the rest, taken on the wire: the hash label is
+        // base32hex, but the zone below it can hold RFC 1035 §5.1's `\.`, which
+        // splitting the text on a dot would cut in the wrong place.
+        let owner = rr.name.as_ref().to_folded();
+        let first = owner.as_ref().labels().next()?;
+        let zone = owner.as_ref().parent()?.to_owned();
+        let owner_hash = base32hex_decode(std::str::from_utf8(first).ok()?).ok()?;
         match rr.rdata.parse().ok()? {
             ParsedRecord::NSEC3 {
                 hash_algorithm,
@@ -252,9 +253,9 @@ impl Nsec3 {
                 next_hashed_owner,
                 type_bitmap,
             } if hash_algorithm == SHA1_HASH_ALGORITHM => Some(Nsec3 {
-                owner: owner.clone(),
+                owner,
                 owner_hash,
-                zone: zone.to_string(),
+                zone,
                 hash_algorithm,
                 flags,
                 iterations,
@@ -283,7 +284,7 @@ impl Nsec3 {
     }
 
     /// The hash of `name` under this record's parameters.
-    pub fn hash(&self, name: &str) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
+    pub fn hash(&self, name: NameRef<'_>) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
         self.params().hash(name)
     }
 
@@ -296,7 +297,7 @@ impl Nsec3 {
     }
 
     /// Whether this NSEC3 is the record *for* `name`.
-    pub fn matches(&self, name: &str) -> DnssecResult<bool> {
+    pub fn matches(&self, name: NameRef<'_>) -> DnssecResult<bool> {
         Ok(self.matches_hash(&self.hash(name)?))
     }
 
@@ -317,7 +318,7 @@ impl Nsec3 {
     }
 
     /// Whether `name`'s hash falls strictly inside this record's span.
-    pub fn covers(&self, name: &str) -> DnssecResult<bool> {
+    pub fn covers(&self, name: NameRef<'_>) -> DnssecResult<bool> {
         Ok(self.covers_hash(&self.hash(name)?))
     }
 
@@ -333,14 +334,14 @@ impl Nsec3 {
 /// iterated SHA-1 the previous record just computed — up to
 /// `MAX_NSEC3_ITERATIONS + 1` passes thrown away per record.
 struct NameHash<'a> {
-    name: &'a str,
+    name: NameRef<'a>,
     /// The parameters `hash` was computed under, and the hash. Replaced whenever
     /// a record's parameters differ.
     computed: Option<(Nsec3Params<'a>, [u8; NSEC3_HASH_LEN])>,
 }
 
 impl<'a> NameHash<'a> {
-    fn new(name: &'a str) -> Self {
+    fn new(name: NameRef<'a>) -> Self {
         NameHash {
             name,
             computed: None,
@@ -407,7 +408,7 @@ impl Denial {
 ///
 /// Without it, stripping the DS from a referral makes every signed zone below
 /// look unsigned.
-pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
+pub fn proves_no_ds(zone: NameRef<'_>, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
     for nsec in nsecs {
         if !nsec.matches(zone) {
             continue;
@@ -475,7 +476,12 @@ pub fn proves_no_ds(zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
 /// wildcard that would otherwise have answered for it (RFC 4035 §5.4) — a
 /// single record often does both. For NSEC3 it is the closest-encloser proof of
 /// RFC 5155 §8.4.
-pub fn proves_nxdomain(qname: &str, zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
+pub fn proves_nxdomain(
+    qname: NameRef<'_>,
+    zone: NameRef<'_>,
+    nsecs: &[Nsec],
+    nsec3s: &[Nsec3],
+) -> Denial {
     if !nsecs.is_empty() {
         let Some(covering) = nsecs.iter().find(|n| n.covers(qname)) else {
             return Denial::NotProved(format!("no NSEC covers {qname}"));
@@ -484,8 +490,10 @@ pub fn proves_nxdomain(qname: &str, zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]
         // NSEC proof is the longest suffix of qname shared with either end of
         // the covering record.
         let encloser = closest_encloser_nsec(qname, covering);
-        let wildcard = format!("*.{encloser}");
-        if nsecs.iter().any(|n| n.covers(&wildcard)) {
+        let Ok(wildcard) = Name::prefixed(b"*", encloser) else {
+            return Denial::NotProved(format!("{encloser} is too long to carry a wildcard label"));
+        };
+        if nsecs.iter().any(|n| n.covers(wildcard.as_ref())) {
             return Denial::Proved;
         }
         return Denial::NotProved(format!(
@@ -509,8 +517,8 @@ pub fn proves_nxdomain(qname: &str, zone: &str, nsecs: &[Nsec], nsec3s: &[Nsec3]
 /// plus the one *at the wildcard* showing what a wildcard would have answered
 /// with (RFC 4035 §5.4, RFC 5155 §8.7).
 pub fn proves_nodata(
-    qname: &str,
-    zone: &str,
+    qname: NameRef<'_>,
+    zone: NameRef<'_>,
     qtype: Rtype,
     nsecs: &[Nsec],
     nsec3s: &[Nsec3],
@@ -561,7 +569,7 @@ pub fn proves_nodata(
 
 /// The bitmap half of a NODATA proof: the type asked for must be absent, and so
 /// must CNAME — a CNAME would have been followed rather than answered NODATA.
-fn nodata_bitmap(qtype: Rtype, at: &str, has_type: impl Fn(Rtype) -> bool) -> Denial {
+fn nodata_bitmap(qtype: Rtype, at: NameRef<'_>, has_type: impl Fn(Rtype) -> bool) -> Denial {
     if has_type(qtype) {
         return Denial::NotProved(format!("the denial at {at} says type {qtype} exists"));
     }
@@ -577,39 +585,46 @@ fn nodata_bitmap(qtype: Rtype, at: &str, has_type: impl Fn(Rtype) -> bool) -> De
 /// The closest encloser is derived from the covering record, not taken on the
 /// responder's word — otherwise a wildcard higher up the tree than the one
 /// governing the name would do, as in [`proves_wildcard_expansion`].
-fn nsec_wildcard_nodata(qname: &str, qtype: Rtype, nsecs: &[Nsec]) -> Denial {
+fn nsec_wildcard_nodata(qname: NameRef<'_>, qtype: Rtype, nsecs: &[Nsec]) -> Denial {
     let Some(covering) = nsecs.iter().find(|n| n.covers(qname)) else {
         return Denial::NotProved(format!("no NSEC matches or covers {qname}"));
     };
-    let wildcard = format!("*.{}", closest_encloser_nsec(qname, covering));
-    let Some(matching) = nsecs.iter().find(|n| n.matches(&wildcard)) else {
+    let encloser = closest_encloser_nsec(qname, covering);
+    let Ok(wildcard) = Name::prefixed(b"*", encloser) else {
+        return Denial::NotProved(format!("{encloser} is too long to carry a wildcard label"));
+    };
+    let Some(matching) = nsecs.iter().find(|n| n.matches(wildcard.as_ref())) else {
         return Denial::NotProved(format!(
             "{qname} does not exist and no NSEC at {wildcard} says what a wildcard would \
              have answered"
         ));
     };
-    nodata_bitmap(qtype, &wildcard, |t| matching.has_type(t))
+    nodata_bitmap(qtype, wildcard.as_ref(), |t| matching.has_type(t))
 }
 
 /// Wildcard NODATA with NSEC3 (RFC 5155 §8.7): the closest-encloser proof for
 /// `qname`, and an NSEC3 matching the wildcard at that encloser whose bitmap
 /// lacks the type.
-fn nsec3_wildcard_nodata(qname: &str, zone: &str, qtype: Rtype, nsec3s: &[Nsec3]) -> Denial {
-    // Absolute before the walk slices it, as in `nsec3_closest_encloser_proof`:
-    // `parent_name` takes the *last* label off a relative name.
-    let qname = crate::utils::absolute_lowered(qname);
-    let encloser = match nsec3_closest_encloser(&qname, zone, nsec3s) {
+fn nsec3_wildcard_nodata(
+    qname: NameRef<'_>,
+    zone: NameRef<'_>,
+    qtype: Rtype,
+    nsec3s: &[Nsec3],
+) -> Denial {
+    let encloser = match nsec3_closest_encloser(qname, zone, nsec3s) {
         Ok(encloser) => encloser,
         Err(why) => return Denial::NotProved(why),
     };
-    let wildcard = format!("*.{encloser}");
-    let mut hash = NameHash::new(&wildcard);
+    let Ok(wildcard) = Name::prefixed(b"*", encloser) else {
+        return Denial::NotProved(format!("{encloser} is too long to carry a wildcard label"));
+    };
+    let mut hash = NameHash::new(wildcard.as_ref());
     let Some(matching) = nsec3s.iter().find(|n| hash.matches(n).unwrap_or(false)) else {
         return Denial::NotProved(format!(
             "{qname} does not exist and no NSEC3 matches the wildcard {wildcard}"
         ));
     };
-    nodata_bitmap(qtype, &wildcard, |t| matching.has_type(t))
+    nodata_bitmap(qtype, wildcard.as_ref(), |t| matching.has_type(t))
 }
 
 /// The outcome of checking a wildcard-expanded answer.
@@ -643,23 +658,22 @@ pub enum WildcardVerdict {
 ///   this from the closest encloser the covering record implies; NSEC3 gets it
 ///   from the "next closer" name, which is derived from where the wildcard sits.
 pub fn proves_wildcard_expansion(
-    owner: &str,
-    wildcard: &str,
+    owner: NameRef<'_>,
+    wildcard: NameRef<'_>,
     nsecs: &[Nsec],
     nsec3s: &[Nsec3],
 ) -> WildcardVerdict {
-    let owner = crate::dnssec::canonical_name(owner);
     let Some(encloser) = wildcard_encloser(wildcard) else {
         return WildcardVerdict::NotProved(format!("{wildcard} is not a wildcard name"));
     };
-    if crate::utils::label_count(&owner) <= crate::utils::label_count(&encloser) {
+    if owner.label_count() <= encloser.label_count() {
         return WildcardVerdict::NotProved(format!(
             "{owner} is not below {encloser}, so {wildcard} cannot have expanded to it"
         ));
     }
 
     if !nsecs.is_empty() {
-        let Some(covering) = nsecs.iter().find(|n| n.covers(&owner)) else {
+        let Some(covering) = nsecs.iter().find(|n| n.covers(owner)) else {
             return WildcardVerdict::NotProved(format!(
                 "no NSEC covers {owner}, so nothing rules out records of its own"
             ));
@@ -667,8 +681,8 @@ pub fn proves_wildcard_expansion(
         // Both ends of a covering NSEC exist, so the longest suffix shared with
         // either is the deepest ancestor of `owner` known to exist. Deeper than
         // the wildcard's own parent means this wildcard never applied.
-        let found = closest_encloser_nsec(&owner, covering);
-        if canonical_name_cmp(&found, &encloser) != Ordering::Equal {
+        let found = closest_encloser_nsec(owner, covering);
+        if found != encloser {
             return WildcardVerdict::NotProved(format!(
                 "the NSEC covering {owner} puts its closest encloser at {found}, \
                  not at {encloser} where {wildcard} lives"
@@ -681,8 +695,7 @@ pub fn proves_wildcard_expansion(
         // RFC 5155 §8.8: show the "next closer" name — one label below the
         // encloser, towards `owner` — absent. Naming it from the wildcard's own
         // position pins the expansion to the right depth.
-        let next_closer =
-            crate::utils::suffix_labels(&owner, crate::utils::label_count(&encloser) + 1);
+        let next_closer = owner.suffix(encloser.label_count() + 1);
         let mut hash = NameHash::new(next_closer);
         if nsec3s
             .iter()
@@ -709,59 +722,44 @@ pub fn proves_wildcard_expansion(
 }
 
 /// The name a wildcard hangs off. `None` for a name that is not a wildcard.
-fn wildcard_encloser(wildcard: &str) -> Option<String> {
-    let name = crate::dnssec::canonical_name(wildcard);
-    let rest = name.strip_prefix("*.")?;
-    Some(if rest.is_empty() {
-        ".".to_string()
-    } else {
-        rest.to_string()
-    })
+fn wildcard_encloser(wildcard: NameRef<'_>) -> Option<NameRef<'_>> {
+    (wildcard.labels().next()? == b"*").then(|| wildcard.parent())?
 }
 
 /// The longest suffix `qname` shares with either end of the NSEC covering it.
 /// Both ends provably exist, so this is `qname`'s closest ancestor that does.
-fn closest_encloser_nsec(qname: &str, covering: &Nsec) -> String {
-    let from_owner = common_suffix(qname, &covering.owner);
-    let from_next = common_suffix(qname, &covering.next);
-    if crate::utils::label_count(&from_owner) >= crate::utils::label_count(&from_next) {
+fn closest_encloser_nsec<'n>(qname: NameRef<'n>, covering: &Nsec) -> NameRef<'n> {
+    let from_owner = common_suffix(qname, covering.owner.as_ref());
+    let from_next = common_suffix(qname, covering.next.as_ref());
+    if from_owner.label_count() >= from_next.label_count() {
         from_owner
     } else {
         from_next
     }
 }
 
-/// The longest suffix of whole labels that two names share.
-fn common_suffix(a: &str, b: &str) -> String {
+/// The longest suffix of whole labels that two names share — a suffix of `a`,
+/// so it borrows rather than building a name of its own.
+fn common_suffix<'n>(a: NameRef<'n>, b: NameRef<'_>) -> NameRef<'n> {
     let shared = crate::denial_wire::reversed_labels(a)
         .zip(crate::denial_wire::reversed_labels(b))
         .take_while(|(x, y)| x == y)
         .count();
-    if shared == 0 {
-        return ".".to_string();
-    }
-    // A suffix of whole labels is a slice of `a`, so the answer is one copy
-    // rather than a `String` per label plus a `join` and a `format!`.
-    let mut out = crate::utils::suffix_labels(a, shared).to_ascii_lowercase();
-    if !crate::utils::ends_with_root(&out) {
-        out.push('.');
-    }
-    out
+    a.suffix(shared)
 }
 
 /// The RFC 5155 §8.4 closest-encloser proof: the encloser is proven, the name one
 /// label below it is absent, and the wildcard at the encloser is accounted for —
 /// without which one could still have answered.
-fn nsec3_closest_encloser_proof(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> Denial {
-    // Absolute, because the walk slices it; the hash down-cases the wire form
-    // itself (RFC 5155 §5), so the case this leaves alone changes nothing.
-    let qname = crate::utils::absolute_lowered(qname);
-    let encloser = match nsec3_closest_encloser(&qname, zone, nsec3s) {
+fn nsec3_closest_encloser_proof(qname: NameRef<'_>, zone: NameRef<'_>, nsec3s: &[Nsec3]) -> Denial {
+    let encloser = match nsec3_closest_encloser(qname, zone, nsec3s) {
         Ok(encloser) => encloser,
         Err(why) => return Denial::NotProved(why),
     };
-    let wildcard = format!("*.{encloser}");
-    let mut hash = NameHash::new(&wildcard);
+    let Ok(wildcard) = Name::prefixed(b"*", encloser) else {
+        return Denial::NotProved(format!("{encloser} is too long to carry a wildcard label"));
+    };
+    let mut hash = NameHash::new(wildcard.as_ref());
     let wildcard_denied = hash.covered_by(nsec3s) || hash.matched_by(nsec3s);
     if !wildcard_denied {
         return Denial::NotProved(format!("no NSEC3 accounts for the wildcard {wildcard}"));
@@ -776,21 +774,20 @@ fn nsec3_closest_encloser_proof(qname: &str, zone: &str, nsec3s: &[Nsec3]) -> De
 ///
 /// `Err` carries why the proof does not stand — including a record matching
 /// `qname` itself, which says the name exists.
-/// `qname` must be absolute, which its caller has already made it: each
-/// ancestor is then a suffix of it rather than a `String` of its own, and the
+/// Each ancestor is a suffix of `qname` rather than a name of its own, and the
 /// next closer name is the candidate visited one step before.
 fn nsec3_closest_encloser<'n>(
-    qname: &'n str,
-    zone: &str,
+    qname: NameRef<'n>,
+    zone: NameRef<'_>,
     nsec3s: &[Nsec3],
-) -> Result<&'n str, String> {
-    let qlabels = crate::utils::label_count(qname);
-    let zlabels = crate::utils::label_count(zone);
+) -> Result<NameRef<'n>, String> {
+    let qlabels = qname.label_count();
+    let zlabels = zone.label_count();
 
     // Walk up towards the apex, which always exists, so the search terminates.
     let mut candidate = qname;
     let mut depth = qlabels;
-    let mut below: Option<&str> = None;
+    let mut below: Option<NameRef<'n>> = None;
     loop {
         if NameHash::new(candidate).matched_by(nsec3s) {
             if depth == qlabels {
@@ -812,7 +809,7 @@ fn nsec3_closest_encloser<'n>(
             break;
         }
         below = Some(candidate);
-        let Some(up) = crate::utils::parent_name(candidate) else {
+        let Some(up) = candidate.parent() else {
             break;
         };
         candidate = up;
@@ -835,15 +832,16 @@ mod tests {
 
     fn nsec(owner: &str, next: &str, types: &[Rtype]) -> Nsec {
         Nsec {
-            owner: owner.to_string(),
-            next: next.to_string(),
+            owner: nm(owner),
+            next: nm(next),
             type_bitmap: build_type_bitmap(types),
         }
     }
 
-    /// The longest shared suffix is a slice of the first name, folded. It was
-    /// rebuilt label by label, which is why this exists: the arithmetic that
-    /// finds where the shared part starts is new and the joining was not.
+    /// The longest shared suffix is a suffix of the first name — a borrow, not
+    /// a name built label by label, which is why this exists. Case is not folded
+    /// here any more and does not need to be: `NameRef`'s equality folds ASCII
+    /// as it compares (RFC 4343).
     #[test]
     fn test_common_suffix_is_the_shared_labels_folded() {
         for (a, b, want) in [
@@ -854,25 +852,33 @@ mod tests {
             ("a.example.", "a.example.", "a.example."),
             (".", "example.", "."),
         ] {
-            assert_eq!(common_suffix(a, b), want, "{a} against {b}");
+            let (a_name, b_name) = (nm(a), nm(b));
+            let shared = common_suffix(a_name.as_ref(), b_name.as_ref());
+            assert_eq!(shared, nm(want).as_ref(), "{a} against {b}");
         }
     }
 
     #[test]
     fn test_nsec_covers_excludes_its_endpoints() {
         let n = nsec("a.example.com.", "z.example.com.", &[rt::A]);
-        assert!(n.covers("m.example.com."));
-        assert!(!n.covers("a.example.com."), "the owner exists");
-        assert!(!n.covers("z.example.com."), "the next name exists");
-        assert!(!n.covers("zz.example.com."));
+        assert!(n.covers(nm("m.example.com.").as_ref()));
+        assert!(!n.covers(nm("a.example.com.").as_ref()), "the owner exists");
+        assert!(
+            !n.covers(nm("z.example.com.").as_ref()),
+            "the next name exists"
+        );
+        assert!(!n.covers(nm("zz.example.com.").as_ref()));
     }
 
     #[test]
     fn test_nsec_covers_wraps_at_the_end_of_the_zone() {
         // The last NSEC in a zone points back at the apex.
         let n = nsec("z.example.com.", "example.com.", &[rt::A]);
-        assert!(n.covers("zz.example.com."), "after the last name");
-        assert!(!n.covers("m.example.com."), "before it");
+        assert!(
+            n.covers(nm("zz.example.com.").as_ref()),
+            "after the last name"
+        );
+        assert!(!n.covers(nm("m.example.com.").as_ref()), "before it");
     }
 
     /// RFC 5155 Appendix A: the zone `example.` with salt `aabbccdd` and 12
@@ -923,7 +929,7 @@ mod tests {
             "z.example.com.",
             &[rt::NS, rt::RRSIG, rt::NSEC],
         );
-        assert!(proves_no_ds("insecure.example.com.", &[n], &[]).is_proved());
+        assert!(proves_no_ds(nm("insecure.example.com.").as_ref(), &[n], &[]).is_proved());
     }
 
     /// The attack this proof exists to stop: strip the DS and claim the zone
@@ -935,7 +941,7 @@ mod tests {
             "z.example.com.",
             &[rt::NS, rt::DS, rt::RRSIG],
         );
-        let denial = proves_no_ds("secure.example.com.", &[n], &[]);
+        let denial = proves_no_ds(nm("secure.example.com.").as_ref(), &[n], &[]);
         assert!(!denial.is_proved(), "{denial:?}");
     }
 
@@ -948,13 +954,13 @@ mod tests {
             "a.child.example.com.",
             &[rt::SOA, rt::NS, rt::DNSKEY, rt::RRSIG],
         );
-        let denial = proves_no_ds("child.example.com.", &[n], &[]);
+        let denial = proves_no_ds(nm("child.example.com.").as_ref(), &[n], &[]);
         assert!(!denial.is_proved(), "{denial:?}");
     }
 
     #[test]
     fn test_nothing_at_all_proves_nothing() {
-        let denial = proves_no_ds("child.example.com.", &[], &[]);
+        let denial = proves_no_ds(nm("child.example.com.").as_ref(), &[], &[]);
         assert!(!denial.is_proved());
     }
 
@@ -967,15 +973,22 @@ mod tests {
         );
         // No AAAA in the bitmap, so NODATA for AAAA is proven.
         assert!(proves_nodata(
-            "www.example.com.",
-            "example.com.",
+            nm("www.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
             rt::AAAA,
             std::slice::from_ref(&n),
             &[]
         )
         .is_proved());
         // But A is listed, so it cannot deny that.
-        assert!(!proves_nodata("www.example.com.", "example.com.", rt::A, &[n], &[]).is_proved());
+        assert!(!proves_nodata(
+            nm("www.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
+            rt::A,
+            &[n],
+            &[]
+        )
+        .is_proved());
     }
 
     /// A CNAME at the name would have been followed rather than answered NODATA,
@@ -987,7 +1000,13 @@ mod tests {
             "z.example.com.",
             &[rt::CNAME, rt::RRSIG],
         );
-        let denial = proves_nodata("www.example.com.", "example.com.", rt::A, &[n], &[]);
+        let denial = proves_nodata(
+            nm("www.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
+            rt::A,
+            &[n],
+            &[],
+        );
         assert!(!denial.is_proved(), "{denial:?}");
     }
 
@@ -1002,8 +1021,8 @@ mod tests {
             &[rt::A, rt::RRSIG, rt::NSEC],
         );
         let denial = proves_nodata(
-            "a.example.com.",
-            "example.com.",
+            nm("a.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
             rt::AAAA,
             std::slice::from_ref(&at_wildcard),
             &[],
@@ -1013,8 +1032,8 @@ mod tests {
         // A is in the wildcard's bitmap, so the wildcard *would* have answered
         // that — this is not NODATA for A.
         let denial = proves_nodata(
-            "a.example.com.",
-            "example.com.",
+            nm("a.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
             rt::A,
             std::slice::from_ref(&at_wildcard),
             &[],
@@ -1028,8 +1047,8 @@ mod tests {
     fn test_wildcard_nodata_needs_the_record_at_the_wildcard() {
         let covering = nsec("m.example.com.", "z.example.com.", &[rt::A, rt::RRSIG]);
         let denial = proves_nodata(
-            "nope.example.com.",
-            "example.com.",
+            nm("nope.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
             rt::AAAA,
             &[covering],
             &[],
@@ -1051,11 +1070,14 @@ mod tests {
             "c.example.com.",
             &[rt::A, rt::RRSIG, rt::NSEC],
         );
-        assert!(covering.covers("a.b.example.com."), "the name is covered");
+        assert!(
+            covering.covers(nm("a.b.example.com.").as_ref()),
+            "the name is covered"
+        );
 
         let denial = proves_nodata(
-            "a.b.example.com.",
-            "example.com.",
+            nm("a.b.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
             rt::AAAA,
             &[at_wildcard, covering],
             &[],
@@ -1078,17 +1100,29 @@ mod tests {
         let wildcard = nsec3_matching("*.example.com.", &[rt::A, rt::RRSIG]);
         let proofs = vec![apex, next_closer, wildcard];
 
-        let denial = proves_nodata("a.example.com.", "example.com.", rt::AAAA, &[], &proofs);
+        let denial = proves_nodata(
+            nm("a.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
+            rt::AAAA,
+            &[],
+            &proofs,
+        );
         assert!(denial.is_proved(), "{denial:?}");
 
         // A is in the wildcard's bitmap.
-        let denial = proves_nodata("a.example.com.", "example.com.", rt::A, &[], &proofs);
+        let denial = proves_nodata(
+            nm("a.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
+            rt::A,
+            &[],
+            &proofs,
+        );
         assert!(!denial.is_proved(), "{denial:?}");
 
         // And without the record at the wildcard there is no proof at all.
         let denial = proves_nodata(
-            "a.example.com.",
-            "example.com.",
+            nm("a.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
             rt::AAAA,
             &[],
             &proofs[..2],
@@ -1098,8 +1132,8 @@ mod tests {
         // Without the next closer name covered, `a.example.com.` may exist in
         // its own right and the wildcard is not what answered.
         let denial = proves_nodata(
-            "a.example.com.",
-            "example.com.",
+            nm("a.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
             rt::AAAA,
             &[],
             &[proofs[0].clone(), proofs[2].clone()],
@@ -1111,12 +1145,23 @@ mod tests {
     fn test_nsec_nxdomain_needs_the_wildcard_denied_too() {
         // One record covering both the name and *.example.com.
         let wide = nsec("example.com.", "z.example.com.", &[rt::SOA, rt::NS]);
-        assert!(proves_nxdomain("nope.example.com.", "example.com.", &[wide], &[]).is_proved());
+        assert!(proves_nxdomain(
+            nm("nope.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
+            &[wide],
+            &[]
+        )
+        .is_proved());
 
         // A record covering the name but not the wildcard proves nothing: a
         // wildcard could still have answered.
         let narrow = nsec("m.example.com.", "z.example.com.", &[rt::A]);
-        let denial = proves_nxdomain("nope.example.com.", "example.com.", &[narrow], &[]);
+        let denial = proves_nxdomain(
+            nm("nope.example.com.").as_ref(),
+            nm("example.com.").as_ref(),
+            &[narrow],
+            &[],
+        );
         assert!(!denial.is_proved(), "{denial:?}");
     }
 
@@ -1127,8 +1172,8 @@ mod tests {
     fn test_wildcard_expansion_proved_by_a_covering_nsec() {
         let covering = nsec("*.example.com.", "www.example.com.", &[rt::A, rt::RRSIG]);
         let verdict = proves_wildcard_expansion(
-            "a.example.com.",
-            "*.example.com.",
+            nm("a.example.com.").as_ref(),
+            nm("*.example.com.").as_ref(),
             std::slice::from_ref(&covering),
             &[],
         );
@@ -1138,7 +1183,12 @@ mod tests {
     /// No denial at all: the signature verified, and that is all it did.
     #[test]
     fn test_wildcard_expansion_without_any_nsec_is_not_proved() {
-        let verdict = proves_wildcard_expansion("a.example.com.", "*.example.com.", &[], &[]);
+        let verdict = proves_wildcard_expansion(
+            nm("a.example.com.").as_ref(),
+            nm("*.example.com.").as_ref(),
+            &[],
+            &[],
+        );
         assert!(
             matches!(verdict, WildcardVerdict::NotProved(_)),
             "{verdict:?}"
@@ -1149,8 +1199,12 @@ mod tests {
     #[test]
     fn test_wildcard_expansion_needs_the_name_covered() {
         let elsewhere = nsec("m.example.com.", "n.example.com.", &[rt::A]);
-        let verdict =
-            proves_wildcard_expansion("a.example.com.", "*.example.com.", &[elsewhere], &[]);
+        let verdict = proves_wildcard_expansion(
+            nm("a.example.com.").as_ref(),
+            nm("*.example.com.").as_ref(),
+            &[elsewhere],
+            &[],
+        );
         assert!(
             matches!(verdict, WildcardVerdict::NotProved(_)),
             "{verdict:?}"
@@ -1165,13 +1219,13 @@ mod tests {
     fn test_wildcard_expansion_at_the_wrong_depth_is_refused() {
         let covering = nsec("b.example.com.", "c.example.com.", &[rt::A, rt::RRSIG]);
         assert!(
-            covering.covers("a.b.example.com."),
+            covering.covers(nm("a.b.example.com.").as_ref()),
             "the fact that makes the attack possible"
         );
 
         let verdict = proves_wildcard_expansion(
-            "a.b.example.com.",
-            "*.example.com.",
+            nm("a.b.example.com.").as_ref(),
+            nm("*.example.com.").as_ref(),
             std::slice::from_ref(&covering),
             &[],
         );
@@ -1181,8 +1235,12 @@ mod tests {
         );
 
         // The wildcard at the closest encloser itself is fine.
-        let verdict =
-            proves_wildcard_expansion("a.b.example.com.", "*.b.example.com.", &[covering], &[]);
+        let verdict = proves_wildcard_expansion(
+            nm("a.b.example.com.").as_ref(),
+            nm("*.b.example.com.").as_ref(),
+            &[covering],
+            &[],
+        );
         assert_eq!(verdict, WildcardVerdict::Proved, "{verdict:?}");
     }
 
@@ -1191,7 +1249,12 @@ mod tests {
     #[test]
     fn test_wildcard_expansion_outside_the_wildcard_is_refused() {
         let wide = nsec("example.com.", "z.example.com.", &[rt::SOA]);
-        let verdict = proves_wildcard_expansion("other.test.", "*.example.com.", &[wide], &[]);
+        let verdict = proves_wildcard_expansion(
+            nm("other.test.").as_ref(),
+            nm("*.example.com.").as_ref(),
+            &[wide],
+            &[],
+        );
         assert!(
             matches!(verdict, WildcardVerdict::NotProved(_)),
             "{verdict:?}"
@@ -1207,8 +1270,8 @@ mod tests {
         // `a.example.com.` from `*.example.com.`: the next closer name is
         // `a.example.com.` itself.
         let verdict = proves_wildcard_expansion(
-            "a.example.com.",
-            "*.example.com.",
+            nm("a.example.com.").as_ref(),
+            nm("*.example.com.").as_ref(),
             &[],
             &[span("a.example.com.", 0)],
         );
@@ -1217,8 +1280,8 @@ mod tests {
         // Two labels down, the next closer is the intermediate name — covering
         // the leaf instead proves nothing about `b.example.com.`.
         let verdict = proves_wildcard_expansion(
-            "a.b.example.com.",
-            "*.example.com.",
+            nm("a.b.example.com.").as_ref(),
+            nm("*.example.com.").as_ref(),
             &[],
             &[span("a.b.example.com.", 0)],
         );
@@ -1227,8 +1290,8 @@ mod tests {
             "covering the leaf says nothing about its parent: {verdict:?}"
         );
         let verdict = proves_wildcard_expansion(
-            "a.b.example.com.",
-            "*.example.com.",
+            nm("a.b.example.com.").as_ref(),
+            nm("*.example.com.").as_ref(),
             &[],
             &[span("b.example.com.", 0)],
         );
@@ -1240,8 +1303,12 @@ mod tests {
     #[test]
     fn test_nsec3_wildcard_expansion_over_an_opt_out_span_is_unjudgeable() {
         let opt_out = nsec3_span_around("a.example.com.", 0x01);
-        let verdict =
-            proves_wildcard_expansion("a.example.com.", "*.example.com.", &[], &[opt_out]);
+        let verdict = proves_wildcard_expansion(
+            nm("a.example.com.").as_ref(),
+            nm("*.example.com.").as_ref(),
+            &[],
+            &[opt_out],
+        );
         assert!(
             matches!(verdict, WildcardVerdict::Unjudgeable(_)),
             "{verdict:?}"
@@ -1263,9 +1330,9 @@ mod tests {
         let hash = nsec3_hash(name, &NSEC3_SALT, NSEC3_ITERATIONS).expect("hash");
         let low = hash_step(&hash, false);
         Nsec3 {
-            owner: nsec3_owner_name(&low, "example.com."),
+            owner: nsec3_owner_name_at(&low, nm("example.com.").as_ref()).unwrap(),
             owner_hash: low,
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             hash_algorithm: 1,
             flags,
             iterations: NSEC3_ITERATIONS,
@@ -1303,8 +1370,8 @@ mod tests {
             0,
             &[rt::NS],
         );
-        assert!(n.matches("child.example.com.").unwrap());
-        assert!(proves_no_ds("child.example.com.", &[], &[n]).is_proved());
+        assert!(n.matches(nm("child.example.com.").as_ref()).unwrap());
+        assert!(proves_no_ds(nm("child.example.com.").as_ref(), &[], &[n]).is_proved());
     }
 
     #[test]
@@ -1316,7 +1383,7 @@ mod tests {
             0,
             &[rt::NS, rt::DS],
         );
-        assert!(!proves_no_ds("child.example.com.", &[], &[n]).is_proved());
+        assert!(!proves_no_ds(nm("child.example.com.").as_ref(), &[], &[n]).is_proved());
     }
 
     /// Opt-out is what lets a covering (rather than matching) NSEC3 stand in
@@ -1325,9 +1392,9 @@ mod tests {
     fn test_nsec3_opt_out_covering_proves_no_ds_but_only_with_the_flag() {
         // A span covering everything: owner hash all zeros, next all ones.
         let covering = |flags: u8| Nsec3 {
-            owner: "00000000000000000000000000000000.example.com.".to_string(),
+            owner: nm("00000000000000000000000000000000.example.com."),
             owner_hash: vec![0x00; 20],
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             hash_algorithm: 1,
             flags,
             iterations: NSEC3_ITERATIONS,
@@ -1337,11 +1404,11 @@ mod tests {
         };
 
         assert!(
-            proves_no_ds("child.example.com.", &[], &[covering(0x01)]).is_proved(),
+            proves_no_ds(nm("child.example.com.").as_ref(), &[], &[covering(0x01)]).is_proved(),
             "opt-out set: the span may hold unsigned delegations"
         );
         assert!(
-            !proves_no_ds("child.example.com.", &[], &[covering(0x00)]).is_proved(),
+            !proves_no_ds(nm("child.example.com.").as_ref(), &[], &[covering(0x00)]).is_proved(),
             "without opt-out a covering record claims the name does not exist, \
              which contradicts the referral we just followed"
         );
@@ -1369,9 +1436,9 @@ mod tests {
 
         let parsed = Nsec3::from_record(&rr).expect("NSEC3 should parse");
         assert_eq!(parsed.owner_hash, hash, "the owner label is the hash");
-        assert_eq!(parsed.zone, "example.com.");
+        assert_eq!(parsed.zone, nm("example.com."));
         assert!(parsed.opt_out());
-        assert!(parsed.matches("child.example.com.").unwrap());
+        assert!(parsed.matches(nm("child.example.com.").as_ref()).unwrap());
         assert!(parsed.has_type(rt::NS));
         assert!(!parsed.has_type(rt::DS));
     }
@@ -1380,9 +1447,9 @@ mod tests {
     #[test]
     fn test_hostile_nsec3_iterations_are_refused() {
         let n = Nsec3 {
-            owner: "aaaa.example.com.".to_string(),
+            owner: nm("aaaa.example.com."),
             owner_hash: vec![0x00; 20],
-            zone: "example.com.".to_string(),
+            zone: nm("example.com."),
             hash_algorithm: 1,
             flags: 0,
             iterations: u16::MAX,
@@ -1390,8 +1457,8 @@ mod tests {
             next_hashed_owner: vec![0xff; 20],
             type_bitmap: build_type_bitmap(&[rt::NS]),
         };
-        assert!(n.matches("child.example.com.").is_err());
-        let denial = proves_no_ds("child.example.com.", &[], &[n]);
+        assert!(n.matches(nm("child.example.com.").as_ref()).is_err());
+        let denial = proves_no_ds(nm("child.example.com.").as_ref(), &[], &[n]);
         assert!(!denial.is_proved(), "{denial:?}");
     }
 
@@ -1408,14 +1475,18 @@ mod tests {
 
         let good = nsec3_matching("example.com.", &[rt::NS]);
         assert_eq!(
-            proves_no_ds("example.com.", &[], std::slice::from_ref(&good)),
+            proves_no_ds(
+                nm("example.com.").as_ref(),
+                &[],
+                std::slice::from_ref(&good)
+            ),
             Denial::Proved,
             "the usable record alone proves it",
         );
 
         // The same set with the unusable record placed first.
         assert_eq!(
-            proves_no_ds("example.com.", &[], &[poison, good]),
+            proves_no_ds(nm("example.com.").as_ref(), &[], &[poison, good]),
             Denial::Proved,
             "an ignorable record before it must not change the answer",
         );
@@ -1430,7 +1501,7 @@ mod tests {
         let mut poison = nsec3_matching("example.com.", &[rt::NS]);
         poison.iterations = MAX_NSEC3_ITERATIONS + 1;
 
-        match proves_no_ds("example.com.", &[], &[poison]) {
+        match proves_no_ds(nm("example.com.").as_ref(), &[], &[poison]) {
             Denial::NotProved(why) => assert!(
                 why.contains("iteration count"),
                 "the cap should be named, got {why:?}",
@@ -1456,7 +1527,7 @@ mod tests {
         rdata.extend_from_slice(&usable.type_bitmap);
 
         let rr = ResourceRecord {
-            name: nm(&usable.owner.clone()),
+            name: usable.owner.clone(),
             class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::new(rt::NSEC3, rdata).expect("well-formed NSEC3 rdata"),
