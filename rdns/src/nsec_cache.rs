@@ -52,6 +52,14 @@ struct ZoneProofs {
     soa: Option<CachedSoa>,
     /// Validated RRsets that came from a wildcard, keyed by (wildcard owner,
     /// type) — the name asked for is the one part that is not reusable.
+    ///
+    /// `Name` rather than [`rdns_core::name_keys::NameTypeKey`], which the answer
+    /// and negative caches use, because the probe has to *build* this key:
+    /// `*.<parent>` appears nowhere in the query, so [`wildcard_for_parent_of`]
+    /// constructs it. The allocation is the key's shape, not its type, and a
+    /// folded key would add a fold and a `dyn` call on top of it. `Name`'s `Hash`
+    /// and `Eq` fold ASCII, so the two are equally right about case
+    /// (`TODO.md` #40b).
     wildcards: HashMap<(Name, Qtype), CachedWildcard>,
 }
 

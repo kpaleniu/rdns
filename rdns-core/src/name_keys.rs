@@ -12,6 +12,21 @@
 //! here: a `HashMap` reaches its key only through `Borrow`, and a `Name` cannot
 //! borrow to a `NameRef` — so the key is the octets and the borrowed form is
 //! `[u8]`, which is the `Path`/`PathBuf` shape without a transmute.
+//!
+//! **Which to reach for.** A `HashMap<Name, _>` is not the worse option, and the
+//! choice is not a matter of taste — `Name`'s `Hash` and `Eq` fold the same
+//! octets the same way, so both are correct about case. It is about what the
+//! probe has in hand:
+//!
+//! - **These types**, when the lookup already holds wire octets and would
+//!   otherwise build a `Name` only to throw it away. That is the resolver's
+//!   caches and `rdnsd`'s zone map, where an ancestor walk probes once per label
+//!   and a fold for the whole walk is the only cost (see
+//!   `rdns::resolver::caches`).
+//! - **`Name` as the key**, when the probe has to *construct* the name anyway.
+//!   Then the allocation belongs to the key's shape rather than to its type, and
+//!   a key here would add a fold and a virtual call on top of it. The denial
+//!   cache's wildcard map is the example, and says so (`TODO.md` #40b).
 
 use crate::{NameRef, Qtype};
 
