@@ -48,15 +48,13 @@ use rdns::{
     transfer::axfr_envelopes,
     tsig::{self, TsigCheck, TsigKeyring, TsigSession},
     update,
-    validation::{AdmissionCheck, Request},
+    validation::{AdmissionCheck, Request, Transport},
     zone::{parse_zone_file_at, Zone},
     DnsMessage, OpCode, Qtype, ResourceRecord, ResponseCode, Serial,
 };
 use rdns::{Name, NameRef};
 use rdns_transport::tcp::{self, send_framed, Reply};
-use rdns_transport::{
-    recv_error_is_transient, ServeContext, Transport, TransportLimits, UDP_RECEIVE_BUFFER,
-};
+use rdns_transport::{recv_error_is_transient, ServeContext, TransportLimits, UDP_RECEIVE_BUFFER};
 
 /// UDP payload size rdnsd advertises to clients via EDNS0.
 const RDNSD_PAYLOAD_SIZE: u16 = 4096;

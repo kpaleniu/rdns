@@ -4,9 +4,8 @@
 //! The wire format itself — messages, records, names, compression, admission
 //! and the control protocol — is [`rdns_core`], which has no `tokio` and no
 //! crypto so that a client can link it alone (`TODO.md` #31). Everything core
-//! defines is re-exported here, so `rdns::DnsMessage` and `rdns::utils` still
-//! name what they always did and nothing downstream has two spellings to
-//! choose between.
+//! defines is re-exported here, so `rdns::DnsMessage` still names what it
+//! always did and nothing downstream has two spellings to choose between.
 
 pub use rdns_core::*;
 

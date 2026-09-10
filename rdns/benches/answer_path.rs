@@ -28,7 +28,7 @@ use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::logging::QueryLogger;
 use rdns::record_types;
 use rdns::security::RateLimiter;
-use rdns::validation::AdmissionCheck;
+use rdns::validation::{AdmissionCheck, Transport};
 use rdns::zone::{parse_zone_file, Zone, ZoneRecord};
 use rdns::zone_signer::{sign_zone, SigningPolicy};
 use rdns::{DnsMessage, DnsMessageBuilder, ParsedRecord, Qtype, RecordData, ResourceRecord};
@@ -240,7 +240,7 @@ fn admission(c: &mut Criterion) {
         b.iter(|| limiter.should_allow(black_box(ip), current_unix_timestamp()))
     });
     group.bench_function("request validator", |b| {
-        b.iter(|| validator.validate_packet(black_box(&packet), false))
+        b.iter(|| validator.validate_packet(black_box(&packet), Transport::Udp))
     });
     group.finish();
 }

@@ -22,7 +22,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::{ServeContext, Transport, TransportLimits};
+use crate::{ServeContext, TransportLimits};
+use rdns::validation::Transport;
 
 /// What a connection's writer task can be handed.
 ///

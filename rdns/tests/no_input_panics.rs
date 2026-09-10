@@ -19,7 +19,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use rdns::clock::current_unix_timestamp;
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::record_types;
-use rdns::validation::AdmissionCheck;
+use rdns::validation::{AdmissionCheck, Transport};
 use rdns::zone::{parse_zone_file, NameKind, Zone};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
 use rdns::{
@@ -289,8 +289,8 @@ fn mutate(rng: &mut Rng, seed_bytes: &[u8]) -> Vec<u8> {
 /// client's question, so an attacker-shaped name goes through the writer too.
 fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring, now: u64) {
     let validator = AdmissionCheck::with_defaults();
-    let _ = validator.validate_packet(data, false);
-    let _ = validator.validate_packet(data, true);
+    let _ = validator.validate_packet(data, Transport::Udp);
+    let _ = validator.validate_packet(data, Transport::Tcp);
     let _ = tsig::check_request(data, keyring, now);
     let _ = tsig::request_mac(data);
 

@@ -17,12 +17,12 @@ use rdns::record_types;
 use rdns::resolver::Resolver;
 use rdns::response::ClientEdns;
 use rdns::special_names;
-use rdns::validation::Request;
+use rdns::validation::{Request, Transport};
 use rdns::Rtype;
 use rdns::{
     DnsCache, DnsMessage, Edns, OpCode, QuerySection, ResourceRecord, ResponseCode, OPT_RECORD_TYPE,
 };
-use rdns_transport::{ServeContext, Transport};
+use rdns_transport::ServeContext;
 
 use crate::RDNSR_PAYLOAD_SIZE;
 

@@ -29,25 +29,8 @@ use rdns::logging::QueryLogger;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::security::{RateLimiter, ResponseLimiter, ResponseVerdict};
 use rdns::shutdown::{stop_signal, Shutdown};
-use rdns::validation::AdmissionCheck;
+use rdns::validation::{AdmissionCheck, Transport};
 use rdns::ResponseCode;
-
-/// Which transport a message arrived on.
-///
-/// Not a bool: it decides the admission size cap (RFC 1035 §4.2.1's 512 against
-/// a ceiling we chose), whether a reply may be truncated, and whether the peer
-/// completed a handshake — three questions one `is_tcp` was answering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transport {
-    Udp,
-    Tcp,
-}
-
-impl Transport {
-    pub fn is_tcp(self) -> bool {
-        self == Transport::Tcp
-    }
-}
 
 /// WSAEMSGSIZE: the datagram was larger than the buffer offered for it. Rust has
 /// no [`std::io::ErrorKind`] for it — it arrives as `Uncategorized` — so the raw
@@ -137,7 +120,7 @@ impl ServeContext {
     /// takes, so the message must not be built unless somebody asked for it,
     /// and the counter is the signal in either case.
     pub fn accept_packet(&self, peer: IpAddr, packet: &[u8], transport: Transport) -> bool {
-        let verdict = self.validator.validate_packet(packet, transport.is_tcp());
+        let verdict = self.validator.validate_packet(packet, transport);
         if verdict.is_valid() {
             return true;
         }
@@ -283,7 +266,7 @@ pub async fn serve_until_stopped(
 ///
 /// A cancelled task is not a failure: it is a task that was told to stop. Both
 /// daemons had this, identical but for whether `anyhow!` was imported.
-pub fn listener_failure(
+fn listener_failure(
     joined: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
 ) -> Option<anyhow::Error> {
     match joined {

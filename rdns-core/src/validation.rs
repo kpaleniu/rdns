@@ -96,13 +96,34 @@ pub fn answers_query(reply: &DnsMessage, sent: &SentQuery) -> Result<(), AnswerM
     Ok(())
 }
 
+/// Which transport a message arrived on.
+///
+/// Not a bool: it decides the admission size cap below (RFC 1035 §4.2.1's 512
+/// against a ceiling we chose), whether a reply may be truncated, and whether
+/// the peer completed a handshake — three questions one `is_tcp` was answering.
+///
+/// Here rather than in `rdns_transport`, where it was until `TODO.md` #40c,
+/// because this is the module that reads it: an enum one crate above the
+/// decision it makes has to be converted back to the bool it replaced at the
+/// call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Udp,
+    Tcp,
+}
+
 /// Upper bound on additional records in a request. A legitimate request carries
 /// at most an OPT plus a TSIG/SIG(0); the slack is for forward compatibility.
 const MAX_REQUEST_ADDITIONALS: usize = 4;
 
-/// Configuration for request validation
+/// The two size caps admission applies, one per transport.
+///
+/// `pub(crate)`: nothing outside builds one, and [`AdmissionCheck::with_defaults`]
+/// is the only constructor anything reaches for. So the caps are not
+/// configurable at all today, which is `TODO.md` #40f's question — a `pub` type
+/// nobody constructs was not an answer to it (`CLAUDE.md` §14).
 #[derive(Debug, Clone)]
-pub struct AdmissionLimits {
+pub(crate) struct AdmissionLimits {
     /// Largest UDP request accepted (RFC 1035 §4.2.1's 512).
     pub max_udp_size: usize,
     /// Largest TCP request accepted. Not a protocol limit — the length prefix
@@ -119,7 +140,11 @@ impl Default for AdmissionLimits {
     }
 }
 
-/// Result of validation
+/// Whether a packet is worth parsing, and if not, the typed reason.
+///
+/// `pub` because [`AdmissionCheck::validate_packet`] returns it and
+/// `rdns_transport` calls that; narrowing it is a private-in-public error
+/// (`TODO.md` #40e).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationResult {
     Valid,
@@ -151,7 +176,7 @@ pub struct AdmissionCheck {
 }
 
 impl AdmissionCheck {
-    pub fn new(config: AdmissionLimits) -> Self {
+    pub(crate) fn new(config: AdmissionLimits) -> Self {
         AdmissionCheck { config }
     }
 
@@ -159,13 +184,11 @@ impl AdmissionCheck {
         Self::new(AdmissionLimits::default())
     }
 
-    /// Validate a DNS request packet
-    pub fn validate_packet(&self, data: &[u8], is_tcp: bool) -> ValidationResult {
-        // Check size
-        let max_size = if is_tcp {
-            self.config.max_tcp_size
-        } else {
-            self.config.max_udp_size
+    /// Whether `data` is worth parsing, at the cap its transport sets.
+    pub fn validate_packet(&self, data: &[u8], transport: Transport) -> ValidationResult {
+        let max_size = match transport {
+            Transport::Tcp => self.config.max_tcp_size,
+            Transport::Udp => self.config.max_udp_size,
         };
 
         if data.len() > max_size {
@@ -398,7 +421,7 @@ mod tests {
             0x00, 0x01, // IN class
         ];
 
-        let result = validator.validate_packet(&packet, false);
+        let result = validator.validate_packet(&packet, Transport::Udp);
         assert_eq!(result, ValidationResult::Valid);
     }
 
@@ -407,7 +430,7 @@ mod tests {
         let validator = AdmissionCheck::with_defaults();
         let packet = vec![0u8; 513]; // Over 512 byte limit for UDP
 
-        let result = validator.validate_packet(&packet, false);
+        let result = validator.validate_packet(&packet, Transport::Udp);
         assert!(!result.is_valid());
         assert!(
             matches!(
@@ -427,7 +450,7 @@ mod tests {
         let packet = vec![0u8; 600]; // Valid for TCP
 
         // But invalid because it's malformed DNS
-        let result = validator.validate_packet(&packet, true);
+        let result = validator.validate_packet(&packet, Transport::Tcp);
         // May fail due to format, but not size
         assert!(
             !matches!(
@@ -446,7 +469,7 @@ mod tests {
         let validator = AdmissionCheck::with_defaults();
         let packet = vec![0u8; 11]; // Less than 12-byte header
 
-        let result = validator.validate_packet(&packet, false);
+        let result = validator.validate_packet(&packet, Transport::Udp);
         assert!(!result.is_valid());
     }
 
@@ -464,7 +487,7 @@ mod tests {
             0x00, 0x00, // 0 additionals
         ];
 
-        let result = validator.validate_packet(&packet, false);
+        let result = validator.validate_packet(&packet, Transport::Udp);
         assert!(!result.is_valid());
         assert!(
             matches!(
@@ -521,19 +544,19 @@ mod tests {
 
         assert!(
             validator
-                .validate_packet(&header(4, 1, 0), false)
+                .validate_packet(&header(4, 1, 0), Transport::Udp)
                 .is_valid(),
             "a NOTIFY carrying the new SOA must reach the server"
         );
         assert!(
             validator
-                .validate_packet(&header(0, 0, 1), false)
+                .validate_packet(&header(0, 0, 1), Transport::Udp)
                 .is_valid(),
             "an IXFR request is a QUERY carrying its SOA in the authority section"
         );
         assert!(
             !validator
-                .validate_packet(&header(4, 40, 0), false)
+                .validate_packet(&header(4, 40, 0), Transport::Udp)
                 .is_valid(),
             "the sections are capped rather than unbounded"
         );
@@ -564,7 +587,9 @@ mod tests {
             0x00, 0x00, // RDLENGTH: no options
         ];
 
-        assert!(validator.validate_packet(&packet, false).is_valid());
+        assert!(validator
+            .validate_packet(&packet, Transport::Udp)
+            .is_valid());
     }
 
     #[test]
@@ -580,7 +605,7 @@ mod tests {
             0x00, 0x64, // 100 additionals (over the limit)
         ];
 
-        let result = validator.validate_packet(&packet, false);
+        let result = validator.validate_packet(&packet, Transport::Udp);
         assert!(!result.is_valid());
         assert!(
             matches!(
@@ -607,7 +632,7 @@ mod tests {
             0x00, 0x00, // 0 additionals
         ];
 
-        let result = validator.validate_packet(&packet, false);
+        let result = validator.validate_packet(&packet, Transport::Udp);
         assert!(!result.is_valid());
     }
 
@@ -625,7 +650,7 @@ mod tests {
             0x00, 0x00, // 0 additionals
         ];
 
-        let result = validator.validate_packet(&packet, false);
+        let result = validator.validate_packet(&packet, Transport::Udp);
         // Should not fail due to answer count (responses can have answers)
         assert!(
             !matches!(
@@ -657,7 +682,7 @@ mod tests {
 
         // Admitted: small, sane counts. That is all this check claims to know.
         assert!(AdmissionCheck::with_defaults()
-            .validate_packet(&packet, false)
+            .validate_packet(&packet, Transport::Udp)
             .is_valid());
 
         // And refused by the one implementation of the rule.
@@ -679,7 +704,7 @@ mod tests {
 
         // 16KB should be accepted for TCP
         let packet = vec![0u8; 16 * 1024];
-        let result = validator.validate_packet(&packet, true);
+        let result = validator.validate_packet(&packet, Transport::Tcp);
         // May fail due to format, but not size
         assert!(
             !matches!(
@@ -699,7 +724,7 @@ mod tests {
 
         // Exceed 16KB for TCP
         let packet = vec![0u8; 16 * 1024 + 1];
-        let result = validator.validate_packet(&packet, true);
+        let result = validator.validate_packet(&packet, Transport::Tcp);
         assert!(!result.is_valid());
     }
 
@@ -718,7 +743,7 @@ mod tests {
         ];
 
         assert!(AdmissionCheck::with_defaults()
-            .validate_packet(&packet, false)
+            .validate_packet(&packet, Transport::Udp)
             .is_valid());
         assert!(DnsMessage::try_from_bytes(&packet).is_err());
     }
