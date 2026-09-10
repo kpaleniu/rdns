@@ -605,6 +605,7 @@ mod tests {
     use crate::dnssec::{verify, verify_rrset, RrsetProof};
     use crate::test_records::a_rdata;
     use crate::test_records::nm;
+    use crate::testutil::ScratchDir;
     use crate::utils::record_types as rt;
     use crate::Class;
 
@@ -805,9 +806,7 @@ mod tests {
 
     #[test]
     fn a_key_directory_loads_every_key_and_refuses_a_broken_one() {
-        let dir = std::env::temp_dir().join(format!("rdns-keys-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = ScratchDir::new("keys");
 
         let ksk = SigningKey::generate(
             SigningAlgorithm::EcdsaP256Sha256,
@@ -821,12 +820,12 @@ mod tests {
             DNSKEY_FLAG_ZONE,
         )
         .unwrap();
-        ksk.write_to_dir(&dir).unwrap();
-        zsk.write_to_dir(&dir).unwrap();
+        ksk.write_to_dir(dir.path()).unwrap();
+        zsk.write_to_dir(dir.path()).unwrap();
         // A file that is not ours is not a key, and is not an error either.
         std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
 
-        let loaded = SigningKey::load_dir(&dir).unwrap();
+        let loaded = SigningKey::load_dir(dir.path()).unwrap();
         assert_eq!(loaded.len(), 2);
         let mut tags: Vec<u16> = loaded.iter().map(|k| k.key_tag()).collect();
         tags.sort_unstable();
@@ -840,14 +839,12 @@ mod tests {
         let broken = dir.join("broken.rdnskey");
         std::fs::write(&broken, "Owner: example.com.\n").unwrap();
         restrict(&broken);
-        let err = SigningKey::load_dir(&dir).unwrap_err();
+        let err = SigningKey::load_dir(dir.path()).unwrap_err();
         assert!(format!("{err:#}").contains("broken.rdnskey"), "{err:#}");
         assert!(
             format!("{err:#}").contains("Flags"),
             "the parse failure, not the permission check: {err:#}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -868,9 +865,7 @@ mod tests {
     #[test]
     fn a_world_readable_private_key_is_refused_by_the_loader() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("rdns-keyperms-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = ScratchDir::new("keyperms");
 
         let key = SigningKey::generate(
             SigningAlgorithm::EcdsaP256Sha256,
@@ -878,18 +873,18 @@ mod tests {
             DNSKEY_FLAG_ZONE,
         )
         .unwrap();
-        let path = key.write_to_dir(&dir).unwrap();
+        let path = key.write_to_dir(dir.path()).unwrap();
 
         // What the server writes is already private, and loads.
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert_eq!(SigningKey::load_dir(&dir).unwrap().len(), 1);
+        assert_eq!(SigningKey::load_dir(dir.path()).unwrap().len(), 1);
 
         // What a deploy script leaves behind does not.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = SigningKey::load_dir(&dir).unwrap_err();
+        let err = SigningKey::load_dir(dir.path()).unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("644"), "name the mode: {text}");
         assert!(
@@ -899,15 +894,13 @@ mod tests {
 
         // And group-readable is no better — the group is other people.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        assert!(SigningKey::load_dir(&dir).is_err());
+        assert!(SigningKey::load_dir(dir.path()).is_err());
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
-            SigningKey::load_dir(&dir).unwrap().len(),
+            SigningKey::load_dir(dir.path()).unwrap().len(),
             1,
             "and putting it back is all it takes to recover"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

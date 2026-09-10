@@ -18,6 +18,8 @@
 //! answering it is each daemon's.
 
 pub mod tcp;
+#[cfg(test)]
+mod testutil;
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -261,31 +263,8 @@ pub fn listener_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdns::security::RateLimitConfig;
+    use crate::testutil::{context, query};
     use rdns::utils::current_unix_timestamp;
-
-    fn context(rate: u32) -> ServeContext {
-        ServeContext {
-            limiter: Arc::new(RateLimiter::new(RateLimitConfig::per_second(rate, rate))),
-            responses: Arc::new(ResponseLimiter::disabled()),
-            validator: Arc::new(AdmissionCheck::with_defaults()),
-            logger: Arc::new(QueryLogger::new()),
-            metrics: Arc::new(DnsMetrics::new()),
-        }
-    }
-
-    /// A minimal question: twelve octets of header and one question section.
-    fn query() -> Vec<u8> {
-        let mut packet = vec![
-            0x12, 0x34, // id
-            0x00, 0x00, // QR=0, opcode QUERY
-            0x00, 0x01, // one question
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        packet.extend_from_slice(b"\x07example\x03com\x00");
-        packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
-        packet
-    }
 
     /// Both refusals are silent on the wire, so both have to be visible in the
     /// counters — that is the whole reason they are not two `if`s at four call
@@ -305,7 +284,7 @@ mod tests {
             1
         );
 
-        assert!(ctx.accept_packet(peer, &query(), Transport::Udp));
+        assert!(ctx.accept_packet(peer, &query(0x1234), Transport::Udp));
         assert!(
             !ctx.accept_packet(peer, &[0x12, 0x34], Transport::Udp),
             "two octets cannot hold a header"
@@ -356,7 +335,7 @@ mod tests {
     fn the_size_cap_belongs_to_the_transport() {
         let ctx = context(0);
         let peer: IpAddr = "192.0.2.10".parse().unwrap();
-        let mut big = query();
+        let mut big = query(0x1234);
         big.resize(1024, 0);
 
         assert!(

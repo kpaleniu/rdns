@@ -504,23 +504,10 @@ pub fn ixfr_response(
 mod tests {
 
     use super::*;
-    use crate::test_records::nm;
+    use crate::test_records::{nm, zone_at};
     use crate::zone::parse_zone_file;
     use crate::Qtype;
     use crate::{OpCode, QueryClass, QuerySection, ResponseCode};
-
-    fn zone_at(serial: u32, body: &str) -> Zone {
-        parse_zone_file(
-            &format!(
-                "$TTL 3600\n\
-                 @    IN SOA ns1.example.com. admin.example.com. {serial} 3600 1800 604800 86400\n\
-                 @    IN NS  ns1.example.com.\n\
-                 {body}"
-            ),
-            "example.com.",
-        )
-        .expect("zone should parse")
-    }
 
     fn request(client_serial: Option<u32>) -> DnsMessage {
         let mut msg = DnsMessage {

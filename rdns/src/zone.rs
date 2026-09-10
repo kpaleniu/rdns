@@ -709,6 +709,7 @@ mod tests {
     use super::*;
     use crate::error::ZoneError;
     use crate::test_records::nm;
+    use crate::testutil::ScratchDir;
     use crate::utils::record_types;
     use crate::ParsedRecord;
     use std::net::Ipv4Addr;
@@ -1725,35 +1726,9 @@ $TTL 3600
 
     /// A scratch directory that removes itself. The include tests need real
     /// files, since resolving `$INCLUDE` is what is under test.
-    struct ScratchDir(std::path::PathBuf);
-
-    impl ScratchDir {
-        fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!("rdns-zone-{tag}-{unique}"));
-            std::fs::create_dir_all(&dir).expect("create scratch dir");
-            ScratchDir(dir)
-        }
-
-        fn write(&self, name: &str, content: &str) -> std::path::PathBuf {
-            let path = self.0.join(name);
-            std::fs::write(&path, content).expect("write scratch file");
-            path
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     fn test_include_pulls_in_records_relative_to_the_including_file() {
-        let dir = ScratchDir::new("include");
+        let dir = ScratchDir::new("zone-include");
         dir.write("hosts.inc", "mail IN A 192.0.2.20\nwww IN A 192.0.2.21\n");
         let main = dir.write(
             "example.com.zone",
@@ -1789,7 +1764,7 @@ $TTL 3600
     /// change the including file's (RFC 1035 §5.1).
     #[test]
     fn test_include_origin_applies_to_the_included_file_only() {
-        let dir = ScratchDir::new("include-origin");
+        let dir = ScratchDir::new("zone-include-origin");
         dir.write(
             "sub.inc",
             "$ORIGIN deeper.example.com.\nns IN A 192.0.2.30\n",
@@ -1821,7 +1796,7 @@ $TTL 3600
 
     #[test]
     fn test_include_of_a_missing_file_is_an_error() {
-        let dir = ScratchDir::new("include-missing");
+        let dir = ScratchDir::new("zone-include-missing");
         let main = dir.write("example.com.zone", "$INCLUDE nope.inc\n");
         let err = parse_zone_file_at(&main, "example.com.").unwrap_err();
         assert!(
@@ -1837,7 +1812,7 @@ $TTL 3600
     /// A file that includes itself recurses until the stack runs out.
     #[test]
     fn test_include_cycle_is_refused() {
-        let dir = ScratchDir::new("include-cycle");
+        let dir = ScratchDir::new("zone-include-cycle");
         let main = dir.write("example.com.zone", "$INCLUDE example.com.zone\n");
         let err = parse_zone_file_at(&main, "example.com.").unwrap_err();
         assert!(err.to_string().contains("cycle"), "got: {err}");

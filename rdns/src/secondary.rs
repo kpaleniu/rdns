@@ -326,6 +326,7 @@ mod tests {
 
     use super::*;
     use crate::test_records::nm;
+    use crate::testutil::ScratchDir;
     use crate::zone::parse_zone_file;
 
     fn addr(text: &str) -> SocketAddr {
@@ -454,30 +455,10 @@ mod tests {
         );
     }
 
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!("rdns-secondary-{tag}-{unique}"));
-            std::fs::create_dir_all(&dir).expect("scratch dir");
-            ScratchDir(dir)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     fn test_state_survives_a_restart() {
-        let dir = ScratchDir::new("state");
-        let path = state_file_path(&dir.0);
+        let dir = ScratchDir::new("secondary-state");
+        let path = state_file_path(dir.path());
 
         let mut state = StateFile::load(&path);
         assert!(state.entries().is_empty(), "nothing fetched yet");
@@ -505,8 +486,8 @@ mod tests {
 
     #[test]
     fn test_recording_the_same_zone_twice_updates_it() {
-        let dir = ScratchDir::new("update");
-        let path = state_file_path(&dir.0);
+        let dir = ScratchDir::new("secondary-update");
+        let path = state_file_path(dir.path());
         let master = addr("192.0.2.1:53");
 
         let mut state = StateFile::load(&path);
@@ -533,8 +514,8 @@ mod tests {
     /// and deleting it reads as "never fetched", which means "fetch and serve".
     #[test]
     fn test_expiry_is_derived_from_the_state_rather_than_stored() {
-        let dir = ScratchDir::new("expiry");
-        let path = state_file_path(&dir.0);
+        let dir = ScratchDir::new("secondary-expiry");
+        let path = state_file_path(dir.path());
         let master = addr("192.0.2.1:53");
         let timers = RefreshTimers::from_soa(3600, 600, 86400);
 
@@ -558,8 +539,8 @@ mod tests {
 
     #[test]
     fn test_a_damaged_state_file_degrades_to_knowing_nothing() {
-        let dir = ScratchDir::new("damaged");
-        let path = state_file_path(&dir.0);
+        let dir = ScratchDir::new("secondary-damaged");
+        let path = state_file_path(dir.path());
         std::fs::write(
             &path,
             "# a comment\n\
@@ -589,7 +570,7 @@ mod tests {
         );
 
         // A file that is not there at all is the same thing: fetch.
-        assert!(StateFile::load(&dir.0.join("no-such-file"))
+        assert!(StateFile::load(&dir.join("no-such-file"))
             .entries()
             .is_empty());
     }

@@ -8,6 +8,7 @@
 
 use crate::denial_wire::build_type_bitmap;
 use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, Nsec3};
+use crate::zone::{parse_zone_file, Zone};
 use crate::{Class, Name, ParsedRecord, RecordData, ResourceRecord, Rtype, Serial, Ttl};
 use std::net::Ipv4Addr;
 
@@ -147,4 +148,21 @@ fn nsec3_as_record(n: &Nsec3, ttl: Ttl) -> ResourceRecord {
         })
         .expect("encode NSEC3"),
     }
+}
+
+/// A zone at `serial`, with `body` appended to an apex that never changes.
+///
+/// `ixfr` and `journal` had this identical: both are about the *steps between*
+/// two versions, so both want a zone that differs only where they say it does.
+pub fn zone_at(serial: u32, body: &str) -> Zone {
+    parse_zone_file(
+        &format!(
+            "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. {serial} 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n\
+             {body}"
+        ),
+        "example.com.",
+    )
+    .expect("zone should parse")
 }

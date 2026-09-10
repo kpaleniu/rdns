@@ -161,45 +161,12 @@ fn sync_dir(_dir: Option<&Path>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A scratch directory that removes itself.
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!("rdns-persist-{tag}-{unique}"));
-            fs::create_dir_all(&dir).expect("create scratch dir");
-            ScratchDir(dir)
-        }
-
-        fn path(&self, name: &str) -> PathBuf {
-            self.0.join(name)
-        }
-
-        fn entries(&self) -> Vec<String> {
-            let mut names: Vec<String> = fs::read_dir(&self.0)
-                .expect("read scratch dir")
-                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-                .collect();
-            names.sort();
-            names
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::testutil::ScratchDir;
 
     #[test]
     fn test_writes_a_new_file() {
-        let dir = ScratchDir::new("new");
-        let path = dir.path("state.txt");
+        let dir = ScratchDir::new("persist-new");
+        let path = dir.join("state.txt");
 
         write_atomically_str(&path, "example.com. 2021010101\n").expect("write");
 
@@ -212,8 +179,8 @@ mod tests {
     /// An existing file is replaced, which a plain Windows `rename` would not do.
     #[test]
     fn test_replaces_an_existing_file() {
-        let dir = ScratchDir::new("replace");
-        let path = dir.path("zone");
+        let dir = ScratchDir::new("persist-replace");
+        let path = dir.join("zone");
         fs::write(&path, "old, and longer than what replaces it").expect("seed");
 
         write_atomically_str(&path, "new").expect("write");
@@ -224,9 +191,9 @@ mod tests {
     /// A stray `.zone.tmpNNN` is something a zone-directory scan would trip on.
     #[test]
     fn test_leaves_no_temporary_behind() {
-        let dir = ScratchDir::new("clean");
-        write_atomically_str(&dir.path("example.com.zone"), "@ IN A 192.0.2.1\n").expect("write");
-        write_atomically_str(&dir.path("example.com.zone"), "@ IN A 192.0.2.2\n").expect("rewrite");
+        let dir = ScratchDir::new("persist-clean");
+        write_atomically_str(&dir.join("example.com.zone"), "@ IN A 192.0.2.1\n").expect("write");
+        write_atomically_str(&dir.join("example.com.zone"), "@ IN A 192.0.2.2\n").expect("rewrite");
 
         assert_eq!(dir.entries(), vec!["example.com.zone".to_string()]);
     }
@@ -234,8 +201,8 @@ mod tests {
     /// The target is a directory, so the rename cannot succeed.
     #[test]
     fn test_a_failed_write_leaves_the_target_alone() {
-        let dir = ScratchDir::new("failure");
-        let path = dir.path("in-the-way");
+        let dir = ScratchDir::new("persist-failure");
+        let path = dir.join("in-the-way");
         fs::create_dir(&path).expect("create the obstruction");
 
         assert!(write_atomically_str(&path, "nope").is_err());
@@ -252,8 +219,8 @@ mod tests {
     #[test]
     fn test_a_secret_readable_by_anyone_else_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = ScratchDir::new("private");
-        let path = dir.path("tsig.secret");
+        let dir = ScratchDir::new("persist-private");
+        let path = dir.join("tsig.secret");
 
         for (mode, private) in [
             (0o600, true),
@@ -290,8 +257,8 @@ mod tests {
     #[test]
     fn test_a_private_write_lands_already_restricted() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = ScratchDir::new("private-write");
-        let path = dir.path("key.rdnskey");
+        let dir = ScratchDir::new("persist-private-write");
+        let path = dir.join("key.rdnskey");
 
         write_atomically_private(&path, "PrivateKey: not-really\n").expect("write");
 

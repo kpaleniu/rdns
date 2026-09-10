@@ -252,47 +252,15 @@ mod tests {
 
     use super::*;
     use crate::ixfr::{diff, DeltaLog};
-    use crate::test_records::nm;
-
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!("rdns-journal-{tag}-{unique}"));
-            std::fs::create_dir_all(&dir).expect("scratch dir");
-            Scratch(dir)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn zone_at(serial: u32, body: &str) -> Zone {
-        parse_zone_file(
-            &format!(
-                "$TTL 3600\n\
-                 @    IN SOA ns1.example.com. admin.example.com. {serial} 3600 1800 604800 86400\n\
-                 @    IN NS  ns1.example.com.\n\
-                 {body}"
-            ),
-            "example.com.",
-        )
-        .expect("zone should parse")
-    }
+    use crate::test_records::{nm, zone_at};
+    use crate::testutil::ScratchDir;
 
     /// A delta round trips record for record, TTL included: a secondary applies
     /// these, so a TTL that shifts in the journal shifts on the replica.
     #[test]
     fn a_delta_round_trips_through_the_journal() {
-        let scratch = Scratch::new("round-trip");
-        let journal = Journal::new(&scratch.0);
+        let scratch = ScratchDir::new("journal-round-trip");
+        let journal = Journal::new(scratch.path());
 
         let v1 = zone_at(1, "www IN A 192.0.2.1\nmail 60 IN A 192.0.2.2\n");
         let v2 = zone_at(2, "www IN A 192.0.2.9\nftp IN AAAA 2001:db8::1\n");
@@ -327,8 +295,8 @@ mod tests {
     /// inspecting the vector, because answering is the point.
     #[test]
     fn a_restored_chain_answers_an_ixfr_from_before_the_restart() {
-        let scratch = Scratch::new("chain");
-        let journal = Journal::new(&scratch.0);
+        let scratch = ScratchDir::new("journal-chain");
+        let journal = Journal::new(scratch.path());
 
         let versions: Vec<Zone> = (1..=4)
             .map(|n| zone_at(n, &format!("www IN A 192.0.2.{n}\n")))
@@ -364,8 +332,8 @@ mod tests {
     /// serial claiming it is current.
     #[test]
     fn a_journal_with_a_gap_is_refused() {
-        let scratch = Scratch::new("gap");
-        let journal = Journal::new(&scratch.0);
+        let scratch = ScratchDir::new("journal-gap");
+        let journal = Journal::new(scratch.path());
 
         let v1 = zone_at(1, "www IN A 192.0.2.1\n");
         let v2 = zone_at(2, "www IN A 192.0.2.2\n");
@@ -386,8 +354,8 @@ mod tests {
     /// Nothing on disk is not an error: it is every zone that has never changed.
     #[test]
     fn a_missing_journal_is_an_empty_history() {
-        let scratch = Scratch::new("missing");
-        let journal = Journal::new(&scratch.0);
+        let scratch = ScratchDir::new("journal-missing");
+        let journal = Journal::new(scratch.path());
         assert!(journal
             .load(nm("example.com.").as_ref())
             .expect("no journal is not a failure")
@@ -398,8 +366,8 @@ mod tests {
     /// after a restart offering increments of itself.
     #[test]
     fn saving_nothing_removes_the_file_and_so_does_forgetting() {
-        let scratch = Scratch::new("withdraw");
-        let journal = Journal::new(&scratch.0);
+        let scratch = ScratchDir::new("journal-withdraw");
+        let journal = Journal::new(scratch.path());
         let v1 = zone_at(1, "www IN A 192.0.2.1\n");
         let v2 = zone_at(2, "www IN A 192.0.2.2\n");
         let delta = diff(&v1, &v2).unwrap();
@@ -425,8 +393,8 @@ mod tests {
     /// Watched failing without `journalled_zones`: there was nothing to ask.
     #[test]
     fn the_journals_on_disk_are_read_from_the_directory() {
-        let scratch = Scratch::new("enumerate");
-        let journal = Journal::new(&scratch.0);
+        let scratch = ScratchDir::new("journal-enumerate");
+        let journal = Journal::new(scratch.path());
         let v1 = zone_at(
             1,
             "www IN A 192.0.2.1
@@ -447,13 +415,13 @@ mod tests {
         // Not ours, and not a domain name: both stay out, because the caller's
         // next step is to delete what comes back.
         std::fs::write(
-            scratch.0.join("example.com.zone"),
+            scratch.join("example.com.zone"),
             "; not a journal
 ",
         )
         .expect("write");
         std::fs::write(
-            scratch.0.join("..journal"),
+            scratch.join("..journal"),
             "; not a name
 ",
         )
@@ -494,8 +462,8 @@ mod tests {
     /// Garbage is an error the caller logs, not a silently empty history.
     #[test]
     fn a_corrupt_journal_is_an_error_rather_than_an_empty_one() {
-        let scratch = Scratch::new("corrupt");
-        let journal = Journal::new(&scratch.0);
+        let scratch = ScratchDir::new("journal-corrupt");
+        let journal = Journal::new(scratch.path());
         std::fs::write(
             journal.path_for(nm("example.com.").as_ref()),
             format!("{SEPARATOR}\nthis is not a record at all\n"),
@@ -512,8 +480,8 @@ mod tests {
     /// the header.
     #[test]
     fn a_sequence_without_its_framing_is_refused() {
-        let scratch = Scratch::new("framing");
-        let journal = Journal::new(&scratch.0);
+        let scratch = ScratchDir::new("journal-framing");
+        let journal = Journal::new(scratch.path());
         std::fs::write(
             journal.path_for(nm("example.com.").as_ref()),
             format!("{SEPARATOR}\nwww.example.com. 3600 IN A 192.0.2.1\n"),

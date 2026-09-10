@@ -319,6 +319,7 @@ mod tests {
 
     use super::*;
     use crate::test_records::nm;
+    use crate::testutil::ScratchDir;
     use crate::utils::record_types as rt;
     use crate::zone::parse_zone_file;
     use crate::Name;
@@ -664,12 +665,7 @@ mod tests {
 
     #[test]
     fn test_written_zone_reaches_disk_whole() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("rdns-zone-writer-{unique}"));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = ScratchDir::new("zone-writer");
         let path = dir.join("example.com.zone");
 
         let zone = parse_zone_file(
@@ -687,7 +683,5 @@ mod tests {
                 .len(),
             1
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

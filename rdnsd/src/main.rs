@@ -2613,7 +2613,7 @@ fn generate_keys(zone: &str, dir: &Path, algorithm: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::replication::{expire_if_out_of_contact, refresh_once, ReplicatedZone};
-    use crate::testutil::{make_response, nm, query, zkey};
+    use crate::testutil::{make_response, nm, query, zkey, ScratchDir};
     use crate::zones::{enumerate_zone_files, plan_reload, zone_key};
     use rdns::secondary::{zone_file_path, RefreshTimers, TransferState};
     use rdns::tsig::{TsigAlgorithm, TsigKey};
@@ -3572,7 +3572,7 @@ mod tests {
     async fn an_update_is_applied_persisted_and_served() {
         let dir = ScratchDir::new("update-applied");
         let key = update_key(rdns::tsig::UpdatePolicy::Any);
-        let addr = spawn_updatable(&dir.0, key.clone()).await;
+        let addr = spawn_updatable(dir.path(), key.clone()).await;
 
         let message = update_message(
             "example.com.",
@@ -3603,7 +3603,7 @@ mod tests {
         );
 
         // The file, which is the half that survives a reload.
-        let written = std::fs::read_to_string(dir.0.join("example.com.zone")).expect("read back");
+        let written = std::fs::read_to_string(dir.join("example.com.zone")).expect("read back");
         assert!(
             written.contains("new.example.com."),
             "the record reached the file:\n{written}"
@@ -3639,7 +3639,7 @@ mod tests {
         let key = update_key(rdns::tsig::UpdatePolicy::Zones(vec![
             "elsewhere.test.".to_string()
         ]));
-        let addr = spawn_updatable(&dir.0, key.clone()).await;
+        let addr = spawn_updatable(dir.path(), key.clone()).await;
         let changes = vec![a_record("new.example.com.", "192.0.2.50")];
 
         // Unsigned: an UPDATE has no address-based path in, by design.
@@ -3679,7 +3679,7 @@ mod tests {
         );
 
         // Nothing was written on any of the three paths.
-        let written = std::fs::read_to_string(dir.0.join("example.com.zone")).expect("read back");
+        let written = std::fs::read_to_string(dir.join("example.com.zone")).expect("read back");
         assert!(
             !written.contains("new.example.com."),
             "a refused UPDATE changes nothing:\n{written}"
@@ -3735,8 +3735,9 @@ mod tests {
     async fn an_update_leaves_a_journal_that_survives_the_process() {
         let dir = ScratchDir::new("update-journal");
         let key = update_key(rdns::tsig::UpdatePolicy::Any);
-        let journal = Arc::new(rdns::journal::Journal::new(dir.0.clone()));
-        let addr = spawn_updatable_with_journal(&dir.0, key.clone(), Some(journal.clone())).await;
+        let journal = Arc::new(rdns::journal::Journal::new(dir.path().to_path_buf()));
+        let addr =
+            spawn_updatable_with_journal(dir.path(), key.clone(), Some(journal.clone())).await;
 
         for (n, addr_text) in [(1u8, "192.0.2.51"), (2, "192.0.2.52")] {
             let bytes = update_message(
@@ -3779,7 +3780,7 @@ mod tests {
     async fn a_failed_prerequisite_leaves_the_zone_alone() {
         let dir = ScratchDir::new("update-prereq");
         let key = update_key(rdns::tsig::UpdatePolicy::Any);
-        let addr = spawn_updatable(&dir.0, key.clone()).await;
+        let addr = spawn_updatable(dir.path(), key.clone()).await;
 
         let mut message = update_message(
             "example.com.",
@@ -3801,7 +3802,7 @@ mod tests {
             ResponseCode::ResourceRecordSetExistsForSomeReason,
             "§3.2.2 YXRRSET, not a generic failure"
         );
-        let written = std::fs::read_to_string(dir.0.join("example.com.zone")).expect("read back");
+        let written = std::fs::read_to_string(dir.join("example.com.zone")).expect("read back");
         assert!(!written.contains("new.example.com."), "{written}");
         let reloaded = rdns::zone::parse_zone_file(&written, "example.com.").expect("reparses");
         assert_eq!(
@@ -3809,26 +3810,6 @@ mod tests {
             Some(Serial::new(1)),
             "and the serial did not move either"
         );
-    }
-
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!("rdnsd-secondary-{tag}-{unique}"));
-            std::fs::create_dir_all(&dir).expect("scratch dir");
-            ScratchDir(dir)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
     }
 
     /// The replication context a refresh runs in, over a scratch directory.
@@ -3840,8 +3821,8 @@ mod tests {
                 metrics: Arc::new(DnsMetrics::new()),
                 journal: None,
             },
-            state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&dir.0)))),
-            zone_dir: dir.0.clone(),
+            state: Arc::new(Mutex::new(StateFile::load(&state_file_path(dir.path())))),
+            zone_dir: dir.path().to_path_buf(),
             notify_targets,
             // Nothing here probes `/readyz`; `readiness::tests` is where the
             // latch itself is checked.
@@ -3891,7 +3872,7 @@ mod tests {
         drop(zones);
 
         // ...written to disk, in the form the ordinary load path reads...
-        let path = zone_file_path(&dir.0, "example.com.");
+        let path = zone_file_path(dir.path(), "example.com.");
         let reloaded = parse_zone_file_at(&path, "example.com.").expect("reload from disk");
         assert_eq!(reloaded.serial(), Some(Serial::new(7)));
         assert_eq!(reloaded.records().len(), 4);
@@ -3913,7 +3894,7 @@ mod tests {
         // write path can break in silence. `record_state` updates under the
         // mutex and writes after dropping it, so "the entry is there" and "the
         // file has it" became two separate claims.
-        let on_disk = StateFile::load(&state_file_path(&dir.0))
+        let on_disk = StateFile::load(&state_file_path(dir.path()))
             .get("example.com.", master)
             .cloned()
             .expect("the sidecar on disk has the entry, not just the copy in memory");
@@ -4030,7 +4011,7 @@ mod tests {
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
         let zone_map = Arc::new(RwLock::new(Zones::new(zones)));
 
-        let mut state_file = StateFile::load(&state_file_path(&dir.0));
+        let mut state_file = StateFile::load(&state_file_path(dir.path()));
         // Contact was made, a very long time ago.
         state_file
             .record(TransferState {
@@ -4050,7 +4031,7 @@ mod tests {
                 journal: None,
             },
             state: state.clone(),
-            zone_dir: dir.0.clone(),
+            zone_dir: dir.path().to_path_buf(),
             notify_targets: Vec::new(),
             readiness: Readiness::ready(),
         };
@@ -4083,7 +4064,7 @@ mod tests {
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
         let zone_map = Arc::new(RwLock::new(Zones::new(zones)));
 
-        let mut state_file = StateFile::load(&state_file_path(&dir.0));
+        let mut state_file = StateFile::load(&state_file_path(dir.path()));
         state_file
             .record(TransferState {
                 zone: "example.com.".to_string(),
@@ -4102,7 +4083,7 @@ mod tests {
                 journal: None,
             },
             state: state.clone(),
-            zone_dir: dir.0.clone(),
+            zone_dir: dir.path().to_path_buf(),
             notify_targets: Vec::new(),
             readiness: Readiness::ready(),
         };
@@ -4603,7 +4584,7 @@ mod tests {
         fn dir_with(tag: &str, files: &[(&str, &str)]) -> ScratchDir {
             let dir = ScratchDir::new(tag);
             for (name, text) in files {
-                std::fs::write(dir.0.join(name), text).expect("write zone");
+                std::fs::write(dir.join(name), text).expect("write zone");
             }
             dir
         }
@@ -4624,7 +4605,7 @@ mod tests {
                     ("broken.test.zone", BROKEN),
                 ],
             );
-            let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
+            let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
 
             let err = load_zones_from_source(&source, false, false)
                 .expect_err("a broken zone file must not pass for a configuration choice")
@@ -4648,7 +4629,7 @@ mod tests {
                 "partial-ok",
                 &[("example.com.zone", GOOD), ("broken.test.zone", BROKEN)],
             );
-            let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
+            let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
 
             let zones = load_zones_from_source(&source, false, true)
                 .expect("the flag is an explicit choice to serve a partial set");
@@ -4671,7 +4652,7 @@ mod tests {
         #[tokio::test]
         async fn a_secondary_may_start_with_an_empty_zone_directory() {
             let dir = dir_with("empty-secondary", &[]);
-            let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
+            let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
 
             let zones = load_zones_from_source(&source, true, false)
                 .expect("a secondary starts before its first transfer");
@@ -4715,7 +4696,7 @@ mod tests {
         }
 
         fn record_contact(dir: &ScratchDir, master: &str, refreshed_at: u64) {
-            let mut state = StateFile::load(&state_file_path(&dir.0));
+            let mut state = StateFile::load(&state_file_path(dir.path()));
             state
                 .record(TransferState {
                     zone: "example.com.".to_string(),
@@ -4746,7 +4727,7 @@ mod tests {
             // Last contact two hours ago, against an EXPIRE of one.
             record_contact(&dir, "192.0.2.1:53", current_unix_timestamp() - 7200);
 
-            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), &dir.0).await;
+            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), dir.path()).await;
             assert!(
                 zone_map.read().await.is_empty(),
                 "out of contact past EXPIRE is not ours to answer for"
@@ -4760,7 +4741,7 @@ mod tests {
             assert_eq!(zone_map.read().await.len(), 1, "a reload re-reads the file");
 
             // ...and must be withdrawn again, which is the whole finding.
-            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), &dir.0).await;
+            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), dir.path()).await;
             assert!(
                 zone_map.read().await.is_empty(),
                 "a SIGHUP is not new contact with the master"
@@ -4784,9 +4765,9 @@ mod tests {
                 zone_map,
                 deltas,
             } = replicated_setup("expire-nostate");
-            assert!(!state_file_path(&dir.0).exists(), "no sidecar at all");
+            assert!(!state_file_path(dir.path()).exists(), "no sidecar at all");
 
-            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), &dir.0).await;
+            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), dir.path()).await;
             assert!(zone_map.read().await.is_empty());
         }
 
@@ -4802,7 +4783,7 @@ mod tests {
             } = replicated_setup("expire-othermaster");
             record_contact(&dir, "192.0.2.99:53", current_unix_timestamp());
 
-            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), &dir.0).await;
+            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), dir.path()).await;
             assert!(zone_map.read().await.is_empty());
         }
 
@@ -4818,7 +4799,7 @@ mod tests {
             } = replicated_setup("expire-fresh");
             record_contact(&dir, "192.0.2.1:53", current_unix_timestamp());
 
-            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), &dir.0).await;
+            withdraw_unvouched_zones(&specs, &served(&zone_map, &deltas), dir.path()).await;
             assert_eq!(zone_map.read().await.len(), 1);
         }
 
@@ -4865,18 +4846,18 @@ mod tests {
                     "@ IN SOA ns1.{zone}.test. admin.{zone}.test. 1 3600 600 604800 300\n\
                      @ IN NS ns1.{zone}.test.\n{records}"
                 );
-                std::fs::write(dir.0.join(format!("{zone}.test.zone")), text).expect("write");
+                std::fs::write(dir.join(format!("{zone}.test.zone")), text).expect("write");
             }
 
             let reloading = Reloading {
                 replicating: false,
                 allow_partial: false,
                 secondaries: Vec::new(),
-                zone_dir: Some(dir.0.clone()),
+                zone_dir: Some(dir.path().to_path_buf()),
                 signing: None,
                 validator: Arc::new(DnssecValidator::new(false)),
             };
-            let source = ZoneSource::Directory(dir.0.to_string_lossy().to_string());
+            let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
 
             // Anything at all that wants the runtime while the reload runs — one
             // query's worth of "was I polled?".
@@ -5502,23 +5483,24 @@ ns.plain  IN A   192.0.2.30
             // meeting — a key written under a name the loader does not look
             // for, or loaded for a zone whose origin is spelled differently.
             let dir = ScratchDir::new("signing");
-            generate_keys("example.com", &dir.0, "ECDSAP256SHA256").expect("generate");
+            generate_keys("example.com", dir.path(), "ECDSAP256SHA256").expect("generate");
 
-            let zone_path = dir.0.join("example.com.zone");
+            let zone_path = dir.join("example.com.zone");
             std::fs::write(&zone_path, SIGNED_ZONE).unwrap();
 
             let cli = Cli::parse_from([
                 "rdnsd",
                 "--zone-dir",
-                dir.0.to_str().unwrap(),
+                dir.path().to_str().unwrap(),
                 "--signing-key-dir",
-                dir.0.to_str().unwrap(),
+                dir.path().to_str().unwrap(),
             ]);
             let signing = ZoneSigning::load(&cli, &BTreeMap::new())
                 .expect("load keys")
                 .expect("configured");
 
-            let mut zones = enumerate_zone_files(dir.0.to_str().unwrap(), false).expect("zones");
+            let mut zones =
+                enumerate_zone_files(dir.path().to_str().unwrap(), false).expect("zones");
             signing.apply(&mut zones).expect("sign");
 
             // Checked with the same validator the server runs before serving.

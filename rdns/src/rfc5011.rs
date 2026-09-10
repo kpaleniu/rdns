@@ -705,6 +705,7 @@ mod tests {
     use super::*;
     use crate::dnssec_chain::TrustAnchors;
     use crate::test_records::nm;
+    use crate::testutil::ScratchDir;
 
     const DAY: u64 = 86_400;
 
@@ -1235,12 +1236,7 @@ mod tests {
 
     #[test]
     fn test_written_state_survives_a_restart() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("rdns-anchors-{unique}"));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = ScratchDir::new("anchors");
         let path = dir.join("root.key");
 
         let old = zone_key(1);
@@ -1261,8 +1257,6 @@ mod tests {
             .expect("the pending key survived");
         assert_eq!(tracked.state, KeyState::AddPend);
         assert_eq!(tracked.since, t0, "the clock did not restart");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

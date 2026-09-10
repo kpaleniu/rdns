@@ -1024,7 +1024,7 @@ pub(crate) fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<Zon
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::nm;
+    use crate::testutil::{nm, ScratchDir};
 
     #[test]
     fn test_extract_zone_origin_with_extension() {
@@ -1089,12 +1089,7 @@ mod tests {
     /// Watched failing without the sweep: both journals were still there.
     #[tokio::test]
     async fn a_journal_no_zone_claims_is_discarded_at_startup() {
-        let dir = std::env::temp_dir().join(format!(
-            "rdnsd-orphan-journal-{}-{}",
-            std::process::id(),
-            current_unix_timestamp()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = ScratchDir::new("orphan-journal");
 
         let at = |origin: &str, serial: u32| {
             rdns::zone::parse_zone_file(
@@ -1110,7 +1105,7 @@ mod tests {
             .expect("the test zone parses")
         };
 
-        let journal = Journal::new(&dir);
+        let journal = Journal::new(dir.path());
         let mut log = DeltaLog::new();
         for origin in ["example.com.", "gone.example.net."] {
             let name = nm(origin);
@@ -1143,9 +1138,9 @@ mod tests {
         assert_eq!(
             on_disk(),
             ["example.com."],
-            "a zone we serve keeps its history; one nobody serves does not sit              there waiting to resurface"
+            "a zone we serve keeps its history; one nobody serves does not \
+             sit there waiting to resurface"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A snapshot is a version, not a view of the map.

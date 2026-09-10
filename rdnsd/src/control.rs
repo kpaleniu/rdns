@@ -378,6 +378,7 @@ async fn dump(args: &[String], control: &Control) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::ScratchDir;
     use rdns::control::{parse_reply, Reply};
     use rdns::zone::Zone;
 
@@ -572,8 +573,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use tokio::io::AsyncWriteExt;
 
-        let dir = std::env::temp_dir().join(format!("rdnsd-control-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = ScratchDir::new("control");
         let path = dir.join("rdnsd.sock");
         let listener = bind(&path).expect("bind");
 
@@ -606,15 +606,13 @@ mod tests {
             !path.exists(),
             "a socket left behind makes `rdnsctl` say `connection refused` about a server that is not running"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A second server over a running one would leave two daemons and one
     /// working control channel, and the second would look fine.
     #[tokio::test]
     async fn binding_over_a_live_socket_is_refused() {
-        let dir = std::env::temp_dir().join(format!("rdnsd-control-live-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = ScratchDir::new("control-live");
         let path = dir.join("rdnsd.sock");
         let first = bind(&path).expect("the first bind");
 
@@ -628,6 +626,5 @@ mod tests {
             bind(&path).is_ok(),
             "a stale socket file must not block a start"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
