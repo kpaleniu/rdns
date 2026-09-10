@@ -274,6 +274,51 @@ pub(crate) async fn restore_journals(
     }
 }
 
+/// Delete the journals of zones this server does not hold.
+///
+/// The gap [`restore_journals`] cannot see: it walks the zone list, so a journal
+/// left behind by a zone removed from the configuration *while the process was
+/// down* is never looked at. A reload deletes the journal of a zone it
+/// withdraws, and this is the same rule for the withdrawal nobody was running
+/// for (`TODO.md` #38b).
+///
+/// Litter is the smaller half. The larger is that the file resurfaces if a zone
+/// of that name is ever added back: `journal::usable_against` refuses a history
+/// that does not reach the serial loaded, but a zone re-added at the serial it
+/// left at is a zone whose journal describes versions of some earlier
+/// incarnation, and a secondary would apply them.
+///
+/// With `--allow-partial-load` a zone whose file will not parse is not held, so
+/// its journal goes too. That is the right way for it to fail: the cost is a
+/// full transfer once the typo is fixed, which RFC 1995 §4 permits at any time,
+/// and the alternative is deciding a zone is still ours on the strength of a
+/// file we could not read.
+pub(crate) async fn discard_orphan_journals(journal: &Journal, zone_map: &Arc<RwLock<Zones>>) {
+    let journalled = match journal.journalled_zones() {
+        Ok(journalled) => journalled,
+        // A warning, like every other failure on this path: nothing here has
+        // teeth, and a directory we cannot read is not a reason to refuse to
+        // serve what we already loaded from it.
+        Err(e) => {
+            tracing::warn!("could not list the journals: {e}");
+            return;
+        }
+    };
+    // Decided under the read guard, deleted outside it: unlinking a directory's
+    // worth of files needs nothing from the map.
+    let orphans: Vec<Name> = {
+        let zones = zone_map.read().await;
+        journalled
+            .into_iter()
+            .filter(|name| zones.matching(name.as_ref()).is_none())
+            .collect()
+    };
+    for name in orphans {
+        tracing::info!("discarding the journal for {name}, which is not a zone we hold");
+        journal.forget(name.as_ref());
+    }
+}
+
 /// What a reload does to the delta log: which zones leave it, and which gain a
 /// version step. Computed away from the write lock — see `Zones`.
 pub(crate) struct ReloadPlan {
@@ -1031,6 +1076,76 @@ mod tests {
             "and it is withdrawn by either"
         );
         assert!(zones.is_empty());
+    }
+
+    /// A journal belonging to no zone we hold is deleted at startup, and one
+    /// belonging to a zone we do hold is not.
+    ///
+    /// The withdrawal nobody was running for: a reload deletes the journal of a
+    /// zone it drops, so the only way to leave one behind is to remove the zone
+    /// while the process is down (`TODO.md` #38b). Nothing swept them, and the
+    /// file then resurfaced under a zone of the same name.
+    ///
+    /// Watched failing without the sweep: both journals were still there.
+    #[tokio::test]
+    async fn a_journal_no_zone_claims_is_discarded_at_startup() {
+        let dir = std::env::temp_dir().join(format!(
+            "rdnsd-orphan-journal-{}-{}",
+            std::process::id(),
+            current_unix_timestamp()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let at = |origin: &str, serial: u32| {
+            rdns::zone::parse_zone_file(
+                &format!(
+                    "$ORIGIN {origin}\n\
+                     $TTL 3600\n\
+                     @ IN SOA ns1.{origin} admin.{origin} ( {serial} 3600 600 604800 300 )\n\
+                     @ IN NS  ns1.{origin}\n\
+                     www IN A 192.0.2.{serial}\n"
+                ),
+                origin,
+            )
+            .expect("the test zone parses")
+        };
+
+        let journal = Journal::new(&dir);
+        let mut log = DeltaLog::new();
+        for origin in ["example.com.", "gone.example.net."] {
+            let name = nm(origin);
+            log.note_change(Some(&at(origin, 1)), &at(origin, 2));
+            journal
+                .save(name.as_ref(), &log.all(name.as_ref()))
+                .expect("a journal for each");
+        }
+        // Through the listing rather than the paths: what the sweep reads is
+        // what a test should assert on.
+        let on_disk = || {
+            let mut names: Vec<String> = journal
+                .journalled_zones()
+                .expect("the directory reads")
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(on_disk(), ["example.com.", "gone.example.net."]);
+
+        // Only one of the two is configured now.
+        let mut zones = Zones::default();
+        drop(zones.insert(at("example.com.", 2)));
+        let zone_map = Arc::new(RwLock::new(zones));
+
+        discard_orphan_journals(&journal, &zone_map).await;
+
+        assert_eq!(
+            on_disk(),
+            ["example.com."],
+            "a zone we serve keeps its history; one nobody serves does not sit              there waiting to resurface"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A snapshot is a version, not a view of the map.

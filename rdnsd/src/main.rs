@@ -20,8 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zones::{
-    install_all_zones, install_zone, load_zones_from_source, note_serials, restore_journals,
-    validate_zone_source, verify_zones, ZoneContext, ZoneMap, ZoneSigning, ZoneSource, Zones,
+    discard_orphan_journals, install_all_zones, install_zone, load_zones_from_source, note_serials,
+    restore_journals, validate_zone_source, verify_zones, ZoneContext, ZoneMap, ZoneSigning,
+    ZoneSource, Zones,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -2398,6 +2399,10 @@ async fn main() -> Result<()> {
     };
     if let Some(journal) = &journal {
         restore_journals(journal, &zone_map, &deltas).await;
+        // A separate walk because it is a separate question: the restore asks
+        // what each zone's journal says, this asks which journals are no zone's
+        // (`CLAUDE.md` §4).
+        discard_orphan_journals(journal, &zone_map).await;
     }
     let addr = format!("{}:{}", cli.host, cli.port);
 

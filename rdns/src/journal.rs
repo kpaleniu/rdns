@@ -17,7 +17,7 @@ use crate::ixfr::ZoneDelta;
 use crate::utils::record_types as rt;
 use crate::zone::{parse_zone_file, Zone, ZoneRecord};
 use crate::zone_writer::record_to_string;
-use crate::{NameRef, ResourceRecord, Serial};
+use crate::{Name, NameRef, ResourceRecord, Serial};
 
 /// The line that separates one difference sequence from the next.
 ///
@@ -134,6 +134,37 @@ impl Journal {
     /// of something nobody serves.
     pub fn forget(&self, zone: NameRef<'_>) {
         let _ = std::fs::remove_file(self.path_for(zone));
+    }
+
+    /// Every zone with a journal in this directory.
+    ///
+    /// Read from the directory rather than from the zone list, because what this
+    /// answers is which journals belong to no zone at all: one left by a zone
+    /// removed while the process was down is invisible to a walk of the zone
+    /// list, and stays on disk until it resurfaces under a zone of the same name
+    /// (`TODO.md` #38b).
+    ///
+    /// A file whose name is not a domain name is somebody else's and is left
+    /// out. So is the root zone's `.journal`, which `Path` reads as a name with
+    /// no extension — never enumerated is never deleted, which is the safe way
+    /// round for a caller whose next step is `forget`.
+    pub fn journalled_zones(&self) -> std::io::Result<Vec<Name>> {
+        let mut zones = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("journal") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // `path_for` writes the presentation form, trailing dot and all, so
+            // the stem is the name without it.
+            if let Ok(name) = Name::from_presentation(&format!("{stem}.")) {
+                zones.push(name);
+            }
+        }
+        Ok(zones)
     }
 }
 
@@ -385,6 +416,66 @@ mod tests {
             .unwrap();
         journal.forget(nm("example.com.").as_ref());
         assert!(!journal.path_for(nm("example.com.").as_ref()).exists());
+    }
+
+    /// The directory answers which journals exist, which is the question the
+    /// zone list cannot: an orphan is exactly a name that is here and not there
+    /// (`TODO.md` #38b).
+    ///
+    /// Watched failing without `journalled_zones`: there was nothing to ask.
+    #[test]
+    fn the_journals_on_disk_are_read_from_the_directory() {
+        let scratch = Scratch::new("enumerate");
+        let journal = Journal::new(&scratch.0);
+        let v1 = zone_at(
+            1,
+            "www IN A 192.0.2.1
+",
+        );
+        let v2 = zone_at(
+            2,
+            "www IN A 192.0.2.2
+",
+        );
+        let delta = diff(&v1, &v2).expect("a step");
+
+        for zone in ["example.com.", "gone.example.net."] {
+            journal
+                .save(nm(zone).as_ref(), &[&delta])
+                .expect("a journal for each");
+        }
+        // Not ours, and not a domain name: both stay out, because the caller's
+        // next step is to delete what comes back.
+        std::fs::write(
+            scratch.0.join("example.com.zone"),
+            "; not a journal
+",
+        )
+        .expect("write");
+        std::fs::write(
+            scratch.0.join("..journal"),
+            "; not a name
+",
+        )
+        .expect("write");
+
+        let mut found: Vec<String> = journal
+            .journalled_zones()
+            .expect("the directory reads")
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        found.sort();
+        assert_eq!(found, ["example.com.", "gone.example.net."]);
+    }
+
+    /// A directory that will not read is an error, not an empty listing: the
+    /// caller deletes what is missing from what this returns, so "nothing here"
+    /// is the one wrong answer (`CLAUDE.md` §4).
+    #[test]
+    fn an_unreadable_directory_is_not_an_empty_one() {
+        let journal = Journal::new(std::env::temp_dir().join("rdns-journal-no-such-dir"));
+        assert!(journal.journalled_zones().is_err());
     }
 
     /// A journal that does not reach the zone's current serial is not used.
