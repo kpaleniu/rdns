@@ -28,7 +28,7 @@ each row exists (`CLAUDE.md` §11).
 | 1035 §4.2.1 | 512-octet UDP, TC=1, TCP retry | yes | `to_bytes_within` |
 | 1035 §4.2.2 | 2-octet TCP length prefix | yes, checked — **D-2** fixed 2026-08-03 | `rdns::framed`, one site |
 | 1035 §5 | master file format | partial — no `$GENERATE` | `zone.rs` |
-| 1035 §5.1 | `\X` and `\DDD` escapes | yes, since 2026-09-07 — in TXT and SVCB values, and in names since **D-1** closed the same day | `utils::char_string_decode`, `Name::from_presentation` |
+| 1035 §5.1 | `\X` and `\DDD` escapes | yes, since 2026-09-07 — in TXT and SVCB values, and in names since **D-1** closed the same day | `codecs::char_string_decode`, `Name::from_presentation` |
 | 1996 | NOTIFY, both directions | yes — **D-3** and **D-4** both fixed 2026-08-03 | `notify.rs`, `rdnsd` |
 | 1982 | serial arithmetic | yes — `Serial` has no `Ord` | `codes.rs` |
 | 2181 §8 | TTL is unsigned; top bit set reads as 0 | yes, clamped at the boundary once | `Ttl::from_wire` |
@@ -36,7 +36,7 @@ each row exists (`CLAUDE.md` §11).
 | 2308 §2 | negative answers carry the SOA | yes | `add_negative` |
 | 2308 §3 | negative TTL = min(MINIMUM, SOA TTL) | yes, and the RRSIG beside it | `negative_ttl`, `soa_signatures` |
 | 3597 | unknown RR types round-trip | yes, incl. `\#` and `TYPEnnn` | `RecordData`, `zone_writer` |
-| 4343 | case folding is ASCII-only | yes — **D-4**'s two exceptions fixed 2026-08-03 | `utils::ascii_lowered` |
+| 4343 | case folding is ASCII-only | yes — **D-4**'s two exceptions fixed 2026-08-03 | `text_names::ascii_lowered` |
 | 4592 §2.2.1 | no synthesis at or below a cut | yes | `name_kind_of_key` |
 | 4592 §2.2.2 | a name with descendants exists | yes — `non_terminals` | `zone.rs` |
 | 4592 §3.3.1/§3.3.2 | synthesis to any depth, closest encloser | yes | `name_kind_of_key` |
@@ -51,11 +51,11 @@ each row exists (`CLAUDE.md` §11).
 | 8482 §4 | ANY answers | yes — `Qtype::matches` | `codes.rs` |
 | 8945 | TSIG, incl. signed errors and chained MACs | yes | `tsig.rs` |
 | 2136 | dynamic UPDATE | **served end to end** (2026-08-03): §2.4/§2.5 forms, §3.1/§3.1.1, §3.2, §3.3 per-key scoping, §3.4.2, §3.6, §3.7. TSIG-only, scoped per key, persisted before the client is told it succeeded. A signed zone is re-signed incrementally and the version steps are journalled — see **G-4** and `TODO.md` #10 | `update.rs`, `journal.rs`, `rdnsd` |
-| 6672 | DNAME | **yes** (2026-09-06): §2.2's substitution incl. Table 1, §2.3's owner-not-redirected, §2.4/§3.3's load refusals, §2.5's uncompressed target, §3.1's synthesized CNAME, §3.2's server algorithm with YXDOMAIN on overflow, §3.4/§3.4.1's resolver half, §5.2's UPDATE rules and §5.3's DNSSEC. Obsoletes 2672 | `utils::dname_redirect`, `Zone::dname_above`, `rdnsd/src/answer.rs`, `resolver.rs` |
+| 6672 | DNAME | **yes** (2026-09-06): §2.2's substitution incl. Table 1, §2.3's owner-not-redirected, §2.4/§3.3's load refusals, §2.5's uncompressed target, §3.1's synthesized CNAME, §3.2's server algorithm with YXDOMAIN on overflow, §3.4/§3.4.1's resolver half, §5.2's UPDATE rules and §5.3's DNSSEC. Obsoletes 2672 | `name::dname_redirect`, `Zone::dname_above`, `rdnsd/src/answer.rs`, `resolver.rs` |
 | 7858 / 8484 / 9250 | DoT / DoH / DoQ | no | — |
 | 7873 | DNS Cookies | opaque round-trip only | `EDNS_OPTION_COOKIE` |
 | 2931 | SIG(0) | no | — |
-| 9460 | SVCB / HTTPS | **stored, served and readable in a zone file** (2026-09-07): §2.1's presentation format, §2.2's wire format and its ordering rule, §2.4's two modes, §7's six parameter shapes, §8's mandatory list. Appendix D's test vectors are a test. **Not** §4.1/§4.2's additional-section prefetching, which are `SHOULD`s — see the note below | `svcb.rs`, `utils::char_string_decode` |
+| 9460 | SVCB / HTTPS | **stored, served and readable in a zone file** (2026-09-07): §2.1's presentation format, §2.2's wire format and its ordering rule, §2.4's two modes, §7's six parameter shapes, §8's mandatory list. Appendix D's test vectors are a test. **Not** §4.1/§4.2's additional-section prefetching, which are `SHOULD`s — see the note below | `svcb.rs`, `codecs::char_string_decode` |
 
 ## 7.2 DNSSEC
 
@@ -133,7 +133,7 @@ source and opcode, and the workspace's `rand` is a library dependency rather tha
 this crate's" — holds for the threat but leaves two functions of the same name
 with different security properties.~~
 
-There is one `utils::rand_id` now and both call it. The dependency argument was
+There is one `rdns::rand_id` now and both call it. The dependency argument was
 what made the second copy look reasonable, and it is exactly what exposing the
 first one removes: `rdns` already has `rand`, so `rdnsd` needs no new dependency
 to stop having its own. An id is still not a security boundary here — a NOTIFY is
@@ -149,7 +149,7 @@ replicated zone folded onto that zone.~~
 
 Fixed in `262b5f3` (`TODO.md` #19a). Both sites, and the replicated-zone check
 the dynamic-UPDATE path added the same day, now go through
-`utils::absolute_lowered`, so all three agree by construction rather than by
+`text_names::absolute_lowered`, so all three agree by construction rather than by
 having been written to match.
 
 ### D-5 — LDH label syntax is not enforced

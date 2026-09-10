@@ -263,7 +263,7 @@ pub fn canonical_name_of(name: NameRef<'_>) -> String {
 /// and canonical DNSSEC form is down-cased (RFC 4034 §6.2).
 pub fn canonical_name(name: &str) -> String {
     let lowered = name.to_ascii_lowercase();
-    if crate::utils::ends_with_root(&lowered) {
+    if crate::text_names::ends_with_root(&lowered) {
         lowered
     } else {
         format!("{lowered}.")
@@ -802,7 +802,7 @@ mod tests {
     use crate::test_records::nm;
     // Only the tests read the clock; the library takes `now` as an argument so
     // that a test can name an instant.
-    use crate::utils::current_unix_timestamp;
+    use crate::clock::current_unix_timestamp;
 
     use crate::Ttl;
     use crate::{ParsedRecord, RecordData};

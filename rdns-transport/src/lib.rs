@@ -298,7 +298,7 @@ pub fn listener_failure(
 mod tests {
     use super::*;
     use crate::testutil::{context, query};
-    use rdns::utils::current_unix_timestamp;
+    use rdns::clock::current_unix_timestamp;
 
     /// The oversized-datagram case, tested through the raw code because
     /// WSAEMSGSIZE's `ErrorKind` is `Uncategorized` and carries no information.

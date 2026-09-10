@@ -158,8 +158,9 @@ its signature field prepended.
 Wildcard reconstruction: an RRSIG whose `labels` count is fewer than the owner's
 was made at `*.<the last `labels` labels>` (RFC 4035 §5.3.2).
 
-Time validity: `utils::is_time_expired(inception, expiration)` — RFC 4034 §3.1.5
-serial-number arithmetic, not a plain comparison.
+Time validity: `Rrsig::is_current(now)` — RFC 4034 §3.1.5 serial-number
+arithmetic, not a plain comparison. (`utils::is_time_expired` was a second copy
+of the rule with no caller, deleted in `77f0e7b`.)
 
 ---
 

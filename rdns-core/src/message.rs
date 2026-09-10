@@ -67,6 +67,13 @@ fn section_count(len: usize, what: &'static str) -> Result<u16, WireError> {
 /// desynchronises the stream. `rdns::tsig` appends to the *finished* bytes
 /// and is the one path that can grow a message past the size it was serialized
 /// to.
+/// A random DNS transaction id. The one implementation: an id is not a security
+/// boundary here, but that is no reason to make it predictable.
+pub fn rand_id() -> u16 {
+    use rand::Rng;
+    rand::thread_rng().gen()
+}
+
 pub fn framed(bytes: &[u8]) -> Result<Vec<u8>, WireError> {
     let len: u16 = bytes.len().try_into().map_err(|_| WireError::TooLong {
         what: "a TCP message",
@@ -502,7 +509,8 @@ const DNSSEC_PAYLOAD_SIZE: u16 = 4096;
 /// answers `None` for ANY, AXFR and IXFR because no *record* is one of those
 /// types — and the question was then dropped with no `else`, so `rdnsc`, this
 /// tree's only query client, could not ask an ANY query at all (`TODO.md` #33b).
-/// The name door is [`utils::qtype_name_to_code`](crate::record_types::qtype_name_to_code), which answers `Option` and
+/// The name door is [`record_types::qtype_name_to_code`](crate::record_types::qtype_name_to_code),
+/// which answers `Option` and
 /// leaves the reporting to the caller that has a person to report to.
 pub struct DnsMessageBuilder {
     id: u16,

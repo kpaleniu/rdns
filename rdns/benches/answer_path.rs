@@ -22,12 +22,12 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use rdns::cache::DnsCache;
+use rdns::clock::current_unix_timestamp;
 use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Rrset};
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::logging::QueryLogger;
 use rdns::record_types;
 use rdns::security::RateLimiter;
-use rdns::utils::current_unix_timestamp;
 use rdns::validation::AdmissionCheck;
 use rdns::zone::{parse_zone_file, Zone, ZoneRecord};
 use rdns::zone_signer::{sign_zone, SigningPolicy};

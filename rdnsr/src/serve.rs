@@ -9,10 +9,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use rdns::clock::current_unix_timestamp;
 use rdns::resolver::Resolver;
 use rdns::security::ResponseVerdict;
 use rdns::shutdown::{Busy, Stop};
-use rdns::utils::current_unix_timestamp;
 use rdns_transport::{recv_error_is_transient, tcp, ServeContext, Transport, UDP_RECEIVE_BUFFER};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Semaphore};

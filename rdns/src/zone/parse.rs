@@ -153,7 +153,7 @@ fn tokenize(text: &str) -> Vec<String> {
         }
         match c {
             // Kept, not consumed: RFC 1035 §5.1's escapes are resolved by the
-            // value that needs them (`utils::char_string_decode`), because only
+            // value that needs them (`codecs::char_string_decode`), because only
             // that value knows whether `\\120` is three characters or one
             // octet. Eating it here made `\\DDD` unspellable and silently
             // turned a quoted `"a\\.b"` into two labels.

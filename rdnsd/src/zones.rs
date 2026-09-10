@@ -15,13 +15,13 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::RwLock;
 
+use rdns::clock::current_unix_timestamp;
 use rdns::dnssec_key::SigningKey;
 use rdns::dnssec_validation_mode::DnssecValidator;
 use rdns::ixfr::{plan_change, DeltaLog, PlannedDelta};
 use rdns::journal::Journal;
 use rdns::metrics::DnsMetrics;
 use rdns::record_types;
-use rdns::utils::current_unix_timestamp;
 use rdns::zone::{parse_zone_file_at, Zone};
 use rdns::zone_signer::{
     resign_after, sign_zone, sign_zone_incrementally, DenialChain, SigningPolicy,
@@ -32,7 +32,7 @@ use crate::config;
 use crate::{absolute_name, Cli};
 
 /// Every zone this server holds, keyed by its origin in
-/// [`rdns::utils::NameKeyBuf`] form.
+/// [`rdns::text_names::NameKeyBuf`] form.
 ///
 /// The key is folded so [`Zones::for_query`] can hash the QNAME's ancestors
 /// against it — bounded by the name's label count rather than by how many zones

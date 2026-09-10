@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use rdns::clock::current_unix_timestamp;
 use rdns::dnssec_chain::ValidationState;
 use rdns::record_types;
 use rdns::resolver::{Resolver, SharedAnchors};
 use rdns::rfc5011::{self, AnchorChange, ManagedAnchors};
 use rdns::shutdown::{Busy, Stop};
-use rdns::utils::current_unix_timestamp;
 use rdns::{Qtype, QuerySection};
 
 /// Follow the managed zones' DNSKEY RRsets and keep the anchors in step

@@ -7,10 +7,10 @@
 
 #[cfg(test)]
 mod benches {
+    use crate::clock::current_unix_timestamp;
     use crate::logging::QueryLogger;
     use crate::record_types as rt;
     use crate::test_records::nm;
-    use crate::utils::current_unix_timestamp;
     use crate::Qtype;
     use crate::{Class, Ttl};
     use std::net::{IpAddr, Ipv4Addr};

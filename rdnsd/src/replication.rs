@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::{Notify, RwLock};
 
+use rdns::clock::current_unix_timestamp;
 use rdns::metrics::DnsMetrics;
 use rdns::readiness::Readiness;
 use rdns::secondary::{
@@ -34,7 +35,6 @@ use rdns::secondary::{
 };
 use rdns::shutdown::{Busy, Lifecycle};
 use rdns::tsig::{TsigAlgorithm, TsigKey, TsigKeyring};
-use rdns::utils::current_unix_timestamp;
 use rdns::xfr;
 use rdns::zone::Zone;
 use rdns::zone_writer::write_zone_file;

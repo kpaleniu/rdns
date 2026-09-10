@@ -1,5 +1,5 @@
+use crate::clock::current_unix_timestamp;
 use crate::error::{ConfigError, ConfigResult};
-use crate::utils::current_unix_timestamp;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

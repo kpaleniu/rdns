@@ -74,9 +74,9 @@ remember. `NameRef::folded` produces the octets for a `HashMap` key and
 or copy as needed and neither is optional at a call site.
 
 `str::to_lowercase` MUST NOT be used on a name — it folds U+212A KELVIN SIGN onto
-`k`. The text helpers that are left (`utils::ascii_lowered`,
-`utils::absolute_lowered`, `utils::NameKeyBuf`) serve the caches, which key on
-presentation text.
+`k`. The text helpers that are left (`text_names::ascii_lowered`,
+`text_names::absolute_lowered`, `text_names::NameKeyBuf`) serve the caches, which
+key on presentation text.
 
 ---
 

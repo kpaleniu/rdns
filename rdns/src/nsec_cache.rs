@@ -15,12 +15,12 @@
 //! - NXDOMAIN needs the wildcard denied too.
 //! - TTL is bounded by the proof, not by the question.
 
+use crate::clock::current_unix_timestamp;
 use crate::denial_wire::canonical_sort_key;
 use crate::dnssec::{signed_owner_name, Rrsig};
 use crate::dnssec_denial::{proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Params};
 use crate::eviction::Halving;
 use crate::record_types as rt;
-use crate::utils::current_unix_timestamp;
 use crate::NameRef;
 use crate::Qtype;
 use crate::Rtype;

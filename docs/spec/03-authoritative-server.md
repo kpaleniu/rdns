@@ -91,7 +91,7 @@ The IXFR-over-UDP answer is always the single-SOA form.
 ### 3.2.5 Zone selection
 
 `find_zone_for_query`: among zones whose origin contains the QNAME
-(`utils::is_at_or_under`), the one with the longest origin wins. The root zone
+(`NameRef::is_at_or_under`), the one with the longest origin wins. The root zone
 contains everything.
 
 No zone: REFUSED with AA clear, not NXDOMAIN.
@@ -248,7 +248,7 @@ back at startup.
 `--also-notify <addr[:port]>` (global) and `[zones."x"].also-notify` (per zone).
 Sent on zone load — at startup and on every reload — for every zone whose serial
 moved forward, compared with `Serial::is_newer_than`. Transaction ids come from
-`utils::rand_id`.
+`rdns::rand_id`.
 
 > Deviation D-3 — fixed 2026-08-03. ~~The transaction id is derived from
 > `SystemTime`'s `subsec_nanos()`, so two NOTIFYs in one clock tick share an
@@ -270,7 +270,7 @@ mid-transfer.
 > Deviation D-4 — fixed 2026-08-03. ~~The zone-name lookup key is built with
 > `str::to_lowercase`, which folds U+212A KELVIN SIGN onto `k` where RFC 4343
 > requires an ASCII-only fold.~~ Both this lookup and its matching insert go
-> through `utils::absolute_lowered` now. See `07-rfc-conformance.md`.
+> through `text_names::absolute_lowered` now. See `07-rfc-conformance.md`.
 
 ---
 

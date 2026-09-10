@@ -12,6 +12,7 @@
 /// commit.
 pub const VERSION: &str = env!("RDNS_VERSION");
 
+pub mod clock;
 pub mod codecs;
 pub mod compression;
 pub mod control;
@@ -21,7 +22,8 @@ pub mod name;
 mod record_data;
 pub mod record_types;
 pub mod response;
-pub mod utils;
+pub mod socket;
+pub mod text_names;
 pub mod validation;
 
 /// [`RecordData`] lives in its own module so its fields are private to it.
@@ -62,7 +64,7 @@ pub use edns::{
     Edns, EdnsHeader, EdnsOption, CLASSIC_UDP_SIZE, EDNS_OPTION_CLIENT_SUBNET, EDNS_OPTION_COOKIE,
     EDNS_OPTION_NSID, EDNS_OPTION_PADDING, EDNS_VERSION, OPT_RECORD_TYPE,
 };
-pub use message::{framed, DnsMessage, DnsMessageBuilder, QuerySection};
+pub use message::{framed, rand_id, DnsMessage, DnsMessageBuilder, QuerySection};
 pub use record::{ParsedRecord, ResourceRecord};
 
 #[cfg(test)]

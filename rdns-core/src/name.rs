@@ -250,7 +250,7 @@ fn finish_label(out: &mut [u8], start: usize, len: usize) -> WireResult<()> {
 
 /// One escape from the front of `bytes`, and how many octets it spanned.
 ///
-/// RFC 1035 §5.1, the grammar `utils::char_string_decode` reads: `\X` is a
+/// RFC 1035 §5.1, the grammar `codecs::char_string_decode` reads: `\X` is a
 /// literal `X`, `\DDD` is one octet, and the digit form is exactly three
 /// digits. Not that function, because this one runs inside a label walk and
 /// returns one octet at a time rather than decoding a whole string.
@@ -480,7 +480,7 @@ impl<'a> NameRef<'a> {
 ///   (RFC 2181 §11), and one written raw would be read back as syntax rather
 ///   than as data. RFC 1035 §5.1's `\X` covers every one of them.
 ///
-/// Not `utils::char_string_escaped`: that one escapes `"` and not `.`, because
+/// Not `codecs::char_string_escaped`: that one escapes `"` and not `.`, because
 /// a character-string's separator is the quote and a dot inside one is
 /// ordinary. Two rules that overlap without either containing the other, so
 /// two functions — `CLAUDE.md` §7 is about one rule written twice, not about

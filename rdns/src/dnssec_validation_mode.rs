@@ -5,9 +5,9 @@
 //! disk has no chain to walk, only the question of whether the records match the
 //! signatures beside them in the same file.
 
+use crate::clock::current_unix_timestamp;
 use crate::dnssec::{verify_rrset, Dnskey, Rrset, RrsetProof, Rrsig};
 use crate::record_types;
-use crate::utils::current_unix_timestamp;
 use crate::zone::Zone;
 use crate::{RecordData, ResourceRecord};
 

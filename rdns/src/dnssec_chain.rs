@@ -854,12 +854,12 @@ pub fn cname_chain_shape(
 mod tests {
 
     use super::*;
+    use crate::clock::current_unix_timestamp;
     use crate::denial_wire::build_type_bitmap;
     use crate::dnssec::ds_digest;
     use crate::dnssec_test_util::{ds_record, TestZone};
     use crate::test_records::nm;
     use crate::test_records::{a_record, nsec_record};
-    use crate::utils::current_unix_timestamp;
     use crate::Ttl;
     use crate::{ParsedRecord, ResourceRecord};
 

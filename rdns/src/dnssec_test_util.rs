@@ -4,6 +4,7 @@
 //! stand up a signed zone — KSK, ZSK, DS in the parent, signed answers — and put
 //! the real verification path through it rather than a mock.
 
+use crate::clock::current_unix_timestamp;
 use crate::dnssec::{
     key_tag, rrsig_labels_of, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP,
     DNSKEY_FLAG_ZONE,
@@ -11,7 +12,6 @@ use crate::dnssec::{
 use crate::dnssec_key::{SigningAlgorithm, SigningKey};
 use crate::record_types as rt;
 use crate::test_records::nm;
-use crate::utils::current_unix_timestamp;
 use crate::zone_signer::{DenialChain, SigningPolicy};
 use crate::Class;
 use crate::Rtype;

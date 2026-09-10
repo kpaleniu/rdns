@@ -4,7 +4,7 @@
 //! scrape is a snapshot of a moving system either way.
 
 use crate::record_types as rt;
-use crate::utils::NameKeyBuf;
+use crate::text_names::NameKeyBuf;
 use crate::Qtype;
 use crate::Serial;
 use std::collections::BTreeMap;

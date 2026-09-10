@@ -163,9 +163,9 @@ fn parse_address(text: &str, spec: &str) -> ConfigResult<SocketAddr> {
     }
 }
 
-/// [`crate::utils::absolute`], owned: this module's callers all keep the result.
+/// [`crate::text_names::absolute`], owned: this module's callers all keep the result.
 fn absolute(name: &str) -> String {
-    crate::utils::absolute(name).into_owned()
+    crate::text_names::absolute(name).into_owned()
 }
 
 // The state sidecar

@@ -441,7 +441,7 @@ mod tests {
     /// spelling: RFC 1035 §5.1's `\DDD`.
     ///
     /// ~~"this format has no decimal escape, so the generic form carries
-    /// it"~~ — true until `utils::char_string_decode` was written for
+    /// it"~~ — true until `codecs::char_string_decode` was written for
     /// RFC 9460's SvcParamValues, which needed the same escape. This test
     /// asserted the limitation, so it had to change when the limitation went
     /// (`CLAUDE.md` §1). What it asserts now is the round trip, which is what

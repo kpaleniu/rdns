@@ -713,7 +713,7 @@ async fn read_reply(
     Ok((msg, mac))
 }
 
-use crate::utils::rand_id;
+use crate::rand_id;
 
 #[cfg(test)]
 mod tests {

@@ -190,7 +190,7 @@ task is spawned, silently, logged at `debug`.
 | `NegativeCache` (RFC 2308) | (folded name, qtype) | its own | `MAX_NEGATIVE_TTL` = 3600 s |
 | `NsecCache` (RFC 8198) | zone → validated denial records | 1000 zones | the records' own |
 
-- Keys go through `utils::NameKeyBuf`, whose only constructor folds.
+- Keys go through `text_names::NameKeyBuf`, whose only constructor folds.
 - The negative TTL is `min(SOA MINIMUM, the SOA record's own TTL)`
   (RFC 2308 §3).
 - `--no-cache` is a zero-capacity `DnsCache` (`put` is a no-op at 0), not an

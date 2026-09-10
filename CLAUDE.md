@@ -220,7 +220,7 @@ no trimming in two of them.
 
 ## 6. Wall-clock time is not monotonic
 
-`utils::current_unix_timestamp` is `SystemTime`. An NTP step backwards made
+`clock::current_unix_timestamp` is `SystemTime`. An NTP step backwards made
 `now - last_refill` underflow: a debug panic with a mutex held, which poisons it,
 after which every later call panics and the server stops answering — a clock
 correction taking the process off the air permanently. In release it wrapped to
@@ -278,7 +278,7 @@ Cheap to re-check, expensive to rediscover.
   (RFC 2308 §3), and so is the RRSIG's beside it.
 - Case folding is ASCII-only (RFC 4343). `str::to_lowercase` folds U+212A KELVIN
   SIGN into `k`, merging two names that differ on the wire. Use
-  `utils::ascii_lowered`.
+  `text_names::ascii_lowered`.
 - REFUSED, not NXDOMAIN, for a zone we do not serve. NXDOMAIN is an assertion we
   have no standing to make, and resolvers cache it.
 - A response is not a question. Test QR at the socket on both daemons.

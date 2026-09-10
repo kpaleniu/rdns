@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use rdns_core::error::AnswerMismatch;
 use rdns_core::record_types::{self as rt, qtype_name_to_code};
-use rdns_core::utils::bind_addr_for;
+use rdns_core::socket::bind_addr_for;
 use rdns_core::validation::{answers_query, SentQuery};
 use rdns_core::Name;
 use rdns_core::{DnsMessage, DnsMessageBuilder, Qtype, ResponseCode};

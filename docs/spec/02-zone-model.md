@@ -36,7 +36,7 @@ NSEC, NSEC3.
 
 Anything else MUST be written in RFC 3597 `\#` generic form
 (`parse_generic_rdata`, `zone.rs:789`), or the line is an error. Type mnemonics
-also accept `TYPEnnn` (`utils::record_type_name_to_code`), and the zone writer
+also accept `TYPEnnn` (`record_types::record_type_name_to_code`), and the zone writer
 emits that form for types it has no mnemonic for.
 
 TXT `<character-string>`s are split on quotes, not on whitespace, so `"a b" "c"`
@@ -45,7 +45,7 @@ is two strings and not three.
 ### Escapes
 
 RFC 1035 §5.1's escapes are resolved by the value that needs them
-(`utils::char_string_decode`), not by the tokenizer, which keeps the backslash
+(`codecs::char_string_decode`), not by the tokenizer, which keeps the backslash
 so that `\DDD` still means something by the time a value sees it. `\X` is a
 literal `X`; `\DDD` is one octet and the digit form is exactly three digits.
 
@@ -60,11 +60,13 @@ standing because it is what the arithmetic below still assumed afterwards.
 Before the decoder existed the tokenizer ate a backslash inside quotes, so
 `"a\.b"` silently became two labels while the unquoted `a\.b` was refused.
 
-The consequence is that presentation text no longer splits on `.`: a name's
-labels are `utils::presentation_labels`, and `label_count`, `suffix_labels`,
-`parent_name` and `is_at_or_under` are built on it. Four places had counted dots
-instead, and the validator read a plain signed answer at such a name as expanded
-from a wildcard that does not exist — `TODO.md` #37a.
+The consequence is that presentation text no longer splits on `.`. The label
+questions are `NameRef`'s — `label_count`, `parent`, `is_at_or_under` — and are
+asked of wire octets, where a label is length-prefixed and there is no separator
+to mis-read (#36). Four places had counted dots instead, and the validator read a
+plain signed answer at such a name as expanded from a wildcard that does not
+exist — `TODO.md` #37a. The text iterator those helpers were built on outlived
+its callers and was deleted under #38c.
 
 ### SVCB and HTTPS
 

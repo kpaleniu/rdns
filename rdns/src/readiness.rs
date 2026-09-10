@@ -18,7 +18,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::utils::ascii_lowered;
+use crate::text_names::ascii_lowered;
 
 /// One thing that has to arrive before the server is ready.
 struct Pending {

@@ -676,9 +676,9 @@ fn parse_annotations(text: &str) -> (Option<KeyState>, Option<u64>) {
     (state, since)
 }
 
-/// [`crate::utils::absolute`], owned — this module's callers all keep the result.
+/// [`crate::text_names::absolute`], owned — this module's callers all keep the result.
 fn absolute(name: &str) -> String {
-    crate::utils::absolute(name).into_owned()
+    crate::text_names::absolute(name).into_owned()
 }
 
 /// A DNSKEY as a resource record.
@@ -1331,7 +1331,7 @@ mod tests {
         let new = TestKey::generate_p256();
         let old_key = old.ksk(".");
         let new_key = new.ksk(".");
-        let t0 = crate::utils::current_unix_timestamp();
+        let t0 = crate::clock::current_unix_timestamp();
 
         // Anchored on the original key, the way the built-in ICANN anchor is.
         let mut anchors = anchored_on(&old_key);
@@ -1426,7 +1426,7 @@ mod tests {
         let old = TestKey::generate_p256();
         let other = TestKey::generate_p256();
         let old_key = old.ksk(".");
-        let t0 = crate::utils::current_unix_timestamp();
+        let t0 = crate::clock::current_unix_timestamp();
 
         let mut anchors = anchored_on(&old_key);
         let records = signed_dnskey_rrset(
@@ -1474,7 +1474,7 @@ mod tests {
     fn test_self_signers_names_only_the_key_that_signed() {
         let signer = TestKey::generate_p256();
         let bystander = TestKey::generate_p256();
-        let t0 = crate::utils::current_unix_timestamp();
+        let t0 = crate::clock::current_unix_timestamp();
 
         let published = vec![signer.ksk("."), bystander.ksk(".")];
         let records = signed_dnskey_rrset(nm(".").as_ref(), &published, &signer, KSK_FLAGS);

@@ -29,6 +29,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use rdns::compression::NameCompressor;
 use rdns::{
+    clock::current_unix_timestamp,
     dnssec::{DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE},
     dnssec_key::{SigningAlgorithm, SigningKey},
     dnssec_validation_mode::DnssecValidator,
@@ -43,10 +44,10 @@ use rdns::{
     secondary::{state_file_path, MasterSpec, StateFile},
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl},
     shutdown::{Busy, Lifecycle, Shutdown, Stop},
+    socket::bind_addr_for,
     transfer::axfr_envelopes,
     tsig::{self, TsigCheck, TsigKeyring, TsigSession},
     update,
-    utils::{bind_addr_for, current_unix_timestamp},
     validation::{AdmissionCheck, Request},
     zone::{parse_zone_file_at, Zone},
     DnsMessage, OpCode, Qtype, ResourceRecord, ResponseCode, Serial,
@@ -1496,10 +1497,10 @@ fn notify_reply(
 
 /// A name in absolute form, so it can be compared with a zone origin.
 ///
-/// [`rdns::utils::absolute`] under this module's name for it. Returns a `Cow` so
+/// [`rdns::text_names::absolute`] under this module's name for it. Returns a `Cow` so
 /// the common case — a name off the wire, already absolute — borrows.
 fn absolute_name(name: &str) -> std::borrow::Cow<'_, str> {
-    rdns::utils::absolute(name)
+    rdns::text_names::absolute(name)
 }
 
 /// Receive datagrams and answer them, as one of `--udp-workers` identical tasks
@@ -2179,7 +2180,7 @@ async fn send_notify(
 
     let mut wait = Duration::from_secs(notify::NOTIFY_RETRY_SECS);
     for attempt in 1..=notify::NOTIFY_ATTEMPTS {
-        let id = rdns::utils::rand_id();
+        let id = rdns::rand_id();
         let msg = notify::notify_request(zone, soa.clone(), id);
         let mut buf = vec![0u8; 512];
         let Ok(len) = msg.to_bytes(&mut buf) else {

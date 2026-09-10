@@ -1,5 +1,5 @@
+use crate::clock::current_unix_timestamp;
 use crate::shutdown::Stop;
-use crate::utils::current_unix_timestamp;
 use crate::Qtype;
 use std::collections::HashMap;
 use std::net::IpAddr;

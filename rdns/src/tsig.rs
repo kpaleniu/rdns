@@ -29,7 +29,7 @@ fn name_wire(name: &str) -> crate::error::WireResult<Vec<u8>> {
         .as_wire()
         .to_vec())
 }
-use crate::utils::current_unix_timestamp;
+use crate::clock::current_unix_timestamp;
 use base64::Engine;
 use ring::hmac;
 

@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use rdns::clock::current_unix_timestamp;
 use rdns::control::{err, ok, Request, MAX_REQUEST};
 use rdns::metrics::ZoneFacts;
 use rdns::persist;
 use rdns::shutdown::{Busy, Stop};
-use rdns::utils::current_unix_timestamp;
 use rdns::zone_writer::zone_to_string;
 use rdns::Name;
 use rdns::Serial;

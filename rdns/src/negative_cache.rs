@@ -18,9 +18,10 @@
 //! - Nothing bogus is stored, and whether an answer validated is stored with it,
 //!   so the AD bit a second client sees is the one the first client saw.
 
+use crate::clock::current_unix_timestamp;
 use crate::eviction::Halving;
 use crate::record_types as rt;
-use crate::utils::{current_unix_timestamp, NameKeyBuf, NameType, NameTypeKey};
+use crate::text_names::{NameKeyBuf, NameType, NameTypeKey};
 use crate::Qtype;
 use crate::Ttl;
 use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};
@@ -171,7 +172,7 @@ impl NegativeCache {
         let now = current_unix_timestamp();
         // Borrowed: a question already in key form — which is what comes off the
         // wire — costs this lookup nothing at all.
-        let name = crate::utils::absolute_lowered(qname);
+        let name = crate::text_names::absolute_lowered(qname);
         let entries = self.entries.lock().ok()?;
 
         // A cached NXDOMAIN denies every name beneath it too (RFC 8020), so the
@@ -182,7 +183,7 @@ impl NegativeCache {
             if let Some(entry) = entries.nxdomain.get(ancestor).filter(|e| e.live(now)) {
                 return Some(entry.answer(now));
             }
-            match crate::utils::parent_name(ancestor) {
+            match crate::text_names::parent_name(ancestor) {
                 Some(up) => ancestor = up,
                 None => break,
             }

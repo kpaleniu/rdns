@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use clap::Parser;
+use rdns::clock::current_unix_timestamp;
 use rdns::dnssec_chain::TrustAnchors;
 use rdns::logging::{watch_anomalies, AnomalyThresholds, LogLevel, QueryLogger};
 use rdns::metrics::DnsMetrics;
@@ -19,7 +20,6 @@ use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::rfc5011::ManagedAnchors;
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
 use rdns::shutdown::Shutdown;
-use rdns::utils::current_unix_timestamp;
 use rdns::validation::AdmissionCheck;
 use rdns_transport::{tcp, ServeContext, TransportLimits};
 use tokio::net::{TcpListener, UdpSocket};

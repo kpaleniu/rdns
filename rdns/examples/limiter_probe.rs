@@ -27,8 +27,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use rdns::clock::current_unix_timestamp;
 use rdns::security::{RateLimitConfig, RateLimiter};
-use rdns::utils::current_unix_timestamp;
 
 fn main() {
     let rounds = 500_000u32;

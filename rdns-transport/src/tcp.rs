@@ -115,7 +115,7 @@ pub async fn serve<H: Handler>(
         if rate == RateLimit::PerConnection
             && !handler
                 .context()
-                .allow_source(peer.ip(), rdns::utils::current_unix_timestamp())
+                .allow_source(peer.ip(), rdns::clock::current_unix_timestamp())
         {
             continue;
         }
@@ -223,7 +223,7 @@ pub async fn serve_one<H: Handler>(
         // task and two `Arc` clones before deciding to drop the message is
         // backwards. One clock read for the message, handed to the handler so
         // the limiter, the log and a TSIG check all name the same instant.
-        let now = rdns::utils::current_unix_timestamp();
+        let now = rdns::clock::current_unix_timestamp();
         if rate == RateLimit::PerMessage && !handler.context().allow_source(peer.ip(), now) {
             continue;
         }
@@ -427,7 +427,7 @@ mod tests {
 
         assert_eq!(
             logger
-                .take_stats(rdns::utils::current_unix_timestamp() + 60)
+                .take_stats(rdns::clock::current_unix_timestamp() + 60)
                 .total_errors,
             1,
             "silent on the wire, so it has to be visible in the counters"

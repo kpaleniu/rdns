@@ -443,7 +443,7 @@ pub(crate) fn truncate_reply(reply: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use rdns::utils::current_unix_timestamp;
+    use rdns::clock::current_unix_timestamp;
     use rdns::Qtype;
 
     use super::*;

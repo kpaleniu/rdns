@@ -1,32 +1,11 @@
-//! What is left of the miscellany: presentation-text name helpers, the
-//! hex/base64/character-string codecs, the clock, and RFC 6672's substitution.
+//! The presentation-text name helpers #36 left behind, and the map keys built
+//! from them.
 //!
-//! Shrinking under `TODO.md` #38c. The type registry is [`crate::record_types`],
-//! the SvcParamKey tables went to `rdns::svcb` and the UDP receive helpers to
-//! `rdns-transport`; each left because nothing in this crate called it, or
-//! because it had a name of its own to go under. What remains has no membership
-//! rule yet, which is the whole finding — see the row for what is planned.
-
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// The wildcard address to bind before talking to `target`.
-///
-/// The family has to match: a v4 socket cannot reach a v6 peer, and binding
-/// `0.0.0.0` then connecting to a v6 address fails outright. Port 0, because a
-/// random source port is half of RFC 5452 §9.2's off-path resistance — the
-/// other half is the id.
-///
-/// Pure and free of I/O, so `rdnsc`'s blocking socket and the resolver's and
-/// `rdnsd`'s async ones share it; it was written out three times
-/// (`TODO.md` #30p).
-pub fn bind_addr_for(target: SocketAddr) -> SocketAddr {
-    if target.is_ipv6() {
-        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-    } else {
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-    }
-}
+//! Everything here compares or folds a name as *text*. A name is wire octets
+//! now ([`crate::NameRef`]), where a label is length-prefixed and there is no
+//! separator to mis-read, so each of these exists only because some map is
+//! still keyed on that text — which is what `TODO.md` #38a is about. A module
+//! rather than a corner of `utils`, so that item has something to delete.
 
 /// A name in the form DNS compares names by: ASCII case folded, and nothing else.
 ///
@@ -53,13 +32,6 @@ fn has_ascii_uppercase(name: &str) -> bool {
     name.bytes()
         .fold(0u8, |seen, b| seen | u8::from(b.wrapping_sub(b'A') < 26))
         != 0
-}
-
-/// A random DNS transaction id. The one implementation: an id is not a security
-/// boundary here, but that is no reason to make it predictable.
-pub fn rand_id() -> u16 {
-    use rand::Rng;
-    rand::thread_rng().gen()
 }
 
 /// A name in absolute form — the trailing root dot added if it is not there.
@@ -271,23 +243,8 @@ pub fn parent_name(name: &str) -> Option<&str> {
     Some(if rest.is_empty() { "." } else { rest })
 }
 
-/// The current Unix timestamp in seconds, or 0 if the clock is before the epoch.
-///
-/// # Examples
-/// ```ignore
-/// let now = current_unix_timestamp();
-/// assert!(now > 0);
-/// ```
-pub fn current_unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::record_types;
 
@@ -365,15 +322,6 @@ mod tests {
         assert_eq!(map.get(unfolded), None);
     }
 
-    #[test]
-    fn test_current_unix_timestamp() {
-        let ts = current_unix_timestamp();
-        assert!(ts > 0);
-
-        let ts2 = current_unix_timestamp();
-        assert!(ts2 >= ts);
-    }
-
     /// The fold has no early exit, so the classic mistakes are the ends: a
     /// capital in the last octet must still be seen, and `@` and `[` sit either
     /// side of `A`-`Z` in ASCII (`TODO.md` #25g).
@@ -390,19 +338,6 @@ mod tests {
         // Non-ASCII is not folded at all (RFC 4343): U+212A KELVIN SIGN is not
         // a capital K here, and its bytes must not read as one either.
         assert!(!has_ascii_uppercase("\u{212a}.example.com."));
-    }
-
-    /// A socket has to be in the peer's family, and a v4-mapped v6 address is a
-    /// v6 peer: binding `0.0.0.0` and connecting to `::ffff:192.0.2.1` fails.
-    #[test]
-    fn a_socket_binds_the_family_it_will_talk_to() {
-        let v4: SocketAddr = "192.0.2.1:53".parse().unwrap();
-        let v6: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
-        let mapped: SocketAddr = "[::ffff:192.0.2.1]:53".parse().unwrap();
-
-        assert_eq!(bind_addr_for(v4), "0.0.0.0:0".parse().unwrap());
-        assert_eq!(bind_addr_for(v6), "[::]:0".parse().unwrap());
-        assert_eq!(bind_addr_for(mapped), "[::]:0".parse().unwrap());
     }
 
     /// ASCII case folding, and nothing else (RFC 4343).

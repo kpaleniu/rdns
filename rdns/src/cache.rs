@@ -1,5 +1,6 @@
+use crate::clock::current_unix_timestamp;
 use crate::eviction::Halving;
-use crate::utils::{absolute_lowered, current_unix_timestamp, NameType, NameTypeKey};
+use crate::text_names::{absolute_lowered, NameType, NameTypeKey};
 use crate::Qtype;
 use crate::ResourceRecord;
 use std::collections::HashMap;
