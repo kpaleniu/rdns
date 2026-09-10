@@ -333,7 +333,7 @@ pub(crate) async fn record_state(
     // Contact, not transfer: all three callers mean "reached the master", and
     // contact is what EXPIRE counts from. A replica in contact with nothing new
     // to fetch is healthy, and a gauge moving only on a transfer calls it stale.
-    metrics.note_zone_transfer(&spec.zone.as_ref().to_presentation(), now);
+    metrics.note_zone_transfer(spec.zone.as_ref(), now);
 
     // Update in memory under the guard, write outside it. `StateFile::record`
     // does both, and its write ends in an fsync of the file and its directory —
@@ -398,7 +398,7 @@ pub(crate) async fn expire_if_out_of_contact(
         // answering for something we stopped serving.
         deltas.write().await.forget(spec.zone.as_ref());
         // And the gauges: a frozen serial shows a withdrawn zone as healthy.
-        metrics.forget_zone(&spec.zone.as_ref().to_presentation());
+        metrics.forget_zone(spec.zone.as_ref());
         // WARN, not INFO: this is what the alert is built on.
         tracing::warn!(
             "secondary {}: EXPIRE ({}s) passed with no contact — no longer serving this zone",
@@ -456,7 +456,7 @@ pub(crate) async fn withdraw_unvouched_zones(
             // As in `expire_if_out_of_contact`: the increments and the gauges
             // go with the zone.
             deltas.write().await.forget(spec.zone.as_ref());
-            metrics.forget_zone(&spec.zone.as_ref().to_presentation());
+            metrics.forget_zone(spec.zone.as_ref());
             tracing::warn!(
                 "secondary {}: {why} — not serving it until {} answers",
                 spec.zone,

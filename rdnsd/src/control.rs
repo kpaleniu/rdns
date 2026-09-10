@@ -378,7 +378,7 @@ async fn dump(args: &[String], control: &Control) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::ScratchDir;
+    use crate::testutil::{nm, ScratchDir};
     use rdns::control::{parse_reply, Reply};
     use rdns::zone::Zone;
 
@@ -402,7 +402,7 @@ mod tests {
         let mut zones = crate::Zones::default();
         drop(zones.insert(zone()));
         let metrics = Arc::new(rdns::metrics::DnsMetrics::new());
-        metrics.set_zone_serial("example.com.", Serial::new(42));
+        metrics.set_zone_serial(nm("example.com.").as_ref(), Serial::new(42));
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         (
             Arc::new(Control {

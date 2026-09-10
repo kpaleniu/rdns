@@ -1,11 +1,11 @@
-//! The presentation-text name helpers #36 left behind, and the map keys built
-//! from them.
+//! The presentation-text name helpers #36 left behind.
 //!
-//! Everything here compares or folds a name as *text*. A name is wire octets
-//! now ([`crate::NameRef`]), where a label is length-prefixed and there is no
-//! separator to mis-read, so each of these exists only because some map is
-//! still keyed on that text — which is what `TODO.md` #38a is about. A module
-//! rather than a corner of `utils`, so that item has something to delete.
+//! A zone file is text, so text names do not go away: these fold and absolutize
+//! what a parser reads and what an operator writes. What did go away is names as
+//! *keys* — the caches hold folded wire octets now ([`crate::name_keys`],
+//! `TODO.md` #38a) — which is why the escape-aware `.`-splitting that made a
+//! text key safe is down to [`ends_with_root`] and nothing else walks a name as
+//! text.
 
 /// A name in the form DNS compares names by: ASCII case folded, and nothing else.
 ///
@@ -67,128 +67,6 @@ pub fn absolute_lowered(name: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(owned)
 }
 
-/// [`absolute_lowered`] into a buffer the caller keeps, so a name that *does*
-/// need folding costs no allocation either.
-///
-/// The only form a name may be a map key in: absolute and ASCII case-folded
-/// (RFC 4343). One constructor, and it folds, so an insertion cannot skip it.
-///
-/// Borrowed lookup is `Borrow<str>` rather than an unsized `NameKey(str)`: the
-/// `Path`/`PathBuf` shape needs a transmute, and this workspace has no `unsafe`.
-/// A lookup therefore takes a `&str` the caller folded with [`absolute_lowered`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NameKeyBuf(String);
-
-impl NameKeyBuf {
-    /// Fold `name` into key form. The only way to make one.
-    pub fn new(name: &str) -> NameKeyBuf {
-        NameKeyBuf(absolute_lowered(name).into_owned())
-    }
-
-    /// The key as text, for the callers that still hold names as `String`.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::borrow::Borrow<str> for NameKeyBuf {
-    /// Lets `map.get(absolute_lowered(name).as_ref())` work without building a
-    /// key, so the lookup path allocates nothing.
-    fn borrow(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for NameKeyBuf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// A cache key of a folded name and a query type, which can be looked up
-/// without building one.
-///
-/// A `HashMap` reaches its key only through `Borrow`, and `Borrow<(str, Qtype)>`
-/// cannot exist: a tuple with an unsized field is not a type. The borrowed form
-/// is therefore a trait object over "a name and a type", which both this and a
-/// plain `(&str, Qtype)` are. One virtual call per lookup, against the `String`
-/// per lookup that a `(String, Qtype)` key costs on the resolver's hottest path
-/// (`TODO.md` #25e).
-///
-/// Folding is [`NameKeyBuf`]'s, so a name and the same name without its trailing
-/// dot are one key, as they are in every other map in this crate.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NameTypeKey {
-    name: NameKeyBuf,
-    qtype: crate::Qtype,
-}
-
-/// A name and a query type: [`NameTypeKey`] owned, `(&str, Qtype)` borrowed.
-///
-/// The `&str` must already be folded — [`absolute_lowered`] — because a lookup
-/// compares bytes.
-pub trait NameType {
-    fn name(&self) -> &str;
-    fn qtype(&self) -> crate::Qtype;
-}
-
-impl NameTypeKey {
-    pub fn new(name: &str, qtype: crate::Qtype) -> NameTypeKey {
-        NameTypeKey {
-            name: NameKeyBuf::new(name),
-            qtype,
-        }
-    }
-}
-
-impl NameType for NameTypeKey {
-    fn name(&self) -> &str {
-        self.name.as_str()
-    }
-    fn qtype(&self) -> crate::Qtype {
-        self.qtype
-    }
-}
-
-impl NameType for (&str, crate::Qtype) {
-    fn name(&self) -> &str {
-        self.0
-    }
-    fn qtype(&self) -> crate::Qtype {
-        self.1
-    }
-}
-
-/// Hashed field by field, and identically for the owned and borrowed forms:
-/// `HashMap` requires that a key and what it is looked up by hash alike.
-impl std::hash::Hash for NameTypeKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name().hash(state);
-        self.qtype().hash(state);
-    }
-}
-
-impl std::hash::Hash for dyn NameType + '_ {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name().hash(state);
-        self.qtype().hash(state);
-    }
-}
-
-impl PartialEq for dyn NameType + '_ {
-    fn eq(&self, other: &Self) -> bool {
-        self.name() == other.name() && self.qtype() == other.qtype()
-    }
-}
-
-impl Eq for dyn NameType + '_ {}
-
-impl<'a> std::borrow::Borrow<dyn NameType + 'a> for NameTypeKey {
-    fn borrow(&self) -> &(dyn NameType + 'a) {
-        self
-    }
-}
-
 /// Whether the `.` at byte `at` separates two labels, or is one *inside* a
 /// label.
 ///
@@ -217,36 +95,9 @@ pub fn ends_with_root(name: &str) -> bool {
     !bytes.is_empty() && bytes[bytes.len() - 1] == b'.' && separates_labels(bytes, bytes.len() - 1)
 }
 
-/// The byte offsets of `name`'s label separators, left to right.
-fn separators(name: &str) -> impl DoubleEndedIterator<Item = usize> + '_ {
-    let bytes = name.as_bytes();
-    (0..bytes.len()).filter(move |&i| bytes[i] == b'.' && separates_labels(bytes, i))
-}
-
-/// The parent of an absolute name: its first label removed. `None` at the root,
-/// which terminates every walk up the tree.
-///
-/// A *relative* name loses its last label instead of terminating, so callers
-/// pass a key form: absolute, and folded if the map they walk is.
-///
-/// The last of the presentation-text name helpers, and it has one caller:
-/// `rdns::negative_cache` walks the ancestors of its own text keys
-/// (`TODO.md` #38a). Ask a tree question about a *name* with
-/// [`crate::NameRef`]'s `parent`, `ancestors` or `is_at_or_under` — the wire
-/// form is what a label is, so there is nothing to get wrong about escapes.
-pub fn parent_name(name: &str) -> Option<&str> {
-    if name == "." {
-        return None;
-    }
-    let cut = separators(name).next()?;
-    let rest = &name[cut + 1..];
-    Some(if rest.is_empty() { "." } else { rest })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record_types;
 
     /// Absolute and folded, borrowing when it is already both.
     #[test]
@@ -278,48 +129,6 @@ mod tests {
             absolute_lowered("\u{212A}.example.com."),
             Cow::Borrowed("\u{212A}.example.com.")
         ));
-    }
-
-    /// The one text walk left: [`crate::negative_cache`]'s ancestors. The rule
-    /// it must not get wrong is RFC 1035 §5.1's escape — `a\.b.com.` is two
-    /// labels, so the parent of `x.a\.b.com.` steps over the whole first one.
-    ///
-    /// Its wire-form counterparts are tested in `name.rs`; what those cannot get
-    /// wrong is exactly this, because a wire label is what its length octet
-    /// says.
-    #[test]
-    fn a_parent_is_the_name_with_its_first_whole_label_removed() {
-        assert_eq!(parent_name("www.example.com."), Some("example.com."));
-        assert_eq!(parent_name("com."), Some("."));
-        assert_eq!(parent_name("."), None);
-        assert_eq!(parent_name(r"x.a\.b.com."), Some(r"a\.b.com."));
-        assert_eq!(parent_name(r"a\.b.com."), Some("com."));
-    }
-
-    /// The whole point of the type: a key put in owned is found borrowed. If the
-    /// two forms hashed differently every lookup would miss and a cache would
-    /// silently never hit — the failure this test exists for.
-    #[test]
-    fn a_name_type_key_is_found_by_its_borrowed_form() {
-        use crate::Qtype;
-        use std::collections::HashMap;
-
-        let a = Qtype::of(record_types::A);
-        let aaaa = Qtype::of(record_types::AAAA);
-        let mut map: HashMap<NameTypeKey, u8> = HashMap::new();
-        map.insert(NameTypeKey::new("WWW.Example.COM", a), 1);
-
-        let probe: &dyn NameType = &("www.example.com.", a);
-        assert_eq!(map.get(probe), Some(&1), "the folded name, borrowed");
-        let other_type: &dyn NameType = &("www.example.com.", aaaa);
-        assert_eq!(map.get(other_type), None, "the type is part of the key");
-        let other_name: &dyn NameType = &("ww.example.com.", a);
-        assert_eq!(map.get(other_name), None);
-
-        // Unfolded: the borrowed form compares bytes, so this is the caller's
-        // job and the doc comment says so.
-        let unfolded: &dyn NameType = &("WWW.Example.COM.", a);
-        assert_eq!(map.get(unfolded), None);
     }
 
     /// The fold has no early exit, so the classic mistakes are the ends: a

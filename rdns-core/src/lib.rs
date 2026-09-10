@@ -19,6 +19,7 @@ pub mod control;
 pub mod dname;
 pub mod error;
 pub mod name;
+pub mod name_keys;
 mod record_data;
 pub mod record_types;
 pub mod response;

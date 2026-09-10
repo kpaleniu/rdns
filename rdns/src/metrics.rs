@@ -3,8 +3,9 @@
 //! Relaxed atomics: each counter is independent, nothing branches on one, and a
 //! scrape is a snapshot of a moving system either way.
 
+use crate::name_keys::NameKeyBuf;
 use crate::record_types as rt;
-use crate::text_names::NameKeyBuf;
+use crate::NameRef;
 use crate::Qtype;
 use crate::Serial;
 use std::collections::BTreeMap;
@@ -215,7 +216,7 @@ impl DnsMetrics {
 
     /// Record the serial currently served for `zone`. Call it wherever a zone is
     /// installed; that is the only moment the answer changes.
-    pub fn set_zone_serial(&self, zone: &str, serial: Serial) {
+    pub fn set_zone_serial(&self, zone: NameRef<'_>, serial: Serial) {
         let Ok(mut zones) = self.zones.write() else {
             // A poisoned lock costs a stale gauge; refusing to serve DNS over
             // one would be worse.
@@ -225,7 +226,7 @@ impl DnsMetrics {
     }
 
     /// Record that `zone` was in contact with its master at `at` (Unix seconds).
-    pub fn note_zone_transfer(&self, zone: &str, at: u64) {
+    pub fn note_zone_transfer(&self, zone: NameRef<'_>, at: u64) {
         let Ok(mut zones) = self.zones.write() else {
             return;
         };
@@ -240,11 +241,11 @@ impl DnsMetrics {
     ///
     /// Forget rather than zero: a gauge frozen at its last value shows a zone
     /// nobody serves as perfectly healthy.
-    pub fn forget_zone(&self, zone: &str) {
+    pub fn forget_zone(&self, zone: NameRef<'_>) {
         let Ok(mut zones) = self.zones.write() else {
             return;
         };
-        zones.remove(zone);
+        zones.remove(zone.folded().as_ref());
     }
 
     /// Snapshot of each zone's serial and last contact with a master.
@@ -267,11 +268,11 @@ impl DnsMetrics {
     }
 
     /// Replace the whole set, for a reload that installs every zone at once.
-    pub fn retain_zones(&self, keep: &[String]) {
+    pub fn retain_zones(&self, keep: &[crate::Name]) {
         let Ok(mut zones) = self.zones.write() else {
             return;
         };
-        zones.retain(|name, _| keep.iter().any(|k| k.eq_ignore_ascii_case(name.as_str())));
+        zones.retain(|name, _| keep.iter().any(|k| k.as_ref() == name.as_name()));
     }
 
     /// Track query type.
@@ -467,7 +468,7 @@ impl DnsMetrics {
             for (zone, gauge) in zones.iter() {
                 output.push_str(&format!(
                     "dns_zone_serial{{zone=\"{}\"}} {}\n",
-                    escape_label(zone.as_str()),
+                    escape_label(&zone.to_string()),
                     gauge.serial
                 ));
             }
@@ -486,7 +487,7 @@ impl DnsMetrics {
                 if let Some(at) = gauge.last_transfer {
                     output.push_str(&format!(
                         "dns_zone_last_refresh_timestamp_seconds{{zone=\"{}\"}} {at}\n",
-                        escape_label(zone.as_str())
+                        escape_label(&zone.to_string())
                     ));
                 }
             }
@@ -535,6 +536,7 @@ impl Default for LatencyTimer {
 #[cfg(test)]
 mod zone_gauge_tests {
     use super::*;
+    use crate::test_records::nm;
 
     fn lines(metrics: &DnsMetrics, prefix: &str) -> Vec<String> {
         metrics
@@ -548,9 +550,9 @@ mod zone_gauge_tests {
     #[test]
     fn a_zone_reports_its_serial_and_a_replica_its_last_contact() {
         let metrics = DnsMetrics::new();
-        metrics.set_zone_serial("example.com.", Serial::new(42));
-        metrics.set_zone_serial("replica.test.", Serial::new(7));
-        metrics.note_zone_transfer("replica.test.", 1_700_000_000);
+        metrics.set_zone_serial(nm("example.com.").as_ref(), Serial::new(42));
+        metrics.set_zone_serial(nm("replica.test.").as_ref(), Serial::new(7));
+        metrics.note_zone_transfer(nm("replica.test.").as_ref(), 1_700_000_000);
 
         assert_eq!(
             lines(&metrics, "dns_zone_serial{"),
@@ -571,11 +573,11 @@ mod zone_gauge_tests {
     #[test]
     fn a_withdrawn_zone_disappears_rather_than_freezing() {
         let metrics = DnsMetrics::new();
-        metrics.set_zone_serial("gone.test.", Serial::new(1));
-        metrics.note_zone_transfer("gone.test.", 1_700_000_000);
+        metrics.set_zone_serial(nm("gone.test.").as_ref(), Serial::new(1));
+        metrics.note_zone_transfer(nm("gone.test.").as_ref(), 1_700_000_000);
         assert_eq!(lines(&metrics, "dns_zone_serial{").len(), 1);
 
-        metrics.forget_zone("gone.test.");
+        metrics.forget_zone(nm("gone.test.").as_ref());
         assert!(lines(&metrics, "dns_zone_serial{").is_empty());
         assert!(lines(&metrics, "dns_zone_last_refresh_timestamp_seconds{").is_empty());
     }
@@ -583,11 +585,11 @@ mod zone_gauge_tests {
     #[test]
     fn a_reload_keeps_only_the_zones_it_installed() {
         let metrics = DnsMetrics::new();
-        metrics.set_zone_serial("kept.test.", Serial::new(5));
-        metrics.note_zone_transfer("kept.test.", 1_700_000_000);
-        metrics.set_zone_serial("dropped.test.", Serial::new(9));
+        metrics.set_zone_serial(nm("kept.test.").as_ref(), Serial::new(5));
+        metrics.note_zone_transfer(nm("kept.test.").as_ref(), 1_700_000_000);
+        metrics.set_zone_serial(nm("dropped.test.").as_ref(), Serial::new(9));
 
-        metrics.retain_zones(&["KEPT.test.".to_string()]);
+        metrics.retain_zones(&[nm("KEPT.test.")]);
 
         assert_eq!(
             lines(&metrics, "dns_zone_serial{"),
@@ -602,13 +604,19 @@ mod zone_gauge_tests {
     }
 
     /// A quote ends the label early and makes the rest of the scrape
-    /// unparseable, not just this line.
+    /// unparseable, not just this line. Escaped twice over: the label value is
+    /// the zone's *presentation* form, where RFC 1035 §5.1 already spells a
+    /// quote `\"` and a dot inside a label `\.`, and Prometheus then escapes
+    /// the backslashes those leave behind.
     #[test]
     fn a_label_value_that_could_break_the_format_is_escaped() {
         let metrics = DnsMetrics::new();
-        metrics.set_zone_serial("od\"d\\.test.", Serial::new(1));
+        metrics.set_zone_serial(nm("od\"d\\.test.").as_ref(), Serial::new(1));
         let rendered = lines(&metrics, "dns_zone_serial{");
-        assert_eq!(rendered, ["dns_zone_serial{zone=\"od\\\"d\\\\.test.\"} 1"]);
+        assert_eq!(
+            rendered,
+            ["dns_zone_serial{zone=\"od\\\\\\\"d\\\\.test.\"} 1"]
+        );
         assert_eq!(escape_label("plain.test."), "plain.test.");
         assert_eq!(escape_label("a\nb"), "a\\nb");
     }

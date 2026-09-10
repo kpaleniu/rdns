@@ -1206,42 +1206,58 @@ fn checking_a_signed_nxdomain() {
 fn what_the_resolvers_caches_cost() {
     let cache = rdns::cache::DnsCache::new(1_000);
     let qtype = Qtype::of(record_types::A);
+    // The names are built once, outside every measurement: a QNAME arrives off
+    // the wire and the caches take it as it stands (`TODO.md` #38a).
+    let held = nm("www.example.com.");
+    let absent = nm("nothing.example.com.");
     let rrset: Vec<ResourceRecord> = (0..3)
         .map(|_| ResourceRecord {
-            name: nm(&nm("www.example.com.").to_string()),
+            name: held.clone(),
             class: Class::new(1),
             ttl: rdns::Ttl::from_wire(3600),
             rdata: rdns::RecordData::new(record_types::A, vec![192u8, 0, 2, 1]).expect("A"),
         })
         .collect();
-    cache.put("www.example.com.", qtype, rrset);
+    cache.put(held.as_ref(), qtype, rrset);
     // The first call in a process picks up a one-off.
-    let _ = cache.get("www.example.com.", qtype);
-    let (hit, count) = allocations(|| cache.get("www.example.com.", qtype));
+    let _ = cache.get(held.as_ref(), qtype);
+    let (hit, count) = allocations(|| cache.get(held.as_ref(), qtype));
     assert_eq!(hit.expect("a hit").len(), 3);
     // One per record's owner and RDATA, and the `Vec` spine. The eighth was the
     // folded key the `(String, Qtype)` map had no `Borrow` for (`TODO.md` #25e);
     // what is left is the copy the caller is handed.
     within("look one RRset up in the answer cache", count, 7..=7);
 
-    let (miss, count) = allocations(|| cache.get("nothing.example.com.", qtype));
+    let (miss, count) = allocations(|| cache.get(absent.as_ref(), qtype));
     assert!(miss.is_none());
     within("miss in the answer cache", count, 0..=0);
 
     // The denial cache is consulted before either of the others, so its miss is
     // the first thing a flood of random names reaches.
     let denials = rdns::nsec_cache::NsecCache::new(16);
-    let absent = nm("nothing.example.com.");
     let _ = denials.synthesize(absent.as_ref(), qtype);
     let (miss, count) = allocations(|| denials.synthesize(absent.as_ref(), qtype));
     assert!(miss.is_none());
     within("miss in the denial cache", count, 0..=0);
 
     let negative = rdns::negative_cache::NegativeCache::new(1_000);
-    let _ = negative.get("nothing.example.com.", qtype);
-    let (miss, count) = allocations(|| negative.get("nothing.example.com.", qtype));
+    let _ = negative.get(absent.as_ref(), qtype);
+    let (miss, count) = allocations(|| negative.get(absent.as_ref(), qtype));
     assert!(miss.is_none());
     within("miss in the negative cache", count, 0..=0);
+
+    // A name the client sent in mixed case is the one lookup that folds, and it
+    // folds into a buffer rather than a key: one allocation for the whole walk,
+    // not one per ancestor.
+    let shouted = nm("NOTHING.Example.COM.");
+    let _ = negative.get(shouted.as_ref(), qtype);
+    let (miss, count) = allocations(|| negative.get(shouted.as_ref(), qtype));
+    assert!(miss.is_none());
+    within(
+        "miss in the negative cache, name in mixed case",
+        count,
+        1..=1,
+    );
 }
 
 /// `verify_rrset` rebuilds the canonical form of the whole RRset per candidate

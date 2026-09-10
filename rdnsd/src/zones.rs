@@ -32,7 +32,7 @@ use crate::config;
 use crate::{absolute_name, Cli};
 
 /// Every zone this server holds, keyed by its origin in
-/// [`rdns::text_names::NameKeyBuf`] form.
+/// [`rdns::name_keys::NameKeyBuf`] form.
 ///
 /// The key is folded so [`Zones::for_query`] can hash the QNAME's ancestors
 /// against it — bounded by the name's label count rather than by how many zones
@@ -111,7 +111,7 @@ pub(crate) async fn install_zone(served: &ZoneContext, zone: Zone) {
     } = served;
     let origin = zone.origin().to_owned();
     if let Some(serial) = zone.serial() {
-        metrics.set_zone_serial(&zone.origin().to_presentation(), serial);
+        metrics.set_zone_serial(zone.origin(), serial);
     }
 
     // The diff walks every record of both versions and queries take this same
@@ -178,7 +178,7 @@ pub(crate) async fn install_all_zones(served: &ZoneContext, new_zones: ZoneMap) 
     metrics.retain_zones(
         &new_zones
             .values()
-            .map(|z| z.origin().to_string())
+            .map(|z| z.origin().to_owned())
             .collect::<Vec<_>>(),
     );
     note_serials(metrics, &new_zones);
@@ -352,7 +352,7 @@ pub(crate) fn plan_reload(zones: &Zones, new_zones: &ZoneMap) -> ReloadPlan {
 pub(crate) fn note_serials(metrics: &DnsMetrics, zones: &ZoneMap) {
     for zone in zones.values() {
         if let Some(serial) = zone.serial() {
-            metrics.set_zone_serial(&zone.origin().to_presentation(), serial);
+            metrics.set_zone_serial(zone.origin(), serial);
         }
     }
 }

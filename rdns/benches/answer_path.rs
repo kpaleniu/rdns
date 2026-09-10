@@ -264,7 +264,11 @@ fn shared_state(c: &mut Criterion) {
     };
     for i in 0..20_000 {
         let name = format!("fill{i}.example.com.");
-        cache.put(&name, Qtype::of(record_types::A), vec![record(&name)]);
+        cache.put(
+            nm(&name).as_ref(),
+            Qtype::of(record_types::A),
+            vec![record(&name)],
+        );
     }
     let mut n = 0u64;
     group.bench_function("100 puts into a full cache", |b| {
@@ -273,7 +277,7 @@ fn shared_state(c: &mut Criterion) {
                 n += 1;
                 let name = format!("new{n}.example.com.");
                 cache.put(
-                    black_box(&name),
+                    black_box(nm(&name).as_ref()),
                     Qtype::of(record_types::A),
                     vec![record(&name)],
                 );

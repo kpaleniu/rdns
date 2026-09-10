@@ -1,6 +1,7 @@
 use crate::clock::current_unix_timestamp;
 use crate::eviction::Halving;
-use crate::text_names::{absolute_lowered, NameType, NameTypeKey};
+use crate::name_keys::{NameType, NameTypeKey};
+use crate::NameRef;
 use crate::Qtype;
 use crate::ResourceRecord;
 use std::collections::HashMap;
@@ -53,13 +54,17 @@ impl DnsCache {
     }
 
     /// Get cached records for a query (domain_name, record_type)
-    pub fn get(&self, name: &str, qtype: Qtype) -> Option<Vec<ResourceRecord>> {
+    pub fn get(&self, name: NameRef<'_>, qtype: Qtype) -> Option<Vec<ResourceRecord>> {
         self.get_validated(name, qtype).map(|(records, _)| records)
     }
 
     /// As [`DnsCache::get`], but also reporting whether the answer was
     /// DNSSEC-validated when it was stored.
-    pub fn get_validated(&self, name: &str, qtype: Qtype) -> Option<(Vec<ResourceRecord>, bool)> {
+    pub fn get_validated(
+        &self,
+        name: NameRef<'_>,
+        qtype: Qtype,
+    ) -> Option<(Vec<ResourceRecord>, bool)> {
         let now = current_unix_timestamp();
         // A poisoned lock reads as a cache miss. Poisoning is permanent, so
         // `.lock().unwrap()` on `rdnsr`'s query path would take the resolver off
@@ -68,10 +73,9 @@ impl DnsCache {
             return None;
         };
 
-        // ASCII fold only (RFC 4343): `str::to_lowercase` folds U+212A KELVIN
-        // SIGN to `k`, merging two names that differ on the wire. Borrowed, so
-        // a lookup allocates only when the name was not already in key form.
-        let folded = absolute_lowered(name);
+        // ASCII fold only (RFC 4343), and borrowed: a name that arrived
+        // lower-case — most of them — is looked up as the octets it already is.
+        let folded = name.folded();
         let key: &dyn NameType = &(folded.as_ref(), qtype);
 
         if let Some(entry) = cache.get(key) {
@@ -86,7 +90,7 @@ impl DnsCache {
     }
 
     /// Put records in cache with TTL, unvalidated.
-    pub fn put(&self, name: &str, qtype: Qtype, records: Vec<ResourceRecord>) {
+    pub fn put(&self, name: NameRef<'_>, qtype: Qtype, records: Vec<ResourceRecord>) {
         self.put_validated(name, qtype, records, false)
     }
 
@@ -96,7 +100,7 @@ impl DnsCache {
     /// as validated tells every later client it is authentic.
     pub fn put_validated(
         &self,
-        name: &str,
+        name: NameRef<'_>,
         qtype: Qtype,
         records: Vec<ResourceRecord>,
         secure: bool,
@@ -230,9 +234,13 @@ mod tests {
         let cache = DnsCache::with_defaults();
         let records = vec![create_test_record("example.com.", Ttl::from_secs(300))];
 
-        cache.put("example.com.", Qtype::of(rt::A), records.clone());
+        cache.put(
+            nm("example.com.").as_ref(),
+            Qtype::of(rt::A),
+            records.clone(),
+        );
 
-        let retrieved = cache.get("example.com.", Qtype::of(rt::A));
+        let retrieved = cache.get(nm("example.com.").as_ref(), Qtype::of(rt::A));
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().len(), 1);
     }
@@ -241,7 +249,7 @@ mod tests {
     fn test_cache_miss() {
         let cache = DnsCache::with_defaults();
 
-        let result = cache.get("notcached.com.", Qtype::of(rt::A));
+        let result = cache.get(nm("notcached.com.").as_ref(), Qtype::of(rt::A));
         assert!(result.is_none());
     }
 
@@ -250,9 +258,13 @@ mod tests {
         let cache = DnsCache::with_defaults();
         let records = vec![create_test_record("example.com.", Ttl::from_secs(300))];
 
-        cache.put("EXAMPLE.COM.", Qtype::of(rt::A), records.clone());
+        cache.put(
+            nm("EXAMPLE.COM.").as_ref(),
+            Qtype::of(rt::A),
+            records.clone(),
+        );
 
-        let retrieved = cache.get("example.com.", Qtype::of(rt::A));
+        let retrieved = cache.get(nm("example.com.").as_ref(), Qtype::of(rt::A));
         assert!(retrieved.is_some());
     }
 
@@ -262,12 +274,22 @@ mod tests {
         let a_records = vec![create_test_record("example.com.", Ttl::from_secs(300))];
         let aaaa_records = vec![create_test_record("example.com.", Ttl::from_secs(300))];
 
-        cache.put("example.com.", Qtype::of(rt::A), a_records);
-        cache.put("example.com.", Qtype::of(rt::AAAA), aaaa_records);
+        cache.put(nm("example.com.").as_ref(), Qtype::of(rt::A), a_records);
+        cache.put(
+            nm("example.com.").as_ref(),
+            Qtype::of(rt::AAAA),
+            aaaa_records,
+        );
 
-        assert!(cache.get("example.com.", Qtype::of(rt::A)).is_some());
-        assert!(cache.get("example.com.", Qtype::of(rt::AAAA)).is_some());
-        assert!(cache.get("example.com.", Qtype::of(rt::CNAME)).is_none()); // CNAME not cached
+        assert!(cache
+            .get(nm("example.com.").as_ref(), Qtype::of(rt::A))
+            .is_some());
+        assert!(cache
+            .get(nm("example.com.").as_ref(), Qtype::of(rt::AAAA))
+            .is_some());
+        assert!(cache
+            .get(nm("example.com.").as_ref(), Qtype::of(rt::CNAME))
+            .is_none()); // CNAME not cached
     }
 
     #[test]
@@ -275,7 +297,7 @@ mod tests {
         let cache = DnsCache::with_defaults();
         let records = vec![create_test_record("example.com.", Ttl::from_secs(300))];
 
-        cache.put("example.com.", Qtype::of(rt::A), records);
+        cache.put(nm("example.com.").as_ref(), Qtype::of(rt::A), records);
 
         let stats = cache.get_stats();
         assert!(stats.total_entries > 0);
@@ -290,11 +312,15 @@ mod tests {
         let cache = DnsCache::with_defaults();
         let records = vec![create_test_record("example.com.", Ttl::from_secs(300))];
 
-        cache.put("example.com.", Qtype::of(rt::A), records);
-        assert!(cache.get("example.com.", Qtype::of(rt::A)).is_some());
+        cache.put(nm("example.com.").as_ref(), Qtype::of(rt::A), records);
+        assert!(cache
+            .get(nm("example.com.").as_ref(), Qtype::of(rt::A))
+            .is_some());
 
         cache.clear();
-        assert!(cache.get("example.com.", Qtype::of(rt::A)).is_none());
+        assert!(cache
+            .get(nm("example.com.").as_ref(), Qtype::of(rt::A))
+            .is_none());
     }
 
     #[test]
@@ -305,9 +331,9 @@ mod tests {
             create_test_record("example.com.", Ttl::from_secs(100)), // Lower TTL
         ];
 
-        cache.put("example.com.", Qtype::of(rt::A), records);
+        cache.put(nm("example.com.").as_ref(), Qtype::of(rt::A), records);
 
-        let retrieved = cache.get("example.com.", Qtype::of(rt::A));
+        let retrieved = cache.get(nm("example.com.").as_ref(), Qtype::of(rt::A));
         assert!(retrieved.is_some()); // Still valid within 100 seconds
     }
 
@@ -318,12 +344,14 @@ mod tests {
         for ttl in [-1, i32::MIN, -3600] {
             let cache = DnsCache::with_defaults();
             cache.put(
-                "example.com.",
+                nm("example.com.").as_ref(),
                 Qtype::of(rt::A),
                 vec![create_test_record("example.com.", Ttl::from_wire(ttl))],
             );
             assert!(
-                cache.get("example.com.", Qtype::of(rt::A)).is_none(),
+                cache
+                    .get(nm("example.com.").as_ref(), Qtype::of(rt::A))
+                    .is_none(),
                 "a TTL of {ttl} means zero seconds, not forever"
             );
         }
@@ -334,12 +362,12 @@ mod tests {
     fn an_absurd_ttl_is_capped() {
         let cache = DnsCache::with_defaults();
         cache.put(
-            "example.com.",
+            nm("example.com.").as_ref(),
             Qtype::of(rt::A),
             vec![create_test_record("example.com.", Ttl::from_wire(i32::MAX))],
         );
         let expires_at = cache.cache.lock().unwrap()
-            [&NameTypeKey::new("example.com.", Qtype::of(rt::A))]
+            [&NameTypeKey::new(nm("example.com.").as_ref(), Qtype::of(rt::A))]
             .expires_at;
         assert!(
             expires_at <= current_unix_timestamp() + MAX_CACHE_TTL,
@@ -354,12 +382,14 @@ mod tests {
     fn the_trailing_dot_does_not_make_a_second_entry() {
         let cache = DnsCache::with_defaults();
         cache.put(
-            "example.com.",
+            nm("example.com.").as_ref(),
             Qtype::of(rt::A),
             vec![create_test_record("example.com.", Ttl::from_secs(3600))],
         );
         assert!(
-            cache.get("example.com", Qtype::of(rt::A)).is_some(),
+            cache
+                .get(nm("example.com").as_ref(), Qtype::of(rt::A))
+                .is_some(),
             "the relative spelling of a name we hold must hit"
         );
         assert_eq!(cache.get_stats().total_entries, 1);
@@ -370,19 +400,21 @@ mod tests {
     #[test]
     fn distinct_names_that_unicode_would_fold_together_stay_distinct() {
         let cache = DnsCache::with_defaults();
-        let kelvin = "\u{212A}.example.com.";
+        let kelvin = nm("\u{212A}.example.com.");
         cache.put(
-            kelvin,
+            kelvin.as_ref(),
             Qtype::of(rt::A),
-            vec![create_test_record(kelvin, Ttl::from_secs(300))],
+            vec![create_test_record(&kelvin.to_string(), Ttl::from_secs(300))],
         );
 
         assert!(
-            cache.get(kelvin, Qtype::of(rt::A)).is_some(),
+            cache.get(kelvin.as_ref(), Qtype::of(rt::A)).is_some(),
             "its own name still finds it"
         );
         assert!(
-            cache.get("k.example.com.", Qtype::of(rt::A)).is_none(),
+            cache
+                .get(nm("k.example.com.").as_ref(), Qtype::of(rt::A))
+                .is_none(),
             "a different owner name must not share the entry"
         );
     }
@@ -394,7 +426,7 @@ mod tests {
         for i in 0..20 {
             let name = format!("example{}.com.", i);
             let records = vec![create_test_record(&name, Ttl::from_secs(300))];
-            cache.put(&name, Qtype::of(rt::A), records);
+            cache.put(nm(&name).as_ref(), Qtype::of(rt::A), records);
         }
 
         let stats = cache.get_stats();
@@ -413,7 +445,7 @@ mod tests {
         for i in 0..101 {
             let name = format!("example{i}.com.");
             cache.put(
-                &name,
+                nm(&name).as_ref(),
                 Qtype::of(rt::A),
                 vec![create_test_record(&name, Ttl::from_secs(300))],
             );
@@ -435,12 +467,14 @@ mod tests {
     fn a_poisoned_lock_costs_the_cache_and_not_the_process() {
         let cache = DnsCache::with_defaults();
         cache.put(
-            "example.com.",
+            nm("example.com.").as_ref(),
             Qtype::of(rt::A),
             vec![create_test_record("example.com.", Ttl::from_secs(300))],
         );
         assert!(
-            cache.get("example.com.", Qtype::of(rt::A)).is_some(),
+            cache
+                .get(nm("example.com.").as_ref(), Qtype::of(rt::A))
+                .is_some(),
             "cached to begin with"
         );
 
@@ -454,11 +488,13 @@ mod tests {
         assert!(cache.cache.lock().is_err(), "so the mutex is poisoned");
 
         assert!(
-            cache.get("example.com.", Qtype::of(rt::A)).is_none(),
+            cache
+                .get(nm("example.com.").as_ref(), Qtype::of(rt::A))
+                .is_none(),
             "a poisoned cache reads as a miss"
         );
         cache.put(
-            "other.example.com.",
+            nm("other.example.com.").as_ref(),
             Qtype::of(rt::A),
             vec![create_test_record(
                 "other.example.com.",
@@ -483,13 +519,15 @@ mod tests {
         let cache = DnsCache::new(1);
         for name in ["a.example.com.", "b.example.com."] {
             cache.put(
-                name,
+                nm(name).as_ref(),
                 Qtype::of(rt::A),
                 vec![create_test_record(name, Ttl::from_secs(300))],
             );
         }
         assert_eq!(cache.get_stats().total_entries, 1);
-        assert!(cache.get("b.example.com.", Qtype::of(rt::A)).is_some());
+        assert!(cache
+            .get(nm("b.example.com.").as_ref(), Qtype::of(rt::A))
+            .is_some());
     }
 
     /// A ceiling, not a floor: this measures ~0.2 s in a debug build, where a
@@ -504,7 +542,7 @@ mod tests {
         for i in 0..40_000 {
             let name = format!("example{i}.com.");
             cache.put(
-                &name,
+                nm(&name).as_ref(),
                 Qtype::of(rt::A),
                 vec![create_test_record(&name, Ttl::from_secs(300))],
             );

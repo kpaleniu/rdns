@@ -207,10 +207,7 @@ pub(crate) async fn handle_query(
     // A cached "no" (RFC 2308), separate from the answer cache only because
     // there are no records to key on. Nothing is synthesized — this is the
     // answer this question got — so a CD client may have it too.
-    if let Some(negative) = caches
-        .negatives
-        .get(&query.qname.as_ref().to_presentation(), query.qtype)
-    {
+    if let Some(negative) = caches.negatives.get(query.qname.as_ref(), query.qtype) {
         ctx.metrics.count(&ctx.metrics.cache_hits);
         let mut resp = build_response(&msg, Vec::new(), negative.rcode);
         resp.authorities = negative.authority;
@@ -220,7 +217,7 @@ pub(crate) async fn handle_query(
     // Build the response: from cache if we have it, else by resolving.
     let (mut resp, secure) = if let Some((records, secure)) = caches
         .answers
-        .get_validated(&query.qname.as_ref().to_presentation(), query.qtype)
+        .get_validated(query.qname.as_ref(), query.qtype)
     {
         ctx.metrics.count(&ctx.metrics.cache_hits);
         (build_response(&msg, records, ResponseCode::Ok), secure)
@@ -265,7 +262,7 @@ pub(crate) async fn handle_query(
                 // the query that carried it.
                 if !upstream.answers.is_empty() && !state.is_bogus() {
                     caches.answers.put_validated(
-                        &query.qname.as_ref().to_presentation(),
+                        query.qname.as_ref(),
                         query.qtype,
                         upstream.answers.clone(),
                         secure,
@@ -275,12 +272,9 @@ pub(crate) async fn handle_query(
                 // cost one upstream walk per repeat. The SOA in the
                 // authority section says how long it is good for (RFC 2308).
                 if !state.is_bogus() {
-                    caches.negatives.insert(
-                        &query.qname.as_ref().to_presentation(),
-                        query.qtype,
-                        &upstream,
-                        secure,
-                    );
+                    caches
+                        .negatives
+                        .insert(query.qname.as_ref(), query.qtype, &upstream, secure);
                 }
                 // A *validated* "no" covers a whole range of names, so it
                 // also goes in the denial cache. Only when Secure: an
