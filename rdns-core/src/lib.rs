@@ -12,6 +12,7 @@
 /// commit.
 pub const VERSION: &str = env!("RDNS_VERSION");
 
+pub mod codecs;
 pub mod compression;
 pub mod control;
 pub mod dname;

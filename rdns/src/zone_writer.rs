@@ -19,10 +19,10 @@ use crate::Ttl;
 use std::borrow::Cow;
 use std::path::Path;
 
+use crate::codecs::{base64_encode, hex_encode};
 use crate::denial_wire::{base32hex_encode, bitmap_types_exact};
 use crate::record_types;
 use crate::record_types::record_type_name;
-use crate::utils::{base64_encode, hex_encode};
 use crate::zone::{format_dnssec_time, Zone, ZoneRecord};
 use crate::{NameRef, ParsedRecord, RecordData};
 
@@ -170,7 +170,7 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
                     out.push(' ');
                 }
                 out.push('"');
-                out.push_str(&rdns_core::utils::char_string_escaped(string));
+                out.push_str(&rdns_core::codecs::char_string_escaped(string));
                 out.push('"');
             }
             out

@@ -595,6 +595,58 @@ impl std::fmt::Debug for Name {
 /// that writes a bad one should fail loudly at that line rather than threading a
 /// `Result` through a fixture. `rdns::test_records::nm` is the same helper for
 /// the crate above.
+/// What a DNAME does to one query name (RFC 6672 §2.2).
+///
+/// Three answers rather than an `Option<Result<..>>`, because the caller
+/// branches three ways: substitute and carry on, decline, or YXDOMAIN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Redirect {
+    /// The substituted name: the labels of the query name above the DNAME's
+    /// owner, followed by its target.
+    To(Name),
+    /// The query name is not strictly below the owner, so the DNAME says
+    /// nothing about it — Table 1's `<no match>`, which the first and fifth
+    /// rows share with the second.
+    NoMatch,
+    /// The substitution overflows RFC 1035 §2.3.4's 255 octets. "If this
+    /// occurs, the server returns an RCODE of YXDOMAIN" (§2.2), and the
+    /// resolver "return\[s\] an implementation-dependent error" (§3.4.1 step 4D).
+    TooLong,
+}
+
+/// Apply a DNAME to a query name: RFC 6672 §2.2's substitution, and Table 1.
+///
+/// "A DNAME substitution is performed by replacing the suffix labels of the
+/// name being sought matching the owner name of the DNAME resource record with
+/// the string of labels in the RDATA field. The matching labels end with the
+/// root label in all cases. Only whole labels are replaced."
+///
+/// **Whole labels is structural here.** Over wire form a suffix at a label
+/// boundary is the only kind of suffix there is, so `ab.example.com.` simply is
+/// not under `b.example.com.` — where the presentation form needed the rule
+/// spelled out and a `str::ends_with` got it wrong. The root as owner or as
+/// target needed a case of its own for the same reason, and does not now.
+///
+/// Strictly below, so the owner is not redirected by its own DNAME (§2.3) —
+/// Table 1's second row, whose answer depends on the QTYPE and so is not a
+/// substitution at all.
+pub fn dname_redirect(qname: NameRef<'_>, owner: NameRef<'_>, target: NameRef<'_>) -> Redirect {
+    if !qname.is_at_or_under(owner) || qname == owner {
+        return Redirect::NoMatch;
+    }
+    let qwire = qname.as_wire();
+    let prefix = &qwire[..qwire.len() - owner.as_wire().len()];
+    let mut out = Vec::with_capacity(prefix.len() + target.as_wire().len());
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(target.as_wire());
+    match NameRef::from_wire_slice(&out) {
+        Ok(name) => Redirect::To(name.to_owned()),
+        // The only way octets that were two names can fail to be one is
+        // §2.3.4's limit, which §2.2 answers with YXDOMAIN.
+        Err(_) => Redirect::TooLong,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn nm(text: &str) -> Name {
     text.parse().expect("a test name parses")
@@ -868,6 +920,159 @@ mod tests {
             name.as_ref().ancestors().count(),
             8,
             "seven labels and the root"
+        );
+    }
+
+    /// RFC 6672 §2.2's Table 1, verbatim — the twelve inputs the spec has
+    /// already committed to an answer for, corner cases and loops included.
+    ///
+    /// Row two, `example.com. / example.com. / example.net.`, is the RFC's
+    /// `[0]`: "The result depends on the QTYPE. If the QTYPE = DNAME, then the
+    /// result is `example.com.`, else `<no match>`." Neither is a substitution
+    /// — the owner is not redirected by its own DNAME (§2.3) — so this function
+    /// answers `NoMatch` and the caller decides what the QTYPE means.
+    #[test]
+    fn the_rfc_6672_substitution_table() {
+        let no_match = Redirect::NoMatch;
+        let to = |n: &str| Redirect::To(nm(n));
+        for (qname, owner, target, want) in [
+            ("com.", "example.com.", "example.net.", no_match.clone()),
+            (
+                "example.com.",
+                "example.com.",
+                "example.net.",
+                no_match.clone(),
+            ),
+            (
+                "a.example.com.",
+                "example.com.",
+                "example.net.",
+                to("a.example.net."),
+            ),
+            (
+                "a.b.example.com.",
+                "example.com.",
+                "example.net.",
+                to("a.b.example.net."),
+            ),
+            (
+                "ab.example.com.",
+                "b.example.com.",
+                "example.net.",
+                no_match.clone(),
+            ),
+            (
+                "foo.example.com.",
+                "example.com.",
+                "example.net.",
+                to("foo.example.net."),
+            ),
+            (
+                "a.x.example.com.",
+                "x.example.com.",
+                "example.net.",
+                to("a.example.net."),
+            ),
+            (
+                "a.example.com.",
+                "example.com.",
+                "y.example.net.",
+                to("a.y.example.net."),
+            ),
+            (
+                "cyc.example.com.",
+                "example.com.",
+                "example.com.",
+                to("cyc.example.com."),
+            ),
+            (
+                "cyc.example.com.",
+                "example.com.",
+                "c.example.com.",
+                to("cyc.c.example.com."),
+            ),
+            ("shortloop.x.x.", "x.", ".", to("shortloop.x.")),
+            ("shortloop.x.", "x.", ".", to("shortloop.")),
+        ] {
+            assert_eq!(
+                dname_redirect(nm(qname).as_ref(), nm(owner).as_ref(), nm(target).as_ref()),
+                want,
+                "QNAME {qname} against {owner} DNAME {target}"
+            );
+        }
+    }
+
+    /// A DNAME at the root redirects every name but the root itself. Not in
+    /// Table 1, and the one shape where the owner's text is the separator: the
+    /// prefix is the whole query name, not the query name with its last
+    /// character cut off.
+    #[test]
+    fn a_dname_at_the_root_keeps_the_whole_prefix() {
+        assert_eq!(
+            dname_redirect(
+                nm("a.").as_ref(),
+                nm(".").as_ref(),
+                nm("example.net.").as_ref()
+            ),
+            Redirect::To(nm("a.example.net."))
+        );
+        assert_eq!(
+            dname_redirect(
+                nm(".").as_ref(),
+                nm(".").as_ref(),
+                nm("example.net.").as_ref()
+            ),
+            Redirect::NoMatch
+        );
+    }
+
+    /// RFC 6672 §2.2: "suppose the target name of the DNAME RR is 250 octets in
+    /// length (multiple labels), if an incoming QNAME that has a first label
+    /// over 5 octets in length, the result would be a name over 255 octets. If
+    /// this occurs, the server returns an RCODE of YXDOMAIN."
+    ///
+    /// The RFC's own arithmetic, so the target is built to exactly 250 encoded
+    /// octets: four 49-octet labels and one of 48 are 4 × 50 + 49 = 249, and
+    /// the root's terminator is the 250th.
+    #[test]
+    fn a_substitution_that_overflows_255_octets_is_yxdomain() {
+        let label = "a".repeat(49);
+        let last = "a".repeat(48);
+        let target = format!("{label}.{label}.{label}.{label}.{last}.");
+        assert_eq!(nm(&target).as_ref().as_wire().len(), 250);
+
+        // One label of six octets over a 250-octet target: 250 + 7 = 257.
+        assert_eq!(
+            dname_redirect(
+                nm("abcdef.example.com.").as_ref(),
+                nm("example.com.").as_ref(),
+                nm(&target).as_ref()
+            ),
+            Redirect::TooLong
+        );
+        // And one that fits: 250 + 2 = 252.
+        assert!(matches!(
+            dname_redirect(
+                nm("a.example.com.").as_ref(),
+                nm("example.com.").as_ref(),
+                nm(&target).as_ref()
+            ),
+            Redirect::To(_)
+        ));
+    }
+
+    /// Case is the client's on the left of the substitution and the zone's on
+    /// the right, because the result is echoed as the owner of the synthesized
+    /// CNAME (RFC 1034 §4.3.3) and a DNS-0x20 client compares it byte for byte.
+    #[test]
+    fn a_substitution_keeps_the_case_it_was_given() {
+        assert_eq!(
+            dname_redirect(
+                nm("WwW.ExAmPlE.CoM.").as_ref(),
+                nm("example.com.").as_ref(),
+                nm("Example.Net.").as_ref()
+            ),
+            Redirect::To(nm("WwW.Example.Net."))
         );
     }
 }

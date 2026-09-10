@@ -1,8 +1,8 @@
 use super::parse::name_at;
+use crate::codecs::hex_decode;
 use crate::denial_wire::base32hex_decode;
 use crate::error::ZoneError;
 use crate::record_types as rt;
-use crate::utils::hex_decode;
 use crate::{NameRef, ParsedRecord, RecordData, Serial};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -260,7 +260,7 @@ pub(super) fn rdata_from_fields(
             // 255-byte ceiling is the encoder's, for every caller.
             let strings: Vec<Vec<u8>> = text_fields
                 .iter()
-                .map(|t| crate::utils::char_string_decode(t))
+                .map(|t| crate::codecs::char_string_decode(t))
                 .collect::<Result<_, _>>()
                 .map_err(|e| ZoneError::syntax(ln, format!("TXT record: {e}")))?;
             if strings.is_empty() {

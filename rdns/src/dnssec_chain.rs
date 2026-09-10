@@ -16,6 +16,7 @@
 //! must still be served. Bogus means the chain was supposed to continue and did
 //! not, and must not be.
 
+use crate::codecs::hex_decode;
 use crate::dnssec::{
     algorithm_supported, digest_type_supported, verify_rrset, Dnskey, Ds, Rrset, RrsetProof, Rrsig,
 };
@@ -24,7 +25,6 @@ use crate::dnssec_denial::{
 };
 use crate::error::DnssecError;
 use crate::record_types as rt;
-use crate::utils::hex_decode;
 use crate::Class;
 use crate::Rtype;
 use crate::{Name, NameRef, ParsedRecord, Qtype, RecordData, ResourceRecord};

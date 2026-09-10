@@ -12,8 +12,8 @@
 //! character-string escaping, which is what RFC 9460 §2.1 asks for and what
 //! lets a zone carry a parameter registered after this code was written.
 
+use crate::codecs::{base64_encode, char_string_decode, char_string_escaped};
 use crate::error::ZoneError;
-use crate::utils::{base64_encode, char_string_decode, char_string_escaped};
 use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -442,8 +442,8 @@ fn present_value(code: u16, value: &[u8]) -> Option<Option<String>> {
 mod tests {
 
     use super::{svc_param_key_from_name, svc_param_key_name};
+    use crate::codecs::hex_encode;
     use crate::record_types as rt;
-    use crate::utils::hex_encode;
     use crate::zone::{parse_zone_file, Zone};
     use crate::zone_writer::zone_to_string;
 

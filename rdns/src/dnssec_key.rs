@@ -14,13 +14,13 @@
 //! depending on who loaded it, and every RRSIG naming that tag would point at a
 //! key nobody can find.
 
+use crate::codecs::base64_encode;
 use crate::dnssec::{
     ds_digest, key_tag, rrsig_labels_of, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP,
     DNSKEY_FLAG_ZONE,
 };
 use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
-use crate::utils::base64_encode;
 use crate::{Name, NameRef};
 use ring::rand::SystemRandom;
 use ring::signature::{

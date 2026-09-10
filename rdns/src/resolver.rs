@@ -9,8 +9,9 @@ use crate::dnssec_chain::{
 };
 use crate::dnssec_denial::{nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, Denial};
 use crate::error::{ResolveError, ResolveResult};
+use crate::name::{dname_redirect, Redirect};
 use crate::record_types as rt;
-use crate::utils::{bind_addr_for, current_unix_timestamp, dname_redirect, Redirect};
+use crate::utils::{bind_addr_for, current_unix_timestamp};
 use crate::validation::{answers_query, SentQuery};
 use crate::Qtype;
 use crate::Rtype;
