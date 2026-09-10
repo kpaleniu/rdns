@@ -42,8 +42,10 @@ inventory**, later the same day: #37 closed on the day it was filed.~~
 **One inventory and one numbered section again, 2026-09-09**: **#38**, from a
 structural review asked for that day. Its three fixes are committed and ~~five
 sub-items are open~~ — ~~**four and a half, later the same day**: 38d's `rdnsr`
-half is done and its `rdnsd` half is not~~ **three and a half on 2026-09-10**,
-38b having gone too. None of them is a defect.
+half is done and its `rdnsd` half is not~~ ~~**three and a half on 2026-09-10**,
+38b having gone too~~ **two and a half the same day**, 38e having gone as well —
+its cross-crate half decided against rather than done, which the row explains.
+None of them is a defect.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -709,7 +711,7 @@ commit; the first four are `CLAUDE.md`'s and the fifth is new with CI:
 
 ```sh
 cargo build --workspace --all-targets
-cargo test --workspace                          # 898 Windows, 914 Linux
+cargo test --workspace                          # 906 Windows, 922 Linux
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo deny check                                # needs cargo-deny 0.17+
@@ -784,8 +786,9 @@ never had the judgement made about it: `rdnsd` was split in #20 and the decision
 not to split it further was taken deliberately, while `rdnsr` simply never got a
 first split.~~ **Taken 2026-09-09**, the day after it was filed; the row says
 what the split was and what it measured. **38a and 38c are moves with no
-behaviour in them, ~~38b is a small operational gap~~ (taken 2026-09-10), and 38e
-is half an hour** —
+behaviour in them, ~~38b is a small operational gap~~ (taken 2026-09-10), and
+~~38e is half an hour~~ (taken the same day, and it was two hours: the count came
+out at eight instances rather than three)** —
 and 38d's other half, `rdnsd`'s fourth seam, is the one #20 already decided
 against once, so it wants an argument rather than a session.
 
@@ -862,7 +865,7 @@ report** — the one defect it turned up (a dropped DO bit) is in the fixed half
 | ~~**38b**~~ | ~~a removed zone's journal is never deleted~~ **done 2026-09-10** | ~~`journal::journalled_zones` read the directory "so a journal left by a removed zone is found and cleaned up instead of resurfacing if that zone is ever re-added". Nothing called it: `zones::restore_journals` walks the *zone list* instead, so an orphan journal stays on disk until somebody notices. Deleted with the rest of the dead code rather than left as a function nobody calls; the gap is here because deleting it would otherwise have deleted the finding~~. `journalled_zones` is back as a `Journal` method, and `zones::discard_orphan_journals` deletes what no zone claims, once, at startup. Startup is the whole of it: a reload already forgets the journal of a zone it withdraws, so the only way to leave one behind is to remove the zone while the process is down. The two EXPIRE paths deliberately keep theirs — the copy on disk did not change while contact was lost, so the history still reaches the serial that loads. Under `--allow-partial-load` a zone whose file will not parse loses its journal, which is the right way for it to fail and is written down where it happens |
 | **38c** | `rdns-core::utils` is the crate's miscellany | 783 code lines and seven unrelated things: the RR-type and QTYPE tables, the SVCB parameter keys, hex/base64/character-string codecs, the presentation-name helpers, `bind_addr_for` and `recv_error_is_transient`, the clock, and `dname_redirect` — which is RFC 6672's substitution rule and not a utility at all. #37d's argument applies (a name that says what is in it, and private helpers held at `pub(super)`), but the visibility measurement is small: four private items (`separators`, `without_root`, `separates_labels`, `has_ascii_uppercase`) and they all belong to the name half. The stronger argument is the one #33 refused to make about line count: `utils` is where a thing goes when nobody decided where it belongs, so it grows by default. A move, its own commit, no behaviour |
 | **38d** | ~~the two daemons are cut on different principles~~ **`rdnsr` split 2026-09-09; `rdnsd`'s half is what is left** | `rdnsd/src/answer.rs` holds the *query* path (391 SLOC) and 559 SLOC of AXFR/IXFR/UPDATE/NOTIFY answering stayed in `main.rs` as `impl Server` — a fourth seam of the kind #20 lifted three of, and #20 said explicitly it was not worth going further, so taking it means arguing with that rather than repeating this. ~~That judgement was never made for **`rdnsr`, which has no modules at all**: 773 SLOC of CLI, the RFC 5011 anchor manager (~180), the answer path, the UDP loop and `main` in one file, and its AD-bit policy spelled out at five call sites.~~ **Done**: `anchors` (the RFC 5011 manager), `answer` (the caches and the answer path), `serve` (the two socket loops) and `testutil`, leaving 300 SLOC of CLI and `main`. Measured the way #37 asks — visibility, not line count — eight items that were visible to the crate root and every descendant — five in `answer`, three in `anchors` — are now module-private, and `Caches`'s three fields have a constructor in front of them; `serve` seals nothing and is the one split made for the seam alone. The AD-bit rule is `finish`'s, once, with a test for all four combinations. 769 non-test SLOC became 813, the difference being four `use` blocks where there was one |
-| **38e** | the fixtures cannot be shared, so they are written three times | `test_records` is `#[cfg(test)]`, so `tests/` and `benches/` — separate crates — cannot see it: `query_message` is identical in `benches/answer_path.rs:53`, `tests/allocations.rs` and `tests/no_input_panics.rs`, and `zone_at` in `ixfr.rs` and `journal.rs` in a module that already imports `test_records::nm`. A `testkit` feature gating those modules, or a dev-dependency crate, is the usual answer. Beside it: `rdns-transport`, the admission path both daemons' packets pass through, has **3 tests** for 627 lines |
+| ~~**38e**~~ | ~~the fixtures cannot be shared, so they are written three times~~ **mostly done 2026-09-10; the cross-crate half is decided against** | ~~`test_records` is `#[cfg(test)]`, so `tests/` and `benches/` — separate crates — cannot see it: `query_message` is identical in `benches/answer_path.rs:53`, `tests/allocations.rs` and `tests/no_input_panics.rs`, and `zone_at` in `ixfr.rs` and `journal.rs` in a module that already imports `test_records::nm`. A `testkit` feature gating those modules, or a dev-dependency crate, is the usual answer.~~ Counting first turned up a bigger instance than the one filed: the scratch-directory helper was written **seven times in `rdns`** and once more in `rdnsd`, and three of those removed the directory on the last line of the test body — the line a failing assertion skips — rather than in `Drop`. One per crate now (`rdns::testutil`, `rdnsd::testutil`, `rdns-transport::testutil`), plus `test_records::zone_at`. **The cross-crate half is not done and should not be**: a `testkit` feature is on for every build whose features unify with the tests’, so the fixtures compile into the shipped binaries to spare `tests/`, `benches/` and `examples/` about twenty lines of `nm` and `query_message`. `test_records::nm`’s own doc had already reached that conclusion for `nm`. If it is ever taken up it gets its own number. ~~Beside it: `rdns-transport`, the admission path both daemons’ packets pass through, has **3 tests** for 627 lines~~ — **11 now**: `tcp.rs` had none at all, and the eight are the writer task’s two guarantees, the drain, the abort, the zero-length prefix, the idle timeout, #17’s framing wrap and #30e’s per-connection rate |
 
 **What the review checked and found nothing wrong with**, so the next one need
 not: a whole-tree scan for repeated function bodies (≥6 lines, normalised) found
