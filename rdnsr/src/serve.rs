@@ -13,8 +13,7 @@ use rdns::resolver::Resolver;
 use rdns::security::ResponseVerdict;
 use rdns::shutdown::{Busy, Stop};
 use rdns::utils::current_unix_timestamp;
-use rdns::utils::{recv_error_is_transient, UDP_RECEIVE_BUFFER};
-use rdns_transport::{tcp, ServeContext, Transport};
+use rdns_transport::{recv_error_is_transient, tcp, ServeContext, Transport, UDP_RECEIVE_BUFFER};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Semaphore};
 

@@ -192,7 +192,7 @@ left the process healthy with nothing alerting.
   `Err` ended the loop and the process, making a stray ICMP report a remote kill
   switch — and then, because the fix was a list of `ErrorKind`s, an oversized
   datagram was a second one: WSAEMSGSIZE arrives as `Uncategorized` and matches
-  no kind. See `utils::recv_error_is_transient`.
+  no kind. See `rdns_transport::recv_error_is_transient`.
 
 ## 5. State keyed on something an attacker chooses must be bounded
 

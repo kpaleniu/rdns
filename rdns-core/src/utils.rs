@@ -49,11 +49,6 @@ pub mod record_types {
     pub const ANY_CODE: u16 = 255;
 }
 
-/// WSAEMSGSIZE: the datagram was larger than the buffer offered for it. Rust has
-/// no [`std::io::ErrorKind`] for it — it arrives as `Uncategorized` — so the raw
-/// code is the only way to recognize it.
-const WSAEMSGSIZE: i32 = 10040;
-
 /// Hex, upper case, as a zone file and an anchor file write a digest or a salt.
 ///
 /// Existed twice as `bytes.iter().map(|b| format!("{b:02X}")).collect()`, which
@@ -133,35 +128,6 @@ pub fn bind_addr_for(target: SocketAddr) -> SocketAddr {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
     }
 }
-
-/// Whether a UDP receive error is about a datagram rather than about the health
-/// of the socket.
-///
-/// Both servers end their receive loop, and with it the process, when `recv_from`
-/// returns `Err`, so anything a remote party can provoke has to be recognized
-/// here or it is a remote kill switch. Two such: Windows reports a stray ICMP
-/// port-unreachable on the socket's *next* `recv_from`, and fails an oversized
-/// receive (WSAEMSGSIZE) instead of truncating it.
-pub fn recv_error_is_transient(e: &std::io::Error) -> bool {
-    if e.raw_os_error() == Some(WSAEMSGSIZE) {
-        return true;
-    }
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::NetworkUnreachable
-            | std::io::ErrorKind::HostUnreachable
-            // The portable spelling of "that datagram did not fit".
-            | std::io::ErrorKind::InvalidInput
-    )
-}
-
-/// The receive buffer one datagram needs.
-///
-/// Not the EDNS payload size either server advertises: that bounds *responses*,
-/// and a client may send anything a UDP length field can express.
-pub const UDP_RECEIVE_BUFFER: usize = 65_535;
 
 /// A name in the form DNS compares names by: ASCII case folded, and nothing else.
 ///
@@ -1206,49 +1172,6 @@ mod tests {
         assert_eq!(bind_addr_for(v4), "0.0.0.0:0".parse().unwrap());
         assert_eq!(bind_addr_for(v6), "[::]:0".parse().unwrap());
         assert_eq!(bind_addr_for(mapped), "[::]:0".parse().unwrap());
-    }
-
-    /// The oversized-datagram case, tested through the raw code because
-    /// WSAEMSGSIZE's `ErrorKind` is `Uncategorized` and carries no information.
-    #[test]
-    fn an_oversized_datagram_is_not_a_reason_to_stop_serving() {
-        let too_big = std::io::Error::from_raw_os_error(WSAEMSGSIZE);
-        assert!(
-            recv_error_is_transient(&too_big),
-            "WSAEMSGSIZE arrives as {:?}, which is why matching on the kind alone missed it",
-            too_big.kind()
-        );
-    }
-
-    #[test]
-    fn a_stray_icmp_report_is_not_a_reason_to_stop_serving() {
-        for kind in [
-            std::io::ErrorKind::ConnectionReset,
-            std::io::ErrorKind::ConnectionRefused,
-            std::io::ErrorKind::NetworkUnreachable,
-            std::io::ErrorKind::HostUnreachable,
-        ] {
-            assert!(
-                recv_error_is_transient(&std::io::Error::from(kind)),
-                "{kind:?}"
-            );
-        }
-    }
-
-    /// The predicate has to stay narrow: a server that cannot receive is not
-    /// serving, and pretending otherwise looks healthy and answers nothing.
-    #[test]
-    fn a_broken_socket_is_still_fatal() {
-        for kind in [
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::AddrNotAvailable,
-            std::io::ErrorKind::OutOfMemory,
-        ] {
-            assert!(
-                !recv_error_is_transient(&std::io::Error::from(kind)),
-                "{kind:?}"
-            );
-        }
     }
 
     /// ASCII case folding, and nothing else (RFC 4343).

@@ -17,7 +17,7 @@ In order. Every step that drops a packet does so silently unless noted.
 
 1. Receive. A fixed pool of `--udp-workers` tasks share the socket and answer
    inline; there is no task per datagram. A receive error that
-   `utils::recv_error_is_transient` recognises (ICMP reports, WSAEMSGSIZE, which
+   `rdns_transport::recv_error_is_transient` recognises (ICMP reports, WSAEMSGSIZE, which
    arrives as `ErrorKind::Uncategorized`) continues the loop; anything else ends
    it and takes the process down.
 2. Rate limit (`security::RateLimiter`, per source address). Over the limit:
