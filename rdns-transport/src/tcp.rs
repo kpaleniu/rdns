@@ -254,3 +254,351 @@ pub async fn serve_one<H: Handler>(
     drop(tx);
     let _ = writer_task.await;
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rdns::shutdown::Shutdown;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    use super::*;
+    use crate::testutil::{context, id_of, query};
+
+    /// What the test handler does with a message it is given.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// Echo it back after pausing for the low octet of its id in
+        /// milliseconds, so one connection can carry a slow message and a fast
+        /// one.
+        AfterIdMillis,
+        /// Abort the connection instead of replying, as a transfer that cannot
+        /// be finished does.
+        Abort,
+    }
+
+    struct Echo {
+        ctx: ServeContext,
+        answer: Answer,
+    }
+
+    impl Echo {
+        fn new(answer: Answer, rate: u32) -> Arc<Echo> {
+            Arc::new(Echo {
+                ctx: context(rate),
+                answer,
+            })
+        }
+    }
+
+    impl Handler for Echo {
+        fn context(&self) -> &ServeContext {
+            &self.ctx
+        }
+
+        async fn handle(
+            &self,
+            packet: Vec<u8>,
+            _peer: SocketAddr,
+            _now: u64,
+            out: mpsc::Sender<Reply>,
+        ) {
+            match self.answer {
+                Answer::AfterIdMillis => {
+                    let pause = u64::from(id_of(&packet) & 0xff);
+                    tokio::time::sleep(Duration::from_millis(pause)).await;
+                    send_framed(&out, &packet).await;
+                }
+                Answer::Abort => {
+                    let _ = out.send(Reply::Abort).await;
+                }
+            }
+        }
+    }
+
+    /// Connect to `listener`'s address and hand the connection to `serve_one`,
+    /// which is what this module exposes for exactly this.
+    async fn connected(
+        handler: Arc<Echo>,
+        limits: TransportLimits,
+        stop: Stop,
+    ) -> (TcpStream, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let (server, peer) = listener.accept().await.expect("accept");
+        let task = tokio::spawn(async move {
+            serve_one(server, peer, handler, limits, RateLimit::PerMessage, stop).await;
+        });
+        (client, task)
+    }
+
+    /// One framed message off the wire, or `None` at EOF.
+    async fn next_reply(client: &mut TcpStream) -> Option<Vec<u8>> {
+        let mut prefix = [0u8; 2];
+        client.read_exact(&mut prefix).await.ok()?;
+        let mut body = vec![0u8; u16::from_be_bytes(prefix) as usize];
+        client.read_exact(&mut body).await.ok()?;
+        Some(body)
+    }
+
+    async fn send(client: &mut TcpStream, message: &[u8]) {
+        client
+            .write_all(&rdns::framed(message).expect("frames"))
+            .await
+            .expect("send");
+    }
+
+    /// Replies may finish out of order (RFC 7766 §6.2.1.1 — clients match on
+    /// the transaction id), and must still reach the wire one whole message at
+    /// a time. Both halves are the writer task's reason for existing: two
+    /// handlers writing to the socket themselves would interleave, and a peer
+    /// reading a length prefix out of the middle of another message has no way
+    /// back.
+    #[tokio::test]
+    async fn replies_may_finish_out_of_order_and_never_interleave() {
+        let shutdown = Shutdown::new();
+        let (mut client, task) = connected(
+            Echo::new(Answer::AfterIdMillis, 0),
+            TransportLimits::default(),
+            shutdown.stop_handle(),
+        )
+        .await;
+
+        // 0x0064 pauses 100ms, 0x0001 pauses 1ms, and the slow one is asked
+        // first.
+        send(&mut client, &query(0x0064)).await;
+        send(&mut client, &query(0x0001)).await;
+
+        let first = next_reply(&mut client).await.expect("a reply");
+        let second = next_reply(&mut client).await.expect("another");
+        assert_eq!(id_of(&first), 0x0001, "the fast one did not wait");
+        assert_eq!(id_of(&second), 0x0064);
+        assert_eq!(first, query(0x0001), "and each message arrived whole");
+        assert_eq!(second, query(0x0064));
+
+        drop(client);
+        let _ = task.await;
+    }
+
+    /// `Reply::Abort` closes the connection rather than falling silent: a
+    /// transfer is complete at its closing SOA (RFC 5936 §2.2), so a stream that
+    /// ends early is one the client must discard — and it can only know that if
+    /// the socket closes instead of leaving it to time out.
+    #[tokio::test]
+    async fn an_abort_closes_the_connection_rather_than_going_quiet() {
+        let shutdown = Shutdown::new();
+        let (mut client, task) = connected(
+            Echo::new(Answer::Abort, 0),
+            TransportLimits::default(),
+            shutdown.stop_handle(),
+        )
+        .await;
+
+        send(&mut client, &query(0x1234)).await;
+        assert!(
+            next_reply(&mut client).await.is_none(),
+            "the write half is dropped, so the client reads EOF"
+        );
+
+        // A real client closes on EOF; without that the read half sits out the
+        // idle timeout, which is what this await would then measure.
+        drop(client);
+        let _ = task.await;
+    }
+
+    /// A zero-length prefix is not a message and cannot become one, so the
+    /// connection ends and the peer is charged with the error. Left running, it
+    /// is a loop that reads two octets and does nothing, forever.
+    #[tokio::test]
+    async fn a_zero_length_message_ends_the_connection_and_is_counted() {
+        let shutdown = Shutdown::new();
+        let handler = Echo::new(Answer::AfterIdMillis, 0);
+        let logger = handler.ctx.logger.clone();
+        let (mut client, task) =
+            connected(handler, TransportLimits::default(), shutdown.stop_handle()).await;
+
+        client.write_all(&[0x00, 0x00]).await.expect("send");
+        assert!(next_reply(&mut client).await.is_none(), "and closes");
+        let _ = task.await;
+
+        assert_eq!(
+            logger
+                .take_stats(rdns::utils::current_unix_timestamp() + 60)
+                .total_errors,
+            1,
+            "silent on the wire, so it has to be visible in the counters"
+        );
+    }
+
+    /// Half of the claim in `serve_one`'s own doc comment, which is a claim to
+    /// verify (`CLAUDE.md` §4): on shutdown, reading stops but a message
+    /// already accepted finishes and reaches the wire. The stop lands while the
+    /// handler is still sleeping, which is what makes this the in-flight case
+    /// rather than a race with the reply.
+    ///
+    /// It is not a regression test for the epilogue that drops `tx` and awaits
+    /// the writer: the handler and writer tasks are detached, so the reply
+    /// arrives even if `serve_one` returns at the stop instead of breaking to
+    /// it. What that epilogue is for is the *drain*, which is the test below.
+    #[tokio::test]
+    async fn a_stop_ends_the_reading_but_not_the_reply_already_in_flight() {
+        let shutdown = Shutdown::new();
+        let (mut client, task) = connected(
+            Echo::new(Answer::AfterIdMillis, 0),
+            TransportLimits::default(),
+            shutdown.stop_handle(),
+        )
+        .await;
+
+        // 200ms of handler, stopped after 20.
+        send(&mut client, &query(0x00c8)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        shutdown.begin();
+
+        let reply = next_reply(&mut client)
+            .await
+            .expect("the answer still comes");
+        assert_eq!(id_of(&reply), 0x00c8);
+        assert!(
+            next_reply(&mut client).await.is_none(),
+            "and then the connection closes rather than waiting for more"
+        );
+        let _ = task.await;
+    }
+
+    /// The drain waits for a reply still being written, which is what holding
+    /// the `Busy` claim for a connection's whole life is for: a client cannot
+    /// tell a truncated AXFR from a complete one, so a process that exits with
+    /// one half-written has served a lie.
+    ///
+    /// Watched failing with `serve_one`'s stop arm returning instead of
+    /// breaking to the epilogue: the connection task ended at once, its `Busy`
+    /// went with it, and the drain finished ~180 ms before the reply reached
+    /// the client.
+    #[tokio::test]
+    async fn the_drain_waits_for_a_reply_still_being_written() {
+        let shutdown = Shutdown::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(serve(
+            listener,
+            Echo::new(Answer::AfterIdMillis, 0),
+            TransportLimits::default(),
+            RateLimit::PerMessage,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        // 200ms of handler, stopped after 20 — so the drain has 180ms to get
+        // the answer wrong in.
+        send(&mut client, &query(0x00c8)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let began = std::time::Instant::now();
+        shutdown.begin();
+        let waited = tokio::spawn(async move {
+            let drained = shutdown.drain(Duration::from_secs(5)).await;
+            assert!(drained, "within the budget, not by timing out");
+            began.elapsed()
+        });
+
+        let reply = next_reply(&mut client).await.expect("the answer");
+        assert_eq!(id_of(&reply), 0x00c8);
+        // Not a performance floor (`CLAUDE.md` §10): the two outcomes are "did
+        // not wait at all" and "waited out the 180ms the handler had left", so
+        // anything between them cannot happen.
+        let waited = waited.await.expect("the drain task");
+        assert!(
+            waited >= Duration::from_millis(100),
+            "the drain returned in {waited:?}, so it did not wait for the \
+             reply the process was still writing"
+        );
+
+        let _ = server.await;
+    }
+
+    /// An idle connection is closed rather than held: RFC 7766 §6.2.3 wants
+    /// connections reused, and an idle one still costs a socket.
+    #[tokio::test]
+    async fn an_idle_connection_is_closed() {
+        let shutdown = Shutdown::new();
+        let limits = TransportLimits {
+            idle_timeout: Duration::from_millis(50),
+            ..TransportLimits::default()
+        };
+        let (mut client, task) = connected(
+            Echo::new(Answer::AfterIdMillis, 0),
+            limits,
+            shutdown.stop_handle(),
+        )
+        .await;
+
+        assert!(
+            next_reply(&mut client).await.is_none(),
+            "nothing was asked, so the timeout ends it like EOF"
+        );
+        let _ = task.await;
+    }
+
+    /// A reply too long to frame is dropped rather than sent with a wrapped
+    /// prefix, which the peer would read as a message boundary in the middle of
+    /// a message and never recover from. That wrap was `TODO.md` #17.
+    #[tokio::test]
+    async fn a_reply_too_long_to_frame_is_dropped_rather_than_wrapped() {
+        let (tx, mut rx) = mpsc::channel::<Reply>(4);
+        assert!(
+            !send_framed(&tx, &vec![0u8; u16::MAX as usize + 1]).await,
+            "the caller is told, because the client gets no answer at all"
+        );
+        assert!(rx.try_recv().is_err(), "and nothing reached the writer");
+
+        assert!(send_framed(&tx, &query(0x1234)).await, "the ordinary case");
+        assert!(matches!(rx.try_recv(), Ok(Reply::Frame(_))));
+    }
+
+    /// Where the query rate applies is the caller's, and the two daemons
+    /// disagree on purpose (`TODO.md` #30e). Per connection: a burst of one
+    /// admits one connection, and the messages on it are not charged again.
+    #[tokio::test]
+    async fn the_query_rate_can_be_per_connection_instead_of_per_message() {
+        let shutdown = Shutdown::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handler = Echo::new(Answer::AfterIdMillis, 1);
+        let server = tokio::spawn(serve(
+            listener,
+            handler,
+            TransportLimits::default(),
+            RateLimit::PerConnection,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let mut first = TcpStream::connect(addr).await.expect("connect");
+        for id in [0x0001u16, 0x0002] {
+            send(&mut first, &query(id)).await;
+            let reply = next_reply(&mut first).await.expect("both are answered");
+            assert_eq!(id_of(&reply), id, "one token was for the connection");
+        }
+
+        // The second connection is over the burst of one. It is accepted by the
+        // kernel and then dropped, so the tell is EOF with nothing on it.
+        let mut second = TcpStream::connect(addr).await.expect("connect");
+        send(&mut second, &query(0x0003)).await;
+        assert!(
+            next_reply(&mut second).await.is_none(),
+            "refused before the connection was served"
+        );
+
+        shutdown.begin();
+        let _ = server.await;
+    }
+}
