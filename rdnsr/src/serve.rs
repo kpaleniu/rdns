@@ -228,9 +228,15 @@ mod tests {
         // Long enough for the loop to have taken all four off the socket.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            metrics.rate_limited.load(std::sync::atomic::Ordering::Relaxed) >= 3,
-            "three of four datagrams are over a burst of one, and each drop is              counted: {}",
-            metrics.rate_limited.load(std::sync::atomic::Ordering::Relaxed)
+            metrics
+                .rate_limited
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 3,
+            "three of four datagrams are over a burst of one, and each drop \
+             is counted: {}",
+            metrics
+                .rate_limited
+                .load(std::sync::atomic::Ordering::Relaxed)
         );
 
         shutdown.begin();

@@ -901,7 +901,9 @@ fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> ConfigResult<Vec<u8>> {
     let tsig_octets = owner.len() + 10 + rdata.len();
     if message.len() > u16::MAX as usize {
         return Err(ConfigError::new(format!(
-            "a signed message is {} octets, and RFC 1035 §4.2.2's length prefix              cannot express more than {} — the TSIG record added {tsig_octets}              to a message that was already within that of the limit",
+            "a signed message is {} octets, and RFC 1035 §4.2.2's length \
+             prefix cannot express more than {} — the TSIG record added \
+             {tsig_octets} to a message that was already close to it",
             message.len(),
             u16::MAX,
         )));
@@ -1133,7 +1135,8 @@ mod tests {
         match check_request(&signed, &keyring, 1_000) {
             TsigCheck::Verified(_) => {}
             other => panic!(
-                "a signed message carrying EDNS must verify; the TSIG has to be                  the last record and OPT is written before it. Got {}",
+                "a signed message carrying EDNS must verify; the TSIG has to \
+                 be the last record and OPT is written before it. Got {}",
                 match other {
                     TsigCheck::Unsigned => "no TSIG found at all".to_string(),
                     TsigCheck::Rejected(r) => format!("rejected: {}", r.error.reason()),
