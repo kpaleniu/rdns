@@ -982,7 +982,10 @@ fn ordering_two_names_canonically() {
     within("order two names canonically", count, 0..=0);
 
     let (key, count) = allocations(|| rdns::denial_wire::canonical_sort_key(a));
-    assert!(!key.is_empty());
+    assert_ne!(
+        key,
+        rdns::denial_wire::canonical_sort_key(nm("other.test.").as_ref())
+    );
     within("build a canonical sort key", count, 1..=1);
 }
 

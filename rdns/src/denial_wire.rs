@@ -36,14 +36,24 @@ pub fn canonical_name_cmp(a: NameRef<'_>, b: NameRef<'_>) -> Ordering {
 /// terminator is what makes an ancestor sort before its descendants and keeps a
 /// label from sorting after a longer label it is a prefix of (`ab\0` before
 /// `abc\0`). Zero cannot occur inside a label.
-pub fn canonical_sort_key(name: NameRef<'_>) -> Vec<u8> {
+pub fn canonical_sort_key(name: NameRef<'_>) -> CanonicalKey {
     let mut key = Vec::with_capacity(name.as_wire().len());
     for label in reversed_labels(name) {
         key.extend(label.folded());
         key.push(0);
     }
-    key
+    CanonicalKey(key)
 }
+
+/// A name in RFC 4034 §6.1 order, which is the only reason this encoding exists.
+///
+/// Its `Ord` *is* the ordering — that is the whole point, and it is why the type
+/// is not interchangeable with a folded name even though both are octets of a
+/// name. `zone_signer` held two `BTreeMap<(Vec<u8>, Rtype), _>`, one keyed this
+/// way and one keyed on folded wire, and nothing but the argument type kept them
+/// apart (`TODO.md` #40a).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CanonicalKey(Vec<u8>);
 
 /// A name's labels, right to left. The root has none.
 ///
@@ -292,7 +302,7 @@ mod tests {
         canonical_name_cmp(nm(a).as_ref(), nm(b).as_ref())
     }
 
-    fn key(name: &str) -> Vec<u8> {
+    fn key(name: &str) -> CanonicalKey {
         canonical_sort_key(nm(name).as_ref())
     }
 
@@ -380,7 +390,10 @@ mod tests {
         // the dot it stands for and not the backslash that spells it. Splitting
         // on `.` made three labels of it and wrote `example\0b\0a\\0`, which is
         // where no other implementation puts the name (`TODO.md` #37a).
-        assert_eq!(key(r"a\.b.example."), b"example\0a.b\0".to_vec());
+        assert_eq!(
+            key(r"a\.b.example."),
+            CanonicalKey(b"example\0a.b\0".to_vec())
+        );
         assert!(key("a.example.") < key(r"a\.b.example."));
         assert!(key(r"a\.b.example.") < key("b.example."));
     }

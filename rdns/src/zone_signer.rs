@@ -19,7 +19,7 @@
 //! classic signer bug — validators ignore the signature, and the extra RRSIG
 //! shows up in the parent's NSEC bitmap as a type that is not there.
 
-use crate::denial_wire::{build_type_bitmap, canonical_sort_key};
+use crate::denial_wire::{build_type_bitmap, canonical_sort_key, CanonicalKey};
 use crate::dnssec::{Dnskey, Rrset};
 use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, MAX_NSEC3_ITERATIONS};
 use crate::dnssec_key::SigningKey;
@@ -661,12 +661,12 @@ impl NameEntry {
 /// wrong one.
 struct Layout {
     origin: Name,
-    names: BTreeMap<Vec<u8>, (Name, NameEntry)>,
+    names: BTreeMap<CanonicalKey, (Name, NameEntry)>,
 }
 
 impl Layout {
     fn of(zone: &Zone, origin: NameRef<'_>) -> Self {
-        let mut names: BTreeMap<Vec<u8>, (Name, NameEntry)> = BTreeMap::new();
+        let mut names: BTreeMap<CanonicalKey, (Name, NameEntry)> = BTreeMap::new();
         for record in zone.records() {
             let key = canonical_sort_key(record.name.as_ref());
             let entry = names
@@ -693,7 +693,7 @@ impl Layout {
         // `check_dname_rules` refuses a zone file with anything below a DNAME,
         // so this covers a zone that arrived by transfer or was built by UPDATE
         // — which §5.2 has adding a DNAME over existing names on purpose.
-        let occluders: BTreeSet<Vec<u8>> = names
+        let occluders: BTreeSet<CanonicalKey> = names
             .values()
             .filter(|(_, e)| e.is_delegation || e.types.contains(&rt::DNAME))
             .map(|(n, _)| canonical_sort_key(n.as_ref()))
@@ -721,7 +721,7 @@ impl Layout {
     /// exists. Under opt-out, neither insecure delegations nor the empty
     /// non-terminals that exist only to hold them.
     fn chain_names(&self, opt_out: bool) -> Vec<Name> {
-        let mut included: BTreeMap<Vec<u8>, Name> = self
+        let mut included: BTreeMap<CanonicalKey, Name> = self
             .names
             .iter()
             .filter(|(_, (_, e))| !e.occluded)
@@ -729,7 +729,7 @@ impl Layout {
             .map(|(k, (n, _))| (k.clone(), n.clone()))
             .collect();
 
-        let mut empty_non_terminals: BTreeMap<Vec<u8>, Name> = BTreeMap::new();
+        let mut empty_non_terminals: BTreeMap<CanonicalKey, Name> = BTreeMap::new();
         for name in included.values() {
             // `skip(1)`: strict ancestors. The walk stops at the origin, which
             // is in the chain already.
@@ -865,7 +865,7 @@ fn nsec3param_rdata(salt: &[u8], iterations: u16) -> RecordData {
 /// One signing run's RRsets: keyed in canonical order (RFC 4034 §6.1), so the
 /// signatures come out in a deterministic order, with the owner carried in the
 /// value because a `Name` has no `Ord`.
-type Rrsets = BTreeMap<(Vec<u8>, Rtype), (Name, Ttl, Vec<RecordData>)>;
+type Rrsets = BTreeMap<(CanonicalKey, Rtype), (Name, Ttl, Vec<RecordData>)>;
 
 fn sign_everything(
     layout: &Layout,

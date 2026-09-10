@@ -1,4 +1,4 @@
-use crate::denial_wire::{base32hex_decode, canonical_sort_key};
+use crate::denial_wire::{base32hex_decode, canonical_sort_key, CanonicalKey};
 use crate::record_types as rt;
 use crate::Class;
 use crate::Rtype;
@@ -58,7 +58,7 @@ pub struct Zone {
     ///
     /// Ordered, where the name index is not, because a denial asks a range
     /// question: which record's span contains this name.
-    nsec_chain: BTreeMap<Vec<u8>, usize>,
+    nsec_chain: BTreeMap<CanonicalKey, usize>,
     nsec3_chain: BTreeMap<Vec<u8>, usize>,
     /// The per-query ancestor walks this zone can skip. See [`Shortcuts`].
     shortcuts: Shortcuts,
@@ -172,9 +172,14 @@ pub enum NameKind {
 }
 
 /// Which of the two chains a denial record belongs to.
-enum Chain {
-    Nsec,
-    Nsec3,
+/// Where a denial record belongs, carrying the key of the chain it belongs to.
+///
+/// As `(Chain, Vec<u8>)` the tuple's second element meant whichever the first
+/// element said — a name in RFC 4034 §6.1 order or an RFC 5155 owner hash
+/// (`TODO.md` #40a).
+enum ChainKey {
+    Nsec(CanonicalKey),
+    Nsec3(Vec<u8>),
 }
 
 impl Zone {
@@ -225,10 +230,10 @@ impl Zone {
             .or_default()
             .push(position);
         match self.chain_key(&record) {
-            Some((Chain::Nsec, k)) => {
+            Some(ChainKey::Nsec(k)) => {
                 self.nsec_chain.insert(k, position);
             }
-            Some((Chain::Nsec3, k)) => {
+            Some(ChainKey::Nsec3(k)) => {
                 self.nsec3_chain.insert(k, position);
             }
             None => {}
@@ -301,18 +306,17 @@ impl Zone {
     /// An NSEC is filed under its owner name; an NSEC3 under the hash in its
     /// owner's first label, which is what the chain is ordered by. A label that
     /// will not decode is left out rather than filed under something wrong.
-    fn chain_key(&self, record: &ZoneRecord) -> Option<(Chain, Vec<u8>)> {
+    fn chain_key(&self, record: &ZoneRecord) -> Option<ChainKey> {
         match record.rdata.rtype() {
             crate::record_types::NSEC => {
-                Some((Chain::Nsec, canonical_sort_key(record.name.as_ref())))
+                Some(ChainKey::Nsec(canonical_sort_key(record.name.as_ref())))
             }
             crate::record_types::NSEC3 => {
                 // The hash is the first label, and a label is octets — so it is
                 // taken as octets rather than by splitting text on a `.` that
                 // may be inside one.
                 let label = record.name.as_ref().labels().next()?;
-                Some((
-                    Chain::Nsec3,
+                Some(ChainKey::Nsec3(
                     base32hex_decode(std::str::from_utf8(label).ok()?).ok()?,
                 ))
             }
@@ -651,16 +655,16 @@ impl Zone {
 
         // The chains are keyed by the absolute name too, so moving the origin
         // moves them.
-        let chain_keys: Vec<Option<(Chain, Vec<u8>)>> =
+        let chain_keys: Vec<Option<ChainKey>> =
             self.records.iter().map(|r| self.chain_key(r)).collect();
         self.nsec_chain.clear();
         self.nsec3_chain.clear();
         for (position, key) in chain_keys.into_iter().enumerate() {
             match key {
-                Some((Chain::Nsec, k)) => {
+                Some(ChainKey::Nsec(k)) => {
                     self.nsec_chain.insert(k, position);
                 }
-                Some((Chain::Nsec3, k)) => {
+                Some(ChainKey::Nsec3(k)) => {
                     self.nsec3_chain.insert(k, position);
                 }
                 None => {}

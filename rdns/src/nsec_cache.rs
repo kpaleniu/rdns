@@ -16,7 +16,7 @@
 //! - TTL is bounded by the proof, not by the question.
 
 use crate::clock::current_unix_timestamp;
-use crate::denial_wire::canonical_sort_key;
+use crate::denial_wire::{canonical_sort_key, CanonicalKey};
 use crate::dnssec::{signed_owner_name, Rrsig};
 use crate::dnssec_denial::{proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Params};
 use crate::eviction::Halving;
@@ -43,7 +43,7 @@ fn synthesizable_qtype(qtype: Qtype) -> bool {
 struct ZoneProofs {
     /// NSEC records by the canonical sort key of their owner, so the record
     /// whose range could contain a name is one range query away.
-    nsecs: BTreeMap<Vec<u8>, CachedProof<Nsec>>,
+    nsecs: BTreeMap<CanonicalKey, CachedProof<Nsec>>,
     /// NSEC3 records by owner hash, which is already ordered by plain bytes.
     nsec3s: BTreeMap<Vec<u8>, CachedProof<Nsec3>>,
     /// The zone's SOA and its signatures. A negative answer must carry it
@@ -918,9 +918,9 @@ fn insert_bounded_map(
 /// One victim, not [`crate::eviction`]'s halving: this bound is per zone and a
 /// constant, so the scan cannot grow with anything an operator or a stranger
 /// sets, and halving would throw away 128 validated proofs to save it.
-fn insert_bounded<T>(
-    map: &mut BTreeMap<Vec<u8>, CachedProof<T>>,
-    key: Vec<u8>,
+fn insert_bounded<K: Ord + Clone, T>(
+    map: &mut BTreeMap<K, CachedProof<T>>,
+    key: K,
     value: CachedProof<T>,
     now: u64,
 ) {
