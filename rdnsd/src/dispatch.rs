@@ -162,6 +162,10 @@ impl Server {
             self.ctx.metrics.track_query_type(qtype);
         }
 
+        // One ceiling for every reply this request can produce, read once from
+        // the transport that will carry it.
+        let max_len = wire.max_len(&msg);
+
         // TSIG before anything that could answer (RFC 8945 §5.2): checking the
         // signature afterwards means answering whoever asked.
         let mut session = match tsig::check_request(packet, &self.tsig_keys, now) {
@@ -177,9 +181,7 @@ impl Server {
                     rejection.key_name(),
                     rejection.error.reason()
                 );
-                let Some(response) =
-                    self.error_bytes(&msg, ResponseCode::NotAuthorized, wire.max_len(&msg))
-                else {
+                let Some(response) = error_reply(&msg, ResponseCode::NotAuthorized, max_len) else {
                     return;
                 };
                 match rejection.attach(response, now) {
@@ -209,7 +211,10 @@ impl Server {
         // the ordering and the persistence are the request's, not the
         // transport's.
         if msg.opcode == OpCode::Update {
-            if let Some(reply) = self.answer_update(&msg, peer, session.as_mut()).await {
+            if let Some(reply) = self
+                .answer_update(&msg, peer, session.as_mut(), max_len)
+                .await
+            {
                 wire.send(&reply, &self.ctx.logger, ip).await;
             }
             return;
@@ -217,7 +222,6 @@ impl Server {
 
         // Never hold the zone lock across a socket write: a SIGHUP reload would
         // queue behind a slow client for the life of its connection.
-        let max_len = wire.max_len(&msg);
         let serialized = {
             let zones = self.zone_map.read().await;
             if msg.opcode == OpCode::Notify {
@@ -273,7 +277,9 @@ impl Server {
             Wire::Framed(_) => Some(Cow::Borrowed(scratch.out.as_slice())),
             Wire::Datagram(..) => match self.ctx.admit_response(ip, scratch.out.len(), now) {
                 ResponseVerdict::Send => Some(Cow::Borrowed(scratch.out.as_slice())),
-                ResponseVerdict::Truncate => truncated_reply(request).map(Cow::Owned),
+                ResponseVerdict::Truncate => {
+                    truncated_reply(request, wire.max_len(request)).map(Cow::Owned)
+                }
                 ResponseVerdict::Drop => None,
             },
         };
@@ -528,7 +534,7 @@ impl Server {
         let _ = out.send(Reply::Abort).await;
     }
 
-    /// [`Server::transfer_error`], sent.
+    /// [`Server::signed_error`], framed and sent.
     async fn send_transfer_error(
         &self,
         msg: &DnsMessage,
@@ -537,17 +543,16 @@ impl Server {
         session: Option<&mut TsigSession>,
         out: &mpsc::Sender<Reply>,
     ) {
-        if let Some(bytes) = self.transfer_error(msg, rcode, ip, session, u16::MAX as usize) {
+        if let Some(bytes) = self.signed_error(msg, rcode, ip, session, u16::MAX as usize) {
             send_framed(out, &bytes).await;
         }
     }
 
-    /// One framed error response to a transfer request, signed if the request
-    /// was.
+    /// One error reply, signed if the request was.
     ///
     /// RFC 8945 §5.3: an error response to a verified request is signed too.
     /// Unsigned, a client cannot tell a refusal from a tampered reply.
-    fn transfer_error(
+    fn signed_error(
         &self,
         msg: &DnsMessage,
         rcode: ResponseCode,
@@ -555,7 +560,7 @@ impl Server {
         session: Option<&mut TsigSession>,
         max_len: usize,
     ) -> Option<Vec<u8>> {
-        let Some(bytes) = self.error_bytes(msg, rcode, max_len) else {
+        let Some(bytes) = error_reply(msg, rcode, max_len) else {
             serving_error!(self.ctx.logger, ip, "could not serialize an error response");
             return None;
         };
@@ -587,6 +592,7 @@ impl Server {
         msg: &DnsMessage,
         peer: SocketAddr,
         session: Option<&mut TsigSession>,
+        max_len: usize,
     ) -> Option<Vec<u8>> {
         let ip = peer.ip();
 
@@ -595,7 +601,7 @@ impl Server {
             Ok(request) => request,
             Err(rejected) => {
                 serving_error!(self.ctx.logger, ip, "UPDATE rejected: {rejected}");
-                return self.update_reply(msg, rejected.rcode, ip, session);
+                return self.signed_error(msg, rejected.rcode, ip, session, max_len);
             }
         };
         let zone_name = request.zone.clone();
@@ -610,7 +616,7 @@ impl Server {
                 ip,
                 "UPDATE of {zone_name} REFUSED: unsigned, and an UPDATE needs a TSIG key"
             );
-            return self.update_reply(msg, ResponseCode::Refused, ip, None);
+            return self.signed_error(msg, ResponseCode::Refused, ip, None, max_len);
         };
         if !session.may_update(&zone_name.as_ref().to_presentation()) {
             serving_error!(
@@ -619,7 +625,7 @@ impl Server {
                 "UPDATE of {zone_name} REFUSED: key {} may not rewrite it",
                 session.key_name()
             );
-            return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
+            return self.signed_error(msg, ResponseCode::Refused, ip, Some(session), max_len);
         }
 
         // §3.1.1: a zone we are not an authority for is NOTAUTH — not the query
@@ -634,7 +640,7 @@ impl Server {
         };
         let Some(previous) = previous else {
             tracing::info!(peer = %ip, "UPDATE of {zone_name}: NOTAUTH (not a zone served here)");
-            return self.update_reply(msg, ResponseCode::NotAuthorized, ip, Some(session));
+            return self.signed_error(msg, ResponseCode::NotAuthorized, ip, Some(session), max_len);
         };
 
         // A zone we replicate is the master's copy: the next refresh transfers
@@ -651,7 +657,7 @@ impl Server {
                 "UPDATE of {zone_name} REFUSED: this server replicates that zone, \
                  so its master owns it"
             );
-            return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
+            return self.signed_error(msg, ResponseCode::Refused, ip, Some(session), max_len);
         }
 
         // A zone we cannot write back must not be updated: the change would live
@@ -663,7 +669,7 @@ impl Server {
                 ip,
                 "UPDATE of {zone_name} REFUSED: this server has no writable zone source"
             );
-            return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
+            return self.signed_error(msg, ResponseCode::Refused, ip, Some(session), max_len);
         };
         let Some(path) = source.file_for(&zone_name.as_ref().to_presentation()) else {
             serving_error!(
@@ -671,7 +677,7 @@ impl Server {
                 ip,
                 "UPDATE of {zone_name} REFUSED: no zone file to write it back to"
             );
-            return self.update_reply(msg, ResponseCode::Refused, ip, Some(session));
+            return self.signed_error(msg, ResponseCode::Refused, ip, Some(session), max_len);
         };
 
         // §3.7's serialization, held across the whole read-modify-write.
@@ -705,7 +711,13 @@ impl Server {
                     ip,
                     "UPDATE of {zone_name}: the task failed: {e}"
                 );
-                return self.update_reply(msg, ResponseCode::ServerFailure, ip, Some(session));
+                return self.signed_error(
+                    msg,
+                    ResponseCode::ServerFailure,
+                    ip,
+                    Some(session),
+                    max_len,
+                );
             }
         };
 
@@ -713,14 +725,20 @@ impl Server {
             Ok(applied) => applied,
             Err(UpdateFailure::Prerequisite(rejected)) => {
                 tracing::info!(peer = %ip, "UPDATE of {zone_name}: {rejected}");
-                return self.update_reply(msg, rejected.rcode, ip, Some(session));
+                return self.signed_error(msg, rejected.rcode, ip, Some(session), max_len);
             }
             // §3.4.2.1: a system failure is SERVFAIL with every applied update
             // undone. Nothing to undo here — the write is atomic and the map is
             // untouched until it succeeds.
             Err(UpdateFailure::System(e)) => {
                 serving_error!(self.ctx.logger, ip, "UPDATE of {zone_name} failed: {e:#}");
-                return self.update_reply(msg, ResponseCode::ServerFailure, ip, Some(session));
+                return self.signed_error(
+                    msg,
+                    ResponseCode::ServerFailure,
+                    ip,
+                    Some(session),
+                    max_len,
+                );
             }
         };
 
@@ -753,7 +771,7 @@ impl Server {
         }
 
         drop(_applying);
-        self.update_reply(msg, ResponseCode::Ok, ip, Some(session))
+        self.signed_error(msg, ResponseCode::Ok, ip, Some(session), max_len)
     }
 
     /// The four things `install_zone` moves together — [`ZoneContext`].
@@ -765,41 +783,32 @@ impl Server {
             journal: self.journal.clone(),
         }
     }
+}
 
-    /// A reply to an UPDATE, signed when the request was.
-    ///
-    /// Signed even when it is a refusal (RFC 8945 §5.3): unsigned, a client
-    /// cannot tell a policy decision from a tampered reply.
-    fn update_reply(
-        &self,
-        msg: &DnsMessage,
-        rcode: ResponseCode,
-        ip: IpAddr,
-        session: Option<&mut TsigSession>,
-    ) -> Option<Vec<u8>> {
-        // An UPDATE reply is one small message on either transport, so the TCP
-        // ceiling is never the binding one.
-        self.transfer_error(msg, rcode, ip, session, u16::MAX as usize)
+/// The start of every reply that carries no records: the question echoed, and
+/// the client's OPT mirrored with its DO bit (RFC 6891 §6.1.1, RFC 3225 §3).
+///
+/// One function because the mirroring is what drifts. It was written out at four
+/// call sites, and three of them dropped the DO bit, so a validating client that
+/// asked over UDP and got TC=1 read the answer as coming from a server that had
+/// stopped doing DNSSEC (`TODO.md` #38, `CLAUDE.md` §7).
+fn empty_reply(request: &DnsMessage) -> DnsMessage {
+    let mut resp = DnsMessage::reply_to(request);
+    if let Some(edns) = ClientEdns::of(request).mirror(RDNSD_PAYLOAD_SIZE) {
+        resp.set_edns(edns);
     }
+    resp
+}
 
-    /// An empty response to `msg` carrying `rcode`, serialized within `max_len`.
-    ///
-    /// The ceiling is the transport's — `u16::MAX` on TCP, the client's EDNS
-    /// payload size on UDP — and is the only thing the UDP TSIG rejection's own
-    /// copy of this differed in (`TODO.md` #30g).
-    fn error_bytes(
-        &self,
-        msg: &DnsMessage,
-        rcode: ResponseCode,
-        max_len: usize,
-    ) -> Option<Vec<u8>> {
-        let mut resp = DnsMessage::reply_to(msg);
-        resp.rcode = rcode;
-        if let Some(edns) = ClientEdns::of(msg).mirror(RDNSD_PAYLOAD_SIZE) {
-            resp.set_edns(edns);
-        }
-        resp.to_bytes_within(max_len).ok()
-    }
+/// An empty reply to `request` carrying `rcode`, serialized within `max_len`.
+///
+/// The ceiling is the transport's — [`Wire::max_len`] — and it is the only thing
+/// the UDP TSIG rejection's own copy of this used to differ in
+/// (`TODO.md` #30g).
+fn error_reply(request: &DnsMessage, rcode: ResponseCode, max_len: usize) -> Option<Vec<u8>> {
+    let mut resp = empty_reply(request);
+    resp.rcode = rcode;
+    resp.to_bytes_within(max_len).ok()
 }
 
 /// Why an UPDATE could not be applied, split by what the client is owed.
@@ -871,16 +880,13 @@ fn apply_update_to_file(
 /// client retry over TCP, where the handshake proves the source address. Silence
 /// would leave a legitimate client with a timeout and no hint that TCP works.
 ///
-/// No AA — the reply carries no data — and bounded by `udp_payload_size()`
+/// No AA — the reply carries no data — and bounded by the caller's ceiling,
+/// which on the transport this can happen on is the client's EDNS payload size
 /// rather than 512 (RFC 6891 §6.2.4).
-fn truncated_reply(request: &DnsMessage) -> Option<Vec<u8>> {
-    let mut resp = DnsMessage::reply_to(request);
+fn truncated_reply(request: &DnsMessage, max_len: usize) -> Option<Vec<u8>> {
+    let mut resp = empty_reply(request);
     resp.truncation = true;
-    if let Some(edns) = ClientEdns::of(request).mirror(RDNSD_PAYLOAD_SIZE) {
-        resp.set_edns(edns);
-    }
-    resp.to_bytes_within(request.udp_payload_size() as usize)
-        .ok()
+    resp.to_bytes_within(max_len).ok()
 }
 
 /// Answer a NOTIFY (RFC 1996).
@@ -952,13 +958,17 @@ mod tests {
     /// same way that file does — RFC 6891 §6.1.1 for the record, RFC 3225 §3
     /// for the DO bit inside it.
     ///
-    /// `truncated_reply` and `error_bytes` each set an OPT of their own with DO
-    /// clear, so a validating client asking over UDP and getting TC=1 read the
-    /// answer as coming from a server that had dropped DNSSEC (`CLAUDE.md` §7).
+    /// `truncated_reply` and what is now `error_reply` each set an OPT of their
+    /// own with DO clear, so a validating client asking over UDP and getting
+    /// TC=1 read the answer as coming from a server that had dropped DNSSEC
+    /// (`CLAUDE.md` §7). Both go through [`empty_reply`] since #39c, so this
+    /// covers both: a mirror written a third time is the way this comes back.
     #[test]
-    fn a_reply_built_outside_the_answer_path_mirrors_the_clients_opt() {
+    fn every_empty_reply_mirrors_the_clients_opt() {
         let asked = query("www.example.com.", Qtype::of(record_types::A), true);
-        let bytes = truncated_reply(&asked).expect("a truncated reply");
+        let ceiling = asked.udp_payload_size() as usize;
+
+        let bytes = truncated_reply(&asked, ceiling).expect("a truncated reply");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
         assert!(reply.truncation, "TC=1");
         assert!(
@@ -968,10 +978,20 @@ mod tests {
                 .do_bit
         );
 
-        let plain = query("www.example.com.", Qtype::of(record_types::A), false);
-        let bytes = truncated_reply(&plain).expect("a truncated reply");
+        let bytes = error_reply(&asked, ResponseCode::Refused, ceiling).expect("an error reply");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
-        assert!(!reply.edns().expect("an OPT").do_bit, "and only when asked");
+        assert_eq!(reply.rcode, ResponseCode::Refused);
+        assert!(reply.edns().expect("an OPT").do_bit, "and so does this one");
+
+        let plain = query("www.example.com.", Qtype::of(record_types::A), false);
+        let ceiling = plain.udp_payload_size() as usize;
+        for bytes in [
+            truncated_reply(&plain, ceiling).expect("a truncated reply"),
+            error_reply(&plain, ResponseCode::Refused, ceiling).expect("an error reply"),
+        ] {
+            let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
+            assert!(!reply.edns().expect("an OPT").do_bit, "and only when asked");
+        }
     }
 
     /// A NOTIFY is acted on when it comes from a master of a zone we replicate,
