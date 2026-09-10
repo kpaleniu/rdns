@@ -391,67 +391,6 @@ pub fn record_type_code(rdata: &RecordData) -> Rtype {
     rdata.rtype()
 }
 
-/// SvcParamKeys that have a name (RFC 9460 §14.3.2). Everything else is
-/// `keyNNNNN`, which is why this is a handful of constants and not an enum.
-pub mod svc_param_keys {
-    /// Keys a client must understand to use the record at all (§8).
-    pub const MANDATORY: u16 = 0;
-    /// Application-Layer Protocol Negotiation ids — how `h3` is advertised.
-    pub const ALPN: u16 = 1;
-    /// Present and empty; the scheme's default ALPN is not supported (§7.1).
-    pub const NO_DEFAULT_ALPN: u16 = 2;
-    pub const PORT: u16 = 3;
-    pub const IPV4HINT: u16 = 4;
-    /// Reserved in RFC 9460 for Encrypted ClientHello, which is why this
-    /// library carries the name but no value format for it.
-    pub const ECH: u16 = 5;
-    pub const IPV6HINT: u16 = 6;
-}
-
-/// The name of a SvcParamKey, or its `keyNNNNN` form (RFC 9460 §2.1).
-///
-/// Always a name [`svc_param_key_from_name`] reads back, which is the same
-/// contract [`record_type_name`] has with its inverse.
-pub fn svc_param_key_name(key: u16) -> Cow<'static, str> {
-    let known = match key {
-        svc_param_keys::MANDATORY => "mandatory",
-        svc_param_keys::ALPN => "alpn",
-        svc_param_keys::NO_DEFAULT_ALPN => "no-default-alpn",
-        svc_param_keys::PORT => "port",
-        svc_param_keys::IPV4HINT => "ipv4hint",
-        svc_param_keys::ECH => "ech",
-        svc_param_keys::IPV6HINT => "ipv6hint",
-        other => return Cow::Owned(format!("key{other}")),
-    };
-    Cow::Borrowed(known)
-}
-
-/// The inverse. `keyNNNNN` is accepted for any key at all.
-///
-/// RFC 9460 §2.1 spells the generic form `key65535` with no leading zeros and
-/// requires the value to fit a `u16`, so `key65536` and `key0001` are not keys.
-pub fn svc_param_key_from_name(name: &str) -> Option<u16> {
-    match name {
-        "mandatory" => Some(svc_param_keys::MANDATORY),
-        "alpn" => Some(svc_param_keys::ALPN),
-        "no-default-alpn" => Some(svc_param_keys::NO_DEFAULT_ALPN),
-        "port" => Some(svc_param_keys::PORT),
-        "ipv4hint" => Some(svc_param_keys::IPV4HINT),
-        "ech" => Some(svc_param_keys::ECH),
-        "ipv6hint" => Some(svc_param_keys::IPV6HINT),
-        other => {
-            let digits = other.strip_prefix("key")?;
-            // "0" is `key0`, but `key0001` is not a spelling of it: the writer
-            // never emits a leading zero, so accepting one would break the
-            // round trip this pair promises.
-            if digits.len() > 1 && digits.starts_with('0') {
-                return None;
-            }
-            digits.parse::<u16>().ok()
-        }
-    }
-}
-
 /// Decode RFC 1035 §5.1's escapes: `\X` is a literal `X`, and `\DDD` is the
 /// octet with that three-digit decimal value.
 ///

@@ -13,11 +13,72 @@
 //! lets a zone carry a parameter registered after this code was written.
 
 use crate::error::ZoneError;
-use crate::utils::{
-    base64_encode, char_string_decode, char_string_escaped, svc_param_key_from_name,
-};
-use crate::utils::{svc_param_key_name, svc_param_keys as key};
+use crate::utils::{base64_encode, char_string_decode, char_string_escaped};
+use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr};
+
+use svc_param_keys as key;
+
+/// SvcParamKeys that have a name (RFC 9460 §14.3.2). Everything else is
+/// `keyNNNNN`, which is why this is a handful of constants and not an enum.
+pub mod svc_param_keys {
+    /// Keys a client must understand to use the record at all (§8).
+    pub const MANDATORY: u16 = 0;
+    /// Application-Layer Protocol Negotiation ids — how `h3` is advertised.
+    pub const ALPN: u16 = 1;
+    /// Present and empty; the scheme's default ALPN is not supported (§7.1).
+    pub const NO_DEFAULT_ALPN: u16 = 2;
+    pub const PORT: u16 = 3;
+    pub const IPV4HINT: u16 = 4;
+    /// Reserved in RFC 9460 for Encrypted ClientHello, which is why this
+    /// library carries the name but no value format for it.
+    pub const ECH: u16 = 5;
+    pub const IPV6HINT: u16 = 6;
+}
+
+/// The name of a SvcParamKey, or its `keyNNNNN` form (RFC 9460 §2.1).
+///
+/// Always a name [`svc_param_key_from_name`] reads back, which is the same
+/// contract [`crate::utils::record_type_name`] has with its inverse.
+pub fn svc_param_key_name(key: u16) -> Cow<'static, str> {
+    let known = match key {
+        svc_param_keys::MANDATORY => "mandatory",
+        svc_param_keys::ALPN => "alpn",
+        svc_param_keys::NO_DEFAULT_ALPN => "no-default-alpn",
+        svc_param_keys::PORT => "port",
+        svc_param_keys::IPV4HINT => "ipv4hint",
+        svc_param_keys::ECH => "ech",
+        svc_param_keys::IPV6HINT => "ipv6hint",
+        other => return Cow::Owned(format!("key{other}")),
+    };
+    Cow::Borrowed(known)
+}
+
+/// The inverse. `keyNNNNN` is accepted for any key at all.
+///
+/// RFC 9460 §2.1 spells the generic form `key65535` with no leading zeros and
+/// requires the value to fit a `u16`, so `key65536` and `key0001` are not keys.
+pub fn svc_param_key_from_name(name: &str) -> Option<u16> {
+    match name {
+        "mandatory" => Some(svc_param_keys::MANDATORY),
+        "alpn" => Some(svc_param_keys::ALPN),
+        "no-default-alpn" => Some(svc_param_keys::NO_DEFAULT_ALPN),
+        "port" => Some(svc_param_keys::PORT),
+        "ipv4hint" => Some(svc_param_keys::IPV4HINT),
+        "ech" => Some(svc_param_keys::ECH),
+        "ipv6hint" => Some(svc_param_keys::IPV6HINT),
+        other => {
+            let digits = other.strip_prefix("key")?;
+            // "0" is `key0`, but `key0001` is not a spelling of it: the writer
+            // never emits a leading zero, so accepting one would break the
+            // round trip this pair promises.
+            if digits.len() > 1 && digits.starts_with('0') {
+                return None;
+            }
+            digits.parse::<u16>().ok()
+        }
+    }
+}
 
 /// Parse the `key=value` tail of an SVCB or HTTPS record.
 ///
@@ -380,6 +441,7 @@ fn present_value(code: u16, value: &[u8]) -> Option<Option<String>> {
 #[cfg(test)]
 mod tests {
 
+    use super::{svc_param_key_from_name, svc_param_key_name};
     use crate::utils::{hex_encode, record_types as rt};
     use crate::zone::{parse_zone_file, Zone};
     use crate::zone_writer::zone_to_string;
@@ -629,20 +691,16 @@ $TTL 3600
     /// zero — so accepting one would break the round trip the pair promises.
     #[test]
     fn the_generic_key_spelling_has_one_form() {
-        assert_eq!(crate::utils::svc_param_key_from_name("key667"), Some(667));
-        assert_eq!(crate::utils::svc_param_key_from_name("key0"), Some(0));
-        assert_eq!(crate::utils::svc_param_key_name(667), "key667");
-        assert_eq!(crate::utils::svc_param_key_from_name("key0001"), None);
-        assert_eq!(crate::utils::svc_param_key_from_name("key65536"), None);
-        assert_eq!(crate::utils::svc_param_key_from_name("keyfoo"), None);
+        assert_eq!(svc_param_key_from_name("key667"), Some(667));
+        assert_eq!(svc_param_key_from_name("key0"), Some(0));
+        assert_eq!(svc_param_key_name(667), "key667");
+        assert_eq!(svc_param_key_from_name("key0001"), None);
+        assert_eq!(svc_param_key_from_name("key65536"), None);
+        assert_eq!(svc_param_key_from_name("keyfoo"), None);
         // The named ones read back both ways.
         for key in 0u16..=6 {
-            let name = crate::utils::svc_param_key_name(key);
-            assert_eq!(
-                crate::utils::svc_param_key_from_name(&name),
-                Some(key),
-                "{name}"
-            );
+            let name = svc_param_key_name(key);
+            assert_eq!(svc_param_key_from_name(&name), Some(key), "{name}");
         }
     }
 }
