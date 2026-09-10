@@ -699,28 +699,89 @@ async fn serve(
 /// The sink shape is this daemon's requirement: an AXFR is a *sequence* of
 /// messages (RFC 5936 §2.2), so a slow client back-pressures the next envelope
 /// rather than having the whole zone built ahead of it (`TODO.md` #30a).
+/// Where one request's reply goes, and the two things that follow from it.
+///
+/// The transport decided three things that were written out twice: how a reply
+/// is framed, how large it may be, and whether a response budget applies. It is
+/// the parameter that lets `rdnsd` have one dispatcher instead of two
+/// (`TODO.md` #39b), and the one place `Framed` is matched for is why "a
+/// transfer is TCP-only" is now a branch the compiler can see rather than a
+/// comment about which caller got here.
+enum Wire<'a> {
+    /// A connection's writer. Length-prefixed (RFC 1035 §4.2.2), a sequence
+    /// allowed, and no response budget: the handshake proved the address.
+    Framed(&'a mpsc::Sender<Reply>),
+    /// One datagram back to the peer, capped by its EDNS advertisement and
+    /// charged against the response budget.
+    Datagram(&'a UdpSocket, SocketAddr),
+}
+
+impl Wire<'_> {
+    /// The size ceiling this transport puts on a reply. Over TCP the length
+    /// prefix is the only limit, so the client's EDNS payload size does not
+    /// apply (RFC 6891 §6.2.2).
+    fn max_len(&self, request: &DnsMessage) -> usize {
+        match self {
+            Wire::Framed(_) => u16::MAX as usize,
+            Wire::Datagram(..) => request.udp_payload_size() as usize,
+        }
+    }
+
+    /// Put one finished message on the wire, framing it if the transport frames.
+    ///
+    /// Callers hand over unframed bytes whichever transport they are on, which
+    /// is what removes the `&framed[2..]` the UDP UPDATE path did by hand.
+    async fn send(&self, bytes: &[u8], logger: &QueryLogger, ip: IpAddr) {
+        match self {
+            Wire::Framed(out) => {
+                send_framed(out, bytes).await;
+            }
+            Wire::Datagram(socket, peer) => {
+                if let Err(e) = socket.send_to(bytes, *peer).await {
+                    bad_request!(logger, ip, "socket send error: {e}");
+                }
+            }
+        }
+    }
+}
+
 impl tcp::Handler for Server {
     fn context(&self) -> &ServeContext {
         &self.ctx
     }
 
     async fn handle(&self, packet: Vec<u8>, peer: SocketAddr, now: u64, out: mpsc::Sender<Reply>) {
-        self.answer(&packet, peer, now, &out).await;
+        // A scratch per message here, where the UDP worker keeps one per worker:
+        // `tcp::Handler` has no per-connection state to hang one on
+        // (`TODO.md` #39e).
+        let mut scratch = Scratch::default();
+        self.answer(&packet, peer, now, &Wire::Framed(&out), &mut scratch)
+            .await;
     }
 }
 
 impl Server {
-    /// Answer one query, sending each length-prefixed message to the connection's
-    /// writer as it is built.
+    /// Answer one request, whatever it arrived on.
     ///
-    /// A sequence, because an AXFR response is one (RFC 5936 §2.2), and sent
-    /// rather than returned so a large zone never exists all at once. Sending
-    /// nothing is how a query earns no response at all.
-    /// `now` is the transport's single clock read for this message: the
-    /// limiter has already used it, and the logger and the TSIG check want the
-    /// same instant (`TODO.md` #28a). Admission ran before the spawn, which is
+    /// One function for both transports: everything up to the TSIG check is the
+    /// same question asked of the same bytes, and what differs afterwards is
+    /// `wire` (`TODO.md` #39b). Sent rather than returned, because an AXFR
+    /// response is a sequence of messages (RFC 5936 §2.2) and a slow client
+    /// should back-pressure the next envelope rather than have the whole zone
+    /// built ahead of it. Sending nothing is how a query earns no response.
+    ///
+    /// `now` is the transport's single clock read for this message: the limiter
+    /// has already used it, and the logger and the TSIG check want the same
+    /// instant (`TODO.md` #28a). Admission ran before this was called, which is
     /// where it belongs (`CLAUDE.md` §9).
-    async fn answer(&self, packet: &[u8], peer: SocketAddr, now: u64, out: &mpsc::Sender<Reply>) {
+    async fn answer(
+        &self,
+        packet: &[u8],
+        peer: SocketAddr,
+        now: u64,
+        wire: &Wire<'_>,
+        scratch: &mut Scratch,
+    ) {
         let ip = peer.ip();
         // `Request` is the door: it parses and it refuses QR=1. `AdmissionCheck`
         // accepts QR=1 on purpose — it runs on both directions of the wire — so
@@ -745,6 +806,8 @@ impl Server {
 
         let qtype = msg.queries.first().map(|q| q.qtype);
         self.ctx.logger.log_query(ip, qtype, now);
+        // Counted before any policy can return, so a request refused later is
+        // still a request received (`TODO.md` #39a).
         self.ctx.metrics.count(&self.ctx.metrics.queries_received);
         if let Some(qtype) = qtype {
             self.ctx.metrics.track_query_type(qtype);
@@ -766,14 +829,12 @@ impl Server {
                     rejection.error.reason()
                 );
                 let Some(response) =
-                    self.error_bytes(&msg, ResponseCode::NotAuthorized, u16::MAX as usize)
+                    self.error_bytes(&msg, ResponseCode::NotAuthorized, wire.max_len(&msg))
                 else {
                     return;
                 };
                 match rejection.attach(response, now) {
-                    Ok(bytes) => {
-                        send_framed(out, &bytes).await;
-                    }
+                    Ok(bytes) => wire.send(&bytes, &self.ctx.logger, ip).await,
                     Err(e) => serving_error!(self.ctx.logger, ip, "TSIG error reply: {e}"),
                 }
                 return;
@@ -781,69 +842,110 @@ impl Server {
         };
 
         // Answered here rather than in `make_response`: a sequence of messages,
-        // gated on an ACL, and the answer can be the whole zone.
-        if matches!(
-            msg.queries.first().map(|q| q.qtype),
-            Some(Qtype::AXFR) | Some(Qtype::IXFR)
-        ) {
-            self.answer_transfer(&msg, peer, session.as_mut(), now, out)
-                .await;
-            return;
+        // gated on an ACL, and the answer can be the whole zone. Only where a
+        // sequence can be carried — AXFR is TCP alone (RFC 5936 §4.2) and an
+        // IXFR over UDP is answered with a single SOA (RFC 1995 §2), both of
+        // which `write_response` does below.
+        if matches!(qtype, Some(Qtype::AXFR) | Some(Qtype::IXFR)) {
+            if let Wire::Framed(out) = wire {
+                self.answer_transfer(&msg, peer, session.as_mut(), now, out)
+                    .await;
+                return;
+            }
         }
 
         // Likewise, plus: an UPDATE installs a new zone, and `make_response`
         // holds a read guard on the zone map that installing would deadlock
-        // against.
+        // against. RFC 2136 §1 permits it on either transport, and the checks,
+        // the ordering and the persistence are the request's, not the
+        // transport's.
         if msg.opcode == OpCode::Update {
-            for framed in self.answer_update(&msg, peer, session.as_mut()).await {
-                let _ = out.send(Reply::Frame(framed)).await;
+            if let Some(reply) = self.answer_update(&msg, peer, session.as_mut()).await {
+                wire.send(&reply, &self.ctx.logger, ip).await;
             }
             return;
         }
 
         // Never hold the zone lock across a socket write: a SIGHUP reload would
         // queue behind a slow client for the life of its connection.
-        let mut bytes = Vec::new();
-        let mut compressor = NameCompressor::new();
-        {
+        let max_len = wire.max_len(&msg);
+        let serialized = {
             let zones = self.zone_map.read().await;
-            // Over TCP the 2-byte length prefix is the only size limit, so the
-            // EDNS UDP payload size does not apply (RFC 6891 §6.2.2).
-            let written = if msg.opcode == OpCode::Notify {
+            if msg.opcode == OpCode::Notify {
                 notify_reply(&msg, &zones, &self.secondaries, peer).to_bytes_within_buf_with(
-                    u16::MAX as usize,
-                    &mut bytes,
-                    &mut compressor,
+                    max_len,
+                    &mut scratch.out,
+                    &mut scratch.compressor,
                 )
             } else {
                 write_response(
                     &msg,
                     &zones,
                     &self.ctx.metrics,
-                    u16::MAX as usize,
-                    &mut bytes,
-                    &mut compressor,
-                    &mut String::new(),
+                    max_len,
+                    &mut scratch.out,
+                    &mut scratch.compressor,
+                    &mut scratch.key,
                 )
-            };
-            if let Err(e) = written {
-                serving_error!(self.ctx.logger, ip, "serialization error: {e}");
-                return;
             }
+        };
+        if let Err(e) = serialized {
+            serving_error!(self.ctx.logger, ip, "serialization error: {e}");
+            return;
         }
 
-        // Same session, so the reply's MAC covers the request's: that is what
-        // stops one question's reply being replayed as another's.
-        match session.as_mut() {
-            Some(session) => match session.sign(bytes, now) {
-                Ok(signed) => {
-                    send_framed(out, &signed).await;
-                }
-                Err(e) => serving_error!(self.ctx.logger, ip, "TSIG signing failed: {e}"),
+        self.finish(wire, &msg, session.as_mut(), peer, now, scratch)
+            .await;
+    }
+
+    /// The epilogue every ordinary answer leaves through: charge it, sign it,
+    /// send it.
+    ///
+    /// Charging is the datagram transport's alone — over TCP the handshake has
+    /// proved the address, so there is nothing to amplify. Over budget, a
+    /// truncated reply is the useful refusal: it carries no records, so it
+    /// cannot amplify, and a real client reads TC=1 and asks again over TCP.
+    /// Dropping is for the rest.
+    ///
+    /// `Cow` so the ordinary answer — no budget trouble, no TSIG — goes out of
+    /// the caller's scratch buffer with nothing allocated. The two exceptions
+    /// build a message of their own and own it.
+    async fn finish(
+        &self,
+        wire: &Wire<'_>,
+        request: &DnsMessage,
+        session: Option<&mut TsigSession>,
+        peer: SocketAddr,
+        now: u64,
+        scratch: &Scratch,
+    ) {
+        let ip = peer.ip();
+        let reply: Option<Cow<'_, [u8]>> = match wire {
+            Wire::Framed(_) => Some(Cow::Borrowed(scratch.out.as_slice())),
+            Wire::Datagram(..) => match self.ctx.admit_response(ip, scratch.out.len(), now) {
+                ResponseVerdict::Send => Some(Cow::Borrowed(scratch.out.as_slice())),
+                ResponseVerdict::Truncate => truncated_reply(request).map(Cow::Owned),
+                ResponseVerdict::Drop => None,
             },
-            None => {
-                send_framed(out, &bytes).await;
-            }
+        };
+        // Sign whatever we ended up sending — including a truncated one, since
+        // that is still our answer to a question someone authenticated. Same
+        // session, so the reply's MAC covers the request's: that is what stops
+        // one question's reply being replayed as another's. This is where the
+        // borrow above becomes a copy, and it is the right place for it: a
+        // signed query over UDP is a NOTIFY or an SOA probe, not traffic.
+        let reply = match (reply, session) {
+            (Some(reply), Some(session)) => match session.sign(reply.into_owned(), now) {
+                Ok(signed) => Some(Cow::Owned(signed)),
+                Err(e) => {
+                    serving_error!(self.ctx.logger, ip, "TSIG signing failed: {e}");
+                    None
+                }
+            },
+            (reply, _) => reply,
+        };
+        if let Some(reply) = reply {
+            wire.send(&reply, &self.ctx.logger, ip).await;
         }
     }
 
@@ -1086,10 +1188,8 @@ impl Server {
         session: Option<&mut TsigSession>,
         out: &mpsc::Sender<Reply>,
     ) {
-        for framed in self.transfer_error(msg, rcode, ip, session) {
-            if out.send(Reply::Frame(framed)).await.is_err() {
-                return;
-            }
+        if let Some(bytes) = self.transfer_error(msg, rcode, ip, session, u16::MAX as usize) {
+            send_framed(out, &bytes).await;
         }
     }
 
@@ -1104,30 +1204,24 @@ impl Server {
         rcode: ResponseCode,
         ip: IpAddr,
         session: Option<&mut TsigSession>,
-    ) -> Vec<Vec<u8>> {
-        let Some(bytes) = self.error_bytes(msg, rcode, u16::MAX as usize) else {
+        max_len: usize,
+    ) -> Option<Vec<u8>> {
+        let Some(bytes) = self.error_bytes(msg, rcode, max_len) else {
             serving_error!(self.ctx.logger, ip, "could not serialize an error response");
-            return Vec::new();
+            return None;
         };
-        let bytes = match session {
+        match session {
             Some(session) => match session.sign(bytes, current_unix_timestamp()) {
-                Ok(signed) => signed,
+                Ok(signed) => Some(signed),
                 Err(e) => {
                     // Send nothing: an unsigned error is what signing exists to
                     // avoid producing.
                     serving_error!(self.ctx.logger, ip, "signing an error response failed: {e}");
-                    return Vec::new();
+                    None
                 }
             },
-            None => bytes,
-        };
-        rdns::framed(&bytes)
-            .map_err(|e| {
-                // ERROR, not DEBUG: a client got no answer at all.
-                tracing::error!("could not frame a {}-octet reply: {e}", bytes.len())
-            })
-            .into_iter()
-            .collect()
+            None => Some(bytes),
+        }
     }
 
     /// Answer a dynamic UPDATE (RFC 2136).
@@ -1144,7 +1238,7 @@ impl Server {
         msg: &DnsMessage,
         peer: SocketAddr,
         session: Option<&mut TsigSession>,
-    ) -> Vec<Vec<u8>> {
+    ) -> Option<Vec<u8>> {
         let ip = peer.ip();
 
         // §3.1: read it, and reject the ways it can be malformed.
@@ -1333,8 +1427,10 @@ impl Server {
         rcode: ResponseCode,
         ip: IpAddr,
         session: Option<&mut TsigSession>,
-    ) -> Vec<Vec<u8>> {
-        self.transfer_error(msg, rcode, ip, session)
+    ) -> Option<Vec<u8>> {
+        // An UPDATE reply is one small message on either transport, so the TCP
+        // ceiling is never the binding one.
+        self.transfer_error(msg, rcode, ip, session, u16::MAX as usize)
     }
 
     /// An empty response to `msg` carrying `rcode`, serialized within `max_len`.
@@ -1555,7 +1651,13 @@ async fn udp_loop(
         // budget.
         let _busy = busy.clone();
         server
-            .answer_datagram(packet, peer, &socket, &mut scratch, now)
+            .answer(
+                packet,
+                peer,
+                now,
+                &Wire::Datagram(&socket, peer),
+                &mut scratch,
+            )
             .await;
     }
 }
@@ -1577,180 +1679,6 @@ struct Scratch {
     out: Vec<u8>,
     compressor: NameCompressor,
     key: String,
-}
-
-/// Next to [`udp_loop`] because this is the body of that loop.
-impl Server {
-    /// Answer one datagram that has already been admitted, into `scratch`.
-    ///
-    /// The rate limiter and the validator have run in the loop above; what is
-    /// left is everything that has to look at the message.
-    async fn answer_datagram(
-        &self,
-        packet: &[u8],
-        peer: SocketAddr,
-        socket: &UdpSocket,
-        scratch: &mut Scratch,
-        now: u64,
-    ) {
-        let Server {
-            zone_map,
-            ctx,
-            tsig_keys,
-            secondaries,
-            ..
-        } = self;
-        let ServeContext {
-            logger, metrics, ..
-        } = ctx;
-
-        // The same door as the TCP path above, and now literally the same code.
-        //
-        // The QR check was missing here and only here, which is the transport
-        // it matters on: `fn answer` has had it since the rule was written and
-        // this one was never given it, so two servers pointed at each other — or
-        // one spoofed datagram naming another server as its source — is a
-        // packet loop neither end can see, and nothing about UDP makes the peer
-        // prove its address first. This daemon has two answering paths, so the
-        // check is a type rather than a line either could omit.
-        let msg = match Request::from_bytes(packet) {
-            Ok(msg) => msg,
-            Err(RequestError::Wire(_)) => {
-                bad_request!(logger, peer.ip(), "failed to parse DNS message");
-                return;
-            }
-            Err(RequestError::NotAQuestion) => {
-                bad_request!(
-                    logger,
-                    peer.ip(),
-                    "a response was sent to a server port; dropped"
-                );
-                return;
-            }
-        };
-
-        let qtype = msg.queries.first().map(|q| q.qtype);
-        logger.log_query(peer.ip(), qtype, now);
-        // Counted here, before any policy can return: the TCP path has always
-        // done it in this order and this one did it after the TSIG check, so a
-        // rejected request was a received query on one transport and not the
-        // other (`TODO.md` #39a). `dns_queries_received_total` says "queries
-        // received", and a request that fails its MAC arrived.
-        metrics.count(&metrics.queries_received);
-        if let Some(qtype) = qtype {
-            metrics.track_query_type(qtype);
-        }
-
-        // A signed query is checked before it is answered, and its answer
-        // is signed back (RFC 8945). A rejected one gets NOTAUTH and a
-        // TSIG saying which of BADKEY/BADSIG/BADTIME it was.
-        let mut session = match tsig::check_request(packet, tsig_keys, now) {
-            TsigCheck::Unsigned => None,
-            TsigCheck::Verified(session) => Some(session),
-            TsigCheck::Rejected(rejection) => {
-                serving_error!(
-                    logger,
-                    peer.ip(),
-                    "TSIG rejected (key {}): {}",
-                    rejection.key_name(),
-                    rejection.error.reason()
-                );
-                let response = self.error_bytes(
-                    &msg,
-                    ResponseCode::NotAuthorized,
-                    msg.udp_payload_size() as usize,
-                );
-                if let Some(bytes) = response {
-                    if let Ok(bytes) = rejection.attach(bytes, now) {
-                        let _ = socket.send_to(&bytes, peer).await;
-                    }
-                }
-                return;
-            }
-        };
-
-        // An UPDATE over UDP is permitted (RFC 2136 §1) and goes through exactly
-        // the same handler as over TCP — the checks, the ordering and the
-        // persistence are the request's, not the transport's. The reply is
-        // already framed for TCP, so the prefix comes off here rather than the
-        // handler learning which socket it was reached from; this is the one
-        // request whose answer is a single small message either way.
-        if msg.opcode == OpCode::Update {
-            for framed in self.answer_update(&msg, peer, session.as_mut()).await {
-                if let Some(bytes) = framed.get(2..) {
-                    if let Err(e) = socket.send_to(bytes, peer).await {
-                        bad_request!(logger, peer.ip(), "socket send error: {e}");
-                    }
-                }
-            }
-            return;
-        }
-
-        // Build the response under the zone lock, then drop it before
-        // touching the socket: a read guard held across `send_to` would
-        // stall a SIGHUP zone reload behind the network.
-        let serialized = {
-            let zones = zone_map.read().await;
-            // Honor the client's EDNS0 UDP payload size (512 if no EDNS);
-            // truncates with TC=1 if the response is larger.
-            let max_len = msg.udp_payload_size() as usize;
-            if msg.opcode == OpCode::Notify {
-                notify_reply(&msg, &zones, secondaries, peer).to_bytes_within_buf_with(
-                    max_len,
-                    &mut scratch.out,
-                    &mut scratch.compressor,
-                )
-            } else {
-                write_response(
-                    &msg,
-                    &zones,
-                    metrics,
-                    max_len,
-                    &mut scratch.out,
-                    &mut scratch.compressor,
-                    &mut scratch.key,
-                )
-            }
-        };
-        if let Err(e) = serialized {
-            serving_error!(logger, peer.ip(), "serialization error: {e}");
-            return;
-        }
-
-        // Charge the response, not the query. Over budget, a truncated reply is
-        // the useful refusal: it carries no records, so it cannot amplify, and a
-        // real client reads TC=1 and asks again over TCP where the handshake
-        // proves who it is. Dropping is for the rest.
-        //
-        // `Cow` so the ordinary answer — no budget trouble, no TSIG — is sent
-        // straight out of the worker's scratch buffer with nothing allocated.
-        // The two exceptions build a message of their own and own it.
-        let reply: Option<Cow<'_, [u8]>> =
-            match ctx.admit_response(peer.ip(), scratch.out.len(), now) {
-                ResponseVerdict::Send => Some(Cow::Borrowed(scratch.out.as_slice())),
-                ResponseVerdict::Truncate => truncated_reply(&msg).map(Cow::Owned),
-                ResponseVerdict::Drop => None,
-            };
-        // Sign whatever we ended up sending — including a truncated one, since
-        // that is still our answer to a question someone authenticated. This is
-        // where the borrow above becomes a copy, and it is the right place for
-        // it: a signed query over UDP is a NOTIFY or an SOA probe, not traffic.
-        let reply = match (reply, session.as_mut()) {
-            (Some(reply), Some(session)) => match session.sign(reply.into_owned(), now) {
-                Ok(signed) => Some(Cow::Owned(signed)),
-                Err(e) => {
-                    serving_error!(logger, peer.ip(), "TSIG signing failed: {e}");
-                    None
-                }
-            },
-            (reply, _) => reply,
-        };
-        if let Some(reply) = reply {
-            if let Err(e) = socket.send_to(&reply, peer).await {
-                bad_request!(logger, peer.ip(), "socket send error: {e}");
-            }
-        }
-    }
 }
 
 /// What a reload has to redo: everything between reading the files and being
@@ -2662,7 +2590,15 @@ mod tests {
     /// nothing in a test fills the channel before it is drained here.
     async fn answered(server: &Server, packet: &[u8], peer: SocketAddr) -> Vec<Vec<u8>> {
         let (tx, mut rx) = mpsc::channel::<Reply>(1024);
-        server.answer(packet, peer, tsig::now(), &tx).await;
+        server
+            .answer(
+                packet,
+                peer,
+                tsig::now(),
+                &Wire::Framed(&tx),
+                &mut Scratch::default(),
+            )
+            .await;
         drop(tx);
         let mut replies = Vec::new();
         while let Some(Reply::Frame(framed)) = rx.recv().await {
@@ -2950,6 +2886,57 @@ mod tests {
                 .expect("serialize the query")
         }
 
+        /// A transfer asked for over UDP is not streamed, and that is now a
+        /// branch rather than a position.
+        ///
+        /// Until one dispatcher replaced two (`TODO.md` #39b), "AXFR never
+        /// reaches `write_response` over TCP" was true because the TCP function
+        /// answered it earlier — `answer.rs`'s comment says exactly that, "so
+        /// this is the UDP path speaking". One function for both transports makes
+        /// the streaming branch reachable from a datagram, so the rule is a
+        /// `match` on `Wire` and this is what holds it: AXFR is FORMERR because
+        /// it is defined over TCP alone (RFC 5936 §4.2), and an IXFR is answered
+        /// with a single SOA of the current version, which tells the client to
+        /// come back over TCP (RFC 1995 §2).
+        ///
+        /// Nothing covered either rule before. Watched failing against a gate
+        /// that trusts the caller: dropping the `Wire::Framed` guard streams the
+        /// zone into the datagram path, and both assertions go.
+        #[tokio::test]
+        async fn a_transfer_over_udp_is_answered_rather_than_streamed() {
+            let server = server_with(one_record_zone());
+            let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+            let peer = client.local_addr().expect("addr");
+
+            for (qtype, rcode, answers) in [
+                (Qtype::AXFR, ResponseCode::FormatError, 0),
+                (Qtype::IXFR, ResponseCode::Ok, 1),
+            ] {
+                let packet = query("example.com.", qtype, false)
+                    .to_bytes_within(4096)
+                    .expect("serialize");
+                let mut scratch = Scratch::default();
+                server
+                    .answer(
+                        &packet,
+                        peer,
+                        tsig::now(),
+                        &Wire::Datagram(&socket, peer),
+                        &mut scratch,
+                    )
+                    .await;
+
+                let reply = DnsMessage::try_from_bytes(&scratch.out).expect("one parseable reply");
+                assert_eq!(reply.rcode, rcode, "{qtype:?} over UDP");
+                assert_eq!(
+                    reply.answers.len(),
+                    answers,
+                    "{qtype:?} over UDP: the answer section"
+                );
+            }
+        }
+
         /// A request that fails its TSIG check is still a request that arrived.
         ///
         /// The two dispatchers had drifted (`TODO.md` #39a): the TCP path counts
@@ -2988,12 +2975,12 @@ mod tests {
             let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
             let mut scratch = Scratch::default();
             over_udp
-                .answer_datagram(
+                .answer(
                     &signed,
                     client.local_addr().expect("addr"),
-                    &socket,
-                    &mut scratch,
                     now,
+                    &Wire::Datagram(&socket, client.local_addr().expect("addr")),
+                    &mut scratch,
                 )
                 .await;
 
@@ -3071,7 +3058,13 @@ mod tests {
 
             let mut scratch = Scratch::default();
             server
-                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
+                .answer(
+                    &packet,
+                    peer,
+                    tsig::now(),
+                    &Wire::Datagram(&socket, peer),
+                    &mut scratch,
+                )
                 .await;
 
             assert!(
@@ -3104,13 +3097,25 @@ mod tests {
             let mut scratch = Scratch::default();
 
             server
-                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
+                .answer(
+                    &packet,
+                    peer,
+                    tsig::now(),
+                    &Wire::Datagram(&socket, peer),
+                    &mut scratch,
+                )
                 .await;
             let (address, capacity) = (scratch.out.as_ptr(), scratch.out.capacity());
             assert!(!scratch.out.is_empty(), "the first answer was serialized");
 
             server
-                .answer_datagram(&packet, peer, &socket, &mut scratch, tsig::now())
+                .answer(
+                    &packet,
+                    peer,
+                    tsig::now(),
+                    &Wire::Datagram(&socket, peer),
+                    &mut scratch,
+                )
                 .await;
             assert_eq!(
                 scratch.out.as_ptr(),
