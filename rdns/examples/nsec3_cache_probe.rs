@@ -118,15 +118,15 @@ fn filled(iterations: u16) -> DnsMessage {
         i += 1;
         // A hash already ending in 0xff would make the span empty *and* wrapped,
         // which covers everything rather than nothing.
-        if *hash.last().unwrap() == 0xff {
+        if *hash.as_bytes().last().unwrap() == 0xff {
             continue;
         }
-        let mut next = hash.clone();
+        let mut next = hash.as_bytes().to_vec();
         *next.last_mut().unwrap() = 0xff;
         authorities.push(ResourceRecord {
             name: nm(&format!(
                 "{}.example.com.",
-                base32hex_encode(&hash).to_lowercase()
+                base32hex_encode(hash.as_bytes()).to_lowercase()
             )),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),

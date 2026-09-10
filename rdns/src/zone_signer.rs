@@ -21,7 +21,7 @@
 
 use crate::denial_wire::{build_type_bitmap, canonical_sort_key, CanonicalKey};
 use crate::dnssec::{Dnskey, Rrset};
-use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, MAX_NSEC3_ITERATIONS};
+use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, Nsec3Hash, MAX_NSEC3_ITERATIONS};
 use crate::dnssec_key::SigningKey;
 use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
@@ -795,13 +795,13 @@ fn build_nsec3_chain(
     ttl: Ttl,
     signed: &mut Zone,
 ) -> Result<()> {
-    let mut hashed: Vec<(Vec<u8>, Name)> = Vec::new();
+    let mut hashed: Vec<(Nsec3Hash, Name)> = Vec::new();
     for name in layout.chain_names(opt_out) {
         let hash = nsec3_hash_name(name.as_ref(), salt, iterations)
             .map_err(|e| DnssecError::key(format!("hashing {name} for the NSEC3 chain: {e}")))?;
-        hashed.push((hash.to_vec(), name));
+        hashed.push((hash, name));
     }
-    hashed.sort_by(|a, b| a.0.cmp(&b.0));
+    hashed.sort_by_key(|(hash, _)| *hash);
 
     // Two names hashing alike leaves one undeniable and the other unprovable.
     // It takes a SHA-1 collision, but the check is one comparison.
@@ -813,7 +813,7 @@ fn build_nsec3_chain(
     }
 
     for (index, (hash, name)) in hashed.iter().enumerate() {
-        let next = &hashed[(index + 1) % hashed.len()].0;
+        let next = hashed[(index + 1) % hashed.len()].0;
         let entry = layout.entry(name.as_ref());
         let mut types = entry.published_types();
         // Unlike NSEC the record does not sit at the name it describes, so it
@@ -829,12 +829,12 @@ fn build_nsec3_chain(
             flags: u8::from(opt_out),
             iterations,
             salt: salt.to_vec(),
-            next_hashed_owner: next.clone(),
+            next_hashed_owner: next.as_bytes().to_vec(),
             type_bitmap: build_type_bitmap(&types.into_iter().collect::<Vec<_>>()),
         })
         .map_err(|e| DnssecError::key(format!("encoding an NSEC3: {e}")))?;
         signed.add_record(ZoneRecord {
-            name: nsec3_owner_name_at(hash, layout.origin.as_ref())
+            name: nsec3_owner_name_at(*hash, layout.origin.as_ref())
                 .map_err(|e| DnssecError::key(format!("an NSEC3 owner name: {e}")))?,
             ttl,
             class: Class::new(1),
@@ -1454,7 +1454,7 @@ a\.b    IN A   192.0.2.50
                         salt, iterations, ..
                     } => {
                         let hash = nsec3_hash_name(name.as_ref(), salt, *iterations).unwrap();
-                        let owner = nsec3_owner_name_at(&hash, nm(ORIGIN).as_ref()).unwrap();
+                        let owner = nsec3_owner_name_at(hash, nm(ORIGIN).as_ref()).unwrap();
                         let Some(nsec3) = nsec3s.iter().find(|n| n.owner == owner) else {
                             panic!("{chain:?}: no NSEC3 for {name}");
                         };
@@ -1492,7 +1492,7 @@ a\.b    IN A   192.0.2.50
             unreachable!()
         };
         let hash = nsec3_hash_name(nm(ORIGIN).as_ref(), &salt, iterations).unwrap();
-        let owner = nsec3_owner_name_at(&hash, nm(ORIGIN).as_ref()).unwrap();
+        let owner = nsec3_owner_name_at(hash, nm(ORIGIN).as_ref()).unwrap();
         let apex = nsec3s
             .iter()
             .find(|n| n.owner == owner)

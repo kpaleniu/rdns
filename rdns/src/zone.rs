@@ -1,4 +1,5 @@
 use crate::denial_wire::{base32hex_decode, canonical_sort_key, CanonicalKey};
+use crate::dnssec_denial::Nsec3Hash;
 use crate::record_types as rt;
 use crate::Class;
 use crate::Rtype;
@@ -8,7 +9,6 @@ use crate::{Name, NameRef, Qtype, RecordData, ResourceRecord};
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Bound;
 
 mod checks;
 mod parse;
@@ -59,7 +59,7 @@ pub struct Zone {
     /// Ordered, where the name index is not, because a denial asks a range
     /// question: which record's span contains this name.
     nsec_chain: BTreeMap<CanonicalKey, usize>,
-    nsec3_chain: BTreeMap<Vec<u8>, usize>,
+    nsec3_chain: BTreeMap<Nsec3Hash, usize>,
     /// The per-query ancestor walks this zone can skip. See [`Shortcuts`].
     shortcuts: Shortcuts,
 }
@@ -174,12 +174,13 @@ pub enum NameKind {
 /// Which of the two chains a denial record belongs to.
 /// Where a denial record belongs, carrying the key of the chain it belongs to.
 ///
-/// As `(Chain, Vec<u8>)` the tuple's second element meant whichever the first
-/// element said — a name in RFC 4034 §6.1 order or an RFC 5155 owner hash
-/// (`TODO.md` #40a).
+/// The two keys are different encodings of different things — one a name in
+/// RFC 4034 §6.1 order, the other an RFC 5155 owner hash — and as
+/// `(Chain, Vec<u8>)` the tuple's second element meant whichever the first
+/// element said (`CLAUDE.md` §2, `TODO.md` #40a).
 enum ChainKey {
     Nsec(CanonicalKey),
-    Nsec3(Vec<u8>),
+    Nsec3(Nsec3Hash),
 }
 
 impl Zone {
@@ -290,12 +291,10 @@ impl Zone {
     }
 
     /// The NSEC3 whose span contains `hash`. Same rule, in hash order.
-    pub fn nsec3_covering(&self, hash: &[u8]) -> Option<&ZoneRecord> {
-        // `..hash`, not `..hash.to_vec()`: the bound only has to compare, and
-        // the copy was an allocation per covering lookup.
+    pub fn nsec3_covering(&self, hash: Nsec3Hash) -> Option<&ZoneRecord> {
         let position = self
             .nsec3_chain
-            .range::<[u8], (Bound<&[u8]>, Bound<&[u8]>)>((Bound::Unbounded, Bound::Excluded(hash)))
+            .range(..hash)
             .next_back()
             .or_else(|| self.nsec3_chain.iter().next_back())?;
         Some(&self.records[*position.1])
@@ -316,9 +315,8 @@ impl Zone {
                 // taken as octets rather than by splitting text on a `.` that
                 // may be inside one.
                 let label = record.name.as_ref().labels().next()?;
-                Some(ChainKey::Nsec3(
-                    base32hex_decode(std::str::from_utf8(label).ok()?).ok()?,
-                ))
+                let decoded = base32hex_decode(std::str::from_utf8(label).ok()?).ok()?;
+                Some(ChainKey::Nsec3(Nsec3Hash::from_wire(&decoded)?))
             }
             _ => None,
         }

@@ -2513,7 +2513,11 @@ this line has no record and is skipped
         };
 
         let encloser = nsec3_hash(zone, &salt, iterations).expect("hash the encloser");
-        let matching = nsec3(&encloser, &[0xff; 20], &[rt::SOA, rt::NS, rt::RRSIG]);
+        let matching = nsec3(
+            encloser.as_bytes(),
+            &[0xff; 20],
+            &[rt::SOA, rt::NS, rt::RRSIG],
+        );
         let covering = nsec3(&[0x00; 20], &[0xff; 20], &[rt::RRSIG]);
 
         let soa_sig = auth.sign_records(std::slice::from_ref(&soa));

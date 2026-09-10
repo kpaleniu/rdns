@@ -15,7 +15,7 @@
 //! wire. What is left allocating is the names looked up *by* — the folded QNAME,
 //! an NSEC3 owner per candidate, `*.<encloser>` — and the lookups' own keys.
 
-use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, NSEC3_HASH_LEN};
+use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, Nsec3Hash};
 use crate::error::WireError;
 use crate::record_types as rt;
 use crate::response::{ResponseWriter, Section};
@@ -389,12 +389,12 @@ impl<'a> Nsec3Chain<'a> {
         Some(Nsec3Chain { salt, iterations })
     }
 
-    fn hash(&self, name: NameRef<'_>) -> Option<[u8; NSEC3_HASH_LEN]> {
+    fn hash(&self, name: NameRef<'_>) -> Option<Nsec3Hash> {
         nsec3_hash_name(name, self.salt, self.iterations).ok()
     }
 
     fn owner(&self, zone: &Zone, name: NameRef<'_>) -> Option<Name> {
-        nsec3_owner_name_at(&self.hash(name)?, zone.origin()).ok()
+        nsec3_owner_name_at(self.hash(name)?, zone.origin()).ok()
     }
 
     /// The chain and the closest encloser of `qname` — what every NSEC3 proof
@@ -466,7 +466,7 @@ impl<'a> Nsec3Chain<'a> {
         let Some(hash) = self.hash(name) else {
             return Ok(());
         };
-        let Some(record) = zone.nsec3_covering(&hash) else {
+        let Some(record) = zone.nsec3_covering(hash) else {
             return Ok(());
         };
         push_with_signatures(zone, record, written, w).map(drop)

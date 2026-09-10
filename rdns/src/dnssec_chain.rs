@@ -728,7 +728,7 @@ fn denial_rrsets(evidence: &DelegationEvidence) -> Vec<(Name, Rtype, Vec<RecordD
             flags: nsec3.flags,
             iterations: nsec3.iterations,
             salt: nsec3.salt.clone(),
-            next_hashed_owner: nsec3.next_hashed_owner.clone(),
+            next_hashed_owner: nsec3.next_hashed_owner.as_bytes().to_vec(),
             type_bitmap: nsec3.type_bitmap.clone(),
         })
         .expect("an NSEC3 we parsed must re-encode");

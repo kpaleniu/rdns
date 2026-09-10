@@ -18,7 +18,9 @@
 use crate::clock::current_unix_timestamp;
 use crate::denial_wire::{canonical_sort_key, CanonicalKey};
 use crate::dnssec::{signed_owner_name, Rrsig};
-use crate::dnssec_denial::{proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Params};
+use crate::dnssec_denial::{
+    proves_nodata, proves_nxdomain, Denial, Nsec, Nsec3, Nsec3Hash, Nsec3Params,
+};
 use crate::eviction::Halving;
 use crate::record_types as rt;
 use crate::NameRef;
@@ -27,7 +29,6 @@ use crate::Rtype;
 use crate::Ttl;
 use crate::{DnsMessage, Name, ParsedRecord, ResourceRecord, ResponseCode};
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Bound;
 use std::sync::Mutex;
 
 /// Query types we will not answer from a gap.
@@ -45,7 +46,7 @@ struct ZoneProofs {
     /// whose range could contain a name is one range query away.
     nsecs: BTreeMap<CanonicalKey, CachedProof<Nsec>>,
     /// NSEC3 records by owner hash, which is already ordered by plain bytes.
-    nsec3s: BTreeMap<Vec<u8>, CachedProof<Nsec3>>,
+    nsec3s: BTreeMap<Nsec3Hash, CachedProof<Nsec3>>,
     /// The zone's SOA and its signatures. A negative answer must carry it
     /// (RFC 2308 §2.1), and its MINIMUM bounds how long the answer may live.
     soa: Option<CachedSoa>,
@@ -246,7 +247,7 @@ impl NsecCache {
                         continue;
                     }
                     let ttl = rr.ttl.capped_at(MAX_PROOF_TTL as u32).as_u64();
-                    let key = nsec3.owner_hash.clone();
+                    let key = nsec3.owner_hash;
                     let records =
                         records_covering(&response.authorities, nsec3.owner.as_ref(), rt::NSEC3);
                     insert_bounded(
@@ -575,12 +576,12 @@ impl ZoneProofs {
     /// The live NSEC3 whose owner hash *is* `hash`.
     fn matching_nsec3(
         &self,
-        hash: &[u8],
+        hash: Nsec3Hash,
         params: &Nsec3Params,
         now: u64,
     ) -> Option<&CachedProof<Nsec3>> {
         self.nsec3s
-            .get(hash)
+            .get(&hash)
             .filter(|c| c.live(now) && c.proof.params() == *params)
     }
 
@@ -592,14 +593,14 @@ impl ZoneProofs {
     /// chains share this map and have different predecessors.
     fn covering_nsec3(
         &self,
-        hash: &[u8],
+        hash: Nsec3Hash,
         params: &Nsec3Params,
         now: u64,
     ) -> Option<&CachedProof<Nsec3>> {
         let usable = |c: &&CachedProof<Nsec3>| c.live(now) && c.proof.params() == *params;
         let candidate = self
             .nsec3s
-            .range::<[u8], _>((Bound::Unbounded, Bound::Excluded(hash)))
+            .range(..hash)
             .rev()
             .map(|(_, v)| v)
             .find(usable)
@@ -637,7 +638,7 @@ impl ZoneProofs {
             let Ok(hash) = params.hash(qname) else {
                 continue;
             };
-            let Some(cached) = self.matching_nsec3(&hash, &params, now) else {
+            let Some(cached) = self.matching_nsec3(hash, &params, now) else {
                 continue;
             };
             if cached.proof.has_type(rt::NS) && !cached.proof.has_type(rt::SOA) && !qtype.is(rt::DS)
@@ -737,7 +738,7 @@ impl ZoneProofs {
         let mut encloser = None;
         loop {
             let hash = params.hash(candidate).ok()?;
-            if let Some(cached) = self.matching_nsec3(&hash, params, now) {
+            if let Some(cached) = self.matching_nsec3(hash, params, now) {
                 // A record at the name itself says it exists: nothing to deny.
                 if depth == qlabels {
                     return None;
@@ -763,15 +764,15 @@ impl ZoneProofs {
 
         // The next closer name must be absent...
         let hash = params.hash(next_closer).ok()?;
-        push_unique(&mut candidates, self.covering_nsec3(&hash, params, now)?);
+        push_unique(&mut candidates, self.covering_nsec3(hash, params, now)?);
 
         // ...and the wildcard at the encloser must be accounted for, whether by
         // being absent or by existing and not having been expanded.
         let wildcard = Name::prefixed(b"*", encloser_name).ok()?;
         let hash = params.hash(wildcard.as_ref()).ok()?;
         let accounted = self
-            .matching_nsec3(&hash, params, now)
-            .or_else(|| self.covering_nsec3(&hash, params, now))?;
+            .matching_nsec3(hash, params, now)
+            .or_else(|| self.covering_nsec3(hash, params, now))?;
         push_unique(&mut candidates, accounted);
 
         Some(Gathered {
@@ -1044,14 +1045,14 @@ mod tests {
             // at 0xff, so it wraps around nothing and contains nothing. A hash
             // already ending in 0xff would make the range empty *and* wrapped,
             // which covers everything instead.
-            if *hash.last().unwrap() == 0xff {
+            if *hash.as_bytes().last().unwrap() == 0xff {
                 continue;
             }
-            let mut next = hash.clone();
+            let mut next = hash.as_bytes().to_vec();
             *next.last_mut().unwrap() = 0xff;
             authority.push(nsec3_span(
                 "example.com.",
-                &hash,
+                hash.as_bytes(),
                 &next,
                 &[rt::A],
                 Ttl::from_secs(3600),
@@ -1473,13 +1474,13 @@ mod tests {
     /// the same hash with its last octet at 0x00 and at 0xff.
     fn span_around(name: &str) -> (Vec<u8>, Vec<u8>) {
         let hash = nsec3_hash(name, &NSEC3_SALT, NSEC3_ITERATIONS).unwrap();
-        let last = *hash.last().unwrap();
+        let last = *hash.as_bytes().last().unwrap();
         assert!(
             last != 0x00 && last != 0xff,
             "{name} hashes to something this fixture cannot bracket"
         );
-        let mut owner = hash.clone();
-        let mut next = hash;
+        let mut owner = hash.as_bytes().to_vec();
+        let mut next = hash.as_bytes().to_vec();
         *owner.last_mut().unwrap() = 0x00;
         *next.last_mut().unwrap() = 0xff;
         (owner, next)
@@ -1490,7 +1491,10 @@ mod tests {
     ///
     /// The shape a scan and a map lookup could disagree about in silence.
     fn cache_with_an_nsec3_chain() -> NsecCache {
-        let apex = nsec3_hash("example.com.", &[0xaa, 0xbb], 3).unwrap();
+        let apex = nsec3_hash("example.com.", &[0xaa, 0xbb], 3)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
         let mut apex_next = apex.clone();
         *apex_next.last_mut().unwrap() = apex.last().unwrap().wrapping_add(1);
         let (nope_owner, nope_next) = span_around("nope.example.com.");
@@ -1562,7 +1566,10 @@ mod tests {
     /// name is not proved absent (RFC 5155 §8.4).
     #[test]
     fn test_nsec3_nxdomain_needs_the_wildcard_accounted_for() {
-        let apex = nsec3_hash("example.com.", &[0xaa, 0xbb], 3).unwrap();
+        let apex = nsec3_hash("example.com.", &[0xaa, 0xbb], 3)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
         let mut apex_next = apex.clone();
         *apex_next.last_mut().unwrap() = apex.last().unwrap().wrapping_add(1);
         let (nope_owner, nope_next) = span_around("nope.example.com.");

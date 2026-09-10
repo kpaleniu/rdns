@@ -39,12 +39,12 @@ pub const NSEC3_HASH_LEN: usize = 20;
 /// zone index folds to. It was spelled out per module as
 /// `format!("{}.{origin}", base32hex_encode(h).to_lowercase())` — three
 /// allocations where one does, and a Unicode fold over ASCII (CLAUDE.md §8).
-pub fn nsec3_owner_name_at(hash: &[u8], origin: NameRef<'_>) -> WireResult<Name> {
+pub fn nsec3_owner_name_at(hash: Nsec3Hash, origin: NameRef<'_>) -> WireResult<Name> {
     // The label is base32hex of a 20-octet SHA-1 digest — 32 characters, so it
     // fits a label and needs no heap of its own. Building the name directly
     // skips a `String` and a re-parse of text this already knows the shape of.
     let mut label = [0u8; 32];
-    let len = encode_base32hex_in(hash, BASE32HEX_LOWER, &mut label);
+    let len = encode_base32hex_in(hash.as_bytes(), BASE32HEX_LOWER, &mut label);
     Name::prefixed(&label[..len], origin)
 }
 
@@ -67,8 +67,8 @@ pub fn nsec3_owner_name(hash: &[u8], origin: &str) -> String {
 ///
 /// The salt is appended at every round, and round zero's input is the down-cased
 /// *wire-format* name, not its text.
-pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Vec<u8>> {
-    Ok(nsec3_hash_in(name, salt, iterations)?.to_vec())
+pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Nsec3Hash> {
+    nsec3_hash_in(name, salt, iterations)
 }
 
 /// [`nsec3_hash`] without allocating.
@@ -77,11 +77,7 @@ pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Vec<
 /// octets and neither it nor the wire name it starts from needs the heap. The
 /// closest-encloser walk hashes a name per label of the QNAME and each
 /// iteration used to rebuild the digest as a fresh `Vec`.
-pub fn nsec3_hash_in(
-    name: &str,
-    salt: &[u8],
-    iterations: u16,
-) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
+pub fn nsec3_hash_in(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Nsec3Hash> {
     // Into the stack: §8.3's walk hashes a name per label of the QNAME and
     // keeps none of them, so this is the one place presentation text is read
     // without building a `Name`.
@@ -96,11 +92,7 @@ pub fn nsec3_hash_in(
 /// The closest-encloser walk hashes one name per label of the QNAME, and going
 /// through presentation text cost a `String` per candidate for a round trip
 /// back to the octets already at hand.
-pub fn nsec3_hash_name(
-    name: NameRef<'_>,
-    salt: &[u8],
-    iterations: u16,
-) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
+pub fn nsec3_hash_name(name: NameRef<'_>, salt: &[u8], iterations: u16) -> DnssecResult<Nsec3Hash> {
     let wire = name.as_wire();
     let mut buf = [0u8; MAX_NAME_LEN];
     // `NameRef` cannot exceed RFC 1035 §2.3.4's limit, so this cannot overrun.
@@ -109,7 +101,7 @@ pub fn nsec3_hash_name(
 }
 
 /// `wire` is down-cased in place, so it is taken by value rather than shared.
-fn hash_wire(wire: &mut [u8], salt: &[u8], iterations: u16) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
+fn hash_wire(wire: &mut [u8], salt: &[u8], iterations: u16) -> DnssecResult<Nsec3Hash> {
     if iterations > MAX_NSEC3_ITERATIONS {
         return Err(DnssecError::parse(format!(
             "NSEC3 iteration count {iterations} exceeds the {MAX_NSEC3_ITERATIONS} we will compute (RFC 9276)",
@@ -131,7 +123,7 @@ fn hash_wire(wire: &mut [u8], salt: &[u8], iterations: u16) -> DnssecResult<[u8;
         hasher.update(salt);
         digest.copy_from_slice(&hasher.finalize());
     }
-    Ok(digest)
+    Ok(Nsec3Hash(digest))
 }
 
 /// An NSEC record and the name it sits at.
@@ -205,7 +197,7 @@ pub struct Nsec3Params<'a> {
 
 impl Nsec3Params<'_> {
     /// The hash of `name` under these parameters.
-    pub fn hash(&self, name: NameRef<'_>) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
+    pub fn hash(&self, name: NameRef<'_>) -> DnssecResult<Nsec3Hash> {
         if self.hash_algorithm != SHA1_HASH_ALGORITHM {
             return Err(DnssecError::parse(format!(
                 "unsupported NSEC3 hash algorithm {}",
@@ -216,19 +208,41 @@ impl Nsec3Params<'_> {
     }
 }
 
+/// The 20 octets RFC 5155 §5 hashes a name to, and the only length one can be.
+///
+/// SHA-1 is the only algorithm IANA has registered for NSEC3 and [`Nsec3`]
+/// refuses any other, so a hash of another length is not a short hash — it is
+/// not a hash. As a `Vec<u8>` it was a heap allocation per map key for 20 bytes,
+/// and a wrong length from a remote record was stored and then silently never
+/// matched, which is what `covers` carried an `is_empty()` guard for
+/// (`TODO.md` #40a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Nsec3Hash([u8; NSEC3_HASH_LEN]);
+
+impl Nsec3Hash {
+    /// The hash these octets are, if they are the right number of them.
+    pub fn from_wire(bytes: &[u8]) -> Option<Nsec3Hash> {
+        Some(Nsec3Hash(bytes.try_into().ok()?))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// An NSEC3 record, with its owner hash decoded out of the first label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nsec3 {
     pub owner: Name,
     /// The hash in the owner's first label, decoded from base32hex.
-    pub owner_hash: Vec<u8>,
+    pub owner_hash: Nsec3Hash,
     /// Everything after that label — the zone the NSEC3 belongs to.
     pub zone: Name,
     pub hash_algorithm: u8,
     pub flags: u8,
     pub iterations: u16,
     pub salt: Vec<u8>,
-    pub next_hashed_owner: Vec<u8>,
+    pub next_hashed_owner: Nsec3Hash,
     pub type_bitmap: Vec<u8>,
 }
 
@@ -243,7 +257,8 @@ impl Nsec3 {
         let owner = rr.name.as_ref().to_folded();
         let first = owner.as_ref().labels().next()?;
         let zone = owner.as_ref().parent()?.to_owned();
-        let owner_hash = base32hex_decode(std::str::from_utf8(first).ok()?).ok()?;
+        let owner_hash =
+            Nsec3Hash::from_wire(&base32hex_decode(std::str::from_utf8(first).ok()?).ok()?)?;
         match rr.rdata.parse().ok()? {
             ParsedRecord::NSEC3 {
                 hash_algorithm,
@@ -260,7 +275,10 @@ impl Nsec3 {
                 flags,
                 iterations,
                 salt,
-                next_hashed_owner,
+                // RFC 5155 §3.1.7 gives this an explicit length octet, so a
+                // record can name a length the algorithm does not produce. It
+                // is refused here rather than kept and never matched.
+                next_hashed_owner: Nsec3Hash::from_wire(&next_hashed_owner)?,
                 type_bitmap,
             }),
             _ => None,
@@ -284,7 +302,7 @@ impl Nsec3 {
     }
 
     /// The hash of `name` under this record's parameters.
-    pub fn hash(&self, name: NameRef<'_>) -> DnssecResult<[u8; NSEC3_HASH_LEN]> {
+    pub fn hash(&self, name: NameRef<'_>) -> DnssecResult<Nsec3Hash> {
         self.params().hash(name)
     }
 
@@ -292,24 +310,21 @@ impl Nsec3 {
     ///
     /// The caller owns the check that [`Nsec3::params`] agree; a hash under other
     /// parameters answers a different question.
-    fn matches_hash(&self, hash: &[u8]) -> bool {
+    fn matches_hash(&self, hash: Nsec3Hash) -> bool {
         hash == self.owner_hash
     }
 
     /// Whether this NSEC3 is the record *for* `name`.
     pub fn matches(&self, name: NameRef<'_>) -> DnssecResult<bool> {
-        Ok(self.matches_hash(&self.hash(name)?))
+        Ok(self.matches_hash(self.hash(name)?))
     }
 
     /// Whether `hash` falls strictly inside this record's span, on the same terms
     /// as `Nsec3::matches_hash`.
-    pub fn covers_hash(&self, hash: &[u8]) -> bool {
-        if hash.is_empty() || self.owner_hash.is_empty() || self.next_hashed_owner.is_empty() {
-            return false;
-        }
-        let after = hash > self.owner_hash.as_slice();
-        let before = hash < self.next_hashed_owner.as_slice();
-        if self.next_hashed_owner.as_slice() > self.owner_hash.as_slice() {
+    pub fn covers_hash(&self, hash: Nsec3Hash) -> bool {
+        let after = hash > self.owner_hash;
+        let before = hash < self.next_hashed_owner;
+        if self.next_hashed_owner > self.owner_hash {
             after && before
         } else {
             // The last NSEC3 wraps around to the first.
@@ -319,7 +334,7 @@ impl Nsec3 {
 
     /// Whether `name`'s hash falls strictly inside this record's span.
     pub fn covers(&self, name: NameRef<'_>) -> DnssecResult<bool> {
-        Ok(self.covers_hash(&self.hash(name)?))
+        Ok(self.covers_hash(self.hash(name)?))
     }
 
     pub fn has_type(&self, rtype: Rtype) -> bool {
@@ -337,7 +352,7 @@ struct NameHash<'a> {
     name: NameRef<'a>,
     /// The parameters `hash` was computed under, and the hash. Replaced whenever
     /// a record's parameters differ.
-    computed: Option<(Nsec3Params<'a>, [u8; NSEC3_HASH_LEN])>,
+    computed: Option<(Nsec3Params<'a>, Nsec3Hash)>,
 }
 
 impl<'a> NameHash<'a> {
@@ -348,13 +363,13 @@ impl<'a> NameHash<'a> {
         }
     }
 
-    fn under<'r: 'a>(&mut self, record: &'r Nsec3) -> DnssecResult<&[u8]> {
+    fn under<'r: 'a>(&mut self, record: &'r Nsec3) -> DnssecResult<Nsec3Hash> {
         let params = record.params();
         match &self.computed {
             Some((have, _)) if *have == params => {}
             _ => self.computed = Some((params, params.hash(self.name)?)),
         }
-        Ok(&self.computed.as_ref().expect("just filled").1)
+        Ok(self.computed.as_ref().expect("just filled").1)
     }
 
     fn matches<'r: 'a>(&mut self, record: &'r Nsec3) -> DnssecResult<bool> {
@@ -889,14 +904,14 @@ mod tests {
         let salt = [0xaa, 0xbb, 0xcc, 0xdd];
         let hash = nsec3_hash("a.example.", &salt, 12).unwrap();
         assert_eq!(
-            base32hex_encode(&hash).to_lowercase(),
+            base32hex_encode(hash.as_bytes()).to_lowercase(),
             "35mthgpgcu1qg68fab165klnsnk3dpvl"
         );
 
         // And the apex itself.
         let hash = nsec3_hash("example.", &salt, 12).unwrap();
         assert_eq!(
-            base32hex_encode(&hash).to_lowercase(),
+            base32hex_encode(hash.as_bytes()).to_lowercase(),
             "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom"
         );
     }
@@ -907,7 +922,7 @@ mod tests {
         let base = nsec3_hash("a.example.", &[], 0).unwrap();
         assert_ne!(base, nsec3_hash("a.example.", &[0xaa], 0).unwrap());
         assert_ne!(base, nsec3_hash("a.example.", &[], 1).unwrap());
-        assert_eq!(base.len(), 20, "SHA-1 output");
+        assert_eq!(base.as_bytes().len(), 20, "SHA-1 output");
         // Case does not: the name is down-cased first.
         assert_eq!(base, nsec3_hash("A.Example.", &[], 0).unwrap());
     }
@@ -1318,8 +1333,9 @@ mod tests {
     /// An NSEC3 matching `name` and covering nothing — its span is the empty
     /// interval above its own hash, so it cannot stand in for a covering record.
     fn nsec3_matching(name: &str, types: &[Rtype]) -> Nsec3 {
-        let mut n = nsec3("example.com.", name, &[], 0, types);
-        n.next_hashed_owner = hash_step(&n.owner_hash, true);
+        // Overwritten on the next line; a hash is 20 octets even as a placeholder.
+        let mut n = nsec3("example.com.", name, &[0; NSEC3_HASH_LEN], 0, types);
+        n.next_hashed_owner = hash_step(n.owner_hash, true);
         n
     }
 
@@ -1328,23 +1344,23 @@ mod tests {
     /// it by luck.
     fn nsec3_span_around(name: &str, flags: u8) -> Nsec3 {
         let hash = nsec3_hash(name, &NSEC3_SALT, NSEC3_ITERATIONS).expect("hash");
-        let low = hash_step(&hash, false);
+        let low = hash_step(hash, false);
         Nsec3 {
-            owner: nsec3_owner_name_at(&low, nm("example.com.").as_ref()).unwrap(),
+            owner: nsec3_owner_name_at(low, nm("example.com.").as_ref()).unwrap(),
             owner_hash: low,
             zone: nm("example.com."),
             hash_algorithm: 1,
             flags,
             iterations: NSEC3_ITERATIONS,
             salt: NSEC3_SALT.to_vec(),
-            next_hashed_owner: hash_step(&hash, true),
+            next_hashed_owner: hash_step(hash, true),
             type_bitmap: build_type_bitmap(&[rt::A]),
         }
     }
 
     /// A hash one step up or down as the big-endian number it is compared as.
-    fn hash_step(hash: &[u8], up: bool) -> Vec<u8> {
-        let mut out = hash.to_vec();
+    fn hash_step(hash: Nsec3Hash, up: bool) -> Nsec3Hash {
+        let mut out = hash.as_bytes().to_vec();
         for byte in out.iter_mut().rev() {
             if up {
                 *byte = byte.wrapping_add(1);
@@ -1358,7 +1374,12 @@ mod tests {
                 }
             }
         }
-        out
+        Nsec3Hash::from_wire(&out).expect("a stepped hash is still 20 octets")
+    }
+
+    /// Every octet the same, for a fixture that only needs an ordering.
+    fn test_hash(byte: u8) -> Nsec3Hash {
+        Nsec3Hash::from_wire(&[byte; NSEC3_HASH_LEN]).expect("20 octets")
     }
 
     #[test]
@@ -1393,13 +1414,13 @@ mod tests {
         // A span covering everything: owner hash all zeros, next all ones.
         let covering = |flags: u8| Nsec3 {
             owner: nm("00000000000000000000000000000000.example.com."),
-            owner_hash: vec![0x00; 20],
+            owner_hash: test_hash(0x00),
             zone: nm("example.com."),
             hash_algorithm: 1,
             flags,
             iterations: NSEC3_ITERATIONS,
             salt: NSEC3_SALT.to_vec(),
-            next_hashed_owner: vec![0xff; 20],
+            next_hashed_owner: test_hash(0xff),
             type_bitmap: build_type_bitmap(&[rt::NS]),
         };
 
@@ -1414,13 +1435,60 @@ mod tests {
         );
     }
 
+    /// A hash of the wrong length is not a short hash, it is not a hash.
+    ///
+    /// RFC 5155 registers one algorithm, SHA-1, and this refuses any other — so
+    /// 20 octets is the only length either hash in the record can have. Both
+    /// come off the wire under a remote party's control: the owner's first label
+    /// is base32hex of whatever they put there, and §3.1.7 gives
+    /// `next_hashed_owner` an explicit length octet. Before `Nsec3Hash`
+    /// (`TODO.md` #40a) a wrong length parsed, went into the cache, and then
+    /// matched nothing for as long as it lived, which is what `covers_hash`
+    /// carried an `is_empty()` guard for.
+    #[test]
+    fn an_nsec3_whose_hashes_are_the_wrong_length_is_refused() {
+        use crate::ParsedRecord;
+
+        let good = |owner_hash: &[u8], next: Vec<u8>| crate::ResourceRecord {
+            name: nm(&format!("{}.example.com.", base32hex_encode(owner_hash))),
+            class: Class::new(1),
+            ttl: Ttl::from_secs(3600),
+            rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
+                hash_algorithm: 1,
+                flags: 0,
+                iterations: 3,
+                salt: vec![0xde, 0xad],
+                next_hashed_owner: next,
+                type_bitmap: build_type_bitmap(&[rt::A]),
+            })
+            .unwrap(),
+        };
+
+        assert!(
+            Nsec3::from_record(&good(&[0x11; NSEC3_HASH_LEN], vec![0xff; NSEC3_HASH_LEN]))
+                .is_some(),
+            "20 octets either side is the record that should parse"
+        );
+        assert!(
+            Nsec3::from_record(&good(&[0x11; 17], vec![0xff; NSEC3_HASH_LEN])).is_none(),
+            "a 17-octet owner label is not an owner hash"
+        );
+        assert!(
+            Nsec3::from_record(&good(&[0x11; NSEC3_HASH_LEN], vec![0xff; 21])).is_none(),
+            "nor is a 21-octet next hashed owner"
+        );
+    }
+
     #[test]
     fn test_nsec3_record_parses_its_owner_hash() {
         use crate::ParsedRecord;
         let salt = vec![0xde, 0xad];
         let hash = nsec3_hash("child.example.com.", &salt, 3).unwrap();
         let rr = crate::ResourceRecord {
-            name: nm(&format!("{}.example.com.", base32hex_encode(&hash))),
+            name: nm(&format!(
+                "{}.example.com.",
+                base32hex_encode(hash.as_bytes())
+            )),
             class: Class::new(1),
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
@@ -1428,7 +1496,7 @@ mod tests {
                 flags: 1,
                 iterations: 3,
                 salt: salt.clone(),
-                next_hashed_owner: vec![0xff; 20],
+                next_hashed_owner: vec![0xff; NSEC3_HASH_LEN],
                 type_bitmap: build_type_bitmap(&[rt::NS]),
             })
             .unwrap(),
@@ -1448,13 +1516,13 @@ mod tests {
     fn test_hostile_nsec3_iterations_are_refused() {
         let n = Nsec3 {
             owner: nm("aaaa.example.com."),
-            owner_hash: vec![0x00; 20],
+            owner_hash: test_hash(0x00),
             zone: nm("example.com."),
             hash_algorithm: 1,
             flags: 0,
             iterations: u16::MAX,
             salt: vec![0xff; 32],
-            next_hashed_owner: vec![0xff; 20],
+            next_hashed_owner: test_hash(0xff),
             type_bitmap: build_type_bitmap(&[rt::NS]),
         };
         assert!(n.matches(nm("child.example.com.").as_ref()).is_err());
@@ -1522,8 +1590,8 @@ mod tests {
         rdata.extend_from_slice(&usable.iterations.to_be_bytes());
         rdata.push(usable.salt.len() as u8);
         rdata.extend_from_slice(&usable.salt);
-        rdata.push(usable.next_hashed_owner.len() as u8);
-        rdata.extend_from_slice(&usable.next_hashed_owner);
+        rdata.push(usable.next_hashed_owner.as_bytes().len() as u8);
+        rdata.extend_from_slice(usable.next_hashed_owner.as_bytes());
         rdata.extend_from_slice(&usable.type_bitmap);
 
         let rr = ResourceRecord {
