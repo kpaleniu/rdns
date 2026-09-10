@@ -766,6 +766,13 @@ taken, as #38.
   correct number was 911 and the only way to know was to check out the commit
   and run it. §1 and §4 say this about the code; it is just as true of the
   message.
+- **A number with the wrong remedy attached is a cost, not a placeholder.**
+  File what you saw; file the fix only if you checked it. #39e named a
+  `Handler::State` per connection that the per-message spawn makes impossible,
+  and #40b named a sweep of a key type that was the right one already. Both
+  observations were sound. Somebody implements what the row says, so a row that
+  names no remedy is cheaper than one that names a wrong remedy — and §19 is
+  how to tell which you have.
 - **"Done" is the whole request, not its interesting half.** When part of a task
   turns out to be bigger than the rest, finish everything that does not depend
   on it, then file the part that does with the measurement that would let
@@ -776,3 +783,51 @@ The check that catches all of this before a commit: read the request back as a
 list of sentences and answer each one with either a diff or a number. That is
 also the shape a session should report in — what was done, what was measured,
 what was filed and under which number.
+
+---
+
+## 19. Take the measurement that could refute the finding
+
+#40 was a measurement that was right and a conclusion that was wrong, twice over
+in one week. The counting was sound — 21 maps keying a name in three
+incompatible encodings, 4 of them typed. What it decided was nothing, and two of
+the conclusions drawn from it were reversed by evidence that was one `grep`
+away. §1 says a test that agrees with the code is not evidence; this is the same
+rule for a review.
+
+- **A measurement that agrees with your finding is not evidence.** Ask which
+  measurement would make the finding *wrong*, and take that one before filing.
+  #40's second measurement — visibility, where 12 of the 14 raw-keyed maps
+  turned out to be private fields — is what showed most of the proposed sweep
+  was uniformity rather than safety, and it took one command.
+- **A claim about a type is a claim about its call sites.** The declaration
+  gives the shape; only the probe gives the job. `(Name, Qtype)` and
+  `NameTypeKey` read as one key spelled twice and are two idioms with a
+  criterion: the denial cache's wildcard probe *builds* its key, so the
+  allocation belongs to the key's shape rather than its type, while the
+  resolver's ancestor walk already holds
+  the octets and would build a `Name` only to throw it away. Both are right.
+  §4's "never state what a function does without opening it", for types.
+- **When the code you are about to call wrong carries a reason, answer it.**
+  `name_keys.rs` states the `Borrow` argument for its own existence; `tcp.rs`'s
+  header says why the handler is a trait and the loop spawns per message. A
+  finding that does not engage the stated reason has not been checked — that is
+  how #39e proposed per-connection state the spawn makes impossible. Where there
+  is no stated reason, *that* is the finding (#40d).
+- **"Missed" and "chosen" are different findings; say which one you verified.**
+  "Missed because it is a tuple rather than a named type" is a guess about
+  somebody's state of mind wearing a measurement's clothes. Write down where the
+  key is built, where it is probed, and what each site has in hand.
+- **When a design choice has two or three shapes, build them.** Arguing costs
+  more than compiling. All three shapes for #39b compiled, linted clean and
+  passed 119 tests, so none of them was settled by whether it worked; the choice
+  turned on things no argument had surfaced — a regression test that *hung*
+  because the send had moved out of the unit under test, a trait method that had
+  to hand back the very type it existed to hide, and a UDP response budget
+  silently applied to TCP with the whole suite still green. #40a went the same
+  way: the option recommended before building was the one that measured out as
+  the one to decline. Build them, keep the patches, put the numbers in the row.
+
+The check: before a row is filed, write the sentence that would make it wrong,
+and go and look. If looking is a `grep` and a function, there is no excuse for
+filing without it.
