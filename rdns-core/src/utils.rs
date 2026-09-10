@@ -380,76 +380,10 @@ pub fn ends_with_root(name: &str) -> bool {
     !bytes.is_empty() && bytes[bytes.len() - 1] == b'.' && separates_labels(bytes, bytes.len() - 1)
 }
 
-/// `name` without its root separator: `example.com.` yields `example.com`, and
-/// the root yields the empty string.
-///
-/// Not `trim_end_matches('.')`, which ate the escaped dot underneath the
-/// separator too and left `foo\..` as a dangling `foo\`.
-fn without_root(name: &str) -> &str {
-    if ends_with_root(name) {
-        &name[..name.len() - 1]
-    } else {
-        name
-    }
-}
-
 /// The byte offsets of `name`'s label separators, left to right.
 fn separators(name: &str) -> impl DoubleEndedIterator<Item = usize> + '_ {
     let bytes = name.as_bytes();
     (0..bytes.len()).filter(move |&i| bytes[i] == b'.' && separates_labels(bytes, i))
-}
-
-/// A name's labels, left to right and still in presentation form. The root has
-/// none.
-///
-/// The one place that knows where a name's labels begin and end, so that no
-/// caller writes `split('.')` and gets `a\.b.com.` wrong. Double-ended, and
-/// linear in either direction: each step scans one label, not the whole name.
-pub fn presentation_labels(name: &str) -> Labels<'_> {
-    let trimmed = without_root(name);
-    Labels {
-        rest: (!trimmed.is_empty()).then_some(trimmed),
-    }
-}
-
-/// [`presentation_labels`]'s iterator. `rest` is what has not been yielded from
-/// either end, and `None` once nothing has.
-pub struct Labels<'a> {
-    rest: Option<&'a str>,
-}
-
-impl<'a> Iterator for Labels<'a> {
-    type Item = &'a str;
-
-    fn next(&mut self) -> Option<&'a str> {
-        let rest = self.rest?;
-        match separators(rest).next() {
-            Some(cut) => {
-                self.rest = Some(&rest[cut + 1..]);
-                Some(&rest[..cut])
-            }
-            None => {
-                self.rest = None;
-                Some(rest)
-            }
-        }
-    }
-}
-
-impl<'a> DoubleEndedIterator for Labels<'a> {
-    fn next_back(&mut self) -> Option<&'a str> {
-        let rest = self.rest?;
-        match separators(rest).next_back() {
-            Some(cut) => {
-                self.rest = Some(&rest[..cut]);
-                Some(&rest[cut + 1..])
-            }
-            None => {
-                self.rest = None;
-                Some(rest)
-            }
-        }
-    }
 }
 
 /// The parent of an absolute name: its first label removed. `None` at the root,
