@@ -46,9 +46,12 @@ half is done and its `rdnsd` half is not~~ ~~**three and a half on 2026-09-10**,
 38b having gone too~~ ~~**two and a half the same day**, 38e having gone as well —
 its cross-crate half decided against rather than done, which the row explains~~
 ~~**one and a half**, 38c having gone too: **38a**, and 38d's `rdnsd` half~~
-**half of one**, 38a having gone as well: 38d's `rdnsd` half is all that is left,
-and it is the one that needs an argument with #20 rather than a session.
-None of them was a defect.
+~~**half of one**, 38a having gone as well: 38d's `rdnsd` half is all that is left,
+and it is the one that needs an argument with #20 rather than a session.~~
+**Half of one, and #39 and #40 on 2026-09-10**: the argument was taken, taking
+it filed the API shape it depends on (#39), and a pass over the joints between
+the internal APIs filed #40. None of #38 was a defect; #39 carries one, #40
+none.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -764,9 +767,12 @@ Four environment traps that have each cost an hour:
 ~~Two sections: **#37**, which is open work, and **#21**, which is an inventory
 rather than a queue.~~ ~~**One section as of 2026-09-08**, #37 having closed the
 day it was filed: **#21**, which is an inventory rather than a queue.~~
-**Two again as of 2026-09-09**: **#38**, whose five open sub-items are cleanups,
-and **#21**, which is an inventory rather than a queue. Everything else numbered
-is under "Closed work" below.
+~~**Two again as of 2026-09-09**: **#38**, whose five open sub-items are cleanups,
+and **#21**, which is an inventory rather than a queue.~~ **Four as of
+2026-09-10**: **#38**, one sub-item of which is left, **#39**, the answering
+path's shape, **#40**, the joints between the internal APIs, and **#21**, which
+is an inventory rather than a queue. Everything
+else numbered is under "Closed work" below.
 
 ### Where to pick up next
 
@@ -794,8 +800,11 @@ behaviour in it: it deleted three things nothing called and found four symbols
 `docs/spec/` names that do not exist), ~~**38b is a small operational gap**~~
 (taken 2026-09-10), and ~~**38e is half an hour**~~ (taken the same day, and it
 was two hours: the count came out at eight instances rather than three) —
-and 38d's other half, `rdnsd`'s fourth seam, is the one #20 already decided
-against once, so it wants an argument rather than a session.
+~~and 38d's other half, `rdnsd`'s fourth seam, is the one #20 already decided
+against once, so it wants an argument rather than a session.~~ **The argument
+was taken 2026-09-10**: the row carries the measurement, and it turned up the
+API shape that decides it — **#39**, one dispatcher instead of two. Take #39
+first; 38d falls out of it.
 
 One candidate named elsewhere on this page, for a session that wants it:
 **SVCB/HTTPS presentation form** was the largest remaining entry in #21's
@@ -824,6 +833,69 @@ whole answer is 522 ns and one `sendto`+`recvfrom` pair is 3.6-4.1 µs, so the
 entire benchmark suite covers about 6% of what a query costs — the context that
 stops a 20% win in it being reported as a 20% win.
 
+
+---
+
+### 40. The internal APIs, asked whether they fit each other — **filed 2026-09-10**
+
+Asked for after #39: a pass over the *joints* rather than the modules — where one
+module hands a value to another, is the type at the joint the right one. Nothing
+here is a live defect; every item is a shape that lets a wrong call compile.
+The measurements are in each row, taken before anything was edited (§18).
+
+| | | |
+|---|---|---|
+| **40a** | three encodings of a name, one type | A name is used as a map key in **21 maps** across 7 modules, in **three incompatible encodings**: folded wire octets (8 maps), RFC 4034 §6.1 canonical sort order (7), and the NSEC3 owner hash (2). Four of the 21 carry a type — `NameKeyBuf`/`NameTypeKey`, which #38a built for the folded meaning; the other 17 are `Vec<u8>`, `Box<[u8]>` or `(Vec<u8>, Rtype)`. The sharpest instance is one file: `zone_signer.rs:348`/`:350` is `BTreeMap<(Vec<u8>, Rtype), _>` keyed by *folded owner*, `:868` is the same type keyed in *canonical order*, and `sign_everything` holds both at once — it builds the canonical-order map at `:889` and calls `previous.reuse` at `:913`, which re-derives a folded key at `:424`. Nothing but the argument type keeps them apart. `nsec_cache::insert_bounded` (`:922`) takes `&mut BTreeMap<Vec<u8>, _>` and is called with both the canonical-order map and the hash map, because at that type they are the same map. §17: newtype them and the wrong one stops compiling everywhere at once. **The limit to respect**: the point of the canonical key is its `Ord`, and `NameKeyBuf`'s `Ord` is byte order over folded wire, which is *not* canonical order — three types, not one, and `Layout`'s doc (`zone_signer.rs:657`) already says why `Name` has no `Ord` at all |
+| **40b** | `(Name, Qtype)` and `NameTypeKey` are one key under two names | `nsec_cache`'s `wildcards` is `HashMap<(Name, Qtype), CachedWildcard>` (`:53`); `cache` and `negative_cache` spell the same key `NameTypeKey`. 38a converted three maps and this is the fourth, missed because it is a tuple rather than a named type and so did not match the shape being counted |
+| **40c** | `Transport` sits one crate above the decision it makes | `rdns_transport::Transport` exists because "one `is_tcp`" was answering three questions (`rdns-transport/src/lib.rs:36-39`), and then `ServeContext::admit` converts it back — `self.validator.validate_packet(packet, transport.is_tcp())` at `:140` — because `rdns_core::validation::Validator::validate_packet` still takes `is_tcp: bool` (`validation.rs:163`). One call site, and the enum has no dependencies, so it can live in `rdns-core` beside the validator and be re-exported where it is now; `is_tcp()` then has no callers |
+| **40d** | twelve library modules state no membership rule | No `//!` anywhere in the file and no doc at the `mod` declaration: `rdns-core/{dname,validation}`, `rdns/{cache,logging,security,zone}`, `rdns/zone/{checks,parse,rdata}` and all three of `rdns/resolver/{caches,recurse,validate}`. #38c's whole fix for `utils` was "seven modules, each stating its membership rule", and #37's argument for a folder is the same argument. Beside it, the inverse: `rdnsd/src/zones.rs:34` documents `ZoneMap` as "keyed by its origin in `rdns::name_keys::NameKeyBuf` form" while the type is `HashMap<Box<[u8]>, Arc<Zone>>`, and `zone_key` (`:44`) exists so "no call site keys on `origin().to_string()`" — an invariant held by a convention and asserted in a doc comment, which §17 says is a claim to verify, not documentation to trust. 40a's fix is what makes it true |
+| **40e** | the tail of #38's `pub` sweep | #38 measured `rdns/src` and narrowed 87 items; it did not look at the other crates. Of the 112 top-level `pub` items in `rdns-core` and `rdns-transport`, **3** are named nowhere outside their own module — `AdmissionLimits` and `ValidationResult` (`rdns-core/src/validation.rs:105`, `:124`) and `listener_failure` (`rdns-transport/src/lib.rs:286`). Small, and the point of recording it is that the sweep was crate-shaped and the crates it skipped are now measured. Beside it, one stale claim: `rdns/src/lib.rs:7` still says `rdns::utils` "names what it always did", and #38c deleted `rdns-core::utils` |
+
+**What this pass checked and found sound**, so the next one need not: the two
+`error` modules are a deliberate joint, not a duplicate — `rdns::error`
+re-exports `rdns_core::error::*` and adds only the two types that need a `tokio`
+`From` impl, and the header says so. `absolute` appears five times and is one
+implementation: `rdns-core::text_names::absolute` plus four aliases, each a
+one-liner whose doc points at it. `rdns-core`'s `lib.rs` already documents the
+`macro_rules!` ordering trap that #39d hit in `rdnsd`. And two of `CLAUDE.md`
+§17's "smells, all currently in this tree" are no longer in it: `num_derive` is
+not a dependency of anything in the workspace, and OPT is a field of
+`DnsMessage` rather than a record in `additionals` — both closed with #13, whose
+row says so. §17's list wants that correction the next time it is opened.
+
+---
+
+### 39. `rdnsd` answers through two dispatchers — **filed 2026-09-10**
+
+Found by taking 38d's measurement: the two items that would not seal are the two
+the root's dispatchers call, so the split is bounded by the answering path's
+shape rather than by where the code sits. `rdnsr` already has the shape this
+asks for — `handle_query` is one dispatcher taking `transport: Transport`, both
+socket loops call it, and `finish` (`rdnsr/src/answer.rs:324`) is the single
+epilogue, shaped by a `Client` (`:64`) carrying the EDNS, the AD wants and the
+size ceiling. `rdnsd` has `Server::answer` (`main.rs:725`, TCP) and
+`Server::answer_datagram` (`:1590`, UDP), the same prologue written twice — the
+UDP copy's own comment says "now literally the same code".
+
+| | | |
+|---|---|---|
+| **39a** | the prologue has drifted, and a counter is the casualty | TCP counts `queries_received` and tracks the qtype at `main.rs:750`/`:752`, *before* the TSIG check at `:757`; UDP does both at `:1666`/`:1668`, *after* the check at `:1641`, which returns early on a rejection. A TSIG-rejected request is a received query over TCP and is not one over UDP, and the qtype histogram gets it on one transport only. §14: a counter's name is a claim about what it counts. The defect in this section; the rest is shape |
+| **39b** | one dispatcher, with the transport as a parameter | What varies across the two loops is three things, each already written twice: the frame (length-prefixed vs bare — the UDP UPDATE path strips the prefix by hand at `main.rs:1676`, `framed.get(2..)`), the ceiling (`u16::MAX` vs `udp_payload_size()`, which #30g recorded as the *only* difference between two copies of the error reply), and the response budget with its TC=1 fallback, which is UDP-only. A sink owning those three is the whole parameter — not `rdnsr`'s `Transport` enum, because `rdnsd`'s TCP path streams a sequence of AXFR envelopes into an `mpsc` while `rdnsr` returns one datagram. **Closing this closes 38d**: with the dispatch inside the module, all nine items seal instead of seven |
+| **39c** | the error reply is one function with a ceiling | `error_bytes`, `truncated_reply`, `send_transfer_error` and `update_reply` — which is `transfer_error` under another name — all build "an empty reply carrying this rcode, at this ceiling, signed if the request was". §7's "two functions building the same kind of message are one function with a parameter", and #30g said the ceiling was the difference. `error_bytes` is stuck in the root today only because both the cluster and the dispatchers call it |
+| **39d** | the two log macros pin the module order | `bad_request!` (`main.rs:90`) and `serving_error!` (`:102`) are `macro_rules!`, so textual scoping forces `mod transfer;` below line 107 — found by hitting it. `pub(crate) use serving_error;` after each makes them ordinary imports, order-independent, without `#[macro_export]` widening them to the crate's public surface |
+
+**Rejected, with the measurement**: a narrower context struct for the transfer
+and UPDATE cluster, on `ZoneContext`'s precedent. The cluster touches 6 of
+`Server`'s 8 fields (`ctx`, `zone_map`, `updates`, `deltas`, `transfer_acl`,
+`journal`), and the two it does not need are the door's (`tsig_keys`) and
+NOTIFY's (`secondaries`). A `TransferContext` would be `Server` minus two
+fields: a rename, not a seal.
+
+**The cost to hold honest.** The UDP dispatcher is the hot path: the ordinary
+answer is sent as a `Cow::Borrowed` straight out of the worker's scratch buffer.
+A sink that forces an owned `Vec` per reply pays an allocation per query.
+`tests/allocations.rs` and `benches/answer_path.rs` are the guards — §17's rule
+that "zero-cost" is a claim about a compiler, not a fact about a diff.
 
 ---
 
@@ -869,7 +941,7 @@ report** — the one defect it turned up (a dropped DO bit) is in the fixed half
 | ~~**38a**~~ | ~~three things still key on folded text~~ **done 2026-09-10** | ~~`negative_cache` (`NameKeyBuf` + `NameTypeKey`), `cache` (`(String, Qtype)` with the `Borrow` trick) and `metrics`’s zone gauges. All three are allocation-free on the lookup path today — `allocations.rs` asserts 0 for a miss in either cache — so the win is uniformity, not speed, and the cost is that `HashMap<Name, _>` cannot be probed by a `NameRef` without the same `dyn` trick these use for `&str`.~~ **That claim was the file’s, not the path’s**: every count in `allocations.rs` hands the cache a `&'static str` already in key form, while `rdnsr` spells the lookup `get(&qname.to_presentation(), qtype)` — measured at 1 allocation per probe, two per query before a resolution and two more on the store. Now 0. The keys are folded wire octets in `rdns-core::name_keys`; `Borrow<[u8]>` needs no `dyn` for the name-only map and no transmute for either; the RFC 8020 ancestor walk is `NameRef::parent()`, which borrows. A name in mixed case costs one allocation for the fold, once for the whole walk. `text_names` keeps only what a zone file needs, `parent_name` and `separators` having lost their last callers |
 | ~~**38b**~~ | ~~a removed zone's journal is never deleted~~ **done 2026-09-10** | ~~`journal::journalled_zones` read the directory "so a journal left by a removed zone is found and cleaned up instead of resurfacing if that zone is ever re-added". Nothing called it: `zones::restore_journals` walks the *zone list* instead, so an orphan journal stays on disk until somebody notices. Deleted with the rest of the dead code rather than left as a function nobody calls; the gap is here because deleting it would otherwise have deleted the finding~~. `journalled_zones` is back as a `Journal` method, and `zones::discard_orphan_journals` deletes what no zone claims, once, at startup. Startup is the whole of it: a reload already forgets the journal of a zone it withdraws, so the only way to leave one behind is to remove the zone while the process is down. The two EXPIRE paths deliberately keep theirs — the copy on disk did not change while contact was lost, so the history still reaches the serial that loads. Under `--allow-partial-load` a zone whose file will not parse loses its journal, which is the right way for it to fail and is written down where it happens |
 | ~~**38c**~~ | ~~`rdns-core::utils` is the crate's miscellany~~ **done 2026-09-10** | ~~783 code lines and seven unrelated things: the RR-type and QTYPE tables, the SVCB parameter keys, hex/base64/character-string codecs, the presentation-name helpers, `bind_addr_for` and `recv_error_is_transient`, the clock, and `dname_redirect` — which is RFC 6672’s substitution rule and not a utility at all. #37d’s argument applies (a name that says what is in it, and private helpers held at `pub(super)`), but the visibility measurement is small: four private items.~~ The measurement that decided it was a different one: **15 of the 30 public items had no caller inside `rdns-core`**, so "shared across the crate", which its doc claimed, was false for half of it. `utils` is deleted. Seven modules, each stating its membership rule: `record_types`, `codecs`, `clock`, `socket`, `text_names` (whose doc says it exists so 38a has something to delete), plus `dname_redirect` to `name`, `rand_id` to `message`, the SvcParamKey tables to `rdns::svcb` and the UDP receive helpers to `rdns-transport`. Along the way: `presentation_labels` and its iterator had no caller anywhere (60 lines), `record_type_code` was `rdata.rtype()` with a function around it, and `test_record_types_constants` asserted `A == A` thirteen times. **And `docs/spec/` named ten `utils::` symbols of which four did not exist** — three from earlier dead-code sweeps, one from this one; `cargo doc` cannot check a Markdown file, which is why they sat there |
-| **38d** | ~~the two daemons are cut on different principles~~ **`rdnsr` split 2026-09-09; `rdnsd`'s half is what is left** | `rdnsd/src/answer.rs` holds the *query* path (391 SLOC) and 559 SLOC of AXFR/IXFR/UPDATE/NOTIFY answering stayed in `main.rs` as `impl Server` — a fourth seam of the kind #20 lifted three of, and #20 said explicitly it was not worth going further, so taking it means arguing with that rather than repeating this. ~~That judgement was never made for **`rdnsr`, which has no modules at all**: 773 SLOC of CLI, the RFC 5011 anchor manager (~180), the answer path, the UDP loop and `main` in one file, and its AD-bit policy spelled out at five call sites.~~ **Done**: `anchors` (the RFC 5011 manager), `answer` (the caches and the answer path), `serve` (the two socket loops) and `testutil`, leaving 300 SLOC of CLI and `main`. Measured the way #37 asks — visibility, not line count — eight items that were visible to the crate root and every descendant — five in `answer`, three in `anchors` — are now module-private, and `Caches`'s three fields have a constructor in front of them; `serve` seals nothing and is the one split made for the seam alone. The AD-bit rule is `finish`'s, once, with a test for all four combinations. 769 non-test SLOC became 813, the difference being four `use` blocks where there was one |
+| **38d** | ~~the two daemons are cut on different principles~~ **`rdnsr` split 2026-09-09; `rdnsd`'s half is what is left** | `rdnsd/src/answer.rs` holds the *query* path (391 SLOC) and 559 SLOC of AXFR/IXFR/UPDATE/NOTIFY answering stayed in `main.rs` as `impl Server` — a fourth seam of the kind #20 lifted three of, and #20 said explicitly it was not worth going further, so taking it means arguing with that rather than repeating this. ~~That judgement was never made for **`rdnsr`, which has no modules at all**: 773 SLOC of CLI, the RFC 5011 anchor manager (~180), the answer path, the UDP loop and `main` in one file, and its AD-bit policy spelled out at five call sites.~~ **Done**: `anchors` (the RFC 5011 manager), `answer` (the caches and the answer path), `serve` (the two socket loops) and `testutil`, leaving 300 SLOC of CLI and `main`. Measured the way #37 asks — visibility, not line count — eight items that were visible to the crate root and every descendant — five in `answer`, three in `anchors` — are now module-private, and `Caches`'s three fields have a constructor in front of them; `serve` seals nothing and is the one split made for the seam alone. The AD-bit rule is `finish`'s, once, with a test for all four combinations. 769 non-test SLOC became 813, the difference being four `use` blocks where there was one. **The measurement #20's judgement was never given, taken 2026-09-10** by doing the split and reverting it: 9 items move (`answer_transfer`, `abandon_transfer`, `send_transfer_error`, `transfer_error`, `answer_update`, `zone_context`, `update_reply`, `UpdateFailure`, `apply_update_to_file`), 411 code lines; `main.rs` non-test code 1692 → 1300, net +19 for the `use` block. **Seven of the nine seal** — the compiler named exactly two, `answer_transfer` and `answer_update`, both called from the root's two dispatchers. Content-preserving: diffed against `HEAD` with the two `pub(super)` markers stripped, zero substantive lines; `cargo test -p rdnsd` 118 before and 118 after, clippy clean (Windows). So the code side of #20's objection comes out in favour, its criterion — an owner and a lifetime — still does not: the module reaches into 6 of `Server`'s 8 fields. **The two that cannot seal are #39's**, which is the prerequisite: with one dispatcher instead of two, all nine seal. The test coupling #20 named is real and unchanged by the move — the tests need not travel, and if they do, 10 of `main.rs`'s 64 and 5 helpers shared with tests that stay |
 | ~~**38e**~~ | ~~the fixtures cannot be shared, so they are written three times~~ **mostly done 2026-09-10; the cross-crate half is decided against** | ~~`test_records` is `#[cfg(test)]`, so `tests/` and `benches/` — separate crates — cannot see it: `query_message` is identical in `benches/answer_path.rs:53`, `tests/allocations.rs` and `tests/no_input_panics.rs`, and `zone_at` in `ixfr.rs` and `journal.rs` in a module that already imports `test_records::nm`. A `testkit` feature gating those modules, or a dev-dependency crate, is the usual answer.~~ Counting first turned up a bigger instance than the one filed: the scratch-directory helper was written **seven times in `rdns`** and once more in `rdnsd`, and three of those removed the directory on the last line of the test body — the line a failing assertion skips — rather than in `Drop`. One per crate now (`rdns::testutil`, `rdnsd::testutil`, `rdns-transport::testutil`), plus `test_records::zone_at`. **The cross-crate half is not done and should not be**: a `testkit` feature is on for every build whose features unify with the tests’, so the fixtures compile into the shipped binaries to spare `tests/`, `benches/` and `examples/` about twenty lines of `nm` and `query_message`. `test_records::nm`’s own doc had already reached that conclusion for `nm`. If it is ever taken up it gets its own number. ~~Beside it: `rdns-transport`, the admission path both daemons’ packets pass through, has **3 tests** for 627 lines~~ — **11 now**: `tcp.rs` had none at all, and the eight are the writer task’s two guarantees, the drain, the abort, the zero-length prefix, the idle timeout, #17’s framing wrap and #30e’s per-connection rate |
 
 **What the review checked and found nothing wrong with**, so the next one need
