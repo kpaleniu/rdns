@@ -1629,9 +1629,17 @@ impl Server {
             }
         };
 
-        // Log successful query parsing
         let qtype = msg.queries.first().map(|q| q.qtype);
         logger.log_query(peer.ip(), qtype, now);
+        // Counted here, before any policy can return: the TCP path has always
+        // done it in this order and this one did it after the TSIG check, so a
+        // rejected request was a received query on one transport and not the
+        // other (`TODO.md` #39a). `dns_queries_received_total` says "queries
+        // received", and a request that fails its MAC arrived.
+        metrics.count(&metrics.queries_received);
+        if let Some(qtype) = qtype {
+            metrics.track_query_type(qtype);
+        }
 
         // A signed query is checked before it is answered, and its answer
         // is signed back (RFC 8945). A rejected one gets NOTAUTH and a
@@ -1660,11 +1668,6 @@ impl Server {
                 return;
             }
         };
-
-        metrics.count(&metrics.queries_received);
-        if let Some(qtype) = qtype {
-            metrics.track_query_type(qtype);
-        }
 
         // An UPDATE over UDP is permitted (RFC 2136 §1) and goes through exactly
         // the same handler as over TCP — the checks, the ordering and the
@@ -2945,6 +2948,67 @@ mod tests {
             query("www.example.com.", Qtype::of(record_types::A), false)
                 .to_bytes_within(4096)
                 .expect("serialize the query")
+        }
+
+        /// A request that fails its TSIG check is still a request that arrived.
+        ///
+        /// The two dispatchers had drifted (`TODO.md` #39a): the TCP path counts
+        /// `queries_received` and the query type before the TSIG check and this
+        /// one counted them after, so a rejected request was a received query on
+        /// one transport and not on the other. The exported name is
+        /// `dns_queries_received_total`, "Total DNS queries received", and a
+        /// request whose MAC does not verify arrived (`CLAUDE.md` §14: a
+        /// counter's name is a claim about what it counts).
+        ///
+        /// Both transports in one test, because the claim is that they agree —
+        /// which is what makes it a test of the *counter* and not of the copy
+        /// #39b will delete. Watched failing against the old order: the UDP half
+        /// read 0.
+        #[tokio::test]
+        async fn a_rejected_tsig_is_a_received_query_on_both_transports() {
+            use std::sync::atomic::Ordering;
+
+            // A key the server does not hold, so `check_request` rejects with
+            // BADKEY before anything can answer.
+            let stranger = TsigKey::new(
+                "stranger.key.",
+                TsigAlgorithm::HmacSha256,
+                b"0123456789012345678901234567890123456789".to_vec(),
+            );
+            let now = tsig::now();
+            let signed = tsig::sign_request(a_query(), &stranger, now).expect("sign the query");
+
+            let over_tcp = server_with(one_record_zone());
+            let peer: SocketAddr = "127.0.0.1:5399".parse().expect("a peer address");
+            let replies = answered(&over_tcp, &signed, peer).await;
+            assert_eq!(replies.len(), 1, "a rejection is still answered, signed");
+
+            let over_udp = server_with(one_record_zone());
+            let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+            let mut scratch = Scratch::default();
+            over_udp
+                .answer_datagram(
+                    &signed,
+                    client.local_addr().expect("addr"),
+                    &socket,
+                    &mut scratch,
+                    now,
+                )
+                .await;
+
+            for (transport, server) in [("TCP", &over_tcp), ("UDP", &over_udp)] {
+                assert_eq!(
+                    server.ctx.metrics.queries_received.load(Ordering::Relaxed),
+                    1,
+                    "{transport} did not count a TSIG-rejected request as received"
+                );
+                assert_eq!(
+                    server.ctx.metrics.queries_type_a.load(Ordering::Relaxed),
+                    1,
+                    "{transport} did not track the query type of a rejected request"
+                );
+            }
         }
 
         /// The pool answers, which is the part a refactor of the answer path has
