@@ -366,6 +366,18 @@ fn writing_a_response_costs_nothing_per_record() {
     let ((), count) = allocations(|| write(&mut out, &mut compressor));
     within("write a one-record response", count, 0..=0);
     assert!(!out.is_empty());
+
+    // And what the reuse is worth: the same write with neither in hand. This is
+    // what `rdnsd` pays per message on TCP, where the scratch cannot be held
+    // per connection (`TODO.md` #39e), against 0 on UDP, where one worker holds
+    // one scratch for the life of the process.
+    let ((), cold) = allocations(|| {
+        let mut out = Vec::new();
+        let mut compressor = NameCompressor::new();
+        write(&mut out, &mut compressor);
+        assert!(!out.is_empty());
+    });
+    within("write it with a fresh buffer and compressor", cold, 3..=3);
 }
 
 /// The three zone lookups `rdnsd` makes per query (RFC 1034 §4.3.2) cost one
