@@ -1,6 +1,5 @@
 use crate::denial_wire::{base32hex_decode, canonical_sort_key};
-use crate::utils::record_type_code;
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::Class;
 use crate::Rtype;
 use crate::Serial;
@@ -143,7 +142,7 @@ impl<'a> Located<'a> {
         self.positions
             .iter()
             .map(move |&i| &zone.records[i])
-            .filter(move |r| qtype.matches(record_type_code(&r.rdata)))
+            .filter(move |r| qtype.matches(r.rdata.rtype()))
     }
 
     /// Whether anything here is of `qtype`. The question `query(..).is_empty()`
@@ -219,8 +218,7 @@ impl Zone {
         let key = record.name.as_ref().folded().into_owned();
         let position = self.records.len();
         let at_apex = key == *self.origin_key();
-        self.shortcuts
-            .note(&key, record_type_code(&record.rdata), at_apex);
+        self.shortcuts.note(&key, record.rdata.rtype(), at_apex);
         self.note_non_terminals(&key);
         self.index
             .entry(key.into_boxed_slice())
@@ -305,10 +303,10 @@ impl Zone {
     /// will not decode is left out rather than filed under something wrong.
     fn chain_key(&self, record: &ZoneRecord) -> Option<(Chain, Vec<u8>)> {
         match record.rdata.rtype() {
-            crate::utils::record_types::NSEC => {
+            crate::record_types::NSEC => {
                 Some((Chain::Nsec, canonical_sort_key(record.name.as_ref())))
             }
-            crate::utils::record_types::NSEC3 => {
+            crate::record_types::NSEC3 => {
                 // The hash is the first label, and a label is octets — so it is
                 // taken as octets rather than by splitting text on a `.` that
                 // may be inside one.
@@ -585,7 +583,7 @@ impl Zone {
             .get(key.as_wire())?
             .iter()
             .map(|&i| &self.records[i])
-            .find(|r| record_type_code(&r.rdata) == rtype)
+            .find(|r| r.rdata.rtype() == rtype)
     }
 
     /// Record every ancestor of `key`, up to the apex, as a name that exists.
@@ -635,7 +633,7 @@ impl Zone {
             .map(|r| {
                 let key = r.name.as_ref().folded().into_owned();
                 let at_apex = key == origin_key;
-                (key, record_type_code(&r.rdata), at_apex)
+                (key, r.rdata.rtype(), at_apex)
             })
             .collect();
         self.index.clear();
@@ -708,9 +706,9 @@ mod tests {
     use super::rdata::{parse_dnssec_time, rdata_from_fields};
     use super::*;
     use crate::error::ZoneError;
+    use crate::record_types;
     use crate::test_records::nm;
     use crate::testutil::ScratchDir;
-    use crate::utils::record_types;
     use crate::ParsedRecord;
     use std::net::Ipv4Addr;
 
@@ -1594,7 +1592,7 @@ $TTL 3600
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         let soa = zone.query(
             nm("example.com.").as_ref(),
-            Qtype::of(crate::utils::record_types::SOA),
+            Qtype::of(crate::record_types::SOA),
         );
         assert_eq!(soa.len(), 1, "the SOA should have loaded");
         match soa[0].rdata.parse().unwrap() {
@@ -1630,7 +1628,7 @@ $TTL 3600
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         let txt = zone.query(
             nm("txt.example.com.").as_ref(),
-            Qtype::of(crate::utils::record_types::TXT),
+            Qtype::of(crate::record_types::TXT),
         );
         assert_eq!(txt.len(), 1);
         match txt[0].rdata.parse().unwrap() {
@@ -1654,7 +1652,7 @@ $TTL 3600
             let zone = parse_zone_file(line, "example.com.").unwrap();
             match zone.query(
                 nm("txt.example.com.").as_ref(),
-                Qtype::of(crate::utils::record_types::TXT),
+                Qtype::of(crate::record_types::TXT),
             )[0]
             .rdata
             .parse()

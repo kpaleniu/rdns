@@ -17,8 +17,8 @@
 
 use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, NSEC3_HASH_LEN};
 use crate::error::WireError;
+use crate::record_types as rt;
 use crate::response::{ResponseWriter, Section};
-use crate::utils::record_types as rt;
 use crate::zone::{Located, NameKind, Zone, ZoneRecord};
 use crate::Rtype;
 use crate::Ttl;

@@ -456,7 +456,7 @@ mod tests {
 
     use super::*;
     use crate::name::nm;
-    use crate::utils::record_types;
+    use crate::record_types;
     use crate::ResourceRecord;
     use crate::{DnsMessageBuilder, ParsedRecord, Qtype, Rtype};
 

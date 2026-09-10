@@ -120,7 +120,7 @@ impl RecordData {
     /// paid that once per RRSIG at the apex — five of them for the zone the
     /// tests use, and the field is at a fixed offset.
     pub fn rrsig_type_covered(&self) -> Option<Rtype> {
-        if self.rtype != crate::utils::record_types::RRSIG {
+        if self.rtype != crate::record_types::RRSIG {
             return None;
         }
         let covered: [u8; 2] = self.rdata.get(..2)?.try_into().ok()?;
@@ -135,7 +135,7 @@ impl RecordData {
     /// asks the chain what it was built with, and [`RecordData::parse`] answers
     /// by copying out the salt, the next hashed owner and the type bitmap.
     pub fn nsec3_parameters(&self) -> Option<(u16, &[u8])> {
-        if self.rtype != crate::utils::record_types::NSEC3 {
+        if self.rtype != crate::record_types::NSEC3 {
             return None;
         }
         let iterations = u16::from_be_bytes(self.rdata.get(2..4)?.try_into().ok()?);
@@ -150,7 +150,7 @@ impl RecordData {
     /// wanted a number. Every negative answer reads MINIMUM, which is the shape
     /// a random-subdomain flood generates.
     fn soa_scalars(&self) -> Option<&[u8; 20]> {
-        if self.rtype != crate::utils::record_types::SOA {
+        if self.rtype != crate::record_types::SOA {
             return None;
         }
         let after_mname = skip_uncompressed_name(&self.rdata)?;
@@ -164,7 +164,7 @@ mod tests {
 
     use super::*;
     use crate::name::nm;
-    use crate::utils::record_types as rt;
+    use crate::record_types as rt;
 
     /// A TYPE that says A, and bytes that are not an address. Cannot be a
     /// failing-first test: what it guards is a line that no longer compiles.
@@ -292,5 +292,45 @@ mod tests {
         for record in &built {
             assert!(record.parse().is_ok(), "{record:?}");
         }
+    }
+
+    #[test]
+    fn test_record_type_code_standard() {
+        use std::net::Ipv4Addr;
+
+        let a_record =
+            RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap();
+        assert_eq!(a_record.rtype(), rt::A);
+
+        let aaaa_record =
+            RecordData::from_parsed(&ParsedRecord::AAAA("::1".parse().unwrap())).unwrap();
+        assert_eq!(aaaa_record.rtype(), rt::AAAA);
+    }
+
+    #[test]
+    fn test_record_type_code_dnssec() {
+        let dnskey = RecordData::from_parsed(&ParsedRecord::DNSKEY {
+            flags: 0x0100,
+            protocol: 3,
+            algorithm: 8,
+            public_key: vec![1, 2, 3],
+        })
+        .unwrap();
+        assert_eq!(dnskey.rtype(), rt::DNSKEY);
+
+        let ds = RecordData::from_parsed(&ParsedRecord::DS {
+            key_tag: 12345,
+            algorithm: 8,
+            digest_type: 2,
+            digest: vec![1, 2, 3],
+        })
+        .unwrap();
+        assert_eq!(ds.rtype(), rt::DS);
+    }
+
+    #[test]
+    fn test_record_type_code_unknown() {
+        let unknown = RecordData::from_parsed(&ParsedRecord::Unknown(Rtype::new(99))).unwrap();
+        assert_eq!(unknown.rtype(), Rtype::new(99));
     }
 }

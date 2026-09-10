@@ -13,7 +13,7 @@
 
 use crate::error::WireError;
 use crate::error::{DnssecError, DnssecResult};
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::Class;
 use crate::Rtype;
 use crate::{Name, NameRef, ParsedRecord, RecordData, ResourceRecord};

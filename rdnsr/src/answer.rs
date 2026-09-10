@@ -13,10 +13,10 @@ use rdns::dnssec_chain::ValidationState;
 use rdns::metrics::LatencyTimer;
 use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
+use rdns::record_types;
 use rdns::resolver::Resolver;
 use rdns::response::ClientEdns;
 use rdns::special_names;
-use rdns::utils::record_types;
 use rdns::validation::Request;
 use rdns::Rtype;
 use rdns::{
@@ -494,10 +494,7 @@ mod tests {
     fn a_truncated_reply_carries_no_records_and_keeps_its_question() {
         let request = rdns::DnsMessageBuilder::new()
             .with_id(0x4242)
-            .with_query(
-                nm("www.example.com."),
-                Qtype::of(rdns::utils::record_types::A),
-            )
+            .with_query(nm("www.example.com."), Qtype::of(rdns::record_types::A))
             .build();
         let resp = build_response(
             &request,
@@ -532,7 +529,7 @@ mod tests {
     fn an_unimplemented_opcode_keeps_the_clients_do_bit() {
         let mut request = rdns::DnsMessageBuilder::new()
             .with_id(0x1234)
-            .with_query(nm("example.com."), Qtype::of(rdns::utils::record_types::A))
+            .with_query(nm("example.com."), Qtype::of(rdns::record_types::A))
             .build();
         request.opcode = OpCode::Status;
         let mut edns = rdns::Edns::with_payload_size(1232);

@@ -18,6 +18,7 @@ pub mod dname;
 pub mod error;
 pub mod name;
 mod record_data;
+pub mod record_types;
 pub mod response;
 pub mod utils;
 pub mod validation;
@@ -75,12 +76,12 @@ mod builder_dnssec_tests {
     #[test]
     fn the_dnssec_flag_sets_do_and_survives_the_wire() {
         let plain = DnsMessageBuilder::new()
-            .with_query(nm("example.com"), Qtype::of(utils::record_types::A))
+            .with_query(nm("example.com"), Qtype::of(record_types::A))
             .build();
         assert!(plain.edns.is_none(), "no OPT unless asked for");
 
         let asked = DnsMessageBuilder::new()
-            .with_query(nm("example.com"), Qtype::of(utils::record_types::A))
+            .with_query(nm("example.com"), Qtype::of(record_types::A))
             .with_dnssec(true)
             .build();
         let mut buf = vec![0u8; 512];
@@ -109,7 +110,8 @@ mod builder_dnssec_tests {
             ("AXFR", Qtype::AXFR),
             ("IXFR", Qtype::IXFR),
         ] {
-            let asked = utils::qtype_name_to_code(name).expect("a name this client can ask for");
+            let asked =
+                record_types::qtype_name_to_code(name).expect("a name this client can ask for");
             assert_eq!(asked, qtype);
 
             let request = DnsMessageBuilder::new()
@@ -128,7 +130,7 @@ mod builder_dnssec_tests {
     #[test]
     fn recursion_and_edns_are_the_callers_to_choose() {
         let plain = DnsMessageBuilder::new()
-            .with_query(nm("example.com."), Qtype::of(utils::record_types::A))
+            .with_query(nm("example.com."), Qtype::of(record_types::A))
             .build();
         assert!(plain.recursion, "RD by default");
 
@@ -151,7 +153,7 @@ mod tests {
     use crate::dname::DNameUnpacker;
     use crate::error::WireError;
     use crate::name::nm;
-    use crate::utils::record_types as rt;
+    use crate::record_types as rt;
     use std::net::Ipv4Addr;
 
     /// RFC 1982 §3.2, which is the whole reason [`Serial`] exists.
@@ -289,7 +291,7 @@ mod tests {
     fn test_query_builder() {
         let req = DnsMessageBuilder::new()
             .with_id(u16::from_be_bytes([0xf5, 0x6f]))
-            .with_query(nm("www.google.fi"), Qtype::of(utils::record_types::A))
+            .with_query(nm("www.google.fi"), Qtype::of(record_types::A))
             .build();
 
         let mut buf = [0u8; 512];
@@ -590,7 +592,7 @@ mod tests {
             0x00, 0x03, 0x00, 0x02, 0x01, 0xbb, // port=443
             0x00, 0x01, 0x00, 0x02, 0x01, b'h', // alpn
         ];
-        let err = RecordData::new(utils::record_types::SVCB, &backwards[..])
+        let err = RecordData::new(record_types::SVCB, &backwards[..])
             .expect_err("out-of-order keys do not make a record");
         assert!(
             err.to_string().contains("increasing"),
@@ -603,7 +605,7 @@ mod tests {
             0x00, 0x01, 0x00, 0x02, 0x01, b'h', //
             0x00, 0x03, 0x00, 0x02, 0x01, 0xbb,
         ];
-        let rdata = RecordData::new(utils::record_types::SVCB, &forwards[..])
+        let rdata = RecordData::new(record_types::SVCB, &forwards[..])
             .expect("the right way round is a record");
         let Ok(ParsedRecord::SVCB { params, .. }) = rdata.parse() else {
             panic!("it parses");
@@ -613,14 +615,14 @@ mod tests {
         // And a value that runs off the end is truncated, not a panic: this is
         // pre-authentication input on both transports (`TODO.md` #12).
         let short = [0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x09, b'h'];
-        assert!(RecordData::new(utils::record_types::SVCB, &short[..]).is_err());
+        assert!(RecordData::new(record_types::SVCB, &short[..]).is_err());
     }
 
     /// The two type codes are one format (RFC 9460 §6), and `rtype` is what
     /// carries which — so a record built as HTTPS comes back as HTTPS.
     #[test]
     fn svcb_and_https_are_one_format_under_two_numbers() {
-        for rtype in [utils::record_types::SVCB, utils::record_types::HTTPS] {
+        for rtype in [record_types::SVCB, record_types::HTTPS] {
             let built = RecordData::from_parsed(&ParsedRecord::SVCB {
                 rtype,
                 priority: 1,
@@ -651,7 +653,7 @@ mod tests {
     #[test]
     fn svcb_encoding_sorts_keys_and_refuses_a_duplicate() {
         let sorted = RecordData::from_parsed(&ParsedRecord::SVCB {
-            rtype: utils::record_types::SVCB,
+            rtype: record_types::SVCB,
             priority: 1,
             target: nm("."),
             params: vec![(3, vec![0x01, 0xbb]), (1, vec![0x01, b'h'])],
@@ -667,7 +669,7 @@ mod tests {
         );
 
         let err = RecordData::from_parsed(&ParsedRecord::SVCB {
-            rtype: utils::record_types::SVCB,
+            rtype: record_types::SVCB,
             priority: 1,
             target: nm("."),
             params: vec![(3, vec![0x00, 0x35]), (3, vec![0x01, 0xbb])],
@@ -799,7 +801,7 @@ mod tests {
                 rcode: ResponseCode::Ok,
                 queries: vec![QuerySection {
                     qname: nm(name),
-                    qtype: Qtype::of(utils::record_types::A),
+                    qtype: Qtype::of(record_types::A),
                     qclass: QueryClass::IN,
                 }],
                 answers: vec![ResourceRecord {
@@ -860,7 +862,7 @@ mod tests {
             rcode: ResponseCode::Ok,
             queries: vec![QuerySection {
                 qname: nm("www.example.com."),
-                qtype: Qtype::of(utils::record_types::A),
+                qtype: Qtype::of(record_types::A),
                 qclass: QueryClass::IN,
             }],
             answers: (0..40)
@@ -1106,7 +1108,7 @@ mod tests {
         for raw in [-1i32, i32::MIN, -3600] {
             let mut wire = vec![0x12, 0x34, 0x00, 0x00, 0, 0, 0x00, 0x01, 0, 0, 0, 0];
             wire.push(0x00); // root owner name
-            wire.extend_from_slice(&utils::record_types::A.to_u16().to_be_bytes());
+            wire.extend_from_slice(&record_types::A.to_u16().to_be_bytes());
             wire.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
             wire.extend_from_slice(&raw.to_be_bytes());
             wire.extend_from_slice(&4u16.to_be_bytes());
@@ -1124,7 +1126,7 @@ mod tests {
         // And a TTL without the high bit is untouched.
         let mut wire = vec![0x12, 0x34, 0x00, 0x00, 0, 0, 0x00, 0x01, 0, 0, 0, 0];
         wire.push(0x00);
-        wire.extend_from_slice(&utils::record_types::A.to_u16().to_be_bytes());
+        wire.extend_from_slice(&record_types::A.to_u16().to_be_bytes());
         wire.extend_from_slice(&1u16.to_be_bytes());
         wire.extend_from_slice(&3600i32.to_be_bytes());
         wire.extend_from_slice(&4u16.to_be_bytes());
@@ -1779,8 +1781,8 @@ mod tests {
 
     #[test]
     fn test_message_builder_initializes_ad_cd_false() {
-        let builder = DnsMessageBuilder::new()
-            .with_query(nm("example.com"), Qtype::of(utils::record_types::A));
+        let builder =
+            DnsMessageBuilder::new().with_query(nm("example.com"), Qtype::of(record_types::A));
         let msg = builder.build();
 
         assert!(!msg.ad, "AD bit should be false by default");

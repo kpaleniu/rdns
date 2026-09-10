@@ -23,8 +23,8 @@ use crate::dnssec_denial::{
     proves_no_ds, proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
 };
 use crate::error::DnssecError;
+use crate::record_types as rt;
 use crate::utils::hex_decode;
-use crate::utils::record_types as rt;
 use crate::Class;
 use crate::Rtype;
 use crate::{Name, NameRef, ParsedRecord, Qtype, RecordData, ResourceRecord};

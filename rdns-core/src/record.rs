@@ -7,7 +7,7 @@ use crate::edns::{Edns, OPT_RECORD_TYPE};
 use crate::error::WireError;
 use crate::name::Name;
 use crate::record_data::RecordData;
-use crate::utils;
+use crate::record_types;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Typed, fully-parsed view of a record's data: produced on demand by
@@ -208,19 +208,19 @@ impl ParsedRecord {
             return Ok(ParsedRecord::Unknown(record_type));
         }
         match record_type {
-            utils::record_types::A => {
+            record_types::A => {
                 let addr: [u8; 4] = rdata.try_into()?;
                 Ok(ParsedRecord::A(Ipv4Addr::from(addr)))
             }
-            utils::record_types::NS => {
+            record_types::NS => {
                 let (nsname, _) = Name::from_wire_in(rdata, unpacker)?;
                 Ok(ParsedRecord::NS(nsname))
             }
-            utils::record_types::CNAME => {
+            record_types::CNAME => {
                 let (cname, _) = Name::from_wire_in(rdata, unpacker)?;
                 Ok(ParsedRecord::CNAME(cname))
             }
-            utils::record_types::SOA => {
+            record_types::SOA => {
                 let (mname, rest) = Name::from_wire_in(rdata, unpacker)?;
                 let (rname, rest) = Name::from_wire_in(rest, unpacker)?;
                 let (serial, rest) = read_be!(u32, rest);
@@ -240,7 +240,7 @@ impl ParsedRecord {
                     minimum,
                 })
             }
-            utils::record_types::PTR => {
+            record_types::PTR => {
                 let (ptrdname, _) = Name::from_wire_in(rdata, unpacker)?;
                 Ok(ParsedRecord::PTR(ptrdname))
             }
@@ -248,13 +248,13 @@ impl ParsedRecord {
             // RFC 6672 §2.5 forbids sending <target> compressed: refusing a
             // pointer here would make us unable to read what a
             // non-conforming server sent, and the rule is on the writer.
-            utils::record_types::DNAME => {
+            record_types::DNAME => {
                 let (target, _) = Name::from_wire_in(rdata, unpacker)?;
                 Ok(ParsedRecord::DNAME(target))
             }
             // Same forgiveness as DNAME about the uncompressed TargetName
             // (RFC 9460 §2.2): the rule binds the writer.
-            utils::record_types::SVCB | utils::record_types::HTTPS => {
+            record_types::SVCB | record_types::HTTPS => {
                 let (priority, rest) = read_be!(u16, rdata);
                 let (target, rest) = Name::from_wire_in(rest, unpacker)?;
                 Ok(ParsedRecord::SVCB {
@@ -264,7 +264,7 @@ impl ParsedRecord {
                     params: decode_svc_params(rest)?,
                 })
             }
-            utils::record_types::MX => {
+            record_types::MX => {
                 let (preference, rest) = read_be!(u16, rdata);
                 let (exchange, _) = Name::from_wire_in(rest, unpacker)?;
                 Ok(ParsedRecord::MX {
@@ -272,7 +272,7 @@ impl ParsedRecord {
                     exchange,
                 })
             }
-            utils::record_types::TXT => {
+            record_types::TXT => {
                 let mut strings = Vec::new();
                 let mut rest = rdata;
                 while let Some((&len, after_len)) = rest.split_first() {
@@ -289,11 +289,11 @@ impl ParsedRecord {
                 }
                 Ok(ParsedRecord::TXT(strings))
             }
-            utils::record_types::AAAA => {
+            record_types::AAAA => {
                 let addr: [u8; 16] = rdata.try_into()?;
                 Ok(ParsedRecord::AAAA(Ipv6Addr::from(addr)))
             }
-            utils::record_types::DS => {
+            record_types::DS => {
                 let (key_tag, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
                     return Err(WireError::Truncated {
@@ -312,7 +312,7 @@ impl ParsedRecord {
                     digest,
                 })
             }
-            utils::record_types::RRSIG => {
+            record_types::RRSIG => {
                 // RRSIG (RFC 4034 §3.1). Expiration precedes inception on the
                 // wire; the other order makes an expired signature look current
                 // and round-trips cleanly against ourselves.
@@ -344,7 +344,7 @@ impl ParsedRecord {
                     signature,
                 })
             }
-            utils::record_types::NSEC => {
+            record_types::NSEC => {
                 let (next_domain_name, rest) = Name::from_wire_in(rdata, unpacker)?;
                 let type_bitmap = rest.to_vec();
                 Ok(ParsedRecord::NSEC {
@@ -352,7 +352,7 @@ impl ParsedRecord {
                     type_bitmap,
                 })
             }
-            utils::record_types::DNSKEY => {
+            record_types::DNSKEY => {
                 let (flags, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
                     return Err(WireError::Truncated {
@@ -371,7 +371,7 @@ impl ParsedRecord {
                     public_key,
                 })
             }
-            utils::record_types::NSEC3 => {
+            record_types::NSEC3 => {
                 if rdata.len() < 5 {
                     return Err(WireError::Truncated {
                         what: "NSEC3 RDATA",
@@ -426,16 +426,12 @@ impl ParsedRecord {
     /// [`ParsedRecord::decode`] for the types we parse.
     pub(crate) fn encode(&self) -> Result<(Rtype, Vec<u8>), WireError> {
         let out = match self {
-            ParsedRecord::A(addr) => (utils::record_types::A, addr.octets().to_vec()),
-            ParsedRecord::AAAA(addr) => (utils::record_types::AAAA, addr.octets().to_vec()),
-            ParsedRecord::NS(name) => (utils::record_types::NS, name.as_ref().as_wire().to_vec()),
-            ParsedRecord::CNAME(name) => {
-                (utils::record_types::CNAME, name.as_ref().as_wire().to_vec())
-            }
-            ParsedRecord::PTR(name) => (utils::record_types::PTR, name.as_ref().as_wire().to_vec()),
-            ParsedRecord::DNAME(name) => {
-                (utils::record_types::DNAME, name.as_ref().as_wire().to_vec())
-            }
+            ParsedRecord::A(addr) => (record_types::A, addr.octets().to_vec()),
+            ParsedRecord::AAAA(addr) => (record_types::AAAA, addr.octets().to_vec()),
+            ParsedRecord::NS(name) => (record_types::NS, name.as_ref().as_wire().to_vec()),
+            ParsedRecord::CNAME(name) => (record_types::CNAME, name.as_ref().as_wire().to_vec()),
+            ParsedRecord::PTR(name) => (record_types::PTR, name.as_ref().as_wire().to_vec()),
+            ParsedRecord::DNAME(name) => (record_types::DNAME, name.as_ref().as_wire().to_vec()),
             ParsedRecord::SVCB {
                 rtype,
                 priority,
@@ -453,7 +449,7 @@ impl ParsedRecord {
             } => {
                 let mut v = preference.to_be_bytes().to_vec();
                 v.extend_from_slice(exchange.as_ref().as_wire());
-                (utils::record_types::MX, v)
+                (record_types::MX, v)
             }
             ParsedRecord::TXT(strings) => {
                 if strings.is_empty() {
@@ -474,7 +470,7 @@ impl ParsedRecord {
                     v.push(len);
                     v.extend_from_slice(s);
                 }
-                (utils::record_types::TXT, v)
+                (record_types::TXT, v)
             }
             ParsedRecord::SOA {
                 mname,
@@ -492,7 +488,7 @@ impl ParsedRecord {
                 v.extend_from_slice(&retry.to_be_bytes());
                 v.extend_from_slice(&expire.to_be_bytes());
                 v.extend_from_slice(&minimum.to_be_bytes());
-                (utils::record_types::SOA, v)
+                (record_types::SOA, v)
             }
             ParsedRecord::DNSKEY {
                 flags,
@@ -504,7 +500,7 @@ impl ParsedRecord {
                 v.push(*protocol);
                 v.push(*algorithm);
                 v.extend_from_slice(public_key);
-                (utils::record_types::DNSKEY, v)
+                (record_types::DNSKEY, v)
             }
             ParsedRecord::RRSIG {
                 type_covered,
@@ -527,7 +523,7 @@ impl ParsedRecord {
                 v.extend_from_slice(&key_tag.to_be_bytes());
                 v.extend_from_slice(signer_name.as_ref().as_wire());
                 v.extend_from_slice(signature);
-                (utils::record_types::RRSIG, v)
+                (record_types::RRSIG, v)
             }
             ParsedRecord::DS {
                 key_tag,
@@ -539,7 +535,7 @@ impl ParsedRecord {
                 v.push(*algorithm);
                 v.push(*digest_type);
                 v.extend_from_slice(digest);
-                (utils::record_types::DS, v)
+                (record_types::DS, v)
             }
             ParsedRecord::NSEC {
                 next_domain_name,
@@ -547,7 +543,7 @@ impl ParsedRecord {
             } => {
                 let mut v = next_domain_name.as_ref().as_wire().to_vec();
                 v.extend_from_slice(type_bitmap);
-                (utils::record_types::NSEC, v)
+                (record_types::NSEC, v)
             }
             ParsedRecord::NSEC3 {
                 hash_algorithm,
@@ -568,7 +564,7 @@ impl ParsedRecord {
                 v.push(next_hashed_owner.len() as u8);
                 v.extend_from_slice(next_hashed_owner);
                 v.extend_from_slice(type_bitmap);
-                (utils::record_types::NSEC3, v)
+                (record_types::NSEC3, v)
             }
             // Stored verbatim by `RecordData::from_wire`; nothing to re-encode.
             ParsedRecord::Unknown(rtype) => (*rtype, Vec::new()),

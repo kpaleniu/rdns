@@ -603,10 +603,10 @@ mod tests {
 
     use super::*;
     use crate::dnssec::{verify, verify_rrset, RrsetProof};
+    use crate::record_types as rt;
     use crate::test_records::a_rdata;
     use crate::test_records::nm;
     use crate::testutil::ScratchDir;
-    use crate::utils::record_types as rt;
     use crate::Class;
 
     #[test]

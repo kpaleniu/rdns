@@ -12,7 +12,7 @@ use crate::denial_wire::{
 use crate::dname::MAX_NAME_LEN;
 use crate::error::WireResult;
 use crate::error::{DnssecError, DnssecResult};
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::Name;
 use crate::NameRef;
 use crate::Rtype;

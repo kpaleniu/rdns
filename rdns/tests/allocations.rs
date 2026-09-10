@@ -22,7 +22,8 @@ use std::sync::Mutex;
 
 use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Rrset, RrsetProof};
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
-use rdns::utils::{current_unix_timestamp, record_types};
+use rdns::record_types;
+use rdns::utils::current_unix_timestamp;
 use rdns::zone::{parse_zone_file, NameKind};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
 use rdns::{DnsMessage, DnsMessageBuilder, Edns, EdnsOption, Qtype, ResourceRecord};

@@ -12,8 +12,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::record_types as rt;
 use crate::tsig::{self, TsigError, TsigKey};
-use crate::utils::record_types as rt;
 use crate::zone::{Zone, ZoneRecord};
 use crate::{
     DnsMessage, Name, NameRef, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection,

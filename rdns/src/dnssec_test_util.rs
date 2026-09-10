@@ -9,8 +9,9 @@ use crate::dnssec::{
     DNSKEY_FLAG_ZONE,
 };
 use crate::dnssec_key::{SigningAlgorithm, SigningKey};
+use crate::record_types as rt;
 use crate::test_records::nm;
-use crate::utils::{current_unix_timestamp, record_types as rt};
+use crate::utils::current_unix_timestamp;
 use crate::zone_signer::{DenialChain, SigningPolicy};
 use crate::Class;
 use crate::Rtype;

@@ -15,8 +15,8 @@ use crate::Ttl;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+use crate::record_types as rt;
 use crate::transfer::{axfr_messages, pack_transfer_messages};
-use crate::utils::record_types as rt;
 use crate::zone::{Zone, ZoneRecord};
 use crate::{DnsMessage, Name, NameRef, RecordData, ResourceRecord};
 

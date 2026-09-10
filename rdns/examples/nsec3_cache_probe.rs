@@ -39,7 +39,7 @@
 use rdns::denial_wire::{base32hex_encode, build_type_bitmap};
 use rdns::dnssec_denial::nsec3_hash;
 use rdns::nsec_cache::NsecCache;
-use rdns::utils::record_types as rt;
+use rdns::record_types as rt;
 use rdns::{
     Class, DnsMessage, Name, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection, RecordData,
     ResourceRecord, ResponseCode, Serial, Ttl,

@@ -25,7 +25,7 @@ use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, MAX_NSEC3_ITERA
 use crate::dnssec_key::SigningKey;
 use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::zone::{Zone, ZoneRecord};
 use crate::Class;
 use crate::Qtype;

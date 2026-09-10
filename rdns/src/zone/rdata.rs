@@ -1,8 +1,8 @@
 use super::parse::name_at;
 use crate::denial_wire::base32hex_decode;
 use crate::error::ZoneError;
+use crate::record_types as rt;
 use crate::utils::hex_decode;
-use crate::utils::record_types as rt;
 use crate::{NameRef, ParsedRecord, RecordData, Serial};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -138,7 +138,7 @@ pub(crate) fn format_dnssec_time(epoch: u32) -> String {
 fn construct_type_bitmap(types: &[String]) -> Result<Vec<u8>, String> {
     let mut codes = Vec::with_capacity(types.len());
     for name in types {
-        let code = crate::utils::record_type_name_to_code(&name.to_uppercase())
+        let code = crate::record_types::record_type_name_to_code(&name.to_uppercase())
             .ok_or_else(|| format!("unknown record type {name:?} in type bitmap"))?;
         codes.push(code);
     }
@@ -156,7 +156,7 @@ pub(super) fn parse_generic_rdata(
     record_type: &str,
     fields: &[&str],
 ) -> Result<RecordData, String> {
-    let rtype = crate::utils::record_type_name_to_code(record_type)
+    let rtype = crate::record_types::record_type_name_to_code(record_type)
         .ok_or_else(|| format!("unknown record type {record_type:?}"))?;
 
     let Some((length, hex)) = fields.split_first() else {
@@ -411,8 +411,8 @@ pub(super) fn rdata_from_fields(
                     format!("RRSIG record needs 9 fields, got {}", rrsig_parts.len()),
                 ));
             }
-            let type_covered =
-                crate::utils::record_type_name_to_code(rrsig_parts[0]).ok_or_else(|| {
+            let type_covered = crate::record_types::record_type_name_to_code(rrsig_parts[0])
+                .ok_or_else(|| {
                     ZoneError::syntax(
                         ln,
                         format!("unknown RRSIG type covered {:?}", rrsig_parts[0]),

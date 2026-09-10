@@ -1016,8 +1016,8 @@ pub fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record_types as rt;
     use crate::test_records::nm;
-    use crate::utils::record_types as rt;
     use crate::{DnsMessage, DnsMessageBuilder, Qtype, Rtype};
 
     fn test_key() -> TsigKey {
@@ -1054,7 +1054,7 @@ mod tests {
         for pad in 0..250usize {
             let mut msg = DnsMessage::try_from_bytes(&query_bytes(
                 "big.example.com.",
-                Qtype::of(crate::utils::record_types::TXT),
+                Qtype::of(crate::record_types::TXT),
             ))
             .expect("a query parses");
             msg.response = true;
@@ -1123,7 +1123,7 @@ mod tests {
 
         let mut msg = DnsMessage::try_from_bytes(&query_bytes(
             "www.example.com.",
-            Qtype::of(crate::utils::record_types::A),
+            Qtype::of(crate::record_types::A),
         ))
         .expect("the query parses");
         msg.set_edns(crate::Edns::with_payload_size(1232));

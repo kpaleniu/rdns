@@ -502,7 +502,7 @@ const DNSSEC_PAYLOAD_SIZE: u16 = 4096;
 /// answers `None` for ANY, AXFR and IXFR because no *record* is one of those
 /// types — and the question was then dropped with no `else`, so `rdnsc`, this
 /// tree's only query client, could not ask an ANY query at all (`TODO.md` #33b).
-/// The name door is [`utils::qtype_name_to_code`](crate::utils::qtype_name_to_code), which answers `Option` and
+/// The name door is [`utils::qtype_name_to_code`](crate::record_types::qtype_name_to_code), which answers `Option` and
 /// leaves the reporting to the caller that has a person to report to.
 pub struct DnsMessageBuilder {
     id: u16,

@@ -5,7 +5,7 @@
 //! newtypes here are sealed: their inner fields are private to *this file*, and
 //! the conversions below are the only way in or out (`CLAUDE.md` §17).
 
-use crate::utils;
+use crate::record_types;
 
 /// The four-bit OPCODE of RFC 1035 §4.1.1 — "set by the originator of a query
 /// and copied into the response".
@@ -196,16 +196,14 @@ impl Rtype {
     pub const fn is_meta(self) -> bool {
         matches!(
             self.0,
-            utils::record_types::ANY_CODE
-                | utils::record_types::AXFR_CODE
-                | utils::record_types::IXFR_CODE
+            record_types::ANY_CODE | record_types::AXFR_CODE | record_types::IXFR_CODE
         )
     }
 }
 
 impl std::fmt::Display for Rtype {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", utils::record_type_name(*self))
+        write!(f, "{}", record_types::record_type_name(*self))
     }
 }
 
@@ -230,14 +228,14 @@ pub struct Qtype(u16);
 
 impl Qtype {
     /// `*` — every type at the name (RFC 1035 §3.2.3).
-    pub const ANY: Qtype = Qtype(utils::record_types::ANY_CODE);
+    pub const ANY: Qtype = Qtype(record_types::ANY_CODE);
     /// A whole-zone transfer (RFC 5936). TCP only.
-    pub const AXFR: Qtype = Qtype(utils::record_types::AXFR_CODE);
+    pub const AXFR: Qtype = Qtype(record_types::AXFR_CODE);
     /// An incremental transfer (RFC 1995).
-    pub const IXFR: Qtype = Qtype(utils::record_types::IXFR_CODE);
+    pub const IXFR: Qtype = Qtype(record_types::IXFR_CODE);
 
     /// The question that asks for exactly this record type. `const`, so
-    /// `utils::record_types` stays the one registry of numbers.
+    /// `record_types` stays the one registry of numbers.
     pub const fn of(rtype: Rtype) -> Qtype {
         Qtype(rtype.to_u16())
     }
@@ -261,7 +259,7 @@ impl Qtype {
     /// Including them would also make an empty non-terminal in an NSEC-signed
     /// zone look like a name with data.
     pub fn matches(self, rtype: Rtype) -> bool {
-        use utils::record_types as rt;
+        use crate::record_types as rt;
         if self == Qtype::ANY {
             !matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3)
         } else {
@@ -277,10 +275,10 @@ impl Qtype {
 }
 
 impl std::fmt::Display for Qtype {
-    /// Through [`utils::qtype_name`], not `record_type_name`: the latter takes
+    /// Through [`record_types::qtype_name`], not `record_type_name`: the latter takes
     /// an `Rtype` and prints the question everyone writes `ANY` as `TYPE255`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", utils::qtype_name(*self))
+        write!(f, "{}", record_types::qtype_name(*self))
     }
 }
 

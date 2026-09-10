@@ -7,7 +7,7 @@
 //! is indistinguishable from a small zone.
 
 use crate::error::{TransferError, TransferResult};
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::zone::Zone;
 #[cfg(test)]
 use crate::Name;

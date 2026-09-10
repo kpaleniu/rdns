@@ -208,8 +208,8 @@ pub struct CacheStats {
 mod tests {
 
     use super::*;
+    use crate::record_types as rt;
     use crate::test_records::nm;
-    use crate::utils::record_types as rt;
     use crate::Class;
     use crate::Ttl;
     use crate::{ParsedRecord, RecordData, ResourceRecord};

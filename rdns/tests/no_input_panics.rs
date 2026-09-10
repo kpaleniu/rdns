@@ -17,7 +17,8 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
-use rdns::utils::{current_unix_timestamp, record_types};
+use rdns::record_types;
+use rdns::utils::current_unix_timestamp;
 use rdns::validation::AdmissionCheck;
 use rdns::zone::{parse_zone_file, NameKind, Zone};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};

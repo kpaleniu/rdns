@@ -3,7 +3,7 @@
 //! Relaxed atomics: each counter is independent, nothing branches on one, and a
 //! scrape is a snapshot of a moving system either way.
 
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::utils::NameKeyBuf;
 use crate::Qtype;
 use crate::Serial;

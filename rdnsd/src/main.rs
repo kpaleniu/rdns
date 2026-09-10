@@ -2617,9 +2617,9 @@ mod tests {
     use crate::replication::{expire_if_out_of_contact, refresh_once, ReplicatedZone};
     use crate::testutil::{make_response, nm, query, zkey, ScratchDir};
     use crate::zones::{enumerate_zone_files, plan_reload, zone_key};
+    use rdns::record_types;
     use rdns::secondary::{zone_file_path, RefreshTimers, TransferState};
     use rdns::tsig::{TsigAlgorithm, TsigKey};
-    use rdns::utils::record_types;
     use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
     use rdns::Class;
     use rdns::QueryClass;

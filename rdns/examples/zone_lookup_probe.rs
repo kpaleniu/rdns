@@ -21,7 +21,7 @@
 use std::hint::black_box;
 use std::net::Ipv4Addr;
 
-use rdns::utils::record_types;
+use rdns::record_types;
 use rdns::zone::{Zone, ZoneRecord};
 use rdns::{Class, Name, ParsedRecord, Qtype, RecordData, Ttl};
 

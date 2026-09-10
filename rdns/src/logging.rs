@@ -488,7 +488,7 @@ impl Default for QueryLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::record_types as rt;
+    use crate::record_types as rt;
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]

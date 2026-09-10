@@ -19,7 +19,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::zone::Zone;
 use crate::{Name, ParsedRecord, Serial};
 

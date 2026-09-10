@@ -6,7 +6,8 @@
 //! signatures beside them in the same file.
 
 use crate::dnssec::{verify_rrset, Dnskey, Rrset, RrsetProof, Rrsig};
-use crate::utils::{current_unix_timestamp, record_types};
+use crate::record_types;
+use crate::utils::current_unix_timestamp;
 use crate::zone::Zone;
 use crate::{RecordData, ResourceRecord};
 

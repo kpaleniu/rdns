@@ -8,7 +8,7 @@
 //! persisted, or a reload serves the file's older number and a secondary
 //! declines to transfer while its signatures expire.
 
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::zone::{Zone, ZoneRecord};
 use crate::ParsedRecord;
 use crate::Qtype;

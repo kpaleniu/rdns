@@ -299,7 +299,7 @@ mod tests {
         let mut reply = DnsMessage::reply_to(&asked);
         assert_eq!(answers_query(&reply, &sent), Ok(()));
 
-        reply.queries[0].qtype = Qtype::of(crate::utils::record_types::MX);
+        reply.queries[0].qtype = Qtype::of(crate::record_types::MX);
         assert!(matches!(
             answers_query(&reply, &sent),
             Err(AnswerMismatch::Question { .. })

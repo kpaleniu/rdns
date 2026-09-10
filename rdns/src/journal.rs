@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use crate::error::ZoneError;
 use crate::ixfr::ZoneDelta;
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::zone::{parse_zone_file, Zone, ZoneRecord};
 use crate::zone_writer::record_to_string;
 use crate::{Name, NameRef, ResourceRecord, Serial};

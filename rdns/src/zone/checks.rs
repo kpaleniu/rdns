@@ -1,7 +1,6 @@
 use super::Zone;
 use crate::error::ZoneError;
-use crate::utils::record_type_code;
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::{Name, Rtype};
 use std::collections::HashMap;
 
@@ -13,7 +12,7 @@ use std::collections::HashMap;
 pub(super) fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
     let mut by_name: HashMap<Name, (bool, Vec<Rtype>)> = HashMap::new();
     for record in zone.records() {
-        let rtype = record_type_code(&record.rdata);
+        let rtype = record.rdata.rtype();
         if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3) {
             continue;
         }
@@ -66,7 +65,7 @@ pub(super) fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
     let mut owners: Vec<&Name> = Vec::new();
 
     for record in zone.records() {
-        if record_type_code(&record.rdata) != rt::DNAME {
+        if record.rdata.rtype() != rt::DNAME {
             continue;
         }
         let key = &record.name;
@@ -127,7 +126,7 @@ pub(super) fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
     // below a DNAME owner, so counting them would refuse a zone the RFC spells
     // out as legal.
     for record in zone.records() {
-        let rtype = record_type_code(&record.rdata);
+        let rtype = record.rdata.rtype();
         if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3 | rt::NSEC3PARAM) {
             continue;
         }

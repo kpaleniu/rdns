@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use rdns::logging::QueryLogger;
 use rdns::metrics::DnsMetrics;
+use rdns::record_types;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode};
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter};
-use rdns::utils::record_types;
 use rdns::validation::AdmissionCheck;
 use rdns::{DnsMessage, OpCode, Qtype, QuerySection, ResponseCode};
 use rdns_transport::ServeContext;

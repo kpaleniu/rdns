@@ -15,8 +15,9 @@ use std::borrow::Cow;
 use rdns::compression::NameCompressor;
 use rdns::error::WireError;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
+use rdns::record_types;
 use rdns::response::{ResponseWriter, Section};
-use rdns::utils::{dname_redirect, record_types, Redirect};
+use rdns::utils::{dname_redirect, Redirect};
 use rdns::zone::{Located, NameKind, Zone, ZoneRecord};
 use rdns::Class;
 use rdns::Qtype;
@@ -1340,7 +1341,7 @@ x.sub2   IN A   192.0.2.30
     }
 
     /// QTYPE=ANY is 255, which is a QTYPE and never an RTYPE, so the strict
-    /// `record_type_code(&r.rdata) == qtype` matched nothing and an existing
+    /// `r.rdata.rtype() == qtype` matched nothing and an existing
     /// name came back as an empty NOERROR plus the SOA. That is a NODATA for
     /// a name that plainly has data, and it is none of the shapes RFC 8482
     /// §4 permits — not the conventional full answer, not §4.2's synthesized

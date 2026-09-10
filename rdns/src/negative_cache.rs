@@ -19,7 +19,8 @@
 //!   so the AD bit a second client sees is the one the first client saw.
 
 use crate::eviction::Halving;
-use crate::utils::{current_unix_timestamp, record_types as rt, NameKeyBuf, NameType, NameTypeKey};
+use crate::record_types as rt;
+use crate::utils::{current_unix_timestamp, NameKeyBuf, NameType, NameTypeKey};
 use crate::Qtype;
 use crate::Ttl;
 use crate::{DnsMessage, ParsedRecord, ResourceRecord, ResponseCode};

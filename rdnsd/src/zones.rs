@@ -20,7 +20,8 @@ use rdns::dnssec_validation_mode::DnssecValidator;
 use rdns::ixfr::{plan_change, DeltaLog, PlannedDelta};
 use rdns::journal::Journal;
 use rdns::metrics::DnsMetrics;
-use rdns::utils::{current_unix_timestamp, record_types};
+use rdns::record_types;
+use rdns::utils::current_unix_timestamp;
 use rdns::zone::{parse_zone_file_at, Zone};
 use rdns::zone_signer::{
     resign_after, sign_zone, sign_zone_incrementally, DenialChain, SigningPolicy,

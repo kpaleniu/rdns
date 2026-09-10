@@ -7,7 +7,7 @@
 
 use crate::dname::{write_bytes, POINTER_MASK, POINTER_TAG};
 use crate::error::WireError;
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::{Name, NameRef, Rtype};
 use std::collections::HashMap;
 

@@ -18,7 +18,7 @@ use crate::Class;
 use std::path::Path;
 
 use crate::dnssec::{ds_digest, Dnskey, Ds, Rrset};
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::utils::{base64_encode, hex_decode, hex_encode};
 use crate::{Name, NameRef, RecordData, ResourceRecord};
 // `key_record` alone: it builds the DNSKEY records the tests feed back in.

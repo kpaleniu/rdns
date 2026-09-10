@@ -7,7 +7,7 @@
 //! and the zone's SOA in the answer section. That last is optional in the RFC and
 //! is how the secondary learns the new serial without asking again.
 
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::zone::Zone;
 use crate::{
     DnsMessage, Name, NameRef, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection,

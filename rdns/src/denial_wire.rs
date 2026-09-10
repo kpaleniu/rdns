@@ -282,8 +282,8 @@ pub fn base32hex_decode(text: &str) -> WireResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record_types as rt;
     use crate::test_records::nm;
-    use crate::utils::record_types as rt;
 
     /// The two orderings under test, over names written as text. Both take a
     /// `NameRef` now, and a test that spelled the conversion at every call site

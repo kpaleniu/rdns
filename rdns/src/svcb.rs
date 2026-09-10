@@ -39,7 +39,7 @@ pub mod svc_param_keys {
 /// The name of a SvcParamKey, or its `keyNNNNN` form (RFC 9460 §2.1).
 ///
 /// Always a name [`svc_param_key_from_name`] reads back, which is the same
-/// contract [`crate::utils::record_type_name`] has with its inverse.
+/// contract [`crate::record_types::record_type_name`] has with its inverse.
 pub fn svc_param_key_name(key: u16) -> Cow<'static, str> {
     let known = match key {
         svc_param_keys::MANDATORY => "mandatory",
@@ -442,7 +442,8 @@ fn present_value(code: u16, value: &[u8]) -> Option<Option<String>> {
 mod tests {
 
     use super::{svc_param_key_from_name, svc_param_key_name};
-    use crate::utils::{hex_encode, record_types as rt};
+    use crate::record_types as rt;
+    use crate::utils::hex_encode;
     use crate::zone::{parse_zone_file, Zone};
     use crate::zone_writer::zone_to_string;
 

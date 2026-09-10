@@ -9,7 +9,7 @@
 //! `example.org.`. RFC 6761 reserves them as *ordinary* names, delegated and
 //! resolvable, which is the one thing they exist for.
 
-use crate::utils::record_types as rt;
+use crate::record_types as rt;
 use crate::Class;
 use crate::Serial;
 use crate::Ttl;
