@@ -1,3 +1,29 @@
+//! Zone-wide rules that must be refused at load, because at query time there is
+//! no correct answer to give.
+//!
+//! The membership rule is exactly that: a check belongs here when the only honest
+//! reply to a query against the broken zone would be a wrong one. A CNAME sharing
+//! its name with another type (RFC 1034 §3.6.2), and RFC 6672's three DNAME cases
+//! — the singleton rule and data below a DNAME (§2.4), and a wildcard DNAME
+//! (§3.3) — are all of that kind: a name with two answers and no rule for
+//! choosing between them.
+//!
+//! Two boundaries, and both are load-bearing:
+//!
+//! - **Not per-record validity.** Whether one record's RDATA is well formed
+//!   belongs to [`crate::RecordData`], which seals its fields against exactly
+//!   that. These are relations *between* records, so they cannot be asked until
+//!   the whole zone is in memory.
+//! - **Not an invariant the answer path may rely on.** A zone that arrives by
+//!   transfer or grows by dynamic update never passes through here, and RFC 6672
+//!   §5.2 has UPDATE adding a DNAME over existing names on purpose. Refusing at
+//!   load is an operator's error message, not a guarantee; [`super::Zone`] still
+//!   has to answer correctly for a zone that never met these.
+//!
+//! All-or-nothing is the caller's rule and `CLAUDE.md` §4's: a zone that fails one
+//! of these is not served at all, because one typo plus a reload is otherwise a
+//! lame delegation with every dashboard green.
+
 use super::Zone;
 use crate::error::ZoneError;
 use crate::record_types as rt;

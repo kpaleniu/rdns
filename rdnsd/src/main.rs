@@ -1,3 +1,21 @@
+//! `rdnsd` — the authoritative server: UDP and TCP from one process.
+//!
+//! One process because anything that writes state — a fetched zone, a refresh
+//! timestamp, a journal — needs a single owner.
+//!
+//! What stays in this root is the shell around the answering: the CLI, startup's
+//! order (config, secrets, zones, signing, verification, then a socket), the two
+//! socket loops, the reload and maintenance timers, and NOTIFY going *out*. What
+//! #20 and #38d lifted out of it, one seam per commit, is [`zones`] (where a zone
+//! comes from and how it is swapped in), [`replication`] (being a secondary),
+//! [`dispatch`] (one request in, its reply on the wire), [`answer`] (what a name
+//! deserves, with no sockets in it), [`config`] and — Unix only, so spelled rather
+//! than linked — `control`.
+//!
+//! Every listening socket this binary binds is bound here or in `control`, and
+//! nothing below them decides to exit. A change about *what an answer is* belongs
+//! two modules down.
+
 mod answer;
 mod config;
 /// Control socket. Needs a Unix domain socket, so Unix only.
@@ -1143,7 +1161,7 @@ async fn announce_zones(
             .iter()
             .filter_map(|(name, serial)| {
                 zones
-                    .get(name.as_ref().folded().as_ref() as &[u8])
+                    .get(&*name.as_ref().folded())
                     .map(|zone| (name.clone(), *serial, zone.apex_soa_record()))
             })
             .collect();

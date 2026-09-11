@@ -1,3 +1,16 @@
+//! The zone *file*: RFC 1035 §5 presentation format in, a [`super::Zone`] out.
+//!
+//! The membership rule is the text. Everything here is about what an operator
+//! wrote — logical lines and their parentheses, `$TTL`/`$ORIGIN`/`$INCLUDE`,
+//! tokenizing with quotes and escapes, an owner name omitted because the
+//! previous record's carries over, and names made absolute against the origin.
+//! What a record *means* once its fields are split is [`super::rdata`]'s, and
+//! what a whole zone must not contain is [`super::checks`]'.
+//!
+//! A name here is text and so carries RFC 1035 §5.1's escapes: `absolutize` goes
+//! through [`crate::Name`]'s own text decoder rather than splitting on `.`, since
+//! a second decoder disagreed with it about `\.` (`TODO.md` #35, #36).
+
 use super::checks::{check_cname_exclusivity, check_dname_rules};
 use super::rdata::{parse_generic_rdata, rdata_from_fields};
 use super::{Zone, ZoneRecord};

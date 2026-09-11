@@ -1,3 +1,23 @@
+//! What has to be true of a packet before anything acts on it, on either side
+//! of the wire.
+//!
+//! Three questions, in the order they are asked, and the membership rule is that
+//! all three are answerable from the packet alone:
+//!
+//! - **Is it worth parsing?** [`AdmissionCheck`] — size and section-count caps
+//!   applied before a byte is allocated, at the cap the [`Transport`] sets.
+//! - **Is it a question for us?** [`Request`], the one door anything a stranger
+//!   can reach goes through, and the only thing that refuses QR=1.
+//! - **Does this reply answer what we asked?** [`answers_query`] against a
+//!   [`SentQuery`], which is RFC 5452 §9.1's list minus the three a `connect`ed
+//!   socket enforces.
+//!
+//! What is deliberately not here: whether the packet is *well formed*, which is
+//! [`DnsMessage::try_from_bytes`] and happens after admission; who the sender is
+//! (`rdns::tsig`, a different question, and `CLAUDE.md` §16 is why it must stay
+//! one); and what the sender may *do*, which is policy and needs a
+//! configuration this module never sees.
+
 use crate::error::{AnswerMismatch, RequestError, RequestResult, WireError};
 use crate::{DnsMessage, NameRef, OpCode, Qtype, QueryClass};
 

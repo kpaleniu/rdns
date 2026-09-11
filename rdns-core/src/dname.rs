@@ -1,3 +1,22 @@
+//! A name as a message spells it: labels, length limits, and RFC 1035 §4.1.4's
+//! compression pointers resolved against the whole message.
+//!
+//! The membership rule is the encoding, not the value. [`crate::Name`] is what a
+//! name *is* once read — comparable, hashable, owned; this module is how it gets
+//! on and off the wire, so everything here either walks encoded octets (`DName`,
+//! `Label`), hops about the message to resolve a pointer ([`DNameUnpacker`],
+//! `UnpackedDName`), or holds RFC 1035 §2.3.4's two lengths ([`MAX_NAME_LEN`],
+//! `check_name_len`). Most of it is `pub(crate)`: the module is public because
+//! parsing a record needs the unpacker, not because a name's innards are.
+//!
+//! No presentation text: #36 moved it out, along with a second text-to-wire
+//! decoder that disagreed with `Name` about RFC 1035 §5.1's escapes. Text names
+//! are [`crate::text_names`], and the text-to-wire direction is `Name`'s own.
+//!
+//! `write_bytes` is here because a serializer writing a name needs it and
+//! because a bounds-checked write is the same problem as a bounds-checked read;
+//! it is the one place a wire writer may touch the output buffer.
+
 use crate::error::WireError;
 
 /// The two high bits that mark a label as a compression pointer (RFC 1035

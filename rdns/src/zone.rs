@@ -1,3 +1,31 @@
+//! One zone in memory, and every question RFC 1034 §4.3.2 asks of it.
+//!
+//! The membership rule is that the answer is in this zone's own records. A name
+//! is looked up once ([`Zone::locate`]) and what comes back says *why* it has an
+//! answer or has none ([`NameKind`]) — exact, an empty non-terminal, a wildcard
+//! match, or absent — because those four owe four different answers and three of
+//! them are "the name exists".
+//!
+//! What is deliberately not here:
+//!
+//! - **The reply.** Which section a record goes in, what the AA bit says, what a
+//!   negative answer owes as proof: `rdnsd`'s `answer` and
+//!   [`crate::dnssec_answer`]. A zone has no opinion about a client.
+//! - **Anything across zones.** Which zone a question belongs to is the
+//!   daemon's `ZoneMap`, and a referral to a child is a record in *this* zone.
+//! - **Signing.** [`crate::zone_signer`] builds the chains; this module stores
+//!   them and searches them by range, which is why they are `BTreeMap`s while the
+//!   name index is a `HashMap`.
+//!
+//! `origin` and `records` are private because the index and the shortcuts are
+//! derived from both: a record appended behind the type's back leaves the zone
+//! answering NXDOMAIN for data it holds.
+//!
+//! The three submodules are the cuts a 2,000-line file wanted, all private:
+//! `parse` is the zone *file*, `rdata` is one record's RDATA from presentation
+//! fields, and `checks` is what must be refused at load because it has no correct
+//! answer at query time.
+
 use crate::denial_wire::{base32hex_decode, canonical_sort_key, CanonicalKey};
 use crate::dnssec_denial::Nsec3Hash;
 use crate::record_types as rt;

@@ -1,3 +1,17 @@
+//! Walking down from the root: referrals, the CNAME chain, and the budgets that
+//! stop both.
+//!
+//! The membership rule is "deciding who to ask next". Every ceiling a hostile
+//! delegation could run up is here — CNAME hops, nested nameserver lookups
+//! (`MAX_NESTED`), QNAME minimisation's count (RFC 9156 §2.3) and the query
+//! budget — because they are one question asked in four places and a missing one
+//! is an unbounded walk, not a wrong answer.
+//!
+//! Not here: whether the answer is *authentic*, which is [`super::validate`] and
+//! runs over what this returns, and what to do with it, which is the parent's
+//! `resolve`. The split is deliberate — checking signatures before the chain of
+//! trust lets an attacker pick the key that validates their own data.
+
 // The parent's `use` block, not a copy per file: these three are continuations
 // of one `impl Resolver`, and a second import list is a second thing to drift.
 use super::*;

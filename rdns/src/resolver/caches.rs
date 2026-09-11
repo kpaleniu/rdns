@@ -1,3 +1,18 @@
+//! What the resolver remembers about the *servers*, as opposed to the answers.
+//!
+//! Three maps, and the membership rule is the key: a zone or a server address,
+//! never a question. `DelegationCache` says which servers a zone was last known
+//! to have, `KeyCache` which DNSKEYs it was last seen to publish, and `RttStore`
+//! how fast each individual server answered. All three are hints — dropping one
+//! costs a round trip and never an answer, which is why a poisoned lock here
+//! returns `None` rather than failing the query.
+//!
+//! Answers keyed by the *question* are elsewhere and shared with the daemon:
+//! [`crate::cache`], [`crate::negative_cache`], [`crate::nsec_cache`]. A hint
+//! that goes stale is a restart from the root (`resolve_from_root`); a cached
+//! answer that goes stale is a wrong answer, which is why those three are
+//! bounded and timed and these are bounded and cheap.
+
 // The parent's `use` block, not a copy per file: these three are continuations
 // of one `impl Resolver`, and a second import list is a second thing to drift.
 use super::*;

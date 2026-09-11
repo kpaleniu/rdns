@@ -1,3 +1,15 @@
+//! How much of a response is authentic: one function, and the order it works in.
+//!
+//! The chain of trust first, the signatures second. That order is the whole
+//! reason this is its own module rather than a step inside [`super::recurse`]:
+//! validating a signature and *then* asking where its key came from lets the
+//! sender choose the key that validates their own data.
+//!
+//! The DNSSEC machinery itself — the chain walk, the denial proofs, the
+//! algorithms — is [`crate::dnssec_chain`] and its neighbours. What is here is
+//! only the resolver's use of it: which of a response's sections may be believed,
+//! and the AD bit that follows.
+
 // The parent's `use` block, not a copy per file: these three are continuations
 // of one `impl Resolver`, and a second import list is a second thing to drift.
 use super::*;

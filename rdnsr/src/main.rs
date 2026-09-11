@@ -1,3 +1,13 @@
+//! `rdnsr` — the recursive resolver: UDP and TCP on one port, bound to
+//! localhost by default, because an open resolver is somebody else's
+//! amplifier.
+//!
+//! This root is the CLI and the startup order, and nothing else: the three
+//! modules under it are [`anchors`] (the trust anchors and RFC 5011's rolling),
+//! [`answer`] (a datagram in, the reply out — no sockets) and [`serve`] (the two
+//! socket loops and the shutdown). One `Resolver` with a mode rather than two
+//! programs; the reasoning is `TODO.md`'s "Architecture: the resolver".
+
 mod anchors;
 mod answer;
 mod serve;

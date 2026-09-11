@@ -1,3 +1,27 @@
+//! What a peer is allowed, decided from its address alone.
+//!
+//! Three policies, and the membership rule is the key they hang off: a source
+//! address, not a name, a key or a zone. [`RateLimiter`] bounds queries per
+//! second, [`ResponseLimiter`] bounds reflected *bytes* — which is the unit
+//! amplification is measured in (RFC 5358) — and [`TransferAcl`] says who may ask
+//! for a whole zone.
+//!
+//! Two consequences of that key, both of which this crate has got wrong before:
+//!
+//! - **Every table here is attacker-keyed and must be bounded**, since an entry
+//!   is created before anything has validated the packet (`CLAUDE.md` §5). Each
+//!   has a `max_tracked`, and each states *which way it fails* at the bound and
+//!   why: the query limiter allows an untracked source, because failing closed
+//!   lets one flood deny service to everybody; the response limiter truncates,
+//!   because a spoofed flood arrives from every address there is.
+//! - **An address is not an identity.** A verified TSIG MAC is, and what it
+//!   authorizes is `crate::tsig`'s to answer — holding a key is not permission to
+//!   transfer a zone (`CLAUDE.md` §16). [`TransferAcl`] is the address half of
+//!   that decision and never the whole of it.
+//!
+//! Not [`crate::validation`], which asks whether a packet is worth parsing at
+//! all: that is a property of the bytes, this is a property of who sent them.
+
 use crate::clock::current_unix_timestamp;
 use crate::error::{ConfigError, ConfigResult};
 use std::collections::HashMap;

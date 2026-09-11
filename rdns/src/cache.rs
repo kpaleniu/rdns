@@ -1,3 +1,27 @@
+//! The positive answer cache: records that exist, keyed by the question that
+//! found them.
+//!
+//! The membership rule is that there is something to store. A "no" has no records
+//! to key on and takes its TTL from the SOA rather than from itself, so it is
+//! [`crate::negative_cache`]; a *validated* denial covers names nobody has asked
+//! about yet and is searched by range, so it is [`crate::nsec_cache`]. Three
+//! caches because a lookup in each asks a different question, not because one
+//! grew too large.
+//!
+//! Two invariants this file owns, both of which have been got wrong here or in a
+//! sibling:
+//!
+//! - **`secure` is what validation concluded**, never what the cache assumed. It
+//!   is the AD bit surviving the cache, so an answer stored as validated tells
+//!   every later client it was authentic.
+//! - **The TTL is the shortest in the RRset, capped at a day** (RFC 8767 §4), and
+//!   not clamped here: [`crate::Ttl`] clamps at the parse boundary, which is the
+//!   only place a negative wire TTL can be stopped from widening to `u64::MAX`
+//!   and winning the `min` (`CLAUDE.md` §2).
+//!
+//! Eviction is `crate::eviction`, shared with the other two: one victim per
+//! insert is a scan per query once a bounded cache is full.
+
 use crate::clock::current_unix_timestamp;
 use crate::eviction::Halving;
 use crate::name_keys::{NameType, NameTypeKey};

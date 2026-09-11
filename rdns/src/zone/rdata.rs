@@ -1,3 +1,19 @@
+//! One record's RDATA, built from the presentation fields a zone file line split
+//! into.
+//!
+//! The membership rule is a single record's own data: this module never sees the
+//! zone, the owner name's neighbours, or another record. It takes the fields
+//! after TTL, class and type and produces a [`crate::RecordData`] — through that
+//! type's checking constructors, so a malformed RDATA is refused rather than
+//! stored (`CLAUDE.md` §17).
+//!
+//! Also the two DNSSEC time conversions, which are here rather than in a date
+//! utility because RFC 4034 §3.1.5's `YYYYMMDDHHmmSS` is a presentation format
+//! and the RRSIG fields that use it are the only reason the tree needs one.
+//!
+//! The generic `\#` form (RFC 3597) is here too: it is still a record's RDATA,
+//! just spelled as a length and hex rather than as fields.
+
 use super::parse::name_at;
 use crate::codecs::hex_decode;
 use crate::denial_wire::base32hex_decode;

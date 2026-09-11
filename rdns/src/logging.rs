@@ -1,3 +1,22 @@
+//! What a daemon says about itself, and when it says it unprompted.
+//!
+//! Three things, and the membership rule is that every one of them is read by a
+//! *human*: the level and the subscriber ([`LogLevel`], [`init`]), the counts a
+//! log line is drawn from ([`QueryStats`], [`QueryLogger`]), and the thresholds
+//! that turn those counts into a warning nobody had to ask for ([`Anomaly`],
+//! [`watch_anomalies`]).
+//!
+//! Not [`crate::metrics`], which is the same traffic counted for a *scrape*. The
+//! two are not a duplicate: a scrape is pulled on somebody else's schedule and
+//! keeps its counters for the life of the process, while these are taken and
+//! reset so the rate reported is over the interval it covers. Either can be off
+//! without the other.
+//!
+//! The per-source maps are keyed on an address the sender chose, so both are
+//! bounded (`MAX_TRACKED_SOURCES`) and the shortfall is itself a counter —
+//! `untracked_sources`, because a bound that lies by omission is worse than a
+//! bound that says so (`CLAUDE.md` §5).
+
 use crate::clock::current_unix_timestamp;
 use crate::shutdown::Stop;
 use crate::Qtype;
