@@ -165,7 +165,7 @@ impl Server {
         // One ceiling for every reply this request can produce, read once from
         // the transport that will carry it and from this server's own limit —
         // not from the client's advertisement alone (`TODO.md` #41b).
-        let max_len = self.ctx.udp.reply_ceiling(&msg, wire.transport());
+        let ceiling = self.ctx.udp.reply_ceiling(&msg, wire.transport());
         let advertised = self.ctx.udp.advertised();
 
         // TSIG before anything that could answer (RFC 8945 §5.2): checking the
@@ -183,9 +183,12 @@ impl Server {
                     rejection.key_name(),
                     rejection.error.reason()
                 );
-                let Some(response) =
-                    error_reply(&msg, ResponseCode::NotAuthorized, max_len, advertised)
-                else {
+                let Some(response) = error_reply(
+                    &msg,
+                    ResponseCode::NotAuthorized,
+                    reserve(ceiling, rejection.reply_overhead()),
+                    advertised,
+                ) else {
                     return;
                 };
                 match rejection.attach(response, now) {
@@ -194,6 +197,15 @@ impl Server {
                 }
                 return;
             }
+        };
+
+        // The record the signer appends comes out of the ceiling, not on top of
+        // it: RFC 8945 §5.3 says a TSIG that would not fit means altering the
+        // response, not sending it oversized (`TODO.md` #41d). Signing is the
+        // one thing here that grows finished bytes.
+        let max_len = match &session {
+            Some(session) => reserve(ceiling, session.reply_overhead()),
+            None => ceiling,
         };
 
         // Answered here rather than in `make_response`: a sequence of messages,
@@ -276,19 +288,40 @@ impl Server {
         scratch: &Scratch,
     ) {
         let ip = peer.ip();
-        let reply: Option<Cow<'_, [u8]>> = match wire {
+        let advertised = self.ctx.udp.advertised();
+        // The ceiling `answer` wrote the body against, signature reserved and
+        // all: a truncated reply is signed too, so it is bounded by the same
+        // number.
+        let ceiling = self.ctx.udp.reply_ceiling(request, wire.transport());
+        let ceiling = match &session {
+            Some(session) => reserve(ceiling, session.reply_overhead()),
+            None => ceiling,
+        };
+        let mut reply: Option<Cow<'_, [u8]>> = match wire {
             Wire::Framed(_) => Some(Cow::Borrowed(scratch.out.as_slice())),
             Wire::Datagram(..) => match self.ctx.admit_response(ip, scratch.out.len(), now) {
                 ResponseVerdict::Send => Some(Cow::Borrowed(scratch.out.as_slice())),
-                ResponseVerdict::Truncate => truncated_reply(
-                    request,
-                    self.ctx.udp.reply_ceiling(request, wire.transport()),
-                    self.ctx.udp.advertised(),
-                )
-                .map(Cow::Owned),
+                ResponseVerdict::Truncate => {
+                    truncated_reply(request, ceiling, advertised).map(Cow::Owned)
+                }
                 ResponseVerdict::Drop => None,
             },
         };
+        // RFC 8945 §5.3: "If addition of the TSIG record will cause the message
+        // to be truncated, the server MUST alter the response so that a TSIG can
+        // be included. This response contains only the question and a TSIG
+        // record, has the TC bit set, and has an RCODE of 0 (NOERROR)."
+        //
+        // `answer` reserved the record out of the ceiling, so the body has
+        // already gone; what the writer cannot know is that the RCODE goes with
+        // it, never having heard of TSIG. Applied to every truncated signed
+        // reply rather than only to one the signature pushed over, because the
+        // two produce the same message and §5.3 is the stricter shape. The OPT
+        // stays — RFC 6891 §6.1.1 requires mirroring it, and §5.3 is older than
+        // that being true of every reply.
+        if session.is_some() && reply.as_deref().is_some_and(rdns::response::is_truncated) {
+            reply = truncated_reply(request, ceiling, advertised).map(Cow::Owned);
+        }
         // Sign whatever we ended up sending — including a truncated one, since
         // that is still our answer to a question someone authenticated. Same
         // session, so the reply's MAC covers the request's: that is what stops
@@ -801,6 +834,19 @@ fn empty_reply(request: &DnsMessage, advertised: u16) -> DnsMessage {
         resp.set_edns(edns);
     }
     resp
+}
+
+/// A reply's ceiling with room kept for a signature.
+///
+/// Floored at the classic 512 rather than allowed to reach zero: the altered
+/// response RFC 8945 §5.3 asks for is a question, an OPT and a TSIG, and it has
+/// to fit somewhere. The floor is reachable only from a ceiling already at 512
+/// with a long key name and hmac-sha512 — 362 octets of record — and a reply
+/// that small plus its TSIG is still under the 512 every peer must accept.
+fn reserve(ceiling: usize, signature: usize) -> usize {
+    ceiling
+        .saturating_sub(signature)
+        .max(rdns::CLASSIC_UDP_SIZE as usize)
 }
 
 /// An empty reply to `request` carrying `rcode`, serialized within `max_len`.

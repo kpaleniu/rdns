@@ -174,11 +174,16 @@ struct Cli {
     max_tcp_request: u16,
     /// UDP payload size advertised to clients in every reply's OPT, in octets.
     ///
-    /// What this resolver says it can reassemble (RFC 6891 §6.2.4), which is
-    /// why it also floors `--max-udp-request`. 1232 is where BIND, Knot, NSD
-    /// and Unbound all landed after DNS Flag Day 2020. Not what this resolver
-    /// advertises *upstream* — that is `ResolverConfig::udp_payload_size` and
-    /// `TODO.md` #41c. Floored at 512.
+    /// What this resolver says it can reassemble (RFC 6891 §6.2.3), in both
+    /// directions: to its clients in every reply's OPT, and to the authoritative
+    /// servers it asks. One number because it is a fact about this host's stack
+    /// rather than about who is being told, which is how Unbound's
+    /// `edns-buffer-size` reads. It also floors `--max-udp-request`.
+    ///
+    /// 1232 is the default of BIND's `edns-udp-size`, Knot's `udp-max-payload`,
+    /// NSD's `ipv4-edns-size` and Unbound's `edns-buffer-size` after DNS Flag
+    /// Day 2020. Not the size an upstream answer is read into, which is
+    /// separate since `TODO.md` #41c. Floored at 512.
     #[arg(long, value_name = "OCTETS", default_value = "1232")]
     udp_payload_size: u16,
     /// Largest UDP reply this resolver will send, in octets.
@@ -251,8 +256,17 @@ async fn main() -> anyhow::Result<()> {
     // writes.
     let shutdown = Shutdown::new();
 
+    // What this host can reassemble and the largest datagram it will send. One
+    // advertisement, in both directions: the number is a fact about this stack,
+    // not about who is being told, which is how Unbound's `edns-buffer-size`
+    // reads too (`TODO.md` #41c).
+    let udp = UdpSizes::new(cli.udp_payload_size, cli.max_udp_response);
+
     // Recursion is the default; naming an upstream is what selects forwarding.
-    let mut config = ResolverConfig::default();
+    let mut config = ResolverConfig {
+        udp_payload_size: udp.advertised(),
+        ..ResolverConfig::default()
+    };
     if cli.upstream.is_empty() {
         config.mode = ResolverMode::Recurse;
     } else {
@@ -381,7 +395,6 @@ async fn main() -> anyhow::Result<()> {
     let query_limit = RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(
         TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
     );
-    let udp = UdpSizes::new(cli.udp_payload_size, cli.max_udp_response);
     // Floored at what this resolver advertises, for the reason
     // `--max-udp-request` gives: the advertisement is a promise.
     let admission = AdmissionLimits::new(

@@ -563,6 +563,23 @@ impl TsigSession {
         self.key.may_update(apex)
     }
 
+    /// Exactly how many octets [`TsigSession::sign`] will append.
+    ///
+    /// RFC 8945 §5.3: "If addition of the TSIG record will cause the message to
+    /// be truncated, the server MUST alter the response so that a TSIG can be
+    /// included." A caller with a size ceiling therefore has to reserve this
+    /// *before* it writes the body — appending the record is the one path that
+    /// grows a message past the size it was serialized to, and discovering that
+    /// afterwards leaves nothing to do about it (`TODO.md` #41d).
+    pub fn reply_overhead(&self) -> usize {
+        tsig_record_len(
+            &self.key.name,
+            self.key.algorithm.wire_name(),
+            self.key.algorithm.mac_len(),
+            0,
+        )
+    }
+
     /// Sign one response message, returning the bytes with a TSIG appended.
     ///
     /// Call once per message of a transfer, in order: the MACs chain, so a
@@ -614,6 +631,23 @@ pub struct TsigRejection {
 impl TsigRejection {
     pub fn key_name(&self) -> &str {
         &self.key_name
+    }
+
+    /// Exactly how many octets [`TsigRejection::attach`] will append, for the
+    /// reason [`TsigSession::reply_overhead`] gives. Unsigned rejections carry
+    /// an empty MAC (RFC 8945 §5.3.2) and BADTIME six octets of this server's
+    /// time (§5.2.3), so the two differ by more than the record's fixed part.
+    pub fn reply_overhead(&self) -> usize {
+        tsig_record_len(
+            &self.key_name,
+            &self.algorithm_name,
+            self.key.as_ref().map_or(0, |k| k.algorithm.mac_len()),
+            if self.error == TsigError::BadTime {
+                6
+            } else {
+                0
+            },
+        )
     }
 
     /// Attach the TSIG that reports this failure to an already-built response.
@@ -909,6 +943,35 @@ fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> ConfigResult<Vec<u8>> {
         )));
     }
     Ok(message)
+}
+
+/// The size of the TSIG record a signer will append (RFC 8945 §4.2): the owner
+/// name, the ten fixed record octets — type, class, TTL, RDLENGTH — and the
+/// RDATA, whose only variable parts are the algorithm name, the MAC and the
+/// "other data".
+///
+/// Neither name is compressed, for the reason [`append_tsig`] gives, so both
+/// cost their full wire form. The `unwrap_or` is a bound rather than an exact
+/// length and is unreachable from either caller: a session's key matched a name
+/// that came off the wire and a rejection's came off the wire itself, so both
+/// parse. It is here so this stays infallible — a caller sizing a buffer has
+/// nothing to do with an error, and [`append_tsig`] reports the same one.
+fn tsig_record_len(
+    key_name: &str,
+    algorithm_name: &str,
+    mac_len: usize,
+    other_len: usize,
+) -> usize {
+    let wire_len = |name: &str| {
+        crate::Name::from_presentation(name)
+            .map(|n| n.as_ref().as_wire().len())
+            // A name's wire form is never longer than its text plus two, which
+            // is the bound `transfer::Envelopes` packs against.
+            .unwrap_or(name.len() + 2)
+    };
+    // 6 time signed, 2 fudge, 2 MAC size, 2 original id, 2 error, 2 other len.
+    const RDATA_FIXED: usize = 16;
+    wire_len(key_name) + 10 + wire_len(algorithm_name) + RDATA_FIXED + mac_len + other_len
 }
 
 /// Past a name at `pos`, following the rule that a pointer ends it.
@@ -1361,6 +1424,84 @@ mod tests {
             .is_some());
         assert!(ring.get("transfer.key.", TsigAlgorithm::HmacSha1).is_none());
         assert!(ring.get("other.key.", TsigAlgorithm::HmacSha256).is_none());
+    }
+
+    /// The reservation a caller makes is the exact number of octets signing
+    /// adds — for every algorithm, and for a key name whose wire form is not
+    /// its text length.
+    ///
+    /// Exact rather than "at least": `TODO.md` #41d is a ceiling that was
+    /// exceeded by a fixed amount, and a bound that drifts from the real size
+    /// re-opens it in one direction or wastes the datagram in the other. This
+    /// is the test that makes `reply_overhead` a claim the compiler cannot
+    /// check into one the suite does (`CLAUDE.md` §4).
+    #[test]
+    fn the_reserved_tsig_size_is_the_size_signing_adds() {
+        let now = 1_800_000_000;
+        for algorithm in [
+            TsigAlgorithm::HmacSha1,
+            TsigAlgorithm::HmacSha256,
+            TsigAlgorithm::HmacSha384,
+            TsigAlgorithm::HmacSha512,
+        ] {
+            for name in [
+                "k.",
+                "transfer.key.",
+                "a-rather-long-key-name.updates.example.com.",
+            ] {
+                let key = TsigKey::new(name, algorithm, vec![0x0b; 32]);
+                let ring = TsigKeyring::new(vec![key.clone()]);
+                let request =
+                    sign_request(query_bytes("example.com.", Qtype::AXFR), &key, now).unwrap();
+                let TsigCheck::Verified(mut session) = check_request(&request, &ring, now) else {
+                    panic!("{name} with {algorithm:?} should verify");
+                };
+
+                let reserved = session.reply_overhead();
+                let reply = query_bytes("example.com.", Qtype::AXFR);
+                let signed = session.sign(reply.clone(), now).expect("sign");
+                assert_eq!(
+                    signed.len() - reply.len(),
+                    reserved,
+                    "{name} with {algorithm:?}"
+                );
+            }
+        }
+    }
+
+    /// The same, for the refusal path: an error response to a verified request
+    /// is signed too (RFC 8945 §5.3), and the three rejection kinds append
+    /// three different sizes — no MAC for BADKEY and BADSIG, a MAC and six
+    /// octets of "other data" for BADTIME.
+    #[test]
+    fn a_rejections_reserved_size_is_what_it_appends() {
+        let key = test_key();
+        let ring = TsigKeyring::new(vec![key.clone()]);
+        let signed_at = 1_800_000_000;
+        let request =
+            sign_request(query_bytes("example.com.", Qtype::AXFR), &key, signed_at).unwrap();
+
+        // Far outside the fudge, which is the one rejection that still signs.
+        let late = signed_at + 100_000;
+        let other_ring = TsigKeyring::new(vec![TsigKey::new(
+            "other.key.",
+            TsigAlgorithm::HmacSha256,
+            vec![0x0c; 32],
+        )]);
+        for (ring, now) in [(&ring, late), (&other_ring, signed_at)] {
+            let TsigCheck::Rejected(rejection) = check_request(&request, ring, now) else {
+                panic!("should be rejected");
+            };
+            let reserved = rejection.reply_overhead();
+            let reply = query_bytes("example.com.", Qtype::AXFR);
+            let attached = rejection.attach(reply.clone(), now).expect("attach");
+            assert_eq!(
+                attached.len() - reply.len(),
+                reserved,
+                "{:?}",
+                rejection.error
+            );
+        }
     }
 
     #[test]

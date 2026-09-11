@@ -164,6 +164,11 @@ told that neither number applies (RFC 1035 §4.2.2). Over the bound the reply is
 an empty TC=1 one. What the answers off a signed zone weigh against that bound is
 measured in `rdnsd/src/response_size.rs`.
 
+When the request was TSIG-signed, the record the signer appends comes out of that
+bound rather than on top of it (`TsigSession::reply_overhead`), and a reply that
+then truncates is reissued as RFC 8945 §5.3's altered response: the question, the
+mirrored OPT and the TSIG, TC=1, RCODE 0.
+
 ---
 
 ## 3.3 Response codes this server emits

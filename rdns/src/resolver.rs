@@ -137,7 +137,13 @@ pub struct ResolverConfig {
     /// CNAME hops and nameserver-address lookups. The NXNSAttack defence: a
     /// referral naming dozens of glueless nameservers costs a resolution each.
     pub query_budget: usize,
-    /// EDNS0 UDP payload size to advertise upstream (RFC 6891).
+    /// EDNS0 UDP payload size to advertise upstream (RFC 6891 §6.2.3): what
+    /// this host can reassemble, which is the same claim `rdnsr` makes to its
+    /// own clients and is set from the same flag.
+    ///
+    /// Not the size of the buffer an answer is read into — those were one
+    /// number until `TODO.md` #41c, which is why lowering this was not free.
+    /// See `recurse::UPSTREAM_RECEIVE_BUFFER`.
     pub udp_payload_size: u16,
     /// How many zone delegations to remember. 0 disables the cache, which makes
     /// every query restart at the root — correct, but only acceptable in tests.
@@ -224,7 +230,10 @@ impl Default for ResolverConfig {
             max_delegations: 16,
             max_cname_hops: 8,
             query_budget: 64,
-            udp_payload_size: 4096,
+            // DNS Flag Day 2020, as BIND's `edns-udp-size` and Unbound's
+            // `edns-buffer-size` default: above it an answer fragments, and a
+            // fragment is what middleboxes drop.
+            udp_payload_size: crate::FLAG_DAY_UDP_SIZE,
             delegation_cache_size: 10_000,
             qname_minimization: true,
             zero_x20: true,
@@ -768,6 +777,44 @@ this line has no record and is skipped
             matches!(err, ResolveError::NoResponse(_)),
             "and it counts as no answer, not as a lookup failure: {err:?}"
         );
+    }
+
+    /// Lowering what this resolver advertises does not narrow what it can
+    /// receive (`TODO.md` #41c).
+    ///
+    /// The two were one number: the answer buffer was
+    /// `vec![0; config.udp_payload_size]`, so moving the advertisement to DNS
+    /// Flag Day's 1232 would have made every answer over 1232 unreadable — and
+    /// unreadable, not truncated: the receive itself fails on Windows and drops
+    /// the tail elsewhere, so the answer is lost rather than parsed short.
+    ///
+    /// The upstream here answers with more than it was told to, which is the
+    /// only case this is about; a conforming server never reaches it.
+    ///
+    /// Watched failing against the coupled buffer: `NoResponse`.
+    #[tokio::test]
+    async fn an_upstream_that_ignores_the_advertisement_is_still_read() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind a fake upstream");
+        let addr = socket.local_addr().unwrap();
+        let _server = spawn_server(socket, |query| {
+            let mut resp = response_to(query);
+            // ~1.9 KB of answer, against the 1232 advertised below.
+            for i in 0..110u8 {
+                resp.answers
+                    .push(a_record("example.com.", [192, 0, 2, i % 254 + 1]));
+            }
+            resp
+        });
+
+        let mut config = test_config(addr);
+        config.udp_payload_size = crate::FLAG_DAY_UDP_SIZE;
+        let resolver = Resolver::new(config);
+
+        let answer = resolver
+            .resolve(&test_query())
+            .await
+            .expect("an oversized answer is still an answer");
+        assert_eq!(answer.answers.len(), 110);
     }
 
     /// A UDP server that answers with whatever the closure builds. Stops when

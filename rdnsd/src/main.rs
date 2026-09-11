@@ -2045,6 +2045,10 @@ mod tests {
     }
 
     fn server_with(zone: Zone) -> Arc<Server> {
+        server_with_keys(zone, Vec::new())
+    }
+
+    fn server_with_keys(zone: Zone, keys: Vec<TsigKey>) -> Arc<Server> {
         let mut zones = HashMap::new();
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
         Arc::new(Server {
@@ -2052,7 +2056,7 @@ mod tests {
             ctx: test_context(),
             journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl")),
-            tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
+            tsig_keys: Arc::new(TsigKeyring::new(keys)),
             secondaries: Arc::new(HashMap::new()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
             updates: Arc::new(UpdateHandling::disabled()),
@@ -2083,9 +2087,9 @@ mod tests {
                 .expect("serialize the query")
         }
 
-        /// A pool of addresses large enough that the answer does not fit in a
-        /// datagram this server is willing to send.
-        fn large_rrset_zone() -> Zone {
+        /// A round-robin pool of `count` addresses, which is how both size
+        /// tests below put an answer at a chosen weight.
+        fn pool_zone(count: u32) -> Zone {
             let mut text = String::from(
                 "$ORIGIN example.com.\n\
                  $TTL 3600\n\
@@ -2093,7 +2097,7 @@ mod tests {
                  @   IN NS  ns1.example.com.\n\
                  ns1 IN A   192.0.2.1\n",
             );
-            for i in 0..128u32 {
+            for i in 0..count {
                 text.push_str(&format!("pool IN A 198.51.100.{}\n", i % 254 + 1));
             }
             rdns::zone::parse_zone_file(&text, "example.com.").expect("the zone parses")
@@ -2113,7 +2117,7 @@ mod tests {
         /// answered in full, which is where a truncated client is sent.
         #[tokio::test]
         async fn a_udp_reply_is_capped_by_this_server_and_not_only_by_the_client() {
-            let server = server_with(large_rrset_zone());
+            let server = server_with(pool_zone(128));
             let cap = server.ctx.udp.max_response() as usize;
             let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
             let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
@@ -2167,6 +2171,114 @@ mod tests {
             let over_tcp = DnsMessage::try_from_bytes(&framed[2..]).expect("it parses");
             assert!(!over_tcp.truncation, "TCP is not capped by either number");
             assert_eq!(over_tcp.answers.len(), 128);
+        }
+
+        /// The TSIG comes out of the reply's ceiling, not on top of it
+        /// (`TODO.md` #41d).
+        ///
+        /// `TsigSession::sign` appends its record to bytes already serialized
+        /// to `max_len`, so before this the signed datagram went out at the cap
+        /// *plus* 85 octets — a cap exceeded by a fixed amount is not a cap.
+        /// RFC 8945 §5.3 says what to do instead: "If addition of the TSIG
+        /// record will cause the message to be truncated, the server MUST alter
+        /// the response so that a TSIG can be included. This response contains
+        /// only the question and a TSIG record, has the TC bit set, and has an
+        /// RCODE of 0 (NOERROR)."
+        ///
+        /// The zone is sized so the answer lands in the window where the
+        /// question is live: it fits the cap and does not fit the cap with a
+        /// signature. The first assertion holds that window, so a zone that
+        /// drifts out of it fails loudly rather than passing for the wrong
+        /// reason (`CLAUDE.md` §1).
+        ///
+        /// Watched failing against the unreserved ceiling: 1,250 octets out of
+        /// a 1,232-octet cap, TC clear.
+        #[tokio::test]
+        async fn a_signed_reply_reserves_its_signature_out_of_the_ceiling() {
+            let key = TsigKey::new("transfer.key.", TsigAlgorithm::HmacSha256, vec![0x0b; 32]);
+            let server = server_with_keys(pool_zone(70), vec![key.clone()]);
+            let cap = server.ctx.udp.max_response() as usize;
+            let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+            let peer = client.local_addr().expect("addr");
+
+            let question = rdns::DnsMessageBuilder::new()
+                .with_id(1)
+                .with_query(nm("pool.example.com."), Qtype::of(record_types::A))
+                .with_recursion(false)
+                .with_edns(u16::MAX, false)
+                .build()
+                .to_bytes_within(4096)
+                .expect("serialize");
+
+            // Read off the wire, not out of the scratch buffer: signing builds
+            // a message of its own, so the bytes that were sent are the only
+            // ones this is about.
+            let answer = |packet: &[u8]| {
+                let server = Arc::clone(&server);
+                let packet = packet.to_vec();
+                let socket = &socket;
+                let client = &client;
+                async move {
+                    let mut scratch = Scratch::default();
+                    server
+                        .answer(
+                            &packet,
+                            peer,
+                            tsig::now(),
+                            &Wire::Datagram(socket, peer),
+                            &mut scratch,
+                        )
+                        .await;
+                    let mut buf = vec![0u8; UDP_RECEIVE_BUFFER];
+                    let n = client.recv(&mut buf).await.expect("one datagram");
+                    buf.truncate(n);
+                    buf
+                }
+            };
+            client
+                .connect(socket.local_addr().expect("addr"))
+                .await
+                .expect("connect");
+
+            // The window: unsigned it fits, and it would not fit signed.
+            let unsigned = answer(&question).await;
+            let overhead = {
+                let probe = rdns::tsig::sign_request(question.clone(), &key, tsig::now())
+                    .expect("sign the probe");
+                let rdns::tsig::TsigCheck::Verified(session) =
+                    rdns::tsig::check_request(&probe, &server.tsig_keys, tsig::now())
+                else {
+                    panic!("the probe verifies");
+                };
+                session.reply_overhead()
+            };
+            assert!(
+                unsigned.len() <= cap && unsigned.len() + overhead > cap,
+                "the zone must answer in the window this is about: {} octets,                  cap {cap}, signature {overhead}",
+                unsigned.len()
+            );
+            assert!(!rdns::response::is_truncated(&unsigned), "unsigned it fits");
+
+            let signed = rdns::tsig::sign_request(question, &key, tsig::now()).expect("sign");
+            let reply = answer(&signed).await;
+            assert!(
+                reply.len() <= cap,
+                "a {}-octet signed datagram went out under a {cap}-octet cap",
+                reply.len()
+            );
+            let parsed = DnsMessage::try_from_bytes(&reply).expect("it parses");
+            assert!(parsed.truncation, "TC=1, so the client comes back over TCP");
+            assert!(parsed.answers.is_empty(), "the question and a TSIG");
+            assert_eq!(parsed.rcode, ResponseCode::Ok, "RFC 8945 §5.3's RCODE");
+            assert!(
+                parsed
+                    .additionals
+                    .iter()
+                    .any(|rr| rr.rdata.rtype() == rdns::Rtype::new(250)),
+                "and the TSIG it was altered to make room for, in {} octets",
+                reply.len()
+            );
         }
 
         /// A transfer asked for over UDP is not streamed, and that is now a

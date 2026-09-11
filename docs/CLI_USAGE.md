@@ -321,6 +321,11 @@ longer gets 65,535. Over the cap the reply is an empty TC=1 one and the client
 asks again over TCP, where the RFC 1035 §4.2.2 length prefix is the only limit
 and neither number applies.
 
+A TSIG-signed reply is bounded by the same number, signature included: the record
+comes out of the cap rather than on top of it, and a reply that then does not fit
+is RFC 8945 §5.3's altered response — the question, the OPT and the TSIG, TC=1,
+NOERROR.
+
 1232 is 1280 — IPv6's minimum MTU — less the IPv6 and UDP headers, and is where
 BIND, Knot, NSD and Unbound all landed after DNS Flag Day 2020. Above it a reply
 fragments, and a fragment is what middleboxes drop.

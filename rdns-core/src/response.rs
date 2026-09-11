@@ -270,6 +270,19 @@ pub(crate) fn wire_rcode(rcode: ResponseCode, has_edns: bool) -> Result<u16, Wir
     Ok(rcode)
 }
 
+/// The TC bit of a message that is already bytes.
+///
+/// Reparsing a finished reply to read one flag costs a `DnsMessage`, and the
+/// caller that needs this — `rdnsd`'s signing epilogue, which owes RFC 8945
+/// §5.3's altered response — is on the answer path. Here rather than at that
+/// call site so the bit's position is written once, beside the `write_header`
+/// that puts it there.
+///
+/// `false` for anything shorter than a header, which is not a message.
+pub fn is_truncated(message: &[u8]) -> bool {
+    message.len() >= HEADER_LEN && message[2] & 0b10 != 0
+}
+
 #[inline]
 pub(crate) fn write_header(
     buf: &mut [u8],

@@ -20,7 +20,7 @@ Everything is async `tokio::net`. Each hop is an `await` on a socket.
 | `max_delegations` | 16 | referrals followed before giving up |
 | `max_cname_hops` | 8 | |
 | `query_budget` | 64 | total upstream queries one `resolve` may spend |
-| `udp_payload_size` | 4096 | advertised upstream, and the size of the buffer an upstream answer is read into. Not `--udp-payload-size`, which is what `rdnsr` advertises to its own clients (1232); these are separate numbers because this one is also a buffer — `TODO.md` #41c |
+| `udp_payload_size` | 1232 | advertised upstream (RFC 6891 §6.2.3). `rdnsr` sets it from `--udp-payload-size`, the same number it advertises to its own clients: one host, one reassembly claim. Not the size an upstream answer is read into, which is `recurse::UPSTREAM_RECEIVE_BUFFER` = 4096 — the two were one number until #41c |
 | `delegation_cache_size` | 10 000 | 0 disables, which restarts every query at the root |
 | `qname_minimization` | on | RFC 9156 |
 | `zero_x20` | on | draft-vixie-dnsext-dns0x20 |

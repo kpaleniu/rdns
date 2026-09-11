@@ -57,11 +57,17 @@ the same day, and #21.~~ ~~**One inventory and one numbered section still, later
 the same day**: #40 closed with 40f, which filed **#41** on its way out — the
 advertised payload size is a hardcoded 4,096 and nothing caps the UDP response at
 all. Two items, neither a defect, and 41b carries the measurement to take first.~~
-**Still one inventory and one numbered section, later again**: 41a and 41b are
+~~**Still one inventory and one numbered section, later again**: 41a and 41b are
 done — the measurement first, then one type for both — and the pass filed **41c**
 (the resolver's *upstream* advertisement, which is the same hardcode wearing a
 receive buffer) and **41d** (a TSIG-signed reply overshoots the new ceiling by
-the record it appends). So #41 is still what is open, and so is #21.
+the record it appends). So #41 is still what is open, and so is #21.~~
+**One inventory, later the same day again**: 41c and 41d are done too, so #41 is
+closed on the day it was filed and **#21 is all that is left** — and #21 is not a
+queue. Nothing was filed on the way out this time: both rows' remedies survived
+being built, 41d's with a better shape than the row proposed (RFC 8945 §5.3 had
+already written it down) and 41c's with the number it names *rejected* by one
+measurement, which the section records.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -922,67 +928,6 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 41. Nothing caps the UDP response this server will send — **filed 2026-09-11**
-
-Found by #40f, which was about the *request* caps and floored one of them at the
-payload size each daemon advertises. Reading that advertisement turned up the
-other half, and it is not a cosmetic knob.
-
-**41a and 41b are done, the same day, and filed 41c and 41d on the way out.**
-The measurement 41b demanded came first and is `rdnsd/src/response_size.rs`; it
-is what the default is chosen from rather than copied. Both fixes are one type,
-`rdns::UdpSizes` — `reply_ceiling` is the only way to a UDP reply's size and it
-cannot be asked without the `min` (`CLAUDE.md` §17). The two regression tests
-were watched failing against the old behaviour: 2,093 octets out of a
-1,232-octet cap, on each daemon.
-
-| | | |
-|---|---|---|
-| ~~**41a**~~ **done 2026-09-11** | the advertised payload size is hardcoded, twice | `RDNSD_PAYLOAD_SIZE` (`rdnsd/src/main.rs:77`) and `RDNSR_PAYLOAD_SIZE` (`rdnsr/src/main.rs:43`) are both a bare `4096`, in every reply's OPT (RFC 6891 §6.2.4) and changeable only by editing the source — §14's rule, twice over. **What the others do, quoted rather than assumed** (§4): BIND `max-udp-size`, Knot `udp-max-payload`, Unbound `edns-buffer-size`, NSD `ipv4-edns-size`/`ipv6-edns-size`, and all four default to **1232** after DNS Flag Day 2020, which is below this tree's 4,096. The cost of being above it is IP fragmentation, which middleboxes drop and which is the attack surface "Fragmentation Considered Poisonous" names. The interaction to respect: #40f floors the *request* cap at this number, so lowering the advertisement lowers that floor — harmlessly, since the floor only raises and the request default stays 4,096, but it has to be checked rather than assumed |
-| ~~**41b**~~ **done 2026-09-11** | and the advertisement is not a ceiling on what we send | The finding behind 41a, and the one with teeth. A UDP reply's ceiling is `Wire::max_len`, which is `request.udp_payload_size()` (`rdnsd/src/dispatch.rs:71`) — the **client's** number, floored at 512 and ceilinged at nothing. A client advertising 65,535 is honoured, so a large signed answer goes out as ~45 IP fragments. That is precisely what every knob in 41a actually does: `max-udp-size` caps the *response*, overriding a client's advertisement downward. This tree has no such cap at all, and `ResponseLimiter` is not one — it meters bytes per second per client and can truncate for budget, never for datagram size. **The measurement to take before fixing**: what a signed answer off this tree's own zones weighs over UDP, which is a response-side sibling of `rdns/examples/request_size_probe.rs` and does not exist yet. Do not write the fix first: the right ceiling is `min(client's advertisement, our own)` and the question is whether TC=1 at 1232 is better than fragmenting at 4,096 for the answers this server actually has |
-
-**Not filed as a defect**, and the distinction matters: 41b is reachable only
-when a client asks for a large datagram and the answer is that big, and the
-fragmentation it causes is a degradation rather than a wrong answer. But it is
-the same shape as #40f's — a number the protocol lets the *peer* choose, honoured
-without a bound of our own (`CLAUDE.md` §5).
-
-**What 41a and 41b landed.** `UdpSizes { advertised, max_response }` in
-`rdns-core/src/edns.rs`, both floored at 512, both defaulting to 1232, carried
-in `ServeContext` so the two daemons read one field rather than two constants.
-`--udp-payload-size` and `--max-udp-response` on both, `udp-payload-size` and
-`max-udp-response` in `[server]`, and both numbers in each startup banner. The
-defaults are Unbound's split verbatim — `edns-buffer-size` "the EDNS reassembly
-buffer size … put into datagrams over UDP towards peers", default 1232, beside
-`max-udp-size` "Maximum UDP response size (not applied to TCP response)",
-default 1232 — and Knot's `udp-max-payload` and NSD's `ipv4-edns-size` are 1232
-in their own reference pages. BIND's `max-udp-size` is "the maximum EDNS UDP
-message size that named sends … valid values are 512 to 4096, the default value
-is 1232", and it says the split out loud: "this value applies to responses sent
-by a server; to set the advertised buffer size in queries, see edns-udp-size",
-which is 1232 as well. BIND caps its response knob at 4096 where `UdpSizes` caps
-at 65,535, which is Unbound's "off" rather than a limit worth copying.
-
-The interaction 41a's row said to check rather than assume: the request cap's
-floor moves from 4,096 to 1,232, and the default request cap stays 4,096, so
-nothing a client may send is refused that was not refused before. What does
-change is that `--max-udp-request 600` now yields 1,232 rather than 4,096 —
-closer to what the operator asked for, and printed.
-
-**The measurement, since the default rests on it.** At 1232 exactly one question
-in a small-business zone truncates, and it is ANY at a signed apex (1,289
-octets), which RFC 8482 exists to make small and which no resolver asks while
-resolving. The nearest thing a resolver does ask is an NSEC3 NXDOMAIN proof at
-760 — 1,188 while a ZSK rollover doubles every signature, which is 44 octets of
-margin and the row that says the choice is thin rather than comfortable.
-
-| | | |
-|---|---|---|
-| **41c** | the resolver's *upstream* advertisement is the third hardcode, and it is also a buffer size | `ResolverConfig::udp_payload_size` (`rdns/src/resolver.rs:227`) is the same bare `4096`, and it is what `rdnsr` advertises to authoritative servers rather than to its own clients — the number DNS Flag Day 2020 is mostly *about*. Counted while fixing 41a and deliberately left: `recurse.rs:512` sizes the receive buffer from it (`vec![0; self.config.udp_payload_size as usize]`), so lowering it to 1232 also shrinks what a non-conformant server's oversized answer can land in, where today 4,096 absorbs it. Unbound keeps those apart — `edns-buffer-size` 1232 advertised against a 65 KiB `msg-buffer-size` — so the fix is to decouple them first and only then make the advertisement a flag. **The measurement that would settle it**: how often an authoritative server answers over what was advertised — which cannot be taken on the development machine, where port 53 is intercepted and "Recursion cannot be verified here" already stands as a caveat on every figure in this file. So the version that can be taken anywhere is a unit test that a short buffer degrades to the TCP retry rather than to a lost answer |
-| **41d** | a signed reply overshoots the ceiling by the TSIG record | `TsigSession::sign` (`rdns/src/tsig.rs:570`) appends the TSIG to a message already serialized within `max_len`, so a TSIG-signed QUERY answered over UDP goes out at the cap *plus* the record — 86 octets for hmac-sha256 with a short key name, 147 for hmac-sha512 with a long one, both measured in `rdns/examples/request_size_probe.rs`. Pre-existing and narrow: the signed UDP traffic this server has is NOTIFY and SOA probes, which are tiny, so nothing has ever exceeded a ceiling this way. #41 makes it worth a number because the ceiling is now *ours* rather than the client's, and a cap that is exceeded by a fixed 86 octets is not a cap. **The remedy is named but not built**: subtract the signed record's size from the ceiling before writing, which needs a size the session can state before it signs — whether `Tsig` can give one without building the record was not checked (§18) |
-
----
-
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -1097,6 +1042,7 @@ the week; the record is under "How the queue kept going stale" in
 | **37** | where a module folder pays, and where it is motion | **filed and closed 2026-09-08**, four items. 37a was the defect: `utils::label_count` splits presentation text on `.` and `NameRef::label_count` counts wire labels, so an owner holding RFC 1035 §5.1's `\.` — loadable and signable since #35 and #36 — read as one label more in text than on the wire, and `rdnsr --dnssec` SERVFAILed a name `rdnsd` serves correctly. 37b, 37c and 37d were splits, and each corrected the count in its own row: a flat split widens only what crosses a file boundary (7 of 19, not 19), Rust privacy runs downward so a child reading its parent widens nothing (19 of 29, not 29), and `rdns-core`'s fifth module was dropped because moving two private functions to a sibling *widens* them. The measurement for a split is visibility, not line count, which is #33's rule and the reason a `dnssec/` directory stayed dropped |
 | **38** | a structural review, and what it left | **filed and closed 2026-09-09 → 2026-09-10**: three fixes in the filing commits and five sub-items after them, 38e's cross-crate half decided against rather than done. **Nothing filed was a defect**; the one defect the review turned up was in the fixed half — a DO bit dropped by three reply paths across both daemons, against `rdnsd/src/answer.rs`, which mirrored it. 38d's `rdnsd` half is what filed #39. |
 | **39** | `rdnsd` answers through two dispatchers | **filed and closed 2026-09-10 → 2026-09-11**, five items. 39a was the defect: a TSIG-rejected request counted as received over TCP and not over UDP, because the two prologues had drifted. 39b built all three shapes before keeping one, and the two it declined are the argument — a trait that had to name the type it existed to hide, and a `transport` plus `out` pair that could disagree with itself. |
+| **41** | nothing capped the UDP response, and the sizes were hardcoded | **filed and closed 2026-09-11**, four items, none of them a live defect. 41b's measurement came before its fix and is `rdnsd/src/response_size.rs`; 41a and 41b became one type, `rdns::UdpSizes`, whose `reply_ceiling` cannot be asked without the `min`. The hardcode had three instances and not the two the filing named — 41c, where the third was also a receive buffer, and where Unbound's 64 KiB was the obvious answer and the wrong one: `--max-inflight-udp` multiplies it by 1024. 41d found RFC 8945 §5.3 had already written the remedy the row guessed at. Nothing filed on the way out. |
 | **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly

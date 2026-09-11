@@ -5613,6 +5613,116 @@ that "zero-cost" is a claim about a compiler, not a fact about a diff.
 
 ---
 
+### 41. Nothing caps the UDP response this server will send — ~~**filed 2026-09-11**~~ **closed 2026-09-11**
+
+Found by #40f, which was about the *request* caps and floored one of them at the
+payload size each daemon advertises. Reading that advertisement turned up the
+other half, and it is not a cosmetic knob.
+
+~~**41a and 41b are done, the same day, and filed 41c and 41d on the way out.**~~
+**All four done 2026-09-11, the day #41 was filed.**
+The measurement 41b demanded came first and is `rdnsd/src/response_size.rs`; it
+is what the default is chosen from rather than copied. Both fixes are one type,
+`rdns::UdpSizes` — `reply_ceiling` is the only way to a UDP reply's size and it
+cannot be asked without the `min` (`CLAUDE.md` §17). The two regression tests
+were watched failing against the old behaviour: 2,093 octets out of a
+1,232-octet cap, on each daemon.
+
+| | | |
+|---|---|---|
+| ~~**41a**~~ **done 2026-09-11** | the advertised payload size is hardcoded, twice | `RDNSD_PAYLOAD_SIZE` (`rdnsd/src/main.rs:77`) and `RDNSR_PAYLOAD_SIZE` (`rdnsr/src/main.rs:43`) are both a bare `4096`, in every reply's OPT (RFC 6891 §6.2.4) and changeable only by editing the source — §14's rule, twice over. **What the others do, quoted rather than assumed** (§4): BIND `max-udp-size`, Knot `udp-max-payload`, Unbound `edns-buffer-size`, NSD `ipv4-edns-size`/`ipv6-edns-size`, and all four default to **1232** after DNS Flag Day 2020, which is below this tree's 4,096. The cost of being above it is IP fragmentation, which middleboxes drop and which is the attack surface "Fragmentation Considered Poisonous" names. The interaction to respect: #40f floors the *request* cap at this number, so lowering the advertisement lowers that floor — harmlessly, since the floor only raises and the request default stays 4,096, but it has to be checked rather than assumed |
+| ~~**41b**~~ **done 2026-09-11** | and the advertisement is not a ceiling on what we send | The finding behind 41a, and the one with teeth. A UDP reply's ceiling is `Wire::max_len`, which is `request.udp_payload_size()` (`rdnsd/src/dispatch.rs:71`) — the **client's** number, floored at 512 and ceilinged at nothing. A client advertising 65,535 is honoured, so a large signed answer goes out as ~45 IP fragments. That is precisely what every knob in 41a actually does: `max-udp-size` caps the *response*, overriding a client's advertisement downward. This tree has no such cap at all, and `ResponseLimiter` is not one — it meters bytes per second per client and can truncate for budget, never for datagram size. **The measurement to take before fixing**: what a signed answer off this tree's own zones weighs over UDP, which is a response-side sibling of `rdns/examples/request_size_probe.rs` and does not exist yet. Do not write the fix first: the right ceiling is `min(client's advertisement, our own)` and the question is whether TC=1 at 1232 is better than fragmenting at 4,096 for the answers this server actually has |
+
+**Not filed as a defect**, and the distinction matters: 41b is reachable only
+when a client asks for a large datagram and the answer is that big, and the
+fragmentation it causes is a degradation rather than a wrong answer. But it is
+the same shape as #40f's — a number the protocol lets the *peer* choose, honoured
+without a bound of our own (`CLAUDE.md` §5).
+
+**What 41a and 41b landed.** `UdpSizes { advertised, max_response }` in
+`rdns-core/src/edns.rs`, both floored at 512, both defaulting to 1232, carried
+in `ServeContext` so the two daemons read one field rather than two constants.
+`--udp-payload-size` and `--max-udp-response` on both, `udp-payload-size` and
+`max-udp-response` in `[server]`, and both numbers in each startup banner. The
+defaults are Unbound's split verbatim — `edns-buffer-size` "the EDNS reassembly
+buffer size … put into datagrams over UDP towards peers", default 1232, beside
+`max-udp-size` "Maximum UDP response size (not applied to TCP response)",
+default 1232 — and Knot's `udp-max-payload` and NSD's `ipv4-edns-size` are 1232
+in their own reference pages. BIND's `max-udp-size` is "the maximum EDNS UDP
+message size that named sends … valid values are 512 to 4096, the default value
+is 1232", and it says the split out loud: "this value applies to responses sent
+by a server; to set the advertised buffer size in queries, see edns-udp-size",
+which is 1232 as well. BIND caps its response knob at 4096 where `UdpSizes` caps
+at 65,535, which is Unbound's "off" rather than a limit worth copying.
+
+The interaction 41a's row said to check rather than assume: the request cap's
+floor moves from 4,096 to 1,232, and the default request cap stays 4,096, so
+nothing a client may send is refused that was not refused before. What does
+change is that `--max-udp-request 600` now yields 1,232 rather than 4,096 —
+closer to what the operator asked for, and printed.
+
+**The measurement, since the default rests on it.** At 1232 exactly one question
+in a small-business zone truncates, and it is ANY at a signed apex (1,289
+octets), which RFC 8482 exists to make small and which no resolver asks while
+resolving. The nearest thing a resolver does ask is an NSEC3 NXDOMAIN proof at
+760 — 1,188 while a ZSK rollover doubles every signature, which is 44 octets of
+margin and the row that says the choice is thin rather than comfortable.
+
+| | | |
+|---|---|---|
+| ~~**41c**~~ **done 2026-09-11** | the resolver's *upstream* advertisement is the third hardcode, and it is also a buffer size | `ResolverConfig::udp_payload_size` (`rdns/src/resolver.rs:227`) is the same bare `4096`, and it is what `rdnsr` advertises to authoritative servers rather than to its own clients — the number DNS Flag Day 2020 is mostly *about*. Counted while fixing 41a and deliberately left: `recurse.rs:512` sizes the receive buffer from it (`vec![0; self.config.udp_payload_size as usize]`), so lowering it to 1232 also shrinks what a non-conformant server's oversized answer can land in, where today 4,096 absorbs it. Unbound keeps those apart — `edns-buffer-size` 1232 advertised against a 65 KiB `msg-buffer-size` — so the fix is to decouple them first and only then make the advertisement a flag. **The measurement that would settle it**: how often an authoritative server answers over what was advertised — which cannot be taken on the development machine, where port 53 is intercepted and "Recursion cannot be verified here" already stands as a caveat on every figure in this file. So the version that can be taken anywhere is a unit test that a short buffer degrades to the TCP retry rather than to a lost answer |
+| ~~**41d**~~ **done 2026-09-11** | a signed reply overshoots the ceiling by the TSIG record | `TsigSession::sign` (`rdns/src/tsig.rs:570`) appends the TSIG to a message already serialized within `max_len`, so a TSIG-signed QUERY answered over UDP goes out at the cap *plus* the record — 86 octets for hmac-sha256 with a short key name, 147 for hmac-sha512 with a long one, both measured in `rdns/examples/request_size_probe.rs`. Pre-existing and narrow: the signed UDP traffic this server has is NOTIFY and SOA probes, which are tiny, so nothing has ever exceeded a ceiling this way. #41 makes it worth a number because the ceiling is now *ours* rather than the client's, and a cap that is exceeded by a fixed 86 octets is not a cap. **The remedy is named but not built**: subtract the signed record's size from the ceiling before writing, which needs a size the session can state before it signs — whether `Tsig` can give one without building the record was not checked (§18) |
+
+---
+
+**What 41c and 41d landed.**
+
+41c was one number doing two jobs. `ResolverConfig::udp_payload_size` was both
+what `rdnsr` advertises upstream *and*
+`vec![0; self.config.udp_payload_size as usize]`, the buffer an upstream answer
+is read into — so lowering the advertisement to 1232 would have narrowed the
+doorway rather than just the promise, and a datagram over the buffer is *lost*,
+not truncated into a parse error (WSAEMSGSIZE on Windows, a dropped tail
+elsewhere). Split: `recurse::UPSTREAM_RECEIVE_BUFFER` is 4,096 — what the coupled
+number was, so nothing readable yesterday is unreadable today — and
+`udp_payload_size` is 1232 and set from `rdnsr`'s own `--udp-payload-size`, since
+"what this host can reassemble" is one fact and not two.
+
+**The measurement that decided the buffer, and refused the obvious answer.**
+Unbound's `msg-buffer-size` is "65552 bytes, enough for 64 Kb packets, the
+maximum DNS message size", which looks like the number to copy. It is not, here:
+one of these exists per query in flight and `--max-inflight-udp` allows 1024, so
+64 KiB each is 64 MB against the ~1.5 MB that flag's own documentation claims it
+costs. Unbound reuses one buffer per thread; this allocates per query. The
+multiplier is the finding (`CLAUDE.md` §5), and it is why the row said to
+decouple before flagging rather than after.
+
+41d had a better answer in the RFC than the one this file guessed. The row said
+"subtract the signed record's size from the ceiling before writing"; RFC 8945
+§5.3 says what to do when it does not fit as well: "If addition of the TSIG
+record will cause the message to be truncated, the server MUST alter the
+response so that a TSIG can be included. This response contains only the
+question and a TSIG record, has the TC bit set, and has an RCODE of 0
+(NOERROR)." Both halves are in now — `TsigSession::reply_overhead`, exact rather
+than a bound and tested against what signing actually appends, and the RCODE,
+which the response writer cannot know because it has never heard of TSIG. The
+OPT stays in that reply: §5.3 is older than RFC 6891 §6.1.1 being true of every
+reply.
+
+The row's "whether `Tsig` can give a size without building the record was not
+checked" — it can. Every field is fixed-width, a name whose wire form is known,
+or the algorithm's own MAC length. The two places that grow a finished message
+were already counted in `append_tsig`'s comment ("~82 octets onto finished
+bytes"), which guarded the TCP length prefix and not the UDP ceiling.
+
+`axfr_envelopes` needed nothing: envelopes are packed to
+`AXFR_TARGET_MESSAGE_SIZE` = 16 KiB inside a 64 KiB frame, so the record has 48
+KiB of headroom, and `append_tsig` already refuses the message that would wrap
+the prefix. One `grep` and a constant, which is what #19 asks for before a row is
+filed.
+
+---
+
 ### 40. The internal APIs, asked whether they fit each other — ~~**filed 2026-09-10**~~ **closed 2026-09-11**
 
 Asked for after #39: a pass over the *joints* rather than the modules — where one
