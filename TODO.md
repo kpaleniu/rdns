@@ -62,12 +62,17 @@ done — the measurement first, then one type for both — and the pass filed **
 (the resolver's *upstream* advertisement, which is the same hardcode wearing a
 receive buffer) and **41d** (a TSIG-signed reply overshoots the new ceiling by
 the record it appends). So #41 is still what is open, and so is #21.~~
-**One inventory, later the same day again**: 41c and 41d are done too, so #41 is
+~~**One inventory, later the same day again**: 41c and 41d are done too, so #41 is
 closed on the day it was filed and **#21 is all that is left** — and #21 is not a
 queue. Nothing was filed on the way out this time: both rows' remedies survived
 being built, 41d's with a better shape than the row proposed (RFC 8945 §5.3 had
 already written it down) and 41c's with the number it names *rejected* by one
-measurement, which the section records.
+measurement, which the section records.~~ **One inventory and one numbered
+section again, later still the same day**: **#42**, the three encrypted
+transports, taken off #21's own list — the third time that list has been read by
+a session with no queue and used to pick the work, which is what it is for. Three
+stages of one item, filed with the dependency measurement the #21 line had
+asserted without ever taking.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -819,10 +824,14 @@ and **#21**, which is an inventory rather than a queue.~~ ~~**Four as of
 path's shape, **#40**, the joints between the internal APIs, and **#21**, which
 is an inventory rather than a queue.~~ ~~**Two as of 2026-09-11**, #38 having closed
 on 2026-09-10 and #39 on 2026-09-11: **#40**, ~~two sub-items of which are left
-(40d, 40f)~~ **one of which is left (40f)**, and **#21**.~~ **Two still, later
-that day**: #40 closed and filed **#41**, whose two items are open. Everything
-else numbered is under "Closed work" below; #38's, #39's and #40's sections went
-across to `docs/CLOSED_WORK.md` on 2026-09-11, which is where a closed section
+(40d, 40f)~~ **one of which is left (40f)**, and **#21**.~~ ~~**Two still, later
+that day**: #40 closed and filed **#41**, whose two items are open.~~ **Two
+again, later still**: #41 closed the day it was filed and **#42** — the three
+encrypted transports — was filed off #21's list, so the pair is #42 and #21.
+Everything
+else numbered is under "Closed work" below; #38's, #39's, #40's and #41's
+sections went
+across to `docs/CLOSED_WORK.md`, which is where a closed section
 lives.
 
 ### Where to pick up next
@@ -874,6 +883,14 @@ One candidate named elsewhere on this page, for a session that wants it:
 **SVCB/HTTPS presentation form** was the largest remaining entry in #21's
 not-implemented list and closed as #35; ~~**#13e's `Name` half**~~ closed as #36
 on 2026-09-07, so both of the two named here are gone. Not a queue either.
+
+**#42 is what is open, and its stages are ordered**: 42a first, because it costs
+7 packages and both of the others are built on it; 42b next, because `quinn`
+supplies streams and RFC 9250's framing is `rdns::framed` already; 42c last and
+largest, because it is the only one carrying a second change — the metrics
+server folding onto `hyper`, which retires the premise written in that module's
+own header. Each stage is a session or more, and the certificate story in 42a is
+the part with no decision behind it yet.
 
 > **1. ~~Push, and read the five CI jobs nobody has ever read.~~ Read 2026-09-11,
 > and the one job that cannot run here is the one that had been broken.** ~~Ask
@@ -928,6 +945,67 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
+### 42. The three encrypted transports — **filed 2026-09-11**
+
+Taken off #21's not-implemented list, where the three sat under one line: "each
+is a transport, and each drags in a TLS stack — the dependency argument §14 makes
+about the OTLP exporter applies with more force here". That argument was never
+wrong, it was never *measured*, and the measurement changes it: the tree already
+links `ring`, so the TLS stack is nearly free and the two protocols on top of it
+are the whole cost.
+
+**One item in three stages, not three items.** All three share one rustls setup,
+one certificate story and one ALPN dispatch, and 42a is the prerequisite for both
+others. Filed in the order they should be taken.
+
+| | | |
+|---|---|---|
+| **42a** | DNS over TLS (RFC 7858) | `rustls` 0.23 + `tokio-rustls` 0.26 on port 853, ALPN `dot`. **`default-features = false, features = ["ring", ...]` and not the default provider**: with `ring`, rustls resolves **0.17.14 — the exact version this tree already links for DNSSEC and TSIG** — and pulls no `aws-lc-rs`/`aws-lc-sys`, so no cmake and no C toolchain. **Measured: +7 runtime packages** against this workspace's 77. `rdns_transport::tcp`'s `Handler` trait is already generic over what answers, so the protocol half is the same accept loop over a TLS stream. **The half that is not the protocol, and is bigger**: where a certificate comes from, whether a reload picks up a renewed one, and what happens when it expires — none of that is decided, and it is what makes this a stage rather than an afternoon |
+| **42b** | DNS over QUIC (RFC 9250), via `quinn` | `quinn` 0.11, `default-features = false, features = ["runtime-tokio", "rustls-ring"]`, ALPN `doq`. **Measured: +22 over 77, so +15 on top of 42a.** Cheaper *architecturally* than 42c despite the larger dependency, because the framing is already here: §4.2 is "All DNS messages (queries and responses) sent over DoQ connections MUST be encoded as a 2-octet length field followed by the message content as specified in [RFC1035]", which is `rdns::framed` and what `tcp.rs` already writes. No HTTP anywhere — §4.2 calls it "a lightweight direct mapping … a more natural fit for both the recursive to authoritative and zone transfer scenarios". So quinn supplies streams and the existing handler supplies the answers |
+| **42c** | DNS over HTTPS (RFC 8484), **unconditional**, and the metrics server folds onto `hyper` | `hyper` 1.11 + `hyper-util` 0.1 + `http-body-util` 0.1 — the third is **not** pulled in by the other two, checked, and is what builds a body. **Measured: +27 over 77 with all three named, so +20 on top of 42a.** HTTP/1 is not a way out: §5.2 makes HTTP/2 "the minimum RECOMMENDED version", and clients negotiate `h2` by ALPN. **Unconditional is the decision, and it is what makes the second half possible.** `rdns/src/metrics_server.rs` says in its own header that it is hand-rolled "because Prometheus needs a `GET` returning text, and an HTTP stack for one method on one path costs `hyper` and everything under it" — a cost comparison, and this stage retires its premise. Fold it onto hyper and move the module to `rdns-transport`, because an HTTP stack belongs at the socket layer and not under the zone parser and the signer |
+
+**What the fold actually deletes, measured before filing so the row is not a
+guess.** `metrics_server.rs` is 315 lines: 168 of code and doc comments, 147 of
+tests. hyper replaces about **58** of the 168 — the request-line parsing (~30),
+`write_all` (6) and `response`'s status-and-header formatting (22). It replaces
+none of the accept loop, the `Stop`/`Busy` shutdown integration, the
+`try_acquire` scrape semaphore ("a queued scrape is stale by the time it is
+served"), or the `match (method, path)`, which becomes a `service_fn` with the
+same arms and the same bodies. A third of the file, not the file.
+
+`/metrics`, `/healthz` and `/readyz` all have to survive it, and the test is CI's
+`image` job, which `curl -sf`s the last two — the one job no local `cargo`
+invocation covers.
+
+**How the measurement was taken, so it can be retaken.** Dependencies appended to
+`rdns-transport/Cargo.toml`, `cargo generate-lockfile`, then unique packages from
+`cargo tree -e normal --workspace --prefix none`; the manifest and `Cargo.lock`
+restored afterwards and `git status` checked clean. Today's baseline is **77**
+runtime packages (145 in `Cargo.lock`, which counts dev-dependencies). Every
+combination resolved against this workspace's `rust-version = "1.95"` without
+complaint. The complete recipe — all three stages at once — measured **118, or
++41**. For scale, deleting the OTLP exporter §14 describes took `Cargo.lock` from
+187 to 104.
+
+**What was declined, with the numbers, because a negative result nobody can
+reproduce is an opinion (§10).**
+
+| declined | measured | why |
+|---|---|---|
+| rustls's default `aws-lc-rs` provider | 58 packages against 49 for the `ring` build, in an isolated `tokio`-only project | +9 packages *and* a cmake/C toolchain, to duplicate a crypto library the tree already links |
+| `quiche` for 42b | not resolved | "BoringSSL … needs to be built and linked", requires cmake, and NASM on Windows. This tree builds with plain `cargo` on both sides; that is the disqualifier, not the package count |
+| `s2n-quic` for 42b | 107 packages against `quinn`'s 80, same isolated project | and it drags `aws-lc-rs` back in |
+| `h2` alone instead of `hyper` for 42c | +19 over 77, so +12 on top of 42a — **cheaper than hyper by 8** | you then write the request handling for an internet-facing HTTP parser yourself. That is the half that ages badly, and it is the opposite trade from the metrics endpoint, which is on a management address and answers three paths |
+
+**What is not measured, and would refute a row rather than confirm one (§19).**
+The package count is a proxy for the dependency argument and for nothing else:
+build time, binary size and the attack surface each stack adds are all unmeasured
+here. For 42c specifically, whether `hyper` unconditional is acceptable in the
+container image's size budget is a question the `image` job can answer and this
+filing did not ask.
+
+---
+
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -957,7 +1035,7 @@ Scope, not defects. Listed so "is this missing on purpose?" has an answer.
 
 | | note |
 |---|---|
-| DoT / DoH / DoQ (7858 / 8484 / 9250) | each is a transport, and each drags in a TLS stack — the dependency argument §14 makes about the OTLP exporter applies with more force here |
+| ~~DoT / DoH / DoQ (7858 / 8484 / 9250)~~ | ~~each is a transport, and each drags in a TLS stack — the dependency argument §14 makes about the OTLP exporter applies with more force here~~ **Taken 2026-09-11 as #42**, and the reasoning is left standing because the *measurement* is what moved it rather than a change of mind: the TLS stack costs 7 packages, not a tree, because `rustls` can be told to use the `ring` this repo already links. "Applies with more force here" was a guess where §14's own argument was a count |
 | SIG(0) (RFC 2931) | TSIG covers the transaction-authentication case this server actually has. SIG(0) matters for a client that cannot share a secret in advance, which is not a deployment this serves |
 | DNS Cookies (RFC 7873) | round-trips as an opaque EDNS option. Implementing it properly is a second anti-spoofing mechanism beside the response budget, and the budget is the one that is there |
 | `$GENERATE` | a BIND zone-file extension, not an RFC. Absent because nothing here needed it |
@@ -977,9 +1055,14 @@ Everything else on the list is something absent that announces its own absence,
 which is why none of the rest is marked. ~~The next strongest, on the same
 reasoning, is **SVCB/HTTPS**: an operator who writes one in a zone file has to
 hand-encode it in `\#` form, and a mistake there is silent.~~ **Taken 2026-09-07
-and done — #35.** Twice now this list has been read by a session with no queue
+and done — #35.** ~~Twice now this list has been read by a session with no queue
 and used to pick the work, which is what it is for; nothing on it is marked any
-more.
+more.~~ **Three times, as of 2026-09-11**: the transports went as #42. That one
+went differently from the first two, and the difference is the lesson — DNAME and
+SVCB were picked because the list already carried the argument, and the
+transports were picked because the argument the list carried turned out to be
+untested. A line that says a thing is expensive is a claim to measure
+(`CLAUDE.md` §4), and this one had sat since 2026-08-03 costing nothing to check.
 
 ---
 

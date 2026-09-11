@@ -52,7 +52,7 @@ each row exists (`CLAUDE.md` §11).
 | 8945 | TSIG, incl. signed errors and chained MACs | yes, and §5.3's altered response when the record would not fit, since #41d | `tsig.rs`, `dispatch.rs` |
 | 2136 | dynamic UPDATE | **served end to end** (2026-08-03): §2.4/§2.5 forms, §3.1/§3.1.1, §3.2, §3.3 per-key scoping, §3.4.2, §3.6, §3.7. TSIG-only, scoped per key, persisted before the client is told it succeeded. A signed zone is re-signed incrementally and the version steps are journalled — see **G-4** and `TODO.md` #10 | `update.rs`, `journal.rs`, `rdnsd` |
 | 6672 | DNAME | **yes** (2026-09-06): §2.2's substitution incl. Table 1, §2.3's owner-not-redirected, §2.4/§3.3's load refusals, §2.5's uncompressed target, §3.1's synthesized CNAME, §3.2's server algorithm with YXDOMAIN on overflow, §3.4/§3.4.1's resolver half, §5.2's UPDATE rules and §5.3's DNSSEC. Obsoletes 2672 | `name::dname_redirect`, `Zone::dname_above`, `rdnsd/src/answer.rs`, `resolver.rs` |
-| 7858 / 8484 / 9250 | DoT / DoH / DoQ | no | — |
+| 7858 / 8484 / 9250 | DoT / DoH / DoQ | no — filed as `TODO.md` #42, one item in three stages | — |
 | 7873 | DNS Cookies | opaque round-trip only | `EDNS_OPTION_COOKIE` |
 | 2931 | SIG(0) | no | — |
 | 9460 | SVCB / HTTPS | **stored, served and readable in a zone file** (2026-09-07): §2.1's presentation format, §2.2's wire format and its ordering rule, §2.4's two modes, §7's six parameter shapes, §8's mandatory list. Appendix D's test vectors are a test. **Not** §4.1/§4.2's additional-section prefetching, which are `SHOULD`s — see the note below | `svcb.rs`, `codecs::char_string_decode` |
