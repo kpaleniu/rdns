@@ -67,12 +67,18 @@ closed on the day it was filed and **#21 is all that is left** — and #21 is no
 queue. Nothing was filed on the way out this time: both rows' remedies survived
 being built, 41d's with a better shape than the row proposed (RFC 8945 §5.3 had
 already written it down) and 41c's with the number it names *rejected* by one
-measurement, which the section records.~~ **One inventory and one numbered
+measurement, which the section records.~~ ~~**One inventory and one numbered
 section again, later still the same day**: **#42**, the three encrypted
 transports, taken off #21's own list — the third time that list has been read by
 a session with no queue and used to pick the work, which is what it is for. Three
 stages of one item, filed with the dependency measurement the #21 line had
-asserted without ever taking.
+asserted without ever taking.~~ **One inventory and four numbered sections, end
+of the same day**: #42, and **#43**, **#44** and **#45** from asking what stands
+between this server and one an operator could run a fleet of. #43 is the one
+that goes first — it is the only section that could *invalidate* the others
+rather than add to them, since nothing here has ever answered another
+implementation. Seventeen rows across the three, of which **nine are a `grep`
+that returned zero**, counted rather than estimated on the day of filing.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -825,9 +831,12 @@ path's shape, **#40**, the joints between the internal APIs, and **#21**, which
 is an inventory rather than a queue.~~ ~~**Two as of 2026-09-11**, #38 having closed
 on 2026-09-10 and #39 on 2026-09-11: **#40**, ~~two sub-items of which are left
 (40d, 40f)~~ **one of which is left (40f)**, and **#21**.~~ ~~**Two still, later
-that day**: #40 closed and filed **#41**, whose two items are open.~~ **Two
+that day**: #40 closed and filed **#41**, whose two items are open.~~ ~~**Two
 again, later still**: #41 closed the day it was filed and **#42** — the three
-encrypted transports — was filed off #21's list, so the pair is #42 and #21.
+encrypted transports — was filed off #21's list, so the pair is #42 and #21.~~
+**Five at the end of that day**: #42, #43 (interop against a real peer), #44
+(what an operator would find missing in `rdnsd`), #45 (what an ISP would find
+missing in `rdnsr`), and #21.
 Everything
 else numbered is under "Closed work" below; #38's, #39's, #40's and #41's
 sections went
@@ -884,13 +893,32 @@ One candidate named elsewhere on this page, for a session that wants it:
 not-implemented list and closed as #35; ~~**#13e's `Name` half**~~ closed as #36
 on 2026-09-07, so both of the two named here are gone. Not a queue either.
 
-**#42 is what is open, and its stages are ordered**: 42a first, because it costs
-7 packages and both of the others are built on it; 42b next, because `quinn`
-supplies streams and RFC 9250's framing is `rdns::framed` already; 42c last and
-largest, because it is the only one carrying a second change — the metrics
-server folding onto `hyper`, which retires the premise written in that module's
-own header. Each stage is a session or more, and the certificate story in 42a is
-the part with no decision behind it yet.
+~~**#42 is what is open, and its stages are ordered**~~ — **#43 is, as of the
+same day.** Take it before any of #42, #44 or #45: it is cheap, it needs no
+design decision, and it is the only item that can tell you the other three are
+worth doing. A year of careful work that has never spoken to BIND is a year of
+work with one untested assumption under all of it.
+
+Then, in order and for stated reasons:
+
+1. **44b**, Extended DNS Errors. The smallest row on the page and the one an
+   operator notices first.
+2. **44a**, catalog zones — the row that moves the answer from "a nice server"
+   to "a server I could run a fleet of".
+3. **#42's stages**: 42a first, because it costs 7 packages and both of the
+   others are built on it; 42b next, because `quinn` supplies streams and
+   RFC 9250's framing is `rdns::framed` already; 42c last and largest, because
+   it is the only one carrying a second change — the metrics server folding onto
+   `hyper`, which retires the premise written in that module's own header. Take
+   **44d** (XFR over TLS) as a fourth stage while the rustls plumbing is open.
+4. **44c**, the scale measurement, whenever somebody wants a number rather than
+   a feature.
+
+**#45 is a different product decision**, not a queue position: it is what an ISP
+needs, and 45a (RPZ) is a legal gate rather than a nice-to-have for anyone with
+blocking obligations. 45e is a decision to take rather than work to schedule.
+
+The certificate story in 42a is still the part with no decision behind it.
 
 > **1. ~~Push, and read the five CI jobs nobody has ever read.~~ Read 2026-09-11,
 > and the one job that cannot run here is the one that had been broken.** ~~Ask
@@ -1006,6 +1034,77 @@ filing did not ask.
 
 ---
 
+### 43. Nothing here has ever answered another implementation — **filed 2026-09-11**
+
+BIND, Knot, NSD and Unbound appear eight times in this tree as *references for
+behaviour* — SRTT tracking in `resolver/caches.rs`, the IXFR delta rules in
+`ixfr.rs`, the flag-day defaults in `resolver.rs` and `edns.rs` — and **zero
+times as peers in a test**. dnspython validates signatures and TSIG, which is
+real third-party checking and more than most projects this size have; what it is
+not is another *nameserver*.
+
+`CLAUDE.md` §1 says a test that agrees with the code is not evidence. The
+project-level form of that rule is a suite that has only ever talked to itself,
+and this section is the one item on the page that could invalidate any of the
+others rather than add to them. **It goes first.**
+
+Needs a container runtime, which makes it the second thing after CI's `image`
+job that no local `cargo` invocation can stand in for.
+
+| | | |
+|---|---|---|
+| **43a** | `rdnsd` as primary, a real secondary pulling from it | BIND, NSD and Knot each configured as a secondary for a zone this serves. AXFR out, IXFR out, NOTIFY out, TSIG on all of it. **The specific thing to watch**: whether an IXFR is applied as a delta or silently falls back to a full AXFR. The fallback is legal (RFC 1995 §2), looks identical from the outside, and would make every `ixfr.rs` test a test of a code path nobody reaches |
+| **43b** | `rdnsd` as secondary, pulling from a real primary | The other direction: BIND and Knot as primaries, `rdnsd` replicating. NOTIFY in, IXFR in, and the EXPIRE path — which means holding a transfer down long enough for the timer to fire, since that is the branch `CLAUDE.md` §4 says degrades quietly |
+| **43c** | a validating resolver over every answer shape | Unbound with the zone's DS as a trust anchor, asked for each shape `rdnsd/src/response_size.rs` already enumerates: positive, NODATA, NXDOMAIN, wildcard, both referral kinds, NSEC and NSEC3, P-256 and P-384. This is the one that would find a denial-proof bug dnspython's per-RRset check structurally cannot — it verifies signatures, not whether the *set* of records proves what the answer claims |
+| **43d** | the clients, not just the servers | `nsupdate` sending a dynamic UPDATE, and `lego` or `certbot-dns-rfc2136` completing an ACME dns-01 challenge against `rdnsd`. #40f *measured* those requests down to the octet and this tree has never received one from the software that sends them |
+| **43e** | what a real peer sends that ours does not | The negative direction, and not a fuzzer — `tests/no_input_panics.rs` covers our own parser with mutated bytes. This is about the well-formed things another implementation does that we never generate: an AXFR split differently, a TSIG on an envelope we did not expect one on, an EDNS option we ignore |
+
+**What would refute a row rather than confirm it (§19)**: if every one of these
+passes first time, the section was cheap insurance and should say so. Writing the
+expectation down first, so it cannot be revised afterwards — **43a's IXFR
+fallback and 43c's NSEC3 shapes are where this is most likely to find
+something**; 43b and 43d are most likely to pass.
+
+---
+
+### 44. What an operator would find missing in `rdnsd` — **filed 2026-09-11**
+
+Filed after asking what stands between this server and something a DNS operator
+could run a fleet of. Not features somebody wanted — each row is a thing whose
+*absence* is the reason an evaluation stops. Every "0 hits" below is a `grep`
+over the tree taken on the day of filing, not a recollection.
+
+**None of these is a defect.** The server answers correctly without them; what is
+missing is the operational surface around the answering, which is the same shape
+§14 kept finding one knob at a time.
+
+| | | |
+|---|---|---|
+| **44a** | catalog zones (RFC 9432, "DNS Catalog Zones") — **0 hits** | The largest one. A catalog zone is an ordinary zone whose contents are the *list* of zones a secondary should serve, so provisioning becomes a transfer rather than a configuration-management problem. BIND, Knot, NSD and PowerDNS all implement it. Below a handful of zones nobody misses it; somewhere around a hundred, configuring each secondary by hand stops being possible, and that is where an evaluation ends. This tree is unusually well placed for it — the consumer side is an AXFR, a parse and `install_zone`, all of which exist |
+| **44b** | Extended DNS Errors (RFC 8914) — **0 hits** | Small, and the highest value per line on this page. A bare SERVFAIL is a support ticket; the same SERVFAIL carrying EDE 6 (DNSSEC Bogus) or EDE 7 (Signature Expired) is a fixed problem. It is an EDNS option, the option list already round-trips, and the RCODE space is already a data-carrying type. Its absence is also a *signal* — it reads as software written by somebody who has not had to debug DNS at 3am |
+| **44c** | no measurement above a test zone | Not a feature, an **evidence** gap, and the first question an operator asks. `bench_zone_lookup` builds 10,000 records and the largest zone file in the tree is a dozen lines. Unmeasured: load time and memory for a zone of a million records, signing time at that size, how many zones one process holds, and what reloading all of them costs. §10's rules apply — this is a measurement to *take*, and the number it produces is the row's real content |
+| **44d** | XFR over TLS (RFC 9103, "DNS Zone Transfer over TLS") — **0 hits** | Zone contents cross the wire in clear between primary and secondary, which for anything with private names is the objection. Cheap *after* #42a: the rustls setup, the certificate plumbing and the ALPN dispatch are the same, and a transfer is already framed TCP. Worth taking as a fourth stage of #42 rather than on its own |
+| **44e** | multi-signer DNSSEC (RFC 8901, "Multi-Signer DNSSEC Models") — **0 hits** | Any zone served by two independent providers needs it, which is ordinary practice for zones that must not go down. The signer here assumes it owns every key in the apex DNSKEY set; the multi-signer models require importing another operator's ZSK and signing alongside it |
+| **44f** | key-rollover automation (RFC 6781) — **moved from #21** | Was on the not-implemented list with the note that "rollover is manual and the signer will not delete a published DNSKEY, which is the half that matters". That reasoning stands and is why this is not urgent — the dangerous half is already safe. It becomes a gate at fleet scale: a manual rollover per zone per year does not survive ten thousand zones |
+| **44g** | dnstap — **0 hits** | A query *stream*, not log lines: how operators feed analytics, security tooling and abuse handling. §14's logging decision is deliberate and right — nothing per-packet above debug, so a flood costs no log lines — and it is exactly why there is no data pipeline. Those are two different outputs and the second does not exist |
+
+---
+
+### 45. What an ISP would find missing in `rdnsr` — **filed 2026-09-11**
+
+The resolver's operator is an ISP or an enterprise, and it wants a different list
+from #44's. Same filing rule: every "0 hits" is a `grep` taken on the day.
+
+| | | |
+|---|---|---|
+| **45a** | Response Policy Zones — **0 hits** | Not an RFC — an ISC-originated specification, like `$GENERATE` — and implemented by BIND, Knot Resolver, Unbound and PowerDNS. It is how blocking is delivered: court-ordered injunctions, police lists, malware feeds. For an ISP under a blocking obligation this is not a missing feature but a legal non-starter, so it sits above everything else here. The pleasing part is the delivery mechanism: an RPZ *is* a DNS zone, so the AXFR/IXFR/NOTIFY machinery that already exists is how the policy would arrive |
+| **45b** | serve-stale (RFC 8767, "Serving Stale Data to Improve DNS Resiliency") — **0 hits** | Answer from expired cache when the authoritative servers cannot be reached, rather than SERVFAIL. It is what keeps a resolver useful through somebody else's outage, and the resilience feature a subscriber is most likely to notice the absence of |
+| **45c** | DNS64 (RFC 6147) — **0 hits** | Synthesize AAAA from A for IPv6-only clients behind NAT64. Required in an IPv6-only mobile network, which is most of them |
+| **45d** | prefetching — **0 hits** | Re-resolve a popular name before its TTL expires, so the hit rate has no hole at every expiry. Unbound's `prefetch`, and the cheapest of the rows here |
+| **45e** | EDNS Client Subnet (RFC 7871) — the option code exists and nothing reads or writes it | `EDNS_OPTION_CLIENT_SUBNET` is defined in `edns.rs` and appears at exactly one other place: its own doc comment. Forwarding it is what lets an authoritative server steer a client to a near replica, and *not* forwarding it is a defensible privacy position — RFC 7871 §2 is unusually explicit about the cost. So this row is a **decision to take**, not work to schedule, and it is the only one on this page whose right answer might be "no, and write down why" |
+
+---
+
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -1040,7 +1139,7 @@ Scope, not defects. Listed so "is this missing on purpose?" has an answer.
 | DNS Cookies (RFC 7873) | round-trips as an opaque EDNS option. Implementing it properly is a second anti-spoofing mechanism beside the response budget, and the budget is the one that is there |
 | `$GENERATE` | a BIND zone-file extension, not an RFC. Absent because nothing here needed it |
 | white lies / minimally-covering NSEC (RFC 4470) | the denial chain is precomputed at signing time, so a lie would have to be signed online. That is a different signing model, not a feature |
-| key-rollover *automation* (RFC 6781) | rollover is manual and the signer will not delete a published DNSKEY, which is the half that matters: a key published without its private half is how every rollover starts, and deleting it would undo the operator's preparation |
+| ~~key-rollover *automation* (RFC 6781)~~ | ~~rollover is manual and the signer will not delete a published DNSKEY, which is the half that matters: a key published without its private half is how every rollover starts, and deleting it would undo the operator's preparation~~ **Taken 2026-09-11 as #44f**, and the reasoning is left standing because it is still why the item is not urgent: the dangerous half is already safe. What moved it is scale, not risk |
 
 ~~**One of these is a stronger candidate than the rest**, and saying which is the
 point of writing the list down: **DNAME**, because it is the only entry that
@@ -1057,7 +1156,8 @@ reasoning, is **SVCB/HTTPS**: an operator who writes one in a zone file has to
 hand-encode it in `\#` form, and a mistake there is silent.~~ **Taken 2026-09-07
 and done — #35.** ~~Twice now this list has been read by a session with no queue
 and used to pick the work, which is what it is for; nothing on it is marked any
-more.~~ **Three times, as of 2026-09-11**: the transports went as #42. That one
+more.~~ **Three times, as of 2026-09-11**: the transports went as #42, and key-rollover
+automation went the same day as #44f, which makes it four. That one
 went differently from the first two, and the difference is the lesson — DNAME and
 SVCB were picked because the list already carried the argument, and the
 transports were picked because the argument the list carried turned out to be
