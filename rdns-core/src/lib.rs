@@ -33,30 +33,9 @@ pub use record_data::RecordData;
 /// A domain name is the wire's, not presentation text — see [`name`].
 pub use name::{Name, NameRef};
 
-#[macro_use]
-mod macros {
-    macro_rules! read_be {
-        ($dt:ty, $data:expr) => {{
-            let sz = std::mem::size_of::<$dt>();
-            if $data.len() < sz {
-                return Err($crate::error::WireError::Truncated {
-                    what: stringify!($dt),
-                    need: sz,
-                    have: $data.len(),
-                });
-            }
-            (
-                <$dt>::from_be_bytes($data[..sz].try_into().unwrap()),
-                &$data[sz..],
-            )
-        }};
-    }
-}
-
-// Declared after `macros`, because `#[macro_use]` on a module makes its macros
-// visible only to what follows it.
 mod codes;
 mod edns;
+mod macros;
 mod message;
 mod record;
 

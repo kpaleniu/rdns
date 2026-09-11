@@ -48,10 +48,11 @@ its cross-crate half decided against rather than done, which the row explains~~
 ~~**one and a half**, 38c having gone too: **38a**, and 38d's `rdnsd` half~~
 ~~**half of one**, 38a having gone as well: 38d's `rdnsd` half is all that is left,
 and it is the one that needs an argument with #20 rather than a session.~~
-**None of #38, and #39 and #40 on 2026-09-10** — 38d closed the same day: the argument was taken, taking
+~~**None of #38, and #39 and #40 on 2026-09-10**~~ — 38d closed the same day: the argument was taken, taking
 it filed the API shape it depends on (#39), and a pass over the joints between
 the internal APIs filed #40. None of #38 was a defect; #39 carries one, #40
-none.
+none. **One inventory and one numbered section again, 2026-09-11**: #39 closed
+with 39d, so what is open is **#40**'s 40d and 40f, and #21.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -768,11 +769,15 @@ Four environment traps that have each cost an hour:
 rather than a queue.~~ ~~**One section as of 2026-09-08**, #37 having closed the
 day it was filed: **#21**, which is an inventory rather than a queue.~~
 ~~**Two again as of 2026-09-09**: **#38**, whose five open sub-items are cleanups,
-and **#21**, which is an inventory rather than a queue.~~ **Four as of
+and **#21**, which is an inventory rather than a queue.~~ ~~**Four as of
 2026-09-10**: **#38**, one sub-item of which is left, **#39**, the answering
 path's shape, **#40**, the joints between the internal APIs, and **#21**, which
-is an inventory rather than a queue. Everything
-else numbered is under "Closed work" below.
+is an inventory rather than a queue.~~ **Two as of 2026-09-11**, #38 having closed
+on 2026-09-10 and #39 on 2026-09-11: **#40**, two sub-items of which are left
+(40d, 40f), and **#21**. Everything
+else numbered is under "Closed work" below — except #38's and #39's sections,
+which are closed and still sit here rather than in `docs/CLOSED_WORK.md`; their
+rows in that table say so.
 
 ### Where to pick up next
 
@@ -804,8 +809,12 @@ was two hours: the count came out at eight instances rather than three) —
 against once, so it wants an argument rather than a session.~~ **The argument
 was taken 2026-09-10**: the row carries the measurement, and it turned up the
 API shape that decides it — **#39**, one dispatcher instead of two. ~~Take #39
-first; 38d falls out of it.~~ **39a and 39b are done (2026-09-10)**, and
-38d went with them, so #38 is closed and what is left is 39c, 39e and #40.
+first; 38d falls out of it.~~ ~~**39a and 39b are done (2026-09-10)**, and
+38d went with them, so #38 is closed and what is left is 39c, 39e and #40.~~
+**#39 closed 2026-09-11**: 39c and 39e went on 2026-09-10, 39d on 2026-09-11.
+**#40's 40d and 40f are what is left**, and neither is a defect — one is twelve
+modules with no membership rule, the other is two caps with no flag and a
+measurement to take before adding one.
 
 One candidate named elsewhere on this page, for a session that wants it:
 **SVCB/HTTPS presentation form** was the largest remaining entry in #21's
@@ -858,8 +867,10 @@ The measurements are in each row, taken before anything was edited (§18).
 re-exports `rdns_core::error::*` and adds only the two types that need a `tokio`
 `From` impl, and the header says so. `absolute` appears five times and is one
 implementation: `rdns-core::text_names::absolute` plus four aliases, each a
-one-liner whose doc points at it. `rdns-core`'s `lib.rs` already documents the
-`macro_rules!` ordering trap that #39d hit in `rdnsd`. And two of `CLAUDE.md`
+one-liner whose doc points at it. ~~`rdns-core`'s `lib.rs` already documents the
+`macro_rules!` ordering trap that #39d hit in `rdnsd`.~~ **Wrong, and the only thing
+this pass called sound that was not: documenting a trap is not escaping it.** The
+same fix applied there, and it went with 39d on 2026-09-11. And two of `CLAUDE.md`
 §17's "smells, all currently in this tree" are no longer in it: `num_derive` is
 not a dependency of anything in the workspace, and OPT is a field of
 `DnsMessage` rather than a record in `additionals` — both closed with #13, whose
@@ -867,7 +878,7 @@ row says so. §17's list wants that correction the next time it is opened.
 
 ---
 
-### 39. `rdnsd` answers through two dispatchers — **filed 2026-09-10**
+### 39. `rdnsd` answers through two dispatchers — ~~**filed 2026-09-10**~~ **closed 2026-09-11**
 
 Found by taking 38d's measurement: the two items that would not seal are the two
 the root's dispatchers call, so the split is bounded by the answering path's
@@ -884,7 +895,7 @@ UDP copy's own comment says "now literally the same code".
 | ~~**39a**~~ | ~~the prologue has drifted, and a counter is the casualty~~ **done 2026-09-10** | ~~TCP counts `queries_received` and tracks the qtype at `main.rs:750`/`:752`, *before* the TSIG check at `:757`; UDP does both at `:1666`/`:1668`, *after* the check at `:1641`, which returns early on a rejection. A TSIG-rejected request is a received query over TCP and is not one over UDP, and the qtype histogram gets it on one transport only. §14: a counter's name is a claim about what it counts. The defect in this section; the rest is shape.~~ **Fixed**: the UDP path counts where the TCP path counts, before any policy can return, so the two prologues are now identical up to the TSIG check — which is what 39b merges. The test asserts both counters on both transports and was watched failing against the old order (the UDP half read 0). 906 tests on Windows, 922 on Linux, one more than before on each |
 | ~~**39b**~~ | ~~one dispatcher, with the transport as a parameter~~ **done 2026-09-10, shape A** | What varies across the two loops is three things, each already written twice: the frame (length-prefixed vs bare — the UDP UPDATE path strips the prefix by hand at `main.rs:1676`, `framed.get(2..)`), the ceiling (`u16::MAX` vs `udp_payload_size()`, which #30g recorded as the *only* difference between two copies of the error reply), and the response budget with its TC=1 fallback, which is UDP-only. A sink owning those three is the whole parameter — not `rdnsr`'s `Transport` enum, because `rdnsd`'s TCP path streams a sequence of AXFR envelopes into an `mpsc` while `rdnsr` returns one datagram. **Closing this closes 38d**: with the dispatch inside the module, all nine items seal instead of seven. **Three shapes were built and measured on 2026-09-10**, each compiling, clippy-clean and passing all 119 `rdnsd` tests, so none of them is decided by whether it works. Baseline: `main.rs` 1691 non-test code lines, the two dispatchers 229 of them. **(A) an enum sink** `Wire::{Framed(&Sender<Reply>), Datagram(&UdpSocket, SocketAddr)}` carrying `max_len` and `send` — 1620 lines. **(B) a `Wire` trait** with two impls — 1619. **(C) no sink**: the dispatcher takes `transport: Transport` plus `out: Option<&Sender<Reply>>` and *returns* `Option<Cow<[u8]>>`, the loops sending — 1601, the smallest. **A is the one to take**, and the 19 lines it costs over C buy three things C and B do not have. *One value that cannot disagree with itself*: C's two parameters can — a caller passing a sender with `Transport::Udp` streams a zone into a datagram loop and nothing there can tell — where A's single `Wire::Framed` **is** both facts, which is also what turns "a transfer is TCP-only" from `answer.rs:140`'s comment about which caller got here into a branch the compiler sees. *The send stays inside the unit under test*: under C `answering_a_second_datagram_reuses_the_first_one_s_buffer` **hung the suite** — its closing assertion is that the reused buffer "really carried an answer to the wire", and with the send moved out to the caller nothing arrived; it had to be rewritten to do the loop's job itself, which is a regression test losing its teeth. *And B is an enum wearing a trait*: asking "can this transport carry a sequence" needs a `fn sequence(&self) -> Option<&mpsc::Sender<Reply>>`, so the TCP type reappears in the vocabulary of the abstraction meant to hide it — and without a fourth method for "are you budgeted" B quietly put TCP replies through the UDP response budget, **with all 119 tests still green** (§1, live). A also gets `match` exhaustiveness the day a third transport arrives. All three delete the `&framed[2..]` hack, because all three make `transfer_error` return unframed bytes — which is 39c, and it fell out of every one of them. **Landed**: `main.rs` 1691 non-test code lines → 1620, the two dispatchers' 229 → 161 as `Wire` + the `Handler` impl + `answer` + `finish`. `transfer_error` takes a ceiling and returns unframed bytes, so `update_reply` and `answer_update` return `Option<Vec<u8>>` where they returned a `Vec` that was always 0 or 1 long, and the UDP UPDATE path's `framed.get(2..)` is gone. The UDP hot path keeps its `Cow::Borrowed` out of the worker's scratch. One new test, because **nothing covered AXFR or IXFR over UDP at all** and the merge is what makes that branch reachable from a datagram: FORMERR for AXFR (RFC 5936 §4.2), one SOA for IXFR (RFC 1995 §2), watched failing against a gate that trusts the caller. 907 tests on Windows, 923 on Linux |
 | ~~**39c**~~ | ~~the error reply is one function with a ceiling~~ **done 2026-09-10** | `error_bytes`, `truncated_reply`, `send_transfer_error` and `update_reply` — which is `transfer_error` under another name — all build "an empty reply carrying this rcode, at this ceiling, signed if the request was". §7's "two functions building the same kind of message are one function with a parameter", and #30g said the ceiling was the difference. `error_bytes` is stuck in the root today only because both the cluster and the dispatchers call it. ~~**Half of this landed with 39b**: `transfer_error` now takes `max_len` and returns unframed bytes, and `update_reply` is a one-line call to it. What is left is the consolidation proper — `error_bytes` and `truncated_reply` are still two functions building an empty reply at a ceiling, and `update_reply` is still a name for `transfer_error`.~~ **Done**: `empty_reply` is the shared part — echo the question, mirror the client's OPT with its DO bit — and `error_reply` and `truncated_reply` are the two things you can then set, each taking the ceiling. Not one function with a `truncated: bool`: the two names carry the difference and a bool at a call site would not (§17's limit on typing everything). `update_reply` is gone and `transfer_error` is `signed_error`, since it was never only the transfer's. **The ceiling now has one source**: `wire.max_len(&msg)` is read once per request and threaded to all four users, so the UPDATE path stopped hardcoding `u16::MAX` on a datagram and `truncated_reply` stopped deriving its own. The OPT test covers `error_reply` too now — it did not before — and was watched failing against a hand-rolled mirror, which is the drift it exists to catch. 907 on Windows, 923 on Linux, unchanged |
-| **39d** | the two log macros pin the module order | `bad_request!` (`main.rs:90`) and `serving_error!` (`:102`) are `macro_rules!`, so textual scoping forces `mod transfer;` below line 107 — found by hitting it. `pub(crate) use serving_error;` after each makes them ordinary imports, order-independent, without `#[macro_export]` widening them to the crate's public surface |
+| ~~**39d**~~ | ~~the two log macros pin the module order~~ **done 2026-09-11, and it was two instances** | `bad_request!` (`main.rs:90`) and `serving_error!` (`:102`) are `macro_rules!`, so textual scoping forces `mod transfer;` below line 107 — found by hitting it. `pub(crate) use serving_error;` after each makes them ordinary imports, order-independent, without `#[macro_export]` widening them to the crate's public surface. **Done**: both are re-exported that way and `dispatch` imports them like any other item. **Counting the shape first (§18) found a second instance, which this section's own sibling had filed as sound**: `read_be!` in `rdns-core`, whose `#[macro_use] mod macros` carried the trap as a comment — "Declared after `macros`, because `#[macro_use]` on a module makes its macros visible only to what follows it". Documenting an ordering constraint is not escaping it. Same fix: `pub(crate) use read_be;`, a `use crate::macros::read_be;` in each of the two users, and the module in its own file with the `//!` 40d wants. `mod macros;` now sits in the alphabetical list like any other module instead of ahead of the users it had to precede — the list is sorted rather than ordered, which is the whole of what this buys in that crate. `rdnsd`'s half is the one that demonstrates it: `mod dispatch;` moved from `main.rs:107` to `:7`, *above* the macros it used to have to follow. The third `macro_rules!` in the tree — `recv!` at `rdns/src/shutdown.rs:188` — is function-local and constrains nothing. No behaviour: 908 tests on Windows and 924 on Linux, the same counts before and after on each, clippy clean on both, `cargo doc` clean |
 
 | ~~**39e**~~ | ~~`tcp::Handler` has nowhere to keep per-connection state~~ **checked 2026-09-10, and not worth doing** | The UDP worker reuses one `Scratch` — reply buffer, name compressor, folded key — across every datagram it answers; the TCP path builds a fresh `Vec`, a fresh `NameCompressor` and a literal `&mut String::new()` per message, because `rdns_transport::tcp::Handler` takes `&self` on a `Server` shared by every connection and has no state of its own. Not a regression and not new — it is what the 39b experiment made visible, since the merged dispatcher takes a `&mut Scratch` and TCP has to conjure one per call. ~~A `Handler::State` created per connection is the shape; the measurement to hold it to is `tests/allocations.rs` plus `benches/answer_path.rs`, and the reason to be careful is that the trait is `rdnsr`'s too.~~ **The shape is wrong and the size is small.** `tcp::Handler::handle` is `tokio::spawn`ed *per message*, capped by a semaphore at `max_inflight_per_connection` (16), so that a pipelining client's next query is read while the last one is answered — up to 16 handlers for one connection run at once and no `&mut` can be handed to them. The shape that would work is "the permit carries the buffer": replace the semaphore with a pool of `Handler::Scratch`, one per in-flight slot, acquired instead of a permit. That needs an associated type on a trait `rdnsd`, `rdnsr` and the transport's own test handler all implement. **What it would buy is 3 allocations per TCP message** — the output buffer and the compressor's two — now measured and asserted in `rdns/tests/allocations.rs` beside the warm case's 0, so the number cannot drift unnoticed. Against that: TCP on an authoritative server is the fallback path, and its biggest consumer does not touch the scratch at all — `answer_transfer` serializes each envelope into its own `Vec`, at 9-20 allocations per envelope of which the buffer is one, and the compressor genuinely has to be fresh per message because a pointer addresses an offset inside its own. **Checked and wrong on the way**: each envelope looked like a 64 KiB allocation from `to_bytes_within(u16::MAX)`, but #25b already sizes the scratch to `wire_size_bound().min(max_len)` |
 
@@ -1015,7 +1026,10 @@ more.
 
 One line each. The reasoning, the RFC citations and the verification are in the
 commit that closed it and in `docs/CLOSED_WORK.md`, which holds every section
-below in full under the same number. **The numbers are stable identifiers** —
+below in full under the same number — ~~every one~~ **all but two as of
+2026-09-11**: #38's and #39's sections are closed and still sit under "Open
+work" above, which is the same drift the second correction under this table
+records, caught this time with the row rather than after it. **The numbers are stable identifiers** —
 referenced from 88 doc comments in the tree and from each other — so they are
 moved, never renumbered.
 
@@ -1062,6 +1076,8 @@ the week; the record is under "How the queue kept going stale" in
 | **36** | #13e's `Name` half: names as wire octets | **filed and closed 2026-09-07**, two commits — the type on its own, then the whole tree onto it, because `ResourceRecord::name` and `QuerySection::qname` are used by every crate and the field type could not change in stages. Closes **D-1**: a label is any binary string now, and a response carrying one relays byte for byte. Five defects found on the way, none of them in the mechanical part, and the oldest is that a name inside RDATA was never resolved against the origin (RFC 1035 §5.1) — `www IN CNAME host` stored `host.`. Of the rest: the delegation and DNSKEY caches inserted a folded key and looked one up unfolded, the NSEC3 closest-encloser walk went through presentation text once per candidate name, and `to_wire` sized every unpacked name at 255 octets and then shrank it. `dname.rs` lost its presentation half in the same commit — both directions, and a second text-to-wire decoder that disagreed with `Name` about RFC 1035 §5.1's escapes. Not one of `allocations.rs`'s forty-four assertion ranges moved; dnspython validates twenty-one answers off a signed zone, including a name with a `.` inside a label |
 | **34** | DNAME (RFC 6672) | **filed and closed 2026-09-06**, five commits — the record type, the zone, the server algorithm, the resolver, then signing and UPDATE. Taken off #21's not-implemented list, which had named it the only entry there that answered *wrong* rather than incomplete. Two bugs found by the new tests: a `Zone` flag maintained in one of the two places that maintain its siblings (now one `Shortcuts` value), and DNAME missing from UPDATE's singleton list. One test had to be rewritten because it passed with the guard it was named for deleted |
 | **37** | where a module folder pays, and where it is motion | **filed and closed 2026-09-08**, four items. 37a was the defect: `utils::label_count` splits presentation text on `.` and `NameRef::label_count` counts wire labels, so an owner holding RFC 1035 §5.1's `\.` — loadable and signable since #35 and #36 — read as one label more in text than on the wire, and `rdnsr --dnssec` SERVFAILed a name `rdnsd` serves correctly. 37b, 37c and 37d were splits, and each corrected the count in its own row: a flat split widens only what crosses a file boundary (7 of 19, not 19), Rust privacy runs downward so a child reading its parent widens nothing (19 of 29, not 29), and `rdns-core`'s fifth module was dropped because moving two private functions to a sibling *widens* them. The measurement for a split is visibility, not line count, which is #33's rule and the reason a `dnssec/` directory stayed dropped |
+| **38** | a structural review, and what it left | **filed and closed 2026-09-09 → 2026-09-10**: three fixes in the filing commits and five sub-items after them, 38e's cross-crate half decided against rather than done. **Nothing filed was a defect**; the one defect the review turned up was in the fixed half — a DO bit dropped by three reply paths across both daemons, against `rdnsd/src/answer.rs`, which mirrored it. 38d's `rdnsd` half is what filed #39. **Section still above rather than in `docs/CLOSED_WORK.md`** |
+| **39** | `rdnsd` answers through two dispatchers | **filed and closed 2026-09-10 → 2026-09-11**, five items. 39a was the defect: a TSIG-rejected request counted as received over TCP and not over UDP, because the two prologues had drifted. 39b built all three shapes before keeping one, and the two it declined are the argument — a trait that had to name the type it existed to hide, and a `transport` plus `out` pair that could disagree with itself. **Section still above rather than in `docs/CLOSED_WORK.md`** |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

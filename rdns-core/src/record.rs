@@ -5,6 +5,7 @@ use crate::codes::{Class, Rtype, Serial, Ttl};
 use crate::dname::{DName, DNameUnpacker, TryFromBytes, TryUnpackFromBytes};
 use crate::edns::{Edns, OPT_RECORD_TYPE};
 use crate::error::WireError;
+use crate::macros::read_be;
 use crate::name::Name;
 use crate::record_data::RecordData;
 use crate::record_types;

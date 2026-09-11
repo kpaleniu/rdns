@@ -3,6 +3,8 @@ mod config;
 /// Control socket. Needs a Unix domain socket, so Unix only.
 #[cfg(unix)]
 mod control;
+/// Answering one request, on either transport.
+mod dispatch;
 mod replication;
 #[cfg(test)]
 mod testutil;
@@ -76,6 +78,11 @@ use tokio::task::JoinSet;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
+// Both macros are re-exported with `pub(crate) use` rather than left to
+// `macro_rules!`'s textual scoping, which would force `mod dispatch;` below this
+// point; `#[macro_export]` would widen them to the crate's public surface
+// instead (`TODO.md` #39d).
+
 /// A peer sent something we could not use: a malformed packet, a truncated TCP
 /// message, a response arriving at a listening socket.
 ///
@@ -88,6 +95,7 @@ macro_rules! bad_request {
         tracing::debug!(peer = %$ip, $($arg)*);
     }};
 }
+pub(crate) use bad_request;
 
 /// A refusal we decided on, or a failure that is ours.
 ///
@@ -100,11 +108,8 @@ macro_rules! serving_error {
         tracing::warn!(peer = %$ip, $($arg)*);
     }};
 }
+pub(crate) use serving_error;
 
-/// Answering one request, on either transport. Declared here rather than with
-/// the other modules because `macro_rules!` is textually scoped and this one
-/// uses `bad_request!` and `serving_error!` (`TODO.md` #39d).
-mod dispatch;
 use dispatch::Wire;
 
 /// Authoritative DNS server.

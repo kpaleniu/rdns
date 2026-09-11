@@ -41,6 +41,7 @@ use rdns_transport::ServeContext;
 use crate::answer::write_response;
 use crate::replication::Secondaries;
 use crate::zones::{install_zone, ZoneContext, ZoneMap, ZoneSigning};
+use crate::{bad_request, serving_error};
 use crate::{Scratch, Server, RDNSD_PAYLOAD_SIZE};
 
 /// Where one request's reply goes, and the two things that follow from it.

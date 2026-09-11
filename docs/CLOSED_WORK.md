@@ -5455,8 +5455,10 @@ of the way a struct literal does.
 
 The four modules are private and `lib.rs` re-exports every type at the path it
 already had, so `rdns_core::Rtype` is still the path and no other crate changed.
-`mod codes` and its siblings are declared *after* `#[macro_use] mod macros`,
-because `read_be!` is visible only to what follows it.
+~~`mod codes` and its siblings are declared *after* `#[macro_use] mod macros`,
+because `read_be!` is visible only to what follows it.~~ **No longer true as of
+2026-09-11** (`TODO.md` #39d): `read_be!` is an ordinary `pub(crate) use` import
+and `mod macros;` is declared after its users, so nothing orders the list.
 
 Verified as a move: the five files, sorted and compared line for line against
 `HEAD:rdns-core/src/lib.rs`, differ only by the module headers and their import

@@ -6,6 +6,7 @@ use crate::compression::NameCompressor;
 use crate::dname::{DNameUnpacker, TryUnpackFromBytes};
 use crate::edns::{Edns, EdnsHeader, CLASSIC_UDP_SIZE};
 use crate::error::WireError;
+use crate::macros::read_be;
 use crate::name::{Name, NameRef};
 use crate::record::{Additional, ResourceRecord};
 use crate::response;
