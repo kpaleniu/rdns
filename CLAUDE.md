@@ -432,7 +432,9 @@ Terse. Facts, not essays. Say why, in as few words as it takes, then stop.
   RFC that forbids the obvious thing. One or two lines. Never restate the code.
 - No comment where the code is plain. Deleting a redundant comment is a fix.
 - Commit messages: imperative subject line, then reasoning, RFC citations, and
-  how it was verified. Terse bullets. Do not narrate the diff.
+  how it was verified. Terse bullets. Do not narrate the diff, and do not
+  describe the machine it was built on (§20) — a message is the one thing here
+  that cannot be corrected in place afterwards.
 - No new READMEs, design documents or doc-comment essays unless asked for by
   name.
 - `TODO.md` carries one line per finished item, pointing at the commit.
@@ -831,3 +833,48 @@ rule for a review.
 The check: before a row is filed, write the sentence that would make it wrong,
 and go and look. If looking is a `grep` and a function, there is no excuse for
 filing without it.
+
+---
+
+## 20. Write about the project, not about the box it was built on
+
+The split already exists and this file's own header describes it: `CLAUDE.local.md`
+is untracked and holds the paths, the Linux image, what is installed and who may
+push, and "every tracked file states its own conclusions and none depends on it
+being present". A commit message is the one artefact that cannot be corrected in
+place later, and it outlives every machine it was written on.
+
+Broken on 2026-09-11 by a commit that opened with "`gh` 2.100.0 is installed and
+authenticated here" and went on to "there is no container runtime on the Windows
+side". Both true, neither about `rdns`, and neither checkable from a clone.
+
+- **The test is a fresh clone, a year on, on somebody else's machine.** Would the
+  sentence still be true, and still tell that reader something about the code? If
+  not, it belongs in `CLAUDE.local.md`. "The Dockerfile's `COPY` list was never
+  told about the crate split" passes; "there is no container runtime here" does
+  not — the project-shaped form of that one is *`image` is the only CI job no
+  local `cargo` invocation covers*, which is a fact about the verification story
+  and stays true everywhere.
+- **A measurement keeps its platform; it does not keep its host.** §1 *requires*
+  naming the side a verification ran on, because "clippy clean" that means "clean
+  on the half this OS compiles" is a false claim. So "908 on Windows and 924 on
+  Linux" is about the code and stays. "under WSL on Fedora 44" is about a box —
+  19 commit messages in this history say "under WSL" and they are pushed and
+  staying, but write no more.
+- **"X is installed" is never a project fact.** It ages out, and a reader cannot
+  check it. A tracked file names the *tool and the command* a recipe needs;
+  whether it is present on some machine is the untracked file's business, which
+  is why the dnspython recipes are in `TODO.md` and "it is already installed" is
+  not.
+- **Do not cite `CLAUDE.local.md` as the source of a claim.** A reader without it
+  — which is every reader but one — cannot follow the reference. Cite the code,
+  the RFC, or the numbered item.
+- **When the stale claim you are correcting is itself a setup fact, do not
+  replace it with a fresher one.** §11 keeps the wrong sentence struck through;
+  the correction beside it states the *rule* ("reading a run starts no job and
+  costs no minutes"), and the detail that made the old sentence wrong goes to the
+  untracked file. Otherwise the page accumulates a machine inventory one
+  correction at a time.
+
+This applies to prose in tracked files exactly as it does to commits, and to
+`TODO.md` hardest of all, since it is the page a session reads first.
