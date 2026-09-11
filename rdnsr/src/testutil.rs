@@ -35,6 +35,7 @@ pub(crate) fn test_shell() -> Arc<ServeContext> {
         metrics: Arc::new(DnsMetrics::new()),
         logger: Arc::new(QueryLogger::new()),
         validator: Arc::new(AdmissionCheck::with_defaults()),
+        udp: rdns::UdpSizes::default(),
     })
 }
 

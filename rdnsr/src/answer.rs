@@ -24,8 +24,6 @@ use rdns::{
 };
 use rdns_transport::ServeContext;
 
-use crate::RDNSR_PAYLOAD_SIZE;
-
 /// What `rdnsr` remembers between queries.
 ///
 /// Three caches with three shapes, which is why they are not one.
@@ -104,22 +102,21 @@ pub(crate) async fn handle_query(
         ctx.metrics.track_query_type(q.qtype);
     }
 
+    // The smaller of what the client said it can take and what this resolver
+    // will send, which on TCP is neither (`rdns::UdpSizes::reply_ceiling`).
+    // Before the opcode check, because a NOTIMP reply is bounded by it too.
+    let client_max = ctx.udp.reply_ceiling(&msg, transport);
+
     // NOTIMP is more useful than answering a NOTIFY or an UPDATE with a
     // plausible QUERY-shaped reply the sender will misread (RFC 1035 §4.1.1).
     if msg.opcode != OpCode::Query {
         ctx.record_answer(ResponseCode::NotImplemented, timer);
-        return unsupported_opcode(&msg);
+        return unsupported_opcode(&msg, ctx.udp.advertised(), client_max);
     }
 
     let query = msg.queries.first()?.clone();
     let id = msg.id;
     let recursion = msg.recursion;
-    // UDP: 512 unless EDNS0 advertised more. TCP: the length prefix is the only
-    // limit, and truncating there strands a client already on the fallback.
-    let client_max = match transport {
-        Transport::Udp => msg.udp_payload_size() as usize,
-        Transport::Tcp => u16::MAX as usize,
-    };
 
     // Before any work on the client's behalf: a malformed option list is
     // FORMERR, an unimplemented EDNS version is BADVERS (RFC 6891 §6.1.3), and
@@ -129,7 +126,7 @@ pub(crate) async fn handle_query(
         Ok(edns) => edns,
         Err(rcode) => {
             ctx.record_answer(rcode, timer);
-            return edns_error(&msg, rcode, client_max);
+            return edns_error(&msg, rcode, client_max, ctx.udp.advertised());
         }
     };
     // DO means "send me the signatures", AD "tell me whether you checked"; CD
@@ -352,24 +349,30 @@ fn finish(
     // otherwise strip any OPT the upstream added so we don't reply with
     // unsolicited EDNS. DO is mirrored, since the signatures the client sees
     // were deliberate.
-    if let Some(edns) = client.edns.mirror(RDNSR_PAYLOAD_SIZE) {
+    if let Some(edns) = client.edns.mirror(ctx.udp.advertised()) {
         resp.set_edns(edns);
     } else {
         resp.additionals
             .retain(|rr| rr.rdata.rtype() != OPT_RECORD_TYPE);
     }
 
-    // Honor the client's advertised UDP size: truncates (TC=1) if it overflows.
+    // Honour the ceiling `handle_query` read once: truncates (TC=1) if it
+    // overflows.
     resp.to_bytes_within(client.max_len).ok()
 }
 
 /// An empty error response carrying a version-0 OPT record, for the EDNS-level
 /// rejections (FORMERR / BADVERS) that must be signalled before resolving.
-fn edns_error(request: &DnsMessage, rcode: ResponseCode, client_max: usize) -> Option<Vec<u8>> {
+fn edns_error(
+    request: &DnsMessage,
+    rcode: ResponseCode,
+    client_max: usize,
+    advertised: u16,
+) -> Option<Vec<u8>> {
     let mut resp = build_response(request, Vec::new(), rcode);
     // BADVERS is an extended RCODE, so the OPT record isn't optional here — it
     // carries the code's high bits.
-    resp.set_edns(Edns::with_payload_size(RDNSR_PAYLOAD_SIZE));
+    resp.set_edns(Edns::with_payload_size(advertised));
     resp.to_bytes_within(client_max).ok()
 }
 
@@ -382,12 +385,12 @@ fn edns_error(request: &DnsMessage, rcode: ResponseCode, client_max: usize) -> O
 /// The question is echoed and the OPT record mirrored if the client used EDNS
 /// (RFC 6891 §6.1.1) — a reply with no OPT may get us cached as a server that
 /// does not do EDNS.
-fn unsupported_opcode(msg: &DnsMessage) -> Option<Vec<u8>> {
+fn unsupported_opcode(msg: &DnsMessage, advertised: u16, max_len: usize) -> Option<Vec<u8>> {
     let mut resp = build_response(msg, Vec::new(), ResponseCode::NotImplemented);
-    if let Some(edns) = ClientEdns::of(msg).mirror(RDNSR_PAYLOAD_SIZE) {
+    if let Some(edns) = ClientEdns::of(msg).mirror(advertised) {
         resp.set_edns(edns);
     }
-    resp.to_bytes_within(RDNSR_PAYLOAD_SIZE as usize).ok()
+    resp.to_bytes_within(max_len).ok()
 }
 
 /// A reply to `request` carrying `answers`, from whatever produced them.
@@ -530,7 +533,13 @@ mod tests {
         edns.do_bit = true;
         request.set_edns(edns);
 
-        let bytes = unsupported_opcode(&request).expect("a NOTIMP reply");
+        let udp = rdns::UdpSizes::default();
+        let bytes = unsupported_opcode(
+            &request,
+            udp.advertised(),
+            udp.reply_ceiling(&request, Transport::Udp),
+        )
+        .expect("a NOTIMP reply");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
         assert_eq!(reply.rcode, ResponseCode::NotImplemented);
         assert!(
@@ -609,6 +618,71 @@ mod tests {
         let n = msg.to_bytes(&mut buf).expect("serialize");
         buf.truncate(n);
         buf
+    }
+
+    /// The client's EDNS advertisement is a ceiling this resolver may lower,
+    /// not one it has to honour (`TODO.md` #41b).
+    ///
+    /// A stub advertising 65,535 was given 65,535, so a large cached RRset left
+    /// as fragments — which is what every other resolver's `max-udp-size`
+    /// exists to prevent. Answered out of the cache so no upstream is involved;
+    /// the ceiling is `finish`'s and every answer path goes through it.
+    ///
+    /// Watched failing against `msg.udp_payload_size()`: 2,093 octets, TC clear.
+    #[tokio::test]
+    async fn a_udp_reply_is_capped_by_this_resolver_and_not_only_by_the_client() {
+        let (resolver, caches) = context();
+        let pool = nm("pool.example.com.");
+        caches.answers.put(
+            pool.as_ref(),
+            Qtype::of(record_types::A),
+            (0..128u32)
+                .map(|i| ResourceRecord {
+                    name: pool.clone(),
+                    class: rdns::Class::new(1),
+                    ttl: rdns::Ttl::from_secs(300),
+                    rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                        std::net::Ipv4Addr::new(198, 51, 100, (i % 254 + 1) as u8),
+                    ))
+                    .expect("encodes"),
+                })
+                .collect(),
+        );
+
+        let greedy = rdns::DnsMessageBuilder::new()
+            .with_id(1)
+            .with_query(pool.clone(), Qtype::of(record_types::A))
+            .with_recursion(true)
+            .with_edns(u16::MAX, false)
+            .build()
+            .to_bytes_within(4096)
+            .expect("serialize");
+
+        let shell = test_shell();
+        let cap = shell.udp.max_response() as usize;
+        let bytes = handle_query(
+            greedy,
+            TEST_PEER,
+            current_unix_timestamp(),
+            &resolver,
+            &caches,
+            &shell,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered from the cache");
+        assert!(
+            bytes.len() <= cap,
+            "a {}-octet datagram went out under a {cap}-octet cap",
+            bytes.len()
+        );
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert!(reply.truncation, "and says so, so the client retries");
+        assert_eq!(
+            reply.edns().expect("an OPT").udp_payload_size,
+            shell.udp.advertised(),
+            "the OPT advertises what this resolver was configured with"
+        );
     }
 
     /// CD comes back as the client set it: RFC 4035 §3.2.2, "The name server

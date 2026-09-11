@@ -31,6 +31,7 @@ use rdns::rfc5011::ManagedAnchors;
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
 use rdns::shutdown::Shutdown;
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
+use rdns::UdpSizes;
 use rdns_transport::{tcp, ServeContext, TransportLimits};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
@@ -38,9 +39,6 @@ use tokio::task::JoinSet;
 use crate::anchors::spawn_anchor_manager;
 use crate::answer::Caches;
 use crate::serve::{udp_main, Resolving};
-
-/// UDP payload size rdnsr advertises to clients via EDNS0.
-const RDNSR_PAYLOAD_SIZE: u16 = 4096;
 
 /// UDP queries this resolver will have in flight at once, when nothing says
 /// otherwise.
@@ -174,6 +172,24 @@ struct Cli {
     /// length prefix allows 65,535 — but a query has no reason to be large.
     #[arg(long, value_name = "OCTETS", default_value = "16384")]
     max_tcp_request: u16,
+    /// UDP payload size advertised to clients in every reply's OPT, in octets.
+    ///
+    /// What this resolver says it can reassemble (RFC 6891 §6.2.4), which is
+    /// why it also floors `--max-udp-request`. 1232 is where BIND, Knot, NSD
+    /// and Unbound all landed after DNS Flag Day 2020. Not what this resolver
+    /// advertises *upstream* — that is `ResolverConfig::udp_payload_size` and
+    /// `TODO.md` #41c. Floored at 512.
+    #[arg(long, value_name = "OCTETS", default_value = "1232")]
+    udp_payload_size: u16,
+    /// Largest UDP reply this resolver will send, in octets.
+    ///
+    /// The client's own advertisement is honoured only down to this: above it
+    /// the reply fragments, and a fragment is what middleboxes drop. Over the
+    /// cap the reply is an empty TC=1 and the client asks again over TCP, which
+    /// is never capped. 65535 is "whatever the client asked for"; floored at
+    /// 512.
+    #[arg(long, value_name = "OCTETS", default_value = "1232")]
+    max_udp_response: u16,
     /// How often to report what the last interval's traffic looked like, in
     /// seconds. 0 turns the anomaly warnings off.
     ///
@@ -365,13 +381,15 @@ async fn main() -> anyhow::Result<()> {
     let query_limit = RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(
         TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
     );
+    let udp = UdpSizes::new(cli.udp_payload_size, cli.max_udp_response);
     // Floored at what this resolver advertises, for the reason
     // `--max-udp-request` gives: the advertisement is a promise.
     let admission = AdmissionLimits::new(
-        cli.max_udp_request.max(RDNSR_PAYLOAD_SIZE) as usize,
+        cli.max_udp_request.max(udp.advertised()) as usize,
         cli.max_tcp_request as usize,
     );
     let ctx = Arc::new(ServeContext {
+        udp,
         limiter: Arc::new(RateLimiter::new(query_limit)),
         responses: Arc::new(ResponseLimiter::per_second(cli.response_rate)),
         metrics: Arc::new(DnsMetrics::new()),
@@ -379,7 +397,8 @@ async fn main() -> anyhow::Result<()> {
         validator: Arc::new(AdmissionCheck::new(admission.clone())),
     });
     tracing::info!(
-        "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, UDP in flight: {}",
+        "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \
+         UDP reply cap: {}B (advertising {}B), UDP in flight: {}",
         addr,
         source,
         if capacity == 0 {
@@ -388,6 +407,8 @@ async fn main() -> anyhow::Result<()> {
             format!("{capacity} entries")
         },
         dnssec_source,
+        udp.max_response(),
+        udp.advertised(),
         // Printed because the drops it causes are silent.
         cli.max_inflight_udp.max(1),
     );

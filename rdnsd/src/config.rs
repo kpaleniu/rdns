@@ -68,6 +68,13 @@ pub struct Server {
     pub max_udp_request: u16,
     #[serde(default = "default_max_tcp_request")]
     pub max_tcp_request: u16,
+    /// What every reply's OPT advertises this server can reassemble, and the
+    /// largest UDP reply it will send. Both floored at 512 — see
+    /// `rdns::UdpSizes`.
+    #[serde(default = "default_udp_payload_size")]
+    pub udp_payload_size: u16,
+    #[serde(default = "default_max_udp_response")]
+    pub max_udp_response: u16,
     /// How often the anomaly warnings run, in seconds; 0 is off. The four
     /// thresholds below are per interval.
     #[serde(default = "default_anomaly_interval")]
@@ -110,6 +117,8 @@ impl Default for Server {
             query_rate_exempt: Vec::new(),
             max_udp_request: default_max_udp_request(),
             max_tcp_request: default_max_tcp_request(),
+            udp_payload_size: default_udp_payload_size(),
+            max_udp_response: default_max_udp_response(),
             anomaly_interval: default_anomaly_interval(),
             anomaly_query_rate: default_anomaly_query_rate(),
             anomaly_error_percent: default_anomaly_error_percent(),
@@ -143,6 +152,12 @@ fn default_max_udp_request() -> u16 {
 }
 fn default_max_tcp_request() -> u16 {
     16 * 1024
+}
+fn default_udp_payload_size() -> u16 {
+    rdns::FLAG_DAY_UDP_SIZE
+}
+fn default_max_udp_response() -> u16 {
+    rdns::FLAG_DAY_UDP_SIZE
 }
 // The same numbers as the flags' defaults, which is the only place they may
 // disagree — `--help` prints one and the file falls back to the other.
@@ -428,6 +443,8 @@ impl Config {
         cli.query_rate_exempt = self.server.query_rate_exempt.clone();
         cli.max_udp_request = self.server.max_udp_request;
         cli.max_tcp_request = self.server.max_tcp_request;
+        cli.udp_payload_size = self.server.udp_payload_size;
+        cli.max_udp_response = self.server.max_udp_response;
         cli.anomaly_interval = self.server.anomaly_interval;
         cli.anomaly_query_rate = self.server.anomaly_query_rate;
         cli.anomaly_error_percent = self.server.anomaly_error_percent;

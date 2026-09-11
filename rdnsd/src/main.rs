@@ -24,6 +24,9 @@ mod control;
 /// Answering one request, on either transport.
 mod dispatch;
 mod replication;
+/// What a signed answer weighs, for `TODO.md` #41's choice of ceiling.
+#[cfg(test)]
+mod response_size;
 #[cfg(test)]
 mod testutil;
 mod zones;
@@ -65,7 +68,7 @@ use rdns::{
     zone::Zone,
     DnsMessage, ResourceRecord, Serial,
 };
-use rdns::{Name, NameRef};
+use rdns::{Name, NameRef, UdpSizes};
 // Test-only since `TODO.md` #38d moved the transfer and UPDATE answering, which
 // were the non-test callers, into `dispatch`.
 #[cfg(test)]
@@ -73,19 +76,16 @@ use rdns::{clock::current_unix_timestamp, zone::parse_zone_file_at};
 use rdns_transport::tcp;
 use rdns_transport::{recv_error_is_transient, ServeContext, TransportLimits, UDP_RECEIVE_BUFFER};
 
-/// UDP payload size rdnsd advertises to clients via EDNS0.
-const RDNSD_PAYLOAD_SIZE: u16 = 4096;
-
 /// The request caps `--max-udp-request` and `--max-tcp-request` ask for, with the
 /// one floor this daemon adds to [`AdmissionLimits::new`]'s.
 ///
-/// The UDP cap may not go below [`RDNSD_PAYLOAD_SIZE`]. That number is in every
+/// The UDP cap may not go below `--udp-payload-size`. That number is in every
 /// reply's OPT as what this server can reassemble (RFC 6891 §6.2.4), so a lower
 /// cap makes the advertisement a promise the server breaks — and breaks it in
 /// silence, which is exactly what `TODO.md` #40f found. Above it is the
 /// operator's business: accepting more than was advertised misleads nobody.
-fn admission_limits(max_udp: u16, max_tcp: u16) -> AdmissionLimits {
-    AdmissionLimits::new(max_udp.max(RDNSD_PAYLOAD_SIZE) as usize, max_tcp as usize)
+fn admission_limits(udp: UdpSizes, max_udp: u16, max_tcp: u16) -> AdmissionLimits {
+    AdmissionLimits::new(max_udp.max(udp.advertised()) as usize, max_tcp as usize)
 }
 
 /// Default for `--udp-workers`: the machine's parallelism, clamped to 2..=32.
@@ -272,6 +272,36 @@ struct Cli {
         conflicts_with = "config"
     )]
     max_udp_request: u16,
+    /// UDP payload size advertised in every reply's OPT, in octets.
+    ///
+    /// What this server says it can reassemble (RFC 6891 §6.2.4), which is why
+    /// it also floors `--max-udp-request`. 1232 is where BIND
+    /// (`edns-udp-size`), Knot (`udp-max-payload`), NSD (`ipv4-edns-size`) and
+    /// Unbound (`edns-buffer-size`) all landed after DNS Flag Day 2020. Floored
+    /// at 512.
+    #[arg(
+        long,
+        value_name = "OCTETS",
+        default_value = "1232",
+        conflicts_with = "config"
+    )]
+    udp_payload_size: u16,
+    /// Largest UDP reply this server will send, in octets.
+    ///
+    /// The client's own advertisement is honoured only down to this — a client
+    /// asking for 65,535 got exactly that before `TODO.md` #41b, so a large
+    /// signed answer left as ~45 IP fragments. Over it the reply is an empty
+    /// TC=1 and the client asks again over TCP, which is never capped. What a
+    /// signed answer off these zones weighs is measured in
+    /// `rdnsd/src/response_size.rs`. 65535 is "whatever the client asked for";
+    /// floored at 512.
+    #[arg(
+        long,
+        value_name = "OCTETS",
+        default_value = "1232",
+        conflicts_with = "config"
+    )]
+    max_udp_response: u16,
     /// Largest TCP request accepted, in octets.
     ///
     /// Not a protocol limit — the length prefix allows 65,535 — but a request
@@ -498,9 +528,11 @@ struct ServePolicy {
     response_rate: u32,
     /// Queries per second per client, with its burst and exemptions.
     query_limit: RateLimitConfig,
-    /// The largest request each transport accepts, and — for UDP — the payload
-    /// size advertised in every reply.
+    /// The largest request each transport accepts.
     admission: AdmissionLimits,
+    /// What every reply's OPT advertises, and the largest datagram this server
+    /// will send.
+    udp: UdpSizes,
     /// How often the anomaly warnings run, and what they warn about. Zero
     /// interval is off.
     anomalies: (Duration, AnomalyThresholds),
@@ -549,6 +581,7 @@ async fn serve(
         response_rate,
         query_limit,
         admission,
+        udp,
         anomalies: (anomaly_interval, anomaly_thresholds),
         udp_workers,
         metrics_listen,
@@ -647,6 +680,7 @@ async fn serve(
             validator: Arc::new(AdmissionCheck::new(admission.clone())),
             logger: Arc::new(QueryLogger::new()),
             metrics,
+            udp,
         },
         transfer_acl: Arc::new(transfer_acl),
         tsig_keys: Arc::new(tsig_keys),
@@ -661,6 +695,7 @@ async fn serve(
         "rdnsd listening on {addr} (UDP+TCP), zone transfer: {transfers}, \
          response budget: {budget}, query rate: {query_limit_note}, \
          request cap: {udp_cap}B UDP / {tcp_cap}B TCP, \
+         UDP reply cap: {reply_cap}B (advertising {advertised}B), \
          UDP workers: {udp_workers}, anomaly warnings: {anomaly_note}, \
          TSIG keys: {}, metrics: {}, control: {}",
         server.tsig_keys.len(),
@@ -671,7 +706,9 @@ async fn serve(
         match &control.socket {
             Some(path) => format!("{} (mode 0600)", path.display()),
             None => "off (--control-socket)".to_string(),
-        }
+        },
+        reply_cap = udp.max_response(),
+        advertised = udp.advertised(),
     );
     // Listening is not serving: the sockets are up and some zones are not, which
     // is invisible from outside unless `/readyz` is reachable.
@@ -1598,6 +1635,8 @@ async fn main() -> Result<()> {
     // Reload on SIGHUP or on the control socket, and re-sign on the signature
     // timer. The sender it hands back is how `rdnsctl reload` reaches the same
     // loop rather than becoming a second implementation of a reload.
+    let udp = UdpSizes::new(cli.udp_payload_size, cli.max_udp_response);
+
     let reloads = spawn_zone_maintenance(
         served.clone(),
         source,
@@ -1622,7 +1661,8 @@ async fn main() -> Result<()> {
             tsig_keys,
             response_rate: cli.response_rate,
             query_limit,
-            admission: admission_limits(cli.max_udp_request, cli.max_tcp_request),
+            admission: admission_limits(udp, cli.max_udp_request, cli.max_tcp_request),
+            udp,
             anomalies: (
                 Duration::from_secs(cli.anomaly_interval),
                 AnomalyThresholds {
@@ -2000,6 +2040,7 @@ mod tests {
             validator: Arc::new(AdmissionCheck::with_defaults()),
             logger: Arc::new(QueryLogger::new()),
             metrics: Arc::new(DnsMetrics::new()),
+            udp: UdpSizes::default(),
         }
     }
 
@@ -2040,6 +2081,92 @@ mod tests {
             query("www.example.com.", Qtype::of(record_types::A), false)
                 .to_bytes_within(4096)
                 .expect("serialize the query")
+        }
+
+        /// A pool of addresses large enough that the answer does not fit in a
+        /// datagram this server is willing to send.
+        fn large_rrset_zone() -> Zone {
+            let mut text = String::from(
+                "$ORIGIN example.com.\n\
+                 $TTL 3600\n\
+                 @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @   IN NS  ns1.example.com.\n\
+                 ns1 IN A   192.0.2.1\n",
+            );
+            for i in 0..128u32 {
+                text.push_str(&format!("pool IN A 198.51.100.{}\n", i % 254 + 1));
+            }
+            rdns::zone::parse_zone_file(&text, "example.com.").expect("the zone parses")
+        }
+
+        /// The client's EDNS advertisement is a ceiling this server may lower,
+        /// not one it has to honour (`TODO.md` #41b).
+        ///
+        /// Before: `max_len` was `request.udp_payload_size()` alone, so a client
+        /// advertising 65,535 was given 65,535 and a large answer left as ~45 IP
+        /// fragments — which middleboxes drop and which is what every other
+        /// implementation's `max-udp-size` exists to prevent. Watched failing
+        /// against that: the reply comes back whole, over 1232 octets, with TC
+        /// clear.
+        ///
+        /// The cap is the datagram's alone. The same question over TCP is
+        /// answered in full, which is where a truncated client is sent.
+        #[tokio::test]
+        async fn a_udp_reply_is_capped_by_this_server_and_not_only_by_the_client() {
+            let server = server_with(large_rrset_zone());
+            let cap = server.ctx.udp.max_response() as usize;
+            let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+            let peer = client.local_addr().expect("addr");
+
+            let greedy = rdns::DnsMessageBuilder::new()
+                .with_id(1)
+                .with_query(nm("pool.example.com."), Qtype::of(record_types::A))
+                .with_recursion(false)
+                .with_edns(u16::MAX, false)
+                .build()
+                .to_bytes_within(4096)
+                .expect("serialize");
+
+            let mut scratch = Scratch::default();
+            server
+                .answer(
+                    &greedy,
+                    peer,
+                    tsig::now(),
+                    &Wire::Datagram(&socket, peer),
+                    &mut scratch,
+                )
+                .await;
+            assert!(
+                scratch.out.len() <= cap,
+                "a {}-octet datagram went out under a {cap}-octet cap",
+                scratch.out.len()
+            );
+            let reply = DnsMessage::try_from_bytes(&scratch.out).expect("it parses");
+            assert!(reply.truncation, "and says so, so the client retries");
+            assert!(
+                reply.answers.is_empty(),
+                "a truncated reply carries nothing"
+            );
+
+            // The same question on the transport a TC=1 sends the client to.
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            server
+                .answer(
+                    &greedy,
+                    peer,
+                    tsig::now(),
+                    &Wire::Framed(&tx),
+                    &mut Scratch::default(),
+                )
+                .await;
+            let Some(rdns_transport::tcp::Reply::Frame(framed)) = rx.recv().await else {
+                panic!("one framed reply");
+            };
+            let over_tcp = DnsMessage::try_from_bytes(&framed[2..]).expect("it parses");
+            assert!(!over_tcp.truncation, "TCP is not capped by either number");
+            assert_eq!(over_tcp.answers.len(), 128);
         }
 
         /// A transfer asked for over UDP is not streamed, and that is now a
@@ -2822,13 +2949,16 @@ mod tests {
             .expect("serialize");
         let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
 
+        let udp = UdpSizes::default();
         assert!(
-            signed.len() > 512 && signed.len() < RDNSD_PAYLOAD_SIZE as usize,
+            signed.len() > 512 && signed.len() < udp.advertised() as usize,
             "the request this is about weighs {} octets: over the old cap, under              what is advertised",
             signed.len()
         );
 
-        let check = AdmissionCheck::new(admission_limits(RDNSD_PAYLOAD_SIZE, 16 * 1024));
+        // The cap set to the floor, which is the smallest this server can be
+        // configured to accept.
+        let check = AdmissionCheck::new(admission_limits(udp, 512, 16 * 1024));
         assert!(
             check
                 .validate_packet(&signed, Transport::Udp)
@@ -2845,13 +2975,14 @@ mod tests {
     /// mistyped knob should be wrong, not fatal).
     #[test]
     fn the_udp_request_cap_cannot_fall_below_what_is_advertised() {
+        let udp = UdpSizes::default();
         assert_eq!(
-            admission_limits(512, 16 * 1024).caps().0,
-            RDNSD_PAYLOAD_SIZE as usize,
+            admission_limits(udp, 512, 16 * 1024).caps().0,
+            udp.advertised() as usize,
             "512 is below the advertisement and is floored to it"
         );
         assert_eq!(
-            admission_limits(8192, 16 * 1024).caps().0,
+            admission_limits(udp, 8192, 16 * 1024).caps().0,
             8192,
             "above it is the operator's business"
         );

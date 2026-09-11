@@ -94,6 +94,8 @@ Exit 0 means the server would start.
 | `--query-burst` | 200 | — | floored at 1 |
 | `--query-rate-exempt` | none | — | — |
 | `--response-rate` (per source, bytes/s) | 8192 | every 2nd over-budget response is an empty TC=1 reply, the rest are dropped (`slip = 2`); burst = 4× the rate | `0` |
+| `--udp-payload-size` (advertised in every reply's OPT) | 1232 | floors `--max-udp-request`; nothing else | floored at 512 |
+| `--max-udp-response` | 1232 | over it, an empty TC=1 reply and the client retries over TCP, which is not capped | `65535` |
 | `--udp-workers` | parallelism, clamped 2–32 | datagrams queue in the socket buffer; the kernel drops the overflow and counts it (`netstat -su`) | — |
 | `MAX_TCP_CONNECTIONS` | 128 | connection waits | — |
 | `MAX_INFLIGHT_PER_CONNECTION` | 16 | read loop back-pressures | — |

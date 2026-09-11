@@ -31,7 +31,7 @@ use rdns::{
     transfer::axfr_envelopes,
     tsig::{self, TsigCheck, TsigSession},
     update,
-    validation::Request,
+    validation::{Request, Transport},
     zone::{parse_zone_file_at, Zone},
     DnsMessage, OpCode, Qtype, ResponseCode,
 };
@@ -42,7 +42,7 @@ use crate::answer::write_response;
 use crate::replication::Secondaries;
 use crate::zones::{install_zone, ZoneContext, ZoneMap, ZoneSigning};
 use crate::{bad_request, serving_error};
-use crate::{Scratch, Server, RDNSD_PAYLOAD_SIZE};
+use crate::{Scratch, Server};
 
 /// Where one request's reply goes, and the two things that follow from it.
 ///
@@ -62,13 +62,12 @@ pub(super) enum Wire<'a> {
 }
 
 impl Wire<'_> {
-    /// The size ceiling this transport puts on a reply. Over TCP the length
-    /// prefix is the only limit, so the client's EDNS payload size does not
-    /// apply (RFC 6891 §6.2.2).
-    fn max_len(&self, request: &DnsMessage) -> usize {
+    /// Which transport this is, for the two questions that turn on it: the
+    /// reply's size ceiling and whether the response budget applies.
+    fn transport(&self) -> Transport {
         match self {
-            Wire::Framed(_) => u16::MAX as usize,
-            Wire::Datagram(..) => request.udp_payload_size() as usize,
+            Wire::Framed(_) => Transport::Tcp,
+            Wire::Datagram(..) => Transport::Udp,
         }
     }
 
@@ -164,8 +163,10 @@ impl Server {
         }
 
         // One ceiling for every reply this request can produce, read once from
-        // the transport that will carry it.
-        let max_len = wire.max_len(&msg);
+        // the transport that will carry it and from this server's own limit —
+        // not from the client's advertisement alone (`TODO.md` #41b).
+        let max_len = self.ctx.udp.reply_ceiling(&msg, wire.transport());
+        let advertised = self.ctx.udp.advertised();
 
         // TSIG before anything that could answer (RFC 8945 §5.2): checking the
         // signature afterwards means answering whoever asked.
@@ -182,7 +183,9 @@ impl Server {
                     rejection.key_name(),
                     rejection.error.reason()
                 );
-                let Some(response) = error_reply(&msg, ResponseCode::NotAuthorized, max_len) else {
+                let Some(response) =
+                    error_reply(&msg, ResponseCode::NotAuthorized, max_len, advertised)
+                else {
                     return;
                 };
                 match rejection.attach(response, now) {
@@ -237,9 +240,8 @@ impl Server {
                     &zones,
                     &self.ctx.metrics,
                     max_len,
-                    &mut scratch.out,
-                    &mut scratch.compressor,
-                    &mut scratch.key,
+                    advertised,
+                    scratch,
                 )
             }
         };
@@ -278,9 +280,12 @@ impl Server {
             Wire::Framed(_) => Some(Cow::Borrowed(scratch.out.as_slice())),
             Wire::Datagram(..) => match self.ctx.admit_response(ip, scratch.out.len(), now) {
                 ResponseVerdict::Send => Some(Cow::Borrowed(scratch.out.as_slice())),
-                ResponseVerdict::Truncate => {
-                    truncated_reply(request, wire.max_len(request)).map(Cow::Owned)
-                }
+                ResponseVerdict::Truncate => truncated_reply(
+                    request,
+                    self.ctx.udp.reply_ceiling(request, wire.transport()),
+                    self.ctx.udp.advertised(),
+                )
+                .map(Cow::Owned),
                 ResponseVerdict::Drop => None,
             },
         };
@@ -561,7 +566,7 @@ impl Server {
         session: Option<&mut TsigSession>,
         max_len: usize,
     ) -> Option<Vec<u8>> {
-        let Some(bytes) = error_reply(msg, rcode, max_len) else {
+        let Some(bytes) = error_reply(msg, rcode, max_len, self.ctx.udp.advertised()) else {
             serving_error!(self.ctx.logger, ip, "could not serialize an error response");
             return None;
         };
@@ -790,9 +795,9 @@ impl Server {
 /// call sites, and three of them dropped the DO bit, so a validating client that
 /// asked over UDP and got TC=1 read the answer as coming from a server that had
 /// stopped doing DNSSEC (`TODO.md` #38, `CLAUDE.md` §7).
-fn empty_reply(request: &DnsMessage) -> DnsMessage {
+fn empty_reply(request: &DnsMessage, advertised: u16) -> DnsMessage {
     let mut resp = DnsMessage::reply_to(request);
-    if let Some(edns) = ClientEdns::of(request).mirror(RDNSD_PAYLOAD_SIZE) {
+    if let Some(edns) = ClientEdns::of(request).mirror(advertised) {
         resp.set_edns(edns);
     }
     resp
@@ -800,11 +805,16 @@ fn empty_reply(request: &DnsMessage) -> DnsMessage {
 
 /// An empty reply to `request` carrying `rcode`, serialized within `max_len`.
 ///
-/// The ceiling is the transport's — [`Wire::max_len`] — and it is the only thing
+/// The ceiling is [`rdns::UdpSizes::reply_ceiling`]'s, and it is the only thing
 /// the UDP TSIG rejection's own copy of this used to differ in
 /// (`TODO.md` #30g).
-fn error_reply(request: &DnsMessage, rcode: ResponseCode, max_len: usize) -> Option<Vec<u8>> {
-    let mut resp = empty_reply(request);
+fn error_reply(
+    request: &DnsMessage,
+    rcode: ResponseCode,
+    max_len: usize,
+    advertised: u16,
+) -> Option<Vec<u8>> {
+    let mut resp = empty_reply(request, advertised);
     resp.rcode = rcode;
     resp.to_bytes_within(max_len).ok()
 }
@@ -879,10 +889,10 @@ fn apply_update_to_file(
 /// would leave a legitimate client with a timeout and no hint that TCP works.
 ///
 /// No AA — the reply carries no data — and bounded by the caller's ceiling,
-/// which on the transport this can happen on is the client's EDNS payload size
-/// rather than 512 (RFC 6891 §6.2.4).
-fn truncated_reply(request: &DnsMessage, max_len: usize) -> Option<Vec<u8>> {
-    let mut resp = empty_reply(request);
+/// which on the transport this can happen on is the smaller of the client's
+/// EDNS payload size and this server's own, rather than 512 (RFC 6891 §6.2.4).
+fn truncated_reply(request: &DnsMessage, max_len: usize, advertised: u16) -> Option<Vec<u8>> {
+    let mut resp = empty_reply(request, advertised);
     resp.truncation = true;
     resp.to_bytes_within(max_len).ok()
 }
@@ -949,6 +959,7 @@ mod tests {
     use crate::testutil::{nm, query};
     use crate::zones::zone_key;
     use rdns::record_types;
+    use rdns::UdpSizes;
     use std::collections::HashMap;
     use tokio::sync::Notify;
 
@@ -963,10 +974,11 @@ mod tests {
     /// covers both: a mirror written a third time is the way this comes back.
     #[test]
     fn every_empty_reply_mirrors_the_clients_opt() {
+        let udp = UdpSizes::default();
         let asked = query("www.example.com.", Qtype::of(record_types::A), true);
-        let ceiling = asked.udp_payload_size() as usize;
+        let ceiling = udp.reply_ceiling(&asked, Transport::Udp);
 
-        let bytes = truncated_reply(&asked, ceiling).expect("a truncated reply");
+        let bytes = truncated_reply(&asked, ceiling, udp.advertised()).expect("a truncated reply");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
         assert!(reply.truncation, "TC=1");
         assert!(
@@ -976,16 +988,18 @@ mod tests {
                 .do_bit
         );
 
-        let bytes = error_reply(&asked, ResponseCode::Refused, ceiling).expect("an error reply");
+        let bytes = error_reply(&asked, ResponseCode::Refused, ceiling, udp.advertised())
+            .expect("an error reply");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
         assert_eq!(reply.rcode, ResponseCode::Refused);
         assert!(reply.edns().expect("an OPT").do_bit, "and so does this one");
 
         let plain = query("www.example.com.", Qtype::of(record_types::A), false);
-        let ceiling = plain.udp_payload_size() as usize;
+        let ceiling = udp.reply_ceiling(&plain, Transport::Udp);
         for bytes in [
-            truncated_reply(&plain, ceiling).expect("a truncated reply"),
-            error_reply(&plain, ResponseCode::Refused, ceiling).expect("an error reply"),
+            truncated_reply(&plain, ceiling, udp.advertised()).expect("a truncated reply"),
+            error_reply(&plain, ResponseCode::Refused, ceiling, udp.advertised())
+                .expect("an error reply"),
         ] {
             let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
             assert!(!reply.edns().expect("an OPT").do_bit, "and only when asked");

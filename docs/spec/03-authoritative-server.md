@@ -154,8 +154,15 @@ parse caps at zero.
 ### 3.2.9 EDNS mirroring
 
 An OPT record is included only when the client sent one (RFC 6891 §6.1.1),
-advertising `RDNSD_PAYLOAD_SIZE`, with DO echoed when it was asked for
-(RFC 3225 §3). This applies on every reply path, NOTIMP and every error included.
+advertising `--udp-payload-size` (default 1232), with DO echoed when it was asked
+for (RFC 3225 §3). This applies on every reply path, NOTIMP and every error
+included.
+
+A UDP reply is bounded by `min(the client's advertisement, --max-udp-response)`,
+floored at 512 — `UdpSizes::reply_ceiling`, which is also where a TCP reply is
+told that neither number applies (RFC 1035 §4.2.2). Over the bound the reply is
+an empty TC=1 one. What the answers off a signed zone weigh against that bound is
+measured in `rdnsd/src/response_size.rs`.
 
 ---
 

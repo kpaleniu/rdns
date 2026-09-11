@@ -23,8 +23,9 @@ rdnsd [OPTIONS]
 ```
 
 UDP and TCP from one process, same host and port. Both are mandatory for an
-authoritative server: a reply overflowing the client's UDP payload size goes out
-with TC=1 and the client retries over TCP (RFC 1035 §4.2.1), and zone transfers
+authoritative server: a reply overflowing the smaller of the client's UDP payload
+size and `--max-udp-response` goes out with TC=1 and the client retries over TCP
+(RFC 1035 §4.2.1), and zone transfers
 are TCP-only (RFC 5936 §4.2). Whichever loop fails first takes the process down,
 so it never quietly serves one and not the other.
 
@@ -303,6 +304,50 @@ process instead of 64 KB.
 rdnsd --zone-file example.com.zone                     # one worker per CPU, 2–32
 rdnsd --zone-file example.com.zone --udp-workers 2     # small VM
 ```
+
+### `--udp-payload-size <OCTETS>` and `--max-udp-response <OCTETS>` (UDP)
+
+The two sizes a UDP answer is governed by. Both default to **1232**, both are
+floored at 512, and both are in the startup banner.
+
+`--udp-payload-size` is what every reply's OPT record says this server can
+reassemble (RFC 6891 §6.2.4) — a statement about *receiving*, which is why it
+also floors `--max-udp-request`: refusing a request smaller than what the OPT
+advertised is a promise broken in silence.
+
+`--max-udp-response` is the largest datagram this server will *send*. A client's
+EDNS advertisement is honoured only down to it, so a stub asking for 65,535 no
+longer gets 65,535. Over the cap the reply is an empty TC=1 one and the client
+asks again over TCP, where the RFC 1035 §4.2.2 length prefix is the only limit
+and neither number applies.
+
+1232 is 1280 — IPv6's minimum MTU — less the IPv6 and UDP headers, and is where
+BIND, Knot, NSD and Unbound all landed after DNS Flag Day 2020. Above it a reply
+fragments, and a fragment is what middleboxes drop.
+
+What this costs in TCP retries is a property of your zones, not of the number, so
+measure rather than guess: `cargo test -p rdnsd response_size -- --nocapture`
+weighs every shape of answer off a signed zone. For the zone it uses, one
+question of eighteen exceeds 1232 and it is ANY at a signed apex; an NSEC3
+NXDOMAIN proof is 760, or 1,188 during a ZSK rollover.
+
+```bash
+rdnsd --zone-file example.com.zone                              # 1232 / 1232
+rdnsd --zone-file example.com.zone --max-udp-response 4096      # the pre-#41 size, bounded
+rdnsd --zone-file example.com.zone --max-udp-response 65535     # whatever the client asked for
+```
+
+### `--max-udp-request <OCTETS>` and `--max-tcp-request <OCTETS>`
+
+The largest request each transport will parse, before anything is allocated for
+it. 4096 on UDP and 16 KiB on TCP; over the cap the packet is dropped in silence,
+so the effective pair is in the startup banner.
+
+The UDP one is floored at `--udp-payload-size` for the reason above. It is 4096
+rather than RFC 1035's 512 because a legitimate signed UPDATE is larger than 512:
+a 2048-bit DKIM rotation weighs 566 octets with its TSIG and an ACME order with
+ten SANs 898, measured by
+`cargo run --release -p rdns --example request_size_probe`.
 
 ### `--control-socket <PATH>` (Unix only)
 

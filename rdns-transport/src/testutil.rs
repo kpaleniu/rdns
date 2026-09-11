@@ -21,6 +21,7 @@ pub(crate) fn context(rate: u32) -> ServeContext {
         validator: Arc::new(AdmissionCheck::with_defaults()),
         logger: Arc::new(QueryLogger::new()),
         metrics: Arc::new(DnsMetrics::new()),
+        udp: rdns::UdpSizes::default(),
     }
 }
 

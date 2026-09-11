@@ -9,12 +9,12 @@
 //! invisible to another crate, which is the whole of `TODO.md` #38e. One copy
 //! per crate is the floor without a `testkit` feature.
 
-use rdns::compression::NameCompressor;
 use rdns::metrics::DnsMetrics;
 use rdns::{DnsMessage, DnsMessageBuilder, Qtype};
 
 use crate::answer::write_response;
 use crate::zones::Zones;
+use crate::Scratch;
 
 /// The answer to `msg`, read back off the wire.
 ///
@@ -24,19 +24,17 @@ use crate::zones::Zones;
 /// two (`CLAUDE.md` §1). `u16::MAX` because nothing here is about truncation;
 /// the tests that are pass their own limit.
 pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetrics) -> DnsMessage {
-    let mut out = Vec::new();
-    let mut compressor = NameCompressor::new();
+    let mut scratch = Scratch::default();
     write_response(
         msg,
         zones,
         metrics,
         u16::MAX as usize,
-        &mut out,
-        &mut compressor,
-        &mut String::new(),
+        rdns::UdpSizes::default().advertised(),
+        &mut scratch,
     )
     .expect("the response serializes");
-    DnsMessage::try_from_bytes(&out).expect("and parses back")
+    DnsMessage::try_from_bytes(&scratch.out).expect("and parses back")
 }
 
 /// A query for `qname`/`qtype`, with DO set when `dnssec_ok`.

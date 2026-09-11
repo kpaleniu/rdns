@@ -41,8 +41,9 @@ mod record;
 
 pub use codes::{Class, OpCode, Qtype, QueryClass, ResponseCode, Rtype, Serial, Ttl};
 pub use edns::{
-    Edns, EdnsHeader, EdnsOption, CLASSIC_UDP_SIZE, EDNS_OPTION_CLIENT_SUBNET, EDNS_OPTION_COOKIE,
-    EDNS_OPTION_NSID, EDNS_OPTION_PADDING, EDNS_VERSION, OPT_RECORD_TYPE,
+    Edns, EdnsHeader, EdnsOption, UdpSizes, CLASSIC_UDP_SIZE, EDNS_OPTION_CLIENT_SUBNET,
+    EDNS_OPTION_COOKIE, EDNS_OPTION_NSID, EDNS_OPTION_PADDING, EDNS_VERSION, FLAG_DAY_UDP_SIZE,
+    OPT_RECORD_TYPE,
 };
 pub use message::{framed, rand_id, DnsMessage, DnsMessageBuilder, QuerySection};
 pub use record::{ParsedRecord, ResourceRecord};

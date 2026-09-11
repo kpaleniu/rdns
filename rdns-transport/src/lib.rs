@@ -30,7 +30,7 @@ use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::security::{RateLimiter, ResponseLimiter, ResponseVerdict};
 use rdns::shutdown::{stop_signal, Shutdown};
 use rdns::validation::{AdmissionCheck, Transport};
-use rdns::ResponseCode;
+use rdns::{ResponseCode, UdpSizes};
 
 /// WSAEMSGSIZE: the datagram was larger than the buffer offered for it. Rust has
 /// no [`std::io::ErrorKind`] for it — it arrives as `Uncategorized` — so the raw
@@ -86,6 +86,9 @@ pub struct ServeContext {
     pub logger: Arc<QueryLogger>,
     /// What an operator scrapes.
     pub metrics: Arc<DnsMetrics>,
+    /// What this host advertises it can reassemble, and the largest datagram it
+    /// will send. Not an `Arc`: two `u16`s fixed at startup.
+    pub udp: UdpSizes,
 }
 
 impl ServeContext {

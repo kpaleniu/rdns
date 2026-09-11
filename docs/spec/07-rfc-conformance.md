@@ -43,7 +43,7 @@ each row exists (`CLAUDE.md` §11).
 | 4592 §4.4 | an existing name ends the search | yes | `name_kind_of_key` |
 | 5936 | AXFR: TCP only, SOA-framed, multi-message | yes | `transfer.rs` |
 | 1995 | IXFR, both directions, UDP single-SOA form | yes, and the deltas survive a restart since 2026-08-03 | `ixfr.rs`, `journal.rs` |
-| 6891 | EDNS0 | yes — one OPT enforced, BADVERS, mirroring | `edns.rs`, `message.rs`, `make_response` |
+| 6891 | EDNS0 | yes — one OPT enforced, BADVERS, mirroring, and §6.2.5's "smaller of the two" since #41 | `edns.rs` (`UdpSizes`), `message.rs`, `make_response` |
 | 6895 §2.3 | the RCODE space stays open | yes — `ResponseCode::Other` | `codes.rs` |
 | 6761 / 6762 / 6303 | special-use names | yes (`rdnsr` only) | `special_names.rs` |
 | 7766 §6.2.1 | many queries per TCP connection, concurrent | yes | both daemons |

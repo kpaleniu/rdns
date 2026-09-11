@@ -12,7 +12,6 @@
 
 use std::borrow::Cow;
 
-use rdns::compression::NameCompressor;
 use rdns::error::WireError;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::name::{dname_redirect, Redirect};
@@ -28,23 +27,28 @@ use rdns::{
 };
 
 use crate::zones::Zones;
-use crate::RDNSD_PAYLOAD_SIZE;
+use crate::Scratch;
 
-/// Write a DNS response to `msg` into `out`, at most `max_len` octets.
+/// Write a DNS response to `msg` into `scratch.out`, at most `max_len` octets,
+/// advertising `advertised` in the OPT it mirrors back.
 ///
-/// `out` and `compressor` are the caller's to keep: a worker answering one
-/// datagram after another reuses both and the answer costs the allocator
-/// nothing. Over `max_len` the reply is an empty TC=1 one (RFC 1035 §4.2.1).
+/// `scratch` is the caller's to keep: a worker answering one datagram after
+/// another reuses it and the answer costs the allocator nothing. Over `max_len`
+/// the reply is an empty TC=1 one (RFC 1035 §4.2.1).
 pub(crate) fn write_response(
     msg: &DnsMessage,
     zones: &Zones,
     metrics: &DnsMetrics,
     max_len: usize,
-    out: &mut Vec<u8>,
-    compressor: &mut NameCompressor,
-    key_buf: &mut String,
+    advertised: u16,
+    scratch: &mut Scratch,
 ) -> Result<(), WireError> {
     let timer = LatencyTimer::new();
+    let Scratch {
+        out,
+        compressor,
+        key,
+    } = scratch;
     let mut w = ResponseWriter::start(out, compressor, max_len, msg)?;
     w.set_authoritative(true);
 
@@ -58,7 +62,7 @@ pub(crate) fn write_response(
         Err(rcode) => {
             w.set_rcode(rcode);
             // `with_payload_size` carries no options, so encoding it cannot fail.
-            w.set_edns(Edns::with_payload_size(RDNSD_PAYLOAD_SIZE));
+            w.set_edns(Edns::with_payload_size(advertised));
             return w.finish();
         }
     };
@@ -80,7 +84,7 @@ pub(crate) fn write_response(
         //
         // `ClientEdns::Present` and `msg.has_edns()` agree here: they differ
         // only for a malformed option list, which answered FORMERR above.
-        if let Some(edns) = client_edns.mirror(RDNSD_PAYLOAD_SIZE) {
+        if let Some(edns) = client_edns.mirror(advertised) {
             w.set_edns(edns);
         }
         return w.finish();
@@ -98,7 +102,7 @@ pub(crate) fn write_response(
         w.set_rcode(ResponseCode::FormatError);
         w.set_authoritative(false);
     } else if let Some(query) = msg.queries.first() {
-        answer_question(query, zones, dnssec_ok, key_buf, &mut w)?;
+        answer_question(query, zones, dnssec_ok, key, &mut w)?;
     }
 
     // Count the answer by what it says. REFUSED climbing means a zone went
@@ -111,7 +115,7 @@ pub(crate) fn write_response(
 
     // Mirror EDNS0: an OPT record only when the client used EDNS
     // (RFC 6891 §6.1.1), and DO echoed when it was asked for (RFC 3225 §3).
-    if let Some(edns) = client_edns.mirror(RDNSD_PAYLOAD_SIZE) {
+    if let Some(edns) = client_edns.mirror(advertised) {
         w.set_edns(edns);
     }
 

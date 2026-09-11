@@ -221,6 +221,11 @@ parsing, so a malformed one cannot stop the FORMERR that answers it being built.
 | `edns()` | the OPT record, if any — infallible |
 | `edns_header()` | the three parameters a server acts on, with the option list checked; `Err` is the caller's cue to answer FORMERR |
 | `udp_payload_size()` | the advertised size floored at 512 (RFC 6891 §6.2.3), or 512 with no OPT |
+
+`UdpSizes { advertised, max_response }` is a server's own pair, both floored at
+512 and both defaulting to 1232. `reply_ceiling(request, transport)` is the only
+way to a reply's size bound: `min` of the two numbers on UDP, the length prefix
+on TCP. Honouring `udp_payload_size()` alone is what `TODO.md` #41b was.
 | `Edns::options()` | the parsed list; `Err` on a malformed one |
 
 `EdnsHeader` is a `Copy` struct of the three fields.

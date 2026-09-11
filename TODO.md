@@ -53,10 +53,15 @@ it filed the API shape it depends on (#39), and a pass over the joints between
 the internal APIs filed #40. None of #38 was a defect; #39 carries one, #40
 none. ~~**One inventory and one numbered section again, 2026-09-11**: #39 closed
 with 39d, so what is open is **#40**'s ~~40d and 40f~~ **40f**, 40d having gone
-the same day, and #21.~~ **One inventory and one numbered section still, later
+the same day, and #21.~~ ~~**One inventory and one numbered section still, later
 the same day**: #40 closed with 40f, which filed **#41** on its way out — the
 advertised payload size is a hardcoded 4,096 and nothing caps the UDP response at
-all. Two items, neither a defect, and 41b carries the measurement to take first.
+all. Two items, neither a defect, and 41b carries the measurement to take first.~~
+**Still one inventory and one numbered section, later again**: 41a and 41b are
+done — the measurement first, then one type for both — and the pass filed **41c**
+(the resolver's *upstream* advertisement, which is the same hardcode wearing a
+receive buffer) and **41d** (a TSIG-signed reply overshoots the new ceiling by
+the record it appends). So #41 is still what is open, and so is #21.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -530,14 +535,25 @@ cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --query-rate 5000 --query-burst 500 --query-rate-exempt 10.0.0.0/8
 
 # The largest request each transport accepts. Both daemons default to 4096 on UDP
-# — which is what they advertise they can reassemble in every reply's OPT
-# (RFC 6891 §6.2.4), so the cap cannot be set below it — and 16 KiB on TCP. Over
-# the cap is dropped in silence, so the effective pair is in the startup banner.
-# Raise the UDP one for a deployment whose signed UPDATEs are large: measure with
-# `cargo run --release -p rdns --example request_size_probe`, which weighs the
-# requests an operator actually sends (a 2048-bit DKIM rotation is 566 octets
-# signed, an ACME order with ten SANs 898).
+# — which is at or above what they advertise they can reassemble in every reply's
+# OPT (RFC 6891 §6.2.4), so the cap cannot be set below that — and 16 KiB on TCP.
+# Over the cap is dropped in silence, so the effective pair is in the startup
+# banner. Raise the UDP one for a deployment whose signed UPDATEs are large:
+# measure with `cargo run --release -p rdns --example request_size_probe`, which
+# weighs the requests an operator actually sends (a 2048-bit DKIM rotation is 566
+# octets signed, an ACME order with ten SANs 898).
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone   --max-udp-request 8192 --max-tcp-request 32768
+
+# The two UDP *reply* sizes, which are the other half of the same question and
+# were hardcoded until #41. --udp-payload-size is what every reply's OPT says
+# this host can reassemble; --max-udp-response is the largest datagram it will
+# send, and the client's own advertisement is honoured only down to it. Both
+# default to 1232, which is where BIND, Knot, NSD and Unbound all landed after
+# DNS Flag Day 2020, and both are floored at 512. Over the reply cap the answer
+# is an empty TC=1 and the client asks again over TCP, which is never capped.
+# What this server's own answers weigh, so the number can be chosen rather than
+# copied: `cargo test -p rdnsd response_size -- --nocapture`.
+cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone   --udp-payload-size 1232 --max-udp-response 1232
 
 # How many UDP datagrams may be answered at once, which on rdnsd is also how
 # many tasks share the socket — there is no task per datagram. Defaults to the
@@ -912,16 +928,58 @@ Found by #40f, which was about the *request* caps and floored one of them at the
 payload size each daemon advertises. Reading that advertisement turned up the
 other half, and it is not a cosmetic knob.
 
+**41a and 41b are done, the same day, and filed 41c and 41d on the way out.**
+The measurement 41b demanded came first and is `rdnsd/src/response_size.rs`; it
+is what the default is chosen from rather than copied. Both fixes are one type,
+`rdns::UdpSizes` — `reply_ceiling` is the only way to a UDP reply's size and it
+cannot be asked without the `min` (`CLAUDE.md` §17). The two regression tests
+were watched failing against the old behaviour: 2,093 octets out of a
+1,232-octet cap, on each daemon.
+
 | | | |
 |---|---|---|
-| **41a** | the advertised payload size is hardcoded, twice | `RDNSD_PAYLOAD_SIZE` (`rdnsd/src/main.rs:77`) and `RDNSR_PAYLOAD_SIZE` (`rdnsr/src/main.rs:43`) are both a bare `4096`, in every reply's OPT (RFC 6891 §6.2.4) and changeable only by editing the source — §14's rule, twice over. **What the others do, quoted rather than assumed** (§4): BIND `max-udp-size`, Knot `udp-max-payload`, Unbound `edns-buffer-size`, NSD `ipv4-edns-size`/`ipv6-edns-size`, and all four default to **1232** after DNS Flag Day 2020, which is below this tree's 4,096. The cost of being above it is IP fragmentation, which middleboxes drop and which is the attack surface "Fragmentation Considered Poisonous" names. The interaction to respect: #40f floors the *request* cap at this number, so lowering the advertisement lowers that floor — harmlessly, since the floor only raises and the request default stays 4,096, but it has to be checked rather than assumed |
-| **41b** | and the advertisement is not a ceiling on what we send | The finding behind 41a, and the one with teeth. A UDP reply's ceiling is `Wire::max_len`, which is `request.udp_payload_size()` (`rdnsd/src/dispatch.rs:71`) — the **client's** number, floored at 512 and ceilinged at nothing. A client advertising 65,535 is honoured, so a large signed answer goes out as ~45 IP fragments. That is precisely what every knob in 41a actually does: `max-udp-size` caps the *response*, overriding a client's advertisement downward. This tree has no such cap at all, and `ResponseLimiter` is not one — it meters bytes per second per client and can truncate for budget, never for datagram size. **The measurement to take before fixing**: what a signed answer off this tree's own zones weighs over UDP, which is a response-side sibling of `rdns/examples/request_size_probe.rs` and does not exist yet. Do not write the fix first: the right ceiling is `min(client's advertisement, our own)` and the question is whether TC=1 at 1232 is better than fragmenting at 4,096 for the answers this server actually has |
+| ~~**41a**~~ **done 2026-09-11** | the advertised payload size is hardcoded, twice | `RDNSD_PAYLOAD_SIZE` (`rdnsd/src/main.rs:77`) and `RDNSR_PAYLOAD_SIZE` (`rdnsr/src/main.rs:43`) are both a bare `4096`, in every reply's OPT (RFC 6891 §6.2.4) and changeable only by editing the source — §14's rule, twice over. **What the others do, quoted rather than assumed** (§4): BIND `max-udp-size`, Knot `udp-max-payload`, Unbound `edns-buffer-size`, NSD `ipv4-edns-size`/`ipv6-edns-size`, and all four default to **1232** after DNS Flag Day 2020, which is below this tree's 4,096. The cost of being above it is IP fragmentation, which middleboxes drop and which is the attack surface "Fragmentation Considered Poisonous" names. The interaction to respect: #40f floors the *request* cap at this number, so lowering the advertisement lowers that floor — harmlessly, since the floor only raises and the request default stays 4,096, but it has to be checked rather than assumed |
+| ~~**41b**~~ **done 2026-09-11** | and the advertisement is not a ceiling on what we send | The finding behind 41a, and the one with teeth. A UDP reply's ceiling is `Wire::max_len`, which is `request.udp_payload_size()` (`rdnsd/src/dispatch.rs:71`) — the **client's** number, floored at 512 and ceilinged at nothing. A client advertising 65,535 is honoured, so a large signed answer goes out as ~45 IP fragments. That is precisely what every knob in 41a actually does: `max-udp-size` caps the *response*, overriding a client's advertisement downward. This tree has no such cap at all, and `ResponseLimiter` is not one — it meters bytes per second per client and can truncate for budget, never for datagram size. **The measurement to take before fixing**: what a signed answer off this tree's own zones weighs over UDP, which is a response-side sibling of `rdns/examples/request_size_probe.rs` and does not exist yet. Do not write the fix first: the right ceiling is `min(client's advertisement, our own)` and the question is whether TC=1 at 1232 is better than fragmenting at 4,096 for the answers this server actually has |
 
 **Not filed as a defect**, and the distinction matters: 41b is reachable only
 when a client asks for a large datagram and the answer is that big, and the
 fragmentation it causes is a degradation rather than a wrong answer. But it is
 the same shape as #40f's — a number the protocol lets the *peer* choose, honoured
 without a bound of our own (`CLAUDE.md` §5).
+
+**What 41a and 41b landed.** `UdpSizes { advertised, max_response }` in
+`rdns-core/src/edns.rs`, both floored at 512, both defaulting to 1232, carried
+in `ServeContext` so the two daemons read one field rather than two constants.
+`--udp-payload-size` and `--max-udp-response` on both, `udp-payload-size` and
+`max-udp-response` in `[server]`, and both numbers in each startup banner. The
+defaults are Unbound's split verbatim — `edns-buffer-size` "the EDNS reassembly
+buffer size … put into datagrams over UDP towards peers", default 1232, beside
+`max-udp-size` "Maximum UDP response size (not applied to TCP response)",
+default 1232 — and Knot's `udp-max-payload` and NSD's `ipv4-edns-size` are 1232
+in their own reference pages. BIND's `max-udp-size` is "the maximum EDNS UDP
+message size that named sends … valid values are 512 to 4096, the default value
+is 1232", and it says the split out loud: "this value applies to responses sent
+by a server; to set the advertised buffer size in queries, see edns-udp-size",
+which is 1232 as well. BIND caps its response knob at 4096 where `UdpSizes` caps
+at 65,535, which is Unbound's "off" rather than a limit worth copying.
+
+The interaction 41a's row said to check rather than assume: the request cap's
+floor moves from 4,096 to 1,232, and the default request cap stays 4,096, so
+nothing a client may send is refused that was not refused before. What does
+change is that `--max-udp-request 600` now yields 1,232 rather than 4,096 —
+closer to what the operator asked for, and printed.
+
+**The measurement, since the default rests on it.** At 1232 exactly one question
+in a small-business zone truncates, and it is ANY at a signed apex (1,289
+octets), which RFC 8482 exists to make small and which no resolver asks while
+resolving. The nearest thing a resolver does ask is an NSEC3 NXDOMAIN proof at
+760 — 1,188 while a ZSK rollover doubles every signature, which is 44 octets of
+margin and the row that says the choice is thin rather than comfortable.
+
+| | | |
+|---|---|---|
+| **41c** | the resolver's *upstream* advertisement is the third hardcode, and it is also a buffer size | `ResolverConfig::udp_payload_size` (`rdns/src/resolver.rs:227`) is the same bare `4096`, and it is what `rdnsr` advertises to authoritative servers rather than to its own clients — the number DNS Flag Day 2020 is mostly *about*. Counted while fixing 41a and deliberately left: `recurse.rs:512` sizes the receive buffer from it (`vec![0; self.config.udp_payload_size as usize]`), so lowering it to 1232 also shrinks what a non-conformant server's oversized answer can land in, where today 4,096 absorbs it. Unbound keeps those apart — `edns-buffer-size` 1232 advertised against a 65 KiB `msg-buffer-size` — so the fix is to decouple them first and only then make the advertisement a flag. **The measurement that would settle it**: how often an authoritative server answers over what was advertised, which this tree cannot take (`CLAUDE.local.md`'s intercepted port 53), so the honest version is a unit test that a short buffer degrades to the TCP retry rather than to a lost answer |
+| **41d** | a signed reply overshoots the ceiling by the TSIG record | `TsigSession::sign` (`rdns/src/tsig.rs:570`) appends the TSIG to a message already serialized within `max_len`, so a TSIG-signed QUERY answered over UDP goes out at the cap *plus* the record — 86 octets for hmac-sha256 with a short key name, 147 for hmac-sha512 with a long one, both measured in `rdns/examples/request_size_probe.rs`. Pre-existing and narrow: the signed UDP traffic this server has is NOTIFY and SOA probes, which are tiny, so nothing has ever exceeded a ceiling this way. #41 makes it worth a number because the ceiling is now *ours* rather than the client's, and a cap that is exceeded by a fixed 86 octets is not a cap. **The remedy is named but not built**: subtract the signed record's size from the ceiling before writing, which needs a size the session can state before it signs — whether `Tsig` can give one without building the record was not checked (§18) |
 
 ---
 
@@ -2263,7 +2321,10 @@ idle timeout between messages, and a 5 s timeout to finish a message whose lengt
 prefix has already arrived — a peer mid-message has committed to those bytes, an
 idle peer has not. A zero-length frame closes the connection. Neither applies the
 EDNS UDP payload size to a TCP reply: the length prefix is the only limit there
-(RFC 6891 §6.2.2), and truncating would strand a client that came to TCP
+(~~RFC 6891 §6.2.2~~ **RFC 1035 §4.2.2, corrected 2026-09-11** — §6.2.2 is
+EDNS *fallback* and says nothing about TCP; the citation was written from memory
+and copied into four more places by #41 before anyone opened the RFC,
+`CLAUDE.md` §1), and truncating would strand a client that came to TCP
 *because* it was truncated.
 
 Both answer a connection's queries **concurrently** (RFC 7766 §6.2.1.1). The
