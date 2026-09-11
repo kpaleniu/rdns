@@ -29,6 +29,7 @@ use tokio::sync::{Notify, RwLock};
 
 use rdns::clock::current_unix_timestamp;
 use rdns::metrics::DnsMetrics;
+use rdns::name_keys::NameKeyBuf;
 use rdns::readiness::Readiness;
 use rdns::secondary::{
     state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile, TransferState,
@@ -53,8 +54,14 @@ pub(crate) struct ReplicatedZone {
     pub(crate) wake: Vec<Arc<Notify>>,
 }
 
-/// Replicated zones by lowercased origin.
-pub(crate) type Secondaries = Arc<HashMap<Vec<u8>, ReplicatedZone>>;
+/// Replicated zones by origin.
+///
+/// [`NameKeyBuf`] rather than the `Vec<u8>` it was until `TODO.md` #40d: the
+/// insertion here and the probe in `notify_reply` each folded by hand, under two
+/// comments pointing at each other to say they agreed (`CLAUDE.md` §17). The
+/// constructor folds, so they cannot now disagree, and `Borrow<[u8]>` keeps the
+/// probe free of an allocation.
+pub(crate) type Secondaries = Arc<HashMap<NameKeyBuf, ReplicatedZone>>;
 
 /// What every refresh task shares with the server and with each other.
 ///
@@ -82,7 +89,7 @@ pub(crate) fn spawn_secondaries(
     lifecycle: Lifecycle,
 ) -> Result<Secondaries> {
     let Lifecycle { stop, busy } = lifecycle;
-    let mut registry: HashMap<Vec<u8>, ReplicatedZone> = HashMap::new();
+    let mut registry: HashMap<NameKeyBuf, ReplicatedZone> = HashMap::new();
 
     for spec in specs {
         // A key named but not defined is a configuration error, not a reason to
@@ -110,8 +117,7 @@ pub(crate) fn spawn_secondaries(
 
         let wake = Arc::new(Notify::new());
         let entry = registry
-            // Folded the same way as the lookup in `notify_reply`.
-            .entry(spec.zone.as_ref().folded().into_owned())
+            .entry(NameKeyBuf::new(spec.zone.as_ref()))
             .or_insert_with(|| ReplicatedZone {
                 masters: Vec::new(),
                 wake: Vec::new(),

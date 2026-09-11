@@ -648,10 +648,7 @@ impl Server {
         // over the change, so accepting it tells the client a write succeeded
         // that has a timer on it. Folded through the helper the table is keyed
         // with, so the two cannot disagree.
-        if self
-            .secondaries
-            .contains_key(zone_name.as_ref().folded().as_ref() as &[u8])
-        {
+        if self.secondaries.contains_key(&*zone_name.as_ref().folded()) {
             serving_error!(
                 self.ctx.logger,
                 ip,
@@ -915,7 +912,7 @@ fn notify_reply(
     // U+212A KELVIN SIGN onto `k` and merge two names that differ on the wire.
     let key = zone.as_ref().folded();
 
-    if let Some(replicated) = secondaries.get(key.as_ref() as &[u8]) {
+    if let Some(replicated) = secondaries.get(&*key) {
         if replicated.masters.contains(&peer.ip()) {
             // `notify_one` leaves a permit for a task that is mid-transfer, so a
             // NOTIFY arriving at a busy moment is not lost.
@@ -1003,7 +1000,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let mut registry = HashMap::new();
         registry.insert(
-            nm("replicated.test.").as_ref().folded().into_owned(),
+            rdns::name_keys::NameKeyBuf::new(nm("replicated.test.").as_ref()),
             ReplicatedZone {
                 masters: vec!["192.0.2.1".parse().unwrap()],
                 wake: vec![wake.clone()],

@@ -21,6 +21,7 @@ use rdns::dnssec_validation_mode::DnssecValidator;
 use rdns::ixfr::{plan_change, DeltaLog, PlannedDelta};
 use rdns::journal::Journal;
 use rdns::metrics::DnsMetrics;
+use rdns::name_keys::NameKeyBuf;
 use rdns::record_types;
 use rdns::zone::{parse_zone_file_at, Zone};
 use rdns::zone_signer::{
@@ -31,19 +32,28 @@ use rdns::{Name, NameRef, Qtype, ResourceRecord, Rtype};
 use crate::config;
 use crate::{absolute_name, Cli};
 
-/// Every zone this server holds, keyed by its origin in
-/// [`rdns::name_keys::NameKeyBuf`] form.
+/// Every zone this server holds, keyed by its origin.
 ///
-/// The key is folded so [`Zones::for_query`] can hash the QNAME's ancestors
-/// against it — bounded by the name's label count rather than by how many zones
-/// are served. The `Arc` lets [`Zones::snapshot`] hand a transfer a version it
-/// can write to a socket while reloads replace the map around it.
-pub(crate) type ZoneMap = HashMap<Box<[u8]>, Arc<Zone>>;
+/// [`NameKeyBuf`] rather than the `Box<[u8]>` it was until `TODO.md` #40d, which
+/// is where the doc comment here asserted "keyed by its origin in `NameKeyBuf`
+/// form" about a type that could hold any octets at all (`CLAUDE.md` §17). The
+/// key is folded so [`Zones::for_query`] can hash the QNAME's ancestors against
+/// it — bounded by the name's label count rather than by how many zones are
+/// served — and `Borrow<[u8]>` is what keeps that probe allocation-free.
+///
+/// The `Arc` lets [`Zones::snapshot`] hand a transfer a version it can write to a
+/// socket while reloads replace the map around it.
+pub(crate) type ZoneMap = HashMap<NameKeyBuf, Arc<Zone>>;
 
-/// The key a zone is held under: its own origin, folded. One definition, so no
-/// call site keys on `origin().to_string()` in whatever case its file used.
-pub(crate) fn zone_key(zone: &Zone) -> Box<[u8]> {
-    zone.origin().folded().into_owned().into_boxed_slice()
+/// The key a zone is held under: its own origin, folded.
+///
+/// One definition, so no call site keys on `origin().to_string()` in whatever
+/// case its file used. The type now says the same thing, which is what makes
+/// reading a key back as a name infallible: six sites re-derived it with
+/// `NameRef::from_wire_slice`, and every one of them skipped the zone in silence
+/// on an `Err` that could not happen (`CLAUDE.md` §4).
+pub(crate) fn zone_key(zone: &Zone) -> NameKeyBuf {
+    NameKeyBuf::new(zone.origin())
 }
 
 /// Zone source: either a single file or a directory of zone files
@@ -205,9 +215,7 @@ pub(crate) async fn install_all_zones(served: &ZoneContext, new_zones: ZoneMap) 
         }
     }
     for planned in plan.recorded {
-        if let Ok(zone) = NameRef::from_wire_slice(planned.zone()) {
-            touched.push(zone.to_owned());
-        }
+        touched.push(planned.zone().to_owned());
         log.record(planned);
     }
     if let Some(journal) = journal {
@@ -244,10 +252,8 @@ pub(crate) async fn restore_journals(
 ) {
     let zones = zone_map.read().await;
     let mut log = deltas.write().await;
-    for (name, zone) in zones.iter() {
-        let Ok(name) = NameRef::from_wire_slice(name) else {
-            continue;
-        };
+    for (key, zone) in zones.iter() {
+        let name = key.as_name();
         let loaded = match journal.load(name) {
             Ok(loaded) => loaded,
             Err(e) => {
@@ -332,11 +338,10 @@ pub(crate) fn plan_reload(zones: &Zones, new_zones: &ZoneMap) -> ReloadPlan {
     // lookup rather than a scan of the new set per zone in the old.
     let forgotten = zones
         .keys()
-        .filter(|old_name| !new_zones.contains_key(old_name.as_ref() as &[u8]))
-        // The map's keys are folded wire octets, which is a name — so this
-        // reads one back rather than keeping a second spelling beside it.
-        .filter_map(|old_name| NameRef::from_wire_slice(old_name).ok())
-        .map(|name| name.to_owned())
+        .filter(|old_name| !new_zones.contains_key(*old_name))
+        // A key is the zone's origin, so this reads the name back rather than
+        // keeping a second spelling of it beside the map.
+        .map(|old_name| old_name.as_name().to_owned())
         .collect();
     let recorded = new_zones
         .values()
@@ -428,11 +433,7 @@ impl Zones {
 
     /// Withdraw a zone. `true` if one was actually held.
     pub(crate) fn remove(&mut self, name: NameRef<'_>) -> bool {
-        if self
-            .by_name
-            .remove(name.folded().as_ref() as &[u8])
-            .is_none()
-        {
+        if self.by_name.remove(&*name.folded()).is_none() {
             return false;
         }
         self.generation += 1;
@@ -514,8 +515,7 @@ impl Zones {
 fn deepest_origin(zones: &ZoneMap) -> usize {
     zones
         .keys()
-        .filter_map(|origin| NameRef::from_wire_slice(origin).ok())
-        .map(|origin| origin.label_count())
+        .map(|origin| origin.as_name().label_count())
         .max()
         .unwrap_or(0)
 }
@@ -719,8 +719,7 @@ impl ZoneSigning {
     pub(crate) fn signed_zone_count(&self, zones: &ZoneMap) -> usize {
         zones
             .keys()
-            .filter_map(|origin| NameRef::from_wire_slice(origin).ok())
-            .filter(|origin| self.keys.contains_key(&origin.to_owned()))
+            .filter(|origin| self.keys.contains_key(&origin.as_name().to_owned()))
             .count()
     }
 
@@ -758,9 +757,7 @@ impl ZoneSigning {
         // One moment for the whole run — see `policy_for`.
         let signed_at = current_unix_timestamp();
         for (key, zone) in zones.iter_mut() {
-            let Ok(origin) = NameRef::from_wire_slice(key) else {
-                continue;
-            };
+            let origin = key.as_name();
             let Some(keys) = self.keys.get(&origin.to_owned()) else {
                 continue;
             };
@@ -797,10 +794,7 @@ pub(crate) fn verify_zones(zones: &ZoneMap, validator: &DnssecValidator) -> Resu
         return Ok(());
     }
     for (key, zone) in zones {
-        let Ok(origin) = NameRef::from_wire_slice(key) else {
-            continue;
-        };
-        let origin = origin.to_presentation();
+        let origin = key.as_name().to_presentation();
         let signed = DnssecValidator::is_zone_signed(zone);
         if !signed {
             // Asking `validate_response` with no records keeps the "is
@@ -1063,6 +1057,9 @@ mod tests {
     /// The key type is what upholds it: a `String` key carries whatever case
     /// the zone file used, so a plain `insert` would leave both entries and the
     /// server would answer from whichever the iteration order reached first.
+    /// Literally the key type since `TODO.md` #40d — [`NameKeyBuf::new`] folds and
+    /// is the only constructor, where `Box<[u8]>` left the folding to whichever
+    /// call site built the key.
     #[test]
     fn one_origin_in_two_cases_is_one_zone() {
         let mut zones = Zones::default();

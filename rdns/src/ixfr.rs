@@ -9,6 +9,7 @@
 //! another SOA means an increment, anything else means a full zone.
 
 use crate::error::{TransferError, TransferResult};
+use crate::name_keys::NameKeyBuf;
 use crate::Class;
 use crate::Serial;
 use crate::Ttl;
@@ -57,7 +58,7 @@ impl ZoneDelta {
 /// planning can mint what recording consumes.
 #[derive(Debug, Default)]
 pub struct DeltaLog {
-    by_zone: HashMap<Vec<u8>, Vec<ZoneDelta>>,
+    by_zone: HashMap<NameKeyBuf, Vec<ZoneDelta>>,
 }
 
 /// A version step that has been computed but not yet recorded.
@@ -68,14 +69,18 @@ pub struct DeltaLog {
 /// a plan cannot be recorded against the wrong zone.
 #[derive(Debug, Clone)]
 pub struct PlannedDelta {
-    zone: Vec<u8>,
+    zone: NameKeyBuf,
     delta: ZoneDelta,
 }
 
 impl PlannedDelta {
-    /// Which zone this step belongs to, folded.
-    pub fn zone(&self) -> &[u8] {
-        &self.zone
+    /// Which zone this step belongs to.
+    ///
+    /// [`NameKeyBuf`] and not the folded octets it was until `TODO.md` #40d: the
+    /// one caller wanted the name back, and re-deriving it from a slice is a
+    /// fallible call whose `Err` it handled by ignoring the step.
+    pub fn zone(&self) -> NameRef<'_> {
+        self.zone.as_name()
     }
 }
 
@@ -95,7 +100,7 @@ pub fn plan_change(old: Option<&Zone>, new: &Zone) -> Option<PlannedDelta> {
         return None;
     }
     Some(PlannedDelta {
-        zone: key(new.origin()),
+        zone: NameKeyBuf::new(new.origin()),
         delta,
     })
 }
@@ -125,7 +130,7 @@ impl DeltaLog {
     /// A zone that is gone — expired, or deconfigured — takes its history with
     /// it: increments of a withdrawn zone are still answers for it.
     pub fn forget(&mut self, zone: NameRef<'_>) {
-        self.by_zone.remove(key(zone).as_slice());
+        self.by_zone.remove(&*zone.folded());
     }
 
     /// The chain of steps from `serial` up to the newest one remembered, or
@@ -134,7 +139,7 @@ impl DeltaLog {
     /// A gap would skip a change, leaving the secondary holding a zone that
     /// never existed — undetectable by any later serial comparison.
     pub fn chain_from(&self, zone: NameRef<'_>, serial: Serial) -> Option<Vec<&ZoneDelta>> {
-        let history = self.by_zone.get(key(zone).as_slice())?;
+        let history = self.by_zone.get(&*zone.folded())?;
         let start = history.iter().position(|d| d.from_serial == serial)?;
 
         let mut chain = Vec::new();
@@ -153,7 +158,7 @@ impl DeltaLog {
     /// [`crate::journal::Journal::save`] writes out.
     pub fn all(&self, zone: NameRef<'_>) -> Vec<&ZoneDelta> {
         self.by_zone
-            .get(key(zone).as_slice())
+            .get(&*zone.folded())
             .map(|history| history.iter().collect())
             .unwrap_or_default()
     }
@@ -169,25 +174,20 @@ impl DeltaLog {
             deltas.drain(..deltas.len() - MAX_DELTAS_PER_ZONE);
         }
         if deltas.is_empty() {
-            self.by_zone.remove(key(zone).as_slice());
+            self.by_zone.remove(&*zone.folded());
             return;
         }
-        self.by_zone.insert(key(zone), deltas);
+        self.by_zone.insert(NameKeyBuf::new(zone), deltas);
     }
 
     /// How many steps are remembered for a zone, for logging and tests.
     pub fn len(&self, zone: NameRef<'_>) -> usize {
-        self.by_zone.get(key(zone).as_slice()).map_or(0, Vec::len)
+        self.by_zone.get(&*zone.folded()).map_or(0, Vec::len)
     }
 
     pub fn is_empty(&self) -> bool {
         self.by_zone.is_empty()
     }
-}
-
-/// The form a zone name is filed under here: absolute and ASCII-folded.
-fn key(zone: NameRef<'_>) -> Vec<u8> {
-    zone.folded().into_owned()
 }
 
 /// What changed between two versions of a zone. `None` if either has no apex
