@@ -30,7 +30,7 @@ use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::rfc5011::ManagedAnchors;
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
 use rdns::shutdown::Shutdown;
-use rdns::validation::AdmissionCheck;
+use rdns::validation::{AdmissionCheck, AdmissionLimits};
 use rdns_transport::{tcp, ServeContext, TransportLimits};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
@@ -162,6 +162,18 @@ struct Cli {
     /// only way to spare a known-good source is to raise the limit for everybody.
     #[arg(long, value_name = "ADDR|CIDR")]
     query_rate_exempt: Vec<String>,
+    /// Largest UDP request accepted, in octets.
+    ///
+    /// Floored at the payload size this resolver advertises it can reassemble
+    /// (RFC 6891 §6.2.4): refusing under what was advertised is a promise broken
+    /// in silence (`TODO.md` #40f). A client's padded query (RFC 8467) is the
+    /// request here that grows, where `rdnsd`'s is a signed UPDATE.
+    #[arg(long, value_name = "OCTETS", default_value = "4096")]
+    max_udp_request: u16,
+    /// Largest TCP request accepted, in octets. Not a protocol limit — the
+    /// length prefix allows 65,535 — but a query has no reason to be large.
+    #[arg(long, value_name = "OCTETS", default_value = "16384")]
+    max_tcp_request: u16,
     /// How often to report what the last interval's traffic looked like, in
     /// seconds. 0 turns the anomaly warnings off.
     ///
@@ -353,12 +365,18 @@ async fn main() -> anyhow::Result<()> {
     let query_limit = RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(
         TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
     );
+    // Floored at what this resolver advertises, for the reason
+    // `--max-udp-request` gives: the advertisement is a promise.
+    let admission = AdmissionLimits::new(
+        cli.max_udp_request.max(RDNSR_PAYLOAD_SIZE) as usize,
+        cli.max_tcp_request as usize,
+    );
     let ctx = Arc::new(ServeContext {
         limiter: Arc::new(RateLimiter::new(query_limit)),
         responses: Arc::new(ResponseLimiter::per_second(cli.response_rate)),
         metrics: Arc::new(DnsMetrics::new()),
         logger: Arc::new(QueryLogger::new()),
-        validator: Arc::new(AdmissionCheck::with_defaults()),
+        validator: Arc::new(AdmissionCheck::new(admission.clone())),
     });
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, UDP in flight: {}",
@@ -382,8 +400,9 @@ async fn main() -> anyhow::Result<()> {
         queries_per_source: cli.anomaly_source_queries,
         refusals_per_source: cli.anomaly_source_refusals,
     };
+    let (udp_cap, tcp_cap) = admission.caps();
     tracing::info!(
-        "query rate: {}, response budget: {}, metrics: {}, anomaly warnings: {}",
+        "query rate: {}, response budget: {}, request cap: {udp_cap}B UDP / {tcp_cap}B TCP,          metrics: {}, anomaly warnings: {}",
         if cli.query_rate == 0 {
             "unlimited (--query-rate 0)".to_string()
         } else {

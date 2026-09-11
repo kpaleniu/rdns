@@ -389,22 +389,27 @@ mod tests {
     }
 
     /// The size cap is the transport's, which is the reason [`Transport`] is
-    /// carried rather than an `is_tcp` bool: 512 octets on UDP (RFC 1035
-    /// §4.2.1) against the 16 KiB ceiling this codebase chose for TCP.
+    /// carried rather than an `is_tcp` bool.
+    ///
+    /// The two numbers moved with `TODO.md` #40f — the UDP cap is the payload
+    /// size a daemon advertises it can reassemble (4,096), not RFC 1035 §4.2.1's
+    /// 512, which is a limit on what a server may *send* — so this test's 1,024
+    /// octets is now admitted on both and the boundary is 8 KiB. It asserted the
+    /// old pair, which is a test encoding the bug (`CLAUDE.md` §1).
     #[test]
     fn the_size_cap_belongs_to_the_transport() {
         let ctx = context(0);
         let peer: IpAddr = "192.0.2.10".parse().unwrap();
         let mut big = query(0x1234);
-        big.resize(1024, 0);
+        big.resize(8 * 1024, 0);
 
         assert!(
             !ctx.accept_packet(peer, &big, Transport::Udp),
-            "over 512 on UDP"
+            "over the advertised 4096 on UDP"
         );
         assert!(
             ctx.accept_packet(peer, &big, Transport::Tcp),
-            "and well under the TCP ceiling"
+            "and still under the TCP ceiling"
         );
     }
 }

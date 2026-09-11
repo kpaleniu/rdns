@@ -51,9 +51,12 @@ and it is the one that needs an argument with #20 rather than a session.~~
 ~~**None of #38, and #39 and #40 on 2026-09-10**~~ — 38d closed the same day: the argument was taken, taking
 it filed the API shape it depends on (#39), and a pass over the joints between
 the internal APIs filed #40. None of #38 was a defect; #39 carries one, #40
-none. **One inventory and one numbered section again, 2026-09-11**: #39 closed
+none. ~~**One inventory and one numbered section again, 2026-09-11**: #39 closed
 with 39d, so what is open is **#40**'s ~~40d and 40f~~ **40f**, 40d having gone
-the same day, and #21.
+the same day, and #21.~~ **One inventory and one numbered section still, later
+the same day**: #40 closed with 40f, which filed **#41** on its way out — the
+advertised payload size is a hardcoded 4,096 and nothing caps the UDP response at
+all. Two items, neither a defect, and 41b carries the measurement to take first.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -503,6 +506,12 @@ cargo bench -p rdns -- --baseline before        # and compare against it
 cargo run --release -p rdns --example zone_lookup_probe -- miss 100000   # #11, #22
 cargo run --release -p rdns --example nsec3_cache_probe -- 150 115       # #23
 
+# A third, which measures octets rather than time, so it takes no arguments and
+# reads the same on every machine: what the requests an operator sends weigh,
+# against the admission caps above.
+cargo run --release -p rdns --example request_size_probe                 # #40f
+cargo run --release -p rdns --example request_size_probe -- 512          # the old cap
+
 # Both daemons stop gracefully: SIGTERM or SIGINT on Unix, Ctrl-C/Ctrl-Break/
 # console-close/shutdown on Windows. They stop accepting, let the work already
 # accepted finish (5s budget), print "drained cleanly", and exit 0 — so an
@@ -516,6 +525,16 @@ kill -TERM $(pgrep rdnsd)
 # sends), so the effective policy is in the startup banner.
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --query-rate 5000 --query-burst 500 --query-rate-exempt 10.0.0.0/8
+
+# The largest request each transport accepts. Both daemons default to 4096 on UDP
+# — which is what they advertise they can reassemble in every reply's OPT
+# (RFC 6891 §6.2.4), so the cap cannot be set below it — and 16 KiB on TCP. Over
+# the cap is dropped in silence, so the effective pair is in the startup banner.
+# Raise the UDP one for a deployment whose signed UPDATEs are large: measure with
+# `cargo run --release -p rdns --example request_size_probe`, which weighs the
+# requests an operator actually sends (a 2048-bit DKIM rotation is 566 octets
+# signed, an ACME order with ten SANs 898).
+cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone   --max-udp-request 8192 --max-tcp-request 32768
 
 # How many UDP datagrams may be answered at once, which on rdnsd is also how
 # many tasks share the socket — there is no task per datagram. Defaults to the
@@ -773,9 +792,10 @@ day it was filed: **#21**, which is an inventory rather than a queue.~~
 and **#21**, which is an inventory rather than a queue.~~ ~~**Four as of
 2026-09-10**: **#38**, one sub-item of which is left, **#39**, the answering
 path's shape, **#40**, the joints between the internal APIs, and **#21**, which
-is an inventory rather than a queue.~~ **Two as of 2026-09-11**, #38 having closed
+is an inventory rather than a queue.~~ ~~**Two as of 2026-09-11**, #38 having closed
 on 2026-09-10 and #39 on 2026-09-11: **#40**, ~~two sub-items of which are left
-(40d, 40f)~~ **one of which is left (40f)**, and **#21**. Everything
+(40d, 40f)~~ **one of which is left (40f)**, and **#21**.~~ **Two still, later
+that day**: #40 closed and filed **#41**, whose two items are open. Everything
 else numbered is under "Closed work" below — except #38's and #39's sections,
 which are closed and still sit here rather than in `docs/CLOSED_WORK.md`; their
 rows in that table say so.
@@ -815,9 +835,13 @@ first; 38d falls out of it.~~ ~~**39a and 39b are done (2026-09-10)**, and
 **#39 closed 2026-09-11**: 39c and 39e went on 2026-09-10, 39d on 2026-09-11.
 ~~**#40's 40d and 40f are what is left**, and neither is a defect — one is twelve
 modules with no membership rule, the other is two caps with no flag and a
-measurement to take before adding one.~~ **40d went the same day and 40f is what
+measurement to take before adding one.~~ ~~**40d went the same day and 40f is what
 is left**: two admission caps with no flag, and §14's own warning to measure what
-a legitimate UPDATE weighs before adding a knob. 40d was not a defect either, but
+a legitimate UPDATE weighs before adding a knob.~~ **40f went the same day too, so
+#40 is closed and #41 is what is open.** §14's warning earned its keep: taking
+the measurement turned 40f from a missing knob into a defect — the caps were not
+un-reviewed, the UDP one was wrong, and it contradicted what every reply's OPT
+advertises. 40d was not a defect either, but
 its second half deleted six silent `continue`s by typing one map key — which is
 the §17 argument, and the correction 40a's row now carries.
 
@@ -851,7 +875,26 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 40. The internal APIs, asked whether they fit each other — **filed 2026-09-10**
+### 41. Nothing caps the UDP response this server will send — **filed 2026-09-11**
+
+Found by #40f, which was about the *request* caps and floored one of them at the
+payload size each daemon advertises. Reading that advertisement turned up the
+other half, and it is not a cosmetic knob.
+
+| | | |
+|---|---|---|
+| **41a** | the advertised payload size is hardcoded, twice | `RDNSD_PAYLOAD_SIZE` (`rdnsd/src/main.rs:77`) and `RDNSR_PAYLOAD_SIZE` (`rdnsr/src/main.rs:43`) are both a bare `4096`, in every reply's OPT (RFC 6891 §6.2.4) and changeable only by editing the source — §14's rule, twice over. **What the others do, quoted rather than assumed** (§4): BIND `max-udp-size`, Knot `udp-max-payload`, Unbound `edns-buffer-size`, NSD `ipv4-edns-size`/`ipv6-edns-size`, and all four default to **1232** after DNS Flag Day 2020, which is below this tree's 4,096. The cost of being above it is IP fragmentation, which middleboxes drop and which is the attack surface "Fragmentation Considered Poisonous" names. The interaction to respect: #40f floors the *request* cap at this number, so lowering the advertisement lowers that floor — harmlessly, since the floor only raises and the request default stays 4,096, but it has to be checked rather than assumed |
+| **41b** | and the advertisement is not a ceiling on what we send | The finding behind 41a, and the one with teeth. A UDP reply's ceiling is `Wire::max_len`, which is `request.udp_payload_size()` (`rdnsd/src/dispatch.rs:71`) — the **client's** number, floored at 512 and ceilinged at nothing. A client advertising 65,535 is honoured, so a large signed answer goes out as ~45 IP fragments. That is precisely what every knob in 41a actually does: `max-udp-size` caps the *response*, overriding a client's advertisement downward. This tree has no such cap at all, and `ResponseLimiter` is not one — it meters bytes per second per client and can truncate for budget, never for datagram size. **The measurement to take before fixing**: what a signed answer off this tree's own zones weighs over UDP, which is a response-side sibling of `rdns/examples/request_size_probe.rs` and does not exist yet. Do not write the fix first: the right ceiling is `min(client's advertisement, our own)` and the question is whether TC=1 at 1232 is better than fragmenting at 4,096 for the answers this server actually has |
+
+**Not filed as a defect**, and the distinction matters: 41b is reachable only
+when a client asks for a large datagram and the answer is that big, and the
+fragmentation it causes is a degradation rather than a wrong answer. But it is
+the same shape as #40f's — a number the protocol lets the *peer* choose, honoured
+without a bound of our own (`CLAUDE.md` §5).
+
+---
+
+### 40. The internal APIs, asked whether they fit each other — ~~**filed 2026-09-10**~~ **closed 2026-09-11**
 
 Asked for after #39: a pass over the *joints* rather than the modules — where one
 module hands a value to another, is the type at the joint the right one. Nothing
@@ -865,7 +908,7 @@ The measurements are in each row, taken before anything was edited (§18).
 | ~~**40c**~~ | ~~`Transport` sits one crate above the decision it makes~~ **done 2026-09-10** | ~~`rdns_transport::Transport` exists because "one `is_tcp`" was answering three questions (`rdns-transport/src/lib.rs:36-39`), and then `ServeContext::admit` converts it back — `self.validator.validate_packet(packet, transport.is_tcp())` at `:140` — because `rdns_core::validation::Validator::validate_packet` still takes `is_tcp: bool` (`validation.rs:163`). One call site, and the enum has no dependencies, so it can live in `rdns-core` beside the validator and be re-exported where it is now; `is_tcp()` then has no callers.~~ **Done**: the enum is `rdns_core::validation::Transport`, `validate_packet` takes it, `is_tcp` is deleted, and the four crates that named `rdns_transport::Transport` now name `rdns::validation::Transport` — one spelling rather than a re-export, since nothing outside the workspace depends on the old path. 8 files, no behaviour: 905 tests on Windows and 921 on Linux, before and after |
 | ~~**40d**~~ | ~~twelve library modules state no membership rule~~ **done 2026-09-11** | No `//!` anywhere in the file and no doc at the `mod` declaration: `rdns-core/{dname,validation}`, `rdns/{cache,logging,security,zone}`, `rdns/zone/{checks,parse,rdata}` and all three of `rdns/resolver/{caches,recurse,validate}`. #38c's whole fix for `utils` was "seven modules, each stating its membership rule", and #37's argument for a folder is the same argument. Beside it, the inverse: `rdnsd/src/zones.rs:34` documents `ZoneMap` as "keyed by its origin in `rdns::name_keys::NameKeyBuf` form" while the type is `HashMap<Box<[u8]>, Arc<Zone>>`, and `zone_key` (`:44`) exists so "no call site keys on `origin().to_string()`" — an invariant held by a convention and asserted in a doc comment, which §17 says is a claim to verify, not documentation to trust. 40a's fix is what makes it true **Done, both halves, and it was fourteen files.** The twelve are confirmed — the `//!`-less files in the workspace were exactly those twelve plus `rdnsd`'s and `rdnsr`'s crate roots. The roots were going to be left, on the argument that what a *binary* is gets said by clap's `about` and by "How to run" above; the measurement that killed that is one command, because `rdnsc` and `rdnsctl` both have a crate header — two of the four binaries had already decided, so the exception was one file's habit and not a rule. Every `.rs` file in the tree has one now, tests and benches included. **The measurement that could have refuted it** (§19) was whether the rule is stated somewhere else: it is not — both crate roots' `//!` document the *crate* boundary (`rdns` against `rdns-core`) and neither is a module map, and none of the twelve had a doc at its `mod` line either. Each header now says what belongs and, where it is the interesting part, what does not: `validation` is the three questions answerable from the packet alone and not who sent it, `security` the three policies keyed on an address that is not an identity (§16), `zone/checks` the rules with no correct query-time answer *and* the boundary that they are a message to an operator rather than an invariant the answer path may lean on, since a zone arriving by transfer or UPDATE never meets them. **The `ZoneMap` half turned out to be the one instance of 40a's declined sweep worth taking**, and taking it found six sites: `ZoneMap` is now `HashMap<NameKeyBuf, Arc<Zone>>`, and the six `NameRef::from_wire_slice` re-derivations of a key went with it — **every one of which skipped the zone in silence** on an `Err` that cannot happen (`continue` or `.ok()`), so a key that failed to read back meant a zone not signed, not verified under `--require-signed`, not journal-restored, not withdrawn by a reload, not counted, and a `deepest` walk too short to find it at all. Not live defects — the `Err` is unreachable by construction — which is the point of §17: the type makes the unreachable branch *unwritable*, where `Box<[u8]>` made six authors write it six ways. **Zero churn at the 22 insertion sites**, since all of them already went through `zone_key`, and none on the hot probe, since `NameKeyBuf`'s `Borrow<[u8]>` already existed and `Zones::for_query` already probed with a folded `Cow`. **Counting the shape (§18) found two more**, both taken: `Secondaries`, the same `pub(crate) type` alias, whose insertion and NOTIFY probe each folded by hand under two comments asserting they agreed; and `PlannedDelta::zone`, the one `pub` accessor handing raw folded octets across a crate boundary, whose single consumer re-derived the name with a seventh silent `if let Ok`. The three together delete `ixfr`'s private `key()` helper and four `as &[u8]` casts, which were the shape of an untyped key leaking into a probe. What stays declined is 40a's set and for 40a's reason: the three remaining raw-keyed maps (`Zone::index`, the resolver's delegation and key caches) are private fields whose `Borrow` probe is the point. No behaviour and so no new test: 908 tests on Windows and 924 on Linux, the same before and after on each, clippy and `cargo doc` clean on both. One existing test's doc was wrong and is corrected — `one_origin_in_two_cases_is_one_zone` said "the key type is what upholds it", which was true of `zone_key`'s convention and not of the type until now |
 | ~~**40e**~~ | ~~the tail of #38's `pub` sweep~~ **done 2026-09-10** | ~~#38 measured `rdns/src` and narrowed 87 items; it did not look at the other crates. Of the 112 top-level `pub` items in `rdns-core` and `rdns-transport`, **3** are named nowhere outside their own module — `AdmissionLimits` and `ValidationResult` (`rdns-core/src/validation.rs:105`, `:124`) and `listener_failure` (`rdns-transport/src/lib.rs:286`). Small, and the point of recording it is that the sweep was crate-shaped and the crates it skipped are now measured. Beside it, one stale claim: `rdns/src/lib.rs:7` still says `rdns::utils` "names what it always did", and #38c deleted `rdns-core::utils`.~~ **Done, and the compiler decided it the way it decided #38's**: `AdmissionLimits` and `AdmissionCheck::new` are `pub(crate)` and `listener_failure` is private, while **`ValidationResult` stays `pub`** — narrowing it is a private-in-public error, because `validate_packet` returns it and `rdns_transport` calls that. The sweep now reads 1 of 110, and the one is justified in a comment. The stale `rdns::utils` line is gone. **40f is what narrowing `AdmissionLimits` exposed** |
-| **40f** | the two admission caps have no flag | `AdmissionLimits` is 512 octets on UDP (RFC 1035 §4.2.1) and a 16 KiB ceiling this codebase chose for TCP, and 40e established that nothing constructs one: `AdmissionCheck::with_defaults` is the only way in, so neither cap can be changed without editing the source. §14 is the rule — a limit with no flag is a limit nobody has reviewed — and the `pub` struct that stood where a flag should be was not an answer, because no caller ever built one. The UDP cap is the one an operator might have to move: it is a *request* cap, and a signed UPDATE or a TSIG'd NOTIFY over UDP is not obviously under 512 in every deployment. Measure before adding a knob (§14's own warning about knobs that turn the server off): what does a legitimate UPDATE actually weigh |
+| ~~**40f**~~ | ~~the two admission caps have no flag~~ **done 2026-09-11, and the measurement found a defect** | `AdmissionLimits` is 512 octets on UDP (RFC 1035 §4.2.1) and a 16 KiB ceiling this codebase chose for TCP, and 40e established that nothing constructs one: `AdmissionCheck::with_defaults` is the only way in, so neither cap can be changed without editing the source. §14 is the rule — a limit with no flag is a limit nobody has reviewed — and the `pub` struct that stood where a flag should be was not an answer, because no caller ever built one. The UDP cap is the one an operator might have to move: it is a *request* cap, and a signed UPDATE or a TSIG'd NOTIFY over UDP is not obviously under 512 in every deployment. Measure before adding a knob (§14's own warning about knobs that turn the server off): what does a legitimate UPDATE actually weigh **The measurement came back the other way round.** `rdns/examples/request_size_probe.rs` weighs the requests an operator actually sends: a DHCP lease is 171 octets signed, a NOTIFY 178, two ACME challenges 266 — all comfortably inside 512. **The first one that is not is a 2,048-bit DKIM key rotation: 470 octets unsigned and 566 signed, so the TSIG this server *requires* is what pushes it over**; an ACME order with ten SANs is 898. So the cap was not merely un-reviewed, it was wrong — and wrong against the server's own word: both daemons advertise 4,096 octets of receive capability in **every** reply's OPT (RFC 6891 §6.2.4) while admission refused over 512 and dropped it in silence. A client that believed the advertisement got nothing back. **512 was RFC 1035 §4.2.1 applied to the wrong direction**: §4.2.1 limits what a server may *send* without EDNS, and what a requestor may send is what the responder advertised it can reassemble. Checked against the others (§4): BIND, Knot, NSD and Unbound have no incoming-request cap at 512 at all — their knobs (`max-udp-size`, `udp-max-payload`, `edns-buffer-size`) all size *responses*. **Provoked on the wire, not read off the diff** (§4): dnspython sending an RFC 7830-padded query to a running `rdnsd` got answers at 448, 518 and 648 octets against the new binary and timed out at 518 and 648 against the old one. **Landed**: `AdmissionLimits` is constructible again with `new`, flooring each cap at `CLASSIC_UDP_SIZE` and ceilinging at 65,535 — a mistyped knob should be wrong, not fatal (§14) — the default UDP cap is 4,096, and both daemons take `--max-udp-request` and `--max-tcp-request` (`rdnsd` in its config file too), each flooring the UDP one at the payload size it advertises, since accepting less than was promised is the broken promise and accepting more misleads nobody. The effective pair is in both startup banners, because over it is still dropped in silence. `rdnsr` gets the same flags for #18's reason — a facility wired into one daemon and not the other is itself a finding — where the request that grows is a padded query rather than an UPDATE. **Two tests had encoded the cap** and are rewritten saying so (§1): `validation`'s `test_packet_too_large_udp`, which asserted that 513 octets is refused, and `rdns-transport`'s `the_size_cap_belongs_to_the_transport`, whose 1,024-octet packet now lands on the same side of both caps. Three new tests, the DKIM one watched failing with the cap back at 512. 911 on Windows and 927 on Linux, three more than before on each; clippy and `cargo doc` clean on both. **What this deliberately did not touch is #41**: the advertised payload size is itself a hardcoded 4,096 in each daemon, which is a response-sizing knob and a different question |
 
 **What this pass checked and found sound**, so the next one need not: the two
 `error` modules are a deliberate joint, not a duplicate — `rdns::error`
@@ -1031,8 +1074,9 @@ more.
 
 One line each. The reasoning, the RFC citations and the verification are in the
 commit that closed it and in `docs/CLOSED_WORK.md`, which holds every section
-below in full under the same number — ~~every one~~ **all but two as of
-2026-09-11**: #38's and #39's sections are closed and still sit under "Open
+below in full under the same number — ~~every one~~ ~~**all but two as of
+2026-09-11**~~ **all but three, later that day**: #38's, #39's and #40's sections
+are closed and still sit under "Open
 work" above, which is the same drift the second correction under this table
 records, caught this time with the row rather than after it. **The numbers are stable identifiers** —
 referenced from 88 doc comments in the tree and from each other — so they are
@@ -1083,6 +1127,7 @@ the week; the record is under "How the queue kept going stale" in
 | **37** | where a module folder pays, and where it is motion | **filed and closed 2026-09-08**, four items. 37a was the defect: `utils::label_count` splits presentation text on `.` and `NameRef::label_count` counts wire labels, so an owner holding RFC 1035 §5.1's `\.` — loadable and signable since #35 and #36 — read as one label more in text than on the wire, and `rdnsr --dnssec` SERVFAILed a name `rdnsd` serves correctly. 37b, 37c and 37d were splits, and each corrected the count in its own row: a flat split widens only what crosses a file boundary (7 of 19, not 19), Rust privacy runs downward so a child reading its parent widens nothing (19 of 29, not 29), and `rdns-core`'s fifth module was dropped because moving two private functions to a sibling *widens* them. The measurement for a split is visibility, not line count, which is #33's rule and the reason a `dnssec/` directory stayed dropped |
 | **38** | a structural review, and what it left | **filed and closed 2026-09-09 → 2026-09-10**: three fixes in the filing commits and five sub-items after them, 38e's cross-crate half decided against rather than done. **Nothing filed was a defect**; the one defect the review turned up was in the fixed half — a DO bit dropped by three reply paths across both daemons, against `rdnsd/src/answer.rs`, which mirrored it. 38d's `rdnsd` half is what filed #39. **Section still above rather than in `docs/CLOSED_WORK.md`** |
 | **39** | `rdnsd` answers through two dispatchers | **filed and closed 2026-09-10 → 2026-09-11**, five items. 39a was the defect: a TSIG-rejected request counted as received over TCP and not over UDP, because the two prologues had drifted. 39b built all three shapes before keeping one, and the two it declined are the argument — a trait that had to name the type it existed to hide, and a `transport` plus `out` pair that could disagree with itself. **Section still above rather than in `docs/CLOSED_WORK.md`** |
+| **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. **Section still above rather than in `docs/CLOSED_WORK.md`** |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

@@ -61,7 +61,7 @@ use rdns::{
     shutdown::{Busy, Lifecycle, Shutdown, Stop},
     socket::bind_addr_for,
     tsig::{self, TsigKeyring},
-    validation::{AdmissionCheck, Transport},
+    validation::{AdmissionCheck, AdmissionLimits, Transport},
     zone::Zone,
     DnsMessage, ResourceRecord, Serial,
 };
@@ -75,6 +75,18 @@ use rdns_transport::{recv_error_is_transient, ServeContext, TransportLimits, UDP
 
 /// UDP payload size rdnsd advertises to clients via EDNS0.
 const RDNSD_PAYLOAD_SIZE: u16 = 4096;
+
+/// The request caps `--max-udp-request` and `--max-tcp-request` ask for, with the
+/// one floor this daemon adds to [`AdmissionLimits::new`]'s.
+///
+/// The UDP cap may not go below [`RDNSD_PAYLOAD_SIZE`]. That number is in every
+/// reply's OPT as what this server can reassemble (RFC 6891 §6.2.4), so a lower
+/// cap makes the advertisement a promise the server breaks — and breaks it in
+/// silence, which is exactly what `TODO.md` #40f found. Above it is the
+/// operator's business: accepting more than was advertised misleads nobody.
+fn admission_limits(max_udp: u16, max_tcp: u16) -> AdmissionLimits {
+    AdmissionLimits::new(max_udp.max(RDNSD_PAYLOAD_SIZE) as usize, max_tcp as usize)
+}
 
 /// Default for `--udp-workers`: the machine's parallelism, clamped to 2..=32.
 ///
@@ -243,6 +255,35 @@ struct Cli {
         conflicts_with = "config"
     )]
     response_rate: u32,
+    /// Largest UDP request accepted, in octets.
+    ///
+    /// Floored at the payload size this server advertises it can reassemble
+    /// (RFC 6891 §6.2.4), because that advertisement is a promise: refusing
+    /// under it is how a client that believed us got silence, which is what this
+    /// default being 512 did (`TODO.md` #40f). Raise it for a deployment whose
+    /// signed UPDATEs are large — a 2,048-bit DKIM key rotation weighs 566
+    /// octets with its TSIG, measured in
+    /// `rdns/examples/request_size_probe.rs`. Over the cap is dropped in
+    /// silence, so the effective value is in the startup line.
+    #[arg(
+        long,
+        value_name = "OCTETS",
+        default_value = "4096",
+        conflicts_with = "config"
+    )]
+    max_udp_request: u16,
+    /// Largest TCP request accepted, in octets.
+    ///
+    /// Not a protocol limit — the length prefix allows 65,535 — but a request
+    /// has no legitimate reason to be large, and a bulk UPDATE is the one that
+    /// might be. Floored at 512.
+    #[arg(
+        long,
+        value_name = "OCTETS",
+        default_value = "16384",
+        conflicts_with = "config"
+    )]
+    max_tcp_request: u16,
     /// Queries per second, per client address. 0 turns the limit off.
     ///
     /// Over the limit is dropped silently, so the number has to be generous:
@@ -457,6 +498,9 @@ struct ServePolicy {
     response_rate: u32,
     /// Queries per second per client, with its burst and exemptions.
     query_limit: RateLimitConfig,
+    /// The largest request each transport accepts, and — for UDP — the payload
+    /// size advertised in every reply.
+    admission: AdmissionLimits,
     /// How often the anomaly warnings run, and what they warn about. Zero
     /// interval is off.
     anomalies: (Duration, AnomalyThresholds),
@@ -504,6 +548,7 @@ async fn serve(
         tsig_keys,
         response_rate,
         query_limit,
+        admission,
         anomalies: (anomaly_interval, anomaly_thresholds),
         udp_workers,
         metrics_listen,
@@ -554,6 +599,10 @@ async fn serve(
         )
     };
 
+    // And the same reason again: over the admission cap is dropped in silence, so
+    // the startup line is the only place an operator learns the number.
+    let (udp_cap, tcp_cap) = admission.caps();
+
     // The same reason the two above are printed: these thresholds decide what an
     // operator is told about a flood, and a check that is off has to say so.
     let anomaly_note = if anomaly_interval.is_zero() {
@@ -595,7 +644,7 @@ async fn serve(
         ctx: ServeContext {
             limiter: Arc::new(RateLimiter::new(query_limit)),
             responses: Arc::new(ResponseLimiter::per_second(response_rate)),
-            validator: Arc::new(AdmissionCheck::with_defaults()),
+            validator: Arc::new(AdmissionCheck::new(admission.clone())),
             logger: Arc::new(QueryLogger::new()),
             metrics,
         },
@@ -611,6 +660,7 @@ async fn serve(
     tracing::info!(
         "rdnsd listening on {addr} (UDP+TCP), zone transfer: {transfers}, \
          response budget: {budget}, query rate: {query_limit_note}, \
+         request cap: {udp_cap}B UDP / {tcp_cap}B TCP, \
          UDP workers: {udp_workers}, anomaly warnings: {anomaly_note}, \
          TSIG keys: {}, metrics: {}, control: {}",
         server.tsig_keys.len(),
@@ -1572,6 +1622,7 @@ async fn main() -> Result<()> {
             tsig_keys,
             response_rate: cli.response_rate,
             query_limit,
+            admission: admission_limits(cli.max_udp_request, cli.max_tcp_request),
             anomalies: (
                 Duration::from_secs(cli.anomaly_interval),
                 AnomalyThresholds {
@@ -2741,6 +2792,71 @@ mod tests {
     /// interval, silently, having told the client it succeeded. Asserting on the
     /// map alone would pass against exactly that bug.
     ///
+    /// A signed UPDATE over 512 octets is admitted on UDP, because that is what
+    /// this server advertises it can reassemble.
+    ///
+    /// `TODO.md` #40f, and the defect rather than the knob: every reply's OPT
+    /// says 4,096 (RFC 6891 §6.2.4) while admission refused over 512 and did it
+    /// in silence — no FORMERR, nothing on the wire. A 2,048-bit DKIM key
+    /// rotation is the ordinary request that falls in the gap, and the TSIG this
+    /// server *requires* is what pushes it over: 470 octets unsigned, 566 signed
+    /// (`rdns/examples/request_size_probe.rs`).
+    ///
+    /// Watched failing with `max_udp_size` back at 512: the signed message was
+    /// refused and the unsigned one, being smaller, was not.
+    #[test]
+    fn a_signed_dkim_sized_update_is_admitted_on_udp() {
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let dkim = format!("v=DKIM1; k=rsa; p={}", "A".repeat(392));
+        let txt = ResourceRecord {
+            name: nm("s2026._domainkey.example.com."),
+            class: rdns::Class::new(1),
+            ttl: Ttl::from_secs(3600),
+            rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::TXT(
+                dkim.as_bytes().chunks(255).map(<[u8]>::to_vec).collect(),
+            ))
+            .expect("encodes"),
+        };
+        let bytes = update_message("example.com.", vec![txt])
+            .to_bytes_within(4096)
+            .expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+
+        assert!(
+            signed.len() > 512 && signed.len() < RDNSD_PAYLOAD_SIZE as usize,
+            "the request this is about weighs {} octets: over the old cap, under              what is advertised",
+            signed.len()
+        );
+
+        let check = AdmissionCheck::new(admission_limits(RDNSD_PAYLOAD_SIZE, 16 * 1024));
+        assert!(
+            check
+                .validate_packet(&signed, Transport::Udp)
+                .error()
+                .is_none(),
+            "a legitimate signed UPDATE must not be dropped in silence"
+        );
+    }
+
+    /// The UDP cap cannot be set below what this server advertises.
+    ///
+    /// Accepting less than the OPT promises is the broken promise above; accepting
+    /// more misleads nobody, so only the floor is enforced (`CLAUDE.md` §14 — a
+    /// mistyped knob should be wrong, not fatal).
+    #[test]
+    fn the_udp_request_cap_cannot_fall_below_what_is_advertised() {
+        assert_eq!(
+            admission_limits(512, 16 * 1024).caps().0,
+            RDNSD_PAYLOAD_SIZE as usize,
+            "512 is below the advertisement and is floored to it"
+        );
+        assert_eq!(
+            admission_limits(8192, 16 * 1024).caps().0,
+            8192,
+            "above it is the operator's business"
+        );
+    }
+
     /// Watched failing against a handler that installed the new zone without
     /// writing the file: the map assertion passed, the file assertion did not.
     #[tokio::test]

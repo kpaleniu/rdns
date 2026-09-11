@@ -62,6 +62,12 @@ pub struct Server {
     pub query_burst: u32,
     #[serde(default)]
     pub query_rate_exempt: Vec<String>,
+    /// Largest request accepted, per transport, in octets. The UDP one is
+    /// floored at the advertised payload size — see `crate::admission_limits`.
+    #[serde(default = "default_max_udp_request")]
+    pub max_udp_request: u16,
+    #[serde(default = "default_max_tcp_request")]
+    pub max_tcp_request: u16,
     /// How often the anomaly warnings run, in seconds; 0 is off. The four
     /// thresholds below are per interval.
     #[serde(default = "default_anomaly_interval")]
@@ -102,6 +108,8 @@ impl Default for Server {
             query_rate: default_query_rate(),
             query_burst: default_query_burst(),
             query_rate_exempt: Vec::new(),
+            max_udp_request: default_max_udp_request(),
+            max_tcp_request: default_max_tcp_request(),
             anomaly_interval: default_anomaly_interval(),
             anomaly_query_rate: default_anomaly_query_rate(),
             anomaly_error_percent: default_anomaly_error_percent(),
@@ -129,6 +137,12 @@ fn default_query_rate() -> u32 {
 }
 fn default_query_burst() -> u32 {
     200
+}
+fn default_max_udp_request() -> u16 {
+    4096
+}
+fn default_max_tcp_request() -> u16 {
+    16 * 1024
 }
 // The same numbers as the flags' defaults, which is the only place they may
 // disagree — `--help` prints one and the file falls back to the other.
@@ -412,6 +426,8 @@ impl Config {
         cli.query_rate = self.server.query_rate;
         cli.query_burst = self.server.query_burst;
         cli.query_rate_exempt = self.server.query_rate_exempt.clone();
+        cli.max_udp_request = self.server.max_udp_request;
+        cli.max_tcp_request = self.server.max_tcp_request;
         cli.anomaly_interval = self.server.anomaly_interval;
         cli.anomaly_query_rate = self.server.anomaly_query_rate;
         cli.anomaly_error_percent = self.server.anomaly_error_percent;

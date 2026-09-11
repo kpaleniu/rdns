@@ -18,6 +18,7 @@
 //! one); and what the sender may *do*, which is policy and needs a
 //! configuration this module never sees.
 
+use crate::edns::CLASSIC_UDP_SIZE;
 use crate::error::{AnswerMismatch, RequestError, RequestResult, WireError};
 use crate::{DnsMessage, NameRef, OpCode, Qtype, QueryClass};
 
@@ -138,25 +139,57 @@ const MAX_REQUEST_ADDITIONALS: usize = 4;
 
 /// The two size caps admission applies, one per transport.
 ///
-/// `pub(crate)`: nothing outside builds one, and [`AdmissionCheck::with_defaults`]
-/// is the only constructor anything reaches for. So the caps are not
-/// configurable at all today, which is `TODO.md` #40f's question — a `pub` type
-/// nobody constructs was not an answer to it (`CLAUDE.md` §14).
+/// A resource bound — how much of a stranger's datagram we are willing to parse
+/// — and not a protocol rule. The distinction is `TODO.md` #40f, where the UDP
+/// cap was RFC 1035 §4.2.1's 512 applied to the wrong direction: §4.2.1 limits
+/// what a server may *send* without EDNS, and a requestor's own limit is the
+/// payload size it advertises (RFC 6891 §4.3). Both daemons advertise 4,096 and
+/// refused over 512, so a client that believed the advertisement got silence —
+/// measured at `rdns/examples/request_size_probe.rs`, where a 2,048-bit DKIM key
+/// rotation weighs 566 octets signed and the TSIG the server *requires* is what
+/// pushes it over.
 #[derive(Debug, Clone)]
-pub(crate) struct AdmissionLimits {
-    /// Largest UDP request accepted (RFC 1035 §4.2.1's 512).
-    pub max_udp_size: usize,
-    /// Largest TCP request accepted. Not a protocol limit — the length prefix
-    /// allows 65,535 — but a request has no legitimate reason to be larger.
-    pub max_tcp_size: usize,
+pub struct AdmissionLimits {
+    max_udp_size: usize,
+    max_tcp_size: usize,
+}
+
+impl AdmissionLimits {
+    /// The largest request accepted on each transport, in octets.
+    ///
+    /// Both are floored at [`CLASSIC_UDP_SIZE`], because a cap below it refuses
+    /// the plainest query RFC 1035 allows: a mistyped flag should be wrong, not
+    /// fatal (`CLAUDE.md` §14). Both are ceilinged at 65,535, which is every
+    /// message there can be — TCP's length prefix is 16 bits and a UDP payload
+    /// cannot exceed 65,507 — so there is no "off", only "as large as a message
+    /// gets".
+    pub fn new(max_udp_size: usize, max_tcp_size: usize) -> AdmissionLimits {
+        let clamp = |n: usize| n.clamp(CLASSIC_UDP_SIZE as usize, u16::MAX as usize);
+        AdmissionLimits {
+            max_udp_size: clamp(max_udp_size),
+            max_tcp_size: clamp(max_tcp_size),
+        }
+    }
+
+    /// The cap for each transport, for an operator-facing line at startup: a
+    /// limit nobody can read is a limit nobody has reviewed (`CLAUDE.md` §14).
+    pub fn caps(&self) -> (usize, usize) {
+        (self.max_udp_size, self.max_tcp_size)
+    }
 }
 
 impl Default for AdmissionLimits {
+    /// 4,096 on UDP, which is what both daemons advertise they can reassemble,
+    /// and 16 KiB on TCP.
+    ///
+    /// Neither is a protocol number. The UDP one has to match the advertisement
+    /// or the advertisement is a lie, and a daemon that advertises something else
+    /// passes its own figure to [`AdmissionLimits::new`]; the TCP one is this
+    /// codebase's judgement about a request that has no legitimate reason to be
+    /// larger, and is now a flag because that judgement is the operator's to
+    /// review.
     fn default() -> Self {
-        AdmissionLimits {
-            max_udp_size: 512,       // RFC 1035 §4.2.1
-            max_tcp_size: 16 * 1024, // not a protocol limit; see the field
-        }
+        AdmissionLimits::new(4096, 16 * 1024)
     }
 }
 
@@ -196,7 +229,7 @@ pub struct AdmissionCheck {
 }
 
 impl AdmissionCheck {
-    pub(crate) fn new(config: AdmissionLimits) -> Self {
+    pub fn new(config: AdmissionLimits) -> Self {
         AdmissionCheck { config }
     }
 
@@ -445,22 +478,72 @@ mod tests {
         assert_eq!(result, ValidationResult::Valid);
     }
 
+    /// The UDP cap is the payload size a daemon advertises, not RFC 1035
+    /// §4.2.1's 512.
+    ///
+    /// This test asserted the opposite until `TODO.md` #40f, which is a test
+    /// encoding the bug (`CLAUDE.md` §1): both daemons advertise 4,096 octets of
+    /// receive capability in every OPT (RFC 6891 §6.2.4) and admission refused
+    /// over 512 in silence, so a 566-octet DKIM rotation — a legitimate signed
+    /// UPDATE, measured in `rdns/examples/request_size_probe.rs` — was dropped
+    /// with nothing on the wire to say why.
     #[test]
-    fn test_packet_too_large_udp() {
+    fn the_udp_cap_is_the_advertised_payload_size() {
         let validator = AdmissionCheck::with_defaults();
-        let packet = vec![0u8; 513]; // Over 512 byte limit for UDP
-
-        let result = validator.validate_packet(&packet, Transport::Udp);
-        assert!(!result.is_valid());
-        assert!(
+        let too_long = |packet: &[u8]| {
             matches!(
-                result.error(),
+                validator.validate_packet(packet, Transport::Udp).error(),
                 Some(WireError::TooLong {
                     what: "the packet",
                     ..
                 })
-            ),
-            "got {result:?}"
+            )
+        };
+
+        assert!(
+            !too_long(&vec![0u8; 513]),
+            "513 octets is what the advertisement promises to accept"
+        );
+        assert!(
+            !too_long(&vec![0u8; 4096]),
+            "and so is the advertised size itself"
+        );
+        assert!(too_long(&vec![0u8; 4097]), "one octet past it is refused");
+    }
+
+    /// A configured cap is the cap, and a cap that would turn the server off is
+    /// floored rather than obeyed (`CLAUDE.md` §14).
+    #[test]
+    fn a_configured_cap_applies_and_cannot_refuse_a_plain_query() {
+        let validator = AdmissionCheck::new(AdmissionLimits::new(1232, 1232));
+        assert!(validator
+            .validate_packet(&vec![0u8; 1232], Transport::Udp)
+            .error()
+            .is_none());
+        assert!(matches!(
+            validator
+                .validate_packet(&vec![0u8; 1233], Transport::Udp)
+                .error(),
+            Some(WireError::TooLong { .. })
+        ));
+
+        // Zero is the flag an operator mistypes, and it must not be a way to
+        // refuse every query: a 512-octet request is the plainest there is.
+        let floored = AdmissionCheck::new(AdmissionLimits::new(0, 0));
+        assert_eq!(
+            AdmissionLimits::new(0, 0).caps(),
+            (CLASSIC_UDP_SIZE as usize, CLASSIC_UDP_SIZE as usize)
+        );
+        assert!(floored
+            .validate_packet(&vec![0u8; CLASSIC_UDP_SIZE as usize], Transport::Udp)
+            .error()
+            .is_none());
+
+        // And past a message's own maximum is that maximum, not a wider cap
+        // nothing can reach.
+        assert_eq!(
+            AdmissionLimits::new(usize::MAX, usize::MAX).caps(),
+            (u16::MAX as usize, u16::MAX as usize)
         );
     }
 
