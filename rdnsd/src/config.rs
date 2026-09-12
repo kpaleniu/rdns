@@ -94,6 +94,13 @@ pub struct Server {
     #[serde(default = "crate::default_udp_workers")]
     pub udp_workers: usize,
     pub metrics_listen: Option<String>,
+    /// Where the dnstap query stream goes: `tcp:<addr:port>` or `file:<path>`.
+    /// Absent is off.
+    pub dnstap: Option<String>,
+    /// How large a dnstap *capture file* may grow before the writing stops.
+    /// 0 is no limit; ignored for a `tcp:` target.
+    #[serde(default = "default_dnstap_max_bytes")]
+    pub dnstap_max_bytes: u64,
     /// Where to answer DNS over TLS (RFC 7858), and with what. All three or
     /// none: `apply` refuses a listener with no certificate, because the
     /// config file has no equivalent of clap's `requires` and would otherwise
@@ -143,6 +150,8 @@ impl Default for Server {
             anomaly_source_refusals: default_anomaly_source_refusals(),
             udp_workers: crate::default_udp_workers(),
             metrics_listen: None,
+            dnstap: None,
+            dnstap_max_bytes: default_dnstap_max_bytes(),
             tls_listen: None,
             quic_listen: None,
             https_listen: None,
@@ -215,6 +224,12 @@ pub struct Signing {
     pub nsec3_opt_out: bool,
     #[serde(default)]
     pub require_signed: bool,
+}
+
+/// One gibibyte, the same number `--dnstap-max-bytes` defaults to: the two
+/// spellings of one setting must not disagree (`CLAUDE.md` §15).
+fn default_dnstap_max_bytes() -> u64 {
+    1_073_741_824
 }
 
 fn default_validity_days() -> u32 {
@@ -541,6 +556,8 @@ impl Config {
         cli.anomaly_source_refusals = self.server.anomaly_source_refusals;
         cli.udp_workers = self.server.udp_workers;
         cli.metrics_listen = self.server.metrics_listen.clone();
+        cli.dnstap = self.server.dnstap.clone();
+        cli.dnstap_max_bytes = self.server.dnstap_max_bytes;
         cli.tls_listen = self.server.tls_listen.clone();
         cli.quic_listen = self.server.quic_listen.clone();
         cli.https_listen = self.server.https_listen.clone();
@@ -1063,6 +1080,34 @@ validity-days = 7
         let other = &config.zones["other.test."];
         assert_eq!(other.nsec3, None, "absent means use [signing]");
         assert_eq!(other.validity_days, None);
+    }
+
+    /// The query stream is a `[server]` setting, and `--dnstap`'s default for
+    /// the file bound is the same number the file's is (`TODO.md` #44g).
+    #[test]
+    fn the_query_stream_is_configurable_from_the_file() {
+        let config = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+dnstap = "tcp:127.0.0.1:6000"
+"#,
+        )
+        .expect("parses");
+        assert_eq!(config.server.dnstap.as_deref(), Some("tcp:127.0.0.1:6000"));
+        assert_eq!(
+            config.server.dnstap_max_bytes,
+            default_dnstap_max_bytes(),
+            "absent means the same bound the flag defaults to"
+        );
+
+        let off = parse(
+            "[server]
+zone-dir = \"./zones\"
+",
+        )
+        .expect("parses");
+        assert_eq!(off.server.dnstap, None, "and absent is off");
     }
 
     /// RFC 8901 Model 1 is one key in one zone's table (`TODO.md` #44e). Model 2

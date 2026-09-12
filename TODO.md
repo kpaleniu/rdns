@@ -37,18 +37,18 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#44** (44a-44d done), **#45**, **#48**, **#49**, **#51**,
-**#53** and **#21**, as of 2026-09-12. ~~**None of them is a live defect**~~ —
-**that claim was wrong about #47**, which closed the same day carrying two MUSTs
-it had been filed as not breaking: RFC 6891 §6.1.1's OPT in a response to a
-request that had one, and RFC 3225 §3's DO bit, dropped on the first envelope of
-every AXFR. It was filed as "not a defect" because its own row read §6.1.1 as
-"asks for", and the section says what the difference cost. Of what is left, #50
-was the live one, and closing it is what added #53: a zone this server signed
-itself is verified again at every load, which 76 seconds of a million-record
-zone made visible. #44 is what an operator would find missing in `rdnsd`, #45
-what an ISP would find missing in `rdnsr`, #48 and #49 the two 44a left, #51 the
-one 44d left, and #21 is an inventory of deliberate deviations rather
+**#44** (44a-44e and 44g done; **44f** open), **#45**, **#48**, **#49**, **#51**,
+**#53**, **#54** and **#21**, as of 2026-09-12. ~~**None of them is a live
+defect**~~ — **that claim was wrong about #47**, which closed the same day
+carrying two MUSTs it had been filed as not breaking: RFC 6891 §6.1.1's OPT in a
+response to a request that had one, and RFC 3225 §3's DO bit, dropped on the
+first envelope of every AXFR. It was filed as "not a defect" because its own row
+read §6.1.1 as "asks for", and the section says what the difference cost. Of what
+is left, #50 was the live one, and closing it is what added #53: a zone this
+server signed itself is verified again at every load, which 76 seconds of a
+million-record zone made visible. #45 is what an ISP would find missing in
+`rdnsr`, #48 and #49 the two 44a left, #51 the one 44d left, #54 the one 44g
+left, and #21 is an inventory of deliberate deviations rather
 than a queue. Everything else numbered is closed;
 the table under "Closed work" says which, when, and where the reasoning went.
 
@@ -825,8 +825,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#44** (44a-44d done), **#45**, **#48**, **#49**, **#51** and
-**#53**, plus **#21** — see "What is open" above,
+**#44** (44a-44e and 44g done), **#45**, **#48**, **#49**, **#51**, **#53** and
+**#54**, plus **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -962,7 +962,7 @@ missing is the operational surface around the answering, which is the same shape
 | ~~**44d**~~ | ~~XFR over TLS (RFC 9103, "DNS Zone Transfer over TLS") — **0 hits**~~ **Done 2026-09-12**, one commit: `rdns::xot` and a stream-generic `xfr` for the client half, a `Privacy` the transports report for the server half, and `43g` against BIND | ~~Zone contents cross the wire in clear between primary and secondary, which for anything with private names is the objection. Cheap *after* #42a: the rustls setup, the certificate plumbing and the ALPN dispatch are the same, and a transfer is already framed TCP. Worth taking as a fourth stage of #42 rather than on its own~~ **"Cheap after 42a" was true of the server and wrong about which side the work was on.** A transfer already went out over the DoT listener, so the primary half was a *policy* — the closing note of #42 said so — and the half with no code at all was the secondary's: nothing here had ever been a TLS client. That cost `rdns` a `rustls` dependency (**+0 packages**, measured before writing it), `xfr` a boxed stream in place of its `TcpStream`, and the endpoint syntax a `+tls=name`. Three things the row did not see: the name is not optional, because §7.5 makes authenticating the master a MUST and "encrypt but do not check" is the shape that looks safe in a log and is not; the *version* matters, because §7.2 is TLS 1.3-only where RFC 7858 allows 1.2, so the fact the transports report is a three-way `Privacy` and not a bool; and a self-signed certificate cannot be both the anchor and the leaf — rustls says `CaUsedAsEndEntity` where kdig accepts one, which is why 43g generates a chain and 42a's DoT never had to. Left behind: **#51** |
 | ~~**44e**~~ | ~~multi-signer DNSSEC (RFC 8901, "Multi-Signer DNSSEC Models") — **0 hits**~~ **Done 2026-09-12**, one commit | ~~Any zone served by two independent providers needs it, which is ordinary practice for zones that must not go down. The signer here assumes it owns every key in the apex DNSKEY set; the multi-signer models require importing another operator's ZSK and signing alongside it~~ **The second sentence was wrong, and one test would have said so** (`CLAUDE.md` §19). The signer assumes no such thing: `publish_dnskeys` leaves a DNSKEY it did not put there alone and `sign_everything` signs with the keys it holds, so **Model 2 (§2.1.2) already worked** — measured before anything was written, and now `rfc_8901_model_2_needs_only_the_zone_file`. Three keys published, ours signing, theirs signing nothing, everything verifying. What was actually missing was **Model 1 (§2.1.1)**, where "the zone owner holds the KSK set ... and is responsible for signing the DNSKEY RRset and distributing it to the providers" — this server has a ZSK and no KSK, and the one RRSIG it cannot make has to survive a signing run that drops every other. `dnskey-rrsig = "imported"` per zone; a zone set to it with no such RRSIG fails rather than publishing an unsigned key set. And one check the row did not ask for: RFC 6840 §5.11's "the zone MUST also be signed with each algorithm ... present in the DNSKEY RRset" is a MUST **on servers** that §5.11 forbids validators to enforce, so a zone publishing a co-provider's key on an algorithm we hold none of is wrong and resolves perfectly. `algorithms_missing_signatures` reports it and `rdnsd` WARNs; refusing would take a working deployment off the air over a point nobody checks. Left undone and named in the section: CDS/CDNSKEY (§8, RFC 7344), and §5's denial agreement, which is not a local fact |
 | **44f** | key-rollover automation (RFC 6781) — **moved from #21** | Was on the not-implemented list with the note that "rollover is manual and the signer will not delete a published DNSKEY, which is the half that matters". That reasoning stands and is why this is not urgent — the dangerous half is already safe. It becomes a gate at fleet scale: a manual rollover per zone per year does not survive ten thousand zones |
-| **44g** | dnstap — **0 hits** | A query *stream*, not log lines: how operators feed analytics, security tooling and abuse handling. §14's logging decision is deliberate and right — nothing per-packet above debug, so a flood costs no log lines — and it is exactly why there is no data pipeline. Those are two different outputs and the second does not exist |
+| ~~**44g**~~ | ~~dnstap — **0 hits**~~ **Done 2026-09-12**, one commit: `rdns::dnstap` for the two wire formats, `rdnsd::dnstap` for the sink, `--dnstap` and `server.dnstap` | ~~A query *stream*, not log lines: how operators feed analytics, security tooling and abuse handling. §14's logging decision is deliberate and right — nothing per-packet above debug, so a flood costs no log lines — and it is exactly why there is no data pipeline. Those are two different outputs and the second does not exist~~ **The framing said "two wire formats, neither of them DNS", and both fit.** Protocol Buffers needs three wire types for this schema and Frame Streams is five control types and one field; what a generator would emit is ~200 lines, against `prost` + `prost-build` + `protoc` — which is the stack #14 removed 83 packages of. `tokio`'s `fs` feature came off its own no-caller list for the capture file and cost **0 packages**, measured either side of `Cargo.lock`. Three decisions the row did not name: **one entry per exchange**, since the response carries the query verbatim and that halves the frames on the answer path; **the queue drops rather than blocking**, because an analytics sink that stops reading must not become an outage (`dns_dnstap_dropped_total` is the shortfall); and **no Unix socket**, dnstap's usual transport, because `tokio::net::UnixStream` is `#[cfg(unix)]` and §1 is the story of what a cfg-gated module does behind a green suite. Verified end to end against **the reference protobuf runtime** rather than our own reader — `rdnsd` under a query over each transport, the capture decoded by `google.protobuf` 7.36.1 with no schema. Left behind: **#54** |
 
 #### 44c's numbers
 
@@ -1233,6 +1233,55 @@ Two halves, and they are not the same size:
 Not urgent, and the reason is the same one that makes it legal: every peer this
 tree talks to accepts TSIG, and #43's harness uses it for every transfer
 including 43g's over TLS.
+
+---
+
+### 54. A dispatcher cannot say which encrypted transport a message arrived on — **filed 2026-09-12**
+
+Left behind by 44g, with a number because the alternative is a sentence in a doc
+comment (`CLAUDE.md` §18).
+
+dnstap's `Message.socket_protocol` distinguishes UDP, TCP, DOT, DOH and DOQ, and
+`rdnsd` can fill in the first two. What reaches the answer path from an encrypted
+connection is `validation::Privacy` — `Clear`, `Tls13` or `TlsOlder` — so DoT,
+DoH and DoQ are one value by the time an entry is built. The field is `optional`
+in the schema, so 44g omits it rather than guessing: DOT for a DoH query is a
+wrong value where an absent one is a reader showing nothing (`CLAUDE.md` §14).
+
+**`Privacy` is not the thing to widen, and it says so itself.** Its doc comment
+is explicit: it is "separate from [`Transport`] rather than two more variants of
+it, because they answer different questions", and the version matters because
+RFC 9103 §7.2 is TLS-1.3-only for a transfer while RFC 7858 §4.1 takes 1.2 for a
+query. Adding "which protocol" to "what did it hide" would put the transfer
+policy and the analytics label in one type, which is the shape that question was
+split to avoid (§19: when the code you are about to call wrong carries a reason,
+answer it).
+
+So the fix is a second thing beside it, and the measurement of what that costs,
+taken rather than guessed:
+
+- `Handler::handle` takes `privacy: Privacy` and is implemented **6 times** —
+  `rdnsd/src/dispatch.rs`, `rdnsr/src/serve.rs`, and one test handler each in
+  `rdns-transport`'s `tcp.rs`, `tls.rs`, `quic.rs` and `https.rs`.
+- The value is *supplied* at **5 sites**: `tcp::serve` and `tcp`'s own test pass
+  `Privacy::Clear`, `tls.rs` and `https.rs` derive it from the negotiated
+  version, and `quic.rs` passes `Privacy::Tls13` outright.
+- `Privacy` appears at **30 sites** in total across the workspace, of which 19
+  are test call sites passing `Privacy::Clear`.
+
+Two shapes, and §19 says build them rather than argue:
+
+- a second parameter, which takes `Handler::handle` to six arguments and
+  `tcp::serve_one` to eight — one past what clippy allows, so it forces the
+  grouping anyway;
+- a small `Arrival { privacy, protocol }` passed where `privacy` is now, which
+  is the grouping done deliberately and touches the same 11 sites.
+
+Not urgent, and the reason is that the field is optional and the two transports
+an authoritative server mostly answers on are the two that already work. It
+becomes worth doing when somebody runs this behind DoH and wants to see it in
+the stream — or when a second consumer of "which transport" appears, which is
+the point at which the absence stops being one row's problem.
 
 ---
 

@@ -43,6 +43,8 @@ transfer-tls-ca = "/etc/rdns/xot-ca.pem"  # anchors for XoT masters (RFC 9103)
 transfer-tls-only = false     # true: refuse a transfer not over TLS 1.3
 control-socket = "/run/rdns/rdnsd.sock"
 allow-partial-load = false
+dnstap = "tcp:127.0.0.1:6000"   # or file:/var/log/rdnsd.fstrm — see 6.4
+dnstap-max-bytes = 1073741824   # a capture file's bound; 0 is no limit
 
 [signing]
 key-dir = "./keys"
@@ -171,6 +173,13 @@ Scraped, not pushed.
 `responses_refused`, `rate_limited`, `validation_errors`, `queries_dropped`, and
 `dns_queries_type{type=...}` for A/AAAA/MX/NS/CNAME/TXT/SOA/PTR/OTHER.
 
+`dns_tls_handshakes_total` and `dns_tls_handshake_failures_total`, and the same
+pair for QUIC: the ratio is how an expired or mismatched certificate is seen at
+all, since nothing here parses `notAfter`.
+
+`dns_dnstap_frames_total` and `dns_dnstap_dropped_total`: the query stream, and
+what its bounded queue had no room for. See 6.4.
+
 `dns_cache_hits_total`, `dns_cache_misses_total` and `dns_queries_recursive_total`
 are `rdnsr`'s and stay at zero on `rdnsd`; `queries_authoritative` is the reverse.
 
@@ -238,6 +247,68 @@ Nothing per-packet is above `debug`. `RUST_LOG` overrides the flag when set.
 
 The log macros (`bad_request!`, `serving_error!`) do not evaluate their arguments
 unless the level is enabled.
+
+### The query stream — `--dnstap` (dnstap)
+
+A different output from the log, for a different reader. The log answers "is
+something wrong" for a human and says nothing per packet above `debug`; dnstap is
+the packet stream analytics, abuse handling and security tooling consume. The two
+are not alternatives and neither substitutes for the other.
+
+`--dnstap tcp:<addr:port>` sends to a collector; `--dnstap file:<path>` writes a
+capture `dnstap -r` reads. **The scheme is required**: a bare path and a bare
+address are both plausible, and guessing is how an operator gets the other one.
+A target that cannot be opened — a collector not listening, a path not writable —
+fails at startup rather than leaving the server up and the stream absent.
+
+| | |
+|---|---|
+| payload | Protocol Buffers, `dnstap.proto`'s `Dnstap` and `Message`, written out rather than generated |
+| framing | Frame Streams (`fstrm`): a 32-bit big-endian length, or a zero escape to a control frame |
+| content type | `protobuf:dnstap.Dnstap`, which is what a reader matches on |
+| handshake | `tcp:` speaks READY/ACCEPT/START; `file:` takes START directly, because there is nobody to accept |
+| close | STOP, and FINISH on a socket. A killed process leaves a capture with neither, which `dnstap -r` reports as truncated |
+
+**One entry per exchange, not two.** BIND emits `AUTH_QUERY` and `AUTH_RESPONSE`
+separately; here the response entry carries the query verbatim in
+`Message.query_message`, which is what the schema is for and halves the frames on
+the answer path. A request that was answered with silence — over the response
+budget — is an `AUTH_QUERY` with no response, which is the one thing a log line
+at `debug` cannot tell a pipeline. An UPDATE is `UPDATE_QUERY` / `UPDATE_RESPONSE`.
+
+**`query_time` and `response_time` are both to the nanosecond**, so a reader can
+subtract them. The transport's own clock read is in whole seconds and is not used
+for this: a query time rounded down to the second reports a latency of up to a
+second for an answer that took microseconds, and a wrong number is worse than an
+absent one. The extra `SystemTime::now` is paid only when `--dnstap` is on.
+
+**`socket_protocol` is UDP or TCP, and absent on an encrypted connection.** The
+dispatcher is told `Privacy` — what the connection hid from the path — which
+deliberately does not say which protocol wrapped it, so DoT, DoH and DoQ are one
+value by the time an entry is built. The field is `optional` in the schema and an
+absent one is a reader showing nothing; DOT for a DoH query would be a wrong one.
+`TODO.md` #54.
+
+**The queue drops rather than blocking.** A bounded channel sits between the
+answer path and the writer, and a full one costs the payload, never the query: an
+analytics sink that stops reading must not become an outage.
+`dns_dnstap_frames_total` and `dns_dnstap_dropped_total` are the pair, and a
+ratio that leaves zero is the alert.
+
+**A capture file is bounded and not rotated.** `--dnstap-max-bytes` (default 1
+GiB, 0 for none) stops the writing when reached, warns once, and counts every
+further payload as dropped. Without it an unrotated capture is a way to fill a
+disk and take the server down with it. Ignored for `tcp:`, where the collector
+owns the storage.
+
+**No Unix socket**, which is dnstap's usual transport. `tokio` has no
+`UnixStream` on Windows, and a cfg-gated sink is a module that stops compiling on
+one platform behind a green suite — which this tree has already done once.
+`rdnsd`'s control socket carries that cost because nothing else can authenticate
+by file mode; a dnstap sink has TCP.
+
+`Dnstap.identity` comes from `HOSTNAME`, then `COMPUTERNAME`, and is omitted when
+neither is set. `Dnstap.version` is `rdnsd <version>`.
 
 ---
 

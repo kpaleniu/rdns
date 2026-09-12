@@ -31,9 +31,14 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 # Not `full`: its `parking_lot` feature costs five packages — `parking_lot`,
 # `parking_lot_core`, `lock_api`, `scopeguard`, `smallvec` — for a mutex nothing
-# here asks for, and `fs`, `process` and `io-std` compile code with no caller
-# (there is no `tokio::fs` or `tokio::process` in the tree). These seven are what
-# the code names; `tokio::task` and `tokio::spawn` come with `rt-multi-thread`.
+# here asks for, and `process` and `io-std` compile code with no caller (there is
+# no `tokio::process` in the tree). These eight are what the code names;
+# `tokio::task` and `tokio::spawn` come with `rt-multi-thread`.
+#
+# `fs` was on that no-caller list until #44g, which writes a dnstap capture file
+# from a task that must not block a worker thread on it. It costs 0 packages —
+# measured either side, `Cargo.lock` does not move — because it is the blocking
+# pool `rt-multi-thread` already provides, wearing an async signature.
 tokio = { version = "1.41.1", features = [
     "time",
     "sync",
@@ -42,6 +47,7 @@ tokio = { version = "1.41.1", features = [
     "signal",
     "macros",
     "rt-multi-thread",
+    "fs",
 ] }
 # Levels, so a malformed-packet flood is not 50k journald lines a second and so
 # the message is not built at all when nothing wants it. The library only emits;

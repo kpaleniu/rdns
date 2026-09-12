@@ -131,6 +131,16 @@ pub struct Counters {
     pub quic_handshakes: AtomicU64,
     pub quic_handshake_failures: AtomicU64,
 
+    /// dnstap payloads queued for the collector, and those the queue had no
+    /// room for.
+    ///
+    /// The pair, not just the first: the queue is bounded on purpose — a
+    /// collector that stops reading must not stop the server — so a bound with
+    /// no visible shortfall would make the stream quietly incomplete
+    /// (`CLAUDE.md` §5). A ratio that leaves zero is the alert.
+    pub dnstap_frames: AtomicU64,
+    pub dnstap_dropped: AtomicU64,
+
     // Cumulative buckets plus count and sum: what `histogram_quantile()` needs.
     latency_buckets: [AtomicU64; 8],
     latency_count: AtomicU64,
@@ -182,6 +192,8 @@ impl DnsMetrics {
             tls_handshake_failures: AtomicU64::new(0),
             quic_handshakes: AtomicU64::new(0),
             quic_handshake_failures: AtomicU64::new(0),
+            dnstap_frames: AtomicU64::new(0),
+            dnstap_dropped: AtomicU64::new(0),
             zones: RwLock::new(BTreeMap::new()),
             catalogs: RwLock::new(BTreeMap::new()),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -483,6 +495,33 @@ impl DnsMetrics {
             "dns_quic_handshake_failures_total {}
 ",
             self.quic_handshake_failures.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "# HELP dns_dnstap_frames_total dnstap payloads queued for the sink
+",
+        );
+        output.push_str(
+            "# TYPE dns_dnstap_frames_total counter
+",
+        );
+        output.push_str(&format!(
+            "dns_dnstap_frames_total {}
+",
+            self.dnstap_frames.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP dns_dnstap_dropped_total dnstap payloads the bounded queue had no room for
+",
+        );
+        output.push_str(
+            "# TYPE dns_dnstap_dropped_total counter
+",
+        );
+        output.push_str(&format!(
+            "dns_dnstap_dropped_total {}
+",
+            self.dnstap_dropped.load(Ordering::Relaxed)
         ));
 
         // Record type metrics
@@ -848,6 +887,11 @@ mod tests {
             "dns_tls_handshake_failures_total",
             "dns_quic_handshakes_total",
             "dns_quic_handshake_failures_total",
+            // Not an encrypted transport, and here for the same reason: a
+            // stream nobody configured reads zero, and zero is the fact
+            // (`TODO.md` #44g).
+            "dns_dnstap_frames_total",
+            "dns_dnstap_dropped_total",
         ] {
             assert!(
                 at_zero.contains(&format!(

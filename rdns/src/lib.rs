@@ -23,6 +23,7 @@ pub mod dnssec_key;
 #[cfg(test)]
 mod dnssec_test_util;
 pub mod dnssec_validation_mode;
+pub mod dnstap;
 mod endpoint;
 pub mod error;
 /// Shared eviction, `pub(crate)` because it is a mechanism and not a policy.

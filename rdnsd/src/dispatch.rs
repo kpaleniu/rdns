@@ -20,6 +20,7 @@ use anyhow::Context;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use rdns::dnstap;
 use rdns::{
     clock::current_unix_timestamp,
     ede::InfoCode,
@@ -65,6 +66,28 @@ pub(super) enum Wire<'a> {
     /// One datagram back to the peer, capped by its EDNS advertisement and
     /// charged against the response budget.
     Datagram(&'a UdpSocket, SocketAddr),
+}
+
+/// A request in both the forms the epilogue needs it: parsed, and as the octets
+/// it arrived as.
+///
+/// One argument rather than two, which keeps [`Server::finish`] at seven and
+/// says the true thing about them: they are one message, and a `DnsMessage`
+/// re-serialized is not the bytes a client sent.
+#[derive(Clone, Copy)]
+pub(super) struct Incoming<'a> {
+    pub(super) msg: &'a DnsMessage,
+    pub(super) bytes: &'a [u8],
+    /// When it arrived, to nanoseconds, and `None` unless there is a query
+    /// stream to put it on.
+    ///
+    /// Not derived from `now`, which is the transport's clock read in whole
+    /// seconds: a dnstap reader subtracts the query time from the response
+    /// time, so a query time rounded down to the second reports a latency of
+    /// up to a second for an answer that took microseconds. A wrong number is
+    /// worse than an absent one (`CLAUDE.md` §14), and here it is worse than
+    /// the extra `SystemTime::now` — which is paid only when `--dnstap` is on.
+    pub(super) arrived: Option<dnstap::Timestamp>,
 }
 
 impl Wire<'_> {
@@ -171,6 +194,10 @@ impl Server {
                 return;
             }
         };
+
+        // Before anything that could take time, and only when somebody is
+        // reading: see `Incoming::arrived`.
+        let arrived = self.dnstap.as_ref().map(|_| dnstap::Timestamp::now());
 
         let qtype = msg.queries.first().map(|q| q.qtype);
         self.ctx.logger.log_query(ip, qtype, now);
@@ -282,8 +309,19 @@ impl Server {
             return;
         }
 
-        self.finish(wire, &msg, session.as_mut(), peer, now, scratch)
-            .await;
+        self.finish(
+            wire,
+            Incoming {
+                msg: &msg,
+                bytes: packet,
+                arrived,
+            },
+            session.as_mut(),
+            peer,
+            now,
+            scratch,
+        )
+        .await;
     }
 
     /// The epilogue every ordinary answer leaves through: charge it, sign it,
@@ -301,12 +339,13 @@ impl Server {
     async fn finish(
         &self,
         wire: &Wire<'_>,
-        request: &DnsMessage,
+        incoming: Incoming<'_>,
         session: Option<&mut TsigSession>,
         peer: SocketAddr,
         now: u64,
         scratch: &Scratch,
     ) {
+        let request = incoming.msg;
         let ip = peer.ip();
         let advertised = self.ctx.udp.advertised();
         // The ceiling `answer` wrote the body against, signature reserved and
@@ -360,7 +399,67 @@ impl Server {
         };
         if let Some(reply) = reply {
             wire.send(&reply, &self.ctx.logger, ip).await;
+            self.record_dnstap(wire, incoming, peer, Some(&reply));
+        } else {
+            // A request we answered with silence — over the response budget.
+            // A query-only entry says it arrived and got nothing, which is the
+            // one thing a log line at DEBUG cannot tell an analytics pipeline.
+            self.record_dnstap(wire, incoming, peer, None);
         }
+    }
+
+    /// Put this exchange on the query stream, if there is one.
+    ///
+    /// One entry per exchange rather than the two BIND emits: the response
+    /// entry carries the query verbatim in `Message.query_message`, which is
+    /// what the schema is for, and halves the frames on the hot path.
+    ///
+    /// `socket_protocol` is UDP or TCP and is *omitted* for an encrypted
+    /// connection. The dispatcher is told [`Privacy`] — which deliberately
+    /// says what a connection hid rather than which protocol wrapped it, and
+    /// says why in its own doc comment — so DoT, DoH and DoQ are one value
+    /// here. An absent optional field is a reader showing nothing; DOT for a
+    /// DoH query would be a wrong one (`TODO.md` #54, `CLAUDE.md` §14).
+    fn record_dnstap(
+        &self,
+        wire: &Wire<'_>,
+        incoming: Incoming<'_>,
+        peer: SocketAddr,
+        reply: Option<&[u8]>,
+    ) {
+        let Some(sink) = &self.dnstap else { return };
+        let update = incoming.msg.opcode == OpCode::Update;
+        let message_type = match (update, reply.is_some()) {
+            (false, true) => dnstap::MessageType::AuthResponse,
+            (false, false) => dnstap::MessageType::AuthQuery,
+            (true, true) => dnstap::MessageType::UpdateResponse,
+            (true, false) => dnstap::MessageType::UpdateQuery,
+        };
+        sink.record(&dnstap::Entry {
+            identity: sink.identity(),
+            version: sink.version(),
+            message_type,
+            socket_protocol: match wire {
+                Wire::Datagram(..) => Some(dnstap::SocketProtocol::Udp),
+                Wire::Framed(_, Privacy::Clear) => Some(dnstap::SocketProtocol::Tcp),
+                Wire::Framed(..) => None,
+            },
+            peer,
+            // The listener's address is not carried this far, and a wrong one
+            // is worse than none on a multi-homed host.
+            local: None,
+            // Both to nanoseconds, because a reader subtracts them. See
+            // `Incoming::arrived` for why the transport's `now` is not one of
+            // them.
+            query_time: incoming.arrived.unwrap_or_default(),
+            response_time: reply.map(|_| dnstap::Timestamp::now()),
+            query: Some(incoming.bytes),
+            response: reply,
+            // `Message.query_zone` needs the zone the answer came out of, which
+            // the epilogue is not told. Optional in the schema, and a reader
+            // takes the zone from the question.
+            zone: None,
+        });
     }
 
     /// Answer an AXFR: the whole zone, or a refusal.

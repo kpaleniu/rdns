@@ -25,6 +25,7 @@ mod config;
 mod control;
 /// Answering one request, on either transport.
 mod dispatch;
+mod dnstap;
 mod replication;
 /// What a signed answer weighs, for `TODO.md` #41's choice of ceiling.
 #[cfg(test)]
@@ -489,6 +490,41 @@ struct Cli {
     /// or --https-listen — or every transfer is refused.
     #[arg(long, conflicts_with = "config")]
     transfer_tls_only: bool,
+    /// Stream every answered request to a dnstap collector.
+    ///
+    /// `tcp:<addr:port>` for a collector, `file:<path>` for a capture `dnstap
+    /// -r` reads. The scheme is not optional: a path and an address are both
+    /// plausible bare, and guessing is how an operator gets the other one.
+    ///
+    /// This is the query *stream*, not the query log — the log deliberately
+    /// says nothing per packet above DEBUG, which is why a pipeline needs its
+    /// own output. The queue between the answer path and the sink is bounded
+    /// and drops rather than blocking: `dns_dnstap_dropped_total` is the
+    /// shortfall, and a collector that stops reading must not become an outage.
+    ///
+    /// No Unix socket, which is dnstap's usual transport: `tokio` has no
+    /// `UnixStream` on Windows and a cfg-gated sink is a module that stops
+    /// compiling on one platform behind a green suite. TCP is portable and does
+    /// the same job.
+    #[arg(
+        long,
+        value_name = "tcp:ADDR:PORT|file:PATH",
+        conflicts_with = "config"
+    )]
+    dnstap: Option<String>,
+    /// Stop writing a dnstap *file* after this many octets. 0 is no limit.
+    ///
+    /// A capture file is not rotated and not reopened, so without a bound it is
+    /// a way to fill a disk and take the server down with it. Reaching the
+    /// bound stops the writing, warns once, and counts every further payload as
+    /// dropped. Ignored for a `tcp:` target, where the collector owns the
+    /// storage.
+    ///
+    /// The config file's `server.dnstap-max-bytes` is the same setting and the
+    /// same default, which `config::default_dnstap_max_bytes` holds so the two
+    /// cannot drift.
+    #[arg(long, value_name = "OCTETS", default_value = "1073741824")]
+    dnstap_max_bytes: u64,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///
     /// `GET /metrics` is the scrape, `GET /healthz` says the process is
@@ -561,6 +597,9 @@ struct Server {
     /// `None` on a server with no writable zone source: every UPDATE refused.
     updates: Arc<UpdateHandling>,
     journal: Option<Arc<Journal>>,
+    /// Where the query stream goes, or `None` when `--dnstap` was not given.
+    /// See [`crate::dnstap`] for why the queue behind it drops.
+    dnstap: Option<crate::dnstap::Sink>,
 }
 
 /// What answering a dynamic UPDATE (RFC 2136) needs beyond what a query needs.
@@ -633,8 +672,24 @@ struct ServePolicy {
     updates: Arc<UpdateHandling>,
     /// Where the delta log is persisted, if anywhere.
     journal: Option<Arc<Journal>>,
+    /// Where the query stream goes, and what a capture file may weigh.
+    dnstap: Option<(crate::dnstap::Target, u64)>,
     /// The control socket, and what a `reload` on it pokes.
     control: ControlPolicy,
+}
+
+/// `Dnstap.identity`: this host, as the environment names it.
+///
+/// `HOSTNAME` then `COMPUTERNAME`, and empty if neither is set — which the
+/// encoder omits rather than writing as an empty string. `std` has no portable
+/// way to ask the OS and a crate for one field of one optional output is not a
+/// dependency this earns (`CLAUDE.md` §14). An operator who needs a particular
+/// identity sets the variable, which is where a service manager already puts it.
+fn hostname_bytes() -> Vec<u8> {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .map(String::into_bytes)
+        .unwrap_or_default()
 }
 
 /// "853 (DoT), 853 (DoQ)", or whichever of the two is configured.
@@ -708,6 +763,7 @@ async fn serve(
         readiness,
         updates,
         journal,
+        dnstap,
         control,
     } = policy;
     // Floored, not refused: `--udp-workers 0` would bind the socket and answer
@@ -835,6 +891,25 @@ async fn serve(
         None => None,
     };
 
+    // Before the sockets, with the other things that must fail at startup: a
+    // collector that is not listening, or a capture path that cannot be
+    // written, is a misconfiguration and not a stream that quietly never
+    // appears (`CLAUDE.md` §4).
+    let dnstap = match &dnstap {
+        Some((target, max_bytes)) => Some(
+            crate::dnstap::Sink::spawn(
+                target,
+                *max_bytes,
+                hostname_bytes(),
+                format!("rdnsd {}", env!("CARGO_PKG_VERSION")).into_bytes(),
+                (*metrics).clone(),
+                shutdown.stop_handle(),
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
     let server = Arc::new(Server {
         zone_map,
         ctx: ServeContext {
@@ -853,6 +928,7 @@ async fn serve(
         deltas,
         updates,
         journal,
+        dnstap,
     });
     // The effective policy, at the default level: a control nobody can observe
     // is a control nobody can debug.
@@ -2091,6 +2167,10 @@ async fn main() -> Result<()> {
             readiness,
             updates,
             journal,
+            dnstap: match &cli.dnstap {
+                Some(spec) => Some((spec.parse()?, cli.dnstap_max_bytes)),
+                None => None,
+            },
             control: ControlPolicy {
                 socket: cli.control_socket,
                 reloads,
@@ -2479,6 +2559,7 @@ mod tests {
             secondaries: Arc::new(Secondaries::default()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
             updates: Arc::new(UpdateHandling::disabled()),
+            dnstap: None,
         })
     }
 
@@ -3344,6 +3425,7 @@ mod tests {
             deltas: Arc::new(RwLock::new(log)),
             updates: Arc::new(UpdateHandling::disabled()),
             journal: None,
+            dnstap: None,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -3406,6 +3488,7 @@ mod tests {
                 applying: tokio::sync::Mutex::new(()),
             }),
             journal,
+            dnstap: None,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -5358,6 +5441,7 @@ mod tests {
             secondaries: Arc::new(Secondaries::default()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
             updates: Arc::new(UpdateHandling::disabled()),
+            dnstap: None,
         };
         let peer: SocketAddr = "192.0.2.9:5353".parse().unwrap();
 
