@@ -66,6 +66,43 @@ existing names on purpose.
 NSEC3PARAM) before generating anything. DNSKEY records are not dropped — a key
 published without its private half is how a rollover starts.
 
+One RRSIG survives, under one setting: see multi-signer below.
+
+### Multi-signer (RFC 8901)
+
+**Model 2 (§2.1.2) works with no setting at all**, and did before anything was
+written for it. Each provider has its own KSK and ZSK; the other providers' ZSKs
+go in the zone file at the apex. `publish_dnskeys` leaves a DNSKEY it did not put
+there alone, `sign_everything` signs the DNSKEY RRset with this server's SEP keys
+and the data with its own ZSK, and a key with no private half here signs nothing.
+See `rfc_8901_model_2_needs_only_the_zone_file`, which exists because `TODO.md`
+#44e claimed the opposite about code nobody had opened.
+
+**Model 1 (§2.1.1) is `dnskey-rrsig = "imported"`** per zone. There "the zone
+owner holds the KSK set ... and is responsible for signing the DNSKEY RRset and
+distributing it to the providers", so this server has a ZSK and no KSK and the
+RRSIG over the apex DNSKEY RRset is one it cannot make. With the setting, that
+one signature is carried through from the zone file and none is generated for
+it. Every other RRSIG in the file is still dropped: keeping those is how a zone
+publishes two generations of signature over one RRset. A zone set to `imported`
+whose file carries no RRSIG(DNSKEY) fails to sign, rather than publishing an
+unsigned key set that is bogus at every validator.
+
+**Algorithm coverage is reported, not enforced.** RFC 6840 §5.11 restating
+RFC 4035 §2.2: "the zone MUST also be signed with each algorithm (though not each
+key) present in the DNSKEY RRset", and "this requirement applies to servers, not
+validators ... [validators] MUST NOT insist that all algorithms signaled in the
+DNSKEY RRset work". So a zone publishing a DNSKEY whose algorithm nothing signs
+with resolves perfectly everywhere and is still wrong. `rdnsd` logs a WARN per
+zone naming the algorithms; it does not refuse, because refusing would take a
+working deployment off the air over something no resolver checks. The two ways in
+are RFC 8901 §4 — "DNS providers participating in multi-signer models need to use
+a common DNSSEC signing algorithm" — and a half-finished algorithm rollover.
+
+Not done, and `TODO.md` #44e says what it would take: CDS/CDNSKEY (§8, RFC 7344),
+which nothing here generates, and §5's authenticated-denial agreement between
+providers, which is not a local fact and cannot be checked here.
+
 ### Validity, spread and re-signing
 
 | knob | value | where |

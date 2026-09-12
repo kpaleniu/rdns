@@ -286,6 +286,29 @@ pub struct ZoneConfig {
     pub nsec3_opt_out: Option<bool>,
     #[serde(default)]
     pub validity_days: Option<u32>,
+    /// Where this zone's apex DNSKEY RRset gets its signature. Absent is
+    /// `local`, which is every ordinary zone.
+    #[serde(default)]
+    pub dnskey_rrsig: Option<DnskeyRrsig>,
+}
+
+/// Who signs a zone's apex DNSKEY RRset.
+///
+/// `imported` is RFC 8901 §2.1.1's Model 1, where "the zone owner holds the KSK
+/// set ... and is responsible for signing the DNSKEY RRset and distributing it
+/// to the providers": the RRSIG arrives in the zone file and this server keeps
+/// it rather than replacing it with one from a key it does not have.
+///
+/// Model 2 (§2.1.2) needs no setting. Each provider has its own KSK and signs
+/// the DNSKEY RRset itself; importing the other providers' ZSKs is a zone-file
+/// edit, and the signer has always published a key it did not put there.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DnskeyRrsig {
+    /// Signed here, by this server's SEP keys.
+    Local,
+    /// Signed elsewhere; keep what the zone file carries.
+    Imported,
 }
 
 /// What a config file supplies that no flag can, so it cannot be folded into
@@ -311,11 +334,15 @@ pub struct ZoneSigningOverride {
     pub nsec3: Option<bool>,
     pub nsec3_opt_out: Option<bool>,
     pub validity_days: Option<u32>,
+    pub dnskey_rrsig: Option<DnskeyRrsig>,
 }
 
 impl ZoneSigningOverride {
     fn is_set(&self) -> bool {
-        self.nsec3.is_some() || self.nsec3_opt_out.is_some() || self.validity_days.is_some()
+        self.nsec3.is_some()
+            || self.nsec3_opt_out.is_some()
+            || self.validity_days.is_some()
+            || self.dnskey_rrsig.is_some()
     }
 }
 
@@ -567,6 +594,7 @@ impl Config {
                 nsec3: settings.nsec3,
                 nsec3_opt_out: settings.nsec3_opt_out,
                 validity_days: settings.validity_days,
+                dnskey_rrsig: settings.dnskey_rrsig,
             };
             if overrides.is_set() {
                 if self.signing.is_none() {
@@ -1035,5 +1063,45 @@ validity-days = 7
         let other = &config.zones["other.test."];
         assert_eq!(other.nsec3, None, "absent means use [signing]");
         assert_eq!(other.validity_days, None);
+    }
+
+    /// RFC 8901 Model 1 is one key in one zone's table (`TODO.md` #44e). Model 2
+    /// is not here on purpose: it needs no setting, only the co-providers' ZSKs
+    /// in the zone file.
+    #[test]
+    fn a_zone_can_say_its_dnskey_rrsig_is_signed_elsewhere() {
+        let config = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+[signing]
+key-dir = "./keys"
+[zones."multi.test."]
+dnskey-rrsig = "imported"
+[zones."ordinary.test."]
+"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            config.zones["multi.test."].dnskey_rrsig,
+            Some(DnskeyRrsig::Imported)
+        );
+        assert_eq!(
+            config.zones["ordinary.test."].dnskey_rrsig, None,
+            "absent means this server signs it, which is every ordinary zone"
+        );
+
+        // `deny_unknown_fields` covers the key; the value is the enum's, and a
+        // typo in it has to fail at startup too (`CLAUDE.md` §15).
+        let err = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+[zones."multi.test."]
+dnskey-rrsig = "improted"
+"#,
+        )
+        .expect_err("a misspelled value is not a setting");
+        assert!(err.to_string().contains("dnskey-rrsig"), "got: {err}");
     }
 }

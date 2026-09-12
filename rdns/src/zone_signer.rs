@@ -35,6 +35,29 @@ use crate::Ttl;
 use crate::{Name, NameRef, ParsedRecord, RecordData};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// Where the apex DNSKEY RRset's signature comes from.
+///
+/// [`DnskeySignature::Imported`] is RFC 8901 §2.1.1's Model 1, where "the zone
+/// owner holds the KSK set, manages the DS record set, and is responsible for
+/// signing the DNSKEY RRset and distributing it to the providers". A provider
+/// running that model has a ZSK and no KSK, so the RRSIG over the DNSKEY RRset
+/// is not one it can make — it arrives in the zone file and has to survive a
+/// signing run rather than being replaced by one this server cannot produce.
+///
+/// Model 2 (§2.1.2) needs none of this and needed no code: each provider has
+/// its own KSK, signs the DNSKEY RRset with it, and publishes the other
+/// providers' ZSKs alongside. Putting those in the zone file is enough — see
+/// `rfc_8901_model_2_needs_only_the_zone_file`, which is the test the row that
+/// filed this had instead of a reading of `publish_dnskeys`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DnskeySignature {
+    /// Made here, by the SEP keys — or by all of them when no key is a SEP.
+    #[default]
+    Local,
+    /// Kept from the zone file, made by a key this server does not hold.
+    Imported,
+}
+
 /// How a zone proves that a name is not in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenialChain {
@@ -130,6 +153,9 @@ pub struct SigningPolicy {
     /// window; see `SigningPolicy::expiry_for`.
     pub expiration: u32,
     pub chain: DenialChain,
+    /// Where the apex DNSKEY RRset's RRSIG comes from. See
+    /// [`DnskeySignature`].
+    pub dnskey_signature: DnskeySignature,
     /// Kept so the policy can say when to re-sign and how far to spread expiry.
     validity: u64,
     /// The wall-clock second this run belongs to, which the served SOA serial is
@@ -150,6 +176,7 @@ impl SigningPolicy {
             inception: now.saturating_sub(CLOCK_SKEW_ALLOWANCE) as u32,
             expiration: now.saturating_add(validity) as u32,
             chain: DenialChain::Nsec,
+            dnskey_signature: DnskeySignature::Local,
             validity,
             signed_at: now,
         }
@@ -157,6 +184,13 @@ impl SigningPolicy {
 
     pub fn with_chain(mut self, chain: DenialChain) -> Self {
         self.chain = chain;
+        self
+    }
+
+    /// RFC 8901 Model 1: keep the apex DNSKEY RRset's RRSIG from the zone file
+    /// and make none here. See [`DnskeySignature`].
+    pub fn with_imported_dnskey_rrsig(mut self) -> Self {
+        self.dnskey_signature = DnskeySignature::Imported;
         self
     }
 
@@ -310,6 +344,14 @@ fn sign_zone_inner(
             class: Class::new(1),
             rdata: nsec3param_rdata(salt, *iterations),
         });
+    }
+
+    if policy.dnskey_signature == DnskeySignature::Imported
+        && !has_dnskey_rrsig(&signed, origin.as_ref())
+    {
+        return Err(DnssecError::signing(format!(
+            "{origin} is configured for an imported DNSKEY signature (RFC 8901 §2.1.1) and its              zone file carries no RRSIG over the apex DNSKEY RRset — signing it here would              publish a key set this server cannot vouch for",
+        )));
     }
 
     let layout = Layout::of(&signed, origin.as_ref());
@@ -493,7 +535,9 @@ fn carry_over_records(
     let mut carried: Vec<ZoneRecord> = Vec::new();
 
     for record in zone.records() {
-        if is_signer_output(record.rdata.rtype()) {
+        if is_signer_output(record.rdata.rtype())
+            && !is_imported_dnskey_rrsig(record, origin, policy)
+        {
             continue;
         }
         if record.class != Class::new(1) {
@@ -563,6 +607,87 @@ fn carry_over_records(
 /// Records this signer generates, and therefore replaces rather than preserves.
 fn is_signer_output(rtype: Rtype) -> bool {
     matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3 | rt::NSEC3PARAM)
+}
+
+/// The one RRSIG a signing run may carry through rather than replace: the apex
+/// DNSKEY RRset's, under [`DnskeySignature::Imported`].
+///
+/// Narrow on purpose. Model 1 hands a provider exactly one signature it did not
+/// make, and every other RRSIG in the file is this signer's own stale output —
+/// keeping those is how a zone comes to publish two generations of signature
+/// over the same RRset.
+fn is_imported_dnskey_rrsig(
+    record: &ZoneRecord,
+    origin: NameRef<'_>,
+    policy: &SigningPolicy,
+) -> bool {
+    policy.dnskey_signature == DnskeySignature::Imported
+        && record.rdata.rtype() == rt::RRSIG
+        && record.name.as_ref() == origin
+        && matches!(
+            record.rdata.parse(),
+            Ok(ParsedRecord::RRSIG { type_covered, .. }) if type_covered == rt::DNSKEY
+        )
+}
+
+/// Whether `zone` holds an RRSIG over the apex DNSKEY RRset.
+fn has_dnskey_rrsig(zone: &Zone, origin: NameRef<'_>) -> bool {
+    zone.query(origin, Qtype::of(rt::RRSIG)).iter().any(|r| {
+        matches!(
+            r.rdata.parse(),
+            Ok(ParsedRecord::RRSIG { type_covered, .. }) if type_covered == rt::DNSKEY
+        )
+    })
+}
+
+/// The DNSSEC algorithms in `zone`'s apex DNSKEY RRset that no RRSIG in the
+/// zone was made with, in the order they first appear.
+///
+/// RFC 6840 §5.11 restating RFC 4035 §2.2: "the zone MUST also be signed with
+/// each algorithm (though not each key) present in the DNSKEY RRset", and "this
+/// requirement applies to servers, not validators". So a non-empty answer here
+/// is a conformance failure of *ours* that no resolver will notice — §5.11 also
+/// says validators "MUST NOT insist that all algorithms signaled in the DNSKEY
+/// RRset work" — which is exactly why it needs saying out loud somewhere.
+///
+/// The case that produces it deliberately is RFC 8901 §4: "DNS providers
+/// participating in multi-signer models need to use a common DNSSEC signing
+/// algorithm". Import another operator's ZSK on an algorithm this server holds
+/// no key for and the zone is published one algorithm short, silently. The
+/// undeliberate case is a half-finished algorithm rollover, which has the same
+/// shape.
+///
+/// Takes the *signed* zone, so it reads what was published rather than what was
+/// intended — a key that failed to sign for any other reason counts here too.
+pub fn algorithms_missing_signatures(zone: &Zone) -> Vec<u8> {
+    let origin = zone.origin();
+    let signed_with: BTreeSet<u8> = zone
+        .records()
+        .iter()
+        .filter_map(|r| match r.rdata.parse() {
+            Ok(ParsedRecord::RRSIG { algorithm, .. }) => Some(algorithm),
+            _ => None,
+        })
+        .collect();
+
+    let mut missing = Vec::new();
+    for record in zone.query(origin, Qtype::of(rt::DNSKEY)) {
+        let Ok(ParsedRecord::DNSKEY {
+            flags, algorithm, ..
+        }) = record.rdata.parse()
+        else {
+            continue;
+        };
+        // A key with the Zone Key bit clear signs nothing by definition
+        // (RFC 4034 §2.1.1), so its algorithm is not one the zone owes.
+        if flags & crate::dnssec::DNSKEY_FLAG_ZONE == 0 {
+            continue;
+        }
+        if !signed_with.contains(&algorithm) && !missing.contains(&algorithm) {
+            missing.push(algorithm);
+        }
+    }
+    missing
 }
 
 /// Publish the DNSKEY for every key, returning the TTL the RRset ended up with.
@@ -900,6 +1025,12 @@ fn sign_everything(
             continue;
         }
         let signers = if rtype == rt::DNSKEY {
+            // Model 1's signature is already in `signed`, carried through by
+            // `carry_over_records`; signing again would publish a second RRSIG
+            // from a key the parent's DS does not name.
+            if policy.dnskey_signature == DnskeySignature::Imported {
+                continue;
+            }
             dnskey_signers
         } else {
             data_signers
@@ -1045,6 +1176,241 @@ a\.b    IN A   192.0.2.50
     fn sign_test_zone(chain: DenialChain) -> Zone {
         let zone = parse_zone_file(ZONE, ORIGIN).expect("the test zone parses");
         sign_zone(&zone, &signing_keys(ORIGIN), &policy(chain)).expect("signing succeeds")
+    }
+
+    // RFC 8901, multi-signer DNSSEC. `TODO.md` #44e.
+
+    /// Publish a foreign ZSK at the apex and it stays there, vouched for by our
+    /// KSK, while our ZSK goes on signing the data.
+    ///
+    /// **This is the test the row that filed #44e did not have.** It said "the
+    /// signer here assumes it owns every key in the apex DNSKEY set"; the
+    /// signer assumes no such thing, and has not since [`publish_dnskeys`] was
+    /// written to leave a key it did not put there alone. Model 2 (§2.1.2) is
+    /// "each provider has their own KSK and ZSK sets" with the other providers'
+    /// ZSKs imported, and that is a zone-file edit here (`CLAUDE.md` §19).
+    #[test]
+    fn rfc_8901_model_2_needs_only_the_zone_file() {
+        let ours = signing_keys(ORIGIN);
+        let theirs =
+            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+                .expect("the other provider's ZSK");
+
+        let mut zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        zone.add_record(ZoneRecord {
+            name: nm(ORIGIN),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+            rdata: dnskey_rdata(&theirs.dnskey()),
+        });
+        let signed = sign_zone(&zone, &ours, &policy(DenialChain::Nsec)).expect("signs");
+        let res = resources(&signed);
+
+        let published: BTreeSet<u16> = dnskeys_in(&res).iter().map(|k| k.key_tag()).collect();
+        let mut expected: BTreeSet<u16> = ours.iter().map(|k| k.key_tag()).collect();
+        expected.insert(theirs.key_tag());
+        assert_eq!(published, expected, "all three keys are published");
+
+        // Vouched for by our KSK: §2.1.2's "the DNSKEY RRset is signed
+        // independently by each provider using their own KSK".
+        let apex_signers: Vec<u16> = rrsigs_in(&res)
+            .iter()
+            .filter(|sig| sig.type_covered == rt::DNSKEY)
+            .map(|sig| sig.key_tag)
+            .collect();
+        let ksk = ours.iter().find(|k| k.is_sep()).expect("a KSK").key_tag();
+        assert_eq!(apex_signers, vec![ksk]);
+        assert!(matches!(
+            proof_for(&signed, ORIGIN, rt::DNSKEY),
+            RrsetProof::Verified { .. }
+        ));
+
+        // And the other provider's key signs nothing here, which is the point:
+        // we do not hold its private half.
+        assert!(
+            rrsigs_in(&res)
+                .iter()
+                .all(|s| s.key_tag != theirs.key_tag()),
+            "a key we have no private half of cannot have signed anything"
+        );
+        assert!(matches!(
+            proof_for(&signed, "www.example.com.", rt::A),
+            RrsetProof::Verified { .. }
+        ));
+    }
+
+    /// RFC 8901 §4: providers "need to use a common DNSSEC signing algorithm".
+    /// Import a ZSK on an algorithm we hold no key for and the zone is
+    /// published one algorithm short of RFC 6840 §5.11's "the zone MUST also be
+    /// signed with each algorithm ... present in the DNSKEY RRset" — invisibly,
+    /// since §5.11 also tells validators not to check.
+    #[test]
+    fn an_imported_key_on_an_algorithm_we_cannot_sign_with_is_reported() {
+        let ours = signing_keys(ORIGIN);
+        let theirs = SigningKey::generate(SigningAlgorithm::Ed25519, ORIGIN, DNSKEY_FLAG_ZONE)
+            .expect("the other provider's ZSK, on another algorithm");
+
+        let mut zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        zone.add_record(ZoneRecord {
+            name: nm(ORIGIN),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+            rdata: dnskey_rdata(&theirs.dnskey()),
+        });
+        let signed = sign_zone(&zone, &ours, &policy(DenialChain::Nsec)).expect("signs");
+
+        assert_eq!(
+            algorithms_missing_signatures(&signed),
+            vec![theirs.algorithm().code()],
+            "Ed25519 is in the DNSKEY RRset and signs nothing"
+        );
+        // The zone still validates, which is why this is reported rather than
+        // refused: §5.11's rule is on the server alone.
+        assert!(matches!(
+            proof_for(&signed, "www.example.com.", rt::A),
+            RrsetProof::Verified { .. }
+        ));
+
+        // The same zone with a matching algorithm owes nothing.
+        let matched = sign_test_zone(DenialChain::Nsec);
+        assert!(algorithms_missing_signatures(&matched).is_empty());
+    }
+
+    /// A DNSKEY with the Zone Key bit clear signs nothing by definition
+    /// (RFC 4034 §2.1.1), so its algorithm is not one the zone owes a signature
+    /// for. Without this the check would fire on any zone publishing one.
+    #[test]
+    fn a_key_that_is_not_a_zone_key_is_not_an_algorithm_the_zone_owes() {
+        let ours = signing_keys(ORIGIN);
+        let other =
+            SigningKey::generate(SigningAlgorithm::Ed25519, ORIGIN, DNSKEY_FLAG_ZONE).expect("key");
+        let mut dnskey = other.dnskey();
+        dnskey.flags &= !DNSKEY_FLAG_ZONE;
+
+        let mut zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        zone.add_record(ZoneRecord {
+            name: nm(ORIGIN),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+            rdata: dnskey_rdata(&dnskey),
+        });
+        let signed = sign_zone(&zone, &ours, &policy(DenialChain::Nsec)).expect("signs");
+        assert!(algorithms_missing_signatures(&signed).is_empty());
+    }
+
+    /// RFC 8901 §2.1.1, Model 1: the zone owner signs the DNSKEY RRset with a
+    /// KSK no provider holds and distributes it. A provider's signing run has
+    /// to carry that one signature through and make none of its own.
+    #[test]
+    fn rfc_8901_model_1_keeps_the_dnskey_rrsig_it_was_given() {
+        // The owner's KSK. Nothing but this fixture ever holds its private half.
+        let owner_ksk = SigningKey::generate(
+            SigningAlgorithm::EcdsaP256Sha256,
+            ORIGIN,
+            DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+        )
+        .expect("the zone owner's KSK");
+        let ours =
+            vec![
+                SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+                    .expect("this provider's ZSK, and no KSK"),
+            ];
+        let theirs =
+            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+                .expect("the other provider's ZSK");
+
+        // What the owner's API hands over: the combined DNSKEY RRset and one
+        // RRSIG over it.
+        let mut zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        let mut rdatas = Vec::new();
+        for key in [&owner_ksk, &ours[0], &theirs] {
+            let rdata = dnskey_rdata(&key.dnskey());
+            rdatas.push(rdata.clone());
+            zone.add_record(ZoneRecord {
+                name: nm(ORIGIN),
+                ttl: Ttl::from_secs(3600),
+                class: Class::new(1),
+                rdata,
+            });
+        }
+        let run = policy(DenialChain::Nsec);
+        let apex = nm(ORIGIN);
+        let sig = owner_ksk
+            .sign_rrset(
+                &Rrset::new(apex.as_ref(), rt::DNSKEY, Class::new(1), &rdatas),
+                3600,
+                run.inception,
+                run.expiration,
+            )
+            .expect("the owner signs the DNSKEY RRset");
+        zone.add_record(ZoneRecord {
+            name: apex.clone(),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+            rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
+                type_covered: sig.type_covered,
+                algorithm: sig.algorithm,
+                labels: sig.labels,
+                original_ttl: sig.original_ttl,
+                inception: sig.inception,
+                expiration: sig.expiration,
+                key_tag: sig.key_tag,
+                signer_name: sig.signer_name,
+                signature: sig.signature,
+            })
+            .expect("encodes"),
+        });
+
+        let signed =
+            sign_zone(&zone, &ours, &run.clone().with_imported_dnskey_rrsig()).expect("signs");
+        let res = resources(&signed);
+
+        let apex: Vec<u16> = rrsigs_in(&res)
+            .iter()
+            .filter(|s| s.type_covered == rt::DNSKEY)
+            .map(|s| s.key_tag)
+            .collect();
+        assert_eq!(
+            apex,
+            vec![owner_ksk.key_tag()],
+            "exactly the signature we were given, and no second one"
+        );
+        assert!(matches!(
+            proof_for(&signed, ORIGIN, rt::DNSKEY),
+            RrsetProof::Verified { .. }
+        ));
+        // Our ZSK still signs the data, and the other provider's still does not.
+        assert!(matches!(
+            proof_for(&signed, "www.example.com.", rt::A),
+            RrsetProof::Verified { .. }
+        ));
+        assert!(rrsigs_in(&res)
+            .iter()
+            .all(|s| s.key_tag != theirs.key_tag()));
+        assert!(algorithms_missing_signatures(&signed).is_empty());
+    }
+
+    /// Model 1 with nothing to import. Publishing an unsigned DNSKEY RRset is a
+    /// bogus zone at every validator, so this fails the run rather than
+    /// producing one (`CLAUDE.md` §4).
+    #[test]
+    fn model_1_without_the_signature_it_was_promised_is_an_error() {
+        let ours =
+            vec![
+                SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+                    .expect("a ZSK"),
+            ];
+        let zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        let err = sign_zone(
+            &zone,
+            &ours,
+            &policy(DenialChain::Nsec).with_imported_dnskey_rrsig(),
+        )
+        .expect_err("no imported signature, so no zone");
+        assert!(
+            err.to_string().contains("imported DNSKEY signature"),
+            "got: {err}"
+        );
     }
 
     /// One expiration for the whole zone means every validating resolver

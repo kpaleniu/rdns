@@ -70,12 +70,24 @@ catalog = true                  # its members are served too — see 03 §3.10
 
 [zones."private.example."]      # fetched over TLS: RFC 9103, port 853 by default
 masters = ["192.0.2.9#partner.key.+tls=ns1.partner.example."]
+
+[zones."multi.example."]        # RFC 8901 Model 1: the owner signs the key set
+dnskey-rrsig = "imported"       # keep the RRSIG(DNSKEY) the zone file carries
 ```
 
 Rules the schema encodes:
 
 - Every `[zones.*]` field is an `Option`: absent means inherit from `[signing]`,
   not "the default".
+- `dnskey-rrsig = "imported"` is RFC 8901 §2.1.1's multi-signer Model 1, where
+  "the zone owner holds the KSK set ... and is responsible for signing the DNSKEY
+  RRset and distributing it to the providers". This server then has a ZSK and no
+  KSK: it keeps the apex DNSKEY RRset's RRSIG from the file and makes none. A
+  zone with that setting and no such RRSIG fails to sign rather than publishing
+  an unsigned key set. **Model 2 (§2.1.2) needs no setting** — each provider
+  signs the DNSKEY RRset with its own KSK, and importing the other providers'
+  ZSKs is a zone-file edit, since the signer publishes a DNSKEY it did not put
+  there and never signs with a key it has no private half of.
 - The re-signing interval follows the shortest validity of any zone.
 - `[zones."x"].file` takes its origin from the table key, unlike `--zone-file`,
   which derives it from the path.

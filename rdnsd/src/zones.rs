@@ -25,7 +25,8 @@ use rdns::name_keys::NameKeyBuf;
 use rdns::record_types;
 use rdns::zone::{parse_zone_file_at, Zone};
 use rdns::zone_signer::{
-    resign_after, sign_zone, sign_zone_incrementally, DenialChain, SigningPolicy,
+    algorithms_missing_signatures, resign_after, sign_zone, sign_zone_incrementally, DenialChain,
+    DnskeySignature, SigningPolicy,
 };
 use rdns::{Name, NameRef, Qtype, ResourceRecord, Rtype};
 
@@ -673,7 +674,11 @@ impl ZoneSigning {
         } else {
             DenialChain::Nsec
         };
-        SigningPolicy::valid_for(signed_at, validity).with_chain(chain)
+        let policy = SigningPolicy::valid_for(signed_at, validity).with_chain(chain);
+        match over.dnskey_rrsig {
+            Some(config::DnskeyRrsig::Imported) => policy.with_imported_dnskey_rrsig(),
+            Some(config::DnskeyRrsig::Local) | None => policy,
+        }
     }
 
     /// The shortest validity any zone is signed with, which is what the
@@ -768,7 +773,7 @@ impl ZoneSigning {
                 sign_zone(zone, keys, &policy).with_context(|| format!("signing {origin}"))?,
             );
             tracing::info!(
-                "signed {origin} with {} key{}, {} for {} day{}",
+                "signed {origin} with {} key{}, {} for {} day{}{}",
                 keys.len(),
                 if keys.len() == 1 { "" } else { "s" },
                 if matches!(policy.chain, DenialChain::Nsec) {
@@ -777,11 +782,46 @@ impl ZoneSigning {
                     "NSEC3"
                 },
                 (u64::from(policy.expiration) - u64::from(policy.inception)) / 86_400,
-                if self.validity == 86_400 { "" } else { "s" }
+                if self.validity == 86_400 { "" } else { "s" },
+                match policy.dnskey_signature {
+                    DnskeySignature::Imported => ", DNSKEY RRSIG imported (RFC 8901 Model 1)",
+                    DnskeySignature::Local => "",
+                }
             );
+            warn_about_unsigned_algorithms(&origin, zone);
         }
         Ok(())
     }
+}
+
+/// Say so when a zone publishes a key of an algorithm nothing in it signs with.
+///
+/// RFC 6840 §5.11: "the zone MUST also be signed with each algorithm (though
+/// not each key) present in the DNSKEY RRset", and "this requirement applies to
+/// servers, not validators" — so nothing downstream will ever complain, and a
+/// zone in this state resolves perfectly while being wrong. The two ways to get
+/// here are RFC 8901 §4's "providers ... need to use a common DNSSEC signing
+/// algorithm", violated by importing a co-provider's ZSK on an algorithm this
+/// server holds no key for, and a half-finished algorithm rollover.
+///
+/// WARN rather than a refusal, deliberately. The zone validates, so refusing to
+/// start would take a working deployment off the air over a conformance point
+/// no resolver checks (`CLAUDE.md` §16); and it is a fact about the config, so
+/// it belongs where the operator reads it once rather than in a counter.
+fn warn_about_unsigned_algorithms(origin: &str, zone: &Zone) {
+    let missing = algorithms_missing_signatures(zone);
+    if missing.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        "{origin} publishes a DNSKEY for algorithm{} {} that nothing in the zone signs with          (RFC 6840 §5.11) — a co-provider's key needs an algorithm this server also holds          (RFC 8901 §4), and a rollover needs finishing",
+        if missing.len() == 1 { "" } else { "s" },
+        missing
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
 }
 
 /// Check every signature in every zone before anything is served from it.
