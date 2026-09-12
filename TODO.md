@@ -37,11 +37,13 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#44** (44a and 44b done), **#45**, **#47**, **#48**, **#49** and **#21**, as
-of 2026-09-12. #44 is what an operator would find missing in `rdnsd`, #45 what
-an ISP would find missing in `rdnsr`, #47 is the one gap 44b left behind, #48
-and #49 the two 44a left, and #21 is an inventory of deliberate deviations
-rather than a queue. Everything else numbered is closed;
+**#50**, **#44** (44a, 44b and 44c done), **#45**, **#47**, **#48**, **#49** and
+**#21**, as of 2026-09-12. **#50 is the only defect among them** and the only
+one that is urgent: a signed zone above a few thousand records cannot be loaded,
+which 44c's measurement found. #44 is what an operator would find missing in
+`rdnsd`, #45 what an ISP would find missing in `rdnsr`, #47 is the one gap 44b
+left behind, #48 and #49 the two 44a left, and #21 is an inventory of deliberate
+deviations rather than a queue. Everything else numbered is closed;
 the table under "Closed work" says which, when, and where the reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
@@ -510,6 +512,15 @@ cargo bench -p rdns
 cargo bench -p rdns -- --save-baseline before   # then change something
 cargo bench -p rdns -- --baseline before        # and compare against it
 
+# What a *fleet* costs, which nothing above measures: load time and memory for a
+# zone of a million records, signing it, verifying it, how many zones one process
+# holds, and what reloading them all costs (#44c). `#[ignore]`d and refused in
+# debug — the default run is about 45 seconds and peaks near a gigabyte. The
+# numbers it produced are under #44c; the knobs are so a smaller box can take the
+# same measurement.
+cargo test --release -p rdns --test scale -- --ignored --nocapture
+RDNS_SCALE_RECORDS=100000 RDNS_SCALE_VERIFY=1000 cargo test --release -p rdns --test scale -- --ignored --nocapture
+
 # The two probes, which measure one thing each and are not part of any suite.
 # Their headers carry what they measured and when; read those before quoting a
 # number. Arguments are the multipliers, so a run is a table row.
@@ -808,8 +819,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#44** (44a and 44b done), **#45**, **#47**, **#48**, **#49** and **#21** —
-see "What is open" above,
+**#50**, **#44** (44a, 44b and 44c done), **#45**, **#47**, **#48**, **#49** and
+**#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -850,8 +861,13 @@ Then, in order and for stated reasons:
    a transfer already works over DoT and DoQ unchanged, so what it still needs is
    the policy half — which keys and which peers may transfer over which
    transport.
-4. **44c**, the scale measurement, whenever somebody wants a number rather than
-   a feature.
+4. ~~**44c**, the scale measurement, whenever somebody wants a number rather
+   than a feature.~~ **Taken 2026-09-12**, and it was not a number rather than a
+   feature: the four figures it was filed for are unremarkable and the fifth is
+   **#50**.
+5. **#50**, which is where the rule at the top of this heading points now. It is
+   the only defect on the page, and the only row anywhere in #44 or #45 that
+   stops a deployment rather than limiting one.
 
 **#45 is a different product decision**, not a queue position: it is what an ISP
 needs, and 45a (RPZ) is a legal gate rather than a nice-to-have for anyone with
@@ -931,11 +947,107 @@ missing is the operational surface around the answering, which is the same shape
 |---|---|---|
 | ~~**44a**~~ | ~~catalog zones (RFC 9432, "DNS Catalog Zones") — **0 hits**~~ **Done 2026-09-12**, three commits: the parse in `rdns::catalog`, then `--catalog` and the provisioning in `rdnsd`, then a scenario against BIND as the producer (`tests/interop`, 43f) | ~~The largest one. A catalog zone is an ordinary zone whose contents are the *list* of zones a secondary should serve, so provisioning becomes a transfer rather than a configuration-management problem. BIND, Knot, NSD and PowerDNS all implement it. Below a handful of zones nobody misses it; somewhere around a hundred, configuring each secondary by hand stops being possible, and that is where an evaluation ends. This tree is unusually well placed for it — the consumer side is an AXFR, a parse and `install_zone`, all of which exist~~ **The placement held and the sizing did not.** The AXFR, the parse and `install_zone` were indeed free; what the row did not see is that provisioning is a *diff*, and a diff needs a third thing the catalog does not contain — which zones this server provisioned last time, and under which member node. §5.3 makes removal conditional on the first and §5.4 makes a reset conditional on the second, so both had to become a sidecar (`rdnsd.catalog`) with the same rule the transfer state has: forgetting it serves a withdrawn zone with AA set. Two things the filing did not see either — the registry of replicated zones was a `HashMap` built once at startup, so membership changing at runtime made it a type with a lock and a `retire`, and that turned up a defect of its own: the reload's EXPIRE check read a list of `--secondary` specs fixed at startup, which a catalog's members would never have joined. And RFC 9432 §6 is worth reading before deploying it: an empty catalog from a buggy producer deletes every member zone, which is why removals are WARN and why `dns_catalog_members` exists. Left behind: **#48** and **#49** |
 | ~~**44b**~~ | ~~Extended DNS Errors (RFC 8914) — **0 hits**~~ **Done 2026-09-12**, two commits: `rdnsd`'s eight refusal sites, then the resolver's SERVFAILs and `rdnsc`'s printing of what it receives | ~~Small, and the highest value per line on this page. A bare SERVFAIL is a support ticket; the same SERVFAIL carrying EDE 6 (DNSSEC Bogus) or EDE 7 (Signature Expired) is a fixed problem. It is an EDNS option, the option list already round-trips, and the RCODE space is already a data-carrying type. Its absence is also a *signal* — it reads as software written by somebody who has not had to debug DNS at 3am~~ **Every clause held except "small".** The option and `rdnsd`'s half are small; the resolver's half is what the row was actually asking for, and it cost a type — the reason a check found had to be carried up to the reply, so `RrsetProof::Bogus`, `ValidationState::Bogus` and `DelegationVerdict::Bogus` all took a `dnssec::Bogus { code, why }` in place of a `String`, at 24 construction sites. That is §17's argument arriving from the other direction: the code is not derivable at the top, so it has to be in the type at the bottom. Two things the filing did not see — EXTRA-TEXT is `&'static str`, because `Bogus::why` names a zone, an owner and a key tag that all came out of an answer a stranger sent, and reflecting those to another stranger is how §2's "leak no private information" breaks quietly; and `rdnsc` sent an OPT only under `--dnssec`, so the tree's own probe could not see the thing the tree had just learned to send. Left behind: **#47** |
-| **44c** | no measurement above a test zone | Not a feature, an **evidence** gap, and the first question an operator asks. `bench_zone_lookup` builds 10,000 records and the largest zone file in the tree is a dozen lines. Unmeasured: load time and memory for a zone of a million records, signing time at that size, how many zones one process holds, and what reloading all of them costs. §10's rules apply — this is a measurement to *take*, and the number it produces is the row's real content |
+| ~~**44c**~~ | ~~no measurement above a test zone~~ **Taken 2026-09-12**, one commit: `rdns/tests/scale.rs`, an `#[ignore]`d harness that refuses a debug build, and the numbers under this table | ~~Not a feature, an **evidence** gap, and the first question an operator asks. `bench_zone_lookup` builds 10,000 records and the largest zone file in the tree is a dozen lines. Unmeasured: load time and memory for a zone of a million records, signing time at that size, how many zones one process holds, and what reloading all of them costs. §10's rules apply — this is a measurement to *take*, and the number it produces is the row's real content~~ **It was an evidence gap, and the evidence found a defect.** The four questions the row asked all have dull answers — a million-record zone loads in 1.7 s for 210 MB, signing it is 28 s for 717 MB, a zone costs 1,901 bytes plus its records, and a thousand-zone reload is 0.2 s. The fifth step, which the row did not name because nothing here had looked: `verify_zones` runs at every load whenever signing is configured and is **quadratic** in the zone. Filed as **#50** |
 | **44d** | XFR over TLS (RFC 9103, "DNS Zone Transfer over TLS") — **0 hits** | Zone contents cross the wire in clear between primary and secondary, which for anything with private names is the objection. Cheap *after* #42a: the rustls setup, the certificate plumbing and the ALPN dispatch are the same, and a transfer is already framed TCP. Worth taking as a fourth stage of #42 rather than on its own |
 | **44e** | multi-signer DNSSEC (RFC 8901, "Multi-Signer DNSSEC Models") — **0 hits** | Any zone served by two independent providers needs it, which is ordinary practice for zones that must not go down. The signer here assumes it owns every key in the apex DNSKEY set; the multi-signer models require importing another operator's ZSK and signing alongside it |
 | **44f** | key-rollover automation (RFC 6781) — **moved from #21** | Was on the not-implemented list with the note that "rollover is manual and the signer will not delete a published DNSKEY, which is the half that matters". That reasoning stands and is why this is not urgent — the dangerous half is already safe. It becomes a gate at fleet scale: a manual rollover per zone per year does not survive ten thousand zones |
 | **44g** | dnstap — **0 hits** | A query *stream*, not log lines: how operators feed analytics, security tooling and abuse handling. §14's logging decision is deliberate and right — nothing per-packet above debug, so a flood costs no log lines — and it is exactly why there is no data pipeline. Those are two different outputs and the second does not exist |
+
+#### 44c's numbers
+
+Taken 2026-09-12 by `cargo test --release -p rdns --test scale -- --ignored
+--nocapture`, on the development machine, on both platforms. **Every byte figure
+is identical on the two**, which is worth the line for the reason
+`allocations.rs`'s counts are: what is counted is calls into the global
+allocator, not what the OS underneath does with them. Only the timings differ,
+and those are given as a pair. The tables are the harness's own output, Windows
+column.
+
+```
+   records       file     read     parse    ns/rec        held  bytes/rec   transient
+     10003      0.2MB    0.01s     0.01s      1261       2.2MB        226       1.4MB
+    100003      2.5MB    0.00s     0.13s      1298      18.9MB        198      10.9MB
+   1000003     26.2MB    0.01s     1.69s      1695     209.9MB        220     174.9MB
+   1000000           built, not parsed       458     137.5MB        144      82.4MB
+```
+
+- **A million records is 210 MB and 1.7 s** (Linux 1.44 s) — 220 bytes held per
+  27-byte line, which is where sizing starts. Reading the 26 MB file is 0.01 s
+  and none of the cost.
+- **The load peaks at 1.8× what it keeps**, and the last row says whose that is.
+  It builds the same zone through `add_record` from records made *before* the
+  measurement, so their names and RDATA are not in its figures: the record
+  vector and the owner index alone hold 137.5 MB and peak 82.4 MB above that. So
+  about half the peak is those two containers growing and half is the parser's
+  own per-line work. `ZoneRecord` is 48 bytes, so 48 MB of the 137.5 is the
+  vector and the rest is the index — which costs more than the records it
+  indexes.
+
+```
+   records       sign     µs/rec  records out        held  bytes/out        both
+     10003      0.26s       26.0        40013       7.9MB        208      10.1MB
+    100003      2.73s       27.3       400013      72.8MB        191      91.7MB
+   1000003     28.02s       28.0      4000013     717.3MB        188     927.2MB
+```
+
+- **28 µs a record, and four records out for every one in** — the RRSIG, the
+  NSEC and the RRSIG over the NSEC. Signing that zone is 28 s (Linux 27.7) and
+  717 MB, and 927 MB at the moment of the swap, because `ZoneSigning::apply`
+  builds the signed zone before dropping the unsigned one. **A signed
+  million-record zone is a gigabyte**, from a 26 MB file.
+- The per-record cost does not move with the zone (26.0, 27.3, 28.0), so it is
+  the ECDSA and not the signer around it.
+
+```
+   records      signed     rrsets       verify    µs/rrset
+       503        2013       1006        0.30s         296
+      1003        4013       2006        1.10s         547
+      2003        8013       4006        4.37s        1092
+```
+
+- **Quadratic, and it is filed as #50.** Doubling the zone quadruples the check
+  every load performs on it. Note the scale: these are 500 to 2,000 records,
+  three orders of magnitude below every other table here, because that is as far
+  as it goes in a few seconds. #50 carries the run that went further — ten
+  thousand records is 112.68 s.
+
+```
+== 10000 zones of 9 records each, as `rdnsd` holds them
+parse and insert      0.12s  (12 µs/zone)
+held                 18.1MB  (1901 bytes/zone, 211 bytes/record)
+transient             0.0MB
+a GiB of zone map holds 564940 zones of this shape
+```
+
+- **A zone is cheap and a record is not.** 1,901 bytes for a zone of the
+  ordinary shape, of which 211 a record is the part that scales. So "how many
+  zones does one process hold" is the wrong question — half a million of them
+  fit in a GiB — and "how many records" is the right one: about five million
+  zone-file records per GiB, or 1.4 million once signed.
+
+```
+== reloading 1000 zones from a directory
+read and parse          0.04s  (39 µs/zone,   1.8MB held)
+sign every zone         0.18s  (177 µs/zone,   4.9MB held)
+re-read and parse       0.04s  (37 µs/zone,   1.8MB held)
+diff, nothing moved     0.00s  (1 µs/zone)
+diff, all moved         0.00s  (5 µs/zone)
+```
+
+- Reading and parsing a small zone file is 39 µs on Windows against **11 on
+  Linux** — the per-file open, and the largest platform gap anywhere in these
+  numbers. Signing is 177/164, and the diff is 1 µs when the serial has not
+  moved against 5 when it has, which is `ixfr::plan_change` returning before the
+  walk.
+- So a 10,000-zone signed reload is about two seconds of one thread, nearly all
+  of it signing — the number behind `Reloading::load`'s `spawn_blocking`
+  (`CLAUDE.md` §9), and what would be blocking every query without it. The
+  figure that is *not* two seconds is #50's.
+
+**What this does not measure**, so that the absence is not read as a result:
+queries per second — that is `benches/answer_path.rs` and its header's warning
+that everything it times is 6% of a query — RSS as against heap bytes, and
+anything about `rdnsr`'s cache.
 
 ---
 
@@ -1068,6 +1180,67 @@ the part with a design decision in it: a bounded list per catalog, or nothing.
 Small either way, and not urgent — `rdnsd.catalog` beside the zones is plain
 text and answers the first question for anyone who can read the disk. It has a
 number because the operator who cannot is exactly the one `rdnsctl` exists for.
+
+---
+
+### 50. Verifying a signed zone at load is quadratic — **filed 2026-09-12**
+
+Found by 44c's harness. #44's preamble says none of its rows is a defect and
+that is true of the rows; this came out of taking one of them, which is what an
+evidence gap is for.
+
+`zones::verify_zones` runs at every load whenever signing is configured —
+`DnssecValidator::new(cli.require_signed || signing.is_some())` — so it is on the
+startup path, on SIGHUP, on `rdnsctl reload`, on the re-signing timer (which
+re-signs *by reloading*, on purpose) and inside `--check-config`. It is not on
+the query path — `validate_response` has exactly two callers, both inside
+`verify_zones` in `rdnsd/src/zones.rs`, so answering a query never pays it.
+
+It asks `validate_response` once per signed RRset. That function collects every
+DNSKEY and every RRSIG **in the whole zone** into fresh vectors, cloning each
+record's RDATA, and `dnssec::verify_rrset` then scans the collected signatures
+linearly for the ones covering this RRset. Two multipliers, both the zone's own
+size, inside a loop that runs once per RRset — three, counting the clone.
+
+Measured, release, `RDNS_SCALE_VERIFY` (the top three on both platforms, the
+bottom three on Windows only — one run, because the last of them is two
+minutes):
+
+| records | signed records | RRsets | verify | ×/doubling |
+|---|---|---|---|---|
+| 503 | 2 013 | 1 006 | 0.30 s / 0.23 s | |
+| 1 003 | 4 013 | 2 006 | 1.10 s / 0.88 s | 3.7 |
+| 2 003 | 8 013 | 4 006 | 4.37 s / 3.37 s | 4.0 |
+| 2 503 | 10 013 | 5 006 | 7.02 s | |
+| 5 003 | 20 013 | 10 006 | 27.73 s | 4.0 |
+| 10 003 | 40 013 | 20 006 | **112.68 s** | 4.1 |
+
+Doubling the zone quadruples the check, over four doublings and without
+drifting. **A zone of ten thousand records takes nearly two minutes to verify,
+at every load** — that one is measured. Beyond it the figures are arithmetic
+from the ratio and that is the finding: a hundred thousand records is about
+three hours and a million about thirteen days. A signed zone of any real size
+cannot be loaded, and the failure is a process that never finishes starting
+rather than an error anybody can read.
+
+Why nothing caught it: every signed zone in the suite is a dozen records and
+#43's interop zones are the same, where the whole check is microseconds. §5 is
+the rule — count the multipliers and time the worst case rather than reading the
+loop — and §13 is the shape, a scan beside the index that would have answered
+it. The zone stores its RRSIGs at their owner names and `Zone::query(name,
+Qtype::of(RRSIG))` already reaches them through the owner index, so "which
+signatures cover this owner" is a lookup that exists.
+
+**What is not enough, checked rather than assumed:** hoisting the two
+collections out of the per-RRset loop. `verify_rrset` takes a slice and filters
+it by owner and type on every call, so the scan survives the hoist and the shape
+stays quadratic. Whatever replaces it has to answer "which signatures cover this
+(owner, type)" without walking the zone — which is a question about
+`verify_rrset`'s signature, not only about `verify_zones`' loop.
+
+The harness's verify stage is already the test, in §10's shape: a ratio, with
+the µs/RRset column flat if it is fixed and doubling if it is not. A fix wants
+its own regression test in `rdnsd`, where `verify_zones` lives.
 
 ---
 
