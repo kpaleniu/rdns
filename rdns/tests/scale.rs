@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use rdns::clock::current_unix_timestamp;
 use rdns::dnssec::Rrsig;
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
-use rdns::dnssec_validation_mode::DnssecValidator;
+use rdns::dnssec_validation_mode::{DnssecValidator, ZoneKeys};
 use rdns::ixfr::plan_change;
 use rdns::name_keys::NameKeyBuf;
 use rdns::zone::{parse_zone_file, parse_zone_file_at, Zone, ZoneRecord};
@@ -386,12 +386,14 @@ fn signing_one_big_zone() {
 /// What `rdnsd` does to a zone it has just signed, before serving any of it.
 ///
 /// `zones::verify_zones` runs on every load whenever signing is configured, and
-/// it asks `DnssecValidator::validate_response` once per signed RRset — which
-/// collects every DNSKEY and every RRSIG *in the whole zone* per call. That is
-/// quadratic and is `TODO.md` #50, which this stage found. So the sizes here
-/// are a quarter, a half and all of a number three orders of magnitude below
-/// the one the sections above use, and what to read is the µs/RRset column
-/// against itself rather than any single figure.
+/// asks one question per signed RRset. It asked it through
+/// `DnssecValidator::validate_response`, which collects every DNSKEY and every
+/// RRSIG *in the whole zone* per call — quadratic, and `TODO.md` #50, which
+/// this stage found and which the shape below is now the fixed version of: the
+/// keys are collected once and `validate_rrset` takes them.
+///
+/// What to read is the µs/RRset column against itself. Flat is the fix; a
+/// column that doubles when the zone doubles is the defect back.
 fn verifying_a_signed_zone() {
     let largest = knob("RDNS_SCALE_VERIFY", 2_000);
     let keys = keys_for("example.com.");
@@ -433,14 +435,14 @@ fn verifying_a_signed_zone() {
         rrsets.dedup();
 
         let (checked, cost) = measure(|| {
+            // Hoisted, as `verify_zones` hoists it: the collection is O(the
+            // zone) and there is one of it per zone, not per RRset. Inside the
+            // measurement because a load pays for it.
+            let zone_keys = ZoneKeys::of(&signed);
             let mut checked = 0usize;
             for (name, rtype) in &rrsets {
                 let records = signed.query(name.as_ref(), Qtype::of(*rtype));
-                let (ok, _) = validator.validate_response(
-                    &signed,
-                    &records,
-                    &name.as_ref().to_presentation(),
-                );
+                let (ok, _) = validator.validate_rrset(&signed, &zone_keys, &records);
                 assert!(ok, "the zone we just signed verifies");
                 checked += 1;
             }

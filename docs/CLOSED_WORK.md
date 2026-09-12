@@ -5784,6 +5784,109 @@ may transfer over which transport.
 
 ---
 
+### 50. Verifying a signed zone at load is quadratic — **filed 2026-09-12**
+
+Found by 44c's harness. #44's preamble says none of its rows is a defect and
+that is true of the rows; this came out of taking one of them, which is what an
+evidence gap is for.
+
+`zones::verify_zones` runs at every load whenever signing is configured —
+`DnssecValidator::new(cli.require_signed || signing.is_some())` — so it is on the
+startup path, on SIGHUP, on `rdnsctl reload`, on the re-signing timer (which
+re-signs *by reloading*, on purpose) and inside `--check-config`. It is not on
+the query path — `validate_response` has exactly two callers, both inside
+`verify_zones` in `rdnsd/src/zones.rs`, so answering a query never pays it.
+
+It asks `validate_response` once per signed RRset. That function collects every
+DNSKEY and every RRSIG **in the whole zone** into fresh vectors, cloning each
+record's RDATA, and `dnssec::verify_rrset` then scans the collected signatures
+linearly for the ones covering this RRset. Two multipliers, both the zone's own
+size, inside a loop that runs once per RRset — three, counting the clone.
+
+Measured, release, `RDNS_SCALE_VERIFY` (the top three on both platforms, the
+bottom three on Windows only — one run, because the last of them is two
+minutes):
+
+| records | signed records | RRsets | verify | ×/doubling |
+|---|---|---|---|---|
+| 503 | 2 013 | 1 006 | 0.30 s / 0.23 s | |
+| 1 003 | 4 013 | 2 006 | 1.10 s / 0.88 s | 3.7 |
+| 2 003 | 8 013 | 4 006 | 4.37 s / 3.37 s | 4.0 |
+| 2 503 | 10 013 | 5 006 | 7.02 s | |
+| 5 003 | 20 013 | 10 006 | 27.73 s | 4.0 |
+| 10 003 | 40 013 | 20 006 | **112.68 s** | 4.1 |
+
+Doubling the zone quadruples the check, over four doublings and without
+drifting. **A zone of ten thousand records takes nearly two minutes to verify,
+at every load** — that one is measured. Beyond it the figures are arithmetic
+from the ratio and that is the finding: a hundred thousand records is about
+three hours and a million about thirteen days. A signed zone of any real size
+cannot be loaded, and the failure is a process that never finishes starting
+rather than an error anybody can read.
+
+Why nothing caught it: every signed zone in the suite is a dozen records and
+#43's interop zones are the same, where the whole check is microseconds. §5 is
+the rule — count the multipliers and time the worst case rather than reading the
+loop — and §13 is the shape, a scan beside the index that would have answered
+it. The zone stores its RRSIGs at their owner names and `Zone::query(name,
+Qtype::of(RRSIG))` already reaches them through the owner index, so "which
+signatures cover this owner" is a lookup that exists.
+
+**What is not enough, checked rather than assumed:** hoisting the two
+collections out of the per-RRset loop. `verify_rrset` takes a slice and filters
+it by owner and type on every call, so the scan survives the hoist and the shape
+stays quadratic. Whatever replaces it has to answer "which signatures cover this
+(owner, type)" without walking the zone — which is a question about
+`verify_rrset`'s signature, not only about `verify_zones`' loop.
+
+The harness's verify stage is already the test, in §10's shape: a ratio, with
+the µs/RRset column flat if it is fixed and doubling if it is not. A fix wants
+its own regression test in `rdnsd`, where `verify_zones` lives.
+
+**Closed the day it was filed**, in the commit that follows it.
+
+**The fix is two halves and the row only saw one.** Hoisting the key collection
+out of the per-RRset loop is the obvious half and is not enough: `verify_rrset`
+filters whatever slice it is handed, so a hoisted *signature* list would still
+be scanned once per RRset. The second half is that an RRSIG is stored at the
+name it covers, so "which signatures could cover this RRset" is a lookup in the
+zone's own owner index — `zone.query(owner, RRSIG)` — and not a search.
+
+`ZoneKeys` is where the shape is now fixed rather than the fix being a call-site
+discipline (`CLAUDE.md` §17): collecting a zone's keys is O(the zone), so it is
+a parameter a caller has to produce, and a caller producing one per RRset can
+see that it is doing so. `validate_response` still exists and still collects per
+call, because a single-RRset caller is a real case and paying once for one check
+is right.
+
+**What it measured**, `rdns/tests/scale.rs`, release, both platforms:
+
+| RRsets | before | after |
+|---|---|---|
+| 5 006 | 7.02 s | 0.16 s |
+| 10 006 | 27.73 s | 0.32 s |
+| 20 006 | **112.68 s** | **0.65 s** |
+| 2 000 006 | ~13 days, by the ratio | **76.06 s**, measured |
+
+Per RRset that is 1,402 → 32 µs at 5,006 and 5,632 → 33 at 20,006: flat, and
+what is left is one ECDSA verification, which is the floor.
+
+**Two guards, because they fail against different mistakes.**
+`rdns/tests/allocations.rs` counts what checking one RRset allocates in a
+ten-host zone and in a five-hundred-host one and asserts they are equal — 34
+either way, against **217 and 6,101** with the scan restored, which is exact and
+reads the same on every machine (§10). That pins the library half.
+`rdnsd`'s `verifying_a_zone_costs_the_same_per_rrset_however_big_it_is` is a
+ratio over a four-fold zone — 1.02× as it stands, 2.23× against the old call —
+and pins the half that is `verify_zones` hoisting at all, which no allocation
+count inside the library can see.
+
+**Left behind: #53.** Seventy-six seconds is linear and still seventy-six
+seconds, and for a zone this server signed itself it is proving what it did a
+moment ago.
+
+---
+
 ### 46. `rdnsd` cannot sign a NOTIFY — ~~**filed 2026-09-12**~~ **closed 2026-09-12**
 
 The one thing #43 found, and no row of #43 pointed at it. `rdns/src/notify.rs`

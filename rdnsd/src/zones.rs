@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 
 use rdns::clock::current_unix_timestamp;
 use rdns::dnssec_key::SigningKey;
-use rdns::dnssec_validation_mode::DnssecValidator;
+use rdns::dnssec_validation_mode::{DnssecValidator, ZoneKeys};
 use rdns::ixfr::{plan_change, DeltaLog, PlannedDelta};
 use rdns::journal::Journal;
 use rdns::metrics::DnsMetrics;
@@ -790,17 +790,24 @@ impl ZoneSigning {
 /// signed" — a delegation's NS RRset and its glue carry no signature by design,
 /// so the second question fails every zone with a child. This catches expired
 /// signatures, and signatures over data since edited.
+///
+/// The keys are collected once per zone and the loop uses
+/// [`DnssecValidator::validate_rrset`]. `validate_response` collects them per
+/// call, which made this quadratic in the zone: a ten-thousand-record zone took
+/// **112 s** to verify and a million-record one would have taken days, on every
+/// startup, every SIGHUP, every `rdnsctl reload`, every re-signing tick and
+/// inside `--check-config` (`TODO.md` #50).
 pub(crate) fn verify_zones(zones: &ZoneMap, validator: &DnssecValidator) -> Result<()> {
     if !validator.is_enabled() {
         return Ok(());
     }
     for (key, zone) in zones {
         let origin = key.as_name().to_presentation();
-        let signed = DnssecValidator::is_zone_signed(zone);
-        if !signed {
-            // Asking `validate_response` with no records keeps the "is
-            // unsigned acceptable" decision in one place.
-            let (ok, _) = validator.validate_response(zone, &[], &origin);
+        let keys = ZoneKeys::of(zone);
+        if !keys.is_signed() {
+            // Asking with no records keeps the "is unsigned acceptable"
+            // decision in one place.
+            let (ok, _) = validator.validate_rrset(zone, &keys, &[]);
             if !ok {
                 return Err(anyhow!("{origin} is not signed"));
             }
@@ -815,8 +822,7 @@ pub(crate) fn verify_zones(zones: &ZoneMap, validator: &DnssecValidator) -> Resu
                     "{origin}: a signature covers the {rtype} RRset at {name}, which is not there"
                 ));
             }
-            let (ok, _) =
-                validator.validate_response(zone, &records, &name.as_ref().to_presentation());
+            let (ok, _) = validator.validate_rrset(zone, &keys, &records);
             if !ok {
                 return Err(anyhow!(
                     "{origin}: the {rtype} RRset at {name} does not verify against the zone's \
@@ -1243,6 +1249,83 @@ mod tests {
              the cost is growing with a length the client chooses",
             nm(&long).as_ref().label_count()
         );
+    }
+
+    /// Verifying a zone costs the same *per RRset* however big the zone is.
+    ///
+    /// A ratio and not a floor (`CLAUDE.md` §10), because the number itself is
+    /// one ECDSA verification and belongs to the machine. What belongs to the
+    /// code is the shape: `TODO.md` #50 was `validate_response` collecting
+    /// every DNSKEY and every RRSIG in the zone on every call, so the per-RRset
+    /// cost grew with the zone — 32 µs at 5,006 RRsets against 1,402, and
+    /// 5,632 at 20,006. On a load that meant two minutes for a zone of ten
+    /// thousand records and days for a million.
+    ///
+    /// Four times the zone, so the per-RRset cost is the assertion. Measured on
+    /// the development machine, debug build: **1.02×** as it stands and
+    /// **2.23×** against the old call, which is what the bound of 1.5 sits
+    /// between. Not larger sizes: the quadratic would read further above 1 and
+    /// the signing that sets the zone up is already three quarters of the
+    /// second this test costs.
+    #[test]
+    fn verifying_a_zone_costs_the_same_per_rrset_however_big_it_is() {
+        const SMALL: usize = 1000;
+        const LARGE: usize = 4000;
+
+        let per_rrset = |hosts: usize| -> f64 {
+            let (map, rrsets) = signed_zone_of(hosts);
+            let validator = DnssecValidator::new(true);
+            let start = std::time::Instant::now();
+            verify_zones(&map, &validator).expect("the zone we just signed verifies");
+            start.elapsed().as_secs_f64() / rrsets as f64
+        };
+
+        // Small first, so the large run is not the one paying for a cold
+        // allocator or a cold cache.
+        let small = per_rrset(SMALL);
+        let large = per_rrset(LARGE);
+        assert!(
+            large < small * 1.5,
+            "verifying cost {:.1} µs/RRset at {LARGE} records against {:.1} at {SMALL}: \
+             the cost is growing with the size of the zone",
+            large * 1e6,
+            small * 1e6
+        );
+    }
+
+    /// A signed zone of `hosts` A records, and how many RRsets carry a
+    /// signature — which is what `verify_zones` iterates.
+    fn signed_zone_of(hosts: usize) -> (ZoneMap, usize) {
+        use rdns::dnssec::DNSKEY_FLAG_ZONE;
+        use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
+
+        let mut text = String::from(
+            "$ORIGIN example.com.\n\
+             $TTL 3600\n\
+             @ IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+             @ IN NS ns1.example.com.\n\
+             ns1 IN A 192.0.2.1\n",
+        );
+        for i in 0..hosts {
+            text.push_str(&format!("host{i} IN A 192.0.2.2\n"));
+        }
+        let zone = rdns::zone::parse_zone_file(&text, "example.com.").expect("parse");
+        let key = SigningKey::generate(
+            SigningAlgorithm::EcdsaP256Sha256,
+            "example.com.",
+            DNSKEY_FLAG_ZONE,
+        )
+        .expect("a key");
+        let signed = sign_zone(
+            &zone,
+            std::slice::from_ref(&key),
+            &SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400),
+        )
+        .expect("sign");
+        let rrsets = signed_rrsets(&signed).len();
+        let mut map = ZoneMap::new();
+        map.insert(zone_key(&signed), Arc::new(signed));
+        (map, rrsets)
     }
 
     /// The same lookup, timed. Best of three: a lost timeslice can only make a

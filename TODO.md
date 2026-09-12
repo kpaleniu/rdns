@@ -37,11 +37,12 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#50**, **#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51**,
-**#52** and **#21**, as of 2026-09-12. **#50 is the only defect among them**
-that has teeth, and the only one that is urgent: a signed zone above a few thousand records cannot be loaded,
-which 44c's measurement found. #44 is what an operator would find missing in
-`rdnsd`, #45 what an ISP would find missing in `rdnsr`, #47 is the one gap 44b
+**#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51**, **#52**,
+**#53** and **#21**, as of 2026-09-12. **None of them is a live defect**; #50
+was, and closing it is what added #53: a zone this server signed itself is
+verified again at every load, which 76 seconds of a million-record zone made
+visible. #44 is what an operator would find missing in `rdnsd`, #45 what an ISP
+would find missing in `rdnsr`, #47 is the one gap 44b
 left behind, #48 and #49 the two 44a left, #51 the one 44d left, #52 a flaky
 test found on the way, and #21 is an inventory of deliberate deviations rather
 than a queue. Everything else numbered is closed;
@@ -820,8 +821,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#50**, **#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51**,
-**#52** and **#21** — see "What is open" above,
+**#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51**, **#52**,
+**#53** and **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -868,9 +869,12 @@ Then, in order and for stated reasons:
    than a feature.~~ **Taken 2026-09-12**, and it was not a number rather than a
    feature: the four figures it was filed for are unremarkable and the fifth is
    **#50**.
-5. **#50**, which is where the rule at the top of this heading points now. It is
-   the only defect on the page, and the only row anywhere in #44 or #45 that
-   stops a deployment rather than limiting one.
+5. ~~**#50**, which is where the rule at the top of this heading points now. It
+   is the only defect on the page, and the only row anywhere in #44 or #45 that
+   stops a deployment rather than limiting one.~~ **Done 2026-09-12**, and it
+   was: 112.68 s to verify twenty thousand RRsets became 0.65. What it left is
+   **#53**, which is not a defect — it is the same check, asked whether it needs
+   to run on a zone we signed ourselves.
 
 **#45 is a different product decision**, not a queue position: it is what an ISP
 needs, and 45a (RPZ) is a legal gate rather than a nice-to-have for anyone with
@@ -1008,11 +1012,13 @@ column.
       2003        8013       4006        4.37s        1092
 ```
 
-- **Quadratic, and it is filed as #50.** Doubling the zone quadruples the check
+- **Quadratic, and it was filed as #50.** Doubling the zone quadrupled the check
   every load performs on it. Note the scale: these are 500 to 2,000 records,
   three orders of magnitude below every other table here, because that is as far
-  as it goes in a few seconds. #50 carries the run that went further — ten
-  thousand records is 112.68 s.
+  as it went in a few seconds. **This table is the *before*** — #50 was fixed the
+  same day and the same stage now reads 32 µs/RRset flat, 0.65 s for the 20,006
+  RRsets that took 112.68. It is left standing because it is the measurement the
+  defect was found by, and the after is in #50's row under "Closed work".
 
 ```
 == 10000 zones of 9 records each, as `rdnsd` holds them
@@ -1186,64 +1192,37 @@ number because the operator who cannot is exactly the one `rdnsctl` exists for.
 
 ---
 
-### 50. Verifying a signed zone at load is quadratic — **filed 2026-09-12**
+### 53. A zone is verified at load even when this server just signed it — **filed 2026-09-12**
 
-Found by 44c's harness. #44's preamble says none of its rows is a defect and
-that is true of the rows; this came out of taking one of them, which is what an
-evidence gap is for.
+Left behind by #50, and only visible once #50 stopped hiding it: verifying a
+million-record zone is **76 s** now that it is linear, against 28 s to sign the
+same zone. Both are paid at every startup, every SIGHUP, every `rdnsctl reload`
+and every re-signing tick, and for a zone this server signed itself the second
+of them is proving what it did a moment ago with the keys it did it with.
 
-`zones::verify_zones` runs at every load whenever signing is configured —
-`DnssecValidator::new(cli.require_signed || signing.is_some())` — so it is on the
-startup path, on SIGHUP, on `rdnsctl reload`, on the re-signing timer (which
-re-signs *by reloading*, on purpose) and inside `--check-config`. It is not on
-the query path — `validate_response` has exactly two callers, both inside
-`verify_zones` in `rdnsd/src/zones.rs`, so answering a query never pays it.
+What `verify_zones` is *for* is the zone it did not sign: a pre-signed file an
+operator dropped in, or signatures that have since expired or stopped covering
+edited data. That case has to keep the check. `ZoneSigning::apply` already knows
+which zones it signed — it returns after replacing each one — so the information
+is in the right place; what does not exist is a way to hand it to
+`verify_zones`, which today takes the whole map and a validator.
 
-It asks `validate_response` once per signed RRset. That function collects every
-DNSKEY and every RRSIG **in the whole zone** into fresh vectors, cloning each
-record's RDATA, and `dnssec::verify_rrset` then scans the collected signatures
-linearly for the ones covering this RRset. Two multipliers, both the zone's own
-size, inside a loop that runs once per RRset — three, counting the clone.
+Measured, so the row is not a guess (`rdns/tests/scale.rs`, release, on the
+development machine):
 
-Measured, release, `RDNS_SCALE_VERIFY` (the top three on both platforms, the
-bottom three on Windows only — one run, because the last of them is two
-minutes):
+| records | sign | verify |
+|---|---|---|
+| 10 003 | 0.26 s | 0.01 s |
+| 100 003 | 2.73 s | 0.09 s |
+| 1 000 003 | 28.0 s | 76.1 s |
 
-| records | signed records | RRsets | verify | ×/doubling |
-|---|---|---|---|---|
-| 503 | 2 013 | 1 006 | 0.30 s / 0.23 s | |
-| 1 003 | 4 013 | 2 006 | 1.10 s / 0.88 s | 3.7 |
-| 2 003 | 8 013 | 4 006 | 4.37 s / 3.37 s | 4.0 |
-| 2 503 | 10 013 | 5 006 | 7.02 s | |
-| 5 003 | 20 013 | 10 006 | 27.73 s | 4.0 |
-| 10 003 | 40 013 | 20 006 | **112.68 s** | 4.1 |
-
-Doubling the zone quadruples the check, over four doublings and without
-drifting. **A zone of ten thousand records takes nearly two minutes to verify,
-at every load** — that one is measured. Beyond it the figures are arithmetic
-from the ratio and that is the finding: a hundred thousand records is about
-three hours and a million about thirteen days. A signed zone of any real size
-cannot be loaded, and the failure is a process that never finishes starting
-rather than an error anybody can read.
-
-Why nothing caught it: every signed zone in the suite is a dozen records and
-#43's interop zones are the same, where the whole check is microseconds. §5 is
-the rule — count the multipliers and time the worst case rather than reading the
-loop — and §13 is the shape, a scan beside the index that would have answered
-it. The zone stores its RRSIGs at their owner names and `Zone::query(name,
-Qtype::of(RRSIG))` already reaches them through the owner index, so "which
-signatures cover this owner" is a lookup that exists.
-
-**What is not enough, checked rather than assumed:** hoisting the two
-collections out of the per-RRset loop. `verify_rrset` takes a slice and filters
-it by owner and type on every call, so the scan survives the hoist and the shape
-stays quadratic. Whatever replaces it has to answer "which signatures cover this
-(owner, type)" without walking the zone — which is a question about
-`verify_rrset`'s signature, not only about `verify_zones`' loop.
-
-The harness's verify stage is already the test, in §10's shape: a ratio, with
-the µs/RRset column flat if it is fixed and doubling if it is not. A fix wants
-its own regression test in `rdnsd`, where `verify_zones` lives.
+**What would refute it** (§19): that verifying our own output catches something.
+It can — a signer that produced a signature over the wrong canonical form would
+be caught here and nowhere else, which is an argument for keeping the check on
+*some* zone rather than on every zone at every reload. So the shape to build is
+probably "verify what we signed once, at startup, and skip it on the re-signing
+tick", not "skip it whenever we signed it". Neither is written, and the number
+that decides it is how long a fleet's re-signing tick is allowed to take.
 
 ---
 
@@ -1435,6 +1414,7 @@ the week; the record is under "How the queue kept going stale" in
 | **42** | the three encrypted transports | **filed 2026-09-11, closed 2026-09-12**, three stages in the order filed. Every dependency number in the filing held — **117 packages for all three**, against the predicted 118, the difference being one `log` this build turns off. The architectural prediction held too: DoT and DoQ carry RFC 1035 §4.2.2's framing unchanged, so `tcp::serve_one` and `Handler` answer on all three transports without knowing which. What the filing got wrong was the size of the metrics fold: 25 lines of code, not ~58, because it counted what `hyper` replaces and not what it asks for back. One certificate store serves all three and one SIGHUP renews it. Image cost, which the filing named as unmeasured: **+1.44 MiB on a 30 MiB image**, of which `hyper` is 0.54 |
 | **46** | `rdnsd` could not sign a NOTIFY | **filed and closed 2026-09-12**, three items, all of them live. 46a: `--also-notify` took an address and nothing else, so a secondary whose notify ACL names a key refused every notification — measured against NSD and Knot, both. 46b: that refusal was logged `acknowledged (Refused)` at INFO, which is a permanently broken notification path with nothing in a failed state. 46c was found while fixing the other two and was the worst of the three: `[zones."x"].also-notify` was parsed into `PerZone::notify` and read by nothing, with two `docs/spec/` files documenting it as working. `--secondary` and `--also-notify` are one parser now (`rdns::endpoint`), which is why 46a existed at all |
 | **43** | nothing here had ever answered another implementation | **filed 2026-09-11, closed 2026-09-12.** `tests/interop/` — one `docker compose` network, `run.sh all`. 112 assertions against BIND 9.20.27, Knot 3.6.0, NSD 4.12.0, Unbound 1.23.1 and ldns 1.8.4; 0 failures. **Neither of the two things the filing predicted happened**: the IXFR is a real delta in both directions and every NSEC3 shape validates. Found one gap, in NOTIFY, which no row had named — **#46**. Three of the first five apparent findings were the harness, and the section says what each was, because that ratio is the lesson |
+| **50** | verifying a signed zone at load was quadratic in the zone | **filed and closed 2026-09-12**, found by 44c's measurement rather than by reading the code. `validate_response` collected every DNSKEY and every RRSIG in the zone on every call and `verify_rrset` then scanned what it collected, so `verify_zones` — which runs at startup, on SIGHUP, on `rdnsctl reload`, on the re-signing tick and inside `--check-config` — cost the square of the zone. **20,006 RRsets: 112.68 s before, 0.65 s after**, and a million-record zone goes from days of arithmetic to a measured 76 s. The fix is a `ZoneKeys` the caller hoists and a signature lookup through the zone's own owner index; the guard is an allocation count (34 either side of a fifty-fold zone, 217 against 6,101 with the scan) plus a ratio test in `rdnsd`. Filed **#53** on the way out |
 | **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly

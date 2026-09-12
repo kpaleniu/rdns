@@ -23,6 +23,7 @@ use std::sync::Mutex;
 use rdns::clock::current_unix_timestamp;
 use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Rrset, RrsetProof};
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
+use rdns::dnssec_validation_mode::{DnssecValidator, ZoneKeys};
 use rdns::record_types;
 use rdns::zone::{parse_zone_file, NameKind};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
@@ -130,7 +131,64 @@ fn allocation_counts() {
     checking_a_signed_nxdomain();
     what_the_resolvers_caches_cost();
     verifying_an_rrset_against_two_candidate_signatures();
+    checking_one_rrset_does_not_read_the_whole_zone();
     a_busy_neighbour_stays_out_of_the_count();
+}
+
+/// What checking one RRset of a signed zone costs, at two zone sizes.
+///
+/// The count is the point and not its value: `TODO.md` #50 was
+/// `validate_response` collecting every DNSKEY and every RRSIG *in the zone*
+/// on every call, cloning each one's RDATA — so this number grew with the zone
+/// and verifying a zone at load was quadratic in it. Two sizes an order of
+/// magnitude apart, and the assertion is that they are the same.
+///
+/// A count rather than a timing because it is exact and reads the same on
+/// every machine (`CLAUDE.md` §10), and because the defect was allocation for
+/// allocation what it was in time: the scan built the two vectors it scanned.
+fn checking_one_rrset_does_not_read_the_whole_zone() {
+    let validator = DnssecValidator::new(true);
+
+    let count_for = |hosts: usize| -> u64 {
+        let mut text = String::from(ZONE);
+        for i in 0..hosts {
+            text.push_str(&format!("host{i} IN A 192.0.2.9\n"));
+        }
+        let zone = parse_zone_file(&text, "example.com.").expect("parse");
+        let keys = vec![SigningKey::generate(
+            SigningAlgorithm::EcdsaP256Sha256,
+            "example.com.",
+            rdns::dnssec::DNSKEY_FLAG_ZONE,
+        )
+        .expect("zsk")];
+        let signed = sign_zone(
+            &zone,
+            &keys,
+            &SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400),
+        )
+        .expect("sign");
+        let zone_keys = ZoneKeys::of(&signed);
+        let records = signed.query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A));
+        assert!(!records.is_empty(), "the RRset to check has to be there");
+
+        // Once before measuring: the first call into a fresh path allocates
+        // things every later one reuses, and the target here is a difference
+        // rather than a level.
+        let _ = validator.validate_rrset(&signed, &zone_keys, &records);
+        let (ok, count) = allocations(|| validator.validate_rrset(&signed, &zone_keys, &records));
+        assert!(ok.0, "the measurement means nothing unless it verified");
+        count
+    };
+
+    let small = count_for(10);
+    let large = count_for(500);
+    println!("check one RRset in a 10-host zone: {small} allocations");
+    println!("check one RRset in a 500-host zone: {large} allocations");
+    assert_eq!(
+        small, large,
+        "checking one RRset allocated {small} in a small zone and {large} in one \
+         fifty times the size: the check is reading the whole zone again"
+    );
 }
 
 /// Two measured bodies must not overlap: the profiler is global, so an
