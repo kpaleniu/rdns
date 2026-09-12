@@ -100,6 +100,8 @@ pub struct Server {
     /// bind 853 with nothing to present on it.
     pub tls_listen: Option<String>,
     pub quic_listen: Option<String>,
+    pub https_listen: Option<String>,
+    pub https_path: Option<String>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     /// Where `rdnsctl` reaches this server. Unix only, and refused at startup
@@ -136,6 +138,8 @@ impl Default for Server {
             metrics_listen: None,
             tls_listen: None,
             quic_listen: None,
+            https_listen: None,
+            https_path: None,
             tls_cert: None,
             tls_key: None,
             control_socket: None,
@@ -466,6 +470,12 @@ impl Config {
         cli.metrics_listen = self.server.metrics_listen.clone();
         cli.tls_listen = self.server.tls_listen.clone();
         cli.quic_listen = self.server.quic_listen.clone();
+        cli.https_listen = self.server.https_listen.clone();
+        // The flag has a default, so an absent key means "keep it" rather than
+        // "clear it" — the `Option` here is the override, not the value (§15).
+        if let Some(path) = &self.server.https_path {
+            cli.https_path = path.clone();
+        }
         cli.tls_cert = self.server.tls_cert.clone();
         cli.tls_key = self.server.tls_key.clone();
         cli.control_socket = self.server.control_socket.clone();

@@ -47,3 +47,28 @@ pub(crate) fn query(id: u16) -> Vec<u8> {
 pub(crate) fn id_of(message: &[u8]) -> u16 {
     u16::from_be_bytes([message[0], message[1]])
 }
+
+/// A response to [`query`]: the same question, plus one A record at `ttl`.
+///
+/// Built by hand for the reason `query` is — a fixture that went through the
+/// serializer would prove the serializer. This one exists so the DoH tests can
+/// assert on `Cache-Control`, which RFC 8484 §5.1 takes from the smallest TTL
+/// in the answer.
+pub(crate) fn answer_with_ttl(id: u16, ttl: u32) -> Vec<u8> {
+    let mut packet = id.to_be_bytes().to_vec();
+    packet.extend_from_slice(&[
+        0x81, 0x80, // QR=1, RD, RA
+        0x00, 0x01, // one question
+        0x00, 0x01, // one answer
+        0x00, 0x00, 0x00, 0x00,
+    ]);
+    packet.extend_from_slice(b"\x07example\x03com\x00");
+    packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+                                                         // The owner, as a pointer back to the question's name at offset 12.
+    packet.extend_from_slice(&[0xc0, 0x0c]);
+    packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+    packet.extend_from_slice(&ttl.to_be_bytes());
+    packet.extend_from_slice(&[0x00, 0x04]); // RDLENGTH
+    packet.extend_from_slice(&[192, 0, 2, 10]);
+    packet
+}

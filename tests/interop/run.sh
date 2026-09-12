@@ -904,6 +904,67 @@ print(urllib.request.urlopen('http://10.53.0.2:9153/metrics').read().decode())" 
     bad "dns_quic_handshakes_total is ${qshook:-absent}, expected at least 2"
   fi
 
+  # ---- DoH, on 443 and through an HTTP stack ------------------------------
+  say "42c - DNS over HTTPS (RFC 8484)"
+
+  check "kdig speaks DoH and gets the answer" "192.0.2.10"     <<< "$(t kdig +short +https=/dns-query +tls-ca=/srv/run/dot-ca.pem               +tls-hostname=dns.example.test -p 443 @10.53.0.2 www.example.com A 2>&1)"
+
+  # The GET form as well as the POST one. RFC 8484 requires a server to take
+  # both, and kdig's +https-get is the only client here that sends the GET.
+  check "...and the GET form with ?dns=<base64url>" "192.0.2.10"     <<< "$(t kdig +short +https=/dns-query +https-get +tls-ca=/srv/run/dot-ca.pem               +tls-hostname=dns.example.test -p 443 @10.53.0.2 www.example.com A 2>&1)"
+
+  check "a DNSSEC-signed answer comes back over HTTPS" "RRSIG"     <<< "$(t kdig +dnssec +https=/dns-query +tls-ca=/srv/run/dot-ca.pem               +tls-hostname=dns.example.test -p 443 @10.53.0.2 www.example.com A 2>&1)"
+
+  # A wrong path is a 404, not an answer: the endpoint is one path, and a server
+  # that answered DNS on any URI would be a different protocol.
+  local badpath
+  badpath=$(t kdig +short +https=/wrong +tls-ca=/srv/run/dot-ca.pem               +tls-hostname=dns.example.test -p 443 @10.53.0.2 www.example.com A 2>&1)
+  if printf '%s' "$badpath" | grep -q '192.0.2.10'; then
+    bad "DoH answered on a path it is not configured for"
+  else
+    ok "...and a request on another path is not answered"
+  fi
+
+  # Curl is the measurement that could refute the three above (§19): kdig could
+  # in principle be satisfied by something that is not HTTP at all. This asks
+  # over HTTP/2 with the media type spelled out, and reads the status line and
+  # the Cache-Control §5.1 requires.
+  local raw
+  raw=$(t sh -c "python3 - <<'PY'
+import base64, http.client, ssl, sys
+ctx = ssl.create_default_context(cafile='/srv/run/dot-ca.pem')
+# A minimal query for www.example.com A, built here so the probe does not
+# depend on a DNS library agreeing with the one under test.
+q = bytes.fromhex('abcd0100000100000000000003777777076578616d706c6503636f6d0000010001')
+c = http.client.HTTPSConnection('dns.example.test', 443, context=ctx)
+c.sock = None
+import socket
+c._create_connection = lambda *a, **k: socket.create_connection(('10.53.0.2', 443))
+c.request('POST', '/dns-query', body=q, headers={'content-type': 'application/dns-message'})
+r = c.getresponse()
+print('status', r.status)
+print('content-type', r.getheader('content-type'))
+print('cache-control', r.getheader('cache-control'))
+print('bodylen', len(r.read()))
+PY")
+  printf '%s
+' "$raw" | sed 's/^/        | /'
+  if printf '%s' "$raw" | grep -q 'status 200'; then
+    ok "a plain HTTPS POST of application/dns-message is answered 200"
+  else
+    bad "the raw HTTP probe did not get a 200"
+  fi
+  if printf '%s' "$raw" | grep -q 'content-type application/dns-message'; then
+    ok "...with the media type RFC 8484 §6 registers"
+  else
+    bad "the response did not carry application/dns-message"
+  fi
+  if printf '%s' "$raw" | grep -qE 'cache-control max-age=[0-9]+'; then
+    ok "...and a Cache-Control taken from the answer's smallest TTL (§5.1)"
+  else
+    bad "no Cache-Control on the DoH response"
+  fi
+
   # ---- the renewal story, which is the half that is not the protocol -------
   #
   # New bytes at the same two paths and one reload. The pin changes, so a client

@@ -84,13 +84,15 @@ as it said it would, and closed the day after it was filed — five rows, 112
 assertions against BIND, Knot, NSD and Unbound, nothing in any row refuted. It
 filed **#46** on its way out, which is the only thing it found and is in NOTIFY,
 a corner none of its five rows had named. So what is open is #42, #44, #45, #46
-and #21.~~ **One inventory and three numbered sections, later the same day**:
+and #21.~~ ~~**One inventory and three numbered sections, later the same day**:
 #46 closed too, and it had grown a third item on the way — the per-zone
 `also-notify` that was parsed and read by nothing. The harness #43 left behind
 is what proved the fix, which is the first time anything here has been checked
 against another implementation rather than against itself: 117 assertions now,
 and the NOTIFY row fails if the signing is taken back out. So **#42, #44, #45
-and #21**.
+and #21**.~~ **One inventory and two numbered sections, end of 2026-09-12**: #42
+went as well, all three stages — DoT, DoQ and DoH, each proved against Knot's
+client in the harness #43 left behind. So **#44, #45 and #21**.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -509,7 +511,7 @@ cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone   --metrics-list
 # Interoperability against BIND, Knot, NSD and Unbound (#43). One docker compose
 # network, `internal: true` and no published ports, so nothing it runs is
 # reachable from off the machine; `contained` asserts that four ways before any
-# scenario starts. 134 assertions, and the peers' versions are printed by every
+# scenario starts. 141 assertions, and the peers' versions are printed by every
 # run because "interop passed" without them names nothing.
 tests/interop/run.sh all            # images, setup, five scenarios; leaves it up
 tests/interop/run.sh 43c            # one scenario against a network already up
@@ -862,8 +864,9 @@ encrypted transports — was filed off #21's list, so the pair is #42 and #21.~~
 (what an operator would find missing in `rdnsd`), #45 (what an ISP would find
 missing in `rdnsr`), and #21.~~ ~~**Five still, 2026-09-12**: #43 closed and filed
 **#46** (`rdnsd` cannot sign a NOTIFY), so the five are #42, #44, #45, #46 and
-#21.~~ **Four, later the same day**: #46 closed as well, so #42, #44, #45 and
-#21. Both sections are in `docs/CLOSED_WORK.md`.
+#21.~~ ~~**Four, later the same day**: #46 closed as well, so #42, #44, #45 and
+#21.~~ **Three, end of that day**: #42 closed too, all three stages. So **#44**,
+**#45** and **#21**. Every closed section is in `docs/CLOSED_WORK.md`.
 Everything
 else numbered is under "Closed work" below; #38's, #39's, #40's and #41's
 sections went
@@ -997,71 +1000,6 @@ The certificate story in 42a is still the part with no decision behind it.
 whole answer is 522 ns and one `sendto`+`recvfrom` pair is 3.6-4.1 µs, so the
 entire benchmark suite covers about 6% of what a query costs — the context that
 stops a 20% win in it being reported as a 20% win.
-
----
-
-### 42. The three encrypted transports — **filed 2026-09-11**
-
-Taken off #21's not-implemented list, where the three sat under one line: "each
-is a transport, and each drags in a TLS stack — the dependency argument §14 makes
-about the OTLP exporter applies with more force here". That argument was never
-wrong, it was never *measured*, and the measurement changes it: the tree already
-links `ring`, so the TLS stack is nearly free and the two protocols on top of it
-are the whole cost.
-
-**One item in three stages, not three items.** All three share one rustls setup,
-one certificate story and one ALPN dispatch, and 42a is the prerequisite for both
-others. Filed in the order they should be taken.
-
-| | | |
-|---|---|---|
-| ~~**42a**~~ **42a — done 2026-09-12** | DNS over TLS (RFC 7858) | `rustls` 0.23 + `tokio-rustls` 0.26 on port 853, ALPN `dot`. **`default-features = false, features = ["ring", ...]` and not the default provider**: with `ring`, rustls resolves **0.17.14 — the exact version this tree already links for DNSSEC and TSIG** — and pulls no `aws-lc-rs`/`aws-lc-sys`, so no cmake and no C toolchain. **Measured: +7 runtime packages** against this workspace's 77. `rdns_transport::tcp`'s `Handler` trait is already generic over what answers, so the protocol half is the same accept loop over a TLS stream. **The half that is not the protocol, and is bigger**: where a certificate comes from, whether a reload picks up a renewed one, and what happens when it expires — none of that is decided, and it is what makes this a stage rather than an afternoon |
-| | **What it measured out at** | **+6 runtime packages, not the +7 filed**: `logging` is off, which is the seventh (`log`). rustls logs through the `log` facade and `tracing-subscriber` here has `tracing-log` disabled on purpose, so those records would be built and dropped — §14's liability, turned off rather than accepted. `ring` resolved to **0.17.14**, the one this tree already links, and no `aws-lc-*` appeared: 77 → 83, checked by diffing `cargo tree` before and after. `rcgen` is a **dev**-dependency for the tests, so the runtime count is untouched by them |
-| | **And what the hard half turned out to be** | The row was right that the certificate story is bigger than the protocol, and wrong about which part. Expiry is not the hard question — it is the one to *decline*: parsing `notAfter` costs an X.509 parser whose whole output is a log line, and the symptom (every client hanging up) is already a counter. The renewal path is the real work, and it is `ResolvesServerCert` over an `RwLock`, re-read by the one function every reload trigger passes through. `rdnsr` had **no reload path at all**, which is why `signal_stream`/`next_reload_signal` moved out of `rdnsd` into `rdns::shutdown` rather than being copied (§7) |
-| ~~**42b**~~ **42b — done 2026-09-12** | DNS over QUIC (RFC 9250), via `quinn` | `quinn` 0.11, `default-features = false, features = ["runtime-tokio", "rustls-ring"]`, ALPN `doq`. **Measured: +22 over 77, so +15 on top of 42a.** Cheaper *architecturally* than 42c despite the larger dependency, because the framing is already here: §4.2 is "All DNS messages (queries and responses) sent over DoQ connections MUST be encoded as a 2-octet length field followed by the message content as specified in [RFC1035]", which is `rdns::framed` and what `tcp.rs` already writes. No HTTP anywhere — §4.2 calls it "a lightweight direct mapping … a more natural fit for both the recursive to authoritative and zone transfer scenarios". So quinn supplies streams and the existing handler supplies the answers |
-| | **What it measured out at** | **98 packages, +15 on top of 42a** — the row's number exactly. The absolute is +21 over 77 rather than the +22 filed, and the missing one is 42a's `log`. The architectural claim held too: the whole protocol is `read_to_end` on a stream, the same 2-octet prefix `tcp.rs` already writes, and `Handler` unchanged — a channel per stream feeds it, so a transfer's several framed messages go out on the one stream that asked |
-| | **What it needed that the row did not name** | A decision about the Message ID. RFC 9250 has a client set it to zero because the stream has already paired request with response; this server **echoes whatever it was sent and never checks**, since the pairing is done and refusing a non-zero ID would break a client for nothing. Also: DoQ shares 42a's `CertificateStore` rather than building its own, so one SIGHUP renews both — two stores over the same two files would be a certificate that expires on one port and not the other |
-| **42c** | DNS over HTTPS (RFC 8484), **unconditional**, and the metrics server folds onto `hyper` | `hyper` 1.11 + `hyper-util` 0.1 + `http-body-util` 0.1 — the third is **not** pulled in by the other two, checked, and is what builds a body. **Measured: +27 over 77 with all three named, so +20 on top of 42a.** HTTP/1 is not a way out: §5.2 makes HTTP/2 "the minimum RECOMMENDED version", and clients negotiate `h2` by ALPN. **Unconditional is the decision, and it is what makes the second half possible.** `rdns/src/metrics_server.rs` says in its own header that it is hand-rolled "because Prometheus needs a `GET` returning text, and an HTTP stack for one method on one path costs `hyper` and everything under it" — a cost comparison, and this stage retires its premise. Fold it onto hyper and move the module to `rdns-transport`, because an HTTP stack belongs at the socket layer and not under the zone parser and the signer |
-
-**What the fold actually deletes, measured before filing so the row is not a
-guess.** `metrics_server.rs` is 315 lines: 168 of code and doc comments, 147 of
-tests. hyper replaces about **58** of the 168 — the request-line parsing (~30),
-`write_all` (6) and `response`'s status-and-header formatting (22). It replaces
-none of the accept loop, the `Stop`/`Busy` shutdown integration, the
-`try_acquire` scrape semaphore ("a queued scrape is stale by the time it is
-served"), or the `match (method, path)`, which becomes a `service_fn` with the
-same arms and the same bodies. A third of the file, not the file.
-
-`/metrics`, `/healthz` and `/readyz` all have to survive it, and the test is CI's
-`image` job, which `curl -sf`s the last two — the one job no local `cargo`
-invocation covers.
-
-**How the measurement was taken, so it can be retaken.** Dependencies appended to
-`rdns-transport/Cargo.toml`, `cargo generate-lockfile`, then unique packages from
-`cargo tree -e normal --workspace --prefix none`; the manifest and `Cargo.lock`
-restored afterwards and `git status` checked clean. Today's baseline is **77**
-runtime packages (145 in `Cargo.lock`, which counts dev-dependencies). Every
-combination resolved against this workspace's `rust-version = "1.95"` without
-complaint. The complete recipe — all three stages at once — measured **118, or
-+41**. For scale, deleting the OTLP exporter §14 describes took `Cargo.lock` from
-187 to 104.
-
-**What was declined, with the numbers, because a negative result nobody can
-reproduce is an opinion (§10).**
-
-| declined | measured | why |
-|---|---|---|
-| rustls's default `aws-lc-rs` provider | 58 packages against 49 for the `ring` build, in an isolated `tokio`-only project | +9 packages *and* a cmake/C toolchain, to duplicate a crypto library the tree already links |
-| `quiche` for 42b | not resolved | "BoringSSL … needs to be built and linked", requires cmake, and NASM on Windows. This tree builds with plain `cargo` on both sides; that is the disqualifier, not the package count |
-| `s2n-quic` for 42b | 107 packages against `quinn`'s 80, same isolated project | and it drags `aws-lc-rs` back in |
-| `h2` alone instead of `hyper` for 42c | +19 over 77, so +12 on top of 42a — **cheaper than hyper by 8** | you then write the request handling for an internet-facing HTTP parser yourself. That is the half that ages badly, and it is the opposite trade from the metrics endpoint, which is on a management address and answers three paths |
-
-**What is not measured, and would refute a row rather than confirm one (§19).**
-The package count is a proxy for the dependency argument and for nothing else:
-build time, binary size and the attack surface each stack adds are all unmeasured
-here. For 42c specifically, whether `hyper` unconditional is acceptable in the
-container image's size budget is a question the `image` job can answer and this
-filing did not ask.
 
 ---
 
@@ -1224,6 +1162,7 @@ the week; the record is under "How the queue kept going stale" in
 | **38** | a structural review, and what it left | **filed and closed 2026-09-09 → 2026-09-10**: three fixes in the filing commits and five sub-items after them, 38e's cross-crate half decided against rather than done. **Nothing filed was a defect**; the one defect the review turned up was in the fixed half — a DO bit dropped by three reply paths across both daemons, against `rdnsd/src/answer.rs`, which mirrored it. 38d's `rdnsd` half is what filed #39. |
 | **39** | `rdnsd` answers through two dispatchers | **filed and closed 2026-09-10 → 2026-09-11**, five items. 39a was the defect: a TSIG-rejected request counted as received over TCP and not over UDP, because the two prologues had drifted. 39b built all three shapes before keeping one, and the two it declined are the argument — a trait that had to name the type it existed to hide, and a `transport` plus `out` pair that could disagree with itself. |
 | **41** | nothing capped the UDP response, and the sizes were hardcoded | **filed and closed 2026-09-11**, four items, none of them a live defect. 41b's measurement came before its fix and is `rdnsd/src/response_size.rs`; 41a and 41b became one type, `rdns::UdpSizes`, whose `reply_ceiling` cannot be asked without the `min`. The hardcode had three instances and not the two the filing named — 41c, where the third was also a receive buffer, and where Unbound's 64 KiB was the obvious answer and the wrong one: `--max-inflight-udp` multiplies it by 1024. 41d found RFC 8945 §5.3 had already written the remedy the row guessed at. Nothing filed on the way out. |
+| **42** | the three encrypted transports | **filed 2026-09-11, closed 2026-09-12**, three stages in the order filed. Every dependency number in the filing held — **117 packages for all three**, against the predicted 118, the difference being one `log` this build turns off. The architectural prediction held too: DoT and DoQ carry RFC 1035 §4.2.2's framing unchanged, so `tcp::serve_one` and `Handler` answer on all three transports without knowing which. What the filing got wrong was the size of the metrics fold: 25 lines of code, not ~58, because it counted what `hyper` replaces and not what it asks for back. One certificate store serves all three and one SIGHUP renews it. Image cost, which the filing named as unmeasured: **+1.44 MiB on a 30 MiB image**, of which `hyper` is 0.54 |
 | **46** | `rdnsd` could not sign a NOTIFY | **filed and closed 2026-09-12**, three items, all of them live. 46a: `--also-notify` took an address and nothing else, so a secondary whose notify ACL names a key refused every notification — measured against NSD and Knot, both. 46b: that refusal was logged `acknowledged (Refused)` at INFO, which is a permanently broken notification path with nothing in a failed state. 46c was found while fixing the other two and was the worst of the three: `[zones."x"].also-notify` was parsed into `PerZone::notify` and read by nothing, with two `docs/spec/` files documenting it as working. `--secondary` and `--also-notify` are one parser now (`rdns::endpoint`), which is why 46a existed at all |
 | **43** | nothing here had ever answered another implementation | **filed 2026-09-11, closed 2026-09-12.** `tests/interop/` — one `docker compose` network, `run.sh all`. 112 assertions against BIND 9.20.27, Knot 3.6.0, NSD 4.12.0, Unbound 1.23.1 and ldns 1.8.4; 0 failures. **Neither of the two things the filing predicted happened**: the IXFR is a real delta in both directions and every NSEC3 shape validates. Found one gap, in NOTIFY, which no row had named — **#46**. Three of the first five apparent findings were the harness, and the section says what each was, because that ratio is the lesson |
 | **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. |

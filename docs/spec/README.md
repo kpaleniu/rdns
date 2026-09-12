@@ -40,7 +40,7 @@ secondary role including EXPIRE, answers Prometheus scrapes, and serves dynamic
 UPDATE (RFC 2136) — TSIG-only, scoped per key, writing each accepted update back
 to the zone file before answering. Class IN only.
 
-Not implemented: DNS over HTTPS (DoT landed as #42a and DoQ as #42b), DNS Cookies as anything but opaque
+Not implemented: DNS Cookies as anything but opaque
 bytes, SIG(0), SVCB/HTTPS, and any record type outside the fourteen listed
 in `02-zone-model.md` — unknown types round-trip as opaque RDATA per RFC 3597 but
 cannot be written in a zone file except in `\#` form. DNAME (RFC 6672) joined

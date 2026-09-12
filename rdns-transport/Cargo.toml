@@ -17,6 +17,12 @@ tracing.workspace = true
 anyhow.workspace = true
 # DoT (#42a). Here rather than in `rdns` because a TLS stack belongs at the
 # socket layer: the zone parser and the signer have no business linking one.
+# RFC 8484 $4.1's GET form is base64url. Already in the tree (`rdns` decodes
+# TSIG secrets and DNSSEC keys with it), so this costs no package.
+base64 = "0.22"
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true

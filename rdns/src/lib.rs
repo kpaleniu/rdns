@@ -30,7 +30,6 @@ pub mod ixfr;
 pub mod journal;
 pub mod logging;
 pub mod metrics;
-pub mod metrics_server;
 pub mod negative_cache;
 pub mod notify;
 pub mod nsec_cache;

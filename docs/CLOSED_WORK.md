@@ -5613,6 +5613,177 @@ that "zero-cost" is a claim about a compiler, not a fact about a diff.
 
 ---
 
+### 42. The three encrypted transports — ~~**filed 2026-09-11**~~ **closed 2026-09-12**
+
+Taken off #21's not-implemented list, where the three sat under one line: "each
+is a transport, and each drags in a TLS stack — the dependency argument §14 makes
+about the OTLP exporter applies with more force here". That argument was never
+wrong, it was never *measured*, and the measurement changes it: the tree already
+links `ring`, so the TLS stack is nearly free and the two protocols on top of it
+are the whole cost.
+
+**One item in three stages, not three items.** All three share one rustls setup,
+one certificate story and one ALPN dispatch, and 42a is the prerequisite for both
+others. Filed in the order they should be taken.
+
+| | | |
+|---|---|---|
+| ~~**42a**~~ **42a — done 2026-09-12** | DNS over TLS (RFC 7858) | `rustls` 0.23 + `tokio-rustls` 0.26 on port 853, ALPN `dot`. **`default-features = false, features = ["ring", ...]` and not the default provider**: with `ring`, rustls resolves **0.17.14 — the exact version this tree already links for DNSSEC and TSIG** — and pulls no `aws-lc-rs`/`aws-lc-sys`, so no cmake and no C toolchain. **Measured: +7 runtime packages** against this workspace's 77. `rdns_transport::tcp`'s `Handler` trait is already generic over what answers, so the protocol half is the same accept loop over a TLS stream. **The half that is not the protocol, and is bigger**: where a certificate comes from, whether a reload picks up a renewed one, and what happens when it expires — none of that is decided, and it is what makes this a stage rather than an afternoon |
+| | **What it measured out at** | **+6 runtime packages, not the +7 filed**: `logging` is off, which is the seventh (`log`). rustls logs through the `log` facade and `tracing-subscriber` here has `tracing-log` disabled on purpose, so those records would be built and dropped — §14's liability, turned off rather than accepted. `ring` resolved to **0.17.14**, the one this tree already links, and no `aws-lc-*` appeared: 77 → 83, checked by diffing `cargo tree` before and after. `rcgen` is a **dev**-dependency for the tests, so the runtime count is untouched by them |
+| | **And what the hard half turned out to be** | The row was right that the certificate story is bigger than the protocol, and wrong about which part. Expiry is not the hard question — it is the one to *decline*: parsing `notAfter` costs an X.509 parser whose whole output is a log line, and the symptom (every client hanging up) is already a counter. The renewal path is the real work, and it is `ResolvesServerCert` over an `RwLock`, re-read by the one function every reload trigger passes through. `rdnsr` had **no reload path at all**, which is why `signal_stream`/`next_reload_signal` moved out of `rdnsd` into `rdns::shutdown` rather than being copied (§7) |
+| ~~**42b**~~ **42b — done 2026-09-12** | DNS over QUIC (RFC 9250), via `quinn` | `quinn` 0.11, `default-features = false, features = ["runtime-tokio", "rustls-ring"]`, ALPN `doq`. **Measured: +22 over 77, so +15 on top of 42a.** Cheaper *architecturally* than 42c despite the larger dependency, because the framing is already here: §4.2 is "All DNS messages (queries and responses) sent over DoQ connections MUST be encoded as a 2-octet length field followed by the message content as specified in [RFC1035]", which is `rdns::framed` and what `tcp.rs` already writes. No HTTP anywhere — §4.2 calls it "a lightweight direct mapping … a more natural fit for both the recursive to authoritative and zone transfer scenarios". So quinn supplies streams and the existing handler supplies the answers |
+| | **What it measured out at** | **98 packages, +15 on top of 42a** — the row's number exactly. The absolute is +21 over 77 rather than the +22 filed, and the missing one is 42a's `log`. The architectural claim held too: the whole protocol is `read_to_end` on a stream, the same 2-octet prefix `tcp.rs` already writes, and `Handler` unchanged — a channel per stream feeds it, so a transfer's several framed messages go out on the one stream that asked |
+| | **What it needed that the row did not name** | A decision about the Message ID. RFC 9250 has a client set it to zero because the stream has already paired request with response; this server **echoes whatever it was sent and never checks**, since the pairing is done and refusing a non-zero ID would break a client for nothing. Also: DoQ shares 42a's `CertificateStore` rather than building its own, so one SIGHUP renews both — two stores over the same two files would be a certificate that expires on one port and not the other |
+| ~~**42c**~~ **42c — done 2026-09-12** | DNS over HTTPS (RFC 8484), **unconditional**, and the metrics server folds onto `hyper` | `hyper` 1.11 + `hyper-util` 0.1 + `http-body-util` 0.1 — the third is **not** pulled in by the other two, checked, and is what builds a body. **Measured: +27 over 77 with all three named, so +20 on top of 42a.** HTTP/1 is not a way out: §5.2 makes HTTP/2 "the minimum RECOMMENDED version", and clients negotiate `h2` by ALPN. **Unconditional is the decision, and it is what makes the second half possible.** `rdns/src/metrics_server.rs` says in its own header that it is hand-rolled "because Prometheus needs a `GET` returning text, and an HTTP stack for one method on one path costs `hyper` and everything under it" — a cost comparison, and this stage retires its premise. Fold it onto hyper and move the module to `rdns-transport`, because an HTTP stack belongs at the socket layer and not under the zone parser and the signer |
+| | **What it measured out at** | **117 packages with all three stages**, against the 118 the recipe below predicted — the one missing is 42a's `log`. So every number in this filing held. |
+| | **And the two estimates it made, corrected** | The fold removes **25 lines of code, not the ~58 estimated** (118 → 93, comments and tests excluded). The estimate counted what hyper *replaces* — the request-line parser, `write_all`, the header formatting — and did not count what it asks for back: a `service_fn`, an async closure per request, `TokioIo`, and building a `Response<Full<Bytes>>` where a `format!` used to do. The second estimate, *which paths survive*, held exactly: `/metrics`, `/healthz` and `/readyz` all answer 200 from the built container |
+
+
+**What the fold actually deletes, measured before filing so the row is not a
+guess.** `metrics_server.rs` is 315 lines: 168 of code and doc comments, 147 of
+tests. hyper replaces about **58** of the 168 — the request-line parsing (~30),
+`write_all` (6) and `response`'s status-and-header formatting (22). It replaces
+none of the accept loop, the `Stop`/`Busy` shutdown integration, the
+`try_acquire` scrape semaphore ("a queued scrape is stale by the time it is
+served"), or the `match (method, path)`, which becomes a `service_fn` with the
+same arms and the same bodies. A third of the file, not the file.
+
+`/metrics`, `/healthz` and `/readyz` all have to survive it, and the test is CI's
+`image` job, which `curl -sf`s the last two — the one job no local `cargo`
+invocation covers.
+
+**How the measurement was taken, so it can be retaken.** Dependencies appended to
+`rdns-transport/Cargo.toml`, `cargo generate-lockfile`, then unique packages from
+`cargo tree -e normal --workspace --prefix none`; the manifest and `Cargo.lock`
+restored afterwards and `git status` checked clean. Today's baseline is **77**
+runtime packages (145 in `Cargo.lock`, which counts dev-dependencies). Every
+combination resolved against this workspace's `rust-version = "1.95"` without
+complaint. The complete recipe — all three stages at once — measured **118, or
++41**. For scale, deleting the OTLP exporter §14 describes took `Cargo.lock` from
+187 to 104.
+
+**What was declined, with the numbers, because a negative result nobody can
+reproduce is an opinion (§10).**
+
+| declined | measured | why |
+|---|---|---|
+| rustls's default `aws-lc-rs` provider | 58 packages against 49 for the `ring` build, in an isolated `tokio`-only project | +9 packages *and* a cmake/C toolchain, to duplicate a crypto library the tree already links |
+| `quiche` for 42b | not resolved | "BoringSSL … needs to be built and linked", requires cmake, and NASM on Windows. This tree builds with plain `cargo` on both sides; that is the disqualifier, not the package count |
+| `s2n-quic` for 42b | 107 packages against `quinn`'s 80, same isolated project | and it drags `aws-lc-rs` back in |
+| `h2` alone instead of `hyper` for 42c | +19 over 77, so +12 on top of 42a — **cheaper than hyper by 8** | you then write the request handling for an internet-facing HTTP parser yourself. That is the half that ages badly, and it is the opposite trade from the metrics endpoint, which is on a management address and answers three paths |
+
+**What is not measured, and would refute a row rather than confirm one (§19).**
+The package count is a proxy for the dependency argument and for nothing else:
+build time, binary size and the attack surface each stack adds are all unmeasured
+here. For 42c specifically, whether `hyper` unconditional is acceptable in the
+container image's size budget is a question the `image` job can answer and this
+filing did not ask.
+
+---
+
+**Closed 2026-09-12**, three stages in the order filed, one commit each.
+
+**Every dependency number here held.** 77 → 83 → 98 → **117**, against the 83,
+98 and 118 the rows predicted; the single package of difference is `log`, which
+42a turns off because rustls logs through the `log` facade and this workspace
+disables `tracing-subscriber`'s `tracing-log` on purpose — records built and
+dropped are §14's liability, not a feature. `ring` stayed one version, the one
+already linked for DNSSEC and TSIG, and no `aws-lc-*` ever appeared.
+
+**The architectural prediction held too**, and it is the more interesting one.
+DoT and DoQ both carry RFC 1035 §4.2.2's 2-octet framing unchanged, so
+`tcp::serve_one` and the `Handler` trait answer on all three transports without
+knowing which is underneath. What each stage added was a handshake and a
+mapping:
+
+| stage | what was actually written |
+|---|---|
+| **42a** DoT | `CertificateStore` (a `ResolvesServerCert` over an `RwLock`), a `SplitStream` trait so plain TCP keeps `into_split`'s lock-free halves, and the accept loop. The certificate story is the module, not the protocol |
+| **42b** DoQ | `read_to_end` per bidirectional stream, a channel per stream feeding the same `Handler`, and quinn's transport parameters set from the same `TransportLimits` the TCP loop uses |
+| **42c** DoH | The only one that changes the wire format: RFC 8484 §4.1 sends the bare message, so this is the one place in the tree that takes framing *off*. Plus `Cache-Control` from the smallest TTL (§5.1), both the POST and GET forms, and ALPN choosing between HTTP/2 and HTTP/1.1 |
+
+**One certificate, one store, one reload, three listeners.** A renewal is
+`certbot --deploy-hook 'rdnsctl reload'` and it reaches all of them, because
+they resolve through the same store. Two stores over the same two files would be
+a certificate that expires on one port and not the others, and the interop check
+pins the renewed key over both DoT and DoQ to say it does not.
+
+**Expiry is the question this declined**, and 42a's row had it as the open one.
+Parsing `notAfter` buys an X.509 parser whose entire output is a log line, while
+the symptom — every client hanging up at the handshake — is already a counter.
+`dns_tls_handshake_failures_total` and `dns_quic_handshake_failures_total` are
+the series, emitted as zeroes even with no listener configured so an alert can
+be written before the feature is turned on.
+
+**What the filing got wrong, and it is the fold.** It measured
+`metrics_server.rs` at 315 lines and predicted hyper would replace about 58 of
+the 168 that are not tests. Measured after: **118 code lines to 93, so 25**. The
+estimate counted what hyper *replaces* — the request-line parser and its 8 KB
+read loop, `write_all`, `response`'s status-line and header formatting — and did
+not count what it asks for in exchange: a `service_fn`, an async closure per
+request, a `TokioIo` wrapper, and building a `Response<Full<Bytes>>` where a
+`format!` used to do. The gross removal was close to 58; the net is 25.
+
+The rest of that row held exactly. `/metrics`, `/healthz` and `/readyz` all
+survive and all answer 200 from the built container, which is the check the row
+named as the one no `cargo` invocation covers. Two behaviours changed and both
+moved *toward* the RFC: an HTTP/1.1 request with no `Host` header now gets 400
+(RFC 9112 §3.2 requires that and the hand-rolled version never looked), and an
+over-long request line is hyper's 431 rather than ours. Keep-alive is the one
+thing hyper offers that is declined, and the module says why: the scrape permit
+is held for a connection's life, so idle keep-alive connections would hold every
+slot.
+
+**The image question the filing left open**, measured across four builds of the
+same Dockerfile:
+
+| | bytes | added |
+|---|---|---|
+| before #42 | 31,748,033 | — |
+| after 42a (DoT) | 32,230,176 | +0.46 MiB |
+| after 42b (DoQ) | 32,693,001 | +0.44 MiB |
+| after 42c (DoH) | 33,254,381 | +0.54 MiB |
+
+**+1.44 MiB on a 30 MiB image, 4.7%**, of which `hyper` unconditional is 0.54.
+That is the answer to "whether `hyper` unconditional is acceptable in the
+container image's size budget", and it is yes.
+
+**Two defects found on the way, neither in a transport.**
+
+- **A counter declared, incremented, and never rendered.** The DoQ pair was
+  added to `Counters` and left out of `to_prometheus_format`, so the series was
+  absent from the scrape while the code read as though it reported something.
+  Found because 42b's interop check asked for a number and got nothing.
+  `every_encrypted_transport_counter_reaches_the_scrape` walks all four now and
+  fails against exactly that.
+- **A test fixture that made three tests share a directory.** `write_pem` keyed
+  its scratch directory on a tag and the pid, so three DoH tests with the same
+  tag wrote `cert.pem` and `key.pem` over each other and loaded a mismatched
+  pair — and each one's `Drop` deleted a directory the others were using. A
+  counter in the name, so reusing a tag cannot do it again.
+
+**`rdnsr` gets all three as well**, and RFC 7858 is written for exactly that hop.
+It had no reload path at all, so `signal_stream`/`next_reload_signal` moved out
+of `rdnsd` into `rdns::shutdown` rather than being copied (§7); there SIGHUP
+means the certificate and nothing else.
+
+**Verified against Knot's client**, which is the only one in the harness with
+all three vocabularies: `+tls`, `+quic` and `+https` (and `+https-get`, the only
+way to exercise RFC 8484's GET form here). Each has a negative control — a
+client trusting a *different* self-signed certificate — because without one
+"the chain verified" is equally consistent with a client that checks nothing. A
+raw `http.client` probe reads the status line, the media type and the
+`Cache-Control`, so DoH is known to be HTTP and not merely something kdig
+accepts.
+
+**Not done, and named rather than left implied:** XFR over TLS (RFC 9103) is
+`TODO.md` #44d and is now much cheaper — the certificate plumbing and the ALPN
+dispatch it needs are all here, and a transfer already works over DoT and DoQ
+unchanged. What it still needs is the *policy* half: which keys and which peers
+may transfer over which transport.
+
+---
+
 ### 46. `rdnsd` cannot sign a NOTIFY — ~~**filed 2026-09-12**~~ **closed 2026-09-12**
 
 The one thing #43 found, and no row of #43 pointed at it. `rdns/src/notify.rs`

@@ -1,31 +1,48 @@
-//! A scrape endpoint for [`crate::metrics::DnsMetrics`], hand-rolled over
-//! `tokio`'s `TcpListener`, plus the two probes an orchestrator asks for:
-//! `/healthz` (alive) and `/readyz` (finished starting). [`crate::readiness`]
-//! has the distinction.
+//! A scrape endpoint for [`rdns::metrics::DnsMetrics`], plus the two probes an
+//! orchestrator asks for: `/healthz` (alive) and `/readyz` (finished starting).
+//! [`rdns::readiness`] has the distinction.
 //!
-//! Hand-rolled because Prometheus needs a `GET` returning text, and an HTTP
-//! stack for one method on one path costs `hyper` and everything under it.
+//! **This was hand-rolled, and its own header said why**: "Prometheus needs a
+//! `GET` returning text, and an HTTP stack for one method on one path costs
+//! `hyper` and everything under it." That was a cost comparison, and #42c
+//! retired its premise — DoH makes `hyper` unconditional, so the stack is
+//! already linked and the comparison is now between using it and keeping a
+//! second HTTP implementation next to it.
 //!
-//! No TLS, no auth, no keep-alive, no chunked encoding, no compression. Bind it
-//! on a management address or on loopback: the counters say how much traffic a
-//! server takes and which zones are failing.
+//! **What the fold actually removed**, since the filing estimated it and an
+//! estimate is worth checking: the request-line parser and its 8 KB read loop,
+//! `write_all`, and `response`'s status-line and header formatting. What stayed
+//! is everything that is not HTTP — the accept loop, the `Stop`/`Busy` shutdown
+//! integration, the `try_acquire` that drops a scrape rather than queueing it,
+//! and the `match (method, path)`, which is a `service_fn` with the same arms
+//! and the same bodies.
+//!
+//! **Two behaviours changed, both toward the RFC.** An HTTP/1.1 request with no
+//! `Host` header now gets 400 rather than being served — RFC 9112 §3.2 requires
+//! that, the hand-rolled version never looked, and every real scraper sends one.
+//! And a request line longer than 8 KB is now hyper's 431 rather than ours.
+//!
+//! **Keep-alive is off on purpose**, which is the one thing hyper offers here
+//! that is not taken. The permit below is held for a connection's life, so a
+//! handful of idle keep-alive connections would hold every scrape slot; the
+//! hand-rolled version closed after one response and this keeps that.
+//!
+//! No TLS and no auth. Bind it on a management address or on loopback: the
+//! counters say how much traffic a server takes and which zones are failing.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use http_body_util::Full;
+use hyper::body::Bytes;
+use hyper::header::CONTENT_TYPE;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpListener;
 
-use crate::metrics::DnsMetrics;
-use crate::readiness::Readiness;
-use crate::shutdown::{Busy, Stop};
-
-/// A connection that has said nothing is a stalled scraper or a port scanner.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Only the first line is read, and a request line with headers is well under
-/// this.
-const MAX_REQUEST: usize = 8 * 1024;
+use rdns::metrics::DnsMetrics;
+use rdns::readiness::Readiness;
+use rdns::shutdown::{Busy, Stop};
 
 /// Concurrent scrape connections. Smaller than the DNS loops' 128: a scrape is
 /// one request from a handful of collectors, and more is a queue nobody waits
@@ -61,116 +78,85 @@ pub async fn serve(
         tokio::spawn(async move {
             let _busy = busy;
             let _permit = permit;
+            let service = service_fn(move |request| {
+                let metrics = metrics.clone();
+                let readiness = readiness.clone();
+                async move { Ok::<_, std::convert::Infallible>(answer(request, &metrics, &readiness)) }
+            });
             // A misbehaving scraper cannot affect an answer, so it is not worth
             // a log line on a DNS server's stderr.
-            let _ = respond(stream, &metrics, &readiness).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
         });
     }
 }
 
-async fn respond(
-    mut stream: TcpStream,
+fn answer(
+    request: Request<hyper::body::Incoming>,
     metrics: &DnsMetrics,
     readiness: &Readiness,
-) -> std::io::Result<()> {
-    let mut buf = vec![0u8; MAX_REQUEST];
-    let mut filled = 0;
-
-    // Only the request line. Waiting for the blank line ending the headers
-    // would hang on a client that pipelines badly.
-    let line_end = loop {
-        if let Some(at) = buf[..filled].iter().position(|b| *b == b'\n') {
-            break at;
-        }
-        if filled == buf.len() {
-            // No request line in 8 KB: not a scraper.
-            return write_all(
-                &mut stream,
-                &response(431, "text/plain", "request too long"),
-            )
-            .await;
-        }
-        let read = match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut buf[filled..])).await {
-            Ok(Ok(0)) | Err(_) => return Ok(()),
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(e),
-        };
-        filled += read;
-    };
-
-    let line = String::from_utf8_lossy(&buf[..line_end]);
-    let mut parts = line.split_whitespace();
-    let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    // Strip a query string: `GET /metrics?foo=1` is a scrape.
-    let path = path.split('?').next().unwrap_or(path);
-
-    let reply = match (method, path) {
-        ("GET", "/metrics") => response(
-            200,
+) -> Response<Full<Bytes>> {
+    // hyper has already stripped the query string, which `GET /metrics?x=1`
+    // needs: a query string is ordinary scrape configuration, not a 404.
+    match (request.method(), request.uri().path()) {
+        (&Method::GET, "/metrics") => text(
+            StatusCode::OK,
             "text/plain; version=0.0.4",
-            &metrics.to_prometheus_format(),
+            metrics.to_prometheus_format(),
         ),
         // The process is running and its runtime is scheduling tasks, which is
         // all a liveness probe can honestly claim.
-        ("GET", "/healthz") => response(200, "text/plain", "ok\n"),
+        (&Method::GET, "/healthz") => text(StatusCode::OK, "text/plain", "ok\n".into()),
         // 503 rather than 200-with-a-body: an orchestrator's probe reads the
         // status code, and one that always passes is not a gate. The names go
         // in the body for whoever curls it.
-        ("GET", "/readyz") => match readiness.pending() {
-            pending if pending.is_empty() => response(200, "text/plain", "ready\n"),
-            pending => response(
-                503,
+        (&Method::GET, "/readyz") => match readiness.pending() {
+            pending if pending.is_empty() => text(StatusCode::OK, "text/plain", "ready\n".into()),
+            pending => text(
+                StatusCode::SERVICE_UNAVAILABLE,
                 "text/plain",
-                &format!(
+                format!(
                     "not ready: waiting for {} zone(s) to transfer: {}\n",
                     pending.len(),
                     pending.join(" ")
                 ),
             ),
         },
-        ("GET", "/") => response(
-            200,
+        (&Method::GET, "/") => text(
+            StatusCode::OK,
             "text/plain",
             "rdns metrics\n\n  /metrics   Prometheus text\n  /healthz   liveness\n  \
-             /readyz    readiness\n",
+             /readyz    readiness\n"
+                .into(),
         ),
-        ("GET", _) => response(404, "text/plain", "not found\n"),
-        _ => response(405, "text/plain", "method not allowed\n"),
-    };
-    write_all(&mut stream, &reply).await
+        (&Method::GET, _) => text(StatusCode::NOT_FOUND, "text/plain", "not found\n".into()),
+        _ => text(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "text/plain",
+            "method not allowed\n".into(),
+        ),
+    }
 }
 
-async fn write_all(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
-    stream.write_all(bytes).await?;
-    stream.flush().await
-}
-
-fn response(status: u16, content_type: &str, body: &str) -> Vec<u8> {
-    let reason = match status {
-        200 => "OK",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        431 => "Request Header Fields Too Large",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    // No keep-alive: one request, one response, one socket, no state machine.
-    format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: {content_type}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n{body}",
-        body.len()
-    )
-    .into_bytes()
+fn text(status: StatusCode, content_type: &str, body: String) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = status;
+    if let Ok(value) = content_type.parse() {
+        response.headers_mut().insert(CONTENT_TYPE, value);
+    }
+    response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shutdown::Shutdown;
+    use rdns::shutdown::Shutdown;
     use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
 
     async fn scrape(addr: SocketAddr, request: &str) -> String {
         let mut stream = TcpStream::connect(addr).await.expect("connect");

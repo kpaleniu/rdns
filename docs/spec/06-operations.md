@@ -33,6 +33,12 @@ query-burst = 200
 query-rate-exempt = ["10.0.0.0/8"]
 udp-workers = 8             # default: parallelism clamped to 2..=32
 metrics-listen = "127.0.0.1:9153"
+tls-listen = "0.0.0.0:853"     # DoT; DoQ is quic-listen, DoH is https-listen
+quic-listen = "0.0.0.0:853"    # UDP, so it does not collide with DoT
+https-listen = "0.0.0.0:443"
+https-path = "/dns-query"
+tls-cert = "/etc/rdns/tls/fullchain.pem"
+tls-key = "/etc/rdns/tls/privkey.pem"   # mode 0600, checked
 control-socket = "/run/rdns/rdnsd.sock"
 allow-partial-load = false
 

@@ -25,7 +25,6 @@ use rdns::clock::current_unix_timestamp;
 use rdns::dnssec_chain::TrustAnchors;
 use rdns::logging::{watch_anomalies, AnomalyThresholds, LogLevel, QueryLogger};
 use rdns::metrics::DnsMetrics;
-use rdns::metrics_server;
 use rdns::readiness::Readiness;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::rfc5011::ManagedAnchors;
@@ -33,6 +32,8 @@ use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl}
 use rdns::shutdown::{next_reload, reload_signal, Shutdown};
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
 use rdns::UdpSizes;
+use rdns_transport::https;
+use rdns_transport::metrics_server;
 use rdns_transport::quic;
 use rdns_transport::tls::{self, CertificateStore};
 use rdns_transport::{tcp, ServeContext, TransportLimits};
@@ -253,6 +254,14 @@ struct Cli {
     /// 853 as well: DoT is TCP and DoQ is UDP, so the two do not collide.
     #[arg(long, value_name = "ADDR:PORT")]
     quic_listen: Option<String>,
+    /// Also answer DNS over HTTPS here (RFC 8484). Needs --tls-cert and --tls-key.
+    ///
+    /// 443 is the port: DoH is meant to look like other HTTPS traffic.
+    #[arg(long, value_name = "ADDR:PORT")]
+    https_listen: Option<String>,
+    /// The path --https-listen answers on.
+    #[arg(long, value_name = "PATH", default_value = rdns_transport::https::DEFAULT_PATH)]
+    https_path: String,
     /// The PEM certificate chain --tls-listen presents. Leaf first.
     #[arg(long, value_name = "PATH")]
     tls_cert: Option<PathBuf>,
@@ -420,12 +429,14 @@ async fn main() -> anyhow::Result<()> {
     // certificate that will not load is a DoT listener that answers nothing.
     // Either encrypted listener needs the pair, which clap's `requires` cannot
     // express as an "or", so the check is here.
-    let encrypted = cli.tls_listen.is_some() || cli.quic_listen.is_some();
+    let encrypted =
+        cli.tls_listen.is_some() || cli.quic_listen.is_some() || cli.https_listen.is_some();
     let tls_store = match (encrypted, &cli.tls_cert, &cli.tls_key) {
         (true, Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
         (true, _, _) => {
             return Err(anyhow!(
-                "--tls-listen and --quic-listen need both --tls-cert and --tls-key"
+                "--tls-listen, --quic-listen and --https-listen need both --tls-cert \
+                 and --tls-key"
             ))
         }
         _ => None,
@@ -436,6 +447,15 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("--tls-listen {spec}"))?,
             tls::server_config(store.clone())?,
+        )),
+        _ => None,
+    };
+    let https_listener = match (&cli.https_listen, &tls_store) {
+        (Some(spec), Some(store)) => Some((
+            TcpListener::bind(spec)
+                .await
+                .with_context(|| format!("--https-listen {spec}"))?,
+            https::endpoint(store.clone(), &cli.https_path),
         )),
         _ => None,
     };
@@ -574,6 +594,21 @@ async fn main() -> anyhow::Result<()> {
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
+    if let Some((https_listener, endpoint)) = https_listener {
+        loops.spawn(https::serve(
+            https_listener,
+            endpoint,
+            Arc::new(Resolving {
+                resolver: resolver.clone(),
+                caches: caches.clone(),
+                ctx: ctx.clone(),
+            }),
+            TransportLimits::default(),
+            tcp::RateLimit::PerConnection,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+    }
     if let Some(endpoint) = quic_endpoint {
         loops.spawn(quic::serve(
             endpoint,

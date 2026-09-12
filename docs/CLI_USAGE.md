@@ -203,13 +203,15 @@ rdnsd --zone-dir ./zones --secondary example.com@192.0.2.1:5353
 `rdnsctl status` reports `secondary` from the configuration rather than inferring
 it from an absent last-contact time, which a primary also has.
 
-### `--tls-listen`, `--quic-listen`, `--tls-cert`, `--tls-key`
+### `--tls-listen`, `--quic-listen`, `--https-listen`, `--tls-cert`, `--tls-key`
 
-DNS over TLS (RFC 7858) and DNS over QUIC (RFC 9250), on the addresses given.
-853 is the assigned port for both, and they do not collide: DoT is TCP and DoQ
-is UDP, so an operator serving both writes the same number twice. Either
-listener needs the certificate pair, and one that has none is refused at startup
-rather than bound with nothing to present.
+DNS over TLS (RFC 7858), QUIC (RFC 9250) and HTTPS (RFC 8484), on the addresses
+given. 853 is the assigned port for the first two and they do not collide — DoT
+is TCP and DoQ is UDP, so an operator serving both writes the same number twice;
+DoH is 443, because it is meant to look like other HTTPS traffic and a port of
+its own would undo that. Any of the three needs the certificate pair, and a
+listener that has none is refused at startup rather than bound with nothing to
+present.
 
 These are *in addition to* the plain UDP and TCP listeners on `--port`, never
 instead of them. An authoritative server's clients are resolvers, and one that
@@ -232,6 +234,19 @@ files would be a certificate that expires on one port and not the other.
   ALPN is still served, because DoT predates the token. On DoQ `doq` *is*
   required — QUIC gives no other way to tell DNS from anything else, and there
   is no pre-ALPN deployment to be gentle with.
+- `--https-path` is the URI DoH answers on, `/dns-query` by default. RFC 8484
+  makes it a template rather than a constant. Anything else is a 404.
+- DoH takes both forms RFC 8484 §4.1 requires: `POST` with
+  `content-type: application/dns-message` and the bare message as the body, and
+  `GET ?dns=<base64url>`. The response carries the media type and a
+  `Cache-Control: max-age` taken from the smallest TTL in the answer (§5.1), so
+  an HTTP cache in the way cannot hold a record past its own lifetime. HTTP/2 is
+  offered first (§5.2 makes it the minimum recommended version) with HTTP/1.1
+  behind it, chosen by ALPN.
+- **A zone transfer cannot go over DoH.** One HTTP response is one DNS message
+  and RFC 8484 defines no framing for a sequence, so a handler that emits
+  several has its first answer sent and the rest dropped with a warning. DoT and
+  DoQ carry transfers normally.
 - DoQ is one query per client-initiated bidirectional stream, framed with the
   same 2-octet prefix as TCP. The stream is the request/response pairing, which
   is why RFC 9250 has a client set the DNS Message ID to zero. This server
@@ -259,6 +274,7 @@ zeroes, so an alert can be written before the feature is turned on.
 rdnsd --zone-dir ./zones \
   --tls-listen 0.0.0.0:853 \
   --quic-listen 0.0.0.0:853 \
+  --https-listen 0.0.0.0:443 \
   --tls-cert /etc/rdns/tls/fullchain.pem \
   --tls-key /etc/rdns/tls/privkey.pem
 ```

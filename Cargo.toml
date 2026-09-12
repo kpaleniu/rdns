@@ -58,6 +58,9 @@ tracing = "0.1"
 # and dropped. A dependency whose output nothing reads is §14's liability; turn
 # the feature and the bridge on together or neither.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+hyper = { version = "1.11", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server", "tokio"] }
+http-body-util = "0.1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # `default-features = false` drops `ansi` (output goes to a journal, not a

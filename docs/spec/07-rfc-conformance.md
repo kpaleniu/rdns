@@ -54,7 +54,7 @@ each row exists (`CLAUDE.md` §11).
 | 6672 | DNAME | **yes** (2026-09-06): §2.2's substitution incl. Table 1, §2.3's owner-not-redirected, §2.4/§3.3's load refusals, §2.5's uncompressed target, §3.1's synthesized CNAME, §3.2's server algorithm with YXDOMAIN on overflow, §3.4/§3.4.1's resolver half, §5.2's UPDATE rules and §5.3's DNSSEC. Obsoletes 2672 | `name::dname_redirect`, `Zone::dname_above`, `rdnsd/src/answer.rs`, `resolver.rs` |
 | 7858 | DNS over TLS | **yes**, both daemons — `TODO.md` #42a. Port 853, ALPN `dot`, one certificate re-read on every reload. No client certificates, and `notAfter` is not parsed: see `rdns-transport/src/tls.rs` | `rdns_transport::tls` |
 | 9250 | DNS over QUIC | **yes**, both daemons — `TODO.md` #42b. Port 853/udp, ALPN `doq`, one query per bidirectional stream framed as on TCP. The Message ID is echoed, never checked: the stream has already paired request with response | `rdns_transport::quic` |
-| 8484 | DNS over HTTPS | no — `TODO.md` #42c, the last stage of #42 | — |
+| 8484 | DNS over HTTPS | **yes**, both daemons — `TODO.md` #42c. 443, `/dns-query` by default, POST and GET, `Cache-Control` from the answer's smallest TTL. HTTP/2 preferred by ALPN with HTTP/1.1 behind it. A zone transfer cannot go over it and the module says why | `rdns_transport::https` |
 | 9432 | catalog zones | no — filed as `TODO.md` #44a | — |
 | 8914 | Extended DNS Errors | no — filed as `TODO.md` #44b | — |
 | 9103 | zone transfer over TLS | no — filed as `TODO.md` #44d, a fourth stage of #42 | — |

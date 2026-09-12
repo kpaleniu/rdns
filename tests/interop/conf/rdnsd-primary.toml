@@ -32,6 +32,9 @@ tls-listen = "0.0.0.0:853"
 # DoQ (#42b) on the same number: DoT is TCP and this is UDP, so they do not
 # collide, and it is the same certificate from the same store.
 quic-listen = "0.0.0.0:853"
+# DoH (#42c) on 443, which is the point of it: RFC 8484 wants the traffic to
+# look like other HTTPS traffic rather than to have a port of its own.
+https-listen = "0.0.0.0:443"
 tls-cert = "/etc/rdns/tls/cert.pem"
 tls-key = "/etc/rdns/tls/key.pem"
 

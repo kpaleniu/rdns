@@ -348,7 +348,15 @@ pub(crate) mod testing {
     }
 
     pub(crate) fn write_pem(tag: &str, name: &str) -> Pem {
-        let dir = std::env::temp_dir().join(format!("rdns-tls-{tag}-{}", std::process::id()));
+        // A counter as well as the pid, and it is not belt-and-braces: three DoH
+        // tests reused one tag, so they shared a directory, wrote cert.pem and
+        // key.pem over each other and loaded a mismatched pair. The `Drop` below
+        // then deleted a directory another test was still using. Unique per
+        // call, so reusing a tag cannot do that again.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("rdns-tls-{tag}-{}-{serial}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let issued =
             rcgen::generate_simple_self_signed(vec![name.to_string()]).expect("a certificate");

@@ -56,7 +56,6 @@ use rdns::{
     journal::Journal,
     logging::{watch_anomalies, AnomalyThresholds, LogLevel, QueryLogger},
     metrics::DnsMetrics,
-    metrics_server,
     notify::{self, NotifyOutcome, NotifyPeer, NotifyPolicy},
     readiness::Readiness,
     secondary::{state_file_path, MasterSpec, StateFile},
@@ -73,6 +72,8 @@ use rdns::{Name, NameRef, UdpSizes};
 // were the non-test callers, into `dispatch`.
 #[cfg(test)]
 use rdns::{clock::current_unix_timestamp, zone::parse_zone_file_at};
+use rdns_transport::https;
+use rdns_transport::metrics_server;
 use rdns_transport::quic;
 use rdns_transport::tcp;
 use rdns_transport::tls::{self, CertificateStore};
@@ -425,6 +426,21 @@ struct Cli {
     /// the same one, from the same store, reloaded by the same SIGHUP.
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     quic_listen: Option<String>,
+    /// Also answer DNS over HTTPS here (RFC 8484). Needs --tls-cert and --tls-key.
+    ///
+    /// 443 is the port, because DoH is meant to look like other HTTPS traffic
+    /// and a port of its own would undo that.
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
+    https_listen: Option<String>,
+    /// The path --https-listen answers on. RFC 8484 makes this a template
+    /// rather than a constant; /dns-query is what every deployment uses.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = rdns_transport::https::DEFAULT_PATH,
+        conflicts_with = "config"
+    )]
+    https_path: String,
     /// The PEM certificate chain --tls-listen and --quic-listen present. Leaf
     /// first.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
@@ -587,6 +603,9 @@ fn describe_encrypted(policy: &TlsPolicy) -> String {
     if let Some(addr) = &policy.doq {
         parts.push(format!("{addr} DoQ"));
     }
+    if let Some((addr, path)) = &policy.doh {
+        parts.push(format!("{addr}{path} DoH"));
+    }
     parts.join(", ")
 }
 
@@ -599,6 +618,8 @@ struct TlsPolicy {
     dot: Option<String>,
     /// Where to answer DNS over QUIC, if anywhere.
     doq: Option<String>,
+    /// Where to answer DNS over HTTPS, and on what path.
+    doh: Option<(String, String)>,
     /// One store for both, so a renewal reaches both listeners. Two stores over
     /// the same two files would be a certificate that expires on one port.
     store: Arc<CertificateStore>,
@@ -727,6 +748,15 @@ async fn serve(
                 .await
                 .with_context(|| format!("--tls-listen {addr}"))?,
             tls::server_config(policy.store.clone())?,
+        )),
+        None => None,
+    };
+    let https_listener = match tls.as_ref().and_then(|p| p.doh.as_ref().map(|d| (p, d))) {
+        Some((policy, (addr, path))) => Some((
+            TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("--https-listen {addr}"))?,
+            https::endpoint(policy.store.clone(), path),
         )),
         None => None,
     };
@@ -867,6 +897,17 @@ async fn serve(
     }
     if let Some(endpoint) = quic_endpoint {
         loops.spawn(quic::serve(
+            endpoint,
+            server.clone(),
+            TransportLimits::default(),
+            tcp::RateLimit::PerMessage,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+    }
+    if let Some((https_listener, endpoint)) = https_listener {
+        loops.spawn(https::serve(
+            https_listener,
             endpoint,
             server.clone(),
             TransportLimits::default(),
@@ -1638,7 +1679,8 @@ async fn main() -> Result<()> {
     // Loaded before anything binds, like every other thing that can stop the
     // start. A certificate that will not read is a DoT listener that answers
     // nothing, which is the failure `--metrics-listen` is already refused for.
-    let encrypted = cli.tls_listen.is_some() || cli.quic_listen.is_some();
+    let encrypted =
+        cli.tls_listen.is_some() || cli.quic_listen.is_some() || cli.https_listen.is_some();
     let tls_store = match (encrypted, &cli.tls_cert, &cli.tls_key) {
         (true, Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
         // In code rather than in clap's `requires`, because the config file has
@@ -1647,7 +1689,7 @@ async fn main() -> Result<()> {
         // cannot express as an "or".
         (true, _, _) => {
             return Err(anyhow!(
-                "tls-listen and quic-listen need both tls-cert and tls-key"
+                "tls-listen, quic-listen and https-listen need both tls-cert and tls-key"
             ))
         }
         _ => None,
@@ -1903,6 +1945,7 @@ async fn main() -> Result<()> {
             tls: tls_store.clone().map(|store| TlsPolicy {
                 dot: cli.tls_listen,
                 doq: cli.quic_listen,
+                doh: cli.https_listen.map(|addr| (addr, cli.https_path.clone())),
                 store,
             }),
             readiness,
