@@ -1,0 +1,9 @@
+; 43e: a zone large enough that its AXFR does not fit in one message.
+; $GENERATE is an ISC extension and BIND expands it here; what reaches rdnsd is
+; five thousand ordinary A records in however many envelopes BIND chooses.
+$ORIGIN big.test.
+$TTL 300
+@   IN SOA ns1.big.test. hostmaster.big.test. ( 1 3600 600 604800 60 )
+@   IN NS  ns1.big.test.
+ns1 IN A   10.53.0.7
+$GENERATE 1-5000 host$ IN A 198.51.100.1

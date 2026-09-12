@@ -1,0 +1,59 @@
+$ORIGIN example.com.
+$TTL 3600
+@       IN SOA ns1.example.com. hostmaster.example.com. ( 2026091101 3600 600 604800 300 )
+@       IN NS  ns1.example.com.
+@       IN NS  ns2.example.com.
+@       IN MX  10 mail.example.com.
+@       IN MX  20 mail2.example.com.
+@       IN A   192.0.2.1
+@       IN AAAA 2001:db8::1
+@       IN TXT "v=spf1 mx a:mail.example.com -all"
+ns1     IN A   192.0.2.2
+ns1     IN AAAA 2001:db8::2
+ns2     IN A   192.0.2.3
+ns2     IN AAAA 2001:db8::3
+www     IN A   192.0.2.10
+www     IN AAAA 2001:db8::10
+mail    IN A   192.0.2.25
+mail    IN AAAA 2001:db8::25
+mail2   IN A   192.0.2.26
+_dmarc  IN TXT "v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com"
+s2026._domainkey IN TXT ( "v=DKIM1; k=rsa; p=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" )
+pool    IN A   192.0.2.100
+pool    IN A   192.0.2.101
+pool    IN A   192.0.2.102
+pool    IN A   192.0.2.103
+pool    IN A   192.0.2.104
+pool    IN A   192.0.2.105
+pool    IN A   192.0.2.106
+pool    IN A   192.0.2.107
+pool    IN A   192.0.2.108
+pool    IN A   192.0.2.109
+pool    IN A   192.0.2.110
+pool    IN A   192.0.2.111
+pool    IN A   192.0.2.112
+pool    IN A   192.0.2.113
+pool    IN A   192.0.2.114
+pool    IN A   192.0.2.115
+pool    IN AAAA 2001:db8::64
+pool    IN AAAA 2001:db8::65
+pool    IN AAAA 2001:db8::66
+pool    IN AAAA 2001:db8::67
+pool    IN AAAA 2001:db8::68
+pool    IN AAAA 2001:db8::69
+pool    IN AAAA 2001:db8::6a
+pool    IN AAAA 2001:db8::6b
+pool    IN AAAA 2001:db8::6c
+pool    IN AAAA 2001:db8::6d
+pool    IN AAAA 2001:db8::6e
+pool    IN AAAA 2001:db8::6f
+pool    IN AAAA 2001:db8::70
+pool    IN AAAA 2001:db8::71
+pool    IN AAAA 2001:db8::72
+pool    IN AAAA 2001:db8::73
+*.wild  IN A   192.0.2.99
+secure  IN NS  ns.secure.example.com.
+secure  IN DS  12345 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+ns.secure IN A 192.0.2.20
+plain   IN NS  ns.plain.example.com.
+ns.plain IN A  192.0.2.30

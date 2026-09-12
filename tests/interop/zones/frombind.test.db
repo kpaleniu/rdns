@@ -1,0 +1,11 @@
+; 43b: BIND is the primary, rdnsd replicates. The EXPIRE is 45 seconds so the
+; branch CLAUDE.md §4 calls out — a zone out of contact with every master is
+; withdrawn, not served stale — is reachable inside a test run rather than in a
+; week.
+$ORIGIN frombind.test.
+$TTL 300
+@   IN SOA ns1.frombind.test. hostmaster.frombind.test. ( 1 10 5 45 60 )
+@   IN NS  ns1.frombind.test.
+ns1 IN A   10.53.0.7
+www IN A   198.51.100.10
+mail IN A  198.51.100.25

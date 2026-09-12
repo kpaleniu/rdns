@@ -5613,6 +5613,119 @@ that "zero-cost" is a claim about a compiler, not a fact about a diff.
 
 ---
 
+### 43. Nothing here has ever answered another implementation — ~~**filed 2026-09-11**~~ **closed 2026-09-12**
+
+BIND, Knot, NSD and Unbound appear eight times in this tree as *references for
+behaviour* — SRTT tracking in `resolver/caches.rs`, the IXFR delta rules in
+`ixfr.rs`, the flag-day defaults in `resolver.rs` and `edns.rs` — and **zero
+times as peers in a test**. dnspython validates signatures and TSIG, which is
+real third-party checking and more than most projects this size have; what it is
+not is another *nameserver*.
+
+`CLAUDE.md` §1 says a test that agrees with the code is not evidence. The
+project-level form of that rule is a suite that has only ever talked to itself,
+and this section is the one item on the page that could invalidate any of the
+others rather than add to them. **It goes first.**
+
+Needs a container runtime, which makes it the second thing after CI's `image`
+job that no local `cargo` invocation can stand in for.
+
+| | | |
+|---|---|---|
+| **43a** | `rdnsd` as primary, a real secondary pulling from it | BIND, NSD and Knot each configured as a secondary for a zone this serves. AXFR out, IXFR out, NOTIFY out, TSIG on all of it. **The specific thing to watch**: whether an IXFR is applied as a delta or silently falls back to a full AXFR. The fallback is legal (RFC 1995 §2), looks identical from the outside, and would make every `ixfr.rs` test a test of a code path nobody reaches |
+| **43b** | `rdnsd` as secondary, pulling from a real primary | The other direction: BIND and Knot as primaries, `rdnsd` replicating. NOTIFY in, IXFR in, and the EXPIRE path — which means holding a transfer down long enough for the timer to fire, since that is the branch `CLAUDE.md` §4 says degrades quietly |
+| **43c** | a validating resolver over every answer shape | Unbound with the zone's DS as a trust anchor, asked for each shape `rdnsd/src/response_size.rs` already enumerates: positive, NODATA, NXDOMAIN, wildcard, both referral kinds, NSEC and NSEC3, P-256 and P-384. This is the one that would find a denial-proof bug dnspython's per-RRset check structurally cannot — it verifies signatures, not whether the *set* of records proves what the answer claims |
+| **43d** | the clients, not just the servers | `nsupdate` sending a dynamic UPDATE, and `lego` or `certbot-dns-rfc2136` completing an ACME dns-01 challenge against `rdnsd`. #40f *measured* those requests down to the octet and this tree has never received one from the software that sends them |
+| **43e** | what a real peer sends that ours does not | The negative direction, and not a fuzzer — `tests/no_input_panics.rs` covers our own parser with mutated bytes. This is about the well-formed things another implementation does that we never generate: an AXFR split differently, a TSIG on an envelope we did not expect one on, an EDNS option we ignore |
+
+**What would refute a row rather than confirm it (§19)**: if every one of these
+passes first time, the section was cheap insurance and should say so. Writing the
+expectation down first, so it cannot be revised afterwards — **43a's IXFR
+fallback and 43c's NSEC3 shapes are where this is most likely to find
+something**; 43b and 43d are most likely to pass.
+
+---
+
+**Closed 2026-09-12**, the day after it was filed. The harness is
+`tests/interop/`, one `docker compose` network and one runner:
+
+```sh
+tests/interop/run.sh all          # images, setup, every scenario, teardown
+tests/interop/run.sh 43c          # one scenario against a network already up
+```
+
+**112 assertions, 0 failures, 1 skipped**, the skip being the one thing this
+section found — **#46**, which is filed and open. The peers, which are the
+point and so are printed by every run: **BIND 9.20.27**, **Knot 3.6.0**,
+**NSD 4.12.0**, **Unbound 1.23.1**, **ldns 1.8.4** and BIND's `nsupdate`,
+Knot's `kdig`/`knsupdate` and ldns's `drill` as clients.
+
+**Containment is asserted, not assumed.** The requirement was a private network
+that leaks nothing off the machine, and four checks say so before any scenario
+runs: the bridge is `internal: true`, no service publishes a host port, a
+container cannot route to 1.1.1.1, and no MASQUERADE rule exists for the
+subnet. The third is the one that could refute the other three, which is why it
+is there (§19).
+
+**What each row did:**
+
+| | |
+|---|---|
+| **43a** | BIND, Knot and NSD each AXFR'd all three zones with TSIG on first contact, and each replica compares **record for record** against the primary's — normalised and sorted, not sampled. **The row's prediction did not hold**: rdnsd served a real delta (`IXFR of example.org.: 1 record(s) across 1 version(s)`, 5 records against the zone's 8) to all three, and all three applied it incrementally. `ixfr.rs` is reached |
+| **43b** | AXFR in from both BIND and Knot, replicas identical to the originals. A TSIG-signed `nsupdate` on each primary made it write a journal, and rdnsd applied the refresh as `1 incremental step(s)` from both — woken by the NOTIFY, not by a timer. EXPIRE was provoked rather than read: `frombind.test.` carries a 45-second EXPIRE, and with BIND stopped rdnsd **withdrew** the zone (REFUSED) rather than serving it stale, then recovered when the primary came back |
+| **43c** | 34 shapes across both chains — NSEC/P-256 and NSEC3/P-384 — every one AD, including the two empty non-terminals, the wildcard's NODATA, and both referral kinds. **The row's other prediction did not hold either.** Two things make the AD bits mean something: a **control delegation** (`bogus.example.com.`, correctly signed, deliberately wrong DS in the parent) that Unbound SERVFAILs and answers under `+cd`, and `ldns-verify-zone` over the whole transferred zone offline — a fourth implementation, checking the *chain's completeness* rather than one answer — which also rejects the same zone with one owner name moved |
+| **43d** | `nsupdate` adds and deletes; the ACME dns-01 shape round-trips (`_acme-challenge` TXT in, read back, removed). The authorization half is checked too: the same key is refused on a zone it is not scoped for and nothing is written, and an unsigned UPDATE changes nothing (§16). `kdig` and `drill` agree with `dig` |
+| **43e** | The multi-envelope path, which every other row's zones were too small to reach: rdnsd **sends** a 5,004-record AXFR in **11 messages** and **receives** BIND's 5,003-record one intact, TSIG verified throughout (dig abandons a transfer whose TSIG fails, so reaching the trailer with the full count *is* the assertion). A DNS COOKIE, an NSID request, an unknown EDNS option and unknown EDNS flags are all ignored without disturbing the answer; EDNS version 1 gets BADVERS; an unknown RR type is a clean NODATA; a 0x20-randomised QNAME comes back with its case intact; ANY is answered; a CHAOS question is REFUSED rather than answered out of the IN zone |
+
+**The filing asked to be refuted and mostly was.** It named 43a's IXFR fallback
+and 43c's NSEC3 shapes as where this was most likely to find something, and
+neither did. What it found is in NOTIFY, which no row mentioned. So the honest
+summary is the one the row asked for in advance: **cheap insurance**, plus one
+gap in a corner nobody had pointed at.
+
+**Three of the first five "findings" were the harness**, and they are recorded
+because the ratio is the lesson (§19 — a measurement that agrees with you is not
+evidence):
+
+- **Unbound SERVFAILed both referral kinds**, which reads exactly like a broken
+  denial proof. It was the rebinding filter: the child servers' glue is
+  `10.53.0.11`, 10/8 is on Unbound's default `private-address` list, and the
+  glue was being stripped. Worse, `unbound.conf` carried a comment of mine
+  saying the filter had nothing to catch here — true when it was written, and
+  false the moment 43c needed a child a validator could reach. `private-domain`
+  is the fix and the corrected comment is in the file.
+- **EDNS version 1 appeared to be answered NOERROR**, i.e. a plain RFC 6891
+  §6.1.3 violation, and `rdns-core`'s own unit test said otherwise. `dig` prints
+  `BADVERS, retrying with EDNS version 0` and then shows the *retry's* answer;
+  grepping its output finds the second one. `kdig` says `status: BADVERS` and is
+  what the check uses now.
+- **A config change to test whether BIND could require a keyed NOTIFY did
+  nothing at all**: `docker cp` into a read-only bind mount fails silently, so
+  the measurement measured the unmodified config and "BIND accepted it" meant
+  nothing. Redone through the mounted file, BIND *does* accept an unsigned
+  NOTIFY even with `allow-notify { key ...; }`, because it always accepts one
+  from a configured primary — which is why #46 names NSD and Knot and not BIND.
+
+A fourth was quieter: `ldns-verify-zone` prints nothing on success, so "no
+output" was read as failure. It asserts on the exit status now, with a
+deliberately corrupted copy beside it, because an exit status of 0 and a tool
+that checked nothing are the same observation.
+
+**Two zones are the tree's own.** `tests/interop/zones/example.com.zone` is
+extracted from `rdnsd/src/response_size.rs`'s `ZONE` by `awk` rather than
+retyped, so 43c asks about the shapes that file already measures; `example.net.`
+is the same zone renamed, signed NSEC3/P-384. `setup()` changes exactly two glue
+addresses in the copies and appends the control delegation, and says why in the
+comment beside each.
+
+**Not done, and deliberately:** `lego` and `certbot-dns-rfc2136` were named in
+43d and are not here. The dns-01 *shape* is — add the challenge TXT under a
+scoped key, read it back, remove it — and what those two clients would add over
+`nsupdate` is an ACME server to talk to, which this network has no route to by
+construction. If it is worth doing it is worth its own number.
+
+---
+
 ### 41. Nothing caps the UDP response this server will send — ~~**filed 2026-09-11**~~ **closed 2026-09-11**
 
 Found by #40f, which was about the *request* caps and floored one of them at the

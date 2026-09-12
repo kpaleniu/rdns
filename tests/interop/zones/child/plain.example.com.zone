@@ -1,0 +1,10 @@
+; 43c's insecure referral. Unsigned on purpose and no DS in the parent, so what
+; a validator has to check here is the *denial* — the NSEC or NSEC3 proving the
+; parent holds no DS for this name. That is the proof CLAUDE.md sec 8 says is
+; owed and the one dnspython's per-RRset check cannot ask for.
+$ORIGIN plain.example.com.
+$TTL 3600
+@    IN SOA ns.plain.example.com. hostmaster.example.com. ( 2026091101 3600 600 604800 300 )
+@    IN NS  ns.plain.example.com.
+ns   IN A   10.53.0.11
+www  IN A   192.0.2.202

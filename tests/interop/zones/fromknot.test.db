@@ -1,0 +1,9 @@
+; 43b: Knot is the primary. Ordinary timers — this zone is the IXFR-in half, and
+; frombind.test. is the one with the short EXPIRE.
+$ORIGIN fromknot.test.
+$TTL 300
+@   IN SOA ns1.fromknot.test. hostmaster.fromknot.test. ( 1 3600 600 604800 60 )
+@   IN NS  ns1.fromknot.test.
+ns1 IN A   10.53.0.8
+www IN A   198.51.100.11
+mail IN A  198.51.100.26

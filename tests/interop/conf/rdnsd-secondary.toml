@@ -1,0 +1,21 @@
+# rdnsd replicating from BIND and from Knot (43b).
+[server]
+host = "0.0.0.0"
+port = 5353
+zone-dir = "/etc/rdns/zones"
+query-rate = 0
+metrics-listen = "0.0.0.0:9153"
+
+[keys."interop.key."]
+algorithm = "hmac-sha256"
+secret = "DIgmHeQfYvAHq1dJuoah8wGGbWNisBT3457iG6YMdhE="
+
+[zones."frombind.test."]
+masters = ["10.53.0.7#interop.key."]
+
+[zones."fromknot.test."]
+masters = ["10.53.0.8#interop.key."]
+
+# 43e: the zone whose AXFR arrives in several messages.
+[zones."big.test."]
+masters = ["10.53.0.7#interop.key."]

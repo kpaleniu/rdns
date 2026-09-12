@@ -1,0 +1,178 @@
+# TODO.md #43: the peers this tree had never answered.
+#
+# Containment, which is a requirement of this harness and not an afterthought:
+#
+#   * the network is `internal: true`, so Docker installs no masquerade rule and
+#     no route off the bridge. A container here cannot reach the internet and
+#     nothing on the internet can reach it. run.sh asserts this rather than
+#     trusting it — see `assert_contained`.
+#   * no service publishes a port. Nothing binds an address on the Linux host,
+#     and therefore nothing on the Windows host either.
+#   * every probe runs from the `tools` container, inside the network. There is
+#     deliberately no path from outside in, so there is no way to probe from
+#     outside either.
+#
+# Addresses are static because the configs name them: a secondary's ACL is an
+# address, and "whatever the DNS said" is not available to a DNS server's own
+# bootstrap.
+
+name: rdns-interop
+
+networks:
+  interop:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.53.0.0/24
+
+volumes:
+  primary-zones:
+  primary-keys:
+  child-zones:
+  child-keys:
+  secondary-zones:
+  bind-sec-state:
+  bind-pri-state:
+  knot-sec-state:
+  knot-pri-state:
+  nsd-state:
+
+services:
+
+  # ---- 43a: rdnsd is the primary, three real secondaries pull from it -------
+
+  rdnsd-primary:
+    image: rdns:local
+    networks:
+      interop:
+        ipv4_address: 10.53.0.2
+    volumes:
+      - ./conf/rdnsd-primary.toml:/etc/rdns/rdnsd.toml:ro
+      - primary-zones:/etc/rdns/zones
+      - primary-keys:/etc/rdns/keys
+    command: ["--config", "/etc/rdns/rdnsd.toml"]
+    stop_grace_period: 10s
+
+  bind-secondary:
+    image: internetsystemsconsortium/bind9:9.20
+    networks:
+      interop:
+        ipv4_address: 10.53.0.3
+    volumes:
+      - ./conf/bind-secondary.conf:/etc/bind/named.conf:ro
+      - bind-sec-state:/var/cache/bind
+    entrypoint: ["/usr/sbin/named"]
+    command: ["-u", "bind", "-g", "-c", "/etc/bind/named.conf"]
+
+  knot-secondary:
+    image: cznic/knot:latest
+    networks:
+      interop:
+        ipv4_address: 10.53.0.4
+    volumes:
+      - ./conf/knot-secondary.conf:/config/knot.conf:ro
+      - knot-sec-state:/storage
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "mkdir -p /storage/run /storage/db /storage/zones && exec knotd -c /config/knot.conf"
+
+  nsd-secondary:
+    image: rdns-interop-peers:local
+    networks:
+      interop:
+        ipv4_address: 10.53.0.5
+    volumes:
+      - ./conf/nsd-secondary.conf:/etc/nsd/nsd.conf:ro
+      - nsd-state:/var/db/nsd
+    command: ["nsd", "-d", "-c", "/etc/nsd/nsd.conf"]
+
+  # The two children of example.com., on port 53 because a referral carries an
+  # address and no port. 43c's two referral shapes end here.
+  rdnsd-child:
+    image: rdns:local
+    networks:
+      interop:
+        ipv4_address: 10.53.0.11
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "53"
+    volumes:
+      - ./conf/rdnsd-child.toml:/etc/rdns/rdnsd.toml:ro
+      - child-zones:/etc/rdns/zones
+      - child-keys:/etc/rdns/keys
+    command: ["--config", "/etc/rdns/rdnsd.toml"]
+    stop_grace_period: 10s
+
+  # ---- 43c: a validating resolver over every answer shape -------------------
+  #
+  # The anchor file is written by run.sh from the DS `--generate-keys` printed,
+  # so the DS-to-DNSKEY link is part of what is tested rather than assumed.
+
+  unbound:
+    image: rdns-interop-peers:local
+    networks:
+      interop:
+        ipv4_address: 10.53.0.6
+    volumes:
+      - ./conf/unbound.conf:/etc/unbound/unbound.conf:ro
+      - ./run/anchors.key:/etc/unbound/anchors.key:ro
+    command: ["unbound", "-d", "-c", "/etc/unbound/unbound.conf"]
+
+  # ---- 43b: rdnsd is the secondary, two real primaries push to it -----------
+
+  bind-primary:
+    image: internetsystemsconsortium/bind9:9.20
+    networks:
+      interop:
+        ipv4_address: 10.53.0.7
+    volumes:
+      - ./conf/bind-primary.conf:/etc/bind/named.conf:ro
+      - ./zones/frombind.test.db:/etc/bind/zones/frombind.test.db:ro
+      - ./zones/big.test.db:/etc/bind/zones/big.test.db:ro
+      - bind-pri-state:/var/cache/bind
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      # Copied rather than mounted: a dynamic-update primary rewrites its zone
+      # file and writes a journal beside it, which is the whole point of 43b's
+      # IXFR half.
+      - "cp -n /etc/bind/zones/*.db /var/cache/bind/ && chown bind:bind /var/cache/bind/*.db && exec /usr/sbin/named -u bind -g -c /etc/bind/named.conf"
+
+  knot-primary:
+    image: cznic/knot:latest
+    networks:
+      interop:
+        ipv4_address: 10.53.0.8
+    volumes:
+      - ./conf/knot-primary.conf:/config/knot.conf:ro
+      - ./zones/fromknot.test.db:/etc/knot/zones/fromknot.test.db:ro
+      - knot-pri-state:/storage
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "mkdir -p /storage/run /storage/db /storage/zones && cp -n /etc/knot/zones/fromknot.test.db /storage/zones/fromknot.test.zone && exec knotd -c /config/knot.conf"
+
+  rdnsd-secondary:
+    image: rdns:local
+    networks:
+      interop:
+        ipv4_address: 10.53.0.9
+    volumes:
+      - ./conf/rdnsd-secondary.toml:/etc/rdns/rdnsd.toml:ro
+      - secondary-zones:/etc/rdns/zones
+    command: ["--config", "/etc/rdns/rdnsd.toml"]
+    stop_grace_period: 10s
+
+  # ---- the probes, and 43d's clients ---------------------------------------
+
+  tools:
+    image: rdns-interop-peers:local
+    networks:
+      interop:
+        ipv4_address: 10.53.0.10
+    volumes:
+      - ./zones:/srv/zones:ro
+      - ./run:/srv/run
+      - primary-zones:/srv/primary-zones
+      - primary-keys:/srv/primary-keys
+      - child-zones:/srv/child-zones
+      - child-keys:/srv/child-keys
+    command: ["sleep", "infinity"]

@@ -1,0 +1,39 @@
+# rdnsd as the primary every peer pulls from (43a), signs for (43c) and is
+# updated over (43d).
+#
+# A config file rather than flags because --config and any other setting are
+# mutually exclusive by design, and because a TSIG secret in argv is visible in
+# `ps`. The secret below is a throwaway for an internal network with no route
+# off this machine; it is in the tree so a rerun measures the same thing.
+
+[server]
+host = "0.0.0.0"
+# 5353: this image runs as uid 65532 and an unprivileged process cannot bind 53.
+# Every peer is told the port explicitly, which is itself worth testing — a
+# primary on a non-default port is the shape a container deployment has.
+port = 5353
+zone-dir = "/etc/rdns/zones"
+allow-transfer = ["10.53.0.0/24"]
+also-notify = ["10.53.0.3", "10.53.0.4", "10.53.0.5"]
+# Off, not raised: the limiter drops in silence, and three secondaries starting
+# at once against one primary is exactly the burst it would eat.
+query-rate = 0
+metrics-listen = "0.0.0.0:9153"
+
+[signing]
+key-dir = "/etc/rdns/keys"
+validity-days = 30
+
+[keys."interop.key."]
+algorithm = "hmac-sha256"
+secret = "DIgmHeQfYvAHq1dJuoah8wGGbWNisBT3457iG6YMdhE="
+zones = ["*"]
+# Narrow on purpose: example.org. is the unsigned zone, and an UPDATE that could
+# rewrite the signed ones would make 43d's result depend on the signer.
+update-zones = ["example.org."]
+
+# NSEC3 and P-384 for this one, so 43c asks every denial shape twice over. The
+# algorithm comes from the key file, which run.sh generates with
+# --key-algorithm ECDSAP384SHA384.
+[zones."example.net."]
+nsec3 = true

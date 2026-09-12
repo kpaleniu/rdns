@@ -1,0 +1,13 @@
+; 43c's control, and the reason the rest of 43c means anything. This zone is
+; correctly signed with its own key; what is wrong is the DS in the parent,
+; which setup() leaves as response_size.rs's placeholder digest. A validator
+; must call this bogus -- SERVFAIL -- and must return the data under +cd.
+;
+; Without it, "every shape came back AD" is equally consistent with a validator
+; that is not validating (CLAUDE.md sec 19).
+$ORIGIN bogus.example.com.
+$TTL 3600
+@    IN SOA ns.bogus.example.com. hostmaster.example.com. ( 2026091101 3600 600 604800 300 )
+@    IN NS  ns.bogus.example.com.
+ns   IN A   10.53.0.11
+www  IN A   192.0.2.205

@@ -1,0 +1,11 @@
+; 43c's secure referral, made answerable. The parent's delegation for `secure`
+; is in the zone response_size.rs measures; what that zone does not have is a
+; child a validator can actually reach, so this is one. rdnsd signs it and
+; setup() puts its real DS into the parent, which is what makes the referral a
+; chain rather than an assertion.
+$ORIGIN secure.example.com.
+$TTL 3600
+@    IN SOA ns.secure.example.com. hostmaster.example.com. ( 2026091101 3600 600 604800 300 )
+@    IN NS  ns.secure.example.com.
+ns   IN A   10.53.0.11
+www  IN A   192.0.2.201

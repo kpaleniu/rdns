@@ -1,0 +1,16 @@
+# Line endings for the files a Linux tool reads.
+#
+# This is a Windows clone with core.autocrlf=true, so without these lines a
+# checkout hands `tests/interop/run.sh` a CRLF shebang — which bash rejects
+# outright — and hands the peers' configs and zone files to daemons running
+# inside containers. A zone file is parsed byte for byte, so a stray \r is not
+# cosmetic there either.
+#
+# Rust sources are deliberately left alone: rustfmt and the compiler do not
+# care, and normalising them would be a whole-tree diff for nothing (§12's rule
+# about never mixing a reformat into a change).
+*.sh              text eol=lf
+*.yml             text eol=lf
+Dockerfile        text eol=lf
+Dockerfile.*      text eol=lf
+tests/interop/**  text eol=lf

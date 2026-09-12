@@ -1,0 +1,36 @@
+# The four peers this tree has never answered, plus the clients that send the
+# requests #40f measured. One image: they share a base, and a container picks
+# its role with a command rather than with a tag.
+#
+# Alpine because it carries all four current — NSD and Unbound are not on Docker
+# Hub under NLnet Labs' name, and Debian stable's are two releases behind. BIND
+# and Knot run from their projects' own images (see docker-compose.yml); what is
+# here is their *client* tools, which is what 43d needs.
+FROM alpine:3.22
+
+# Pinned so a rerun next month measures the same peers. Versions are printed by
+# run.sh into the report, because "interop passed" without them names nothing.
+#
+# ldns earns its place twice over: `drill` is a third client encoding, and
+# `ldns-verify-zone` is a fourth DNSSEC implementation that checks a whole
+# signed zone offline — every RRSIG and the completeness of the denial chain,
+# which is the question 43c exists to ask.
+RUN apk add --no-cache \
+      nsd=4.12.0-r0 \
+      unbound=1.23.1-r1 \
+      bind-tools=9.20.26-r0 \
+      knot-utils=3.4.9-r0 \
+      ldns-tools=1.8.4-r0 \
+      drill=1.8.4-r0 \
+      python3 py3-dnspython py3-cryptography \
+      tcpdump bash jq
+
+# Unbound's package ships a root trust anchor and an auto-update service; this
+# network has no root and no internet, so neither can run. The conf mounted at
+# runtime says so too — this only keeps the package's copy from being found.
+RUN rm -f /etc/unbound/root.key /usr/share/dnssec-root/trust-anchor.key 2>/dev/null || true
+
+RUN mkdir -p /var/db/nsd /var/run/nsd /var/lib/unbound \
+    && chown -R nsd:nsd /var/db/nsd /var/run/nsd 2>/dev/null || true
+
+CMD ["sleep", "infinity"]

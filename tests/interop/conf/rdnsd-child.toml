@@ -1,0 +1,17 @@
+# The two children of example.com., so 43c's referral shapes end somewhere.
+#
+# Port 53, unlike every other rdnsd here: a validator follows a delegation to
+# the address in the glue and asks it on 53, and there is nowhere in a referral
+# to write a port. The Dockerfile's own escape hatch is used for it --
+# net.ipv4.ip_unprivileged_port_start=53 in docker-compose.yml -- rather than
+# running the image as root.
+[server]
+host = "0.0.0.0"
+port = 53
+zone-dir = "/etc/rdns/zones"
+allow-transfer = ["10.53.0.0/24"]
+query-rate = 0
+
+[signing]
+key-dir = "/etc/rdns/keys"
+validity-days = 30
