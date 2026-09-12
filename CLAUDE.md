@@ -441,6 +441,13 @@ Terse. Facts, not essays. Say why, in as few words as it takes, then stop.
 - Do not quietly edit a claim in `TODO.md` that turned out to be wrong. Correct it
   in place with a pointer and leave the reasoning that produced it — that
   reasoning is why the bug happened.
+- **That applies to a claim, not to a status line.** "What is open" was never
+  *wrong*; it stopped being current. Striking it through and writing the next one
+  underneath preserves no reasoning, because there was no mistake to learn from —
+  and by 2026-09-12 it had produced eleven struck restatements of a fact the
+  closed-work table already held, two of them nested into markdown that no longer
+  rendered. Overwrite a status line; strike a claim. The test is whether somebody
+  reading the struck version learns why something went wrong.
 - The numbered sections in `TODO.md` are stable identifiers referenced from the
   code and from each other. Move them, never renumber them.
 

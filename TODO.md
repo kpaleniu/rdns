@@ -37,72 +37,27 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-~~**One inventory and one numbered section**, as of 2026-09-08.~~ ~~**One
-inventory**, later the same day: #37 closed on the day it was filed.~~
-**One inventory and one numbered section again, 2026-09-09**: **#38**, from a
-structural review asked for that day. Its three fixes are committed and ~~five
-sub-items are open~~ — ~~**four and a half, later the same day**: 38d's `rdnsr`
-half is done and its `rdnsd` half is not~~ ~~**three and a half on 2026-09-10**,
-38b having gone too~~ ~~**two and a half the same day**, 38e having gone as well —
-its cross-crate half decided against rather than done, which the row explains~~
-~~**one and a half**, 38c having gone too: **38a**, and 38d's `rdnsd` half~~
-~~**half of one**, 38a having gone as well: 38d's `rdnsd` half is all that is left,
-and it is the one that needs an argument with #20 rather than a session.~~
-~~**None of #38, and #39 and #40 on 2026-09-10**~~ — 38d closed the same day: the argument was taken, taking
-it filed the API shape it depends on (#39), and a pass over the joints between
-the internal APIs filed #40. None of #38 was a defect; #39 carries one, #40
-none. ~~**One inventory and one numbered section again, 2026-09-11**: #39 closed
-with 39d, so what is open is **#40**'s ~~40d and 40f~~ **40f**, 40d having gone
-the same day, and #21.~~ ~~**One inventory and one numbered section still, later
-the same day**: #40 closed with 40f, which filed **#41** on its way out — the
-advertised payload size is a hardcoded 4,096 and nothing caps the UDP response at
-all. Two items, neither a defect, and 41b carries the measurement to take first.~~
-~~**Still one inventory and one numbered section, later again**: 41a and 41b are
-done — the measurement first, then one type for both — and the pass filed **41c**
-(the resolver's *upstream* advertisement, which is the same hardcode wearing a
-receive buffer) and **41d** (a TSIG-signed reply overshoots the new ceiling by
-the record it appends). So #41 is still what is open, and so is #21.~~
-~~**One inventory, later the same day again**: 41c and 41d are done too, so #41 is
-closed on the day it was filed and **#21 is all that is left** — and #21 is not a
-queue. Nothing was filed on the way out this time: both rows' remedies survived
-being built, 41d's with a better shape than the row proposed (RFC 8945 §5.3 had
-already written it down) and 41c's with the number it names *rejected* by one
-measurement, which the section records.~~ ~~**One inventory and one numbered
-section again, later still the same day**: **#42**, the three encrypted
-transports, taken off #21's own list — the third time that list has been read by
-a session with no queue and used to pick the work, which is what it is for. Three
-stages of one item, filed with the dependency measurement the #21 line had
-asserted without ever taking.~~ ~~**One inventory and four numbered sections, end
-of the same day**: #42, and **#43**, **#44** and **#45** from asking what stands
-between this server and one an operator could run a fleet of. #43 is the one
-that goes first — it is the only section that could *invalidate* the others
-rather than add to them, since nothing here has ever answered another
-implementation. Seventeen rows across the three, of which **nine are a `grep`
-that returned zero**, counted rather than estimated on the day of filing.~~
-~~**One inventory and four numbered sections still, 2026-09-12**: #43 went first,
-as it said it would, and closed the day after it was filed — five rows, 112
-assertions against BIND, Knot, NSD and Unbound, nothing in any row refuted. It
-filed **#46** on its way out, which is the only thing it found and is in NOTIFY,
-a corner none of its five rows had named. So what is open is #42, #44, #45, #46
-and #21.~~ ~~**One inventory and three numbered sections, later the same day**:
-#46 closed too, and it had grown a third item on the way — the per-zone
-`also-notify` that was parsed and read by nothing. The harness #43 left behind
-is what proved the fix, which is the first time anything here has been checked
-against another implementation rather than against itself: 117 assertions now,
-and the NOTIFY row fails if the signing is taken back out. So **#42, #44, #45
-and #21**.~~ **One inventory and two numbered sections, end of 2026-09-12**: #42
-went as well, all three stages — DoT, DoQ and DoH, each proved against Knot's
-client in the harness #43 left behind. So **#44, #45 and #21**.
+**#44**, **#45** and **#21**, as of 2026-09-12. #44 is what an operator would
+find missing in `rdnsd`, #45 what an ISP would find missing in `rdnsr`, and #21
+is an inventory of deliberate deviations rather than a queue. Everything else
+numbered is closed; the table under "Closed work" says which, when, and where
+the reasoning went.
 
-- ~~**#37** — where a module folder pays, and where it is motion. Four items, of
-  which one (37a, five name helpers #35 and #36 left behind) is the only one
-  with teeth; the rest are preventative. Filed with the measurement #33's rule
-  demands, which for a split is *visibility* and not line count. **37a is done
-  (2026-09-08)** and was a defect, not a cleanup — see the section. 37b-37d
-  remain, and remain preventative.~~ **All four done 2026-09-08, the day it was
-  filed**; the section is in `docs/CLOSED_WORK.md`. 37a was a defect, 37b, 37c
-  and 37d each corrected the count in their own row, and 37d dropped the fifth
-  module its row asked for because it would have widened rather than sealed.
+**This sentence goes stale faster than anything else on the page** — nine times
+by the page's own count, and the record is in `docs/CLOSED_WORK.md` under "How
+the queue kept going stale". It used to be corrected the way a wrong *claim* is,
+by striking the old one through and writing the next underneath, and by
+2026-09-12 that was eleven struck restatements of a fact the table already held,
+two of them nested into markdown that no longer rendered.
+
+So the chain is gone and the table is the authority. The distinction that
+survives is the one `CLAUDE.md` §11 actually draws: a claim that turned out to
+be **wrong** keeps its strike-through and its correction, because the reasoning
+that produced it is why the bug happened — the measurements under "Current
+state" are all of that kind and are untouched. A status line that merely stopped
+being current is not that, and deleting it loses nothing the table does not
+hold.
+
 - **#21** — the four deliberate RFC deviations and the not-implemented list.
   **Not a queue.** It exists so the next person to notice one finds the decision
   instead of re-deriving it. If one is ever taken up it gets its own number.
@@ -149,20 +104,25 @@ are read below.
 
 **A count in a preamble goes stale whenever the list under it changes**, which
 happened to this page's summary paragraphs at least ~~eight~~ ~~nine~~ **ten**
-times
-between 2026-07-30 and 2026-09-06 — the ninth is the `docs/CLOSED_WORK.md`
-section count above, found wrong on 2026-09-06 and already wrong on the day it
-was written — each corrected in place rather than reworded. The record is kept
-under "How the queue kept going stale" in `docs/CLOSED_WORK.md`, because the
-shape is the lesson. What this rewrite did about it is not a better paragraph
-but a shorter list: two items cannot drift from a summary of two items. ~~It is
-one item as of 2026-09-06~~ — ~~**two as of 2026-09-08**, #37 having been filed,~~
-**one again the same day**, #37 having closed,
-and the summary above was corrected in the same commit both times rather than a
-later one, which is the only way this has ever stayed true. Not a tenth
-staleness: a count updated with the list it counts is the behaviour, not the
-failure. Whether it holds is a question for the next reader who finds this page
-wrong.
+times between 2026-07-30 and 2026-09-06 — the ninth is the
+`docs/CLOSED_WORK.md` section count above, found wrong on 2026-09-06 and already
+wrong on the day it was written. The record is kept under "How the queue kept
+going stale" in `docs/CLOSED_WORK.md`, because the shape is the lesson.
+
+**Two remedies have been tried.** The first was a *shorter list*: two items
+cannot drift from a summary of two items. That held while the list stayed at
+two, and then four days of filing and closing turned the summary into eleven
+struck restatements of itself. The second, on **2026-09-12**, was to *delete the
+chain* — the summary above is one sentence now, and the table under "Closed
+work" is the authority it points at.
+
+The reasoning for the change is the reasoning §11 gives for the opposite: a
+strike-through is kept because it preserves *why a claim was wrong*. A status
+line was never wrong, it merely stopped being current, so striking it preserved
+nothing the table did not already hold — while costing every reader the whole
+history of a fact they had come to look up the current value of. The five wrong
+claims below are a different thing and stay. Whether *that* distinction holds is
+a question for the next reader who finds this page wrong.
 
 **The five claims on this page that were wrong**, kept because the reasoning is
 the useful part (`CLAUDE.md` §11 — correct in place, never quietly):
@@ -847,87 +807,26 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-~~Two sections: **#37**, which is open work, and **#21**, which is an inventory
-rather than a queue.~~ ~~**One section as of 2026-09-08**, #37 having closed the
-day it was filed: **#21**, which is an inventory rather than a queue.~~
-~~**Two again as of 2026-09-09**: **#38**, whose five open sub-items are cleanups,
-and **#21**, which is an inventory rather than a queue.~~ ~~**Four as of
-2026-09-10**: **#38**, one sub-item of which is left, **#39**, the answering
-path's shape, **#40**, the joints between the internal APIs, and **#21**, which
-is an inventory rather than a queue.~~ ~~**Two as of 2026-09-11**, #38 having closed
-on 2026-09-10 and #39 on 2026-09-11: **#40**, ~~two sub-items of which are left
-(40d, 40f)~~ **one of which is left (40f)**, and **#21**.~~ ~~**Two still, later
-that day**: #40 closed and filed **#41**, whose two items are open.~~ ~~**Two
-again, later still**: #41 closed the day it was filed and **#42** — the three
-encrypted transports — was filed off #21's list, so the pair is #42 and #21.~~
-~~**Five at the end of that day**: #42, #43 (interop against a real peer), #44
-(what an operator would find missing in `rdnsd`), #45 (what an ISP would find
-missing in `rdnsr`), and #21.~~ ~~**Five still, 2026-09-12**: #43 closed and filed
-**#46** (`rdnsd` cannot sign a NOTIFY), so the five are #42, #44, #45, #46 and
-#21.~~ ~~**Four, later the same day**: #46 closed as well, so #42, #44, #45 and
-#21.~~ **Three, end of that day**: #42 closed too, all three stages. So **#44**,
-**#45** and **#21**. Every closed section is in `docs/CLOSED_WORK.md`.
-Everything
-else numbered is under "Closed work" below; #38's, #39's, #40's and #41's
-sections went
-across to `docs/CLOSED_WORK.md`, which is where a closed section
-lives.
+**#44**, **#45** and **#21** — see "What is open" above, which is the same list
+and the only place it is written down. Every closed section lives in
+`docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
+referenced from the code, so they move rather than being renumbered.
 
 ### Where to pick up next
 
-Everything here is a choice, not a queue. ~~One thing, with #33 and #34 both
-closed~~ — that was the state on 2026-09-07; ~~**#37 was filed on 2026-09-08** and
-is the only numbered work open.~~ ~~It is still a choice: 37a is worth taking on
-its own~~ — 37a was taken the day it was filed, because checking its own open
-question turned it into a defect report. ~~**37b-37d are what is left**~~ —
-~~37b and 37c were taken on 2026-09-08 too. **37d is what is left**, and it is
-explicitly "when that code is next opened".~~ ~~**All four were taken on
-2026-09-08**, so nothing numbered is open and this heading has nothing under
-it.~~ **#38 was filed on 2026-09-09** and five of its sub-items are open, so
-this heading has something under it again — for a day, at least.
-The four strike-throughs above are one day's worth, which is the argument for
-this heading being short: a paragraph naming what is next is wrong as soon as
-somebody does it.
+Everything here is a choice, not a queue, and this heading is deliberately
+short. Its own previous contents made the argument: four strike-throughs
+accumulated in a single day, under a sentence observing that "a paragraph naming
+what is next is wrong as soon as somebody does it". It was right, so the
+paragraph is gone.
 
-~~**Of #38's five, take 38d's `rdnsr` half first.** It is the only one that has
-never had the judgement made about it: `rdnsd` was split in #20 and the decision
-not to split it further was taken deliberately, while `rdnsr` simply never got a
-first split.~~ **Taken 2026-09-09**, the day after it was filed; the row says
-what the split was and what it measured. ~~**38a and 38c are moves with no
-behaviour in them**~~ (**38c taken 2026-09-10**, and it was not a move with no
-behaviour in it: it deleted three things nothing called and found four symbols
-`docs/spec/` names that do not exist), ~~**38b is a small operational gap**~~
-(taken 2026-09-10), and ~~**38e is half an hour**~~ (taken the same day, and it
-was two hours: the count came out at eight instances rather than three) —
-~~and 38d's other half, `rdnsd`'s fourth seam, is the one #20 already decided
-against once, so it wants an argument rather than a session.~~ **The argument
-was taken 2026-09-10**: the row carries the measurement, and it turned up the
-API shape that decides it — **#39**, one dispatcher instead of two. ~~Take #39
-first; 38d falls out of it.~~ ~~**39a and 39b are done (2026-09-10)**, and
-38d went with them, so #38 is closed and what is left is 39c, 39e and #40.~~
-**#39 closed 2026-09-11**: 39c and 39e went on 2026-09-10, 39d on 2026-09-11.
-~~**#40's 40d and 40f are what is left**, and neither is a defect — one is twelve
-modules with no membership rule, the other is two caps with no flag and a
-measurement to take before adding one.~~ ~~**40d went the same day and 40f is what
-is left**: two admission caps with no flag, and §14's own warning to measure what
-a legitimate UPDATE weighs before adding a knob.~~ **40f went the same day too, so
-#40 is closed and #41 is what is open.** §14's warning earned its keep: taking
-the measurement turned 40f from a missing knob into a defect — the caps were not
-un-reviewed, the UDP one was wrong, and it contradicted what every reply's OPT
-advertises. 40d was not a defect either, but
-its second half deleted six silent `continue`s by typing one map key — which is
-the §17 argument, and the correction 40a's row now carries.
-
-One candidate named elsewhere on this page, for a session that wants it:
-**SVCB/HTTPS presentation form** was the largest remaining entry in #21's
-not-implemented list and closed as #35; ~~**#13e's `Name` half**~~ closed as #36
-on 2026-09-07, so both of the two named here are gone. Not a queue either.
-
-~~**#42 is what is open, and its stages are ordered**~~ — **#43 is, as of the
-same day.** Take it before any of #42, #44 or #45: it is cheap, it needs no
-design decision, and it is the only item that can tell you the other three are
-worth doing. A year of careful work that has never spoken to BIND is a year of
-work with one untested assumption under all of it.
+What is left worth saying is the rule the chain kept demonstrating. **Take the
+item that could invalidate the others before the ones that add to them.** #43
+was that item — a year of careful work that had never spoken to BIND had one
+untested assumption under all of it — and it went first for that reason, then
+proved #46's fix and all three of #42's stages on the way out. Of what remains,
+#44 and #45 are lists of absences rather than defects, and #21 is not a queue at
+all.
 
 Then, in order and for stated reasons:
 
@@ -935,12 +834,16 @@ Then, in order and for stated reasons:
    operator notices first.
 2. **44a**, catalog zones — the row that moves the answer from "a nice server"
    to "a server I could run a fleet of".
-3. **#42's stages**: 42a first, because it costs 7 packages and both of the
+3. ~~**#42's stages**: 42a first, because it costs 7 packages and both of the
    others are built on it; 42b next, because `quinn` supplies streams and
    RFC 9250's framing is `rdns::framed` already; 42c last and largest, because
    it is the only one carrying a second change — the metrics server folding onto
-   `hyper`, which retires the premise written in that module's own header. Take
-   **44d** (XFR over TLS) as a fourth stage while the rustls plumbing is open.
+   `hyper`.~~ **All three done 2026-09-12, in that order and for those reasons**,
+   which held. **44d** (XFR over TLS) is the fourth stage that row named and is
+   what is left of it: the rustls plumbing and the ALPN dispatch are in place and
+   a transfer already works over DoT and DoQ unchanged, so what it still needs is
+   the policy half — which keys and which peers may transfer over which
+   transport.
 4. **44c**, the scale measurement, whenever somebody wants a number rather than
    a feature.
 
@@ -948,7 +851,11 @@ Then, in order and for stated reasons:
 needs, and 45a (RPZ) is a legal gate rather than a nice-to-have for anyone with
 blocking obligations. 45e is a decision to take rather than work to schedule.
 
-The certificate story in 42a is still the part with no decision behind it.
+~~The certificate story in 42a is still the part with no decision behind it.~~
+**Decided 2026-09-12**, and the decision was partly to decline: a renewal is a
+reload of one shared `CertificateStore`, and expiry is deliberately not parsed —
+the section says why an X.509 parser whose whole output is a log line is the
+wrong trade when the symptom is already a counter.
 
 > **1. ~~Push, and read the five CI jobs nobody has ever read.~~ Read 2026-09-11,
 > and the one job that cannot run here is the one that had been broken.** ~~Ask
@@ -1106,13 +1013,16 @@ untested. A line that says a thing is expensive is a claim to measure
 
 One line each. The reasoning, the RFC citations and the verification are in the
 commit that closed it and in `docs/CLOSED_WORK.md`, which holds every section
-below in full under the same number — ~~every one~~ ~~**all but two as of
-2026-09-11**~~ ~~**all but three, later that day**: #38's, #39's and #40's sections
-are closed and still sit under "Open
-work" above~~ — **every one again, later still**: the three went across on
-2026-09-11. That they were listed as exceptions for a few hours rather than
-described as moved is the point; it is the same drift the second correction under
-this table records, caught this time by the row rather than after it. **The numbers are stable identifiers** —
+below in full under the same number.
+
+**"Every one" has had to be corrected three times**, each time because a section
+closed and sat under "Open work" for a few hours or a day before it was moved.
+The exceptions used to be listed here and struck through as they went; they are
+not any more, for the reason given under "What is open" — a count that stopped
+being current teaches nobody anything, and the row for each number already says
+where its section is. What is worth keeping is the shape: a section is closed in
+one commit and moved in another, and the gap between them is when this sentence
+is wrong. **The numbers are stable identifiers** —
 referenced from 88 doc comments in the tree and from each other — so they are
 moved, never renumbered.
 
