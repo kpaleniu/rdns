@@ -63,6 +63,7 @@ each row exists (`CLAUDE.md` §11).
 | 6147 | DNS64 | no — filed as `TODO.md` #45c | — |
 | 7871 | EDNS Client Subnet | no, and possibly on purpose — the option code is defined and never read; `TODO.md` #45e is the decision | `edns.rs` |
 | 7873 | DNS Cookies | opaque round-trip only | `EDNS_OPTION_COOKIE` |
+| 8914 | Extended DNS Errors | yes, both daemons, on the refusals and on `rdnsr`'s SERVFAILs; `rdnsc` prints what it receives | `ede.rs` |
 | 2931 | SIG(0) | no | — |
 | 9460 | SVCB / HTTPS | **stored, served and readable in a zone file** (2026-09-07): §2.1's presentation format, §2.2's wire format and its ordering rule, §2.4's two modes, §7's six parameter shapes, §8's mandatory list. Appendix D's test vectors are a test. **Not** §4.1/§4.2's additional-section prefetching, which are `SHOULD`s — see the note below | `svcb.rs`, `codecs::char_string_decode` |
 

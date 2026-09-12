@@ -37,11 +37,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#44**, **#45** and **#21**, as of 2026-09-12. #44 is what an operator would
-find missing in `rdnsd`, #45 what an ISP would find missing in `rdnsr`, and #21
-is an inventory of deliberate deviations rather than a queue. Everything else
-numbered is closed; the table under "Closed work" says which, when, and where
-the reasoning went.
+**#44** (44b done), **#45**, **#47** and **#21**, as of 2026-09-12. #44 is what
+an operator would find missing in `rdnsd`, #45 what an ISP would find missing in
+`rdnsr`, #47 is the one gap 44b left behind, and #21 is an inventory of
+deliberate deviations rather than a queue. Everything else numbered is closed;
+the table under "Closed work" says which, when, and where the reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
 by the page's own count, and the record is in `docs/CLOSED_WORK.md` under "How
@@ -807,8 +807,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#44**, **#45** and **#21** — see "What is open" above, which is the same list
-and the only place it is written down. Every closed section lives in
+**#44** (44b done), **#45**, **#47** and **#21** — see "What is open" above,
+which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
 
@@ -830,8 +830,10 @@ all.
 
 Then, in order and for stated reasons:
 
-1. **44b**, Extended DNS Errors. The smallest row on the page and the one an
-   operator notices first.
+1. ~~**44b**, Extended DNS Errors. The smallest row on the page and the one an
+   operator notices first.~~ **Done 2026-09-12.** It was the one an operator
+   notices first and it was not the smallest; the row says what the difference
+   cost.
 2. **44a**, catalog zones — the row that moves the answer from "a nice server"
    to "a server I could run a fleet of".
 3. ~~**#42's stages**: 42a first, because it costs 7 packages and both of the
@@ -924,7 +926,7 @@ missing is the operational surface around the answering, which is the same shape
 | | | |
 |---|---|---|
 | **44a** | catalog zones (RFC 9432, "DNS Catalog Zones") — **0 hits** | The largest one. A catalog zone is an ordinary zone whose contents are the *list* of zones a secondary should serve, so provisioning becomes a transfer rather than a configuration-management problem. BIND, Knot, NSD and PowerDNS all implement it. Below a handful of zones nobody misses it; somewhere around a hundred, configuring each secondary by hand stops being possible, and that is where an evaluation ends. This tree is unusually well placed for it — the consumer side is an AXFR, a parse and `install_zone`, all of which exist |
-| **44b** | Extended DNS Errors (RFC 8914) — **0 hits** | Small, and the highest value per line on this page. A bare SERVFAIL is a support ticket; the same SERVFAIL carrying EDE 6 (DNSSEC Bogus) or EDE 7 (Signature Expired) is a fixed problem. It is an EDNS option, the option list already round-trips, and the RCODE space is already a data-carrying type. Its absence is also a *signal* — it reads as software written by somebody who has not had to debug DNS at 3am |
+| ~~**44b**~~ | ~~Extended DNS Errors (RFC 8914) — **0 hits**~~ **Done 2026-09-12**, two commits: `rdnsd`'s eight refusal sites, then the resolver's SERVFAILs and `rdnsc`'s printing of what it receives | ~~Small, and the highest value per line on this page. A bare SERVFAIL is a support ticket; the same SERVFAIL carrying EDE 6 (DNSSEC Bogus) or EDE 7 (Signature Expired) is a fixed problem. It is an EDNS option, the option list already round-trips, and the RCODE space is already a data-carrying type. Its absence is also a *signal* — it reads as software written by somebody who has not had to debug DNS at 3am~~ **Every clause held except "small".** The option and `rdnsd`'s half are small; the resolver's half is what the row was actually asking for, and it cost a type — the reason a check found had to be carried up to the reply, so `RrsetProof::Bogus`, `ValidationState::Bogus` and `DelegationVerdict::Bogus` all took a `dnssec::Bogus { code, why }` in place of a `String`, at 24 construction sites. That is §17's argument arriving from the other direction: the code is not derivable at the top, so it has to be in the type at the bottom. Two things the filing did not see — EXTRA-TEXT is `&'static str`, because `Bogus::why` names a zone, an owner and a key tag that all came out of an answer a stranger sent, and reflecting those to another stranger is how §2's "leak no private information" breaks quietly; and `rdnsc` sent an OPT only under `--dnssec`, so the tree's own probe could not see the thing the tree had just learned to send. Left behind: **#47** |
 | **44c** | no measurement above a test zone | Not a feature, an **evidence** gap, and the first question an operator asks. `bench_zone_lookup` builds 10,000 records and the largest zone file in the tree is a dozen lines. Unmeasured: load time and memory for a zone of a million records, signing time at that size, how many zones one process holds, and what reloading all of them costs. §10's rules apply — this is a measurement to *take*, and the number it produces is the row's real content |
 | **44d** | XFR over TLS (RFC 9103, "DNS Zone Transfer over TLS") — **0 hits** | Zone contents cross the wire in clear between primary and secondary, which for anything with private names is the objection. Cheap *after* #42a: the rustls setup, the certificate plumbing and the ALPN dispatch are the same, and a transfer is already framed TCP. Worth taking as a fourth stage of #42 rather than on its own |
 | **44e** | multi-signer DNSSEC (RFC 8901, "Multi-Signer DNSSEC Models") — **0 hits** | Any zone served by two independent providers needs it, which is ordinary practice for zones that must not go down. The signer here assumes it owns every key in the apex DNSKEY set; the multi-signer models require importing another operator's ZSK and signing alongside it |
@@ -945,6 +947,35 @@ from #44's. Same filing rule: every "0 hits" is a `grep` taken on the day.
 | **45c** | DNS64 (RFC 6147) — **0 hits** | Synthesize AAAA from A for IPv6-only clients behind NAT64. Required in an IPv6-only mobile network, which is most of them |
 | **45d** | prefetching — **0 hits** | Re-resolve a popular name before its TTL expires, so the hit rate has no hole at every expiry. Unbound's `prefetch`, and the cheapest of the rows here |
 | **45e** | EDNS Client Subnet (RFC 7871) — the option code exists and nothing reads or writes it | `EDNS_OPTION_CLIENT_SUBNET` is defined in `edns.rs` and appears at exactly one other place: its own doc comment. Forwarding it is what lets an authoritative server steer a client to a near replica, and *not* forwarding it is a defensible privacy position — RFC 7871 §2 is unusually explicit about the cost. So this row is a **decision to take**, not work to schedule, and it is the only one on this page whose right answer might be "no, and write down why" |
+
+---
+
+### 47. A NOTIFY reply carries no OPT record — **filed 2026-09-12**
+
+Found while doing 44b and not filed by it, because it is not an EDE question.
+`notify::notify_response` builds a reply from `DnsMessage::reply_to` and
+attaches nothing: no OPT, whatever the NOTIFY carried. Every other reply path in
+`rdnsd` goes through `ClientEdns::mirror` or `empty_reply`, which is the
+consolidation #38 made and this function predates.
+
+Two consequences, and the second is why it has a number rather than a sentence
+in a doc comment:
+
+- RFC 6891 §6.1.1 asks for an OPT in a response to a request that had one, and
+  some senders remember its absence as a downgrade and stop offering EDNS.
+- A refused NOTIFY therefore cannot say why, where every other refusal here now
+  can (44b). "REFUSED — you are not one of my masters" and "NOTAUTH — I am that
+  zone's primary, not a secondary" are two different operator problems, and #46b
+  was filed because the first of them was invisible in the *log*. On the wire it
+  still is.
+
+The measurement somebody would start from, taken rather than guessed:
+`rdns::notify::notify_response` has exactly three callers outside its own tests,
+all three in `rdnsd/src/dispatch.rs`'s `notify_reply` — NOERROR, REFUSED and
+NOTAUTH — so it is `rdnsd`'s function alone and can grow a parameter without
+touching another daemon. #43's interop harness is what would show a real
+sender's reaction; none of its 112 assertions covers this, because the NOTIFY it
+exercises is accepted.
 
 ---
 

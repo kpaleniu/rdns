@@ -250,7 +250,12 @@ rdnsc [--dnssec] <server[:port]> <QTYPE> <name>
 - 5-second read timeout, 2 attempts.
 - TC=1 over UDP retries over TCP.
 - Refuses to print an answer it cannot tell was an answer to its own question.
-- `--dnssec` attaches an EDNS0 OPT with DO set (RFC 4035 §3.2.1).
+- Every query carries an EDNS0 OPT advertising 1232; `--dnssec` sets DO in it
+  (RFC 4035 §3.2.1). The OPT is unconditional because a server may only put an
+  Extended DNS Error in a reply to a query that had one (RFC 8914 §2).
+- Prints any Extended DNS Error the reply carries, beside the RCODE it
+  annotates — on an answer and on a refused transfer, which is the reply an
+  operator is most likely to be holding.
 - The type is a QTYPE: `ANY` (or `*`), `AXFR` and `TYPEnnn` as well as the
   mnemonics. An unreadable name exits 1 and says so.
 - `AXFR` goes straight to TCP with RD clear (RFC 5936 §4.2, §4.1.1) and prints

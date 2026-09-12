@@ -142,8 +142,10 @@ process down. Binds 127.0.0.1 by default.
 
 1. `validation::Request::from_bytes` — parses and refuses QR=1. Both failures are
    silence.
-2. Opcode: anything but QUERY is NOTIMP with the opcode echoed.
+2. Opcode: anything but QUERY is NOTIMP with the opcode echoed, carrying
+   EDE 21 (Not Supported).
 3. EDNS sanity: malformed option list → FORMERR; version > 0 → BADVERS.
+   Neither carries an Extended DNS Error, for the reason `03`'s §3.2.1 gives.
 4. Special-use names (`special_names::lookup`) — answered locally, never
    forwarded, before every cache and before any resolution. AD is never set. Not
    skipped for a client with CD. See §5.6.
@@ -161,6 +163,31 @@ process down. Binds 127.0.0.1 by default.
 10. Reply, echoing the transaction id with RA set and the OPT record mirrored
     only if the client used EDNS, sized by transport (`Transport::Udp` uses the
     client's advertised payload size; `Transport::Tcp` uses the 2-byte frame).
+
+### Extended DNS Errors on a SERVFAIL (RFC 8914)
+
+A bare SERVFAIL says a lookup failed and nothing about where to look. The code
+is chosen by the check that found the fault and carried up unchanged —
+`dnssec::Bogus { code, why }` inside `RrsetProof::Bogus`,
+`ValidationState::Bogus` and `DelegationVerdict::Bogus` — because nothing above
+that check can tell "expired" from "did not verify" without reading the message
+back.
+
+| INFO-CODE | when |
+|---|---|
+| 7, Signature Expired / 8, Signature Not Yet Valid | `Rrsig::is_current` failed, split by which side of the window `now` is on |
+| 9, DNSKEY Missing | a DS exists and no DNSKEY matches it, or no RRSIG's key tag and algorithm match a key we hold |
+| 10, RRSIGs Missing | an RRset, a DNSKEY RRset or a no-DS denial came back unsigned from a zone the chain says is signed |
+| 12, NSEC Missing | a denial with no NSEC or NSEC3, one that does not prove what was asked, or a wildcard answer with no denial of the name served |
+| 6, DNSSEC Bogus | everything else bogus: a signature that did not verify, a signer outside the zone, a chain that does not terminate, an answer that is not the chain asked for |
+| 22, No Reachable Authority | `ResolveError::NoResponse` and `::Delegation` |
+| 23, Network Error | `ResolveError::Io` |
+| 0, Other | `ResolveError::BudgetExhausted` (the NXNSAttack defence firing) and an upstream answer that did not parse |
+
+EXTRA-TEXT is a fixed `&'static str` in every case. `Bogus::why` names the
+zone, the owner and the key tag, all of them out of an answer a stranger sent,
+and RFC 8914 §2 asks that EXTRA-TEXT leak nothing; the detail goes to the WARN
+line beside the counter instead.
 
 ### Concurrency
 

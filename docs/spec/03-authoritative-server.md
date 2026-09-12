@@ -66,17 +66,21 @@ Applied in this order.
 | malformed EDNS option list | FORMERR (1) | bare version-0 OPT |
 | EDNS version > 0 | BADVERS (16) | bare version-0 OPT (it carries the extended code's high bits) |
 
+Neither carries an Extended DNS Error: the first has no readable option list to
+answer, and BADVERS already names its own cause.
+
 ### 3.2.2 Opcode
 
 Only QUERY reaches the zone lookup. NOTIFY is answered by the caller (§3.5) and
 UPDATE by §3.7, both before `make_response`. Everything else — STATUS, IQUERY,
 anything unassigned — is NOTIMP with AA clear, the client's opcode echoed and the
-client's OPT record mirrored.
+client's OPT record mirrored, carrying EDE 21 (Not Supported).
 
 ### 3.2.3 Class
 
 `QCLASS ∈ {IN, ANY}` proceeds. Anything else is REFUSED with AA clear
-(RFC 1034 §4.3.2 step 1 searches the zones of the question's class). QCLASS=ANY
+(RFC 1034 §4.3.2 step 1 searches the zones of the question's class), carrying
+EDE 21 (Not Supported) — what is absent is the class, not the zone. QCLASS=ANY
 matches any class (RFC 1035 §3.2.5), and IN is the only class served.
 
 ### 3.2.4 Transfer QTYPEs on UDP
@@ -183,6 +187,24 @@ mirrored OPT and the TSIG, TC=1, RCODE 0.
 | NOTAUTH | a transfer or NOTIFY for a zone not served here; a TSIG that did not verify; an UPDATE for a zone we are not authoritative for (RFC 2136 §3.1.1) |
 | SERVFAIL | a transfer that would not build or serialize; an UPDATE that could not be read, written or signed (RFC 2136 §3.4.2.1) |
 | BADVERS | EDNS version > 0 |
+
+### Extended DNS Errors (RFC 8914)
+
+Attached to the refusals, and only for a client whose query carried an OPT
+(§2). The SERVFAILs carry none on purpose: they are internal failures with a
+log line and a counter, and EDE 0 would say nothing the RCODE does not. Nor
+does the TSIG rejection — the TSIG record in that reply already says BADKEY,
+BADSIG or BADTIME (RFC 8945 §4.3), which is finer than any INFO-CODE.
+
+| INFO-CODE | when |
+|---|---|
+| 20, Not Authoritative | a name in no zone we hold — the query path and the IXFR-over-UDP shortcut; an UPDATE for a zone not served here |
+| 21, Not Supported | an opcode we do not implement; a class we do not serve |
+| 18, Prohibited | a transfer or an UPDATE the ACL or the key scope denies, all four ways. One code for all four: telling a stranger which of them it was is telling it about the keyring |
+| 0, Other | an UPDATE for a zone we replicate, or for a zone we have nowhere to write back to |
+
+A NOTIFY reply carries no OPT at all, so it can carry no reason — see
+`TODO.md` #47.
 | NOTZONE | an UPDATE record outside the zone its own Zone section names (RFC 2136 §3.4.1) |
 | YXDOMAIN, YXRRSET, NXRRSET | the other three UPDATE prerequisite failures (RFC 2136 §3.2) |
 

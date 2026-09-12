@@ -233,6 +233,30 @@ on TCP. Honouring `udp_payload_size()` alone is what `TODO.md` #41b was.
 Named option codes, round-tripped as opaque bytes and never interpreted: NSID
 (3), Client Subnet (8), Cookie (10), Padding (12).
 
+### Extended DNS Errors (RFC 8914), option code 15
+
+`ede::InfoCode` is a `u16` newtype over IANA's "Extended DNS Error Codes"
+registry, with constants only for the codes this tree emits. `ExtendedError`
+pairs one with an EXTRA-TEXT that is `&'static str` and at most
+`MAX_EXTRA_TEXT` (128) octets — a bound `ExtendedError::new` asserts in a
+`const fn`, so every call site, all of which are `const`, fails to compile
+rather than at run time.
+
+The option reaches the wire only through an OPT record, and an OPT record only
+when the client sent one (RFC 8914 §2). That rule is not a check anywhere:
+`ClientEdns::mirror` returns `None` without one, and it is what
+`ResponseWriter::finish` and `ClientEdns::mirror_with` — the only two ways to
+attach an EDE — both go through.
+
+| call | question answered |
+|---|---|
+| `ResponseWriter::set_extended_error(e)` | say why, from anywhere on the answer path; folded into the OPT by `finish` or dropped if there is none |
+| `ClientEdns::mirror_with(size, why)` | the same, for a reply built as a `DnsMessage` |
+| `ExtendedError::all_in(&edns)` | every EDE a received reply carries; `Err` only on a malformed option list |
+
+`Edns::with_extended_error` and `Edns::with_options` share one TLV encoder,
+`EdnsOption::append_to`.
+
 Only EDNS version 0 is implemented (`EDNS_VERSION`). A request at a higher
 version MUST be answered BADVERS (16) with a bare version-0 OPT record.
 
