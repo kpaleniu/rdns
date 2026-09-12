@@ -14,7 +14,11 @@ host = "0.0.0.0"
 port = 5353
 zone-dir = "/etc/rdns/zones"
 allow-transfer = ["10.53.0.0/24"]
-also-notify = ["10.53.0.3", "10.53.0.4", "10.53.0.5"]
+# Signed: NSD's and Knot's notify ACLs below name the key, so an unsigned
+# NOTIFY is refused by both (#46a). BIND is here without one on purpose -- it
+# accepts an unsigned NOTIFY from a configured primary regardless, so leaving
+# it unkeyed keeps that path covered too.
+also-notify = ["10.53.0.3", "10.53.0.4#interop.key."]
 # Off, not raised: the limiter drops in silence, and three secondaries starting
 # at once against one primary is exactly the burst it would eat.
 query-rate = 0
@@ -37,3 +41,10 @@ update-zones = ["example.org."]
 # --key-algorithm ECDSAP384SHA384.
 [zones."example.net."]
 nsec3 = true
+
+# #46c: this list is *added* to [server].also-notify, for this zone only. NSD
+# is named nowhere else, so "did NSD get a NOTIFY for example.org. and for no
+# other zone" is the assertion -- and until #46c the whole table was parsed and
+# dropped on the floor.
+[zones."example.org."]
+also-notify = ["10.53.0.5#interop.key."]

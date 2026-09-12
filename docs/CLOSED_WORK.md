@@ -5613,6 +5613,113 @@ that "zero-cost" is a claim about a compiler, not a fact about a diff.
 
 ---
 
+### 46. `rdnsd` cannot sign a NOTIFY — ~~**filed 2026-09-12**~~ **closed 2026-09-12**
+
+The one thing #43 found, and no row of #43 pointed at it. `rdns/src/notify.rs`
+mentions TSIG nowhere and `--also-notify` takes an address and an optional port
+and nothing else, so every NOTIFY this server sends is unsigned.
+
+The *receiving* side is fine and was checked: `tsig::check_request` runs before
+dispatch decides anything (`rdnsd/src/dispatch.rs`), so a signed NOTIFY has its
+MAC verified, a bad one gets NOTAUTH, and the reply is signed. Knot's primary
+signs its NOTIFY to `rdnsd` and `rdnsd` acts on it. It is the send side alone.
+
+Measured against two peers, configured the way an operator configures them once
+the transfer is already keyed:
+
+| | | |
+|---|---|---|
+| **46a** | `--also-notify` cannot name a key | NSD's `allow-notify: 10.53.0.2 interop.key.` answers **REFUSED** and Knot's `acl: { key: interop.key., action: notify }` answers **NOTAUTH** — measured, both of them, not inferred from their manuals. The secondary then learns of a change when its REFRESH timer next fires, which for an ordinary SOA is hours. BIND is *not* affected, and the reason is worth writing down rather than rediscovering: it accepts a NOTIFY from any server in the zone's `primaries` list whatever `allow-notify` says, so `allow-notify { key ...; }` on a BIND secondary does not do what it looks like it does |
+| **46b** | a refused NOTIFY is logged as `acknowledged` | `NOTIFY example.org. serial N to 10.53.0.5:53: acknowledged (Refused)`, at INFO, and then no retry. The reasoning behind treating any rcode as an acknowledgement is in `docs/CLI_USAGE.md` and is right for NOTAUTH-because-not-a-secondary — repeating would not change its mind. It is wrong for REFUSED-because-unsigned, where the NOTIFY path is permanently broken and nothing says so. This is `CLAUDE.md` §4's shape: healthy process, nothing alerting, a zone that is hours stale on every secondary |
+
+**What would refute this (§19).** That an unsigned NOTIFY is legal — RFC 1996
+requires no TSIG, and rdnsd is not violating anything. So 46a is a *capability*
+gap and not a defect, and the argument for taking it is that all three of the
+peers this tree now talks to can demand it and two of them do when asked. 46b is
+the half with teeth, is independent of 46a, and is the cheaper of the two.
+
+The shape of the fix is not the interesting question — `--also-notify
+ADDR[:PORT][#KEY]` is the spelling every other flag here already uses
+(`--secondary` parses exactly that, `MasterSpec`), and `notify::notify_request`
+would gain what `xfr` already does to sign a request. What has to be decided
+first is 46b's rcode policy, because a keyed NOTIFY makes REFUSED mean something
+new and the current code cannot tell the two apart.
+
+---
+
+**Closed the day it was filed**, and it grew a third item on the way.
+
+**46a — `--also-notify ADDR[:PORT][#KEY]`.** The NOTIFY is signed with that key
+(RFC 8945) and the reply is verified against it; an unsigned or wrongly signed
+answer to a signed request is not an answer, so it does not stop the retries
+— the property the loop already had for a reply carrying the wrong id.
+
+The spelling is not new and that is the point. `--secondary
+zone@addr[:port][#key]` had the `#key` half already, and the two flags are one
+parser now — `rdns::endpoint`, whose module comment says *why* it exists, since
+that is what stops the next copy (`CLAUDE.md` §7). The same pass folded
+`rdnsd`'s four-algorithm key lookup into `TsigKeyring::by_name`, which is the
+config-side lookup: on the wire a peer supplies name *and* algorithm and a
+mismatch must be BADKEY, but an operator writing `#partner.key.` has already
+said the algorithm once, beside the secret.
+
+**46b — a refusal is a `warn` naming the rcode.** `notify::acknowledges` was a
+`bool` and is `notify::outcome` returning `Accepted` or `Rejected(rcode)`. Both
+still end the retries — the message arrived, and repeating it would not change
+the answer — but only NOERROR is logged as acceptance. The warning names the
+rcode and, when the NOTIFY went out unsigned, the remedy:
+
+```
+WARN rdnsd: NOTIFY example.org. serial 2026091108 to 10.53.0.4:53: refused
+(NotAuthorized) — that secondary will not refresh until its REFRESH timer
+fires. This NOTIFY was unsigned; if that secondary's notify ACL names a key,
+give it here as --also-notify ADDR#KEYNAME
+```
+
+**46c — `[zones."x"].also-notify` did nothing at all**, and was found while
+rebuilding the plumbing for the other two rather than by looking for it. It was
+parsed into `PerZone::notify` and read by nobody: a `deny_unknown_fields` config
+accepted it, `docs/spec/03-authoritative-server.md` and `06-operations.md` both
+documented it as working, and `ZoneConfig::also_notify`'s own doc comment said
+"in addition to `server.also-notify`" — a sentence nothing in the tree
+implemented. That is `CLAUDE.md` §4's shape exactly, and the worst of the three,
+because the other two fail loudly at a peer while this one is silent. It is
+`NotifyPolicy` now, which builds the union once at startup, deduplicates it, and
+is the only thing `announce_zones` and `announce_transfer` ask.
+
+**One more, fixed in passing and not filed:** `send_notify` serialized into a
+fixed 512-byte buffer. A NOTIFY carries the zone's SOA, whose two names and
+owner can each reach 255 octets, so a zone with long enough names would have
+failed to serialize and lost the notification with `could not serialize` as the
+only sign — before a TSIG was added to it. It builds within the wire maximum
+now, and `to_bytes_within` sizes the buffer to the message rather than to the
+ceiling, so that costs nothing.
+
+**Verified against the peers, which is what #43 built.** `tests/interop/` now
+configures NSD's `allow-notify` and Knot's notify ACL to *name the key*, so an
+unsigned NOTIFY fails the suite, and BIND deliberately stays unkeyed because it
+accepts one from a configured primary regardless — all three states are covered
+at once. The check is pinned to the serial the run itself bumped: without that,
+earlier still-signed NOTIFYs in the log window satisfied the grep and taking the
+signing back out left every assertion passing.
+
+Taking it back out is the measurement that was actually run (§1). Unsigned,
+Knot answers NOTAUTH and NSD answers REFUSED and the three rows fail; the unit
+tests fail the same way, `the NOTIFY went out unsigned` being the message.
+
+**And a harness bug the same check found.** `docker compose logs --since` reads
+a bare timestamp as the daemon's *local* time, so `date -u` without a `Z` had
+been widening every log window in `run.sh` by the host's UTC offset — and by
+nothing at all on a host set to UTC, which is why it read as working for the
+whole of #43. Every window is `since_now` now, and the comment says why.
+
+**Numbers:** 117 interop assertions, 0 failures, 0 skipped — the skip #43 left
+behind was this. `cargo test --workspace` 933 on Windows and 949 on Linux —
+the 16 between them are the `#[cfg(unix)]` half Windows never compiles — clippy
+clean on both, `cargo doc --workspace --no-deps` clean.
+
+---
+
 ### 43. Nothing here has ever answered another implementation — ~~**filed 2026-09-11**~~ **closed 2026-09-12**
 
 BIND, Knot, NSD and Unbound appear eight times in this tree as *references for
@@ -5655,7 +5762,9 @@ tests/interop/run.sh 43c          # one scenario against a network already up
 ```
 
 **112 assertions, 0 failures, 1 skipped**, the skip being the one thing this
-section found — **#46**, which is filed and open. The peers, which are the
+section found — **#46**, ~~which is filed and open~~ **closed later the same
+day; the harness is 117 assertions and 0 skips now, and its NOTIFY row fails if
+the signing is taken back out**. The peers, which are the
 point and so are printed by every run: **BIND 9.20.27**, **Knot 3.6.0**,
 **NSD 4.12.0**, **Unbound 1.23.1**, **ldns 1.8.4** and BIND's `nsupdate`,
 Knot's `kdig`/`knsupdate` and ldns's `drill` as clients.

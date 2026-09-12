@@ -450,10 +450,12 @@ rdnsd --zone-file example.com.zone \
   --allow-transfer 10.9.0.0/24
 ```
 
-### `--also-notify <ADDR[:PORT]>`
+### `--also-notify <ADDR[:PORT][#KEY]>`
 
 A secondary to notify when a zone changes (RFC 1996). Repeatable; port defaults
-to 53.
+to 53. `#KEY` names a key from `--tsig-key` and signs the NOTIFY with it — the
+same spelling `--secondary` uses for the same two things, and one parser
+(`rdns::endpoint`).
 
 Without it a secondary learns of a change when its refresh timer next goes off —
 for a typical SOA, hours later. A NOTIFY says so at once, and the secondary
@@ -468,12 +470,33 @@ decides what to do about it.
   acknowledgement — a secondary answering NOTAUTH has still received it, and
   repeating would not change its mind.
 - A bare IPv6 address needs brackets to carry a port: `[::1]:5353`.
+- A `#KEY` naming a key no `--tsig-key` defines stops the server. The operator
+  asked for authentication and would otherwise not be able to see they did not
+  get it.
+
+**Sign it when the secondary's ACL says to.** A secondary can require the
+NOTIFY be signed, and then an unsigned one is refused and the zone stays stale
+there until its REFRESH timer fires — hours, typically. Measured against two:
+NSD's `allow-notify: <addr> <key>` answers REFUSED and Knot's
+`acl: { key: ..., action: notify }` answers NOTAUTH. BIND is the odd one out and
+worth knowing about before drawing conclusions from it: it accepts a NOTIFY from
+anything in the zone's `primaries` list whatever `allow-notify` says, so
+configuring a key there does not test this at all.
+
+A refusal is a `warn` naming the rcode, not an `info` saying `acknowledged`.
+Both end the retries — the message arrived, and repeating it would not change
+the answer — but only NOERROR means the secondary is going to do anything.
 
 ```bash
 rdnsd --zone-file example.com.zone \
   --also-notify 192.0.2.10 --also-notify 192.0.2.11
 
 rdnsd --zone-file example.com.zone --also-notify 127.0.0.1:15353
+
+# Signed, for a secondary whose notify ACL names the key.
+rdnsd --zone-file example.com.zone \
+  --tsig-key hmac-sha256:transfer.key:MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI= \
+  --also-notify 192.0.2.10#transfer.key
 ```
 
 Not done: notifying the zone's own NS set. BIND derives that list from the NS

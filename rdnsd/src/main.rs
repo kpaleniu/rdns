@@ -35,8 +35,7 @@ use replication::{
     parse_secondary_specs, spawn_secondaries, withdraw_unvouched_zones, ReplicationContext,
     Secondaries,
 };
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -57,7 +56,8 @@ use rdns::{
     journal::Journal,
     logging::{watch_anomalies, AnomalyThresholds, LogLevel, QueryLogger},
     metrics::DnsMetrics,
-    metrics_server, notify,
+    metrics_server,
+    notify::{self, NotifyOutcome, NotifyPeer, NotifyPolicy},
     readiness::Readiness,
     secondary::{state_file_path, MasterSpec, StateFile},
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl},
@@ -1004,7 +1004,7 @@ async fn reload_once(
     reloading: &Reloading,
     source: &ZoneSource,
     served: &ZoneContext,
-    notify_targets: &[SocketAddr],
+    notify: &NotifyPolicy,
     announced: Vec<(Name, Serial)>,
     busy: &Busy,
     trigger: ReloadTrigger,
@@ -1026,7 +1026,7 @@ async fn reload_once(
             // minimum new signatures and a new serial — so this is exactly when a
             // secondary wants to hear about it.
             (
-                announce_zones(&served.zone_map, &announced, notify_targets, busy).await,
+                announce_zones(&served.zone_map, &announced, notify, busy).await,
                 Ok(loaded),
             )
         }
@@ -1067,7 +1067,7 @@ async fn reload_once(
 fn spawn_zone_maintenance(
     served: ZoneContext,
     source: ZoneSource,
-    notify_targets: Vec<SocketAddr>,
+    notify: Arc<NotifyPolicy>,
     announced: Vec<(Name, Serial)>,
     reloading: Reloading,
     lifecycle: Lifecycle,
@@ -1128,13 +1128,7 @@ fn spawn_zone_maintenance(
                 _ = stop.wait() => break,
             };
             announced = reload_once(
-                &reloading,
-                &source,
-                &served,
-                &notify_targets,
-                announced,
-                &_busy,
-                trigger,
+                &reloading, &source, &served, &notify, announced, &_busy, trigger,
             )
             .await;
         }
@@ -1196,32 +1190,45 @@ async fn next_reload_signal(_signals: &mut Option<()>) -> bool {
     std::future::pending().await
 }
 
-/// `addr` or `addr:port` for a secondary, defaulting to port 53.
+/// `addr[:port][#keyname]` for a secondary, resolved against the keyring.
 ///
-/// A bare IPv6 address has colons of its own, so `[::1]:5353` is the only
-/// unambiguous way to give one a port — which is what `SocketAddr` already
-/// parses, so the shape is the familiar one rather than a new convention.
-fn parse_notify_targets(specs: &[String]) -> Result<Vec<SocketAddr>> {
-    let mut targets = Vec::new();
+/// The spelling is `rdns::endpoint`'s, shared with `--secondary`, and the key
+/// lookup is `NotifyTarget::resolve` — so a `#key` naming nothing is a startup
+/// error here for the same reason and in the same words as there.
+fn parse_notify_peers(specs: &[String], keys: &TsigKeyring) -> Result<Vec<NotifyPeer>> {
+    let mut peers = Vec::new();
     for spec in specs {
         let spec = spec.trim();
         if spec.is_empty() {
             continue;
         }
-        if let Ok(addr) = spec.parse::<SocketAddr>() {
-            targets.push(addr);
-            continue;
-        }
-        match spec.parse::<IpAddr>() {
-            Ok(ip) => targets.push(SocketAddr::new(ip, 53)),
-            Err(e) => {
-                return Err(anyhow!(
-                    "--also-notify {spec:?} is not an address or address:port: {e}"
-                ))
-            }
-        }
+        peers.push(
+            notify::NotifyTarget::parse(spec)
+                .map_err(|e| anyhow!("--also-notify {e}"))?
+                .resolve(keys)?,
+        );
     }
-    Ok(targets)
+    Ok(peers)
+}
+
+/// The global list plus whatever `[zones."x"].also-notify` adds per zone.
+///
+/// The per-zone half is #46c: it was parsed into `PerZone::notify` and read by
+/// nothing, so a config that named extra secondaries for one zone was accepted
+/// and silently ignored, with `docs/spec/03-authoritative-server.md` and
+/// `06-operations.md` both documenting it as working.
+fn build_notify_policy(
+    cli: &Cli,
+    per_zone: &BTreeMap<String, Vec<String>>,
+    keys: &TsigKeyring,
+) -> Result<NotifyPolicy> {
+    let mut policy = NotifyPolicy::new(parse_notify_peers(&cli.also_notify, keys)?);
+    for (origin, specs) in per_zone {
+        let zone = Name::from_presentation(&absolute_name(origin))
+            .map_err(|e| anyhow!("zone {origin:?}: {e}"))?;
+        policy.add_zone(zone.as_ref(), parse_notify_peers(specs, keys)?);
+    }
+    Ok(policy)
 }
 
 /// Tell every secondary about the zones whose serial moved since `announced`,
@@ -1233,7 +1240,7 @@ fn parse_notify_targets(specs: &[String]) -> Result<Vec<SocketAddr>> {
 async fn announce_zones(
     zone_map: &Arc<RwLock<Zones>>,
     announced: &[(Name, Serial)],
-    targets: &[SocketAddr],
+    notify: &NotifyPolicy,
     busy: &Busy,
 ) -> Vec<(Name, Serial)> {
     let (current, pending) = {
@@ -1255,12 +1262,14 @@ async fn announce_zones(
         (current, pending)
     };
 
-    if targets.is_empty() || pending.is_empty() {
+    if notify.is_empty() || pending.is_empty() {
         return current;
     }
     for (zone, serial, soa) in pending {
-        for target in targets {
-            let target = *target;
+        // Per zone, not once for the whole run: `[zones."x"].also-notify` adds
+        // to the global list for that zone alone (#46c).
+        for peer in notify.targets_for(zone.as_ref()) {
+            let peer = peer.clone();
             let zone = zone.clone();
             let soa = soa.clone();
             // Fire-and-forget, but not unaccounted-for: a NOTIFY dropped at
@@ -1269,7 +1278,7 @@ async fn announce_zones(
             let busy = busy.clone();
             tokio::spawn(async move {
                 let _busy = busy;
-                send_notify(zone.as_ref(), serial, soa, target).await;
+                send_notify(zone.as_ref(), serial, soa, peer).await;
             });
         }
     }
@@ -1292,65 +1301,133 @@ fn announce_transfer(
     zone: NameRef<'_>,
     serial: Serial,
     soa: Option<ResourceRecord>,
-    targets: &[SocketAddr],
+    notify: &NotifyPolicy,
     busy: &Busy,
 ) {
-    for target in targets {
-        let (zone, soa, target) = (zone.to_owned(), soa.clone(), *target);
+    for peer in notify.targets_for(zone) {
+        let (zone, soa, peer) = (zone.to_owned(), soa.clone(), peer.clone());
         // Accounted for by the drain, like the primary's announcements: a NOTIFY
         // dropped at shutdown costs the level below us a whole REFRESH before it
         // learns of a change that has already reached us.
         let busy = busy.clone();
         tokio::spawn(async move {
             let _busy = busy;
-            send_notify(zone.as_ref(), serial, soa, target).await;
+            send_notify(zone.as_ref(), serial, soa, peer).await;
         });
     }
 }
 
-/// Send one NOTIFY, retrying until it is acknowledged (RFC 1996 §3.6).
+/// Send one NOTIFY, retrying until it is answered (RFC 1996 §3.6).
 ///
-/// Any rcode is an acknowledgement: a secondary answering NOTAUTH has still
-/// received the message, and repeating it would not change its mind. Giving up
-/// after [`notify::NOTIFY_ATTEMPTS`] is safe because the secondary's refresh timer
-/// is the backstop this is an optimisation over.
+/// Signed when the target carries a key (RFC 8945), because a secondary's notify
+/// ACL can demand one and two of the three this tree is tested against do when
+/// asked — `TODO.md` #46a. The reply is then verified: an unsigned or wrongly
+/// signed answer to a signed request is not an answer.
+///
+/// Every rcode ends the retries, because the secondary has the message and
+/// repeating it would not change its mind — but only NOERROR means it will
+/// refresh, and the difference is logged rather than flattened into
+/// "acknowledged" (#46b).
+///
+/// Giving up after [`notify::NOTIFY_ATTEMPTS`] is safe because the secondary's
+/// refresh timer is the backstop this is an optimisation over.
 async fn send_notify(
     zone: NameRef<'_>,
     serial: Serial,
     soa: Option<rdns::ResourceRecord>,
-    target: SocketAddr,
+    peer: NotifyPeer,
 ) {
+    let target = peer.addr;
     let Ok(socket) = UdpSocket::bind(bind_addr_for(target)).await else {
-        tracing::warn!("NOTIFY {zone} to {target}: could not open a socket");
+        tracing::warn!("NOTIFY {zone} to {peer}: could not open a socket");
         return;
     };
 
     let mut wait = Duration::from_secs(notify::NOTIFY_RETRY_SECS);
+    let mut last_tsig_error: Option<&'static str> = None;
+
     for attempt in 1..=notify::NOTIFY_ATTEMPTS {
         let id = rdns::rand_id();
         let msg = notify::notify_request(zone, soa.clone(), id);
-        let mut buf = vec![0u8; 512];
-        let Ok(len) = msg.to_bytes(&mut buf) else {
+        // `to_bytes_within` sizes the buffer to what the message needs and
+        // only truncates past the ceiling, so the wire maximum here is not a
+        // 64 KiB allocation. It replaces a fixed 512-byte buffer that
+        // `to_bytes` would have refused to write into for a zone whose SOA
+        // carries long enough names -- losing the notification, with
+        // "could not serialize" as the only sign.
+        let Ok(mut packet) = msg.to_bytes_within(u16::MAX as usize) else {
             tracing::warn!("NOTIFY {zone}: could not serialize");
             return;
         };
-        if socket.send_to(&buf[..len], target).await.is_err() {
-            tracing::warn!("NOTIFY {zone} to {target}: send failed");
+        // The MAC of our request opens the digest the reply is verified against
+        // (RFC 8945 §4.3.3), so it has to be kept — the same sequence
+        // `rdns::xfr` uses on the client side of a transfer.
+        let mut request_mac = Vec::new();
+        if let Some(key) = &peer.key {
+            match tsig::sign_request(packet, key, tsig::now()) {
+                Ok(signed) => {
+                    request_mac = tsig::request_mac(&signed).unwrap_or_default();
+                    packet = signed;
+                }
+                Err(e) => {
+                    tracing::warn!("NOTIFY {zone} to {peer}: could not sign: {e}");
+                    return;
+                }
+            }
+        }
+        if socket.send_to(&packet, target).await.is_err() {
+            tracing::warn!("NOTIFY {zone} to {peer}: send failed");
             return;
         }
 
-        let mut reply = vec![0u8; 512];
+        // A NOTIFY reply echoes the question and carries no data; 4 KiB is well
+        // past anything one plus a TSIG can weigh.
+        let mut reply = vec![0u8; 4096];
         // Something answered, but not this? Treat it as no answer rather than as
         // an acknowledgement: an off-path reply should not be able to silence a
-        // notification.
+        // notification. A TSIG that does not verify is the same case — which is
+        // why this keeps retrying rather than returning, and remembers the
+        // reason for the line at the end.
         if let Ok(Ok((n, _))) = tokio::time::timeout(wait, socket.recv_from(&mut reply)).await {
-            if let Ok(parsed) = DnsMessage::try_from_bytes(&reply[..n]) {
-                if notify::acknowledges(&parsed, id) {
-                    tracing::info!(
-                        "NOTIFY {zone} serial {serial} to {target}: acknowledged ({:?})",
-                        parsed.rcode
-                    );
-                    return;
+            let packet = &reply[..n];
+            let verified = match &peer.key {
+                Some(key) => {
+                    match tsig::check_response(packet, key, &request_mac, true, tsig::now()) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            last_tsig_error = Some(e.reason());
+                            false
+                        }
+                    }
+                }
+                None => true,
+            };
+            if verified {
+                if let Ok(parsed) = DnsMessage::try_from_bytes(packet) {
+                    match notify::outcome(&parsed, id) {
+                        Some(NotifyOutcome::Accepted) => {
+                            tracing::info!("NOTIFY {zone} serial {serial} to {peer}: accepted");
+                            return;
+                        }
+                        // It arrived and was refused, so stop — but say so.
+                        // Nothing is going to refresh, and the zone is stale on
+                        // that secondary until its REFRESH timer fires.
+                        Some(NotifyOutcome::Rejected(rcode)) => {
+                            tracing::warn!(
+                                "NOTIFY {zone} serial {serial} to {peer}: refused ({rcode:?}) — \
+                                 that secondary will not refresh until its REFRESH timer fires{}",
+                                if peer.key.is_none() {
+                                    ". This NOTIFY was unsigned; if that secondary's \
+                                     notify ACL names a key, give it here as \
+                                     --also-notify ADDR#KEYNAME"
+                                } else {
+                                    ""
+                                }
+                            );
+                            return;
+                        }
+                        None => {}
+                    }
                 }
             }
         }
@@ -1359,8 +1436,12 @@ async fn send_notify(
         }
     }
     tracing::warn!(
-        "NOTIFY {zone} serial {serial} to {target}: no acknowledgement after {} attempts",
-        notify::NOTIFY_ATTEMPTS
+        "NOTIFY {zone} serial {serial} to {peer}: no answer after {} attempts{}",
+        notify::NOTIFY_ATTEMPTS,
+        match last_tsig_error {
+            Some(reason) => format!(" (the last reply did not verify: {reason})"),
+            None => String::new(),
+        }
     );
 }
 
@@ -1452,7 +1533,14 @@ async fn main() -> Result<()> {
     // or, worse, being read as something wider.
     let transfer_acl = TransferAcl::parse(&cli.allow_transfer)?;
     let tsig_keys = TsigKeyring::parse(&cli.tsig_key)?;
-    let notify_targets = parse_notify_targets(&cli.also_notify)?;
+    // After the keyring, because a `#key` names one of its entries.
+    let notify = Arc::new(build_notify_policy(&cli, &per_zone.notify, &tsig_keys)?);
+    // Said out loud for the reason the transfer policy is: whether a NOTIFY is
+    // signed decides whether a secondary with a keyed notify ACL will act on it,
+    // and the failure is otherwise a zone that is quietly hours stale (#46).
+    if !notify.is_empty() {
+        tracing::info!("notifying {}", notify.describe());
+    }
     let query_limit = RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(
         TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
     );
@@ -1598,7 +1686,7 @@ async fn main() -> Result<()> {
             served: served.clone(),
             state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&zone_dir)))),
             zone_dir,
-            notify_targets: notify_targets.clone(),
+            notify: notify.clone(),
             readiness: readiness.clone(),
         };
         spawn_secondaries(
@@ -1611,7 +1699,7 @@ async fn main() -> Result<()> {
 
     // A zone that has just been loaded is news to every secondary, which is why
     // this runs at startup and not only on reload.
-    let announced = announce_zones(&zone_map, &[], &notify_targets, &shutdown.busy()).await;
+    let announced = announce_zones(&zone_map, &[], &notify, &shutdown.busy()).await;
 
     // Which zones are replicated, before `reload_secondaries` is moved into
     // `Reloading`. `status` reports the role from the configuration rather than
@@ -1640,7 +1728,7 @@ async fn main() -> Result<()> {
     let reloads = spawn_zone_maintenance(
         served.clone(),
         source,
-        notify_targets,
+        notify,
         announced,
         Reloading {
             replicating,
@@ -1778,6 +1866,7 @@ mod tests {
     use rdns::{OpCode, Qtype, ResponseCode, Ttl};
     use rdns_transport::tcp::Reply;
     use std::collections::BTreeMap;
+    use std::net::{IpAddr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -3347,7 +3436,7 @@ mod tests {
     }
 
     /// The replication context a refresh runs in, over a scratch directory.
-    fn replication(dir: &ScratchDir, notify_targets: Vec<SocketAddr>) -> ReplicationContext {
+    fn replication(dir: &ScratchDir, notify: NotifyPolicy) -> ReplicationContext {
         ReplicationContext {
             served: ZoneContext {
                 zone_map: Arc::new(RwLock::new(Zones::default())),
@@ -3357,7 +3446,7 @@ mod tests {
             },
             state: Arc::new(Mutex::new(StateFile::load(&state_file_path(dir.path())))),
             zone_dir: dir.path().to_path_buf(),
-            notify_targets,
+            notify: Arc::new(notify),
             // Nothing here probes `/readyz`; `readiness::tests` is where the
             // latch itself is checked.
             readiness: Readiness::ready(),
@@ -3385,7 +3474,7 @@ mod tests {
             master,
             key_name: None,
         };
-        let r = replication(&dir, Vec::new());
+        let r = replication(&dir, NotifyPolicy::default());
 
         let outcome = refresh_once(&spec, None, &r, &test_shutdown().busy())
             .await
@@ -3448,7 +3537,7 @@ mod tests {
             master,
             key_name: None,
         };
-        let r = replication(&dir, Vec::new());
+        let r = replication(&dir, NotifyPolicy::default());
 
         refresh_once(&spec, None, &r, &test_shutdown().busy())
             .await
@@ -3476,7 +3565,7 @@ mod tests {
     async fn test_a_bumped_serial_replaces_the_zone() {
         let dir = ScratchDir::new("bumped");
         let spec_zone = "example.com.".to_string();
-        let r = replication(&dir, Vec::new());
+        let r = replication(&dir, NotifyPolicy::default());
 
         let old = spawn_primary(&zone_text(7)).await;
         refresh_once(
@@ -3566,7 +3655,7 @@ mod tests {
             },
             state: state.clone(),
             zone_dir: dir.path().to_path_buf(),
-            notify_targets: Vec::new(),
+            notify: Arc::new(NotifyPolicy::default()),
             readiness: Readiness::ready(),
         };
         expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
@@ -3618,7 +3707,7 @@ mod tests {
             },
             state: state.clone(),
             zone_dir: dir.path().to_path_buf(),
-            notify_targets: Vec::new(),
+            notify: Arc::new(NotifyPolicy::default()),
             readiness: Readiness::ready(),
         };
         expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
@@ -3642,7 +3731,7 @@ mod tests {
              www  IN A   192.0.2.250\n\
              extra IN TXT \"added in version 8\"\n";
 
-        let r = replication(&dir, Vec::new());
+        let r = replication(&dir, NotifyPolicy::default());
 
         // Start from version 7, fetched in full because we hold nothing yet.
         let first = spawn_primary(&old_text).await;
@@ -3731,7 +3820,13 @@ mod tests {
         let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
         let target = downstream.local_addr().expect("addr");
 
-        let r = replication(&dir, vec![target]);
+        let r = replication(
+            &dir,
+            NotifyPolicy::new(vec![NotifyPeer {
+                addr: target,
+                key: None,
+            }]),
+        );
         let spec = MasterSpec {
             zone: nm("example.com."),
             master,
@@ -3765,6 +3860,219 @@ mod tests {
         );
     }
 
+    /// #46a: a NOTIFY signed, and verified by the *reader* rather than by
+    /// looking at it. `check_request` is the same function the answering path
+    /// runs on an inbound message, so this is the check a real secondary makes.
+    ///
+    /// Against the old code this fails at `TsigCheck::Unsigned`: `notify.rs`
+    /// mentioned TSIG nowhere and `--also-notify` had no way to name a key.
+    #[tokio::test]
+    async fn test_a_notify_can_be_signed_and_verifies_as_a_request() {
+        let dir = ScratchDir::new("announce-signed");
+        let master = spawn_primary(&zone_text(11)).await;
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let target = downstream.local_addr().expect("addr");
+
+        let key = TsigKey::new("notify.key.", TsigAlgorithm::HmacSha256, vec![0x2b; 32]);
+        let r = replication(
+            &dir,
+            NotifyPolicy::new(vec![NotifyPeer {
+                addr: target,
+                key: Some(key.clone()),
+            }]),
+        );
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+        };
+        refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("transfer");
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _from) =
+            tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
+                .await
+                .expect("a NOTIFY should arrive")
+                .expect("recv");
+
+        let keyring = TsigKeyring::new(vec![key]);
+        match tsig::check_request(&buf[..n], &keyring, tsig::now()) {
+            rdns::tsig::TsigCheck::Verified(session) => {
+                assert_eq!(session.key_name(), "notify.key.");
+            }
+            rdns::tsig::TsigCheck::Unsigned => panic!("the NOTIFY went out unsigned"),
+            rdns::tsig::TsigCheck::Rejected(r) => {
+                panic!("the NOTIFY did not verify: {}", r.error.reason())
+            }
+        }
+
+        let msg = DnsMessage::try_from_bytes(&buf[..n]).expect("parse");
+        assert_eq!(msg.opcode, OpCode::Notify, "still a NOTIFY, signed or not");
+        assert_eq!(notify::notified_zone(&msg), Some(nm("example.com.")));
+    }
+
+    /// A refusal ends the sending: it arrived, and repeating it would not change
+    /// the secondary's mind.
+    ///
+    /// **Not a regression test for #46b**, and saying so is the point (§10).
+    /// The old code stopped here too — what it did wrong was call it
+    /// `acknowledged` at INFO. That distinction lives in `notify::outcome`'s
+    /// return type and is tested beside it; this only holds the retry behaviour
+    /// that the rewording must not have changed.
+    #[tokio::test]
+    async fn test_a_refused_notify_is_not_retried() {
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let target = downstream.local_addr().expect("addr");
+
+        let sender = tokio::spawn(async move {
+            send_notify(
+                nm("example.com.").as_ref(),
+                Serial::new(7),
+                None,
+                NotifyPeer {
+                    addr: target,
+                    key: None,
+                },
+            )
+            .await;
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
+                .await
+                .expect("the first NOTIFY")
+                .expect("recv");
+        let request = DnsMessage::try_from_bytes(&buf[..n]).expect("parse");
+        let refusal = notify::notify_response(&request, ResponseCode::Refused);
+        let bytes = refusal.to_bytes_within(512).expect("serialize");
+        downstream.send_to(&bytes, from).await.expect("reply");
+
+        // Nothing further: the message got there, and a second copy would not
+        // make a secondary that refused it change its answer.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), downstream.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "a refusal must end the retries"
+        );
+        sender.await.expect("the sender finishes");
+    }
+
+    /// An unsigned answer to a signed NOTIFY is not an answer: otherwise anyone
+    /// who can guess the transaction could silence a notification with a forged
+    /// datagram, which is the property the retry loop already had for a reply
+    /// carrying the wrong id.
+    #[tokio::test]
+    async fn test_an_unsigned_reply_to_a_signed_notify_is_not_an_acknowledgement() {
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let target = downstream.local_addr().expect("addr");
+        let key = TsigKey::new("notify.key.", TsigAlgorithm::HmacSha256, vec![0x3c; 32]);
+
+        let sender = tokio::spawn(async move {
+            send_notify(
+                nm("example.com.").as_ref(),
+                Serial::new(7),
+                None,
+                NotifyPeer {
+                    addr: target,
+                    key: Some(key),
+                },
+            )
+            .await;
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let mut answered = 0;
+        // Every attempt gets an unsigned "yes", and none of them counts.
+        while let Ok(Ok((n, from))) =
+            tokio::time::timeout(Duration::from_secs(4), downstream.recv_from(&mut buf)).await
+        {
+            answered += 1;
+            let request = DnsMessage::try_from_bytes(&buf[..n]).expect("parse");
+            let reply = notify::notify_response(&request, ResponseCode::Ok);
+            let bytes = reply.to_bytes_within(512).expect("serialize");
+            downstream.send_to(&bytes, from).await.expect("reply");
+        }
+        assert_eq!(
+            answered,
+            notify::NOTIFY_ATTEMPTS,
+            "an unsigned NOERROR must not stop the retries"
+        );
+        sender.await.expect("the sender finishes");
+    }
+
+    /// #46c: `[zones."x"].also-notify` adds to the global list for that zone
+    /// and leaves every other zone's alone.
+    ///
+    /// There is no old behaviour for this to fail against, which is the finding:
+    /// the per-zone list was parsed into `PerZone::notify` and read by nothing.
+    #[test]
+    fn test_per_zone_notify_targets_add_to_the_global_list() {
+        let peer = |s: &str| NotifyPeer {
+            addr: s.parse().expect("an address"),
+            key: None,
+        };
+        let mut policy = NotifyPolicy::new(vec![peer("192.0.2.1:53")]);
+        policy.add_zone(
+            nm("example.com.").as_ref(),
+            vec![peer("192.0.2.2:53"), peer("192.0.2.1:53")],
+        );
+
+        let addrs = |zone: &str| {
+            policy
+                .targets_for(nm(zone).as_ref())
+                .iter()
+                .map(|p| p.addr.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            addrs("example.com."),
+            ["192.0.2.1:53", "192.0.2.2:53"],
+            "the global list plus this zone's, and the repeat named once"
+        );
+        assert_eq!(
+            addrs("example.net."),
+            ["192.0.2.1:53"],
+            "a zone with no list of its own gets the global one"
+        );
+        assert_eq!(
+            addrs("EXAMPLE.COM."),
+            ["192.0.2.1:53", "192.0.2.2:53"],
+            "matched as a name, so case does not decide who is told (RFC 4343)"
+        );
+    }
+
+    /// A `#key` naming a key nothing defines stops the server, for the reason
+    /// `--secondary` already does: the operator asked for authentication and
+    /// would otherwise not be able to see that they did not get it.
+    #[test]
+    fn test_a_notify_key_that_no_tsig_key_defines_is_a_startup_error() {
+        let keys = TsigKeyring::new(vec![TsigKey::new(
+            "known.key.",
+            TsigAlgorithm::HmacSha256,
+            vec![0x4d; 32],
+        )]);
+        let err = parse_notify_peers(&["192.0.2.1#missing.key.".to_string()], &keys)
+            .expect_err("a key nobody defines");
+        assert!(
+            err.to_string().contains("missing.key."),
+            "the message names the key that is missing: {err}"
+        );
+
+        // And the one that is defined resolves, whatever its algorithm — the
+        // operator wrote the algorithm once, beside the secret.
+        let peers = parse_notify_peers(&["192.0.2.1#known.key.".to_string()], &keys)
+            .expect("a key that exists");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].key.as_ref().map(|k| k.name.as_str()),
+            Some("known.key.")
+        );
+    }
+
     /// Nothing is announced when nothing moved: a refresh that confirms the
     /// serial is unchanged is not news, and telling anyone would cost them a
     /// pointless SOA probe every refresh interval.
@@ -3775,7 +4083,13 @@ mod tests {
         let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
         let target = downstream.local_addr().expect("addr");
 
-        let r = replication(&dir, vec![target]);
+        let r = replication(
+            &dir,
+            NotifyPolicy::new(vec![NotifyPeer {
+                addr: target,
+                key: None,
+            }]),
+        );
         let spec = MasterSpec {
             zone: nm("example.com."),
             master,
@@ -3811,7 +4125,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_transferred_change_becomes_an_increment_we_can_serve() {
         let dir = ScratchDir::new("ixfr-out");
-        let r = replication(&dir, Vec::new());
+        let r = replication(&dir, NotifyPolicy::default());
         let spec = |master| MasterSpec {
             zone: nm("example.com."),
             master,
@@ -4074,7 +4388,7 @@ mod tests {
             key_name: None,
         };
         let dir = ScratchDir::new("refused");
-        let r = replication(&dir, Vec::new());
+        let r = replication(&dir, NotifyPolicy::default());
 
         // The AXFR our own client makes is refused, which is the baseline.
         let err = refresh_once(&spec, None, &r, &test_shutdown().busy())

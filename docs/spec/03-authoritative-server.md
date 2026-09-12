@@ -257,10 +257,23 @@ back at startup.
 
 ### Sending
 
-`--also-notify <addr[:port]>` (global) and `[zones."x"].also-notify` (per zone).
-Sent on zone load — at startup and on every reload — for every zone whose serial
-moved forward, compared with `Serial::is_newer_than`. Transaction ids come from
-`rdns::rand_id`.
+`--also-notify <addr[:port][#key]>` (global) and `[zones."x"].also-notify` (per
+zone, *added* to the global list). Sent on zone load — at startup and on every
+reload — for every zone whose serial moved forward, compared with
+`Serial::is_newer_than`. Transaction ids come from `rdns::rand_id`.
+
+`#key` names a `--tsig-key` and signs the NOTIFY (RFC 8945); the reply is then
+verified, and an unsigned or wrongly signed one is not treated as an answer. A
+key naming nothing stops the server.
+
+Every rcode ends the retries, because the message arrived. Only NOERROR is
+logged as acceptance; anything else is a `warn` naming the rcode, since nothing
+will refresh as a result.
+
+> ~~`[zones."x"].also-notify` is parsed and applied per zone.~~ **Wrong until
+> 2026-09-12**, and this page said it for months: the per-zone list was parsed
+> into `PerZone::notify` and read by nothing, so a `deny_unknown_fields` config
+> accepted it and dropped it. `TODO.md` #46c.
 
 > Deviation D-3 — fixed 2026-08-03. ~~The transaction id is derived from
 > `SystemTime`'s `subsec_nanos()`, so two NOTIFYs in one clock tick share an

@@ -343,6 +343,24 @@ impl TsigKeyring {
             .find(|k| k.name == name && k.algorithm == algorithm)
     }
 
+    /// The key of that name, whatever its algorithm: the *config* lookup.
+    ///
+    /// Deliberately not [`Self::get`], and the difference is where the algorithm
+    /// comes from. On the wire a peer supplies both, and a name that matches
+    /// under the wrong algorithm must be BADKEY rather than a downgrade — so
+    /// `get` requires both. Here the operator has written `#partner.key.` in a
+    /// `--secondary` or `--also-notify`, and the algorithm is whatever the
+    /// `--tsig-key` defining that name says; making them repeat it would be a
+    /// second place to get it wrong.
+    ///
+    /// One function because two call sites wanted it and the second was about to
+    /// be a copy of the first, which is how the four-algorithm fallback in
+    /// `rdnsd`'s replication came to exist (`CLAUDE.md` §7).
+    pub fn by_name(&self, name: &str) -> Option<&TsigKey> {
+        let name = canonical_key_name(name);
+        self.keys.iter().find(|k| k.name == name)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }

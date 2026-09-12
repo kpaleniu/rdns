@@ -26,7 +26,7 @@ host = "127.0.0.1"          # default 0.0.0.0
 port = 53
 zone-dir = "./zones"
 allow-transfer = ["192.0.2.1"]
-also-notify = ["192.0.2.2:53"]
+also-notify = ["192.0.2.2:53", "192.0.2.4#partner.key."]   # #key signs the NOTIFY
 response-rate = 8192        # bytes/s per client, 0 = off
 query-rate = 1000           # queries/s per client, 0 = off
 query-burst = 200
@@ -52,7 +52,7 @@ zones = ["example.com."]                        # or every zone if omitted
 [zones."example.com."]
 file = "example.com.zone"       # the origin comes from the TABLE KEY, not the name
 masters = ["192.0.2.9#partner.key."]
-also-notify = ["192.0.2.3"]
+also-notify = ["192.0.2.3"]     # added to [server].also-notify, for this zone
 nsec3 = true                    # overrides [signing] for this zone only
 validity-days = 7
 ```

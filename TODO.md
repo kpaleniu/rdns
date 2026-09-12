@@ -79,12 +79,18 @@ that goes first — it is the only section that could *invalidate* the others
 rather than add to them, since nothing here has ever answered another
 implementation. Seventeen rows across the three, of which **nine are a `grep`
 that returned zero**, counted rather than estimated on the day of filing.~~
-**One inventory and four numbered sections still, 2026-09-12**: #43 went first,
+~~**One inventory and four numbered sections still, 2026-09-12**: #43 went first,
 as it said it would, and closed the day after it was filed — five rows, 112
 assertions against BIND, Knot, NSD and Unbound, nothing in any row refuted. It
 filed **#46** on its way out, which is the only thing it found and is in NOTIFY,
 a corner none of its five rows had named. So what is open is #42, #44, #45, #46
-and #21.
+and #21.~~ **One inventory and three numbered sections, later the same day**:
+#46 closed too, and it had grown a third item on the way — the per-zone
+`also-notify` that was parsed and read by nothing. The harness #43 left behind
+is what proved the fix, which is the first time anything here has been checked
+against another implementation rather than against itself: 117 assertions now,
+and the NOTIFY row fails if the signing is taken back out. So **#42, #44, #45
+and #21**.
 
 - ~~**#37** — where a module folder pays, and where it is motion. Four items, of
   which one (37a, five name helpers #35 and #36 left behind) is the only one
@@ -503,7 +509,7 @@ cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone   --metrics-list
 # Interoperability against BIND, Knot, NSD and Unbound (#43). One docker compose
 # network, `internal: true` and no published ports, so nothing it runs is
 # reachable from off the machine; `contained` asserts that four ways before any
-# scenario starts. 112 assertions, and the peers' versions are printed by every
+# scenario starts. 117 assertions, and the peers' versions are printed by every
 # run because "interop passed" without them names nothing.
 tests/interop/run.sh all            # images, setup, five scenarios; leaves it up
 tests/interop/run.sh 43c            # one scenario against a network already up
@@ -854,9 +860,10 @@ again, later still**: #41 closed the day it was filed and **#42** — the three
 encrypted transports — was filed off #21's list, so the pair is #42 and #21.~~
 ~~**Five at the end of that day**: #42, #43 (interop against a real peer), #44
 (what an operator would find missing in `rdnsd`), #45 (what an ISP would find
-missing in `rdnsr`), and #21.~~ **Five still, 2026-09-12**: #43 closed and filed
+missing in `rdnsr`), and #21.~~ ~~**Five still, 2026-09-12**: #43 closed and filed
 **#46** (`rdnsd` cannot sign a NOTIFY), so the five are #42, #44, #45, #46 and
-#21. #43's section is in `docs/CLOSED_WORK.md`.
+#21.~~ **Four, later the same day**: #46 closed as well, so #42, #44, #45 and
+#21. Both sections are in `docs/CLOSED_WORK.md`.
 Everything
 else numbered is under "Closed work" below; #38's, #39's, #40's and #41's
 sections went
@@ -1092,40 +1099,6 @@ from #44's. Same filing rule: every "0 hits" is a `grep` taken on the day.
 
 ---
 
-### 46. `rdnsd` cannot sign a NOTIFY — **filed 2026-09-12**
-
-The one thing #43 found, and no row of #43 pointed at it. `rdns/src/notify.rs`
-mentions TSIG nowhere and `--also-notify` takes an address and an optional port
-and nothing else, so every NOTIFY this server sends is unsigned.
-
-The *receiving* side is fine and was checked: `tsig::check_request` runs before
-dispatch decides anything (`rdnsd/src/dispatch.rs`), so a signed NOTIFY has its
-MAC verified, a bad one gets NOTAUTH, and the reply is signed. Knot's primary
-signs its NOTIFY to `rdnsd` and `rdnsd` acts on it. It is the send side alone.
-
-Measured against two peers, configured the way an operator configures them once
-the transfer is already keyed:
-
-| | | |
-|---|---|---|
-| **46a** | `--also-notify` cannot name a key | NSD's `allow-notify: 10.53.0.2 interop.key.` answers **REFUSED** and Knot's `acl: { key: interop.key., action: notify }` answers **NOTAUTH** — measured, both of them, not inferred from their manuals. The secondary then learns of a change when its REFRESH timer next fires, which for an ordinary SOA is hours. BIND is *not* affected, and the reason is worth writing down rather than rediscovering: it accepts a NOTIFY from any server in the zone's `primaries` list whatever `allow-notify` says, so `allow-notify { key ...; }` on a BIND secondary does not do what it looks like it does |
-| **46b** | a refused NOTIFY is logged as `acknowledged` | `NOTIFY example.org. serial N to 10.53.0.5:53: acknowledged (Refused)`, at INFO, and then no retry. The reasoning behind treating any rcode as an acknowledgement is in `docs/CLI_USAGE.md` and is right for NOTAUTH-because-not-a-secondary — repeating would not change its mind. It is wrong for REFUSED-because-unsigned, where the NOTIFY path is permanently broken and nothing says so. This is `CLAUDE.md` §4's shape: healthy process, nothing alerting, a zone that is hours stale on every secondary |
-
-**What would refute this (§19).** That an unsigned NOTIFY is legal — RFC 1996
-requires no TSIG, and rdnsd is not violating anything. So 46a is a *capability*
-gap and not a defect, and the argument for taking it is that all three of the
-peers this tree now talks to can demand it and two of them do when asked. 46b is
-the half with teeth, is independent of 46a, and is the cheaper of the two.
-
-The shape of the fix is not the interesting question — `--also-notify
-ADDR[:PORT][#KEY]` is the spelling every other flag here already uses
-(`--secondary` parses exactly that, `MasterSpec`), and `notify::notify_request`
-would gain what `xfr` already does to sign a request. What has to be decided
-first is 46b's rcode policy, because a keyed NOTIFY makes REFUSED mean something
-new and the current code cannot tell the two apart.
-
----
-
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -1247,6 +1220,7 @@ the week; the record is under "How the queue kept going stale" in
 | **38** | a structural review, and what it left | **filed and closed 2026-09-09 → 2026-09-10**: three fixes in the filing commits and five sub-items after them, 38e's cross-crate half decided against rather than done. **Nothing filed was a defect**; the one defect the review turned up was in the fixed half — a DO bit dropped by three reply paths across both daemons, against `rdnsd/src/answer.rs`, which mirrored it. 38d's `rdnsd` half is what filed #39. |
 | **39** | `rdnsd` answers through two dispatchers | **filed and closed 2026-09-10 → 2026-09-11**, five items. 39a was the defect: a TSIG-rejected request counted as received over TCP and not over UDP, because the two prologues had drifted. 39b built all three shapes before keeping one, and the two it declined are the argument — a trait that had to name the type it existed to hide, and a `transport` plus `out` pair that could disagree with itself. |
 | **41** | nothing capped the UDP response, and the sizes were hardcoded | **filed and closed 2026-09-11**, four items, none of them a live defect. 41b's measurement came before its fix and is `rdnsd/src/response_size.rs`; 41a and 41b became one type, `rdns::UdpSizes`, whose `reply_ceiling` cannot be asked without the `min`. The hardcode had three instances and not the two the filing named — 41c, where the third was also a receive buffer, and where Unbound's 64 KiB was the obvious answer and the wrong one: `--max-inflight-udp` multiplies it by 1024. 41d found RFC 8945 §5.3 had already written the remedy the row guessed at. Nothing filed on the way out. |
+| **46** | `rdnsd` could not sign a NOTIFY | **filed and closed 2026-09-12**, three items, all of them live. 46a: `--also-notify` took an address and nothing else, so a secondary whose notify ACL names a key refused every notification — measured against NSD and Knot, both. 46b: that refusal was logged `acknowledged (Refused)` at INFO, which is a permanently broken notification path with nothing in a failed state. 46c was found while fixing the other two and was the worst of the three: `[zones."x"].also-notify` was parsed into `PerZone::notify` and read by nothing, with two `docs/spec/` files documenting it as working. `--secondary` and `--also-notify` are one parser now (`rdns::endpoint`), which is why 46a existed at all |
 | **43** | nothing here had ever answered another implementation | **filed 2026-09-11, closed 2026-09-12.** `tests/interop/` — one `docker compose` network, `run.sh all`. 112 assertions against BIND 9.20.27, Knot 3.6.0, NSD 4.12.0, Unbound 1.23.1 and ldns 1.8.4; 0 failures. **Neither of the two things the filing predicted happened**: the IXFR is a real delta in both directions and every NSEC3 shape validates. Found one gap, in NOTIFY, which no row had named — **#46**. Three of the first five apparent findings were the harness, and the section says what each was, because that ratio is the lesson |
 | **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. |
 

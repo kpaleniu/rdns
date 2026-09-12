@@ -20,7 +20,7 @@
 //! built on the `Server` harness there.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -30,20 +30,21 @@ use tokio::sync::{Notify, RwLock};
 use rdns::clock::current_unix_timestamp;
 use rdns::metrics::DnsMetrics;
 use rdns::name_keys::NameKeyBuf;
+use rdns::notify::NotifyPolicy;
 use rdns::readiness::Readiness;
 use rdns::secondary::{
     state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile, TransferState,
 };
 use rdns::shutdown::{Busy, Lifecycle};
-use rdns::tsig::{TsigAlgorithm, TsigKey, TsigKeyring};
+use rdns::tsig::{TsigKey, TsigKeyring};
 use rdns::xfr;
 use rdns::zone::Zone;
 use rdns::zone_writer::write_zone_file;
 use rdns::NameRef;
 use rdns::Serial;
 
+use crate::announce_transfer;
 use crate::zones::{install_zone, ZoneContext, Zones};
-use crate::{absolute_name, announce_transfer};
 
 /// One replicated zone, as a NOTIFY needs to see it.
 pub(crate) struct ReplicatedZone {
@@ -74,7 +75,7 @@ pub(crate) struct ReplicationContext {
     pub(crate) state: Arc<Mutex<StateFile>>,
     pub(crate) zone_dir: PathBuf,
     /// Who to tell when a zone we replicate moves — we are its master to them.
-    pub(crate) notify_targets: Vec<SocketAddr>,
+    pub(crate) notify: Arc<NotifyPolicy>,
     /// Ticked off when a zone this server had nothing for arrives, taking a
     /// cold-started secondary from "listening" to "ready".
     pub(crate) readiness: Readiness,
@@ -97,16 +98,7 @@ pub(crate) fn spawn_secondaries(
         // not see that they did not get it.
         let key = match &spec.key_name {
             Some(name) => Some(
-                keys.get(&absolute_name(name), TsigAlgorithm::HmacSha256)
-                    .or_else(|| {
-                        [
-                            TsigAlgorithm::HmacSha1,
-                            TsigAlgorithm::HmacSha384,
-                            TsigAlgorithm::HmacSha512,
-                        ]
-                        .into_iter()
-                        .find_map(|alg| keys.get(&absolute_name(name), alg))
-                    })
+                keys.by_name(name)
                     .ok_or_else(|| {
                         anyhow!("--secondary names TSIG key {name:?}, which no --tsig-key defines")
                     })?
@@ -231,7 +223,7 @@ pub(crate) async fn refresh_once(
         served,
         state,
         zone_dir,
-        notify_targets,
+        notify,
         readiness,
     } = replication;
     let ZoneContext {
@@ -321,7 +313,7 @@ pub(crate) async fn refresh_once(
     }
 
     // We are this zone's master to whoever replicates it from us.
-    announce_transfer(spec.zone.as_ref(), serial, soa, notify_targets, busy);
+    announce_transfer(spec.zone.as_ref(), serial, soa, notify, busy);
 
     Ok(match held {
         Some(held) => format!("transferred serial {held} -> {serial}, {count} records{note}"),

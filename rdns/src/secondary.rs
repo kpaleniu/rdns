@@ -15,7 +15,7 @@
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::Qtype;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -117,16 +117,9 @@ pub struct MasterSpec {
 impl MasterSpec {
     pub fn parse(spec: &str) -> ConfigResult<Self> {
         let spec = spec.trim();
-        let (rest, key_name) = match spec.split_once('#') {
-            Some((rest, key)) if !key.is_empty() => (rest, Some(key.to_string())),
-            Some(_) => {
-                return Err(ConfigError::new(format!(
-                    "{spec:?}: '#' with no key name after it"
-                )))
-            }
-            None => (spec, None),
-        };
-        let Some((zone, master)) = rest.split_once('@') else {
+        // Split the zone off first; the rest is `addr[:port][#key]`, which
+        // `--also-notify` spells the same way and which one parser owns.
+        let Some((zone, master)) = spec.split_once('@') else {
             return Err(ConfigError::new(format!(
                 "{spec:?} is not zone@master[:port][#key]: no '@' separating the \
                  zone from the address it comes from"
@@ -138,28 +131,15 @@ impl MasterSpec {
             )));
         }
 
+        let (master, key_name) = crate::endpoint::parse_endpoint(master, spec)?;
+
         Ok(MasterSpec {
             zone: Name::from_presentation(zone).map_err(|e| {
                 ConfigError::new(format!("{spec:?}: {zone:?} is not a domain name: {e}"))
             })?,
-            master: parse_address(master, spec)?,
+            master,
             key_name,
         })
-    }
-}
-
-/// `addr` or `addr:port`, defaulting to 53. A bare IPv6 address has colons, so
-/// `[::1]:5353` is the only unambiguous way to give one a port — which is what
-/// `SocketAddr` already parses.
-fn parse_address(text: &str, spec: &str) -> ConfigResult<SocketAddr> {
-    if let Ok(addr) = text.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    match text.parse::<IpAddr>() {
-        Ok(ip) => Ok(SocketAddr::new(ip, 53)),
-        Err(e) => Err(ConfigError::new(format!(
-            "{spec:?}: {text:?} is not an address or address:port: {e}"
-        ))),
     }
 }
 

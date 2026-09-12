@@ -51,6 +51,12 @@ check() {
 t() { $COMPOSE exec -T tools "$@" 2>&1; }
 dig_() { t dig +timeout=3 +tries=2 "$@"; }
 
+# A log window docker will read as UTC. `docker compose logs --since` treats a
+# bare timestamp as the daemon's *local* time, so `date -u` without the Z was
+# widening every window by the host's UTC offset -- and by nothing at all on a
+# host set to UTC, which is why it read as working.
+since_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
 wait_for() { # wait_for <seconds> <command...>  — polls until the command succeeds
   local deadline=$(( $(date +%s) + $1 )); shift
   until "$@" >/dev/null 2>&1; do
@@ -269,7 +275,7 @@ s43a() {
   # visible is the secondary's own log, so that is what is read.
   say "43a - IXFR, and whether it is a delta or a silent AXFR"
 
-  local since; since=$(date -u +%Y-%m-%dT%H:%M:%S)
+  local since; since=$(since_now)
   local old_serial new_serial
   old_serial=$(serial_of 10.53.0.2 5353 example.org.)
   new_serial=$((old_serial + 1))
@@ -378,7 +384,7 @@ s43b() {
 
   # ---- IXFR in, driven by a dynamic update on the real primary -------------
   say "43b - NOTIFY in and IXFR in"
-  local since; since=$(date -u +%Y-%m-%dT%H:%M:%S)
+  local since; since=$(since_now)
   local i=0 before after line
   for spec in $PRIMARIES; do
     zone="${spec%%@*}"; addr="$(echo "$spec" | cut -d@ -f2)"; name="${spec##*@}"
@@ -428,7 +434,7 @@ s43b() {
   # frombind.test. has a 45-second EXPIRE. CLAUDE.md sec 4: a zone out of
   # contact with every master must be withdrawn, not served stale with AA set.
   say "43b - EXPIRE, with the primary held down"
-  local expire_since; expire_since=$(date -u +%Y-%m-%dT%H:%M:%S)
+  local expire_since; expire_since=$(since_now)
   info "stopping bind-primary; frombind.test. EXPIRE is 45s"
   $COMPOSE stop bind-primary >/dev/null 2>&1
 
@@ -703,23 +709,68 @@ s43e() {
   check "kdig's EDNS padding does not break the answer" "192.0.2.10" \
     <<< "$(t kdig +short +padding=128 -p 5353 @10.53.0.2 www.example.com A 2>&1)"
 
-  # ---- the one gap this section found, kept visible ----------------------
+  # ---- #46: a NOTIFY the peer's ACL demands be signed ---------------------
   #
-  # rdnsd cannot sign a NOTIFY: rdns/src/notify.rs mentions TSIG nowhere and
-  # --also-notify takes an address and nothing else. Measured against two peers
-  # configured the way an operator would when the transfer is already keyed --
-  # NSD's `allow-notify: <addr> <key>` and Knot's `acl: key: <key>, action:
-  # notify` both refuse every NOTIFY, and rdnsd writes the refusal down as
-  # "acknowledged" and stops retrying. BIND is unaffected only because it
-  # accepts NOTIFY from its configured primaries whatever allow-notify says.
+  # NSD's `allow-notify: <addr> <key>` and Knot's `acl: { key: ..., action:
+  # notify }` both refuse an unsigned NOTIFY, which is how #46 was found: rdnsd
+  # could not sign one, and logged the refusal as "acknowledged". Both configs
+  # now name the key, so an unsigned NOTIFY would fail this.
   #
-  # A skip rather than a failure: the harness's own configs use address ACLs,
-  # so nothing here is broken. See TODO.md #46.
-  skip "a TSIG-signed NOTIFY (#46) - rdnsd cannot send one; NSD and Knot refuse an unsigned one when keyed"
-  local refused
-  refused=$($COMPOSE logs rdnsd-primary 2>/dev/null | grep -c 'NOTIFY.*acknowledged (Refused)')
-  if [ "${refused:-0}" -gt 0 ]; then
-    info "rdnsd logged $refused refused NOTIFYs as 'acknowledged' in this run (#46)"
+  # BIND is deliberately still unkeyed in rdnsd-primary.toml: it accepts an
+  # unsigned NOTIFY from a configured primary whatever allow-notify says, so
+  # leaving it so keeps that path covered.
+  say "46 - a signed NOTIFY, to peers whose ACLs demand one"
+
+  local nsince; nsince=$(since_now)
+  local nserial nnew
+  nserial=$(serial_of 10.53.0.2 5353 example.org.)
+  nnew=$((nserial + 1))
+  # A plain global replace, as 43a's edit does: the serial is a distinctive
+  # number and appears nowhere else in the file, whichever of the two layouts
+  # the file is in by now (the tree's, or the one rdnsd rewrote after 43d).
+  $COMPOSE exec -T --user root tools \
+    sh -c "sed -i 's/$nserial/$nnew/' /srv/primary-zones/example.org.zone" >/dev/null 2>&1
+  $COMPOSE kill -s HUP rdnsd-primary >/dev/null 2>&1
+  sleep 6
+
+  local sent
+  sent=$($COMPOSE logs --since "$nsince" rdnsd-primary 2>/dev/null | grep 'NOTIFY example.org.')
+  printf '%s\n' "$sent" > "$RUN/notify-46.log"
+
+  local who
+  # The address as rdnsd prints it, port included: `10.53.0.4:53#interop.key.`.
+  for who in "knot-secondary=10.53.0.4:53#interop.key." \
+             "nsd-secondary=10.53.0.5:53#interop.key." \
+             "bind-secondary=10.53.0.3:53"; do
+    local nname="${who%%=*}" naddr="${who#*=}"
+    # Pinned to this run's serial. Without it the window's earlier, still-signed
+    # NOTIFYs satisfy the grep, and unsigning the config to check that this test
+    # can fail leaves all three of these passing.
+    if printf '%s' "$sent" | grep -qF "serial $nnew to $naddr: accepted"; then
+      ok "$nname accepted a NOTIFY sent as $naddr"
+    else
+      bad "$nname did not accept the NOTIFY"
+      printf '%s\n' "$sent" | grep -F "${naddr%%#*}" | head -3 | sed 's/^/        | /'
+    fi
+  done
+
+  if printf '%s' "$sent" | grep -q 'refused ('; then
+    bad "a NOTIFY was refused in this run"
+    printf '%s\n' "$sent" | grep 'refused (' | head -3 | sed 's/^/        | /'
+  else
+    ok "no NOTIFY was refused - and a refusal is now a warning naming the rcode, not 'acknowledged'"
+  fi
+
+  # #46c: NSD is named only under [zones."example.org."], so it must be told
+  # about that zone and about no other. Until #46c the per-zone table was
+  # parsed and read by nothing, and this would find NSD in neither list.
+  local other
+  other=$($COMPOSE logs --since "$nsince" rdnsd-primary 2>/dev/null \
+          | grep -E 'NOTIFY example\.(com|net)\.' | grep -c '10.53.0.5' || true)
+  if [ "${other:-0}" = 0 ]; then
+    ok "...and the per-zone list is per zone: nothing else was sent to 10.53.0.5"
+  else
+    bad "$other NOTIFYs for other zones went to example.org.'s per-zone target"
   fi
 }
 
