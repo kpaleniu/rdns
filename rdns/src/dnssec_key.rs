@@ -119,6 +119,128 @@ impl SigningAlgorithm {
     }
 }
 
+/// When a key is published in the DNSKEY RRset, and when it signs.
+///
+/// RFC 6781 §4.1.1.1's Pre-Publish ZSK rollover is four moments and nothing
+/// else: publish the successor, wait out the DNSKEY RRset's TTL, start signing
+/// with it and stop signing with the predecessor, wait out the RRSIG TTL, and
+/// withdraw the predecessor. Written down per key, a signing run reads them and
+/// the rollover happens on its own — there is no state machine, nothing to
+/// persist beyond the key files, and no step that can be half-done because a
+/// process restarted in the middle of it. `dnssec-settime` is the same idea.
+///
+/// **Absent means no boundary on that side**, which is what makes a key file
+/// written before this existed go on working: no `Publish` is "published since
+/// always", no `Delete` is "until somebody removes the file". The four fields
+/// are Unix seconds and unknown fields have always been ignored on read, so a
+/// file moves between versions in both directions.
+///
+/// The signer never removes a key file. `Delete` withdraws the DNSKEY from the
+/// zone, which is the reversible half; taking the private key off the disk is
+/// the operator's, and RFC 6781 §4.1.1 is worth reading before doing it early.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyTiming {
+    /// In the DNSKEY RRset from here. Before it the key is loaded and invisible.
+    pub publish: Option<u64>,
+    /// Signs from here. A key that is published and not yet active is the
+    /// pre-publish half of §4.1.1.1.
+    pub activate: Option<u64>,
+    /// Stops signing here, and stays published so the signatures it made can
+    /// still be verified.
+    pub inactive: Option<u64>,
+    /// Leaves the DNSKEY RRset here.
+    pub delete: Option<u64>,
+}
+
+impl KeyTiming {
+    /// Whether the key belongs in the DNSKEY RRset at `now`.
+    pub fn is_published(&self, now: u64) -> bool {
+        self.publish.is_none_or(|t| now >= t) && self.delete.is_none_or(|t| now < t)
+    }
+
+    /// Whether the key may sign at `now`.
+    ///
+    /// Implies published: a signature from a key the zone does not carry
+    /// verifies against nothing, so an `Activate` before `Publish` is a
+    /// contradiction rather than a broader window.
+    pub fn is_active(&self, now: u64) -> bool {
+        self.is_published(now)
+            && self.activate.is_none_or(|t| now >= t)
+            && self.inactive.is_none_or(|t| now < t)
+    }
+
+    /// The next moment after `now` at which either answer changes, if any.
+    ///
+    /// What a re-signing timer needs: the signer reads these at the start of a
+    /// run, so a rollover step happens at the next run and not at the moment it
+    /// was scheduled for. Without this a successor key activated at noon waits
+    /// for the ordinary re-signing tick, which is a third of the signature
+    /// validity — ten days, by default, for a step whose whole purpose is to
+    /// land at a TTL boundary.
+    pub fn next_change(&self, now: u64) -> Option<u64> {
+        [self.publish, self.activate, self.inactive, self.delete]
+            .into_iter()
+            .flatten()
+            .filter(|t| *t > now)
+            .min()
+    }
+
+    /// The ordering RFC 6781 §4.1.1.1 walks through, as a check.
+    ///
+    /// Refused rather than sorted: each pair inverted is a different mistake
+    /// with a different consequence, and a signer that quietly reordered them
+    /// would hide the one the operator made.
+    pub fn check(&self) -> crate::error::DnssecResult<()> {
+        for (earlier, later, what) in [
+            (self.publish, self.activate, "Publish is after Activate"),
+            (self.activate, self.inactive, "Activate is after Inactive"),
+            (self.inactive, self.delete, "Inactive is after Delete"),
+            (self.publish, self.delete, "Publish is after Delete"),
+        ] {
+            if let (Some(earlier), Some(later)) = (earlier, later) {
+                if earlier > later {
+                    return Err(crate::error::DnssecError::key(format!(
+                        "{what} ({earlier} > {later}): a key cannot sign before it is \
+                         published or be withdrawn before it stops signing \
+                         (RFC 6781 §4.1.1.1)"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The four timing fields, or nothing at all when the key carries none.
+///
+/// Omitted rather than written as empty: a key that does not roll should look
+/// like a key that does not roll, and an operator reading the file should not
+/// have to work out that `Publish:` with nothing after it means "always".
+fn timing_lines(timing: &KeyTiming) -> String {
+    [
+        ("Publish", timing.publish),
+        ("Activate", timing.activate),
+        ("Inactive", timing.inactive),
+        ("Delete", timing.delete),
+    ]
+    .into_iter()
+    .filter_map(|(name, at)| at.map(|at| format!("{name}: {at}\n")))
+    .collect()
+}
+
+/// One timing field: Unix seconds, and nothing else.
+///
+/// Not a date format. A signer compares these against a clock, the clock is
+/// `SystemTime` seconds, and a second spelling would be a parser to keep in step
+/// with whatever wrote the file (`CLAUDE.md` §7). `date +%s` is the recipe.
+fn timestamp(value: &str, field: &str) -> Result<u64> {
+    value.parse::<u64>().map_err(|e| {
+        DnssecError::key(format!(
+            "the {field} field ({value:?}): {e} — Unix seconds, as `date +%s` prints"
+        ))
+    })
+}
+
 /// The `ring` keypair behind a [`SigningKey`]. All three boxed: an
 /// `EcdsaKeyPair` alone is 240 bytes.
 enum Pair {
@@ -138,6 +260,10 @@ pub struct SigningKey {
     /// Kept so the key writes back out without a second encoding path.
     pkcs8: Vec<u8>,
     pair: Pair,
+    /// When this key is published and when it signs. All-absent for a key file
+    /// that carries no timing, which is every one written before `TODO.md` #44f
+    /// and every zone that does not roll.
+    timing: KeyTiming,
 }
 
 impl std::fmt::Debug for SigningKey {
@@ -148,6 +274,7 @@ impl std::fmt::Debug for SigningKey {
             .field("flags", &self.flags)
             .field("algorithm", &self.algorithm.name())
             .field("key_tag", &self.key_tag())
+            .field("timing", &self.timing)
             .finish_non_exhaustive()
     }
 }
@@ -245,7 +372,31 @@ impl SigningKey {
             public_key,
             pkcs8: pkcs8.to_vec(),
             pair,
+            timing: KeyTiming::default(),
         })
+    }
+
+    /// When this key is published and when it signs (`TODO.md` #44f).
+    pub fn timing(&self) -> KeyTiming {
+        self.timing
+    }
+
+    /// Set it, for a caller building a key rather than reading one.
+    pub fn with_timing(mut self, timing: KeyTiming) -> Result<Self> {
+        timing.check()?;
+        self.timing = timing;
+        Ok(self)
+    }
+
+    /// Whether this key belongs in the DNSKEY RRset at `now`, and whether it
+    /// may sign. Both are [`KeyTiming`]'s; here so a caller holding a key need
+    /// not reach through to it.
+    pub fn is_published(&self, now: u64) -> bool {
+        self.timing.is_published(now)
+    }
+
+    pub fn is_active(&self, now: u64) -> bool {
+        self.timing.is_active(now)
     }
 
     pub fn owner(&self) -> NameRef<'_> {
@@ -386,13 +537,14 @@ impl SigningKey {
              Owner: {owner}\n\
              Flags: {flags}\n\
              Algorithm: {alg}\n\
-             PrivateKey: {key}\n",
+             PrivateKey: {key}\n{timing}",
             owner = self.owner,
             alg_name = self.algorithm.name(),
             tag = self.key_tag(),
             flags = self.flags,
             alg = self.algorithm.code(),
             key = base64_encode(&self.pkcs8),
+            timing = timing_lines(&self.timing),
         )
     }
 
@@ -402,6 +554,7 @@ impl SigningKey {
         let mut flags = None;
         let mut algorithm = None;
         let mut private = None;
+        let mut timing = KeyTiming::default();
 
         for line in text.lines() {
             let line = line.trim();
@@ -428,11 +581,19 @@ impl SigningKey {
                             .map_err(|e| DnssecError::key(format!("the PrivateKey: {e}")))?,
                     )
                 }
+                // The four rollover moments (`TODO.md` #44f). Absent is no
+                // boundary on that side, which is why each is an `Option`
+                // rather than a defaulted number.
+                "publish" => timing.publish = Some(timestamp(value, "Publish")?),
+                "activate" => timing.activate = Some(timestamp(value, "Activate")?),
+                "inactive" => timing.inactive = Some(timestamp(value, "Inactive")?),
+                "delete" => timing.delete = Some(timestamp(value, "Delete")?),
                 // Unknown fields ignored so a file from a later version loads,
                 // as the anchor file does.
                 _ => {}
             }
         }
+        timing.check()?;
 
         let owner = owner.ok_or_else(|| {
             DnssecError::key(
@@ -443,7 +604,7 @@ impl SigningKey {
         let flags = flags.ok_or_else(|| DnssecError::key("no Flags field"))?;
         let algorithm = algorithm.ok_or_else(|| DnssecError::key("no Algorithm field"))?;
         let private = private.ok_or_else(|| DnssecError::key("no PrivateKey field"))?;
-        Self::from_pkcs8(algorithm, &owner, flags, &private)
+        Self::from_pkcs8(algorithm, &owner, flags, &private).map(|key| SigningKey { timing, ..key })
     }
 
     /// Write the key into `dir` under [`SigningKey::file_name`], returning the
@@ -608,6 +769,111 @@ mod tests {
     use crate::test_records::nm;
     use crate::testutil::ScratchDir;
     use crate::Class;
+
+    /// The four rollover moments survive a write and a read, and a key that
+    /// has none writes none — a key that does not roll should look like one
+    /// (`TODO.md` #44f).
+    #[test]
+    fn key_timing_round_trips_through_the_file_and_is_absent_when_unset() {
+        let dir = ScratchDir::new("key-timing");
+        let plain =
+            SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", 0x0100).expect("a key");
+        let path = plain.write_to_dir(dir.path()).expect("write");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        for field in ["Publish:", "Activate:", "Inactive:", "Delete:"] {
+            assert!(!text.contains(field), "{field} in a key that does not roll");
+        }
+
+        let timing = KeyTiming {
+            publish: Some(1_700_000_000),
+            activate: Some(1_700_086_400),
+            inactive: Some(1_702_678_400),
+            delete: Some(1_702_764_800),
+        };
+        let rolling = SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", 0x0100)
+            .expect("a key")
+            .with_timing(timing)
+            .expect("legal timing");
+        let path = rolling.write_to_dir(dir.path()).expect("write");
+        let read = SigningKey::load_dir(dir.path())
+            .expect("load")
+            .into_iter()
+            .find(|k| k.key_tag() == rolling.key_tag())
+            .expect("the rolling key");
+        assert_eq!(read.timing(), timing);
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .lines()
+                .filter(|l| l.starts_with("Publish: "))
+                .count(),
+            1,
+            "written once, not once per field name"
+        );
+    }
+
+    /// A file from a version that did not have timing still loads, and one
+    /// from a version with more fields than this build knows loads too — the
+    /// parser has always ignored what it does not recognize, and the rollover
+    /// fields do not change that.
+    #[test]
+    fn a_key_file_without_timing_and_one_with_unknown_fields_both_load() {
+        let dir = ScratchDir::new("key-timing-compat");
+        let key =
+            SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", 0x0100).expect("a key");
+        let text = key.to_key_file();
+
+        // `write_atomically_private`, not `ScratchDir::write`: `load_dir`
+        // refuses a key file the group can read, and that check is `cfg(unix)`
+        // — so a 0644 fixture passes on Windows and fails on Linux. It did,
+        // before this line (`CLAUDE.md` §1).
+        let old = dir.join("Kold.rdnskey");
+        crate::persist::write_atomically_private(&old, &text).expect("write");
+        let from_future = dir.join("Kfuture.rdnskey");
+        crate::persist::write_atomically_private(
+            &from_future,
+            &format!("{text}Publish: 1700000000\nSomethingElse: 7\n"),
+        )
+        .expect("write");
+
+        let loaded = SigningKey::load_dir(dir.path()).expect("both load");
+        assert_eq!(loaded.len(), 2, "{old:?} {from_future:?}");
+        assert!(loaded.iter().any(|k| k.timing() == KeyTiming::default()));
+        assert!(loaded
+            .iter()
+            .any(|k| k.timing().publish == Some(1_700_000_000)));
+    }
+
+    /// A timing field that is not a number, and an ordering that cannot happen.
+    /// Both are refused at load: a key whose schedule does not parse is a zone
+    /// short a signature at some moment nobody chose.
+    #[test]
+    fn a_key_file_with_timing_that_does_not_make_sense_is_refused() {
+        let dir = ScratchDir::new("key-timing-bad");
+        let key =
+            SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", 0x0100).expect("a key");
+        let text = key.to_key_file();
+
+        crate::persist::write_atomically_private(
+            &dir.join("Kbad.rdnskey"),
+            &format!("{text}Publish: last Tuesday\n"),
+        )
+        .expect("write");
+        let err = SigningKey::load_dir(dir.path()).expect_err("not a number");
+        assert!(err.to_string().contains("Publish"), "got: {err}");
+
+        let dir = ScratchDir::new("key-timing-order");
+        crate::persist::write_atomically_private(
+            &dir.join("Korder.rdnskey"),
+            &format!("{text}Publish: 200\nActivate: 100\n"),
+        )
+        .expect("write");
+        let err = SigningKey::load_dir(dir.path()).expect_err("impossible order");
+        assert!(
+            err.to_string().contains("Publish is after Activate"),
+            "got: {err}"
+        );
+    }
 
     #[test]
     fn a_generated_key_signs_something_the_validator_accepts() {

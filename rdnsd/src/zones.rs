@@ -709,8 +709,36 @@ impl ZoneSigning {
     ///
     /// Floored at a minute so a tiny `--signature-validity` cannot make this a
     /// spin loop.
+    ///
+    /// **Shortened to the next key transition when one is nearer** (`TODO.md`
+    /// #44f). A rollover moment is read by a signing *run*, so a key that
+    /// activates at noon takes effect at the next run — and the ordinary
+    /// interval is a third of the validity, ten days by default, for a step
+    /// whose entire purpose is to land at a TTL boundary. The timer has to know
+    /// what the keys are waiting for.
     pub(crate) fn resign_interval(&self) -> Duration {
-        Duration::from_secs(resign_after(self.shortest_validity()).max(60))
+        self.resign_interval_at(current_unix_timestamp())
+    }
+
+    /// [`ZoneSigning::resign_interval`] against a given instant, which is what
+    /// makes it testable without waiting ten days.
+    pub(crate) fn resign_interval_at(&self, now: u64) -> Duration {
+        let ordinary = resign_after(self.shortest_validity()).max(60);
+        let next_key_change = self
+            .keys
+            .values()
+            .flatten()
+            .filter_map(|key| key.timing().next_change(now))
+            .min()
+            // One second past it, not exactly on it: `is_active` is `now >= t`,
+            // and waking in the same second the clock reads one tick earlier
+            // would re-sign without the change and then sleep the full interval
+            // with it pending.
+            .map(|at| at.saturating_sub(now).saturating_add(1).max(60));
+        Duration::from_secs(match next_key_change {
+            Some(next) => ordinary.min(next),
+            None => ordinary,
+        })
     }
 
     /// How many of `zones` this would actually sign, for `--check-config`.
@@ -789,8 +817,48 @@ impl ZoneSigning {
                 }
             );
             warn_about_unsigned_algorithms(&origin, zone);
+            log_key_schedule(&origin, keys, signed_at);
         }
         Ok(())
+    }
+}
+
+/// Say what each key is doing right now, once per load.
+///
+/// A rollover is four moments per key and the operator wrote them into a file
+/// weeks earlier; a line per key at startup is how they find out the server
+/// agrees. INFO, not DEBUG: this is a handful of lines per reload, and the
+/// alternative is discovering the disagreement from a validator.
+fn log_key_schedule(origin: &str, keys: &[SigningKey], now: u64) {
+    for key in keys {
+        let timing = key.timing();
+        if timing == rdns::dnssec_key::KeyTiming::default() {
+            continue;
+        }
+        let state = if key.is_active(now) {
+            "signing"
+        } else if key.is_published(now) {
+            // Both ends of the window look the same in the DNSKEY RRset and are
+            // different halves of the rollover, so they are not one word.
+            match timing.activate {
+                Some(at) if now < at => "published, not yet signing",
+                _ => "published, retired from signing",
+            }
+        } else {
+            match timing.publish {
+                Some(at) if now < at => "held back, not yet published",
+                _ => "withdrawn",
+            }
+        };
+        tracing::info!(
+            "{origin} key {} ({}): {state}{}",
+            key.key_tag(),
+            if key.is_sep() { "KSK" } else { "ZSK" },
+            match timing.next_change(now) {
+                Some(at) => format!(", next change in {}s", at.saturating_sub(now)),
+                None => String::new(),
+            }
+        );
     }
 }
 
@@ -1067,6 +1135,77 @@ pub(crate) fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<Zon
 mod tests {
     use super::*;
     use crate::testutil::{nm, ScratchDir};
+    use rdns::dnssec_key::KeyTiming;
+
+    /// The re-signing timer follows the nearest key rollover step when one is
+    /// closer than the ordinary tick (`TODO.md` #44f).
+    ///
+    /// Without it a key that activates at noon waits for the ordinary interval
+    /// — ten days, by default — for a step whose entire purpose is to land at a
+    /// TTL boundary.
+    #[test]
+    fn the_resigning_timer_wakes_for_the_next_rollover_step() {
+        const NOW: u64 = 1_700_000_000;
+        let ordinary = Duration::from_secs(resign_after(30 * 86_400));
+
+        let with = |timing: KeyTiming| {
+            let key = rdns::dnssec_key::SigningKey::generate(
+                rdns::dnssec_key::SigningAlgorithm::Ed25519,
+                "example.com.",
+                0x0100,
+            )
+            .expect("a key")
+            .with_timing(timing)
+            .expect("legal timing");
+            ZoneSigning {
+                keys: HashMap::from([(nm("example.com."), vec![key])]),
+                validity: 30 * 86_400,
+                chain: DenialChain::Nsec,
+                per_zone: BTreeMap::new(),
+            }
+        };
+
+        // No timing at all: the ordinary interval, exactly as before #44f.
+        assert_eq!(
+            with(KeyTiming::default()).resign_interval_at(NOW),
+            ordinary,
+            "a key that does not roll schedules nothing"
+        );
+
+        // A step an hour away: wake for it, one second past so the signer's own
+        // `now >= t` has already turned over.
+        let soon = with(KeyTiming {
+            activate: Some(NOW + 3600),
+            ..KeyTiming::default()
+        });
+        assert_eq!(
+            soon.resign_interval_at(NOW),
+            Duration::from_secs(3601),
+            "the step, not the tick"
+        );
+
+        // A step further away than the ordinary tick changes nothing: the tick
+        // will have re-signed and recomputed by then.
+        let distant = with(KeyTiming {
+            activate: Some(NOW + 400 * 86_400),
+            ..KeyTiming::default()
+        });
+        assert_eq!(distant.resign_interval_at(NOW), ordinary);
+
+        // A step already past is not a step: nothing is scheduled behind us.
+        let done = with(KeyTiming {
+            activate: Some(NOW - 1),
+            ..KeyTiming::default()
+        });
+        assert_eq!(done.resign_interval_at(NOW), ordinary);
+
+        // And the floor holds, so a step in the next second is not a spin loop.
+        let immediate = with(KeyTiming {
+            activate: Some(NOW + 1),
+            ..KeyTiming::default()
+        });
+        assert_eq!(immediate.resign_interval_at(NOW), Duration::from_secs(60));
+    }
 
     #[test]
     fn test_extract_zone_origin_with_extension() {

@@ -326,7 +326,13 @@ fn sign_zone_inner(
 
     let mut signed = Zone::new(origin.clone());
     let (soa_ttl, minimum) = carry_over_records(zone, origin.as_ref(), policy, &mut signed)?;
-    let dnskey_ttl = publish_dnskeys(keys, origin.as_ref(), soa_ttl, &mut signed);
+    let dnskey_ttl = publish_dnskeys(
+        keys,
+        origin.as_ref(),
+        soa_ttl,
+        policy.signed_at,
+        &mut signed,
+    );
 
     // Before `Layout::of`, which snapshots which types are at which name. Every
     // NSEC3 bitmap "MUST indicate the presence of all types present at the
@@ -699,6 +705,7 @@ fn publish_dnskeys(
     keys: &[SigningKey],
     origin: NameRef<'_>,
     soa_ttl: Ttl,
+    now: u64,
     signed: &mut Zone,
 ) -> Ttl {
     let existing: Vec<RecordData> = signed
@@ -715,6 +722,12 @@ fn publish_dnskeys(
         .unwrap_or(soa_ttl);
 
     for key in keys {
+        // A key before its `Publish` or past its `Delete` is loaded and not
+        // published, which is RFC 6781 §4.1.1.1's pre-publish window at one end
+        // and its withdrawal at the other (`TODO.md` #44f).
+        if !key.is_published(now) {
+            continue;
+        }
         let rdata = dnskey_rdata(&key.dnskey());
         if existing.contains(&rdata) {
             continue;
@@ -1002,11 +1015,29 @@ fn sign_everything(
     // The key the parent's DS points at signs only the DNSKEY RRset; a separate
     // key signs the data. Not required — one key does both when only one is
     // present — but it lets the data key roll without involving the parent.
-    let sep: Vec<&SigningKey> = keys.iter().filter(|k| k.is_sep()).collect();
-    let rest: Vec<&SigningKey> = keys.iter().filter(|k| !k.is_sep()).collect();
-    let all: Vec<&SigningKey> = keys.iter().collect();
+    // Only the keys that are active at this instant sign (`TODO.md` #44f). A
+    // key inside its pre-publish window is in the DNSKEY RRset and not here,
+    // and a retired one is still in the RRset so the signatures it made go on
+    // verifying — which is the whole of RFC 6781 §4.1.1.1's ordering.
+    let now = policy.signed_at;
+    let active: Vec<&SigningKey> = keys.iter().filter(|k| k.is_active(now)).collect();
+    let sep: Vec<&SigningKey> = active.iter().copied().filter(|k| k.is_sep()).collect();
+    let rest: Vec<&SigningKey> = active.iter().copied().filter(|k| !k.is_sep()).collect();
+    let all: Vec<&SigningKey> = active.clone();
     let dnskey_signers = if sep.is_empty() { &all } else { &sep };
     let data_signers = if rest.is_empty() { &all } else { &rest };
+    if data_signers.is_empty() {
+        // Every key inactive at once. Publishing a zone whose DNSKEY RRset
+        // promises DNSSEC and whose data carries no signature is bogus at every
+        // validator, so this is a failed run and not a zone served bare
+        // (`CLAUDE.md` §4). The usual cause is an `Inactive` in the past with no
+        // successor activated.
+        return Err(DnssecError::signing(format!(
+            "no key is active at {now} to sign {} with — every key this zone has is \
+             before its Activate or past its Inactive (RFC 6781 §4.1.1.1)",
+            layout.origin,
+        )));
+    }
 
     // (owner, type) -> the RDATA of that RRset, in the order they were added.
     let mut rrsets: Rrsets = BTreeMap::new();
@@ -1130,7 +1161,7 @@ mod tests {
         nsec3s_in, nsecs_in, proves_no_ds, proves_nodata, proves_nxdomain,
         proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
     };
-    use crate::dnssec_key::{SigningAlgorithm, SigningKey};
+    use crate::dnssec_key::{KeyTiming, SigningAlgorithm, SigningKey};
     use crate::dnssec_test_util::{signing_keys, signing_policy};
     use crate::test_records::nm;
     use crate::zone::parse_zone_file;
@@ -1176,6 +1207,273 @@ a\.b    IN A   192.0.2.50
     fn sign_test_zone(chain: DenialChain) -> Zone {
         let zone = parse_zone_file(ZONE, ORIGIN).expect("the test zone parses");
         sign_zone(&zone, &signing_keys(ORIGIN), &policy(chain)).expect("signing succeeds")
+    }
+
+    // RFC 6781 key rollover, driven by the four moments in a key file.
+    // `TODO.md` #44f.
+
+    /// A key with no timing behaves exactly as it did before there was any:
+    /// published, and signing. Every key file written before #44f is this one.
+    #[test]
+    fn a_key_with_no_timing_is_published_and_active_at_every_instant() {
+        let timing = KeyTiming::default();
+        for now in [0, 1, NOW, u64::MAX] {
+            assert!(timing.is_published(now), "{now}");
+            assert!(timing.is_active(now), "{now}");
+        }
+        assert_eq!(timing.next_change(NOW), None, "nothing is ever scheduled");
+    }
+
+    /// RFC 6781 §4.1.1.1's Pre-Publish ZSK rollover, walked through: the
+    /// successor is published before it signs, the predecessor stays published
+    /// after it stops, and only one of them signs in the middle.
+    #[test]
+    fn a_pre_publish_zsk_rollover_is_four_moments_and_no_state() {
+        let old = KeyTiming {
+            inactive: Some(NOW + 200),
+            delete: Some(NOW + 300),
+            ..KeyTiming::default()
+        };
+        let new = KeyTiming {
+            publish: Some(NOW + 100),
+            activate: Some(NOW + 200),
+            ..KeyTiming::default()
+        };
+
+        // Before anything: the old key alone, doing both jobs.
+        assert!(old.is_published(NOW) && old.is_active(NOW));
+        assert!(!new.is_published(NOW), "the successor is not visible yet");
+
+        // Pre-publish: both in the DNSKEY RRset, one signing. This window has
+        // to outlast the old DNSKEY RRset in every cache.
+        assert!(new.is_published(NOW + 150) && !new.is_active(NOW + 150));
+        assert!(old.is_active(NOW + 150));
+
+        // The switch: the successor signs, the predecessor stays published so
+        // the signatures it made still verify.
+        assert!(new.is_active(NOW + 250));
+        assert!(old.is_published(NOW + 250) && !old.is_active(NOW + 250));
+
+        // And the withdrawal.
+        assert!(!old.is_published(NOW + 350));
+        assert!(new.is_active(NOW + 350));
+    }
+
+    /// The ordering is refused rather than sorted: each inversion is a
+    /// different mistake, and a signer that quietly reordered them would hide
+    /// the one the operator made.
+    #[test]
+    fn timing_that_cannot_happen_in_that_order_is_refused() {
+        for (timing, expected) in [
+            (
+                KeyTiming {
+                    publish: Some(200),
+                    activate: Some(100),
+                    ..KeyTiming::default()
+                },
+                "Publish is after Activate",
+            ),
+            (
+                KeyTiming {
+                    activate: Some(200),
+                    inactive: Some(100),
+                    ..KeyTiming::default()
+                },
+                "Activate is after Inactive",
+            ),
+            (
+                KeyTiming {
+                    inactive: Some(200),
+                    delete: Some(100),
+                    ..KeyTiming::default()
+                },
+                "Inactive is after Delete",
+            ),
+            (
+                KeyTiming {
+                    publish: Some(200),
+                    delete: Some(100),
+                    ..KeyTiming::default()
+                },
+                "Publish is after Delete",
+            ),
+        ] {
+            let err = timing.check().expect_err("{expected}");
+            assert!(err.to_string().contains(expected), "got: {err}");
+        }
+        // And the one that is legal at every pair: a key that is published,
+        // signs, retires and goes.
+        assert!(KeyTiming {
+            publish: Some(1),
+            activate: Some(2),
+            inactive: Some(3),
+            delete: Some(4),
+        }
+        .check()
+        .is_ok());
+    }
+
+    /// `Activate` before `Publish` is a contradiction rather than a wider
+    /// window: a signature from a key the zone does not carry verifies against
+    /// nothing. `check` refuses it, and `is_active` would too.
+    #[test]
+    fn a_key_cannot_sign_before_it_is_published() {
+        let timing = KeyTiming {
+            publish: Some(NOW + 100),
+            ..KeyTiming::default()
+        };
+        assert!(!timing.is_active(NOW), "not published, so not signing");
+        assert!(timing.is_active(NOW + 100));
+    }
+
+    /// What the re-signing timer asks: when does anything change next.
+    #[test]
+    fn the_next_change_is_the_nearest_moment_still_ahead() {
+        let timing = KeyTiming {
+            publish: Some(100),
+            activate: Some(200),
+            inactive: Some(300),
+            delete: Some(400),
+        };
+        assert_eq!(timing.next_change(0), Some(100));
+        assert_eq!(timing.next_change(100), Some(200), "exactly on one is past");
+        assert_eq!(timing.next_change(250), Some(300));
+        assert_eq!(timing.next_change(400), None, "nothing left to wait for");
+    }
+
+    /// The whole of it against a real zone: three keys, one instant, and the
+    /// zone that comes out. Judged with `verify_rrset`, so the rollover is
+    /// checked by the validator rather than by counting records.
+    #[test]
+    fn the_signer_publishes_and_signs_with_what_the_moment_allows() {
+        let ksk = SigningKey::generate(
+            SigningAlgorithm::EcdsaP256Sha256,
+            ORIGIN,
+            DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+        )
+        .expect("KSK");
+        let retiring =
+            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+                .expect("the ZSK on its way out")
+                .with_timing(KeyTiming {
+                    inactive: Some(NOW + 200),
+                    delete: Some(NOW + 300),
+                    ..KeyTiming::default()
+                })
+                .expect("legal timing");
+        let successor =
+            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+                .expect("the ZSK coming in")
+                .with_timing(KeyTiming {
+                    publish: Some(NOW + 100),
+                    activate: Some(NOW + 200),
+                    ..KeyTiming::default()
+                })
+                .expect("legal timing");
+        let keys = vec![ksk, retiring, successor];
+        let (ksk, retiring, successor) = (&keys[0], &keys[1], &keys[2]);
+
+        let zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        let at = |now: u64| {
+            let policy = signing_policy(now, DenialChain::Nsec);
+            sign_zone(&zone, &keys, &policy).expect("signs")
+        };
+        let published = |signed: &Zone| -> BTreeSet<u16> {
+            dnskeys_in(&resources(signed))
+                .iter()
+                .map(|k| k.key_tag())
+                .collect()
+        };
+        let data_signers = |signed: &Zone| -> BTreeSet<u16> {
+            rrsigs_in(&resources(signed))
+                .iter()
+                .filter(|s| s.type_covered == rt::A)
+                .map(|s| s.key_tag)
+                .collect()
+        };
+
+        // Before the successor is published: two keys, the old ZSK signing.
+        let early = at(NOW);
+        assert_eq!(
+            published(&early),
+            BTreeSet::from([ksk.key_tag(), retiring.key_tag()])
+        );
+        assert_eq!(data_signers(&early), BTreeSet::from([retiring.key_tag()]));
+
+        // Pre-publish window: three keys, still one signer. This is the state
+        // that has to outlast the old DNSKEY RRset in every cache.
+        let waiting = at(NOW + 150);
+        assert_eq!(
+            published(&waiting),
+            BTreeSet::from([ksk.key_tag(), retiring.key_tag(), successor.key_tag()])
+        );
+        assert_eq!(data_signers(&waiting), BTreeSet::from([retiring.key_tag()]));
+
+        // The switch: still three keys, the successor signing alone.
+        let switched = at(NOW + 250);
+        assert_eq!(
+            published(&switched),
+            BTreeSet::from([ksk.key_tag(), retiring.key_tag(), successor.key_tag()])
+        );
+        assert_eq!(
+            data_signers(&switched),
+            BTreeSet::from([successor.key_tag()])
+        );
+
+        // And after the withdrawal: two keys again, and nothing in the zone
+        // refers to the one that went.
+        let done = at(NOW + 350);
+        assert_eq!(
+            published(&done),
+            BTreeSet::from([ksk.key_tag(), successor.key_tag()])
+        );
+        assert_eq!(data_signers(&done), BTreeSet::from([successor.key_tag()]));
+
+        // Every one of the four states is a zone a validator accepts, which is
+        // the assertion the tag counting above is only evidence for.
+        for (label, signed) in [
+            ("before", &early),
+            ("pre-publish", &waiting),
+            ("switched", &switched),
+            ("after", &done),
+        ] {
+            assert!(
+                matches!(
+                    proof_for(signed, "www.example.com.", rt::A),
+                    RrsetProof::Verified { .. }
+                ),
+                "{label}"
+            );
+            assert!(
+                matches!(
+                    proof_for(signed, ORIGIN, rt::DNSKEY),
+                    RrsetProof::Verified { .. }
+                ),
+                "{label}: the DNSKEY RRset"
+            );
+        }
+    }
+
+    /// A rollover that was set up and never finished: every key inactive at
+    /// once. A DNSKEY RRset promising DNSSEC over data carrying no signature is
+    /// bogus at every validator, so the run fails rather than producing it.
+    #[test]
+    fn a_zone_whose_keys_have_all_retired_is_a_failed_run_not_a_bare_zone() {
+        let keys =
+            vec![
+                SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+                    .expect("a ZSK")
+                    .with_timing(KeyTiming {
+                        inactive: Some(NOW),
+                        ..KeyTiming::default()
+                    })
+                    .expect("legal timing"),
+            ];
+
+        let zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        let err = sign_zone(&zone, &keys, &policy(DenialChain::Nsec))
+            .expect_err("nothing is left to sign with");
+        assert!(err.to_string().contains("no key is active"), "got: {err}");
     }
 
     // RFC 8901, multi-signer DNSSEC. `TODO.md` #44e.

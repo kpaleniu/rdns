@@ -68,6 +68,68 @@ published without its private half is how a rollover starts.
 
 One RRSIG survives, under one setting: see multi-signer below.
 
+### Key rollover (RFC 6781)
+
+Four moments per key, in the key file, in Unix seconds. Absent means no boundary
+on that side, so a key file written before this existed goes on behaving exactly
+as it did — published, and signing.
+
+| field | what changes at it |
+|---|---|
+| `Publish` | the DNSKEY enters the apex RRset |
+| `Activate` | the key starts signing |
+| `Inactive` | it stops signing, and stays published so its signatures still verify |
+| `Delete` | the DNSKEY leaves the RRset |
+
+Refused at load: any pair out of order (`Publish` after `Activate`, and so on),
+and a value that is not a number. Each inversion is a different mistake, so they
+are named separately rather than sorted into shape.
+
+**That is RFC 6781 §4.1.1.1's Pre-Publish ZSK rollover with no state machine.**
+The successor is published, the old DNSKEY RRset ages out of every cache, the
+successor starts signing and the predecessor stops, the old RRSIGs age out, the
+predecessor is withdrawn. Nothing is persisted beyond the key files and no step
+can be half-done because a process restarted in the middle of it.
+
+```sh
+# a successor ZSK that pre-publishes for a day and takes over tomorrow
+now=$(date +%s)
+# ... generate the key, then add to its .rdnskey file:
+#   Publish:  $now
+#   Activate: $((now + 86400))
+# and to the predecessor's:
+#   Inactive: $((now + 86400))
+#   Delete:   $((now + 172800))
+```
+
+**The re-signing timer follows the nearest step.** These are read by a signing
+*run*, and the ordinary interval is a third of the signature validity — ten days
+by default — so without this a key activating at noon would wait ten days for a
+step whose whole purpose is to land at a TTL boundary. The interval is asked for
+each time round the loop, not once at startup, because the nearest step moves as
+the steps are taken. The startup line says which of the two it followed.
+
+**Every key inactive at once is a failed signing run, not a bare zone.** A DNSKEY
+RRset promising DNSSEC over data carrying no signature is bogus at every
+validator. The usual cause is an `Inactive` in the past with no successor
+activated.
+
+**Each key's state is logged once per load** — signing, published but not yet
+signing, published but retired, held back, withdrawn — with the time to its next
+change. The operator wrote those moments weeks earlier; this is how they find out
+the server agrees.
+
+**The KSK half is not automated, and the reason is the parent.** RFC 6781 §4.1.2's
+double-signature KSK rollover needs the parent's DS RRset to change, which no
+amount of local scheduling can do. The moments above work for a KSK too — publish
+both, sign the DNSKEY RRset with both, withdraw the old one after the parent has
+switched — but the step in the middle is a registrar transaction, and the way to
+automate it is CDS/CDNSKEY (RFC 7344, RFC 8078), which this tree does not
+generate. `TODO.md` #55.
+
+The signer never removes a key file. `Delete` withdraws the DNSKEY from the zone,
+which is reversible; taking the private key off the disk is the operator's.
+
 ### Multi-signer (RFC 8901)
 
 **Model 2 (§2.1.2) works with no setting at all**, and did before anything was
