@@ -13,6 +13,8 @@
 // The parent's `use` block, not a copy per file: these three are continuations
 // of one `impl Resolver`, and a second import list is a second thing to drift.
 use super::*;
+use crate::dnssec::Bogus;
+use crate::ede::InfoCode;
 
 impl Resolver {
     /// Decide how much of `response` is authentic.
@@ -70,9 +72,12 @@ impl Resolver {
                 .establish_chain(query.qname.as_ref(), state, anchors, now, &mut keys)
                 .await
             {
-                ValidationState::Secure => ValidationState::Bogus(format!(
-                    "{} lies in a signed zone but nothing in the answer is signed",
-                    query.qname
+                ValidationState::Secure => ValidationState::Bogus(Bogus::new(
+                    InfoCode::RRSIGS_MISSING,
+                    format!(
+                        "{} lies in a signed zone but nothing in the answer is signed",
+                        query.qname
+                    ),
                 )),
                 other => other,
             };
@@ -104,7 +109,7 @@ impl Resolver {
             // A chain that is not a chain must not be laundered into a denial:
             // its "final name" is not one we asked about.
             if let ChainShape::Broken(why) = shape {
-                return ValidationState::Bogus(why);
+                return ValidationState::Bogus(Bogus::new(InfoCode::DNSSEC_BOGUS, why));
             }
             return self.check_denial(query, denied_name.as_ref(), response);
         }
@@ -114,7 +119,7 @@ impl Resolver {
         // rather than in `recurse`'s per-hop filter so it also covers an answer
         // that arrived whole from a forwarder.
         if let ChainShape::Broken(why) = shape {
-            return ValidationState::Bogus(why);
+            return ValidationState::Bogus(Bogus::new(InfoCode::DNSSEC_BOGUS, why));
         }
 
         // A wildcard's signature verifies at every name it could expand to, so a
@@ -170,9 +175,12 @@ impl Resolver {
                     let (records, ttl) = match self.fetch_dnskeys(zone.as_ref(), state).await {
                         Ok(found) => found,
                         Err(e) => {
-                            return ValidationState::Bogus(format!(
-                                "could not fetch the DNSKEY RRset for {zone}: {e:#}"
-                            ))
+                            return ValidationState::Bogus(Bogus::new(
+                                // The DNSKEY RRset is what a DS committed to,
+                                // and we could not get it (RFC 8914 §4.10).
+                                InfoCode::DNSKEY_MISSING,
+                                format!("could not fetch the DNSKEY RRset for {zone}: {e:#}"),
+                            ));
                         }
                     };
                     match validator.validate_dnskeys(zone.as_ref(), &records, &ds_set) {
@@ -202,11 +210,14 @@ impl Resolver {
                     zone = evidence.zone.clone();
                 }
                 DelegationVerdict::Insecure(_) => return ValidationState::Insecure,
-                DelegationVerdict::Bogus(why) => return ValidationState::Bogus(why),
+                DelegationVerdict::Bogus(bogus) => return ValidationState::Bogus(bogus),
             }
         }
 
-        ValidationState::Bogus(format!("the chain of trust to {target} does not terminate"))
+        ValidationState::Bogus(Bogus::new(
+            InfoCode::DNSSEC_BOGUS,
+            format!("the chain of trust to {target} does not terminate"),
+        ))
     }
 
     /// Fetch a zone's DNSKEY RRset, returning the records and the TTL to cache
@@ -253,8 +264,9 @@ impl Resolver {
         if nsecs.is_empty() && nsec3s.is_empty() {
             // A signed zone answering "no" without proof; common from a
             // middlebox, but not something to pass on as authenticated.
-            return ValidationState::Bogus(format!(
-                "{denied_name} was denied without an NSEC or NSEC3 proof"
+            return ValidationState::Bogus(Bogus::new(
+                InfoCode::NSEC_MISSING,
+                format!("{denied_name} was denied without an NSEC or NSEC3 proof"),
             ));
         }
 
@@ -281,8 +293,9 @@ impl Resolver {
 
         match denial {
             Denial::Proved => ValidationState::Secure,
-            Denial::NotProved(why) => ValidationState::Bogus(format!(
-                "the denial of {denied_name} does not prove it: {why}"
+            Denial::NotProved(why) => ValidationState::Bogus(Bogus::new(
+                InfoCode::NSEC_MISSING,
+                format!("the denial of {denied_name} does not prove it: {why}"),
             )),
         }
     }

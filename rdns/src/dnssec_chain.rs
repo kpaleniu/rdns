@@ -18,11 +18,13 @@
 
 use crate::codecs::hex_decode;
 use crate::dnssec::{
-    algorithm_supported, digest_type_supported, verify_rrset, Dnskey, Ds, Rrset, RrsetProof, Rrsig,
+    algorithm_supported, digest_type_supported, verify_rrset, Bogus, Dnskey, Ds, Rrset, RrsetProof,
+    Rrsig,
 };
 use crate::dnssec_denial::{
     proves_no_ds, proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
 };
+use crate::ede::InfoCode;
 use crate::error::DnssecError;
 use crate::record_types as rt;
 use crate::Class;
@@ -38,8 +40,9 @@ pub enum ValidationState {
     /// Provably unsigned: some zone on the path proved it has no DS. Serve it,
     /// without AD.
     Insecure,
-    /// Signed, but the signatures do not add up. SERVFAIL.
-    Bogus(String),
+    /// Signed, but the signatures do not add up. SERVFAIL, with the reason and
+    /// the RFC 8914 INFO-CODE that names it for the client.
+    Bogus(Bogus),
     /// No trust anchor covers this name, so there is no chain to walk. Served
     /// like insecure, but insecure was *proven* and this was never in scope.
     Indeterminate(String),
@@ -59,7 +62,8 @@ impl ValidationState {
         match self {
             ValidationState::Secure => "secure",
             ValidationState::Insecure => "insecure (provably unsigned)",
-            ValidationState::Bogus(why) | ValidationState::Indeterminate(why) => why,
+            ValidationState::Bogus(bogus) => &bogus.why,
+            ValidationState::Indeterminate(why) => why,
         }
     }
 }
@@ -69,7 +73,7 @@ impl std::fmt::Display for ValidationState {
         match self {
             ValidationState::Secure => write!(f, "secure"),
             ValidationState::Insecure => write!(f, "insecure"),
-            ValidationState::Bogus(why) => write!(f, "bogus: {why}"),
+            ValidationState::Bogus(bogus) => write!(f, "bogus: {bogus}"),
             ValidationState::Indeterminate(why) => write!(f, "indeterminate: {why}"),
         }
     }
@@ -278,8 +282,9 @@ pub enum DelegationVerdict {
     /// The parent proved there is no DS, or published only DS records naming
     /// algorithms we cannot verify. Either way the chain ends here.
     Insecure(String),
-    /// The parent's statement about the child does not hold up.
-    Bogus(String),
+    /// The parent's statement about the child does not hold up, with the
+    /// RFC 8914 INFO-CODE naming which way.
+    Bogus(Bogus),
 }
 
 /// The keys established for each zone so far, keyed by canonical zone name.
@@ -357,8 +362,9 @@ impl<'a> ChainValidator<'a> {
             .filter(|k| k.owner.as_ref() == zone)
             .collect();
         if keys.is_empty() {
-            return Err(ValidationState::Bogus(format!(
-                "{zone} has a DS in its parent but published no DNSKEY"
+            return Err(ValidationState::Bogus(Bogus::new(
+                InfoCode::DNSKEY_MISSING,
+                format!("{zone} has a DS in its parent but published no DNSKEY"),
             )));
         }
 
@@ -384,8 +390,9 @@ impl<'a> ChainValidator<'a> {
             }
         }
         if vouched.is_empty() {
-            return Err(ValidationState::Bogus(format!(
-                "no DNSKEY at {zone} matches any DS its parent published"
+            return Err(ValidationState::Bogus(Bogus::new(
+                InfoCode::DNSKEY_MISSING,
+                format!("no DNSKEY at {zone} matches any DS its parent published"),
             )));
         }
 
@@ -405,14 +412,21 @@ impl<'a> ChainValidator<'a> {
             self.now,
         ) {
             RrsetProof::Verified { .. } => Ok(keys),
-            RrsetProof::Unsigned => Err(ValidationState::Bogus(format!(
-                "the DNSKEY RRset at {zone} is unsigned, but its parent published a DS"
+            RrsetProof::Unsigned => Err(ValidationState::Bogus(Bogus::new(
+                InfoCode::RRSIGS_MISSING,
+                format!("the DNSKEY RRset at {zone} is unsigned, but its parent published a DS"),
             ))),
             // Signed with something we cannot read: no opinion, so the chain
             // ends here rather than condemning the zone.
             RrsetProof::Unsupported(_) => Err(ValidationState::Insecure),
-            RrsetProof::Bogus(why) => Err(ValidationState::Bogus(format!(
-                "the DNSKEY RRset at {zone} did not verify under its DS-vouched key: {why}"
+            // The proof's own code, not a fresh one: what went wrong was found
+            // by the check that looked, and an expired DNSKEY signature is
+            // EDE 7 wherever it is met.
+            RrsetProof::Bogus(bogus) => Err(ValidationState::Bogus(Bogus::new(
+                bogus.code,
+                format!(
+                    "the DNSKEY RRset at {zone} did not verify under its DS-vouched key: {bogus}"
+                ),
             ))),
         }
     }
@@ -430,9 +444,12 @@ impl<'a> ChainValidator<'a> {
             if let Denial::NotProved(why) =
                 proves_no_ds(evidence.zone.as_ref(), &evidence.nsecs, &evidence.nsec3s)
             {
-                return DelegationVerdict::Bogus(format!(
-                    "{} has no DS and its parent did not prove it: {why}",
-                    evidence.zone
+                return DelegationVerdict::Bogus(Bogus::new(
+                    InfoCode::NSEC_MISSING,
+                    format!(
+                        "{} has no DS and its parent did not prove it: {why}",
+                        evidence.zone
+                    ),
                 ));
             }
             // The proof is itself a signed RRset; unverified it is just bytes an
@@ -444,7 +461,13 @@ impl<'a> ChainValidator<'a> {
                 Err(ValidationState::Insecure) => {
                     DelegationVerdict::Insecure(format!("{} could not be judged", evidence.zone))
                 }
-                Err(other) => DelegationVerdict::Bogus(other.reason().to_string()),
+                // `verify_denial_records` reports a `ValidationState`, whose
+                // Bogus arm already carries the code the check that failed
+                // chose; anything else here is not a code we can name.
+                Err(other) => DelegationVerdict::Bogus(match other {
+                    ValidationState::Bogus(bogus) => bogus,
+                    other => Bogus::new(InfoCode::DNSSEC_BOGUS, other.reason()),
+                }),
             };
         }
 
@@ -472,14 +495,17 @@ impl<'a> ChainValidator<'a> {
             self.now,
         ) {
             RrsetProof::Verified { .. } => DelegationVerdict::Secure(evidence.ds.clone()),
-            RrsetProof::Unsigned => DelegationVerdict::Bogus(format!(
-                "the DS at {} is unsigned, inside the signed zone {parent_zone}",
-                evidence.zone
+            RrsetProof::Unsigned => DelegationVerdict::Bogus(Bogus::new(
+                InfoCode::RRSIGS_MISSING,
+                format!(
+                    "the DS at {} is unsigned, inside the signed zone {parent_zone}",
+                    evidence.zone
+                ),
             )),
             RrsetProof::Unsupported(why) => DelegationVerdict::Insecure(why),
-            RrsetProof::Bogus(why) => DelegationVerdict::Bogus(format!(
-                "the DS at {} did not verify: {why}",
-                evidence.zone
+            RrsetProof::Bogus(bogus) => DelegationVerdict::Bogus(Bogus::new(
+                bogus.code,
+                format!("the DS at {} did not verify: {bogus}", evidence.zone),
             )),
         }
     }
@@ -504,15 +530,18 @@ impl<'a> ChainValidator<'a> {
                 RrsetProof::Verified { .. } => checked_any = true,
                 RrsetProof::Unsupported(_) => return Err(ValidationState::Insecure),
                 RrsetProof::Unsigned => {
-                    return Err(ValidationState::Bogus(format!(
-                        "the denial of a DS at {} is unsigned",
-                        evidence.zone
+                    return Err(ValidationState::Bogus(Bogus::new(
+                        InfoCode::RRSIGS_MISSING,
+                        format!("the denial of a DS at {} is unsigned", evidence.zone),
                     )))
                 }
-                RrsetProof::Bogus(why) => {
-                    return Err(ValidationState::Bogus(format!(
-                        "the denial of a DS at {} did not verify: {why}",
-                        evidence.zone
+                RrsetProof::Bogus(bogus) => {
+                    return Err(ValidationState::Bogus(Bogus::new(
+                        bogus.code,
+                        format!(
+                            "the denial of a DS at {} did not verify: {bogus}",
+                            evidence.zone
+                        ),
                     )))
                 }
             }
@@ -520,9 +549,9 @@ impl<'a> ChainValidator<'a> {
         if checked_any {
             Ok(())
         } else {
-            Err(ValidationState::Bogus(format!(
-                "nothing signed denies a DS at {}",
-                evidence.zone
+            Err(ValidationState::Bogus(Bogus::new(
+                InfoCode::NSEC_MISSING,
+                format!("nothing signed denies a DS at {}", evidence.zone),
             )))
         }
     }
@@ -546,19 +575,22 @@ impl<'a> ChainValidator<'a> {
                 .map(|s| s.signer_name.clone());
 
             let Some(signer) = signer else {
-                return RecordsVerdict::state(ValidationState::Bogus(format!(
-                    "{owner} type {rtype} came back unsigned from a signed zone"
+                return RecordsVerdict::state(ValidationState::Bogus(Bogus::new(
+                    InfoCode::RRSIGS_MISSING,
+                    format!("{owner} type {rtype} came back unsigned from a signed zone"),
                 )));
             };
             // A zone may only sign at or below itself.
             if !owner.as_ref().is_at_or_under(signer.as_ref()) {
-                return RecordsVerdict::state(ValidationState::Bogus(format!(
-                    "{owner} is signed by {signer}, which is not above it"
+                return RecordsVerdict::state(ValidationState::Bogus(Bogus::new(
+                    InfoCode::DNSSEC_BOGUS,
+                    format!("{owner} is signed by {signer}, which is not above it"),
                 )));
             }
             let Some(zone_keys) = keys.get(&signer) else {
-                return RecordsVerdict::state(ValidationState::Bogus(format!(
-                    "{owner} is signed by {signer}, whose keys were never established"
+                return RecordsVerdict::state(ValidationState::Bogus(Bogus::new(
+                    InfoCode::DNSSEC_BOGUS,
+                    format!("{owner} is signed by {signer}, whose keys were never established"),
                 )));
             };
 
@@ -580,15 +612,16 @@ impl<'a> ChainValidator<'a> {
                     }
                 }
                 RrsetProof::Unsigned => {
-                    return RecordsVerdict::state(ValidationState::Bogus(format!(
-                        "{owner} type {rtype} is unsigned"
+                    return RecordsVerdict::state(ValidationState::Bogus(Bogus::new(
+                        InfoCode::RRSIGS_MISSING,
+                        format!("{owner} type {rtype} is unsigned"),
                     )))
                 }
                 RrsetProof::Unsupported(_) => {
                     return RecordsVerdict::state(ValidationState::Insecure)
                 }
-                RrsetProof::Bogus(why) => {
-                    return RecordsVerdict::state(ValidationState::Bogus(why))
+                RrsetProof::Bogus(bogus) => {
+                    return RecordsVerdict::state(ValidationState::Bogus(bogus))
                 }
             }
         }
@@ -617,9 +650,12 @@ impl<'a> ChainValidator<'a> {
     ) -> ValidationState {
         for expansion in expansions {
             let Some(zone_keys) = keys.get(&expansion.signer) else {
-                return ValidationState::Bogus(format!(
-                    "{} was expanded from {} by {}, whose keys were never established",
-                    expansion.owner, expansion.wildcard, expansion.signer
+                return ValidationState::Bogus(Bogus::new(
+                    InfoCode::DNSSEC_BOGUS,
+                    format!(
+                        "{} was expanded from {} by {}, whose keys were never established",
+                        expansion.owner, expansion.wildcard, expansion.signer
+                    ),
                 ));
             };
             let (nsecs, nsec3s) =
@@ -634,10 +670,12 @@ impl<'a> ChainValidator<'a> {
                 // Not a proof, but not an accusation either: serve it without AD.
                 WildcardVerdict::Unjudgeable(_) => return ValidationState::Insecure,
                 WildcardVerdict::NotProved(why) => {
-                    return ValidationState::Bogus(format!(
-                        "{} was answered from the wildcard {} without proof that it has no \
-                         records of its own: {why}",
-                        expansion.owner, expansion.wildcard
+                    return ValidationState::Bogus(Bogus::new(
+                        InfoCode::NSEC_MISSING,
+                        format!(
+                            "{} was answered from the wildcard {} without proof that it has no records of its own: {why}",
+                            expansion.owner, expansion.wildcard
+                        ),
                     ))
                 }
             }

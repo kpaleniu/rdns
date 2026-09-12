@@ -11,7 +11,7 @@ use rdns_core::record_types::{self as rt, qtype_name_to_code};
 use rdns_core::socket::bind_addr_for;
 use rdns_core::validation::{answers_query, SentQuery};
 use rdns_core::Name;
-use rdns_core::{DnsMessage, DnsMessageBuilder, Qtype, ResponseCode};
+use rdns_core::{DnsMessage, DnsMessageBuilder, ExtendedError, Qtype, ResponseCode};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -59,7 +59,13 @@ fn main() -> Result<()> {
         )
         // RFC 5936 §4.1.1: RD SHOULD be clear in an AXFR request.
         .with_recursion(!transfer)
-        .with_dnssec(args.dnssec)
+        // An OPT on every query, not only with --dnssec. A server may only put
+        // an Extended DNS Error in a reply to a query that carried one
+        // (RFC 8914 §2), so a probe that sends none cannot see the diagnostic
+        // this tree emits — and `dig` and every resolver send one anyway.
+        // --dnssec now moves DO alone. 1232 is what the reply is bounded by;
+        // the 4096 receive buffer below is unchanged and still larger.
+        .with_edns(rdns_core::FLAG_DAY_UDP_SIZE, args.dnssec)
         .build();
 
     // Send `len` bytes, not the whole buffer: trailing zeros are extra records
@@ -172,7 +178,11 @@ fn read_transfer(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resu
         // A refusal is one message with an rcode and no records, and looking for
         // the SOA first would wait out the read timeout instead of saying so.
         if message.rcode != ResponseCode::Ok {
-            bail!("the server refused the transfer: {:?}", message.rcode);
+            bail!(
+                "the server refused the transfer: {:?}{}",
+                message.rcode,
+                extended_errors(&message)
+            );
         }
         if first {
             matches_request(&message, request)
@@ -249,8 +259,37 @@ fn matches_request(message: &DnsMessage, request: &DnsMessage) -> Result<(), Ans
     )
 }
 
+/// The reasons a reply gives for its RCODE (RFC 8914), as text to append to a
+/// line that has already named the RCODE.
+///
+/// Empty when there are none, which is every reply from a server that does not
+/// send them and every reply to a query that carried no OPT (§2).
+///
+/// A function because the two callers are a printed answer and a refused
+/// transfer, and a refused transfer is the reply an operator is most likely to
+/// be holding when they want one (`TODO.md` #44b). An unreadable option list is
+/// reported rather than dropped: it is FORMERR for the message, and the parse
+/// that produced it let it through.
+fn extended_errors(msg: &DnsMessage) -> String {
+    let Some(edns) = msg.edns.as_ref() else {
+        return String::new();
+    };
+    match ExtendedError::all_in(edns) {
+        Ok(errors) => errors
+            .iter()
+            .map(|(code, text)| format!("\nextended error {code}: {text}"))
+            .collect(),
+        Err(e) => format!("\nextended errors: unreadable option list: {e}"),
+    }
+}
+
 fn print_message(msg: &DnsMessage) {
-    println!("rcode: {:?}, authoritative: {}", msg.rcode, msg.authoritive);
+    println!(
+        "rcode: {:?}, authoritative: {}{}",
+        msg.rcode,
+        msg.authoritive,
+        extended_errors(msg)
+    );
     for q in &msg.queries {
         println!("{q:?}");
     }

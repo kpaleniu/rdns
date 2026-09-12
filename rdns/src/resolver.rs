@@ -2787,6 +2787,43 @@ this line has no record and is skipped
         assert!(state.is_bogus(), "expected bogus, got {state}");
     }
 
+    /// Bogus is not one failure, and the client is owed which one it was
+    /// (RFC 8914, `TODO.md` #44b).
+    ///
+    /// Two shapes that both end in SERVFAIL and send an operator to two
+    /// different places: signatures that never arrived, and signatures that
+    /// arrived and did not verify. The code is chosen by the check that found
+    /// the fault and carried up unchanged, which is why it is asserted here —
+    /// at the top of a full chain walk — rather than beside the check.
+    #[tokio::test]
+    async fn a_bogus_answer_names_the_way_it_is_bogus() {
+        use crate::ede::InfoCode;
+
+        let stripped = signed_hierarchy(signed_ds, |_auth| {
+            vec![a_record("www.example.test.", [192, 0, 2, 1])]
+        });
+        let substituted = signed_hierarchy(signed_ds, |auth| {
+            let real = a_record("www.example.test.", [192, 0, 2, 1]);
+            let sig = auth.sign_records(std::slice::from_ref(&real));
+            vec![a_record("www.example.test.", [6, 6, 6, 6]), sig]
+        });
+
+        for (h, expected, what) in [
+            (&stripped, InfoCode::RRSIGS_MISSING, "no signatures at all"),
+            (
+                &substituted,
+                InfoCode::DNSSEC_BOGUS,
+                "a signature that fails",
+            ),
+        ] {
+            let (_, state) = resolve_www(validating_config(h)).await;
+            match state {
+                ValidationState::Bogus(bogus) => assert_eq!(bogus.code, expected, "{what}"),
+                other => panic!("{what}: expected bogus, got {other}"),
+            }
+        }
+    }
+
     /// With no anchors configured nothing is checked, and the state says so —
     /// "indeterminate", not "insecure": we did not establish that anything is
     /// unsigned, we simply never looked.

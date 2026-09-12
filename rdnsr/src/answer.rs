@@ -9,7 +9,9 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use rdns::dnssec::Bogus;
 use rdns::dnssec_chain::ValidationState;
+use rdns::ede::InfoCode;
 use rdns::metrics::LatencyTimer;
 use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
@@ -20,7 +22,8 @@ use rdns::special_names;
 use rdns::validation::{Request, Transport};
 use rdns::Rtype;
 use rdns::{
-    DnsCache, DnsMessage, Edns, OpCode, QuerySection, ResourceRecord, ResponseCode, OPT_RECORD_TYPE,
+    DnsCache, DnsMessage, Edns, ExtendedError, OpCode, QuerySection, ResourceRecord, ResponseCode,
+    OPT_RECORD_TYPE,
 };
 use rdns_transport::ServeContext;
 
@@ -147,7 +150,7 @@ pub(crate) async fn handle_query(
     // match the request either (`TODO.md` #30r).
     if msg.queries.len() > 1 {
         let resp = build_response(&msg, Vec::new(), ResponseCode::FormatError);
-        return finish(resp, false, &client, &query, ctx, timer);
+        return finish(resp, false, None, &client, &query, ctx, timer);
     }
 
     // Names that must not leave this machine (RFC 6761, 6762, 6303). Before
@@ -165,7 +168,7 @@ pub(crate) async fn handle_query(
         tracing::debug!(qname = %query.qname, why = %local.why, "answered locally");
         // Never authenticated: this was decided by specification rather than
         // validated, and a validating client cannot check the claim itself.
-        return finish(resp, false, &client, &query, ctx, timer);
+        return finish(resp, false, None, &client, &query, ctx, timer);
     }
 
     // Aggressive use of the validated denial cache (RFC 8198). A cached NSEC
@@ -186,7 +189,7 @@ pub(crate) async fn handle_query(
             resp.authorities = wildcard.authority;
             // A wildcard signature verifies at this name unchanged, so the
             // client can check this for itself.
-            return finish(resp, true, &client, &query, ctx, timer);
+            return finish(resp, true, None, &client, &query, ctx, timer);
         }
     }
 
@@ -197,7 +200,7 @@ pub(crate) async fn handle_query(
             resp.authorities = denial.authority;
             // The proofs were validated before storage, so what is derived
             // from them is authentic on the same terms.
-            return finish(resp, true, &client, &query, ctx, timer);
+            return finish(resp, true, None, &client, &query, ctx, timer);
         }
     }
 
@@ -208,16 +211,21 @@ pub(crate) async fn handle_query(
         ctx.metrics.count(&ctx.metrics.cache_hits);
         let mut resp = build_response(&msg, Vec::new(), negative.rcode);
         resp.authorities = negative.authority;
-        return finish(resp, negative.secure, &client, &query, ctx, timer);
+        return finish(resp, negative.secure, None, &client, &query, ctx, timer);
     }
 
-    // Build the response: from cache if we have it, else by resolving.
-    let (mut resp, secure) = if let Some((records, secure)) = caches
+    // Build the response: from cache if we have it, else by resolving. The
+    // third is RFC 8914's reason, which only the two failing arms have.
+    let (mut resp, secure, why) = if let Some((records, secure)) = caches
         .answers
         .get_validated(query.qname.as_ref(), query.qtype)
     {
         ctx.metrics.count(&ctx.metrics.cache_hits);
-        (build_response(&msg, records, ResponseCode::Ok), secure)
+        (
+            build_response(&msg, records, ResponseCode::Ok),
+            secure,
+            None,
+        )
     } else {
         // Everything above answered from something held; from here the
         // query costs a recursion. This is the line a cache hit rate is
@@ -235,13 +243,13 @@ pub(crate) async fn handle_query(
                 upstream.recursion = recursion;
                 upstream.recursion_ok = true;
 
-                if let ValidationState::Bogus(ref why) = state {
+                if let ValidationState::Bogus(ref bogus) = state {
                     // WARN: an answer that does not validate is an attack
                     // or a broken zone, and both are worth seeing.
                     tracing::warn!(
                         qname = %query.qname,
                         qtype = %query.qtype,
-                        "DNSSEC validation failed: {why}"
+                        "DNSSEC validation failed: {bogus}"
                     );
                     // Fail closed: the client cannot tell unauthenticated
                     // data from checked data, so serving it launders an
@@ -250,7 +258,15 @@ pub(crate) async fn handle_query(
                     // data unfiltered.
                     if !checking_disabled {
                         let resp = build_response(&msg, Vec::new(), ResponseCode::ServerFailure);
-                        return finish(resp, false, &client, &query, ctx, timer);
+                        return finish(
+                            resp,
+                            false,
+                            Some(bogus_reason(bogus)),
+                            &client,
+                            &query,
+                            ctx,
+                            timer,
+                        );
                     }
                 }
 
@@ -286,7 +302,7 @@ pub(crate) async fn handle_query(
                 if !upstream.answers.is_empty() && secure {
                     caches.denials.insert_validated_wildcard(&upstream);
                 }
-                (upstream, secure)
+                (upstream, secure, None)
             }
             // Say why, then SERVFAIL: lame delegation, budget exhausted
             // and CNAME loop are distinct so they can be read.
@@ -302,6 +318,7 @@ pub(crate) async fn handle_query(
                 (
                     build_response(&msg, Vec::new(), ResponseCode::ServerFailure),
                     false,
+                    Some(e.extended_error()),
                 )
             }
         }
@@ -309,7 +326,19 @@ pub(crate) async fn handle_query(
 
     resp.cd = checking_disabled;
 
-    finish(resp, secure, &client, &query, ctx, timer)
+    finish(resp, secure, why, &client, &query, ctx, timer)
+}
+
+/// What the client is told about a validation failure: the INFO-CODE the check
+/// that failed chose, and one fixed sentence.
+///
+/// Fixed because [`Bogus::why`] names the zone, the owner and the key tag, and
+/// all three came out of an answer a stranger sent — RFC 8914 §2 asks that
+/// EXTRA-TEXT leak nothing, and reflecting a remote party's names back to
+/// another remote party is the way to do so without noticing. The detail is in
+/// the WARN line beside the counter, where the operator reads it.
+fn bogus_reason(bogus: &Bogus) -> ExtendedError {
+    ExtendedError::new(bogus.code, "this answer did not validate")
 }
 
 /// Final shaping common to every reply: the AD bit, OPT mirroring, stripping
@@ -321,6 +350,7 @@ pub(crate) async fn handle_query(
 fn finish(
     mut resp: DnsMessage,
     authenticated: bool,
+    why: Option<ExtendedError>,
     client: &Client,
     query: &QuerySection,
     ctx: &ServeContext,
@@ -349,7 +379,16 @@ fn finish(
     // otherwise strip any OPT the upstream added so we don't reply with
     // unsolicited EDNS. DO is mirrored, since the signatures the client sees
     // were deliberate.
-    if let Some(edns) = client.edns.mirror(ctx.udp.advertised()) {
+    //
+    // `why` rides in that OPT and nowhere else (RFC 8914 §2), which is why it
+    // is `mirror_with`'s business rather than a check here. Its only failure is
+    // an option too long for its length field, which `ExtendedError` bounds out
+    // of reach; the fallback drops the reason rather than the answer.
+    let mirrored = client
+        .edns
+        .mirror_with(ctx.udp.advertised(), why)
+        .unwrap_or_else(|_| client.edns.mirror(ctx.udp.advertised()));
+    if let Some(edns) = mirrored {
         resp.set_edns(edns);
     } else {
         resp.additionals
@@ -386,8 +425,14 @@ fn edns_error(
 /// (RFC 6891 §6.1.1) — a reply with no OPT may get us cached as a server that
 /// does not do EDNS.
 fn unsupported_opcode(msg: &DnsMessage, advertised: u16, max_len: usize) -> Option<Vec<u8>> {
+    const WHY: ExtendedError =
+        ExtendedError::new(InfoCode::NOT_SUPPORTED, "this opcode is not implemented");
     let mut resp = build_response(msg, Vec::new(), ResponseCode::NotImplemented);
-    if let Some(edns) = ClientEdns::of(msg).mirror(advertised) {
+    let asked = ClientEdns::of(msg);
+    let mirrored = asked
+        .mirror_with(advertised, Some(WHY))
+        .unwrap_or_else(|_| asked.mirror(advertised));
+    if let Some(edns) = mirrored {
         resp.set_edns(edns);
     }
     resp.to_bytes_within(max_len).ok()
@@ -468,6 +513,7 @@ mod tests {
                 let bytes = finish(
                     resp,
                     authenticated,
+                    None,
                     &client,
                     &query,
                     &test_shell(),
@@ -600,6 +646,38 @@ mod tests {
                 "{opcode:?}: a plausible QUERY-shaped answer is worse than a refusal"
             );
         }
+    }
+
+    /// The NOTIMP above, to a client that sent an OPT for the reason to ride
+    /// in (RFC 8914 §2). Same code `rdnsd` uses for the same refusal, because
+    /// it is the same sentence: §4.22, "the requested operation or query is not
+    /// supported".
+    #[tokio::test]
+    async fn an_unimplemented_opcode_says_why_when_the_client_used_edns() {
+        let (resolver, caches) = context();
+        let mut msg = DnsMessage::try_from_bytes(&message(OpCode::Update, false)).expect("parses");
+        msg.set_edns(Edns::with_payload_size(4096));
+
+        let bytes = handle_query(
+            msg.to_bytes_within(4096).expect("serialize"),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &resolver,
+            &caches,
+            &test_shell(),
+            Transport::Udp,
+        )
+        .await
+        .expect("an UPDATE is answered, not dropped");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+
+        assert_eq!(reply.rcode, ResponseCode::NotImplemented);
+        let edns = reply.edns.as_ref().expect("the OPT is mirrored");
+        let errors = ExtendedError::all_in(edns).expect("a well-formed option list");
+        assert_eq!(
+            errors.iter().map(|(code, _)| *code).collect::<Vec<_>>(),
+            vec![InfoCode::NOT_SUPPORTED]
+        );
     }
 
     /// A query for `name` with `queries` questions in it, CD as given.

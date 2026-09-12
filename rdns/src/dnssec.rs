@@ -11,6 +11,7 @@
 //! original TTL rather than the received one, embedded names down-cased for the
 //! RFC 4034 §6.2 types, RRs sorted by canonical RDATA, duplicates dropped.
 
+use crate::ede::InfoCode;
 use crate::error::WireError;
 use crate::error::{DnssecError, DnssecResult};
 use crate::record_types as rt;
@@ -635,10 +636,44 @@ pub enum RrsetProof {
     Unsigned,
     /// Signatures were present but none verified. An attack or a
     /// misconfiguration; either way the data must not be served as authentic.
-    Bogus(String),
+    Bogus(Bogus),
     /// Signatures were present but every one of them used an algorithm or key
     /// we cannot read, so we have no opinion either way.
     Unsupported(String),
+}
+
+/// Why something did not verify: the sentence an operator reads, and the
+/// RFC 8914 INFO-CODE the client is owed beside it.
+///
+/// One type for [`RrsetProof::Bogus`] and
+/// [`ValidationState::Bogus`](crate::dnssec_chain::ValidationState::Bogus), so a
+/// reason keeps its code as it is carried up the chain. Deriving the code from
+/// the text at the top instead is `CLAUDE.md` §3's "assert on the variant, not
+/// the message" seen from the other end â a SERVFAIL that says *expired* has
+/// to be told so by the check that found the expiry.
+///
+/// The text stays here and never reaches the wire: [`crate::ExtendedError`]
+/// carries a `&'static str`, because a name the client sent must not be
+/// reflected back to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bogus {
+    pub code: InfoCode,
+    pub why: String,
+}
+
+impl Bogus {
+    pub fn new(code: InfoCode, why: impl Into<String>) -> Bogus {
+        Bogus {
+            code,
+            why: why.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Bogus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
 }
 
 /// One RRset: every record sharing an owner name, type and class.
@@ -700,7 +735,10 @@ pub fn verify_rrset(
         return RrsetProof::Unsigned;
     }
 
-    let mut last_failure = String::new();
+    // The reason, and the INFO-CODE RFC 8914 gives it: "signature expired" is
+    // the answer an operator can act on, and only the check that found the
+    // expiry knows it.
+    let mut last_failure: Option<Bogus> = None;
     let mut unsupported: Option<String> = None;
 
     for rrsig in covering {
@@ -708,27 +746,44 @@ pub fn verify_rrset(
         // signature from anyone at all would do, as long as we happened to have
         // their key.
         if rrsig.signer_name != zone {
-            last_failure = format!(
-                "RRSIG on {owner} names signer {} but the RRset belongs to {zone}",
-                rrsig.signer_name
-            );
+            last_failure = Some(Bogus::new(
+                InfoCode::DNSSEC_BOGUS,
+                format!(
+                    "RRSIG on {owner} names signer {} but the RRset belongs to {zone}",
+                    rrsig.signer_name
+                ),
+            ));
             continue;
         }
         // A label count larger than the name has is nonsense, and one smaller
         // is a wildcard — legitimate, but it must not claim to have been signed
         // at a name above the zone apex.
         if rrsig.labels as usize > owner_labels || (rrsig.labels as usize) < zone_labels {
-            last_failure = format!(
-                "RRSIG on {owner} claims {} labels, which its owner and zone do not allow",
-                rrsig.labels
-            );
+            last_failure = Some(Bogus::new(
+                InfoCode::DNSSEC_BOGUS,
+                format!(
+                    "RRSIG on {owner} claims {} labels, which its owner and zone do not allow",
+                    rrsig.labels
+                ),
+            ));
             continue;
         }
         if !rrsig.is_current(now) {
-            last_failure = format!(
-                "RRSIG on {owner} is valid {}..{} but now is {now}",
-                rrsig.inception, rrsig.expiration
-            );
+            // The two halves of "not current" are two INFO-CODEs and two
+            // different operator problems: a lapsed re-signing run, and a
+            // clock or a signature published early (RFC 8914 §4.8, §4.9).
+            let code = if now > rrsig.expiration as u64 {
+                InfoCode::SIGNATURE_EXPIRED
+            } else {
+                InfoCode::SIGNATURE_NOT_YET_VALID
+            };
+            last_failure = Some(Bogus::new(
+                code,
+                format!(
+                    "RRSIG on {owner} is valid {}..{} but now is {now}",
+                    rrsig.inception, rrsig.expiration
+                ),
+            ));
             continue;
         }
 
@@ -740,7 +795,10 @@ pub fn verify_rrset(
                 // signed name is not the name served.
                 Ok(signed) => (signed.as_ref() != rrset.owner).then_some(signed),
                 Err(e) => {
-                    last_failure = format!("could not name the signer of {owner}: {e}");
+                    last_failure = Some(Bogus::new(
+                        InfoCode::DNSSEC_BOGUS,
+                        format!("could not name the signer of {owner}: {e}"),
+                    ));
                     continue;
                 }
             }
@@ -751,7 +809,10 @@ pub fn verify_rrset(
         let data = match signed_data(rrsig, rrset.owner, class, rdatas) {
             Ok(data) => data,
             Err(e) => {
-                last_failure = format!("could not build signed data for {owner}: {e}");
+                last_failure = Some(Bogus::new(
+                    InfoCode::DNSSEC_BOGUS,
+                    format!("could not build signed data for {owner}: {e}"),
+                ));
                 continue;
             }
         };
@@ -770,27 +831,42 @@ pub fn verify_rrset(
                     }
                 }
                 Ok(false) => {
-                    last_failure = format!(
-                        "signature on {owner} did not verify under key {}",
-                        key.key_tag()
-                    )
+                    last_failure = Some(Bogus::new(
+                        InfoCode::DNSSEC_BOGUS,
+                        format!(
+                            "signature on {owner} did not verify under key {}",
+                            key.key_tag()
+                        ),
+                    ))
                 }
                 Err(e) => unsupported = Some(format!("{owner}: {e}")),
             }
         }
-        if last_failure.is_empty() {
-            last_failure = format!(
-                "no DNSKEY at {zone} matches RRSIG key tag {} algorithm {}",
-                rrsig.key_tag, rrsig.algorithm
-            );
+        if last_failure.is_none() {
+            // RFC 8914 §4.10: "a DS record existed at a parent, but no
+            // supported matching DNSKEY record could be found".
+            last_failure = Some(Bogus::new(
+                InfoCode::DNSKEY_MISSING,
+                format!(
+                    "no DNSKEY at {zone} matches RRSIG key tag {} algorithm {}",
+                    rrsig.key_tag, rrsig.algorithm
+                ),
+            ));
         }
     }
 
     // Only report "cannot read" when nothing was actually rejected: a genuine
     // failure alongside an unreadable algorithm is still a failure.
-    match unsupported {
-        Some(why) if last_failure.is_empty() => RrsetProof::Unsupported(why),
-        _ => RrsetProof::Bogus(last_failure),
+    match (unsupported, last_failure) {
+        (Some(why), None) => RrsetProof::Unsupported(why),
+        // Every path above sets one or the other, so the fallback names the
+        // one thing left: signatures covered this RRset and none was reached.
+        (_, failure) => RrsetProof::Bogus(failure.unwrap_or_else(|| {
+            Bogus::new(
+                InfoCode::DNSSEC_BOGUS,
+                format!("no RRSIG on {owner} could be checked"),
+            )
+        })),
     }
 }
 
@@ -1159,26 +1235,49 @@ mod tests {
     fn test_expired_signature_is_bogus() {
         let key = TestKey::generate_p256();
         let rdatas = vec![a_rdata(1)];
-        let mut rrsig = key.sign_rrset(
-            "example.com.",
-            rt::A,
-            Class::new(1),
-            3600,
-            "example.com.",
-            &rdatas,
-        );
         let now = current_unix_timestamp();
-        rrsig.inception = (now - 7200) as u32;
-        rrsig.expiration = (now - 3600) as u32;
 
-        let proof = verify_rrset(
-            &Rrset::new(nm("example.com.").as_ref(), rt::A, Class::new(1), &rdatas),
-            &[rrsig],
-            &[key.dnskey("example.com.")],
-            nm("example.com.").as_ref(),
-            now,
-        );
-        assert!(matches!(proof, RrsetProof::Bogus(_)), "{proof:?}");
+        // The two halves of "not current" are two INFO-CODEs and two different
+        // operator problems — a re-signing run that stopped, and a clock or a
+        // signature published early — so a client told only "bogus" has to
+        // guess between them (`TODO.md` #44b).
+        for (inception, expiration, expected, what) in [
+            (
+                now - 7200,
+                now - 3600,
+                InfoCode::SIGNATURE_EXPIRED,
+                "expired",
+            ),
+            (
+                now + 3600,
+                now + 7200,
+                InfoCode::SIGNATURE_NOT_YET_VALID,
+                "not yet valid",
+            ),
+        ] {
+            let mut rrsig = key.sign_rrset(
+                "example.com.",
+                rt::A,
+                Class::new(1),
+                3600,
+                "example.com.",
+                &rdatas,
+            );
+            rrsig.inception = inception as u32;
+            rrsig.expiration = expiration as u32;
+
+            let proof = verify_rrset(
+                &Rrset::new(nm("example.com.").as_ref(), rt::A, Class::new(1), &rdatas),
+                &[rrsig],
+                &[key.dnskey("example.com.")],
+                nm("example.com.").as_ref(),
+                now,
+            );
+            match proof {
+                RrsetProof::Bogus(bogus) => assert_eq!(bogus.code, expected, "{what}"),
+                other => panic!("{what}: {other:?}"),
+            }
+        }
     }
 
     #[test]

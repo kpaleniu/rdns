@@ -73,6 +73,9 @@ impl InfoCode {
     pub const NOT_AUTHORITATIVE: InfoCode = InfoCode(20);
     /// 21, Not Supported: "the requested operation or query is not supported".
     pub const NOT_SUPPORTED: InfoCode = InfoCode(21);
+    /// 23, Network Error: "an unrecoverable error occurred while communicating
+    /// with another server".
+    pub const NETWORK_ERROR: InfoCode = InfoCode(23);
     /// 22, No Reachable Authority: "the resolver could not reach any of the
     /// authoritative name servers (or they potentially refused to reply)".
     pub const NO_REACHABLE_AUTHORITY: InfoCode = InfoCode(22);
