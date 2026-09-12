@@ -823,6 +823,61 @@ s43e() {
   else
     bad "$other NOTIFYs for other zones went to example.org.'s per-zone target"
   fi
+
+  # ---- #47: what a refused NOTIFY carries back ---------------------------
+  #
+  # RFC 6891 6.1.1 is a MUST about a *request*, not about a query: "if an OPT
+  # record is present in a received request, compliant responders MUST include
+  # an OPT record in their respective responses". `notify_response` attached
+  # nothing at all until #47, whatever the NOTIFY carried.
+  #
+  # The peers are measured beside us because #47's EDE half is a reading rather
+  # than a quotation -- RFC 8914 sec 2 describes the option in a response "to a
+  # query that includes an OPT pseudo-RR" and a NOTIFY is not a query. The
+  # answer, taken here: BIND and Knot mirror the OPT and the DO bit and send no
+  # EDE, so the OPT half is what everyone does and the EDE half is this tree
+  # going further. NSD answers NXDOMAIN with QDCOUNT=0 and no OPT at all.
+  say "47 - a refused NOTIFY says why, and mirrors the OPT it was asked with"
+
+  notify_() { # notify_ <addr> <port> <zone> [dig flags...]
+    local a="$1" p="$2" z="$3"; shift 3
+    t dig +opcode=notify +nocmd +timeout=3 +tries=2 "$@" -p "$p" "@$a" "$z" SOA
+  }
+
+  local unknown refused ours plain
+  unknown=$(notify_ 10.53.0.9 5353 never-heard-of.test. +edns=0 +dnssec)
+  refused=$(notify_ 10.53.0.9 5353 frombind.test. +edns=0 +dnssec)
+  ours=$(notify_ 10.53.0.2 5353 example.com. +edns=0 +dnssec)
+  plain=$(notify_ 10.53.0.9 5353 never-heard-of.test. +noedns)
+
+  check "a NOTIFY for an unknown zone is NOTAUTH with the OPT mirrored" \
+    "flags: do" <<< "$unknown"
+  check "...and says which NOTAUTH it is" \
+    "EDE: 0 (Other): (not a zone served here)" <<< "$unknown"
+  check "a NOTIFY from a non-master is REFUSED" "status: REFUSED" <<< "$refused"
+  check "...with RFC 8914 sec 4.19's Prohibited, the code a transfer refusal uses" \
+    "EDE: 18 (Prohibited): (not one of this zone's masters)" <<< "$refused"
+  # The distinction the reply exists to carry: one RCODE, two operator problems.
+  check "a NOTIFY to the zone's own primary is the other NOTAUTH" \
+    "EDE: 0 (Other): (this server is this zone's primary, not a secondary)" \
+    <<< "$ours"
+  # RFC 6891 sec 6.2.2's converse MUST NOT, and the EDE goes with the OPT or
+  # nowhere (RFC 8914 sec 2). The one assertion in this block that passed
+  # *before* #47, since the old code attached nothing to anything: it guards
+  # the direction the fix could have overshot in, not the defect.
+  check "a NOTIFY with no OPT is answered with none, EDE included" \
+    "ADDITIONAL: 0" <<< "$plain"
+
+  # DO is the sender's (RFC 3225 sec 3: "the DO bit of the query MUST be copied
+  # in the response"), which is the half three reply paths dropped in #38.
+  check "DO clear in the NOTIFY is DO clear in the reply" "flags:;" \
+    <<< "$(notify_ 10.53.0.9 5353 never-heard-of.test. +edns=0 +nodnssec | grep '; EDNS:')"
+
+  for peer in "BIND=10.53.0.3" "Knot=10.53.0.4"; do
+    local pname="${peer%%=*}" paddr="${peer#*=}"
+    check "$pname mirrors the OPT and DO on a NOTIFY it refuses, as we now do" \
+      "flags: do" <<< "$(notify_ "$paddr" 53 never-heard-of.test. +edns=0 +dnssec)"
+  done
 }
 
 # --------------------------------------------------------------------------

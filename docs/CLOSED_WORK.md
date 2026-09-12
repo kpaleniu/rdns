@@ -7423,6 +7423,107 @@ Windows count of 996 is `clock`'s own two tests.
 
 ---
 
+### 47. A NOTIFY reply carries no OPT record — ~~**filed 2026-09-12**~~ **closed 2026-09-12**
+
+Found while doing 44b and not filed by it, because it is not an EDE question.
+`notify::notify_response` builds a reply from `DnsMessage::reply_to` and
+attaches nothing: no OPT, whatever the NOTIFY carried. Every other reply path in
+`rdnsd` goes through `ClientEdns::mirror` or `empty_reply`, which is the
+consolidation #38 made and this function predates.
+
+Two consequences, and the second is why it has a number rather than a sentence
+in a doc comment:
+
+- RFC 6891 §6.1.1 asks for an OPT in a response to a request that had one, and
+  some senders remember its absence as a downgrade and stop offering EDNS.
+- A refused NOTIFY therefore cannot say why, where every other refusal here now
+  can (44b). "REFUSED — you are not one of my masters" and "NOTAUTH — I am that
+  zone's primary, not a secondary" are two different operator problems, and #46b
+  was filed because the first of them was invisible in the *log*. On the wire it
+  still is.
+
+The measurement somebody would start from, taken rather than guessed:
+`rdns::notify::notify_response` has exactly three callers outside its own tests,
+all three in `rdnsd/src/dispatch.rs`'s `notify_reply` — NOERROR, REFUSED and
+NOTAUTH — so it is `rdnsd`'s function alone and can grow a parameter without
+touching another daemon. #43's interop harness is what would show a real
+sender's reaction; none of its 158 assertions covers this, because the NOTIFY it
+exercises is accepted.
+
+**Closed 2026-09-12, one commit.** The row said RFC 6891 §6.1.1 "asks for" an
+OPT. It does not ask: "**if an OPT record is present in a received request,
+compliant responders MUST include an OPT record in their respective
+responses**", with §6.2.2's converse MUST NOT beside it. Both say *request*,
+which a NOTIFY is — so this was a MUST, not a courtesy, and the row undersold
+it by reading the rule as being about queries.
+
+`notify_response` mirrors through `ClientEdns` now, like every other reply here,
+and takes the advertised size and an optional reason. The three refusals get
+three:
+
+- **not one of this zone's masters** → RFC 8914 §4.19's Prohibited (18), "a
+  query from an 'unauthorized' client", which is what a NOTIFY refused on its
+  source address is and what a refused transfer already uses.
+- **this server is this zone's primary, not a secondary** → OTHER (0). Not
+  §4.21's Not Authoritative, which would be false — we are authoritative — and
+  whose own text is about a query with RD clear rather than about a zone we do
+  not hold.
+- **not a zone served here** → OTHER as well, for §4.21's reason and not for the
+  previous one's. The two NOTAUTHs are the distinction the reply exists to
+  carry, so they must not share a code.
+
+**A second instance, found by counting** (`CLAUDE.md` §18). Two functions in
+`rdns` build a reply outside the mirroring consolidation, not one:
+`notify_response` and `transfer::Envelopes`. The second already mirrored the
+OPT on the first envelope — RFC 5936 §2.2.5, "it SHOULD include one OPT RR in
+the first response message and MAY do so in subsequent response messages" — and
+built it from `has_edns()` plus a fresh `Edns`, which is the spelling that
+drops DO. RFC 3225 §3 is "**the DO bit of the query MUST be copied in the
+response**", unconditional, and the same paragraph says the security records
+"are part of the zone data for an AXFR or IXFR query" and go whether it was set
+or not — so the cleared bit changed nothing about the transfer and said this
+server had stopped doing DNSSEC. #38's slip, on a fourth path, with no test
+over it either way. Fixed in the same commit; both halves now go through
+`ClientEdns`.
+
+**And one consolidation, because #47 would otherwise have written a fourth
+copy.** `ClientEdns::mirror_with` returned a `Result` whose `Err` all three
+callers answered identically — drop the *reason*, keep the reply — each with
+the same four lines of comment explaining why. It is total now, the decision is
+in one doc comment, and the unreachable arm rebuilds the bare OPT rather than
+cloning one up front for a branch that cannot run.
+
+**What the peers do, measured rather than reasoned** (`CLAUDE.md` §4, §19). The
+EDE half is a *reading*: RFC 8914 §2 describes the option in a response "to a
+query that includes an OPT pseudo-RR", and a NOTIFY is not a query. So the
+harness was asked. Against a NOTIFY for a zone none of them serves:
+
+| | answer | OPT mirrored | DO mirrored | EDE |
+|---|---|---|---|---|
+| BIND 9.20 | NOTAUTH | yes | yes | none |
+| Knot 3.6 | NOTAUTH | yes | yes | none |
+| NSD 4.12 | NXDOMAIN, QDCOUNT=0 | no | — | none |
+| rdnsd | NOTAUTH | yes | yes | yes |
+
+So the OPT half is what everyone does and the EDE half is this tree going
+further than its peers — recorded here rather than claimed as conformance. It
+is additive and ignorable (an EDNS option a receiver does not recognize is
+skipped), and the alternative is two refusals an operator cannot tell apart on
+the wire.
+
+**Verified by provoking the old behaviour** (`CLAUDE.md` §1). With the mirror
+removed from `notify_response`, two of the three new unit tests fail; with the
+transfer envelope put back on `has_edns()`, the DO assertion fails with
+`left: false, right: true`. Nine new assertions in the harness, run against the
+containers: scenario 43e reports **29 passed, 0 failed**, including dig reading
+each EDE text off the wire and the two peer rows in the table above. One of the
+nine — "a NOTIFY with no OPT is answered with none" — would have passed before
+the fix, and the comment beside it says so: it guards the direction the fix
+could have overshot in. 1002 tests on Windows and 1019 on Linux, clippy clean
+on both, `cargo doc` clean.
+
+---
+
 **Read `benches/answer_path.rs`'s header before quoting anything from it.** One
 whole answer is 522 ns and one `sendto`+`recvfrom` pair is 4 µs, so the entire
 benchmark suite covers about 6% of what a query costs — the context that stops a

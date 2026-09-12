@@ -4381,7 +4381,7 @@ mod tests {
                 .expect("the first NOTIFY")
                 .expect("recv");
         let request = DnsMessage::try_from_bytes(&buf[..n]).expect("parse");
-        let refusal = notify::notify_response(&request, ResponseCode::Refused);
+        let refusal = notify::notify_response(&request, ResponseCode::Refused, 1232, None);
         let bytes = refusal.to_bytes_within(512).expect("serialize");
         downstream.send_to(&bytes, from).await.expect("reply");
 
@@ -4427,7 +4427,7 @@ mod tests {
         {
             answered += 1;
             let request = DnsMessage::try_from_bytes(&buf[..n]).expect("parse");
-            let reply = notify::notify_response(&request, ResponseCode::Ok);
+            let reply = notify::notify_response(&request, ResponseCode::Ok, 1232, None);
             let bytes = reply.to_bytes_within(512).expect("serialize");
             downstream.send_to(&bytes, from).await.expect("reply");
         }

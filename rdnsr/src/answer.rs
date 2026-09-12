@@ -381,14 +381,9 @@ fn finish(
     // were deliberate.
     //
     // `why` rides in that OPT and nowhere else (RFC 8914 §2), which is why it
-    // is `mirror_with`'s business rather than a check here. Its only failure is
-    // an option too long for its length field, which `ExtendedError` bounds out
-    // of reach; the fallback drops the reason rather than the answer.
-    let mirrored = client
-        .edns
-        .mirror_with(ctx.udp.advertised(), why)
-        .unwrap_or_else(|_| client.edns.mirror(ctx.udp.advertised()));
-    if let Some(edns) = mirrored {
+    // is `mirror_with`'s business rather than a check here — and so is what
+    // happens to a reason too long to encode.
+    if let Some(edns) = client.edns.mirror_with(ctx.udp.advertised(), why) {
         resp.set_edns(edns);
     } else {
         resp.additionals
@@ -428,11 +423,7 @@ fn unsupported_opcode(msg: &DnsMessage, advertised: u16, max_len: usize) -> Opti
     const WHY: ExtendedError =
         ExtendedError::new(InfoCode::NOT_SUPPORTED, "this opcode is not implemented");
     let mut resp = build_response(msg, Vec::new(), ResponseCode::NotImplemented);
-    let asked = ClientEdns::of(msg);
-    let mirrored = asked
-        .mirror_with(advertised, Some(WHY))
-        .unwrap_or_else(|_| asked.mirror(advertised));
-    if let Some(edns) = mirrored {
+    if let Some(edns) = ClientEdns::of(msg).mirror_with(advertised, Some(WHY)) {
         resp.set_edns(edns);
     }
     resp.to_bytes_within(max_len).ok()

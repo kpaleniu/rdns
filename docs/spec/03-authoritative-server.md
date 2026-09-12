@@ -187,11 +187,15 @@ mirrored OPT and the TSIG, TC=1, RCODE 0.
 | NOTAUTH | a transfer or NOTIFY for a zone not served here; a TSIG that did not verify; an UPDATE for a zone we are not authoritative for (RFC 2136 §3.1.1) |
 | SERVFAIL | a transfer that would not build or serialize; an UPDATE that could not be read, written or signed (RFC 2136 §3.4.2.1) |
 | BADVERS | EDNS version > 0 |
+| NOTZONE | an UPDATE record outside the zone its own Zone section names (RFC 2136 §3.4.1) |
+| YXDOMAIN, YXRRSET, NXRRSET | the other three UPDATE prerequisite failures (RFC 2136 §3.2) |
 
 ### Extended DNS Errors (RFC 8914)
 
-Attached to the refusals, and only for a client whose query carried an OPT
-(§2). The SERVFAILs carry none on purpose: they are internal failures with a
+Attached to the refusals, and only for a client whose *request* carried an OPT
+(§2; RFC 6891 §6.1.1 and §6.2.2 are what make that a MUST and a MUST NOT, and
+both say request rather than query — which is how a NOTIFY reply came to carry
+neither, `TODO.md` #47). The SERVFAILs carry none on purpose: they are internal failures with a
 log line and a counter, and EDE 0 would say nothing the RCODE does not. Nor
 does the TSIG rejection — the TSIG record in that reply already says BADKEY,
 BADSIG or BADTIME (RFC 8945 §4.3), which is finer than any INFO-CODE.
@@ -200,13 +204,22 @@ BADSIG or BADTIME (RFC 8945 §4.3), which is finer than any INFO-CODE.
 |---|---|
 | 20, Not Authoritative | a name in no zone we hold — the query path and the IXFR-over-UDP shortcut; an UPDATE for a zone not served here |
 | 21, Not Supported | an opcode we do not implement; a class we do not serve |
-| 18, Prohibited | a transfer or an UPDATE the ACL or the key scope denies, all four ways. One code for all four: telling a stranger which of them it was is telling it about the keyring |
-| 0, Other | an UPDATE for a zone we replicate, or for a zone we have nowhere to write back to; a transfer that did not arrive over TLS 1.3 where the policy requires it. Not Prohibited, which is about the client's credential: this one may be authorized and asking on the wrong socket |
+| 18, Prohibited | a transfer or an UPDATE the ACL or the key scope denies, all four ways, and a NOTIFY from an address the zone's `masters` list does not name. One code for all of them: telling a stranger which it was is telling it about the keyring |
+| 0, Other | an UPDATE for a zone we replicate, or for a zone we have nowhere to write back to; a transfer that did not arrive over TLS 1.3 where the policy requires it; either of the two NOTIFY NOTAUTHs. Not Prohibited, which is about the client's credential: this one may be authorized and asking on the wrong socket |
 
-A NOTIFY reply carries no OPT at all, so it can carry no reason — see
-`TODO.md` #47.
-| NOTZONE | an UPDATE record outside the zone its own Zone section names (RFC 2136 §3.4.1) |
-| YXDOMAIN, YXRRSET, NXRRSET | the other three UPDATE prerequisite failures (RFC 2136 §3.2) |
+**The two NOTIFY NOTAUTHs are one RCODE and two operator problems**, which is
+why each carries its own text: "this server is this zone's primary, not a
+secondary" and "not a zone served here". Neither is §4.21's Not Authoritative —
+that code's own text is about a query with RD clear, and for the first of them
+it would be false.
+
+**Going further than the peers here, deliberately.** RFC 8914 §2 describes the
+option in a response "to a query that includes an OPT pseudo-RR", and a NOTIFY
+is not a query. Measured against the interop harness: BIND 9.20 and Knot 3.6
+mirror the OPT and the DO bit on a NOTIFY they refuse and send no EDE; NSD 4.12
+answers NXDOMAIN with QDCOUNT=0 and no OPT at all. An option a receiver does not
+recognize is skipped, so the cost is nothing and the gain is a refusal an
+operator can read.
 
 ---
 
@@ -252,7 +265,13 @@ Every attempt is logged, allowed or not, with which of the two granted it.
 - Split into messages of about 16 KiB (`AXFR_TARGET_MESSAGE_SIZE`) by a size
   estimate that ignores compression and so can only be too large. Each message is
   a well-formed authoritative answer that repeats the question.
-- The OPT record goes on the first message only, before the TSIG.
+- The OPT record goes on the first message only, before the TSIG — RFC 5936
+  §2.2.5, "it SHOULD include one OPT RR in the first response message and MAY
+  do so in subsequent response messages". It mirrors the client's DO bit
+  (RFC 3225 §3), which it did not until `TODO.md` #47; the bit changes nothing
+  about what a transfer carries, since §3 puts the security records in the zone
+  data "whether or not the DO bit was set", so a cleared one said only that
+  this server had stopped doing DNSSEC.
 - A zone with no apex SOA cannot be transferred: SERVFAIL.
 - A serialization failure abandons the whole transfer.
 
@@ -314,9 +333,13 @@ will refresh as a result.
 if the zone is one we replicate:
         if the peer's address is one of its masters:  NOERROR, wake the refresh task now
         else:                                          REFUSED
-else if we serve the zone as primary:                  NOTAUTH  ("this server is its primary")
-else:                                                  NOTAUTH  ("not a zone served here")
+else if we serve the zone as primary:                  NOTAUTH  (EDE 0: this server is this zone's primary, not a secondary)
+else:                                                  NOTAUTH  (EDE 0: not a zone served here)
 ```
+
+The REFUSED carries EDE 18, Prohibited. Every one of the four replies mirrors
+the sender's OPT and its DO bit if the NOTIFY carried one, and carries none if
+it did not — RFC 6891 §6.1.1 and §6.2.2, RFC 3225 §3.
 
 Waking uses `Notify::notify_one`, which leaves a permit for a task that is
 mid-transfer.

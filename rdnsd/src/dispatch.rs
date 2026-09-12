@@ -264,11 +264,8 @@ impl Server {
         let serialized = {
             let zones = self.zone_map.read().await;
             if msg.opcode == OpCode::Notify {
-                notify_reply(&msg, &zones, &self.secondaries, peer).to_bytes_within_buf_with(
-                    max_len,
-                    &mut scratch.out,
-                    &mut scratch.compressor,
-                )
+                notify_reply(&msg, &zones, &self.secondaries, peer, advertised)
+                    .to_bytes_within_buf_with(max_len, &mut scratch.out, &mut scratch.compressor)
             } else {
                 write_response(
                     &msg,
@@ -987,6 +984,26 @@ const NOT_WRITABLE: ExtendedError = ExtendedError::new(
     "this server has nowhere to write this zone back to",
 );
 
+/// A NOTIFY from an address the zone's `masters` list does not name. RFC 8914
+/// §4.19's "a query from an 'unauthorized' client", which is what this is: the
+/// sender is refused on its address, exactly as a transfer is.
+const NOT_ITS_MASTER: ExtendedError =
+    ExtendedError::new(InfoCode::PROHIBITED, "not one of this zone's masters");
+
+/// A NOTIFY for a zone this server is the *primary* for. Not §4.21's Not
+/// Authoritative, which would be a false statement — we are authoritative, and
+/// §4.21's own text is about a query with RD clear rather than about a zone we
+/// do not hold. OTHER carries the sentence (§4.1).
+const NOT_A_SECONDARY: ExtendedError = ExtendedError::new(
+    InfoCode::OTHER,
+    "this server is this zone's primary, not a secondary",
+);
+
+/// A NOTIFY for a zone this server has never heard of. OTHER as well, and for
+/// the same reading of §4.21 — the two NOTAUTHs here are exactly the
+/// distinction the reply exists to carry, so they must not share a code.
+const NO_SUCH_ZONE: ExtendedError = ExtendedError::new(InfoCode::OTHER, "not a zone served here");
+
 /// The start of every reply that carries no records: the question echoed, and
 /// the client's OPT mirrored with its DO bit (RFC 6891 §6.1.1, RFC 3225 §3).
 ///
@@ -996,17 +1013,11 @@ const NOT_WRITABLE: ExtendedError = ExtendedError::new(
 /// stopped doing DNSSEC (`TODO.md` #38, `CLAUDE.md` §7).
 ///
 /// `why` is RFC 8914's reason for the RCODE, and rides in that OPT or nowhere
-/// (§2). Its encoder can only fail on an option too long for its length field,
-/// which [`ExtendedError`]'s own bound puts out of reach; the fallback drops
-/// the *reason* rather than the reply, because a refusal without its annotation
-/// is still the answer and a refusal that failed to serialize is not.
+/// (§2) — which is [`ClientEdns::mirror_with`]'s rule, and so is what happens
+/// to a reason that will not encode.
 fn empty_reply(request: &DnsMessage, advertised: u16, why: Option<ExtendedError>) -> DnsMessage {
     let mut resp = DnsMessage::reply_to(request);
-    let asked = ClientEdns::of(request);
-    let mirrored = asked
-        .mirror_with(advertised, why)
-        .unwrap_or_else(|_| asked.mirror(advertised));
-    if let Some(edns) = mirrored {
+    if let Some(edns) = ClientEdns::of(request).mirror_with(advertised, why) {
         resp.set_edns(edns);
     }
     resp
@@ -1138,13 +1149,14 @@ fn notify_reply(
     zone_map: &ZoneMap,
     secondaries: &Secondaries,
     peer: SocketAddr,
+    advertised: u16,
 ) -> DnsMessage {
     let zone = notify::notified_zone(msg).unwrap_or_default();
 
     match secondaries.notified(zone.as_ref(), peer.ip()) {
         Notified::Refreshing => {
             tracing::info!(%peer, "NOTIFY for {zone}: refreshing now");
-            return notify::notify_response(msg, ResponseCode::Ok);
+            return notify::notify_response(msg, ResponseCode::Ok, advertised, None);
         }
         Notified::NotItsMaster => {
             tracing::warn!(
@@ -1152,7 +1164,12 @@ fn notify_reply(
                 "NOTIFY for {zone}: REFUSED (not one of its masters — \
                  a NOTIFY costs its recipient a transfer)"
             );
-            return notify::notify_response(msg, ResponseCode::Refused);
+            return notify::notify_response(
+                msg,
+                ResponseCode::Refused,
+                advertised,
+                Some(NOT_ITS_MASTER),
+            );
         }
         Notified::NotOurs => {}
     }
@@ -1162,13 +1179,12 @@ fn notify_reply(
     // `Name` does it; `str::to_lowercase` would fold U+212A KELVIN SIGN onto `k`
     // and merge two names that differ on the wire.
     let ours = zone_map.contains_key(zone.as_ref().folded().as_ref());
-    let why = if ours {
-        "this server is its primary, not a secondary"
-    } else {
-        "not a zone served here"
-    };
-    tracing::info!(%peer, "NOTIFY for {zone}: NOTAUTH ({why})");
-    notify::notify_response(msg, ResponseCode::NotAuthorized)
+    // The same distinction on the wire and in the log since #47. It used to be
+    // the log alone, which is the half an operator on the *sending* side cannot
+    // read.
+    let why = if ours { NOT_A_SECONDARY } else { NO_SUCH_ZONE };
+    tracing::info!(%peer, "NOTIFY for {zone}: NOTAUTH ({})", why.extra_text());
+    notify::notify_response(msg, ResponseCode::NotAuthorized, advertised, Some(why))
 }
 
 #[cfg(test)]
@@ -1258,30 +1274,118 @@ mod tests {
         let mut zones = HashMap::new();
         zones.insert(zone_key(&primary_zone), std::sync::Arc::new(primary_zone));
 
+        // The NOTIFY carries an OPT, because #47 is about what comes back in
+        // one: RFC 6891 §6.1.1's MUST applies to a *request*, and a NOTIFY is
+        // one.
         let from = |zone: &str, ip: &str| {
-            let msg = notify::notify_request(nm(zone).as_ref(), None, 1);
+            let mut msg = notify::notify_request(nm(zone).as_ref(), None, 1);
+            msg.set_edns(rdns::Edns::with_payload_size(1232));
             let peer: SocketAddr = format!("{ip}:5353").parse().unwrap();
-            notify_reply(&msg, &zones, &secondaries, peer).rcode
+            notify_reply(&msg, &zones, &secondaries, peer, 1232)
+        };
+        let why = |reply: &DnsMessage| {
+            let edns = reply.edns().expect("the sender's OPT is mirrored");
+            ExtendedError::all_in(edns)
+                .expect("a well-formed option list")
+                .into_iter()
+                .collect::<Vec<_>>()
         };
 
+        let accepted = from("replicated.test.", "192.0.2.1");
         assert_eq!(
-            from("replicated.test.", "192.0.2.1"),
+            accepted.rcode,
             ResponseCode::Ok,
             "from its master: acted on"
         );
+        assert!(
+            why(&accepted).is_empty(),
+            "nothing went wrong, so there is nothing to annotate"
+        );
+
+        let refused = from("replicated.test.", "203.0.113.9");
         assert_eq!(
-            from("replicated.test.", "203.0.113.9"),
+            refused.rcode,
             ResponseCode::Refused,
             "from anywhere else: refused, because acting would cost us a transfer"
         );
         assert_eq!(
-            from("example.com.", "192.0.2.1"),
+            why(&refused),
+            vec![(
+                InfoCode::PROHIBITED,
+                "not one of this zone's masters".to_string()
+            )]
+        );
+
+        // The two NOTAUTHs are one RCODE and two operator problems, which is
+        // the whole reason the reply carries a reason (`TODO.md` #47).
+        let ours = from("example.com.", "192.0.2.1");
+        assert_eq!(
+            ours.rcode,
             ResponseCode::NotAuthorized,
             "a zone we are the primary for: we are nobody's secondary for it"
         );
         assert_eq!(
-            from("never-heard-of.test.", "192.0.2.1"),
-            ResponseCode::NotAuthorized
+            why(&ours),
+            vec![(
+                InfoCode::OTHER,
+                "this server is this zone's primary, not a secondary".to_string()
+            )]
         );
+
+        let unknown = from("never-heard-of.test.", "192.0.2.1");
+        assert_eq!(unknown.rcode, ResponseCode::NotAuthorized);
+        assert_eq!(
+            why(&unknown),
+            vec![(InfoCode::OTHER, "not a zone served here".to_string())],
+            "the same RCODE as the zone we are primary for, and not the same reason"
+        );
+    }
+
+    /// RFC 6891 §6.2.2: a request with no OPT gets a response with none, EDE
+    /// included — the reason rides in the OPT or nowhere (RFC 8914 §2).
+    ///
+    /// The mirror in the other direction is the defect #47 was: this function
+    /// attached nothing at all, whatever the NOTIFY carried, because it predates
+    /// the [`empty_reply`] consolidation every other reply here goes through.
+    #[test]
+    fn a_notify_without_edns_is_answered_without_edns() {
+        let secondaries = Secondaries::replicating(&[]);
+        let zones = HashMap::new();
+        let msg = notify::notify_request(nm("never-heard-of.test.").as_ref(), None, 1);
+        assert!(msg.edns().is_none(), "the fixture sends no OPT");
+
+        let peer: SocketAddr = "192.0.2.1:5353".parse().expect("a test address");
+        let reply = notify_reply(&msg, &zones, &secondaries, peer, 1232);
+
+        assert_eq!(reply.rcode, ResponseCode::NotAuthorized);
+        assert!(
+            reply.edns().is_none(),
+            "an unsolicited OPT is not a mirror, and the EDE goes with it"
+        );
+    }
+
+    /// DO is the sender's and is copied back (RFC 3225 §3), the same rule
+    /// [`empty_reply`] holds for every other reply. A NOTIFY has no DNSSEC to
+    /// ask for; what a dropped bit would say is that this server stopped doing
+    /// DNSSEC, which is how the same slip read on three reply paths in #38.
+    #[test]
+    fn a_notify_reply_mirrors_the_senders_do_bit() {
+        let secondaries = Secondaries::replicating(&[]);
+        let zones = HashMap::new();
+        let peer: SocketAddr = "192.0.2.1:5353".parse().expect("a test address");
+
+        for do_bit in [false, true] {
+            let mut msg = notify::notify_request(nm("never-heard-of.test.").as_ref(), None, 1);
+            let mut edns = rdns::Edns::with_payload_size(1232);
+            edns.do_bit = do_bit;
+            msg.set_edns(edns);
+
+            let reply = notify_reply(&msg, &zones, &secondaries, peer, 1232);
+            assert_eq!(
+                reply.edns().expect("an OPT").do_bit,
+                do_bit,
+                "DO must be copied in the response"
+            );
+        }
     }
 }

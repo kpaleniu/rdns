@@ -37,14 +37,18 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51**,
-**#53** and **#21**, as of 2026-09-12. **None of them is a live defect**; #50
-was, and closing it is what added #53: a zone this server signed itself is
-verified again at every load, which 76 seconds of a million-record zone made
-visible. #44 is what an operator would find missing in `rdnsd`, #45 what an ISP
-would find missing in `rdnsr`, #47 is the one gap 44b
-left behind, #48 and #49 the two 44a left, #51 the one 44d left,
-and #21 is an inventory of deliberate deviations rather
+**#44** (44a-44d done), **#45**, **#48**, **#49**, **#51**,
+**#53** and **#21**, as of 2026-09-12. ~~**None of them is a live defect**~~ —
+**that claim was wrong about #47**, which closed the same day carrying two MUSTs
+it had been filed as not breaking: RFC 6891 §6.1.1's OPT in a response to a
+request that had one, and RFC 3225 §3's DO bit, dropped on the first envelope of
+every AXFR. It was filed as "not a defect" because its own row read §6.1.1 as
+"asks for", and the section says what the difference cost. Of what is left, #50
+was the live one, and closing it is what added #53: a zone this server signed
+itself is verified again at every load, which 76 seconds of a million-record
+zone made visible. #44 is what an operator would find missing in `rdnsd`, #45
+what an ISP would find missing in `rdnsr`, #48 and #49 the two 44a left, #51 the
+one 44d left, and #21 is an inventory of deliberate deviations rather
 than a queue. Everything else numbered is closed;
 the table under "Closed work" says which, when, and where the reasoning went.
 
@@ -821,7 +825,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51** and
+**#44** (44a-44d done), **#45**, **#48**, **#49**, **#51** and
 **#53**, plus **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
@@ -1072,35 +1076,6 @@ from #44's. Same filing rule: every "0 hits" is a `grep` taken on the day.
 | **45c** | DNS64 (RFC 6147) — **0 hits** | Synthesize AAAA from A for IPv6-only clients behind NAT64. Required in an IPv6-only mobile network, which is most of them |
 | **45d** | prefetching — **0 hits** | Re-resolve a popular name before its TTL expires, so the hit rate has no hole at every expiry. Unbound's `prefetch`, and the cheapest of the rows here |
 | **45e** | EDNS Client Subnet (RFC 7871) — the option code exists and nothing reads or writes it | `EDNS_OPTION_CLIENT_SUBNET` is defined in `edns.rs` and appears at exactly one other place: its own doc comment. Forwarding it is what lets an authoritative server steer a client to a near replica, and *not* forwarding it is a defensible privacy position — RFC 7871 §2 is unusually explicit about the cost. So this row is a **decision to take**, not work to schedule, and it is the only one on this page whose right answer might be "no, and write down why" |
-
----
-
-### 47. A NOTIFY reply carries no OPT record — **filed 2026-09-12**
-
-Found while doing 44b and not filed by it, because it is not an EDE question.
-`notify::notify_response` builds a reply from `DnsMessage::reply_to` and
-attaches nothing: no OPT, whatever the NOTIFY carried. Every other reply path in
-`rdnsd` goes through `ClientEdns::mirror` or `empty_reply`, which is the
-consolidation #38 made and this function predates.
-
-Two consequences, and the second is why it has a number rather than a sentence
-in a doc comment:
-
-- RFC 6891 §6.1.1 asks for an OPT in a response to a request that had one, and
-  some senders remember its absence as a downgrade and stop offering EDNS.
-- A refused NOTIFY therefore cannot say why, where every other refusal here now
-  can (44b). "REFUSED — you are not one of my masters" and "NOTAUTH — I am that
-  zone's primary, not a secondary" are two different operator problems, and #46b
-  was filed because the first of them was invisible in the *log*. On the wire it
-  still is.
-
-The measurement somebody would start from, taken rather than guessed:
-`rdns::notify::notify_response` has exactly three callers outside its own tests,
-all three in `rdnsd/src/dispatch.rs`'s `notify_reply` — NOERROR, REFUSED and
-NOTAUTH — so it is `rdnsd`'s function alone and can grow a parameter without
-touching another daemon. #43's interop harness is what would show a real
-sender's reaction; none of its 158 assertions covers this, because the NOTIFY it
-exercises is accepted.
 
 ---
 
@@ -1391,6 +1366,7 @@ the week; the record is under "How the queue kept going stale" in
 | **50** | verifying a signed zone at load was quadratic in the zone | **filed and closed 2026-09-12**, found by 44c's measurement rather than by reading the code. `validate_response` collected every DNSKEY and every RRSIG in the zone on every call and `verify_rrset` then scanned what it collected, so `verify_zones` — which runs at startup, on SIGHUP, on `rdnsctl reload`, on the re-signing tick and inside `--check-config` — cost the square of the zone. **20,006 RRsets: 112.68 s before, 0.65 s after**, and a million-record zone goes from days of arithmetic to a measured 76 s. The fix is a `ZoneKeys` the caller hoists and a signature lookup through the zone's own owner index; the guard is an allocation count (34 either side of a fifty-fold zone, 217 against 6,101 with the scan) plus a ratio test in `rdnsd`. Filed **#53** on the way out |
 | **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. |
 | **52** | a rate-limit test is a coin toss at a second boundary | **filed and closed 2026-09-12**, one commit. Not a defect in the server, and the filing undercounted it by 23: the shape is a test that reads the wall clock at a limiter call, and there were **43 such call sites across 24 tests**, six of them assertions a refill actually breaks. Both buckets refill by whole seconds, so the verdict depended on whether two reads straddled one. 41 sites needed nothing but one `let now` per test, because `should_allow` has taken the instant as a parameter since #28a; the two that read the clock inside the loop under test — `tcp::serve`'s per-connection charge and `rdnsr`'s UDP loop — got `rdns::clock::Clock` on `ServeContext`. The test now asserts the refill as well as the refusal, which is the half that says the connection was charged rather than never admitted |
+| **47** | a NOTIFY reply carried no OPT record | **filed and closed 2026-09-12**, one commit, and it was a defect after all: the row read RFC 6891 §6.1.1 as "asks for" where it is "if an OPT record is present in a received **request**, compliant responders MUST include an OPT record in their respective responses" — a NOTIFY is a request. Counting the shape (§18) found a second site and a second MUST: `transfer::Envelopes` built the first AXFR envelope's OPT from `has_edns()` and a fresh `Edns`, which drops DO, against RFC 3225 §3's unconditional "the DO bit of the query MUST be copied in the response". Nothing tested either. The three NOTIFY refusals now carry three different EDEs, because "you are not one of my masters" and "I am that zone's primary" are one RCODE and two operator problems. `ClientEdns::mirror_with` became total on the way, so the `Err` all three callers answered identically is one doc comment rather than four. The EDE half is a reading rather than a quotation and the peers were asked: BIND 9.20 and Knot 3.6 mirror the OPT and DO and send no EDE, NSD 4.12 answers NXDOMAIN with QDCOUNT=0 and no OPT. Nine new assertions in the interop harness, 29 passed 0 failed in 43e |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

@@ -473,14 +473,25 @@ impl ClientEdns {
     /// The EDE goes where the OPT goes and nowhere else, so a client that sent
     /// none gets neither: this is the [`DnsMessage`]-shaped half of the rule
     /// [`ResponseWriter::set_extended_error`] holds for the writer-shaped half.
-    pub fn mirror_with(
-        self,
-        payload_size: u16,
-        error: Option<ExtendedError>,
-    ) -> Result<Option<Edns>, WireError> {
-        match (self.mirror(payload_size), error) {
-            (Some(edns), Some(error)) => Ok(Some(edns.with_extended_error(error)?)),
-            (edns, _) => Ok(edns),
+    ///
+    /// Total, and the `Result` it used to return is the reason. Encoding the
+    /// option can only fail on one too long for its length field, which
+    /// [`ExtendedError`]'s own bound on EXTRA-TEXT puts out of reach on the
+    /// fresh OPT this builds; every one of the three callers answered that
+    /// impossible `Err` by dropping the *reason* and keeping the reply, since a
+    /// refusal without its annotation is still the answer and a refusal that
+    /// failed to serialize is not. One decision written three times is the
+    /// second copy waiting to differ (`CLAUDE.md` §7), so it is here.
+    pub fn mirror_with(self, payload_size: u16, error: Option<ExtendedError>) -> Option<Edns> {
+        let mirrored = self.mirror(payload_size)?;
+        let Some(error) = error else {
+            return Some(mirrored);
+        };
+        match mirrored.with_extended_error(error) {
+            Ok(annotated) => Some(annotated),
+            // `with_extended_error` consumed the OPT, so the unreachable arm
+            // rebuilds the bare one rather than cloning it up front for it.
+            Err(_) => self.mirror(payload_size),
         }
     }
 }

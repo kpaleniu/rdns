@@ -12,11 +12,12 @@ use std::net::SocketAddr;
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::record_types as rt;
+use crate::response::ClientEdns;
 use crate::tsig::{TsigKey, TsigKeyring};
 use crate::zone::Zone;
 use crate::{
-    name_keys::NameKeyBuf, DnsMessage, Name, NameRef, OpCode, ParsedRecord, Qtype, QueryClass,
-    QuerySection, ResourceRecord, ResponseCode, Serial,
+    name_keys::NameKeyBuf, DnsMessage, ExtendedError, Name, NameRef, OpCode, ParsedRecord, Qtype,
+    QueryClass, QuerySection, ResourceRecord, ResponseCode, Serial,
 };
 
 /// A secondary to tell, and the key to tell it with: `addr[:port][#keyname]`.
@@ -225,11 +226,35 @@ pub fn notify_request(zone: NameRef<'_>, soa: Option<ResourceRecord>, id: u16) -
     }
 }
 
-/// The reply to a NOTIFY: same opcode, question echoed, no data (RFC 1996 §4.7).
-pub fn notify_response(request: &DnsMessage, rcode: ResponseCode) -> DnsMessage {
+/// The reply to a NOTIFY: same opcode, question echoed, no data (RFC 1996 §4.7),
+/// and the sender's OPT mirrored.
+///
+/// The mirror is not optional and not about queries: RFC 6891 §6.1.1 is "if an
+/// OPT record is present in a received request, compliant responders MUST
+/// include an OPT record in their respective responses", and §6.2.2 is the
+/// converse MUST NOT — both about a *request*, which a NOTIFY is. This function
+/// attached nothing for a year because it predates the consolidation that made
+/// every other reply here go through [`ClientEdns`] (`TODO.md` #38, #47), and a
+/// sender that remembers a missing OPT as a downgrade stops offering EDNS.
+///
+/// `why` is RFC 8914's reason for the RCODE. §2 describes the option in "any
+/// response ... to a query that includes an OPT pseudo-RR" and a NOTIFY is not a
+/// query, so this is a reading rather than a quotation: an EDNS option a peer
+/// does not recognize is ignored, and the alternative is two refusals an
+/// operator cannot tell apart on the wire — "you are not one of my masters" and
+/// "I am that zone's primary" are different problems with the same RCODE.
+pub fn notify_response(
+    request: &DnsMessage,
+    rcode: ResponseCode,
+    advertised: u16,
+    why: Option<ExtendedError>,
+) -> DnsMessage {
     let mut msg = DnsMessage::reply_to(request);
     msg.authoritive = true;
     msg.rcode = rcode;
+    if let Some(edns) = ClientEdns::of(request).mirror_with(advertised, why) {
+        msg.set_edns(edns);
+    }
     msg
 }
 
@@ -369,7 +394,7 @@ mod tests {
     #[test]
     fn test_a_notify_response_acknowledges_it() {
         let request = notify_request(nm("example.com.").as_ref(), None, 0x4321);
-        let reply = notify_response(&request, ResponseCode::Ok);
+        let reply = notify_response(&request, ResponseCode::Ok, 1232, None);
 
         let mut buf = vec![0u8; 512];
         let n = reply.to_bytes(&mut buf).expect("serialize");
@@ -397,7 +422,7 @@ mod tests {
     fn test_a_refusal_ends_the_retries_without_being_an_acceptance() {
         let request = notify_request(nm("example.com.").as_ref(), None, 5);
         assert_eq!(
-            outcome(&notify_response(&request, ResponseCode::Ok), 5),
+            outcome(&notify_response(&request, ResponseCode::Ok, 1232, None), 5),
             Some(NotifyOutcome::Accepted)
         );
         for rcode in [
@@ -406,7 +431,7 @@ mod tests {
             ResponseCode::ServerFailure,
         ] {
             assert_eq!(
-                outcome(&notify_response(&request, rcode), 5),
+                outcome(&notify_response(&request, rcode, 1232, None), 5),
                 Some(NotifyOutcome::Rejected(rcode)),
                 "{rcode:?} arrived, so stop retrying, but nothing will refresh"
             );
@@ -497,6 +522,8 @@ mod tests {
         let reply = notify_response(
             &notify_request(nm("example.com.").as_ref(), None, 1),
             ResponseCode::Ok,
+            1232,
+            None,
         );
         assert!(notified_zone(&reply).is_none());
     }

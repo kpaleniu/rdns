@@ -8,11 +8,12 @@
 
 use crate::error::{TransferError, TransferResult};
 use crate::record_types as rt;
+use crate::response::ClientEdns;
 use crate::zone::Zone;
 #[cfg(test)]
 use crate::Name;
 use crate::Qtype;
-use crate::{DnsMessage, Edns, ResourceRecord};
+use crate::{DnsMessage, ResourceRecord};
 
 /// How much of a message to fill before starting the next one.
 ///
@@ -160,14 +161,25 @@ impl<I: Iterator<Item = ResourceRecord>> Iterator for Envelopes<'_, I> {
         }
 
         let mut message = transfer_message(self.request, current);
-        // Mirror the client's OPT (RFC 6891 §6.1.1) on the first message only: a
-        // multi-message transfer is one exchange, as BIND treats it, so repeating
-        // it would be a second OPT. Before any TSIG, which must be last in the
-        // additional section (RFC 8945 §5.1) and is appended by the signer.
-        if std::mem::take(&mut self.first) && self.request.has_edns() {
+        // Mirror the client's OPT on the first message only — RFC 5936 §2.2.5:
+        // "it SHOULD include one OPT RR in the first response message and MAY do
+        // so in subsequent response messages". Before any TSIG, which must be
+        // last in the additional section (RFC 8945 §5.1) and is appended by the
+        // signer.
+        //
+        // Through [`ClientEdns`] rather than `has_edns()` plus a fresh `Edns`,
+        // which is what dropped DO here: RFC 3225 §3's "the DO bit of the query
+        // MUST be copied in the response" is not about queries only, and this
+        // was the fourth site to read it that way (`TODO.md` #38, #47). The two
+        // agree on *whether* to mirror — they differ only for an option list
+        // that does not parse, which never reaches a transfer.
+        if std::mem::take(&mut self.first) {
             // The client's own size, echoed: a transfer is framed by the TCP
             // length prefix, so ours says nothing useful here.
-            message.set_edns(Edns::with_payload_size(self.request.udp_payload_size()));
+            if let Some(edns) = ClientEdns::of(self.request).mirror(self.request.udp_payload_size())
+            {
+                message.set_edns(edns);
+            }
         }
         Some(message)
     }
@@ -288,6 +300,77 @@ mod tests {
             assert_eq!(message.queries[0].qname, request.queries[0].qname);
             assert_eq!(message.queries[0].qtype, Qtype::of(rt::AXFR));
         }
+    }
+
+    /// RFC 5936 §2.2.5: "it SHOULD include one OPT RR in the first response
+    /// message and MAY do so in subsequent response messages" — and RFC 3225
+    /// §3: "the DO bit of the query MUST be copied in the response", which this
+    /// dropped until #47. Nothing asserted either before.
+    ///
+    /// The DO bit changes nothing about what a transfer carries — §3 says the
+    /// security records "are part of the zone data for an AXFR or IXFR query"
+    /// and go whether it was set or not — so what a cleared bit says is that
+    /// this server stopped doing DNSSEC, which is exactly how the same slip
+    /// read on three reply paths in #38.
+    #[test]
+    fn the_first_envelope_mirrors_the_clients_opt_and_its_do_bit() {
+        let zone = small_zone();
+
+        for do_bit in [false, true] {
+            let mut request = request_for("example.com.");
+            let mut edns = crate::Edns::with_payload_size(1232);
+            edns.do_bit = do_bit;
+            request.set_edns(edns);
+
+            let messages = axfr_messages(&request, &zone).expect("a transfer");
+            let first = messages.first().expect("at least one envelope");
+            let opt = first.edns().expect("the first message carries an OPT");
+            assert_eq!(opt.do_bit, do_bit, "DO is the client's");
+            assert_eq!(
+                opt.udp_payload_size,
+                request.udp_payload_size(),
+                "the client's own size: a transfer is framed by the TCP length                  prefix, so ours says nothing here"
+            );
+        }
+
+        // And no OPT at all when the client sent none (RFC 6891 §6.2.2).
+        let plain = request_for("example.com.");
+        assert!(plain.edns().is_none(), "the fixture sends no OPT");
+        let messages = axfr_messages(&plain, &zone).expect("a transfer");
+        assert!(
+            messages.iter().all(|m| m.edns().is_none()),
+            "an unsolicited OPT is not a mirror"
+        );
+    }
+
+    /// The "first message only" half of §2.2.5, which needs a zone that splits.
+    #[test]
+    fn only_the_first_envelope_of_a_split_transfer_carries_the_opt() {
+        let mut text = String::from(
+            "$TTL 3600
+@ IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400
+",
+        );
+        for i in 0..2_000 {
+            text.push_str(&format!(
+                "host-with-a-fairly-long-name-{i} IN TXT \"padding padding padding\"
+"
+            ));
+        }
+        let zone = parse_zone_file(&text, "example.com.").unwrap();
+
+        let mut request = request_for("example.com.");
+        let mut edns = crate::Edns::with_payload_size(1232);
+        edns.do_bit = true;
+        request.set_edns(edns);
+
+        let messages = axfr_messages(&request, &zone).expect("a transfer");
+        assert!(messages.len() > 1, "expected a split");
+        assert!(messages[0].edns().is_some(), "the first message has it");
+        assert!(
+            messages[1..].iter().all(|m| m.edns().is_none()),
+            "a multi-message transfer is one exchange, so the rest do not"
+        );
     }
 
     /// A zone too big for one message becomes several, each a complete answer,
