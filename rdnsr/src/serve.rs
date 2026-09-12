@@ -9,7 +9,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use rdns::clock::current_unix_timestamp;
 use rdns::resolver::Resolver;
 use rdns::security::ResponseVerdict;
 use rdns::shutdown::{Busy, Stop};
@@ -65,7 +64,7 @@ pub(crate) async fn udp_main(
         // One read for the limiter and the query log, which happen within
         // microseconds of each other; the response budget reads its own, since a
         // recursion sits in between (`TODO.md` #28a).
-        let now = current_unix_timestamp();
+        let now = ctx.clock.now();
         if !ctx.allow_source(peer.ip(), now) {
             continue;
         }
@@ -110,7 +109,7 @@ pub(crate) async fn udp_main(
                 // recursive resolution sits in between and can take seconds, so
                 // sharing that instant would deny the bucket the refill the wait
                 // earned it.
-                match ctx.admit_response(peer.ip(), reply.len(), current_unix_timestamp()) {
+                match ctx.admit_response(peer.ip(), reply.len(), ctx.clock.now()) {
                     ResponseVerdict::Send => {
                         let _ = socket.send_to(&reply, peer).await;
                     }
@@ -198,8 +197,9 @@ mod tests {
     async fn a_source_over_its_query_rate_is_dropped_and_counted() {
         let (resolver, caches) = context();
 
-        // One per second, burst of one: the second datagram in a burst is over
-        // the limit whatever the clock does.
+        // One per second, burst of one, on a clock nothing moves: against
+        // `SystemTime` a second boundary inside the burst hands back a token
+        // and only two of the four are dropped (`TODO.md` #52).
         let ctx = Arc::new(ServeContext {
             limiter: Arc::new(RateLimiter::new(RateLimitConfig::per_second(1, 1))),
             responses: Arc::new(ResponseLimiter::disabled()),
@@ -207,6 +207,7 @@ mod tests {
             logger: Arc::new(QueryLogger::new()),
             validator: Arc::new(AdmissionCheck::with_defaults()),
             udp: rdns::UdpSizes::default(),
+            clock: rdns::clock::Clock::fixed(1_000_000_000),
         });
         let metrics = ctx.metrics.clone();
 
@@ -258,15 +259,19 @@ mod tests {
         );
         let exempt: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         let other: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        // One instant for the whole test: the bucket refills by whole seconds,
+        // so a clock read per call decides the last assertion on whether two of
+        // them straddled a boundary (`TODO.md` #52).
+        let now = rdns::clock::current_unix_timestamp();
         for _ in 0..10 {
             assert!(
-                limiter.should_allow(exempt, current_unix_timestamp()),
+                limiter.should_allow(exempt, now),
                 "an exempt source never trips"
             );
         }
-        assert!(limiter.should_allow(other, current_unix_timestamp()));
+        assert!(limiter.should_allow(other, now));
         assert!(
-            !limiter.should_allow(other, current_unix_timestamp()),
+            !limiter.should_allow(other, now),
             "and a source that is not exempt still does"
         );
     }

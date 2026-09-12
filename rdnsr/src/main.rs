@@ -487,6 +487,7 @@ async fn main() -> anyhow::Result<()> {
         metrics: Arc::new(DnsMetrics::new()),
         logger: Arc::new(QueryLogger::new()),
         validator: Arc::new(AdmissionCheck::new(admission.clone())),
+        clock: rdns::clock::Clock::system(),
     });
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \

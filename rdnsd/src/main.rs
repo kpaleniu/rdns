@@ -50,6 +50,7 @@ use zones::{
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use rdns::clock::Clock;
 use rdns::compression::NameCompressor;
 use rdns::xot::XotTrust;
 use rdns::{
@@ -843,6 +844,7 @@ async fn serve(
             logger: Arc::new(QueryLogger::new()),
             metrics,
             udp,
+            clock: Clock::system(),
         },
         transfer_acl: Arc::new(transfer_acl),
         transfer_tls_only,
@@ -2456,6 +2458,7 @@ mod tests {
             logger: Arc::new(QueryLogger::new()),
             metrics: Arc::new(DnsMetrics::new()),
             udp: UdpSizes::default(),
+            clock: Clock::system(),
         }
     }
 

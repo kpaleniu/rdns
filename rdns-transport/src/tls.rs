@@ -250,7 +250,7 @@ pub async fn serve<H: Handler>(
         if rate == RateLimit::PerConnection
             && !handler
                 .context()
-                .allow_source(peer.ip(), rdns::clock::current_unix_timestamp())
+                .allow_source(peer.ip(), handler.context().clock.now())
         {
             continue;
         }

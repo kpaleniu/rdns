@@ -7358,6 +7358,71 @@ choice again; the numbered order below is age, not priority.
 > hand-maintained ordering is a claim that goes stale whenever the sections move,
 > and nothing checks it.
 
+### 52. A rate-limit test is a coin toss at a second boundary — ~~**filed 2026-09-12**~~ **closed 2026-09-12**
+
+`rdns_transport::tcp::tests::the_query_rate_can_be_per_connection_instead_of_per_message`
+opens one connection with a burst of one token, then a second, and asserts the
+second is dropped. `RateLimiter::should_allow` refills by whole seconds
+(`current_unix_timestamp`), so if the two connects straddle a second boundary
+the second one gets a fresh token and is served.
+
+**What was measured, and what it does not settle.** On 2026-09-12 it failed
+twice in about thirty runs of the changed tree, and **not once in 26 runs of a
+worktree at the previous commit** (20 of the test alone, 6 of the whole crate).
+At a rate of roughly one in thirty that is consistent with the flake being
+there all along *and* with its being new, so the exoneration is the code and
+not the count: the refill is `RateLimiter::should_allow`, which #44d does not
+touch, and what #44d added to that path is one `Privacy` argument. §10's rule
+is the one the test breaks either way: a wall-clock assertion with no headroom
+is a coin toss.
+
+The fix is not a longer window, which would only make the coin heavier: it is a
+clock the test controls. `should_allow` already takes `now` as a parameter, and
+what does not is the accept loop above it (`tcp::serve` reads
+`current_unix_timestamp` itself). So the shape is either a seam there or a test
+that drives `serve_one` with a clock of its own.
+
+**Closed 2026-09-12, one commit.** The filing named the right fix and the wrong
+size. "Either a seam there or a test that drives `serve_one` with a clock of its
+own" — the second is impossible, because `RateLimit::PerConnection` is charged
+in `serve` and `serve_one` never sees it, so the seam was the only option. And
+the row counted one test where there were **twenty-four**.
+
+`rdns::clock::Clock` is the seam: `System`, which is `current_unix_timestamp`,
+or `Fixed`, an instant the holder moves. `ServeContext` carries one, so the four
+accept loops read `ctx.clock.now()` where seven of them had
+`rdns::clock::current_unix_timestamp()` written out (`CLAUDE.md` §7), and
+`rdnsr`'s UDP loop reads it at both of its two places — which stay two, for the
+reason `ServeContext::allow_source` gives: a recursion sits between them.
+Nothing in production holds anything but `Clock::System`.
+
+**The count, taken before anything was edited** (`CLAUDE.md` §18): 43 test call
+sites across 24 tests passed `current_unix_timestamp()` inline to
+`RateLimiter::should_allow` or `ResponseLimiter::admit`. Both refill by whole
+seconds, so every one of them is the shape §10 names — and six were assertions a
+refill would actually break, the worst being
+`test_rate_limiter_concurrent_ips`'s exact `assert_eq!(total_allowed, 200)`,
+where one boundary in any of ten threads' thirty calls hands back ten tokens.
+Forty-one of the 43 needed no `Clock` at all, because `should_allow` has taken
+`now` as a parameter since #28a: one `let now` per test, and the seam was
+already there. The two that did — the TCP accept loop and `rdnsr`'s UDP loop —
+read the clock inside the loop under test.
+
+One inline read is left on purpose: `benches/answer_path.rs`'s `admission`
+group, which is measuring what a clock read costs and asserts nothing.
+
+**Verified by provoking both directions** (`CLAUDE.md` §1, §4). With the
+per-connection charge removed from `serve`, the test fails on "refused before
+the connection was served"; with `Clock::advance` made a no-op, it fails on "the
+refill admits one". That second half is new, and it is what says the connection
+was *charged* rather than never admitted — a refusal that no refill undoes would
+have passed the old assertion on its own. 40 consecutive runs of the test and 30
+of the three affected crates, no failures. **998 tests on Windows and 1015 on
+Linux**, clippy clean on both, `cargo doc` clean; the +2 against the pre-change
+Windows count of 996 is `clock`'s own two tests.
+
+---
+
 **Read `benches/answer_path.rs`'s header before quoting anything from it.** One
 whole answer is 522 ns and one `sendto`+`recvfrom` pair is 4 µs, so the entire
 benchmark suite covers about 6% of what a query costs — the context that stops a

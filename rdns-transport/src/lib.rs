@@ -29,6 +29,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rdns::clock::Clock;
 use rdns::logging::QueryLogger;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::security::{RateLimiter, ResponseLimiter, ResponseVerdict};
@@ -93,6 +94,15 @@ pub struct ServeContext {
     /// What this host advertises it can reassemble, and the largest datagram it
     /// will send. Not an `Arc`: two `u16`s fixed at startup.
     pub udp: UdpSizes,
+    /// Where the accept loops read the wall clock.
+    ///
+    /// The four of them had `rdns::clock::current_unix_timestamp()` written out
+    /// seven times, which left a rate-limit test deciding on whether two
+    /// connects straddled a second boundary (`TODO.md` #52). A handler still
+    /// gets `now` as an argument for the reason [`ServeContext::allow_source`]
+    /// gives — the clock read belongs to the caller — and this says which clock
+    /// that read comes from.
+    pub clock: Clock,
 }
 
 impl ServeContext {

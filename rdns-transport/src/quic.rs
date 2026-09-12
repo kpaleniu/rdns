@@ -115,7 +115,7 @@ pub async fn serve<H: Handler>(
         if rate == RateLimit::PerConnection
             && !handler
                 .context()
-                .allow_source(peer.ip(), rdns::clock::current_unix_timestamp())
+                .allow_source(peer.ip(), handler.context().clock.now())
         {
             // Refuse before the handshake: a retry-able refusal costs the
             // source a round trip and costs us no crypto at all.
@@ -179,7 +179,7 @@ async fn serve_connection<H: Handler>(
             Err(_) => return,
         };
 
-        let now = rdns::clock::current_unix_timestamp();
+        let now = handler.context().clock.now();
         if rate == RateLimit::PerMessage && !handler.context().allow_source(peer.ip(), now) {
             continue;
         }

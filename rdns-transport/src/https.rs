@@ -111,7 +111,7 @@ pub async fn serve<H: Handler>(
         if rate == RateLimit::PerConnection
             && !handler
                 .context()
-                .allow_source(peer.ip(), rdns::clock::current_unix_timestamp())
+                .allow_source(peer.ip(), handler.context().clock.now())
         {
             continue;
         }
@@ -207,7 +207,7 @@ async fn answer<H: Handler>(
         Err(code) => return status(code),
     };
 
-    let now = rdns::clock::current_unix_timestamp();
+    let now = handler.context().clock.now();
     if !handler.context().allow_source(peer.ip(), now) {
         // 429 rather than a silent drop, and the difference from UDP is the
         // point: this peer completed a TCP and a TLS handshake, so there is

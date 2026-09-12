@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use rdns::clock::Clock;
 use rdns::logging::QueryLogger;
 use rdns::metrics::DnsMetrics;
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter};
@@ -22,6 +23,9 @@ pub(crate) fn context(rate: u32) -> ServeContext {
         logger: Arc::new(QueryLogger::new()),
         metrics: Arc::new(DnsMetrics::new()),
         udp: rdns::UdpSizes::default(),
+        // A test that asserts on the rate limiter overrides this with a
+        // `Clock::fixed`; the rest never read it.
+        clock: Clock::system(),
     }
 }
 

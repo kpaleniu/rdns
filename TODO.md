@@ -37,14 +37,14 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51**, **#52**,
+**#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51**,
 **#53** and **#21**, as of 2026-09-12. **None of them is a live defect**; #50
 was, and closing it is what added #53: a zone this server signed itself is
 verified again at every load, which 76 seconds of a million-record zone made
 visible. #44 is what an operator would find missing in `rdnsd`, #45 what an ISP
 would find missing in `rdnsr`, #47 is the one gap 44b
-left behind, #48 and #49 the two 44a left, #51 the one 44d left, #52 a flaky
-test found on the way, and #21 is an inventory of deliberate deviations rather
+left behind, #48 and #49 the two 44a left, #51 the one 44d left,
+and #21 is an inventory of deliberate deviations rather
 than a queue. Everything else numbered is closed;
 the table under "Closed work" says which, when, and where the reasoning went.
 
@@ -821,8 +821,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51**, **#52**,
-**#53** and **#21** — see "What is open" above,
+**#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51** and
+**#53**, plus **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -1261,32 +1261,6 @@ including 43g's over TLS.
 
 ---
 
-### 52. A rate-limit test is a coin toss at a second boundary — **filed 2026-09-12**
-
-`rdns_transport::tcp::tests::the_query_rate_can_be_per_connection_instead_of_per_message`
-opens one connection with a burst of one token, then a second, and asserts the
-second is dropped. `RateLimiter::should_allow` refills by whole seconds
-(`current_unix_timestamp`), so if the two connects straddle a second boundary
-the second one gets a fresh token and is served.
-
-**What was measured, and what it does not settle.** On 2026-09-12 it failed
-twice in about thirty runs of the changed tree, and **not once in 26 runs of a
-worktree at the previous commit** (20 of the test alone, 6 of the whole crate).
-At a rate of roughly one in thirty that is consistent with the flake being
-there all along *and* with its being new, so the exoneration is the code and
-not the count: the refill is `RateLimiter::should_allow`, which #44d does not
-touch, and what #44d added to that path is one `Privacy` argument. §10's rule
-is the one the test breaks either way: a wall-clock assertion with no headroom
-is a coin toss.
-
-The fix is not a longer window, which would only make the coin heavier: it is a
-clock the test controls. `should_allow` already takes `now` as a parameter, and
-what does not is the accept loop above it (`tcp::serve` reads
-`current_unix_timestamp` itself). So the shape is either a seam there or a test
-that drives `serve_one` with a clock of its own.
-
----
-
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -1416,6 +1390,7 @@ the week; the record is under "How the queue kept going stale" in
 | **43** | nothing here had ever answered another implementation | **filed 2026-09-11, closed 2026-09-12.** `tests/interop/` — one `docker compose` network, `run.sh all`. 112 assertions against BIND 9.20.27, Knot 3.6.0, NSD 4.12.0, Unbound 1.23.1 and ldns 1.8.4; 0 failures. **Neither of the two things the filing predicted happened**: the IXFR is a real delta in both directions and every NSEC3 shape validates. Found one gap, in NOTIFY, which no row had named — **#46**. Three of the first five apparent findings were the harness, and the section says what each was, because that ratio is the lesson |
 | **50** | verifying a signed zone at load was quadratic in the zone | **filed and closed 2026-09-12**, found by 44c's measurement rather than by reading the code. `validate_response` collected every DNSKEY and every RRSIG in the zone on every call and `verify_rrset` then scanned what it collected, so `verify_zones` — which runs at startup, on SIGHUP, on `rdnsctl reload`, on the re-signing tick and inside `--check-config` — cost the square of the zone. **20,006 RRsets: 112.68 s before, 0.65 s after**, and a million-record zone goes from days of arithmetic to a measured 76 s. The fix is a `ZoneKeys` the caller hoists and a signature lookup through the zone's own owner index; the guard is an allocation count (34 either side of a fifty-fold zone, 217 against 6,101 with the scan) plus a ratio test in `rdnsd`. Filed **#53** on the way out |
 | **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. |
+| **52** | a rate-limit test is a coin toss at a second boundary | **filed and closed 2026-09-12**, one commit. Not a defect in the server, and the filing undercounted it by 23: the shape is a test that reads the wall clock at a limiter call, and there were **43 such call sites across 24 tests**, six of them assertions a refill actually breaks. Both buckets refill by whole seconds, so the verdict depended on whether two reads straddled one. 41 sites needed nothing but one `let now` per test, because `should_allow` has taken the instant as a parameter since #28a; the two that read the clock inside the loop under test — `tcp::serve`'s per-connection charge and `rdnsr`'s UDP loop — got `rdns::clock::Clock` on `ServeContext`. The test now asserts the refill as well as the refusal, which is the half that says the connection was charged rather than never admitted |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

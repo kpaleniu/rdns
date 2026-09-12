@@ -147,7 +147,7 @@ pub async fn serve<H: Handler>(
         if rate == RateLimit::PerConnection
             && !handler
                 .context()
-                .allow_source(peer.ip(), rdns::clock::current_unix_timestamp())
+                .allow_source(peer.ip(), handler.context().clock.now())
         {
             continue;
         }
@@ -256,7 +256,7 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
         // task and two `Arc` clones before deciding to drop the message is
         // backwards. One clock read for the message, handed to the handler so
         // the limiter, the log and a TSIG check all name the same instant.
-        let now = rdns::clock::current_unix_timestamp();
+        let now = handler.context().clock.now();
         if rate == RateLimit::PerMessage && !handler.context().allow_source(peer.ip(), now) {
             continue;
         }
@@ -292,6 +292,7 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
 mod tests {
     use std::time::Duration;
 
+    use rdns::clock::Clock;
     use rdns::shutdown::Shutdown;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -318,8 +319,17 @@ mod tests {
 
     impl Echo {
         fn new(answer: Answer, rate: u32) -> Arc<Echo> {
+            Echo::on_clock(answer, rate, Clock::system())
+        }
+
+        /// A handler whose limiter reads a clock the test holds, for the one
+        /// test that asserts on a refill rather than on an answer.
+        fn on_clock(answer: Answer, rate: u32, clock: Clock) -> Arc<Echo> {
             Arc::new(Echo {
-                ctx: context(rate),
+                ctx: ServeContext {
+                    clock,
+                    ..context(rate)
+                },
                 answer,
             })
         }
@@ -607,7 +617,15 @@ mod tests {
 
     /// Where the query rate applies is the caller's, and the two daemons
     /// disagree on purpose (`TODO.md` #30e). Per connection: a burst of one
-    /// admits one connection, and the messages on it are not charged again.
+    /// admits one connection, the messages on it are not charged again, and the
+    /// next connection waits for the refill.
+    ///
+    /// The clock is the test's. `RateLimiter::should_allow` refills by whole
+    /// seconds, so against `SystemTime` the refusal below was decided by
+    /// whether two connects straddled a second boundary — about one run in
+    /// thirty served the second connection instead (`TODO.md` #52). A longer
+    /// window would only have made the coin heavier; a clock nothing else moves
+    /// takes it out of the assertion.
     #[tokio::test]
     async fn the_query_rate_can_be_per_connection_instead_of_per_message() {
         let shutdown = Shutdown::new();
@@ -615,7 +633,11 @@ mod tests {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let handler = Echo::new(Answer::AfterIdMillis, 1);
+        // Before `RateLimiter`'s own `last_cleanup`, which it takes from the
+        // real clock: the sweep is then never due and cannot evict the bucket
+        // this test is about.
+        let clock = Clock::fixed(1_000_000_000);
+        let handler = Echo::on_clock(Answer::AfterIdMillis, 1, clock.clone());
         let server = tokio::spawn(serve(
             listener,
             handler,
@@ -640,6 +662,15 @@ mod tests {
             next_reply(&mut second).await.is_none(),
             "refused before the connection was served"
         );
+
+        // One second buys exactly one token back. This half is what says the
+        // connection was *charged* rather than never admitted: a refusal that
+        // no refill undoes would pass the assertion above on its own.
+        clock.advance(1);
+        let mut third = TcpStream::connect(addr).await.expect("connect");
+        send(&mut third, &query(0x0004)).await;
+        let reply = next_reply(&mut third).await.expect("the refill admits one");
+        assert_eq!(id_of(&reply), 0x0004);
 
         shutdown.begin();
         let _ = server.await;
