@@ -32,8 +32,9 @@ pub const MAX_EXTRA_TEXT: usize = 128;
 /// An INFO-CODE: an index into IANA's "Extended DNS Error Codes" registry
 /// (RFC 8914 §2).
 ///
-/// A newtype over the whole 16-bit space rather than an enum. The registry is
-/// open, so a code we have no name for has to relay as itself, and there is no
+/// A newtype over the whole 16-bit space rather than an enum. §5.2 gives
+/// 0-49151 to First Come First Served and 49152-65535 to Private Use, so a code
+/// we have no name for is ordinary and has to relay as itself; there is no
 /// value free to be a sentinel (`CLAUDE.md` §2).
 ///
 /// Only the codes this tree emits are named. An option code that exists and
