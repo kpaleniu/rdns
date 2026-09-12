@@ -12,6 +12,7 @@
 
 use std::borrow::Cow;
 
+use rdns::ede::InfoCode;
 use rdns::error::WireError;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::name::{dname_redirect, Redirect};
@@ -22,8 +23,8 @@ use rdns::Class;
 use rdns::Qtype;
 use rdns::Ttl;
 use rdns::{
-    dnssec_answer, DnsMessage, Edns, Name, NameRef, OpCode, ParsedRecord, QueryClass, RecordData,
-    ResponseCode,
+    dnssec_answer, DnsMessage, Edns, ExtendedError, Name, NameRef, OpCode, ParsedRecord,
+    QueryClass, RecordData, ResponseCode,
 };
 
 use crate::zones::Zones;
@@ -77,6 +78,7 @@ pub(crate) fn write_response(
     if msg.opcode != OpCode::Query {
         w.set_rcode(ResponseCode::NotImplemented);
         w.set_authoritative(false);
+        w.set_extended_error(UNIMPLEMENTED_OPCODE);
         // This `return` jumps over the EDNS mirroring at the end of the
         // function, and RFC 6891 §6.1.1 says a response to a request that had an
         // OPT includes one. Some clients remember a missing OPT as a downgrade
@@ -122,6 +124,29 @@ pub(crate) fn write_response(
     w.finish()
 }
 
+/// Why a NOTIMP is NOTIMP (RFC 8914 §4.22): "the requested operation or query
+/// is not supported". Which operation is the client's own opcode, so the text
+/// says only which of this server's two NOT_SUPPORTED sites it came from.
+const UNIMPLEMENTED_OPCODE: ExtendedError =
+    ExtendedError::new(InfoCode::NOT_SUPPORTED, "this opcode is not implemented");
+
+/// NOT_SUPPORTED rather than [`NOT_OUR_ZONE`], though the two arrive at the
+/// same REFUSED: what is absent is the class, not the zone, and the operator's
+/// fix differs. Serving CH at all is `TODO.md` #21's deviation D-7.
+const UNSERVED_CLASS: ExtendedError =
+    ExtendedError::new(InfoCode::NOT_SUPPORTED, "this class is not served");
+
+/// Why a REFUSED for a name we hold no zone for is REFUSED (RFC 8914 §4.21).
+///
+/// One constant because the two sites are one decision seen twice â the ordinary
+/// lookup and the IXFR-over-UDP shortcut both fall through to `for_query`
+/// finding nothing â and a second spelling is where the two would drift
+/// (`CLAUDE.md` §7).
+pub(crate) const NOT_OUR_ZONE: ExtendedError = ExtendedError::new(
+    InfoCode::NOT_AUTHORITATIVE,
+    "no zone here is at or above this name",
+);
+
 /// The one question, once the message-level answers are out of the way.
 fn answer_question(
     query: &rdns::QuerySection,
@@ -138,6 +163,7 @@ fn answer_question(
     if !matches!(query.qclass, QueryClass::IN | QueryClass::Any) {
         w.set_rcode(ResponseCode::Refused);
         w.set_authoritative(false);
+        w.set_extended_error(UNSERVED_CLASS);
         return Ok(());
     }
 
@@ -170,6 +196,7 @@ fn answer_question(
             None => {
                 w.set_rcode(ResponseCode::Refused);
                 w.set_authoritative(false);
+                w.set_extended_error(NOT_OUR_ZONE);
             }
         }
         return Ok(());
@@ -192,6 +219,7 @@ fn answer_question(
         // secondary answering NXDOMAIN takes its zone off the internet.
         w.set_rcode(ResponseCode::Refused);
         w.set_authoritative(false);
+        w.set_extended_error(NOT_OUR_ZONE);
         return Ok(());
     };
 
@@ -1210,6 +1238,56 @@ x.sub2   IN A   192.0.2.30
             assert_eq!(
                 response.queries[0].qclass, class,
                 "{class:?}: the question is echoed as it was asked"
+            );
+        }
+    }
+
+    /// Every refusal this path can give says why (RFC 8914), and says it only
+    /// to a client that sent an OPT to carry it (§2).
+    ///
+    /// A bare REFUSED is a support ticket: an operator cannot tell "you asked
+    /// the wrong server" from "your key is scoped elsewhere" from "that class
+    /// is not served" without one. The three sites share two INFO-CODEs on
+    /// purpose â the registry is coarser than the reasons â so the text is
+    /// what separates them.
+    #[test]
+    fn a_refusal_says_why_when_the_client_can_hear_it() {
+        let mut wrong_class = query("example.com.", Qtype::of(record_types::SOA), false);
+        wrong_class.queries[0].qclass = QueryClass::CH;
+        let mut notify = query("example.com.", Qtype::of(record_types::SOA), false);
+        notify.opcode = OpCode::Notify;
+
+        for (request, rcode, expected) in [
+            (
+                query("nothing.here.test.", Qtype::of(record_types::A), false),
+                ResponseCode::Refused,
+                InfoCode::NOT_AUTHORITATIVE,
+            ),
+            (wrong_class, ResponseCode::Refused, InfoCode::NOT_SUPPORTED),
+            (
+                notify,
+                ResponseCode::NotImplemented,
+                InfoCode::NOT_SUPPORTED,
+            ),
+        ] {
+            let response = make_response(&request, &server(), &DnsMetrics::new());
+            assert_eq!(response.rcode, rcode);
+            let edns = response.edns.as_ref().expect("the OPT is mirrored");
+            let errors = ExtendedError::all_in(edns).expect("a well-formed option list");
+            assert_eq!(
+                errors.iter().map(|(code, _)| *code).collect::<Vec<_>>(),
+                vec![expected],
+                "{rcode:?}"
+            );
+
+            // The same question without an OPT: no OPT, so nowhere to put it.
+            let mut plain = request.clone();
+            plain.edns = None;
+            let response = make_response(&plain, &server(), &DnsMetrics::new());
+            assert_eq!(response.rcode, rcode);
+            assert!(
+                response.edns.is_none(),
+                "{rcode:?}: an unsolicited OPT is not mirroring (RFC 6891 §6.1.1)"
             );
         }
     }

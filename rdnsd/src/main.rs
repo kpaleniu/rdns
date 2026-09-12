@@ -3434,6 +3434,44 @@ mod tests {
         );
     }
 
+    /// The refusal says why, to a client that sent an OPT to hear it in
+    /// (RFC 8914 §2).
+    ///
+    /// PROHIBITED for all four ways permission can be missing, and no finer:
+    /// telling a stranger *which* of them it was is telling it about the
+    /// keyring. The text is what an operator reads, and the RCODE is still
+    /// REFUSED whatever §3 says about EDE â "applications MUST continue to
+    /// follow requirements ... on how to process RCODEs".
+    #[tokio::test]
+    async fn a_refused_update_says_why_when_the_client_used_edns() {
+        let dir = ScratchDir::new("update-ede");
+        let key = update_key(rdns::tsig::UpdatePolicy::Zones(vec![
+            "elsewhere.test.".to_string()
+        ]));
+        let addr = spawn_updatable(dir.path(), key).await;
+        let changes = vec![a_record("new.example.com.", "192.0.2.50")];
+
+        let mut asked = update_message("example.com.", changes.clone());
+        asked.set_edns(rdns::Edns::with_payload_size(4096));
+        let reply = round_trip(addr, asked.to_bytes_within(4096).expect("serialize")).await;
+        assert_eq!(reply.rcode, ResponseCode::Refused);
+        let edns = reply.edns.as_ref().expect("the OPT is mirrored");
+        let errors = rdns::ExtendedError::all_in(edns).expect("a well-formed option list");
+        assert_eq!(
+            errors
+                .iter()
+                .map(|(code, _)| *code)
+                .collect::<Vec<rdns::InfoCode>>(),
+            vec![rdns::InfoCode::PROHIBITED]
+        );
+
+        // The same UPDATE with no OPT: the same refusal, and nowhere to say why.
+        let plain = update_message("example.com.", changes);
+        let reply = round_trip(addr, plain.to_bytes_within(4096).expect("serialize")).await;
+        assert_eq!(reply.rcode, ResponseCode::Refused);
+        assert!(reply.edns.is_none(), "an unsolicited OPT is not mirroring");
+    }
+
     /// The three refusals, each with the code RFC 2136 gives it.
     ///
     /// They are not interchangeable and that is the point: NOTAUTH says "not my

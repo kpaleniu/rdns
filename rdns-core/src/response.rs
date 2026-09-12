@@ -15,6 +15,7 @@
 
 use crate::compression::NameCompressor;
 use crate::dname::write_bytes;
+use crate::ede::ExtendedError;
 use crate::error::WireError;
 use crate::{
     Class, DnsMessage, Edns, NameRef, OpCode, QuerySection, RecordData, ResponseCode, Ttl,
@@ -67,6 +68,13 @@ pub struct ResponseWriter<'a> {
     section: Section,
     header: Header,
     edns: Option<Edns>,
+    /// The reason beside the RCODE (RFC 8914), folded into the OPT by
+    /// [`ResponseWriter::finish`]. Held apart from `edns` because the two are
+    /// decided at opposite ends of the answer path: the RCODE and its reason
+    /// deep inside the zone lookup, the OPT once, at the end, from what the
+    /// client sent. Dropped silently when there is no OPT to carry it, which
+    /// is §2's rule and the one this type exists to make unskippable.
+    extended_error: Option<ExtendedError>,
     truncated: bool,
 }
 
@@ -125,6 +133,7 @@ impl<'a> ResponseWriter<'a> {
                 rcode: ResponseCode::Ok,
             },
             edns: None,
+            extended_error: None,
             truncated: false,
         })
     }
@@ -150,6 +159,16 @@ impl<'a> ResponseWriter<'a> {
     /// RCODE's high bits (§6.1.3).
     pub fn set_edns(&mut self, edns: Edns) {
         self.edns = Some(edns);
+    }
+
+    /// Say *why* this reply carries the RCODE it does (RFC 8914).
+    ///
+    /// Order-independent: it may be set before or after [`set_edns`], and
+    /// reaches the wire only if there is an OPT to put it in.
+    ///
+    /// [`set_edns`]: ResponseWriter::set_edns
+    pub fn set_extended_error(&mut self, error: ExtendedError) {
+        self.extended_error = Some(error);
     }
 
     /// Append one record. Past the size limit the reply becomes an empty TC=1
@@ -215,7 +234,10 @@ impl<'a> ResponseWriter<'a> {
     /// wire bytes.
     pub fn finish(mut self) -> Result<(), WireError> {
         let rcode = wire_rcode(self.header.rcode, self.edns.is_some())?;
-        if let Some(edns) = self.edns.take() {
+        if let Some(mut edns) = self.edns.take() {
+            if let Some(error) = self.extended_error {
+                edns = edns.with_extended_error(error)?;
+            }
             match write_opt(self.out, self.pos, &edns, rcode) {
                 Ok(end) if end <= self.limit => {
                     self.pos = end;
@@ -228,8 +250,15 @@ impl<'a> ResponseWriter<'a> {
                 }) => {
                     // The OPT survives truncation: the size limit is itself
                     // signalled through EDNS. A header, a question and an OPT
-                    // are under 300 octets, so the 512-octet floor `start` sized
-                    // the buffer to leaves room for this one.
+                    // are under 300 octets, and an EDE adds at most 6 plus
+                    // `ede::MAX_EXTRA_TEXT`, so the 512-octet floor `start`
+                    // sized the buffer to leaves room for this one.
+                    //
+                    // Truncating rather than dropping the EDE is RFC 8914 §3
+                    // the way round it asks for: "servers SHOULD truncate
+                    // messages by dropping EDE options before dropping other
+                    // data" is about an EDE on an *answer*, and every reply
+                    // that carries one here carries no other data to drop.
                     self.truncate();
                     self.pos = write_opt(self.out, self.pos, &edns, rcode)?;
                     self.counts[3] = 1;
@@ -438,6 +467,22 @@ impl ClientEdns {
             edns
         })
     }
+
+    /// The same OPT, carrying `error` when there is one (RFC 8914 §2).
+    ///
+    /// The EDE goes where the OPT goes and nowhere else, so a client that sent
+    /// none gets neither: this is the [`DnsMessage`]-shaped half of the rule
+    /// [`ResponseWriter::set_extended_error`] holds for the writer-shaped half.
+    pub fn mirror_with(
+        self,
+        payload_size: u16,
+        error: Option<ExtendedError>,
+    ) -> Result<Option<Edns>, WireError> {
+        match (self.mirror(payload_size), error) {
+            (Some(edns), Some(error)) => Ok(Some(edns.with_extended_error(error)?)),
+            (edns, _) => Ok(edns),
+        }
+    }
 }
 
 /// Read `request`'s EDNS, or the RCODE that refuses it.
@@ -468,6 +513,7 @@ pub fn client_edns(request: &DnsMessage) -> Result<ClientEdns, ResponseCode> {
 mod tests {
 
     use super::*;
+    use crate::ede::InfoCode;
     use crate::name::nm;
     use crate::record_types;
     use crate::ResourceRecord;
@@ -521,6 +567,48 @@ mod tests {
             &[0x00, 0x0a, 0x00, 0x08, 0xde, 0xad],
         ));
         assert_eq!(client_edns(&malformed), Err(ResponseCode::FormatError));
+    }
+
+    /// An EDE reaches the wire only in an OPT, and an OPT only when the client
+    /// sent one (RFC 8914 §2). The writer holds the two apart until `finish`
+    /// precisely so the second half cannot be forgotten at a call site that is
+    /// choosing an RCODE.
+    #[test]
+    fn an_extended_error_rides_in_the_opt_or_not_at_all() {
+        for (client_used_edns, expected) in
+            [(true, Some(InfoCode::NOT_AUTHORITATIVE)), (false, None)]
+        {
+            let request = request("example.com.", client_used_edns);
+            let mut out = Vec::new();
+            let mut compressor = NameCompressor::new();
+            let mut w =
+                ResponseWriter::start(&mut out, &mut compressor, 4096, &request).expect("a start");
+            w.set_rcode(ResponseCode::Refused);
+            w.set_extended_error(ExtendedError::new(
+                InfoCode::NOT_AUTHORITATIVE,
+                "no zone here",
+            ));
+            if let Some(edns) = ClientEdns::of(&request).mirror(1232) {
+                w.set_edns(edns);
+            }
+            w.finish().expect("a reply");
+
+            let reply = DnsMessage::try_from_bytes(&out).expect("a message");
+            assert_eq!(reply.rcode, ResponseCode::Refused);
+            let errors = reply
+                .edns
+                .as_ref()
+                .map(|e| ExtendedError::all_in(e).expect("a well-formed option list"))
+                .unwrap_or_default();
+            assert_eq!(
+                errors.first().map(|(code, _)| *code),
+                expected,
+                "client used EDNS: {client_used_edns}"
+            );
+            if let Some((_, text)) = errors.first() {
+                assert_eq!(text, "no zone here");
+            }
+        }
     }
 
     fn request(qname: &str, edns: bool) -> DnsMessage {

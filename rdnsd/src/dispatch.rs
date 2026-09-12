@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 
 use rdns::{
     clock::current_unix_timestamp,
+    ede::InfoCode,
     error::RequestError,
     ixfr::{ixfr_response, IxfrResponse},
     logging::QueryLogger,
@@ -33,12 +34,12 @@ use rdns::{
     update,
     validation::{Request, Transport},
     zone::{parse_zone_file_at, Zone},
-    DnsMessage, OpCode, Qtype, ResponseCode,
+    DnsMessage, ExtendedError, OpCode, Qtype, ResponseCode,
 };
 use rdns_transport::tcp::{self, send_framed, Reply};
 use rdns_transport::ServeContext;
 
-use crate::answer::write_response;
+use crate::answer::{write_response, NOT_OUR_ZONE};
 use crate::replication::Secondaries;
 use crate::zones::{install_zone, ZoneContext, ZoneMap, ZoneSigning};
 use crate::{bad_request, serving_error};
@@ -183,9 +184,13 @@ impl Server {
                     rejection.key_name(),
                     rejection.error.reason()
                 );
+                // No RFC 8914 reason: the TSIG record this reply carries says
+                // BADKEY, BADSIG or BADTIME itself (RFC 8945 §4.3), which is a
+                // finer answer than any INFO-CODE has.
                 let Some(response) = error_reply(
                     &msg,
                     ResponseCode::NotAuthorized,
+                    None,
                     reserve(ceiling, rejection.reply_overhead()),
                     advertised,
                 ) else {
@@ -389,8 +394,15 @@ impl Server {
                 ip,
                 "{kind} of {qname} REFUSED: key {key_name} is scoped to other zones"
             );
-            self.send_transfer_error(msg, ResponseCode::Refused, ip, session, out)
-                .await;
+            self.send_transfer_error(
+                msg,
+                ResponseCode::Refused,
+                Some(NOT_YOURS),
+                ip,
+                session,
+                out,
+            )
+            .await;
             return;
         }
 
@@ -402,7 +414,7 @@ impl Server {
                 "{kind} of {qname} REFUSED: no TSIG key, and not in --allow-transfer"
             );
             // No session on this path by construction — it is the "no key" case.
-            self.send_transfer_error(msg, ResponseCode::Refused, ip, None, out)
+            self.send_transfer_error(msg, ResponseCode::Refused, Some(NOT_YOURS), ip, None, out)
                 .await;
             return;
         }
@@ -419,8 +431,15 @@ impl Server {
             let zones = self.zone_map.read().await;
             let Some(zone) = zones.snapshot(apex.as_ref()) else {
                 tracing::info!(peer = %ip, "{kind} of {qname}: NOTAUTH (not a zone served here)");
-                self.send_transfer_error(msg, ResponseCode::NotAuthorized, ip, session, out)
-                    .await;
+                self.send_transfer_error(
+                    msg,
+                    ResponseCode::NotAuthorized,
+                    Some(NOT_OUR_ZONE),
+                    ip,
+                    session,
+                    out,
+                )
+                .await;
                 return;
             };
             if !incremental {
@@ -458,6 +477,7 @@ impl Server {
                         self.send_transfer_error(
                             msg,
                             ResponseCode::ServerFailure,
+                            None,
                             ip,
                             session,
                             out,
@@ -479,8 +499,15 @@ impl Server {
                 Err(e) => {
                     // Nothing sent yet, so an ordinary error response still works.
                     serving_error!(self.ctx.logger, ip, "{kind} of {qname}: {e}");
-                    self.send_transfer_error(msg, ResponseCode::ServerFailure, ip, session, out)
-                        .await;
+                    self.send_transfer_error(
+                        msg,
+                        ResponseCode::ServerFailure,
+                        None,
+                        ip,
+                        session,
+                        out,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -561,7 +588,7 @@ impl Server {
         out: &mpsc::Sender<Reply>,
     ) {
         if sent == 0 {
-            self.send_transfer_error(msg, ResponseCode::ServerFailure, ip, session, out)
+            self.send_transfer_error(msg, ResponseCode::ServerFailure, None, ip, session, out)
                 .await;
             return;
         }
@@ -578,11 +605,12 @@ impl Server {
         &self,
         msg: &DnsMessage,
         rcode: ResponseCode,
+        why: Option<ExtendedError>,
         ip: IpAddr,
         session: Option<&mut TsigSession>,
         out: &mpsc::Sender<Reply>,
     ) {
-        if let Some(bytes) = self.signed_error(msg, rcode, ip, session, u16::MAX as usize) {
+        if let Some(bytes) = self.signed_error(msg, rcode, why, ip, session, u16::MAX as usize) {
             send_framed(out, &bytes).await;
         }
     }
@@ -595,11 +623,12 @@ impl Server {
         &self,
         msg: &DnsMessage,
         rcode: ResponseCode,
+        why: Option<ExtendedError>,
         ip: IpAddr,
         session: Option<&mut TsigSession>,
         max_len: usize,
     ) -> Option<Vec<u8>> {
-        let Some(bytes) = error_reply(msg, rcode, max_len, self.ctx.udp.advertised()) else {
+        let Some(bytes) = error_reply(msg, rcode, why, max_len, self.ctx.udp.advertised()) else {
             serving_error!(self.ctx.logger, ip, "could not serialize an error response");
             return None;
         };
@@ -640,7 +669,7 @@ impl Server {
             Ok(request) => request,
             Err(rejected) => {
                 serving_error!(self.ctx.logger, ip, "UPDATE rejected: {rejected}");
-                return self.signed_error(msg, rejected.rcode, ip, session, max_len);
+                return self.signed_error(msg, rejected.rcode, None, ip, session, max_len);
             }
         };
         let zone_name = request.zone.clone();
@@ -655,7 +684,14 @@ impl Server {
                 ip,
                 "UPDATE of {zone_name} REFUSED: unsigned, and an UPDATE needs a TSIG key"
             );
-            return self.signed_error(msg, ResponseCode::Refused, ip, None, max_len);
+            return self.signed_error(
+                msg,
+                ResponseCode::Refused,
+                Some(NOT_YOURS),
+                ip,
+                None,
+                max_len,
+            );
         };
         if !session.may_update(&zone_name.as_ref().to_presentation()) {
             serving_error!(
@@ -664,7 +700,14 @@ impl Server {
                 "UPDATE of {zone_name} REFUSED: key {} may not rewrite it",
                 session.key_name()
             );
-            return self.signed_error(msg, ResponseCode::Refused, ip, Some(session), max_len);
+            return self.signed_error(
+                msg,
+                ResponseCode::Refused,
+                Some(NOT_YOURS),
+                ip,
+                Some(session),
+                max_len,
+            );
         }
 
         // §3.1.1: a zone we are not an authority for is NOTAUTH — not the query
@@ -679,7 +722,14 @@ impl Server {
         };
         let Some(previous) = previous else {
             tracing::info!(peer = %ip, "UPDATE of {zone_name}: NOTAUTH (not a zone served here)");
-            return self.signed_error(msg, ResponseCode::NotAuthorized, ip, Some(session), max_len);
+            return self.signed_error(
+                msg,
+                ResponseCode::NotAuthorized,
+                Some(NOT_OUR_ZONE),
+                ip,
+                Some(session),
+                max_len,
+            );
         };
 
         // A zone we replicate is the master's copy: the next refresh transfers
@@ -693,7 +743,14 @@ impl Server {
                 "UPDATE of {zone_name} REFUSED: this server replicates that zone, \
                  so its master owns it"
             );
-            return self.signed_error(msg, ResponseCode::Refused, ip, Some(session), max_len);
+            return self.signed_error(
+                msg,
+                ResponseCode::Refused,
+                Some(REPLICATED_ZONE),
+                ip,
+                Some(session),
+                max_len,
+            );
         }
 
         // A zone we cannot write back must not be updated: the change would live
@@ -705,7 +762,14 @@ impl Server {
                 ip,
                 "UPDATE of {zone_name} REFUSED: this server has no writable zone source"
             );
-            return self.signed_error(msg, ResponseCode::Refused, ip, Some(session), max_len);
+            return self.signed_error(
+                msg,
+                ResponseCode::Refused,
+                Some(NOT_WRITABLE),
+                ip,
+                Some(session),
+                max_len,
+            );
         };
         let Some(path) = source.file_for(&zone_name.as_ref().to_presentation()) else {
             serving_error!(
@@ -713,7 +777,14 @@ impl Server {
                 ip,
                 "UPDATE of {zone_name} REFUSED: no zone file to write it back to"
             );
-            return self.signed_error(msg, ResponseCode::Refused, ip, Some(session), max_len);
+            return self.signed_error(
+                msg,
+                ResponseCode::Refused,
+                Some(NOT_WRITABLE),
+                ip,
+                Some(session),
+                max_len,
+            );
         };
 
         // §3.7's serialization, held across the whole read-modify-write.
@@ -750,6 +821,7 @@ impl Server {
                 return self.signed_error(
                     msg,
                     ResponseCode::ServerFailure,
+                    None,
                     ip,
                     Some(session),
                     max_len,
@@ -761,7 +833,7 @@ impl Server {
             Ok(applied) => applied,
             Err(UpdateFailure::Prerequisite(rejected)) => {
                 tracing::info!(peer = %ip, "UPDATE of {zone_name}: {rejected}");
-                return self.signed_error(msg, rejected.rcode, ip, Some(session), max_len);
+                return self.signed_error(msg, rejected.rcode, None, ip, Some(session), max_len);
             }
             // §3.4.2.1: a system failure is SERVFAIL with every applied update
             // undone. Nothing to undo here — the write is atomic and the map is
@@ -771,6 +843,7 @@ impl Server {
                 return self.signed_error(
                     msg,
                     ResponseCode::ServerFailure,
+                    None,
                     ip,
                     Some(session),
                     max_len,
@@ -807,7 +880,7 @@ impl Server {
         }
 
         drop(_applying);
-        self.signed_error(msg, ResponseCode::Ok, ip, Some(session), max_len)
+        self.signed_error(msg, ResponseCode::Ok, None, ip, Some(session), max_len)
     }
 
     /// The four things `install_zone` moves together — [`ZoneContext`].
@@ -821,6 +894,32 @@ impl Server {
     }
 }
 
+/// Why a transfer or an UPDATE was refused: RFC 8914 §4.19's "a query from an
+/// 'unauthorized' client", which covers all four ways permission is missing
+/// here â no key, a key scoped elsewhere, an unsigned UPDATE, a key that may
+/// not rewrite this zone. One reason for all four on purpose: telling a
+/// stranger *which* of them it was is telling it about the keyring.
+const NOT_YOURS: ExtendedError =
+    ExtendedError::new(InfoCode::PROHIBITED, "not authorized for this zone");
+
+/// An UPDATE for a zone this server replicates. Not PROHIBITED â the
+/// credential was good and the refusal is about where the zone is written, so
+/// OTHER carries what the text says (§4.1: "does not match known extended
+/// error codes").
+const REPLICATED_ZONE: ExtendedError = ExtendedError::new(
+    InfoCode::OTHER,
+    "this zone is replicated here; its master owns it",
+);
+
+/// An UPDATE this server could apply and could not persist. Same reasoning as
+/// [`REPLICATED_ZONE`]: an operator's configuration, not the client's
+/// credential. Both spellings of it â no writable source at all, and no file
+/// for this zone â answer the one question the client can act on.
+const NOT_WRITABLE: ExtendedError = ExtendedError::new(
+    InfoCode::OTHER,
+    "this server has nowhere to write this zone back to",
+);
+
 /// The start of every reply that carries no records: the question echoed, and
 /// the client's OPT mirrored with its DO bit (RFC 6891 §6.1.1, RFC 3225 §3).
 ///
@@ -828,9 +927,19 @@ impl Server {
 /// call sites, and three of them dropped the DO bit, so a validating client that
 /// asked over UDP and got TC=1 read the answer as coming from a server that had
 /// stopped doing DNSSEC (`TODO.md` #38, `CLAUDE.md` §7).
-fn empty_reply(request: &DnsMessage, advertised: u16) -> DnsMessage {
+///
+/// `why` is RFC 8914's reason for the RCODE, and rides in that OPT or nowhere
+/// (§2). Its encoder can only fail on an option too long for its length field,
+/// which [`ExtendedError`]'s own bound puts out of reach; the fallback drops
+/// the *reason* rather than the reply, because a refusal without its annotation
+/// is still the answer and a refusal that failed to serialize is not.
+fn empty_reply(request: &DnsMessage, advertised: u16, why: Option<ExtendedError>) -> DnsMessage {
     let mut resp = DnsMessage::reply_to(request);
-    if let Some(edns) = ClientEdns::of(request).mirror(advertised) {
+    let asked = ClientEdns::of(request);
+    let mirrored = asked
+        .mirror_with(advertised, why)
+        .unwrap_or_else(|_| asked.mirror(advertised));
+    if let Some(edns) = mirrored {
         resp.set_edns(edns);
     }
     resp
@@ -857,10 +966,11 @@ fn reserve(ceiling: usize, signature: usize) -> usize {
 fn error_reply(
     request: &DnsMessage,
     rcode: ResponseCode,
+    why: Option<ExtendedError>,
     max_len: usize,
     advertised: u16,
 ) -> Option<Vec<u8>> {
-    let mut resp = empty_reply(request, advertised);
+    let mut resp = empty_reply(request, advertised, why);
     resp.rcode = rcode;
     resp.to_bytes_within(max_len).ok()
 }
@@ -938,7 +1048,7 @@ fn apply_update_to_file(
 /// which on the transport this can happen on is the smaller of the client's
 /// EDNS payload size and this server's own, rather than 512 (RFC 6891 §6.2.4).
 fn truncated_reply(request: &DnsMessage, max_len: usize, advertised: u16) -> Option<Vec<u8>> {
-    let mut resp = empty_reply(request, advertised);
+    let mut resp = empty_reply(request, advertised, None);
     resp.truncation = true;
     resp.to_bytes_within(max_len).ok()
 }
@@ -1034,8 +1144,14 @@ mod tests {
                 .do_bit
         );
 
-        let bytes = error_reply(&asked, ResponseCode::Refused, ceiling, udp.advertised())
-            .expect("an error reply");
+        let bytes = error_reply(
+            &asked,
+            ResponseCode::Refused,
+            None,
+            ceiling,
+            udp.advertised(),
+        )
+        .expect("an error reply");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
         assert_eq!(reply.rcode, ResponseCode::Refused);
         assert!(reply.edns().expect("an OPT").do_bit, "and so does this one");
@@ -1044,8 +1160,14 @@ mod tests {
         let ceiling = udp.reply_ceiling(&plain, Transport::Udp);
         for bytes in [
             truncated_reply(&plain, ceiling, udp.advertised()).expect("a truncated reply"),
-            error_reply(&plain, ResponseCode::Refused, ceiling, udp.advertised())
-                .expect("an error reply"),
+            error_reply(
+                &plain,
+                ResponseCode::Refused,
+                None,
+                ceiling,
+                udp.advertised(),
+            )
+            .expect("an error reply"),
         ] {
             let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
             assert!(!reply.edns().expect("an OPT").do_bit, "and only when asked");

@@ -17,6 +17,7 @@ pub mod codecs;
 pub mod compression;
 pub mod control;
 pub mod dname;
+pub mod ede;
 pub mod error;
 pub mod name;
 pub mod name_keys;
@@ -40,6 +41,7 @@ mod message;
 mod record;
 
 pub use codes::{Class, OpCode, Qtype, QueryClass, ResponseCode, Rtype, Serial, Ttl};
+pub use ede::{ExtendedError, InfoCode, EDNS_OPTION_EXTENDED_ERROR};
 pub use edns::{
     Edns, EdnsHeader, EdnsOption, UdpSizes, CLASSIC_UDP_SIZE, EDNS_OPTION_CLIENT_SUBNET,
     EDNS_OPTION_COOKIE, EDNS_OPTION_NSID, EDNS_OPTION_PADDING, EDNS_VERSION, FLAG_DAY_UDP_SIZE,

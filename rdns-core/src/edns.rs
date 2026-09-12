@@ -4,6 +4,7 @@
 //! by anything but the constructors here, which encode a well-formed one.
 
 use crate::codes::Rtype;
+use crate::ede::ExtendedError;
 use crate::error::WireError;
 use crate::validation::Transport;
 use crate::DnsMessage;
@@ -142,6 +143,25 @@ pub struct EdnsOption {
     pub data: Vec<u8>,
 }
 
+impl EdnsOption {
+    /// Append this option's three fields to an OPT RDATA under construction.
+    ///
+    /// The one encoder: [`Edns::with_options`] and [`Edns::with_extended_error`]
+    /// both go through it, because a second copy is where the length field
+    /// would come to disagree with the data (`CLAUDE.md` §7).
+    fn append_to(&self, rdata: &mut Vec<u8>) -> Result<(), WireError> {
+        let len: u16 = self.data.len().try_into().map_err(|_| WireError::TooLong {
+            what: "EDNS option data",
+            limit: u16::MAX as usize,
+            actual: self.data.len(),
+        })?;
+        rdata.extend_from_slice(&self.code.to_be_bytes());
+        rdata.extend_from_slice(&len.to_be_bytes());
+        rdata.extend_from_slice(&self.data);
+        Ok(())
+    }
+}
+
 /// EDNS0 OPT pseudo-record (RFC 6891).
 ///
 /// OPT repurposes the usual RR fields: NAME is root, CLASS is the requestor's
@@ -235,20 +255,30 @@ impl Edns {
     ) -> Result<Self, WireError> {
         let mut rdata = Vec::new();
         for opt in options {
-            let len: u16 = opt.data.len().try_into().map_err(|_| WireError::TooLong {
-                what: "EDNS option data",
-                limit: u16::MAX as usize,
-                actual: opt.data.len(),
-            })?;
-            rdata.extend_from_slice(&opt.code.to_be_bytes());
-            rdata.extend_from_slice(&len.to_be_bytes());
-            rdata.extend_from_slice(&opt.data);
+            opt.append_to(&mut rdata)?;
         }
         Ok(Edns {
             udp_payload_size: size,
             version,
             do_bit,
             rdata: rdata.into_boxed_slice(),
+        })
+    }
+
+    /// The same OPT with `error` appended to its option list (RFC 8914 §2).
+    ///
+    /// Appended rather than replacing: §2 says "Senders MAY include more than
+    /// one EDE option", so a second call means two errors and not a correction.
+    ///
+    /// `Result` for the same reason [`Edns::with_options`] has one, though
+    /// [`ExtendedError`]'s own bound on EXTRA-TEXT is what keeps this one from
+    /// firing.
+    pub fn with_extended_error(self, error: ExtendedError) -> Result<Self, WireError> {
+        let mut rdata = self.rdata.into_vec();
+        error.to_option().append_to(&mut rdata)?;
+        Ok(Edns {
+            rdata: rdata.into_boxed_slice(),
+            ..self
         })
     }
 
