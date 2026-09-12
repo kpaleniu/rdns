@@ -12,6 +12,7 @@ pub use rdns_core::*;
 #[cfg(test)]
 mod bench;
 pub mod cache;
+pub mod catalog;
 pub mod denial_wire;
 pub mod dnssec;
 pub mod dnssec_answer;

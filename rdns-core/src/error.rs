@@ -180,6 +180,51 @@ impl DnssecError {
     }
 }
 
+/// A zone that is not the catalog zone it was configured as (RFC 9432).
+///
+/// The variants are the RFC's own list of what makes a catalog "broken" — §4.1
+/// for the member nodes, §4.2.1 for the version property, §4.3.1 for `coo` —
+/// and no consumer branches on them: §5.1 gives one answer for all of them,
+/// which is to keep the membership already in force and say so. They are
+/// separate anyway because the operator has to fix a specific record, and
+/// because a test asserting on the variant is a test that survives rewording
+/// (`CLAUDE.md` §3).
+///
+/// Not a reason to reject the *zone*: §5.1 says a name server "MAY allow
+/// loading and transfer of broken zones with incorrect catalog zone syntax (as
+/// they are treated as regular zones)", so this describes the catalog reading
+/// and nothing else.
+#[derive(Debug, thiserror::Error)]
+pub enum BrokenCatalog {
+    #[error(
+        "there is no version.$CATZ TXT record, so this is not a catalog zone (RFC 9432 §4.2.1)"
+    )]
+    NoVersion,
+    #[error("the version.$CATZ TXT RRset holds {0} records, not one (RFC 9432 §4.2.1)")]
+    VersionRrset(usize),
+    #[error("catalog schema version {0:?} is not implemented; this build reads version 2 (RFC 9432 §4.2.1)")]
+    Version(String),
+    #[error("the member node {node} holds {records} PTR records, not one (RFC 9432 §4.1)")]
+    MemberRrset { node: crate::Name, records: usize },
+    #[error("{first} and {second} both name the member zone {zone} (RFC 9432 §4.1)")]
+    DuplicateMember {
+        zone: crate::Name,
+        first: crate::Name,
+        second: crate::Name,
+    },
+    #[error("the coo property at {node} holds {records} PTR records, not one (RFC 9432 §4.3.1)")]
+    CooRrset { node: crate::Name, records: usize },
+    /// A property RR of the right type whose RDATA does not decode — §4.2's
+    /// "known properties that have the correct RR type but are for some reason
+    /// invalid".
+    #[error("the record at {name} does not decode: {source}")]
+    Undecodable {
+        name: crate::Name,
+        #[source]
+        source: WireError,
+    },
+}
+
 /// Operator-supplied text that does not parse: a `--secondary` spec, a TSIG key
 /// spec, a CIDR in an ACL.
 ///
