@@ -73,6 +73,7 @@ use rdns::{Name, NameRef, UdpSizes};
 // were the non-test callers, into `dispatch`.
 #[cfg(test)]
 use rdns::{clock::current_unix_timestamp, zone::parse_zone_file_at};
+use rdns_transport::quic;
 use rdns_transport::tcp;
 use rdns_transport::tls::{self, CertificateStore};
 use rdns_transport::{recv_error_is_transient, ServeContext, TransportLimits, UDP_RECEIVE_BUFFER};
@@ -417,25 +418,23 @@ struct Cli {
     /// authoritative server's clients.
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     tls_listen: Option<String>,
-    /// The PEM certificate chain --tls-listen presents. Leaf first.
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "config",
-        requires = "tls_listen"
-    )]
+    /// Also answer DNS over QUIC here (RFC 9250). Needs --tls-cert and --tls-key.
+    ///
+    /// 853 as well, and the two do not collide: DoT is TCP and DoQ is UDP, so an
+    /// operator serving both writes the same number twice. The certificate is
+    /// the same one, from the same store, reloaded by the same SIGHUP.
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
+    quic_listen: Option<String>,
+    /// The PEM certificate chain --tls-listen and --quic-listen present. Leaf
+    /// first.
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
     tls_cert: Option<PathBuf>,
     /// The PEM private key for --tls-cert.
     ///
     /// Refused if it is readable by its group or by everybody, the same check
     /// the DNSSEC keys and a TSIG `secret-file` get. Unix only; Windows has no
     /// equivalent.
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "config",
-        requires = "tls_listen"
-    )]
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
     tls_key: Option<PathBuf>,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///
@@ -579,12 +578,29 @@ struct ServePolicy {
     control: ControlPolicy,
 }
 
+/// "853 (DoT), 853 (DoQ)", or whichever of the two is configured.
+fn describe_encrypted(policy: &TlsPolicy) -> String {
+    let mut parts = Vec::new();
+    if let Some(addr) = &policy.dot {
+        parts.push(format!("{addr} DoT"));
+    }
+    if let Some(addr) = &policy.doq {
+        parts.push(format!("{addr} DoQ"));
+    }
+    parts.join(", ")
+}
+
 /// A DoT listener: the address, and the certificate it presents.
 ///
 /// The store is shared with the reload path, so a renewed certificate is picked
 /// up by `rdnsctl reload` or a SIGHUP rather than by a restart (`TODO.md` #42a).
 struct TlsPolicy {
-    listen: String,
+    /// Where to answer DNS over TLS, if anywhere.
+    dot: Option<String>,
+    /// Where to answer DNS over QUIC, if anywhere.
+    doq: Option<String>,
+    /// One store for both, so a renewal reaches both listeners. Two stores over
+    /// the same two files would be a certificate that expires on one port.
     store: Arc<CertificateStore>,
 }
 
@@ -705,13 +721,26 @@ async fn serve(
     // And the TLS listener, for the same reason the metrics one is bound here:
     // a port conflict on 853 must stop the start rather than leave a server
     // running that a DoT client cannot reach and nothing reports.
-    let tls_listener = match &tls {
-        Some(policy) => Some((
-            TcpListener::bind(&policy.listen)
+    let tls_listener = match tls.as_ref().and_then(|p| p.dot.as_ref().map(|a| (p, a))) {
+        Some((policy, addr)) => Some((
+            TcpListener::bind(addr)
                 .await
-                .with_context(|| format!("--tls-listen {}", policy.listen))?,
+                .with_context(|| format!("--tls-listen {addr}"))?,
             tls::server_config(policy.store.clone())?,
         )),
+        None => None,
+    };
+    // quinn binds its own UDP socket, so this is the same "fail here, not after
+    // one transport is up" rule applied to a different kind of listener.
+    let quic_endpoint = match tls.as_ref().and_then(|p| p.doq.as_ref().map(|a| (p, a))) {
+        Some((policy, addr)) => Some(
+            quinn::Endpoint::server(
+                quic::server_config(policy.store.clone(), TransportLimits::default())?,
+                addr.parse()
+                    .with_context(|| format!("--quic-listen {addr} is not an address:port"))?,
+            )
+            .with_context(|| format!("--quic-listen {addr}"))?,
+        ),
         None => None,
     };
     // Same rule for the control socket: a path that cannot be bound stops the
@@ -747,19 +776,19 @@ async fn serve(
          request cap: {udp_cap}B UDP / {tcp_cap}B TCP, \
          UDP reply cap: {reply_cap}B (advertising {advertised}B), \
          UDP workers: {udp_workers}, anomaly warnings: {anomaly_note}, \
-         TSIG keys: {}, DoT: {}, metrics: {}, control: {}",
+         TSIG keys: {}, encrypted: {}, metrics: {}, control: {}",
         server.tsig_keys.len(),
         match &tls {
             Some(policy) => {
                 let (cert, key) = policy.store.paths();
                 format!(
                     "{} (cert {}, key {})",
-                    policy.listen,
+                    describe_encrypted(policy),
                     cert.display(),
                     key.display()
                 )
             }
-            None => "off (--tls-listen)".to_string(),
+            None => "off (--tls-listen, --quic-listen)".to_string(),
         },
         match &metrics_listen {
             Some(spec) => format!("{spec}/metrics"),
@@ -829,6 +858,16 @@ async fn serve(
         loops.spawn(tls::serve(
             tls_listener,
             config,
+            server.clone(),
+            TransportLimits::default(),
+            tcp::RateLimit::PerMessage,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+    }
+    if let Some(endpoint) = quic_endpoint {
+        loops.spawn(quic::serve(
+            endpoint,
             server.clone(),
             TransportLimits::default(),
             tcp::RateLimit::PerMessage,
@@ -1599,14 +1638,16 @@ async fn main() -> Result<()> {
     // Loaded before anything binds, like every other thing that can stop the
     // start. A certificate that will not read is a DoT listener that answers
     // nothing, which is the failure `--metrics-listen` is already refused for.
-    let tls_store = match (&cli.tls_listen, &cli.tls_cert, &cli.tls_key) {
-        (Some(_), Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
-        // clap's `requires` covers a missing flag; this covers the config file,
-        // which has no such mechanism and would otherwise bind 853 with nothing
-        // to present on it.
-        (Some(listen), _, _) => {
+    let encrypted = cli.tls_listen.is_some() || cli.quic_listen.is_some();
+    let tls_store = match (encrypted, &cli.tls_cert, &cli.tls_key) {
+        (true, Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
+        // In code rather than in clap's `requires`, because the config file has
+        // no such mechanism and would otherwise bind 853 with nothing to present
+        // on it — and because either listener needs the pair, which `requires`
+        // cannot express as an "or".
+        (true, _, _) => {
             return Err(anyhow!(
-                "tls-listen {listen} needs both tls-cert and tls-key"
+                "tls-listen and quic-listen need both tls-cert and tls-key"
             ))
         }
         _ => None,
@@ -1680,7 +1721,7 @@ async fn main() -> Result<()> {
         // not be able to take away the output of a command whose entire job is
         // to produce it.
         println!(
-            "configuration is valid: {} zone(s), {} TSIG key(s), signing {}, DoT {}",
+            "configuration is valid: {} zone(s), {} TSIG key(s), signing {}, encrypted transports {}",
             zones.len(),
             cli.tsig_key.len(),
             match &signing {
@@ -1691,9 +1732,16 @@ async fn main() -> Result<()> {
             // matched against its key above — a dry run has to run everything
             // that does not bind a socket (`CLAUDE.md` §15), and saying nothing
             // about it would leave an operator unable to tell whether it did.
-            match (&cli.tls_listen, &tls_store) {
-                (Some(listen), Some(_)) => format!("on {listen}, certificate loads"),
-                _ => "disabled".to_string(),
+            match (&cli.tls_listen, &cli.quic_listen, &tls_store) {
+                (None, None, _) | (_, _, None) => "disabled".to_string(),
+                (dot, doq, Some(_)) => format!(
+                    "on {}, certificate loads",
+                    [dot.as_deref().map(|a| format!("{a} DoT")), doq.as_deref().map(|a| format!("{a} DoQ"))]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                ),
             }
         );
         return Ok(());
@@ -1852,10 +1900,11 @@ async fn main() -> Result<()> {
             ),
             udp_workers: cli.udp_workers,
             metrics_listen: cli.metrics_listen,
-            tls: match (cli.tls_listen, tls_store.clone()) {
-                (Some(listen), Some(store)) => Some(TlsPolicy { listen, store }),
-                _ => None,
-            },
+            tls: tls_store.clone().map(|store| TlsPolicy {
+                dot: cli.tls_listen,
+                doq: cli.quic_listen,
+                store,
+            }),
             readiness,
             updates,
             journal,

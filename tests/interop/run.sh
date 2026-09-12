@@ -861,6 +861,49 @@ print(urllib.request.urlopen('http://10.53.0.2:9153/metrics').read().decode())\"
     bad "dns_tls_handshake_failures_total is ${failed:-absent}, expected at least 1"
   fi
 
+  # ---- DoQ, on the same port number and the same certificate --------------
+  say "42b - DNS over QUIC (RFC 9250)"
+
+  check "kdig speaks DoQ and gets the answer" "192.0.2.10" \
+    <<< "$(t kdig +short +quic +tls-ca=/srv/run/dot-ca.pem +tls-hostname=dns.example.test \
+              -p 853 @10.53.0.2 www.example.com A 2>&1)"
+
+  # A signed answer, which is also the one large enough to matter: QUIC has no
+  # 512-octet reflex and nothing here should truncate.
+  check "a DNSSEC-signed answer comes back over QUIC" "RRSIG" \
+    <<< "$(t kdig +dnssec +quic +tls-ca=/srv/run/dot-ca.pem +tls-hostname=dns.example.test \
+              -p 853 @10.53.0.2 www.example.com A 2>&1)"
+
+  # The same negative control DoT gets: a client trusting the wrong certificate
+  # must fail, or "+tls-ca passed" says nothing about what was verified.
+  local qwrong
+  qwrong=$(t sh -c "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -nodes -keyout /tmp/qw.key -out /tmp/qw.pem -days 1 -subj '/CN=dns.example.test' \
+      -addext 'subjectAltName=DNS:dns.example.test,IP:10.53.0.2' 2>/dev/null;
+      kdig +short +quic +tls-ca=/tmp/qw.pem +tls-hostname=dns.example.test \
+        -p 853 @10.53.0.2 www.example.com A 2>&1")
+  if printf '%s' "$qwrong" | grep -q '192.0.2.10'; then
+    bad "the DoQ client accepted a certificate it should not trust"
+  else
+    ok "...and refuses a certificate it does not trust"
+  fi
+
+  # 853/udp and 853/tcp at once, which is the claim the two listeners make by
+  # sharing a number. Both answered above; this says they are both still there.
+  check "DoT on 853/tcp still answers with DoQ on 853/udp" "192.0.2.10" \
+    <<< "$(t kdig +short +tls-ca=/srv/run/dot-ca.pem -p 853 @10.53.0.2 www.example.com A 2>&1)"
+
+  local qscrape qshook
+  qscrape=$(t python3 -c "
+import urllib.request
+print(urllib.request.urlopen('http://10.53.0.2:9153/metrics').read().decode())" 2>&1)
+  qshook=$(printf '%s\n' "$qscrape" | awk '/^dns_quic_handshakes_total /{print $2}')
+  if [ "${qshook:-0}" -ge 2 ]; then
+    ok "dns_quic_handshakes_total is $qshook, counted separately from DoT's"
+  else
+    bad "dns_quic_handshakes_total is ${qshook:-absent}, expected at least 2"
+  fi
+
   # ---- the renewal story, which is the half that is not the protocol -------
   #
   # New bytes at the same two paths and one reload. The pin changes, so a client
@@ -891,6 +934,9 @@ print(urllib.request.urlopen('http://10.53.0.2:9153/metrics').read().decode())\"
 
   check "the renewed certificate is served after a SIGHUP, with no restart" "192.0.2.10" \
     <<< "$(t kdig +short "+tls-pin=$after" -p 853 @10.53.0.2 www.example.com A 2>&1)"
+
+  check "...and DoQ is serving the renewed one too, from the same store" "192.0.2.10" \
+    <<< "$(t kdig +short +quic "+tls-pin=$after" -p 853 @10.53.0.2 www.example.com A 2>&1)"
 
   local stale
   stale=$(t kdig +short "+tls-pin=$before" -p 853 @10.53.0.2 www.example.com A 2>&1)

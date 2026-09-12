@@ -125,6 +125,11 @@ pub struct Counters {
     /// fire.
     pub tls_handshakes: AtomicU64,
     pub tls_handshake_failures: AtomicU64,
+    /// The same pair for DoQ, and separate on purpose: the two listen on the
+    /// same port number over different protocols, so one series would hide a
+    /// client population failing on only one of them.
+    pub quic_handshakes: AtomicU64,
+    pub quic_handshake_failures: AtomicU64,
 
     // Cumulative buckets plus count and sum: what `histogram_quantile()` needs.
     latency_buckets: [AtomicU64; 8],
@@ -170,6 +175,8 @@ impl DnsMetrics {
             queries_dropped: AtomicU64::new(0),
             tls_handshakes: AtomicU64::new(0),
             tls_handshake_failures: AtomicU64::new(0),
+            quic_handshakes: AtomicU64::new(0),
+            quic_handshake_failures: AtomicU64::new(0),
             zones: RwLock::new(BTreeMap::new()),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             latency_count: AtomicU64::new(0),
@@ -428,6 +435,32 @@ impl DnsMetrics {
         output.push_str(&format!(
             "dns_tls_handshake_failures_total {}\n",
             self.tls_handshake_failures.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP dns_quic_handshakes_total DoQ handshakes completed
+",
+        );
+        output.push_str(
+            "# TYPE dns_quic_handshakes_total counter
+",
+        );
+        output.push_str(&format!(
+            "dns_quic_handshakes_total {}
+",
+            self.quic_handshakes.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP dns_quic_handshake_failures_total DoQ handshakes that did not complete
+",
+        );
+        output.push_str(
+            "# TYPE dns_quic_handshake_failures_total counter
+",
+        );
+        output.push_str(&format!(
+            "dns_quic_handshake_failures_total {}
+",
+            self.quic_handshake_failures.load(Ordering::Relaxed)
         ));
 
         // Record type metrics
@@ -752,5 +785,47 @@ mod tests {
         assert!(prometheus.contains("dns_responses_sent_total 90"));
         assert!(prometheus.contains("# HELP"));
         assert!(prometheus.contains("# TYPE"));
+    }
+
+    /// A counter that is declared and incremented and never *rendered* is worse
+    /// than one that does not exist: the code reads as if it reports something.
+    /// All four encrypted-transport counters were added at once and one pair was
+    /// left out of `to_prometheus_format` by an edit that silently did not
+    /// apply; the series was simply absent from the scrape.
+    ///
+    /// Emitted even at zero, on purpose. A series that appears only once
+    /// something has happened cannot be alerted on beforehand, and for a
+    /// handshake count zero is a fact rather than a missing measurement —
+    /// unlike the per-zone gauges, which are omitted so `absent()` can ask.
+    #[test]
+    fn every_encrypted_transport_counter_reaches_the_scrape() {
+        let metrics = DnsMetrics::new();
+        let at_zero = metrics.to_prometheus_format();
+        for series in [
+            "dns_tls_handshakes_total",
+            "dns_tls_handshake_failures_total",
+            "dns_quic_handshakes_total",
+            "dns_quic_handshake_failures_total",
+        ] {
+            assert!(
+                at_zero.contains(&format!(
+                    "{series} 0
+"
+                )),
+                "{series} is missing from a scrape with no DoT or DoQ listener"
+            );
+            assert!(
+                at_zero.contains(&format!("# TYPE {series} counter")),
+                "{series} has no TYPE line"
+            );
+        }
+
+        metrics.quic_handshakes.fetch_add(3, Ordering::Relaxed);
+        metrics
+            .tls_handshake_failures
+            .fetch_add(7, Ordering::Relaxed);
+        let counted = metrics.to_prometheus_format();
+        assert!(counted.contains("dns_quic_handshakes_total 3"));
+        assert!(counted.contains("dns_tls_handshake_failures_total 7"));
     }
 }

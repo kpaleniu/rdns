@@ -99,6 +99,7 @@ pub struct Server {
     /// config file has no equivalent of clap's `requires` and would otherwise
     /// bind 853 with nothing to present on it.
     pub tls_listen: Option<String>,
+    pub quic_listen: Option<String>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     /// Where `rdnsctl` reaches this server. Unix only, and refused at startup
@@ -134,6 +135,7 @@ impl Default for Server {
             udp_workers: crate::default_udp_workers(),
             metrics_listen: None,
             tls_listen: None,
+            quic_listen: None,
             tls_cert: None,
             tls_key: None,
             control_socket: None,
@@ -463,6 +465,7 @@ impl Config {
         cli.udp_workers = self.server.udp_workers;
         cli.metrics_listen = self.server.metrics_listen.clone();
         cli.tls_listen = self.server.tls_listen.clone();
+        cli.quic_listen = self.server.quic_listen.clone();
         cli.tls_cert = self.server.tls_cert.clone();
         cli.tls_key = self.server.tls_key.clone();
         cli.control_socket = self.server.control_socket.clone();

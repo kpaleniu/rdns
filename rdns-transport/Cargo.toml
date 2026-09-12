@@ -17,6 +17,7 @@ tracing.workspace = true
 anyhow.workspace = true
 # DoT (#42a). Here rather than in `rdns` because a TLS stack belongs at the
 # socket layer: the zone parser and the signer have no business linking one.
+quinn.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 

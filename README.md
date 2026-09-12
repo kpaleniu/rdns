@@ -295,7 +295,8 @@ UDP and TCP from one process, same host and port.
 | `--tsig-key <[ALG:]NAME:SECRET[:TRANSFER-ZONES[:UPDATE-ZONES]]>` | a TSIG key (RFC 8945). Repeatable. Zone lists are comma-separated, `*` is every zone, and a list needs the algorithm spelled out. Absent transfer list = every zone; absent update list = no zone |
 | `--also-notify <ADDR[:PORT][#KEY]>` | notify a secondary when a serial moves. Repeatable; `#KEY` signs it |
 | `--tls-listen <ADDR:PORT>` | also answer DNS over TLS here (RFC 7858). Needs `--tls-cert` and `--tls-key` |
-| `--tls-cert <PATH>`, `--tls-key <PATH>` | the PEM chain and key it presents; re-read on every reload |
+| `--quic-listen <ADDR:PORT>` | also answer DNS over QUIC here (RFC 9250). Same certificate, same 853 — DoT is TCP, this is UDP |
+| `--tls-cert <PATH>`, `--tls-key <PATH>` | the PEM chain and key both present; re-read on every reload |
 | `--response-rate <BYTES_PER_SEC>` | UDP response bytes per client, default 8192, `0` disables |
 | `--query-rate <QUERIES_PER_SEC>` | per client, default 1000, `0` disables. With `--query-burst` (200) and `--query-rate-exempt`. Over the limit a query is dropped silently |
 | `--secondary <ZONE@MASTER[:PORT][#KEY]>` | replicate a zone. Repeatable; requires `--zone-dir` |

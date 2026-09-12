@@ -205,13 +205,22 @@ fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 
 /// The rustls configuration a DoT listener serves under.
 pub fn server_config(store: Arc<CertificateStore>) -> Result<Arc<ServerConfig>> {
+    Ok(Arc::new(config_with_alpn(store, ALPN_DOT)))
+}
+
+/// The same configuration under a different ALPN token.
+///
+/// DoQ is the other caller (`TODO.md` #42b): same certificate, same store, same
+/// reload — a different protocol on top. Shared so that a certificate renewal
+/// reaches both listeners, which it would not if each built its own.
+pub(crate) fn config_with_alpn(store: Arc<CertificateStore>, alpn: &[u8]) -> ServerConfig {
     let mut config = ServerConfig::builder()
-        // RFC 8310 §8.1: a DoT *server* authenticates itself to the client and
-        // does not ask the client to authenticate. See the module docs.
+        // A DoT or DoQ *server* authenticates itself to the client and does not
+        // ask the client to authenticate. See the module docs.
         .with_no_client_auth()
         .with_cert_resolver(store);
-    config.alpn_protocols = vec![ALPN_DOT.to_vec()];
-    Ok(Arc::new(config))
+    config.alpn_protocols = vec![alpn.to_vec()];
+    config
 }
 
 /// Accept TLS connections and serve each one as an ordinary DNS-over-TCP
@@ -310,27 +319,26 @@ pub async fn serve_one_tls<H: Handler>(
     crate::tcp::serve_one(stream, peer, handler, limits, rate, stop).await;
 }
 
+/// Fixtures the DoT and DoQ tests share.
+///
+/// `pub(crate)` and not `#[cfg(test)]`-private to this module, because
+/// `quic.rs` needs the same certificate and the alternative was a second copy
+/// of it (`CLAUDE.md` §7) — which is how the two would come to disagree about
+/// what "a valid pair" means.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
-    use crate::testutil::{context, query};
-    use crate::ServeContext;
-    use rdns::shutdown::Shutdown;
-    use std::net::SocketAddr;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::mpsc;
 
     /// A certificate and key on disk, generated per run.
     ///
     /// Generated rather than checked in: a private key in the tree is a private
     /// key in every clone, and a fixture with an expiry date is a test that
     /// starts failing on a Tuesday years from now.
-    struct Pem {
+    pub(crate) struct Pem {
         dir: std::path::PathBuf,
-        cert: PathBuf,
-        key: PathBuf,
-        der: Vec<u8>,
+        pub(crate) cert: PathBuf,
+        pub(crate) key: PathBuf,
+        pub(crate) der: Vec<u8>,
     }
 
     impl Drop for Pem {
@@ -339,7 +347,7 @@ mod tests {
         }
     }
 
-    fn write_pem(tag: &str, name: &str) -> Pem {
+    pub(crate) fn write_pem(tag: &str, name: &str) -> Pem {
         let dir = std::env::temp_dir().join(format!("rdns-tls-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let issued =
@@ -359,7 +367,7 @@ mod tests {
 
     /// The mode `ensure_private` insists on. A no-op where there are no mode
     /// bits, which is the same platform split the check itself has.
-    fn make_private(path: &Path) {
+    pub(crate) fn make_private(path: &Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -369,6 +377,19 @@ mod tests {
         #[cfg(not(unix))]
         let _ = path;
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{make_private, write_pem};
+    use super::*;
+    use crate::testutil::{context, query};
+    use crate::ServeContext;
+    use rdns::shutdown::Shutdown;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
     struct Echo(ServeContext);
 

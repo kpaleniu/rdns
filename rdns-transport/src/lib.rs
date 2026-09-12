@@ -17,6 +17,7 @@
 //! It holds no DNS logic. Deciding what a question deserves is `rdns`'s, and
 //! answering it is each daemon's.
 
+pub mod quic;
 pub mod tcp;
 #[cfg(test)]
 mod testutil;

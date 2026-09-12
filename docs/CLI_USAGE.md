@@ -203,15 +203,21 @@ rdnsd --zone-dir ./zones --secondary example.com@192.0.2.1:5353
 `rdnsctl status` reports `secondary` from the configuration rather than inferring
 it from an absent last-contact time, which a primary also has.
 
-### `--tls-listen <ADDR:PORT>`, `--tls-cert`, `--tls-key`
+### `--tls-listen`, `--quic-listen`, `--tls-cert`, `--tls-key`
 
-DNS over TLS (RFC 7858), on the address given. 853 is the assigned port. All
-three or none: a listener with no certificate is refused at startup rather than
-bound with nothing to present.
+DNS over TLS (RFC 7858) and DNS over QUIC (RFC 9250), on the addresses given.
+853 is the assigned port for both, and they do not collide: DoT is TCP and DoQ
+is UDP, so an operator serving both writes the same number twice. Either
+listener needs the certificate pair, and one that has none is refused at startup
+rather than bound with nothing to present.
 
-This is *in addition to* the plain UDP and TCP listeners on `--port`, never
+These are *in addition to* the plain UDP and TCP listeners on `--port`, never
 instead of them. An authoritative server's clients are resolvers, and one that
 answered only over TLS could not be used by most of them.
+
+**One certificate, one store, one reload.** Both listeners resolve through the
+same `CertificateStore`, so a renewal reaches both. Two stores over the same two
+files would be a certificate that expires on one port and not the other.
 
 - The certificate is a PEM chain, leaf first; the key is its PEM private key.
   Both are re-read on every reload, so **a renewal is a reload, not a restart**:
@@ -222,8 +228,15 @@ answered only over TLS could not be used by most of them.
   DNSSEC keys and a TSIG `secret-file` get. Unix only; Windows has no equivalent.
 - A certificate and key that are not a pair are refused at startup. They would
   otherwise load, start, and fail every handshake.
-- ALPN `dot` is advertised and not required: a client that offers no ALPN is
-  still served, because DoT predates the token.
+- ALPN `dot` is advertised and not required on DoT: a client that offers no
+  ALPN is still served, because DoT predates the token. On DoQ `doq` *is*
+  required — QUIC gives no other way to tell DNS from anything else, and there
+  is no pre-ALPN deployment to be gentle with.
+- DoQ is one query per client-initiated bidirectional stream, framed with the
+  same 2-octet prefix as TCP. The stream is the request/response pairing, which
+  is why RFC 9250 has a client set the DNS Message ID to zero. This server
+  echoes whatever ID it was sent and never checks it: the pairing is already
+  done, and refusing a non-zero ID would break a client for no gain.
 - No client certificates. RFC 8310 §8.2's mutual TLS authenticates a *client*,
   which TSIG already does here on every transport rather than one.
 
@@ -236,13 +249,16 @@ the alert is the counter:
 rate(dns_tls_handshake_failures_total[5m]) > 0
 ```
 
-`dns_tls_handshakes_total` is its companion. Both are emitted even when no DoT
-listener is configured, as a pair of zeroes, so an alert can be written before
-the feature is turned on.
+`dns_tls_handshakes_total` is its companion, and `dns_quic_handshakes_total` /
+`dns_quic_handshake_failures_total` are the DoQ pair — separate on purpose,
+because one series over both would hide a client population failing on only one
+of them. All four are emitted even when neither listener is configured, as
+zeroes, so an alert can be written before the feature is turned on.
 
 ```bash
 rdnsd --zone-dir ./zones \
   --tls-listen 0.0.0.0:853 \
+  --quic-listen 0.0.0.0:853 \
   --tls-cert /etc/rdns/tls/fullchain.pem \
   --tls-key /etc/rdns/tls/privkey.pem
 ```

@@ -33,6 +33,7 @@ use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl}
 use rdns::shutdown::{next_reload, reload_signal, Shutdown};
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
 use rdns::UdpSizes;
+use rdns_transport::quic;
 use rdns_transport::tls::{self, CertificateStore};
 use rdns_transport::{tcp, ServeContext, TransportLimits};
 use tokio::net::{TcpListener, UdpSocket};
@@ -247,14 +248,19 @@ struct Cli {
     /// plain listeners on --port, not instead of them.
     #[arg(long, value_name = "ADDR:PORT")]
     tls_listen: Option<String>,
+    /// Also answer DNS over QUIC here (RFC 9250). Needs --tls-cert and --tls-key.
+    ///
+    /// 853 as well: DoT is TCP and DoQ is UDP, so the two do not collide.
+    #[arg(long, value_name = "ADDR:PORT")]
+    quic_listen: Option<String>,
     /// The PEM certificate chain --tls-listen presents. Leaf first.
-    #[arg(long, value_name = "PATH", requires = "tls_listen")]
+    #[arg(long, value_name = "PATH")]
     tls_cert: Option<PathBuf>,
     /// The PEM private key for --tls-cert.
     ///
     /// Refused if it is readable by its group or by everybody. Unix only;
     /// Windows has no equivalent.
-    #[arg(long, value_name = "PATH", requires = "tls_listen")]
+    #[arg(long, value_name = "PATH")]
     tls_key: Option<PathBuf>,
 }
 
@@ -412,11 +418,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Read before anything binds, like the metrics listener above: a
     // certificate that will not load is a DoT listener that answers nothing.
-    let tls_store = match (&cli.tls_listen, &cli.tls_cert, &cli.tls_key) {
-        (Some(_), Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
-        (Some(listen), _, _) => {
+    // Either encrypted listener needs the pair, which clap's `requires` cannot
+    // express as an "or", so the check is here.
+    let encrypted = cli.tls_listen.is_some() || cli.quic_listen.is_some();
+    let tls_store = match (encrypted, &cli.tls_cert, &cli.tls_key) {
+        (true, Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
+        (true, _, _) => {
             return Err(anyhow!(
-                "--tls-listen {listen} needs both --tls-cert and --tls-key"
+                "--tls-listen and --quic-listen need both --tls-cert and --tls-key"
             ))
         }
         _ => None,
@@ -428,6 +437,17 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("--tls-listen {spec}"))?,
             tls::server_config(store.clone())?,
         )),
+        _ => None,
+    };
+    let quic_endpoint = match (&cli.quic_listen, &tls_store) {
+        (Some(spec), Some(store)) => Some(
+            quinn::Endpoint::server(
+                quic::server_config(store.clone(), TransportLimits::default())?,
+                spec.parse()
+                    .with_context(|| format!("--quic-listen {spec} is not an address:port"))?,
+            )
+            .with_context(|| format!("--quic-listen {spec}"))?,
+        ),
         _ => None,
     };
 
@@ -554,6 +574,20 @@ async fn main() -> anyhow::Result<()> {
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
+    if let Some(endpoint) = quic_endpoint {
+        loops.spawn(quic::serve(
+            endpoint,
+            Arc::new(Resolving {
+                resolver: resolver.clone(),
+                caches: caches.clone(),
+                ctx: ctx.clone(),
+            }),
+            TransportLimits::default(),
+            tcp::RateLimit::PerConnection,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+    }
     // Same admission, same per-connection rate rule as the plain TCP loop: what
     // TLS changes is who can read the connection, not what is answered on it.
     if let Some((tls_listener, config)) = tls_listener {
@@ -572,7 +606,8 @@ async fn main() -> anyhow::Result<()> {
         ));
         // The renewal story, and the only reload this daemon has. `rdnsd` folds
         // the same call into the reload every trigger passes through; here there
-        // are no zones, so SIGHUP means this and only this.
+        // are no zones, so SIGHUP means this and only this. One store serves
+        // both encrypted listeners, so one reload reaches both.
         //
         // Not in the `JoinSet` below: that set's rule is "the first task to end
         // ends the process", and this one ends on the stop signal by design.

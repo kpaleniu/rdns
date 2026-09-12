@@ -29,6 +29,9 @@ metrics-listen = "0.0.0.0:9153"
 # in this tree and never one on a DrvFs mount, where `ensure_private` would
 # refuse it for being mode 0777.
 tls-listen = "0.0.0.0:853"
+# DoQ (#42b) on the same number: DoT is TCP and this is UDP, so they do not
+# collide, and it is the same certificate from the same store.
+quic-listen = "0.0.0.0:853"
 tls-cert = "/etc/rdns/tls/cert.pem"
 tls-key = "/etc/rdns/tls/key.pem"
 
