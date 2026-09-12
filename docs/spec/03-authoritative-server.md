@@ -555,6 +555,14 @@ fatal: a member whose row is gone reads as a zone nothing claims, so it is left
 alone rather than removed, and the clash is logged. That direction is chosen —
 the other one replicates over a file the operator wrote.
 
+### Checked against BIND
+
+`tests/interop` 43f: BIND 9.20 serving a catalog and the member it lists,
+`rdnsd` consuming it. The member is provisioned and answered for with AA, the
+member that clashes with the consumer's own configuration is refused and logged,
+`dns_catalog_members` reads 1, and an `nsupdate` deleting the member node from
+the catalog takes the zone out of service — REFUSED, and the gauge at 0.
+
 ### What is not implemented
 
 - Group properties are read, logged and not acted on. §4.3.2 leaves their

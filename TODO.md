@@ -37,11 +37,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#44** (44a and 44b done), **#45**, **#47**, **#48** and **#21**, as of
-2026-09-12. #44 is what an operator would find missing in `rdnsd`, #45 what an
-ISP would find missing in `rdnsr`, #47 is the one gap 44b left behind, #48 the
-one 44a left, and #21 is an inventory of deliberate deviations rather than a
-queue. Everything else numbered is closed;
+**#44** (44a and 44b done), **#45**, **#47**, **#48**, **#49** and **#21**, as
+of 2026-09-12. #44 is what an operator would find missing in `rdnsd`, #45 what
+an ISP would find missing in `rdnsr`, #47 is the one gap 44b left behind, #48
+and #49 the two 44a left, and #21 is an inventory of deliberate deviations
+rather than a queue. Everything else numbered is closed;
 the table under "Closed work" says which, when, and where the reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
@@ -808,8 +808,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#44** (44a and 44b done), **#45**, **#47**, **#48** and **#21** — see
-"What is open" above,
+**#44** (44a and 44b done), **#45**, **#47**, **#48**, **#49** and **#21** —
+see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -839,7 +839,7 @@ Then, in order and for stated reasons:
 2. ~~**44a**, catalog zones — the row that moves the answer from "a nice server"
    to "a server I could run a fleet of".~~ **Done 2026-09-12**, the consumer
    side; the producer side needed no code, because a catalog is an ordinary
-   zone. Left behind: **#48**.
+   zone. Left behind: **#48** and **#49**.
 3. ~~**#42's stages**: 42a first, because it costs 7 packages and both of the
    others are built on it; 42b next, because `quinn` supplies streams and
    RFC 9250's framing is `rdns::framed` already; 42c last and largest, because
@@ -929,7 +929,7 @@ missing is the operational surface around the answering, which is the same shape
 
 | | | |
 |---|---|---|
-| ~~**44a**~~ | ~~catalog zones (RFC 9432, "DNS Catalog Zones") — **0 hits**~~ **Done 2026-09-12**, two commits: the parse in `rdns::catalog`, then `--catalog` and the provisioning in `rdnsd` | ~~The largest one. A catalog zone is an ordinary zone whose contents are the *list* of zones a secondary should serve, so provisioning becomes a transfer rather than a configuration-management problem. BIND, Knot, NSD and PowerDNS all implement it. Below a handful of zones nobody misses it; somewhere around a hundred, configuring each secondary by hand stops being possible, and that is where an evaluation ends. This tree is unusually well placed for it — the consumer side is an AXFR, a parse and `install_zone`, all of which exist~~ **The placement held and the sizing did not.** The AXFR, the parse and `install_zone` were indeed free; what the row did not see is that provisioning is a *diff*, and a diff needs a third thing the catalog does not contain — which zones this server provisioned last time, and under which member node. §5.3 makes removal conditional on the first and §5.4 makes a reset conditional on the second, so both had to become a sidecar (`rdnsd.catalog`) with the same rule the transfer state has: forgetting it serves a withdrawn zone with AA set. Two things the filing did not see either — the registry of replicated zones was a `HashMap` built once at startup, so membership changing at runtime made it a type with a lock and a `retire`, and that turned up a defect of its own: the reload's EXPIRE check read a list of `--secondary` specs fixed at startup, which a catalog's members would never have joined. And RFC 9432 §6 is worth reading before deploying it: an empty catalog from a buggy producer deletes every member zone, which is why removals are WARN and why `dns_catalog_members` exists. Left behind: **#48** |
+| ~~**44a**~~ | ~~catalog zones (RFC 9432, "DNS Catalog Zones") — **0 hits**~~ **Done 2026-09-12**, three commits: the parse in `rdns::catalog`, then `--catalog` and the provisioning in `rdnsd`, then a scenario against BIND as the producer (`tests/interop`, 43f) | ~~The largest one. A catalog zone is an ordinary zone whose contents are the *list* of zones a secondary should serve, so provisioning becomes a transfer rather than a configuration-management problem. BIND, Knot, NSD and PowerDNS all implement it. Below a handful of zones nobody misses it; somewhere around a hundred, configuring each secondary by hand stops being possible, and that is where an evaluation ends. This tree is unusually well placed for it — the consumer side is an AXFR, a parse and `install_zone`, all of which exist~~ **The placement held and the sizing did not.** The AXFR, the parse and `install_zone` were indeed free; what the row did not see is that provisioning is a *diff*, and a diff needs a third thing the catalog does not contain — which zones this server provisioned last time, and under which member node. §5.3 makes removal conditional on the first and §5.4 makes a reset conditional on the second, so both had to become a sidecar (`rdnsd.catalog`) with the same rule the transfer state has: forgetting it serves a withdrawn zone with AA set. Two things the filing did not see either — the registry of replicated zones was a `HashMap` built once at startup, so membership changing at runtime made it a type with a lock and a `retire`, and that turned up a defect of its own: the reload's EXPIRE check read a list of `--secondary` specs fixed at startup, which a catalog's members would never have joined. And RFC 9432 §6 is worth reading before deploying it: an empty catalog from a buggy producer deletes every member zone, which is why removals are WARN and why `dns_catalog_members` exists. Left behind: **#48** and **#49** |
 | ~~**44b**~~ | ~~Extended DNS Errors (RFC 8914) — **0 hits**~~ **Done 2026-09-12**, two commits: `rdnsd`'s eight refusal sites, then the resolver's SERVFAILs and `rdnsc`'s printing of what it receives | ~~Small, and the highest value per line on this page. A bare SERVFAIL is a support ticket; the same SERVFAIL carrying EDE 6 (DNSSEC Bogus) or EDE 7 (Signature Expired) is a fixed problem. It is an EDNS option, the option list already round-trips, and the RCODE space is already a data-carrying type. Its absence is also a *signal* — it reads as software written by somebody who has not had to debug DNS at 3am~~ **Every clause held except "small".** The option and `rdnsd`'s half are small; the resolver's half is what the row was actually asking for, and it cost a type — the reason a check found had to be carried up to the reply, so `RrsetProof::Bogus`, `ValidationState::Bogus` and `DelegationVerdict::Bogus` all took a `dnssec::Bogus { code, why }` in place of a `String`, at 24 construction sites. That is §17's argument arriving from the other direction: the code is not derivable at the top, so it has to be in the type at the bottom. Two things the filing did not see — EXTRA-TEXT is `&'static str`, because `Bogus::why` names a zone, an owner and a key tag that all came out of an answer a stranger sent, and reflecting those to another stranger is how §2's "leak no private information" breaks quietly; and `rdnsc` sent an OPT only under `--dnssec`, so the tree's own probe could not see the thing the tree had just learned to send. Left behind: **#47** |
 | **44c** | no measurement above a test zone | Not a feature, an **evidence** gap, and the first question an operator asks. `bench_zone_lookup` builds 10,000 records and the largest zone file in the tree is a dozen lines. Unmeasured: load time and memory for a zone of a million records, signing time at that size, how many zones one process holds, and what reloading all of them costs. §10's rules apply — this is a measurement to *take*, and the number it produces is the row's real content |
 | **44d** | XFR over TLS (RFC 9103, "DNS Zone Transfer over TLS") — **0 hits** | Zone contents cross the wire in clear between primary and secondary, which for anything with private names is the objection. Cheap *after* #42a: the rustls setup, the certificate plumbing and the ALPN dispatch are the same, and a transfer is already framed TCP. Worth taking as a fourth stage of #42 rather than on its own |
@@ -1034,6 +1034,40 @@ Three things to settle before writing it, none of which 44a had to:
 
 Not urgent: a fleet with one class of member zone — which is the ordinary case
 and the one 44a's row was about — never writes a group at all.
+
+---
+
+### 49. Nothing on the control socket says a zone came from a catalog — **filed 2026-09-12**
+
+Also left behind by 44a. RFC 9432 §6 asks for it in as many words: "Querying/
+serving catalog zone contents may be inconvenient via DNS due to the nature of
+their representation ... Implementations are therefore advised to provide a tool
+that uses either the output of AXFR or an out-of-band method to perform queries
+on catalog zones."
+
+What exists, measured rather than recalled: `rdnsctl status` prints one row per
+zone with serial, records, signing and a `secondary` marker, and since 44a that
+marker is read from the live replication registry, so a catalog's members *are*
+marked secondary. What no command says is **which catalog** a zone came from,
+under which member node, or what a catalog holds that this server declined —
+the clash in §5.2 is an ERROR in the log and nowhere else.
+
+The facts are all in the process already: `Catalogs`' sidecar is the mapping and
+`dns_catalog_members` is the count. Two shapes, and the cheap one is probably
+right:
+
+- a `catalog` column on `status`, which costs a row-width and answers "where did
+  this come from" for every zone at once;
+- a `catalog [<zone>]` command listing members with their node labels and
+  groups, which is the tool §6 describes and is the only one that can report a
+  member the server *refused*, since that zone has no row in `status` at all.
+
+The second needs the refusals to be remembered rather than only logged, which is
+the part with a design decision in it: a bounded list per catalog, or nothing.
+
+Small either way, and not urgent — `rdnsd.catalog` beside the zones is plain
+text and answers the first question for anyone who can read the disk. It has a
+number because the operator who cannot is exactly the one `rdnsctl` exists for.
 
 ---
 

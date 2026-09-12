@@ -1,0 +1,10 @@
+; 43f's member zone: served by BIND, named by the catalog, and never mentioned
+; in the consumer's configuration. Nothing but the catalog puts it there.
+;
+; REFRESH is 60 so a missed NOTIFY costs a minute rather than an hour, and
+; EXPIRE is short because 43f checks what a withdrawn member does.
+$TTL 300
+@       IN SOA  ns.member.test. hostmaster.member.test. ( 1 60 60 600 300 )
+@       IN NS   ns.member.test.
+ns      IN A    10.53.0.7
+www     IN A    198.51.100.40

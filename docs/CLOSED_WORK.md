@@ -5922,6 +5922,15 @@ expectation down first, so it cannot be revised afterwards — **43a's IXFR
 fallback and 43c's NSEC3 shapes are where this is most likely to find
 something**; 43b and 43d are most likely to pass.
 
+**43f, added 2026-09-12 by #44a** (catalog zones): BIND 9.20 as the catalog
+*producer* — a catalog is an ordinary zone, so a producer is a zone file and an
+`allow-update` — and `rdnsd` as the consumer. It provisions the member the
+catalog lists, refuses the one that clashes with its own configuration, and
+stops serving the member when an `nsupdate` deletes it from the catalog. A
+scenario added to a closed section rather than a new number, because the harness
+is what #43 built and this is one more peer conversation in it; what it verifies
+belongs to #44a.
+
 ---
 
 **Closed 2026-09-12**, the day after it was filed. The harness is

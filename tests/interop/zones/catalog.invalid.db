@@ -1,0 +1,17 @@
+; A catalog zone (RFC 9432), served by BIND as an ordinary primary zone —
+; which is all a producer is. 43f's consumer is rdnsd.
+;
+; The TTLs are 0 because §4.1 says the field "has no meaning in this context and
+; SHOULD be ignored"; the shape is Appendix A's.
+$TTL 0
+@                       IN SOA  invalid. invalid. ( 1 3600 600 2147483646 0 )
+@                       IN NS   invalid.
+version                 IN TXT  "2"
+; Provisioned by the consumer.
+nj2xg5b.zones           IN PTR  member.test.
+; Refused by it: 43f's consumer already has this zone from its own
+; configuration, and §5.2 says an incoming member that clashes with an
+; otherwise configured zone "MUST be ignored and an error SHOULD be logged".
+nvxxezj.zones           IN PTR  big.test.
+; Read, logged, and acted on by nothing here (TODO.md #48).
+group.nj2xg5b.zones     IN TXT  "operator-x-interop"

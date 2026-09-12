@@ -137,6 +137,8 @@ services:
       - ./conf/bind-primary.conf:/etc/bind/named.conf:ro
       - ./zones/frombind.test.db:/etc/bind/zones/frombind.test.db:ro
       - ./zones/big.test.db:/etc/bind/zones/big.test.db:ro
+      - ./zones/catalog.invalid.db:/etc/bind/zones/catalog.invalid.db:ro
+      - ./zones/member.test.db:/etc/bind/zones/member.test.db:ro
       - bind-pri-state:/var/cache/bind
     entrypoint: ["/bin/sh", "-c"]
     command:

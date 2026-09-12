@@ -36,7 +36,18 @@ bad()  { FAIL=$((FAIL+1)); FAILED+=("$*"); printf '   \033[31mFAIL\033[0m %s\n' 
 skip() { SKIP=$((SKIP+1)); printf '   \033[33mSKIP\033[0m %s\n' "$*"; }
 
 # check <name> <expected-substring> <<< actual   — the workhorse assertion.
+#
+# The herestring is not decoration. `cmd | check ...` puts this in a subshell,
+# where `ok` and `bad` increment a copy of the counters that is thrown away: the
+# PASS and FAIL lines print, and the summary counts neither. A run that says "0
+# failed" over a FAIL line is the one thing a harness must not do, so the shape
+# is checked rather than trusted -- $BASHPID is the forked shell's, $$ the
+# script's.
 check() {
+  if [ "$BASHPID" != "$$" ]; then
+    printf '   \033[31mBUG\033[0m check ran in a subshell, so its verdict is not counted: %s\n' "$1"
+    printf '        (write it as: check "name" "want" <<< "$(cmd)")\n'
+  fi
   local name="$1" want="$2" got; got="$(cat)"
   if printf '%s' "$got" | grep -qF -- "$want"; then
     ok "$name"
@@ -789,6 +800,87 @@ s43e() {
 
 # --------------------------------------------------------------------------
 
+# scrape_metrics <addr> — the tools image has no curl, so python3 asks, the
+# way 42a's scrape does.
+scrape_metrics() {
+  t sh -c "python3 -c \"
+import urllib.request
+print(urllib.request.urlopen('http://$1:9153/metrics').read().decode())\""
+}
+
+s43f() {
+  say "43f - rdnsd consuming a catalog zone BIND serves (RFC 9432)"
+
+  # The catalog itself is an ordinary zone and arrives by the ordinary route.
+  if wait_serial 10.53.0.9 5353 catalog.invalid. "$(serial_of 10.53.0.7 53 catalog.invalid.)" 60; then
+    ok "rdnsd replicated the catalog zone itself at serial $(serial_of 10.53.0.9 5353 catalog.invalid.)"
+  else
+    bad "rdnsd never matched BIND's serial for catalog.invalid."
+    return
+  fi
+
+  # The member is in no config file of rdnsd's: the catalog is the only thing
+  # that names it.
+  if wait_for 60 sh -c "[ -n \"\$($COMPOSE exec -T tools dig +short -p 5353 @10.53.0.9 SOA member.test. | head -1)\" ]"; then
+    ok "rdnsd serves member.test., which only the catalog names (§4.1)"
+  else
+    bad "rdnsd never provisioned member.test. from the catalog"
+  fi
+  check "and answers out of the member zone it transferred" "198.51.100.40" \
+    <<< "$(dig_ +noall +answer -p 5353 @10.53.0.9 A www.member.test.)"
+
+  # AA, because a member is served as a replica and not as something cached.
+  check "authoritatively" "flags: qr aa" \
+    <<< "$(dig_ +noall +comments -p 5353 @10.53.0.9 SOA member.test.)"
+
+  # §5.2: the catalog also lists big.test., which this consumer's own
+  # configuration already replicates. The catalog must not take it over.
+  check "big.test. is still served (the clash was ignored, not applied)" "NOERROR" \
+    <<< "$(dig_ +noall +comments -p 5353 @10.53.0.9 SOA big.test.)"
+  check "and the clash was logged as an error (§5.2)" \
+    "the configuration already names that zone" \
+    <<< "$($COMPOSE logs rdnsd-secondary 2>/dev/null | grep -E "ignoring member big.test" | tail -1)"
+
+  # The gauge an operator alerts on, counted from what was provisioned rather
+  # than from what the catalog lists: one member, not two.
+  check "dns_catalog_members counts the member it provisioned" \
+    'dns_catalog_members{catalog="catalog.invalid."} 1' \
+    <<< "$(scrape_metrics 10.53.0.9 | grep '^dns_catalog_members')"
+
+  # ---- §5.3: the producer drops the member, the consumer stops serving it ---
+  say "43f - a member removed from the catalog"
+  local before after
+  before=$(serial_of 10.53.0.7 53 catalog.invalid.)
+  t sh -c "printf 'server 10.53.0.7 53\nzone catalog.invalid.\nupdate delete nj2xg5b.zones.catalog.invalid. PTR\nupdate delete group.nj2xg5b.zones.catalog.invalid. TXT\nsend\n' | nsupdate -y '$TSIG'" >/dev/null
+  sleep 2
+  after=$(serial_of 10.53.0.7 53 catalog.invalid.)
+  if [ -n "$after" ] && [ "$after" != "$before" ]; then
+    ok "BIND accepted the removal, catalog serial $before -> $after"
+  else
+    bad "BIND's catalog serial did not move after the delete (still $before)"
+    return
+  fi
+
+  if wait_serial 10.53.0.9 5353 catalog.invalid. "$after" 60; then
+    ok "rdnsd followed the catalog to $after"
+  else
+    bad "rdnsd did not follow the catalog to $after"
+    return
+  fi
+
+  # REFUSED, not NXDOMAIN: a zone we do not serve is not ours to deny
+  # (`CLAUDE.md` §8).
+  if wait_for 30 sh -c "$COMPOSE exec -T tools dig +timeout=3 -p 5353 @10.53.0.9 SOA member.test. | grep -q 'status: REFUSED'"; then
+    ok "rdnsd stopped serving member.test. (§5.3)"
+  else
+    bad "rdnsd still answers for member.test. after the catalog dropped it"
+    dig_ +noall +comments -p 5353 @10.53.0.9 SOA member.test. | sed 's/^/        | /'
+  fi
+  check "and the gauge fell to zero rather than going absent" \
+    'dns_catalog_members{catalog="catalog.invalid."} 0' \
+    <<< "$(scrape_metrics 10.53.0.9 | grep '^dns_catalog_members')"
+}
+
 s42a() {
   say "42a - DNS over TLS (RFC 7858), answered to somebody else's client"
 
@@ -1036,7 +1128,7 @@ all() {
   up
   versions
   contained
-  s43a; s43b; s43c; s43d; s43e; s42a
+  s43a; s43b; s43c; s43d; s43e; s43f; s42a
   report
 }
 
@@ -1052,9 +1144,10 @@ case "${1:-all}" in
   43c) s43c; report ;;
   43d) s43d; report ;;
   43e) s43e; report ;;
+  43f) s43f; report ;;
   42a) s42a; report ;;
   down) down ;;
   logs) shift; $COMPOSE logs "$@" ;;
   shell) $COMPOSE exec tools bash ;;
-  *) echo "usage: $0 {build|setup|up|contained|versions|43a|43b|43c|43d|43e|42a|all|down|logs|shell}"; exit 2 ;;
+  *) echo "usage: $0 {build|setup|up|contained|versions|43a|43b|43c|43d|43e|43f|42a|all|down|logs|shell}"; exit 2 ;;
 esac
