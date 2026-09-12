@@ -32,6 +32,8 @@ Authoritative (`rdnsd`):
   wildcards to any depth, empty non-terminals, NODATA against NXDOMAIN
 - AXFR (RFC 5936) and IXFR (RFC 1995) in both directions; secondary role with
   REFRESH/RETRY timers and EXPIRE
+- Catalog zones (RFC 9432), consumer side: the zones a catalog lists are
+  provisioned, removed and migrated between catalogs without an operator
 - NOTIFY (RFC 1996), sent and received
 - TSIG (RFC 8945), per-key zone scoping, signed error replies
 - Dynamic UPDATE (RFC 2136), TSIG-only, scoped per key, written back to the zone
@@ -301,10 +303,13 @@ UDP and TCP from one process, same host and port.
 | `--response-rate <BYTES_PER_SEC>` | UDP response bytes per client, default 8192, `0` disables |
 | `--query-rate <QUERIES_PER_SEC>` | per client, default 1000, `0` disables. With `--query-burst` (200) and `--query-rate-exempt`. Over the limit a query is dropped silently |
 | `--secondary <ZONE@MASTER[:PORT][#KEY]>` | replicate a zone. Repeatable; requires `--zone-dir` |
+| `--catalog <ZONE@MASTER[:PORT][#KEY]>` | consume a catalog zone (RFC 9432): replicate it, and serve the zones it lists from the same master. Repeatable; requires `--zone-dir` |
 | `--config <FILE>`, `--check-config` | read settings from TOML, and dry-run them. Mutually exclusive with the flags above |
 
-Nine of twenty-seven flags. `rdnsd --help` is the full list; `docs/CLI_USAGE.md`
-covers them individually and `docs/spec/06-operations.md` has every default.
+Nineteen of `rdnsd`'s forty-three flags, counted rather than remembered: the
+sentence here said "nine of twenty-seven" and both halves had gone stale.
+`rdnsd --help` is the full list; `docs/CLI_USAGE.md` covers them individually
+and `docs/spec/06-operations.md` has every default.
 
 ### `rdnsr` — recursive resolver
 

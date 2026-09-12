@@ -61,6 +61,10 @@ masters = ["192.0.2.9#partner.key."]
 also-notify = ["192.0.2.3"]     # added to [server].also-notify, for this zone
 nsec3 = true                    # overrides [signing] for this zone only
 validity-days = 7
+
+[zones."catalog.invalid."]
+masters = ["192.0.2.9#partner.key."]
+catalog = true                  # its members are served too — see 03 §3.10
 ```
 
 Rules the schema encodes:
@@ -76,6 +80,11 @@ Rules the schema encodes:
   `TsigKey::parse` rather than constructing keys directly.
 - A zone list requires the algorithm spelled out, because a fourth
   colon-separated field collides with `[alg:]name:secret` at three fields.
+- `catalog = true` needs masters: a catalog is consumed by replicating it, and
+  one served from a local file is an ordinary zone this server produces. A
+  catalog is in the catalog list and *not* also in the secondary list — startup
+  adds it to the second itself, and a zone in both would be two refresh tasks
+  asking one master the same question.
 
 ### Secret files
 
@@ -86,9 +95,14 @@ world-readable file.
 
 ### `--check-config`
 
-Reads the config, reads and mode-checks every secret, loads every zone, signs
-every zone and verifies every signature, and exits without binding a socket.
-Exit 0 means the server would start.
+Reads the config, reads and mode-checks every secret, resolves every TSIG key
+name a `--secondary` or `--catalog` spec gives, loads every zone, signs every
+zone and verifies every signature, and exits without binding a socket. Exit 0
+means the server would start.
+
+Member zones of a catalog are not among the zone count it reports: they arrive
+with the catalog, so what a dry run can check is that the catalog itself is
+configured and that its key resolves.
 
 ---
 
@@ -159,6 +173,15 @@ zone lookup (tens of microseconds).
   `forget_zone`.
 - Gauges are written where the fact changes, not sampled at scrape time.
 - Label values are escaped: RFC 1035 §5.1 allows escapes in a zone name.
+
+### Per-catalog gauge
+
+`dns_catalog_members{catalog=...}` — how many member zones each consumed catalog
+has this server serving (see `03-authoritative-server.md` §3.10). Zero is a real
+value here and is reported: RFC 9432 §6's failure is a producer emptying a
+catalog, and the count falling to zero is what an alert fires on. Absent means
+no catalog of that name has been read yet — one configured and never
+transferred has no series, which `absent()` is the question for.
 
 ### The two alerts worth having
 

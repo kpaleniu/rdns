@@ -37,10 +37,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#44** (44b done), **#45**, **#47** and **#21**, as of 2026-09-12. #44 is what
-an operator would find missing in `rdnsd`, #45 what an ISP would find missing in
-`rdnsr`, #47 is the one gap 44b left behind, and #21 is an inventory of
-deliberate deviations rather than a queue. Everything else numbered is closed;
+**#44** (44a and 44b done), **#45**, **#47**, **#48** and **#21**, as of
+2026-09-12. #44 is what an operator would find missing in `rdnsd`, #45 what an
+ISP would find missing in `rdnsr`, #47 is the one gap 44b left behind, #48 the
+one 44a left, and #21 is an inventory of deliberate deviations rather than a
+queue. Everything else numbered is closed;
 the table under "Closed work" says which, when, and where the reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
@@ -807,7 +808,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#44** (44b done), **#45**, **#47** and **#21** — see "What is open" above,
+**#44** (44a and 44b done), **#45**, **#47**, **#48** and **#21** — see
+"What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -834,8 +836,10 @@ Then, in order and for stated reasons:
    operator notices first.~~ **Done 2026-09-12.** It was the one an operator
    notices first and it was not the smallest; the row says what the difference
    cost.
-2. **44a**, catalog zones — the row that moves the answer from "a nice server"
-   to "a server I could run a fleet of".
+2. ~~**44a**, catalog zones — the row that moves the answer from "a nice server"
+   to "a server I could run a fleet of".~~ **Done 2026-09-12**, the consumer
+   side; the producer side needed no code, because a catalog is an ordinary
+   zone. Left behind: **#48**.
 3. ~~**#42's stages**: 42a first, because it costs 7 packages and both of the
    others are built on it; 42b next, because `quinn` supplies streams and
    RFC 9250's framing is `rdns::framed` already; 42c last and largest, because
@@ -925,7 +929,7 @@ missing is the operational surface around the answering, which is the same shape
 
 | | | |
 |---|---|---|
-| **44a** | catalog zones (RFC 9432, "DNS Catalog Zones") — **0 hits** | The largest one. A catalog zone is an ordinary zone whose contents are the *list* of zones a secondary should serve, so provisioning becomes a transfer rather than a configuration-management problem. BIND, Knot, NSD and PowerDNS all implement it. Below a handful of zones nobody misses it; somewhere around a hundred, configuring each secondary by hand stops being possible, and that is where an evaluation ends. This tree is unusually well placed for it — the consumer side is an AXFR, a parse and `install_zone`, all of which exist |
+| ~~**44a**~~ | ~~catalog zones (RFC 9432, "DNS Catalog Zones") — **0 hits**~~ **Done 2026-09-12**, two commits: the parse in `rdns::catalog`, then `--catalog` and the provisioning in `rdnsd` | ~~The largest one. A catalog zone is an ordinary zone whose contents are the *list* of zones a secondary should serve, so provisioning becomes a transfer rather than a configuration-management problem. BIND, Knot, NSD and PowerDNS all implement it. Below a handful of zones nobody misses it; somewhere around a hundred, configuring each secondary by hand stops being possible, and that is where an evaluation ends. This tree is unusually well placed for it — the consumer side is an AXFR, a parse and `install_zone`, all of which exist~~ **The placement held and the sizing did not.** The AXFR, the parse and `install_zone` were indeed free; what the row did not see is that provisioning is a *diff*, and a diff needs a third thing the catalog does not contain — which zones this server provisioned last time, and under which member node. §5.3 makes removal conditional on the first and §5.4 makes a reset conditional on the second, so both had to become a sidecar (`rdnsd.catalog`) with the same rule the transfer state has: forgetting it serves a withdrawn zone with AA set. Two things the filing did not see either — the registry of replicated zones was a `HashMap` built once at startup, so membership changing at runtime made it a type with a lock and a `retire`, and that turned up a defect of its own: the reload's EXPIRE check read a list of `--secondary` specs fixed at startup, which a catalog's members would never have joined. And RFC 9432 §6 is worth reading before deploying it: an empty catalog from a buggy producer deletes every member zone, which is why removals are WARN and why `dns_catalog_members` exists. Left behind: **#48** |
 | ~~**44b**~~ | ~~Extended DNS Errors (RFC 8914) — **0 hits**~~ **Done 2026-09-12**, two commits: `rdnsd`'s eight refusal sites, then the resolver's SERVFAILs and `rdnsc`'s printing of what it receives | ~~Small, and the highest value per line on this page. A bare SERVFAIL is a support ticket; the same SERVFAIL carrying EDE 6 (DNSSEC Bogus) or EDE 7 (Signature Expired) is a fixed problem. It is an EDNS option, the option list already round-trips, and the RCODE space is already a data-carrying type. Its absence is also a *signal* — it reads as software written by somebody who has not had to debug DNS at 3am~~ **Every clause held except "small".** The option and `rdnsd`'s half are small; the resolver's half is what the row was actually asking for, and it cost a type — the reason a check found had to be carried up to the reply, so `RrsetProof::Bogus`, `ValidationState::Bogus` and `DelegationVerdict::Bogus` all took a `dnssec::Bogus { code, why }` in place of a `String`, at 24 construction sites. That is §17's argument arriving from the other direction: the code is not derivable at the top, so it has to be in the type at the bottom. Two things the filing did not see — EXTRA-TEXT is `&'static str`, because `Bogus::why` names a zone, an owner and a key tag that all came out of an answer a stranger sent, and reflecting those to another stranger is how §2's "leak no private information" breaks quietly; and `rdnsc` sent an OPT only under `--dnssec`, so the tree's own probe could not see the thing the tree had just learned to send. Left behind: **#47** |
 | **44c** | no measurement above a test zone | Not a feature, an **evidence** gap, and the first question an operator asks. `bench_zone_lookup` builds 10,000 records and the largest zone file in the tree is a dozen lines. Unmeasured: load time and memory for a zone of a million records, signing time at that size, how many zones one process holds, and what reloading all of them costs. §10's rules apply — this is a measurement to *take*, and the number it produces is the row's real content |
 | **44d** | XFR over TLS (RFC 9103, "DNS Zone Transfer over TLS") — **0 hits** | Zone contents cross the wire in clear between primary and secondary, which for anything with private names is the objection. Cheap *after* #42a: the rustls setup, the certificate plumbing and the ALPN dispatch are the same, and a transfer is already framed TCP. Worth taking as a fourth stage of #42 rather than on its own |
@@ -976,6 +980,60 @@ NOTAUTH — so it is `rdnsd`'s function alone and can grow a parameter without
 touching another daemon. #43's interop harness is what would show a real
 sender's reaction; none of its 112 assertions covers this, because the NOTIFY it
 exercises is accepted.
+
+---
+
+### 48. A catalog's `group` property is read and not acted on — **filed 2026-09-12**
+
+Left behind by 44a, with a number because 44a's own row would otherwise be the
+only place it is written down (`CLAUDE.md` §18).
+
+`rdns::catalog` parses the `group` property (RFC 9432 §4.3.2) and
+`CatalogMember::groups` hands the values over; `rdnsd` logs them beside the
+member it is provisioning and does nothing else. Every member of every catalog
+is therefore replicated the same way: from the catalog's master, with the
+catalog's key.
+
+That is legal — §4.3 makes every member property optional and §4.3.2 leaves "the
+exact handling of the group property value ... to the consumer's implementation
+and configuration" — and it is not useful. The group is how a producer says *how*
+a member should be treated, which for this server would be: a different master
+or key, whether to sign it, what to NOTIFY about it.
+
+What it needs is the half that does not exist: a per-group configuration to map
+a value onto. The shape §4.3.2 asks for is explicit — "Implementations MAY
+facilitate mapping of a specific group value to a specific configuration
+configurable *on a per catalog zone basis*" — so it is a table under the
+catalog's own `[zones.*]` entry rather than a global one, because a producer may
+publish one catalog to several consumer operators who each agreed different
+values:
+
+```toml
+[zones."catalog.invalid."]
+masters = ["192.0.2.1#transfer.key"]
+catalog = true
+[zones."catalog.invalid.".groups."operator-x-signed"]
+masters = ["192.0.2.9#other.key"]
+```
+
+Three things to settle before writing it, none of which 44a had to:
+
+- **A member may carry several group values** (§4.3.2), and "the consumer ...
+  MAY choose to process all, some, or none of them". Two matching groups naming
+  different masters is a conflict with no right answer in the RFC, so the config
+  has to define one — refusing the member and logging it is the only answer that
+  is not a silent choice about what is being served (`CLAUDE.md` §15).
+- **A group value is octets, not text.** `CatalogMember::groups` keeps bytes for
+  the reason `ParsedRecord::TXT` does, and a TOML key is a `String`; the
+  comparison has to be the byte one, with the config key's UTF-8 encoding as the
+  needle.
+- **Changing a member's group is a reconfiguration, not a re-add.** §5.4's reset
+  is about the member *node* label; a group change under the same label means
+  the same zone fetched differently, so the sidecar has to record which group
+  was in force or the change is invisible to the next reconcile.
+
+Not urgent: a fleet with one class of member zone — which is the ordinary case
+and the one 44a's row was about — never writes a group at all.
 
 ---
 

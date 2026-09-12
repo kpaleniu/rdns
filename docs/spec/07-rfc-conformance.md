@@ -55,7 +55,7 @@ each row exists (`CLAUDE.md` §11).
 | 7858 | DNS over TLS | **yes**, both daemons — `TODO.md` #42a. Port 853, ALPN `dot`, one certificate re-read on every reload. No client certificates, and `notAfter` is not parsed: see `rdns-transport/src/tls.rs` | `rdns_transport::tls` |
 | 9250 | DNS over QUIC | **yes**, both daemons — `TODO.md` #42b. Port 853/udp, ALPN `doq`, one query per bidirectional stream framed as on TCP. The Message ID is echoed, never checked: the stream has already paired request with response | `rdns_transport::quic` |
 | 8484 | DNS over HTTPS | **yes**, both daemons — `TODO.md` #42c. 443, `/dns-query` by default, POST and GET, `Cache-Control` from the answer's smallest TTL. HTTP/2 preferred by ALPN with HTTP/1.1 behind it. A zone transfer cannot go over it and the module says why | `rdns_transport::https` |
-| 9432 | catalog zones | no — filed as `TODO.md` #44a | — |
+| 9432 | catalog zones | **the consumer side** (2026-09-12): §4's whole schema incl. `coo` and `group`, §5.1's broken-catalog rule, §5.2's clash rule, §5.3's removal, §5.4's state reset, §4.3.1's migration. Group values are read and not acted on (`TODO.md` #48). The producer side needs no code — a catalog is an ordinary zone | `rdns/src/catalog.rs`, `rdnsd/src/catalog.rs` |
 | 8914 | Extended DNS Errors | no — filed as `TODO.md` #44b | — |
 | 9103 | zone transfer over TLS | no — filed as `TODO.md` #44d, a fourth stage of #42 | — |
 | 8901 | multi-signer DNSSEC | no — filed as `TODO.md` #44e | — |

@@ -494,6 +494,77 @@ why; `rdnsctl reload` exits 1 with the parse error.
 
 ---
 
+## 3.10 Catalog zones (RFC 9432) — the consumer side
+
+`--catalog zone@master[:port][#key]`, or `catalog = true` on a `[zones.*]` table
+with masters. Requires `--zone-dir`. `rdns/src/catalog.rs` reads a catalog;
+`rdnsd/src/catalog.rs` acts on it.
+
+The catalog is a replicated zone like any other (§5.1), so §3.6 is the whole of
+how it arrives. `--catalog` adds the reading, and adds nothing to the transfer.
+
+### What is read (`rdns::catalog::Catalog::from_zone`)
+
+| node | type | meaning |
+|---|---|---|
+| `version.$CATZ` | TXT | schema version; exactly one RR, value `"2"` (§4.2.1) |
+| `<unique-N>.zones.$CATZ` | PTR | a member zone; exactly one RR (§4.1) |
+| `group.<unique-N>.zones.$CATZ` | TXT | group values, read and not acted on (§4.3.2) |
+| `coo.<unique-N>.zones.$CATZ` | PTR | change of ownership; exactly one RR (§4.3.1) |
+| anything else | — | ignored (§3), including `*.ext` custom properties (§4.4) |
+
+Labels are matched ASCII-case-insensitively (RFC 4343). A TXT value is the
+record's whole RDATA, its character-strings joined, which is what §4.3.2's
+`"operator-y" "bar"` example means. The TTL is ignored (§4.1) and the class
+cannot be anything but IN, because the zone parser refuses another class.
+
+Anything else is a **broken catalog**: `BrokenCatalog`, which is not an error
+about the zone — §5.1 lets a broken catalog load and transfer as a regular zone.
+A broken catalog changes nothing (§5.1): the membership in force stands, is
+logged at WARN, and processing resumes at the next transfer that fixes it. That
+is why `from_zone` returns an error rather than a partial member list; a partial
+list is exactly the shape that would reconfigure something.
+
+### What is done about it (`Catalogs::reconcile`)
+
+After every successful refresh of every replicated zone, and once at startup for
+each catalog already on disk. A catalog whose serial has not moved since the last
+reconcile is a lookup and nothing else.
+
+| the catalog says | this server does | RFC |
+|---|---|---|
+| a member it has not got | replicate it from the catalog's master, with the catalog's key | §5.1 |
+| a member under a new `<unique-N>` | remove, state and all, then immediately re-add | §5.4 |
+| a member the configuration names, or another catalog holds | ignore it, log an error | §5.2 |
+| a member another catalog hands over with `coo` | take it, keeping its state if the node label matches | §4.3.1 |
+| nothing, where it listed a member | stop serving it, delete its zone file, its transfer state and its membership row | §5.3 |
+
+A removal is logged at WARN, and `dns_catalog_members{catalog="..."}` is the
+gauge to alert on — §6's failure mode is a producer emptying a catalog and
+taking every member off a fleet within seconds.
+
+### The membership sidecar
+
+`rdnsd.catalog`, beside `rdnsd.state` in `--zone-dir`. One line per member: the
+zone, then the member node it came from (`<unique-N>.zones.$CATZ`, which carries
+both the label §5.4 turns on and the catalog §5.3 turns on). Presentation form,
+so whatever octets a producer chose for `<unique-N>` survive.
+
+It is the only record of which catalog a zone came from, and losing it is not
+fatal: a member whose row is gone reads as a zone nothing claims, so it is left
+alone rather than removed, and the clash is logged. That direction is chosen —
+the other one replicates over a file the operator wrote.
+
+### What is not implemented
+
+- Group properties are read, logged and not acted on. §4.3.2 leaves their
+  handling to the consumer, and there is no per-group configuration here to map
+  them onto. `TODO.md` #48.
+- The producer side needs no code: a catalog zone is an ordinary zone, so
+  `rdnsd` already serves and transfers one written by hand or by a script.
+
+---
+
 ## 3.9 The control socket
 
 `--control-socket <path>`, Unix only — `tokio` has no `UnixListener` on Windows,
