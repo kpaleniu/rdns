@@ -208,11 +208,12 @@ impl Catalog {
     }
 
     /// The member naming this zone, if the catalog lists it.
+    ///
+    /// A scan: a consumer diffing a whole catalog iterates [`Catalog::members`]
+    /// and builds its own index, and this is for the handful of one-off
+    /// questions — "does the catalog still list it" — around that.
     pub fn member(&self, zone: NameRef<'_>) -> Option<&CatalogMember> {
-        let wanted = zone.folded();
-        self.members
-            .iter()
-            .find(|m| m.zone.as_ref().folded() == wanted)
+        self.members.iter().find(|m| m.zone.as_ref() == zone)
     }
 }
 

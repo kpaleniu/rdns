@@ -144,6 +144,11 @@ pub struct Counters {
     /// Unbounded is safe here — the keys are configured zone names, not
     /// anything a client puts on the wire.
     zones: RwLock<BTreeMap<NameKeyBuf, ZoneGauge>>,
+    /// How many member zones each consumed catalog has this server serving
+    /// (RFC 9432). Separate from `zones` because a catalog is not a zone fact:
+    /// the catalog zone itself has a serial and a last-transfer time like any
+    /// other, and this counts what it provisioned.
+    catalogs: RwLock<BTreeMap<NameKeyBuf, usize>>,
 
     // Record type counters
     pub queries_type_a: AtomicU64,
@@ -178,6 +183,7 @@ impl DnsMetrics {
             quic_handshakes: AtomicU64::new(0),
             quic_handshake_failures: AtomicU64::new(0),
             zones: RwLock::new(BTreeMap::new()),
+            catalogs: RwLock::new(BTreeMap::new()),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             latency_count: AtomicU64::new(0),
             latency_sum_us: AtomicU64::new(0),
@@ -266,6 +272,22 @@ impl DnsMetrics {
             return;
         };
         zones.remove(zone.folded().as_ref());
+    }
+
+    /// Record how many member zones `catalog` currently has this server
+    /// serving.
+    ///
+    /// The number an operator alerts on: RFC 9432 §6 is explicit that a
+    /// producer's mistake can take every member zone off a whole fleet at once
+    /// ("millions of member zones may get deleted from their secondaries within
+    /// seconds"), and a count that falls off a cliff is how that is seen before
+    /// the queries stop.
+    pub fn set_catalog_members(&self, catalog: NameRef<'_>, members: usize) {
+        let Ok(mut catalogs) = self.catalogs.write() else {
+            // As above: a poisoned lock costs a stale gauge.
+            return;
+        };
+        catalogs.insert(NameKeyBuf::new(catalog), members);
     }
 
     /// Snapshot of each zone's serial and last contact with a master.
@@ -554,6 +576,26 @@ impl DnsMetrics {
                     output.push_str(&format!(
                         "dns_zone_last_refresh_timestamp_seconds{{zone=\"{}\"}} {at}\n",
                         escape_label(&zone.to_string())
+                    ));
+                }
+            }
+        }
+
+        if let Ok(catalogs) = self.catalogs.read() {
+            if !catalogs.is_empty() {
+                output.push_str(
+                    "# HELP dns_catalog_members                      Member zones provisioned from a consumed catalog zone
+",
+                );
+                output.push_str(
+                    "# TYPE dns_catalog_members gauge
+",
+                );
+                for (catalog, members) in catalogs.iter() {
+                    output.push_str(&format!(
+                        "dns_catalog_members{{catalog=\"{}\"}} {members}
+",
+                        escape_label(&catalog.to_string())
                     ));
                 }
             }

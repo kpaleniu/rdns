@@ -562,8 +562,9 @@ pub(crate) fn validate_zone_source(
 ) -> Result<ZoneSource> {
     if replicating && zone_dir.is_none() {
         return Err(anyhow!(
-            "--secondary needs --zone-dir: a transferred zone is written to disk, \
-             and --zone-file names one file rather than somewhere to put them",
+            "--secondary and --catalog need --zone-dir: a transferred zone is \
+             written to disk, and --zone-file names one file rather than \
+             somewhere to put them",
         ));
     }
     match (zone_file, zone_dir) {

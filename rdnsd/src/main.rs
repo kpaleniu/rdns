@@ -17,6 +17,8 @@
 //! two modules down.
 
 mod answer;
+/// Consuming catalog zones: what `--catalog` provisions (RFC 9432).
+mod catalog;
 mod config;
 /// Control socket. Needs a Unix domain socket, so Unix only.
 #[cfg(unix)]
@@ -31,11 +33,12 @@ mod response_size;
 mod testutil;
 mod zones;
 
+use catalog::{parse_catalog_specs, Catalogs};
 use replication::{
-    parse_secondary_specs, spawn_secondaries, withdraw_unvouched_zones, ReplicationContext,
-    Secondaries,
+    parse_secondary_specs, resolve_key, spawn_secondaries, withdraw_unvouched_zones,
+    ReplicationContext, Secondaries,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,7 +61,7 @@ use rdns::{
     metrics::DnsMetrics,
     notify::{self, NotifyOutcome, NotifyPeer, NotifyPolicy},
     readiness::Readiness,
-    secondary::{state_file_path, MasterSpec, StateFile},
+    secondary::{state_file_path, StateFile},
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl},
     shutdown::{next_reload, reload_signal, Busy, Lifecycle, Shutdown, Stop},
     socket::bind_addr_for,
@@ -192,6 +195,19 @@ struct Cli {
         conflicts_with = "config"
     )]
     secondary: Vec<String>,
+    /// A catalog zone to consume: `zone@master[:port][#tsig-key-name]`,
+    /// repeatable.
+    ///
+    /// The catalog is replicated like any other zone, and the zones it lists
+    /// (RFC 9432) are then served as secondaries of the same master, signed
+    /// with the same key. A zone the catalog stops listing stops being served
+    /// and its file is deleted. Requires `--zone-dir`.
+    #[arg(
+        long,
+        value_name = "ZONE@MASTER[:PORT][#KEY]",
+        conflicts_with = "config"
+    )]
+    catalog: Vec<String>,
     /// A directory of `.rdnskey` signing keys.
     ///
     /// A zone whose apex matches a key here is signed in memory as it loads.
@@ -513,7 +529,7 @@ struct Server {
     transfer_acl: Arc<TransferAcl>,
     tsig_keys: Arc<TsigKeyring>,
     /// The zones we replicate, so a NOTIFY can be told from a plausible one.
-    secondaries: Secondaries,
+    secondaries: Arc<Secondaries>,
     /// Per-zone change history, so an IXFR can answer with the difference.
     /// Derived from the zone map, so the two are only updated together.
     deltas: Arc<RwLock<DeltaLog>>,
@@ -630,10 +646,11 @@ struct TlsPolicy {
 struct ControlPolicy {
     socket: Option<PathBuf>,
     reloads: mpsc::Sender<ReloadTrigger>,
-    /// Zones this server replicates, so `status` says `secondary` from
-    /// configuration rather than guessing from an absent timestamp, which a
-    /// primary also has.
-    replicated: Vec<String>,
+    /// Zones this server replicates, so `status` says `secondary` from what is
+    /// being replicated rather than guessing from an absent timestamp, which a
+    /// primary also has. The live registry, because a catalog's members are
+    /// replicated and arrive after startup (`TODO.md` #44a).
+    secondaries: Arc<Secondaries>,
     /// For `status`'s uptime. Taken in `main`, not here: loading and signing
     /// every zone happens before `serve` and is the bulk of a big start.
     started: Instant,
@@ -644,7 +661,7 @@ async fn serve(
     addr: &str,
     zone_map: Arc<RwLock<Zones>>,
     policy: ServePolicy,
-    secondaries: Secondaries,
+    secondaries: Arc<Secondaries>,
     deltas: Arc<RwLock<DeltaLog>>,
     shutdown: Shutdown,
     metrics: Arc<DnsMetrics>,
@@ -933,7 +950,7 @@ async fn serve(
         let ControlPolicy {
             socket,
             reloads,
-            replicated,
+            secondaries,
             started,
         } = control;
         loops.spawn(control::serve(
@@ -946,7 +963,7 @@ async fn serve(
                     metrics: server.ctx.metrics.clone(),
                     journal: server.journal.clone(),
                 },
-                replicated,
+                secondaries,
                 reloads,
                 started,
                 listen: addr.to_string(),
@@ -1068,8 +1085,12 @@ struct Reloading {
     /// The zones we replicate, and the directory their state sidecar lives in.
     /// A reload re-reads every `.zone` file from disk, so it can resurrect a zone
     /// that was withdrawn for EXPIRE — these are what let it be withdrawn again.
-    /// Empty for a server that is nobody's secondary.
-    secondaries: Vec<MasterSpec>,
+    ///
+    /// The live registry rather than the `--secondary` specs: a catalog's
+    /// members are replicated zones whose files are in the same directory, and
+    /// a list fixed at startup would let a reload serve one of those with AA set
+    /// however long its master had been unreachable (`TODO.md` #44a).
+    secondaries: Arc<Secondaries>,
     zone_dir: Option<PathBuf>,
     signing: Option<Arc<ZoneSigning>>,
     validator: Arc<DnssecValidator>,
@@ -1115,10 +1136,11 @@ impl Reloading {
         let Some(zone_dir) = &self.zone_dir else {
             return;
         };
-        if self.secondaries.is_empty() {
+        let specs = self.secondaries.specs();
+        if specs.is_empty() {
             return;
         }
-        withdraw_unvouched_zones(&self.secondaries, served, zone_dir).await;
+        withdraw_unvouched_zones(&specs, served, zone_dir).await;
     }
 }
 
@@ -1707,7 +1729,23 @@ async fn main() -> Result<()> {
         TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
     );
 
-    let secondary_specs = parse_secondary_specs(&cli.secondary)?;
+    let mut secondary_specs = parse_secondary_specs(&cli.secondary)?;
+    // A catalog is replicated by the same machinery as any other zone
+    // (RFC 9432 §5.1), so it joins the list rather than growing a second one:
+    // the refresh timers, the NOTIFY handling, the EXPIRE withdrawal and the
+    // file on disk are then the ones that are already tested.
+    let catalog_specs = parse_catalog_specs(&cli.catalog)?;
+    // Here rather than where the refresh tasks start, which is after
+    // `--check-config` has already answered: a dry run has to run everything
+    // that does not bind a socket (`CLAUDE.md` §15), and a spec naming a key no
+    // `--tsig-key` defines is a startup failure either way.
+    for spec in secondary_specs.iter() {
+        resolve_key(spec, &tsig_keys, "--secondary")?;
+    }
+    for spec in catalog_specs.iter() {
+        resolve_key(spec, &tsig_keys, "--catalog")?;
+    }
+    secondary_specs.extend(catalog_specs.iter().cloned());
 
     let replicating = !secondary_specs.is_empty();
     // Read before the source is taken apart, which consumes the two path
@@ -1763,8 +1801,15 @@ async fn main() -> Result<()> {
         // not be able to take away the output of a command whose entire job is
         // to produce it.
         println!(
-            "configuration is valid: {} zone(s), {} TSIG key(s), signing {}, encrypted transports {}",
+            "configuration is valid: {} zone(s){}, {} TSIG key(s), signing {}, encrypted transports {}",
             zones.len(),
+            // Said out loud because the member zones are not among the count
+            // above: they arrive with the catalog, and what a dry run can check
+            // is that the catalog itself is configured and its key resolves.
+            match catalog_specs.len() {
+                0 => String::new(),
+                n => format!(", {n} catalog(s) to consume"),
+            },
             cli.tsig_key.len(),
             match &signing {
                 Some(s) => format!("{} zone(s)", s.signed_zone_count(&zones)),
@@ -1824,24 +1869,21 @@ async fn main() -> Result<()> {
     // Before anything is served: a replicated zone whose copy on disk went out
     // of contact past its EXPIRE is not ours to answer for, however recently the
     // process started.
-    let mut reload_secondaries: Vec<MasterSpec> = Vec::new();
     let mut reload_zone_dir: Option<PathBuf> = None;
     // Filled in below for a secondary. A primary's is empty and it is ready as
     // soon as it is alive: every zone it serves was loaded, signed and verified
     // above, and a failure in any of that stopped the start rather than reaching
     // here.
     let mut readiness = Readiness::ready();
-    let secondaries = if secondary_specs.is_empty() {
-        Arc::new(HashMap::new())
-    } else {
+    let secondaries = Arc::new(Secondaries::default());
+    if !secondary_specs.is_empty() {
         let ZoneSource::Directory(dir) = &source else {
             // `validate_zone_source` has already refused this combination; this
             // is the compiler being told so.
-            return Err(anyhow!("--secondary requires --zone-dir"));
+            return Err(anyhow!("--secondary and --catalog require --zone-dir"));
         };
         let zone_dir = PathBuf::from(dir);
         withdraw_unvouched_zones(&secondary_specs, &served, &zone_dir).await;
-        reload_secondaries = secondary_specs.clone();
         reload_zone_dir = Some(zone_dir.clone());
 
         // What we are configured to answer for but do not hold — asked *after*
@@ -1859,32 +1901,60 @@ async fn main() -> Result<()> {
             )
         };
 
+        // What a catalog may not take over (RFC 9432 §5.2): the zones the
+        // configuration names, and the zones already on disk that no catalog
+        // says are its.
+        let held: Vec<Name> = {
+            let zones = zone_map.read().await;
+            zones.keys().map(|key| key.as_name().to_owned()).collect()
+        };
+        let catalogs = Catalogs::new(
+            catalog_specs,
+            &tsig_keys,
+            secondary_specs
+                .iter()
+                .map(|spec| rdns::name_keys::NameKeyBuf::new(spec.zone.as_ref()))
+                .collect(),
+            held,
+            &zone_dir,
+            secondaries.clone(),
+        )?;
+
         let replication = ReplicationContext {
             served: served.clone(),
             state: Arc::new(Mutex::new(StateFile::load(&state_file_path(&zone_dir)))),
             zone_dir,
             notify: notify.clone(),
             readiness: readiness.clone(),
+            catalogs: catalogs.clone(),
         };
+        // Before the tasks start and before anything is served: the members a
+        // previous run provisioned are on disk too, and their refresh tasks do
+        // not exist until their catalog is reconciled below.
+        catalogs.vouch_for_members(&replication).await;
+
         spawn_secondaries(
             secondary_specs,
             &tsig_keys,
-            replication,
-            shutdown.lifecycle(),
-        )?
-    };
+            &replication,
+            &shutdown.lifecycle(),
+            &secondaries,
+        )?;
+
+        // The members of every catalog we already hold a copy of. A reload does
+        // not repeat this: a catalog reaches a consumer by transfer, and the
+        // refresh task reconciles what it installs, so the only thing a SIGHUP
+        // re-reads is the file that transfer wrote.
+        for zone in catalogs.zones() {
+            catalogs
+                .reconcile(zone.as_ref(), &replication, &shutdown.lifecycle())
+                .await;
+        }
+    }
 
     // A zone that has just been loaded is news to every secondary, which is why
     // this runs at startup and not only on reload.
     let announced = announce_zones(&zone_map, &[], &notify, &shutdown.busy()).await;
-
-    // Which zones are replicated, before `reload_secondaries` is moved into
-    // `Reloading`. `status` reports the role from the configuration rather than
-    // inferring it from an absent last-contact time, which a primary also has.
-    let replicated: Vec<String> = reload_secondaries
-        .iter()
-        .map(|spec| spec.zone.as_ref().to_presentation())
-        .collect();
 
     // What a dynamic UPDATE needs, taken before `source` and `signing` are moved
     // into the maintenance task. It holds the same two things that task does, on
@@ -1907,7 +1977,7 @@ async fn main() -> Result<()> {
             reloading: Reloading {
                 replicating,
                 allow_partial: cli.allow_partial_load,
-                secondaries: reload_secondaries,
+                secondaries: secondaries.clone(),
                 zone_dir: reload_zone_dir,
                 signing,
                 validator,
@@ -1954,7 +2024,7 @@ async fn main() -> Result<()> {
             control: ControlPolicy {
                 socket: cli.control_socket,
                 reloads,
-                replicated,
+                secondaries: secondaries.clone(),
                 started,
             },
         },
@@ -2044,7 +2114,7 @@ mod tests {
     use crate::testutil::{make_response, nm, query, zkey, ScratchDir};
     use crate::zones::{enumerate_zone_files, plan_reload, zone_key};
     use rdns::record_types;
-    use rdns::secondary::{zone_file_path, RefreshTimers, TransferState};
+    use rdns::secondary::{zone_file_path, MasterSpec, RefreshTimers, TransferState};
     use rdns::tsig::{TsigAlgorithm, TsigKey};
     use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
     use rdns::Class;
@@ -2052,6 +2122,7 @@ mod tests {
     use rdns::{OpCode, Qtype, ResponseCode, Ttl};
     use rdns_transport::tcp::Reply;
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::net::{IpAddr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -2332,7 +2403,7 @@ mod tests {
             journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl")),
             tsig_keys: Arc::new(TsigKeyring::new(keys)),
-            secondaries: Arc::new(HashMap::new()),
+            secondaries: Arc::new(Secondaries::default()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
             updates: Arc::new(UpdateHandling::disabled()),
         })
@@ -3161,7 +3232,7 @@ mod tests {
             ctx: test_context(),
             transfer_acl: Arc::new(TransferAcl::parse(acl).expect("acl")),
             tsig_keys: Arc::new(keys),
-            secondaries: Arc::new(HashMap::new()),
+            secondaries: Arc::new(Secondaries::default()),
             deltas: Arc::new(RwLock::new(log)),
             updates: Arc::new(UpdateHandling::disabled()),
             journal: None,
@@ -3217,7 +3288,7 @@ mod tests {
             ctx: test_context(),
             transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
             tsig_keys: Arc::new(TsigKeyring::new(vec![key])),
-            secondaries: Arc::new(HashMap::new()),
+            secondaries: Arc::new(Secondaries::default()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
             updates: Arc::new(UpdateHandling {
                 source: Some(source),
@@ -3659,6 +3730,20 @@ mod tests {
         );
     }
 
+    /// A consumer of no catalogs, for the refresh tests: they are about the
+    /// transfer, and `--catalog` adds nothing to it until a catalog arrives.
+    fn no_catalogs() -> Arc<crate::catalog::Catalogs> {
+        crate::catalog::Catalogs::new(
+            Vec::new(),
+            &TsigKeyring::default(),
+            std::collections::HashSet::new(),
+            Vec::new(),
+            Path::new("."),
+            Arc::new(Secondaries::default()),
+        )
+        .expect("no specs, nothing to resolve")
+    }
+
     /// The replication context a refresh runs in, over a scratch directory.
     fn replication(dir: &ScratchDir, notify: NotifyPolicy) -> ReplicationContext {
         ReplicationContext {
@@ -3674,6 +3759,7 @@ mod tests {
             // Nothing here probes `/readyz`; `readiness::tests` is where the
             // latch itself is checked.
             readiness: Readiness::ready(),
+            catalogs: no_catalogs(),
         }
     }
 
@@ -3881,6 +3967,7 @@ mod tests {
             zone_dir: dir.path().to_path_buf(),
             notify: Arc::new(NotifyPolicy::default()),
             readiness: Readiness::ready(),
+            catalogs: no_catalogs(),
         };
         expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
         assert!(
@@ -3933,6 +4020,7 @@ mod tests {
             zone_dir: dir.path().to_path_buf(),
             notify: Arc::new(NotifyPolicy::default()),
             readiness: Readiness::ready(),
+            catalogs: no_catalogs(),
         };
         expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
         assert_eq!(zone_map.read().await.len(), 1, "still served");
@@ -4924,7 +5012,7 @@ mod tests {
             let reloading = Reloading {
                 replicating: false,
                 allow_partial: false,
-                secondaries: Vec::new(),
+                secondaries: Arc::new(Secondaries::default()),
                 zone_dir: Some(dir.path().to_path_buf()),
                 signing: None,
                 validator: Arc::new(DnssecValidator::new(false)),
@@ -4991,7 +5079,7 @@ mod tests {
             journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
             tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
-            secondaries: Arc::new(HashMap::new()),
+            secondaries: Arc::new(Secondaries::default()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
             updates: Arc::new(UpdateHandling::disabled()),
         };

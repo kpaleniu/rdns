@@ -46,23 +46,191 @@ use rdns::Serial;
 use crate::announce_transfer;
 use crate::zones::{install_zone, ZoneContext, Zones};
 
-/// One replicated zone, as a NOTIFY needs to see it.
+/// One refresh task: what it replicates, and the two handles that steer it.
+pub(crate) struct RefreshTask {
+    /// The zone and the master it asks, kept so the registry can say what this
+    /// server is currently replicating.
+    ///
+    /// The alternative was the second list that already existed — the
+    /// `--secondary` specs, fixed at startup, which `Reloading` held. A
+    /// catalog's members would never have joined it, so a reload would re-read a
+    /// member's file from disk and serve it with AA set whatever its age, and
+    /// the two lists would have had to be kept in step by hand (`CLAUDE.md` §7).
+    spec: MasterSpec,
+    /// A NOTIFY arriving cuts the wait short.
+    wake: Arc<Notify>,
+    /// Held rather than dropped, so a task can be stopped. Dropping a
+    /// `JoinHandle` detaches the task and cancels nothing (`CLAUDE.md` §9), and
+    /// a catalog that drops a member has to stop asking its master about it.
+    ///
+    /// `None` only in a registry a test built: what those check is what the
+    /// registry answers, and there is no runtime under them to have spawned on.
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// One replicated zone: one refresh task per master, since each is on its own
+/// timer.
+#[derive(Default)]
 pub(crate) struct ReplicatedZone {
-    /// The only addresses a NOTIFY for this zone is believed from.
-    pub(crate) masters: Vec<IpAddr>,
-    /// One per refresh task, since a zone may have several masters and each is
-    /// checked on its own timer.
-    pub(crate) wake: Vec<Arc<Notify>>,
+    tasks: Vec<RefreshTask>,
 }
 
 /// Replicated zones by origin.
 ///
 /// [`NameKeyBuf`] rather than the `Vec<u8>` it was until `TODO.md` #40d: the
-/// insertion here and the probe in `notify_reply` each folded by hand, under two
-/// comments pointing at each other to say they agreed (`CLAUDE.md` §17). The
-/// constructor folds, so they cannot now disagree, and `Borrow<[u8]>` keeps the
-/// probe free of an allocation.
-pub(crate) type Secondaries = Arc<HashMap<NameKeyBuf, ReplicatedZone>>;
+/// insertion here and the probe in [`Secondaries::notified`] each folded by
+/// hand, under two comments pointing at each other to say they agreed
+/// (`CLAUDE.md` §17). The constructor folds, so they cannot now disagree, and
+/// `Borrow<[u8]>` keeps the probe free of an allocation.
+///
+/// Mutable behind a lock since `TODO.md` #44a, because catalog zones make
+/// membership a thing that changes while the process runs (RFC 9432 §5.1:
+/// "when a name server that supports catalog zones completes a zone transfer
+/// for a catalog zone, it SHOULD apply changes ... without any manual
+/// intervention"). A `std::sync::RwLock` and not tokio's: every section below
+/// is a map probe, `notified` is called from a `fn` on the answering path, and
+/// nothing here awaits.
+#[derive(Default)]
+pub(crate) struct Secondaries {
+    by_zone: std::sync::RwLock<HashMap<NameKeyBuf, ReplicatedZone>>,
+}
+
+/// What a NOTIFY for a zone means here. The waking happens inside
+/// [`Secondaries::notified`], under the guard, so the decision and the action
+/// cannot come apart.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Notified {
+    /// A zone we replicate, from one of its masters: the tasks were woken.
+    Refreshing,
+    /// A zone we replicate, from anywhere else.
+    NotItsMaster,
+    /// Not a zone we replicate.
+    NotOurs,
+}
+
+impl Secondaries {
+    /// Read or write the registry, recovering a poisoned lock.
+    ///
+    /// Nothing inside any of these sections can panic — they are map probes and
+    /// `Notify::notify_one` — so a poisoned lock means a panic elsewhere in the
+    /// process, not a half-updated registry. Recovering is therefore right, and
+    /// is the one answer that neither takes the server off the air (`CLAUDE.md`
+    /// §6) nor reports a replicated zone as somebody else's.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<NameKeyBuf, ReplicatedZone>> {
+        self.by_zone
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<NameKeyBuf, ReplicatedZone>> {
+        self.by_zone
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether this server replicates `zone` from somebody.
+    pub(crate) fn replicates(&self, zone: NameRef<'_>) -> bool {
+        self.read().contains_key(&*zone.folded())
+    }
+
+    /// Act on a NOTIFY: wake the refresh tasks if it came from a master.
+    pub(crate) fn notified(&self, zone: NameRef<'_>, from: IpAddr) -> Notified {
+        let registry = self.read();
+        let Some(replicated) = registry.get(&*zone.folded()) else {
+            return Notified::NotOurs;
+        };
+        if !replicated
+            .tasks
+            .iter()
+            .any(|task| task.spec.master.ip() == from)
+        {
+            return Notified::NotItsMaster;
+        }
+        for task in &replicated.tasks {
+            // `notify_one` leaves a permit for a task that is mid-transfer, so a
+            // NOTIFY arriving at a busy moment is not lost.
+            task.wake.notify_one();
+        }
+        Notified::Refreshing
+    }
+
+    fn register(&self, zone: NameRef<'_>, task: RefreshTask) {
+        self.write()
+            .entry(NameKeyBuf::new(zone))
+            .or_default()
+            .tasks
+            .push(task);
+    }
+
+    /// Every (zone, master) pair being replicated right now.
+    ///
+    /// The list a reload checks against: `--secondary` specs and catalog members
+    /// alike, since both arrive here and nowhere else.
+    pub(crate) fn specs(&self) -> Vec<MasterSpec> {
+        self.read()
+            .values()
+            .flat_map(|zone| zone.tasks.iter().map(|task| task.spec.clone()))
+            .collect()
+    }
+
+    /// A registry that answers for these specs, for tests that need the answer
+    /// without a refresh task behind it.
+    #[cfg(test)]
+    pub(crate) fn replicating(specs: &[MasterSpec]) -> Secondaries {
+        let registry = Secondaries::default();
+        for spec in specs {
+            registry.register(
+                spec.zone.as_ref(),
+                RefreshTask {
+                    spec: spec.clone(),
+                    wake: Arc::new(Notify::new()),
+                    handle: None,
+                },
+            );
+        }
+        registry
+    }
+
+    /// Stop replicating `zone`: abort its refresh tasks and forget them.
+    ///
+    /// Aborted rather than asked to stop, so that the caller's next step — which
+    /// is removing the zone and deleting its file — cannot race a transfer that
+    /// is halfway through installing it. What an abort can interrupt is an await,
+    /// so the two places it can land in a refresh are a socket read and a lock
+    /// acquisition, and `install_zone` mutates nothing between taking its two
+    /// guards and finishing.
+    ///
+    /// The handles come back because `abort` only *requests* it: the task stops
+    /// at its next poll, which can be after a `write_zone_file` already under
+    /// way. Awaiting them is what makes "deleted the member's file" true rather
+    /// than likely — see [`Secondaries::retired`].
+    #[must_use = "await the handles, or the file this deletes can be written again"]
+    pub(crate) fn retire(&self, zone: NameRef<'_>) -> Vec<tokio::task::JoinHandle<()>> {
+        let Some(replicated) = self.write().remove(&*zone.folded()) else {
+            return Vec::new();
+        };
+        replicated
+            .tasks
+            .into_iter()
+            .filter_map(|task| task.handle)
+            .inspect(|handle| handle.abort())
+            .collect()
+    }
+
+    /// [`Secondaries::retire`], waited out.
+    ///
+    /// A cancelled task's handle resolves as soon as it has actually stopped,
+    /// which is its next poll — so this is short, and after it nothing is still
+    /// writing that zone's file.
+    pub(crate) async fn retired(&self, zone: NameRef<'_>) {
+        for handle in self.retire(zone) {
+            // `Err` is the cancellation we asked for, or a panic already logged
+            // by the runtime. Either way the task has stopped, which is the
+            // whole question here.
+            let _ = handle.await;
+        }
+    }
+}
 
 /// What every refresh task shares with the server and with each other.
 ///
@@ -79,6 +247,10 @@ pub(crate) struct ReplicationContext {
     /// Ticked off when a zone this server had nothing for arrives, taking a
     /// cold-started secondary from "listening" to "ready".
     pub(crate) readiness: Readiness,
+    /// The catalogs this server consumes, so a refresh that installs one
+    /// provisions what it lists (RFC 9432 §5.1). Empty for a server with no
+    /// `--catalog`, where every call below is a map probe that misses.
+    pub(crate) catalogs: Arc<crate::catalog::Catalogs>,
 }
 
 /// Start a refresh task per (zone, master), and return what a NOTIFY needs to
@@ -86,60 +258,78 @@ pub(crate) struct ReplicationContext {
 pub(crate) fn spawn_secondaries(
     specs: Vec<MasterSpec>,
     keys: &TsigKeyring,
-    replication: ReplicationContext,
-    lifecycle: Lifecycle,
-) -> Result<Secondaries> {
-    let Lifecycle { stop, busy } = lifecycle;
-    let mut registry: HashMap<NameKeyBuf, ReplicatedZone> = HashMap::new();
-
+    replication: &ReplicationContext,
+    lifecycle: &Lifecycle,
+    secondaries: &Arc<Secondaries>,
+) -> Result<()> {
     for spec in specs {
-        // A key named but not defined is a configuration error, not a reason to
-        // transfer unsigned: the operator asked for authentication and could
-        // not see that they did not get it.
-        let key = match &spec.key_name {
-            Some(name) => Some(
-                keys.by_name(name)
-                    .ok_or_else(|| {
-                        anyhow!("--secondary names TSIG key {name:?}, which no --tsig-key defines")
-                    })?
-                    .clone(),
-            ),
-            None => None,
-        };
-
-        let wake = Arc::new(Notify::new());
-        let entry = registry
-            .entry(NameKeyBuf::new(spec.zone.as_ref()))
-            .or_insert_with(|| ReplicatedZone {
-                masters: Vec::new(),
-                wake: Vec::new(),
-            });
-        entry.masters.push(spec.master.ip());
-        entry.wake.push(wake.clone());
-
-        tracing::info!(
-            "secondary for {} from {}{}",
-            spec.zone,
-            spec.master,
-            match &spec.key_name {
-                Some(name) => format!(" signed with {name}"),
-                None => String::new(),
-            }
-        );
-
-        tokio::spawn(secondary_loop(
-            spec,
-            key,
-            replication.clone(),
-            wake,
-            Lifecycle {
-                stop: stop.clone(),
-                busy: busy.clone(),
-            },
-        ));
+        let key = resolve_key(&spec, keys, "--secondary")?;
+        spawn_secondary(spec, key, replication, lifecycle, secondaries);
     }
+    Ok(())
+}
 
-    Ok(Arc::new(registry))
+/// The key a spec names, or an error if no `--tsig-key` defines it.
+///
+/// A key named but not defined is a configuration error, not a reason to
+/// transfer unsigned: the operator asked for authentication and could not see
+/// that they did not get it.
+pub(crate) fn resolve_key(
+    spec: &MasterSpec,
+    keys: &TsigKeyring,
+    flag: &str,
+) -> Result<Option<TsigKey>> {
+    match &spec.key_name {
+        Some(name) => Ok(Some(
+            keys.by_name(name)
+                .ok_or_else(|| {
+                    anyhow!("{flag} names TSIG key {name:?}, which no --tsig-key defines")
+                })?
+                .clone(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Start one refresh task and register it, so a NOTIFY can reach it.
+///
+/// The one way a refresh task comes into being: `--secondary` at startup and a
+/// catalog adding a member (`TODO.md` #44a) go through here, so the two cannot
+/// register a zone differently.
+pub(crate) fn spawn_secondary(
+    spec: MasterSpec,
+    key: Option<TsigKey>,
+    replication: &ReplicationContext,
+    lifecycle: &Lifecycle,
+    secondaries: &Arc<Secondaries>,
+) {
+    let wake = Arc::new(Notify::new());
+    tracing::info!(
+        "secondary for {} from {}{}",
+        spec.zone,
+        spec.master,
+        match &spec.key_name {
+            Some(name) => format!(" signed with {name}"),
+            None => String::new(),
+        }
+    );
+    let registered = spec.clone();
+    let handle = tokio::spawn(secondary_loop(
+        spec,
+        key,
+        replication.clone(),
+        wake.clone(),
+        lifecycle.clone(),
+    ));
+    let zone = registered.zone.clone();
+    secondaries.register(
+        zone.as_ref(),
+        RefreshTask {
+            spec: registered,
+            wake,
+            handle: Some(handle),
+        },
+    );
 }
 
 /// Keep one zone in step with one master, forever.
@@ -183,6 +373,22 @@ async fn secondary_loop(
         let wait = match result {
             Ok(outcome) => {
                 tracing::info!("secondary {}: {outcome} (from {})", spec.zone, spec.master);
+                // If this zone is a catalog, what it now lists is what this
+                // server should hold (RFC 9432 §5.1). A no-op for every other
+                // zone, and for a catalog whose serial has not moved. Held
+                // `Busy`: provisioning writes the membership sidecar.
+                let _busy = busy.clone();
+                replication
+                    .catalogs
+                    .reconcile(
+                        spec.zone.as_ref(),
+                        &replication,
+                        &Lifecycle {
+                            stop: stop.clone(),
+                            busy: busy.clone(),
+                        },
+                    )
+                    .await;
                 timers.after_success()
             }
             Err(e) => {
@@ -225,6 +431,7 @@ pub(crate) async fn refresh_once(
         zone_dir,
         notify,
         readiness,
+        catalogs: _,
     } = replication;
     let ZoneContext {
         zone_map, metrics, ..
@@ -373,12 +580,6 @@ pub(crate) async fn expire_if_out_of_contact(
     timers: RefreshTimers,
 ) {
     let ReplicationContext { served, state, .. } = replication;
-    let ZoneContext {
-        zone_map,
-        deltas,
-        metrics,
-        journal: _,
-    } = served;
     let last_contact = state
         .lock()
         .expect("state mutex")
@@ -390,13 +591,7 @@ pub(crate) async fn expire_if_out_of_contact(
         return;
     }
 
-    let mut zones = zone_map.write().await;
-    if zones.remove(spec.zone.as_ref()) {
-        // The increments go with it: offering a chain for a withdrawn zone is
-        // answering for something we stopped serving.
-        deltas.write().await.forget(spec.zone.as_ref());
-        // And the gauges: a frozen serial shows a withdrawn zone as healthy.
-        metrics.forget_zone(spec.zone.as_ref());
+    if withdraw(served, spec.zone.as_ref()).await {
         // WARN, not INFO: this is what the alert is built on.
         tracing::warn!(
             "secondary {}: EXPIRE ({}s) passed with no contact — no longer serving this zone",
@@ -404,6 +599,31 @@ pub(crate) async fn expire_if_out_of_contact(
             timers.expire
         );
     }
+}
+
+/// Stop serving a zone, and forget everything derived from holding it.
+///
+/// Three callers — EXPIRE, an unvouched copy at startup, a catalog dropping a
+/// member — and three copies of it until `TODO.md` #44a, which is how the
+/// metrics half came to be missing from one of them once already
+/// (`CLAUDE.md` §7, §14). Returns whether the zone was there to withdraw.
+pub(crate) async fn withdraw(served: &ZoneContext, zone: NameRef<'_>) -> bool {
+    let ZoneContext {
+        zone_map,
+        deltas,
+        metrics,
+        journal: _,
+    } = served;
+    let mut zones = zone_map.write().await;
+    if !zones.remove(zone) {
+        return false;
+    }
+    // The increments go with it: offering a chain for a withdrawn zone is
+    // answering for something we stopped serving.
+    deltas.write().await.forget(zone);
+    // And the gauges: a frozen serial shows a withdrawn zone as healthy.
+    metrics.forget_zone(zone);
+    true
 }
 
 /// Withdraw every replicated zone whose age we cannot vouch for.
@@ -427,12 +647,7 @@ pub(crate) async fn withdraw_unvouched_zones(
     served: &ZoneContext,
     zone_dir: &Path,
 ) {
-    let ZoneContext {
-        zone_map,
-        deltas,
-        metrics,
-        journal: _,
-    } = served;
+    let ZoneContext { zone_map, .. } = served;
     let state = StateFile::load(&state_file_path(zone_dir));
     let now = current_unix_timestamp();
 
@@ -449,12 +664,7 @@ pub(crate) async fn withdraw_unvouched_zones(
                 .to_string(),
         };
 
-        let mut zones = zone_map.write().await;
-        if zones.remove(spec.zone.as_ref()) {
-            // As in `expire_if_out_of_contact`: the increments and the gauges
-            // go with the zone.
-            deltas.write().await.forget(spec.zone.as_ref());
-            metrics.forget_zone(spec.zone.as_ref());
+        if withdraw(served, spec.zone.as_ref()).await {
             tracing::warn!(
                 "secondary {}: {why} — not serving it until {} answers",
                 spec.zone,

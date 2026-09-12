@@ -243,6 +243,17 @@ impl StateFile {
         }
     }
 
+    /// Forget every master's state for one zone.
+    ///
+    /// For a zone that stops being ours: a catalog dropping a member
+    /// (`TODO.md` #44a). The row is what vouches for the age of the copy on
+    /// disk, so leaving it behind means a zone of the same name provisioned
+    /// later is served from whatever file it finds, with AA set, on the
+    /// strength of a transfer of something else.
+    pub fn forget(&mut self, zone: &str) {
+        self.entries.retain(|e| !e.zone.eq_ignore_ascii_case(zone));
+    }
+
     /// The path and the exact contents [`StateFile::record`] would write, owned
     /// so they outlive the guard they were taken under.
     pub fn snapshot(&self) -> (PathBuf, String) {

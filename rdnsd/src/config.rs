@@ -258,6 +258,15 @@ pub struct ZoneConfig {
     /// Who to NOTIFY for *this* zone, in addition to `server.also-notify`.
     #[serde(default)]
     pub also_notify: Vec<String>,
+    /// Whether this zone is a catalog to consume rather than a zone to serve
+    /// (RFC 9432): the zones it lists are replicated from the same masters,
+    /// with the same key.
+    ///
+    /// It is still replicated and served like any other zone — a catalog is an
+    /// ordinary zone (§5.1) — so this adds a reading of it, and takes nothing
+    /// away.
+    #[serde(default)]
+    pub catalog: bool,
     /// Per-zone signing overrides. Absent means "use `[signing]`".
     #[serde(default)]
     pub nsec3: Option<bool>,
@@ -381,6 +390,11 @@ impl Config {
             if settings.nsec3_opt_out == Some(true) && settings.nsec3 == Some(false) {
                 bail!("zone {zone:?} asks for nsec3-opt-out with nsec3 off");
             }
+            if settings.catalog && settings.masters.is_empty() {
+                bail!(
+                    "zone {zone:?} is marked catalog but has no masters: a catalog is                      consumed by replicating it, and one served from a local file is                      an ordinary zone this server is the producer of"
+                );
+            }
             if settings.file.is_none()
                 && settings.masters.is_empty()
                 && self.server.zone_dir.is_none()
@@ -482,6 +496,7 @@ impl Config {
         cli.allow_partial_load = self.server.allow_partial_load;
         cli.tsig_key = self.tsig_specs()?;
         cli.secondary = self.secondary_specs();
+        cli.catalog = self.catalog_specs();
 
         if let Some(signing) = &self.signing {
             cli.signing_key_dir = Some(signing.key_dir.clone());
@@ -532,10 +547,28 @@ impl Config {
         Ok(per_zone)
     }
 
-    /// The `--secondary`-shaped specs this config implies: one per (zone, master).
+    /// The `--secondary`-shaped specs this config implies: one per (zone,
+    /// master), catalogs excluded.
+    ///
+    /// A catalog zone is replicated too, but `--catalog` is what says so: the
+    /// startup path adds every catalog to the secondary list itself, and a zone
+    /// in both lists would be fetched by two refresh tasks asking one master the
+    /// same question on the same timer.
     pub fn secondary_specs(&self) -> Vec<String> {
+        self.zone_specs(false)
+    }
+
+    /// The `--catalog`-shaped specs this config implies, in the same spelling.
+    pub fn catalog_specs(&self) -> Vec<String> {
+        self.zone_specs(true)
+    }
+
+    fn zone_specs(&self, catalog: bool) -> Vec<String> {
         let mut specs = Vec::new();
         for (zone, settings) in &self.zones {
+            if settings.catalog != catalog {
+                continue;
+            }
             for master in &settings.masters {
                 specs.push(format!("{zone}@{master}"));
             }
@@ -782,6 +815,47 @@ secret = "AAECAwQFBgcICQoLDA0ODw=="
         let specs = config.tsig_specs().expect("specs");
         assert_eq!(specs[0].split(':').count(), 3, "got {:?}", specs[0]);
         rdns::tsig::TsigKey::parse(&specs[0]).expect("and parses");
+    }
+
+    /// A catalog zone is in the catalog list and *not* in the secondary list:
+    /// startup adds it to the second itself, and a zone in both is two refresh
+    /// tasks asking one master the same question.
+    #[test]
+    fn a_catalog_zone_is_not_also_a_secondary_spec() {
+        let config = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+[zones."catalog.invalid."]
+masters = ["192.0.2.1"]
+catalog = true
+[zones."other.test."]
+masters = ["192.0.2.3"]
+"#,
+        )
+        .expect("parses");
+        assert_eq!(config.catalog_specs(), ["catalog.invalid.@192.0.2.1"]);
+        assert_eq!(config.secondary_specs(), ["other.test.@192.0.2.3"]);
+    }
+
+    /// A catalog is consumed by replicating it, so one with no masters is a
+    /// setting that does nothing — which `CLAUDE.md` §15 says must fail rather
+    /// than be ignored.
+    #[test]
+    fn a_catalog_with_no_masters_is_refused() {
+        let err = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+[zones."catalog.invalid."]
+catalog = true
+"#,
+        )
+        .expect_err("a catalog with nowhere to fetch it from");
+        assert!(
+            err.to_string().contains("no masters"),
+            "the message says what is missing: {err}"
+        );
     }
 
     #[test]

@@ -40,7 +40,7 @@ use rdns_transport::tcp::{self, send_framed, Reply};
 use rdns_transport::ServeContext;
 
 use crate::answer::{write_response, NOT_OUR_ZONE};
-use crate::replication::Secondaries;
+use crate::replication::{Notified, Secondaries};
 use crate::zones::{install_zone, ZoneContext, ZoneMap, ZoneSigning};
 use crate::{bad_request, serving_error};
 use crate::{Scratch, Server};
@@ -736,7 +736,7 @@ impl Server {
         // over the change, so accepting it tells the client a write succeeded
         // that has a timer on it. Folded through the helper the table is keyed
         // with, so the two cannot disagree.
-        if self.secondaries.contains_key(&*zone_name.as_ref().folded()) {
+        if self.secondaries.replicates(zone_name.as_ref()) {
             serving_error!(
                 self.ctx.logger,
                 ip,
@@ -1073,32 +1073,28 @@ fn notify_reply(
     peer: SocketAddr,
 ) -> DnsMessage {
     let zone = notify::notified_zone(msg).unwrap_or_default();
-    // Folded octets, which is what the registry is keyed on. The fold is
-    // ASCII-only (RFC 4343) and `Name` does it; `str::to_lowercase` would fold
-    // U+212A KELVIN SIGN onto `k` and merge two names that differ on the wire.
-    let key = zone.as_ref().folded();
 
-    if let Some(replicated) = secondaries.get(&*key) {
-        if replicated.masters.contains(&peer.ip()) {
-            // `notify_one` leaves a permit for a task that is mid-transfer, so a
-            // NOTIFY arriving at a busy moment is not lost.
-            for wake in &replicated.wake {
-                wake.notify_one();
-            }
+    match secondaries.notified(zone.as_ref(), peer.ip()) {
+        Notified::Refreshing => {
             tracing::info!(%peer, "NOTIFY for {zone}: refreshing now");
             return notify::notify_response(msg, ResponseCode::Ok);
         }
-        tracing::warn!(
-            %peer,
-            "NOTIFY for {zone}: REFUSED (not one of its masters — \
-             a NOTIFY costs its recipient a transfer)"
-        );
-        return notify::notify_response(msg, ResponseCode::Refused);
+        Notified::NotItsMaster => {
+            tracing::warn!(
+                %peer,
+                "NOTIFY for {zone}: REFUSED (not one of its masters — \
+                 a NOTIFY costs its recipient a transfer)"
+            );
+            return notify::notify_response(msg, ResponseCode::Refused);
+        }
+        Notified::NotOurs => {}
     }
 
-    // The zone map is keyed in the same folded form, so this is a lookup rather
-    // than a scan of every origin.
-    let ours = zone_map.contains_key(key.as_ref());
+    // Folded octets, which is what the zone map is keyed on, so this is a lookup
+    // rather than a scan of every origin. The fold is ASCII-only (RFC 4343) and
+    // `Name` does it; `str::to_lowercase` would fold U+212A KELVIN SIGN onto `k`
+    // and merge two names that differ on the wire.
+    let ours = zone_map.contains_key(zone.as_ref().folded().as_ref());
     let why = if ours {
         "this server is its primary, not a secondary"
     } else {
@@ -1111,13 +1107,11 @@ fn notify_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replication::ReplicatedZone;
     use crate::testutil::{nm, query};
     use crate::zones::zone_key;
     use rdns::record_types;
     use rdns::UdpSizes;
     use std::collections::HashMap;
-    use tokio::sync::Notify;
 
     /// Every reply built away from `answer.rs` mirrors the client's OPT the
     /// same way that file does — RFC 6891 §6.1.1 for the record, RFC 3225 §3
@@ -1179,16 +1173,11 @@ mod tests {
     /// for — three different answers to three different situations.
     #[test]
     fn test_notify_is_answered_by_what_the_zone_is_to_us() {
-        let wake = Arc::new(Notify::new());
-        let mut registry = HashMap::new();
-        registry.insert(
-            rdns::name_keys::NameKeyBuf::new(nm("replicated.test.").as_ref()),
-            ReplicatedZone {
-                masters: vec!["192.0.2.1".parse().unwrap()],
-                wake: vec![wake.clone()],
-            },
-        );
-        let secondaries: Secondaries = Arc::new(registry);
+        let secondaries = Secondaries::replicating(&[rdns::secondary::MasterSpec {
+            zone: nm("replicated.test."),
+            master: "192.0.2.1:53".parse().expect("a test address"),
+            key_name: None,
+        }]);
 
         let primary_zone = rdns::zone::parse_zone_file(
             "$TTL 3600\n\

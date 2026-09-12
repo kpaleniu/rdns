@@ -38,7 +38,7 @@ pub struct Control {
     pub served: ZoneContext,
     /// Zones this server replicates, so `status` can say which are secondary
     /// without inferring it from a timestamp that is also absent on a primary.
-    pub replicated: Vec<String>,
+    pub secondaries: Arc<crate::replication::Secondaries>,
     /// Where a `reload` request goes: the same loop SIGHUP and the re-signing
     /// timer feed, so two reloads cannot install two snapshots of one file set.
     pub reloads: tokio::sync::mpsc::Sender<ReloadTrigger>,
@@ -216,9 +216,9 @@ async fn status(control: &Control) -> String {
         let mut rows: Vec<Row> = zones
             .values()
             .map(|zone| {
-                // Both lists are presentation text — a metrics label and a
-                // config string — so the comparison happens there rather than
-                // as names.
+                // The metrics label is presentation text, so that comparison
+                // happens there; the replication registry is keyed on names and
+                // is asked as one.
                 let origin = zone.origin().to_presentation();
                 let gauge = facts.iter().find(|f| f.zone.eq_ignore_ascii_case(&origin));
                 Row {
@@ -238,10 +238,7 @@ async fn status(control: &Control) -> String {
                     } else {
                         "-"
                     },
-                    replicated: control
-                        .replicated
-                        .iter()
-                        .any(|z| z.eq_ignore_ascii_case(&origin)),
+                    replicated: control.secondaries.replicates(zone.origin()),
                     last_transfer: gauge.and_then(|g: &ZoneFacts| g.last_transfer),
                 }
             })
@@ -394,8 +391,9 @@ mod tests {
         .expect("the zone parses")
     }
 
+    /// `replicated` names the zones the registry should report as secondary.
     fn control(
-        replicated: Vec<String>,
+        replicated: Vec<&str>,
     ) -> (Arc<Control>, tokio::sync::mpsc::Receiver<ReloadTrigger>) {
         use tokio::sync::RwLock;
 
@@ -404,6 +402,14 @@ mod tests {
         let metrics = Arc::new(rdns::metrics::DnsMetrics::new());
         metrics.set_zone_serial(nm("example.com.").as_ref(), Serial::new(42));
         let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let replicated: Vec<rdns::secondary::MasterSpec> = replicated
+            .iter()
+            .map(|z| rdns::secondary::MasterSpec {
+                zone: nm(z),
+                master: "192.0.2.1:53".parse().expect("a test address"),
+                key_name: None,
+            })
+            .collect();
         (
             Arc::new(Control {
                 served: ZoneContext {
@@ -412,7 +418,7 @@ mod tests {
                     metrics,
                     journal: None,
                 },
-                replicated,
+                secondaries: Arc::new(crate::replication::Secondaries::replicating(&replicated)),
                 reloads: tx,
                 started: Instant::now(),
                 listen: "127.0.0.1:15353".to_string(),
@@ -444,7 +450,7 @@ mod tests {
     /// stale.
     #[tokio::test]
     async fn a_zone_with_no_contact_shows_no_time_rather_than_the_epoch() {
-        let (control, _rx) = control(vec!["example.com.".to_string()]);
+        let (control, _rx) = control(vec!["example.com."]);
         let Reply::Ok(body) = ask(&control, "status").await else {
             panic!("status failed");
         };
