@@ -169,7 +169,7 @@ rdnsd --zone-dir ./zones \
 rdnsd --zone-dir ./zones --query-rate 0     # off, for a lab
 ```
 
-### `--secondary <ZONE@MASTER[:PORT][#KEY]>`
+### `--secondary <ZONE@MASTER[:PORT][#KEY][+tls=NAME]>`
 
 Replicate a zone from a master. Repeatable, and requires `--zone-dir`: the
 fetched zone is written there, so a restart serves it without waiting for a
@@ -190,6 +190,23 @@ zone-and-master pair, which:
   time would read "nothing known" as "fetch and serve".
 
 `#KEY` names a TSIG key from `--tsig-key`, used to sign the transfer request.
+
+`+tls=NAME` fetches the zone over TLS instead (RFC 9103, XFR-over-TLS) and
+requires the master's certificate to carry `NAME`:
+
+- the port defaults to 853 rather than 53 (§7.3), and a stated port still wins;
+- TLS 1.3 only (§7.2) and ALPN `dot` (§7.1);
+- the name is not optional and there is no opportunistic mode. §7.5 makes
+  authenticating the master a MUST, and an unauthenticated TLS connection is
+  exactly as forgeable as the cleartext it replaces while looking in a log like
+  it is not;
+- the anchors come from `--transfer-tls-ca`, which startup insists on;
+- it goes last, after `#KEY`. The other order is refused rather than guessed at.
+
+This server does not present a client certificate. RFC 9103 §7.5 lets a primary
+authorize its client by mutual TLS *or* by "an IP-based ACL ... combined with a
+valid TSIG/SIG(0) signature", and this is the second — so a primary that demands
+mTLS cannot be replicated from (`TODO.md` #51).
 
 ```bash
 # Two masters for one zone; either can answer, both may NOTIFY.
@@ -594,6 +611,41 @@ rdnsd --zone-file example.com.zone \
   --allow-transfer 192.0.2.10 --allow-transfer 192.0.2.11 \
   --allow-transfer 10.9.0.0/24
 ```
+
+### `--transfer-tls-only`
+
+Refuse a zone transfer that did not arrive over TLS 1.3.
+
+RFC 9103 §11: "An individual zone transfer is not considered protected by XoT
+unless both the client and server are configured to use only XoT". This is the
+server's half; `--secondary ...+tls=` above is the client's.
+
+- It narrows `--allow-transfer` and the TSIG keys rather than replacing them: a
+  peer still has to be allowed, and now also has to be on an encrypted
+  connection.
+- TLS 1.3 or later, because §7.2 is "All implementations of this specification
+  MUST use only TLS 1.3 or later". A DoT connection that negotiated 1.2 is fine
+  for a query (RFC 7858 §4.1) and is refused here.
+- DoQ counts: QUIC is TLS 1.3 by construction (RFC 9001 §4.2). DoH counts when
+  its handshake was 1.3.
+- It needs `--tls-listen`, `--quic-listen` or `--https-listen`; without one,
+  every transfer would be refused, so startup fails instead.
+- The refusal is REFUSED with an EDE saying so (RFC 8914), not silence.
+
+```bash
+rdnsd --zone-dir ./zones --allow-transfer 192.0.2.10   --tls-listen 0.0.0.0:853 --tls-cert cert.pem --tls-key key.pem   --transfer-tls-only
+```
+
+### `--transfer-tls-ca <PATH>`
+
+The PEM trust anchors a master's certificate is checked against, for zones this
+server *fetches* over TLS. Needed by, and only by, a `--secondary` with
+`+tls=`.
+
+There is no default and no system trust store: the masters a server replicates
+from are usually its own operator's, with a private CA. Pointing this at
+`/etc/ssl/certs/ca-certificates.crt` is how a publicly issued certificate is
+trusted — it is a PEM bundle like any other.
 
 ### `--also-notify <ADDR[:PORT][#KEY]>`
 

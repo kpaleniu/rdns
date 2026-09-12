@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::record_types as rt;
+use crate::xot::XotName;
 use crate::zone::Zone;
 use crate::{Name, ParsedRecord, Serial};
 
@@ -112,9 +113,30 @@ pub struct MasterSpec {
     /// By name, looked up in the keys `--tsig-key` defines, so a secret is
     /// written down in one place.
     pub key_name: Option<String>,
+    /// `Some` when the zone is transferred over TLS (RFC 9103): the name this
+    /// master's certificate has to carry. The anchors it is checked against are
+    /// one per process — `--transfer-tls-ca` — because who issues certificates
+    /// is not a decision per master.
+    pub tls: Option<XotName>,
 }
 
 impl MasterSpec {
+    /// The same master, for another zone: what a catalog's member inherits
+    /// from the catalog it was listed in (RFC 9432 §5.1).
+    ///
+    /// A method rather than three field copies at the call site, because there
+    /// are two call sites and the field that would be forgotten is `tls` —
+    /// which forgotten transfers a member in clear from a master the catalog
+    /// itself is reached over TLS, and nothing would say so (`CLAUDE.md` §4).
+    pub fn for_member(&self, zone: Name) -> Self {
+        MasterSpec {
+            zone,
+            master: self.master,
+            key_name: self.key_name.clone(),
+            tls: self.tls.clone(),
+        }
+    }
+
     pub fn parse(spec: &str) -> ConfigResult<Self> {
         let spec = spec.trim();
         // Split the zone off first; the rest is `addr[:port][#key]`, which
@@ -131,14 +153,15 @@ impl MasterSpec {
             )));
         }
 
-        let (master, key_name) = crate::endpoint::parse_endpoint(master, spec)?;
+        let parsed = crate::endpoint::parse_endpoint(master, spec)?;
 
         Ok(MasterSpec {
             zone: Name::from_presentation(zone).map_err(|e| {
                 ConfigError::new(format!("{spec:?}: {zone:?} is not a domain name: {e}"))
             })?,
-            master,
-            key_name,
+            master: parsed.addr,
+            key_name: parsed.key_name,
+            tls: parsed.tls,
         })
     }
 }
@@ -332,6 +355,7 @@ mod tests {
                 zone: nm("example.com."),
                 master: addr("192.0.2.1:53"),
                 key_name: None,
+                tls: None,
             },
             "the zone is made absolute and the port defaults to 53"
         );
@@ -341,7 +365,20 @@ mod tests {
                 zone: nm("example.com."),
                 master: addr("192.0.2.1:5353"),
                 key_name: Some("transfer.key.".to_string()),
+                tls: None,
             }
+        );
+    }
+
+    /// The whole of `--secondary`'s XoT half: the suffix, the port RFC 9103
+    /// §7.3 moves to, and the name the master will be checked against.
+    #[test]
+    fn test_master_spec_takes_a_tls_name() {
+        let spec = MasterSpec::parse("example.com@192.0.2.1+tls=ns1.example.com.").expect("parses");
+        assert_eq!(spec.master, addr("192.0.2.1:853"));
+        assert_eq!(
+            spec.tls.map(|n| n.to_string()).as_deref(),
+            Some("ns1.example.com.")
         );
     }
 

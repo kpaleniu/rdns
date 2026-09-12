@@ -183,7 +183,7 @@ mirrored OPT and the TSIG, TC=1, RCODE 0.
 | NXDOMAIN | `NameKind::NotFound` inside a zone we serve; an UPDATE prerequisite of §2.4.4's form that did not hold (§3.2.4) |
 | FORMERR | a malformed EDNS option list; AXFR over UDP; an UPDATE that breaks §3.1 or §3.4.1's prescan |
 | NOTIMP | any opcode but QUERY, NOTIFY and UPDATE |
-| REFUSED | a class we do not serve; a name in no zone we hold; a transfer the ACL or key scope denies; an UPDATE that is unsigned, outside its key's scope, for a zone we replicate, or for a zone we cannot write |
+| REFUSED | a class we do not serve; a name in no zone we hold; a transfer the ACL or key scope denies, or one not over TLS 1.3 under `--transfer-tls-only`; an UPDATE that is unsigned, outside its key's scope, for a zone we replicate, or for a zone we cannot write |
 | NOTAUTH | a transfer or NOTIFY for a zone not served here; a TSIG that did not verify; an UPDATE for a zone we are not authoritative for (RFC 2136 §3.1.1) |
 | SERVFAIL | a transfer that would not build or serialize; an UPDATE that could not be read, written or signed (RFC 2136 §3.4.2.1) |
 | BADVERS | EDNS version > 0 |
@@ -201,7 +201,7 @@ BADSIG or BADTIME (RFC 8945 §4.3), which is finer than any INFO-CODE.
 | 20, Not Authoritative | a name in no zone we hold — the query path and the IXFR-over-UDP shortcut; an UPDATE for a zone not served here |
 | 21, Not Supported | an opcode we do not implement; a class we do not serve |
 | 18, Prohibited | a transfer or an UPDATE the ACL or the key scope denies, all four ways. One code for all four: telling a stranger which of them it was is telling it about the keyring |
-| 0, Other | an UPDATE for a zone we replicate, or for a zone we have nowhere to write back to |
+| 0, Other | an UPDATE for a zone we replicate, or for a zone we have nowhere to write back to; a transfer that did not arrive over TLS 1.3 where the policy requires it. Not Prohibited, which is about the client's credential: this one may be authorized and asking on the wrong socket |
 
 A NOTIFY reply carries no OPT at all, so it can carry no reason — see
 `TODO.md` #47.
@@ -215,7 +215,9 @@ A NOTIFY reply carries no OPT at all, so it can carry no reason — see
 ### Authorization
 
 ```
-if a TSIG session exists and the key is scoped to zones not containing <apex>:
+if --transfer-tls-only and the connection is not TLS 1.3 or later:
+        REFUSED   (EDE: zone transfers here are over TLS 1.3 only)
+else if a TSIG session exists and the key is scoped to zones not containing <apex>:
         REFUSED   (signed)
 else if no TSIG session and the source address is not in --allow-transfer:
         REFUSED   (unsigned — there is no session to sign with)
@@ -223,6 +225,11 @@ else:
         allowed
 ```
 
+- The transport question comes first because it is about the connection rather
+  than the peer: a client may be perfectly authorized and asking on the wrong
+  socket, and RFC 9103 §11 makes that a different answer. TLS 1.3 or later
+  (§7.2); DoQ always qualifies (RFC 9001 §4.2) and DoT or DoH qualify when the
+  handshake was 1.3.
 - Checked before the zone is looked up and before any message is built.
 - Authorized against the apex, exactly: a child of a listed zone is refused.
 - The check hangs off the `TsigSession` rather than re-looking-up the key by
@@ -323,8 +330,14 @@ mid-transfer.
 
 ## 3.6 The secondary role
 
-`--secondary zone@master[:port][#tsig-key-name]`, repeatable; repeat the same
-zone for more masters. Requires `--zone-dir`.
+`--secondary zone@master[:port][#tsig-key-name][+tls=name]`, repeatable; repeat
+the same zone for more masters. Requires `--zone-dir`.
+
+`+tls=name` is RFC 9103's XFR-over-TLS: the SOA probe and the transfer both go
+over TLS 1.3 (§7.2) with ALPN `dot` (§7.1), to port 853 unless a port is stated
+(§7.3), and the master's certificate must carry `name` and chain to
+`--transfer-tls-ca` (§7.5). There is no opportunistic mode. A catalog's member
+inherits its catalog's spec whole, `+tls=` included.
 
 ### The refresh loop (one task per `(zone, master)` pair)
 

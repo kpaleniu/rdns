@@ -133,6 +133,38 @@ pub enum Transport {
     Tcp,
 }
 
+/// What the connection a message arrived on hid from the path it crossed.
+///
+/// Separate from [`Transport`] rather than two more variants of it, because
+/// they answer different questions and the same message can want both: DoT is
+/// framed like TCP and private like nothing else, and every size and
+/// truncation rule keyed on `Transport` would have had to learn the new
+/// variants to keep saying the same thing.
+///
+/// The version matters, which is why this is not a bool. RFC 9103 §7.2: "All
+/// implementations of this specification MUST use only TLS 1.3 \[RFC8446\] or
+/// later" — so a zone transfer over a 1.2 connection is not XFR-over-TLS, while
+/// a *query* over one is ordinary DoT (RFC 7858 §4.1 asks only for 1.2 or
+/// later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Privacy {
+    /// Plain UDP or TCP: everyone on the path read it.
+    Clear,
+    /// TLS 1.3 or later. DoQ is always this — RFC 9001 §4.2, "QUIC ... MUST use
+    /// TLS 1.3 or greater" — and DoT and DoH are when they negotiate it.
+    Tls13,
+    /// TLS older than 1.3. Good enough for a query, not for a transfer.
+    TlsOlder,
+}
+
+impl Privacy {
+    /// Whether a zone transfer may be answered over this, when the operator
+    /// has asked that transfers be encrypted (RFC 9103 §7.2, §11).
+    pub fn is_xot(&self) -> bool {
+        matches!(self, Privacy::Tls13)
+    }
+}
+
 /// Upper bound on additional records in a request. A legitimate request carries
 /// at most an OPT plus a TSIG/SIG(0); the slack is for forward compatibility.
 const MAX_REQUEST_ADDITIONALS: usize = 4;

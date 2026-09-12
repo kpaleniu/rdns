@@ -53,6 +53,7 @@ pub mod transfer;
 pub mod tsig;
 pub mod update;
 pub mod xfr;
+pub mod xot;
 pub mod zone;
 pub mod zone_signer;
 pub mod zone_writer;

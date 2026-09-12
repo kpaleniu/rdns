@@ -42,7 +42,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use rdns::shutdown::{Busy, Stop};
-use rdns::validation::Transport;
+use rdns::validation::{Privacy, Transport};
 
 use crate::tcp::{Handler, RateLimit, Reply};
 use crate::tls::CertificateStore;
@@ -154,11 +154,19 @@ pub async fn serve<H: Handler>(
                 .count(&handler.context().metrics.tls_handshakes);
 
             let negotiated_h2 = stream.get_ref().1.alpn_protocol() == Some(ALPN_H2);
+            // From the finished handshake, as DoT does it: this build offers
+            // 1.2 as well, and a transfer wants 1.3 (RFC 9103 §7.2).
+            let privacy = match stream.get_ref().1.protocol_version() {
+                Some(rustls::ProtocolVersion::TLSv1_3) => Privacy::Tls13,
+                _ => Privacy::TlsOlder,
+            };
             let service = service_fn(move |request| {
                 let handler = handler.clone();
                 let path = path.clone();
                 async move {
-                    Ok::<_, std::convert::Infallible>(answer(request, peer, handler, path).await)
+                    Ok::<_, std::convert::Infallible>(
+                        answer(request, peer, handler, path, privacy).await,
+                    )
                 }
             });
             let io = TokioIo::new(stream);
@@ -189,6 +197,7 @@ async fn answer<H: Handler>(
     peer: SocketAddr,
     handler: Arc<H>,
     path: Arc<str>,
+    privacy: Privacy,
 ) -> Response<Full<Bytes>> {
     if request.uri().path() != &*path {
         return status(StatusCode::NOT_FOUND);
@@ -215,7 +224,7 @@ async fn answer<H: Handler>(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Reply>(4);
     let answering = tokio::spawn(async move {
-        handler.handle(query, peer, now, tx).await;
+        handler.handle(query, peer, now, privacy, tx).await;
     });
 
     let mut answer = None;
@@ -381,6 +390,7 @@ mod tests {
             packet: Vec<u8>,
             _peer: SocketAddr,
             _now: u64,
+            _privacy: Privacy,
             out: tokio::sync::mpsc::Sender<Reply>,
         ) {
             crate::tcp::send_framed(&out, &packet).await;

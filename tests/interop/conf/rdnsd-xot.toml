@@ -1,0 +1,17 @@
+# 43g's server half: a primary that answers a zone transfer over TLS and over
+# nothing else (RFC 9103 §11, --transfer-tls-only).
+#
+# Its own service rather than a setting on rdnsd-primary, because 43a has three
+# real secondaries pulling from that one in clear and this policy would refuse
+# all of them. The certificate is the one the DoT scenario already generates:
+# a client verifies the name it was told to check, not the address it dialled.
+[server]
+host = "0.0.0.0"
+port = 5353
+zone-dir = "/etc/rdns/zones"
+query-rate = 0
+allow-transfer = ["10.53.0.0/24"]
+transfer-tls-only = true
+tls-listen = "0.0.0.0:853"
+tls-cert = "/etc/rdns/tls/cert.pem"
+tls-key = "/etc/rdns/tls/key.pem"

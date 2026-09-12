@@ -48,6 +48,7 @@ use rdns::shutdown::{Busy, Stop};
 
 use crate::tcp::{Handler, RateLimit, SplitStream};
 use crate::TransportLimits;
+use rdns::validation::Privacy;
 
 /// The port RFC 7858 §3.1 assigns.
 pub const DOT_PORT: u16 = 853;
@@ -316,7 +317,16 @@ pub async fn serve_one_tls<H: Handler>(
         .context()
         .metrics
         .count(&handler.context().metrics.tls_handshakes);
-    crate::tcp::serve_one(stream, peer, handler, limits, rate, stop).await;
+    // Read from the finished handshake rather than assumed from the listener:
+    // this build offers TLS 1.2 as well, because RFC 7858 §4.1 asks only for
+    // "1.2 or later" and a stub resolver in the field may offer nothing else.
+    // A *transfer* needs 1.3 (RFC 9103 §7.2), and only the connection knows
+    // which it got.
+    let privacy = match stream.get_ref().1.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => Privacy::Tls13,
+        _ => Privacy::TlsOlder,
+    };
+    crate::tcp::serve_one(stream, peer, handler, limits, rate, privacy, stop).await;
 }
 
 /// Fixtures the DoT and DoQ tests share.
@@ -399,7 +409,18 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
-    struct Echo(ServeContext);
+    struct Echo(ServeContext, std::sync::Mutex<Option<Privacy>>);
+
+    impl Echo {
+        fn new(ctx: ServeContext) -> Echo {
+            Echo(ctx, std::sync::Mutex::new(None))
+        }
+
+        /// What the last message handled arrived over.
+        fn seen(&self) -> Option<Privacy> {
+            *self.1.lock().expect("the test's own mutex")
+        }
+    }
 
     impl Handler for Echo {
         fn context(&self) -> &ServeContext {
@@ -411,8 +432,10 @@ mod tests {
             packet: Vec<u8>,
             _peer: SocketAddr,
             _now: u64,
+            privacy: Privacy,
             out: mpsc::Sender<crate::tcp::Reply>,
         ) {
+            *self.1.lock().expect("the test's own mutex") = Some(privacy);
             crate::tcp::send_framed(&out, &packet).await;
         }
     }
@@ -442,8 +465,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let shutdown = Shutdown::new();
-        let handler = Arc::new(Echo(context(0)));
+        let handler = Arc::new(Echo::new(context(0)));
         let metrics = handler.0.metrics.clone();
+        let seen = handler.clone();
         let server = tokio::spawn(serve(
             listener,
             config,
@@ -483,6 +507,16 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+        // What the handler was told the connection was, read off the finished
+        // handshake rather than assumed from the listener. `rdnsd` refuses a
+        // zone transfer that is not this (RFC 9103 §7.2, §11), so a listener
+        // reporting the wrong thing would refuse every transfer or accept every
+        // one.
+        assert_eq!(
+            seen.seen(),
+            Some(Privacy::Tls13),
+            "a DoT connection this build negotiates is TLS 1.3"
+        );
 
         shutdown.begin();
         server.abort();
@@ -504,7 +538,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let shutdown = Shutdown::new();
-        let handler = Arc::new(Echo(context(0)));
+        let handler = Arc::new(Echo::new(context(0)));
         let metrics = handler.0.metrics.clone();
         let server = tokio::spawn(serve(
             listener,

@@ -1,0 +1,10 @@
+; 43g: the zone BIND serves to rdnsd over XFR-over-TLS (RFC 9103) and over
+; nothing else. Its `allow-transfer transport tls` in bind-primary.conf is what
+; makes a successful transfer proof that the transfer was encrypted: a
+; cleartext AXFR of this zone is refused by the primary, so a secondary holding
+; it cannot have got it in clear.
+$TTL 3600
+@       IN SOA ns1.fromxot.test. hostmaster.fromxot.test. ( 2026091201 3600 600 604800 300 )
+@       IN NS  ns1.fromxot.test.
+ns1     IN A   10.53.0.7
+www     IN A   198.51.100.70

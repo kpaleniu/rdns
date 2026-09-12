@@ -30,6 +30,8 @@ volumes:
   primary-zones:
   primary-keys:
   primary-tls:
+  bind-tls:
+  xot-zones:
   child-zones:
   child-keys:
   secondary-zones:
@@ -139,6 +141,8 @@ services:
       - ./zones/big.test.db:/etc/bind/zones/big.test.db:ro
       - ./zones/catalog.invalid.db:/etc/bind/zones/catalog.invalid.db:ro
       - ./zones/member.test.db:/etc/bind/zones/member.test.db:ro
+      - ./zones/fromxot.test.db:/etc/bind/zones/fromxot.test.db:ro
+      - bind-tls:/etc/bind/tls:ro
       - bind-pri-state:/var/cache/bind
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -167,7 +171,24 @@ services:
         ipv4_address: 10.53.0.9
     volumes:
       - ./conf/rdnsd-secondary.toml:/etc/rdns/rdnsd.toml:ro
+      - ./run:/srv/run:ro
       - secondary-zones:/etc/rdns/zones
+    command: ["--config", "/etc/rdns/rdnsd.toml"]
+    stop_grace_period: 10s
+
+  # ---- 43g: a primary that answers a transfer over TLS and nothing else -----
+
+  rdnsd-xot:
+    image: rdns:local
+    networks:
+      interop:
+        ipv4_address: 10.53.0.12
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "53"
+    volumes:
+      - ./conf/rdnsd-xot.toml:/etc/rdns/rdnsd.toml:ro
+      - xot-zones:/etc/rdns/zones
+      - primary-tls:/etc/rdns/tls:ro
     command: ["--config", "/etc/rdns/rdnsd.toml"]
     stop_grace_period: 10s
 
@@ -184,6 +205,8 @@ services:
       - primary-zones:/srv/primary-zones
       - primary-keys:/srv/primary-keys
       - primary-tls:/srv/primary-tls
+      - bind-tls:/srv/bind-tls
+      - xot-zones:/srv/xot-zones
       - child-zones:/srv/child-zones
       - child-keys:/srv/child-keys
     command: ["sleep", "infinity"]

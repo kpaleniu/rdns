@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use quinn::{Endpoint, ServerConfig};
 
 use rdns::shutdown::{Busy, Stop};
-use rdns::validation::Transport;
+use rdns::validation::{Privacy, Transport};
 
 use crate::tcp::{Handler, RateLimit, Reply};
 use crate::tls::CertificateStore;
@@ -252,7 +252,10 @@ async fn serve_stream<H: Handler>(
     // (RFC 9250 permits that, and it is what makes XFR-over-DoQ the same code).
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Reply>(limits.max_inflight_per_connection);
     let answering = tokio::spawn(async move {
-        handler.handle(packet, peer, now, tx).await;
+        // Unconditionally 1.3: RFC 9001 §4.2 gives QUIC no other option
+        // ("QUIC ... MUST use TLS 1.3 or greater"), so there is no handshake to
+        // interrogate the way `tls.rs` has to.
+        handler.handle(packet, peer, now, Privacy::Tls13, tx).await;
     });
 
     while let Some(reply) = rx.recv().await {
@@ -293,6 +296,7 @@ mod tests {
             packet: Vec<u8>,
             _peer: SocketAddr,
             _now: u64,
+            _privacy: Privacy,
             out: tokio::sync::mpsc::Sender<Reply>,
         ) {
             crate::tcp::send_framed(&out, &packet).await;

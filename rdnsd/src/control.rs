@@ -408,6 +408,7 @@ mod tests {
                 zone: nm(z),
                 master: "192.0.2.1:53".parse().expect("a test address"),
                 key_name: None,
+                tls: None,
             })
             .collect();
         (

@@ -97,7 +97,8 @@ setup() {
   $COMPOSE run --rm --user root --no-deps tools sh -c '
     cp /srv/zones/example.com.zone /srv/zones/example.net.zone /srv/zones/example.org.zone /srv/primary-zones/ &&
     cp /srv/zones/child/*.zone /srv/child-zones/ &&
-    chown -R 65532:65532 /srv/primary-zones /srv/primary-keys /srv/child-zones /srv/child-keys &&
+    cp /srv/zones/example.org.zone /srv/xot-zones/ &&
+    chown -R 65532:65532 /srv/primary-zones /srv/primary-keys /srv/child-zones /srv/child-keys /srv/xot-zones &&
     chmod 0750 /srv/primary-keys /srv/child-keys' >/dev/null || return 1
 
   # The parent zone is response_size.rs's verbatim, with two glue addresses
@@ -144,6 +145,32 @@ EOZ
     chmod 0600 /srv/primary-tls/key.pem &&
     chmod 0644 /srv/primary-tls/cert.pem &&
     cp /srv/primary-tls/cert.pem /srv/run/dot-ca.pem' >/dev/null || return 1
+
+  # 43g's: BIND's certificate for the zone it will only transfer over TLS, and
+  # the anchor file rdnsd checks it against.
+  #
+  # A *chain* rather than the self-signed certificate 42a's DoT uses, and the
+  # reason is a real one rather than tidiness: rustls refuses a trust anchor
+  # presented as the end-entity certificate (`CaUsedAsEndEntity`), which is what
+  # a `-x509` self-signed pair is. kdig accepts one, so the DoT scenario above
+  # never asked the question. One CA, one leaf signed by it, and the anchor file
+  # holds only the CA.
+  #
+  # 0644 on the key because named has no mode check of its own and the
+  # alternative is guessing which uid this image runs as; it is a throwaway key
+  # on an internal bridge.
+  $COMPOSE run --rm --user root --no-deps tools sh -c '
+    cd /srv/bind-tls &&
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+      -keyout ca-key.pem -out ca.pem -days 30 -subj "/CN=xot-ca.example.test" \
+      2>/dev/null &&
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+      -keyout key.pem -out leaf.csr -subj "/CN=xot.example.test" 2>/dev/null &&
+    printf "subjectAltName=DNS:xot.example.test,IP:10.53.0.7\nbasicConstraints=critical,CA:FALSE\n" > leaf.ext &&
+    openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
+      -out cert.pem -days 30 -extfile leaf.ext 2>/dev/null &&
+    chmod 0644 key.pem cert.pem &&
+    cp ca.pem /srv/run/xot-ca.pem' >/dev/null || return 1
 
   info "generating signing keys"
   # P-256 for example.com., P-384 for example.net. — the two curves this tree
@@ -1107,6 +1134,47 @@ PY")
   fi
 }
 
+s43g() {
+  say "43g - XFR over TLS (RFC 9103), both directions"
+
+  # ---- the client half: rdnsd fetching from BIND over XoT ------------------
+  #
+  # BIND's `allow-transfer transport tls` for this zone is what makes holding
+  # it the assertion rather than a demonstration: a cleartext AXFR of
+  # fromxot.test. is refused, so a copy of it cannot have arrived in clear.
+  local want
+  want=$(serial_of 10.53.0.7 53 fromxot.test.)
+  if [ -n "$want" ] && wait_serial 10.53.0.9 5353 fromxot.test. "$want" 90; then
+    ok "rdnsd replicated fromxot.test. at serial $want, over TLS"
+  else
+    bad "rdnsd never matched BIND's serial for fromxot.test. (wanted ${want:-none})"
+    $COMPOSE logs --tail 20 rdnsd-secondary 2>/dev/null | sed 's/^/        | /'
+  fi
+  check "and answers out of the zone it fetched" "198.51.100.70"     <<< "$(dig_ +noall +answer -p 5353 @10.53.0.9 A www.fromxot.test.)"
+
+  # The control. Without it the line above is equally consistent with a BIND
+  # that would have handed the zone to anyone.
+  check "BIND refuses the same AXFR in clear (allow-transfer transport tls)" "REFUSED"     <<< "$(t kdig +noall +comments -p 53 @10.53.0.7 -y "$TSIG" fromxot.test. AXFR)"
+
+  # ---- the server half: rdnsd refusing a transfer that is not over TLS -----
+  #
+  # kdig is the third party here: it decides what an AXFR over TLS looks like,
+  # and it is the same client 42a used for DoT.
+  check "rdnsd with --transfer-tls-only refuses an AXFR in clear" "REFUSED"     <<< "$(t kdig +noall +comments -p 5353 @10.53.0.12 example.org. AXFR)"
+  # Through dnspython rather than a command-line client: neither kdig nor dig
+  # prints the OPT of a *failed* transfer, so "no EDE line" from either would
+  # have been a statement about the client. RFC 8914's whole value is that the
+  # refusal says which policy refused it.
+  check "...and says why rather than only no (RFC 8914)" "over TLS 1.3 only"     <<< "$(t python3 -c "
+import dns.message, dns.query, dns.rcode
+q = dns.message.make_query('example.org.', 'AXFR', use_edns=0)
+r = dns.query.tcp(q, '10.53.0.12', port=5353, timeout=5)
+print(dns.rcode.to_text(r.rcode()))
+for o in r.options:
+    print(o.to_text())")"
+  check "and answers the same AXFR over TLS" "ns1.example.org."     <<< "$(t kdig +short +tls-ca=/srv/run/dot-ca.pem +tls-hostname=dns.example.test              -p 853 @10.53.0.12 example.org. AXFR)"
+}
+
 # --------------------------------------------------------------------------
 
 report() {
@@ -1128,7 +1196,7 @@ all() {
   up
   versions
   contained
-  s43a; s43b; s43c; s43d; s43e; s43f; s42a
+  s43a; s43b; s43c; s43d; s43e; s43f; s43g; s42a
   report
 }
 
@@ -1145,9 +1213,10 @@ case "${1:-all}" in
   43d) s43d; report ;;
   43e) s43e; report ;;
   43f) s43f; report ;;
+  43g) s43g; report ;;
   42a) s42a; report ;;
   down) down ;;
   logs) shift; $COMPOSE logs "$@" ;;
   shell) $COMPOSE exec tools bash ;;
-  *) echo "usage: $0 {build|setup|up|contained|versions|43a|43b|43c|43d|43e|43f|42a|all|down|logs|shell}"; exit 2 ;;
+  *) echo "usage: $0 {build|setup|up|contained|versions|43a|43b|43c|43d|43e|43f|43g|42a|all|down|logs|shell}"; exit 2 ;;
 esac

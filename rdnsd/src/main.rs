@@ -51,6 +51,7 @@ use zones::{
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use rdns::compression::NameCompressor;
+use rdns::xot::XotTrust;
 use rdns::{
     dnssec::{DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE},
     dnssec_key::{SigningAlgorithm, SigningKey},
@@ -468,6 +469,25 @@ struct Cli {
     /// equivalent.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     tls_key: Option<PathBuf>,
+    /// PEM trust anchors for zone transfers this server *fetches* over TLS
+    /// (RFC 9103), which is what `--secondary ...+tls=name` asks for.
+    ///
+    /// Nothing here is a default: the anchors are whoever issues the
+    /// certificates of the masters this server replicates from, which for a
+    /// primary and its own secondaries is usually a private CA. A master
+    /// holding a publicly issued certificate means pointing this at the
+    /// system bundle, which is a PEM file like any other.
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
+    transfer_tls_ca: Option<PathBuf>,
+    /// Refuse a zone transfer that did not arrive over an encrypted transport.
+    ///
+    /// The other half of RFC 9103: §11 says an individual transfer "is not
+    /// considered protected by XoT unless both the client and server are
+    /// configured to use only XoT", and this is the server's half of that.
+    /// Needs a listener a transfer can arrive on — --tls-listen, --quic-listen
+    /// or --https-listen — or every transfer is refused.
+    #[arg(long, conflicts_with = "config")]
+    transfer_tls_only: bool,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///
     /// `GET /metrics` is the scrape, `GET /healthz` says the process is
@@ -527,6 +547,10 @@ struct Server {
     ctx: ServeContext,
     /// Who may ask for a zone transfer. Empty by default, which refuses everyone.
     transfer_acl: Arc<TransferAcl>,
+    /// Refuse a transfer that did not arrive over TLS 1.3 (RFC 9103 §11,
+    /// `--transfer-tls-only`). Beside the ACL because it is the other half of
+    /// the same question — the ACL says who may ask, this says on what.
+    transfer_tls_only: bool,
     tsig_keys: Arc<TsigKeyring>,
     /// The zones we replicate, so a NOTIFY can be told from a plausible one.
     secondaries: Arc<Secondaries>,
@@ -580,6 +604,8 @@ impl UpdateHandling {
 /// address-shaped things are one edit away from being swapped silently.
 struct ServePolicy {
     transfer_acl: TransferAcl,
+    /// Refuse a zone transfer that did not arrive encrypted (RFC 9103 §11).
+    transfer_tls_only: bool,
     tsig_keys: TsigKeyring,
     /// Bytes per second per client, for UDP replies. 0 is off.
     response_rate: u32,
@@ -668,6 +694,7 @@ async fn serve(
 ) -> Result<()> {
     let ServePolicy {
         transfer_acl,
+        transfer_tls_only,
         tsig_keys,
         response_rate,
         query_limit,
@@ -700,6 +727,15 @@ async fn serve(
                 format!(" [{}]", tsig_keys.describe())
             }
         )
+    };
+    // Appended rather than folded in: `--transfer-tls-only` narrows whatever
+    // the line above says, and an operator reading "allowed for 2 address
+    // rule(s)" should not have to know the flag exists to find out that none of
+    // them applies over plain TCP (RFC 9103 §11, `CLAUDE.md` §14).
+    let transfers = if transfer_tls_only {
+        format!("{transfers}, over TLS 1.3 only (--transfer-tls-only)")
+    } else {
+        transfers
     };
     let budget = if response_rate == 0 {
         "off".to_string()
@@ -809,6 +845,7 @@ async fn serve(
             udp,
         },
         transfer_acl: Arc::new(transfer_acl),
+        transfer_tls_only,
         tsig_keys: Arc::new(tsig_keys),
         secondaries,
         deltas,
@@ -1716,6 +1753,16 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
+    // A transfer arrives on a connection, and if none of them can be encrypted
+    // then this refuses every transfer there will ever be. That is a
+    // configuration that cannot do what it says, so it is a startup error and
+    // not a server that answers REFUSED to its own secondaries all night
+    // (`CLAUDE.md` §15).
+    if cli.transfer_tls_only && !encrypted {
+        return Err(anyhow!(
+            "--transfer-tls-only needs a listener a transfer can arrive on:              --tls-listen, --quic-listen or --https-listen. Without one, every              transfer is refused"
+        ));
+    }
 
     // After the keyring, because a `#key` names one of its entries.
     let notify = Arc::new(build_notify_policy(&cli, &per_zone.notify, &tsig_keys)?);
@@ -1746,6 +1793,25 @@ async fn main() -> Result<()> {
         resolve_key(spec, &tsig_keys, "--catalog")?;
     }
     secondary_specs.extend(catalog_specs.iter().cloned());
+
+    // The anchors every XoT master is checked against, and the check that a
+    // spec asking for TLS has somewhere to check against. Here, with the key
+    // resolution above and for the same reason: `--check-config` has to reach
+    // it, and "no anchors" is a startup failure rather than a transfer that
+    // goes out in clear months later (`CLAUDE.md` §4).
+    let xot = match &cli.transfer_tls_ca {
+        Some(path) => Some(XotTrust::from_ca_file(path)?),
+        None => None,
+    };
+    if xot.is_none() {
+        if let Some(spec) = secondary_specs.iter().find(|spec| spec.tls.is_some()) {
+            return Err(anyhow!(
+                "{} is replicated from {} over TLS, and --transfer-tls-ca names                  no trust anchors to check its certificate against                  (RFC 9103 §7.5)",
+                spec.zone,
+                spec.master
+            ));
+        }
+    }
 
     let replicating = !secondary_specs.is_empty();
     // Read before the source is taken apart, which consumes the two path
@@ -1927,6 +1993,7 @@ async fn main() -> Result<()> {
             notify: notify.clone(),
             readiness: readiness.clone(),
             catalogs: catalogs.clone(),
+            xot: xot.clone(),
         };
         // Before the tasks start and before anything is served: the members a
         // previous run provisioned are on disk too, and their refresh tasks do
@@ -1996,6 +2063,7 @@ async fn main() -> Result<()> {
         zone_map,
         ServePolicy {
             transfer_acl,
+            transfer_tls_only: cli.transfer_tls_only,
             tsig_keys,
             response_rate: cli.response_rate,
             query_limit,
@@ -2116,6 +2184,7 @@ mod tests {
     use rdns::record_types;
     use rdns::secondary::{zone_file_path, MasterSpec, RefreshTimers, TransferState};
     use rdns::tsig::{TsigAlgorithm, TsigKey};
+    use rdns::validation::Privacy;
     use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
     use rdns::Class;
     use rdns::QueryClass;
@@ -2137,7 +2206,7 @@ mod tests {
                 packet,
                 peer,
                 tsig::now(),
-                &Wire::Framed(&tx),
+                &Wire::Framed(&tx, Privacy::Clear),
                 &mut Scratch::default(),
             )
             .await;
@@ -2402,6 +2471,7 @@ mod tests {
             ctx: test_context(),
             journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl")),
+            transfer_tls_only: false,
             tsig_keys: Arc::new(TsigKeyring::new(keys)),
             secondaries: Arc::new(Secondaries::default()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
@@ -2507,7 +2577,7 @@ mod tests {
                     &greedy,
                     peer,
                     tsig::now(),
-                    &Wire::Framed(&tx),
+                    &Wire::Framed(&tx, Privacy::Clear),
                     &mut Scratch::default(),
                 )
                 .await;
@@ -3130,9 +3200,13 @@ mod tests {
             let scoped = key(&["other.test."]);
             let master = primary_with(scoped.clone()).await;
 
-            let err = rdns::xfr::fetch_zone(master, nm("example.com.").as_ref(), Some(&scoped))
-                .await
-                .expect_err("a key scoped to other.test. must not transfer example.com.");
+            let err = rdns::xfr::fetch_zone(
+                &rdns::xfr::Master::plain(master),
+                nm("example.com.").as_ref(),
+                Some(&scoped),
+            )
+            .await
+            .expect_err("a key scoped to other.test. must not transfer example.com.");
             // REFUSED, and reported as a refusal rather than as a bad signature:
             // the peer proved who it is and the answer is still no.
             assert!(
@@ -3147,9 +3221,13 @@ mod tests {
             let scoped = key(&["example.com."]);
             let master = primary_with(scoped.clone()).await;
 
-            let zone = rdns::xfr::fetch_zone(master, nm("example.com.").as_ref(), Some(&scoped))
-                .await
-                .expect("a key naming this zone must transfer it");
+            let zone = rdns::xfr::fetch_zone(
+                &rdns::xfr::Master::plain(master),
+                nm("example.com.").as_ref(),
+                Some(&scoped),
+            )
+            .await
+            .expect("a key naming this zone must transfer it");
             assert_eq!(zone.serial(), Some(Serial::new(1)));
         }
 
@@ -3162,9 +3240,13 @@ mod tests {
             let scoped = key(&["EXAMPLE.com"]);
             let master = primary_with(scoped.clone()).await;
 
-            let zone = rdns::xfr::fetch_zone(master, nm("example.com.").as_ref(), Some(&scoped))
-                .await
-                .expect("case and the trailing dot must not decide authorization");
+            let zone = rdns::xfr::fetch_zone(
+                &rdns::xfr::Master::plain(master),
+                nm("example.com.").as_ref(),
+                Some(&scoped),
+            )
+            .await
+            .expect("case and the trailing dot must not decide authorization");
             assert_eq!(zone.serial(), Some(Serial::new(1)));
         }
 
@@ -3177,9 +3259,13 @@ mod tests {
             let unscoped = key(&[]);
             let master = primary_with(unscoped.clone()).await;
 
-            let zone = rdns::xfr::fetch_zone(master, nm("example.com.").as_ref(), Some(&unscoped))
-                .await
-                .expect("an unscoped key is unrestricted, as it always was");
+            let zone = rdns::xfr::fetch_zone(
+                &rdns::xfr::Master::plain(master),
+                nm("example.com.").as_ref(),
+                Some(&unscoped),
+            )
+            .await
+            .expect("an unscoped key is unrestricted, as it always was");
             assert_eq!(zone.serial(), Some(Serial::new(1)));
         }
     }
@@ -3224,6 +3310,24 @@ mod tests {
         log: DeltaLog,
         keys: TsigKeyring,
     ) -> SocketAddr {
+        spawn_primary_full(zone, acl, log, keys, false, Privacy::Clear).await
+    }
+
+    /// A primary with the two XoT knobs exposed: whether it requires an
+    /// encrypted transfer, and what the connection claims to be.
+    ///
+    /// The privacy is asserted rather than negotiated, which is the point of
+    /// the split: `rdns_transport::tls` reads it off a real handshake and has
+    /// its own test for that, and this one is about what `answer_transfer`
+    /// does with the answer.
+    async fn spawn_primary_full(
+        zone: Zone,
+        acl: &[String],
+        log: DeltaLog,
+        keys: TsigKeyring,
+        transfer_tls_only: bool,
+        privacy: Privacy,
+    ) -> SocketAddr {
         let mut zones = HashMap::new();
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
 
@@ -3231,6 +3335,7 @@ mod tests {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             ctx: test_context(),
             transfer_acl: Arc::new(TransferAcl::parse(acl).expect("acl")),
+            transfer_tls_only,
             tsig_keys: Arc::new(keys),
             secondaries: Arc::new(Secondaries::default()),
             deltas: Arc::new(RwLock::new(log)),
@@ -3248,6 +3353,7 @@ mod tests {
                     server.clone(),
                     TransportLimits::default(),
                     tcp::RateLimit::PerMessage,
+                    privacy,
                     test_shutdown().stop_handle(),
                 ));
             }
@@ -3287,6 +3393,7 @@ mod tests {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             ctx: test_context(),
             transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
+            transfer_tls_only: false,
             tsig_keys: Arc::new(TsigKeyring::new(vec![key])),
             secondaries: Arc::new(Secondaries::default()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),
@@ -3308,6 +3415,7 @@ mod tests {
                     server.clone(),
                     TransportLimits::default(),
                     tcp::RateLimit::PerMessage,
+                    Privacy::Clear,
                     test_shutdown().stop_handle(),
                 ));
             }
@@ -3760,6 +3868,7 @@ mod tests {
             // latch itself is checked.
             readiness: Readiness::ready(),
             catalogs: no_catalogs(),
+            xot: None,
         }
     }
 
@@ -3783,6 +3892,7 @@ mod tests {
             zone: nm("example.com."),
             master,
             key_name: None,
+            tls: None,
         };
         let r = replication(&dir, NotifyPolicy::default());
 
@@ -3846,6 +3956,7 @@ mod tests {
             zone: nm("example.com."),
             master,
             key_name: None,
+            tls: None,
         };
         let r = replication(&dir, NotifyPolicy::default());
 
@@ -3883,6 +3994,7 @@ mod tests {
                 zone: nm(&spec_zone.clone()),
                 master: old,
                 key_name: None,
+                tls: None,
             },
             None,
             &r,
@@ -3905,6 +4017,7 @@ mod tests {
                 zone: nm(&spec_zone),
                 master: new,
                 key_name: None,
+                tls: None,
             },
             None,
             &r,
@@ -3936,6 +4049,7 @@ mod tests {
             zone: nm("example.com."),
             master,
             key_name: None,
+            tls: None,
         };
 
         let zone = rdns::zone::parse_zone_file(&zone_text(7), "example.com.").expect("zone");
@@ -3968,6 +4082,7 @@ mod tests {
             notify: Arc::new(NotifyPolicy::default()),
             readiness: Readiness::ready(),
             catalogs: no_catalogs(),
+            xot: None,
         };
         expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
         assert!(
@@ -3990,6 +4105,7 @@ mod tests {
             zone: nm("example.com."),
             master,
             key_name: None,
+            tls: None,
         };
 
         let zone = rdns::zone::parse_zone_file(&zone_text(7), "example.com.").expect("zone");
@@ -4021,6 +4137,7 @@ mod tests {
             notify: Arc::new(NotifyPolicy::default()),
             readiness: Readiness::ready(),
             catalogs: no_catalogs(),
+            xot: None,
         };
         expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
         assert_eq!(zone_map.read().await.len(), 1, "still served");
@@ -4051,6 +4168,7 @@ mod tests {
             zone: nm("example.com."),
             master,
             key_name: None,
+            tls: None,
         };
         refresh_once(&spec(first), None, &r, &test_shutdown().busy())
             .await
@@ -4143,6 +4261,7 @@ mod tests {
             zone: nm("example.com."),
             master,
             key_name: None,
+            tls: None,
         };
 
         refresh_once(&spec, None, &r, &test_shutdown().busy())
@@ -4197,6 +4316,7 @@ mod tests {
             zone: nm("example.com."),
             master,
             key_name: None,
+            tls: None,
         };
         refresh_once(&spec, None, &r, &test_shutdown().busy())
             .await
@@ -4406,6 +4526,7 @@ mod tests {
             zone: nm("example.com."),
             master,
             key_name: None,
+            tls: None,
         };
 
         // The first transfer announces; drain it.
@@ -4442,6 +4563,7 @@ mod tests {
             zone: nm("example.com."),
             master,
             key_name: None,
+            tls: None,
         };
 
         let first = spawn_primary(&zone_text(7)).await;
@@ -4687,6 +4809,154 @@ mod tests {
         );
     }
 
+    /// RFC 9103 §11's server half: with `--transfer-tls-only` a transfer that
+    /// arrived in clear is refused, whatever the ACL says about the peer.
+    ///
+    /// The ACL here *allows* 127.0.0.1, so the only thing that can refuse this
+    /// is the transport policy — which is what makes it a test of the policy
+    /// and not of the ACL.
+    #[tokio::test]
+    async fn a_transfer_in_clear_is_refused_when_tls_is_required() {
+        let zone = rdns::zone::parse_zone_file(&zone_text(7), "example.com.").expect("zone");
+        let master = spawn_primary_full(
+            zone,
+            &["127.0.0.1".to_string()],
+            DeltaLog::new(),
+            TsigKeyring::new(Vec::new()),
+            true,
+            Privacy::Clear,
+        )
+        .await;
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        let dir = ScratchDir::new("xot-required");
+        let r = replication(&dir, NotifyPolicy::default());
+
+        let err = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Refused"), "got: {err}");
+    }
+
+    /// And the refusal says which policy refused it, because "REFUSED" over a
+    /// working TLS connection is otherwise an afternoon's debugging
+    /// (RFC 8914, `TODO.md` #44b). Read off the wire rather than from the
+    /// constant: the reply's OPT is where it has to be (RFC 8914 §2), and an
+    /// EDE that never reaches it is the same as none.
+    #[tokio::test]
+    async fn the_refusal_says_the_transfer_must_be_encrypted() {
+        let zone = rdns::zone::parse_zone_file(&zone_text(7), "example.com.").expect("zone");
+        let master = spawn_primary_full(
+            zone,
+            &["127.0.0.1".to_string()],
+            DeltaLog::new(),
+            TsigKeyring::new(Vec::new()),
+            true,
+            Privacy::Clear,
+        )
+        .await;
+
+        // With an OPT, because that is where the reason rides and a request
+        // without one gets a reply without one.
+        let mut request = rdns::xfr::axfr_request(nm("example.com.").as_ref(), 0x77);
+        request.edns = Some(rdns::Edns::with_payload_size(4096));
+        let mut buf = vec![0u8; 512];
+        let n = request.to_bytes(&mut buf).expect("serialize");
+        let mut framed = (n as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&buf[..n]);
+
+        let mut stream = TcpStream::connect(master).await.expect("connect");
+        stream.write_all(&framed).await.expect("send");
+        let mut length = [0u8; 2];
+        stream.read_exact(&mut length).await.expect("length");
+        let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+        stream.read_exact(&mut packet).await.expect("reply");
+        let reply = rdns::DnsMessage::try_from_bytes(&packet).expect("parse the reply");
+
+        assert_eq!(reply.rcode, ResponseCode::Refused);
+        let edns = reply.edns.as_ref().expect("the reply mirrors the OPT");
+        let reasons = rdns::ExtendedError::all_in(edns).expect("readable options");
+        assert!(
+            reasons
+                .iter()
+                .any(|(_, text)| text.contains("over TLS 1.3 only")),
+            "the refusal should say which policy refused it: {reasons:?}"
+        );
+    }
+
+    /// And the same server answers the same request when the connection is one
+    /// RFC 9103 §7.2 accepts. Without this the test above is equally consistent
+    /// with a server that refuses every transfer.
+    #[tokio::test]
+    async fn the_same_transfer_is_answered_over_tls() {
+        let zone = rdns::zone::parse_zone_file(&zone_text(7), "example.com.").expect("zone");
+        let master = spawn_primary_full(
+            zone,
+            &["127.0.0.1".to_string()],
+            DeltaLog::new(),
+            TsigKeyring::new(Vec::new()),
+            true,
+            Privacy::Tls13,
+        )
+        .await;
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        let dir = ScratchDir::new("xot-allowed");
+        let r = replication(&dir, NotifyPolicy::default());
+
+        refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("a transfer over an encrypted connection");
+        assert!(
+            r.served
+                .zone_map
+                .read()
+                .await
+                .matching(nm("example.com.").as_ref())
+                .is_some(),
+            "the zone should have been installed"
+        );
+    }
+
+    /// TLS 1.2 is a fine way to ask a question and not a way to take a zone:
+    /// RFC 9103 §7.2 is "MUST use only TLS 1.3 [RFC8446] or later", where
+    /// RFC 7858 §4.1 asks only for 1.2. A bool in place of [`Privacy`] would
+    /// have made this case invisible.
+    #[tokio::test]
+    async fn tls_older_than_1_3_does_not_satisfy_the_transfer_policy() {
+        let zone = rdns::zone::parse_zone_file(&zone_text(7), "example.com.").expect("zone");
+        let master = spawn_primary_full(
+            zone,
+            &["127.0.0.1".to_string()],
+            DeltaLog::new(),
+            TsigKeyring::new(Vec::new()),
+            true,
+            Privacy::TlsOlder,
+        )
+        .await;
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        let dir = ScratchDir::new("xot-tls12");
+        let r = replication(&dir, NotifyPolicy::default());
+
+        let err = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Refused"), "got: {err}");
+    }
+
     /// An IXFR is gated by the same ACL as an AXFR, and it has to be: it may
     /// *answer* with the whole zone (RFC 1995 §4), so a policy that let it
     /// through would be no policy at all. The default is to refuse everyone, and
@@ -4698,6 +4968,7 @@ mod tests {
             zone: nm("example.com."),
             master,
             key_name: None,
+            tls: None,
         };
         let dir = ScratchDir::new("refused");
         let r = replication(&dir, NotifyPolicy::default());
@@ -4846,6 +5117,7 @@ mod tests {
                 zone: nm("example.com."),
                 master: "192.0.2.1:53".parse().unwrap(),
                 key_name: None,
+                tls: None,
             }];
             Replica {
                 dir,
@@ -5078,6 +5350,7 @@ mod tests {
             ctx: test_context(),
             journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
+            transfer_tls_only: false,
             tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
             secondaries: Arc::new(Secondaries::default()),
             deltas: Arc::new(RwLock::new(DeltaLog::new())),

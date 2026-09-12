@@ -23,7 +23,6 @@
 //! exists for is the entire point of it.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -49,9 +48,11 @@ use crate::replication::{
 /// member zones SHOULD NOT be mentioned in the catalog zone data", so the only
 /// key a consumer can use for a member is one it was already configured with.
 struct CatalogSpec {
-    zone: Name,
-    master: SocketAddr,
-    key_name: Option<String>,
+    /// The catalog zone as `--catalog` named it. Kept whole rather than
+    /// unpacked into three fields, because a member inherits it whole: the
+    /// unpacked copy is what silently drops a field added later, and the field
+    /// added later was `tls` (`TODO.md` #44d, `CLAUDE.md` §7).
+    spec: MasterSpec,
     /// Resolved once at startup, so a member added at three in the morning
     /// cannot fail on a key name that was already known to be missing.
     key: Option<TsigKey>,
@@ -126,12 +127,7 @@ impl Catalogs {
             );
             by_zone.insert(
                 NameKeyBuf::new(spec.zone.as_ref()),
-                CatalogSpec {
-                    zone: spec.zone,
-                    master: spec.master,
-                    key_name: spec.key_name,
-                    key,
-                },
+                CatalogSpec { spec, key },
             );
         }
         Ok(Arc::new(Catalogs {
@@ -149,7 +145,7 @@ impl Catalogs {
     pub(crate) fn zones(&self) -> Vec<Name> {
         self.by_zone
             .values()
-            .map(|spec| spec.zone.clone())
+            .map(|spec| spec.spec.zone.clone())
             .collect()
     }
 
@@ -174,11 +170,7 @@ impl Catalogs {
         let mut orphaned: Vec<Name> = Vec::new();
         for (zone, node) in state.membership.rows() {
             match self.by_zone.get(&*catalog_of(node.as_ref()).folded()) {
-                Some(spec) => specs.push(MasterSpec {
-                    zone: zone.clone(),
-                    master: spec.master,
-                    key_name: spec.key_name.clone(),
-                }),
+                Some(spec) => specs.push(spec.spec.for_member(zone.clone())),
                 None => orphaned.push(zone.clone()),
             }
         }
@@ -262,10 +254,10 @@ impl Catalogs {
             .await;
         // Where the fact changes, not where it is read (`CLAUDE.md` §14): this
         // is the only moment membership moves.
-        replication
-            .served
-            .metrics
-            .set_catalog_members(zone, state.membership.members_of(spec.zone.as_ref()).len());
+        replication.served.metrics.set_catalog_members(
+            zone,
+            state.membership.members_of(spec.spec.zone.as_ref()).len(),
+        );
         if let Some(serial) = held.serial() {
             state.reconciled.insert(key, serial);
         }
@@ -292,7 +284,7 @@ impl Catalogs {
         replication: &ReplicationContext,
         lifecycle: &Lifecycle,
     ) {
-        let mine: Vec<(Name, Name)> = state.membership.members_of(spec.zone.as_ref());
+        let mine: Vec<(Name, Name)> = state.membership.members_of(spec.spec.zone.as_ref());
 
         for member in catalog.members() {
             let held = mine
@@ -328,7 +320,7 @@ impl Catalogs {
                         // an error SHOULD be logged".
                         tracing::error!(
                             "catalog {}: ignoring member {} — {why}",
-                            spec.zone,
+                            spec.spec.zone,
                             member.zone()
                         );
                     }
@@ -341,7 +333,7 @@ impl Catalogs {
                         // per refresh, forever.
                         tracing::debug!(
                             "catalog {}: {} has already moved to {to}",
-                            spec.zone,
+                            spec.spec.zone,
                             member.zone()
                         );
                     }
@@ -349,7 +341,7 @@ impl Catalogs {
                         tracing::info!(
                             "catalog {}: taking {} over from {from}, which carries a coo \
                              property naming us (RFC 9432 §4.3.1)",
-                            spec.zone,
+                            spec.spec.zone,
                             member.zone()
                         );
                         if reset {
@@ -384,7 +376,7 @@ impl Catalogs {
                     state,
                     zone.as_ref(),
                     replication,
-                    &format!("catalog {} no longer lists it", spec.zone),
+                    &format!("catalog {} no longer lists it", spec.spec.zone),
                 )
                 .await;
             }
@@ -411,14 +403,14 @@ impl Catalogs {
             return Ownership::Taken("the configuration already names that zone".to_string());
         }
         if let Some(other) = self.by_zone.get(&*zone.folded()) {
-            return Ownership::Taken(format!("{} is a catalog zone here", other.zone));
+            return Ownership::Taken(format!("{} is a catalog zone here", other.spec.zone));
         }
         let Some(owner) = state.membership.owner_of(zone) else {
             return Ownership::Free;
         };
         // Ours already — reachable only if the caller's view of the membership
         // is older than this one, which is a reason to do nothing either way.
-        if owner.as_ref() == spec.zone.as_ref() {
+        if owner.as_ref() == spec.spec.zone.as_ref() {
             return Ownership::Free;
         }
         // We handed it to that catalog ourselves, and §4.3.1 keeps it listed
@@ -444,7 +436,7 @@ impl Catalogs {
             .and_then(|catalog| {
                 catalog
                     .member(zone)
-                    .filter(|old| old.coo() == Some(spec.zone.as_ref()))
+                    .filter(|old| old.coo() == Some(spec.spec.zone.as_ref()))
                     // §4.3.1: the same member node label carries the state over,
                     // a different one resets it (§5.6). Folded, because every
                     // other comparison of a label here is (RFC 4343).
@@ -469,15 +461,11 @@ impl Catalogs {
         lifecycle: &Lifecycle,
     ) {
         let zone = member.zone().to_owned();
-        let master = MasterSpec {
-            zone: zone.clone(),
-            master: spec.master,
-            key_name: spec.key_name.clone(),
-        };
+        let master = spec.spec.for_member(zone.clone());
         tracing::info!(
             "catalog {}: serving {zone} from {}{}",
-            spec.zone,
-            spec.master,
+            spec.spec.zone,
+            spec.spec.master,
             describe_groups(member)
         );
         // The same rule a configured secondary gets at startup: a copy on disk
@@ -812,6 +800,7 @@ mod tests {
                     zone: nm(zone),
                     master: MASTER.parse().expect("a test address"),
                     key_name: None,
+                    tls: None,
                 })
                 .collect();
             let catalogs = Catalogs::new(
@@ -836,6 +825,7 @@ mod tests {
                     notify: Arc::new(NotifyPolicy::default()),
                     readiness: Readiness::ready(),
                     catalogs: catalogs.clone(),
+                    xot: None,
                 },
                 dir,
                 catalogs,

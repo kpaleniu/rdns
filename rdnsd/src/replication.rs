@@ -37,7 +37,8 @@ use rdns::secondary::{
 };
 use rdns::shutdown::{Busy, Lifecycle};
 use rdns::tsig::{TsigKey, TsigKeyring};
-use rdns::xfr;
+use rdns::xfr::{self, Master};
+use rdns::xot::{XotClient, XotTrust};
 use rdns::zone::Zone;
 use rdns::zone_writer::write_zone_file;
 use rdns::NameRef;
@@ -251,6 +252,40 @@ pub(crate) struct ReplicationContext {
     /// provisions what it lists (RFC 9432 §5.1). Empty for a server with no
     /// `--catalog`, where every call below is a map probe that misses.
     pub(crate) catalogs: Arc<crate::catalog::Catalogs>,
+    /// The anchors an XoT master's certificate is checked against
+    /// (`--transfer-tls-ca`), or `None` when nothing is transferred over TLS.
+    ///
+    /// One per process rather than one per master: who issues certificates is
+    /// not a decision an operator takes per peer, and the name that *is* per
+    /// peer is in [`MasterSpec::tls`].
+    pub(crate) xot: Option<XotTrust>,
+}
+
+impl ReplicationContext {
+    /// How to reach this spec's master: TLS when the spec asked for it
+    /// (RFC 9103), plain TCP otherwise.
+    ///
+    /// The error cannot be reached from a running server — startup refuses a
+    /// `+tls=` spec when no `--transfer-tls-ca` names the anchors, and a
+    /// catalog's member inherits its catalog's spec whole
+    /// ([`MasterSpec::for_member`]). It is an error rather than a fall back to
+    /// cleartext because a transfer that quietly goes out unencrypted after an
+    /// operator asked for TLS is `CLAUDE.md` §4's case exactly: nothing fails,
+    /// and the zone crosses the wire in the clear.
+    fn master(&self, spec: &MasterSpec) -> Result<Master> {
+        match (&spec.tls, &self.xot) {
+            (None, _) => Ok(Master::plain(spec.master)),
+            (Some(name), Some(trust)) => Ok(Master::over_tls(
+                spec.master,
+                XotClient::new(trust.clone(), name.clone()),
+            )),
+            (Some(name), None) => Err(anyhow!(
+                "{} is transferred from {} over TLS as {name}, and no                  --transfer-tls-ca names the anchors to check its certificate                  against (RFC 9103 §7.5)",
+                spec.zone,
+                spec.master
+            )),
+        }
+    }
 }
 
 /// Start a refresh task per (zone, master), and return what a NOTIFY needs to
@@ -432,6 +467,7 @@ pub(crate) async fn refresh_once(
         notify,
         readiness,
         catalogs: _,
+        xot: _,
     } = replication;
     let ZoneContext {
         zone_map, metrics, ..
@@ -441,7 +477,8 @@ pub(crate) async fn refresh_once(
     let base = zone_map.read().await.matching(spec.zone.as_ref()).cloned();
     let held = base.as_ref().and_then(Zone::serial);
 
-    let remote = xfr::fetch_soa(spec.master, spec.zone.as_ref(), key).await?;
+    let master = replication.master(spec)?;
+    let remote = xfr::fetch_soa(&master, spec.zone.as_ref(), key).await?;
     let now = current_unix_timestamp();
 
     // EXPIRE resets on contact, not on a transfer: a zone confirmed current is
@@ -457,7 +494,7 @@ pub(crate) async fn refresh_once(
     // whole zone (RFC 1995 §4).
     let mut note = String::new();
     let fetched = match &base {
-        Some(base) => match xfr::fetch_changes(spec.master, base, key).await? {
+        Some(base) => match xfr::fetch_changes(&master, base, key).await? {
             xfr::IxfrOutcome::UpToDate(serial) => {
                 // The SOA probe said otherwise a moment ago: the master changed
                 // its mind between the two questions.
@@ -484,7 +521,7 @@ pub(crate) async fn refresh_once(
                 zone
             }
         },
-        None => xfr::fetch_zone(spec.master, spec.zone.as_ref(), key).await?,
+        None => xfr::fetch_zone(&master, spec.zone.as_ref(), key).await?,
     };
 
     let serial = fetched

@@ -32,7 +32,7 @@ use rdns::{
     transfer::axfr_envelopes,
     tsig::{self, TsigCheck, TsigSession},
     update,
-    validation::{Request, Transport},
+    validation::{Privacy, Request, Transport},
     zone::{parse_zone_file_at, Zone},
     DnsMessage, ExtendedError, OpCode, Qtype, ResponseCode,
 };
@@ -54,9 +54,14 @@ use crate::{Scratch, Server};
 /// transfer is TCP-only" is now a branch the compiler can see rather than a
 /// comment about which caller got here.
 pub(super) enum Wire<'a> {
-    /// A connection's writer. Length-prefixed (RFC 1035 §4.2.2), a sequence
-    /// allowed, and no response budget: the handshake proved the address.
-    Framed(&'a mpsc::Sender<Reply>),
+    /// A connection's writer, and what the connection hid from the path.
+    /// Length-prefixed (RFC 1035 §4.2.2), a sequence allowed, and no response
+    /// budget: the handshake proved the address.
+    ///
+    /// The [`Privacy`] rides here rather than beside it because it is a fact
+    /// about *this* connection and only a framed one can carry a transfer,
+    /// which is the one answer that has a policy about it (RFC 9103 §11).
+    Framed(&'a mpsc::Sender<Reply>, Privacy),
     /// One datagram back to the peer, capped by its EDNS advertisement and
     /// charged against the response budget.
     Datagram(&'a UdpSocket, SocketAddr),
@@ -67,7 +72,7 @@ impl Wire<'_> {
     /// reply's size ceiling and whether the response budget applies.
     fn transport(&self) -> Transport {
         match self {
-            Wire::Framed(_) => Transport::Tcp,
+            Wire::Framed(..) => Transport::Tcp,
             Wire::Datagram(..) => Transport::Udp,
         }
     }
@@ -78,7 +83,7 @@ impl Wire<'_> {
     /// is what removes the `&framed[2..]` the UDP UPDATE path did by hand.
     async fn send(&self, bytes: &[u8], logger: &QueryLogger, ip: IpAddr) {
         match self {
-            Wire::Framed(out) => {
+            Wire::Framed(out, _) => {
                 send_framed(out, bytes).await;
             }
             Wire::Datagram(socket, peer) => {
@@ -100,13 +105,26 @@ impl tcp::Handler for Server {
         &self.ctx
     }
 
-    async fn handle(&self, packet: Vec<u8>, peer: SocketAddr, now: u64, out: mpsc::Sender<Reply>) {
+    async fn handle(
+        &self,
+        packet: Vec<u8>,
+        peer: SocketAddr,
+        now: u64,
+        privacy: Privacy,
+        out: mpsc::Sender<Reply>,
+    ) {
         // A scratch per message here, where the UDP worker keeps one per worker:
         // `tcp::Handler` has no per-connection state to hang one on
         // (`TODO.md` #39e).
         let mut scratch = Scratch::default();
-        self.answer(&packet, peer, now, &Wire::Framed(&out), &mut scratch)
-            .await;
+        self.answer(
+            &packet,
+            peer,
+            now,
+            &Wire::Framed(&out, privacy),
+            &mut scratch,
+        )
+        .await;
     }
 }
 
@@ -219,8 +237,8 @@ impl Server {
         // IXFR over UDP is answered with a single SOA (RFC 1995 §2), both of
         // which `write_response` does below.
         if matches!(qtype, Some(Qtype::AXFR) | Some(Qtype::IXFR)) {
-            if let Wire::Framed(out) = wire {
-                self.answer_transfer(&msg, peer, session.as_mut(), now, out)
+            if let Wire::Framed(out, privacy) = wire {
+                self.answer_transfer(&msg, peer, session.as_mut(), now, *privacy, out)
                     .await;
                 return;
             }
@@ -303,7 +321,7 @@ impl Server {
             None => ceiling,
         };
         let mut reply: Option<Cow<'_, [u8]>> = match wire {
-            Wire::Framed(_) => Some(Cow::Borrowed(scratch.out.as_slice())),
+            Wire::Framed(..) => Some(Cow::Borrowed(scratch.out.as_slice())),
             Wire::Datagram(..) => match self.ctx.admit_response(ip, scratch.out.len(), now) {
                 ResponseVerdict::Send => Some(Cow::Borrowed(scratch.out.as_slice())),
                 ResponseVerdict::Truncate => {
@@ -362,6 +380,7 @@ impl Server {
         peer: SocketAddr,
         mut session: Option<&mut TsigSession>,
         now: u64,
+        privacy: Privacy,
         out: &mpsc::Sender<Reply>,
     ) {
         let ip = peer.ip();
@@ -372,6 +391,41 @@ impl Server {
             .unwrap_or_default();
         let incremental = msg.queries.first().map(|q| q.qtype) == Some(Qtype::IXFR);
         let kind = if incremental { "IXFR" } else { "AXFR" };
+
+        // Before anything about who is asking: RFC 9103 §11 — "An individual
+        // zone transfer is not considered protected by XoT unless both the
+        // client and server are configured to use only XoT" — and this is the
+        // server's half. TLS 1.3 or better, because §7.2 is "All
+        // implementations of this specification MUST use only TLS 1.3
+        // [RFC8446] or later" and a 1.2 DoT connection is a fine way to ask a
+        // question and not a way to take a zone.
+        //
+        // REFUSED, not NOTAUTH: the zone exists and the answer is policy. The
+        // reply says which policy, because "REFUSED" alone over a working TLS
+        // connection is the sort of thing an operator debugs for an afternoon
+        // (RFC 8914, `TODO.md` #44b).
+        if self.transfer_tls_only && !privacy.is_xot() {
+            serving_error!(
+                self.ctx.logger,
+                ip,
+                "{kind} of {qname} REFUSED: --transfer-tls-only, and this one                  arrived over {}",
+                match privacy {
+                    Privacy::Clear => "an unencrypted connection",
+                    Privacy::TlsOlder => "TLS older than 1.3 (RFC 9103 §7.2)",
+                    Privacy::Tls13 => "TLS 1.3",
+                }
+            );
+            self.send_transfer_error(
+                msg,
+                ResponseCode::Refused,
+                Some(NOT_OVER_TLS),
+                ip,
+                session,
+                out,
+            )
+            .await;
+            return;
+        }
 
         // Either a verified TSIG or an address rule grants the transfer, and an
         // IXFR is gated identically because it may answer with the whole zone
@@ -902,6 +956,19 @@ impl Server {
 const NOT_YOURS: ExtendedError =
     ExtendedError::new(InfoCode::PROHIBITED, "not authorized for this zone");
 
+/// A transfer this server would answer, over a connection it will not answer
+/// it on (`--transfer-tls-only`, RFC 9103 §11).
+///
+/// Not PROHIBITED, which is about the client's credential: this client may be
+/// perfectly authorized and asking on the wrong socket, and telling it so is
+/// the difference between an operator adding a key it does not need and one
+/// turning on the transport it does. RFC 8914 has no code for "use the
+/// encrypted transport", so OTHER carries the sentence (§4.1).
+const NOT_OVER_TLS: ExtendedError = ExtendedError::new(
+    InfoCode::OTHER,
+    "zone transfers here are over TLS 1.3 only (RFC 9103)",
+);
+
 /// An UPDATE for a zone this server replicates. Not PROHIBITED â the
 /// credential was good and the refusal is about where the zone is written, so
 /// OTHER carries what the text says (§4.1: "does not match known extended
@@ -1177,6 +1244,7 @@ mod tests {
             zone: nm("replicated.test."),
             master: "192.0.2.1:53".parse().expect("a test address"),
             key_name: None,
+            tls: None,
         }]);
 
         let primary_zone = rdns::zone::parse_zone_file(

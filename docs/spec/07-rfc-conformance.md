@@ -57,7 +57,7 @@ each row exists (`CLAUDE.md` §11).
 | 8484 | DNS over HTTPS | **yes**, both daemons — `TODO.md` #42c. 443, `/dns-query` by default, POST and GET, `Cache-Control` from the answer's smallest TTL. HTTP/2 preferred by ALPN with HTTP/1.1 behind it. A zone transfer cannot go over it and the module says why | `rdns_transport::https` |
 | 9432 | catalog zones | **the consumer side** (2026-09-12): §4's whole schema incl. `coo` and `group`, §5.1's broken-catalog rule, §5.2's clash rule, §5.3's removal, §5.4's state reset, §4.3.1's migration. Group values are read and not acted on (`TODO.md` #48). The producer side needs no code — a catalog is an ordinary zone | `rdns/src/catalog.rs`, `rdnsd/src/catalog.rs` |
 | 8914 | Extended DNS Errors | no — filed as `TODO.md` #44b | — |
-| 9103 | zone transfer over TLS | no — filed as `TODO.md` #44d, a fourth stage of #42 | — |
+| 9103 | zone transfer over TLS | **yes**, both directions (2026-09-12, `TODO.md` #44d). As a secondary: `--secondary zone@addr[:port][#key]+tls=name`, TLS 1.3 only (§7.2), ALPN `dot` (§7.1), port 853 by default (§7.3), the master authenticated by name against `--transfer-tls-ca` (§7.5) with no opportunistic mode. As a primary: `--transfer-tls-only` refuses a transfer that did not arrive over TLS 1.3 (§11). The client is authorized by the address ACL and TSIG, which is §7.5's second method; **mutual TLS is not implemented** and is `TODO.md` #51 | `rdns/src/xot.rs`, `rdns/src/xfr.rs`, `rdnsd`'s `answer_transfer` |
 | 8901 | multi-signer DNSSEC | no — filed as `TODO.md` #44e | — |
 | 8767 | serve-stale | no — filed as `TODO.md` #45b | — |
 | 6147 | DNS64 | no — filed as `TODO.md` #45c | — |

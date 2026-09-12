@@ -39,6 +39,8 @@ https-listen = "0.0.0.0:443"
 https-path = "/dns-query"
 tls-cert = "/etc/rdns/tls/fullchain.pem"
 tls-key = "/etc/rdns/tls/privkey.pem"   # mode 0600, checked
+transfer-tls-ca = "/etc/rdns/xot-ca.pem"  # anchors for XoT masters (RFC 9103)
+transfer-tls-only = false     # true: refuse a transfer not over TLS 1.3
 control-socket = "/run/rdns/rdnsd.sock"
 allow-partial-load = false
 
@@ -65,6 +67,9 @@ validity-days = 7
 [zones."catalog.invalid."]
 masters = ["192.0.2.9#partner.key."]
 catalog = true                  # its members are served too — see 03 §3.10
+
+[zones."private.example."]      # fetched over TLS: RFC 9103, port 853 by default
+masters = ["192.0.2.9#partner.key.+tls=ns1.partner.example."]
 ```
 
 Rules the schema encodes:
@@ -85,6 +90,11 @@ Rules the schema encodes:
   catalog is in the catalog list and *not* also in the secondary list — startup
   adds it to the second itself, and a zone in both would be two refresh tasks
   asking one master the same question.
+- A master is parsed by `MasterSpec::parse`, the same function the flag uses, so
+  the file and `--secondary` cannot disagree about what `#key` or `+tls=` means.
+- `+tls=` needs `server.transfer-tls-ca`, and the name after it is not optional:
+  RFC 9103 §7.5 has the client authenticate the master, so there is no spelling
+  of "encrypt but do not check".
 
 ### Secret files
 

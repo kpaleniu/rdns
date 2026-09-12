@@ -18,6 +18,8 @@ sha1 = "0.10"
 sha2 = "0.10"
 
 tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
 # The subscriber is here, but nothing in this crate installs one: `logging::init`
 # exists so that `rdnsd` and `rdnsr` configure logging identically rather than
@@ -35,6 +37,10 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 # Allocation counting for `tests/allocations.rs`. A dev-dependency, so a normal
 # build of the library never sees it.
 dhat = "0.3"
+# A certificate per run for the XFR-over-TLS tests (`TODO.md` #44d), the same
+# dev-dependency and the same flags `rdns-transport` uses for DoT's — so it is
+# one version in the lock rather than two, and still zero runtime packages.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [[bench]]
 name = "answer_path"

@@ -37,13 +37,14 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#50**, **#44** (44a, 44b and 44c done), **#45**, **#47**, **#48**, **#49** and
-**#21**, as of 2026-09-12. **#50 is the only defect among them** and the only
-one that is urgent: a signed zone above a few thousand records cannot be loaded,
+**#50**, **#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51**,
+**#52** and **#21**, as of 2026-09-12. **#50 is the only defect among them**
+that has teeth, and the only one that is urgent: a signed zone above a few thousand records cannot be loaded,
 which 44c's measurement found. #44 is what an operator would find missing in
 `rdnsd`, #45 what an ISP would find missing in `rdnsr`, #47 is the one gap 44b
-left behind, #48 and #49 the two 44a left, and #21 is an inventory of deliberate
-deviations rather than a queue. Everything else numbered is closed;
+left behind, #48 and #49 the two 44a left, #51 the one 44d left, #52 a flaky
+test found on the way, and #21 is an inventory of deliberate deviations rather
+than a queue. Everything else numbered is closed;
 the table under "Closed work" says which, when, and where the reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
@@ -474,9 +475,9 @@ cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone   --metrics-list
 # Interoperability against BIND, Knot, NSD and Unbound (#43). One docker compose
 # network, `internal: true` and no published ports, so nothing it runs is
 # reachable from off the machine; `contained` asserts that four ways before any
-# scenario starts. 141 assertions, and the peers' versions are printed by every
+# scenario starts. 158 assertions, and the peers' versions are printed by every
 # run because "interop passed" without them names nothing.
-tests/interop/run.sh all            # images, setup, five scenarios; leaves it up
+tests/interop/run.sh all            # images, setup, every scenario; leaves it up
 tests/interop/run.sh 43c            # one scenario against a network already up
 tests/interop/run.sh shell          # a prompt inside the network
 tests/interop/run.sh down           # and give the volumes back
@@ -819,8 +820,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#50**, **#44** (44a, 44b and 44c done), **#45**, **#47**, **#48**, **#49** and
-**#21** — see "What is open" above,
+**#50**, **#44** (44a-44d done), **#45**, **#47**, **#48**, **#49**, **#51**,
+**#52** and **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -857,10 +858,12 @@ Then, in order and for stated reasons:
    it is the only one carrying a second change — the metrics server folding onto
    `hyper`.~~ **All three done 2026-09-12, in that order and for those reasons**,
    which held. **44d** (XFR over TLS) is the fourth stage that row named and is
-   what is left of it: the rustls plumbing and the ALPN dispatch are in place and
-   a transfer already works over DoT and DoQ unchanged, so what it still needs is
-   the policy half — which keys and which peers may transfer over which
-   transport.
+   ~~what is left of it: the rustls plumbing and the ALPN dispatch are in place
+   and a transfer already works over DoT and DoQ unchanged, so what it still
+   needs is the policy half — which keys and which peers may transfer over which
+   transport.~~ **Done 2026-09-12**, and the policy half was the smaller one: the
+   client half had no code at all, because nothing here had ever spoken TLS as a
+   client.
 4. ~~**44c**, the scale measurement, whenever somebody wants a number rather
    than a feature.~~ **Taken 2026-09-12**, and it was not a number rather than a
    feature: the four figures it was filed for are unremarkable and the fifth is
@@ -948,7 +951,7 @@ missing is the operational surface around the answering, which is the same shape
 | ~~**44a**~~ | ~~catalog zones (RFC 9432, "DNS Catalog Zones") — **0 hits**~~ **Done 2026-09-12**, three commits: the parse in `rdns::catalog`, then `--catalog` and the provisioning in `rdnsd`, then a scenario against BIND as the producer (`tests/interop`, 43f) | ~~The largest one. A catalog zone is an ordinary zone whose contents are the *list* of zones a secondary should serve, so provisioning becomes a transfer rather than a configuration-management problem. BIND, Knot, NSD and PowerDNS all implement it. Below a handful of zones nobody misses it; somewhere around a hundred, configuring each secondary by hand stops being possible, and that is where an evaluation ends. This tree is unusually well placed for it — the consumer side is an AXFR, a parse and `install_zone`, all of which exist~~ **The placement held and the sizing did not.** The AXFR, the parse and `install_zone` were indeed free; what the row did not see is that provisioning is a *diff*, and a diff needs a third thing the catalog does not contain — which zones this server provisioned last time, and under which member node. §5.3 makes removal conditional on the first and §5.4 makes a reset conditional on the second, so both had to become a sidecar (`rdnsd.catalog`) with the same rule the transfer state has: forgetting it serves a withdrawn zone with AA set. Two things the filing did not see either — the registry of replicated zones was a `HashMap` built once at startup, so membership changing at runtime made it a type with a lock and a `retire`, and that turned up a defect of its own: the reload's EXPIRE check read a list of `--secondary` specs fixed at startup, which a catalog's members would never have joined. And RFC 9432 §6 is worth reading before deploying it: an empty catalog from a buggy producer deletes every member zone, which is why removals are WARN and why `dns_catalog_members` exists. Left behind: **#48** and **#49** |
 | ~~**44b**~~ | ~~Extended DNS Errors (RFC 8914) — **0 hits**~~ **Done 2026-09-12**, two commits: `rdnsd`'s eight refusal sites, then the resolver's SERVFAILs and `rdnsc`'s printing of what it receives | ~~Small, and the highest value per line on this page. A bare SERVFAIL is a support ticket; the same SERVFAIL carrying EDE 6 (DNSSEC Bogus) or EDE 7 (Signature Expired) is a fixed problem. It is an EDNS option, the option list already round-trips, and the RCODE space is already a data-carrying type. Its absence is also a *signal* — it reads as software written by somebody who has not had to debug DNS at 3am~~ **Every clause held except "small".** The option and `rdnsd`'s half are small; the resolver's half is what the row was actually asking for, and it cost a type — the reason a check found had to be carried up to the reply, so `RrsetProof::Bogus`, `ValidationState::Bogus` and `DelegationVerdict::Bogus` all took a `dnssec::Bogus { code, why }` in place of a `String`, at 24 construction sites. That is §17's argument arriving from the other direction: the code is not derivable at the top, so it has to be in the type at the bottom. Two things the filing did not see — EXTRA-TEXT is `&'static str`, because `Bogus::why` names a zone, an owner and a key tag that all came out of an answer a stranger sent, and reflecting those to another stranger is how §2's "leak no private information" breaks quietly; and `rdnsc` sent an OPT only under `--dnssec`, so the tree's own probe could not see the thing the tree had just learned to send. Left behind: **#47** |
 | ~~**44c**~~ | ~~no measurement above a test zone~~ **Taken 2026-09-12**, one commit: `rdns/tests/scale.rs`, an `#[ignore]`d harness that refuses a debug build, and the numbers under this table | ~~Not a feature, an **evidence** gap, and the first question an operator asks. `bench_zone_lookup` builds 10,000 records and the largest zone file in the tree is a dozen lines. Unmeasured: load time and memory for a zone of a million records, signing time at that size, how many zones one process holds, and what reloading all of them costs. §10's rules apply — this is a measurement to *take*, and the number it produces is the row's real content~~ **It was an evidence gap, and the evidence found a defect.** The four questions the row asked all have dull answers — a million-record zone loads in 1.7 s for 210 MB, signing it is 28 s for 717 MB, a zone costs 1,901 bytes plus its records, and a thousand-zone reload is 0.2 s. The fifth step, which the row did not name because nothing here had looked: `verify_zones` runs at every load whenever signing is configured and is **quadratic** in the zone. Filed as **#50** |
-| **44d** | XFR over TLS (RFC 9103, "DNS Zone Transfer over TLS") — **0 hits** | Zone contents cross the wire in clear between primary and secondary, which for anything with private names is the objection. Cheap *after* #42a: the rustls setup, the certificate plumbing and the ALPN dispatch are the same, and a transfer is already framed TCP. Worth taking as a fourth stage of #42 rather than on its own |
+| ~~**44d**~~ | ~~XFR over TLS (RFC 9103, "DNS Zone Transfer over TLS") — **0 hits**~~ **Done 2026-09-12**, one commit: `rdns::xot` and a stream-generic `xfr` for the client half, a `Privacy` the transports report for the server half, and `43g` against BIND | ~~Zone contents cross the wire in clear between primary and secondary, which for anything with private names is the objection. Cheap *after* #42a: the rustls setup, the certificate plumbing and the ALPN dispatch are the same, and a transfer is already framed TCP. Worth taking as a fourth stage of #42 rather than on its own~~ **"Cheap after 42a" was true of the server and wrong about which side the work was on.** A transfer already went out over the DoT listener, so the primary half was a *policy* — the closing note of #42 said so — and the half with no code at all was the secondary's: nothing here had ever been a TLS client. That cost `rdns` a `rustls` dependency (**+0 packages**, measured before writing it), `xfr` a boxed stream in place of its `TcpStream`, and the endpoint syntax a `+tls=name`. Three things the row did not see: the name is not optional, because §7.5 makes authenticating the master a MUST and "encrypt but do not check" is the shape that looks safe in a log and is not; the *version* matters, because §7.2 is TLS 1.3-only where RFC 7858 allows 1.2, so the fact the transports report is a three-way `Privacy` and not a bool; and a self-signed certificate cannot be both the anchor and the leaf — rustls says `CaUsedAsEndEntity` where kdig accepts one, which is why 43g generates a chain and 42a's DoT never had to. Left behind: **#51** |
 | **44e** | multi-signer DNSSEC (RFC 8901, "Multi-Signer DNSSEC Models") — **0 hits** | Any zone served by two independent providers needs it, which is ordinary practice for zones that must not go down. The signer here assumes it owns every key in the apex DNSKEY set; the multi-signer models require importing another operator's ZSK and signing alongside it |
 | **44f** | key-rollover automation (RFC 6781) — **moved from #21** | Was on the not-implemented list with the note that "rollover is manual and the signer will not delete a published DNSKEY, which is the half that matters". That reasoning stands and is why this is not urgent — the dangerous half is already safe. It becomes a gate at fleet scale: a manual rollover per zone per year does not survive ten thousand zones |
 | **44g** | dnstap — **0 hits** | A query *stream*, not log lines: how operators feed analytics, security tooling and abuse handling. §14's logging decision is deliberate and right — nothing per-packet above debug, so a flood costs no log lines — and it is exactly why there is no data pipeline. Those are two different outputs and the second does not exist |
@@ -1090,7 +1093,7 @@ The measurement somebody would start from, taken rather than guessed:
 all three in `rdnsd/src/dispatch.rs`'s `notify_reply` — NOERROR, REFUSED and
 NOTAUTH — so it is `rdnsd`'s function alone and can grow a parameter without
 touching another daemon. #43's interop harness is what would show a real
-sender's reaction; none of its 112 assertions covers this, because the NOTIFY it
+sender's reaction; none of its 158 assertions covers this, because the NOTIFY it
 exercises is accepted.
 
 ---
@@ -1241,6 +1244,67 @@ stays quadratic. Whatever replaces it has to answer "which signatures cover this
 The harness's verify stage is already the test, in §10's shape: a ratio, with
 the µs/RRset column flat if it is fixed and doubling if it is not. A fix wants
 its own regression test in `rdnsd`, where `verify_zones` lives.
+
+---
+
+### 51. XoT authorizes its client by ACL and TSIG, never by certificate — **filed 2026-09-12**
+
+Left behind by 44d, with a number because the alternative is a sentence in a
+doc comment (`CLAUDE.md` §18).
+
+RFC 9103 §7.5 gives a server two ways to decide a transfer client is allowed:
+"mutual TLS (mTLS)" or "an IP-based ACL (which can be either per message or per
+connection) combined with a valid TSIG/SIG(0) signature on the XFR request".
+This tree does the second and has done since `security::TransferAcl` and #16;
+§7.5 adds "If only one method is selected, then mTLS is preferred".
+
+So the gap is not conformance — one of the two is what the RFC asks for — it is
+**interoperability in one direction**: a primary configured to demand a client
+certificate cannot be replicated from here, because `xot::client_config` calls
+`with_no_client_auth()`.
+
+Two halves, and they are not the same size:
+
+- **The client half is small.** Two flags for a certificate and key, and
+  `with_client_auth_cert` in place of `with_no_client_auth`. The mode check
+  `persist::ensure_private` already exists for the DoT key.
+- **The server half is #16 again.** `WebPkiClientVerifier` answers "is this
+  certificate one of ours", which is authentication; deciding *which zones* that
+  client may transfer is authorization, and a verified certificate says nothing
+  about it. The question to settle first is what a certificate maps to — a
+  subject name matched against a per-zone list, or a certificate that stands for
+  a TSIG key's scope — because `answer_transfer` authorizes against the apex
+  through a `TsigSession` and a client certificate is not one.
+
+Not urgent, and the reason is the same one that makes it legal: every peer this
+tree talks to accepts TSIG, and #43's harness uses it for every transfer
+including 43g's over TLS.
+
+---
+
+### 52. A rate-limit test is a coin toss at a second boundary — **filed 2026-09-12**
+
+`rdns_transport::tcp::tests::the_query_rate_can_be_per_connection_instead_of_per_message`
+opens one connection with a burst of one token, then a second, and asserts the
+second is dropped. `RateLimiter::should_allow` refills by whole seconds
+(`current_unix_timestamp`), so if the two connects straddle a second boundary
+the second one gets a fresh token and is served.
+
+**What was measured, and what it does not settle.** On 2026-09-12 it failed
+twice in about thirty runs of the changed tree, and **not once in 26 runs of a
+worktree at the previous commit** (20 of the test alone, 6 of the whole crate).
+At a rate of roughly one in thirty that is consistent with the flake being
+there all along *and* with its being new, so the exoneration is the code and
+not the count: the refill is `RateLimiter::should_allow`, which #44d does not
+touch, and what #44d added to that path is one `Privacy` argument. §10's rule
+is the one the test breaks either way: a wall-clock assertion with no headroom
+is a coin toss.
+
+The fix is not a longer window, which would only make the coin heavier: it is a
+clock the test controls. `should_allow` already takes `now` as a parameter, and
+what does not is the accept loop above it (`tcp::serve` reads
+`current_unix_timestamp` itself). So the shape is either a seam there or a test
+that drives `serve_one` with a clock of its own.
 
 ---
 

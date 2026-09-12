@@ -23,7 +23,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::{ServeContext, TransportLimits};
-use rdns::validation::Transport;
+use rdns::validation::{Privacy, Transport};
 
 /// What a connection's writer task can be handed.
 ///
@@ -95,11 +95,17 @@ pub trait Handler: Send + Sync + 'static {
     /// handler answers with.
     fn context(&self) -> &ServeContext;
 
+    /// `privacy` is what the connection hid from the path, which a handler
+    /// needs for exactly one decision here: RFC 9103 §11 lets an operator
+    /// require that a zone transfer be encrypted, and only the transport knows
+    /// whether it was. Passed rather than asked for afterwards, because by the
+    /// time a handler has the bytes the socket is three layers below it.
     fn handle(
         &self,
         packet: Vec<u8>,
         peer: SocketAddr,
         now: u64,
+        privacy: Privacy,
         out: mpsc::Sender<Reply>,
     ) -> impl std::future::Future<Output = ()> + Send;
 }
@@ -156,7 +162,7 @@ pub async fn serve<H: Handler>(
         // truncated AXFR from a complete one.
         let busy = busy.clone();
         tokio::spawn(async move {
-            serve_one(stream, peer, handler, limits, rate, stop).await;
+            serve_one(stream, peer, handler, limits, rate, Privacy::Clear, stop).await;
             drop(permit);
             drop(busy);
         });
@@ -178,6 +184,7 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
     handler: Arc<H>,
     limits: TransportLimits,
     rate: RateLimit,
+    privacy: Privacy,
     stop: Stop,
 ) {
     let (mut reader, mut writer) = stream.split_halves();
@@ -270,7 +277,7 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
         let handler = handler.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            handler.handle(packet, peer, now, tx).await;
+            handler.handle(packet, peer, now, privacy, tx).await;
             drop(permit);
         });
     }
@@ -328,6 +335,7 @@ mod tests {
             packet: Vec<u8>,
             _peer: SocketAddr,
             _now: u64,
+            _privacy: Privacy,
             out: mpsc::Sender<Reply>,
         ) {
             match self.answer {
@@ -357,7 +365,16 @@ mod tests {
         let client = TcpStream::connect(addr).await.expect("connect");
         let (server, peer) = listener.accept().await.expect("accept");
         let task = tokio::spawn(async move {
-            serve_one(server, peer, handler, limits, RateLimit::PerMessage, stop).await;
+            serve_one(
+                server,
+                peer,
+                handler,
+                limits,
+                RateLimit::PerMessage,
+                Privacy::Clear,
+                stop,
+            )
+            .await;
         });
         (client, task)
     }

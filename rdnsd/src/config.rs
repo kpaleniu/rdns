@@ -104,6 +104,13 @@ pub struct Server {
     pub https_path: Option<String>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// Trust anchors for transfers this server *fetches* over TLS
+    /// (RFC 9103), and whether one that arrives must have been encrypted.
+    /// Separate settings because they are separate directions: a server can be
+    /// a secondary over XoT, a primary that insists on it, or both.
+    pub transfer_tls_ca: Option<PathBuf>,
+    #[serde(default)]
+    pub transfer_tls_only: bool,
     /// Where `rdnsctl` reaches this server. Unix only, and refused at startup
     /// on Windows rather than ignored — the field parses everywhere so that one
     /// config file can be read on either platform and fail with a sentence
@@ -142,6 +149,8 @@ impl Default for Server {
             https_path: None,
             tls_cert: None,
             tls_key: None,
+            transfer_tls_ca: None,
+            transfer_tls_only: false,
             control_socket: None,
             allow_partial_load: false,
         }
@@ -251,8 +260,11 @@ fn default_algorithm() -> String {
 pub struct ZoneConfig {
     /// The zone file, if it is not simply `<zone-dir>/<name>.zone`.
     pub file: Option<String>,
-    /// Masters to replicate this zone from: `addr[:port][#key-name]`, the same
-    /// spelling `--secondary` uses after the `zone@`.
+    /// Masters to replicate this zone from: `addr[:port][#key-name][+tls=name]`,
+    /// the same spelling `--secondary` uses after the `zone@` — one parser, so
+    /// the flag and the file cannot disagree (`CLAUDE.md` §15). The `+tls=`
+    /// half is RFC 9103's transfer over TLS and needs
+    /// `server.transfer-tls-ca`.
     #[serde(default)]
     pub masters: Vec<String>,
     /// Who to NOTIFY for *this* zone, in addition to `server.also-notify`.
@@ -374,9 +386,18 @@ impl Config {
         // A zone naming a key that does not exist is the failure mode the flags
         // already refuse: an operator who believes a transfer is authenticated
         // and finds it is not has no way to see that from the outside.
+        //
+        // Through `MasterSpec::parse` rather than a `split_once('#')` here,
+        // which is what this was until `TODO.md` #44d and is exactly the shape
+        // `CLAUDE.md` §7 warns about: the endpoint syntax grew a `+tls=` suffix
+        // and this copy read `k.+tls=ns1.example.net.` as the key name. The
+        // flag's parser is the only thing that knows the syntax, so it is what
+        // has to be asked — and asking it validates the address here too.
         for (zone, settings) in &self.zones {
             for master in &settings.masters {
-                if let Some((_, key)) = master.split_once('#') {
+                let spec = rdns::secondary::MasterSpec::parse(&format!("{zone}@{master}"))
+                    .map_err(|e| anyhow::anyhow!("zone {zone:?}: {e}"))?;
+                if let Some(key) = &spec.key_name {
                     if !self.keys.contains_key(key)
                         && !self.keys.keys().any(|k| k.eq_ignore_ascii_case(key))
                     {
@@ -385,6 +406,17 @@ impl Config {
                              defines that key"
                         );
                     }
+                }
+                // The same rule the flags get, in the place the file's own
+                // reader can say it: anchors are what RFC 9103 §7.5's "the
+                // client MUST authenticate the server" needs, and a `+tls=`
+                // without them is a transfer that cannot happen.
+                if spec.tls.is_some() && self.server.transfer_tls_ca.is_none() {
+                    bail!(
+                        "zone {zone:?} replicates from {master:?} over TLS, and \
+                         server.transfer-tls-ca names no trust anchors to check its \
+                         certificate against (RFC 9103 §7.5)"
+                    );
                 }
             }
             if settings.nsec3_opt_out == Some(true) && settings.nsec3 == Some(false) {
@@ -492,6 +524,8 @@ impl Config {
         }
         cli.tls_cert = self.server.tls_cert.clone();
         cli.tls_key = self.server.tls_key.clone();
+        cli.transfer_tls_ca = self.server.transfer_tls_ca.clone();
+        cli.transfer_tls_only = self.server.transfer_tls_only;
         cli.control_socket = self.server.control_socket.clone();
         cli.allow_partial_load = self.server.allow_partial_load;
         cli.tsig_key = self.tsig_specs()?;
@@ -888,6 +922,41 @@ masters = ["192.0.2.3"]
             rdns::secondary::MasterSpec::parse(spec)
                 .unwrap_or_else(|e| panic!("{spec} should parse: {e}"));
         }
+    }
+
+    /// The `+tls=` half of the endpoint spelling survives the file, because the
+    /// file builds the same string the flag parses (`CLAUDE.md` §7). A second
+    /// parser here is how the flag and the file come to disagree about which
+    /// masters are reached over TLS.
+    #[test]
+    fn a_master_may_ask_for_a_transfer_over_tls() {
+        let config = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+transfer-tls-ca = "/etc/rdns/anchors.pem"
+[keys."k."]
+secret = "AAECAwQFBgcICQoLDA0ODw=="
+[zones."example.com."]
+masters = ["192.0.2.1#k.+tls=ns1.example.net."]
+"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            config.secondary_specs(),
+            ["example.com.@192.0.2.1#k.+tls=ns1.example.net."]
+        );
+        let spec = rdns::secondary::MasterSpec::parse(&config.secondary_specs()[0])
+            .expect("the same parser the flag uses");
+        assert_eq!(
+            spec.master,
+            "192.0.2.1:853".parse().expect("RFC 9103 §7.3's port")
+        );
+        assert!(spec.tls.is_some());
+        assert_eq!(
+            config.server.transfer_tls_ca.as_deref(),
+            Some(std::path::Path::new("/etc/rdns/anchors.pem"))
+        );
     }
 
     /// A config that configures no zones at all is a server that will answer

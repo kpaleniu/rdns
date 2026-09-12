@@ -9,11 +9,12 @@ use crate::error::{TransferError, TransferResult};
 use crate::Class;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::record_types as rt;
 use crate::tsig::{self, TsigError, TsigKey};
+use crate::xot::XotClient;
 use crate::zone::{Zone, ZoneRecord};
 use crate::{
     DnsMessage, Name, NameRef, OpCode, ParsedRecord, Qtype, QueryClass, QuerySection,
@@ -470,6 +471,57 @@ fn belongs_here(rr: &ResourceRecord, zone: NameRef<'_>) -> TransferResult<Name> 
     Ok(name)
 }
 
+/// A master, and how to reach it.
+///
+/// One type rather than a `SocketAddr` and an `Option` threaded separately
+/// through five signatures: "which address" and "in clear or not" are one
+/// decision an operator makes per master, and splitting them is how a transfer
+/// ends up encrypted on the SOA probe and not on the zone (`CLAUDE.md` §17).
+#[derive(Clone, Debug)]
+pub struct Master {
+    pub addr: std::net::SocketAddr,
+    /// `Some` when this master is transferred from over TLS (RFC 9103), and
+    /// what to check its certificate against.
+    pub xot: Option<XotClient>,
+}
+
+impl Master {
+    /// Cleartext TCP, which is what every transfer was before `TODO.md` #44d.
+    pub fn plain(addr: std::net::SocketAddr) -> Self {
+        Master { addr, xot: None }
+    }
+
+    /// Over TLS, verifying the master against `xot`'s name.
+    pub fn over_tls(addr: std::net::SocketAddr, xot: XotClient) -> Self {
+        Master {
+            addr,
+            xot: Some(xot),
+        }
+    }
+}
+
+impl std::fmt::Display for Master {
+    /// The address, and the name a TLS master was checked as — the two things
+    /// an operator needs to tell "the wrong host answered" from "the right host
+    /// presented the wrong certificate".
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.xot {
+            Some(xot) => write!(f, "{} over TLS as {}", self.addr, xot.name()),
+            None => write!(f, "{}", self.addr),
+        }
+    }
+}
+
+/// Either socket a transfer runs over.
+///
+/// A boxed trait object rather than a type parameter on [`fetch_zone`] and its
+/// two siblings: the generic would reach through `secondary`, the replication
+/// task and the catalog provisioner, and what it would buy is one allocation
+/// per transfer — against a zone that is megabytes and a handshake that is two
+/// round trips.
+trait TransferStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> TransferStream for T {}
+
 /// One transfer's connection: the socket, the id every reply is checked
 /// against, and the MAC chain.
 ///
@@ -480,7 +532,7 @@ fn belongs_here(rr: &ResourceRecord, zone: NameRef<'_>) -> TransferResult<Name> 
 /// (`TODO.md` #33e). Not a trait over the two assemblers: they differ in what
 /// finishing means, and `fetch_soa` shares this and has no assembler at all.
 struct TransferSession<'a> {
-    stream: TcpStream,
+    stream: Box<dyn TransferStream>,
     id: u16,
     key: Option<&'a TsigKey>,
     /// The MAC the next envelope's signature must be taken over.
@@ -494,7 +546,7 @@ impl<'a> TransferSession<'a> {
     /// The id to check replies against is the request's own, so the two cannot
     /// be handed in separately and disagree.
     async fn open(
-        master: std::net::SocketAddr,
+        master: &Master,
         request: &DnsMessage,
         key: Option<&'a TsigKey>,
     ) -> TransferResult<TransferSession<'a>> {
@@ -534,7 +586,7 @@ impl<'a> TransferSession<'a> {
 /// is no truncation to handle, and the handshake proves the reply came from the
 /// address we asked.
 pub async fn fetch_soa(
-    master: std::net::SocketAddr,
+    master: &Master,
     zone: NameRef<'_>,
     key: Option<&TsigKey>,
 ) -> TransferResult<Serial> {
@@ -559,7 +611,7 @@ pub async fn fetch_soa(
 
 /// Transfer the zone from `master`, verifying it as it arrives.
 pub async fn fetch_zone(
-    master: std::net::SocketAddr,
+    master: &Master,
     zone: NameRef<'_>,
     key: Option<&TsigKey>,
 ) -> TransferResult<Zone> {
@@ -585,7 +637,7 @@ pub async fn fetch_zone(
 /// RFC 1995 §2 suggests trying UDP first, but the answer may be the whole zone
 /// at the server's discretion, so the UDP attempt only buys a second code path.
 pub async fn fetch_changes(
-    master: std::net::SocketAddr,
+    master: &Master,
     base: &Zone,
     key: Option<&TsigKey>,
 ) -> TransferResult<IxfrOutcome> {
@@ -614,16 +666,25 @@ pub async fn fetch_changes(
     })?
 }
 
-async fn connect(master: std::net::SocketAddr) -> TransferResult<TcpStream> {
-    TcpStream::connect(master)
-        .await
-        .map_err(|e| TransferError::malformed(format!("connecting to {master}: {e}")))
+/// Open the connection a transfer runs over: TLS when the master is an XoT
+/// one, plain TCP otherwise.
+async fn connect(master: &Master) -> TransferResult<Box<dyn TransferStream>> {
+    match &master.xot {
+        Some(xot) => Ok(Box::new(xot.connect(master.addr).await?)),
+        None => {
+            let addr = master.addr;
+            let stream = TcpStream::connect(addr)
+                .await
+                .map_err(|e| TransferError::malformed(format!("connecting to {addr}: {e}")))?;
+            Ok(Box::new(stream))
+        }
+    }
 }
 
 /// Serialize, sign if there is a key, and send. Returns the request's MAC, which
 /// the first reply's signature is computed over.
-async fn send_request(
-    stream: &mut TcpStream,
+async fn send_request<S: AsyncWrite + Unpin + ?Sized>(
+    stream: &mut S,
     request: &DnsMessage,
     key: Option<&TsigKey>,
 ) -> TransferResult<Vec<u8>> {
@@ -652,8 +713,8 @@ async fn send_request(
 /// Read one framed reply, check its TSIG if there is a key, and parse it.
 ///
 /// Returns the message and, when signed, the MAC to carry into the next one.
-async fn read_reply(
-    stream: &mut TcpStream,
+async fn read_reply<S: AsyncRead + Unpin + ?Sized>(
+    stream: &mut S,
     id: u16,
     key: Option<&TsigKey>,
     previous_mac: &[u8],
@@ -1254,77 +1315,232 @@ mod tests {
 
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
+                let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
                 let zone = zone.clone();
                 let key = key.clone();
-                tokio::spawn(async move {
-                    let mut length = [0u8; 2];
-                    if stream.read_exact(&mut length).await.is_err() {
-                        return;
-                    }
-                    let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
-                    if stream.read_exact(&mut packet).await.is_err() {
-                        return;
-                    }
-
-                    let request = DnsMessage::try_from_bytes(&packet).expect("parse the request");
-
-                    // A request that does not verify is answered with the
-                    // rejection, as a real master does; hanging up would test a
-                    // different failure.
-                    let mut session = None;
-                    if let Some(k) = key.as_ref() {
-                        let keyring = crate::tsig::TsigKeyring::new(vec![k.clone()]);
-                        match tsig::check_request(&packet, &keyring, tsig::now()) {
-                            tsig::TsigCheck::Verified(verified) => session = Some(verified),
-                            tsig::TsigCheck::Rejected(rejection) => {
-                                let mut refusal = request.clone();
-                                refusal.response = true;
-                                refusal.rcode = ResponseCode::NotAuthorized;
-                                let mut buf = vec![0u8; 512];
-                                let n = refusal.to_bytes(&mut buf).expect("serialize");
-                                let bytes = rejection
-                                    .attach(buf[..n].to_vec(), tsig::now())
-                                    .expect("attach the rejection");
-                                let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
-                                framed.extend_from_slice(&bytes);
-                                let _ = stream.write_all(&framed).await;
-                                return;
-                            }
-                            tsig::TsigCheck::Unsigned => return,
-                        }
-                    }
-                    let replies: Vec<DnsMessage> =
-                        if request.queries[0].qtype == Qtype::of(rt::AXFR) {
-                            axfr_messages(&request, &zone).expect("build the transfer")
-                        } else {
-                            let mut reply = request.clone();
-                            reply.response = true;
-                            reply.authoritive = true;
-                            reply.answers = vec![zone.apex_soa_record().unwrap()];
-                            vec![reply]
-                        };
-
-                    for reply in replies {
-                        let mut buf = vec![0u8; 65535];
-                        let n = reply.to_bytes(&mut buf).expect("serialize");
-                        let mut bytes = buf[..n].to_vec();
-                        if let Some(session) = session.as_mut() {
-                            bytes = session.sign(bytes, tsig::now()).expect("sign");
-                        }
-                        let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
-                        framed.extend_from_slice(&bytes);
-                        if stream.write_all(&framed).await.is_err() {
-                            return;
-                        }
-                    }
-                });
+                tokio::spawn(answer_one_transfer(stream, zone, key));
             }
         });
 
         addr
+    }
+
+    /// One connection's worth of master, whatever socket it arrived on.
+    ///
+    /// Generic since `TODO.md` #44d, so the XoT tests below drive the *same*
+    /// master through a TLS stream: a second copy of this would be the one that
+    /// stops answering the way the first does (`CLAUDE.md` §7).
+    async fn answer_one_transfer<S: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: S,
+        zone: Zone,
+        key: Option<TsigKey>,
+    ) {
+        {
+            let mut length = [0u8; 2];
+            if stream.read_exact(&mut length).await.is_err() {
+                return;
+            }
+            let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+            if stream.read_exact(&mut packet).await.is_err() {
+                return;
+            }
+
+            let request = DnsMessage::try_from_bytes(&packet).expect("parse the request");
+
+            // A request that does not verify is answered with the
+            // rejection, as a real master does; hanging up would test a
+            // different failure.
+            let mut session = None;
+            if let Some(k) = key.as_ref() {
+                let keyring = crate::tsig::TsigKeyring::new(vec![k.clone()]);
+                match tsig::check_request(&packet, &keyring, tsig::now()) {
+                    tsig::TsigCheck::Verified(verified) => session = Some(verified),
+                    tsig::TsigCheck::Rejected(rejection) => {
+                        let mut refusal = request.clone();
+                        refusal.response = true;
+                        refusal.rcode = ResponseCode::NotAuthorized;
+                        let mut buf = vec![0u8; 512];
+                        let n = refusal.to_bytes(&mut buf).expect("serialize");
+                        let bytes = rejection
+                            .attach(buf[..n].to_vec(), tsig::now())
+                            .expect("attach the rejection");
+                        let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+                        framed.extend_from_slice(&bytes);
+                        let _ = stream.write_all(&framed).await;
+                        return;
+                    }
+                    tsig::TsigCheck::Unsigned => return,
+                }
+            }
+            let replies: Vec<DnsMessage> = if request.queries[0].qtype == Qtype::of(rt::AXFR) {
+                axfr_messages(&request, &zone).expect("build the transfer")
+            } else {
+                let mut reply = request.clone();
+                reply.response = true;
+                reply.authoritive = true;
+                reply.answers = vec![zone.apex_soa_record().unwrap()];
+                vec![reply]
+            };
+
+            for reply in replies {
+                let mut buf = vec![0u8; 65535];
+                let n = reply.to_bytes(&mut buf).expect("serialize");
+                let mut bytes = buf[..n].to_vec();
+                if let Some(session) = session.as_mut() {
+                    bytes = session.sign(bytes, tsig::now()).expect("sign");
+                }
+                let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+                framed.extend_from_slice(&bytes);
+                if stream.write_all(&framed).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A certificate for `name`, its own PEM anchor file, and a TLS master
+    /// serving `zone` behind it.
+    ///
+    /// Self-signed and generated per run, for the reason `rdns-transport`'s DoT
+    /// fixture gives: a private key in the tree is a private key in every
+    /// clone, and a checked-in certificate is a test that starts failing on a
+    /// Tuesday years from now. Self-signed also makes the *anchor* the leaf,
+    /// which is what lets a second certificate be a negative control.
+    struct TlsMaster {
+        addr: std::net::SocketAddr,
+        anchors: std::path::PathBuf,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for TlsMaster {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    async fn spawn_tls_master(zone: Zone, name: &str) -> TlsMaster {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rdns-xot-{}-{serial}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let issued =
+            rcgen::generate_simple_self_signed(vec![name.to_string()]).expect("a certificate");
+        let anchors = dir.join("anchors.pem");
+        std::fs::write(&anchors, issued.cert.pem()).expect("write the anchor");
+
+        let cert = CertificateDer::from(issued.cert.der().to_vec());
+        let key = PrivateKeyDer::from_pem_slice(issued.signing_key.serialize_pem().as_bytes())
+            .expect("the key");
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("a server config");
+        // What RFC 9103 §7.1 says a client MUST select. Advertised here so the
+        // test fails if the client ever stops offering it.
+        config.alpn_protocols = vec![b"dot".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a master");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                let zone = zone.clone();
+                tokio::spawn(async move {
+                    let Ok(stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    answer_one_transfer(stream, zone, None).await;
+                });
+            }
+        });
+        TlsMaster { addr, anchors, dir }
+    }
+
+    fn xot_master(master: &TlsMaster, name: &str) -> Master {
+        let trust = crate::xot::XotTrust::from_ca_file(&master.anchors).expect("anchors");
+        Master::over_tls(
+            master.addr,
+            crate::xot::XotClient::new(trust, crate::xot::XotName::parse(name).expect("a name")),
+        )
+    }
+
+    /// The whole of RFC 9103's client half, end to end: TLS 1.3, ALPN `dot`,
+    /// the master authenticated by name, and the same AXFR arriving.
+    #[tokio::test]
+    async fn a_zone_transfers_over_tls() {
+        let source = source_zone();
+        let master = spawn_tls_master(source.clone(), "master.test").await;
+
+        let received = fetch_zone(
+            &xot_master(&master, "master.test"),
+            nm("example.com.").as_ref(),
+            None,
+        )
+        .await
+        .expect("transfer over TLS");
+        assert_eq!(received.serial(), Some(Serial::new(42)));
+        assert_eq!(received.records().len(), source.records().len());
+    }
+
+    /// The negative control, and without it "the handshake succeeded" is
+    /// equally consistent with a client that checks nothing. Same certificate
+    /// trusted, different name asked for — which is the mistake an operator
+    /// actually makes.
+    #[tokio::test]
+    async fn a_master_presenting_a_certificate_for_another_name_is_refused() {
+        let source = source_zone();
+        let master = spawn_tls_master(source, "master.test").await;
+
+        let err = fetch_zone(
+            &xot_master(&master, "someone-else.test"),
+            nm("example.com.").as_ref(),
+            None,
+        )
+        .await
+        .expect_err("the certificate does not name this master");
+        assert!(
+            err.to_string()
+                .contains("certificate not valid for name \"someone-else.test\""),
+            "the name, and the reason it was refused, both belong in the message: {err}"
+        );
+    }
+
+    /// And the other half of it: the right name, an anchor set that does not
+    /// include the issuer.
+    #[tokio::test]
+    async fn a_master_signed_by_nobody_we_trust_is_refused() {
+        let source = source_zone();
+        let master = spawn_tls_master(source.clone(), "master.test").await;
+        let stranger = spawn_tls_master(source, "master.test").await;
+
+        // The addresses are the first master's; the anchors are the second's,
+        // which issued a different self-signed certificate for the same name.
+        let trust = crate::xot::XotTrust::from_ca_file(&stranger.anchors).expect("anchors");
+        let wrong = Master::over_tls(
+            master.addr,
+            crate::xot::XotClient::new(
+                trust,
+                crate::xot::XotName::parse("master.test").expect("a name"),
+            ),
+        );
+        let err = fetch_zone(&wrong, nm("example.com.").as_ref(), None)
+            .await
+            .expect_err("an issuer we do not trust");
+        assert!(
+            err.to_string().contains("invalid peer certificate"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1332,7 +1548,7 @@ mod tests {
         let source = source_zone();
         let master = spawn_master(source.clone(), None).await;
 
-        let received = fetch_zone(master, nm("example.com.").as_ref(), None)
+        let received = fetch_zone(&Master::plain(master), nm("example.com.").as_ref(), None)
             .await
             .expect("transfer");
         assert_eq!(received.serial(), Some(Serial::new(42)));
@@ -1349,7 +1565,7 @@ mod tests {
     async fn test_fetches_the_soa_serial_over_tcp() {
         let master = spawn_master(source_zone(), None).await;
         assert_eq!(
-            fetch_soa(master, nm("example.com.").as_ref(), None)
+            fetch_soa(&Master::plain(master), nm("example.com.").as_ref(), None)
                 .await
                 .unwrap(),
             Serial::new(42),
@@ -1368,9 +1584,13 @@ mod tests {
         );
         let master = spawn_master(source_zone(), Some(key.clone())).await;
 
-        let received = fetch_zone(master, nm("example.com.").as_ref(), Some(&key))
-            .await
-            .expect("signed transfer");
+        let received = fetch_zone(
+            &Master::plain(master),
+            nm("example.com.").as_ref(),
+            Some(&key),
+        )
+        .await
+        .expect("signed transfer");
         assert_eq!(received.serial(), Some(Serial::new(42)));
     }
 
@@ -1408,9 +1628,13 @@ mod tests {
         );
         let master = spawn_master(source.clone(), Some(key.clone())).await;
 
-        let received = fetch_zone(master, nm("example.com.").as_ref(), Some(&key))
-            .await
-            .expect("signed multi-envelope transfer");
+        let received = fetch_zone(
+            &Master::plain(master),
+            nm("example.com.").as_ref(),
+            Some(&key),
+        )
+        .await
+        .expect("signed multi-envelope transfer");
         assert_eq!(received.serial(), Some(Serial::new(42)));
         assert_eq!(received.records().len(), source.records().len());
     }
@@ -1430,9 +1654,13 @@ mod tests {
         );
         let master = spawn_master(source_zone(), Some(master_key)).await;
 
-        let err = fetch_zone(master, nm("example.com.").as_ref(), Some(&ours))
-            .await
-            .unwrap_err();
+        let err = fetch_zone(
+            &Master::plain(master),
+            nm("example.com.").as_ref(),
+            Some(&ours),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("signature failed"), "got: {err}");
     }
 
@@ -1443,8 +1671,10 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             listener.local_addr().unwrap()
         };
-        assert!(fetch_zone(addr, nm("example.com.").as_ref(), None)
-            .await
-            .is_err());
+        assert!(
+            fetch_zone(&Master::plain(addr), nm("example.com.").as_ref(), None)
+                .await
+                .is_err()
+        );
     }
 }

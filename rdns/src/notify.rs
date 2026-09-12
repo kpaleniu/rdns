@@ -39,8 +39,21 @@ pub struct NotifyTarget {
 impl NotifyTarget {
     pub fn parse(spec: &str) -> ConfigResult<Self> {
         let spec = spec.trim();
-        let (addr, key_name) = crate::endpoint::parse_endpoint(spec, spec)?;
-        Ok(NotifyTarget { addr, key_name })
+        let parsed = crate::endpoint::parse_endpoint(spec, spec)?;
+        // The endpoint syntax carries `+tls=` for `--secondary` (`TODO.md`
+        // #44d). RFC 9103 is about the transfer and says nothing about NOTIFY,
+        // and this server has no TLS client for one, so accepting the suffix
+        // here would be a flag that changes nothing — which is the shape
+        // `CLAUDE.md` §15 refuses in a config key.
+        if parsed.tls.is_some() {
+            return Err(ConfigError::new(format!(
+                "--also-notify {spec:?}: '+tls=' is for --secondary, where it is                  RFC 9103's zone transfer over TLS. A NOTIFY here is sent in                  clear whatever this says, so it is refused rather than ignored"
+            )));
+        }
+        Ok(NotifyTarget {
+            addr: parsed.addr,
+            key_name: parsed.key_name,
+        })
     }
 
     /// Look the key name up in `keys`.
@@ -486,5 +499,14 @@ mod tests {
             ResponseCode::Ok,
         );
         assert!(notified_zone(&reply).is_none());
+    }
+    /// `+tls=` is `--secondary`'s, and a NOTIFY is sent in clear whatever the
+    /// flag says — so it is refused rather than silently doing nothing
+    /// (`CLAUDE.md` §15).
+    #[test]
+    fn a_notify_target_refuses_the_transfer_tls_suffix() {
+        let err =
+            NotifyTarget::parse("192.0.2.1+tls=ns1.example.com.").expect_err("not a notify option");
+        assert!(err.to_string().contains("is for --secondary"), "got: {err}");
     }
 }

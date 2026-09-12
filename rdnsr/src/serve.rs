@@ -13,7 +13,7 @@ use rdns::clock::current_unix_timestamp;
 use rdns::resolver::Resolver;
 use rdns::security::ResponseVerdict;
 use rdns::shutdown::{Busy, Stop};
-use rdns::validation::Transport;
+use rdns::validation::{Privacy, Transport};
 use rdns_transport::{recv_error_is_transient, tcp, ServeContext, UDP_RECEIVE_BUFFER};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Semaphore};
@@ -148,6 +148,10 @@ impl tcp::Handler for Resolving {
         packet: Vec<u8>,
         peer: SocketAddr,
         now: u64,
+        // A resolver answers a query the same way whatever hid it from the
+        // path. The parameter is `rdnsd`'s: only a zone transfer has a policy
+        // about how private the connection was (RFC 9103 §11).
+        _privacy: Privacy,
         out: mpsc::Sender<tcp::Reply>,
     ) {
         if let Some(reply) = handle_query(
