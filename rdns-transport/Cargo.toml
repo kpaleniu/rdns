@@ -15,3 +15,14 @@ tracing.workspace = true
 # returns typed errors and only a binary may use `anyhow`. A crate whose only
 # consumers are the two daemons may (`TODO.md` #30c, #30d, #31).
 anyhow.workspace = true
+# DoT (#42a). Here rather than in `rdns` because a TLS stack belongs at the
+# socket layer: the zone parser and the signer have no business linking one.
+rustls.workspace = true
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+# Test-only, so the runtime package count is untouched: the DoT tests need a
+# certificate, and one generated per run beats a key checked into the tree.
+# `ring` rather than the default provider, for the reason the workspace
+# manifest gives about rustls.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

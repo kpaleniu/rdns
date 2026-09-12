@@ -121,6 +121,19 @@ EOZ
     } > /srv/primary-zones/bigout.test.zone
     chown 65532:65532 /srv/primary-zones/bigout.test.zone' >/dev/null || return 1
 
+  # The DoT certificate (#42a). Self-signed, P-256, with both the name and the
+  # address in the SAN so a client can verify either way. Mode 0600 and owned by
+  # the runtime uid, because rdnsd refuses a private key its group can read.
+  $COMPOSE run --rm --user root --no-deps tools sh -c '
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+      -keyout /srv/primary-tls/key.pem -out /srv/primary-tls/cert.pem -days 30 \
+      -subj "/CN=dns.example.test" \
+      -addext "subjectAltName=DNS:dns.example.test,IP:10.53.0.2" 2>/dev/null &&
+    chown 65532:65532 /srv/primary-tls/cert.pem /srv/primary-tls/key.pem &&
+    chmod 0600 /srv/primary-tls/key.pem &&
+    chmod 0644 /srv/primary-tls/cert.pem &&
+    cp /srv/primary-tls/cert.pem /srv/run/dot-ca.pem' >/dev/null || return 1
+
   info "generating signing keys"
   # P-256 for example.com., P-384 for example.net. — the two curves this tree
   # can produce, and the pair response_size.rs measures.
@@ -776,6 +789,127 @@ s43e() {
 
 # --------------------------------------------------------------------------
 
+s42a() {
+  say "42a - DNS over TLS (RFC 7858), answered to somebody else's client"
+
+  # kdig is Knot's, and the only client here with the full DoT vocabulary:
+  # +tls-ca verifies the chain, +tls-hostname names what to check it against,
+  # and +tls-pin checks the key rather than the name. Three different ways of
+  # being satisfied, which is three different ways of catching a server that
+  # presents the wrong thing.
+  check "kdig verifies the chain and gets the answer" "192.0.2.10" \
+    <<< "$(t kdig +short +tls-ca=/srv/run/dot-ca.pem +tls-hostname=dns.example.test \
+              -p 853 @10.53.0.2 www.example.com A 2>&1)"
+
+  check "...and over the address in the SAN, with no hostname given" "192.0.2.10" \
+    <<< "$(t kdig +short +tls-ca=/srv/run/dot-ca.pem -p 853 @10.53.0.2 www.example.com A 2>&1)"
+
+  # The pin is the certificate's public key, which is what a stub resolver with
+  # no CA store uses (RFC 7858 §4.2). Computed here rather than written down,
+  # because the certificate is generated per run.
+  local pin
+  pin=$(t sh -c "openssl x509 -in /srv/run/dot-ca.pem -pubkey -noout \
+        | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | openssl enc -base64")
+  pin=$(printf '%s' "$pin" | tr -d '\r\n ')
+  check "kdig is satisfied by a pinned key (RFC 7858 §4.2)" "192.0.2.10" \
+    <<< "$(t kdig +short "+tls-pin=$pin" -p 853 @10.53.0.2 www.example.com A 2>&1)"
+
+  # The measurement that could refute the three above (§19): a client that
+  # trusts the *wrong* certificate must fail. Without this, "+tls-ca passed"
+  # is equally consistent with a client that verifies nothing.
+  local wrong
+  wrong=$(t sh -c "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -nodes -keyout /tmp/w.key -out /tmp/w.pem -days 1 -subj '/CN=dns.example.test' \
+      -addext 'subjectAltName=DNS:dns.example.test,IP:10.53.0.2' 2>/dev/null;
+      kdig +short +tls-ca=/tmp/w.pem +tls-hostname=dns.example.test \
+        -p 853 @10.53.0.2 www.example.com A 2>&1")
+  if printf '%s' "$wrong" | grep -q '192.0.2.10'; then
+    bad "kdig accepted a certificate it should not trust - the checks above prove nothing"
+    printf '%s\n' "$wrong" | head -4 | sed 's/^/        | /'
+  else
+    ok "...and refuses a certificate it does not trust"
+  fi
+
+  # A signed zone over DoT, so the two encryptions are known not to interfere:
+  # DNSSEC records are payload and TLS is the pipe.
+  check "a DNSSEC-signed answer survives the TLS transport" "RRSIG" \
+    <<< "$(t kdig +dnssec +tls-ca=/srv/run/dot-ca.pem -p 853 @10.53.0.2 www.example.com A 2>&1)"
+
+  # Plain TCP on 5353 still answers: DoT is an addition, not a replacement, and
+  # a resolver that cannot speak it must not be locked out.
+  check "plain TCP still answers on its own port" "192.0.2.10" \
+    <<< "$(t dig +short +tcp -p 5353 @10.53.0.2 www.example.com A 2>&1)"
+
+  # And the counters, which are the whole of the expiry story: nothing here
+  # parses notAfter, so `dns_tls_handshake_failures_total` is what an operator
+  # alerts on. Tie them to the handshakes just made.
+  local scrape shook failed
+  scrape=$(t sh -c "dig +short @10.53.0.2 -p 5353 www.example.com A >/dev/null;
+                    python3 -c \"
+import urllib.request
+print(urllib.request.urlopen('http://10.53.0.2:9153/metrics').read().decode())\"" 2>&1)
+  shook=$(printf '%s\n' "$scrape" | awk '/^dns_tls_handshakes_total /{print $2}')
+  failed=$(printf '%s\n' "$scrape" | awk '/^dns_tls_handshake_failures_total /{print $2}')
+  if [ "${shook:-0}" -ge 4 ]; then
+    ok "dns_tls_handshakes_total is $shook, counting the handshakes above"
+  else
+    bad "dns_tls_handshakes_total is ${shook:-absent}, expected at least 4"
+  fi
+  if [ "${failed:-0}" -ge 1 ]; then
+    ok "dns_tls_handshake_failures_total is $failed, counting the refused one"
+  else
+    bad "dns_tls_handshake_failures_total is ${failed:-absent}, expected at least 1"
+  fi
+
+  # ---- the renewal story, which is the half that is not the protocol -------
+  #
+  # New bytes at the same two paths and one reload. The pin changes, so a client
+  # pinned to the old key is the way to see that the *server* changed rather
+  # than that a cache was warm.
+  say "42a - a renewed certificate, without a restart"
+  local before after
+  before="$pin"
+  $COMPOSE exec -T --user root tools sh -c '
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+      -keyout /srv/primary-tls/key.pem -out /srv/primary-tls/cert.pem -days 30 \
+      -subj "/CN=dns.example.test" \
+      -addext "subjectAltName=DNS:dns.example.test,IP:10.53.0.2" 2>/dev/null &&
+    chown 65532:65532 /srv/primary-tls/cert.pem /srv/primary-tls/key.pem &&
+    chmod 0600 /srv/primary-tls/key.pem && chmod 0644 /srv/primary-tls/cert.pem &&
+    cp /srv/primary-tls/cert.pem /srv/run/dot-ca.pem' >/dev/null 2>&1
+
+  $COMPOSE kill -s HUP rdnsd-primary >/dev/null 2>&1
+  sleep 3
+
+  after=$(t sh -c "openssl x509 -in /srv/run/dot-ca.pem -pubkey -noout \
+          | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | openssl enc -base64")
+  after=$(printf '%s' "$after" | tr -d '\r\n ')
+  if [ "$after" = "$before" ]; then
+    bad "the renewed certificate has the same key as the old one; the test proves nothing"
+    return
+  fi
+
+  check "the renewed certificate is served after a SIGHUP, with no restart" "192.0.2.10" \
+    <<< "$(t kdig +short "+tls-pin=$after" -p 853 @10.53.0.2 www.example.com A 2>&1)"
+
+  local stale
+  stale=$(t kdig +short "+tls-pin=$before" -p 853 @10.53.0.2 www.example.com A 2>&1)
+  if printf '%s' "$stale" | grep -q '192.0.2.10'; then
+    bad "the old key still satisfies a pin, so nothing was actually replaced"
+  else
+    ok "...and the old key no longer does, so it was replaced rather than cached"
+  fi
+
+  # The process did not restart: its uptime covers the whole run.
+  if $COMPOSE logs rdnsd-primary 2>/dev/null | grep -c 'rdnsd listening on' | grep -q '^1$'; then
+    ok "rdnsd bound its sockets exactly once, so the renewal was a reload"
+  else
+    bad "rdnsd started more than once during this run; the reload claim is not tested"
+  fi
+}
+
+# --------------------------------------------------------------------------
+
 report() {
   say "result"
   printf '   %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
@@ -795,7 +929,7 @@ all() {
   up
   versions
   contained
-  s43a; s43b; s43c; s43d; s43e
+  s43a; s43b; s43c; s43d; s43e; s42a
   report
 }
 
@@ -811,8 +945,9 @@ case "${1:-all}" in
   43c) s43c; report ;;
   43d) s43d; report ;;
   43e) s43e; report ;;
+  42a) s42a; report ;;
   down) down ;;
   logs) shift; $COMPOSE logs "$@" ;;
   shell) $COMPOSE exec tools bash ;;
-  *) echo "usage: $0 {build|setup|up|contained|versions|43a|43b|43c|43d|43e|all|down|logs|shell}"; exit 2 ;;
+  *) echo "usage: $0 {build|setup|up|contained|versions|43a|43b|43c|43d|43e|42a|all|down|logs|shell}"; exit 2 ;;
 esac

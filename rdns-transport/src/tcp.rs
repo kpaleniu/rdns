@@ -58,6 +58,31 @@ pub async fn send_framed(out: &mpsc::Sender<Reply>, bytes: &[u8]) -> bool {
     }
 }
 
+/// A stream whose two halves can be owned by two tasks.
+///
+/// One trait rather than one generic bound, and the reason is the plain-TCP
+/// path. `TcpStream::into_split` hands back owned halves with nothing between
+/// them; a TLS stream has no such method, so `tokio::io::split` puts a `BiLock`
+/// in the way. Making [`serve_one`] generic over `AsyncRead + AsyncWrite` would
+/// have been shorter and would have taken that lock on every connection,
+/// encrypted or not — a cost paid by the transport that does not need it, to
+/// spare fifteen lines here.
+pub trait SplitStream: Send + 'static {
+    type Reader: tokio::io::AsyncRead + Unpin + Send + 'static;
+    type Writer: tokio::io::AsyncWrite + Unpin + Send + 'static;
+
+    fn split_halves(self) -> (Self::Reader, Self::Writer);
+}
+
+impl SplitStream for TcpStream {
+    type Reader = tokio::net::tcp::OwnedReadHalf;
+    type Writer = tokio::net::tcp::OwnedWriteHalf;
+
+    fn split_halves(self) -> (Self::Reader, Self::Writer) {
+        self.into_split()
+    }
+}
+
 /// What answers a message that has been admitted.
 ///
 /// Sink-shaped on purpose: see the module docs. `now` is the transport's single
@@ -147,15 +172,15 @@ pub async fn serve<H: Handler>(
 ///
 /// Public because a caller with its own accept loop — a test driving one
 /// connection, say — wants exactly this and not the listener.
-pub async fn serve_one<H: Handler>(
-    stream: TcpStream,
+pub async fn serve_one<H: Handler, S: SplitStream>(
+    stream: S,
     peer: SocketAddr,
     handler: Arc<H>,
     limits: TransportLimits,
     rate: RateLimit,
     stop: Stop,
 ) {
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = stream.split_halves();
     let (tx, mut rx) = mpsc::channel::<Reply>(limits.max_inflight_per_connection);
 
     // One task owns the write half: replies may complete out of order

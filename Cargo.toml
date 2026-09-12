@@ -47,6 +47,18 @@ tokio = { version = "1.41.1", features = [
 # the message is not built at all when nothing wants it. The library only emits;
 # the binaries choose where it goes.
 tracing = "0.1"
+# TLS for DoT (#42a). `ring`, not rustls's default `aws-lc-rs` provider: ring
+# resolves to 0.17.14, the exact version this tree already links for DNSSEC and
+# TSIG, so the provider is a feature flag rather than a second crypto library —
+# and no cmake or C toolchain comes with it. Measured: +6 runtime packages.
+#
+# `logging` is off, which is the seventh package. rustls logs through the `log`
+# facade, and `tracing-subscriber` here has `tracing-log` disabled on purpose
+# ("nothing here logs through the log facade"), so those records would be built
+# and dropped. A dependency whose output nothing reads is §14's liability; turn
+# the feature and the bridge on together or neither.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # `default-features = false` drops `ansi` (output goes to a journal, not a
 # terminal) and `tracing-log` (nothing here logs through the `log` facade).
 # `env-filter` is kept for `RUST_LOG`, which is how a level gets changed on a

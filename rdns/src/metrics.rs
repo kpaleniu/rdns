@@ -115,6 +115,17 @@ pub struct Counters {
     pub validation_errors: AtomicU64,
     pub queries_dropped: AtomicU64,
 
+    /// DoT connections whose handshake completed, and those that did not.
+    ///
+    /// The pair is how an expired or mismatched certificate is seen at all
+    /// (`TODO.md` #42a). Nothing here parses `notAfter` — that would be an X.509
+    /// parser whose whole job is a log line — so the failure is reported as the
+    /// symptom it produces: every client hanging up at the handshake. A ratio
+    /// that goes to one is the alert, and it does not need the expiry date to
+    /// fire.
+    pub tls_handshakes: AtomicU64,
+    pub tls_handshake_failures: AtomicU64,
+
     // Cumulative buckets plus count and sum: what `histogram_quantile()` needs.
     latency_buckets: [AtomicU64; 8],
     latency_count: AtomicU64,
@@ -157,6 +168,8 @@ impl DnsMetrics {
             rate_limited: AtomicU64::new(0),
             validation_errors: AtomicU64::new(0),
             queries_dropped: AtomicU64::new(0),
+            tls_handshakes: AtomicU64::new(0),
+            tls_handshake_failures: AtomicU64::new(0),
             zones: RwLock::new(BTreeMap::new()),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             latency_count: AtomicU64::new(0),
@@ -395,6 +408,26 @@ impl DnsMetrics {
         output.push_str(&format!(
             "dns_queries_dropped_total {}\n",
             self.queries_dropped.load(Ordering::Relaxed)
+        ));
+
+        // Always emitted, including as a pair of zeroes on a server with no DoT
+        // listener. A series that appears only once something has happened
+        // cannot be alerted on before it does, and `absent()` is the wrong
+        // question here: zero handshakes is a fact, not a missing measurement
+        // (contrast the per-zone gauges below, which are omitted on purpose).
+        output.push_str("# HELP dns_tls_handshakes_total DoT handshakes completed\n");
+        output.push_str("# TYPE dns_tls_handshakes_total counter\n");
+        output.push_str(&format!(
+            "dns_tls_handshakes_total {}\n",
+            self.tls_handshakes.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP dns_tls_handshake_failures_total DoT handshakes that did not complete\n",
+        );
+        output.push_str("# TYPE dns_tls_handshake_failures_total counter\n");
+        output.push_str(&format!(
+            "dns_tls_handshake_failures_total {}\n",
+            self.tls_handshake_failures.load(Ordering::Relaxed)
         ));
 
         // Record type metrics

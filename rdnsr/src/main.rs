@@ -15,6 +15,7 @@ mod serve;
 mod testutil;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,9 +30,10 @@ use rdns::readiness::Readiness;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::rfc5011::ManagedAnchors;
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
-use rdns::shutdown::Shutdown;
+use rdns::shutdown::{next_reload, reload_signal, Shutdown};
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
 use rdns::UdpSizes;
+use rdns_transport::tls::{self, CertificateStore};
 use rdns_transport::{tcp, ServeContext, TransportLimits};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
@@ -238,6 +240,22 @@ struct Cli {
     /// because it is shared with `rdnsd`.
     #[arg(long, value_name = "ADDR:PORT")]
     metrics_listen: Option<String>,
+    /// Also answer DNS over TLS here (RFC 7858). Needs --tls-cert and --tls-key.
+    ///
+    /// 853 is the assigned port, and a resolver is what RFC 7858 was written
+    /// for: the stub-to-recursive hop is the one it names. In addition to the
+    /// plain listeners on --port, not instead of them.
+    #[arg(long, value_name = "ADDR:PORT")]
+    tls_listen: Option<String>,
+    /// The PEM certificate chain --tls-listen presents. Leaf first.
+    #[arg(long, value_name = "PATH", requires = "tls_listen")]
+    tls_cert: Option<PathBuf>,
+    /// The PEM private key for --tls-cert.
+    ///
+    /// Refused if it is readable by its group or by everybody. Unix only;
+    /// Windows has no equivalent.
+    #[arg(long, value_name = "PATH", requires = "tls_listen")]
+    tls_key: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -392,6 +410,27 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // Read before anything binds, like the metrics listener above: a
+    // certificate that will not load is a DoT listener that answers nothing.
+    let tls_store = match (&cli.tls_listen, &cli.tls_cert, &cli.tls_key) {
+        (Some(_), Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
+        (Some(listen), _, _) => {
+            return Err(anyhow!(
+                "--tls-listen {listen} needs both --tls-cert and --tls-key"
+            ))
+        }
+        _ => None,
+    };
+    let tls_listener = match (&cli.tls_listen, &tls_store) {
+        (Some(spec), Some(store)) => Some((
+            TcpListener::bind(spec)
+                .await
+                .with_context(|| format!("--tls-listen {spec}"))?,
+            tls::server_config(store.clone())?,
+        )),
+        _ => None,
+    };
+
     let query_limit = RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(
         TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
     );
@@ -504,8 +543,10 @@ async fn main() -> anyhow::Result<()> {
     loops.spawn(tcp::serve(
         listener,
         Arc::new(Resolving {
-            resolver,
-            caches,
+            // Cloned, because the DoT loop below serves the same resolver and
+            // the same caches: one answer path, two ways in.
+            resolver: resolver.clone(),
+            caches: caches.clone(),
             ctx: ctx.clone(),
         }),
         TransportLimits::default(),
@@ -513,6 +554,51 @@ async fn main() -> anyhow::Result<()> {
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
+    // Same admission, same per-connection rate rule as the plain TCP loop: what
+    // TLS changes is who can read the connection, not what is answered on it.
+    if let Some((tls_listener, config)) = tls_listener {
+        loops.spawn(tls::serve(
+            tls_listener,
+            config,
+            Arc::new(Resolving {
+                resolver: resolver.clone(),
+                caches: caches.clone(),
+                ctx: ctx.clone(),
+            }),
+            TransportLimits::default(),
+            tcp::RateLimit::PerConnection,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+        // The renewal story, and the only reload this daemon has. `rdnsd` folds
+        // the same call into the reload every trigger passes through; here there
+        // are no zones, so SIGHUP means this and only this.
+        //
+        // Not in the `JoinSet` below: that set's rule is "the first task to end
+        // ends the process", and this one ends on the stop signal by design.
+        if let Some(store) = tls_store.clone() {
+            let stop = shutdown.stop_handle();
+            tokio::spawn(async move {
+                let mut signals = reload_signal();
+                loop {
+                    tokio::select! {
+                        reloaded = next_reload(&mut signals) => {
+                            if !reloaded {
+                                break;
+                            }
+                        }
+                        _ = stop.wait() => break,
+                    }
+                    match store.reload() {
+                        Ok(()) => tracing::info!("TLS certificate re-read (SIGHUP)"),
+                        Err(e) => {
+                            tracing::warn!("could not re-read the TLS certificate (SIGHUP): {e:#}")
+                        }
+                    }
+                }
+            });
+        }
+    }
     // A listener like the others: if it dies, the process does. Metrics that
     // silently stopped are worse than a resolver that is plainly down.
     if let Some(metrics_listener) = metrics_listener {

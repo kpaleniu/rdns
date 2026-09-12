@@ -138,6 +138,57 @@ impl Default for Shutdown {
     }
 }
 
+/// A SIGHUP stream, or `None` if one could not be registered.
+///
+/// Here rather than in a daemon because both of them want it and the second was
+/// about to be a copy of the first (`CLAUDE.md` §7). `rdnsd` reloads its zones
+/// on this; `rdnsr` has no zones and re-reads its TLS certificate, which is the
+/// half neither can do without a restart otherwise (`TODO.md` #42a).
+///
+/// `None` rather than an error: losing the signal costs a reload trigger, and
+/// `rdnsd` still has its re-signing timer and its control socket. It is logged
+/// because the difference is invisible until somebody sends one.
+///
+/// `tokio`'s own signal support rather than `signal-hook-tokio`, for the same
+/// reason [`stop_signal`] uses it: it is already here, it needs no dependency,
+/// and one mechanism for every signal this process handles beats two.
+#[cfg(unix)]
+pub fn reload_signal() -> Option<tokio::signal::unix::Signal> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    match signal(SignalKind::hangup()) {
+        Ok(signals) => Some(signals),
+        Err(e) => {
+            tracing::error!("could not listen for SIGHUP ({e}); nothing will reload on signal");
+            None
+        }
+    }
+}
+
+/// Whether a reload was asked for. `false` means the signal source ended and
+/// the caller should stop watching it.
+#[cfg(unix)]
+pub async fn next_reload(signals: &mut Option<tokio::signal::unix::Signal>) -> bool {
+    match signals {
+        Some(signals) => signals.recv().await.is_some(),
+        // No signal source, but a caller's timer may still fire — so park here
+        // rather than ending its loop.
+        None => std::future::pending().await,
+    }
+}
+
+/// Windows has no SIGHUP, so only a timer or the control socket triggers a
+/// reload there.
+#[cfg(not(unix))]
+pub fn reload_signal() -> Option<()> {
+    None
+}
+
+#[cfg(not(unix))]
+pub async fn next_reload(_signals: &mut Option<()>) -> bool {
+    std::future::pending().await
+}
+
 /// Resolve when the OS asks the process to stop, naming the signal.
 ///
 /// SIGTERM is what every supervisor sends first; ignoring it spends the grace

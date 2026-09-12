@@ -203,6 +203,58 @@ rdnsd --zone-dir ./zones --secondary example.com@192.0.2.1:5353
 `rdnsctl status` reports `secondary` from the configuration rather than inferring
 it from an absent last-contact time, which a primary also has.
 
+### `--tls-listen <ADDR:PORT>`, `--tls-cert`, `--tls-key`
+
+DNS over TLS (RFC 7858), on the address given. 853 is the assigned port. All
+three or none: a listener with no certificate is refused at startup rather than
+bound with nothing to present.
+
+This is *in addition to* the plain UDP and TCP listeners on `--port`, never
+instead of them. An authoritative server's clients are resolvers, and one that
+answered only over TLS could not be used by most of them.
+
+- The certificate is a PEM chain, leaf first; the key is its PEM private key.
+  Both are re-read on every reload, so **a renewal is a reload, not a restart**:
+  `certbot --deploy-hook 'rdnsctl reload'`, or a SIGHUP. A reload whose new files
+  will not load keeps the certificate already being served and says so — half a
+  renewal must not take 853 off the air.
+- The key is refused if its group or everybody can read it, the same check the
+  DNSSEC keys and a TSIG `secret-file` get. Unix only; Windows has no equivalent.
+- A certificate and key that are not a pair are refused at startup. They would
+  otherwise load, start, and fail every handshake.
+- ALPN `dot` is advertised and not required: a client that offers no ALPN is
+  still served, because DoT predates the token.
+- No client certificates. RFC 8310 §8.2's mutual TLS authenticates a *client*,
+  which TSIG already does here on every transport rather than one.
+
+**Expiry is not parsed.** Reading `notAfter` means an X.509 parser, and the only
+thing this tree would gain from one is a log line. What an expired certificate
+produces is observable without it — every client hangs up at the handshake — so
+the alert is the counter:
+
+```promql
+rate(dns_tls_handshake_failures_total[5m]) > 0
+```
+
+`dns_tls_handshakes_total` is its companion. Both are emitted even when no DoT
+listener is configured, as a pair of zeroes, so an alert can be written before
+the feature is turned on.
+
+```bash
+rdnsd --zone-dir ./zones \
+  --tls-listen 0.0.0.0:853 \
+  --tls-cert /etc/rdns/tls/fullchain.pem \
+  --tls-key /etc/rdns/tls/privkey.pem
+```
+
+Below 1024 needs root or `CAP_NET_BIND_SERVICE`, exactly as `--port` does; in a
+container, `--sysctl net.ipv4.ip_unprivileged_port_start=53`.
+
+`rdnsr` takes the same three flags and means the same thing by them. A resolver
+is in fact what RFC 7858 was written for — the stub-to-recursive hop is the one
+it names — and there SIGHUP does nothing *but* re-read the certificate, since a
+resolver has no zones to reload.
+
 ### `--metrics-listen <ADDR:PORT>`
 
 Prometheus metrics on `/metrics`, plus `/healthz` (liveness) and `/readyz`

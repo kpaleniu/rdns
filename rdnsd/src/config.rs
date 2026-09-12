@@ -94,6 +94,13 @@ pub struct Server {
     #[serde(default = "crate::default_udp_workers")]
     pub udp_workers: usize,
     pub metrics_listen: Option<String>,
+    /// Where to answer DNS over TLS (RFC 7858), and with what. All three or
+    /// none: `apply` refuses a listener with no certificate, because the
+    /// config file has no equivalent of clap's `requires` and would otherwise
+    /// bind 853 with nothing to present on it.
+    pub tls_listen: Option<String>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
     /// Where `rdnsctl` reaches this server. Unix only, and refused at startup
     /// on Windows rather than ignored — the field parses everywhere so that one
     /// config file can be read on either platform and fail with a sentence
@@ -126,6 +133,9 @@ impl Default for Server {
             anomaly_source_refusals: default_anomaly_source_refusals(),
             udp_workers: crate::default_udp_workers(),
             metrics_listen: None,
+            tls_listen: None,
+            tls_cert: None,
+            tls_key: None,
             control_socket: None,
             allow_partial_load: false,
         }
@@ -452,6 +462,9 @@ impl Config {
         cli.anomaly_source_refusals = self.server.anomaly_source_refusals;
         cli.udp_workers = self.server.udp_workers;
         cli.metrics_listen = self.server.metrics_listen.clone();
+        cli.tls_listen = self.server.tls_listen.clone();
+        cli.tls_cert = self.server.tls_cert.clone();
+        cli.tls_key = self.server.tls_key.clone();
         cli.control_socket = self.server.control_socket.clone();
         cli.allow_partial_load = self.server.allow_partial_load;
         cli.tsig_key = self.tsig_specs()?;

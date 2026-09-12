@@ -29,6 +29,7 @@ networks:
 volumes:
   primary-zones:
   primary-keys:
+  primary-tls:
   child-zones:
   child-keys:
   secondary-zones:
@@ -47,10 +48,17 @@ services:
     networks:
       interop:
         ipv4_address: 10.53.0.2
+    # 853 is the port RFC 7858 assigns and there is nowhere in a DoT client to
+    # put a different one by default, so the DoT listener gets the real one --
+    # through the Dockerfile's own escape hatch rather than by running as root.
+    # Plain DNS stays on 5353, which is what every peer here is configured for.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "53"
     volumes:
       - ./conf/rdnsd-primary.toml:/etc/rdns/rdnsd.toml:ro
       - primary-zones:/etc/rdns/zones
       - primary-keys:/etc/rdns/keys
+      - primary-tls:/etc/rdns/tls
     command: ["--config", "/etc/rdns/rdnsd.toml"]
     stop_grace_period: 10s
 
@@ -173,6 +181,7 @@ services:
       - ./run:/srv/run
       - primary-zones:/srv/primary-zones
       - primary-keys:/srv/primary-keys
+      - primary-tls:/srv/primary-tls
       - child-zones:/srv/child-zones
       - child-keys:/srv/child-keys
     command: ["sleep", "infinity"]

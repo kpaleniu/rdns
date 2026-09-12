@@ -20,6 +20,7 @@
 pub mod tcp;
 #[cfg(test)]
 mod testutil;
+pub mod tls;
 
 use std::net::IpAddr;
 use std::sync::Arc;

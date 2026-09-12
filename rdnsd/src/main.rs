@@ -61,7 +61,7 @@ use rdns::{
     readiness::Readiness,
     secondary::{state_file_path, MasterSpec, StateFile},
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl},
-    shutdown::{Busy, Lifecycle, Shutdown, Stop},
+    shutdown::{next_reload, reload_signal, Busy, Lifecycle, Shutdown, Stop},
     socket::bind_addr_for,
     tsig::{self, TsigKeyring},
     validation::{AdmissionCheck, AdmissionLimits, Transport},
@@ -74,6 +74,7 @@ use rdns::{Name, NameRef, UdpSizes};
 #[cfg(test)]
 use rdns::{clock::current_unix_timestamp, zone::parse_zone_file_at};
 use rdns_transport::tcp;
+use rdns_transport::tls::{self, CertificateStore};
 use rdns_transport::{recv_error_is_transient, ServeContext, TransportLimits, UDP_RECEIVE_BUFFER};
 
 /// The request caps `--max-udp-request` and `--max-tcp-request` ask for, with the
@@ -104,9 +105,6 @@ pub(crate) fn default_udp_workers() -> usize {
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
-
-#[cfg(unix)]
-use tokio::signal::unix::{signal, Signal, SignalKind};
 
 // Both macros are re-exported with `pub(crate) use` rather than left to
 // `macro_rules!`'s textual scoping, which would force `mod dispatch;` below this
@@ -411,6 +409,34 @@ struct Cli {
         conflicts_with = "config"
     )]
     udp_workers: usize,
+    /// Also answer DNS over TLS here (RFC 7858). Needs --tls-cert and --tls-key.
+    ///
+    /// 853 is the assigned port. This is in addition to the plain UDP and TCP
+    /// listeners on --port, not instead of them: a server that answered only
+    /// over TLS could not be used by the resolvers that make up an
+    /// authoritative server's clients.
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
+    tls_listen: Option<String>,
+    /// The PEM certificate chain --tls-listen presents. Leaf first.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "config",
+        requires = "tls_listen"
+    )]
+    tls_cert: Option<PathBuf>,
+    /// The PEM private key for --tls-cert.
+    ///
+    /// Refused if it is readable by its group or by everybody, the same check
+    /// the DNSSEC keys and a TSIG `secret-file` get. Unix only; Windows has no
+    /// equivalent.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "config",
+        requires = "tls_listen"
+    )]
+    tls_key: Option<PathBuf>,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///
     /// `GET /metrics` is the scrape, `GET /healthz` says the process is
@@ -540,6 +566,8 @@ struct ServePolicy {
     udp_workers: usize,
     /// Where to serve Prometheus metrics, if anywhere.
     metrics_listen: Option<String>,
+    /// Where to answer DNS over TLS, and with what. `None` is off.
+    tls: Option<TlsPolicy>,
     /// Whether every zone this server answers for is in the map yet, for
     /// `/readyz` on that same listener.
     readiness: Readiness,
@@ -549,6 +577,15 @@ struct ServePolicy {
     journal: Option<Arc<Journal>>,
     /// The control socket, and what a `reload` on it pokes.
     control: ControlPolicy,
+}
+
+/// A DoT listener: the address, and the certificate it presents.
+///
+/// The store is shared with the reload path, so a renewed certificate is picked
+/// up by `rdnsctl reload` or a SIGHUP rather than by a restart (`TODO.md` #42a).
+struct TlsPolicy {
+    listen: String,
+    store: Arc<CertificateStore>,
 }
 
 /// Where the control socket lives and how it asks for a reload.
@@ -585,6 +622,7 @@ async fn serve(
         anomalies: (anomaly_interval, anomaly_thresholds),
         udp_workers,
         metrics_listen,
+        tls,
         readiness,
         updates,
         journal,
@@ -664,6 +702,18 @@ async fn serve(
         ),
         None => None,
     };
+    // And the TLS listener, for the same reason the metrics one is bound here:
+    // a port conflict on 853 must stop the start rather than leave a server
+    // running that a DoT client cannot reach and nothing reports.
+    let tls_listener = match &tls {
+        Some(policy) => Some((
+            TcpListener::bind(&policy.listen)
+                .await
+                .with_context(|| format!("--tls-listen {}", policy.listen))?,
+            tls::server_config(policy.store.clone())?,
+        )),
+        None => None,
+    };
     // Same rule for the control socket: a path that cannot be bound stops the
     // start.
     #[cfg(unix)]
@@ -697,8 +747,20 @@ async fn serve(
          request cap: {udp_cap}B UDP / {tcp_cap}B TCP, \
          UDP reply cap: {reply_cap}B (advertising {advertised}B), \
          UDP workers: {udp_workers}, anomaly warnings: {anomaly_note}, \
-         TSIG keys: {}, metrics: {}, control: {}",
+         TSIG keys: {}, DoT: {}, metrics: {}, control: {}",
         server.tsig_keys.len(),
+        match &tls {
+            Some(policy) => {
+                let (cert, key) = policy.store.paths();
+                format!(
+                    "{} (cert {}, key {})",
+                    policy.listen,
+                    cert.display(),
+                    key.display()
+                )
+            }
+            None => "off (--tls-listen)".to_string(),
+        },
         match &metrics_listen {
             Some(spec) => format!("{spec}/metrics"),
             None => "off (--metrics-listen)".to_string(),
@@ -760,6 +822,20 @@ async fn serve(
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
+    // Same admission and the same rate rule as the plain TCP loop above: what
+    // TLS changes is who can read the connection, not what this server will
+    // answer on it.
+    if let Some((tls_listener, config)) = tls_listener {
+        loops.spawn(tls::serve(
+            tls_listener,
+            config,
+            server.clone(),
+            TransportLimits::default(),
+            tcp::RateLimit::PerMessage,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+    }
     // A listener like the others: if it dies, the process does. A server whose
     // metrics stopped is one nobody is watching.
     if let Some(metrics_listener) = metrics_listener {
@@ -996,20 +1072,55 @@ impl ReloadTrigger {
     }
 }
 
+/// Everything a reload acts on, fixed for the life of the process.
+///
+/// A struct because the list reached eight and clippy says so at seven, which
+/// is `CLAUDE.md` §14's rule and the same one `ServePolicy` exists for: two of
+/// these are `Arc`-shaped and two are path-shaped, one swap away from each
+/// other with nothing to catch it.
+struct ReloadContext {
+    reloading: Reloading,
+    source: ZoneSource,
+    served: ZoneContext,
+    notify: Arc<NotifyPolicy>,
+    /// Re-read on every reload, so a renewed certificate costs a SIGHUP rather
+    /// than a restart (`TODO.md` #42a). `None` when there is no DoT listener.
+    tls: Option<Arc<CertificateStore>>,
+}
+
 /// One reload, installed and announced. What SIGHUP, the re-signing timer and
 /// the control socket all do, so that they cannot drift apart (`CLAUDE.md` §7).
 ///
 /// Returns the announced-serial state to carry into the next round.
 async fn reload_once(
-    reloading: &Reloading,
-    source: &ZoneSource,
-    served: &ZoneContext,
-    notify: &NotifyPolicy,
+    ctx: &ReloadContext,
     announced: Vec<(Name, Serial)>,
     busy: &Busy,
     trigger: ReloadTrigger,
 ) -> Vec<(Name, Serial)> {
+    let ReloadContext {
+        reloading,
+        source,
+        served,
+        notify,
+        tls,
+    } = ctx;
     let why = trigger.why();
+    // Before the zones, and independent of whether they load. This is the one
+    // function SIGHUP, `rdnsctl reload` and the re-signing timer all pass
+    // through, which is why the certificate renewal story is a reload and not a
+    // restart (`TODO.md` #42a): `certbot --deploy-hook 'rdnsctl reload'`.
+    //
+    // A failure here is a warning and nothing more. `CertificateStore::reload`
+    // keeps the certificate it is already serving, so half a renewal costs a
+    // log line rather than the listener — and the zones, which have nothing to
+    // do with it, still reload.
+    if let Some(store) = tls {
+        match store.reload() {
+            Ok(()) => tracing::info!("TLS certificate re-read ({why})"),
+            Err(e) => tracing::warn!("could not re-read the TLS certificate ({why}): {e:#}"),
+        }
+    }
     let (announced, outcome) = match reloading.load(source).await {
         Ok(new_zones) => {
             let loaded = new_zones.len();
@@ -1065,23 +1176,20 @@ async fn reload_once(
 /// installing zones is work the drain should wait for, and a task that never
 /// exits while holding a `Busy` spends the whole budget every shutdown.
 fn spawn_zone_maintenance(
-    served: ZoneContext,
-    source: ZoneSource,
-    notify: Arc<NotifyPolicy>,
+    ctx: ReloadContext,
     announced: Vec<(Name, Serial)>,
-    reloading: Reloading,
     lifecycle: Lifecycle,
 ) -> mpsc::Sender<ReloadTrigger> {
     let Lifecycle { stop, busy } = lifecycle;
     // `None` when nothing is signed: a server with no keys has nothing to
     // re-sign, and a timer that fired anyway would reload the zones on a
     // schedule nobody asked for.
-    let resign_every = reloading.signing.as_ref().map(|s| s.resign_interval());
+    let resign_every = ctx.reloading.signing.as_ref().map(|s| s.resign_interval());
     if let Some(every) = resign_every {
         tracing::info!(
             "re-signing every {}h, a third of the {}-day signature validity",
             every.as_secs() / 3600,
-            reloading
+            ctx.reloading
                 .signing
                 .as_ref()
                 .map(|s| s.validity_days())
@@ -1104,7 +1212,7 @@ fn spawn_zone_maintenance(
         let _busy = busy;
         let _keepalive = keepalive;
         let mut announced = announced;
-        let mut signals = signal_stream();
+        let mut signals = reload_signal();
         loop {
             // Whichever comes first. A trigger that arrives during shutdown is
             // ignored: reloading zones we are about to stop serving is work for
@@ -1115,7 +1223,7 @@ fn spawn_zone_maintenance(
             // that loses to the stop is one whose sender is about to be told the
             // server stopped, which is true.
             let trigger = tokio::select! {
-                reloaded = next_reload_signal(&mut signals) => {
+                reloaded = next_reload(&mut signals) => {
                     if !reloaded {
                         break;
                     }
@@ -1127,10 +1235,7 @@ fn spawn_zone_maintenance(
                 _ = sleep_for(resign_every) => ReloadTrigger::Timer,
                 _ = stop.wait() => break,
             };
-            announced = reload_once(
-                &reloading, &source, &served, &notify, announced, &_busy, trigger,
-            )
-            .await;
+            announced = reload_once(&ctx, announced, &_busy, trigger).await;
         }
     });
 
@@ -1146,48 +1251,6 @@ async fn sleep_for(every: Option<Duration>) {
         Some(every) => tokio::time::sleep(every).await,
         None => std::future::pending().await,
     }
-}
-
-/// `tokio`'s own signal support rather than `signal-hook-tokio`, for the same
-/// reason `rdns::shutdown` uses it: it is already here, it needs no dependency,
-/// and one mechanism for every signal this process handles beats two.
-///
-/// `signals.next()` needs a `StreamExt` in scope to resolve to `Stream::next`;
-/// without one it resolves to `Iterator::next` and fails the trait bound — which
-/// no amount of building on Windows shows, since the module is `#[cfg(unix)]`.
-#[cfg(unix)]
-fn signal_stream() -> Option<Signal> {
-    match signal(SignalKind::hangup()) {
-        Ok(signals) => Some(signals),
-        Err(e) => {
-            // The re-signing timer still works, which is the half with teeth.
-            tracing::error!("could not listen for SIGHUP ({e}); zones will not reload on signal");
-            None
-        }
-    }
-}
-
-/// Whether a reload was asked for. `false` means the signal source ended and the
-/// loop should stop watching it.
-#[cfg(unix)]
-async fn next_reload_signal(signals: &mut Option<Signal>) -> bool {
-    match signals {
-        Some(signals) => signals.recv().await.is_some(),
-        // No signal source, but the timer may still fire — so park here rather
-        // than ending the loop.
-        None => std::future::pending().await,
-    }
-}
-
-/// Windows has no SIGHUP, so only the timer triggers a reload here.
-#[cfg(not(unix))]
-fn signal_stream() -> Option<()> {
-    None
-}
-
-#[cfg(not(unix))]
-async fn next_reload_signal(_signals: &mut Option<()>) -> bool {
-    std::future::pending().await
 }
 
 /// `addr[:port][#keyname]` for a secondary, resolved against the keyring.
@@ -1533,6 +1596,22 @@ async fn main() -> Result<()> {
     // or, worse, being read as something wider.
     let transfer_acl = TransferAcl::parse(&cli.allow_transfer)?;
     let tsig_keys = TsigKeyring::parse(&cli.tsig_key)?;
+    // Loaded before anything binds, like every other thing that can stop the
+    // start. A certificate that will not read is a DoT listener that answers
+    // nothing, which is the failure `--metrics-listen` is already refused for.
+    let tls_store = match (&cli.tls_listen, &cli.tls_cert, &cli.tls_key) {
+        (Some(_), Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
+        // clap's `requires` covers a missing flag; this covers the config file,
+        // which has no such mechanism and would otherwise bind 853 with nothing
+        // to present on it.
+        (Some(listen), _, _) => {
+            return Err(anyhow!(
+                "tls-listen {listen} needs both tls-cert and tls-key"
+            ))
+        }
+        _ => None,
+    };
+
     // After the keyring, because a `#key` names one of its entries.
     let notify = Arc::new(build_notify_policy(&cli, &per_zone.notify, &tsig_keys)?);
     // Said out loud for the reason the transfer policy is: whether a NOTIFY is
@@ -1601,12 +1680,20 @@ async fn main() -> Result<()> {
         // not be able to take away the output of a command whose entire job is
         // to produce it.
         println!(
-            "configuration is valid: {} zone(s), {} TSIG key(s), signing {}",
+            "configuration is valid: {} zone(s), {} TSIG key(s), signing {}, DoT {}",
             zones.len(),
             cli.tsig_key.len(),
             match &signing {
                 Some(s) => format!("{} zone(s)", s.signed_zone_count(&zones)),
                 None => "disabled".to_string(),
+            },
+            // Named because the certificate was read, permission-checked and
+            // matched against its key above — a dry run has to run everything
+            // that does not bind a socket (`CLAUDE.md` §15), and saying nothing
+            // about it would leave an operator unable to tell whether it did.
+            match (&cli.tls_listen, &tls_store) {
+                (Some(listen), Some(_)) => format!("on {listen}, certificate loads"),
+                _ => "disabled".to_string(),
             }
         );
         return Ok(());
@@ -1726,18 +1813,21 @@ async fn main() -> Result<()> {
     let udp = UdpSizes::new(cli.udp_payload_size, cli.max_udp_response);
 
     let reloads = spawn_zone_maintenance(
-        served.clone(),
-        source,
-        notify,
-        announced,
-        Reloading {
-            replicating,
-            allow_partial: cli.allow_partial_load,
-            secondaries: reload_secondaries,
-            zone_dir: reload_zone_dir,
-            signing,
-            validator,
+        ReloadContext {
+            reloading: Reloading {
+                replicating,
+                allow_partial: cli.allow_partial_load,
+                secondaries: reload_secondaries,
+                zone_dir: reload_zone_dir,
+                signing,
+                validator,
+            },
+            source,
+            served: served.clone(),
+            notify,
+            tls: tls_store.clone(),
         },
+        announced,
         shutdown.lifecycle(),
     );
 
@@ -1762,6 +1852,10 @@ async fn main() -> Result<()> {
             ),
             udp_workers: cli.udp_workers,
             metrics_listen: cli.metrics_listen,
+            tls: match (cli.tls_listen, tls_store.clone()) {
+                (Some(listen), Some(store)) => Some(TlsPolicy { listen, store }),
+                _ => None,
+            },
             readiness,
             updates,
             journal,
