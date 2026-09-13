@@ -51,7 +51,7 @@ use rdns::tls_identity::TlsIdentity;
 
 use crate::tcp::{Handler, RateLimit, SplitStream};
 use crate::TransportLimits;
-use rdns::validation::Privacy;
+use rdns::validation::{Arrival, TlsVersion};
 
 /// The port RFC 7858 §3.1 assigns.
 pub const DOT_PORT: u16 = 853;
@@ -296,11 +296,11 @@ pub async fn serve_one_tls<H: Handler>(
     // "1.2 or later" and a stub resolver in the field may offer nothing else.
     // A *transfer* needs 1.3 (RFC 9103 §7.2), and only the connection knows
     // which it got.
-    let privacy = match stream.get_ref().1.protocol_version() {
-        Some(rustls::ProtocolVersion::TLSv1_3) => Privacy::Tls13,
-        _ => Privacy::TlsOlder,
-    };
-    crate::tcp::serve_one(stream, peer, handler, limits, rate, privacy, stop).await;
+    let arrival = Arrival::Dot(match stream.get_ref().1.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => TlsVersion::Tls13,
+        _ => TlsVersion::Older,
+    });
+    crate::tcp::serve_one(stream, peer, handler, limits, rate, arrival, stop).await;
 }
 
 /// Fixtures the DoT and DoQ tests share.
@@ -383,7 +383,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
-    struct Echo(ServeContext, std::sync::Mutex<Option<Privacy>>);
+    struct Echo(ServeContext, std::sync::Mutex<Option<Arrival>>);
 
     impl Echo {
         fn new(ctx: ServeContext) -> Echo {
@@ -391,7 +391,7 @@ mod tests {
         }
 
         /// What the last message handled arrived over.
-        fn seen(&self) -> Option<Privacy> {
+        fn seen(&self) -> Option<Arrival> {
             *self.1.lock().expect("the test's own mutex")
         }
     }
@@ -406,10 +406,10 @@ mod tests {
             packet: Vec<u8>,
             _peer: SocketAddr,
             _now: u64,
-            privacy: Privacy,
+            arrival: Arrival,
             out: mpsc::Sender<crate::tcp::Reply>,
         ) {
-            *self.1.lock().expect("the test's own mutex") = Some(privacy);
+            *self.1.lock().expect("the test's own mutex") = Some(arrival);
             crate::tcp::send_framed(&out, &packet).await;
         }
     }
@@ -488,7 +488,7 @@ mod tests {
         // one.
         assert_eq!(
             seen.seen(),
-            Some(Privacy::Tls13),
+            Some(Arrival::Dot(TlsVersion::Tls13)),
             "a DoT connection this build negotiates is TLS 1.3"
         );
 

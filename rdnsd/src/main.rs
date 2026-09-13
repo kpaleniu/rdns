@@ -2385,7 +2385,7 @@ mod tests {
     use rdns::record_types;
     use rdns::secondary::{zone_file_path, MasterSpec, RefreshTimers, TransferState};
     use rdns::tsig::{TsigAlgorithm, TsigKey};
-    use rdns::validation::Privacy;
+    use rdns::validation::{Arrival, TlsVersion};
     use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
     use rdns::Class;
     use rdns::QueryClass;
@@ -2407,7 +2407,7 @@ mod tests {
                 packet,
                 peer,
                 tsig::now(),
-                &Wire::Framed(&tx, Privacy::Clear),
+                &Wire::Framed(&tx, Arrival::Tcp),
                 &mut Scratch::default(),
             )
             .await;
@@ -2780,7 +2780,7 @@ mod tests {
                     &greedy,
                     peer,
                     tsig::now(),
-                    &Wire::Framed(&tx, Privacy::Clear),
+                    &Wire::Framed(&tx, Arrival::Tcp),
                     &mut Scratch::default(),
                 )
                 .await;
@@ -3513,7 +3513,7 @@ mod tests {
         log: DeltaLog,
         keys: TsigKeyring,
     ) -> SocketAddr {
-        spawn_primary_full(zone, acl, log, keys, false, Privacy::Clear).await
+        spawn_primary_full(zone, acl, log, keys, false, Arrival::Tcp).await
     }
 
     /// A primary with the two XoT knobs exposed: whether it requires an
@@ -3529,7 +3529,7 @@ mod tests {
         log: DeltaLog,
         keys: TsigKeyring,
         transfer_tls_only: bool,
-        privacy: Privacy,
+        arrival: Arrival,
     ) -> SocketAddr {
         let mut zones = HashMap::new();
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
@@ -3557,7 +3557,7 @@ mod tests {
                     server.clone(),
                     TransportLimits::default(),
                     tcp::RateLimit::PerMessage,
-                    privacy,
+                    arrival,
                     test_shutdown().stop_handle(),
                 ));
             }
@@ -3620,7 +3620,7 @@ mod tests {
                     server.clone(),
                     TransportLimits::default(),
                     tcp::RateLimit::PerMessage,
-                    Privacy::Clear,
+                    Arrival::Tcp,
                     test_shutdown().stop_handle(),
                 ));
             }
@@ -5030,7 +5030,7 @@ mod tests {
             DeltaLog::new(),
             TsigKeyring::new(Vec::new()),
             true,
-            Privacy::Clear,
+            Arrival::Tcp,
         )
         .await;
         let spec = MasterSpec {
@@ -5062,7 +5062,7 @@ mod tests {
             DeltaLog::new(),
             TsigKeyring::new(Vec::new()),
             true,
-            Privacy::Clear,
+            Arrival::Tcp,
         )
         .await;
 
@@ -5106,7 +5106,7 @@ mod tests {
             DeltaLog::new(),
             TsigKeyring::new(Vec::new()),
             true,
-            Privacy::Tls13,
+            Arrival::Dot(TlsVersion::Tls13),
         )
         .await;
         let spec = MasterSpec {
@@ -5145,7 +5145,7 @@ mod tests {
             DeltaLog::new(),
             TsigKeyring::new(Vec::new()),
             true,
-            Privacy::TlsOlder,
+            Arrival::Dot(TlsVersion::Older),
         )
         .await;
         let spec = MasterSpec {

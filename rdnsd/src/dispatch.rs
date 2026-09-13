@@ -33,7 +33,7 @@ use rdns::{
     transfer::axfr_envelopes,
     tsig::{self, TsigCheck, TsigSession},
     update,
-    validation::{Privacy, Request, Transport},
+    validation::{Arrival, Privacy, Request, Transport},
     zone::{parse_zone_file_at, Zone},
     DnsMessage, ExtendedError, OpCode, Qtype, ResponseCode,
 };
@@ -59,10 +59,10 @@ pub(super) enum Wire<'a> {
     /// Length-prefixed (RFC 1035 §4.2.2), a sequence allowed, and no response
     /// budget: the handshake proved the address.
     ///
-    /// The [`Privacy`] rides here rather than beside it because it is a fact
+    /// The [`Arrival`] rides here rather than beside it because it is a fact
     /// about *this* connection and only a framed one can carry a transfer,
     /// which is the one answer that has a policy about it (RFC 9103 §11).
-    Framed(&'a mpsc::Sender<Reply>, Privacy),
+    Framed(&'a mpsc::Sender<Reply>, Arrival),
     /// One datagram back to the peer, capped by its EDNS advertisement and
     /// charged against the response budget.
     Datagram(&'a UdpSocket, SocketAddr),
@@ -100,6 +100,21 @@ impl Wire<'_> {
         }
     }
 
+    /// What a dnstap reader calls this transport.
+    ///
+    /// All five, since `TODO.md` #54 gave the dispatcher an [`Arrival`] rather
+    /// than a [`Privacy`]: the three encrypted ones were one value before, and
+    /// the field was left absent rather than guessed at.
+    fn socket_protocol(&self) -> dnstap::SocketProtocol {
+        match self {
+            Wire::Datagram(..) => dnstap::SocketProtocol::Udp,
+            Wire::Framed(_, Arrival::Tcp) => dnstap::SocketProtocol::Tcp,
+            Wire::Framed(_, Arrival::Dot(_)) => dnstap::SocketProtocol::Dot,
+            Wire::Framed(_, Arrival::Doh(_)) => dnstap::SocketProtocol::Doh,
+            Wire::Framed(_, Arrival::Doq) => dnstap::SocketProtocol::Doq,
+        }
+    }
+
     /// Put one finished message on the wire, framing it if the transport frames.
     ///
     /// Callers hand over unframed bytes whichever transport they are on, which
@@ -133,7 +148,7 @@ impl tcp::Handler for Server {
         packet: Vec<u8>,
         peer: SocketAddr,
         now: u64,
-        privacy: Privacy,
+        arrival: Arrival,
         out: mpsc::Sender<Reply>,
     ) {
         // A scratch per message here, where the UDP worker keeps one per worker:
@@ -144,7 +159,7 @@ impl tcp::Handler for Server {
             &packet,
             peer,
             now,
-            &Wire::Framed(&out, privacy),
+            &Wire::Framed(&out, arrival),
             &mut scratch,
         )
         .await;
@@ -264,8 +279,8 @@ impl Server {
         // IXFR over UDP is answered with a single SOA (RFC 1995 §2), both of
         // which `write_response` does below.
         if matches!(qtype, Some(Qtype::AXFR) | Some(Qtype::IXFR)) {
-            if let Wire::Framed(out, privacy) = wire {
-                self.answer_transfer(&msg, peer, session.as_mut(), now, *privacy, out)
+            if let Wire::Framed(out, arrival) = wire {
+                self.answer_transfer(&msg, peer, session.as_mut(), now, arrival.privacy(), out)
                     .await;
                 return;
             }
@@ -414,12 +429,12 @@ impl Server {
     /// entry carries the query verbatim in `Message.query_message`, which is
     /// what the schema is for, and halves the frames on the hot path.
     ///
-    /// `socket_protocol` is UDP or TCP and is *omitted* for an encrypted
-    /// connection. The dispatcher is told [`Privacy`] — which deliberately
-    /// says what a connection hid rather than which protocol wrapped it, and
-    /// says why in its own doc comment — so DoT, DoH and DoQ are one value
-    /// here. An absent optional field is a reader showing nothing; DOT for a
-    /// DoH query would be a wrong one (`TODO.md` #54, `CLAUDE.md` §14).
+    /// `socket_protocol` names the transport exactly, DoT, DoH and DoQ
+    /// included, because the dispatcher is told [`Arrival`] — which protocol
+    /// carried the message as well as what it hid (`TODO.md` #54). It was
+    /// omitted for every encrypted connection until then: [`Privacy`] alone
+    /// cannot tell the three apart, and DOT for a DoH query is a wrong value
+    /// where an absent one is a reader showing nothing (`CLAUDE.md` §14).
     fn record_dnstap(
         &self,
         wire: &Wire<'_>,
@@ -439,11 +454,7 @@ impl Server {
             identity: sink.identity(),
             version: sink.version(),
             message_type,
-            socket_protocol: match wire {
-                Wire::Datagram(..) => Some(dnstap::SocketProtocol::Udp),
-                Wire::Framed(_, Privacy::Clear) => Some(dnstap::SocketProtocol::Tcp),
-                Wire::Framed(..) => None,
-            },
+            socket_protocol: Some(wire.socket_protocol()),
             peer,
             // The listener's address is not carried this far, and a wrong one
             // is worse than none on a multi-homed host.
@@ -1294,6 +1305,38 @@ mod tests {
     use rdns::record_types;
     use rdns::UdpSizes;
     use std::collections::HashMap;
+
+    /// Every encrypted transport gets its own dnstap label.
+    ///
+    /// `TODO.md` #54: the dispatcher was told [`Privacy`], which is `Clear`,
+    /// `Tls13` or `TlsOlder`, so DoT, DoH and DoQ were one value and the field
+    /// was left *absent* rather than guessed at — a reader showing nothing
+    /// where it should show three different things. Against the old code the
+    /// last three rows here read `None`.
+    ///
+    /// A table rather than a live exchange: the mapping is what changed, and
+    /// `record_dnstap` needs a sink, a socket and a parsed message to reach.
+    #[test]
+    fn a_dnstap_entry_names_the_transport_including_the_encrypted_three() {
+        use rdns::validation::TlsVersion;
+        let (tx, _rx) = mpsc::channel::<Reply>(1);
+        let cases = [
+            (Arrival::Tcp, dnstap::SocketProtocol::Tcp),
+            (Arrival::Dot(TlsVersion::Tls13), dnstap::SocketProtocol::Dot),
+            // The version does not change the label: DoT over 1.2 is still DoT,
+            // and it is `Privacy` that decides whether a transfer may use it.
+            (Arrival::Dot(TlsVersion::Older), dnstap::SocketProtocol::Dot),
+            (Arrival::Doh(TlsVersion::Tls13), dnstap::SocketProtocol::Doh),
+            (Arrival::Doq, dnstap::SocketProtocol::Doq),
+        ];
+        for (arrival, expected) in cases {
+            assert_eq!(
+                Wire::Framed(&tx, arrival).socket_protocol(),
+                expected,
+                "{arrival:?}"
+            );
+        }
+    }
 
     /// Every reply built away from `answer.rs` mirrors the client's OPT the
     /// same way that file does — RFC 6891 §6.1.1 for the record, RFC 3225 §3

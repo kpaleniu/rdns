@@ -8028,3 +8028,128 @@ against the built binary. 1,121 tests on Windows and 1,141 on Linux, clippy
 clean on both, `cargo doc` clean.
 
 ---
+
+### 54. A dispatcher cannot say which encrypted transport a message arrived on — ~~**filed 2026-09-12**~~ **closed 2026-09-13**
+
+Left behind by 44g, with a number because the alternative is a sentence in a doc
+comment (`CLAUDE.md` §18).
+
+dnstap's `Message.socket_protocol` distinguishes UDP, TCP, DOT, DOH and DOQ, and
+`rdnsd` can fill in the first two. What reaches the answer path from an encrypted
+connection is `validation::Privacy` — `Clear`, `Tls13` or `TlsOlder` — so DoT,
+DoH and DoQ are one value by the time an entry is built. The field is `optional`
+in the schema, so 44g omits it rather than guessing: DOT for a DoH query is a
+wrong value where an absent one is a reader showing nothing (`CLAUDE.md` §14).
+
+**`Privacy` is not the thing to widen, and it says so itself.** Its doc comment
+is explicit: it is "separate from [`Transport`] rather than two more variants of
+it, because they answer different questions", and the version matters because
+RFC 9103 §7.2 is TLS-1.3-only for a transfer while RFC 7858 §4.1 takes 1.2 for a
+query. Adding "which protocol" to "what did it hide" would put the transfer
+policy and the analytics label in one type, which is the shape that question was
+split to avoid (§19: when the code you are about to call wrong carries a reason,
+answer it).
+
+So the fix is a second thing beside it, and the measurement of what that costs,
+taken rather than guessed:
+
+- `Handler::handle` takes `privacy: Privacy` and is implemented **6 times** —
+  `rdnsd/src/dispatch.rs`, `rdnsr/src/serve.rs`, and one test handler each in
+  `rdns-transport`'s `tcp.rs`, `tls.rs`, `quic.rs` and `https.rs`.
+- The value is *supplied* at **5 sites**: `tcp::serve` and `tcp`'s own test pass
+  `Privacy::Clear`, `tls.rs` and `https.rs` derive it from the negotiated
+  version, and `quic.rs` passes `Privacy::Tls13` outright.
+- `Privacy` appears at **30 sites** in total across the workspace, of which 19
+  are test call sites passing `Privacy::Clear`.
+
+Two shapes, and §19 says build them rather than argue:
+
+- a second parameter, which takes `Handler::handle` to six arguments and
+  `tcp::serve_one` to eight — one past what clippy allows, so it forces the
+  grouping anyway;
+- a small `Arrival { privacy, protocol }` passed where `privacy` is now, which
+  is the grouping done deliberately and touches the same 11 sites.
+
+~~Not urgent, and the reason is that the field is optional and the two transports
+an authoritative server mostly answers on are the two that already work. It
+becomes worth doing when somebody runs this behind DoH and wants to see it in
+the stream — or when a second consumer of "which transport" appears, which is
+the point at which the absence stops being one row's problem.~~
+
+**The second consumer appeared on 2026-09-13 and the sentence above named it
+exactly.** #59 — demanding a client certificate for a transfer — needs the same
+thing to travel the same channel: `tls::serve_one_tls` reads the negotiated
+version off the finished handshake and passes it into `tcp::serve_one`, and a
+peer certificate is beside it (`stream.get_ref().1.peer_certificates()`). So the
+grouping this row measured is now a prerequisite rather than a tidy-up, and the
+`Arrival` shape it drew takes a third field. **Do this before #59**, or the two
+grow separate answers to one question (`CLAUDE.md` §7). The measurements below
+are unchanged and are what either would start from.
+
+---
+
+**Done 2026-09-13.** `validation::Arrival` replaces `Privacy` on
+`Handler::handle`, `tcp::serve_one` and `Wire::Framed`, and `Privacy` is derived
+from it. All five dnstap labels are filled in now — UDP, TCP, DOT, DOH, DOQ.
+
+**All three shapes were built** (§19), and one of them measured out as the one
+to decline.
+
+- **A, a second parameter.** Built, and the row's prediction held exactly:
+  `tcp::serve_one` goes to 8 arguments and clippy says *"this function has too
+  many arguments (8/7)"*. So the grouping is forced whether or not anybody wants
+  it, and A is not a shape — it is B with a lint suppressed.
+- **B, `Arrival { privacy, protocol }`** — the row's own proposal. Compiles,
+  lints clean, 1,121 tests, +125/-58 in 8 files.
+- **C, `Arrival` as an enum with the negotiated version inside.** Compiles,
+  lints clean, 1,121 tests, +123/-66 in 8 files.
+
+**What decided it was not size and not the diff**, both of which came out the
+same: `size_of::<Arrival>()` is **2** either way, and the two diffs are within
+ten lines of each other. It was that **B can be written down wrong.** A probe on
+the B tree printed
+
+```
+Arrival { privacy: Tls13, protocol: Tcp }
+```
+
+with no complaint — a plain TCP connection claiming to have hidden everything,
+which is exactly the value `answer_transfer` reads to decide whether a zone may
+leave the building (RFC 9103 §11). Nothing in B stops it; every one of the five
+construction sites has to keep getting it right, which is the call-site-versus-
+type argument `CLAUDE.md` §17 says has already run twice in this repo with the
+same result. In C, `Tcp` cannot claim to have hidden anything and `Doq` cannot
+claim not to — RFC 9001 §4.2's "QUIC ... MUST use TLS 1.3 or greater" is the
+absence of a field rather than a comment.
+
+The supply sites say the same thing in shorter form. DoQ is `Arrival::Doq` in C
+against `Arrival::new(Protocol::Doq, Privacy::Tls13)` in B — which rustfmt then
+broke across nine lines, because restating an RFC at a call site does not fit on
+one.
+
+**The row's own measurements did not reproduce**, and that is worth more than
+the fix (§18: never write a number you did not just read). It said `Privacy`
+appeared at **30 sites, 19 of them test call sites passing `Privacy::Clear`**.
+Counted again on the commit before this one, excluding comments: **44 mentions
+across 8 files, 10 of them `Privacy::Clear`**. The handler count (6) and the
+supply-site count (5) did reproduce. Nothing between the filing and now touched
+`Privacy`, so the two large numbers were wrong when they were written — a grep
+whose shape is not recorded is a number nobody can check, and this page has now
+done that to itself.
+
+**What it leaves.** #59's plumbing, which is why this went first: a peer
+certificate is a field on the two TLS variants, where `Tcp` and a certificate
+cannot be written together — the same property that decided B against C. Nothing
+filed on the way out.
+
+Verified: a table test per transport in `rdnsd::dispatch` (against the old
+behaviour the last three rows read `None`; against a mapping that collapses DoH
+onto DOT it fails with `left: Dot, right: Doh`), a derivation table in
+`rdns_core::validation` (breaking `Doq`'s row fails it), and a pinned
+`size_of` of 2 — §17's rule about measuring rather than assuming a newtype is
+free. The DoT listener's own test now asserts `Arrival::Dot(TlsVersion::Tls13)`
+where it asserted `Privacy::Tls13`, which pins the protocol as well as the
+version. 1,124 tests on Windows and 1,144 on Linux, clippy clean on both,
+`cargo doc` clean.
+
+---

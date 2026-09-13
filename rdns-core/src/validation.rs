@@ -165,6 +165,61 @@ impl Privacy {
     }
 }
 
+/// Which protocol carried a message, and what it negotiated.
+///
+/// Three questions, three types, and this one answers the other two.
+/// [`Transport`] is "what size may this answer be"; [`Privacy`] is "what did
+/// the connection hide"; this is "what was it called", which dnstap's
+/// `SocketProtocol` wants and neither of the others can give — DoT, DoH and DoQ
+/// are one [`Privacy`] and one [`Transport`] between them (`TODO.md` #54).
+///
+/// An enum with the TLS version inside rather than a `{ protocol, privacy }`
+/// pair, because the pair can be written down wrong: `Tcp` with `Tls13`, or
+/// `Doq` with `TlsOlder`, are states no connection can be in and every one of
+/// the five construction sites would have to keep saying so. Here `Doq` carries
+/// RFC 9001 §4.2 — "QUIC ... MUST use TLS 1.3 or greater" — in the type, and
+/// `Tcp` cannot claim to have hidden anything (`CLAUDE.md` §17).
+///
+/// No `Udp` variant, on purpose: this reaches a consumer by way of a
+/// *connection* handler, and a datagram takes a different path in both daemons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrival {
+    /// Plain TCP (RFC 1035 §4.2.2).
+    Tcp,
+    /// DNS over TLS (RFC 7858). 1.2 is allowed for a query (§4.1), so the
+    /// version is carried.
+    Dot(TlsVersion),
+    /// DNS over HTTPS (RFC 8484), same.
+    Doh(TlsVersion),
+    /// DNS over QUIC (RFC 9250). No version: RFC 9001 §4.2 makes it 1.3.
+    Doq,
+}
+
+/// Which TLS version an encrypted connection negotiated.
+///
+/// Two values, because that is how many there are once a connection exists:
+/// "no TLS" is a different variant of [`Arrival`] rather than a third value
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsVersion {
+    /// 1.3 or later, which is what RFC 9103 §7.2 requires of a transfer.
+    Tls13,
+    /// Older than 1.3. Good enough for a query (RFC 7858 §4.1), not a transfer.
+    Older,
+}
+
+impl Arrival {
+    /// What this connection hid from the path it crossed.
+    pub fn privacy(&self) -> Privacy {
+        match self {
+            Arrival::Tcp => Privacy::Clear,
+            Arrival::Doq => Privacy::Tls13,
+            Arrival::Dot(TlsVersion::Tls13) | Arrival::Doh(TlsVersion::Tls13) => Privacy::Tls13,
+            Arrival::Dot(TlsVersion::Older) | Arrival::Doh(TlsVersion::Older) => Privacy::TlsOlder,
+        }
+    }
+}
+
 /// Upper bound on additional records in a request. A legitimate request carries
 /// at most an OPT plus a TSIG/SIG(0); the slack is for forward compatibility.
 const MAX_REQUEST_ADDITIONALS: usize = 4;
@@ -861,6 +916,44 @@ mod tests {
         let packet = vec![0u8; 16 * 1024 + 1];
         let result = validator.validate_packet(&packet, Transport::Tcp);
         assert!(!result.is_valid());
+    }
+
+    /// What each arrival hid, which is the half of it RFC 9103 §11 turns on.
+    ///
+    /// A table because the derivation is the whole content of the type
+    /// (`TODO.md` #54): the alternative shape carried a `Privacy` beside a
+    /// protocol, and the two could be written down disagreeing —
+    /// `{ protocol: Tcp, privacy: Tls13 }` compiles, and was printed by the
+    /// probe that decided against it. Here `Tcp` cannot claim to have hidden
+    /// anything and `Doq` cannot claim not to.
+    #[test]
+    fn what_each_arrival_hid() {
+        assert_eq!(Arrival::Tcp.privacy(), Privacy::Clear);
+        assert_eq!(Arrival::Dot(TlsVersion::Tls13).privacy(), Privacy::Tls13);
+        assert_eq!(Arrival::Dot(TlsVersion::Older).privacy(), Privacy::TlsOlder);
+        assert_eq!(Arrival::Doh(TlsVersion::Tls13).privacy(), Privacy::Tls13);
+        assert_eq!(Arrival::Doh(TlsVersion::Older).privacy(), Privacy::TlsOlder);
+        // RFC 9001 §4.2: "QUIC ... MUST use TLS 1.3 or greater", so there is no
+        // older DoQ to carry a version for.
+        assert_eq!(Arrival::Doq.privacy(), Privacy::Tls13);
+
+        // Only 1.3 may carry a transfer (RFC 9103 §7.2), whichever protocol it
+        // is under.
+        assert!(Arrival::Doq.privacy().is_xot());
+        assert!(Arrival::Dot(TlsVersion::Tls13).privacy().is_xot());
+        assert!(!Arrival::Dot(TlsVersion::Older).privacy().is_xot());
+        assert!(!Arrival::Tcp.privacy().is_xot());
+    }
+
+    /// Two octets, the same as the `Privacy` it replaces plus a discriminant.
+    ///
+    /// Pinned because this rides on the answer path, once per message
+    /// (`CLAUDE.md` §17's rule about measuring rather than assuming a newtype
+    /// is free). The `{ protocol, privacy }` pair measured the same 2, which is
+    /// why size was not what decided between them.
+    #[test]
+    fn an_arrival_costs_two_octets() {
+        assert_eq!(std::mem::size_of::<Arrival>(), 2);
     }
 
     /// A truncated compression pointer is the parser's business, not this

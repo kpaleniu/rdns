@@ -94,10 +94,12 @@ pub struct Entry<'a> {
     /// `Dnstap.version`, the software name and version.
     pub version: &'a [u8],
     pub message_type: MessageType,
-    /// `None` when the transport is known to be encrypted and not which of the
-    /// three encrypted transports it was. The field is `optional` in the
-    /// schema, and an absent one is a reader showing nothing rather than
-    /// showing DoT for a DoH query (`TODO.md` #54).
+    /// `Option` because the field is `optional` in the schema, and a producer
+    /// that does not know which transport carried a message must leave it out
+    /// rather than guess — an absent field is a reader showing nothing, and DOT
+    /// for a DoH query is a wrong value (`CLAUDE.md` §14). `rdnsd` fills it in
+    /// every case since `TODO.md` #54; before that the three encrypted
+    /// transports reached it as one `Privacy` and it left this `None`.
     pub socket_protocol: Option<SocketProtocol>,
     /// Who asked. `query_address` and `query_port`.
     pub peer: SocketAddr,

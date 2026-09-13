@@ -409,7 +409,7 @@ summary kept beside it.
 The gap between the columns is the `#[cfg(unix)]` tests, which a Windows build
 never compiles.
 
-Open work is `TODO.md`: #54-#60, and one inventory of deliberate
+Open work is `TODO.md`: #55-#60, and one inventory of deliberate
 RFC deviations (#21). Everything else numbered is closed, and
 `docs/CLOSED_WORK.md` holds it.
 

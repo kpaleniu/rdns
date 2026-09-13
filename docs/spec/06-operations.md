@@ -318,12 +318,13 @@ for this: a query time rounded down to the second reports a latency of up to a
 second for an answer that took microseconds, and a wrong number is worse than an
 absent one. The extra `SystemTime::now` is paid only when `--dnstap` is on.
 
-**`socket_protocol` is UDP or TCP, and absent on an encrypted connection.** The
-dispatcher is told `Privacy` — what the connection hid from the path — which
-deliberately does not say which protocol wrapped it, so DoT, DoH and DoQ are one
-value by the time an entry is built. The field is `optional` in the schema and an
-absent one is a reader showing nothing; DOT for a DoH query would be a wrong one.
-`TODO.md` #54.
+**`socket_protocol` names all five: UDP, TCP, DOT, DOH and DOQ.** The dispatcher
+is told `validation::Arrival`, which says which protocol carried the message and
+what it negotiated; `Privacy` — what the connection hid — is derived from it and
+is still what RFC 9103 §11 turns on. Until `TODO.md` #54 the dispatcher had only
+the `Privacy`, so the three encrypted transports were one value and the field
+was left absent: it is `optional` in the schema, and an absent field is a reader
+showing nothing where DOT for a DoH query would be a wrong one.
 
 **The queue drops rather than blocking.** A bounded channel sits between the
 answer path and the writer, and a full one costs the payload, never the query: an

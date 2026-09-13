@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use rdns::security::ResponseVerdict;
 use rdns::shutdown::{Busy, Stop};
-use rdns::validation::{Privacy, Transport};
+use rdns::validation::{Arrival, Transport};
 use rdns_transport::{recv_error_is_transient, tcp, ServeContext, UDP_RECEIVE_BUFFER};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Semaphore};
@@ -134,7 +134,7 @@ impl tcp::Handler for Resolving {
         // A resolver answers a query the same way whatever hid it from the
         // path. The parameter is `rdnsd`'s: only a zone transfer has a policy
         // about how private the connection was (RFC 9103 §11).
-        _privacy: Privacy,
+        _arrival: Arrival,
         out: mpsc::Sender<tcp::Reply>,
     ) {
         let answered = handle_query(packet, peer.ip(), now, self, Transport::Tcp).await;
