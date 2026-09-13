@@ -74,6 +74,11 @@ pub enum ResolveError {
     /// failures.
     #[error("the query budget was exhausted")]
     BudgetExhausted,
+    /// A [`crate::resolver::NameserverPolicy`] refused a delegation. Its own
+    /// variant because it is not a failure: the caller that supplied the policy
+    /// has an answer to send and the walk stopped so it could (`TODO.md` #56).
+    #[error("a delegation was refused by policy")]
+    PolicyStopped,
     #[error("{0}")]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -107,6 +112,13 @@ impl ResolveError {
             ResolveError::BudgetExhausted => {
                 ExtendedError::new(InfoCode::OTHER, "the query budget was exhausted")
             }
+            // §4.16 Blocked: "blocked for administrative reasons". Only read by
+            // a caller that set a policy and then discarded what it recorded;
+            // the rewrite carries its own code through `apply_policy`.
+            ResolveError::PolicyStopped => ExtendedError::new(
+                InfoCode::BLOCKED,
+                "this answer is the resolver operator's policy",
+            ),
             ResolveError::Io(_) => {
                 ExtendedError::new(InfoCode::NETWORK_ERROR, "the upstream query failed")
             }

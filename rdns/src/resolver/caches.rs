@@ -28,7 +28,19 @@ pub(super) struct DelegationCache {
 #[derive(Debug, Clone)]
 struct CachedDelegation {
     servers: Vec<SocketAddr>,
+    /// The NS names the referral carried. Kept because a start from here skips
+    /// the referral that named them, and a nameserver policy asked about only
+    /// the delegations a query happened to walk is a rule in force for the
+    /// first client and not the next (`TODO.md` #56).
+    ns_names: Vec<Name>,
     expires_at: u64,
+}
+
+/// Where a walk starts: a zone, its servers, and what the referral called them.
+pub(super) struct Start {
+    pub(super) zone: Name,
+    pub(super) servers: Vec<SocketAddr>,
+    pub(super) ns_names: Vec<Name>,
 }
 
 /// Never cache a delegation for longer than this, whatever the record says.
@@ -44,7 +56,7 @@ impl DelegationCache {
 
     /// The deepest cached zone that encloses `qname` and has not expired.
     /// Deepest wins: it skips a round trip.
-    pub(super) fn best_match(&self, qname: NameRef<'_>) -> Option<(Name, Vec<SocketAddr>)> {
+    pub(super) fn best_match(&self, qname: NameRef<'_>) -> Option<Start> {
         self.best_match_where(qname, |_| true)
     }
 
@@ -55,7 +67,7 @@ impl DelegationCache {
         &self,
         qname: NameRef<'_>,
         accept: impl Fn(NameRef<'_>) -> bool,
-    ) -> Option<(Name, Vec<SocketAddr>)> {
+    ) -> Option<Start> {
         let now = current_unix_timestamp();
         let mut entries = self.entries.lock().ok()?;
 
@@ -68,7 +80,11 @@ impl DelegationCache {
         for (candidate, key) in qname.ancestors().zip(folded.ancestors()) {
             match entries.get(key.as_wire()) {
                 Some(entry) if entry.expires_at > now && accept(candidate) => {
-                    return Some((candidate.to_owned(), entry.servers.clone()));
+                    return Some(Start {
+                        zone: candidate.to_owned(),
+                        servers: entry.servers.clone(),
+                        ns_names: entry.ns_names.clone(),
+                    });
                 }
                 // Live, but the caller does not want to start here.
                 Some(entry) if entry.expires_at > now => {}
@@ -81,7 +97,13 @@ impl DelegationCache {
         None
     }
 
-    pub(super) fn insert(&self, zone: NameRef<'_>, servers: Vec<SocketAddr>, ttl: u64) {
+    pub(super) fn insert(
+        &self,
+        zone: NameRef<'_>,
+        servers: Vec<SocketAddr>,
+        ns_names: Vec<Name>,
+        ttl: u64,
+    ) {
         // A zero TTL means "do not cache this", and a zero-capacity cache is
         // how callers turn the whole thing off.
         if servers.is_empty() || ttl == 0 || self.capacity == 0 {
@@ -111,6 +133,7 @@ impl DelegationCache {
             zone.folded().into_owned().into_boxed_slice(),
             CachedDelegation {
                 servers,
+                ns_names,
                 expires_at: current_unix_timestamp() + ttl.min(MAX_DELEGATION_TTL),
             },
         );
@@ -351,15 +374,14 @@ mod tests {
         let com: SocketAddr = "192.0.2.1:53".parse().unwrap();
         let example: SocketAddr = "192.0.2.2:53".parse().unwrap();
 
-        cache.insert(nm("com.").as_ref(), vec![com], 3600);
-        assert_eq!(
-            cache.best_match(nm("www.example.com.").as_ref()).unwrap(),
-            (nm("com."), vec![com])
-        );
+        cache.insert(nm("com.").as_ref(), vec![com], Vec::new(), 3600);
+        let start = cache.best_match(nm("www.example.com.").as_ref()).unwrap();
+        assert_eq!((start.zone, start.servers), (nm("com."), vec![com]));
 
-        cache.insert(nm("example.com.").as_ref(), vec![example], 3600);
+        cache.insert(nm("example.com.").as_ref(), vec![example], Vec::new(), 3600);
+        let start = cache.best_match(nm("www.example.com.").as_ref()).unwrap();
         assert_eq!(
-            cache.best_match(nm("www.example.com.").as_ref()).unwrap(),
+            (start.zone, start.servers),
             (nm("example.com."), vec![example])
         );
 
@@ -373,7 +395,7 @@ mod tests {
         let server: SocketAddr = "192.0.2.1:53".parse().unwrap();
 
         // A zero TTL means "don't cache".
-        cache.insert(nm("zero.test.").as_ref(), vec![server], 0);
+        cache.insert(nm("zero.test.").as_ref(), vec![server], Vec::new(), 0);
         assert!(cache.best_match(nm("zero.test.").as_ref()).is_none());
 
         // An entry already expired is not returned.
@@ -383,6 +405,7 @@ mod tests {
                 key_of("stale.test."),
                 CachedDelegation {
                     servers: vec![server],
+                    ns_names: Vec::new(),
                     expires_at: current_unix_timestamp().saturating_sub(1),
                 },
             );
@@ -390,14 +413,14 @@ mod tests {
         assert!(cache.best_match(nm("stale.test.").as_ref()).is_none());
 
         // forget() drops a live entry.
-        cache.insert(nm("live.test.").as_ref(), vec![server], 3600);
+        cache.insert(nm("live.test.").as_ref(), vec![server], Vec::new(), 3600);
         assert!(cache.best_match(nm("live.test.").as_ref()).is_some());
         cache.forget(nm("live.test.").as_ref());
         assert!(cache.best_match(nm("live.test.").as_ref()).is_none());
 
         // A zero-capacity cache stores nothing.
         let off = DelegationCache::new(0);
-        off.insert(nm("any.test.").as_ref(), vec![server], 3600);
+        off.insert(nm("any.test.").as_ref(), vec![server], Vec::new(), 3600);
         assert!(off.best_match(nm("any.test.").as_ref()).is_none());
     }
 
@@ -406,9 +429,9 @@ mod tests {
         let cache = DelegationCache::new(2);
         let server: SocketAddr = "192.0.2.1:53".parse().unwrap();
 
-        cache.insert(nm("a.test.").as_ref(), vec![server], 3600);
-        cache.insert(nm("b.test.").as_ref(), vec![server], 7200);
-        cache.insert(nm("c.test.").as_ref(), vec![server], 7200);
+        cache.insert(nm("a.test.").as_ref(), vec![server], Vec::new(), 3600);
+        cache.insert(nm("b.test.").as_ref(), vec![server], Vec::new(), 7200);
+        cache.insert(nm("c.test.").as_ref(), vec![server], Vec::new(), 7200);
 
         let entries = cache.entries.lock().unwrap();
         assert!(entries.len() <= 2, "cache must stay within capacity");

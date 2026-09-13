@@ -304,9 +304,16 @@ RPZ wildcard rule is RFC 1034 §4.3.3's.
 | TCP-Only | `CNAME rpz-tcp-only.` | TC=1 over UDP; over TCP, resolved normally |
 | local data | anything else | the RRset answers, owner rewritten to the name asked for |
 
-- Trigger types: QNAME, `rpz-client-ip` and `rpz-ip` are enforced. `rpz-nsdname`
-  and `rpz-nsip` are **counted at load and printed in the startup banner**, not
-  enforced (`TODO.md` #56).
+- All five trigger types are enforced. QNAME, `rpz-client-ip` and `rpz-ip` are
+  answerable from the request and the answer. `rpz-nsdname` and `rpz-nsip` are
+  asked of each delegation the resolver is about to follow, through
+  `resolver::NameserverPolicy`, and a match **stops the resolution** rather than
+  rewriting its result (`TODO.md` #56) — so the refused server is never asked
+  and nothing enters the cache. NSDNAME is tried before NSIP, and both after
+  everything above. The delegation cache keeps each referral's NS names, because
+  a walk starts at the deepest zone already known and a policy asked only at
+  referrals would hold for one client and not the next. `rpz-passthru` at a
+  delegation does not stop the walk. The startup banner counts all five kinds.
 - Zones are consulted in the order `--rpz` names them; the first with a rule
   decides. `--rpz-policy` overrides every action in every zone
   (`given`/`disabled`/`passthru`/`drop`/`nxdomain`/`nodata`/`tcp-only`).

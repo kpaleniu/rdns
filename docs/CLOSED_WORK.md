@@ -8280,3 +8280,108 @@ records are added and not before — the snapshot-then-mutate shape §8 names.
 clean. Nothing filed on the way out.
 
 ---
+
+### 56. NSDNAME and NSIP triggers are counted and not enforced — ~~**filed 2026-09-13**~~ **closed 2026-09-13**
+
+Left behind by 45a, with a number because the alternative is a sentence in a doc
+comment (`CLAUDE.md` §18).
+
+An RPZ has five trigger types. `rdns::rpz` enforced three — QNAME, client IP and
+response IP — because those three are answerable from what the answer path
+already holds: the name asked for, the peer's address, and the addresses in the
+answer. The other two are about the *nameservers* a name was resolved through:
+`<nsname>.rpz-nsdname` matches a delegation's NS name, and
+`<prefix>.<addr>.rpz-nsip` matches that nameserver's address. Real feeds use
+them — a malware operator changes names faster than nameservers, which is the
+point of the trigger.
+
+Nothing here could answer them, and the reason was structural rather than an
+omission: `Resolver::resolve_validated` hands back a `DnsMessage`, and the
+delegation chain it walked to get there is not in it.
+
+**Both questions the row said to settle were settled by looking, and the second
+one's answer was not the one the row expected.**
+
+**What the resolver hands back: nothing.** The callback the row preferred is
+what landed — `resolver::NameserverPolicy`, one method, `Option<&dyn …>` on
+`resolve_validated`, threaded as a field of `Resolution` because that struct is
+already "the state of one client query, threaded through the whole walk". A
+refusal is `ResolveError::PolicyStopped`, which is a variant rather than a
+string for the reason §3 gives: the caller branches on it and has an answer to
+send. What matched is not in the error — the policy recorded it, because only
+the policy knows what a match means. The trait's argument list is the two things
+a nameserver rule is about, `&[Name]` and `&[SocketAddr]`, and the delegated
+zone is deliberately not among them: nothing here would read it, and §17's limit
+is that a type does not settle a question it inherits.
+
+Asked **after** the glueless nameserver lookup, so an address rule sees what an
+NS name resolves to rather than what it is called, and **before** the delegation
+is cached, so a refused delegation is not left behind as a start point for the
+next query.
+
+**Does a cached answer carry it? Two caches, and the one the row was worried
+about is not the one that was wrong.**
+
+- **The answer cache was never the problem, because a stopped resolution caches
+  nothing.** The block holds for the second client because the first client's
+  query produced no entry, not because anything re-checks. The only window is an
+  answer cached *before* the policy came into force, and `rdnsr` loads every
+  `--rpz` file before a socket binds (`main.rs`), so today that window is empty.
+  It opens the moment a feed can be re-read under a running resolver, which is
+  **#57**, and closing it is that row's — its reload has to drop the answer
+  cache or say why not.
+- **The delegation cache was the problem, and it is internal.**
+  `resolve_from_root` starts at the deepest delegation it already knows, so a
+  policy asked only at referrals is a rule in force for the client that walked
+  the chain and for nobody after it — the exact "first client and not the next"
+  the row feared, arriving from a cache nobody was looking at.
+  `CachedDelegation` now keeps the referral's NS names beside its addresses and
+  the start point is offered to the policy like any other delegation. That is
+  `a_cached_delegation_is_still_offered_to_the_policy`, watched failing against
+  the pre-fix behaviour: the second query for a different name under the same
+  zone resolved.
+
+**What it costs when nothing uses it.** `PolicyZones::watches_delegations()`
+gates the whole thing: with no NSDNAME or NSIP rule in any zone the per-query
+`DelegationPolicy` is never built and the resolver is handed `None`, so a walk
+asks nothing and allocates nothing. Within a zone, `nsdname == 0` skips the name
+lookup, because a feed's bulk is QNAME rules and the alternative is a zone
+lookup per nameserver per delegation per query.
+
+Order is NSDNAME then NSIP, which is the order `draft-vixie-dns-rpz-04` gives
+them, and both after everything in `before_query` — that pass runs before any
+resolution starts, so it cannot be otherwise. A `rpz-passthru` at a delegation
+does **not** stop the walk: stopping for one would turn the exception into the
+block it is carved out of, and the resolution then produces exactly the answer
+and the cache entry it would have anyway.
+
+A prefetch and DNS64's A query go through `resolve_and_store`, which is policed
+too — an answer a nameserver rule blocks must not reach the cache by a back
+door. `rdnsr`'s RFC 5011 probe (`anchors.rs`) deliberately is not: it is the
+resolver's own trust maintenance, and a blocking feed has no standing over which
+keys a zone we hold an anchor for publishes.
+
+The startup banner said "N NSDNAME/NSIP triggers not enforced". It now counts
+all five kinds, and says out loud that the first number is what is left over
+rather than a QNAME rule count — the apex SOA and NS are in it.
+
+Verified: **eight tests in `rdns::rpz`** (a name match, an address match, the
+order between them, an unlisted delegation, a wildcard rule with an exact
+passthru under it, the `watches_delegations` gate, what the resolver is told,
+and a nameserver named like a trigger subtree); **four in `rdns::resolver`**
+against the fake hierarchy — the walk stops before the refused server is asked
+(asserted as a query count of 0 on that server), an address stops a *glueless*
+delegation, the cached start is offered, and a refused delegation is neither
+cached nor fatal to the next client; and **one end to end in `rdnsr`**, where a
+name the feed never mentions comes back NXDOMAIN because of the company its
+nameserver keeps. That last one's control is the whole of its value: with the
+rule pointed at a different nameserver the same fixture is a SERVFAIL after a
+1.02 s timeout against unreachable glue, which is the proof the passing run
+stopped the walk rather than resolved through it.
+
+1,142 tests on Windows and 1,162 on Linux, clippy clean on both, `cargo doc`
+clean. Filed nothing on the way out; what the answer cache still owes is
+**#57**'s, above.
+
+---
+

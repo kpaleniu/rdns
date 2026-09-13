@@ -53,7 +53,7 @@ impl Resolver {
     pub(super) async fn recurse(
         &self,
         query: &QuerySection,
-        state: &mut Resolution,
+        state: &mut Resolution<'_>,
     ) -> ResolveResult<DnsMessage> {
         let mut qname = query.qname.clone();
         let mut answers = Vec::new();
@@ -180,7 +180,7 @@ impl Resolver {
     pub(super) async fn resolve_from_root(
         &self,
         query: &QuerySection,
-        state: &mut Resolution,
+        state: &mut Resolution<'_>,
         depth: usize,
     ) -> ResolveResult<Answered> {
         const MAX_NESTED: usize = 4;
@@ -193,9 +193,22 @@ impl Resolver {
         // Start as far down the tree as already known. Validating narrows that:
         // a shortcut past a zone cut skips its DS records, so only zones whose
         // keys are already validated may be jumped to.
-        if let Some((zone, servers)) = self.best_start(query.qname.as_ref()) {
-            match self.walk(query, state, depth, zone.clone(), servers).await {
+        if let Some(start) = self.best_start(query.qname.as_ref()) {
+            // The referral that named these servers is the one being skipped,
+            // so the policy is asked here instead — otherwise a nameserver rule
+            // holds for the client that walked the delegation and for nobody
+            // after (`TODO.md` #56).
+            state.allows(&start.ns_names, &start.servers)?;
+            let zone = start.zone;
+            match self
+                .walk(query, state, depth, zone.clone(), start.servers)
+                .await
+            {
                 Ok(response) => return Ok(response),
+                // A refusal is the policy's answer, not our bookkeeping going
+                // stale: restarting from the root would walk to the same
+                // delegation and refuse it again, one root round trip later.
+                Err(ResolveError::PolicyStopped) => return Err(ResolveError::PolicyStopped),
                 Err(_) => {
                     // Cached delegations go stale; restart from the root rather
                     // than fail a query on our own bookkeeping.
@@ -215,7 +228,7 @@ impl Resolver {
     }
 
     /// The deepest cached delegation we are willing to start from.
-    fn best_start(&self, qname: NameRef<'_>) -> Option<(Name, Vec<SocketAddr>)> {
+    fn best_start(&self, qname: NameRef<'_>) -> Option<Start> {
         if self.config.dnssec.is_some() {
             self.delegations
                 .best_match_where(qname, |zone| self.keys.holds(zone))
@@ -228,7 +241,7 @@ impl Resolver {
     async fn walk(
         &self,
         query: &QuerySection,
-        state: &mut Resolution,
+        state: &mut Resolution<'_>,
         depth: usize,
         start_zone: Name,
         start_servers: Vec<SocketAddr>,
@@ -318,8 +331,12 @@ impl Resolver {
                         "no reachable nameserver for {child_zone}"
                     )));
                 }
+                // After the glueless lookup, so an address rule sees what the
+                // NS names resolve to; before the insert, so a refused
+                // delegation is not cached for the next query to start from.
+                state.allows(&ns_names, &servers)?;
                 self.delegations
-                    .insert(child_zone.as_ref(), servers.clone(), ttl);
+                    .insert(child_zone.as_ref(), servers.clone(), ns_names, ttl);
                 // A referral may jump more than one label at once.
                 sent_labels = child_zone.as_ref().label_count() + 1;
                 zone = child_zone;
@@ -473,7 +490,7 @@ impl Resolver {
     async fn resolve_nameserver_addresses(
         &self,
         ns_names: &[Name],
-        state: &mut Resolution,
+        state: &mut Resolution<'_>,
         depth: usize,
     ) -> ResolveResult<Vec<SocketAddr>> {
         const A: u16 = 1;

@@ -26,7 +26,7 @@ impl Resolver {
         &self,
         query: &QuerySection,
         response: &DnsMessage,
-        state: &mut Resolution,
+        state: &mut Resolution<'_>,
         anchors: &TrustAnchors,
     ) -> ValidationState {
         let now = current_unix_timestamp();
@@ -142,7 +142,7 @@ impl Resolver {
     async fn establish_chain(
         &self,
         target: NameRef<'_>,
-        state: &mut Resolution,
+        state: &mut Resolution<'_>,
         anchors: &TrustAnchors,
         now: u64,
         keys: &mut KeyStore,
@@ -225,7 +225,7 @@ impl Resolver {
     async fn fetch_dnskeys(
         &self,
         zone: NameRef<'_>,
-        state: &mut Resolution,
+        state: &mut Resolution<'_>,
     ) -> Result<(Vec<ResourceRecord>, u64), ResolveError> {
         let query = QuerySection {
             qname: zone.to_owned(),

@@ -619,17 +619,17 @@ async fn main() -> anyhow::Result<()> {
         queries_per_source: cli.anomaly_source_queries,
         refusals_per_source: cli.anomaly_source_refusals,
     };
-    // What each policy zone holds and how much of it is not enforced. Printed
-    // for the reason the rate limiter's policy is: a rewrite is invisible on
-    // the wire, and an NSDNAME trigger nothing acts on is a rule an operator
-    // believes is in force (`CLAUDE.md` §4, §14, `TODO.md` #45a, #56).
+    // What each policy zone holds, by trigger kind. Printed for the reason the
+    // rate limiter's policy is: a rewrite is invisible on the wire, so the feed
+    // that loaded and the feed the operator meant to load are otherwise the
+    // same picture (`CLAUDE.md` §4, §14, `TODO.md` #45a, #56).
     for zone in policy.zones() {
+        let [qname, client_ip, response_ip, nsdname, nsip] = zone.trigger_counts();
         tracing::info!(
-            "policy zone {} ({}): {} records, {} NSDNAME/NSIP triggers not enforced",
+            "policy zone {} ({}): {} records, {qname} qname, {client_ip} client-ip,              {response_ip} response-ip, {nsdname} nsdname, {nsip} nsip",
             zone.origin().to_presentation(),
             zone.policy(),
             zone.records(),
-            zone.unsupported_triggers(),
         );
     }
 

@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#56**, **#57**, **#58**, **#59**, **#60** and **#21**, as of 2026-09-13.
+**#57**, **#58**, **#59**, **#60** and **#21**, as of 2026-09-13.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -48,7 +48,9 @@ as "not a defect" because its own row read §6.1.1 as "asks for", and the sectio
 says what the difference cost. Of what is left, #50 was the live one, and
 closing it is what added #53 — a zone this server signed itself verified again
 at every load — which closed the same day it was taken.
-#56 and #57 are what 45a left, #58 what 45b left, #59 what #51 left and #60
+#57 is what is left of what 45a left — **#56 closed the same day it was filed**,
+and what it found was in a cache nobody was looking at rather than in the
+resolver's return type. #58 is what 45b left, #59 what #51 left and #60
 what #51 turned up on the way; and #21 is an inventory of deliberate deviations
 rather than a queue. **#59's prerequisite is gone**: #54
 was it, and closing it put `validation::Arrival` where a peer certificate can
@@ -832,7 +834,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#56**, **#57**, **#58**, **#59** and **#60**, plus
+**#57**, **#58**, **#59** and **#60**, plus
 **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
@@ -958,49 +960,6 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 56. NSDNAME and NSIP triggers are counted and not enforced — **filed 2026-09-13**
-
-Left behind by 45a, with a number because the alternative is a sentence in a doc
-comment (`CLAUDE.md` §18).
-
-An RPZ has five trigger types. `rdns::rpz` enforces three — QNAME, client IP and
-response IP — because those three are answerable from what the answer path
-already holds: the name asked for, the peer's address, and the addresses in the
-answer. The other two are about the *nameservers* a name was resolved through:
-`<nsname>.rpz-nsdname` matches a delegation's NS name, and
-`<prefix>.<addr>.rpz-nsip` matches that nameserver's address. Real feeds use
-them — a malware operator changes names faster than nameservers, which is the
-point of the trigger.
-
-Nothing here can answer them, and the reason is structural rather than an
-omission: `Resolver::resolve_validated` hands back a `DnsMessage`, and the
-delegation chain it walked to get there is not in it. `resolver::recurse` knows
-every NS name and every address it asked; `handle_query` knows none of them.
-
-So the row is really two questions, and the second is the one to settle first:
-
-- **What does the resolver hand back?** An extra return value is the obvious
-  answer and probably the wrong one — every caller pays for a `Vec<Name>` it
-  does not want. A callback the resolver consults at each delegation is the
-  shape that costs nothing when no policy is loaded, and it is also the shape
-  that lets a match *stop* the resolution rather than rewriting its result,
-  which is what the trigger is for.
-- **Does a cached answer carry it?** A name whose answer came from the cache was
-  not resolved through anything on this query, so an NSDNAME rule would apply to
-  the first client and not the next. BIND has the same problem and solves it by
-  keying the rewrite on the cached RRset. Either way this decides whether the
-  trigger is worth having, so it is the measurement to take before writing any
-  of it.
-
-Until then a zone carrying either is loaded, the rules are counted, and the
-count is printed at startup beside what the zone does enforce. Not refused:
-refusing a whole feed for one trigger drops every rule in it, which for an
-operator under an obligation is the worse of the two failures. Not silent:
-a trigger nobody enforces is a block the operator believes is in force
-(`CLAUDE.md` §4).
-
----
-
 ### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13**
 
 Also left behind by 45a, and the half of its own row that did not survive
@@ -1022,7 +981,12 @@ Three things to settle, in this order:
   most of the value and needs no protocol: `rdnsr` already has a reload signal
   for the TLS certificate (`main.rs`), so this is a second thing that handler
   does. All-or-nothing, the way `PolicyZones::load` is at startup — a feed that
-  fails to parse must leave the one in force in force.
+  fails to parse must leave the one in force in force. **And it has to decide
+  what happens to the answer cache**, which #56 left here: a nameserver trigger
+  blocks by stopping the resolution, so nothing it blocks is ever cached — but
+  an answer cached before a new rule arrived outlives it by its TTL. Today that
+  window is empty because the policy loads before a socket binds; a reload opens
+  it.
 - **Then the transfer**, which is the part with a cost: it means `rdnsr` grows a
   replication task, an SOA timer and a NOTIFY listener, and those are what
   `rdnsd` is. The alternative worth measuring first is that the *operator* runs
@@ -1318,6 +1282,7 @@ the week; the record is under "How the queue kept going stale" in
 | **51** | XoT authorized its client by ACL and TSIG, never by certificate | **filed 2026-09-12, closed 2026-09-13**, the client half — which is the gap the row was filed for: a primary demanding mTLS could not be replicated from. `--transfer-tls-cert`/`--transfer-tls-key`, both or neither and only with `--transfer-tls-ca`. Two things the row did not have: rustls runs `keys_match` inside `with_client_auth_cert`, so a mismatched pair is a startup error for free; and `XotTrust::anchor_count` had **no callers** — written "for the startup banner" and the banner never added (§18), which is where "a certificate is loaded" is now said, since a certificate is offered only if a master asks and "mTLS is in force" is not a claim this end can make. One PEM loader now, `rdns::tls_identity::TlsIdentity`, which is what `rdns-transport`'s `read_certs`/`read_key` became (§7). The negative control corrected the guess (§19): a master that demands a certificate and gets none fails on the **read**, not the handshake — TLS 1.3 lets the client finish first — so what the operator sees is `CertificateRequired` under the transfer. Filed **#59** (the server half: #54's plumbing under #16's question) and **#60** |
 | **54** | a dispatcher could not say which encrypted transport a message arrived on | **filed 2026-09-12, closed 2026-09-13**, taken ahead of #59 because it is its plumbing. `validation::Arrival` on `Handler::handle`, `tcp::serve_one` and `Wire::Framed`; `Privacy` is derived from it and dnstap now names all five transports. **All three shapes were built** (§19) and the decision turned on none of the things that were argued: A is not a shape at all — clippy says "too many arguments (8/7)" at `serve_one`, exactly as the row predicted; B and C are the same **2** bytes, within ten lines of diff, and the same 1,121 tests. What decided it is that B compiles `Arrival { privacy: Tls13, protocol: Tcp }` — a plain TCP connection claiming to have hidden everything, which is the value `answer_transfer` reads to let a zone leave the building. **And the row's own numbers did not reproduce**: it claimed 30 `Privacy` sites of which 19 were `Privacy::Clear`; re-counted on the commit before the fix, 44 across 8 files of which 10. Nothing had touched `Privacy` in between. Nothing filed on the way out |
 | **55** | nothing generated CDS or CDNSKEY, so a KSK rollover still needed a human | **filed 2026-09-12, closed 2026-09-13**, and the row's premise was wrong where it was most confident: "the gap is *generation*, not carriage" — an operator writing `CDS` by hand got *unsupported record type "CDS"*, and only RFC 3597's `TYPE59` form parsed. One `parse_zone_file` call settled it (§4). Three halves, all done. **Carriage**: both types named, one `ParsedRecord` arm each on the SVCB/HTTPS precedent, an `rtype` field across **19 sites** counted before one was edited. **Generation**: `SyncPublish`/`SyncDelete` per key, BIND's `dnssec-settime -P sync` field names, which dodges the row's "near future is a policy" problem and says the truer thing — a rollover step must not ask a registrar to act. **Signing**, the one that mattered: RFC 7344 §4.1 needs a key in both the DNSKEY *and* the DS RRsets, and `sign_everything` would have used the ZSK, which nothing downstream would report because the RRset verifies fine against the zone's own keys. RFC 8078 §4's algorithm-0 record is never generated and a zone carrying one beside a sync window is a failed run. Also closed a hole in **#53**: a `SyncPublish` crossing changes the output without changing the signing key set. dnspython validates both RRsets off a live `rdnsd` and agrees on the digest. Nothing filed on the way out |
+| **56** | an RPZ's NSDNAME and NSIP triggers were counted and not enforced | **filed and closed 2026-09-13**, left behind by 45a. The callback the row preferred is what landed — `resolver::NameserverPolicy`, one method, asked at every delegation, refusing with `ResolveError::PolicyStopped` so the *caller* supplies the answer it recorded. The row's second question had a two-part answer and the part it worried about was the sound one: a stopped resolution caches nothing, so the block holds for every client, and `rdnsr` loads every `--rpz` file before a socket binds. **What was wrong was the delegation cache** — `resolve_from_root` starts at the deepest zone already known, so a policy asked only at referrals was in force for the client that walked the chain and nobody after; `CachedDelegation` keeps the referral's NS names now and the start point is offered like any other delegation. `rpz-passthru` at a delegation does not stop the walk; a refused one is not cached; a prefetch is policed and the RFC 5011 probe deliberately is not. The end-to-end test's control is its value: the same fixture with the rule pointed elsewhere is a SERVFAIL after a 1.02 s timeout. Nothing filed on the way out |
 | **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. |
 | **52** | a rate-limit test is a coin toss at a second boundary | **filed and closed 2026-09-12**, one commit. Not a defect in the server, and the filing undercounted it by 23: the shape is a test that reads the wall clock at a limiter call, and there were **43 such call sites across 24 tests**, six of them assertions a refill actually breaks. Both buckets refill by whole seconds, so the verdict depended on whether two reads straddled one. 41 sites needed nothing but one `let now` per test, because `should_allow` has taken the instant as a parameter since #28a; the two that read the clock inside the loop under test — `tcp::serve`'s per-connection charge and `rdnsr`'s UDP loop — got `rdns::clock::Clock` on `ServeContext`. The test now asserts the refill as well as the refusal, which is the half that says the connection was charged rather than never admitted |
 | **47** | a NOTIFY reply carried no OPT record | **filed and closed 2026-09-12**, one commit, and it was a defect after all: the row read RFC 6891 §6.1.1 as "asks for" where it is "if an OPT record is present in a received **request**, compliant responders MUST include an OPT record in their respective responses" — a NOTIFY is a request. Counting the shape (§18) found a second site and a second MUST: `transfer::Envelopes` built the first AXFR envelope's OPT from `has_edns()` and a fresh `Edns`, which drops DO, against RFC 3225 §3's unconditional "the DO bit of the query MUST be copied in the response". Nothing tested either. The three NOTIFY refusals now carry three different EDEs, because "you are not one of my masters" and "I am that zone's primary" are one RCODE and two operator problems. `ClientEdns::mirror_with` became total on the way, so the `Err` all three callers answered identically is one doc comment rather than four. The EDE half is a reading rather than a quotation and the peers were asked: BIND 9.20 and Knot 3.6 mirror the OPT and DO and send no EDE, NSD 4.12 answers NXDOMAIN with QDCOUNT=0 and no OPT. Nine new assertions in the interop harness, 29 passed 0 failed in 43e |

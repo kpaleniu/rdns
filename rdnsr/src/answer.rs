@@ -15,13 +15,14 @@ use rdns::dns64::Dns64;
 use rdns::dnssec::Bogus;
 use rdns::dnssec_chain::ValidationState;
 use rdns::ede::InfoCode;
+use rdns::error::ResolveError;
 use rdns::metrics::LatencyTimer;
 use rdns::negative_cache::NegativeCache;
 use rdns::nsec_cache::NsecCache;
 use rdns::record_types;
-use rdns::resolver::Resolver;
+use rdns::resolver::{NameserverPolicy, Resolver};
 use rdns::response::ClientEdns;
-use rdns::rpz::{Action, PolicyZones, Rewrite};
+use rdns::rpz::{Action, DelegationPolicy, PolicyZones, Rewrite};
 use rdns::special_names;
 use rdns::validation::{Request, Transport};
 use rdns::Qtype;
@@ -366,9 +367,19 @@ pub(crate) async fn handle_query(
         // drawn on.
         ctx.metrics.count(&ctx.metrics.cache_misses);
         ctx.metrics.count(&ctx.metrics.queries_recursive);
+        // The nameserver triggers, which can only be asked while the
+        // delegation chain is being walked (`rdns::rpz`, `TODO.md` #56).
+        // Built only when some zone has one: a feed of QNAME rules pays
+        // nothing here.
+        let watch = policy
+            .watches_delegations()
+            .then(|| policy.at_delegations(query.qname.as_ref(), query.qtype));
         // Async: each upstream round trip is an await, so this yields the
         // task rather than holding a thread.
-        match resolver.resolve_validated(&query).await {
+        match resolver
+            .resolve_validated(&query, watch.as_ref().map(|w| w as &dyn NameserverPolicy))
+            .await
+        {
             Ok((mut upstream, state)) => {
                 // The resolver used its own random id; the reply must echo
                 // the client's and advertise recursion.
@@ -438,6 +449,33 @@ pub(crate) async fn handle_query(
                     caches.denials.insert_validated_wildcard(&upstream);
                 }
                 (upstream, secure, None)
+            }
+            // A nameserver trigger matched, so the walk stopped and the
+            // policy has the answer. Nothing was cached: the resolution
+            // never finished, which is what makes the block hold for the
+            // next client as well as this one.
+            Err(ResolveError::PolicyStopped) => {
+                match watch.as_ref().and_then(DelegationPolicy::matched) {
+                    Some(rewrite) => {
+                        if let Applied::Replied(reply) =
+                            apply_policy(&msg, rewrite, &client, &query, ctx, timer, transport)
+                        {
+                            return reply.into();
+                        }
+                        // `Passthru` never stops the walk, and the other five
+                        // actions all reply. Unreachable rather than ignorable.
+                        unreachable!("a stopped resolution has a reply")
+                    }
+                    // The policy refused and recorded nothing, which
+                    // `DelegationPolicy::allows` does only on a poisoned
+                    // lock. SERVFAIL is the honest answer to "blocked, and
+                    // the reason was lost".
+                    None => (
+                        build_response(&msg, Vec::new(), ResponseCode::ServerFailure),
+                        false,
+                        Some(ResolveError::PolicyStopped.extended_error()),
+                    ),
+                }
             }
             // Say why, then SERVFAIL: lame delegation, budget exhausted
             // and CNAME loop are distinct so they can be read.
@@ -616,7 +654,18 @@ async fn resolve_and_store(
     serving: &Resolving,
     query: &QuerySection,
 ) -> Option<Vec<ResourceRecord>> {
-    let Ok((answer, state)) = serving.resolver.resolve_validated(query).await else {
+    // Policed like a client's query: an answer a nameserver trigger blocks
+    // must not reach the cache by the back door of a prefetch.
+    let watch = serving.policy.watches_delegations().then(|| {
+        serving
+            .policy
+            .at_delegations(query.qname.as_ref(), query.qtype)
+    });
+    let Ok((answer, state)) = serving
+        .resolver
+        .resolve_validated(query, watch.as_ref().map(|w| w as &dyn NameserverPolicy))
+        .await
+    else {
         return None;
     };
     if state.is_bogus() {
@@ -1717,6 +1766,92 @@ mod tests {
         assert_eq!(
             reply.answers[0].rdata.parse().unwrap(),
             rdns::ParsedRecord::CNAME(nm("33.2.0.192.in-addr.arpa."))
+        );
+    }
+
+    /// The whole of #56 end to end: a name nothing in the feed mentions,
+    /// delegated to a nameserver the feed does mention, comes back NXDOMAIN.
+    ///
+    /// The fake root refers and nothing else answers, so the `192.0.2.13` glue
+    /// is never reachable — which is also the proof the walk stopped rather
+    /// than resolved: an unblocked run of this fixture is a SERVFAIL, as
+    /// `passthru_resolves_the_query_as_if_no_rule_matched` shows.
+    #[tokio::test]
+    async fn a_nameserver_trigger_blocks_a_name_the_feed_never_names() {
+        let root = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind a fake root");
+        let root_addr = root.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = root.recv_from(&mut buf).await {
+                let Ok(query) = DnsMessage::try_from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let mut resp = DnsMessage::try_from_bytes(&buf[..n]).expect("parses twice");
+                resp.response = true;
+                resp.queries = query.queries.clone();
+                resp.authorities = vec![ResourceRecord {
+                    name: nm("example.test."),
+                    class: rdns::Class::new(1),
+                    ttl: rdns::Ttl::from_secs(3600),
+                    rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::NS(nm(
+                        "ns.evil.example.com.",
+                    )))
+                    .expect("encodes"),
+                }];
+                resp.additionals = vec![ResourceRecord {
+                    name: nm("ns.evil.example.com."),
+                    class: rdns::Class::new(1),
+                    ttl: rdns::Ttl::from_secs(3600),
+                    rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                        std::net::Ipv4Addr::new(192, 0, 2, 13),
+                    ))
+                    .expect("encodes"),
+                }];
+                let mut out = vec![0u8; 1500];
+                if let Ok(len) = resp.to_bytes(&mut out) {
+                    let _ = root.send_to(&out[..len], peer).await;
+                }
+            }
+        });
+
+        let resolver = Arc::new(Resolver::new(rdns::resolver::ResolverConfig {
+            mode: rdns::resolver::ResolverMode::Recurse,
+            root_hints: vec![root_addr],
+            server_port: root_addr.port(),
+            timeout_ms: 2000,
+            ..Default::default()
+        }));
+        let serving = serving(
+            resolver,
+            test_shell(),
+            policy("ns.evil.example.com.rpz-nsdname IN CNAME .\n"),
+        );
+
+        let bytes = handle_query(
+            query_for("www.example.test.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+        assert!(
+            serving
+                .caches
+                .answers
+                .lookup(
+                    nm("www.example.test.").as_ref(),
+                    Qtype::of(record_types::A),
+                    false
+                )
+                .is_none(),
+            "a resolution that never finished has nothing to cache"
         );
     }
 

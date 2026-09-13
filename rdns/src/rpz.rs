@@ -13,14 +13,19 @@
 //! lookup is an ordinary zone lookup — [`Zone::locate`], wildcards and all
 //! (RFC 1034 §4.3.3) — rather than a second name matcher written here.
 //!
-//! Three of the five trigger types are implemented: QNAME, client IP and
-//! response IP. NSDNAME and NSIP need the delegation path a resolution walked,
-//! which [`crate::resolver`] does not hand back; a zone carrying them **loads
-//! with a warning and a count in the startup banner** rather than being refused
-//! (`TODO.md` #56). Refusing would drop every other rule in the feed, which for
-//! an operator under an obligation is the worse of the two failures — but a
-//! trigger silently not in force is what `CLAUDE.md` §4 is about, so it is
-//! counted where the operator reads counts.
+//! All five trigger types are implemented. QNAME, client IP and response IP are
+//! answerable from what the answer path already holds. The other two are about
+//! the *nameservers* a name is resolved through — `<nsname>.rpz-nsdname` and
+//! `<prefix>.<addr>.rpz-nsip` — which the answer does not carry, so they are
+//! asked while the delegation chain is being walked, through
+//! [`crate::resolver::NameserverPolicy`]: a match stops the resolution rather
+//! than rewriting its result, which is what the trigger is for (`TODO.md` #56).
+//!
+//! A stopped resolution caches nothing, so the block holds for every client
+//! rather than the first one — provided the walk actually happens. It need not:
+//! `resolve_from_root` starts at the deepest delegation it already knows, which
+//! is why the delegation cache keeps the referral's NS names and the policy is
+//! asked there too.
 //!
 //! Two deviations from BIND worth knowing, both deliberate:
 //!
@@ -38,12 +43,14 @@
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::record_types as rt;
+use crate::resolver::NameserverPolicy;
 use crate::security::prefix_matches;
 use crate::zone::{parse_zone_file_at, Located, NameKind, Zone, ZoneRecord};
 use crate::{Name, NameRef, ParsedRecord, Qtype, ResourceRecord};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
 
 /// What a policy zone says to do with a query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +79,8 @@ pub enum Trigger {
     Qname,
     ClientIp,
     ResponseIp,
+    Nsdname,
+    Nsip,
 }
 
 impl std::fmt::Display for Trigger {
@@ -80,6 +89,8 @@ impl std::fmt::Display for Trigger {
             Trigger::Qname => "qname",
             Trigger::ClientIp => "client-ip",
             Trigger::ResponseIp => "response-ip",
+            Trigger::Nsdname => "nsdname",
+            Trigger::Nsip => "nsip",
         })
     }
 }
@@ -194,8 +205,14 @@ pub struct PolicyZone {
     /// Longest prefix first, so the first match is the most specific one.
     client_ip: Vec<IpTrigger>,
     response_ip: Vec<IpTrigger>,
-    /// NSDNAME and NSIP triggers in the file, which nothing here enforces.
-    unsupported: usize,
+    ns_ip: Vec<IpTrigger>,
+    /// `rpz-nsdname.<origin>`, the parent of every NSDNAME trigger name, built
+    /// once rather than per delegation.
+    nsdname_root: Name,
+    /// How many NSDNAME triggers the zone holds. A zone with none skips the
+    /// lookup: a feed's bulk is QNAME rules and every delegation of every
+    /// query would otherwise pay a zone lookup per nameserver.
+    nsdname: usize,
 }
 
 impl PolicyZone {
@@ -224,7 +241,8 @@ impl PolicyZone {
         let origin = zone.origin();
         let mut client_ip = Vec::new();
         let mut response_ip = Vec::new();
-        let mut unsupported = 0;
+        let mut ns_ip = Vec::new();
+        let mut nsdname = 0;
         let mut seen: Vec<Name> = Vec::new();
         for record in zone.records() {
             let owner = record.name.as_ref();
@@ -236,8 +254,11 @@ impl PolicyZone {
                 continue;
             }
             seen.push(record.name.clone());
-            if kind != b"rpz-client-ip" && kind != b"rpz-ip" {
-                unsupported += 1;
+            // An NSDNAME trigger's labels are a name, not an address; the
+            // lookup that matches one is the zone's own, so nothing is indexed
+            // here beyond knowing whether to try it at all.
+            if kind == b"rpz-nsdname" {
+                nsdname += 1;
                 continue;
             }
             let labels: Vec<&[u8]> = owner
@@ -256,10 +277,10 @@ impl PolicyZone {
                 prefix,
                 owner: record.name.clone(),
             };
-            if kind == b"rpz-client-ip" {
-                client_ip.push(trigger);
-            } else {
-                response_ip.push(trigger);
+            match kind {
+                b"rpz-client-ip" => client_ip.push(trigger),
+                b"rpz-nsip" => ns_ip.push(trigger),
+                _ => response_ip.push(trigger),
             }
         }
         // Longest prefix wins, which a linear scan gives once the list is in
@@ -267,13 +288,23 @@ impl PolicyZone {
         // triggers, and those the zone's own index answers.
         client_ip.sort_by_key(|rule| std::cmp::Reverse(rule.prefix));
         response_ip.sort_by_key(|rule| std::cmp::Reverse(rule.prefix));
+        ns_ip.sort_by_key(|rule| std::cmp::Reverse(rule.prefix));
+
+        let nsdname_root = Name::prefixed(b"rpz-nsdname", origin).map_err(|e| {
+            ConfigError::new(format!(
+                "the policy zone {} is too long to hold NSDNAME triggers: {e}",
+                origin.to_presentation()
+            ))
+        })?;
 
         Ok(PolicyZone {
             zone,
             policy,
             client_ip,
             response_ip,
-            unsupported,
+            ns_ip,
+            nsdname_root,
+            nsdname,
         })
     }
 
@@ -287,9 +318,27 @@ impl PolicyZone {
         self.zone.records().len()
     }
 
-    /// NSDNAME and NSIP triggers this build does not enforce (`TODO.md` #56).
-    pub fn unsupported_triggers(&self) -> usize {
-        self.unsupported
+    /// How many triggers of each kind the zone holds, for the startup banner:
+    /// QNAME, client IP, response IP, NSDNAME, NSIP.
+    ///
+    /// The QNAME count is what is left after the four indexed kinds, which is
+    /// the apex's own records too — a feed's SOA and NS are not rules, so this
+    /// is "how big is the file" rather than a rule count, and the banner says
+    /// so.
+    pub fn trigger_counts(&self) -> [usize; 5] {
+        let addressed = self.client_ip.len() + self.response_ip.len() + self.ns_ip.len();
+        [
+            self.records().saturating_sub(addressed + self.nsdname),
+            self.client_ip.len(),
+            self.response_ip.len(),
+            self.nsdname,
+            self.ns_ip.len(),
+        ]
+    }
+
+    /// Whether this zone has anything to say about a delegation.
+    fn watches_delegations(&self) -> bool {
+        self.nsdname > 0 || !self.ns_ip.is_empty()
     }
 
     pub fn policy(&self) -> PolicyOverride {
@@ -315,6 +364,27 @@ impl PolicyZone {
 
     fn response_action(&self, addr: IpAddr, qname: NameRef<'_>, qtype: Qtype) -> Option<Action> {
         self.ip_action(&self.response_ip, addr, qname, qtype)
+    }
+
+    /// The action for one nameserver name: the trigger is that name under
+    /// `rpz-nsdname.<origin>`, so a wildcard rule is an ordinary zone wildcard
+    /// exactly as a QNAME rule's is.
+    fn nsdname_action(&self, ns: NameRef<'_>, qname: NameRef<'_>, qtype: Qtype) -> Option<Action> {
+        if self.nsdname == 0 {
+            return None;
+        }
+        // As in `qname_action`: a nameserver called `something.rpz-ip.` would
+        // otherwise build a trigger name inside an address subtree.
+        let last = ns.labels().last()?;
+        if SPECIAL_LABELS.iter().any(|l| last.eq_ignore_ascii_case(l)) {
+            return None;
+        }
+        let trigger = Name::concat(ns, self.nsdname_root.as_ref()).ok()?;
+        self.action_at(trigger.as_ref(), qname, qtype)
+    }
+
+    fn ns_ip_action(&self, addr: IpAddr, qname: NameRef<'_>, qtype: Qtype) -> Option<Action> {
+        self.ip_action(&self.ns_ip, addr, qname, qtype)
     }
 
     fn ip_action(
@@ -569,6 +639,53 @@ impl PolicyZones {
         None
     }
 
+    /// Whether any zone has an NSDNAME or NSIP trigger.
+    ///
+    /// The resolver is handed a policy only when one does: the walk asks
+    /// nothing, and the per-query [`DelegationPolicy`] is never built.
+    pub fn watches_delegations(&self) -> bool {
+        self.zones.iter().any(PolicyZone::watches_delegations)
+    }
+
+    /// One query's view of the nameserver triggers, to hand to the resolver.
+    pub fn at_delegations(&self, qname: NameRef<'_>, qtype: Qtype) -> DelegationPolicy<'_> {
+        DelegationPolicy {
+            zones: self,
+            qname: qname.to_owned(),
+            qtype,
+            hit: Mutex::new(None),
+        }
+    }
+
+    /// The rewrite that applies to a delegation the resolver is about to
+    /// follow: the names it was referred to, then the addresses those names
+    /// stand for.
+    ///
+    /// NSDNAME before NSIP, which is the order `draft-vixie-dns-rpz-04` §2.2
+    /// gives the two, and both after everything in [`PolicyZones::before_query`]
+    /// because that pass runs before any resolution starts.
+    pub fn on_delegation(
+        &self,
+        ns_names: &[Name],
+        servers: &[IpAddr],
+        qname: NameRef<'_>,
+        qtype: Qtype,
+    ) -> Option<Rewrite> {
+        for zone in &self.zones {
+            for ns in ns_names {
+                if let Some(action) = zone.nsdname_action(ns.as_ref(), qname, qtype) {
+                    return Some(zone.rewrite(action, Trigger::Nsdname));
+                }
+            }
+            for addr in servers {
+                if let Some(action) = zone.ns_ip_action(*addr, qname, qtype) {
+                    return Some(zone.rewrite(action, Trigger::Nsip));
+                }
+            }
+        }
+        None
+    }
+
     /// The rewrite that applies to an answer already obtained: every address in
     /// it, against the response-IP triggers.
     pub fn on_answer(
@@ -588,6 +705,55 @@ impl PolicyZones {
             }
         }
         None
+    }
+}
+
+/// One query's nameserver triggers, as the resolver consults them.
+///
+/// Built per query and only when [`PolicyZones::watches_delegations`] says
+/// there is something to consult. The resolver holds it by shared reference
+/// across the walk, so the match it found is behind a `Mutex` — locked twice
+/// per delegation and never across an await.
+pub struct DelegationPolicy<'a> {
+    zones: &'a PolicyZones,
+    qname: Name,
+    qtype: Qtype,
+    hit: Mutex<Option<Rewrite>>,
+}
+
+impl DelegationPolicy<'_> {
+    /// What stopped the resolution, if anything did.
+    pub fn matched(&self) -> Option<Rewrite> {
+        self.hit.lock().ok()?.take()
+    }
+}
+
+impl NameserverPolicy for DelegationPolicy<'_> {
+    fn allows(&self, ns_names: &[Name], servers: &[SocketAddr]) -> bool {
+        // The port is this resolver's business, not the policy's: an NSIP rule
+        // is about the host.
+        let addrs: Vec<IpAddr> = servers.iter().map(SocketAddr::ip).collect();
+        let Some(rewrite) =
+            self.zones
+                .on_delegation(ns_names, &addrs, self.qname.as_ref(), self.qtype)
+        else {
+            return true;
+        };
+        // A passthru is a match that changes nothing, so the resolution is
+        // exactly what it would have been — including its cache entry. Stopping
+        // for one would turn the exception into the block it exists to carve
+        // out of.
+        if rewrite.action == Action::Passthru {
+            return true;
+        }
+        let Ok(mut hit) = self.hit.lock() else {
+            // A poisoned lock means a panic already happened here. Refuse: the
+            // policy said no and the caller will find nothing recorded, which
+            // is a SERVFAIL rather than an answer the operator meant to block.
+            return false;
+        };
+        *hit = Some(rewrite);
+        false
     }
 }
 
@@ -628,6 +794,9 @@ elsewhere.example.com   IN CNAME landing.example.net.
 24.0.2.0.198.rpz-ip         IN CNAME .
 32.zz.db8.2001.rpz-ip       IN CNAME .
 ns.evil.example.com.rpz-nsdname IN CNAME .
+*.hoster.example.net.rpz-nsdname IN CNAME .
+good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
+32.13.2.0.192.rpz-nsip      IN CNAME .
 ";
 
     fn policy_zones(policy: PolicyOverride) -> PolicyZones {
@@ -933,12 +1102,20 @@ ns.evil.example.com.rpz-nsdname IN CNAME .
         );
     }
 
-    /// NSDNAME and NSIP are counted rather than enforced or refused, so the
-    /// startup banner can say how much of the feed is not in force.
+    /// The banner counts each trigger kind, so the feed that loaded and the
+    /// feed the operator meant to load are two different pictures.
     #[test]
-    fn an_unsupported_trigger_is_counted() {
+    fn every_trigger_kind_is_counted_for_the_banner() {
         let zones = zones();
-        assert_eq!(zones.zones()[0].unsupported_triggers(), 1);
+        let [qname, client_ip, response_ip, nsdname, nsip] = zones.zones()[0].trigger_counts();
+        assert_eq!(
+            (client_ip, response_ip, nsdname, nsip),
+            (2, 2, 3, 1),
+            "the four indexed kinds are counted exactly"
+        );
+        // Not a rule count: the apex SOA and NS are in it, which is why the
+        // banner calls the first number what is left over.
+        assert_eq!(qname, zones.zones()[0].records() - 8);
     }
 
     /// A rewrite to NXDOMAIN needs the zone's SOA, so a file without one is a
@@ -972,5 +1149,151 @@ evil.example.com IN CNAME rpz-passthru.
             Some(Action::Passthru),
             "the local zone is first and says to let it through"
         );
+    }
+
+    fn ns(names: &[&str]) -> Vec<Name> {
+        names.iter().map(|n| nm(n)).collect()
+    }
+
+    fn addrs(text: &[&str]) -> Vec<IpAddr> {
+        text.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    /// The trigger is the nameserver's name under `rpz-nsdname.<origin>`, and
+    /// what it rewrites is the *query*: the client asked about a name nothing
+    /// in the feed mentions, and it is blocked for the company it keeps.
+    #[test]
+    fn a_nameserver_name_is_a_trigger() {
+        let zones = zones();
+        let rewrite = zones
+            .on_delegation(
+                &ns(&["ns1.example.com.", "ns.evil.example.com."]),
+                &addrs(&["203.0.113.1"]),
+                nm("www.unlisted.test.").as_ref(),
+                Qtype::of(rt::A),
+            )
+            .expect("the second nameserver is listed");
+        assert_eq!(rewrite.action, Action::Nxdomain);
+        assert_eq!(rewrite.trigger, Trigger::Nsdname);
+        assert_eq!(rewrite.zone, nm(ORIGIN));
+    }
+
+    /// A nameserver's *address*, which is the trigger a feed reaches for when
+    /// the operator renames servers faster than they renumber them.
+    #[test]
+    fn a_nameserver_address_is_a_trigger() {
+        let zones = zones();
+        let rewrite = zones
+            .on_delegation(
+                &ns(&["ns1.unlisted.test."]),
+                &addrs(&["203.0.113.1", "192.0.2.13"]),
+                nm("www.unlisted.test.").as_ref(),
+                Qtype::of(rt::A),
+            )
+            .expect("the second address is listed");
+        assert_eq!(rewrite.action, Action::Nxdomain);
+        assert_eq!(rewrite.trigger, Trigger::Nsip);
+    }
+
+    /// Names before addresses, which is the order `draft-vixie-dns-rpz-04`
+    /// gives them — visible only when one delegation matches both.
+    #[test]
+    fn a_name_match_is_reported_before_an_address_match() {
+        let zones = zones();
+        let rewrite = zones
+            .on_delegation(
+                &ns(&["ns.evil.example.com."]),
+                &addrs(&["192.0.2.13"]),
+                nm("www.unlisted.test.").as_ref(),
+                Qtype::of(rt::A),
+            )
+            .unwrap();
+        assert_eq!(rewrite.trigger, Trigger::Nsdname);
+    }
+
+    /// A delegation nothing in the feed names costs a lookup and no rewrite.
+    #[test]
+    fn an_unlisted_delegation_is_not_rewritten() {
+        assert!(zones()
+            .on_delegation(
+                &ns(&["ns1.example.com."]),
+                &addrs(&["203.0.113.1"]),
+                nm("www.unlisted.test.").as_ref(),
+                Qtype::of(rt::A),
+            )
+            .is_none());
+    }
+
+    /// A wildcard NSDNAME rule is an ordinary zone wildcard, and an exact rule
+    /// under it wins — which is how one customer is carved out of a hoster.
+    #[test]
+    fn a_wildcard_nameserver_rule_has_exceptions() {
+        let zones = zones();
+        let blocked = zones.on_delegation(
+            &ns(&["bad.hoster.example.net."]),
+            &[],
+            nm("www.unlisted.test.").as_ref(),
+            Qtype::of(rt::A),
+        );
+        assert_eq!(blocked.map(|r| r.action), Some(Action::Nxdomain));
+        let allowed = zones.on_delegation(
+            &ns(&["good.hoster.example.net."]),
+            &[],
+            nm("www.unlisted.test.").as_ref(),
+            Qtype::of(rt::A),
+        );
+        assert_eq!(allowed.map(|r| r.action), Some(Action::Passthru));
+    }
+
+    /// A zone with no nameserver rule is never asked: the resolver is handed no
+    /// policy at all, so a feed of QNAME triggers costs a walk nothing.
+    #[test]
+    fn only_a_zone_with_a_nameserver_rule_watches_delegations() {
+        const PLAIN: &str = "$TTL 60
+@                IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. 1 3600 600 86400 60
+evil.example.com IN CNAME .
+";
+        assert!(zones().watches_delegations());
+        let plain = parse_zone_file(PLAIN, ORIGIN).unwrap();
+        let plain =
+            PolicyZones::from_zones(vec![PolicyZone::new(plain, PolicyOverride::Given).unwrap()]);
+        assert!(!plain.watches_delegations());
+    }
+
+    /// What the resolver sees: a refusal that records the rewrite, and a
+    /// passthru that does not stop the walk — stopping for one would turn the
+    /// exception into the rule it is carved out of.
+    #[test]
+    fn the_resolver_is_told_to_stop_for_everything_but_a_passthru() {
+        let zones = zones();
+        let qtype = Qtype::of(rt::A);
+
+        let watch = zones.at_delegations(nm("www.unlisted.test.").as_ref(), qtype);
+        assert!(!watch.allows(&ns(&["ns.evil.example.com."]), &[]));
+        let rewrite = watch.matched().expect("the refusal recorded what matched");
+        assert_eq!(rewrite.trigger, Trigger::Nsdname);
+        assert!(
+            watch.matched().is_none(),
+            "the match is taken, so a second read cannot replay it"
+        );
+
+        let watch = zones.at_delegations(nm("www.unlisted.test.").as_ref(), qtype);
+        assert!(watch.allows(&ns(&["good.hoster.example.net."]), &[]));
+        assert!(watch.matched().is_none(), "a passthru records nothing");
+    }
+
+    /// A nameserver called `something.rpz-ip.` must not build a trigger name
+    /// inside the address subtree, for the reason `qname_action` guards the
+    /// same shape: `24.0.2.0.198.rpz-ip` would answer for it.
+    #[test]
+    fn a_nameserver_named_like_a_subtree_matches_nothing() {
+        assert!(zones()
+            .on_delegation(
+                &ns(&["24.0.2.0.198.rpz-ip."]),
+                &[],
+                nm("www.unlisted.test.").as_ref(),
+                Qtype::of(rt::A),
+            )
+            .is_none());
     }
 }

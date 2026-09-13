@@ -111,8 +111,11 @@ async fn probe_zone(resolver: &Resolver, zone: &str) -> anyhow::Result<AnchorPro
         qtype: Qtype::of(record_types::DNSKEY),
         qclass: rdns::QueryClass::IN,
     };
+    // No nameserver policy: this is the resolver's own trust maintenance, not a
+    // client's query, and a blocking feed has no standing over which keys a
+    // zone we hold an anchor for publishes (`TODO.md` #56).
     let (response, state) = resolver
-        .resolve_validated(&query)
+        .resolve_validated(&query, None)
         .await
         .context("resolving DNSKEY")?;
 

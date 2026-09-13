@@ -32,7 +32,7 @@ mod caches;
 mod recurse;
 mod validate;
 
-use caches::{DelegationCache, KeyCache, RttStore};
+use caches::{DelegationCache, KeyCache, RttStore, Start};
 
 /// A DNS message sent over TCP is prefixed with a 2-byte big-endian length
 /// (RFC 1035 §4.2.2), so no message can exceed what that field can express.
@@ -290,23 +290,55 @@ impl Budget {
     }
 }
 
+/// Consulted before a resolution follows a delegation, so a policy about the
+/// *nameservers* a name is resolved through can act on one.
+///
+/// A callback rather than a second return value, because the delegation chain
+/// is walked and discarded: handing it back means every caller pays for a
+/// `Vec<Name>` it does not want, and only this shape can *stop* the resolution,
+/// which is what `rdns::rpz`'s NSDNAME and NSIP triggers are for (`TODO.md`
+/// #56). Nothing is asked and nothing is allocated when no policy is set.
+///
+/// `Sync`, because the reference is held across the walk's awaits and the
+/// resolution is spawned.
+pub trait NameserverPolicy: Sync {
+    /// Whether the walk may follow this delegation. `false` fails the
+    /// resolution with [`ResolveError::PolicyStopped`]; what to answer instead
+    /// is the implementation's to remember, since only it knows what matched.
+    ///
+    /// `servers` is what will be asked — glue, or the addresses a glueless
+    /// delegation's names resolved to — so an address rule sees what an NS name
+    /// actually points at rather than what it claims.
+    fn allows(&self, ns_names: &[Name], servers: &[SocketAddr]) -> bool;
+}
+
 /// The mutable state of one client query, threaded through the whole walk.
 ///
 /// A referral is the only sight of the *parent's* side of a zone cut, where the
 /// DS lives; asking the child for its own DS lets it answer about itself. So
 /// `cuts` collects DS and NSEC evidence in passing and validation consumes it.
-struct Resolution {
+struct Resolution<'a> {
     budget: Budget,
     cuts: Vec<DelegationEvidence>,
     denials: Vec<ResourceRecord>,
+    policy: Option<&'a dyn NameserverPolicy>,
 }
 
-impl Resolution {
-    fn new(budget: usize) -> Self {
+impl<'a> Resolution<'a> {
+    fn new(budget: usize, policy: Option<&'a dyn NameserverPolicy>) -> Self {
         Resolution {
             budget: Budget::new(budget),
             cuts: Vec::new(),
             denials: Vec::new(),
+            policy,
+        }
+    }
+
+    /// Ask the policy about a delegation, if there is one.
+    fn allows(&self, ns_names: &[Name], servers: &[SocketAddr]) -> ResolveResult<()> {
+        match self.policy {
+            Some(policy) if !policy.allows(ns_names, servers) => Err(ResolveError::PolicyStopped),
+            _ => Ok(()),
         }
     }
 
@@ -401,18 +433,24 @@ impl Resolver {
     /// Resolve a query. The answer only; [`Resolver::resolve_validated`] also
     /// reports whether it was authenticated.
     pub async fn resolve(&self, query: &QuerySection) -> ResolveResult<DnsMessage> {
-        self.resolve_validated(query).await.map(|(msg, _)| msg)
+        self.resolve_validated(query, None)
+            .await
+            .map(|(msg, _)| msg)
     }
 
     /// Resolve a query and say how much the answer can be trusted.
     ///
     /// With no trust anchors the state is [`ValidationState::Indeterminate`],
     /// not `Insecure`: nothing established that anything is unsigned.
+    ///
+    /// `policy` sees each delegation on the way down and may stop the walk; see
+    /// [`NameserverPolicy`]. `None` is the ordinary case and costs nothing.
     pub async fn resolve_validated(
         &self,
         query: &QuerySection,
+        policy: Option<&dyn NameserverPolicy>,
     ) -> Result<(DnsMessage, ValidationState), ResolveError> {
-        let mut state = Resolution::new(self.config.query_budget);
+        let mut state = Resolution::new(self.config.query_budget, policy);
         let response = match self.config.mode {
             ResolverMode::Forward => self.forward(query, &mut state).await?,
             ResolverMode::Recurse => self.recurse(query, &mut state).await?,
@@ -435,7 +473,7 @@ impl Resolver {
     async fn forward(
         &self,
         query: &QuerySection,
-        state: &mut Resolution,
+        state: &mut Resolution<'_>,
     ) -> ResolveResult<DnsMessage> {
         // RD=1: the upstream does the recursion.
         let out = self.build_query(query, true)?;
@@ -991,6 +1029,44 @@ this line has no record and is skipped
             .unwrap_or_default()
     }
 
+    /// A [`NameserverPolicy`] for the tests: refuse a delegation naming this
+    /// server, or standing at this address, and count what was asked.
+    struct RefuseNs {
+        name: Option<Name>,
+        addr: Option<IpAddr>,
+        asked: AtomicUsize,
+    }
+
+    impl RefuseNs {
+        fn by_name(name: &str) -> RefuseNs {
+            RefuseNs {
+                name: Some(nm(name)),
+                addr: None,
+                asked: AtomicUsize::new(0),
+            }
+        }
+
+        fn by_address(addr: IpAddr) -> RefuseNs {
+            RefuseNs {
+                name: None,
+                addr: Some(addr),
+                asked: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl NameserverPolicy for RefuseNs {
+        fn allows(&self, ns_names: &[Name], servers: &[SocketAddr]) -> bool {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            let named = self.name.iter().any(|n| ns_names.contains(n));
+            let addressed = self
+                .addr
+                .iter()
+                .any(|a| servers.iter().any(|s| s.ip() == *a));
+            !(named || addressed)
+        }
+    }
+
     /// Root → TLD → authoritative, following glue at each step.
     #[tokio::test]
     async fn test_recursion_follows_the_delegation_chain() {
@@ -1033,6 +1109,223 @@ this line has no record and is skipped
             answer.answers[0].rdata.parse().unwrap(),
             ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))
         );
+    }
+
+    /// A policy that refuses the delegation stops the walk before the zone's
+    /// own servers are asked — which is what the trigger is for: an NSDNAME
+    /// rule that rewrote the *result* would already have talked to the server
+    /// it exists to keep the resolver away from.
+    #[tokio::test]
+    async fn a_refused_delegation_stops_the_walk_before_the_server_is_asked() {
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, tld_sock, auth_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let tld_addr = tld_sock.local_addr().unwrap();
+        let auth_addr = auth_sock.local_addr().unwrap();
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let _auth = spawn_server(auth_sock, move |q| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            authoritative(q, vec![a_record("www.example.test.", [192, 0, 2, 1])])
+        });
+        let _tld = spawn_server(tld_sock, move |q| {
+            referral(
+                q,
+                "example.test.",
+                "ns.example.test.",
+                Some(("ns.example.test.", auth_addr)),
+            )
+        });
+        let root = spawn_server(root_sock, move |q| {
+            referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
+        });
+
+        let resolver = Resolver::new(recursing_config(root.addr));
+        let policy = RefuseNs::by_name("ns.example.test.");
+        let err = resolver
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("www.example.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                },
+                Some(&policy),
+            )
+            .await
+            .expect_err("the policy refused the delegation");
+
+        assert!(matches!(err, ResolveError::PolicyStopped), "{err:?}");
+        assert_eq!(
+            asked.load(Ordering::Relaxed),
+            0,
+            "the refused server was never asked"
+        );
+        // Both delegations were offered: the root's, then the one refused.
+        assert_eq!(policy.asked.load(Ordering::Relaxed), 2);
+    }
+
+    /// The address is the rule, not the name. A glueless delegation resolves
+    /// its nameservers first, so the policy sees what the names stand for
+    /// rather than what they are called.
+    #[tokio::test]
+    async fn a_refused_address_stops_a_glueless_delegation() {
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, tld_sock, auth_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let tld_addr = tld_sock.local_addr().unwrap();
+        let auth_addr = auth_sock.local_addr().unwrap();
+
+        let _auth = spawn_server(auth_sock, |q| {
+            authoritative(q, vec![a_record("www.example.test.", [192, 0, 2, 1])])
+        });
+        // No glue for `example.test.`: its nameserver lives elsewhere under
+        // `test.`, so the address comes back from a nested resolution.
+        let _tld = spawn_server(tld_sock, move |q| {
+            if qname_of(q).starts_with("ns.hoster.test.") {
+                let IpAddr::V4(v4) = auth_addr.ip() else {
+                    panic!("test glue must be IPv4")
+                };
+                return authoritative(q, vec![a_record("ns.hoster.test.", v4.octets())]);
+            }
+            referral(q, "example.test.", "ns.hoster.test.", None)
+        });
+        let root = spawn_server(root_sock, move |q| {
+            referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
+        });
+
+        let resolver = Resolver::new(recursing_config(root.addr));
+        let policy = RefuseNs::by_address(auth_addr.ip());
+        let err = resolver
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("www.example.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                },
+                Some(&policy),
+            )
+            .await
+            .expect_err("the policy refused the address the nameserver resolved to");
+        assert!(matches!(err, ResolveError::PolicyStopped), "{err:?}");
+    }
+
+    /// The regression that decided the shape of the delegation cache: a walk
+    /// starts at the deepest delegation already known, so a policy asked only
+    /// at referrals is a rule in force for the client that walked the chain and
+    /// for nobody after it (`TODO.md` #56).
+    ///
+    /// Fails against a cache holding addresses alone — the second query starts
+    /// at `example.test.`, sees no referral, and resolves.
+    #[tokio::test]
+    async fn a_cached_delegation_is_still_offered_to_the_policy() {
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, tld_sock, auth_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let tld_addr = tld_sock.local_addr().unwrap();
+        let auth_addr = auth_sock.local_addr().unwrap();
+
+        let _auth = spawn_server(auth_sock, |q| {
+            let owner = qname_of(q);
+            authoritative(q, vec![a_record(&owner, [192, 0, 2, 1])])
+        });
+        let _tld = spawn_server(tld_sock, move |q| {
+            referral(
+                q,
+                "example.test.",
+                "ns.example.test.",
+                Some(("ns.example.test.", auth_addr)),
+            )
+        });
+        let root = spawn_server(root_sock, move |q| {
+            referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
+        });
+
+        let resolver = Resolver::new(recursing_config(root.addr));
+        // The first client has no policy, and caches the delegation.
+        resolver
+            .resolve(&QuerySection {
+                qname: nm("www.example.test."),
+                qtype: Qtype::of(rt::A),
+                qclass: QueryClass::IN,
+            })
+            .await
+            .expect("the first query resolves");
+
+        let policy = RefuseNs::by_name("ns.example.test.");
+        let err = resolver
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("other.example.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                },
+                Some(&policy),
+            )
+            .await
+            .expect_err("the cached delegation carries the name the rule names");
+        assert!(matches!(err, ResolveError::PolicyStopped), "{err:?}");
+        assert_eq!(
+            policy.asked.load(Ordering::Relaxed),
+            1,
+            "one delegation was offered — the cached start, not a walk from the root"
+        );
+    }
+
+    /// A refused delegation is not cached. It was never followed, so an entry
+    /// for it would be a start point nothing here ever learned, and the walk
+    /// that falls back from a stale one would be starting from a refusal.
+    #[tokio::test]
+    async fn a_refused_delegation_is_not_cached() {
+        let mut socks = bind_hierarchy(3).into_iter();
+        let (root_sock, tld_sock, auth_sock) = (
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+            socks.next().unwrap(),
+        );
+        let tld_addr = tld_sock.local_addr().unwrap();
+        let auth_addr = auth_sock.local_addr().unwrap();
+
+        let _auth = spawn_server(auth_sock, |q| {
+            authoritative(q, vec![a_record("www.example.test.", [192, 0, 2, 1])])
+        });
+        let _tld = spawn_server(tld_sock, move |q| {
+            referral(
+                q,
+                "example.test.",
+                "ns.example.test.",
+                Some(("ns.example.test.", auth_addr)),
+            )
+        });
+        let root = spawn_server(root_sock, move |q| {
+            referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
+        });
+
+        let resolver = Resolver::new(recursing_config(root.addr));
+        let policy = RefuseNs::by_name("ns.example.test.");
+        let query = QuerySection {
+            qname: nm("www.example.test."),
+            qtype: Qtype::of(rt::A),
+            qclass: QueryClass::IN,
+        };
+        let _ = resolver.resolve_validated(&query, Some(&policy)).await;
+        let cached = resolver
+            .delegations
+            .best_match(query.qname.as_ref())
+            .map(|start| start.zone);
+        assert_ne!(cached, Some(nm("example.test.")));
+        // And the name still resolves for a client the policy says nothing
+        // about, from the root as if nothing had happened.
+        assert!(resolver.resolve(&query).await.is_ok());
     }
 
     /// RFC 6672 §3.4.1 step 4D and §3.4: a DNAME in the answer is followed,
@@ -1889,7 +2182,7 @@ this line has no record and is skipped
         let dead: SocketAddr = format!("192.0.2.99:{}", root.addr.port()).parse().unwrap();
         resolver
             .delegations
-            .insert(nm("example.test.").as_ref(), vec![dead], 3600);
+            .insert(nm("example.test.").as_ref(), vec![dead], Vec::new(), 3600);
 
         let answer = resolver
             .resolve(&QuerySection {
@@ -2671,11 +2964,14 @@ this line has no record and is skipped
         qtype: Qtype,
     ) -> (DnsMessage, ValidationState) {
         Resolver::new(config)
-            .resolve_validated(&QuerySection {
-                qname: nm("www.example.test."),
-                qtype,
-                qclass: QueryClass::IN,
-            })
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("www.example.test."),
+                    qtype,
+                    qclass: QueryClass::IN,
+                },
+                None,
+            )
             .await
             .expect("the resolution itself should succeed")
     }
@@ -2896,11 +3192,14 @@ this line has no record and is skipped
     async fn test_signed_nxdomain_validates_as_secure() {
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (answer, state) = Resolver::new(validating_config(&h))
-            .resolve_validated(&QuerySection {
-                qname: nm("gone.example.test."),
-                qtype: Qtype::of(rt::A),
-                qclass: QueryClass::IN,
-            })
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("gone.example.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                },
+                None,
+            )
             .await
             .expect("the resolution itself should succeed");
 
@@ -2921,11 +3220,14 @@ this line has no record and is skipped
     async fn test_signed_nsec3_nxdomain_validates_as_secure() {
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (answer, state) = Resolver::new(validating_config(&h))
-            .resolve_validated(&QuerySection {
-                qname: nm("nsec3-gone.example.test."),
-                qtype: Qtype::of(rt::A),
-                qclass: QueryClass::IN,
-            })
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("nsec3-gone.example.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                },
+                None,
+            )
             .await
             .expect("the resolution itself should succeed");
 
@@ -2959,11 +3261,14 @@ this line has no record and is skipped
     async fn test_an_nsec3_denial_missing_its_closest_encloser_is_not_secure() {
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (_, state) = Resolver::new(validating_config(&h))
-            .resolve_validated(&QuerySection {
-                qname: nm("nsec3-incomplete.example.test."),
-                qtype: Qtype::of(rt::A),
-                qclass: QueryClass::IN,
-            })
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("nsec3-incomplete.example.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                },
+                None,
+            )
             .await
             .expect("the resolution itself should succeed");
 
@@ -2986,11 +3291,14 @@ this line has no record and is skipped
 
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (denial, state) = Resolver::new(validating_config(&h))
-            .resolve_validated(&QuerySection {
-                qname: nm("gone.example.test."),
-                qtype: Qtype::of(rt::A),
-                qclass: QueryClass::IN,
-            })
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("gone.example.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                },
+                None,
+            )
             .await
             .expect("resolution should succeed");
         assert_eq!(state, ValidationState::Secure, "{state}");
@@ -3030,11 +3338,14 @@ this line has no record and is skipped
     async fn test_wildcard_nodata_validates_as_secure() {
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (answer, state) = Resolver::new(validating_config(&h))
-            .resolve_validated(&QuerySection {
-                qname: nm("wild-nodata.example.test."),
-                qtype: Qtype::of(rt::AAAA),
-                qclass: QueryClass::IN,
-            })
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("wild-nodata.example.test."),
+                    qtype: Qtype::of(rt::AAAA),
+                    qclass: QueryClass::IN,
+                },
+                None,
+            )
             .await
             .expect("the resolution itself should succeed");
 
@@ -3055,11 +3366,14 @@ this line has no record and is skipped
     async fn test_wildcard_nodata_without_the_wildcards_own_nsec_is_bogus() {
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (_, state) = Resolver::new(validating_config(&h))
-            .resolve_validated(&QuerySection {
-                qname: nm("stripped-wildcard.example.test."),
-                qtype: Qtype::of(rt::AAAA),
-                qclass: QueryClass::IN,
-            })
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("stripped-wildcard.example.test."),
+                    qtype: Qtype::of(rt::AAAA),
+                    qclass: QueryClass::IN,
+                },
+                None,
+            )
             .await
             .expect("the resolution itself should succeed");
 
@@ -3144,11 +3458,14 @@ this line has no record and is skipped
     async fn a_negative_answer_after_a_cname_is_validated() {
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (answer, state) = Resolver::new(validating_config(&h))
-            .resolve_validated(&QuerySection {
-                qname: nm("chase.example.test."),
-                qtype: Qtype::of(rt::AAAA),
-                qclass: QueryClass::IN,
-            })
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("chase.example.test."),
+                    qtype: Qtype::of(rt::AAAA),
+                    qclass: QueryClass::IN,
+                },
+                None,
+            )
             .await
             .expect("the resolution itself should succeed");
 
@@ -3183,11 +3500,14 @@ this line has no record and is skipped
     async fn a_stripped_denial_after_a_cname_is_bogus() {
         let h = signed_hierarchy(signed_ds, signed_answer);
         let (_, state) = Resolver::new(validating_config(&h))
-            .resolve_validated(&QuerySection {
-                qname: nm("stripped-chase.example.test."),
-                qtype: Qtype::of(rt::AAAA),
-                qclass: QueryClass::IN,
-            })
+            .resolve_validated(
+                &QuerySection {
+                    qname: nm("stripped-chase.example.test."),
+                    qtype: Qtype::of(rt::AAAA),
+                    qclass: QueryClass::IN,
+                },
+                None,
+            )
             .await
             .expect("the resolution itself should succeed");
 
@@ -3315,7 +3635,7 @@ this line has no record and is skipped
             qclass: QueryClass::IN,
         };
 
-        let (_, first) = resolver.resolve_validated(&query).await.unwrap();
+        let (_, first) = resolver.resolve_validated(&query, None).await.unwrap();
         assert_eq!(first, ValidationState::Secure, "{first}");
         assert!(
             resolver.keys.holds(nm("example.test.").as_ref()),
@@ -3323,7 +3643,7 @@ this line has no record and is skipped
         );
         assert!(resolver.keys.holds(nm(".").as_ref()), "and the root's");
 
-        let (_, second) = resolver.resolve_validated(&query).await.unwrap();
+        let (_, second) = resolver.resolve_validated(&query, None).await.unwrap();
         assert_eq!(second, ValidationState::Secure, "{second}");
     }
 }
