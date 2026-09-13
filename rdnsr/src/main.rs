@@ -28,6 +28,7 @@ use rdns::metrics::DnsMetrics;
 use rdns::readiness::Readiness;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::rfc5011::ManagedAnchors;
+use rdns::rpz::PolicyZones;
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
 use rdns::shutdown::{next_reload, reload_signal, Shutdown};
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
@@ -41,8 +42,8 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
 
 use crate::anchors::spawn_anchor_manager;
-use crate::answer::Caches;
-use crate::serve::{udp_main, Resolving};
+use crate::answer::{Caches, Resolving};
+use crate::serve::udp_main;
 
 /// UDP queries this resolver will have in flight at once, when nothing says
 /// otherwise.
@@ -271,6 +272,27 @@ struct Cli {
     /// Windows has no equivalent.
     #[arg(long, value_name = "PATH")]
     tls_key: Option<PathBuf>,
+    /// A Response Policy Zone file, repeatable and consulted in the order
+    /// given: the first zone with a rule for a query decides it.
+    ///
+    /// An RPZ is how blocking is delivered — a court order, a police list, a
+    /// malware feed — and it is an ordinary DNS zone, so a feed is a zone file
+    /// here. The zone's origin comes from its `$ORIGIN` line, or from the file
+    /// name if it has none.
+    ///
+    /// Not naming one is the off switch, and costs nothing per query.
+    #[arg(long, value_name = "PATH")]
+    rpz: Vec<PathBuf>,
+    /// What a policy zone's rules mean, when it should not be taken at its
+    /// word: given, disabled, passthru, drop, nxdomain, nodata or tcp-only.
+    ///
+    /// `given` — the default — does what each rule says. `passthru` matches and
+    /// changes nothing, which is how a new feed is measured before it is
+    /// enforced; `disabled` keeps the configuration and matches nothing.
+    /// Applies to every `--rpz` zone: a per-zone policy wants a config file,
+    /// and this daemon has flags.
+    #[arg(long, value_name = "POLICY", default_value = "given")]
+    rpz_policy: rdns::rpz::PolicyOverride,
 }
 
 #[tokio::main]
@@ -407,7 +429,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         NSEC_CACHE_ZONES
     };
-    let caches = Arc::new(Caches::new(capacity, denial_zones));
+    let caches = Caches::new(capacity, denial_zones);
+
+    // Before anything binds, like the certificate and the metrics listener: a
+    // policy file that will not parse is a block that is not in force, and
+    // starting without it is the failure worth avoiding most here.
+    let policy = PolicyZones::load(&cli.rpz, cli.rpz_policy)?;
 
     let addr = format!("{}:{}", cli.host, cli.port);
     // Both transports are mandatory: an answer over the client's UDP payload
@@ -514,6 +541,20 @@ async fn main() -> anyhow::Result<()> {
         queries_per_source: cli.anomaly_source_queries,
         refusals_per_source: cli.anomaly_source_refusals,
     };
+    // What each policy zone holds and how much of it is not enforced. Printed
+    // for the reason the rate limiter's policy is: a rewrite is invisible on
+    // the wire, and an NSDNAME trigger nothing acts on is a rule an operator
+    // believes is in force (`CLAUDE.md` §4, §14, `TODO.md` #45a, #56).
+    for zone in policy.zones() {
+        tracing::info!(
+            "policy zone {} ({}): {} records, {} NSDNAME/NSIP triggers not enforced",
+            zone.origin().to_presentation(),
+            zone.policy(),
+            zone.records(),
+            zone.unsupported_triggers(),
+        );
+    }
+
     let (udp_cap, tcp_cap) = admission.caps();
     tracing::info!(
         "query rate: {}, response budget: {}, request cap: {udp_cap}B UDP / {tcp_cap}B TCP,          metrics: {}, anomaly warnings: {}",
@@ -569,12 +610,20 @@ async fn main() -> anyhow::Result<()> {
         shutdown.stop_handle(),
     ));
 
+    // One handle for every listener: the four encrypted ones each built their
+    // own copy of the same three fields, and a fourth field to add is a fourth
+    // place to forget it (`CLAUDE.md` §7).
+    let serving = Arc::new(Resolving {
+        resolver,
+        caches,
+        policy,
+        ctx: ctx.clone(),
+    });
+
     let mut loops = JoinSet::new();
     loops.spawn(udp_main(
         socket,
-        resolver.clone(),
-        caches.clone(),
-        ctx.clone(),
+        serving.clone(),
         cli.max_inflight_udp,
         shutdown.stop_handle(),
         shutdown.busy(),
@@ -583,13 +632,7 @@ async fn main() -> anyhow::Result<()> {
     // and ask a few things (`TODO.md` #30e).
     loops.spawn(tcp::serve(
         listener,
-        Arc::new(Resolving {
-            // Cloned, because the DoT loop below serves the same resolver and
-            // the same caches: one answer path, two ways in.
-            resolver: resolver.clone(),
-            caches: caches.clone(),
-            ctx: ctx.clone(),
-        }),
+        serving.clone(),
         TransportLimits::default(),
         tcp::RateLimit::PerConnection,
         shutdown.stop_handle(),
@@ -599,11 +642,7 @@ async fn main() -> anyhow::Result<()> {
         loops.spawn(https::serve(
             https_listener,
             endpoint,
-            Arc::new(Resolving {
-                resolver: resolver.clone(),
-                caches: caches.clone(),
-                ctx: ctx.clone(),
-            }),
+            serving.clone(),
             TransportLimits::default(),
             tcp::RateLimit::PerConnection,
             shutdown.stop_handle(),
@@ -613,11 +652,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(endpoint) = quic_endpoint {
         loops.spawn(quic::serve(
             endpoint,
-            Arc::new(Resolving {
-                resolver: resolver.clone(),
-                caches: caches.clone(),
-                ctx: ctx.clone(),
-            }),
+            serving.clone(),
             TransportLimits::default(),
             tcp::RateLimit::PerConnection,
             shutdown.stop_handle(),
@@ -630,11 +665,7 @@ async fn main() -> anyhow::Result<()> {
         loops.spawn(tls::serve(
             tls_listener,
             config,
-            Arc::new(Resolving {
-                resolver: resolver.clone(),
-                caches: caches.clone(),
-                ctx: ctx.clone(),
-            }),
+            serving.clone(),
             TransportLimits::default(),
             tcp::RateLimit::PerConnection,
             shutdown.stop_handle(),

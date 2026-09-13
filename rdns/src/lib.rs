@@ -39,6 +39,7 @@ pub mod persist;
 pub mod readiness;
 pub mod resolver;
 pub mod rfc5011;
+pub mod rpz;
 pub mod secondary;
 pub mod security;
 pub mod shutdown;

@@ -18,6 +18,7 @@ use rdns::nsec_cache::NsecCache;
 use rdns::record_types;
 use rdns::resolver::Resolver;
 use rdns::response::ClientEdns;
+use rdns::rpz::{Action, PolicyZones, Rewrite};
 use rdns::special_names;
 use rdns::validation::{Request, Transport};
 use rdns::Rtype;
@@ -60,6 +61,22 @@ impl Caches {
     }
 }
 
+/// Everything answering a query needs, in one handle.
+///
+/// One `Arc` clone per datagram rather than three, and one place to add a piece
+/// of state to: the UDP loop and the TCP handler are two callers of one
+/// function, and each was cloning the same three fields into every task
+/// (`CLAUDE.md` §7). The four encrypted listeners each built their own copy of
+/// it, which is the shape `CLAUDE.md` §14 groups into a struct.
+pub(crate) struct Resolving {
+    pub(crate) resolver: Arc<Resolver>,
+    pub(crate) caches: Caches,
+    /// The response policy zones in force, in the order they are consulted.
+    /// Empty unless `--rpz` named one, and empty costs one `is_empty` a query.
+    pub(crate) policy: PolicyZones,
+    pub(crate) ctx: Arc<ServeContext>,
+}
+
 /// What the client asked for and what it can take: everything about a request
 /// that shapes the reply once the answer itself is decided.
 struct Client {
@@ -77,11 +94,15 @@ pub(crate) async fn handle_query(
     data: Vec<u8>,
     peer: IpAddr,
     now: u64,
-    resolver: &Arc<Resolver>,
-    caches: &Arc<Caches>,
-    ctx: &ServeContext,
+    serving: &Resolving,
     transport: Transport,
 ) -> Option<Vec<u8>> {
+    let Resolving {
+        resolver,
+        caches,
+        policy,
+        ctx,
+    } = serving;
     // Refuse a *response*: a reply parsed as a question and answered with
     // another reply is a packet loop between two servers pointed at each other.
     // `None` is the whole reply, because the peer did not ask anything. The type
@@ -169,6 +190,23 @@ pub(crate) async fn handle_query(
         // Never authenticated: this was decided by specification rather than
         // validated, and a validating client cannot check the claim itself.
         return finish(resp, false, None, &client, &query, ctx, timer);
+    }
+
+    // The operator's policy, before every cache and before any resolution: a
+    // blocked name must cost no upstream query, and an answer held from before
+    // the rule was written must not outlive it.
+    //
+    // After `special_names` and not before, because that table is a protocol
+    // requirement rather than a preference — RFC 6761 §6.3's `localhost` is the
+    // loopback address whatever a feed says about it.
+    if !policy.is_empty() {
+        if let Some(rewrite) = policy.before_query(peer, query.qname.as_ref(), query.qtype) {
+            if let Applied::Replied(reply) =
+                apply_policy(&msg, rewrite, &client, &query, ctx, timer, transport)
+            {
+                return reply;
+            }
+        }
     }
 
     // Aggressive use of the validated denial cache (RFC 8198). A cached NSEC
@@ -326,7 +364,95 @@ pub(crate) async fn handle_query(
 
     resp.cd = checking_disabled;
 
+    // The address in an answer is a trigger too (`rpz-ip`): a name nobody
+    // blocked that resolves into blocked space. After a cache hit as well as
+    // after a recursion — the cache holds what the internet said, and the
+    // policy is applied to what leaves.
+    if !policy.is_empty() && !resp.answers.is_empty() {
+        if let Some(rewrite) = policy.on_answer(&resp.answers, query.qname.as_ref(), query.qtype) {
+            if let Applied::Replied(reply) =
+                apply_policy(&msg, rewrite, &client, &query, ctx, timer, transport)
+            {
+                return reply;
+            }
+        }
+    }
+
     finish(resp, secure, why, &client, &query, ctx, timer)
+}
+
+/// What a policy match did, since one of the six actions is to do nothing.
+enum Applied {
+    /// The bytes to send back, or `None` for `rpz-drop`: no reply at all.
+    Replied(Option<Vec<u8>>),
+    /// Matched and deliberately unchanged — `rpz-passthru`, or `rpz-tcp-only`
+    /// on a connection that is already TCP.
+    Unchanged,
+}
+
+/// Turn a policy match into the reply it calls for (`rdns::rpz`).
+///
+/// Never authenticated: this answer was decided here, so AD stays clear and a
+/// validating client will find the signatures missing — which is the honest
+/// outcome and the reason the rewrite is announced with an Extended DNS Error
+/// (RFC 8914 §4.16) rather than only in a log nobody downstream reads.
+fn apply_policy(
+    request: &DnsMessage,
+    rewrite: Rewrite,
+    client: &Client,
+    query: &QuerySection,
+    ctx: &ServeContext,
+    timer: LatencyTimer,
+    transport: Transport,
+) -> Applied {
+    const WHY: ExtendedError = ExtendedError::new(
+        InfoCode::BLOCKED,
+        "this answer is the resolver operator's policy",
+    );
+    // INFO, not DEBUG: a name that does not resolve is a support call, and this
+    // line is the answer to it. One per rewrite, which is bounded by how much
+    // of the traffic the policy covers rather than by the traffic.
+    tracing::info!(
+        qname = %query.qname,
+        qtype = %query.qtype,
+        zone = %rewrite.zone,
+        trigger = %rewrite.trigger,
+        "policy applied"
+    );
+    let soa = rewrite.soa.into_iter().collect::<Vec<_>>();
+    let (answers, rcode) = match rewrite.action {
+        // Nothing leaves. Counted, because a query that arrives and produces
+        // no answer is otherwise indistinguishable from a lost packet.
+        Action::Drop => {
+            ctx.metrics.count(&ctx.metrics.policy_drops);
+            return Applied::Replied(None);
+        }
+        Action::Passthru => return Applied::Unchanged,
+        // TC=1 sends the client to TCP, where the handshake proves the source;
+        // over TCP it has already done that, so there is nothing to ask for.
+        Action::TcpOnly => {
+            if transport != Transport::Udp {
+                return Applied::Unchanged;
+            }
+            ctx.metrics.count(&ctx.metrics.policy_rewrites);
+            let mut resp = build_response(request, Vec::new(), ResponseCode::Ok);
+            resp.truncation = true;
+            ctx.record_answer(resp.rcode, timer);
+            return Applied::Replied(resp.to_bytes_within(client.max_len).ok());
+        }
+        Action::Nxdomain => (Vec::new(), ResponseCode::NoSuchDomain),
+        Action::Nodata => (Vec::new(), ResponseCode::Ok),
+        Action::LocalData(records) => (records, ResponseCode::Ok),
+    };
+    ctx.metrics.count(&ctx.metrics.policy_rewrites);
+    let mut resp = build_response(request, answers, rcode);
+    // The policy zone's own SOA, so a negative answer can be cached at all
+    // (RFC 2308 §5). Its MINIMUM and its TTL are the two numbers the client
+    // needs; which of them wins is §3's rule and the client's to apply.
+    if resp.answers.is_empty() {
+        resp.authorities = soa;
+    }
+    Applied::Replied(finish(resp, false, Some(WHY), client, query, ctx, timer))
 }
 
 /// What the client is told about a validation failure: the INFO-CODE the check
@@ -592,14 +718,12 @@ mod tests {
     /// Nothing may come back at all.
     #[tokio::test]
     async fn a_response_is_dropped_rather_than_resolved() {
-        let (resolver, caches) = context();
+        let serving = context();
         let reply = handle_query(
             message(OpCode::Query, true),
             TEST_PEER,
             current_unix_timestamp(),
-            &resolver,
-            &caches,
-            &test_shell(),
+            &serving,
             Transport::Udp,
         )
         .await;
@@ -613,15 +737,13 @@ mod tests {
     /// with `opcode = QUERY` is a reply its sender cannot match.
     #[tokio::test]
     async fn an_unimplemented_opcode_is_notimp_with_the_opcode_echoed() {
-        let (resolver, caches) = context();
+        let serving = context();
         for opcode in [OpCode::Notify, OpCode::Update, OpCode::Status] {
             let bytes = handle_query(
                 message(opcode, false),
                 TEST_PEER,
                 current_unix_timestamp(),
-                &resolver,
-                &caches,
-                &test_shell(),
+                &serving,
                 Transport::Udp,
             )
             .await
@@ -645,7 +767,7 @@ mod tests {
     /// supported".
     #[tokio::test]
     async fn an_unimplemented_opcode_says_why_when_the_client_used_edns() {
-        let (resolver, caches) = context();
+        let serving = context();
         let mut msg = DnsMessage::try_from_bytes(&message(OpCode::Update, false)).expect("parses");
         msg.set_edns(Edns::with_payload_size(4096));
 
@@ -653,9 +775,7 @@ mod tests {
             msg.to_bytes_within(4096).expect("serialize"),
             TEST_PEER,
             current_unix_timestamp(),
-            &resolver,
-            &caches,
-            &test_shell(),
+            &serving,
             Transport::Udp,
         )
         .await
@@ -689,6 +809,244 @@ mod tests {
         buf
     }
 
+    /// A policy zone with one rule of each kind this test needs, built in
+    /// memory: `PolicyZone::load` is `rdns::rpz`'s to test, and what is under
+    /// test here is the answer path around it.
+    fn policy(rules: &str) -> PolicyZones {
+        let text = format!(
+            "$TTL 60\n\
+             @ IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. 1 3600 600 86400 60\n{rules}"
+        );
+        let zone = rdns::zone::parse_zone_file(&text, "rpz.invalid.").expect("the policy parses");
+        PolicyZones::from_zones(vec![rdns::rpz::PolicyZone::new(
+            zone,
+            rdns::rpz::PolicyOverride::Given,
+        )
+        .expect("indexes")])
+    }
+
+    async fn policy_reply(rules: &str, name: &str, transport: Transport) -> Option<DnsMessage> {
+        let serving = serving(test_resolver(), test_shell(), policy(rules));
+        let bytes = handle_query(
+            query_for(name, 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            transport,
+        )
+        .await?;
+        Some(DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply"))
+    }
+
+    /// The whole point of the feature, end to end: a blocked name is NXDOMAIN
+    /// with the policy zone's SOA to cache it by, and no upstream is reached —
+    /// the resolver in this fixture forwards to a port nothing listens on, so
+    /// an answer at all is proof the query never left.
+    #[tokio::test]
+    async fn a_blocked_name_is_answered_from_the_policy_and_never_resolved() {
+        let reply = policy_reply(
+            "evil.example.com IN CNAME .\n",
+            "evil.example.com.",
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+        assert!(reply.answers.is_empty());
+        assert_eq!(
+            reply.authorities.len(),
+            1,
+            "the policy zone's SOA, or the client cannot cache the answer"
+        );
+        assert!(!reply.ad, "nothing here was authenticated");
+    }
+
+    /// RFC 8914 §4.16: the client is told this was policy rather than the
+    /// internet, which is the difference between a support call and a shrug.
+    #[tokio::test]
+    async fn a_rewrite_says_it_was_blocked_when_the_client_used_edns() {
+        let serving = serving(
+            test_resolver(),
+            test_shell(),
+            policy("evil.example.com IN CNAME .\n"),
+        );
+        let query = rdns::DnsMessageBuilder::new()
+            .with_id(7)
+            .with_query(nm("evil.example.com."), Qtype::of(record_types::A))
+            .with_recursion(true)
+            .with_edns(1232, false)
+            .build()
+            .to_bytes_within(4096)
+            .expect("serialize");
+        let bytes = handle_query(
+            query,
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        let edns = reply.edns.as_ref().expect("the OPT is mirrored");
+        let errors = ExtendedError::all_in(edns).expect("a well-formed option list");
+        assert_eq!(
+            errors.iter().map(|(code, _)| *code).collect::<Vec<_>>(),
+            vec![InfoCode::BLOCKED]
+        );
+    }
+
+    /// Local data answers under the name asked for, and is counted as a
+    /// rewrite: a walled garden is the other half of blocking.
+    #[tokio::test]
+    async fn local_data_answers_the_query_and_is_counted() {
+        let serving = serving(
+            test_resolver(),
+            test_shell(),
+            policy("evil.example.com IN A 192.0.2.10\n"),
+        );
+        let bytes = handle_query(
+            query_for("evil.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].name, nm("evil.example.com."));
+        assert_eq!(
+            serving
+                .ctx
+                .metrics
+                .policy_rewrites
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// `rpz-drop` sends nothing, and the counter is the only way an operator
+    /// tells that from a lost packet.
+    #[tokio::test]
+    async fn a_dropped_query_is_silent_and_counted() {
+        let serving = serving(
+            test_resolver(),
+            test_shell(),
+            policy("evil.example.com IN CNAME rpz-drop.\n"),
+        );
+        let reply = handle_query(
+            query_for("evil.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await;
+        assert!(reply.is_none(), "rpz-drop means no reply at all");
+        assert_eq!(
+            serving
+                .ctx
+                .metrics
+                .policy_drops
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// `rpz-tcp-only` is a statement about UDP: TC=1 sends the client to TCP,
+    /// where the handshake proves the source. Over TCP there is nothing left to
+    /// ask for, so the query is answered as usual — which here means the
+    /// unreachable upstream and SERVFAIL, not a truncated reply.
+    #[tokio::test]
+    async fn tcp_only_truncates_over_udp_and_does_nothing_over_tcp() {
+        let rules = "evil.example.com IN CNAME rpz-tcp-only.\n";
+        let over_udp = policy_reply(rules, "evil.example.com.", Transport::Udp)
+            .await
+            .expect("answered");
+        assert!(over_udp.truncation, "TC=1 is the whole of the action");
+        assert!(over_udp.answers.is_empty());
+
+        let over_tcp = policy_reply(rules, "evil.example.com.", Transport::Tcp)
+            .await
+            .expect("answered");
+        assert!(!over_tcp.truncation, "the client is already on TCP");
+    }
+
+    /// `rpz-passthru` matches and changes nothing, so the query is resolved —
+    /// against an upstream that does not answer, which is what SERVFAIL here
+    /// means and what tells this apart from a rewrite to NODATA.
+    #[tokio::test]
+    async fn passthru_resolves_the_query_as_if_no_rule_matched() {
+        let reply = policy_reply(
+            "evil.example.com IN CNAME rpz-passthru.\n",
+            "evil.example.com.",
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(reply.rcode, ResponseCode::ServerFailure);
+    }
+
+    /// A name in the answer is a trigger too, and the answer this one rewrites
+    /// comes out of the cache: the cache holds what the internet said, and the
+    /// policy applies to what leaves.
+    #[tokio::test]
+    async fn a_response_ip_trigger_rewrites_an_answer_served_from_the_cache() {
+        let serving = serving(
+            test_resolver(),
+            test_shell(),
+            policy("24.0.2.0.198.rpz-ip IN CNAME .\n"),
+        );
+        let name = nm("www.example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![ResourceRecord {
+                name: name.clone(),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(300),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    std::net::Ipv4Addr::new(198, 0, 2, 7),
+                ))
+                .expect("encodes"),
+            }],
+        );
+        let bytes = handle_query(
+            query_for("www.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+        assert!(
+            reply.answers.is_empty(),
+            "the address the cache held is what the rule is about"
+        );
+    }
+
+    /// RFC 6761 §6.3's `localhost` is the loopback address whatever a feed says
+    /// about it: the table is a protocol requirement and the policy is a
+    /// preference, so the table goes first.
+    #[tokio::test]
+    async fn the_special_names_table_is_not_overridable_by_policy() {
+        let reply = policy_reply("localhost IN CNAME .\n", "localhost.", Transport::Udp)
+            .await
+            .expect("answered");
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(
+            reply.answers.len(),
+            1,
+            "127.0.0.1, not the policy's NXDOMAIN"
+        );
+    }
+
     /// The client's EDNS advertisement is a ceiling this resolver may lower,
     /// not one it has to honour (`TODO.md` #41b).
     ///
@@ -700,9 +1058,9 @@ mod tests {
     /// Watched failing against `msg.udp_payload_size()`: 2,093 octets, TC clear.
     #[tokio::test]
     async fn a_udp_reply_is_capped_by_this_resolver_and_not_only_by_the_client() {
-        let (resolver, caches) = context();
+        let serving = context();
         let pool = nm("pool.example.com.");
-        caches.answers.put(
+        serving.caches.answers.put(
             pool.as_ref(),
             Qtype::of(record_types::A),
             (0..128u32)
@@ -727,15 +1085,12 @@ mod tests {
             .to_bytes_within(4096)
             .expect("serialize");
 
-        let shell = test_shell();
-        let cap = shell.udp.max_response() as usize;
+        let cap = serving.ctx.udp.max_response() as usize;
         let bytes = handle_query(
             greedy,
             TEST_PEER,
             current_unix_timestamp(),
-            &resolver,
-            &caches,
-            &shell,
+            &serving,
             Transport::Udp,
         )
         .await
@@ -749,7 +1104,7 @@ mod tests {
         assert!(reply.truncation, "and says so, so the client retries");
         assert_eq!(
             reply.edns().expect("an OPT").udp_payload_size,
-            shell.udp.advertised(),
+            serving.ctx.udp.advertised(),
             "the OPT advertises what this resolver was configured with"
         );
     }
@@ -766,15 +1121,13 @@ mod tests {
     /// Watched failing against the old builder: CD came back clear.
     #[tokio::test]
     async fn the_checking_disabled_bit_is_the_clients() {
-        let (resolver, caches) = context();
+        let serving = context();
         for cd in [false, true] {
             let bytes = handle_query(
                 query_for("localhost.", 1, cd),
                 TEST_PEER,
                 current_unix_timestamp(),
-                &resolver,
-                &caches,
-                &test_shell(),
+                &serving,
                 Transport::Udp,
             )
             .await
@@ -794,14 +1147,12 @@ mod tests {
     /// answered.
     #[tokio::test]
     async fn two_questions_in_one_query_are_a_format_error() {
-        let (resolver, caches) = context();
+        let serving = context();
         let bytes = handle_query(
             query_for("localhost.", 2, false),
             TEST_PEER,
             current_unix_timestamp(),
-            &resolver,
-            &caches,
-            &test_shell(),
+            &serving,
             Transport::Udp,
         )
         .await
@@ -823,8 +1174,7 @@ mod tests {
     /// involved (RFC 6761 §6.3).
     #[tokio::test]
     async fn a_query_is_counted_against_the_source_that_sent_it() {
-        let (resolver, caches) = context();
-        let ctx = test_shell();
+        let serving = context();
         let now = current_unix_timestamp();
 
         for _ in 0..3 {
@@ -832,9 +1182,7 @@ mod tests {
                 query_for("localhost.", 1, false),
                 TEST_PEER,
                 now,
-                &resolver,
-                &caches,
-                &ctx,
+                &serving,
                 Transport::Udp,
             )
             .await
@@ -846,15 +1194,13 @@ mod tests {
             vec![0x00, 0x01, 0x00],
             TEST_PEER,
             now,
-            &resolver,
-            &caches,
-            &ctx,
+            &serving,
             Transport::Udp,
         )
         .await
         .is_none());
 
-        let stats = ctx.logger.take_stats(now + 60);
+        let stats = serving.ctx.logger.take_stats(now + 60);
         assert_eq!(stats.total_queries, 3);
         assert_eq!(stats.queries_by_ip.get(&TEST_PEER), Some(&3));
         assert_eq!(stats.total_errors, 1);

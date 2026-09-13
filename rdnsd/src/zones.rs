@@ -88,7 +88,7 @@ impl ZoneSource {
         let matches = |candidate: &str| absolute_name(candidate).eq_ignore_ascii_case(&wanted);
         match self {
             ZoneSource::SingleFile(path) => {
-                matches(&extract_zone_origin_from_path(path)).then(|| PathBuf::from(path))
+                matches(&rdns::zone::origin_from_path(path)).then(|| PathBuf::from(path))
             }
             ZoneSource::Files(files) => files
                 .iter()
@@ -100,7 +100,7 @@ impl ZoneSource {
                 .map(|entry| entry.path())
                 .find(|path| {
                     path.extension().and_then(|s| s.to_str()) == Some("zone")
-                        && matches(&extract_zone_origin_from_path(&path.to_string_lossy()))
+                        && matches(&rdns::zone::origin_from_path(&path.to_string_lossy()))
                 }),
         }
     }
@@ -1001,7 +1001,7 @@ pub(crate) fn load_zones_from_source(
         ZoneSource::SingleFile(path) => {
             // Path-aware, so a `$INCLUDE` in the file resolves next to it rather
             // than against whatever directory the daemon happens to run in.
-            let zone_origin = extract_zone_origin_from_path(path);
+            let zone_origin = rdns::zone::origin_from_path(path);
             let zone = parse_zone_file_at(Path::new(path), &zone_origin)?;
             let mut map = ZoneMap::new();
             map.insert(zone_key(&zone), std::sync::Arc::new(zone));
@@ -1056,26 +1056,6 @@ pub(crate) fn load_zones_from_source(
     }
 }
 
-/// `example.com.zone` -> `example.com.`
-pub(crate) fn extract_zone_origin_from_path(path: &str) -> String {
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("zone");
-
-    let origin = if let Some(stripped) = file_name.strip_suffix(".zone") {
-        stripped
-    } else {
-        file_name
-    };
-
-    if origin.ends_with('.') {
-        origin.to_string()
-    } else {
-        format!("{}.", origin)
-    }
-}
-
 /// Enumerate all .zone files in a directory and load them
 pub(crate) fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<ZoneMap> {
     let mut zones = ZoneMap::new();
@@ -1088,7 +1068,7 @@ pub(crate) fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<Zon
 
         if path.extension().and_then(|s| s.to_str()) == Some("zone") {
             let path_str = path.to_string_lossy();
-            let zone_origin = extract_zone_origin_from_path(&path_str);
+            let zone_origin = rdns::zone::origin_from_path(&path_str);
             match parse_zone_file_at(&path, &zone_origin) {
                 Ok(zone) => {
                     tracing::info!("loaded zone from {}", path_str);
@@ -1209,31 +1189,31 @@ mod tests {
 
     #[test]
     fn test_extract_zone_origin_with_extension() {
-        let origin = extract_zone_origin_from_path("example.com.zone");
+        let origin = rdns::zone::origin_from_path("example.com.zone");
         assert_eq!(origin, "example.com.");
     }
 
     #[test]
     fn test_extract_zone_origin_with_path() {
-        let origin = extract_zone_origin_from_path("/etc/dns/example.com.zone");
+        let origin = rdns::zone::origin_from_path("/etc/dns/example.com.zone");
         assert_eq!(origin, "example.com.");
     }
 
     #[test]
     fn test_extract_zone_origin_already_dotted() {
-        let origin = extract_zone_origin_from_path("example.com..zone");
+        let origin = rdns::zone::origin_from_path("example.com..zone");
         assert_eq!(origin, "example.com.");
     }
 
     #[test]
     fn test_extract_zone_origin_no_extension() {
-        let origin = extract_zone_origin_from_path("example.com");
+        let origin = rdns::zone::origin_from_path("example.com");
         assert_eq!(origin, "example.com.");
     }
 
     #[test]
     fn test_extract_zone_origin_deep_path() {
-        let origin = extract_zone_origin_from_path("/var/lib/dns/zones/example.com.zone");
+        let origin = rdns::zone::origin_from_path("/var/lib/dns/zones/example.com.zone");
         assert_eq!(origin, "example.com.");
     }
 

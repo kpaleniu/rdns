@@ -131,6 +131,17 @@ pub struct Counters {
     pub quic_handshakes: AtomicU64,
     pub quic_handshake_failures: AtomicU64,
 
+    /// Answers a Response Policy Zone replaced (`crate::rpz`), and queries it
+    /// dropped outright.
+    ///
+    /// Two counters, because the second is invisible otherwise: an `rpz-drop`
+    /// rule sends nothing at all, so without this the operator sees a query
+    /// arrive, no answer leave, and has nothing to attribute it to
+    /// (`CLAUDE.md` §14). A match that passes the query through is neither —
+    /// nothing was changed.
+    pub policy_rewrites: AtomicU64,
+    pub policy_drops: AtomicU64,
+
     /// dnstap payloads queued for the collector, and those the queue had no
     /// room for.
     ///
@@ -192,6 +203,8 @@ impl DnsMetrics {
             tls_handshake_failures: AtomicU64::new(0),
             quic_handshakes: AtomicU64::new(0),
             quic_handshake_failures: AtomicU64::new(0),
+            policy_rewrites: AtomicU64::new(0),
+            policy_drops: AtomicU64::new(0),
             dnstap_frames: AtomicU64::new(0),
             dnstap_dropped: AtomicU64::new(0),
             zones: RwLock::new(BTreeMap::new()),
@@ -414,6 +427,23 @@ impl DnsMetrics {
         output.push_str(&format!(
             "dns_responses_noerror_total {}\n",
             self.responses_noerror.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "# HELP dns_policy_rewrites_total Answers replaced by a response policy zone\n",
+        );
+        output.push_str("# TYPE dns_policy_rewrites_total counter\n");
+        output.push_str(&format!(
+            "dns_policy_rewrites_total {}\n",
+            self.policy_rewrites.load(Ordering::Relaxed)
+        ));
+
+        output
+            .push_str("# HELP dns_policy_drops_total Queries dropped by a response policy zone\n");
+        output.push_str("# TYPE dns_policy_drops_total counter\n");
+        output.push_str(&format!(
+            "dns_policy_drops_total {}\n",
+            self.policy_drops.load(Ordering::Relaxed)
         ));
 
         output.push_str("# HELP dns_cache_hits_total Cache hits\n");
@@ -653,6 +683,10 @@ impl Default for DnsMetrics {
 /// Timer for one query, in the units a latency histogram wants.
 ///
 /// `Instant`: this measures an interval, and the wall clock steps backwards.
+///
+/// `Copy`, because an answer path that offers one reply and then falls through
+/// to build another needs the same start instant twice.
+#[derive(Clone, Copy)]
 pub struct LatencyTimer {
     start: Instant,
 }

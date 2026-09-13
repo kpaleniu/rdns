@@ -37,9 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#45**, **#48**, **#49**, **#51**, **#53**, **#54**, **#55** and **#21**,
-as of 2026-09-12. **#44 is closed in full.** ~~**None of them is a live
-defect**~~ — **that claim was wrong about #47**, which closed the same day
+**#45**, **#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56**,
+**#57** and **#21**, as of 2026-09-13. **#44 is closed in full.**
+~~**None of them is a live defect**~~ — **that claim was wrong about #47**, which closed the same day
 carrying two MUSTs it had been filed as not breaking: RFC 6891 §6.1.1's OPT in a
 response to a request that had one, and RFC 3225 §3's DO bit, dropped on the
 first envelope of every AXFR. It was filed as "not a defect" because its own row
@@ -48,8 +48,8 @@ is left, #50 was the live one, and closing it is what added #53: a zone this
 server signed itself is verified again at every load, which 76 seconds of a
 million-record zone made visible. #45 is what an ISP would find missing in
 `rdnsr`; #48 and #49 are what 44a left, #51 what 44d left, #54 what 44g left and
-#55 what 44f left; and #21 is an inventory of deliberate deviations rather
-than a queue. Everything else numbered is closed;
+#55 what 44f left, and #56 and #57 what 45a left; and #21 is an inventory of
+deliberate deviations rather than a queue. Everything else numbered is closed;
 the table under "Closed work" says which, when, and where the reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
@@ -823,8 +823,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#45**, **#48**, **#49**, **#51**, **#53**, **#54** and **#55**, plus **#21**
-— see "What is open" above,
+**#45**, **#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56** and
+**#57**, plus **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -883,6 +883,8 @@ Then, in order and for stated reasons:
 **#45 is a different product decision**, not a queue position: it is what an ISP
 needs, and 45a (RPZ) is a legal gate rather than a nice-to-have for anyone with
 blocking obligations. 45e is a decision to take rather than work to schedule.
+**45a done 2026-09-13**, and it went first for the reason the row gave. It left
+#56 and #57.
 
 ~~The certificate story in 42a is still the part with no decision behind it.~~
 **Decided 2026-09-12**, and the decision was partly to decline: a renewal is a
@@ -950,11 +952,89 @@ from #44's. Same filing rule: every "0 hits" is a `grep` taken on the day.
 
 | | | |
 |---|---|---|
-| **45a** | Response Policy Zones — **0 hits** | Not an RFC — an ISC-originated specification, like `$GENERATE` — and implemented by BIND, Knot Resolver, Unbound and PowerDNS. It is how blocking is delivered: court-ordered injunctions, police lists, malware feeds. For an ISP under a blocking obligation this is not a missing feature but a legal non-starter, so it sits above everything else here. The pleasing part is the delivery mechanism: an RPZ *is* a DNS zone, so the AXFR/IXFR/NOTIFY machinery that already exists is how the policy would arrive |
+| **45a** | Response Policy Zones — ~~**0 hits**~~ **done 2026-09-13**, `rdns/src/rpz.rs` and `rdnsr --rpz` | Not an RFC — an ISC-originated specification, like `$GENERATE` — and implemented by BIND, Knot Resolver, Unbound and PowerDNS. It is how blocking is delivered: court-ordered injunctions, police lists, malware feeds. For an ISP under a blocking obligation this is not a missing feature but a legal non-starter, so it sits above everything else here. The pleasing part is the delivery mechanism: an RPZ *is* a DNS zone, so the AXFR/IXFR/NOTIFY machinery that already exists is how the policy would arrive. **That half held and was not the work**: the lookup is `Zone::locate` on a trigger name built as QNAME + origin, so RFC 1034 §4.3.3's wildcard rule is the RPZ wildcard rule with nothing written twice. What the row did not see is that the *delivery* is still a file: transferring a policy zone needs the secondary machinery, which lives in `rdnsd` and has no home in `rdnsr` — filed as **#57**. Three of the five trigger types are enforced; NSDNAME and NSIP are **#56** |
 | **45b** | serve-stale (RFC 8767, "Serving Stale Data to Improve DNS Resiliency") — **0 hits** | Answer from expired cache when the authoritative servers cannot be reached, rather than SERVFAIL. It is what keeps a resolver useful through somebody else's outage, and the resilience feature a subscriber is most likely to notice the absence of |
 | **45c** | DNS64 (RFC 6147) — **0 hits** | Synthesize AAAA from A for IPv6-only clients behind NAT64. Required in an IPv6-only mobile network, which is most of them |
 | **45d** | prefetching — **0 hits** | Re-resolve a popular name before its TTL expires, so the hit rate has no hole at every expiry. Unbound's `prefetch`, and the cheapest of the rows here |
 | **45e** | EDNS Client Subnet (RFC 7871) — the option code exists and nothing reads or writes it | `EDNS_OPTION_CLIENT_SUBNET` is defined in `edns.rs` and appears at exactly one other place: its own doc comment. Forwarding it is what lets an authoritative server steer a client to a near replica, and *not* forwarding it is a defensible privacy position — RFC 7871 §2 is unusually explicit about the cost. So this row is a **decision to take**, not work to schedule, and it is the only one on this page whose right answer might be "no, and write down why" |
+
+---
+
+### 56. NSDNAME and NSIP triggers are counted and not enforced — **filed 2026-09-13**
+
+Left behind by 45a, with a number because the alternative is a sentence in a doc
+comment (`CLAUDE.md` §18).
+
+An RPZ has five trigger types. `rdns::rpz` enforces three — QNAME, client IP and
+response IP — because those three are answerable from what the answer path
+already holds: the name asked for, the peer's address, and the addresses in the
+answer. The other two are about the *nameservers* a name was resolved through:
+`<nsname>.rpz-nsdname` matches a delegation's NS name, and
+`<prefix>.<addr>.rpz-nsip` matches that nameserver's address. Real feeds use
+them — a malware operator changes names faster than nameservers, which is the
+point of the trigger.
+
+Nothing here can answer them, and the reason is structural rather than an
+omission: `Resolver::resolve_validated` hands back a `DnsMessage`, and the
+delegation chain it walked to get there is not in it. `resolver::recurse` knows
+every NS name and every address it asked; `handle_query` knows none of them.
+
+So the row is really two questions, and the second is the one to settle first:
+
+- **What does the resolver hand back?** An extra return value is the obvious
+  answer and probably the wrong one — every caller pays for a `Vec<Name>` it
+  does not want. A callback the resolver consults at each delegation is the
+  shape that costs nothing when no policy is loaded, and it is also the shape
+  that lets a match *stop* the resolution rather than rewriting its result,
+  which is what the trigger is for.
+- **Does a cached answer carry it?** A name whose answer came from the cache was
+  not resolved through anything on this query, so an NSDNAME rule would apply to
+  the first client and not the next. BIND has the same problem and solves it by
+  keying the rewrite on the cached RRset. Either way this decides whether the
+  trigger is worth having, so it is the measurement to take before writing any
+  of it.
+
+Until then a zone carrying either is loaded, the rules are counted, and the
+count is printed at startup beside what the zone does enforce. Not refused:
+refusing a whole feed for one trigger drops every rule in it, which for an
+operator under an obligation is the worse of the two failures. Not silent:
+a trigger nobody enforces is a block the operator believes is in force
+(`CLAUDE.md` §4).
+
+---
+
+### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13**
+
+Also left behind by 45a, and the half of its own row that did not survive
+contact with the code. #45a said the pleasing part was the delivery mechanism —
+"an RPZ *is* a DNS zone, so the AXFR/IXFR/NOTIFY machinery that already exists
+is how the policy would arrive". The machinery does exist. It is in `rdnsd`:
+`rdns::secondary`, `rdns::transfer`, `rdns::notify`, `rdnsd/src/replication.rs`.
+`rdnsr` has never been a secondary of anything, has no zone map, and does not
+listen for a NOTIFY at all.
+
+So `--rpz` takes a path, and a feed is refreshed by whatever writes that path —
+which is how an operator with one feed and a cron job already works, and is not
+how an operator with an hourly-updated blocklist wants to work: a file rewritten
+under a running resolver is not re-read, so today the answer is a restart.
+
+Three things to settle, in this order:
+
+- **Re-read before replicate.** A SIGHUP that re-reads every `--rpz` file is
+  most of the value and needs no protocol: `rdnsr` already has a reload signal
+  for the TLS certificate (`main.rs`), so this is a second thing that handler
+  does. All-or-nothing, the way `PolicyZones::load` is at startup — a feed that
+  fails to parse must leave the one in force in force.
+- **Then the transfer**, which is the part with a cost: it means `rdnsr` grows a
+  replication task, an SOA timer and a NOTIFY listener, and those are what
+  `rdnsd` is. The alternative worth measuring first is that the *operator* runs
+  `rdnsd` as the secondary and points `rdnsr --rpz` at the zone file it writes,
+  which is two processes and no new code, and is what several ISPs do with BIND
+  for unrelated reasons.
+- **And IXFR only if the zone is large enough to care.** A national blocklist is
+  thousands of names; the RPZ feeds that are millions are the commercial malware
+  ones. `rdns::ixfr` exists either way, so this is a question about the timer
+  and not about the format.
 
 ---
 

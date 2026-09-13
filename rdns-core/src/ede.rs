@@ -65,6 +65,13 @@ impl InfoCode {
     /// 12, NSEC Missing: "the requested data was missing and a covering NSEC
     /// or NSEC3 was not provided".
     pub const NSEC_MISSING: InfoCode = InfoCode(12);
+    /// 15, Blocked: "the server is blocking the query due to a policy defined
+    /// by the operator" — a Response Policy Zone rewrite (`rdns::rpz`).
+    ///
+    /// Not 16 (Censored, "an external requirement") or 17 (Filtered, "a policy
+    /// defined by the end user"): which of the three an RPZ feed is depends on
+    /// where the feed came from, and only the operator knows that.
+    pub const BLOCKED: InfoCode = InfoCode(15);
     /// 18, Prohibited: "an authoritative server or recursive resolver that
     /// receives a query from an 'unauthorized' client can annotate its REFUSED
     /// message with this code".

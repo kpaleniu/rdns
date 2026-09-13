@@ -108,12 +108,26 @@ impl Name {
     /// name and a trailing dot are the zone parser's to interpret, not this
     /// type's.
     pub fn relative_to(text: &str, origin: NameRef<'_>) -> WireResult<Name> {
-        let head = Name::from_presentation(text)?;
-        // Everything but the root terminator, which `origin` supplies.
-        let head = &head.0[..head.0.len() - 1];
-        let mut out = Vec::with_capacity(head.len() + origin.0.len());
+        // The text decoded on the stack, so the join below is the only
+        // allocation: this is the zone parser's per-record cost.
+        let mut buf = [0u8; MAX_NAME_LEN];
+        let len = presentation_wire_in(text, &mut buf)?;
+        Name::joined(&buf[..len - 1], origin)
+    }
+
+    /// `head`'s labels, then `tail`'s: how an RPZ trigger name is built from a
+    /// QNAME and the policy zone's origin (`rdns::rpz`, `TODO.md` #45a).
+    ///
+    /// Both are absolute, so `head`'s root terminator is what `tail` replaces.
+    pub fn concat(head: NameRef<'_>, tail: NameRef<'_>) -> WireResult<Name> {
+        Name::joined(&head.0[..head.0.len() - 1], tail)
+    }
+
+    /// `head`, which is wire octets *without* the root terminator, then `tail`.
+    fn joined(head: &[u8], tail: NameRef<'_>) -> WireResult<Name> {
+        let mut out = Vec::with_capacity(head.len() + tail.0.len());
         out.extend_from_slice(head);
-        out.extend_from_slice(origin.0);
+        out.extend_from_slice(tail.0);
         check_name_len(out.len())?;
         Ok(Name(out.into_boxed_slice()))
     }

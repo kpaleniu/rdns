@@ -15,7 +15,9 @@ use rdns::validation::AdmissionCheck;
 use rdns::{DnsMessage, OpCode, Qtype, QuerySection, ResponseCode};
 use rdns_transport::ServeContext;
 
-use crate::answer::Caches;
+use rdns::rpz::PolicyZones;
+
+use crate::answer::{Caches, Resolving};
 
 /// A name from a literal, for tests only: `Name` is fallible to build and a
 /// test that writes a bad one should fail loudly at that line.
@@ -41,19 +43,35 @@ pub(crate) fn test_shell() -> Arc<ServeContext> {
 }
 
 /// A resolver that is never reached — every test using it is about a packet
-/// refused before any resolution is attempted — and caches small enough to see
-/// into.
-pub(crate) fn context() -> (Arc<Resolver>, Arc<Caches>) {
+/// refused before any resolution is attempted.
+pub(crate) fn test_resolver() -> Arc<Resolver> {
     let config = ResolverConfig {
         mode: ResolverMode::Forward,
         // Nothing here reaches an upstream.
         upstream_servers: vec!["127.0.0.1:1".parse().unwrap()],
         ..Default::default()
     };
-    (
-        Arc::new(Resolver::new(config)),
-        Arc::new(Caches::new(16, 4)),
-    )
+    Arc::new(Resolver::new(config))
+}
+
+/// The handle `handle_query` takes: an unreachable resolver, caches small
+/// enough to see into, no policy, and every limit off.
+pub(crate) fn context() -> Arc<Resolving> {
+    serving(test_resolver(), test_shell(), PolicyZones::default())
+}
+
+/// The same, for a test that brings its own resolver, shell or policy.
+pub(crate) fn serving(
+    resolver: Arc<Resolver>,
+    ctx: Arc<ServeContext>,
+    policy: PolicyZones,
+) -> Arc<Resolving> {
+    Arc::new(Resolving {
+        resolver,
+        caches: Caches::new(16, 4),
+        policy,
+        ctx,
+    })
 }
 
 pub(crate) fn message(opcode: OpCode, response: bool) -> Vec<u8> {

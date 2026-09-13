@@ -45,6 +45,26 @@ mod rdata;
 pub use parse::{parse_zone_file, parse_zone_file_at};
 pub(crate) use rdata::format_dnssec_time;
 
+/// The origin a zone file's name says it holds: `example.com.zone` is
+/// `example.com.`, and a name without the extension is taken whole.
+///
+/// The rule `rdnsd` reads a zone directory by, and the fallback
+/// [`crate::rpz::PolicyZone::load`] uses when a policy zone has no `$ORIGIN`
+/// line. It lived in `rdnsd` alone until the second caller (`CLAUDE.md` §7):
+/// two files deciding what a zone is called would disagree eventually.
+pub fn origin_from_path(path: &str) -> String {
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("zone");
+    let origin = file_name.strip_suffix(".zone").unwrap_or(file_name);
+    if origin.ends_with('.') {
+        origin.to_string()
+    } else {
+        format!("{origin}.")
+    }
+}
+
 /// A single DNS resource record stored in a zone
 #[derive(Debug, Clone)]
 pub struct ZoneRecord {

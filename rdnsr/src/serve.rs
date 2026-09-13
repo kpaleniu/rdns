@@ -9,7 +9,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use rdns::resolver::Resolver;
 use rdns::security::ResponseVerdict;
 use rdns::shutdown::{Busy, Stop};
 use rdns::validation::{Privacy, Transport};
@@ -17,7 +16,7 @@ use rdns_transport::{recv_error_is_transient, tcp, ServeContext, UDP_RECEIVE_BUF
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::answer::{handle_query, truncate_reply, Caches};
+use crate::answer::{handle_query, truncate_reply, Resolving};
 
 /// Receive datagrams and resolve each in its own task, up to `max_inflight`.
 ///
@@ -28,13 +27,12 @@ use crate::answer::{handle_query, truncate_reply, Caches};
 /// back-pressure.
 pub(crate) async fn udp_main(
     socket: Arc<UdpSocket>,
-    resolver: Arc<Resolver>,
-    caches: Arc<Caches>,
-    ctx: Arc<ServeContext>,
+    serving: Arc<Resolving>,
     max_inflight: usize,
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
+    let ctx = &serving.ctx;
     // Floored, not refused: nobody means "answer nothing".
     let in_flight = Arc::new(Semaphore::new(max_inflight.max(1)));
     // Sized for any datagram a client may send, not the payload size we
@@ -82,25 +80,15 @@ pub(crate) async fn udp_main(
         };
         let data = buf[..n].to_vec();
         let socket = socket.clone();
-        let resolver = resolver.clone();
-        let caches = caches.clone();
         // A recursion takes seconds and the client is already waiting, so it
         // is worth the drain.
         let busy = busy.clone();
-        let ctx = ctx.clone();
+        let serving = serving.clone();
         tokio::spawn(async move {
             let _busy = busy;
             let _permit = permit;
-            if let Some(reply) = handle_query(
-                data,
-                peer.ip(),
-                now,
-                &resolver,
-                &caches,
-                &ctx,
-                Transport::Udp,
-            )
-            .await
+            let ctx = &serving.ctx;
+            if let Some(reply) = handle_query(data, peer.ip(), now, &serving, Transport::Udp).await
             {
                 // Charge the response, not the query. Over budget, TC=1 is
                 // the useful refusal: no records to amplify, and a real client
@@ -125,16 +113,6 @@ pub(crate) async fn udp_main(
     }
 }
 
-/// What answers a query on this resolver, for the shared TCP transport.
-///
-/// The three handles `handle_query` needs, in one place so the transport can
-/// hold them: it is generic over the handler and knows nothing about resolving.
-pub(crate) struct Resolving {
-    pub(crate) resolver: Arc<Resolver>,
-    pub(crate) caches: Arc<Caches>,
-    pub(crate) ctx: Arc<ServeContext>,
-}
-
 impl tcp::Handler for Resolving {
     fn context(&self) -> &ServeContext {
         &self.ctx
@@ -153,17 +131,7 @@ impl tcp::Handler for Resolving {
         _privacy: Privacy,
         out: mpsc::Sender<tcp::Reply>,
     ) {
-        if let Some(reply) = handle_query(
-            packet,
-            peer.ip(),
-            now,
-            &self.resolver,
-            &self.caches,
-            &self.ctx,
-            Transport::Tcp,
-        )
-        .await
-        {
+        if let Some(reply) = handle_query(packet, peer.ip(), now, self, Transport::Tcp).await {
             tcp::send_framed(&out, &reply).await;
         }
     }
@@ -175,7 +143,8 @@ mod tests {
 
     use rdns::logging::QueryLogger;
     use rdns::metrics::DnsMetrics;
-    use rdns::resolver::{ResolverConfig, ResolverMode};
+    use rdns::resolver::{Resolver, ResolverConfig, ResolverMode};
+    use rdns::rpz::PolicyZones;
     use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
     use rdns::shutdown::Shutdown;
     use rdns::validation::AdmissionCheck;
@@ -195,8 +164,6 @@ mod tests {
     /// `rate_limited` at 0.
     #[tokio::test]
     async fn a_source_over_its_query_rate_is_dropped_and_counted() {
-        let (resolver, caches) = context();
-
         // One per second, burst of one, on a clock nothing moves: against
         // `SystemTime` a second boundary inside the burst hands back a token
         // and only two of the four are dropped (`TODO.md` #52).
@@ -210,15 +177,14 @@ mod tests {
             clock: rdns::clock::Clock::fixed(1_000_000_000),
         });
         let metrics = ctx.metrics.clone();
+        let serving = serving(test_resolver(), ctx, PolicyZones::default());
 
         let shutdown = Shutdown::new();
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
         let addr = socket.local_addr().expect("addr");
         let server = tokio::spawn(udp_main(
             socket,
-            resolver,
-            caches,
-            ctx,
+            serving,
             16,
             shutdown.stop_handle(),
             shutdown.busy(),
@@ -314,20 +280,15 @@ mod tests {
     /// Watched failing with the check removed: the reply carried 0xBAD1.
     #[tokio::test]
     async fn a_tcp_message_over_the_admission_caps_is_dropped_and_the_connection_kept() {
-        let (resolver, caches) = context();
-        let ctx = test_shell();
-        let metrics = ctx.metrics.clone();
+        let serving = context();
+        let metrics = serving.ctx.metrics.clone();
 
         let shutdown = Shutdown::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let server = tokio::spawn(tcp::serve(
             listener,
-            Arc::new(Resolving {
-                resolver,
-                caches,
-                ctx,
-            }),
+            serving,
             TransportLimits::default(),
             tcp::RateLimit::PerConnection,
             shutdown.stop_handle(),
@@ -390,16 +351,12 @@ mod tests {
             timeout_ms: 30_000,
             ..Default::default()
         }));
-        let (_, caches) = context();
-
         let shutdown = Shutdown::new();
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
         let addr = socket.local_addr().expect("addr");
         let server = tokio::spawn(udp_main(
             socket,
-            resolver,
-            caches,
-            test_shell(),
+            serving(resolver, test_shell(), PolicyZones::default()),
             1,
             shutdown.stop_handle(),
             shutdown.busy(),
