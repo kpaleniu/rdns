@@ -19,6 +19,12 @@
 //!   only place a negative wire TTL can be stopped from widening to `u64::MAX`
 //!   and winning the `min` (`CLAUDE.md` §2).
 //!
+//! - **An entry has two lifetimes**, once serve-stale is on (RFC 8767): the TTL,
+//!   after which it stops being an answer, and the stale window after that, in
+//!   which it is still the last thing known and better than SERVFAIL. See
+//!   [`StalePolicy`]; with no policy the two are the same instant and nothing
+//!   changes.
+//!
 //! Eviction is `crate::eviction`, shared with the other two: one victim per
 //! insert is a scan per query once a bounded cache is full.
 
@@ -35,6 +41,61 @@ use std::sync::{Arc, Mutex};
 ///
 /// A nonsense TTL then costs a day rather than the life of the process.
 const MAX_CACHE_TTL: u64 = 86_400;
+
+/// How long past its TTL an answer may still be served, and with what TTL on it
+/// (RFC 8767, "Serving Stale Data to Improve DNS Resiliency").
+///
+/// One type for both caches, because the window and the TTL are one policy and
+/// two copies of it would disagree (`CLAUDE.md` §7). `Copy` and eight bytes: it
+/// is passed, not shared.
+///
+/// Off by default, which is what `max_stale` of zero means. Serving stale is a
+/// deliberate decision to answer with something known to be out of date, and
+/// RFC 8767 §6 is explicit that it can keep a withdrawn name alive for as long
+/// as the window — so it is the operator's to turn on. BIND and Unbound both
+/// default it off for the same reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StalePolicy {
+    max_stale: u64,
+}
+
+/// The TTL a stale answer carries (RFC 8767 §4, recommended 30 seconds).
+///
+/// Not the TTL that is left — there is none — and not zero, which some clients
+/// refuse to cache at all and which would make every client re-ask at once, on
+/// exactly the resolution path that is already failing.
+pub const STALE_ANSWER_TTL: u32 = 30;
+
+impl StalePolicy {
+    /// Serve nothing stale. The default, and what `--serve-stale 0` means.
+    pub const OFF: StalePolicy = StalePolicy { max_stale: 0 };
+
+    /// Serve an expired answer for up to `seconds` past its TTL.
+    ///
+    /// RFC 8767 §4 recommends between one and three days for this "maximum
+    /// stale timer": long enough to cover an outage nobody is awake for, short
+    /// enough that a name really withdrawn stops being answered.
+    pub const fn seconds(seconds: u64) -> StalePolicy {
+        StalePolicy { max_stale: seconds }
+    }
+
+    pub const fn is_on(self) -> bool {
+        self.max_stale > 0
+    }
+
+    pub const fn max_stale(self) -> u64 {
+        self.max_stale
+    }
+
+    /// Whether an entry that expired at `expires_at` is still worth keeping.
+    ///
+    /// The one place the window is arithmetic, so no call site re-derives it.
+    /// With the policy off this is exactly "has not expired", which is what
+    /// makes one predicate serve both caches in both modes.
+    pub(crate) fn keeps(self, expires_at: u64, now: u64) -> bool {
+        expires_at.saturating_add(self.max_stale) > now
+    }
+}
 
 /// DNS cache entry with TTL expiration
 #[derive(Debug, Clone)]
@@ -61,6 +122,7 @@ impl CacheEntry {
 pub struct DnsCache {
     cache: Arc<Mutex<HashMap<NameTypeKey, CacheEntry>>>,
     max_entries: usize,
+    stale: StalePolicy,
 }
 
 impl DnsCache {
@@ -69,6 +131,15 @@ impl DnsCache {
         DnsCache {
             cache: Arc::new(Mutex::new(HashMap::new())),
             max_entries,
+            stale: StalePolicy::OFF,
+        }
+    }
+
+    /// The same, holding expired entries for [`StalePolicy`]'s window.
+    pub fn with_stale(max_entries: usize, stale: StalePolicy) -> Self {
+        DnsCache {
+            stale,
+            ..DnsCache::new(max_entries)
         }
     }
 
@@ -105,12 +176,48 @@ impl DnsCache {
         if let Some(entry) = cache.get(key) {
             if !entry.is_expired(now) {
                 return Some((entry.records.clone(), entry.secure));
-            } else {
+            } else if !self.stale.keeps(entry.expires_at, now) {
+                // Expired and past its stale window: nothing will ask for it
+                // again. Inside the window it stays for `get_stale`.
                 cache.remove(key);
             }
         }
 
         None
+    }
+
+    /// An answer that has expired but is still inside the stale window
+    /// (RFC 8767), with [`STALE_ANSWER_TTL`] on every record.
+    ///
+    /// Only for the caller that has already failed to refresh it: §4 has the
+    /// resolver try the authoritative servers first and serve this when that
+    /// does not work, so a cache that can answer normally must not come here.
+    /// `None` when the policy is off, so the check is this function's and not
+    /// every call site's.
+    pub fn get_stale(
+        &self,
+        name: NameRef<'_>,
+        qtype: Qtype,
+    ) -> Option<(Vec<ResourceRecord>, bool)> {
+        if !self.stale.is_on() {
+            return None;
+        }
+        let now = current_unix_timestamp();
+        let cache = self.cache.lock().ok()?;
+        let folded = name.folded();
+        let key: &dyn NameType = &(folded.as_ref(), qtype);
+        let entry = cache
+            .get(key)
+            .filter(|entry| entry.is_expired(now) && self.stale.keeps(entry.expires_at, now))?;
+        let records = entry
+            .records
+            .iter()
+            .map(|rr| ResourceRecord {
+                ttl: crate::Ttl::from_secs(STALE_ANSWER_TTL),
+                ..rr.clone()
+            })
+            .collect();
+        Some((records, entry.secure))
     }
 
     /// Put records in cache with TTL, unvalidated.
@@ -175,7 +282,10 @@ impl DnsCache {
     fn evict_oldest(&self, cache: &mut HashMap<NameTypeKey, CacheEntry>) {
         let now = current_unix_timestamp();
 
-        cache.retain(|_, entry| !entry.is_expired(now));
+        // Usable, not fresh: with serve-stale on, an expired entry is still the
+        // last thing known and dropping it here would make the window a lie
+        // under any load that fills the cache.
+        cache.retain(|_, entry| self.stale.keeps(entry.expires_at, now));
 
         let expiries = cache.values().map(|entry| entry.expires_at).collect();
         let Some(mut plan) = Halving::plan(expiries, self.max_entries / 2) else {
@@ -441,6 +551,109 @@ mod tests {
                 .is_none(),
             "a different owner name must not share the entry"
         );
+    }
+
+    /// The window is one piece of arithmetic and both caches read it, so its
+    /// two edges are asserted here rather than in a test that has to wait.
+    #[test]
+    fn the_stale_window_ends_exactly_where_it_says() {
+        let policy = StalePolicy::seconds(3600);
+        assert!(
+            policy.keeps(1_000, 1_000),
+            "expired this second, still usable"
+        );
+        assert!(policy.keeps(1_000, 1_000 + 3599));
+        assert!(
+            !policy.keeps(1_000, 1_000 + 3600),
+            "a window of an hour ends an hour after the TTL did"
+        );
+        assert!(
+            !StalePolicy::OFF.keeps(1_000, 1_000),
+            "with the policy off, usable and unexpired are the same thing"
+        );
+        // A window past the end of time must not wrap into the past.
+        assert!(StalePolicy::seconds(u64::MAX).keeps(1_000, u64::MAX - 1));
+    }
+
+    /// RFC 8767 §4: an expired answer is not an answer — the resolver tries the
+    /// authoritative servers first — so `get` must still miss. It is `get_stale`
+    /// that hands it over, and only to a caller that has already failed.
+    #[test]
+    fn an_expired_entry_is_a_miss_and_a_stale_hit() {
+        let cache = DnsCache::with_stale(16, StalePolicy::seconds(3600));
+        // TTL zero: expired the instant it is stored, with no clock to move.
+        cache.put(
+            nm("example.com.").as_ref(),
+            Qtype::of(rt::A),
+            vec![create_test_record("example.com.", Ttl::from_secs(0))],
+        );
+        assert!(
+            cache
+                .get(nm("example.com.").as_ref(), Qtype::of(rt::A))
+                .is_none(),
+            "an expired entry is not an answer"
+        );
+        let (records, secure) = cache
+            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A))
+            .expect("but it is still the last thing known");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].ttl.as_secs(),
+            STALE_ANSWER_TTL,
+            "the TTL a stale answer carries is chosen, not counted down (§4)"
+        );
+        assert!(!secure, "and AD is what validation concluded, unchanged");
+    }
+
+    /// With the policy off nothing is stale, and the expired entry is dropped on
+    /// the lookup that found it — which is what the cache did before RFC 8767
+    /// and must still do.
+    #[test]
+    fn with_the_policy_off_an_expired_entry_is_dropped_on_lookup() {
+        let cache = DnsCache::with_defaults();
+        cache.put(
+            nm("example.com.").as_ref(),
+            Qtype::of(rt::A),
+            vec![create_test_record("example.com.", Ttl::from_secs(0))],
+        );
+        assert_eq!(cache.get_stats().total_entries, 1);
+        assert!(cache
+            .get(nm("example.com.").as_ref(), Qtype::of(rt::A))
+            .is_none());
+        assert_eq!(
+            cache.get_stats().total_entries,
+            0,
+            "nothing will ask for it again"
+        );
+        assert!(cache
+            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A))
+            .is_none());
+    }
+
+    /// The lookup keeps it, and so must eviction: a window the cache empties
+    /// under load is a window only a quiet resolver has.
+    ///
+    /// Eleven entries into a cache of ten, all of them expired and all inside
+    /// the window, so the one insert that triggers eviction has to halve rather
+    /// than sweep. Watched failing against `retain(|_, e| !e.is_expired(now))`:
+    /// **1** entry survived, being the one that arrived after the sweep.
+    #[test]
+    fn eviction_keeps_what_is_still_inside_the_stale_window() {
+        let cache = DnsCache::with_stale(10, StalePolicy::seconds(3600));
+        for i in 0..11 {
+            let name = format!("example{i}.com.");
+            cache.put(
+                nm(&name).as_ref(),
+                Qtype::of(rt::A),
+                vec![create_test_record(&name, Ttl::from_secs(0))],
+            );
+        }
+        let held = cache.get_stats().total_entries;
+        assert!(
+            held >= 5,
+            "halved to five and one more inserted, not swept: {held} survived"
+        );
+        assert!(held <= 10, "still bounded, got {held}");
     }
 
     #[test]

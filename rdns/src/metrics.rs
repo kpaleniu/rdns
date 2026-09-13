@@ -142,6 +142,14 @@ pub struct Counters {
     pub policy_rewrites: AtomicU64,
     pub policy_drops: AtomicU64,
 
+    /// Answers served from expired cache because a refresh failed (RFC 8767).
+    ///
+    /// The number an operator watches during somebody else's outage, and the
+    /// one that says whether `--serve-stale` is doing anything at all: a
+    /// resolver that never serves stale and one that has it turned off look
+    /// identical from outside.
+    pub stale_answers: AtomicU64,
+
     /// dnstap payloads queued for the collector, and those the queue had no
     /// room for.
     ///
@@ -203,6 +211,7 @@ impl DnsMetrics {
             tls_handshake_failures: AtomicU64::new(0),
             quic_handshakes: AtomicU64::new(0),
             quic_handshake_failures: AtomicU64::new(0),
+            stale_answers: AtomicU64::new(0),
             policy_rewrites: AtomicU64::new(0),
             policy_drops: AtomicU64::new(0),
             dnstap_frames: AtomicU64::new(0),
@@ -427,6 +436,13 @@ impl DnsMetrics {
         output.push_str(&format!(
             "dns_responses_noerror_total {}\n",
             self.responses_noerror.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("# HELP dns_stale_answers_total Answers served from expired cache\n");
+        output.push_str("# TYPE dns_stale_answers_total counter\n");
+        output.push_str(&format!(
+            "dns_stale_answers_total {}\n",
+            self.stale_answers.load(Ordering::Relaxed)
         ));
 
         output.push_str(

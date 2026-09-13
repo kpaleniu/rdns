@@ -15,6 +15,7 @@ use rdns::validation::AdmissionCheck;
 use rdns::{DnsMessage, OpCode, Qtype, QuerySection, ResponseCode};
 use rdns_transport::ServeContext;
 
+use rdns::cache::StalePolicy;
 use rdns::rpz::PolicyZones;
 
 use crate::answer::{Caches, Resolving};
@@ -68,7 +69,7 @@ pub(crate) fn serving(
 ) -> Arc<Resolving> {
     Arc::new(Resolving {
         resolver,
-        caches: Caches::new(16, 4),
+        caches: Caches::new(16, 4, StalePolicy::OFF),
         policy,
         ctx,
     })

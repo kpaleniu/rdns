@@ -38,9 +38,9 @@ every *measurement* and every caveat needed to trust one; those say
 ## What is open
 
 **#45**, **#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56**,
-**#57** and **#21**, as of 2026-09-13. **#44 is closed in full.**
-~~**None of them is a live defect**~~ — **that claim was wrong about #47**, which closed the same day
-carrying two MUSTs it had been filed as not breaking: RFC 6891 §6.1.1's OPT in a
+**#57**, **#58** and **#21**, as of 2026-09-13. **#44 is closed in full.**
+~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
+which closed the same day carrying two MUSTs it had been filed as not breaking: RFC 6891 §6.1.1's OPT in a
 response to a request that had one, and RFC 3225 §3's DO bit, dropped on the
 first envelope of every AXFR. It was filed as "not a defect" because its own row
 read §6.1.1 as "asks for", and the section says what the difference cost. Of what
@@ -48,8 +48,8 @@ is left, #50 was the live one, and closing it is what added #53: a zone this
 server signed itself is verified again at every load, which 76 seconds of a
 million-record zone made visible. #45 is what an ISP would find missing in
 `rdnsr`; #48 and #49 are what 44a left, #51 what 44d left, #54 what 44g left and
-#55 what 44f left, and #56 and #57 what 45a left; and #21 is an inventory of
-deliberate deviations rather than a queue. Everything else numbered is closed;
+#55 what 44f left, #56 and #57 what 45a left and #58 what 45b left; and #21 is
+an inventory of deliberate deviations rather than a queue. Everything else numbered is closed;
 the table under "Closed work" says which, when, and where the reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
@@ -823,8 +823,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#45**, **#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56** and
-**#57**, plus **#21** — see "What is open" above,
+**#45**, **#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56**,
+**#57** and **#58**, plus **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -884,7 +884,7 @@ Then, in order and for stated reasons:
 needs, and 45a (RPZ) is a legal gate rather than a nice-to-have for anyone with
 blocking obligations. 45e is a decision to take rather than work to schedule.
 **45a done 2026-09-13**, and it went first for the reason the row gave. It left
-#56 and #57.
+#56 and #57. **45b done the same day**; it left #58.
 
 ~~The certificate story in 42a is still the part with no decision behind it.~~
 **Decided 2026-09-12**, and the decision was partly to decline: a renewal is a
@@ -953,7 +953,7 @@ from #44's. Same filing rule: every "0 hits" is a `grep` taken on the day.
 | | | |
 |---|---|---|
 | **45a** | Response Policy Zones — ~~**0 hits**~~ **done 2026-09-13**, `rdns/src/rpz.rs` and `rdnsr --rpz` | Not an RFC — an ISC-originated specification, like `$GENERATE` — and implemented by BIND, Knot Resolver, Unbound and PowerDNS. It is how blocking is delivered: court-ordered injunctions, police lists, malware feeds. For an ISP under a blocking obligation this is not a missing feature but a legal non-starter, so it sits above everything else here. The pleasing part is the delivery mechanism: an RPZ *is* a DNS zone, so the AXFR/IXFR/NOTIFY machinery that already exists is how the policy would arrive. **That half held and was not the work**: the lookup is `Zone::locate` on a trigger name built as QNAME + origin, so RFC 1034 §4.3.3's wildcard rule is the RPZ wildcard rule with nothing written twice. What the row did not see is that the *delivery* is still a file: transferring a policy zone needs the secondary machinery, which lives in `rdnsd` and has no home in `rdnsr` — filed as **#57**. Three of the five trigger types are enforced; NSDNAME and NSIP are **#56** |
-| **45b** | serve-stale (RFC 8767, "Serving Stale Data to Improve DNS Resiliency") — **0 hits** | Answer from expired cache when the authoritative servers cannot be reached, rather than SERVFAIL. It is what keeps a resolver useful through somebody else's outage, and the resilience feature a subscriber is most likely to notice the absence of |
+| **45b** | serve-stale (RFC 8767, "Serving Stale Data to Improve DNS Resiliency") — ~~**0 hits**~~ **done 2026-09-13**, `rdnsr --serve-stale SECONDS` | Answer from expired cache when the authoritative servers cannot be reached, rather than SERVFAIL. It is what keeps a resolver useful through somebody else's outage, and the resilience feature a subscriber is most likely to notice the absence of. Both caches hold an expired entry for the window and hand it over only to a caller whose refresh has already failed (§4); the answer carries a 30-second TTL (§4), RFC 8914 §4.4's code, and a counter. Off by default, because §6 is explicit that a withdrawn name stays alive for the whole window. **What the row did not name is the half that makes it felt on a *slow* upstream rather than a dead one** — §4's client response timer, which answers stale at 1.8 s while the resolution keeps running — and that is **#58** |
 | **45c** | DNS64 (RFC 6147) — **0 hits** | Synthesize AAAA from A for IPv6-only clients behind NAT64. Required in an IPv6-only mobile network, which is most of them |
 | **45d** | prefetching — **0 hits** | Re-resolve a popular name before its TTL expires, so the hit rate has no hole at every expiry. Unbound's `prefetch`, and the cheapest of the rows here |
 | **45e** | EDNS Client Subnet (RFC 7871) — the option code exists and nothing reads or writes it | `EDNS_OPTION_CLIENT_SUBNET` is defined in `edns.rs` and appears at exactly one other place: its own doc comment. Forwarding it is what lets an authoritative server steer a client to a near replica, and *not* forwarding it is a defensible privacy position — RFC 7871 §2 is unusually explicit about the cost. So this row is a **decision to take**, not work to schedule, and it is the only one on this page whose right answer might be "no, and write down why" |
@@ -1035,6 +1035,45 @@ Three things to settle, in this order:
   thousands of names; the RPZ feeds that are millions are the commercial malware
   ones. `rdns::ixfr` exists either way, so this is a question about the timer
   and not about the format.
+
+---
+
+### 58. serve-stale answers a dead upstream and not a slow one — **filed 2026-09-13**
+
+Left behind by 45b. RFC 8767 §4 has two timers and this tree implements one.
+
+The **query resolution timer** is the one in place: resolve, and if that fails,
+answer from the stale window. It covers an upstream that is down, refusing, or
+unreachable — which is the outage the 45b row was about.
+
+The **client response timer** is the other, recommended 1.8 seconds: answer from
+the stale window *while the resolution is still running*, and let it finish into
+the cache for the next client. It covers the case a subscriber actually notices
+more often — an authoritative server that is slow rather than dead, where this
+resolver's own `timeout_ms` of 5 seconds is longer than a browser waits.
+
+Why it was not done with the rest: it is not a cache change, it is a lifetime
+change. `handle_query` borrows `&Resolving`, and answering early means the
+resolution has to outlive the request that started it — a task, holding an
+`Arc<Resolving>` and a `Busy` from `rdns::shutdown` so the drain waits for it
+(`CLAUDE.md` §9: dropping a `JoinHandle` detaches, it does not cancel). That
+means `handle_query` takes `&Arc<Resolving>`, and the two socket loops have to
+agree about who owns the guard.
+
+Three things to settle, and the first is a measurement:
+
+- **How often would it fire?** A resolution that takes over 1.8 s and then
+  succeeds is the only case this helps. `LatencyTimer` already feeds the latency
+  histogram, whose buckets stop at 50 ms — so the number is not currently
+  measurable and the first step is a bucket that reaches seconds. Filing the
+  feature before that number is the mistake §19 is about.
+- **What stops a flood of detached resolutions?** The in-flight semaphore bounds
+  tasks *per datagram*; a resolution that outlives its datagram is outside that
+  bound. It needs one of its own, or the permit has to be handed to the task.
+- **Does the early answer suppress the second client's?** Two clients asking the
+  same slow name should not start two resolutions. That is a de-duplicating
+  in-flight table, which this resolver does not have and which is worth more
+  than the timer on its own.
 
 ---
 

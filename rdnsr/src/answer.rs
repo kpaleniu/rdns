@@ -9,6 +9,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use rdns::cache::StalePolicy;
 use rdns::dnssec::Bogus;
 use rdns::dnssec_chain::ValidationState;
 use rdns::ede::InfoCode;
@@ -51,11 +52,16 @@ impl Caches {
     /// no-op), which is what `--no-cache` means. `denial_zones` is separately 0
     /// without validation: aggressive use rests on the proofs having been
     /// checked.
-    pub(crate) fn new(capacity: usize, denial_zones: usize) -> Caches {
+    ///
+    /// `stale` reaches the first two and not `denials`: a denial is served
+    /// because its signature proves it, and an expired proof proves nothing —
+    /// RFC 8198 §5 rests on the validity period the signer chose, which
+    /// RFC 8767 has no standing to extend.
+    pub(crate) fn new(capacity: usize, denial_zones: usize, stale: StalePolicy) -> Caches {
         Caches {
-            answers: DnsCache::new(capacity),
+            answers: DnsCache::with_stale(capacity, stale),
             // Negative answers are answers: `--no-cache` means no cache.
-            negatives: NegativeCache::new(capacity),
+            negatives: NegativeCache::with_stale(capacity, stale),
             denials: NsecCache::new(denial_zones),
         }
     }
@@ -353,11 +359,18 @@ pub(crate) async fn handle_query(
                     "resolve failed: {:#}",
                     e
                 );
-                (
-                    build_response(&msg, Vec::new(), ResponseCode::ServerFailure),
-                    false,
-                    Some(e.extended_error()),
-                )
+                // Only here, and only now: RFC 8767 §4 has the resolver try
+                // the authoritative servers and serve what it last knew when
+                // that does not work. Everything above answered from something
+                // still valid, so this is the one place stale data is right.
+                match stale_answer(&msg, caches, &query, ctx) {
+                    Some(stale) => stale,
+                    None => (
+                        build_response(&msg, Vec::new(), ResponseCode::ServerFailure),
+                        false,
+                        Some(e.extended_error()),
+                    ),
+                }
             }
         }
     };
@@ -379,6 +392,63 @@ pub(crate) async fn handle_query(
     }
 
     finish(resp, secure, why, &client, &query, ctx, timer)
+}
+
+/// The last thing this resolver knew about `query`, for a resolution that has
+/// just failed (RFC 8767).
+///
+/// Returns what the answer path's own arms return — the response, whether it is
+/// authenticated, and the reason to put in the OPT — so the caller has nothing
+/// to assemble. `None` when serve-stale is off or nothing usable is held, which
+/// is SERVFAIL as before.
+///
+/// AD survives: `secure` is what validation concluded when the answer was
+/// stored, and an expired signature is a validity period rather than a
+/// verdict. RFC 8767 §6 notes that a validating stub may reject the answer for
+/// exactly that reason, which is its right and not ours to pre-empt.
+fn stale_answer(
+    request: &DnsMessage,
+    caches: &Caches,
+    query: &QuerySection,
+    ctx: &ServeContext,
+) -> Option<(DnsMessage, bool, Option<ExtendedError>)> {
+    const WHY_POSITIVE: ExtendedError = ExtendedError::new(
+        InfoCode::STALE_ANSWER,
+        "the authoritative servers could not be reached",
+    );
+    const WHY_NEGATIVE: ExtendedError = ExtendedError::new(
+        InfoCode::STALE_NXDOMAIN,
+        "the authoritative servers could not be reached",
+    );
+
+    // A "yes" before a "no": both may be held for one name, and the answer is
+    // the more specific thing known about it.
+    if let Some((records, secure)) = caches.answers.get_stale(query.qname.as_ref(), query.qtype) {
+        ctx.metrics.count(&ctx.metrics.stale_answers);
+        // INFO: serving data known to be out of date is a decision the operator
+        // turned on, and the line beside the counter is how the decision is
+        // seen taking effect.
+        tracing::info!(qname = %query.qname, qtype = %query.qtype, "answered from expired cache");
+        return Some((
+            build_response(request, records, ResponseCode::Ok),
+            secure,
+            Some(WHY_POSITIVE),
+        ));
+    }
+
+    let negative = caches
+        .negatives
+        .get_stale(query.qname.as_ref(), query.qtype)?;
+    ctx.metrics.count(&ctx.metrics.stale_answers);
+    tracing::info!(qname = %query.qname, qtype = %query.qtype, "answered from expired cache");
+    let mut resp = build_response(request, Vec::new(), negative.rcode);
+    resp.authorities = negative.authority;
+    let why = if negative.rcode == ResponseCode::NoSuchDomain {
+        WHY_NEGATIVE
+    } else {
+        WHY_POSITIVE
+    };
+    Some((resp, negative.secure, Some(why)))
 }
 
 /// What a policy match did, since one of the six actions is to do nothing.
@@ -807,6 +877,143 @@ mod tests {
         let n = msg.to_bytes(&mut buf).expect("serialize");
         buf.truncate(n);
         buf
+    }
+
+    /// The handle every test here takes, with a serve-stale window on it.
+    fn serving_stale(seconds: u64) -> Arc<Resolving> {
+        Arc::new(Resolving {
+            resolver: test_resolver(),
+            caches: Caches::new(16, 4, StalePolicy::seconds(seconds)),
+            policy: PolicyZones::default(),
+            ctx: test_shell(),
+        })
+    }
+
+    fn expired_a_record(name: &rdns::Name) -> ResourceRecord {
+        ResourceRecord {
+            name: name.clone(),
+            class: rdns::Class::new(1),
+            // Zero: expired the instant it is stored, with no clock to move.
+            ttl: rdns::Ttl::from_secs(0),
+            rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(std::net::Ipv4Addr::new(
+                192, 0, 2, 10,
+            )))
+            .expect("encodes"),
+        }
+    }
+
+    /// RFC 8767, the whole point: the authoritative servers cannot be reached —
+    /// the fixture forwards to a port nothing listens on — so the last thing
+    /// known goes out instead of SERVFAIL, with the 30-second TTL §4 asks for
+    /// and RFC 8914 §4.4's code saying what happened.
+    ///
+    /// Watched failing with `--serve-stale` off: SERVFAIL, no answers.
+    #[tokio::test]
+    async fn an_expired_answer_is_served_when_the_resolution_fails() {
+        let serving = serving_stale(3600);
+        let name = nm("example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![expired_a_record(&name)],
+        );
+
+        let query = rdns::DnsMessageBuilder::new()
+            .with_id(9)
+            .with_query(name.clone(), Qtype::of(record_types::A))
+            .with_recursion(true)
+            .with_edns(1232, false)
+            .build()
+            .to_bytes_within(4096)
+            .expect("serialize");
+        let bytes = handle_query(
+            query,
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].ttl.as_secs(), 30, "RFC 8767 §4");
+        let edns = reply.edns.as_ref().expect("the OPT is mirrored");
+        let errors = ExtendedError::all_in(edns).expect("a well-formed option list");
+        assert_eq!(
+            errors.iter().map(|(code, _)| *code).collect::<Vec<_>>(),
+            vec![InfoCode::STALE_ANSWER]
+        );
+        assert_eq!(
+            serving
+                .ctx
+                .metrics
+                .stale_answers
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// Off is the default, and off means the answer is the failure.
+    #[tokio::test]
+    async fn without_the_flag_a_failed_resolution_is_servfail() {
+        let serving = context();
+        let name = nm("example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![expired_a_record(&name)],
+        );
+        let bytes = handle_query(
+            query_for("example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::ServerFailure);
+        assert!(reply.answers.is_empty());
+    }
+
+    /// A fresh entry is answered from the cache and never reaches the stale
+    /// path: RFC 8767 §4 has the resolver try the authoritative servers first,
+    /// so an answer that is still an answer must not be counted as stale.
+    #[tokio::test]
+    async fn a_live_entry_is_not_a_stale_answer() {
+        let serving = serving_stale(3600);
+        let name = nm("example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![ResourceRecord {
+                ttl: rdns::Ttl::from_secs(300),
+                ..expired_a_record(&name)
+            }],
+        );
+        let bytes = handle_query(
+            query_for("example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.answers[0].ttl.as_secs(), 300, "its own TTL, not 30");
+        assert_eq!(
+            serving
+                .ctx
+                .metrics
+                .stale_answers
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     /// A policy zone with one rule of each kind this test needs, built in

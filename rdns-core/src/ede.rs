@@ -48,6 +48,9 @@ impl InfoCode {
     /// 0, Other Error: "the error in question falls into a category that does
     /// not match known extended error codes".
     pub const OTHER: InfoCode = InfoCode(0);
+    /// 3, Stale Answer: "the resolver was unable to resolve the answer within
+    /// its time limits and decided to answer with stale data" (RFC 8767).
+    pub const STALE_ANSWER: InfoCode = InfoCode(3);
     /// 6, DNSSEC Bogus: "validation ended in the Bogus state".
     pub const DNSSEC_BOGUS: InfoCode = InfoCode(6);
     /// 7, Signature Expired: "no signatures are presently valid and some
@@ -76,6 +79,9 @@ impl InfoCode {
     /// receives a query from an 'unauthorized' client can annotate its REFUSED
     /// message with this code".
     pub const PROHIBITED: InfoCode = InfoCode(18);
+    /// 19, Stale NXDOMAIN Answer: the same for a cached "no", which is a
+    /// different claim and so a different code.
+    pub const STALE_NXDOMAIN: InfoCode = InfoCode(19);
     /// 20, Not Authoritative: an authoritative server refusing a name it holds
     /// no zone for.
     pub const NOT_AUTHORITATIVE: InfoCode = InfoCode(20);

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use clap::Parser;
+use rdns::cache::StalePolicy;
 use rdns::clock::current_unix_timestamp;
 use rdns::dnssec_chain::TrustAnchors;
 use rdns::logging::{watch_anomalies, AnomalyThresholds, LogLevel, QueryLogger};
@@ -283,6 +284,22 @@ struct Cli {
     /// Not naming one is the off switch, and costs nothing per query.
     #[arg(long, value_name = "PATH")]
     rpz: Vec<PathBuf>,
+    /// Serve an expired answer for this many seconds past its TTL when the
+    /// authoritative servers cannot be reached (RFC 8767). 0 turns it off, and
+    /// off is the default.
+    ///
+    /// One number rather than a switch and a ceiling: the window *is* the
+    /// feature, and a switch that needs a second flag to mean anything is two
+    /// ways to get one policy wrong. RFC 8767 §4 recommends between one and
+    /// three days — long enough to cover an outage nobody is awake for, short
+    /// enough that a name really withdrawn stops being answered.
+    ///
+    /// Off by default because this answers with data known to be out of date:
+    /// §6 is explicit that a withdrawn name stays alive for the whole window.
+    /// The stale answer carries a 30-second TTL (§4), says so with an Extended
+    /// DNS Error (RFC 8914 §4.4), and is counted.
+    #[arg(long, value_name = "SECONDS", default_value = "0")]
+    serve_stale: u64,
     /// What a policy zone's rules mean, when it should not be taken at its
     /// word: given, disabled, passthru, drop, nxdomain, nodata or tcp-only.
     ///
@@ -422,14 +439,18 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // What the two flags mean for each cache is `Caches::new`'s to say.
+    // What the flags mean for each cache is `Caches::new`'s to say.
     let capacity = if cli.no_cache { 0 } else { cli.cache_size };
     let denial_zones = if cli.no_cache || !cli.dnssec_validate {
         0
     } else {
         NSEC_CACHE_ZONES
     };
-    let caches = Caches::new(capacity, denial_zones);
+    let caches = Caches::new(
+        capacity,
+        denial_zones,
+        StalePolicy::seconds(cli.serve_stale),
+    );
 
     // Before anything binds, like the certificate and the metrics listener: a
     // policy file that will not parse is a block that is not in force, and
@@ -523,8 +544,15 @@ async fn main() -> anyhow::Result<()> {
         source,
         if capacity == 0 {
             "disabled".to_string()
-        } else {
+        } else if cli.serve_stale == 0 {
             format!("{capacity} entries")
+        } else {
+            // Printed because an answer known to be out of date is a decision,
+            // and because a window measured in days is easy to mistype.
+            format!(
+                "{capacity} entries, serving stale for up to {}s past the TTL",
+                cli.serve_stale
+            )
         },
         dnssec_source,
         udp.max_response(),

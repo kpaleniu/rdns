@@ -17,7 +17,11 @@
 //!   NODATA denies exactly one type.
 //! - Nothing bogus is stored, and whether an answer validated is stored with it,
 //!   so the AD bit a second client sees is the one the first client saw.
+//! - **A "no" goes stale like a "yes"** (RFC 8767): past its TTL it stops being
+//!   an answer and stays usable for [`crate::cache::StalePolicy`]'s window, so
+//!   an outage does not turn a cached NXDOMAIN into a SERVFAIL.
 
+use crate::cache::{StalePolicy, STALE_ANSWER_TTL};
 use crate::clock::current_unix_timestamp;
 use crate::eviction::Halving;
 use crate::name_keys::{NameKeyBuf, NameType, NameTypeKey};
@@ -62,6 +66,12 @@ impl Entry {
         self.expires_at > now
     }
 
+    /// Expired, but inside the stale window: an answer only for a caller that
+    /// has already failed to refresh it (RFC 8767 §4).
+    fn stale(&self, now: u64, policy: StalePolicy) -> bool {
+        !self.live(now) && policy.keeps(self.expires_at, now)
+    }
+
     fn remaining(&self, now: u64) -> u32 {
         self.expires_at.saturating_sub(now).min(u32::MAX as u64) as u32
     }
@@ -92,6 +102,7 @@ pub struct NegativeCache {
     /// Entries held across both kinds. Zero disables the cache entirely — the
     /// same idiom `--no-cache` uses for the answer cache.
     max_entries: usize,
+    stale: StalePolicy,
 }
 
 impl NegativeCache {
@@ -99,6 +110,15 @@ impl NegativeCache {
         NegativeCache {
             entries: Mutex::new(Entries::default()),
             max_entries,
+            stale: StalePolicy::OFF,
+        }
+    }
+
+    /// The same, holding expired entries for [`StalePolicy`]'s window.
+    pub fn with_stale(max_entries: usize, stale: StalePolicy) -> Self {
+        NegativeCache {
+            stale,
+            ..NegativeCache::new(max_entries)
         }
     }
 
@@ -155,13 +175,13 @@ impl NegativeCache {
             if !entries.nxdomain.contains_key(qname.folded().as_ref())
                 && entries.len() >= self.max_entries
             {
-                make_room(&mut entries, self.max_entries, now);
+                make_room(&mut entries, self.max_entries, now, self.stale);
             }
             entries.nxdomain.insert(name, entry);
         } else {
             let key = NameTypeKey::new(qname, qtype);
             if !entries.nodata.contains_key(&key) && entries.len() >= self.max_entries {
-                make_room(&mut entries, self.max_entries, now);
+                make_room(&mut entries, self.max_entries, now, self.stale);
             }
             entries.nodata.insert(key, entry);
         }
@@ -205,6 +225,44 @@ impl NegativeCache {
             .map(|entry| entry.answer(now))
     }
 
+    /// The cached "no" that has expired but is still inside the stale window
+    /// (RFC 8767), with [`STALE_ANSWER_TTL`] on it.
+    ///
+    /// The same walk [`NegativeCache::get`] does and the same rule about who may
+    /// ask: only a caller whose attempt to refresh has already failed. `None`
+    /// when the policy is off.
+    pub fn get_stale(&self, qname: NameRef<'_>, qtype: Qtype) -> Option<NegativeAnswer> {
+        if self.max_entries == 0 || !self.stale.is_on() {
+            return None;
+        }
+        let now = current_unix_timestamp();
+        let mut fold_buf = Vec::new();
+        let name = qname.folded_in(&mut fold_buf);
+        let entries = self.entries.lock().ok()?;
+
+        let mut ancestor = name;
+        loop {
+            if let Some(entry) = entries
+                .nxdomain
+                .get(ancestor.as_wire())
+                .filter(|e| e.stale(now, self.stale))
+            {
+                return Some(entry.stale_answer());
+            }
+            match ancestor.parent() {
+                Some(up) => ancestor = up,
+                None => break,
+            }
+        }
+
+        let key: &dyn NameType = &(name.as_wire(), qtype);
+        entries
+            .nodata
+            .get(key)
+            .filter(|e| e.stale(now, self.stale))
+            .map(|entry| entry.stale_answer())
+    }
+
     /// How many negative answers are held. For tests and diagnostics.
     pub fn len(&self) -> usize {
         self.entries.lock().map(|e| e.len()).unwrap_or(0)
@@ -226,7 +284,16 @@ impl Entry {
     /// This entry as an answer, TTLs counted down. Handing back the original
     /// would let each cache in a chain restart the clock.
     fn answer(&self, now: u64) -> NegativeAnswer {
-        let ttl = self.remaining(now);
+        self.with_ttl(self.remaining(now))
+    }
+
+    /// The same, with the TTL a stale answer carries: there is none left to
+    /// count down (RFC 8767 §4).
+    fn stale_answer(&self) -> NegativeAnswer {
+        self.with_ttl(STALE_ANSWER_TTL)
+    }
+
+    fn with_ttl(&self, ttl: u32) -> NegativeAnswer {
         NegativeAnswer {
             rcode: self.rcode,
             authority: self
@@ -251,10 +318,15 @@ impl Entry {
 /// 14.6 µs at `max_entries` 10 000, with the lock every lookup needs held for
 /// it. See [`crate::eviction`]; the bound spans both maps, so one plan drives
 /// both `retain`s.
-fn make_room(entries: &mut Entries, max_entries: usize, now: u64) {
+fn make_room(entries: &mut Entries, max_entries: usize, now: u64, stale: StalePolicy) {
     let before = entries.len();
-    entries.nxdomain.retain(|_, e| e.live(now));
-    entries.nodata.retain(|_, e| e.live(now));
+    // Usable, not live: with serve-stale on, an expired "no" is still the last
+    // thing known, and dropping it here would make the window a lie under any
+    // load that fills the cache.
+    entries
+        .nxdomain
+        .retain(|_, e| stale.keeps(e.expires_at, now));
+    entries.nodata.retain(|_, e| stale.keeps(e.expires_at, now));
     if entries.len() < before {
         return;
     }
@@ -279,6 +351,108 @@ mod tests {
     use crate::test_records::nm;
     use crate::test_records::soa_record;
     use crate::{Class, OpCode, QueryClass, QuerySection, RecordData};
+
+    /// A cached "no" goes stale like a "yes" (RFC 8767): past its TTL it stops
+    /// being an answer and stays usable until the window closes.
+    ///
+    /// The entry is built rather than inserted through `insert`, which refuses a
+    /// negative TTL of zero (RFC 2308 §5 takes it from the SOA, and zero means
+    /// "do not cache") — so there is no way to store an already-expired one
+    /// through the door, and a test that waits a second measures the clock.
+    fn expired_entry(rcode: ResponseCode) -> Entry {
+        Entry {
+            rcode,
+            authority: vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
+            secure: false,
+            expires_at: current_unix_timestamp(),
+        }
+    }
+
+    #[test]
+    fn an_expired_nxdomain_is_a_miss_and_a_stale_hit() {
+        let cache = NegativeCache::with_stale(16, StalePolicy::seconds(3600));
+        cache.entries.lock().unwrap().nxdomain.insert(
+            NameKeyBuf::new(nm("gone.example.com.").as_ref()),
+            expired_entry(ResponseCode::NoSuchDomain),
+        );
+
+        assert!(
+            cache
+                .get(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+                .is_none(),
+            "expired is not an answer"
+        );
+        let stale = cache
+            .get_stale(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+            .expect("but it is the last thing known");
+        assert_eq!(stale.rcode, ResponseCode::NoSuchDomain);
+        assert_eq!(stale.ttl, STALE_ANSWER_TTL);
+        assert_eq!(stale.authority[0].ttl.as_secs(), STALE_ANSWER_TTL);
+
+        // RFC 8020: the denial still covers everything below the name.
+        assert!(cache
+            .get_stale(nm("a.b.gone.example.com.").as_ref(), Qtype::of(rt::A))
+            .is_some());
+    }
+
+    #[test]
+    fn an_expired_nodata_is_a_stale_hit_for_its_type_alone() {
+        let cache = NegativeCache::with_stale(16, StalePolicy::seconds(3600));
+        cache.entries.lock().unwrap().nodata.insert(
+            NameTypeKey::new(nm("example.com.").as_ref(), Qtype::of(rt::AAAA)),
+            expired_entry(ResponseCode::Ok),
+        );
+        assert!(cache
+            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::AAAA))
+            .is_some());
+        assert!(
+            cache
+                .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A))
+                .is_none(),
+            "a NODATA denies one type"
+        );
+    }
+
+    /// Eviction keeps what the window keeps, the way the answer cache's does:
+    /// otherwise the window is one only a quiet resolver has.
+    ///
+    /// Eleven entries into a cache of ten, all expired and all inside the
+    /// window, so the insert that triggers `make_room` has to halve rather than
+    /// sweep. Watched failing against `retain(|_, e| e.live(now))`: **1**
+    /// survived, being the one inserted after the sweep.
+    #[test]
+    fn eviction_keeps_what_is_still_inside_the_stale_window() {
+        let cache = NegativeCache::with_stale(10, StalePolicy::seconds(3600));
+        for i in 0..11 {
+            let name = format!("gone{i}.example.com.");
+            let mut entries = cache.entries.lock().unwrap();
+            if entries.len() >= 10 {
+                make_room(&mut entries, 10, current_unix_timestamp(), cache.stale);
+            }
+            entries.nxdomain.insert(
+                NameKeyBuf::new(nm(&name).as_ref()),
+                expired_entry(ResponseCode::NoSuchDomain),
+            );
+        }
+        let held = cache.len();
+        assert!(
+            held >= 5,
+            "halved to five and one more inserted, not swept: {held} survived"
+        );
+        assert!(held <= 10, "still bounded, got {held}");
+    }
+
+    #[test]
+    fn with_the_policy_off_nothing_is_stale() {
+        let cache = NegativeCache::new(16);
+        cache.entries.lock().unwrap().nxdomain.insert(
+            NameKeyBuf::new(nm("gone.example.com.").as_ref()),
+            expired_entry(ResponseCode::NoSuchDomain),
+        );
+        assert!(cache
+            .get_stale(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+            .is_none());
+    }
 
     /// A negative response as a server would send it.
     fn negative(qname: &str, rcode: ResponseCode, authority: Vec<ResourceRecord>) -> DnsMessage {
