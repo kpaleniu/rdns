@@ -37,20 +37,21 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#45**, **#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56**,
-**#57**, **#58** and **#21**, as of 2026-09-13. **#44 is closed in full.**
+**#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56**, **#57**,
+**#58** and **#21**, as of 2026-09-13. **#44 and #45 are both closed in full.**
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
-which closed the same day carrying two MUSTs it had been filed as not breaking: RFC 6891 §6.1.1's OPT in a
-response to a request that had one, and RFC 3225 §3's DO bit, dropped on the
-first envelope of every AXFR. It was filed as "not a defect" because its own row
-read §6.1.1 as "asks for", and the section says what the difference cost. Of what
-is left, #50 was the live one, and closing it is what added #53: a zone this
-server signed itself is verified again at every load, which 76 seconds of a
-million-record zone made visible. #45 is what an ISP would find missing in
-`rdnsr`; #48 and #49 are what 44a left, #51 what 44d left, #54 what 44g left and
-#55 what 44f left, #56 and #57 what 45a left and #58 what 45b left; and #21 is
-an inventory of deliberate deviations rather than a queue. Everything else numbered is closed;
-the table under "Closed work" says which, when, and where the reasoning went.
+which closed the same day carrying two MUSTs it had been filed as not
+breaking: RFC 6891 §6.1.1's OPT in a response to a request that had one, and
+RFC 3225 §3's DO bit, dropped on the first envelope of every AXFR. It was filed
+as "not a defect" because its own row read §6.1.1 as "asks for", and the section
+says what the difference cost. Of what is left, #50 was the live one, and
+closing it is what added #53: a zone this server signed itself is verified
+again at every load, which 76 seconds of a
+million-record zone made visible. #48 and #49 are what 44a left, #51 what 44d
+left, #54 what 44g left, #55 what 44f left, #56 and #57 what 45a left and #58
+what 45b left; and #21 is an inventory of deliberate deviations rather than a
+queue. Everything else numbered is closed; the table under "Closed work" says
+which, when, and where the reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
 by the page's own count, and the record is in `docs/CLOSED_WORK.md` under "How
@@ -823,8 +824,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#45**, **#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56**,
-**#57** and **#58**, plus **#21** — see "What is open" above,
+**#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56**, **#57** and
+**#58**, plus **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -880,13 +881,13 @@ Then, in order and for stated reasons:
    **#53**, which is not a defect — it is the same check, asked whether it needs
    to run on a zone we signed ourselves.
 
-**#45 is a different product decision**, not a queue position: it is what an ISP
-needs, and 45a (RPZ) is a legal gate rather than a nice-to-have for anyone with
-blocking obligations. 45e is a decision to take rather than work to schedule.
-**45a done 2026-09-13**, and it went first for the reason the row gave. It left
-#56 and #57. **45b, 45c and 45d done the same day**; 45b left #58, 45c left
-nothing, and 45d left nothing — its own mechanism is half of what #58 will
-want. **45e is what remains, and it is a decision rather than work.**
+~~**#45 is a different product decision**, not a queue position: it is what an
+ISP needs, and 45a (RPZ) is a legal gate rather than a nice-to-have for anyone
+with blocking obligations. 45e is a decision to take rather than work to
+schedule.~~ **Closed 2026-09-13**, all five rows in one day, and both halves of
+that paragraph held: 45a went first because of the gate, and 45e was a decision
+whose answer was no. 45a left #56 and #57, and 45b left #58; 45c and 45d left
+nothing, and 45d's mechanism is half of what #58 will want.
 
 ~~The certificate story in 42a is still the part with no decision behind it.~~
 **Decided 2026-09-12**, and the decision was partly to decline: a renewal is a
@@ -944,21 +945,6 @@ wrong trade when the symptom is already a counter.
 whole answer is 522 ns and one `sendto`+`recvfrom` pair is 3.6-4.1 µs, so the
 entire benchmark suite covers about 6% of what a query costs — the context that
 stops a 20% win in it being reported as a 20% win.
-
----
-
-### 45. What an ISP would find missing in `rdnsr` — **filed 2026-09-11**
-
-The resolver's operator is an ISP or an enterprise, and it wants a different list
-from #44's. Same filing rule: every "0 hits" is a `grep` taken on the day.
-
-| | | |
-|---|---|---|
-| **45a** | Response Policy Zones — ~~**0 hits**~~ **done 2026-09-13**, `rdns/src/rpz.rs` and `rdnsr --rpz` | Not an RFC — an ISC-originated specification, like `$GENERATE` — and implemented by BIND, Knot Resolver, Unbound and PowerDNS. It is how blocking is delivered: court-ordered injunctions, police lists, malware feeds. For an ISP under a blocking obligation this is not a missing feature but a legal non-starter, so it sits above everything else here. The pleasing part is the delivery mechanism: an RPZ *is* a DNS zone, so the AXFR/IXFR/NOTIFY machinery that already exists is how the policy would arrive. **That half held and was not the work**: the lookup is `Zone::locate` on a trigger name built as QNAME + origin, so RFC 1034 §4.3.3's wildcard rule is the RPZ wildcard rule with nothing written twice. What the row did not see is that the *delivery* is still a file: transferring a policy zone needs the secondary machinery, which lives in `rdnsd` and has no home in `rdnsr` — filed as **#57**. Three of the five trigger types are enforced; NSDNAME and NSIP are **#56** |
-| **45b** | serve-stale (RFC 8767, "Serving Stale Data to Improve DNS Resiliency") — ~~**0 hits**~~ **done 2026-09-13**, `rdnsr --serve-stale SECONDS` | Answer from expired cache when the authoritative servers cannot be reached, rather than SERVFAIL. It is what keeps a resolver useful through somebody else's outage, and the resilience feature a subscriber is most likely to notice the absence of. Both caches hold an expired entry for the window and hand it over only to a caller whose refresh has already failed (§4); the answer carries a 30-second TTL (§4), RFC 8914 §4.4's code, and a counter. Off by default, because §6 is explicit that a withdrawn name stays alive for the whole window. **What the row did not name is the half that makes it felt on a *slow* upstream rather than a dead one** — §4's client response timer, which answers stale at 1.8 s while the resolution keeps running — and that is **#58** |
-| **45c** | DNS64 (RFC 6147) — ~~**0 hits**~~ **done 2026-09-13**, `rdns/src/dns64.rs` and `rdnsr --dns64` | Synthesize AAAA from A for IPv6-only clients behind NAT64. Required in an IPv6-only mobile network, which is most of them. The arithmetic is RFC 6052 §2.2 — six prefix lengths, the four octets in a different place in each — and §2.4's own example table is the test. What the row did not name is where the *decision* lives: four paths in `rdnsr` can produce an empty AAAA answer and two more must never be synthesized over (a name RFC 6761 answers locally, and a name a policy zone blocked), so the split is a shared epilogue that `CLAUDE.md` §7 would otherwise be about. §5.3.1's reverse mapping is done as the CNAME into `in-addr.arpa` that section offers as its second alternative. §5.1.8's parallel A query is a MAY and is **declined**: the A lookup follows a delegation walk the AAAA lookup just warmed, so it costs about one round trip, and running two resolutions per AAAA query would double the upstream traffic of a resolver whose clients are all IPv6-only |
-| **45d** | prefetching — ~~**0 hits**~~ **done 2026-09-13**, `rdnsr --prefetch` | Re-resolve a popular name before its TTL expires, so the hit rate has no hole at every expiry. Unbound's `prefetch`, and the cheapest of the rows here. **It was, and the cheap part was not the arithmetic**: a tenth of the TTL is two lines, and what the row does not name is that a popular name in its last tenth gets one query per client unless the *cache* hands the obligation to exactly one of them. The refresh runs in the task that just answered, after the reply — so it is bounded by the in-flight permit that task already holds and needs no shutdown guard of its own (`CLAUDE.md` §9). Both caches took a `Clock` on the way (`TODO.md` #52's fix, arriving where a TTL is measured) |
-| **45e** | EDNS Client Subnet (RFC 7871) — the option code exists and nothing reads or writes it | `EDNS_OPTION_CLIENT_SUBNET` is defined in `edns.rs` and appears at exactly one other place: its own doc comment. Forwarding it is what lets an authoritative server steer a client to a near replica, and *not* forwarding it is a defensible privacy position — RFC 7871 §2 is unusually explicit about the cost. So this row is a **decision to take**, not work to schedule, and it is the only one on this page whose right answer might be "no, and write down why" |
 
 ---
 
@@ -1465,6 +1451,7 @@ the week; the record is under "How the queue kept going stale" in
 | **39** | `rdnsd` answers through two dispatchers | **filed and closed 2026-09-10 → 2026-09-11**, five items. 39a was the defect: a TSIG-rejected request counted as received over TCP and not over UDP, because the two prologues had drifted. 39b built all three shapes before keeping one, and the two it declined are the argument — a trait that had to name the type it existed to hide, and a `transport` plus `out` pair that could disagree with itself. |
 | **41** | nothing capped the UDP response, and the sizes were hardcoded | **filed and closed 2026-09-11**, four items, none of them a live defect. 41b's measurement came before its fix and is `rdnsd/src/response_size.rs`; 41a and 41b became one type, `rdns::UdpSizes`, whose `reply_ceiling` cannot be asked without the `min`. The hardcode had three instances and not the two the filing named — 41c, where the third was also a receive buffer, and where Unbound's 64 KiB was the obvious answer and the wrong one: `--max-inflight-udp` multiplies it by 1024. 41d found RFC 8945 §5.3 had already written the remedy the row guessed at. Nothing filed on the way out. |
 | **42** | the three encrypted transports | **filed 2026-09-11, closed 2026-09-12**, three stages in the order filed. Every dependency number in the filing held — **117 packages for all three**, against the predicted 118, the difference being one `log` this build turns off. The architectural prediction held too: DoT and DoQ carry RFC 1035 §4.2.2's framing unchanged, so `tcp::serve_one` and `Handler` answer on all three transports without knowing which. What the filing got wrong was the size of the metrics fold: 25 lines of code, not ~58, because it counted what `hyper` replaces and not what it asks for back. One certificate store serves all three and one SIGHUP renews it. Image cost, which the filing named as unmeasured: **+1.44 MiB on a 30 MiB image**, of which `hyper` is 0.54 |
+| **45** | what an ISP would find missing in `rdnsr` | **filed 2026-09-11, closed 2026-09-13**, five rows in one day. Four were absences and the fifth was a decision, answered **no**. Each of the four cost more than its row said, and in the same way: the *arithmetic* was small and where the decision belonged was not. RPZ's lookup is `Zone::locate` on a trigger name, so RFC 1034 §4.3.3's wildcard rule is the RPZ wildcard rule — but the delivery its row called the pleasing part turned out to live in `rdnsd` (#57), and two of five trigger types need a delegation path the resolver does not hand back (#56). serve-stale is one comparison, and the two eviction paths that swept the window were found by tests rather than by reading. Prefetch is a tenth of a TTL, and the part that matters is handing the obligation to exactly one client. DNS64 is RFC 6052 §2.2's table, and the work was deciding which of six answer paths may synthesize. Left behind: **#56**, **#57**, **#58** |
 | **46** | `rdnsd` could not sign a NOTIFY | **filed and closed 2026-09-12**, three items, all of them live. 46a: `--also-notify` took an address and nothing else, so a secondary whose notify ACL names a key refused every notification — measured against NSD and Knot, both. 46b: that refusal was logged `acknowledged (Refused)` at INFO, which is a permanently broken notification path with nothing in a failed state. 46c was found while fixing the other two and was the worst of the three: `[zones."x"].also-notify` was parsed into `PerZone::notify` and read by nothing, with two `docs/spec/` files documenting it as working. `--secondary` and `--also-notify` are one parser now (`rdns::endpoint`), which is why 46a existed at all |
 | **43** | nothing here had ever answered another implementation | **filed 2026-09-11, closed 2026-09-12.** `tests/interop/` — one `docker compose` network, `run.sh all`. 112 assertions against BIND 9.20.27, Knot 3.6.0, NSD 4.12.0, Unbound 1.23.1 and ldns 1.8.4; 0 failures. **Neither of the two things the filing predicted happened**: the IXFR is a real delta in both directions and every NSEC3 shape validates. Found one gap, in NOTIFY, which no row had named — **#46**. Three of the first five apparent findings were the harness, and the section says what each was, because that ratio is the lesson |
 | **50** | verifying a signed zone at load was quadratic in the zone | **filed and closed 2026-09-12**, found by 44c's measurement rather than by reading the code. `validate_response` collected every DNSKEY and every RRSIG in the zone on every call and `verify_rrset` then scanned what it collected, so `verify_zones` — which runs at startup, on SIGHUP, on `rdnsctl reload`, on the re-signing tick and inside `--check-config` — cost the square of the zone. **20,006 RRsets: 112.68 s before, 0.65 s after**, and a million-record zone goes from days of arithmetic to a measured 76 s. The fix is a `ZoneKeys` the caller hoists and a signature lookup through the zone's own owner index; the guard is an allocation count (34 either side of a fifty-fold zone, 217 against 6,101 with the scan) plus a ratio test in `rdnsd`. Filed **#53** on the way out |

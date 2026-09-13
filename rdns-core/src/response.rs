@@ -525,6 +525,45 @@ mod tests {
 
     use super::*;
     use crate::ede::InfoCode;
+
+    /// `TODO.md` #45e, answered **no**: this resolver does not implement EDNS
+    /// Client Subnet, so a query carrying one is answered without it. RFC 7871
+    /// §11 is the reason — the option makes "the network address of the client
+    /// ... visible to all servers involved in the resolution process" — and the
+    /// mechanism is that `mirror` builds a *fresh* OPT rather than copying the
+    /// client's.
+    ///
+    /// A test for the absence of a behaviour, because that is the kind that
+    /// comes back: echoing an option is one line away from here, and an echoed
+    /// ECS with SCOPE 0 is a claim to support it (RFC 7871 §7.2).
+    #[test]
+    fn no_option_of_the_clients_is_echoed_back() {
+        use crate::edns::{EdnsOption, EDNS_OPTION_CLIENT_SUBNET, EDNS_OPTION_NSID};
+
+        let ecs = EdnsOption {
+            code: EDNS_OPTION_CLIENT_SUBNET,
+            // FAMILY 1, SOURCE PREFIX-LENGTH 24, SCOPE 0, 192.0.2.0.
+            data: vec![0, 1, 24, 0, 192, 0, 2],
+        };
+        let nsid = EdnsOption {
+            code: EDNS_OPTION_NSID,
+            data: Vec::new(),
+        };
+        let mut request = request("example.com.", false);
+        request.set_edns(
+            Edns::with_options(1232, 0, true, &[ecs, nsid]).expect("a well-formed option list"),
+        );
+
+        let mirrored = ClientEdns::of(&request)
+            .mirror(1232)
+            .expect("the client used EDNS, so it gets an OPT back");
+        assert!(
+            mirrored.options().expect("well formed").is_empty(),
+            "a fresh OPT, carrying the payload size and DO and nothing else"
+        );
+        assert!(mirrored.do_bit, "and DO, which is mirrored on purpose");
+    }
+
     use crate::name::nm;
     use crate::record_types;
     use crate::ResourceRecord;

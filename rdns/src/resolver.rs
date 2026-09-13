@@ -690,6 +690,37 @@ mod tests {
         }
     }
 
+    /// `TODO.md` #45e, answered **no**: nothing about the client goes upstream.
+    ///
+    /// The query this resolver sends carries one OPT with a payload size and
+    /// possibly DO, and no options at all — EDNS Client Subnet included, which
+    /// is the one an operator would be tempted to add for the sake of a near
+    /// replica. RFC 7871 §11: the option makes the client's network "visible to
+    /// all servers involved in the resolution process".
+    ///
+    /// A test for the absence of a behaviour, because `build_query` is where it
+    /// would be added and nothing else would notice.
+    #[test]
+    fn the_query_sent_upstream_carries_nothing_about_the_client() {
+        for dnssec in [false, true] {
+            let mut config = ResolverConfig::default();
+            if dnssec {
+                config.dnssec = Some(SharedAnchors::new(TrustAnchors::icann_root()));
+            }
+            let resolver = Resolver::new(config);
+            let sent = resolver
+                .build_query(&test_query(), true)
+                .expect("a query this small serializes");
+            let msg = DnsMessage::try_from_bytes(&sent.buf).expect("a well-formed query");
+            let edns = msg.edns().expect("EDNS0, for a payload size over 512");
+            assert!(
+                edns.options().expect("well formed").is_empty(),
+                "dnssec={dnssec}: the OPT carries a size and a bit, and nothing about who asked"
+            );
+            assert_eq!(edns.do_bit, dnssec);
+        }
+    }
+
     #[test]
     fn test_parse_root_hints() {
         let sample = "\

@@ -127,6 +127,26 @@ pub const FLAG_DAY_UDP_SIZE: u16 = 1232;
 /// Name Server Identifier (RFC 5001).
 pub const EDNS_OPTION_NSID: u16 = 3;
 /// Client Subnet (RFC 7871).
+///
+/// **This tree answers no to it, and the reason is worth more than the code.**
+/// Forwarding a client's network to every authoritative server in a resolution
+/// is what lets one of them steer the client to a near replica, and RFC 7871
+/// §11 is plain about the cost: "the network address of the client ... becomes
+/// visible to all servers involved in the resolution process". The RFC also
+/// says the feature "SHOULD be disabled in all default configurations",
+/// because of the cache pressure — an answer tied to a network is an answer per
+/// network.
+///
+/// So `rdnsr` never sends one and never echoes one, and that is a property of
+/// two functions rather than of a flag: [`crate::response::ClientEdns::mirror`]
+/// builds a *fresh* OPT carrying the payload size and DO and nothing else, and
+/// the resolver's upstream query carries no options at all. Both are pinned by
+/// tests, because the absence of a behaviour is the kind that comes back.
+///
+/// The constant stays for the reason its three neighbours do: a query carrying
+/// the option is well formed and parses, and naming the code is how a caller
+/// reading an option list says which one it is looking at. What a reply carries
+/// is a separate question, and the answer is nothing (`TODO.md` #45e).
 pub const EDNS_OPTION_CLIENT_SUBNET: u16 = 8;
 /// DNS Cookie (RFC 7873).
 pub const EDNS_OPTION_COOKIE: u16 = 10;
