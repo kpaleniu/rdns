@@ -1,5 +1,5 @@
-//! The control socket: `status`, `reload` and `dump`, answered by the process
-//! that knows.
+//! The control socket: `status`, `reload`, `dump` and `catalog`, answered by
+//! the process that knows.
 //!
 //! A Unix socket and no TCP; see [`rdns::control`]. Unix-only because neither
 //! `std` nor `tokio` exposes AF_UNIX on Windows, where `--control-socket` is
@@ -39,6 +39,11 @@ pub struct Control {
     /// Zones this server replicates, so `status` can say which are secondary
     /// without inferring it from a timestamp that is also absent on a primary.
     pub secondaries: Arc<crate::replication::Secondaries>,
+    /// The catalogs this server consumes, so `status` can say where a zone came
+    /// from and `catalog` can say what a catalog holds — including the members
+    /// it declined, which have no row anywhere else (RFC 9432 §6,
+    /// `TODO.md` #49).
+    pub catalogs: Arc<crate::catalog::Catalogs>,
     /// Where a `reload` request goes: the same loop SIGHUP and the re-signing
     /// timer feed, so two reloads cannot install two snapshots of one file set.
     pub reloads: tokio::sync::mpsc::Sender<ReloadTrigger>,
@@ -176,6 +181,7 @@ async fn run(request: Request, control: &Control) -> String {
         "status" => ok(&status(control).await),
         "reload" => reload(&request.args, control).await,
         "dump" => dump(&request.args, control).await,
+        "catalog" => catalog(&request.args, control).await,
         "version" => ok(&format!("rdnsd {}", rdns::VERSION)),
         "help" | "" => ok(HELP),
         other => err(&format!(
@@ -189,6 +195,7 @@ status          what is loaded, at what serial, and when each replica last heard
 from a master
 reload          re-read every zone file, sign, verify, and install the set
 dump <zone>     the zone as it is being served right now, in presentation format
+catalog [<zone>] what each consumed catalog provisioned, and what it declined
 version         the server's version
 help            this";
 
@@ -209,7 +216,13 @@ async fn status(control: &Control) -> String {
         signing: &'static str,
         replicated: bool,
         last_transfer: Option<u64>,
+        /// The catalog that provisioned it, if one did (RFC 9432).
+        catalog: Option<String>,
     }
+
+    // Before the zone-map guard, because it takes the catalogs' own lock and
+    // holding two is how two reconciles once decided against each other.
+    let provenance = control.catalogs.provenance().await;
 
     let rows: Vec<Row> = {
         let zones = control.served.zone_map.read().await;
@@ -240,6 +253,10 @@ async fn status(control: &Control) -> String {
                     },
                     replicated: control.secondaries.replicates(zone.origin()),
                     last_transfer: gauge.and_then(|g: &ZoneFacts| g.last_transfer),
+                    catalog: provenance
+                        .iter()
+                        .find(|(member, _)| member.as_ref() == zone.origin())
+                        .map(|(_, catalog)| catalog.to_string()),
                 }
             })
             .collect();
@@ -248,20 +265,21 @@ async fn status(control: &Control) -> String {
     };
 
     let replicated = rows.iter().filter(|r| r.replicated).count();
+    let provisioned = rows.iter().filter(|r| r.catalog.is_some()).count();
     let mut out = format!(
         "rdnsd {} on {}, up {}\n\
-         zones: {} loaded, {replicated} replicated\n\n",
+         zones: {} loaded, {replicated} replicated, {provisioned} from a catalog\n\n",
         rdns::VERSION,
         control.listen,
         duration(control.started.elapsed().as_secs()),
         rows.len(),
     );
     out.push_str(
-        "zone                            serial  records  denial  role       last contact\n",
+        "zone                            serial  records  denial  role       catalog                   last contact\n",
     );
     for row in &rows {
         out.push_str(&format!(
-            "{:<30}  {:>6}  {:>7}  {:<6}  {:<9}  {}\n",
+            "{:<30}  {:>6}  {:>7}  {:<6}  {:<9}  {:<24}  {}\n",
             row.zone,
             row.serial,
             row.records,
@@ -271,6 +289,9 @@ async fn status(control: &Control) -> String {
             } else {
                 "primary"
             },
+            // `-` rather than blank: a column that is empty for every zone on a
+            // server with no catalogs reads as a column that is broken.
+            row.catalog.as_deref().unwrap_or("-"),
             match row.last_transfer {
                 // The instant for a dashboard, the age for the person reading
                 // this, who is asking whether it is stale.
@@ -284,6 +305,86 @@ async fn status(control: &Control) -> String {
         out.push_str("(none — every query will be REFUSED)\n");
     }
     out
+}
+
+/// What each consumed catalog provisioned, under which member node and group,
+/// and what it declined.
+///
+/// RFC 9432 §6 asks for exactly this: "Querying/serving catalog zone contents
+/// may be inconvenient via DNS due to the nature of their representation ...
+/// Implementations are therefore advised to provide a tool that uses either the
+/// output of AXFR or an out-of-band method to perform queries on catalog
+/// zones."
+///
+/// The refusals are the half `status` cannot have. A member this server
+/// declined — §5.2's clash, or two groups that disagree — has no zone, so it has
+/// no row in `status`, and until now it appeared in the log and nowhere else.
+async fn catalog(args: &[String], control: &Control) -> String {
+    let reports = control.catalogs.report().await;
+    if reports.is_empty() {
+        return ok("this server consumes no catalogs (--catalog)\n");
+    }
+    let wanted = args
+        .first()
+        .map(|zone| rdns::text_names::absolute_lowered(zone).into_owned());
+    if let Some(wanted) = &wanted {
+        if !reports
+            .iter()
+            .any(|r| r.catalog.to_string().eq_ignore_ascii_case(wanted))
+        {
+            return err(&format!("no catalog {wanted:?} is configured"));
+        }
+    }
+
+    let mut out = String::new();
+    for report in &reports {
+        if let Some(wanted) = &wanted {
+            if !report.catalog.to_string().eq_ignore_ascii_case(wanted) {
+                continue;
+            }
+        }
+        out.push_str(&format!(
+            "catalog {} from {}: {} member(s)\n",
+            report.catalog,
+            report.master,
+            report.members.len()
+        ));
+        if report.members.is_empty() {
+            out.push_str("  (none — the catalog has not been transferred, or lists nothing)\n");
+        }
+        for (zone, node, group) in &report.members {
+            out.push_str(&format!(
+                "  {:<30}  node {:<20}  group {}\n",
+                zone.to_string(),
+                // The `<unique-N>` label alone: the rest of the node is the
+                // catalog, which the heading already said.
+                String::from_utf8_lossy(node.as_ref().labels().next().unwrap_or(b"")),
+                match group {
+                    // Lossy on purpose, and only here: a group value is octets
+                    // and this is a line for a person to read. Nothing compares
+                    // against what this prints.
+                    Some(value) => format!("{:?}", String::from_utf8_lossy(value)),
+                    None => "-".to_string(),
+                }
+            ));
+        }
+        if report.refused.total > 0 {
+            out.push_str(&format!(
+                "  refused {} member(s) at the last reconcile:\n",
+                report.refused.total
+            ));
+            for (zone, why) in &report.refused.shown {
+                out.push_str(&format!("  ! {zone}: {why}\n"));
+            }
+            if report.refused.total > report.refused.shown.len() {
+                out.push_str(&format!(
+                    "  ! ... and {} more, in the log\n",
+                    report.refused.total - report.refused.shown.len()
+                ));
+            }
+        }
+    }
+    ok(&out)
 }
 
 /// `1d 2h`, `3h 4m`, `5m 6s`, `7s`. Rounds down: for an age, "0s ago" is a fact
@@ -395,6 +496,15 @@ mod tests {
     fn control(
         replicated: Vec<&str>,
     ) -> (Arc<Control>, tokio::sync::mpsc::Receiver<ReloadTrigger>) {
+        control_with(replicated, None)
+    }
+
+    /// The same, consuming `catalog` and holding the sidecar rows `members`
+    /// names — what a previous reconcile would have left behind.
+    fn control_with(
+        replicated: Vec<&str>,
+        catalog: Option<SeededCatalog<'_>>,
+    ) -> (Arc<Control>, tokio::sync::mpsc::Receiver<ReloadTrigger>) {
         use tokio::sync::RwLock;
 
         let mut zones = crate::Zones::default();
@@ -420,6 +530,7 @@ mod tests {
                     journal: None,
                 },
                 secondaries: Arc::new(crate::replication::Secondaries::replicating(&replicated)),
+                catalogs: catalogs(catalog),
                 reloads: tx,
                 started: Instant::now(),
                 listen: "127.0.0.1:15353".to_string(),
@@ -428,8 +539,125 @@ mod tests {
         )
     }
 
+    /// A consumer of `catalog`, over a scratch directory seeded with the
+    /// sidecar rows a previous reconcile would have written.
+    fn catalogs(catalog: Option<SeededCatalog<'_>>) -> Arc<crate::catalog::Catalogs> {
+        let (dir, specs) = match catalog {
+            Some((dir, zone, members)) => {
+                let rows: String = members
+                    .iter()
+                    .map(|(member, node)| format!("{member} {node} -\n"))
+                    .collect();
+                std::fs::write(crate::catalog::membership_path(dir.path()), rows)
+                    .expect("seed the sidecar");
+                (
+                    dir.path().to_path_buf(),
+                    vec![rdns::secondary::MasterSpec {
+                        zone: nm(zone),
+                        master: "192.0.2.1:53".parse().expect("a test address"),
+                        key_name: None,
+                        tls: None,
+                    }],
+                )
+            }
+            None => (PathBuf::from("."), Vec::new()),
+        };
+        crate::catalog::Catalogs::new(
+            specs,
+            &rdns::tsig::TsigKeyring::default(),
+            std::collections::HashSet::new(),
+            Vec::new(),
+            &dir,
+            Arc::new(crate::replication::Secondaries::default()),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("no key names to resolve")
+    }
+
+    /// A catalog to seed: the scratch directory its sidecar goes in, the
+    /// catalog zone, and the (member, member node) rows a previous reconcile
+    /// would have written.
+    type SeededCatalog<'a> = (
+        &'a crate::testutil::ScratchDir,
+        &'a str,
+        &'a [(&'a str, &'a str)],
+    );
+
     async fn ask(control: &Control, line: &str) -> Reply {
         parse_reply(&run(Request::parse(line), control).await)
+    }
+
+    /// RFC 9432 §6, the point of #49: `status` says which catalog a zone came
+    /// from, and `catalog` lists what each one provisioned. Neither question had
+    /// an answer anywhere but the sidecar on disk.
+    #[tokio::test]
+    async fn status_and_catalog_say_where_a_member_came_from() {
+        let dir = crate::testutil::ScratchDir::new("control-catalog");
+        let (control, _rx) = control_with(
+            vec!["example.com."],
+            Some((
+                &dir,
+                "catalog.invalid.",
+                &[("example.com.", "nj2xg5b.zones.catalog.invalid.")],
+            )),
+        );
+
+        let Reply::Ok(body) = ask(&control, "status").await else {
+            panic!("status failed");
+        };
+        assert!(
+            body.contains("catalog.invalid."),
+            "the catalog column names it: {body}"
+        );
+        assert!(
+            body.contains("1 from a catalog"),
+            "and the header counts it: {body}"
+        );
+
+        let Reply::Ok(body) = ask(&control, "catalog").await else {
+            panic!("catalog failed");
+        };
+        assert!(
+            body.contains("catalog catalog.invalid. from 192.0.2.1:53"),
+            "{body}"
+        );
+        assert!(body.contains("example.com."), "{body}");
+        assert!(
+            body.contains("node nj2xg5b"),
+            "the <unique-N> label §5.4 turns on: {body}"
+        );
+    }
+
+    /// A server consuming none says so rather than printing an empty table: the
+    /// operator asking is deciding whether the flag took effect.
+    #[tokio::test]
+    async fn catalog_says_when_there_are_none() {
+        let (control, _rx) = control(Vec::new());
+        let Reply::Ok(body) = ask(&control, "catalog").await else {
+            panic!("catalog failed");
+        };
+        assert!(body.contains("consumes no catalogs"), "{body}");
+
+        let Reply::Ok(body) = ask(&control, "status").await else {
+            panic!("status failed");
+        };
+        assert!(
+            body.contains("0 from a catalog"),
+            "and status still has the column: {body}"
+        );
+    }
+
+    /// A name that is not a configured catalog is an error and not an empty
+    /// answer, for the reason `dump` refuses a zone it does not hold: an empty
+    /// reply reads as "it has no members".
+    #[tokio::test]
+    async fn catalog_refuses_a_name_it_does_not_consume() {
+        let dir = crate::testutil::ScratchDir::new("control-catalog-unknown");
+        let (control, _rx) = control_with(Vec::new(), Some((&dir, "catalog.invalid.", &[])));
+        let Reply::Err(why) = ask(&control, "catalog nosuch.test.").await else {
+            panic!("an unknown catalog should be refused");
+        };
+        assert!(why.contains("nosuch.test."), "{why}");
     }
 
     /// On the wire a zone that failed to load and one that was never configured

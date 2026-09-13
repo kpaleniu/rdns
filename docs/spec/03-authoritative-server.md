@@ -644,8 +644,6 @@ the catalog takes the zone out of service — REFUSED, and the gauge at 0.
 
 ### What is not implemented
 
-- Nothing on the control socket says which catalog a zone came from, which
-  RFC 9432 §6 asks for. `TODO.md` #49.
 - The producer side needs no code: a catalog zone is an ordinary zone, so
   `rdnsd` already serves and transfers one written by hand or by a script.
 
@@ -665,11 +663,27 @@ Protocol (`rdns/src/control.rs`): one command line in, a status line
 
 | command | does |
 |---|---|
-| `status` (default) | zones, serials, last transfer, uptime, counters |
+| `status` (default) | zones, serials, last transfer, the catalog each came from, uptime |
 | `reload` | a full reload, answering whether it worked; server-side bound 120 s |
 | `dump <zone>` | the zone in presentation form |
+| `catalog [<zone>]` | what each consumed catalog provisioned, and what it declined (RFC 9432 §6) |
 | `version` | `rdnsd <version>` |
 | `help`, empty | usage |
+
+`catalog` is the tool §6 advises: "Querying/serving catalog zone contents may be
+inconvenient via DNS due to the nature of their representation ...
+Implementations are therefore advised to provide a tool that uses either the
+output of AXFR or an out-of-band method to perform queries on catalog zones."
+It reports, per catalog, its master, every member with the `<unique-N>` label
+and group it was provisioned under, and **the members the last reconcile
+refused** — a §5.2 clash or two groups that disagree. Those have no zone, so
+they have no row in `status` and appeared in the log and nowhere else. The
+refusal list is rebuilt each reconcile, so one that stops applying stops being
+reported, and it is bounded at 16 with the total beside it: §6's failure mode is
+a producer with millions of members.
+
+A name that is not a configured catalog is `-ERR`, not an empty answer — an
+empty one reads as "it has no members".
 
 Request bound: `control::MAX_REQUEST` = 4096 bytes.
 

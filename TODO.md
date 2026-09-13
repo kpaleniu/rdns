@@ -37,8 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56**, **#57**,
-**#58** and **#21**, as of 2026-09-13. **#44 and #45 are both closed in full.**
+**#51**, **#53**, **#54**, **#55**, **#56**, **#57**, **#58** and **#21**, as
+of 2026-09-13. **#44 and #45 are both closed in full, and so are #48 and #49**,
+which is everything 44a left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
 which closed the same day carrying two MUSTs it had been filed as not
 breaking: RFC 6891 §6.1.1's OPT in a response to a request that had one, and
@@ -46,12 +47,11 @@ RFC 3225 §3's DO bit, dropped on the first envelope of every AXFR. It was filed
 as "not a defect" because its own row read §6.1.1 as "asks for", and the section
 says what the difference cost. Of what is left, #50 was the live one, and
 closing it is what added #53: a zone this server signed itself is verified
-again at every load, which 76 seconds of a
-million-record zone made visible. #48 and #49 are what 44a left, #51 what 44d
-left, #54 what 44g left, #55 what 44f left, #56 and #57 what 45a left and #58
-what 45b left; and #21 is an inventory of deliberate deviations rather than a
-queue. Everything else numbered is closed; the table under "Closed work" says
-which, when, and where the reasoning went.
+again at every load, which 76 seconds of a million-record zone made visible.
+#51 is what 44d left, #54 what 44g left, #55 what 44f left, #56 and #57 what
+45a left and #58 what 45b left; and #21 is an inventory of deliberate
+deviations rather than a queue. Everything else numbered is closed; the table
+under "Closed work" says which, when, and where the reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
 by the page's own count, and the record is in `docs/CLOSED_WORK.md` under "How
@@ -830,8 +830,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#48**, **#49**, **#51**, **#53**, **#54**, **#55**, **#56**, **#57** and
-**#58**, plus **#21** — see "What is open" above,
+**#51**, **#53**, **#54**, **#55**, **#56**, **#57** and **#58**, plus
+**#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
 referenced from the code, so they move rather than being renumbered.
@@ -1075,129 +1075,6 @@ Three things to settle, and the first is a measurement:
   same slow name should not start two resolutions. That is a de-duplicating
   in-flight table, which this resolver does not have and which is worth more
   than the timer on its own.
-
----
-
-### 48. A catalog's `group` property is read and not acted on — ~~**filed 2026-09-12**~~ **closed 2026-09-13**
-
-Left behind by 44a, with a number because 44a's own row would otherwise be the
-only place it is written down (`CLAUDE.md` §18).
-
-`rdns::catalog` parses the `group` property (RFC 9432 §4.3.2) and
-`CatalogMember::groups` hands the values over; `rdnsd` logs them beside the
-member it is provisioning and does nothing else. Every member of every catalog
-is therefore replicated the same way: from the catalog's master, with the
-catalog's key.
-
-That is legal — §4.3 makes every member property optional and §4.3.2 leaves "the
-exact handling of the group property value ... to the consumer's implementation
-and configuration" — and it is not useful. The group is how a producer says *how*
-a member should be treated, which for this server would be: a different master
-or key, whether to sign it, what to NOTIFY about it.
-
-What it needs is the half that does not exist: a per-group configuration to map
-a value onto. The shape §4.3.2 asks for is explicit — "Implementations MAY
-facilitate mapping of a specific group value to a specific configuration
-configurable *on a per catalog zone basis*" — so it is a table under the
-catalog's own `[zones.*]` entry rather than a global one, because a producer may
-publish one catalog to several consumer operators who each agreed different
-values:
-
-```toml
-[zones."catalog.invalid."]
-masters = ["192.0.2.1#transfer.key"]
-catalog = true
-[zones."catalog.invalid.".groups."operator-x-signed"]
-masters = ["192.0.2.9#other.key"]
-```
-
-Three things to settle before writing it, none of which 44a had to:
-
-- **A member may carry several group values** (§4.3.2), and "the consumer ...
-  MAY choose to process all, some, or none of them". Two matching groups naming
-  different masters is a conflict with no right answer in the RFC, so the config
-  has to define one — refusing the member and logging it is the only answer that
-  is not a silent choice about what is being served (`CLAUDE.md` §15).
-- **A group value is octets, not text.** `CatalogMember::groups` keeps bytes for
-  the reason `ParsedRecord::TXT` does, and a TOML key is a `String`; the
-  comparison has to be the byte one, with the config key's UTF-8 encoding as the
-  needle.
-- **Changing a member's group is a reconfiguration, not a re-add.** §5.4's reset
-  is about the member *node* label; a group change under the same label means
-  the same zone fetched differently, so the sidecar has to record which group
-  was in force or the change is invisible to the next reconcile.
-
-Not urgent: a fleet with one class of member zone — which is the ordinary case
-and the one 44a's row was about — never writes a group at all.
-
----
-
-**Done 2026-09-13**, in the shape the row drew: `[zones."$CATZ".groups."value"]`
-with a `masters` list, per catalog zone. All three things the row said to settle
-were settled as it proposed, and one of them was not the hard part.
-
-- **Several groups on one member** is a conflict only when they name *different*
-  masters — two labels for one arrangement is the ordinary way a producer uses
-  §4.3.2's "MAY assign more than one group property". A real conflict refuses the
-  member; a member that is *already* held and becomes conflicted is left exactly
-  as it is, which the row did not consider and which §5.1 decides: an instruction
-  that cannot be followed must not remove or reconfigure anything.
-- **Octets, not text**: the TOML key's UTF-8 encoding is the needle, and the
-  sidecar's third field is RFC 1035 §5.1 escaping with spaces as `\032`, since
-  the row is whitespace-separated. Every byte round-trips, `-` included, which is
-  a test.
-- **A group change under an unchanged node label** replaces the refresh task and
-  keeps the zone file and the transfer state. What the row did not name is what
-  that costs: the copy on disk was fetched from the *old* master, so
-  `withdraw_unvouched_zones` takes the zone out of service until the new one
-  answers — the same rule a configured secondary gets when its `masters` change,
-  and the same one the §4.3.1 handover path has always had. The test asserts the
-  withdrawal rather than the serving, and the log line says it.
-
-**Scope taken, and the part of the row's own sentence that was declined.** The
-row said a group is how a producer says "a different master or key, whether to
-sign it, what to NOTIFY about it". Masters carry the key and the TLS name, so
-that is one setting and not two. The other two are not a consumer's to decide: a
-secondary does not sign a zone it replicates, and NOTIFY targets are
-`server.also-notify`'s, which a member inherits like any other zone. A setting
-whose effect here would be nothing is worse than its absence (`CLAUDE.md` §14).
-
-**Two tests changed**, and they encoded the old sidecar format rather than a
-behaviour: the third field is new, so the lines they assert gained a `-`.
-
----
-
-### 49. Nothing on the control socket says a zone came from a catalog — **filed 2026-09-12**
-
-Also left behind by 44a. RFC 9432 §6 asks for it in as many words: "Querying/
-serving catalog zone contents may be inconvenient via DNS due to the nature of
-their representation ... Implementations are therefore advised to provide a tool
-that uses either the output of AXFR or an out-of-band method to perform queries
-on catalog zones."
-
-What exists, measured rather than recalled: `rdnsctl status` prints one row per
-zone with serial, records, signing and a `secondary` marker, and since 44a that
-marker is read from the live replication registry, so a catalog's members *are*
-marked secondary. What no command says is **which catalog** a zone came from,
-under which member node, or what a catalog holds that this server declined —
-the clash in §5.2 is an ERROR in the log and nowhere else.
-
-The facts are all in the process already: `Catalogs`' sidecar is the mapping and
-`dns_catalog_members` is the count. Two shapes, and the cheap one is probably
-right:
-
-- a `catalog` column on `status`, which costs a row-width and answers "where did
-  this come from" for every zone at once;
-- a `catalog [<zone>]` command listing members with their node labels and
-  groups, which is the tool §6 describes and is the only one that can report a
-  member the server *refused*, since that zone has no row in `status` at all.
-
-The second needs the refusals to be remembered rather than only logged, which is
-the part with a design decision in it: a bounded list per catalog, or nothing.
-
-Small either way, and not urgent — `rdnsd.catalog` beside the zones is plain
-text and answers the first question for anyone who can read the disk. It has a
-number because the operator who cannot is exactly the one `rdnsctl` exists for.
 
 ---
 
@@ -1492,6 +1369,8 @@ the week; the record is under "How the queue kept going stale" in
 | **39** | `rdnsd` answers through two dispatchers | **filed and closed 2026-09-10 → 2026-09-11**, five items. 39a was the defect: a TSIG-rejected request counted as received over TCP and not over UDP, because the two prologues had drifted. 39b built all three shapes before keeping one, and the two it declined are the argument — a trait that had to name the type it existed to hide, and a `transport` plus `out` pair that could disagree with itself. |
 | **41** | nothing capped the UDP response, and the sizes were hardcoded | **filed and closed 2026-09-11**, four items, none of them a live defect. 41b's measurement came before its fix and is `rdnsd/src/response_size.rs`; 41a and 41b became one type, `rdns::UdpSizes`, whose `reply_ceiling` cannot be asked without the `min`. The hardcode had three instances and not the two the filing named — 41c, where the third was also a receive buffer, and where Unbound's 64 KiB was the obvious answer and the wrong one: `--max-inflight-udp` multiplies it by 1024. 41d found RFC 8945 §5.3 had already written the remedy the row guessed at. Nothing filed on the way out. |
 | **42** | the three encrypted transports | **filed 2026-09-11, closed 2026-09-12**, three stages in the order filed. Every dependency number in the filing held — **117 packages for all three**, against the predicted 118, the difference being one `log` this build turns off. The architectural prediction held too: DoT and DoQ carry RFC 1035 §4.2.2's framing unchanged, so `tcp::serve_one` and `Handler` answer on all three transports without knowing which. What the filing got wrong was the size of the metrics fold: 25 lines of code, not ~58, because it counted what `hyper` replaces and not what it asks for back. One certificate store serves all three and one SIGHUP renews it. Image cost, which the filing named as unmeasured: **+1.44 MiB on a 30 MiB image**, of which `hyper` is 0.54 |
+| **48** | a catalog's `group` property is read and not acted on | **filed 2026-09-12, closed 2026-09-13.** `[zones."$CATZ".groups."value"]` with a `masters` list, per catalog zone as RFC 9432 §4.3.2 asks. All three things the filing said to settle were settled as it proposed; what it did not see is what a group change costs — the copy on disk came from the old master, so the zone stops being *served* until the new one answers, which is the rule every secondary gets. Two tests changed, both encoding the sidecar's format rather than a behaviour |
+| **49** | nothing on the control socket says a zone came from a catalog | **filed 2026-09-12, closed 2026-09-13.** Both shapes the filing drew were built and both kept: they answer different questions, and only the second — `rdnsctl catalog` — can report a member the server *refused*, which has no zone and so no row in `status`. The design decision the filing named was the refusal list; it is bounded at 16 with the total beside it and rebuilt every reconcile, since a refusal is a property of the catalog as it stands |
 | **45** | what an ISP would find missing in `rdnsr` | **filed 2026-09-11, closed 2026-09-13**, five rows in one day. Four were absences and the fifth was a decision, answered **no**. Each of the four cost more than its row said, and in the same way: the *arithmetic* was small and where the decision belonged was not. RPZ's lookup is `Zone::locate` on a trigger name, so RFC 1034 §4.3.3's wildcard rule is the RPZ wildcard rule — but the delivery its row called the pleasing part turned out to live in `rdnsd` (#57), and two of five trigger types need a delegation path the resolver does not hand back (#56). serve-stale is one comparison, and the two eviction paths that swept the window were found by tests rather than by reading. Prefetch is a tenth of a TTL, and the part that matters is handing the obligation to exactly one client. DNS64 is RFC 6052 §2.2's table, and the work was deciding which of six answer paths may synthesize. Left behind: **#56**, **#57**, **#58** |
 | **46** | `rdnsd` could not sign a NOTIFY | **filed and closed 2026-09-12**, three items, all of them live. 46a: `--also-notify` took an address and nothing else, so a secondary whose notify ACL names a key refused every notification — measured against NSD and Knot, both. 46b: that refusal was logged `acknowledged (Refused)` at INFO, which is a permanently broken notification path with nothing in a failed state. 46c was found while fixing the other two and was the worst of the three: `[zones."x"].also-notify` was parsed into `PerZone::notify` and read by nothing, with two `docs/spec/` files documenting it as working. `--secondary` and `--also-notify` are one parser now (`rdns::endpoint`), which is why 46a existed at all |
 | **43** | nothing here had ever answered another implementation | **filed 2026-09-11, closed 2026-09-12.** `tests/interop/` — one `docker compose` network, `run.sh all`. 112 assertions against BIND 9.20.27, Knot 3.6.0, NSD 4.12.0, Unbound 1.23.1 and ldns 1.8.4; 0 failures. **Neither of the two things the filing predicted happened**: the IXFR is a real delta in both directions and every NSEC3 shape validates. Found one gap, in NOTIFY, which no row had named — **#46**. Three of the first five apparent findings were the harness, and the section says what each was, because that ratio is the lesson |

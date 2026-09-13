@@ -7690,3 +7690,158 @@ from #44's. Same filing rule: every "0 hits" is a `grep` taken on the day.
 | **45e** | EDNS Client Subnet (RFC 7871) — ~~the option code exists and nothing reads or writes it~~ **answered no, 2026-09-13** | `EDNS_OPTION_CLIENT_SUBNET` is defined in `edns.rs` and appears at exactly one other place: its own doc comment. Forwarding it is what lets an authoritative server steer a client to a near replica, and *not* forwarding it is a defensible privacy position — RFC 7871 §2 is unusually explicit about the cost. So this row is a **decision to take**, not work to schedule, and it is the only one on this page whose right answer might be "no, and write down why". **It was, and RFC 7871 says so itself**: "Due to the high cache pressure introduced by ECS, the feature SHOULD be disabled in all default configurations", and §11 that the option makes "the network address of the client ... visible to all servers involved in the resolution process". So `rdnsr` sends none and echoes none. **What that cost was two tests and a doc comment, because the behaviour was already right by accident** — `ClientEdns::mirror` builds a fresh OPT rather than copying the client's, and `Resolver::build_query` attaches a payload size and a DO bit and nothing else — and a property nothing asserts is one a later change takes away in silence. The row's own finding held: the constant appeared nowhere but its doc comment, and it appears in a test now |
 
 ---
+
+### 48. A catalog's `group` property is read and not acted on — ~~**filed 2026-09-12**~~ **closed 2026-09-13**
+
+Left behind by 44a, with a number because 44a's own row would otherwise be the
+only place it is written down (`CLAUDE.md` §18).
+
+`rdns::catalog` parses the `group` property (RFC 9432 §4.3.2) and
+`CatalogMember::groups` hands the values over; `rdnsd` logs them beside the
+member it is provisioning and does nothing else. Every member of every catalog
+is therefore replicated the same way: from the catalog's master, with the
+catalog's key.
+
+That is legal — §4.3 makes every member property optional and §4.3.2 leaves "the
+exact handling of the group property value ... to the consumer's implementation
+and configuration" — and it is not useful. The group is how a producer says *how*
+a member should be treated, which for this server would be: a different master
+or key, whether to sign it, what to NOTIFY about it.
+
+What it needs is the half that does not exist: a per-group configuration to map
+a value onto. The shape §4.3.2 asks for is explicit — "Implementations MAY
+facilitate mapping of a specific group value to a specific configuration
+configurable *on a per catalog zone basis*" — so it is a table under the
+catalog's own `[zones.*]` entry rather than a global one, because a producer may
+publish one catalog to several consumer operators who each agreed different
+values:
+
+```toml
+[zones."catalog.invalid."]
+masters = ["192.0.2.1#transfer.key"]
+catalog = true
+[zones."catalog.invalid.".groups."operator-x-signed"]
+masters = ["192.0.2.9#other.key"]
+```
+
+Three things to settle before writing it, none of which 44a had to:
+
+- **A member may carry several group values** (§4.3.2), and "the consumer ...
+  MAY choose to process all, some, or none of them". Two matching groups naming
+  different masters is a conflict with no right answer in the RFC, so the config
+  has to define one — refusing the member and logging it is the only answer that
+  is not a silent choice about what is being served (`CLAUDE.md` §15).
+- **A group value is octets, not text.** `CatalogMember::groups` keeps bytes for
+  the reason `ParsedRecord::TXT` does, and a TOML key is a `String`; the
+  comparison has to be the byte one, with the config key's UTF-8 encoding as the
+  needle.
+- **Changing a member's group is a reconfiguration, not a re-add.** §5.4's reset
+  is about the member *node* label; a group change under the same label means
+  the same zone fetched differently, so the sidecar has to record which group
+  was in force or the change is invisible to the next reconcile.
+
+Not urgent: a fleet with one class of member zone — which is the ordinary case
+and the one 44a's row was about — never writes a group at all.
+
+---
+
+**Done 2026-09-13**, in the shape the row drew: `[zones."$CATZ".groups."value"]`
+with a `masters` list, per catalog zone. All three things the row said to settle
+were settled as it proposed, and one of them was not the hard part.
+
+- **Several groups on one member** is a conflict only when they name *different*
+  masters — two labels for one arrangement is the ordinary way a producer uses
+  §4.3.2's "MAY assign more than one group property". A real conflict refuses the
+  member; a member that is *already* held and becomes conflicted is left exactly
+  as it is, which the row did not consider and which §5.1 decides: an instruction
+  that cannot be followed must not remove or reconfigure anything.
+- **Octets, not text**: the TOML key's UTF-8 encoding is the needle, and the
+  sidecar's third field is RFC 1035 §5.1 escaping with spaces as `\032`, since
+  the row is whitespace-separated. Every byte round-trips, `-` included, which is
+  a test.
+- **A group change under an unchanged node label** replaces the refresh task and
+  keeps the zone file and the transfer state. What the row did not name is what
+  that costs: the copy on disk was fetched from the *old* master, so
+  `withdraw_unvouched_zones` takes the zone out of service until the new one
+  answers — the same rule a configured secondary gets when its `masters` change,
+  and the same one the §4.3.1 handover path has always had. The test asserts the
+  withdrawal rather than the serving, and the log line says it.
+
+**Scope taken, and the part of the row's own sentence that was declined.** The
+row said a group is how a producer says "a different master or key, whether to
+sign it, what to NOTIFY about it". Masters carry the key and the TLS name, so
+that is one setting and not two. The other two are not a consumer's to decide: a
+secondary does not sign a zone it replicates, and NOTIFY targets are
+`server.also-notify`'s, which a member inherits like any other zone. A setting
+whose effect here would be nothing is worse than its absence (`CLAUDE.md` §14).
+
+**Two tests changed**, and they encoded the old sidecar format rather than a
+behaviour: the third field is new, so the lines they assert gained a `-`.
+
+---
+
+### 49. Nothing on the control socket says a zone came from a catalog — ~~**filed 2026-09-12**~~ **closed 2026-09-13**
+
+Also left behind by 44a. RFC 9432 §6 asks for it in as many words: "Querying/
+serving catalog zone contents may be inconvenient via DNS due to the nature of
+their representation ... Implementations are therefore advised to provide a tool
+that uses either the output of AXFR or an out-of-band method to perform queries
+on catalog zones."
+
+What exists, measured rather than recalled: `rdnsctl status` prints one row per
+zone with serial, records, signing and a `secondary` marker, and since 44a that
+marker is read from the live replication registry, so a catalog's members *are*
+marked secondary. What no command says is **which catalog** a zone came from,
+under which member node, or what a catalog holds that this server declined —
+the clash in §5.2 is an ERROR in the log and nowhere else.
+
+The facts are all in the process already: `Catalogs`' sidecar is the mapping and
+`dns_catalog_members` is the count. Two shapes, and the cheap one is probably
+right:
+
+- a `catalog` column on `status`, which costs a row-width and answers "where did
+  this come from" for every zone at once;
+- a `catalog [<zone>]` command listing members with their node labels and
+  groups, which is the tool §6 describes and is the only one that can report a
+  member the server *refused*, since that zone has no row in `status` at all.
+
+The second needs the refusals to be remembered rather than only logged, which is
+the part with a design decision in it: a bounded list per catalog, or nothing.
+
+Small either way, and not urgent — `rdnsd.catalog` beside the zones is plain
+text and answers the first question for anyone who can read the disk. It has a
+number because the operator who cannot is exactly the one `rdnsctl` exists for.
+
+---
+
+**Done 2026-09-13, and both shapes were built**, which the row guessed at with
+"the cheap one is probably right". It was right about the cheap one and wrong
+that it was a choice: the two answer different questions and the second is the
+only one §6 actually describes.
+
+- **The `catalog` column on `status`**, plus `N from a catalog` in the header.
+  A row-width, as predicted, and `-` rather than blank when nothing came from a
+  catalog — a column that is empty for every zone reads as a column that is
+  broken.
+- **`rdnsctl catalog [<zone>]`**: per catalog, its master, every member with the
+  `<unique-N>` label and the group it was provisioned under, and the members the
+  last reconcile refused. A name that is not a configured catalog is `-ERR`,
+  because an empty answer reads as "it has no members".
+
+**The design decision the row named was the refusal list, and the answer is a
+bounded one.** Sixteen shown with the total beside it, for §6's own reason —
+"millions of member zones" — and rebuilt at every reconcile rather than
+accumulated, which is the part the row did not name: a refusal is a property of
+the catalog *as it stands*, so a member refused once and accepted later has to
+stop being reported. That is a test.
+
+**What made it more than plumbing** was that `Catalogs` was built inside the
+`if !secondary_specs.is_empty()` block and the control socket is constructed
+outside it, so a server with no `--secondary` had nothing to ask. It now holds a
+consumer of nothing rather than an `Option` every caller unwraps, and
+`rdnsctl catalog` answers "this server consumes no catalogs".
+
+Three of the new tests are `#[cfg(unix)]`, because the control socket is; the
+platform gap in the test counts is 20 rather than 17 for that reason.
+
+---

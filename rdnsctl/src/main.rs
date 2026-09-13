@@ -25,10 +25,11 @@ struct Cli {
     /// answering, and the server bounds its own reply at 120 seconds.
     #[arg(short, long, value_name = "SECONDS", default_value = "150")]
     timeout: u64,
-    /// `status`, `reload`, `dump <zone>`, `version`, or `help`.
+    /// `status`, `reload`, `dump <zone>`, `catalog [<zone>]`, `version`, or
+    /// `help`.
     #[arg(value_name = "COMMAND", default_value = "status")]
     command: String,
-    /// Arguments for the command — a zone name, for `dump`.
+    /// Arguments for the command — a zone name, for `dump` and `catalog`.
     #[arg(value_name = "ARG")]
     args: Vec<String>,
 }

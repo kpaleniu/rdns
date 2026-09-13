@@ -529,15 +529,23 @@ existed:
 | Is `broken.test` loaded? | REFUSED — also what a zone that was never configured answers | `rdnsctl status` |
 | Is the secondary in sync? | read the state sidecar off the box by hand | `rdnsctl status`, last-contact column |
 | Did that reload take effect? | grep the log and hope the level was left on | `rdnsctl reload` exits non-zero and says why |
+| Where did this zone come from, and what did the catalog refuse? | read `rdnsd.catalog` off the box, and grep the log | `rdnsctl status`'s catalog column, and `rdnsctl catalog` |
 
 ```console
 $ rdnsctl status
 rdnsd 0.1.0 on 127.0.0.1:15356, up 4h 12m
-zones: 2 loaded, 1 replicated
+zones: 3 loaded, 2 replicated, 1 from a catalog
 
-zone                            serial  records  denial  role       last contact
-example.com.                        42       57  NSEC3   primary    -
-replica.test.                        7       12  -       secondary  1754060591 (4m 11s ago)
+zone                            serial  records  denial  role       catalog                   last contact
+example.com.                        42       57  NSEC3   primary    -                         -
+member.test.                         3        9  -       secondary  catalog.invalid.          1754060601 (1m 2s ago)
+replica.test.                        7       12  -       secondary  -                         1754060591 (4m 11s ago)
+
+$ rdnsctl catalog
+catalog catalog.invalid. from 192.0.2.1:53: 1 member(s)
+  member.test.                    node nj2xg5b               group -
+  refused 1 member(s) at the last reconcile:
+  ! example.com.: the configuration already names that zone
 ```
 
 Filesystem permissions are the authentication: the socket is created mode 0600 —

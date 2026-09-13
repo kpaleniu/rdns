@@ -733,6 +733,11 @@ struct ControlPolicy {
     /// primary also has. The live registry, because a catalog's members are
     /// replicated and arrive after startup (`TODO.md` #44a).
     secondaries: Arc<Secondaries>,
+    /// The catalogs this server consumes, so `status` can name the catalog a
+    /// zone came from and `catalog` can report what one holds — refusals
+    /// included, which have no zone and so no row in `status`
+    /// (`TODO.md` #49).
+    catalogs: Arc<crate::catalog::Catalogs>,
     /// For `status`'s uptime. Taken in `main`, not here: loading and signing
     /// every zone happens before `serve` and is the bulk of a big start.
     started: Instant,
@@ -1066,6 +1071,7 @@ async fn serve(
             socket,
             reloads,
             secondaries,
+            catalogs,
             started,
         } = control;
         loops.spawn(control::serve(
@@ -1079,6 +1085,7 @@ async fn serve(
                     journal: server.journal.clone(),
                 },
                 secondaries,
+                catalogs,
                 reloads,
                 started,
                 listen: addr.to_string(),
@@ -2032,6 +2039,11 @@ async fn main() -> Result<()> {
     // here.
     let mut readiness = Readiness::ready();
     let secondaries = Arc::new(Secondaries::default());
+    // Hoisted out of the block below so the control socket can report what each
+    // catalog holds (`TODO.md` #49). A server with no `--secondary` and no
+    // `--catalog` never enters that block, and this stays the empty consumer —
+    // which `rdnsctl catalog` answers as "this server consumes no catalogs".
+    let mut control_catalogs: Option<Arc<Catalogs>> = None;
     if !secondary_specs.is_empty() {
         let ZoneSource::Directory(dir) = &source else {
             // `validate_zone_source` has already refused this combination; this
@@ -2076,6 +2088,7 @@ async fn main() -> Result<()> {
             secondaries.clone(),
             &per_zone.groups,
         )?;
+        control_catalogs = Some(catalogs.clone());
 
         let replication = ReplicationContext {
             served: served.clone(),
@@ -2188,6 +2201,20 @@ async fn main() -> Result<()> {
                 socket: cli.control_socket,
                 reloads,
                 secondaries: secondaries.clone(),
+                catalogs: match control_catalogs {
+                    Some(catalogs) => catalogs,
+                    // No `--secondary` and no `--catalog`: a consumer of
+                    // nothing, rather than an `Option` every caller unwraps.
+                    None => Catalogs::new(
+                        Vec::new(),
+                        &TsigKeyring::default(),
+                        std::collections::HashSet::new(),
+                        Vec::new(),
+                        Path::new("."),
+                        secondaries.clone(),
+                        &std::collections::BTreeMap::new(),
+                    )?,
+                },
                 started,
             },
         },

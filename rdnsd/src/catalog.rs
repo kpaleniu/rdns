@@ -179,8 +179,63 @@ pub(crate) struct Catalogs {
     state: Mutex<CatalogState>,
 }
 
+/// How many refused members one catalog reports, of however many there were.
+///
+/// A bound, because the list is keyed on member names a *producer* chooses and
+/// a mistaken one can list millions (§6). A count beside it, because a bound
+/// with no visible shortfall is a report that is quietly a lie
+/// (`CLAUDE.md` §5). Small on purpose: a fleet with a hundred refusals has one
+/// misconfiguration, not a hundred, and the log has every one of them.
+const MAX_REFUSALS_REPORTED: usize = 16;
+
+/// What one catalog declined to provision at its last reconcile.
+///
+/// Rebuilt from scratch each time rather than accumulated: a member refused
+/// once and accepted later must stop being reported, and §5.2's clash is a
+/// property of the catalog as it stands.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Refusals {
+    /// The first [`MAX_REFUSALS_REPORTED`], in the order the catalog lists them.
+    pub(crate) shown: Vec<(Name, String)>,
+    /// How many there were, which is `shown.len()` unless the bound bit.
+    pub(crate) total: usize,
+}
+
+impl Refusals {
+    fn push(&mut self, zone: Name, why: String) {
+        self.total += 1;
+        if self.shown.len() < MAX_REFUSALS_REPORTED {
+            self.shown.push((zone, why));
+        }
+    }
+}
+
+/// One catalog as `rdnsctl catalog` reports it.
+///
+/// Read by `crate::control` alone, which is `#[cfg(unix)]` because the socket
+/// is. Named in backticks rather than linked, because a link to it resolves to
+/// nothing on Windows — one of the sixteen shapes `cargo doc` found, in
+/// `CLAUDE.md`'s preamble — and built by nothing there, which is what the
+/// attribute below says so that the next reader does not have to work it out.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct CatalogReport {
+    pub(crate) catalog: Name,
+    /// Where the catalog itself comes from, which is also where a member with
+    /// no group comes from.
+    pub(crate) master: String,
+    /// Zone, member node, group — the sidecar's own rows, sorted by zone.
+    pub(crate) members: Vec<(Name, Name, Option<Vec<u8>>)>,
+    pub(crate) refused: Refusals,
+}
+
 struct CatalogState {
     membership: Membership,
+    /// What each catalog declined at its last reconcile, by catalog zone.
+    ///
+    /// §5.2's clash is "an error SHOULD be logged" and was logged and nowhere
+    /// else, so the one question `rdnsctl status` could never answer was about
+    /// a zone that has no row in it (`TODO.md` #49).
+    refused: HashMap<NameKeyBuf, Refusals>,
     /// The serial of each catalog as last reconciled, so an hourly refresh that
     /// changed nothing costs a lookup instead of a parse of every member. A
     /// catalog we could not read is *not* recorded, which is what makes §5.1's
@@ -261,9 +316,63 @@ impl Catalogs {
             configured,
             state: Mutex::new(CatalogState {
                 membership,
+                refused: HashMap::new(),
                 reconciled: HashMap::new(),
             }),
         }))
+    }
+
+    /// What each catalog provisioned and what it declined, for the control
+    /// socket (RFC 9432 §6: "Implementations are ... advised to provide a tool
+    /// ... to perform queries on catalog zones").
+    ///
+    /// A snapshot under the one lock the reconcile also takes, so a report is
+    /// never half of one reconcile and half of the next.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) async fn report(&self) -> Vec<CatalogReport> {
+        let state = self.state.lock().await;
+        let mut reports: Vec<CatalogReport> = self
+            .by_zone
+            .values()
+            .map(|spec| {
+                let mut members: Vec<(Name, Name, Option<Vec<u8>>)> = state
+                    .membership
+                    .members_of(spec.spec.zone.as_ref())
+                    .into_iter()
+                    .map(|row| (row.zone, row.node, row.group))
+                    .collect();
+                members.sort_by_key(|(zone, _, _)| zone.to_string());
+                CatalogReport {
+                    catalog: spec.spec.zone.clone(),
+                    master: spec.spec.master.to_string(),
+                    members,
+                    refused: state
+                        .refused
+                        .get(&*spec.spec.zone.as_ref().folded())
+                        .cloned()
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        reports.sort_by_key(|report| report.catalog.to_string());
+        reports
+    }
+
+    /// Which catalog provisioned each member, for the `catalog` column on
+    /// `rdnsctl status`.
+    ///
+    /// The sidecar's rows rather than the catalogs' contents: a zone is this
+    /// server's member because the sidecar says so, which is the same fact
+    /// §5.3's removal turns on.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) async fn provenance(&self) -> Vec<(Name, Name)> {
+        let state = self.state.lock().await;
+        state
+            .membership
+            .rows()
+            .iter()
+            .map(|row| (row.zone.clone(), catalog_of(row.node.as_ref()).to_owned()))
+            .collect()
     }
 
     /// Every catalog, for the startup pass.
@@ -413,6 +522,9 @@ impl Catalogs {
         lifecycle: &Lifecycle,
     ) {
         let mine: Vec<MemberRow> = state.membership.members_of(spec.spec.zone.as_ref());
+        // Rebuilt from scratch: a member refused last time and accepted now
+        // must stop being reported (`TODO.md` #49).
+        let mut refused = Refusals::default();
 
         for member in catalog.members() {
             // Which group's configuration this member now falls under, and
@@ -428,6 +540,7 @@ impl Catalogs {
                     spec.spec.zone,
                     member.zone()
                 );
+                refused.push(member.zone().to_owned(), why.clone());
                 continue;
             }
             let group = match &fetch {
@@ -494,6 +607,7 @@ impl Catalogs {
                             spec.spec.zone,
                             member.zone()
                         );
+                        refused.push(member.zone().to_owned(), why);
                     }
                     Ownership::AlreadyHandedOver(to) => {
                         // Not an error, and this is why it is not: §4.3.1 leaves
@@ -539,6 +653,10 @@ impl Catalogs {
                 },
             }
         }
+
+        state
+            .refused
+            .insert(NameKeyBuf::new(spec.spec.zone.as_ref()), refused);
 
         // §5.3: removed from this catalog, and configured from this catalog, so
         // ours to remove.
@@ -1709,6 +1827,84 @@ mod tests {
         assert_eq!(
             h.membership().lines().last(),
             Some("example.com. nj2xg5b.zones.catalog.invalid. operator-y")
+        );
+    }
+
+    /// RFC 9432 §6, the point of #49: the refusals §5.2 says to log are also
+    /// reported, because a member this server declined has no zone and so no
+    /// row in `rdnsctl status`.
+    ///
+    /// Rebuilt every reconcile, so a member refused once and accepted later
+    /// stops being reported — which the second half asserts.
+    #[tokio::test]
+    async fn a_refused_member_is_reported_until_it_stops_being_refused() {
+        let h = Harness::new("catalog-report", &["catalog.invalid."], &["example.com."]);
+        h.publish(catalog_zone(
+            "catalog.invalid.",
+            1,
+            &[("nj2xg5b", "example.com."), ("nvxxezj", "example.net.")],
+            "",
+        ))
+        .await;
+
+        let report = h.catalogs.report().await;
+        assert_eq!(report.len(), 1);
+        assert_eq!(
+            report[0].members.len(),
+            1,
+            "one provisioned: {:?}",
+            report[0].members
+        );
+        assert_eq!(report[0].refused.total, 1);
+        assert_eq!(report[0].refused.shown[0].0, nm("example.com."));
+        assert!(
+            report[0].refused.shown[0].1.contains("configuration"),
+            "and why: {}",
+            report[0].refused.shown[0].1
+        );
+
+        // The clash goes away because the catalog stops listing it.
+        h.publish(catalog_zone(
+            "catalog.invalid.",
+            2,
+            &[("nvxxezj", "example.net.")],
+            "",
+        ))
+        .await;
+        assert_eq!(
+            h.catalogs.report().await[0].refused.total,
+            0,
+            "a refusal is a property of the catalog as it stands, not a log"
+        );
+    }
+
+    /// The refusal list is bounded, and says how much it is not showing: a
+    /// producer's member list is what §6 warns can be millions.
+    #[tokio::test]
+    async fn the_refusal_list_is_bounded_and_says_so() {
+        let refused: Vec<String> = (0..MAX_REFUSALS_REPORTED + 4)
+            .map(|i| format!("clash{i}.test."))
+            .collect();
+        let configured: Vec<&str> = refused.iter().map(String::as_str).collect();
+        let h = Harness::new("catalog-report-bound", &["catalog.invalid."], &configured);
+        let members: Vec<(String, &str)> = refused
+            .iter()
+            .enumerate()
+            .map(|(i, zone)| (format!("m{i}"), zone.as_str()))
+            .collect();
+        let members: Vec<(&str, &str)> = members
+            .iter()
+            .map(|(id, zone)| (id.as_str(), *zone))
+            .collect();
+        h.publish(catalog_zone("catalog.invalid.", 1, &members, ""))
+            .await;
+
+        let report = h.catalogs.report().await;
+        assert_eq!(report[0].refused.total, MAX_REFUSALS_REPORTED + 4);
+        assert_eq!(
+            report[0].refused.shown.len(),
+            MAX_REFUSALS_REPORTED,
+            "bounded, and the total says how many it is not showing"
         );
     }
 

@@ -69,7 +69,7 @@ Operations:
 - Prometheus metrics: RED counters, answer-latency histogram, per-zone serial and
   last-refresh gauges, `/healthz` and `/readyz`
 - A container image (`Dockerfile`), unprivileged, built and exercised in CI
-- A control socket and `rdnsctl`: `status`, `reload`, `dump`
+- A control socket and `rdnsctl`: `status`, `reload`, `dump`, `catalog`
 
 ## Quick start
 
@@ -250,9 +250,10 @@ readinessProbe:
 ### Monitoring
 
 ```bash
-rdnsctl status               # zones, serials, records, denial, role, last contact
+rdnsctl status               # zones, serials, records, denial, role, catalog, last contact
 rdnsctl reload               # re-read every zone; exits non-zero if it failed
 rdnsctl dump example.com.    # the zone as served, signatures and all
+rdnsctl catalog              # what each catalog provisioned, and what it refused
 
 journalctl -u rdns -f
 ```
