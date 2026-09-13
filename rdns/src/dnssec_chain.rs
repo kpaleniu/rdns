@@ -478,6 +478,7 @@ impl<'a> ChainValidator<'a> {
             .iter()
             .map(|ds| {
                 RecordData::from_parsed(&crate::ParsedRecord::DS {
+                    rtype: rt::DS,
                     key_tag: ds.key_tag,
                     algorithm: ds.algorithm,
                     digest_type: ds.digest_type,

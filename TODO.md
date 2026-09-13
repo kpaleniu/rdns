@@ -37,9 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#55**, **#56**, **#57**, **#58**, **#59**, **#60** and **#21**, as of
-2026-09-13. **#44 and #45 are both closed in full, and so are #48, #49, #51,
-#53 and #54**, which is everything 44a and #50 left.
+**#56**, **#57**, **#58**, **#59**, **#60** and **#21**, as of 2026-09-13.
+**#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
+#55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
 which closed the same day carrying two MUSTs it had been filed as not
 breaking: RFC 6891 §6.1.1's OPT in a response to a request that had one, and
@@ -48,9 +48,9 @@ as "not a defect" because its own row read §6.1.1 as "asks for", and the sectio
 says what the difference cost. Of what is left, #50 was the live one, and
 closing it is what added #53 — a zone this server signed itself verified again
 at every load — which closed the same day it was taken.
-#55 is what 44f left, #56 and #57 what 45a left, #58 what 45b left, #59 what
-#51 left and #60 what #51 turned up on the way; and #21 is an inventory of
-deliberate deviations rather than a queue. **#59's prerequisite is gone**: #54
+#56 and #57 are what 45a left, #58 what 45b left, #59 what #51 left and #60
+what #51 turned up on the way; and #21 is an inventory of deliberate deviations
+rather than a queue. **#59's prerequisite is gone**: #54
 was it, and closing it put `validation::Arrival` where a peer certificate can
 hang off the two TLS variants and nowhere else. Everything else numbered is closed; the table
 under "Closed work" says which, when, and where the reasoning went.
@@ -832,7 +832,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#55**, **#56**, **#57**, **#58**, **#59** and **#60**, plus
+**#56**, **#57**, **#58**, **#59** and **#60**, plus
 **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
@@ -1183,54 +1183,6 @@ Three things to settle:
 
 ---
 
-### 55. Nothing generates CDS or CDNSKEY, so a KSK rollover still needs a human — **filed 2026-09-12**
-
-Left behind by 44f, which automated RFC 6781 §4.1.1.1's ZSK rollover and stopped
-where the parent starts.
-
-The four timing fields work for a KSK exactly as they do for a ZSK — publish
-both, sign the DNSKEY RRset with both, withdraw the old one — but §4.1.2's
-double-signature rollover has a step in the middle that no local schedule can
-take: **the parent's DS RRset has to change**. RFC 7344 is how that is automated
-without a registrar API: the child publishes CDS and CDNSKEY records saying what
-it wants the parent's DS to become, and RFC 8078 §3 gives the parent the rules
-for acting on them.
-
-**What is missing, measured rather than recalled.** `record_types.rs` names
-neither type: CDS is 59 and CDNSKEY is 60, and both are absent, so a zone file
-carrying one is parsed as RFC 3597 generic RDATA and served unchanged. That is
-not nothing — an operator who writes the records by hand today gets them
-published and signed — so the gap is *generation*, not carriage.
-
-Three things to settle, none of which 44f had to:
-
-- **Which keys.** RFC 7344 §4.1: the CDS/CDNSKEY RRset is "the DS RRset the
-  child wants", so it is the KSKs that will be published *after* the rollover,
-  not the ones published now. With 44f's timing that is computable — the keys
-  whose `Delete` is not in the near future — but "near" is a policy and the RFC
-  does not set it.
-- **The delete signal.** RFC 8078 §4 defines a CDS with algorithm 0 meaning
-  "withdraw the DS and go insecure". That is a footgun with a DNSSEC-sized blast
-  radius and it should not be reachable by accident, which argues for it being a
-  separate explicit setting rather than a state the timing fields can produce.
-- **Signing.** RFC 7344 §4.1 requires the CDS/CDNSKEY RRset to be signed by a
-  key the *current* DS set authenticates — i.e. by the outgoing KSK, not the
-  incoming one. `sign_everything` signs the DNSKEY RRset with every SEP key it
-  holds; this RRset needs a narrower rule, and getting it wrong publishes a
-  rollover instruction the parent cannot verify.
-
-**What would refute the value of this** (§19): that the registrars a fleet uses
-poll CDS at all. RFC 8078 is a decade old and adoption is uneven, so a server
-that publishes CDS into a parent that never looks has automated nothing. That is
-worth checking against the actual parent before building it — and it is also why
-the records being *carriable* today is most of what a cautious operator needs.
-
-Not urgent. A KSK rollover is a once-a-year-per-zone event that an operator
-already has to schedule with their registrar, and 44f made the frequent half —
-the ZSK — hands-off.
-
----
-
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -1365,6 +1317,7 @@ the week; the record is under "How the queue kept going stale" in
 | **53** | a zone was verified at load even when this server had just signed it | **filed 2026-09-12, closed 2026-09-13**, left behind by #50 and only visible once #50 stopped hiding it. The row proposed "verify what we signed once, at startup"; what landed is **once per zone per set of signing keys**, which costs the same and has neither of that rule's two holes — a zone appearing after a SIGHUP was never at a startup, and #44f made a key crossing its Activate change the output with the zone file unchanged, so a rollover publishes signatures nothing has checked. `ZoneSigning::apply` returns what it signed with which key tags; the proof is recorded **after** the zone verifies, because recording first lets the next reload install what this one refused (§4), and that is a test. Startup and `--check-config` still check everything. Worth 76 s of a re-signing tick on a million-record zone, asserted as a count (`Checked { zones: 0, rrsets: 0, skipped: 1 }`) rather than a clock. The number the row said would decide it — how long a fleet's tick may take — was not needed. Nothing filed on the way out |
 | **51** | XoT authorized its client by ACL and TSIG, never by certificate | **filed 2026-09-12, closed 2026-09-13**, the client half — which is the gap the row was filed for: a primary demanding mTLS could not be replicated from. `--transfer-tls-cert`/`--transfer-tls-key`, both or neither and only with `--transfer-tls-ca`. Two things the row did not have: rustls runs `keys_match` inside `with_client_auth_cert`, so a mismatched pair is a startup error for free; and `XotTrust::anchor_count` had **no callers** — written "for the startup banner" and the banner never added (§18), which is where "a certificate is loaded" is now said, since a certificate is offered only if a master asks and "mTLS is in force" is not a claim this end can make. One PEM loader now, `rdns::tls_identity::TlsIdentity`, which is what `rdns-transport`'s `read_certs`/`read_key` became (§7). The negative control corrected the guess (§19): a master that demands a certificate and gets none fails on the **read**, not the handshake — TLS 1.3 lets the client finish first — so what the operator sees is `CertificateRequired` under the transfer. Filed **#59** (the server half: #54's plumbing under #16's question) and **#60** |
 | **54** | a dispatcher could not say which encrypted transport a message arrived on | **filed 2026-09-12, closed 2026-09-13**, taken ahead of #59 because it is its plumbing. `validation::Arrival` on `Handler::handle`, `tcp::serve_one` and `Wire::Framed`; `Privacy` is derived from it and dnstap now names all five transports. **All three shapes were built** (§19) and the decision turned on none of the things that were argued: A is not a shape at all — clippy says "too many arguments (8/7)" at `serve_one`, exactly as the row predicted; B and C are the same **2** bytes, within ten lines of diff, and the same 1,121 tests. What decided it is that B compiles `Arrival { privacy: Tls13, protocol: Tcp }` — a plain TCP connection claiming to have hidden everything, which is the value `answer_transfer` reads to let a zone leave the building. **And the row's own numbers did not reproduce**: it claimed 30 `Privacy` sites of which 19 were `Privacy::Clear`; re-counted on the commit before the fix, 44 across 8 files of which 10. Nothing had touched `Privacy` in between. Nothing filed on the way out |
+| **55** | nothing generated CDS or CDNSKEY, so a KSK rollover still needed a human | **filed 2026-09-12, closed 2026-09-13**, and the row's premise was wrong where it was most confident: "the gap is *generation*, not carriage" — an operator writing `CDS` by hand got *unsupported record type "CDS"*, and only RFC 3597's `TYPE59` form parsed. One `parse_zone_file` call settled it (§4). Three halves, all done. **Carriage**: both types named, one `ParsedRecord` arm each on the SVCB/HTTPS precedent, an `rtype` field across **19 sites** counted before one was edited. **Generation**: `SyncPublish`/`SyncDelete` per key, BIND's `dnssec-settime -P sync` field names, which dodges the row's "near future is a policy" problem and says the truer thing — a rollover step must not ask a registrar to act. **Signing**, the one that mattered: RFC 7344 §4.1 needs a key in both the DNSKEY *and* the DS RRsets, and `sign_everything` would have used the ZSK, which nothing downstream would report because the RRset verifies fine against the zone's own keys. RFC 8078 §4's algorithm-0 record is never generated and a zone carrying one beside a sync window is a failed run. Also closed a hole in **#53**: a `SyncPublish` crossing changes the output without changing the signing key set. dnspython validates both RRsets off a live `rdnsd` and agrees on the digest. Nothing filed on the way out |
 | **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. |
 | **52** | a rate-limit test is a coin toss at a second boundary | **filed and closed 2026-09-12**, one commit. Not a defect in the server, and the filing undercounted it by 23: the shape is a test that reads the wall clock at a limiter call, and there were **43 such call sites across 24 tests**, six of them assertions a refill actually breaks. Both buckets refill by whole seconds, so the verdict depended on whether two reads straddled one. 41 sites needed nothing but one `let now` per test, because `should_allow` has taken the instant as a parameter since #28a; the two that read the clock inside the loop under test — `tcp::serve`'s per-connection charge and `rdnsr`'s UDP loop — got `rdns::clock::Clock` on `ServeContext`. The test now asserts the refill as well as the refusal, which is the half that says the connection was charged rather than never admitted |
 | **47** | a NOTIFY reply carried no OPT record | **filed and closed 2026-09-12**, one commit, and it was a defect after all: the row read RFC 6891 §6.1.1 as "asks for" where it is "if an OPT record is present in a received **request**, compliant responders MUST include an OPT record in their respective responses" — a NOTIFY is a request. Counting the shape (§18) found a second site and a second MUST: `transfer::Envelopes` built the first AXFR envelope's OPT from `has_edns()` and a fresh `Edns`, which drops DO, against RFC 3225 §3's unconditional "the DO bit of the query MUST be copied in the response". Nothing tested either. The three NOTIFY refusals now carry three different EDEs, because "you are not one of my masters" and "I am that zone's primary" are one RCODE and two operator problems. `ClientEdns::mirror_with` became total on the way, so the `Err` all three callers answered identically is one doc comment rather than four. The EDE half is a reading rather than a quotation and the peers were asked: BIND 9.20 and Knot 3.6 mirror the OPT and DO and send no EDE, NSD 4.12 answers NXDOMAIN with QDCOUNT=0 and no OPT. Nine new assertions in the interop harness, 29 passed 0 failed in 43e |

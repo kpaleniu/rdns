@@ -310,6 +310,7 @@ mod tests {
     #[test]
     fn test_record_type_code_dnssec() {
         let dnskey = RecordData::from_parsed(&ParsedRecord::DNSKEY {
+            rtype: crate::record_types::DNSKEY,
             flags: 0x0100,
             protocol: 3,
             algorithm: 8,
@@ -319,6 +320,7 @@ mod tests {
         assert_eq!(dnskey.rtype(), rt::DNSKEY);
 
         let ds = RecordData::from_parsed(&ParsedRecord::DS {
+            rtype: crate::record_types::DS,
             key_tag: 12345,
             algorithm: 8,
             digest_type: 2,

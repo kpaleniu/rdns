@@ -189,6 +189,10 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
             }
         }
         ParsedRecord::DNSKEY {
+            // The mnemonic comes from the record's own type, not from here:
+            // a CDNSKEY prints the same RDATA under another name
+            // (RFC 7344 §3.2).
+            rtype: _,
             flags,
             protocol,
             algorithm,
@@ -198,6 +202,7 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
             base64_encode(public_key)
         ),
         ParsedRecord::DS {
+            rtype: _,
             key_tag,
             algorithm,
             digest_type,
@@ -556,6 +561,53 @@ mod tests {
         assert_eq!(
             first.query(nm("example.com.").as_ref(), Qtype::of(rt::NSEC3))[0].rdata,
             second.query(nm("example.com.").as_ref(), Qtype::of(rt::NSEC3))[0].rdata
+        );
+    }
+
+    /// CDS and CDNSKEY read and write under their own names, not as
+    /// `TYPE59`/`TYPE60`.
+    ///
+    /// They share DS's and DNSKEY's formats (RFC 7344 §3.1, §3.2) and one
+    /// `ParsedRecord` arm each, so what could go wrong is the *name*: a record
+    /// that parses into the DS arm and prints as `DS` is a different record,
+    /// and a signature over it covers a different type code. Until `TODO.md`
+    /// #55 neither name parsed at all — the row said an operator could write
+    /// them by hand, and `record_type_name_to_code` said `unsupported record
+    /// type "CDS"`.
+    #[test]
+    fn cds_and_cdnskey_round_trip_under_their_own_names() {
+        // Unindented, because a leading space makes a line a continuation of
+        // the record above it — a zone file's own syntax, not this file's
+        // formatting.
+        const TEXT: &str = "\
+@ IN SOA ns1. admin. 1 2 3 4 5
+@ 3600 IN CDS 12345 8 2 49FD46E6C4B45C55D4AC69CBD3CD34AC1AFE51DE1EE8F13B5F5D1D1D1D1D1D1D
+@ 3600 IN CDNSKEY 257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3
+@ 3600 IN CDS 0 0 0 00
+";
+        let (first, second, written) = round_trip(TEXT, "example.com.");
+        assert!(written.contains("CDS     12345 8 2 49FD46E6"), "{written}");
+        assert!(written.contains("CDNSKEY 257 3 8 "), "{written}");
+        // RFC 8078 §4's "withdraw the DS": an operator is allowed to mean it,
+        // and nothing here generates it.
+        assert!(written.contains("CDS     0 0 0 00"), "{written}");
+        assert!(
+            !written.contains("TYPE59") && !written.contains("TYPE60"),
+            "neither took RFC 3597's generic escape hatch: {written}"
+        );
+
+        let cds = |z: &Zone| {
+            z.query(nm("example.com.").as_ref(), Qtype::of(rt::CDS))
+                .len()
+        };
+        assert_eq!(cds(&first), 2);
+        assert_eq!(cds(&second), 2);
+        // And neither is a DS: the arm is shared, the type code is not.
+        assert_eq!(
+            first
+                .query(nm("example.com.").as_ref(), Qtype::of(rt::DS))
+                .len(),
+            0
         );
     }
 

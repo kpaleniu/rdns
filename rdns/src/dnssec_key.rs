@@ -150,12 +150,40 @@ pub struct KeyTiming {
     pub inactive: Option<u64>,
     /// Leaves the DNSKEY RRset here.
     pub delete: Option<u64>,
+    /// A CDS and CDNSKEY asking the parent to publish a DS for this key appear
+    /// from here (RFC 7344). Absent means never: publishing one is a request to
+    /// change the *parent's* DS RRset, which no schedule of this zone's own can
+    /// be allowed to infer.
+    ///
+    /// `SyncPublish` in the file, which is `dnssec-settime -P sync`'s field, so
+    /// an operator who has run a BIND rollover writes the same word.
+    pub sync_publish: Option<u64>,
+    /// Those records go away here. `SyncDelete`, `dnssec-settime -D sync`.
+    ///
+    /// Not RFC 8078 §4's algorithm-0 "withdraw the DS and go insecure": that is
+    /// a different record with a much larger blast radius, and no timing field
+    /// produces it. See [`super::zone_signer::sign_zone`].
+    pub sync_delete: Option<u64>,
 }
 
 impl KeyTiming {
     /// Whether the key belongs in the DNSKEY RRset at `now`.
     pub fn is_published(&self, now: u64) -> bool {
         self.publish.is_none_or(|t| now >= t) && self.delete.is_none_or(|t| now < t)
+    }
+
+    /// Whether a CDS and CDNSKEY for this key belong in the zone at `now`
+    /// (RFC 7344 §4.1).
+    ///
+    /// Independent of [`KeyTiming::is_published`], deliberately. The two
+    /// windows overlap in an ordinary rollover and are not the same window:
+    /// §4.1 has the child publish what it wants the parent's DS to *become*,
+    /// which is the incoming key — published locally before the parent knows
+    /// about it — and stop once the parent has acted, which is long before the
+    /// key is withdrawn. Tying this to `Publish`/`Delete` would ask the parent
+    /// to change its DS on every rollover step.
+    pub fn is_sync_published(&self, now: u64) -> bool {
+        self.sync_publish.is_some_and(|t| now >= t) && self.sync_delete.is_none_or(|t| now < t)
     }
 
     /// Whether the key may sign at `now`.
@@ -178,11 +206,21 @@ impl KeyTiming {
     /// validity — ten days, by default, for a step whose whole purpose is to
     /// land at a TTL boundary.
     pub fn next_change(&self, now: u64) -> Option<u64> {
-        [self.publish, self.activate, self.inactive, self.delete]
-            .into_iter()
-            .flatten()
-            .filter(|t| *t > now)
-            .min()
+        // The two sync moments are here as well: a `SyncPublish` at noon has to
+        // reach the zone at noon, and the ordinary tick is a third of the
+        // signature validity. Same reason as the other four (`TODO.md` #44f).
+        [
+            self.publish,
+            self.activate,
+            self.inactive,
+            self.delete,
+            self.sync_publish,
+            self.sync_delete,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|t| *t > now)
+        .min()
     }
 
     /// The ordering RFC 6781 §4.1.1.1 walks through, as a check.
@@ -196,6 +234,11 @@ impl KeyTiming {
             (self.activate, self.inactive, "Activate is after Inactive"),
             (self.inactive, self.delete, "Inactive is after Delete"),
             (self.publish, self.delete, "Publish is after Delete"),
+            (
+                self.sync_publish,
+                self.sync_delete,
+                "SyncPublish is after SyncDelete",
+            ),
         ] {
             if let (Some(earlier), Some(later)) = (earlier, later) {
                 if earlier > later {
@@ -211,7 +254,7 @@ impl KeyTiming {
     }
 }
 
-/// The four timing fields, or nothing at all when the key carries none.
+/// The six timing fields, or nothing at all when the key carries none.
 ///
 /// Omitted rather than written as empty: a key that does not roll should look
 /// like a key that does not roll, and an operator reading the file should not
@@ -222,6 +265,8 @@ fn timing_lines(timing: &KeyTiming) -> String {
         ("Activate", timing.activate),
         ("Inactive", timing.inactive),
         ("Delete", timing.delete),
+        ("SyncPublish", timing.sync_publish),
+        ("SyncDelete", timing.sync_delete),
     ]
     .into_iter()
     .filter_map(|(name, at)| at.map(|at| format!("{name}: {at}\n")))
@@ -588,6 +633,10 @@ impl SigningKey {
                 "activate" => timing.activate = Some(timestamp(value, "Activate")?),
                 "inactive" => timing.inactive = Some(timestamp(value, "Inactive")?),
                 "delete" => timing.delete = Some(timestamp(value, "Delete")?),
+                // And the two that are about the *parent's* DS RRset rather
+                // than this zone's DNSKEY RRset (RFC 7344, `TODO.md` #55).
+                "syncpublish" => timing.sync_publish = Some(timestamp(value, "SyncPublish")?),
+                "syncdelete" => timing.sync_delete = Some(timestamp(value, "SyncDelete")?),
                 // Unknown fields ignored so a file from a later version loads,
                 // as the anchor file does.
                 _ => {}
@@ -789,6 +838,7 @@ mod tests {
             activate: Some(1_700_086_400),
             inactive: Some(1_702_678_400),
             delete: Some(1_702_764_800),
+            ..KeyTiming::default()
         };
         let rolling = SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", 0x0100)
             .expect("a key")

@@ -247,6 +247,7 @@ impl TestZone {
 /// A DNSKEY's RDATA in stored form.
 pub fn dnskey_rdata(key: &Dnskey) -> RecordData {
     RecordData::from_parsed(&ParsedRecord::DNSKEY {
+        rtype: crate::record_types::DNSKEY,
         flags: key.flags,
         protocol: key.protocol,
         algorithm: key.algorithm,
@@ -283,6 +284,7 @@ pub fn ds_record(ds: &Ds, ttl: Ttl) -> ResourceRecord {
         class: Class::new(1),
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::DS {
+            rtype: crate::record_types::DS,
             key_tag: ds.key_tag,
             algorithm: ds.algorithm,
             digest_type: ds.digest_type,

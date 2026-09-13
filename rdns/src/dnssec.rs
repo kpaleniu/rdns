@@ -91,6 +91,9 @@ impl Dnskey {
         }
         match rr.rdata.parse().ok()? {
             ParsedRecord::DNSKEY {
+                // Checked above: a CDNSKEY parses into this arm and is not one
+                // of these (RFC 7344 §3.2).
+                rtype: _,
                 flags,
                 protocol,
                 algorithm,
@@ -208,6 +211,8 @@ impl Ds {
         }
         match rr.rdata.parse().ok()? {
             ParsedRecord::DS {
+                // Checked above, as in `Dnskey::from_record`.
+                rtype: _,
                 key_tag,
                 algorithm,
                 digest_type,

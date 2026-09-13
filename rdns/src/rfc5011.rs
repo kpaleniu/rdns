@@ -685,6 +685,7 @@ fn absolute(name: &str) -> String {
 #[cfg(test)]
 fn key_record(key: &Dnskey, ttl: Ttl) -> Option<ResourceRecord> {
     let rdata = RecordData::from_parsed(&ParsedRecord::DNSKEY {
+        rtype: crate::record_types::DNSKEY,
         flags: key.flags,
         protocol: key.protocol,
         algorithm: key.algorithm,
@@ -1300,6 +1301,7 @@ mod tests {
             .iter()
             .map(|key| {
                 RecordData::from_parsed(&ParsedRecord::DNSKEY {
+                    rtype: crate::record_types::DNSKEY,
                     flags: key.flags,
                     protocol: key.protocol,
                     algorithm: key.algorithm,

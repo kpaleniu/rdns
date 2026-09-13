@@ -2373,6 +2373,18 @@ fn generate_keys(zone: &str, dir: &Path, algorithm: &str) -> Result<()> {
         "\nUntil it is published, {zone} is signed but insecure: a validator has no way to \
          reach these keys."
     );
+    // The second half of the same operator task, which nothing else names: a
+    // parent that polls CDS does not need the paste, and the only way to ask it
+    // to is a field in the key file (RFC 7344, `TODO.md` #55). Said here
+    // because this is the one command an operator runs before a rollover, and a
+    // feature nobody can find is a feature nobody uses (`CLAUDE.md` §14).
+    println!(
+        "\nFor a parent that polls CDS/CDNSKEY instead (RFC 7344), add\n\
+         \n    SyncPublish: <unix seconds>\n\
+         \nto {} and reload. The records appear at the apex, signed by the \
+         KSK, and go away again at an optional SyncDelete.",
+        ksk.file_name()
+    );
     Ok(())
 }
 

@@ -81,7 +81,16 @@ pub enum ParsedRecord {
     /// `String` would fail the whole message on a TXT carrying non-UTF-8 data.
     TXT(Vec<Vec<u8>>),
     AAAA(Ipv6Addr),
+    /// A zone's public key (RFC 4034 §2), or the child's request that the
+    /// parent build a DS from one (CDNSKEY, RFC 7344 §3.2).
+    ///
+    /// One arm for two type codes, as [`ParsedRecord::SVCB`] is: §3.2 gives
+    /// CDNSKEY "the same wire and presentation format as the DNSKEY record",
+    /// so a second arm would be a second parser for one syntax
+    /// (`CLAUDE.md` §7). `rtype` says which of the two it is and cannot
+    /// disagree with the enclosing [`RecordData`].
     DNSKEY {
+        rtype: Rtype,
         flags: u16,
         protocol: u8,
         algorithm: u8,
@@ -98,7 +107,12 @@ pub enum ParsedRecord {
         signer_name: Name,
         signature: Vec<u8>,
     },
+    /// A delegation's signer (RFC 4034 §5), or what the child wants that to
+    /// become (CDS, RFC 7344 §3.1, "the same wire and presentation format as
+    /// the DS record"). `rtype` says which, as it does for
+    /// [`ParsedRecord::DNSKEY`].
     DS {
+        rtype: Rtype,
         key_tag: u16,
         algorithm: u8,
         digest_type: u8,
@@ -294,7 +308,7 @@ impl ParsedRecord {
                 let addr: [u8; 16] = rdata.try_into()?;
                 Ok(ParsedRecord::AAAA(Ipv6Addr::from(addr)))
             }
-            record_types::DS => {
+            record_types::DS | record_types::CDS => {
                 let (key_tag, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
                     return Err(WireError::Truncated {
@@ -307,6 +321,7 @@ impl ParsedRecord {
                 let digest_type = rest[1];
                 let digest = rest[2..].to_vec();
                 Ok(ParsedRecord::DS {
+                    rtype: record_type,
                     key_tag,
                     algorithm,
                     digest_type,
@@ -353,7 +368,7 @@ impl ParsedRecord {
                     type_bitmap,
                 })
             }
-            record_types::DNSKEY => {
+            record_types::DNSKEY | record_types::CDNSKEY => {
                 let (flags, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
                     return Err(WireError::Truncated {
@@ -366,6 +381,7 @@ impl ParsedRecord {
                 let algorithm = rest[1];
                 let public_key = rest[2..].to_vec();
                 Ok(ParsedRecord::DNSKEY {
+                    rtype: record_type,
                     flags,
                     protocol,
                     algorithm,
@@ -492,6 +508,7 @@ impl ParsedRecord {
                 (record_types::SOA, v)
             }
             ParsedRecord::DNSKEY {
+                rtype,
                 flags,
                 protocol,
                 algorithm,
@@ -501,7 +518,7 @@ impl ParsedRecord {
                 v.push(*protocol);
                 v.push(*algorithm);
                 v.extend_from_slice(public_key);
-                (record_types::DNSKEY, v)
+                (*rtype, v)
             }
             ParsedRecord::RRSIG {
                 type_covered,
@@ -527,6 +544,7 @@ impl ParsedRecord {
                 (record_types::RRSIG, v)
             }
             ParsedRecord::DS {
+                rtype,
                 key_tag,
                 algorithm,
                 digest_type,
@@ -536,7 +554,7 @@ impl ParsedRecord {
                 v.push(*algorithm);
                 v.push(*digest_type);
                 v.extend_from_slice(digest);
-                (record_types::DS, v)
+                (*rtype, v)
             }
             ParsedRecord::NSEC {
                 next_domain_name,

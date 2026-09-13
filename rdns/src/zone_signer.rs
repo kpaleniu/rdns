@@ -347,6 +347,13 @@ fn sign_zone_inner(
         policy.signed_at,
         &mut signed,
     );
+    publish_sync_records(
+        keys,
+        origin.as_ref(),
+        dnskey_ttl,
+        policy.signed_at,
+        &mut signed,
+    )?;
 
     // Before `Layout::of`, which snapshots which types are at which name. Every
     // NSEC3 bitmap "MUST indicate the presence of all types present at the
@@ -693,7 +700,10 @@ pub fn algorithms_missing_signatures(zone: &Zone) -> Vec<u8> {
     let mut missing = Vec::new();
     for record in zone.query(origin, Qtype::of(rt::DNSKEY)) {
         let Ok(ParsedRecord::DNSKEY {
-            flags, algorithm, ..
+            rtype: _,
+            flags,
+            algorithm,
+            ..
         }) = record.rdata.parse()
         else {
             continue;
@@ -754,6 +764,118 @@ fn publish_dnskeys(
         });
     }
     ttl
+}
+
+/// Ask the parent to publish a DS for every key inside its sync window
+/// (RFC 7344).
+///
+/// A CDS and a CDNSKEY per key, at the apex, saying what the child wants the
+/// parent's DS RRset to *become* — "the CDS RRset expresses what the child
+/// would like the DS RRset to look like" (§4.1). Both types, because §4.1 has
+/// the child publish both and lets the parent use whichever it prefers.
+///
+/// **The window is its own two fields and is not derived from the rollover
+/// schedule.** `SyncPublish`/`SyncDelete` (BIND's `dnssec-settime -P sync` /
+/// `-D sync`) rather than "the keys whose `Delete` is not soon": publishing a
+/// CDS is a request to change the *parent's* zone, and inferring it from a
+/// local schedule means every rollover step asks a registrar to act. Absent is
+/// never, so a key file written before this existed publishes nothing.
+///
+/// **SHA-256 only** (digest type 2). RFC 8624 §3.3 makes it the one digest that
+/// is MUST for both signing and validation; SHA-1 is MUST NOT sign, and SHA-384
+/// is optional either way. Offering the operator a choice would be a knob whose
+/// wrong setting is a DS the parent rejects.
+///
+/// **RFC 8078 §4's "delete" CDS is deliberately not produced here.** A CDS with
+/// algorithm 0 tells the parent to withdraw the DS and take the zone insecure,
+/// which no timing field should be able to reach by accident; an operator who
+/// means it writes `CDS 0 0 0 00` in the zone file, which this tree now parses
+/// (`TODO.md` #55).
+fn publish_sync_records(
+    keys: &[SigningKey],
+    origin: NameRef<'_>,
+    ttl: Ttl,
+    now: u64,
+    signed: &mut Zone,
+) -> Result<()> {
+    /// RFC 8624 §3.3's only MUST for a DS digest.
+    const SHA256: u8 = 2;
+
+    let existing: Vec<RecordData> = signed
+        .query(origin, Qtype::of(rt::CDS))
+        .iter()
+        .chain(signed.query(origin, Qtype::of(rt::CDNSKEY)).iter())
+        .map(|r| r.rdata.clone())
+        .collect();
+
+    let wanted: Vec<&SigningKey> = keys
+        .iter()
+        .filter(|k| k.timing().is_sync_published(now))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+
+    // RFC 8078 §4 gives algorithm 0 the meaning "withdraw the DS and go
+    // insecure". A zone that says that *and* asks for a DS at the same time is
+    // telling the parent two things, and which one the parent acts on is its
+    // choice — so this is a failed run rather than a zone served with both
+    // (`CLAUDE.md` §4). The operator resolves it by clearing one side.
+    if existing.iter().any(is_go_insecure) {
+        return Err(DnssecError::signing(format!(
+            "{origin} carries a CDS or CDNSKEY with algorithm 0, which asks the parent to              withdraw the DS (RFC 8078 §4), and {} key(s) are inside a SyncPublish window              asking it to publish one",
+            wanted.len(),
+        )));
+    }
+
+    for key in wanted {
+        let ds = key.ds(SHA256)?;
+        let dnskey = key.dnskey();
+        for rdata in [
+            RecordData::from_parsed(&ParsedRecord::DS {
+                rtype: rt::CDS,
+                key_tag: ds.key_tag,
+                algorithm: ds.algorithm,
+                digest_type: ds.digest_type,
+                digest: ds.digest.clone(),
+            })?,
+            RecordData::from_parsed(&ParsedRecord::DNSKEY {
+                rtype: rt::CDNSKEY,
+                flags: dnskey.flags,
+                protocol: dnskey.protocol,
+                algorithm: dnskey.algorithm,
+                public_key: dnskey.public_key.clone(),
+            })?,
+        ] {
+            // An operator who wrote the record by hand keeps theirs, the way a
+            // hand-written DNSKEY is kept.
+            if existing.contains(&rdata) {
+                continue;
+            }
+            signed.add_record(ZoneRecord {
+                name: origin.to_owned(),
+                ttl,
+                class: Class::new(1),
+                rdata,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// RFC 8078 §4's "delete" signal: algorithm 0 in a CDS or CDNSKEY.
+///
+/// Read off the RDATA rather than the parsed record, because the two types put
+/// the algorithm in different places — a CDS is DS-shaped (key tag, algorithm,
+/// digest type, digest) and a CDNSKEY is DNSKEY-shaped (flags, protocol,
+/// algorithm, key), so the offset is 2 in one and 3 in the other.
+fn is_go_insecure(rdata: &RecordData) -> bool {
+    let at = match rdata.rtype() {
+        rt::CDS => 2,
+        rt::CDNSKEY => 3,
+        _ => return false,
+    };
+    rdata.bytes().get(at) == Some(&0)
 }
 
 // What is where: delegations, occlusion, and the names that need a denial
@@ -1073,6 +1195,16 @@ fn sign_everything(
                 continue;
             }
             dnskey_signers
+        } else if rtype == rt::CDS || rtype == rt::CDNSKEY {
+            // RFC 7344 §4.1: the CDS/CDNSKEY RRset "MUST be signed with a key
+            // that is represented in both the current DNSKEY and DS RRsets".
+            // The data key is in the first and not the second, so signing these
+            // as ordinary data publishes a rollover instruction the parent
+            // cannot verify — and none of `verify_rrset`, dnspython or a
+            // validating resolver would say so, because the RRset *does* verify
+            // against the zone's own keys. The SEP keys are the ones a DS
+            // names.
+            dnskey_signers
         } else {
             data_signers
         };
@@ -1318,6 +1450,7 @@ a\.b    IN A   192.0.2.50
             activate: Some(2),
             inactive: Some(3),
             delete: Some(4),
+            ..KeyTiming::default()
         }
         .check()
         .is_ok());
@@ -1344,11 +1477,26 @@ a\.b    IN A   192.0.2.50
             activate: Some(200),
             inactive: Some(300),
             delete: Some(400),
+            ..KeyTiming::default()
         };
         assert_eq!(timing.next_change(0), Some(100));
         assert_eq!(timing.next_change(100), Some(200), "exactly on one is past");
         assert_eq!(timing.next_change(250), Some(300));
         assert_eq!(timing.next_change(400), None, "nothing left to wait for");
+
+        // And the two sync moments are in it, so a CDS that appears at noon
+        // reaches the zone at noon rather than at the next ordinary tick
+        // (`TODO.md` #55).
+        let syncing = KeyTiming {
+            publish: Some(100),
+            sync_publish: Some(150),
+            sync_delete: Some(350),
+            delete: Some(400),
+            ..KeyTiming::default()
+        };
+        assert_eq!(syncing.next_change(100), Some(150));
+        assert_eq!(syncing.next_change(150), Some(350));
+        assert_eq!(syncing.next_change(350), Some(400));
     }
 
     /// The whole of it against a real zone: three keys, one instant, and the
@@ -1462,6 +1610,202 @@ a\.b    IN A   192.0.2.50
                 "{label}: the DNSKEY RRset"
             );
         }
+    }
+
+    /// RFC 7344, end to end: a key inside its sync window puts a CDS and a
+    /// CDNSKEY at the apex, and they go away again when the window closes.
+    ///
+    /// The two windows are separate on purpose, which is what this asserts
+    /// against the alternative the row proposed ("the keys whose `Delete` is
+    /// not in the near future"): the key here is published the whole time and
+    /// its CDS is not. A rollover step must not ask a registrar to act.
+    #[test]
+    fn a_key_in_its_sync_window_asks_the_parent_for_a_ds() {
+        let ksk = SigningKey::generate(
+            SigningAlgorithm::EcdsaP256Sha256,
+            ORIGIN,
+            DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+        )
+        .expect("KSK")
+        .with_timing(KeyTiming {
+            sync_publish: Some(NOW + 100),
+            sync_delete: Some(NOW + 300),
+            ..KeyTiming::default()
+        })
+        .expect("legal timing");
+        let zsk = SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+            .expect("ZSK");
+        let tag = ksk.key_tag();
+        let keys = vec![ksk, zsk];
+
+        let zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        let at = |now: u64| {
+            sign_zone(&zone, &keys, &signing_policy(now, DenialChain::Nsec)).expect("signs")
+        };
+        let count =
+            |signed: &Zone, rtype: Rtype| signed.query(nm(ORIGIN).as_ref(), Qtype::of(rtype)).len();
+
+        // Before the window: the key is published and the parent is asked
+        // nothing.
+        let before = at(NOW);
+        assert_eq!(count(&before, rt::CDS), 0);
+        assert_eq!(count(&before, rt::CDNSKEY), 0);
+        assert_eq!(
+            dnskeys_in(&resources(&before)).len(),
+            2,
+            "both keys are published throughout"
+        );
+
+        // Inside it: one of each, naming this key.
+        let inside = at(NOW + 200);
+        assert_eq!(count(&inside, rt::CDS), 1);
+        assert_eq!(count(&inside, rt::CDNSKEY), 1);
+        let cds = inside.query(nm(ORIGIN).as_ref(), Qtype::of(rt::CDS))[0]
+            .rdata
+            .parse()
+            .expect("CDS RDATA");
+        let ParsedRecord::DS {
+            rtype,
+            key_tag,
+            digest_type,
+            ..
+        } = cds
+        else {
+            panic!("a CDS parses as a DS: RFC 7344 §3.1");
+        };
+        assert_eq!(rtype, rt::CDS, "and knows which of the two codes it is");
+        assert_eq!(key_tag, tag, "the KSK the operator scheduled");
+        assert_eq!(digest_type, 2, "SHA-256, RFC 8624 §3.3's only MUST");
+
+        // And after: the parent has acted, so the request stops being made. A
+        // request left standing is one the parent may act on twice.
+        let after = at(NOW + 400);
+        assert_eq!(count(&after, rt::CDS), 0);
+        assert_eq!(count(&after, rt::CDNSKEY), 0);
+        assert_eq!(dnskeys_in(&resources(&after)).len(), 2);
+
+        // Every state verifies, which is the assertion the counting is evidence
+        // for.
+        for (label, signed) in [("before", &before), ("inside", &inside), ("after", &after)] {
+            assert!(
+                matches!(
+                    proof_for(signed, ORIGIN, rt::DNSKEY),
+                    RrsetProof::Verified { .. }
+                ),
+                "{label}"
+            );
+        }
+        assert!(matches!(
+            proof_for(&inside, ORIGIN, rt::CDS),
+            RrsetProof::Verified { .. }
+        ));
+        assert!(matches!(
+            proof_for(&inside, ORIGIN, rt::CDNSKEY),
+            RrsetProof::Verified { .. }
+        ));
+    }
+
+    /// The CDS/CDNSKEY RRset is signed by a key the *parent's* DS names, not by
+    /// the data key.
+    ///
+    /// RFC 7344 §4.1: it "MUST be signed with a key that is represented in both
+    /// the current DNSKEY and DS RRsets". The ZSK is in the first and not the
+    /// second, so signing these as ordinary data publishes a rollover
+    /// instruction the parent cannot verify — and nothing downstream would say
+    /// so, because the RRset *does* verify against the zone's own keys. That is
+    /// why this asserts on the key tag and not on `RrsetProof`.
+    #[test]
+    fn a_sync_rrset_is_signed_by_the_key_the_parent_knows() {
+        let ksk = SigningKey::generate(
+            SigningAlgorithm::EcdsaP256Sha256,
+            ORIGIN,
+            DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+        )
+        .expect("KSK")
+        .with_timing(KeyTiming {
+            sync_publish: Some(NOW),
+            ..KeyTiming::default()
+        })
+        .expect("legal timing");
+        let zsk = SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+            .expect("ZSK");
+        let (ksk_tag, zsk_tag) = (ksk.key_tag(), zsk.key_tag());
+        let keys = vec![ksk, zsk];
+
+        let zone = parse_zone_file(ZONE, ORIGIN).expect("parses");
+        let signed =
+            sign_zone(&zone, &keys, &signing_policy(NOW, DenialChain::Nsec)).expect("signs");
+        let signers = |rtype: Rtype| -> BTreeSet<u16> {
+            rrsigs_in(&resources(&signed))
+                .iter()
+                .filter(|s| s.type_covered == rtype)
+                .map(|s| s.key_tag)
+                .collect()
+        };
+
+        assert_eq!(signers(rt::CDS), BTreeSet::from([ksk_tag]));
+        assert_eq!(signers(rt::CDNSKEY), BTreeSet::from([ksk_tag]));
+        // The control: ordinary data is the ZSK's, which is the whole reason
+        // the two are split.
+        assert_eq!(signers(rt::A), BTreeSet::from([zsk_tag]));
+        assert_eq!(signers(rt::DNSKEY), BTreeSet::from([ksk_tag]));
+    }
+
+    /// RFC 8078 §4's "withdraw the DS" record and a SyncPublish window are two
+    /// contradictory instructions to one parent.
+    ///
+    /// The delete signal is never *generated* — no timing field reaches a
+    /// DNSSEC-sized footgun — so a zone carrying one got it from an operator
+    /// who wrote it by hand, and a run that then adds a request to publish is
+    /// asking the parent to choose. Failing the run beats serving both
+    /// (`CLAUDE.md` §4).
+    #[test]
+    fn asking_the_parent_to_publish_and_to_withdraw_at_once_is_a_failed_run() {
+        let ksk = SigningKey::generate(
+            SigningAlgorithm::EcdsaP256Sha256,
+            ORIGIN,
+            DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+        )
+        .expect("KSK")
+        .with_timing(KeyTiming {
+            sync_publish: Some(NOW),
+            ..KeyTiming::default()
+        })
+        .expect("legal timing");
+        let zsk = SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+            .expect("ZSK");
+        let keys = vec![ksk, zsk];
+
+        // Written by hand, which is the only way to get one, and which works
+        // because CDS is a name this tree parses (`TODO.md` #55).
+        let text = format!("{ZONE}\n@ IN CDS 0 0 0 00\n");
+        let zone = parse_zone_file(&text, ORIGIN).expect("parses");
+        let err = sign_zone(&zone, &keys, &signing_policy(NOW, DenialChain::Nsec))
+            .expect_err("two instructions");
+        assert!(err.to_string().contains("algorithm 0"), "{err}");
+
+        // Without the window it is the operator's record and the signer leaves
+        // it alone: RFC 8078 §4 is a thing an operator is allowed to mean.
+        let no_window = vec![
+            SigningKey::generate(
+                SigningAlgorithm::EcdsaP256Sha256,
+                ORIGIN,
+                DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+            )
+            .expect("KSK"),
+            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
+                .expect("ZSK"),
+        ];
+        let signed =
+            sign_zone(&zone, &no_window, &signing_policy(NOW, DenialChain::Nsec)).expect("signs");
+        assert_eq!(
+            signed.query(nm(ORIGIN).as_ref(), Qtype::of(rt::CDS)).len(),
+            1
+        );
+        assert!(matches!(
+            proof_for(&signed, ORIGIN, rt::CDS),
+            RrsetProof::Verified { .. }
+        ));
     }
 
     /// A rollover that was set up and never finished: every key inactive at

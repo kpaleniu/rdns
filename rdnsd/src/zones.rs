@@ -835,20 +835,50 @@ impl ZoneSigning {
 /// (`TODO.md` #44f), and signatures no run has ever checked are exactly what
 /// the pass is for.
 #[derive(Debug, Default)]
-pub(crate) struct SigningRun(HashMap<Name, Vec<u16>>);
+pub(crate) struct SigningRun(HashMap<Name, KeyRoles>);
+
+/// The key tags a run used, by what it used them for.
+///
+/// Two lists, not one: the same key can be signing and inside its
+/// `SyncPublish` window, and the two windows move independently
+/// (`TODO.md` #55). A run that starts publishing a CDS produces a zone nothing
+/// has verified, with the signing key set unchanged — so a record keyed on the
+/// signers alone would skip exactly that load.
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+struct KeyRoles {
+    /// Whose signatures are in the zone.
+    signing: Vec<u16>,
+    /// Whose CDS and CDNSKEY are at the apex (RFC 7344).
+    syncing: Vec<u16>,
+}
 
 impl SigningRun {
     fn record(&mut self, origin: Name, keys: &[SigningKey], signed_at: u64) {
-        let mut tags: Vec<u16> = active_signing_keys(keys, signed_at)
-            .iter()
-            .map(|k| k.key_tag())
-            .collect();
-        // Sorted and deduped so the comparison is about the set: key tags are
-        // not unique (RFC 4034 Appendix B is a checksum, not an identifier) and
+        // Sorted and deduped so a comparison is about the set: key tags are not
+        // unique (RFC 4034 Appendix B is a checksum, not an identifier) and
         // `load_dir`'s order is a directory listing's.
-        tags.sort_unstable();
-        tags.dedup();
-        self.0.insert(origin, tags);
+        let tidy = |mut tags: Vec<u16>| {
+            tags.sort_unstable();
+            tags.dedup();
+            tags
+        };
+        self.0.insert(
+            origin,
+            KeyRoles {
+                signing: tidy(
+                    active_signing_keys(keys, signed_at)
+                        .iter()
+                        .map(|k| k.key_tag())
+                        .collect(),
+                ),
+                syncing: tidy(
+                    keys.iter()
+                        .filter(|k| k.timing().is_sync_published(signed_at))
+                        .map(|k| k.key_tag())
+                        .collect(),
+                ),
+            },
+        );
     }
 }
 
@@ -863,16 +893,18 @@ impl SigningRun {
 ///
 /// Not "skip whatever we signed". Verifying our own output is the one place a
 /// canonicalization bug in the signer shows up, so the rule is **once per zone
-/// per set of signing keys**: the first run producing a given zone from a given
-/// key set is checked and its repeats are not. A zone that appears after a
-/// SIGHUP is checked, a rollover step makes its zone checked again, and a zone
-/// this server did not sign is checked every time.
+/// per set of key roles**: the first run producing a given zone from a given set
+/// of signing keys, with a given set of keys asking the parent for a DS, is
+/// checked and its repeats are not. A zone that appears after a SIGHUP is
+/// checked, a rollover step makes its zone checked again, a `SyncPublish`
+/// crossing does too (`TODO.md` #55), and a zone this server did not sign is
+/// checked every time.
 ///
 /// Recorded *after* the zone verifies, never before: a run whose output is
 /// rejected must not leave a note saying it was proved, or the next reload
 /// installs what this one refused (`CLAUDE.md` §4).
 #[derive(Clone, Default)]
-pub(crate) struct ProvenSigning(Arc<std::sync::Mutex<HashMap<Name, Vec<u16>>>>);
+pub(crate) struct ProvenSigning(Arc<std::sync::Mutex<HashMap<Name, KeyRoles>>>);
 
 impl ProvenSigning {
     /// Has this run's signing of `origin` already been checked?
@@ -881,23 +913,23 @@ impl ProvenSigning {
     /// strength of state that cannot be read is the wrong way for this to fail
     /// (`CLAUDE.md` §6 — the decision goes here rather than in an `unwrap`).
     fn already_proved(&self, origin: &Name, run: &SigningRun) -> bool {
-        let Some(tags) = run.0.get(origin) else {
+        let Some(roles) = run.0.get(origin) else {
             return false;
         };
         let Ok(proved) = self.0.lock() else {
             return false;
         };
-        proved.get(origin).is_some_and(|seen| seen == tags)
+        proved.get(origin).is_some_and(|seen| seen == roles)
     }
 
     fn prove(&self, origin: &Name, run: &SigningRun) {
-        let Some(tags) = run.0.get(origin) else {
+        let Some(roles) = run.0.get(origin) else {
             return;
         };
         let Ok(mut proved) = self.0.lock() else {
             return;
         };
-        proved.insert(origin.clone(), tags.clone());
+        proved.insert(origin.clone(), roles.clone());
     }
 }
 
@@ -1675,6 +1707,54 @@ mod tests {
         let second = verify_zones(&zones, &validator, &run, &proved).expect("verifies");
         assert_eq!(second.skipped, 0, "a key whose output was never checked");
         assert_eq!(second.zones, 1);
+    }
+
+    /// A key crossing its `SyncPublish` makes its zone verified again.
+    ///
+    /// The hole #55 opened in #53's rule and the reason `SigningRun` records
+    /// two lists: the signing key set does not move when a CDS appears, so
+    /// "once per zone per set of signing keys" would skip the one load whose
+    /// output is new. The CDS and CDNSKEY RRsets are signed by the SEP key
+    /// (RFC 7344 §4.1) and nothing would have checked those signatures.
+    #[test]
+    fn a_key_entering_its_sync_window_is_verified_again() {
+        let dir = ScratchDir::new("sync-window");
+        let key = SigningKey::generate(
+            rdns::dnssec_key::SigningAlgorithm::Ed25519,
+            "example.com.",
+            rdns::dnssec::DNSKEY_FLAG_ZONE | rdns::dnssec::DNSKEY_FLAG_SEP,
+        )
+        .expect("a key");
+        key.write_to_dir(dir.path()).expect("write");
+        let validator = DnssecValidator::new(true);
+        let proved = ProvenSigning::default();
+
+        let signing = signing_with(SigningKey::load_dir(dir.path()).expect("load"));
+        let mut zones = unsigned_zone();
+        let run = signing.apply(&mut zones).expect("signs");
+        let first = verify_zones(&zones, &validator, &run, &proved).expect("verifies");
+        assert_eq!(first.skipped, 0);
+
+        // The same keys, the same file, and no window: a repeat.
+        let mut zones = unsigned_zone();
+        let run = signing.apply(&mut zones).expect("signs");
+        assert_eq!(
+            verify_zones(&zones, &validator, &run, &proved)
+                .expect("verifies")
+                .skipped,
+            1
+        );
+
+        // Now the operator opens the window, which is a line in the key file.
+        let path = dir.path().join(key.file_name());
+        let text = std::fs::read_to_string(&path).expect("read");
+        std::fs::write(&path, format!("{text}SyncPublish: 1\n")).expect("write");
+        let signing = signing_with(SigningKey::load_dir(dir.path()).expect("reload"));
+        let mut zones = unsigned_zone();
+        let run = signing.apply(&mut zones).expect("signs");
+        let opened = verify_zones(&zones, &validator, &run, &proved).expect("verifies");
+        assert_eq!(opened.skipped, 0, "a CDS nothing has checked");
+        assert_eq!(opened.zones, 1);
     }
 
     /// A signing run whose output is rejected leaves nothing behind.

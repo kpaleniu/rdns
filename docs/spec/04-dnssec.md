@@ -70,9 +70,9 @@ One RRSIG survives, under one setting: see multi-signer below.
 
 ### Key rollover (RFC 6781)
 
-Four moments per key, in the key file, in Unix seconds. Absent means no boundary
+Six moments per key, in the key file, in Unix seconds. Absent means no boundary
 on that side, so a key file written before this existed goes on behaving exactly
-as it did — published, and signing.
+as it did — published, signing, and asking the parent for nothing.
 
 | field | what changes at it |
 |---|---|
@@ -80,6 +80,11 @@ as it did — published, and signing.
 | `Activate` | the key starts signing |
 | `Inactive` | it stops signing, and stays published so its signatures still verify |
 | `Delete` | the DNSKEY leaves the RRset |
+| `SyncPublish` | a CDS and a CDNSKEY for this key enter the apex (RFC 7344) |
+| `SyncDelete` | they leave it |
+
+The last two are `dnssec-settime -P sync` / `-D sync`'s fields under the same
+names, so an operator who has run a BIND rollover writes the same word.
 
 Refused at load: any pair out of order (`Publish` after `Activate`, and so on),
 and a value that is not a number. Each inversion is a different mistake, so they
@@ -119,13 +124,38 @@ signing, published but retired, held back, withdrawn — with the time to its ne
 change. The operator wrote those moments weeks earlier; this is how they find out
 the server agrees.
 
-**The KSK half is not automated, and the reason is the parent.** RFC 6781 §4.1.2's
-double-signature KSK rollover needs the parent's DS RRset to change, which no
-amount of local scheduling can do. The moments above work for a KSK too — publish
-both, sign the DNSKEY RRset with both, withdraw the old one after the parent has
-switched — but the step in the middle is a registrar transaction, and the way to
-automate it is CDS/CDNSKEY (RFC 7344, RFC 8078), which this tree does not
-generate. `TODO.md` #55.
+**The KSK half needs the parent, and CDS/CDNSKEY is how it is asked.**
+RFC 6781 §4.1.2's double-signature KSK rollover needs the parent's DS RRset to
+change, which no amount of local scheduling can do. The first four moments work
+for a KSK too — publish both, sign the DNSKEY RRset with both, withdraw the old
+one after the parent has switched — and the step in the middle is a registrar
+transaction. RFC 7344 automates it without a registrar API: the child publishes
+what it wants the parent's DS to become, and the parent acts on it (RFC 8078 §3).
+
+- **`SyncPublish`/`SyncDelete`, and not the rollover schedule.** A key inside its
+  sync window puts a CDS and a CDNSKEY at the apex. The window is its own two
+  fields because publishing one is a request to change the *parent's* zone:
+  deriving it from `Publish`/`Delete` would ask a registrar to act at every
+  rollover step. Absent is never.
+- **SHA-256 only** (digest type 2), which RFC 8624 §3.3 makes the one digest that
+  is MUST both to sign with and to validate. No knob: a wrong setting here is a
+  DS the parent rejects.
+- **Signed by the KSK, not the ZSK.** RFC 7344 §4.1: the RRset "MUST be signed
+  with a key that is represented in both the current DNSKEY and DS RRsets". The
+  data key is in the first and not the second, so signing these as ordinary data
+  publishes a rollover instruction the parent cannot verify — and nothing
+  downstream would report it, because the RRset does verify against the zone's
+  own keys.
+- **RFC 8078 §4's "delete" record is never generated.** A CDS with algorithm 0
+  tells the parent to withdraw the DS and take the zone insecure; no timing field
+  reaches it. An operator who means it writes `CDS 0 0 0 00` in the zone file,
+  which parses. A zone carrying one *and* a key in its sync window is a failed
+  signing run: two contradictory instructions to one parent.
+
+**CDS (59) and CDNSKEY (60) are carried by name** in a zone file and on the wire,
+sharing DS's and DNSKEY's formats (RFC 7344 §3.1, §3.2) and one parser each. They
+were `TYPE59`/`TYPE60` generic RDATA before `TODO.md` #55 — which is to say a
+hand-written `CDS` line did not parse at all.
 
 The signer never removes a key file. `Delete` withdraws the DNSKEY from the zone,
 which is reversible; taking the private key off the disk is the operator's.
@@ -161,9 +191,12 @@ working deployment off the air over something no resolver checks. The two ways i
 are RFC 8901 §4 — "DNS providers participating in multi-signer models need to use
 a common DNSSEC signing algorithm" — and a half-finished algorithm rollover.
 
-Not done, and `TODO.md` #44e says what it would take: CDS/CDNSKEY (§8, RFC 7344),
-which nothing here generates, and §5's authenticated-denial agreement between
-providers, which is not a local fact and cannot be checked here.
+Not done, and `TODO.md` #44e says what it would take. Half of it arrived with
+#55: CDS/CDNSKEY (§8, RFC 7344) are generated now, per key and on the operator's
+schedule. What is still missing is §5's authenticated-denial agreement between
+providers, which is not a local fact and cannot be checked here — and RFC 8901's
+own use of CDS, where the *set* of providers has to agree on one CDS RRset,
+which one signer's key file cannot express.
 
 ### Validity, spread and re-signing
 

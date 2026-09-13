@@ -8153,3 +8153,130 @@ version. 1,124 tests on Windows and 1,144 on Linux, clippy clean on both,
 `cargo doc` clean.
 
 ---
+
+### 55. Nothing generates CDS or CDNSKEY, so a KSK rollover still needs a human — ~~**filed 2026-09-12**~~ **closed 2026-09-13**
+
+Left behind by 44f, which automated RFC 6781 §4.1.1.1's ZSK rollover and stopped
+where the parent starts.
+
+The four timing fields work for a KSK exactly as they do for a ZSK — publish
+both, sign the DNSKEY RRset with both, withdraw the old one — but §4.1.2's
+double-signature rollover has a step in the middle that no local schedule can
+take: **the parent's DS RRset has to change**. RFC 7344 is how that is automated
+without a registrar API: the child publishes CDS and CDNSKEY records saying what
+it wants the parent's DS to become, and RFC 8078 §3 gives the parent the rules
+for acting on them.
+
+**What is missing, measured rather than recalled.** `record_types.rs` names
+neither type: CDS is 59 and CDNSKEY is 60, and both are absent, so a zone file
+carrying one is parsed as RFC 3597 generic RDATA and served unchanged. That is
+not nothing — an operator who writes the records by hand today gets them
+published and signed — so the gap is *generation*, not carriage.
+
+Three things to settle, none of which 44f had to:
+
+- **Which keys.** RFC 7344 §4.1: the CDS/CDNSKEY RRset is "the DS RRset the
+  child wants", so it is the KSKs that will be published *after* the rollover,
+  not the ones published now. With 44f's timing that is computable — the keys
+  whose `Delete` is not in the near future — but "near" is a policy and the RFC
+  does not set it.
+- **The delete signal.** RFC 8078 §4 defines a CDS with algorithm 0 meaning
+  "withdraw the DS and go insecure". That is a footgun with a DNSSEC-sized blast
+  radius and it should not be reachable by accident, which argues for it being a
+  separate explicit setting rather than a state the timing fields can produce.
+- **Signing.** RFC 7344 §4.1 requires the CDS/CDNSKEY RRset to be signed by a
+  key the *current* DS set authenticates — i.e. by the outgoing KSK, not the
+  incoming one. `sign_everything` signs the DNSKEY RRset with every SEP key it
+  holds; this RRset needs a narrower rule, and getting it wrong publishes a
+  rollover instruction the parent cannot verify.
+
+**What would refute the value of this** (§19): that the registrars a fleet uses
+poll CDS at all. RFC 8078 is a decade old and adoption is uneven, so a server
+that publishes CDS into a parent that never looks has automated nothing. That is
+worth checking against the actual parent before building it — and it is also why
+the records being *carriable* today is most of what a cautious operator needs.
+
+Not urgent. A KSK rollover is a once-a-year-per-zone event that an operator
+already has to schedule with their registrar, and 44f made the frequent half —
+the ZSK — hands-off.
+
+---
+
+**Done 2026-09-13**, and the row's own premise was wrong in the half it was most
+confident about.
+
+**"The gap is *generation*, not carriage" did not survive a probe.** The row says
+an operator "who writes the records by hand today gets them published and
+signed". They do not: `record_type_name_to_code` had no `"CDS"`, so a zone file
+line reading `@ IN CDS 12345 13 2 ...` failed with *unsupported record type
+"CDS"*. Only RFC 3597's `TYPE59 \# 36 ...` generic form parsed, and it printed
+back as `TYPE59`. One `parse_zone_file` call settled it, which is §4's rule about
+never stating what a function does without opening it — the row had read
+`record_types.rs` for the *codes* and inferred the rest.
+
+So there were three halves, not two, and all three are done.
+
+- **Carriage.** CDS (59) and CDNSKEY (60) are named both ways. One
+  `ParsedRecord` arm each rather than two, following the SVCB/HTTPS precedent in
+  the same file: RFC 7344 §3.1 and §3.2 give them DS's and DNSKEY's formats, so a
+  second arm would be a second parser for one syntax (§7). That is an `rtype`
+  field on `ParsedRecord::DS` and `::DNSKEY`, which touched **19 sites** —
+  counted before one was edited, and every one of them a reader that already
+  gated on `rr.rdata.rtype()`, so no behaviour moved.
+- **Generation.** `SyncPublish`/`SyncDelete` per key, which is BIND's
+  `dnssec-settime -P sync` / `-D sync` under the same field names (§4: check what
+  the other implementations do). The row proposed deriving the window from the
+  rollover schedule — "the keys whose `Delete` is not in the near future" — and
+  noted that "near" is a policy the RFC does not set. Two explicit fields dodge
+  the policy entirely and say the truer thing: publishing a CDS is a request to
+  change the *parent's* zone, and a rollover step must not make one on its own.
+  Both are in `next_change`, so a window that opens at noon reaches the zone at
+  noon rather than at the ordinary tick.
+- **Signing, which was the row's third question and is the one that matters.**
+  RFC 7344 §4.1: the RRset "MUST be signed with a key that is represented in both
+  the current DNSKEY and DS RRsets". `sign_everything` splits DNSKEY from data
+  and the data key is the ZSK — in the first set and not the second — so these
+  would have been signed by a key the parent cannot verify. **Nothing downstream
+  would have said so**: the RRset verifies perfectly against the zone's own keys,
+  so `verify_rrset`, dnspython and every validating resolver report it fine. The
+  test asserts on the key tag for that reason.
+
+**RFC 8078 §4's algorithm-0 "withdraw the DS and go insecure" is never
+generated**, which is the row's second question answered as it suggested. No
+timing field reaches a footgun with that blast radius; an operator who means it
+writes `CDS 0 0 0 00`, which now parses. A zone carrying one *while* a key is
+inside its sync window is a **failed signing run** — two contradictory
+instructions to one parent, and which one the parent acts on is its choice (§4).
+
+**It also closed a hole in #53.** That rule is "verify once per zone per set of
+signing keys", and a `SyncPublish` crossing produces a zone nothing has verified
+with the signing key set unchanged — so the one load whose output is new would
+have been skipped, and the CDS signatures never checked. `SigningRun` records two
+lists now, signing and syncing, and there is a test that fails when the second is
+dropped.
+
+**What would have refuted it** (§19) was in the row: whether registrars poll CDS
+at all. Not checkable from here against a real parent, and the answer did not
+need to be: the work that turned out to matter was the §4.1 signing rule and the
+carriage the row thought already worked, both of which are right or wrong
+independently of who is looking. The adoption question remains the reason this
+was not urgent, and is now the reason the *hand-written* path matters as much as
+the generated one.
+
+Verified: three tests in `zone_signer` (the window opens and closes; the RRset is
+signed by the SEP key and ordinary data by the ZSK; the contradiction fails the
+run), each run against the reverted behaviour — the signer-pick revert reads
+`left: {39318}, right: {19270}`, which is the ZSK where the KSK belongs. A
+round-trip in `zone_writer` that pins both names against `TYPE59`/`TYPE60`. A
+`next_change` case for the two new moments. A `zones` test for the #53
+interaction. And **a live `rdnsd` judged by dnspython** (§1: anything
+cryptographic goes through a third party): both RRsets validate, both are signed
+by the KSK and not the ZSK, and the CDS digest equals dnspython's own
+`make_ds` for that key and the DS `--generate-keys` printed. The apex NSEC reads
+`NS SOA RRSIG NSEC DNSKEY CDS CDNSKEY`, so `Layout::of` is taken after the
+records are added and not before — the snapshot-then-mutate shape §8 names.
+
+1,129 tests on Windows and 1,149 on Linux, clippy clean on both, `cargo doc`
+clean. Nothing filed on the way out.
+
+---

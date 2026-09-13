@@ -38,6 +38,13 @@ pub const NSEC3: Rtype = Rtype::new(50);
 /// The salt and iteration count of a zone's NSEC3 chain (RFC 5155 §4). Held
 /// as opaque RDATA, so there is no `ParsedRecord` arm for it.
 pub const NSEC3PARAM: Rtype = Rtype::new(51);
+/// What the child wants the parent's DS RRset to become (RFC 7344 §3.1).
+/// "Uses the same wire and presentation format as the DS record", so one
+/// parser serves both — [`DS`] under another number.
+pub const CDS: Rtype = Rtype::new(59);
+/// The DNSKEY half of the same request (RFC 7344 §3.2): "uses the same wire
+/// and presentation format as the DNSKEY record".
+pub const CDNSKEY: Rtype = Rtype::new(60);
 /// A QTYPE only, and over TCP alone (RFC 5936).
 pub const AXFR: Rtype = Rtype::new(252);
 /// The raw codes, so `Rtype::is_meta` and `Qtype`'s constants can be `const`
@@ -73,6 +80,8 @@ pub fn record_type_name_to_code(kind: &str) -> Option<Rtype> {
         "AAAA" => Some(AAAA),
         "DNAME" => Some(DNAME),
         "DS" => Some(DS),
+        "CDS" => Some(CDS),
+        "CDNSKEY" => Some(CDNSKEY),
         "SVCB" => Some(SVCB),
         "HTTPS" => Some(HTTPS),
         "DNSKEY" => Some(DNSKEY),
@@ -121,7 +130,7 @@ pub fn qtype_name(qtype: Qtype) -> Cow<'static, str> {
 /// The mnemonic for a type code, or its `TYPEnnn` form (RFC 3597 §5) when this
 /// library has none. Always a name [`record_type_name_to_code`] reads back.
 ///
-/// `Cow`, because sixteen of the answers are constants and only the last one
+/// `Cow`, because eighteen of the answers are constants and only the last one
 /// has to be built: writing a zone allocated a `String` per record to print a
 /// name that was in the binary already (`TODO.md` #26h).
 pub fn record_type_name(code: Rtype) -> Cow<'static, str> {
@@ -136,6 +145,8 @@ pub fn record_type_name(code: Rtype) -> Cow<'static, str> {
         AAAA => "AAAA",
         DNAME => "DNAME",
         DS => "DS",
+        CDS => "CDS",
+        CDNSKEY => "CDNSKEY",
         SVCB => "SVCB",
         HTTPS => "HTTPS",
         DNSKEY => "DNSKEY",

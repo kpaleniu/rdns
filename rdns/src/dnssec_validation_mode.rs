@@ -260,6 +260,7 @@ mod tests {
             ttl: Ttl::from_secs(3600),
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::DNSKEY {
+                rtype: rdns_core::record_types::DNSKEY,
                 flags: 256,
                 protocol: 3,
                 algorithm: 8,

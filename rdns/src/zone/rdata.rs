@@ -357,7 +357,7 @@ pub(super) fn rdata_from_fields(
             })
             .map_err(|e| ZoneError::syntax(ln, format!("SOA record: {e}")))?
         }
-        "DNSKEY" => {
+        "DNSKEY" | "CDNSKEY" => {
             let key_parts = fields;
             if key_parts.len() < 4 {
                 return Err(ZoneError::syntax(
@@ -384,6 +384,13 @@ pub(super) fn rdata_from_fields(
             let public_key = base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_key)
                 .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY base64 key: {e}")))?;
             RecordData::from_parsed(&ParsedRecord::DNSKEY {
+                // Which of the two codes the operator wrote. `kind` is the
+                // mnemonic from the line, so this cannot drift from it.
+                rtype: if record_type == "CDNSKEY" {
+                    crate::record_types::CDNSKEY
+                } else {
+                    crate::record_types::DNSKEY
+                },
                 flags,
                 protocol,
                 algorithm,
@@ -391,7 +398,7 @@ pub(super) fn rdata_from_fields(
             })
             .map_err(|e| ZoneError::syntax(ln, format!("DNSKEY record: {e}")))?
         }
-        "DS" => {
+        "DS" | "CDS" => {
             let ds_parts = fields;
             if ds_parts.len() < 4 {
                 return Err(ZoneError::syntax(
@@ -412,6 +419,11 @@ pub(super) fn rdata_from_fields(
             let digest = hex_decode(&hex_digest)
                 .map_err(|e| ZoneError::syntax(ln, format!("invalid DS digest: {e}")))?;
             RecordData::from_parsed(&ParsedRecord::DS {
+                rtype: if record_type == "CDS" {
+                    crate::record_types::CDS
+                } else {
+                    crate::record_types::DS
+                },
                 key_tag,
                 algorithm,
                 digest_type,
