@@ -563,7 +563,9 @@ impl Catalogs {
                 // `masters` change.
                 Some(row) if row.node.as_ref() == member.node() => {
                     tracing::info!(
-                        "catalog {}: {} moves from {} to {} (RFC 9432 §4.3.2). Its                          copy on disk is kept and it stops being served until the                          new master answers, which is the rule every secondary gets",
+                        "catalog {}: {} moves from {} to {} (RFC 9432 §4.3.2). Its \
+                         copy on disk is kept and it stops being served until the \
+                         new master answers, which is the rule every secondary gets",
                         spec.spec.zone,
                         member.zone(),
                         describe_group(row.group.as_deref()),

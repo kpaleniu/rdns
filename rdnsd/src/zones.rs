@@ -1007,7 +1007,9 @@ fn warn_about_unsigned_algorithms(origin: &str, zone: &Zone) {
         return;
     }
     tracing::warn!(
-        "{origin} publishes a DNSKEY for algorithm{} {} that nothing in the zone signs with          (RFC 6840 §5.11) — a co-provider's key needs an algorithm this server also holds          (RFC 8901 §4), and a rollover needs finishing",
+        "{origin} publishes a DNSKEY for algorithm{} {} that nothing in the zone signs with \
+         (RFC 6840 §5.11) — a co-provider's key needs an algorithm this server also holds \
+         (RFC 8901 §4), and a rollover needs finishing",
         if missing.len() == 1 { "" } else { "s" },
         missing
             .iter()
@@ -1198,7 +1200,8 @@ pub(crate) fn load_zones_from_source(
                     ));
                 }
                 tracing::warn!(
-                    "{} of {} configured zone(s) failed to load and are NOT being served                      (--allow-partial-load):
+                    "{} of {} configured zone(s) failed to load and are NOT being served \
+                     (--allow-partial-load):
 {listed}",
                     failures.len(),
                     files.len()

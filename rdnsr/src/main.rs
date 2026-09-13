@@ -630,7 +630,8 @@ async fn main() -> anyhow::Result<()> {
 
     let (udp_cap, tcp_cap) = admission.caps();
     tracing::info!(
-        "query rate: {}, response budget: {}, request cap: {udp_cap}B UDP / {tcp_cap}B TCP,          metrics: {}, anomaly warnings: {}",
+        "query rate: {}, response budget: {}, request cap: {udp_cap}B UDP / {tcp_cap}B TCP, \
+         metrics: {}, anomaly warnings: {}",
         if cli.query_rate == 0 {
             "unlimited (--query-rate 0)".to_string()
         } else {

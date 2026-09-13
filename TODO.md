@@ -1012,12 +1012,28 @@ Three things to settle, in this order. The first is done.
   so that number is a probe rather than a bench: 20 M calls to
   `PolicyStore::in_force`, timed, not kept.
 
+  Proved against a process, not only against the functions (§4): `rdnsr` run
+  with `--rpz`, queried, the feed rewritten, `kill -HUP`, queried again — the
+  new rule blocks, the cache-clear line appears when the nsdname rule arrives,
+  and a feed replaced with rubbish leaves the block in force with the file and
+  line in the WARN. That run is also what caught the banner defect below; the
+  unit tests could not, since they assert on rcodes rather than on log lines.
+
   Six tests, three in `rdns::rpz` and three in `rdnsr::answer`; every one was
   run against the shape it forbids. The all-or-nothing pair fails against a
   `reload` that installs file by file; the cache pair fails against a
   fingerprint missing either half (the serial, or the "watches delegations"
   filter); the two answer-path tests fail against a `reload_policy` that returns
   at once, which is what the tree did before.
+  **An unrelated defect, five instances, fixed in the same sitting.** Moving
+  the banner line showed it printing `client-ip,              0 response-ip`:
+  a `\` continuation had been lost from the format string and the next line's
+  indentation was baked into the message. §12 names this exactly — rustfmt does
+  not touch string literals, so a careless search-and-replace wrecks the
+  continuation and nothing complains. `grep` for a run of five spaces inside a
+  `tracing::` format string found five, in `rdnsr/src/answer.rs`,
+  `rdnsr/src/main.rs`, `rdnsd/src/catalog.rs` and `rdnsd/src/zones.rs` (two);
+  all five fixed, seven continuations restored.
 - **Then the transfer**, which is the part with a cost: it means `rdnsr` grows a
   replication task, an SOA timer and a NOTIFY listener, and those are what
   `rdnsd` is. The alternative worth measuring first is that the *operator* runs

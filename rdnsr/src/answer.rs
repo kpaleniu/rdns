@@ -822,7 +822,8 @@ pub(crate) fn log_policy(zones: &PolicyZones) {
     for zone in zones.zones() {
         let [qname, client_ip, response_ip, nsdname, nsip] = zone.trigger_counts();
         tracing::info!(
-            "policy zone {} ({}): {} records, {qname} qname, {client_ip} client-ip,              {response_ip} response-ip, {nsdname} nsdname, {nsip} nsip",
+            "policy zone {} ({}): {} records, {qname} qname, {client_ip} client-ip, \
+             {response_ip} response-ip, {nsdname} nsdname, {nsip} nsip",
             zone.origin().to_presentation(),
             zone.policy(),
             zone.records(),
