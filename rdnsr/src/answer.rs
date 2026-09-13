@@ -22,7 +22,7 @@ use rdns::nsec_cache::NsecCache;
 use rdns::record_types;
 use rdns::resolver::{NameserverPolicy, Resolver};
 use rdns::response::ClientEdns;
-use rdns::rpz::{Action, DelegationPolicy, PolicyZones, Rewrite};
+use rdns::rpz::{Action, DelegationPolicy, PolicyStore, PolicyZones, Rewrite};
 use rdns::special_names;
 use rdns::validation::{Request, Transport};
 use rdns::Qtype;
@@ -76,6 +76,19 @@ impl Caches {
             denials: NsecCache::new(denial_zones),
         }
     }
+
+    /// Forget everything held, positive and negative.
+    ///
+    /// All three, because all three answer without walking a delegation, and
+    /// the walk is where a nameserver trigger is asked — a synthesized
+    /// NXDOMAIN (RFC 8198) skips it exactly as a cache hit does. The one
+    /// caller is the policy reload (`TODO.md` #57); there is no index from a
+    /// nameserver to the names it served, so the sweep is the whole cache.
+    pub(crate) fn clear(&self) {
+        self.answers.clear();
+        self.negatives.clear();
+        self.denials.clear();
+    }
 }
 
 /// Everything answering a query needs, in one handle.
@@ -88,9 +101,9 @@ impl Caches {
 pub(crate) struct Resolving {
     pub(crate) resolver: Arc<Resolver>,
     pub(crate) caches: Caches,
-    /// The response policy zones in force, in the order they are consulted.
+    /// The response policy zones, and the files a SIGHUP re-reads them from.
     /// Empty unless `--rpz` named one, and empty costs one `is_empty` a query.
-    pub(crate) policy: PolicyZones,
+    pub(crate) policy: Arc<PolicyStore>,
     /// Whether a cache hit in the last tenth of its TTL should be re-resolved
     /// once the client's own answer is away (`--prefetch`).
     pub(crate) prefetch: bool,
@@ -160,6 +173,11 @@ pub(crate) async fn handle_query(
         dns64: _,
         ctx,
     } = serving;
+    // One snapshot for one query: a SIGHUP can install a new set part-way
+    // through, and a query decided half by each is a rule nobody wrote. The
+    // `Arc` also outlives the resolution that the nameserver triggers are
+    // borrowed across, where a lock guard could not go (`CLAUDE.md` §9).
+    let policy = policy.in_force();
     // Set by the one lookup that can discover it, returned by every path.
     let mut refresh = None;
     // Refuse a *response*: a reply parsed as a question and answered with
@@ -656,11 +674,10 @@ async fn resolve_and_store(
 ) -> Option<Vec<ResourceRecord>> {
     // Policed like a client's query: an answer a nameserver trigger blocks
     // must not reach the cache by the back door of a prefetch.
-    let watch = serving.policy.watches_delegations().then(|| {
-        serving
-            .policy
-            .at_delegations(query.qname.as_ref(), query.qtype)
-    });
+    let policy = serving.policy.in_force();
+    let watch = policy
+        .watches_delegations()
+        .then(|| policy.at_delegations(query.qname.as_ref(), query.qtype));
     let Ok((answer, state)) = serving
         .resolver
         .resolve_validated(query, watch.as_ref().map(|w| w as &dyn NameserverPolicy))
@@ -793,6 +810,61 @@ fn stale_answer(
         WHY_POSITIVE
     };
     Some((resp, negative.secure, Some(why)))
+}
+
+/// What each policy zone holds, by trigger kind.
+///
+/// Printed at startup and again after every reload, for the reason the rate
+/// limiter's policy is: a rewrite is invisible on the wire, so the feed that
+/// loaded and the feed the operator meant to load are otherwise the same
+/// picture (`CLAUDE.md` §4, §14, `TODO.md` #45a, #56).
+pub(crate) fn log_policy(zones: &PolicyZones) {
+    for zone in zones.zones() {
+        let [qname, client_ip, response_ip, nsdname, nsip] = zone.trigger_counts();
+        tracing::info!(
+            "policy zone {} ({}): {} records, {qname} qname, {client_ip} client-ip,              {response_ip} response-ip, {nsdname} nsdname, {nsip} nsip",
+            zone.origin().to_presentation(),
+            zone.policy(),
+            zone.records(),
+        );
+    }
+}
+
+/// Re-read every `--rpz` file, and tell the caches what arrived.
+///
+/// A feed is rewritten under a running resolver — by a cron job, or by an
+/// `rdnsd` writing what it transferred — and until this the answer was a
+/// restart (`TODO.md` #57).
+pub(crate) fn reload_policy(serving: &Resolving) {
+    if !serving.policy.is_configured() {
+        return;
+    }
+    match serving.policy.reload() {
+        Ok(reloaded) => {
+            tracing::info!("policy zones re-read (SIGHUP)");
+            log_policy(&reloaded.zones);
+            // The one thing a new rule cannot reach on its own. A QNAME or
+            // client-IP rule is consulted before every cache and a response-IP
+            // rule is applied to what leaves, so both bind the next query
+            // whatever is held; a nameserver rule is only asked while a
+            // delegation is walked, which a cache hit never does. Conditional,
+            // because a reload that emptied the cache every hour would be its
+            // own outage.
+            if reloaded.delegation_rules_changed {
+                serving.caches.clear();
+                tracing::info!(
+                    "the caches were cleared: a nameserver trigger changed, and nothing held \
+                     was offered to it"
+                );
+            }
+        }
+        // The previous set is still in force, which is the whole point of
+        // saying so: a half-written feed must not lift a block.
+        Err(e) => tracing::warn!(
+            "could not re-read the policy zones (SIGHUP); the previous ones are still in \
+             force: {e}"
+        ),
+    }
 }
 
 /// What a policy match did, since one of the six actions is to do nothing.
@@ -1030,6 +1102,7 @@ pub(crate) fn truncate_reply(reply: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use rdns::clock::current_unix_timestamp;
+    use rdns::rpz::PolicyOverride;
     use rdns::Qtype;
 
     use rdns::clock::Clock;
@@ -1260,7 +1333,7 @@ mod tests {
             Arc::new(Resolving {
                 resolver: test_resolver(),
                 caches,
-                policy: PolicyZones::default(),
+                policy: PolicyStore::in_memory(PolicyZones::default()),
                 prefetch,
                 dns64: None,
                 ctx,
@@ -1468,7 +1541,7 @@ mod tests {
         Arc::new(Resolving {
             resolver: test_resolver(),
             caches: Caches::new(16, 4, StalePolicy::OFF, rdns::clock::Clock::system()),
-            policy: PolicyZones::default(),
+            policy: PolicyStore::in_memory(PolicyZones::default()),
             prefetch: false,
             dns64: Some(
                 rdns::dns64::Dns64::new(rdns::dns64::Nat64Prefix::well_known(), &[])
@@ -2264,5 +2337,124 @@ mod tests {
             stats.queries_by_type.get(&Qtype::of(record_types::A)),
             Some(&3)
         );
+    }
+
+    /// A policy feed with one QNAME rule, and optionally a nameserver rule.
+    fn feed(serial: u32, blocked: &str, nsdname: Option<&str>) -> String {
+        let mut text = format!(
+            "$TTL 60\n\
+             @ IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. {serial} 3600 600 86400 60\n\
+             @ IN NS localhost.\n\
+             {blocked} IN CNAME .\n"
+        );
+        if let Some(ns) = nsdname {
+            text.push_str(&format!("{ns}.rpz-nsdname IN CNAME .\n"));
+        }
+        text
+    }
+
+    /// #57: a feed rewritten under a running resolver reaches the answer path,
+    /// which was a restart before.
+    ///
+    /// The resolver here is unreachable on purpose, so the assertion is also
+    /// that the reply cost no resolution: a rule that only arrived at the
+    /// reload blocked the name.
+    #[tokio::test]
+    async fn a_rule_that_arrived_at_a_reload_blocks_the_next_query() {
+        let dir = ScratchDir::new("reload-blocks");
+        let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
+        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
+            .expect("it loads");
+        let serving = serving_policy(store);
+        assert!(
+            serving
+                .policy
+                .in_force()
+                .before_query(
+                    TEST_PEER,
+                    nm("second.example.com.").as_ref(),
+                    Qtype::of(record_types::A)
+                )
+                .is_none(),
+            "the rule is not in the feed yet"
+        );
+
+        std::fs::write(&path, feed(2, "second.example.com", None)).expect("rewrite");
+        reload_policy(&serving);
+
+        let reply = handle_query(
+            query_for("second.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("the policy answered");
+        let reply = DnsMessage::try_from_bytes(&reply).expect("parses");
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+    }
+
+    /// The reload's obligation to the caches, and its limit: an answer held
+    /// from before a *nameserver* rule arrived is the one thing that rule
+    /// cannot reach, because a cache hit never walks a delegation
+    /// (`TODO.md` #56, #57).
+    #[tokio::test]
+    async fn a_nameserver_rule_that_arrived_at_a_reload_empties_the_caches() {
+        let dir = ScratchDir::new("reload-caches");
+        let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
+        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
+            .expect("it loads");
+        let serving = serving_policy(store);
+        let held = nm("held.example.com.");
+        let qtype = Qtype::of(record_types::A);
+        let cached = || vec![a_record(&held, 3600)];
+
+        // A QNAME rule that moved: what is held is still what the internet
+        // said, and the new rule is consulted before the cache anyway.
+        serving.caches.answers.put(held.as_ref(), qtype, cached());
+        std::fs::write(&path, feed(2, "second.example.com", None)).expect("rewrite");
+        reload_policy(&serving);
+        assert!(
+            serving.caches.answers.get(held.as_ref(), qtype).is_some(),
+            "an hourly reload that emptied the cache would be its own outage"
+        );
+
+        // A nameserver rule that moved: nothing held was ever offered to it.
+        std::fs::write(
+            &path,
+            feed(3, "second.example.com", Some("ns.evil.example.com")),
+        )
+        .expect("rewrite");
+        reload_policy(&serving);
+        assert!(serving.caches.answers.get(held.as_ref(), qtype).is_none());
+    }
+
+    /// A half-written feed must not lift a block: the previous set stays in
+    /// force and the reload says so (`CLAUDE.md` §4).
+    #[tokio::test]
+    async fn a_feed_that_will_not_parse_leaves_the_block_in_force() {
+        let dir = ScratchDir::new("reload-broken");
+        let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
+        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
+            .expect("it loads");
+        let serving = serving_policy(store);
+
+        std::fs::write(&path, "this is not a zone file\n").expect("rewrite");
+        reload_policy(&serving);
+
+        let reply = handle_query(
+            query_for("first.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("the policy answered");
+        let reply = DnsMessage::try_from_bytes(&reply).expect("parses");
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
     }
 }

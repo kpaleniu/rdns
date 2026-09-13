@@ -365,8 +365,8 @@ container, `--sysctl net.ipv4.ip_unprivileged_port_start=53`.
 
 `rdnsr` takes the same three flags and means the same thing by them. A resolver
 is in fact what RFC 7858 was written for — the stub-to-recursive hop is the one
-it names — and there SIGHUP does nothing *but* re-read the certificate, since a
-resolver has no zones to reload.
+it names — and there SIGHUP re-reads the certificate and every `--rpz` policy
+file, which is everything it holds from disk; it has no zones.
 
 ### `--metrics-listen <ADDR:PORT>`
 

@@ -46,11 +46,11 @@ use crate::record_types as rt;
 use crate::resolver::NameserverPolicy;
 use crate::security::prefix_matches;
 use crate::zone::{parse_zone_file_at, Located, NameKind, Zone, ZoneRecord};
-use crate::{Name, NameRef, ParsedRecord, Qtype, ResourceRecord};
+use crate::{Name, NameRef, ParsedRecord, Qtype, ResourceRecord, Serial};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 /// What a policy zone says to do with a query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,6 +647,23 @@ impl PolicyZones {
         self.zones.iter().any(PolicyZone::watches_delegations)
     }
 
+    /// The version of each zone that watches delegations, in the order they
+    /// are consulted — what [`Reloaded::delegation_rules_changed`] compares.
+    ///
+    /// The serial is the zone's own claim to have changed: an RPZ is a DNS
+    /// zone and a feed bumps it, which is also how a secondary decides whether
+    /// to transfer one. A file edited without a bump is missed here exactly as
+    /// a transfer would miss it. Coarse in the safe direction — a zone that
+    /// carries one nameserver rule and a million QNAME rules reports a change
+    /// when any of them moves.
+    fn delegation_versions(&self) -> Vec<(Name, Option<Serial>)> {
+        self.zones
+            .iter()
+            .filter(|zone| zone.watches_delegations())
+            .map(|zone| (zone.origin().to_owned(), zone.zone.serial()))
+            .collect()
+    }
+
     /// One query's view of the nameserver triggers, to hand to the resolver.
     pub fn at_delegations(&self, qname: NameRef<'_>, qtype: Qtype) -> DelegationPolicy<'_> {
         DelegationPolicy {
@@ -706,6 +723,103 @@ impl PolicyZones {
         }
         None
     }
+}
+
+/// The policy zones in force, and the files they came from.
+///
+/// A feed is rewritten under a running resolver — by a cron job, or by an
+/// `rdnsd` writing what it transferred — and until a reload re-reads it the
+/// answer is a restart (`TODO.md` #57). The shape is the certificate store's
+/// (`rdns_transport::tls::CertificateStore`): the paths, a current value behind
+/// a lock, and a `reload` that leaves the old one in force if the new one does
+/// not parse.
+///
+/// One query reads [`PolicyStore::in_force`] once and decides by that snapshot,
+/// which is why an `Arc` is handed out rather than a guard: the nameserver
+/// triggers are consulted across a resolution a dozen round trips long, and no
+/// lock may be held over it (`CLAUDE.md` §9).
+#[derive(Debug)]
+pub struct PolicyStore {
+    paths: Vec<PathBuf>,
+    policy: PolicyOverride,
+    current: RwLock<Arc<PolicyZones>>,
+}
+
+impl PolicyStore {
+    /// Read every file, or fail without installing any of them.
+    pub fn load(paths: &[PathBuf], policy: PolicyOverride) -> ConfigResult<Arc<PolicyStore>> {
+        let zones = PolicyZones::load(paths, policy)?;
+        Ok(Arc::new(PolicyStore {
+            paths: paths.to_vec(),
+            policy,
+            current: RwLock::new(Arc::new(zones)),
+        }))
+    }
+
+    /// A store over zones that came from somewhere other than a file, for a
+    /// caller that has already built them. Reloading one re-reads nothing.
+    pub fn in_memory(zones: PolicyZones) -> Arc<PolicyStore> {
+        Arc::new(PolicyStore {
+            paths: Vec::new(),
+            policy: PolicyOverride::Given,
+            current: RwLock::new(Arc::new(zones)),
+        })
+    }
+
+    /// Whether any file was named, and so whether a reload has anything to do.
+    pub fn is_configured(&self) -> bool {
+        !self.paths.is_empty()
+    }
+
+    /// The set to decide one query by.
+    pub fn in_force(&self) -> Arc<PolicyZones> {
+        // A poisoned lock still holds a whole, valid set: the only thing done
+        // under this lock is one `Arc` assignment, which cannot leave a torn
+        // value behind. Recovering keeps the policy in force, where `unwrap`
+        // would take the resolver off the air and a default would silently lift
+        // every block (`CLAUDE.md` §4, §6).
+        match self.current.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Re-read every file and install the result.
+    ///
+    /// All-or-nothing, as at startup: a feed that will not parse must not leave
+    /// the resolver enforcing a policy shorter than the one configured, so the
+    /// previous set stays in force and the caller is told which file was wrong.
+    pub fn reload(&self) -> ConfigResult<Reloaded> {
+        let zones = Arc::new(PolicyZones::load(&self.paths, self.policy)?);
+        let mut guard = match self.current.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let delegation_rules_changed = zones.delegation_versions() != guard.delegation_versions();
+        *guard = zones.clone();
+        Ok(Reloaded {
+            zones,
+            delegation_rules_changed,
+        })
+    }
+}
+
+/// What a reload installed, and the one thing a caller holding a cache has to
+/// know about it.
+#[derive(Debug)]
+pub struct Reloaded {
+    /// The set now in force.
+    pub zones: Arc<PolicyZones>,
+    /// Whether any zone that has something to say about a delegation is at a
+    /// different version than the one it replaced.
+    ///
+    /// A reload's one obligation to an answer cache. A QNAME or client-IP rule
+    /// is consulted before every cache and a response-IP rule is applied to
+    /// what leaves, so a new one of either is in force for the next query
+    /// whatever is held. A nameserver rule can only be asked while a delegation
+    /// is being walked, so an answer already cached is never offered to it and
+    /// outlives the rule by its TTL (`TODO.md` #56, #57).
+    pub delegation_rules_changed: bool,
 }
 
 /// One query's nameserver triggers, as the resolver consults them.
@@ -770,6 +884,7 @@ fn address_in(record: &ResourceRecord) -> Option<IpAddr> {
 mod tests {
     use super::*;
     use crate::test_records::nm;
+    use crate::testutil::ScratchDir;
     use crate::zone::parse_zone_file;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -1295,5 +1410,136 @@ evil.example.com IN CNAME .
                 Qtype::of(rt::A),
             )
             .is_none());
+    }
+
+    /// A feed, parameterised by the two things a reload turns on: the serial
+    /// the zone claims to be at, and whether it has anything to say about a
+    /// delegation.
+    fn feed(serial: u32, blocked: &str, nsdname: Option<&str>) -> String {
+        let mut text = format!(
+            "$TTL 60\n\
+             @ IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. {serial} 3600 600 86400 60\n\
+             @ IN NS localhost.\n\
+             {blocked} IN CNAME .\n"
+        );
+        if let Some(ns) = nsdname {
+            text.push_str(&format!("{ns}.rpz-nsdname IN CNAME .\n"));
+        }
+        text
+    }
+
+    /// The point of #57: a feed rewritten under a running resolver is read
+    /// again, and the rule that arrived is in force for the next query.
+    ///
+    /// Fails against the shape this replaced, where the zones were read once
+    /// into `Resolving` and the only way to change them was a restart.
+    #[test]
+    fn a_reload_reads_the_file_again() {
+        let dir = ScratchDir::new("rpz-reload");
+        let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
+        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
+            .expect("it loads");
+        assert_eq!(
+            action_for(&store.in_force(), "second.example.com.", Qtype::of(rt::A)),
+            None
+        );
+
+        std::fs::write(&path, feed(2, "second.example.com", None)).expect("rewrite");
+        let reloaded = store.reload().expect("it re-reads");
+        assert_eq!(
+            action_for(&store.in_force(), "second.example.com.", Qtype::of(rt::A)),
+            Some(Action::Nxdomain)
+        );
+        assert_eq!(
+            action_for(&store.in_force(), "first.example.com.", Qtype::of(rt::A)),
+            None,
+            "a rule the feed dropped is a rule that stopped being enforced"
+        );
+        assert!(
+            !reloaded.delegation_rules_changed,
+            "neither version had a nameserver trigger, so nothing held was bypassing one"
+        );
+    }
+
+    /// All-or-nothing, as at startup: one unparseable file out of two must not
+    /// leave the resolver enforcing half the policy (`CLAUDE.md` §4).
+    #[test]
+    fn a_feed_that_will_not_parse_leaves_the_previous_ones_in_force() {
+        let dir = ScratchDir::new("rpz-reload-broken");
+        let first = dir.write("first.zone", &feed(1, "first.example.com", None));
+        let second = dir.write("second.zone", &feed(1, "second.example.com", None));
+        let store = PolicyStore::load(&[first.clone(), second.clone()], PolicyOverride::Given)
+            .expect("both load");
+
+        // The first file is good and the second is not, so a loader that
+        // installed as it went would leave the new first rule in force.
+        std::fs::write(&first, feed(2, "third.example.com", None)).expect("rewrite");
+        std::fs::write(&second, "this is not a zone file\n").expect("rewrite");
+        assert!(store.reload().is_err());
+
+        let in_force = store.in_force();
+        assert_eq!(
+            action_for(&in_force, "first.example.com.", Qtype::of(rt::A)),
+            Some(Action::Nxdomain)
+        );
+        assert_eq!(
+            action_for(&in_force, "second.example.com.", Qtype::of(rt::A)),
+            Some(Action::Nxdomain)
+        );
+        assert_eq!(
+            action_for(&in_force, "third.example.com.", Qtype::of(rt::A)),
+            None,
+            "half of a failed reload is worse than none of it"
+        );
+    }
+
+    /// What the caches are owed, and only what they are owed: a QNAME rule
+    /// that moved is in force for the next query whatever is held, and a
+    /// nameserver rule that moved is not.
+    #[test]
+    fn only_a_moved_nameserver_rule_reports_a_change() {
+        let dir = ScratchDir::new("rpz-reload-versions");
+        let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
+        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
+            .expect("it loads");
+
+        std::fs::write(&path, feed(2, "second.example.com", None)).expect("rewrite");
+        assert!(
+            !store.reload().expect("re-reads").delegation_rules_changed,
+            "a QNAME rule is consulted before every cache"
+        );
+
+        std::fs::write(
+            &path,
+            feed(3, "second.example.com", Some("ns.evil.example.com")),
+        )
+        .expect("rewrite");
+        assert!(
+            store.reload().expect("re-reads").delegation_rules_changed,
+            "a nameserver rule is only asked while a delegation is walked"
+        );
+
+        // Same file, same serial: an operator who sends SIGHUP hourly must not
+        // pay a cold cache for it.
+        assert!(
+            !store.reload().expect("re-reads").delegation_rules_changed,
+            "nothing moved"
+        );
+
+        std::fs::write(
+            &path,
+            feed(4, "second.example.com", Some("ns.other.example.com")),
+        )
+        .expect("rewrite");
+        assert!(store.reload().expect("re-reads").delegation_rules_changed);
+    }
+
+    /// A store nothing was loaded from reloads nothing: the `--rpz`-less
+    /// resolver must not have SIGHUP say "policy zones re-read".
+    #[test]
+    fn a_store_with_no_files_is_not_configured() {
+        let store = PolicyStore::in_memory(PolicyZones::default());
+        assert!(!store.is_configured());
+        assert!(store.in_force().is_empty());
     }
 }

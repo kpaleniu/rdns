@@ -320,6 +320,17 @@ RPZ wildcard rule is RFC 1034 §4.3.3's.
 - A policy zone without an apex SOA is refused at load, since a negative rewrite
   owes one (RFC 2308 §5). An address trigger that is not an address is refused
   too. Loading is all-or-nothing.
+- **SIGHUP re-reads every `--rpz` file** (`rpz::PolicyStore`, `TODO.md` #57),
+  all-or-nothing as at startup: a feed that will not parse leaves the previous
+  set in force and says so, because a half-written file must not lift a block.
+  Unix only, as every SIGHUP here is. One query is decided by one snapshot of
+  the set, taken at its start. A reload also clears the three caches, but only
+  when a zone carrying a nameserver trigger is at a new SOA serial: a QNAME or
+  `rpz-client-ip` rule is consulted before every cache and an `rpz-ip` rule is
+  applied to what leaves, so either binds the next query whatever is held,
+  while `rpz-nsdname` and `rpz-nsip` are asked only while a delegation is
+  walked — which a cache hit never does. A feed is delivered by whatever writes
+  the file; `rdnsr` is not a secondary and does not listen for NOTIFY.
 - Every rewrite goes out with AD clear and an Extended DNS Error: 15 (Blocked)
   when the answer is a denial, 4 (Forged Answer) when records are still
   provided — RFC 8914 §4.5 draws that line.

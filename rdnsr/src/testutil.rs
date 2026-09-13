@@ -16,7 +16,7 @@ use rdns::{DnsMessage, OpCode, Qtype, QuerySection, ResponseCode};
 use rdns_transport::ServeContext;
 
 use rdns::cache::StalePolicy;
-use rdns::rpz::PolicyZones;
+use rdns::rpz::{PolicyStore, PolicyZones};
 
 use crate::answer::{Caches, Resolving};
 
@@ -71,11 +71,58 @@ pub(crate) fn serving(
     Arc::new(Resolving {
         resolver,
         caches,
+        policy: PolicyStore::in_memory(policy),
+        prefetch: false,
+        dns64: None,
+        ctx,
+    })
+}
+
+/// The same, for a test that brings a policy it will rewrite under the
+/// resolver.
+pub(crate) fn serving_policy(policy: Arc<PolicyStore>) -> Arc<Resolving> {
+    let ctx = test_shell();
+    let caches = Caches::new(16, 4, StalePolicy::OFF, ctx.clock.clone());
+    Arc::new(Resolving {
+        resolver: test_resolver(),
+        caches,
         policy,
         prefetch: false,
         dns64: None,
         ctx,
     })
+}
+
+/// A directory under `TEMP`, removed when it goes out of scope.
+///
+/// A third copy of `rdns`'s: a `#[cfg(test)]` item is invisible to another
+/// crate, which is what `rdnsd`'s copy says too (`TODO.md` #38e). One per
+/// crate is the floor without a `testkit` feature.
+pub(crate) struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    pub(crate) fn new(tag: &str) -> ScratchDir {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("rdnsr-{tag}-{unique}"));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        ScratchDir(dir)
+    }
+
+    /// Write a file into it, and give back its path.
+    pub(crate) fn write(&self, name: &str, content: &str) -> std::path::PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, content).expect("write scratch file");
+        path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 pub(crate) fn message(opcode: OpCode, response: bool) -> Vec<u8> {

@@ -50,7 +50,10 @@ closing it is what added #53 — a zone this server signed itself verified again
 at every load — which closed the same day it was taken.
 #57 is what is left of what 45a left — **#56 closed the same day it was filed**,
 and what it found was in a cache nobody was looking at rather than in the
-resolver's return type. #58 is what 45b left, #59 what #51 left and #60
+resolver's return type. **#57's own first item closed the same day too**: a
+SIGHUP re-reads every `--rpz` file now, so what is left of it is the transfer
+and the IXFR question, and the row says why the cheap answer to both may be a
+post-transfer hook in `rdnsd`. #58 is what 45b left, #59 what #51 left and #60
 what #51 turned up on the way; and #21 is an inventory of deliberate deviations
 rather than a queue. **#59's prerequisite is gone**: #54
 was it, and closing it put `validation::Arrival` where a peer certificate can
@@ -960,7 +963,7 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13**
+### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, first item closed 2026-09-13**
 
 Also left behind by 45a, and the half of its own row that did not survive
 contact with the code. #45a said the pleasing part was the delivery mechanism —
@@ -972,27 +975,60 @@ listen for a NOTIFY at all.
 
 So `--rpz` takes a path, and a feed is refreshed by whatever writes that path —
 which is how an operator with one feed and a cron job already works, and is not
-how an operator with an hourly-updated blocklist wants to work: a file rewritten
-under a running resolver is not re-read, so today the answer is a restart.
+how an operator with an hourly-updated blocklist wants to work.
 
-Three things to settle, in this order:
+Three things to settle, in this order. The first is done.
 
-- **Re-read before replicate.** A SIGHUP that re-reads every `--rpz` file is
-  most of the value and needs no protocol: `rdnsr` already has a reload signal
-  for the TLS certificate (`main.rs`), so this is a second thing that handler
-  does. All-or-nothing, the way `PolicyZones::load` is at startup — a feed that
-  fails to parse must leave the one in force in force. **And it has to decide
-  what happens to the answer cache**, which #56 left here: a nameserver trigger
-  blocks by stopping the resolution, so nothing it blocks is ever cached — but
-  an answer cached before a new rule arrived outlives it by its TTL. Today that
-  window is empty because the policy loads before a socket binds; a reload opens
-  it.
+- ~~**Re-read before replicate.**~~ **Done, `rpz::PolicyStore`.** SIGHUP
+  re-reads every `--rpz` file, all-or-nothing, and a feed that will not parse
+  leaves the previous set in force with a WARN naming it. The shape is
+  `CertificateStore`'s (§7): paths, an `RwLock<Arc<PolicyZones>>`, and a
+  `reload` that builds the whole set before installing any of it.
+
+  One thing the row got wrong: "`rdnsr` already has a reload signal for the TLS
+  certificate, so this is a second thing that handler does" — the handler was
+  spawned *inside* the `--tls-listen` arm, so a resolver with `--rpz` and no DoT
+  had no reload task at all. It is now one task, spawned when either has
+  something to re-read.
+
+  **What it decided about the caches.** Only a nameserver trigger can be
+  bypassed by something held: a QNAME or `rpz-client-ip` rule is consulted
+  before every cache and an `rpz-ip` rule is applied to what leaves, so both
+  bind the next query whatever is cached, while `rpz-nsdname` and `rpz-nsip` are
+  asked only while a delegation is walked — which a cache hit never does. So a
+  reload clears all three caches, and only when a zone carrying one of those two
+  is at a new SOA serial. The serial, because that is the zone's own claim to
+  have changed and the same number a secondary transfers on; the alternative,
+  clearing whenever any nameserver rule exists, makes an hourly SIGHUP an hourly
+  cold cache, which is its own outage. A file edited without a serial bump is
+  missed here exactly as a transfer would miss it.
+
+  Cost, measured on the development machine: one `RwLock` read and one `Arc`
+  clone per query, **15.9 ns** in release — one snapshot decides one query,
+  because the nameserver triggers are borrowed across a resolution and no lock
+  may be held over that (§9). Against the 522 ns `benches/answer_path.rs` reads
+  for a whole answer and the 3.6-4.1 µs its header gives for one
+  `sendto`+`recvfrom` pair. No benchmark covers `rdnsr::answer::handle_query`,
+  so that number is a probe rather than a bench: 20 M calls to
+  `PolicyStore::in_force`, timed, not kept.
+
+  Six tests, three in `rdns::rpz` and three in `rdnsr::answer`; every one was
+  run against the shape it forbids. The all-or-nothing pair fails against a
+  `reload` that installs file by file; the cache pair fails against a
+  fingerprint missing either half (the serial, or the "watches delegations"
+  filter); the two answer-path tests fail against a `reload_policy` that returns
+  at once, which is what the tree did before.
 - **Then the transfer**, which is the part with a cost: it means `rdnsr` grows a
   replication task, an SOA timer and a NOTIFY listener, and those are what
   `rdnsd` is. The alternative worth measuring first is that the *operator* runs
   `rdnsd` as the secondary and points `rdnsr --rpz` at the zone file it writes,
   which is two processes and no new code, and is what several ISPs do with BIND
-  for unrelated reasons.
+  for unrelated reasons. **The reload above is what makes that alternative work
+  at all**, and it leaves exactly one gap: nothing sends the SIGHUP. `rdnsd` has
+  no post-transfer hook, so today the trigger is the operator's — a systemd path
+  unit, or a cron job beside the one that already writes the file. A hook is a
+  smaller change than a replication task and would settle this row without it;
+  measure that before building the task.
 - **And IXFR only if the zone is large enough to care.** A national blocklist is
   thousands of names; the RPZ feeds that are millions are the commercial malware
   ones. `rdns::ixfr` exists either way, so this is a question about the timer

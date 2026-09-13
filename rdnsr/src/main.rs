@@ -30,9 +30,9 @@ use rdns::metrics::DnsMetrics;
 use rdns::readiness::Readiness;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::rfc5011::ManagedAnchors;
-use rdns::rpz::PolicyZones;
+use rdns::rpz::PolicyStore;
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
-use rdns::shutdown::{next_reload, reload_signal, Shutdown};
+use rdns::shutdown::{next_reload, reload_signal, Shutdown, Stop};
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
 use rdns::UdpSizes;
 use rdns_transport::https;
@@ -44,7 +44,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
 
 use crate::anchors::spawn_anchor_manager;
-use crate::answer::{Caches, Resolving};
+use crate::answer::{log_policy, reload_policy, Caches, Resolving};
 use crate::serve::udp_main;
 
 /// UDP queries this resolver will have in flight at once, when nothing says
@@ -493,7 +493,7 @@ async fn main() -> anyhow::Result<()> {
     // Before anything binds, like the certificate and the metrics listener: a
     // policy file that will not parse is a block that is not in force, and
     // starting without it is the failure worth avoiding most here.
-    let policy = PolicyZones::load(&cli.rpz, cli.rpz_policy)?;
+    let policy = PolicyStore::load(&cli.rpz, cli.rpz_policy)?;
 
     // Before anything binds, as everything else operator-supplied is: a NAT64
     // prefix that does not parse is an IPv6-only network with no DNS at all.
@@ -619,19 +619,7 @@ async fn main() -> anyhow::Result<()> {
         queries_per_source: cli.anomaly_source_queries,
         refusals_per_source: cli.anomaly_source_refusals,
     };
-    // What each policy zone holds, by trigger kind. Printed for the reason the
-    // rate limiter's policy is: a rewrite is invisible on the wire, so the feed
-    // that loaded and the feed the operator meant to load are otherwise the
-    // same picture (`CLAUDE.md` §4, §14, `TODO.md` #45a, #56).
-    for zone in policy.zones() {
-        let [qname, client_ip, response_ip, nsdname, nsip] = zone.trigger_counts();
-        tracing::info!(
-            "policy zone {} ({}): {} records, {qname} qname, {client_ip} client-ip,              {response_ip} response-ip, {nsdname} nsdname, {nsip} nsip",
-            zone.origin().to_presentation(),
-            zone.policy(),
-            zone.records(),
-        );
-    }
+    log_policy(&policy.in_force());
 
     if let Some(dns64) = dns64.as_ref() {
         tracing::info!(
@@ -758,35 +746,21 @@ async fn main() -> anyhow::Result<()> {
             shutdown.stop_handle(),
             shutdown.busy(),
         ));
-        // The renewal story, and the only reload this daemon has. `rdnsd` folds
-        // the same call into the reload every trigger passes through; here there
-        // are no zones, so SIGHUP means this and only this. One store serves
-        // both encrypted listeners, so one reload reaches both.
-        //
-        // Not in the `JoinSet` below: that set's rule is "the first task to end
-        // ends the process", and this one ends on the stop signal by design.
-        if let Some(store) = tls_store.clone() {
-            let stop = shutdown.stop_handle();
-            tokio::spawn(async move {
-                let mut signals = reload_signal();
-                loop {
-                    tokio::select! {
-                        reloaded = next_reload(&mut signals) => {
-                            if !reloaded {
-                                break;
-                            }
-                        }
-                        _ = stop.wait() => break,
-                    }
-                    match store.reload() {
-                        Ok(()) => tracing::info!("TLS certificate re-read (SIGHUP)"),
-                        Err(e) => {
-                            tracing::warn!("could not re-read the TLS certificate (SIGHUP): {e:#}")
-                        }
-                    }
-                }
-            });
-        }
+    }
+    // Two things pass through the one reload this daemon has: the certificate a
+    // renewal rewrote, and every `--rpz` file. `rdnsd` folds the same
+    // certificate call into the reload every trigger passes through; here there
+    // are no zones, so SIGHUP means these and only these. One certificate store
+    // serves all three encrypted listeners, so one reload reaches them all.
+    //
+    // Not in the `JoinSet` below: that set's rule is "the first task to end ends
+    // the process", and this one ends on the stop signal by design.
+    if tls_store.is_some() || serving.policy.is_configured() {
+        tokio::spawn(reload_on_signal(
+            tls_store.clone(),
+            serving.clone(),
+            shutdown.stop_handle(),
+        ));
     }
     // A listener like the others: if it dies, the process does. Metrics that
     // silently stopped are worse than a resolver that is plainly down.
@@ -816,4 +790,35 @@ async fn main() -> anyhow::Result<()> {
     // client is waiting on, or the RFC 5011 manager part-way through rewriting
     // the anchor file.
     rdns_transport::serve_until_stopped(loops, anomalies, shutdown).await
+}
+
+/// SIGHUP: re-read the TLS certificate and every `--rpz` file.
+///
+/// A policy feed is rewritten under a running resolver and was not re-read
+/// until a restart (`TODO.md` #57). Both reloads leave what is in force in
+/// force if the new files do not parse, so a half-written feed or a
+/// half-renewed certificate costs a log line rather than the service.
+async fn reload_on_signal(
+    certificate: Option<Arc<CertificateStore>>,
+    serving: Arc<Resolving>,
+    stop: Stop,
+) {
+    let mut signals = reload_signal();
+    loop {
+        tokio::select! {
+            reloaded = next_reload(&mut signals) => {
+                if !reloaded {
+                    break;
+                }
+            }
+            _ = stop.wait() => break,
+        }
+        if let Some(store) = &certificate {
+            match store.reload() {
+                Ok(()) => tracing::info!("TLS certificate re-read (SIGHUP)"),
+                Err(e) => tracing::warn!("could not re-read the TLS certificate (SIGHUP): {e:#}"),
+            }
+        }
+        reload_policy(&serving);
+    }
 }
