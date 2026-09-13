@@ -142,6 +142,13 @@ pub struct Counters {
     pub policy_rewrites: AtomicU64,
     pub policy_drops: AtomicU64,
 
+    /// Names re-resolved before they expired (`--prefetch`).
+    ///
+    /// Every one is an upstream query no client asked for, which is what the
+    /// switch buys and what it costs: against `dns_cache_hits_total` it says
+    /// whether prefetching is paying for itself.
+    pub prefetches: AtomicU64,
+
     /// Answers served from expired cache because a refresh failed (RFC 8767).
     ///
     /// The number an operator watches during somebody else's outage, and the
@@ -211,6 +218,7 @@ impl DnsMetrics {
             tls_handshake_failures: AtomicU64::new(0),
             quic_handshakes: AtomicU64::new(0),
             quic_handshake_failures: AtomicU64::new(0),
+            prefetches: AtomicU64::new(0),
             stale_answers: AtomicU64::new(0),
             policy_rewrites: AtomicU64::new(0),
             policy_drops: AtomicU64::new(0),
@@ -436,6 +444,13 @@ impl DnsMetrics {
         output.push_str(&format!(
             "dns_responses_noerror_total {}\n",
             self.responses_noerror.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("# HELP dns_prefetches_total Names re-resolved before expiry\n");
+        output.push_str("# TYPE dns_prefetches_total counter\n");
+        output.push_str(&format!(
+            "dns_prefetches_total {}\n",
+            self.prefetches.load(Ordering::Relaxed)
         ));
 
         output.push_str("# HELP dns_stale_answers_total Answers served from expired cache\n");

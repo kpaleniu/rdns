@@ -300,6 +300,18 @@ struct Cli {
     /// DNS Error (RFC 8914 §4.4), and is counted.
     #[arg(long, value_name = "SECONDS", default_value = "0")]
     serve_stale: u64,
+    /// Re-resolve a cached name in the last tenth of its TTL, so a popular
+    /// name never makes a client wait for the walk (Unbound's `prefetch`).
+    ///
+    /// The refresh runs in the task that just answered, after the reply is
+    /// sent, and at most one is started per cache entry — a popular name in its
+    /// last tenth costs one upstream query and not one per client.
+    ///
+    /// Off by default: it turns a client's query into two, for a name nobody
+    /// may ask for again, and `dns_prefetches_total` against
+    /// `dns_cache_hits_total` is how an operator decides whether that pays.
+    #[arg(long)]
+    prefetch: bool,
     /// What a policy zone's rules mean, when it should not be taken at its
     /// word: given, disabled, passthru, drop, nxdomain, nodata or tcp-only.
     ///
@@ -446,10 +458,14 @@ async fn main() -> anyhow::Result<()> {
     } else {
         NSEC_CACHE_ZONES
     };
+    // One clock for the process: the rate limiter, the query log and both
+    // caches read the same instant, and a test can move it.
+    let clock = rdns::clock::Clock::system();
     let caches = Caches::new(
         capacity,
         denial_zones,
         StalePolicy::seconds(cli.serve_stale),
+        clock.clone(),
     );
 
     // Before anything binds, like the certificate and the metrics listener: a
@@ -535,7 +551,7 @@ async fn main() -> anyhow::Result<()> {
         metrics: Arc::new(DnsMetrics::new()),
         logger: Arc::new(QueryLogger::new()),
         validator: Arc::new(AdmissionCheck::new(admission.clone())),
-        clock: rdns::clock::Clock::system(),
+        clock,
     });
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \
@@ -645,6 +661,7 @@ async fn main() -> anyhow::Result<()> {
         resolver,
         caches,
         policy,
+        prefetch: cli.prefetch,
         ctx: ctx.clone(),
     });
 

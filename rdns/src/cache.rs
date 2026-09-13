@@ -28,7 +28,7 @@
 //! Eviction is `crate::eviction`, shared with the other two: one victim per
 //! insert is a scan per query once a bounded cache is full.
 
-use crate::clock::current_unix_timestamp;
+use crate::clock::Clock;
 use crate::eviction::Halving;
 use crate::name_keys::{NameType, NameTypeKey};
 use crate::NameRef;
@@ -97,21 +97,60 @@ impl StalePolicy {
     }
 }
 
+/// The fraction of an entry's TTL that has to be left for a prefetch to fire:
+/// a tenth, which is Unbound's `prefetch`.
+///
+/// Low enough that a name asked for once an hour never triggers one, high
+/// enough that a name under steady load is refreshed before any client waits
+/// for the walk.
+const PREFETCH_AT: u64 = 10;
+
 /// DNS cache entry with TTL expiration
 #[derive(Debug, Clone)]
 struct CacheEntry {
     records: Vec<ResourceRecord>,
     expires_at: u64, // Unix timestamp
+    /// What the TTL was, so "nearly expired" is a fraction of it rather than a
+    /// fixed number of seconds — a minute left is nothing on a day's TTL and
+    /// everything on two minutes'.
+    ttl: u64,
     /// Whether this answer was DNSSEC-validated when stored. The AD bit has to
     /// survive the cache, and must never be picked up here by an answer that
     /// arrived without it.
     secure: bool,
+    /// Whether a prefetch has already been handed out for this entry.
+    ///
+    /// Set by the lookup that hands it out, so a popular name in the last tenth
+    /// of its TTL costs one refresh and not one per query — which is the whole
+    /// difference between prefetching and a stampede. Not reset on failure: the
+    /// entry then expires and the next query resolves the ordinary way.
+    refreshing: bool,
 }
 
 impl CacheEntry {
     fn is_expired(&self, now: u64) -> bool {
         now >= self.expires_at
     }
+
+    /// Whether less than [`PREFETCH_AT`]'s share of the TTL is left.
+    fn nearly_expired(&self, now: u64) -> bool {
+        self.expires_at.saturating_sub(now) <= self.ttl / PREFETCH_AT
+    }
+}
+
+/// A cache hit, and what the caller may want to do about it besides answer.
+#[derive(Debug, Clone)]
+pub struct Cached {
+    pub records: Vec<ResourceRecord>,
+    /// What validation concluded when this was stored — the AD bit surviving
+    /// the cache.
+    pub secure: bool,
+    /// The entry is in the last tenth of its TTL and no refresh has been handed
+    /// out for it yet, so this caller is the one to re-resolve the name once its
+    /// own answer is on its way (Unbound's `prefetch`).
+    ///
+    /// True at most once per entry: whoever is told carries the obligation.
+    pub refresh: bool,
 }
 
 /// DNS response cache with TTL support.
@@ -123,6 +162,11 @@ pub struct DnsCache {
     cache: Arc<Mutex<HashMap<NameTypeKey, CacheEntry>>>,
     max_entries: usize,
     stale: StalePolicy,
+    /// Where "now" comes from. [`Clock::System`] everywhere but in a test, which
+    /// needs one it can move: a TTL is measured in seconds, so asserting
+    /// anything about expiry against the wall clock is a test that waits
+    /// (`TODO.md` #52, `CLAUDE.md` §10).
+    clock: Clock,
 }
 
 impl DnsCache {
@@ -132,13 +176,16 @@ impl DnsCache {
             cache: Arc::new(Mutex::new(HashMap::new())),
             max_entries,
             stale: StalePolicy::OFF,
+            clock: Clock::system(),
         }
     }
 
-    /// The same, holding expired entries for [`StalePolicy`]'s window.
-    pub fn with_stale(max_entries: usize, stale: StalePolicy) -> Self {
+    /// The same, holding expired entries for [`StalePolicy`]'s window and
+    /// reading the time from `clock`.
+    pub fn with_stale(max_entries: usize, stale: StalePolicy, clock: Clock) -> Self {
         DnsCache {
             stale,
+            clock,
             ..DnsCache::new(max_entries)
         }
     }
@@ -160,7 +207,19 @@ impl DnsCache {
         name: NameRef<'_>,
         qtype: Qtype,
     ) -> Option<(Vec<ResourceRecord>, bool)> {
-        let now = current_unix_timestamp();
+        self.lookup(name, qtype, false)
+            .map(|hit| (hit.records, hit.secure))
+    }
+
+    /// The whole of a cache hit: the records, what validation concluded, and
+    /// whether this caller owes the name a prefetch.
+    ///
+    /// `prefetching` is the operator's switch, passed in rather than stored,
+    /// because the cache has no opinion about it and a second copy of the
+    /// setting is a second thing to get out of step (`CLAUDE.md` §7). With it
+    /// false nothing is ever marked and `refresh` is always false.
+    pub fn lookup(&self, name: NameRef<'_>, qtype: Qtype, prefetching: bool) -> Option<Cached> {
+        let now = self.clock.now();
         // A poisoned lock reads as a cache miss. Poisoning is permanent, so
         // `.lock().unwrap()` on `rdnsr`'s query path would take the resolver off
         // the air for good after one panic; a miss costs a round trip.
@@ -173,9 +232,19 @@ impl DnsCache {
         let folded = name.folded();
         let key: &dyn NameType = &(folded.as_ref(), qtype);
 
-        if let Some(entry) = cache.get(key) {
+        if let Some(entry) = cache.get_mut(key) {
             if !entry.is_expired(now) {
-                return Some((entry.records.clone(), entry.secure));
+                // The flag is flipped here, under the lock the lookup already
+                // holds: the caller that is told is the caller that refreshes.
+                let refresh = prefetching && !entry.refreshing && entry.nearly_expired(now);
+                if refresh {
+                    entry.refreshing = true;
+                }
+                return Some(Cached {
+                    records: entry.records.clone(),
+                    secure: entry.secure,
+                    refresh,
+                });
             } else if !self.stale.keeps(entry.expires_at, now) {
                 // Expired and past its stale window: nothing will ask for it
                 // again. Inside the window it stays for `get_stale`.
@@ -202,7 +271,7 @@ impl DnsCache {
         if !self.stale.is_on() {
             return None;
         }
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
         let cache = self.cache.lock().ok()?;
         let folded = name.folded();
         let key: &dyn NameType = &(folded.as_ref(), qtype);
@@ -240,7 +309,7 @@ impl DnsCache {
             return;
         }
 
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
 
         // An RRset is cached for the shortest TTL in it. No clamp here: `Ttl`
         // clamps at the parse boundary (RFC 2181 §8), so a negative wire TTL
@@ -269,7 +338,9 @@ impl DnsCache {
             CacheEntry {
                 records,
                 expires_at,
+                ttl: min_ttl,
                 secure,
+                refreshing: false,
             },
         );
     }
@@ -280,7 +351,7 @@ impl DnsCache {
     /// Three linear passes and one `Vec<u64>`; the halving and the reason for it
     /// are in [`crate::eviction`].
     fn evict_oldest(&self, cache: &mut HashMap<NameTypeKey, CacheEntry>) {
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
 
         // Usable, not fresh: with serve-stale on, an expired entry is still the
         // last thing known and dropping it here would make the window a lie
@@ -306,7 +377,7 @@ impl DnsCache {
                 expired_entries: 0,
             };
         };
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
 
         let mut expired_count = 0;
         let mut valid_count = 0;
@@ -347,6 +418,7 @@ pub struct CacheStats {
 mod tests {
 
     use super::*;
+    use crate::clock::current_unix_timestamp;
     use crate::record_types as rt;
     use crate::test_records::nm;
     use crate::Class;
@@ -553,8 +625,27 @@ mod tests {
         );
     }
 
+    /// A cache whose clock the test moves, so expiry is asserted rather than
+    /// waited for (`TODO.md` #52): a TTL is whole seconds, and every other way
+    /// of reaching one is a sleep or a zero.
+    fn fixed_cache(max_entries: usize, stale: StalePolicy) -> (DnsCache, Clock) {
+        let clock = Clock::fixed(1_000_000_000);
+        (
+            DnsCache::with_stale(max_entries, stale, clock.clone()),
+            clock,
+        )
+    }
+
+    fn put_a(cache: &DnsCache, name: &str, ttl: u32) {
+        cache.put(
+            nm(name).as_ref(),
+            Qtype::of(rt::A),
+            vec![create_test_record(name, Ttl::from_secs(ttl))],
+        );
+    }
+
     /// The window is one piece of arithmetic and both caches read it, so its
-    /// two edges are asserted here rather than in a test that has to wait.
+    /// two edges are asserted directly.
     #[test]
     fn the_stale_window_ends_exactly_where_it_says() {
         let policy = StalePolicy::seconds(3600);
@@ -580,13 +671,10 @@ mod tests {
     /// that hands it over, and only to a caller that has already failed.
     #[test]
     fn an_expired_entry_is_a_miss_and_a_stale_hit() {
-        let cache = DnsCache::with_stale(16, StalePolicy::seconds(3600));
-        // TTL zero: expired the instant it is stored, with no clock to move.
-        cache.put(
-            nm("example.com.").as_ref(),
-            Qtype::of(rt::A),
-            vec![create_test_record("example.com.", Ttl::from_secs(0))],
-        );
+        let (cache, clock) = fixed_cache(16, StalePolicy::seconds(3600));
+        put_a(&cache, "example.com.", 300);
+        clock.advance(301);
+
         assert!(
             cache
                 .get(nm("example.com.").as_ref(), Qtype::of(rt::A))
@@ -603,6 +691,12 @@ mod tests {
             "the TTL a stale answer carries is chosen, not counted down (§4)"
         );
         assert!(!secure, "and AD is what validation concluded, unchanged");
+
+        // Past the window it is gone, and the lookup that finds it says so.
+        clock.advance(3600);
+        assert!(cache
+            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A))
+            .is_none());
     }
 
     /// With the policy off nothing is stale, and the expired entry is dropped on
@@ -610,12 +704,9 @@ mod tests {
     /// and must still do.
     #[test]
     fn with_the_policy_off_an_expired_entry_is_dropped_on_lookup() {
-        let cache = DnsCache::with_defaults();
-        cache.put(
-            nm("example.com.").as_ref(),
-            Qtype::of(rt::A),
-            vec![create_test_record("example.com.", Ttl::from_secs(0))],
-        );
+        let (cache, clock) = fixed_cache(16, StalePolicy::OFF);
+        put_a(&cache, "example.com.", 300);
+        clock.advance(301);
         assert_eq!(cache.get_stats().total_entries, 1);
         assert!(cache
             .get(nm("example.com.").as_ref(), Qtype::of(rt::A))
@@ -639,21 +730,75 @@ mod tests {
     /// **1** entry survived, being the one that arrived after the sweep.
     #[test]
     fn eviction_keeps_what_is_still_inside_the_stale_window() {
-        let cache = DnsCache::with_stale(10, StalePolicy::seconds(3600));
-        for i in 0..11 {
-            let name = format!("example{i}.com.");
-            cache.put(
-                nm(&name).as_ref(),
-                Qtype::of(rt::A),
-                vec![create_test_record(&name, Ttl::from_secs(0))],
-            );
+        let (cache, clock) = fixed_cache(10, StalePolicy::seconds(3600));
+        for i in 0..10 {
+            put_a(&cache, &format!("example{i}.com."), 300);
         }
+        clock.advance(301);
+        put_a(&cache, "eleventh.example.com.", 300);
+
         let held = cache.get_stats().total_entries;
         assert!(
             held >= 5,
             "halved to five and one more inserted, not swept: {held} survived"
         );
         assert!(held <= 10, "still bounded, got {held}");
+    }
+
+    /// The prefetch obligation is handed to exactly one caller (Unbound's
+    /// `prefetch`, at a tenth of the TTL). Handing it to every caller is the
+    /// difference between refreshing a popular name and stampeding it.
+    #[test]
+    fn a_prefetch_is_offered_once_per_entry() {
+        let (cache, clock) = fixed_cache(16, StalePolicy::OFF);
+        put_a(&cache, "hot.example.com.", 100);
+        clock.advance(95);
+
+        let first = cache
+            .lookup(nm("hot.example.com.").as_ref(), Qtype::of(rt::A), true)
+            .expect("still a hit");
+        assert!(first.refresh, "five seconds left of a hundred");
+        let second = cache
+            .lookup(nm("hot.example.com.").as_ref(), Qtype::of(rt::A), true)
+            .expect("still a hit");
+        assert!(
+            !second.refresh,
+            "the second client in the same tenth must not start a second walk"
+        );
+    }
+
+    #[test]
+    fn an_entry_with_life_left_is_not_prefetched() {
+        let (cache, clock) = fixed_cache(16, StalePolicy::OFF);
+        put_a(&cache, "cold.example.com.", 100);
+        clock.advance(10);
+        let hit = cache
+            .lookup(nm("cold.example.com.").as_ref(), Qtype::of(rt::A), true)
+            .expect("a hit");
+        assert!(!hit.refresh, "ninety seconds left of a hundred");
+    }
+
+    /// Off means off, and it must also leave the entry unmarked: a resolver
+    /// restarted with the switch on would otherwise find its whole cache
+    /// already claimed.
+    #[test]
+    fn with_prefetching_off_nothing_is_offered_or_marked() {
+        let (cache, clock) = fixed_cache(16, StalePolicy::OFF);
+        put_a(&cache, "hot.example.com.", 100);
+        clock.advance(95);
+        assert!(
+            !cache
+                .lookup(nm("hot.example.com.").as_ref(), Qtype::of(rt::A), false)
+                .expect("a hit")
+                .refresh
+        );
+        assert!(
+            cache
+                .lookup(nm("hot.example.com.").as_ref(), Qtype::of(rt::A), true)
+                .expect("a hit")
+                .refresh,
+            "and the entry was left unclaimed"
+        );
     }
 
     #[test]

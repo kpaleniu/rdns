@@ -10,6 +10,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use rdns::cache::StalePolicy;
+use rdns::clock::Clock;
 use rdns::dnssec::Bogus;
 use rdns::dnssec_chain::ValidationState;
 use rdns::ede::InfoCode;
@@ -57,11 +58,18 @@ impl Caches {
     /// because its signature proves it, and an expired proof proves nothing —
     /// RFC 8198 §5 rests on the validity period the signer chose, which
     /// RFC 8767 has no standing to extend.
-    pub(crate) fn new(capacity: usize, denial_zones: usize, stale: StalePolicy) -> Caches {
+    /// `clock` is the daemon's, the one `ServeContext` reads: one process, one
+    /// idea of the time, and a test that can move it (`TODO.md` #52).
+    pub(crate) fn new(
+        capacity: usize,
+        denial_zones: usize,
+        stale: StalePolicy,
+        clock: Clock,
+    ) -> Caches {
         Caches {
-            answers: DnsCache::with_stale(capacity, stale),
+            answers: DnsCache::with_stale(capacity, stale, clock.clone()),
             // Negative answers are answers: `--no-cache` means no cache.
-            negatives: NegativeCache::with_stale(capacity, stale),
+            negatives: NegativeCache::with_stale(capacity, stale, clock),
             denials: NsecCache::new(denial_zones),
         }
     }
@@ -80,7 +88,35 @@ pub(crate) struct Resolving {
     /// The response policy zones in force, in the order they are consulted.
     /// Empty unless `--rpz` named one, and empty costs one `is_empty` a query.
     pub(crate) policy: PolicyZones,
+    /// Whether a cache hit in the last tenth of its TTL should be re-resolved
+    /// once the client's own answer is away (`--prefetch`).
+    pub(crate) prefetch: bool,
     pub(crate) ctx: Arc<ServeContext>,
+}
+
+/// What answering one query produced: the reply, and any work it left behind.
+///
+/// The second field is the whole reason this is not `Option<Vec<u8>>`. A
+/// prefetch must not delay the answer that discovered it, so it is handed back
+/// to the socket loop to run *after* the reply is sent — in the same task,
+/// which already holds its in-flight permit and its shutdown guard. A task
+/// spawned here would hold neither, and `CLAUDE.md` §9 is about what happens to
+/// the ones nobody owns.
+pub(crate) struct Answered {
+    /// The bytes to send back, or `None` to send nothing at all.
+    pub(crate) reply: Option<Vec<u8>>,
+    /// A question to re-resolve into the cache, now that the client has its
+    /// answer.
+    pub(crate) refresh: Option<QuerySection>,
+}
+
+impl From<Option<Vec<u8>>> for Answered {
+    fn from(reply: Option<Vec<u8>>) -> Answered {
+        Answered {
+            reply,
+            refresh: None,
+        }
+    }
 }
 
 /// What the client asked for and what it can take: everything about a request
@@ -102,13 +138,16 @@ pub(crate) async fn handle_query(
     now: u64,
     serving: &Resolving,
     transport: Transport,
-) -> Option<Vec<u8>> {
+) -> Answered {
     let Resolving {
         resolver,
         caches,
         policy,
+        prefetch,
         ctx,
     } = serving;
+    // Set by the one lookup that can discover it, returned by every path.
+    let mut refresh = None;
     // Refuse a *response*: a reply parsed as a question and answered with
     // another reply is a packet loop between two servers pointed at each other.
     // `None` is the whole reply, because the peer did not ask anything. The type
@@ -117,7 +156,7 @@ pub(crate) async fn handle_query(
         Ok(msg) => msg,
         Err(_) => {
             ctx.logger.count_error(peer);
-            return None;
+            return None.into();
         }
     };
     let timer = LatencyTimer::new();
@@ -141,10 +180,13 @@ pub(crate) async fn handle_query(
     // plausible QUERY-shaped reply the sender will misread (RFC 1035 §4.1.1).
     if msg.opcode != OpCode::Query {
         ctx.record_answer(ResponseCode::NotImplemented, timer);
-        return unsupported_opcode(&msg, ctx.udp.advertised(), client_max);
+        return unsupported_opcode(&msg, ctx.udp.advertised(), client_max).into();
     }
 
-    let query = msg.queries.first()?.clone();
+    // No question at all: nothing to answer and nothing to say about it.
+    let Some(query) = msg.queries.first().cloned() else {
+        return None.into();
+    };
     let id = msg.id;
     let recursion = msg.recursion;
 
@@ -156,7 +198,7 @@ pub(crate) async fn handle_query(
         Ok(edns) => edns,
         Err(rcode) => {
             ctx.record_answer(rcode, timer);
-            return edns_error(&msg, rcode, client_max, ctx.udp.advertised());
+            return edns_error(&msg, rcode, client_max, ctx.udp.advertised()).into();
         }
     };
     // DO means "send me the signatures", AD "tell me whether you checked"; CD
@@ -177,7 +219,7 @@ pub(crate) async fn handle_query(
     // match the request either (`TODO.md` #30r).
     if msg.queries.len() > 1 {
         let resp = build_response(&msg, Vec::new(), ResponseCode::FormatError);
-        return finish(resp, false, None, &client, &query, ctx, timer);
+        return finish(resp, false, None, &client, &query, ctx, timer).into();
     }
 
     // Names that must not leave this machine (RFC 6761, 6762, 6303). Before
@@ -195,7 +237,7 @@ pub(crate) async fn handle_query(
         tracing::debug!(qname = %query.qname, why = %local.why, "answered locally");
         // Never authenticated: this was decided by specification rather than
         // validated, and a validating client cannot check the claim itself.
-        return finish(resp, false, None, &client, &query, ctx, timer);
+        return finish(resp, false, None, &client, &query, ctx, timer).into();
     }
 
     // The operator's policy, before every cache and before any resolution: a
@@ -210,7 +252,7 @@ pub(crate) async fn handle_query(
             if let Applied::Replied(reply) =
                 apply_policy(&msg, rewrite, &client, &query, ctx, timer, transport)
             {
-                return reply;
+                return reply.into();
             }
         }
     }
@@ -233,7 +275,7 @@ pub(crate) async fn handle_query(
             resp.authorities = wildcard.authority;
             // A wildcard signature verifies at this name unchanged, so the
             // client can check this for itself.
-            return finish(resp, true, None, &client, &query, ctx, timer);
+            return finish(resp, true, None, &client, &query, ctx, timer).into();
         }
     }
 
@@ -244,7 +286,7 @@ pub(crate) async fn handle_query(
             resp.authorities = denial.authority;
             // The proofs were validated before storage, so what is derived
             // from them is authentic on the same terms.
-            return finish(resp, true, None, &client, &query, ctx, timer);
+            return finish(resp, true, None, &client, &query, ctx, timer).into();
         }
     }
 
@@ -255,16 +297,23 @@ pub(crate) async fn handle_query(
         ctx.metrics.count(&ctx.metrics.cache_hits);
         let mut resp = build_response(&msg, Vec::new(), negative.rcode);
         resp.authorities = negative.authority;
-        return finish(resp, negative.secure, None, &client, &query, ctx, timer);
+        return finish(resp, negative.secure, None, &client, &query, ctx, timer).into();
     }
 
     // Build the response: from cache if we have it, else by resolving. The
     // third is RFC 8914's reason, which only the two failing arms have.
-    let (mut resp, secure, why) = if let Some((records, secure)) = caches
-        .answers
-        .get_validated(query.qname.as_ref(), query.qtype)
+    let (mut resp, secure, why) = if let Some(hit) =
+        caches
+            .answers
+            .lookup(query.qname.as_ref(), query.qtype, *prefetch)
     {
         ctx.metrics.count(&ctx.metrics.cache_hits);
+        // The cache said this entry is in the last tenth of its TTL and nobody
+        // has been asked to refresh it yet. Not here: the client is waiting.
+        if hit.refresh {
+            refresh = Some(query.clone());
+        }
+        let (records, secure) = (hit.records, hit.secure);
         (
             build_response(&msg, records, ResponseCode::Ok),
             secure,
@@ -310,7 +359,8 @@ pub(crate) async fn handle_query(
                             &query,
                             ctx,
                             timer,
-                        );
+                        )
+                        .into();
                     }
                 }
 
@@ -386,12 +436,55 @@ pub(crate) async fn handle_query(
             if let Applied::Replied(reply) =
                 apply_policy(&msg, rewrite, &client, &query, ctx, timer, transport)
             {
-                return reply;
+                return reply.into();
             }
         }
     }
 
-    finish(resp, secure, why, &client, &query, ctx, timer)
+    Answered {
+        reply: finish(resp, secure, why, &client, &query, ctx, timer),
+        refresh,
+    }
+}
+
+/// Re-resolve a name into the cache, after the client that asked for it has its
+/// answer (Unbound's `prefetch`).
+///
+/// Called by the socket loop rather than by [`handle_query`], in the task that
+/// has already sent the reply: nothing is waiting on this, and the in-flight
+/// permit that task holds is what bounds how many may run at once.
+///
+/// The result goes through the same storing as an ordinary resolution, because
+/// it *is* one — the only difference is that nobody is listening. A failure is
+/// left to the entry's own expiry: the name is still in the cache with a tenth
+/// of its TTL left, so the next client either finds it or resolves it.
+pub(crate) async fn refresh(serving: &Resolving, query: QuerySection) {
+    let ctx = &serving.ctx;
+    ctx.metrics.count(&ctx.metrics.prefetches);
+    let Ok((answer, state)) = serving.resolver.resolve_validated(&query).await else {
+        // DEBUG: nobody is waiting, and a failure here costs the next client a
+        // resolution it would have paid for anyway.
+        tracing::debug!(qname = %query.qname, qtype = %query.qtype, "prefetch failed");
+        return;
+    };
+    if state.is_bogus() {
+        return;
+    }
+    let secure = state.is_secure();
+    if !answer.answers.is_empty() {
+        serving.caches.answers.put_validated(
+            query.qname.as_ref(),
+            query.qtype,
+            answer.answers.clone(),
+            secure,
+        );
+    }
+    // A "no" is an answer, and a name that has gone is exactly what a prefetch
+    // should notice before a client does.
+    serving
+        .caches
+        .negatives
+        .insert(query.qname.as_ref(), query.qtype, &answer, secure);
 }
 
 /// The last thing this resolver knew about `query`, for a resolution that has
@@ -675,6 +768,8 @@ mod tests {
     use rdns::clock::current_unix_timestamp;
     use rdns::Qtype;
 
+    use rdns::clock::Clock;
+
     use super::*;
     use crate::testutil::*;
 
@@ -796,7 +891,8 @@ mod tests {
             &serving,
             Transport::Udp,
         )
-        .await;
+        .await
+        .reply;
         assert!(
             reply.is_none(),
             "answering a response is how a resolver becomes a packet engine"
@@ -817,6 +913,7 @@ mod tests {
                 Transport::Udp,
             )
             .await
+            .reply
             .unwrap_or_else(|| panic!("{opcode:?} should be answered, not dropped"));
             let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
 
@@ -849,6 +946,7 @@ mod tests {
             Transport::Udp,
         )
         .await
+        .reply
         .expect("an UPDATE is answered, not dropped");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
 
@@ -879,22 +977,37 @@ mod tests {
         buf
     }
 
-    /// The handle every test here takes, with a serve-stale window on it.
-    fn serving_stale(seconds: u64) -> Arc<Resolving> {
-        Arc::new(Resolving {
-            resolver: test_resolver(),
-            caches: Caches::new(16, 4, StalePolicy::seconds(seconds)),
-            policy: PolicyZones::default(),
-            ctx: test_shell(),
-        })
+    /// A handle with a serve-stale window and a clock the test moves: a TTL is
+    /// whole seconds, so every other way of reaching expiry is a sleep
+    /// (`TODO.md` #52).
+    fn serving_stale(seconds: u64) -> (Arc<Resolving>, Clock) {
+        timed(StalePolicy::seconds(seconds), false)
     }
 
-    fn expired_a_record(name: &rdns::Name) -> ResourceRecord {
+    fn timed(stale: StalePolicy, prefetch: bool) -> (Arc<Resolving>, Clock) {
+        let clock = Clock::fixed(1_000_000_000);
+        let ctx = Arc::new(ServeContext {
+            clock: clock.clone(),
+            ..(*test_shell()).clone()
+        });
+        let caches = Caches::new(16, 4, stale, clock.clone());
+        (
+            Arc::new(Resolving {
+                resolver: test_resolver(),
+                caches,
+                policy: PolicyZones::default(),
+                prefetch,
+                ctx,
+            }),
+            clock,
+        )
+    }
+
+    fn a_record(name: &rdns::Name, ttl: u32) -> ResourceRecord {
         ResourceRecord {
             name: name.clone(),
             class: rdns::Class::new(1),
-            // Zero: expired the instant it is stored, with no clock to move.
-            ttl: rdns::Ttl::from_secs(0),
+            ttl: rdns::Ttl::from_secs(ttl),
             rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(std::net::Ipv4Addr::new(
                 192, 0, 2, 10,
             )))
@@ -910,13 +1023,14 @@ mod tests {
     /// Watched failing with `--serve-stale` off: SERVFAIL, no answers.
     #[tokio::test]
     async fn an_expired_answer_is_served_when_the_resolution_fails() {
-        let serving = serving_stale(3600);
+        let (serving, clock) = serving_stale(3600);
         let name = nm("example.com.");
         serving.caches.answers.put(
             name.as_ref(),
             Qtype::of(record_types::A),
-            vec![expired_a_record(&name)],
+            vec![a_record(&name, 300)],
         );
+        clock.advance(301);
 
         let query = rdns::DnsMessageBuilder::new()
             .with_id(9)
@@ -934,6 +1048,7 @@ mod tests {
             Transport::Udp,
         )
         .await
+        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
 
@@ -959,13 +1074,14 @@ mod tests {
     /// Off is the default, and off means the answer is the failure.
     #[tokio::test]
     async fn without_the_flag_a_failed_resolution_is_servfail() {
-        let serving = context();
+        let (serving, clock) = timed(StalePolicy::OFF, false);
         let name = nm("example.com.");
         serving.caches.answers.put(
             name.as_ref(),
             Qtype::of(record_types::A),
-            vec![expired_a_record(&name)],
+            vec![a_record(&name, 300)],
         );
+        clock.advance(301);
         let bytes = handle_query(
             query_for("example.com.", 1, false),
             TEST_PEER,
@@ -974,6 +1090,7 @@ mod tests {
             Transport::Udp,
         )
         .await
+        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::ServerFailure);
@@ -985,15 +1102,12 @@ mod tests {
     /// so an answer that is still an answer must not be counted as stale.
     #[tokio::test]
     async fn a_live_entry_is_not_a_stale_answer() {
-        let serving = serving_stale(3600);
+        let (serving, _clock) = serving_stale(3600);
         let name = nm("example.com.");
         serving.caches.answers.put(
             name.as_ref(),
             Qtype::of(record_types::A),
-            vec![ResourceRecord {
-                ttl: rdns::Ttl::from_secs(300),
-                ..expired_a_record(&name)
-            }],
+            vec![a_record(&name, 300)],
         );
         let bytes = handle_query(
             query_for("example.com.", 1, false),
@@ -1003,6 +1117,7 @@ mod tests {
             Transport::Udp,
         )
         .await
+        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.answers[0].ttl.as_secs(), 300, "its own TTL, not 30");
@@ -1014,6 +1129,73 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+    }
+
+    /// The answer path's half of prefetching: a cache hit in its last tenth
+    /// comes back with the question to re-resolve, and the socket loop runs it
+    /// after the reply. Nothing here waits for it.
+    ///
+    /// Watched failing with `prefetch: false`: `refresh` was `None`.
+    #[tokio::test]
+    async fn a_nearly_expired_cache_hit_asks_for_a_refresh() {
+        let (serving, clock) = timed(StalePolicy::OFF, true);
+        let name = nm("hot.example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![a_record(&name, 100)],
+        );
+        // Into the last tenth of the TTL, which is where a prefetch is due.
+        clock.advance(95);
+
+        let answered = handle_query(
+            query_for("hot.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await;
+        let reply = DnsMessage::try_from_bytes(&answered.reply.expect("answered from the cache"))
+            .expect("a well-formed reply");
+        assert_eq!(reply.answers.len(), 1, "the client is answered first");
+        let query = answered.refresh.expect("and the name is due a refresh");
+        assert_eq!(query.qname, name);
+
+        // The refresh itself: the upstream is unreachable, so this is about it
+        // being counted and returning rather than about what it learns.
+        refresh(&serving, query).await;
+        assert_eq!(
+            serving
+                .ctx
+                .metrics
+                .prefetches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// Without the switch there is nothing to run, whatever the TTL says.
+    #[tokio::test]
+    async fn without_the_switch_no_refresh_is_asked_for() {
+        let (serving, clock) = timed(StalePolicy::OFF, false);
+        let name = nm("hot.example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![a_record(&name, 100)],
+        );
+        clock.advance(95);
+        let answered = handle_query(
+            query_for("hot.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await;
+        assert!(answered.reply.is_some());
+        assert!(answered.refresh.is_none());
     }
 
     /// A policy zone with one rule of each kind this test needs, built in
@@ -1041,7 +1223,8 @@ mod tests {
             &serving,
             transport,
         )
-        .await?;
+        .await
+        .reply?;
         Some(DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply"))
     }
 
@@ -1093,6 +1276,7 @@ mod tests {
             Transport::Udp,
         )
         .await
+        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         let edns = reply.edns.as_ref().expect("the OPT is mirrored");
@@ -1120,6 +1304,7 @@ mod tests {
             Transport::Udp,
         )
         .await
+        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::Ok);
@@ -1151,7 +1336,8 @@ mod tests {
             &serving,
             Transport::Udp,
         )
-        .await;
+        .await
+        .reply;
         assert!(reply.is_none(), "rpz-drop means no reply at all");
         assert_eq!(
             serving
@@ -1229,6 +1415,7 @@ mod tests {
             Transport::Udp,
         )
         .await
+        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
@@ -1301,6 +1488,7 @@ mod tests {
             Transport::Udp,
         )
         .await
+        .reply
         .expect("answered from the cache");
         assert!(
             bytes.len() <= cap,
@@ -1338,6 +1526,7 @@ mod tests {
                 Transport::Udp,
             )
             .await
+            .reply
             .expect("localhost is answered from the table");
             let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
             assert!(!reply.answers.is_empty(), "the ordinary answer path");
@@ -1363,6 +1552,7 @@ mod tests {
             Transport::Udp,
         )
         .await
+        .reply
         .expect("answered, not dropped");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::FormatError);
@@ -1393,6 +1583,7 @@ mod tests {
                 Transport::Udp,
             )
             .await
+            .reply
             .expect("answered from the table");
         }
         // Not a question at all: dropped, and counted as an error rather than
@@ -1405,6 +1596,7 @@ mod tests {
             Transport::Udp,
         )
         .await
+        .reply
         .is_none());
 
         let stats = serving.ctx.logger.take_stats(now + 60);

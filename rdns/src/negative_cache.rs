@@ -22,7 +22,7 @@
 //!   an outage does not turn a cached NXDOMAIN into a SERVFAIL.
 
 use crate::cache::{StalePolicy, STALE_ANSWER_TTL};
-use crate::clock::current_unix_timestamp;
+use crate::clock::Clock;
 use crate::eviction::Halving;
 use crate::name_keys::{NameKeyBuf, NameType, NameTypeKey};
 use crate::record_types as rt;
@@ -103,6 +103,9 @@ pub struct NegativeCache {
     /// same idiom `--no-cache` uses for the answer cache.
     max_entries: usize,
     stale: StalePolicy,
+    /// Where "now" comes from — [`crate::cache::DnsCache`]'s reason, and the
+    /// same clock in the daemon that holds both.
+    clock: Clock,
 }
 
 impl NegativeCache {
@@ -111,13 +114,16 @@ impl NegativeCache {
             entries: Mutex::new(Entries::default()),
             max_entries,
             stale: StalePolicy::OFF,
+            clock: Clock::system(),
         }
     }
 
-    /// The same, holding expired entries for [`StalePolicy`]'s window.
-    pub fn with_stale(max_entries: usize, stale: StalePolicy) -> Self {
+    /// The same, holding expired entries for [`StalePolicy`]'s window and
+    /// reading the time from `clock`.
+    pub fn with_stale(max_entries: usize, stale: StalePolicy, clock: Clock) -> Self {
         NegativeCache {
             stale,
+            clock,
             ..NegativeCache::new(max_entries)
         }
     }
@@ -159,7 +165,7 @@ impl NegativeCache {
             return;
         }
 
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
         let entry = Entry {
             rcode: response.rcode,
             authority: response.authorities.clone(),
@@ -192,7 +198,7 @@ impl NegativeCache {
         if self.max_entries == 0 {
             return None;
         }
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
         // Borrowed: a question that arrived folded — which is most of them —
         // costs this lookup nothing at all.
         let mut fold_buf = Vec::new();
@@ -235,7 +241,7 @@ impl NegativeCache {
         if self.max_entries == 0 || !self.stale.is_on() {
             return None;
         }
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
         let mut fold_buf = Vec::new();
         let name = qname.folded_in(&mut fold_buf);
         let entries = self.entries.lock().ok()?;
@@ -348,33 +354,37 @@ fn make_room(entries: &mut Entries, max_entries: usize, now: u64, stale: StalePo
 mod tests {
 
     use super::*;
+    use crate::clock::Clock;
     use crate::test_records::nm;
     use crate::test_records::soa_record;
     use crate::{Class, OpCode, QueryClass, QuerySection, RecordData};
 
-    /// A cached "no" goes stale like a "yes" (RFC 8767): past its TTL it stops
-    /// being an answer and stays usable until the window closes.
-    ///
-    /// The entry is built rather than inserted through `insert`, which refuses a
-    /// negative TTL of zero (RFC 2308 §5 takes it from the SOA, and zero means
-    /// "do not cache") — so there is no way to store an already-expired one
-    /// through the door, and a test that waits a second measures the clock.
-    fn expired_entry(rcode: ResponseCode) -> Entry {
-        Entry {
-            rcode,
-            authority: vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
-            secure: false,
-            expires_at: current_unix_timestamp(),
-        }
+    /// A cache whose clock the test moves: a negative TTL is whole seconds, so
+    /// every other way of reaching expiry is a sleep (`TODO.md` #52).
+    fn fixed_cache(max_entries: usize, stale: StalePolicy) -> (NegativeCache, Clock) {
+        let clock = Clock::fixed(1_000_000_000);
+        (
+            NegativeCache::with_stale(max_entries, stale, clock.clone()),
+            clock,
+        )
     }
 
+    /// A cached "no" goes stale like a "yes" (RFC 8767): past its TTL it stops
+    /// being an answer and stays usable until the window closes.
     #[test]
     fn an_expired_nxdomain_is_a_miss_and_a_stale_hit() {
-        let cache = NegativeCache::with_stale(16, StalePolicy::seconds(3600));
-        cache.entries.lock().unwrap().nxdomain.insert(
-            NameKeyBuf::new(nm("gone.example.com.").as_ref()),
-            expired_entry(ResponseCode::NoSuchDomain),
+        let (cache, clock) = fixed_cache(16, StalePolicy::seconds(3600));
+        cache.insert(
+            nm("gone.example.com.").as_ref(),
+            Qtype::of(rt::A),
+            &negative(
+                "gone.example.com.",
+                ResponseCode::NoSuchDomain,
+                vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
+            ),
+            false,
         );
+        clock.advance(61);
 
         assert!(
             cache
@@ -389,19 +399,34 @@ mod tests {
         assert_eq!(stale.ttl, STALE_ANSWER_TTL);
         assert_eq!(stale.authority[0].ttl.as_secs(), STALE_ANSWER_TTL);
 
-        // RFC 8020: the denial still covers everything below the name.
+        // RFC 8020: the denial still covers everything beneath the name.
         assert!(cache
             .get_stale(nm("a.b.gone.example.com.").as_ref(), Qtype::of(rt::A))
             .is_some());
+
+        clock.advance(3600);
+        assert!(
+            cache
+                .get_stale(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+                .is_none(),
+            "and the window closes"
+        );
     }
 
     #[test]
     fn an_expired_nodata_is_a_stale_hit_for_its_type_alone() {
-        let cache = NegativeCache::with_stale(16, StalePolicy::seconds(3600));
-        cache.entries.lock().unwrap().nodata.insert(
-            NameTypeKey::new(nm("example.com.").as_ref(), Qtype::of(rt::AAAA)),
-            expired_entry(ResponseCode::Ok),
+        let (cache, clock) = fixed_cache(16, StalePolicy::seconds(3600));
+        cache.insert(
+            nm("example.com.").as_ref(),
+            Qtype::of(rt::AAAA),
+            &negative(
+                "example.com.",
+                ResponseCode::Ok,
+                vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
+            ),
+            false,
         );
+        clock.advance(61);
         assert!(cache
             .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::AAAA))
             .is_some());
@@ -422,18 +447,26 @@ mod tests {
     /// survived, being the one inserted after the sweep.
     #[test]
     fn eviction_keeps_what_is_still_inside_the_stale_window() {
-        let cache = NegativeCache::with_stale(10, StalePolicy::seconds(3600));
-        for i in 0..11 {
+        let (cache, clock) = fixed_cache(10, StalePolicy::seconds(3600));
+        let deny = |name: &str| {
+            negative(
+                name,
+                ResponseCode::NoSuchDomain,
+                vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
+            )
+        };
+        for i in 0..10 {
             let name = format!("gone{i}.example.com.");
-            let mut entries = cache.entries.lock().unwrap();
-            if entries.len() >= 10 {
-                make_room(&mut entries, 10, current_unix_timestamp(), cache.stale);
-            }
-            entries.nxdomain.insert(
-                NameKeyBuf::new(nm(&name).as_ref()),
-                expired_entry(ResponseCode::NoSuchDomain),
-            );
+            cache.insert(nm(&name).as_ref(), Qtype::of(rt::A), &deny(&name), false);
         }
+        clock.advance(61);
+        cache.insert(
+            nm("eleventh.example.com.").as_ref(),
+            Qtype::of(rt::A),
+            &deny("eleventh.example.com."),
+            false,
+        );
+
         let held = cache.len();
         assert!(
             held >= 5,
@@ -444,11 +477,18 @@ mod tests {
 
     #[test]
     fn with_the_policy_off_nothing_is_stale() {
-        let cache = NegativeCache::new(16);
-        cache.entries.lock().unwrap().nxdomain.insert(
-            NameKeyBuf::new(nm("gone.example.com.").as_ref()),
-            expired_entry(ResponseCode::NoSuchDomain),
+        let (cache, clock) = fixed_cache(16, StalePolicy::OFF);
+        cache.insert(
+            nm("gone.example.com.").as_ref(),
+            Qtype::of(rt::A),
+            &negative(
+                "gone.example.com.",
+                ResponseCode::NoSuchDomain,
+                vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
+            ),
+            false,
         );
+        clock.advance(61);
         assert!(cache
             .get_stale(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());

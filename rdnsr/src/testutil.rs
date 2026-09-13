@@ -67,10 +67,12 @@ pub(crate) fn serving(
     ctx: Arc<ServeContext>,
     policy: PolicyZones,
 ) -> Arc<Resolving> {
+    let caches = Caches::new(16, 4, StalePolicy::OFF, ctx.clock.clone());
     Arc::new(Resolving {
         resolver,
-        caches: Caches::new(16, 4, StalePolicy::OFF),
+        caches,
         policy,
+        prefetch: false,
         ctx,
     })
 }

@@ -884,7 +884,8 @@ Then, in order and for stated reasons:
 needs, and 45a (RPZ) is a legal gate rather than a nice-to-have for anyone with
 blocking obligations. 45e is a decision to take rather than work to schedule.
 **45a done 2026-09-13**, and it went first for the reason the row gave. It left
-#56 and #57. **45b done the same day**; it left #58.
+#56 and #57. **45b and 45d done the same day**; 45b left #58, and 45d left
+nothing — its own mechanism is half of what #58 will want.
 
 ~~The certificate story in 42a is still the part with no decision behind it.~~
 **Decided 2026-09-12**, and the decision was partly to decline: a renewal is a
@@ -955,7 +956,7 @@ from #44's. Same filing rule: every "0 hits" is a `grep` taken on the day.
 | **45a** | Response Policy Zones — ~~**0 hits**~~ **done 2026-09-13**, `rdns/src/rpz.rs` and `rdnsr --rpz` | Not an RFC — an ISC-originated specification, like `$GENERATE` — and implemented by BIND, Knot Resolver, Unbound and PowerDNS. It is how blocking is delivered: court-ordered injunctions, police lists, malware feeds. For an ISP under a blocking obligation this is not a missing feature but a legal non-starter, so it sits above everything else here. The pleasing part is the delivery mechanism: an RPZ *is* a DNS zone, so the AXFR/IXFR/NOTIFY machinery that already exists is how the policy would arrive. **That half held and was not the work**: the lookup is `Zone::locate` on a trigger name built as QNAME + origin, so RFC 1034 §4.3.3's wildcard rule is the RPZ wildcard rule with nothing written twice. What the row did not see is that the *delivery* is still a file: transferring a policy zone needs the secondary machinery, which lives in `rdnsd` and has no home in `rdnsr` — filed as **#57**. Three of the five trigger types are enforced; NSDNAME and NSIP are **#56** |
 | **45b** | serve-stale (RFC 8767, "Serving Stale Data to Improve DNS Resiliency") — ~~**0 hits**~~ **done 2026-09-13**, `rdnsr --serve-stale SECONDS` | Answer from expired cache when the authoritative servers cannot be reached, rather than SERVFAIL. It is what keeps a resolver useful through somebody else's outage, and the resilience feature a subscriber is most likely to notice the absence of. Both caches hold an expired entry for the window and hand it over only to a caller whose refresh has already failed (§4); the answer carries a 30-second TTL (§4), RFC 8914 §4.4's code, and a counter. Off by default, because §6 is explicit that a withdrawn name stays alive for the whole window. **What the row did not name is the half that makes it felt on a *slow* upstream rather than a dead one** — §4's client response timer, which answers stale at 1.8 s while the resolution keeps running — and that is **#58** |
 | **45c** | DNS64 (RFC 6147) — **0 hits** | Synthesize AAAA from A for IPv6-only clients behind NAT64. Required in an IPv6-only mobile network, which is most of them |
-| **45d** | prefetching — **0 hits** | Re-resolve a popular name before its TTL expires, so the hit rate has no hole at every expiry. Unbound's `prefetch`, and the cheapest of the rows here |
+| **45d** | prefetching — ~~**0 hits**~~ **done 2026-09-13**, `rdnsr --prefetch` | Re-resolve a popular name before its TTL expires, so the hit rate has no hole at every expiry. Unbound's `prefetch`, and the cheapest of the rows here. **It was, and the cheap part was not the arithmetic**: a tenth of the TTL is two lines, and what the row does not name is that a popular name in its last tenth gets one query per client unless the *cache* hands the obligation to exactly one of them. The refresh runs in the task that just answered, after the reply — so it is bounded by the in-flight permit that task already holds and needs no shutdown guard of its own (`CLAUDE.md` §9). Both caches took a `Clock` on the way (`TODO.md` #52's fix, arriving where a TTL is measured) |
 | **45e** | EDNS Client Subnet (RFC 7871) — the option code exists and nothing reads or writes it | `EDNS_OPTION_CLIENT_SUBNET` is defined in `edns.rs` and appears at exactly one other place: its own doc comment. Forwarding it is what lets an authoritative server steer a client to a near replica, and *not* forwarding it is a defensible privacy position — RFC 7871 §2 is unusually explicit about the cost. So this row is a **decision to take**, not work to schedule, and it is the only one on this page whose right answer might be "no, and write down why" |
 
 ---
@@ -1059,6 +1060,13 @@ resolution has to outlive the request that started it — a task, holding an
 (`CLAUDE.md` §9: dropping a `JoinHandle` detaches, it does not cancel). That
 means `handle_query` takes `&Arc<Resolving>`, and the two socket loops have to
 agree about who owns the guard.
+
+**45d moved one of those pieces on 2026-09-13.** `handle_query` returns
+`Answered` now — the reply, plus work the socket loop runs *after* sending it —
+and a prefetch goes down that path. What it does not solve is this one: a
+prefetch starts after the answer, and the client response timer has to answer
+while a resolution is already running. The return value is the same shape; the
+lifetime is not.
 
 Three things to settle, and the first is a measurement:
 
