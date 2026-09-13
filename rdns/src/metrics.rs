@@ -142,6 +142,13 @@ pub struct Counters {
     pub policy_rewrites: AtomicU64,
     pub policy_drops: AtomicU64,
 
+    /// AAAA answers synthesized from an A record (RFC 6147, `--dns64`).
+    ///
+    /// Every one is an address that exists in no zone, so this is the number an
+    /// operator watches when a NAT64 is retired or its prefix changes: it does
+    /// not fall to zero on its own.
+    pub synthesized: AtomicU64,
+
     /// Names re-resolved before they expired (`--prefetch`).
     ///
     /// Every one is an upstream query no client asked for, which is what the
@@ -218,6 +225,7 @@ impl DnsMetrics {
             tls_handshake_failures: AtomicU64::new(0),
             quic_handshakes: AtomicU64::new(0),
             quic_handshake_failures: AtomicU64::new(0),
+            synthesized: AtomicU64::new(0),
             prefetches: AtomicU64::new(0),
             stale_answers: AtomicU64::new(0),
             policy_rewrites: AtomicU64::new(0),
@@ -444,6 +452,13 @@ impl DnsMetrics {
         output.push_str(&format!(
             "dns_responses_noerror_total {}\n",
             self.responses_noerror.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("# HELP dns_synthesized_total AAAA records synthesized by DNS64\n");
+        output.push_str("# TYPE dns_synthesized_total counter\n");
+        output.push_str(&format!(
+            "dns_synthesized_total {}\n",
+            self.synthesized.load(Ordering::Relaxed)
         ));
 
         output.push_str("# HELP dns_prefetches_total Names re-resolved before expiry\n");

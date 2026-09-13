@@ -14,6 +14,7 @@ mod bench;
 pub mod cache;
 pub mod catalog;
 pub mod denial_wire;
+pub mod dns64;
 pub mod dnssec;
 pub mod dnssec_answer;
 pub mod dnssec_chain;

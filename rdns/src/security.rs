@@ -447,6 +447,15 @@ impl TransferAcl {
 
     /// Whether `ip` is on the list. An empty list allows nothing.
     pub fn allows(&self, ip: IpAddr) -> bool {
+        self.contains(ip)
+    }
+
+    /// The same predicate under the name a caller that is not an ACL wants:
+    /// [`crate::dns64`]'s exclusion set is a list of prefixes to *refuse*, and
+    /// `allows` would read as its opposite there. One list type, because a
+    /// second CIDR parser would disagree with this one eventually — about a
+    /// v4-mapped v6 address, most likely (`CLAUDE.md` §7).
+    pub fn contains(&self, ip: IpAddr) -> bool {
         self.rules.iter().any(|rule| rule.matches(ip))
     }
 

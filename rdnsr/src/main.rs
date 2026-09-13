@@ -23,6 +23,7 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use rdns::cache::StalePolicy;
 use rdns::clock::current_unix_timestamp;
+use rdns::dns64::{Dns64, Nat64Prefix};
 use rdns::dnssec_chain::TrustAnchors;
 use rdns::logging::{watch_anomalies, AnomalyThresholds, LogLevel, QueryLogger};
 use rdns::metrics::DnsMetrics;
@@ -273,6 +274,27 @@ struct Cli {
     /// Windows has no equivalent.
     #[arg(long, value_name = "PATH")]
     tls_key: Option<PathBuf>,
+    /// Synthesize AAAA records from A records under this NAT64 prefix, so an
+    /// IPv6-only client can reach an IPv4-only name (RFC 6147).
+    ///
+    /// Given without a value it is the Well-Known Prefix, 64:ff9b::/96
+    /// (RFC 6052 §2.1); otherwise `2001:db8::/96`, with a length of 32, 40, 48,
+    /// 56, 64 or 96 — the six RFC 6052 §2.2 has a place for the address in.
+    ///
+    /// Off unless given. A synthesized AAAA is an address that exists in no
+    /// zone and is only reachable through a translator this resolver does not
+    /// operate, so turning it on says one is there.
+    #[arg(long, value_name = "PREFIX", num_args = 0..=1,
+          default_missing_value = rdns::dns64::WELL_KNOWN_PREFIX)]
+    dns64: Option<String>,
+    /// An IPv6 prefix whose presence in a AAAA answer is to be read as no
+    /// answer at all (RFC 6147 §5.1.4), repeatable.
+    ///
+    /// Added to `::ffff:0:0/96`, which §5.1.4 asks for by name and which is
+    /// never removed: an address in it is an IPv4 address written differently,
+    /// so a client given one is no better off.
+    #[arg(long, value_name = "CIDR")]
+    dns64_exclude: Vec<String>,
     /// A Response Policy Zone file, repeatable and consulted in the order
     /// given: the first zone with a rule for a query decides it.
     ///
@@ -473,6 +495,18 @@ async fn main() -> anyhow::Result<()> {
     // starting without it is the failure worth avoiding most here.
     let policy = PolicyZones::load(&cli.rpz, cli.rpz_policy)?;
 
+    // Before anything binds, as everything else operator-supplied is: a NAT64
+    // prefix that does not parse is an IPv6-only network with no DNS at all.
+    let dns64 = match &cli.dns64 {
+        Some(spec) => Some(Dns64::new(Nat64Prefix::parse(spec)?, &cli.dns64_exclude)?),
+        None => {
+            if !cli.dns64_exclude.is_empty() {
+                tracing::warn!("--dns64-exclude does nothing without --dns64");
+            }
+            None
+        }
+    };
+
     let addr = format!("{}:{}", cli.host, cli.port);
     // Both transports are mandatory: an answer over the client's UDP payload
     // size gets TC=1, and RFC 1035 §4.2.1 has the client retry over TCP.
@@ -599,6 +633,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    if let Some(dns64) = dns64.as_ref() {
+        tracing::info!(
+            "DNS64: synthesizing AAAA under {} (RFC 6147)",
+            dns64.prefix()
+        );
+    }
+
     let (udp_cap, tcp_cap) = admission.caps();
     tracing::info!(
         "query rate: {}, response budget: {}, request cap: {udp_cap}B UDP / {tcp_cap}B TCP,          metrics: {}, anomaly warnings: {}",
@@ -662,6 +703,7 @@ async fn main() -> anyhow::Result<()> {
         caches,
         policy,
         prefetch: cli.prefetch,
+        dns64,
         ctx: ctx.clone(),
     });
 

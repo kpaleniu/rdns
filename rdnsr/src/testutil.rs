@@ -73,6 +73,7 @@ pub(crate) fn serving(
         caches,
         policy,
         prefetch: false,
+        dns64: None,
         ctx,
     })
 }

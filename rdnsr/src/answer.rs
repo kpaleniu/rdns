@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use rdns::cache::StalePolicy;
 use rdns::clock::Clock;
+use rdns::dns64::Dns64;
 use rdns::dnssec::Bogus;
 use rdns::dnssec_chain::ValidationState;
 use rdns::ede::InfoCode;
@@ -23,6 +24,7 @@ use rdns::response::ClientEdns;
 use rdns::rpz::{Action, PolicyZones, Rewrite};
 use rdns::special_names;
 use rdns::validation::{Request, Transport};
+use rdns::Qtype;
 use rdns::Rtype;
 use rdns::{
     DnsCache, DnsMessage, Edns, ExtendedError, OpCode, QuerySection, ResourceRecord, ResponseCode,
@@ -91,6 +93,8 @@ pub(crate) struct Resolving {
     /// Whether a cache hit in the last tenth of its TTL should be re-resolved
     /// once the client's own answer is away (`--prefetch`).
     pub(crate) prefetch: bool,
+    /// The NAT64 prefix to synthesize AAAA records into, if any (`--dns64`).
+    pub(crate) dns64: Option<Dns64>,
     pub(crate) ctx: Arc<ServeContext>,
 }
 
@@ -127,6 +131,14 @@ struct Client {
     /// in the query.
     wants_ad: bool,
     max_len: usize,
+    /// Whether an empty answer to this request may be answered with a
+    /// synthesized AAAA (RFC 6147).
+    ///
+    /// A property of the request, decided once rather than at each of the paths
+    /// that can produce an empty AAAA answer: DNS64 is configured, the question
+    /// is for AAAA, and the client did not set both CD and DO — §5.5 leaves a
+    /// client that said it would validate for itself to do its own synthesis.
+    dns64: bool,
 }
 
 /// Resolve one datagram: cache lookup, else forward upstream and cache-store.
@@ -144,6 +156,7 @@ pub(crate) async fn handle_query(
         caches,
         policy,
         prefetch,
+        dns64: _,
         ctx,
     } = serving;
     // Set by the one lookup that can discover it, returned by every path.
@@ -204,12 +217,15 @@ pub(crate) async fn handle_query(
     // DO means "send me the signatures", AD "tell me whether you checked"; CD
     // means "don't withhold anything on my behalf, I validate myself", which is
     // the message's own bit.
+    let checking_disabled = msg.cd;
     let client = Client {
         wants_ad: client_edns.do_bit() || msg.ad,
+        dns64: serving.dns64.is_some()
+            && query.qtype.is(record_types::AAAA)
+            && !(checking_disabled && client_edns.do_bit()),
         edns: client_edns,
         max_len: client_max,
     };
-    let checking_disabled = msg.cd;
 
     // RFC 9619 §4: "A DNS message with OPCODE = 0 MUST NOT include a QDCOUNT
     // parameter whose value is greater than 1", and one that does "MUST be
@@ -257,6 +273,25 @@ pub(crate) async fn handle_query(
         }
     }
 
+    // RFC 6147 §5.3.1: a PTR under `ip6.arpa` for an address inside the NAT64
+    // prefix is really a question about the IPv4 address embedded in it. Of the
+    // two answers §5.3.1 offers, this is the second — a CNAME into
+    // `in-addr.arpa` — because the first means inventing PTR data for a
+    // translator this resolver knows nothing about.
+    //
+    // Before the caches because the question is rewritten, not answered: what is
+    // cached is the `in-addr.arpa` name, under its own key.
+    if query.qtype.is(record_types::PTR) {
+        if let Some(target) = serving
+            .dns64
+            .as_ref()
+            .and_then(|dns64| dns64.reverse_target(query.qname.as_ref()))
+        {
+            let resp = reverse_dns64(&msg, &query, target, serving).await;
+            return finish(resp, false, None, &client, &query, ctx, timer).into();
+        }
+    }
+
     // Aggressive use of the validated denial cache (RFC 8198). A cached NSEC
     // answers every question in its gap, so it goes before the answer cache: a
     // flood of random names under one zone costs one upstream query, not one per
@@ -275,7 +310,9 @@ pub(crate) async fn handle_query(
             resp.authorities = wildcard.authority;
             // A wildcard signature verifies at this name unchanged, so the
             // client can check this for itself.
-            return finish(resp, true, None, &client, &query, ctx, timer).into();
+            return finish_dns64(resp, true, None, &client, &query, serving, timer)
+                .await
+                .into();
         }
     }
 
@@ -286,7 +323,9 @@ pub(crate) async fn handle_query(
             resp.authorities = denial.authority;
             // The proofs were validated before storage, so what is derived
             // from them is authentic on the same terms.
-            return finish(resp, true, None, &client, &query, ctx, timer).into();
+            return finish_dns64(resp, true, None, &client, &query, serving, timer)
+                .await
+                .into();
         }
     }
 
@@ -297,7 +336,9 @@ pub(crate) async fn handle_query(
         ctx.metrics.count(&ctx.metrics.cache_hits);
         let mut resp = build_response(&msg, Vec::new(), negative.rcode);
         resp.authorities = negative.authority;
-        return finish(resp, negative.secure, None, &client, &query, ctx, timer).into();
+        return finish_dns64(resp, negative.secure, None, &client, &query, serving, timer)
+            .await
+            .into();
     }
 
     // Build the response: from cache if we have it, else by resolving. The
@@ -442,33 +483,144 @@ pub(crate) async fn handle_query(
     }
 
     Answered {
-        reply: finish(resp, secure, why, &client, &query, ctx, timer),
+        reply: finish_dns64(resp, secure, why, &client, &query, serving, timer).await,
         refresh,
     }
 }
 
-/// Re-resolve a name into the cache, after the client that asked for it has its
-/// answer (Unbound's `prefetch`).
+/// [`finish`], with RFC 6147's synthesis in front of it.
 ///
-/// Called by the socket loop rather than by [`handle_query`], in the task that
-/// has already sent the reply: nothing is waiting on this, and the in-flight
-/// permit that task holds is what bounds how many may run at once.
+/// **Every path that can produce an empty AAAA answer ends here**, and the two
+/// that must not synthesize end at `finish` instead: a name RFC 6761 answers
+/// from the table is not an IPv4 name behind a translator, and a name a policy
+/// zone blocked is blocked (`TODO.md` #45a). `CLAUDE.md` §7 is about the
+/// opposite mistake — an early return jumping over a shared epilogue — so the
+/// split is deliberate and the reason is written at both ends.
 ///
-/// The result goes through the same storing as an ordinary resolution, because
-/// it *is* one — the only difference is that nobody is listening. A failure is
-/// left to the entry's own expiry: the name is still in the cache with a tenth
-/// of its TTL left, so the next client either finds it or resolves it.
-pub(crate) async fn refresh(serving: &Resolving, query: QuerySection) {
-    let ctx = &serving.ctx;
-    ctx.metrics.count(&ctx.metrics.prefetches);
-    let Ok((answer, state)) = serving.resolver.resolve_validated(&query).await else {
-        // DEBUG: nobody is waiting, and a failure here costs the next client a
-        // resolution it would have paid for anyway.
-        tracing::debug!(qname = %query.qname, qtype = %query.qtype, "prefetch failed");
-        return;
+/// `client.dns64` carries everything about the request that decides this, so
+/// nothing here re-derives it.
+async fn finish_dns64(
+    resp: DnsMessage,
+    authenticated: bool,
+    why: Option<ExtendedError>,
+    client: &Client,
+    query: &QuerySection,
+    serving: &Resolving,
+    timer: LatencyTimer,
+) -> Option<Vec<u8>> {
+    match synthesized_aaaa(&resp, client, query, serving).await {
+        // Never authenticated: these records are this resolver's invention, so
+        // AD stays clear whatever the AAAA denial validated as. No Extended DNS
+        // Error either — RFC 8914 has no code for a DNS64 answer, and 4
+        // (Forged Answer) says "for policy reasons", which this is not.
+        Some(synthesized) => finish(synthesized, false, None, client, query, &serving.ctx, timer),
+        None => finish(resp, authenticated, why, client, query, &serving.ctx, timer),
+    }
+}
+
+/// The CNAME into `in-addr.arpa` that answers a reverse query for a synthesized
+/// address, and the PTR it leads to (RFC 6147 §5.3.1).
+///
+/// The CNAME goes out whether or not the PTR resolves: it is true — that
+/// `ip6.arpa` name *is* this `in-addr.arpa` name — and a client that follows it
+/// itself gets the same answer.
+async fn reverse_dns64(
+    request: &DnsMessage,
+    query: &QuerySection,
+    target: rdns::Name,
+    serving: &Resolving,
+) -> DnsMessage {
+    let cname = ResourceRecord {
+        name: query.qname.clone(),
+        class: rdns::Class::new(1),
+        ttl: rdns::Ttl::from_secs(REVERSE_CNAME_TTL),
+        rdata: match rdns::RecordData::from_parsed(&rdns::ParsedRecord::CNAME(target.clone())) {
+            Ok(rdata) => rdata,
+            Err(_) => return build_response(request, Vec::new(), ResponseCode::ServerFailure),
+        },
+    };
+    let ptr = QuerySection {
+        qname: target,
+        qtype: Qtype::of(record_types::PTR),
+        qclass: query.qclass,
+    };
+    let mut answers = vec![cname];
+    if let Some(found) = cached_or_resolve(serving, &ptr).await {
+        answers.extend(found);
+    }
+    build_response(request, answers, ResponseCode::Ok)
+}
+
+/// How long the `ip6.arpa` → `in-addr.arpa` CNAME is good for.
+///
+/// It is derived from the configured prefix rather than from any zone, so there
+/// is no authority to take a TTL from; an hour is short enough that changing the
+/// prefix takes effect within a shift.
+const REVERSE_CNAME_TTL: u32 = 3600;
+
+/// An answer built from the name's A records, for a AAAA question that came
+/// back with nothing usable (RFC 6147 §5.1.7).
+///
+/// `None` — meaning "answer what you have" — for every reason there is not to
+/// synthesize: the request is not eligible, the answer already carries a usable
+/// AAAA (§5.1.1), the name does not exist (§5.1.2 passes NXDOMAIN through), or
+/// the A query found nothing either.
+async fn synthesized_aaaa(
+    resp: &DnsMessage,
+    client: &Client,
+    query: &QuerySection,
+    serving: &Resolving,
+) -> Option<DnsMessage> {
+    let dns64 = serving.dns64.as_ref()?;
+    if !client.dns64 || resp.rcode == ResponseCode::NoSuchDomain || dns64.answered(&resp.answers) {
+        return None;
+    }
+
+    // §5.1.7's ceiling: the name has no AAAA, so the SOA that says so bounds
+    // how long the invention may live.
+    let ttl_cap = resp
+        .authorities
+        .iter()
+        .find(|rr| rr.rdata.rtype() == record_types::SOA)
+        .map(|soa| soa.ttl);
+
+    let a = QuerySection {
+        qname: query.qname.clone(),
+        qtype: Qtype::of(record_types::A),
+        qclass: query.qclass,
+    };
+    let synthesized = dns64.synthesize(&cached_or_resolve(serving, &a).await?, ttl_cap);
+    if synthesized.is_empty() {
+        return None;
+    }
+    serving.ctx.metrics.count(&serving.ctx.metrics.synthesized);
+
+    let mut out = resp.clone();
+    out.rcode = ResponseCode::Ok;
+    out.answers = synthesized;
+    // The SOA said there was no AAAA and now there is one; §5.4 assembles the
+    // reply from the question and the synthesized answer section alone.
+    out.authorities.clear();
+    out.additionals.clear();
+    Some(out)
+}
+
+/// Resolve a question and store what comes back, for the callers that ask on
+/// nobody's behalf: a prefetch, and DNS64's A query.
+///
+/// The answer section, or `None` for a failure or a bogus answer. Not the main
+/// answer path's storing, which also has a client to fail closed for, a CD bit
+/// to honour and denial proofs to keep; what is shared is what these two need
+/// and it is this much (`CLAUDE.md` §7).
+async fn resolve_and_store(
+    serving: &Resolving,
+    query: &QuerySection,
+) -> Option<Vec<ResourceRecord>> {
+    let Ok((answer, state)) = serving.resolver.resolve_validated(query).await else {
+        return None;
     };
     if state.is_bogus() {
-        return;
+        return None;
     }
     let secure = state.is_secure();
     if !answer.answers.is_empty() {
@@ -485,6 +637,56 @@ pub(crate) async fn refresh(serving: &Resolving, query: QuerySection) {
         .caches
         .negatives
         .insert(query.qname.as_ref(), query.qtype, &answer, secure);
+    Some(answer.answers)
+}
+
+/// [`resolve_and_store`] with the cache tried first — the shape a caller that
+/// wants an answer rather than a fresh one needs.
+///
+/// A cached negative counts: an A query that found nothing is a name with no
+/// address of either family, and asking the internet again on every AAAA query
+/// for it is how a DNS64 resolver doubles its own traffic.
+async fn cached_or_resolve(
+    serving: &Resolving,
+    query: &QuerySection,
+) -> Option<Vec<ResourceRecord>> {
+    if let Some(hit) = serving
+        .caches
+        .answers
+        .lookup(query.qname.as_ref(), query.qtype, false)
+    {
+        return Some(hit.records);
+    }
+    if serving
+        .caches
+        .negatives
+        .get(query.qname.as_ref(), query.qtype)
+        .is_some()
+    {
+        return None;
+    }
+    resolve_and_store(serving, query).await
+}
+
+/// Re-resolve a name into the cache, after the client that asked for it has its
+/// answer (Unbound's `prefetch`).
+///
+/// Called by the socket loop rather than by [`handle_query`], in the task that
+/// has already sent the reply: nothing is waiting on this, and the in-flight
+/// permit that task holds is what bounds how many may run at once.
+///
+/// The result goes through the same storing as an ordinary resolution, because
+/// it *is* one — the only difference is that nobody is listening. A failure is
+/// left to the entry's own expiry: the name is still in the cache with a tenth
+/// of its TTL left, so the next client either finds it or resolves it.
+pub(crate) async fn refresh(serving: &Resolving, query: QuerySection) {
+    let ctx = &serving.ctx;
+    ctx.metrics.count(&ctx.metrics.prefetches);
+    if resolve_and_store(serving, &query).await.is_none() {
+        // DEBUG: nobody is waiting, and a failure here costs the next client a
+        // resolution it would have paid for anyway.
+        tracing::debug!(qname = %query.qname, qtype = %query.qtype, "prefetch failed");
+    }
 }
 
 /// The last thing this resolver knew about `query`, for a resolution that has
@@ -568,8 +770,16 @@ fn apply_policy(
     timer: LatencyTimer,
     transport: Transport,
 ) -> Applied {
-    const WHY: ExtendedError = ExtendedError::new(
+    // RFC 8914 §4.5 draws the line: Forged Answer (4) "should be used when an
+    // answer is still provided, not when failure codes are returned instead.
+    // See Blocked (15), Censored (16), and Filtered (17) for use when returning
+    // other response codes."
+    const WHY_DENIED: ExtendedError = ExtendedError::new(
         InfoCode::BLOCKED,
+        "this answer is the resolver operator's policy",
+    );
+    const WHY_FORGED: ExtendedError = ExtendedError::new(
+        InfoCode::FORGED_ANSWER,
         "this answer is the resolver operator's policy",
     );
     // INFO, not DEBUG: a name that does not resolve is a support call, and this
@@ -607,6 +817,11 @@ fn apply_policy(
         Action::Nodata => (Vec::new(), ResponseCode::Ok),
         Action::LocalData(records) => (records, ResponseCode::Ok),
     };
+    let why = if answers.is_empty() {
+        WHY_DENIED
+    } else {
+        WHY_FORGED
+    };
     ctx.metrics.count(&ctx.metrics.policy_rewrites);
     let mut resp = build_response(request, answers, rcode);
     // The policy zone's own SOA, so a negative answer can be cached at all
@@ -615,7 +830,7 @@ fn apply_policy(
     if resp.answers.is_empty() {
         resp.authorities = soa;
     }
-    Applied::Replied(finish(resp, false, Some(WHY), client, query, ctx, timer))
+    Applied::Replied(finish(resp, false, Some(why), client, query, ctx, timer))
 }
 
 /// What the client is told about a validation failure: the INFO-CODE the check
@@ -790,6 +1005,7 @@ mod tests {
                     edns: ClientEdns::of(&msg),
                     wants_ad: asked,
                     max_len: 512,
+                    dns64: false,
                 };
                 let resp = build_response(&msg, Vec::new(), ResponseCode::Ok);
                 let bytes = finish(
@@ -997,6 +1213,7 @@ mod tests {
                 caches,
                 policy: PolicyZones::default(),
                 prefetch,
+                dns64: None,
                 ctx,
             }),
             clock,
@@ -1196,6 +1413,311 @@ mod tests {
         .await;
         assert!(answered.reply.is_some());
         assert!(answered.refresh.is_none());
+    }
+
+    fn with_dns64() -> Arc<Resolving> {
+        Arc::new(Resolving {
+            resolver: test_resolver(),
+            caches: Caches::new(16, 4, StalePolicy::OFF, rdns::clock::Clock::system()),
+            policy: PolicyZones::default(),
+            prefetch: false,
+            dns64: Some(
+                rdns::dns64::Dns64::new(rdns::dns64::Nat64Prefix::well_known(), &[])
+                    .expect("the Well-Known Prefix"),
+            ),
+            ctx: test_shell(),
+        })
+    }
+
+    fn soa(zone: &str) -> ResourceRecord {
+        ResourceRecord {
+            name: nm(zone),
+            class: rdns::Class::new(1),
+            ttl: rdns::Ttl::from_secs(60),
+            rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::SOA {
+                mname: nm("ns.example.com."),
+                rname: nm("hostmaster.example.com."),
+                serial: rdns::Serial::new(1),
+                refresh: 3600,
+                retry: 600,
+                expire: 86400,
+                minimum: 60,
+            })
+            .expect("encodes"),
+        }
+    }
+
+    /// The cached "no" for AAAA that every DNS64 test starts from, plus the A
+    /// record synthesis reads.
+    fn nodata_aaaa_with_an_a(serving: &Resolving, name: &rdns::Name) {
+        let mut denial = DnsMessage::try_from_bytes(&message(OpCode::Query, true)).expect("parses");
+        denial.rcode = ResponseCode::Ok;
+        denial.answers.clear();
+        denial.authorities = vec![soa("example.com.")];
+        serving.caches.negatives.insert(
+            name.as_ref(),
+            Qtype::of(record_types::AAAA),
+            &denial,
+            false,
+        );
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![ResourceRecord {
+                name: name.clone(),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(300),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    "192.0.2.33".parse().unwrap(),
+                ))
+                .expect("encodes"),
+            }],
+        );
+    }
+
+    async fn aaaa_reply(serving: &Resolving, name: &str, cd: bool, do_bit: bool) -> DnsMessage {
+        let query = rdns::DnsMessageBuilder::new()
+            .with_id(5)
+            .with_query(nm(name), Qtype::of(record_types::AAAA))
+            .with_recursion(true)
+            .with_edns(1232, do_bit)
+            .build();
+        let mut query = query;
+        query.cd = cd;
+        let bytes = handle_query(
+            query.to_bytes_within(4096).expect("serialize"),
+            TEST_PEER,
+            current_unix_timestamp(),
+            serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("answered");
+        DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply")
+    }
+
+    /// RFC 6147 §5.1.7 end to end: a name with an A and no AAAA answers with an
+    /// address inside the NAT64 prefix, built from RFC 6052 §2.4's own example
+    /// pair — 192.0.2.33 under 64:ff9b::/96.
+    ///
+    /// From the *negative* cache, which is one of the four paths that can
+    /// produce an empty AAAA answer: synthesis that only covers a fresh
+    /// resolution answers the first client and not the second.
+    #[tokio::test]
+    async fn a_name_with_no_aaaa_is_answered_from_its_a() {
+        let serving = with_dns64();
+        let name = nm("v4only.example.com.");
+        nodata_aaaa_with_an_a(&serving, &name);
+
+        let reply = aaaa_reply(&serving, "v4only.example.com.", false, false).await;
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(
+            reply.answers[0].rdata.parse().unwrap(),
+            rdns::ParsedRecord::AAAA("64:ff9b::192.0.2.33".parse().unwrap())
+        );
+        assert_eq!(
+            reply.answers[0].ttl.as_secs(),
+            60,
+            "§5.1.7 caps it at the SOA's TTL"
+        );
+        assert!(
+            reply.authorities.is_empty(),
+            "§5.4: the SOA said there was no AAAA and now there is one"
+        );
+        assert!(!reply.ad, "an invented address is not authentic");
+        assert_eq!(
+            serving
+                .ctx
+                .metrics
+                .synthesized
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// RFC 6147 §5.5: a client that set both CD and DO said it validates for
+    /// itself, so it gets the denial and can synthesize on its own.
+    #[tokio::test]
+    async fn a_client_that_validates_for_itself_is_not_synthesized_for() {
+        let serving = with_dns64();
+        let name = nm("v4only.example.com.");
+        nodata_aaaa_with_an_a(&serving, &name);
+
+        let reply = aaaa_reply(&serving, "v4only.example.com.", true, true).await;
+        assert!(reply.answers.is_empty(), "the empty answer, unchanged");
+        assert_eq!(reply.authorities.len(), 1, "and the SOA that says so");
+    }
+
+    /// DO alone is not that statement — a stub that asks for signatures is not
+    /// a stub that validates — so §5.5's exemption needs CD as well.
+    #[tokio::test]
+    async fn the_do_bit_alone_does_not_suppress_synthesis() {
+        let serving = with_dns64();
+        let name = nm("v4only.example.com.");
+        nodata_aaaa_with_an_a(&serving, &name);
+
+        let reply = aaaa_reply(&serving, "v4only.example.com.", false, true).await;
+        assert_eq!(reply.answers.len(), 1);
+    }
+
+    /// §5.1.4: an answer of nothing but IPv4-mapped addresses is an empty
+    /// answer, and the client gets something it can route instead.
+    #[tokio::test]
+    async fn an_answer_of_only_mapped_addresses_is_synthesized_over() {
+        let serving = with_dns64();
+        let name = nm("mapped.example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::AAAA),
+            vec![ResourceRecord {
+                name: name.clone(),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(300),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::AAAA(
+                    "::ffff:192.0.2.33".parse().unwrap(),
+                ))
+                .expect("encodes"),
+            }],
+        );
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![ResourceRecord {
+                name: name.clone(),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(300),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    "192.0.2.33".parse().unwrap(),
+                ))
+                .expect("encodes"),
+            }],
+        );
+
+        let reply = aaaa_reply(&serving, "mapped.example.com.", false, false).await;
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(
+            reply.answers[0].rdata.parse().unwrap(),
+            rdns::ParsedRecord::AAAA("64:ff9b::192.0.2.33".parse().unwrap())
+        );
+    }
+
+    /// A real AAAA is passed through untouched (§5.1.1).
+    #[tokio::test]
+    async fn a_name_that_has_an_aaaa_is_left_alone() {
+        let serving = with_dns64();
+        let name = nm("dual.example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::AAAA),
+            vec![ResourceRecord {
+                name: name.clone(),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(300),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::AAAA(
+                    "2001:db8::1".parse().unwrap(),
+                ))
+                .expect("encodes"),
+            }],
+        );
+        let reply = aaaa_reply(&serving, "dual.example.com.", false, false).await;
+        assert_eq!(
+            reply.answers[0].rdata.parse().unwrap(),
+            rdns::ParsedRecord::AAAA("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(
+            serving
+                .ctx
+                .metrics
+                .synthesized
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// §5.1.2: a name that does not exist has no A to build from either, so
+    /// NXDOMAIN passes through rather than becoming a NOERROR with an address
+    /// in it.
+    #[tokio::test]
+    async fn nxdomain_is_not_synthesized_over() {
+        let serving = with_dns64();
+        let name = nm("gone.example.com.");
+        let mut denial = DnsMessage::try_from_bytes(&message(OpCode::Query, true)).expect("parses");
+        denial.rcode = ResponseCode::NoSuchDomain;
+        denial.answers.clear();
+        denial.authorities = vec![soa("example.com.")];
+        serving.caches.negatives.insert(
+            name.as_ref(),
+            Qtype::of(record_types::AAAA),
+            &denial,
+            false,
+        );
+
+        let reply = aaaa_reply(&serving, "gone.example.com.", false, false).await;
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+        assert!(reply.answers.is_empty());
+    }
+
+    /// RFC 6147 §5.3.1: a reverse query for an address this resolver invented
+    /// is a question about the IPv4 address inside it, answered with the CNAME
+    /// §5.3.1's second alternative describes.
+    #[tokio::test]
+    async fn a_reverse_query_for_a_synthesized_address_is_a_cname() {
+        let serving = with_dns64();
+        // 64:ff9b::192.0.2.33 = 0064:ff9b:0:0:0:0:c000:0221, one nibble per
+        // label, least significant first (RFC 3596 §2.5).
+        let nibbles: String = "0064ff9b0000000000000000c0000221"
+            .chars()
+            .rev()
+            .map(|c| format!("{c}."))
+            .collect();
+        let bytes = handle_query(
+            query_for(&format!("{nibbles}ip6.arpa."), 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        // `query_for` asks for A; the PTR rewrite is about the name, so ask
+        // again with the right type through the same path.
+        assert_eq!(
+            reply.rcode,
+            ResponseCode::ServerFailure,
+            "an A query is not a PTR query"
+        );
+
+        let ptr = rdns::DnsMessageBuilder::new()
+            .with_id(6)
+            .with_query(
+                nm(&format!("{nibbles}ip6.arpa.")),
+                Qtype::of(record_types::PTR),
+            )
+            .with_recursion(true)
+            .build()
+            .to_bytes_within(4096)
+            .expect("serialize");
+        let bytes = handle_query(
+            ptr,
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1, "the CNAME, with no PTR behind it");
+        assert_eq!(
+            reply.answers[0].rdata.parse().unwrap(),
+            rdns::ParsedRecord::CNAME(nm("33.2.0.192.in-addr.arpa."))
+        );
     }
 
     /// A policy zone with one rule of each kind this test needs, built in

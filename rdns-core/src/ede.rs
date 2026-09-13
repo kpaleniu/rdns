@@ -51,6 +51,11 @@ impl InfoCode {
     /// 3, Stale Answer: "the resolver was unable to resolve the answer within
     /// its time limits and decided to answer with stale data" (RFC 8767).
     pub const STALE_ANSWER: InfoCode = InfoCode(3);
+    /// 4, Forged Answer: "For policy reasons (legal obligation or malware
+    /// filtering, for instance), an answer was forged. Note that this should be
+    /// used when an answer is still provided, not when failure codes are
+    /// returned instead" — which is the line between this and `BLOCKED`.
+    pub const FORGED_ANSWER: InfoCode = InfoCode(4);
     /// 6, DNSSEC Bogus: "validation ended in the Bogus state".
     pub const DNSSEC_BOGUS: InfoCode = InfoCode(6);
     /// 7, Signature Expired: "no signatures are presently valid and some
