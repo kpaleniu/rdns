@@ -157,6 +157,26 @@ the startup banner, because rate-limited queries are dropped without a reply.
 `--query-rate-exempt` and `--allow-transfer` are parsed by the same
 `security::TransferAcl`, including the rule that a v4 prefix never matches a
 v4-mapped v6 peer. `TransferAcl::parse_named` carries which list a typo is in.
+So is `--dns64-exclude`, which is the same question — is this address in one of
+these prefixes — asked of an answer rather than of a peer.
+
+### `rdnsr`'s policy switches
+
+Four flags that change what an answer *is* rather than how much of it there may
+be. All are off unless given, all are printed in the startup banner, and each is
+specified in `05-resolver.md`.
+
+| flag | default | what it turns on |
+|---|---|---|
+| `--rpz PATH` (repeatable, ordered) | none | response policy zones; `--rpz-policy` overrides every action in every zone (§5.6) |
+| `--serve-stale SECONDS` | `0`, off | answering from expired cache when a refresh fails (RFC 8767, §5.5) |
+| `--prefetch` | off | re-resolving a cache entry in the last tenth of its TTL (§5.5) |
+| `--dns64 [PREFIX]` | off; the Well-Known Prefix when given no value | synthesizing AAAA from A (RFC 6147, §5.7). `--dns64-exclude` adds to §5.1.4's `::ffff:0:0/96` |
+
+Off by default in every case, and for one reason each: an RPZ is a policy the
+operator has to have; a stale answer is known to be out of date (RFC 8767 §6); a
+prefetch turns one client query into two; and a synthesized AAAA is only
+reachable through a translator this resolver does not operate.
 
 ---
 
@@ -182,6 +202,17 @@ what its bounded queue had no room for. See 6.4.
 
 `dns_cache_hits_total`, `dns_cache_misses_total` and `dns_queries_recursive_total`
 are `rdnsr`'s and stay at zero on `rdnsd`; `queries_authoritative` is the reverse.
+
+Five more are `rdnsr`'s alone, and each counts something that is otherwise
+invisible on the wire (see `05-resolver.md` §5.5-§5.7):
+
+| counter | what it counts |
+|---|---|
+| `dns_policy_rewrites_total` | answers a response policy zone replaced |
+| `dns_policy_drops_total` | queries an `rpz-drop` rule answered with silence — without this, one is indistinguishable from a lost packet |
+| `dns_stale_answers_total` | answers served from expired cache because a refresh failed (RFC 8767) |
+| `dns_prefetches_total` | names re-resolved before expiry; against `dns_cache_hits_total` it says whether `--prefetch` is paying for itself |
+| `dns_synthesized_total` | AAAA records DNS64 built from an A record; it does not fall to zero on its own when a NAT64 is retired |
 
 > Gap G-3 — fixed 2026-08-03. ~~Those three counters are exported by `rdnsd` and
 > nothing increments them.~~ See `07-rfc-conformance.md`.

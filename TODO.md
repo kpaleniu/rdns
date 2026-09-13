@@ -301,17 +301,23 @@ the note there. `cargo clippy --workspace --all-targets` is clean there too,
 which is the half Windows cannot check at all.
 
 **Two of those single tests are worth more than their count suggests.**
-`allocations` reports **forty-two** measurements, **thirty-two** of them exact
-(`n..=n`) — ~~twenty-nine and twenty~~ before #27 and #29 landed, twenty-two and
-fourteen before the shapes added on 2026-08-31, nineteen and thirteen before
-that, and the claim of
-"fourteen exact" at the start was never counted and was wrong both ways; ten
-are deliberate ranges and one
-(`verify a DNSKEY RRset with two candidate signatures`) is `0..=u64::MAX`, a
-figure printed on purpose and asserted on purpose not at all, because §10 found
-it is a time problem and not a count problem. `no_input_panics` runs 1,506
-mutated messages through the pre-authentication path — 1.4 million of them when
-soaked. A test count is a poor summary of a suite and this is where it shows.
+`allocations` prints **forty-nine** measurements — the number
+`cargo test -p rdns --test allocations -- --nocapture` puts on stdout, and the
+only one on this line that a command answers. ~~forty-two measurements,
+thirty-two of them exact~~ was the pair here until 2026-09-13 and was wrong on
+both counts; ~~twenty-nine and twenty~~ before #27 and #29 landed, twenty-two
+and fourteen before the shapes added on 2026-08-31, nineteen and thirteen
+before that, and the claim of "fourteen exact" at the start was never counted
+and was wrong both ways. **Five pairs, four of them stale, and the fifth is
+gone**: how many of the forty-nine are asserted exactly is a property of the
+file and not of a `grep` — one helper writes `expected..=expected` and is
+called twice — so the answer is to read `rdns/tests/allocations.rs`. One
+measurement (`verify a DNSKEY RRset with two candidate signatures`) is asserted
+as `0..=u64::MAX`: printed on purpose and asserted on purpose not at all,
+because §10 found it is a time problem and not a count problem.
+`no_input_panics` runs 1,506 mutated messages through the pre-authentication
+path — 1.4 million of them when soaked. A test count is a poor summary of a
+suite and this is where it shows.
 
 **Sixteen tests exist on Linux only**, and they are the ones a green Windows run
 says nothing about: two on the secret-file mode check and one on the private-key

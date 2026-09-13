@@ -6,6 +6,11 @@ closed most of what the first reading recorded as a gap; those entries are struc
 through and kept. Where the code and an RFC disagree, the disagreement is
 recorded as a deviation.
 
+Revised since, by the work that changed the behaviour rather than in a pass of
+its own: **2026-09-13** added `05-resolver.md` §5.6 and §5.7 and rewrote §5.4's
+per-query path, for `TODO.md` #45 — response policy zones, serving stale,
+prefetching and DNS64, all four of them `rdnsr`'s and all four off by default.
+
 ## Reading order
 
 | file | what it specifies |
@@ -40,11 +45,20 @@ secondary role including EXPIRE, answers Prometheus scrapes, and serves dynamic
 UPDATE (RFC 2136) — TSIG-only, scoped per key, writing each accepted update back
 to the zone file before answering. Class IN only.
 
+`rdnsr` also serves stale answers (RFC 8767), prefetches, synthesizes AAAA
+records (DNS64, RFC 6147) and enforces response policy zones, each off unless a
+flag turns it on.
+
 Not implemented: DNS Cookies as anything but opaque
-bytes, SIG(0), SVCB/HTTPS, and any record type outside the fourteen listed
+bytes, SIG(0), ~~SVCB/HTTPS,~~ and any record type outside the sixteen listed
 in `02-zone-model.md` — unknown types round-trip as opaque RDATA per RFC 3597 but
 cannot be written in a zone file except in `\#` form. DNAME (RFC 6672) joined
 that list on 2026-09-06 and is now served, signed, followed and resolved.
+**SVCB and HTTPS left it on 2026-09-07** (`TODO.md` #35) and this sentence did
+not, for six days: `07-rfc-conformance.md`'s own row said "stored, served and
+readable in a zone file" the whole time. Two places, one fact, and the summary
+is the one that went stale — which is the shape `TODO.md`'s preamble records
+about itself.
 
 ## Overlap with `docs/CLI_USAGE.md`
 

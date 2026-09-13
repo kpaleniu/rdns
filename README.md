@@ -56,8 +56,11 @@ Recursive (`rdnsr`):
 - Recursion from the root, or forwarding with `--upstream`
 - QNAME minimisation (RFC 9156), 0x20 case randomisation, per-server RTT
   selection, a total query budget
-- Answer, negative (RFC 2308) and denial caches
+- Answer, negative (RFC 2308) and denial caches, with optional serve-stale
+  (RFC 8767) and prefetching
 - Special-use names answered locally (RFC 6761, 6762, 6303)
+- Response Policy Zones, for an operator with a blocklist to enforce
+- DNS64 (RFC 6147) for an IPv6-only network behind a NAT64
 - Rate limits, response-byte budget, Prometheus metrics, `/healthz`
 
 Operations:
@@ -327,6 +330,13 @@ Binds 127.0.0.1 by default. Recurses from the root unless given `--upstream`.
 | `--query-rate <QUERIES_PER_SEC>` | default 200, with `--query-burst` (100) and `--query-rate-exempt` |
 | `--response-rate <BYTES_PER_SEC>` | default 8192, `0` disables |
 | `--metrics-listen <ADDR:PORT>` | Prometheus metrics and `/healthz`. No `/readyz` |
+| `--rpz <FILE>` | a response policy zone, repeatable and consulted in order; `--rpz-policy` overrides what its rules say. How blocking is delivered |
+| `--serve-stale <SECONDS>` | answer from expired cache when the authoritative servers cannot be reached (RFC 8767). `0`, off, by default |
+| `--prefetch` | re-resolve a cached name in the last tenth of its TTL, after the reply that found it |
+| `--dns64 [PREFIX]` | synthesize AAAA from A for an IPv6-only client behind a NAT64 (RFC 6147). The Well-Known Prefix if given no value; `--dns64-exclude` adds to RFC 6147 §5.1.4's default |
+
+The last four are off unless given, and each is specified in
+`docs/spec/05-resolver.md` §5.4-§5.7.
 
 ### `rdnsc` — query client
 
@@ -372,26 +382,35 @@ rdnsr --port 5354 --dnssec-validate
 
 # Resolver: forwarding instead.
 rdnsr --port 5354 --upstream 1.1.1.1:53
+
+# Resolver for an IPv6-only network, blocking what a feed says to block and
+# riding out an upstream outage on what it last knew.
+rdnsr --port 5354 --dns64 --rpz /var/lib/rdns/blocklist.rpz --serve-stale 86400
 ```
 
 ## Status
 
-854 tests passing on Windows and 870 on Linux, measured 2026-09-05 on the same
-tree; the gap is the sixteen `#[cfg(unix)]` tests. Plus 4 doc-tests marked
-`ignore`. `cargo test --workspace` is the source of truth.
+1,098 tests passing on Windows and 1,115 on Linux, measured 2026-09-13 on the
+same tree. Plus 4 doc-tests marked `ignore`. `cargo test --workspace` is the
+source of truth, and the numbers below are what it printed rather than a
+summary kept beside it.
 
 | suite | tests |
 |---|---|
-| `rdns-core` | 157 |
-| `rdns` library | 574 (577 on Linux) |
-| `rdns` allocation gate (`tests/allocations.rs`) | 1, holding 42 measurements, 32 exact |
+| `rdns-core` | 178 |
+| `rdns` library | 695 (698 on Linux) |
+| `rdns` allocation gate (`tests/allocations.rs`) | 1, printing 49 measurements — `cargo test -p rdns --test allocations -- --nocapture` shows them, and most are asserted to an exact count |
 | `rdns` fuzz guard (`tests/no_input_panics.rs`) | 1, running 1,506 mutated messages through the pre-authentication path |
-| `rdns-transport` | 2 |
-| `rdnsd` | 109 (122 on Linux) |
-| `rdnsr` | 10 |
+| `rdns-transport` | 31 (32 on Linux) |
+| `rdnsd` | 158 (171 on Linux) |
+| `rdnsr` | 34 |
 
-Open work is `TODO.md` — nothing numbered, and one inventory of deliberate RFC
-deviations (#21). Everything numbered is closed; `docs/CLOSED_WORK.md` holds it.
+The gap between the columns is the `#[cfg(unix)]` tests, which a Windows build
+never compiles.
+
+Open work is `TODO.md`: #48, #49, #51, #53-#58, and one inventory of deliberate
+RFC deviations (#21). Everything else numbered is closed, and
+`docs/CLOSED_WORK.md` holds it.
 
 Not implemented: DNS over TLS/HTTPS/QUIC, SIG(0), DNS Cookies as anything but
 opaque bytes, `$GENERATE`, any class but IN.

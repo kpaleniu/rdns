@@ -148,21 +148,42 @@ process down. Binds 127.0.0.1 by default.
    Neither carries an Extended DNS Error, for the reason `03`'s §3.2.1 gives.
 4. Special-use names (`special_names::lookup`) — answered locally, never
    forwarded, before every cache and before any resolution. AD is never set. Not
-   skipped for a client with CD. See §5.6.
-5. RFC 8198 synthesis from validated denials, skipped when the client set CD.
+   skipped for a client with CD. See §5.8.
+5. Response policy (`rpz::PolicyZones::before_query`), when `--rpz` named a
+   zone: the client's address, then the name, zone by zone in order. After the
+   special-use table, because that table is a protocol requirement and a policy
+   zone is a preference. See §5.6.
+6. DNS64 reverse mapping, when `--dns64` is on and the question is a PTR under
+   `ip6.arpa` for an address inside the NAT64 prefix: the question is rewritten
+   rather than answered. See §5.7.
+7. RFC 8198 synthesis from validated denials, skipped when the client set CD.
    Checked before the answer cache, so a flood of random names under one zone
    costs one upstream query rather than one per name. The positive half (a
    validated wildcard) is tried first; the two are mutually exclusive by
    construction.
-6. Answer cache, then negative cache.
-7. Miss → `Resolver::resolve`.
-8. Validation, if `--dnssec-validate`: AD is set only on `Secure`; `Bogus` is
-   SERVFAIL unless the client set CD.
-9. Cache store by (name, type) with the answer's TTL, and its validation state
-   alongside it, so a cached answer carries the same AD bit the first client saw.
-10. Reply, echoing the transaction id with RA set and the OPT record mirrored
+8. Answer cache, then negative cache.
+9. Miss → `Resolver::resolve`.
+10. Validation, if `--dnssec-validate`: AD is set only on `Secure`; `Bogus` is
+    SERVFAIL unless the client set CD.
+11. On a resolution that failed and `--serve-stale` non-zero: the expired answer
+    or the expired "no", if either is still inside the window. See §5.5.
+12. Cache store by (name, type) with the answer's TTL, and its validation state
+    alongside it, so a cached answer carries the same AD bit the first client
+    saw.
+13. Response policy again (`rpz::PolicyZones::on_answer`): the addresses in the
+    answer against the `rpz-ip` triggers. See §5.6.
+14. DNS64 synthesis (`finish_dns64`), when the answer carries no usable AAAA.
+    See §5.7.
+15. Reply, echoing the transaction id with RA set and the OPT record mirrored
     only if the client used EDNS, sized by transport (`Transport::Udp` uses the
     client's advertised payload size; `Transport::Tcp` uses the 2-byte frame).
+16. A prefetch, if the answer came from a cache entry in the last tenth of its
+    TTL and `--prefetch` is on: run by the socket loop **after** the reply is
+    sent, in the same task. See §5.5.
+
+Steps 5, 6, 11, 13, 14 and 16 do nothing at all unless the flag that turns them
+on was given; each costs one `is_empty`, one `Option` test or one comparison
+otherwise.
 
 ### Extended DNS Errors on a SERVFAIL (RFC 8914)
 
@@ -225,10 +246,114 @@ task is spawned, silently, logged at `debug`.
 - Eviction halves the map with `select_nth_unstable`. Expiries are whole seconds,
   so a burst-filled cache has every entry on one value and a `retain` on the
   cutoff would empty it instead of halving it.
+- Both the answer cache and the negative cache read the time from
+  `rdns::clock::Clock`, which is the daemon's — one process, one instant, and a
+  test can move it.
+
+### Serving stale (RFC 8767) — `--serve-stale SECONDS`
+
+Off at 0, which is the default. Non-zero, an entry has two lifetimes: its TTL,
+after which it is not an answer, and `max_stale` seconds after that, in which it
+is the last thing known. `cache::StalePolicy` holds both and is the only place
+the window is arithmetic; with the policy off its predicate is exactly "has not
+expired", so nothing branches on the mode.
+
+- Only reached from the arm where a resolution has already failed (§4 of
+  RFC 8767 has the resolver try the authoritative servers first). A cache that
+  can answer normally never gets here.
+- The answer carries `STALE_ANSWER_TTL` = 30 s (§4), EDE 3 (Stale Answer) or
+  EDE 19 (Stale NXDOMAIN Answer), and AD as validation concluded when it was
+  stored.
+- The `NsecCache` is **not** covered: RFC 8198 serves a denial because its
+  signature proves it, and an expired proof proves nothing.
+- Eviction keeps what the window keeps in both caches. Sweeping the expired
+  entries when making room would leave the window to a resolver nobody is
+  querying.
+
+### Prefetching — `--prefetch`
+
+Off by default. A cache hit with less than a tenth of its TTL left
+(`PREFETCH_AT` = 10, Unbound's rule) is re-resolved once the client's reply is
+away.
+
+- The obligation is handed to **exactly one** caller: `Cached::refresh` is true
+  at most once per entry, flipped under the lock the lookup already holds. A
+  popular name in its last tenth otherwise starts one walk per client.
+- The refresh runs in the task that sent the reply, so it is bounded by that
+  task's in-flight permit and held open by its shutdown guard. Nothing is
+  spawned.
+- A failure leaves the entry claimed and expiring: the next client either finds
+  it or resolves it the ordinary way.
 
 ---
 
-## 5.6 Names that never leave (`special_names.rs`)
+## 5.6 Response Policy Zones (`rdns::rpz`, `--rpz`)
+
+Not an RFC — ISC's `draft-vixie-dns-rpz-04`, as BIND, Knot Resolver, Unbound and
+PowerDNS implement it. A policy zone is an ordinary DNS zone whose owner names
+are triggers and whose RRsets are actions; the trigger name is the thing matched
+with the policy zone's origin appended, so the lookup is `Zone::locate` and the
+RPZ wildcard rule is RFC 1034 §4.3.3's.
+
+| action | spelling | effect |
+|---|---|---|
+| NXDOMAIN | `CNAME .` | the name does not exist; the policy zone's SOA in the authority section |
+| NODATA | `CNAME *.` | no records of this type; the same SOA |
+| PASSTHRU | `CNAME rpz-passthru.` | matched, resolved normally |
+| DROP | `CNAME rpz-drop.` | no reply at all |
+| TCP-Only | `CNAME rpz-tcp-only.` | TC=1 over UDP; over TCP, resolved normally |
+| local data | anything else | the RRset answers, owner rewritten to the name asked for |
+
+- Trigger types: QNAME, `rpz-client-ip` and `rpz-ip` are enforced. `rpz-nsdname`
+  and `rpz-nsip` are **counted at load and printed in the startup banner**, not
+  enforced (`TODO.md` #56).
+- Zones are consulted in the order `--rpz` names them; the first with a rule
+  decides. `--rpz-policy` overrides every action in every zone
+  (`given`/`disabled`/`passthru`/`drop`/`nxdomain`/`nodata`/`tcp-only`).
+- A policy zone without an apex SOA is refused at load, since a negative rewrite
+  owes one (RFC 2308 §5). An address trigger that is not an address is refused
+  too. Loading is all-or-nothing.
+- Every rewrite goes out with AD clear and an Extended DNS Error: 15 (Blocked)
+  when the answer is a denial, 4 (Forged Answer) when records are still
+  provided — RFC 8914 §4.5 draws that line.
+- Counted as `dns_policy_rewrites_total` and `dns_policy_drops_total`.
+
+---
+
+## 5.7 DNS64 (RFC 6147, `--dns64`)
+
+Off unless the flag is given; given without a value it is the Well-Known Prefix
+`64:ff9b::/96` (RFC 6052 §2.1). `rdns::dns64` holds RFC 6052 §2.2's address
+arithmetic — six prefix lengths, the four octets somewhere different in each,
+bits 64-71 reserved and zero in every form but the /96.
+
+- **When**: the question is AAAA, the answer carries no AAAA outside the
+  exclusion set (§5.1.4), the RCODE is not NXDOMAIN (§5.1.2 passes it through),
+  and the client did not set both CD and DO (§5.5 leaves such a client to
+  synthesize for itself).
+- **Where**: `finish_dns64`, which the four paths that can produce an empty AAAA
+  answer end at — the two denial caches, the negative cache, and a fresh
+  resolution. The special-use table and a policy-zone rewrite end at `finish`
+  instead, deliberately: RFC 6761's `localhost` is not an IPv4 name behind a
+  translator, and a blocked name is blocked.
+- **What**: an AAAA per A record, owner unchanged, CNAMEs in the chain kept
+  (§5.1.5). TTL is the lesser of the A record's and the SOA's (§5.1.7). The
+  authority and additional sections are dropped (§5.4). AD is clear, and there
+  is no Extended DNS Error — RFC 8914 has no code for it and 4 (Forged Answer)
+  says "for policy reasons", which this is not.
+- **Exclusions**: `--dns64-exclude` adds to `::ffff:0:0/96`, which §5.1.4 names
+  and which is never removed.
+- **Reverse**: a PTR under `ip6.arpa` for an address inside the prefix is
+  answered with a CNAME into `in-addr.arpa` and whatever that name resolves to
+  — §5.3.1's second alternative, since the first means inventing PTR data for a
+  translator this resolver knows nothing about.
+- §5.1.8's parallel A query is a MAY and is not done; the A lookup follows a
+  delegation walk the AAAA lookup just warmed.
+- Counted as `dns_synthesized_total`.
+
+---
+
+## 5.8 Names that never leave (`special_names.rs`)
 
 Answered locally, never forwarded, each with a reason recorded for the log. Local
 TTL 3600.
@@ -244,7 +369,7 @@ TTL 3600.
 
 ---
 
-## 5.7 Managed trust anchors in `rdnsr`
+## 5.9 Managed trust anchors in `rdnsr`
 
 With `--auto-trust-anchor`, a background task probes the anchored zone's DNSKEY
 RRset on a timer, applies RFC 5011's add-hold-down (30 days) and revocation
