@@ -25,8 +25,8 @@ use rdns::name_keys::NameKeyBuf;
 use rdns::record_types;
 use rdns::zone::{parse_zone_file_at, Zone};
 use rdns::zone_signer::{
-    algorithms_missing_signatures, resign_after, sign_zone, sign_zone_incrementally, DenialChain,
-    DnskeySignature, SigningPolicy,
+    active_signing_keys, algorithms_missing_signatures, resign_after, sign_zone,
+    sign_zone_incrementally, DenialChain, DnskeySignature, SigningPolicy,
 };
 use rdns::{Name, NameRef, Qtype, ResourceRecord, Rtype};
 
@@ -787,14 +787,16 @@ impl ZoneSigning {
             .with_context(|| format!("re-signing {origin} after an update"))
     }
 
-    pub(crate) fn apply(&self, zones: &mut ZoneMap) -> Result<()> {
+    pub(crate) fn apply(&self, zones: &mut ZoneMap) -> Result<SigningRun> {
         // One moment for the whole run — see `policy_for`.
         let signed_at = current_unix_timestamp();
+        let mut run = SigningRun::default();
         for (key, zone) in zones.iter_mut() {
             let origin = key.as_name();
             let Some(keys) = self.keys.get(&origin.to_owned()) else {
                 continue;
             };
+            run.record(origin.to_owned(), keys, signed_at);
             let origin = origin.to_presentation();
             let policy = self.policy_for(&origin, signed_at);
             *zone = Arc::new(
@@ -819,8 +821,99 @@ impl ZoneSigning {
             warn_about_unsigned_algorithms(&origin, zone);
             log_key_schedule(&origin, keys, signed_at);
         }
-        Ok(())
+        Ok(run)
     }
+}
+
+/// What one signing run produced: the zones it signed, and the key tags that
+/// signed each.
+///
+/// Handed to [`verify_zones`] so it can tell a zone this process signed a
+/// moment ago from a pre-signed one an operator dropped in. Key tags rather
+/// than a bare set of origins, because *which* keys sign moves without the zone
+/// file moving: a key crossing its Activate changes the output on the next tick
+/// (`TODO.md` #44f), and signatures no run has ever checked are exactly what
+/// the pass is for.
+#[derive(Debug, Default)]
+pub(crate) struct SigningRun(HashMap<Name, Vec<u16>>);
+
+impl SigningRun {
+    fn record(&mut self, origin: Name, keys: &[SigningKey], signed_at: u64) {
+        let mut tags: Vec<u16> = active_signing_keys(keys, signed_at)
+            .iter()
+            .map(|k| k.key_tag())
+            .collect();
+        // Sorted and deduped so the comparison is about the set: key tags are
+        // not unique (RFC 4034 Appendix B is a checksum, not an identifier) and
+        // `load_dir`'s order is a directory listing's.
+        tags.sort_unstable();
+        tags.dedup();
+        self.0.insert(origin, tags);
+    }
+}
+
+/// The signing runs this process has already checked its own output of.
+///
+/// [`verify_zones`] re-checks every signature at every load. For a zone this
+/// server signed, with the keys it has already been checked for, that is
+/// proving what it did a moment ago — and it is the expensive half: a
+/// million-record zone signs in 28 s and verifies in 76 s, paid at every
+/// startup, every SIGHUP, every `rdnsctl reload` and every re-signing tick
+/// (`TODO.md` #53).
+///
+/// Not "skip whatever we signed". Verifying our own output is the one place a
+/// canonicalization bug in the signer shows up, so the rule is **once per zone
+/// per set of signing keys**: the first run producing a given zone from a given
+/// key set is checked and its repeats are not. A zone that appears after a
+/// SIGHUP is checked, a rollover step makes its zone checked again, and a zone
+/// this server did not sign is checked every time.
+///
+/// Recorded *after* the zone verifies, never before: a run whose output is
+/// rejected must not leave a note saying it was proved, or the next reload
+/// installs what this one refused (`CLAUDE.md` §4).
+#[derive(Clone, Default)]
+pub(crate) struct ProvenSigning(Arc<std::sync::Mutex<HashMap<Name, Vec<u16>>>>);
+
+impl ProvenSigning {
+    /// Has this run's signing of `origin` already been checked?
+    ///
+    /// A poisoned lock answers no, so the check runs: skipping work on the
+    /// strength of state that cannot be read is the wrong way for this to fail
+    /// (`CLAUDE.md` §6 — the decision goes here rather than in an `unwrap`).
+    fn already_proved(&self, origin: &Name, run: &SigningRun) -> bool {
+        let Some(tags) = run.0.get(origin) else {
+            return false;
+        };
+        let Ok(proved) = self.0.lock() else {
+            return false;
+        };
+        proved.get(origin).is_some_and(|seen| seen == tags)
+    }
+
+    fn prove(&self, origin: &Name, run: &SigningRun) {
+        let Some(tags) = run.0.get(origin) else {
+            return;
+        };
+        let Ok(mut proved) = self.0.lock() else {
+            return;
+        };
+        proved.insert(origin.clone(), tags.clone());
+    }
+}
+
+/// What one pass of [`verify_zones`] did.
+///
+/// Returned so a test can assert on counts rather than on a clock
+/// (`CLAUDE.md` §10): "the second load of a zone we signed checks nothing" is
+/// an equality, and a timing of the same claim is a coin toss.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Checked {
+    /// Zones whose signatures were checked.
+    pub(crate) zones: usize,
+    /// RRsets checked across them.
+    pub(crate) rrsets: usize,
+    /// Zones this run signed whose output had already been proved.
+    pub(crate) skipped: usize,
 }
 
 /// Say what each key is doing right now, once per load.
@@ -905,12 +998,29 @@ fn warn_about_unsigned_algorithms(origin: &str, zone: &Zone) {
 /// **112 s** to verify and a million-record one would have taken days, on every
 /// startup, every SIGHUP, every `rdnsctl reload`, every re-signing tick and
 /// inside `--check-config` (`TODO.md` #50).
-pub(crate) fn verify_zones(zones: &ZoneMap, validator: &DnssecValidator) -> Result<()> {
+///
+/// `run` is what the signing that just happened produced and `proved` what this
+/// process has checked before; together they say which zones this is proving
+/// for a second time. See [`ProvenSigning`] for the rule and why it is not
+/// "skip whatever we signed". Both empty — which is what a startup and a
+/// `--check-config` hand it — checks everything.
+pub(crate) fn verify_zones(
+    zones: &ZoneMap,
+    validator: &DnssecValidator,
+    run: &SigningRun,
+    proved: &ProvenSigning,
+) -> Result<Checked> {
+    let mut done = Checked::default();
     if !validator.is_enabled() {
-        return Ok(());
+        return Ok(done);
     }
     for (key, zone) in zones {
+        let apex = key.as_name().to_owned();
         let origin = key.as_name().to_presentation();
+        if proved.already_proved(&apex, run) {
+            done.skipped += 1;
+            continue;
+        }
         let keys = ZoneKeys::of(zone);
         if !keys.is_signed() {
             // Asking with no records keeps the "is unsigned acceptable"
@@ -939,9 +1049,21 @@ pub(crate) fn verify_zones(zones: &ZoneMap, validator: &DnssecValidator) -> Resu
             }
             checked += 1;
         }
+        proved.prove(&apex, run);
+        done.zones += 1;
+        done.rrsets += checked;
         tracing::info!("verified {checked} signed RRsets in {origin}");
     }
-    Ok(())
+    if done.skipped > 0 {
+        // Said out loud: a check that stopped running and says nothing is a
+        // check the operator believes is in force (`CLAUDE.md` §4).
+        tracing::info!(
+            "{} zone{} signed here with keys already checked: not verified again",
+            done.skipped,
+            if done.skipped == 1 { "" } else { "s" },
+        );
+    }
+    Ok(done)
 }
 
 /// Every `(owner, type)` in the zone that some RRSIG claims to cover.
@@ -1435,7 +1557,13 @@ mod tests {
             let (map, rrsets) = signed_zone_of(hosts);
             let validator = DnssecValidator::new(true);
             let start = std::time::Instant::now();
-            verify_zones(&map, &validator).expect("the zone we just signed verifies");
+            verify_zones(
+                &map,
+                &validator,
+                &SigningRun::default(),
+                &ProvenSigning::default(),
+            )
+            .expect("the zone we just signed verifies");
             start.elapsed().as_secs_f64() / rrsets as f64
         };
 
@@ -1485,6 +1613,142 @@ mod tests {
         let mut map = ZoneMap::new();
         map.insert(zone_key(&signed), Arc::new(signed));
         (map, rrsets)
+    }
+
+    /// A zone this server signed is proved once, not at every reload.
+    ///
+    /// `TODO.md` #53: re-signing is a reload, and a reload re-verified
+    /// everything — 76 s of a million-record zone to prove what the 28 s above
+    /// it had just produced with the same keys.
+    ///
+    /// Counts, not a clock (`CLAUDE.md` §10): the claim is that the second pass
+    /// checks nothing, which is an equality.
+    #[test]
+    fn a_zone_we_signed_with_the_same_keys_is_proved_once() {
+        let signing = signing_with(vec![new_key()]);
+        let validator = DnssecValidator::new(true);
+        let proved = ProvenSigning::default();
+
+        let mut zones = unsigned_zone();
+        let run = signing.apply(&mut zones).expect("signs");
+        let first = verify_zones(&zones, &validator, &run, &proved).expect("verifies");
+        assert_eq!(first.zones, 1, "the first load proves it");
+        assert!(first.rrsets > 0, "{first:?}");
+        assert_eq!(first.skipped, 0);
+
+        // The re-signing tick, which reloads: the same file, signed again by
+        // the same keys, with new inceptions and expirations on every RRSIG.
+        let mut zones = unsigned_zone();
+        let run = signing.apply(&mut zones).expect("signs");
+        assert_eq!(
+            verify_zones(&zones, &validator, &run, &proved).expect("verifies"),
+            Checked {
+                zones: 0,
+                rrsets: 0,
+                skipped: 1
+            },
+        );
+    }
+
+    /// A different set of signing keys is a different thing to prove.
+    ///
+    /// The case the tracker keys on tags for: a second key starts signing and
+    /// the zone file has not moved, so "we signed this zone already" would skip
+    /// a signature nothing has ever checked. Two key sets rather than a clock,
+    /// because `ZoneSigning::apply` reads the time itself.
+    #[test]
+    fn a_key_set_that_changed_is_verified_again() {
+        let dir = ScratchDir::new("resign-keys");
+        new_key().write_to_dir(dir.path()).expect("write");
+        let validator = DnssecValidator::new(true);
+        let proved = ProvenSigning::default();
+
+        let signing = signing_with(SigningKey::load_dir(dir.path()).expect("load"));
+        let mut zones = unsigned_zone();
+        let run = signing.apply(&mut zones).expect("signs");
+        verify_zones(&zones, &validator, &run, &proved).expect("verifies");
+
+        new_key().write_to_dir(dir.path()).expect("write");
+        let signing = signing_with(SigningKey::load_dir(dir.path()).expect("load"));
+        let mut zones = unsigned_zone();
+        let run = signing.apply(&mut zones).expect("signs");
+        let second = verify_zones(&zones, &validator, &run, &proved).expect("verifies");
+        assert_eq!(second.skipped, 0, "a key whose output was never checked");
+        assert_eq!(second.zones, 1);
+    }
+
+    /// A signing run whose output is rejected leaves nothing behind.
+    ///
+    /// Recording the proof before the check would let the next reload install
+    /// what this one refused (`CLAUDE.md` §4).
+    #[test]
+    fn a_run_that_failed_to_verify_is_not_recorded_as_proved() {
+        let signing = signing_with(vec![new_key()]);
+        let validator = DnssecValidator::new(true);
+        let proved = ProvenSigning::default();
+
+        let mut zones = unsigned_zone();
+        let run = signing.apply(&mut zones).expect("signs");
+        // Edit one RRset out from under its signature, exactly as an operator
+        // editing a pre-signed file does.
+        let broken = {
+            let zone = zones.values().next().expect("the zone");
+            let mut edited = Zone::new(nm("example.com."));
+            for record in zone.records() {
+                let mut record = record.clone();
+                if record.name == nm("ns1.example.com.") && record.rdata.rtype() == record_types::A
+                {
+                    record.rdata = rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                        "198.51.100.9".parse().unwrap(),
+                    ))
+                    .unwrap();
+                }
+                edited.add_record(record);
+            }
+            edited
+        };
+        zones.insert(zone_key(&broken), Arc::new(broken));
+        verify_zones(&zones, &validator, &run, &proved).expect_err("does not verify");
+
+        // The same run again, against the same tracker: still checked, and
+        // still refused.
+        verify_zones(&zones, &validator, &run, &proved).expect_err("still does not verify");
+    }
+
+    fn new_key() -> SigningKey {
+        SigningKey::generate(
+            rdns::dnssec_key::SigningAlgorithm::Ed25519,
+            "example.com.",
+            rdns::dnssec::DNSKEY_FLAG_ZONE,
+        )
+        .expect("a key")
+    }
+
+    fn signing_with(keys: Vec<SigningKey>) -> ZoneSigning {
+        ZoneSigning {
+            keys: HashMap::from([(nm("example.com."), keys)]),
+            validity: 30 * 86_400,
+            chain: DenialChain::Nsec,
+            per_zone: BTreeMap::new(),
+        }
+    }
+
+    /// The file, re-read. Each call is a fresh load, which is what a reload is.
+    fn unsigned_zone() -> ZoneMap {
+        // Unindented on purpose: a leading space makes a line a continuation of
+        // the record above it, which is a zone file's own syntax and not this
+        // file's formatting.
+        const TEXT: &str = "$ORIGIN example.com.
+$TTL 3600
+@ IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )
+@ IN NS ns1.example.com.
+ns1 IN A 192.0.2.1
+www IN A 192.0.2.2
+";
+        let zone = rdns::zone::parse_zone_file(TEXT, "example.com.").expect("parse");
+        let mut map = ZoneMap::new();
+        map.insert(zone_key(&zone), Arc::new(zone));
+        map
     }
 
     /// The same lookup, timed. Best of three: a lost timeslice can only make a

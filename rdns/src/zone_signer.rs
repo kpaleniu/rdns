@@ -281,6 +281,20 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
     sign_zone_inner(zone, keys, policy, None)
 }
 
+/// The keys that sign at `now`, which is not the keys that are published
+/// (`TODO.md` #44f).
+///
+/// A key inside its pre-publish window is in the DNSKEY RRset and does not
+/// sign; a retired one is still in the RRset so the signatures it made go on
+/// verifying. That is the whole of RFC 6781 §4.1.1.1's ordering.
+///
+/// `pub` because a caller deciding whether a signing run still needs checking
+/// has to key that decision on this exact set (`TODO.md` #53), and a second
+/// copy of the predicate is what `CLAUDE.md` §7 is about.
+pub fn active_signing_keys(keys: &[SigningKey], now: u64) -> Vec<&SigningKey> {
+    keys.iter().filter(|k| k.is_active(now)).collect()
+}
+
 /// Sign `zone`, carrying forward any signature from `previous` that still
 /// covers exactly what it covered before.
 ///
@@ -1015,12 +1029,8 @@ fn sign_everything(
     // The key the parent's DS points at signs only the DNSKEY RRset; a separate
     // key signs the data. Not required — one key does both when only one is
     // present — but it lets the data key roll without involving the parent.
-    // Only the keys that are active at this instant sign (`TODO.md` #44f). A
-    // key inside its pre-publish window is in the DNSKEY RRset and not here,
-    // and a retired one is still in the RRset so the signatures it made go on
-    // verifying — which is the whole of RFC 6781 §4.1.1.1's ordering.
     let now = policy.signed_at;
-    let active: Vec<&SigningKey> = keys.iter().filter(|k| k.is_active(now)).collect();
+    let active = active_signing_keys(keys, now);
     let sep: Vec<&SigningKey> = active.iter().copied().filter(|k| k.is_sep()).collect();
     let rest: Vec<&SigningKey> = active.iter().copied().filter(|k| !k.is_sep()).collect();
     let all: Vec<&SigningKey> = active.clone();

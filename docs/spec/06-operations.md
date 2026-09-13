@@ -351,7 +351,8 @@ neither is set. `Dnstap.version` is `rdnsd <version>`.
 2. Config or flags; refuse the combination.
 3. Read secrets, mode-check them.
 4. Load every zone, sign every zone with a key, verify every signature. All or
-   nothing unless `--allow-partial-load`.
+   nothing unless `--allow-partial-load`. Startup verifies everything; a later
+   reload skips what it has already proved (`03-authoritative-server.md` §3.8).
 5. `withdraw_unvouched_zones`.
 6. Print the banner: effective rate limits, worker count, what each TSIG key may
    transfer.

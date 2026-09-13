@@ -37,17 +37,17 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#51**, **#53**, **#54**, **#55**, **#56**, **#57**, **#58** and **#21**, as
-of 2026-09-13. **#44 and #45 are both closed in full, and so are #48 and #49**,
-which is everything 44a left.
+**#51**, **#54**, **#55**, **#56**, **#57**, **#58** and **#21**, as of
+2026-09-13. **#44 and #45 are both closed in full, and so are #48, #49 and
+#53**, which is everything 44a and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
 which closed the same day carrying two MUSTs it had been filed as not
 breaking: RFC 6891 §6.1.1's OPT in a response to a request that had one, and
 RFC 3225 §3's DO bit, dropped on the first envelope of every AXFR. It was filed
 as "not a defect" because its own row read §6.1.1 as "asks for", and the section
 says what the difference cost. Of what is left, #50 was the live one, and
-closing it is what added #53: a zone this server signed itself is verified
-again at every load, which 76 seconds of a million-record zone made visible.
+closing it is what added #53 — a zone this server signed itself verified again
+at every load — which closed the same day it was taken.
 #51 is what 44d left, #54 what 44g left, #55 what 44f left, #56 and #57 what
 45a left and #58 what 45b left; and #21 is an inventory of deliberate
 deviations rather than a queue. Everything else numbered is closed; the table
@@ -830,7 +830,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#51**, **#53**, **#54**, **#55**, **#56**, **#57** and **#58**, plus
+**#51**, **#54**, **#55**, **#56**, **#57** and **#58**, plus
 **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
@@ -883,9 +883,11 @@ Then, in order and for stated reasons:
 5. ~~**#50**, which is where the rule at the top of this heading points now. It
    is the only defect on the page, and the only row anywhere in #44 or #45 that
    stops a deployment rather than limiting one.~~ **Done 2026-09-12**, and it
-   was: 112.68 s to verify twenty thousand RRsets became 0.65. What it left is
+   was: 112.68 s to verify twenty thousand RRsets became 0.65. ~~What it left is
    **#53**, which is not a defect — it is the same check, asked whether it needs
-   to run on a zone we signed ourselves.
+   to run on a zone we signed ourselves.~~ **#53 closed 2026-09-13**, and it was
+   the same check: it runs once per zone per set of signing keys now, so a
+   re-signing tick pays for signing and nothing else.
 
 ~~**#45 is a different product decision**, not a queue position: it is what an
 ISP needs, and 45a (RPZ) is a legal gate rather than a nice-to-have for anyone
@@ -1075,40 +1077,6 @@ Three things to settle, and the first is a measurement:
   same slow name should not start two resolutions. That is a de-duplicating
   in-flight table, which this resolver does not have and which is worth more
   than the timer on its own.
-
----
-
-### 53. A zone is verified at load even when this server just signed it — **filed 2026-09-12**
-
-Left behind by #50, and only visible once #50 stopped hiding it: verifying a
-million-record zone is **76 s** now that it is linear, against 28 s to sign the
-same zone. Both are paid at every startup, every SIGHUP, every `rdnsctl reload`
-and every re-signing tick, and for a zone this server signed itself the second
-of them is proving what it did a moment ago with the keys it did it with.
-
-What `verify_zones` is *for* is the zone it did not sign: a pre-signed file an
-operator dropped in, or signatures that have since expired or stopped covering
-edited data. That case has to keep the check. `ZoneSigning::apply` already knows
-which zones it signed — it returns after replacing each one — so the information
-is in the right place; what does not exist is a way to hand it to
-`verify_zones`, which today takes the whole map and a validator.
-
-Measured, so the row is not a guess (`rdns/tests/scale.rs`, release, on the
-development machine):
-
-| records | sign | verify |
-|---|---|---|
-| 10 003 | 0.26 s | 0.01 s |
-| 100 003 | 2.73 s | 0.09 s |
-| 1 000 003 | 28.0 s | 76.1 s |
-
-**What would refute it** (§19): that verifying our own output catches something.
-It can — a signer that produced a signature over the wrong canonical form would
-be caught here and nowhere else, which is an argument for keeping the check on
-*some* zone rather than on every zone at every reload. So the shape to build is
-probably "verify what we signed once, at startup, and skip it on the re-signing
-tick", not "skip it whenever we signed it". Neither is written, and the number
-that decides it is how long a fleet's re-signing tick is allowed to take.
 
 ---
 
@@ -1375,6 +1343,7 @@ the week; the record is under "How the queue kept going stale" in
 | **46** | `rdnsd` could not sign a NOTIFY | **filed and closed 2026-09-12**, three items, all of them live. 46a: `--also-notify` took an address and nothing else, so a secondary whose notify ACL names a key refused every notification — measured against NSD and Knot, both. 46b: that refusal was logged `acknowledged (Refused)` at INFO, which is a permanently broken notification path with nothing in a failed state. 46c was found while fixing the other two and was the worst of the three: `[zones."x"].also-notify` was parsed into `PerZone::notify` and read by nothing, with two `docs/spec/` files documenting it as working. `--secondary` and `--also-notify` are one parser now (`rdns::endpoint`), which is why 46a existed at all |
 | **43** | nothing here had ever answered another implementation | **filed 2026-09-11, closed 2026-09-12.** `tests/interop/` — one `docker compose` network, `run.sh all`. 112 assertions against BIND 9.20.27, Knot 3.6.0, NSD 4.12.0, Unbound 1.23.1 and ldns 1.8.4; 0 failures. **Neither of the two things the filing predicted happened**: the IXFR is a real delta in both directions and every NSEC3 shape validates. Found one gap, in NOTIFY, which no row had named — **#46**. Three of the first five apparent findings were the harness, and the section says what each was, because that ratio is the lesson |
 | **50** | verifying a signed zone at load was quadratic in the zone | **filed and closed 2026-09-12**, found by 44c's measurement rather than by reading the code. `validate_response` collected every DNSKEY and every RRSIG in the zone on every call and `verify_rrset` then scanned what it collected, so `verify_zones` — which runs at startup, on SIGHUP, on `rdnsctl reload`, on the re-signing tick and inside `--check-config` — cost the square of the zone. **20,006 RRsets: 112.68 s before, 0.65 s after**, and a million-record zone goes from days of arithmetic to a measured 76 s. The fix is a `ZoneKeys` the caller hoists and a signature lookup through the zone's own owner index; the guard is an allocation count (34 either side of a fifty-fold zone, 217 against 6,101 with the scan) plus a ratio test in `rdnsd`. Filed **#53** on the way out |
+| **53** | a zone was verified at load even when this server had just signed it | **filed 2026-09-12, closed 2026-09-13**, left behind by #50 and only visible once #50 stopped hiding it. The row proposed "verify what we signed once, at startup"; what landed is **once per zone per set of signing keys**, which costs the same and has neither of that rule's two holes — a zone appearing after a SIGHUP was never at a startup, and #44f made a key crossing its Activate change the output with the zone file unchanged, so a rollover publishes signatures nothing has checked. `ZoneSigning::apply` returns what it signed with which key tags; the proof is recorded **after** the zone verifies, because recording first lets the next reload install what this one refused (§4), and that is a test. Startup and `--check-config` still check everything. Worth 76 s of a re-signing tick on a million-record zone, asserted as a count (`Checked { zones: 0, rrsets: 0, skipped: 1 }`) rather than a clock. The number the row said would decide it — how long a fleet's tick may take — was not needed. Nothing filed on the way out |
 | **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. |
 | **52** | a rate-limit test is a coin toss at a second boundary | **filed and closed 2026-09-12**, one commit. Not a defect in the server, and the filing undercounted it by 23: the shape is a test that reads the wall clock at a limiter call, and there were **43 such call sites across 24 tests**, six of them assertions a refill actually breaks. Both buckets refill by whole seconds, so the verdict depended on whether two reads straddled one. 41 sites needed nothing but one `let now` per test, because `should_allow` has taken the instant as a parameter since #28a; the two that read the clock inside the loop under test — `tcp::serve`'s per-connection charge and `rdnsr`'s UDP loop — got `rdns::clock::Clock` on `ServeContext`. The test now asserts the refill as well as the refusal, which is the half that says the connection was charged rather than never admitted |
 | **47** | a NOTIFY reply carried no OPT record | **filed and closed 2026-09-12**, one commit, and it was a defect after all: the row read RFC 6891 §6.1.1 as "asks for" where it is "if an OPT record is present in a received **request**, compliant responders MUST include an OPT record in their respective responses" — a NOTIFY is a request. Counting the shape (§18) found a second site and a second MUST: `transfer::Envelopes` built the first AXFR envelope's OPT from `has_edns()` and a fresh `Edns`, which drops DO, against RFC 3225 §3's unconditional "the DO bit of the query MUST be copied in the response". Nothing tested either. The three NOTIFY refusals now carry three different EDEs, because "you are not one of my masters" and "I am that zone's primary" are one RCODE and two operator problems. `ClientEdns::mirror_with` became total on the way, so the `Err` all three callers answered identically is one doc comment rather than four. The EDE half is a reading rather than a quotation and the peers were asked: BIND 9.20 and Knot 3.6 mirror the OPT and DO and send no EDE, NSD 4.12 answers NXDOMAIN with QDCOUNT=0 and no OPT. Nine new assertions in the interop harness, 29 passed 0 failed in 43e |

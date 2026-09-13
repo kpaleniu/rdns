@@ -45,8 +45,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zones::{
     discard_orphan_journals, install_all_zones, load_zones_from_source, note_serials,
-    restore_journals, validate_zone_source, verify_zones, ZoneContext, ZoneMap, ZoneSigning,
-    ZoneSource, Zones,
+    restore_journals, validate_zone_source, verify_zones, ProvenSigning, SigningRun, ZoneContext,
+    ZoneMap, ZoneSigning, ZoneSource, Zones,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -1216,6 +1216,10 @@ struct Reloading {
     zone_dir: Option<PathBuf>,
     signing: Option<Arc<ZoneSigning>>,
     validator: Arc<DnssecValidator>,
+    /// Shared with the startup pass, which is the run that proves most of it:
+    /// a reload that re-signs a zone with the same keys has nothing new to
+    /// check (`TODO.md` #53).
+    proved: ProvenSigning,
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -1242,10 +1246,11 @@ impl Reloading {
     /// The blocking half of [`Reloading::load`], and named so at the call site.
     fn load_blocking(&self, source: &ZoneSource) -> Result<ZoneMap> {
         let mut zones = load_zones_from_source(source, self.replicating, self.allow_partial)?;
-        if let Some(signing) = &self.signing {
-            signing.apply(&mut zones)?;
-        }
-        verify_zones(&zones, &self.validator)?;
+        let run = match &self.signing {
+            Some(signing) => signing.apply(&mut zones)?,
+            None => SigningRun::default(),
+        };
+        verify_zones(&zones, &self.validator, &run, &self.proved)?;
         Ok(zones)
     }
 
@@ -1941,13 +1946,17 @@ async fn main() -> Result<()> {
     // Signing happens between loading and serving, and so does checking the
     // result: verifying what we just produced is what catches a canonicalization
     // bug here rather than at every validator on the internet.
-    if let Some(signing) = &signing {
-        signing.apply(&mut zones)?;
-    }
+    let run = match &signing {
+        Some(signing) => signing.apply(&mut zones)?,
+        None => SigningRun::default(),
+    };
     let mut validator = DnssecValidator::new(cli.require_signed || signing.is_some());
     validator.set_require_signed(cli.require_signed);
     let validator = Arc::new(validator);
-    verify_zones(&zones, &validator)?;
+    // Empty, so this pass checks everything; what it proves is what the reload
+    // path may then skip.
+    let proved = ProvenSigning::default();
+    verify_zones(&zones, &validator, &run, &proved)?;
 
     // The dry run exits here, and *here* specifically: everything above is
     // everything that can be known without touching the network. The config
@@ -2152,6 +2161,7 @@ async fn main() -> Result<()> {
                 zone_dir: reload_zone_dir,
                 signing,
                 validator,
+                proved,
             },
             source,
             served: served.clone(),
@@ -5415,6 +5425,7 @@ mod tests {
                 zone_dir: Some(dir.path().to_path_buf()),
                 signing: None,
                 validator: Arc::new(DnssecValidator::new(false)),
+                proved: ProvenSigning::default(),
             };
             let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
 
@@ -6014,12 +6025,26 @@ ns.plain  IN A   192.0.2.30
 
             let mut zones =
                 enumerate_zone_files(dir.path().to_str().unwrap(), false).expect("zones");
-            signing.apply(&mut zones).expect("sign");
+            let run = signing.apply(&mut zones).expect("sign");
 
             // Checked with the same validator the server runs before serving.
             let mut validator = DnssecValidator::new(true);
             validator.set_require_signed(true);
-            verify_zones(&zones, &validator).expect("the zone we just signed verifies");
+            let proved = ProvenSigning::default();
+            verify_zones(&zones, &validator, &run, &proved)
+                .expect("the zone we just signed verifies");
+
+            // And the same zones again, without re-signing: the run is the same
+            // and the keys have not moved, so nothing is checked a second time
+            // (`TODO.md` #53).
+            assert_eq!(
+                verify_zones(&zones, &validator, &run, &proved).expect("verifies"),
+                zones::Checked {
+                    zones: 0,
+                    rrsets: 0,
+                    skipped: 1,
+                },
+            );
 
             let zones = Zones::new(zones);
             let metrics = DnsMetrics::new();
@@ -6039,13 +6064,25 @@ ns.plain  IN A   192.0.2.30
 
             let mut validator = DnssecValidator::new(true);
             validator.set_require_signed(true);
-            let err = verify_zones(&zones, &validator).unwrap_err();
+            let err = verify_zones(
+                &zones,
+                &validator,
+                &SigningRun::default(),
+                &ProvenSigning::default(),
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("not signed"), "{err}");
 
             // And without the assertion, the same zone is fine: most zones are
             // unsigned and serving them is the normal case.
             let permissive = DnssecValidator::new(true);
-            assert!(verify_zones(&zones, &permissive).is_ok());
+            assert!(verify_zones(
+                &zones,
+                &permissive,
+                &SigningRun::default(),
+                &ProvenSigning::default()
+            )
+            .is_ok());
         }
 
         #[test]
@@ -6076,7 +6113,13 @@ ns.plain  IN A   192.0.2.30
             drop(zones.insert(edited));
 
             let validator = DnssecValidator::new(true);
-            let err = verify_zones(&zones, &validator).unwrap_err();
+            let err = verify_zones(
+                &zones,
+                &validator,
+                &SigningRun::default(),
+                &ProvenSigning::default(),
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("does not verify"), "{err}");
         }
     }

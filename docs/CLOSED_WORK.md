@@ -7845,3 +7845,89 @@ Three of the new tests are `#[cfg(unix)]`, because the control socket is; the
 platform gap in the test counts is 20 rather than 17 for that reason.
 
 ---
+
+### 53. A zone is verified at load even when this server just signed it — ~~**filed 2026-09-12**~~ **closed 2026-09-13**
+
+Left behind by #50, and only visible once #50 stopped hiding it: verifying a
+million-record zone is **76 s** now that it is linear, against 28 s to sign the
+same zone. Both are paid at every startup, every SIGHUP, every `rdnsctl reload`
+and every re-signing tick, and for a zone this server signed itself the second
+of them is proving what it did a moment ago with the keys it did it with.
+
+What `verify_zones` is *for* is the zone it did not sign: a pre-signed file an
+operator dropped in, or signatures that have since expired or stopped covering
+edited data. That case has to keep the check. `ZoneSigning::apply` already knows
+which zones it signed — it returns after replacing each one — so the information
+is in the right place; what does not exist is a way to hand it to
+`verify_zones`, which today takes the whole map and a validator.
+
+Measured, so the row is not a guess (`rdns/tests/scale.rs`, release, on the
+development machine):
+
+| records | sign | verify |
+|---|---|---|
+| 10 003 | 0.26 s | 0.01 s |
+| 100 003 | 2.73 s | 0.09 s |
+| 1 000 003 | 28.0 s | 76.1 s |
+
+**What would refute it** (§19): that verifying our own output catches something.
+It can — a signer that produced a signature over the wrong canonical form would
+be caught here and nowhere else, which is an argument for keeping the check on
+*some* zone rather than on every zone at every reload. So the shape to build is
+probably "verify what we signed once, at startup, and skip it on the re-signing
+tick", not "skip it whenever we signed it". Neither is written, and the number
+that decides it is how long a fleet's re-signing tick is allowed to take.
+
+---
+
+**Done 2026-09-13**, and the shape the row guessed at is nearly the one that
+landed. It said "verify what we signed once, at startup, and skip it on the
+re-signing tick"; what is written is **once per zone per set of signing keys**,
+which is strictly more than that and costs the same.
+
+The difference is the two holes "at startup" has. A zone that appears after a
+SIGHUP was never at a startup, so a rule keyed on the startup would never check
+it. And *which* keys sign moves on its own — #44f made a key crossing its
+Activate change the output with the zone file unchanged — so a rollover step
+publishes signatures nothing has ever verified. Keying the record on the active
+key tags closes both, and `ZoneSigning::apply` already has the keys in hand.
+
+- `ZoneSigning::apply` returns a `SigningRun`: which zones it signed, and the
+  key tags that signed each. `ProvenSigning` is the record of what has been
+  checked, shared between the startup pass and `Reloading`.
+- The tags come from `rdns::zone_signer::active_signing_keys`, extracted from
+  `sign_zone_inner` so the two cannot disagree about which keys sign
+  (`CLAUDE.md` §7). Deriving the predicate a second time in `rdnsd` would have
+  been the second copy that drifts.
+- **Recorded after the zone verifies, never before.** Recording first would let
+  a run whose output is *rejected* leave a note saying it was proved, and the
+  next reload would install what this one refused (§4). That is a test, and it
+  fails against the inverted ordering.
+
+Startup and `--check-config` begin with an empty record, so both still check
+everything: the dry run's whole claim is "every signature verified" and a zone
+the operator pre-signed is checked at every load, which is what the pass is for.
+
+**What it is worth**, deterministically rather than on a clock (§10): the second
+load of a zone this server signed reports `Checked { zones: 0, rrsets: 0,
+skipped: 1 }`, against `zones: 1, rrsets: 8` before. In the numbers the row was
+filed with, a re-signing tick on a million-record zone goes from 28 s of signing
+plus 76 s of verifying to 28 s of signing.
+
+**What would have refuted it** (§19) was in the row already: verifying our own
+output is where a canonicalization bug in the signer shows up. It still runs —
+once per zone, and again whenever the key set changes — so the check that
+catches that bug is kept and only its repeats are gone. The number the row said
+would decide it, how long a fleet's re-signing tick may take, was not needed:
+the per-key-set rule makes the tick's verification cost zero rather than small,
+whatever the fleet.
+
+Nothing filed on the way out. `docs/spec/03-authoritative-server.md` §3.8 said
+"verifies every signature" and now says which ones; `rdns/tests/scale.rs` said
+the pass "runs on every load" in the header over the measurement that produced
+this row.
+
+Verified: 1,114 tests on Windows and 1,134 on Linux, clippy clean on both,
+`cargo doc` clean.
+
+---

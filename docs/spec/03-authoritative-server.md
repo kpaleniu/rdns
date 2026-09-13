@@ -516,9 +516,19 @@ Triggered by SIGHUP (Unix), by `rdnsctl reload`, or by the zone-maintenance time
 (which also re-signs; see `04-dnssec.md` §4.1).
 
 All or nothing. `Reloading::load` reads every zone, signs every zone that has a
-key, verifies every signature, and installs the new set only if the whole set
-came through. A failure leaves the previously served zones in place and reports
-why; `rdnsctl reload` exits 1 with the parse error.
+key, verifies the signatures it has not proved before, and installs the new set
+only if the whole set came through. A failure leaves the previously served zones
+in place and reports why; `rdnsctl reload` exits 1 with the parse error.
+
+**Which signatures get verified.** A zone this server did not sign is verified
+every time — that is what the pass is for. A zone it signed is verified once per
+set of signing keys: the first run producing it from a given key set is checked,
+its repeats are not, and a rollover step activating a key makes its zone checked
+again. The proof is recorded after the zone verifies, never before. Startup and
+`--check-config` begin with an empty record, so both check everything.
+Verification is the expensive half of a load — 76 s against 28 s to sign, for a
+million-record zone — and a re-signing tick that re-proved what the tick above it
+had just produced was most of it (`TODO.md` #53).
 
 1. Read and parse every zone on a blocking thread (`spawn_blocking`).
 2. `plan_reload` diffs the new set against the old under the read lock.

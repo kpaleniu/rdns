@@ -385,12 +385,15 @@ fn signing_one_big_zone() {
 
 /// What `rdnsd` does to a zone it has just signed, before serving any of it.
 ///
-/// `zones::verify_zones` runs on every load whenever signing is configured, and
-/// asks one question per signed RRset. It asked it through
-/// `DnssecValidator::validate_response`, which collects every DNSKEY and every
-/// RRSIG *in the whole zone* per call — quadratic, and `TODO.md` #50, which
-/// this stage found and which the shape below is now the fixed version of: the
-/// keys are collected once and `validate_rrset` takes them.
+/// `zones::verify_zones` asks one question per signed RRset. It asked it
+/// through `DnssecValidator::validate_response`, which collects every DNSKEY
+/// and every RRSIG *in the whole zone* per call — quadratic, and `TODO.md` #50,
+/// which this stage found and which the shape below is now the fixed version
+/// of: the keys are collected once and `validate_rrset` takes them.
+///
+/// It ran on *every* load until `TODO.md` #53; a zone this server signed is
+/// proved once per set of signing keys now, so what is timed here is the first
+/// load of a zone and every load of one this server did not sign.
 ///
 /// What to read is the µs/RRset column against itself. Flat is the fix; a
 /// column that doubles when the zone doubles is the defect back.
@@ -399,7 +402,7 @@ fn verifying_a_signed_zone() {
     let keys = keys_for("example.com.");
     let validator = DnssecValidator::new(true);
     println!(
-        "\n== verifying it, as every load does (`zones::verify_zones`)\n\
+        "\n== verifying it, as the first load does (`zones::verify_zones`)\n\
          {:>10}  {:>10}  {:>9}  {:>11}  {:>10}",
         "records", "signed", "rrsets", "verify", "µs/rrset"
     );
